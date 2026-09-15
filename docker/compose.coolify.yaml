@@ -16,14 +16,18 @@
 #      (just save); BASE_DOMAIN is required and blocks deploy until set.
 #      BETTER_AUTH_URL / GIT_PUBLIC_BASE derive from BASE_DOMAIN unless
 #      overridden. Review ports, then Deploy.
-#   3. Domains: automatic. `SERVICE_URL_CADDY_80` provisions Coolify's
-#      generated domain and routes it to `caddy:80`; the runner adds the
-#      generated hostname (`SERVICE_FQDN_CADDY_80`) to the control site via
-#      CONTROL_EXTRA_HOSTS, so first boot serves the UI with zero manual
-#      domain steps. Coolify terminates TLS; Caddy routes app./api./git
-#      plus every tenant slug internally (CADDY_AUTO_HTTPS=off below).
-#      Add your real domains later (`app.`/`api.`/`git.`/`*.slug`) in the
-#      `caddy` service Domains field; the apex stays on marketing/GitHub Pages.
+#   3. Domains: two parts. `SERVICE_URL_CADDY_80` auto-provisions Coolify's
+#      generated domain on `caddy:80` (boot check only); the runner adds that
+#      hostname to the control site via CONTROL_EXTRA_HOSTS. Custom
+#      hostnames CANNOT come from Compose — Coolify builds proxy labels
+#      from the dashboard Domains field, so paste this once on the `caddy`
+#      service (one entry per hostname, https, port 80, empty path):
+#        https://app.BASE_DOMAIN:80,https://api.BASE_DOMAIN:80,https://git.BASE_DOMAIN:80
+#      Internal Caddy routes by Host header, so every public hostname must
+#      land on `caddy:80` (CADDY_AUTO_HTTPS=off below; Coolify terminates
+#      TLS). Tenant slugs need their own entries as you deploy them, or one
+#      wildcard entry plus a DNS-challenge wildcard cert at the proxy level.
+#      Do NOT point the apex at caddy — it stays on marketing/GitHub Pages.
 #
 # NOTES
 #   - No `ports:` on caddy: published host ports bypass Coolify's proxy.
