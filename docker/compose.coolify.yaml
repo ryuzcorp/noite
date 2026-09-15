@@ -23,11 +23,14 @@
 #      from the dashboard Domains field, so paste this once on the `caddy`
 #      service (one entry per hostname, https, port 80, empty path):
 #        https://app.BASE_DOMAIN:80,https://api.BASE_DOMAIN:80,https://git.BASE_DOMAIN:80
-#      Tenant slugs are automatic: the `traefik.*` labels below TCP-forward
+#      Tenant slugs are automatic: a dashboard-pasted file defines the
+#      Traefik TCP router (see README for the verbatim snippet — static
+#      text, since Coolify mangles `$` inside compose labels), forwarding
 #      every `*.BASE_DOMAIN` SNI to our Caddy on `:443`, which mints
 #      per-slug certs on demand (runner ask-gated; first visit pauses a few
-#      seconds). One-time needs: `*.BASE_DOMAIN` DNS → the server, labels
-#      intact (check the `noite-tenants` router in Traefik dashboard).
+#      seconds). One-time needs: `*.BASE_DOMAIN` DNS → the server, the
+#      file saved, and the `traefik.tcp.services` label below intact
+#      (check the `noite-tenants` router in the Traefik dashboard).
 #      Do NOT point the apex at caddy — it stays on marketing/GitHub Pages.
 #
 # NOTES
@@ -151,18 +154,14 @@ services:
       # Auto-provision Coolify's generated domain and route it to caddy:80.
       SERVICE_URL_CADDY_80: /
     labels:
-      # Tenant TLS: Traefik TCP-forwards every *.BASE SNI straight to our
-      # Caddy, which mints per-slug certs on demand (ask-gated at the
-      # runner — no wildcard cert or DNS provider needed, zero per-app
-      # steps). app./api./git pass through here too and are served by our
-      # Caddy over the same on-demand certs; :80 keeps the Coolify HTTP
-      # routes (redirects, healthchecks, HTTP-01 challenges). If Coolify
-      # ever drops custom labels, move these to a Raw Compose Deployment.
+      # Tenant TLS service definition only (a bare port — no `$`, which
+      # Coolify rewrites to `$$` in labels so Docker never interpolates it
+      # and Traefik receives a literal `${BASE_DOMAIN}` that matches
+      # nothing). The TCP *router* lives in a dashboard-pasted file
+      # instead (`Servers > server > Proxy > Dynamic Configurations`, see
+      # README): file config is static text, and `noite-tenants@docker`
+      # resolves this service live with no hardcoded address.
       - "traefik.enable=true"
-      - "traefik.tcp.routers.noite-tenants.entrypoints=websecure"
-      - "traefik.tcp.routers.noite-tenants.rule=HostSNIRegexp(`^.+\\.${BASE_DOMAIN}$`)"
-      - "traefik.tcp.routers.noite-tenants.service=noite-tenants"
-      - "traefik.tcp.routers.noite-tenants.tls.passthrough=true"
       - "traefik.tcp.services.noite-tenants.loadbalancer.server.port=443"
     expose:
       - "80"

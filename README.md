@@ -28,4 +28,16 @@ make logs
 
 Point a Docker Compose resource at `docker/compose.coolify.yaml` (repo root, branch `main`). In Environment Variables, set the required `BASE_DOMAIN` (secrets auto-generate — just save); `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` derive from it unless overridden. Deploy: Coolify auto-provisions a generated domain for the `caddy` service and the runner serves the control UI on it (boot check). Coolify terminates TLS; Caddy routes `app.`/`api.`/`git.` plus every tenant slug internally. Then paste the real hostnames once on the `caddy` service Domains field (Coolify can't take custom hostnames from Compose): `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. The apex stays on your marketing site.
 
-Tenant subdomains (`<slug>.<domain>`) are fully automatic: the compose file labels a Traefik TCP router that forwards every `*.<domain>` SNI straight to our Caddy on `:443`, and our Caddy mints a per-slug cert on demand (ask-gated by the runner — only live tenant/platform hosts get certs, no wildcard cert or DNS provider involved). One-time prerequisites: `*.<domain>` DNS → the server, and the `traefik.*` labels present on the `caddy` service (verify the `noite-tenants` router in the Traefik dashboard; if Coolify ever drops custom labels, move them to a Raw Compose Deployment). First visit to a new slug pauses a few seconds for issuance; certs persist in `caddy-data`. Fallback if passthrough misbehaves: add `https://<slug>.<domain>:80` per app (exact hostnames use the plain HTTP challenge).
+Tenant subdomains (`<slug>.<domain>`) are fully automatic: a Traefik TCP router forwards every `*.<domain>` SNI straight to our Caddy on `:443`, and our Caddy mints a per-slug cert on demand (ask-gated by the runner — only live tenant/platform hosts get certs, no wildcard cert or DNS provider involved). Two one-time prerequisites: `*.<domain>` DNS → the server, and this file saved under `Servers > server > Proxy > Dynamic Configurations` (dashboard-pasted file config is static text — unlike compose labels, Coolify can't mangle it — and `noite-tenants@docker` resolves the TCP service the compose file defines):
+
+```yaml
+tcp:
+  routers:
+    noite-tenants:
+      entryPoints: [https]
+      rule: 'HostSNIRegexp(`^.+\.<domain>$`)'
+      service: noite-tenants@docker
+      tls: { passthrough: true }
+```
+
+Then redeploy once and confirm the `noite-tenants` router in the Traefik dashboard. First visit to a new slug pauses a few seconds for issuance; certs persist in `caddy-data`. Fallback if passthrough misbehaves: add `https://<slug>.<domain>:80` per app (exact hostnames use the plain HTTP challenge).
