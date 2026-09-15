@@ -48,7 +48,7 @@ Set `BETTER_AUTH_URL` to the final URL **before** users register — passkeys ar
 S3_ENDPOINT=https://s3.us-east-1.amazonaws.com \
 AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
 NOITE_S3_BUCKET=noite S3_PUBLIC_ENDPOINT=https://s3.us-east-1.amazonaws.com \
-docker compose --project-directory . -f docker/compose.yaml -f docker/compose.byob.yaml up -d --build runner ui caddy
+docker compose -f docker/compose.yaml -f docker/compose.byob.yaml up -d --build runner ui caddy
 # or: export the vars above, then `make up-byob`
 ```
 

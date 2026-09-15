@@ -30,6 +30,6 @@ case "${BETTER_AUTH_URL:-}" in
 esac
 
 cd /app
-echo "noite: start dist/server.js on :${PORT:-8080}"
+echo "noite: start srvx ./dist/server.js on :${PORT:-8080}"
 export PORT="${PORT:-8080}"
 exec bun run start

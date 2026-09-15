@@ -1,6 +1,9 @@
 # Compose — run from repo root.
 
-COMPOSE ?= $(shell command -v docker >/dev/null 2>&1 && echo 'docker compose' || echo 'podman compose') --project-directory $(CURDIR) -f docker/compose.yaml
+# Both docker compose and podman-compose resolve host paths in these files
+# relative to the first -f file's directory (docker/), so no
+# --project-directory flag (which podman-compose rejects outright).
+COMPOSE ?= $(shell command -v docker >/dev/null 2>&1 && echo 'docker compose' || echo 'podman compose') -f docker/compose.yaml
 
 -include .env
 export
@@ -79,7 +82,10 @@ reset:
 	-$(COMPOSE) down -v --remove-orphans
 
 rebuild:
-	$(COMPOSE) build --no-cache runner ui
+	# Serialized: podman-compose builds services in parallel and the
+	# cargo-release + vite combination OOMs; each builds fine alone.
+	$(COMPOSE) build --no-cache runner
+	$(COMPOSE) build --no-cache ui
 	$(COMPOSE) up -d --force-recreate runner ui
 	$(COMPOSE) up -d caddy
 

@@ -3,6 +3,12 @@
 #   cp .env.example .env && make up && make logs
 #
 # Apex → Oxide (passkeys + actions). api.* → runner. <slug> → tenant fleets.
+#
+# NOTE: host paths below are relative to this file's directory (docker/) —
+# both `docker compose` (project dir defaults to the first -f file's dir)
+# and podman-compose resolve them the same way. (The Coolify file is the
+# exception: Coolify uses Base Directory as project dir, so its paths stay
+# repo-root-relative.)
 
 name: noite
 
@@ -36,7 +42,7 @@ services:
 
   runner:
     build:
-      context: ./apps/runner
+      context: ../apps/runner
       dockerfile: Dockerfile
     image: noite-runner:local
     container_name: noite-runner
@@ -78,7 +84,7 @@ services:
     # (docker/Dockerfile.control). No source bind mount, no npm at boot.
     # Dev HMR keeps the tools image + bind mount — see docker/compose.dev.yaml.
     build:
-      context: .
+      context: ..
       dockerfile: docker/Dockerfile.control
     image: noite-control-ui:local
     container_name: noite-ui

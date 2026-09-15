@@ -7,6 +7,8 @@ import { controlEnv, hydrateControlEnv } from "./lib/control-env";
 hydrateControlEnv();
 installBunDurable(controlEnv);
 
-export const fetch = handleHttp;
-
-export default { fetch } satisfies ServerEntry<KitEnv>;
+// NOTE: no named `fetch` export on purpose. Oxide builds the full app
+// (middleware + SSR + static) as the default export; srvx-style loaders
+// prefer a named `fetch` and would serve the raw API-only `handleHttp`,
+// 404ing every page. Keep the entry surface to the composed app.
+export default { fetch: handleHttp } satisfies ServerEntry<KitEnv>;
