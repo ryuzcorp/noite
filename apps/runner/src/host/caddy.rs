@@ -37,7 +37,6 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
         String::new(),
         format!("{}, http://127.0.0.1 {{", site(&control_site)),
         format!("\treverse_proxy {} {{", cfg.caddy_control_upstream),
-        "\t\theader_up Host {http.request.hostport}".into(),
         "\t\tflush_interval -1".into(),
         "\t}".into(),
         "}".into(),
@@ -58,7 +57,6 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
             "\treverse_proxy {}:{} {{",
             cfg.caddy_upstream_host, port
         ));
-        lines.push("\t\theader_up Host {http.request.hostport}".into());
         lines.push("\t\theader_up X-Forwarded-Host {http.request.hostport}".into());
         lines.push("\t\theader_up X-Forwarded-Proto {http.request.scheme}".into());
         lines.push("\t\tflush_interval -1".into());
@@ -69,7 +67,6 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
     // API → runner (Bearer-protected REST)
     lines.push(format!("{} {{", site(&format!("api.{}", cfg.base_domain))));
     lines.push(format!("\treverse_proxy {} {{", cfg.caddy_api_upstream));
-    lines.push("\t\theader_up Host {http.request.hostport}".into());
     lines.push("\t\tflush_interval -1".into());
     lines.push("\t}".into());
     lines.push("}".into());
@@ -79,7 +76,6 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
     lines.push(format!("{} {{", site(&format!("git.{}", cfg.base_domain))));
     lines.push("\trewrite * /v1/git{uri}".into());
     lines.push(format!("\treverse_proxy {} {{", cfg.caddy_api_upstream));
-    lines.push("\t\theader_up Host {http.request.hostport}".into());
     lines.push("\t\tflush_interval -1".into());
     lines.push("\t}".into());
     lines.push("}".into());
@@ -91,7 +87,6 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
     lines.push(format!("{} {{", site(&format!("*.{}", cfg.base_domain))));
     lines.push("\trewrite * /v1/edge/fallback".into());
     lines.push(format!("\treverse_proxy {} {{", cfg.caddy_api_upstream));
-    lines.push("\t\theader_up Host {http.request.hostport}".into());
     lines.push("\t\tflush_interval -1".into());
     lines.push("}".into());
     lines.push("}".into());
