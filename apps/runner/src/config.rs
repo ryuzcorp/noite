@@ -1,5 +1,15 @@
 use std::env;
 
+/// Caddy `auto_https`: explicit off wins (behind-proxy deployments like
+/// Coolify, which terminates TLS itself); otherwise on except `localhost`.
+fn parse_auto_https(raw: Option<&str>, base_domain: &str) -> bool {
+    match raw {
+        Some("off") | Some("0") | Some("false") => false,
+        Some(_) => true,
+        None => base_domain != "localhost",
+    }
+}
+
 fn env_or(keys: &[&str], default: &str) -> String {
     for key in keys {
         if let Ok(v) = env::var(key) {
@@ -34,6 +44,9 @@ pub struct Config {
     pub port_base: u16,
     pub poll_ms: u64,
     pub caddy_upstream_host: String,
+    /// Caddy `auto_https`: unset = on except `localhost`; explicit
+    /// `off` for behind-proxy deployments (Coolify terminates TLS).
+    pub auto_https: bool,
     pub caddy_control_upstream: String,
     pub caddy_api_upstream: String,
     /// Public base for Git smart-HTTP remotes (no trailing slash).
@@ -72,6 +85,10 @@ impl Config {
             }
         });
         let ui_url = env_or(&["UI_URL", "CONTROL_URL"], "http://ui:8080");
+        let auto_https = parse_auto_https(
+            env::var("CADDY_AUTO_HTTPS").ok().as_deref(),
+            &base_domain,
+        );
         Ok(Self {
             bind: env_or(
                 &["RUNNER_BIND", "HOST_BIND", "AGENT_BIND"],
@@ -107,6 +124,7 @@ impl Config {
             .parse()
             .unwrap_or(5000),
             caddy_upstream_host: env_or(&["CADDY_UPSTREAM_HOST"], "runner"),
+            auto_https,
             caddy_control_upstream: env::var("CADDY_CONTROL_UPSTREAM")
                 .unwrap_or_else(|_| "ui:8080".into()),
             caddy_api_upstream: env_or(&["CADDY_API_UPSTREAM"], "runner:8080"),
@@ -153,5 +171,28 @@ impl Config {
     pub fn s3_uri(&self, key: &str) -> String {
         let key = key.trim_start_matches('/');
         format!("s3://{}/{key}", self.s3_bucket)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_https_explicit_off_wins() {
+        for raw in ["off", "0", "false"] {
+            assert!(!parse_auto_https(Some(raw), "noite.now"));
+        }
+    }
+
+    #[test]
+    fn auto_https_explicit_on_wins() {
+        assert!(parse_auto_https(Some("on"), "localhost"));
+    }
+
+    #[test]
+    fn auto_https_defaults_by_domain() {
+        assert!(!parse_auto_https(None, "localhost"));
+        assert!(parse_auto_https(None, "noite.now"));
     }
 }

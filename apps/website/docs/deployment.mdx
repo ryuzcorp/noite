@@ -1,0 +1,69 @@
+---
+title: Deployment
+description: Deploy Noite anywhere with Docker Compose — bundled RustFS or your own S3 bucket.
+---
+
+Noite ships as four containers: **runner** (deploy pipeline, fleet supervisor, Caddyfile owner), **ui** (control plane), **caddy** (edge router), and **storage**. Two storage options, same three app services:
+
+|  | A: bundled RustFS | B: your own bucket (BYOB) |
+| --- | --- | --- |
+| Compose file | `compose.yaml` | `compose.yaml` + `compose.byob.yaml` |
+| Start | `make up` | `make up-byob` |
+| S3 | RustFS container (`:9000`) | AWS S3 / MinIO / R2 / Ceph — anything SigV4 |
+
+Coolify? Use `compose.coolify.yaml` instead — same stack, Coolify-managed proxy/secrets (see README).
+
+## Prerequisites
+
+- A server with Docker (or Podman) + Compose.
+- DNS: `app.<domain>` (control UI), `api.<domain>`, `git.<domain>`, plus `*.<domain>` for tenant apps. The apex stays free for your marketing site.
+- Ports 80/443 reachable — Caddy gets certificates automatically (`auto_https`).
+
+## A: bundled RustFS
+
+```bash
+cp .env.example .env
+# edit .env: production values (see below)
+make up && make logs
+```
+
+Production `.env` essentials:
+
+```bash
+BASE_DOMAIN=noite.now
+CONTROL_SUBDOMAIN=app
+BETTER_AUTH_URL=https://app.noite.now
+GIT_PUBLIC_BASE=https://git.noite.now
+RUNNER_TOKEN=<long-random>            # shared runner↔ui bearer token
+BETTER_AUTH_SECRET=<long-random>      # session signing secret
+RUSTFS_ACCESS_KEY=<key>               # default dev values must change
+RUSTFS_SECRET_KEY=<secret>
+```
+
+Set `BETTER_AUTH_URL` to the final URL **before** users register — passkeys are bound to it. Open `https://app.noite.now`, create the owner account (first signup), then deploy: `cd apps/noite/test && ./deploy.sh`.
+
+## B: your own bucket
+
+```bash
+S3_ENDPOINT=https://s3.us-east-1.amazonaws.com \
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+NOITE_S3_BUCKET=noite S3_PUBLIC_ENDPOINT=https://s3.us-east-1.amazonaws.com \
+docker compose -f compose.yaml -f compose.byob.yaml up -d --build runner ui caddy
+# or: export the vars above, then `make up-byob`
+```
+
+Key requirements: Get/Put/Delete/List on the bucket prefix. `ListAllMyBuckets` is optional (readiness falls back to `HeadBucket`). The bucket is created if the key allows, otherwise create it first. Same production `.env` as option A, minus the `RUSTFS_*` keys.
+
+## Verify
+
+```bash
+curl https://api.<domain>/health                    # runner
+curl -s https://api.<domain>/v1/apps -H "Authorization: Bearer $RUNNER_TOKEN"
+make logs                                           # runner + ui + caddy
+```
+
+Push the sample app via `apps/noite/test/deploy.sh` (point its remote at `https://git.<domain>/<slug>`) and open `https://<slug>.<domain>`.
+
+## Data & backups
+
+State lives in named volumes: `agent-data` (runner SQLite, git mirrors, fleet state), `ui-data` (control DB), `rustfs-data` (option A only). Back those up; images are disposable. `make down` keeps volumes, `make reset` deletes them.

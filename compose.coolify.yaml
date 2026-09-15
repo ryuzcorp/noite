@@ -1,0 +1,165 @@
+# Noite on Coolify — production Compose definition.
+#
+# HOW TO DEPLOY
+#   1. Coolify → New Resource → Docker Compose (Git repository):
+#        repository = your noite repo, branch = main,
+#        Compose file = compose.coolify.yaml, Base Directory = /.
+#   2. Environment Variables tab: everything below is pre-filled except the
+#      generated secrets (Coolify creates them on first parse — just save).
+#      Review BASE_DOMAIN / ports, then Deploy.
+#   3. Domains: attach a wildcard domain (e.g. *.noite.now) to the `caddy`
+#      service (port 80). Coolify terminates TLS; Caddy routes app./api./git
+#      plus every tenant slug internally (CADDY_AUTO_HTTPS=off below).
+#      The apex (noite.now) stays on your marketing site / GitHub Pages.
+#
+# NOTES
+#   - No `ports:` on caddy: published host ports bypass Coolify's proxy.
+#     RustFS keeps its ports (console + S3 API) — reassign if they clash.
+#   - No `container_name:`: Coolify manages container names itself.
+#   - Secrets use Coolify-generated values (persisted across deploys); the
+#     same variable referenced twice receives the same value.
+#   - First boot takes a few minutes (Rust release build); runner waits for
+#     RustFS readiness itself, so ordering needs no healthcheck gates.
+
+name: noite
+
+x-aws: &aws
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  AWS_ACCESS_KEY_ID: ${SERVICE_USER_RUSTFS}
+  AWS_SECRET_ACCESS_KEY: ${SERVICE_PASSWORD_64_RUSTFS}
+  AWS_EC2_METADATA_DISABLED: "true"
+
+services:
+  rustfs:
+    image: docker.io/rustfs/rustfs:1.0.0-rc.6
+    restart: unless-stopped
+    command: ["/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: ${SERVICE_USER_RUSTFS}
+      RUSTFS_SECRET_KEY: ${SERVICE_PASSWORD_64_RUSTFS}
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_OBS_LOGGER_LEVEL: error
+      # Notify/webhook disabled: RustFS cannot send a bearer token, the runner
+      # gate requires one — poll + deploy.sh nudge are the deploy triggers.
+    ports:
+      - "${RUSTFS_API_PORT:-9000}:9000"
+      - "${RUSTFS_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - rustfs-data:/data
+    networks: [noite]
+
+  runner:
+    build:
+      context: ./apps/runner
+      dockerfile: Dockerfile
+    image: noite-runner:coolify
+    hostname: runner
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      <<: *aws
+      RUNNER_BIND: "0.0.0.0:8080"
+      RUNNER_TOKEN: ${SERVICE_PASSWORD_64_RUNNER}
+      RUST_LOG: ${RUST_LOG:-noite_runner=info,tower_http=info}
+      NOITE_DB: /data/noite.sqlite
+      S3_ENDPOINT: http://rustfs:9000
+      S3_PUBLIC_ENDPOINT: http://rustfs:9000
+      NOITE_S3_BUCKET: ${NOITE_S3_BUCKET:-noite}
+      BASE_DOMAIN: ${BASE_DOMAIN:-noite.now}
+      CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-app}
+      CADDY_AUTO_HTTPS: "off"
+      CADDYFILE_PATH: /caddy/Caddyfile
+      CADDY_UPSTREAM_HOST: runner
+      CADDY_CONTROL_UPSTREAM: ui:8080
+      CADDY_API_UPSTREAM: runner:8080
+      RUNNER_WORK_DIR: /data/runner
+      PORT_BASE: "8100"
+      RUNNER_POLL_MS: "5000"
+      CELLD_BIN: celld
+      GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-https://git.noite.now}
+      UI_URL: ${UI_URL:-http://ui:8080}
+    volumes:
+      - agent-data:/data
+      - caddy-config:/caddy
+    networks: [noite]
+    depends_on:
+      - rustfs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+
+  ui:
+    # Immutable image: deps + vite build baked at `docker build` time.
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.control
+    image: noite-control-ui:coolify
+    hostname: ui
+    restart: unless-stopped
+    stop_grace_period: 15s
+    environment:
+      <<: *aws
+      PORT: "8080"
+      RUNNER_URL: http://runner:8080
+      RUNNER_TOKEN: ${SERVICE_PASSWORD_64_RUNNER}
+      BETTER_AUTH_SECRET: ${SERVICE_PASSWORD_64_AUTH}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-https://app.noite.now}
+      BASE_DOMAIN: ${BASE_DOMAIN:-noite.now}
+      CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-app}
+      NOITE_DB: /data/noite-control.sqlite
+    volumes:
+      - ui-data:/data
+    networks: [noite]
+    depends_on:
+      - rustfs
+      - runner
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+  caddy:
+    image: docker.io/library/caddy:2.10.0-alpine
+    restart: unless-stopped
+    expose:
+      - "80"
+      - "443"
+    volumes:
+      - caddy-config:/etc/caddy
+      - caddy-data:/data
+    command:
+      - /bin/sh
+      - -c
+      - |
+        # Single owner for routes: the runner rewrites this file every reconcile
+        # (5 s). We only make sure the file exists so `caddy run` can start
+        # before the runner's first write; empty config runs fine in --watch.
+        [ -f /etc/caddy/Caddyfile ] || printf '%s\n' '# noite-edge' > /etc/caddy/Caddyfile
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile --watch
+    networks: [noite]
+    depends_on:
+      - runner
+      - ui
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O/dev/null", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+networks:
+  noite:
+
+volumes:
+  rustfs-data:
+  agent-data:
+  ui-data:
+  caddy-config:
+  caddy-data:

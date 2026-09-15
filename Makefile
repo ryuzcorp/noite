@@ -25,12 +25,14 @@ ifdef DISTROBOX
   export PODMAN_SOCK := /run/user/$(shell id -u)/podman/podman.sock
 endif
 
-.PHONY: help up down reset logs rebuild restart deploy-test dev
+.PHONY: help up up-byob down reset logs rebuild restart deploy-test dev
 
 COMPOSE_DEV := $(COMPOSE) -f compose.yaml -f compose.dev.yaml
+COMPOSE_BYOB := $(COMPOSE) -f compose.yaml -f compose.byob.yaml
 
 help:
 	@echo "  make up          start stack (release runner + Oxide UI)"
+	@echo "  make up-byob     start stack against external S3 (no rustfs)"
 	@echo "  make dev         hot reload (runner cargo-watch + Oxide Vite)"
 	@echo "  make logs        follow runner + ui + rustfs + caddy"
 	@echo "  make down        stop stack (keeps data volumes)"
@@ -45,6 +47,13 @@ help:
 up:
 	$(COMPOSE) build runner ui
 	$(COMPOSE) up -d rustfs runner ui caddy
+	@echo "open http://localhost:$${HTTP_PORT:-9080}"
+
+# BYOB: external S3 (no bundled rustfs). Requires S3_ENDPOINT,
+# AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_PUBLIC_ENDPOINT in env.
+up-byob:
+	$(COMPOSE_BYOB) build runner ui
+	$(COMPOSE_BYOB) up -d runner ui caddy
 	@echo "open http://localhost:$${HTTP_PORT:-9080}"
 
 dev:

@@ -1,0 +1,33 @@
+# BYOB: bring your own S3-compatible bucket instead of bundled RustFS.
+#
+#   S3_ENDPOINT=https://s3.us-east-1.amazonaws.com \
+#   AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+#   NOITE_S3_BUCKET=noite S3_PUBLIC_ENDPOINT=https://s3.us-east-1.amazonaws.com \
+#   docker compose -f compose.yaml -f compose.byob.yaml up -d --build runner ui caddy
+#
+# Works with AWS S3, MinIO, R2, Ceph — anything SigV4. The runner only needs
+# Get/Put/Delete/List on its bucket prefix; ListAllMyBuckets is optional
+# (readiness falls back to HeadBucket). Bucket is created if missing and the
+# key allows it, otherwise it must already exist.
+services:
+  rustfs:
+    # Excluded from BYOB runs — start it explicitly only for local dev.
+    profiles: ["bundled-s3"]
+
+  runner:
+    depends_on: []
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?}
+      S3_ENDPOINT: ${S3_ENDPOINT:?}
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:?}
+      NOITE_S3_BUCKET: ${NOITE_S3_BUCKET:-noite}
+
+  ui:
+    depends_on:
+      - runner
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?}
+      S3_ENDPOINT: ${S3_ENDPOINT:?}
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:?}

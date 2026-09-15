@@ -9,7 +9,7 @@
 - **Source:** stock Git smart-HTTP at `http://git.$BASE_DOMAIN/{slug}` (Basic `git` / profile API key; collaborator `view`/`push`) → runner writes tip `s3://noite/git/{slug}/refs/heads/main/{sha}.bundle` + a `MANIFEST.json` linearization point
 - **Deploy:** push to `main` (and/or tip poll / webhook) → bare mirror + checkout → build → `celld deploy` → reload
 - **Isolation:** one app = one fleet; never share `deploy/current.json`
-- **Edge:** Caddy — control on bare `$BASE_DOMAIN` locally (`https://app.noite.now` in prod via `CONTROL_SUBDOMAIN=app`) + `api.` + `git.` + `{app}.$BASE_DOMAIN` (prod `https://{app}.noite.now`; `app`/`api`/`git` slugs reserved)
+- **Edge:** Caddy — control on bare `$BASE_DOMAIN` locally (`https://app.noite.now` in prod via `CONTROL_SUBDOMAIN=app`) + `api.` + `git.` + `{app}.$BASE_DOMAIN` (prod `https://{app}.noite.now`; `app`/`api`/`git` slugs reserved) Behind a terminating proxy (Coolify), `CADDY_AUTO_HTTPS=off`; see `compose.coolify.yaml`.
 - **Effect:** prefer `Effect` / `Config` / `Schedule` / `Schema` / `HttpClient` / `Layer` over ad-hoc async
 
 ## Status (2026-09-15)

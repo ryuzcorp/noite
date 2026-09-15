@@ -91,7 +91,30 @@ pub async fn ensure_buckets(cfg: &Config) -> anyhow::Result<()> {
         }
     }
     if !ready {
-        bail!("s3 not ready at {} after 60s", cfg.s3_endpoint);
+        // BYOB keys are often scoped to one bucket without ListAllMyBuckets:
+        // accept a reachable bucket instead of failing readiness.
+        let bucket = cfg.s3_bucket.as_str();
+        let headed = run_cmd(
+            "aws",
+            &[
+                "--endpoint-url",
+                &cfg.s3_endpoint,
+                "s3api",
+                "head-bucket",
+                "--bucket",
+                bucket,
+            ],
+            None,
+            &env,
+            Duration::from_secs(15),
+        )
+        .await
+        .is_ok();
+        if headed {
+            tracing::info!(bucket, "s3 list denied but bucket reachable (BYOB?) — continuing");
+        } else {
+            bail!("s3 not ready at {} after 60s", cfg.s3_endpoint);
+        }
     }
 
     let bucket = cfg.s3_bucket.as_str();

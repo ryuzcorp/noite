@@ -5,7 +5,8 @@ use crate::models::App;
 
 pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
     let local = cfg.base_domain == "localhost";
-    let auto_https = if local { "off" } else { "on" };
+    let auto_https = if cfg.auto_https { "on" } else { "off" };
+    let plain = local || !cfg.auto_https;
     // Control plane lives on the bare domain when CONTROL_SUBDOMAIN is empty
     // (dev `localhost` — the only hostname Bitwarden's matcher accepts
     // without https) or on `{sub}.{domain}` in prod (`app`, apex stays free
@@ -17,7 +18,7 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
         format!("{}.{}", cfg.control_subdomain, cfg.base_domain)
     };
     let site = |host: &str| -> String {
-        if local {
+        if plain {
             format!("http://{host}")
         } else {
             host.to_string()
