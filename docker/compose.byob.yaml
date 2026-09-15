@@ -3,7 +3,7 @@
 #   S3_ENDPOINT=https://s3.us-east-1.amazonaws.com \
 #   AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
 #   NOITE_S3_BUCKET=noite S3_PUBLIC_ENDPOINT=https://s3.us-east-1.amazonaws.com \
-#   docker compose -f compose.yaml -f compose.byob.yaml up -d --build runner ui caddy
+#   docker compose --project-directory . -f docker/compose.yaml -f docker/compose.byob.yaml up -d --build runner ui caddy
 #
 # Works with AWS S3, MinIO, R2, Ceph — anything SigV4. The runner only needs
 # Get/Put/Delete/List on its bucket prefix; ListAllMyBuckets is optional

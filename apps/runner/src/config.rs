@@ -2,6 +2,14 @@ use std::env;
 
 /// Caddy `auto_https`: explicit off wins (behind-proxy deployments like
 /// Coolify, which terminates TLS itself); otherwise on except `localhost`.
+/// Comma-separated hostname list (`CONTROL_EXTRA_HOSTS`).
+fn parse_host_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn parse_auto_https(raw: Option<&str>, base_domain: &str) -> bool {
     match raw {
         Some("off") | Some("0") | Some("false") => false,
@@ -38,6 +46,9 @@ pub struct Config {
     /// only hostname Bitwarden's matcher accepts without https); prod sets
     /// `app` so control serves `app.{BASE_DOMAIN}` and the apex stays free.
     pub control_subdomain: String,
+    /// Extra hostnames serving the control UI (comma-separated
+    /// `CONTROL_EXTRA_HOSTS`) — e.g. Coolify's generated domain.
+    pub control_extra_hosts: Vec<String>,
     pub work_dir: String,
     pub caddyfile_path: String,
     pub celld_bin: String,
@@ -109,6 +120,9 @@ impl Config {
                 .unwrap_or_else(|_| "noitesecretnoitesecretnoite12".into()),
             base_domain,
             control_subdomain: env::var("CONTROL_SUBDOMAIN").unwrap_or_default(),
+            control_extra_hosts: env::var("CONTROL_EXTRA_HOSTS")
+                .map(|v| parse_host_list(&v))
+                .unwrap_or_default(),
             work_dir: env_or(
                 &["RUNNER_WORK_DIR", "HOST_WORK_DIR", "AGENT_WORK_DIR"],
                 "/data/runner",
@@ -188,6 +202,15 @@ mod tests {
     #[test]
     fn auto_https_explicit_on_wins() {
         assert!(parse_auto_https(Some("on"), "localhost"));
+    }
+
+    #[test]
+    fn extra_hosts_split_and_trim() {
+        assert!(parse_host_list("").is_empty());
+        assert_eq!(
+            parse_host_list("a.example.com, b.example.com,,"),
+            vec!["a.example.com", "b.example.com"]
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Compose — run from repo root.
 
-COMPOSE ?= $(shell command -v docker >/dev/null 2>&1 && echo 'docker compose' || echo 'podman compose')
+COMPOSE ?= $(shell command -v docker >/dev/null 2>&1 && echo 'docker compose' || echo 'podman compose') --project-directory $(CURDIR) -f docker/compose.yaml
 
 -include .env
 export
@@ -27,8 +27,8 @@ endif
 
 .PHONY: help up up-byob down reset logs rebuild restart deploy-test dev
 
-COMPOSE_DEV := $(COMPOSE) -f compose.yaml -f compose.dev.yaml
-COMPOSE_BYOB := $(COMPOSE) -f compose.yaml -f compose.byob.yaml
+COMPOSE_DEV := $(COMPOSE) -f docker/compose.dev.yaml
+COMPOSE_BYOB := $(COMPOSE) -f docker/compose.byob.yaml
 
 help:
 	@echo "  make up          start stack (release runner + Oxide UI)"

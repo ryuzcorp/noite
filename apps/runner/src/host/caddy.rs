@@ -12,11 +12,16 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
     // without https) or on `{sub}.{domain}` in prod (`app`, apex stays free
     // for marketing). `http://` pins plain HTTP for dev; prod uses bare
     // hostnames so auto_https serves https://app.{domain} + https://{app}.{domain}.
-    let control_host = if cfg.control_subdomain.is_empty() {
+    let mut control_hosts = vec![if cfg.control_subdomain.is_empty() {
         cfg.base_domain.clone()
     } else {
         format!("{}.{}", cfg.control_subdomain, cfg.base_domain)
-    };
+    }];
+    // Extra control hostnames (e.g. Coolify's generated domain) share the
+    // control site so the auto-provisioned route serves the UI, not the
+    // unknown-host fallback.
+    control_hosts.extend(cfg.control_extra_hosts.iter().cloned());
+    let control_site = control_hosts.join(", ");
     let site = |host: &str| -> String {
         if plain {
             format!("http://{host}")
@@ -30,7 +35,7 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
         format!("\tauto_https {auto_https}"),
         "}".into(),
         String::new(),
-        format!("{}, http://127.0.0.1 {{", site(&control_host)),
+        format!("{}, http://127.0.0.1 {{", site(&control_site)),
         format!("\treverse_proxy {} {{", cfg.caddy_control_upstream),
         "\t\theader_up Host {http.request.hostport}".into(),
         "\t\tflush_interval -1".into(),

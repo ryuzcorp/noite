@@ -1,16 +1,29 @@
+# documentation: https://noite.dev
+# slogan: Tiny self-hostable PaaS for celld
+# category: PaaS
+# tags: paas,celld,git,edge,s3
+# port: 80
+# (No `# logo:` — this file deploys from our repo, not as an upstream
+# Coolify service template.)
+#
 # Noite on Coolify — production Compose definition.
 #
 # HOW TO DEPLOY
 #   1. Coolify → New Resource → Docker Compose (Git repository):
 #        repository = your noite repo, branch = main,
-#        Compose file = compose.coolify.yaml, Base Directory = /.
-#   2. Environment Variables tab: everything below is pre-filled except the
-#      generated secrets (Coolify creates them on first parse — just save).
-#      Review BASE_DOMAIN / ports, then Deploy.
-#   3. Domains: attach a wildcard domain (e.g. *.noite.now) to the `caddy`
-#      service (port 80). Coolify terminates TLS; Caddy routes app./api./git
+#        Compose file = docker/compose.coolify.yaml, Base Directory = /.
+#   2. Environment Variables tab: secrets auto-generate on first parse
+#      (just save); BASE_DOMAIN is required and blocks deploy until set.
+#      BETTER_AUTH_URL / GIT_PUBLIC_BASE derive from BASE_DOMAIN unless
+#      overridden. Review ports, then Deploy.
+#   3. Domains: automatic. `SERVICE_URL_CADDY_80` provisions Coolify's
+#      generated domain and routes it to `caddy:80`; the runner adds the
+#      generated hostname (`SERVICE_FQDN_CADDY_80`) to the control site via
+#      CONTROL_EXTRA_HOSTS, so first boot serves the UI with zero manual
+#      domain steps. Coolify terminates TLS; Caddy routes app./api./git
 #      plus every tenant slug internally (CADDY_AUTO_HTTPS=off below).
-#      The apex (noite.now) stays on your marketing site / GitHub Pages.
+#      Add your real domains later (`app.`/`api.`/`git.`/`*.slug`) in the
+#      `caddy` service Domains field; the apex stays on marketing/GitHub Pages.
 #
 # NOTES
 #   - No `ports:` on caddy: published host ports bypass Coolify's proxy.
@@ -67,18 +80,19 @@ services:
       S3_ENDPOINT: http://rustfs:9000
       S3_PUBLIC_ENDPOINT: http://rustfs:9000
       NOITE_S3_BUCKET: ${NOITE_S3_BUCKET:-noite}
-      BASE_DOMAIN: ${BASE_DOMAIN:-noite.now}
+      BASE_DOMAIN: ${BASE_DOMAIN:?}
       CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-app}
       CADDY_AUTO_HTTPS: "off"
       CADDYFILE_PATH: /caddy/Caddyfile
       CADDY_UPSTREAM_HOST: runner
       CADDY_CONTROL_UPSTREAM: ui:8080
       CADDY_API_UPSTREAM: runner:8080
+      CONTROL_EXTRA_HOSTS: ${SERVICE_FQDN_CADDY_80}
       RUNNER_WORK_DIR: /data/runner
       PORT_BASE: "8100"
       RUNNER_POLL_MS: "5000"
       CELLD_BIN: celld
-      GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-https://git.noite.now}
+      GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-https://git.${BASE_DOMAIN}}
       UI_URL: ${UI_URL:-http://ui:8080}
     volumes:
       - agent-data:/data
@@ -108,8 +122,8 @@ services:
       RUNNER_URL: http://runner:8080
       RUNNER_TOKEN: ${SERVICE_PASSWORD_64_RUNNER}
       BETTER_AUTH_SECRET: ${SERVICE_PASSWORD_64_AUTH}
-      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-https://app.noite.now}
-      BASE_DOMAIN: ${BASE_DOMAIN:-noite.now}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-https://app.${BASE_DOMAIN}}
+      BASE_DOMAIN: ${BASE_DOMAIN:?}
       CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-app}
       NOITE_DB: /data/noite-control.sqlite
     volumes:
@@ -128,6 +142,9 @@ services:
   caddy:
     image: docker.io/library/caddy:2.10.0-alpine
     restart: unless-stopped
+    environment:
+      # Auto-provision Coolify's generated domain and route it to caddy:80.
+      SERVICE_URL_CADDY_80: /
     expose:
       - "80"
       - "443"

@@ -76,7 +76,7 @@ services:
   ui:
     # Immutable image: deps + vite build baked at `docker build` time
     # (docker/Dockerfile.control). No source bind mount, no npm at boot.
-    # Dev HMR keeps the tools image + bind mount — see compose.dev.yaml.
+    # Dev HMR keeps the tools image + bind mount — see docker/compose.dev.yaml.
     build:
       context: .
       dockerfile: docker/Dockerfile.control

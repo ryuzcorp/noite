@@ -9,7 +9,7 @@
 - **Source:** stock Git smart-HTTP at `http://git.$BASE_DOMAIN/{slug}` (Basic `git` / profile API key; collaborator `view`/`push`) → runner writes tip `s3://noite/git/{slug}/refs/heads/main/{sha}.bundle` + a `MANIFEST.json` linearization point
 - **Deploy:** push to `main` (and/or tip poll / webhook) → bare mirror + checkout → build → `celld deploy` → reload
 - **Isolation:** one app = one fleet; never share `deploy/current.json`
-- **Edge:** Caddy — control on bare `$BASE_DOMAIN` locally (`https://app.noite.now` in prod via `CONTROL_SUBDOMAIN=app`) + `api.` + `git.` + `{app}.$BASE_DOMAIN` (prod `https://{app}.noite.now`; `app`/`api`/`git` slugs reserved) Behind a terminating proxy (Coolify), `CADDY_AUTO_HTTPS=off`; see `compose.coolify.yaml`.
+- **Edge:** Caddy — control on bare `$BASE_DOMAIN` locally (`https://app.noite.now` in prod via `CONTROL_SUBDOMAIN=app`) + `api.` + `git.` + `{app}.$BASE_DOMAIN` (prod `https://{app}.noite.now`; `app`/`api`/`git` slugs reserved) Behind a terminating proxy (Coolify), `CADDY_AUTO_HTTPS=off`; see `docker/compose.coolify.yaml`.
 - **Effect:** prefer `Effect` / `Config` / `Schedule` / `Schema` / `HttpClient` / `Layer` over ad-hoc async
 
 ## Status (2026-09-15)
@@ -20,7 +20,7 @@ Working end-to-end on rootless Podman Compose (repo root).
 
 | Area | Notes |
 | --- | --- |
-| Compose stack | `rustfs`, `runner`, `ui`, `caddy` — `compose.yaml` at repo root |
+| Compose stack | `rustfs`, `runner`, `ui`, `caddy` — `docker/compose.yaml` (Compose files live under `docker/`) |
 | Ports | Host **9080/9443**; control `http://localhost:9080`; API `http://api.localhost:9080`; apps `http://{slug}.localhost:9080` |
 | Runner | **Rust** (`apps/runner`) — deploy, fleets, caddy; ensures the single `NOITE_S3_BUCKET` bucket on boot |
 | Control UI | **Oxide** (`apps/noite`) — passkeys + actions proxying to runner |
@@ -85,7 +85,7 @@ Ordered by payoff. Each item: what · why · files. W1 is mechanical and safe; W
 
 ### Wave 3 — structural
 
-- [x] **W3.1 Immutable UI image** · prod no longer bind-mounts source and `bun install` + `vite build` per boot; `docker/Dockerfile.control` bakes deps + dist at `docker build` time (immutable, no npm at runtime) · entrypoint `docker/noite-prod.sh` (secret gate + start) · prod compose ui = image + `ui-data` only · dev (`make dev`) still uses the tools image + bind mount + `docker/noite.sh` HMR — see `compose.dev.yaml`
+- [x] **W3.1 Immutable UI image** · prod no longer bind-mounts source and `bun install` + `vite build` per boot; `docker/Dockerfile.control` bakes deps + dist at `docker build` time (immutable, no npm at runtime) · entrypoint `docker/noite-prod.sh` (secret gate + start) · prod compose ui = image + `ui-data` only · dev (`make dev`) still uses the tools image + bind mount + `docker/noite.sh` HMR — see `docker/compose.dev.yaml`
 - [ ] **W3.2 UI DB mirror consolidation — deferred, showcase** · the UI keeps its own `app`/`app_secret`/`deploy` copy + 1-min `sync-apps` schedule + `runner-op` queue/workflow + liveQuery topics mirroring the runner. The runner is already the source of truth behind a bearer-gated REST API and single-writer SQLite; consolidating would remove the mirror + drift at the cost of deleting the Oxide schedule/queue/workflow showcase. **Kept deliberately** (creator decision) — revisit only if the dual-write actually bites
 
 Acceptance: `make up` cold build < 30 s · Git-HTTP push → app live ≤ poll + build · `make down` preserves `agent-data` + `ui-data` · no legacy `_control` worker image.
@@ -137,7 +137,7 @@ make up
 make deploy-test   # sample push via Git HTTP → deploy
 ```
 
-Infra: `compose.yaml`, `docker/`, `Makefile` at repo root.
+Infra: `docker/compose.yaml`, `docker/`, `Makefile` at repo root.
 
 ## Out of scope for v1
 

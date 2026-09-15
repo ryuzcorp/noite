@@ -27,7 +27,7 @@ Ground truth for working on Noite. Read this before touching code — the rules 
 - `apps/noite` — Oxide/ilha control UI (passkeys, actions, source-preview, metrics card). Web root is `apps/noite/src`.
 - `apps/runner` — the Rust runner (deploy, fleets, Caddyfile, metrics). Plain folder rename from `apps/noite-runner`.
 - `apps/noite/test` — sample app + `deploy.sh`; also a nested git repo.
-- `docker/` — image definitions + entrypoints; `compose.yaml` / `compose.dev.yaml` / `Makefile` at the root.
+- `docker/` — image definitions + entrypoints + Compose files (`docker/compose.yaml`, `docker/compose.dev.yaml`, `docker/compose.byob.yaml`, `docker/compose.coolify.yaml`); `Makefile` at the root.
 - URLs: control UI `http://localhost:9080` (prod `https://app.noite.now` via `CONTROL_SUBDOMAIN=app`; bare `localhost` is the only non-https hostname Bitwarden accepts), runner REST `http://api.localhost:9080`, Git HTTP `http://git.localhost:9080/{slug}`, rustfs S3 `:9000`, console `:9001`, deployed apps `http://{slug}.localhost:9080` (prod `https://{slug}.noite.now`; `app`/`api`/`git` slugs reserved).
 
 | Piece | Role | Owner of what |

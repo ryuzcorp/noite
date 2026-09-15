@@ -14,9 +14,9 @@ make logs
 | `apps/runner` | Rust runner (deploy, fleets, caddy) |
 | `apps/noite` | Oxide control UI (passkeys, workflow/queue/schedule → runner) |
 | `apps/noite/test` | sample app + `deploy.sh` |
-| `compose.yaml` | stack |
-| `compose.coolify.yaml` | production stack for Coolify (no published edge ports, generated secrets, healthchecks) |
-| `compose.byob.yaml` | external-S3 overlay (`make up-byob`), bundled RustFS excluded |
+| `docker/compose.yaml` | stack |
+| `docker/compose.coolify.yaml` | production stack for Coolify (automatic generated domain, generated secrets, healthchecks) |
+| `docker/compose.byob.yaml` | external-S3 overlay (`make up-byob`), bundled RustFS excluded |
 
 | URL                            |                       |
 | ------------------------------ | --------------------- |
@@ -26,4 +26,4 @@ make logs
 
 ## Deploy to Coolify
 
-Point a Docker Compose resource at `compose.coolify.yaml` (repo root, branch `main`). Fill Environment Variables (secrets auto-generate on first parse — just save), attach a wildcard domain (`*.noite.now`) to the `caddy` service (port 80), Deploy. Coolify terminates TLS; Caddy routes `app.`/`api.`/`git.` plus every tenant slug internally. The apex stays on your marketing site.
+Point a Docker Compose resource at `docker/compose.coolify.yaml` (repo root, branch `main`). In Environment Variables, set the required `BASE_DOMAIN` (secrets auto-generate — just save); `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` derive from it unless overridden. Deploy: Coolify auto-provisions a generated domain for the `caddy` service and the runner serves the control UI on it. Coolify terminates TLS; Caddy routes `app.`/`api.`/`git.` plus every tenant slug internally. Add real domains later; the apex stays on your marketing site.

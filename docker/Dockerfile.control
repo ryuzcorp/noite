@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Immutable control-UI image: deps + `vite build` are baked at image build
 # time. Runtime needs no npm registry and no bind mount — dev keeps
-# docker/Dockerfile.tools + HMR (see compose.dev.yaml).
+# docker/Dockerfile.tools + HMR (see docker/compose.dev.yaml).
 #
 # Build context is the repo root (see .dockerignore) so we can COPY both the
 # app source and the production entrypoint script.
