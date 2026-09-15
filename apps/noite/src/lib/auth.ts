@@ -1,0 +1,259 @@
+/* eslint-disable max-classes-per-file -- tagged Fail types for auth */
+/* eslint-disable func-names -- Effect.gen uses anonymous generators */
+import { apiKey } from "@better-auth/api-key";
+import { passkey } from "@better-auth/passkey";
+import { betterAuth } from "better-auth";
+import { APIError } from "better-auth/api";
+import { admin } from "better-auth/plugins";
+import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
+import { OxideRequest } from "oxidejs";
+
+import { ensureDbPromise, getAuthDb, missingDb } from "./db";
+
+// oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
+export class MissingAuthSecretError extends Schema.TaggedError<MissingAuthSecretError>()(
+  "MissingAuthSecretError",
+  { message: Schema.String }
+) {}
+
+// oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
+export class UnauthorizedError extends Schema.TaggedError<UnauthorizedError>()(
+  "UnauthorizedError",
+  { message: Schema.String }
+) {}
+
+// oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
+export class ActionError extends Schema.TaggedError<ActionError>()(
+  "ActionError",
+  { message: Schema.String }
+) {}
+
+export const failAction = (message: string): never => {
+  throw new ActionError({ message });
+};
+
+// oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
+class InvalidRegistrationContextError extends Schema.TaggedError<InvalidRegistrationContextError>()(
+  "InvalidRegistrationContextError",
+  { message: Schema.String }
+) {}
+
+const RegistrationContext = Schema.Struct({
+  email: Schema.String,
+  name: Schema.String,
+});
+
+const parseRegistration = (context: string | null | undefined) =>
+  Effect.gen(function* () {
+    if (!context) {
+      return yield* Effect.fail(
+        new InvalidRegistrationContextError({
+          message: "Registration context is required",
+        })
+      );
+    }
+    const raw = yield* Effect.try({
+      catch: () =>
+        new InvalidRegistrationContextError({
+          message: "Registration context must be JSON",
+        }),
+      try: () => {
+        try {
+          return JSON.parse(context);
+        } catch {
+          throw new InvalidRegistrationContextError({
+            message: "Registration context must be JSON",
+          });
+        }
+      },
+    });
+    const decoded = yield* Schema.decodeUnknownEffect(RegistrationContext)(
+      raw
+    ).pipe(
+      Effect.mapError(
+        () =>
+          new InvalidRegistrationContextError({
+            message: "Registration context needs email and name strings",
+          })
+      )
+    );
+    const email = decoded.email.trim().toLowerCase();
+    const name = decoded.name.trim();
+    if (!(email && name)) {
+      return yield* Effect.fail(
+        new InvalidRegistrationContextError({
+          message: "Email and name must be non-empty",
+        })
+      );
+    }
+    return { email, name };
+  });
+
+const requireRegistration = (context: string | null | undefined) => {
+  try {
+    return Effect.runSync(parseRegistration(context));
+  } catch (error) {
+    if (error instanceof InvalidRegistrationContextError) {
+      throw APIError.from("BAD_REQUEST", {
+        code: "INVALID_REGISTRATION_CONTEXT",
+        message: error.message,
+      });
+    }
+    throw error;
+  }
+};
+
+/** Hostname for the passkey RP ID. Bad config must fail loud (a silent
+ * fallback would misbind passkeys), surfaced as the mapped 500. */
+const rpHostname = (baseURL: string): string => {
+  try {
+    return new URL(baseURL).hostname;
+  } catch {
+    throw new MissingAuthSecretError({
+      message: "noite: BETTER_AUTH_URL is invalid",
+    });
+  }
+};
+
+export const createAuth = (
+  env: { BETTER_AUTH_SECRET: string; BETTER_AUTH_URL?: string },
+  baseURL: string
+) =>
+  betterAuth({
+    advanced: {
+      database: {
+        validateSchema: false,
+      },
+    },
+    baseURL,
+    database: getAuthDb(),
+    plugins: [
+      admin({ defaultRole: "user" }),
+      apiKey({
+        defaultPrefix: "noite_",
+        enableMetadata: false,
+        rateLimit: {
+          enabled: false,
+          maxRequests: 10_000,
+          timeWindow: 1000 * 60 * 60 * 24,
+        },
+        requireName: true,
+      }),
+      passkey({
+        registration: {
+          afterVerification: async ({ context, ctx }) => {
+            const parsed = requireRegistration(context);
+            const existing = await ctx.context.internalAdapter.findUserByEmail(
+              parsed.email
+            );
+            if (existing?.user) {
+              throw APIError.from("BAD_REQUEST", {
+                code: "USER_ALREADY_EXISTS",
+                message:
+                  "An account with this email already exists. Sign in instead.",
+              });
+            }
+            const user = await ctx.context.internalAdapter.createUser(
+              {
+                email: parsed.email,
+                emailVerified: true,
+                name: parsed.name,
+              },
+              { method: "passkey" }
+            );
+            return { userId: user.id };
+          },
+          requireSession: false,
+          resolveUser: ({ context }) => {
+            const parsed = requireRegistration(context);
+            return {
+              displayName: parsed.name,
+              id: crypto.randomUUID(),
+              name: parsed.email,
+            };
+          },
+        },
+        rpID: rpHostname(baseURL),
+        rpName: "Noite",
+      }),
+    ],
+    secret: env.BETTER_AUTH_SECRET,
+  });
+
+export const authFromEnv = (env: KitEnv, origin: string) => {
+  if (!env.BETTER_AUTH_SECRET) {
+    throw new MissingAuthSecretError({
+      message: "noite: BETTER_AUTH_SECRET is missing",
+    });
+  }
+  return createAuth(
+    {
+      BETTER_AUTH_SECRET: env.BETTER_AUTH_SECRET,
+      BETTER_AUTH_URL: env.BETTER_AUTH_URL,
+    },
+    env.BETTER_AUTH_URL ?? origin
+  );
+};
+
+export const authFromEnvEffect = (env: KitEnv, origin: string) =>
+  Effect.gen(function* () {
+    if (!env.BETTER_AUTH_SECRET) {
+      return yield* Effect.fail(
+        new MissingAuthSecretError({
+          message: "noite: BETTER_AUTH_SECRET is missing",
+        })
+      );
+    }
+    return createAuth(
+      {
+        BETTER_AUTH_SECRET: env.BETTER_AUTH_SECRET,
+        BETTER_AUTH_URL: env.BETTER_AUTH_URL,
+      },
+      env.BETTER_AUTH_URL ?? origin
+    );
+  });
+
+export interface SessionUser {
+  email: string;
+  id: string;
+  name: string;
+}
+
+export const requireUser = Effect.gen(function* () {
+  const request = yield* OxideRequest;
+  // SAFETY: globalThis.process is a read-only lookup, never mutated here; when present its env carries the same KitEnv keys used everywhere else.
+  const env = (globalThis as { process?: { env?: KitEnv } }).process?.env ?? {};
+  yield* Effect.promise(() => ensureDbPromise());
+  if (!env.BETTER_AUTH_SECRET && !process.env.BETTER_AUTH_SECRET) {
+    return yield* Effect.fail(missingDb());
+  }
+  // Malformed request URL must 401 like a missing session, never defect.
+  let origin: string;
+  try {
+    ({ origin } = new URL(request.url));
+  } catch {
+    return yield* Effect.fail(
+      new UnauthorizedError({ message: "Sign in required" })
+    );
+  }
+  const auth = yield* authFromEnvEffect(
+    {
+      BETTER_AUTH_SECRET:
+        env.BETTER_AUTH_SECRET ?? process.env.BETTER_AUTH_SECRET,
+      BETTER_AUTH_URL: env.BETTER_AUTH_URL ?? process.env.BETTER_AUTH_URL,
+    },
+    origin
+  );
+  const session = yield* Effect.tryPromise({
+    catch: () => new UnauthorizedError({ message: "Sign in required" }),
+    try: () => auth.api.getSession({ headers: request.headers }),
+  });
+  const user = session?.user;
+  if (!user) {
+    return yield* Effect.fail(
+      new UnauthorizedError({ message: "Sign in required" })
+    );
+  }
+  return { email: user.email, id: user.id, name: user.name };
+});

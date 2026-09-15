@@ -1,0 +1,18 @@
+{
+  "name": "counter",
+  "main": "index.js",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": {
+    "bindings": [{ "name": "COUNTER", "class_name": "Counter" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }],
+  "r2_buckets": [{ "binding": "FILES", "bucket_name": "uploads" }],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "demo",
+      "database_id": "demo",
+      "migrations_dir": "migrations",
+    },
+  ],
+}

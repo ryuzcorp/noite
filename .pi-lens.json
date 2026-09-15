@@ -1,0 +1,7 @@
+{
+  "rules": {
+    "shellcheck-14-1073": { "disable": true },
+    "shellcheck-14-1050": { "disable": true },
+    "shellcheck-14-1072": { "disable": true }
+  }
+}

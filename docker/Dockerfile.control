@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1
+# Immutable control-UI image: deps + `vite build` are baked at image build
+# time. Runtime needs no npm registry and no bind mount — dev keeps
+# docker/Dockerfile.tools + HMR (see compose.dev.yaml).
+#
+# Build context is the repo root (see .dockerignore) so we can COPY both the
+# app source and the production entrypoint script.
+FROM docker.io/oven/bun:1.3-debian
+
+ARG TARGETARCH
+COPY apps/noite /app
+COPY docker/noite-prod.sh /entrypoint.sh
+WORKDIR /app
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends curl ca-certificates \
+  && rm -rf /var/lib/apt/lists/* \
+  && chmod +x /entrypoint.sh \
+  && bun install --frozen-lockfile \
+  && bun run build
+
+ENV PORT=8080
+EXPOSE 8080
+ENTRYPOINT ["/bin/sh", "/entrypoint.sh"]

@@ -1,0 +1,7 @@
+# Local wrangler / celld secrets (copy to `.dev.vars`).
+
+BETTER_AUTH_SECRET=dev-only-change-me-to-a-long-random-string
+BETTER_AUTH_URL=http://127.0.0.1:8080
+BASE_DOMAIN=localhost
+RUNNER_TOKEN=dev-runner-token
+S3_ENDPOINT=http://127.0.0.1:9000

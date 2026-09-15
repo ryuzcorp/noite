@@ -1,0 +1,45 @@
+# Dev overlay: runner cargo-watch + Oxide Vite HMR.
+#   make dev
+# ui flips back to the tools image + source bind mount + docker/noite.sh
+# (HMR); prod compose uses the immutable docker/Dockerfile.control image.
+services:
+  runner:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.runner-dev
+    image: noite-runner-dev:local
+    volumes:
+      - ./apps/runner:/src
+      - ./docker/runner-dev.sh:/runner-dev.sh:ro
+      - runner-cargo-registry:/usr/local/cargo/registry
+      - runner-cargo-git:/usr/local/cargo/git
+      - runner-target:/src/target
+      - agent-data:/data
+      - caddy-config:/caddy
+    working_dir: /src
+    environment:
+      RUST_LOG: ${RUST_LOG:-noite_runner=debug,tower_http=info}
+      CARGO_TERM_COLOR: always
+    command: ["/bin/sh", "/runner-dev.sh"]
+
+  ui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.tools
+    image: noite-tools:local
+    working_dir: /app
+    environment:
+      NOITE_MODE: ${NOITE_MODE:-dev}
+    volumes:
+      - ./apps/noite:/app
+      - ./docker/noite.sh:/noite.sh:ro
+      - ./docker/noite-dev.sh:/noite-dev.sh:ro
+      - ui-data:/data
+      - bun-cache:/root/.bun/install/cache
+    command: ["/bin/sh", "/noite.sh"]
+
+volumes:
+  runner-cargo-registry:
+  runner-cargo-git:
+  runner-target:
+  bun-cache:

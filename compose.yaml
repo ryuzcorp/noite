@@ -1,0 +1,138 @@
+# Noite stack: Rust runner + Oxide control UI + RustFS + Caddy.
+#
+#   cp .env.example .env && make up && make logs
+#
+# Apex → Oxide (passkeys + actions). api.* → runner. <slug> → tenant fleets.
+
+name: noite
+
+x-aws: &aws
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:-noiteaccess}
+  AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:-noitesecretnoitesecretnoite12}
+  AWS_EC2_METADATA_DISABLED: "true"
+
+services:
+  rustfs:
+    image: docker.io/rustfs/rustfs:1.0.0-rc.6
+    restart: unless-stopped
+    command: ["/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-noiteaccess}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-noitesecretnoitesecretnoite12}
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_OBS_LOGGER_LEVEL: error
+      # Notify/webhook disabled: RustFS cannot send a bearer token, the runner
+      # gate requires one, and the SPEC treats notify as unreliable — poll + the
+      # deploy.sh nudge are the deploy triggers.
+    ports:
+      - "${RUSTFS_API_PORT:-9000}:9000"
+      - "${RUSTFS_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - rustfs-data:/data
+    networks: [drillo]
+
+  runner:
+    build:
+      context: ./apps/runner
+      dockerfile: Dockerfile
+    image: noite-runner:local
+    container_name: noite-runner
+    hostname: runner
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      <<: *aws
+      RUNNER_BIND: "0.0.0.0:8080"
+      # RUNNER_TOKEN preferred; HOST_TOKEN / AGENT_TOKEN still accepted by the binary.
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-${HOST_TOKEN:-${AGENT_TOKEN:-dev-runner-token}}}
+      NOITE_DB: /data/noite.sqlite
+      S3_ENDPOINT: http://rustfs:9000
+      S3_PUBLIC_ENDPOINT: http://localhost:${RUSTFS_API_PORT:-9000}
+      NOITE_S3_BUCKET: ${NOITE_S3_BUCKET:-noite}
+      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
+      # Empty = control on bare domain (dev); prod sets CONTROL_SUBDOMAIN=app.
+      CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-}
+      CADDYFILE_PATH: /caddy/Caddyfile
+      CADDY_UPSTREAM_HOST: runner
+      CADDY_CONTROL_UPSTREAM: ui:8080
+      CADDY_API_UPSTREAM: runner:8080
+      RUNNER_WORK_DIR: /data/runner
+      PORT_BASE: "8100"
+      RUNNER_POLL_MS: "5000"
+      CELLD_BIN: celld
+      GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-http://git.localhost:${HTTP_PORT:-9080}}
+      UI_URL: ${UI_URL:-http://ui:8080}
+    volumes:
+      # Volume key kept as agent-data so existing stacks keep SQLite / builds.
+      - agent-data:/data
+      - caddy-config:/caddy
+    networks: [drillo]
+    depends_on:
+      - rustfs
+
+  ui:
+    # Immutable image: deps + vite build baked at `docker build` time
+    # (docker/Dockerfile.control). No source bind mount, no npm at boot.
+    # Dev HMR keeps the tools image + bind mount — see compose.dev.yaml.
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.control
+    image: noite-control-ui:local
+    container_name: noite-ui
+    hostname: ui
+    restart: unless-stopped
+    stop_grace_period: 15s
+    environment:
+      <<: *aws
+      PORT: "8080"
+      RUNNER_URL: http://runner:8080
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-${HOST_TOKEN:-${AGENT_TOKEN:-dev-runner-token}}}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-dev-only-change-me-to-a-long-random-string}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:${HTTP_PORT:-9080}}
+      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
+      # Empty = control on bare domain (dev); prod sets CONTROL_SUBDOMAIN=app.
+      CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-}
+      NOITE_DB: /data/noite-control.sqlite
+    volumes:
+      - ui-data:/data
+    networks: [drillo]
+    depends_on:
+      - rustfs
+      - runner
+
+  caddy:
+    image: docker.io/library/caddy:2.10.0-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-9080}:80"
+      - "${HTTPS_PORT:-9443}:443"
+    volumes:
+      - caddy-config:/etc/caddy
+      - caddy-data:/data
+    command:
+      - /bin/sh
+      - -c
+      - |
+        # Single owner for routes: the runner rewrites this file every reconcile
+        # (5 s). We only make sure the file exists so `caddy run` can start
+        # before the runner's first write; empty config runs fine in --watch.
+        [ -f /etc/caddy/Caddyfile ] || printf '%s\n' '# noite-edge' > /etc/caddy/Caddyfile
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile --watch
+    networks: [drillo]
+    depends_on:
+      - runner
+      - ui
+
+networks:
+  drillo:
+
+volumes:
+  rustfs-data:
+  agent-data:
+  ui-data:
+  caddy-config:
+  caddy-data:
+  bun-cache:

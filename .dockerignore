@@ -1,0 +1,34 @@
+# Build context bloat guard — docker/Dockerfile.tools builds with context: .
+# (repo root). Keep the 2.5 GB cargo target / node_modules / local state out
+# of the tar stream. The tools image only needs this file + its own context.
+
+# language build output
+target
+dist
+out
+
+# dependencies
+node_modules
+
+# container registry seeds + local state
+.wrangler
+.celld
+data
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# vcs / editor
+.git
+.gitignore
+.dockerignore
+.idea
+
+# dotes
+.env
+.env.*
+!.env.example
+
+# plan + docs are repo content — keep markdown out of images to shrink context
+# (README is small; SPEC.md is small; both fine to exclude since no image COPYs them)
+*.md
