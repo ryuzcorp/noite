@@ -4,7 +4,6 @@ import { atom, unsafe, watch } from "ilha";
 
 import { initials, presenceTone } from "./apps";
 import {
-  appLogs,
   appMetrics,
   appSpans,
   get,
@@ -124,36 +123,76 @@ export const DeployList = ({ appId }: { appId: string }) => {
   );
 };
 
+// Scroll memory per app (module scope — survives re-renders without
+// reactive churn). Pinned-to-bottom follows the tail; scrolled-up stays put.
+const logScroll = new Map<string, { stick: boolean; top: number }>();
+
+const rememberScroll = (appId: string, el: HTMLPreElement) => {
+  logScroll.set(appId, {
+    stick: el.scrollHeight - el.scrollTop - el.clientHeight < 24,
+    top: el.scrollTop,
+  });
+};
+
+const restoreScroll = (appId: string) => {
+  const el = document.querySelector("#runtime-logs");
+  if (!(el instanceof HTMLPreElement)) {
+    return;
+  }
+  const saved = logScroll.get(appId);
+  el.scrollTop = saved && !saved.stick ? saved.top : el.scrollHeight;
+};
+
 /**
  * Live tail of the running celld fleet's stdout/stderr (bounded buffer on the
- * runner). Polls every 2 s — the buffer resets on runner restart, so this is
- * recent activity only.
+ * runner). Streams SSE and only rerenders when the snapshot actually changes —
+ * the buffer resets on runner restart, so this is recent activity only.
  */
 export const RuntimeLogs = ({ appId }: { appId: string }) => {
   const lines = atom<string[]>([]);
   const loadError = atom("");
 
   watch.once(() => {
-    const poll = async () => {
+    let stopped = false;
+    const source = new EventSource(
+      `/api/apps/${encodeURIComponent(appId)}/logs/stream`
+    );
+    source.addEventListener("message", (event) => {
       try {
-        lines.set(await appLogs(appId));
+        const next: unknown = JSON.parse(event.data);
+        if (!Array.isArray(next)) {
+          return;
+        }
+        if (JSON.stringify(lines()) === JSON.stringify(next)) {
+          return;
+        }
+        // SAFETY: the runner log stream emits string arrays; the array shape
+        // is checked above and entries flow only into text rendering.
+        lines.set(next as string[]);
         loadError.set("");
-      } catch (error) {
-        loadError.set(error instanceof Error ? error.message : String(error));
+        window.requestAnimationFrame(() => {
+          restoreScroll(appId);
+        });
+      } catch {
+        loadError.set("Log stream sent invalid data");
       }
+    });
+    source.addEventListener("error", () => {
+      if (!stopped) {
+        loadError.set("Log stream disconnected — retrying…");
+      }
+    });
+    return () => {
+      stopped = true;
+      source.close();
     };
-    void poll();
-    const timer = window.setInterval(() => {
-      void poll();
-    }, 2000);
-    return () => window.clearInterval(timer);
   });
 
   return (
     <div class="flex flex-col gap-2">
       <div class="flex items-center gap-2">
         <h3 class="m-0 text-lg font-medium">Runtime logs</h3>
-        <span class="badge badge-ghost badge-sm">live · 2s</span>
+        <span class="badge badge-ghost badge-sm">live · SSE</span>
       </div>
       {loadError() ? <p class="text-error m-0 text-sm">{loadError()}</p> : null}
       {lines().length === 0 && !loadError() ? (
@@ -161,7 +200,16 @@ export const RuntimeLogs = ({ appId }: { appId: string }) => {
           No output yet from the running fleet.
         </p>
       ) : (
-        <pre class="bg-base-200 max-h-96 overflow-auto rounded p-3 font-mono text-xs whitespace-pre-wrap">
+        <pre
+          id="runtime-logs"
+          class="bg-base-200 max-h-96 overflow-auto rounded p-3 font-mono text-xs whitespace-pre-wrap"
+          onscroll={(e) => {
+            const target = e.currentTarget;
+            if (target instanceof HTMLPreElement) {
+              rememberScroll(appId, target);
+            }
+          }}
+        >
           {lines().join("\n")}
         </pre>
       )}
@@ -332,7 +380,6 @@ const CollaboratorsPanel = ({
       createdAt: string;
     }[]
   >([]);
-  const email = atom("");
   const role = atom<AppRole>("view");
   const err = atom("");
   const busy = atom(false);
@@ -355,14 +402,24 @@ const CollaboratorsPanel = ({
     if (!isAdmin || busy()) {
       return;
     }
+    // Read the address from the DOM: the input is uncontrolled so typing
+    // never re-renders (and blurs) the field.
+    const input = document.querySelector("#invite-email");
+    const address = input instanceof HTMLInputElement ? input.value.trim() : "";
+    if (!address) {
+      err.set("Email is required");
+      return;
+    }
     busy.set(true);
     try {
       await inviteCollaborator({
         appId,
-        email: email(),
+        email: address,
         role: role(),
       });
-      email.set("");
+      if (input instanceof HTMLInputElement) {
+        input.value = "";
+      }
       await reload();
     } catch (error) {
       err.set(error instanceof Error ? error.message : String(error));
@@ -450,36 +507,41 @@ const CollaboratorsPanel = ({
       </ul>
       {isAdmin ? (
         <div class="mt-1 flex flex-wrap items-end gap-2">
-          <label class="form-control min-w-48 flex-1">
-            <span class="label-text text-xs">Invite by email</span>
+          <fieldset class="fieldset min-w-48 flex-1">
+            <label class="label" for="invite-email">
+              Invite by email
+            </label>
             <input
-              class="input input-bordered input-sm"
+              id="invite-email"
+              class="input input-sm validator"
               type="email"
-              value={email()}
               placeholder="user@example.com"
-              oninput={(e) => {
-                // SAFETY: ilha oninput currentTarget is the <input> that fired.
-                email.set((e.currentTarget as HTMLInputElement).value);
-              }}
             />
-          </label>
-          <select
-            class="select select-bordered select-sm w-24"
-            value={role()}
-            onchange={(e) => {
-              // SAFETY: ilha onchange currentTarget is the <select> that fired.
-              const next = parseAppRole(
-                (e.currentTarget as HTMLSelectElement).value
-              );
-              if (next) {
-                role.set(next);
-              }
-            }}
-          >
-            <option value="view">view</option>
-            <option value="push">push</option>
-            <option value="admin">admin</option>
-          </select>
+            <p class="validator-hint hidden">Enter a valid email address</p>
+          </fieldset>
+          <fieldset class="fieldset w-24">
+            <label class="label" for="invite-role">
+              Role
+            </label>
+            <select
+              id="invite-role"
+              class="select select-sm"
+              value={role()}
+              onchange={(e) => {
+                // SAFETY: ilha onchange currentTarget is the <select> that fired.
+                const next = parseAppRole(
+                  (e.currentTarget as HTMLSelectElement).value
+                );
+                if (next) {
+                  role.set(next);
+                }
+              }}
+            >
+              <option value="view">view</option>
+              <option value="push">push</option>
+              <option value="admin">admin</option>
+            </select>
+          </fieldset>
           <button
             type="button"
             class="btn btn-sm btn-primary"
@@ -492,6 +554,51 @@ const CollaboratorsPanel = ({
       ) : null}
     </section>
   );
+};
+
+/** Sync the slug modal's live URL preview without reactive state, so typing
+ * never re-renders (and blurs) the input. */
+const setSlugPreview = (value: string) => {
+  const preview = document.querySelector("#slug-preview");
+  if (preview) {
+    preview.textContent = `${value || "…"}.localhost`;
+  }
+};
+
+const MODAL_RESERVED_SLUGS = new Set(["_control", "app", "api", "git"]);
+
+/** Live slug validation message (null = valid), mirroring the runner gate. */
+const slugValidationMessage = (raw: string): string | null => {
+  const value = raw.trim();
+  if (!value) {
+    return "Slug is required";
+  }
+  if (value.length > 48) {
+    return "Max 48 characters";
+  }
+  if (/[A-Z]/u.test(value)) {
+    return "Lowercase letters only";
+  }
+  if (/[^a-z-]/u.test(value)) {
+    return "Only lowercase letters and hyphens";
+  }
+  if (value.startsWith("-") || value.endsWith("-")) {
+    return "Must start and end with a letter";
+  }
+  if (MODAL_RESERVED_SLUGS.has(value)) {
+    return "Slug is reserved";
+  }
+  return null;
+};
+
+/** Validate the slug modal input as typed, showing the message below the
+ * input. Direct DOM writes only, so typing never re-renders (and blurs). */
+const showSlugValidation = (value: string) => {
+  setSlugPreview(value.trim().toLowerCase());
+  const error = document.querySelector("#slug-error");
+  if (error) {
+    error.textContent = slugValidationMessage(value) ?? "";
+  }
 };
 
 /** Identity form: display name (regular input) + slug change behind an
@@ -510,7 +617,6 @@ const AppIdentityForm = ({
   onSaved: () => void;
 }) => {
   const draftName = atom(name);
-  const draftSlug = atom(slug);
   const dialogOpen = atom(false);
   const err = atom("");
   const busy = atom(false);
@@ -541,11 +647,17 @@ const AppIdentityForm = ({
     if (!isAdmin || busy()) {
       return;
     }
-    const next = draftSlug().trim().toLowerCase();
-    if (!next) {
-      err.set("Slug is required");
+    const input = document.querySelector("#slug-input");
+    const raw = input instanceof HTMLInputElement ? input.value : "";
+    const message = slugValidationMessage(raw);
+    if (message) {
+      const error = document.querySelector("#slug-error");
+      if (error) {
+        error.textContent = message;
+      }
       return;
     }
+    const next = raw.trim().toLowerCase();
     busy.set(true);
     try {
       await renameApp({ id: appId, slug: next });
@@ -563,10 +675,13 @@ const AppIdentityForm = ({
     <section class="border-base-300 flex flex-col gap-2 rounded-lg border p-3">
       <h3 class="m-0 text-lg font-medium">Identity</h3>
       {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
-      <label class="form-control w-full">
-        <span class="label-text text-xs">Name</span>
+      <fieldset class="fieldset w-full">
+        <label class="label" for="identity-name">
+          Name
+        </label>
         <input
-          class="input input-bordered input-sm"
+          id="identity-name"
+          class="input input-sm"
           value={draftName()}
           disabled={!isAdmin || busy()}
           placeholder="My Service"
@@ -575,7 +690,7 @@ const AppIdentityForm = ({
             draftName.set((e.currentTarget as HTMLInputElement).value);
           }}
         />
-      </label>
+      </fieldset>
       {isAdmin ? (
         <div>
           <button
@@ -599,9 +714,13 @@ const AppIdentityForm = ({
             class="btn btn-sm btn-ghost"
             disabled={busy()}
             onclick={() => {
-              draftSlug.set(slug);
               err.set("");
               dialogOpen.set(true);
+              const input = document.querySelector("#slug-input");
+              if (input instanceof HTMLInputElement) {
+                input.value = slug;
+              }
+              showSlugValidation(slug);
             }}
           >
             Change slug…
@@ -618,24 +737,32 @@ const AppIdentityForm = ({
           <h3 class="m-0 text-lg font-bold">Change slug?</h3>
           <p class="m-0 py-2 text-sm opacity-80">
             This renames the app everywhere: the internal URL becomes{" "}
-            <code>{draftSlug() || "…"}.localhost</code> and the git origin moves
-            with it — update your local remote (`git remote set-url`) and any
-            bookmarks. The fleet keeps running; deploys are blocked while the
-            move completes.
+            <code id="slug-preview">{slug}.localhost</code> and the git origin
+            moves with it — update your local remote (`git remote set-url`) and
+            any bookmarks. The fleet keeps running; deploys are blocked while
+            the move completes.
           </p>
-          <label class="form-control w-full">
-            <span class="label-text text-xs">New slug</span>
+          <fieldset class="fieldset w-full">
+            <label class="label" for="slug-input">
+              New slug
+            </label>
             <input
-              class="input input-bordered input-sm font-mono"
-              value={draftSlug()}
+              id="slug-input"
+              class="input input-sm validator font-mono"
               disabled={busy()}
               placeholder="my-app"
+              pattern="[a-z]([a-z-]{0,46}[a-z])?"
+              maxlength={48}
+              title="Lowercase letters and hyphens, 1–48 chars, starting and ending with a letter"
               oninput={(e) => {
-                // SAFETY: ilha oninput currentTarget is the <input> that fired.
-                draftSlug.set((e.currentTarget as HTMLInputElement).value);
+                const target = e.currentTarget;
+                if (target instanceof HTMLInputElement) {
+                  showSlugValidation(target.value);
+                }
               }}
             />
-          </label>
+          </fieldset>
+          <p id="slug-error" class="text-error m-0 text-sm" />
           <div class="modal-action">
             <button
               type="button"

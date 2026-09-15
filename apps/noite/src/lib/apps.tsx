@@ -14,6 +14,34 @@ const createQueued = queue.wrap(create, {
   idempotencyKey: ({ slug }) => `create:${slug}`,
 });
 
+// Letters plus hyphens only: fold whitespace, drop digits/symbols, and trim
+// edge hyphens so live slugs match the create/rename gate.
+export const slugifyName = async (value: string): Promise<string> => {
+  const { kebabCase } = await import("scule");
+  return kebabCase(value.replaceAll(/\s+/gu, "-"))
+    .replaceAll(/[^A-Za-z-]+/gu, "")
+    .replaceAll(/-{2,}/gu, "-")
+    .replaceAll(/^-+|-+$/gu, "")
+    .slice(0, 48);
+};
+
+// Mirror the name into the slug while typing, until the user overrides it.
+// Imperative DOM writes (not atoms) so re-renders never steal input focus.
+// Touched/auto state lives on the slug element's dataset, surviving renders.
+const syncSlug = async (value: string) => {
+  const el = document.querySelector("#create-slug");
+  if (!(el instanceof HTMLInputElement) || el.dataset.touched === "1") {
+    return;
+  }
+  const seen = el.dataset.auto ?? "";
+  const next = await slugifyName(value);
+  if (el.dataset.touched === "1" || (el.dataset.auto ?? "") !== seen) {
+    return;
+  }
+  el.value = next;
+  el.dataset.auto = next;
+};
+
 /** Initials for the avatar placeholder: first letters of the first two
  * words ("My Service" → "MS", "test" → "T"). */
 export const initials = (name: string): string => {
@@ -159,18 +187,16 @@ export const CreateAppForm = () => {
       .trim()
       .toLowerCase();
     if (!slug && name) {
-      slug = name
-        .toLowerCase()
-        .replaceAll(/[^a-z0-9]+/gu, "-")
-        .replaceAll(/^-|-$/gu, "")
-        .slice(0, 48);
+      slug = await slugifyName(name);
     }
     if (!(name && slug)) {
       notice.set("Name and slug are required");
       return;
     }
-    if (!/^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/u.test(slug)) {
-      notice.set("Slug must be 2–48 chars: lowercase letters, digits, hyphens");
+    if (!/^[a-z](?:[a-z-]{0,46}[a-z])?$/u.test(slug)) {
+      notice.set(
+        "Slug must be 1–48 chars: lowercase letters and hyphens, starting and ending with a letter"
+      );
       return;
     }
     try {
@@ -192,28 +218,50 @@ export const CreateAppForm = () => {
         </div>
       ) : null}
 
-      <label class="form-control w-full">
-        <span class="label-text">Name</span>
+      <fieldset class="fieldset">
+        <label class="label" for="create-name">
+          Name
+        </label>
         <input
+          id="create-name"
           name="name"
-          class="input input-bordered w-full"
+          class="input w-full"
           placeholder="My Service"
+          oninput={(e) => {
+            const target = e.currentTarget;
+            if (target instanceof HTMLInputElement) {
+              void syncSlug(target.value);
+            }
+          }}
           autofocus
           required
         />
-      </label>
-      <label class="form-control w-full">
-        <span class="label-text">Slug</span>
+      </fieldset>
+      <fieldset class="fieldset">
+        <label class="label" for="create-slug">
+          Slug
+        </label>
         <input
+          id="create-slug"
           name="slug"
-          class="input input-bordered w-full"
+          class="input validator w-full"
           placeholder="my-app"
+          pattern="[a-z]([a-z-]{0,46}[a-z])?"
+          maxlength={48}
+          title="Lowercase letters and hyphens, 1–48 chars, starting and ending with a letter"
+          oninput={(e) => {
+            const target = e.currentTarget;
+            if (target instanceof HTMLInputElement) {
+              target.dataset.touched = target.value.length > 0 ? "1" : "";
+            }
+          }}
           required
         />
-        <span class="label-text-alt opacity-70">
-          Leave blank to derive from the name.
-        </span>
-      </label>
+        <p class="label">Auto-generated from the name — edit to override.</p>
+        <p class="validator-hint hidden">
+          Lowercase letters and hyphens, 1–48 chars
+        </p>
+      </fieldset>
 
       <button type="submit" class="btn btn-primary w-full" disabled={busy()}>
         {busy() ? "Creating…" : "Create app"}

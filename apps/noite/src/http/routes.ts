@@ -263,11 +263,50 @@ const handleR2Raw: RouteHandler = async (request, env, params) => {
   );
 };
 
+/** Live log tail proxy: session + view-role gate, then pipe the runner SSE
+ * (the browser never sees RUNNER_TOKEN). */
+const handleLogsStream: RouteHandler = async (request, env, params) => {
+  const appId = params?.appId?.trim() ?? "";
+  if (!appId) {
+    return new Response("app required", { status: 400 });
+  }
+  await ensureDbPromise();
+  // SAFETY: same KitEnv/process.env contract as every other RouteHandler.
+  const kit = env ?? (process.env as KitEnv);
+  const userId = await routeUserId(request, kit);
+  if (!userId) {
+    return new Response("Sign in required", { status: 401 });
+  }
+  try {
+    await requireAppRole(appId, userId, "view");
+  } catch {
+    return new Response("forbidden", { status: 403 });
+  }
+  const rc = runnerConfig(kit);
+  if (!rc) {
+    return new Response("RUNNER_TOKEN is not configured", { status: 500 });
+  }
+  const upstream = await fetch(
+    `${rc.runner}/v1/apps/${encodeURIComponent(appId)}/logs/stream`,
+    { headers: { authorization: `Bearer ${rc.token}` } }
+  );
+  if (!upstream.ok || !upstream.body) {
+    const text = await upstream.text().catch(() => upstream.statusText);
+    return new Response(text, { status: upstream.status });
+  }
+  const headers = new Headers();
+  headers.set("content-type", "text/event-stream");
+  headers.set("cache-control", "no-cache");
+  headers.set("connection", "keep-alive");
+  return new Response(upstream.body, { headers, status: upstream.status });
+};
+
 const router = FindMyWay.make<RouteHandler>();
 router.all("/health", handleHealth);
 router.on("POST", "/webhook", handleWebhook);
 router.on("POST", "/internal/git-auth", handleGitAuth);
 router.on("GET", "/storage/:appId/r2/:bucket/raw", handleR2Raw);
+router.on("GET", "/api/apps/:appId/logs/stream", handleLogsStream);
 router.all("/api/auth", handleAuth);
 router.all("/api/auth/*", handleAuth);
 

@@ -5,8 +5,8 @@ export default function Login() {
   head({ title: "Login · Noite" });
 
   return (
-    <div class="mx-auto mt-8 flex max-w-xl flex-col gap-4 px-4">
-      <div class="card bg-base-100 shadow">
+    <div class="mx-auto mt-4 flex w-full max-w-5xl flex-col gap-4 px-4 pb-12">
+      <div class="card bg-base-100 mx-auto w-full max-w-xl shadow">
         <div class="card-body gap-4">
           <h2 class="card-title m-0">Noite</h2>
           <LoginPanel />

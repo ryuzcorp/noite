@@ -29,7 +29,7 @@ export default function Source() {
     return <p class="text-error">Missing app id</p>;
   }
   return (
-    <div class="mx-auto mt-8 flex max-w-5xl flex-col gap-4 px-4 pb-12">
+    <div class="mx-auto mt-4 flex w-full max-w-5xl flex-col gap-4 px-4 pb-12">
       <Breadcrumbs
         trail={[
           { href: "/apps", label: "Apps" },

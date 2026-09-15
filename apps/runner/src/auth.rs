@@ -12,7 +12,11 @@ pub async fn require_bearer(state: AppState, req: Request, next: Next) -> Respon
     let path = req.uri().path();
     // Health is public. Git smart-HTTP uses its own Basic auth per slug.
     // /webhook stays bearer-gated (deploy nudge / optional S3 notify).
-    if path == "/health" || path.starts_with("/v1/git/") {
+    // The edge fallback page does its own lookup and carries no secrets.
+    if path == "/health"
+        || path.starts_with("/v1/git/")
+        || path == "/v1/edge/fallback"
+    {
         return next.run(req).await;
     }
 

@@ -5,9 +5,11 @@ import {
   DeployList,
   RuntimeLogs,
 } from "$lib/app-detail";
+import { get } from "$lib/apps.server";
 import { SourceBrowser } from "$lib/source-browser";
 import { AppStorageList } from "$lib/storage";
 import { useRoute, head, navigate } from "@ilha/router";
+import { watch } from "ilha";
 
 const TABS = [
   { id: "overview", label: "Overview" },
@@ -35,10 +37,27 @@ export default function AppPage() {
     navigate(`${route.path()}?t=${tab}`, { replace: true });
   };
 
+  // Tab title follows the app once loaded (head() only applies on mount).
+  watch.once(() => {
+    if (!appId) {
+      return;
+    }
+    void (async () => {
+      try {
+        const info = await get(appId);
+        if (typeof document !== "undefined") {
+          document.title = `${info.app.name} · Noite`;
+        }
+      } catch {
+        // keep the default title
+      }
+    })();
+  });
+
   return (
     <div class="mx-auto mt-4 flex w-full max-w-5xl flex-col gap-4 px-4 pb-12">
       {appId ? <AppBreadcrumbs appId={appId} /> : null}
-      <div role="tablist" class="tabs tabs-box w-fit">
+      <div role="tablist" class="tabs tabs-border w-fit">
         {TABS.map((tab) => (
           <button
             type="button"

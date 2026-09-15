@@ -1,6 +1,7 @@
 pub mod caddy;
 pub mod cmd;
 pub mod deploy;
+pub mod edge;
 pub mod git_http;
 pub mod git_manifest;
 pub mod git_policy;

@@ -31,7 +31,6 @@ import {
   runnerSourceDiff,
   runnerSourceTree,
   runnerAppMetrics,
-  runnerAppLogs,
   runnerAppSpans,
   runnerStorage,
   runnerD1,
@@ -58,7 +57,8 @@ const SourceBlobArgs = Schema.Struct({
   path: Schema.String,
 });
 
-const SLUG_RE = /^[a-z0-9](?<slug>[a-z0-9-]{0,46}[a-z0-9])?$/u;
+const SLUG_RE = /^[a-z](?<slug>[a-z-]{0,46}[a-z])?$/u;
+const RESERVED_SLUGS = new Set(["_control", "app", "api", "git"]);
 
 const asApp = (row: App): App => ({
   ...row,
@@ -178,8 +178,13 @@ export const create = action(
     if (!trimmedName) {
       failAction("Name is required");
     }
-    if (!SLUG_RE.test(normalized) || normalized === "_control") {
-      failAction("Slug must be 2–48 chars, lowercase alphanumeric/hyphens");
+    if (RESERVED_SLUGS.has(normalized)) {
+      failAction("Slug is reserved");
+    }
+    if (!SLUG_RE.test(normalized)) {
+      failAction(
+        "Slug must be 1–48 chars: lowercase letters and hyphens, starting and ending with a letter"
+      );
     }
     const hub = appsFor(user.id);
     try {
@@ -276,11 +281,13 @@ export const renameApp = action(
     if (!trimmedName && !normalized) {
       failAction("Name or slug required");
     }
-    if (
-      normalized &&
-      (!SLUG_RE.test(normalized) || normalized === "_control")
-    ) {
-      failAction("Slug must be 2–48 chars, lowercase alphanumeric/hyphens");
+    if (normalized && RESERVED_SLUGS.has(normalized)) {
+      failAction("Slug is reserved");
+    }
+    if (normalized && !SLUG_RE.test(normalized)) {
+      failAction(
+        "Slug must be 1–48 chars: lowercase letters and hyphens, starting and ending with a letter"
+      );
     }
     const user = await sessionUser();
     await requireAppRole(id, user.id, "admin");
@@ -390,19 +397,6 @@ export const appSpans = action(
     } catch (error) {
       // Surface the underlying failure instead of the RPC's generic
       // "Internal error" — failAction is mapped into AuthError.
-      failAction(error instanceof Error ? error.message : String(error));
-    }
-  }),
-  { error: AuthError }
-);
-
-export const appLogs = action(
-  withSchema(AppId, async (appId) => {
-    await requireViewApp(appId);
-    try {
-      // Recent stdout/stderr from the running celld fleet (bounded buffer).
-      return await runnerAppLogs(appId);
-    } catch (error) {
       failAction(error instanceof Error ? error.message : String(error));
     }
   }),

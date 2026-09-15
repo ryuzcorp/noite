@@ -16,7 +16,7 @@ pub fn sha_same(a: &str, b: &str) -> bool {
     !a.is_empty() && a == b
 }
 
-/// Slug rules for create: DNS-ish label, not the reserved control prefix.
+/// Slug rules for create: letters plus hyphens only, not a reserved route.
 /// Slugs that would collide with edge routes and must never become apps.
 const RESERVED_SLUGS: &[&str] = &["_control", "app", "api", "git"];
 
@@ -26,7 +26,7 @@ pub fn slug_ok(slug: &str) -> bool {
     }
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
-        regex::Regex::new(r"^[a-z0-9]([a-z0-9\-]{0,46}[a-z0-9])?$").expect("slug re")
+        regex::Regex::new(r"^[a-z]([a-z\-]{0,46}[a-z])?$").expect("slug re")
     });
     re.is_match(slug)
 }
@@ -48,12 +48,16 @@ mod tests {
     fn slug_rules() {
         assert!(slug_ok("test"));
         assert!(slug_ok("a"));
-        assert!(slug_ok("my-app-1"));
+        assert!(slug_ok("my-app"));
         assert!(!slug_ok("_control"));
         assert!(!slug_ok("app"));
         assert!(!slug_ok("api"));
         assert!(!slug_ok("git"));
         assert!(!slug_ok("-bad"));
+        assert!(!slug_ok("bad-"));
+        assert!(!slug_ok("my-app-1"));
+        assert!(!slug_ok("app2"));
+        assert!(!slug_ok("under_score"));
         assert!(!slug_ok("Bad"));
         assert!(!slug_ok(""));
     }

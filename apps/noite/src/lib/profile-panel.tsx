@@ -26,7 +26,8 @@ export const ProfilePanel = () => {
   const error = atom("");
   const keys = atom<ApiKeyRow[]>([]);
   const freshKey = atom<string | null>(null);
-  const name = atom("git");
+  const name = atom("");
+  const keyModal = atom(false);
 
   const reload = async () => {
     const result = await authClient.apiKey.list({
@@ -71,6 +72,7 @@ export const ProfilePanel = () => {
     if (key) {
       freshKey.set(key);
     }
+    keyModal.set(false);
     await reload();
   };
 
@@ -102,31 +104,70 @@ export const ProfilePanel = () => {
           requires collaborator <code>push</code> or <code>admin</code> on that
           app.
         </p>
-        <form class="flex flex-wrap items-end gap-2" onsubmit={createKey}>
-          <label class="form-control w-full max-w-xs">
-            <span class="label-text text-xs">Name</span>
-            <input
-              class="input input-bordered input-sm"
-              name="name"
-              value={name()}
-              oninput={(event) => {
-                const target = event.currentTarget;
-                if (target instanceof HTMLInputElement) {
-                  name.set(target.value);
-                }
-              }}
-              maxlength={32}
-              required
-            />
-          </label>
+        <div>
           <button
-            type="submit"
+            type="button"
             class="btn btn-primary btn-sm"
-            disabled={busy()}
+            onclick={() => {
+              name.set("");
+              error.set("");
+              keyModal.set(true);
+            }}
           >
             Create key
           </button>
-        </form>
+        </div>
+        <div class={`modal ${keyModal() ? "modal-open" : ""}`}>
+          <div class="modal-box">
+            <h3 class="m-0 text-lg font-bold">Create API key</h3>
+            <form onsubmit={createKey}>
+              <fieldset class="fieldset w-full">
+                <label class="label" for="key-name">
+                  Name
+                </label>
+                <input
+                  id="key-name"
+                  class="input input-sm"
+                  name="name"
+                  value={name()}
+                  oninput={(event) => {
+                    const target = event.currentTarget;
+                    if (target instanceof HTMLInputElement) {
+                      name.set(target.value);
+                    }
+                  }}
+                  maxlength={32}
+                  minlength={1}
+                  placeholder="ci"
+                  autofocus
+                  required
+                />
+              </fieldset>
+              {error() ? (
+                <p class="text-error m-0 py-2 text-sm">{error()}</p>
+              ) : null}
+              <div class="modal-action">
+                <button
+                  type="button"
+                  class="btn btn-sm btn-ghost"
+                  disabled={busy()}
+                  onclick={() => {
+                    keyModal.set(false);
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  class="btn btn-sm btn-primary"
+                  disabled={busy()}
+                >
+                  {busy() ? "Creating…" : "Create key"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
         {freshKey() ? (
           <div class="bg-base-200 flex flex-col gap-1 rounded p-3 text-xs">
             <p class="m-0 font-medium">Copy now — shown once:</p>

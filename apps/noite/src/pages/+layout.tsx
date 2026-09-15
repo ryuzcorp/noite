@@ -1,4 +1,5 @@
 import { authClient, hardNav } from "$lib/auth-client";
+import { Authed } from "$lib/authed";
 import { defineLayout, useRoute } from "@ilha/router";
 
 /**
@@ -14,7 +15,7 @@ export default defineLayout(({ children }) => {
   return (
     <div class="drawer lg:drawer-open">
       <input id="nav-drawer" type="checkbox" class="drawer-toggle" />
-      <div class="drawer-content flex min-h-screen flex-1 flex-col">
+      <div class="drawer-content bg-base-200 flex min-h-screen flex-1 flex-col">
         <label
           for="nav-drawer"
           class="btn btn-ghost btn-sm fixed top-3 left-3 z-40 lg:hidden"
@@ -33,7 +34,7 @@ export default defineLayout(({ children }) => {
             <line x1="4" y1="18" x2="20" y2="18" />
           </svg>
         </label>
-        {children}
+        <Authed>{children}</Authed>
       </div>
       <div class="drawer-side">
         <label
@@ -41,7 +42,7 @@ export default defineLayout(({ children }) => {
           class="drawer-overlay"
           aria-label="Close menu"
         />
-        <aside class="menu bg-base-200 min-h-full w-60">
+        <aside class="menu bg-base-200 border-base-300 min-h-full w-60 border-r">
           <a href="/apps" class="link menu-title" aria-label="Noite dashboard">
             Noite
           </a>

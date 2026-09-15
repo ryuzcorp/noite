@@ -41,8 +41,10 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
         let Some(port) = app.listen_port else {
             continue;
         };
-        // Stopped apps keep ports allocated but must not be edged.
-        if app.is_stopped() {
+        // Only deployed apps can serve: stopped ones are parked and
+        // never-deployed ones have no fleet — both fall through to the
+        // wildcard fallback page instead of a dead route.
+        if app.is_stopped() || !app.is_deployed() {
             continue;
         }
         lines.push(format!("{} {{", site(&format!("{}.{}", app.slug, cfg.base_domain))));
@@ -74,6 +76,18 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
     lines.push("\t\theader_up Host {http.request.hostport}".into());
     lines.push("\t\tflush_interval -1".into());
     lines.push("\t}".into());
+    lines.push("}".into());
+    lines.push(String::new());
+
+    // Fallback: unknown slugs + stopped apps → runner edge page (per-Host).
+    // NOTE: a wildcard site needs a DNS-challenge module for auto_https in
+    // prod; without one only the concrete sites above get certificates.
+    lines.push(format!("{} {{", site(&format!("*.{}", cfg.base_domain))));
+    lines.push("\trewrite * /v1/edge/fallback".into());
+    lines.push(format!("\treverse_proxy {} {{", cfg.caddy_api_upstream));
+    lines.push("\t\theader_up Host {http.request.hostport}".into());
+    lines.push("\t\tflush_interval -1".into());
+    lines.push("}".into());
     lines.push("}".into());
     lines.push(String::new());
 

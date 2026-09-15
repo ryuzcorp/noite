@@ -92,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(api::health))
+        .route("/v1/edge/fallback", get(host::edge::edge_fallback))
         .route("/webhook", post(api::webhook))
         .route("/v1/apps", get(api::list_apps).post(api::create_app))
         .route(
@@ -107,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/apps/{id}/metrics", get(api::app_metrics))
         .route("/v1/apps/{id}/spans", get(api::app_spans))
         .route("/v1/apps/{id}/logs", get(api::app_logs))
+        .route("/v1/apps/{id}/logs/stream", get(api::app_logs_stream))
         .route("/v1/apps/{id}/storage", get(api::app_storage))
         .route(
             "/v1/apps/{id}/storage/d1/{database_id}",

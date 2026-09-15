@@ -4,9 +4,13 @@ use axum::{
     body::Body,
     extract::{Path, Query, State},
     http::{header, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     Json,
 };
+use tokio_stream::wrappers::ReceiverStream;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
@@ -346,6 +350,42 @@ pub async fn app_logs(
     let mut lines = metrics::recent_logs(&state.config, &app.slug, 500).await;
     lines.extend(logs::tail(&state.logs, &app.slug, 500).await);
     Json(lines).into_response()
+}
+
+/// Live log tail as server-sent events: one JSON array per message, sent
+/// only when the snapshot changed (plus keep-alive comments). Ends when the
+/// client disconnects.
+pub async fn app_logs_stream(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let app = match db::get_app(&state.pool, &id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return ApiError::not_found("app not found").into_response(),
+        Err(e) => return ApiError::internal(e.to_string()).into_response(),
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, anyhow::Error>>(16);
+    let cfg = state.config.clone();
+    let log_state = state.logs.clone();
+    let slug = app.slug.clone();
+    tokio::spawn(async move {
+        let mut last: Option<Vec<String>> = None;
+        loop {
+            let mut lines = metrics::recent_logs(&cfg, &slug, 500).await;
+            lines.extend(logs::tail(&log_state, &slug, 500).await);
+            if last.as_ref() != Some(&lines) {
+                let data = serde_json::to_string(&lines).unwrap_or_default();
+                if tx.send(Ok(Event::default().data(data))).await.is_err() {
+                    break;
+                }
+                last = Some(lines);
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+    Sse::new(ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 pub async fn app_storage(

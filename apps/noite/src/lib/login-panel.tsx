@@ -113,21 +113,34 @@ export const LoginPanel = () => {
 
       {mode() === "register" ? (
         <form onsubmit={register} class="flex flex-col gap-3">
-          <input
-            name="name"
-            class="input input-bordered w-full"
-            placeholder="Name"
-            autocomplete="name"
-            required
-          />
-          <input
-            name="email"
-            type="email"
-            class="input input-bordered w-full"
-            placeholder="Email"
-            autocomplete="username webauthn"
-            required
-          />
+          <fieldset class="fieldset">
+            <label class="label" for="register-name">
+              Name
+            </label>
+            <input
+              id="register-name"
+              name="name"
+              class="input w-full"
+              placeholder="Name"
+              autocomplete="name"
+              required
+            />
+          </fieldset>
+          <fieldset class="fieldset">
+            <label class="label" for="register-email">
+              Email
+            </label>
+            <input
+              id="register-email"
+              name="email"
+              type="email"
+              class="input validator w-full"
+              placeholder="Email"
+              autocomplete="username webauthn"
+              required
+            />
+            <p class="validator-hint hidden">Enter a valid email address</p>
+          </fieldset>
           <button type="submit" class="btn btn-primary" disabled={busy()}>
             Create passkey
           </button>

@@ -175,6 +175,17 @@ export const StorageList = () => {
   );
 };
 
+/** Display name for a storage resource id (mirrors StorageDetail's parsing). */
+export const resourceDisplayName = (resourceId: string): string => {
+  if (resourceId.startsWith("d1:") || resourceId.startsWith("r2:")) {
+    return resourceId.slice(3);
+  }
+  if (resourceId.startsWith("do:")) {
+    return resourceId.split(":").slice(2).join(":");
+  }
+  return resourceId;
+};
+
 /** One storage resource's details: D1 shows each table as a read-only
  * daisyUI table (rows + first rows); a DO class shows its live instances;
  * an R2 bucket lists keys with a bounded text preview per file.

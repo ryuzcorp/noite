@@ -203,10 +203,6 @@ export interface RunnerSpan {
 export const runnerAppSpans = (id: string, hours = 1) =>
   runnerFetch<RunnerSpan[]>(`/v1/apps/${id}/spans?hours=${hours}`);
 
-/** Most recent stdout/stderr lines from the running celld fleet. */
-export const runnerAppLogs = (id: string) =>
-  runnerFetch<string[]>(`/v1/apps/${id}/logs`);
-
 export interface StorageItem {
   appId: string;
   appSlug: string;
