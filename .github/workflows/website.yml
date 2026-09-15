@@ -1,0 +1,49 @@
+# Marketing site + docs (apps/website, Blume) → GitHub Pages.
+#
+# After the first run: repo Settings → Pages → Custom domain = noite.dev
+# (plus the DNS A/AAAA records), then re-run to stamp the CNAME.
+name: website
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/website/**"
+      - ".github/workflows/website.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: apps/website
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - run: bun install
+      - run: bun run build
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: apps/website/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
