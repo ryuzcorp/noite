@@ -55,14 +55,12 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
     ];
     // One reverse-proxy site block; `tls` adds an on-demand TLS gate so the
     // site serves HTTPS with per-hostname certs (no wildcard cert needed).
+    // A tls-gated site does NOT proxy plaintext :80 (empty 200s) — so it
+    // always gets an `http://` twin serving the same handlers in clear.
     // Site-level extras (e.g. `rewrite`) go in the site block; proxy options
     // (e.g. `header_up`) MUST go inside `reverse_proxy` — Caddy rejects
     // them at site level and then keeps serving the stale config.
-    let mut push_site = |addr: &str,
-                         tls: bool,
-                         site_extra: &[&str],
-                         proxy_extra: &[&str],
-                         upstream: &str| {
+    let mut push_block = |addr: &str, tls: bool, site_extra: &[&str], proxy_extra: &[&str], upstream: &str| {
         lines.push(format!("{addr} {{"));
         // Access log per site (method/host/status/bytes/upstream) — the
         // edge is otherwise a black box when a route misbehaves.
@@ -83,6 +81,16 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
         lines.push("\t}".into());
         lines.push("}".into());
         lines.push(String::new());
+    };
+    let mut push_site = |addr: &str,
+                         tls: bool,
+                         site_extra: &[&str],
+                         proxy_extra: &[&str],
+                         upstream: &str| {
+        if tls && !addr.starts_with("http://") {
+            push_block(&format!("http://{addr}"), false, site_extra, proxy_extra, upstream);
+        }
+        push_block(addr, tls, site_extra, proxy_extra, upstream);
     };
     push_site(
         &addr_of(&control_site),
@@ -231,16 +239,20 @@ mod tests {
         let cfg = test_config("noite.now", "app", false, "/tmp/noite-test-coolify");
         let out = rendered(&cfg, &[test_app()]).await;
         println!("--- coolify Caddyfile ---\n{out}\n--- end ---");
-        // Behind-proxy: bare hostnames + on-demand TLS, never an http://
-        // pin combined with a tls directive (Caddy refuses to adapt that).
+        // Behind-proxy: bare hostnames + on-demand TLS for :443, plus an
+        // `http://` twin per site — tls-gated sites answer plaintext :80
+        // with empty 200s, so the twin carries the cleartext handlers.
+        // (Never an `http://` pin combined with a `tls` directive in one
+        // block: Caddy refuses to adapt that.)
         assert!(out.contains("app.noite.now {"), "control TLS site");
+        assert!(out.contains("http://app.noite.now {"), "control plain twin");
         assert!(out.contains("test.noite.now {"), "tenant TLS site");
+        assert!(out.contains("http://test.noite.now {"), "tenant plain twin");
         assert!(out.contains("api.noite.now {"), "api TLS site");
         assert!(out.contains("on_demand"), "on-demand gate");
         assert!(out.contains("tls-ask"), "ask endpoint");
         assert!(out.contains("http://127.0.0.1 {"), "loopback health site");
         assert!(!out.contains("header_up Host"), "no redundant Host");
-        assert!(!out.contains("http://app.noite.now"), "no scheme pin");
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
     }
 
