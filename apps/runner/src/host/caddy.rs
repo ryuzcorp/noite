@@ -107,14 +107,14 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
             continue;
         }
         let upstream = format!("{}:{}", cfg.caddy_upstream_host, port);
+        // No header_up lines: Caddy's reverse_proxy already forwards Host
+        // and sets X-Forwarded-For/Proto/Host by default (it warns on
+        // explicit duplicates, and site-level ones fail the whole adapt).
         push_site(
             &addr_of(&format!("{}.{}", app.slug, cfg.base_domain)),
             edge_tls,
             &[],
-            &[
-                "header_up X-Forwarded-Host {http.request.hostport}",
-                "header_up X-Forwarded-Proto {http.request.scheme}",
-            ],
+            &[],
             &upstream,
         );
     }
