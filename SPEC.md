@@ -12,7 +12,7 @@
 - **Edge:** Caddy — control on bare `$BASE_DOMAIN` locally (`https://app.noite.now` in prod via `CONTROL_SUBDOMAIN=app`) + `api.` + `git.` + `{app}.$BASE_DOMAIN` (prod `https://{app}.noite.now`; `app`/`api`/`git` slugs reserved)
 - **Effect:** prefer `Effect` / `Config` / `Schedule` / `Schema` / `HttpClient` / `Layer` over ad-hoc async
 
-## Status (2026-09-12)
+## Status (2026-09-15)
 
 Working end-to-end on rootless Podman Compose (repo root).
 
@@ -22,21 +22,22 @@ Working end-to-end on rootless Podman Compose (repo root).
 | --- | --- |
 | Compose stack | `rustfs`, `runner`, `ui`, `caddy` — `compose.yaml` at repo root |
 | Ports | Host **9080/9443**; control `http://localhost:9080`; API `http://api.localhost:9080`; apps `http://{slug}.localhost:9080` |
-| Runner | **Rust** (`apps/runner`) — deploy, fleets, caddy; ensures `git`/`fleets` buckets on boot |
+| Runner | **Rust** (`apps/runner`) — deploy, fleets, caddy; ensures the single `NOITE_S3_BUCKET` bucket on boot |
 | Control UI | **Oxide** (`apps/noite`) — passkeys + actions proxying to runner |
 | Deploy pipeline | Tip `.bundle` → bare repo + worktree → optional bun scripts → `celld deploy` → spawn/reload |
-| Deploy trigger | `/webhook` (bearer-gated nudge) + poll of tip main `.bundle` — RustFS notify off |
+| Deploy trigger | push fast-path (spawn) + reconcile tip poll of `MANIFEST.json` + main `.bundle` + `/webhook` bearer-gated nudge — RustFS notify off |
 | Edge | Caddy; preserve `Host` / forwarded headers |
 | Source preview | per-app file tree + code / last-push diff — `@pierre/trees` + `@pierre/diffs` (vanilla) · runner `{tree,blob,diff}` endpoints read the bare mirror |
 | Observability | per-app requests / latency from **celld OTel** (`CELLD_OTEL=1` → Parquet spans in the fleet bucket, aggregated by the runner with DuckDB) + CPU ms (celld process sampling) → minute buckets (`app_metric`) → detail-page 24h chart — the pricing substrate |
 | Sample app | `apps/noite/test/` + `deploy.sh` (Git HTTP → tip bundle) |
+| Git hardening | `MANIFEST.json` linearization per slug, receive-pack head parsing, per-role push policy (`push` = create + fast-forward only, `admin` = anything), per-slug push mutex, manifest re-apply on reads (`git_policy.rs`/`git_manifest.rs`); `app`/`api`/`git` slugs reserved |
 
 ### Left / polish
 
 - RustFS webhooks unreliable — poll is the reliable path; `/webhook` stays as an optional bearer-gated nudge for `deploy.sh`
 - Tiny forge UI over bare mirrors (`RUNNER_WORK_DIR/repos/{slug}.git`) — source preview (W4) started this; full history / commit views remain
 - Source preview polish: hydrated expand-unchanged context (`loadDiffFiles`), per-file permalinks
-- TLS / real domains
+- TLS / real domains (plan: `https://app.noite.now` control via `CONTROL_SUBDOMAIN=app`, `https://{slug}.noite.now` apps)
 - Ops (backups, quotas, APM)
 - Scoped per-app RustFS keys: the Bun host plane that minted them is deleted (W1.3); Git auth is profile API keys (Better Auth) + collaborator checks via runner → UI `/internal/git-auth`
 
@@ -65,13 +66,13 @@ Working end-to-end on rootless Podman Compose (repo root).
 
 ## Plan (2026-09-12)
 
-Ordered by payoff. Each item: what · why · files. W1 is mechanical and safe; W2 is hardening; W3 is structural. Oxide/Effect showcase code (schedules, queues, workflows, liveQuery, the retired Bun host plane) is **kept deliberately** — this PaaS doubles as a framework showcase (creator decision).
+Ordered by payoff. Each item: what · why · files. W1 is mechanical and safe; W2 is hardening; W3 is structural. Oxide/Effect showcase code (schedules, queues, workflows, liveQuery, the `sync-apps` mirror) is **kept deliberately** — this PaaS doubles as a framework showcase (creator decision). The retired Bun host plane (`apps/noite/src/host/*`, `lib/store.ts`) was deleted outright during cleanup.
 
 ### Wave 1 — quick wins (mechanical) — done
 
 - [x] **W1.1 Root `.dockerignore`** · kills the 2.5 GB build context (1.5 GB `target/`, `node_modules`, `dist`, `.wrangler`, `data`) · `+.dockerignore`
 - [x] **W1.2 `make down` preserves data** · was `down -v --remove-orphans` (nuked runner SQLite, git mirrors, control DB, caddy config) · `down` = plain down; new explicit `reset` = down -v · `Makefile` (+ `.pi-lens.json` so the repo linter's shellcheck-in-bash-mode stops mis-parsing make conditionals; Makefile `ifneq`/exports use shell-safe quoted + `$(or $(and …))` forms)
-- [x] **W1.3 Legacy worker UI deleted** · `docker/ui.sh` + `apps/noite/ui/` were the pre-Oxide celld worker control UI (`s3://fleets/_control`), superseded by Oxide · deleted, dir and bucket documented as legacy. **Kept as showcase:** `apps/noite/src/host/*`, `lib/store.ts` — retired Oxide/Effect host plane (nothing imports it; Rust runner is the host), now carries a RETIRED header; NOT wired back in without SPEC sign-off
+- [x] **W1.3 Legacy worker UI deleted** · `docker/ui.sh` + `apps/noite/ui/` were the pre-Oxide celld worker control UI (`s3://fleets/_control`), superseded by Oxide · deleted, dir and bucket documented as legacy. **Deleted during cleanup:** `apps/noite/src/host/*`, `lib/store.ts` — retired Oxide/Effect host plane (nothing imported it; Rust runner is the host)
 - [x] **W1.4 Caddyfile single owner** · compose bootstrap + `docker/noite.sh` seed raced the runner's rewrite · both deleted; caddy only creates an empty file if missing; runner `caddy::rewrite_caddy` owns all routes. Trade-off: on a fresh volume, control/api routes appear once the runner's first reconcile writes the file (rustfs ready, ~≤60 s worst case) instead of instantly
 
 ### Wave 2 — hardening — done (W2.5 partial)
@@ -87,41 +88,46 @@ Ordered by payoff. Each item: what · why · files. W1 is mechanical and safe; W
 - [x] **W3.1 Immutable UI image** · prod no longer bind-mounts source and `bun install` + `vite build` per boot; `docker/Dockerfile.control` bakes deps + dist at `docker build` time (immutable, no npm at runtime) · entrypoint `docker/noite-prod.sh` (secret gate + start) · prod compose ui = image + `ui-data` only · dev (`make dev`) still uses the tools image + bind mount + `docker/noite.sh` HMR — see `compose.dev.yaml`
 - [ ] **W3.2 UI DB mirror consolidation — deferred, showcase** · the UI keeps its own `app`/`app_secret`/`deploy` copy + 1-min `sync-apps` schedule + `runner-op` queue/workflow + liveQuery topics mirroring the runner. The runner is already the source of truth behind a bearer-gated REST API and single-writer SQLite; consolidating would remove the mirror + drift at the cost of deleting the Oxide schedule/queue/workflow showcase. **Kept deliberately** (creator decision) — revisit only if the dual-write actually bites
 
-Acceptance: `make up` cold build < 30 s · `git push s3://…` → app live ≤ poll + build · `make down` preserves `agent-data` + `ui-data` · no legacy `_control` worker image.
+Acceptance: `make up` cold build < 30 s · Git-HTTP push → app live ≤ poll + build · `make down` preserves `agent-data` + `ui-data` · no legacy `_control` worker image.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  dev[Developer] -->|git push s3://| rustfs[RustFS]
-  rustfs -->|ObjectCreated .bundle| runner[NoiteRunner]
-  runner -->|poll tip .bundle| rustfs
-  runner -->|bare + checkout| repos[repos/slug.git]
-  runner -->|celld deploy| fleetBucket[AppFleetPrefix]
-  runner -->|spawn| celldApp[celld fleet]
+  dev[Developer] -->|git push → git.BASE/slug| runner[NoiteRunner]
+  runner -->|tip .bundle + MANIFEST.json| rustfs[(RustFS s3://noite)]
+  runner -->|poll MANIFEST + tip .bundle| rustfs
+  runner -->|protocol mirror| githttp[git-http/slug.git]
+  runner -->|deploy/source mirror| repos[repos/slug.git]
+  repos -->|checkout + build| work[worktree]
+  work -->|celld deploy| fleet[celld fleet per app]
+  runner -->|spawn + supervise| fleet
   runner -->|Caddyfile| caddy[Caddy]
   user[Browser] --> caddy
-  caddy -->|app.BASE_DOMAIN| celldApp
-  caddy -->|BASE_DOMAIN| ui[OxideUI]
-  ui -->|Bearer /api| runner
+  caddy -->|bare domain, app.BASE prod| ui[OxideUI control]
+  caddy -->|api.BASE| runner
+  caddy -->|git.BASE| runner
+  caddy -->|slug.BASE| fleet
+  ui -->|Bearer REST| runner
+  ui -->|API-key + role check| runner
 ```
 
 ### Buckets
 
 - `s3://noite/git/{appSlug}/` — tip bundles from Git HTTP (or legacy git-remote-s3) + `MANIFEST.json` (`{seq, refs}`; readers resolve refs from the manifest so half-written pushes stay invisible)
 - `s3://noite/fleets/{appSlug}/` — tenant celld
-- Legacy `s3://fleets/_control/` worker UI bucket is gone (W1.3); Oxide serves apex
+- Legacy `s3://fleets/_control/` worker UI bucket is gone (W1.3); control serves the bare domain locally
 - Runner ensures bucket `NOITE_S3_BUCKET` (default `noite`) on boot; uses root keys for deploy/reconcile
 - One rustfs bucket, two prefixes — not separate `git` / `fleets` buckets
 
 ### Process model
 
-| Process  | Role                                                |
-| -------- | --------------------------------------------------- |
-| `rustfs` | S3 + (optional) webhook → `runner:8080/webhook`     |
-| `runner` | REST API, deploy, caddy rewrite, spawn tenant celld |
-| `ui`     | Oxide control UI (server-side proxy to runner)      |
-| `caddy`  | subdomains on host ports 9080/9443                  |
+| Process  | Role                                                  |
+| -------- | ----------------------------------------------------- |
+| `rustfs` | S3 (notify disabled; runner polls + `/webhook` nudge) |
+| `runner` | REST API, deploy, caddy rewrite, spawn tenant celld   |
+| `ui`     | Oxide control UI (server-side proxy to runner)        |
+| `caddy`  | subdomains on host ports 9080/9443                    |
 
 ## Compose UX
 

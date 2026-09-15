@@ -32,7 +32,7 @@ services:
       - "${RUSTFS_CONSOLE_PORT:-9001}:9001"
     volumes:
       - rustfs-data:/data
-    networks: [drillo]
+    networks: [noite]
 
   runner:
     build:
@@ -69,7 +69,7 @@ services:
       # Volume key kept as agent-data so existing stacks keep SQLite / builds.
       - agent-data:/data
       - caddy-config:/caddy
-    networks: [drillo]
+    networks: [noite]
     depends_on:
       - rustfs
 
@@ -98,7 +98,7 @@ services:
       NOITE_DB: /data/noite-control.sqlite
     volumes:
       - ui-data:/data
-    networks: [drillo]
+    networks: [noite]
     depends_on:
       - rustfs
       - runner
@@ -121,13 +121,13 @@ services:
         # before the runner's first write; empty config runs fine in --watch.
         [ -f /etc/caddy/Caddyfile ] || printf '%s\n' '# noite-edge' > /etc/caddy/Caddyfile
         exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile --watch
-    networks: [drillo]
+    networks: [noite]
     depends_on:
       - runner
       - ui
 
 networks:
-  drillo:
+  noite:
 
 volumes:
   rustfs-data:
