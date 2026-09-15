@@ -160,3 +160,93 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
     tracing::info!(path = %cfg.caddyfile_path, n = apps.len(), "caddyfile updated");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::models::App;
+
+    fn test_config(base: &str, sub: &str, auto_https: bool, path: &str) -> Config {
+        Config {
+            bind: "0.0.0.0:8080".into(),
+            runner_token: "test-token".into(),
+            database_url: "sqlite::memory:".into(),
+            s3_endpoint: "http://rustfs:9000".into(),
+            s3_public_endpoint: "http://rustfs:9000".into(),
+            s3_bucket: "noite".into(),
+            aws_region: "us-east-1".into(),
+            aws_access_key_id: "key".into(),
+            aws_secret_access_key: "secret".into(),
+            base_domain: base.into(),
+            control_subdomain: sub.into(),
+            control_extra_hosts: vec![],
+            work_dir: "/tmp/noite-test".into(),
+            caddyfile_path: path.into(),
+            celld_bin: "celld".into(),
+            port_base: 8100,
+            poll_ms: 5000,
+            caddy_upstream_host: "runner".into(),
+            auto_https,
+            caddy_control_upstream: "ui:8080".into(),
+            caddy_api_upstream: "runner:8080".into(),
+            git_public_base: format!("https://git.{base}"),
+            ui_url: "http://ui:8080".into(),
+        }
+    }
+
+    fn test_app() -> App {
+        App {
+            id: "app-id".into(),
+            slug: "test".into(),
+            name: "Test".into(),
+            user_id: "local".into(),
+            status: "running".into(),
+            subdomain: "test.noite.now".into(),
+            git_prefix: "git/test/".into(),
+            fleet_bucket: "s3://noite/fleets/test".into(),
+            listen_port: Some(8100),
+            internal_port: Some(8101),
+            last_deploy_sha: Some("abc123".into()),
+            last_error: None,
+            desired_state: "running".into(),
+            created_at: "2026-09-15T00:00:00Z".into(),
+            updated_at: "2026-09-15T00:00:00Z".into(),
+        }
+    }
+
+    async fn rendered(cfg: &Config, apps: &[App]) -> String {
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+        rewrite_caddy(cfg, apps).await.expect("rewrite");
+        tokio::fs::read_to_string(&cfg.caddyfile_path)
+            .await
+            .expect("read back")
+    }
+
+    #[tokio::test]
+    async fn coolify_shape() {
+        let cfg = test_config("noite.now", "app", false, "/tmp/noite-test-coolify");
+        let out = rendered(&cfg, &[test_app()]).await;
+        println!("--- coolify Caddyfile ---\n{out}\n--- end ---");
+        // Behind-proxy: bare hostnames + on-demand TLS, never an http://
+        // pin combined with a tls directive (Caddy refuses to adapt that).
+        assert!(out.contains("app.noite.now {"), "control TLS site");
+        assert!(out.contains("test.noite.now {"), "tenant TLS site");
+        assert!(out.contains("api.noite.now {"), "api TLS site");
+        assert!(out.contains("on_demand"), "on-demand gate");
+        assert!(out.contains("tls-ask"), "ask endpoint");
+        assert!(out.contains("http://127.0.0.1 {"), "loopback health site");
+        assert!(!out.contains("header_up Host"), "no redundant Host");
+        assert!(!out.contains("http://app.noite.now"), "no scheme pin");
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
+    #[tokio::test]
+    async fn local_shape_unchanged() {
+        let cfg = test_config("localhost", "", false, "/tmp/noite-test-local");
+        let out = rendered(&cfg, &[test_app()]).await;
+        assert!(out.contains("http://test.localhost {"), "tenant plain site");
+        assert!(!out.contains("\ttls {"), "no TLS site in dev");
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+}
