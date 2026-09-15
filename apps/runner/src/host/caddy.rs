@@ -31,8 +31,18 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
     };
     // Behind a terminating edge proxy (Coolify/Traefik) our Caddy terminates
     // TLS itself for every hostname via on-demand certs; the proxy only
-    // TCP-forwards SNI. Everywhere else keep the existing scheme behavior.
+    // TCP-forwards SNI. Those sites use bare hostnames (both :80 plaintext
+    // and :443 TLS) — never an `http://` pin combined with a `tls`
+    // directive, which Caddy refuses to adapt. Everywhere else keep the
+    // existing scheme behavior.
     let edge_tls = !local && !cfg.auto_https;
+    let addr_of = |host: &str| -> String {
+        if edge_tls {
+            host.to_string()
+        } else {
+            site(host)
+        }
+    };
     let mut lines = vec![
         "# noite-edge".into(),
         "{".into(),
@@ -72,8 +82,16 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
         lines.push(String::new());
     };
     push_site(
-        &format!("{}, http://127.0.0.1", site(&control_site)),
+        &addr_of(&control_site),
         edge_tls,
+        &[],
+        &[],
+        &cfg.caddy_control_upstream,
+    );
+    // Plaintext loopback for container healthchecks, independent of TLS mode.
+    push_site(
+        "http://127.0.0.1",
+        false,
         &[],
         &[],
         &cfg.caddy_control_upstream,
@@ -90,7 +108,7 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
         }
         let upstream = format!("{}:{}", cfg.caddy_upstream_host, port);
         push_site(
-            &site(&format!("{}.{}", app.slug, cfg.base_domain)),
+            &addr_of(&format!("{}.{}", app.slug, cfg.base_domain)),
             edge_tls,
             &[],
             &[
@@ -102,7 +120,7 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
     }
     // API → runner (Bearer-protected REST)
     push_site(
-        &site(&format!("api.{}", cfg.base_domain)),
+        &addr_of(&format!("api.{}", cfg.base_domain)),
         edge_tls,
         &[],
         &[],
@@ -111,7 +129,7 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
 
     // Git smart-HTTP → runner `/v1/git/{slug}/…` (Basic auth inside runner)
     push_site(
-        &site(&format!("git.{}", cfg.base_domain)),
+        &addr_of(&format!("git.{}", cfg.base_domain)),
         edge_tls,
         &["rewrite * /v1/git{uri}"],
         &[],
@@ -122,7 +140,7 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
     // Tenant TLS is minted on demand (ask-gated), so no wildcard cert or
     // DNS-challenge module is needed on any platform.
     push_site(
-        &site(&format!("*.{}", cfg.base_domain)),
+        &addr_of(&format!("*.{}", cfg.base_domain)),
         !local,
         &["rewrite * /v1/edge/fallback"],
         &[],
