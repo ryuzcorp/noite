@@ -64,6 +64,9 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
                          proxy_extra: &[&str],
                          upstream: &str| {
         lines.push(format!("{addr} {{"));
+        // Access log per site (method/host/status/bytes/upstream) — the
+        // edge is otherwise a black box when a route misbehaves.
+        lines.push("\tlog".into());
         if tls {
             lines.push("\ttls {".into());
             lines.push("\t\ton_demand".into());
