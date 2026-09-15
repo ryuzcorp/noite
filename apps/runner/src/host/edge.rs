@@ -5,8 +5,10 @@
 //! Paused; app without a deploy → 404 Not deployed yet. Self-contained HTML
 //! (no UI build involved), public route (own lookup, no bearer token).
 
+use std::collections::HashMap;
+
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
 };
@@ -159,6 +161,71 @@ pub async fn edge_fallback(
     )
 }
 
+/// Structural allowlist for the Caddy `on_demand_tls` ask gate: platform
+/// hosts (control/api/git + extra) are always ours; tenant slugs need a DB
+/// liveness check (done by the caller). Never localhost — dev has no public
+/// TLS and must not trigger issuance attempts.
+pub fn tls_ask_static_ok(
+    host: &str,
+    base_domain: &str,
+    control_sub: &str,
+    extra_hosts: &[String],
+) -> bool {
+    if base_domain == "localhost" || base_domain.trim().is_empty() {
+        return false;
+    }
+    let bare = host
+        .split_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host)
+        .trim()
+        .to_lowercase();
+    if bare.is_empty() {
+        return false;
+    }
+    let control = if control_sub.is_empty() {
+        base_domain.to_owned()
+    } else {
+        format!("{control_sub}.{base_domain}")
+    };
+    bare == control
+        || bare == format!("api.{base_domain}")
+        || bare == format!("git.{base_domain}")
+        || extra_hosts
+            .iter()
+            .any(|h| h.trim().to_lowercase() == bare)
+}
+
+/// Caddy `on_demand_tls` gate (`GET /v1/edge/tls-ask?domain=`): 200 only
+/// for hostnames that are really ours — platform hosts statically, tenant
+/// slugs when deployed and running. Public (Caddy calls without
+/// credentials), read-only; unknown names get 404 so no cert is minted.
+pub async fn tls_ask(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let cfg = &state.config;
+    let domain = params.get("domain").map(String::as_str).unwrap_or("");
+    if tls_ask_static_ok(
+        domain,
+        &cfg.base_domain,
+        &cfg.control_subdomain,
+        &cfg.control_extra_hosts,
+    ) {
+        return StatusCode::OK;
+    }
+    let Some(slug) = parse_edge_slug(domain, &cfg.base_domain, &cfg.control_subdomain) else {
+        return StatusCode::NOT_FOUND;
+    };
+    if !crate::lifecycle::slug_ok(&slug) {
+        return StatusCode::NOT_FOUND;
+    }
+    match crate::db::get_app_by_slug(&state.pool, &slug).await {
+        Ok(Some(app)) if !app.is_stopped() && app.is_deployed() => StatusCode::OK,
+        _ => StatusCode::NOT_FOUND,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +240,31 @@ mod tests {
             parse_edge_slug("my-app.noite.now", "noite.now", "app"),
             Some("my-app".to_string())
         );
+    }
+
+    #[test]
+    fn tls_gate_allows_platform_hosts() {
+        let extra = vec!["xyz-123.wild.example".to_string()];
+        assert!(tls_ask_static_ok("app.noite.now", "noite.now", "app", &[]));
+        assert!(tls_ask_static_ok(
+            "app.noite.now:443",
+            "noite.now",
+            "app",
+            &[]
+        ));
+        assert!(tls_ask_static_ok("api.noite.now", "noite.now", "app", &[]));
+        assert!(tls_ask_static_ok("git.noite.now", "noite.now", "app", &[]));
+        assert!(tls_ask_static_ok(
+            "XYZ-123.wild.example",
+            "noite.now",
+            "app",
+            &extra
+        ));
+        assert!(!tls_ask_static_ok("evil.com", "noite.now", "app", &extra));
+        assert!(!tls_ask_static_ok("test.noite.now", "noite.now", "app", &[]));
+        assert!(!tls_ask_static_ok("noite.now", "noite.now", "app", &[]));
+        assert!(!tls_ask_static_ok("app.noite.now", "localhost", "", &[]));
+        assert!(!tls_ask_static_ok("anything", "", "app", &[]));
     }
 
     #[test]

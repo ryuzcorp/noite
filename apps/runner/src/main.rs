@@ -93,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(api::health))
         .route("/v1/edge/fallback", get(host::edge::edge_fallback))
+        .route("/v1/edge/tls-ask", get(host::edge::tls_ask))
         .route("/webhook", post(api::webhook))
         .route("/v1/apps", get(api::list_apps).post(api::create_app))
         .route(

@@ -1,4 +1,5 @@
--- Drillo agent schema (control plane; no Better Auth in v1)
+-- Noite runner schema, single migration (fresh DBs only; old multi-file
+-- history was compacted, so pre-existing databases must be reset).
 CREATE TABLE IF NOT EXISTS app (
   id TEXT PRIMARY KEY NOT NULL,
   slug TEXT NOT NULL UNIQUE,
@@ -42,3 +43,17 @@ CREATE TABLE IF NOT EXISTS deploy (
 );
 
 CREATE INDEX IF NOT EXISTS idx_deploy_app ON deploy(app_id);
+
+-- Per-app usage metrics (requests from celld OTel spans, CPU time sampled
+-- from the fleet process). Minute-bucketed, UTC text keys sortable.
+CREATE TABLE IF NOT EXISTS app_metric (
+  app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,
+  bucket_ts TEXT NOT NULL,          -- start-of-minute ISO-8601 UTC
+  requests INTEGER NOT NULL DEFAULT 0,
+  errors INTEGER NOT NULL DEFAULT 0,
+  latency_ms INTEGER NOT NULL DEFAULT 0,
+  cpu_ms INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (app_id, bucket_ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_app_metric_app_bucket ON app_metric(app_id, bucket_ts);

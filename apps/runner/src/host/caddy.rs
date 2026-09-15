@@ -29,19 +29,55 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
             host.to_string()
         }
     };
+    // Behind a terminating edge proxy (Coolify/Traefik) our Caddy terminates
+    // TLS itself for every hostname via on-demand certs; the proxy only
+    // TCP-forwards SNI. Everywhere else keep the existing scheme behavior.
+    let edge_tls = !local && !cfg.auto_https;
     let mut lines = vec![
         "# noite-edge".into(),
         "{".into(),
         format!("\tauto_https {auto_https}"),
-        "}".into(),
-        String::new(),
-        format!("{}, http://127.0.0.1 {{", site(&control_site)),
-        format!("\treverse_proxy {} {{", cfg.caddy_control_upstream),
-        "\t\tflush_interval -1".into(),
+        "\ton_demand_tls {".into(),
+        format!("\t\task http://{}/v1/edge/tls-ask", cfg.caddy_api_upstream),
         "\t}".into(),
         "}".into(),
         String::new(),
     ];
+    // One reverse-proxy site block; `tls` adds an on-demand TLS gate so the
+    // site serves HTTPS with per-hostname certs (no wildcard cert needed).
+    // Site-level extras (e.g. `rewrite`) go in the site block; proxy options
+    // (e.g. `header_up`) MUST go inside `reverse_proxy` — Caddy rejects
+    // them at site level and then keeps serving the stale config.
+    let mut push_site = |addr: &str,
+                         tls: bool,
+                         site_extra: &[&str],
+                         proxy_extra: &[&str],
+                         upstream: &str| {
+        lines.push(format!("{addr} {{"));
+        if tls {
+            lines.push("\ttls {".into());
+            lines.push("\t\ton_demand".into());
+            lines.push("\t}".into());
+        }
+        for line in site_extra {
+            lines.push(format!("\t{line}"));
+        }
+        lines.push(format!("\treverse_proxy {upstream} {{"));
+        for line in proxy_extra {
+            lines.push(format!("\t\t{line}"));
+        }
+        lines.push("\t\tflush_interval -1".into());
+        lines.push("\t}".into());
+        lines.push("}".into());
+        lines.push(String::new());
+    };
+    push_site(
+        &format!("{}, http://127.0.0.1", site(&control_site)),
+        edge_tls,
+        &[],
+        &[],
+        &cfg.caddy_control_upstream,
+    );
     for app in apps {
         let Some(port) = app.listen_port else {
             continue;
@@ -52,45 +88,46 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
         if app.is_stopped() || !app.is_deployed() {
             continue;
         }
-        lines.push(format!("{} {{", site(&format!("{}.{}", app.slug, cfg.base_domain))));
-        lines.push(format!(
-            "\treverse_proxy {}:{} {{",
-            cfg.caddy_upstream_host, port
-        ));
-        lines.push("\t\theader_up X-Forwarded-Host {http.request.hostport}".into());
-        lines.push("\t\theader_up X-Forwarded-Proto {http.request.scheme}".into());
-        lines.push("\t\tflush_interval -1".into());
-        lines.push("\t}".into());
-        lines.push("}".into());
-        lines.push(String::new());
+        let upstream = format!("{}:{}", cfg.caddy_upstream_host, port);
+        push_site(
+            &site(&format!("{}.{}", app.slug, cfg.base_domain)),
+            edge_tls,
+            &[],
+            &[
+                "header_up X-Forwarded-Host {http.request.hostport}",
+                "header_up X-Forwarded-Proto {http.request.scheme}",
+            ],
+            &upstream,
+        );
     }
     // API → runner (Bearer-protected REST)
-    lines.push(format!("{} {{", site(&format!("api.{}", cfg.base_domain))));
-    lines.push(format!("\treverse_proxy {} {{", cfg.caddy_api_upstream));
-    lines.push("\t\tflush_interval -1".into());
-    lines.push("\t}".into());
-    lines.push("}".into());
-    lines.push(String::new());
+    push_site(
+        &site(&format!("api.{}", cfg.base_domain)),
+        edge_tls,
+        &[],
+        &[],
+        &cfg.caddy_api_upstream,
+    );
 
     // Git smart-HTTP → runner `/v1/git/{slug}/…` (Basic auth inside runner)
-    lines.push(format!("{} {{", site(&format!("git.{}", cfg.base_domain))));
-    lines.push("\trewrite * /v1/git{uri}".into());
-    lines.push(format!("\treverse_proxy {} {{", cfg.caddy_api_upstream));
-    lines.push("\t\tflush_interval -1".into());
-    lines.push("\t}".into());
-    lines.push("}".into());
-    lines.push(String::new());
+    push_site(
+        &site(&format!("git.{}", cfg.base_domain)),
+        edge_tls,
+        &["rewrite * /v1/git{uri}"],
+        &[],
+        &cfg.caddy_api_upstream,
+    );
 
     // Fallback: unknown slugs + stopped apps → runner edge page (per-Host).
-    // NOTE: a wildcard site needs a DNS-challenge module for auto_https in
-    // prod; without one only the concrete sites above get certificates.
-    lines.push(format!("{} {{", site(&format!("*.{}", cfg.base_domain))));
-    lines.push("\trewrite * /v1/edge/fallback".into());
-    lines.push(format!("\treverse_proxy {} {{", cfg.caddy_api_upstream));
-    lines.push("\t\tflush_interval -1".into());
-    lines.push("}".into());
-    lines.push("}".into());
-    lines.push(String::new());
+    // Tenant TLS is minted on demand (ask-gated), so no wildcard cert or
+    // DNS-challenge module is needed on any platform.
+    push_site(
+        &site(&format!("*.{}", cfg.base_domain)),
+        !local,
+        &["rewrite * /v1/edge/fallback"],
+        &[],
+        &cfg.caddy_api_upstream,
+    );
 
     let next = lines.join("\n");
     let path = Path::new(&cfg.caddyfile_path);

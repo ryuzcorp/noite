@@ -76,6 +76,9 @@ impl Config {
             anyhow::bail!("RUNNER_TOKEN must not be empty");
         }
         let base_domain = env::var("BASE_DOMAIN").unwrap_or_else(|_| "localhost".into());
+        if base_domain.trim().is_empty() {
+            anyhow::bail!("BASE_DOMAIN must not be empty (got blank); set it to your domain, e.g. noite.now");
+        }
         if base_domain != "localhost" && runner_token == "dev-runner-token" {
             anyhow::bail!(
                 "refusing default RUNNER_TOKEN on non-localhost {base_domain}; set RUNNER_TOKEN in .env"

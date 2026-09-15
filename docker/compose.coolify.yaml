@@ -23,10 +23,11 @@
 #      from the dashboard Domains field, so paste this once on the `caddy`
 #      service (one entry per hostname, https, port 80, empty path):
 #        https://app.BASE_DOMAIN:80,https://api.BASE_DOMAIN:80,https://git.BASE_DOMAIN:80
-#      Internal Caddy routes by Host header, so every public hostname must
-#      land on `caddy:80` (CADDY_AUTO_HTTPS=off below; Coolify terminates
-#      TLS). Tenant slugs need their own entries as you deploy them, or one
-#      wildcard entry plus a DNS-challenge wildcard cert at the proxy level.
+#      Tenant slugs are automatic: the `traefik.*` labels below TCP-forward
+#      every `*.BASE_DOMAIN` SNI to our Caddy on `:443`, which mints
+#      per-slug certs on demand (runner ask-gated; first visit pauses a few
+#      seconds). One-time needs: `*.BASE_DOMAIN` DNS → the server, labels
+#      intact (check the `noite-tenants` router in Traefik dashboard).
 #      Do NOT point the apex at caddy — it stays on marketing/GitHub Pages.
 #
 # NOTES
@@ -149,6 +150,20 @@ services:
     environment:
       # Auto-provision Coolify's generated domain and route it to caddy:80.
       SERVICE_URL_CADDY_80: /
+    labels:
+      # Tenant TLS: Traefik TCP-forwards every *.BASE SNI straight to our
+      # Caddy, which mints per-slug certs on demand (ask-gated at the
+      # runner — no wildcard cert or DNS provider needed, zero per-app
+      # steps). app./api./git pass through here too and are served by our
+      # Caddy over the same on-demand certs; :80 keeps the Coolify HTTP
+      # routes (redirects, healthchecks, HTTP-01 challenges). If Coolify
+      # ever drops custom labels, move these to a Raw Compose Deployment.
+      - "traefik.enable=true"
+      - "traefik.tcp.routers.noite-tenants.entrypoints=websecure"
+      - "traefik.tcp.routers.noite-tenants.rule=HostSNIRegexp(`^.+\\.${BASE_DOMAIN}$`)"
+      - "traefik.tcp.routers.noite-tenants.service=noite-tenants"
+      - "traefik.tcp.routers.noite-tenants.tls.passthrough=true"
+      - "traefik.tcp.services.noite-tenants.loadbalancer.server.port=443"
     expose:
       - "80"
       - "443"
