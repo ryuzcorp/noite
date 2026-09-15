@@ -11,7 +11,8 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
     // (dev `localhost` — the only hostname Bitwarden's matcher accepts
     // without https) or on `{sub}.{domain}` in prod (`app`, apex stays free
     // for marketing). `http://` pins plain HTTP for dev; prod uses bare
-    // hostnames so auto_https serves https://app.{domain} + https://{app}.{domain}.
+    // hostnames so TLS serves https://app.{domain} + https://{app}.{domain}
+    // (automatic certs, or on-demand behind a proxy).
     let mut control_hosts = vec![if cfg.control_subdomain.is_empty() {
         cfg.base_domain.clone()
     } else {

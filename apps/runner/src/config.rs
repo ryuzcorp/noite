@@ -1,7 +1,8 @@
 use std::env;
 
 /// Caddy `auto_https`: explicit off wins (behind-proxy deployments like
-/// Coolify, which terminates TLS itself); otherwise on except `localhost`.
+/// Coolify, where Traefik TCP-forwards SNI and our Caddy terminates per-host
+/// TLS itself via on-demand certs); otherwise on except `localhost`.
 /// Comma-separated hostname list (`CONTROL_EXTRA_HOSTS`).
 fn parse_host_list(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -56,7 +57,8 @@ pub struct Config {
     pub poll_ms: u64,
     pub caddy_upstream_host: String,
     /// Caddy `auto_https`: unset = on except `localhost`; explicit
-    /// `off` for behind-proxy deployments (Coolify terminates TLS).
+    /// `off` for behind-proxy deployments (our Caddy still terminates
+    /// per-host TLS itself via on-demand certs).
     pub auto_https: bool,
     pub caddy_control_upstream: String,
     pub caddy_api_upstream: String,

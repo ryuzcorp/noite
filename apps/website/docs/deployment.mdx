@@ -11,7 +11,7 @@ Noite ships as four containers: **runner** (deploy pipeline, fleet supervisor, C
 | Start | `make up` | `make up-byob` |
 | S3 | RustFS container (`:9000`) | AWS S3 / MinIO / R2 / Ceph — anything SigV4 |
 
-Coolify? Use `docker/compose.coolify.yaml` instead — same stack, automatic generated domain plus Coolify-managed proxy/secrets (see README).
+Coolify? Use `docker/compose.coolify.yaml` instead — same stack, generated secrets plus Coolify-managed proxy/secrets. See [Coolify](#coolify) below for the full setup including tenant subdomains.
 
 ## Prerequisites
 
@@ -63,6 +63,26 @@ make logs                                           # runner + ui + caddy
 ```
 
 Push the sample app via `apps/noite/test/deploy.sh` (point its remote at `https://git.<domain>/<slug>`) and open `https://<slug>.<domain>`.
+
+## Coolify
+
+Point a Docker Compose resource at `docker/compose.coolify.yaml` (repo root, branch `main`). In Environment Variables, set the required `BASE_DOMAIN` (secrets auto-generate — just save); `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` derive from it unless overridden. Deploy, then paste the real hostnames once on the `caddy` service Domains field: `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. The apex stays on your marketing site.
+
+Tenant subdomains (`<slug>.<domain>`) are fully automatic — no per-app steps, no wildcard cert, no DNS provider. How it works: a Traefik TCP router forwards every `*.<domain>` SNI straight to our Caddy on `:443`, and our Caddy mints a per-slug certificate on demand (ask-gated by the runner at `/v1/edge/tls-ask`, so only live tenant and platform hosts get certs). Plain-HTTP `:80` routes keep working alongside via per-site twins in the generated Caddyfile.
+
+One-time setup (besides `*.<domain>` DNS pointing at the server): save this file under `Servers > server > Proxy > Dynamic Configurations` in Coolify. It is static text — unlike compose labels, Coolify can't mangle it — and `noite-tenants@docker` resolves the TCP service the compose file defines:
+
+```yaml
+tcp:
+  routers:
+    noite-tenants:
+      entryPoints: [https]
+      rule: 'HostSNIRegexp(`^.+\.<domain>$`)'
+      service: noite-tenants@docker
+      tls: { passthrough: true }
+```
+
+Then redeploy once and confirm the `noite-tenants` router in the Traefik dashboard. The first visit to a new slug pauses a few seconds for certificate issuance; certs persist in the `caddy-data` volume. If passthrough misbehaves, the fallback is `https://<slug>.<domain>:80` per app (exact hostnames use the plain HTTP challenge).
 
 ## Data & backups
 
