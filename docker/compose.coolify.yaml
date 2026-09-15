@@ -160,9 +160,11 @@ services:
       - -c
       - |
         # Single owner for routes: the runner rewrites this file every reconcile
-        # (5 s). We only make sure the file exists so `caddy run` can start
-        # before the runner's first write; empty config runs fine in --watch.
-        [ -f /etc/caddy/Caddyfile ] || printf '%s\n' '# noite-edge' > /etc/caddy/Caddyfile
+        # (5 s). Until its first write, serve a `:80` starting page so caddy
+        # is healthy and routable from boot (an empty config listens on
+        # nothing, which fails the healthcheck and yields "No Available
+        # Server" at the proxy). Skipped when a real Caddyfile already exists.
+        [ -f /etc/caddy/Caddyfile ] || printf '%s\n' ':80 {' '  respond "noite edge starting" 200' '}' > /etc/caddy/Caddyfile
         exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile --watch
     networks: [noite]
     depends_on:
