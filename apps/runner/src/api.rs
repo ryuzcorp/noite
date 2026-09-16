@@ -31,6 +31,19 @@ pub async fn health() -> impl IntoResponse {
     Json(json!({ "ok": true, "service": "noite-runner" }))
 }
 
+/// Readiness for the edge: 200 only after the first successful reconcile
+/// pass (fleets spawned, Caddyfile written). Liveness stays on /health.
+/// Compose healthchecks and Coolify route on this, so tenants are never
+/// sent to a runner whose fleets are still cold-booting.
+pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
+    if state.ready.load(std::sync::atomic::Ordering::Relaxed) {
+        Json(json!({ "ok": true, "service": "noite-runner" })).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "ok": false })))
+            .into_response()
+    }
+}
+
 pub async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
     match db::list_apps(&state.pool).await {
         Ok(apps) => Json(apps).into_response(),

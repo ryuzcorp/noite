@@ -68,6 +68,12 @@ Push the sample app via `apps/noite/test/deploy.sh` (point its remote at `https:
 
 Point a Docker Compose resource at `docker/compose.coolify.yaml` (repo root, branch `main`). In Environment Variables, set the required `BASE_DOMAIN` (secrets auto-generate — just save); `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` derive from it unless overridden. Deploy, then paste the real hostnames once on the `caddy` service Domains field: `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. The apex stays on your marketing site.
 
+### Downtime model
+
+Coolify does rolling updates only for single-image apps — **not for Compose**. `docker compose up` stops a service before starting its replacement, so this file minimizes services and recreates: one joint control image (runner+UI, baked by `.github/workflows/images.yml` from `railpack.json` and published to `ghcr.io/ryuzcorp/noite` on every main push — enable the workflow once and, for a private repo, make the package public or add registry auth in Coolify), plus RustFS and Caddy. `pull_policy: always` re-pulls each deploy, and Compose recreates only services whose image changed.
+
+The trade for a single control image: **any** control change (UI or runner) restarts both together and fleets cold-boot — roughly a minute for many apps. Batch control changes, deploy them off-peak, and pin `NOITE_RELEASE` to a SHA/tag for reproducibility (`latest` follows main). Readiness is honest: the control healthcheck gates on runner `/ready` (first reconcile done, fleets spawned, Caddyfile written — not the instant `/health`) plus the UI root, and caddy starts only after control is healthy, so the edge never routes to a cold runner.
+
 Tenant subdomains (`<slug>.<domain>`) are fully automatic — no per-app steps, no wildcard cert, no DNS provider. How it works: a Traefik TCP router forwards every `*.<domain>` SNI straight to our Caddy on `:443`, and our Caddy mints a per-slug certificate on demand (ask-gated by the runner at `/v1/edge/tls-ask`, so only live tenant and platform hosts get certs). Plain-HTTP `:80` routes keep working alongside via per-site twins in the generated Caddyfile.
 
 One-time setup (besides `*.<domain>` DNS pointing at the server): save this file under `Servers > server > Proxy > Dynamic Configurations` in Coolify. It is static text — unlike compose labels, Coolify can't mangle it — and `noite-tenants@docker` resolves the TCP service the compose file defines:
@@ -86,4 +92,4 @@ Then redeploy once and confirm the `noite-tenants` router in the Traefik dashboa
 
 ## Data & backups
 
-State lives in named volumes: `agent-data` (runner SQLite, git mirrors, fleet state), `ui-data` (control DB), `rustfs-data` (option A only). Back those up; images are disposable. `make down` keeps volumes, `make reset` deletes them.
+State lives in named volumes. Local split stack: `agent-data` (runner SQLite, git mirrors, fleet state) + `ui-data` (control DB). Coolify joint stack: single `control-data` (`runner.sqlite` + `ui.sqlite`) + `rustfs-data` (bundled S3 only). Back those up; images are disposable. `make down` keeps volumes, `make reset` deletes them.

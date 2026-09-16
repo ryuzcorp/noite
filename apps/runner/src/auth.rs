@@ -10,12 +10,14 @@ use crate::AppState;
 
 pub async fn require_bearer(state: AppState, req: Request, next: Next) -> Response {
     let path = req.uri().path();
-    // Health is public. Git smart-HTTP uses its own Basic auth per slug.
+    // Health/readiness are public (edge + orchestrator probes carry no
+    // credentials). Git smart-HTTP uses its own Basic auth per slug.
     // /webhook stays bearer-gated (deploy nudge / optional S3 notify).
     // The edge fallback page does its own lookup and carries no secrets.
     // The TLS ask gate is likewise public: Caddy calls it without
     // credentials and it only answers whether a hostname may have a cert.
     if path == "/health"
+        || path == "/ready"
         || path.starts_with("/v1/git/")
         || path == "/v1/edge/fallback"
         || path == "/v1/edge/tls-ask"

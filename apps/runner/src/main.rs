@@ -15,7 +15,10 @@ mod lifecycle;
 mod models;
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::AtomicBool,
+};
 
 use axum::{
     middleware,
@@ -40,6 +43,10 @@ pub struct AppState {
     pub logs: LogState,
     pub deploying: Deploying,
     pub git_sync: host::git_manifest::GitSync,
+    /// Set after the first successful reconcile pass (fleets spawned,
+    /// Caddyfile written). Gates /ready so the edge never routes to a
+    /// runner whose tenants are still cold-booting.
+    pub ready: Arc<AtomicBool>,
 }
 
 #[tokio::main]
@@ -71,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
 
     let deploying = host::deploy::new_deploying();
     let metrics = host::metrics::new_state();
+    let ready = Arc::new(AtomicBool::new(false));
     let state = AppState {
         pool: pool.clone(),
         config: config.clone(),
@@ -78,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         logs: logs.clone(),
         deploying: deploying.clone(),
         git_sync: host::git_manifest::GitSync::default(),
+        ready: ready.clone(),
     };
 
     let cfg_loop = (*config).clone();
@@ -88,10 +97,12 @@ async fn main() -> anyhow::Result<()> {
         logs,
         deploying,
         metrics,
+        ready,
     ));
 
     let app = Router::new()
         .route("/health", get(api::health))
+        .route("/ready", get(api::ready))
         .route("/v1/edge/fallback", get(host::edge::edge_fallback))
         .route("/v1/edge/tls-ask", get(host::edge::tls_ask))
         .route("/webhook", post(api::webhook))

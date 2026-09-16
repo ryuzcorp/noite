@@ -1,5 +1,9 @@
 //! Reconcile tick: desired_state → fleet processes, tip poll → deploy, Caddy, metrics.
 //! Named `loop_` because `loop` is a Rust keyword.
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use sqlx::SqlitePool;
@@ -22,6 +26,7 @@ pub async fn run_forever(
     logs: LogState,
     deploying: Deploying,
     mut metrics: MetricsState,
+    ready: Arc<AtomicBool>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(cfg.poll_ms));
     loop {
@@ -29,6 +34,8 @@ pub async fn run_forever(
         if let Err(e) = reconcile_once(&pool, &cfg, &procs, &logs, &deploying, &mut metrics).await
         {
             tracing::error!(error = %e, "reconcile");
+        } else {
+            ready.store(true, Ordering::Relaxed);
         }
     }
 }

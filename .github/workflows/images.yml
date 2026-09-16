@@ -1,0 +1,65 @@
+# Production control image for the Coolify Compose stack (ghcr.io).
+#
+# One joint image — Rust runner + Bun control UI — defined declaratively in
+# railpack.json and built through the Railpack BuildKit frontend, so plain
+# buildx handles push/cache/multi-arch. Coolify does NOT rolling-update
+# Compose apps, so prod never builds: this workflow bakes the immutable
+# image per commit, and docker/compose.coolify.yaml pulls it by tag.
+# A control-image change restarts runner+UI together (fleets cold-boot),
+# so batch control changes and pin NOITE_RELEASE to a SHA/tag.
+#
+# Tags: `latest` + short SHA on main; version tags (v*) also push `stable`.
+# In Coolify, pin NOITE_RELEASE for reproducible deploys, or leave it
+# `latest` to follow main (pull_policy: always re-pulls).
+name: images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/runner/**"
+      - "apps/noite/**"
+      - "docker/Dockerfile.railpack"
+      - "docker/noite-joint.sh"
+      - "railpack.json"
+      - ".github/workflows/images.yml"
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/noite
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=,format=short
+            type=semver,pattern={{version}}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile.railpack
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -8,6 +8,20 @@
 #
 # Noite on Coolify — production Compose definition.
 #
+# DOWNTIME MODEL (read before chasing rolling updates): Coolify does NOT
+# rolling-update Compose apps — it runs `docker compose up`, which stops a
+# service before starting its replacement. So this file minimizes services
+# and recreates: one joint control image (runner+UI, baked by CI from
+# railpack.json → ghcr.io, `pull_policy: always`), RustFS, and Caddy.
+# Unchanged image digest = no recreate. ANY control-image change restarts
+# runner+UI together and fleets cold-boot (≈1–2 min for many apps) — batch
+# control changes, deploy them off-peak, and pin NOITE_RELEASE to a
+# SHA/tag for reproducibility (leave `latest` to follow main).
+#   - The control healthcheck gates on runner /ready (first reconcile done,
+#     fleets spawned, Caddyfile written) AND the UI root — caddy starts
+#     only after control is healthy, so the edge never routes to a cold
+#     runner.
+#
 # HOW TO DEPLOY
 #   1. Coolify → New Resource → Docker Compose (Git repository):
 #        repository = your noite repo, branch = main,
@@ -71,20 +85,27 @@ services:
       - rustfs-data:/data
     networks: [noite]
 
-  runner:
-    build:
-      context: ./apps/runner
-      dockerfile: Dockerfile
-    image: noite-runner:coolify
-    hostname: runner
+  # Joint control plane: Rust runner (:8080, fleets + Caddyfile) and Bun
+  # control UI (:8081) supervised in one container (docker/noite-joint.sh).
+  # One image = one recreate: any control change restarts both together.
+  control:
+    # Never build on prod: Railpack-baked immutable image, re-pulled
+    # every deploy (see railpack.json + images.yml).
+    image: ${NOITE_CONTROL_IMAGE:-ghcr.io/ryuzcorp/noite}:${NOITE_RELEASE:-latest}
+    pull_policy: always
+    hostname: control
     restart: unless-stopped
     stop_grace_period: 30s
     environment:
       <<: *aws
       RUNNER_BIND: "0.0.0.0:8080"
+      PORT: "8081"
       RUNNER_TOKEN: ${SERVICE_PASSWORD_64_RUNNER}
+      RUNNER_URL: http://127.0.0.1:8080
+      UI_URL: ${UI_URL:-http://127.0.0.1:8081}
       RUST_LOG: ${RUST_LOG:-noite_runner=info,tower_http=info}
-      NOITE_DB: /data/noite.sqlite
+      NOITE_RUNNER_DB: /data/runner.sqlite
+      NOITE_UI_DB: /data/ui.sqlite
       S3_ENDPOINT: http://rustfs:9000
       S3_PUBLIC_ENDPOINT: http://rustfs:9000
       NOITE_S3_BUCKET: ${NOITE_S3_BUCKET:-noite}
@@ -92,62 +113,40 @@ services:
       CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-app}
       CADDY_AUTO_HTTPS: "off"
       CADDYFILE_PATH: /caddy/Caddyfile
-      CADDY_UPSTREAM_HOST: runner
-      CADDY_CONTROL_UPSTREAM: ui:8080
-      CADDY_API_UPSTREAM: runner:8080
+      CADDY_UPSTREAM_HOST: control
+      CADDY_CONTROL_UPSTREAM: control:8081
+      CADDY_API_UPSTREAM: control:8080
       CONTROL_EXTRA_HOSTS: ${SERVICE_FQDN_CADDY_80}
       RUNNER_WORK_DIR: /data/runner
       PORT_BASE: "8100"
       RUNNER_POLL_MS: "5000"
       CELLD_BIN: celld
       GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-https://git.${BASE_DOMAIN}}
-      UI_URL: ${UI_URL:-http://ui:8080}
+      BETTER_AUTH_SECRET: ${SERVICE_PASSWORD_64_AUTH}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-https://app.${BASE_DOMAIN}}
+      # Instance admin bootstrap address (empty = disabled).
+      NOITE_ADMIN_EMAIL: ${NOITE_ADMIN_EMAIL:-}
     volumes:
-      - agent-data:/data
+      # One volume for the whole control plane: runner SQLite + fleet
+      # state next to the UI DB, with ownership in the filename. Fresh
+      # names for the joint era — the split-era agent-data/ui-data volumes
+      # are simply left unused (alpha: re-register + re-push after moving).
+      - control-data:/data
       - caddy-config:/caddy
     networks: [noite]
     depends_on:
       - rustfs
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
+      # Runner /ready (fleets spawned, Caddyfile written) AND the UI root.
+      test:
+        [
+          "CMD-SHELL",
+          "curl -f http://127.0.0.1:8080/ready && curl -f http://127.0.0.1:8081/",
+        ]
+      interval: 10s
       timeout: 5s
       retries: 3
       start_period: 180s
-
-  ui:
-    # Immutable image: deps + vite build baked at `docker build` time.
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.control
-    image: noite-control-ui:coolify
-    hostname: ui
-    restart: unless-stopped
-    stop_grace_period: 15s
-    environment:
-      <<: *aws
-      PORT: "8080"
-      RUNNER_URL: http://runner:8080
-      RUNNER_TOKEN: ${SERVICE_PASSWORD_64_RUNNER}
-      BETTER_AUTH_SECRET: ${SERVICE_PASSWORD_64_AUTH}
-      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-https://app.${BASE_DOMAIN}}
-      BASE_DOMAIN: ${BASE_DOMAIN:?}
-      CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-app}
-      NOITE_DB: /data/noite-control.sqlite
-      # Instance admin bootstrap address (empty = disabled).
-      NOITE_ADMIN_EMAIL: ${NOITE_ADMIN_EMAIL:-}
-    volumes:
-      - ui-data:/data
-    networks: [noite]
-    depends_on:
-      - rustfs
-      - runner
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 120s
 
   caddy:
     image: docker.io/library/caddy:2.10.0-alpine
@@ -184,8 +183,8 @@ services:
         exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile --watch
     networks: [noite]
     depends_on:
-      - runner
-      - ui
+      control:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "-O/dev/null", "http://127.0.0.1/"]
       interval: 30s
@@ -198,7 +197,6 @@ networks:
 
 volumes:
   rustfs-data:
-  agent-data:
-  ui-data:
+  control-data:
   caddy-config:
   caddy-data:
