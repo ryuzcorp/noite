@@ -72,7 +72,10 @@ jobs:
         with:
           context: .
           file: railpack-plan.json
-          build-args: BUILDKIT_SYNTAX=ghcr.io/railwayapp/railpack-frontend:v0.0.32
+          # Unpinned on purpose: frontend tags (v0.0.x) are decoupled from
+          # the CLI and go stale — v0.0.32 cannot even parse current plans
+          # (verified locally). Upstream docs use :latest everywhere.
+          build-args: BUILDKIT_SYNTAX=ghcr.io/railwayapp/railpack-frontend:latest
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/noite,push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.platform }}
