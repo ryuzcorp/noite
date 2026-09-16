@@ -23,7 +23,6 @@ on:
     paths:
       - "apps/runner/**"
       - "apps/noite/**"
-      - "docker/Dockerfile.railpack"
       - "docker/noite-joint.sh"
       - "railpack.json"
       - ".github/workflows/images.yml"
@@ -61,11 +60,18 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Pinned Railpack CLI: generates railpack-plan.json for the BuildKit
+      # frontend (the frontend cannot read railpack.json itself).
+      - run: |
+          curl -sSL https://railpack.com/install.sh -o /tmp/railpack-install.sh
+          RAILPACK_VERSION=0.39.0 sh /tmp/railpack-install.sh --bin-dir "$HOME/.local/bin"
+          "$HOME/.local/bin/railpack" prepare --plan-out railpack-plan.json .
       - id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          file: docker/Dockerfile.railpack
+          file: railpack-plan.json
+          build-args: BUILDKIT_SYNTAX=ghcr.io/railwayapp/railpack-frontend:v0.0.32
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/noite,push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.platform }}

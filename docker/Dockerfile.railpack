@@ -1,7 +1,0 @@
-# syntax=ghcr.io/railwayapp/railpack-frontend:v0.0.32
-# Joint control image (runner binary + UI) built from railpack.json at the
-# repo root via plain buildx — push, cache, and multi-arch all work as usual:
-#   docker buildx build -f docker/Dockerfile.railpack -t <tag> --push .
-# The frontend has its own versioning (NOT the railpack CLI version) —
-# re-pin when upgrading. Local dev keeps the explicit Dockerfiles
-# (compose.yaml) — this file is Coolify/CI only.
