@@ -63,8 +63,9 @@ jobs:
       # Pinned Railpack CLI: generates railpack-plan.json for the BuildKit
       # frontend (the frontend cannot read railpack.json itself).
       - run: |
+          mkdir -p "$HOME/.local/bin"
           curl -sSL https://railpack.com/install.sh -o /tmp/railpack-install.sh
-          RAILPACK_VERSION=0.39.0 sh /tmp/railpack-install.sh --bin-dir "$HOME/.local/bin"
+          RAILPACK_VERSION=0.39.0 bash /tmp/railpack-install.sh --bin-dir "$HOME/.local/bin"
           "$HOME/.local/bin/railpack" prepare --plan-out railpack-plan.json .
       - id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
