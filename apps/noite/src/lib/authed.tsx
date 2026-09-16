@@ -32,6 +32,9 @@ export const Authed = ({
   fallback?: View;
 }) => {
   const ready = atom(false);
+  const impersonatedEmail = atom("");
+  const returning = atom(false);
+  const returnError = atom("");
 
   watch.once(() => {
     void (async () => {
@@ -40,6 +43,15 @@ export const Authed = ({
         // oxlint-disable-next-line eslint/no-await-in-loop -- sequential cookie-readiness poll; Promise.all would defeat the early-exit
         const { data } = await authClient.getSession();
         if (data?.user) {
+          // SAFETY: the admin plugin adds an optional impersonatedBy id to
+          // sessions it creates; presence means this session is impersonated.
+          const session = data.session as
+            | { impersonatedBy?: unknown }
+            | null
+            | undefined;
+          if (session?.impersonatedBy) {
+            impersonatedEmail.set(data.user.email);
+          }
           ready.set(true);
           return;
         }
@@ -50,5 +62,51 @@ export const Authed = ({
     })();
   });
 
-  return ready() ? children : fallback;
+  const stopImpersonating = async () => {
+    returning.set(true);
+    returnError.set("");
+    try {
+      const result = await authClient.admin.stopImpersonating({});
+      if (result.error) {
+        returnError.set(
+          result.error.message ?? "Failed to return to admin session"
+        );
+        returning.set(false);
+        return;
+      }
+      hardNav("/god-mode");
+    } catch (error) {
+      returnError.set(error instanceof Error ? error.message : String(error));
+      returning.set(false);
+    }
+  };
+
+  if (!ready()) {
+    return fallback;
+  }
+  return (
+    <>
+      {impersonatedEmail() ? (
+        <div class="bg-warning text-warning-content px-4 py-2 text-sm">
+          <div class="mx-auto flex w-full max-w-5xl flex-wrap items-center justify-between gap-2">
+            <span>Impersonating {impersonatedEmail()}</span>
+            <span class="flex items-center gap-2">
+              {returnError() ? <span>{returnError()}</span> : null}
+              <button
+                type="button"
+                class="btn btn-xs"
+                disabled={returning()}
+                onclick={() => {
+                  void stopImpersonating();
+                }}
+              >
+                Return to admin
+              </button>
+            </span>
+          </div>
+        </div>
+      ) : null}
+      {children}
+    </>
+  );
 };

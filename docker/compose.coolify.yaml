@@ -134,6 +134,8 @@ services:
       BASE_DOMAIN: ${BASE_DOMAIN:?}
       CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-app}
       NOITE_DB: /data/noite-control.sqlite
+      # Instance admin bootstrap address (empty = disabled).
+      NOITE_ADMIN_EMAIL: ${NOITE_ADMIN_EMAIL:-}
     volumes:
       - ui-data:/data
     networks: [noite]

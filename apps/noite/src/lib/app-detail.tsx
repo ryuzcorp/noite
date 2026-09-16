@@ -8,7 +8,6 @@ import {
   appSpans,
   get,
   inviteCollaborator,
-  list,
   listCollaborators,
   listDeploys,
   remove,
@@ -19,10 +18,11 @@ import {
 } from "./apps.server";
 import { authClient, hardNav } from "./auth-client";
 import { Breadcrumbs } from "./breadcrumbs";
-import type { App, Deploy } from "./db";
+import type { Deploy } from "./db";
 import { parseAppRole } from "./roles";
 import type { AppRole } from "./roles";
 import type { RunnerMetric, RunnerSpan } from "./runner";
+import { readSwrCache, writeSwrCache } from "./swr-cache";
 
 const toStreamError = (cause: unknown): Error =>
   cause instanceof Error ? cause : new Error(String(cause));
@@ -47,36 +47,32 @@ const deployBadge = (status: string) => {
   return <span class={`badge badge-sm ${tone}`}>{status}</span>;
 };
 
+/** Header status line, rendered from the already-fetched detail (no live
+ * subscription — every overview visit used to open an infinite `list()`
+ * stream, and unmount cleanup across tab switches is not guaranteed). */
 const LiveAppStatus = ({
-  appId,
-  fallback,
+  app,
 }: {
-  appId: string;
-  fallback: { status: string; lastDeploySha: string | null; subdomain: string };
-}) =>
-  Stream.map(
-    Stream.fromAsyncIterable(list(), toStreamError),
-    (items: App[]) => {
-      const app = items.find((a) => a.id === appId);
-      const sha = app?.lastDeploySha ?? fallback.lastDeploySha;
-      const subdomain = app?.subdomain ?? fallback.subdomain;
-      const { port } = window.location;
-      const url = port ? `http://${subdomain}:${port}` : `https://${subdomain}`;
-      return (
-        <p class="m-0 opacity-70">
-          <a class="link" href={url} target="_blank" rel="noreferrer">
-            {subdomain}
-          </a>
-          {sha ? " · " : " · not deployed"}
-          {sha ? (
-            <span class="tooltip font-mono" data-tip={sha}>
-              {sha.slice(0, 12)}
-            </span>
-          ) : null}
-        </p>
-      );
-    }
+  app: { lastDeploySha: string | null; subdomain: string };
+}) => {
+  const { port } = window.location;
+  const url = port
+    ? `http://${app.subdomain}:${port}`
+    : `https://${app.subdomain}`;
+  return (
+    <p class="m-0 opacity-70">
+      <a class="link" href={url} target="_blank" rel="noreferrer">
+        {app.subdomain}
+      </a>
+      {app.lastDeploySha ? " · " : " · not deployed"}
+      {app.lastDeploySha ? (
+        <span class="tooltip font-mono" data-tip={app.lastDeploySha}>
+          {app.lastDeploySha.slice(0, 12)}
+        </span>
+      ) : null}
+    </p>
   );
+};
 
 export const DeployList = ({ appId }: { appId: string }) => {
   const listError = atom("");
@@ -256,15 +252,27 @@ const MetricsCard = ({ appId }: { appId: string }) => {
   const loadError = atom("");
   const spansError = atom("");
   watch.once(() => {
+    const cachedRows = readSwrCache<RunnerMetric[]>(`app:${appId}:metrics`);
+    if (cachedRows) {
+      rows.set(cachedRows);
+    }
+    const cachedSpans = readSwrCache<RunnerSpan[]>(`app:${appId}:spans`);
+    if (cachedSpans) {
+      spans.set(cachedSpans);
+    }
     void (async () => {
       // Independent sections: a failure in one must not blank the other.
       try {
-        rows.set(await appMetrics(appId));
+        const fresh = await appMetrics(appId);
+        rows.set(fresh);
+        writeSwrCache(`app:${appId}:metrics`, fresh);
       } catch (error) {
         loadError.set(error instanceof Error ? error.message : String(error));
       }
       try {
-        spans.set(await appSpans(appId));
+        const fresh = await appSpans(appId);
+        spans.set(fresh);
+        writeSwrCache(`app:${appId}:spans`, fresh);
       } catch (error) {
         spansError.set(error instanceof Error ? error.message : String(error));
       }
@@ -364,6 +372,14 @@ const MetricsCard = ({ appId }: { appId: string }) => {
   );
 };
 
+interface CollaboratorRow {
+  createdAt: string;
+  email: string;
+  name: string;
+  role: AppRole;
+  userId: string;
+}
+
 const CollaboratorsPanel = ({
   appId,
   myRole,
@@ -371,15 +387,7 @@ const CollaboratorsPanel = ({
   appId: string;
   myRole: AppRole;
 }) => {
-  const rows = atom<
-    {
-      userId: string;
-      email: string;
-      name: string;
-      role: AppRole;
-      createdAt: string;
-    }[]
-  >([]);
+  const rows = atom<CollaboratorRow[]>([]);
   const role = atom<AppRole>("view");
   const err = atom("");
   const busy = atom(false);
@@ -387,7 +395,9 @@ const CollaboratorsPanel = ({
 
   const reload = async () => {
     try {
-      rows.set(await listCollaborators(appId));
+      const fresh = await listCollaborators(appId);
+      rows.set(fresh);
+      writeSwrCache(`app:${appId}:collaborators`, fresh);
       err.set("");
     } catch (error) {
       err.set(error instanceof Error ? error.message : String(error));
@@ -395,6 +405,12 @@ const CollaboratorsPanel = ({
   };
 
   watch.once(() => {
+    const cached = readSwrCache<CollaboratorRow[]>(
+      `app:${appId}:collaborators`
+    );
+    if (cached) {
+      rows.set(cached);
+    }
     void reload();
   });
 
@@ -810,6 +826,16 @@ export const AppSettingsPanel = () => {
       ready.set(true);
       return;
     }
+    const cached = readSwrCache<AppDetailInfo>(`app:${id}:detail`);
+    if (cached) {
+      access.set({
+        appId: cached.app.id,
+        myRole: cached.myRole,
+        name: cached.app.name,
+        slug: cached.app.slug,
+      });
+      ready.set(true);
+    }
     try {
       const info = await get(id);
       access.set({
@@ -818,6 +844,7 @@ export const AppSettingsPanel = () => {
         name: info.app.name,
         slug: info.app.slug,
       });
+      writeSwrCache(`app:${id}:detail`, info);
       loadError.set("");
       ready.set(true);
     } catch (error) {
@@ -903,15 +930,41 @@ export const AppSettingsPanel = () => {
   );
 };
 
+interface AppDetailInfo {
+  app: {
+    desiredState: string;
+    fleetBucket: string;
+    id: string;
+    lastDeploySha: string | null;
+    lastError: string | null;
+    name: string;
+    slug: string;
+    status: string;
+    subdomain: string;
+  };
+  gitHint: string;
+  gitRemote: string;
+  myRole: AppRole;
+  s3Endpoint: string;
+  username: string;
+}
+
 export const AppBreadcrumbs = ({ appId }: { appId: string }) => {
   const name = atom<string | null>(null);
   watch.once(() => {
+    const cached = readSwrCache<AppDetailInfo>(`app:${appId}:detail`);
+    if (cached) {
+      name.set(cached.app.name);
+    }
     void (async () => {
       try {
         const info = await get(appId);
         name.set(info.app.name);
+        writeSwrCache(`app:${appId}:detail`, info);
       } catch {
-        name.set(null);
+        if (!name()) {
+          name.set(null);
+        }
       }
     })();
   });
@@ -926,24 +979,7 @@ export const AppBreadcrumbs = ({ appId }: { appId: string }) => {
 export const AppDetailPanel = () => {
   const { params } = useRoute();
   const ready = atom(false);
-  const detail = atom<{
-    app: {
-      id: string;
-      name: string;
-      slug: string;
-      status: string;
-      subdomain: string;
-      desiredState: string;
-      fleetBucket: string;
-      lastDeploySha: string | null;
-      lastError: string | null;
-    };
-    gitRemote: string;
-    gitHint: string;
-    s3Endpoint: string;
-    myRole: AppRole;
-    username: string;
-  } | null>(null);
+  const detail = atom<AppDetailInfo | null>(null);
   const loadError = atom("");
   const notice = atom<string | null>(null);
   const gitModal = atom(false);
@@ -961,9 +997,15 @@ export const AppDetailPanel = () => {
         ready.set(true);
         return;
       }
+      const cached = readSwrCache<AppDetailInfo>(`app:${id}:detail`);
+      if (cached) {
+        detail.set(cached);
+        ready.set(true);
+      }
       try {
         const info = await get(id);
         detail.set(info);
+        writeSwrCache(`app:${id}:detail`, info);
         ready.set(true);
       } catch (error) {
         loadError.set(error instanceof Error ? error.message : String(error));
@@ -1008,14 +1050,7 @@ export const AppDetailPanel = () => {
           </div>
           <div>
             <h1 class="m-0 text-2xl font-semibold">{app.name}</h1>
-            <LiveAppStatus
-              appId={app.id}
-              fallback={{
-                lastDeploySha: app.lastDeploySha,
-                status: app.status,
-                subdomain: app.subdomain,
-              }}
-            />
+            <LiveAppStatus app={app} />
           </div>
         </div>
         <div class="flex shrink-0 flex-wrap gap-2">
@@ -1040,6 +1075,7 @@ export const AppDetailPanel = () => {
                     id: app.id,
                   });
                   detail.set(await get(app.id));
+                  writeSwrCache(`app:${app.id}:detail`, detail());
                   notice.set(null);
                 } catch (error) {
                   notice.set(

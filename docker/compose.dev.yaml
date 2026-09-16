@@ -30,6 +30,8 @@ services:
     working_dir: /app
     environment:
       NOITE_MODE: ${NOITE_MODE:-dev}
+      # Instance admin bootstrap address (empty = disabled).
+      NOITE_ADMIN_EMAIL: ${NOITE_ADMIN_EMAIL:-}
     volumes:
       - ../apps/noite:/app
       - ../docker/noite.sh:/noite.sh:ro

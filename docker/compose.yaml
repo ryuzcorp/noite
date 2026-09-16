@@ -102,6 +102,8 @@ services:
       # Empty = control on bare domain (dev); prod sets CONTROL_SUBDOMAIN=app.
       CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-}
       NOITE_DB: /data/noite-control.sqlite
+      # Instance admin bootstrap address (empty = disabled).
+      NOITE_ADMIN_EMAIL: ${NOITE_ADMIN_EMAIL:-}
     volumes:
       - ui-data:/data
     networks: [noite]

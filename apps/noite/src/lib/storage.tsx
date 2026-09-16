@@ -11,6 +11,7 @@ import {
 import { Breadcrumbs } from "./breadcrumbs";
 import { r2DownloadUrl } from "./runner";
 import type { D1Preview, DoPreview, R2Preview, StorageItem } from "./runner";
+import { readSwrCache, writeSwrCache } from "./swr-cache";
 
 /** celld d1 prints each result set as a space-padded table: a header line,
  * a rule line of dashes, then the data rows. Turn that into columns + rows
@@ -91,9 +92,15 @@ export const AppStorageList = ({ appId }: { appId: string }) => {
   const items = atom<StorageItem[]>([]);
   const loadError = atom("");
   watch.once(() => {
+    const cached = readSwrCache<StorageItem[]>(`app:${appId}:storage`);
+    if (cached) {
+      items.set(cached);
+    }
     void (async () => {
       try {
-        items.set(await listAppStorage({ appId }));
+        const fresh = await listAppStorage({ appId });
+        items.set(fresh);
+        writeSwrCache(`app:${appId}:storage`, fresh);
       } catch (error) {
         loadError.set(error instanceof Error ? error.message : String(error));
       }

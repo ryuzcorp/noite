@@ -1,6 +1,6 @@
 import * as Effect from "effect/Effect";
 
-import { UnauthorizedError } from "./auth";
+import { isUserAdminById, UnauthorizedError } from "./auth";
 import { orm, withDb } from "./db";
 import type { App } from "./db";
 import { parseAppRole, roleAtLeast } from "./roles";
@@ -71,6 +71,11 @@ const membershipFor = (appId: string, userId: string) =>
       return null;
     }
     yield* ensureOwnerAdmin(app);
+    // Instance admins manage every app, collaborator or not.
+    if (yield* isUserAdminById(userId)) {
+      // SAFETY: instance admins are granted the top app role; roleAtLeast("admin", need) holds for every need.
+      return { app: asApp(app), membership: null, role: "admin" as AppRole };
+    }
     let membership = yield* orm.app_collaborator.findFirst({
       where: { appId, userId },
     });
@@ -122,9 +127,25 @@ export const requireAppRoleBySlug = async (
   return { app: access.app, role: access.role };
 };
 
-/** Apps the user can see (any collaborator role), newest first. */
+/** Apps the user can see (any collaborator role), newest first.
+ * Instance admins see every app. */
 export const listAppsForCollaborator = (userId: string) =>
   Effect.gen(function* run() {
+    if (yield* isUserAdminById(userId)) {
+      const all = yield* orm.app.findMany({});
+      const apps = all.filter(
+        (app) =>
+          app.desiredState !== "deleted" &&
+          app.status !== "deleting" &&
+          app.status !== "gone"
+      );
+      apps.sort((a, b) => {
+        const at = a.createdAt instanceof Date ? a.createdAt.getTime() : 0;
+        const bt = b.createdAt instanceof Date ? b.createdAt.getTime() : 0;
+        return bt - at;
+      });
+      return apps.map(asApp);
+    }
     // Backfill owner→admin for apps this user created.
     const owned = yield* orm.app.findMany({ where: { userId } });
     for (const app of owned) {

@@ -230,6 +230,22 @@ export const ensureDb = Effect.gen(function* ensureDb() {
       yield* sql.unsafe(healed, stmt.parameters);
     }
   }
+  // Instance admin bootstrap (runs once per process at startup): if
+  // NOITE_ADMIN_EMAIL names an already-registered account, ensure it
+  // holds the admin role. No-op when unset or not yet registered.
+  const adminEmail =
+    process.env.NOITE_ADMIN_EMAIL?.trim().toLowerCase() || null;
+  if (adminEmail) {
+    const existing = yield* orm.user.findFirst({
+      where: { email: adminEmail },
+    });
+    if (existing && existing.role !== "admin") {
+      yield* orm.user.update({
+        data: { role: "admin" },
+        where: { id: existing.id },
+      });
+    }
+  }
   migrated.done = true;
 });
 

@@ -9,7 +9,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { OxideRequest } from "oxidejs";
 
-import { ensureDbPromise, getAuthDb, missingDb } from "./db";
+import { ensureDbPromise, getAuthDb, missingDb, orm } from "./db";
 
 // oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
 export class MissingAuthSecretError extends Schema.TaggedError<MissingAuthSecretError>()(
@@ -129,7 +129,9 @@ export const createAuth = (
     baseURL,
     database: getAuthDb(),
     plugins: [
-      admin({ defaultRole: "user" }),
+      // God-mode impersonates any account (including fellow admins) — the
+      // impersonator is already an admin, so this grants no new power.
+      admin({ allowImpersonatingAdmins: true, defaultRole: "user" }),
       apiKey({
         defaultPrefix: "noite_",
         enableMetadata: false,
@@ -219,6 +221,25 @@ export interface SessionUser {
   id: string;
   name: string;
 }
+
+/** Instance-admin check by user id: `admin` role, or the env-anchored
+ * bootstrap address. Used to let admins manage every app, not just ones
+ * they collaborate on. */
+export const isUserAdminById = (userId: string) =>
+  Effect.gen(function* run() {
+    const user = yield* orm.user.findFirst({ where: { id: userId } });
+    if (!user) {
+      return false;
+    }
+    if (user.role === "admin") {
+      return true;
+    }
+    const anchored = process.env.NOITE_ADMIN_EMAIL?.trim().toLowerCase();
+    if (!anchored) {
+      return false;
+    }
+    return user.email.trim().toLowerCase() === anchored;
+  });
 
 export const requireUser = Effect.gen(function* () {
   const request = yield* OxideRequest;

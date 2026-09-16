@@ -13,6 +13,7 @@ interface KitEnv {
   BASE_DOMAIN?: string;
   BETTER_AUTH_SECRET?: string;
   BETTER_AUTH_URL?: string;
+  NOITE_ADMIN_EMAIL?: string;
   NOITE_DB?: string;
   /** @deprecated use RUNNER_TOKEN */
   HOST_TOKEN?: string;
