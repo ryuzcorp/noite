@@ -1,5 +1,6 @@
-import { atom, watch } from "ilha";
+import { atom, unsafe, watch } from "ilha";
 
+import { CHEVRON_SVG } from "./apps";
 import {
   d1Preview,
   doPreview,
@@ -8,9 +9,9 @@ import {
   r2Delete,
   r2List,
 } from "./apps.server";
-import { Breadcrumbs } from "./breadcrumbs";
 import { r2DownloadUrl } from "./runner";
 import type { D1Preview, DoPreview, R2Preview, StorageItem } from "./runner";
+import { ListSkeleton, SectionSkeleton } from "./skeletons";
 import { readSwrCache, writeSwrCache } from "./swr-cache";
 
 /** celld d1 prints each result set as a space-padded table: a header line,
@@ -68,120 +69,6 @@ const storageBadge = (kind: string) =>
     tone: "badge-ghost",
   };
 
-/** One storage resource card: name links to its detail page, kind badge. */
-const StorageCard = ({ item: s }: { item: StorageItem }) => (
-  <div class="card bg-base-100 w-full shadow-sm">
-    <div class="card-body gap-3">
-      <div class="flex items-start justify-between gap-2">
-        <a
-          href={`/storage/${encodeURIComponent(s.appId)}/${encodeURIComponent(s.id)}`}
-          class="link link-hover card-title m-0"
-        >
-          {s.name}
-        </a>
-        <span class={`badge badge-sm ${storageBadge(s.kind).tone}`}>
-          {storageBadge(s.kind).label}
-        </span>
-      </div>
-    </div>
-  </div>
-);
-
-/** One app's storage resources, same cards as the Storage page. */
-export const AppStorageList = ({ appId }: { appId: string }) => {
-  const items = atom<StorageItem[]>([]);
-  const loadError = atom("");
-  watch.once(() => {
-    const cached = readSwrCache<StorageItem[]>(`app:${appId}:storage`);
-    if (cached) {
-      items.set(cached);
-    }
-    void (async () => {
-      try {
-        const fresh = await listAppStorage({ appId });
-        items.set(fresh);
-        writeSwrCache(`app:${appId}:storage`, fresh);
-      } catch (error) {
-        loadError.set(error instanceof Error ? error.message : String(error));
-      }
-    })();
-  });
-
-  return (
-    <div class="flex w-full flex-col gap-4">
-      {loadError() ? <p class="text-error m-0 text-sm">{loadError()}</p> : null}
-      <div class="flex items-center gap-2">
-        <Breadcrumbs trail={[{ label: "Storage" }]} />
-        <span class="badge badge-primary">{items().length}</span>
-      </div>
-      {items().length === 0 ? (
-        <p class="m-0 opacity-70">
-          No storage yet. Deploy a version that uses D1, R2, or Durable Objects.
-        </p>
-      ) : (
-        <div class="flex flex-col gap-3">
-          {items().map((s) => (
-            <StorageCard key={`${s.appId}:${s.id}`} item={s} />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-};
-
-/** All storage items across the user's apps (D1 DBs + DO classes). */
-export const StorageList = () => {
-  const items = atom<StorageItem[]>([]);
-  const loadError = atom("");
-  watch.once(() => {
-    void (async () => {
-      try {
-        items.set(await listAllStorage());
-      } catch (error) {
-        loadError.set(error instanceof Error ? error.message : String(error));
-      }
-    })();
-  });
-
-  const byApp = new Map<string, StorageItem[]>();
-  for (const item of items()) {
-    const group = byApp.get(item.appId) ?? [];
-    group.push(item);
-    byApp.set(item.appId, group);
-  }
-
-  return (
-    <div class="flex w-full flex-col gap-4">
-      {loadError() ? <p class="text-error m-0 text-sm">{loadError()}</p> : null}
-      <div class="flex items-center gap-2">
-        <Breadcrumbs trail={[{ label: "Storage" }]} />
-        <span class="badge badge-primary">{items().length}</span>
-      </div>
-      {items().length === 0 ? (
-        <p class="m-0 opacity-70">
-          No storage yet. Deploy an app that uses D1, R2, or Durable Objects.
-        </p>
-      ) : (
-        <div class="flex w-full flex-col gap-6">
-          {[...byApp].map(([appId, group]) => (
-            <div key={appId} class="flex flex-col gap-3">
-              <div class="flex items-center justify-between gap-2">
-                <h3 class="m-0 text-lg font-semibold">{group[0].appName}</h3>
-                <span class="badge badge-ghost badge-sm">{group.length}</span>
-              </div>
-              <div class="flex flex-col gap-3">
-                {group.map((s) => (
-                  <StorageCard key={`${s.appId}:${s.id}`} item={s} />
-                ))}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-};
-
 /** Display name for a storage resource id (mirrors StorageDetail's parsing). */
 export const resourceDisplayName = (resourceId: string): string => {
   if (resourceId.startsWith("d1:") || resourceId.startsWith("r2:")) {
@@ -191,6 +78,152 @@ export const resourceDisplayName = (resourceId: string): string => {
     return resourceId.split(":").slice(2).join(":");
   }
   return resourceId;
+};
+
+const storageHref = (s: StorageItem): string =>
+  `/storage/${encodeURIComponent(s.appId)}/${encodeURIComponent(s.id)}`;
+
+/** One storage resource row: kind badge, name + id, chevron to detail. */
+const StorageRow = ({ item: s }: { item: StorageItem }) => (
+  <li class="list-row">
+    <div>
+      <span class={`badge badge-sm ${storageBadge(s.kind).tone}`}>
+        {storageBadge(s.kind).label}
+      </span>
+    </div>
+    <div>
+      <div>
+        <a href={storageHref(s)} class="link link-hover block truncate">
+          {s.name}
+        </a>
+      </div>
+      <div class="text-base-content/70 truncate font-mono text-xs">
+        {resourceDisplayName(s.id)}
+      </div>
+    </div>
+    <a
+      href={storageHref(s)}
+      class="btn btn-square btn-ghost btn-sm shrink-0"
+      aria-label={`Open ${s.name} details`}
+    >
+      <span class="inline-flex h-5 w-5 shrink-0">{unsafe(CHEVRON_SVG)}</span>
+    </a>
+  </li>
+);
+
+/** One app's storage resources, same cards as the Storage page. */
+export const AppStorageList = ({ appId }: { appId: string }) => {
+  // Cache-first: first paint carries last-good items on every mount.
+  const seedItems = readSwrCache<StorageItem[]>(`app:${appId}:storage`);
+  const items = atom<StorageItem[]>(seedItems ?? []);
+  const loadError = atom("");
+  const loaded = atom(seedItems !== null);
+  watch.once(() => {
+    void (async () => {
+      try {
+        const fresh = await listAppStorage({ appId });
+        items.set(fresh);
+        writeSwrCache(`app:${appId}:storage`, fresh);
+      } catch (error) {
+        loadError.set(error instanceof Error ? error.message : String(error));
+      }
+      loaded.set(true);
+    })();
+  });
+
+  const emptyView =
+    !loaded() && !loadError() ? (
+      <li class="px-4 pt-2 pb-4">
+        <ListSkeleton rows={2} />
+      </li>
+    ) : (
+      <li class="text-base-content/70 px-4 pt-2 pb-4 text-sm">
+        No storage yet. Deploy a version that uses D1, R2, or Durable Objects.
+      </li>
+    );
+
+  return (
+    <div class="flex w-full flex-col gap-4">
+      {loadError() ? <p class="text-error m-0 text-sm">{loadError()}</p> : null}
+      <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
+        <li class="flex items-center justify-between gap-2 p-4 pb-2">
+          <span class="flex items-center gap-2 tracking-wide">
+            <span class="text-lg font-semibold">Storage</span>
+            <span class="badge badge-sm">{items().length}</span>
+          </span>
+        </li>
+        {items().length === 0
+          ? emptyView
+          : items().map((s) => (
+              <StorageRow key={`${s.appId}:${s.id}`} item={s} />
+            ))}
+      </ul>
+    </div>
+  );
+};
+
+/** All storage items across the user's apps (D1 DBs + DO classes). */
+export const StorageList = () => {
+  // Cache-first: first paint carries last-good items on every mount.
+  const seedItems = readSwrCache<StorageItem[]>("all:storage");
+  const items = atom<StorageItem[]>(seedItems ?? []);
+  const loadError = atom("");
+  const loaded = atom(seedItems !== null);
+  watch.once(() => {
+    void (async () => {
+      try {
+        const fresh = await listAllStorage();
+        items.set(fresh);
+        writeSwrCache("all:storage", fresh);
+      } catch (error) {
+        loadError.set(error instanceof Error ? error.message : String(error));
+      }
+      loaded.set(true);
+    })();
+  });
+
+  const byApp = new Map<string, StorageItem[]>();
+  for (const item of items()) {
+    const group = byApp.get(item.appId) ?? [];
+    group.push(item);
+    byApp.set(item.appId, group);
+  }
+  const emptyView =
+    !loaded() && !loadError() ? (
+      <li class="px-4 pt-2 pb-4">
+        <ListSkeleton rows={3} />
+      </li>
+    ) : (
+      <li class="text-base-content/70 px-4 pt-2 pb-4 text-sm">
+        No storage yet. Deploy an app that uses D1, R2, or Durable Objects.
+      </li>
+    );
+
+  // Flat rows: one group header li per app, then its resource rows.
+  const rows = [...byApp].flatMap(([appId, group], index) => [
+    <li
+      key={`group:${appId}`}
+      class={`px-4 pb-2 ${index === 0 ? "pt-2" : "pt-4"}`}
+    >
+      <span class="text-xs tracking-wide opacity-60">{group[0].appName}</span>
+    </li>,
+    ...group.map((s) => <StorageRow key={`${s.appId}:${s.id}`} item={s} />),
+  ]);
+
+  return (
+    <div class="flex w-full flex-col gap-4">
+      {loadError() ? <p class="text-error m-0 text-sm">{loadError()}</p> : null}
+      <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
+        <li class="flex items-center justify-between gap-2 p-4 pb-2">
+          <span class="flex items-center gap-2 tracking-wide">
+            <span class="text-lg font-semibold">Storage</span>
+            <span class="badge badge-sm">{items().length}</span>
+          </span>
+        </li>
+        {items().length === 0 ? emptyView : rows}
+      </ul>
+    </div>
+  );
 };
 
 /** One storage resource's details: D1 shows each table as a read-only
@@ -269,7 +302,7 @@ export const StorageDetail = ({
     return <p class="text-error m-0 text-sm">{loadError()}</p>;
   }
   if (!preview()) {
-    return <p class="m-0 opacity-70">Loading…</p>;
+    return <SectionSkeleton lines={5} />;
   }
   const p = preview();
   if (!p) {
@@ -283,12 +316,9 @@ export const StorageDetail = ({
     return (
       <div class="flex flex-col gap-4">
         <div>
-          <Breadcrumbs
-            trail={[{ href: "/storage", label: "Storage" }, { label: bucket }]}
-          />
           <div class="flex items-center gap-2">
             <span class="badge badge-secondary">R2</span>
-            <h1 class="m-0 text-2xl font-semibold">{bucket}</h1>
+            <h1 class="m-0 text-lg font-semibold">{bucket}</h1>
           </div>
           <p class="m-0 text-sm opacity-70">
             {r2Data.objects.length} object(s)
@@ -299,8 +329,8 @@ export const StorageDetail = ({
             No objects yet — PUT to /files/&lt;key&gt; on the app to upload one.
           </p>
         ) : (
-          <div class="card bg-base-100 shadow">
-            <div class="card-body gap-2">
+          <div class="card bg-base-100 dark:bg-base-200 border-base-300 border shadow-md">
+            <div class="card-body gap-4">
               <div class="overflow-x-auto">
                 <table class="table-sm table-zebra table">
                   <thead>
@@ -359,15 +389,9 @@ export const StorageDetail = ({
     return (
       <div class="flex flex-col gap-4">
         <div>
-          <Breadcrumbs
-            trail={[
-              { href: "/storage", label: "Storage" },
-              { label: className },
-            ]}
-          />
           <div class="flex items-center gap-2">
             <span class="badge badge-ghost">DO</span>
-            <h1 class="m-0 text-2xl font-semibold">{className}</h1>
+            <h1 class="m-0 text-lg font-semibold">{className}</h1>
           </div>
           <p class="m-0 text-sm opacity-70">
             {doData.instances.length} instance(s)
@@ -379,8 +403,8 @@ export const StorageDetail = ({
             called.
           </p>
         ) : (
-          <div class="card bg-base-100 shadow">
-            <div class="card-body gap-2">
+          <div class="card bg-base-100 dark:bg-base-200 border-base-300 border shadow-md">
+            <div class="card-body gap-4">
               <div class="overflow-x-auto">
                 <table class="table-sm table-zebra table">
                   <thead>
@@ -414,24 +438,21 @@ export const StorageDetail = ({
   return (
     <div class="flex flex-col gap-4">
       <div>
-        <Breadcrumbs
-          trail={[
-            { href: "/storage", label: "Storage" },
-            { label: databaseId },
-          ]}
-        />
         <div class="flex items-center gap-2">
           <span class="badge badge-primary">D1</span>
-          <h1 class="m-0 text-2xl font-semibold">{databaseId}</h1>
+          <h1 class="m-0 text-lg font-semibold">{databaseId}</h1>
         </div>
         <p class="m-0 text-sm opacity-70">{d1Data.tables.length} table(s)</p>
       </div>
       {d1Data.tables.map((table, index) => {
         const { columns, rows } = parseTable(d1Data.rows[index] ?? "");
         return (
-          <div key={table} class="card bg-base-100 shadow">
-            <div class="card-body gap-2">
-              <h3 class="m-0 text-lg font-medium">{table}</h3>
+          <div
+            key={table}
+            class="card bg-base-100 dark:bg-base-200 border-base-300 border shadow-md"
+          >
+            <div class="card-body gap-4">
+              <h3 class="m-0 text-lg font-semibold">{table}</h3>
               {rows.length === 0 ? (
                 <p class="m-0 text-sm opacity-70">(no data)</p>
               ) : (

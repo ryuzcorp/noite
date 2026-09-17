@@ -15,6 +15,8 @@ interface KitEnv {
   BETTER_AUTH_URL?: string;
   NOITE_ADMIN_EMAIL?: string;
   NOITE_DB?: string;
+  NOITE_SMTP_FROM?: string;
+  NOITE_SMTP_URL?: string;
   /** @deprecated use RUNNER_TOKEN */
   HOST_TOKEN?: string;
   /** @deprecated use RUNNER_URL */

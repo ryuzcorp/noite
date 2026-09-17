@@ -222,6 +222,46 @@ pub async fn list_deploys(
     }
 }
 
+/// Deploy history as server-sent events: one JSON array per message, sent
+/// only when the snapshot changed (plus keep-alive comments). Ends when the
+/// client disconnects.
+pub async fn list_deploys_stream(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let app = match db::get_app(&state.pool, &id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return ApiError::not_found("app not found").into_response(),
+        Err(e) => return ApiError::internal(e.to_string()).into_response(),
+    };
+    let pool = state.pool.clone();
+    let app_id = app.id.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, anyhow::Error>>(16);
+    tokio::spawn(async move {
+        let mut last: Option<String> = None;
+        loop {
+            match db::list_deploys(&pool, &app_id).await {
+                Ok(rows) => {
+                    let data = serde_json::to_string(&rows).unwrap_or_default();
+                    if last.as_ref() != Some(&data) {
+                        if tx.send(Ok(Event::default().data(data.clone()))).await.is_err() {
+                            break;
+                        }
+                        last = Some(data);
+                    }
+                }
+                Err(_) => {
+                    // Transient DB error — retry on next tick.
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+    Sse::new(ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GitRemote {

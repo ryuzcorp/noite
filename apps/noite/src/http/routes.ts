@@ -263,9 +263,15 @@ const handleR2Raw: RouteHandler = async (request, env, params) => {
   );
 };
 
-/** Live log tail proxy: session + view-role gate, then pipe the runner SSE
- * (the browser never sees RUNNER_TOKEN). */
-const handleLogsStream: RouteHandler = async (request, env, params) => {
+/** Runner SSE proxy shared by the log tail and deploy history streams:
+ * session + view-role gate, then pipe the runner events (the browser
+ * never sees RUNNER_TOKEN). */
+const proxyRunnerStream = async (
+  request: Request,
+  env: KitEnv,
+  params: Record<string, string | undefined> | undefined,
+  upstreamPath: (appId: string) => string
+): Promise<Response> => {
   const appId = params?.appId?.trim() ?? "";
   if (!appId) {
     return new Response("app required", { status: 400 });
@@ -287,7 +293,7 @@ const handleLogsStream: RouteHandler = async (request, env, params) => {
     return new Response("RUNNER_TOKEN is not configured", { status: 500 });
   }
   const upstream = await fetch(
-    `${rc.runner}/v1/apps/${encodeURIComponent(appId)}/logs/stream`,
+    `${rc.runner}${upstreamPath(encodeURIComponent(appId))}`,
     { headers: { authorization: `Bearer ${rc.token}` } }
   );
   if (!upstream.ok || !upstream.body) {
@@ -301,12 +307,31 @@ const handleLogsStream: RouteHandler = async (request, env, params) => {
   return new Response(upstream.body, { headers, status: upstream.status });
 };
 
+/** Live log tail proxy (see proxyRunnerStream). */
+const handleLogsStream: RouteHandler = (request, env, params) =>
+  proxyRunnerStream(
+    request,
+    env,
+    params,
+    (appId) => `/v1/apps/${appId}/logs/stream`
+  );
+
+/** Live deploy history proxy (see proxyRunnerStream). */
+const handleDeploysStream: RouteHandler = (request, env, params) =>
+  proxyRunnerStream(
+    request,
+    env,
+    params,
+    (appId) => `/v1/apps/${appId}/deploys/stream`
+  );
+
 const router = FindMyWay.make<RouteHandler>();
 router.all("/health", handleHealth);
 router.on("POST", "/webhook", handleWebhook);
 router.on("POST", "/internal/git-auth", handleGitAuth);
 router.on("GET", "/storage/:appId/r2/:bucket/raw", handleR2Raw);
 router.on("GET", "/api/apps/:appId/logs/stream", handleLogsStream);
+router.on("GET", "/api/apps/:appId/deploys/stream", handleDeploysStream);
 router.all("/api/auth", handleAuth);
 router.all("/api/auth/*", handleAuth);
 

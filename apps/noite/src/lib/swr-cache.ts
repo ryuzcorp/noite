@@ -7,6 +7,11 @@
  * fetch. */
 const prefix = "swr:";
 
+/** L1: in-memory last-good values. Survives SPA tab switches even when
+ * sessionStorage is unavailable/full/blocked; sessionStorage (L2) adds
+ * survival across reloads. Writes populate both, reads try L1 first. */
+const memory = new Map<string, unknown>();
+
 const store = (): Storage | null => {
   if (typeof sessionStorage === "undefined") {
     return null;
@@ -21,6 +26,11 @@ const store = (): Storage | null => {
 
 /** Last good value for `key`, or null (missing, corrupt, or no store). */
 export const readSwrCache = <T>(key: string): T | null => {
+  if (memory.has(prefix + key)) {
+    // SAFETY: only writeSwrCache populates this map, always with a T for
+    // its key (same generic call sites read it back).
+    return memory.get(prefix + key) as T;
+  }
   const storage = store();
   if (!storage) {
     return null;
@@ -33,7 +43,9 @@ export const readSwrCache = <T>(key: string): T | null => {
     // SAFETY: entries are only ever written by writeSwrCache below as JSON
     // of T; a shape mismatch throws in the caller and is caught there — the
     // try/catch here covers malformed JSON, and callers validate before use.
-    return JSON.parse(raw) as T;
+    const value = JSON.parse(raw) as T;
+    memory.set(prefix + key, value);
+    return value;
   } catch {
     return null;
   }
@@ -49,6 +61,7 @@ type SwrCacheValue =
 
 /** Remember the last good value for `key`. Never throws. */
 export const writeSwrCache = (key: string, value: SwrCacheValue): void => {
+  memory.set(prefix + key, value);
   const storage = store();
   if (!storage) {
     return;

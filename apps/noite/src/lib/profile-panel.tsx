@@ -1,6 +1,7 @@
 import { atom, watch } from "ilha";
 
 import { authClient, hardNav } from "./auth-client";
+import { SectionSkeleton } from "./skeletons";
 
 interface ApiKeyRow {
   id: string;
@@ -26,8 +27,10 @@ export const ProfilePanel = () => {
   const error = atom("");
   const keys = atom<ApiKeyRow[]>([]);
   const freshKey = atom<string | null>(null);
-  const name = atom("");
   const keyModal = atom(false);
+  const saveBusy = atom(false);
+  const saveError = atom("");
+  const saveOk = atom(false);
 
   const reload = async () => {
     const result = await authClient.apiKey.list({
@@ -49,12 +52,28 @@ export const ProfilePanel = () => {
       }
       await reload();
       ready.set(true);
+      // Uncontrolled inputs (see key-name): preset after first paint so
+      // typing never re-renders and blurs the fields. The inputs only
+      // exist in the DOM once ready flips, hence the frame delay.
+      window.requestAnimationFrame(() => {
+        const nameInput = document.querySelector("#profile-name");
+        if (nameInput instanceof HTMLInputElement) {
+          nameInput.value = data.user.name ?? "";
+        }
+        const emailInput = document.querySelector("#profile-email");
+        if (emailInput instanceof HTMLInputElement) {
+          emailInput.value = data.user.email ?? "";
+        }
+      });
     })();
   });
 
   const createKey = async (event: SubmitEvent) => {
     event.preventDefault();
-    const label = name().trim();
+    // Read the name from the DOM: the input is uncontrolled so typing
+    // never re-renders (and blurs) the field.
+    const input = document.querySelector("#key-name");
+    const label = input instanceof HTMLInputElement ? input.value.trim() : "";
     if (!label) {
       error.set("Name is required");
       return;
@@ -91,25 +110,92 @@ export const ProfilePanel = () => {
     await reload();
   };
 
+  const saveProfile = async () => {
+    const input = document.querySelector("#profile-name");
+    const next = input instanceof HTMLInputElement ? input.value.trim() : "";
+    if (!next) {
+      saveError.set("Display name is required");
+      return;
+    }
+    saveBusy.set(true);
+    saveError.set("");
+    saveOk.set(false);
+    try {
+      const result = await authClient.updateUser({ name: next });
+      if (result.error) {
+        saveError.set(result.error.message ?? "Failed to update profile");
+        return;
+      }
+      saveOk.set(true);
+    } catch {
+      saveError.set("Failed to update profile");
+    } finally {
+      saveBusy.set(false);
+    }
+  };
+
   if (!ready()) {
-    return <p class="opacity-70">Loading…</p>;
+    return <SectionSkeleton lines={4} />;
   }
 
   return (
     <div class="flex flex-col gap-6">
-      <section class="border-base-300 flex flex-col gap-3 rounded-lg border p-4">
-        <h2 class="m-0 text-lg font-medium">API keys</h2>
-        <p class="m-0 text-sm opacity-80">
-          Use a key as the Git HTTPS password (<code>username=git</code>). Push
-          requires collaborator <code>push</code> or <code>admin</code> on that
-          app.
-        </p>
+      <section class="border-base-300 dark:bg-base-200 bg-base-100 rounded-box flex flex-col gap-4 border p-4 shadow-md">
+        <h2 class="m-0 text-lg font-semibold">Profile</h2>
+        <fieldset class="fieldset w-full">
+          <label class="label" for="profile-name">
+            Display name
+          </label>
+          <input
+            id="profile-name"
+            class="input input-sm"
+            name="name"
+            maxlength={64}
+            placeholder="Name"
+            autocomplete="name"
+          />
+        </fieldset>
+        <fieldset class="fieldset w-full">
+          <label class="label" for="profile-email">
+            Email
+          </label>
+          <input
+            id="profile-email"
+            class="input input-sm"
+            type="email"
+            disabled
+          />
+        </fieldset>
+        {saveError() ? (
+          <p class="text-error m-0 text-sm">{saveError()}</p>
+        ) : null}
+        {saveOk() ? (
+          <p class="text-success m-0 text-sm">Display name updated.</p>
+        ) : null}
         <div>
           <button
             type="button"
-            class="btn btn-primary btn-sm"
+            class="btn btn-sm btn-neutral"
+            disabled={saveBusy()}
             onclick={() => {
-              name.set("");
+              void saveProfile();
+            }}
+          >
+            {saveBusy() ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </section>
+      <section class="border-base-300 dark:bg-base-200 bg-base-100 rounded-box flex flex-col gap-4 border p-4 shadow-md">
+        <div class="flex items-center justify-between gap-2">
+          <h2 class="m-0 text-lg font-semibold">API keys</h2>
+          <button
+            type="button"
+            class="btn btn-neutral btn-sm shrink-0"
+            onclick={() => {
+              const input = document.querySelector("#key-name");
+              if (input instanceof HTMLInputElement) {
+                input.value = "";
+              }
               error.set("");
               keyModal.set(true);
             }}
@@ -117,6 +203,11 @@ export const ProfilePanel = () => {
             Create key
           </button>
         </div>
+        <p class="m-0 text-sm opacity-80">
+          Use a key as the Git HTTPS password (<code>username=git</code>). Push
+          requires collaborator <code>push</code> or <code>admin</code> on that
+          app.
+        </p>
         <div class={`modal ${keyModal() ? "modal-open" : ""}`}>
           <div class="modal-box">
             <h3 class="m-0 text-lg font-bold">Create API key</h3>
@@ -129,13 +220,6 @@ export const ProfilePanel = () => {
                   id="key-name"
                   class="input input-sm"
                   name="name"
-                  value={name()}
-                  oninput={(event) => {
-                    const target = event.currentTarget;
-                    if (target instanceof HTMLInputElement) {
-                      name.set(target.value);
-                    }
-                  }}
                   maxlength={32}
                   minlength={1}
                   placeholder="ci"
@@ -159,7 +243,7 @@ export const ProfilePanel = () => {
                 </button>
                 <button
                   type="submit"
-                  class="btn btn-sm btn-primary"
+                  class="btn btn-sm btn-neutral"
                   disabled={busy()}
                 >
                   {busy() ? "Creating…" : "Create key"}

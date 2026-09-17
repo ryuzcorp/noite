@@ -2,6 +2,7 @@ import { atom, watch } from "ilha";
 
 import { banUser, listAllApps, listUsers, unbanUser } from "./admin.server";
 import { authClient, hardNav } from "./auth-client";
+import { ListSkeleton, SectionSkeleton } from "./skeletons";
 
 interface AdminUser {
   banned: boolean;
@@ -195,14 +196,19 @@ export const AdminPanel = ({ email }: { email: string }) => {
   };
 
   if (loading()) {
-    return <p class="m-0 text-sm opacity-70">Loading users and apps…</p>;
+    return (
+      <div class="flex flex-col gap-3">
+        <SectionSkeleton lines={2} />
+        <ListSkeleton rows={3} />
+      </div>
+    );
   }
   if (loadError()) {
     return <p class="m-0 text-sm opacity-70">Failed to load: {loadError()}</p>;
   }
   return (
     <section class="border-base-300 flex flex-col gap-3 rounded-lg border p-4">
-      <h2 class="m-0 text-lg font-medium">Administration</h2>
+      <h2 class="m-0 text-lg font-semibold">Administration</h2>
       {adminError() ? (
         <p class="text-error m-0 text-sm">{adminError()}</p>
       ) : null}

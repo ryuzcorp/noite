@@ -78,6 +78,33 @@ interface DiffsModule {
   parsePatchFiles: (patch: string) => { files: unknown[] }[];
 }
 
+export type SourceMode = "files" | "diff";
+
+/** Pending mode switch (set on mount, cleared on unmount). Lets the page
+ * header drive the browser without atoms crossing the imperative boundary. */
+let modeRequest: ((mode: SourceMode) => void) | undefined;
+
+/** Ask the mounted browser to show Files or the last-push diff. */
+export const requestSourceMode = (mode: SourceMode) => {
+  modeRequest?.(mode);
+};
+
+/** Header toggle styling, synced imperatively by id (see setMode). */
+const syncToggle = (showFiles: boolean) => {
+  const filesBtn = document.querySelector("#noite-src-view-files");
+  const diffBtn = document.querySelector("#noite-src-view-diff");
+  filesBtn?.classList.toggle("btn-neutral", showFiles);
+  filesBtn?.classList.toggle("btn-ghost", !showFiles);
+  diffBtn?.classList.toggle("btn-neutral", !showFiles);
+  diffBtn?.classList.toggle("btn-ghost", showFiles);
+};
+
+/** Mount generation — each setup takes the next number. Stale async
+ * continuations (remounts, HMR, slow fetches resolving late) compare
+ * against it and abort instead of clobbering the live UI. Bumped on
+ * setup start and on unmount cleanup. */
+let setupGen = 0;
+
 export const SourceBrowser = ({ appId }: { appId: string }) => {
   watch.once(() => {
     if (typeof document === "undefined") {
@@ -88,44 +115,34 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
     // SAFETY: fn starts unset (undefined) and is only ever assigned the real cleanup once the async setup completes.
     const teardown = { fn: undefined as (() => void) | undefined };
     void (async () => {
-      const actionHost = await waitEl("noite-src-actions");
+      setupGen += 1;
+      const gen = setupGen;
       const treeRoot = await waitEl("noite-src-tree");
       const codeHost = await waitEl("noite-src-code");
       const diffHost = await waitEl("noite-src-diff");
-      if (!actionHost || !treeRoot || !codeHost || !diffHost) {
+      const statusEl = await waitEl("noite-src-status");
+      if (!treeRoot || !codeHost || !diffHost || !statusEl) {
         return;
       }
 
-      const statusEl = document.createElement("span");
-      statusEl.className = "text-xs opacity-70 ml-auto";
       const setStatus = (s: string) => {
         statusEl.textContent = s;
       };
-      actionHost.append(statusEl);
 
-      const btnFiles = document.createElement("button");
-      btnFiles.type = "button";
-      btnFiles.className = "btn btn-sm btn-primary";
-      btnFiles.textContent = "Files";
-      const btnDiff = document.createElement("button");
-      btnDiff.type = "button";
-      btnDiff.className = "btn btn-sm btn-ghost";
-      btnDiff.textContent = "Last push diff";
-      statusEl.before(btnFiles);
-      statusEl.before(btnDiff);
-
-      const setMode = (mode: "files" | "diff") => {
+      let currentMode: SourceMode = "files";
+      let modeSeq = 0;
+      // Header toggle shares no atoms with this component (a parent
+      // subscription would remount this browser on every switch), so
+      // its styling syncs imperatively by id like the status line.
+      const setMode = (mode: SourceMode) => {
+        modeSeq += 1;
+        currentMode = mode;
         const showFiles = mode === "files";
         treeRoot.classList.toggle("hidden", !showFiles);
         codeHost.classList.toggle("hidden", !showFiles);
         diffHost.classList.toggle("hidden", showFiles);
-        btnFiles.classList.toggle("btn-primary", showFiles);
-        btnFiles.classList.toggle("btn-ghost", !showFiles);
-        btnDiff.classList.toggle("btn-primary", !showFiles);
-        btnDiff.classList.toggle("btn-ghost", showFiles);
+        syncToggle(showFiles);
       };
-      btnFiles.addEventListener("click", () => setMode("files"));
-      btnDiff.addEventListener("click", () => setMode("diff"));
 
       let diffViews: { cleanUp: () => void }[] = [];
 
@@ -164,6 +181,9 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
       let activePreview = 0;
 
       const openFile = async (path: string) => {
+        if (gen !== setupGen) {
+          return;
+        }
         if (!filePaths.has(path)) {
           // directory row — nothing to preview
           return;
@@ -171,11 +191,16 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
         activePreview += 1;
         const previewToken = activePreview;
         setMode("files");
+        const openSeq = modeSeq;
         setStatus(`loading ${path} …`);
         try {
           // SAFETY: sourceBlob returns the runner Blob payload which matches RunnerBlob field-for-field; binary/truncated branches are handled below.
           const blob = (await sourceBlob({ appId, path })) as RunnerBlob;
-          if (previewToken !== activePreview) {
+          if (
+            previewToken !== activePreview ||
+            openSeq !== modeSeq ||
+            gen !== setupGen
+          ) {
             return;
           }
           if (blob.binary) {
@@ -192,7 +217,13 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
           }
           setStatus(`${path} · ${fmtSize(blob.size)}`);
         } catch (error) {
-          setStatus(error instanceof Error ? error.message : String(error));
+          if (
+            previewToken === activePreview &&
+            openSeq === modeSeq &&
+            gen === setupGen
+          ) {
+            setStatus(error instanceof Error ? error.message : String(error));
+          }
         }
       };
 
@@ -215,7 +246,10 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
             ? [defaultPreviewPath]
             : undefined,
           onSelectionChange: (selected) => {
-            if (selected[0]) {
+            // Late/duplicate selection events (e.g. the initial selection
+            // re-firing seconds after mount) must not yank an open diff
+            // back to Files — the tree is only actionable in files mode.
+            if (selected[0] && currentMode === "files") {
               void openFile(selected[0]);
             }
           },
@@ -233,8 +267,11 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
         setStatus(error instanceof Error ? error.message : String(error));
       }
 
-      btnDiff.addEventListener("click", async () => {
-        setMode("diff");
+      const loadDiff = async () => {
+        if (gen !== setupGen) {
+          return;
+        }
+        const diffSeq = modeSeq;
         setStatus("loading last-push diff …");
         diffHost.textContent = "";
         for (const d of diffViews) {
@@ -243,6 +280,9 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
         diffViews = [];
         try {
           const d = await sourceDiff(appId);
+          if (gen !== setupGen || diffSeq !== modeSeq) {
+            return;
+          }
           const patches = parsePatchFiles(d.patch);
           for (const patch of patches) {
             for (const fileDiff of patch.files) {
@@ -267,17 +307,38 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
             `${changed} file(s) changed · ${d.sha.slice(0, 12)}${d.truncated ? " · patch truncated" : ""}`
           );
         } catch (error) {
-          setStatus(error instanceof Error ? error.message : String(error));
+          if (gen === setupGen && diffSeq === modeSeq) {
+            setStatus(error instanceof Error ? error.message : String(error));
+          }
         }
-      });
+      };
+      if (gen !== setupGen) {
+        return;
+      }
+      modeRequest = (mode) => {
+        if (mode === "diff") {
+          setMode("diff");
+          void loadDiff();
+        } else {
+          setMode("files");
+        }
+      };
+      // Deep links / refreshes with ?view=diff land straight in the diff.
+      if (new URLSearchParams(window.location.search).get("view") === "diff") {
+        setMode("diff");
+        void loadDiff();
+      }
     })();
-    return () => teardown.fn?.();
+    return () => {
+      modeRequest = undefined;
+      setupGen += 1;
+      teardown.fn?.();
+    };
   });
 
   return (
-    <div class="flex flex-col gap-2">
-      <div id="noite-src-actions" class="flex min-h-9 items-center gap-2"></div>
-      <div class="border-base-300 flex h-[65vh] overflow-hidden rounded-lg border">
+    <div class="flex min-h-0 w-full flex-1 flex-col gap-2">
+      <div class="border-base-300 flex min-h-[50vh] flex-1 overflow-hidden rounded-lg border">
         <div
           id="noite-src-tree"
           class="bg-base-200/50 w-72 shrink-0 overflow-auto p-2"
@@ -289,8 +350,10 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
         ></div>
       </div>
       <p class="m-0 text-xs opacity-60">
-        Preview of the latest pushed commit, served from the runner&apos;s bare
-        mirror.
+        <span id="noite-src-status" class="font-medium"></span>
+        {
+          " Preview of the latest pushed commit, served from the runner's bare mirror."
+        }
       </p>
     </div>
   );

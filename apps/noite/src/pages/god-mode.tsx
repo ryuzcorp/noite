@@ -2,7 +2,6 @@ import { AdminPanel } from "$lib/admin-panel";
 import { adminOverview } from "$lib/admin.server";
 import { hardNav } from "$lib/auth-client";
 import { SessionSplash } from "$lib/authed";
-import { Breadcrumbs } from "$lib/breadcrumbs";
 import { head } from "@ilha/router";
 import { atom, watch } from "ilha";
 
@@ -51,7 +50,6 @@ export default function GodMode() {
   }
   return (
     <div class="mx-auto mt-4 flex w-full max-w-5xl flex-col gap-4 px-4 pb-12">
-      <Breadcrumbs trail={[{ label: "God Mode" }]} />
       <div class="w-full max-w-2xl">
         <AdminPanel email={email()} />
       </div>

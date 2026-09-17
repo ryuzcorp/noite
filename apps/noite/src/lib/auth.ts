@@ -5,8 +5,10 @@ import { passkey } from "@better-auth/passkey";
 import { betterAuth } from "better-auth";
 import { APIError } from "better-auth/api";
 import { admin } from "better-auth/plugins";
+import { emailOTP } from "better-auth/plugins/email-otp";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { createTransport } from "nodemailer";
 import { OxideRequest } from "oxidejs";
 
 import { ensureDbPromise, getAuthDb, missingDb, orm } from "./db";
@@ -104,6 +106,30 @@ const requireRegistration = (context: string | null | undefined) => {
   }
 };
 
+/** Deliver a sign-in OTP: real SMTP when configured, dev-console fallback
+ * on localhost, loud refusal otherwise (a silent no-op would lock every
+ * passkey-less user out with no trace). */
+const sendSignInOTP = async (email: string, otp: string): Promise<void> => {
+  const smtpUrl = process.env.NOITE_SMTP_URL;
+  if (smtpUrl) {
+    const from = process.env.NOITE_SMTP_FROM ?? "Noite <no-reply@localhost>";
+    const transporter = createTransport(smtpUrl);
+    await transporter.sendMail({
+      from,
+      subject: "Your Noite sign-in code",
+      text: `Your Noite sign-in code is ${otp}. It expires in 10 minutes.`,
+      to: email,
+    });
+    return;
+  }
+  if ((process.env.BASE_DOMAIN ?? "localhost") === "localhost") {
+    // oxlint-disable-next-line no-console-except-error -- dev-only OTP delivery channel; prod uses SMTP or refuses loudly below.
+    console.log(`[noite:otp] sign-in code for ${email}: ${otp}`);
+    return;
+  }
+  throw new Error("Email delivery is not configured (NOITE_SMTP_URL)");
+};
+
 /** Hostname for the passkey RP ID. Bad config must fail loud (a silent
  * fallback would misbind passkeys), surfaced as the mapped 500. */
 const rpHostname = (baseURL: string): string => {
@@ -132,6 +158,20 @@ export const createAuth = (
       // God-mode impersonates any account (including fellow admins) — the
       // impersonator is already an admin, so this grants no new power.
       admin({ allowImpersonatingAdmins: true, defaultRole: "user" }),
+      // Lost-passkey recovery: email OTP is deliberately secondary — the
+      // login UI keeps passkeys primary and reveals this behind
+      // "Lost passkey?". Sign-in only (no auto-provisioning strangers).
+      emailOTP({
+        allowedAttempts: 5,
+        expiresIn: 600,
+        otpLength: 6,
+        async sendVerificationOTP({ email, otp, type }) {
+          if (type !== "sign-in") {
+            return;
+          }
+          await sendSignInOTP(email, otp);
+        },
+      }),
       apiKey({
         defaultPrefix: "noite_",
         enableMetadata: false,

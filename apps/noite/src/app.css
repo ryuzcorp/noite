@@ -1,6 +1,11 @@
 @import "tailwindcss";
 @plugin "daisyui";
 
+@theme {
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, monospace;
+}
+
 @plugin "daisyui/theme" {
   name: "light";
   default: true;
@@ -51,8 +56,8 @@
   --color-secondary-content: oklch(98% 0.014 180.72);
   --color-accent: oklch(70% 0.165 254.624);
   --color-accent-content: oklch(28% 0.091 267.935);
-  --color-neutral: oklch(14% 0.005 285.823);
-  --color-neutral-content: oklch(92% 0.004 286.32);
+  --color-neutral: oklch(100% 0 0);
+  --color-neutral-content: oklch(14% 0 0);
   --color-info: oklch(78% 0.154 211.53);
   --color-info-content: oklch(30% 0.056 229.695);
   --color-success: oklch(69% 0.17 162.48);
@@ -74,4 +79,26 @@
 * {
   --menu-active-bg: var(--color-base-300);
   --menu-active-fg: var(--color-base-content);
+}
+
+/* One outer padding everywhere: card bodies match the 1rem list padding. */
+:root {
+  --card-p: 1rem;
+}
+
+/* Badges are always fully rounded — no per-use rounded-full needed.
+ * Scoped to .badge (not --radius-selector, which checkbox/range/etc share). */
+.badge {
+  border-radius: 9999px;
+}
+
+/* Source preview: the pierre host is content-sized — stretch it to the
+ * full pane height so short files still fill the code area. */
+#noite-src-code:not(.hidden) {
+  display: flex;
+  flex-direction: column;
+}
+#noite-src-code:not(.hidden) > * {
+  flex: 1;
+  min-height: 100%;
 }

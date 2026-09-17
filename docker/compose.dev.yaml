@@ -20,7 +20,16 @@ services:
     environment:
       RUST_LOG: ${RUST_LOG:-noite_runner=debug,tower_http=info}
       CARGO_TERM_COLOR: always
+      RUNNER_DEV_RELEASE: ${RUNNER_DEV_RELEASE:-0}
     command: ["/bin/sh", "/runner-dev.sh"]
+    healthcheck:
+      # Debug compile on first boot can take minutes — start_period covers
+      # it; afterwards fleets must be spawned (/ready) before dependents start.
+      test: ["CMD", "curl", "-f", "http://localhost:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 600s
 
   ui:
     build:
@@ -32,6 +41,11 @@ services:
       NOITE_MODE: ${NOITE_MODE:-dev}
       # Instance admin bootstrap address (empty = disabled).
       NOITE_ADMIN_EMAIL: ${NOITE_ADMIN_EMAIL:-}
+      # 1 = polling file watcher (flaky rootless inotify).
+      VITE_USE_POLLING: ${VITE_USE_POLLING:-0}
+    depends_on:
+      runner:
+        condition: service_healthy
     volumes:
       - ../apps/noite:/app
       - ../docker/noite.sh:/noite.sh:ro

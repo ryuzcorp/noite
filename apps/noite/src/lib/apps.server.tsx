@@ -21,12 +21,11 @@ import {
   requireAppRole,
 } from "./collaborators";
 import { ensureDb, ensureDbPromise, orm, SqlLive, withDb } from "./db";
-import type { App, AppRole, Deploy } from "./db";
+import type { App, AppRole } from "./db";
 import { enqueueOp } from "./ops.server";
 import {
   runnerGetApp,
   runnerGitRemote,
-  runnerListDeploys,
   runnerSourceBlob,
   runnerSourceDiff,
   runnerSourceTree,
@@ -80,29 +79,6 @@ const loadApps = (userId: string) =>
     Effect.scoped
   );
 
-const loadDeploys = (appId: string) =>
-  Effect.tryPromise({
-    catch: (e) =>
-      new ActionError({
-        message: e instanceof Error ? e.message : String(e),
-      }),
-    try: async () => {
-      const rows = await runnerListDeploys(appId);
-      return rows.map((d) => {
-        const row: Deploy = {
-          appId: d.appId,
-          createdAt: d.createdAt,
-          id: d.id,
-          log: d.log,
-          sha: d.sha,
-          status: d.status,
-          updatedAt: d.updatedAt,
-        };
-        return row;
-      });
-    },
-  });
-
 /** new URL() throws on malformed input — never let a bad request URL 500. */
 const requestOrigin = (request: Request): string | undefined => {
   try {
@@ -144,29 +120,6 @@ export const list = action(
         );
       })
     ),
-  { error: AuthError, stream: true }
-);
-
-/** One-shot deploy history from the runner (no liveQuery — avoids seed/ALS Defects). */
-export const listDeploys = action(
-  withSchema(AppId, (appId: string) =>
-    Stream.unwrap(
-      Effect.gen(function* () {
-        const user = yield* requireUser;
-        yield* Effect.tryPromise({
-          catch: (e) =>
-            e instanceof UnauthorizedError || e instanceof ActionError
-              ? e
-              : new ActionError({
-                  message: e instanceof Error ? e.message : String(e),
-                }),
-          try: () => requireAppRole(appId, user.id, "view"),
-        });
-        const rows = yield* loadDeploys(appId);
-        return Stream.succeed(rows);
-      })
-    )
-  ),
   { error: AuthError, stream: true }
 );
 

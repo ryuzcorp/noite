@@ -3,7 +3,6 @@ import { atom, unsafe } from "ilha";
 import { createMutationQueue } from "oxidejs/mutation-queue";
 
 import { create, list } from "./apps.server";
-import { Breadcrumbs } from "./breadcrumbs";
 import type { App } from "./db";
 
 const toStreamError = (cause: unknown): Error =>
@@ -71,12 +70,12 @@ export const presenceTone = (status: string): string => {
 /** Lucide chevron-right. Static trusted markup (no user input), so the
  * unsafe() path is appropriate — it parses in the SVG namespace, which
  * inline <svg> JSX can't reach under ilha's HTML-namespace mounting. */
-const CHEVRON_SVG =
+export const CHEVRON_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>';
 
 /** Live-app URL on the current host (mirrors LiveAppStatus in app-detail).
  * Dev carries the port over http; prod (no port) links plain https. */
-const appUrl = (subdomain: string): string => {
+export const appUrl = (subdomain: string): string => {
   const { port } = window.location;
   return port ? `http://${subdomain}:${port}` : `https://${subdomain}`;
 };
@@ -99,72 +98,71 @@ export const AppsList = () => {
           <p class="text-error m-0 text-sm">{listError()}</p>
         ) : null}
 
-        <div class="flex items-center justify-between gap-2">
-          <div class="flex items-center gap-2">
-            <Breadcrumbs trail={[{ label: "Apps" }]} />
-            <span class="badge badge-primary">{items.length}</span>
-          </div>
-          <a href="/apps/new" class="btn btn-sm btn-primary">
-            New app
-          </a>
-        </div>
-
-        {items.length === 0 ? (
-          <p class="text-base-content/70 m-0">
-            No apps yet.{" "}
-            <a href="/apps/new" class="link">
-              Create one
-            </a>{" "}
-            to get a git remote.
-          </p>
-        ) : (
-          <div class="flex w-full flex-col gap-4">
-            {items.map((app) => (
-              <div key={app.id} class="card bg-base-100 w-full shadow-sm">
-                <div class="card-body gap-3">
-                  <div class="flex items-center gap-3">
-                    <div class="avatar avatar-placeholder shrink-0">
-                      <div class="bg-neutral text-neutral-content w-12 rounded-full">
-                        <span class="text-sm">{initials(app.name)}</span>
-                      </div>
-                      <span
-                        class={`status ${presenceTone(app.status)} absolute right-0 bottom-0`}
-                        title={app.status}
-                      />
+        <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
+          <li class="flex items-center justify-between gap-2 p-4 pb-2">
+            <span class="flex items-center gap-2 tracking-wide">
+              <span class="text-lg font-semibold">Your Apps</span>
+              <span class="badge badge-sm">{items.length}</span>
+            </span>
+            <a href="/apps/new" class="btn btn-sm btn-neutral">
+              New app
+            </a>
+          </li>
+          {items.length === 0 ? (
+            <li class="px-4 pt-2 pb-4 text-sm">
+              <span class="text-base-content/70">No apps yet. </span>
+              <a href="/apps/new" class="link">
+                Create one
+              </a>
+              <span class="text-base-content/70"> to get a git remote.</span>
+            </li>
+          ) : (
+            items.map((app) => (
+              <li key={app.id} class="list-row">
+                <div>
+                  <div class="avatar avatar-placeholder">
+                    <div class="bg-neutral text-neutral-content w-10 rounded-full">
+                      <span class="text-sm">{initials(app.name)}</span>
                     </div>
-                    <div class="min-w-0 flex-1">
-                      <a
-                        href={`/apps/${app.id}`}
-                        class="link link-hover card-title m-0 block truncate"
-                      >
-                        {app.name}
-                      </a>
-                      <p class="text-base-content/70 m-0 truncate text-sm">
-                        <a
-                          class="link"
-                          href={appUrl(app.subdomain)}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          {app.subdomain}
-                        </a>
-                      </p>
-                    </div>
+                    <span
+                      class={`status ${presenceTone(app.status)} absolute right-0 bottom-0`}
+                      title={app.status}
+                    />
+                  </div>
+                </div>
+                <div>
+                  <div>
                     <a
                       href={`/apps/${app.id}`}
-                      class="btn btn-ghost btn-sm btn-circle shrink-0"
-                      aria-label={`Open ${app.name} details`}
+                      class="link link-hover block truncate text-lg font-semibold"
                     >
-                      <span class="inline-flex h-5 w-5 shrink-0">
-                        {unsafe(CHEVRON_SVG)}
-                      </span>
+                      {app.name}
+                    </a>
+                  </div>
+                  <div class="text-base-content/70 truncate text-xs">
+                    <a
+                      class="link"
+                      href={appUrl(app.subdomain)}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {app.subdomain}
                     </a>
                   </div>
                 </div>
-              </div>
-            ))}
-          </div>
-        )}
+                <a
+                  href={`/apps/${app.id}`}
+                  class="btn btn-square btn-ghost btn-sm shrink-0"
+                  aria-label={`Open ${app.name} details`}
+                >
+                  <span class="inline-flex h-5 w-5 shrink-0">
+                    {unsafe(CHEVRON_SVG)}
+                  </span>
+                </a>
+              </li>
+            ))
+          )}
+        </ul>
       </>
     )
   );
@@ -263,7 +261,7 @@ export const CreateAppForm = () => {
         </p>
       </fieldset>
 
-      <button type="submit" class="btn btn-primary w-full" disabled={busy()}>
+      <button type="submit" class="btn btn-neutral w-full" disabled={busy()}>
         {busy() ? "Creating…" : "Create app"}
       </button>
     </form>

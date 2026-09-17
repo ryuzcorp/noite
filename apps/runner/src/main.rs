@@ -113,6 +113,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/v1/apps/{id}/rename", post(api::rename_app))
         .route("/v1/apps/{id}/deploys", get(api::list_deploys))
+        .route(
+            "/v1/apps/{id}/deploys/stream",
+            get(api::list_deploys_stream),
+        )
         .route("/v1/apps/{id}/git-remote", post(api::git_remote))
         .route("/v1/apps/{id}/tree", get(api::source_tree))
         .route("/v1/apps/{id}/blob/{*path}", get(api::source_blob))

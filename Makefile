@@ -28,15 +28,18 @@ ifdef DISTROBOX
   export PODMAN_SOCK := /run/user/$(shell id -u)/podman/podman.sock
 endif
 
-.PHONY: help up up-byob down reset logs rebuild restart deploy-test dev
+.PHONY: help up up-byob down reset logs rebuild restart deploy-test dev dev-build dev-joint
 
 COMPOSE_DEV := $(COMPOSE) -f docker/compose.dev.yaml
+COMPOSE_DEV_JOINT := $(COMPOSE) -f docker/compose.dev-joint.yaml
 COMPOSE_BYOB := $(COMPOSE) -f docker/compose.byob.yaml
 
 help:
 	@echo "  make up          start stack (release runner + Oxide UI)"
 	@echo "  make up-byob     start stack against external S3 (no rustfs)"
-	@echo "  make dev         hot reload (runner cargo-watch + Oxide Vite)"
+	@echo "  make dev         hot reload, no rebuild (runner cargo-watch + Oxide Vite)"
+	@echo "  make dev-build   rebuild dev images (Dockerfile/toolchain changes only)"
+	@echo "  make dev-joint   prod joint topology with dev processes (catches joint-only bugs)"
 	@echo "  make logs        follow runner + ui + rustfs + caddy"
 	@echo "  make down        stop stack (keeps data volumes)"
 	@echo "  make reset       stop + delete all volumes (data loss!)"
@@ -60,13 +63,23 @@ up-byob:
 	@echo "open http://localhost:$${HTTP_PORT:-9080}"
 
 dev:
-	$(COMPOSE_DEV) build runner ui
-	$(COMPOSE_DEV) up -d rustfs runner caddy
-	# The ui container bind-mounts ./apps/noite: compose skips a recreate
-	# when the image id is unchanged, so the UI would keep running stale
-	# source. Force it here so every `make dev` starts with fresh code.
-	$(COMPOSE_DEV) up -d --no-deps --force-recreate ui
+	# No build, no force-recreate: images change rarely, source is bind-
+	# mounted and HMR/watch pick up edits. Use dev-build when Dockerfiles
+	# or toolchains change.
+	$(COMPOSE_DEV) up -d rustfs runner caddy ui
 	@echo "dev — runner: cargo watch · ui: Vite HMR + passkeys"
+	@echo "open http://localhost:$${HTTP_PORT:-9080}  (make logs)"
+
+dev-build:
+	$(COMPOSE_DEV) build runner ui
+	$(COMPOSE_DEV) up -d --force-recreate runner ui
+
+dev-joint:
+	# Prod joint topology (runner :8080 + UI :8081, one container, joint
+	# DB layout) with dev processes. RUNNER_DEV_RELEASE=1 for release-mode
+	# runner, VITE_USE_POLLING=1 for flaky rootless inotify.
+	$(COMPOSE_DEV_JOINT) up -d
+	@echo "dev-joint — cargo watch + Vite HMR in prod topology"
 	@echo "open http://localhost:$${HTTP_PORT:-9080}  (make logs)"
 
 logs:

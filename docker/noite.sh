@@ -33,7 +33,25 @@ case "${BETTER_AUTH_URL:-}" in
 esac
 
 echo "noite: bun install"
-bun install
+# Skip when node_modules is newer than the lockfile — container restarts
+# shouldn't pay for a no-op install (first boot and lockfile bumps still
+# install via the stamp below).
+install_needed=0
+if [ ! -d node_modules ]; then
+  install_needed=1
+elif [ ! -f node_modules/.noite-install-stamp ]; then
+  install_needed=1
+elif [ package.json -nt node_modules/.noite-install-stamp ]; then
+  install_needed=1
+elif [ -f bun.lock ] && [ bun.lock -nt node_modules/.noite-install-stamp ]; then
+  install_needed=1
+fi
+if [ "$install_needed" = 1 ]; then
+  bun install
+  touch node_modules/.noite-install-stamp
+else
+  echo "noite: node_modules fresh, skipping install"
+fi
 
 # Pin `rustfs` in hosts — aardvark DNS can flake and hang AWS SDK forever.
 # Keep hostname in S3_ENDPOINT (path-style); do not rewrite to a raw IP
@@ -63,6 +81,9 @@ if [ -n "${rustfs_ip:-}" ]; then
 fi
 
 if [ "${NOITE_MODE:-prod}" = "dev" ]; then
+  if [ "${VITE_USE_POLLING:-0}" = "1" ]; then
+    export CHOKIDAR_USEPOLLING=1
+  fi
   echo "noite: vite dev on 0.0.0.0:${PORT:-8080} (auth ${BETTER_AUTH_URL})"
   exec bunx vite --host 0.0.0.0 --port "${PORT:-8080}" --strictPort
 fi
