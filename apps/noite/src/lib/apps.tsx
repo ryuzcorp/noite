@@ -1,24 +1,23 @@
-import * as Stream from "effect/Stream";
-import { atom, unsafe } from "ilha";
+import { navigate } from "@ilha/router";
+import { atom, unsafe, watch } from "ilha";
 import { createMutationQueue } from "oxidejs/mutation-queue";
 
-import { create, list } from "./apps.server";
+import { create } from "./apps.server";
 import type { App } from "./db";
-
-const toStreamError = (cause: unknown): Error =>
-  cause instanceof Error ? cause : new Error(String(cause));
+import { ListSkeleton } from "./skeletons";
+import { readSwrCache, writeSwrCache } from "./swr-cache";
 
 const queue = createMutationQueue();
 const createQueued = queue.wrap(create, {
   idempotencyKey: ({ slug }) => `create:${slug}`,
 });
 
-// Letters plus hyphens only: fold whitespace, drop digits/symbols, and trim
-// edge hyphens so live slugs match the create/rename gate.
+// Letters, digits, plus hyphens: fold whitespace, drop other symbols,
+// and trim edge hyphens so live slugs match the create/rename gate.
 export const slugifyName = async (value: string): Promise<string> => {
   const { kebabCase } = await import("scule");
   return kebabCase(value.replaceAll(/\s+/gu, "-"))
-    .replaceAll(/[^A-Za-z-]+/gu, "")
+    .replaceAll(/[^A-Za-z0-9-]+/gu, "")
     .replaceAll(/-{2,}/gu, "-")
     .replaceAll(/^-+|-+$/gu, "")
     .slice(0, 48);
@@ -80,95 +79,130 @@ export const appUrl = (subdomain: string): string => {
   return port ? `http://${subdomain}:${port}` : `https://${subdomain}`;
 };
 
-/** App list — navigation only; start/stop/delete live in app details. */
+/** App list over SSE (like DeployList): cache-first seed paints instantly
+ * on every mount, then the event stream pushes updates — no polling, and
+ * resubscribe is automatic on drop. */
 export const AppsList = () => {
+  const seed = readSwrCache<App[]>("apps:list");
+  const items = atom<App[]>(seed ?? []);
   const listError = atom("");
+  const loaded = atom(seed !== null);
 
-  return Stream.map(
-    // oxide Stream.catch mirrors an Error channel, not a Promise — the promise lint rules are false positives here.
-    // oxlint-disable-next-line promise/prefer-await-to-then, promise/valid-params
-    Stream.catch(Stream.fromAsyncIterable(list(), toStreamError), (cause) => {
-      listError.set(cause instanceof Error ? cause.message : String(cause));
-      // SAFETY: an empty app list is the correct fallback shape on load failure.
-      return Stream.succeed([] as App[]);
-    }),
-    (items: App[]) => (
-      <>
-        {listError() ? (
-          <p class="text-error m-0 text-sm">{listError()}</p>
-        ) : null}
+  watch.once(() => {
+    let stopped = false;
+    const source = new EventSource("/api/apps/stream");
+    source.addEventListener("message", (event) => {
+      // A frame arrived, so the stream is alive — even when the payload
+      // matches (empty list with no seed would stick on the skeleton).
+      loaded.set(true);
+      try {
+        const next: unknown = JSON.parse(event.data);
+        if (!Array.isArray(next)) {
+          return;
+        }
+        if (JSON.stringify(items()) === JSON.stringify(next)) {
+          return;
+        }
+        // SAFETY: the apps stream emits the same App rows as the list action; entries flow only into list rendering.
+        items.set(next as App[]);
+        writeSwrCache("apps:list", next);
+        listError.set("");
+      } catch {
+        listError.set("App stream sent invalid data");
+      }
+    });
+    source.addEventListener("error", () => {
+      if (!stopped) {
+        listError.set("App stream disconnected — retrying…");
+      }
+      loaded.set(true);
+    });
+    return () => {
+      stopped = true;
+      source.close();
+    };
+  });
 
-        <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
-          <li class="flex items-center justify-between gap-2 p-4 pb-2">
-            <span class="flex items-center gap-2 tracking-wide">
-              <span class="text-lg font-semibold">Your Apps</span>
-              <span class="badge badge-sm">{items.length}</span>
-            </span>
-            <a href="/apps/new" class="btn btn-sm btn-neutral">
-              New app
-            </a>
+  return (
+    <>
+      {listError() ? <p class="text-error m-0 text-sm">{listError()}</p> : null}
+
+      <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
+        <li class="flex items-center justify-between gap-2 p-4 pb-2">
+          <span class="flex items-center gap-2 tracking-wide">
+            <span class="text-lg font-semibold">Your Apps</span>
+            <span class="badge badge-sm">{items().length}</span>
+          </span>
+          <a href="/apps/new" class="btn btn-sm btn-neutral">
+            New app
+          </a>
+        </li>
+        {!loaded() && (
+          <li class="px-4 pt-2 pb-4">
+            <ListSkeleton rows={3} />
           </li>
-          {items.length === 0 ? (
-            <li class="px-4 pt-2 pb-4 text-sm">
-              <span class="text-base-content/70">No apps yet. </span>
-              <a href="/apps/new" class="link">
-                Create one
+        )}
+        {loaded() && items().length === 0 && (
+          <li class="px-4 pt-2 pb-4 text-sm">
+            <span class="text-base-content/70">No apps yet. </span>
+            <a href="/apps/new" class="link">
+              Create one
+            </a>
+            <span class="text-base-content/70"> to get a git remote.</span>
+          </li>
+        )}
+        {loaded() &&
+          items().map((app) => (
+            <li key={app.id} class="list-row">
+              <div>
+                <div class="avatar avatar-placeholder">
+                  <div class="bg-neutral text-neutral-content w-10 rounded-full">
+                    <span class="text-sm">{initials(app.name)}</span>
+                  </div>
+                  <span
+                    class={`status ${presenceTone(app.status)} absolute right-0 bottom-0`}
+                    title={app.status}
+                  />
+                </div>
+              </div>
+              <div>
+                <div>
+                  <a
+                    href={`/apps/${app.id}`}
+                    class="link link-hover block truncate text-lg font-semibold"
+                  >
+                    {app.name}
+                  </a>
+                </div>
+                <div class="text-base-content/70 truncate text-xs">
+                  <a
+                    class="link"
+                    href={appUrl(app.subdomain)}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    {app.subdomain}
+                  </a>
+                </div>
+              </div>
+              <a
+                href={`/apps/${app.id}`}
+                class="btn btn-sm btn-square btn-ghost shrink-0"
+                aria-label={`Open ${app.name} details`}
+              >
+                <span class="inline-flex h-5 w-5 shrink-0">
+                  {unsafe(CHEVRON_SVG)}
+                </span>
               </a>
-              <span class="text-base-content/70"> to get a git remote.</span>
             </li>
-          ) : (
-            items.map((app) => (
-              <li key={app.id} class="list-row">
-                <div>
-                  <div class="avatar avatar-placeholder">
-                    <div class="bg-neutral text-neutral-content w-10 rounded-full">
-                      <span class="text-sm">{initials(app.name)}</span>
-                    </div>
-                    <span
-                      class={`status ${presenceTone(app.status)} absolute right-0 bottom-0`}
-                      title={app.status}
-                    />
-                  </div>
-                </div>
-                <div>
-                  <div>
-                    <a
-                      href={`/apps/${app.id}`}
-                      class="link link-hover block truncate text-lg font-semibold"
-                    >
-                      {app.name}
-                    </a>
-                  </div>
-                  <div class="text-base-content/70 truncate text-xs">
-                    <a
-                      class="link"
-                      href={appUrl(app.subdomain)}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      {app.subdomain}
-                    </a>
-                  </div>
-                </div>
-                <a
-                  href={`/apps/${app.id}`}
-                  class="btn btn-square btn-ghost btn-sm shrink-0"
-                  aria-label={`Open ${app.name} details`}
-                >
-                  <span class="inline-flex h-5 w-5 shrink-0">
-                    {unsafe(CHEVRON_SVG)}
-                  </span>
-                </a>
-              </li>
-            ))
-          )}
-        </ul>
-      </>
-    )
+          ))}
+      </ul>
+    </>
   );
 };
 
-/** Dedicated create-app form; navigates to the new app's detail on success. */
+/** Dedicated create-app form; SPA-navigates to the list on success (the
+ * SSE stream picks the new row up live — no document reload, no FOUC). */
 export const CreateAppForm = () => {
   const notice = atom<string | null>(null);
   const busy = atom(false);
@@ -191,17 +225,17 @@ export const CreateAppForm = () => {
       notice.set("Name and slug are required");
       return;
     }
-    if (!/^[a-z](?:[a-z-]{0,46}[a-z])?$/u.test(slug)) {
+    if (!/^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/u.test(slug)) {
       notice.set(
-        "Slug must be 1–48 chars: lowercase letters and hyphens, starting and ending with a letter"
+        "Slug must be 1–48 chars: lowercase letters, digits, and hyphens, starting and ending with a letter or digit"
       );
       return;
     }
     try {
       busy.set(true);
       await createQueued({ name, slug });
-      // The new DB id lives server-side; land on the list so the app shows up.
-      window.location.replace("/apps");
+      // SPA nav keeps CSS/DOM parsed; the apps SSE stream adds the new row.
+      navigate("/apps");
     } catch (error) {
       busy.set(false);
       notice.set(error instanceof Error ? error.message : String(error));
@@ -244,9 +278,9 @@ export const CreateAppForm = () => {
           name="slug"
           class="input validator w-full"
           placeholder="my-app"
-          pattern="[a-z]([a-z-]{0,46}[a-z])?"
+          pattern="[a-z0-9]([a-z0-9-]{0,46}[a-z0-9])?"
           maxlength={48}
-          title="Lowercase letters and hyphens, 1–48 chars, starting and ending with a letter"
+          title="Lowercase letters, digits, and hyphens, 1–48 chars, starting and ending with a letter or digit"
           oninput={(e) => {
             const target = e.currentTarget;
             if (target instanceof HTMLInputElement) {
@@ -257,11 +291,15 @@ export const CreateAppForm = () => {
         />
         <p class="label">Auto-generated from the name — edit to override.</p>
         <p class="validator-hint hidden">
-          Lowercase letters and hyphens, 1–48 chars
+          Lowercase letters, digits, and hyphens, 1–48 chars
         </p>
       </fieldset>
 
-      <button type="submit" class="btn btn-neutral w-full" disabled={busy()}>
+      <button
+        type="submit"
+        class="btn btn-sm btn-neutral w-full"
+        disabled={busy()}
+      >
         {busy() ? "Creating…" : "Create app"}
       </button>
     </form>

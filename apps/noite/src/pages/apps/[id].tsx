@@ -1,21 +1,16 @@
-import {
-  AppDetailPanel,
-  AppSettingsPanel,
-  CODE_SVG,
-  DeployList,
-  DeployDropdown,
-  RuntimeLogs,
-} from "$lib/app-detail";
+import { DeployList, DeployDropdown } from "$lib/app-detail/deploys";
+import { CODE_SVG } from "$lib/app-detail/icons";
+import { MetricsCard } from "$lib/app-detail/metrics";
+import { AppDetailPanel } from "$lib/app-detail/panel";
+import { AppSettingsPanel } from "$lib/app-detail/settings";
 import { get } from "$lib/apps.server";
-import { AppStorageList } from "$lib/storage";
 import { useRoute, head, navigate } from "@ilha/router";
 import { unsafe, watch } from "ilha";
 
 const TABS = [
   { id: "overview", label: "Overview" },
-  { id: "logs", label: "Logs" },
   { id: "deployments", label: "Deployments" },
-  { id: "resources", label: "Resources" },
+  { id: "metrics", label: "Metrics" },
   { id: "settings", label: "Settings" },
 ] as const;
 
@@ -85,17 +80,6 @@ export default function AppPage() {
       </div>
 
       {activeTab() === "overview" ? <AppDetailPanel /> : null}
-      {activeTab() === "logs" ? (
-        <div class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-          <div class="card-body gap-4">
-            {appId ? (
-              <RuntimeLogs appId={appId} />
-            ) : (
-              <p class="m-0 text-sm opacity-70">Missing app id.</p>
-            )}
-          </div>
-        </div>
-      ) : null}
       {activeTab() === "deployments" ? (
         <>
           {appId ? (
@@ -105,16 +89,16 @@ export default function AppPage() {
           )}
         </>
       ) : null}
-      {activeTab() === "resources" ? (
+      {activeTab() === "settings" ? <AppSettingsPanel /> : null}
+      {activeTab() === "metrics" ? (
         <>
           {appId ? (
-            <AppStorageList appId={appId} />
+            <MetricsCard appId={appId} detail />
           ) : (
             <p class="m-0 text-sm opacity-70">Missing app id.</p>
           )}
         </>
       ) : null}
-      {activeTab() === "settings" ? <AppSettingsPanel /> : null}
     </div>
   );
 }

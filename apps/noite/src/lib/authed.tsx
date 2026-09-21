@@ -1,14 +1,10 @@
+import { navigate } from "@ilha/router";
 import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
-import { authClient, hardNav } from "./auth-client";
+import { authClient } from "./auth-client";
 import { DashboardSkeleton } from "./skeletons";
-
-const sleep = (ms: number) =>
-  // oxlint-disable-next-line promise/avoid-new -- browser has no Bun.sleep; setTimeout delay needs a Promise
-  new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
+import { sleep } from "./sleep";
 
 interface CachedSession {
   email: string;
@@ -89,7 +85,7 @@ export const Authed = ({
           return;
         }
         sessionCache = null;
-        hardNav("/login");
+        navigate("/login");
         return;
       }
       // Slow path (initial load): retry briefly — first paint after
@@ -115,7 +111,7 @@ export const Authed = ({
       }
       // No session: leave nothing dashboard-shaped on screen and bounce.
       denied.set(true);
-      hardNav("/login");
+      navigate("/login");
     })();
   });
 
@@ -131,7 +127,7 @@ export const Authed = ({
         returning.set(false);
         return;
       }
-      hardNav("/god-mode");
+      navigate("/god-mode");
     } catch (error) {
       returnError.set(error instanceof Error ? error.message : String(error));
       returning.set(false);
@@ -151,7 +147,7 @@ export const Authed = ({
               {returnError() ? <span>{returnError()}</span> : null}
               <button
                 type="button"
-                class="btn btn-xs"
+                class="btn btn-sm"
                 disabled={returning()}
                 onclick={() => {
                   void stopImpersonating();

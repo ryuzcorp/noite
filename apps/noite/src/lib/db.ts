@@ -1,12 +1,15 @@
-import { Database } from "bun:sqlite";
-import { mkdirSync } from "node:fs";
-
-import { SqliteClient } from "@effect/sql-sqlite-bun";
+import type { D1Database } from "@cloudflare/workers-types";
+import { D1Client } from "@effect/sql-d1";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { SqlClient } from "effect/unstable/sql/SqlClient";
+import { Kysely } from "kysely";
+import { D1Dialect } from "kysely-d1";
+import { useEnv } from "oxidejs";
 import { createMigrator, defineSchema, paranorm } from "paranorm";
 import type { InferSchema, Selectable } from "paranorm";
+
+import { controlEnv } from "./control-env";
 
 const schema = defineSchema(`
   _version: "1.2.0"
@@ -181,34 +184,50 @@ export class MissingDbError extends Schema.TaggedError<MissingDbError>()(
 
 export const missingDb = () =>
   new MissingDbError({
-    message: "noite: database path missing (NOITE_DB)",
+    message: "noite: D1 database binding is missing (DB)",
   });
 
-export const dbFilename = () => process.env.NOITE_DB ?? "./data/noite.sqlite";
+let d1Binding: D1Database | undefined;
 
-let authSqlite: Database | undefined;
-
-/** Better Auth uses bun:sqlite directly. */
-export const getAuthDb = () => {
-  if (!authSqlite) {
-    const file = dbFilename();
-    const dir = file.includes("/") ? file.replace(/\/[^/]+$/u, "") : ".";
-    if (dir && dir !== ".") {
-      mkdirSync(dir, { recursive: true });
-    }
-    authSqlite = new Database(file, { create: true });
-    // Share the file with Effect SqlClient — avoid "database is locked" right
-    // after passkey register when list() races session writes.
-    authSqlite.exec("PRAGMA journal_mode = WAL;");
-    authSqlite.exec("PRAGMA busy_timeout = 5000;");
-  }
-  return authSqlite;
+/** Stamp the Worker D1 binding for calls outside a request store. */
+export const setD1Binding = (db: D1Database) => {
+  d1Binding = db;
 };
 
-export const SqlLive = SqliteClient.layer({
-  create: true,
-  filename: dbFilename(),
-});
+/** Live D1: request ALS env first, then the middleware-stamped binding. */
+export const resolveD1 = (): D1Database => {
+  try {
+    const live = useEnv<KitEnv>()?.DB;
+    if (live) {
+      return live;
+    }
+  } catch {
+    // Outside a request store — fall through to the stamped binding.
+  }
+  if (d1Binding) {
+    return d1Binding;
+  }
+  throw missingDb();
+};
+
+/** Request-scoped env over process defaults (Worker-safe: no bare process.env). */
+export const resolveEnv = (): KitEnv => {
+  let live: KitEnv | undefined;
+  try {
+    live = useEnv<KitEnv>();
+  } catch {
+    // Outside a request store — defaults only.
+  }
+  // SAFETY: the merged bag mirrors KitEnv (control defaults + live Worker env); unset keys stay undefined as callers tolerate.
+  return { ...controlEnv, ...live } as KitEnv;
+};
+
+/** Better Auth database: Kysely over D1 (fresh handle per call — D1 has no connections to pool). */
+export const getAuthDb = () =>
+  new Kysely({ dialect: new D1Dialect({ database: resolveD1() }) });
+
+/** D1-backed SqlClient layer for the resolved binding. */
+export const sqlLive = () => D1Client.layer({ db: resolveD1() });
 
 const migrated = { done: false };
 
@@ -234,8 +253,9 @@ export const ensureDb = Effect.gen(function* ensureDb() {
   // NOITE_ADMIN_EMAIL names an already-registered account, ensure it
   // holds the admin role. No-op when unset or not yet registered.
   const adminEmail =
-    process.env.NOITE_ADMIN_EMAIL?.trim().toLowerCase() || null;
+    resolveEnv().NOITE_ADMIN_EMAIL?.trim().toLowerCase() || null;
   if (adminEmail) {
+    // @ts-expect-error TS2589: paranorm user-table inference exceeds tsc's depth budget; the query is correct at runtime.
     const existing = yield* orm.user.findFirst({
       where: { email: adminEmail },
     });
@@ -250,21 +270,17 @@ export const ensureDb = Effect.gen(function* ensureDb() {
 });
 
 export const ensureDbPromise = () =>
-  Effect.runPromise(ensureDb.pipe(Effect.provide(SqlLive), Effect.scoped));
+  Effect.runPromise(ensureDb.pipe(Effect.provide(sqlLive()), Effect.scoped));
 
 export const withDb = <A, E, R>(
   effect: Effect.Effect<A, E, R | SqlClient>
 ): Promise<A> => {
-  const promise = Effect.runPromise(
-    ensureDb.pipe(
-      Effect.andThen(() => effect),
-      Effect.provide(SqlLive),
-      Effect.scoped
-    )
+  const open = ensureDb.pipe(
+    Effect.andThen(() => effect),
+    Effect.provide(sqlLive()),
+    Effect.scoped
   );
-  // SAFETY: Effect.runPromise unwraps the effect's A channel; providing SqlLive+scoped collapses E+R, so the resolved value is exactly the action's A.
-  return promise as Promise<A>;
+  // SAFETY: providing the D1 layer and scope collapses the R channel, so runPromise sees a closed effect resolving to exactly A.
+  const promise = Effect.runPromise(open as Effect.Effect<A, never, never>);
+  return promise;
 };
-
-/** @deprecated capture unused — SQLite is process-global */
-export const useDb = () => getAuthDb();

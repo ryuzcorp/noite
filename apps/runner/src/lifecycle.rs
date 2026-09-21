@@ -26,7 +26,7 @@ pub fn slug_ok(slug: &str) -> bool {
     }
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
-        regex::Regex::new(r"^[a-z]([a-z\-]{0,46}[a-z])?$").expect("slug re")
+        regex::Regex::new(r"^[a-z0-9]([a-z0-9\-]{0,46}[a-z0-9])?$").expect("slug re")
     });
     re.is_match(slug)
 }
@@ -49,14 +49,15 @@ mod tests {
         assert!(slug_ok("test"));
         assert!(slug_ok("a"));
         assert!(slug_ok("my-app"));
+        assert!(slug_ok("my-app-1"));
+        assert!(slug_ok("app2"));
+        assert!(slug_ok("2fast"));
         assert!(!slug_ok("_control"));
         assert!(!slug_ok("app"));
         assert!(!slug_ok("api"));
         assert!(!slug_ok("git"));
         assert!(!slug_ok("-bad"));
         assert!(!slug_ok("bad-"));
-        assert!(!slug_ok("my-app-1"));
-        assert!(!slug_ok("app2"));
         assert!(!slug_ok("under_score"));
         assert!(!slug_ok("Bad"));
         assert!(!slug_ok(""));

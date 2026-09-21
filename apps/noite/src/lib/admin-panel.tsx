@@ -1,7 +1,8 @@
+import { navigate } from "@ilha/router";
 import { atom, watch } from "ilha";
 
 import { banUser, listAllApps, listUsers, unbanUser } from "./admin.server";
-import { authClient, hardNav } from "./auth-client";
+import { authClient } from "./auth-client";
 import { ListSkeleton, SectionSkeleton } from "./skeletons";
 
 interface AdminUser {
@@ -23,6 +24,7 @@ interface AdminApp {
 }
 
 interface AdminUserRowProps {
+  key?: string;
   row: AdminUser;
   isSelf: boolean;
   busy: boolean;
@@ -49,7 +51,7 @@ const AdminUserRow = (props: AdminUserRowProps) => {
         <span class="flex gap-1">
           <button
             type="button"
-            class="btn btn-ghost btn-xs"
+            class="btn btn-sm btn-ghost"
             disabled={props.busy || props.impersonating}
             onclick={() => {
               props.onImpersonate(row);
@@ -59,7 +61,7 @@ const AdminUserRow = (props: AdminUserRowProps) => {
           </button>
           <button
             type="button"
-            class="btn btn-ghost btn-xs"
+            class="btn btn-sm btn-ghost"
             disabled={props.busy}
             onclick={() => {
               props.onToggle(row);
@@ -149,8 +151,8 @@ export const AdminPanel = ({ email }: { email: string }) => {
 
   const reload = async () => {
     const [userRows, appRows] = await Promise.all([listUsers(), listAllApps()]);
-    users.set(userRows);
-    apps.set(appRows);
+    users.set(userRows ?? []);
+    apps.set(appRows ?? []);
   };
 
   watch.once(() => {
@@ -176,7 +178,9 @@ export const AdminPanel = ({ email }: { email: string }) => {
         impersonating.set(false);
         return;
       }
-      hardNav("/apps");
+      // SPA nav: the session cookie is swapped server-side; the gate
+      // re-reads it on the next mount with no document reload.
+      navigate("/apps");
     } catch (error) {
       adminError.set(error instanceof Error ? error.message : String(error));
       impersonating.set(false);

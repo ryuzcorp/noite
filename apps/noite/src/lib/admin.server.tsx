@@ -1,9 +1,9 @@
 /* eslint-disable func-names -- Effect.gen uses anonymous generators */
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { action, useEnv, useRequest, withSchema } from "oxidejs";
-import type { Selectable } from "paranorm";
+import { action, useEnv, useRequest } from "oxidejs";
 
+import { checkedSchema } from "./action-schema";
 import {
   ActionError,
   authFromEnv,
@@ -12,11 +12,21 @@ import {
   UnauthorizedError,
 } from "./auth";
 import { ensureDbPromise, orm, withDb } from "./db";
-import type { DB } from "./db";
+import { failUnknown } from "./ops.server";
 import { runnerListApps } from "./runner";
 import type { RunnerApp } from "./runner";
 
-type DbUser = Selectable<DB["user"]>;
+/** Explicit user-row shape (mirrors the paranorm `user` table). Written
+ * out instead of `Selectable<DB["user"]>`, whose instantiation blows up
+ * tsc's depth budget (TS2589). */
+interface DbUser {
+  banned: boolean | null;
+  createdAt: Date | string | null;
+  email: string;
+  id: string;
+  name: string | null;
+  role: string | null;
+}
 
 const AuthError = Schema.Union([
   UnauthorizedError,
@@ -170,15 +180,21 @@ export const listUsers = action(
       failAction("Admin only");
     }
     try {
+      // @ts-expect-error TS2589: paranorm user-table inference exceeds tsc's depth budget; rows are plain user records at runtime.
       const rows = await withDb(orm.user.findMany({}));
-      const users = rows.map(asUserRow);
+      const users = rows.map((row) =>
+        asUserRow(
+          // SAFETY: rows come from the user table; columns match DbUser.
+          row as DbUser
+        )
+      );
       users.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
       return users.slice(0, 200);
     } catch (error) {
       if (error instanceof UnauthorizedError || error instanceof ActionError) {
         throw error;
       }
-      failAction(error instanceof Error ? error.message : String(error));
+      failUnknown(error);
     }
   },
   { error: AuthError }
@@ -216,7 +232,7 @@ export const listAllApps = action(
       if (error instanceof UnauthorizedError || error instanceof ActionError) {
         throw error;
       }
-      failAction(error instanceof Error ? error.message : String(error));
+      failUnknown(error);
     }
   },
   { error: AuthError }
@@ -226,11 +242,8 @@ const UserId = Schema.String;
 
 /** Ban (also revokes sessions via the admin plugin). Never self-ban. */
 export const banUser = action(
-  withSchema(UserId, async (userId: string) => {
-    const admin = await requireAdmin();
-    if (!admin) {
-      failAction("Admin only");
-    }
+  checkedSchema(UserId, async (userId: string) => {
+    const admin = (await requireAdmin()) ?? failAction("Admin only");
     if (userId === admin.id) {
       failAction("Cannot ban your own account");
     }
@@ -241,14 +254,14 @@ export const banUser = action(
       if (error instanceof UnauthorizedError || error instanceof ActionError) {
         throw error;
       }
-      failAction(error instanceof Error ? error.message : String(error));
+      failUnknown(error);
     }
   }),
   { error: AuthError }
 );
 
 export const unbanUser = action(
-  withSchema(UserId, async (userId: string) => {
+  checkedSchema(UserId, async (userId: string) => {
     const admin = await requireAdmin();
     if (!admin) {
       failAction("Admin only");
@@ -260,7 +273,7 @@ export const unbanUser = action(
       if (error instanceof UnauthorizedError || error instanceof ActionError) {
         throw error;
       }
-      failAction(error instanceof Error ? error.message : String(error));
+      failUnknown(error);
     }
   }),
   { error: AuthError }

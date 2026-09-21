@@ -1,6 +1,7 @@
+import { navigate } from "@ilha/router";
 import { atom, watch } from "ilha";
 
-import { authClient, hardNav } from "./auth-client";
+import { authClient } from "./auth-client";
 import { SectionSkeleton } from "./skeletons";
 
 interface ApiKeyRow {
@@ -47,7 +48,7 @@ export const ProfilePanel = () => {
     void (async () => {
       const { data } = await authClient.getSession();
       if (!data?.user) {
-        hardNav("/login");
+        navigate("/login");
         return;
       }
       await reload();
@@ -140,7 +141,7 @@ export const ProfilePanel = () => {
 
   return (
     <div class="flex flex-col gap-6">
-      <section class="border-base-300 dark:bg-base-200 bg-base-100 rounded-box flex flex-col gap-4 border p-4 shadow-md">
+      <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
         <h2 class="m-0 text-lg font-semibold">Profile</h2>
         <fieldset class="fieldset w-full">
           <label class="label" for="profile-name">
@@ -185,12 +186,12 @@ export const ProfilePanel = () => {
           </button>
         </div>
       </section>
-      <section class="border-base-300 dark:bg-base-200 bg-base-100 rounded-box flex flex-col gap-4 border p-4 shadow-md">
+      <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
         <div class="flex items-center justify-between gap-2">
           <h2 class="m-0 text-lg font-semibold">API keys</h2>
           <button
             type="button"
-            class="btn btn-neutral btn-sm shrink-0"
+            class="btn btn-sm btn-neutral shrink-0"
             onclick={() => {
               const input = document.querySelector("#key-name");
               if (input instanceof HTMLInputElement) {
@@ -209,7 +210,7 @@ export const ProfilePanel = () => {
           app.
         </p>
         <div class={`modal ${keyModal() ? "modal-open" : ""}`}>
-          <div class="modal-box">
+          <div class="modal-box bg-base-100 dark:bg-base-200">
             <h3 class="m-0 text-lg font-bold">Create API key</h3>
             <form onsubmit={createKey}>
               <fieldset class="fieldset w-full">
@@ -251,6 +252,17 @@ export const ProfilePanel = () => {
               </div>
             </form>
           </div>
+          <form method="dialog" class="modal-backdrop">
+            <button
+              aria-label="Close dialog"
+              disabled={busy()}
+              onclick={() => {
+                keyModal.set(false);
+              }}
+            >
+              close
+            </button>
+          </form>
         </div>
         {freshKey() ? (
           <div class="bg-base-200 flex flex-col gap-1 rounded p-3 text-xs">
@@ -278,7 +290,7 @@ export const ProfilePanel = () => {
                 </div>
                 <button
                   type="button"
-                  class="btn btn-ghost btn-xs"
+                  class="btn btn-sm btn-ghost"
                   disabled={busy()}
                   onclick={() => {
                     void revoke(row.id);

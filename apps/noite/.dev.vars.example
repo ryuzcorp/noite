@@ -1,7 +1,9 @@
-# Local wrangler / celld secrets (copy to `.dev.vars`).
-
-BETTER_AUTH_SECRET=dev-only-change-me-to-a-long-random-string
-BETTER_AUTH_URL=http://127.0.0.1:8080
-BASE_DOMAIN=localhost
+# Local workerd dev secrets (gitignored). Copy to `.dev.vars` and fill in.
+# Production values come from `wrangler secret` / deploy env, never this file.
+BETTER_AUTH_SECRET=dev-insecure-secret-change-me
+BETTER_AUTH_URL=http://localhost:9080
 RUNNER_TOKEN=dev-runner-token
-S3_ENDPOINT=http://127.0.0.1:9000
+RUSTFS_ACCESS_KEY=minio
+RUSTFS_SECRET_KEY=minio123
+NOITE_ADMIN_EMAIL=
+NOITE_EMAIL_WEBHOOK_URL=

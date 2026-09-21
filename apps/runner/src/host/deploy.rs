@@ -168,6 +168,12 @@ async fn deploy_inner(
 
     let src_dir = materialize_bundle(cfg, app, &work, &bundle_path, &commit_sha).await?;
 
+    // Tenant env (`.dev.vars` model): build + release see the same vars the
+    // fleet gets at spawn. Reserved platform names filtered in db.
+    let tenant = db::tenant_env(pool, &app.id).await;
+    let tenant_refs: Vec<(&str, &str)> =
+        tenant.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
     if tokio::fs::try_exists(src_dir.join("package.json")).await? {
         deploy_id = db::upsert_deploy(
             pool,
@@ -182,7 +188,7 @@ async fn deploy_inner(
             "bun",
             &["install"],
             Some(&src_dir),
-            &[],
+            &tenant_refs,
             Duration::from_secs(300),
         )
         .await?;
@@ -201,7 +207,7 @@ async fn deploy_inner(
                 "bun",
                 &["run", "build"],
                 Some(&src_dir),
-                &[],
+                &tenant_refs,
                 Duration::from_secs(300),
             )
             .await?;
@@ -214,6 +220,44 @@ async fn deploy_inner(
 
     if db::get_app(pool, &app.id).await?.is_none() {
         anyhow::bail!("app {} deleted during build; aborting celld deploy", app.id);
+    }
+
+    // One-shot release command (`"release": "bun run db:migrate"` in the
+    // tenant wrangler config), run once after build, before `celld deploy`.
+    // Failure aborts: the old release keeps serving. 10 min hard timeout.
+    if let Some(release) = release_cmd(&src_dir).await {
+        deploy_id = db::upsert_deploy(
+            pool,
+            Some(&deploy_id),
+            &app.id,
+            DeployStatus::Building.as_str(),
+            Some(&commit_sha),
+            &format!("release: {release}\n"),
+        )
+        .await?;
+        let env_owned = cmd::aws_env(cfg);
+        let mut cmd_env: Vec<(&str, &str)> =
+            env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        cmd_env.push(("S3_ENDPOINT", cfg.s3_endpoint.as_str()));
+        cmd_env.extend(tenant_refs.iter().copied());
+        let out = cmd::run_cmd(
+            "sh",
+            &["-c", &release],
+            Some(&src_dir),
+            &cmd_env,
+            Duration::from_secs(600),
+        )
+        .await?;
+        let tail = if out.len() > 4096 { &out[out.len() - 4096..] } else { &out };
+        deploy_id = db::upsert_deploy(
+            pool,
+            Some(&deploy_id),
+            &app.id,
+            DeployStatus::Building.as_str(),
+            Some(&commit_sha),
+            &format!("{tail}\n"),
+        )
+        .await?;
     }
 
     deploy_id = db::upsert_deploy(
@@ -322,6 +366,25 @@ async fn materialize_bundle(
     )
     .await?;
     Ok(src_dir)
+}
+
+/// One-shot release command from the tenant's wrangler config
+/// (`"release": "bun run db:migrate"`), capped at 500 chars.
+async fn release_cmd(src_dir: &PathBuf) -> Option<String> {
+    for name in ["wrangler.jsonc", "wrangler.json"] {
+        let Ok(text) = tokio::fs::read_to_string(src_dir.join(name)).await else {
+            continue;
+        };
+        let Ok(v) = crate::host::storage::parse_wrangler(&text) else {
+            continue;
+        };
+        if let Some(r) = v.get("release").and_then(|r| r.as_str()).map(str::trim) {
+            if !r.is_empty() {
+                return Some(r.chars().take(500).collect());
+            }
+        }
+    }
+    None
 }
 
 async fn find_deploy_root(dir: &PathBuf) -> anyhow::Result<Option<PathBuf>> {

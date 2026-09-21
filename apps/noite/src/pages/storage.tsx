@@ -1,4 +1,4 @@
-import { StorageList } from "$lib/storage";
+import { StorageList } from "$lib/storage/list";
 import { head } from "@ilha/router";
 
 export default function StoragePage() {

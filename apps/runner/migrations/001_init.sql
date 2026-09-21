@@ -57,3 +57,14 @@ CREATE TABLE IF NOT EXISTS app_metric (
 );
 
 CREATE INDEX IF NOT EXISTS idx_app_metric_app_bucket ON app_metric(app_id, bucket_ts);
+
+-- Tenant env vars (CF `.dev.vars` model). Names starting with `FLAG_`
+-- are feature flags: the settings UI renders them as on/off toggles
+-- writing `1`/`0`, and they inject like any other var.
+CREATE TABLE IF NOT EXISTS app_env (
+  app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  value TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (app_id, name)
+);

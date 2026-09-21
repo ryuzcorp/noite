@@ -75,36 +75,45 @@ pub async fn ensure_fleet(
     // 127.0.0.1:{internal} (reload_fleet). A hostname advertise
     // (fleet-{slug}) doesn't resolve inside the container, which breaks celld
     // node discovery (d1/diagnose read the lease and dial `addr`).
-    let mut child = Command::new(&cfg.celld_bin)
-        .args([
-            "--bucket",
-            &app.fleet_bucket,
-            "--endpoint",
-            &cfg.s3_endpoint,
-            "--region",
-            &cfg.aws_region,
-            "--listen",
-            &format!("0.0.0.0:{listen}"),
-            "--internal-listen",
-            &format!("0.0.0.0:{internal}"),
-            "--advertise",
-            &format!("127.0.0.1:{internal}"),
-        ])
-        .env("AWS_ACCESS_KEY_ID", access)
-        .env("AWS_SECRET_ACCESS_KEY", secret_key)
-        .env("AWS_REGION", &cfg.aws_region)
-        .env("AWS_EC2_METADATA_DISABLED", "true")
-        .env("S3_ENDPOINT", &cfg.s3_endpoint)
-        .env("CELLD_WATCH", &state_dir)
-        .env("CELLD_DURABILITY", "bucket")
-        .env("CELLD_DEPLOY_POLL_S", "5")
-        .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
-        // Fleet telemetry -> Parquet in the fleet bucket (celld OTel, bucket
-        // sink). 2 s flush + 10 s runner aggregation = ~near-real-time request
-        // counts; retention matches the runner's app_metric prune.
-        .env("CELLD_OTEL", "1")
-        .env("CELLD_OTEL_FLUSH_MS", "2000")
-        .env("CELLD_OTEL_RETENTION", "14d")
+    let listen_addr = format!("0.0.0.0:{listen}");
+    let internal_addr = format!("0.0.0.0:{internal}");
+    let advertise_addr = format!("127.0.0.1:{internal}");
+    let mut cmd = Command::new(&cfg.celld_bin);
+    cmd.args([
+        "--bucket",
+        &app.fleet_bucket,
+        "--endpoint",
+        &cfg.s3_endpoint,
+        "--region",
+        &cfg.aws_region,
+        "--listen",
+        listen_addr.as_str(),
+        "--internal-listen",
+        internal_addr.as_str(),
+        "--advertise",
+        advertise_addr.as_str(),
+    ])
+    .env("AWS_ACCESS_KEY_ID", access)
+    .env("AWS_SECRET_ACCESS_KEY", secret_key)
+    .env("AWS_REGION", &cfg.aws_region)
+    .env("AWS_EC2_METADATA_DISABLED", "true")
+    .env("S3_ENDPOINT", &cfg.s3_endpoint)
+    .env("CELLD_WATCH", &state_dir)
+    .env("CELLD_DURABILITY", "bucket")
+    .env("CELLD_DEPLOY_POLL_S", "5")
+    .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
+    // Fleet telemetry -> Parquet in the fleet bucket (celld OTel, bucket
+    // sink). 2 s flush + 10 s runner aggregation = ~near-real-time request
+    // counts; retention matches the runner's app_metric prune.
+    .env("CELLD_OTEL", "1")
+    .env("CELLD_OTEL_FLUSH_MS", "2000")
+    .env("CELLD_OTEL_RETENTION", "14d");
+    // Tenant env (`.dev.vars` model): UI-set vars reach the fleet here.
+    // Reserved platform names are already filtered by db::tenant_env.
+    for (k, v) in db::tenant_env(pool, &app.id).await {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)

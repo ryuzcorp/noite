@@ -6,26 +6,28 @@ Ground truth for working on Noite. Read this before touching code — the rules 
 
 - Noite is a tiny, self-hostable PaaS for [celld](https://celld.dev/) — user accounts, apps, subdomains, and thin deploy/build logs + status. Spec: [SPEC.md](SPEC.md).
 - It is a Bun monorepo with two real apps — `apps/runner` (Rust control plane) and `apps/noite` (Oxide/ilha control UI) — plus one disposable sample app under `apps/noite/test/`.
-- The control plane is **Oxide Bun UI + Rust runner**, deliberately not a celld Worker. Every tenant app runs as its own celld fleet (prefix + keys); storage is a RustFS S3 bucket `s3://noite` with prefixes `git/` and `fleets/`; edge is Caddy.
+- The control plane is **Oxide Worker UI on a celld fleet** (`apps/noite`, `preset: worker`) + **Rust runner** (stays a container — a Rust binary can't be a worker; single owner of the Caddyfile). Every tenant app runs as its own celld fleet (prefix + keys); storage is a RustFS S3 bucket `s3://noite` with prefixes `git/` and `fleets/`; edge is Caddy.
 - Source flows through the runner’s Git smart-HTTP adapter (`http://git.{BASE_DOMAIN}/{slug}`, Basic `git` + profile API key; collaborator-gated) into the same `s3://noite/git/{slug}` tip-bundle layout; deploys are tip `.bundle` → bare mirror + worktree → optional build → `celld deploy` → reload. Clients do not need git-remote-s3.
 
 ## Build and run
 
-- Install / manage deps with Bun: `bun add <dependency>`. A `bun add`-less dependency edit requires a manual `bun install` to refresh the lockfile (`bun.lock`) — see the pinned-tools warning below.
+- Install / manage deps with Bun: `bun add <dependency>`. A `bun add`-less dependency edit requires a manual `bun install` to refresh the lockfile (`bun.lock`) — see the pinned-tools warning below. Two lockfiles are load-bearing: root `bun.lock` (lint tooling) + `apps/noite/bun.lock` (UI image + dev `bun install` run inside `apps/noite`) — keep both.
 - Run checks before calling a change done:
   - Lint + format: `bun run check` (this is `ultracite check`)
   - Auto-fix: `bun x ultracite fix`
+  - UI changes: `cd apps/noite && bun run build` (worker build — proves workerd compat; `check` alone doesn't catch Node/Bun-only imports)
 - The stack runs via **rootless podman**:
-  - `make up` — release runner + Oxide UI (prod-ish)
-  - `make dev` — cargo-watch runner + Vite HMR (bind-mounts)
-  - `make logs`, `make down` (keeps volumes), `make reset` (deletes them)
-  - Compose edits require a container recreate: `up -d --force-recreate …`
+  - `make up` — production stack (release images); `make dev` — same topology, dev processes (bind-mounts, cargo-watch, `vite dev`)
+  - `make logs`, `make down` (keeps volumes), `make nuke` (volumes + local `.wrangler` D1/SQLite)
+  - `up`/`dev` build with cache every run, so no separate build targets
 
 ## Map and architecture in one breath
 
-- **Monorepo, no git repo at the root** — do not run `git status` / `git diff` at root. Only `apps/runner` and `apps/noite/test` have nested repos.
+- **Monorepo, single git repo at the root** — run `git status` / `git diff` at root. Only `apps/noite/test` has a nested repo (sample-app remote).
 - `apps/noite` — Oxide/ilha control UI (passkeys, actions, source-preview, metrics card). Web root is `apps/noite/src`.
-- `apps/runner` — the Rust runner (deploy, fleets, Caddyfile, metrics). Plain folder rename from `apps/noite-runner`.
+- `apps/runner` — the Rust runner (deploy, fleets, Caddyfile, metrics).
+- `apps/website` — docs site (blume), not part of the runtime.
+- `packages/cli` — `@noitenow/cli` (Effect CLI `noite deploy`: CI-built dist over Git smart-HTTP).
 - `apps/noite/test` — sample app + `deploy.sh`; also a nested git repo.
 - `docker/` — image definitions + entrypoints + Compose files (`docker/compose.yaml`, `docker/compose.dev.yaml`, `docker/compose.byob.yaml`, `docker/compose.coolify.yaml`); `Makefile` at the root.
 - URLs: control UI `http://localhost:9080` (prod `https://app.noite.now` via `CONTROL_SUBDOMAIN=app`; bare `localhost` is the only non-https hostname Bitwarden accepts), runner REST `http://api.localhost:9080`, Git HTTP `http://git.localhost:9080/{slug}`, rustfs S3 `:9000`, console `:9001`, deployed apps `http://{slug}.localhost:9080` (prod `https://{slug}.noite.now`; `app`/`api`/`git` slugs reserved).
@@ -53,7 +55,7 @@ Ground truth for working on Noite. Read this before touching code — the rules 
 3. **Oxide actions**: adding an action without importing its runner helper fails at runtime as `runnerX is not defined`; unmapped action exceptions surface to the client as the generic "Internal error" — wrap failures in `failAction(...)` (mapped `ActionError`) to surface the real message.
 4. **Makefile**: keep conditionals in quoted form and avoid `$(if …)` — the repo linter parses Makefile as bash; the inline `# pi-lens-ignore: …` markers and `.pi-lens.json` `rules.*.disable` exist deliberately, do not remove.
 5. **The live stack is reachable from this machine**: probe the runner via `curl -H "Host: api.localhost" -H "Authorization: Bearer $RUNNER_TOKEN" http://127.0.0.1:9080/...` (token from `.env`). Local `duckdb` can query fleet telemetry directly (secret setup mirrors `app/runner/src/host/metrics.rs`).
-6. **Baked images**: tools like `duckdb` (and its per-arch pins: 1.5.5 amd64 / 1.2.1 arm64 — newer tags dropped the aarch64 CLI), `esbuild`, `bun` arrive via Dockerfiles. Adding a new binary requires an **image rebuild**, and a `bun add`-less dependency edit requires a manual `bun install` to refresh the lockfile. Do not bump these pins casually.
+6. **Baked images**: tools like `duckdb` (and its per-arch pins: 1.5.5 amd64 / 1.2.1 arm64 — newer tags dropped the aarch64 CLI), `esbuild`, `bun` arrive via `docker/install-sidecars.sh` (shared by both Dockerfiles + railpack; celld stays a per-file ARG). Adding a new binary requires an **image rebuild**, and a `bun add`-less dependency edit requires a manual `bun install` to refresh the lockfile. Do not bump these pins casually.
 7. `make dev` rebuild: image changes need `up -d --force-recreate runner ui`; source-only changes still need the runner container recreated when **mount paths** change.
 
 ## Style expectations from this codebase
@@ -65,6 +67,7 @@ Ground truth for working on Noite. Read this before touching code — the rules 
 - Lowercase `onclick`-style event props (ilha).
 - Dynamic `import()` for non-ilha libs so SSR stays safe.
 - `for…of` over `.forEach()`; `i += 1` over `i++`; arrows over `function` forms; prefer early `return` and non-nested ternaries.
+- Buttons: `btn-sm` everywhere — no other size modifiers (`btn-xs`/`btn-md`/`btn-lg`/`btn-xl`).
 
 ### Runner (ryu, apps/runner)
 

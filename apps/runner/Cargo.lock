@@ -107,6 +107,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "axum-jrpc"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "971e8b8715d28ffcbe7146f45b9463b537878740f1046b0981e597a865d572a8"
+dependencies = [
+ "axum",
+ "cfg-if",
+ "mime",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "axum-macros"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -998,6 +1012,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "axum-jrpc",
  "base64",
  "bytes",
  "chrono",

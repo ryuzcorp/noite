@@ -158,7 +158,7 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
-async fn ensure_bare(cfg: &Config, slug: &str) -> anyhow::Result<PathBuf> {
+pub(crate) async fn ensure_bare(cfg: &Config, slug: &str) -> anyhow::Result<PathBuf> {
     let bare = http_bare(cfg, slug);
     tokio::fs::create_dir_all(bare.parent().unwrap()).await?;
     if !bare.join("HEAD").exists() {
@@ -244,7 +244,7 @@ async fn hydrate_from_s3(cfg: &Config, bare: &Path, slug: &str) -> anyhow::Resul
     Ok(())
 }
 
-async fn list_refs(bare: &Path) -> anyhow::Result<HashMap<String, String>> {
+pub(crate) async fn list_refs(bare: &Path) -> anyhow::Result<HashMap<String, String>> {
     let out = cmd::run_cmd(
         "git",
         &[
@@ -436,7 +436,7 @@ async fn is_fast_forward(bare: &Path, old: &str, new: &str) -> bool {
 /// prune after. Returns the main tip when `refs/heads/main` moved. On any
 /// failure the local mirror rolls back and the manifest keeps pointing at
 /// the previous state, so the push stays invisible until retried.
-async fn after_receive(
+pub(crate) async fn after_receive(
     state: &AppState,
     app: &App,
     bare: &Path,

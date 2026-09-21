@@ -102,3 +102,65 @@
   flex: 1;
   min-height: 100%;
 }
+
+/* File tree (pierre): DaisyUI tokens onto --trees-*-override (highest
+ * precedence in the tree's fallback chain). Token references flip with
+ * the light/dark theme for free; bg stays transparent to blend with
+ * the pane. Scoped to the tree host so nothing leaks. */
+#noite-src-tree {
+  --trees-accent-override: var(--color-primary);
+  --trees-bg-override: transparent;
+  --trees-border-color-override: var(--color-base-300);
+  --trees-border-radius-override: var(--radius-box);
+  --trees-fg-override: var(--color-base-content);
+  --trees-fg-muted-override: color-mix(
+    in oklch,
+    var(--color-base-content) 60%,
+    transparent
+  );
+  --trees-focus-ring-color-override: var(--color-primary);
+  --trees-font-family-override: var(--font-sans);
+  --trees-indent-guide-bg-override: var(--color-base-300);
+  --trees-input-bg-override: var(--color-base-100);
+  --trees-scrollbar-thumb-override: var(--color-base-300);
+  --trees-search-bg-override: var(--color-base-100);
+  --trees-search-fg-override: var(--color-base-content);
+  --trees-selected-bg-override: var(--color-base-300);
+  --trees-selected-fg-override: var(--color-base-content);
+  --trees-selected-focused-border-color-override: var(--color-primary);
+}
+
+/* D1 row drawer (modal-end): tiny slide-in from the right on mount,
+ * slide-out on close (see D1RowDrawer closing state). */
+@keyframes noite-drawer-in {
+  from {
+    opacity: 0;
+    transform: translateX(2rem);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+@keyframes noite-drawer-out {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(2rem);
+  }
+}
+.noite-drawer-in {
+  animation: noite-drawer-in 120ms ease-out;
+}
+.noite-drawer-out {
+  animation: noite-drawer-out 100ms ease-in forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  .noite-drawer-in,
+  .noite-drawer-out {
+    animation: none;
+  }
+}

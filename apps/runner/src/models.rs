@@ -149,6 +149,15 @@ impl Deploy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct AppEnv {
+    pub app_id: String,
+    pub name: String,
+    pub value: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct AppSecret {
     pub id: String,
     pub app_id: String,

@@ -1,7 +1,8 @@
+import { adminOverview } from "$lib/admin.server";
 import { initials } from "$lib/apps";
-import { authClient, hardNav } from "$lib/auth-client";
+import { authClient } from "$lib/auth-client";
 import { Authed, clearSessionCache } from "$lib/authed";
-import { defineLayout, useRoute } from "@ilha/router";
+import { defineLayout, navigate, useRoute } from "@ilha/router";
 import { atom, unsafe, watch } from "ilha";
 
 /**
@@ -18,26 +19,31 @@ const lucideIcon = (body: string): string =>
 
 const LAYOUT_LIST =
   '<rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/><path d="M14 4h7m-7 5h7m-7 6h7m-7 5h7"/>';
-const GLOBE =
-  '<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20a14.5 14.5 0 0 0 0-20M2 12h20"/>';
 const HARD_DRIVE =
   '<path d="M10 16h.01m-7.798-4.423a2 2 0 0 0-.212.896V18a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5.527a2 2 0 0 0-.212-.896L18.55 5.11A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11zm19.734.436H2.054M6 16h.01"/>';
-const TOGGLE_RIGHT =
-  '<circle cx="15" cy="12" r="3"/><rect width="20" height="14" x="2" y="5" rx="7"/>';
 
 const signOut = async () => {
   clearSessionCache();
   await authClient.signOut();
-  hardNav("/login");
+  navigate("/login");
 };
 
 export default defineLayout(({ children }) => {
   const { path } = useRoute();
   const displayName = atom("");
+  const isAdmin = atom(false);
   watch.once(() => {
     void (async () => {
       const { data } = await authClient.getSession();
       displayName.set(data?.user?.name || data?.user?.email || "");
+      if (data?.user) {
+        try {
+          const overview = await adminOverview();
+          isAdmin.set(overview.isAdmin);
+        } catch {
+          isAdmin.set(false);
+        }
+      }
     })();
   });
   if (path() === "/login") {
@@ -51,7 +57,7 @@ export default defineLayout(({ children }) => {
         <div class="drawer-content bg-base-200 dark:bg-base-100 flex min-h-screen flex-1 flex-col">
           <label
             for="nav-drawer"
-            class="btn btn-ghost btn-sm fixed top-3 left-3 z-40 lg:hidden"
+            class="btn btn-sm btn-ghost fixed top-3 left-3 z-40 lg:hidden"
             aria-label="Open menu"
           >
             <svg
@@ -75,7 +81,7 @@ export default defineLayout(({ children }) => {
             class="drawer-overlay"
             aria-label="Close menu"
           />
-          <aside class="menu bg-base-200 dark:bg-base-100 border-base-300 min-h-full w-60 border-r">
+          <aside class="menu bg-base-200 dark:bg-base-100 border-base-300 min-h-full w-60 border-r p-0">
             <a
               href="/apps"
               class="link menu-title flex items-center gap-2"
@@ -99,12 +105,6 @@ export default defineLayout(({ children }) => {
                 </a>
               </li>
               <li>
-                <a class="cursor-default" aria-disabled="true">
-                  {unsafe(lucideIcon(GLOBE))}
-                  Domains
-                </a>
-              </li>
-              <li>
                 <a
                   href="/storage"
                   class={
@@ -115,12 +115,6 @@ export default defineLayout(({ children }) => {
                   Storage
                 </a>
               </li>
-              <li>
-                <a class="cursor-default" aria-disabled="true">
-                  {unsafe(lucideIcon(TOGGLE_RIGHT))}
-                  Feature Flags
-                </a>
-              </li>
             </ul>
             <div class="border-base-300 border-t p-2">
               <div class="dropdown dropdown-top w-full">
@@ -128,7 +122,7 @@ export default defineLayout(({ children }) => {
                   tabindex={0}
                   role="button"
                   aria-label="Account menu"
-                  class="btn btn-ghost flex w-full items-center justify-start gap-2 px-2"
+                  class="btn btn-sm btn-ghost flex w-full items-center justify-start gap-2 px-2"
                 >
                   <div class="avatar avatar-placeholder">
                     <div class="bg-neutral text-neutral-content w-8 rounded-full">
@@ -139,14 +133,20 @@ export default defineLayout(({ children }) => {
                 </div>
                 <ul
                   tabindex={0}
-                  class="dropdown-content menu bg-base-100 rounded-box z-10 w-52 p-2 shadow"
+                  class="dropdown-content menu bg-base-100 dark:bg-base-200 rounded-box z-10 w-52 p-2 shadow"
                 >
                   <li>
                     <a href="/profile">Account</a>
                   </li>
+                  {isAdmin() ? (
+                    <li>
+                      <a href="/god-mode">God Mode</a>
+                    </li>
+                  ) : null}
                   <li>
                     <button
                       type="button"
+                      class="text-error"
                       onclick={() => {
                         void signOut();
                       }}

@@ -2,9 +2,10 @@ use std::collections::HashSet;
 
 use anyhow::Context;
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::sqlite::SqliteConnection;
 
 use crate::models::{
-    now_iso, new_id, App, AppMetric, AppSecret, AppStatus, Deploy, DeployStatus,
+    now_iso, new_id, App, AppEnv, AppMetric, AppSecret, AppStatus, Deploy, DeployStatus,
 };
 
 const APP_COLS: &str = r#"id, slug, name, user_id, status, subdomain, git_prefix, fleet_bucket,
@@ -22,9 +23,23 @@ pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     }
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
+        // Deploy log streaming writes constantly while reads serve the UI;
+        // without a busy timeout every writer collision fails immediately.
+        .after_connect(|conn: &mut SqliteConnection, _| {
+            Box::pin(async move {
+                sqlx::query("PRAGMA busy_timeout = 5000;")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok::<_, sqlx::Error>(())
+            })
+        })
         .connect(database_url)
         .await
         .with_context(|| format!("connect {database_url}"))?;
+    // WAL persists on the file: readers never block writers after first boot.
+    sqlx::query("PRAGMA journal_mode = WAL;")
+        .execute(&pool)
+        .await?;
     sqlx::query("PRAGMA foreign_keys = ON")
         .execute(&pool)
         .await?;
@@ -169,6 +184,24 @@ pub async fn list_deploys(pool: &SqlitePool, app_id: &str) -> sqlx::Result<Vec<D
     )
     .bind(app_id)
     .fetch_all(pool)
+    .await
+}
+
+/// Restorable release pointer: a successful deploy row for this sha.
+/// Rollback re-runs the pipeline at the old sha — no separate state.
+pub async fn get_success_deploy(
+    pool: &SqlitePool,
+    app_id: &str,
+    sha: &str,
+) -> sqlx::Result<Option<Deploy>> {
+    sqlx::query_as::<_, Deploy>(
+        r#"SELECT id, app_id, sha, status, log, created_at, updated_at
+           FROM deploy WHERE app_id = ? AND sha = ? AND status = 'success'
+           ORDER BY created_at DESC LIMIT 1"#,
+    )
+    .bind(app_id)
+    .bind(sha)
+    .fetch_optional(pool)
     .await
 }
 
@@ -399,6 +432,79 @@ pub async fn ensure_git_push_secret(pool: &SqlitePool, app_id: &str) -> sqlx::Re
     get_secret(pool, app_id, "git_push")
         .await
         .map(|o| o.expect("just inserted"))
+}
+
+/// Tenant env vars (CF `.dev.vars` model: local file for dev, fleet env in
+/// prod). Plaintext in SQLite like the other single-operator secrets — no
+/// vault. Names are validated at the API layer; values capped at 32 KiB.
+pub async fn list_env(pool: &SqlitePool, app_id: &str) -> sqlx::Result<Vec<AppEnv>> {
+    sqlx::query_as::<_, AppEnv>(
+        "SELECT app_id, name, value, updated_at FROM app_env WHERE app_id = ? ORDER BY name",
+    )
+    .bind(app_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn set_env(
+    pool: &SqlitePool,
+    app_id: &str,
+    name: &str,
+    value: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO app_env (app_id, name, value, updated_at) VALUES (?, ?, ?, ?)
+           ON CONFLICT (app_id, name) DO UPDATE SET value = excluded.value,
+           updated_at = excluded.updated_at"#,
+    )
+    .bind(app_id)
+    .bind(name)
+    .bind(value)
+    .bind(now_iso())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_env(pool: &SqlitePool, app_id: &str, name: &str) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM app_env WHERE app_id = ? AND name = ?")
+        .bind(app_id)
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Reserved prefixes/names the platform owns — tenant values for these are
+/// dropped (logged) rather than injected into fleet/build/release env.
+fn env_reserved(name: &str) -> bool {
+    name == "PORT"
+        || name == "HOST"
+        || name.starts_with("AWS_")
+        || name.starts_with("S3_")
+        || name.starts_with("CELLD_")
+}
+
+/// Tenant env ready to inject, minus reserved names. Feature flags are
+/// plain `FLAG_<NAME>` rows (`1`/`0`) and flow through like any other var.
+pub async fn tenant_env(pool: &SqlitePool, app_id: &str) -> Vec<(String, String)> {
+    match list_env(pool, app_id).await {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(|r| {
+                if env_reserved(&r.name) {
+                    tracing::warn!(app_id, name = %r.name, "tenant env reserved; skipping");
+                    None
+                } else {
+                    Some((r.name, r.value))
+                }
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(app_id, error = %e, "tenant env list failed; deploying without");
+            Vec::new()
+        }
+    }
 }
 
 pub async fn next_ports(pool: &SqlitePool, base: u16) -> sqlx::Result<(i64, i64)> {

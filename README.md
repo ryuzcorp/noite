@@ -4,8 +4,8 @@ Tiny self-hostable PaaS for [celld](https://celld.dev/). Spec: [SPEC.md](SPEC.md
 
 ```bash
 cp .env.example .env
-make up      # release runner + Oxide UI
-make dev     # cargo-watch runner + Oxide Vite HMR
+make up      # production stack (release images)
+make dev     # same topology, dev processes (cargo-watch + vite dev)
 make logs
 ```
 
@@ -16,7 +16,7 @@ make logs
 | `apps/noite/test` | sample app + `deploy.sh` |
 | `docker/compose.yaml` | stack |
 | `docker/compose.coolify.yaml` | production stack for Coolify (automatic generated domain, generated secrets, healthchecks) |
-| `docker/compose.byob.yaml` | external-S3 overlay (`make up-byob`), bundled RustFS excluded |
+| `docker/compose.byob.yaml` | external-S3 overlay (compose `-f` flag), bundled RustFS excluded |
 
 | URL                            |                       |
 | ------------------------------ | --------------------- |

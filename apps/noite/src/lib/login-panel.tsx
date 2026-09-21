@@ -1,15 +1,11 @@
+import { navigate } from "@ilha/router";
 import { atom, watch } from "ilha";
 
-import { authClient, hardNav } from "./auth-client";
+import { authClient } from "./auth-client";
+import { sleep } from "./sleep";
 
 const registrationContext = (email: string, name: string) =>
   JSON.stringify({ email, name });
-
-const sleep = (ms: number) =>
-  // oxlint-disable-next-line promise/avoid-new -- browser has no Bun.sleep; setTimeout delay needs a Promise
-  new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
 
 /** Page-load/passkey UX: the auth cookie may not be readable immediately, so poll briefly. */
 const waitForSession = async (): Promise<void> => {
@@ -24,7 +20,9 @@ const waitForSession = async (): Promise<void> => {
   }
 };
 
-/** Passkey register / sign-in. Reloads `/` on success. Email OTP stays
+/** Passkey register / sign-in. Navigates to `/apps` on success (SPA —
+ * the session cookie is verified readable before leaving, so the gate
+ * revalidates instantly with no document reload). Email OTP stays
  * behind "Lost passkey?" — recovery for passkey-less devices, not primary. */
 export const LoginPanel = () => {
   const busy = atom(false);
@@ -38,7 +36,7 @@ export const LoginPanel = () => {
     void (async () => {
       const { data } = await authClient.getSession();
       if (data?.user) {
-        hardNav("/");
+        navigate("/apps");
       }
     })();
   });
@@ -71,7 +69,7 @@ export const LoginPanel = () => {
     if (result.data?.user) {
       // Cookie may not be readable for the very next document request yet.
       await waitForSession();
-      hardNav("/");
+      navigate("/apps");
       return;
     }
     error.set("Registration completed without a session");
@@ -87,7 +85,7 @@ export const LoginPanel = () => {
       return;
     }
     await waitForSession();
-    hardNav("/");
+    navigate("/apps");
   };
 
   const sendOtp = async (event: SubmitEvent) => {
@@ -139,7 +137,7 @@ export const LoginPanel = () => {
       return;
     }
     await waitForSession();
-    hardNav("/");
+    navigate("/apps");
   };
 
   const showRecovery = () => {
@@ -173,13 +171,16 @@ export const LoginPanel = () => {
                 name="otp"
                 class="input w-full font-mono"
                 placeholder="123456"
-                inputmode="numeric"
                 autocomplete="one-time-code"
                 maxlength={6}
                 required
               />
             </fieldset>
-            <button type="submit" class="btn btn-primary" disabled={busy()}>
+            <button
+              type="submit"
+              class="btn btn-sm btn-primary"
+              disabled={busy()}
+            >
               Sign in
             </button>
           </form>
@@ -200,14 +201,18 @@ export const LoginPanel = () => {
               />
               <p class="validator-hint hidden">Enter a valid email address</p>
             </fieldset>
-            <button type="submit" class="btn btn-primary" disabled={busy()}>
+            <button
+              type="submit"
+              class="btn btn-sm btn-primary"
+              disabled={busy()}
+            >
               Email me a code
             </button>
           </form>
         )}
         <button
           type="button"
-          class="btn btn-ghost btn-sm w-fit"
+          class="btn btn-sm btn-ghost w-fit"
           onclick={hideRecovery}
         >
           Back to passkeys
@@ -272,14 +277,18 @@ export const LoginPanel = () => {
             />
             <p class="validator-hint hidden">Enter a valid email address</p>
           </fieldset>
-          <button type="submit" class="btn btn-primary" disabled={busy()}>
+          <button
+            type="submit"
+            class="btn btn-sm btn-primary"
+            disabled={busy()}
+          >
             Create passkey
           </button>
         </form>
       ) : (
         <button
           type="button"
-          class="btn btn-primary"
+          class="btn btn-sm btn-primary"
           disabled={busy()}
           onclick={signIn}
         >

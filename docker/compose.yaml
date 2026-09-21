@@ -1,4 +1,4 @@
-# Noite stack: Rust runner + Oxide control UI + RustFS + Caddy.
+# Noite stack: Rust runner + control celld fleet + RustFS + Caddy.
 #
 #   cp .env.example .env && make up && make logs
 #
@@ -42,8 +42,8 @@ services:
 
   runner:
     build:
-      context: ../apps/runner
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: docker/Dockerfile.runner
     image: noite-runner:local
     container_name: noite-runner
     hostname: runner
@@ -63,14 +63,14 @@ services:
       CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-}
       CADDYFILE_PATH: /caddy/Caddyfile
       CADDY_UPSTREAM_HOST: runner
-      CADDY_CONTROL_UPSTREAM: ui:8080
+      CADDY_CONTROL_UPSTREAM: control:8090
       CADDY_API_UPSTREAM: runner:8080
       RUNNER_WORK_DIR: /data/runner
       PORT_BASE: "8100"
       RUNNER_POLL_MS: "5000"
       CELLD_BIN: celld
       GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-http://git.localhost:${HTTP_PORT:-9080}}
-      UI_URL: ${UI_URL:-http://ui:8080}
+      UI_URL: ${UI_URL:-http://control:8090}
     volumes:
       # Volume key kept as agent-data so existing stacks keep SQLite / builds.
       - agent-data:/data
@@ -79,37 +79,49 @@ services:
     depends_on:
       - rustfs
 
-  ui:
-    # Immutable image: deps + vite build baked at `docker build` time
-    # (docker/Dockerfile.control). No source bind mount, no npm at boot.
-    # Dev HMR keeps the tools image + bind mount — see docker/compose.dev.yaml.
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.control
-    image: noite-control-ui:local
-    container_name: noite-ui
-    hostname: ui
+  control:
+    # celld fleet node serving the control UI worker (`apps/noite/dist`
+    # deployed via `celld deploy`). Reuses the runner image — celld is baked
+    # in at /usr/local/bin/celld. Env mirrors the runner's fleet spawn
+    # (apps/runner/src/host/supervisor.rs); advertise stays loopback with
+    # published ports so host-side `celld d1` / `diagnose` can dial the lease.
+    image: noite-runner:local
+    container_name: noite-control
+    hostname: control
     restart: unless-stopped
     stop_grace_period: 15s
+    command:
+      - celld
+      - --bucket
+      - s3://${NOITE_S3_BUCKET:-noite}/control
+      - --endpoint
+      - ${S3_ENDPOINT:-http://rustfs:9000}
+      - --region
+      - ${AWS_REGION:-us-east-1}
+      - --listen
+      - 0.0.0.0:8090
+      - --internal-listen
+      - 0.0.0.0:8091
+      - --advertise
+      - 127.0.0.1:8091
     environment:
       <<: *aws
-      PORT: "8080"
-      RUNNER_URL: http://runner:8080
-      RUNNER_TOKEN: ${RUNNER_TOKEN:-${HOST_TOKEN:-${AGENT_TOKEN:-dev-runner-token}}}
-      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-dev-only-change-me-to-a-long-random-string}
-      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:${HTTP_PORT:-9080}}
-      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
-      # Empty = control on bare domain (dev); prod sets CONTROL_SUBDOMAIN=app.
-      CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-}
-      NOITE_DB: /data/noite-control.sqlite
-      # Instance admin bootstrap address (empty = disabled).
-      NOITE_ADMIN_EMAIL: ${NOITE_ADMIN_EMAIL:-}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://rustfs:9000}
+      CELLD_WATCH: /data/control
+      CELLD_DURABILITY: bucket
+      CELLD_DEPLOY_POLL_S: "5"
+      CELLD_TRUST_FORWARDED_HEADERS: "1"
+      CELLD_OTEL: "1"
+      CELLD_OTEL_FLUSH_MS: "2000"
+      CELLD_OTEL_RETENTION: 14d
+    ports:
+      - "8090:8090"
+      - "8091:8091"
     volumes:
-      - ui-data:/data
+      - control-state:/data
     networks: [noite]
     depends_on:
       - rustfs
-      - runner
 
   caddy:
     image: docker.io/library/caddy:2.10.0-alpine
@@ -133,7 +145,7 @@ services:
     networks: [noite]
     depends_on:
       - runner
-      - ui
+      - control
 
 networks:
   noite:
@@ -141,7 +153,7 @@ networks:
 volumes:
   rustfs-data:
   agent-data:
-  ui-data:
+  control-state:
   caddy-config:
   caddy-data:
   bun-cache:

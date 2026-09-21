@@ -67,10 +67,21 @@ async fn reconcile_once(
         // Spawn celld only after a successful deploy — a fleet whose bucket
         // lacks deploy/current.json exits(1) immediately and would crash-loop.
         if app.listen_port.is_some() && app.is_deployed() {
-            if let Err(e) = supervisor::ensure_fleet(pool, cfg, procs, logs, app).await {
-                tracing::warn!(slug = %app.slug, error = %e, "ensure_fleet");
-                let msg = format!("{e:#}");
-                db::update_app_status(pool, &app.id, &app.status, Some(&msg), None).await?;
+            match supervisor::ensure_fleet(pool, cfg, procs, logs, app).await {
+                Ok(()) => {
+                    // Mirror the stopped branch: a spawned fleet is running.
+                    // Without this, start/resume leaves the stop-time status
+                    // stuck until the next deploy flips it.
+                    if app.status != AppStatus::Running.as_str() {
+                        db::update_app_status(pool, &app.id, AppStatus::Running.as_str(), None, None)
+                            .await?;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(slug = %app.slug, error = %e, "ensure_fleet");
+                    let msg = format!("{e:#}");
+                    db::update_app_status(pool, &app.id, &app.status, Some(&msg), None).await?;
+                }
             }
         }
 

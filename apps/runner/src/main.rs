@@ -22,7 +22,7 @@ use std::sync::{
 
 use axum::{
     middleware,
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use sqlx::SqlitePool;
@@ -113,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/v1/apps/{id}/rename", post(api::rename_app))
         .route("/v1/apps/{id}/deploys", get(api::list_deploys))
+        .route("/v1/apps/{id}/rollback", post(api::rollback))
         .route(
             "/v1/apps/{id}/deploys/stream",
             get(api::list_deploys_stream),
@@ -131,6 +132,14 @@ async fn main() -> anyhow::Result<()> {
             get(api::app_d1),
         )
         .route(
+            "/v1/apps/{id}/storage/d1/{database_id}/write",
+            post(api::app_d1_write),
+        )
+        .route(
+            "/v1/apps/{id}/source/commit",
+            post(api::app_source_commit),
+        )
+        .route(
             "/v1/apps/{id}/storage/do/{class_name}",
             get(api::app_do),
         )
@@ -146,6 +155,9 @@ async fn main() -> anyhow::Result<()> {
             "/v1/apps/{id}/storage/r2/{bucket}/raw",
             get(api::app_r2_raw),
         )
+        .route("/v1/apps/{id}/env", get(api::list_env).post(api::set_env))
+        .route("/v1/apps/{id}/env/{name}", delete(api::delete_env))
+        .route("/rpc", post(api::handle_rpc))
         .route(
             "/v1/git/{slug}/info/refs",
             get(host::git_http::info_refs),

@@ -1,6 +1,7 @@
 /* eslint-disable max-classes-per-file -- tagged Fail types for auth */
 /* eslint-disable func-names -- Effect.gen uses anonymous generators */
 import { apiKey } from "@better-auth/api-key";
+import { kyselyAdapter } from "@better-auth/kysely-adapter";
 import { passkey } from "@better-auth/passkey";
 import { betterAuth } from "better-auth";
 import { APIError } from "better-auth/api";
@@ -8,10 +9,9 @@ import { admin } from "better-auth/plugins";
 import { emailOTP } from "better-auth/plugins/email-otp";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { createTransport } from "nodemailer";
 import { OxideRequest } from "oxidejs";
 
-import { ensureDbPromise, getAuthDb, missingDb, orm } from "./db";
+import { ensureDbPromise, getAuthDb, missingDb, orm, resolveEnv } from "./db";
 
 // oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
 export class MissingAuthSecretError extends Schema.TaggedError<MissingAuthSecretError>()(
@@ -106,28 +106,50 @@ const requireRegistration = (context: string | null | undefined) => {
   }
 };
 
-/** Deliver a sign-in OTP: real SMTP when configured, dev-console fallback
- * on localhost, loud refusal otherwise (a silent no-op would lock every
- * passkey-less user out with no trace). */
-const sendSignInOTP = async (email: string, otp: string): Promise<void> => {
-  const smtpUrl = process.env.NOITE_SMTP_URL;
-  if (smtpUrl) {
-    const from = process.env.NOITE_SMTP_FROM ?? "Noite <no-reply@localhost>";
-    const transporter = createTransport(smtpUrl);
-    await transporter.sendMail({
-      from,
-      subject: "Your Noite sign-in code",
-      text: `Your Noite sign-in code is ${otp}. It expires in 10 minutes.`,
-      to: email,
+/** Deliver a sign-in OTP: POST to the configured webhook (Workers have no
+ * SMTP sockets), dev-console fallback on localhost, loud refusal otherwise
+ * (a silent no-op would lock every passkey-less user out with no trace). */
+const sendSignInOTP = async (
+  email: string,
+  otp: string,
+  env: KitEnv
+): Promise<void> => {
+  const webhook = env.NOITE_EMAIL_WEBHOOK_URL?.trim();
+  if (webhook) {
+    // Operator-configured URL (same trust as the SMTP URL it replaces),
+    // but still constrained to http(s) before use as a fetch target.
+    try {
+      const { protocol } = new URL(webhook);
+      if (protocol !== "http:" && protocol !== "https:") {
+        throw new Error("NOITE_EMAIL_WEBHOOK_URL must be http(s)");
+      }
+    } catch (error) {
+      throw error instanceof Error
+        ? error
+        : new Error("NOITE_EMAIL_WEBHOOK_URL is invalid");
+    }
+    // pi-lens-ignore: ts-ssrf -- operator-configured, scheme-validated URL (same trust as the SMTP URL it replaces); never user input.
+    const response = await fetch(webhook, {
+      body: JSON.stringify({
+        email,
+        from: env.NOITE_SMTP_FROM ?? "Noite <no-reply@localhost>",
+        otp,
+        type: "sign-in",
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
     });
+    if (!response.ok) {
+      throw new Error(`OTP webhook failed with status ${response.status}`);
+    }
     return;
   }
-  if ((process.env.BASE_DOMAIN ?? "localhost") === "localhost") {
-    // oxlint-disable-next-line no-console-except-error -- dev-only OTP delivery channel; prod uses SMTP or refuses loudly below.
+  if ((env.BASE_DOMAIN ?? "localhost") === "localhost") {
+    // oxlint-disable-next-line no-console-except-error -- dev-only OTP delivery channel; prod uses the webhook or refuses loudly below.
     console.log(`[noite:otp] sign-in code for ${email}: ${otp}`);
     return;
   }
-  throw new Error("Email delivery is not configured (NOITE_SMTP_URL)");
+  throw new Error("Email delivery is not configured (NOITE_EMAIL_WEBHOOK_URL)");
 };
 
 /** Hostname for the passkey RP ID. Bad config must fail loud (a silent
@@ -142,10 +164,7 @@ const rpHostname = (baseURL: string): string => {
   }
 };
 
-export const createAuth = (
-  env: { BETTER_AUTH_SECRET: string; BETTER_AUTH_URL?: string },
-  baseURL: string
-) =>
+export const createAuth = (env: KitEnv, baseURL: string) =>
   betterAuth({
     advanced: {
       database: {
@@ -153,7 +172,7 @@ export const createAuth = (
       },
     },
     baseURL,
-    database: getAuthDb(),
+    database: kyselyAdapter(getAuthDb()),
     plugins: [
       // God-mode impersonates any account (including fellow admins) — the
       // impersonator is already an admin, so this grants no new power.
@@ -169,7 +188,7 @@ export const createAuth = (
           if (type !== "sign-in") {
             return;
           }
-          await sendSignInOTP(email, otp);
+          await sendSignInOTP(email, otp, env);
         },
       }),
       apiKey({
@@ -274,7 +293,7 @@ export const isUserAdminById = (userId: string) =>
     if (user.role === "admin") {
       return true;
     }
-    const anchored = process.env.NOITE_ADMIN_EMAIL?.trim().toLowerCase();
+    const anchored = resolveEnv().NOITE_ADMIN_EMAIL?.trim().toLowerCase();
     if (!anchored) {
       return false;
     }
@@ -283,10 +302,9 @@ export const isUserAdminById = (userId: string) =>
 
 export const requireUser = Effect.gen(function* () {
   const request = yield* OxideRequest;
-  // SAFETY: globalThis.process is a read-only lookup, never mutated here; when present its env carries the same KitEnv keys used everywhere else.
-  const env = (globalThis as { process?: { env?: KitEnv } }).process?.env ?? {};
+  const env = resolveEnv();
   yield* Effect.promise(() => ensureDbPromise());
-  if (!env.BETTER_AUTH_SECRET && !process.env.BETTER_AUTH_SECRET) {
+  if (!env.BETTER_AUTH_SECRET) {
     return yield* Effect.fail(missingDb());
   }
   // Malformed request URL must 401 like a missing session, never defect.
@@ -298,14 +316,7 @@ export const requireUser = Effect.gen(function* () {
       new UnauthorizedError({ message: "Sign in required" })
     );
   }
-  const auth = yield* authFromEnvEffect(
-    {
-      BETTER_AUTH_SECRET:
-        env.BETTER_AUTH_SECRET ?? process.env.BETTER_AUTH_SECRET,
-      BETTER_AUTH_URL: env.BETTER_AUTH_URL ?? process.env.BETTER_AUTH_URL,
-    },
-    origin
-  );
+  const auth = yield* authFromEnvEffect(env, origin);
   const session = yield* Effect.tryPromise({
     catch: () => new UnauthorizedError({ message: "Sign in required" }),
     try: () => auth.api.getSession({ headers: request.headers }),

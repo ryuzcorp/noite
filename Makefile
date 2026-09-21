@@ -1,4 +1,7 @@
-# Compose — run from repo root.
+# Noite — two modes, same 4-service topology (rustfs, runner, control, caddy):
+#   make up   production (release images)
+#   make dev  local development (bind mounts + watch processes)
+# Run from repo root.
 
 # Both docker compose and podman-compose resolve host paths in these files
 # relative to the first -f file's directory (docker/), so no
@@ -28,84 +31,50 @@ ifdef DISTROBOX
   export PODMAN_SOCK := /run/user/$(shell id -u)/podman/podman.sock
 endif
 
-.PHONY: help up up-byob down reset logs rebuild restart deploy-test dev dev-build dev-joint
+.PHONY: help up dev logs doctor down nuke
 
 COMPOSE_DEV := $(COMPOSE) -f docker/compose.dev.yaml
-COMPOSE_DEV_JOINT := $(COMPOSE) -f docker/compose.dev-joint.yaml
-COMPOSE_BYOB := $(COMPOSE) -f docker/compose.byob.yaml
 
 help:
-	@echo "  make up          start stack (release runner + Oxide UI)"
-	@echo "  make up-byob     start stack against external S3 (no rustfs)"
-	@echo "  make dev         hot reload, no rebuild (runner cargo-watch + Oxide Vite)"
-	@echo "  make dev-build   rebuild dev images (Dockerfile/toolchain changes only)"
-	@echo "  make dev-joint   prod joint topology with dev processes (catches joint-only bugs)"
-	@echo "  make logs        follow runner + ui + rustfs + caddy"
-	@echo "  make down        stop stack (keeps data volumes)"
-	@echo "  make reset       stop + delete all volumes (data loss!)"
-	@echo "  make rebuild     rebuild runner (+ tools) images"
-	@echo "  make restart     recreate runner + ui (keeps volumes)"
-	@echo "  make deploy-test push apps/noite/test via Git HTTP → deploy"
+	@echo "  make up    production stack (release images)"
+	@echo "  make dev   same topology, dev processes (cargo-watch + vite dev)"
+	@echo "  make logs  follow runner + control + rustfs + caddy"
+	@echo "  make doctor  codified health checks (stack, runner, rustfs, UI)"
+	@echo "  make down  stop stack (keeps data volumes)"
+	@echo "  make nuke  stop stack + delete volumes + local D1/SQLite state"
 	@echo ""
 	@echo "UI: http://localhost:9080  API: http://api.localhost:9080"
 	@echo "apps: http://<slug>.localhost:9080"
 
+# --build runs on every up: cached layers make it a no-op when nothing
+# changed, and it ends the entire stale-image bug class (no separate
+# build/rebuild/restart targets to remember).
 up:
-	$(COMPOSE) build runner ui
-	$(COMPOSE) up -d rustfs runner ui caddy
-	@echo "open http://localhost:$${HTTP_PORT:-9080}"
-
-# BYOB: external S3 (no bundled rustfs). Requires S3_ENDPOINT,
-# AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_PUBLIC_ENDPOINT in env.
-up-byob:
-	$(COMPOSE_BYOB) build runner ui
-	$(COMPOSE_BYOB) up -d runner ui caddy
+	$(COMPOSE) up -d --build rustfs runner control caddy
 	@echo "open http://localhost:$${HTTP_PORT:-9080}"
 
 dev:
-	# No build, no force-recreate: images change rarely, source is bind-
-	# mounted and HMR/watch pick up edits. Use dev-build when Dockerfiles
-	# or toolchains change.
-	$(COMPOSE_DEV) up -d rustfs runner caddy ui
-	@echo "dev — runner: cargo watch · ui: Vite HMR + passkeys"
-	@echo "open http://localhost:$${HTTP_PORT:-9080}  (make logs)"
-
-dev-build:
-	$(COMPOSE_DEV) build runner ui
-	$(COMPOSE_DEV) up -d --force-recreate runner ui
-
-dev-joint:
-	# Prod joint topology (runner :8080 + UI :8081, one container, joint
-	# DB layout) with dev processes. RUNNER_DEV_RELEASE=1 for release-mode
-	# runner, VITE_USE_POLLING=1 for flaky rootless inotify.
-	$(COMPOSE_DEV_JOINT) up -d
-	@echo "dev-joint — cargo watch + Vite HMR in prod topology"
+	$(COMPOSE_DEV) up -d --build rustfs runner control caddy
+	@echo "dev — runner: cargo watch · control: vite dev + watch"
 	@echo "open http://localhost:$${HTTP_PORT:-9080}  (make logs)"
 
 logs:
-	$(COMPOSE) logs -f runner ui rustfs caddy
+	$(COMPOSE) logs -f runner control rustfs caddy
+
+# Codified tribal checks: stack up, runner healthy + reconciled, API auth,
+# rustfs live, control UI serving. Exit nonzero naming the failing check.
+doctor:
+	sh docker/doctor.sh
 
 # Never destroy data on a plain stop — agent-data holds the runner SQLite,
-# git mirrors and fleet state; ui-data holds the control DB.
+# git mirrors and fleet state.
 down:
 	-$(COMPOSE) down --remove-orphans
 
-# Explicit nuke — use only when you mean to wipe every volume.
-reset:
+# Explicit nuke — use only when you mean to wipe everything: all volumes
+# (runner SQLite, git mirrors, fleet state, caddy) plus local miniflare
+# state (.wrangler holds the dev D1/SQLite outside any volume).
+nuke:
+	-$(COMPOSE_DEV) down -v --remove-orphans
 	-$(COMPOSE) down -v --remove-orphans
-
-rebuild:
-	# Serialized: podman-compose builds services in parallel and the
-	# cargo-release + vite combination OOMs; each builds fine alone.
-	$(COMPOSE) build --no-cache runner
-	$(COMPOSE) build --no-cache ui
-	$(COMPOSE) up -d --force-recreate runner ui
-	$(COMPOSE) up -d caddy
-
-restart:
-	$(COMPOSE) up -d --force-recreate runner ui
-	$(COMPOSE) up -d caddy
-
-deploy-test:
-	@chmod +x apps/noite/test/deploy.sh
-	./apps/noite/test/deploy.sh
+	rm -rf apps/noite/.wrangler

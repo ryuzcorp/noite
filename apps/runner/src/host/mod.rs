@@ -13,3 +13,4 @@ pub mod rename;
 pub mod source;
 pub mod storage;
 pub mod supervisor;
+pub mod web_commit;

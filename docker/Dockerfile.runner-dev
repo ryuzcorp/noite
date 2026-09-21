@@ -1,35 +1,27 @@
 # syntax=docker/dockerfile:1
-# Dev host plane: Rust toolchain + celld/bun/aws/esbuild for cargo-watch rebuilds.
-ARG CELLD_VERSION=0.4.1
-ARG ESBUILD_VERSION=0.25.12
+# Dev runner image: Rust toolchain + celld/bun/aws for cargo-watch rebuilds.
+# Sidecar versions (esbuild/duckdb) live in docker/install-sidecars.sh —
+# bump there, not here. celld stays an ARG; keep 0.5.0 in sync with
+# Dockerfile.runner (0.4.1 stalls binding-created workflows — see SPEC).
+ARG CELLD_VERSION=0.5.0
 ARG BUN_VERSION=1.3.5
-ARG DUCKDB_VERSION=1.5.5
-ARG DUCKDB_VERSION_AARCH64=1.2.1
 
 FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
 
 FROM docker.io/library/rust:1-bookworm
 ARG TARGETARCH=amd64
-ARG ESBUILD_VERSION=0.25.12
 ARG BUN_VERSION=1.3.5
-ARG DUCKDB_VERSION=1.5.5
-ARG DUCKDB_VERSION_AARCH64=1.2.1
 
+COPY docker/install-sidecars.sh /tmp/install-sidecars.sh
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git awscli pkg-config libssl-dev inotify-tools xz-utils unzip \
   && rm -rf /var/lib/apt/lists/* \
+  && sh /tmp/install-sidecars.sh && rm /tmp/install-sidecars.sh \
   && case "${TARGETARCH}" in \
-       amd64) ESBUILD_PKG=linux-x64; BUN_ARCH=x64; DUCKDB_ZIP=duckdb_cli-linux-amd64.zip; DUCKDB_VER=${DUCKDB_VERSION} ;; \
-       arm64) ESBUILD_PKG=linux-arm64; BUN_ARCH=aarch64; DUCKDB_ZIP=duckdb_cli-linux-aarch64.zip; DUCKDB_VER=${DUCKDB_VERSION_AARCH64} ;; \
+       amd64) BUN_ARCH=x64 ;; \
+       arm64) BUN_ARCH=aarch64 ;; \
        *) echo "unsupported arch: ${TARGETARCH}" >&2; exit 1 ;; \
      esac \
-  && curl -fsSL "https://registry.npmjs.org/@esbuild/${ESBUILD_PKG}/-/${ESBUILD_PKG}-${ESBUILD_VERSION}.tgz" \
-    | tar -xz -C /tmp \
-  && install -m 755 /tmp/package/bin/esbuild /usr/local/bin/esbuild \
-  && rm -rf /tmp/package \
-  && curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VER}/${DUCKDB_ZIP}" -o /tmp/duckdb.zip \
-  && unzip -qo /tmp/duckdb.zip -d /usr/local/bin \
-  && rm -f /tmp/duckdb.zip \
   && curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-${BUN_ARCH}.zip" -o /tmp/bun.zip \
   && unzip -q /tmp/bun.zip -d /tmp \
   && install -m 755 /tmp/bun-linux-${BUN_ARCH}/bun /usr/local/bin/bun \

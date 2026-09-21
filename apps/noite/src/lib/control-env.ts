@@ -2,7 +2,14 @@
 // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type
 export const controlEnv: Record<string, unknown> = {};
 
-export const hydrateControlEnv = (from: NodeJS.ProcessEnv = process.env) => {
+export const hydrateControlEnv = (
+  // SAFETY: defaulting to process.env crashes on Workers (no process) — guard with typeof, which is safe on undefined globals.
+  from:
+    | NodeJS.ProcessEnv
+    | Record<string, string | undefined> = typeof process === "undefined"
+    ? {}
+    : process.env
+) => {
   for (const [key, value] of Object.entries(from)) {
     if (
       value !== undefined &&
@@ -16,7 +23,6 @@ export const hydrateControlEnv = (from: NodeJS.ProcessEnv = process.env) => {
   const defaults = {
     AWS_REGION: "us-east-1",
     BASE_DOMAIN: "localhost",
-    NOITE_DB: "./data/noite.sqlite",
     RUNNER_URL: "http://runner:8080",
     S3_ENDPOINT: "http://rustfs:9000",
     S3_PUBLIC_ENDPOINT: "http://127.0.0.1:9000",

@@ -1,15 +1,9 @@
 import { AdminPanel } from "$lib/admin-panel";
 import { adminOverview } from "$lib/admin.server";
-import { hardNav } from "$lib/auth-client";
 import { SessionSplash } from "$lib/authed";
-import { head } from "@ilha/router";
+import { sleep } from "$lib/sleep";
+import { head, navigate } from "@ilha/router";
 import { atom, watch } from "ilha";
-
-const sleep = (ms: number) =>
-  // oxlint-disable-next-line promise/avoid-new -- browser has no Bun.sleep; setTimeout delay needs a Promise
-  new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
 
 /** Instance administration — admin role or NOITE_ADMIN_EMAIL only.
  * Everyone else bounces to /apps (server actions enforce the same gate).
@@ -38,9 +32,9 @@ export default function GodMode() {
           // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll backoff
           await sleep(100);
         }
-        hardNav("/apps");
+        navigate("/apps");
       } catch {
-        hardNav("/apps");
+        navigate("/apps");
       }
     })();
   });

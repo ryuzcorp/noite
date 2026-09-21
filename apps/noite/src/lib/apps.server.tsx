@@ -1,15 +1,14 @@
 /* eslint-disable func-names -- Effect.gen */
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import * as Stream from "effect/Stream";
-import { action, liveQuery, useEnv, useRequest, withSchema } from "oxidejs";
+import { action, liveQuery, useEnv, useRequest } from "oxidejs";
 
+import { checkedSchema } from "./action-schema";
 import {
   ActionError,
   authFromEnv,
   failAction,
   MissingAuthSecretError,
-  requireUser,
   UnauthorizedError,
 } from "./auth";
 import type { SessionUser } from "./auth";
@@ -19,20 +18,24 @@ import {
   listAppsForCollaborator,
   parseAppRole,
   requireAppRole,
+  withLiveRunner,
 } from "./collaborators";
-import { ensureDb, ensureDbPromise, orm, SqlLive, withDb } from "./db";
+import { ensureDb, ensureDbPromise, orm, sqlLive, withDb } from "./db";
 import type { App, AppRole } from "./db";
-import { enqueueOp } from "./ops.server";
+import { enqueueOp, failUnknown } from "./ops.server";
 import {
-  runnerGetApp,
   runnerGitRemote,
   runnerSourceBlob,
+  runnerSourceCommit,
   runnerSourceDiff,
   runnerSourceTree,
-  runnerAppMetrics,
-  runnerAppSpans,
+  runnerRollback,
+  runnerListEnv,
+  runnerSetEnv,
+  runnerDeleteEnv,
   runnerStorage,
   runnerD1,
+  runnerD1Write,
   runnerDoInstances,
   runnerR2Get,
   runnerR2List,
@@ -56,16 +59,8 @@ const SourceBlobArgs = Schema.Struct({
   path: Schema.String,
 });
 
-const SLUG_RE = /^[a-z](?<slug>[a-z-]{0,46}[a-z])?$/u;
+const SLUG_RE = /^[a-z0-9](?<slug>[a-z0-9-]{0,46}[a-z0-9])?$/u;
 const RESERVED_SLUGS = new Set(["_control", "app", "api", "git"]);
-
-const asApp = (row: App): App => ({
-  ...row,
-  internalPort: row.internalPort ?? null,
-  lastDeploySha: row.lastDeploySha ?? null,
-  lastError: row.lastError ?? null,
-  listenPort: row.listenPort ?? null,
-});
 
 const appsFor = (userId: string) =>
   liveQuery<App[]>({ topic: `apps:${userId}` });
@@ -75,7 +70,7 @@ const snapshotApps = (userId: string) => listAppsForCollaborator(userId);
 const loadApps = (userId: string) =>
   ensureDb.pipe(
     Effect.andThen(() => snapshotApps(userId)),
-    Effect.provide(SqlLive),
+    Effect.provide(sqlLive()),
     Effect.scoped
   );
 
@@ -101,7 +96,14 @@ const sessionUser = async (): Promise<SessionUser> => {
     env as KitEnv,
     origin
   );
-  const session = await auth.api.getSession({ headers: request.headers });
+  // A missing/unreadable session must 401 like a missing user, never
+  // defect (matches requireUser's contract in lib/auth.ts).
+  let session;
+  try {
+    session = await auth.api.getSession({ headers: request.headers });
+  } catch {
+    throw new UnauthorizedError({ message: "Sign in required" });
+  }
   const user = session?.user;
   if (!user) {
     throw new UnauthorizedError({ message: "Sign in required" });
@@ -109,22 +111,8 @@ const sessionUser = async (): Promise<SessionUser> => {
   return { email: user.email, id: user.id, name: user.name };
 };
 
-export const list = action(
-  () =>
-    Stream.unwrap(
-      Effect.gen(function* () {
-        const user = yield* requireUser;
-        const apps = appsFor(user.id);
-        return apps.subscribeStream(
-          apps.mutateEffect(() => loadApps(user.id)).pipe(Effect.asVoid)
-        );
-      })
-    ),
-  { error: AuthError, stream: true }
-);
-
 export const create = action(
-  withSchema(CreateApp, async ({ name, slug }) => {
+  checkedSchema(CreateApp, async ({ name, slug }) => {
     const user = await sessionUser();
     const trimmedName = name.trim();
     const normalized = slug.trim().toLowerCase();
@@ -136,7 +124,7 @@ export const create = action(
     }
     if (!SLUG_RE.test(normalized)) {
       failAction(
-        "Slug must be 1–48 chars: lowercase letters and hyphens, starting and ending with a letter"
+        "Slug must be 1–48 chars: lowercase letters, digits, and hyphens, starting and ending with a letter or digit"
       );
     }
     const hub = appsFor(user.id);
@@ -156,14 +144,14 @@ export const create = action(
       if (error instanceof ActionError || error instanceof UnauthorizedError) {
         throw error;
       }
-      failAction(error instanceof Error ? error.message : String(error));
+      failUnknown(error);
     }
   }),
   { error: AuthError }
 );
 
 export const remove = action(
-  withSchema(AppId, async (appId) => {
+  checkedSchema(AppId, async (appId) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "admin");
     const hub = appsFor(user.id);
@@ -177,14 +165,14 @@ export const remove = action(
       if (error instanceof ActionError || error instanceof UnauthorizedError) {
         throw error;
       }
-      failAction(error instanceof Error ? error.message : String(error));
+      failUnknown(error);
     }
   }),
   { error: AuthError }
 );
 
 export const setDesired = action(
-  withSchema(
+  checkedSchema(
     Schema.Struct({ desiredState: Schema.String, id: Schema.String }),
     async ({ id, desiredState }) => {
       if (desiredState !== "running" && desiredState !== "stopped") {
@@ -212,7 +200,7 @@ export const setDesired = action(
         ) {
           throw error;
         }
-        failAction(error instanceof Error ? error.message : String(error));
+        failUnknown(error);
       }
     }
   ),
@@ -228,7 +216,7 @@ const RenameApp = Schema.Struct({
 /** Rename an app (display name and/or slug). Admin-gated; a slug change
  * moves the subdomain, git remote, and fleet data via the runner op. */
 export const renameApp = action(
-  withSchema(RenameApp, async ({ id, name, slug }) => {
+  checkedSchema(RenameApp, async ({ id, name, slug }) => {
     const trimmedName = name?.trim() || undefined;
     const normalized = slug?.trim().toLowerCase() || undefined;
     if (!trimmedName && !normalized) {
@@ -239,7 +227,7 @@ export const renameApp = action(
     }
     if (normalized && !SLUG_RE.test(normalized)) {
       failAction(
-        "Slug must be 1–48 chars: lowercase letters and hyphens, starting and ending with a letter"
+        "Slug must be 1–48 chars: lowercase letters, digits, and hyphens, starting and ending with a letter or digit"
       );
     }
     const user = await sessionUser();
@@ -261,33 +249,17 @@ export const renameApp = action(
       if (error instanceof ActionError || error instanceof UnauthorizedError) {
         throw error;
       }
-      failAction(error instanceof Error ? error.message : String(error));
+      failUnknown(error);
     }
   }),
   { error: AuthError }
 );
 
 export const get = action(
-  withSchema(AppId, async (appId) => {
+  checkedSchema(AppId, async (appId) => {
     const user = await sessionUser();
     const { app: local, role } = await requireAppRole(appId, user.id, "view");
-    let app = asApp(local);
-    try {
-      const remote = await runnerGetApp(appId);
-      app = asApp({
-        ...local,
-        desiredState: remote.desiredState,
-        fleetBucket: remote.fleetBucket,
-        internalPort: remote.internalPort,
-        lastDeploySha: remote.lastDeploySha,
-        lastError: remote.lastError,
-        listenPort: remote.listenPort,
-        status: remote.status,
-        subdomain: remote.subdomain,
-      });
-    } catch {
-      /* runner may be briefly down */
-    }
+    const app = await withLiveRunner(local);
     const git = await runnerGitRemote(appId);
     return {
       app,
@@ -309,7 +281,7 @@ const requireViewApp = async (appId: string): Promise<void> => {
 };
 
 export const sourceTree = action(
-  withSchema(AppId, async (appId) => {
+  checkedSchema(AppId, async (appId) => {
     await requireViewApp(appId);
     return runnerSourceTree(appId);
   }),
@@ -317,7 +289,7 @@ export const sourceTree = action(
 );
 
 export const sourceBlob = action(
-  withSchema(SourceBlobArgs, async ({ appId, path }) => {
+  checkedSchema(SourceBlobArgs, async ({ appId, path }) => {
     await requireViewApp(appId);
     return runnerSourceBlob(appId, path);
   }),
@@ -325,33 +297,120 @@ export const sourceBlob = action(
 );
 
 export const sourceDiff = action(
-  withSchema(AppId, async (appId) => {
+  checkedSchema(AppId, async (appId) => {
     await requireViewApp(appId);
     return runnerSourceDiff(appId);
   }),
   { error: AuthError }
 );
 
-export const appMetrics = action(
-  withSchema(AppId, async (appId) => {
-    await requireViewApp(appId);
-    return runnerAppMetrics(appId, 24);
+const SourceCommitArgs = Schema.Struct({
+  appId: Schema.String,
+  files: Schema.Array(
+    Schema.Struct({ content: Schema.String, path: Schema.String })
+  ),
+  message: Schema.String,
+});
+
+/** Browser-edit commit (push-gated): validated files become a main commit
+ * that deploys like a stock push. The author is always the session user. */
+export const sourceCommit = action(
+  checkedSchema(SourceCommitArgs, async ({ appId, files, message }) => {
+    const user = await sessionUser();
+    await requireAppRole(appId, user.id, "push");
+    try {
+      return await runnerSourceCommit(appId, {
+        author: user.email,
+        files,
+        message,
+      });
+    } catch (error) {
+      failUnknown(error);
+    }
   }),
   { error: AuthError }
 );
 
-export const appSpans = action(
-  withSchema(AppId, async (appId) => {
-    await requireViewApp(appId);
+// ---- Rollback + tenant env vars (`.dev.vars` model) ----
+
+const RollbackArgs = Schema.Struct({
+  appId: Schema.String,
+  sha: Schema.String,
+});
+
+/** Rollback to a previous successful deploy sha (push-gated): re-runs
+ * the pipeline at the old tip bundle. Progress follows on the deploys
+ * stream like a normal deploy. */
+export const rollback = action(
+  checkedSchema(RollbackArgs, async ({ appId, sha }) => {
+    const user = await sessionUser();
+    await requireAppRole(appId, user.id, "push");
     try {
-      // On-demand window over the fleet's OTel spans (what it's doing, queue
-      // wait, errors) — read at page load, not stored.
-      return await runnerAppSpans(appId, 1);
+      return await runnerRollback(appId, sha);
     } catch (error) {
-      // Surface the underlying failure instead of the RPC's generic
-      // "Internal error" — failAction is mapped into AuthError.
-      failAction(error instanceof Error ? error.message : String(error));
+      failUnknown(error);
     }
+  }),
+  { error: AuthError }
+);
+
+const SetEnvArgs = Schema.Struct({
+  appId: Schema.String,
+  name: Schema.String,
+  value: Schema.String,
+});
+const DeleteEnvArgs = Schema.Struct({
+  appId: Schema.String,
+  name: Schema.String,
+});
+
+export const listEnv = action(
+  checkedSchema(AppId, async (appId) => {
+    await requireViewApp(appId);
+    return runnerListEnv(appId);
+  }),
+  { error: AuthError }
+);
+
+export const setEnv = action(
+  checkedSchema(SetEnvArgs, async ({ appId, name, value }) => {
+    const user = await sessionUser();
+    await requireAppRole(appId, user.id, "admin");
+    try {
+      return await runnerSetEnv(appId, name, value);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }),
+  { error: AuthError }
+);
+
+export const deleteEnv = action(
+  checkedSchema(DeleteEnvArgs, async ({ appId, name }) => {
+    const user = await sessionUser();
+    await requireAppRole(appId, user.id, "admin");
+    try {
+      return await runnerDeleteEnv(appId, name);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }),
+  { error: AuthError }
+);
+
+/** Render stored env as `.dev.vars` text for local dev (view-gated).
+ * Values are shell-escaped. */
+export const envDotVars = action(
+  checkedSchema(AppId, async (appId) => {
+    await requireViewApp(appId);
+    const rows = await runnerListEnv(appId);
+    const lines = rows.map(({ name, value }) => {
+      const escaped = value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+      return /\s|#/u.test(value)
+        ? `${name}="${escaped}"`
+        : `${name}=${escaped}`;
+    });
+    return lines.join("\n");
   }),
   { error: AuthError }
 );
@@ -408,12 +467,12 @@ export const listAllStorage = action(
 
 /** D1 databases + DO classes declared by an app's deployed config. */
 export const listAppStorage = action(
-  withSchema(StorageListArgs, async ({ appId }) => {
+  checkedSchema(StorageListArgs, async ({ appId }) => {
     await requireViewApp(appId);
     try {
       return await runnerStorage(appId);
     } catch (error) {
-      failAction(error instanceof Error ? error.message : String(error));
+      failUnknown(error);
     }
   }),
   { error: AuthError }
@@ -421,25 +480,65 @@ export const listAppStorage = action(
 
 /** Curated read-only D1 preview: tables + first rows. */
 export const d1Preview = action(
-  withSchema(D1PreviewArgs, async ({ appId, databaseId }) => {
+  checkedSchema(D1PreviewArgs, async ({ appId, databaseId }) => {
     await requireViewApp(appId);
     try {
       return await runnerD1(appId, databaseId);
     } catch (error) {
-      failAction(error instanceof Error ? error.message : String(error));
+      failUnknown(error);
     }
   }),
   { error: AuthError }
 );
 
+const D1WriteArgs = Schema.Struct({
+  appId: Schema.String,
+  databaseId: Schema.String,
+  key: Schema.optional(
+    Schema.Record(Schema.String, Schema.Union([Schema.String, Schema.Null]))
+  ),
+  op: Schema.Union([
+    Schema.Literal("insert"),
+    Schema.Literal("update"),
+    Schema.Literal("delete"),
+  ]),
+  table: Schema.String,
+  values: Schema.Record(
+    Schema.String,
+    Schema.Union([Schema.String, Schema.Null])
+  ),
+});
+
+/** Curated tenant-DB write (push-gated): single INSERT or UPDATE. */
+export const d1Write = action(
+  checkedSchema(
+    D1WriteArgs,
+    async ({ appId, databaseId, key, op, table, values }) => {
+      const user = await sessionUser();
+      await requireAppRole(appId, user.id, "push");
+      try {
+        return await runnerD1Write(appId, databaseId, {
+          key,
+          op,
+          table,
+          values,
+        });
+      } catch (error) {
+        failUnknown(error);
+      }
+    }
+  ),
+  { error: AuthError }
+);
+
 /** Read-only Durable Object instance list for one class. */
 export const doPreview = action(
-  withSchema(DoPreviewArgs, async ({ appId, className }) => {
+  checkedSchema(DoPreviewArgs, async ({ appId, className }) => {
     await requireViewApp(appId);
     try {
       return await runnerDoInstances(appId, className);
     } catch (error) {
-      failAction(error instanceof Error ? error.message : String(error));
+      failUnknown(error);
     }
   }),
   { error: AuthError }
@@ -447,12 +546,12 @@ export const doPreview = action(
 
 /** Read-only R2 key listing for one bucket. */
 export const r2List = action(
-  withSchema(R2ListArgs, async ({ appId, bucket }) => {
+  checkedSchema(R2ListArgs, async ({ appId, bucket }) => {
     await requireViewApp(appId);
     try {
       return await runnerR2List(appId, bucket);
     } catch (error) {
-      failAction(error instanceof Error ? error.message : String(error));
+      failUnknown(error);
     }
   }),
   { error: AuthError }
@@ -460,12 +559,12 @@ export const r2List = action(
 
 /** Read-only R2 object fetch (bounded text preview). */
 export const r2Get = action(
-  withSchema(R2GetArgs, async ({ appId, bucket, key }) => {
+  checkedSchema(R2GetArgs, async ({ appId, bucket, key }) => {
     await requireViewApp(appId);
     try {
       return await runnerR2Get(appId, bucket, key);
     } catch (error) {
-      failAction(error instanceof Error ? error.message : String(error));
+      failUnknown(error);
     }
   }),
   { error: AuthError }
@@ -473,14 +572,14 @@ export const r2Get = action(
 
 /** Delete one R2 object by key (push role — a write). */
 export const r2Delete = action(
-  withSchema(R2GetArgs, async ({ appId, bucket, key }) => {
+  checkedSchema(R2GetArgs, async ({ appId, bucket, key }) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "push");
     try {
       await runnerR2Delete(appId, bucket, key);
       return { ok: true as const };
     } catch (error) {
-      failAction(error instanceof Error ? error.message : String(error));
+      failUnknown(error);
     }
   }),
   { error: AuthError }
@@ -506,7 +605,7 @@ const RemoveCollaborator = Schema.Struct({
 });
 
 export const listCollaborators = action(
-  withSchema(AppId, async (appId) => {
+  checkedSchema(AppId, async (appId) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "view");
     const rows = await withDb(
@@ -548,7 +647,7 @@ export const listCollaborators = action(
 );
 
 export const inviteCollaborator = action(
-  withSchema(InviteCollaborator, async ({ appId, email, role }) => {
+  checkedSchema(InviteCollaborator, async ({ appId, email, role }) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "admin");
     const nextRole = parseAppRole(role.trim().toLowerCase());
@@ -574,7 +673,7 @@ export const inviteCollaborator = action(
 );
 
 export const updateCollaboratorRole = action(
-  withSchema(UpdateCollaborator, async ({ appId, userId, role }) => {
+  checkedSchema(UpdateCollaborator, async ({ appId, userId, role }) => {
     const actor = await sessionUser();
     await requireAppRole(appId, actor.id, "admin");
     const nextRole = parseAppRole(role.trim().toLowerCase());
@@ -612,7 +711,7 @@ export const updateCollaboratorRole = action(
 );
 
 export const removeCollaborator = action(
-  withSchema(RemoveCollaborator, async ({ appId, userId }) => {
+  checkedSchema(RemoveCollaborator, async ({ appId, userId }) => {
     const actor = await sessionUser();
     await requireAppRole(appId, actor.id, "admin");
     const err = await withDb(

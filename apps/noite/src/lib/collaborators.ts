@@ -5,6 +5,7 @@ import { orm, withDb } from "./db";
 import type { App } from "./db";
 import { parseAppRole, roleAtLeast } from "./roles";
 import type { AppRole } from "./roles";
+import { runnerGetApp } from "./runner";
 
 export { parseAppRole, roleAtLeast } from "./roles";
 export type { AppRole } from "./roles";
@@ -16,6 +17,29 @@ const asApp = (row: App): App => ({
   lastError: row.lastError ?? null,
   listenPort: row.listenPort ?? null,
 });
+
+/** Overlay live runner state onto a D1 app row (runner may be briefly
+ * down — then the local row stands). Single implementation backing both
+ * the detail header and the SSE list so they can never disagree. */
+export const withLiveRunner = async (local: App): Promise<App> => {
+  try {
+    const remote = await runnerGetApp(local.id);
+    return asApp({
+      ...local,
+      desiredState: remote.desiredState,
+      fleetBucket: remote.fleetBucket,
+      internalPort: remote.internalPort,
+      lastDeploySha: remote.lastDeploySha,
+      lastError: remote.lastError,
+      listenPort: remote.listenPort,
+      status: remote.status,
+      subdomain: remote.subdomain,
+    });
+  } catch {
+    /* runner may be briefly down */
+    return asApp(local);
+  }
+};
 
 /** Ensure the app creator has an admin membership row (legacy apps). */
 export const ensureOwnerAdmin = (app: App) =>
@@ -128,24 +152,10 @@ export const requireAppRoleBySlug = async (
 };
 
 /** Apps the user can see (any collaborator role), newest first.
- * Instance admins see every app. */
+ * Admins see only their own apps here too — the global view lives
+ * in god-mode (`listAllApps`). */
 export const listAppsForCollaborator = (userId: string) =>
   Effect.gen(function* run() {
-    if (yield* isUserAdminById(userId)) {
-      const all = yield* orm.app.findMany({});
-      const apps = all.filter(
-        (app) =>
-          app.desiredState !== "deleted" &&
-          app.status !== "deleting" &&
-          app.status !== "gone"
-      );
-      apps.sort((a, b) => {
-        const at = a.createdAt instanceof Date ? a.createdAt.getTime() : 0;
-        const bt = b.createdAt instanceof Date ? b.createdAt.getTime() : 0;
-        return bt - at;
-      });
-      return apps.map(asApp);
-    }
     // Backfill owner→admin for apps this user created.
     const owned = yield* orm.app.findMany({ where: { userId } });
     for (const app of owned) {

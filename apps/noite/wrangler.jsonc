@@ -1,0 +1,38 @@
+{
+  // Control UI as a celld fleet (preset: worker).
+  // Durable bindings (workflows / queues / crons) are NOT hand-written here:
+  // they merge at build time via withOxide() scanning ops.server.ts.
+  "name": "noite-control",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-09-01",
+  // Client-side router: navigations without a static file serve index.html.
+  // (The dist snapshots get the same keys via the withOxide config in
+  // vite.config.ts — the Cloudflare plugin owns the deploy-time snapshot.)
+  // `binding` is required: unlike Cloudflare, celld does not auto-inject
+  // env.ASSETS, which the Oxide worker wrapper needs for its SPA fallback.
+  "assets": {
+    "binding": "ASSETS",
+    // `celld dev` reads this file raw (no plugin fills it in) and requires
+    // a string directory; deploy snapshots overwrite it with their own.
+    "directory": "dist/client",
+    "not_found_handling": "single-page-application",
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      // No database_id: celld uses database_name as the stable identity.
+      // (Cloudflare deploys would need a real `wrangler d1 create` id here.)
+      "database_name": "noite-control",
+    },
+  ],
+  // Non-secret defaults only. Secrets (BETTER_AUTH_SECRET, RUNNER_TOKEN,
+  // AWS/RUSTFS keys, NOITE_ADMIN_EMAIL, NOITE_EMAIL_WEBHOOK_URL) come from
+  // `.dev.vars` locally and `wrangler secret` / deploy env in prod.
+  "vars": {
+    "AWS_REGION": "us-east-1",
+    "BASE_DOMAIN": "localhost",
+    "RUNNER_URL": "http://runner:8080",
+    "S3_ENDPOINT": "http://rustfs:9000",
+    "S3_PUBLIC_ENDPOINT": "http://127.0.0.1:9000",
+  },
+}

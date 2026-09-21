@@ -1,4 +1,5 @@
-import { StorageDetail, resourceDisplayName } from "$lib/storage";
+import { StorageDetail } from "$lib/storage/detail";
+import { resourceDisplayName } from "$lib/storage/list";
 import { useRoute, head } from "@ilha/router";
 import { watch } from "ilha";
 

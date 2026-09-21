@@ -51,16 +51,11 @@ export const readSwrCache = <T>(key: string): T | null => {
   }
 };
 
-type SwrCacheValue =
-  | string
-  | number
-  | boolean
-  | null
-  | SwrCacheValue[]
-  | { [key: string]: SwrCacheValue };
-
-/** Remember the last good value for `key`. Never throws. */
-export const writeSwrCache = (key: string, value: SwrCacheValue): void => {
+/** Remember the last good value for `key`. Never throws. Values only
+ * need JSON.stringify to accept them (Date-bearing RPC rows included) —
+ * reads come back through JSON.parse cast to the caller's T. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- the store is intentionally untyped; callers own their T via the read cast.
+export const writeSwrCache = (key: string, value: unknown): void => {
   memory.set(prefix + key, value);
   const storage = store();
   if (!storage) {

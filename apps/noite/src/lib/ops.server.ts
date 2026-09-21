@@ -1,22 +1,18 @@
 import * as Effect from "effect/Effect";
-/**
- * Durable control-plane ops via Oxide workflow / queue / schedule.
- * Bun fetch mode gets bindings from `./bun-durable` (imports).
- */
+/** Durable control-plane ops via Oxide workflow / queue / schedule (real Worker bindings). */
 import * as Schema from "effect/Schema";
-import {
-  publish,
-  queue,
-  schedule,
-  useEnv,
-  useRequest,
-  withRequestStore,
-  workflow,
-} from "oxidejs";
+import { publish, queue, readWorkflowMeta, schedule, workflow } from "oxidejs";
 
+import { failAction } from "./auth";
 import { listAppsForCollaborator } from "./collaborators";
-import { controlEnv } from "./control-env";
-import { ensureDb, ensureDbPromise, orm, SqlLive, withDb } from "./db";
+import {
+  ensureDb,
+  ensureDbPromise,
+  orm,
+  resolveEnv,
+  sqlLive,
+  withDb,
+} from "./db";
 import {
   runnerCreateApp,
   runnerDeleteApp,
@@ -24,6 +20,12 @@ import {
   runnerPatchApp,
   runnerRenameApp,
 } from "./runner";
+
+/** Map an unknown catch value into a mapped ActionError (client-visible).
+ * Use in action catch blocks instead of repeating the instanceof ternary. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site values are unknown by construction; this helper narrows to message
+export const failUnknown = (error: unknown): never =>
+  failAction(error instanceof Error ? error.message : String(error));
 
 const OpPayloadSchema = Schema.Union([
   Schema.Struct({
@@ -88,7 +90,7 @@ const asAppRow = (agent: {
 const loadApps = (userId: string) =>
   ensureDb.pipe(
     Effect.andThen(() => listAppsForCollaborator(userId)),
-    Effect.provide(SqlLive),
+    Effect.provide(sqlLive()),
     Effect.scoped
   );
 
@@ -262,6 +264,7 @@ export const syncApps = workflow({
               continue;
             }
             yield* orm.app.update({
+              // @ts-expect-error TS2589: paranorm update inference exceeds tsc's depth budget here; same call shape typechecks elsewhere.
               data: {
                 desiredState: remoteApp.desiredState,
                 internalPort: remoteApp.internalPort,
@@ -293,69 +296,71 @@ export const syncAppsSchedule = schedule({
   workflow: syncApps,
 });
 
-/** Vite action RPC has no worker `env` — bind durable APIs onto ALS for this call. */
-const withDurableAls = async <T>(fn: () => Promise<T>): Promise<T> => {
-  const { durableBindingsReady, ensureDurableEnv, installBunDurable } =
-    await import("./bun-durable");
-  installBunDurable(controlEnv);
-  // SAFETY: useEnv returns the ALS request env, which mirrors the controlEnv shape (strings + durable bindings), so widening to a Record for inspection is safe.
-  // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type
-  const current = useEnv() as Record<string, unknown> | undefined;
-  if (current && durableBindingsReady(current)) {
-    return fn();
+/** Parse oxide step durations (`ms`/`s`/`m`/`h`/`d`, default ms). */
+const stepDurationMs = (spec: string): number => {
+  const m = /^(?<num>\d+)\s*(?<unit>ms|s|m|h|d)?$/iu.exec(spec.trim());
+  if (!m?.groups) {
+    return 0;
   }
-  // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type, anti-slop/no-known-value-widening -- the control env bag is a heterogeneous open map by design
-  const bag: Record<string, unknown> = { ...controlEnv, ...current };
-  ensureDurableEnv(bag);
-  let req: Request;
-  try {
-    req = useRequest();
-  } catch {
-    req = new Request("https://oxide.local/durable");
+  const n = Number(m.groups.num);
+  switch ((m.groups.unit ?? "ms").toLowerCase()) {
+    case "s": {
+      return n * 1000;
+    }
+    case "m": {
+      return n * 60_000;
+    }
+    case "h": {
+      return n * 3_600_000;
+    }
+    case "d": {
+      return n * 86_400_000;
+    }
+    default: {
+      return n;
+    }
   }
-  // SAFETY: oxide's withRequestStore carries a `never`-keyed env store slot; the real control/ALS env bag only ever holds strings + durable binders.
-  return withRequestStore({ env: bag as never, req }, fn);
 };
 
-const sleep = (ms: number) => Bun.sleep(ms);
+/** Inline step shim: each step runs once, immediately, in the action isolate. */
+const inlineStep = () => ({
+  do: async <T>(_name: string, fn: () => T | Promise<T>): Promise<T> =>
+    await fn(),
+  sleep: async (_name: string, duration: string) => {
+    await Effect.runPromise(Effect.sleep(stepDurationMs(duration)));
+  },
+  sleepUntil: () => Promise.resolve(),
+  waitForEvent: () => Promise.resolve(),
+});
 
-export const enqueueOp = (payload: OpPayload, idempotencyKey?: string) =>
-  withDurableAls(async () => {
-    let id: string;
-    try {
-      ({ id } = await runnerOps.send(
-        payload,
-        idempotencyKey ? { idempotencyKey } : {}
-      ));
-    } catch (error) {
-      throw new Error(
-        error instanceof Error
-          ? error.message
-          : `queue send failed: ${String(error)}`,
-        { cause: error }
-      );
-    }
-    for (let i = 0; i < 120; i += 1) {
-      // oxlint-disable-next-line eslint/no-await-in-loop -- sequential status polling; Promise.all can't early-exit on completion
-      const st = await runnerOp.status(id);
-      if (st.status === "complete" || st.status === "completed") {
-        // SAFETY: the runner op's output is the created/patched app id envelope the workers type as `{ appId }`.
-        return st.output as { appId: string };
-      }
-      if (
-        st.status === "errored" ||
-        st.status === "error" ||
-        st.status === "failed"
-      ) {
-        throw new Error(st.error?.message ?? "runner op failed");
-      }
-      if (st.status === "not_found") {
-        // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll backoff
-        await sleep(50);
-        continue;
-      }
-      // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll backoff
-      await sleep(100);
-    }
-    throw new Error("runner op timed out");
-  });
+export const enqueueOp = async (
+  payload: OpPayload,
+  idempotencyKey?: string
+): Promise<{ appId: string }> => {
+  // Interactive ops run inline, not via queue+workflow: celld only drives
+  // platform-triggered (cron) workflow instances, while binding-created
+  // ones wait forever (no queue consumer runs with fetch()). Same behavior
+  // as the pre-worker inline runner. Schedules keep real workflows.
+  // SAFETY: runnerOp is an Oxide workflow handle carrying WORKFLOW_META; the bridge below only reads its run callback.
+  const meta = readWorkflowMeta(
+    // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- the handle type and the meta reader disagree on generics; unknown bridges them.
+    runnerOp as unknown as Parameters<typeof readWorkflowMeta>[0]
+  );
+  if (!meta?.run) {
+    throw new Error("runner op workflow has no run function");
+  }
+  // SAFETY: meta.run is the runnerOp run callback, which resolves the created/patched app id envelope; the event/ctx shapes mirror oxide's run contract.
+  // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- same generic disagreement as above; unknown bridges it.
+  const run = meta.run as unknown as (
+    event: { instanceId: string; payload: OpPayload; timestamp: Date },
+    ctx: { env: KitEnv; step: ReturnType<typeof inlineStep> }
+  ) => Promise<{ appId: string }>;
+  return await run(
+    {
+      instanceId: idempotencyKey ?? crypto.randomUUID(),
+      payload,
+      timestamp: new Date(),
+    },
+    { env: resolveEnv(), step: inlineStep() }
+  );
+};

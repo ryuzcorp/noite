@@ -149,6 +149,31 @@ pub async fn ensure_buckets(cfg: &Config) -> anyhow::Result<()> {
     )
     .await
     .with_context(|| format!("head-bucket {bucket}"))?;
+    // S3 native versioning: one call, protects MANIFEST.json + fleet state
+    // from overwrites. Revert itself stays a sha redeploy (tip bundles are
+    // already immutable per-sha), so no restore code. Best-effort: BYOB
+    // keys are often scoped without versioning permission.
+    match run_cmd(
+        "aws",
+        &[
+            "--endpoint-url",
+            &cfg.s3_endpoint,
+            "s3api",
+            "put-bucket-versioning",
+            "--bucket",
+            bucket,
+            "--versioning-configuration",
+            "Status=Enabled",
+        ],
+        None,
+        &env,
+        Duration::from_secs(15),
+    )
+    .await
+    {
+        Ok(_) => tracing::info!(bucket, "s3 versioning enabled"),
+        Err(e) => tracing::warn!(bucket, error = %e, "s3 versioning not enabled (non-fatal)"),
+    }
     tracing::info!(bucket, "s3 bucket ready (prefixes git/, fleets/)");
     Ok(())
 }

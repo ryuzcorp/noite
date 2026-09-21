@@ -1,5 +1,5 @@
-import { authClient, hardNav } from "$lib/auth-client";
-import { head } from "@ilha/router";
+import { authClient } from "$lib/auth-client";
+import { head, navigate } from "@ilha/router";
 import { watch } from "ilha";
 
 /** Home resolves by session: signed in → apps, otherwise login. The layout
@@ -10,7 +10,7 @@ export default function Home() {
   watch.once(() => {
     void (async () => {
       const { data } = await authClient.getSession();
-      hardNav(data?.user ? "/apps" : "/login");
+      navigate(data?.user ? "/apps" : "/login");
     })();
   });
 

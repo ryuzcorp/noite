@@ -10,16 +10,17 @@
  * Data comes from the runner's bare-mirror endpoints via server-side actions
  * (sourceTree / sourceBlob / sourceDiff) — the browser never sees tokens.
  */
+import type { EditorChangeEvent, EditorOptions } from "@pierre/diffs/edit";
 import { watch } from "ilha";
 
-import { sourceBlob, sourceDiff, sourceTree } from "./apps.server";
+import {
+  sourceBlob,
+  sourceCommit,
+  sourceDiff,
+  sourceTree,
+} from "./apps.server";
 import type { RunnerBlob } from "./runner";
-
-const sleep = (ms: number) =>
-  // oxlint-disable-next-line promise/avoid-new -- the browser has no timers/promises; a setTimeout-based delay needs a fresh Promise
-  new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
+import { sleep } from "./sleep";
 
 const waitEl = async (id: string, tries = 60): Promise<HTMLElement | null> => {
   for (let i = 0; i < tries; i += 1) {
@@ -35,6 +36,26 @@ const waitEl = async (id: string, tries = 60): Promise<HTMLElement | null> => {
 
 const fmtSize = (n: number) =>
   n >= 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} B`;
+
+/** Sort flat file paths so folders come first at every level, then
+ * files — alphabetical within each group (segment-wise compare). */
+const sortTreePaths = (paths: string[]): string[] =>
+  paths.toSorted((a, b) => {
+    const as = a.split("/");
+    const bs = b.split("/");
+    const len = Math.min(as.length, bs.length);
+    for (let i = 0; i < len; i += 1) {
+      if (as[i] !== bs[i]) {
+        const aIsDir = i < as.length - 1;
+        const bIsDir = i < bs.length - 1;
+        if (aIsDir !== bIsDir) {
+          return aIsDir ? -1 : 1;
+        }
+        return as[i] < bs[i] ? -1 : 1;
+      }
+    }
+    return as.length - bs.length;
+  });
 
 const THEME = { dark: "pierre-dark", light: "pierre-light" } as const;
 
@@ -60,14 +81,39 @@ interface TreesModule {
   preparePresortedFileTreeInput: (paths: string[]) => PreparedTreeInput;
 }
 
+/** Minimal pierre File view surface (render target + edit attach). */
+interface PierreFileView {
+  cleanUp: () => void;
+  render: (opts: {
+    containerWrapper: HTMLElement | null;
+    file: { contents: string; name: string };
+  }) => void;
+}
+
+/** Minimal pierre editor surface: attach to a File view, read text.
+ * The full Editor class carries generics the vanilla side never needs. */
+interface PierreEditor {
+  cleanUp: () => void;
+  edit: (file: PierreFileView) => () => void;
+  getText: () => string;
+}
+
+interface EditModule {
+  Editor: new (
+    type: "file",
+    options?: EditorOptions<"file", undefined, undefined>,
+    editStateKey?: string
+  ) => PierreEditor;
+}
+
 interface DiffsModule {
-  File: new (opts?: { theme?: unknown; overflow?: string }) => {
-    render: (opts: {
-      file: { name: string; contents: string };
-      containerWrapper: HTMLElement | null;
-    }) => void;
-    cleanUp: () => void;
-  };
+  File: new (opts?: {
+    theme?: unknown;
+    overflow?: string;
+    onEditChange?: (
+      event: EditorChangeEvent<"file", undefined, undefined>
+    ) => void;
+  }) => PierreFileView;
   FileDiff: new (opts?: { theme?: unknown; diffStyle?: string }) => {
     render: (opts: {
       fileDiff: unknown;
@@ -89,6 +135,16 @@ export const requestSourceMode = (mode: SourceMode) => {
   modeRequest?.(mode);
 };
 
+/** Pending push trigger (set on mount, cleared on unmount). The page's
+ * Push button fires through here so no atoms cross into page JSX
+ * (a parent re-render would remount this browser). */
+let pushNow: (() => void) | undefined;
+
+/** Ask the mounted browser to commit + push dirty files. */
+export const requestSourcePush = () => {
+  pushNow?.();
+};
+
 /** Header toggle styling, synced imperatively by id (see setMode). */
 const syncToggle = (showFiles: boolean) => {
   const filesBtn = document.querySelector("#noite-src-view-files");
@@ -97,6 +153,12 @@ const syncToggle = (showFiles: boolean) => {
   filesBtn?.classList.toggle("btn-ghost", !showFiles);
   diffBtn?.classList.toggle("btn-neutral", !showFiles);
   diffBtn?.classList.toggle("btn-ghost", showFiles);
+};
+
+// The status line is gone from the layout — a no-op sink so the
+// load/error call sites in the setup stay intact.
+const setStatus = (s: string): void => {
+  void s;
 };
 
 /** Mount generation — each setup takes the next number. Stale async
@@ -120,17 +182,21 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
       const treeRoot = await waitEl("noite-src-tree");
       const codeHost = await waitEl("noite-src-code");
       const diffHost = await waitEl("noite-src-diff");
-      const statusEl = await waitEl("noite-src-status");
-      if (!treeRoot || !codeHost || !diffHost || !statusEl) {
+      if (!treeRoot || !codeHost || !diffHost) {
         return;
       }
 
-      const setStatus = (s: string) => {
-        statusEl.textContent = s;
-      };
-
       let currentMode: SourceMode = "files";
       let modeSeq = 0;
+      // Drafts live here (never in atoms): the page must not re-render
+      // (see its NOTE), so every control syncs imperatively. The code
+      // pane is always pierre-editable — no edit mode, no toggle.
+      let pushing = false;
+      let pushError = false;
+      let currentPath: string | null = null;
+      let currentEditable = false;
+      const drafts = new Map<string, string>();
+      const originals = new Map<string, string>();
       // Header toggle shares no atoms with this component (a parent
       // subscription would remount this browser on every switch), so
       // its styling syncs imperatively by id like the status line.
@@ -143,21 +209,46 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
         diffHost.classList.toggle("hidden", showFiles);
         syncToggle(showFiles);
       };
-
+      // Push button state: label + disabled, synced by id.
+      const syncPushButton = () => {
+        const btn = document.querySelector("#noite-src-push");
+        if (!(btn instanceof HTMLButtonElement)) {
+          return;
+        }
+        const n = drafts.size;
+        btn.disabled = n === 0 || pushing;
+        if (pushing) {
+          btn.textContent = "Pushing…";
+        } else if (pushError) {
+          btn.textContent = "Push failed — retry";
+        } else if (n > 0) {
+          btn.textContent = `Push (${n})`;
+        } else {
+          btn.textContent = "Push";
+        }
+      };
       let diffViews: { cleanUp: () => void }[] = [];
 
       let trees: TreesModule;
       let diffs: DiffsModule;
+      let editMod: EditModule;
       try {
         const modulesPromise = Promise.all([
           import("@pierre/trees"),
           import("@pierre/diffs"),
+          import("@pierre/diffs/edit"),
         ]);
-        // SAFETY: import() resolves the installed @pierre modules which structurally match TreesModule/DiffsModule.
-        const loaded = (await modulesPromise) as [TreesModule, DiffsModule];
-        const [treesMod, diffsMod] = loaded;
+        // SAFETY: import() resolves the installed @pierre modules which structurally match TreesModule/DiffsModule/EditModule.
+        // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- vendor types drift from the minimal local interfaces; unknown bridges them.
+        const loaded = (await modulesPromise) as unknown as [
+          TreesModule,
+          DiffsModule,
+          EditModule,
+        ];
+        const [treesMod, diffsMod, editModLoaded] = loaded;
         trees = treesMod;
         diffs = diffsMod;
+        editMod = editModLoaded;
       } catch {
         setStatus(
           "@pierre/trees + @pierre/diffs not installed — run `bun install` in apps/noite"
@@ -167,15 +258,42 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
       const { FileTree, preparePresortedFileTreeInput } = trees;
       const { File, FileDiff, parsePatchFiles } = diffs;
 
-      const fileView = new File({ overflow: "scroll", theme: THEME });
-      let tree: { cleanUp: () => void } | undefined;
+      const editor = new editMod.Editor("file", {});
+      // Draft bookkeeping for the pierre editor: clean text clears the draft.
+      const handleEditChange = () => {
+        if (!currentPath || !currentEditable) {
+          return;
+        }
+        const text = editor.getText();
+        const original = originals.get(currentPath) ?? "";
+        if (text === original) {
+          drafts.delete(currentPath);
+        } else {
+          drafts.set(currentPath, text);
+        }
+        pushError = false;
+        syncPushButton();
+      };
+      const fileView = new File({
+        onEditChange: () => {
+          handleEditChange();
+        },
+        overflow: "scroll",
+        theme: THEME,
+      });
+      // Active pierre edit session (dispose before switching files).
+      let disposeEdit: (() => void) | undefined;
+      let tree: InstanceType<TreesModule["FileTree"]> | undefined;
       teardown.fn = () => {
+        disposeEdit?.();
+        disposeEdit = undefined;
         tree?.cleanUp();
         for (const d of diffViews) {
           d.cleanUp();
         }
         diffViews = [];
         fileView?.cleanUp();
+        editor.cleanUp();
       };
       const filePaths = new Set<string>();
       let activePreview = 0;
@@ -203,17 +321,36 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
           ) {
             return;
           }
-          if (blob.binary) {
-            codeHost.textContent = "(binary file — preview not available)";
-          } else if (blob.truncated) {
-            codeHost.textContent =
-              "(file exceeds 256 KB — preview not available)";
+          currentPath = path;
+          // Mirror the open file into the URL (deep-linkable, no history
+          // spam — same replaceState pattern as the D1 filters).
+          const fileParams = new URLSearchParams(window.location.search);
+          fileParams.set("file", path);
+          window.history.replaceState(
+            null,
+            "",
+            `${window.location.pathname}?${fileParams.toString()}`
+          );
+          // A new file always starts detached; text re-attaches below.
+          disposeEdit?.();
+          disposeEdit = undefined;
+          if (blob.binary || blob.truncated) {
+            // Binary/oversize files stay read-only: no edit session, so
+            // no draft can form on placeholder text.
+            currentEditable = false;
+            codeHost.textContent = blob.binary
+              ? "(binary file — preview not available)"
+              : "(file exceeds 256 KB — preview not available)";
           } else {
+            currentEditable = true;
+            originals.set(path, blob.text);
             // SAFETY: fileView.render expects { file: { name, contents } }; name/value match the opened path/blob text 1:1.
+            // Reopening a dirty file restores its draft, not the preview.
             fileView.render({
               containerWrapper: codeHost,
-              file: { contents: blob.text, name: path },
+              file: { contents: drafts.get(path) ?? blob.text, name: path },
             });
+            disposeEdit = editor.edit(fileView);
           }
           setStatus(`${path} · ${fmtSize(blob.size)}`);
         } catch (error) {
@@ -227,24 +364,46 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
         }
       };
 
-      try {
+      // Rebuild the file tree (initial mount + post-push refresh).
+      // Returns a default file to open, if any.
+      const loadTree = async (): Promise<string | undefined> => {
         const treeData = await sourceTree(appId);
+        if (gen !== setupGen) {
+          return undefined;
+        }
         setStatus(
           `${treeData.files.length} file(s) @ ${treeData.sha.slice(0, 12)}`
         );
+        filePaths.clear();
         for (const f of treeData.files) {
           filePaths.add(f.path);
         }
-        let defaultPreviewPath: string | undefined;
-        if (filePaths.has("wrangler.jsonc")) {
-          defaultPreviewPath = "wrangler.jsonc";
+        // Deep link wins when it names a real file; otherwise the
+        // wrangler manifest is the sensible default to open — and the
+        // tree highlights whichever file lands open.
+        const urlFile = new URLSearchParams(window.location.search).get("file");
+        let initial: string | undefined;
+        if (urlFile && filePaths.has(urlFile)) {
+          initial = urlFile;
+        } else if (filePaths.has("wrangler.jsonc")) {
+          initial = "wrangler.jsonc";
         } else if (filePaths.has("wrangler.toml")) {
-          defaultPreviewPath = "wrangler.toml";
+          initial = "wrangler.toml";
         }
+        // Ancestor dirs of the initial file, so deep links land with
+        // parents expanded (collapsed parents hide the selection and
+        // block the focus scroll).
+        const ancestors: string[] = [];
+        if (initial) {
+          const parts = initial.split("/");
+          for (let i = 1; i < parts.length; i += 1) {
+            ancestors.push(parts.slice(0, i).join("/"));
+          }
+        }
+        tree?.cleanUp();
         tree = new FileTree({
-          initialSelectedPaths: defaultPreviewPath
-            ? [defaultPreviewPath]
-            : undefined,
+          initialExpandedPaths: ancestors,
+          initialSelectedPaths: initial ? [initial] : undefined,
           onSelectionChange: (selected) => {
             // Late/duplicate selection events (e.g. the initial selection
             // re-firing seconds after mount) must not yank an open diff
@@ -254,11 +413,52 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
             }
           },
           preparedInput: preparePresortedFileTreeInput(
-            treeData.files.map((f) => f.path)
+            sortTreePaths(treeData.files.map((f) => f.path))
           ),
           search: true,
         });
         tree.render({ fileTreeContainer: treeRoot });
+        return initial;
+      };
+
+      // Commit drafts + push (generic message for now).
+      const commit = async () => {
+        if (pushing || drafts.size === 0) {
+          return;
+        }
+        pushing = true;
+        syncPushButton();
+        const files = [...drafts].map(([path, content]) => ({
+          content,
+          path,
+        }));
+        try {
+          const result = await sourceCommit({
+            appId,
+            files,
+            message: `Web edit: ${files.map((f) => f.path).join(", ")}`,
+          });
+          if (!result) {
+            throw new Error("commit returned nothing");
+          }
+          const { sha } = result;
+          for (const [path, content] of drafts) {
+            originals.set(path, content);
+          }
+          drafts.clear();
+          await loadTree();
+          setStatus(`pushed ${sha.slice(0, 12)} — deploy follows the tip`);
+        } catch (error) {
+          pushError = true;
+          setStatus(error instanceof Error ? error.message : String(error));
+        } finally {
+          pushing = false;
+          syncPushButton();
+        }
+      };
+
+      try {
+        const defaultPreviewPath = await loadTree();
         if (defaultPreviewPath) {
           await openFile(defaultPreviewPath);
         }
@@ -323,6 +523,9 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
           setMode("files");
         }
       };
+      pushNow = () => {
+        void commit();
+      };
       // Deep links / refreshes with ?view=diff land straight in the diff.
       if (new URLSearchParams(window.location.search).get("view") === "diff") {
         setMode("diff");
@@ -331,6 +534,7 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
     })();
     return () => {
       modeRequest = undefined;
+      pushNow = undefined;
       setupGen += 1;
       teardown.fn?.();
     };
@@ -338,23 +542,20 @@ export const SourceBrowser = ({ appId }: { appId: string }) => {
 
   return (
     <div class="flex min-h-0 w-full flex-1 flex-col gap-2">
-      <div class="border-base-300 flex min-h-[50vh] flex-1 overflow-hidden rounded-lg border">
+      <div class="flex min-h-0 min-w-0 flex-1 gap-4">
         <div
           id="noite-src-tree"
-          class="bg-base-200/50 w-72 shrink-0 overflow-auto p-2"
+          class="bg-base-200/50 min-h-0 w-72 shrink-0 overflow-auto pt-2"
         ></div>
-        <div id="noite-src-code" class="min-w-0 flex-1 overflow-auto"></div>
+        <div
+          id="noite-src-code"
+          class="min-h-0 min-w-0 flex-1 overflow-auto"
+        ></div>
         <div
           id="noite-src-diff"
-          class="hidden min-w-0 flex-1 overflow-auto"
+          class="hidden min-h-0 min-w-0 flex-1 overflow-auto"
         ></div>
       </div>
-      <p class="m-0 text-xs opacity-60">
-        <span id="noite-src-status" class="font-medium"></span>
-        {
-          " Preview of the latest pushed commit, served from the runner's bare mirror."
-        }
-      </p>
     </div>
   );
 };

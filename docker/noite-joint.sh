@@ -5,7 +5,7 @@
 # restarts a known-good unit instead of half-serving.
 set -eu
 
-# Same default-secret gate as docker/noite-prod.sh, so the baked image can
+# Default-secret gate so the baked image can
 # never silently serve with the repo-shipped dev credentials on a real domain.
 if [ "${BASE_DOMAIN:-localhost}" != "localhost" ]; then
   case "${BETTER_AUTH_SECRET:-}" in

@@ -4,11 +4,14 @@ import type { FetchHandler } from "oxidejs";
 
 import { authFromEnv, MissingAuthSecretError } from "../lib/auth";
 import {
+  listAppsForCollaborator,
   parseAppRole,
   requireAppRole,
   requireAppRoleBySlug,
+  withLiveRunner,
 } from "../lib/collaborators";
-import { ensureDbPromise } from "../lib/db";
+import { ensureDbPromise, withDb } from "../lib/db";
+import type { RunnerMetric, RunnerSpan } from "../lib/runner";
 
 type RouteHandler = (
   request: Request,
@@ -16,8 +19,13 @@ type RouteHandler = (
   params?: Record<string, string | undefined>
 ) => Response | undefined | Promise<Response | undefined>;
 
+/** Deployment generation marker: bump on every `celld deploy` so adoption
+ * is verifiable (`/health` exposes it). Without this, worker-code version
+ * is indistinguishable from outside and every diagnosis branches. */
+const CONTROL_BUILD = 18;
+
 const handleHealth: RouteHandler = () =>
-  Response.json({ ok: true, service: "noite-control" });
+  Response.json({ build: CONTROL_BUILD, ok: true, service: "noite-control" });
 
 /** Optional nudge path — prefer runner webhook; proxy for deploy.sh convenience. */
 const handleWebhook: RouteHandler = async (request, env) => {
@@ -38,17 +46,14 @@ const handleWebhook: RouteHandler = async (request, env) => {
     body: await request.arrayBuffer(),
     headers,
     method: "POST",
+    signal: AbortSignal.timeout(10_000),
   });
 };
 
 const handleAuth: RouteHandler = async (request, env) => {
   await ensureDbPromise();
   try {
-    const auth = authFromEnv(
-      // SAFETY: the request env always carries the control env keys KitEnv narrows onto; falling back to process.env only guards a hypothetical un-injected env.
-      env ?? (process.env as KitEnv),
-      new URL(request.url).origin
-    );
+    const auth = authFromEnv(env, new URL(request.url).origin);
     return auth.handler(request);
   } catch (error) {
     if (error instanceof MissingAuthSecretError) {
@@ -117,8 +122,7 @@ const handleGitAuth: RouteHandler = async (request, env) => {
   await ensureDbPromise();
   try {
     const auth = authFromEnv(
-      // SAFETY: same KitEnv / process.env contract as handleAuth.
-      env ?? (process.env as KitEnv),
+      env,
       env.BETTER_AUTH_URL ?? new URL(request.url).origin
     );
     const verified = await auth.api.verifyApiKey({ body: { key } });
@@ -191,7 +195,10 @@ const proxyR2Object = async (
     "content-disposition",
     `attachment; filename="${filename.replaceAll('"', "_")}"`
   );
-  return new Response(await res.arrayBuffer(), { headers });
+  // Stream the body through (never buffer): large downloads must show
+  // progress, not hang into the platform deadline. Deliberately no total
+  // timeout — only the headers below are awaited before responding.
+  return new Response(res.body, { headers, status: res.status });
 };
 
 /** Path params + key query for the R2 download route (undefined when bad). */
@@ -239,9 +246,7 @@ const handleR2Raw: RouteHandler = async (request, env, params) => {
     return new Response("app, bucket, and key required", { status: 400 });
   }
   await ensureDbPromise();
-  // SAFETY: same KitEnv/process.env contract as every other RouteHandler.
-  const kit = env ?? (process.env as KitEnv);
-  const userId = await routeUserId(request, kit);
+  const userId = await routeUserId(request, env);
   if (!userId) {
     return new Response("Sign in required", { status: 401 });
   }
@@ -250,7 +255,7 @@ const handleR2Raw: RouteHandler = async (request, env, params) => {
   } catch {
     return new Response("forbidden", { status: 403 });
   }
-  const rc = runnerConfig(kit);
+  const rc = runnerConfig(env);
   if (!rc) {
     return new Response("RUNNER_TOKEN is not configured", { status: 500 });
   }
@@ -277,9 +282,7 @@ const proxyRunnerStream = async (
     return new Response("app required", { status: 400 });
   }
   await ensureDbPromise();
-  // SAFETY: same KitEnv/process.env contract as every other RouteHandler.
-  const kit = env ?? (process.env as KitEnv);
-  const userId = await routeUserId(request, kit);
+  const userId = await routeUserId(request, env);
   if (!userId) {
     return new Response("Sign in required", { status: 401 });
   }
@@ -288,7 +291,7 @@ const proxyRunnerStream = async (
   } catch {
     return new Response("forbidden", { status: 403 });
   }
-  const rc = runnerConfig(kit);
+  const rc = runnerConfig(env);
   if (!rc) {
     return new Response("RUNNER_TOKEN is not configured", { status: 500 });
   }
@@ -316,6 +319,163 @@ const handleLogsStream: RouteHandler = (request, env, params) =>
     (appId) => `/v1/apps/${appId}/logs/stream`
   );
 
+/** App list snapshot poll cadence: change diffs push immediately, comment
+ * heartbeats land well inside celld's ~60s idle-stream expiry. */
+const APPS_STREAM_POLL_MS = 10_000;
+
+/** App list over SSE (like DeployList): the oxide stream action hangs (its
+ * first frame never arrives) and idle HTTP streams die on celld's ~60s
+ * expiry without reconnect — so this polls D1 here and pushes diffs, with
+ * comment heartbeats resetting the expiry and EventSource auto-reconnect
+ * covering the rest. Session-gated like every other browser route. */
+const handleAppsStream: RouteHandler = async (request, env) => {
+  await ensureDbPromise();
+  const userId = await routeUserId(request, env);
+  if (!userId) {
+    return new Response("Sign in required", { status: 401 });
+  }
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      let last = "";
+      let quiet = 0;
+      while (!request.signal.aborted) {
+        let json: string | null = null;
+        try {
+          // oxlint-disable-next-line eslint/no-await-in-loop -- one poll per cycle; parallel polls would race change detection
+          const apps = await withDb(listAppsForCollaborator(userId));
+          // oxlint-disable-next-line eslint/no-await-in-loop -- fans out this cycle's live overlays together
+          const live = await Promise.all(
+            apps.map((row) => withLiveRunner(row))
+          );
+          json = JSON.stringify(live);
+        } catch (error) {
+          // Transient failure: log it; the heartbeat below keeps the
+          // stream alive and the next poll heals.
+          console.error("apps stream poll failed", error);
+        }
+        if (json !== null && json !== last) {
+          last = json;
+          quiet = 0;
+          controller.enqueue(encoder.encode(`data: ${json}\n\n`));
+        } else {
+          quiet += 1;
+          if (quiet % 2 === 0) {
+            controller.enqueue(encoder.encode(": ping\n\n"));
+          }
+        }
+        // oxlint-disable-next-line eslint/no-await-in-loop, promise/avoid-new -- sequential abortable sleep; Effect.sleep takes no abort signal
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, APPS_STREAM_POLL_MS);
+          request.signal.addEventListener("abort", () => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
+      }
+      controller.close();
+    },
+  });
+  const headers = new Headers();
+  headers.set("content-type", "text/event-stream");
+  headers.set("cache-control", "no-cache");
+  headers.set("connection", "keep-alive");
+  return new Response(stream, { headers });
+};
+
+/** Usage-stats poll cadence: the runner rolls minute buckets, so 30s
+ * catches every change without hammering it. */
+const METRICS_STREAM_POLL_MS = 30_000;
+
+/** Usage stats over SSE (like the apps stream): the runner only exposes
+ * unary metrics/spans endpoints, so this polls them here and pushes one
+ * frame only when the request total moves — minute buckets mean the rest
+ * is noise. Comment heartbeats reset celld's ~60s idle-stream expiry;
+ * EventSource auto-reconnect covers the rest. Session + view-role gated. */
+const handleMetricsStream: RouteHandler = async (request, env, params) => {
+  const appId = params?.appId?.trim() ?? "";
+  if (!appId) {
+    return new Response("app required", { status: 400 });
+  }
+  await ensureDbPromise();
+  const userId = await routeUserId(request, env);
+  if (!userId) {
+    return new Response("Sign in required", { status: 401 });
+  }
+  try {
+    await requireAppRole(appId, userId, "view");
+  } catch {
+    return new Response("forbidden", { status: 403 });
+  }
+  const rc = runnerConfig(env);
+  if (!rc) {
+    return new Response("RUNNER_TOKEN is not configured", { status: 500 });
+  }
+  const base = `${rc.runner}/v1/apps/${encodeURIComponent(appId)}`;
+  const auth = { authorization: `Bearer ${rc.token}` };
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      let lastReq = -1;
+      while (!request.signal.aborted) {
+        let frame: string | null = null;
+        try {
+          // oxlint-disable-next-line eslint/no-await-in-loop -- one poll per cycle; parallel polls would race change detection
+          const [mRes, sRes] = await Promise.all([
+            fetch(`${base}/metrics?hours=24`, { headers: auth }),
+            fetch(`${base}/spans?hours=1`, { headers: auth }),
+          ]);
+          if (!mRes.ok || !sRes.ok) {
+            throw new Error(`runner metrics ${mRes.status}/${sRes.status}`);
+          }
+          // oxlint-disable-next-line eslint/no-await-in-loop -- same single poll, bodies read together
+          const [mJson, sJson]: unknown[] = await Promise.all([
+            mRes.json(),
+            sRes.json(),
+          ]);
+          if (!Array.isArray(mJson) || !Array.isArray(sJson)) {
+            throw new TypeError("runner metrics sent invalid data");
+          }
+          // SAFETY: mJson passed Array.isArray above; rows match the retired unary action shape.
+          const metrics = mJson as RunnerMetric[];
+          // SAFETY: sJson passed Array.isArray above; entries flow only into the SSE frame.
+          const spans = sJson as RunnerSpan[];
+          const total = metrics.reduce((a, r) => a + r.requests, 0);
+          if (total !== lastReq) {
+            lastReq = total;
+            frame = JSON.stringify({ metrics, spans });
+          }
+        } catch (error) {
+          // Transient failure: log it; the heartbeat below keeps the
+          // stream alive and the next poll heals.
+          console.error("metrics stream poll failed", error);
+        }
+        if (frame === null) {
+          // No change (or a failed poll): heartbeat every cycle — 30s
+          // cadence stays well inside the ~60s idle-stream expiry.
+          controller.enqueue(encoder.encode(": ping\n\n"));
+        } else {
+          controller.enqueue(encoder.encode(`data: ${frame}\n\n`));
+        }
+        // oxlint-disable-next-line eslint/no-await-in-loop, promise/avoid-new -- sequential abortable sleep; Effect.sleep takes no abort signal
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, METRICS_STREAM_POLL_MS);
+          request.signal.addEventListener("abort", () => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
+      }
+      controller.close();
+    },
+  });
+  const out = new Headers();
+  out.set("content-type", "text/event-stream");
+  out.set("cache-control", "no-cache");
+  out.set("connection", "keep-alive");
+  return new Response(stream, { headers: out });
+};
+
 /** Live deploy history proxy (see proxyRunnerStream). */
 const handleDeploysStream: RouteHandler = (request, env, params) =>
   proxyRunnerStream(
@@ -332,6 +492,8 @@ router.on("POST", "/internal/git-auth", handleGitAuth);
 router.on("GET", "/storage/:appId/r2/:bucket/raw", handleR2Raw);
 router.on("GET", "/api/apps/:appId/logs/stream", handleLogsStream);
 router.on("GET", "/api/apps/:appId/deploys/stream", handleDeploysStream);
+router.on("GET", "/api/apps/stream", handleAppsStream);
+router.on("GET", "/api/apps/:appId/metrics/stream", handleMetricsStream);
 router.all("/api/auth", handleAuth);
 router.all("/api/auth/*", handleAuth);
 
@@ -351,6 +513,6 @@ export const handleHttp = ((request, env) => {
   if (!match) {
     return;
   }
-  // SAFETY: the env (or process.env fallback) provides the same KitEnv control keys handled by every RouteHandler.
-  return match.handler(request, (env ?? process.env) as KitEnv, match.params);
+  // SAFETY: the Worker env carries every KitEnv control key the handlers need; unset keys stay undefined as handlers tolerate.
+  return match.handler(request, env as KitEnv, match.params);
 }) satisfies FetchHandler<KitEnv>;
