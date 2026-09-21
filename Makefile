@@ -31,15 +31,20 @@ ifdef DISTROBOX
   export PODMAN_SOCK := /run/user/$(shell id -u)/podman/podman.sock
 endif
 
-.PHONY: help up dev logs doctor down nuke
+ .PHONY: help up dev dev-host logs doctor down nuke
 
-COMPOSE_DEV := $(COMPOSE) -f docker/compose.dev.yaml
+ COMPOSE_DEV := $(COMPOSE) -f docker/compose.dev.yaml
+
+ # LAN IP for `dev-host`: source IP of the default route (the interface LAN
+ # peers reach). Override when detection fails (no `ip` route, VPN, multi-NIC):
+ # `make dev-host HOST_IP=192.168.1.50`.
+ HOST_IP ?= $(shell ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($$i == "src") {print $$(i+1); exit}}')
 
 help:
 	@echo "  make up    production stack (release images)"
 	@echo "  make dev   same topology, dev processes (cargo-watch + vite dev)"
+	@echo "  make dev-host  dev + control UI reachable from LAN (Host: <lan-ip>)"
 	@echo "  make logs  follow runner + control + rustfs + caddy"
-	@echo "  make doctor  codified health checks (stack, runner, rustfs, UI)"
 	@echo "  make down  stop stack (keeps data volumes)"
 	@echo "  make nuke  stop stack + delete volumes + local D1/SQLite state"
 	@echo ""
@@ -57,6 +62,20 @@ dev:
 	$(COMPOSE_DEV) up -d --build rustfs runner control caddy
 	@echo "dev — runner: cargo watch · control: vite dev + watch"
 	@echo "open http://localhost:$${HTTP_PORT:-9080}  (make logs)"
+
+ # Same as dev, plus the host LAN IP joins the control site so phones/other
+ # machines on the network get the UI at http://<lan-ip>:9080. Caddy matches
+ # the Host header, so `localhost` sites alone 404 a LAN peer — the runner
+ # rewrites the Caddyfile on its next reconcile (<= RUNNER_POLL_MS).
+ # NOTE: `make dev --host` is not valid make syntax (`--host` parses as a make
+ # option); this target is the equivalent.
+ # For passkeys over the LAN you need https://noite.local (portless) — the
+ # full runbook is README.md `LAN access (dev)`.
+dev-host:
+	@if [ -z "$(HOST_IP)" ]; then echo "error: could not detect LAN IP; retry as \`make dev-host HOST_IP=192.168.x.x\`"; exit 1; fi
+	CONTROL_EXTRA_HOSTS="$${CONTROL_EXTRA_HOSTS:+$$CONTROL_EXTRA_HOSTS,}$(HOST_IP)" $(COMPOSE_DEV) up -d --build rustfs runner control caddy
+	@echo "dev-host — control UI on LAN at http://$(HOST_IP):$${HTTP_PORT:-9080}"
+	@echo "localhost unchanged: http://localhost:$${HTTP_PORT:-9080}  (make logs)"
 
 logs:
 	$(COMPOSE) logs -f runner control rustfs caddy

@@ -61,6 +61,8 @@ services:
       BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
       # Empty = control on bare domain (dev); prod sets CONTROL_SUBDOMAIN=app.
       CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-}
+      # Extra hostnames serving the control UI (e.g. `make dev-host` LAN IP).
+      CONTROL_EXTRA_HOSTS: ${CONTROL_EXTRA_HOSTS:-}
       CADDYFILE_PATH: /caddy/Caddyfile
       CADDY_UPSTREAM_HOST: runner
       CADDY_CONTROL_UPSTREAM: control:8090

@@ -186,6 +186,29 @@ impl Config {
         format!("s3://{}/fleets/{slug}", self.s3_bucket)
     }
 
+    /// DNS bases tenants are served under: the configured domain first, then
+    /// every extra control hostname that is a DNS name (dev-host LAN name,
+    /// Coolify domain). Bare IPs can't parent subdomains (`*.1.2.3.4` never
+    /// matches) so they're control-only; entries with ports/paths are
+    /// operator error — skipped rather than rendered half-working.
+    pub fn tenant_bases(&self) -> Vec<String> {
+        let mut bases = vec![self.base_domain.clone()];
+        for raw in &self.control_extra_hosts {
+            let host = raw.trim().trim_matches('.');
+            if host.is_empty()
+                || host.parse::<std::net::IpAddr>().is_ok()
+                || host.contains(':')
+                || host.contains('/')
+            {
+                continue;
+            }
+            if !bases.iter().any(|b| b.eq_ignore_ascii_case(host)) {
+                bases.push(host.to_string());
+            }
+        }
+        bases
+    }
+
     /// S3 URI for a key already under the shared bucket (e.g. tip bundle key).
     pub fn s3_uri(&self, key: &str) -> String {
         let key = key.trim_start_matches('/');
@@ -222,5 +245,41 @@ mod tests {
     fn auto_https_defaults_by_domain() {
         assert!(!parse_auto_https(None, "localhost"));
         assert!(parse_auto_https(None, "noite.now"));
+    }
+
+    #[test]
+    fn tenant_bases_skips_ips_ports_and_dupes() {
+        let cfg = Config {
+            bind: "0.0.0.0:8080".into(),
+            runner_token: "test-token".into(),
+            database_url: "sqlite::memory:".into(),
+            s3_endpoint: "http://rustfs:9000".into(),
+            s3_public_endpoint: "http://rustfs:9000".into(),
+            s3_bucket: "noite".into(),
+            aws_region: "us-east-1".into(),
+            aws_access_key_id: "key".into(),
+            aws_secret_access_key: "secret".into(),
+            base_domain: "localhost".into(),
+            control_subdomain: "".into(),
+            control_extra_hosts: vec![
+                "noite.local".into(),
+                "192.168.10.62".into(),
+                "noite.local".into(),
+                "weird:9080".into(),
+                "".into(),
+            ],
+            work_dir: "/tmp/noite-test".into(),
+            caddyfile_path: "/tmp/noite-test-bases".into(),
+            celld_bin: "celld".into(),
+            port_base: 8100,
+            poll_ms: 5000,
+            caddy_upstream_host: "runner".into(),
+            auto_https: false,
+            caddy_control_upstream: "ui:8080".into(),
+            caddy_api_upstream: "runner:8080".into(),
+            git_public_base: "https://git.localhost".into(),
+            ui_url: "http://ui:8080".into(),
+        };
+        assert_eq!(cfg.tenant_bases(), vec!["localhost", "noite.local"]);
     }
 }

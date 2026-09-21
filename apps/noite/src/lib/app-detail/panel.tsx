@@ -2,7 +2,7 @@
 import { navigate, useRoute } from "@ilha/router";
 import { atom, unsafe, watch } from "ilha";
 
-import { appUrl, initials, presenceTone } from "../apps";
+import { appHost, appUrl, initials, presenceTone } from "../apps";
 import { get, setDesired } from "../apps.server";
 import { authClient } from "../auth-client";
 import type { AppRole } from "../roles";
@@ -26,14 +26,12 @@ const LiveAppStatus = ({
 }: {
   app: { lastDeploySha: string | null; subdomain: string };
 }) => {
-  const { port } = window.location;
-  const url = port
-    ? `http://${app.subdomain}:${port}`
-    : `https://${app.subdomain}`;
+  const url = appUrl(app.subdomain);
+  const host = appHost(app.subdomain);
   return (
     <p class="m-0 opacity-70">
       <a class="link" href={url} target="_blank" rel="noreferrer">
-        {app.subdomain}
+        {host}
       </a>
       {app.lastDeploySha ? " · " : " · not deployed"}
       {app.lastDeploySha ? (

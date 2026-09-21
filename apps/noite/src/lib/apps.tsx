@@ -72,11 +72,34 @@ export const presenceTone = (status: string): string => {
 export const CHEVRON_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>';
 
+/** Reachable host for a stored subdomain on the current page's network.
+ * Stored subdomains anchor on the configured base (dev: slug.localhost).
+ * When this UI is served from outside that family (dev-host LAN name/IP),
+ * rebase the slug onto the current host so the link stays on this network.
+ * Loopback forms and same-family hosts keep the stored value untouched. */
+export const appHost = (subdomain: string): string => {
+  const { hostname } = window.location;
+  const host = hostname.toLowerCase();
+  const dot = subdomain.indexOf(".");
+  const base = dot === -1 ? "" : subdomain.slice(dot + 1).toLowerCase();
+  const loopback =
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "::1" ||
+    host === "[::1]";
+  if (loopback || host === base || (base !== "" && host.endsWith(`.${base}`))) {
+    return subdomain;
+  }
+  const slug = dot === -1 ? subdomain : subdomain.slice(0, dot);
+  return `${slug}.${hostname}`;
+};
+
 /** Live-app URL on the current host (mirrors LiveAppStatus in app-detail).
  * Dev carries the port over http; prod (no port) links plain https. */
 export const appUrl = (subdomain: string): string => {
   const { port } = window.location;
-  return port ? `http://${subdomain}:${port}` : `https://${subdomain}`;
+  const host = appHost(subdomain);
+  return port ? `http://${host}:${port}` : `https://${host}`;
 };
 
 /** App list over SSE (like DeployList): cache-first seed paints instantly

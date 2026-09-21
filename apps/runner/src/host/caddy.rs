@@ -13,16 +13,9 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
     // for marketing). `http://` pins plain HTTP for dev; prod uses bare
     // hostnames so TLS serves https://app.{domain} + https://{app}.{domain}
     // (automatic certs, or on-demand behind a proxy).
-    let mut control_hosts = vec![if cfg.control_subdomain.is_empty() {
-        cfg.base_domain.clone()
-    } else {
-        format!("{}.{}", cfg.control_subdomain, cfg.base_domain)
-    }];
-    // Extra control hostnames (e.g. Coolify's generated domain) share the
-    // control site so the auto-provisioned route serves the UI, not the
-    // unknown-host fallback.
-    control_hosts.extend(cfg.control_extra_hosts.iter().cloned());
-    let control_site = control_hosts.join(", ");
+    // Scheme is pinned PER HOST: Caddy binds a schemeless address to :443,
+    // so one `http://` prefix across a comma-joined list strands every host
+    // after the first on :443 (unreachable behind the :80 edge publish).
     let site = |host: &str| -> String {
         if plain {
             format!("http://{host}")
@@ -44,6 +37,20 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
             site(host)
         }
     };
+    let mut control_hosts = vec![if cfg.control_subdomain.is_empty() {
+        cfg.base_domain.clone()
+    } else {
+        format!("{}.{}", cfg.control_subdomain, cfg.base_domain)
+    }];
+    // Extra control hostnames (e.g. Coolify's generated domain, `dev-host`
+    // LAN IP) share the control site so the route serves the UI, not the
+    // unknown-host fallback.
+    control_hosts.extend(cfg.control_extra_hosts.iter().cloned());
+    let control_site = control_hosts
+        .iter()
+        .map(|h| addr_of(h))
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut lines = vec![
         "# noite-edge".into(),
         "{".into(),
@@ -94,7 +101,9 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
         push_block(addr, tls, site_extra, proxy_extra, upstream);
     };
     push_site(
-        &addr_of(&control_site),
+        // Already per-host scheme-mapped above — mapping the joined string
+        // again would double-prefix the first host (`http://http://…`).
+        &control_site,
         edge_tls,
         &[],
         &[],
@@ -108,27 +117,32 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
         &[],
         &cfg.caddy_control_upstream,
     );
-    for app in apps {
-        let Some(port) = app.listen_port else {
-            continue;
-        };
-        // Only deployed apps can serve: stopped ones are parked and
-        // never-deployed ones have no fleet — both fall through to the
-        // wildcard fallback page instead of a dead route.
-        if app.is_stopped() || !app.is_deployed() {
-            continue;
+    // Tenants serve under every DNS base (dev `localhost` plus LAN names
+    // like `noite.local` and Coolify domains) — same per-app routes and
+    // wildcard fallback on each, so LAN URLs work without a second topology.
+    for base in cfg.tenant_bases() {
+        for app in apps {
+            let Some(port) = app.listen_port else {
+                continue;
+            };
+            // Only deployed apps can serve: stopped ones are parked and
+            // never-deployed ones have no fleet — both fall through to the
+            // wildcard fallback page instead of a dead route.
+            if app.is_stopped() || !app.is_deployed() {
+                continue;
+            }
+            let upstream = format!("{}:{}", cfg.caddy_upstream_host, port);
+            // No header_up lines: Caddy's reverse_proxy already forwards Host
+            // and sets X-Forwarded-For/Proto/Host by default (it warns on
+            // explicit duplicates, and site-level ones fail the whole adapt).
+            push_site(
+                &addr_of(&format!("{}.{}", app.slug, base)),
+                edge_tls,
+                &[],
+                &[],
+                &upstream,
+            );
         }
-        let upstream = format!("{}:{}", cfg.caddy_upstream_host, port);
-        // No header_up lines: Caddy's reverse_proxy already forwards Host
-        // and sets X-Forwarded-For/Proto/Host by default (it warns on
-        // explicit duplicates, and site-level ones fail the whole adapt).
-        push_site(
-            &addr_of(&format!("{}.{}", app.slug, cfg.base_domain)),
-            edge_tls,
-            &[],
-            &[],
-            &upstream,
-        );
     }
     // API → runner (Bearer-protected REST)
     push_site(
@@ -148,16 +162,18 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
         &cfg.caddy_api_upstream,
     );
 
-    // Fallback: unknown slugs + stopped apps → runner edge page (per-Host).
-    // Tenant TLS is minted on demand (ask-gated), so no wildcard cert or
-    // DNS-challenge module is needed on any platform.
-    push_site(
-        &addr_of(&format!("*.{}", cfg.base_domain)),
-        !local,
-        &["rewrite * /v1/edge/fallback"],
-        &[],
-        &cfg.caddy_api_upstream,
-    );
+    // Fallback: unknown slugs + stopped apps → runner edge page (per-Host,
+    // on every tenant base). Tenant TLS is minted on demand (ask-gated), so
+    // no wildcard cert or DNS-challenge module is needed on any platform.
+    for base in cfg.tenant_bases() {
+        push_site(
+            &addr_of(&format!("*.{base}")),
+            !local,
+            &["rewrite * /v1/edge/fallback"],
+            &[],
+            &cfg.caddy_api_upstream,
+        );
+    }
 
     let next = lines.join("\n");
     let path = Path::new(&cfg.caddyfile_path);
@@ -263,6 +279,53 @@ mod tests {
         let out = rendered(&cfg, &[test_app()]).await;
         assert!(out.contains("http://test.localhost {"), "tenant plain site");
         assert!(!out.contains("\ttls {"), "no TLS site in dev");
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
+    #[tokio::test]
+    async fn local_extra_hosts_each_get_plain_scheme() {
+        // Caddy binds a schemeless address to :443, stranding it behind the
+        // :80 edge publish — every control host needs its own `http://` pin.
+        let mut cfg = test_config("localhost", "", false, "/tmp/noite-test-local-extra");
+        cfg.control_extra_hosts = vec!["192.168.10.62".into()];
+        let out = rendered(&cfg, &[test_app()]).await;
+        assert!(
+            out.contains("http://localhost, http://192.168.10.62 {"),
+            "control site pins plain HTTP per host:\n{out}"
+        );
+        assert!(
+            !out.contains("http://http://"),
+            "no doubled scheme from mapping the joined list again:\n{out}"
+        );
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+    #[tokio::test]
+    async fn tenants_serve_under_dns_extra_hosts() {
+        let mut cfg = test_config("localhost", "", false, "/tmp/noite-test-tenant-lan");
+        cfg.control_extra_hosts = vec!["noite.local".into()];
+        let out = rendered(&cfg, &[test_app()]).await;
+        assert!(
+            out.contains("http://test.noite.local {"),
+            "tenant plain site on LAN base:\n{out}"
+        );
+        assert!(
+            out.contains("http://*.noite.local {"),
+            "wildcard fallback on LAN base:\n{out}"
+        );
+        // Base shape untouched.
+        assert!(out.contains("http://test.localhost {"), "tenant plain site");
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
+    #[tokio::test]
+    async fn ip_extra_hosts_get_no_tenant_sites() {
+        let mut cfg = test_config("localhost", "", false, "/tmp/noite-test-tenant-ip");
+        cfg.control_extra_hosts = vec!["192.168.10.62".into()];
+        let out = rendered(&cfg, &[test_app()]).await;
+        assert!(
+            !out.contains("*.192.168") && !out.contains("test.192.168"),
+            "bare IPs are control-only, never tenant bases:\n{out}"
+        );
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
     }
 }

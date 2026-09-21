@@ -15,23 +15,35 @@ use axum::{
 
 use crate::AppState;
 
-/// Tenant slug from a Host header, if it addresses `{slug}.{base}` and is
-/// not one of the platform hosts (control, api, git).
-pub fn parse_edge_slug(host: &str, base_domain: &str, control_sub: &str) -> Option<String> {
+/// Tenant slug from a Host header, if it addresses `{slug}.{base}` under any
+/// tenant base (configured domain plus LAN/extra DNS names) and is not one
+/// of the platform hosts (bare bases, control, api, git).
+pub fn parse_edge_slug(host: &str, bases: &[String], control_sub: &str) -> Option<String> {
     let bare = host.split_once(':').map(|(h, _)| h).unwrap_or(host);
     let bare = bare.trim().to_lowercase();
-    if bare.is_empty() || bare == base_domain {
+    if bare.is_empty() {
         return None;
     }
-    let suffix = format!(".{base_domain}");
-    let slug = bare.strip_suffix(&suffix)?;
-    if slug.is_empty() || slug.contains('.') {
+    if bases.iter().any(|b| bare == *b) {
         return None;
     }
-    if slug == control_sub || slug == "api" || slug == "git" {
-        return None;
+    // First suffix match wins; the configured domain stays primary.
+    for base in bases {
+        if base.trim().is_empty() {
+            continue;
+        }
+        let Some(slug) = bare.strip_suffix(format!(".{base}").as_str()) else {
+            continue;
+        };
+        if slug.is_empty() || slug.contains('.') {
+            return None;
+        }
+        if slug == control_sub || slug == "api" || slug == "git" {
+            return None;
+        }
+        return Some(slug.to_string());
     }
-    Some(slug.to_string())
+    None
 }
 
 fn escape(text: &str) -> String {
@@ -47,16 +59,33 @@ fn escape(text: &str) -> String {
     }
     out
 }
-
 /// Control-plane base URL for the "back to Noite" link, derived from the
-/// incoming Host (keeps dev ports working without configuration).
-fn control_url(host: &str, base_domain: &str, control_sub: &str) -> String {
+/// incoming Host (keeps dev ports working without configuration). Visitors
+/// on a LAN/extra host link back to that host, not localhost — which would
+/// resolve to their own machine.
+fn control_url(host: &str, base_domain: &str, control_sub: &str, tenant_bases: &[String]) -> String {
     let port = host
         .split_once(':')
         .map(|(_, p)| p)
         .filter(|p| !p.is_empty())
         .map(|p| format!(":{p}"))
         .unwrap_or_default();
+    let bare = host
+        .split_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host)
+        .trim()
+        .to_lowercase();
+    // Extra-host visitor (LAN name): same host serves control there.
+    if let Some(extra) = tenant_bases
+        .iter()
+        .find(|b| *b != base_domain && (bare == **b || bare.ends_with(format!(".{b}").as_str())))
+    {
+        if base_domain == "localhost" {
+            return format!("http://{extra}{port}");
+        }
+        return format!("https://{extra}");
+    }
     let name = if control_sub.is_empty() {
         base_domain.to_string()
     } else {
@@ -107,8 +136,9 @@ pub async fn edge_fallback(
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     let cfg = &state.config;
-    let control = control_url(host, &cfg.base_domain, &cfg.control_subdomain);
-    let Some(slug) = parse_edge_slug(host, &cfg.base_domain, &cfg.control_subdomain) else {
+    let bases = cfg.tenant_bases();
+    let control = control_url(host, &cfg.base_domain, &cfg.control_subdomain, &bases);
+    let Some(slug) = parse_edge_slug(host, &bases, &cfg.control_subdomain) else {
         return page(
             StatusCode::NOT_FOUND,
             "Not found",
@@ -214,7 +244,7 @@ pub async fn tls_ask(
     ) {
         return StatusCode::OK;
     }
-    let Some(slug) = parse_edge_slug(domain, &cfg.base_domain, &cfg.control_subdomain) else {
+    let Some(slug) = parse_edge_slug(domain, &cfg.tenant_bases(), &cfg.control_subdomain) else {
         return StatusCode::NOT_FOUND;
     };
     if !crate::lifecycle::slug_ok(&slug) {
@@ -230,16 +260,34 @@ pub async fn tls_ask(
 mod tests {
     use super::*;
 
+    fn bases(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn parses_tenant_hosts() {
         assert_eq!(
-            parse_edge_slug("asdf.localhost:9080", "localhost", ""),
+            parse_edge_slug("asdf.localhost:9080", &bases(&["localhost"]), ""),
             Some("asdf".to_string())
         );
         assert_eq!(
-            parse_edge_slug("my-app.noite.now", "noite.now", "app"),
+            parse_edge_slug("my-app.noite.now", &bases(&["noite.now"]), "app"),
             Some("my-app".to_string())
         );
+    }
+
+    #[test]
+    fn parses_lan_extra_bases() {
+        let lan = bases(&["localhost", "noite.local"]);
+        assert_eq!(
+            parse_edge_slug("test.noite.local:9080", &lan, ""),
+            Some("test".to_string())
+        );
+        assert_eq!(parse_edge_slug("noite.local:9080", &lan, ""), None);
+        assert_eq!(parse_edge_slug("api.noite.local", &lan, ""), None);
+        assert_eq!(parse_edge_slug("a.b.noite.local", &lan, ""), None);
+        assert_eq!(parse_edge_slug("test.localhost:9080", &lan, ""), Some("test".to_string()));
+        assert_eq!(parse_edge_slug("test.evil.local", &lan, ""), None);
     }
 
     #[test]
@@ -266,31 +314,50 @@ mod tests {
         assert!(!tls_ask_static_ok("app.noite.now", "localhost", "", &[]));
         assert!(!tls_ask_static_ok("anything", "", "app", &[]));
     }
-
     #[test]
     fn rejects_platform_hosts() {
-        assert_eq!(parse_edge_slug("localhost:9080", "localhost", ""), None);
+        let dev = bases(&["localhost"]);
+        assert_eq!(parse_edge_slug("localhost:9080", &dev, ""), None);
         // Dev has no control subdomain: `app` is just an unknown slug there.
         assert_eq!(
-            parse_edge_slug("app.localhost", "localhost", ""),
+            parse_edge_slug("app.localhost", &dev, ""),
             Some("app".to_string())
         );
-        assert_eq!(parse_edge_slug("api.noite.now", "noite.now", "app"), None);
-        assert_eq!(parse_edge_slug("git.noite.now", "noite.now", "app"), None);
-        assert_eq!(parse_edge_slug("app.noite.now", "noite.now", "app"), None);
-        assert_eq!(parse_edge_slug("a.b.localhost", "localhost", ""), None);
-        assert_eq!(parse_edge_slug("", "localhost", ""), None);
+        let prod = bases(&["noite.now"]);
+        assert_eq!(parse_edge_slug("api.noite.now", &prod, "app"), None);
+        assert_eq!(parse_edge_slug("git.noite.now", &prod, "app"), None);
+        assert_eq!(parse_edge_slug("app.noite.now", &prod, "app"), None);
+        assert_eq!(parse_edge_slug("a.b.localhost", &dev, ""), None);
+        assert_eq!(parse_edge_slug("", &dev, ""), None);
     }
 
     #[test]
     fn control_url_shapes() {
         assert_eq!(
-            control_url("asdf.localhost:9080", "localhost", ""),
+            control_url("asdf.localhost:9080", "localhost", "", &bases(&["localhost"])),
             "http://localhost:9080"
         );
         assert_eq!(
-            control_url("x.noite.now", "noite.now", "app"),
+            control_url("x.noite.now", "noite.now", "app", &bases(&["noite.now"])),
             "https://app.noite.now"
+        );
+    }
+
+    #[test]
+    fn control_url_links_lan_visitors_home() {
+        let lan = bases(&["localhost", "noite.local"]);
+        assert_eq!(
+            control_url("test.noite.local:9080", "localhost", "", &lan),
+            "http://noite.local:9080"
+        );
+        assert_eq!(
+            control_url("noite.local", "localhost", "", &lan),
+            "http://noite.local"
+        );
+        // Base visitors are unaffected by the extra host.
+        assert_eq!(
+            control_url("asdf.localhost:9080", "localhost", "", &lan),
+            "http://localhost:9080"
         );
     }
 

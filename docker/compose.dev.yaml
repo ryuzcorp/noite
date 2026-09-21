@@ -13,8 +13,8 @@ services:
       dockerfile: docker/Dockerfile.runner-dev
     image: noite-runner-dev:local
     volumes:
-      - ../apps/runner:/src
-      - ../docker/runner-dev.sh:/runner-dev.sh:ro
+      - ../apps/runner:/src:z
+      - ../docker/runner-dev.sh:/runner-dev.sh:ro,z
       - runner-cargo-registry:/usr/local/cargo/registry
       - runner-cargo-git:/usr/local/cargo/git
       - runner-target:/src/target
@@ -51,8 +51,8 @@ services:
       # 1 = polling file watcher (flaky rootless inotify).
       VITE_USE_POLLING: ${VITE_USE_POLLING:-0}
     volumes:
-      - ../apps/noite:/app
-      - ../docker/control-dev.sh:/control-dev.sh:ro
+      - ../apps/noite:/app:z
+      - ../docker/control-dev.sh:/control-dev.sh:ro,z
       - bun-cache:/root/.bun/install/cache
       # Vite optimizer cache holds absolute paths: host runs write
       # /home/ryuz/Arch/..., the container sees /app/... Sharing it
