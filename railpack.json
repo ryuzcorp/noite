@@ -55,7 +55,7 @@
         { "local": true, "include": ["docker/install-sidecars.sh"] }
       ],
       "commands": [
-        "export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && apt-get update && apt-get install -y --no-install-recommends curl ca-certificates unzip && rm -rf /var/lib/apt/lists/* && sh /app/docker/install-sidecars.sh"
+        "export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && apt-get update && apt-get install -y --no-install-recommends curl ca-certificates unzip && rm -rf /var/lib/apt/lists/* && sh /app/install-sidecars.sh"
       ]
     }
   },
