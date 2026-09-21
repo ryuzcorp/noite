@@ -31,11 +31,11 @@ arm64 | aarch64)
   ;;
 esac
 
-curl -fsSL "https://registry.npmjs.org/@esbuild/${ESBUILD_PKG}/-/${ESBUILD_PKG}-${ESBUILD_VERSION}.tgz" |
+curl -fsSL --retry 5 --retry-all-errors --connect-timeout 15 "https://registry.npmjs.org/@esbuild/${ESBUILD_PKG}/-/${ESBUILD_PKG}-${ESBUILD_VERSION}.tgz" |
   tar -xz -C /tmp
 install -m 755 /tmp/package/bin/esbuild /usr/local/bin/esbuild
 rm -rf /tmp/package
 
-curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VER}/${DUCKDB_ZIP}" -o /tmp/duckdb.zip
+curl -fsSL --retry 5 --retry-all-errors --connect-timeout 15 "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VER}/${DUCKDB_ZIP}" -o /tmp/duckdb.zip
 unzip -qo /tmp/duckdb.zip -d /usr/local/bin
 rm -f /tmp/duckdb.zip
