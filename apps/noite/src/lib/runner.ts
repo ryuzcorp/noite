@@ -274,8 +274,70 @@ export interface RunnerSpan {
   qwaitMs: number;
 }
 
+export interface RunnerDevice {
+  bucketTs: string;
+  browser: string;
+  os: string;
+  requests: number;
+}
+
+export interface RunnerPath {
+  bucketTs: string;
+  path: string;
+  requests: number;
+}
+
+export interface RunnerRef {
+  bucketTs: string;
+  source: string;
+  requests: number;
+}
+
 export const runnerAppSpans = (id: string, hours = 1) =>
   runnerRpc<RunnerSpan[]>("spans.get", { hours, id });
+
+export interface RunnerEvent {
+  id: string;
+  appId: string;
+  channel: string;
+  event: string;
+  description: string;
+  icon: string;
+  tags: string;
+  userId: string;
+  ts: string;
+}
+
+export interface RunnerUserProps {
+  appId: string;
+  userId: string;
+  properties: string;
+  updatedAt: string;
+}
+
+export interface RunnerInsight {
+  appId: string;
+  title: string;
+  value: string;
+  num: number | null;
+  icon: string;
+  updatedAt: string;
+}
+
+export const runnerListEvents = (id: string, channel?: string, limit = 50) =>
+  runnerRpc<RunnerEvent[]>("events.list", { channel, id, limit });
+
+export const runnerListEventChannels = (id: string) =>
+  runnerRpc<string[]>("events.channels", { id });
+
+export const runnerListInsights = (id: string) =>
+  runnerRpc<RunnerInsight[]>("events.insights", { id });
+
+export const runnerGetUserProps = (id: string, userId: string) =>
+  runnerRpc<RunnerUserProps | null>("events.user_props", {
+    id,
+    user_id: userId,
+  });
 
 export interface StorageItem {
   appId: string;

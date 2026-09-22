@@ -179,6 +179,68 @@ pub struct AppMetric {
     pub cpu_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct AppDeviceStat {
+    pub app_id: String,
+    pub bucket_ts: String,
+    pub browser: String,
+    pub os: String,
+    pub requests: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct AppPathStat {
+    pub app_id: String,
+    pub bucket_ts: String,
+    pub path: String,
+    pub requests: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct AppRefStat {
+    pub app_id: String,
+    pub bucket_ts: String,
+    pub source: String,
+    pub requests: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct AppEvent {
+    pub id: String,
+    pub app_id: String,
+    pub channel: String,
+    pub event: String,
+    pub description: String,
+    pub icon: String,
+    pub tags: String,
+    pub user_id: String,
+    pub ts: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct AppUserProps {
+    pub app_id: String,
+    pub user_id: String,
+    pub properties: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct AppInsight {
+    pub app_id: String,
+    pub title: String,
+    pub value: String,
+    pub num: Option<f64>,
+    pub icon: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateApp {

@@ -1,11 +1,14 @@
 {
   "compilerOptions": {
     // Environment setup & latest features
-    "lib": ["ESNext"],
+    // (DOM lib + ilha JSX: the control UI needs browser types and its own
+    // JSX runtime; per-package configs remain authoritative for builds.)
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
     "target": "ESNext",
     "module": "Preserve",
     "moduleDetection": "force",
     "jsx": "react-jsx",
+    "jsxImportSource": "ilha",
     "allowJs": true,
     "types": ["bun"],
 
@@ -14,7 +17,9 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "noEmit": true,
-
+    "paths": {
+      "$lib/*": ["./apps/noite/src/lib/*"]
+    },
     // Best practices
     "strict": true,
     "skipLibCheck": true,
@@ -26,5 +31,8 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
-  }
+  },
+  // Generated router declarations live under a dot-directory the default
+  // glob skips; include explicitly so `ilha:pages/*` resolves bare.
+  "files": ["apps/noite/.ilha/pages.d.ts"]
 }

@@ -1,6 +1,6 @@
 import * as Effect from "effect/Effect";
-/** Durable control-plane ops via Oxide workflow / queue / schedule (real Worker bindings). */
 import * as Schema from "effect/Schema";
+import { SqlClient } from "effect/unstable/sql/SqlClient";
 import { publish, queue, readWorkflowMeta, schedule, workflow } from "oxidejs";
 
 import { failAction } from "./auth";
@@ -26,6 +26,15 @@ import {
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site values are unknown by construction; this helper narrows to message
 export const failUnknown = (error: unknown): never =>
   failAction(error instanceof Error ? error.message : String(error));
+
+/** Minimal app row for the reconcile merge (see collectUserIds): a narrow
+ * interface keeps the raw query shallow where the full builder blows tsc's
+ * depth budget. */
+interface MergeRow {
+  desiredState: string;
+  id: string;
+  userId: string;
+}
 
 const OpPayloadSchema = Schema.Union([
   Schema.Struct({
@@ -247,7 +256,16 @@ export const syncApps = workflow({
     const userIds = await step.do("merge", () =>
       withDb(
         Effect.gen(function* collectUserIds() {
-          const local = yield* orm.app.findMany({});
+          // Plain SELECT outside the paranorm builder (see MergeRow): the
+          // builder exceeds tsc's depth budget in some configs, while the
+          // untyped call stays shallow everywhere.
+          const sql = yield* SqlClient;
+          const found = yield* sql.unsafe(
+            `SELECT id, userId, desiredState FROM "app"`
+          );
+          // SAFETY: the column list mirrors MergeRow and D1 returns plain
+          // row objects.
+          const local = found as MergeRow[];
           const users = new Set<string>();
           for (const row of local) {
             if (row.desiredState === "deleted") {

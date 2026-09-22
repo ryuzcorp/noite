@@ -1,11 +1,15 @@
 //! Single-resource detail: D1 tables, DO instances, R2 keys + previews.
 import { atom, watch } from "ilha";
 
-import { d1Preview, doPreview, r2Delete, r2List } from "../apps.server";
+import type { AppDetailInfo } from "../app-detail/panel";
+import { d1Preview, doPreview, get, r2Delete, r2List } from "../apps.server";
+import { formatDateTime } from "../dates";
 import { r2DownloadUrl } from "../runner";
 import type { D1Preview, DoPreview, R2Preview } from "../runner";
 import { SectionSkeleton } from "../skeletons";
+import { readSwrCache, writeSwrCache } from "../swr-cache";
 import { D1DetailPanel } from "./d1";
+import { StorageTopCard } from "./list";
 
 /** One storage resource's details: D1 shows each table as a read-only
  * daisyUI table (rows + first rows); a DO class shows its live instances;
@@ -31,6 +35,8 @@ export const StorageDetail = ({
   const preview = atom<D1Preview | DoPreview | R2Preview | null>(null);
   const fileError = atom("");
   const loadError = atom("");
+  const seedDetail = readSwrCache<AppDetailInfo>(`app:${appId}:detail`);
+  const appName = atom(seedDetail?.app.name ?? "");
 
   const reloadR2 = async () => {
     try {
@@ -67,6 +73,15 @@ export const StorageDetail = ({
 
   watch.once(() => {
     void (async () => {
+      if (!isD1) {
+        try {
+          const info = await get(appId);
+          appName.set(info.app.name);
+          writeSwrCache(`app:${appId}:detail`, info);
+        } catch {
+          // Name stays at its seed; the back link shows an ellipsis instead.
+        }
+      }
       try {
         if (isR2) {
           await reloadR2();
@@ -101,15 +116,13 @@ export const StorageDetail = ({
     const r2Data = p as R2Preview;
     return (
       <div class="flex flex-col gap-4">
-        <div>
-          <div class="flex items-center gap-2">
-            <span class="badge">R2</span>
-            <h1 class="m-0 text-lg font-semibold">{bucket}</h1>
-          </div>
-          <p class="m-0 text-sm opacity-70">
-            {r2Data.objects.length} object(s)
-          </p>
-        </div>
+        <StorageTopCard
+          appId={appId}
+          appName={appName()}
+          badge="R2"
+          subtitle={`${r2Data.objects.length} object(s)`}
+          title={bucket}
+        />
         {r2Data.objects.length === 0 ? (
           <p class="m-0 text-sm opacity-70">
             No objects yet — PUT to /files/&lt;key&gt; on the app to upload one.
@@ -133,7 +146,7 @@ export const StorageDetail = ({
                         <td class="font-mono text-xs">{object.key}</td>
                         <td class="font-mono text-xs">{object.size}</td>
                         <td class="font-mono text-xs">
-                          {object.lastModified || "—"}
+                          {formatDateTime(object.lastModified)}
                         </td>
                         <td class="whitespace-nowrap">
                           <a
@@ -174,15 +187,13 @@ export const StorageDetail = ({
     const doData = p as DoPreview;
     return (
       <div class="flex flex-col gap-4">
-        <div>
-          <div class="flex items-center gap-2">
-            <span class="badge">DO</span>
-            <h1 class="m-0 text-lg font-semibold">{className}</h1>
-          </div>
-          <p class="m-0 text-sm opacity-70">
-            {doData.instances.length} instance(s)
-          </p>
-        </div>
+        <StorageTopCard
+          appId={appId}
+          appName={appName()}
+          badge="DO"
+          subtitle={`${doData.instances.length} instance(s)`}
+          title={className}
+        />
         {doData.instances.length === 0 ? (
           <p class="m-0 text-sm opacity-70">
             No instances yet — one is created the first time the object is

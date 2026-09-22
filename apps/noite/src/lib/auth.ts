@@ -194,6 +194,13 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
       apiKey({
         defaultPrefix: "noite_",
         enableMetadata: false,
+        // Machine scopes: `apps.manage` (git push and other app-management
+        // API calls) and `events.push` (event ingest). Keys created without
+        // explicit permissions inherit both, preserving current behavior;
+        // legacy keys get the same via the ensureDb backfill.
+        permissions: {
+          defaultPermissions: { apps: ["manage"], events: ["push"] },
+        },
         rateLimit: {
           enabled: false,
           maxRequests: 10_000,

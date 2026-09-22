@@ -1,6 +1,7 @@
 /* eslint-disable func-names -- Effect.gen uses anonymous generators */
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { SqlClient } from "effect/unstable/sql/SqlClient";
 import { action, useEnv, useRequest } from "oxidejs";
 
 import { checkedSchema } from "./action-schema";
@@ -11,7 +12,7 @@ import {
   MissingAuthSecretError,
   UnauthorizedError,
 } from "./auth";
-import { ensureDbPromise, orm, withDb } from "./db";
+import { ensureDbPromise, withDb } from "./db";
 import { failUnknown } from "./ops.server";
 import { runnerListApps } from "./runner";
 import type { RunnerApp } from "./runner";
@@ -52,14 +53,24 @@ const ensureAdminAccount = (email: string | null) =>
     if (!email) {
       return;
     }
-    const existing = yield* orm.user.findFirst({ where: { email } });
+    const found = yield* Effect.gen(function* () {
+      const sql = yield* SqlClient;
+      return yield* sql.unsafe(
+        `SELECT id, email, name, banned, role, createdAt FROM "user" WHERE "email" = ?`,
+        [email]
+      );
+    });
+    // SAFETY: the column list mirrors DbUser and D1 returns plain row
+    // objects; the paranorm builder for this table exceeds tsc's depth
+    // budget, so raw SQL stays shallow in every config.
+    const existing = (found[0] ?? null) as DbUser | null;
     if (!existing || existing.role === "admin") {
       return;
     }
-    yield* orm.user.update({
-      data: { role: "admin" },
-      where: { id: existing.id },
-    });
+    const sql = yield* SqlClient;
+    yield* sql.unsafe(`UPDATE "user" SET "role" = 'admin' WHERE "id" = ?`, [
+      existing.id,
+    ]);
   });
 
 interface AdminSession {
@@ -180,14 +191,21 @@ export const listUsers = action(
       failAction("Admin only");
     }
     try {
-      // @ts-expect-error TS2589: paranorm user-table inference exceeds tsc's depth budget; rows are plain user records at runtime.
-      const rows = await withDb(orm.user.findMany({}));
-      const users = rows.map((row) =>
-        asUserRow(
-          // SAFETY: rows come from the user table; columns match DbUser.
-          row as DbUser
-        )
+      // Plain SELECT outside the paranorm builder: the builder exceeds
+      // tsc's depth budget in some configs, while the untyped call stays
+      // shallow everywhere.
+      const found = await withDb(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient;
+          return yield* sql.unsafe(
+            `SELECT id, email, name, banned, role, createdAt FROM "user"`
+          );
+        })
       );
+      // SAFETY: the column list mirrors DbUser and D1 returns plain row
+      // objects.
+      const rows = found as DbUser[];
+      const users = rows.map((row) => asUserRow(row));
       users.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
       return users.slice(0, 200);
     } catch (error) {

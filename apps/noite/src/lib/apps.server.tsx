@@ -83,7 +83,7 @@ const requestOrigin = (request: Request): string | undefined => {
   }
 };
 
-const sessionUser = async (): Promise<SessionUser> => {
+export const sessionUser = async (): Promise<SessionUser> => {
   const request = useRequest();
   const env = useEnv<KitEnv>() ?? process.env;
   await ensureDbPromise();
@@ -167,6 +167,56 @@ export const remove = action(
       }
       failUnknown(error);
     }
+  }),
+  { error: AuthError }
+);
+
+const CreateApiKey = Schema.Struct({
+  appManagement: Schema.Boolean,
+  events: Schema.Boolean,
+  name: Schema.String,
+});
+
+/** Profile API key with machine scopes. Permissions are server-only in
+ * better-auth, so creation goes through this action (the client SDK
+ * cannot set them). Returns the raw key once — the UI shows it once,
+ * like the client flow did. */
+export const createApiKey = action(
+  checkedSchema(CreateApiKey, async ({ appManagement, events, name }) => {
+    const user = await sessionUser();
+    const label = name.trim();
+    if (!label) {
+      failAction("Name is required");
+    }
+    if (!appManagement && !events) {
+      failAction("Select at least one scope");
+    }
+    const permissions: Record<string, string[]> = {};
+    if (appManagement) {
+      permissions.apps = ["manage"];
+    }
+    if (events) {
+      permissions.events = ["push"];
+    }
+    const request = useRequest();
+    const env = useEnv<KitEnv>() ?? process.env;
+    const origin = requestOrigin(request);
+    if (!origin) {
+      throw new UnauthorizedError({ message: "Sign in required" });
+    }
+    const auth = authFromEnv(
+      // SAFETY: the ALS env (or process.env fallback) provides the same KitEnv control keys used by every action.
+      env as KitEnv,
+      origin
+    );
+    const created = await auth.api.createApiKey({
+      body: { name: label, permissions, userId: user.id },
+    });
+    const key = created?.key;
+    if (!key) {
+      failAction("Failed to create API key");
+    }
+    return { key };
   }),
   { error: AuthError }
 );
@@ -435,35 +485,6 @@ const R2GetArgs = Schema.Struct({
   bucket: Schema.String,
   key: Schema.String,
 });
-
-/** D1 databases + DO classes across all of the user's apps. */
-export const listAllStorage = action(
-  async () => {
-    const user = await sessionUser();
-    const apps = await withDb(listAppsForCollaborator(user.id));
-    const all: Awaited<ReturnType<typeof runnerStorage>> = [];
-    const live = apps.filter(
-      (app) => app.status !== "deleting" && app.status !== "gone"
-    );
-    const got = await Promise.all(
-      live.map(async (app) => {
-        try {
-          return await runnerStorage(app.id);
-        } catch {
-          // no deployed source yet for this app — skip
-          return [];
-        }
-      })
-    );
-    for (const items of got) {
-      all.push(...items);
-    }
-    return all;
-  },
-  {
-    error: AuthError,
-  }
-);
 
 /** D1 databases + DO classes declared by an app's deployed config. */
 export const listAppStorage = action(

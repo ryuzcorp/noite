@@ -1,7 +1,9 @@
 import { navigate } from "@ilha/router";
 import { atom, watch } from "ilha";
 
+import { createApiKey } from "./apps.server";
 import { authClient } from "./auth-client";
+import { formatDateTime } from "./dates";
 import { SectionSkeleton } from "./skeletons";
 
 interface ApiKeyRow {
@@ -11,21 +13,36 @@ interface ApiKeyRow {
   prefix: string | null;
   enabled: boolean;
   createdAt: Date | string;
+  permissions: Record<string, string[]> | null;
 }
 
-const formatCreated = (value: Date | string): string => {
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "—";
+/** Display label for a machine scope key. Unknown keys pass through raw. */
+const scopeLabel = (key: string): string => {
+  if (key === "apps") {
+    return "App Management";
   }
-  return date.toLocaleString();
+  if (key === "events") {
+    return "Events";
+  }
+  return key;
+};
+
+/** Human scope badges for a key (`Full access` predates scoped keys). */
+const scopeBadges = (
+  permissions: Record<string, string[]> | null
+): string[] => {
+  if (!permissions) {
+    return ["Full access"];
+  }
+  const badges = Object.keys(permissions).map(scopeLabel);
+  return badges.length > 0 ? badges : ["Full access"];
 };
 
 /** Create / list / revoke Better Auth API keys (Git push password). */
 export const ProfilePanel = () => {
   const ready = atom(false);
   const busy = atom(false);
-  const error = atom("");
+  const keyError = atom("");
   const keys = atom<ApiKeyRow[]>([]);
   const freshKey = atom<string | null>(null);
   const keyModal = atom(false);
@@ -38,7 +55,7 @@ export const ProfilePanel = () => {
       query: { limit: 50, sortBy: "createdAt", sortDirection: "desc" },
     });
     if (result.error) {
-      error.set(result.error.message ?? "Failed to list API keys");
+      keyError.set(result.error.message ?? "Failed to list API keys");
       return;
     }
     keys.set(result.data?.apiKeys ?? []);
@@ -71,38 +88,46 @@ export const ProfilePanel = () => {
 
   const createKey = async (event: SubmitEvent) => {
     event.preventDefault();
-    // Read the name from the DOM: the input is uncontrolled so typing
-    // never re-renders (and blurs) the field.
+    // Read the form from the DOM: inputs are uncontrolled so typing
+    // never re-renders (and blurs) the fields.
     const input = document.querySelector("#key-name");
     const label = input instanceof HTMLInputElement ? input.value.trim() : "";
     if (!label) {
-      error.set("Name is required");
+      keyError.set("Name is required");
       return;
     }
+    const appsBox = document.querySelector("#scope-apps");
+    const eventsBox = document.querySelector("#scope-events");
+    const appManagement =
+      !(appsBox instanceof HTMLInputElement) || appsBox.checked;
+    const events =
+      !(eventsBox instanceof HTMLInputElement) || eventsBox.checked;
     busy.set(true);
-    error.set("");
+    keyError.set("");
     freshKey.set(null);
-    const result = await authClient.apiKey.create({ name: label });
-    busy.set(false);
-    if (result.error) {
-      error.set(result.error.message ?? "Failed to create API key");
-      return;
-    }
-    const key = result.data?.key;
-    if (key) {
+    try {
+      const { key } = await createApiKey({
+        appManagement,
+        events,
+        name: label,
+      });
       freshKey.set(key);
+      keyModal.set(false);
+      await reload();
+    } catch (error) {
+      keyError.set(error instanceof Error ? error.message : String(error));
+    } finally {
+      busy.set(false);
     }
-    keyModal.set(false);
-    await reload();
   };
 
   const revoke = async (keyId: string) => {
     busy.set(true);
-    error.set("");
+    keyError.set("");
     const result = await authClient.apiKey.delete({ keyId });
     busy.set(false);
     if (result.error) {
-      error.set(result.error.message ?? "Failed to revoke API key");
+      keyError.set(result.error.message ?? "Failed to revoke API key");
       return;
     }
     if (freshKey()) {
@@ -197,7 +222,13 @@ export const ProfilePanel = () => {
               if (input instanceof HTMLInputElement) {
                 input.value = "";
               }
-              error.set("");
+              for (const id of ["#scope-apps", "#scope-events"]) {
+                const box = document.querySelector(id);
+                if (box instanceof HTMLInputElement) {
+                  box.checked = true;
+                }
+              }
+              keyError.set("");
               keyModal.set(true);
             }}
           >
@@ -207,12 +238,33 @@ export const ProfilePanel = () => {
         <p class="m-0 text-sm opacity-80">
           Use a key as the Git HTTPS password (<code>username=git</code>). Push
           requires collaborator <code>push</code> or <code>admin</code> on that
-          app.
+          app. Events-only keys can't push code.
         </p>
         <div class={`modal ${keyModal() ? "modal-open" : ""}`}>
           <div class="modal-box bg-base-100 dark:bg-base-200">
             <h3 class="m-0 text-lg font-bold">Create API key</h3>
             <form onsubmit={createKey}>
+              <fieldset class="fieldset w-full">
+                <span class="label">Scopes</span>
+                <label class="flex cursor-pointer items-center gap-2 text-sm">
+                  <input
+                    id="scope-apps"
+                    type="checkbox"
+                    class="checkbox checkbox-sm"
+                    checked
+                  />
+                  App Management — git push, deploys, variables
+                </label>
+                <label class="flex cursor-pointer items-center gap-2 text-sm">
+                  <input
+                    id="scope-events"
+                    type="checkbox"
+                    class="checkbox checkbox-sm"
+                    checked
+                  />
+                  Events — publish to the event API
+                </label>
+              </fieldset>
               <fieldset class="fieldset w-full">
                 <label class="label" for="key-name">
                   Name
@@ -228,8 +280,8 @@ export const ProfilePanel = () => {
                   required
                 />
               </fieldset>
-              {error() ? (
-                <p class="text-error m-0 py-2 text-sm">{error()}</p>
+              {keyError() ? (
+                <p class="text-error m-0 py-2 text-sm">{keyError()}</p>
               ) : null}
               <div class="modal-action">
                 <button
@@ -270,7 +322,7 @@ export const ProfilePanel = () => {
             <code class="break-all">{freshKey()}</code>
           </div>
         ) : null}
-        {error() ? <p class="text-error m-0 text-sm">{error()}</p> : null}
+        {keyError() ? <p class="text-error m-0 text-sm">{keyError()}</p> : null}
         {keys().length === 0 ? (
           <p class="m-0 text-sm opacity-70">No API keys yet.</p>
         ) : (
@@ -284,8 +336,15 @@ export const ProfilePanel = () => {
                   <span class="font-medium">{row.name ?? "unnamed"}</span>
                   <span class="text-xs opacity-70">
                     {row.start ?? row.prefix ?? "••••"} ·{" "}
-                    {formatCreated(row.createdAt)}
+                    {formatDateTime(row.createdAt)}
                     {row.enabled ? "" : " · disabled"}
+                  </span>
+                  <span class="flex flex-wrap gap-1">
+                    {scopeBadges(row.permissions).map((label) => (
+                      <span key={label} class="badge badge-ghost badge-sm">
+                        {label}
+                      </span>
+                    ))}
                   </span>
                 </div>
                 <button

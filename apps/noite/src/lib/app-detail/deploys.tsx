@@ -2,6 +2,7 @@
 import { atom, unsafe, watch } from "ilha";
 
 import { get, rollback } from "../apps.server";
+import { formatDateTime } from "../dates";
 import type { Deploy } from "../db";
 import { ListSkeleton } from "../skeletons";
 import { readSwrCache, writeSwrCache } from "../swr-cache";
@@ -172,7 +173,7 @@ const DeployRow = ({
             {d.sha ? d.sha.slice(0, 12) : "—"}
           </div>
           <div class="text-base-content/70 text-xs">
-            {new Date(d.createdAt).toLocaleString()}
+            {formatDateTime(d.createdAt)}
           </div>
         </div>
         {rollError() ? (

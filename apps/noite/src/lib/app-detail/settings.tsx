@@ -2,6 +2,7 @@
 import { navigate, useRoute } from "@ilha/router";
 import { atom, watch } from "ilha";
 
+import { appHost } from "../apps";
 import {
   deleteEnv,
   envDotVars,
@@ -120,8 +121,8 @@ const CollaboratorsPanel = ({
           ) : null}
         </div>
         <p class="m-0 text-sm opacity-80">
-          Roles: <code>view</code> read · <code>push</code> deploy/token ·{" "}
-          <code>admin</code> invite &amp; delete.
+          Roles: <code>view</code> read-only · <code>push</code> deploy, push
+          code, write data · <code>admin</code> members, variables, delete.
         </p>
         {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
         {!loaded() && rows().length === 0 && !err() ? (
@@ -200,9 +201,9 @@ const CollaboratorsPanel = ({
           <div class="modal-box bg-base-100 dark:bg-base-200">
             <h3 class="m-0 text-lg font-bold">Invite collaborator</h3>
             <p class="m-0 py-2 text-sm opacity-80">
-              They sign in with the invited email address — roles:{" "}
-              <code>view</code> read · <code>push</code> deploy/token ·{" "}
-              <code>admin</code> invite &amp; delete.
+              They join by signing in with this email address. Roles:{" "}
+              <code>view</code> read-only · <code>push</code> deploy, push code,
+              write data · <code>admin</code> members, variables, delete.
             </p>
             <div class="flex flex-wrap items-end gap-2">
               <fieldset class="fieldset min-w-48 flex-1">
@@ -269,7 +270,7 @@ const CollaboratorsPanel = ({
 const setSlugPreview = (value: string) => {
   const preview = document.querySelector("#slug-preview");
   if (preview) {
-    preview.textContent = `${value || "…"}.localhost`;
+    preview.textContent = appHost(`${value || "…"}.localhost`);
   }
 };
 
@@ -318,7 +319,9 @@ const CustomDomainSection = () => {
     <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
       <div class="card-body gap-4">
         <h3 class="m-0 text-lg font-semibold">Custom Domain</h3>
-        {note() ? <p class="m-0 text-sm opacity-70">{note()}</p> : null}
+        <p class="m-0 text-sm opacity-70">
+          Serve this app from your own hostname.
+        </p>
         <fieldset class="fieldset w-full">
           <label class="label" for="custom-domain-hostname">
             Hostname
@@ -341,7 +344,7 @@ const CustomDomainSection = () => {
             onclick={() => {
               note.set(
                 hostname().trim()
-                  ? `Custom domain ${hostname().trim()} is not wired yet — coming soon.`
+                  ? "Custom domains aren't available yet — nothing was saved."
                   : "Enter a hostname first."
               );
             }}
@@ -500,11 +503,11 @@ const AppIdentityForm = ({
           <div class="modal-box bg-base-100 dark:bg-base-200">
             <h3 class="m-0 text-lg font-bold">Change slug?</h3>
             <p class="m-0 py-2 text-sm opacity-80">
-              This renames the app everywhere: the internal URL becomes{" "}
+              This renames the app everywhere: the app URL becomes{" "}
               <code id="slug-preview">{slug}.localhost</code> and the git origin
-              moves with it — update your local remote (`git remote set-url`)
-              and any bookmarks. The fleet keeps running; deploys are blocked
-              while the move completes.
+              moves to the new slug — update your local remote (`git remote
+              set-url`) and any bookmarks. The fleet keeps running; deploys are
+              blocked while the move completes.
             </p>
             <fieldset class="fieldset w-full">
               <label class="label" for="slug-input">
@@ -710,16 +713,16 @@ const EnvVarsPanel = ({
           ) : null}
         </div>
         <p class="m-0 text-sm opacity-70">
-          Secrets (API keys) and flags live here together. Names starting with{" "}
-          <code>FLAG_</code> act as on/off toggles and reach the app as{" "}
-          <code>1</code>/<code>0</code> on the next deploy.
+          Variables reach the build, the release command, and the fleet. Values
+          are hidden after saving; names starting with <code>FLAG_</code> render
+          as on/off toggles (<code>1</code>/<code>0</code>).
         </p>
         {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
         {loaded() ? null : <ListSkeleton rows={2} />}
         {loaded() && rows().length === 0 ? (
           <p class="m-0 text-sm opacity-70">
-            No vars yet. They reach the build, the release command, and the
-            fleet.
+            No variables yet — add one to configure the build, the release
+            command, or the fleet.
           </p>
         ) : null}
         {loaded() && rows().length > 0 ? (
@@ -787,14 +790,17 @@ const EnvVarsPanel = ({
           </ul>
         ) : null}
         {isAdmin ? null : (
-          <p class="m-0 text-sm opacity-70">Only admins can change vars.</p>
+          <p class="m-0 text-sm opacity-70">
+            Only admins can add or remove variables.
+          </p>
         )}
         <div class={`modal ${dialogOpen() ? "modal-open" : ""}`}>
           <div class="modal-box bg-base-100 dark:bg-base-200">
             <h3 class="m-0 text-lg font-bold">Add Variable</h3>
             <p class="m-0 py-2 text-sm opacity-80">
-              Names starting with <code>FLAG_</code> are saved as boolean
-              feature flags — toggle them in the list.
+              Names starting with <code>FLAG_</code> become on/off toggles in
+              the list. Other values are hidden after saving and can't be viewed
+              again.
             </p>
             <fieldset class="fieldset w-full">
               <label class="label" for="newvar-name">

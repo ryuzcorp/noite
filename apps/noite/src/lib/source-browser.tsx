@@ -45,13 +45,15 @@ const sortTreePaths = (paths: string[]): string[] =>
     const bs = b.split("/");
     const len = Math.min(as.length, bs.length);
     for (let i = 0; i < len; i += 1) {
-      if (as[i] !== bs[i]) {
+      const charA = as[i] ?? "";
+      const charB = bs[i] ?? "";
+      if (charA !== charB) {
         const aIsDir = i < as.length - 1;
         const bIsDir = i < bs.length - 1;
         if (aIsDir !== bIsDir) {
           return aIsDir ? -1 : 1;
         }
-        return as[i] < bs[i] ? -1 : 1;
+        return charA < charB ? -1 : 1;
       }
     }
     return as.length - bs.length;

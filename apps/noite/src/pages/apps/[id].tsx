@@ -1,4 +1,5 @@
 import { DeployList, DeployDropdown } from "$lib/app-detail/deploys";
+import { EventsPanel } from "$lib/app-detail/events";
 import { CODE_SVG } from "$lib/app-detail/icons";
 import { MetricsCard } from "$lib/app-detail/metrics";
 import { AppDetailPanel } from "$lib/app-detail/panel";
@@ -11,6 +12,7 @@ const TABS = [
   { id: "overview", label: "Overview" },
   { id: "deployments", label: "Deployments" },
   { id: "metrics", label: "Metrics" },
+  { id: "events", label: "Events" },
   { id: "settings", label: "Settings" },
 ] as const;
 
@@ -89,7 +91,6 @@ export default function AppPage() {
           )}
         </>
       ) : null}
-      {activeTab() === "settings" ? <AppSettingsPanel /> : null}
       {activeTab() === "metrics" ? (
         <>
           {appId ? (
@@ -99,6 +100,16 @@ export default function AppPage() {
           )}
         </>
       ) : null}
+      {activeTab() === "events" ? (
+        <>
+          {appId ? (
+            <EventsPanel appId={appId} />
+          ) : (
+            <p class="m-0 text-sm opacity-70">Missing app id.</p>
+          )}
+        </>
+      ) : null}
+      {activeTab() === "settings" ? <AppSettingsPanel /> : null}
     </div>
   );
 }

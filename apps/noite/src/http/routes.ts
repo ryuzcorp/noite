@@ -11,7 +11,13 @@ import {
   withLiveRunner,
 } from "../lib/collaborators";
 import { ensureDbPromise, withDb } from "../lib/db";
-import type { RunnerMetric, RunnerSpan } from "../lib/runner";
+import type {
+  RunnerDevice,
+  RunnerMetric,
+  RunnerPath,
+  RunnerRef,
+  RunnerSpan,
+} from "../lib/runner";
 
 type RouteHandler = (
   request: Request,
@@ -125,7 +131,9 @@ const handleGitAuth: RouteHandler = async (request, env) => {
       env,
       env.BETTER_AUTH_URL ?? new URL(request.url).origin
     );
-    const verified = await auth.api.verifyApiKey({ body: { key } });
+    const verified = await auth.api.verifyApiKey({
+      body: { key, permissions: { apps: ["manage"] } },
+    });
     if (!(verified.valid && verified.key?.referenceId)) {
       return Response.json(
         { error: "invalid key", ok: false },
@@ -236,6 +244,68 @@ const runnerConfig = (
     "http://runner:8080"
   ).replace(/\/$/u, "");
   return { runner, token };
+};
+
+/** Machine ingest for tenant apps (LogSnag-style event API): Bearer
+ * profile API key + push role on the app, then forward the JSON body to
+ * the runner untouched so validation errors pass through with their
+ * status codes. External callers use the control origin + `/api` path
+ * (api.* routes to the runner, which knows no API keys). */
+const INGEST_KINDS = new Set(["events", "identify", "insights"]);
+const forwardIngest: RouteHandler = async (request, env, params) => {
+  const appId = params?.appId?.trim() ?? "";
+  const kind = params?.kind?.trim() ?? "";
+  if (!appId || !INGEST_KINDS.has(kind)) {
+    return new Response(
+      "app and endpoint (events|identify|insights) required",
+      { status: 400 }
+    );
+  }
+  const key = (request.headers.get("authorization") ?? "")
+    .replace(/^Bearer /u, "")
+    .trim();
+  if (!key) {
+    return new Response("bearer token required", { status: 401 });
+  }
+  await ensureDbPromise();
+  try {
+    const auth = authFromEnv(
+      env,
+      env.BETTER_AUTH_URL ?? new URL(request.url).origin
+    );
+    const verified = await auth.api.verifyApiKey({
+      body: { key, permissions: { events: ["push"] } },
+    });
+    if (!(verified.valid && verified.key?.referenceId)) {
+      return new Response("invalid key", { status: 401 });
+    }
+    await requireAppRole(appId, verified.key.referenceId, "push");
+  } catch (error) {
+    if (error instanceof MissingAuthSecretError) {
+      return new Response(error.message, { status: 500 });
+    }
+    return new Response("forbidden", { status: 403 });
+  }
+  const rc = runnerConfig(env);
+  if (!rc) {
+    return new Response("RUNNER_TOKEN is not configured", { status: 500 });
+  }
+  const upstream = await fetch(
+    `${rc.runner}/v1/apps/${encodeURIComponent(appId)}/${kind}`,
+    {
+      body: await request.text(),
+      headers: {
+        authorization: `Bearer ${rc.token}`,
+        "content-type": "application/json",
+      },
+      method: "POST",
+      signal: AbortSignal.timeout(10_000),
+    }
+  );
+  return new Response(await upstream.text(), {
+    headers: { "content-type": "application/json" },
+    status: upstream.status,
+  });
 };
 
 /** Browser download for one R2 object: session + view-role gate, then proxy
@@ -421,29 +491,50 @@ const handleMetricsStream: RouteHandler = async (request, env, params) => {
         let frame: string | null = null;
         try {
           // oxlint-disable-next-line eslint/no-await-in-loop -- one poll per cycle; parallel polls would race change detection
-          const [mRes, sRes] = await Promise.all([
+          const [mRes, sRes, dRes, pRes, rRes] = await Promise.all([
             fetch(`${base}/metrics?hours=24`, { headers: auth }),
             fetch(`${base}/spans?hours=1`, { headers: auth }),
+            fetch(`${base}/devices?hours=24`, { headers: auth }),
+            fetch(`${base}/paths?hours=24`, { headers: auth }),
+            fetch(`${base}/refs?hours=24`, { headers: auth }),
           ]);
-          if (!mRes.ok || !sRes.ok) {
-            throw new Error(`runner metrics ${mRes.status}/${sRes.status}`);
+          if (!mRes.ok || !sRes.ok || !dRes.ok || !pRes.ok || !rRes.ok) {
+            throw new Error(
+              `runner metrics ${mRes.status}/${sRes.status}/${dRes.status}/${pRes.status}/${rRes.status}`
+            );
           }
-          // oxlint-disable-next-line eslint/no-await-in-loop -- same single poll, bodies read together
-          const [mJson, sJson]: unknown[] = await Promise.all([
-            mRes.json(),
-            sRes.json(),
-          ]);
-          if (!Array.isArray(mJson) || !Array.isArray(sJson)) {
+          const [mJson, sJson, dJson, pJson, rJson]: unknown[] =
+            // oxlint-disable-next-line eslint/no-await-in-loop -- same single poll, bodies read together
+            await Promise.all([
+              mRes.json(),
+              sRes.json(),
+              dRes.json(),
+              pRes.json(),
+              rRes.json(),
+            ]);
+          if (
+            !Array.isArray(mJson) ||
+            !Array.isArray(sJson) ||
+            !Array.isArray(dJson) ||
+            !Array.isArray(pJson) ||
+            !Array.isArray(rJson)
+          ) {
             throw new TypeError("runner metrics sent invalid data");
           }
           // SAFETY: mJson passed Array.isArray above; rows match the retired unary action shape.
           const metrics = mJson as RunnerMetric[];
           // SAFETY: sJson passed Array.isArray above; entries flow only into the SSE frame.
           const spans = sJson as RunnerSpan[];
+          // SAFETY: dJson passed Array.isArray above; entries flow only into the SSE frame.
+          const devices = dJson as RunnerDevice[];
+          // SAFETY: pJson passed Array.isArray above; entries flow only into the SSE frame.
+          const paths = pJson as RunnerPath[];
+          // SAFETY: rJson passed Array.isArray above; entries flow only into the SSE frame.
+          const refs = rJson as RunnerRef[];
           const total = metrics.reduce((a, r) => a + r.requests, 0);
           if (total !== lastReq) {
             lastReq = total;
-            frame = JSON.stringify({ metrics, spans });
+            frame = JSON.stringify({ devices, metrics, paths, refs, spans });
           }
         } catch (error) {
           // Transient failure: log it; the heartbeat below keeps the
@@ -494,6 +585,7 @@ router.on("GET", "/api/apps/:appId/logs/stream", handleLogsStream);
 router.on("GET", "/api/apps/:appId/deploys/stream", handleDeploysStream);
 router.on("GET", "/api/apps/stream", handleAppsStream);
 router.on("GET", "/api/apps/:appId/metrics/stream", handleMetricsStream);
+router.on("POST", "/api/apps/:appId/ingest/:kind", forwardIngest);
 router.all("/api/auth", handleAuth);
 router.all("/api/auth/*", handleAuth);
 

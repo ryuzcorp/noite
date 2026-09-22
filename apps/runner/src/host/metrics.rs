@@ -18,6 +18,7 @@ use sqlx::SqlitePool;
 
 use crate::config::Config;
 use crate::db;
+use crate::host::accesslog;
 use crate::host::cmd;
 use crate::host::supervisor::ProcMap;
 use crate::models::{App, AppStatus};
@@ -392,7 +393,13 @@ pub async fn tick(
         }
     }
 
-    // 3. Persist minute buckets.
+    // 3. Caddy access log → device families. Never fails the tick: a missing
+    //    log (Caddy not yet reloaded) or a corrupt line is a silent skip.
+    if let Err(e) = accesslog::tick(pool, cfg, &slug_id).await {
+        tracing::warn!(error = %e, "access_log");
+    }
+
+    // 4. Persist minute buckets.
     for ((id, bucket), a) in &acc {
         if a.req > 0 || a.err > 0 || a.cpu_ms > 0 {
             db::add_app_metric(pool, &id, &bucket, a.req, a.err, a.lat_ms, a.cpu_ms)
@@ -400,7 +407,7 @@ pub async fn tick(
         }
     }
 
-    // 4. Prune old buckets occasionally (~every 100 ticks).
+    // 5. Prune old buckets occasionally (~every 100 ticks).
     if state.tick % 100 == 0 {
         let cutoff = (Utc::now() - chrono::Duration::days(14))
             .format("%Y-%m-%dT%H:%M:00Z")
@@ -408,6 +415,21 @@ pub async fn tick(
         if let Ok(n) = db::prune_app_metrics(pool, &cutoff).await {
             if n > 0 {
                 tracing::info!(pruned = n, "pruned old app metrics");
+            }
+        }
+        if let Ok(n) = db::prune_app_devices(pool, &cutoff).await {
+            if n > 0 {
+                tracing::info!(pruned = n, "pruned old device stats");
+            }
+        }
+        if let Ok(n) = db::prune_app_paths(pool, &cutoff).await {
+            if n > 0 {
+                tracing::info!(pruned = n, "pruned old path stats");
+            }
+        }
+        if let Ok(n) = db::prune_app_refs(pool, &cutoff).await {
+            if n > 0 {
+                tracing::info!(pruned = n, "pruned old ref stats");
             }
         }
     }

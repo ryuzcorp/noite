@@ -43,6 +43,66 @@ pub async fn app_metrics(
     }
 }
 
+pub async fn app_devices(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<MetricsQuery>,
+) -> impl IntoResponse {
+    match db::get_app(&state.pool, &id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return ApiError::not_found("app not found").into_response(),
+        Err(e) => return ApiError::internal(e.to_string()).into_response(),
+    }
+    let hours = q.hours.unwrap_or(24).clamp(1, 336);
+    let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
+        .format("%Y-%m-%dT%H:00:00Z")
+        .to_string();
+    match db::list_app_devices(&state.pool, &id, &since).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => ApiError::internal(e.to_string()).into_response(),
+    }
+}
+
+pub async fn app_paths(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<MetricsQuery>,
+) -> impl IntoResponse {
+    match db::get_app(&state.pool, &id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return ApiError::not_found("app not found").into_response(),
+        Err(e) => return ApiError::internal(e.to_string()).into_response(),
+    }
+    let hours = q.hours.unwrap_or(24).clamp(1, 336);
+    let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
+        .format("%Y-%m-%dT%H:00:00Z")
+        .to_string();
+    match db::list_app_paths(&state.pool, &id, &since).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => ApiError::internal(e.to_string()).into_response(),
+    }
+}
+
+pub async fn app_refs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<MetricsQuery>,
+) -> impl IntoResponse {
+    match db::get_app(&state.pool, &id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return ApiError::not_found("app not found").into_response(),
+        Err(e) => return ApiError::internal(e.to_string()).into_response(),
+    }
+    let hours = q.hours.unwrap_or(24).clamp(1, 336);
+    let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
+        .format("%Y-%m-%dT%H:00:00Z")
+        .to_string();
+    match db::list_app_refs(&state.pool, &id, &since).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => ApiError::internal(e.to_string()).into_response(),
+    }
+}
+
 pub async fn app_spans(
     State(state): State<AppState>,
     Path(id): Path<String>,

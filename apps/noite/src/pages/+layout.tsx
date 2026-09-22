@@ -19,8 +19,6 @@ const lucideIcon = (body: string): string =>
 
 const LAYOUT_LIST =
   '<rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/><path d="M14 4h7m-7 5h7m-7 6h7m-7 5h7"/>';
-const HARD_DRIVE =
-  '<path d="M10 16h.01m-7.798-4.423a2 2 0 0 0-.212.896V18a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5.527a2 2 0 0 0-.212-.896L18.55 5.11A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11zm19.734.436H2.054M6 16h.01"/>';
 
 const signOut = async () => {
   clearSessionCache();
@@ -102,17 +100,6 @@ export default defineLayout(({ children }) => {
                 >
                   {unsafe(lucideIcon(LAYOUT_LIST))}
                   Apps
-                </a>
-              </li>
-              <li>
-                <a
-                  href="/storage"
-                  class={
-                    path().startsWith("/storage") ? "menu-active" : undefined
-                  }
-                >
-                  {unsafe(lucideIcon(HARD_DRIVE))}
-                  Storage
                 </a>
               </li>
             </ul>

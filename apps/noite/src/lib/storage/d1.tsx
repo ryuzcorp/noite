@@ -19,6 +19,7 @@ import type { AppDetailInfo } from "../app-detail/panel";
 import { d1Write, get } from "../apps.server";
 import type { D1Preview } from "../runner";
 import { readSwrCache, writeSwrCache } from "../swr-cache";
+import { StorageTopCard } from "./list";
 
 /** celld d1 prints each result set as a space-padded table: a header line,
  * a rule line of dashes, then the data rows. Turn that into columns + rows
@@ -36,7 +37,7 @@ const parseTable = (text: string): ParsedTable => {
   if (lines.length === 0) {
     return { columns: [], rows: [] };
   }
-  const columns = lines[0].trim().split(/\s+/u);
+  const columns = (lines[0] ?? "").trim().split(/\s+/u);
   const rows: string[][] = [];
   for (const line of lines.slice(1)) {
     // The dashes rule under the header carries no data.
@@ -928,6 +929,7 @@ export const D1DetailPanel = ({
   // Collaborator role for write UI (fail-closed until confirmed).
   const seedDetail = readSwrCache<AppDetailInfo>(`app:${appId}:detail`);
   const myRole = atom(seedDetail?.myRole ?? null);
+  const appName = atom(seedDetail?.app.name ?? "");
   // Create/edit drawer state (table/schema resolve from the selection).
   const drawer = atom<null | {
     mode: "create" | "edit";
@@ -939,6 +941,7 @@ export const D1DetailPanel = ({
       try {
         const info = await get(appId);
         myRole.set(info.myRole);
+        appName.set(info.app.name);
         writeSwrCache(`app:${appId}:detail`, info);
       } catch {
         // Role stays at its seed; write UI stays hidden without push/admin.
@@ -976,51 +979,51 @@ export const D1DetailPanel = ({
   const activeDrawer = drawer();
   return (
     <div class="flex flex-col gap-4">
-      <div>
-        <div class="flex items-center gap-2">
-          <span class="badge">D1</span>
-          <h1 class="m-0 text-lg font-semibold">{databaseId}</h1>
-        </div>
-        <p class="m-0 text-sm opacity-70">{tables.length} table(s)</p>
-      </div>
-      {tables.length === 0 ? (
-        <p class="m-0 text-sm opacity-70">(no tables)</p>
-      ) : (
-        <div class="flex flex-wrap items-center justify-between gap-2">
-          <fieldset class="fieldset w-64">
-            <label class="label" for="d1-table-picker">
-              Table
-            </label>
-            <select
-              id="d1-table-picker"
-              class="select select-sm"
-              onchange={(e) => {
-                const el = e.currentTarget;
-                if (el instanceof HTMLSelectElement) {
-                  switchTable(el.value);
-                }
-              }}
-            >
-              {tables.map((t) => (
-                <option key={t} value={t} selected={t === current}>
-                  {t}
-                </option>
-              ))}
-            </select>
-          </fieldset>
-          {canWrite ? (
-            <button
-              type="button"
-              class="btn btn-sm btn-neutral"
-              onclick={() => {
-                drawer.set({ mode: "create", row: null });
-              }}
-            >
-              Add entry
-            </button>
-          ) : null}
-        </div>
-      )}
+      <StorageTopCard
+        actions={
+          tables.length === 0 ? (
+            <p class="m-0 text-sm opacity-70">(no tables)</p>
+          ) : (
+            [
+              <fieldset key="picker" class="fieldset w-64">
+                <select
+                  aria-label="Table"
+                  class="select select-sm"
+                  onchange={(e) => {
+                    const el = e.currentTarget;
+                    if (el instanceof HTMLSelectElement) {
+                      switchTable(el.value);
+                    }
+                  }}
+                >
+                  {tables.map((t) => (
+                    <option key={t} value={t} selected={t === current}>
+                      {t}
+                    </option>
+                  ))}
+                </select>
+              </fieldset>,
+              canWrite ? (
+                <button
+                  key="add"
+                  type="button"
+                  class="btn btn-sm btn-neutral"
+                  onclick={() => {
+                    drawer.set({ mode: "create", row: null });
+                  }}
+                >
+                  Add entry
+                </button>
+              ) : null,
+            ]
+          )
+        }
+        appId={appId}
+        appName={appName()}
+        badge="D1"
+        subtitle={`${tables.length} table(s)`}
+        title={databaseId}
+      />
       {current ? (
         <D1TablePanel
           key={current}

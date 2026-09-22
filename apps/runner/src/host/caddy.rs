@@ -70,9 +70,15 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
     // them at site level and then keeps serving the stale config.
     let mut push_block = |addr: &str, tls: bool, site_extra: &[&str], proxy_extra: &[&str], upstream: &str| {
         lines.push(format!("{addr} {{"));
-        // Access log per site (method/host/status/bytes/upstream) — the
-        // edge is otherwise a black box when a route misbehaves.
-        lines.push("\tlog".into());
+        // Access log per site as JSON into the shared file (same volume as
+        // the Caddyfile), feeding the runner's device breakdown. Tradeoff:
+        // per-request lines leave `docker logs` (Caddy process logs like
+        // reloads and errors still go to stdout); tail them via
+        // `podman exec <caddy> tail -f /etc/caddy/access.log` instead.
+        lines.push("\tlog {".into());
+        lines.push("\t\toutput file /etc/caddy/access.log".into());
+        lines.push("\t\tformat json".into());
+        lines.push("\t}".into());
         if tls {
             lines.push("\ttls {".into());
             lines.push("\t\ton_demand".into());

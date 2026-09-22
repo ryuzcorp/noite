@@ -75,9 +75,9 @@ dev-host:
 	@if [ -z "$(HOST_IP)" ]; then echo "error: could not detect LAN IP; retry as \`make dev-host HOST_IP=192.168.x.x\`"; exit 1; fi
 	CONTROL_EXTRA_HOSTS="$${CONTROL_EXTRA_HOSTS:+$$CONTROL_EXTRA_HOSTS,}$(HOST_IP)" $(COMPOSE_DEV) up -d --build rustfs runner control caddy
 	@echo "dev-host — control UI on LAN at http://$(HOST_IP):$${HTTP_PORT:-9080}"
-	@echo "localhost unchanged: http://localhost:$${HTTP_PORT:-9080}  (make logs)"
-
 logs:
+	# Caddy per-request lines live in the shared access.log (device stats),
+	# not stdout: `podman exec noite_caddy_1 tail -f /etc/caddy/access.log`.
 	$(COMPOSE) logs -f runner control rustfs caddy
 
 # Codified tribal checks: stack up, runner healthy + reconciled, API auth,

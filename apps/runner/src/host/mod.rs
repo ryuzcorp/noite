@@ -1,3 +1,4 @@
+pub mod accesslog;
 pub mod caddy;
 pub mod cmd;
 pub mod deploy;

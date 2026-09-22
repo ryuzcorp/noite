@@ -249,6 +249,13 @@ export const ensureDb = Effect.gen(function* ensureDb() {
       yield* sql.unsafe(healed, stmt.parameters);
     }
   }
+  // Pre-scope API keys stored NULL permissions, which fail scoped verification.
+  // Grant them the full set once (matches the plugin defaultPermissions for
+  // new keys); a no-op when every key already carries permissions.
+  yield* sql.unsafe(
+    `UPDATE apikey SET permissions = '{"apps":["manage"],"events":["push"]}' WHERE permissions IS NULL`,
+    []
+  );
   // Instance admin bootstrap (runs once per process at startup): if
   // NOITE_ADMIN_EMAIL names an already-registered account, ensure it
   // holds the admin role. No-op when unset or not yet registered.

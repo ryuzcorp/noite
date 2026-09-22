@@ -537,6 +537,71 @@ async fn dispatch_call(
                 Err(e) => internal(&id, e.to_string()),
             }
         }
+        "events.list" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: String,
+                channel: Option<String>,
+                limit: Option<i64>,
+            }
+            let p: P = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            if app(state, &p.id, &id).await.is_err() {
+                return not_found(&id, "app not found");
+            }
+            let limit = p.limit.unwrap_or(50).clamp(1, 200);
+            let channel = p.channel.as_deref().map(str::trim).filter(|c| !c.is_empty());
+            match db::list_app_events(&state.pool, &p.id, channel, limit).await {
+                Ok(rows) => JsonRpcResponse::success(id, rows),
+                Err(e) => internal(&id, e.to_string()),
+            }
+        }
+        "events.channels" => {
+            let p: IdParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            if app(state, &p.id, &id).await.is_err() {
+                return not_found(&id, "app not found");
+            }
+            match db::list_app_channels(&state.pool, &p.id).await {
+                Ok(rows) => JsonRpcResponse::success(id, rows),
+                Err(e) => internal(&id, e.to_string()),
+            }
+        }
+        "events.insights" => {
+            let p: IdParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            if app(state, &p.id, &id).await.is_err() {
+                return not_found(&id, "app not found");
+            }
+            match db::list_app_insights(&state.pool, &p.id).await {
+                Ok(rows) => JsonRpcResponse::success(id, rows),
+                Err(e) => internal(&id, e.to_string()),
+            }
+        }
+        "events.user_props" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: String,
+                user_id: String,
+            }
+            let p: P = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            if app(state, &p.id, &id).await.is_err() {
+                return not_found(&id, "app not found");
+            }
+            match db::get_app_user_props(&state.pool, &p.id, p.user_id.trim()).await {
+                Ok(row) => JsonRpcResponse::success(id, row),
+                Err(e) => internal(&id, e.to_string()),
+            }
+        }
         "spans.get" => {
             #[derive(Deserialize)]
             struct P {
