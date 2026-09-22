@@ -249,18 +249,53 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
     secret: env.BETTER_AUTH_SECRET,
   });
 
+/** Port of the retired joint image's boot gate: never serve auth with
+ * repo-shipped dev credentials on a real domain. The worker entry is
+ * virtual (no boot hook), so callers run this on first auth construction —
+ * still fail-loud before any session exists. Returns the refusal message,
+ * or null when the credentials may serve. */
+const defaultSecretRefusal = (env: KitEnv, baseURL: string): string | null => {
+  let local = false;
+  try {
+    const host = new URL(baseURL).hostname.toLowerCase();
+    local =
+      host === "localhost" ||
+      host === "127.0.0.1" ||
+      host === "::1" ||
+      host.endsWith(".localhost") ||
+      // mDNS/LAN dev domains (e.g. https://noite.local via the README LAN
+      // setup) are non-routable by definition — never a prod domain.
+      host.endsWith(".local");
+  } catch {
+    local = false;
+  }
+  if (local) {
+    return null;
+  }
+  const secret = env.BETTER_AUTH_SECRET ?? "";
+  if (!secret || secret.startsWith("dev-")) {
+    return `noite: refusing default BETTER_AUTH_SECRET on ${baseURL}`;
+  }
+  return null;
+};
+
 export const authFromEnv = (env: KitEnv, origin: string) => {
   if (!env.BETTER_AUTH_SECRET) {
     throw new MissingAuthSecretError({
       message: "noite: BETTER_AUTH_SECRET is missing",
     });
   }
+  const baseURL = env.BETTER_AUTH_URL ?? origin;
+  const refusal = defaultSecretRefusal(env, baseURL);
+  if (refusal) {
+    throw new MissingAuthSecretError({ message: refusal });
+  }
   return createAuth(
     {
       BETTER_AUTH_SECRET: env.BETTER_AUTH_SECRET,
       BETTER_AUTH_URL: env.BETTER_AUTH_URL,
     },
-    env.BETTER_AUTH_URL ?? origin
+    baseURL
   );
 };
 
@@ -273,12 +308,19 @@ export const authFromEnvEffect = (env: KitEnv, origin: string) =>
         })
       );
     }
+    const baseURL = env.BETTER_AUTH_URL ?? origin;
+    const refusal = defaultSecretRefusal(env, baseURL);
+    if (refusal) {
+      return yield* Effect.fail(
+        new MissingAuthSecretError({ message: refusal })
+      );
+    }
     return createAuth(
       {
         BETTER_AUTH_SECRET: env.BETTER_AUTH_SECRET,
         BETTER_AUTH_URL: env.BETTER_AUTH_URL,
       },
-      env.BETTER_AUTH_URL ?? origin
+      baseURL
     );
   });
 

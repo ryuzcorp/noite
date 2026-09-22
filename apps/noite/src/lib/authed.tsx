@@ -3,6 +3,7 @@ import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
 import { authClient } from "./auth-client";
+import { fetchSession, invalidateSession } from "./session";
 import { DashboardSkeleton } from "./skeletons";
 import { sleep } from "./sleep";
 
@@ -61,8 +62,10 @@ export const Authed = ({
   const impersonatedEmail = atom("");
   const returning = atom(false);
   const returnError = atom("");
-
   watch.once(() => {
+    // Unmount (e.g. the index route bouncing to /login) stops the poll —
+    // an orphaned loop would keep hitting get-session after redirect.
+    let cancelled = false;
     void (async () => {
       // Fast path: verified recently — render instantly, revalidate silently.
       const cached = sessionCache;
@@ -71,7 +74,10 @@ export const Authed = ({
           impersonatedEmail.set(cached.email);
         }
         ready.set(true);
-        const { data } = await authClient.getSession();
+        const { data } = await fetchSession();
+        if (cancelled) {
+          return;
+        }
         if (data?.user) {
           const seen = readImpersonated(data.session, data.user.email);
           sessionCache = {
@@ -91,8 +97,11 @@ export const Authed = ({
       // Slow path (initial load): retry briefly — first paint after
       // register can race the session cookie.
       for (let i = 0; i < 20; i += 1) {
+        if (cancelled) {
+          return;
+        }
         // oxlint-disable-next-line eslint/no-await-in-loop -- sequential cookie-readiness poll; Promise.all would defeat the early-exit
-        const { data } = await authClient.getSession();
+        const { data } = await fetchSession();
         if (data?.user) {
           const seen = readImpersonated(data.session, data.user.email);
           sessionCache = {
@@ -109,10 +118,16 @@ export const Authed = ({
         // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll backoff
         await sleep(50);
       }
+      if (cancelled) {
+        return;
+      }
       // No session: leave nothing dashboard-shaped on screen and bounce.
       denied.set(true);
       navigate("/login");
     })();
+    return () => {
+      cancelled = true;
+    };
   });
 
   const stopImpersonating = async () => {
@@ -127,6 +142,7 @@ export const Authed = ({
         returning.set(false);
         return;
       }
+      invalidateSession();
       navigate("/god-mode");
     } catch (error) {
       returnError.set(error instanceof Error ? error.message : String(error));

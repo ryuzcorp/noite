@@ -28,21 +28,17 @@ const TRUNCATE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CATCHUP_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Caddy writes here (its view of the shared volume); the runner reads the
-/// same file via the Caddyfile's directory.
+/// same file. Single source of truth is `CADDY_ACCESS_LOG`.
 pub fn access_log_path(cfg: &Config) -> PathBuf {
-    let dir = std::path::Path::new(&cfg.caddyfile_path)
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    dir.join("access.log")
+    PathBuf::from(&cfg.caddy_access_log)
 }
 
 fn offset_path(cfg: &Config) -> PathBuf {
-    let dir = std::path::Path::new(&cfg.caddyfile_path)
+    // Legacy name kept so upgrades don't re-ingest the whole file.
+    std::path::Path::new(&cfg.caddy_access_log)
         .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    dir.join("access-log.offset")
+        .map(|p| p.join("access-log.offset"))
+        .unwrap_or_else(|| PathBuf::from("access-log.offset"))
 }
 
 /// Coarse (browser, os) pair for a User-Agent. Order matters: mobile UAs

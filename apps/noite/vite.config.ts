@@ -107,5 +107,13 @@ export default defineConfig({
     allowedHosts: true,
     host: true,
     port: Number(process.env.PORT ?? 8080),
+    // Runtime state lives inside the project root: local D1/R2/DO sqlite
+    // under .wrangler and build output under dist. Every deploy status
+    // write flips those files, and the default watcher (everything except
+    // node_modules/.git) answers with a full document reload. Ignore them —
+    // source edits still HMR normally.
+    watch: {
+      ignored: ["**/.wrangler/**", "**/dist/**"],
+    },
   },
 });

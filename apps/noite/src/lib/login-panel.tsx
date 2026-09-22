@@ -2,6 +2,7 @@ import { navigate } from "@ilha/router";
 import { atom, watch } from "ilha";
 
 import { authClient } from "./auth-client";
+import { fetchSession } from "./session";
 import { sleep } from "./sleep";
 
 const registrationContext = (email: string, name: string) =>
@@ -11,7 +12,7 @@ const registrationContext = (email: string, name: string) =>
 const waitForSession = async (): Promise<void> => {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     // oxlint-disable-next-line eslint/no-await-in-loop -- sequential cookie-readiness poll; Promise.all would defeat the early-exit
-    const session = await authClient.getSession();
+    const session = await fetchSession({ force: true });
     if (session.data?.user) {
       return;
     }
@@ -34,7 +35,7 @@ export const LoginPanel = () => {
 
   watch.once(() => {
     void (async () => {
-      const { data } = await authClient.getSession();
+      const { data } = await fetchSession();
       if (data?.user) {
         navigate("/apps");
       }

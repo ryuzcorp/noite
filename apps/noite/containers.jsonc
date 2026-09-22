@@ -1,0 +1,20 @@
+{
+  // Runner container cell for `celld deploy dist` (Phase 2, behind
+  // RUNNER_TARGET=container). Kept OUT of wrangler.jsonc on purpose:
+  // wrangler (hence `vite dev`) rejects image paths escaping the project
+  // dir, which crash-loops control in dev. `bun run build` resolves `image`
+  // (repo-root-relative here) to an absolute path and injects the entry —
+  // celld-allowed keys only — into dist/wrangler.json (see
+  // scripts/inject-containers.ts). G4 note: oxide 0.5.4 `toCelldWrangler`
+  // strips `containers`, hence the inject instead of a merged key.
+  // NOTE: `//` full-line comments and trailing commas are fine (the inject
+  // script strips both before JSON.parse).
+  "containers": [
+    {
+      "class_name": "RunnerContainer",
+      "image": "./Dockerfile.runner-container",
+      "instance_type": "standard-4",
+      "max_instances": 1,
+    },
+  ],
+}

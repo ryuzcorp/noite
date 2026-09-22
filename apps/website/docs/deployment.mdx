@@ -3,12 +3,12 @@ title: Deployment
 description: Deploy Noite anywhere with Docker Compose — bundled RustFS or your own S3 bucket.
 ---
 
-Noite ships as four containers: **runner** (deploy pipeline, fleet supervisor, Caddyfile owner), **ui** (control plane), **caddy** (edge router), and **storage**. Two storage options, same three app services:
+Noite ships as three services: **control** (control-plane UI plus the Rust runner as a container cell — deploy pipeline, fleet supervisor, route table), **caddy** (static edge router), and **rustfs** (S3 bucket). Two storage options for the fleet bucket:
 
 |  | A: bundled RustFS | B: your own bucket (BYOB) |
 | --- | --- | --- |
 | Compose file | `docker/compose.yaml` | `docker/compose.yaml` + `docker/compose.byob.yaml` |
-| Start | `make up` | `make up-byob` |
+| Start | `make up` | `docker compose -f docker/compose.yaml -f docker/compose.byob.yaml up -d --build control caddy` (with `S3_ENDPOINT` + keys in env) |
 | S3 | RustFS container (`:9000`) | AWS S3 / MinIO / R2 / Ceph — anything SigV4 |
 
 Coolify? Use `docker/compose.coolify.yaml` instead — same stack, generated secrets plus Coolify-managed proxy/secrets. See [Coolify](#coolify) below for the full setup including tenant subdomains.
@@ -17,7 +17,7 @@ Coolify? Use `docker/compose.coolify.yaml` instead — same stack, generated sec
 
 - A server with Docker (or Podman) + Compose.
 - DNS: `app.<domain>` (control UI), `api.<domain>`, `git.<domain>`, plus `*.<domain>` for tenant apps. The apex stays free for your marketing site.
-- Ports 80/443 reachable — Caddy gets certificates automatically (`auto_https`).
+- Ports 80/443 reachable — Caddy terminates per-host TLS itself via on-demand certificates (ask-gated, so only live hosts get certs).
 
 ## A: bundled RustFS
 
@@ -48,8 +48,7 @@ Set `BETTER_AUTH_URL` to the final URL **before** users register — passkeys ar
 S3_ENDPOINT=https://s3.us-east-1.amazonaws.com \
 AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
 NOITE_S3_BUCKET=noite S3_PUBLIC_ENDPOINT=https://s3.us-east-1.amazonaws.com \
-docker compose -f docker/compose.yaml -f docker/compose.byob.yaml up -d --build runner ui caddy
-# or: export the vars above, then `make up-byob`
+docker compose -f docker/compose.yaml -f docker/compose.byob.yaml up -d --build control caddy
 ```
 
 Key requirements: Get/Put/Delete/List on the bucket prefix. `ListAllMyBuckets` is optional (readiness falls back to `HeadBucket`). The bucket is created if the key allows, otherwise create it first. Same production `.env` as option A, minus the `RUSTFS_*` keys.
@@ -57,24 +56,22 @@ Key requirements: Get/Put/Delete/List on the bucket prefix. `ListAllMyBuckets` i
 ## Verify
 
 ```bash
-curl https://api.<domain>/health                    # runner
+curl https://api.<domain>/health                    # edge → worker → runner cell
 curl -s https://api.<domain>/v1/apps -H "Authorization: Bearer $RUNNER_TOKEN"
-make logs                                           # runner + ui + caddy
+make logs                                           # control + rustfs + caddy
 ```
 
 Push the sample app via `apps/noite/test/deploy.sh` (point its remote at `https://git.<domain>/<slug>`) and open `https://<slug>.<domain>`.
 
 ## Coolify
 
-Point a Docker Compose resource at `docker/compose.coolify.yaml` (repo root, branch `main`). In Environment Variables, set the required `BASE_DOMAIN` (secrets auto-generate — just save); `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` derive from it unless overridden. Deploy, then paste the real hostnames once on the `caddy` service Domains field: `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. The apex stays on your marketing site.
+Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `main`) — the same universal file as `make up`, driven by env. In Environment Variables, set `BASE_DOMAIN` to your domain (defaults to `localhost`); `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` derive from it unless overridden. Generate values for `BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY` — nothing auto-generates; the worker refuses dev defaults on real domains. To pull the release image instead of building, set `NOITE_RUNNER_IMAGE=ghcr.io/ryuzcorp/noite-runner:stable` (pinned) or `:latest` (follows main; baked by `.github/workflows/images.yml` from `railpack.json` on every main push — for a private repo, make the package public or add registry auth in Coolify). Deploy, then paste the real hostnames once on the `caddy` service Domains field: `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. The apex stays on your marketing site.
 
 ### Downtime model
 
-Coolify does rolling updates only for single-image apps — **not for Compose**. `docker compose up` stops a service before starting its replacement, so this file minimizes services and recreates: one joint control image (runner+UI, baked by `.github/workflows/images.yml` from `railpack.json` and published to `ghcr.io/ryuzcorp/noite` on every main push — enable the workflow once and, for a private repo, make the package public or add registry auth in Coolify), plus RustFS and Caddy. `pull_policy: always` re-pulls each deploy, and Compose recreates only services whose image changed.
+Coolify does rolling updates only for single-image apps — **not for Compose**. `docker compose up` stops a service before starting its replacement. A runner-image change restarts the control plane together with all tenant fleets (they cold-boot — roughly a minute for many apps), so batch control changes, deploy them off-peak, and pin `NOITE_RUNNER_IMAGE` to a SHA/tag for reproducibility.
 
-The trade for a single control image: **any** control change (UI or runner) restarts both together and fleets cold-boot — roughly a minute for many apps. Batch control changes, deploy them off-peak, and pin `NOITE_RELEASE` to a SHA/tag for reproducibility (`latest` follows main). Readiness is honest: the control healthcheck gates on runner `/ready` (first reconcile done, fleets spawned, Caddyfile written — not the instant `/health`) plus the UI root, and caddy starts only after control is healthy, so the edge never routes to a cold runner.
-
-Tenant subdomains (`<slug>.<domain>`) are fully automatic — no per-app steps, no wildcard cert, no DNS provider. How it works: a Traefik TCP router forwards every `*.<domain>` SNI straight to our Caddy on `:443`, and our Caddy mints a per-slug certificate on demand (ask-gated by the runner at `/v1/edge/tls-ask`, so only live tenant and platform hosts get certs). Plain-HTTP `:80` routes keep working alongside via per-site twins in the generated Caddyfile.
+Tenant subdomains (`<slug>.<domain>`) are fully automatic — no per-app steps, no wildcard cert, no DNS provider. How it works: a Traefik TCP router forwards every `*.<domain>` SNI straight to our Caddy on `:443`, and our Caddy mints a per-slug certificate on demand (ask-gated by the control worker at `/v1/edge/tls-ask`, so only live tenant and platform hosts get certs).
 
 One-time setup (besides `*.<domain>` DNS pointing at the server): save this file under `Servers > server > Proxy > Dynamic Configurations` in Coolify. It is static text — unlike compose labels, Coolify can't mangle it — and `noite-tenants@docker` resolves the TCP service the compose file defines:
 
@@ -92,4 +89,4 @@ Then redeploy once and confirm the `noite-tenants` router in the Traefik dashboa
 
 ## Data & backups
 
-State lives in named volumes. Local split stack: `agent-data` (runner SQLite, git mirrors, fleet state) + `ui-data` (control DB). Coolify joint stack: single `control-data` (`runner.sqlite` + `ui.sqlite`) + `rustfs-data` (bundled S3 only). Back those up; images are disposable. `make down` keeps volumes, `make reset` deletes them.
+State lives in named volumes. Prod cutover: `rustfs-data` (fleet bucket incl. the runner R2 relay prefix), `control-state` (celld node state), `caddy-data` (certs). Dev adds `agent-data` (runner SQLite, git mirrors, builds) + `caddy-config`. Back those up; images are disposable. `make down` keeps volumes, `make nuke` deletes them plus local `.wrangler` state.

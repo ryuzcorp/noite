@@ -1,7 +1,6 @@
-# Noite — two modes, same 4-service topology (rustfs, runner, control, caddy):
-#   make up   production (release images)
-#   make dev  local development (bind mounts + watch processes)
-# Run from repo root.
+# Noite — two modes: prod runs 3 services (rustfs, control, caddy; the
+# runner is a container cell of the control worker), dev keeps 4
+# (bind-mounted cargo-watch runner; see docker/compose.dev.yaml):
 
 # Both docker compose and podman-compose resolve host paths in these files
 # relative to the first -f file's directory (docker/), so no
@@ -19,18 +18,6 @@ export
 # pi-lens-ignore: shellcheck-14-1073
 # pi-lens-ignore: shellcheck-14-1050
 # pi-lens-ignore: shellcheck-14-1072
-ifneq "$(wildcard /run/.containerenv)" ""
-  DISTROBOX ?= 1
-endif
-ifdef DISTROBOX
-  export LD_LIBRARY_PATH := /run/host/usr/lib:/run/host/usr/lib64$(or $(and $(LD_LIBRARY_PATH),:$(LD_LIBRARY_PATH)),)
-  export XDG_DATA_HOME := /home/$(USER)/.local/share
-  export XDG_CONFIG_HOME := /home/$(USER)/.config
-  export PYTHONPATH := /run/host/usr/lib/python3.14/site-packages$(or $(and $(PYTHONPATH),:$(PYTHONPATH)),)
-  export PATH := $(CURDIR)/docker/bin:$(PATH)
-  export PODMAN_SOCK := /run/user/$(shell id -u)/podman/podman.sock
-endif
-
  .PHONY: help up dev dev-host logs doctor down nuke
 
  COMPOSE_DEV := $(COMPOSE) -f docker/compose.dev.yaml
@@ -42,9 +29,9 @@ endif
 
 help:
 	@echo "  make up    production stack (release images)"
-	@echo "  make dev   same topology, dev processes (cargo-watch + vite dev)"
+	@echo "  make dev   dev processes (cargo-watch runner + vite dev control)"
 	@echo "  make dev-host  dev + control UI reachable from LAN (Host: <lan-ip>)"
-	@echo "  make logs  follow runner + control + rustfs + caddy"
+	@echo "  make logs  follow control + rustfs + caddy"
 	@echo "  make down  stop stack (keeps data volumes)"
 	@echo "  make nuke  stop stack + delete volumes + local D1/SQLite state"
 	@echo ""
@@ -55,7 +42,7 @@ help:
 # changed, and it ends the entire stale-image bug class (no separate
 # build/rebuild/restart targets to remember).
 up:
-	$(COMPOSE) up -d --build rustfs runner control caddy
+	$(COMPOSE) up -d --build rustfs control caddy
 	@echo "open http://localhost:$${HTTP_PORT:-9080}"
 
 dev:
@@ -78,15 +65,15 @@ dev-host:
 logs:
 	# Caddy per-request lines live in the shared access.log (device stats),
 	# not stdout: `podman exec noite_caddy_1 tail -f /etc/caddy/access.log`.
-	$(COMPOSE) logs -f runner control rustfs caddy
+	$(COMPOSE) logs -f control rustfs caddy
 
 # Codified tribal checks: stack up, runner healthy + reconciled, API auth,
 # rustfs live, control UI serving. Exit nonzero naming the failing check.
 doctor:
 	sh docker/doctor.sh
-
-# Never destroy data on a plain stop — agent-data holds the runner SQLite,
-# git mirrors and fleet state.
+# Never destroy data on a plain stop — volumes hold all state (dev
+# agent-data: runner SQLite, git mirrors, builds; control-state, rustfs-data,
+# caddy-data in both stacks).
 down:
 	-$(COMPOSE) down --remove-orphans
 

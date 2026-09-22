@@ -1,4 +1,4 @@
-import { authClient } from "$lib/auth-client";
+import { fetchSession } from "$lib/session";
 import { head, navigate } from "@ilha/router";
 import { watch } from "ilha";
 
@@ -9,7 +9,7 @@ export default function Home() {
 
   watch.once(() => {
     void (async () => {
-      const { data } = await authClient.getSession();
+      const { data } = await fetchSession();
       navigate(data?.user ? "/apps" : "/login");
     })();
   });

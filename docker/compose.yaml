@@ -1,8 +1,11 @@
-# Noite stack: Rust runner + control celld fleet + RustFS + Caddy.
+# Noite stack: control celld fleet (with runner container cell) + RustFS + Caddy.
 #
 #   cp .env.example .env && make up && make logs
 #
-# Apex → Oxide (passkeys + actions). api.* → runner. <slug> → tenant fleets.
+# Container migration cutover: the `runner` service is gone — the Rust runner
+# runs as the `containers` cell of the control worker (`RunnerContainer` DO,
+# image `Dockerfile.runner-container`, singleton standard-4). Worker dispatch
+# follows RUNNER_TARGET=compose|container (container default).
 #
 # NOTE: host paths below are relative to this file's directory (docker/) —
 # both `docker compose` (project dir defaults to the first -f file's dir)
@@ -40,55 +43,22 @@ services:
       - rustfs-data:/data
     networks: [noite]
 
-  runner:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.runner
-    image: noite-runner:local
-    container_name: noite-runner
-    hostname: runner
-    restart: unless-stopped
-    stop_grace_period: 30s
-    environment:
-      <<: *aws
-      RUNNER_BIND: "0.0.0.0:8080"
-      # RUNNER_TOKEN preferred; HOST_TOKEN / AGENT_TOKEN still accepted by the binary.
-      RUNNER_TOKEN: ${RUNNER_TOKEN:-${HOST_TOKEN:-${AGENT_TOKEN:-dev-runner-token}}}
-      NOITE_DB: /data/noite.sqlite
-      S3_ENDPOINT: http://rustfs:9000
-      S3_PUBLIC_ENDPOINT: http://localhost:${RUSTFS_API_PORT:-9000}
-      NOITE_S3_BUCKET: ${NOITE_S3_BUCKET:-noite}
-      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
-      # Empty = control on bare domain (dev); prod sets CONTROL_SUBDOMAIN=app.
-      CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-}
-      # Extra hostnames serving the control UI (e.g. `make dev-host` LAN IP).
-      CONTROL_EXTRA_HOSTS: ${CONTROL_EXTRA_HOSTS:-}
-      CADDYFILE_PATH: /caddy/Caddyfile
-      CADDY_UPSTREAM_HOST: runner
-      CADDY_CONTROL_UPSTREAM: control:8090
-      CADDY_API_UPSTREAM: runner:8080
-      RUNNER_WORK_DIR: /data/runner
-      PORT_BASE: "8100"
-      RUNNER_POLL_MS: "5000"
-      CELLD_BIN: celld
-      GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-http://git.localhost:${HTTP_PORT:-9080}}
-      UI_URL: ${UI_URL:-http://control:8090}
-    volumes:
-      # Volume key kept as agent-data so existing stacks keep SQLite / builds.
-      - agent-data:/data
-      - caddy-config:/caddy
-    networks: [noite]
-    depends_on:
-      - rustfs
-
   control:
     # celld fleet node serving the control UI worker (`apps/noite/dist`
-    # deployed via `celld deploy`). Reuses the runner image — celld is baked
-    # in at /usr/local/bin/celld. Env mirrors the runner's fleet spawn
-    # (apps/runner/src/host/supervisor.rs); advertise stays loopback with
-    # published ports so host-side `celld d1` / `diagnose` can dial the lease.
-    image: noite-runner:local
-    container_name: noite-control
+    # deployed via `celld deploy`) AND the runner container cell
+    # (`RunnerContainer` DO → `Dockerfile.runner-container`). Reuses the
+    # runner image — celld is baked in at /usr/local/bin/celld. Env mirrors
+    # the runner's fleet spawn (apps/runner/src/host/supervisor.rs);
+    # advertise stays loopback with published ports so host-side `celld d1` /
+    # `diagnose` can dial the lease.
+    # Built from the repo root (the Dockerfile COPYs apps/runner/…).
+    # `make up` passes --build, so a source change always ships — no
+    # separate build step to forget. Coolify: set NOITE_RUNNER_IMAGE to
+    # the GHCR release tag to pull instead of building.
+    build:
+      context: ..
+      dockerfile: Dockerfile.runner-container
+    image: ${NOITE_RUNNER_IMAGE:-noite-runner:local}
     hostname: control
     restart: unless-stopped
     stop_grace_period: 15s
@@ -116,11 +86,30 @@ services:
       CELLD_OTEL: "1"
       CELLD_OTEL_FLUSH_MS: "2000"
       CELLD_OTEL_RETENTION: 14d
-    ports:
-      - "8090:8090"
-      - "8091:8091"
-    volumes:
-      - control-state:/data
+      # Container engine for the RunnerContainer cell (G1): the node starts
+      # containers through this socket. Rootless podman likely cannot install
+      # the celld fence (privileged nftables) — a rootful engine may be
+      # required; see the migration plan gates.
+      DOCKER_HOST: unix:///run/podman/podman.sock
+      # Deploy-time vars source for the runner container cell: the worker
+      # forwards its env into every container start (RunnerContainer envVars),
+      # replacing the old compose `runner.environment:` block as a config
+      # source. Secrets (RUNNER_TOKEN, AWS keys) arrive via wrangler secret /
+      # deploy env in prod, `.dev.vars` never leaves the laptop.
+      RUNNER_TARGET: ${RUNNER_TARGET:-container}
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-dev-runner-token}
+      # Loopback S3 sidecar in the runner container (B1): the fence blocks
+      # every route to this compose network, so the runner serves S3 to
+      # itself on 127.0.0.1:9000 and the worker relays durability into R2.
+      RUNNER_SIDECAR_S3: "1"
+      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
+      CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-}
+      CONTROL_EXTRA_HOSTS: ${CONTROL_EXTRA_HOSTS:-}
+      NOITE_S3_BUCKET: ${NOITE_S3_BUCKET:-noite}
+      GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-http://git.localhost:${HTTP_PORT:-9080}}
+      UI_URL: ${UI_URL:-http://control:8090}
+      RUNNER_POLL_MS: "5000"
+      PORT_BASE: "8100"
     networks: [noite]
     depends_on:
       - rustfs
@@ -131,22 +120,28 @@ services:
     ports:
       - "${HTTP_PORT:-9080}:80"
       - "${HTTPS_PORT:-9443}:443"
+    expose:
+      - "80"
+      - "443"
+    environment:
+      # Coolify boot-check domain (ignored elsewhere).
+      SERVICE_URL_CADDY_80: /
+    labels:
+      # Tenant TLS service for Coolify's Traefik (bare port — no `$`, which
+      # Coolify rewrites in labels). The TCP *router* is a dashboard-pasted
+      # file (`Servers > server > Proxy > Dynamic Configurations`):
+      # `noite-tenants@docker` resolves this service live. Ignored without
+      # Traefik — plain compose/docker setups are unaffected.
+      - "traefik.enable=true"
+      - "traefik.tcp.services.noite-tenants.loadbalancer.server.port=443"
     volumes:
-      - caddy-config:/etc/caddy
+      # Static edge: single wildcard site + on-demand TLS (ask via the
+      # control worker) → reverse_proxy control:8090 for everything. See
+      # docker/Caddyfile.static.
+      - ./Caddyfile.static:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
-    command:
-      - /bin/sh
-      - -c
-      - |
-        # Single owner for routes: the runner rewrites this file every reconcile
-        # (5 s). Until its first write, serve a `:80` starting page so caddy
-        # listens from boot (an empty config listens on nothing, which reads
-        # as down until routes appear). Skipped when a Caddyfile already exists.
-        [ -f /etc/caddy/Caddyfile ] || printf '%s\n' ':80 {' '  respond "noite edge starting" 200' '}' > /etc/caddy/Caddyfile
-        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile --watch
     networks: [noite]
     depends_on:
-      - runner
       - control
 
 networks:
@@ -154,8 +149,6 @@ networks:
 
 volumes:
   rustfs-data:
-  agent-data:
   control-state:
-  caddy-config:
   caddy-data:
   bun-cache:

@@ -14,8 +14,7 @@ make logs
 | `apps/runner` | Rust runner (deploy, fleets, caddy) |
 | `apps/noite` | Oxide control UI (passkeys, workflow/queue/schedule → runner) |
 | `apps/noite/test` | sample app + `deploy.sh` |
-| `docker/compose.yaml` | stack |
-| `docker/compose.coolify.yaml` | production stack for Coolify (automatic generated domain, generated secrets, healthchecks) |
+| `docker/compose.yaml` | universal production stack (compose + Coolify via env) |
 | `docker/compose.byob.yaml` | external-S3 overlay (compose `-f` flag), bundled RustFS excluded |
 
 | URL                            |                       |
@@ -62,9 +61,9 @@ portless alias test.noite 9080 # → https://test.noite.local (hosts + mDNS)
 
 ## Deploy to Coolify
 
-Point a Docker Compose resource at `docker/compose.coolify.yaml` (repo root, branch `main`). In Environment Variables, set the required `BASE_DOMAIN` (secrets auto-generate — just save); `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` derive from it unless overridden. Deploy: Coolify auto-provisions a generated domain for the `caddy` service and the runner serves the control UI on it (boot check). Traefik routes `app.`/`api.`/`git.` to `caddy:80` and TCP-forwards `*.<domain>` SNI to `caddy:443`, where our Caddy terminates per-host TLS itself; tenant subdomains need zero per-app steps (full guide in `apps/website/docs/deployment.mdx`). Then paste the real hostnames once on the `caddy` service Domains field (Coolify can't take custom hostnames from Compose): `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. The apex stays on your marketing site.
+Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `main`) — the same universal file as `make up`, driven by env. In Environment Variables, set `BASE_DOMAIN` to your domain (defaults to `localhost`); `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` derive from it unless overridden. For secrets, generate values for `BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY` (any generator — nothing auto-generates here; the worker refuses dev defaults on real domains). To pull the release image instead of building (Rust release build takes minutes), set `NOITE_RUNNER_IMAGE=ghcr.io/ryuzcorp/noite-runner:stable` (pinned) or `:latest` (follows main). Deploy: Coolify auto-provisions a generated domain for the `caddy` service (boot check via `SERVICE_URL_CADDY_80`). Traefik routes `app.`/`api.`/`git.` to `caddy:80` and TCP-forwards `*.<domain>` SNI to `caddy:443`, where our Caddy terminates per-host TLS itself; tenant subdomains need zero per-app steps (full guide in `apps/website/docs/deployment.mdx`). Then paste the real hostnames once on the `caddy` service Domains field (Coolify can't take custom hostnames from Compose): `https://ap…
 
-Tenant subdomains (`<slug>.<domain>`) are fully automatic: a Traefik TCP router forwards every `*.<domain>` SNI straight to our Caddy on `:443`, and our Caddy mints a per-slug cert on demand (ask-gated by the runner — only live tenant/platform hosts get certs, no wildcard cert or DNS provider involved). Two one-time prerequisites: `*.<domain>` DNS → the server, and this file saved under `Servers > server > Proxy > Dynamic Configurations` (dashboard-pasted file config is static text — unlike compose labels, Coolify can't mangle it — and `noite-tenants@docker` resolves the TCP service the compose file defines):
+Tenant subdomains (`<slug>.<domain>`) are fully automatic: a Traefik TCP router forwards every `*.<domain>` SNI straight to our Caddy on `:443`, and our Caddy mints a per-slug cert on demand (ask-gated by the control worker — only live tenant/platform hosts get certs, no wildcard cert or DNS provider involved). Two one-time prerequisites: `*.<domain>` DNS → the server, and this file saved under `Servers > server > Proxy > Dynamic Configurations` (dashboard-pasted file config is static text — unlike compose labels, Coolify can't mangle it — and `noite-tenants@docker` resolves the TCP service the compose file defines):
 
 ```yaml
 tcp:

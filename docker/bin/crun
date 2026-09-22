@@ -1,3 +1,0 @@
-#!/bin/sh
-export LD_LIBRARY_PATH="/run/host/usr/lib:/run/host/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-exec /run/host/usr/bin/crun "$@"

@@ -4,6 +4,7 @@ import { atom, watch } from "ilha";
 import { createApiKey } from "./apps.server";
 import { authClient } from "./auth-client";
 import { formatDateTime } from "./dates";
+import { fetchSession } from "./session";
 import { SectionSkeleton } from "./skeletons";
 
 interface ApiKeyRow {
@@ -63,7 +64,7 @@ export const ProfilePanel = () => {
 
   watch.once(() => {
     void (async () => {
-      const { data } = await authClient.getSession();
+      const { data } = await fetchSession();
       if (!data?.user) {
         navigate("/login");
         return;

@@ -1,6 +1,6 @@
 import type { AppDetailInfo } from "$lib/app-detail/panel";
 import { get } from "$lib/apps.server";
-import { authClient } from "$lib/auth-client";
+import { fetchSession } from "$lib/session";
 import { PageSkeleton } from "$lib/skeletons";
 import {
   requestSourceMode,
@@ -48,7 +48,7 @@ export default function Source() {
 
   watch.once(() => {
     void (async () => {
-      const { data } = await authClient.getSession();
+      const { data } = await fetchSession();
       if (!data?.user) {
         navigate("/login");
         return;

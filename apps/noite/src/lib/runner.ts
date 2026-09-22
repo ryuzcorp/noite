@@ -68,6 +68,33 @@ const runnerBase = () =>
     "http://runner:8080"
   ).replace(/\/$/u, "");
 
+/** Minimal container-stub surface the worker uses (fetch only). */
+export interface RunnerContainerStub {
+  fetch: (request: Request) => Promise<Response>;
+}
+
+/** DO stub for the runner container, or null outside container target.
+ * Shared by runnerFetch, Host dispatch, and the R2 relay cron. */
+export const runnerContainerStub =
+  async (): Promise<RunnerContainerStub | null> => {
+    if (readEnv().RUNNER_TARGET !== "container") {
+      return null;
+    }
+    const binding = readEnv().RUNNER;
+    if (!binding) {
+      return null;
+    }
+    // Platform-specific: @cloudflare/containers only exists in the worker
+    // runtime, not vite dev SSR — dynamic import keeps dev working.
+    const { getContainer } = await import(
+      // oxlint-disable-next-line eslint/no-inline-comments -- @vite-ignore must sit inside the import call or vite bundles a worker-only module.
+      /* @vite-ignore */ "@cloudflare/containers"
+    );
+    // SAFETY: RUNNER is a DO namespace binding; getContainer takes it opaque and only fetches through the stub below.
+    const stub: RunnerContainerStub = getContainer(binding as never);
+    return stub;
+  };
+
 const runnerToken = () => {
   const token =
     readEnv().RUNNER_TOKEN ??
@@ -88,6 +115,36 @@ export const runnerFetch = async <T = unknown>(
   headers.set("authorization", `Bearer ${runnerToken()}`);
   if (init.body && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
+  }
+  // Container target (Phase 2, behind RUNNER_TARGET=container): in-worker
+  // calls go getContainer(env.RUNNER).fetch(...) → runner API on 8080.
+  // Compose stays the default until the cutover.
+  const stub = await runnerContainerStub();
+  if (stub) {
+    // SAFETY: fetch body is JSON/string/undefined from callers above; workers require BodyInit so narrow here for the container Request.
+    const body = init.body as BodyInit | undefined;
+    const res = await stub.fetch(
+      new Request(`http://runner${path}`, {
+        body,
+        headers,
+        method: init.method ?? "GET",
+        signal: init.signal ?? AbortSignal.timeout(10_000),
+      })
+    );
+    if (!res.ok) {
+      const text = await res.text().catch(() => res.statusText);
+      throw new Error(
+        `runner ${init.method ?? "GET"} ${path}: ${res.status} ${text}`
+      );
+    }
+    if (res.status === 204) {
+      // SAFETY: 204 (no content) is only used by void/empty responses; callers type those `T`s as `void` or discard the value.
+      // oxlint-disable-next-line typescript/no-invalid-void-type
+      return undefined as T;
+    }
+    const payload = await res.json();
+    // SAFETY: the runner returns the response object directly (no `{ body }` envelope); the JSON already matches the caller's requested `T`.
+    return payload as T;
   }
   // Bound every runner call: a hung upstream must fail fast with the path
   // in the message, never hang into the platform request deadline.

@@ -8,7 +8,7 @@ use anyhow::{bail, Context};
 use serde::Serialize;
 
 use crate::config::Config;
-use crate::host::cmd;
+use crate::host::{cmd, rehydrate};
 use crate::models::App;
 
 pub const MAX_BLOB: usize = 256 * 1024;
@@ -66,6 +66,10 @@ pub async fn checkout_worktree(
 ) -> anyhow::Result<()> {
     let bare = bare_repo(cfg, slug);
     if !bare.join("HEAD").exists() {
+        // Ephemeral disk: pull tip bundle then retry once.
+        let _ = rehydrate::ensure_deploy_mirror(cfg, slug).await;
+    }
+    if !bare.join("HEAD").exists() {
         anyhow::bail!("no bare mirror for {slug} yet");
     }
     tokio::fs::create_dir_all(dest).await?;
@@ -90,9 +94,17 @@ pub async fn checkout_worktree(
 /// every fetch even when a deploy later fails).
 pub async fn resolve_rev(cfg: &Config, app: &App) -> anyhow::Result<Option<String>> {
     if let Some(sha) = app.last_deploy_sha.as_deref() {
+        // Ephemeral disk: ensure the mirror exists for the deployed sha.
+        let repo = bare_repo(cfg, &app.slug);
+        if !repo.join("HEAD").exists() {
+            let _ = rehydrate::ensure_deploy_mirror(cfg, &app.slug).await;
+        }
         return Ok(Some(sha.to_string()));
     }
     let repo = bare_repo(cfg, &app.slug);
+    if !repo.join("HEAD").exists() {
+        let _ = rehydrate::ensure_deploy_mirror(cfg, &app.slug).await;
+    }
     if !repo.join("HEAD").exists() {
         return Ok(None);
     }
@@ -242,6 +254,9 @@ pub async fn make_patch(
 
 async fn git(cfg: &Config, slug: &str, args: &[&str]) -> anyhow::Result<String> {
     let repo = bare_repo(cfg, slug);
+    if !repo.join("HEAD").exists() {
+        let _ = rehydrate::ensure_deploy_mirror(cfg, slug).await;
+    }
     let git_dir = format!("--git-dir={}", repo.display());
     let mut full = Vec::with_capacity(args.len() + 1);
     full.push(git_dir.as_str());

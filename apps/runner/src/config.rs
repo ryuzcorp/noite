@@ -66,6 +66,15 @@ pub struct Config {
     pub git_public_base: String,
     /// Control UI base URL for Git API-key auth (runner → UI).
     pub ui_url: String,
+    /// Caddy JSON access log the device/path/ref tick tails. The Caddy `log`
+    /// block is path-fixed at the volume root; the Caddyfile itself may live
+    /// in a subpath (dev `dynamic/`).
+    pub caddy_access_log: String,
+    /// Run a loopback S3 sidecar (rustfs on 127.0.0.1:9000) and talk to it
+    /// instead of `S3_ENDPOINT`. Set in the container cell, where the celld
+    /// fence blocks every route to the compose-network object store; the
+    /// worker relays durability into R2. Off in compose mode.
+    pub sidecar_s3: bool,
 }
 
 impl Config {
@@ -134,6 +143,8 @@ impl Config {
             ),
             caddyfile_path: env::var("CADDYFILE_PATH")
                 .unwrap_or_else(|_| "/caddy/Caddyfile".into()),
+            caddy_access_log: env::var("CADDY_ACCESS_LOG")
+                .unwrap_or_else(|_| "/caddy/access.log".into()),
             celld_bin: env::var("CELLD_BIN").unwrap_or_else(|_| "celld".into()),
             port_base: env_or(&["PORT_BASE"], "8100").parse().unwrap_or(8100),
             poll_ms: env_or(
@@ -149,6 +160,10 @@ impl Config {
             caddy_api_upstream: env_or(&["CADDY_API_UPSTREAM"], "runner:8080"),
             git_public_base,
             ui_url: ui_url.trim_end_matches('/').to_string(),
+            sidecar_s3: matches!(
+                env_or(&["RUNNER_SIDECAR_S3"], "0").as_str(),
+                "1" | "true" | "yes"
+            ),
         })
     }
 
@@ -279,6 +294,8 @@ mod tests {
             caddy_api_upstream: "runner:8080".into(),
             git_public_base: "https://git.localhost".into(),
             ui_url: "http://ui:8080".into(),
+            caddy_access_log: "/caddy/access.log".into(),
+            sidecar_s3: false,
         };
         assert_eq!(cfg.tenant_bases(), vec!["localhost", "noite.local"]);
     }

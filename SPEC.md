@@ -4,12 +4,12 @@
 
 - **Product:** full tiny PaaS — user accounts, apps, subdomains, thin deploy/build logs + status
 - **Tenancy:** single-operator Compose install; no orgs; users own apps; per-app collaborators (`view` / `push` / `admin`)
-- **Control plane:** **Oxide Worker UI on a celld fleet** (`preset: worker` — real workflows/queues/cron, D1 auth DB) + **Rust runner** (fleet supervisor + Caddyfile owner; stays a container, a Rust binary can't be a worker)
+- **Control plane:** **Oxide Worker UI on a celld fleet** (`preset: worker` — real workflows/queues/cron, D1 auth DB) + **Rust runner as the `noite-control` container cell** (`RunnerContainer` DO, singleton `standard-4`, image `Dockerfile.runner-container`; a Rust binary can't be a worker). The worker DO owns host→port routing; the Caddyfile is static.
 - **Tenant runtime:** each app is its own celld fleet (prefix + keys)
 - **Source:** stock Git smart-HTTP at `http://git.$BASE_DOMAIN/{slug}` (Basic `git` / profile API key; collaborator `view`/`push`) → runner writes tip `s3://noite/git/{slug}/refs/heads/main/{sha}.bundle` + a `MANIFEST.json` linearization point
 - **Deploy:** push to `main` (and/or tip poll / webhook) → bare mirror + checkout → build → `celld deploy` → reload
 - **Isolation:** one app = one fleet; never share `deploy/current.json`
-- **Edge:** Caddy — control on bare `$BASE_DOMAIN` locally (`https://app.noite.now` in prod via `CONTROL_SUBDOMAIN=app`) + `api.` + `git.` + `{app}.$BASE_DOMAIN` (prod `https://{app}.noite.now`; `app`/`api`/`git` slugs reserved) Behind a terminating proxy (Coolify), `CADDY_AUTO_HTTPS=off` and our Caddy terminates per-host TLS itself via on-demand certs (runner ask-gated at `/v1/edge/tls-ask`; Traefik TCP-forwards SNI); see `docker/compose.coolify.yaml`.
+- **Edge:** Caddy (static file) — wildcard site + on-demand TLS (ask-gated at `/v1/edge/tls-ask` via the control worker) + `reverse_proxy control:8090` for everything; the worker Host-dispatches to control UI (`CONTROL_SUBDOMAIN=app` in prod, bare domain in dev) + `api.` + `git.` + `{app}.$BASE_DOMAIN` (prod `https://{app}.noite.now`; `app`/`api`/`git` slugs reserved) through `RunnerContainer.getTcpPort(port)`. Behind a terminating proxy (Coolify/Traefik TCP-forwards SNI) our Caddy still terminates per-host TLS itself via on-demand certs; Coolify uses the same universal `docker/compose.yaml` with env overrides (Traefik labels for the tenant TCP service are in the file).
 - **Effect:** prefer `Effect` / `Config` / `Schedule` / `Schema` / `HttpClient` / `Layer` over ad-hoc async
 
 ## Status (2026-09-15)
@@ -20,9 +20,9 @@ Working end-to-end on rootless Podman Compose (repo root).
 
 | Area | Notes |
 | --- | --- |
-| Compose stack | `rustfs`, `runner`, `ui`, `caddy` — `docker/compose.yaml` (Compose files live under `docker/`) |
+| Compose stack | `rustfs`, `control`, `caddy` — `docker/compose.yaml` (Compose files live under `docker/`) |
 | Ports | Host **9080/9443**; control `http://localhost:9080`; API `http://api.localhost:9080`; apps `http://{slug}.localhost:9080` |
-| Runner | **Rust** (`apps/runner`) — deploy, fleets, caddy; ensures the single `NOITE_S3_BUCKET` bucket on boot |
+| Runner | **Rust** (`apps/runner`) — deploy, fleets, route table; loopback S3 sidecar in container mode (fence blocks the compose store) with worker-relayed R2 durability; SQLite snapshot restores from the sidecar, bare mirrors rehydrate from tip bundles; ensures the single `NOITE_S3_BUCKET` bucket on boot |
 | Control UI | **Oxide worker fleet** (`apps/noite`, `preset: worker`) — passkeys + actions proxying to runner; D1 (`DB` binding) replaces `bun:sqlite`, OTP email via `NOITE_EMAIL_WEBHOOK_URL` webhook (no SMTP sockets on workers), `bun-durable` shim deleted |
 | Deploy pipeline | Tip `.bundle` → bare repo + worktree → optional bun scripts → `celld deploy` → spawn/reload |
 | Deploy trigger | push fast-path (spawn) + reconcile tip poll of `MANIFEST.json` + main `.bundle` + `/webhook` bearer-gated nudge — RustFS notify off |
@@ -47,10 +47,10 @@ Steps:
 3. Set secrets on the fleet (`BETTER_AUTH_SECRET` unchanged, `RUNNER_TOKEN`, AWS/RUSTFS keys, `NOITE_ADMIN_EMAIL`, `NOITE_EMAIL_WEBHOOK_URL`; `BETTER_AUTH_URL` = the same control URL).
 4. `celld deploy dist` from `apps/noite` (uses the oxide-prepared `dist/wrangler.json`).
 5. Flip `CADDY_CONTROL_UPSTREAM` from `ui:8080` to the fleet origin URL and recreate caddy (`reverse_proxy` accepts a full URL).
-6. Retire local joint serving (`docker/compose.dev-joint.yaml` + `noite-joint-dev.sh` deleted); the single-container joint image (`docker/noite-joint.sh` via `railpack.json`) stays for Coolify/GHCR only. Image rebuilds happen inline via `up`/`dev --build`, no separate build targets.
+6. Single runner image (`Dockerfile.runner-container` at the root — compose `control`, the `celld deploy` container cell, and the railpack CI build all use it); the joint supervisor (`docker/noite-joint.sh`, `docker/compose.coolify.yaml`) is deleted, Coolify deploys the universal `docker/compose.yaml` with env overrides. Image rebuilds happen inline via `up`/`dev --build`, no separate build targets.
 7. Sign up fresh on the fleet UI and verify apps/keys/passkeys end to end.
 
-Dev loop: `make dev` runs the same 4 services as prod with dev processes — runner cargo-watch, control as `vite dev` (full Oxide + Cloudflare plugin pipeline: workerd, local D1, HMR). No bucket, no deploy cycle. (`celld dev` cannot serve this app: raw esbuild can't resolve `virtual:oxide/worker`.) Secrets from `.dev.vars`. Never run dev and prod stacks at once (shared names/volumes).
+Dev loop: `make dev` runs the 4-service dev layout with dev processes — runner cargo-watch, control as `vite dev` (full Oxide + Cloudflare plugin pipeline: workerd, local D1, HMR). No bucket, no deploy cycle. (`celld dev` cannot serve this app: raw esbuild can't resolve `virtual:oxide/worker`.) Secrets from `.dev.vars`. Never run dev and prod stacks at once (shared names/volumes).
 
 ### Left / polish
 
@@ -103,7 +103,7 @@ Ordered by payoff. Each item: what · why · files. W1 is mechanical and safe; W
 ### Wave 2 — hardening — done (W2.5 partial)
 
 - [x] **W2.1 `/webhook` bearer-gated** · `auth.rs` allows only `/health` without a token · UI proxy (`routes.ts`) and `deploy.sh` nudge send `authorization: Bearer $RUNNER_TOKEN` · RustFS notify **disabled** in compose (it cannot carry a bearer header; poll + deploy.sh nudge are the triggers — SPEC already treated poll as authoritative)
-- [x] **W2.2 Default secrets refused off-localhost** · `BASE_DOMAIN != localhost` with `BETTER_AUTH_SECRET`/`RUNNER_TOKEN` still at shipped defaults ⇒ boot fails with a message · guards in `docker/noite-joint.sh` (joint/Coolify image) + runner `config.rs` (dev runs on localhost, no gate needed)
+- [x] **W2.2 Default secrets refused off-localhost** · `BASE_DOMAIN != localhost` with `BETTER_AUTH_SECRET`/`RUNNER_TOKEN` still at shipped defaults ⇒ boot fails with a message · guards in worker `auth.ts` (`defaultSecretRefusal` on first auth construction — the worker entry is virtual, no boot hook) + runner `config.rs` (dev runs on localhost, no gate needed)
 - [x] **W2.3 Deploy log capped at 64 KB tail** · `db.rs::upsert_deploy` no longer grows unbounded
 - [x] **W2.4 Git credentials** · Profile API keys (Better Auth); runner verifies via UI + collaborator role (`view` fetch / `push` receive)
 - [x] **W2.5 Graceful stops** · `stop_grace_period: 30s/15s` on runner/ui. **Deferred:** rustfs `healthcheck:` + `depends_on: service_healthy` — the rustfs image's tooling couldn't be verified from this environment (no container engine); runner already blocks on readiness at boot
@@ -119,20 +119,21 @@ Acceptance: `make up` cold build < 30 s · Git-HTTP push → app live ≤ poll +
 
 ```mermaid
 flowchart LR
-  dev[Developer] -->|git push → git.BASE/slug| runner[NoiteRunner]
+  dev[Developer] -->|git push → git.BASE/slug| runner[NoiteRunner container cell]
   runner -->|tip .bundle + MANIFEST.json| rustfs[(RustFS s3://noite)]
   runner -->|poll MANIFEST + tip .bundle| rustfs
+  runner -->|SQLite snapshot| control[(s3://noite/control/runner.sqlite)]
+  runner -->|loopback S3| sidecar[(sidecar 127.0.0.1:9000)]
+  ui -->|R2 relay import/export| control
   runner -->|protocol mirror| githttp[git-http/slug.git]
   runner -->|deploy/source mirror| repos[repos/slug.git]
   repos -->|checkout + build| work[worktree]
   work -->|celld deploy| fleet[celld fleet per app]
   runner -->|spawn + supervise| fleet
-  runner -->|Caddyfile| caddy[Caddy]
-  user[Browser] --> caddy
-  caddy -->|bare domain, app.BASE prod| ui[OxideUI control]
-  caddy -->|api.BASE| runner
-  caddy -->|git.BASE| runner
-  caddy -->|slug.BASE| fleet
+  runner -->|route table| ui[OxideUI control + RunnerContainer DO]
+  user[Browser] --> caddy[Caddy static]
+  caddy -->|all vhosts| ui
+  ui -->|getTcpPort by Host| runner
   ui -->|Bearer REST| runner
   ui -->|API-key + role check| runner
 ```
@@ -142,17 +143,18 @@ flowchart LR
 - `s3://noite/git/{appSlug}/` — tip bundles from Git HTTP (or legacy git-remote-s3) + `MANIFEST.json` (`{seq, refs}`; readers resolve refs from the manifest so half-written pushes stay invisible)
 - `s3://noite/fleets/{appSlug}/` — tenant celld
 - Legacy `s3://fleets/_control/` worker UI bucket is gone (W1.3); control serves the bare domain locally
+- `s3://noite/control/runner.sqlite` — runner SQLite snapshot (ephemeral container disks restore from it on boot)
+- Container mode: the runner talks S3-protocol to a loopback sidecar (`RUNNER_SIDECAR_S3`, same keyspace), and the worker relays durability into R2 (`RUNNER_SNAP` binding → `r2/noite-runner/` in this same bucket — no second store or credential). Telemetry stays sidecar-local; moves reset the metrics watermark.
 - Runner ensures bucket `NOITE_S3_BUCKET` (default `noite`) on boot; uses root keys for deploy/reconcile
-- One rustfs bucket, two prefixes — not separate `git` / `fleets` buckets
+- One rustfs bucket, three prefixes (+ `r2/` relay keyspace in container mode) — not separate `git` / `fleets` buckets
 
 ### Process model
 
-| Process  | Role                                                  |
-| -------- | ----------------------------------------------------- |
+| Process | Role |
+| --- | --- |
 | `rustfs` | S3 (notify disabled; runner polls + `/webhook` nudge) |
-| `runner` | REST API, deploy, caddy rewrite, spawn tenant celld   |
-| `ui`     | Oxide control UI (server-side proxy to runner)        |
-| `caddy`  | subdomains on host ports 9080/9443                    |
+| `control` | Oxide control UI + runner container cell; engine socket for container starts |
+| `caddy` | static wildcard edge on host ports 9080/9443 → `control:8090` for all vhosts |
 
 ## Compose UX
 

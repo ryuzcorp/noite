@@ -193,7 +193,10 @@ async fn dispatch_call(
             )
             .await
             {
-                Ok(app) => JsonRpcResponse::success(id, app),
+                Ok(app) => {
+                    crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
+                    JsonRpcResponse::success(id, app)
+                }
                 Err(e) => internal(&id, e.to_string()),
             }
         }
@@ -225,6 +228,7 @@ async fn dispatch_call(
                 if let Err(e) = db::patch_app_desired(&state.pool, &p.id, ds.as_str()).await {
                     return internal(&id, e.to_string());
                 }
+                crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
             }
             match app(state, &p.id, &id).await {
                 Ok(a) => JsonRpcResponse::success(id, a),
@@ -250,7 +254,10 @@ async fn dispatch_call(
                 return internal(&id, format!("failed to purge app data: {e:#}"));
             }
             match db::delete_app(&state.pool, &p.id).await {
-                Ok(()) => JsonRpcResponse::success(id, serde_json::json!({ "ok": true })),
+                Ok(()) => {
+                    crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
+                    JsonRpcResponse::success(id, serde_json::json!({ "ok": true }))
+                }
                 Err(e) => internal(&id, e.to_string()),
             }
         }
@@ -347,7 +354,10 @@ async fn dispatch_call(
                 Err(e) => return e,
             };
             match db::set_env(&state.pool, &a.id, &name, &p.value).await {
-                Ok(()) => JsonRpcResponse::success(id, serde_json::json!({ "ok": true, "name": name })),
+                Ok(()) => {
+                    crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
+                    JsonRpcResponse::success(id, serde_json::json!({ "ok": true, "name": name }))
+                }
                 Err(e) => internal(&id, e.to_string()),
             }
         }
@@ -369,7 +379,10 @@ async fn dispatch_call(
                 Err(e) => return e,
             };
             match db::delete_env(&state.pool, &a.id, &p.name).await {
-                Ok(()) => JsonRpcResponse::success(id, serde_json::json!({ "ok": true })),
+                Ok(()) => {
+                    crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
+                    JsonRpcResponse::success(id, serde_json::json!({ "ok": true }))
+                }
                 Err(e) => internal(&id, e.to_string()),
             }
         }

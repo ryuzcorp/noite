@@ -12,12 +12,14 @@ import {
 } from "../lib/collaborators";
 import { ensureDbPromise, withDb } from "../lib/db";
 import type {
+  RunnerContainerStub,
   RunnerDevice,
   RunnerMetric,
   RunnerPath,
   RunnerRef,
   RunnerSpan,
 } from "../lib/runner";
+import { runnerContainerStub } from "../lib/runner";
 
 type RouteHandler = (
   request: Request,
@@ -576,6 +578,19 @@ const handleDeploysStream: RouteHandler = (request, env, params) =>
     (appId) => `/v1/apps/${appId}/deploys/stream`
   );
 
+/** Live event feed proxy (see proxyRunnerStream). Query (channel/limit)
+ * passes through so the client scopes the snapshot server-side. */
+const handleEventsStream: RouteHandler = (request, env, params) => {
+  const url = new URL(request.url);
+  const query = url.search;
+  return proxyRunnerStream(
+    request,
+    env,
+    params,
+    (appId) => `/v1/apps/${appId}/events/stream${query}`
+  );
+};
+
 const router = FindMyWay.make<RouteHandler>();
 router.all("/health", handleHealth);
 router.on("POST", "/webhook", handleWebhook);
@@ -583,14 +598,180 @@ router.on("POST", "/internal/git-auth", handleGitAuth);
 router.on("GET", "/storage/:appId/r2/:bucket/raw", handleR2Raw);
 router.on("GET", "/api/apps/:appId/logs/stream", handleLogsStream);
 router.on("GET", "/api/apps/:appId/deploys/stream", handleDeploysStream);
+router.on("GET", "/api/apps/:appId/events/stream", handleEventsStream);
 router.on("GET", "/api/apps/stream", handleAppsStream);
 router.on("GET", "/api/apps/:appId/metrics/stream", handleMetricsStream);
 router.on("POST", "/api/apps/:appId/ingest/:kind", forwardIngest);
 router.all("/api/auth", handleAuth);
 router.all("/api/auth/*", handleAuth);
 
+/** One cached tenant port per slug for container dispatch. */
+interface EdgePort {
+  listenPort: number;
+}
+
+let edgeCacheAt = 0;
+const edgeCacheBySlug = new Map<string, EdgePort>();
+const EDGE_CACHE_TTL_MS = 5000;
+
+type DispatchTarget =
+  | { kind: "local" }
+  | { kind: "runner"; path: string }
+  | { kind: "tenant"; slug: string };
+
+/** Pure Host/path sort: platform hosts → runner 8080, slugs → tenant port. */
+const dispatchTarget = (
+  host: string,
+  base: string,
+  pathname: string
+): DispatchTarget => {
+  if (host === `api.${base}`) {
+    return { kind: "runner", path: pathname };
+  }
+  if (host === `git.${base}`) {
+    const path = pathname.startsWith("/v1/git/")
+      ? pathname
+      : `/v1/git${pathname.startsWith("/") ? "" : "/"}${pathname}`;
+    return { kind: "runner", path };
+  }
+  if (pathname === "/v1/edge/tls-ask") {
+    return { kind: "runner", path: pathname };
+  }
+  if (host === base || host === `app.${base}` || !host.endsWith(`.${base}`)) {
+    return { kind: "local" };
+  }
+  const slug = host.slice(0, -(base.length + 1));
+  const reserved = new Set(["api", "app", "git"]);
+  if (!slug || slug.includes(".") || reserved.has(slug)) {
+    return { kind: "local" };
+  }
+  return { kind: "tenant", slug };
+};
+
+const forwardVia = (
+  stub: RunnerContainerStub,
+  request: Request,
+  host: string,
+  search: string,
+  targetPath: string
+): Promise<Response> => {
+  const headers = new Headers(request.headers);
+  // Preserve the original Host for the runner fallback page (it renders
+  // per-Host); the container URL would otherwise collapse it to `runner`.
+  headers.set("x-forwarded-host", host);
+  return stub.fetch(
+    new Request(`http://runner${targetPath}${search}`, {
+      body: request.body,
+      // @ts-expect-error duplex required for streamed bodies in workers
+      duplex: "half",
+      headers,
+      method: request.method,
+    })
+  );
+};
+
+const EdgeRoutePayload = Schema.Struct({
+  listenPort: Schema.Number,
+  slug: Schema.String,
+});
+
+const EdgeRoutesPayload = Schema.Struct({
+  routes: Schema.optional(Schema.Array(EdgeRoutePayload)),
+});
+
+const refreshEdgeCache = async (
+  stub: RunnerContainerStub,
+  token: string
+): Promise<void> => {
+  const res = await stub.fetch(
+    new Request("http://runner/v1/edge/routes", {
+      headers: { authorization: `Bearer ${token}` },
+    })
+  );
+  if (!res.ok) {
+    return;
+  }
+  const payload = Schema.decodeUnknownSync(EdgeRoutesPayload)(await res.json());
+  edgeCacheBySlug.clear();
+  for (const route of payload.routes ?? []) {
+    if (Number.isInteger(route.listenPort)) {
+      edgeCacheBySlug.set(route.slug, { listenPort: route.listenPort });
+    }
+  }
+  edgeCacheAt = Date.now();
+};
+
+/** Host dispatch for RUNNER_TARGET=container (before path routing).
+ *
+ * Static Caddy → control:8090 → worker Host-dispatch → container port:
+ * api./git./tls-ask → runner 8080; {slug}. → port lookup; apex/control →
+ * existing asset/worker routes (undefined). Compose target skips entirely.
+ */
+const containerDispatch = async (
+  request: Request,
+  env: KitEnv
+): Promise<Response | undefined> => {
+  if (env.RUNNER_TARGET !== "container" || !env.RUNNER) {
+    return undefined;
+  }
+  let parsed: URL | undefined;
+  try {
+    parsed = new URL(request.url);
+  } catch {
+    return undefined;
+  }
+  const { hostname: rawHost, pathname, search } = parsed;
+  const hostname = rawHost.toLowerCase();
+  const base = (env.BASE_DOMAIN ?? "localhost").toLowerCase();
+  const stub = await runnerContainerStub();
+  if (!stub) {
+    return undefined;
+  }
+  const target = dispatchTarget(hostname, base, pathname);
+  if (target.kind === "local") {
+    return undefined;
+  }
+  if (target.kind === "runner") {
+    return forwardVia(stub, request, hostname, search, target.path);
+  }
+  // Refresh the route table on miss + ~5 s TTL (mirrors the DO cache).
+  const now = Date.now();
+  if (
+    now - edgeCacheAt > EDGE_CACHE_TTL_MS ||
+    !edgeCacheBySlug.has(target.slug)
+  ) {
+    try {
+      await refreshEdgeCache(stub, env.RUNNER_TOKEN ?? "");
+    } catch {
+      // Serve stale on failure; miss below falls through to fallback.
+    }
+  }
+  const hit = edgeCacheBySlug.get(target.slug);
+  if (hit) {
+    return forwardVia(
+      stub,
+      request,
+      hostname,
+      search,
+      `/${hit.listenPort}${pathname === "/" ? "/" : pathname}`
+    );
+  }
+  return forwardVia(stub, request, hostname, search, "/v1/edge/fallback");
+};
+
 /** Shared by Server Entry (prod) and Vite DEV middleware. */
-export const handleHttp = ((request, env) => {
+export const handleHttp = (async (request, env) => {
+  // SAFETY: the Worker env carries every KitEnv control key the handlers need; unset keys stay undefined as handlers tolerate.
+  const kit = env as KitEnv;
+  let dispatched: Response | undefined;
+  try {
+    dispatched = await containerDispatch(request, kit);
+  } catch {
+    dispatched = undefined;
+  }
+  if (dispatched) {
+    return dispatched;
+  }
   let pathname: string;
   try {
     const { pathname: p } = new URL(request.url);
@@ -606,5 +787,5 @@ export const handleHttp = ((request, env) => {
     return;
   }
   // SAFETY: the Worker env carries every KitEnv control key the handlers need; unset keys stay undefined as handlers tolerate.
-  return match.handler(request, env as KitEnv, match.params);
+  return match.handler(request, kit, match.params);
 }) satisfies FetchHandler<KitEnv>;

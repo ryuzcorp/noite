@@ -226,6 +226,8 @@ mod tests {
             caddy_api_upstream: "runner:8080".into(),
             git_public_base: format!("https://git.{base}"),
             ui_url: "http://ui:8080".into(),
+            caddy_access_log: "/caddy/access.log".into(),
+            sidecar_s3: false,
         }
     }
 

@@ -1,4 +1,11 @@
 # syntax=docker/dockerfile:1
+# THE production runner image: compose `control` (local build), the
+# `celld deploy` container cell (`RunnerContainer` wrangler
+# `containers[0].image`), and the railpack CI build all use this file —
+# one definition, no sync drift. Repo-root location is load-bearing (G3):
+# `celld deploy` resolves the image path relative to the project and
+# derives the context from the Dockerfile's directory; under `docker/`
+# the repo-root `COPY apps/runner/…` inputs would break.
 # 0.5.0: binding-created workflow instances stall in `waiting` on 0.4.1
 # (platform-cron instances run fine); see SPEC runbook. Rebuild to apply.
 # Sidecar versions (esbuild/duckdb) live in docker/install-sidecars.sh —
@@ -8,6 +15,12 @@
 ARG CELLD_VERSION=0.5.0
 
 FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
+
+# Loopback S3 sidecar for container mode (B1): the fence blocks every route
+# to the compose object store, so the runner spawns this on 127.0.0.1:9000
+# and the worker relays durability into R2. Single binary keeps the image
+# small; the data dir is ephemeral by design (relay owns durability).
+FROM docker.io/rustfs/rustfs:1.0.0-rc.6 AS rustfs
 
 FROM docker.io/library/rust:1-bookworm AS build
 WORKDIR /src
@@ -27,9 +40,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && sh /tmp/install-sidecars.sh && rm /tmp/install-sidecars.sh
 COPY --from=celld /usr/local/bin/celld /usr/local/bin/celld
 COPY --from=build /src/target/release/noite-runner /usr/local/bin/noite-runner
+COPY --from=rustfs /usr/bin/rustfs /usr/local/bin/rustfs
 WORKDIR /data
 ENV RUNNER_BIND=0.0.0.0:8080 \
     PATH="/usr/local/bin:${PATH}" \
     CELLD_ESBUILD=/usr/local/bin/esbuild
-EXPOSE 8080
+# Runner API (8080) + sync API (18080, R2 relay import/export) + tenant fleet
+# range (8100+): celld on Linux dials the container bridge (all ports work),
+# but macOS/`wrangler dev` reaches the container through published loopback
+# ports, so every served port needs EXPOSE. Keep in sync with PORT_BASE
+# stride and SYNC_BIND in `apps/runner`.
+EXPOSE 8080 8100-8199 18080
 CMD ["noite-runner"]

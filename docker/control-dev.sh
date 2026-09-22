@@ -1,7 +1,7 @@
 #!/bin/sh
 # Dev control plane: `vite dev` (real Oxide + Cloudflare plugin pipeline:
-# actions, middleware, workerd, local D1) with file watching. Same
-# 4-service topology as prod; the only difference is this process versus
+# actions, middleware, workerd, local D1) with file watching. Dev keeps the
+# 4-service layout; the only difference is this process versus
 # the prod fleet node (`celld --bucket`, bucket-backed, deployed versions).
 #
 # NOTE: `celld dev` cannot serve this app — it bundles `main` with raw

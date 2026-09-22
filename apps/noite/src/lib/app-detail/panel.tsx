@@ -4,8 +4,8 @@ import { atom, unsafe, watch } from "ilha";
 
 import { appHost, appUrl, initials, presenceTone } from "../apps";
 import { get, setDesired } from "../apps.server";
-import { authClient } from "../auth-client";
 import type { AppRole } from "../roles";
+import { fetchSession } from "../session";
 import { AppHeaderSkeleton } from "../skeletons";
 import { sleep } from "../sleep";
 import { AppStorageList } from "../storage/list";
@@ -77,7 +77,7 @@ export const AppDetailPanel = () => {
 
   watch.once(() => {
     void (async () => {
-      const { data } = await authClient.getSession();
+      const { data } = await fetchSession();
       if (!data?.user) {
         navigate("/login");
         return;

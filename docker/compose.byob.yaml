@@ -1,30 +1,26 @@
-# BYOB: bring your own S3-compatible bucket instead of bundled RustFS.
+# BYOB: bring your own S3-compatible bucket for the control fleet bucket
+# instead of bundled RustFS.
 #
 #   S3_ENDPOINT=https://s3.us-east-1.amazonaws.com \
 #   AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
 #   NOITE_S3_BUCKET=noite S3_PUBLIC_ENDPOINT=https://s3.us-east-1.amazonaws.com \
-#   docker compose -f docker/compose.yaml -f docker/compose.byob.yaml up -d --build runner control caddy
+#   docker compose -f docker/compose.yaml -f docker/compose.byob.yaml up -d --build control caddy
 #
-# Works with AWS S3, MinIO, R2, Ceph — anything SigV4. The runner only needs
-# Get/Put/Delete/List on its bucket prefix; ListAllMyBuckets is optional
-# (readiness falls back to HeadBucket). Bucket is created if missing and the
-# key allows it, otherwise it must already exist.
+# Works with AWS S3, MinIO, R2, Ceph — anything SigV4. The control node opens
+# its fleet bucket (and the runner R2 relay prefix inside it) through these
+# credentials; ListAllMyBuckets is optional (readiness falls back to
+# HeadBucket). Bucket is created if missing and the key allows it, otherwise
+# it must already exist. (Container-mode runner traffic never touches this
+# endpoint directly: sidecar loopback + worker R2 relay.)
 services:
   rustfs:
     # Excluded from BYOB runs — start it explicitly only for local dev.
     profiles: ["bundled-s3"]
-
-  runner:
-    depends_on: []
-    environment:
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?}
-      S3_ENDPOINT: ${S3_ENDPOINT:?}
-      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:?}
-      NOITE_S3_BUCKET: ${NOITE_S3_BUCKET:-noite}
 
   control:
     environment:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?}
       S3_ENDPOINT: ${S3_ENDPOINT:?}
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:?}
+      NOITE_S3_BUCKET: ${NOITE_S3_BUCKET:-noite}

@@ -66,11 +66,14 @@ export const presenceTone = (status: string): string => {
   return "status-warning";
 };
 
-/** Lucide chevron-right. Static trusted markup (no user input), so the
- * unsafe() path is appropriate — it parses in the SVG namespace, which
- * inline <svg> JSX can't reach under ilha's HTML-namespace mounting. */
+/** Lucide chevron-right body (like the layout menu icons: bodies copied
+ * from lucide, rendered via unsafe() to reach the SVG namespace). */
 export const CHEVRON_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>';
+
+/** Lucide chevron-down body (same treatment as CHEVRON_SVG). */
+export const CHEVRON_DOWN_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>';
 
 /** Reachable host for a stored subdomain on the current page's network.
  * Stored subdomains anchor on the configured base (dev: slug.localhost).

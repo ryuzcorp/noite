@@ -17,8 +17,11 @@ use crate::lifecycle::slug_ok;
 use crate::models::{CreateApp, DesiredState, PatchApp, RenameApp};
 use crate::AppState;
 
-pub async fn health() -> impl IntoResponse {
-    Json(json!({ "ok": true, "service": "noite-runner" }))
+pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    // Busy when a deploy holds the runner: the control DO extends its idle
+    // window on this flag so long builds never sleep mid-flight.
+    let busy = !crate::host::deploy::snapshot_claimed(&state.deploying).await.is_empty();
+    Json(json!({ "busy": busy, "ok": true, "service": "noite-runner" }))
 }
 
 /// Readiness for the edge: 200 only after the first successful reconcile
@@ -91,7 +94,10 @@ pub async fn create_app(
         internal,
     )
     .await {
-        Ok(app) => (StatusCode::CREATED, Json(app)).into_response(),
+        Ok(app) => {
+            crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
+            (StatusCode::CREATED, Json(app)).into_response()
+        }
         Err(e) => ApiError::internal(e.to_string()).into_response(),
     }
 }
@@ -116,6 +122,7 @@ pub async fn patch_app(
         if let Err(e) = db::patch_app_desired(&state.pool, &id, ds.as_str()).await {
             return ApiError::internal(e.to_string()).into_response();
         }
+        crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
     }
     match db::get_app(&state.pool, &id).await {
         Ok(Some(app)) => Json(app).into_response(),
@@ -197,7 +204,10 @@ pub async fn delete_app(
     }
 
     match db::delete_app(&state.pool, &id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => ApiError::internal(e.to_string()).into_response(),
     }
 }

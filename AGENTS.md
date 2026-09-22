@@ -6,7 +6,7 @@ Ground truth for working on Noite. Read this before touching code — the rules 
 
 - Noite is a tiny, self-hostable PaaS for [celld](https://celld.dev/) — user accounts, apps, subdomains, and thin deploy/build logs + status. Spec: [SPEC.md](SPEC.md).
 - It is a Bun monorepo with two real apps — `apps/runner` (Rust control plane) and `apps/noite` (Oxide/ilha control UI) — plus one disposable sample app under `apps/noite/test/`.
-- The control plane is **Oxide Worker UI on a celld fleet** (`apps/noite`, `preset: worker`) + **Rust runner** (stays a container — a Rust binary can't be a worker; single owner of the Caddyfile). Every tenant app runs as its own celld fleet (prefix + keys); storage is a RustFS S3 bucket `s3://noite` with prefixes `git/` and `fleets/`; edge is Caddy.
+- The control plane is **Oxide Worker UI on a celld fleet** (`apps/noite`, `preset: worker`) + **Rust runner as the `noite-control` container cell** (a Rust binary can't be a worker; worker `RunnerContainer` DO owns host→port routing; Caddyfile is static). Every tenant app runs as its own celld fleet (prefix + keys); storage is a RustFS S3 bucket `s3://noite` with prefixes `git/`, `fleets/` and `control/`; edge is Caddy.
 - Source flows through the runner’s Git smart-HTTP adapter (`http://git.{BASE_DOMAIN}/{slug}`, Basic `git` + profile API key; collaborator-gated) into the same `s3://noite/git/{slug}` tip-bundle layout; deploys are tip `.bundle` → bare mirror + worktree → optional build → `celld deploy` → reload. Clients do not need git-remote-s3.
 
 ## Build and run
@@ -17,7 +17,7 @@ Ground truth for working on Noite. Read this before touching code — the rules 
   - Auto-fix: `bun x ultracite fix`
   - UI changes: `cd apps/noite && bun run build` (worker build — proves workerd compat; `check` alone doesn't catch Node/Bun-only imports)
 - The stack runs via **rootless podman**:
-  - `make up` — production stack (release images); `make dev` — same topology, dev processes (bind-mounts, cargo-watch, `vite dev`)
+  - `make up` — production stack (release images: rustfs, control, caddy; runner is a container cell); `make dev` — dev processes on the 4-service layout (bind-mounts, cargo-watch, `vite dev`)
   - `make logs`, `make down` (keeps volumes), `make nuke` (volumes + local `.wrangler` D1/SQLite)
   - `up`/`dev` build with cache every run, so no separate build targets
 
@@ -29,22 +29,22 @@ Ground truth for working on Noite. Read this before touching code — the rules 
 - `apps/website` — docs site (blume), not part of the runtime.
 - `packages/cli` — `@noitenow/cli` (Effect CLI `noite deploy`: CI-built dist over Git smart-HTTP).
 - `apps/noite/test` — sample app + `deploy.sh`; also a nested git repo.
-- `docker/` — image definitions + entrypoints + Compose files (`docker/compose.yaml`, `docker/compose.dev.yaml`, `docker/compose.byob.yaml`, `docker/compose.coolify.yaml`); `Makefile` at the root.
+- `docker/` — image definitions + entrypoints + Compose files (`docker/compose.yaml` universal for compose + Coolify via env, `docker/compose.dev.yaml`, `docker/compose.byob.yaml`); `Makefile` at the root.
 - URLs: control UI `http://localhost:9080` (prod `https://app.noite.now` via `CONTROL_SUBDOMAIN=app`; bare `localhost` is the only non-https hostname Bitwarden accepts), runner REST `http://api.localhost:9080`, Git HTTP `http://git.localhost:9080/{slug}`, rustfs S3 `:9000`, console `:9001`, deployed apps `http://{slug}.localhost:9080` (prod `https://{slug}.noite.now`; `app`/`api`/`git` slugs reserved).
 
 | Piece | Role | Owner of what |
 | --- | --- | --- |
-| rustfs | S3 bucket `noite` (`git/` for bundles, `fleets/` for tenant celld) + webhook → runner | storage |
-| runner | bearer-gated REST (`RUNNER_TOKEN`, in `.env`; current `dev-agent-token`), deploy pipeline, fleet supervisor | **single owner of the Caddyfile** |
+| rustfs | S3 bucket `noite` (`git/` bundles, `fleets/` tenant celld, `control/` snapshot) + webhook → runner | storage |
+| runner | bearer-gated REST (`RUNNER_TOKEN`, in `.env`; current `dev-agent-token`), deploy pipeline, fleet supervisor, `/v1/edge/routes` table, `/v1/sync/*` relay API (`:18080`) + loopback S3 sidecar in container mode | container cell; host→port routing owned by the worker DO; durability relayed into R2 (`RUNNER_SNAP`), telemetry stays sidecar-local |
 | ui | Oxide/ilha; every `action` in `apps.server.tsx` runs **server-side** as RPC — the browser never sees the token | control plane |
-| caddy | edge routes control (`CONTROL_SUBDOMAIN`, empty = bare domain in dev) + `{slug}.{BASE_DOMAIN}` → fleets; access logs exist but metrics do **not** come from them | edge |
+| caddy | static wildcard edge → `control:8090` for every vhost (worker Host-dispatches); access logs exist but metrics do **not** come from them | edge |
 
 ## Observability (the pricing substrate)
 
 - Fleets run `CELLD_OTEL=1` → celld writes Parquet traces to `s3://noite/fleets/{slug}/telemetry/traces/...` (bucket sink, no collector).
 - The runner aggregates with the **duckdb CLI** → minute buckets in `app_metric` → `GET /v1/apps/{id}/metrics|spans`.
 - Reality checks: requests = span `name='celld.fetch'`; errors = `ok` flag; latency/queue = `duration_us`/`queue_wait_us`; CPU = `/proc` process sampling (OTel has no CPU signal).
-- Runner restarts reset the metrics watermark — request history counts only from the last restart.
+- Runner restarts (and container moves — telemetry stays sidecar-local, excluded from the R2 relay) reset the metrics watermark — request history counts only from the last restart.
 - Never spawn celld for undeployed apps (crash-loops on missing `deploy/current.json` — guard lives in `app/loop_.rs`).
 - Keep responses lean: on-demand DuckDB reads in endpoints (e.g. `/spans`) instead of persisted aggregates when data is cheap to recompute; only persist what pricing needs (`app_metric` minute buckets).
 

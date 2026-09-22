@@ -11,6 +11,7 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
+    Json,
 };
 
 use crate::AppState;
@@ -224,6 +225,31 @@ pub fn tls_ask_static_ok(
         || extra_hosts
             .iter()
             .any(|h| h.trim().to_lowercase() == bare)
+}
+
+/// Worker route table for container dispatch (`GET /v1/edge/routes`,
+/// bearer-gated): slug → fleet ports for deployed running apps. The control
+/// worker DO caches this (~5 s TTL) and targets tenants via
+/// `getTcpPort(listenPort)`. Stopped/never-deployed apps are omitted so the
+/// worker falls through to the edge fallback page.
+pub async fn edge_routes(State(state): State<AppState>) -> impl IntoResponse {
+    let apps = crate::db::list_apps(&state.pool).await.unwrap_or_default();
+    let mut routes = Vec::new();
+    for app in &apps {
+        if app.is_stopped() || !app.is_deployed() {
+            continue;
+        }
+        let (Some(listen), Some(internal)) = (app.listen_port, app.internal_port) else {
+            continue;
+        };
+        routes.push(serde_json::json!({
+            "slug": app.slug,
+            "listenPort": listen,
+            "internalPort": internal,
+            "status": app.status,
+        }));
+    }
+    Json(serde_json::json!({ "routes": routes }))
 }
 
 /// Caddy `on_demand_tls` gate (`GET /v1/edge/tls-ask?domain=`): 200 only

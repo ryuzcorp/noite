@@ -2,6 +2,7 @@ import { adminOverview } from "$lib/admin.server";
 import { initials } from "$lib/apps";
 import { authClient } from "$lib/auth-client";
 import { Authed, clearSessionCache } from "$lib/authed";
+import { fetchSession, invalidateSession } from "$lib/session";
 import { defineLayout, navigate, useRoute } from "@ilha/router";
 import { atom, unsafe, watch } from "ilha";
 
@@ -22,6 +23,7 @@ const LAYOUT_LIST =
 
 const signOut = async () => {
   clearSessionCache();
+  invalidateSession();
   await authClient.signOut();
   navigate("/login");
 };
@@ -32,7 +34,7 @@ export default defineLayout(({ children }) => {
   const isAdmin = atom(false);
   watch.once(() => {
     void (async () => {
-      const { data } = await authClient.getSession();
+      const { data } = await fetchSession();
       displayName.set(data?.user?.name || data?.user?.email || "");
       if (data?.user) {
         try {

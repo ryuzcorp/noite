@@ -16,10 +16,10 @@ import {
   setEnv,
   updateCollaboratorRole,
 } from "../apps.server";
-import { authClient } from "../auth-client";
 import { parseAppRole } from "../roles";
 import type { AppRole } from "../roles";
 import type { RunnerEnv } from "../runner";
+import { fetchSession } from "../session";
 import { ListSkeleton, SectionSkeleton } from "../skeletons";
 import { readSwrCache, writeSwrCache } from "../swr-cache";
 import type { AppDetailInfo } from "./panel";
@@ -925,7 +925,7 @@ export const AppSettingsPanel = () => {
 
   watch.once(() => {
     void (async () => {
-      const { data } = await authClient.getSession();
+      const { data } = await fetchSession();
       if (!data?.user) {
         navigate("/login");
         return;

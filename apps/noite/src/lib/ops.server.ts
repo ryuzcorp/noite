@@ -14,8 +14,10 @@ import {
   withDb,
 } from "./db";
 import {
+  runnerContainerStub,
   runnerCreateApp,
   runnerDeleteApp,
+  runnerFetch,
   runnerListApps,
   runnerPatchApp,
   runnerRenameApp,
@@ -312,6 +314,41 @@ export const syncAppsSchedule = schedule({
   name: "sync-apps-tick",
   params: { reason: "cron" },
   workflow: syncApps,
+});
+/** Keep the runner container alive and its R2 relay fresh.
+ *
+ * Container target: POST /__do/export through the DO stub — the export
+ * itself is the activity that resets the 10 min idle timer, so long builds
+ * with no other HTTP stay alive on this cadence. Compose mode: plain health
+ * check (harmless). Failures resolve, never reject — the schedule must not
+ * wedge on a wedged container. */
+export const runnerKeepalive = workflow({
+  name: "runner-keepalive",
+  payload: SyncPayload,
+  run: async () => {
+    const stub = await runnerContainerStub();
+    if (stub) {
+      const res = await stub
+        .fetch(new Request("http://runner/__do/export", { method: "POST" }))
+        .catch(() => null);
+      if (res?.ok) {
+        // SAFETY: /__do/export answers {ok, pushed, deleted}; kept defaults true when the shape drifts so the cron stays green.
+        return (await res.json().catch(() => ({ kept: true }))) as {
+          kept: boolean;
+        };
+      }
+      return { kept: false };
+    }
+    await runnerFetch<{ ok: boolean }>("/health").catch(() => ({ ok: false }));
+    return { kept: true };
+  },
+});
+
+export const runnerKeepaliveSchedule = schedule({
+  cron: "*/5 * * * *",
+  name: "runner-keepalive-tick",
+  params: { reason: "cron" },
+  workflow: runnerKeepalive,
 });
 
 /** Parse oxide step durations (`ms`/`s`/`m`/`h`/`d`, default ms). */

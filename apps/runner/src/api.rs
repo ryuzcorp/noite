@@ -15,7 +15,7 @@ pub use apps::{
 };
 pub use deploys::{list_deploys, list_deploys_stream, rollback};
 pub use env::{delete_env, list_env, set_env};
-pub use events::{get_user_props, identify_user, list_channels, list_events, list_insights, log_event, set_insight};
+pub use events::{get_user_props, identify_user, list_channels, list_events, list_events_stream, list_insights, log_event, set_insight};
 pub use git::{git_remote, webhook};
 pub use observe::{app_devices, app_logs, app_logs_stream, app_metrics, app_paths, app_refs, app_spans};
 pub use rpc::handle_rpc;

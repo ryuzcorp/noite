@@ -58,10 +58,43 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config = Arc::new(Config::from_env()?);
+    let mut config = Config::from_env()?;
     tokio::fs::create_dir_all(&config.work_dir).await.ok();
 
+    // Container cell: loopback sidecar replaces the unreachable compose
+    // object store; everything below (buckets, snapshot, bundles) talks to
+    // it, and the worker relays durability into R2.
+    let _sidecar = if config.sidecar_s3 {
+        let child = host::sidecar::spawn_sidecar(&config).await?;
+        config.s3_endpoint = host::sidecar::SIDECAR_ENDPOINT.into();
+        Some(child)
+    } else {
+        None
+    };
+    let config = Arc::new(config);
+
+    // Sync server from boot: the worker pushes the R2 snapshot through it
+    // before the main server exists. No pool needed (sidecar file ops).
+    let imported = Arc::new(AtomicBool::new(!config.sidecar_s3));
+    let sync_state = host::sync::SyncState {
+        cfg: config.clone(),
+        imported: imported.clone(),
+    };
+    let sync_app = host::sync::router(sync_state);
+    let sync_listener = tokio::net::TcpListener::bind(host::sync::SYNC_BIND).await?;
+    tracing::info!(bind = host::sync::SYNC_BIND, "noite-runner sync listening");
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(sync_listener, sync_app).await {
+            tracing::error!(error = %e, "sync server exited");
+        }
+    });
+
     host::cmd::ensure_buckets(&config).await?;
+    // Boot import window: the worker pushes the snapshot, then POSTs
+    // /v1/sync/complete; timeout covers fresh boots and worker-absent runs.
+    host::sync::await_import(&imported, std::time::Duration::from_secs(180)).await;
+    // Ephemeral disk: pull the SQLite snapshot before opening it.
+    let _ = host::persist::restore_from_bucket(&config).await;
 
     let pool = db::connect(&config.database_url).await?;
     let swept = db::fail_stuck_deploys(&pool, DEPLOY_STUCK_MS, &HashSet::new())
@@ -75,7 +108,8 @@ async fn main() -> anyhow::Result<()> {
     let logs = host::logs::new_state();
     // Reclaim leftover soft-delete rows from pre-hard-DELETE era.
     reclaim_legacy_soft_deletes(&pool, &config, &procs, &logs).await;
-
+    // Ephemeral disk: rehydrate bare mirrors from S3 tip bundles.
+    host::rehydrate::rehydrate_all(&pool, &config).await;
     let deploying = host::deploy::new_deploying();
     let metrics = host::metrics::new_state();
     let ready = Arc::new(AtomicBool::new(false));
@@ -105,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/ready", get(api::ready))
         .route("/v1/edge/fallback", get(host::edge::edge_fallback))
         .route("/v1/edge/tls-ask", get(host::edge::tls_ask))
+        .route("/v1/edge/routes", get(host::edge::edge_routes))
         .route("/webhook", post(api::webhook))
         .route("/v1/apps", get(api::list_apps).post(api::create_app))
         .route(
@@ -128,6 +163,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/apps/{id}/refs", get(api::app_refs))
         .route("/v1/apps/{id}/spans", get(api::app_spans))
         .route("/v1/apps/{id}/events", get(api::list_events).post(api::log_event))
+        .route("/v1/apps/{id}/events/stream", get(api::list_events_stream))
         .route("/v1/apps/{id}/events/channels", get(api::list_channels))
         .route("/v1/apps/{id}/identify", post(api::identify_user))
         .route("/v1/apps/{id}/users/{user_id}/props", get(api::get_user_props))

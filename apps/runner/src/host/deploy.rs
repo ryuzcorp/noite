@@ -86,6 +86,7 @@ pub async fn deploy_app(
             tracing::error!(slug = %app.slug, error = %db_e, "failed to record deploy failure");
         }
     }
+    crate::host::persist::snapshot_best_effort(pool, cfg).await;
     release(deploying, &app.id).await;
 }
 

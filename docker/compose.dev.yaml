@@ -1,13 +1,22 @@
-# Dev overlay: same 4-service topology as prod (rustfs, runner, control,
-# caddy) with dev processes. `control` runs `vite dev` (real Oxide +
-# Cloudflare plugin pipeline: workerd, local D1, HMR) instead of joining
-# the prod fleet — no bucket, no deploy cycle. (`celld dev` cannot serve
-# this app: it bundles with raw esbuild, which can't resolve the Oxide
-# plugin's `virtual:oxide/worker` entry.) Secrets come from
-# apps/noite/.dev.vars (auto-loaded).
+# Dev overlay: 4-service layout (rustfs, runner, control, caddy) with dev
+# processes — prod (`docker/compose.yaml`) runs 3 (the runner is a container
+# cell there). `control` runs `vite dev` (real Oxide + Cloudflare plugin
+# pipeline: workerd, local D1, HMR) instead of joining the prod fleet — no
+# bucket, no deploy cycle. (`celld dev` cannot serve this app: it bundles
+# with raw esbuild, which can't resolve the Oxide plugin's
+# `virtual:oxide/worker` entry.) Secrets come from apps/noite/.dev.vars
+# (auto-loaded).
 #   make dev
 services:
   runner:
+    # Dev-only service (prod `compose.yaml` has no runner — the runner is a
+    # container cell there). Fully specified here: hostname/networks live in
+    # this overlay, not the base file.
+    hostname: runner
+    restart: unless-stopped
+    networks: [noite]
+    depends_on:
+      - rustfs
     build:
       context: ..
       dockerfile: docker/Dockerfile.runner-dev
@@ -22,9 +31,38 @@ services:
       - caddy-config:/caddy
     working_dir: /src
     environment:
+      # Dev restores the full runner env the prod base file used to provide
+      # (prod cutover moved the runner into a container cell): without these
+      # the binary falls back to ui:8080 upstreams and dev-host extra hosts
+      # never reach the Caddyfile.
       RUST_LOG: ${RUST_LOG:-noite_runner=debug,tower_http=info}
       CARGO_TERM_COLOR: always
       RUNNER_DEV_RELEASE: ${RUNNER_DEV_RELEASE:-0}
+      RUNNER_BIND: "0.0.0.0:8080"
+      # RUNNER_TOKEN preferred; HOST_TOKEN / AGENT_TOKEN still accepted by the binary.
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-${HOST_TOKEN:-${AGENT_TOKEN:-dev-runner-token}}}
+      NOITE_DB: /data/noite.sqlite
+      S3_ENDPOINT: http://rustfs:9000
+      S3_PUBLIC_ENDPOINT: http://localhost:${RUSTFS_API_PORT:-9000}
+      NOITE_S3_BUCKET: ${NOITE_S3_BUCKET:-noite}
+      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
+      # Empty = control on bare domain (dev); prod sets CONTROL_SUBDOMAIN=app.
+      CONTROL_EXTRA_HOSTS: ${CONTROL_EXTRA_HOSTS:-}
+      # Dynamic subpath: base's static file mount shadows /etc/caddy/Caddyfile
+      # on the caddy side (see caddy below), so write where it stays visible.
+      CADDYFILE_PATH: /caddy/dynamic/Caddyfile
+      # Log stays at the volume root (caddy `log` block is path-fixed);
+      # without this the tick tails <caddyfile-dir>/access.log (missing).
+      CADDY_ACCESS_LOG: /caddy/access.log
+      CADDY_UPSTREAM_HOST: runner
+      CADDY_CONTROL_UPSTREAM: control:8090
+      CADDY_API_UPSTREAM: runner:8080
+      RUNNER_WORK_DIR: /data/runner
+      PORT_BASE: "8100"
+      RUNNER_POLL_MS: "5000"
+      CELLD_BIN: celld
+      GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-http://git.localhost:${HTTP_PORT:-9080}}
+      UI_URL: ${UI_URL:-http://control:8090}
     command: ["/bin/sh", "/runner-dev.sh"]
     healthcheck:
       # Debug compile on first boot can take minutes — start_period covers
@@ -50,6 +88,9 @@ services:
       PORT: "8090"
       # 1 = polling file watcher (flaky rootless inotify).
       VITE_USE_POLLING: ${VITE_USE_POLLING:-0}
+      # Dev never uses the container cell (no celld runtime in vite dev):
+      # pin compose so a prod-inherited RUNNER_TARGET can't leak in.
+      RUNNER_TARGET: compose
     volumes:
       - ../apps/noite:/app:z
       - ../docker/control-dev.sh:/control-dev.sh:ro,z
@@ -64,7 +105,31 @@ services:
       - rustfs
     command: ["/bin/sh", "/control-dev.sh"]
 
+  caddy:
+    # Dev keeps the runner-owned Caddyfile era (prod base is static): the
+    # runner rewrites the shared volume every reconcile. The merged volume
+    # list keeps base's static file mount at /etc/caddy/Caddyfile (it shadows
+    # that exact path), so both sides use the `dynamic/` subpath instead,
+    # which stays visible. Never run dev and prod stacks at once.
+    volumes:
+      - caddy-config:/etc/caddy
+      - caddy-data:/data
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /etc/caddy/dynamic
+        [ -f /etc/caddy/dynamic/Caddyfile ] || printf '%s\n' ':80 {' '  respond "noite edge starting" 200' '}' > /etc/caddy/dynamic/Caddyfile
+        exec caddy run --config /etc/caddy/dynamic/Caddyfile --adapter caddyfile --watch
+    depends_on:
+      - runner
+      - control
+
 volumes:
+  # Dev-only persistent data (prod cutover dropped these): runner SQLite +
+  # git mirrors/builds (agent-data) and the runner-owned Caddyfile.
+  agent-data:
+  caddy-config:
   runner-cargo-registry:
   runner-cargo-git:
   runner-target:
