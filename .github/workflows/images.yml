@@ -39,7 +39,7 @@ permissions:
 concurrency:
   group: images-${{ github.ref }}
   cancel-in-progress: true
-
+jobs:
   check:
     runs-on: ubuntu-latest
     permissions:
