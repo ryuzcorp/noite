@@ -308,7 +308,7 @@ pub async fn tick(
             continue;
         };
         if let Some((app_id, bucket, browser, os, path, source)) = parse_line(text, cfg, slug_id) {
-            db::add_app_device(pool, &app_id, &bucket, &browser, &os).await?;
+            db::add_app_device(pool, &app_id, &bucket, browser, os).await?;
             db::add_app_path(pool, &app_id, &bucket, &path).await?;
             db::add_app_ref(pool, &app_id, &bucket, &source).await?;
         }

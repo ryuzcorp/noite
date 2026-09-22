@@ -25,7 +25,7 @@ pub fn parse_edge_slug(host: &str, bases: &[String], control_sub: &str) -> Optio
     if bare.is_empty() {
         return None;
     }
-    if bases.iter().any(|b| bare == *b) {
+    if bases.contains(&bare) {
         return None;
     }
     // First suffix match wins; the configured domain stays primary.

@@ -62,7 +62,7 @@ pub async fn d1_preview(
         &cfg.celld_bin,
         &[
             "d1", "execute", database_id,
-            "--command", &sql,
+            "--command", sql,
             "--json",
             "--bucket", &bucket,
         ],

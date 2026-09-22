@@ -83,6 +83,9 @@ async fn move_s3_prefix(cfg: &Config, from: &str, to: &str) -> anyhow::Result<()
     Ok(())
 }
 
+// Eight params thread the rename through every subsystem (db, fleets, git,
+// caddy, logs) in one call — a params struct would just rename the problem.
+#[allow(clippy::too_many_arguments)]
 pub async fn rename_app(
     cfg: &Config,
     pool: &sqlx::SqlitePool,
@@ -109,9 +112,9 @@ pub async fn rename_app(
             &app.fleet_bucket,
         )
         .await?;
-        return Ok(db::get_app(pool, app_id)
+        return db::get_app(pool, app_id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("app not found"))?);
+            .ok_or_else(|| anyhow::anyhow!("app not found"));
     }
     if !crate::lifecycle::slug_ok(new_slug) {
         anyhow::bail!("invalid slug");
@@ -211,7 +214,7 @@ async fn rename_slugged(
         &format!("s3://{}/fleets/{new_slug}/", cfg.s3_bucket),
     )
     .await?;
-    Ok(db::get_app(pool, &app.id)
+    db::get_app(pool, &app.id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("app not found"))?)
+        .ok_or_else(|| anyhow::anyhow!("app not found"))
 }

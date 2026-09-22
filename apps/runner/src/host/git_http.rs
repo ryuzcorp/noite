@@ -92,6 +92,11 @@ fn extract_api_key(user: &str, pass: &str) -> Option<String> {
     None
 }
 
+// The Err variant carries a full Response (over the lint's size budget),
+// but every construction site and all three callers already speak Response
+// and the error path runs at most once per request — boxing would churn
+// nine sites for no measurable gain.
+#[allow(clippy::result_large_err)]
 async fn authorize(
     state: &AppState,
     slug: &str,
@@ -258,10 +263,7 @@ pub(crate) async fn list_refs(bare: &Path) -> anyhow::Result<HashMap<String, Str
         Duration::from_secs(15),
     )
     .await;
-    let text = match out {
-        Ok(t) => t,
-        Err(_) => String::new(), // empty repo → no refs
-    };
+    let text = out.unwrap_or_default();
     let mut map = HashMap::new();
     for line in text.lines() {
         let Some((sha, name)) = line.split_once(' ') else {

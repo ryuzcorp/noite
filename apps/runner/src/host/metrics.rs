@@ -251,10 +251,7 @@ pub async fn top_spans(cfg: &Config, slug: &str, since_us: i64) -> Vec<SpanStat>
             since_us,
         ),
     );
-    let out = match duckdb_json(&sql).await {
-        Ok(o) => o,
-        Err(_) => String::new(),
-    };
+    let out = duckdb_json(&sql).await.unwrap_or_default();
     let mut rows = Vec::new();
     let Ok(v) = serde_json::from_str::<serde_json::Value>(out.trim()) else {
         return rows;
@@ -362,7 +359,7 @@ pub async fn tick(
     // 2. Telemetry aggregation every ~2 ticks (10 s at a 5 s poll; 2 s flush)
     //    for near-real-time request counts.
     state.tick += 1;
-    if state.tick % 2 == 0 {
+    if state.tick.is_multiple_of(2) {
         for (slug, id) in &slug_id {
             let after = state.watermark.get(slug).copied().unwrap_or(now_us() - 5_000_000);
             match telemetry_agg(cfg, slug, after).await {
@@ -402,13 +399,13 @@ pub async fn tick(
     // 4. Persist minute buckets.
     for ((id, bucket), a) in &acc {
         if a.req > 0 || a.err > 0 || a.cpu_ms > 0 {
-            db::add_app_metric(pool, &id, &bucket, a.req, a.err, a.lat_ms, a.cpu_ms)
+            db::add_app_metric(pool, id, bucket, a.req, a.err, a.lat_ms, a.cpu_ms)
                 .await?;
         }
     }
 
     // 5. Prune old buckets occasionally (~every 100 ticks).
-    if state.tick % 100 == 0 {
+    if state.tick.is_multiple_of(100) {
         let cutoff = (Utc::now() - chrono::Duration::days(14))
             .format("%Y-%m-%dT%H:%M:00Z")
             .to_string();

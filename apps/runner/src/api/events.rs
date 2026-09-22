@@ -36,6 +36,9 @@ fn tag_value(v: &serde_json::Value) -> bool {
 }
 
 #[derive(Deserialize)]
+// Alpha cut: `notify` (no push delivery) and `parser` (no markdown
+// rendering) are accepted and ignored — the fields must stay for API shape.
+#[allow(dead_code)]
 pub struct LogBody {
     channel: String,
     event: String,
@@ -319,23 +322,20 @@ pub async fn list_events_stream(
             let feed = db::list_app_events(&pool, &app_id, channel.as_deref(), limit).await;
             let channels = db::list_app_channels(&pool, &app_id).await;
             let insights = db::list_app_insights(&pool, &app_id).await;
-            match (feed, channels, insights) {
-                (Ok(feed), Ok(channels), Ok(insights)) => {
-                    let data = serde_json::json!({
-                        "feed": feed,
-                        "channels": channels,
-                        "insights": insights,
-                    })
-                    .to_string();
-                    if last.as_ref() != Some(&data) {
-                        if tx.send(Ok(Event::default().data(data.clone()))).await.is_err() {
-                            break;
-                        }
-                        last = Some(data);
+            // Transient DB error — retry on next tick.
+            if let (Ok(feed), Ok(channels), Ok(insights)) = (feed, channels, insights) {
+                let data = serde_json::json!({
+                    "feed": feed,
+                    "channels": channels,
+                    "insights": insights,
+                })
+                .to_string();
+                if last.as_ref() != Some(&data) {
+                    if tx.send(Ok(Event::default().data(data.clone()))).await.is_err() {
+                        break;
                     }
+                    last = Some(data);
                 }
-                // Transient DB error — retry on next tick.
-                _ => {}
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }

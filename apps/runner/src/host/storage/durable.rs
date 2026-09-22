@@ -96,9 +96,7 @@ pub async fn do_instances(
 /// best-effort. The loopback address matches ensure_fleet's --advertise;
 /// rootless podman routes it to the fleet child in the runner's netns.
 async fn probe_instance(app: &App, scope: &str) -> Option<String> {
-    let Some(port) = app.internal_port else {
-        return None;
-    };
+    let port = app.internal_port?;
     let url = format!("http://127.0.0.1:{port}/do/{scope}?read=1");
     let Ok(response) = reqwest::Client::new()
         .get(&url)

@@ -170,21 +170,19 @@ pub async fn web_commit(
         .await
         .with_context(|| "tip moved under this commit — reload and retry")?;
         // Same linearization + deploy fast-path as a stock push.
-        match after_receive(state, app, &bare, &before).await? {
-            Some(tip) => {
-                if !app.is_stopped() {
-                    let pool = state.pool.clone();
-                    let cfg = state.config.clone();
-                    let procs = state.procs.clone();
-                    let logs = state.logs.clone();
-                    let deploying = state.deploying.clone();
-                    let app = app.clone();
-                    tokio::spawn(async move {
-                        deploy::deploy_tip(&pool, &cfg, &procs, &logs, &deploying, app, tip).await;
-                    });
-                }
-            }
-            None => {}
+        let Some(tip) = after_receive(state, app, &bare, &before).await? else {
+            return Ok(sha);
+        };
+        if !app.is_stopped() {
+            let pool = state.pool.clone();
+            let cfg = state.config.clone();
+            let procs = state.procs.clone();
+            let logs = state.logs.clone();
+            let deploying = state.deploying.clone();
+            let app = app.clone();
+            tokio::spawn(async move {
+                deploy::deploy_tip(&pool, &cfg, &procs, &logs, &deploying, app, tip).await;
+            });
         }
         Ok::<_, anyhow::Error>(sha)
     }

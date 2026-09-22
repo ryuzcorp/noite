@@ -63,6 +63,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # The Rust workspace lives at apps/runner, not the repo root —
+          # without this the action runs cargo metadata at the root,
+          # finds no Cargo.toml, and silently caches nothing.
+          workspaces: apps/runner
       - run: cargo check --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked

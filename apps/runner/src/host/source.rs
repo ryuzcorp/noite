@@ -108,7 +108,7 @@ pub async fn resolve_rev(cfg: &Config, app: &App) -> anyhow::Result<Option<Strin
     if !repo.join("HEAD").exists() {
         return Ok(None);
     }
-    match git(&cfg, &app.slug, &["rev-parse", "--verify", "--quiet", "HEAD"]).await {
+    match git(cfg, &app.slug, &["rev-parse", "--verify", "--quiet", "HEAD"]).await {
         Ok(out) => Ok(Some(out.trim().to_string())),
         Err(_) => Ok(None),
     }

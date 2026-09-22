@@ -6,8 +6,8 @@
 //! - `admin` may do anything (force-push, delete, move tags).
 //! - `push` may create refs and fast-forward-update them; deletes and
 //!   non-fast-forward updates are denied with the naming rule.
-//! Anything else is denied. A body we cannot parse fails open (warn + let git
-//! decide) — git itself re-validates old OIDs, so parsing is policy-only.
+//!   Anything else is denied. A body we cannot parse fails open (warn + let git
+//!   decide) — git itself re-validates old OIDs, so parsing is policy-only.
 
 /// All-zero OID: ref deletion (`new`) or ref creation (`old`).
 pub fn is_zero_oid(s: &str) -> bool {

@@ -80,7 +80,7 @@ pub async fn snapshot_to_bucket(pool: &SqlitePool, cfg: &Config) -> anyhow::Resu
     }
     cmd::s3_cp_upload(cfg, &tmp, SNAPSHOT_KEY).await?;
     let _ = tokio::fs::remove_file(&tmp).await;
-    return Ok(());
+    Ok(())
 }
 
 /// Fire-and-forget snapshot for hot paths (reconcile tick, API writes):

@@ -666,6 +666,9 @@ pub async fn next_ports(pool: &SqlitePool, base: u16) -> sqlx::Result<(i64, i64)
 }
 
 /// Insert one tenant event. Caller validates shapes; tags arrive serialized.
+// Ten args mirror the INSERT column list 1:1 (single caller) — grouping
+// would add indirection without removing a parameter.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_app_event(
     pool: &SqlitePool,
     id: &str,
@@ -791,25 +794,6 @@ pub async fn get_app_user_props(
     .bind(user_id)
     .fetch_optional(pool)
     .await
-}
-
-pub async fn list_app_user_props(
-    pool: &SqlitePool,
-    app_id: &str,
-    user_ids: &[String],
-) -> sqlx::Result<Vec<AppUserProps>> {
-    if user_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let placeholders = user_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT app_id, user_id, properties, updated_at FROM app_user_prop WHERE app_id = ? AND user_id IN ({placeholders})"
-    );
-    let mut q = sqlx::query_as::<_, AppUserProps>(&sql).bind(app_id);
-    for id in user_ids {
-        q = q.bind(id);
-    }
-    q.fetch_all(pool).await
 }
 
 /// Set an insight widget value (string or number).

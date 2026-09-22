@@ -8,7 +8,7 @@
 //! durability is relayed by the control worker into R2 (`host/sync.rs` +
 //! `RunnerContainer` import/export). The sidecar holds no unique state:
 //! everything in it is a copy of what the relay carries.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -24,7 +24,7 @@ pub fn sidecar_dir(cfg: &Config) -> PathBuf {
     PathBuf::from(&cfg.work_dir).join("sidecar")
 }
 
-fn rustfs_cmd(dir: &PathBuf, cfg: &Config) -> tokio::process::Command {
+fn rustfs_cmd(dir: &Path, cfg: &Config) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("/usr/local/bin/rustfs");
     cmd.arg(dir.as_os_str())
         .arg("--address")

@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -316,8 +316,8 @@ async fn deploy_inner(
 async fn materialize_bundle(
     cfg: &Config,
     app: &App,
-    work: &PathBuf,
-    bundle_path: &PathBuf,
+    work: &Path,
+    bundle_path: &Path,
     sha: &str,
 ) -> anyhow::Result<PathBuf> {
     let bare = cmd::work_root(cfg)
@@ -371,7 +371,7 @@ async fn materialize_bundle(
 
 /// One-shot release command from the tenant's wrangler config
 /// (`"release": "bun run db:migrate"`), capped at 500 chars.
-async fn release_cmd(src_dir: &PathBuf) -> Option<String> {
+async fn release_cmd(src_dir: &Path) -> Option<String> {
     for name in ["wrangler.jsonc", "wrangler.json"] {
         let Ok(text) = tokio::fs::read_to_string(src_dir.join(name)).await else {
             continue;

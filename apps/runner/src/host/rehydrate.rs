@@ -60,7 +60,7 @@ pub async fn ensure_deploy_mirror(cfg: &Config, slug: &str) -> anyhow::Result<bo
     let _ = tokio::fs::remove_file(&tmp).await;
     fetched?;
     tracing::info!(slug, sha = %&tip.sha[..12.min(tip.sha.len())], "rehydrated deploy mirror from S3 tip");
-    return Ok(true);
+    Ok(true)
 }
 
 /// Boot-time best-effort: rehydrate every app's deploy mirror. Failures are
