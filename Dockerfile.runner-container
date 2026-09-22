@@ -12,7 +12,7 @@
 # bump there, not here. celld stays an ARG (FROM refs can't come from a
 # script); keep it in sync with Dockerfile.runner-dev, Dockerfile.tools,
 # and railpack.json.
-ARG CELLD_VERSION=0.5.0
+ARG CELLD_VERSION=0.5.1
 
 FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
 

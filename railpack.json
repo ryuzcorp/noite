@@ -7,7 +7,7 @@
   // the `celld deploy` container cell uses the same bytes. Toolchains come
   // from explicit base images, not autodetection — this repo's pins are
   // load-bearing. esbuild/duckdb versions come from
-  // docker/install-sidecars.sh; celld 0.5.0 and rustfs 1.0.0-rc.6 must
+  // docker/install-sidecars.sh; celld 0.5.1 and rustfs 1.0.0-rc.6 must
   // mirror Dockerfile.runner-container (0.4.1 stalls binding-created
   // workflows).
   //
@@ -60,7 +60,7 @@
         "include": ["/usr/local/bin/esbuild", "/usr/local/bin/duckdb"]
       },
       {
-        "image": "ghcr.io/denoland/celld:0.5.0",
+        "image": "ghcr.io/denoland/celld:0.5.1",
         "include": ["/usr/local/bin/celld"]
       },
       {
