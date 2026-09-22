@@ -1,4 +1,4 @@
-# Production runner image for ghcr.io (ghcr.io/ryuzcorp/noite-runner).
+# Production runner image for ghcr.io (ghcr.io/ryuzcorp/noite).
 #
 # The single image every runtime uses — compose `control`
 # (`NOITE_RUNNER_IMAGE`), Coolify (same universal compose file, env
@@ -111,7 +111,7 @@ jobs:
           # (verified locally). Upstream docs use :latest everywhere.
           build-args: BUILDKIT_SYNTAX=ghcr.io/railwayapp/railpack-frontend:latest
           platforms: ${{ matrix.platform }}
-          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/noite-runner,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/noite,push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
       - run: |
@@ -150,7 +150,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/noite-runner
+          images: ghcr.io/${{ github.repository_owner }}/noite
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,prefix=,format=short
@@ -166,4 +166,4 @@ jobs:
           docker buildx imagetools create $tags $digests
         env:
           DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
-          IMAGE: ghcr.io/${{ github.repository_owner }}/noite-runner
+          IMAGE: ghcr.io/${{ github.repository_owner }}/noite
