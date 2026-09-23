@@ -41,10 +41,12 @@ services:
       RUNNER_BIND: "0.0.0.0:8080"
       # RUNNER_TOKEN preferred; HOST_TOKEN / AGENT_TOKEN still accepted by the binary.
       RUNNER_TOKEN: ${RUNNER_TOKEN:-${HOST_TOKEN:-${AGENT_TOKEN:-dev-runner-token}}}
-      NOITE_DB: /data/noite.sqlite
-      S3_ENDPOINT: http://rustfs:9000
-      S3_PUBLIC_ENDPOINT: http://localhost:${RUSTFS_API_PORT:-9000}
-      NOITE_S3_BUCKET: ${NOITE_S3_BUCKET:-noite}
+      # S3 credentials must match the rustfs service (base file `x-aws`
+      # anchor): without these the binary falls back to `noiteaccess`, which
+      # a customized .env rejects with InvalidAccessKeyId — the runner then
+      # never leaves its S3 wait and the edge keeps the placeholder forever.
+      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:-noiteaccess}
+      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:-noitesecretnoitesecretnoite12}
       BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
       # Empty = control on bare domain (dev); prod sets CONTROL_SUBDOMAIN=app.
       CONTROL_EXTRA_HOSTS: ${CONTROL_EXTRA_HOSTS:-}
