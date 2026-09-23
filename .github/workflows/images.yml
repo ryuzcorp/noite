@@ -64,9 +64,9 @@ jobs:
       - name: render byob overlay
         run: BASE_DOMAIN=localhost AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x S3_ENDPOINT=https://s3.example.com S3_PUBLIC_ENDPOINT=https://s3.example.com docker compose -f docker/compose.yaml -f docker/compose.byob.yaml config > /dev/null
       - name: render standalone output
-        run: |
-          bun docker/standalone.ts --out /tmp/compose.standalone.yaml
-          BASE_DOMAIN=localhost docker compose -f /tmp/compose.standalone.yaml config > /dev/null
+        run: bun docker/standalone.ts --out /tmp/compose.standalone.yaml
+      - name: validate standalone output
+        run: BASE_DOMAIN=localhost docker compose -f /tmp/compose.standalone.yaml config > /dev/null
   # Single-file release compose for cloneless deploys (Arcane, plain
   # Docker clouds): generated from the tree, render-proven, attached here
   # so release means downloading, not cloning + bun.

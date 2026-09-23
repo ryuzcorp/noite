@@ -12,9 +12,15 @@ import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 const root = new URL("../", import.meta.url).pathname;
-const arg = (name: string, fallback: string): string =>
-  process.argv.find((a) => a.startsWith(`${name}=`))?.slice(name.length + 1) ??
-  fallback;
+const arg = (name: string, fallback: string): string => {
+  const eq = process.argv.find((a) => a.startsWith(`${name}=`));
+  if (eq === undefined) {
+    const ix = process.argv.indexOf(name);
+    const next = ix === -1 ? undefined : process.argv[ix + 1];
+    return next ?? fallback;
+  }
+  return eq.slice(name.length + 1);
+};
 const tag = arg("--tag", "ghcr.io/ryuzcorp/noite:latest");
 const caddyTag = arg("--caddy-tag", "ghcr.io/ryuzcorp/noite-caddy:latest");
 const outFile = path.resolve(
