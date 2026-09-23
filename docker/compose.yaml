@@ -42,7 +42,23 @@ services:
     volumes:
       - rustfs-data:/data
     networks: [noite]
-
+    # Gate control on S3 actually answering: on a fresh box rustfs spends
+    # seconds initializing data dirs, and control's bucket validation
+    # exits (non-zero, no restart on some platforms) if it dials too early.
+    # Root GET / answers 403 without credentials — connection, not auth,
+    # is the readiness signal, so no -f flag.
+    healthcheck:
+      test: ["CMD", "curl", "-s", "-o", "/dev/null", "http://127.0.0.1:9000/"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+  # Bucket note: the celld node validates s3://NOITE_S3_BUCKET at boot and
+  # exits non-zero when missing — on a fresh box nothing else creates it
+  # (the runner cell only starts after the worker serves). Control ensures
+  # it in its own start command (idempotent head-or-make via the baked-in
+  # awscli) instead of a separate init service, so no platform has to honor
+  # cross-service completion ordering.
   control:
     # celld fleet node serving the control UI worker (`apps/noite/dist`
     # deployed via `celld deploy`) AND the runner container cell
@@ -59,23 +75,15 @@ services:
       context: ..
       dockerfile: Dockerfile.runner-container
     image: ${NOITE_RUNNER_IMAGE:-noite-runner:local}
+    # Entrypoint script (baked in the image): ensures the fleet bucket,
+    # then execs celld. Explicit here so GHCR (railpack `/bin/bash -c`
+    # entrypoint) and local builds behave identically — never rely on
+    # image defaults for control.
+    entrypoint: ["/usr/local/bin/noite-entrypoint.sh"]
     hostname: control
-    restart: unless-stopped
     stop_grace_period: 15s
-    command:
-      - celld
-      - --bucket
-      - s3://${NOITE_S3_BUCKET:-noite}/control
-      - --endpoint
-      - ${S3_ENDPOINT:-http://rustfs:9000}
-      - --region
-      - ${AWS_REGION:-us-east-1}
-      - --listen
-      - 0.0.0.0:8090
-      - --internal-listen
-      - 0.0.0.0:8091
-      - --advertise
-      - 127.0.0.1:8091
+    # No `command:` — the entrypoint runs bucket-ensure + celld with
+    # topology flags from env (explicit args would pass through verbatim).
     environment:
       <<: *aws
       S3_ENDPOINT: ${S3_ENDPOINT:-http://rustfs:9000}
@@ -112,10 +120,25 @@ services:
       PORT_BASE: "8100"
     networks: [noite]
     depends_on:
-      - rustfs
-
+      rustfs:
+        condition: service_healthy
+    # Process-alive (not HTTP): an empty fleet accepts TCP on :8090 but
+    # never answers without a deployment, so a curl gate would deadlock
+    # fresh installs. PID 1 is celld (entrypoint reset); this only gates
+    # ordering — caddy must not route before the node exists.
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
   caddy:
-    image: docker.io/library/caddy:2.10.0-alpine
+    # Baked edge image (Dockerfile.caddy + Caddyfile.static); `make up`
+    # --build refreshes it on file edits, the standalone release pulls it.
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.caddy
+    image: noite-caddy:local
     restart: unless-stopped
     ports:
       - "${HTTP_PORT:-9080}:80"
@@ -137,12 +160,16 @@ services:
     volumes:
       # Static edge: single wildcard site + on-demand TLS (ask via the
       # control worker) → reverse_proxy control:8090 for everything. See
-      # docker/Caddyfile.static.
-      - ./Caddyfile.static:/etc/caddy/Caddyfile:ro
+      # docker/Caddyfile.static. `:z` relabels for container reads on
+      # SELinux-enforcing hosts (Fedora); ignored elsewhere.
+      - ./Caddyfile.static:/etc/caddy/Caddyfile:ro,z
       - caddy-data:/data
     networks: [noite]
+    # Wait for the node listener before routing to it (kills the 502 window
+    # on fresh boot; an empty fleet still serves 404s, which is fine).
     depends_on:
-      - control
+      control:
+        condition: service_healthy
 
 networks:
   noite:

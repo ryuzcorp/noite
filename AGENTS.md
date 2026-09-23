@@ -29,7 +29,7 @@ Ground truth for working on Noite. Read this before touching code — the rules 
 - `apps/website` — docs site (blume), not part of the runtime.
 - `packages/cli` — `@noitenow/cli` (Effect CLI `noite deploy`: CI-built dist over Git smart-HTTP).
 - `apps/noite/test` — sample app + `deploy.sh`; also a nested git repo.
-- `docker/` — image definitions + entrypoints + Compose files (`docker/compose.yaml` universal for compose + Coolify via env, `docker/compose.dev.yaml`, `docker/compose.byob.yaml`); `Makefile` at the root.
+- `docker/` — image definitions + entrypoints + Compose files (`docker/compose.yaml` universal for compose + Coolify via env, `docker/compose.dev.yaml`, `docker/compose.byob.yaml`; `docker/standalone.ts` single-file generator, `docker/check-versions.ts` pin drift guard); release compose ships as the `compose-standalone` CI artifact. `Makefile` at the root.
 - URLs: control UI `http://localhost:9080` (prod `https://app.noite.now` via `CONTROL_SUBDOMAIN=app`; bare `localhost` is the only non-https hostname Bitwarden accepts), runner REST `http://api.localhost:9080`, Git HTTP `http://git.localhost:9080/{slug}`, rustfs S3 `:9000`, console `:9001`, deployed apps `http://{slug}.localhost:9080` (prod `https://{slug}.noite.now`; `app`/`api`/`git` slugs reserved).
 
 | Piece | Role | Owner of what |

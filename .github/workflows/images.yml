@@ -26,7 +26,10 @@ on:
     paths:
       - "apps/runner/**"
       - "Dockerfile.runner-container"
+      - "docker/Dockerfile.caddy"
+      - "docker/Caddyfile.static"
       - "docker/install-sidecars.sh"
+      - "docker/noite-entrypoint.sh"
       - "railpack.json"
       - ".github/workflows/images.yml"
     tags:
@@ -49,6 +52,35 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - run: bun install
       - run: bun run check
+      - run: bun docker/check-versions.ts
+      # Every compose variant must render (config needs no daemon) and the
+      # standalone generator output must render too — catches YAML
+      # structure breaks and generator drift before release.
+      - run: |
+          BASE_DOMAIN=localhost docker compose -f docker/compose.yaml config > /dev/null
+          BASE_DOMAIN=localhost docker compose -f docker/compose.yaml -f docker/compose.dev.yaml config > /dev/null
+          BASE_DOMAIN=localhost AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x S3_ENDPOINT=https://s3.example.com S3_PUBLIC_ENDPOINT=https://s3.example.com docker compose -f docker/compose.yaml -f docker/compose.byob.yaml config > /dev/null
+          bun docker/standalone.ts --out /tmp/compose.standalone.yaml
+          BASE_DOMAIN=localhost docker compose -f /tmp/compose.standalone.yaml config > /dev/null
+  # Single-file release compose for cloneless deploys (Arcane, plain
+  # Docker clouds): generated from the tree, render-proven, attached here
+  # so release means downloading, not cloning + bun.
+  standalone:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - run: bun docker/standalone.ts --out /tmp/compose.standalone.yaml
+      - run: docker compose -f /tmp/compose.standalone.yaml config > /dev/null
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: compose-standalone
+          path: /tmp/compose.standalone.yaml
+          retention-days: 30
 
   rust:
     runs-on: ubuntu-latest
@@ -127,6 +159,40 @@ jobs:
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
+
+  # Edge image is a COPY-only layer over upstream multi-arch Caddy, so one
+  # job builds both platforms at once (no matrix, no cache needed).
+  caddy-image:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/noite-caddy
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=,format=short
+            type=semver,pattern={{version}}
+            type=raw,value=stable,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile.caddy
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
 
   merge:
     needs: build

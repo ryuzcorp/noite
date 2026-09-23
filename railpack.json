@@ -43,10 +43,11 @@
     "sidecars": {
       "inputs": [
         { "image": "docker.io/library/debian:bookworm-slim" },
-        { "local": true, "include": ["docker/install-sidecars.sh"] }
+        { "local": true, "include": ["docker/install-sidecars.sh"] },
+        { "local": true, "include": ["docker/noite-entrypoint.sh"] }
       ],
       "commands": [
-        "export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && apt-get update && apt-get install -y --no-install-recommends curl ca-certificates unzip && rm -rf /var/lib/apt/lists/* && sh /app/install-sidecars.sh"
+        "export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && apt-get update && apt-get install -y --no-install-recommends curl ca-certificates unzip && rm -rf /var/lib/apt/lists/* && sh /app/install-sidecars.sh && install -m 755 /app/docker/noite-entrypoint.sh /usr/local/bin/noite-entrypoint.sh"
       ]
     }
   },
@@ -57,7 +58,11 @@
       { "step": "runner", "include": ["/usr/local/bin/noite-runner"] },
       {
         "step": "sidecars",
-        "include": ["/usr/local/bin/esbuild", "/usr/local/bin/duckdb"]
+        "include": [
+          "/usr/local/bin/esbuild",
+          "/usr/local/bin/duckdb",
+          "/usr/local/bin/noite-entrypoint.sh"
+        ]
       },
       {
         "image": "ghcr.io/denoland/celld:0.5.1",

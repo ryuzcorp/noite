@@ -41,6 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=celld /usr/local/bin/celld /usr/local/bin/celld
 COPY --from=build /src/target/release/noite-runner /usr/local/bin/noite-runner
 COPY --from=rustfs /usr/bin/rustfs /usr/local/bin/rustfs
+COPY docker/noite-entrypoint.sh /usr/local/bin/noite-entrypoint.sh
 WORKDIR /data
 ENV RUNNER_BIND=0.0.0.0:8080 \
     PATH="/usr/local/bin:${PATH}" \
@@ -51,4 +52,10 @@ ENV RUNNER_BIND=0.0.0.0:8080 \
 # ports, so every served port needs EXPOSE. Keep in sync with PORT_BASE
 # stride and SYNC_BIND in `apps/runner`.
 EXPOSE 8080 8100-8199 18080
-CMD ["noite-runner"]
+# Dual role (see the script): compose control overrides entrypoint+command
+# explicitly; the celld container cell runs image defaults (entrypoint
+# script + `cell` → the runner). Exec form — never shell — so flags always
+# reach the binary (a `/bin/bash -c` entrypoint would eat a list-form
+# command and run it bare).
+ENTRYPOINT ["/usr/local/bin/noite-entrypoint.sh"]
+CMD ["cell"]

@@ -5,6 +5,8 @@ node_modules
 out
 dist
 *.tgz
+# generated standalone compose (bun docker/standalone.ts)
+docker/compose.standalone.yaml
 
 # code coverage
 coverage

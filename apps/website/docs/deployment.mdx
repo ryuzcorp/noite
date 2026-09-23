@@ -3,7 +3,7 @@ title: Deployment
 description: Deploy Noite anywhere with Docker Compose — bundled RustFS or your own S3 bucket.
 ---
 
-Noite ships as three services: **control** (control-plane UI plus the Rust runner as a container cell — deploy pipeline, fleet supervisor, route table), **caddy** (static edge router), and **rustfs** (S3 bucket). Two storage options for the fleet bucket:
+Noite ships as three services: **control** (control-plane UI plus the Rust runner as a container cell — deploy pipeline, fleet supervisor, route table), **caddy** (static edge router), and **rustfs** (S3 bucket). Two storage options for the fleet bucket. No clone needed: `bun docker/standalone.ts > noite.compose.yaml` emits a single self-contained file (GHCR image, embedded Caddyfile) from `docker/compose.yaml` + `docker/Caddyfile.static` — run it anywhere with four env vars (see the file header). The rest of this guide uses the repo checkout.
 
 |  | A: bundled RustFS | B: your own bucket (BYOB) |
 | --- | --- | --- |
@@ -65,7 +65,7 @@ Push the sample app via `apps/noite/test/deploy.sh` (point its remote at `https:
 
 ## Coolify
 
-Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `main`) — the same universal file as `make up`, driven by env. In Environment Variables, set `BASE_DOMAIN` to your domain (defaults to `localhost`); `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` derive from it unless overridden. Generate values for `BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY` — nothing auto-generates; the worker refuses dev defaults on real domains. To pull the release image instead of building, set `NOITE_RUNNER_IMAGE=ghcr.io/ryuzcorp/noite:stable` (pinned) or `:latest` (follows main; baked by `.github/workflows/images.yml` from `railpack.json` on every main push — for a private repo, make the package public or add registry auth in Coolify). Deploy, then paste the real hostnames once on the `caddy` service Domains field: `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. The apex stays on your marketing site.
+Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `main`) — the same universal file as `make up`, driven by env. In Environment Variables, set `BASE_DOMAIN` to your domain (defaults to `localhost`); `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` derive from it unless overridden. Generate values for `BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY` — nothing auto-generates; the worker refuses dev defaults on real domains. To pull the release image instead of building, set `NOITE_RUNNER_IMAGE=ghcr.io/ryuzcorp/noite:latest` (`:stable` once the first release tag exists; pin a SHA for reproducibility; baked by `.github/workflows/images.yml` from `railpack.json` on every main push — for a private repo, make the package public or add registry auth in Coolify). Deploy, then paste the real hostnames once on the `caddy` service Domains field: `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. The apex stays on your marketing site.
 
 ### Downtime model
 

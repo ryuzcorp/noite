@@ -18,7 +18,7 @@ export
 # pi-lens-ignore: shellcheck-14-1073
 # pi-lens-ignore: shellcheck-14-1050
 # pi-lens-ignore: shellcheck-14-1072
- .PHONY: help up dev dev-host logs doctor down nuke
+ .PHONY: help up up-prod dev dev-host logs doctor down nuke
 
  COMPOSE_DEV := $(COMPOSE) -f docker/compose.dev.yaml
 
@@ -29,6 +29,7 @@ export
 
 help:
 	@echo "  make up    production stack (release images)"
+	@echo "  make up-prod  production stack from GHCR (no build; any cloud VM)"
 	@echo "  make dev   dev processes (cargo-watch runner + vite dev control)"
 	@echo "  make dev-host  dev + control UI reachable from LAN (Host: <lan-ip>)"
 	@echo "  make logs  follow control + rustfs + caddy"
@@ -44,6 +45,12 @@ help:
 up:
 	$(COMPOSE) up -d --build rustfs control caddy
 	@echo "open http://localhost:$${HTTP_PORT:-9080}"
+
+# Release deploy (any cloud VM): pull the GHCR image, never build. Pin with
+# NOITE_RUNNER_IMAGE=ghcr.io/ryuzcorp/noite:<sha> for reproducibility
+# (:stable does not exist yet — first v* tag/release creates it).
+up-prod:
+	NOITE_RUNNER_IMAGE=$${NOITE_RUNNER_IMAGE:-ghcr.io/ryuzcorp/noite:latest} $(COMPOSE) up -d --pull always rustfs control caddy
 
 dev:
 	$(COMPOSE_DEV) up -d --build rustfs runner control caddy
