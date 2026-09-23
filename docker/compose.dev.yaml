@@ -84,6 +84,10 @@ services:
     image: noite-tools:local
     restart: unless-stopped
     stop_grace_period: 15s
+    # Reset prod's entrypoint (the tools image has no bucket script and
+    # runs vite, not celld) — verified `entrypoint: []` restores the image
+    # default on podman; command below then runs as-is.
+    entrypoint: []
     environment:
       PORT: "8090"
       # 1 = polling file watcher (flaky rootless inotify).

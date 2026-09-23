@@ -14,9 +14,21 @@ if [ "${1:-}" = "cell" ]; then
   exec noite-runner "$@"
 fi
 # Fleet bucket must exist before celld validates it (fresh boxes have
-# nothing else to create it): idempotent head-or-make via awscli.
+# nothing else to create it): wait for S3, then idempotent head-or-make
+# via awscli. The wait loop (not compose ordering) is what makes this
+# work under BYOB overlays and on platforms that ignore dependency
+# conditions — S3 root answers 403 without credentials, so connection
+# (not auth) is the signal. Caps at ~2 min, then fails loud.
 BKT="s3://${NOITE_S3_BUCKET:-noite}"
 EP="${S3_ENDPOINT:-http://rustfs:9000}"
+tries=0
+while [ $tries -lt 60 ]; do
+  if curl -s -o /dev/null "$EP"; then
+    break
+  fi
+  tries=$((tries + 1))
+  sleep 2
+done
 aws --endpoint-url "$EP" s3api head-bucket --bucket "${NOITE_S3_BUCKET:-noite}" 2>/dev/null || aws --endpoint-url "$EP" s3 mb "$BKT"
 # No args = the celld node with topology flags from env. Explicit args
 # (compose `command:`, manual runs) pass straight through to celld.

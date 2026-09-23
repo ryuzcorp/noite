@@ -118,10 +118,10 @@ services:
       UI_URL: ${UI_URL:-http://control:8090}
       RUNNER_POLL_MS: "5000"
       PORT_BASE: "8100"
+    # No depends_on: the entrypoint wait-loops S3 itself, so no bundled
+    # edge can dangle (BYOB profiles rustfs out and strict engines reject
+    # undefined services). Caddy still gates on this node's health below.
     networks: [noite]
-    depends_on:
-      rustfs:
-        condition: service_healthy
     # Process-alive (not HTTP): an empty fleet accepts TCP on :8090 but
     # never answers without a deployment, so a curl gate would deadlock
     # fresh installs. PID 1 is celld (entrypoint reset); this only gates
