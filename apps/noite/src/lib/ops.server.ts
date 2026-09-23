@@ -351,6 +351,40 @@ export const runnerKeepaliveSchedule = schedule({
   workflow: runnerKeepalive,
 });
 
+/** Nightly disaster copy of the runner's telemetry keyspace (the only state
+ * the 5-min relay doesn't carry) into R2 `backup/<date>/`, 7-day retention.
+ * Container target: POST /__do/backup through the DO stub. Compose mode:
+ * skip — telemetry lives on a persistent host volume there, which is the
+ * operator's backup domain, not the relay's. Failures resolve, never reject.
+ */
+export const runnerBackup = workflow({
+  name: "runner-backup",
+  payload: SyncPayload,
+  run: async () => {
+    const stub = await runnerContainerStub();
+    if (!stub) {
+      return { backedUp: false, reason: "compose-target" };
+    }
+    const res = await stub
+      .fetch(new Request("http://runner/__do/backup", { method: "POST" }))
+      .catch(() => null);
+    if (!res?.ok) {
+      return { backedUp: false };
+    }
+    // SAFETY: /__do/backup answers {ok, copied, date, pruned}; kept defaults false when the shape drifts so the cron stays honest.
+    return (await res.json().catch(() => ({ backedUp: true }))) as {
+      backedUp: boolean;
+    };
+  },
+});
+
+export const runnerBackupSchedule = schedule({
+  cron: "0 4 * * *",
+  name: "runner-backup-tick",
+  params: { reason: "cron" },
+  workflow: runnerBackup,
+});
+
 /** Parse oxide step durations (`ms`/`s`/`m`/`h`/`d`, default ms). */
 const stepDurationMs = (spec: string): number => {
   const m = /^(?<num>\d+)\s*(?<unit>ms|s|m|h|d)?$/iu.exec(spec.trim());

@@ -11,9 +11,13 @@
  * every route to the compose object store, so the runner talks S3-protocol
  * to a loopback sidecar and this DO relays durability into R2 (same fleet
  * bucket, `r2/noite-runner/`, no second store or credential): import on
- * every container start, export on cron. Telemetry stays sidecar-local
- * (moves reset the metrics watermark — already today's semantic).
+ * every container start, export on cron. The 5-min relay excludes telemetry
+ * spans (bandwidth proportional to state, not spans); the nightly backup
+ * copies them to `backup/<date>/` (7-day retention, explicit restore via
+ * `/__do/restore`). The metrics watermark persists in the SQLite snapshot,
+ * so moves resume aggregation instead of resetting it.
  */
+
 import { Container } from "@cloudflare/containers";
 import type { DurableObjectState, R2Bucket } from "@cloudflare/workers-types";
 import * as Schema from "effect/Schema";
@@ -22,6 +26,8 @@ const RUNNER_PORT = 8080;
 const SYNC_PORT = 18_080;
 const ROUTES_TTL_MS = 5000;
 const MANIFEST_KEY = "runner/manifest.json";
+/** Nightly backup retention: dated `backup/<date>/` prefixes kept in R2. */
+const BACKUP_RETAIN_DAYS = 7;
 
 const EdgeRouteSchema = Schema.Struct({
   internalPort: Schema.Number,
@@ -177,9 +183,11 @@ export class RunnerContainer extends Container<ContainerEnv> {
     if (url.pathname === "/__do/export") {
       return this.handleExport();
     }
-    if (url.pathname === "/__do/import") {
-      await this.ensureImported();
-      return Response.json({ ok: true });
+    if (url.pathname === "/__do/backup") {
+      return this.handleBackup();
+    }
+    if (url.pathname === "/__do/restore") {
+      return this.handleRestore(url.searchParams.get("date") ?? "");
     }
     const routed = parsePortPrefix(url.pathname);
     const port = routed?.port ?? RUNNER_PORT;
@@ -285,7 +293,9 @@ export class RunnerContainer extends Container<ContainerEnv> {
       // oxlint-disable-next-line eslint/no-await-in-loop -- cursor pagination: each page depends on the previous cursor.
       const listed = await r2.list(cursor ? { cursor } : {});
       for (const obj of listed.objects) {
-        if (obj.key === MANIFEST_KEY) {
+        // Backup copies are restore-only: never hydrate them into the live
+        // sidecar (restore strips the date prefix explicitly via /__do/restore).
+        if (obj.key === MANIFEST_KEY || obj.key.startsWith("backup/")) {
           continue;
         }
         // oxlint-disable-next-line eslint/no-await-in-loop -- bounded sequential puts: bundles can be 100s of MB, Promise.all would OOM the isolate.
@@ -316,6 +326,13 @@ export class RunnerContainer extends Container<ContainerEnv> {
     });
     const token = this.stringEnv("RUNNER_TOKEN");
     const auth = { authorization: `Bearer ${token}` };
+    // Flush a fresh snapshot first so the relay copies seconds-old state.
+    // Fail-soft: a wedged runner must not wedge the relay schedule.
+    await this.runnerFetch("/v1/admin/checkpoint", { method: "POST" }).catch(
+      () => {
+        console.log("pre-export checkpoint failed");
+      }
+    );
     const manifestRes = await this.syncFetch("/v1/sync/manifest", {
       headers: auth,
     });
@@ -363,6 +380,201 @@ export class RunnerContainer extends Container<ContainerEnv> {
       { httpMetadata: { contentType: "application/json" } }
     );
     return { deleted: stale.length, pushed };
+  }
+
+  /** Nightly disaster copy: telemetry is the only keyspace the 5-min relay
+   * doesn't carry, so back it up under `backup/<date>/` (everything else is
+   * already continuously in R2). The per-day manifest holds etags so repeat
+   * runs copy only changed objects; days older than BACKUP_RETAIN_DAYS are
+   * pruned. Restore is explicit (`POST /__do/restore?date=`) — never automatic.
+   * Never runs before the import gate — an empty sidecar must not blank a
+   * backup day. */
+  private async backupToR2(): Promise<{
+    copied: number;
+    date: string;
+    pruned: number;
+  }> {
+    const r2 = this.relayBucket();
+    await this.startAndWaitForPorts({
+      ports: [SYNC_PORT],
+      startOptions: { envVars: this.runnerEnv() },
+    });
+    const token = this.stringEnv("RUNNER_TOKEN");
+    const auth = { authorization: `Bearer ${token}` };
+    await this.runnerFetch("/v1/admin/checkpoint", { method: "POST" }).catch(
+      () => {
+        console.log("pre-backup checkpoint failed");
+      }
+    );
+    const manifestRes = await this.syncFetch(
+      "/v1/sync/manifest?include_telemetry=1",
+      { headers: auth }
+    );
+    if (!manifestRes.ok) {
+      throw new Error(`sync manifest: ${manifestRes.status}`);
+    }
+    const manifest = Schema.decodeUnknownSync(SyncManifestSchema)(
+      await manifestRes.json()
+    );
+    if (!manifest.imported) {
+      await this.ensureImported();
+      return { copied: 0, date: "", pruned: 0 };
+    }
+    const date = new Date().toISOString().slice(0, 10);
+    const dayManifestKey = `backup/${date}/manifest.json`;
+    const dayRaw = await r2.get(dayManifestKey);
+    const day: RelayManifest = dayRaw
+      ? Schema.decodeUnknownSync(RelayManifestSchema)(await dayRaw.json())
+      : { objects: {} };
+    let copied = 0;
+    const want: Record<string, string> = {};
+    for (const obj of manifest.objects) {
+      if (!obj.key.includes("/telemetry/")) {
+        continue;
+      }
+      want[obj.key] = obj.etag;
+      if (day.objects[obj.key] === obj.etag) {
+        continue;
+      }
+      // oxlint-disable-next-line eslint/no-await-in-loop -- bounded sequential gets: objects can be 100s of MB, Promise.all would OOM the isolate.
+      const got = await this.syncFetch(
+        `/v1/sync/get?key=${encodeURIComponent(obj.key)}`,
+        { headers: auth }
+      );
+      if (!got.ok) {
+        throw new Error(`sync get ${obj.key}: ${got.status}`);
+      }
+      // oxlint-disable-next-line eslint/no-await-in-loop -- same bounded sequential; the bytes above are already in hand one at a time.
+      await r2.put(`backup/${date}/${obj.key}`, await got.arrayBuffer(), {
+        httpMetadata: { contentType: "application/octet-stream" },
+      });
+      copied += 1;
+    }
+    await r2.put(dayManifestKey, JSON.stringify({ objects: want }), {
+      httpMetadata: { contentType: "application/json" },
+    });
+    const pruned = await this.pruneBackups(date);
+    return { copied, date, pruned };
+  }
+
+  /** Delete `backup/<date>/` prefixes older than the retention window. */
+  private async pruneBackups(today: string): Promise<number> {
+    const cutoffDate = new Date(`${today}T00:00:00Z`);
+    cutoffDate.setUTCDate(cutoffDate.getUTCDate() - (BACKUP_RETAIN_DAYS - 1));
+    const cutoff = cutoffDate.toISOString().slice(0, 10);
+    const r2 = this.relayBucket();
+    const stale: string[] = [];
+    let cursor: string | undefined;
+    for (;;) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- cursor pagination: each page depends on the previous cursor.
+      const listed = await r2.list(
+        cursor ? { cursor, prefix: "backup/" } : { prefix: "backup/" }
+      );
+      for (const obj of listed.objects) {
+        const day = obj.key.split("/")[1] ?? "";
+        if (/^\d{4}-\d{2}-\d{2}$/u.test(day) && day < cutoff) {
+          stale.push(obj.key);
+        }
+      }
+      if (!listed.truncated) {
+        break;
+      }
+      ({ cursor } = listed);
+    }
+    const CHUNK = 500;
+    for (let i = 0; i < stale.length; i += CHUNK) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- chunked deletes: bounded sequential R2 calls.
+      await r2.delete(stale.slice(i, i + CHUNK));
+    }
+    return stale.length;
+  }
+
+  /** Manual disaster restore: copy `backup/<date>/` objects back to live
+   * keys (date prefix stripped) through the sync API. Validates the date;
+   * telemetry parquet lands back in the sidecar where the tick re-aggregates
+   * it once the watermark predates it (fresh restores start empty, so no
+   * double-count). */
+  private async restoreFromBackup(date: string): Promise<{ restored: number }> {
+    if (!/^\d{4}-\d{2}-\d{2}$/u.test(date)) {
+      throw new Error(`bad date: ${date}`);
+    }
+    const r2 = this.relayBucket();
+    const dayRaw = await r2.get(`backup/${date}/manifest.json`);
+    if (!dayRaw) {
+      throw new Error(`no backup for ${date}`);
+    }
+    const day = Schema.decodeUnknownSync(RelayManifestSchema)(
+      await dayRaw.json()
+    );
+    await this.startAndWaitForPorts({
+      ports: [SYNC_PORT],
+      startOptions: { envVars: this.runnerEnv() },
+    });
+    const token = this.stringEnv("RUNNER_TOKEN");
+    const auth = { authorization: `Bearer ${token}` };
+    let restored = 0;
+    for (const key of Object.keys(day.objects)) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- bounded sequential gets: objects can be 100s of MB, Promise.all would OOM the isolate.
+      const stored = await r2.get(`backup/${date}/${key}`);
+      if (!stored) {
+        continue;
+      }
+      // oxlint-disable-next-line eslint/no-await-in-loop -- same bounded sequential; the bytes above are already in hand one at a time.
+      const body = await stored.arrayBuffer();
+      // oxlint-disable-next-line eslint/no-await-in-loop -- same bounded sequential put per object.
+      const put = await this.syncFetch(
+        `/v1/sync/put?key=${encodeURIComponent(key)}`,
+        {
+          body,
+          headers: {
+            ...auth,
+            "content-type": "application/octet-stream",
+          },
+          method: "POST",
+        }
+      );
+      if (!put.ok) {
+        throw new Error(`sync put ${key}: ${put.status}`);
+      }
+      restored += 1;
+    }
+    return { restored };
+  }
+
+  /** Cron entrypoint (POST /__do/backup): never throws — the schedule must
+   * not wedge on a wedged container. */
+  private async handleBackup(): Promise<Response> {
+    try {
+      const counts = await this.backupToR2();
+      return Response.json({ ok: true, ...counts });
+    } catch (error) {
+      console.log("backup failed:", error);
+      return Response.json(
+        {
+          error: error instanceof Error ? error.message : String(error),
+          ok: false,
+        },
+        { status: 502 }
+      );
+    }
+  }
+
+  /** Operator entrypoint (POST /__do/restore?date=YYYY-MM-DD). */
+  private async handleRestore(date: string): Promise<Response> {
+    try {
+      const counts = await this.restoreFromBackup(date);
+      return Response.json({ date, ok: true, ...counts });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.log("restore failed:", error);
+      let status = 502;
+      if (message.startsWith("bad date")) {
+        status = 400;
+      } else if (message.startsWith("no backup")) {
+        status = 404;
+      }
+      return Response.json({ error: message, ok: false }, { status });
+    }
   }
 
   /** Cron entrypoint (POST /__do/export): never throws — the schedule must

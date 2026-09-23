@@ -44,7 +44,7 @@ Ground truth for working on Noite. Read this before touching code — the rules 
 - Fleets run `CELLD_OTEL=1` → celld writes Parquet traces to `s3://noite/fleets/{slug}/telemetry/traces/...` (bucket sink, no collector).
 - The runner aggregates with the **duckdb CLI** → minute buckets in `app_metric` → `GET /v1/apps/{id}/metrics|spans`.
 - Reality checks: requests = span `name='celld.fetch'`; errors = `ok` flag; latency/queue = `duration_us`/`queue_wait_us`; CPU = `/proc` process sampling (OTel has no CPU signal).
-- Runner restarts (and container moves — telemetry stays sidecar-local, excluded from the R2 relay) reset the metrics watermark — request history counts only from the last restart.
+- Runner restarts resume telemetry aggregation from the persisted watermark (`metric_watermark` in the relayed SQLite snapshot) — history counts from the last relay export, not the last restart. (Fresh sidecars still lose spans written since the last metrics tick; the tick runs every ~10 s so the gap is seconds.)
 - Never spawn celld for undeployed apps (crash-loops on missing `deploy/current.json` — guard lives in `app/loop_.rs`).
 - Keep responses lean: on-demand DuckDB reads in endpoints (e.g. `/spans`) instead of persisted aggregates when data is cheap to recompute; only persist what pricing needs (`app_metric` minute buckets).
 

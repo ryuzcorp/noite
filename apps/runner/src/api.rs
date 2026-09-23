@@ -11,7 +11,8 @@ pub mod source;
 pub mod storage;
 
 pub use apps::{
-    create_app, delete_app, get_app, health, list_apps, patch_app, ready, rename_app,
+    checkpoint, create_app, delete_app, get_app, health, list_apps, patch_app,
+    ready, rename_app,
 };
 pub use deploys::{list_deploys, list_deploys_stream, rollback};
 pub use env::{delete_env, list_env, set_env};

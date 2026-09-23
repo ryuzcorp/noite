@@ -37,6 +37,11 @@ pub fn new_state() -> MetricsState {
     }
 }
 
+/// Restore a persisted watermark map into fresh state (boot only).
+pub fn set_watermarks(state: &mut MetricsState, marks: HashMap<String, i64>) {
+    state.watermark = marks;
+}
+
 fn minute_bucket_now() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:00Z").to_string()
 }
@@ -359,6 +364,7 @@ pub async fn tick(
     // 2. Telemetry aggregation every ~2 ticks (10 s at a 5 s poll; 2 s flush)
     //    for near-real-time request counts.
     state.tick += 1;
+    let mut advanced: Vec<(String, i64)> = Vec::new();
     if state.tick.is_multiple_of(2) {
         for (slug, id) in &slug_id {
             let after = state.watermark.get(slug).copied().unwrap_or(now_us() - 5_000_000);
@@ -375,13 +381,17 @@ pub async fn tick(
                         }
                     }
                     if should_advance_watermark(true, false) {
-                        state.watermark.insert(slug.clone(), now_us() - 5_000_000);
+                        let wm = now_us() - 5_000_000;
+                        state.watermark.insert(slug.clone(), wm);
+                        advanced.push((slug.clone(), wm));
                     }
                 }
                 Err(e) => {
                     let idle = is_idle_telemetry_err(&e);
                     if should_advance_watermark(false, idle) {
-                        state.watermark.insert(slug.clone(), now_us() - 5_000_000);
+                        let wm = now_us() - 5_000_000;
+                        state.watermark.insert(slug.clone(), wm);
+                        advanced.push((slug.clone(), wm));
                     } else {
                         tracing::warn!(slug = %slug, error = %e, "telemetry_agg");
                     }
@@ -389,7 +399,6 @@ pub async fn tick(
             }
         }
     }
-
     // 3. Caddy access log → device families. Never fails the tick: a missing
     //    log (Caddy not yet reloaded) or a corrupt line is a silent skip.
     if let Err(e) = accesslog::tick(pool, cfg, &slug_id).await {
@@ -401,6 +410,17 @@ pub async fn tick(
         if a.req > 0 || a.err > 0 || a.cpu_ms > 0 {
             db::add_app_metric(pool, id, bucket, a.req, a.err, a.lat_ms, a.cpu_ms)
                 .await?;
+        }
+    }
+
+    // 4b. Durable watermark: these rows ride the same SQLite snapshot the R2
+    // relay carries, so restarts resume aggregation instead of resetting it.
+    // Written only after the buckets above persist. A crash between the two
+    // re-aggregates at most one window (upsert-accumulate may double-count
+    // it) — narrow by construction.
+    if !advanced.is_empty() {
+        if let Err(e) = db::set_metric_watermarks(pool, &advanced).await {
+            tracing::warn!(error = %e, "watermark persist");
         }
     }
 

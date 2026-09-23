@@ -37,6 +37,14 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// Pre-export checkpoint: flush a fresh SQLite snapshot so the worker's R2
+/// relay (and nightly backup) copy seconds-old state, not minutes-old.
+/// Best-effort like every other snapshot trigger — the relay diffs etags anyway.
+pub async fn checkpoint(State(state): State<AppState>) -> impl IntoResponse {
+    crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
+    Json(json!({ "ok": true }))
+}
+
 pub async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
     match db::list_apps(&state.pool).await {
         Ok(apps) => Json(apps).into_response(),

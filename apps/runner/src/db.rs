@@ -392,6 +392,37 @@ pub async fn prune_app_metrics(pool: &SqlitePool, older_than_ts: &str) -> sqlx::
         .await?;
     Ok(res.rows_affected())
 }
+
+/// Telemetry watermark persistence (slug -> last consumed start_unix_us).
+/// Written after bucket persist each tick; the same SQLite snapshot the R2
+/// relay carries restores it, so restarts resume instead of resetting.
+pub async fn get_metric_watermarks(
+    pool: &SqlitePool,
+) -> sqlx::Result<std::collections::HashMap<String, i64>> {
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT slug, after_us FROM metric_watermark")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
+pub async fn set_metric_watermarks(
+    pool: &SqlitePool,
+    marks: &[(String, i64)],
+) -> sqlx::Result<()> {
+    for (slug, after_us) in marks {
+        sqlx::query(
+            r#"INSERT INTO metric_watermark (slug, after_us) VALUES (?, ?)
+               ON CONFLICT (slug) DO UPDATE SET after_us = excluded.after_us"#,
+        )
+        .bind(slug)
+        .bind(after_us)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Accumulate one device hit into its hour bucket. Called from the
 /// access-log tick; only the classified pair is stored, never IPs or
 /// raw user-agents.

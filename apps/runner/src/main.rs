@@ -111,7 +111,12 @@ async fn main() -> anyhow::Result<()> {
     // Ephemeral disk: rehydrate bare mirrors from S3 tip bundles.
     host::rehydrate::rehydrate_all(&pool, &config).await;
     let deploying = host::deploy::new_deploying();
-    let metrics = host::metrics::new_state();
+    let mut metrics = host::metrics::new_state();
+    // Resume telemetry aggregation where the last snapshot left off.
+    match db::get_metric_watermarks(&pool).await {
+        Ok(marks) => host::metrics::set_watermarks(&mut metrics, marks),
+        Err(e) => tracing::warn!(error = %e, "watermark restore"),
+    }
     let ready = Arc::new(AtomicBool::new(false));
     let state = AppState {
         pool: pool.clone(),
@@ -137,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(api::health))
         .route("/ready", get(api::ready))
+        .route("/v1/admin/checkpoint", post(api::checkpoint))
         .route("/v1/edge/fallback", get(host::edge::edge_fallback))
         .route("/v1/edge/tls-ask", get(host::edge::tls_ask))
         .route("/v1/edge/routes", get(host::edge::edge_routes))

@@ -63,7 +63,7 @@ Dev loop: `make dev` runs the 4-service dev layout with dev processes — runner
 - Tiny forge UI over bare mirrors (`RUNNER_WORK_DIR/repos/{slug}.git`) — source preview (W4) started this; full history / commit views remain
 - Source preview polish: hydrated expand-unchanged context (`loadDiffFiles`), per-file permalinks
 - TLS / real domains (plan: `https://app.noite.now` control via `CONTROL_SUBDOMAIN=app`, `https://{slug}.noite.now` apps)
-- Ops (backups, quotas, APM)
+- Ops (quotas, APM) — backups built 2026-09-23: nightly `runner-backup` cron copies the telemetry keyspace (the only state the 5-min R2 relay skips) to `backup/<date>/`, 7-day retention, explicit `POST /__do/restore?date=` recovery
 - Scoped per-app RustFS keys: the Bun host plane that minted them is deleted (W1.3); Git auth is profile API keys (Better Auth) + collaborator checks via runner → UI `/internal/git-auth`
 
 ## Source preview (W4) — 2026-09-12

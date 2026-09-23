@@ -7,6 +7,8 @@
 //! - `GET /v1/sync/manifest` → `{imported, objects: [{key, etag, size}]}` for
 //!   every sidecar key except tenant telemetry (re-derivable, excluded to
 //!   keep relay bandwidth proportional to state, not spans).
+//!   `?include_telemetry=1` lists telemetry too — the nightly backup's copy
+//!   path (telemetry is the only keyspace the relay doesn't carry).
 //! - `GET /v1/sync/get?key=` → raw object bytes (bounded).
 //! - `POST /v1/sync/put?key=` → store raw body bytes (bounded).
 //! - `POST /v1/sync/complete` → end the boot import window; the main server
@@ -46,8 +48,10 @@ pub const SYNC_BIND: &str = "0.0.0.0:18080";
 const MAX_SYNC_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Prefixes never relayed: celld OTel telemetry re-derives nothing durable —
-/// today's restart already resets the metrics watermark, so moves keep that
-/// semantic instead of paying bandwidth for spans.
+/// the watermark now persists in the SQLite snapshot (see `metric_watermark`),
+/// so moves resume aggregation instead of resetting it, and the nightly
+/// backup copies spans separately. Keep them out of the relay to hold relay
+/// bandwidth proportional to state, not spans.
 fn relayable(key: &str) -> bool {
     !key.contains("/telemetry/")
 }
@@ -110,7 +114,16 @@ async fn require_bearer(
     next.run(req).await
 }
 
-async fn sync_manifest(State(state): State<SyncState>) -> impl IntoResponse {
+#[derive(Debug, Deserialize)]
+struct ManifestQuery {
+    #[serde(default)]
+    include_telemetry: bool,
+}
+
+async fn sync_manifest(
+    State(state): State<SyncState>,
+    Query(query): Query<ManifestQuery>,
+) -> impl IntoResponse {
     let json = match cmd::s3_list_prefix(&state.cfg, &state.cfg.s3_bucket, "").await {
         Ok(json) => json,
         Err(e) => {
@@ -133,7 +146,7 @@ async fn sync_manifest(State(state): State<SyncState>) -> impl IntoResponse {
             })
             .collect();
         for (key, obj) in entries {
-            if relayable(key) {
+            if query.include_telemetry || relayable(key) {
                 let etag = obj
                     .get("ETag")
                     .and_then(|e| e.as_str())
