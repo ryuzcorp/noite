@@ -104,14 +104,15 @@ jobs:
           E2E_IMAGE_TAG: ${{ steps.images.outputs.tag }}
 
       # The node has no published API port, so deploy from inside the
-      # control container (loopback to the internal listener). Same shape
+      # control container (loopback to the internal listener) with CWD at
+      # the /e2e-app mount (repo apps/noite): `celld deploy` re-bundles
+      # with esbuild, which resolves node_modules above the CWD. Same shape
       # as the runner's tenant deploys (celld deploy <dir> --bucket
       # --endpoint --region); D1 provisions from dist/wrangler.json.
       - name: deploy control worker
         run: |
           CID="$(docker compose -f docker/compose.yaml ps -q control)"
-          docker cp apps/noite/dist "$CID:/tmp/e2e-dist"
-          docker exec -w /tmp/e2e-dist "$CID" celld deploy . \
+          docker exec -w /e2e-app "$CID" celld deploy dist \
             --bucket "s3://noite/control" \
             --endpoint http://rustfs:9000 \
             --region us-east-1

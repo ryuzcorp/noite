@@ -12,3 +12,9 @@ services:
       DOCKER_HOST: unix:///var/run/docker.sock
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # Deploy runs from here (CWD): `celld deploy` re-bundles the worker
+      # with esbuild, which resolves node_modules by walking up from the
+      # working directory — the laptop flow (`celld deploy dist` from
+      # apps/noite) works for the same reason. A bare `docker cp` of dist
+      # has no modules above it and fails resolving @cloudflare/containers.
+      - ../apps/noite:/e2e-app:ro
