@@ -19,6 +19,7 @@ Ground truth for working on Noite. Read this before touching code — the rules 
 - The stack runs via **rootless podman**:
   - `make up` — production stack (release images: rustfs, control, caddy; runner is a container cell); `make dev` — dev processes on the 4-service layout (bind-mounts, cargo-watch, `vite dev`)
   - `make logs`, `make down` (keeps volumes), `make nuke` (volumes + local `.wrangler` D1/SQLite)
+  - E2E: `cd apps/noite && bun run test:e2e` against a prod `make up` stack (+ `celld deploy dist`), with `api/git/e2e.localhost` in /etc/hosts; CI runs `.github/workflows/e2e.yml` (main pushes + dispatch). No test-only app code: passkeys use a CDP virtual authenticator, fixed slug `e2e`.
   - `up`/`dev` build with cache every run, so no separate build targets
 
 ## Map and architecture in one breath

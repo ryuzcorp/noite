@@ -1,0 +1,113 @@
+# End-to-end: Playwright (apps/noite/e2e) against the prod compose stack.
+#
+# Builds the tree's images, boots docker/compose.yaml, deploys the control
+# worker bundle into the celld node, then runs signup → app → API key →
+# git push → deploy → serve. No test-only app code: passkeys use a CDP
+# virtual authenticator, subdomains resolve via /etc/hosts.
+#
+# Heavy (Rust release build + multi-service boot): main pushes and manual
+# dispatch only, not PRs.
+name: e2e
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/noite/**"
+      - "apps/runner/**"
+      - "docker/**"
+      - "Dockerfile.runner-container"
+      - "railpack.json"
+      - ".env.example"
+      - ".github/workflows/e2e.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      E2E_RUNNER_TOKEN: dev-runner-token
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1f9d37b0da39408b5beb # v4
+        with:
+          node-version: 24
+
+      - run: bun install
+        working-directory: apps/noite
+
+      - name: install playwright browsers
+        run: |
+          ./node_modules/.bin/playwright install chromium
+          sudo ./node_modules/.bin/playwright install-deps chromium
+        working-directory: apps/noite
+
+      # Localhost-safe defaults from the example (dev secrets are only
+      # refused on real domains). Deterministic token doubles as the test
+      # credential below.
+      - name: write env
+        run: cp .env.example .env
+
+      - name: resolve subdomains locally
+        run: |
+          echo "127.0.0.1 api.localhost git.localhost e2e.localhost" | sudo tee -a /etc/hosts
+
+      - name: boot prod stack
+        run: make up
+        timeout-minutes: 30
+
+      - name: build control worker bundle
+        run: bun run build
+        working-directory: apps/noite
+
+      # The node has no published API port, so deploy from inside the
+      # control container (loopback to the internal listener). Same shape
+      # as the runner's tenant deploys (celld deploy <dir> --bucket
+      # --endpoint --region); D1 provisions from dist/wrangler.json.
+      - name: deploy control worker
+        run: |
+          CID="$(docker compose -f docker/compose.yaml ps -q control)"
+          docker cp apps/noite/dist "$CID:/tmp/e2e-dist"
+          docker exec -w /tmp/e2e-dist "$CID" celld deploy . \
+            --bucket "s3://noite/control" \
+            --endpoint http://rustfs:9000 \
+            --region us-east-1
+        timeout-minutes: 10
+
+      - name: wait for healthy stack
+        run: |
+          for i in $(seq 1 60); do
+            if make doctor; then exit 0; fi
+            sleep 10
+          done
+          echo "stack never became healthy"
+          exit 1
+        timeout-minutes: 12
+
+      # The Playwright runner is Node-only: invoke through npx (bun owns
+      # installs, node owns execution).
+      - name: playwright e2e
+        run: npx playwright test
+        working-directory: apps/noite
+        timeout-minutes: 20
+
+      - name: stack logs on failure
+        if: failure()
+        run: docker compose -f docker/compose.yaml logs --tail=200
+
+      - name: upload playwright report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: playwright-report
+          path: apps/noite/playwright-report/
+          retention-days: 14

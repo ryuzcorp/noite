@@ -16,6 +16,11 @@ dist
 coverage
 *.lcov
 
+# playwright e2e: reports, traces, authed session
+playwright-report/
+test-results/
+e2e/.auth/
+
 # logs
 logs
 _.log

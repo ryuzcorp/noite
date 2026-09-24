@@ -7,7 +7,8 @@
     "prebuild": "rm -rf dist",
     "build": "vite build && bun scripts/inject-containers.ts",
     "build:containers": "bun scripts/inject-containers.ts",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@aws-crypto/sha256-js": "^5.2.0",
@@ -39,6 +40,7 @@
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.55.0",
     "@cloudflare/workers-types": "^5.20260917.1",
+    "@playwright/test": "^1.63.0",
     "@tailwindcss/vite": "^4.3.3",
     "@types/bun": "^1.4.2",
     "daisyui": "^5.7.22",
