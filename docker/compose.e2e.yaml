@@ -2,18 +2,13 @@
 # (.github/workflows/e2e.yml; `make up-e2e`).
 #
 # The runner container cell is provisioned by celld at `celld deploy` time
-# by BUILDING Dockerfile.runner-container through an engine socket — the
-# base file deliberately has neither (a missing source breaks `make up` on
-# rootless podman, which has no socket at the Docker path; see
-# standalone.ts for the release equivalent). This overlay adds both, plus
-# the repo itself (read-only): dist/wrangler.json points `image` at an
-# absolute Dockerfile path that only exists on the deploying host, so CI
-# rewrites it to /repo/Dockerfile.runner-container before deploying from
-# inside the control container.
+# through an engine socket. The base file deliberately has no socket mount
+# (a missing source breaks `make up` on rootless podman, which has no
+# socket at the Docker path; see standalone.ts for the release
+# equivalent) — this overlay adds it and points DOCKER_HOST at it.
 services:
   control:
     environment:
       DOCKER_HOST: unix:///var/run/docker.sock
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ..:/repo:ro

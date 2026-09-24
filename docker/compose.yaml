@@ -135,10 +135,11 @@ services:
   caddy:
     # Baked edge image (Dockerfile.caddy + Caddyfile.static); `make up`
     # --build refreshes it on file edits, the standalone release pulls it.
+    # Override with NOITE_CADDY_IMAGE to pull GHCR (CI e2e does this).
     build:
       context: ..
       dockerfile: docker/Dockerfile.caddy
-    image: noite-caddy:local
+    image: ${NOITE_CADDY_IMAGE:-noite-caddy:local}
     restart: unless-stopped
     ports:
       - "${HTTP_PORT:-9080}:80"

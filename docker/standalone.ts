@@ -80,7 +80,11 @@ text = text.replaceAll(
   "image: ${NOITE_RUNNER_IMAGE:-noite-runner:local}",
   `image: ${tag}`
 );
-text = text.replace("image: noite-caddy:local", `image: ${caddyTag}`);
+text = text.replace(
+  // oxlint-disable-next-line eslint/no-template-curly-in-string -- matching literal compose source text, not interpolating.
+  "image: ${NOITE_CADDY_IMAGE:-noite-caddy:local}",
+  `image: ${caddyTag}`
+);
 // Drop the build-cache volume (nothing builds here).
 text = text.replaceAll(/^ {2}bun-cache:\n/gmu, "");
 // The container cell needs an engine: mount the host socket where

@@ -70,6 +70,13 @@
         "image": "ghcr.io/denoland/celld:0.5.1",
         "include": ["/usr/local/bin/celld"]
       },
+      // Engine CLI for celld container provisioning (mirrors the
+      // Dockerfile.runner-container dockercli stage): `celld deploy`
+      // builds cell images through the mounted engine socket.
+      {
+        "image": "docker.io/library/docker:28-cli",
+        "include": ["/usr/local/bin/docker"]
+      },
       {
         "image": "docker.io/rustfs/rustfs:1.0.0-rc.6",
         "include": ["/usr/bin/rustfs"]

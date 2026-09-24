@@ -1,26 +1,24 @@
 # End-to-end: Playwright (apps/noite/e2e) against the prod compose stack.
 #
-# Builds the tree's images, boots docker/compose.yaml, deploys the control
-# worker bundle into the celld node, then runs signup → app → API key →
-# git push → deploy → serve. No test-only app code: passkeys use a CDP
-# virtual authenticator, subdomains resolve via /etc/hosts.
+# Runs AFTER the images workflow and tests those exact bytes: the runner +
+# caddy GHCR tags at the images-run SHA (control service and runner cell
+# both pull them — nothing builds here). No test-only app code: passkeys
+# use a CDP virtual authenticator, subdomains resolve via /etc/hosts.
 #
-# Heavy (Rust release build + multi-service boot): main pushes and manual
-# dispatch only, not PRs.
+# Informational only (continue-on-error): signal for the operator, never
+# a merge gate.
 name: e2e
 
 on:
-  push:
+  workflow_run:
+    workflows: ["images"]
     branches: [main]
-    paths:
-      - "apps/noite/**"
-      - "apps/runner/**"
-      - "docker/**"
-      - "Dockerfile.runner-container"
-      - "railpack.json"
-      - ".env.example"
-      - ".github/workflows/e2e.yml"
+    types: [completed]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "GHCR image tag for runner + caddy (default latest)"
+        default: latest
 
 concurrency:
   group: e2e-${{ github.ref }}
@@ -28,19 +26,46 @@ concurrency:
 
 jobs:
   e2e:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: read
+      packages: read
+    # Informational: report, don't gate.
+    continue-on-error: true
     env:
       E2E_RUNNER_TOKEN: dev-runner-token
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: checkout triggering commit
+        if: github.event_name == 'workflow_run'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: checkout
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+
+      - id: images
+        name: resolve image tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "tag=$(echo '${{ github.event.workflow_run.head_sha }}' | cut -c1-7)" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - run: bun install
         working-directory: apps/noite
@@ -60,30 +85,24 @@ jobs:
       - name: resolve subdomains locally
         run: echo "127.0.0.1 api.localhost git.localhost e2e.localhost" | sudo tee -a /etc/hosts
 
-      - name: boot prod stack
+      - name: boot prod stack from GHCR
         run: make up-e2e
-        timeout-minutes: 30
+        env:
+          NOITE_CADDY_IMAGE: ghcr.io/ryuzcorp/noite-caddy:${{ steps.images.outputs.tag }}
+          NOITE_RUNNER_IMAGE: ghcr.io/ryuzcorp/noite:${{ steps.images.outputs.tag }}
+        timeout-minutes: 15
 
       - name: build control worker bundle
         run: bun run build
         working-directory: apps/noite
 
-      # celld provisions the runner cell by building Dockerfile.runner-container
-      # through an engine socket: the image has no docker CLI baked in, so
-      # install it here (CI-only; prod bakes it or mounts its own engine).
-      # dist/wrangler.json points `image` at the deploying host's absolute
-      # Dockerfile path — rewrite it to the /repo mount (see compose.e2e.yaml)
-      # before copying dist into the container.
-      - name: prep control container for deploy
-        run: |
-          CID="$(docker compose -f docker/compose.yaml ps -q control)"
-          docker exec -u 0 "$CID" sh -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends docker.io && rm -rf /var/lib/apt/lists/*'
-          # Diagnose as the deploy user (no -u flag, same as the deploy step).
-          docker exec "$CID" sh -c 'id; echo PATH=$PATH; ls -l /usr/bin/docker /usr/local/bin/docker 2>&1; command -v docker || true'
-          docker exec -u 0 "$CID" ln -sf /usr/bin/docker /usr/local/bin/docker
-          docker exec "$CID" docker --version
-          python3 -c "import json; p='apps/noite/dist/wrangler.json'; d=json.load(open(p)); d['containers'][0]['image']='/repo/Dockerfile.runner-container'; json.dump(d, open(p,'w'), indent=2)"
-        timeout-minutes: 8
+      # The runner cell pulls (never builds): point dist/wrangler.json at
+      # the same GHCR tag the control service runs.
+      - name: point cell at GHCR image
+        run: python3 -c "import json,os; p='apps/noite/dist/wrangler.json'; d=json.load(open(p)); d['containers'][0]['image']=f\"ghcr.io/ryuzcorp/noite:{os.environ['E2E_IMAGE_TAG']}\"; json.dump(d, open(p,'w'), indent=2)"
+        env:
+          E2E_IMAGE_TAG: ${{ steps.images.outputs.tag }}
+
       # The node has no published API port, so deploy from inside the
       # control container (loopback to the internal listener). Same shape
       # as the runner's tenant deploys (celld deploy <dir> --bucket
@@ -96,9 +115,8 @@ jobs:
             --bucket "s3://noite/control" \
             --endpoint http://rustfs:9000 \
             --region us-east-1
-        # celld builds the runner-cell image through the mounted socket
-        # (cold daemon: full Rust release build, ~5 min) before deploying.
-        timeout-minutes: 18
+        timeout-minutes: 12
+
       - name: wait for healthy stack
         run: |
           for i in $(seq 1 60); do

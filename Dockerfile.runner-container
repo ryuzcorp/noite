@@ -22,6 +22,12 @@ FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
 # small; the data dir is ephemeral by design (relay owns durability).
 FROM docker.io/rustfs/rustfs:1.0.0-rc.6 AS rustfs
 
+# Engine CLI for celld container provisioning: `celld deploy` and the runner
+# cell build their images through the mounted engine socket (DOCKER_HOST),
+# so the CLI must be baked in — it cannot be installed at runtime. CLI-only
+# stage (no daemon): the socket always points at an external engine.
+FROM docker.io/library/docker:28-cli AS dockercli
+
 FROM docker.io/library/rust:1-bookworm AS build
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev \
@@ -38,9 +44,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git awscli unzip \
   && rm -rf /var/lib/apt/lists/* \
   && sh /tmp/install-sidecars.sh && rm /tmp/install-sidecars.sh
-COPY --from=celld /usr/local/bin/celld /usr/local/bin/celld
-COPY --from=build /src/target/release/noite-runner /usr/local/bin/noite-runner
 COPY --from=rustfs /usr/bin/rustfs /usr/local/bin/rustfs
+COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 COPY docker/noite-entrypoint.sh /usr/local/bin/noite-entrypoint.sh
 WORKDIR /data
 ENV RUNNER_BIND=0.0.0.0:8080 \
