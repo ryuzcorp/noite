@@ -58,17 +58,28 @@ jobs:
         run: cp .env.example .env
 
       - name: resolve subdomains locally
-        run: |
-          echo "127.0.0.1 api.localhost git.localhost e2e.localhost" | sudo tee -a /etc/hosts
+        run: echo "127.0.0.1 api.localhost git.localhost e2e.localhost" | sudo tee -a /etc/hosts
 
       - name: boot prod stack
-        run: make up
+        run: make up-e2e
         timeout-minutes: 30
 
       - name: build control worker bundle
         run: bun run build
         working-directory: apps/noite
 
+      # celld provisions the runner cell by building Dockerfile.runner-container
+      # through an engine socket: the image has no docker CLI baked in, so
+      # install it here (CI-only; prod bakes it or mounts its own engine).
+      # dist/wrangler.json points `image` at the deploying host's absolute
+      # Dockerfile path — rewrite it to the /repo mount (see compose.e2e.yaml)
+      # before copying dist into the container.
+      - name: prep control container for deploy
+        run: |
+          CID="$(docker compose -f docker/compose.yaml ps -q control)"
+          docker exec -u 0 "$CID" sh -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends docker.io && rm -rf /var/lib/apt/lists/*'
+          python3 -c "import json; p='apps/noite/dist/wrangler.json'; d=json.load(open(p)); d['containers'][0]['image']='/repo/Dockerfile.runner-container'; json.dump(d, open(p,'w'), indent=2)"
+        timeout-minutes: 8
       # The node has no published API port, so deploy from inside the
       # control container (loopback to the internal listener). Same shape
       # as the runner's tenant deploys (celld deploy <dir> --bucket
@@ -81,8 +92,9 @@ jobs:
             --bucket "s3://noite/control" \
             --endpoint http://rustfs:9000 \
             --region us-east-1
-        timeout-minutes: 10
-
+        # celld builds the runner-cell image through the mounted socket
+        # (cold daemon: full Rust release build, ~5 min) before deploying.
+        timeout-minutes: 18
       - name: wait for healthy stack
         run: |
           for i in $(seq 1 60); do

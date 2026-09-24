@@ -46,6 +46,14 @@ up:
 	$(COMPOSE) up -d --build rustfs control caddy
 	@echo "open http://localhost:$${HTTP_PORT:-9080}"
 
+# CI e2e (Playwright): prod stack plus the engine socket + repo mounts the
+# runner container cell needs (celld builds Dockerfile.runner-container
+# through the mounted daemon at `celld deploy` time). CI-only — local prod
+# installs use `up` / `up-prod` (+ standalone.ts for the socket mount).
+up-e2e:
+	$(COMPOSE) -f docker/compose.e2e.yaml up -d --build rustfs control caddy
+	@echo "open http://localhost:$${HTTP_PORT:-9080}"
+
 # Release deploy (any cloud VM): pull the GHCR image, never build. Pin with
 # NOITE_RUNNER_IMAGE=ghcr.io/ryuzcorp/noite:<sha> for reproducibility
 # (:stable does not exist yet — first v* tag/release creates it).
