@@ -1,5 +1,4 @@
-# CI-only overlay for the Playwright e2e workflow
-# (.github/workflows/e2e.yml; `make up-e2e`).
+# Local pre-release overlay (`make e2e` / `make up-e2e`, via docker/e2e-local.sh).
 #
 # The runner container cell is provisioned by celld at `celld deploy` time
 # through an engine socket. The base file deliberately has no socket mount

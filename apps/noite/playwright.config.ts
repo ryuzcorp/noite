@@ -1,8 +1,8 @@
 import { defineConfig } from "@playwright/test";
 
-// Prod edge on the CI runner (plain HTTP locally; TLS only fronts real
-// domains). Subdomain hosts (api./git./{slug}.localhost) need /etc/hosts
-// entries — the workflow adds them; see .github/workflows/e2e.yml.
+// Prod edge locally (plain HTTP; TLS only fronts real domains). Subdomain
+// hosts (api./git./{slug}.localhost) need /etc/hosts entries — `make e2e`
+// checks them (docker/e2e-local.sh).
 const baseURL = process.env.E2E_BASE_URL ?? "http://localhost:9080";
 
 export default defineConfig({

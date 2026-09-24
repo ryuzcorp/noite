@@ -18,7 +18,7 @@ export
 # pi-lens-ignore: shellcheck-14-1073
 # pi-lens-ignore: shellcheck-14-1050
 # pi-lens-ignore: shellcheck-14-1072
- .PHONY: help up up-prod dev dev-host logs doctor down nuke
+ .PHONY: help up up-prod up-e2e e2e dev dev-host logs doctor down nuke
 
  COMPOSE_DEV := $(COMPOSE) -f docker/compose.dev.yaml
 
@@ -33,6 +33,7 @@ help:
 	@echo "  make dev   dev processes (cargo-watch runner + vite dev control)"
 	@echo "  make dev-host  dev + control UI reachable from LAN (Host: <lan-ip>)"
 	@echo "  make logs  follow control + rustfs + caddy"
+	@echo "  make e2e   pre-release check: GHCR stack + deploy + doctor + Playwright (TAG=<sha>)"
 	@echo "  make down  stop stack (keeps data volumes)"
 	@echo "  make nuke  stop stack + delete volumes + local D1/SQLite state"
 	@echo ""
@@ -46,14 +47,18 @@ up:
 	$(COMPOSE) up -d --build rustfs control caddy
 	@echo "open http://localhost:$${HTTP_PORT:-9080}"
 
-# CI e2e (Playwright): prod stack from GHCR release images (built by the
-# images workflow — never build here, the e2e run must test those exact
-# bytes) plus the engine socket mount the runner container cell needs.
-# CI passes NOITE_*_IMAGE at the images-run SHA; the latest defaults are
-# for manual runs.
+# Prod stack from GHCR release images (built by the images workflow — never
+# build here, the run must test those exact bytes) plus the engine socket
+# mount the runner container cell needs. Used by `make e2e`; pass
+# NOITE_*_IMAGE at the release SHA, `:latest` follows main.
 up-e2e:
 	NOITE_RUNNER_IMAGE=$${NOITE_RUNNER_IMAGE:-ghcr.io/ryuzcorp/noite:latest} NOITE_CADDY_IMAGE=$${NOITE_CADDY_IMAGE:-ghcr.io/ryuzcorp/noite-caddy:latest} $(COMPOSE) -f docker/compose.e2e.yaml up -d --pull always rustfs control caddy
 	@echo "open http://localhost:$${HTTP_PORT:-9080}"
+
+# Pre-release check (manual — no CI e2e): boot the GHCR stack, deploy the
+# worker, doctor (5 min), Playwright. TAG=<short-sha> pins the release.
+e2e:
+	sh docker/e2e-local.sh
 
 # Release deploy (any cloud VM): pull the GHCR image, never build. Pin with
 # NOITE_RUNNER_IMAGE=ghcr.io/ryuzcorp/noite:<sha> for reproducibility
