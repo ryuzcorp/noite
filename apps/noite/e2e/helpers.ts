@@ -10,9 +10,9 @@ export const E2E_EMAIL = "e2e@noite.local";
 export const E2E_NAME = "E2E";
 export const E2E_SLUG = "e2e";
 
-const apiBase = process.env.E2E_API_BASE ?? "http://api.localhost:9080";
-const gitBase = process.env.E2E_GIT_BASE ?? "http://git.localhost:9080";
-const appBase = process.env.E2E_APP_BASE ?? `http://${E2E_SLUG}.localhost:9080`;
+const apiBase = process.env.E2E_API_BASE ?? "http://localhost:8080";
+const gitBase = process.env.E2E_GIT_BASE ?? "http://localhost:8080/v1/git";
+const tenantBase = (port: number): string => `http://localhost:${port}`;
 
 const runnerToken = (): string => {
   const token = process.env.E2E_RUNNER_TOKEN ?? "";
@@ -26,6 +26,7 @@ interface RunnerApp {
   id: string;
   slug: string;
   status: string;
+  listenPort: number | null;
 }
 
 interface RunnerDeploy {
@@ -50,8 +51,7 @@ export const addVirtualAuthenticator = async (page: Page): Promise<void> => {
     },
   });
 };
-
-/** Runner API call through the edge (Host-dispatched to :8080). */
+/** Runner API call direct on :8080 (raw-port lane, no edge). */
 export const runnerApi = async <T>(
   request: APIRequestContext,
   path: string
@@ -65,13 +65,25 @@ export const runnerApi = async <T>(
   // SAFETY: the runner returns raw JSON objects matching the caller's shape (runnerFetch contract — never a { body } envelope).
   return (await res.json()) as T;
 };
-
 export const findAppId = async (
   request: APIRequestContext,
   slug: string
 ): Promise<string | null> => {
   const apps = await runnerApi<RunnerApp[]>(request, "/v1/apps");
   return apps.find((app) => app.slug === slug)?.id ?? null;
+};
+
+/** Tenant listen port for raw-port traffic (published 8100-8199). */
+export const appListenPort = async (
+  request: APIRequestContext,
+  appId: string
+): Promise<number> => {
+  const app = await runnerApi<RunnerApp>(request, `/v1/apps/${appId}`);
+  const { listenPort } = app;
+  if (listenPort === null || listenPort === undefined) {
+    throw new TypeError(`app ${appId} has no listen port yet`);
+  }
+  return listenPort;
 };
 
 /** Poll deploys until the tip reaches a terminal status. Push fast-path
@@ -105,7 +117,10 @@ export const waitForDeploy = async (
 export const pushSampleApp = (apiKey: string): string => {
   const dir = mkdtempSync(nodePath.join(tmpdir(), "noite-e2e-"));
   try {
-    cpSync(new URL("../../test", import.meta.url), dir, { recursive: true });
+    cpSync(new URL("../test", import.meta.url), dir, { recursive: true });
+    // The sample checkout is itself a repo — drop its history so the push
+    // is a fresh repo + fresh commit (new deploy), like deploy.sh re-init.
+    rmSync(nodePath.join(dir, ".git"), { force: true, recursive: true });
     const git = (args: string[], extraEnv: Record<string, string> = {}) =>
       execFileSync("git", args, {
         cwd: dir,
@@ -135,9 +150,10 @@ export const pushSampleApp = (apiKey: string): string => {
 
 /** Read-only probe of the deployed sample (counter `?read=1` never advances). */
 export const readSampleApp = async (
-  request: APIRequestContext
+  request: APIRequestContext,
+  port: number
 ): Promise<{ n: number }> => {
-  const res = await request.get(`${appBase}/?read=1`);
+  const res = await request.get(`${tenantBase(port)}/?read=1`);
   if (!res.ok) {
     throw new Error(`tenant ${res.status()} ${await res.text()}`);
   }

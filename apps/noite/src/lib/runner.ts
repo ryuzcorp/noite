@@ -74,26 +74,30 @@ export interface RunnerContainerStub {
 }
 
 /** DO stub for the runner container, or null outside container target.
- * Shared by runnerFetch, Host dispatch, and the R2 relay cron. */
-export const runnerContainerStub =
-  async (): Promise<RunnerContainerStub | null> => {
-    if (readEnv().RUNNER_TARGET !== "container") {
-      return null;
-    }
-    const binding = readEnv().RUNNER;
-    if (!binding) {
-      return null;
-    }
-    // Platform-specific: @cloudflare/containers only exists in the worker
-    // runtime, not vite dev SSR — dynamic import keeps dev working.
-    const { getContainer } = await import(
-      // oxlint-disable-next-line eslint/no-inline-comments -- @vite-ignore must sit inside the import call or vite bundles a worker-only module.
-      /* @vite-ignore */ "@cloudflare/containers"
-    );
-    // SAFETY: RUNNER is a DO namespace binding; getContainer takes it opaque and only fetches through the stub below.
-    const stub: RunnerContainerStub = getContainer(binding as never);
-    return stub;
-  };
+ * Shared by runnerFetch, Host dispatch, and the R2 relay cron. Pass the
+ * platform-injected env on the edge fetch path: oxide's ALS (readEnv) is
+ * only entered for actions/workflows/queues, never for edge fetch, so
+ * readEnv() alone always sees the compose default there. */
+export const runnerContainerStub = async (
+  from?: KitEnv
+): Promise<RunnerContainerStub | null> => {
+  if ((from?.RUNNER_TARGET ?? readEnv().RUNNER_TARGET) !== "container") {
+    return null;
+  }
+  const binding = from?.RUNNER ?? readEnv().RUNNER;
+  if (!binding) {
+    return null;
+  }
+  // Platform-specific: @cloudflare/containers only exists in the worker
+  // runtime, not vite dev SSR — dynamic import keeps dev working.
+  const { getContainer } = await import(
+    // oxlint-disable-next-line eslint/no-inline-comments -- @vite-ignore must sit inside the import call or vite bundles a worker-only module.
+    /* @vite-ignore */ "@cloudflare/containers"
+  );
+  // SAFETY: RUNNER is a DO namespace binding; getContainer takes it opaque and only fetches through the stub below.
+  const stub: RunnerContainerStub = getContainer(binding as never);
+  return stub;
+};
 
 const runnerToken = () => {
   const token =

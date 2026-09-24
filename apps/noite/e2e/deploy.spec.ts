@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 
 import {
   E2E_SLUG,
+  appListenPort,
   findAppId,
   pushSampleApp,
   readSampleApp,
@@ -19,11 +20,14 @@ test("push to deploy serves traffic", async ({ page, request }) => {
 
   const appId = await findAppId(request, E2E_SLUG);
   expect(appId).not.toBeNull();
-
   await page.goto("/profile");
-  await page.getByRole("button", { name: "Create key" }).click();
+  await page
+    .locator('button[type="button"]', { hasText: "Create key" })
+    .click();
   await page.locator("#key-name").fill("e2e-ci");
-  await page.getByRole("button", { name: "Create key" }).click();
+  await page
+    .locator('button[type="submit"]', { hasText: "Create key" })
+    .click();
   const keyBox = page.locator("text=Copy now — shown once");
   await expect(keyBox).toBeVisible({ timeout: 30_000 });
   const rawKey = await page.locator("code.break-all").first().textContent();
@@ -35,6 +39,7 @@ test("push to deploy serves traffic", async ({ page, request }) => {
   const deploy = await waitForDeploy(request, appId ?? "");
   expect(deploy.status).toBe("success");
 
-  const body = await readSampleApp(request);
+  const port = await appListenPort(request, appId ?? "");
+  const body = await readSampleApp(request, port);
   expect(Number.isInteger(body.n)).toBe(true);
 });

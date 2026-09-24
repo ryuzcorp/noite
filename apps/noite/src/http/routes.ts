@@ -723,7 +723,7 @@ const containerDispatch = async (
   const { hostname: rawHost, pathname, search } = parsed;
   const hostname = rawHost.toLowerCase();
   const base = (env.BASE_DOMAIN ?? "localhost").toLowerCase();
-  const stub = await runnerContainerStub();
+  const stub = await runnerContainerStub(env);
   if (!stub) {
     return undefined;
   }

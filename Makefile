@@ -48,12 +48,13 @@ up:
 	@echo "open http://localhost:$${HTTP_PORT:-9080}"
 
 # Prod stack from GHCR release images (built by the images workflow — never
-# build here, the run must test those exact bytes) plus the engine socket
-# mount the runner container cell needs. Used by `make e2e`; pass
-# NOITE_*_IMAGE at the release SHA, `:latest` follows main.
+# build here, the run must test those exact bytes): rustfs + control + a
+# PLAIN runner container (no Caddy, no cells in this lane). Used by
+# `make e2e`; pass NOITE_RUNNER_IMAGE at the release SHA, `:latest`
+# follows main. Raw ports: runner :8080 (+ tenants 81xx), UI :8090.
 up-e2e:
-	NOITE_RUNNER_IMAGE=$${NOITE_RUNNER_IMAGE:-ghcr.io/ryuzcorp/noite:latest} NOITE_CADDY_IMAGE=$${NOITE_CADDY_IMAGE:-ghcr.io/ryuzcorp/noite-caddy:latest} $(COMPOSE) -f docker/compose.e2e.yaml up -d --pull always rustfs control caddy
-	@echo "open http://localhost:$${HTTP_PORT:-9080}"
+	DOCKER_SOCK=$${DOCKER_SOCK:-/var/run/docker.sock} NOITE_RUNNER_IMAGE=$${NOITE_RUNNER_IMAGE:-ghcr.io/ryuzcorp/noite:latest} $(COMPOSE) -p noite-e2e -f docker/compose.e2e.yaml up -d --pull always rustfs control runner
+	@echo "UI http://localhost:8090  API http://localhost:8080"
 
 # Pre-release check (manual — no CI e2e): boot the GHCR stack, deploy the
 # worker, doctor (5 min), Playwright. TAG=<short-sha> pins the release.
@@ -105,3 +106,7 @@ nuke:
 	-$(COMPOSE_DEV) down -v --remove-orphans
 	-$(COMPOSE) down -v --remove-orphans
 	rm -rf apps/noite/.wrangler
+	# Pre-fix dev runners wrote SQLite under working_dir (/src) into the
+	# source tree instead of the agent-data volume — wipe the stray copy
+	# too, or its rows outlive every nuke (and reseed via bucket restore).
+	rm -f apps/runner/data/noite.sqlite*

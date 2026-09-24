@@ -1,20 +1,81 @@
-# Local pre-release overlay (`make e2e` / `make up-e2e`, via docker/e2e-local.sh).
+# Local pre-release lane (`make e2e`, via docker/e2e-local.sh): raw
+# localhost:ports, no Caddy, no subdomains, no cells.
 #
-# The runner container cell is provisioned by celld at `celld deploy` time
-# through an engine socket. The base file deliberately has no socket mount
-# (a missing source breaks `make up` on rootless podman, which has no
-# socket at the Docker path; see standalone.ts for the release
-# equivalent) — this overlay adds it and points DOCKER_HOST at it.
+# The runner cell needs a fenced (rootful) engine, which this machine
+# doesn't have — so e2e runs the SAME GHCR image as a PLAIN runner
+# container (default entrypoint CMD `cell` → noite-runner directly) and the
+# worker in RUNNER_TARGET=compose (vars rewritten at deploy time by the
+# script). Tenants are plain processes binding 0.0.0.0:81xx, published
+# below. Nothing here rewrites routes or dispatches by Host.
+#
+# Ports: runner API/git/health/ready on :8080, control UI on :8090,
+# tenant fleets on their 81xx listen ports, rustfs on :9000.
+# State: runner /data is a host bind dir (wiped every lane run for
+# hermetic reruns); the fleet bucket is `noite-e2e` (dev uses `noite`),
+# wiped every lane run, auto-made by the control entrypoint.
+#
+# Validates: GHCR bytes, signup/passkey, git push, deploy, tenant serve.
+# NOT covered: cell boot, DO dispatch, fence (needs rootful engine).
 services:
   control:
+    ports:
+      - "8090:8090"
     environment:
       DOCKER_HOST: unix:///var/run/docker.sock
+      # Isolated fleet bucket; the entrypoint makes it on boot.
+      NOITE_S3_BUCKET: noite-e2e
+    # `celld deploy` pulls the cell image through the mounted socket;
+    # container-selinux has no allow rule for container_t -> socket
+    # connect, so separation must be off here (verified: only
+    # label=disable dials). Local pre-release lane only.
+    security_opt:
+      - label=disable
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      # Engine socket source varies (docker vs rootful/rootless podman):
+      # DOCKER_SOCK override or the /var/run/docker.sock default
+      # (docker/e2e-local.sh probes podman paths when unset; pulls work
+      # rootless — only the fence needs rootful).
+      - "${DOCKER_SOCK}:/var/run/docker.sock:z"
       # Whole repo (read-only): bun workspaces hoist shared deps to the
       # root node_modules and link members relatively (../../node_modules),
       # so mounting only apps/noite leaves DANGLING symlinks in-container
       # (visible to ls, unresolvable to esbuild). The root mount preserves
       # the exact layout `celld deploy` assumes; deploy runs with CWD at
       # /repo/apps/noite, mirroring the laptop flow.
-      - ..:/repo:ro
+      - ..:/repo:ro,z
+  runner:
+    image: ${NOITE_RUNNER_IMAGE:-noite-runner:local}
+    hostname: runner
+    restart: "no"
+    networks: [noite]
+    depends_on:
+      - rustfs
+    # Default entrypoint CMD (`cell`) runs noite-runner directly.
+    ports:
+      - "8080:8080"
+      - "8100-8199:8100-8199"
+    environment:
+      RUST_LOG: ${RUST_LOG:-noite_runner=info,tower_http=info}
+      RUNNER_BIND: "0.0.0.0:8080"
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-dev-runner-token}
+      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:-noiteaccess}
+      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:-noitesecretnoitesecretnoite12}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      S3_ENDPOINT: http://rustfs:9000
+      NOITE_S3_BUCKET: noite-e2e
+      BASE_DOMAIN: localhost
+      # Raw-port git remote (no subdomains in this lane).
+      GIT_PUBLIC_BASE: http://localhost:8080/v1/git
+      UI_URL: http://control:8090
+      # SQLite + workdir live in the per-run bind dir (wiped by the lane),
+      # never the `./data` default (resolves into the source tree).
+      NOITE_DB: /data/noite.sqlite
+      RUNNER_WORK_DIR: /data/runner
+      # No Caddy consumer here; still needs a writable path or reconcile
+      # never marks ready.
+      CADDYFILE_PATH: /data/caddy/Caddyfile
+      PORT_BASE: "8100"
+      RUNNER_POLL_MS: "5000"
+      CELLD_BIN: celld
+    volumes:
+      - .e2e-data:/data:z

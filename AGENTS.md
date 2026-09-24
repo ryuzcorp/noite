@@ -19,7 +19,7 @@ Ground truth for working on Noite. Read this before touching code — the rules 
 - The stack runs via **rootless podman**:
   - `make up` — production stack (release images: rustfs, control, caddy; runner is a container cell); `make dev` — dev processes on the 4-service layout (bind-mounts, cargo-watch, `vite dev`)
   - `make logs`, `make down` (keeps volumes), `make nuke` (volumes + local `.wrangler` D1/SQLite)
-  - E2E (manual pre-release, no CI): `TAG=<short-sha> make e2e` — boots the prod stack from those exact GHCR bytes (images workflow tags; control service + runner cell both pull, nothing builds), deploys the worker (`celld deploy dist` from inside control), `make doctor` (5 min), then Playwright. Needs `127.0.0.1 api.localhost git.localhost e2e.localhost` in /etc/hosts. No test-only app code: passkeys use a CDP virtual authenticator, fixed slug `e2e`.
+  - E2E (manual pre-release, no CI): `TAG=<short-sha> make e2e` — raw localhost:ports, no Caddy/subdomains/cells: rustfs :9000, plain GHCR runner :8080 (+ tenants 81xx), control UI :8090. Always fresh (own `noite-e2e` project/volumes/bucket + wiped bind dir; the wipe refuses non-`-e2e` buckets) and never touches dev storage (separate volumes, no `-v` anywhere in the lane). Validates GHCR bytes, passkey signup, git push, deploy, tenant serve. NOT covered: cell boot / DO dispatch / fence (needs rootful engine).
   - `up`/`dev` build with cache every run, so no separate build targets
 
 ## Map and architecture in one breath

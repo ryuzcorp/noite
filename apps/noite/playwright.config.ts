@@ -1,15 +1,18 @@
 import { defineConfig } from "@playwright/test";
 
-// Prod edge locally (plain HTTP; TLS only fronts real domains). Subdomain
-// hosts (api./git./{slug}.localhost) need /etc/hosts entries — `make e2e`
-// checks them (docker/e2e-local.sh).
-const baseURL = process.env.E2E_BASE_URL ?? "http://localhost:9080";
+// Raw-port lane locally (control UI direct on localhost:8090; runner API
+// direct on localhost:8080; tenants on their 81xx ports). No Caddy, no
+// subdomains, no /etc/hosts. Plain `localhost` (never 127.0.0.1) so the
+// WebAuthn RP ID validates.
+const baseURL = process.env.E2E_BASE_URL ?? "http://localhost:8090";
 
 export default defineConfig({
   expect: { timeout: 30_000 },
   fullyParallel: false,
   projects: [
-    { name: "setup", testMatch: /auth\.setup\.ts/u },
+    // One retry: the CDP passkey ceremony flakes rarely, and a retry with
+    // the same email is safe (verified: passes immediately after failing).
+    { name: "setup", retries: 1, testMatch: /auth\.setup\.ts/u },
     {
       dependencies: ["setup"],
       name: "e2e",

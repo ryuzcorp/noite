@@ -60,6 +60,10 @@ services:
       CADDY_CONTROL_UPSTREAM: control:8090
       CADDY_API_UPSTREAM: runner:8080
       RUNNER_WORK_DIR: /data/runner
+      # SQLite lives in the agent-data volume (NOT the `./data` default,
+      # which resolves under working_dir /src into the source tree where
+      # `make nuke` never looks). Missing file restores from the bucket.
+      NOITE_DB: /data/noite.sqlite
       PORT_BASE: "8100"
       RUNNER_POLL_MS: "5000"
       CELLD_BIN: celld
