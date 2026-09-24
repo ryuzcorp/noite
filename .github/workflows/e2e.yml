@@ -78,6 +78,10 @@ jobs:
         run: |
           CID="$(docker compose -f docker/compose.yaml ps -q control)"
           docker exec -u 0 "$CID" sh -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends docker.io && rm -rf /var/lib/apt/lists/*'
+          # Diagnose as the deploy user (no -u flag, same as the deploy step).
+          docker exec "$CID" sh -c 'id; echo PATH=$PATH; ls -l /usr/bin/docker /usr/local/bin/docker 2>&1; command -v docker || true'
+          docker exec -u 0 "$CID" ln -sf /usr/bin/docker /usr/local/bin/docker
+          docker exec "$CID" docker --version
           python3 -c "import json; p='apps/noite/dist/wrangler.json'; d=json.load(open(p)); d['containers'][0]['image']='/repo/Dockerfile.runner-container'; json.dump(d, open(p,'w'), indent=2)"
         timeout-minutes: 8
       # The node has no published API port, so deploy from inside the
