@@ -112,6 +112,7 @@ jobs:
       - name: deploy control worker
         run: |
           CID="$(docker compose -f docker/compose.yaml ps -q control)"
+          docker exec "$CID" sh -c 'ls /e2e-app; echo ---; ls /e2e-app/node_modules/@cloudflare 2>&1; echo ---; grep -o "\"image\": \"[^\"]*\"" /e2e-app/dist/wrangler.json'
           docker exec -w /e2e-app "$CID" celld deploy dist \
             --bucket "s3://noite/control" \
             --endpoint http://rustfs:9000 \
