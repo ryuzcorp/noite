@@ -1,0 +1,252 @@
+# Noite — standalone install (ONE file, no repo clone, no local build).
+#
+# For cloud VMs, Docker panels and Compose stores (Arcane, Portainer, Dockge,
+# Kompose, Runtipi, ...): every image is pulled from GHCR, every path is a
+# named volume, and every variable has a default, so
+#
+#     docker compose -f compose.standalone.yaml up -d
+#
+# boots a working install that serves the control UI at http://localhost:9080.
+# First boot takes ~1 min: the control container creates the bucket, deploys
+# the baked UI bundle into it, then starts the celld node.
+#
+#   host ports   HTTP_PORT 9080, HTTPS_PORT 9443, RUSTFS_API_PORT 9000,
+#                RUSTFS_CONSOLE_PORT 9001 (rustfs console: no auth in front —
+#                keep it off the internet or firewalled)
+#   UI           http://localhost:9080   (passkeys work on `localhost` as-is)
+#   runner API   http://api.localhost:9080
+#   git remote   http://git.localhost:9080/{slug}
+#   apps         http://{slug}.localhost:9080
+#
+# Real domain (subdomains and HTTPS): set at least
+#
+#     BASE_DOMAIN=example.com  BETTER_AUTH_URL=https://app.example.com
+#     BETTER_AUTH_SECRET=<long random>   RUNNER_TOKEN=<long random>
+#     RUSTFS_ACCESS_KEY=<random>         RUSTFS_SECRET_KEY=<long random>
+#     S3_PUBLIC_ENDPOINT=https://s3.example.com   # public URL of rustfs
+#
+# and point `*.example.com` at the host (plus 80/443 for the port mappings).
+# Dev-default secrets are refused off localhost, so a half-configured domain
+# install fails loudly instead of booting insecurely.
+#
+# Images: `ghcr.io/ryuzcorp/noite-runner` (deploy pipeline, fleets, edge
+# routes) and `ghcr.io/ryuzcorp/noite-control` (control UI). Pin a SHA/tag with
+# NOITE_RUNNER_IMAGE / NOITE_CONTROL_IMAGE for reproducible upgrades; both
+# packages must stay public so this file stays pull-only.
+#
+# Upgrading a service that owns a volume stops it briefly (Compose has to
+# release the volume); batch control-plane changes. The `runner-data` volume
+# holds the only copy of deploy metadata — back it up (docker/backup.sh works
+# against this stack: `docker compose -f compose.standalone.yaml` from a
+# checkout, or just tar the volume).
+#
+# Same four services and the same variables as docker/compose.yaml; this file
+# only drops the `build:` blocks and the Coolify labels. `bun run
+# docker/check-standalone.ts` (CI: `check` job) fails if it drifts behind.
+name: noite
+
+x-aws: &aws
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:-noiteaccess}
+  AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:-noitesecretnoitesecretnoite12}
+  AWS_EC2_METADATA_DISABLED: "true"
+
+services:
+  rustfs:
+    image: docker.io/rustfs/rustfs:1.0.0-rc.6
+    restart: unless-stopped
+    command: ["/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-noiteaccess}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-noitesecretnoitesecretnoite12}
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_OBS_LOGGER_LEVEL: error
+    ports:
+      - "${RUSTFS_API_PORT:-9000}:9000"
+      - "${RUSTFS_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - rustfs-data:/data
+    networks: [noite]
+    # Gate the other services on S3 answering: on a fresh box rustfs spends
+    # seconds initializing data dirs. Root GET / answers 403 without
+    # credentials — connection, not auth, is the readiness signal.
+    healthcheck:
+      test: ["CMD", "curl", "-s", "-o", "/dev/null", "http://127.0.0.1:9000/"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+  # Bucket note: the celld node validates s3://NOITE_S3_BUCKET at boot and
+  # exits non-zero when missing — the control entrypoint ensures it (idempotent
+  # head-or-make via awscli) before exec'ing celld, and the runner ensures it
+  # too, so no platform has to honor cross-service ordering.
+  runner:
+    # Deploy pipeline, fleet supervisor, Caddyfile owner, telemetry
+    # aggregation. Talks straight to the object store (`S3_ENDPOINT`).
+    image: ${NOITE_RUNNER_IMAGE:-ghcr.io/ryuzcorp/noite-runner:latest}
+    hostname: runner
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      <<: *aws
+      RUST_LOG: ${RUST_LOG:-noite_runner=info,tower_http=info}
+      RUNNER_BIND: 0.0.0.0:8080
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-dev-runner-token}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://rustfs:9000}
+      NOITE_S3_BUCKET: ${NOITE_S3_BUCKET:-noite}
+      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
+      CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-}
+      CONTROL_EXTRA_HOSTS: ${CONTROL_EXTRA_HOSTS:-}
+      GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-http://git.localhost:${HTTP_PORT:-9080}}
+      # Control UI base for Git API-key + collaborator checks.
+      UI_URL: ${UI_URL:-http://control:8090}
+      # The runner owns the Caddyfile (caddy `--watch` reloads it): platform
+      # hosts → control, api./git. → itself, {slug}. → the tenant's port.
+      CADDYFILE_PATH: /caddy/Caddyfile
+      CADDY_ACCESS_LOG: /caddy/access.log
+      CADDY_CONTROL_UPSTREAM: control:8090
+      CADDY_API_UPSTREAM: runner:8080
+      CADDY_UPSTREAM_HOST: runner
+      # Unset = on except localhost; `off` behind a terminating proxy, where
+      # this Caddy still mints per-host certs on demand.
+      CADDY_AUTO_HTTPS: ${CADDY_AUTO_HTTPS:-}
+      RUNNER_WORK_DIR: /data/runner
+      NOITE_DB: /data/noite.sqlite
+      PORT_BASE: "8100"
+      RUNNER_POLL_MS: "5000"
+      CELLD_BIN: celld
+      # Bounds per account and per fleet.
+      RUNNER_MAX_APPS_PER_USER: ${RUNNER_MAX_APPS_PER_USER:-10}
+      RUNNER_FLEET_MAX_RSS_MB: ${RUNNER_FLEET_MAX_RSS_MB:-512}
+      RUNNER_FLEET_IDLE_EVICT_S: ${RUNNER_FLEET_IDLE_EVICT_S:-300}
+      RUNNER_FLEET_LOG: ${RUNNER_FLEET_LOG:-error,celld=warn}
+    volumes:
+      # All runner state: SQLite, git mirrors, builds, sidecar-free.
+      - runner-data:/data
+      # Shared with caddy (mounted at /etc/caddy there): the Caddyfile the
+      # runner writes and the access log it tails.
+      - caddy-config:/caddy
+    networks: [noite]
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    healthcheck:
+      # /ready gates on the first reconcile pass (fleets spawned, Caddyfile
+      # written), so caddy never routes to a cold runner.
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+  control:
+    # Oxide control UI on a celld node. The image bakes the built worker
+    # bundle and the entrypoint deploys it — revision-gated, with the worker's
+    # vars patched from this environment. No host-side clone, build or
+    # `celld deploy` step exists.
+    image: ${NOITE_CONTROL_IMAGE:-ghcr.io/ryuzcorp/noite-control:latest}
+    hostname: control
+    restart: unless-stopped
+    # Must exceed the node's CELLD_SHUTDOWN_TOTAL_MS below, or the orchestrator
+    # SIGKILLs celld mid-shutdown.
+    stop_grace_period: 30s
+    environment:
+      <<: *aws
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://rustfs:9000}
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://127.0.0.1:9000}
+      NOITE_S3_BUCKET: ${NOITE_S3_BUCKET:-noite}
+      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
+      # Empty = control on the bare domain (dev `localhost`); prod sets `app`.
+      CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-}
+      CONTROL_EXTRA_HOSTS: ${CONTROL_EXTRA_HOSTS:-}
+      # Passkeys are bound to this origin — set it before users register.
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:${HTTP_PORT:-9080}}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-dev-only-change-me-to-a-long-random-string}
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-dev-runner-token}
+      RUNNER_URL: http://runner:8080
+      UI_URL: ${UI_URL:-http://control:8090}
+      GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-http://git.localhost:${HTTP_PORT:-9080}}
+      NOITE_ADMIN_EMAIL: ${NOITE_ADMIN_EMAIL:-}
+      NOITE_EMAIL_WEBHOOK_URL: ${NOITE_EMAIL_WEBHOOK_URL:-}
+      NOITE_SMTP_FROM: ${NOITE_SMTP_FROM:-}
+      # Caddy forwards the original Host/scheme; without this the worker sees
+      # the compose-internal URL and every link/redirect is wrong.
+      CELLD_TRUST_FORWARDED_HEADERS: "1"
+      # Rate limits: the platform's per-client budget on the public routes,
+      # and better-auth's own budget for /api/auth/* (0 / unset disables them).
+      NOITE_RATE_LIMIT_RPM: ${NOITE_RATE_LIMIT_RPM:-600}
+      NOITE_AUTH_RATE_LIMIT: ${NOITE_AUTH_RATE_LIMIT:-600}
+      CELLD_WATCH: /data/control
+      # Stop budget; the compose `stop_grace_period` above is deliberately
+      # larger so celld can finish its durability shutdown and seal its log.
+      CELLD_SHUTDOWN_TOTAL_MS: "25000"
+    volumes:
+      # celld's local SQLite/replication working dir (durability itself is the
+      # fleet bucket). Scope it to the control prefix.
+      - control-state:/data
+    networks: [noite]
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    # The node's own public health endpoint: it answers 503 before the fleet
+    # settles and during a drain, so caddy starts routing only to a node that
+    # is really ready. PID 1 is celld (entrypoint exec).
+    healthcheck:
+      test:
+        ["CMD", "curl", "-fs", "http://127.0.0.1:8090/.well-known/celld/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 180s
+  caddy:
+    # Stock upstream image: the edge config is not baked, the runner writes it
+    # into the shared volume below and `--watch` picks it up within a tick.
+    image: docker.io/library/caddy:2.10.0-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-9080}:80"
+      - "${HTTPS_PORT:-9443}:443"
+    expose:
+      - "80"
+      - "443"
+    environment:
+      # Inert here (Coolify's boot check); kept so the variables match
+      # docker/compose.yaml exactly.
+      SERVICE_URL_CADDY_80: /
+    volumes:
+      # Shared with the runner (mounted at /caddy there): it writes the
+      # Caddyfile and tails the access log. The bootstrap config covers the
+      # window before the runner's first reconcile; `:z` relabels for
+      # container reads on SELinux-enforcing hosts (Fedora).
+      - caddy-config:/etc/caddy
+      - caddy-data:/data
+    networks: [noite]
+    # Route only once the UI answers and the runner has reconciled (kills the
+    # 502/placeholder window on fresh boot).
+    depends_on:
+      control:
+        condition: service_healthy
+      runner:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /etc/caddy
+        [ -f /etc/caddy/Caddyfile ] || printf '%s\n' ':80 {' '  respond "noite edge starting" 200' '}' > /etc/caddy/Caddyfile
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile --watch
+
+networks:
+  noite:
+
+volumes:
+  rustfs-data:
+  # Runner state (SQLite + git mirrors + builds) — the only copy of deploy
+  # metadata, so back this up.
+  runner-data:
+  # celld node working dir for the control fleet.
+  control-state:
+  # Shared edge config (runner-written Caddyfile + access log) and certs.
+  caddy-config:
+  caddy-data:

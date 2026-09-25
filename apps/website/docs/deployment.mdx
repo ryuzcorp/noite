@@ -13,6 +13,8 @@ Noite ships as four services, all defined in `docker/compose.yaml`: **rustfs** (
 
 Coolify uses the same `docker/compose.yaml` with env overrides. See [Coolify](#coolify) below for the full setup including tenant subdomains.
 
+**No clone, no build:** `docker/compose.standalone.yaml` is the same four services in one file that pulls the published `ghcr.io/<owner>/noite-runner` and `noite-control` images and uses only named volumes — drop it into a cloud VM or a Compose store/panel (Arcane, Portainer, Dockge, …) and `docker compose -f compose.standalone.yaml up -d` is the whole install. Every variable has a default, so it boots with no env set and serves the control UI on `http://localhost:9080`; add `BASE_DOMAIN`, `BETTER_AUTH_URL` and the four secrets (plus `S3_PUBLIC_ENDPOINT`) for a real domain, exactly as in option A.
+
 ## Prerequisites
 
 - A Docker or Podman host with Compose.

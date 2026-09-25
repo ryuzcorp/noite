@@ -40,6 +40,16 @@ jobs:
         run: BASE_DOMAIN=localhost AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x S3_ENDPOINT=https://s3.example.com S3_PUBLIC_ENDPOINT=https://s3.example.com docker compose -f docker/compose.yaml -f docker/compose.byob.yaml config > /dev/null
       - name: render e2e overlay
         run: BASE_DOMAIN=localhost docker compose -f docker/compose.yaml -f docker/compose.e2e.yaml config > /dev/null
+      - name: render standalone compose
+        run: docker compose -f docker/compose.standalone.yaml config > /dev/null
+      # The standalone file is a hand-maintained mirror of docker/compose.yaml
+      # (pull-only, no build:), so a service that gains an env var or volume
+      # there would silently rot store installs. Compare the rendered configs.
+      - name: standalone matches the base install
+        run: |
+          BASE_DOMAIN=localhost docker compose -f docker/compose.yaml config --format json > /tmp/base.json
+          docker compose -f docker/compose.standalone.yaml config --format json > /tmp/standalone.json
+          bun docker/check-standalone.ts /tmp/base.json /tmp/standalone.json
       - name: shell scripts parse
         run: for f in docker/*.sh; do sh -n "$f"; done
       - name: runner schema applies twice (idempotent)

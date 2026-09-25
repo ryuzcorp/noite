@@ -16,7 +16,7 @@ make backup  # tar every data volume into backups/<UTC stamp>/
 
 Restore is destructive and replays a backup directory over the live volumes: `make restore FROM=backups/<stamp>`.
 
-`make up-prod` pulls the release images instead of building. On a host without a clone, set `NOITE_RUNNER_IMAGE=ghcr.io/<owner>/noite-runner:latest` and `NOITE_CONTROL_IMAGE=ghcr.io/<owner>/noite-control:latest`, then `docker compose -f docker/compose.yaml up -d` (never `--build`) — same file, env-driven.
+`make up-prod` pulls the release images instead of building. On a host with nothing but Compose, `docker compose -f docker/compose.standalone.yaml up -d` (or the same file from a panel's/registry's template) boots the whole install — it is `docker/compose.yaml` without the `build:` blocks, pull-only and defaulted. On a host without a clone, set `NOITE_RUNNER_IMAGE=ghcr.io/<owner>/noite-runner:latest` and `NOITE_CONTROL_IMAGE=ghcr.io/<owner>/noite-control:latest`, then `docker compose -f docker/compose.yaml up -d` (never `--build`) — same file, env-driven.
 
 | Path |  |
 | --- | --- |
@@ -26,6 +26,7 @@ Restore is destructive and replays a backup directory over the live volumes: `ma
 | `docker/compose.yaml` | the whole install (compose + Coolify via env) |
 | `docker/compose.dev.yaml` | dev overlay: bind-mounted dev processes |
 | `docker/compose.byob.yaml` | external-S3 overlay (compose `-f` flag), bundled RustFS excluded |
+| `docker/compose.standalone.yaml` | ONE file for cloud VMs and Compose stores (Arcane, Portainer, Dockge, …): pulls the GHCR images, named volumes only, no clone, no build |
 
 | URL                            |                       |
 | ------------------------------ | --------------------- |

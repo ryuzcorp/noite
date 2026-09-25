@@ -170,6 +170,12 @@ make up
 
 Infra: `docker/compose.yaml`, `docker/`, `Makefile` at repo root.
 
+## Standalone install for stores and cloud VMs (2026-09-25)
+
+`docker/compose.standalone.yaml` is the whole install in **one file** for hosts that have Compose and nothing else — cloud VMs and Compose stores/panels (Arcane registry templates, Portainer stacks, Dockge, …). It is `docker/compose.yaml` with the `build:` blocks replaced by `ghcr.io/<owner>/noite-{runner,control}` image refs (published, public) and the Coolify labels dropped; every variable keeps a default, so it renders and boots with **no env at all** (`docker compose config -q` passes for a registry's validator, first boot serves the UI on `http://localhost:9080`).
+
+Because it is a hand-maintained mirror, `docker/check-standalone.ts` guards it: CI renders both files (`docker compose config --format json`) and fails when a service, volume or env key of the base install is missing from the mirror, when the mirror builds instead of pulling, or when a service there points at a locally-built image. Verified by booting the mirror as a store would (all defaults, GHCR refs swapped for the locally-built tags): control first-boot deploy, UI `200` through Caddy, `api.localhost/health` `200`, `git.localhost` `401` (auth gate), unknown slug → the edge fallback page, Caddyfile adapts, no placeholder config.
+
 ## Out of scope for v1
 
 - Organizations / multi-host
@@ -187,7 +193,7 @@ Decision: the container-cell topology is retired. Noite installs as a plain four
 - **Container-cell path deleted:** the `RunnerContainer` Durable Object, `RUNNER_TARGET`, the compose-store fence, the loopback S3 sidecar, the `/v1/sync/*` relay API, the R2 durability relay, the nightly telemetry backup workflow, and the `containers.jsonc` + `inject-containers.ts` generated-DO wiring are all gone. Tenant routing no longer goes through `getTcpPort` — the runner's Caddyfile decides every host.
 - **D1 mirror retired.** The UI no longer keeps its own `app`/`deploy` rows; it reads the runner API (Bearer REST/RPC over HTTP) directly.
 - **CI without Railpack.** `.github/workflows/images.yml` lints, asserts the celld pin, renders every compose variant, then builds both multi-arch images with plain buildx (native per-arch runners, digests merged into a manifest list).
-- **Deleted from the tree:** `docker/standalone.ts` (the single-file compose generator) and the generated `compose.standalone.yaml` it emitted, `railpack.json`, `docker/Dockerfile.caddy`, and `docker/Caddyfile.static`. `docker/compose.yaml` is the only documented install file; the BYOB overlay is `docker/compose.byob.yaml`.
+- **Deleted from the tree:** `docker/standalone.ts` (the single-file compose generator) and the generated `compose.standalone.yaml` it emitted, `railpack.json`, `docker/Dockerfile.caddy`, and `docker/Caddyfile.static`. `docker/compose.yaml` is the documented Compose install file; the BYOB overlay is `docker/compose.byob.yaml` and the store/VM mirror is `docker/compose.standalone.yaml`.
 
 Consequences for operators: `cp .env.example .env && make up` builds and starts, `make up-prod` (or setting `NOITE_RUNNER_IMAGE` / `NOITE_CONTROL_IMAGE`) pulls the release images instead, and an image-only host runs `docker compose -f docker/compose.yaml up -d` with no clone. A runner-image change still restarts the control plane together with all tenant fleets (they cold-boot), so batch control-plane changes and pin the image variables by SHA. A fresh install serves nothing until the control container's first-boot deploy finishes (seconds) — `make doctor` gates on the UI actually serving HTML.
 
