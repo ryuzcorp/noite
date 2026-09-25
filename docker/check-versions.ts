@@ -22,7 +22,7 @@ const celldArg = /ARG CELLD_VERSION=(?<version>\d+\.\d+\.\d+)/u;
 
 const groups = {
   celld: [
-    { file: "Dockerfile.runner-container", pattern: celldArg },
+    { file: "docker/Dockerfile.runner", pattern: celldArg },
     { file: "docker/Dockerfile.ui", pattern: celldArg },
     { file: "docker/Dockerfile.runner-dev", pattern: celldArg },
     { file: "docker/Dockerfile.tools", pattern: celldArg },

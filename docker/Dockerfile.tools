@@ -1,5 +1,5 @@
 # Tooling image only — app source is bind-mounted at runtime (no rebuild on code change).
-# Pinned to the fleet celld (see Dockerfile.runner-container) so `vite dev`
+# Pinned to the fleet celld (see docker/Dockerfile.runner) so `vite dev`
 # matches prod behavior. esbuild/duckdb versions live in docker/install-sidecars.sh.
 ARG CELLD_VERSION=0.5.1
 FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld

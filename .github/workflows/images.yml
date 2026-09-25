@@ -19,8 +19,8 @@ on:
     paths:
       - "apps/runner/**"
       - "apps/noite/**"
-      - "Dockerfile.runner-container"
-      - "docker/Dockerfile.ui"
+      - "docker/Dockerfile.runner*"
+      - "docker/Dockerfile.ui*"
       - "docker/noite-entrypoint.sh"
       - "docker/install-sidecars.sh"
       - "docker/compose.yaml"
@@ -86,7 +86,7 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          file: Dockerfile.runner-container
+          file: docker/Dockerfile.runner
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/noite-runner,push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=runner-${{ matrix.platform }}

@@ -2,7 +2,7 @@
 # Dev runner image: Rust toolchain + celld/bun/aws for cargo-watch rebuilds.
 # Sidecar versions (esbuild/duckdb) live in docker/install-sidecars.sh —
 # bump there, not here. celld stays an ARG; keep 0.5.1 in sync with
-# Dockerfile.runner-container (0.4.1 stalls binding-created workflows — see SPEC).
+# docker/Dockerfile.runner (0.4.1 stalls binding-created workflows — see SPEC).
 ARG CELLD_VERSION=0.5.1
 ARG BUN_VERSION=1.3.5
 

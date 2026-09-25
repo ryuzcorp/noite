@@ -1,0 +1,10 @@
+# Per-Dockerfile ignore file: `<Dockerfile>.dockerignore` takes precedence over
+# a context-root `.dockerignore`, keeping every Docker artifact under docker/.
+#
+# This image COPYs exactly one context path — docker/install-sidecars.sh — and
+# takes its sources from the runtime bind mount (docker/compose.dev.yaml), so
+# send nothing else. `*` + the explicit negations keep the repo-root context at
+# a few KB instead of the whole source tree.
+*
+!docker/
+!docker/install-sidecars.sh

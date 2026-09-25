@@ -1,0 +1,50 @@
+# Per-Dockerfile ignore file: `<Dockerfile>.dockerignore` takes precedence over
+# a context-root `.dockerignore`, keeping every Docker artifact under docker/.
+# Patterns are relative to the build context — the repo root, since compose
+# builds with `context: ..` — NOT to docker/.
+#
+# Build-context bloat guard: keep the 2.5 GB cargo target/, node_modules trees,
+# local state and dotenv files out of the tar stream. Nested paths need `**/`:
+# a bare name matches the context root only (`target` alone leaves
+# apps/runner/target in the context — bare matching verified against
+# moby/patternmatcher semantics).
+#
+# Keep in sync with docker/Dockerfile.runner.dockerignore (both prod images
+# build from the repo root); the dev images use the minimal variants.
+
+# language build output
+**/target
+**/dist
+**/out
+
+# dependencies
+**/node_modules
+
+# container registry seeds + local state
+**/.wrangler
+**/.celld
+data
+**/*.sqlite
+**/*.sqlite-shm
+**/*.sqlite-wal
+
+# vcs / editor
+**/.git
+**/.gitignore
+**/*.dockerignore
+**/.idea
+
+# dotenv files MUST use `**/`: a bare name only matches the context root, and
+# `apps/noite/.dev.vars` is a real secret file (this image bakes it into the
+# worker bundle's vars block if it leaks into the context).
+**/.env
+**/.env.*
+!**/.env.example
+**/.dev.vars
+**/.dev.vars.*
+!**/.dev.vars.example
+
+# plan + docs are repo content — keep markdown out of images to shrink context
+# (README is small; SPEC.md is small; both fine to exclude since no image COPYs them)
+**/*.md
+**/*.mdx

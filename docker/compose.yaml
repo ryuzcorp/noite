@@ -58,7 +58,7 @@ services:
     # aggregation. Talks straight to the object store (`S3_ENDPOINT`).
     build:
       context: ..
-      dockerfile: Dockerfile.runner-container
+      dockerfile: docker/Dockerfile.runner
     image: ${NOITE_RUNNER_IMAGE:-noite-runner:local}
     hostname: runner
     restart: unless-stopped

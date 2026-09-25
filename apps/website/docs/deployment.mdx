@@ -3,7 +3,7 @@ title: Deployment
 description: Deploy Noite anywhere with Docker Compose — bundled RustFS or your own S3 bucket.
 ---
 
-Noite ships as four services, all defined in `docker/compose.yaml`: **rustfs** (S3 bucket), **runner** (the Rust deploy pipeline, tenant celld fleets, Caddyfile, telemetry aggregation and Git smart-HTTP; image built from the repo-root `Dockerfile.runner-container`), **control** (the Oxide control UI on a celld node; bundle baked into its image) and **caddy** (stock upstream `caddy:2.10.0-alpine`, which the runner configures). `docker compose up -d` is the whole install — no host-side build or deploy step exists. Two storage options for the fleet bucket.
+Noite ships as four services, all defined in `docker/compose.yaml`: **rustfs** (S3 bucket), **runner** (the Rust deploy pipeline, tenant celld fleets, Caddyfile, telemetry aggregation and Git smart-HTTP; image built from `docker/Dockerfile.runner`), **control** (the Oxide control UI on a celld node; bundle baked into its image) and **caddy** (stock upstream `caddy:2.10.0-alpine`, which the runner configures). `docker compose up -d` is the whole install — no host-side build or deploy step exists. Two storage options for the fleet bucket.
 
 |  | A: bundled RustFS | B: your own bucket (BYOB) |
 | --- | --- | --- |
