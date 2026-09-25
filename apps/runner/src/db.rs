@@ -80,6 +80,10 @@ pub fn local_db_path(cfg: &crate::config::Config) -> Option<std::path::PathBuf> 
 /// `CREATE TABLE IF NOT EXISTS` only ever covers whole tables). Guard with
 /// `pragma_table_info` instead: this is the supported path for the next column,
 /// and it is a no-op once applied.
+// Never called yet — it exists for the next column this schema gains, and the
+// unit test below pins the add-once behaviour. Delete it the moment a real call
+// site lands (this allow is the only reason it is not `dead_code`).
+#[allow(dead_code)]
 pub async fn ensure_column(
     pool: &SqlitePool,
     table: &str,

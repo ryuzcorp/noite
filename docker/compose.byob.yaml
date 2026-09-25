@@ -11,16 +11,21 @@
 # (ListAllMyBuckets optional: readiness falls back to HeadBucket).
 services:
   rustfs:
-    # Excluded from BYOB runs (the profile is never enabled).
+    # Excluded from BYOB runs (the profile is never enabled). A dependency on a
+    # service whose profile is not enabled fails validation ("depends on
+    # undefined service"), so both consumers reset theirs to empty — there is no
+    # bundled bucket to wait for.
     profiles: ["bundled-s3"]
 
   runner:
+    depends_on: !reset []
     environment:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?}
       S3_ENDPOINT: ${S3_ENDPOINT:?}
 
   control:
+    depends_on: !reset []
     environment:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?}
