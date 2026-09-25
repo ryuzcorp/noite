@@ -11,8 +11,12 @@ import type { InferSchema, Selectable } from "paranorm";
 
 import { controlEnv } from "./control-env";
 
+// D1 holds auth (better-auth tables) plus collaborator grants — the ONLY
+// app-shaped state the UI owns. App rows and deploy history live in the runner
+// (single writer, behind its bearer API), so `app_collaborator.appId` is a
+// plain key into that store: no local FK, no mirror, no sync job.
 const schema = defineSchema(`
-  _version: "1.2.0"
+  _version: "1.3.0"
   _extends: [idempotency]
 
   user:
@@ -30,7 +34,6 @@ const schema = defineSchema(`
     _relations:
       accounts: has_many=account
       sessions: has_many=session
-      apps: has_many=app
       collaborations: has_many=app_collaborator
 
   session:
@@ -110,66 +113,28 @@ const schema = defineSchema(`
     permissions: string?
     metadata: string?
 
-  app:
-    id: id(uuidv4)
-    slug: string unique
-    name: string
-    userId: references=user.id on_delete=cascade index
-    status: string default="pending"
-    subdomain: string
-    gitPrefix: string
-    fleetBucket: string
-    listenPort: int?
-    internalPort: int?
-    lastDeploySha: string?
-    lastError: string?
-    desiredState: string default="running"
-    createdAt: timestamp default=now
-    updatedAt: timestamp default=now
-    _relations:
-      user: belongs_to=user
-      secrets: has_many=app_secret
-      deploys: has_many=deploy
-      collaborators: has_many=app_collaborator
-
   app_collaborator:
     id: id(uuidv4)
-    appId: references=app.id on_delete=cascade index unique=[app_collaborator.appId,app_collaborator.userId]
+    appId: string index unique=[app_collaborator.appId,app_collaborator.userId]
     userId: references=user.id on_delete=cascade index
     role: string enum=[view,push,admin]
     createdAt: timestamp default=now
     _relations:
-      app: belongs_to=app
       user: belongs_to=user
 
-  app_secret:
+  invite:
     id: id(uuidv4)
-    appId: references=app.id on_delete=cascade index
-    kind: string
-    accessKey: string
-    secretKey: string
-    revealed: boolean default=false
+    code: string unique index
+    createdBy: string index
+    usedBy: string?
+    usedAt: timestamp?
+    revoked: boolean default=false
+    note: string?
     createdAt: timestamp default=now
-    _relations:
-      app: belongs_to=app
-
-  deploy:
-    id: id(uuidv4)
-    appId: references=app.id on_delete=cascade index
-    sha: string?
-    status: string default="queued"
-    log: string default=""
-    createdAt: timestamp default=now
-    updatedAt: timestamp default=now
-    _relations:
-      app: belongs_to=app
 `);
 
 export type DB = InferSchema<typeof schema>;
-export type App = Selectable<DB["app"]>;
 export type AppCollaborator = Selectable<DB["app_collaborator"]>;
-export type AppSecret = Selectable<DB["app_secret"]>;
-export type Deploy = Selectable<DB["deploy"]>;
 export type AppRole = "view" | "push" | "admin";
 
 export const orm = paranorm<DB>();
@@ -262,7 +227,6 @@ export const ensureDb = Effect.gen(function* ensureDb() {
   const adminEmail =
     resolveEnv().NOITE_ADMIN_EMAIL?.trim().toLowerCase() || null;
   if (adminEmail) {
-    // @ts-expect-error TS2589: paranorm user-table inference exceeds tsc's depth budget; the query is correct at runtime.
     const existing = yield* orm.user.findFirst({
       where: { email: adminEmail },
     });

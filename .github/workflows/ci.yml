@@ -1,0 +1,113 @@
+# Pull-request gate: lint, formatting, version-pin drift, every compose variant
+# renders, the Rust crate builds warning-free with its tests, and the worker
+# bundle builds for celld. Release images are a separate workflow (`images.yml`).
+#
+# The end-to-end lane (`make e2e`) needs a container engine plus a few minutes,
+# so it is not a pull-request job: run it from the Actions tab
+# (`workflow_dispatch`) or locally. Its Playwright half is also the only place
+# the browser flows (passkey signup, invites, deploys) are exercised.
+name: ci
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - run: bun install
+      - name: lint and format
+        run: bun run check
+      - name: version pins
+        run: bun docker/check-versions.ts
+      # `config` needs no daemon, so a broken compose file fails here instead of
+      # on someone's server. Every variant, including the test overlay.
+      - name: render prod compose
+        run: BASE_DOMAIN=localhost docker compose -f docker/compose.yaml config > /dev/null
+      - name: render dev overlay
+        run: BASE_DOMAIN=localhost docker compose -f docker/compose.yaml -f docker/compose.dev.yaml config > /dev/null
+      - name: render byob overlay
+        run: BASE_DOMAIN=localhost AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x S3_ENDPOINT=https://s3.example.com S3_PUBLIC_ENDPOINT=https://s3.example.com docker compose -f docker/compose.yaml -f docker/compose.byob.yaml config > /dev/null
+      - name: render e2e overlay
+        run: BASE_DOMAIN=localhost docker compose -f docker/compose.yaml -f docker/compose.e2e.yaml config > /dev/null
+      - name: shell scripts parse
+        run: for f in docker/*.sh; do sh -n "$f"; done
+      - name: runner schema applies twice (idempotent)
+        run: |
+          sqlite3 /tmp/schema.db < apps/runner/schema.sql
+          sqlite3 /tmp/schema.db < apps/runner/schema.sql
+          for t in app app_env app_metric app_secret deploy metric_watermark; do
+            sqlite3 /tmp/schema.db "SELECT name FROM sqlite_master WHERE type='table' AND name='$t'" | grep -qx "$t"
+          done
+
+  rust:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: apps/runner
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The Rust workspace lives at apps/runner, not the repo root.
+          workspaces: apps/runner
+      - run: cargo check --locked --all-targets
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      # The UI image installs from apps/noite's own lockfile, so CI must too —
+      # a drift there breaks the image build, not this build.
+      - name: install UI deps
+        working-directory: apps/noite
+        run: bun install --frozen-lockfile
+      - name: typecheck
+        working-directory: apps/noite
+        run: bunx tsc --noEmit
+      - name: build worker bundle
+        working-directory: apps/noite
+        run: bun run build
+
+  # Manual, because it builds both images and drives a real browser.
+  e2e:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - run: bun install
+      - name: install UI deps
+        working-directory: apps/noite
+        run: bun install --frozen-lockfile
+      - name: playwright chromium
+        working-directory: apps/noite
+        run: bunx playwright install --with-deps chromium
+      - name: e2e lane
+        run: make e2e
+      - name: upload playwright report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: playwright-report
+          path: apps/noite/playwright-report/
+          retention-days: 7

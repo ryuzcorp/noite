@@ -3,7 +3,7 @@ import { atom, unsafe, watch } from "ilha";
 
 import { get, rollback } from "../apps.server";
 import { formatDateTime } from "../dates";
-import type { Deploy } from "../db";
+import type { RunnerDeploy } from "../runner";
 import { ListSkeleton } from "../skeletons";
 import { readSwrCache, writeSwrCache } from "../swr-cache";
 import {
@@ -151,7 +151,7 @@ const DeployRow = ({
 }: {
   appId: string;
   currentSha: string | null;
-  d: Deploy;
+  d: RunnerDeploy;
   key?: string;
 }) => {
   // Atom-driven expansion (no native <details>): ilha binds no `ontoggle`
@@ -275,8 +275,8 @@ const DeployRow = ({
  * rewrites the cache — no polling, and rows never remount underneath
  * an open log. */
 export const DeployList = ({ appId }: { appId: string }) => {
-  const seed = readSwrCache<Deploy[]>(`app:${appId}:deploys`);
-  const items = atom<Deploy[]>(seed ?? []);
+  const seed = readSwrCache<RunnerDeploy[]>(`app:${appId}:deploys`);
+  const items = atom<RunnerDeploy[]>(seed ?? []);
   const loadError = atom("");
   const loaded = atom(seed !== null);
   const detail = atom<AppDetailInfo | null>(
@@ -310,7 +310,7 @@ export const DeployList = ({ appId }: { appId: string }) => {
         }
         // SAFETY: the runner deploys stream emits the same Deploy rows as
         // the list endpoint; entries flow only into list rendering.
-        items.set(next as Deploy[]);
+        items.set(next as RunnerDeploy[]);
         writeSwrCache(`app:${appId}:deploys`, next);
         loadError.set("");
       } catch {

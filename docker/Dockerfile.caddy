@@ -1,7 +1,0 @@
-# syntax=docker/dockerfile:1
-# Edge image: stock Caddy + the static Caddyfile baked in. Used by the
-# standalone release file (no repo files at deploy time). Local compose
-# bind-mounts docker/Caddyfile.static instead, so `make up --build`
-# still reflects file edits instantly.
-FROM docker.io/library/caddy:2.10.0-alpine
-COPY docker/Caddyfile.static /etc/caddy/Caddyfile

@@ -290,6 +290,98 @@ pub async fn run_cmd_stdin(
     Ok(output.stdout)
 }
 
+/// One listing page with `/` as the delimiter: `CommonPrefixes` are the
+/// directories below `prefix` and `Contents` the files in it. Cheaper than
+/// walking every key when only one level matters (telemetry compaction).
+pub async fn s3_list_delimited(cfg: &Config, bucket: &str, prefix: &str) -> anyhow::Result<String> {
+    let env_owned = aws_env(cfg);
+    let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    run_cmd(
+        "timeout",
+        &[
+            "-k",
+            "2",
+            "15",
+            "aws",
+            "--endpoint-url",
+            &cfg.s3_endpoint,
+            "s3api",
+            "list-objects-v2",
+            "--bucket",
+            bucket,
+            "--prefix",
+            prefix,
+            "--delimiter",
+            "/",
+            "--output",
+            "json",
+        ],
+        None,
+        &env,
+        Duration::from_secs(20),
+    )
+    .await
+}
+
+/// `s3api head-object` probe: Ok(true) when the object exists.
+pub async fn s3_object_exists(cfg: &Config, bucket: &str, key: &str) -> bool {
+    let env_owned = aws_env(cfg);
+    let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    run_cmd(
+        "timeout",
+        &[
+            "-k",
+            "2",
+            "15",
+            "aws",
+            "--endpoint-url",
+            &cfg.s3_endpoint,
+            "s3api",
+            "head-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--output",
+            "json",
+        ],
+        None,
+        &env,
+        Duration::from_secs(20),
+    )
+    .await
+    .is_ok()
+}
+
+/// Recursive delete of one telemetry hour directory, keeping the compacted
+/// file the copy just wrote.
+pub async fn s3_rm_dir_except(cfg: &Config, bucket: &str, prefix: &str, keep: &str) -> anyhow::Result<()> {
+    let env_owned = aws_env(cfg);
+    let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    run_cmd(
+        "timeout",
+        &[
+            "-k",
+            "2",
+            "60",
+            "aws",
+            "--endpoint-url",
+            &cfg.s3_endpoint,
+            "s3",
+            "rm",
+            &format!("s3://{bucket}/{prefix}"),
+            "--recursive",
+            "--exclude",
+            keep,
+        ],
+        None,
+        &env,
+        Duration::from_secs(90),
+    )
+    .await
+    .map(|_| ())
+}
+
 pub async fn s3_list_prefix(cfg: &Config, bucket: &str, prefix: &str) -> anyhow::Result<String> {
     let env_owned = aws_env(cfg);
     let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();

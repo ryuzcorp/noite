@@ -158,6 +158,14 @@ pub struct AppEnv {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct AppDomain {
+    pub app_id: String,
+    pub hostname: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct AppSecret {
     pub id: String,
     pub app_id: String,
@@ -246,6 +254,9 @@ pub struct AppInsight {
 pub struct CreateApp {
     pub name: String,
     pub slug: String,
+    /// Owning account (the control UI passes the signed-in user). Absent on
+    /// direct API calls, which fall back to the local-operator placeholder.
+    pub user_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

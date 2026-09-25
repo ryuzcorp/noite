@@ -1,18 +1,19 @@
-# Noite stack: control celld fleet (with runner container cell) + RustFS + Caddy.
+# Noite production stack: runner (deploy pipeline + fleet supervisor + edge
+# route table) + control (Oxide control UI on a celld node) + RustFS + Caddy.
 #
 #   cp .env.example .env && make up && make logs
 #
-# Container migration cutover: the `runner` service is gone — the Rust runner
-# runs as the `containers` cell of the control worker (`RunnerContainer` DO,
-# image `Dockerfile.runner-container`, singleton standard-4). Worker dispatch
-# follows RUNNER_TARGET=compose|container (container default).
+# This file is the whole install — `docker compose up -d` boots, the UI image
+# deploys itself into the fleet bucket on first start, and nothing has to be
+# run on the host. Same shape as `docker/compose.dev.yaml`, so one topology is
+# exercised in dev, CI and production.
 #
-# NOTE: host paths below are relative to this file's directory (docker/) —
-# both `docker compose` (project dir defaults to the first -f file's dir)
-# and podman-compose resolve them the same way. (The Coolify file is the
-# exception: Coolify uses Base Directory as project dir, so its paths stay
-# repo-root-relative.)
-
+# Host paths are relative to this file's directory (docker/) — both
+# `docker compose` (project dir defaults to the first -f file's dir) and
+# podman-compose resolve them the same way.
+#
+# BYOB (external S3 instead of bundled RustFS): add the overlay —
+#   docker compose -f docker/compose.yaml -f docker/compose.byob.yaml up -d
 name: noite
 
 x-aws: &aws
@@ -33,20 +34,15 @@ services:
       RUSTFS_CONSOLE_ADDRESS: ":9001"
       RUSTFS_CONSOLE_ENABLE: "true"
       RUSTFS_OBS_LOGGER_LEVEL: error
-      # Notify/webhook disabled: RustFS cannot send a bearer token, the runner
-      # gate requires one, and the SPEC treats notify as unreliable — poll + the
-      # deploy.sh nudge are the deploy triggers.
     ports:
       - "${RUSTFS_API_PORT:-9000}:9000"
       - "${RUSTFS_CONSOLE_PORT:-9001}:9001"
     volumes:
       - rustfs-data:/data
     networks: [noite]
-    # Gate control on S3 actually answering: on a fresh box rustfs spends
-    # seconds initializing data dirs, and control's bucket validation
-    # exits (non-zero, no restart on some platforms) if it dials too early.
-    # Root GET / answers 403 without credentials — connection, not auth,
-    # is the readiness signal, so no -f flag.
+    # Gate the other services on S3 actually answering: on a fresh box rustfs
+    # spends seconds initializing data dirs. Root GET / answers 403 without
+    # credentials — connection, not auth, is the readiness signal.
     healthcheck:
       test: ["CMD", "curl", "-s", "-o", "/dev/null", "http://127.0.0.1:9000/"]
       interval: 5s
@@ -54,92 +50,142 @@ services:
       retries: 12
       start_period: 10s
   # Bucket note: the celld node validates s3://NOITE_S3_BUCKET at boot and
-  # exits non-zero when missing — on a fresh box nothing else creates it
-  # (the runner cell only starts after the worker serves). Control ensures
-  # it in its own start command (idempotent head-or-make via the baked-in
-  # awscli) instead of a separate init service, so no platform has to honor
-  # cross-service completion ordering.
-  control:
-    # celld fleet node serving the control UI worker (`apps/noite/dist`
-    # deployed via `celld deploy`) AND the runner container cell
-    # (`RunnerContainer` DO → `Dockerfile.runner-container`). Reuses the
-    # runner image — celld is baked in at /usr/local/bin/celld. Env mirrors
-    # the runner's fleet spawn (apps/runner/src/host/supervisor.rs);
-    # advertise stays loopback with published ports so host-side `celld d1` /
-    # `diagnose` can dial the lease.
-    # Built from the repo root (the Dockerfile COPYs apps/runner/…).
-    # `make up` passes --build, so a source change always ships — no
-    # separate build step to forget. Coolify: set NOITE_RUNNER_IMAGE to
-    # the GHCR release tag to pull instead of building.
+  # exits non-zero when missing — the control entrypoint ensures it
+  # (idempotent head-or-make via awscli) before exec'ing celld, and the runner
+  # ensures it too, so no platform has to honor cross-service ordering.
+  runner:
+    # Deploy pipeline, fleet supervisor, Caddyfile owner, telemetry
+    # aggregation. Talks straight to the object store (`S3_ENDPOINT`).
     build:
       context: ..
       dockerfile: Dockerfile.runner-container
     image: ${NOITE_RUNNER_IMAGE:-noite-runner:local}
-    # Entrypoint script (baked in the image): ensures the fleet bucket,
-    # then execs celld. Explicit here so GHCR (railpack `/bin/bash -c`
-    # entrypoint) and local builds behave identically — never rely on
-    # image defaults for control.
-    entrypoint: ["/usr/local/bin/noite-entrypoint.sh"]
-    hostname: control
-    stop_grace_period: 15s
-    # No `command:` — the entrypoint runs bucket-ensure + celld with
-    # topology flags from env (explicit args would pass through verbatim).
+    hostname: runner
+    restart: unless-stopped
+    stop_grace_period: 30s
     environment:
       <<: *aws
-      S3_ENDPOINT: ${S3_ENDPOINT:-http://rustfs:9000}
-      CELLD_WATCH: /data/control
-      CELLD_DURABILITY: bucket
-      CELLD_DEPLOY_POLL_S: "5"
-      CELLD_TRUST_FORWARDED_HEADERS: "1"
-      CELLD_OTEL: "1"
-      CELLD_OTEL_FLUSH_MS: "2000"
-      CELLD_OTEL_RETENTION: 14d
-      # Container engine for the RunnerContainer cell (G1): the node starts
-      # containers through this socket. Rootless podman likely cannot install
-      # the celld fence (privileged nftables) — a rootful engine may be
-      # required; see the migration plan gates.
-      DOCKER_HOST: unix:///run/podman/podman.sock
-      # Deploy-time vars source for the runner container cell: the worker
-      # forwards its env into every container start (RunnerContainer envVars),
-      # replacing the old compose `runner.environment:` block as a config
-      # source. Secrets (RUNNER_TOKEN, AWS keys) arrive via wrangler secret /
-      # deploy env in prod, `.dev.vars` never leaves the laptop.
-      RUNNER_TARGET: ${RUNNER_TARGET:-container}
+      RUST_LOG: ${RUST_LOG:-noite_runner=info,tower_http=info}
+      RUNNER_BIND: 0.0.0.0:8080
       RUNNER_TOKEN: ${RUNNER_TOKEN:-dev-runner-token}
-      # Loopback S3 sidecar in the runner container (B1): the fence blocks
-      # every route to this compose network, so the runner serves S3 to
-      # itself on 127.0.0.1:9000 and the worker relays durability into R2.
-      RUNNER_SIDECAR_S3: "1"
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://rustfs:9000}
+      NOITE_S3_BUCKET: ${NOITE_S3_BUCKET:-noite}
       BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
       CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-}
       CONTROL_EXTRA_HOSTS: ${CONTROL_EXTRA_HOSTS:-}
-      NOITE_S3_BUCKET: ${NOITE_S3_BUCKET:-noite}
       GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-http://git.localhost:${HTTP_PORT:-9080}}
+      # Control UI base for Git API-key + collaborator checks.
       UI_URL: ${UI_URL:-http://control:8090}
-      RUNNER_POLL_MS: "5000"
+      # The runner owns the Caddyfile (caddy `--watch` reloads it): platform
+      # hosts → control, api./git. → itself, {slug}. → the tenant's port.
+      CADDYFILE_PATH: /caddy/Caddyfile
+      CADDY_ACCESS_LOG: /caddy/access.log
+      CADDY_CONTROL_UPSTREAM: control:8090
+      CADDY_API_UPSTREAM: runner:8080
+      CADDY_UPSTREAM_HOST: runner
+      # Unset = on except localhost; `off` behind a terminating proxy (Coolify
+      # Traefik), where our Caddy still mints per-host certs on demand.
+      CADDY_AUTO_HTTPS: ${CADDY_AUTO_HTTPS:-}
+      RUNNER_WORK_DIR: /data/runner
+      NOITE_DB: /data/noite.sqlite
       PORT_BASE: "8100"
-    # No depends_on: the entrypoint wait-loops S3 itself, so no bundled
-    # edge can dangle (BYOB profiles rustfs out and strict engines reject
-    # undefined services). Caddy still gates on this node's health below.
+      RUNNER_POLL_MS: "5000"
+      CELLD_BIN: celld
+      # Bounds per account and per fleet (see .env.example).
+      RUNNER_MAX_APPS_PER_USER: ${RUNNER_MAX_APPS_PER_USER:-10}
+      RUNNER_FLEET_MAX_RSS_MB: ${RUNNER_FLEET_MAX_RSS_MB:-512}
+      RUNNER_FLEET_IDLE_EVICT_S: ${RUNNER_FLEET_IDLE_EVICT_S:-300}
+      RUNNER_FLEET_LOG: ${RUNNER_FLEET_LOG:-error,celld=warn}
+    volumes:
+      # All runner state: SQLite, git mirrors, builds, sidecar-free.
+      - runner-data:/data
+      # Shared with caddy (mounted at /etc/caddy there): the Caddyfile the
+      # runner writes and the access log it tails.
+      - caddy-config:/caddy
     networks: [noite]
-    # Process-alive (not HTTP): an empty fleet accepts TCP on :8090 but
-    # never answers without a deployment, so a curl gate would deadlock
-    # fresh installs. PID 1 is celld (entrypoint reset); this only gates
-    # ordering — caddy must not route before the node exists.
+    depends_on:
+      rustfs:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "kill -0 1"]
+      # /ready gates on the first reconcile pass (fleets spawned, Caddyfile
+      # written), so caddy never routes to a cold runner.
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/ready"]
       interval: 10s
       timeout: 5s
-      retries: 3
-      start_period: 30s
-  caddy:
-    # Baked edge image (Dockerfile.caddy + Caddyfile.static); `make up`
-    # --build refreshes it on file edits, the standalone release pulls it.
-    # Override with NOITE_CADDY_IMAGE to pull GHCR (CI e2e does this).
+      retries: 12
+      start_period: 60s
+  control:
+    # Oxide control UI on a celld node. The image bakes the built worker
+    # bundle (apps/noite/dist) and the entrypoint deploys it — revision-gated,
+    # with the worker's vars patched from this environment. No host-side
+    # clone, build or `celld deploy` step exists.
     build:
       context: ..
-      dockerfile: docker/Dockerfile.caddy
-    image: ${NOITE_CADDY_IMAGE:-noite-caddy:local}
+      dockerfile: docker/Dockerfile.ui
+    image: ${NOITE_CONTROL_IMAGE:-noite-control:local}
+    hostname: control
+    restart: unless-stopped
+    # Must exceed the node's CELLD_SHUTDOWN_TOTAL_MS above, or the orchestrator
+    # SIGKILLs celld mid-shutdown (docs: "You must set a longer orchestrator
+    # stop grace, such as systemd TimeoutStopSec").
+    stop_grace_period: 30s
+    environment:
+      <<: *aws
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://rustfs:9000}
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://127.0.0.1:9000}
+      NOITE_S3_BUCKET: ${NOITE_S3_BUCKET:-noite}
+      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
+      # Empty = control on the bare domain (dev `localhost` — the only
+      # hostname Bitwarden's matcher accepts without https); prod sets `app`.
+      CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-}
+      CONTROL_EXTRA_HOSTS: ${CONTROL_EXTRA_HOSTS:-}
+      # Passkeys are bound to this origin — set it before users register.
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:${HTTP_PORT:-9080}}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-dev-only-change-me-to-a-long-random-string}
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-dev-runner-token}
+      RUNNER_URL: http://runner:8080
+      UI_URL: ${UI_URL:-http://control:8090}
+      GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-http://git.localhost:${HTTP_PORT:-9080}}
+      NOITE_ADMIN_EMAIL: ${NOITE_ADMIN_EMAIL:-}
+      NOITE_EMAIL_WEBHOOK_URL: ${NOITE_EMAIL_WEBHOOK_URL:-}
+      NOITE_SMTP_FROM: ${NOITE_SMTP_FROM:-}
+      # Caddy forwards the original Host/scheme; without this the worker sees
+      # the compose-internal URL and every link/redirect is wrong.
+      CELLD_TRUST_FORWARDED_HEADERS: "1"
+      # Rate limits: the platform's per-client budget on the public routes,
+      # and better-auth's own budget for /api/auth/* (0 / unset disables them).
+      NOITE_RATE_LIMIT_RPM: ${NOITE_RATE_LIMIT_RPM:-600}
+      NOITE_AUTH_RATE_LIMIT: ${NOITE_AUTH_RATE_LIMIT:-600}
+      CELLD_WATCH: /data/control
+      # Stop budget. The docs require the orchestrator's stop grace to exceed
+      # this bound, so the compose `stop_grace_period` below is deliberately
+      # larger; a shorter total bound keeps `make down` responsive while still
+      # letting celld finish its durability shutdown and seal its node log.
+      CELLD_SHUTDOWN_TOTAL_MS: "25000"
+    volumes:
+      # celld's local SQLite/replication working dir (durability itself is the
+      # fleet bucket). Scope it to the control prefix.
+      - control-state:/data
+    networks: [noite]
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    # The node's own public health endpoint (documented boolean): it answers
+    # 503 before the fleet settles and during a drain, so caddy starts routing
+    # only to a node that is really ready — not merely a live process. PID 1 is
+    # celld (entrypoint exec); a fresh node holds its first healthy response
+    # until its lease and memory headroom are satisfied.
+    healthcheck:
+      test:
+        ["CMD", "curl", "-fs", "http://127.0.0.1:8090/.well-known/celld/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 180s
+  caddy:
+    # Stock upstream image: the edge config is not baked, the runner writes it
+    # into the shared volume below and `--watch` picks it up within a tick.
+    image: docker.io/library/caddy:2.10.0-alpine
     restart: unless-stopped
     ports:
       - "${HTTP_PORT:-9080}:80"
@@ -159,24 +205,38 @@ services:
       - "traefik.enable=true"
       - "traefik.tcp.services.noite-tenants.loadbalancer.server.port=443"
     volumes:
-      # Static edge: single wildcard site + on-demand TLS (ask via the
-      # control worker) → reverse_proxy control:8090 for everything. See
-      # docker/Caddyfile.static. `:z` relabels for container reads on
-      # SELinux-enforcing hosts (Fedora); ignored elsewhere.
-      - ./Caddyfile.static:/etc/caddy/Caddyfile:ro,z
+      # Shared with the runner (mounted at /caddy there): it writes the
+      # Caddyfile and tails the access log. The bootstrap config covers the
+      # window before the runner's first reconcile; `:z` relabels for
+      # container reads on SELinux-enforcing hosts (Fedora).
+      - caddy-config:/etc/caddy
       - caddy-data:/data
     networks: [noite]
-    # Wait for the node listener before routing to it (kills the 502 window
-    # on fresh boot; an empty fleet still serves 404s, which is fine).
+    # Route only once the UI answers and the runner has reconciled (kills the
+    # 502/placeholder window on fresh boot).
     depends_on:
       control:
         condition: service_healthy
+      runner:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /etc/caddy
+        [ -f /etc/caddy/Caddyfile ] || printf '%s\n' ':80 {' '  respond "noite edge starting" 200' '}' > /etc/caddy/Caddyfile
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile --watch
 
 networks:
   noite:
 
 volumes:
   rustfs-data:
+  # Runner state (SQLite + git mirrors + builds) — the only copy of deploy
+  # metadata, so back this up.
+  runner-data:
+  # celld node working dir for the control fleet.
   control-state:
+  # Shared edge config (runner-written Caddyfile + access log) and certs.
+  caddy-config:
   caddy-data:
-  bun-cache:

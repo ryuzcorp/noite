@@ -1,9 +1,10 @@
-//! Rehydrate deploy bare mirrors from S3 tip bundles on ephemeral disks.
+//! Rehydrate deploy bare mirrors from S3 tip bundles when the work dir is fresh.
 //!
 //! `git-http/{slug}.git` already hydrates on demand (`git_http::ensure_bare`);
 //! this covers the deploy/source mirror `repos/{slug}.git` the same way:
 //! any read of a missing mirror pulls the tip bundle then retries once.
-//! Boot calls `rehydrate_all` so fleets and source preview work immediately.
+//! Boot calls `rehydrate_all` so fleets and source preview work immediately
+//! after a work-dir wipe (volume loss, host move) without a re-push.
 use std::time::Duration;
 
 use crate::config::Config;

@@ -4,21 +4,24 @@ import { atom, watch } from "ilha";
 
 import { appHost } from "../apps";
 import {
+  addDomain,
   deleteEnv,
   envDotVars,
   get,
   inviteCollaborator,
   listCollaborators,
+  listDomains,
   listEnv,
   remove,
   removeCollaborator,
+  removeDomain,
   renameApp,
   setEnv,
   updateCollaboratorRole,
 } from "../apps.server";
 import { parseAppRole } from "../roles";
 import type { AppRole } from "../roles";
-import type { RunnerEnv } from "../runner";
+import type { RunnerDomain, RunnerEnv } from "../runner";
 import { fetchSession } from "../session";
 import { ListSkeleton, SectionSkeleton } from "../skeletons";
 import { readSwrCache, writeSwrCache } from "../swr-cache";
@@ -310,48 +313,140 @@ const showSlugValidation = (value: string) => {
   }
 };
 
-/** Custom domain placeholder (not wired to any backend yet): hostname
- * field + save button. Save only surfaces a coming-soon note. */
-const CustomDomainSection = () => {
-  const hostname = atom("");
+/** Custom domains: hostnames this app answers on, plus the one DNS step the
+ * operator owns. The runner owns validation, collisions and the Caddyfile
+ * route; adding a hostname here reserves it and the edge picks it up on the
+ * next reconcile (a few seconds). */
+const CustomDomainsPanel = ({
+  appId,
+  myRole,
+}: {
+  appId: string;
+  myRole: AppRole;
+}) => {
+  const rows = atom<RunnerDomain[]>([]);
+  const err = atom("");
   const note = atom("");
+  const busy = atom(false);
+  const loaded = atom(false);
+  const hostname = atom("");
+  const isAdmin = myRole === "admin";
+
+  const reload = async () => {
+    try {
+      const listed = await listDomains(appId);
+      rows.set(listed ?? []);
+      err.set("");
+    } catch (error) {
+      err.set(error instanceof Error ? error.message : String(error));
+    }
+    loaded.set(true);
+  };
+
+  watch.once(() => {
+    void reload();
+  });
+
+  const add = async (event: SubmitEvent) => {
+    event.preventDefault();
+    const value = hostname().trim();
+    if (!value) {
+      note.set("Enter a hostname first.");
+      return;
+    }
+    busy.set(true);
+    note.set("");
+    try {
+      await addDomain({ appId, hostname: value });
+      hostname.set("");
+      note.set(
+        "Saved. Point an A/AAAA record for it at this server; the certificate issues on the first visit."
+      );
+      await reload();
+    } catch (error) {
+      note.set(error instanceof Error ? error.message : String(error));
+    }
+    busy.set(false);
+  };
+
+  const removeDomainRow = async (value: string) => {
+    busy.set(true);
+    note.set("");
+    try {
+      await removeDomain({ appId, hostname: value });
+      await reload();
+    } catch (error) {
+      note.set(error instanceof Error ? error.message : String(error));
+    }
+    busy.set(false);
+  };
+
+  if (!loaded()) {
+    return <SectionSkeleton lines={2} />;
+  }
   return (
     <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
       <div class="card-body gap-4">
         <h3 class="m-0 text-lg font-semibold">Custom Domain</h3>
         <p class="m-0 text-sm opacity-70">
-          Serve this app from your own hostname.
+          Serve this app from your own hostname. Keep DNS pointed at this
+          server; the edge routes the hostname and issues its certificate on
+          demand.
         </p>
-        <fieldset class="fieldset w-full">
-          <label class="label" for="custom-domain-hostname">
-            Hostname
-          </label>
-          <input
-            id="custom-domain-hostname"
-            class="input input-sm font-mono"
-            value={hostname()}
-            placeholder="app.example.com"
-            oninput={(e) => {
-              // SAFETY: ilha oninput currentTarget is the <input> that fired.
-              hostname.set((e.currentTarget as HTMLInputElement).value);
-            }}
-          />
-        </fieldset>
-        <div>
-          <button
-            type="button"
-            class="btn btn-sm"
-            onclick={() => {
-              note.set(
-                hostname().trim()
-                  ? "Custom domains aren't available yet — nothing was saved."
-                  : "Enter a hostname first."
-              );
-            }}
-          >
-            Save domain
-          </button>
-        </div>
+        {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
+        {rows().length === 0 ? (
+          <p class="m-0 text-sm opacity-70">No custom hostnames yet.</p>
+        ) : (
+          <ul class="m-0 flex list-none flex-col gap-2 p-0">
+            {rows().map((row) => (
+              <li
+                key={row.hostname}
+                class="border-base-300 flex flex-wrap items-center justify-between gap-2 rounded border p-2 text-sm"
+              >
+                <span class="font-mono text-xs">{row.hostname}</span>
+                {isAdmin ? (
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                    disabled={busy()}
+                    onclick={() => {
+                      void removeDomainRow(row.hostname);
+                    }}
+                  >
+                    Remove
+                  </button>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        )}
+        {isAdmin ? (
+          <form class="flex flex-wrap items-end gap-2" onsubmit={add}>
+            <fieldset class="fieldset grow">
+              <label class="label" for="custom-domain-hostname">
+                Hostname
+              </label>
+              <input
+                id="custom-domain-hostname"
+                class="input input-sm font-mono"
+                value={hostname()}
+                placeholder="app.example.com"
+                oninput={(e) => {
+                  // SAFETY: ilha oninput currentTarget is the <input> that fired.
+                  hostname.set((e.currentTarget as HTMLInputElement).value);
+                }}
+              />
+            </fieldset>
+            <button type="submit" class="btn btn-sm" disabled={busy()}>
+              Add domain
+            </button>
+          </form>
+        ) : (
+          <p class="m-0 text-sm opacity-70">
+            Only an app admin can add or remove hostnames.
+          </p>
+        )}
+        {note() ? <p class="m-0 text-sm opacity-70">{note()}</p> : null}
       </div>
     </section>
   );
@@ -955,7 +1050,7 @@ export const AppSettingsPanel = () => {
           void reload();
         }}
       />
-      <CustomDomainSection />
+      <CustomDomainsPanel appId={gate.appId} myRole={gate.myRole} />
       <CollaboratorsPanel appId={gate.appId} myRole={gate.myRole} />
       <EnvVarsPanel appId={gate.appId} myRole={gate.myRole} />
       {gate.myRole === "admin" ? (

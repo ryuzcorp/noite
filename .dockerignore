@@ -24,10 +24,15 @@ data
 .dockerignore
 .idea
 
-# dotes
-.env
-.env.*
-!.env.example
+# dotenv files MUST use `**/`: a bare name only matches the context root, and
+# `apps/noite/.dev.vars` is a real secret file (the UI image build would bake
+# its values into the worker bundle's vars block).
+**/.env
+**/.env.*
+!**/.env.example
+**/.dev.vars
+**/.dev.vars.*
+!**/.dev.vars.example
 
 # plan + docs are repo content — keep markdown out of images to shrink context
 # (README is small; SPEC.md is small; both fine to exclude since no image COPYs them)

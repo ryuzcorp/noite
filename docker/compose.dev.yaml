@@ -1,145 +1,79 @@
-# Dev overlay: 4-service layout (rustfs, runner, control, caddy) with dev
-# processes — prod (`docker/compose.yaml`) runs 3 (the runner is a container
-# cell there). `control` runs `vite dev` (real Oxide + Cloudflare plugin
-# pipeline: workerd, local D1, HMR) instead of joining the prod fleet — no
-# bucket, no deploy cycle. (`celld dev` cannot serve this app: it bundles
-# with raw esbuild, which can't resolve the Oxide plugin's
-# `virtual:oxide/worker` entry.) Secrets come from apps/noite/.dev.vars
-# (auto-loaded).
+# Dev overlay: same 4 services as prod (`docker/compose.yaml`), dev processes.
+# `control` runs `vite dev` (real Oxide + Cloudflare plugin pipeline: workerd,
+# local D1, HMR) instead of the celld node's deployed bundle, and `runner` runs
+# cargo-watch against a bind-mounted source tree.
+#
 #   make dev
+#
+# Secrets for the vite process come from apps/noite/.dev.vars (auto-loaded).
+# Never run dev and prod at once — same container names, ports and volumes.
 services:
   runner:
-    # Dev-only service (prod `compose.yaml` has no runner — the runner is a
-    # container cell there). Fully specified here: hostname/networks live in
-    # this overlay, not the base file.
-    hostname: runner
-    restart: unless-stopped
-    networks: [noite]
-    depends_on:
-      - rustfs
     build:
       context: ..
       dockerfile: docker/Dockerfile.runner-dev
     image: noite-runner-dev:local
+    # hostname/restart/networks/healthcheck/env/volume for runner state all
+    # come from the prod service — dev only replaces what differs.
     volumes:
       - ../apps/runner:/src:z
       - ../docker/runner-dev.sh:/runner-dev.sh:ro,z
       - runner-cargo-registry:/usr/local/cargo/registry
       - runner-cargo-git:/usr/local/cargo/git
       - runner-target:/src/target
-      - agent-data:/data
-      - caddy-config:/caddy
     working_dir: /src
     environment:
-      # Dev restores the full runner env the prod base file used to provide
-      # (prod cutover moved the runner into a container cell): without these
-      # the binary falls back to ui:8080 upstreams and dev-host extra hosts
-      # never reach the Caddyfile.
       RUST_LOG: ${RUST_LOG:-noite_runner=debug,tower_http=info}
       CARGO_TERM_COLOR: always
       RUNNER_DEV_RELEASE: ${RUNNER_DEV_RELEASE:-0}
-      RUNNER_BIND: "0.0.0.0:8080"
-      # RUNNER_TOKEN preferred; HOST_TOKEN / AGENT_TOKEN still accepted by the binary.
-      RUNNER_TOKEN: ${RUNNER_TOKEN:-${HOST_TOKEN:-${AGENT_TOKEN:-dev-runner-token}}}
-      # S3 credentials must match the rustfs service (base file `x-aws`
-      # anchor): without these the binary falls back to `noiteaccess`, which
-      # a customized .env rejects with InvalidAccessKeyId — the runner then
-      # never leaves its S3 wait and the edge keeps the placeholder forever.
-      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:-noiteaccess}
-      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:-noitesecretnoitesecretnoite12}
-      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
-      # Empty = control on bare domain (dev); prod sets CONTROL_SUBDOMAIN=app.
-      CONTROL_EXTRA_HOSTS: ${CONTROL_EXTRA_HOSTS:-}
-      # Dynamic subpath: base's static file mount shadows /etc/caddy/Caddyfile
-      # on the caddy side (see caddy below), so write where it stays visible.
-      CADDYFILE_PATH: /caddy/dynamic/Caddyfile
-      # Log stays at the volume root (caddy `log` block is path-fixed);
-      # without this the tick tails <caddyfile-dir>/access.log (missing).
-      CADDY_ACCESS_LOG: /caddy/access.log
-      CADDY_UPSTREAM_HOST: runner
-      CADDY_CONTROL_UPSTREAM: control:8090
-      CADDY_API_UPSTREAM: runner:8080
-      RUNNER_WORK_DIR: /data/runner
-      # SQLite lives in the agent-data volume (NOT the `./data` default,
-      # which resolves under working_dir /src into the source tree where
-      # `make nuke` never looks). Missing file restores from the bucket.
-      NOITE_DB: /data/noite.sqlite
-      PORT_BASE: "8100"
-      RUNNER_POLL_MS: "5000"
-      CELLD_BIN: celld
-      GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-http://git.localhost:${HTTP_PORT:-9080}}
-      UI_URL: ${UI_URL:-http://control:8090}
     command: ["/bin/sh", "/runner-dev.sh"]
     healthcheck:
-      # Debug compile on first boot can take minutes — start_period covers
-      # it; afterwards fleets must be spawned (/ready) before dependents start.
-      test: ["CMD", "curl", "-f", "http://localhost:8080/ready"]
+      # Debug compile on first boot takes minutes — the prod start_period
+      # (60s) would flap, and caddy waits on this gate.
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/ready"]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 600s
 
   control:
-    # Dev flavor of the prod fleet node: tools image + source bind mount +
-    # docker/control-dev.sh (`vite dev`). Inherits
-    # hostname, container name, ports, and networks from prod so the two
-    # stacks replace each other cleanly — never run both at once.
+    # Dev flavor of the prod celld node: tools image + source bind mount +
+    # docker/control-dev.sh (`vite dev`).
     build:
       context: ..
       dockerfile: docker/Dockerfile.tools
     image: noite-tools:local
-    restart: unless-stopped
-    stop_grace_period: 15s
-    # Reset prod's entrypoint (the tools image has no bucket script and
-    # runs vite, not celld) — verified `entrypoint: []` restores the image
-    # default on podman; command below then runs as-is.
+    # Reset the image entrypoint (the UI image deploys a bundle and execs
+    # celld; dev runs vite) — `entrypoint: []` restores the image default.
     entrypoint: []
     environment:
       PORT: "8090"
       # 1 = polling file watcher (flaky rootless inotify).
       VITE_USE_POLLING: ${VITE_USE_POLLING:-0}
-      # Dev never uses the container cell (no celld runtime in vite dev):
-      # pin compose so a prod-inherited RUNNER_TARGET can't leak in.
-      RUNNER_TARGET: compose
+      # Marks the dev lane for `make doctor`: this container serves the UI with
+      # `vite dev`, so the celld node checks do not apply to it.
+      NOITE_DEV: "1"
     volumes:
       - ../apps/noite:/app:z
       - ../docker/control-dev.sh:/control-dev.sh:ro,z
       - bun-cache:/root/.bun/install/cache
       # Vite optimizer cache holds absolute paths: host runs write
-      # /home/ryuz/Arch/..., the container sees /app/... Sharing it
-      # poisons worker-entry analysis (hangs/crashes on stale entries),
-      # so the container keeps its own warm cache here.
+      # /home/<user>/…, the container sees /app/…, and sharing it poisons
+      # worker-entry analysis — so the container keeps its own warm cache.
       - vite-cache:/app/node_modules/.vite
-    networks: [noite]
-    depends_on:
-      - rustfs
     command: ["/bin/sh", "/control-dev.sh"]
-
-  caddy:
-    # Dev keeps the runner-owned Caddyfile era (prod base is static): the
-    # runner rewrites the shared volume every reconcile. The merged volume
-    # list keeps base's static file mount at /etc/caddy/Caddyfile (it shadows
-    # that exact path), so both sides use the `dynamic/` subpath instead,
-    # which stays visible. Never run dev and prod stacks at once.
-    volumes:
-      - caddy-config:/etc/caddy
-      - caddy-data:/data
-    command:
-      - /bin/sh
-      - -c
-      - |
-        mkdir -p /etc/caddy/dynamic
-        [ -f /etc/caddy/dynamic/Caddyfile ] || printf '%s\n' ':80 {' '  respond "noite edge starting" 200' '}' > /etc/caddy/dynamic/Caddyfile
-        exec caddy run --config /etc/caddy/dynamic/Caddyfile --adapter caddyfile --watch
-    depends_on:
-      - runner
-      - control
+    healthcheck:
+      # Dev serves the UI with `vite dev`, not a celld node, so the base
+      # service's documented celld health path cannot answer here. Gate on the
+      # dev server itself; the first boot also runs `bun install`.
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:8090/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 180s
 
 volumes:
-  # Dev-only persistent data (prod cutover dropped these): runner SQLite +
-  # git mirrors/builds (agent-data) and the runner-owned Caddyfile.
-  agent-data:
-  caddy-config:
+  # Dev-only build caches.
   runner-cargo-registry:
   runner-cargo-git:
   runner-target:

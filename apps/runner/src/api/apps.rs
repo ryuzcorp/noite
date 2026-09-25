@@ -37,14 +37,6 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-/// Pre-export checkpoint: flush a fresh SQLite snapshot so the worker's R2
-/// relay (and nightly backup) copy seconds-old state, not minutes-old.
-/// Best-effort like every other snapshot trigger — the relay diffs etags anyway.
-pub async fn checkpoint(State(state): State<AppState>) -> impl IntoResponse {
-    crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
-    Json(json!({ "ok": true }))
-}
-
 pub async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
     match db::list_apps(&state.pool).await {
         Ok(apps) => Json(apps).into_response(),
@@ -92,18 +84,39 @@ pub async fn create_app(
         }
     };
     let subdomain = format!("{slug}.{}", state.config.base_domain);
+    let owner = body
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("local");
+    if owner != "local" {
+        match db::count_apps_for_user(&state.pool, owner).await {
+            Ok(count) if count >= i64::from(state.config.max_apps_per_user) => {
+                return ApiError::conflict(format!(
+                    "app limit reached ({} per account)",
+                    state.config.max_apps_per_user
+                ))
+                .into_response();
+            }
+            Ok(_) => {}
+            Err(e) => return ApiError::internal(e.to_string()).into_response(),
+        }
+    }
     match db::create_app(
         &state.pool,
         &state.config,
-        &name,
-        &slug,
-        &subdomain,
-        listen,
-        internal,
+        db::NewApp {
+            internal,
+            listen,
+            name: &name,
+            slug: &slug,
+            subdomain: &subdomain,
+            user_id: owner,
+        },
     )
     .await {
         Ok(app) => {
-            crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
             (StatusCode::CREATED, Json(app)).into_response()
         }
         Err(e) => ApiError::internal(e.to_string()).into_response(),
@@ -130,7 +143,6 @@ pub async fn patch_app(
         if let Err(e) = db::patch_app_desired(&state.pool, &id, ds.as_str()).await {
             return ApiError::internal(e.to_string()).into_response();
         }
-        crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
     }
     match db::get_app(&state.pool, &id).await {
         Ok(Some(app)) => Json(app).into_response(),
@@ -213,7 +225,6 @@ pub async fn delete_app(
 
     match db::delete_app(&state.pool, &id).await {
         Ok(()) => {
-            crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => ApiError::internal(e.to_string()).into_response(),

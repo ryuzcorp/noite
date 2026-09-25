@@ -61,7 +61,6 @@ pub async fn set_env(
     };
     match db::set_env(&state.pool, &app.id, &name, &body.value).await {
         Ok(()) => {
-            crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
             Json(serde_json::json!({ "ok": true, "name": name })).into_response()
         }
         Err(e) => ApiError::internal(e.to_string()).into_response(),
@@ -82,7 +81,6 @@ pub async fn delete_env(
     };
     match db::delete_env(&state.pool, &app.id, &name).await {
         Ok(()) => {
-            crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
             Json(serde_json::json!({ "ok": true })).into_response()
         }
         Err(e) => ApiError::internal(e.to_string()).into_response(),

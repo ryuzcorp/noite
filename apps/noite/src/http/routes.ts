@@ -8,18 +8,23 @@ import {
   parseAppRole,
   requireAppRole,
   requireAppRoleBySlug,
-  withLiveRunner,
 } from "../lib/collaborators";
-import { ensureDbPromise, withDb } from "../lib/db";
+import { ensureDbPromise } from "../lib/db";
+import { INVITES_PER_USER, signupPolicy } from "../lib/invites.server";
+import {
+  clientKey,
+  DEFAULT_RPM,
+  limitedClass,
+  rateLimitDecision,
+} from "../lib/rate-limit";
 import type {
-  RunnerContainerStub,
   RunnerDevice,
   RunnerMetric,
   RunnerPath,
   RunnerRef,
   RunnerSpan,
 } from "../lib/runner";
-import { runnerContainerStub } from "../lib/runner";
+import { stampRunnerEnv } from "../lib/runner";
 
 type RouteHandler = (
   request: Request,
@@ -56,6 +61,23 @@ const handleWebhook: RouteHandler = async (request, env) => {
     method: "POST",
     signal: AbortSignal.timeout(10_000),
   });
+};
+
+/** Public signup policy for the login panel: is a code required? Answered
+ * without a session (the panel asks before anyone can sign in), carries no
+ * account data. A broken check must not block the UI, so it answers with the
+ * stricter policy on failure. */
+const handleInviteStatus: RouteHandler = async () => {
+  await ensureDbPromise();
+  try {
+    return Response.json(await signupPolicy());
+  } catch {
+    return Response.json({
+      firstRun: false,
+      invitesPerUser: INVITES_PER_USER,
+      requiresInvite: true,
+    });
+  }
 };
 
 const handleAuth: RouteHandler = async (request, env) => {
@@ -415,12 +437,8 @@ const handleAppsStream: RouteHandler = async (request, env) => {
         let json: string | null = null;
         try {
           // oxlint-disable-next-line eslint/no-await-in-loop -- one poll per cycle; parallel polls would race change detection
-          const apps = await withDb(listAppsForCollaborator(userId));
-          // oxlint-disable-next-line eslint/no-await-in-loop -- fans out this cycle's live overlays together
-          const live = await Promise.all(
-            apps.map((row) => withLiveRunner(row))
-          );
-          json = JSON.stringify(live);
+          const apps = await listAppsForCollaborator(userId);
+          json = JSON.stringify(apps);
         } catch (error) {
           // Transient failure: log it; the heartbeat below keeps the
           // stream alive and the next poll heals.
@@ -602,176 +620,17 @@ router.on("GET", "/api/apps/:appId/events/stream", handleEventsStream);
 router.on("GET", "/api/apps/stream", handleAppsStream);
 router.on("GET", "/api/apps/:appId/metrics/stream", handleMetricsStream);
 router.on("POST", "/api/apps/:appId/ingest/:kind", forwardIngest);
+router.on("GET", "/api/invite/status", handleInviteStatus);
 router.all("/api/auth", handleAuth);
 router.all("/api/auth/*", handleAuth);
 
-/** One cached tenant port per slug for container dispatch. */
-interface EdgePort {
-  listenPort: number;
-}
-
-let edgeCacheAt = 0;
-const edgeCacheBySlug = new Map<string, EdgePort>();
-const EDGE_CACHE_TTL_MS = 5000;
-
-type DispatchTarget =
-  | { kind: "local" }
-  | { kind: "runner"; path: string }
-  | { kind: "tenant"; slug: string };
-
-/** Pure Host/path sort: platform hosts → runner 8080, slugs → tenant port. */
-const dispatchTarget = (
-  host: string,
-  base: string,
-  pathname: string
-): DispatchTarget => {
-  if (host === `api.${base}`) {
-    return { kind: "runner", path: pathname };
-  }
-  if (host === `git.${base}`) {
-    const path = pathname.startsWith("/v1/git/")
-      ? pathname
-      : `/v1/git${pathname.startsWith("/") ? "" : "/"}${pathname}`;
-    return { kind: "runner", path };
-  }
-  if (pathname === "/v1/edge/tls-ask") {
-    return { kind: "runner", path: pathname };
-  }
-  if (host === base || host === `app.${base}` || !host.endsWith(`.${base}`)) {
-    return { kind: "local" };
-  }
-  const slug = host.slice(0, -(base.length + 1));
-  const reserved = new Set(["api", "app", "git"]);
-  if (!slug || slug.includes(".") || reserved.has(slug)) {
-    return { kind: "local" };
-  }
-  return { kind: "tenant", slug };
-};
-
-const forwardVia = (
-  stub: RunnerContainerStub,
-  request: Request,
-  host: string,
-  search: string,
-  targetPath: string
-): Promise<Response> => {
-  const headers = new Headers(request.headers);
-  // Preserve the original Host for the runner fallback page (it renders
-  // per-Host); the container URL would otherwise collapse it to `runner`.
-  headers.set("x-forwarded-host", host);
-  return stub.fetch(
-    new Request(`http://runner${targetPath}${search}`, {
-      body: request.body,
-      // @ts-expect-error duplex required for streamed bodies in workers
-      duplex: "half",
-      headers,
-      method: request.method,
-    })
-  );
-};
-
-const EdgeRoutePayload = Schema.Struct({
-  listenPort: Schema.Number,
-  slug: Schema.String,
-});
-
-const EdgeRoutesPayload = Schema.Struct({
-  routes: Schema.optional(Schema.Array(EdgeRoutePayload)),
-});
-
-const refreshEdgeCache = async (
-  stub: RunnerContainerStub,
-  token: string
-): Promise<void> => {
-  const res = await stub.fetch(
-    new Request("http://runner/v1/edge/routes", {
-      headers: { authorization: `Bearer ${token}` },
-    })
-  );
-  if (!res.ok) {
-    return;
-  }
-  const payload = Schema.decodeUnknownSync(EdgeRoutesPayload)(await res.json());
-  edgeCacheBySlug.clear();
-  for (const route of payload.routes ?? []) {
-    if (Number.isInteger(route.listenPort)) {
-      edgeCacheBySlug.set(route.slug, { listenPort: route.listenPort });
-    }
-  }
-  edgeCacheAt = Date.now();
-};
-
-/** Host dispatch for RUNNER_TARGET=container (before path routing).
- *
- * Static Caddy → control:8090 → worker Host-dispatch → container port:
- * api./git./tls-ask → runner 8080; {slug}. → port lookup; apex/control →
- * existing asset/worker routes (undefined). Compose target skips entirely.
- */
-const containerDispatch = async (
-  request: Request,
-  env: KitEnv
-): Promise<Response | undefined> => {
-  if (env.RUNNER_TARGET !== "container" || !env.RUNNER) {
-    return undefined;
-  }
-  let parsed: URL | undefined;
-  try {
-    parsed = new URL(request.url);
-  } catch {
-    return undefined;
-  }
-  const { hostname: rawHost, pathname, search } = parsed;
-  const hostname = rawHost.toLowerCase();
-  const base = (env.BASE_DOMAIN ?? "localhost").toLowerCase();
-  const stub = await runnerContainerStub(env);
-  if (!stub) {
-    return undefined;
-  }
-  const target = dispatchTarget(hostname, base, pathname);
-  if (target.kind === "local") {
-    return undefined;
-  }
-  if (target.kind === "runner") {
-    return forwardVia(stub, request, hostname, search, target.path);
-  }
-  // Refresh the route table on miss + ~5 s TTL (mirrors the DO cache).
-  const now = Date.now();
-  if (
-    now - edgeCacheAt > EDGE_CACHE_TTL_MS ||
-    !edgeCacheBySlug.has(target.slug)
-  ) {
-    try {
-      await refreshEdgeCache(stub, env.RUNNER_TOKEN ?? "");
-    } catch {
-      // Serve stale on failure; miss below falls through to fallback.
-    }
-  }
-  const hit = edgeCacheBySlug.get(target.slug);
-  if (hit) {
-    return forwardVia(
-      stub,
-      request,
-      hostname,
-      search,
-      `/${hit.listenPort}${pathname === "/" ? "/" : pathname}`
-    );
-  }
-  return forwardVia(stub, request, hostname, search, "/v1/edge/fallback");
-};
-
 /** Shared by Server Entry (prod) and Vite DEV middleware. */
-export const handleHttp = (async (request, env) => {
+export const handleHttp = ((request, env) => {
   // SAFETY: the Worker env carries every KitEnv control key the handlers need; unset keys stay undefined as handlers tolerate.
   const kit = env as KitEnv;
-  let dispatched: Response | undefined;
-  try {
-    dispatched = await containerDispatch(request, kit);
-  } catch {
-    dispatched = undefined;
-  }
-  if (dispatched) {
-    return dispatched;
-  }
+  // Edge routes never enter oxide's ALS, so hand the real runner credentials
+  // to the fetch path before any handler runs.
+  stampRunnerEnv(kit);
   let pathname: string;
   try {
     const { pathname: p } = new URL(request.url);
@@ -779,6 +638,26 @@ export const handleHttp = (async (request, env) => {
   } catch {
     // Malformed URL — no route can match, let the platform 404.
     return;
+  }
+  // Platform rate limit for the public routes: a flood is refused here, before
+  // it reaches better-auth or D1. `NOITE_RATE_LIMIT_RPM=0` disables it.
+  const klass = limitedClass(pathname);
+  if (klass) {
+    const rpm = Number(kit.NOITE_RATE_LIMIT_RPM ?? DEFAULT_RPM);
+    const decision = rateLimitDecision(
+      `${klass}:${clientKey(request)}`,
+      Number.isFinite(rpm) ? rpm : DEFAULT_RPM,
+      Date.now()
+    );
+    if (!decision.allowed) {
+      return new Response("Too many requests", {
+        headers: {
+          "retry-after": String(decision.retryAfter),
+          "x-ratelimit-remaining": "0",
+        },
+        status: 429,
+      });
+    }
   }
   // FindMyWay route lookup (method, path) — not Array.prototype.find.
   // oxlint-disable-next-line unicorn/no-array-method-this-argument -- router API

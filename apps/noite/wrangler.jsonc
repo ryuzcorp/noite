@@ -25,34 +25,14 @@
       "database_name": "noite-control",
     },
   ],
-  // Runner container cell (Phase 2, behind RUNNER_TARGET=container). NOTE:
-  // no `containers` key here on purpose — wrangler (hence `vite dev`)
-  // rejects image paths escaping the project dir, which crash-loops control
-  // in dev. The entry lives in `containers.jsonc` (repo-root-relative image)
-  // and `bun run build` injects it (absolute path, celld-allowed keys only)
-  // into dist/wrangler.json for `celld deploy dist`. Dev never uses it.
-  "durable_objects": {
-    "bindings": [{ "class_name": "RunnerContainer", "name": "RUNNER" }],
-  },
-  // Runner durability relay (B1 sidecar design): the worker copies the
-  // sidecar keyspace here — no second store/credential, just the reserved
-  // `r2/noite-runner/` prefix in the control fleet bucket. Passes
-  // `toCelldWrangler` untouched (r2_buckets is allowlisted).
-  "r2_buckets": [{ "binding": "RUNNER_SNAP", "bucket_name": "noite-runner" }],
-  "migrations": [{ "new_sqlite_classes": ["RunnerContainer"], "tag": "v1" }],
   // Non-secret defaults only (fleet fallback — deploy env / compose env
   // override these). Secrets (BETTER_AUTH_SECRET, RUNNER_TOKEN,
   // AWS/RUSTFS keys, NOITE_ADMIN_EMAIL, NOITE_EMAIL_WEBHOOK_URL) come from
   // `.dev.vars` locally and `wrangler secret` / deploy env in prod.
-  // RUNNER_TARGET=container: post-cutover prod runs the container cell.
-  // Dev overrides to compose via `.dev.vars` (which shadows `vars` in the
-  // workerd dev runtime) — vite dev has no container runtime, and the
-  // dispatch gate reads these vars directly, so the overlay pin alone
-  // would not cover it.
   "vars": {
     "AWS_REGION": "us-east-1",
     "BASE_DOMAIN": "localhost",
-    "RUNNER_TARGET": "container",
+    // Runner REST base: the compose service name.
     "RUNNER_URL": "http://runner:8080",
     "S3_ENDPOINT": "http://rustfs:9000",
     "S3_PUBLIC_ENDPOINT": "http://127.0.0.1:9000",

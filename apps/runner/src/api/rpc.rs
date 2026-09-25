@@ -148,6 +148,7 @@ async fn dispatch_call(
             struct P {
                 name: String,
                 slug: String,
+                user_id: Option<String>,
             }
             let p: P = match parse(params, &id) {
                 Ok(p) => p,
@@ -182,19 +183,39 @@ async fn dispatch_call(
                     Err(e) => return internal(&id, e.to_string()),
                 };
             let subdomain = format!("{slug}.{}", state.config.base_domain);
+            let owner = p
+                .user_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("local");
+            if owner != "local" {
+                match db::count_apps_for_user(&state.pool, owner).await {
+                    Ok(count) if count >= i64::from(state.config.max_apps_per_user) => {
+                        return conflict(
+                            &id,
+                            format!("app limit reached ({} per account)", state.config.max_apps_per_user),
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => return internal(&id, e.to_string()),
+                }
+            }
             match db::create_app(
                 &state.pool,
                 &state.config,
-                &name,
-                &slug,
-                &subdomain,
-                listen,
-                internal_port,
+                db::NewApp {
+                    internal: internal_port,
+                    listen,
+                    name: &name,
+                    slug: &slug,
+                    subdomain: &subdomain,
+                    user_id: owner,
+                },
             )
             .await
             {
                 Ok(app) => {
-                    crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
                     JsonRpcResponse::success(id, app)
                 }
                 Err(e) => internal(&id, e.to_string()),
@@ -228,7 +249,6 @@ async fn dispatch_call(
                 if let Err(e) = db::patch_app_desired(&state.pool, &p.id, ds.as_str()).await {
                     return internal(&id, e.to_string());
                 }
-                crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
             }
             match app(state, &p.id, &id).await {
                 Ok(a) => JsonRpcResponse::success(id, a),
@@ -255,7 +275,6 @@ async fn dispatch_call(
             }
             match db::delete_app(&state.pool, &p.id).await {
                 Ok(()) => {
-                    crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
                     JsonRpcResponse::success(id, serde_json::json!({ "ok": true }))
                 }
                 Err(e) => internal(&id, e.to_string()),
@@ -355,7 +374,6 @@ async fn dispatch_call(
             };
             match db::set_env(&state.pool, &a.id, &name, &p.value).await {
                 Ok(()) => {
-                    crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
                     JsonRpcResponse::success(id, serde_json::json!({ "ok": true, "name": name }))
                 }
                 Err(e) => internal(&id, e.to_string()),
@@ -380,9 +398,82 @@ async fn dispatch_call(
             };
             match db::delete_env(&state.pool, &a.id, &p.name).await {
                 Ok(()) => {
-                    crate::host::persist::snapshot_best_effort(&state.pool, &state.config).await;
                     JsonRpcResponse::success(id, serde_json::json!({ "ok": true }))
                 }
+                Err(e) => internal(&id, e.to_string()),
+            }
+        }
+        "domains.list" => {
+            let p: IdParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            match db::list_domains_for(&state.pool, &p.id).await {
+                Ok(rows) => JsonRpcResponse::success(id, rows),
+                Err(e) => internal(&id, e.to_string()),
+            }
+        }
+        "domains.add" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: String,
+                hostname: String,
+            }
+            let p: P = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let hostname = p.hostname.trim().trim_end_matches('.').to_lowercase();
+            if !crate::lifecycle::hostname_ok(&hostname) {
+                return bad(&id, "invalid hostname");
+            }
+            let base = state.config.base_domain.to_lowercase();
+            let platform = hostname == base
+                || hostname.ends_with(&format!(".{base}"))
+                || state
+                    .config
+                    .control_extra_hosts
+                    .iter()
+                    .any(|h| hostname == h.trim().trim_matches('.').to_lowercase());
+            if platform {
+                return bad(&id, "hostname belongs to the platform");
+            }
+            match app(state, &p.id, &id).await {
+                Ok(_) => {}
+                Err(e) => return e,
+            }
+            match db::domain_owner(&state.pool, &hostname).await {
+                Ok(Some(owner)) if owner != p.id => {
+                    return conflict(&id, "hostname is already in use".to_string());
+                }
+                Ok(_) => {}
+                Err(e) => return internal(&id, e.to_string()),
+            }
+            match db::add_domain(&state.pool, &p.id, &hostname).await {
+                Ok(()) => match db::list_domains_for(&state.pool, &p.id).await {
+                    Ok(rows) => JsonRpcResponse::success(id, rows),
+                    Err(e) => internal(&id, e.to_string()),
+                },
+                Err(e) => conflict(&id, format!("hostname is already in use: {e}")),
+            }
+        }
+        "domains.remove" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: String,
+                hostname: String,
+            }
+            let p: P = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let hostname = p.hostname.trim().to_lowercase();
+            match db::remove_domain(&state.pool, &p.id, &hostname).await {
+                Ok(0) => not_found(&id, "hostname is not attached to this app"),
+                Ok(_) => match db::list_domains_for(&state.pool, &p.id).await {
+                    Ok(rows) => JsonRpcResponse::success(id, rows),
+                    Err(e) => internal(&id, e.to_string()),
+                },
                 Err(e) => internal(&id, e.to_string()),
             }
         }

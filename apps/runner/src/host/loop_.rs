@@ -129,14 +129,9 @@ async fn reconcile_once(
     }
 
     let visible = db::list_apps(pool).await?;
-    // No Caddyfile consumer in container mode (static edge, worker-owned
-    // routing) — rewriting a local ephemeral file every tick is pure I/O.
-    if !cfg.sidecar_s3 {
-        caddy::rewrite_caddy(cfg, &visible).await?;
-    }
+    let domains = db::list_app_domains(pool).await.unwrap_or_default();
+    caddy::rewrite_caddy(cfg, &visible, &domains).await?;
 
     metrics::tick(pool, cfg, procs, metrics).await?;
-    // Ephemeral disk: bucket checkpoint for metrics (seconds RPO).
-    crate::host::persist::snapshot_best_effort(pool, cfg).await;
     Ok(())
 }

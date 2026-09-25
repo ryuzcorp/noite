@@ -58,7 +58,7 @@ export default function AppPage() {
             <button
               type="button"
               role="tab"
-              aria-selected={activeTab() === tab.id}
+              aria-selected={activeTab() === tab.id ? "true" : "false"}
               class={`tab ${activeTab() === tab.id ? "tab-active" : ""}`}
               onclick={() => {
                 selectTab(tab.id);

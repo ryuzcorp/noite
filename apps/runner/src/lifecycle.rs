@@ -31,9 +31,63 @@ pub fn slug_ok(slug: &str) -> bool {
     re.is_match(slug)
 }
 
+/// A hostname an app may serve on. Lowercase DNS shape only: at least two
+/// labels, letters/digits/hyphens, no leading or trailing hyphen, no wildcard,
+/// no scheme, no port, no path, and never an IP literal. Platform-owned hosts
+/// (the base domain, api./git./control) are rejected by the API handler, which
+/// is the only place that knows the configured domain.
+pub fn hostname_ok(name: &str) -> bool {
+    if name.is_empty() || name.len() > 253 || !name.is_ascii() {
+        return false;
+    }
+    if name.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    if !name.contains('.') {
+        return false;
+    }
+    name.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_hostname_shape() {
+        for ok in [
+            "app.example.com",
+            "a-b.example.dev",
+            "deep.sub.domain.co.uk",
+            "x1.example.io",
+        ] {
+            assert!(hostname_ok(ok), "should accept {ok}");
+        }
+        for bad in [
+            "example.com.",   // trailing dot is not a label
+            "-a.example.com", // leading hyphen
+            "a-.example.com", // trailing hyphen
+            "a..example.com", // empty label
+            "example",        // single label
+            "Example.com",    // uppercase (the API lowercases first)
+            "*.example.com",  // wildcard
+            "a_b.example.com",
+            "192.168.1.1",       // IP literal
+            "a.example.com:443", // port
+            "a.example.com/path",
+            "",
+        ] {
+            assert!(!hostname_ok(bad), "should reject {bad}");
+        }
+    }
 
     #[test]
     fn sha_same_exact_only() {

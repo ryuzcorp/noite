@@ -8,23 +8,32 @@ import {
   ActionError,
   authFromEnv,
   failAction,
+  failUnknown,
   MissingAuthSecretError,
   UnauthorizedError,
 } from "./auth";
 import type { SessionUser } from "./auth";
 import {
   countAdmins,
+  dropAppCollaborators,
   grantCollaborator,
   listAppsForCollaborator,
   parseAppRole,
   requireAppRole,
-  withLiveRunner,
 } from "./collaborators";
-import { ensureDb, ensureDbPromise, orm, sqlLive, withDb } from "./db";
-import type { App, AppRole } from "./db";
-import { enqueueOp, failUnknown } from "./ops.server";
+import type { App } from "./collaborators";
+import { ensureDbPromise, orm, withDb } from "./db";
+import type { AppRole } from "./db";
+import { listUnusedInvitesFor } from "./invites.server";
 import {
+  runnerAddDomain,
+  runnerCreateApp,
+  runnerListDomains,
+  runnerRemoveDomain,
+  runnerDeleteApp,
   runnerGitRemote,
+  runnerPatchApp,
+  runnerRenameApp,
   runnerSourceBlob,
   runnerSourceCommit,
   runnerSourceDiff,
@@ -64,15 +73,6 @@ const RESERVED_SLUGS = new Set(["_control", "app", "api", "git"]);
 
 const appsFor = (userId: string) =>
   liveQuery<App[]>({ topic: `apps:${userId}` });
-
-const snapshotApps = (userId: string) => listAppsForCollaborator(userId);
-
-const loadApps = (userId: string) =>
-  ensureDb.pipe(
-    Effect.andThen(() => snapshotApps(userId)),
-    Effect.provide(sqlLive()),
-    Effect.scoped
-  );
 
 /** new URL() throws on malformed input — never let a bad request URL 500. */
 const requestOrigin = (request: Request): string | undefined => {
@@ -129,17 +129,14 @@ export const create = action(
     }
     const hub = appsFor(user.id);
     try {
-      // Run the op outside mutate so publish/liveQuery cannot deadlock the topic gate.
-      await enqueueOp(
-        {
-          name: trimmedName,
-          slug: normalized,
-          type: "create",
-          userId: user.id,
-        },
-        `create:${user.id}:${normalized}:${Date.now()}`
-      );
-      await hub.mutate(() => Effect.runPromise(loadApps(user.id)));
+      const app = await runnerCreateApp({
+        name: trimmedName,
+        slug: normalized,
+        userId: user.id,
+      });
+      // The runner owns the app row; the creator's admin grant is ours.
+      await withDb(grantCollaborator(app.id, user.id, "admin"));
+      await hub.mutate(() => listAppsForCollaborator(user.id));
     } catch (error) {
       if (error instanceof ActionError || error instanceof UnauthorizedError) {
         throw error;
@@ -156,11 +153,10 @@ export const remove = action(
     await requireAppRole(appId, user.id, "admin");
     const hub = appsFor(user.id);
     try {
-      await enqueueOp(
-        { appId, type: "remove", userId: user.id },
-        `remove:${appId}:${Date.now()}`
-      );
-      await hub.mutate(() => Effect.runPromise(loadApps(user.id)));
+      await runnerDeleteApp(appId);
+      // Nothing cascades grants now that the app row lives in the runner.
+      await withDb(dropAppCollaborators(appId));
+      await hub.mutate(() => listAppsForCollaborator(user.id));
     } catch (error) {
       if (error instanceof ActionError || error instanceof UnauthorizedError) {
         throw error;
@@ -232,17 +228,11 @@ export const setDesired = action(
       await requireAppRole(id, user.id, "push");
       const hub = appsFor(user.id);
       try {
-        await enqueueOp(
-          {
-            appId: id,
-            // SAFETY: desiredState is validated above to be exactly "running" | "stopped" before this cast.
-            desiredState: desiredState as "running" | "stopped",
-            type: "desired",
-            userId: user.id,
-          },
-          `desired:${id}:${desiredState}:${Date.now()}`
-        );
-        await hub.mutate(() => Effect.runPromise(loadApps(user.id)));
+        // SAFETY: desiredState is validated above to be exactly "running" | "stopped" before this cast.
+        await runnerPatchApp(id, {
+          desiredState: desiredState as "running" | "stopped",
+        });
+        await hub.mutate(() => listAppsForCollaborator(user.id));
       } catch (error) {
         if (
           error instanceof ActionError ||
@@ -284,17 +274,8 @@ export const renameApp = action(
     await requireAppRole(id, user.id, "admin");
     const hub = appsFor(user.id);
     try {
-      await enqueueOp(
-        {
-          appId: id,
-          name: trimmedName,
-          slug: normalized,
-          type: "rename",
-          userId: user.id,
-        },
-        `rename:${id}:${Date.now()}`
-      );
-      await hub.mutate(() => Effect.runPromise(loadApps(user.id)));
+      await runnerRenameApp(id, { name: trimmedName, slug: normalized });
+      await hub.mutate(() => listAppsForCollaborator(user.id));
     } catch (error) {
       if (error instanceof ActionError || error instanceof UnauthorizedError) {
         throw error;
@@ -308,8 +289,7 @@ export const renameApp = action(
 export const get = action(
   checkedSchema(AppId, async (appId) => {
     const user = await sessionUser();
-    const { app: local, role } = await requireAppRole(appId, user.id, "view");
-    const app = await withLiveRunner(local);
+    const { app, role } = await requireAppRole(appId, user.id, "view");
     const git = await runnerGitRemote(appId);
     return {
       app,
@@ -461,6 +441,69 @@ export const envDotVars = action(
         : `${name}=${escaped}`;
     });
     return lines.join("\n");
+  }),
+  { error: AuthError }
+);
+
+// ---- Invitations a member can hand out ----
+
+/** The signed-in account's unused codes (see `INVITES_PER_USER`). */
+export const myInviteCodes = action(
+  async () => {
+    const user = await sessionUser();
+    try {
+      return await listUnusedInvitesFor(user.id);
+    } catch (error) {
+      failUnknown(error);
+    }
+  },
+  { error: AuthError }
+);
+
+// ---- Custom domains (read: view · write: admin) ----
+
+const DomainArgs = Schema.Struct({
+  appId: Schema.String,
+  hostname: Schema.String,
+});
+
+/** Hostnames this app answers on, for anyone who can see the app. */
+export const listDomains = action(
+  checkedSchema(AppId, async (appId) => {
+    await requireViewApp(appId);
+    try {
+      return await runnerListDomains(appId);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }),
+  { error: AuthError }
+);
+
+/** Reserve a hostname for the app (admin). The runner is the authority on
+ * shape, collisions and platform-owned names; its message is surfaced. */
+export const addDomain = action(
+  checkedSchema(DomainArgs, async ({ appId, hostname }) => {
+    const user = await sessionUser();
+    await requireAppRole(appId, user.id, "admin");
+    try {
+      return await runnerAddDomain(appId, hostname);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }),
+  { error: AuthError }
+);
+
+export const removeDomain = action(
+  checkedSchema(DomainArgs, async ({ appId, hostname }) => {
+    const user = await sessionUser();
+    await requireAppRole(appId, user.id, "admin");
+    try {
+      return await runnerRemoveDomain(appId, hostname);
+    } catch (error) {
+      failUnknown(error);
+    }
   }),
   { error: AuthError }
 );

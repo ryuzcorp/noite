@@ -6,6 +6,16 @@ Deploy CI-built `dist` to Noite over Git smart-HTTP. Same auth as `git push` (Ba
 bunx @noitenow/cli deploy --slug myapp --url https://git.noite.now --token $NOITE_API_KEY
 ```
 
+## Install
+
+Ships as a Bun bundle, so Bun must be on the machine that runs it.
+
+```sh
+bun add -g @noitenow/cli   # Bun
+npm i -g @noitenow/cli     # npm/pnpm/yarn — same tarball
+bunx @noitenow/cli deploy  # one-off, no install
+```
+
 Flags fall back to env, then to GitHub Actions context:
 
 | Flag | Env | Actions default |
@@ -31,3 +41,15 @@ In Actions it writes `url=` + `sha=` to `$GITHUB_OUTPUT` and posts (or updates, 
 ```
 
 Commits are parented on the remote tip, so pushes stay fast-forward (`push` role suffices — never force). Values are never logged; the token travels in the remote URL exactly like `deploy.sh`.
+
+## Publishing
+
+Maintainers only. The artifact is the Bun bundle in `dist/` (`dist/bin.js`); `src/` is not shipped.
+
+```sh
+bun run build                 # writes dist/bin.js
+bun publish                   # prepack builds first, so dist/ can never be stale
+npm publish --access public   # equivalent via npm
+```
+
+The `version` field in `package.json` defines the release — bump it before publishing. Keep `VERSION` in `src/bin.ts` in sync.

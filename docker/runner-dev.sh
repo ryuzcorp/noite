@@ -1,5 +1,5 @@
 #!/bin/sh
-# Dev host plane: rebuild + restart on src / Cargo.toml / migrations changes.
+# Dev host plane: rebuild + restart on src / Cargo.toml / schema changes.
 set -eu
 cd /src
 export PATH="${CARGO_HOME:-/usr/local/cargo}/bin:${PATH}"
@@ -11,7 +11,7 @@ if [ "${RUNNER_DEV_RELEASE:-0}" = "1" ]; then
     -w src \
     -w Cargo.toml \
     -w Cargo.lock \
-    -w migrations \
+    -w schema.sql \
     -s "cargo run --release"
 fi
 
@@ -21,5 +21,5 @@ exec cargo watch \
   -w src \
   -w Cargo.toml \
   -w Cargo.lock \
-  -w migrations \
+  -w schema.sql \
   -x run

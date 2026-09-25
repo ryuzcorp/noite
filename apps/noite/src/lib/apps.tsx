@@ -3,7 +3,7 @@ import { atom, unsafe, watch } from "ilha";
 import { createMutationQueue } from "oxidejs/mutation-queue";
 
 import { create } from "./apps.server";
-import type { App } from "./db";
+import type { App } from "./collaborators";
 import { ListSkeleton } from "./skeletons";
 import { readSwrCache, writeSwrCache } from "./swr-cache";
 

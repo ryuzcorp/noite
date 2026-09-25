@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1
+# Control-UI node image (compose `control`, GHCR ghcr.io/<owner>/noite-control):
+# a celld node with the built Oxide worker baked in, so a plain
+# `docker compose up` serves the UI with no host-side clone, build or
+# `celld deploy`. The entrypoint deploys the baked bundle (revision-gated)
+# and patches the worker's vars from the container environment, so this one
+# image serves any domain and secret set.
+#
+# celld version comes from the runner image's ARG — keep in sync with
+# Dockerfile.runner-container and docker/Dockerfile.runner-dev
+# (docker/check-versions.ts asserts it).
+ARG CELLD_VERSION=0.5.1
+
+# --- stage 1: build the worker bundle (client + ssr + celld entry) ---------
+# bun install runs inside the image, so the lockfile is the only input that
+# pins UI deps. `.dockerignore` keeps .dev.vars out of the context: a
+# build-time secret would otherwise be baked into the deployed vars block.
+FROM docker.io/oven/bun:1.3-debian AS ui
+WORKDIR /app
+COPY apps/noite/package.json apps/noite/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY apps/noite/ ./
+RUN bun run build \
+  && rm -f dist/.dev.vars dist/.dev.vars.* dist/ssr/.dev.vars dist/ssr/.dev.vars.* \
+  && find dist -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1 >dist/REVISION
+
+# --- stage 2: celld node + bundle -----------------------------------------
+# Base is upstream celld (Debian, root). awscli: bucket ensure + revision
+# marker. jq: runtime vars patch. esbuild: `celld deploy` shells out to it for
+# worker projects (shared installer, no second pin).
+FROM ghcr.io/denoland/celld:${CELLD_VERSION}
+COPY docker/install-sidecars.sh /tmp/install-sidecars.sh
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends awscli ca-certificates curl jq unzip \
+  && rm -rf /var/lib/apt/lists/* \
+  && sh /tmp/install-sidecars.sh esbuild \
+  && rm /tmp/install-sidecars.sh
+COPY --from=ui /app/dist /ui/dist
+COPY docker/noite-entrypoint.sh /usr/local/bin/noite-entrypoint.sh
+WORKDIR /data
+# Worker listener (:8090 public, :8091 internal) + CELD_WATCH state dir.
+EXPOSE 8090
+ENTRYPOINT ["/usr/local/bin/noite-entrypoint.sh"]

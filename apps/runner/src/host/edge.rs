@@ -11,7 +11,6 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
-    Json,
 };
 
 use crate::AppState;
@@ -139,25 +138,43 @@ pub async fn edge_fallback(
     let cfg = &state.config;
     let bases = cfg.tenant_bases();
     let control = control_url(host, &cfg.base_domain, &cfg.control_subdomain, &bases);
-    let Some(slug) = parse_edge_slug(host, &bases, &cfg.control_subdomain) else {
-        return page(
-            StatusCode::NOT_FOUND,
-            "Not found",
-            &format!("There&rsquo;s nothing at <code>{}</code>.", escape(host)),
-            &control,
-        );
+    // A tenant hostname resolves by slug; anything else may be a custom
+    // hostname registered for one app (`app_domain`).
+    let bare = host
+        .split_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host)
+        .trim()
+        .trim_end_matches('.')
+        .to_lowercase();
+    let (slug, app) = match parse_edge_slug(host, &bases, &cfg.control_subdomain) {
+        Some(slug) => (
+            Some(slug.clone()),
+            crate::db::get_app_by_slug(&state.pool, &slug).await.ok().flatten(),
+        ),
+        None => (
+            None,
+            crate::db::get_app_by_domain(&state.pool, &bare).await.ok().flatten(),
+        ),
     };
-    let app = crate::db::get_app_by_slug(&state.pool, &slug).await.ok().flatten();
     let Some(app) = app else {
-        return page(
-            StatusCode::NOT_FOUND,
-            "Not found",
-            &format!(
-                "There&rsquo;s no app for this slug (<code>{}</code>).",
-                escape(&slug)
+        return match slug {
+            Some(slug) => page(
+                StatusCode::NOT_FOUND,
+                "Not found",
+                &format!(
+                    "There&rsquo;s no app for this slug (<code>{}</code>).",
+                    escape(&slug)
+                ),
+                &control,
             ),
-            &control,
-        );
+            None => page(
+                StatusCode::NOT_FOUND,
+                "Not found",
+                &format!("There&rsquo;s nothing at <code>{}</code>.", escape(host)),
+                &control,
+            ),
+        };
     };
     if app.is_stopped() {
         return page(
@@ -227,31 +244,6 @@ pub fn tls_ask_static_ok(
             .any(|h| h.trim().to_lowercase() == bare)
 }
 
-/// Worker route table for container dispatch (`GET /v1/edge/routes`,
-/// bearer-gated): slug → fleet ports for deployed running apps. The control
-/// worker DO caches this (~5 s TTL) and targets tenants via
-/// `getTcpPort(listenPort)`. Stopped/never-deployed apps are omitted so the
-/// worker falls through to the edge fallback page.
-pub async fn edge_routes(State(state): State<AppState>) -> impl IntoResponse {
-    let apps = crate::db::list_apps(&state.pool).await.unwrap_or_default();
-    let mut routes = Vec::new();
-    for app in &apps {
-        if app.is_stopped() || !app.is_deployed() {
-            continue;
-        }
-        let (Some(listen), Some(internal)) = (app.listen_port, app.internal_port) else {
-            continue;
-        };
-        routes.push(serde_json::json!({
-            "slug": app.slug,
-            "listenPort": listen,
-            "internalPort": internal,
-            "status": app.status,
-        }));
-    }
-    Json(serde_json::json!({ "routes": routes }))
-}
-
 /// Caddy `on_demand_tls` gate (`GET /v1/edge/tls-ask?domain=`): 200 only
 /// for hostnames that are really ours — platform hosts statically, tenant
 /// slugs when deployed and running. Public (Caddy calls without
@@ -270,15 +262,32 @@ pub async fn tls_ask(
     ) {
         return StatusCode::OK;
     }
-    let Some(slug) = parse_edge_slug(domain, &cfg.tenant_bases(), &cfg.control_subdomain) else {
-        return StatusCode::NOT_FOUND;
-    };
-    if !crate::lifecycle::slug_ok(&slug) {
-        return StatusCode::NOT_FOUND;
-    }
-    match crate::db::get_app_by_slug(&state.pool, &slug).await {
-        Ok(Some(app)) if !app.is_stopped() && app.is_deployed() => StatusCode::OK,
-        _ => StatusCode::NOT_FOUND,
+    // A tenant hostname or a registered custom hostname. Both must belong to
+    // an app that is deployed and running, so a certificate is never minted for
+    // a name this fleet does not serve.
+    match parse_edge_slug(domain, &cfg.tenant_bases(), &cfg.control_subdomain) {
+        Some(slug) => {
+            if !crate::lifecycle::slug_ok(&slug) {
+                return StatusCode::NOT_FOUND;
+            }
+            match crate::db::get_app_by_slug(&state.pool, &slug).await {
+                Ok(Some(app)) if !app.is_stopped() && app.is_deployed() => StatusCode::OK,
+                _ => StatusCode::NOT_FOUND,
+            }
+        }
+        None => {
+            let bare = domain
+                .split_once(':')
+                .map(|(h, _)| h)
+                .unwrap_or(domain)
+                .trim()
+                .trim_end_matches('.')
+                .to_lowercase();
+            match crate::db::get_app_by_domain(&state.pool, &bare).await {
+                Ok(Some(app)) if !app.is_stopped() && app.is_deployed() => StatusCode::OK,
+                _ => StatusCode::NOT_FOUND,
+            }
+        }
     }
 }
 

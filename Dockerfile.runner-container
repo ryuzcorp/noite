@@ -1,42 +1,32 @@
 # syntax=docker/dockerfile:1
-# THE production runner image: compose `control` (local build), the
-# `celld deploy` container cell (`RunnerContainer` wrangler
-# `containers[0].image`), and the railpack CI build all use this file —
-# one definition, no sync drift. Repo-root location is load-bearing (G3):
-# `celld deploy` resolves the image path relative to the project and
-# derives the context from the Dockerfile's directory; under `docker/`
-# the repo-root `COPY apps/runner/…` inputs would break.
-# 0.5.0: binding-created workflow instances stall in `waiting` on 0.4.1
-# (platform-cron instances run fine); see SPEC runbook. Rebuild to apply.
-# Sidecar versions (esbuild/duckdb) live in docker/install-sidecars.sh —
-# bump there, not here. celld stays an ARG (FROM refs can't come from a
-# script); keep it in sync with Dockerfile.runner-dev, Dockerfile.tools,
-# and railpack.json.
+# THE runner image: compose `runner` (deploy pipeline, fleet supervisor, route
+# table, telemetry aggregation) in every install — local build or GHCR pull.
+#
+# Repo-root location is load-bearing: `COPY apps/runner/…` inputs are relative
+# to the Dockerfile's directory, and CI builds it with the repo root as context.
+#
+# celld version ARG asserts against docker/Dockerfile.ui, docker/Dockerfile.tools
+# and docker/Dockerfile.runner-dev (docker/check-versions.ts).
+# Sidecar versions (esbuild/duckdb) live in docker/install-sidecars.sh — bump
+# there, not here.
 ARG CELLD_VERSION=0.5.1
 
 FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
-
-# Loopback S3 sidecar for container mode (B1): the fence blocks every route
-# to the compose object store, so the runner spawns this on 127.0.0.1:9000
-# and the worker relays durability into R2. Single binary keeps the image
-# small; the data dir is ephemeral by design (relay owns durability).
-FROM docker.io/rustfs/rustfs:1.0.0-rc.6 AS rustfs
-
-# Engine CLI for celld container provisioning: `celld deploy` and the runner
-# cell build their images through the mounted engine socket (DOCKER_HOST),
-# so the CLI must be baked in — it cannot be installed at runtime. CLI-only
-# stage (no daemon): the socket always points at an external engine.
-FROM docker.io/library/docker:28-cli AS dockercli
 
 FROM docker.io/library/rust:1-bookworm AS build
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev \
   && rm -rf /var/lib/apt/lists/*
 COPY apps/runner/Cargo.toml apps/runner/Cargo.lock ./
-COPY apps/runner/migrations ./migrations
 COPY apps/runner/src ./src
+# schema.sql is `include_str!`-embedded at compile time: needed to BUILD the
+# binary, never shipped as a file.
+COPY apps/runner/schema.sql ./schema.sql
 RUN cargo build --release && strip target/release/noite-runner
 
+# bun base: the deploy pipeline runs the app's own `bun run build`/release
+# scripts. celld binary for tenant fleets; esbuild for `celld deploy`; duckdb
+# CLI for telemetry aggregation over the fleet bucket's Parquet spans.
 FROM docker.io/oven/bun:1.3-debian
 ARG TARGETARCH
 COPY docker/install-sidecars.sh /tmp/install-sidecars.sh
@@ -44,23 +34,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git awscli unzip \
   && rm -rf /var/lib/apt/lists/* \
   && sh /tmp/install-sidecars.sh && rm /tmp/install-sidecars.sh
-COPY --from=rustfs /usr/bin/rustfs /usr/local/bin/rustfs
-COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
-COPY docker/noite-entrypoint.sh /usr/local/bin/noite-entrypoint.sh
+COPY --from=build /src/target/release/noite-runner /usr/local/bin/noite-runner
+COPY --from=celld /usr/local/bin/celld /usr/local/bin/celld
 WORKDIR /data
 ENV RUNNER_BIND=0.0.0.0:8080 \
     PATH="/usr/local/bin:${PATH}" \
     CELLD_ESBUILD=/usr/local/bin/esbuild
-# Runner API (8080) + sync API (18080, R2 relay import/export) + tenant fleet
-# range (8100+): celld on Linux dials the container bridge (all ports work),
-# but macOS/`wrangler dev` reaches the container through published loopback
-# ports, so every served port needs EXPOSE. Keep in sync with PORT_BASE
-# stride and SYNC_BIND in `apps/runner`.
-EXPOSE 8080 8100-8199 18080
-# Dual role (see the script): compose control overrides entrypoint+command
-# explicitly; the celld container cell runs image defaults (entrypoint
-# script + `cell` → the runner). Exec form — never shell — so flags always
-# reach the binary (a `/bin/bash -c` entrypoint would eat a list-form
-# command and run it bare).
-ENTRYPOINT ["/usr/local/bin/noite-entrypoint.sh"]
-CMD ["cell"]
+# Runner API (8080) + tenant fleet range (8100+, PORT_BASE stride). celld runs
+# in this container so the compose network reaches the tenant listeners
+# directly (Caddy proxies runner:81xx); nothing needs publishing on the host.
+EXPOSE 8080 8100-8199
+# Exec form — never shell — so flags always reach the binary.
+ENTRYPOINT ["/usr/local/bin/noite-runner"]

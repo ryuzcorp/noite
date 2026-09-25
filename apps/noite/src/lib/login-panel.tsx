@@ -5,8 +5,29 @@ import { authClient } from "./auth-client";
 import { fetchSession } from "./session";
 import { sleep } from "./sleep";
 
-const registrationContext = (email: string, name: string) =>
-  JSON.stringify({ email, name });
+const registrationContext = (email: string, name: string, invite: string) =>
+  JSON.stringify({ email, invite, name });
+
+/** Public policy from `/api/invite/status`: the first account on a fresh
+ * instance bootstraps it, so only later ones need a code. */
+interface SignupPolicy {
+  firstRun: boolean;
+  invitesPerUser: number;
+  requiresInvite: boolean;
+}
+
+const fetchSignupPolicy = async (): Promise<SignupPolicy> => {
+  try {
+    const res = await fetch("/api/invite/status");
+    if (res.ok) {
+      // SAFETY: the route answers exactly this shape (see handleInviteStatus).
+      return (await res.json()) as SignupPolicy;
+    }
+  } catch {
+    // Fall through to the stricter default below.
+  }
+  return { firstRun: false, invitesPerUser: 0, requiresInvite: true };
+};
 
 /** Page-load/passkey UX: the auth cookie may not be readable immediately, so poll briefly. */
 const waitForSession = async (): Promise<void> => {
@@ -32,9 +53,11 @@ export const LoginPanel = () => {
   const recovery = atom(false);
   const otpSent = atom(false);
   const otpEmail = atom("");
+  const invite = atom<SignupPolicy | null>(null);
 
   watch.once(() => {
     void (async () => {
+      invite.set(await fetchSignupPolicy());
       const { data } = await fetchSession();
       if (data?.user) {
         navigate("/apps");
@@ -51,14 +74,19 @@ export const LoginPanel = () => {
     const data = new FormData(form);
     const email = String(data.get("email") ?? "").trim();
     const name = String(data.get("name") ?? "").trim();
+    const code = String(data.get("invite") ?? "").trim();
     if (!(email && name)) {
       error.set("Name and email are required");
+      return;
+    }
+    if (invite()?.requiresInvite && !code) {
+      error.set("An invitation code is required on this instance");
       return;
     }
     busy.set(true);
     error.set("");
     const result = await authClient.passkey.addPasskey({
-      context: registrationContext(email, name),
+      context: registrationContext(email, name, code),
       createSession: true,
       name: "Primary",
     });
@@ -278,6 +306,25 @@ export const LoginPanel = () => {
             />
             <p class="validator-hint hidden">Enter a valid email address</p>
           </fieldset>
+          {invite()?.requiresInvite ? (
+            <fieldset class="fieldset">
+              <label class="label" for="register-invite">
+                Invitation code
+              </label>
+              <input
+                id="register-invite"
+                name="invite"
+                class="input w-full font-mono"
+                placeholder="XXXX-XXXX-XXXX"
+                autocomplete="off"
+                spellcheck={false}
+                required
+              />
+              <p class="label">
+                This instance is invite-only. Ask a member for a code.
+              </p>
+            </fieldset>
+          ) : null}
           <button
             type="submit"
             class="btn btn-sm btn-primary"

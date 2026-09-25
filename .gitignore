@@ -5,12 +5,12 @@ node_modules
 out
 dist
 *.tgz
-# generated standalone compose (bun docker/standalone.ts)
-docker/compose.standalone.yaml
-
 # code coverage
 coverage
 *.lcov
+
+# local backups (make backup)
+backups/
 
 # logs
 logs
@@ -34,4 +34,3 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Finder (MacOS) folder config
 .DS_Store
-docker/.e2e-data/

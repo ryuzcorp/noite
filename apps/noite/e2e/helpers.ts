@@ -51,6 +51,27 @@ export const addVirtualAuthenticator = async (page: Page): Promise<void> => {
     },
   });
 };
+/** Authenticated runner call (raw-port lane: direct on :8080). The runner is
+ * the platform's API, so feature checks that do not need a browser belong
+ * here — the app-detail panels are a known-broken surface (see SPEC.md). */
+export const runnerCall = async (
+  request: APIRequestContext,
+  path: string,
+  init: { body?: unknown; method?: "GET" | "POST" | "DELETE" | "PATCH" } = {}
+): Promise<{
+  body: Record<string, never> | unknown[] | string | number | boolean | null;
+  status: number;
+}> => {
+  const res = await request.fetch(`${apiBase}${path}`, {
+    data: init.body,
+    headers: { authorization: `Bearer ${runnerToken()}` },
+    method: init.method ?? "GET",
+  });
+  // 204 and error bodies are not JSON; callers only read status then.
+  const body = await res.json().catch(() => null);
+  return { body, status: res.status() };
+};
+
 /** Runner API call direct on :8080 (raw-port lane, no edge). */
 export const runnerApi = async <T>(
   request: APIRequestContext,

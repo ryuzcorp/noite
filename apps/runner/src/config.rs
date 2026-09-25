@@ -12,6 +12,10 @@ fn parse_host_list(raw: &str) -> Vec<String> {
 }
 
 fn parse_auto_https(raw: Option<&str>, base_domain: &str) -> bool {
+    // An empty value means "not configured" (compose renders
+    // `CADDY_AUTO_HTTPS: ""` when the operator leaves it unset), so trim and
+    // treat it as absent rather than as an explicit on.
+    let raw = raw.map(str::trim).filter(|value| !value.is_empty());
     match raw {
         Some("off") | Some("0") | Some("false") => false,
         Some(_) => true,
@@ -66,15 +70,25 @@ pub struct Config {
     pub git_public_base: String,
     /// Control UI base URL for Git API-key auth (runner → UI).
     pub ui_url: String,
+    /// Per-account app quota. Every app is its own celld fleet, so this is the
+    /// knob that bounds how much of the host one account can claim.
+    pub max_apps_per_user: u32,
+    /// Per-fleet celld memory ceiling in MiB (`CELLD_MAX_RSS_MB`). Without it
+    /// celld sheds at 80% of the *whole* container's memory, which lets one
+    /// tenant's fleet starve every other app on the host.
+    pub fleet_max_rss_mb: u32,
+    /// celld's own log filter for tenant fleets (`RUNNER_FLEET_LOG`). The
+    /// runner's RUST_LOG describes the runner's modules, so inheriting it left
+    /// a fleet's runtime logs out of the per-app log view entirely.
+    pub fleet_log: String,
+    /// Idle seconds after which a fleet's cells hibernate
+    /// (`CELLD_IDLE_EVICT_S`). The docs' default evicts only under memory
+    /// pressure, which keeps idle fleets resident forever.
+    pub fleet_idle_evict_s: u32,
     /// Caddy JSON access log the device/path/ref tick tails. The Caddy `log`
     /// block is path-fixed at the volume root; the Caddyfile itself may live
     /// in a subpath (dev `dynamic/`).
     pub caddy_access_log: String,
-    /// Run a loopback S3 sidecar (rustfs on 127.0.0.1:9000) and talk to it
-    /// instead of `S3_ENDPOINT`. Set in the container cell, where the celld
-    /// fence blocks every route to the compose-network object store; the
-    /// worker relays durability into R2. Off in compose mode.
-    pub sidecar_s3: bool,
 }
 
 impl Config {
@@ -160,10 +174,16 @@ impl Config {
             caddy_api_upstream: env_or(&["CADDY_API_UPSTREAM"], "runner:8080"),
             git_public_base,
             ui_url: ui_url.trim_end_matches('/').to_string(),
-            sidecar_s3: matches!(
-                env_or(&["RUNNER_SIDECAR_S3"], "0").as_str(),
-                "1" | "true" | "yes"
-            ),
+            max_apps_per_user: env_or(&["RUNNER_MAX_APPS_PER_USER"], "10")
+                .parse()
+                .unwrap_or(10),
+            fleet_max_rss_mb: env_or(&["RUNNER_FLEET_MAX_RSS_MB"], "512")
+                .parse()
+                .unwrap_or(512),
+            fleet_log: env_or(&["RUNNER_FLEET_LOG"], "error,celld=warn"),
+            fleet_idle_evict_s: env_or(&["RUNNER_FLEET_IDLE_EVICT_S"], "300")
+                .parse()
+                .unwrap_or(300),
         })
     }
 
@@ -248,6 +268,15 @@ mod tests {
     }
 
     #[test]
+    fn auto_https_empty_value_is_unset() {
+        // Compose renders `CADDY_AUTO_HTTPS: ""` when the operator leaves it
+        // unset, which must fall back to the domain default — not force on.
+        assert!(!parse_auto_https(Some(""), "localhost"));
+        assert!(parse_auto_https(Some(""), "noite.now"));
+        assert!(!parse_auto_https(Some("  "), "localhost"));
+    }
+
+    #[test]
     fn extra_hosts_split_and_trim() {
         assert!(parse_host_list("").is_empty());
         assert_eq!(
@@ -290,12 +319,15 @@ mod tests {
             poll_ms: 5000,
             caddy_upstream_host: "runner".into(),
             auto_https: false,
+            fleet_log: "error,celld=warn".into(),
+            max_apps_per_user: 10,
+            fleet_max_rss_mb: 512,
+            fleet_idle_evict_s: 300,
             caddy_control_upstream: "ui:8080".into(),
             caddy_api_upstream: "runner:8080".into(),
             git_public_base: "https://git.localhost".into(),
             ui_url: "http://ui:8080".into(),
             caddy_access_log: "/caddy/access.log".into(),
-            sidecar_s3: false,
         };
         assert_eq!(cfg.tenant_bases(), vec!["localhost", "noite.local"]);
     }

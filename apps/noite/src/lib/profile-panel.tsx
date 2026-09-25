@@ -1,7 +1,7 @@
 import { navigate } from "@ilha/router";
 import { atom, watch } from "ilha";
 
-import { createApiKey } from "./apps.server";
+import { createApiKey, myInviteCodes } from "./apps.server";
 import { authClient } from "./auth-client";
 import { formatDateTime } from "./dates";
 import { fetchSession } from "./session";
@@ -37,6 +37,77 @@ const scopeBadges = (
   }
   const badges = Object.keys(permissions).map(scopeLabel);
   return badges.length > 0 ? badges : ["Full access"];
+};
+
+/** The codes this account can still hand out. Every account receives a share
+ * on registration (`INVITES_PER_USER`); this is the only place a non-admin can
+ * read them, so it is part of the invite flow rather than a nicety. */
+const MyInvitesCard = () => {
+  const codes = atom<{ code: string; id: string }[]>([]);
+  const copied = atom("");
+  const loaded = atom(false);
+  watch.once(() => {
+    void (async () => {
+      try {
+        codes.set((await myInviteCodes()) ?? []);
+      } catch {
+        // A failed read leaves the card empty rather than blocking the page.
+      }
+      loaded.set(true);
+    })();
+  });
+  const copy = async (code: string) => {
+    try {
+      await navigator.clipboard.writeText(code);
+      copied.set(code);
+      setTimeout(() => {
+        copied.set("");
+      }, 1500);
+    } catch {
+      copied.set("");
+    }
+  };
+  if (!loaded()) {
+    return <SectionSkeleton lines={2} />;
+  }
+  return (
+    <div class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
+      <div class="card-body gap-3">
+        <h2 class="card-title m-0 text-base">Invitations</h2>
+        <p class="m-0 text-sm opacity-70">
+          This instance is invite-only. Share a code with someone you want to
+          let in; each one works once.
+        </p>
+        {codes().length === 0 ? (
+          <p class="m-0 text-sm opacity-70">
+            No codes left — ask an admin for one.
+          </p>
+        ) : (
+          <ul class="m-0 flex list-none flex-col gap-2 p-0">
+            {codes().map((row) => (
+              <li
+                key={row.id}
+                class="border-base-300 flex items-center justify-between gap-2 rounded border p-2"
+              >
+                <code class="font-mono text-xs">
+                  {copied() === row.code ? "copied" : row.code}
+                </code>
+                <button
+                  type="button"
+                  class="btn btn-sm btn-ghost"
+                  onclick={() => {
+                    void copy(row.code);
+                  }}
+                >
+                  Copy
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
 };
 
 /** Create / list / revoke Better Auth API keys (Git push password). */
@@ -167,6 +238,7 @@ export const ProfilePanel = () => {
 
   return (
     <div class="flex flex-col gap-6">
+      <MyInvitesCard />
       <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
         <h2 class="m-0 text-lg font-semibold">Profile</h2>
         <fieldset class="fieldset w-full">

@@ -1,8 +1,11 @@
 #!/usr/bin/env bun
-// Version-pin drift guard: celld/rustfs versions are pinned in several
-// static formats (Dockerfile ARGs, railpack image refs, compose image refs)
-// that no tool reads jointly. This asserts they agree; run in CI (`check`
-// job) and after any bump.
+// Version-pin drift guard: the celld version is pinned in several static
+// formats (Dockerfile ARGs) that no tool reads jointly. This asserts they
+// agree; run in CI (`check` job) and after any bump.
+//
+// rustfs + caddy are single-sourced now (compose `image:` refs), and
+// esbuild/duckdb live only in docker/install-sidecars.sh — nothing to compare
+// for any of them, so they have no group here.
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
@@ -16,23 +19,14 @@ interface Source {
 }
 
 const celldArg = /ARG CELLD_VERSION=(?<version>\d+\.\d+\.\d+)/u;
-const celldImage = /celld:(?<version>\d+\.\d+\.\d+)/u;
-const rustfsImage = /rustfs\/rustfs:(?<version>[\d.]+(?:-rc\.\d+)?)/u;
 
 const groups = {
   celld: [
     { file: "Dockerfile.runner-container", pattern: celldArg },
+    { file: "docker/Dockerfile.ui", pattern: celldArg },
     { file: "docker/Dockerfile.runner-dev", pattern: celldArg },
     { file: "docker/Dockerfile.tools", pattern: celldArg },
-    { file: "railpack.json", pattern: celldImage },
   ],
-  rustfs: [
-    { file: "Dockerfile.runner-container", pattern: rustfsImage },
-    { file: "docker/compose.yaml", pattern: rustfsImage },
-    { file: "railpack.json", pattern: rustfsImage },
-  ],
-  // NOTE: caddy/esbuild/duckdb are single-sourced (Dockerfile.caddy FROM,
-  // install-sidecars.sh) — nothing to compare, so no group here.
 } satisfies Record<string, Source[]>;
 
 let failed = false;

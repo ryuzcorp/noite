@@ -5,7 +5,7 @@ use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 use sqlx::sqlite::SqliteConnection;
 
 use crate::models::{
-    now_iso, new_id, App, AppDeviceStat, AppEnv, AppEvent, AppInsight, AppMetric, AppPathStat, AppRefStat, AppSecret, AppStatus, AppUserProps, Deploy, DeployStatus,
+    now_iso, new_id, App, AppDeviceStat, AppDomain, AppEnv, AppEvent, AppInsight, AppMetric, AppPathStat, AppRefStat, AppSecret, AppStatus, AppUserProps, Deploy, DeployStatus,
 };
 
 const APP_COLS: &str = r#"id, slug, name, user_id, status, subdomain, git_prefix, fleet_bucket,
@@ -43,8 +43,60 @@ pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     sqlx::query("PRAGMA foreign_keys = ON")
         .execute(&pool)
         .await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    // One idempotent file (embedded at compile time), applied on every boot:
+    // it creates whatever is missing and drops what earlier versions retired,
+    // so there is no ledger to migrate and no ordering to keep in sync.
+    let mut tx = pool.begin().await?;
+    sqlx::raw_sql(include_str!("../schema.sql"))
+        .execute(&mut *tx)
+        .await
+        .context("apply schema")?;
+    tx.commit().await?;
     Ok(pool)
+}
+
+/// Consistent copy of the runner database, written by `VACUUM INTO` next to
+/// the live file (inside the same volume, so `make backup` picks it up with
+/// the volume tar). One copy per run: the caller removes the previous one.
+pub fn snapshot_path(cfg: &crate::config::Config) -> std::path::PathBuf {
+    let live = local_db_path(cfg).unwrap_or_else(|| std::path::PathBuf::from("/data/noite.sqlite"));
+    let dir = live.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+    dir.join("noite-snapshot.sqlite")
+}
+
+/// Local path of the live database, parsed from `database_url`
+/// (`sqlite:{path}?mode=rwc`). None when the URL is not a file path.
+pub fn local_db_path(cfg: &crate::config::Config) -> Option<std::path::PathBuf> {
+    let stripped = cfg.database_url.strip_prefix("sqlite:")?;
+    let path = stripped.split('?').next().unwrap_or(stripped);
+    if path.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(path))
+}
+
+/// Additive schema change. SQLite has no `ADD COLUMN IF NOT EXISTS`, so a new
+/// column on an existing table cannot live in `schema.sql` (whose
+/// `CREATE TABLE IF NOT EXISTS` only ever covers whole tables). Guard with
+/// `pragma_table_info` instead: this is the supported path for the next column,
+/// and it is a no-op once applied.
+pub async fn ensure_column(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+    ddl: &str,
+) -> anyhow::Result<bool> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM pragma_table_info(?)")
+        .bind(table)
+        .fetch_all(pool)
+        .await?;
+    if rows.iter().any(|(name,)| name == column) {
+        return Ok(false);
+    }
+    sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"))
+        .execute(pool)
+        .await?;
+    Ok(true)
 }
 
 pub async fn list_apps(pool: &SqlitePool) -> sqlx::Result<Vec<App>> {
@@ -79,14 +131,100 @@ pub async fn get_app_by_slug(pool: &SqlitePool, slug: &str) -> sqlx::Result<Opti
         .await
 }
 
+/// Every registered custom hostname (the Caddyfile writer and the on-demand
+/// TLS gate read this once per reconcile).
+pub async fn list_app_domains(pool: &SqlitePool) -> sqlx::Result<Vec<AppDomain>> {
+    sqlx::query_as::<_, AppDomain>(
+        "SELECT app_id, hostname, created_at FROM app_domain ORDER BY hostname",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn list_domains_for(pool: &SqlitePool, app_id: &str) -> sqlx::Result<Vec<AppDomain>> {
+    sqlx::query_as::<_, AppDomain>(
+        "SELECT app_id, hostname, created_at FROM app_domain WHERE app_id = ? ORDER BY hostname",
+    )
+    .bind(app_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Resolve a request by custom hostname (edge fallback page).
+pub async fn get_app_by_domain(pool: &SqlitePool, hostname: &str) -> sqlx::Result<Option<App>> {
+    let sql = format!(
+        "SELECT {APP_COLS} FROM app WHERE id = (SELECT app_id FROM app_domain WHERE hostname = ?)"
+    );
+    sqlx::query_as::<_, App>(&sql)
+        .bind(hostname)
+        .fetch_optional(pool)
+        .await
+}
+
+/// The app that already owns a hostname, if any (hostname is the primary key,
+/// so this is the collision check the API runs before inserting).
+pub async fn domain_owner(pool: &SqlitePool, hostname: &str) -> sqlx::Result<Option<String>> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT app_id FROM app_domain WHERE hostname = ?")
+            .bind(hostname)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(id,)| id).next())
+}
+
+pub async fn add_domain(
+    pool: &SqlitePool,
+    app_id: &str,
+    hostname: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("INSERT INTO app_domain (app_id, hostname, created_at) VALUES (?, ?, ?)")
+        .bind(app_id)
+        .bind(hostname)
+        .bind(now_iso())
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+pub async fn remove_domain(
+    pool: &SqlitePool,
+    app_id: &str,
+    hostname: &str,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query("DELETE FROM app_domain WHERE app_id = ? AND hostname = ?")
+        .bind(app_id)
+        .bind(hostname)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Apps a given owner already has. The per-account quota is enforced here so
+/// an API key cannot slip past the UI's check.
+pub async fn count_apps_for_user(pool: &SqlitePool, user_id: &str) -> sqlx::Result<i64> {
+    let rows: Vec<(i64,)> =
+        sqlx::query_as("SELECT count(*) FROM app WHERE user_id = ? AND desired_state != 'deleted'")
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(n,)| n).next().unwrap_or(0))
+}
+
+/// Everything a new app row needs. A struct keeps the call sites readable now
+/// that the owner is part of the row.
+pub struct NewApp<'a> {
+    pub name: &'a str,
+    pub slug: &'a str,
+    pub user_id: &'a str,
+    pub subdomain: &'a str,
+    pub listen: i64,
+    pub internal: i64,
+}
+
 pub async fn create_app(
     pool: &SqlitePool,
     cfg: &crate::config::Config,
-    name: &str,
-    slug: &str,
-    subdomain: &str,
-    listen: i64,
-    internal: i64,
+    new: NewApp<'_>,
 ) -> sqlx::Result<App> {
     let id = new_id();
     let ts = now_iso();
@@ -94,22 +232,22 @@ pub async fn create_app(
         r#"INSERT INTO app (
             id, slug, name, user_id, status, subdomain, git_prefix, fleet_bucket,
             listen_port, internal_port, desired_state, created_at, updated_at
-          ) VALUES (?, ?, ?, 'local', ?, ?, ?, ?, ?, ?, 'running', ?, ?)"#,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)"#,
     )
     .bind(&id)
-    .bind(slug)
-    .bind(name)
+    .bind(new.slug)
+    .bind(new.name)
+    .bind(new.user_id)
     .bind(AppStatus::Provisioned.as_str())
-    .bind(subdomain)
-    .bind(crate::config::Config::git_prefix(slug))
-    .bind(cfg.fleets_uri(slug))
-    .bind(listen)
-    .bind(internal)
+    .bind(new.subdomain)
+    .bind(crate::config::Config::git_prefix(new.slug))
+    .bind(cfg.fleets_uri(new.slug))
+    .bind(new.listen)
+    .bind(new.internal)
     .bind(&ts)
     .bind(&ts)
     .execute(pool)
     .await?;
-    let _ = ensure_git_push_secret(pool, &id).await?;
     get_app(pool, &id).await.map(|a| a.expect("just inserted"))
 }
 
@@ -394,8 +532,8 @@ pub async fn prune_app_metrics(pool: &SqlitePool, older_than_ts: &str) -> sqlx::
 }
 
 /// Telemetry watermark persistence (slug -> last consumed start_unix_us).
-/// Written after bucket persist each tick; the same SQLite snapshot the R2
-/// relay carries restores it, so restarts resume instead of resetting.
+/// Written after bucket persist each tick; the runner SQLite lives on the
+/// data volume, so restarts resume instead of resetting.
 pub async fn get_metric_watermarks(
     pool: &SqlitePool,
 ) -> sqlx::Result<std::collections::HashMap<String, i64>> {
@@ -564,6 +702,7 @@ pub async fn prune_app_refs(pool: &SqlitePool, older_than_ts: &str) -> sqlx::Res
     Ok(res.rows_affected())
 }
 
+/// Per-app secret by kind (`fleet` → the pair the tenant celld fleet gets).
 pub async fn get_secret(
     pool: &SqlitePool,
     app_id: &str,
@@ -576,33 +715,6 @@ pub async fn get_secret(
     .bind(kind)
     .fetch_optional(pool)
     .await
-}
-
-/// Mint (or return existing) HTTP Basic password for Git smart-HTTP pushes.
-pub async fn ensure_git_push_secret(pool: &SqlitePool, app_id: &str) -> sqlx::Result<AppSecret> {
-    if let Some(existing) = get_secret(pool, app_id, "git_push").await? {
-        return Ok(existing);
-    }
-    let id = new_id();
-    let token = format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
-    let ts = now_iso();
-    sqlx::query(
-        r#"INSERT INTO app_secret (id, app_id, kind, access_key, secret_key, revealed, created_at)
-           VALUES (?, ?, 'git_push', 'git', ?, 0, ?)"#,
-    )
-    .bind(&id)
-    .bind(app_id)
-    .bind(&token)
-    .bind(&ts)
-    .execute(pool)
-    .await?;
-    get_secret(pool, app_id, "git_push")
-        .await
-        .map(|o| o.expect("just inserted"))
 }
 
 /// Tenant env vars (CF `.dev.vars` model: local file for dev, fleet env in
@@ -917,4 +1029,56 @@ pub async fn list_app_insights(
     .bind(app_id)
     .fetch_all(pool)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ensure_column_adds_once() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory db");
+        sqlx::query("CREATE TABLE sample (id TEXT PRIMARY KEY NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("create");
+        // Added the first time, a no-op afterwards — the guard is the point of
+        // the helper, because SQLite has no ADD COLUMN IF NOT EXISTS.
+        assert!(ensure_column(&pool, "sample", "note", "note TEXT")
+            .await
+            .expect("first add"));
+        assert!(!ensure_column(&pool, "sample", "note", "note TEXT")
+            .await
+            .expect("second add"));
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM pragma_table_info('sample')")
+            .fetch_all(&pool)
+            .await
+            .expect("pragma");
+        assert!(rows.iter().any(|(name,)| name == "note"));
+        // Existing rows survive with the column's default.
+        sqlx::query("INSERT INTO sample (id, note) VALUES ('a', 'kept')")
+            .execute(&pool)
+            .await
+            .expect("insert");
+        let (note,): (String,) = sqlx::query_as("SELECT note FROM sample WHERE id = 'a'")
+            .fetch_one(&pool)
+            .await
+            .expect("read");
+        assert_eq!(note, "kept");
+        // And the snapshot helper resolves next to the live file.
+    }
+
+    #[test]
+    fn snapshot_sits_beside_the_database() {
+        let mut cfg = crate::config::Config::from_env().expect("config");
+        cfg.database_url = "sqlite:/data/noite.sqlite?mode=rwc".into();
+        assert_eq!(
+            snapshot_path(&cfg),
+            std::path::PathBuf::from("/data/noite-snapshot.sqlite")
+        );
+    }
 }

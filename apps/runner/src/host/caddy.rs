@@ -1,11 +1,14 @@
 use std::path::Path;
 
 use crate::config::Config;
-use crate::models::App;
+use crate::models::{App, AppDomain};
 
-pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
+pub async fn rewrite_caddy(
+    cfg: &Config,
+    apps: &[App],
+    domains: &[AppDomain],
+) -> anyhow::Result<()> {
     let local = cfg.base_domain == "localhost";
-    let auto_https = if cfg.auto_https { "on" } else { "off" };
     let plain = local || !cfg.auto_https;
     // Control plane lives on the bare domain when CONTROL_SUBDOMAIN is empty
     // (dev `localhost` — the only hostname Bitwarden's matcher accepts
@@ -51,16 +54,21 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
         .map(|h| addr_of(h))
         .collect::<Vec<_>>()
         .join(", ");
-    let mut lines = vec![
-        "# noite-edge".into(),
-        "{".into(),
-        format!("\tauto_https {auto_https}"),
-        "\ton_demand_tls {".into(),
-        format!("\t\task http://{}/v1/edge/tls-ask", cfg.caddy_api_upstream),
-        "\t}".into(),
-        "}".into(),
-        String::new(),
-    ];
+    let mut lines = vec!["# noite-edge".into(), "{".into()];
+    // `auto_https` accepts only disable-style values — "on" is Caddy's
+    // default and NOT a valid token, so the directive is emitted only when
+    // HTTPS must be off (localhost dev, behind-proxy installs).
+    if !cfg.auto_https {
+        lines.push("\tauto_https off".into());
+    }
+    lines.push("\ton_demand_tls {".into());
+    lines.push(format!(
+        "\t\task http://{}/v1/edge/tls-ask",
+        cfg.caddy_api_upstream
+    ));
+    lines.push("\t}".into());
+    lines.push("}".into());
+    lines.push(String::new());
     // One reverse-proxy site block; `tls` adds an on-demand TLS gate so the
     // site serves HTTPS with per-hostname certs (no wildcard cert needed).
     // A tls-gated site does NOT proxy plaintext :80 (empty 200s) — so it
@@ -79,6 +87,14 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
         lines.push("\t\toutput file /etc/caddy/access.log".into());
         lines.push("\t\tformat json".into());
         lines.push("\t}".into());
+        // Compression, because celld does not compress an asset response and
+        // the docs point at a compressing ingress proxy for clients that want
+        // gzip or brotli. Measured through this edge: the control UI's
+        // content-hashed bundle drops from 462 KiB to 144 KiB and its CSS from
+        // 129 KiB to 22 KiB, while the `text/event-stream` log/deploy/metric
+        // endpoints stay uncompressed, chunked and unbuffered (the proxy below
+        // keeps `flush_interval -1`, and Caddy skips an event stream).
+        lines.push("\tencode zstd gzip".into());
         if tls {
             lines.push("\ttls {".into());
             lines.push("\t\ton_demand".into());
@@ -150,6 +166,25 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
             );
         }
     }
+    // Custom hostnames (app_domain): one site per registered name, routed to
+    // its app's port. Same rule as the tenant sites — a stopped or
+    // never-deployed app gets no route, so the request lands on the wildcard
+    // fallback page instead of a dead upstream (host/edge.rs resolves custom
+    // hosts there too).
+    for domain in domains {
+        let Some(app) = apps.iter().find(|a| a.id == domain.app_id) else {
+            continue;
+        };
+        let Some(port) = app.listen_port else {
+            continue;
+        };
+        if app.is_stopped() || !app.is_deployed() {
+            continue;
+        }
+        let upstream = format!("{}:{}", cfg.caddy_upstream_host, port);
+        push_site(&addr_of(&domain.hostname), edge_tls, &[], &[], &upstream);
+    }
+
     // API → runner (Bearer-protected REST)
     push_site(
         &addr_of(&format!("api.{}", cfg.base_domain)),
@@ -199,7 +234,7 @@ pub async fn rewrite_caddy(cfg: &Config, apps: &[App]) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::models::App;
+    use crate::models::{App, AppDomain};
 
     fn test_config(base: &str, sub: &str, auto_https: bool, path: &str) -> Config {
         Config {
@@ -227,7 +262,10 @@ mod tests {
             git_public_base: format!("https://git.{base}"),
             ui_url: "http://ui:8080".into(),
             caddy_access_log: "/caddy/access.log".into(),
-            sidecar_s3: false,
+            fleet_log: "error,celld=warn".into(),
+            max_apps_per_user: 10,
+            fleet_max_rss_mb: 512,
+            fleet_idle_evict_s: 300,
         }
     }
 
@@ -251,18 +289,73 @@ mod tests {
         }
     }
 
+    fn test_domain(app_id: &str, hostname: &str) -> AppDomain {
+        AppDomain {
+            app_id: app_id.into(),
+            hostname: hostname.into(),
+            created_at: "2026-09-15T00:00:00Z".into(),
+        }
+    }
+
     async fn rendered(cfg: &Config, apps: &[App]) -> String {
+        rendered_with(cfg, apps, &[]).await
+    }
+
+    async fn rendered_with(cfg: &Config, apps: &[App], domains: &[AppDomain]) -> String {
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
-        rewrite_caddy(cfg, apps).await.expect("rewrite");
+        rewrite_caddy(cfg, apps, domains).await.expect("rewrite");
         tokio::fs::read_to_string(&cfg.caddyfile_path)
             .await
             .expect("read back")
     }
 
     #[tokio::test]
+    async fn custom_domains_route_only_live_apps() {
+        let cfg = test_config("noite.now", "app", true, "/tmp/noite-test-domains");
+        let live = test_app();
+        let mut stopped = test_app();
+        stopped.id = "stopped-id".into();
+        stopped.slug = "parked".into();
+        stopped.desired_state = "stopped".into();
+        let mut undeployed = test_app();
+        undeployed.id = "fresh-id".into();
+        undeployed.slug = "fresh".into();
+        // Provisioned but never pushed: `is_deployed()` is status-or-sha, so
+        // both have to be unset to model a fresh app.
+        undeployed.status = "pending".into();
+        undeployed.last_deploy_sha = None;
+        let domains = [
+            test_domain("app-id", "www.example.com"),
+            test_domain("stopped-id", "parked.example.com"),
+            test_domain("fresh-id", "fresh.example.com"),
+            test_domain("gone-id", "orphan.example.com"),
+        ];
+        let out = rendered_with(&cfg, &[live, stopped, undeployed], &domains).await;
+        assert!(out.contains("www.example.com {"), "live app gets a site");
+        assert!(
+            !out.contains("parked.example.com"),
+            "a stopped app gets no route"
+        );
+        assert!(
+            !out.contains("fresh.example.com"),
+            "a never-deployed app gets no route"
+        );
+        assert!(
+            !out.contains("orphan.example.com"),
+            "a domain without an app gets no route"
+        );
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
+    #[tokio::test]
     async fn coolify_shape() {
         let cfg = test_config("noite.now", "app", false, "/tmp/noite-test-coolify");
-        let out = rendered(&cfg, &[test_app()]).await;
+        let out = rendered_with(
+            &cfg,
+            &[test_app()],
+            &[test_domain("app-id", "www.example.com")],
+        )
+        .await;
         println!("--- coolify Caddyfile ---\n{out}\n--- end ---");
         // Behind-proxy: bare hostnames + on-demand TLS for :443, plus an
         // `http://` twin per site — tls-gated sites answer plaintext :80
@@ -274,10 +367,32 @@ mod tests {
         assert!(out.contains("test.noite.now {"), "tenant TLS site");
         assert!(out.contains("http://test.noite.now {"), "tenant plain twin");
         assert!(out.contains("api.noite.now {"), "api TLS site");
+        assert!(out.contains("www.example.com {"), "custom domain TLS site");
+        assert!(
+            out.contains("http://www.example.com {"),
+            "custom domain plaintext twin behind the proxy"
+        );
         assert!(out.contains("on_demand"), "on-demand gate");
         assert!(out.contains("tls-ask"), "ask endpoint");
         assert!(out.contains("http://127.0.0.1 {"), "loopback health site");
         assert!(!out.contains("header_up Host"), "no redundant Host");
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
+    #[tokio::test]
+    async fn direct_tls_omits_auto_https_directive() {
+        // Caddy's `auto_https` takes only disable-style values — "on" is the
+        // default and is REJECTED at adapt time, which killed every
+        // real-domain install the moment the runner owned the Caddyfile.
+        let cfg = test_config("noite.now", "app", true, "/tmp/noite-test-direct");
+        let out = rendered(&cfg, &[test_app()]).await;
+        assert!(
+            !out.contains("auto_https"),
+            "no auto_https directive when HTTPS is on"
+        );
+        assert!(out.contains("\ttls {"), "on-demand TLS site");
+        assert!(out.contains("tls-ask"), "ask endpoint");
+        assert!(out.contains("\tencode zstd gzip"), "compressing edge");
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
     }
 

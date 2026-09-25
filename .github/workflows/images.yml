@@ -1,23 +1,16 @@
-# Production runner image for ghcr.io (ghcr.io/ryuzcorp/noite).
+# Release images for ghcr.io: the runner (ghcr.io/<owner>/noite) and the
+# control-UI celld node (ghcr.io/<owner>/noite-control). Both are built from
+# plain Dockerfiles with buildx — one platform per native runner, pushed by
+# digest, then merged into a multi-arch manifest list.
 #
-# The single image every runtime uses — compose `control`
-# (`NOITE_RUNNER_IMAGE`), Coolify (same universal compose file, env
-# overrides), and the `celld deploy` container cell — defined by
-# Dockerfile.runner-container and baked here through the Railpack BuildKit
-# frontend, so plain buildx handles push/cache/multi-arch. Compose never
-# builds in prod-like installs: this workflow bakes the immutable image
-# per commit, and runtimes pull it by tag.
-# A runner-image change restarts the control plane together with all
-# tenant fleets (they cold-boot), so batch control changes and pin
-# NOITE_RELEASE to a SHA/tag for reproducibility (`latest` follows main).
+# Compose installs never build in prod-like setups: they pull these tags
+# (NOITE_RUNNER_IMAGE / NOITE_CONTROL_IMAGE) and `docker compose up -d`.
+# A runner-image change restarts the control plane together with all tenant
+# fleets (they cold-boot), so batch control changes and pin a SHA/tag for
+# reproducibility (`latest` follows main).
 #
-# The Railpack frontend builds ONE platform per invocation, so each arch
-# builds natively in matrix (amd64 + arm64 runners — no QEMU) and pushes
-# by digest; the merge job assembles the multi-arch manifest list.
-#
-# Tags: `latest` + short SHA on main; version tags (v*) also push the
-# version + `stable`. In Coolify, pin NOITE_RELEASE for reproducible
-# deploys, or leave it `latest` to follow main.
+# Tags: `latest` + short SHA on main; version tags (v*) also push the version
+# + `stable`.
 name: images
 
 on:
@@ -25,12 +18,13 @@ on:
     branches: [main]
     paths:
       - "apps/runner/**"
+      - "apps/noite/**"
       - "Dockerfile.runner-container"
-      - "docker/Dockerfile.caddy"
-      - "docker/Caddyfile.static"
-      - "docker/install-sidecars.sh"
+      - "docker/Dockerfile.ui"
       - "docker/noite-entrypoint.sh"
-      - "railpack.json"
+      - "docker/install-sidecars.sh"
+      - "docker/compose.yaml"
+      - "docker/compose.byob.yaml"
       - ".github/workflows/images.yml"
     tags:
       - "v*"
@@ -55,37 +49,107 @@ jobs:
         run: bun run check
       - name: version pins
         run: bun docker/check-versions.ts
-      # Every compose variant must render (config needs no daemon) —
-      # catches YAML structure breaks before release.
+      # Every compose variant must render (config needs no daemon) — catches
+      # YAML structure breaks before release.
       - name: render prod compose
         run: BASE_DOMAIN=localhost docker compose -f docker/compose.yaml config > /dev/null
       - name: render dev overlay
         run: BASE_DOMAIN=localhost docker compose -f docker/compose.yaml -f docker/compose.dev.yaml config > /dev/null
       - name: render byob overlay
         run: BASE_DOMAIN=localhost AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x S3_ENDPOINT=https://s3.example.com S3_PUBLIC_ENDPOINT=https://s3.example.com docker compose -f docker/compose.yaml -f docker/compose.byob.yaml config > /dev/null
-      - name: render standalone output
-        run: bun docker/standalone.ts --out /tmp/compose.standalone.yaml
-      - name: validate standalone output
-        run: BASE_DOMAIN=localhost docker compose -f /tmp/compose.standalone.yaml config > /dev/null
-  # Single-file release compose for cloneless deploys (Arcane, plain
-  # Docker clouds): generated from the tree, render-proven, attached here
-  # so release means downloading, not cloning + bun.
-  standalone:
+  # Single-arch release images are proven here before the merge jobs publish:
+  # a broken Dockerfile fails the release, not the install.
+  runner-image:
     needs: check
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runs-on: ubuntu-latest
+          - platform: linux/arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
     permissions:
-      contents: read
       actions: write
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-      - run: bun docker/standalone.ts --out /tmp/compose.standalone.yaml
-      - run: docker compose -f /tmp/compose.standalone.yaml config > /dev/null
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile.runner-container
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/noite,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=runner-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=runner-${{ matrix.platform }}
+      - run: |
+          mkdir -p /tmp/digests
+          echo -n "$DIGEST" > "/tmp/digests/$SUFFIX"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          SUFFIX: ${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: compose-standalone
-          path: /tmp/compose.standalone.yaml
-          retention-days: 30
+          # Bare sha256 per platform — no credentials, no code.
+          name: runner-digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+  # The UI image runs `bun install` + `vite build` in a build stage, so each
+  # arch builds natively too (no QEMU).
+  control-image:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runs-on: ubuntu-latest
+          - platform: linux/arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    permissions:
+      actions: write
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile.ui
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/noite-control,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=control-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=control-${{ matrix.platform }}
+      - run: |
+          mkdir -p /tmp/digests
+          echo -n "$DIGEST" > "/tmp/digests/$SUFFIX"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          SUFFIX: ${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: control-digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
 
   rust:
     runs-on: ubuntu-latest
@@ -108,104 +172,20 @@ jobs:
       - run: cargo check --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
-  build:
-    needs: [check, rust]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            runs-on: ubuntu-latest
-          - platform: linux/arm64
-            runs-on: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runs-on }}
-    permissions:
-      actions: write
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      # Pinned Railpack CLI: generates railpack-plan.json for the BuildKit
-      # frontend (the frontend cannot read railpack.json itself).
-      - run: |
-          mkdir -p "$HOME/.local/bin"
-          curl -sSL https://railpack.com/install.sh -o /tmp/railpack-install.sh
-          RAILPACK_VERSION=0.39.0 bash /tmp/railpack-install.sh --bin-dir "$HOME/.local/bin"
-          "$HOME/.local/bin/railpack" prepare --plan-out railpack-plan.json .
-      - id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: railpack-plan.json
-          # Unpinned on purpose: frontend tags (v0.0.x) are decoupled from
-          # the CLI and go stale — v0.0.32 cannot even parse current plans
-          # (verified locally). Upstream docs use :latest everywhere.
-          build-args: BUILDKIT_SYNTAX=ghcr.io/railwayapp/railpack-frontend:latest
-          platforms: ${{ matrix.platform }}
-          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/noite,push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
-      - run: |
-          mkdir -p /tmp/digests
-          echo -n "$DIGEST" > "/tmp/digests/$SUFFIX"
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-          SUFFIX: ${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          # Bare sha256 per platform — no credentials, no code.
-          name: digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  # Edge image is a COPY-only layer over upstream multi-arch Caddy, so one
-  # job builds both platforms at once (no matrix, no cache needed).
-  caddy-image:
-    needs: check
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/noite-caddy
-          tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=sha,prefix=,format=short
-            type=semver,pattern={{version}}
-            type=raw,value=stable,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: docker/Dockerfile.caddy
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-
   merge:
-    needs: build
+    needs: [runner-image, control-image]
     runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: read
       packages: write
+    strategy:
+      matrix:
+        include:
+          - image: noite
+            artifact: runner-digest
+          - image: noite-control
+            artifact: control-digest
     steps:
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -215,13 +195,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: digest-*
+          pattern: ${{ matrix.artifact }}-*
           path: /tmp/digests
           merge-multiple: true
       - id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/noite
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,prefix=,format=short
@@ -237,4 +217,4 @@ jobs:
           docker buildx imagetools create $tags $digests
         env:
           DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
-          IMAGE: ghcr.io/${{ github.repository_owner }}/noite
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}

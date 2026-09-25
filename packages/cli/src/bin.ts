@@ -1,4 +1,6 @@
-import { BunRuntime } from "@effect/platform-bun";
+#!/usr/bin/env bun
+import { BunRuntime, BunServices } from "@effect/platform-bun";
+import { Effect } from "effect";
 import { Command } from "effect/unstable/cli";
 
 import { deploy } from "./deploy.js";
@@ -13,4 +15,10 @@ const root = Command.make("noite").pipe(
   Command.withSubcommands([deploy])
 );
 
-BunRuntime.runMain(Command.run(root, { version: VERSION }));
+BunRuntime.runMain(
+  // Command.run needs the platform Environment (Stdio, Terminal, FileSystem,
+  // Path, ChildProcessSpawner) — BunRuntime.runMain does not provide it.
+  Command.run(root, { version: VERSION }).pipe(
+    Effect.provide(BunServices.layer)
+  )
+);

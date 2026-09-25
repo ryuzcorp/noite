@@ -1,0 +1,10 @@
+# Static-asset response headers (celld reads this file with the deployment).
+#
+# celld serves an asset with `Cache-Control: public, max-age=0,
+# must-revalidate` and no `Last-Modified`, so a browser revalidates every file
+# on every load. The docs' remedy is a `_headers` rule that gives a
+# content-hashed file a long cache: Vite emits every chunk and stylesheet as
+# `/assets/<name>-<hash>.<ext>`, so the name changes whenever the bytes do and
+# the file can be cached forever.
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable

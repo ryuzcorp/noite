@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 /// <reference types="bun" />
 
-import type { D1Database, R2Bucket } from "@cloudflare/workers-types";
+import type { D1Database } from "@cloudflare/workers-types";
 
 /** Worker `env` bag (preset: worker) — strings plus the D1 binding.
  * Declared global: this file has imports (making it a module), so a plain
@@ -9,13 +9,12 @@ import type { D1Database, R2Bucket } from "@cloudflare/workers-types";
 declare global {
   interface KitEnv {
     DB?: D1Database;
-    /** R2 relay for the runner sidecar keyspace (B1 sidecar design). */
-    RUNNER_SNAP?: R2Bucket;
-    /** Runner container DO (Phase 2, behind RUNNER_TARGET=container). */
-    RUNNER?: DurableObjectNamespace;
-    /** compose (default) routes to RUNNER_URL; container uses the DO. */
-    RUNNER_TARGET?: string;
     NOITE_EMAIL_WEBHOOK_URL?: string;
+    /** Platform requests per minute per client per route class on the public
+     * routes (`/api/auth/*`, `/api/invite/status`); `0` disables it. */
+    NOITE_RATE_LIMIT_RPM?: string;
+    /** Better-auth's own per-client budget per minute (`/api/auth/*`). */
+    NOITE_AUTH_RATE_LIMIT?: string;
     /** @deprecated use RUNNER_TOKEN */
     AGENT_TOKEN?: string;
     /** @deprecated use RUNNER_URL */

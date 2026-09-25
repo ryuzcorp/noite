@@ -19,15 +19,40 @@ pub fn new_procs() -> ProcMap {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// Stop one tenant fleet. The docs are explicit about how a node stops:
+/// "celld shuts a node down gracefully on SIGTERM or SIGINT, the signals that
+/// `systemctl stop`, `docker stop`, and a Kubernetes pod delete send" — it
+/// cancels in-flight work, proves durability, publishes its snapshot, releases
+/// its leases and seals the node log. SIGKILL skips all of that, which is what
+/// the old `child.kill()` did, and a hard stop is also how a purge leaves
+/// half-written leases/LTX behind in the prefix it is about to delete. So:
+/// SIGTERM, wait for the seal, and SIGKILL only as a bounded fallback.
 pub async fn stop_fleet(procs: &ProcMap, slug: &str) {
     let mut map = procs.lock().await;
-    if let Some(mut child) = map.remove(slug) {
+    let Some(mut child) = map.remove(slug) else {
+        return;
+    };
+    if let Some(pid) = child.id() {
+        // No signal crate and no `/bin/kill` in this image (the `kill` that
+        // exists is the shell builtin), so send the documented signal through
+        // a shell. `pid` comes from the OS, never from input.
+        let _ = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("kill -TERM {}", pid))
+            .status()
+            .await;
+    }
+    if tokio::time::timeout(Duration::from_secs(15), child.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(slug, "celld did not stop within 15s; killing");
         let _ = child.kill().await;
         // Wait so the node cannot rewrite leases / LTX into a prefix we are
         // about to wipe (partial S3 clears leave RestoreFailed cells).
         let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-        tracing::info!(slug, "stopped celld");
     }
+    tracing::info!(slug, "stopped celld");
 }
 
 pub async fn ensure_fleet(
@@ -100,13 +125,24 @@ pub async fn ensure_fleet(
     .env("S3_ENDPOINT", &cfg.s3_endpoint)
     .env("CELLD_WATCH", &state_dir)
     .env("CELLD_DURABILITY", "bucket")
+    // Bounds. Read the docs' knobs rather than letting every fleet assume it
+    // owns the whole host: the memory ceiling makes celld shed cells (503 +
+    // Retry-After) instead of the container OOM-ing every other tenant, and
+    // idle eviction returns memory when an app goes quiet.
+    // celld's own logs are what an app owner reads when a deploy serves but
+    // misbehaves; the inherited runner filter would suppress them.
+    .env("RUST_LOG", &cfg.fleet_log)
+    .env("CELLD_MAX_RSS_MB", cfg.fleet_max_rss_mb.to_string())
+    .env("CELLD_IDLE_EVICT_S", cfg.fleet_idle_evict_s.to_string())
     .env("CELLD_DEPLOY_POLL_S", "5")
     .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
     // Fleet telemetry -> Parquet in the fleet bucket (celld OTel, bucket
-    // sink). 2 s flush + 10 s runner aggregation = ~near-real-time request
-    // counts; retention matches the runner's app_metric prune.
+    // sink), the documented query path for request counts. The flush is the
+    // docs' near-live value and the runner compacted the previous hour
+    // (`metrics::compact_fleet`) — a short flush without that job makes DuckDB
+    // read thousands of tiny files. Retention matches the app_metric prune.
     .env("CELLD_OTEL", "1")
-    .env("CELLD_OTEL_FLUSH_MS", "2000")
+    .env("CELLD_OTEL_FLUSH_MS", crate::host::metrics::OTEL_FLUSH_MS.to_string())
     .env("CELLD_OTEL_RETENTION", "14d");
     // Tenant env (`.dev.vars` model): UI-set vars reach the fleet here.
     // Reserved platform names are already filtered by db::tenant_env.

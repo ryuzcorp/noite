@@ -9,11 +9,13 @@ import {
   ActionError,
   authFromEnv,
   failAction,
+  failUnknown,
   MissingAuthSecretError,
+  resolveAdminEmail,
   UnauthorizedError,
 } from "./auth";
 import { ensureDbPromise, withDb } from "./db";
-import { failUnknown } from "./ops.server";
+import { listInvites, mintInvites, revokeInvite } from "./invites.server";
 import { runnerListApps } from "./runner";
 import type { RunnerApp } from "./runner";
 
@@ -34,17 +36,6 @@ const AuthError = Schema.Union([
   MissingAuthSecretError,
   ActionError,
 ]);
-
-/** Env-anchored bootstrap address (lowercased); null = no bootstrap. */
-const adminEmail = (): string | null => {
-  const env = useEnv<KitEnv>() ?? process.env;
-  const raw = env.NOITE_ADMIN_EMAIL ?? process.env.NOITE_ADMIN_EMAIL;
-  if (raw === undefined) {
-    return null;
-  }
-  const email = raw.trim().toLowerCase();
-  return email || null;
-};
 
 /** Promote the env-anchored address to `admin` (idempotent, no-op if unset
  * or the user does not exist yet — they register first via passkeys). */
@@ -113,7 +104,7 @@ const requireAdmin = async (): Promise<AdminSession | null> => {
     const roleField = (user as { role?: unknown }).role;
     const role = roleField === "admin" ? "admin" : "user";
     const email = user.email.trim().toLowerCase();
-    const anchored = adminEmail();
+    const anchored = resolveAdminEmail();
     if (anchored && email === anchored) {
       await withDb(ensureAdminAccount(anchored));
       return { email, id: user.id, isAdmin: true };
@@ -287,6 +278,68 @@ export const unbanUser = action(
     const { auth, headers } = await adminAuth();
     try {
       await auth.api.unbanUser({ body: { userId }, headers });
+    } catch (error) {
+      if (error instanceof UnauthorizedError || error instanceof ActionError) {
+        throw error;
+      }
+      failUnknown(error);
+    }
+  }),
+  { error: AuthError }
+);
+
+// ---- Invitations (admin-gated; see invites.server.ts for the code rules) ----
+
+const InviteCount = Schema.Struct({ count: Schema.Number });
+
+/** Every invitation code with both ends of the exchange. */
+export const adminListInvites = action(
+  async () => {
+    const admin = await requireAdmin();
+    if (!admin) {
+      failAction("Admin only");
+    }
+    try {
+      return await listInvites();
+    } catch (error) {
+      if (error instanceof UnauthorizedError || error instanceof ActionError) {
+        throw error;
+      }
+      failUnknown(error);
+    }
+  },
+  { error: AuthError }
+);
+
+/** Mint more codes for the admin to hand out. */
+export const adminCreateInvites = action(
+  checkedSchema(InviteCount, async ({ count }) => {
+    const admin = (await requireAdmin()) ?? failAction("Admin only");
+    if (!Number.isInteger(count) || count < 1 || count > 50) {
+      failAction("Ask for between 1 and 50 codes");
+    }
+    try {
+      return { codes: await mintInvites(admin.id, count, "admin") };
+    } catch (error) {
+      if (error instanceof UnauthorizedError || error instanceof ActionError) {
+        throw error;
+      }
+      failUnknown(error);
+    }
+  }),
+  { error: AuthError }
+);
+
+/** Revoke an unused code (a redeemed one is history and stays visible). */
+export const adminRevokeInvite = action(
+  checkedSchema(Schema.String, async (id: string) => {
+    const admin = await requireAdmin();
+    if (!admin) {
+      failAction("Admin only");
+    }
+    try {
+      await revokeInvite(id);
+      return { ok: true as const };
     } catch (error) {
       if (error instanceof UnauthorizedError || error instanceof ActionError) {
         throw error;

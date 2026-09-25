@@ -14,7 +14,6 @@ sqlx = { version = "0.8", features = [
   "sqlite",
   "chrono",
   "uuid",
-  "migrate",
 ] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }

@@ -197,7 +197,6 @@ async fn rename_slugged(
         &cfg.fleets_uri(new_slug),
     )
     .await?;
-    crate::host::persist::snapshot_best_effort(pool, cfg).await;
     // The loop may have respawned the old-slug fleet mid-move (it reads the
     // pre-update row); kill it and re-sweep both prefixes so late writes
     // land under the new slug instead of orphaning under the old one.

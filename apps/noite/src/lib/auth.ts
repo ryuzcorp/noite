@@ -11,7 +11,15 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { OxideRequest } from "oxidejs";
 
-import { ensureDbPromise, getAuthDb, missingDb, orm, resolveEnv } from "./db";
+import { ensureDbPromise, getAuthDb, missingDb, resolveEnv } from "./db";
+import {
+  checkInvite,
+  consumeInvite,
+  INVITES_PER_USER,
+  mintInvites,
+  signupPolicy,
+} from "./invites.server";
+import type { InviteProblem } from "./invites.server";
 
 // oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
 export class MissingAuthSecretError extends Schema.TaggedError<MissingAuthSecretError>()(
@@ -35,6 +43,14 @@ export const failAction = (message: string): never => {
   throw new ActionError({ message });
 };
 
+/** Map an unknown catch value into a mapped ActionError (client-visible).
+ * Use in action catch blocks instead of repeating the instanceof ternary. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site values are unknown by construction; this helper narrows to message
+export const failUnknown = (error: unknown): never => {
+  const message = error instanceof Error ? error.message : String(error);
+  throw new ActionError({ message });
+};
+
 // oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
 class InvalidRegistrationContextError extends Schema.TaggedError<InvalidRegistrationContextError>()(
   "InvalidRegistrationContextError",
@@ -43,6 +59,7 @@ class InvalidRegistrationContextError extends Schema.TaggedError<InvalidRegistra
 
 const RegistrationContext = Schema.Struct({
   email: Schema.String,
+  invite: Schema.optional(Schema.String),
   name: Schema.String,
 });
 
@@ -89,8 +106,26 @@ const parseRegistration = (context: string | null | undefined) =>
         })
       );
     }
-    return { email, name };
+    return { email, invite: decoded.invite?.trim() || undefined, name };
   });
+
+/** User-facing reason a code was refused. The panel shows this verbatim. */
+const inviteProblemMessage = (problem: InviteProblem): string => {
+  switch (problem) {
+    case "missing": {
+      return "This instance is invite-only. Enter an invitation code.";
+    }
+    case "unknown": {
+      return "That invitation code is not valid.";
+    }
+    case "revoked": {
+      return "That invitation code was revoked. Ask for a new one.";
+    }
+    default: {
+      return "That invitation code has already been used. Ask for a new one.";
+    }
+  }
+};
 
 const requireRegistration = (context: string | null | undefined) => {
   try {
@@ -164,11 +199,26 @@ const rpHostname = (baseURL: string): string => {
   }
 };
 
+/** Better-auth's per-client budget (`NOITE_AUTH_RATE_LIMIT`), sized for a UI
+ * that asks for the session on every navigation. */
+const publicAuthRpm = (): number => {
+  const raw = resolveEnv().NOITE_AUTH_RATE_LIMIT;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 600;
+};
+
 export const createAuth = (env: KitEnv, baseURL: string) =>
   betterAuth({
     advanced: {
       database: {
         validateSchema: false,
+      },
+      // Resolve the client address from the proxy's header first. Without this
+      // better-auth warns that it cannot determine a client IP and falls back
+      // to ONE shared bucket per path for every caller — which turns its rate
+      // limit into a fleet-wide outage under normal traffic.
+      ipAddress: {
+        ipAddressHeaders: ["x-forwarded-for", "cf-connecting-ip"],
       },
     },
     baseURL,
@@ -222,6 +272,18 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
                   "An account with this email already exists. Sign in instead.",
               });
             }
+            // Invite-only: the first account bootstraps the instance (it owns
+            // it, so it also becomes the admin), every later one needs a code.
+            const policy = await signupPolicy();
+            if (!policy.firstRun) {
+              const problem = await checkInvite(parsed.invite);
+              if (problem) {
+                throw APIError.from("FORBIDDEN", {
+                  code: "INVITE_REQUIRED",
+                  message: inviteProblemMessage(problem),
+                });
+              }
+            }
             const user = await ctx.context.internalAdapter.createUser(
               {
                 email: parsed.email,
@@ -230,6 +292,32 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
               },
               { method: "passkey" }
             );
+            if (!policy.firstRun && parsed.invite) {
+              const claimed = await consumeInvite(parsed.invite, user.id);
+              if (!claimed) {
+                // Lost the race for this code: drop the half-created account
+                // instead of leaving one that no invite covers. Best effort —
+                // the registration fails either way.
+                try {
+                  await ctx.context.internalAdapter.deleteUser(user.id);
+                } catch {
+                  // Nothing to do: the account is unusable without a passkey.
+                }
+                throw APIError.from("FORBIDDEN", {
+                  code: "INVITE_REQUIRED",
+                  message: inviteProblemMessage("used"),
+                });
+              }
+            }
+            if (policy.firstRun) {
+              // The bootstrap account owns the instance; the role persists even
+              // when NOITE_ADMIN_EMAIL is unset.
+              await ctx.context.internalAdapter.updateUser(user.id, {
+                role: "admin",
+              });
+            }
+            // Every account can invite its own share.
+            await mintInvites(user.id, INVITES_PER_USER);
             return { userId: user.id };
           },
           requireSession: false,
@@ -246,6 +334,17 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
         rpName: "Noite",
       }),
     ],
+    // Built-in auth rate limiting: every /api/auth call is counted per client
+    // IP, so passkey sign-in and the invite gate cannot be brute-forced. The
+    // budget has to clear a real UI's session polling (each navigation asks for
+    // the session, and the login page polls while the cookie settles) — 120/min
+    // tripped during an e2e run, which then blocked every later action. The
+    // platform limiter in http/routes.ts is the coarser backstop.
+    rateLimit: {
+      enabled: true,
+      max: publicAuthRpm(),
+      window: 60,
+    },
     secret: env.BETTER_AUTH_SECRET,
   });
 
@@ -333,21 +432,16 @@ export interface SessionUser {
 /** Instance-admin check by user id: `admin` role, or the env-anchored
  * bootstrap address. Used to let admins manage every app, not just ones
  * they collaborate on. */
-export const isUserAdminById = (userId: string) =>
-  Effect.gen(function* run() {
-    const user = yield* orm.user.findFirst({ where: { id: userId } });
-    if (!user) {
-      return false;
-    }
-    if (user.role === "admin") {
-      return true;
-    }
-    const anchored = resolveEnv().NOITE_ADMIN_EMAIL?.trim().toLowerCase();
-    if (!anchored) {
-      return false;
-    }
-    return user.email.trim().toLowerCase() === anchored;
-  });
+/** Instance-admin anchor from the environment (`NOITE_ADMIN_EMAIL`,
+ * lowercased). One definition for the access gate and the admin panel. */
+export const resolveAdminEmail = (): string | null => {
+  const raw = resolveEnv().NOITE_ADMIN_EMAIL;
+  if (raw === undefined) {
+    return null;
+  }
+  const email = raw.trim().toLowerCase();
+  return email || null;
+};
 
 export const requireUser = Effect.gen(function* () {
   const request = yield* OxideRequest;

@@ -20,14 +20,12 @@ export const hydrateControlEnv = (
       controlEnv[key] = value;
     }
   }
-  // Dev-process fallback only (vite dev has no compose env for the worker;
-  // `make dev` pins RUNNER_TARGET=compose in the overlay). Prod values
-  // always arrive via compose environment / wrangler vars / deploy env —
-  // never rely on these outside localhost dev.
+  // Dev-process fallback only (vite dev has no compose env for the worker).
+  // Prod values always arrive via compose environment / wrangler vars /
+  // deploy env — never rely on these outside localhost dev.
   const defaults = {
     AWS_REGION: "us-east-1",
     BASE_DOMAIN: "localhost",
-    RUNNER_TARGET: "compose",
     RUNNER_URL: "http://runner:8080",
     S3_ENDPOINT: "http://rustfs:9000",
     S3_PUBLIC_ENDPOINT: "http://127.0.0.1:9000",
