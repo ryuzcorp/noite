@@ -52,8 +52,8 @@ CE="$ENGINE compose -f docker/compose.yaml"
 img_ok() { "$ENGINE" image inspect "$1" >/dev/null 2>&1; }
 if [ -n "${NOITE_BACKUP_IMAGE:-}" ]; then
   HELPER="$NOITE_BACKUP_IMAGE"
-elif img_ok "${NOITE_RUNNER_IMAGE:-ghcr.io/ryuzcorp/noite:latest}"; then
-  HELPER="${NOITE_RUNNER_IMAGE:-ghcr.io/ryuzcorp/noite:latest}"
+elif img_ok "${NOITE_RUNNER_IMAGE:-ghcr.io/ryuzcorp/noite-runner:latest}"; then
+  HELPER="${NOITE_RUNNER_IMAGE:-ghcr.io/ryuzcorp/noite-runner:latest}"
 elif img_ok noite-runner:local; then
   HELPER=noite-runner:local
 elif img_ok docker.io/library/caddy:2.10.0-alpine; then

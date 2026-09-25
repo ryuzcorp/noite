@@ -64,7 +64,7 @@ up:
 # Pin with NOITE_RUNNER_IMAGE / NOITE_CONTROL_IMAGE at a SHA for
 # reproducibility (`:stable` once the first v* tag exists).
 up-prod:
-	NOITE_RUNNER_IMAGE=$${NOITE_RUNNER_IMAGE:-ghcr.io/ryuzcorp/noite:latest} NOITE_CONTROL_IMAGE=$${NOITE_CONTROL_IMAGE:-ghcr.io/ryuzcorp/noite-control:latest} $(COMPOSE) up -d --pull always --force-recreate rustfs runner control caddy
+	NOITE_RUNNER_IMAGE=$${NOITE_RUNNER_IMAGE:-ghcr.io/ryuzcorp/noite-runner:latest} NOITE_CONTROL_IMAGE=$${NOITE_CONTROL_IMAGE:-ghcr.io/ryuzcorp/noite-control:latest} $(COMPOSE) up -d --pull always --force-recreate rustfs runner control caddy
 
 # Pre-release check (manual — no CI e2e): boot the stack, doctor, deploy the
 # sample app, Playwright. TAG=<short-sha> pins the release images.

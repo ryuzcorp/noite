@@ -16,7 +16,7 @@ make backup  # tar every data volume into backups/<UTC stamp>/
 
 Restore is destructive and replays a backup directory over the live volumes: `make restore FROM=backups/<stamp>`.
 
-`make up-prod` pulls the release images instead of building. On a host without a clone, set `NOITE_RUNNER_IMAGE=ghcr.io/<owner>/noite:latest` and `NOITE_CONTROL_IMAGE=ghcr.io/<owner>/noite-control:latest`, then `docker compose -f docker/compose.yaml up -d` (never `--build`) — same file, env-driven.
+`make up-prod` pulls the release images instead of building. On a host without a clone, set `NOITE_RUNNER_IMAGE=ghcr.io/<owner>/noite-runner:latest` and `NOITE_CONTROL_IMAGE=ghcr.io/<owner>/noite-control:latest`, then `docker compose -f docker/compose.yaml up -d` (never `--build`) — same file, env-driven.
 
 | Path |  |
 | --- | --- |
@@ -82,7 +82,7 @@ portless alias test.noite 9080 # → https://test.noite.local (hosts + mDNS)
 
 ## Deploy to Coolify
 
-Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `main`) — the same universal file as `make up`, driven by env. In Environment Variables, set `BASE_DOMAIN` to your domain (defaults to `localhost`); `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` derive from it unless overridden. Set the four secrets (`BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`) and optionally `NOITE_RUNNER_IMAGE` / `NOITE_CONTROL_IMAGE` (`ghcr.io/<owner>/noite:latest` and `ghcr.io/<owner>/noite-control:latest`; pin a SHA for reproducibility) to pull release images instead of building. Nothing generates secrets here; dev-default secrets are refused on real domains. Coolify auto-provisions a generated domain for the `caddy` service (boot check via `SERVICE_URL_CADDY_80`), then paste the real hostnames once on that service's Domains field (Coolify can't take custom hostnames from Compose): `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. Behind a terminating proxy set `CADDY_AUTO_HTTPS=off`; our Caddy still mints per-host certs on demand. The apex stays on your marketing site.
+Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `main`) — the same universal file as `make up`, driven by env. In Environment Variables, set `BASE_DOMAIN` to your domain (defaults to `localhost`); `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` derive from it unless overridden. Set the four secrets (`BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`) and optionally `NOITE_RUNNER_IMAGE` / `NOITE_CONTROL_IMAGE` (`ghcr.io/<owner>/noite-runner:latest` and `ghcr.io/<owner>/noite-control:latest`; pin a SHA for reproducibility) to pull release images instead of building. Nothing generates secrets here; dev-default secrets are refused on real domains. Coolify auto-provisions a generated domain for the `caddy` service (boot check via `SERVICE_URL_CADDY_80`), then paste the real hostnames once on that service's Domains field (Coolify can't take custom hostnames from Compose): `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. Behind a terminating proxy set `CADDY_AUTO_HTTPS=off`; our Caddy still mints per-host certs on demand. The apex stays on your marketing site.
 
 Runtime changes round-trip through the images (`NOITE_RUNNER_IMAGE` / `NOITE_CONTROL_IMAGE`); `docker compose up` stops a service before starting its replacement, so batch control-plane changes and deploy off-peak.
 

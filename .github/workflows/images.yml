@@ -1,4 +1,4 @@
-# Release images for ghcr.io: the runner (ghcr.io/<owner>/noite) and the
+# Release images for ghcr.io: the runner (ghcr.io/<owner>/noite-runner) and the
 # control-UI celld node (ghcr.io/<owner>/noite-control). Both are built from
 # plain Dockerfiles with buildx — one platform per native runner, pushed by
 # digest, then merged into a multi-arch manifest list.
@@ -88,7 +88,7 @@ jobs:
           context: .
           file: Dockerfile.runner-container
           platforms: ${{ matrix.platform }}
-          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/noite,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/noite-runner,push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=runner-${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=runner-${{ matrix.platform }}
       - run: |
@@ -182,7 +182,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - image: noite
+          - image: noite-runner
             artifact: runner-digest
           - image: noite-control
             artifact: control-digest

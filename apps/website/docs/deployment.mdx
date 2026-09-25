@@ -113,7 +113,7 @@ Rate limiting is built in, in two layers. Better-auth budgets per client for `/a
 On a host without the repo, skip the build entirely: set the two image variables on the same compose file.
 
 ```bash
-NOITE_RUNNER_IMAGE=ghcr.io/<owner>/noite:latest \
+NOITE_RUNNER_IMAGE=ghcr.io/<owner>/noite-runner:latest \
 NOITE_CONTROL_IMAGE=ghcr.io/<owner>/noite-control:latest \
 docker compose -f docker/compose.yaml up -d
 ```
@@ -132,7 +132,7 @@ To read the same data yourself, point DuckDB at the fleet bucket the way the run
 
 ## Coolify
 
-Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `main`) — the same universal file as `make up`, driven by env. In Environment Variables, set `BASE_DOMAIN` to your domain (defaults to `localhost`); `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` derive from it unless overridden. Set the four secrets — `BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY` — and optionally the two image variables (`NOITE_RUNNER_IMAGE=ghcr.io/<owner>/noite:latest`, `NOITE_CONTROL_IMAGE=ghcr.io/<owner>/noite-control:latest`; pin a SHA for reproducibility). Nothing auto-generates secrets; dev defaults are refused on real domains. Deploy, then paste the real hostnames once on the `caddy` service Domains field: `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. The apex stays on your marketing site. Behind a terminating proxy set `CADDY_AUTO_HTTPS=off` (our Caddy still mints per-host certs on demand there).
+Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `main`) — the same universal file as `make up`, driven by env. In Environment Variables, set `BASE_DOMAIN` to your domain (defaults to `localhost`); `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` derive from it unless overridden. Set the four secrets — `BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY` — and optionally the two image variables (`NOITE_RUNNER_IMAGE=ghcr.io/<owner>/noite-runner:latest`, `NOITE_CONTROL_IMAGE=ghcr.io/<owner>/noite-control:latest`; pin a SHA for reproducibility). Nothing auto-generates secrets; dev defaults are refused on real domains. Deploy, then paste the real hostnames once on the `caddy` service Domains field: `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. The apex stays on your marketing site. Behind a terminating proxy set `CADDY_AUTO_HTTPS=off` (our Caddy still mints per-host certs on demand there).
 
 ### Downtime model
 

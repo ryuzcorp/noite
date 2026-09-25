@@ -21,7 +21,7 @@ cd "$(dirname "$0")/.."
 
 TAG="${TAG:-}"
 if [ -n "$TAG" ]; then
-  export NOITE_RUNNER_IMAGE="ghcr.io/ryuzcorp/noite:${TAG}"
+  export NOITE_RUNNER_IMAGE="ghcr.io/ryuzcorp/noite-runner:${TAG}"
   export NOITE_CONTROL_IMAGE="ghcr.io/ryuzcorp/noite-control:${TAG}"
   PULL_FLAG="--pull always"
 else
