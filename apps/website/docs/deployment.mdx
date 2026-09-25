@@ -156,6 +156,33 @@ tcp:
 
 Then redeploy once and confirm the `noite-tenants` router in the Traefik dashboard. The first visit to a new slug pauses a few seconds for certificate issuance; certs persist in the `caddy-data` volume. If passthrough misbehaves, the fallback is `https://<slug>.<domain>:80` per app (exact hostnames use the plain HTTP challenge).
 
+## Railway
+
+Railway attaches a volume per _service_ and terminates TLS at its own edge, which folds the four compose services into three: the runner and Caddy ship in one container (`docker/Dockerfile.edge`, published as `ghcr.io/<owner>/noite-edge`). They have to — Caddy reads the Caddyfile the runner writes, and tenant fleet ports (`127.0.0.1:8100+`) sit on Caddy's loopback.
+
+| Service | Image | Volume | Public domain |
+| --- | --- | --- | --- |
+| `edge` | `ghcr.io/<owner>/noite-edge:<tag>`, or this repo with `RAILWAY_DOCKERFILE_PATH=docker/Dockerfile.edge` | `/data` | `*.<domain>` → port `80` |
+| `control` | `ghcr.io/<owner>/noite-control:<tag>` | `/data` | none (the edge fronts it) |
+| `rustfs` | `rustfs/rustfs:1.0.0-rc.6` | `/data` | `<host>` → port `9000` (`S3_PUBLIC_ENDPOINT`) |
+
+`edge` and `control` both take the S3 credentials and bucket, `RUNNER_TOKEN`, `BASE_DOMAIN`, `CONTROL_SUBDOMAIN=app`, `CONTROL_EXTRA_HOSTS=app.<domain>` and `GIT_PUBLIC_BASE=https://git.<domain>`. `edge` additionally takes `RUNNER_BIND=0.0.0.0:8080`, `S3_ENDPOINT=http://rustfs.railway.internal:9000`, `CADDY_AUTO_HTTPS=off`, `CADDY_CONTROL_UPSTREAM=control.railway.internal:8090`, `CADDY_API_UPSTREAM=127.0.0.1:8080`, `CADDY_UPSTREAM_HOST=127.0.0.1`, `RUNNER_WORK_DIR=/data/runner` and `NOITE_DB=/data/noite.sqlite`. `control` takes `S3_ENDPOINT`, `S3_PUBLIC_ENDPOINT=https://<rustfs host>`, `RUNNER_URL=https://api.<domain>`, `BETTER_AUTH_URL=https://app.<domain>` (set before the first registration — passkeys bind to that origin), `CELLD_TRUST_FORWARDED_HEADERS=1` and `CELLD_WATCH=/data/control`.
+
+Two constraints only bite on this host:
+
+1. **The worker is a celld cell, and cells cannot resolve `*.railway.internal`.** Caddy, celld and the runner are ordinary processes and use the private network happily — so `CADDY_CONTROL_UPSTREAM` and the runner's `UI_URL` stay internal — but the worker's own outbound call to the runner never completes, and its client has no timeout, so the UI hangs instead of erroring. Give the worker the runner's public host (`RUNNER_URL=https://api.<domain>`, bearer-gated).
+2. **Caddy's access-log sink is fixed by the generator** (`output file /etc/caddy/access.log` in `apps/runner/src/host/caddy.rs`) while the tailer follows `CADDY_ACCESS_LOG`. One container means one filesystem, so both paths live under `/etc/caddy/` there. Move the Caddyfile elsewhere without the log and every analytics panel goes empty with no error anywhere; `docker/check-versions.ts` asserts the pair.
+
+One wildcard domain is the whole DNS story: add the `*` CNAME, the `_acme-challenge` CNAME and the ownership TXT the dashboard returns for `*.<domain>` on the `edge` service. That covers `app.`, `git.`, `api.` and every `{slug}.` host, because the Caddyfile dispatches by Host. Without a domain the platform still runs on the Railway host (`CONTROL_EXTRA_HOSTS` keeps it served), but `git.`, `api.` and tenant hosts need a zone you control.
+
+```bash
+curl -s https://api.<domain>/health                                # edge -> runner
+curl -s https://api.<domain>/v1/apps -H "Authorization: Bearer $RUNNER_TOKEN"
+curl -s https://app.<domain>/api/auth/ok                           # control worker
+```
+
+`make doctor` and `make backup` read `.env` and drive `docker compose`, so neither applies here. A service redeploys as a single container — no rolling replacement — so the edge 5xxs briefly while its volume is released and re-attached; batch control-plane changes. The volumes are the state: `edge`'s holds the runner's SQLite and git mirrors (the only copy of deploy metadata), `rustfs`'s holds the bucket (git tips, tenant celld and the control D1). Railway exposes only a volume's name and mount path over its API, so there is nothing to wire — use Railway's volume backups, or point any S3 client at `S3_PUBLIC_ENDPOINT` and copy the bucket.
+
 ## Data & backups
 
 State lives in named volumes; images are disposable, volumes are not.

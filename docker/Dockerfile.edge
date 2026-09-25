@@ -27,9 +27,16 @@ RUN set -eux; \
 COPY docker/edge-entrypoint.sh /usr/local/bin/edge-entrypoint.sh
 RUN chmod +x /usr/local/bin/edge-entrypoint.sh
 
-# The runner writes the Caddyfile here and caddy `--watch` reloads it; same
-# path docker/compose.yaml wires through the caddy-config volume.
-ENV CADDYFILE_PATH=/caddy/Caddyfile \
-    CADDY_ACCESS_LOG=/caddy/access.log
+# The runner writes the Caddyfile here and caddy `--watch` reloads it. Both
+# paths must be the ones the runner actually reads. The Caddyfile comes from
+# CADDYFILE_PATH, but the access log is hardcoded by the generator
+# (`output file /etc/caddy/access.log` in apps/runner/src/host/caddy.rs) —
+# compose gets away with CADDY_ACCESS_LOG=/caddy because caddy-config is
+# mounted at /etc/caddy in caddy and /caddy in the runner, while here the
+# writer and the reader share one filesystem, so a mismatch is silent: caddy
+# writes a file nobody tails and every analytics panel stays empty.
+# docker/check-versions.ts asserts this default against the generator.
+ENV CADDYFILE_PATH=/etc/caddy/Caddyfile \
+    CADDY_ACCESS_LOG=/etc/caddy/access.log
 
 ENTRYPOINT ["/usr/local/bin/edge-entrypoint.sh"]

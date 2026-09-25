@@ -1,7 +1,11 @@
-# Release images for ghcr.io: the runner (ghcr.io/<owner>/noite-runner) and the
-# control-UI celld node (ghcr.io/<owner>/noite-control). Both are built from
-# plain Dockerfiles with buildx — one platform per native runner, pushed by
-# digest, then merged into a multi-arch manifest list.
+# Release images for ghcr.io: the runner (ghcr.io/<owner>/noite-runner), the
+# control-UI celld node (ghcr.io/<owner>/noite-control) and the single-container
+# edge (ghcr.io/<owner>/noite-edge — runner + Caddy, for hosts that attach a
+# volume per service, e.g. Railway). All are built from plain Dockerfiles with
+# buildx — one platform per native runner, pushed by digest, then merged into a
+# multi-arch manifest list. The edge image is built FROM the runner image of
+# this same commit, pinned by digest, so an edge tag can never bundle a
+# different runner than its sibling tags.
 #
 # Compose installs never build in prod-like setups: they pull these tags
 # (NOITE_RUNNER_IMAGE / NOITE_CONTROL_IMAGE) and `docker compose up -d`.
@@ -21,7 +25,9 @@ on:
       - "apps/noite/**"
       - "docker/Dockerfile.runner*"
       - "docker/Dockerfile.ui*"
+      - "docker/Dockerfile.edge*"
       - "docker/noite-entrypoint.sh"
+      - "docker/edge-entrypoint.sh"
       - "docker/install-sidecars.sh"
       - "docker/compose.yaml"
       - "docker/compose.byob.yaml"
@@ -160,6 +166,63 @@ jobs:
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
+  # The edge image adds the Caddy release tarball on top of the runner image, so
+  # it has no app build of its own — but it must be built FROM *this* commit's
+  # runner, hence the digest pin downloaded from the runner-image job above.
+  edge-image:
+    needs: [check, runner-image]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runs-on: ubuntu-latest
+          - platform: linux/arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    permissions:
+      actions: write
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: runner image of this commit, this arch
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: runner-digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/runner-digest
+      - id: runner
+        run: |
+          echo "ref=ghcr.io/${{ github.repository_owner }}/noite-runner@$(cat /tmp/runner-digest/*)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile.edge
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            RUNNER_IMAGE=${{ steps.runner.outputs.ref }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/noite-edge,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=edge-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=edge-${{ matrix.platform }}
+      - run: |
+          mkdir -p /tmp/digests
+          echo -n "$DIGEST" > "/tmp/digests/$SUFFIX"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          SUFFIX: ${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: edge-digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
 
   rust:
     runs-on: ubuntu-latest
@@ -183,7 +246,7 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
   merge:
-    needs: [runner-image, control-image]
+    needs: [runner-image, control-image, edge-image]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -196,6 +259,8 @@ jobs:
             artifact: runner-digest
           - image: noite-control
             artifact: control-digest
+          - image: noite-edge
+            artifact: edge-digest
     steps:
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
