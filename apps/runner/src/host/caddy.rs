@@ -3,6 +3,28 @@ use std::path::Path;
 use crate::config::Config;
 use crate::models::{App, AppDomain};
 
+/// Pin `http://` on every address of a site line.
+///
+/// Caddy applies an address line's scheme to the **first** address only, so
+/// `http://a, b` binds `b` on `:443` — the same address the site's own
+/// bare-hosts block claims — and the whole file is rejected with
+/// `Error: ambiguous site definition: b`. Caddy then keeps serving whatever it
+/// loaded last (the bootstrap config), which reads as a blank edge. The
+/// plaintext twin of a tls-gated site therefore needs the scheme per host.
+fn plaintext_hosts(addr: &str) -> String {
+    addr.split(',')
+        .map(str::trim)
+        .map(|host| {
+            if host.starts_with("http://") || host.starts_with("https://") {
+                host.to_string()
+            } else {
+                format!("http://{host}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub async fn rewrite_caddy(
     cfg: &Config,
     apps: &[App],
@@ -45,10 +67,13 @@ pub async fn rewrite_caddy(
     } else {
         format!("{}.{}", cfg.control_subdomain, cfg.base_domain)
     }];
-    // Extra control hostnames (e.g. Coolify's generated domain, `dev-host`
+    // Extra control hostnames (e.g. Coolify's assigned domain, `dev-host`
     // LAN IP) share the control site so the route serves the UI, not the
-    // unknown-host fallback.
+    // unknown-host fallback. Consecutive duplicates are dropped: an install
+    // that sets the extra host to the control host itself (Coolify's domain on
+    // the bare domain) would otherwise emit `lab.example.com, lab.example.com`.
     control_hosts.extend(cfg.control_extra_hosts.iter().cloned());
+    control_hosts.dedup();
     let control_site = control_hosts
         .iter()
         .map(|h| addr_of(h))
@@ -118,13 +143,19 @@ pub async fn rewrite_caddy(
                          proxy_extra: &[&str],
                          upstream: &str| {
         if tls && !addr.starts_with("http://") {
-            push_block(&format!("http://{addr}"), false, site_extra, proxy_extra, upstream);
+            push_block(
+                &plaintext_hosts(addr),
+                false,
+                site_extra,
+                proxy_extra,
+                upstream,
+            );
         }
         push_block(addr, tls, site_extra, proxy_extra, upstream);
     };
     push_site(
-        // Already per-host scheme-mapped above — mapping the joined string
-        // again would double-prefix the first host (`http://http://…`).
+        // Per-host scheme mapping is handled inside `push_site`, so the joined
+        // control list needs no special casing here.
         &control_site,
         edge_tls,
         &[],
@@ -376,6 +407,53 @@ mod tests {
         assert!(out.contains("tls-ask"), "ask endpoint");
         assert!(out.contains("http://127.0.0.1 {"), "loopback health site");
         assert!(!out.contains("header_up Host"), "no redundant Host");
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
+    #[test]
+    fn plaintext_twin_pins_the_scheme_per_host() {
+        assert_eq!(plaintext_hosts("app.noite.now"), "http://app.noite.now");
+        assert_eq!(
+            plaintext_hosts("app.noite.now, lab.netbird.cloud"),
+            "http://app.noite.now, http://lab.netbird.cloud"
+        );
+        // Already-mapped input is left alone (that branch skips the twin).
+        assert_eq!(
+            plaintext_hosts("http://a.example.com, http://b.example.com"),
+            "http://a.example.com, http://b.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn behind_proxy_extra_control_host_keeps_a_valid_twin() {
+        // A Coolify install sets CONTROL_EXTRA_HOSTS to the domain Coolify
+        // gave the caddy service, and that host is also a tenant base — so the
+        // control site becomes a joined list. Prefixing that list once put
+        // every host after the first on :443, where the same site's bare hosts
+        // live, and Caddy rejected the whole file:
+        //   Error: ambiguous site definition: lab.netbird.cloud
+        // It then kept serving the bootstrap config, so the edge answered the
+        // placeholder (or, for an unmatched Host, an empty 200) instead of the
+        // control UI.
+        let mut cfg = test_config("noite.now", "app", false, "/tmp/noite-test-extra");
+        cfg.control_extra_hosts = vec!["lab.netbird.cloud".into()];
+        let out = rendered(&cfg, &[test_app()]).await;
+        assert!(
+            out.contains("http://app.noite.now, http://lab.netbird.cloud {"),
+            "plaintext twin pins the scheme per control host:\n{out}"
+        );
+        assert!(
+            !out.contains("http://app.noite.now, lab.netbird.cloud {"),
+            "a joined list must never carry a single scheme"
+        );
+        assert!(
+            out.contains("app.noite.now, lab.netbird.cloud {"),
+            "the tls-gated site still lists both hosts"
+        );
+        assert!(
+            out.contains("http://*.lab.netbird.cloud {"),
+            "the extra host keeps its tenant wildcard twin"
+        );
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
     }
 
