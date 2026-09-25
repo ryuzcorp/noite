@@ -30,6 +30,7 @@ RUN bun run build \
 # marker. jq: runtime vars patch. esbuild: `celld deploy` shells out to it for
 # worker projects (shared installer, no second pin).
 FROM ghcr.io/denoland/celld:${CELLD_VERSION}
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 COPY docker/install-sidecars.sh /tmp/install-sidecars.sh
 RUN apt-get update \
   && apt-get install -y --no-install-recommends awscli ca-certificates curl jq unzip \
@@ -38,6 +39,9 @@ RUN apt-get update \
   && rm /tmp/install-sidecars.sh
 COPY --from=ui /app/dist /ui/dist
 COPY docker/noite-entrypoint.sh /usr/local/bin/noite-entrypoint.sh
+# Apache-2.0 §4(a): a distributed image carries a copy of the License, so
+# pulling the image is enough to know its terms.
+COPY LICENSE /licenses/
 WORKDIR /data
 # Worker listener (:8090 public, :8091 internal) + CELD_WATCH state dir.
 EXPOSE 8090

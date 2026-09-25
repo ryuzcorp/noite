@@ -191,6 +191,23 @@ Decision: the container-cell topology is retired. Noite installs as a plain four
 
 Consequences for operators: `cp .env.example .env && make up` builds and starts, `make up-prod` (or setting `NOITE_RUNNER_IMAGE` / `NOITE_CONTROL_IMAGE`) pulls the release images instead, and an image-only host runs `docker compose -f docker/compose.yaml up -d` with no clone. A runner-image change still restarts the control plane together with all tenant fleets (they cold-boot), so batch control-plane changes and pin the image variables by SHA. A fresh install serves nothing until the control container's first-boot deploy finishes (seconds) — `make doctor` gates on the UI actually serving HTML.
 
+## Railway install (2026-09-25)
+
+Railway runs no Compose files (each `docker/compose.yaml` service maps to a Railway service) and **volumes attach per service**, so the single structural change is the edge.
+
+- **Edge = runner + Caddy in ONE service** — `docker/Dockerfile.edge` (runner pulled from the release image + caddy `2.10.0`) and `docker/edge-entrypoint.sh`. Because a Railway volume cannot be shared between services, the reader (Caddy) and the writer (runner) of the `caddy-config` volume share a filesystem by sharing a container; tenant fleet ports are then `127.0.0.1:8100+` on Caddy's own loopback. Verified locally against an isolated rustfs + `control`: Caddyfile adapts clean, `app.<domain>` → control UI, `api.`/`git.` → runner, `{slug}.<domain>` → a listener on the fleet port, wildcard fallback page, `/ready` on the healthcheck port, access log at the path the runner tails.
+- **`rustfs` and `control` stay ordinary services.** rustfs = image `docker.io/rustfs/rustfs:1.0.0-rc.6` + `/data` volume (no healthcheck — its root answers 403); `control` = `docker/Dockerfile.ui` + `/data` volume, healthcheck `/.well-known/celld/health`. No `depends_on` exists on Railway, which the images already tolerate (the control entrypoint waits ~2 min for S3 and creates the bucket; the runner ensures it too).
+- **Railway terminates TLS.** The `*.<domain>` custom domain (CNAME + `_acme-challenge` CNAME + ownership TXT) gets the wildcard cert, and hosts route by Host to the edge service's target port. So `CADDY_AUTO_HTTPS=off` and Caddy serves plaintext `:80`; its `:443` sites are inert. One wildcard custom domain covers `app.`, `api.`, `git.` and every slug.
+- **Env deltas vs compose:** `PORT=8080` on the edge + `PORT=8090` on control — Railway injects `PORT` and uses _that_ port for healthchecks while both images listen on fixed ports, and the edge's **domain target port must be 80** (caddy), not `PORT`; `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30` (default 0) for the fleet stop budget; `RAILWAY_HEALTHCHECK_TIMEOUT_SEC=600` (control's node holds its first healthy response for ~3 min); `CADDY_UPSTREAM_HOST`/`CADDY_API_UPSTREAM` = `127.0.0.1` (same container), `CADDY_CONTROL_UPSTREAM=control.railway.internal:8090`, `S3_ENDPOINT=http://rustfs.railway.internal:9000`; **`CADDY_ACCESS_LOG=/etc/caddy/access.log`** in the joint container (Caddy's Caddyfile hardcodes that path; compose only matches it because both services mount the same volume).
+
+## Known issue (open) — `CONTROL_EXTRA_HOSTS` makes the Caddyfile unadaptable behind a terminating proxy
+
+With `BASE_DOMAIN != localhost` and `CADDY_AUTO_HTTPS=off` (the Coolify/Railway branch), a non-empty `CONTROL_EXTRA_HOSTS` makes Caddy reject the entire generated config — `Error: ambiguous site definition: <extra host>` — so Caddy keeps serving its bootstrap/stale config and every host gets the placeholder page.
+
+Cause: in that branch `caddy.rs` emits the plaintext twin via `format!("http://{addr}")` with `addr` = the **comma-joined** control-host list, and Caddy applies an address line's scheme to the _first_ address only. `http://app.example.com, healthcheck.railway.app` therefore binds the second host on `:443` — the exact address the bare twin already claims. The tenant-base loop already pins the scheme per host ("Scheme is pinned PER HOST"); the joined control list does not.
+
+Repro (verified with `caddy adapt`): `http://a.test, b.test { respond "x" }` + `a.test, b.test { respond "x" }` → `ambiguous site definition: b.test`; the single-host twin adapts clean. Workaround: leave `CONTROL_EXTRA_HOSTS` empty in that branch — on Railway point the healthcheck at the runner (`PORT=8080`, `/ready`) instead of the edge, since Railway's healthcheck Host is `healthcheck.railway.app`.
+
 ## celld alignment (2026-09-24)
 
 Audited against the official celld documentation (https://celld.dev/docs/) and aligned to it. Each bullet records a runtime change made in the same pass, with the docs' reasoning for it.
@@ -243,7 +260,7 @@ The runner's SQLite is one idempotent `schema.sql` applied on every boot. A new 
 
 ### CLI publish fix
 
-`packages/cli` is publishable now: no `private`, MIT license, `publishConfig.access=public`, `files: [dist, README.md]`, and a `prepack` that builds — so `bun publish` / `npm publish --access public` ship a working bin. A real bug was fixed in the same pass: an Effect service wiring mistake made the bin crash on **every** invocation.
+`packages/cli` is publishable now: no `private`, Apache-2.0 license, `publishConfig.access=public`, `files: [dist, README.md, LICENSE]`, and a `prepack` that builds — so `bun publish` / `npm publish --access public` ship a working bin. A real bug was fixed in the same pass: an Effect service wiring mistake made the bin crash on **every** invocation.
 
 ## Known issue (open) — celld control node stalls app-detail and `/god-mode` actions
 

@@ -2,6 +2,7 @@
 name = "noite-runner"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }

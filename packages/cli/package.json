@@ -15,7 +15,7 @@
   "bugs": {
     "url": "https://github.com/ryuzcorp/noite/issues"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ryuzcorp/noite.git",
@@ -26,7 +26,8 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "type": "module",
   "publishConfig": {

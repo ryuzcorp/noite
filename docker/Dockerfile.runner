@@ -28,6 +28,7 @@ RUN cargo build --release && strip target/release/noite-runner
 # scripts. celld binary for tenant fleets; esbuild for `celld deploy`; duckdb
 # CLI for telemetry aggregation over the fleet bucket's Parquet spans.
 FROM docker.io/oven/bun:1.3-debian
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 ARG TARGETARCH
 COPY docker/install-sidecars.sh /tmp/install-sidecars.sh
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -36,6 +37,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && sh /tmp/install-sidecars.sh && rm /tmp/install-sidecars.sh
 COPY --from=build /src/target/release/noite-runner /usr/local/bin/noite-runner
 COPY --from=celld /usr/local/bin/celld /usr/local/bin/celld
+# Apache-2.0 §4(a): a distributed image carries a copy of the License, so
+# pulling the image is enough to know its terms.
+COPY LICENSE /licenses/
 WORKDIR /data
 ENV RUNNER_BIND=0.0.0.0:8080 \
     PATH="/usr/local/bin:${PATH}" \

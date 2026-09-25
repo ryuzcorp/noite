@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+# Railway edge: the runner and Caddy in ONE container.
+#
+# Railway attaches a volume to a *service*, so the runner (which writes the
+# Caddyfile) and Caddy (which reads it) cannot share one the way
+# docker/compose.yaml's `caddy-config` volume does. Running them in the same
+# container keeps the writer and the reader on one filesystem — and puts the
+# tenant fleet ports (127.0.0.1:8100+) on caddy's loopback.
+#
+# Railway terminates TLS at its own edge (wildcard cert from the `*.DOMAIN`
+# custom domain), so caddy here serves plaintext :80: set CADDY_AUTO_HTTPS=off,
+# and the domain's target port to 80.
+#
+# The runner comes from the published release image (public ghcr package, no
+# registry credentials needed in the build). Pin a SHA for reproducibility.
+ARG RUNNER_IMAGE=ghcr.io/ryuzcorp/noite-runner:latest
+FROM ${RUNNER_IMAGE}
+
+# Caddy, matching docker/compose.yaml's pinned edge version.
+ARG CADDY_VERSION=2.10.0
+RUN set -eux; \
+  arch="$(dpkg --print-architecture)"; \
+  curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_${arch}.tar.gz" \
+    | tar -xz -C /usr/local/bin caddy; \
+  caddy version
+
+COPY docker/edge-entrypoint.sh /usr/local/bin/edge-entrypoint.sh
+RUN chmod +x /usr/local/bin/edge-entrypoint.sh
+
+# The runner writes the Caddyfile here and caddy `--watch` reloads it; same
+# path docker/compose.yaml wires through the caddy-config volume.
+ENV CADDYFILE_PATH=/caddy/Caddyfile \
+    CADDY_ACCESS_LOG=/caddy/access.log
+
+ENTRYPOINT ["/usr/local/bin/edge-entrypoint.sh"]

@@ -1,0 +1,5 @@
+# Per-Dockerfile ignore file: this image COPYs exactly one context path —
+# docker/edge-entrypoint.sh — and pulls the runner from the release image.
+*
+!docker/
+!docker/edge-entrypoint.sh
