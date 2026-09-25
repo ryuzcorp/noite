@@ -107,6 +107,18 @@ const runnerToken = () => {
   return token;
 };
 
+/** Bound every runner call: a hung upstream must fail with the path in the
+ * message, never hang into the platform request deadline. Healthy calls
+ * measure ~70ms through the public edge (a Railway worker cell cannot resolve
+ * `*.railway.internal`, so that hop is the internet), so 5s leaves room for
+ * the slow queries (metrics/spans read Parquet) while still failing well
+ * before a browser gives up — a 10s bound surfaced as a mystery hang. */
+const RUNNER_TIMEOUT_MS = 5000;
+/** Log anything slower than this, with the path and the base URL: when the
+ * deployed worker is the only thing we can observe, this is what attributes
+ * an intermittent stall instead of guessing. */
+const RUNNER_SLOW_MS = 1000;
+
 export const runnerFetch = async <T = unknown>(
   path: string,
   init: RequestInit = {}
@@ -116,13 +128,19 @@ export const runnerFetch = async <T = unknown>(
   if (init.body && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
   }
-  // Bound every runner call: a hung upstream must fail fast with the path
-  // in the message, never hang into the platform request deadline.
-  const res = await fetch(`${runnerBase()}${path}`, {
+  const base = runnerBase();
+  const started = Date.now();
+  const res = await fetch(`${base}${path}`, {
     ...init,
     headers,
-    signal: init.signal ?? AbortSignal.timeout(10_000),
+    signal: init.signal ?? AbortSignal.timeout(RUNNER_TIMEOUT_MS),
   });
+  const elapsed = Date.now() - started;
+  if (elapsed >= RUNNER_SLOW_MS) {
+    console.warn(
+      `[runner] slow ${init.method ?? "GET"} ${path} ${elapsed}ms via ${base}`
+    );
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     throw new Error(
