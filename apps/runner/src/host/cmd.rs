@@ -5,6 +5,11 @@ use tokio::process::Command;
 
 use crate::config::Config;
 
+/// Bucket retention for a fleet bucket: expire noncurrent versions and abort
+/// multipart uploads abandoned mid-deploy, so an unbounded version history
+/// cannot grow into a listing the object store refuses (see `ensure_buckets`).
+pub const LIFECYCLE_RULE: &str = r#"{"Rules":[{"ID":"noite-fleet-retention","Status":"Enabled","Filter":{"Prefix":""},"NoncurrentVersionExpiration":{"NoncurrentDays":1},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":1}}]}"#;
+
 pub async fn run_cmd(
     program: &str,
     args: &[&str],
@@ -173,6 +178,40 @@ pub async fn ensure_buckets(cfg: &Config) -> anyhow::Result<()> {
     {
         Ok(_) => tracing::info!(bucket, "s3 versioning enabled"),
         Err(e) => tracing::warn!(bucket, error = %e, "s3 versioning not enabled (non-fatal)"),
+    }
+    // Versioning on its own is unbounded: a celld node rewrites its keys
+    // continuously, and this fleet bucket reached 72,390 versions for 647
+    // objects within a day. At that size RustFS 1.0.0-rc.6 answers a *flat*
+    // listing of the prefixes a node validates at boot (`control/`, `fleets/`)
+    // with 503 ServiceUnavailable — 100 keys fine, 500 not — while still
+    // reporting itself ready, so the control plane and every tenant fleet die
+    // on `bucket unavailable or inaccessible`. Expire noncurrent versions to
+    // keep the history bounded, and abort parts an interrupted deploy left
+    // behind. Both Filter.Prefix and NoncurrentVersionExpiration are present
+    // on purpose: RustFS panics evaluating a rule that omits either. The
+    // current version is never expired — that is the fleet's live state.
+    // Best-effort like the versioning call above: BYOB keys are often scoped
+    // without lifecycle permission.
+    match run_cmd(
+        "aws",
+        &[
+            "--endpoint-url",
+            &cfg.s3_endpoint,
+            "s3api",
+            "put-bucket-lifecycle-configuration",
+            "--bucket",
+            bucket,
+            "--lifecycle-configuration",
+            LIFECYCLE_RULE,
+        ],
+        None,
+        &env,
+        Duration::from_secs(15),
+    )
+    .await
+    {
+        Ok(_) => tracing::info!(bucket, "s3 lifecycle: noncurrent versions expire after a day"),
+        Err(e) => tracing::warn!(bucket, error = %e, "s3 lifecycle not set (non-fatal)"),
     }
     tracing::info!(bucket, "s3 bucket ready (prefixes git/, fleets/)");
     Ok(())
