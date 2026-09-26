@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1
 # Dev runner image: Rust toolchain + celld/bun/aws for cargo-watch rebuilds.
 # Sidecar versions (esbuild/duckdb) live in docker/install-sidecars.sh —
-# bump there, not here. celld stays an ARG; keep 0.5.1 in sync with
-# docker/Dockerfile.runner (0.4.1 stalls binding-created workflows — see SPEC).
-ARG CELLD_VERSION=0.5.1
+# bump there, not here. celld stays an ARG; keep it in sync with
+# docker/Dockerfile.runner (celld 0.4.1 stalled binding-created workflows — see
+# SPEC; docker/check-versions.ts asserts the pin, so it is not written here).
+ARG CELLD_VERSION=0.6.0
 ARG BUN_VERSION=1.3.5
 
 FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld

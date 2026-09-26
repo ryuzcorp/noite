@@ -6,10 +6,10 @@
 # and patches the worker's vars from the container environment, so this one
 # image serves any domain and secret set.
 #
-# celld version comes from the runner image's ARG — keep in sync with
+# celld is pinned to the same version as the runner image — keep in sync with
 # docker/Dockerfile.runner and docker/Dockerfile.runner-dev
 # (docker/check-versions.ts asserts it).
-ARG CELLD_VERSION=0.5.1
+ARG CELLD_VERSION=0.6.0
 
 # --- stage 1: build the worker bundle (client + ssr + celld entry) ---------
 # bun install runs inside the image, so the lockfile is the only input that

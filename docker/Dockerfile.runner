@@ -9,7 +9,7 @@
 # and docker/Dockerfile.runner-dev (docker/check-versions.ts).
 # Sidecar versions (esbuild/duckdb) live in docker/install-sidecars.sh — bump
 # there, not here.
-ARG CELLD_VERSION=0.5.1
+ARG CELLD_VERSION=0.6.0
 
 FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
 

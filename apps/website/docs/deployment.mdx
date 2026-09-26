@@ -185,6 +185,14 @@ curl -s https://app.<domain>/api/auth/ok                           # control wor
 
 `make doctor` and `make backup` read `.env` and drive `docker compose`, so neither applies here. A service redeploys as a single container — no rolling replacement — so the edge 5xxs briefly while its volume is released and re-attached; batch control-plane changes. The volumes are the state: `edge`'s holds the runner's SQLite and git mirrors (the only copy of deploy metadata), `rustfs`'s holds the bucket (git tips, tenant celld and the control D1). Railway exposes only a volume's name and mount path over its API, so there is nothing to wire — use Railway's volume backups, or point any S3 client at `S3_PUBLIC_ENDPOINT` and copy the bucket.
 
+## Updating
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+Images are disposable and state lives in the volumes, so an update is a pull plus a recreate. One celld caveat applies to the 0.5.1 → 0.6.0 bump specifically: Durable Object facets migrate to their own SQLite files on first open, and with `fleet` durability — celld's default, and what the `control` node runs — **the whole fleet must be stopped before the new version starts it**. A compose recreate, a Railway redeploy or a Coolify deploy all replace the single container rather than overlapping two, so they already satisfy that; if you run more than one control node, stop the others first (a fleet already on `bucket` durability can roll).
+
 ## Data & backups
 
 State lives in named volumes; images are disposable, volumes are not.
