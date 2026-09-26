@@ -28,13 +28,33 @@ BUNDLE_REV="$(cat "${DIST}/REVISION" 2>/dev/null || echo unknown)"
 # first: on a fresh box nothing else has, and neither side may assume the
 # other won the race. ~5 min cap, then say what is wrong instead of looping.
 PREFIX="${DEPLOY_BUCKET#s3://${BKT}/}"
+# Why S3 is refusing, in the endpoint's own words. RustFS's readiness probe
+# names the unmet dependency (`storage`/`iam`/`lock` plus `degradedReasons`,
+# e.g. storage_quorum_unavailable) while its liveness probe stays 200 — which
+# is why "the rustfs service is up" and its 503s are both true. Endpoints
+# without that probe fall back to their response headers (`x-rustfs-readiness-
+# pending` during startup, a plain 403 on / once serving).
+s3_status() {
+  ready="$(curl -s --max-time 5 "${EP}/health/ready" 2>/dev/null || true)"
+  if summary="$(printf '%s' "$ready" | jq -r '"ready=\(.ready) degradedReasons=\((.degradedReasons // []) | join(","))"' 2>/dev/null)"; then
+    printf '%s' "$summary"
+    return 0
+  fi
+  curl -s -o /dev/null -D - --max-time 5 "$EP/" 2>/dev/null |
+    tr -d '\r' |
+    grep -iE "^HTTP/|^retry-after:|^x-rustfs-readiness-pending:" |
+    tr '\n' ' '
+}
 s3_serves() {
   # Bounded per attempt: awscli retries a 503 five times by default, which would
   # stretch the 150 × 2s window to tens of minutes while looking like a hang.
   AWS_MAX_ATTEMPTS=1 aws --cli-connect-timeout 5 --cli-read-timeout 5 \
     --endpoint-url "$EP" s3api create-bucket --bucket "$BKT" >/dev/null 2>&1 || true
+  # No --max-keys: celld validates by listing this prefix in one request, and a
+  # bounded listing can succeed where that one does not — which is how a
+  # container gets past this gate only to die in celld's own validate.
   AWS_MAX_ATTEMPTS=1 aws --cli-connect-timeout 5 --cli-read-timeout 5 \
-    --endpoint-url "$EP" s3api list-objects-v2 --bucket "$BKT" --prefix "$PREFIX" --max-keys 1 >/dev/null 2>&1
+    --endpoint-url "$EP" s3api list-objects-v2 --bucket "$BKT" --prefix "$PREFIX" >/dev/null 2>&1
 }
 ready=0
 tries=0
@@ -45,12 +65,12 @@ while [ "$tries" -lt 150 ]; do
   fi
   tries=$((tries + 1))
   if [ $((tries % 15)) -eq 0 ]; then
-    echo "noite-ui: waiting for ${EP} to serve s3://${BKT}/${PREFIX} (${tries}/150) — a 503 means rustfs is not serving its volume yet"
+    echo "noite-ui: waiting for ${EP} to serve s3://${BKT}/${PREFIX} (${tries}/150) — ${EP} says: $(s3_status)"
   fi
   sleep 2
 done
 if [ "$ready" -ne 1 ]; then
-  echo "noite-ui: ${EP} does not serve s3://${BKT}/${PREFIX} after 5 min — check the rustfs service: 503 = not ready (volume still indexing, restarting, or out of memory), 403 = credentials, 500 'Disk full' = its volume is full" >&2
+  echo "noite-ui: ${EP} does not serve s3://${BKT}/${PREFIX} after 5 min — ${EP} says: $(s3_status); check the rustfs service (503 + x-rustfs-readiness-pending = still starting; 403 = credentials on this side; 500 'Disk full' = its volume is full)" >&2
   exit 1
 fi
 
@@ -100,11 +120,11 @@ else
   while ! celld deploy "$DIST" --bucket "$DEPLOY_BUCKET" --endpoint "$EP" --region "${AWS_REGION:-us-east-1}" --json; do
     attempt=$((attempt + 1))
     if [ "$attempt" -ge 5 ]; then
-      echo "noite-ui: celld deploy failed against ${EP} on ${attempt} attempts — check the rustfs service (503 = not serving its volume yet)" >&2
+      echo "noite-ui: celld deploy failed against ${EP} on ${attempt} attempts — ${EP} says: $(s3_status); check the rustfs service" >&2
       exit 1
     fi
     backoff=$((attempt * 10))
-    echo "noite-ui: celld deploy failed (attempt ${attempt}/5), retrying in ${backoff}s — a 503 means rustfs is not serving its volume yet"
+    echo "noite-ui: celld deploy failed (attempt ${attempt}/5), retrying in ${backoff}s — ${EP} says: $(s3_status)"
     sleep "$backoff"
   done
   printf '%s' "$REV" >/tmp/revision
