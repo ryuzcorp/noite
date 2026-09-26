@@ -50,9 +50,10 @@ services:
       retries: 12
       start_period: 10s
   # Bucket note: the celld node validates s3://NOITE_S3_BUCKET at boot and
-  # exits non-zero when missing — the control entrypoint ensures it
-  # (idempotent head-or-make via awscli) before exec'ing celld, and the runner
-  # ensures it too, so no platform has to honor cross-service ordering.
+  # exits non-zero when it is missing or not served — the control entrypoint
+  # creates it and waits until a LIST of the deploy prefix answers (idempotent,
+  # via awscli) before exec'ing celld, and the runner ensures it too, so no
+  # platform has to honor cross-service ordering.
   runner:
     # Deploy pipeline, fleet supervisor, Caddyfile owner, telemetry
     # aggregation. Talks straight to the object store (`S3_ENDPOINT`).
