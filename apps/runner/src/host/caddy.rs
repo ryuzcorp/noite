@@ -132,6 +132,22 @@ pub async fn rewrite_caddy(
         for line in proxy_extra {
             lines.push(format!("\t\t{line}"));
         }
+        // One fresh upstream connection per request, and a bound on the wait
+        // for a response header. Caddy pools upstream connections for two
+        // minutes by default while celld closes idle ones far sooner, so a
+        // pooled connection can already be dead when Caddy writes to it: the
+        // request goes into nothing, there is no response to forward, and the
+        // browser waits for its own timeout — a hang, not an error. Measured on
+        // Railway before this: bursts of action requests hung 30-60s and only
+        // recovered after ~75s idle, celld logged `incomplete_message`
+        // connection failures on its public surface, and the store, CPU and
+        // memory were all healthy. `flush_interval -1` below only affects
+        // response streaming, so it does not cover this.
+        lines.push("\t\ttransport http {".into());
+        lines.push("\t\t\tkeepalive off".into());
+        lines.push("\t\t\tdial_timeout 5s".into());
+        lines.push("\t\t\tresponse_header_timeout 30s".into());
+        lines.push("\t\t}".into());
         lines.push("\t\tflush_interval -1".into());
         lines.push("\t}".into());
         lines.push("}".into());

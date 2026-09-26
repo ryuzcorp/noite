@@ -1,4 +1,3 @@
-import { batched } from "$lib/batched-loads";
 //! App overview panel: header, status, actions, metrics.
 import { navigate, useRoute } from "@ilha/router";
 import { atom, unsafe, watch } from "ilha";
@@ -94,7 +93,7 @@ export const AppDetailPanel = () => {
         detail.set(cached);
       }
       try {
-        const info = await batched(() => get(id));
+        const info = await get(id);
         detail.set(info);
         writeSwrCache(`app:${id}:detail`, info);
         ready.set(true);

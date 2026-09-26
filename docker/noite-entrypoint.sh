@@ -136,10 +136,19 @@ fi
 
 # 4. Run the node. Explicit flags (not env-only) so the topology is readable
 # here: worker listener on the compose network, operator listener internal.
+# `--advertise` is how *peers* reach this node (node-to-node RPC, and
+# `celld diagnose --peer`), so it has to be an address another node can dial —
+# 127.0.0.1 is only correct for a one-node fleet, and celld's own advice for
+# more capacity is "start another node against the same bucket", which a
+# loopback advertise silently forbids. Prefer an explicit CELLD_ADVERTISE, then
+# the platform's private DNS name (Railway sets RAILWAY_PRIVATE_DOMAIN), then
+# the hostname (compose names a container after its service, which peers
+# resolve).
+advertise="${CELLD_ADVERTISE:-${RAILWAY_PRIVATE_DOMAIN:-$(hostname)}}:8091"
 exec celld \
   --bucket "$DEPLOY_BUCKET" \
   --endpoint "$EP" \
   --region "${AWS_REGION:-us-east-1}" \
   --listen 0.0.0.0:8090 \
   --internal-listen 0.0.0.0:8091 \
-  --advertise 127.0.0.1:8091
+  --advertise "$advertise"

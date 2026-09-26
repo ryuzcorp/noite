@@ -1,4 +1,3 @@
-import { batched } from "$lib/batched-loads";
 //! Settings tab: identity form, collaborators, danger zone.
 import { navigate, useRoute } from "@ilha/router";
 import { atom, watch } from "ilha";
@@ -55,7 +54,7 @@ const CollaboratorsPanel = ({
 
   const reload = async () => {
     try {
-      const fresh = await batched(() => listCollaborators(appId));
+      const fresh = await listCollaborators(appId);
       rows.set(fresh);
       writeSwrCache(`app:${appId}:collaborators`, fresh);
       err.set("");
@@ -335,7 +334,7 @@ const CustomDomainsPanel = ({
 
   const reload = async () => {
     try {
-      const listed = await batched(() => listDomains(appId));
+      const listed = await listDomains(appId);
       rows.set(listed ?? []);
       err.set("");
     } catch (error) {
@@ -702,7 +701,7 @@ const EnvVarsPanel = ({
   const isAdmin = myRole === "admin";
   const reload = async () => {
     try {
-      rows.set(await batched(() => listEnv(appId)));
+      rows.set(await listEnv(appId));
       err.set("");
     } catch (error) {
       err.set(error instanceof Error ? error.message : String(error));
@@ -1003,7 +1002,7 @@ export const AppSettingsPanel = () => {
       });
     }
     try {
-      const info = await batched(() => get(id));
+      const info = await get(id);
       access.set({
         appId: info.app.id,
         myRole: info.myRole,

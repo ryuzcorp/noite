@@ -2,7 +2,6 @@ import { adminOverview } from "$lib/admin.server";
 import { initials } from "$lib/apps";
 import { authClient } from "$lib/auth-client";
 import { Authed, clearSessionCache } from "$lib/authed";
-import { batched } from "$lib/batched-loads";
 import { fetchSession, invalidateSession } from "$lib/session";
 import { defineLayout, navigate, useRoute } from "@ilha/router";
 import { atom, unsafe, watch } from "ilha";
@@ -39,7 +38,7 @@ export default defineLayout(({ children }) => {
       displayName.set(data?.user?.name || data?.user?.email || "");
       if (data?.user) {
         try {
-          const overview = await batched(() => adminOverview());
+          const overview = await adminOverview();
           isAdmin.set(overview.isAdmin);
         } catch {
           isAdmin.set(false);
