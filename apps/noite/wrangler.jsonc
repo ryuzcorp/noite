@@ -28,7 +28,9 @@
   // Non-secret defaults only (fleet fallback — deploy env / compose env
   // override these). Secrets (BETTER_AUTH_SECRET, RUNNER_TOKEN,
   // AWS/RUSTFS keys, NOITE_ADMIN_EMAIL, NOITE_EMAIL_WEBHOOK_URL) come from
-  // `.dev.vars` locally and `wrangler secret` / deploy env in prod.
+  // the container environment in dev (`docker/compose.dev.yaml` sets
+  // CLOUDFLARE_INCLUDE_PROCESS_ENV so wrangler reads it) and `wrangler
+  // secret` / deploy env in prod. `apps/noite/.dev.vars` overrides both.
   "vars": {
     "AWS_REGION": "us-east-1",
     "BASE_DOMAIN": "localhost",

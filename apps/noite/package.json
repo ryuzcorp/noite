@@ -42,7 +42,7 @@
     "@tailwindcss/vite": "^4.3.3",
     "@types/bun": "^1.4.2",
     "daisyui": "^5.7.22",
-    "oxidejs": "^0.5.4",
+    "oxidejs": "0.5.5",
     "tailwindcss": "^4.3.3",
     "typescript": "^7",
     "vite": "^8.2.2",

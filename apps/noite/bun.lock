@@ -37,7 +37,7 @@
         "@tailwindcss/vite": "^4.3.3",
         "@types/bun": "^1.4.2",
         "daisyui": "^5.7.22",
-        "oxidejs": "^0.5.4",
+        "oxidejs": "0.5.5",
         "tailwindcss": "^4.3.3",
         "typescript": "^7",
         "vite": "^8.2.2",
@@ -107,7 +107,6 @@
     "@better-auth/utils": ["@better-auth/utils@0.4.2", "", { "dependencies": { "@noble/hashes": "^2.0.1" } }, "sha512-AUxrvu+HaaODsUyzDxFgwd/8RZ1yZaYo42LXKSrU2oGgR38pS1ij8nqQKNgtTWoYGpNevNXtCfgTy6loHveW9A=="],
 
     "@better-fetch/fetch": ["@better-fetch/fetch@1.3.1", "", {}, "sha512-ABkD1WhyfPZprKRQI3bhATjeiFuNWC9PXhfGWqL+sg/gKrM977oFrYkdb4msM3hgUGonr7KlOsOFT5TU2rht9g=="],
-
 
     "@cloudflare/kv-asset-handler": ["@cloudflare/kv-asset-handler@0.5.0", "", {}, "sha512-jxQYkj8dSIzc0cD6cMMNdOc1UVjqSqu8BZdor5s8cGjW2I8BjODt/kWPVdY+u9zj3ms75Q5qaZgnxUad83+eAg=="],
 
@@ -643,7 +642,7 @@
 
     "oniguruma-to-es": ["oniguruma-to-es@4.3.6", "", { "dependencies": { "oniguruma-parser": "^0.12.2", "regex": "^6.1.0", "regex-recursion": "^6.0.2" } }, "sha512-csuQ9x3Yr0cEIs/Zgx/OEt9iBw9vqIunAPQkx19R/fiMq2oGVTgcMqO/V3Ybqefr1TBvosI6jU539ksaBULJyA=="],
 
-    "oxidejs": ["oxidejs@0.5.4", "", { "dependencies": { "effect": "~4.0.0-rc.112", "linkedom": "^0.18.13", "unplugin": "^3.3.0" }, "peerDependencies": { "@rsbuild/core": "*", "crossws": "*", "vite": "*" }, "optionalPeers": ["@rsbuild/core", "crossws", "vite"] }, "sha512-Vbj9GQ9JFJ51cOpc5Ha5xOn6D6h6077P0+a6ixy87sdDS5Ticm9MtSS/sV1DGo33nBFgAxqAy496khz0qHopLw=="],
+    "oxidejs": ["oxidejs@0.5.5", "", { "dependencies": { "effect": "~4.0.0-rc.112", "linkedom": "^0.18.13", "unplugin": "^3.3.0" }, "peerDependencies": { "@rsbuild/core": "*", "crossws": "*", "vite": "*" }, "optionalPeers": ["@rsbuild/core", "crossws", "vite"] }, "sha512-WRkgC3VUHYJxX/UD+yB1OE+9YzSnTKLs0m7RxyLJlrf5GwLs76ZIgYXKpTp2nCsrqbkJgt7gYN0jkXM9EVKnNw=="],
 
     "paranorm": ["paranorm@0.3.3", "", { "dependencies": { "confbox": "^0.2.4", "effect": "^4.0.0-rc.112" } }, "sha512-AFoQm3bFh8G9caikgdygWnz+EIORzb5ABOsFxSgPLqOLEMwZNXKSc+yQqMuITEIQvRT9NGueYZhNrAs2Yt6vRA=="],
 

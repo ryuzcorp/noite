@@ -5,7 +5,9 @@
 #
 #   make dev
 #
-# Secrets for the vite process come from apps/noite/.dev.vars (auto-loaded).
+# Worker secrets come from this service's environment (see
+# CLOUDFLARE_INCLUDE_PROCESS_ENV below) — the same single source prod uses,
+# where the entrypoint patches the worker's vars from the container env.
 # Never run dev and prod at once — same container names, ports and volumes.
 services:
   runner:
@@ -53,6 +55,14 @@ services:
       # Marks the dev lane for `make doctor`: this container serves the UI with
       # `vite dev`, so the celld node checks do not apply to it.
       NOITE_DEV: "1"
+      # Worker bindings from this container's environment, which compose fills
+      # from the root `.env`. Wrangler's dev-var loader reads `.dev.vars`/`.env`
+      # only — it skips `process.env` unless this flag is exactly "true" — so
+      # without it the worker gets `wrangler.jsonc` `vars` alone and every
+      # `/api/auth/*` call answers 500 "BETTER_AUTH_SECRET is missing".
+      # `apps/noite/.dev.vars` still overrides this when present (wrangler
+      # prefers the file), for a value that should not live in `.env`.
+      CLOUDFLARE_INCLUDE_PROCESS_ENV: "true"
     volumes:
       - ../apps/noite:/app:z
       - ../docker/control-dev.sh:/control-dev.sh:ro,z

@@ -5,6 +5,7 @@ import { MetricsCard } from "$lib/app-detail/metrics";
 import { AppDetailPanel } from "$lib/app-detail/panel";
 import { AppSettingsPanel } from "$lib/app-detail/settings";
 import { get } from "$lib/apps.server";
+import { batched } from "$lib/batched-loads";
 import { useRoute, head, navigate } from "@ilha/router";
 import { unsafe, watch } from "ilha";
 
@@ -40,7 +41,7 @@ export default function AppPage() {
     }
     void (async () => {
       try {
-        const info = await get(appId);
+        const info = await batched(() => get(appId));
         if (typeof document !== "undefined") {
           document.title = `${info.app.name} · Noite`;
         }

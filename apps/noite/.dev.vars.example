@@ -1,5 +1,0 @@
-# Single source: the root `.env.example`. Copy it to `.env` for compose
-# (`make up` / `make dev`) AND to `apps/noite/.dev.vars` for the worker
-# dev process (`vite dev` reads that path) — same values, one definition.
-# Fill in secrets; production values come from deploy env / `wrangler
-# secret`, never from a checked-in file.

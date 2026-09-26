@@ -1,3 +1,4 @@
+import { batched } from "$lib/batched-loads";
 //! Deploy history: header dropdown + SSE list.
 import { atom, unsafe, watch } from "ilha";
 
@@ -27,7 +28,7 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
   watch.once(() => {
     void (async () => {
       try {
-        const info = await get(appId);
+        const info = await batched(() => get(appId));
         detail.set(info);
         writeSwrCache(`app:${appId}:detail`, info);
       } catch {
@@ -285,7 +286,7 @@ export const DeployList = ({ appId }: { appId: string }) => {
   watch.once(() => {
     void (async () => {
       try {
-        const info = await get(appId);
+        const info = await batched(() => get(appId));
         detail.set(info);
         writeSwrCache(`app:${appId}:detail`, info);
       } catch {

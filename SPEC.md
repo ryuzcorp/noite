@@ -56,7 +56,7 @@ Steps:
 6. Single runner image (`docker/Dockerfile.runner` — compose `control`, the `celld deploy` container cell, and the railpack CI build all use it); the joint supervisor (`docker/noite-joint.sh`, `docker/compose.coolify.yaml`) is deleted, Coolify deploys the universal `docker/compose.yaml` with env overrides. Image rebuilds happen inline via `up`/`dev --build`, no separate build targets.
 7. Sign up fresh on the fleet UI and verify apps/keys/passkeys end to end.
 
-Dev loop: `make dev` runs the 4-service dev layout with dev processes — runner cargo-watch, control as `vite dev` (full Oxide + Cloudflare plugin pipeline: workerd, local D1, HMR). No bucket, no deploy cycle. (`celld dev` cannot serve this app: raw esbuild can't resolve `virtual:oxide/worker`.) Secrets from `.dev.vars`. Never run dev and prod stacks at once (shared names/volumes).
+Dev loop: `make dev` runs the 4-service dev layout with dev processes — runner cargo-watch, control as `vite dev` (full Oxide + Cloudflare plugin pipeline: workerd, local D1, HMR). No bucket, no deploy cycle. (`celld dev` cannot serve this app: raw esbuild can't resolve `virtual:oxide/worker`.) Secrets from the control container's env (root `.env`). Never run dev and prod stacks at once (shared names/volumes).
 
 ### Left / polish
 

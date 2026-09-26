@@ -57,14 +57,9 @@ portless alias noite 9080 # route lives in ~/.portless, survives restarts
 sudo firewall-cmd --permanent --add-service=https && sudo firewall-cmd --reload
 ```
 
-Auth also needs a secret — without it every `/api/auth/*` call 500s, on all origins. Create `apps/noite/.dev.vars` with:
+Auth needs a secret or every `/api/auth/*` call answers 500 (`BETTER_AUTH_SECRET is missing`) on all origins. No extra file: `control` passes its whole environment to the worker, exactly as prod's entrypoint patches the worker's vars from it, so `.env` alone is that source.
 
-```
-BETTER_AUTH_SECRET=<long-random-string>
-RUNNER_TOKEN=dev-runner-token
-```
-
-Leave `BETTER_AUTH_URL` **unset** so the passkey rpID follows each origin (`localhost` on the laptop, `noite.local` on the phone). The vite dev process reads `.dev.vars` at startup, so write it before `make dev`.
+Set `BETTER_AUTH_URL=https://noite.local` in `.env` for this flow. Passkeys bind to that origin as their rpID, so the laptop and the phone share one credential namespace — the `.env.example` default (`http://localhost:9080`) binds them to `localhost` instead, and a phone registering on `noite.local` then fails with an rpID mismatch. A hand-written `apps/noite/.dev.vars` still overrides the environment when it exists.
 
 Per boot:
 
