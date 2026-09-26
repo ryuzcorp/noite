@@ -154,10 +154,21 @@ pub async fn ensure_buckets(cfg: &Config) -> anyhow::Result<()> {
     )
     .await
     .with_context(|| format!("head-bucket {bucket}"))?;
-    // S3 native versioning: one call, protects MANIFEST.json + fleet state
-    // from overwrites. Revert itself stays a sha redeploy (tip bundles are
-    // already immutable per-sha), so no restore code. Best-effort: BYOB
-    // keys are often scoped without versioning permission.
+    // Versioning is deliberately *suspended*, not enabled. It was meant to
+    // protect MANIFEST.json + fleet state from overwrites, but celld rewrites
+    // hot keys continuously and the accumulated history is what takes the
+    // install down: this bucket reached 647 objects / 72,390 versions, after
+    // which RustFS (rc.6 `ServiceUnavailable`, 1.0.0 `SlowDownRead`) refused
+    // to list the prefixes a node validates at boot as soon as one page passed
+    // ~100 keys — the control plane and every tenant fleet then died on
+    // `bucket unavailable or inaccessible`. The identical keys in a
+    // version-free bucket list fine, which is how that was pinned down.
+    // Suspending stops new versions while keeping the property that a delete
+    // really removes the key: celld's state is append-only per segment
+    // (`ltx/<seq>-<seq>.ltx`) and revert is a sha redeploy, so overwrite
+    // protection bought nothing here. Versions already written are expired by
+    // the lifecycle rule below. Best-effort: BYOB keys are often scoped
+    // without versioning permission.
     match run_cmd(
         "aws",
         &[
@@ -168,7 +179,7 @@ pub async fn ensure_buckets(cfg: &Config) -> anyhow::Result<()> {
             "--bucket",
             bucket,
             "--versioning-configuration",
-            "Status=Enabled",
+            "Status=Suspended",
         ],
         None,
         &env,

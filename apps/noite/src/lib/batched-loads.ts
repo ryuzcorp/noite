@@ -19,9 +19,14 @@ import { batch } from "oxidejs";
 const COALESCE_MS = 8;
 
 /** One queued load: started inside the batch tick, settling its own caller. */
-type QueuedLoad = () => Promise<void>;
+interface Queued {
+  /** Starts the call and settles the caller with its own result or error. */
+  readonly run: () => Promise<void>;
+  /** Settles the caller when the batch itself failed, so `run` never started. */
+  readonly fail: (error: Error) => void;
+}
 
-let queued: QueuedLoad[] = [];
+let queued: Queued[] = [];
 let timer: ReturnType<typeof setTimeout> | null = null;
 
 const flush = async (): Promise<void> => {
@@ -31,9 +36,21 @@ const flush = async (): Promise<void> => {
   if (items.length === 0) {
     return;
   }
-  // Each thunk starts its own call here, which is the tick `batch()` requires;
-  // a load that fails therefore rejects only through its own caller below.
-  await batch(items);
+  try {
+    // Each thunk starts its own call here, which is the tick `batch()` requires;
+    // a load that fails therefore rejects only through its own caller.
+    await batch(items.map((item) => item.run));
+  } catch (error) {
+    // The batch never ran its items — an aborted POST (the browser drops them
+    // on navigation, and this page load had two), a dropped connection, or a
+    // server error. Each caller is settled only inside its own thunk, so
+    // without this every panel that fed the batch waits forever: a skeleton
+    // with no error to show and nothing to retry from.
+    const failure = error instanceof Error ? error : new Error(String(error));
+    for (const item of items) {
+      item.fail(failure);
+    }
+  }
 };
 
 /** Run `load` as part of the current paint's batch. Use this instead of calling
@@ -42,12 +59,15 @@ const flush = async (): Promise<void> => {
 export const batched = <T>(load: () => Promise<T>): Promise<T> =>
   // oxlint-disable-next-line promise/avoid-new -- only a deferred can hand one batched result back to the caller that asked for it.
   new Promise<T>((resolve, reject) => {
-    queued.push(async () => {
-      try {
-        resolve(await load());
-      } catch (error) {
-        reject(error instanceof Error ? error : new Error(String(error)));
-      }
+    queued.push({
+      fail: reject,
+      run: async () => {
+        try {
+          resolve(await load());
+        } catch (error) {
+          reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      },
     });
     if (timer === null) {
       timer = setTimeout(() => {
