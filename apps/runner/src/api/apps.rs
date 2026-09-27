@@ -24,16 +24,79 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({ "busy": busy, "ok": true, "service": "noite-runner" }))
 }
 
-/// Readiness for the edge: 200 only after the first successful reconcile
-/// pass (fleets spawned, Caddyfile written). Liveness stays on /health.
-/// Compose healthchecks and Coolify route on this, so tenants are never
-/// sent to a runner whose fleets are still cold-booting.
+/// Readiness for the edge (SPEC, Readiness): 200 only when all hold —
+/// first reconcile pass, bucket reachable (head-bucket cached 5 s),
+/// multi-tenancy isolation checks passed, the control fleet healthy, Caddy's
+/// last config load accepted. Body names the failing ones so one healthcheck
+/// fits Compose, Railway, Coolify and Fly.
 pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
-    if state.ready.load(std::sync::atomic::Ordering::Relaxed) {
+    let mut failing: Vec<String> = Vec::new();
+    if !state.ready.load(std::sync::atomic::Ordering::Relaxed) {
+        failing.push("reconcile".into());
+    }
+    // Bucket reachable (HEAD on runner/state/, 2 s timeout, cached 5 s).
+    {
+        let now = std::time::Instant::now();
+        let (ok, detail, at) = state.bucket_ok.read().await.clone();
+        if now.duration_since(at).as_secs() >= 5 || !ok {
+            let _ = detail;
+            // One head-bucket per 5 s: it errors only on transport/auth, which
+            // is exactly "unreachable".
+            let reachable = bucket_reachable(&state.config).await;
+            *state.bucket_ok.write().await = (reachable.0, reachable.1.clone(), now);
+            if !reachable.0 {
+                failing.push(format!("bucket: {}", reachable.1));
+            }
+        } else if !ok {
+            failing.push(format!("bucket: {detail}"));
+        }
+    }
+    {
+        let iso = state.isolation.read().await;
+        if iso.blocked {
+            failing.push(format!("isolation: {}", iso.detail));
+        }
+    }
+    // Control fleet #0 (absent in the dev image, where vite dev serves it).
+    if std::path::Path::new(&state.config.control_bundle_dir).exists() {
+        let healthy = reqwest::Client::new()
+            .get("http://127.0.0.1:8090/.well-known/celld/health")
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success());
+        if !healthy {
+            failing.push("control: fleet not healthy yet".into());
+        }
+    }
+    {
+        let (ok, detail) = crate::host::caddy::admin_status();
+        if !ok {
+            failing.push(format!("caddy: {detail}"));
+        }
+    }
+    if failing.is_empty() {
         Json(json!({ "ok": true, "service": "noite-runner" })).into_response()
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "ok": false })))
+        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "ok": false, "failing": failing })))
             .into_response()
+    }
+}
+
+async fn bucket_reachable(cfg: &crate::config::Config) -> (bool, String) {
+    let env_owned = crate::host::cmd::aws_env(cfg);
+    let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    match crate::host::cmd::run_cmd(
+        "aws",
+        &["--endpoint-url", &cfg.s3_endpoint, "s3api", "head-bucket", "--bucket", &cfg.s3_bucket],
+        None,
+        &env,
+        std::time::Duration::from_secs(2),
+    )
+    .await
+    {
+        Ok(_) => (true, String::new()),
+        Err(e) => (false, format!("{e:#}")),
     }
 }
 
@@ -54,17 +117,6 @@ pub async fn create_app(
         return ApiError::bad("invalid name/slug").into_response();
     }
     match db::get_app_by_slug(&state.pool, &slug).await {
-        Ok(Some(existing))
-            if existing.desired_state == "deleted"
-                || existing.status == "deleting"
-                || existing.status == "gone" =>
-        {
-            // Legacy soft-delete row: reclaim requires a hard DB delete first.
-            if let Err(e) = db::delete_app(&state.pool, &existing.id).await {
-                return ApiError::internal(format!("failed to reclaim slug row: {e}"))
-                    .into_response();
-            }
-        }
         Ok(Some(_)) => {
             return ApiError::conflict("slug already taken").into_response();
         }
@@ -77,7 +129,7 @@ pub async fn create_app(
     if let Err(e) = purge::purge_slug(&state.config, &state.procs, &state.logs, &slug).await {
         return ApiError::internal(format!("failed to clear slug data: {e:#}")).into_response();
     }
-    let (listen, internal) = match db::next_ports(&state.pool, state.config.port_base).await {
+    let (listen, internal) = match db::next_ports_in(&state.pool, state.config.fleet_port_min, state.config.fleet_port_max).await {
         Ok(p) => p,
         Err(e) => {
             return ApiError::internal(e.to_string()).into_response();
@@ -117,11 +169,14 @@ pub async fn create_app(
     )
     .await {
         Ok(app) => {
+            // No credential row: only a scoped provider (Phase 4) mints one.
+            state.state_sync.mark_dirty();
             (StatusCode::CREATED, Json(app)).into_response()
         }
         Err(e) => ApiError::internal(e.to_string()).into_response(),
     }
 }
+
 
 pub async fn get_app(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     match db::get_app(&state.pool, &id).await {
@@ -225,6 +280,7 @@ pub async fn delete_app(
 
     match db::delete_app(&state.pool, &id).await {
         Ok(()) => {
+            let _ = crate::host::credentials::revoke(&state.pool, &id).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => ApiError::internal(e.to_string()).into_response(),

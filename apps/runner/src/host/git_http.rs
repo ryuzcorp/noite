@@ -387,34 +387,6 @@ async fn delete_ref_prefix(cfg: &Config, slug: &str, refname: &str) {
     .await;
 }
 
-/// Locate the live bundle for a ref+sha the manifest does not know (legacy
-/// slugs on their first manifest write): scan the ref prefix, else cut one.
-async fn bundle_key_for(
-    cfg: &Config,
-    bare: &Path,
-    slug: &str,
-    refname: &str,
-    sha: &str,
-) -> anyhow::Result<String> {
-    let prefix = format!("git/{slug}/{refname}/");
-    if let Ok(json) = cmd::s3_list_prefix(cfg, &cfg.s3_bucket, &prefix).await {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
-            if let Some(contents) = v.get("Contents").and_then(|c| c.as_array()) {
-                let want = format!("{sha}.bundle").to_lowercase();
-                for obj in contents {
-                    let Some(key) = obj.get("Key").and_then(|k| k.as_str()) else {
-                        continue;
-                    };
-                    if key.to_lowercase().ends_with(&want) {
-                        return Ok(key.to_string());
-                    }
-                }
-            }
-        }
-    }
-    write_ref_bundle(cfg, bare, slug, refname, sha).await
-}
-
 /// `old` must be an ancestor of `new` for a fast-forward update.
 async fn is_fast_forward(bare: &Path, old: &str, new: &str) -> bool {
     cmd::run_cmd(
@@ -482,7 +454,9 @@ pub(crate) async fn after_receive(
         if refs.contains_key(refname) {
             continue;
         }
-        let bundle = bundle_key_for(&state.config, bare, &app.slug, refname, sha).await?;
+        // A ref the previous manifest does not carry (every push writes a
+        // complete one, so this is a ref git itself created): cut its bundle.
+        let bundle = write_ref_bundle(&state.config, bare, &app.slug, refname, sha).await?;
         refs.insert(refname.clone(), ManifestRef { sha: sha.clone(), bundle });
     }
     // 3. The linearization point: one manifest write.

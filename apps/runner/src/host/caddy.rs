@@ -103,13 +103,14 @@ pub async fn rewrite_caddy(
     // them at site level and then keeps serving the stale config.
     let mut push_block = |addr: &str, tls: bool, site_extra: &[&str], proxy_extra: &[&str], upstream: &str| {
         lines.push(format!("{addr} {{"));
-        // Access log per site as JSON into the shared file (same volume as
-        // the Caddyfile), feeding the runner's device breakdown. Tradeoff:
-        // per-request lines leave `docker logs` (Caddy process logs like
-        // reloads and errors still go to stdout); tail them via
-        // `podman exec <caddy> tail -f /etc/caddy/access.log` instead.
+        // Access log per site as JSON into the file the runner tails
+        // (`CADDY_ACCESS_LOG`: one path for writer and reader, since they
+        // share this container), feeding the device/path/ref breakdown. The
+        // tailer bounds its size itself (host/accesslog.rs truncates after
+        // consuming), so no Caddy-side rolling. Per-request lines leave
+        // `docker logs`; tail the file instead.
         lines.push("\tlog {".into());
-        lines.push("\t\toutput file /etc/caddy/access.log".into());
+        lines.push(format!("\t\toutput file {}", cfg.caddy_access_log));
         lines.push("\t\tformat json".into());
         lines.push("\t}".into());
         // Compression, because celld does not compress an asset response and
@@ -272,9 +273,71 @@ pub async fn rewrite_caddy(
     if prev == next {
         return Ok(());
     }
-    tokio::fs::write(path, next).await?;
+    tokio::fs::write(path, &next).await?;
     tracing::info!(path = %cfg.caddyfile_path, n = apps.len(), "caddyfile updated");
+    // POST the changed config to Caddy's admin (127.0.0.1:2019). A non-2xx
+    // is logged with Caddy's body and surfaced in /ready; the previous config
+    // keeps serving (Caddy applies loads atomically). `--watch` on the file
+    // above applies it too, so a Caddy that is still starting loses nothing.
+    load_admin(cfg, &next).await;
     Ok(())
+}
+
+static CADDY_ADMIN_OK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+static CADDY_ADMIN_ERR: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
+
+/// Last admin-load result for /ready.
+pub fn admin_status() -> (bool, String) {
+    let ok = CADDY_ADMIN_OK.load(std::sync::atomic::Ordering::Relaxed);
+    let detail = CADDY_ADMIN_ERR
+        .get()
+        .map(|m| m.lock().map(|s| s.clone()).unwrap_or_default())
+        .unwrap_or_default();
+    (ok, detail)
+}
+
+fn admin_note(ok: bool, detail: String) {
+    CADDY_ADMIN_OK.store(ok, std::sync::atomic::Ordering::Relaxed);
+    if let Some(m) = CADDY_ADMIN_ERR.get() {
+        if let Ok(mut g) = m.lock() {
+            *g = detail;
+        }
+    } else {
+        let _ = CADDY_ADMIN_ERR.set(std::sync::Mutex::new(detail));
+    }
+}
+
+async fn load_admin(cfg: &Config, caddyfile: &str) {
+    let url = format!("{}/load", cfg.caddy_admin_url.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    match client
+        .post(&url)
+        .header("Content-Type", "text/caddyfile")
+        .body(caddyfile.to_string())
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            admin_note(true, String::new());
+        }
+        Ok(resp) => {
+            // Connection worked but Caddy rejected the config: real problem.
+            // Distinguish "nothing listening" (connection error below) from
+            // a bad config by only marking unhealthy on HTTP responses.
+            let code = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let tail = body.chars().take(500).collect::<String>();
+            admin_note(false, format!("caddy /load {code}: {tail}"));
+            tracing::warn!(%code, body = %tail, "caddy admin load rejected config");
+        }
+        Err(e) => {
+            // Caddy is (re)starting under supervision; it reads the file on
+            // start, so this is not a failure.
+            tracing::debug!(error = %e, "caddy admin not reachable yet");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -300,19 +363,30 @@ mod tests {
             work_dir: "/tmp/noite-test".into(),
             caddyfile_path: path.into(),
             celld_bin: "celld".into(),
-            port_base: 8100,
+            fleet_port_min: 20000,
+            fleet_port_max: 29999,
             poll_ms: 5000,
-            caddy_upstream_host: "runner".into(),
+            caddy_upstream_host: "127.0.0.1".into(),
             auto_https,
-            caddy_control_upstream: "ui:8080".into(),
-            caddy_api_upstream: "runner:8080".into(),
+            caddy_control_upstream: "127.0.0.1:8090".into(),
+            caddy_api_upstream: "127.0.0.1:8080".into(),
+            caddy_admin_url: "http://127.0.0.1:2019".into(),
             git_public_base: format!("https://git.{base}"),
-            ui_url: "http://ui:8080".into(),
-            caddy_access_log: "/caddy/access.log".into(),
+            ui_url: "http://127.0.0.1:8090".into(),
+            caddy_access_log: "/data/caddy/access.log".into(),
             fleet_log: "error,celld=warn".into(),
             max_apps_per_user: 10,
             fleet_max_rss_mb: 512,
             fleet_idle_evict_s: 300,
+            tenancy: crate::config::Tenancy::Single,
+            stop_budget_ms: 25000,
+            build_max_mb: 2048,
+            build_uid: None,
+            build_gid: None,
+            fleet_uid: None,
+            fleet_gid: None,
+            control_bundle_dir: "/opt/noite/control/dist".into(),
+            better_auth_url: "".into(),
         }
     }
 

@@ -26,7 +26,7 @@ export const hydrateControlEnv = (
   const defaults = {
     AWS_REGION: "us-east-1",
     BASE_DOMAIN: "localhost",
-    RUNNER_URL: "http://runner:8080",
+    RUNNER_URL: "http://127.0.0.1:8080",
     S3_ENDPOINT: "http://rustfs:9000",
     S3_PUBLIC_ENDPOINT: "http://127.0.0.1:9000",
   } satisfies Record<string, string>;

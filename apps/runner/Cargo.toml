@@ -26,6 +26,11 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
 ] }
 anyhow = "1"
+libc = "0.2"
+aes-gcm = { version = "0.10", features = ["std"] }
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
 thiserror = "2"
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }

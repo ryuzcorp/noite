@@ -40,16 +40,16 @@ esac
 CE="$ENGINE compose -f docker/compose.yaml"
 
 img_ok() { "$ENGINE" image inspect "$1" >/dev/null 2>&1; }
-if [ -n "${NOITE_BACKUP_IMAGE:-}" ]; then
-  HELPER="$NOITE_BACKUP_IMAGE"
-elif img_ok "${NOITE_RUNNER_IMAGE:-ghcr.io/ryuzcorp/noite-runner:latest}"; then
-  HELPER="${NOITE_RUNNER_IMAGE:-ghcr.io/ryuzcorp/noite-runner:latest}"
-elif img_ok noite-runner:local; then
-  HELPER=noite-runner:local
-elif img_ok docker.io/library/caddy:2.10.0-alpine; then
-  HELPER=docker.io/library/caddy:2.10.0-alpine
-else
+HELPER=""
+for candidate in "${NOITE_BACKUP_IMAGE:-}" "${NOITE_IMAGE:-}" noite:local noite-dev:local ghcr.io/ryuzcorp/noite:latest; do
+  if [ -n "$candidate" ] && img_ok "$candidate"; then
+    HELPER="$candidate"
+    break
+  fi
+done
+if [ -z "$HELPER" ]; then
   echo "error: no image available to untar the volumes with."
+  echo "  set NOITE_BACKUP_IMAGE=<image with tar>."
   exit 1
 fi
 

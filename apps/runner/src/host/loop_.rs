@@ -19,6 +19,7 @@ use crate::host::supervisor::{self, ProcMap};
 use crate::lifecycle::{sha_same, DEPLOY_IN_FLIGHT_MS, DEPLOY_STUCK_MS};
 use crate::models::{AppStatus, DesiredState};
 
+#[allow(clippy::too_many_arguments)] // shared deps threaded by reference; matches deploy_app's existing allow
 pub async fn run_forever(
     pool: SqlitePool,
     cfg: Config,
@@ -27,10 +28,14 @@ pub async fn run_forever(
     deploying: Deploying,
     mut metrics: MetricsState,
     ready: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(cfg.poll_ms));
     loop {
         tick.tick().await;
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         if let Err(e) = reconcile_once(&pool, &cfg, &procs, &logs, &deploying, &mut metrics).await
         {
             tracing::error!(error = %e, "reconcile");

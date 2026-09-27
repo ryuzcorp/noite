@@ -24,7 +24,7 @@ import type {
   RunnerRef,
   RunnerSpan,
 } from "../lib/runner";
-import { stampRunnerEnv } from "../lib/runner";
+import { RUNNER_DEFAULT_URL, stampRunnerEnv } from "../lib/runner";
 
 type RouteHandler = (
   request: Request,
@@ -42,16 +42,11 @@ const handleHealth: RouteHandler = () =>
 
 /** Optional nudge path — prefer runner webhook; proxy for deploy.sh convenience. */
 const handleWebhook: RouteHandler = async (request, env) => {
-  const token = env.RUNNER_TOKEN ?? env.HOST_TOKEN ?? env.AGENT_TOKEN ?? "";
+  const token = env.RUNNER_TOKEN ?? "";
   if (!token) {
     return new Response("RUNNER_TOKEN is not configured", { status: 500 });
   }
-  const runner = (
-    env.RUNNER_URL ??
-    env.HOST_URL ??
-    env.AGENT_URL ??
-    "http://runner:8080"
-  ).replace(/\/$/u, "");
+  const runner = (env.RUNNER_URL ?? RUNNER_DEFAULT_URL).replace(/\/$/u, "");
   const headers = new Headers(request.headers);
   headers.delete("host");
   headers.set("authorization", `Bearer ${token}`);
@@ -94,7 +89,7 @@ const handleAuth: RouteHandler = async (request, env) => {
 };
 
 const runnerTokenOk = (request: Request, env: KitEnv): boolean => {
-  const expected = env.RUNNER_TOKEN ?? env.HOST_TOKEN ?? env.AGENT_TOKEN ?? "";
+  const expected = env.RUNNER_TOKEN ?? "";
   if (!expected) {
     return false;
   }
@@ -257,16 +252,11 @@ const r2RawTarget = (
 const runnerConfig = (
   kit: KitEnv
 ): { runner: string; token: string } | undefined => {
-  const token = kit.RUNNER_TOKEN ?? kit.HOST_TOKEN ?? kit.AGENT_TOKEN ?? "";
+  const token = kit.RUNNER_TOKEN ?? "";
   if (!token) {
     return undefined;
   }
-  const runner = (
-    kit.RUNNER_URL ??
-    kit.HOST_URL ??
-    kit.AGENT_URL ??
-    "http://runner:8080"
-  ).replace(/\/$/u, "");
+  const runner = (kit.RUNNER_URL ?? RUNNER_DEFAULT_URL).replace(/\/$/u, "");
   return { runner, token };
 };
 

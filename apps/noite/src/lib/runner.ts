@@ -66,28 +66,20 @@ const readEnv = (): KitEnv => {
   return merged as KitEnv;
 };
 
-/** Runner base URL from the compose environment. */
+/** The runner beside this worker: the control fleet (prod) and `vite dev`
+ * (dev) both run in the runner's container. */
+export const RUNNER_DEFAULT_URL = "http://127.0.0.1:8080";
+
+/** Runner base URL from the environment. */
 const runnerBase = () =>
-  (
-    readEnv().RUNNER_URL ??
-    readEnv().HOST_URL ??
-    readEnv().AGENT_URL ??
-    "http://runner:8080"
-  ).replace(/\/$/u, "");
+  (readEnv().RUNNER_URL ?? RUNNER_DEFAULT_URL).replace(/\/$/u, "");
 
 /** Stamp the platform env for runner calls made on the edge fetch path.
  * Oxide only enters its ALS (readEnv) for actions, workflows and queues, so a
  * plain route handler — `/internal/git-auth`, the SSE pollers — otherwise sees
  * the localhost dev defaults and misses the real RUNNER_URL/RUNNER_TOKEN. */
 export const stampRunnerEnv = (env: KitEnv): void => {
-  for (const key of [
-    "AGENT_TOKEN",
-    "AGENT_URL",
-    "HOST_TOKEN",
-    "HOST_URL",
-    "RUNNER_TOKEN",
-    "RUNNER_URL",
-  ] as const) {
+  for (const key of ["RUNNER_TOKEN", "RUNNER_URL"] as const) {
     const value = env[key];
     if (value) {
       controlEnv[key] = value;
@@ -96,11 +88,7 @@ export const stampRunnerEnv = (env: KitEnv): void => {
 };
 
 const runnerToken = () => {
-  const token =
-    readEnv().RUNNER_TOKEN ??
-    readEnv().HOST_TOKEN ??
-    readEnv().AGENT_TOKEN ??
-    "";
+  const token = readEnv().RUNNER_TOKEN ?? "";
   if (!token) {
     throw new Error("RUNNER_TOKEN is not configured");
   }

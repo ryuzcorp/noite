@@ -246,8 +246,7 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
         enableMetadata: false,
         // Machine scopes: `apps.manage` (git push and other app-management
         // API calls) and `events.push` (event ingest). Keys created without
-        // explicit permissions inherit both, preserving current behavior;
-        // legacy keys get the same via the ensureDb backfill.
+        // explicit permissions inherit both.
         permissions: {
           defaultPermissions: { apps: ["manage"], events: ["push"] },
         },

@@ -169,7 +169,7 @@ export const AppDetailPanel = () => {
                   Visit
                 </span>
               </a>
-              {canPush && app.desiredState !== "deleted" ? (
+              {canPush ? (
                 <button
                   type="button"
                   class="btn btn-sm"

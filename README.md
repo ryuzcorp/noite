@@ -2,31 +2,34 @@
 
 Tiny self-hostable PaaS for [celld](https://celld.dev/). Spec: [SPEC.md](SPEC.md), operator guide: [apps/website/docs/deployment.mdx](apps/website/docs/deployment.mdx).
 
-`docker compose up -d` runs four services from `docker/compose.yaml`: `rustfs` (S3), `runner` (deploy pipeline, tenant fleets, Caddyfile, telemetry), `control` (Oxide control UI on a celld node) and `caddy` (edge).
+Noite ships as **one image**, `ghcr.io/<owner>/noite`: the runner (deploy pipeline, API, Git, telemetry) runs as PID 1 and supervises Caddy (the edge), the control UI (a celld node, fleet #0) and one celld fleet per tenant app. `docker compose up -d` runs it from `docker/compose.yaml` next to the bundled RustFS store.
 
 Registration is invite-only: the **first** account to sign up bootstraps the instance — it needs no code and is promoted to `admin` — and every later account needs a single-use code. Each member holds two codes to hand out (read them on `/profile`), and admins mint more from the Invitations panel in `/god-mode`.
 
 ```bash
 cp .env.example .env
-make up      # build both images from the tree and start
+make up      # build the image from the tree and start
 make logs
 make doctor  # codified health checks
-make backup  # tar every data volume into backups/<UTC stamp>/
+make backup  # tar both volumes into backups/<UTC stamp>/
 ```
 
 Restore is destructive and replays a backup directory over the live volumes: `make restore FROM=backups/<stamp>`.
 
-`make up-prod` pulls the release images instead of building. On a host with nothing but Compose, `docker compose -f docker/compose.standalone.yaml up -d` (or the same file from a panel's/registry's template) boots the whole install — it is `docker/compose.yaml` without the `build:` blocks, pull-only and defaulted. On a host without a clone, set `NOITE_RUNNER_IMAGE=ghcr.io/<owner>/noite-runner:latest` and `NOITE_CONTROL_IMAGE=ghcr.io/<owner>/noite-control:latest`, then `docker compose -f docker/compose.yaml up -d` (never `--build`) — same file, env-driven.
+`make up-prod` pulls the release image instead of building. `docker/compose.yaml` pulls by default and gives every variable a default, so on a host with nothing but Compose (a cloud VM, a panel's or registry's template) `docker compose -f docker/compose.yaml up -d` is the whole install. Pin `NOITE_IMAGE` to a SHA tag in production.
+
+Bring your own S3 (R2, Tigris or S3, the stores celld qualifies; recommended for real installs): set `S3_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and start with `--scale rustfs=0`.
 
 | Path |  |
 | --- | --- |
-| `apps/runner` | Rust runner (deploy, fleets, Caddyfile, telemetry) |
+| `apps/runner` | Rust runner (deploy, fleets, edge config, telemetry, supervision) |
 | `apps/noite` | Oxide control UI (passkeys, app actions → runner) |
-| `apps/noite/test` | sample app + `deploy.sh` |
-| `docker/compose.yaml` | the whole install (compose + Coolify via env) |
-| `docker/compose.dev.yaml` | dev overlay: bind-mounted dev processes |
-| `docker/compose.byob.yaml` | external-S3 overlay (compose `-f` flag), bundled RustFS excluded |
-| `docker/compose.standalone.yaml` | ONE file for cloud VMs and Compose stores (Arcane, Portainer, Dockge, …): pulls the GHCR images, named volumes only, no clone, no build |
+| `apps/noite/test` | sample app + `deploy.sh`; `test/hostile` is the isolation probe app |
+| `docker/Dockerfile` | the one image (`noite` target) and its dev variant (`dev` target) |
+| `docker/compose.yaml` | the whole install: pulls the image, every variable defaulted (Compose, Coolify, stores, VMs) |
+| `docker/compose.build.yaml` | overlay: build the image from the tree (`make up`) |
+| `docker/compose.dev.yaml` | overlay: `cargo watch` runner + `vite dev` UI in the same service (`make dev`) |
+| `docker/compose.e2e.yaml` | overlay: the e2e lane (`make e2e`, `make e2e-isolation`) |
 
 | URL                            |                       |
 | ------------------------------ | --------------------- |
@@ -36,12 +39,18 @@ Restore is destructive and replays a backup directory over the live volumes: `ma
 
 ## Architecture
 
-- **rustfs** — the fleet bucket: `git/` tip bundles, `fleets/` tenant celld, `control/` UI worker + its D1. Bundled by default; the `docker/compose.byob.yaml` overlay points the stack at any external S3 instead.
-- **runner** — the Rust control plane: Git smart-HTTP, bare mirrors + builds, one celld fleet per tenant app, telemetry aggregation (DuckDB), and the Caddyfile. State lives in the `runner-data` volume and the fleet bucket; it talks straight to `rustfs:9000`.
-- **control** — the Oxide control UI on a celld node. The worker bundle (`apps/noite/dist`) is baked into its image at build time and its entrypoint deploys it into `s3://<bucket>/control` on first start, revision-gated, with the worker's runtime vars patched from the container environment — so one image serves any domain/secret set and no secret is baked in.
-- **caddy** — stock upstream `caddy:2.10.0-alpine`. The edge config is neither baked nor static: the runner writes the Caddyfile into the shared `caddy-config` volume and Caddy's `--watch` reloads it within a poll tick. Caddy terminates per-host TLS with on-demand certificates ask-gated at `/v1/edge/tls-ask`, and it does the compression celld does not: the generated config carries `encode zstd gzip` on every site (measured through the edge, the control UI's JS bundle drops 462 KB → 144 KB gzip and CSS 129 KB → 22 KB, while `text/event-stream` responses stay uncompressed). Content-hashed `/assets/*` chunks are cached immutably (`apps/noite/public/_headers`, `max-age=31536000, immutable`) because celld serves an asset with `max-age=0, must-revalidate` and no `Last-Modified`.
+- **The `noite` container.** `noite-runner` is PID 1 (under `tini`) and owns every other process:
+  - **Caddy** (edge): TLS with on-demand certificates ask-gated at `/v1/edge/tls-ask`, host routing, and the compression celld does not do (`encode zstd gzip` on every site: the control UI's JS bundle drops 462 KB → 144 KB gzip, CSS 129 KB → 22 KB, while `text/event-stream` responses stay uncompressed). The runner generates the Caddyfile and loads it through Caddy's admin API (`127.0.0.1:2019`); certificates live in the volume.
+  - **Control UI** (fleet #0): the Oxide worker bundle baked into the image, deployed into `s3://<bucket>/control` at boot (revision-gated, vars from the container environment) and served by a supervised celld node on `127.0.0.1:8090`.
+  - **Tenant fleets**: one celld node per app, running as the unprivileged `fleet` user. Builds and release commands run as the `build` user with a cleared environment.
+  - Everything else the runner does: Git smart-HTTP, bare mirrors, builds, telemetry aggregation (DuckDB), and its SQLite state, which it also snapshots into the bucket so a lost volume loses nothing.
+- **rustfs** (bundled, optional): the bucket: `git/` tip bundles, `fleets/` tenant celld, `control/` the UI worker and its D1, `runner/state/` runner snapshots.
 
-Tenant subdomains are automatic: `{slug}.{BASE_DOMAIN}` routes to that app's celld listen port (8100+) through the runner, decided by the Caddyfile the runner writes. `app`/`api`/`git` slugs are reserved.
+Content-hashed `/assets/*` chunks are cached immutably (`apps/noite/public/_headers`, `max-age=31536000, immutable`) because celld serves an asset with `max-age=0, must-revalidate` and no `Last-Modified`.
+
+Tenancy: `NOITE_TENANCY=multi` (the default off `localhost`) runs tenant code sandboxed, as unprivileged users behind an egress policy that closes loopback, private ranges and cloud metadata (the object store is the one allowed private address), and refuses builds when the container lacks the capabilities for it. `single` means only you push code to the install. See [SPEC.md](SPEC.md).
+
+Tenant subdomains are automatic: `{slug}.{BASE_DOMAIN}` routes to that app's celld listen port (20000+), decided by the edge config the runner writes. `app`/`api`/`git` slugs are reserved.
 
 Custom hostnames are opt-in per app: add one in the app's settings (or `POST /v1/apps/{id}/domains`), point its DNS at the server, and the first visit mints the certificate — the runner routes a registered hostname to its app's port only while the app is deployed and running, and the on-demand TLS gate only issues for a live app. Platform hostnames and a hostname another app already holds are refused. There is no DNS/TXT control check yet — treat that as later hardening.
 
@@ -57,7 +66,7 @@ portless alias noite 9080 # route lives in ~/.portless, survives restarts
 sudo firewall-cmd --permanent --add-service=https && sudo firewall-cmd --reload
 ```
 
-Auth needs a secret or every `/api/auth/*` call answers 500 (`BETTER_AUTH_SECRET is missing`) on all origins. No extra file: `control` passes its whole environment to the worker, exactly as prod's entrypoint patches the worker's vars from it, so `.env` alone is that source.
+Auth needs a secret or every `/api/auth/*` call answers 500 (`BETTER_AUTH_SECRET is missing`) on all origins. No extra file: in dev, `vite dev` hands the container's environment to the worker, as the runner does with the control fleet in prod, so `.env` alone is that source.
 
 Set `BETTER_AUTH_URL=https://noite.local` in `.env` for this flow. Passkeys bind to that origin as their rpID, so the laptop and the phone share one credential namespace — the `.env.example` default (`http://localhost:9080`) binds them to `localhost` instead, and a phone registering on `noite.local` then fails with an rpID mismatch. A hand-written `apps/noite/.dev.vars` still overrides the environment when it exists.
 
@@ -78,11 +87,11 @@ portless alias test.noite 9080 # → https://test.noite.local (hosts + mDNS)
 
 ## Deploy to Coolify
 
-Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `main`) — the same universal file as `make up`, driven by env. In Environment Variables, set `BASE_DOMAIN` to your domain (defaults to `localhost`); `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` derive from it unless overridden. Set the four secrets (`BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`) and optionally `NOITE_RUNNER_IMAGE` / `NOITE_CONTROL_IMAGE` (`ghcr.io/<owner>/noite-runner:latest` and `ghcr.io/<owner>/noite-control:latest`; pin a SHA for reproducibility) to pull release images instead of building. Nothing generates secrets here; dev-default secrets are refused on real domains. Coolify auto-provisions a generated domain for the `caddy` service (boot check via `SERVICE_URL_CADDY_80`), then paste the real hostnames once on that service's Domains field (Coolify can't take custom hostnames from Compose): `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. Behind a terminating proxy set `CADDY_AUTO_HTTPS=off`; our Caddy still mints per-host certs on demand. The apex stays on your marketing site.
+Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `main`): the same file as `make up-prod`, driven by env. In Environment Variables, set `BASE_DOMAIN` to your domain (defaults to `localhost`) and `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` to match, the three secrets (`BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, and `RUSTFS_ACCESS_KEY` + `RUSTFS_SECRET_KEY` or your own S3 keys), and pin `NOITE_IMAGE` to a SHA tag. Nothing generates secrets here; dev-default secrets are refused on real domains. Coolify auto-provisions a generated domain for the `noite` service (boot check via `SERVICE_URL_NOITE_80`), then paste the real hostnames once on that service's Domains field (Coolify can't take custom hostnames from Compose): `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. Behind a terminating proxy set `CADDY_AUTO_HTTPS=off`; Noite's Caddy still mints per-host certs on demand. The apex stays on your marketing site.
 
-Runtime changes round-trip through the images (`NOITE_RUNNER_IMAGE` / `NOITE_CONTROL_IMAGE`); `docker compose up` stops a service before starting its replacement, so batch control-plane changes and deploy off-peak.
+A new image restarts the runner and every tenant fleet with it (they cold-boot), so batch upgrades and deploy off-peak.
 
-Tenant subdomains (`<slug>.<domain>`) are fully automatic: a Traefik TCP router forwards every `*.<domain>` SNI straight to our Caddy on `:443`, and our Caddy mints a per-slug cert on demand (ask-gated at `/v1/edge/tls-ask` — only live tenant/platform hosts get certs, no wildcard cert or DNS provider involved). Two one-time prerequisites: `*.<domain>` DNS → the server, and this file saved under `Servers > server > Proxy > Dynamic Configurations` (dashboard-pasted file config is static text — unlike compose labels, Coolify can't mangle it — and `noite-tenants@docker` resolves the TCP service the `caddy` service label defines):
+Tenant subdomains (`<slug>.<domain>`) are fully automatic: a Traefik TCP router forwards every `*.<domain>` SNI straight to Noite's Caddy on `:443`, which mints a per-slug cert on demand (ask-gated at `/v1/edge/tls-ask`: only live tenant/platform hosts get certs, no wildcard cert or DNS provider involved). Two one-time prerequisites: `*.<domain>` DNS → the server, and this file saved under `Servers > server > Proxy > Dynamic Configurations` (dashboard-pasted file config is static text that Coolify cannot mangle, and `noite-tenants@docker` resolves the TCP service the `noite` service label defines):
 
 ```yaml
 tcp:
@@ -94,4 +103,10 @@ tcp:
       tls: { passthrough: true }
 ```
 
-Then redeploy once and confirm the `noite-tenants` router in the Traefik dashboard. First visit to a new slug pauses a few seconds for issuance; certs persist in `caddy-data`. Fallback if passthrough misbehaves: add `https://<slug>.<domain>:80` per app (exact hostnames use the plain HTTP challenge). Full guide: [apps/website/docs/deployment.mdx](apps/website/docs/deployment.mdx).
+Then redeploy once and confirm the `noite-tenants` router in the Traefik dashboard. First visit to a new slug pauses a few seconds for issuance; certs persist in the `noite-data` volume. Fallback if passthrough misbehaves: add `https://<slug>.<domain>:80` per app (exact hostnames use the plain HTTP challenge).
+
+## Deploy to Railway
+
+One service from the image `ghcr.io/<owner>/noite:<sha>` with a volume at `/data`, plus a bucket: R2 or Tigris (recommended), or a second service from `docker.io/rustfs/rustfs` with its own volume. Set the same variables as above, `S3_ENDPOINT` to the bucket (`http://rustfs.railway.internal:9000` for the RustFS service), `CADDY_AUTO_HTTPS=off` (Railway terminates TLS with the `*.<domain>` custom domain), the domain's target port to `80`, and `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=35` so the stop budget fits. Healthcheck path `/ready` on port `8080` if you set one (first boot can take minutes). Whether Railway grants the capabilities multi-tenant mode needs is unverified: check `make doctor`'s output (or `/ready`) on the deployed service, and run `NOITE_TENANCY=single` if isolation cannot be set up there.
+
+Full guide: [apps/website/docs/deployment.mdx](apps/website/docs/deployment.mdx).

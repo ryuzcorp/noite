@@ -49,9 +49,10 @@ pub async fn webhook(
         }
     }
     for key in &keys {
-        // Keys are `git/{slug}/refs/heads/main/{sha}.bundle` (single-bucket layout).
-        // Accept legacy `{slug}/refs/...` from the old dedicated `git` bucket.
-        let path = key.strip_prefix("git/").unwrap_or(key.as_str());
+        // Keys are `git/{slug}/refs/heads/main/{sha}.bundle`.
+        let Some(path) = key.strip_prefix("git/") else {
+            continue;
+        };
         let slug = path.split('/').next().unwrap_or("");
         if slug.is_empty() || !key.ends_with(".bundle") || !path.contains("/refs/heads/main/") {
             continue;

@@ -166,17 +166,6 @@ pub struct AppDomain {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct AppSecret {
-    pub id: String,
-    pub app_id: String,
-    pub kind: String,
-    pub access_key: String,
-    pub secret_key: String,
-    pub revealed: i64,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct AppMetric {
     pub app_id: String,

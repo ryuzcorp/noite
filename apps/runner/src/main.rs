@@ -47,6 +47,13 @@ pub struct AppState {
     /// Caddyfile written). Gates /ready so the edge never routes to a
     /// runner whose tenants are still cold-booting.
     pub ready: Arc<AtomicBool>,
+    /// Isolation self-check result (SPEC, Tenancy mode).
+    pub isolation: Arc<tokio::sync::RwLock<host::isolation::IsolationStatus>>,
+    /// Bucket state sync (SPEC, Runner state). Marked dirty by mutating
+    /// API calls (see snapshot hook in api modules).
+    pub state_sync: host::state::StateSync,
+    /// Bucket reachability probe (cached 5 s) for /ready.
+    pub bucket_ok: Arc<tokio::sync::RwLock<(bool, String, std::time::Instant)>>,
 }
 
 #[tokio::main]
@@ -61,7 +68,19 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(Config::from_env()?);
     tokio::fs::create_dir_all(&config.work_dir).await.ok();
 
+    // Before anything writes to /data: private by default (SPEC, Data directory).
+    host::isolation::harden_data_dir(&config);
+
     host::cmd::ensure_buckets(&config).await?;
+
+    // Boot: restore SQLite snapshot when the volume is empty (SPEC, Runner state). A
+    // failure other than "no snapshot" stops the boot: starting empty would
+    // upload the empty database over the good snapshot.
+    host::state::restore_if_missing(&config).await?;
+    let state_sync = host::state::StateSync::new();
+    if let Err(e) = state_sync.claim(&config).await {
+        tracing::warn!(error = %e, "could not claim runner state in the bucket; snapshots keep trying");
+    }
 
     let pool = db::connect(&config.database_url).await?;
     let swept = db::fail_stuck_deploys(&pool, DEPLOY_STUCK_MS, &HashSet::new())
@@ -71,10 +90,47 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(swept, "swept stalled deploys on boot");
     }
 
+    // Isolation: nft egress policy first, then self-checks (SPEC, Egress policy + Tenancy mode).
+    // Only in multi tenancy: the single tenant is trusted, and the policy
+    // would also cut single-tenant release commands off from the bucket.
+    let nft_installed = match (config.tenancy, config.build_uid, config.fleet_uid) {
+        (config::Tenancy::Multi, Some(b), Some(f)) => {
+            let storage = host::netisolation::storage_target(&config.s3_endpoint).await;
+            let ok = host::netisolation::ensure(b, f, &storage).await;
+            if ok {
+                host::netisolation::spawn_storage_refresh(b, f, config.s3_endpoint.clone());
+            }
+            ok
+        }
+        _ => {
+            host::netisolation::skip("single tenancy: egress policy not installed");
+            false
+        }
+    };
+    let isolation = host::isolation::self_check(&config, nft_installed).await;
+    if isolation.blocked {
+        tracing::error!(detail = %isolation.detail, "multi-tenant isolation checks failed; /ready stays 503");
+    }
+
+    // Control fleet #0: deploy the bundle baked into the image, then run it.
+    // The dev image has no bundle: `vite dev` serves the UI on the same port
+    // (docker/dev.sh), so there is nothing to deploy or supervise.
+    let control_child = if control_bundle_present(&config) {
+        if let Err(e) = host::control::ensure_deployed(&config).await {
+            tracing::warn!(error = %e, "control fleet deploy failed; continuing");
+        }
+        Some(supervise_control(&config))
+    } else {
+        tracing::info!("no control bundle (dev image): the UI is served by vite dev");
+        None
+    };
+    // The edge: Caddy as a supervised child, with a placeholder config until
+    // the first reconcile writes the real one.
+    host::children::ensure_bootstrap_caddyfile(&config.caddyfile_path).await?;
+    let caddy_child = supervise_caddy(&config);
+
     let procs = host::supervisor::new_procs();
     let logs = host::logs::new_state();
-    // Reclaim leftover soft-delete rows from pre-hard-DELETE era.
-    reclaim_legacy_soft_deletes(&pool, &config, &procs, &logs).await;
     // Rebuild bare mirrors from S3 tip bundles when the work dir is fresh.
     host::rehydrate::rehydrate_all(&pool, &config).await;
     let deploying = host::deploy::new_deploying();
@@ -85,6 +141,8 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "watermark restore"),
     }
     let ready = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    host::state::spawn_sync_task(state_sync.clone(), pool.clone(), (*config).clone());
     let state = AppState {
         pool: pool.clone(),
         config: config.clone(),
@@ -93,18 +151,24 @@ async fn main() -> anyhow::Result<()> {
         deploying: deploying.clone(),
         git_sync: host::git_manifest::GitSync::default(),
         ready: ready.clone(),
+        isolation: Arc::new(tokio::sync::RwLock::new(isolation)),
+        state_sync: state_sync.clone(),
+        bucket_ok: Arc::new(tokio::sync::RwLock::new((true, String::new(), std::time::Instant::now()))),
     };
 
     let cfg_loop = (*config).clone();
+    let shutdown_loop = shutdown.clone();
     tokio::spawn(host::loop_::run_forever(
-        pool,
+        pool.clone(),
         cfg_loop,
-        procs,
-        logs,
-        deploying,
+        procs.clone(),
+        logs.clone(),
+        deploying.clone(),
         metrics,
-        ready,
+        ready.clone(),
+        shutdown_loop,
     ));
+
 
     let app = Router::new()
         .route("/health", get(api::health))
@@ -200,39 +264,122 @@ async fn main() -> anyhow::Result<()> {
              req,
              next| async move { auth::require_bearer(s, req, next).await },
         ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            |axum::extract::State(s): axum::extract::State<AppState>,
+             req: axum::http::Request<axum::body::Body>,
+             next: axum::middleware::Next| async move {
+                let dirty = matches!(req.method(), &axum::http::Method::POST | &axum::http::Method::PATCH | &axum::http::Method::PUT | &axum::http::Method::DELETE)
+                    && req.uri().path().starts_with("/v1/");
+                let resp = next.run(req).await;
+                if dirty && resp.status().is_success() {
+                    s.state_sync.mark_dirty();
+                }
+                resp
+            },
+        ))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     tracing::info!(bind = %config.bind, "noite-runner listening");
-    axum::serve(listener, app).await?;
+    // Graceful shutdown (SPEC, Shutdown): SIGTERM/SIGINT stops the listener, then all
+    // fleets in parallel under one budget, then a final bucket snapshot.
+    // Caddy stops last so in-flight requests drain.
+    let shutdown_signal = shutdown.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+            let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+            loop {
+                tokio::select! {
+                    v = async { match sigterm.as_mut() { Some(s) => s.recv().await, None => std::future::pending().await } } => {
+                        if v.is_some() {
+                            break;
+                        }
+                    }
+                    v = async { match sigint.as_mut() { Some(s) => s.recv().await, None => std::future::pending().await } } => {
+                        if v.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.ok();
+        }
+        shutdown_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    let budget = std::time::Duration::from_millis(config.stop_budget_ms);
+    axum::serve(listener, app)
+        .with_graceful_shutdown({
+            let shutdown = shutdown.clone();
+            async move {
+                while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        })
+        .await?;
+    // Reconcile loop observes the flag and stops spawning. Tenant fleets and
+    // the control fleet stop together under the one budget; Caddy goes last
+    // so requests already in flight drain through it.
+    let control_stop = async {
+        if let Some(control) = &control_child {
+            control.stop(budget).await;
+        }
+    };
+    tokio::join!(host::supervisor::stop_all(&procs, budget), control_stop);
+    caddy_child.stop(std::time::Duration::from_secs(5)).await;
+    host::state::final_snapshot(&state_sync, &pool, &config).await;
     Ok(())
 }
 
-async fn reclaim_legacy_soft_deletes(
-    pool: &SqlitePool,
-    cfg: &Config,
-    procs: &ProcMap,
-    logs: &LogState,
-) {
-    let Ok(apps) = db::list_all_apps(pool).await else {
-        return;
-    };
-    for app in apps {
-        let soft = app.desired_state == "deleted"
-            || app.status == "deleting"
-            || app.status == "gone";
-        if !soft {
-            continue;
-        }
-        tracing::info!(slug = %app.slug, "reclaiming legacy soft-deleted app");
-        if let Err(e) = host::purge::purge_slug(cfg, procs, logs, &app.slug).await {
-            tracing::error!(slug = %app.slug, error = %e, "legacy purge failed");
-            continue;
-        }
-        if let Err(e) = db::delete_app(pool, &app.id).await {
-            tracing::error!(slug = %app.slug, error = %e, "legacy row delete failed");
-        }
-    }
+fn control_bundle_present(config: &Config) -> bool {
+    let dir = std::path::Path::new(&config.control_bundle_dir);
+    dir.join("wrangler.json").exists() || dir.join("wrangler.jsonc").exists()
 }
+
+/// Control fleet #0: celld with the public listener on loopback
+/// (Caddy is in the same container) and the internal one on the private
+/// address (see `host::control::control_advertise`). Supervised: restarted
+/// on exit, stopped with the fleets on shutdown.
+fn supervise_control(config: &Config) -> host::children::Supervised {
+    let args = host::control::spawn_args(config);
+    let shutdown_ms = config.fleet_shutdown_ms().to_string();
+    let celld = config.celld_bin.clone();
+    host::children::Supervised::start("control", move || {
+        let state_dir = "/data/control";
+        let _ = std::fs::create_dir_all(state_dir);
+        let mut cmd = tokio::process::Command::new(&celld);
+        cmd.args(&args)
+            .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
+            .env("CELLD_WATCH", state_dir)
+            .env("CELLD_READY_FLEET_GATE_MS", "15000")
+            .env("CELLD_DURABILITY", "bucket")
+            .env("CELLD_SHUTDOWN_TOTAL_MS", &shutdown_ms);
+        cmd
+    })
+}
+
+/// Caddy: admin on its default 127.0.0.1:2019, where the runner
+/// POSTs each new config (`host::caddy::load_admin`); `--watch` on the same
+/// file stays as the fallback path.
+fn supervise_caddy(config: &Config) -> host::children::Supervised {
+    let caddyfile = config.caddyfile_path.clone();
+    host::children::Supervised::start("caddy", move || {
+        let mut cmd = tokio::process::Command::new("caddy");
+        cmd.args(["run", "--config", &caddyfile, "--adapter", "caddyfile", "--watch"])
+            // Certificates and ACME state in the volume, not in the
+            // container's $HOME: a recreate must not re-issue every cert
+            // (CA rate limits) or lose the on-demand ones.
+            .env("XDG_DATA_HOME", "/data/caddy/data")
+            .env("XDG_CONFIG_HOME", "/data/caddy/config");
+        cmd
+    })
+}
+

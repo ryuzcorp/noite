@@ -4,19 +4,19 @@
 #   make backup                 # → backups/<UTC stamp>/
 #   make backup DEST=/srv/noite-backups/latest
 #
-# What lives where, and therefore what is irreplaceable:
-#   runner-data    the runner SQLite (apps, deploys, env, domains, metrics) and
-#                  the git mirrors — the only copy of deploy metadata
-#   rustfs-data    the fleet bucket: `git/` bundles, `fleets/` tenant celld,
-#                  `control/` UI worker + its D1
-#   control-state  celld's local working dir for the UI node (cache; cheap)
-#   caddy-data     certificates (re-issuable, but avoids a re-issuance storm)
-#   caddy-config   the runner-written Caddyfile + access log
+# What lives where:
+#   noite-data   the runner SQLite (apps, deploys, env, domains, metrics; also
+#                snapshotted into the bucket every minute), git mirrors,
+#                builds, fleet working dirs, Caddy config + certificates
+#   rustfs-data  the bundled bucket: `git/` bundles, `fleets/` tenant celld,
+#                `control/` UI worker + its D1, `runner/state/` snapshots
 #
-# How: ask the runner for a `VACUUM INTO` snapshot, then stop the stack (a
-# quiesced copy is the only honest one — rustfs and the runner both write
-# continuously), tar each volume into the destination, and start the stack
-# again. Downtime is the tar time.
+# With BYO S3 the bucket is not here: back it up at the provider (versioning)
+# and this script covers `noite-data` only.
+#
+# How: ask the runner for a fresh snapshot (local + bucket), stop the stack
+# (a quiesced copy is the only honest one), tar each volume, start again.
+# Downtime is the tar time.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -36,7 +36,7 @@ API_HOST_HEADER="${NOITE_API_HOST_HEADER:-api.localhost}"
 PROJECT="${COMPOSE_PROJECT_NAME:-noite}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DEST="${1:-backups/${STAMP}}"
-VOLUMES="rustfs-data runner-data control-state caddy-config caddy-data"
+VOLUMES="noite-data rustfs-data"
 
 if command -v docker >/dev/null 2>&1; then
   ENGINE=docker
@@ -50,24 +50,20 @@ esac
 CE="$ENGINE compose -f docker/compose.yaml"
 
 img_ok() { "$ENGINE" image inspect "$1" >/dev/null 2>&1; }
-if [ -n "${NOITE_BACKUP_IMAGE:-}" ]; then
-  HELPER="$NOITE_BACKUP_IMAGE"
-elif img_ok "${NOITE_RUNNER_IMAGE:-ghcr.io/ryuzcorp/noite-runner:latest}"; then
-  HELPER="${NOITE_RUNNER_IMAGE:-ghcr.io/ryuzcorp/noite-runner:latest}"
-elif img_ok noite-runner:local; then
-  HELPER=noite-runner:local
-elif img_ok docker.io/library/caddy:2.10.0-alpine; then
-  HELPER=docker.io/library/caddy:2.10.0-alpine
-else
+# Any image with `tar` will do; prefer the Noite image already on this host.
+HELPER=""
+for candidate in "${NOITE_BACKUP_IMAGE:-}" "${NOITE_IMAGE:-}" noite:local noite-dev:local ghcr.io/ryuzcorp/noite:latest; do
+  if [ -n "$candidate" ] && img_ok "$candidate"; then
+    HELPER="$candidate"
+    break
+  fi
+done
+if [ -z "$HELPER" ]; then
   echo "error: no image available to tar the volumes with."
-  echo "  build one with 'make up', or set NOITE_BACKUP_IMAGE=<image with tar>."
+  echo "  run 'make up' first, or set NOITE_BACKUP_IMAGE=<image with tar>."
   exit 1
 fi
 
-# A relative destination lands under the repo (the default); an absolute one is
-# used as given. Prefixing `pwd` onto an absolute path would mount a directory
-# that does not exist, and the engine would silently create an empty one there
-# while the tarballs went somewhere else entirely.
 case "$DEST" in
 /*) DEST_DIR="$DEST" ;;
 *) DEST_DIR="$(pwd)/${DEST}" ;;
@@ -104,9 +100,7 @@ done
   echo "noite backup"
   echo "created: ${STAMP}"
   echo "project: ${PROJECT}"
-  echo "images:"
-  echo "  runner: ${NOITE_RUNNER_IMAGE:-noite-runner:local}"
-  echo "  control: ${NOITE_CONTROL_IMAGE:-noite-control:local}"
+  echo "image: ${NOITE_IMAGE:-noite:local}"
   echo "volumes: ${VOLUMES}"
   echo "git: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
   echo "restore: make restore FROM=${DEST}"

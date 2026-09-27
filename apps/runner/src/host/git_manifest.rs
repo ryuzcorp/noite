@@ -3,8 +3,8 @@
 //! Layout: `git/{slug}/MANIFEST.json` — `{version, seq, refs: {refname: {sha,
 //! bundle}}}`. A push writes all ref tip bundles first, then the manifest
 //! once; readers resolve refs from the manifest, so a half-written push is
-//! never visible. Legacy slugs without a manifest fall back to scanning tip
-//! bundles. The manifest moves with `git/{slug}/` on rename and clears with
+//! never visible. Every push writes a complete manifest, so it is the only
+//! source of refs; a slug without one has never been pushed. The manifest moves with `git/{slug}/` on rename and clears with
 //! the prefix on purge, so no extra handling is needed there.
 //!
 //! Concurrency: the runner is the single writer; pushes to one slug are
@@ -83,7 +83,11 @@ pub async fn read_manifest(cfg: &Config, slug: &str) -> anyhow::Result<Option<Ma
     let uri = cfg.s3_uri(&manifest_key(slug));
     match cmd::s3_cp_download(cfg, &uri, &tmp).await {
         Ok(()) => {}
-        Err(_) => return Ok(None), // no manifest yet → legacy bundle scan
+        // Never pushed. Any other failure is an error: treating an
+        // unreachable store as "no manifest" would restart `seq` and write a
+        // manifest holding only this push's refs, dropping the others.
+        Err(e) if cmd::is_not_found(&e) => return Ok(None),
+        Err(e) => return Err(e.context("read git manifest")),
     }
     let bytes = tokio::fs::read(&tmp).await?;
     let _ = tokio::fs::remove_file(&tmp).await;

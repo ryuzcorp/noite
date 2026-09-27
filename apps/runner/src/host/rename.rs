@@ -197,6 +197,9 @@ async fn rename_slugged(
         &cfg.fleets_uri(new_slug),
     )
     .await?;
+    // The prefix changed, so a scoped pair for the old prefix must not
+    // survive (SPEC, Scoped credentials). A scoped provider mints the new-prefix pair here.
+    let _ = crate::host::credentials::revoke(pool, &app.id).await;
     // The loop may have respawned the old-slug fleet mid-move (it reads the
     // pre-update row); kill it and re-sweep both prefixes so late writes
     // land under the new slug instead of orphaning under the old one.

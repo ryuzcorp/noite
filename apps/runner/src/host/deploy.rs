@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use crate::config::Config;
+use crate::config::{Config, Tenancy};
 use crate::db;
-use crate::host::cmd::{self, TipBundle};
+use crate::host::cmd::{self, Sandbox, TipBundle};
+use crate::host::credentials;
 use crate::host::logs::LogState;
 use crate::host::supervisor::{self, ProcMap};
 use crate::lifecycle::sha_same;
@@ -133,6 +134,14 @@ async fn deploy_inner(
             .to_string(),
     );
     tokio::fs::create_dir_all(&work).await?;
+    // builds/<slug>/ is created private (umask 077); the build user must be
+    // able to reach its worktree through it, and bun lists parent
+    // directories to resolve a project (see isolation::harden_data_dir).
+    #[cfg(unix)]
+    if let Some(slug_dir) = work.parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(slug_dir, std::fs::Permissions::from_mode(0o755));
+    }
 
     let mut deploy_id = db::upsert_deploy(
         pool,
@@ -167,13 +176,37 @@ async fn deploy_inner(
     .await?;
 
     let src_dir = materialize_bundle(cfg, app, &work, &bundle_path, &commit_sha).await?;
-
     // Tenant env (`.dev.vars` model): build + release see the same vars the
-    // fleet gets at spawn. Reserved platform names filtered in db.
+    // fleet gets at spawn. Reserved platform names filtered in db (now
+    // including RUNNER_*/NOITE_*/BETTER_AUTH_*/CADDY_*/LD_*/NODE_OPTIONS/BUN_*).
     let tenant = db::tenant_env(pool, &app.id).await;
     let tenant_refs: Vec<(&str, &str)> =
         tenant.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
+    // Tenancy gate (SPEC, Tenancy mode): multi-tenant builds require the uid drop.
+    // Without CAP_SETUID/CAP_SETGID the runner refuses builds rather than
+    // running tenant scripts as itself with platform secrets in reach.
+    let multi = cfg.tenancy == Tenancy::Multi;
+    let sandbox_ok = match (cfg.build_uid, cfg.build_gid) {
+        (Some(u), Some(g)) => cmd::can_drop_uid(u, g),
+        (Some(u), None) => cmd::can_drop_uid(u, u),
+        _ => false,
+    };
+    if multi && !sandbox_ok {
+        anyhow::bail!("build sandbox unavailable (no CAP_SETUID/SETGID for build uid); refusing build in multi-tenant mode");
+    }
+    if multi && cfg.build_uid.is_none() {
+        anyhow::bail!("build sandbox unavailable (RUNNER_BUILD_UID unset); refusing build in multi-tenant mode");
+    }
+    // Hand the worktree to the build uid before tenant scripts run.
+    if let (Some(uid), Some(gid)) = (cfg.build_uid, cfg.build_gid) {
+        if sandbox_ok && !cmd::lchown_tree(&work, uid, gid) {
+            tracing::warn!(slug = %app.slug, "chown worktree to build uid failed; continuing (needs CAP_CHOWN)");
+        }
+    }
+    let sb = Sandbox { uid: if sandbox_ok { cfg.build_uid } else { None }, gid: if sandbox_ok { cfg.build_gid } else { None }, env: &tenant_refs };
+
+    cmd::check_work_quota(&work, cfg.build_max_mb)?;
     if tokio::fs::try_exists(src_dir.join("package.json")).await? {
         deploy_id = db::upsert_deploy(
             pool,
@@ -184,14 +217,8 @@ async fn deploy_inner(
             "bun install\n",
         )
         .await?;
-        cmd::run_cmd(
-            "bun",
-            &["install"],
-            Some(&src_dir),
-            &tenant_refs,
-            Duration::from_secs(300),
-        )
-        .await?;
+        cmd::run_sandboxed("bun", &["install"], &src_dir, &sb, Duration::from_secs(300)).await?;
+        cmd::check_work_quota(&work, cfg.build_max_mb)?;
         let pkg_text = tokio::fs::read_to_string(src_dir.join("package.json")).await?;
         if pkg_text.contains("\"build\"") {
             deploy_id = db::upsert_deploy(
@@ -203,14 +230,8 @@ async fn deploy_inner(
                 "bun run build\n",
             )
             .await?;
-            cmd::run_cmd(
-                "bun",
-                &["run", "build"],
-                Some(&src_dir),
-                &tenant_refs,
-                Duration::from_secs(300),
-            )
-            .await?;
+            cmd::run_sandboxed("bun", &["run", "build"], &src_dir, &sb, Duration::from_secs(300)).await?;
+            cmd::check_work_quota(&work, cfg.build_max_mb)?;
         }
     }
 
@@ -225,6 +246,8 @@ async fn deploy_inner(
     // One-shot release command (`"release": "bun run db:migrate"` in the
     // tenant wrangler config), run once after build, before `celld deploy`.
     // Failure aborts: the old release keeps serving. 10 min hard timeout.
+    // Release must not see root keys (SPEC, Build and release sandbox): in multi it gets the scoped
+    // credential or is disabled with a clear log line; single keeps root.
     if let Some(release) = release_cmd(&src_dir).await {
         deploy_id = db::upsert_deploy(
             pool,
@@ -235,31 +258,67 @@ async fn deploy_inner(
             &format!("release: {release}\n"),
         )
         .await?;
-        let env_owned = cmd::aws_env(cfg);
-        let mut cmd_env: Vec<(&str, &str)> =
-            env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        cmd_env.push(("S3_ENDPOINT", cfg.s3_endpoint.as_str()));
-        cmd_env.extend(tenant_refs.iter().copied());
-        let out = cmd::run_cmd(
-            "sh",
-            &["-c", &release],
-            Some(&src_dir),
-            &cmd_env,
-            Duration::from_secs(600),
-        )
-        .await?;
-        let tail = if out.len() > 4096 { &out[out.len() - 4096..] } else { &out };
-        deploy_id = db::upsert_deploy(
-            pool,
-            Some(&deploy_id),
-            &app.id,
-            DeployStatus::Building.as_str(),
-            Some(&commit_sha),
-            &format!("{tail}\n"),
-        )
-        .await?;
+        let scoped = credentials::tenant_process_credentials(pool, cfg, &app.slug)
+            .await
+            .ok()
+            .flatten();
+        if scoped.is_none() {
+            deploy_id = db::upsert_deploy(
+                pool,
+                Some(&deploy_id),
+                &app.id,
+                DeployStatus::Building.as_str(),
+                Some(&commit_sha),
+                "release skipped: multi-tenant mode runs release commands only with scoped bucket credentials (SPEC, Scoped credentials)\n",
+            )
+            .await?;
+        } else {
+            let mut owned: Vec<(String, String)> = Vec::new();
+            if let Some(s) = scoped {
+                owned.push(("AWS_ACCESS_KEY_ID".into(), s.access_key));
+                owned.push(("AWS_SECRET_ACCESS_KEY".into(), s.secret_key));
+                owned.push(("AWS_REGION".into(), cfg.aws_region.clone()));
+                owned.push(("AWS_DEFAULT_REGION".into(), cfg.aws_region.clone()));
+                owned.push(("AWS_EC2_METADATA_DISABLED".into(), "true".into()));
+            }
+            owned.push(("S3_ENDPOINT".into(), cfg.s3_endpoint.clone()));
+            owned.push(("NOITE_S3_BUCKET".into(), cfg.s3_bucket.clone()));
+            owned.push(("NOITE_APP_PREFIX".into(), format!("fleets/{}", app.slug)));
+            let mut cmd_env: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            cmd_env.extend(tenant_refs.iter().copied());
+            let sb_release = Sandbox { uid: sb.uid, gid: sb.gid, env: &cmd_env };
+            let out = cmd::run_sandboxed("sh", &["-c", &release], &src_dir, &sb_release, Duration::from_secs(600)).await?;
+            let tail = if out.len() > 4096 { &out[out.len() - 4096..] } else { &out };
+            deploy_id = db::upsert_deploy(
+                pool,
+                Some(&deploy_id),
+                &app.id,
+                DeployStatus::Building.as_str(),
+                Some(&commit_sha),
+                &format!("{tail}\n"),
+            )
+            .await?;
+        }
     }
 
+
+
+    // Tenant steps are over: take the tree back from the build user, so
+    // nothing it left behind can change the bundle `celld deploy` uploads.
+    #[cfg(unix)]
+    if sb.uid.is_some() {
+        // SAFETY: geteuid/getegid cannot fail.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        if !cmd::lchown_tree(&work, uid, gid) {
+            anyhow::bail!("could not take the worktree back from the build user; refusing to deploy it");
+        }
+    }
+    // `release` is Noite's key, not Wrangler's: celld deploy refuses any
+    // config key it does not know, so drop it once the release step ran.
+    strip_noite_keys(&deploy_root).await?;
+    if deploy_root != src_dir {
+        strip_noite_keys(&src_dir).await?;
+    }
     deploy_id = db::upsert_deploy(
         pool,
         Some(&deploy_id),
@@ -387,6 +446,43 @@ async fn release_cmd(src_dir: &Path) -> Option<String> {
     None
 }
 
+/// Config keys Noite reads from the tenant's Wrangler file that celld does
+/// not accept.
+const NOITE_WRANGLER_KEYS: &[&str] = &["release"];
+
+/// Remove Noite-only keys from `dir`'s wrangler.json(c) before `celld
+/// deploy`. A file is rewritten only when it carried one; comments in a
+/// .jsonc are dropped then, which only affects this build's copy.
+async fn strip_noite_keys(dir: &Path) -> anyhow::Result<()> {
+    for name in ["wrangler.jsonc", "wrangler.json"] {
+        let path = dir.join(name);
+        let Ok(text) = tokio::fs::read_to_string(&path).await else {
+            continue;
+        };
+        let Some(stripped) = without_noite_keys(&text)? else {
+            continue;
+        };
+        tokio::fs::write(&path, stripped).await?;
+    }
+    Ok(())
+}
+
+/// The config without Noite-only keys, or `None` when it has none.
+fn without_noite_keys(text: &str) -> anyhow::Result<Option<String>> {
+    let mut value = crate::host::storage::parse_wrangler(text)?;
+    let Some(obj) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    let before = obj.len();
+    for key in NOITE_WRANGLER_KEYS {
+        obj.remove(*key);
+    }
+    if obj.len() == before {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string_pretty(&value)?))
+}
+
 async fn find_deploy_root(dir: &PathBuf) -> anyhow::Result<Option<PathBuf>> {
     for name in ["wrangler.jsonc", "wrangler.json", "wrangler.toml"] {
         if tokio::fs::try_exists(dir.join(name)).await? {
@@ -440,4 +536,21 @@ pub async fn deploy_tip(
         Some(&tip.sha),
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::without_noite_keys;
+
+    #[test]
+    fn release_is_stripped_and_other_keys_survive() {
+        let jsonc = "{\n  // tenant comment\n  \"name\": \"a\",\n  \"release\": \"bun run migrate\",\n  \"main\": \"index.js\"\n}";
+        let out = without_noite_keys(jsonc).unwrap().expect("rewritten");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("release").is_none());
+        assert_eq!(v["name"], "a");
+        assert_eq!(v["main"], "index.js");
+        // Nothing to strip: the file is left alone.
+        assert!(without_noite_keys("{\"name\": \"a\"}").unwrap().is_none());
+    }
 }

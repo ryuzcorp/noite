@@ -195,7 +195,7 @@ export const getAuthDb = () =>
 export const sqlLive = () => D1Client.layer({ db: resolveD1() });
 
 /** The setup pass itself: migrations, the schema heal, and the one-time
- * backfills below. `ensureDb` runs it at most once per isolate. */
+ * admin bootstrap below. `ensureDb` runs it at most once per isolate. */
 const runDbSetup = Effect.gen(function* runDbSetup() {
   yield* migrator.migrate;
   // The migrator tracks a single plan id, so a DB created under an older
@@ -211,13 +211,6 @@ const runDbSetup = Effect.gen(function* runDbSetup() {
       yield* sql.unsafe(healed, stmt.parameters);
     }
   }
-  // Pre-scope API keys stored NULL permissions, which fail scoped verification.
-  // Grant them the full set once (matches the plugin defaultPermissions for
-  // new keys); a no-op when every key already carries permissions.
-  yield* sql.unsafe(
-    `UPDATE apikey SET permissions = '{"apps":["manage"],"events":["push"]}' WHERE permissions IS NULL`,
-    []
-  );
   // Instance admin bootstrap (runs once per process at startup): if
   // NOITE_ADMIN_EMAIL names an already-registered account, ensure it
   // holds the admin role. No-op when unset or not yet registered.

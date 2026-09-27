@@ -46,6 +46,9 @@ pub async fn d1_preview(
     // celld d1 must resolve the declared database from this app's own
     // wrangler.jsonc (cwd), and needs its S3 bucket to find the fleet node.
     // Use the stored fleet bucket exactly as ensure_fleet passes it to celld.
+    // NOTE (SPEC, Scoped credentials follow-up): route through credentials::app_credentials once
+    // per-store scoped minters land (needs pool plumbed through preview/write
+    // + api callers); today that returns root in single-tenant anyway.
     let proj = ensure_project(cfg, app).await?;
     let bucket = app.fleet_bucket.clone();
     let env_owned = cmd::aws_env(cfg);

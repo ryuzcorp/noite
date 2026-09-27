@@ -2,16 +2,13 @@
 -- (`db::connect`), with no migration ledger: every statement is
 -- CREATE ... IF NOT EXISTS, so a fresh database is built and an existing one
 -- is upgraded in place. Nothing to order, nothing to checksum, nothing to
--- rewrite when a table changes shape. The old four-file `migrations/` history
--- (and its `_sqlx_migrations` ledger) is retired below.
+-- rewrite when a table changes shape.
 --
--- Retired tables are DROPPED here rather than versioned away: this file is the
--- single source of truth for the runner's shape, and the runner is the only
--- copy of deploy metadata, so leaving orphan tables around would only invite
--- accidental reads.
+-- A table that goes away is DROPPED here (DROP TABLE IF EXISTS) rather than
+-- versioned away: this file is the single source of truth for the runner's
+-- shape, and leaving orphan tables around would only invite accidental reads.
 
--- Apps: one row per tenant app. Hard DELETE is the only remove path (legacy
--- soft-delete rows are reclaimed at boot; see `reclaim_legacy_soft_deletes`).
+-- Apps: one row per tenant app. Hard DELETE is the only remove path.
 CREATE TABLE IF NOT EXISTS app (
   id TEXT PRIMARY KEY NOT NULL,
   slug TEXT NOT NULL UNIQUE,
@@ -31,29 +28,6 @@ CREATE TABLE IF NOT EXISTS app (
 );
 
 CREATE INDEX IF NOT EXISTS idx_app_user ON app(user_id);
-
--- Per-app fleet credentials (`kind = 'fleet'`): legacy scoped S3 keys for a
--- tenant's celld fleet, minted by the retired Bun host plane. The supervisor
--- still honours an existing row (host/supervisor.rs) and otherwise uses the
--- root keys; nothing mints new ones.
-CREATE TABLE IF NOT EXISTS app_secret (
-  id TEXT PRIMARY KEY NOT NULL,
-  app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,
-  kind TEXT NOT NULL,
-  access_key TEXT NOT NULL,
-  secret_key TEXT NOT NULL,
-  revealed INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_app_secret_app ON app_secret(app_id);
-
--- Retired `kind = 'git_push'` rows (Git auth is profile API keys + collaborator
--- checks via the control UI). No-op once cleared.
-DELETE FROM app_secret WHERE kind = 'git_push';
-
--- Ledger of the retired multi-file migrator.
-DROP TABLE IF EXISTS _sqlx_migrations;
 
 -- Deploy attempts: status + capped build/deploy log tail per push.
 CREATE TABLE IF NOT EXISTS deploy (
@@ -185,4 +159,14 @@ CREATE INDEX IF NOT EXISTS idx_app_domain_app ON app_domain(app_id);
 CREATE TABLE IF NOT EXISTS metric_watermark (
   slug TEXT PRIMARY KEY NOT NULL,
   after_us INTEGER NOT NULL
+);
+
+-- Scoped per-app credentials (SPEC, Scoped credentials): one encrypted row per
+-- app. Nonce + AES-GCM ciphertext over JSON {access_key, secret_key}; the KEK
+-- derives from RUNNER_TOKEN via HKDF, so the bucket snapshot is not a key dump.
+CREATE TABLE IF NOT EXISTS app_credential (
+  app_id TEXT PRIMARY KEY NOT NULL,
+  nonce BLOB NOT NULL,
+  ciphertext BLOB NOT NULL,
+  updated_at TEXT NOT NULL
 );

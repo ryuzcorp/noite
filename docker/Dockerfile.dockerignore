@@ -1,0 +1,29 @@
+# Build-context guard for docker/Dockerfile (the single image). Patterns are
+# relative to the repo-root context, and nested paths need `**/` (a bare name
+# matches the context root only). Keeps the 2.5 GB cargo target/,
+# node_modules, local state and every dotenv file (so no secret enters the
+# build context) out of the tar stream. The runner's and the
+# UI's sources must stay IN the context: both are built inside the image.
+
+**/target
+**/dist
+**/out
+**/node_modules
+**/.wrangler
+**/.celld
+data
+**/*.sqlite
+**/*.sqlite-shm
+**/*.sqlite-wal
+**/.git
+**/.gitignore
+**/*.dockerignore
+**/.idea
+**/.env
+**/.env.*
+!**/.env.example
+**/.dev.vars
+**/.dev.vars.*
+**/*.md
+**/*.mdx
+backups

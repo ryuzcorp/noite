@@ -1,0 +1,8 @@
+# Build the image from this tree instead of pulling it (`make up`).
+services:
+  noite:
+    image: noite:local
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: noite

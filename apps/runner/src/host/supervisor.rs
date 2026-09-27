@@ -9,9 +9,39 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::db;
-use crate::host::logs::{self, LogState};
+use crate::host::{credentials, logs};
+use crate::host::logs::LogState;
 use crate::models::App;
 use sqlx::SqlitePool;
+
+/// Send SIGTERM to a pid (replaces the `/bin/sh -c kill` workaround; the
+/// image has no `/bin/kill`). Returns false when the pid is already gone.
+fn sigterm(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: kill with SIGTERM has no process-state side effects beyond
+        // the signal itself.
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn sigkill(pid: u32) {
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
 
 pub type ProcMap = Arc<Mutex<HashMap<String, Child>>>;
 
@@ -19,40 +49,81 @@ pub fn new_procs() -> ProcMap {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// Stop one tenant fleet. The docs are explicit about how a node stops:
-/// "celld shuts a node down gracefully on SIGTERM or SIGINT, the signals that
-/// `systemctl stop`, `docker stop`, and a Kubernetes pod delete send" — it
-/// cancels in-flight work, proves durability, publishes its snapshot, releases
-/// its leases and seals the node log. SIGKILL skips all of that, which is what
-/// the old `child.kill()` did, and a hard stop is also how a purge leaves
-/// half-written leases/LTX behind in the prefix it is about to delete. So:
-/// SIGTERM, wait for the seal, and SIGKILL only as a bounded fallback.
+/// Stop one tenant fleet. The docs are explicit: celld shuts down gracefully
+/// on SIGTERM/SIGINT (cancel work, prove durability, release leases, seal
+/// the node log). SIGKILL only as a bounded fallback.
 pub async fn stop_fleet(procs: &ProcMap, slug: &str) {
     let mut map = procs.lock().await;
     let Some(mut child) = map.remove(slug) else {
         return;
     };
+    drop(map);
     if let Some(pid) = child.id() {
-        // No signal crate and no `/bin/kill` in this image (the `kill` that
-        // exists is the shell builtin), so send the documented signal through
-        // a shell. `pid` comes from the OS, never from input.
-        let _ = tokio::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!("kill -TERM {}", pid))
-            .status()
-            .await;
+        sigterm(pid);
     }
     if tokio::time::timeout(Duration::from_secs(15), child.wait())
         .await
         .is_err()
     {
         tracing::warn!(slug, "celld did not stop within 15s; killing");
-        let _ = child.kill().await;
-        // Wait so the node cannot rewrite leases / LTX into a prefix we are
-        // about to wipe (partial S3 clears leave RestoreFailed cells).
+        if let Some(pid) = child.id() {
+            sigkill(pid);
+        } else {
+            let _ = child.kill().await;
+        }
         let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
     }
     tracing::info!(slug, "stopped celld");
+}
+
+/// Signal every fleet at once, then join waits under one budget
+/// (SPEC, Shutdown). Survivors past the budget get SIGKILL. Caddy
+/// is stopped last by the caller so in-flight requests drain.
+pub async fn stop_all(procs: &ProcMap, budget: Duration) {
+    let mut children: Vec<(String, Child, Option<u32>)> = Vec::new();
+    {
+        let mut map = procs.lock().await;
+        for (slug, child) in map.drain() {
+            let pid = child.id();
+            children.push((slug, child, pid));
+        }
+    }
+    for (_, _, pid) in &children {
+        if let Some(pid) = pid {
+            sigterm(*pid);
+        }
+    }
+    if children.is_empty() {
+        return;
+    }
+    let deadline = tokio::time::sleep(budget);
+    tokio::pin!(deadline);
+    let mut remaining: Vec<(String, Child)> =
+        children.into_iter().map(|(s, c, _)| (s, c)).collect();
+    let waits = remaining.iter_mut().map(|(s, c)| async move {
+        let st = c.wait().await.ok();
+        (s.clone(), st)
+    });
+    tokio::select! {
+        done = futures::future::join_all(waits) => {
+            for (slug, _) in done {
+                tracing::info!(slug, "stopped celld");
+            }
+        }
+        _ = &mut deadline => {
+            for (slug, child) in &mut remaining {
+                tracing::warn!(slug, "fleet past stop budget; killing");
+                if let Some(pid) = child.id() {
+                    sigkill(pid);
+                } else {
+                    let _ = child.kill().await;
+                }
+            }
+            for (_, mut child) in remaining {
+                let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+            }
+        }
+    }
 }
 
 pub async fn ensure_fleet(
@@ -84,24 +155,31 @@ pub async fn ensure_fleet(
 
     let state_dir = format!("{}/fleets/{}", cfg.work_dir, app.slug);
     tokio::fs::create_dir_all(&state_dir).await?;
-
-    let secret = db::get_secret(pool, &app.id, "fleet").await?;
-    let access = secret
-        .as_ref()
-        .map(|s| s.access_key.as_str())
-        .unwrap_or(&cfg.aws_access_key_id);
-    let secret_key = secret
-        .as_ref()
-        .map(|s| s.secret_key.as_str())
-        .unwrap_or(&cfg.aws_secret_access_key);
-
-    // Advertise on loopback: fleets run as children of the runner in its own
-    // network namespace, and the runner already reaches them at
-    // 127.0.0.1:{internal} (reload_fleet). A hostname advertise
+    // celld runs as the fleet user: the whole state dir must be its own,
+    // including SQLite / replication files an earlier runner (root, or the
+    // an older build of this image) left there, or the fleet cannot open its
+    // cells.
+    #[cfg(unix)]
+    if let Some(uid) = cfg.fleet_uid {
+        if !crate::host::cmd::lchown_tree(
+            std::path::Path::new(&state_dir),
+            uid,
+            cfg.fleet_gid.unwrap_or(uid),
+        ) {
+            tracing::warn!(slug = %app.slug, "could not hand the fleet state dir to the fleet user");
+        }
+    }
+    let creds = credentials::fleet_credentials(pool, cfg, &app.slug).await?;
+    let (access, secret_key) = (creds.access_key, creds.secret_key);
+    // Advertise on loopback: a tenant fleet is a single node, a child of the
+    // runner in its own network namespace, and the runner already reaches it
+    // at 127.0.0.1:{internal} (reload_fleet). A hostname advertise
     // (fleet-{slug}) doesn't resolve inside the container, which breaks celld
-    // node discovery (d1/diagnose read the lease and dial `addr`).
+    // node discovery (d1/diagnose read the lease and dial `addr`). The
+    // internal listener binds loopback too: it carries celld's
+    // unauthenticated operator API (SPEC, Egress policy).
     let listen_addr = format!("0.0.0.0:{listen}");
-    let internal_addr = format!("0.0.0.0:{internal}");
+    let internal_addr = format!("127.0.0.1:{internal}");
     let advertise_addr = format!("127.0.0.1:{internal}");
     let mut cmd = Command::new(&cfg.celld_bin);
     cmd.args([
@@ -125,6 +203,9 @@ pub async fn ensure_fleet(
     .env("S3_ENDPOINT", &cfg.s3_endpoint)
     .env("CELLD_WATCH", &state_dir)
     .env("CELLD_DURABILITY", "bucket")
+    // Inside the runner's stop budget, so celld seals its node log before
+    // the runner's own SIGKILL fallback (SPEC, Shutdown).
+    .env("CELLD_SHUTDOWN_TOTAL_MS", cfg.fleet_shutdown_ms().to_string())
     // Bounds. Read the docs' knobs rather than letting every fleet assume it
     // owns the whole host: the memory ceiling makes celld shed cells (503 +
     // Retry-After) instead of the container OOM-ing every other tenant, and
@@ -138,14 +219,22 @@ pub async fn ensure_fleet(
     .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
     // Fleet telemetry -> Parquet in the fleet bucket (celld OTel, bucket
     // sink), the documented query path for request counts. The flush is the
-    // docs' near-live value and the runner compacted the previous hour
+    // docs' near-live value and the runner compacts the previous hour
     // (`metrics::compact_fleet`) — a short flush without that job makes DuckDB
     // read thousands of tiny files. Retention matches the app_metric prune.
     .env("CELLD_OTEL", "1")
     .env("CELLD_OTEL_FLUSH_MS", crate::host::metrics::OTEL_FLUSH_MS.to_string())
     .env("CELLD_OTEL_RETENTION", "14d");
-    // Tenant env (`.dev.vars` model): UI-set vars reach the fleet here.
-    // Reserved platform names are already filtered by db::tenant_env.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        if let Some(uid) = cfg.fleet_uid {
+            cmd.as_std_mut().uid(uid);
+        }
+        if let Some(gid) = cfg.fleet_gid {
+            cmd.as_std_mut().gid(gid);
+        }
+    }
     for (k, v) in db::tenant_env(pool, &app.id).await {
         cmd.env(k, v);
     }

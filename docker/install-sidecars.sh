@@ -1,8 +1,7 @@
 #!/bin/sh
 # Shared sidecar installer: esbuild + duckdb CLI at pinned versions.
-# Single source of truth — consumed by docker/Dockerfile.runner,
-# docker/Dockerfile.runner-dev, docker/Dockerfile.tools and
-# docker/Dockerfile.ui. Bump versions here, not in each image.
+# Single source of truth for these pins, consumed by docker/Dockerfile
+# (both targets). Bump versions here, not in the Dockerfile.
 #
 # Usage: sh install-sidecars.sh [esbuild] [duckdb]   (no args = both)
 #

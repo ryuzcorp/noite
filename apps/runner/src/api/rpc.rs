@@ -160,15 +160,6 @@ async fn dispatch_call(
                 return bad(&id, "invalid name/slug");
             }
             match db::get_app_by_slug(&state.pool, &slug).await {
-                Ok(Some(existing))
-                    if existing.desired_state == "deleted"
-                        || existing.status == "deleting"
-                        || existing.status == "gone" =>
-                {
-                    if let Err(e) = db::delete_app(&state.pool, &existing.id).await {
-                        return internal(&id, format!("failed to reclaim slug row: {e}"));
-                    }
-                }
                 Ok(Some(_)) => return conflict(&id, "slug already taken".into()),
                 Ok(None) => {}
                 Err(e) => return internal(&id, e.to_string()),
@@ -178,7 +169,7 @@ async fn dispatch_call(
                 return internal(&id, format!("failed to clear slug data: {e:#}"));
             }
             let (listen, internal_port) =
-                match db::next_ports(&state.pool, state.config.port_base).await {
+                match db::next_ports_in(&state.pool, state.config.fleet_port_min, state.config.fleet_port_max).await {
                     Ok(p) => p,
                     Err(e) => return internal(&id, e.to_string()),
                 };

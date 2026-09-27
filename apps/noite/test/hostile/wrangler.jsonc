@@ -1,0 +1,6 @@
+{
+  "name": "hostile",
+  "main": "index.js",
+  "compatibility_date": "2026-01-01",
+  "release": "bun release-probe.js",
+}

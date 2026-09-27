@@ -34,7 +34,6 @@ pub fn access_log_path(cfg: &Config) -> PathBuf {
 }
 
 fn offset_path(cfg: &Config) -> PathBuf {
-    // Legacy name kept so upgrades don't re-ingest the whole file.
     std::path::Path::new(&cfg.caddy_access_log)
         .parent()
         .map(|p| p.join("access-log.offset"))

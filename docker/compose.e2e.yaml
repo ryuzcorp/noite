@@ -1,35 +1,20 @@
-# E2E overlay (`make e2e`, via docker/e2e-local.sh): raw localhost:ports, no
-# Caddy, no subdomains. Same images and same services as prod minus the edge.
-#
-# Ports: runner API/git/health/ready on :8080, control UI on :8090, tenant
-# fleets on their 81xx listen ports. Everything else (env, health gates) comes
-# from docker/compose.yaml.
-#
-# State: this lane runs as its own compose project (-p noite-e2e), so the
-# named volumes are `noite-e2e_*` — `down -v` in the lane can only ever remove
-# those, never dev/prod storage. The fleet bucket is `noite-e2e` (dev/prod use
-# `noite`), and wiping the rustfs volume wipes the bucket with it.
+# E2E lane (`make e2e`, docker/e2e-local.sh): its own project (`-p
+# noite-e2e`) and bucket, raw ports for the Playwright helpers. The control
+# UI is reached through Caddy (the lane sets HTTP_PORT=8090, so
+# http://localhost:8090 serves it); the runner API and Git on :8080; tenant
+# fleets on their own ports.
 services:
-  runner:
+  noite:
     ports:
       - "8080:8080"
-      - "8100-8199:8100-8199"
+      - "20000-20099:20000-20099"
     environment:
-      # Raw-port git remote (no subdomains in this lane).
-      GIT_PUBLIC_BASE: http://localhost:8080/v1/git
       NOITE_S3_BUCKET: noite-e2e
-      S3_PUBLIC_ENDPOINT: http://localhost:9000
-
-  control:
-    ports:
-      - "8090:8090"
-    environment:
       BETTER_AUTH_URL: http://localhost:8090
-      NOITE_S3_BUCKET: noite-e2e
-      S3_PUBLIC_ENDPOINT: http://localhost:9000
-      # This lane has no proxy, so no client IP reaches the worker and every
-      # request shares one bucket per route class. The suite drives the whole
-      # UI from one address, so the production budgets would throttle it; the
-      # limiter itself is exercised by hand (`NOITE_RATE_LIMIT_RPM=5`).
+      GIT_PUBLIC_BASE: http://localhost:8080/v1/git
+      S3_PUBLIC_ENDPOINT: http://localhost:${RUSTFS_API_PORT:-19000}
+      # No proxy in front of the lane: every request shares one client key.
       NOITE_RATE_LIMIT_RPM: "100000"
       NOITE_AUTH_RATE_LIMIT: "100000"
+      # `E2E_TENANCY=multi` runs the isolation lane (hostile tenant spec).
+      NOITE_TENANCY: ${E2E_TENANCY:-single}

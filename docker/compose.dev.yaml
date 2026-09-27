@@ -1,91 +1,43 @@
-# Dev overlay: same 4 services as prod (`docker/compose.yaml`), dev processes.
-# `control` runs `vite dev` (real Oxide + Cloudflare plugin pipeline: workerd,
-# local D1, HMR) instead of the celld node's deployed bundle, and `runner` runs
-# cargo-watch against a bind-mounted source tree.
-#
-#   make dev
-#
-# Worker secrets come from this service's environment (see
-# CLOUDFLARE_INCLUDE_PROCESS_ENV below) — the same single source prod uses,
-# where the entrypoint patches the worker's vars from the container env.
-# Never run dev and prod at once — same container names, ports and volumes.
+# Dev overlay (`make dev`): the same one service, from the Dockerfile's `dev`
+# target, with the sources bind-mounted. docker/dev.sh runs the control UI
+# (`vite dev` on 127.0.0.1:8090, where Caddy expects control) and the runner
+# (`cargo watch`); the runner supervises Caddy and the tenant fleets as in
+# prod. Never run dev and prod at once: same project, ports and volumes.
 services:
-  runner:
+  noite:
+    image: noite-dev:local
     build:
       context: ..
-      dockerfile: docker/Dockerfile.runner-dev
-    image: noite-runner-dev:local
-    # hostname/restart/networks/healthcheck/env/volume for runner state all
-    # come from the prod service — dev only replaces what differs.
+      dockerfile: docker/Dockerfile
+      target: dev
     volumes:
       - ../apps/runner:/src:z
-      - ../docker/runner-dev.sh:/runner-dev.sh:ro,z
-      - runner-cargo-registry:/usr/local/cargo/registry
-      - runner-cargo-git:/usr/local/cargo/git
+      - ../apps/noite:/app:z
+      - ../docker/dev.sh:/opt/noite/dev.sh:ro,z
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
       - runner-target:/src/target
-    working_dir: /src
+      - bun-cache:/root/.bun/install/cache
+      # The vite optimizer cache holds absolute paths: host runs write
+      # /home/<user>/…, the container sees /app/…, so it keeps its own.
+      - vite-cache:/app/node_modules/.vite
     environment:
       RUST_LOG: ${RUST_LOG:-noite_runner=debug,tower_http=info}
-      CARGO_TERM_COLOR: always
       RUNNER_DEV_RELEASE: ${RUNNER_DEV_RELEASE:-0}
-    command: ["/bin/sh", "/runner-dev.sh"]
-    healthcheck:
-      # Debug compile on first boot takes minutes — the prod start_period
-      # (60s) would flap, and caddy waits on this gate.
-      test: ["CMD", "curl", "-fs", "http://localhost:8080/ready"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 600s
-
-  control:
-    # Dev flavor of the prod celld node: tools image + source bind mount +
-    # docker/control-dev.sh (`vite dev`).
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.tools
-    image: noite-tools:local
-    # Reset the image entrypoint (the UI image deploys a bundle and execs
-    # celld; dev runs vite) — `entrypoint: []` restores the image default.
-    entrypoint: []
-    environment:
-      PORT: "8090"
       # 1 = polling file watcher (flaky rootless inotify).
       VITE_USE_POLLING: ${VITE_USE_POLLING:-0}
-      # Marks the dev lane for `make doctor`: this container serves the UI with
-      # `vite dev`, so the celld node checks do not apply to it.
-      NOITE_DEV: "1"
-      # Worker bindings from this container's environment, which compose fills
-      # from the root `.env`. Wrangler's dev-var loader reads `.dev.vars`/`.env`
-      # only — it skips `process.env` unless this flag is exactly "true" — so
-      # without it the worker gets `wrangler.jsonc` `vars` alone and every
-      # `/api/auth/*` call answers 500 "BETTER_AUTH_SECRET is missing".
-      # `apps/noite/.dev.vars` still overrides this when present (wrangler
-      # prefers the file), for a value that should not live in `.env`.
+      # Worker bindings from this container's environment: wrangler's dev-var
+      # loader reads `.dev.vars`/`.env` only unless this is exactly "true",
+      # and without it every /api/auth/* call answers 500 "BETTER_AUTH_SECRET
+      # is missing". `apps/noite/.dev.vars` still wins when present.
       CLOUDFLARE_INCLUDE_PROCESS_ENV: "true"
-    volumes:
-      - ../apps/noite:/app:z
-      - ../docker/control-dev.sh:/control-dev.sh:ro,z
-      - bun-cache:/root/.bun/install/cache
-      # Vite optimizer cache holds absolute paths: host runs write
-      # /home/<user>/…, the container sees /app/…, and sharing it poisons
-      # worker-entry analysis — so the container keeps its own warm cache.
-      - vite-cache:/app/node_modules/.vite
-    command: ["/bin/sh", "/control-dev.sh"]
     healthcheck:
-      # Dev serves the UI with `vite dev`, not a celld node, so the base
-      # service's documented celld health path cannot answer here. Gate on the
-      # dev server itself; the first boot also runs `bun install`.
-      test: ["CMD", "curl", "-fs", "http://127.0.0.1:8090/"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 180s
+      # The first boot compiles the runner and installs UI deps: minutes.
+      start_period: 900s
 
 volumes:
-  # Dev-only build caches.
-  runner-cargo-registry:
-  runner-cargo-git:
+  cargo-registry:
+  cargo-git:
   runner-target:
   bun-cache:
   vite-cache:

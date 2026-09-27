@@ -29,7 +29,7 @@ pub async fn list_env(
         Ok(None) => return ApiError::not_found("app not found").into_response(),
         Err(e) => return ApiError::internal(e.to_string()).into_response(),
     };
-    // Values included: single-operator premise, same posture as app_secret.
+    // Values included: single-operator premise, same posture as the rest of the runner API.
     match db::list_env(&state.pool, &app.id).await {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => ApiError::internal(e.to_string()).into_response(),

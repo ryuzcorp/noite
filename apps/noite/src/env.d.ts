@@ -15,10 +15,6 @@ declare global {
     NOITE_RATE_LIMIT_RPM?: string;
     /** Better-auth's own per-client budget per minute (`/api/auth/*`). */
     NOITE_AUTH_RATE_LIMIT?: string;
-    /** @deprecated use RUNNER_TOKEN */
-    AGENT_TOKEN?: string;
-    /** @deprecated use RUNNER_URL */
-    AGENT_URL?: string;
     AWS_ACCESS_KEY_ID?: string;
     AWS_REGION?: string;
     AWS_SECRET_ACCESS_KEY?: string;
@@ -27,10 +23,6 @@ declare global {
     BETTER_AUTH_URL?: string;
     NOITE_ADMIN_EMAIL?: string;
     NOITE_SMTP_FROM?: string;
-    /** @deprecated use RUNNER_TOKEN */
-    HOST_TOKEN?: string;
-    /** @deprecated use RUNNER_URL */
-    HOST_URL?: string;
     RUNNER_TOKEN?: string;
     RUNNER_URL?: string;
     RUSTFS_ACCESS_KEY?: string;

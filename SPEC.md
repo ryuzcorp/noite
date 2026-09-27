@@ -1,311 +1,296 @@
-# Noite: tiny self-hostable Celld PaaS
+# Noite: tiny self-hostable celld PaaS
+
+Status (2026-09-27): one image, tenant isolation, bucket-held runner state, graceful shutdown and readiness are implemented and verified (`cargo build --release`, `cargo test`, `clippy -D warnings`, `bun run check`, `make e2e`, `make e2e-isolation`, the dev overlay). Scoped per-app credentials are scaffolded; no provider mints them yet. There is no v1 compatibility and no migration path: installs from before 2026-09-27 are wiped and reinstalled.
+
+Noite's promise is "your own tiny Cloudflare Workers": a person runs one install, and other people push code to it. That makes tenant code **untrusted**, and it makes the install something people deploy on Compose, Railway, Coolify or a VM with minimal effort. This file is the record of the current system: the locked decisions first, then how each part works, then what is left, then history.
 
 ## Decisions (locked)
 
-> **Partly superseded 2026-09-24:** the control-plane and edge bullets below describe the retired container-cell topology (RunnerContainer DO, static Caddyfile, container mode). Current topology: see [Topology revert to compose mode](#topology-revert-to-compose-mode-2026-09-24) at the bottom.
-
-- **Product:** full tiny PaaS — user accounts, apps, subdomains, thin deploy/build logs + status
-- **Tenancy:** single-operator Compose install; no orgs; users own apps; per-app collaborators (`view` / `push` / `admin`)
-- **Control plane:** **Oxide Worker UI on a celld fleet** (`preset: worker` — real workflows/queues/cron, D1 auth DB) + **Rust runner as the `noite-control` container cell** (`RunnerContainer` DO, singleton `standard-4`, image `docker/Dockerfile.runner`; a Rust binary can't be a worker). The worker DO owns host→port routing; the Caddyfile is static.
-- **Tenant runtime:** each app is its own celld fleet (prefix + keys)
-- **Source:** stock Git smart-HTTP at `http://git.$BASE_DOMAIN/{slug}` (Basic `git` / profile API key; collaborator `view`/`push`) → runner writes tip `s3://noite/git/{slug}/refs/heads/main/{sha}.bundle` + a `MANIFEST.json` linearization point
-- **Deploy:** push to `main` (and/or tip poll / webhook) → bare mirror + checkout → build → `celld deploy` → reload
-- **Isolation:** one app = one fleet; never share `deploy/current.json`
-- **Edge:** Caddy (static file) — wildcard site + on-demand TLS (ask-gated at `/v1/edge/tls-ask` via the control worker) + `reverse_proxy control:8090` for everything; the worker Host-dispatches to control UI (`CONTROL_SUBDOMAIN=app` in prod, bare domain in dev) + `api.` + `git.` + `{app}.$BASE_DOMAIN` (prod `https://{app}.noite.now`; `app`/`api`/`git` slugs reserved) through `RunnerContainer.getTcpPort(port)`. Behind a terminating proxy (Coolify/Traefik TCP-forwards SNI) our Caddy still terminates per-host TLS itself via on-demand certs; Coolify uses the same universal `docker/compose.yaml` with env overrides (Traefik labels for the tenant TCP service are in the file).
-- **Effect:** prefer `Effect` / `Config` / `Schedule` / `Schema` / `HttpClient` / `Layer` over ad-hoc async
-
-## Status (2026-09-15)
-
-> **Historical (superseded 2026-09-24):** the rows below describe the container-cell cutover, the loopback S3 sidecar and the R2 durability relay. See [Topology revert to compose mode](#topology-revert-to-compose-mode-2026-09-24).
-
-Working end-to-end on rootless Podman Compose (repo root).
-
-### Done
-
-| Area | Notes |
-| --- | --- |
-| Compose stack | `rustfs`, `control`, `caddy` — `docker/compose.yaml` (Compose files live under `docker/`) |
-| Ports | Host **9080/9443**; control `http://localhost:9080`; API `http://api.localhost:9080`; apps `http://{slug}.localhost:9080` |
-| Runner | **Rust** (`apps/runner`) — deploy, fleets, route table; loopback S3 sidecar in container mode (fence blocks the compose store) with worker-relayed R2 durability; SQLite snapshot restores from the sidecar, bare mirrors rehydrate from tip bundles; ensures the single `NOITE_S3_BUCKET` bucket on boot |
-| Control UI | **Oxide worker fleet** (`apps/noite`, `preset: worker`) — passkeys + actions proxying to runner; D1 (`DB` binding) replaces `bun:sqlite`, OTP email via `NOITE_EMAIL_WEBHOOK_URL` webhook (no SMTP sockets on workers), `bun-durable` shim deleted |
-| Deploy pipeline | Tip `.bundle` → bare repo + worktree → optional bun scripts → `celld deploy` → spawn/reload |
-| Deploy trigger | push fast-path (spawn) + reconcile tip poll of `MANIFEST.json` + main `.bundle` + `/webhook` bearer-gated nudge — RustFS notify off |
-| Edge | Caddy; preserve `Host` / forwarded headers |
-| Source preview | per-app file tree + code / last-push diff — `@pierre/trees` + `@pierre/diffs` (vanilla) · runner `{tree,blob,diff}` endpoints read the bare mirror |
-| Observability | per-app requests / latency from **celld OTel** (`CELLD_OTEL=1` → Parquet spans in the fleet bucket, aggregated by the runner with DuckDB) + CPU ms (celld process sampling) → minute buckets (`app_metric`) → detail-page 24h chart — the pricing substrate |
-| Sample app | `apps/noite/test/` + `deploy.sh` (Git HTTP → tip bundle) |
-| Git hardening | `MANIFEST.json` linearization per slug, receive-pack head parsing, per-role push policy (`push` = create + fast-forward only, `admin` = anything), per-slug push mutex, manifest re-apply on reads (`git_policy.rs`/`git_manifest.rs`); `app`/`api`/`git` slugs reserved |
-
-### Control fleet cutover runbook (UI → celld fleet)
-
-> **Historical (superseded 2026-09-24):** kept as a record of the container-cell cutover; the runbook steps no longer apply. See [Topology revert to compose mode](#topology-revert-to-compose-mode-2026-09-24).
-
-Topology decision (2026-09-18): control plane runs split — Rust runner and control celld node in separate containers, one image each. UI versions deploy via `celld deploy` with zero restarts (runner and tenant fleets never bounce), and each side keeps its own logs. The pre-worker joint Bun image (`Dockerfile.control`, `noite-prod.sh`, `dist/server.js` via srvx) is retired — Bun cannot serve the worker build. End state is one image runnable both ways (per-service command for split compose, supervisor default for single-container GHCR/Coolify); until reliability settles, split stays canonical locally.
-
-Status: executed up to the compose flip. `s3://noite/control` holds the worker (final prod vars) + live D1 `noite-control` (migrated, empty — fresh start, old SQLite deleted). Verified on a temp node: `/health` 200, `/login` 200 shell (needs the explicit `assets.binding: ASSETS` — celld does not auto-inject it), `/api/auth/get-session` 200, cron/queue/workflow cells ticking, zero node errors. Remaining: `make up`, then sign up fresh (step 7).
-
-Fresh start (2026-09-18): no data migration — D1 starts empty, old SQLite files deleted, `ui-data` volume dropped. Everyone re-registers; passkeys/keys are recreated. The fleet must still serve the same control URL (`BETTER_AUTH_URL` unchanged) so RP ID stays valid for the new credentials.
-
-Steps:
-
-1. Provision D1 (`wrangler d1 create noite-control` or celld equivalent) and fill `database_id` in `apps/noite/wrangler.jsonc`.
-2. Import the sqlite dump into D1; verify tables (`user`, `session`, `account`, `verification`, `passkey`, `apikey`, `app`, …).
-3. Set secrets on the fleet (`BETTER_AUTH_SECRET` unchanged, `RUNNER_TOKEN`, AWS/RUSTFS keys, `NOITE_ADMIN_EMAIL`, `NOITE_EMAIL_WEBHOOK_URL`; `BETTER_AUTH_URL` = the same control URL).
-4. `celld deploy dist` from `apps/noite` (uses the oxide-prepared `dist/wrangler.json`).
-5. Flip `CADDY_CONTROL_UPSTREAM` from `ui:8080` to the fleet origin URL and recreate caddy (`reverse_proxy` accepts a full URL).
-6. Single runner image (`docker/Dockerfile.runner` — compose `control`, the `celld deploy` container cell, and the railpack CI build all use it); the joint supervisor (`docker/noite-joint.sh`, `docker/compose.coolify.yaml`) is deleted, Coolify deploys the universal `docker/compose.yaml` with env overrides. Image rebuilds happen inline via `up`/`dev --build`, no separate build targets.
-7. Sign up fresh on the fleet UI and verify apps/keys/passkeys end to end.
-
-Dev loop: `make dev` runs the 4-service dev layout with dev processes — runner cargo-watch, control as `vite dev` (full Oxide + Cloudflare plugin pipeline: workerd, local D1, HMR). No bucket, no deploy cycle. (`celld dev` cannot serve this app: raw esbuild can't resolve `virtual:oxide/worker`.) Secrets from the control container's env (root `.env`). Never run dev and prod stacks at once (shared names/volumes).
-
-### Left / polish
-
-- Release command + releases/rollback (built 2026-09-19) — `release` from tenant `wrangler.jsonc` runs once post-build with tenant+AWS env, abort keeps old release serving; `POST /v1/apps/{id}/rollback {sha}` redeploys a past success sha; UI rollback button on success rows
-- Revert via S3 native versioning (built 2026-09-19) — `put-bucket-versioning` at boot, best-effort for BYOB keys; revert stays a sha redeploy (bundles immutable per-sha)
-- Tenant secrets on the Cloudflare model (built 2026-09-19) — `app_env` table + `/v1/apps/{id}/env` CRUD (admin-gated writes), injected into build/release/fleet env with `AWS_/*S3_/*CELLD_*/PORT/HOST` denylist; `.dev.vars` download in settings; local dev stays the tenant's own file
-- Doctor diagnostics (built 2026-09-19) — `make doctor` runs `docker/doctor.sh`: stack up, runner healthy + reconciled, API auth, rustfs live, control UI serving
-- CLI (`packages/cli`, `@noitenow/cli`) — Effect CLI `noite deploy`: CI-built dist + `wrangler.jsonc` pushed as a synthetic commit over Git smart-HTTP (Basic `git` + API key, `push`-gated, always fast-forward); reads `GITHUB_*` context in Actions, writes `$GITHUB_OUTPUT`, PR comments via `gh` (no GitHub App). Full REST CLI still deferred until the surface stabilizes.
-- RustFS webhooks unreliable — poll is the reliable path; `/webhook` stays as an optional bearer-gated nudge for `deploy.sh`
-- Tiny forge UI over bare mirrors (`RUNNER_WORK_DIR/repos/{slug}.git`) — source preview (W4) started this; full history / commit views remain
-- Source preview polish: hydrated expand-unchanged context (`loadDiffFiles`), per-file permalinks
-- TLS / real domains (plan: `https://app.noite.now` control via `CONTROL_SUBDOMAIN=app`, `https://{slug}.noite.now` apps)
-- Ops (quotas, APM) — backups built 2026-09-23: nightly `runner-backup` cron copies the telemetry keyspace (the only state the 5-min R2 relay skips) to `backup/<date>/`, 7-day retention, explicit `POST /__do/restore?date=` recovery
-- Scoped per-app RustFS keys: the Bun host plane that minted them is deleted (W1.3); Git auth is profile API keys (Better Auth) + collaborator checks via runner → UI `/internal/git-auth`
-
-## Source preview (W4) — 2026-09-12
-
-"Code preview of the latest code pushed to the git bucket, per app."
-
-- [x] **Runner endpoints** (`apps/runner/src/host/source.rs`) — `GET /v1/apps/{id}/tree` (paths + sizes), `/{id}/blob/{*path}` (256 KB cap, binary detect), `/{id}/diff` (parent diff; `--root` for the initial push; 1 MB cap) — all served from the persistent bare mirror `repos/{slug}.git`, rev = `last_deploy_sha` else HEAD; browser never sees the runner token (server actions)
-- [x] **UI actions** — `sourceTree` / `sourceBlob` / `sourceDiff` in `apps.server.tsx` (ownership-gated)
-- [x] **Browser** — `/apps/[id]/source` page + `lib/source-browser.tsx`: `@pierre/trees` vanilla `FileTree` (presorted prepared input, search) in the sidebar; `@pierre/diffs` vanilla `File` for the code pane and `FileDiff` per changed file (via `parsePatchFiles`) for the last-push diff; mounts are imperative inside `watch.once()` so ilha reruns never repatch the mounted hosts (dynamic `import()` keeps SSR clean)
-- [ ] **Hydration** — wire `loadDiffFiles` (blob@parent / blob@HEAD) so patch diffs can expand unchanged context; needs a rev parameter on the blob endpoint
-
-## Observability (W5) — via celld telemetry
-
-"Basic stats per app: requests received + CPU time celld executes — pricing-ready." Implemented as directed: use celld.dev/docs/telemetry rather than edge logs.
-
-- [x] **Enable fleet telemetry** — `CELLD_OTEL=1` + `CELLD_OTEL_FLUSH_MS=10000` + `CELLD_OTEL_RETENTION=14d` in `supervisor.rs`; celld (bucket sink) writes Parquet spans to `s3://noite/fleets/{slug}/telemetry/traces/<node>/<yyyy>/<mm>/<dd>/<hh>/…` — no collector service
-- [x] **Requests + latency** — runner (every ~10 s) runs the DuckDB CLI against that glob: `strftime('%Y-%m-%dT%H:%M:00Z', to_timestamp(start_unix_us/1000000))` per-minute buckets, incremental watermark 5 s behind the 2 s flush (closed minutes ⇒ never double-counts); **only `celld.fetch` spans count as requests** (verified 1:1 against traffic — the docs' schema is `node,region,trace_id,span_id,parent_span_id,name,kind,start_unix_us,duration_us,ok,error,request_id,cell,epoch,isolate,queue_wait_us,url,http_status,parent_remote`); no-files errors (fresh app) are skipped, real failures are logged
-- [x] **CPU time celld executes** — spans carry durations only (no metrics signal yet in celld), so CPU stays on `/proc/<celld-pid>/stat` subtree sampling (utime+stime deltas, descendants via `task/*/children`); the runner spawns celld, so /proc is visible
-- [x] **Errors** — from the trace `ok` flag (no more invented zeros): `sum(CASE WHEN NOT ok THEN 1 ELSE 0 END)` per minute
-- [x] **What the fleet is doing** — `GET /v1/apps/{id}/spans?hours=1` (on-demand DuckDB, read at page load, not stored): top spans by name/kind with counts, exec ms, failed spans, and the **queue wait** (`queue_wait_us`) celld records
-- [x] **Persistence** — `app_metric` minute buckets (upsert-accumulate), 14-day prune
-- [x] **API + UI** — `GET /v1/apps/{id}/metrics?hours=24` (bearer-gated) · `MetricsCard` on the app page: 24×1 h bars (requests, CPU ms) + totals + a **Spans · last hour** table (name · n · ms · err · queued) fed by `/spans`
-- [ ] **Pricing** — bill on requests + `duration_us` (span wall time incl. queue wait — the closest pricing-compute signal celld exposes today) and/or `cpu_ms`; `errors` stays 0 (trace schema has no status)
-- [ ] **Later** — run the docs' compaction job before shortening flush windows at scale; a future celld metrics signal may also expose true CPU
-
-## Plan (2026-09-12)
-
-> **Historical:** this plan shipped; its volume names and container-cell details predate the 2026-09-24 revert — see [Topology revert to compose mode](#topology-revert-to-compose-mode-2026-09-24).
-
-Ordered by payoff. Each item: what · why · files. W1 is mechanical and safe; W2 is hardening; W3 is structural. Oxide/Effect showcase code (schedules, queues, workflows, liveQuery, the `sync-apps` mirror) is **kept deliberately** — this PaaS doubles as a framework showcase (creator decision). The retired Bun host plane (`apps/noite/src/host/*`, `lib/store.ts`) was deleted outright during cleanup.
-
-### Wave 1 — quick wins (mechanical) — done
-
-- [x] **W1.1 Root `.dockerignore`** · kills the 2.5 GB build context (1.5 GB `target/`, `node_modules`, `dist`, `.wrangler`, `data`) · `+.dockerignore`
-- [x] **W1.2 `make down` preserves data** · was `down -v --remove-orphans` (nuked runner SQLite, git mirrors, control DB, caddy config) · `down` = plain down; new explicit `nuke` = down -v + local `.wrangler` miniflare state · `Makefile` (+ `.pi-lens.json` so the repo linter's shellcheck-in-bash-mode stops mis-parsing make conditionals; Makefile `ifneq`/exports use shell-safe quoted + `$(or $(and …))` forms)
-- [x] **W1.2b `nuke` really wipes every database** · reported: after `make nuke`, `apps.create` answered `409 slug already taken`. Cause: podman-compose's `down -v` exits on the first container it cannot find and never reaches its volume loop, so a stopped stack kept `runner-data` (the runner's SQLite → every app row) and `rustfs-data` (bucket: git mirrors, fleets, and the control D1 with accounts/invites). `nuke` now removes `<project>_*` and `noite-e2e_*` volumes by name after the three `down`s, and the e2e line merges the base file so the lane's volumes are known. Verified: nuke → `apps: []`, `/api/invite/status` `firstRun: true`, re-creating the old slug → 201, creating it twice → 409 · `Makefile`, docs
-- [x] **W1.3 Legacy worker UI deleted** · `docker/ui.sh` + `apps/noite/ui/` were the pre-Oxide celld worker control UI (`s3://fleets/_control`), superseded by Oxide · deleted, dir and bucket documented as legacy. **Deleted during cleanup:** `apps/noite/src/host/*`, `lib/store.ts` — retired Oxide/Effect host plane (nothing imported it; Rust runner is the host)
-- [x] **W1.4 Caddyfile single owner** · compose bootstrap + `docker/noite.sh` seed raced the runner's rewrite · both deleted; caddy only creates an empty file if missing; runner `caddy::rewrite_caddy` owns all routes. Trade-off: on a fresh volume, control/api routes appear once the runner's first reconcile writes the file (rustfs ready, ~≤60 s worst case) instead of instantly
-
-### Wave 2 — hardening — done (W2.5 partial)
-
-- [x] **W2.1 `/webhook` bearer-gated** · `auth.rs` allows only `/health` without a token · UI proxy (`routes.ts`) and `deploy.sh` nudge send `authorization: Bearer $RUNNER_TOKEN` · RustFS notify **disabled** in compose (it cannot carry a bearer header; poll + deploy.sh nudge are the triggers — SPEC already treated poll as authoritative)
-- [x] **W2.2 Default secrets refused off-localhost** · `BASE_DOMAIN != localhost` with `BETTER_AUTH_SECRET`/`RUNNER_TOKEN` still at shipped defaults ⇒ boot fails with a message · guards in worker `auth.ts` (`defaultSecretRefusal` on first auth construction — the worker entry is virtual, no boot hook) + runner `config.rs` (dev runs on localhost, no gate needed)
-- [x] **W2.3 Deploy log capped at 64 KB tail** · `db.rs::upsert_deploy` no longer grows unbounded
-- [x] **W2.4 Git credentials** · Profile API keys (Better Auth); runner verifies via UI + collaborator role (`view` fetch / `push` receive)
-- [x] **W2.6 Runner release image renamed to `noite-runner`** · was `ghcr.io/<owner>/noite`, ambiguous next to `noite-control` and easy to confuse with the repo/bundle names · workflow push target + merge matrix, `make up-prod` default, `.env.example`, `docker/e2e-local.sh` (`TAG=<sha>` pulls), backup/restore helper fallbacks, README + deployment docs · **Migration:** installs that pin `NOITE_RUNNER_IMAGE=ghcr.io/<owner>/noite:<tag>` keep working off the old package's last tags but stop receiving updates — switch to `noite-runner`. A new package name is a new GHCR package: check its visibility/linkage matches the old one before anonymous hosts pull it
-- [x] **W2.7 Docker artifacts all under `docker/`** · `Dockerfile.runner-container` (root) → `docker/Dockerfile.runner`; each image gets its own `<Dockerfile>.dockerignore` (Docker/BuildKit resolves it next to the Dockerfile and it wins over a context-root `.dockerignore`; verified on podman/buildah too), so no `Dockerfile*` / `.dockerignore` / `compose*` sits outside `docker/` — `apps/noite/.dockerignore` and `apps/runner/.dockerignore` were dead context files and are gone. **Behavior fix found while moving:** a bare pattern matches the context root only, so the old `target`/`node_modules`/`dist` lines never excluded `apps/runner/target` (≈2.5 GB) or the nested `node_modules` trees from the repo-root context — the guards are now `**/target`, `**/node_modules`, `**/dist`, … The dev images (`runner-dev`, `tools`) COPY only `docker/install-sidecars.sh`, so their guards are `*` + explicit negations (a few KB of context instead of the whole tree)
-- [x] **W2.5 Graceful stops** · `stop_grace_period: 30s/15s` on runner/ui. **Deferred:** rustfs `healthcheck:` + `depends_on: service_healthy` — the rustfs image's tooling couldn't be verified from this environment (no container engine); runner already blocks on readiness at boot
-
-### Wave 3 — structural
-
-- [x] **W3.1 Immutable UI image (joint era, superseded by the split topology above)** · prod no longer bind-mounts source and `bun install` + `vite build` per boot; `docker/Dockerfile.control` baked deps + dist at `docker build` time (immutable, no npm at runtime) · entrypoint `docker/noite-prod.sh` (secret gate + start) · prod compose ui = image + `ui-data` only · dev (`make dev`) still uses the tools image + bind mount + `docker/noite.sh` HMR — see `docker/compose.dev.yaml`
-- [ ] **W3.2 UI DB mirror consolidation — deferred, showcase** · the UI keeps its own `app`/`app_secret`/`deploy` copy + 1-min `sync-apps` schedule + `runner-op` queue/workflow + liveQuery topics mirroring the runner. The runner is already the source of truth behind a bearer-gated REST API and single-writer SQLite; consolidating would remove the mirror + drift at the cost of deleting the Oxide schedule/queue/workflow showcase. **Kept deliberately** (creator decision) — revisit only if the dual-write actually bites
-  - **Superseded 2026-09-24:** the mirror was retired — the UI reads the runner API directly. See [Topology revert to compose mode](#topology-revert-to-compose-mode-2026-09-24).
-
-Acceptance: `make up` cold build < 30 s · Git-HTTP push → app live ≤ poll + build · `make down` preserves `agent-data` · no legacy `_control` worker image.
+- **Product:** full tiny PaaS — user accounts, apps, subdomains, thin deploy/build logs + status.
+- **Tenancy:** one operator per install; no orgs; users own apps; per-app collaborators (`view` / `push` / `admin`). `NOITE_TENANCY=multi` (the default off `localhost`) treats pushed code as untrusted and sandboxes it; `single` means only the operator pushes code.
+- **One image:** `ghcr.io/<owner>/noite`. `tini` → the Rust runner as PID 1, which supervises Caddy, the control UI and every tenant fleet. Every platform deploys the same image.
+- **Control plane:** **Oxide Worker UI** (`apps/noite`, `preset: worker` — workflows/queues/cron, D1 auth DB) served as celld fleet #0, plus the **Rust runner** (`apps/runner`; a Rust binary can't be a worker), which owns deploys, fleets, routing and the edge config.
+- **Tenant runtime:** each app is its own celld fleet (its own bucket prefix and process).
+- **Source:** stock Git smart-HTTP at `http://git.$BASE_DOMAIN/{slug}` (Basic `git` / profile API key; collaborator `view`/`push`) → runner writes tip `s3://noite/git/{slug}/refs/heads/main/{sha}.bundle` + a `MANIFEST.json` linearization point.
+- **Deploy:** push to `main` (and/or tip poll / webhook) → bare mirror + checkout → build → `celld deploy` → reload.
+- **Isolation:** one app = one fleet; never share `deploy/current.json`.
+- **Edge:** Caddy inside the image — per-host on-demand TLS (ask-gated at `/v1/edge/tls-ask`), Host routing to the control UI (`CONTROL_SUBDOMAIN=app` in prod, bare domain in dev), `api.`/`git.` → runner, `{app}.$BASE_DOMAIN` → the app's fleet (`app`/`api`/`git` slugs reserved). Behind a terminating proxy (Coolify/Traefik TCP-forwarding SNI, Railway) our Caddy still issues per-host certs on demand where the proxy passes TLS through, and serves plaintext `:80` where it does not.
+- **State:** one S3 bucket holds everything durable; the `/data` volume is a cache the runner can rebuild from it.
+- **Effect:** prefer `Effect` / `Config` / `Schedule` / `Schema` / `HttpClient` / `Layer` over ad-hoc async.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  dev[Developer] -->|git push → git.BASE/slug| runner[runner: Rust deploy pipeline]
-  runner <-->|git/ tip bundles + MANIFEST, fleets/ celld| rustfs[(rustfs s3://noite)]
-  runner -->|spawn + supervise| fleet[celld fleet per app]
-  runner -->|writes Caddyfile into the shared volume| caddy[caddy: stock upstream]
-  user[Browser] --> caddy
-  caddy -->|platform hosts| control[control: Oxide UI on a celld node]
-  caddy -->|api. / git.| runner
-  caddy -->|"{slug}."| fleet
-  control -->|Bearer REST / RPC over HTTP| runner
+  dev[Developer] -->|git push → git.BASE/slug| edge
+  user[Browser] --> edge
+  subgraph noite[noite container]
+    runner[runner: PID 1, Rust deploy pipeline]
+    edge[caddy: child, admin API 127.0.0.1:2019]
+    control[control: celld fleet #0 on 127.0.0.1:8090]
+    fleet[celld fleet per app, uid fleet]
+    runner -->|spawn + supervise| edge
+    runner -->|spawn + supervise| control
+    runner -->|spawn + supervise| fleet
+    edge -->|platform hosts| control
+    edge -->|api. / git.| runner
+    edge -->|"{slug}."| fleet
+    control -->|Bearer REST / RPC, 127.0.0.1:8080| runner
+  end
+  runner <-->|git/, fleets/, control/, runner/state/| s3[(S3: bundled rustfs or your own)]
 ```
 
-### Buckets
+### Process tree
 
-- `s3://noite/git/{appSlug}/` — tip bundles from Git HTTP + `MANIFEST.json` (`{seq, refs}`; readers resolve refs from the manifest so half-written pushes stay invisible)
-- `s3://noite/fleets/{appSlug}/` — tenant celld
-- `s3://noite/control/` — the UI worker bundle + its D1 (the `control-state` volume is the celld node's local working dir, not durable state)
-- Runner state — SQLite, git mirrors, builds — lives in the `runner-data` volume, the only copy of deploy metadata; the fleet bucket is the other durable half (`rustfs-data`)
-- Runner ensures bucket `NOITE_S3_BUCKET` (default `noite`) on boot; uses root keys for deploy/reconcile
-- One rustfs bucket, three prefixes — not separate `git` / `fleets` buckets
-
-### Process model
-
-| Process | Role |
-| --- | --- |
-| `rustfs` | S3 (bundled, or external via the BYOB overlay) |
-| `runner` | Rust deploy pipeline, tenant celld fleets, Caddyfile, telemetry aggregation |
-| `control` | Oxide control UI on a celld node; the image bakes the worker bundle and self-deploys it on boot |
-| `caddy` | stock upstream edge on host ports 9080/9443 — `api.`/`git.` → runner, platform hosts → control, `{slug}.` → tenant ports |
-
-## Compose UX
-
-```bash
-cp .env.example .env
-make up
-./apps/noite/test/deploy.sh   # sample push via Git HTTP → deploy
+```
+tini (PID 1: reaps zombies, forwards signals)
+└── noite-runner                      root; API on :8080
+    ├── caddy run --watch             :80/:443, admin 127.0.0.1:2019
+    ├── celld  control fleet #0       public 127.0.0.1:8090, internal 0.0.0.0:8091
+    ├── celld  tenant fleet × N       uid fleet (10020); public 0.0.0.0:{p}, internal 127.0.0.1:{p+1}
+    └── bun / sh                      builds and release, uid build (10010), transient
 ```
 
-Infra: `docker/compose.yaml`, `docker/`, `Makefile` at repo root.
+- The runner owns every child's lifecycle (`host/children.rs`: restart with 1–30 s backoff; SIGTERM, then SIGKILL past the budget). There is no second supervisor and no shell entrypoint.
+- The runner stays root: it needs `setuid`, `chown` and `nft`. Its children are the privilege boundary.
 
-## Standalone install for stores and cloud VMs (2026-09-25)
+### Ports
 
-`docker/compose.standalone.yaml` is the whole install in **one file** for hosts that have Compose and nothing else — cloud VMs and Compose stores/panels (Arcane registry templates, Portainer stacks, Dockge, …). It is `docker/compose.yaml` with the `build:` blocks replaced by `ghcr.io/<owner>/noite-{runner,control}` image refs (published, public) and the Coolify labels dropped; every variable keeps a default, so it renders and boots with **no env at all** (`docker compose config -q` passes for a registry's validator, first boot serves the UI on `http://localhost:9080`).
+- Published: `:80`/`:443` (host `HTTP_PORT`/`HTTPS_PORT`, default 9080/9443). `:8080` (runner API) is published only by the e2e lane.
+- Fleet ports: two per app from `NOITE_FLEET_PORTS` (default `20000-29999`), allocated by `db::next_ports`; exhaustion errors instead of wandering into ephemeral ports.
 
-Because it is a hand-maintained mirror, `docker/check-standalone.ts` guards it: CI renders both files (`docker compose config --format json`) and fails when a service, volume or env key of the base install is missing from the mirror, when the mirror builds instead of pulling, or when a service there points at a locally-built image. Verified by booting the mirror as a store would (all defaults, GHCR refs swapped for the locally-built tags): control first-boot deploy, UI `200` through Caddy, `api.localhost/health` `200`, `git.localhost` `401` (auth gate), unknown slug → the edge fallback page, Caddyfile adapts, no placeholder config.
+### Bucket and volume
 
-## Out of scope for v1
+- `s3://noite/git/{slug}/` — tip bundles from Git HTTP + `MANIFEST.json` (`{seq, refs}`; readers resolve refs from the manifest so half-written pushes stay invisible).
+- `s3://noite/fleets/{slug}/` — tenant celld (deploys, storage, telemetry).
+- `s3://noite/control/` — the UI worker bundle + its D1 (accounts, invites).
+- `s3://noite/runner/state/` — runner SQLite snapshots + the `owner.json` fence.
+- The runner ensures bucket `NOITE_S3_BUCKET` (default `noite`) on boot, enables versioning best-effort, and uses root keys for deploy/reconcile (see [Scoped credentials](#scoped-credentials)).
+- `/data` (volume `noite-data`): the live runner SQLite, git mirrors, builds, fleet working dirs, the control node's working dir, Caddy config and certificates. Everything in it is rebuildable from the bucket (certificates are re-issued).
 
-- Organizations / multi-host
-- Deep APM
-- Custom domains beyond `*.BASE_DOMAIN`
-- Workloads that aren't celld apps
+### Image
 
-## Topology revert to compose mode (2026-09-24)
+`docker/Dockerfile` is the only Dockerfile. Stages: `celld` (pinned `CELLD_VERSION`), `runner-build`, `ui-build`, `base` (bun on Debian + `tini`, `ca-certificates`, `curl`, `git`, `awscli`, `nftables`, sidecars from `docker/install-sidecars.sh`, Caddy `CADDY_VERSION`, users `build`/`fleet`), `dev`, and `noite` (the default last stage: runner binary + `/opt/noite/control/dist`). `docker/check-versions.ts` asserts each pin appears exactly once and that the access-log path matches the runner's default. `awscli` stays for release commands and debugging. CI builds `noite` for amd64 and arm64 on native runners and merges the digests (`.github/workflows/images.yml`).
 
-Decision: the container-cell topology is retired. Noite installs as a plain four-service Compose stack from `docker/compose.yaml` — `rustfs`, `runner`, `control`, `caddy` — and `docker compose up -d` is the whole install.
+## Tenant isolation
 
-- **Runner as a compose service.** `runner` runs as an ordinary container built from `docker/Dockerfile.runner` (release `ghcr.io/<owner>/noite-runner`). It owns the deploy pipeline, tenant celld fleets, the Caddyfile, telemetry aggregation and Git smart-HTTP. State lives in the `runner-data` volume plus the fleet bucket, and it talks straight to `rustfs:9000`.
-- **Control UI as a celld node with a self-deploying image.** `control` is a celld node (`docker/Dockerfile.ui`, release `ghcr.io/<owner>/noite-control`) whose image bakes the built worker bundle (`apps/noite/dist`); `docker/noite-entrypoint.sh` deploys it into `s3://<bucket>/control` on first start — revision-gated (a restart with unchanged bundle and vars does not redeploy) — with the worker's runtime vars patched from the container environment, so one image serves any domain/secret set and no secret is baked in.
-- **Edge on the stock upstream image.** `caddy` is `caddy:2.10.0-alpine`; the config is neither baked nor static — the runner writes the Caddyfile into the shared `caddy-config` volume and `--watch` reloads it within a poll tick. Per-host TLS stays on-demand and ask-gated at `/v1/edge/tls-ask`.
-- **Container-cell path deleted:** the `RunnerContainer` Durable Object, `RUNNER_TARGET`, the compose-store fence, the loopback S3 sidecar, the `/v1/sync/*` relay API, the R2 durability relay, the nightly telemetry backup workflow, and the `containers.jsonc` + `inject-containers.ts` generated-DO wiring are all gone. Tenant routing no longer goes through `getTcpPort` — the runner's Caddyfile decides every host.
-- **D1 mirror retired.** The UI no longer keeps its own `app`/`deploy` rows; it reads the runner API (Bearer REST/RPC over HTTP) directly.
-- **CI without Railpack.** `.github/workflows/images.yml` lints, asserts the celld pin, renders every compose variant, then builds both multi-arch images with plain buildx (native per-arch runners, digests merged into a manifest list).
-- **Deleted from the tree:** `docker/standalone.ts` (the single-file compose generator) and the generated `compose.standalone.yaml` it emitted, `railpack.json`, `docker/Dockerfile.caddy`, and `docker/Caddyfile.static`. `docker/compose.yaml` is the documented Compose install file; the BYOB overlay is `docker/compose.byob.yaml` and the store/VM mirror is `docker/compose.standalone.yaml`.
+celld's internal listener carries peer traffic and an **unauthenticated operator API** (`POST /shutdown`, `POST /reload`, `POST /rebalance/pause`, `GET /state`); celld's security model assumes a trusted private network protects it. Noite runs untrusted Worker code in the same container, so the platform closes that network to tenant code itself.
 
-Consequences for operators: `cp .env.example .env && make up` builds and starts, `make up-prod` (or setting `NOITE_RUNNER_IMAGE` / `NOITE_CONTROL_IMAGE`) pulls the release images instead, and an image-only host runs `docker compose -f docker/compose.yaml up -d` with no clone. A runner-image change still restarts the control plane together with all tenant fleets (they cold-boot), so batch control-plane changes and pin the image variables by SHA. A fresh install serves nothing until the control container's first-boot deploy finishes (seconds) — `make doctor` gates on the UI actually serving HTML.
+### Tenancy mode
 
-## Railway install (2026-09-25)
+`NOITE_TENANCY=single|multi` (default `multi` when `BASE_DOMAIN` is not `localhost`, else `single`). `host/isolation.rs::self_check` runs at boot: build uid drop, fleet uid drop, nft table installed.
 
-Railway runs no Compose files (each `docker/compose.yaml` service maps to a Railway service) and **volumes attach per service**, so the single structural change is the edge.
+- `multi`: any failed check keeps `/ready` at 503 with the reason and refuses builds.
+- `single`: checks run and warn, nothing is refused; fleets and release commands use the root bucket keys, and no egress policy is installed.
 
-- **Edge = runner + Caddy in ONE service** — `docker/Dockerfile.edge` (runner pulled from the release image + caddy `2.10.0`) and `docker/edge-entrypoint.sh`. Because a Railway volume cannot be shared between services, the reader (Caddy) and the writer (runner) of the `caddy-config` volume share a filesystem by sharing a container; tenant fleet ports are then `127.0.0.1:8100+` on Caddy's own loopback. Verified locally against an isolated rustfs + `control`: Caddyfile adapts clean, `app.<domain>` → control UI, `api.`/`git.` → runner, `{slug}.<domain>` → a listener on the fleet port, wildcard fallback page, `/ready` on the healthcheck port, access log at the path the runner tails.
-- **`rustfs` and `control` stay ordinary services.** rustfs = image `docker.io/rustfs/rustfs:1.0.0-rc.6` + `/data` volume (no healthcheck — its root answers 403); `control` = `docker/Dockerfile.ui` + `/data` volume, healthcheck `/.well-known/celld/health`. No `depends_on` exists on Railway, which the images already tolerate (the control entrypoint waits ~2 min for S3 and creates the bucket; the runner ensures it too).
-- **Railway terminates TLS.** The `*.<domain>` custom domain (CNAME + `_acme-challenge` CNAME + ownership TXT) gets the wildcard cert, and hosts route by Host to the edge service's target port. So `CADDY_AUTO_HTTPS=off` and Caddy serves plaintext `:80`; its `:443` sites are inert. One wildcard custom domain covers `app.`, `api.`, `git.` and every slug.
-- **Env deltas vs compose:** `PORT=8080` on the edge + `PORT=8090` on control — Railway injects `PORT` and uses _that_ port for healthchecks while both images listen on fixed ports, and the edge's **domain target port must be 80** (caddy), not `PORT`; `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30` (default 0) for the fleet stop budget; `RAILWAY_HEALTHCHECK_TIMEOUT_SEC=600` (control's node holds its first healthy response for ~3 min); `CADDY_UPSTREAM_HOST`/`CADDY_API_UPSTREAM` = `127.0.0.1` (same container), `CADDY_CONTROL_UPSTREAM=control.railway.internal:8090`, `S3_ENDPOINT=http://rustfs.railway.internal:9000`; **`CADDY_ACCESS_LOG=/etc/caddy/access.log`** in the joint container (Caddy's Caddyfile hardcodes that path; compose only matches it because both services mount the same volume).
+This is the honest contract for platforms that cannot provide isolation: they run Noite for one person.
 
-## Fixed (2026-09-25) — `CONTROL_EXTRA_HOSTS` made the Caddyfile unadaptable behind a terminating proxy
+### Build and release sandbox
 
-With `BASE_DOMAIN != localhost` and `CADDY_AUTO_HTTPS=off` (the Coolify/Railway branch), a non-empty `CONTROL_EXTRA_HOSTS` makes Caddy reject the entire generated config — `Error: ambiguous site definition: <extra host>` — so Caddy keeps serving its bootstrap/stale config and every host gets the placeholder page.
+- `cmd::run_sandboxed` starts from `env_clear()`, adds `base_env` (`PATH`, `HOME=/home/build`, `TMPDIR`, `LANG=C.UTF-8`, `CI=1`, `NODE_ENV=production`, `BUN_INSTALL_CACHE_DIR`) and the tenant's vars, drops to uid `build` in `multi`, runs in its own process group, and `killpg`s the group after every step. `run_cmd` (runner-owned tools: `git`, `celld deploy`, `aws`, `duckdb`) clears the environment too.
+- Tenant vars never carry platform names: `db::env_reserved` drops `PORT`, `HOST`, `AWS_*`, `S3_*`, `CELLD_*`, `RUNNER_*`, `NOITE_*`, `BETTER_AUTH_*`, `CADDY_*`, `LD_*`, `NODE_OPTIONS` and `BUN_*` (except the cache var).
+- Bounds: `bun install` and `bun run build` 300 s each, release 600 s; `RLIMIT_NPROC` (only when dropping uid) and `RLIMIT_FSIZE`; a worktree above `RUNNER_BUILD_MAX_MB` (2048) fails the deploy.
+- Worktrees are `lchown`ed to the build uid (never following symlinks) and taken back after the build. `builds/<slug>` is 0755 so bun can resolve its cwd.
+- **Release** (`release` in the tenant's `wrangler.jsonc`, meant for migrations) runs in `multi` only with scoped bucket keys, so it is **skipped** there until a credential provider lands, with a deploy-log line saying so. In `single` it runs with the root keys. Noite's `release` key is stripped from `wrangler.json` before `celld deploy` (celld rejects unknown keys).
+- Build network stays open (package registries); the egress policy below applies to the build uid as well.
 
-Cause: in that branch `caddy.rs` emits the plaintext twin via `format!("http://{addr}")` with `addr` = the **comma-joined** control-host list, and Caddy applies an address line's scheme to the _first_ address only. `http://app.example.com, healthcheck.railway.app` therefore binds the second host on `:443` — the exact address the bare twin already claims. The tenant-base loop already pins the scheme per host ("Scheme is pinned PER HOST"); the joined control list does not.
+### Egress policy
 
-Fix: `caddy.rs::plaintext_hosts` pins `http://` on every address of a site line (already-schemed entries are left alone), so the twin of the joined control list is `http://app.x, http://coolify.x` instead of `http://app.x, coolify.x`; `control_hosts` drops consecutive duplicates as well (a Coolify install that points the extra host at the control host emitted `lab.example.com, lab.example.com`). Regression tests: `plaintext_twin_pins_the_scheme_per_host` and `behind_proxy_extra_control_host_keeps_a_valid_twin`. Verified end to end with a runner built from this tree and the Coolify shape (`CONTROL_SUBDOMAIN=` empty, `CONTROL_EXTRA_HOSTS=lab.netbird.cloud`, `CADDY_AUTO_HTTPS=off`, `BASE_DOMAIN=lab.netbird.cloud`): the generated Caddyfile carries `http://lab.netbird.cloud {` + `lab.netbird.cloud {`, `caddy adapt` succeeds (the pre-fix generator's shape still fails in the same Caddy with `ambiguous site definition`), and `Host: lab.netbird.cloud:9080` serves the control UI `200` while `api.` → `200` and `git.` → the auth gate.
+`host/netisolation.rs` installs one nft table in `multi` (it needs `CAP_NET_ADMIN`). For the build and fleet uids, in order:
 
-Repro (verified with `caddy adapt`): `http://a.test, b.test { respond "x" }` + `a.test, b.test { respond "x" }` → `ambiguous site definition: b.test`; the single-host twin adapts clean. Workaround: leave `CONTROL_EXTRA_HOSTS` empty in that branch — on Railway point the healthcheck at the runner (`PORT=8080`, `/ready`) instead of the edge, since Railway's healthcheck Host is `healthcheck.railway.app`.
+1. accept `ct state established,related` (without it, replies on connections the runner itself opened were rejected);
+2. accept DNS (udp/tcp 53);
+3. accept the storage endpoint, for the fleet uid only: the addresses `S3_ENDPOINT` resolves to, on its port, refreshed every 30 s (a fleet's celld needs its bucket, and bundled RustFS sits on a private address);
+4. reject loopback (`127.0.0.0/8`, `::1`), RFC 1918, link-local and metadata (`169.254.0.0/16`), CGNAT (`100.64.0.0/10`), and ULA/link-local IPv6 (`fc00::/7`, `fe80::/10`).
 
-## celld alignment (2026-09-24)
+Since all fleets share one uid, "the fleet uid may not dial loopback" blocks fleet → fleet, fleet → operator API, fleet → runner and fleet → Caddy admin. A single-node fleet never needs to dial loopback: Caddy dials the fleet, not the reverse. The same rules, loopback included, apply to builds. Tenant fleets additionally bind their internal listener to loopback. The control node's internal listener binds `0.0.0.0:8091` so a replacement node can reach it during an overlapping redeploy; the policy, not the bind, keeps tenants off it.
 
-Audited against the official celld documentation (https://celld.dev/docs/) and aligned to it. Each bullet records a runtime change made in the same pass, with the docs' reasoning for it.
+Fallback where a platform grants no `NET_ADMIN` (not built): run each fleet under `bwrap --unshare-net` with `pasta`/`slirp4netns` for internet-only egress. Upstream requests worth filing with celld: an auth token for the operator API, and an outbound policy for the main Worker.
 
-- **Telemetry** (docs: `/docs/telemetry`) — tenant fleets run `CELLD_OTEL=1` with the bucket sink (Parquet under `telemetry/traces/` and `telemetry/logs/` in the fleet bucket), `CELLD_OTEL_FLUSH_MS=5000` (the docs' near-live value) and `CELLD_OTEL_RETENTION=14d`. The docs require a compaction job when the flush is short ("Turn on the compaction job first, then shorten the flush, or queries grow slow within hours"; "celld does not compact its own files"), so the runner runs `metrics::compact_fleet` hourly for the hour that just ended, per node directory — one DuckDB `COPY (...) TO .../compacted.parquet (FORMAT parquet, COMPRESSION zstd)` ordered by `start_unix_us`, then the source files are deleted. Sources are deleted only after `head-object` proves the compacted file exists, so a failed copy can never lose spans; `union_by_name=true` merges an hour that spans a schema change (the docs call the schema `v0-unstable`). The current hour is never compacted. Runner queries are day-scoped: the aggregation window stops 10 s behind the flush and names only the day directories it spans (the docs' "a query that reads one day therefore touches only that day's files") instead of globbing the whole retention. (The 10 s flush recorded in the W5 note above is superseded by this 5 s flush.)
-- **Edge compression** (docs: `/docs/services/static-assets`) — the docs state celld does not compress an asset response and point at a compressing ingress proxy when a client needs gzip or brotli, so the runner's generated Caddyfile carries `encode zstd gzip` on every site. Measured through the edge: the control UI's JS bundle 462 KB → 144 KB gzip, CSS 129 KB → 22 KB gzip; `text/event-stream` responses (log/deploy/metric streams) stay uncompressed, chunked and unbuffered.
-- **Asset caching** (docs: same page) — celld serves an asset with `Cache-Control: public, max-age=0, must-revalidate` and no `Last-Modified`; the docs recommend a `_headers` rule for content-hashed files. `apps/noite/public/_headers` now sets `Cache-Control: public, max-age=31536000, immutable` for `/assets/*` (Vite emits `/assets/<name>-<hash>.<ext>`), verified on every hashed chunk.
-- **Operator surfaces in `make doctor`** — `celld node health` (`GET /.well-known/celld/health` on the control node, the documented public boolean) and `celld fleet diagnose` (`celld diagnose --read-only` run inside the control container: reads node leases, probes peers, validates advertised addresses). The control service's compose healthcheck is now that documented health endpoint (was a process-alive check), so Caddy starts routing only once the node is really ready.
-- **Storage qualification** (docs: `/docs`, "Configure object storage") — celld qualifies Amazon S3, Cloudflare R2, Google Cloud Storage, Tigris and Azure Blob Storage; the store must provide conditional writes, read-after-write consistency and ranged reads. celld runs a storage-contract check at node startup (a contract violation stops startup, an ambiguous transport error warns). MinIO community edition passes celld's storage test but is not qualified for production. Noite's bundled default, RustFS, is **not** on celld's qualified list — celld's own startup check still runs and passes on it and the runner/control nodes boot normally, but for production the BYOB overlay pointing at a qualified store is the recommended path; bundled RustFS stays the zero-config default for trying Noite out and for single-host installs.
-- **Flags/env Noite sets** (docs: `/docs`, "Start a node" + "Environment variables") — control node: `--bucket s3://<bucket>/control --endpoint … --region … --listen 0.0.0.0:8090 --internal-listen 0.0.0.0:8091 --advertise ${CELLD_ADVERTISE:-${RAILWAY_PRIVATE_DOMAIN:-$(hostname)}}:8091` (a peer-dialable address, not loopback: `--advertise` is how node-to-node RPC and `celld diagnose --peer` reach the node, and a loopback value silently forbids the extra nodes celld's docs prescribe as the capacity story), (an explicit advertise requires an explicit internal listener, as the docs mandate), plus `CELLD_TRUST_FORWARDED_HEADERS=1` (Caddy forwards the original Host/scheme), `CELLD_WATCH=/data/control`, and `CELLD_DURABILITY=bucket` (the fleet posture needs two running nodes before any node can complete a fleet proof — "a fleet of one node requests the fleet posture and does not get it" — and asking for it on a one-node fleet holds the takeover gate closed on every restart; the runner's tenant fleets already run `bucket`). Tenant fleets (spawned by the runner): the same bucket/endpoint/region form with `--listen 0.0.0.0:<port> --internal-listen 0.0.0.0:<port> --advertise 127.0.0.1:<port>`, `CELLD_WATCH` in the runner's data volume, `CELLD_DURABILITY=bucket` (a single-node fleet has nobody to send to, so the documented `fleet` default would wait for the bucket anyway), `CELLD_DEPLOY_POLL_S=5` (the documented 30 s default shortened so a push goes live faster; a node adopts a new deployment in place, and `POST /reload` on the internal listener is what the runner calls after `celld deploy`), `CELLD_ESBUILD`, `CELLD_ASSET_CACHE_BYTES` (512 MiB default, per fleet on the runner's data volume), and the telemetry settings above. celld rejects removed variables at startup (`CELLD_OTEL_SINK`, `CELLD_OUTPUT_GATE`, `CELLD_STORAGE_PROBE`, `CELLD_PACED_HANDOFF`, `CELLD_SHUTDOWN_DRAIN_MS`, …) — Noite sets none of them.
-- **Graceful stop** — `supervisor::stop_fleet` sends SIGTERM (documented graceful stop: cancels in-flight work, proves durability, publishes the snapshot, releases leases, seals the node log) and waits 15 s before a SIGKILL fallback; the control service sets `CELLD_SHUTDOWN_TOTAL_MS=25000` with a compose `stop_grace_period` of 30 s (the docs require the grace to exceed the bound).
-- **celld 0.6.0 (2026-09-26)** — the four image pins (`Dockerfile.runner`, `Dockerfile.ui`, `Dockerfile.runner-dev`, `Dockerfile.tools`) moved 0.5.1 → 0.6.0 in one pass; `docker/check-versions.ts` asserts they agree. Release-note items that needed a repo check, and where it stands: the worker's `compatibilityDate` is now required — `apps/noite/wrangler.jsonc` sets `2026-09-01` and the build carries it into `dist/wrangler.json`; `export const …` in a main module fails the Worker's start — the built entry emits one `export {}` and no such binding; a wasm entry in `modules` must be `{ wasm: bytes }` — nothing wasm is staged in `dist`; `transactionSync()` takes no callback argument — nothing calls it; R2 keeps empty key segments (`a/b`, `/a/b`, `a//b`, `a/b/` are four objects) — runner keys are `fleets/{slug}/r2/{bucket}/` + the caller's key, so a tenant key containing `//` or a trailing `/` is now stored distinctly rather than coalesced. Durable Object facets migrate to their own SQLite files on first open, and with `fleet` durability — the celld default, which is what the control node runs — **that migration requires stopping the whole fleet before the new version starts** (`bucket`-durability fleets may roll); every install path here replaces the single control container instead of overlapping two, so each satisfies it already, and the operator-facing step is in the deployment guide.
+### Data directory
 
-## Control-node request stalls (2026-09-27)
+`isolation::harden_data_dir` runs first at boot: the runner sets umask 077, `/data`, the work dir, `builds` and `fleets` are 0755 for traversal, every other entry is 0700/0600, and the SQLite files (`-wal`, `-shm` included) are 0600. The hostile suite found the gap that motivated it: the build uid could read `noite.sqlite`.
 
-A page load fans out several `/__oxide/action` calls; on the production install the node answers one and stalls the rest. Measured from outside against `app.noite.now` with a real session: `N=1` ⇒ 0.58 s; **`N=2` ⇒ one 200, one 504 at 30.07 s** (that 504 is the edge's `response_header_timeout` added the same day, which bounds the stall instead of hanging forever); a browser HAR of the app-detail page shows 5 of 6 requests never answered, **all of them `/__oxide/action`**, while `/api/auth/get-session` answered in 47 ms.
+### Hostile-tenant suite
 
-Ruled out by measurement: our request handling — the same build with a cold isolate (`CELLD_IDLE_EVICT_S=1`) answers **64 concurrent** requests in 0.49 s median on a local store; the runner hop — a D1-only action stalls identically; storage correctness/speed — RustFS under celld's own primitives is fast and correct; node resources — 8 vCPU idle, 655 MB of 8 GB used.
+`apps/noite/test/hostile/` is a sample app whose Worker, build script and release script attempt each attack and report JSON; `apps/noite/e2e/hostile.spec.ts` asserts every attempt failed. It runs in `make e2e-isolation` (`NOITE_TENANCY=multi`, `E2E_HOSTILE=1`) and is skipped otherwise.
 
-Fixed while investigating: `ensureDb` ran its migration + schema-heal pass per _call_, guarded only by a flag set after the work, so a burst on a cold isolate replayed the whole plan several times over. It is now memoized behind an in-flight-aware promise (`apps/noite/src/lib/db.ts`): 0.64 s → 0.49 s at 64-way cold locally, and contending schema transactions are gone.
+| Probe | Where | Must |
+| --- | --- | --- |
+| `process.env` / `/proc/self/environ` for `RUNNER_TOKEN`, `AWS_SECRET_ACCESS_KEY`, `BETTER_AUTH_SECRET` | build, release | none present |
+| read `/data/noite.sqlite`, git mirrors | build | EACCES |
+| a neighbour's internal `/state`, `POST /shutdown` | Worker | refused |
+| the runner on `127.0.0.1:8080`, the control node on `:8091` | Worker, build | refused |
+| the object store root | Worker | refused or 401/403 (reachable by design, holds no keys) |
+| `169.254.169.254` | Worker, build | refused |
+| `https://example.com/` | Worker | succeeds |
+| the neighbour app still serves afterwards | lane | 200 |
 
-**Root cause (2026-09-27: the node's own logs + Railway's deployment records).** Not request handling and not the store — the readiness gate around a _drain_. celld serves nothing until readiness opens, and a node that replaces an owner drains the previous deployment first: `WARN … the ready-gate observation deadline expired; readiness stays closed event="ready_gate_expired" holder=… reason=Some(Drain) waited_ms=15009` (expiry does **not** open serving), then `INFO … ready_gate_open readiness_reason="fleet_settled" waited_ms=106010`. Both captured stalls sit inside such windows (deploy `10:25:08Z` → gate `10:27:13Z`, stall `10:26:21Z`; earlier: `09:28:35Z` → `09:30:22Z`), and their 504s carry no `via: 1.1 Caddy`, so Railway's edge was cutting requests our Caddy still held.
+### Known limits
 
-What decides the wait is **how many nodes the deploy replaces**. This install runs two celld nodes — the `edge` container serves the UI from its own node and `control` runs the other (`live_leases=2` in a joining node's log) — and a single-service redeploy of `control` measured `ready_gate_open waited_ms=1009`. Replacing every node at once (the celld bump deployed both images) is what costs the ~106 s.
+- The build uid is **shared**, so two concurrent builds can read each other's worktrees. Acceptable while tenants are untrusted rather than adversarial; per-build uids are the fix.
+- Fleets hold the **root** bucket keys until [Scoped credentials](#scoped-credentials) land, so a compromised fleet process can reach every prefix.
+- Worker code can reach the object store's unauthenticated surface (it answers 401/403).
+- Sandbox depth is uid + env + rlimits + egress rules. A container per build (rootless Podman in the image, gVisor) is out of scope unless tenants are expected to be adversarial.
+- Railway's capabilities are **unverified**: until probed, Railway installs read `/ready` after the first deploy and fall back to `single`.
 
-Ruled out with numbers: request handling (64 concurrent requests on a cold isolate answer in 0.49 s locally; the `ensureDb` memo is hygiene, not this), resources (CPU peaked at 0.0995 of 8 vCPU, memory 711 MB of 8 GB), the store (`S3_ENDPOINT` is the private `rustfs.railway.internal:9000`, and the wait is a drain, not per-operation latency), and the edge config.
+## Control UI (fleet #0)
 
-Fixes: (1) **deploy one service at a time** — the surviving node absorbs the drain and the replacement opens in about a second; (2) **do not set a Railway healthcheck on `control`** — a whole-stack deploy legitimately needs minutes, and Railway _removes_ a deployment whose healthcheck misses its timeout (observed: control's `13:06:59Z` deployment REMOVED while edge's deploy in the same minute succeeded); (3) the entrypoint bounds celld's own observation with `CELLD_READY_FLEET_GATE_MS=15000`, which is no substitute for (1) because expiry does not open serving. Two earlier readings in this section were wrong and are withdrawn: that a one-node fleet cannot complete a fleet proof (this install has two nodes, and `CELLD_DURABILITY=bucket` — briefly defaulted in the entrypoint, never shipped — was reverted before it went anywhere), and that a healthcheck was the fix.
+`host/control.rs` deploys and `main.rs::supervise_control` runs the control worker as a reserved fleet:
 
-**Root cause, corrected (2026-09-27, measured).** The readiness-gate reading above explains the stalls in the minutes after a deploy that replaces every node, and nothing else. The steady-state stalls are in oxidejs on celld, not in celld, D1 or the store:
+1. Wait for the bucket (`ensure_buckets`, with RustFS status diagnostics).
+2. Build the worker's vars from the runner's config (`CONTROL_PASSTHROUGH`: `BETTER_AUTH_SECRET`, `NOITE_ADMIN_EMAIL`, `NOITE_AUTH_RATE_LIMIT`, `NOITE_EMAIL_WEBHOOK_URL`, `NOITE_RATE_LIMIT_RPM`, `NOITE_SMTP_FROM`, plus the URLs), dropping empty values.
+3. Revision = hash of the bundle's `REVISION` and the vars; if it differs from the marker in the bucket, write `wrangler.json` into a temp copy of `/opt/noite/control/dist`, `celld deploy` it to `s3://{bucket}/control`, then store the marker. A restart with the same bundle and vars deploys nothing.
+4. Spawn celld with `--listen 127.0.0.1:8090 --internal-listen 0.0.0.0:8091 --advertise <CELLD_ADVERTISE | RAILWAY_PRIVATE_DOMAIN | /etc/hostname>:8091`, `CELLD_TRUST_FORWARDED_HEADERS=1`, `CELLD_WATCH=/data/control`, `CELLD_READY_FLEET_GATE_MS=15000`, `CELLD_DURABILITY=bucket` and `CELLD_SHUTDOWN_TOTAL_MS` inside the stop budget.
 
-- celld's `node:process` answers every unknown `process.versions` key with a stub function, so oxidejs's `Boolean(process.versions.webcontainer)` read celld as a StackBlitz WebContainer. In that mode `withRequestEntry` makes each action wait for the one before it through a promise chain that crosses requests.
-- celld drops a request's pending work when that request answers or its client goes away (unless the work is under `ctx.waitUntil`). A promise another request is waiting on then never settles. One cancelled link in the chain above stalls every later action on the isolate, which is the "answers one, stalls the rest" symptom that persists until restart. D1 was never involved: an action whose only await is `await Promise.resolve()` stalls the same way.
-- Independently, the Effect RPC runtime that oxidejs cached per isolate stalls on celld under concurrency even without the gate. A runtime built per request does not.
+The worker reaches the runner at `http://127.0.0.1:8080`. When the image has no bundle (the `dev` target), the runner skips the control child and `vite dev` serves the UI on the same address.
 
-A/B on the e2e lane with the same session and data, 30 concurrent authenticated app-detail actions per round: the release image `noite-control:52da0a2` left 12–17 per round unanswered and then stalled single calls (20 s curl limit). The same image with the fixed worker answered 30/30 in 5 rounds (mean 0.02 s), and the full Playwright suite passed (8/8).
+## Edge
 
-Fixes: oxidejs 0.5.6 (WebContainer detection requires a version string; one RPC runtime per request on Worker hosts; no cross-request entry gate on Workers; `actions.timeout` answers a stuck action with a JSON-RPC error). The control UI sets `actions.timeout: 15_000`, under the edge's 30 s `response_header_timeout`. In `apps/noite/src/lib/db.ts`, a request waits at most 5 s on a setup pass another request started before it runs its own (celld can orphan that pass), and D1 work is bounded (setup 15 s, `withDb` 10 s). Rule for worker code: **no promise, timer or Effect runtime may be shared across requests** unless it is registered with `waitUntil` or its waiters are time-bounded.
+- Caddy is a runner child (`--watch` on `/data/caddy/Caddyfile`, admin on `127.0.0.1:2019`). `host/caddy.rs` generates Caddyfile text (the generator and its tests are unchanged), writes it only when it changed, and `POST`s it to the admin `/load`; a rejected config is logged with Caddy's error and surfaced in `/ready`, and the previous config keeps serving. Admin connection errors during Caddy's own startup are debug-level.
+- Upstreams are loopback: control `127.0.0.1:8090`, `api.`/`git.` `127.0.0.1:8080`, tenants `127.0.0.1:{port}`.
+- Every site carries `encode zstd gzip` (celld does not compress; `text/event-stream` stays uncompressed and unbuffered) and a 30 s `response_header_timeout`.
+- Access log at `/data/caddy/access.log` (one constant, `CADDY_ACCESS_LOG`); Caddy does not roll it, the tailer (`host/accesslog.rs`) truncates after reading. Metrics do **not** come from it.
+- On-demand TLS is ask-gated at `/v1/edge/tls-ask`: a certificate is minted only for a platform host or a live tenant/custom host. `CADDY_AUTO_HTTPS=off` behind a terminating proxy serves plaintext `:80`.
+- Scheme is pinned per host on plaintext twins (`caddy.rs::plaintext_hosts`): Caddy applies an address line's scheme to the first address only, so `http://app.x, extra.x` once bound the extra host on `:443` and made the whole config unadaptable (`ambiguous site definition`). Regression tests: `plaintext_twin_pins_the_scheme_per_host`, `behind_proxy_extra_control_host_keeps_a_valid_twin`.
 
-## Alpha completion (2026-09-24)
+## Runner state
 
-The surfaces that turn the compose install from a single-tenant demo into something an operator can run for others: invite-only onboarding, per-app custom domains, per-fleet resource limits, backup/restore, a schema-evolution rule, and a publishable CLI. All landed after the [topology revert](#topology-revert-to-compose-mode-2026-09-24).
+`host/state.rs` makes the volume a cache:
+
+- **Write path:** a task polls `PRAGMA data_version` every 2 s; after a change it waits for 10 s of quiet and at most one upload a minute, then `VACUUM INTO` a temp file and uploads `runner/state/noite.sqlite`. Also on graceful shutdown and on `POST /v1/admin/snapshot`. The loss window on an ungraceful crash is therefore about 70 s of API mutations. Everything else is reconstructible: git mirrors from tip bundles (`host/rehydrate.rs`), fleets from the bucket, telemetry from Parquet.
+- **Single writer:** `claim()` writes `runner/state/owner.json` at boot and every upload re-checks it first (`still_owner`), so a replaced runner stops uploading instead of overwriting its successor. This is a fence rather than an `If-Match` conditional write because not every S3 store supports those.
+- **Boot path:** if the local database is missing, download the snapshot into `.restoring` and rename it into place before `db::connect`. Not-found starts fresh; any other error is retried and then **fails the boot**, because an empty database would overwrite the good snapshot. A local file always wins over the bucket (only local state is ever uploaded).
+- Litestream was considered: a smaller loss window for a sidecar and a second config surface. Revisit if operators report lost mutations.
+
+## Shutdown
+
+On SIGTERM/SIGINT the API stops accepting, the reconcile loop stops spawning, and `supervisor::stop_all` signals every tenant fleet and the control node at once (`libc::kill`), waiting under one budget `NOITE_STOP_BUDGET_MS` (25000; each celld gets a `CELLD_SHUTDOWN_TOTAL_MS` below it so it seals its node log inside ours). Survivors get SIGKILL. Then Caddy stops (5 s), last, so in-flight requests drain through it, and then the final state snapshot is written. Compose sets `stop_grace_period: 35s`; Railway needs `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=35`. A single fleet stop (`stop_fleet`) waits 15 s before SIGKILL.
+
+## Readiness
+
+`GET /ready` answers 200 only when all hold, else 503 with `{"ok":false,"failing":[…]}`: first reconcile done (`reconcile`); the bucket answers (`bucket: …`, cached briefly); `multi` isolation checks passed (`isolation: …`); the control fleet is healthy when the image has a bundle (`control: …`); Caddy accepted the last config (`caddy: …`). It is the container healthcheck and what `make doctor` prints. One check fits Compose, Railway, Coolify and Fly.
+
+## Scoped credentials
+
+Goal: a compromise of one fleet reaches one app.
+
+Built (`host/credentials.rs`, table `app_credential`): rows are AES-256-GCM with a random nonce and the app id as associated data, under a key derived from `RUNNER_TOKEN` with HKDF, so the snapshot in the bucket is not a key dump and a row cannot be replayed onto another app. Lookups: `scoped_credentials` (the decrypted row or nothing), `tenant_process_credentials` (scoped, else root in `single` only; used by release), `fleet_credentials` (scoped, else root). `mint` refuses to store root keys. No provider mints keys yet, so fleets run with root keys.
+
+To build: a `CredentialProvider` (`app_credentials(slug)`, `revoke(slug)`), keys minted at app create, rotated on rename, revoked on delete (`host/purge.rs`), used by fleet spawn, release and the D1 storage browser.
+
+| Store | Mechanism | Status |
+| --- | --- | --- |
+| RustFS | IAM user + policy on `arn:aws:s3:::{bucket}/fleets/{slug}/*` via its admin API | verify support at the pinned version |
+| MinIO | same, admin API user + policy | supported |
+| AWS S3 | IAM user or STS `AssumeRole` with a prefix-scoped session policy | supported |
+| Cloudflare R2 | tokens scope to buckets: bucket-per-app (`noite-{slug}`) via the Cloudflare API | optional provider; changes the bucket layout on R2 |
+| Tigris | per-bucket keys; bucket-per-app like R2 | verify |
+| none of these | root keys | `single` only |
+
+celld's storage contract (conditional writes, read-after-write, ranged reads) must hold under the scoped keys; celld's startup check fails loudly when a policy blocks a required call. Order: MinIO/S3 first, RustFS after verification, R2 last. Done when fleet keys fail `ListObjectsV2` outside `fleets/{slug}/`, release migrations work with them, and purge revokes them.
+
+## Configuration
+
+`config.rs` is the single source of truth: one struct, defaults in one place, and no aliases (every variable has exactly one name). `Config::validate` fails the boot with a list of problems: the dev `RUNNER_TOKEN`, dev `BETTER_AUTH_SECRET` (`dev-` prefix) or the compose-default S3 keys on a non-`localhost` `BASE_DOMAIN`; a `BETTER_AUTH_URL` host the edge does not serve as a control host; a bad `NOITE_FLEET_PORTS` range; a stop budget under 5 s; on Railway, a draining window shorter than the stop budget. The worker refuses default secrets off-localhost on its own too (`auth.ts::defaultSecretRefusal`). `.env.example` documents every variable and `docker/compose.yaml` gives each a default.
+
+## Install targets
+
+Operator guide: `apps/website/docs/deployment.mdx`.
+
+- **Compose:** `docker/compose.yaml` is the whole install: one `noite` service (image `${NOITE_IMAGE:-ghcr.io/ryuzcorp/noite:latest}`, `cap_add: NET_ADMIN, SETUID, SETGID, CHOWN`, volume `noite-data:/data`, healthcheck `/ready`, stop grace 35 s) and `rustfs` (1.0.0, API on loopback). `noite` depends on `rustfs` with `required: false`, so BYO S3 is `--scale rustfs=0` plus `S3_ENDPOINT` and keys. Every variable is defaulted, so the file boots as-is from a store or panel. Overlays: `compose.build.yaml` (build from the tree: `make up`), `compose.dev.yaml` (the `dev` target with sources bind-mounted: `make dev`), `compose.e2e.yaml` (the test lane).
+- **Coolify:** the same file; the Traefik TCP router for `*.<domain>` SNI passthrough is a label on `noite`, and domains go on the `noite` service (`SERVICE_URL_NOITE_80`).
+- **Railway:** one service from the image, one volume at `/data`, R2/Tigris or a `rustfs` service. Domain target port 80, `CADDY_AUTO_HTTPS=off` (Railway terminates TLS; one `*.<domain>` custom domain covers every host), `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=35`, and `PORT=8080` + path `/ready` + `RAILWAY_HEALTHCHECK_TIMEOUT_SEC=600` for a healthcheck (Railway probes `PORT`; the runner never reads it).
+- **Dev:** `docker/dev.sh` runs the runner under cargo-watch and `vite dev` on `127.0.0.1:8090`. `celld dev` cannot serve the UI (raw esbuild cannot resolve Oxide's `virtual:oxide/worker`), the one deliberate divergence from celld's documented dev flow.
+- **E2E:** `make e2e` builds the image (or `TAG=<sha>` pulls it), boots it as project `noite-e2e` with its own bucket and ports (UI :8090 through Caddy, API :8080, tenants 20000+, rustfs :19000), resets containers and volumes by label and name (podman-compose's `down -v` aborts on the first missing container), runs doctor and Playwright. `make e2e-isolation` = the same in `multi` plus the hostile suite. `E2E_KEEP=1` leaves the stack up.
+- **Backup:** `make backup` snapshots the runner, stops the stack, tars `noite-data` and `rustfs-data` with a `MANIFEST`, starts again. `make restore FROM=…` is destructive. With your own bucket, use provider versioning.
+- **Updates** restart the runner and every fleet with it (cold boots). Pin `NOITE_IMAGE` to a SHA tag and batch upgrades.
+
+## Deploy pipeline and Git
+
+- Trigger: push fast-path (spawn after receive-pack), reconcile poll of `MANIFEST.json` + the main tip bundle, and a bearer-gated `/webhook` nudge. RustFS notifications stay off (they cannot carry a bearer).
+- Pipeline: tip `.bundle` → bare mirror `repos/{slug}.git` + worktree → sandboxed `bun install` / `bun run build` when declared → optional release → strip Noite keys → `celld deploy` → spawn or `POST /reload` on the fleet's internal listener. A failed release keeps the old deployment serving. Deploy logs keep a 64 KB tail.
+- Rollback: `POST /v1/apps/{id}/rollback {sha}` redeploys a past successful sha (bundles are immutable per sha); the UI offers it on success rows.
+- Tenant env: `app_env` + `/v1/apps/{id}/env` (admin-gated writes), injected into build, release and fleet env minus the reserved names; `.dev.vars` download in settings.
+- Git hardening: `MANIFEST.json` linearization per slug, receive-pack head parsing, per-role push policy (`push` = create + fast-forward only, `admin` = anything), per-slug push mutex, manifest re-apply on reads (`git_policy.rs`, `git_manifest.rs`). Git keys must sit under `git/`, and a manifest read error other than not-found is an error, not an empty repo.
+- Auth: profile API keys (Better Auth); the runner verifies via the UI's `/internal/git-auth` and the collaborator role (`view` fetch, `push` receive).
+- CLI (`packages/cli`, `@noitenow/cli`, publishable): `noite deploy` pushes a CI-built dist + `wrangler.jsonc` as a synthetic fast-forward commit over Git HTTP; reads `GITHUB_*`, writes `$GITHUB_OUTPUT`, comments on PRs via `gh`.
+
+## Features
+
+### Source preview
+
+Runner endpoints (`host/source.rs`) serve from the bare mirror at `last_deploy_sha` else HEAD: `GET /v1/apps/{id}/tree`, `/blob/{*path}` (256 KB cap, binary detect), `/diff` (parent diff, `--root` for the first push, 1 MB cap). UI actions `sourceTree`/`sourceBlob`/`sourceDiff` (ownership-gated) feed `/apps/[id]/source`: `@pierre/trees` `FileTree` and `@pierre/diffs` `File`/`FileDiff`, mounted imperatively inside `watch.once()` with dynamic `import()` so SSR stays clean. Not done: `loadDiffFiles` hydration (needs a rev on the blob endpoint), per-file permalinks.
+
+### Observability (the pricing substrate)
+
+- Fleets run `CELLD_OTEL=1` with the bucket sink (Parquet under `fleets/{slug}/telemetry/{traces,logs}/`), `CELLD_OTEL_FLUSH_MS=5000`, `CELLD_OTEL_RETENTION=14d`. No collector.
+- The runner aggregates with the DuckDB CLI into `app_metric` minute buckets (upsert-accumulate, 14-day prune). The window stops 10 s behind now so every bucket it names has closed; globs are day-scoped; the watermark persists in SQLite, so restarts never double-count.
+- Requests = `celld.fetch` spans (verified 1:1 against traffic); errors = the `ok` flag; latency and queue = `duration_us` / `queue_wait_us`; CPU = `/proc` sampling of the celld subtree (OTel has no CPU signal).
+- Compaction (celld never compacts its own files): hourly, for the hour just ended, per node directory, one DuckDB `COPY … compacted.parquet (zstd)` ordered by `start_unix_us`; sources are deleted only after `head-object` proves the output exists; `union_by_name=true` survives schema changes (celld calls the schema `v0-unstable`).
+- API/UI: `GET /v1/apps/{id}/metrics?hours=24` and on-demand `/spans?hours=1`; `MetricsCard` shows 24 × 1 h bars and a spans table.
+- Pricing (not built): bill on requests + `duration_us` and/or CPU ms.
 
 ### Invite-only registration
 
-- **Model.** `apps/noite/src/lib/db.ts` gains an `invite` table — `code`, `createdBy`, `usedBy`, `usedAt`, `revoked`, `note`, `createdAt` — and `lib/invites.server.ts` owns mint/redeem/list. The **first** account to register bootstraps the instance: it needs no code and is promoted to the `admin` role, so god-mode works without `NOITE_ADMIN_EMAIL`. Every **later** registration needs a single-use invitation code.
-- **Codes.** 12 characters in four-char groups (`ABCD-EFGH-JKLM`) from an unambiguous alphabet (no `0/O/1/I`). A used, revoked or unknown code is refused with a specific message before any account is created (`INVITES_PER_USER = 2` codes are minted for every new account at registration, so an invitee can pass one on without admin rights).
-- **Atomicity.** Redemption is one guarded write — `UPDATE ... WHERE usedBy IS NULL AND revoked = 0` — and the row count decides success, so two simultaneous registrations with one code cannot both win.
-- **Surfaces.** Members read their unused codes in the "Invitations" card on `/profile`; admins mint 1–50 more and revoke unused ones from the Invitations panel in `/god-mode`. The signup form shows the code field only when `GET /api/invite/status` reports the instance is past its first account.
-- **Why the code path is the worker (not the runner).** Accounts live in the worker's D1 (better-auth), so the invite table and its guard live beside them; the runner never sees registration.
+The worker D1 has an `invite` table (`code`, `createdBy`, `usedBy`, `usedAt`, `revoked`, `note`, `createdAt`); `lib/invites.server.ts` owns mint/redeem/list. The first account registers with no code and becomes `admin`; every later one needs a single-use code (12 characters, unambiguous alphabet, `ABCD-EFGH-JKLM`). Redemption is one `UPDATE … WHERE usedBy IS NULL AND revoked = 0`, so one code admits one account. Each new account gets `INVITES_PER_USER = 2` codes. Members see theirs on `/profile`; admins mint 1–50 and revoke in `/god-mode`; the signup form shows the field once `GET /api/invite/status` says the instance is past its first account. It lives in the worker because accounts do; the runner never sees registration.
 
 ### Custom domains
 
-- **Storage.** `app_domain` in the runner's `schema.sql` — `app_id`, `hostname` (PRIMARY KEY, so one app per hostname), `created_at`; index on `app_id`.
-- **API + RPC.** `GET/POST /v1/apps/{id}/domains`, `DELETE /v1/apps/{id}/domains/{hostname}`, and RPC `domains.list|add|remove`; the app settings UI exposes add/remove/list.
-- **Validation.** `lifecycle.rs::hostname_ok` — lowercase DNS shape, ≥2 labels, no wildcard, IP literal, port or path. The API additionally refuses platform hostnames (the base domain and its subdomains, plus `CONTROL_EXTRA_HOSTS`), and adding a hostname another app already holds returns 409.
-- **Routing + TLS.** The runner's Caddyfile writer routes a registered hostname to its app's port **only while the app is deployed and running**, and the on-demand TLS gate (`/v1/edge/tls-ask`) mints a certificate only for a hostname that exists _and_ whose app is live. The wildcard fallback page resolves custom hosts too, so an undeployed name lands on Noite rather than a bare 404.
-- **Operator flow.** Point DNS at the server; TLS issues on the first visit. There is **no DNS/TXT control check yet** — that stays a documented later hardening.
+`app_domain` (hostname PRIMARY KEY: one app per hostname) with `GET/POST /v1/apps/{id}/domains`, `DELETE …/domains/{hostname}` and RPC `domains.list|add|remove`. `lifecycle.rs::hostname_ok` validates (lowercase DNS shape, ≥ 2 labels, no wildcard/IP/port/path); platform hostnames and `CONTROL_EXTRA_HOSTS` are refused, a taken hostname is 409. Routed and certified only while the app is deployed and running; the fallback page resolves custom hosts too. No DNS/TXT ownership check yet.
 
-### Limits (one host, many fleets)
+### Limits
 
-- **Per-account quota.** `RUNNER_MAX_APPS_PER_USER` (default 10), enforced in the runner on `apps.create`, so an API key cannot bypass it.
-- **Per-fleet memory.** `RUNNER_FLEET_MAX_RSS_MB` (default 512) → celld's `CELLD_MAX_RSS_MB`: at the ceiling celld sheds cells (503 + `Retry-After`) instead of the runner container OOM-ing every other app. `RUNNER_FLEET_IDLE_EVICT_S` (default 300) → `CELLD_IDLE_EVICT_S`: idle cells hibernate and give memory back. Both celld-side variables are documented at https://celld.dev/docs/.
-- **Fleet log visibility.** `RUNNER_FLEET_LOG` (default `error,celld=warn`) → the fleet's own `RUST_LOG`, so celld's runtime warnings and errors reach the per-app log view; the runner's own filter used to suppress them entirely.
-- **Rate limiting, two layers.** Better-auth budgets per client for `/api/auth/*` (`NOITE_AUTH_RATE_LIMIT`, default 600/min, with `advanced.ipAddress.ipAddressHeaders` so the proxy's client address is the bucket key) and a platform limiter in the worker (`NOITE_RATE_LIMIT_RPM`, default 600/min **per route class**: `auth`, `invite`) answers 429 + `Retry-After` before the request reaches better-auth or D1. `0` disables either. In the raw-port e2e lane there is no proxy, so every request shares one bucket and the lane raises both budgets.
-
-### Backup and restore
-
-- **`make backup`** (`docker/backup.sh`) asks the runner for a `VACUUM INTO` snapshot of its SQLite (`POST /v1/admin/snapshot`, written beside the live file inside the data volume), stops the stack for a quiesced copy, tars every data volume into `backups/<UTC stamp>/` (or `DEST=...`) and writes a `MANIFEST`, then starts the stack again. Downtime is the tar time.
-- **Volumes covered:** `rustfs-data` (the fleet bucket: `git/` tip bundles, `fleets/` tenant celld, `control/` UI worker + its D1), `runner-data` (runner SQLite + git mirrors — the only copy of deploy metadata), `control-state`, `caddy-config`, `caddy-data`.
-- **`make restore FROM=backups/<stamp>`** (`docker/restore.sh`) is destructive: stops the stack, removes the backed-up volumes, unpacks them, starts again; verify with `make doctor`.
-- Both scripts need an image with `tar` — `NOITE_BACKUP_IMAGE` if set, else the runner image.
+- `RUNNER_MAX_APPS_PER_USER` (10), enforced in the runner on `apps.create`, so API keys cannot bypass it.
+- `RUNNER_FLEET_MAX_RSS_MB` (512) → `CELLD_MAX_RSS_MB` (celld sheds cells with 503 + `Retry-After` instead of the container OOM-ing); `RUNNER_FLEET_IDLE_EVICT_S` (300) → `CELLD_IDLE_EVICT_S`; `CELLD_ASSET_CACHE_BYTES` (512 MiB) per fleet.
+- `RUNNER_FLEET_LOG` (`error,celld=warn`) → the fleet's `RUST_LOG`, so celld's warnings reach the per-app log view.
+- Rate limits: better-auth's per-client budget for `/api/auth/*` (`NOITE_AUTH_RATE_LIMIT`, 600/min, keyed on the forwarded client address) and a worker limiter per route class `auth`/`invite` (`NOITE_RATE_LIMIT_RPM`, 600/min, 429 + `Retry-After` before better-auth or D1). `0` disables either. The raw-port e2e lane raises both.
 
 ### Runner schema evolution
 
-The runner's SQLite is one idempotent `schema.sql` applied on every boot. A new **table** just goes in that file (`CREATE ... IF NOT EXISTS`), but SQLite has no `ADD COLUMN IF NOT EXISTS`, so a new **column** on an existing table must go through `db::ensure_column` — guarded by `pragma_table_info`, a no-op once applied. Columns are **not** covered by `schema.sql`. There is no migration ledger; tables are idempotent in the file and columns go through the helper.
+One idempotent `apps/runner/schema.sql`, embedded and applied every boot: no migration ledger. New tables go in it with `CREATE … IF NOT EXISTS`; new columns on existing tables go through `db::ensure_column` (SQLite has no `ADD COLUMN IF NOT EXISTS`).
 
-### CLI publish fix
+## celld alignment
 
-`packages/cli` is publishable now: no `private`, Apache-2.0 license, `publishConfig.access=public`, `files: [dist, README.md, LICENSE]`, and a `prepack` that builds — so `bun publish` / `npm publish --access public` ship a working bin. A real bug was fixed in the same pass: an Effect service wiring mistake made the bin crash on **every** invocation.
+The docs at https://celld.dev/docs/ are the source of truth. What Noite relies on:
 
-## Resolved — celld control node stalled app-detail and `/god-mode` actions
+- **Tenant fleets:** `--bucket s3://<bucket>/fleets/<slug> --endpoint … --region … --listen 0.0.0.0:<p> --internal-listen 127.0.0.1:<p+1> --advertise 127.0.0.1:<p+1>`, `CELLD_WATCH` under `/data/fleets` (owned by the fleet uid), `CELLD_DURABILITY=bucket` (a single-node fleet has nobody to send to; the `fleet` posture needs two nodes before any proof completes), `CELLD_DEPLOY_POLL_S=5` (a push goes live faster; the runner also calls `POST /reload`), `CELLD_ESBUILD`, and the telemetry and limit settings above.
+- **Control node:** see [Control UI](#control-ui-fleet-0). An explicit `--advertise` requires an explicit `--internal-listen`; the advertise must be peer-dialable, never loopback.
+- **Removed variables** are rejected at startup (`CELLD_OTEL_SINK`, `CELLD_OUTPUT_GATE`, `CELLD_STORAGE_PROBE`, `CELLD_PACED_HANDOFF`, `CELLD_SHUTDOWN_DRAIN_MS`, …); Noite sets none.
+- **Storage qualification:** celld qualifies S3, R2, GCS, Tigris and Azure Blob; the store must provide conditional writes, read-after-write and ranged reads, and celld checks the contract at node start. RustFS is **not** qualified: it passes celld's check and stays the zero-config default, but production should use a qualified store.
+- **Assets:** only accepted top-level `wrangler` keys (unknown keys fail the deploy — hence stripping `release`); `assets` uses `directory`, `binding: ASSETS` (not auto-injected) and `not_found_handling: single-page-application`. celld serves assets with `max-age=0, must-revalidate`, so `apps/noite/public/_headers` marks `/assets/*` immutable for a year.
+- **Operator surfaces:** `make doctor` checks `GET /.well-known/celld/health` on the control node and runs `celld diagnose --read-only --listen 127.0.0.1:0` inside the container (diagnose binds a listener of its own, and its default `:8080` is the runner's).
+- **celld 0.6.0:** `compatibilityDate` is required (`2026-09-01` in `apps/noite/wrangler.jsonc`); no `export const` in a main module; wasm modules as `{ wasm: bytes }`; `transactionSync()` takes no callback; R2 keeps empty key segments distinct. Durable Object facets migrate to their own SQLite files on first open, which with `fleet` durability requires stopping the whole fleet first; every install path here replaces the node rather than overlapping two.
 
-The stalled Settings/Overview and admin panels, including the "second D1 read never resolves" reading, were the oxidejs stalls described under [Control-node request stalls](#control-node-request-stalls-2026-09-27). The earlier hypotheses (a D1 layer per `withDb` call, the builder-vs-raw-SQL split) are withdrawn. The panels still have no UI-level e2e coverage.
+## Worker code rules
 
-### Related measurement: the `celld d1` CLI wedges the cell for the worker
+- **Nothing crosses requests.** No promise, timer or Effect runtime may be shared between requests unless it is registered with `ctx.waitUntil` or its waiters are time-bounded. celld drops a request's pending work when the request answers or its client leaves, and anything still waiting on that work hangs forever without an error.
+- **Isolate-level setup runs once, concurrently-safe.** `ensureDb` (migrations, schema heal, backfills) is memoized behind an in-flight-aware promise (`apps/noite/src/lib/db.ts`); a request waits at most 5 s on a pass another request started, then runs its own. D1 work is bounded (setup 15 s, `withDb` 10 s).
+- **Actions are bounded.** `actions.timeout: 15_000` in `apps/noite/vite.config.ts` answers a stuck action with a JSON-RPC error before the edge's 30 s timeout.
+- **Do not write to a live D1 with the `celld d1` CLI.** In the lane, one `celld d1 execute` against the control node's D1 while the UI ran made every later page load hang. The D1 storage browser (`host/storage/d1.rs`) shells out the same way against a tenant's D1; check whether browsing a D1 stalls the app it inspects.
 
-Writing to the control node's D1 with the operator CLI (`podman exec <control> celld d1 execute noite-control --command …`) while the UI is running leaves that D1 cell unable to serve the worker: in the lane, a single such call (a test invite insert, or a code count) was immediately followed by every later page load hanging, on a freshly booted stack. The lane's helper for it was removed for that reason. The same shape exists in the D1 storage browser (`apps/runner/src/host/storage/d1.rs` shells out to `celld d1 execute` for a tenant's declared database) — that runs against the tenant's own fleet cell rather than the control one, so the blast radius is that app, but it is worth checking whether browsing a D1 stalls the app it inspects.
+## Open questions and known issues
 
-## TODO
+1. **Railway capabilities:** probe `NET_ADMIN`/`SETUID`/`SETGID`/`CHOWN` and unprivileged user namespaces; record the decision (`multi`, the `bwrap` fallback, or `single` only). Do not ship `multi` there on hope.
+2. **RustFS IAM:** if unsupported at the pinned version, bundled-RustFS installs stay on root keys, i.e. effectively `single`, unless the operator moves to MinIO/S3/R2.
+3. **Snapshot loss window** (about 70 s) vs Litestream.
+4. **Control and runner restart together** on every image update. Accepted: the UI cannot act without the runner, and one node removes the two-node readiness-gate drain that stalled the old topology.
+5. **E2E comments** in `apps/noite/e2e/{helpers.ts,app-lifecycle.spec.ts,a-invite.spec.ts}` still call the app-detail and invite panels a known-broken surface; the stalls were fixed in oxidejs 0.5.6 (History, 2026-09-27), so those surfaces can now get UI-level coverage.
+6. **Not built:** app-author docs ("your first app": `wrangler.jsonc`, build/release scripts, env, `_headers`/`_redirects`, `deploy.sh`, logs/metrics) and a README for `apps/noite/test`; a tiny forge UI over bare mirrors (history, commit views); DNS/TXT verification for custom domains; pricing.
 
-- **TODO — app-author documentation.** `apps/website/docs/` currently has only `index.mdx` and `deployment.mdx`, both operator-facing. Missing: a "your first app" guide covering what `wrangler.jsonc` must declare, the optional build/release scripts, the env model, `_headers`/`_redirects`, `deploy.sh`, and the logs/metrics surfaces — plus a README in `apps/noite/test` for the sample app.
-- **TODO — SPEC drift in "Left / polish".** That list still describes deleted machinery as built (the R2 durability relay, the nightly `runner-backup` cron, the 5-minute relay) and lists "TLS / real domains" as a plan although on-demand per-host certificates have shipped. Reconcile the list with the current architecture.
+## Out of scope
+
+Organizations and multi-host; deep APM; workloads that aren't celld apps.
+
+## History
+
+Condensed; git history has the detail.
+
+- **2026-09-12 — plan waves.** Root `.dockerignore` (with `**/` patterns: a bare pattern matches the context root only, so `apps/runner/target` was in every build context); `make down` keeps data and `make nuke` wipes it (by name, since podman-compose's `down -v` aborts on the first missing container and left `409 slug already taken` behind); the pre-Oxide `_control` worker and the Bun host plane deleted; the runner as the Caddyfile's single owner; `/webhook` bearer-gated; default secrets refused off-localhost; deploy logs capped; Git auth on profile API keys. Oxide/Effect showcase code (schedules, queues, workflows, liveQuery) is kept deliberately.
+- **2026-09-15/18 — container-cell topology.** The runner ran as a `RunnerContainer` Durable Object cell with a loopback S3 sidecar, a worker-relayed R2 durability relay and a static Caddyfile; the UI moved from a Bun server to the Oxide worker on a celld fleet (D1 fresh start, everyone re-registered).
+- **2026-09-19 — features.** Release command + rollback, bucket versioning, tenant env, `make doctor`, the CLI.
+- **2026-09-24 — revert to Compose.** The container-cell path (the DO, the sidecar, `/v1/sync/*`, the R2 relay, generated DO wiring) and the UI's D1 mirror of runner rows were deleted; Noite became four services (`rustfs`, `runner`, `control`, `caddy`) with a runner-written Caddyfile. The same day: celld alignment (telemetry flush + compaction, edge compression, asset caching, operator surfaces, storage qualification) and the alpha surfaces (invites, custom domains, limits, backup/restore, schema evolution, CLI publish fix).
+- **2026-09-25 — installs.** A pull-only standalone Compose mirror for stores/VMs, and a Railway layout with an `edge` image (runner + Caddy) because Railway volumes cannot be shared between services. The `CONTROL_EXTRA_HOSTS` scheme bug (see [Edge](#edge)) was found there.
+- **2026-09-26 — celld 0.6.0.**
+- **2026-09-27 — control-node request stalls.** Page loads fanned out several `/__oxide/action` calls and the node answered one and stalled the rest (5 of 6 in a HAR; `N=2` ⇒ one 200, one 504 at 30 s). Two causes. (1) Minutes after a deploy that replaced every celld node, readiness waited for a drain (`ready_gate_expired reason=Drain`, then `ready_gate_open waited_ms=106010`), while a single-node replacement opened in about a second. (2) The steady-state cause was oxidejs on celld: celld's `node:process` answers unknown `process.versions` keys with a stub, so oxidejs detected a StackBlitz WebContainer and chained every action behind the previous one across requests; one cancelled link stalled the isolate until restart. Separately, the Effect RPC runtime oxidejs cached per isolate stalled under concurrency. A/B with 30 concurrent actions per round: 12–17 unanswered before, 30/30 (mean 0.02 s) after. Fixed in oxidejs 0.5.6 (version-string WebContainer detection, one RPC runtime per request on Worker hosts, no cross-request entry gate, `actions.timeout`). Ruled out by measurement: request handling, the runner hop, the store, node resources, the edge config.
+- **2026-09-27 — one image, tenant isolation, no v1 compatibility.** Everything in this file above History. Deleted: `Dockerfile.runner`/`.ui`/`.edge`/`.runner-dev`/`.tools` and their ignores, both entrypoints, `runner-dev.sh`, `control-dev.sh`, `compose.byob.yaml`, `compose.standalone.yaml`, `check-standalone.ts`; the `noite-runner`/`noite-control`/`noite-edge` images; the `HOST_*`/`AGENT_*`/`CONTROL_URL`/`S3_BUCKET`/`PORT_BASE` aliases; the `app_secret` table, soft-delete reclaim, `git-remote-s3` bundle keys, the apikey backfill and `--print-env-example`. The one production install is wiped and reinstalled; a v1 bucket or volume is not read. The separate platform-v2 design spec was merged into this file.

@@ -7,18 +7,20 @@ description: Noite is a tiny self-hostable PaaS for celld — accounts, apps, su
 
 Noite is a tiny self-hostable PaaS for [celld](https://celld.dev/): user accounts (passkeys), apps, `{slug}.{BASE_DOMAIN}` subdomains, thin deploy/build logs and status. It fits on one small server.
 
-One `docker compose up -d` runs four services from `docker/compose.yaml`:
+Noite is **one image**, `ghcr.io/<owner>/noite`. One `docker compose up -d` runs it next to a bundled RustFS store (`docker/compose.yaml`); inside the container the runner supervises everything else:
 
-- **rustfs** — the S3 fleet bucket (`git/` tip bundles, `fleets/` tenant celld, `control/` UI worker + its D1). Optional: point the stack at your own S3 instead.
-- **runner** — the Rust deploy pipeline: Git smart-HTTP, builds, one celld fleet per app, telemetry aggregation, and the Caddyfile the edge reloads.
-- **control** — the Oxide control UI on a celld node; its worker bundle is baked into the image and self-deployed on first boot.
-- **caddy** — the edge: per-host TLS with on-demand certificates, routing to the UI, the API and tenant apps.
+- **runner**: the Rust deploy pipeline and PID 1. Git smart-HTTP, builds, one celld fleet per app, telemetry aggregation, and the edge's config.
+- **caddy**: the edge. Per-host TLS with on-demand certificates, routing to the UI, the API and tenant apps.
+- **control**: the Oxide control UI, a celld fleet whose worker bundle is baked into the image and deployed on first boot.
+- **tenant fleets**: one celld per app, sandboxed from the platform when other people push code (`NOITE_TENANCY=multi`).
+
+State lives in one S3 bucket (`git/` tip bundles, `fleets/` tenant celld, `control/` the UI worker and its D1, `runner/state/` runner snapshots): the bundled RustFS, or your own S3 with `--scale rustfs=0`.
 
 Get started from a checkout:
 
 ```bash
 cp .env.example .env
-make up      # build both images and start the stack
+make up      # build the image and start the stack
 make logs
 make doctor  # verify the install
 ```

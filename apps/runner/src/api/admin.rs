@@ -10,8 +10,9 @@ use crate::error::ApiError;
 use crate::AppState;
 
 /// Write a consistent copy of the runner SQLite (`VACUUM INTO`) and report it.
-/// Overwrites the previous copy: the file lives in the data volume, so a stale
-/// one would be tarred silently.
+/// Overwrites the previous copy. Also uploads to the bucket (SPEC, Runner state) so the
+/// trigger doubles as "flush state now" — `make backup` becomes bucket
+/// versioning + copy.
 pub async fn snapshot(State(state): State<AppState>) -> impl IntoResponse {
     let path = db::snapshot_path(&state.config);
     if let Some(parent) = path.parent() {
@@ -29,5 +30,8 @@ pub async fn snapshot(State(state): State<AppState>) -> impl IntoResponse {
     }
     let bytes = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
     tracing::info!(path = %path.display(), bytes, "runner db snapshot written");
-    Json(json!({ "bytes": bytes, "ok": true, "path": target })).into_response()
+    // Bucket upload (best-effort surfaced in the response, not a failure:
+    // the local file is what `backup.sh` tars today).
+    let uploaded = state.state_sync.snapshot_now(&state.pool, &state.config).await.ok();
+    Json(json!({ "bytes": bytes, "ok": true, "path": target, "bucket_bytes": uploaded })).into_response()
 }

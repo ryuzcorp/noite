@@ -31,32 +31,20 @@ jobs:
       - name: version pins
         run: bun docker/check-versions.ts
       # `config` needs no daemon, so a broken compose file fails here instead of
-      # on someone's server. Every variant, including the test overlay.
-      - name: render prod compose
-        run: BASE_DOMAIN=localhost docker compose -f docker/compose.yaml config > /dev/null
-      - name: render dev overlay
-        run: BASE_DOMAIN=localhost docker compose -f docker/compose.yaml -f docker/compose.dev.yaml config > /dev/null
-      - name: render byob overlay
-        run: BASE_DOMAIN=localhost AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x S3_ENDPOINT=https://s3.example.com S3_PUBLIC_ENDPOINT=https://s3.example.com docker compose -f docker/compose.yaml -f docker/compose.byob.yaml config > /dev/null
-      - name: render e2e overlay
-        run: BASE_DOMAIN=localhost docker compose -f docker/compose.yaml -f docker/compose.e2e.yaml config > /dev/null
-      - name: render standalone compose
-        run: docker compose -f docker/compose.standalone.yaml config > /dev/null
-      # The standalone file is a hand-maintained mirror of docker/compose.yaml
-      # (pull-only, no build:), so a service that gains an env var or volume
-      # there would silently rot store installs. Compare the rendered configs.
-      - name: standalone matches the base install
+      # on someone's server. Every variant, including the test overlays.
+      - name: render compose (prod, build, dev, e2e)
         run: |
-          BASE_DOMAIN=localhost docker compose -f docker/compose.yaml config --format json > /tmp/base.json
-          docker compose -f docker/compose.standalone.yaml config --format json > /tmp/standalone.json
-          bun docker/check-standalone.ts /tmp/base.json /tmp/standalone.json
+          docker compose -f docker/compose.yaml config > /dev/null
+          docker compose -f docker/compose.yaml -f docker/compose.build.yaml config > /dev/null
+          docker compose -f docker/compose.yaml -f docker/compose.dev.yaml config > /dev/null
+          docker compose -f docker/compose.yaml -f docker/compose.e2e.yaml config > /dev/null
       - name: shell scripts parse
         run: for f in docker/*.sh; do sh -n "$f"; done
       - name: runner schema applies twice (idempotent)
         run: |
           sqlite3 /tmp/schema.db < apps/runner/schema.sql
           sqlite3 /tmp/schema.db < apps/runner/schema.sql
-          for t in app app_env app_metric app_secret deploy metric_watermark; do
+          for t in app app_credential app_env app_metric deploy metric_watermark; do
             sqlite3 /tmp/schema.db "SELECT name FROM sqlite_master WHERE type='table' AND name='$t'" | grep -qx "$t"
           done
 
@@ -97,7 +85,7 @@ jobs:
         working-directory: apps/noite
         run: bun run build
 
-  # Manual, because it builds both images and drives a real browser.
+  # Manual, because it builds the image and drives a real browser.
   e2e:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -114,6 +102,10 @@ jobs:
         run: bunx playwright install --with-deps chromium
       - name: e2e lane
         run: make e2e
+      # Multi-tenant mode with the image's capabilities: the hostile-tenant
+      # spec proves builds and fleets cannot reach secrets or internal APIs.
+      - name: e2e isolation lane
+        run: make e2e-isolation
       - name: upload playwright report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

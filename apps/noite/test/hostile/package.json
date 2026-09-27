@@ -1,0 +1,7 @@
+{
+  "name": "hostile",
+  "private": true,
+  "scripts": {
+    "build": "bun build-probe.js"
+  }
+}

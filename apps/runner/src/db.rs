@@ -5,7 +5,7 @@ use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 use sqlx::sqlite::SqliteConnection;
 
 use crate::models::{
-    now_iso, new_id, App, AppDeviceStat, AppDomain, AppEnv, AppEvent, AppInsight, AppMetric, AppPathStat, AppRefStat, AppSecret, AppStatus, AppUserProps, Deploy, DeployStatus,
+    now_iso, new_id, App, AppDeviceStat, AppDomain, AppEnv, AppEvent, AppInsight, AppMetric, AppPathStat, AppRefStat, AppStatus, AppUserProps, Deploy, DeployStatus,
 };
 
 const APP_COLS: &str = r#"id, slug, name, user_id, status, subdomain, git_prefix, fleet_bucket,
@@ -83,7 +83,7 @@ pub fn local_db_path(cfg: &crate::config::Config) -> Option<std::path::PathBuf> 
 // Never called yet — it exists for the next column this schema gains, and the
 // unit test below pins the add-once behaviour. Delete it the moment a real call
 // site lands (this allow is the only reason it is not `dead_code`).
-#[allow(dead_code)]
+#[allow(dead_code)] // the schema-evolution helper: no column is pending right now
 pub async fn ensure_column(
     pool: &SqlitePool,
     table: &str,
@@ -706,19 +706,40 @@ pub async fn prune_app_refs(pool: &SqlitePool, older_than_ts: &str) -> sqlx::Res
     Ok(res.rows_affected())
 }
 
-/// Per-app secret by kind (`fleet` → the pair the tenant celld fleet gets).
-pub async fn get_secret(
-    pool: &SqlitePool,
-    app_id: &str,
-    kind: &str,
-) -> sqlx::Result<Option<AppSecret>> {
-    sqlx::query_as::<_, AppSecret>(
-        "SELECT id, app_id, kind, access_key, secret_key, revealed, created_at FROM app_secret WHERE app_id = ? AND kind = ?",
+/// Encrypted per-app credential row (SPEC, Scoped credentials). Nonce +
+/// AES-GCM ciphertext over JSON `{access_key, secret_key}`; the KEK derives
+/// from RUNNER_TOKEN so the bucket snapshot is not a key dump.
+pub async fn get_app_credential(pool: &SqlitePool, app_id: &str) -> sqlx::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT nonce, ciphertext FROM app_credential WHERE app_id = ?",
     )
     .bind(app_id)
-    .bind(kind)
     .fetch_optional(pool)
-    .await
+    .await?;
+    Ok(row)
+}
+
+pub async fn put_app_credential(pool: &SqlitePool, app_id: &str, nonce: &[u8], ciphertext: &[u8]) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO app_credential (app_id, nonce, ciphertext, updated_at) VALUES (?, ?, ?, ?)
+           ON CONFLICT (app_id) DO UPDATE SET nonce = excluded.nonce,
+           ciphertext = excluded.ciphertext, updated_at = excluded.updated_at"#,
+    )
+    .bind(app_id)
+    .bind(nonce)
+    .bind(ciphertext)
+    .bind(now_iso())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_app_credential(pool: &SqlitePool, app_id: &str) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM app_credential WHERE app_id = ?")
+        .bind(app_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Tenant env vars (CF `.dev.vars` model: local file for dev, fleet env in
@@ -770,6 +791,13 @@ fn env_reserved(name: &str) -> bool {
         || name.starts_with("AWS_")
         || name.starts_with("S3_")
         || name.starts_with("CELLD_")
+        || name.starts_with("RUNNER_")
+        || name.starts_with("NOITE_")
+        || name.starts_with("BETTER_AUTH_")
+        || name.starts_with("CADDY_")
+        || name.starts_with("LD_")
+        || name == "NODE_OPTIONS"
+        || (name.starts_with("BUN_") && name != "BUN_INSTALL_CACHE_DIR")
 }
 
 /// Tenant env ready to inject, minus reserved names. Feature flags are
@@ -794,7 +822,10 @@ pub async fn tenant_env(pool: &SqlitePool, app_id: &str) -> Vec<(String, String)
     }
 }
 
-pub async fn next_ports(pool: &SqlitePool, base: u16) -> sqlx::Result<(i64, i64)> {
+/// Range-bounded allocator (SPEC, Ports): new fleets come from the
+/// configured range. Exhaustion errors instead of wandering past max into
+/// ephemeral ports.
+pub async fn next_ports_in(pool: &SqlitePool, min: u16, max: u16) -> sqlx::Result<(i64, i64)> {
     let apps = list_all_apps(pool).await?;
     let mut used = std::collections::HashSet::new();
     for a in apps {
@@ -805,11 +836,16 @@ pub async fn next_ports(pool: &SqlitePool, base: u16) -> sqlx::Result<(i64, i64)
             used.insert(p as u16);
         }
     }
-    let mut listen = base;
-    while used.contains(&listen) || used.contains(&(listen + 1)) {
-        listen += 2;
+    let mut listen = min;
+    loop {
+        if listen.saturating_add(1) > max {
+            return Err(sqlx::Error::RowNotFound);
+        }
+        if !used.contains(&listen) && !used.contains(&(listen + 1)) {
+            return Ok((listen as i64, (listen + 1) as i64));
+        }
+        listen = listen.saturating_add(2);
     }
-    Ok((listen as i64, (listen + 1) as i64))
 }
 
 /// Insert one tenant event. Caller validates shapes; tags arrive serialized.

@@ -16,12 +16,6 @@ export type { AppRole } from "./roles";
  * grants only. `App` is that runner row — the UI never holds a second copy. */
 export type App = RunnerApp;
 
-/** Soft-delete tombstones the runner still keeps: never show or gate on them. */
-const live = (app: RunnerApp): boolean =>
-  app.desiredState !== "deleted" &&
-  app.status !== "deleting" &&
-  app.status !== "gone";
-
 /** Look up a live app by id (runner GET) or slug (runner list). Returns null
  * when the runner is down or the app does not exist; callers 401 either way. */
 const findApp = async (
@@ -30,10 +24,10 @@ const findApp = async (
   try {
     if ("id" in key) {
       const app = await runnerGetApp(key.id);
-      return app && live(app) ? app : null;
+      return app ?? null;
     }
     const apps = await runnerListApps();
-    return apps.find((app) => app.slug === key.slug && live(app)) ?? null;
+    return apps.find((app) => app.slug === key.slug) ?? null;
   } catch {
     return null;
   }
@@ -180,9 +174,7 @@ export const listAppsForCollaborator = async (
   ]);
   const granted = new Set(grants.map((grant) => grant.appId));
   return apps
-    .filter(
-      (app) => live(app) && (app.userId === userId || granted.has(app.id))
-    )
+    .filter((app) => app.userId === userId || granted.has(app.id))
     .toSorted(
       (a, b) =>
         new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
