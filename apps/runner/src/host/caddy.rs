@@ -132,19 +132,19 @@ pub async fn rewrite_caddy(
         for line in proxy_extra {
             lines.push(format!("\t\t{line}"));
         }
-        // One fresh upstream connection per request, and a bound on the wait
-        // for a response header. Caddy pools upstream connections for two
-        // minutes by default while celld closes idle ones far sooner, so a
-        // pooled connection can already be dead when Caddy writes to it: the
-        // request goes into nothing, there is no response to forward, and the
-        // browser waits for its own timeout — a hang, not an error. Measured on
-        // Railway before this: bursts of action requests hung 30-60s and only
-        // recovered after ~75s idle, celld logged `incomplete_message`
-        // connection failures on its public surface, and the store, CPU and
-        // memory were all healthy. `flush_interval -1` below only affects
-        // response streaming, so it does not cover this.
+        // Bound the upstream waits, but keep the connection pool. celld
+        // answers a subset of concurrent requests never at all (measured on
+        // the production install: every failure is exactly the timeout below,
+        // while the ones that answer take 0.55-0.88 s), and with no bound
+        // Caddy holds such a request until the browser gives up — the client
+        // sees a hang rather than an error it could retry. `dial_timeout`
+        // bounds a stalled connect. Pooling stays ON deliberately: measured
+        // against a 0.6.0 node, an upstream per request (`keepalive off`)
+        // costs ~590 ms per request where the pool costs ~11 ms, because celld
+        // charges a new connection to the Worker, and it also multiplies
+        // simultaneous connections to a node that is already the bottleneck.
+        // `flush_interval -1` below only affects response streaming.
         lines.push("\t\ttransport http {".into());
-        lines.push("\t\t\tkeepalive off".into());
         lines.push("\t\t\tdial_timeout 5s".into());
         lines.push("\t\t\tresponse_header_timeout 30s".into());
         lines.push("\t\t}".into());
