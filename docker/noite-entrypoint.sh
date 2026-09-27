@@ -146,27 +146,15 @@ fi
 # resolve).
 advertise="${CELLD_ADVERTISE:-${RAILWAY_PRIVATE_DOMAIN:-$(hostname)}}:8091"
 
-# 5. One node cannot hold the fleet posture. celld's default is
-# CELLD_DURABILITY=fleet, and the docs are explicit that the ensemble needs two
-# nodes: "A node picks its followers from the other nodes in the fleet, so it
-# never counts itself. One follower is enough, therefore a fleet needs two
-# running celld nodes before any node can complete a fleet proof.
-# CELLD_DURABILITY=fleet is the default, so a fleet of one node requests the
-# fleet posture and does not get it." Bucket durability is the single-node
-# posture and is what the runner's tenant fleets already run; it also keeps a
-# rolling update legal on the next celld upgrade (0.6.0 requires stopping a
-# whole `fleet`-durability fleet, while a `bucket` fleet may roll).
-export CELLD_DURABILITY="${CELLD_DURABILITY:-bucket}"
-
-# 6. Bound the first-readiness observation. On a one-node fleet a restart holds
-# the takeover gate closed while it waits for handover evidence a fleet of one
-# cannot produce — the Railway install logged `ready_gate_expired reason=Drain
-# waited_ms=15009` and only opened at `ready_gate_open waited_ms=106010`, with
-# Worker requests accepted and unanswered for that whole window. Expiry does NOT
-# open serving (prod proves that), so this bound limits the observation only;
-# what removes the user-visible hang is not routing to the node until it serves,
-# and what removes the wait is a second node. Bounded below the ingress timeout
-# (Railway's edge cuts at 30 s) so celld stops observing before then.
+# 5. Bound the first-readiness observation. celld serves nothing until its
+# readiness gate opens, and it opens only once the fleet settles: on this
+# install that took ~106 s whenever *every* node restarted together (deploying
+# the whole stack), while a single-service deploy joins the fleet that is still
+# live and opens immediately (`live_leases=2` in the joining node's log). Expiry
+# of this deadline does NOT open serving — the Railway install logged
+# `ready_gate_expired reason=Drain waited_ms=15009` and then `ready_gate_open
+# waited_ms=106010` — so this bound limits celld's observation, nothing more.
+# Bounded below the ingress timeout (Railway's edge cuts at 30 s).
 export CELLD_READY_FLEET_GATE_MS="${CELLD_READY_FLEET_GATE_MS:-15000}"
 
 exec celld \
