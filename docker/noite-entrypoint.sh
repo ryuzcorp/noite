@@ -145,6 +145,19 @@ fi
 # the hostname (compose names a container after its service, which peers
 # resolve).
 advertise="${CELLD_ADVERTISE:-${RAILWAY_PRIVATE_DOMAIN:-$(hostname)}}:8091"
+
+# 5. Bound the first-readiness gate. celld opens serving only once the fleet has
+# capacity ("ready_gate_open", readiness_reason="fleet_settled"), and until it
+# opens it accepts connections and answers nothing. Measured on the Railway
+# install that wait is ~104 s after every start (waited_ms=104008 in the node's
+# own log), so for ~2 minutes after each deploy every Worker request — the
+# control UI's actions — hangs until the ingress gives up, while celld's health
+# endpoint already answers 503. The wait is bounded by
+# CELLD_READY_FLEET_GATE_MS; keep it below the ingress timeout (Railway's edge
+# cuts at 30 s) so a boot serves — cold, if need be — instead of holding
+# requests silently.
+export CELLD_READY_FLEET_GATE_MS="${CELLD_READY_FLEET_GATE_MS:-15000}"
+
 exec celld \
   --bucket "$DEPLOY_BUCKET" \
   --endpoint "$EP" \

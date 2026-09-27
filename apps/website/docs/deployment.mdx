@@ -185,6 +185,8 @@ curl -s https://app.<domain>/api/auth/ok                           # control wor
 
 `make doctor` and `make backup` read `.env` and drive `docker compose`, so neither applies here. A service redeploys as a single container — no rolling replacement — so the edge 5xxs briefly while its volume is released and re-attached; batch control-plane changes. The volumes are the state: `edge`'s holds the runner's SQLite and git mirrors (the only copy of deploy metadata), `rustfs`'s holds the bucket (git tips, tenant celld and the control D1). Railway exposes only a volume's name and mount path over its API, so there is nothing to wire — use Railway's volume backups, or point any S3 client at `S3_PUBLIC_ENDPOINT` and copy the bucket.
 
+One Railway-specific step for the `control` service: **set its healthcheck path to `/.well-known/celld/health`**. celld serves nothing until its first-readiness wait ends (on this install ~104 s after every start, `waited_ms=104008` in the node's log) and answers **503** on that path until then, so without a healthcheck Railway routes traffic to a node that accepts connections and never replies — every request after a deploy hangs until the ingress gives up. With it, Railway holds traffic until the node can actually serve. The control entrypoint also bounds that wait (`CELLD_READY_FLEET_GATE_MS`, default `15000` here) so a boot serves cold rather than holding requests silently.
+
 ## Updating
 
 ```bash
