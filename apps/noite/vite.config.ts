@@ -70,6 +70,9 @@ export default defineConfig({
     oxide({
       actions: {
         sameOrigin: true,
+        // Below the edge's 30 s response_header_timeout: a stuck action
+        // answers with a JSON-RPC error instead of an edge 504.
+        timeout: 15_000,
         transport: "http",
       },
       // SAFETY: controlEnv is a plain-object env bag; oxide only reads known keys off it, so casting to its `never`-indexed env type is safe (the bag holds only strings + durable bindings written before vite boot).

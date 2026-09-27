@@ -245,6 +245,16 @@ Ruled out with numbers: request handling (64 concurrent requests on a cold isola
 
 Fixes: (1) **deploy one service at a time** — the surviving node absorbs the drain and the replacement opens in about a second; (2) **do not set a Railway healthcheck on `control`** — a whole-stack deploy legitimately needs minutes, and Railway _removes_ a deployment whose healthcheck misses its timeout (observed: control's `13:06:59Z` deployment REMOVED while edge's deploy in the same minute succeeded); (3) the entrypoint bounds celld's own observation with `CELLD_READY_FLEET_GATE_MS=15000`, which is no substitute for (1) because expiry does not open serving. Two earlier readings in this section were wrong and are withdrawn: that a one-node fleet cannot complete a fleet proof (this install has two nodes, and `CELLD_DURABILITY=bucket` — briefly defaulted in the entrypoint, never shipped — was reverted before it went anywhere), and that a healthcheck was the fix.
 
+**Root cause, corrected (2026-09-27, measured).** The readiness-gate reading above explains the stalls in the minutes after a deploy that replaces every node, and nothing else. The steady-state stalls are in oxidejs on celld, not in celld, D1 or the store:
+
+- celld's `node:process` answers every unknown `process.versions` key with a stub function, so oxidejs's `Boolean(process.versions.webcontainer)` read celld as a StackBlitz WebContainer. In that mode `withRequestEntry` makes each action wait for the one before it through a promise chain that crosses requests.
+- celld drops a request's pending work when that request answers or its client goes away (unless the work is under `ctx.waitUntil`). A promise another request is waiting on then never settles. One cancelled link in the chain above stalls every later action on the isolate, which is the "answers one, stalls the rest" symptom that persists until restart. D1 was never involved: an action whose only await is `await Promise.resolve()` stalls the same way.
+- Independently, the Effect RPC runtime that oxidejs cached per isolate stalls on celld under concurrency even without the gate. A runtime built per request does not.
+
+A/B on the e2e lane with the same session and data, 30 concurrent authenticated app-detail actions per round: the release image `noite-control:52da0a2` left 12–17 per round unanswered and then stalled single calls (20 s curl limit). The same image with the fixed worker answered 30/30 in 5 rounds (mean 0.02 s), and the full Playwright suite passed (8/8).
+
+Fixes: oxidejs 0.5.6 (WebContainer detection requires a version string; one RPC runtime per request on Worker hosts; no cross-request entry gate on Workers; `actions.timeout` answers a stuck action with a JSON-RPC error). The control UI sets `actions.timeout: 15_000`, under the edge's 30 s `response_header_timeout`. In `apps/noite/src/lib/db.ts`, a request waits at most 5 s on a setup pass another request started before it runs its own (celld can orphan that pass), and D1 work is bounded (setup 15 s, `withDb` 10 s). Rule for worker code: **no promise, timer or Effect runtime may be shared across requests** unless it is registered with `waitUntil` or its waiters are time-bounded.
+
 ## Alpha completion (2026-09-24)
 
 The surfaces that turn the compose install from a single-tenant demo into something an operator can run for others: invite-only onboarding, per-app custom domains, per-fleet resource limits, backup/restore, a schema-evolution rule, and a publishable CLI. All landed after the [topology revert](#topology-revert-to-compose-mode-2026-09-24).
@@ -287,21 +297,9 @@ The runner's SQLite is one idempotent `schema.sql` applied on every boot. A new 
 
 `packages/cli` is publishable now: no `private`, Apache-2.0 license, `publishConfig.access=public`, `files: [dist, README.md, LICENSE]`, and a `prepack` that builds — so `bun publish` / `npm publish --access public` ship a working bin. A real bug was fixed in the same pass: an Effect service wiring mistake made the bin crash on **every** invocation.
 
-## Known issue (open) — celld control node stalls app-detail and `/god-mode` actions
+## Resolved — celld control node stalled app-detail and `/god-mode` actions
 
-Under the celld deployment (the `control` node), the app-detail pages and `/god-mode` stall: their server actions never return, so the Settings/Overview panels and the admin panel stay on their loading skeleton.
-
-Diagnosis (all measured on the e2e lane):
-
-- The worker isolate is idle while the browser waits.
-- Routes answer normally — `/api/auth/get-session`, `/api/invite/status` and the document all return in ~3 ms.
-- The action layer starts executing (`findApp` reads the app from the runner; the raw-SQL admin check completes) and then a **second** D1 read inside the same action never resolves — e.g. `withDb(orm.app_collaborator.findFirst(...))` after `withDb(isUserAdminById(...))`.
-- Restarting the control node clears it until the next page load.
-- It reproduces on pages the previous e2e suite never visited, so it is **pre-existing**, not introduced by the invite/domain work; the same code paths work in `make dev` (vite/workerd).
-
-Working hypotheses: a D1 session/layer per `withDb` call, or the builder-vs-raw-SQL split (the ORM builder path hanging where the raw query returned).
-
-Consequence: those panels are **not covered by tests**. The lane pins what it can reach: custom domains, tenant env vars and the app lifecycle through the runner API; the invite gate through the signup form; deploys and the edge through their existing specs. Do not read a green lane as proof that the panels render, and treat "redeem an invitation code" and "read your own codes" as unverified end to end.
+The stalled Settings/Overview and admin panels, including the "second D1 read never resolves" reading, were the oxidejs stalls described under [Control-node request stalls](#control-node-request-stalls-2026-09-27). The earlier hypotheses (a D1 layer per `withDb` call, the builder-vs-raw-SQL split) are withdrawn. The panels still have no UI-level e2e coverage.
 
 ### Related measurement: the `celld d1` CLI wedges the cell for the worker
 

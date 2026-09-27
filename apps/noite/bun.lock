@@ -37,7 +37,7 @@
         "@tailwindcss/vite": "^4.3.3",
         "@types/bun": "^1.4.2",
         "daisyui": "^5.7.22",
-        "oxidejs": "0.5.5",
+        "oxidejs": "0.5.6",
         "tailwindcss": "^4.3.3",
         "typescript": "^7",
         "vite": "^8.2.2",
@@ -642,7 +642,7 @@
 
     "oniguruma-to-es": ["oniguruma-to-es@4.3.6", "", { "dependencies": { "oniguruma-parser": "^0.12.2", "regex": "^6.1.0", "regex-recursion": "^6.0.2" } }, "sha512-csuQ9x3Yr0cEIs/Zgx/OEt9iBw9vqIunAPQkx19R/fiMq2oGVTgcMqO/V3Ybqefr1TBvosI6jU539ksaBULJyA=="],
 
-    "oxidejs": ["oxidejs@0.5.5", "", { "dependencies": { "effect": "~4.0.0-rc.112", "linkedom": "^0.18.13", "unplugin": "^3.3.0" }, "peerDependencies": { "@rsbuild/core": "*", "crossws": "*", "vite": "*" }, "optionalPeers": ["@rsbuild/core", "crossws", "vite"] }, "sha512-WRkgC3VUHYJxX/UD+yB1OE+9YzSnTKLs0m7RxyLJlrf5GwLs76ZIgYXKpTp2nCsrqbkJgt7gYN0jkXM9EVKnNw=="],
+    "oxidejs": ["oxidejs@0.5.6", "", { "dependencies": { "effect": "~4.0.0-rc.112", "linkedom": "^0.18.13", "unplugin": "^3.3.0" }, "peerDependencies": { "@rsbuild/core": "*", "crossws": "*", "vite": "*" }, "optionalPeers": ["@rsbuild/core", "crossws", "vite"] }, "sha512-JiqRtgnLXGDKNIkmicxfu7UgHjU6xZUZIqqqANt9r3TrD8jIkPVdhGJ3KafCMCt7noAC47QL25o1wmdvPd6ItA=="],
 
     "paranorm": ["paranorm@0.3.3", "", { "dependencies": { "confbox": "^0.2.4", "effect": "^4.0.0-rc.112" } }, "sha512-AFoQm3bFh8G9caikgdygWnz+EIORzb5ABOsFxSgPLqOLEMwZNXKSc+yQqMuITEIQvRT9NGueYZhNrAs2Yt6vRA=="],
 

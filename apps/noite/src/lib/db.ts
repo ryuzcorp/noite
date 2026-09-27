@@ -241,17 +241,29 @@ const runDbSetup = Effect.gen(function* runDbSetup() {
  * The old `migrated.done` flag was only set *after* the work finished, so
  * every request already in flight on a cold isolate replayed the whole pass —
  * migrations plus the schema-heal plan, tens of statements each — against a
- * single-threaded D1 cell. Measured against a 0.6.0 control node: eight
- * concurrent page-load batches, four answered, four stalled past the ingress
- * timeout, while sequential calls stayed near 0.6 s. A failed pass clears the
- * cache so the next request retries; a cold isolate still pays it once. */
+ * single-threaded D1 cell. A failed pass clears the cache so the next request
+ * retries; a cold isolate still pays it once. */
 let setupOnce: Promise<void> | undefined;
 const clearSetupOnce = () => {
   setupOnce = undefined;
 };
+
+/** Bound on one setup pass. A D1 call that never answers must fail the pass
+ * (and clear the cache) instead of holding every later request. */
+const SETUP_TIMEOUT = "15 seconds";
+
+/** How long a request waits on a pass another request started before it
+ * drops that pass and runs its own. celld cancels a request's pending work
+ * when that request ends or its client goes away (measured on 0.6.0: a
+ * promise started by an aborted request never settles), so a shared pass can
+ * be orphaned without ever failing — without this bound, every later request
+ * on the isolate would wait on it forever. */
+const SHARED_SETUP_WAIT_MS = 5000;
+
 const runDbSetupOnce = (): Promise<void> => {
   setupOnce ??= Effect.runPromise(
     runDbSetup.pipe(
+      Effect.timeout(SETUP_TIMEOUT),
       Effect.provide(sqlLive()),
       Effect.scoped,
       // A failed pass must not poison the isolate: drop the cache so the next
@@ -262,15 +274,44 @@ const runDbSetupOnce = (): Promise<void> => {
   return setupOnce;
 };
 
-export const ensureDb = Effect.promise(runDbSetupOnce);
+/** Await the shared setup pass, but never longer than
+ * {@link SHARED_SETUP_WAIT_MS}: past that, replace a pass that may have been
+ * orphaned by its request with one this request owns. */
+const awaitDbSetup = async (): Promise<void> => {
+  const pass = runDbSetupOnce();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // oxlint-disable-next-line promise/avoid-new -- a timer-backed race needs its own Promise
+  const orphaned = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(true), SHARED_SETUP_WAIT_MS);
+  });
+  try {
+    const stale = await Promise.race([pass.then(() => false), orphaned]);
+    if (!stale) {
+      return;
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+  if (setupOnce === pass) {
+    clearSetupOnce();
+  }
+  await runDbSetupOnce();
+};
 
-export const ensureDbPromise = (): Promise<void> => runDbSetupOnce();
+export const ensureDb = Effect.promise(awaitDbSetup);
+
+export const ensureDbPromise = (): Promise<void> => awaitDbSetup();
+
+/** Bound on one `withDb` unit of work. A D1 read that never answers fails
+ * the action (the client sees an error) instead of leaving it pending. */
+const DB_CALL_TIMEOUT = "10 seconds";
 
 export const withDb = <A, E, R>(
   effect: Effect.Effect<A, E, R | SqlClient>
 ): Promise<A> => {
   const open = ensureDb.pipe(
     Effect.andThen(() => effect),
+    Effect.timeout(DB_CALL_TIMEOUT),
     Effect.provide(sqlLive()),
     Effect.scoped
   );
