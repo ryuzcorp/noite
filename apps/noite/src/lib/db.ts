@@ -194,12 +194,9 @@ export const getAuthDb = () =>
 /** D1-backed SqlClient layer for the resolved binding. */
 export const sqlLive = () => D1Client.layer({ db: resolveD1() });
 
-const migrated = { done: false };
-
-export const ensureDb = Effect.gen(function* ensureDb() {
-  if (migrated.done) {
-    return;
-  }
+/** The setup pass itself: migrations, the schema heal, and the one-time
+ * backfills below. `ensureDb` runs it at most once per isolate. */
+const runDbSetup = Effect.gen(function* runDbSetup() {
   yield* migrator.migrate;
   // The migrator tracks a single plan id, so a DB created under an older
   // schema version skips tables added later (e.g. app_collaborator) while
@@ -237,11 +234,37 @@ export const ensureDb = Effect.gen(function* ensureDb() {
       });
     }
   }
-  migrated.done = true;
 });
 
-export const ensureDbPromise = () =>
-  Effect.runPromise(ensureDb.pipe(Effect.provide(sqlLive()), Effect.scoped));
+/** At most one setup pass per isolate, and a caller that arrives while the
+ * pass is still running awaits that same pass instead of starting another.
+ * The old `migrated.done` flag was only set *after* the work finished, so
+ * every request already in flight on a cold isolate replayed the whole pass —
+ * migrations plus the schema-heal plan, tens of statements each — against a
+ * single-threaded D1 cell. Measured against a 0.6.0 control node: eight
+ * concurrent page-load batches, four answered, four stalled past the ingress
+ * timeout, while sequential calls stayed near 0.6 s. A failed pass clears the
+ * cache so the next request retries; a cold isolate still pays it once. */
+let setupOnce: Promise<void> | undefined;
+const clearSetupOnce = () => {
+  setupOnce = undefined;
+};
+const runDbSetupOnce = (): Promise<void> => {
+  setupOnce ??= Effect.runPromise(
+    runDbSetup.pipe(
+      Effect.provide(sqlLive()),
+      Effect.scoped,
+      // A failed pass must not poison the isolate: drop the cache so the next
+      // request retries. Defects count too (a missing D1 binding).
+      Effect.onError(() => Effect.sync(clearSetupOnce))
+    )
+  );
+  return setupOnce;
+};
+
+export const ensureDb = Effect.promise(runDbSetupOnce);
+
+export const ensureDbPromise = (): Promise<void> => runDbSetupOnce();
 
 export const withDb = <A, E, R>(
   effect: Effect.Effect<A, E, R | SqlClient>
