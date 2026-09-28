@@ -39,12 +39,12 @@ export default {
       });
       worker[n7] = v7;
       const [n8, v8] = await attempt("fetch:control-operator", async () => {
-        const res = await fetch("http://control:8091/state");
+        const res = await fetch("http://127.0.0.1:8091/state");
         return `status ${res.status}`;
       });
       worker[n8] = v8;
-      const [n3, v3] = await attempt("fetch:runner", async () => {
-        const res = await fetch("http://runner:8080/health");
+      const [n3, v3] = await attempt("fetch:caddy-admin", async () => {
+        const res = await fetch("http://127.0.0.1:2019/config/");
         return `status ${res.status}`;
       });
       worker[n3] = v3;

@@ -88,7 +88,7 @@ fn parse_opt_uid(raw: Option<&str>, def: u32) -> Option<u32> {
 
 /// Control UI inside this container: fleet #0 in prod, `vite dev` in dev.
 pub const CONTROL_UPSTREAM: &str = "127.0.0.1:8090";
-const CONTROL_UPSTREAM_URL: &str = "http://127.0.0.1:8090";
+pub const CONTROL_UPSTREAM_URL: &str = "http://127.0.0.1:8090";
 /// The runner's own API, as Caddy reaches it for `api.` and `git.`.
 pub const API_UPSTREAM: &str = "127.0.0.1:8080";
 
@@ -145,14 +145,16 @@ fn parse_fleet_ports() -> (u16, u16) {
      pub caddy_admin_url: String,
      /// Public base for Git smart-HTTP remotes (no trailing slash).
      pub git_public_base: String,
-     /// Control UI base URL for Git API-key auth (runner → UI).
-     pub ui_url: String,
      /// Per-account app quota. Every app is its own celld fleet, so this is the
      /// knob that bounds how much of the host one account can claim.
      pub max_apps_per_user: u32,
-     /// Per-fleet celld memory ceiling in MiB (`CELLD_MAX_RSS_MB`). Without it
-     /// celld sheds at 80% of the *whole* container's memory, which lets one
-     /// tenant's fleet starve every other app on the host.
+     /// celld's shedding threshold in MiB (`CELLD_MAX_RSS_MB`); 0 leaves
+     /// celld's default, 80% of the container's memory. celld compares it with
+     /// the greater of its own RSS and the cgroup's working set, and every
+     /// fleet shares the one container cgroup, so this is a container-wide
+     /// threshold, not a per-tenant cap (SPEC, Limits): a per-fleet value
+     /// such as 512 closes every fleet's admission as soon as the container
+     /// as a whole passes it.
      pub fleet_max_rss_mb: u32,
      /// celld's own log filter for tenant fleets (`RUNNER_FLEET_LOG`). The
      /// runner's RUST_LOG describes the runner's modules, so inheriting it left
@@ -214,8 +216,6 @@ impl Config {
                 format!("https://git.{base_domain}")
             }
         });
-        // Control runs in this container (fleet #0, or `vite dev` in dev).
-        let ui_url = env_or(&["UI_URL"], CONTROL_UPSTREAM_URL);
         let auto_https = parse_auto_https(
             env::var("CADDY_AUTO_HTTPS").ok().as_deref(),
             &base_domain,
@@ -259,13 +259,12 @@ impl Config {
             caddy_admin_url: env::var("CADDY_ADMIN_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:2019".into()),
             git_public_base,
-            ui_url: ui_url.trim_end_matches('/').to_string(),
             max_apps_per_user: env_or(&["RUNNER_MAX_APPS_PER_USER"], "10")
                 .parse()
                 .unwrap_or(10),
-            fleet_max_rss_mb: env_or(&["RUNNER_FLEET_MAX_RSS_MB"], "512")
+            fleet_max_rss_mb: env_or(&["RUNNER_FLEET_MAX_RSS_MB"], "0")
                 .parse()
-                .unwrap_or(512),
+                .unwrap_or(0),
             fleet_log: env_or(&["RUNNER_FLEET_LOG"], "error,celld=warn"),
             fleet_idle_evict_s: env_or(&["RUNNER_FLEET_IDLE_EVICT_S"], "300")
                 .parse()
@@ -493,13 +492,12 @@ mod tests {
             auto_https: false,
             fleet_log: "error,celld=warn".into(),
             max_apps_per_user: 10,
-            fleet_max_rss_mb: 512,
+            fleet_max_rss_mb: 0,
             fleet_idle_evict_s: 300,
             caddy_control_upstream: CONTROL_UPSTREAM.into(),
             caddy_api_upstream: API_UPSTREAM.into(),
             caddy_admin_url: "http://127.0.0.1:2019".into(),
             git_public_base: "https://git.localhost".into(),
-            ui_url: CONTROL_UPSTREAM_URL.into(),
             caddy_access_log: "/caddy/access.log".into(),
             tenancy: Tenancy::Single,
             stop_budget_ms: 25000,

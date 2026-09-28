@@ -118,7 +118,7 @@ async fn authorize(
             return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response());
         }
     };
-    let url = format!("{}/internal/git-auth", state.config.ui_url);
+    let url = format!("{}/internal/git-auth", crate::config::CONTROL_UPSTREAM_URL);
     let client = reqwest::Client::new();
     let res = match client
         .post(&url)

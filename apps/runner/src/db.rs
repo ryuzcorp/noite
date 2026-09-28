@@ -104,13 +104,7 @@ pub async fn ensure_column(
 }
 
 pub async fn list_apps(pool: &SqlitePool) -> sqlx::Result<Vec<App>> {
-    // Hard DELETE is the only remove path; leftover soft-delete rows are
-    // reclaimed on boot (see main) and excluded here so the UI never sees them.
-    let sql = format!(
-        "SELECT {APP_COLS} FROM app \
-         WHERE desired_state NOT IN ('deleted') AND status NOT IN ('deleting', 'gone') \
-         ORDER BY created_at DESC"
-    );
+    let sql = format!("SELECT {APP_COLS} FROM app ORDER BY created_at DESC");
     sqlx::query_as::<_, App>(&sql).fetch_all(pool).await
 }
 
@@ -207,7 +201,7 @@ pub async fn remove_domain(
 /// an API key cannot slip past the UI's check.
 pub async fn count_apps_for_user(pool: &SqlitePool, user_id: &str) -> sqlx::Result<i64> {
     let rows: Vec<(i64,)> =
-        sqlx::query_as("SELECT count(*) FROM app WHERE user_id = ? AND desired_state != 'deleted'")
+        sqlx::query_as("SELECT count(*) FROM app WHERE user_id = ?")
             .bind(user_id)
             .fetch_all(pool)
             .await?;

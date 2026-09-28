@@ -1,6 +1,6 @@
 // Full app teardown: stop the fleet, wipe local work dirs, and empty the
 // S3 prefixes that hold the git mirror + fleet durability (D1 / DO / telemetry).
-// Used by DELETE /v1/apps/{id} and boot reclaim of legacy soft-deleted rows.
+// Used by DELETE /v1/apps/{id}.
 //
 // Must hold the same AppLock as deploy (callers claim before calling) so a
 // finishing deploy cannot rewrite fleets/git after we clear them.

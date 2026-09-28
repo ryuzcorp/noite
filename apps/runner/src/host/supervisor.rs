@@ -206,14 +206,11 @@ pub async fn ensure_fleet(
     // Inside the runner's stop budget, so celld seals its node log before
     // the runner's own SIGKILL fallback (SPEC, Shutdown).
     .env("CELLD_SHUTDOWN_TOTAL_MS", cfg.fleet_shutdown_ms().to_string())
-    // Bounds. Read the docs' knobs rather than letting every fleet assume it
-    // owns the whole host: the memory ceiling makes celld shed cells (503 +
-    // Retry-After) instead of the container OOM-ing every other tenant, and
-    // idle eviction returns memory when an app goes quiet.
+    // Bounds: idle eviction returns memory when an app goes quiet; the
+    // shedding threshold (set below only when configured) is container-wide.
     // celld's own logs are what an app owner reads when a deploy serves but
     // misbehaves; the inherited runner filter would suppress them.
     .env("RUST_LOG", &cfg.fleet_log)
-    .env("CELLD_MAX_RSS_MB", cfg.fleet_max_rss_mb.to_string())
     .env("CELLD_IDLE_EVICT_S", cfg.fleet_idle_evict_s.to_string())
     .env("CELLD_DEPLOY_POLL_S", "5")
     .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
@@ -225,6 +222,9 @@ pub async fn ensure_fleet(
     .env("CELLD_OTEL", "1")
     .env("CELLD_OTEL_FLUSH_MS", crate::host::metrics::OTEL_FLUSH_MS.to_string())
     .env("CELLD_OTEL_RETENTION", "14d");
+    if cfg.fleet_max_rss_mb > 0 {
+        cmd.env("CELLD_MAX_RSS_MB", cfg.fleet_max_rss_mb.to_string());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

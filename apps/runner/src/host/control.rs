@@ -66,13 +66,11 @@ fn control_vars(cfg: &Config) -> serde_json::Value {
     put("RUNNER_URL", "http://127.0.0.1:8080");
     put("S3_ENDPOINT", &cfg.s3_endpoint);
     put("S3_PUBLIC_ENDPOINT", &cfg.s3_public_endpoint);
-    put("UI_URL", &cfg.ui_url);
     if !cfg.better_auth_url.is_empty() {
         put("BETTER_AUTH_URL", &cfg.better_auth_url);
     }
     // Worker settings the runner does not use itself: passed through from
-    // the container environment, the same keys docker/noite-entrypoint.sh
-    // patched in. Without BETTER_AUTH_SECRET every /api/auth/* call fails.
+    // the container environment. Without BETTER_AUTH_SECRET every /api/auth/* call fails.
     for key in CONTROL_PASSTHROUGH {
         if let Ok(value) = std::env::var(key) {
             put(key, &value);

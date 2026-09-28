@@ -132,7 +132,8 @@ Fallback where a platform grants no `NET_ADMIN` (not built): run each fleet unde
 - Fleets hold the **root** bucket keys until [Scoped credentials](#scoped-credentials) land, so a compromised fleet process can reach every prefix.
 - Worker code can reach the object store's unauthenticated surface (it answers 401/403).
 - Sandbox depth is uid + env + rlimits + egress rules. A container per build (rootless Podman in the image, gVisor) is out of scope unless tenants are expected to be adversarial.
-- Railway's capabilities are **unverified**: until probed, Railway installs read `/ready` after the first deploy and fall back to `single`.
+- No per-tenant memory containment: fleets share the container cgroup, so one fleet's growth pushes every fleet toward the shared shed threshold. Per-fleet cgroups (memory.max per fleet, which also gives celld a per-fleet working set) are the fix where cgroupfs is writable.
+- Railway does not grant `NET_ADMIN` (verified 2026-09-27: `nft` fails with `Operation not permitted`), so Railway installs run `NOITE_TENANCY=single`. Railway also wraps the entrypoint, so tini is not PID 1 there; set `TINI_SUBREAPER=1`.
 
 ## Control UI (fleet #0)
 
@@ -150,6 +151,7 @@ The worker reaches the runner at `http://127.0.0.1:8080`. When the image has no 
 - Caddy is a runner child (`--watch` on `/data/caddy/Caddyfile`, admin on `127.0.0.1:2019`). `host/caddy.rs` generates Caddyfile text (the generator and its tests are unchanged), writes it only when it changed, and `POST`s it to the admin `/load`; a rejected config is logged with Caddy's error and surfaced in `/ready`, and the previous config keeps serving. Admin connection errors during Caddy's own startup are debug-level.
 - Upstreams are loopback: control `127.0.0.1:8090`, `api.`/`git.` `127.0.0.1:8080`, tenants `127.0.0.1:{port}`.
 - Every site carries `encode zstd gzip` (celld does not compress; `text/event-stream` stays uncompressed and unbuffered) and a 30 s `response_header_timeout`.
+- Tenant and custom-domain sites are **gated on fleet readiness** (`caddy.rs::TENANT_PROXY`): Caddy health-checks `/.well-known/celld/health` (503 until celld's ready gate opens) on load and every second, holds a request up to 20 s (`lb_try_duration`) while the fleet is not ready, and otherwise serves a self-refreshing "starting" page with 503 + `Retry-After: 5` (`TENANT_STARTING`, `handle_errors 502 503`). A ready fleet is proxied with no added wait; a held request is never sent, so POSTs are safe. celld's own 503s (load shedding) pass through.
 - Access log at `/data/caddy/access.log` (one constant, `CADDY_ACCESS_LOG`); Caddy does not roll it, the tailer (`host/accesslog.rs`) truncates after reading. Metrics do **not** come from it.
 - On-demand TLS is ask-gated at `/v1/edge/tls-ask`: a certificate is minted only for a platform host or a live tenant/custom host. `CADDY_AUTO_HTTPS=off` behind a terminating proxy serves plaintext `:80`.
 - Scheme is pinned per host on plaintext twins (`caddy.rs::plaintext_hosts`): Caddy applies an address line's scheme to the first address only, so `http://app.x, extra.x` once bound the extra host on `:443` and made the whole config unadaptable (`ambiguous site definition`). Regression tests: `plaintext_twin_pins_the_scheme_per_host`, `behind_proxy_extra_control_host_keeps_a_valid_twin`.
@@ -242,7 +244,7 @@ The worker D1 has an `invite` table (`code`, `createdBy`, `usedBy`, `usedAt`, `r
 ### Limits
 
 - `RUNNER_MAX_APPS_PER_USER` (10), enforced in the runner on `apps.create`, so API keys cannot bypass it.
-- `RUNNER_FLEET_MAX_RSS_MB` (512) → `CELLD_MAX_RSS_MB` (celld sheds cells with 503 + `Retry-After` instead of the container OOM-ing); `RUNNER_FLEET_IDLE_EVICT_S` (300) → `CELLD_IDLE_EVICT_S`; `CELLD_ASSET_CACHE_BYTES` (512 MiB) per fleet.
+- `RUNNER_FLEET_MAX_RSS_MB` (0 = unset: celld's default, 80% of the container's memory) → `CELLD_MAX_RSS_MB`, set on a fleet only when non-zero. celld applies it to the greater of its own RSS and the **cgroup working set**, and every fleet shares the container's cgroup, so it is a container-wide shed threshold (503 + `Retry-After` instead of the container OOM-ing), not a per-tenant cap. The old default of 512 closed every fleet's ready gate (`memory_headroom=false`) and refused cells with `CapacityExhausted` once the container as a whole passed 512 MB: permanently in dev (vite + workerd ≈ 2.7 GB), and while the control fleet booted in prod (fixed 2026-09-28); `RUNNER_FLEET_IDLE_EVICT_S` (300) → `CELLD_IDLE_EVICT_S`; `CELLD_ASSET_CACHE_BYTES` (512 MiB) per fleet.
 - `RUNNER_FLEET_LOG` (`error,celld=warn`) → the fleet's `RUST_LOG`, so celld's warnings reach the per-app log view.
 - Rate limits: better-auth's per-client budget for `/api/auth/*` (`NOITE_AUTH_RATE_LIMIT`, 600/min, keyed on the forwarded client address) and a worker limiter per route class `auth`/`invite` (`NOITE_RATE_LIMIT_RPM`, 600/min, 429 + `Retry-After` before better-auth or D1). `0` disables either. The raw-port e2e lane raises both.
 
@@ -271,7 +273,7 @@ The docs at https://celld.dev/docs/ are the source of truth. What Noite relies o
 
 ## Open questions and known issues
 
-1. **Railway capabilities:** probe `NET_ADMIN`/`SETUID`/`SETGID`/`CHOWN` and unprivileged user namespaces; record the decision (`multi`, the `bwrap` fallback, or `single` only). Do not ship `multi` there on hope.
+1. **Railway multi-tenancy:** `NET_ADMIN` is unavailable (verified 2026-09-27), so the nft egress policy cannot run there. Still open: probe `SETUID`/`SETGID`/`CHOWN` and unprivileged user namespaces, and decide whether a `bwrap` fallback is worth building or Railway stays `single` only.
 2. **RustFS IAM:** if unsupported at the pinned version, bundled-RustFS installs stay on root keys, i.e. effectively `single`, unless the operator moves to MinIO/S3/R2.
 3. **Snapshot loss window** (about 70 s) vs Litestream.
 4. **Control and runner restart together** on every image update. Accepted: the UI cannot act without the runner, and one node removes the two-node readiness-gate drain that stalled the old topology.

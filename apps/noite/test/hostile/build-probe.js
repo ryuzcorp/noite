@@ -53,15 +53,15 @@ deny("read:/proc/self/environ:secrets", () => {
   throw new Error("no platform secrets in environ");
 });
 // Real targets only: a probe at an address nothing listens on "fails" with
-// or without isolation and proves nothing. Builds run in the runner's
-// container (both topologies), so its API is on loopback; the services
-// resolve by name on the compose network.
+// or without isolation and proves nothing. Builds run in the one Noite
+// container, so the runner, the control node's internal port and Caddy's
+// admin API are all on loopback; the bundled store resolves by name.
 await Promise.all(
   [
     ["fetch:runner-loopback", "http://127.0.0.1:8080/health"],
-    ["fetch:runner", "http://runner:8080/health"],
     ["fetch:rustfs", "http://rustfs:9000/"],
-    ["fetch:control-operator", "http://control:8091/state"],
+    ["fetch:control-operator", "http://127.0.0.1:8091/state"],
+    ["fetch:caddy-admin", "http://127.0.0.1:2019/config/"],
   ].map(([name, target]) =>
     denyAsync(name, async () => {
       const res = await fetch(target, { signal: AbortSignal.timeout(3000) });
