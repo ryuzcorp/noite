@@ -1,0 +1,165 @@
+/* Spliced verbatim into Blume's Tailwind entry (after `@import "tailwindcss"`),
+   so everything here is Tailwind v4 CSS shared by the docs and the landing. */
+
+/* daisyUI, for the landing page (pages/index.astro).
+   - `d-` prefix: Blume's own markup uses class names daisyUI also defines
+     (link, table, menu, footer, …), and the docs must not pick those styles up.
+   - No built-in themes, and none of the base layers that restyle the page
+     root (background, scrollbar, scrollbar gutter): the docs keep Blume's. */
+@plugin "daisyui" {
+  themes: false;
+  prefix: "d-";
+  exclude: rootcolor, rootscrollgutter, scrollbar;
+}
+
+/* daisyUI's `light` and `dark` follow Blume's own `data-theme` switch and
+   read Blume's tokens, so daisyUI components match the docs in both modes. */
+@plugin "daisyui/theme" {
+  name: "light";
+  default: true;
+  --color-base-100: var(--blume-background);
+  --color-base-200: var(--blume-muted);
+  --color-base-300: var(--blume-border);
+  --color-base-content: var(--blume-foreground);
+  --color-primary: var(--blume-accent);
+  --color-primary-content: var(--blume-accent-foreground);
+  --color-accent: var(--blume-accent);
+  --color-accent-content: var(--blume-accent-foreground);
+  --radius-field: 0.5rem;
+  --radius-box: 0.75rem;
+}
+
+@plugin "daisyui/theme" {
+  name: "dark";
+  --color-base-100: var(--blume-background);
+  --color-base-200: var(--blume-muted);
+  --color-base-300: var(--blume-border);
+  --color-base-content: var(--blume-foreground);
+  --color-primary: var(--blume-accent);
+  --color-primary-content: var(--blume-accent-foreground);
+  --color-accent: var(--blume-accent);
+  --color-accent-content: var(--blume-accent-foreground);
+  --radius-field: 0.5rem;
+  --radius-box: 0.75rem;
+}
+
+/* The night: the landing's hero and final call to action set
+   `data-theme="noite"` and stay dark in either mode. */
+@plugin "daisyui/theme" {
+  name: "noite";
+  color-scheme: dark;
+  /* Deep-ocean night; teal and ocean green from the control UI's palette
+     (apps/noite/src/app.css). */
+  --color-base-100: oklch(15% 0.018 205);
+  --color-base-200: oklch(19% 0.024 200);
+  --color-base-300: oklch(29% 0.035 195);
+  --color-base-content: oklch(96% 0.012 190);
+  --color-primary: oklch(91% 0.096 180.426);
+  --color-primary-content: oklch(27% 0.046 192.524);
+  --color-secondary: oklch(69% 0.17 162.48);
+  --color-secondary-content: oklch(20% 0.04 170);
+  --color-accent: oklch(91% 0.096 180.426);
+  --color-accent-content: oklch(27% 0.046 192.524);
+  --color-neutral: oklch(96% 0.012 190);
+  --color-neutral-content: oklch(15% 0.018 205);
+  --color-info: oklch(78% 0.154 211.53);
+  --color-info-content: oklch(30% 0.056 229.695);
+  --color-success: oklch(69% 0.17 162.48);
+  --color-success-content: oklch(20% 0.04 170);
+  --color-warning: oklch(82% 0.189 84.429);
+  --color-warning-content: oklch(27% 0.077 45.635);
+  --color-error: oklch(70% 0.19 22);
+  --color-error-content: oklch(96% 0.015 12.422);
+  --radius-selector: 2rem;
+  --radius-field: 2rem;
+  --radius-box: 0.875rem;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+
+/* Blume pairs every accent with white text; on the pale-aqua dark accent that
+   is unreadable, so dark mode takes the control UI's deep-teal
+   primary-content instead (white on the light-mode teal is fine). */
+:root[data-theme="dark"] {
+  --blume-accent-foreground: oklch(27% 0.046 192.524);
+}
+
+/* Header Discord link (a `navigation.actions` entry, which Blume renders as
+   text): shown as an icon button matching Blume's GitHub one. The label stays
+   in the markup as the link's accessible name. */
+header a[href^="https://discord.gg/"] {
+  align-items: center;
+  font-size: 0;
+  height: 2.25rem;
+  justify-content: center;
+  padding: 0;
+  width: 2.25rem;
+}
+
+header a[href^="https://discord.gg/"]::before {
+  background-color: currentColor;
+  content: "";
+  height: 18px;
+  mask: url("/icons/discord.svg") center / contain no-repeat;
+  width: 18px;
+}
+
+header a[href^="https://discord.gg/"]:hover {
+  background-color: var(--blume-muted);
+}
+
+/* Landing display face: Instrument Serif (OFL, public/fonts). */
+@font-face {
+  font-display: swap;
+  font-family: "Noite Serif";
+  font-style: normal;
+  font-weight: 400;
+  src: url("/fonts/InstrumentSerif-Regular.woff2") format("woff2");
+}
+
+@font-face {
+  font-display: swap;
+  font-family: "Noite Serif";
+  font-style: italic;
+  font-weight: 400;
+  src: url("/fonts/InstrumentSerif-Italic.woff2") format("woff2");
+}
+
+@theme {
+  --font-noite: "Noite Serif", Georgia, serif;
+  --animate-line-in: line-in 360ms ease-out both;
+
+  @keyframes line-in {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+  }
+}
+
+/* A teal glow, an ocean-green one and a few stars, behind the landing's
+   night sections. */
+@utility bg-night-sky {
+  background-image:
+    radial-gradient(
+      60rem 30rem at 78% -10%,
+      oklch(70% 0.14 182.503 / 0.26),
+      transparent 65%
+    ),
+    radial-gradient(
+      40rem 24rem at 5% 110%,
+      oklch(69% 0.17 162.48 / 0.16),
+      transparent 70%
+    ),
+    radial-gradient(1px 1px at 12% 22%, #fff9, transparent),
+    radial-gradient(1px 1px at 31% 64%, #fff6, transparent),
+    radial-gradient(1.5px 1.5px at 47% 18%, #fffa, transparent),
+    radial-gradient(1px 1px at 58% 82%, #fff5, transparent),
+    radial-gradient(1px 1px at 69% 35%, #fff8, transparent),
+    radial-gradient(1.5px 1.5px at 84% 72%, #fff9, transparent),
+    radial-gradient(1px 1px at 92% 14%, #fff7, transparent),
+    radial-gradient(1px 1px at 22% 88%, #fff5, transparent);
+}

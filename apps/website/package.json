@@ -8,6 +8,7 @@
     "doctor": "blume doctor"
   },
   "dependencies": {
-    "blume": "2.0.3"
+    "blume": "2.0.3",
+    "daisyui": "^5.7.46"
   }
 }

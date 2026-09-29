@@ -1,0 +1,480 @@
+---
+// Landing page at `/` (Blume custom page: it wins over any generated route
+// there). Copy lives in ./_home/content.ts. Styling is Tailwind plus daisyUI
+// (prefixed `d-`); both are configured in ../theme.css.
+import PageLayout from "blume/components/layout/PageLayout.astro";
+import data from "blume:data";
+
+import {
+  FAQ,
+  FEATURES,
+  formatTime,
+  DISCORD_URL,
+  GITHUB_URL,
+  INSTALL_COMMAND,
+  INSTALL_TABS,
+  STEPS,
+  TERMINAL,
+  TOUR,
+} from "./_home/content";
+import logoSvg from "../public/logo.svg?raw";
+
+const { config } = data;
+const hasVideo = TOUR.src !== "";
+
+// Shared class strings: the Amp-style frame every section sits in.
+const section = "border-t border-base-300";
+const frame =
+  "mx-auto max-w-[76rem] border-x border-base-300 px-4 py-16 sm:px-10 sm:py-24 max-sm:border-x-0";
+const eyebrow =
+  "mb-4 font-mono text-xs uppercase tracking-[0.08em] text-base-content/60";
+const display =
+  "font-noite text-balance font-normal leading-[1.02] tracking-[-0.015em]";
+const h2 = `${display} m-0 text-[clamp(2.1rem,4.4vw,3.6rem)] [&_em]:text-primary`;
+const body = "max-w-xl text-[1.0625rem] leading-relaxed text-base-content/70";
+const link =
+  "mt-6 inline-block font-mono text-sm text-primary no-underline hover:underline";
+---
+
+<PageLayout
+  site={{ description: config.description, title: config.title }}
+  logo={config.logo}
+  banner={config.banner}
+  analytics={config.analytics}
+  navigation={data.navigation}
+  favicon={config.favicon}
+  fontCssVars={data.fontCssVars}
+  themeMode={config.theme.mode}
+  searchEnabled={config.search.enabled}
+  siteUrl={config.site}
+  ogEnabled={config.og.enabled}
+  transparentHeader={true}
+  page={{
+    description: config.description,
+    route: "/",
+    title: "Noite: self-hosted PaaS for Cloudflare Workers apps",
+  }}
+>
+  <div data-landing class="text-base-content">
+    <!-- Hero: always night (daisyUI theme `noite`), under the transparent header. -->
+    <section
+      data-theme="noite"
+      class="bg-night-sky relative -mt-16 overflow-hidden bg-base-100 pt-[calc(4rem+clamp(3.5rem,9vw,7rem))] pb-[clamp(3.5rem,8vw,6rem)] text-base-content"
+    >
+      <div
+        class="mx-auto grid max-w-[76rem] items-center gap-10 px-4 sm:px-10 lg:grid-cols-[1.15fr_1fr] lg:gap-16"
+      >
+        <div>
+          <p class={`${eyebrow} text-primary`}>
+            Open source · Apache-2.0 · Powered by celld
+          </p>
+          <h1
+            class={`${display} m-0 text-[clamp(2.75rem,6.4vw,5.5rem)] [&_em]:text-primary`}
+          >
+            Your Cloudflare Workers, <em>on</em> your own server.
+          </h1>
+          <p class={`${body} mt-6 mb-8`}>
+            Noite is a tiny, self-hostable platform for Workers apps, with
+            Durable Objects, D1 and R2 included. One command installs it, one
+            image runs it, and your data lives in a bucket you own.
+          </p>
+          <div
+            class="flex max-w-2xl items-center gap-3 rounded-box border border-base-300 bg-base-200/60 py-2.5 pr-2.5 pl-4"
+          >
+            <code class="min-w-0 flex-1 overflow-x-auto whitespace-pre font-mono text-sm">
+              <span class="mr-2 select-none text-primary" aria-hidden="true">$</span>{INSTALL_COMMAND}
+            </code>
+            <button
+              type="button"
+              class="d-btn d-btn-outline d-btn-xs font-mono"
+              data-copy={INSTALL_COMMAND}
+              aria-label="Copy the install command"
+            >
+              <span data-copy-label>Copy</span>
+            </button>
+          </div>
+          <p class="mt-3 font-mono text-xs text-base-content/60">
+            Ubuntu or Debian · amd64 or arm64 · 2 GB of RAM · no domain needed
+            to try it
+          </p>
+          <div class="mt-8 flex flex-wrap gap-3">
+            <a class="d-btn d-btn-neutral" href="/quickstart">
+              Read the quickstart →
+            </a>
+            <a
+              class="d-btn d-btn-outline"
+              href={GITHUB_URL}
+              target="_blank"
+              rel="noopener noreferrer">View on GitHub</a
+            >
+          </div>
+        </div>
+
+        <div
+          class="d-mockup-code border border-base-300 bg-base-200/85 text-base-content text-[0.78rem] shadow-[0_30px_80px_-20px_oklch(70%_0.14_182.503/0.28)]"
+          role="img"
+          aria-label="Terminal: installing Noite, then deploying an app with git push"
+        >
+          {
+            TERMINAL.map((line) => (
+              <pre
+                data-prefix={line.prefix}
+                class={`animate-line-in motion-reduce:animate-none ${line.delay} ${line.tone}`}
+              ><code>{line.text}</code></pre>
+            ))
+          }
+        </div>
+      </div>
+    </section>
+
+    <!-- 01 · Product tour -->
+    <section class={section} aria-labelledby="tour-title">
+      <div class={frame}>
+        <p class={eyebrow}>01 · Product tour</p>
+        <h2 id="tour-title" class={`${h2} mb-10 sm:mb-12`}>
+          From empty VPS <em>to</em> live app
+        </h2>
+        <div class="grid gap-8 lg:grid-cols-[20rem_1fr] lg:gap-10">
+          <ul class="d-list max-lg:order-last">
+            {
+              TOUR.chapters.map((chapter) => (
+                <li class="d-list-row items-baseline px-0">
+                  <span class="w-11 font-mono text-sm text-base-content/60">
+                    {formatTime(chapter.at)}
+                  </span>
+                  {hasVideo ? (
+                    <button
+                      type="button"
+                      class="cursor-pointer text-left hover:text-primary"
+                      data-chapter={chapter.at}
+                    >
+                      {chapter.title}
+                    </button>
+                  ) : (
+                    <span>{chapter.title}</span>
+                  )}
+                </li>
+              ))
+            }
+          </ul>
+          <div
+            data-theme="noite"
+            class="relative aspect-video overflow-hidden rounded-box border border-base-300 bg-base-100 text-base-content"
+          >
+            {
+              hasVideo ? (
+                <video
+                  data-tour-video
+                  class="block size-full object-cover"
+                  controls
+                  preload="metadata"
+                  playsinline
+                  poster={TOUR.poster || undefined}
+                >
+                  <source src={TOUR.src} />
+                </video>
+              ) : (
+                <div class="flex size-full flex-col items-center justify-center bg-[radial-gradient(40rem_20rem_at_70%_0%,oklch(70%_0.14_182.503/0.28),transparent_70%)] text-center">
+                  <span
+                    class="flex size-18 items-center justify-center rounded-full border border-base-content/30 pl-1"
+                    aria-hidden="true"
+                  >
+                    <svg viewBox="0 0 24 24" width="28" height="28">
+                      <path d="M8 5v14l11-7z" fill="currentColor" />
+                    </svg>
+                  </span>
+                  <p class="font-noite mt-5 mb-1 text-3xl">
+                    Product tour · {TOUR.duration}
+                  </p>
+                  <p class="m-0 font-mono text-xs text-base-content/60">
+                    Recording soon.
+                  </p>
+                </div>
+              )
+            }
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 02 · How it works -->
+    <section class={section} aria-labelledby="push-title">
+      <div class={frame}>
+        <p class={eyebrow}>02 · How it works</p>
+        <h2 id="push-title" class={`${h2} mb-10 sm:mb-12`}>
+          git push. <em>It's</em> live.
+        </h2>
+        <ol
+          class="m-0 grid list-none gap-px border border-base-300 bg-base-300 p-0 md:grid-cols-3"
+        >
+          {
+            STEPS.map((step, index) => (
+              <li class="bg-base-100 p-6 sm:p-8">
+                <p class="mb-6 font-mono text-xs text-primary">
+                  {String(index + 1).padStart(2, "0")}
+                </p>
+                <h3 class="mb-2 text-[1.0625rem] font-semibold tracking-tight">
+                  {step.title}
+                </h3>
+                <p class="m-0 text-[0.9375rem] leading-relaxed text-base-content/70">
+                  {step.body}
+                </p>
+              </li>
+            ))
+          }
+        </ol>
+        <div class="d-mockup-code rounded-t-none border border-t-0 border-base-300 bg-base-200 text-base-content text-[0.8125rem] before:hidden">
+          <pre data-prefix="$"><code>git remote add origin https://git:$KEY@git.example.com/hello</code></pre>
+          <pre data-prefix="$"><code>git push -u origin main</code></pre>
+          <pre data-prefix="#" class="text-primary"><code>→ https://hello.example.com</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- 03 · Features -->
+    <section class={section} aria-labelledby="features-title">
+      <div class={frame}>
+        <p class={eyebrow}>03 · Features</p>
+        <h2 id="features-title" class={`${h2} mb-10 sm:mb-12`}>
+          Everything a small platform needs. <em>Nothing</em> it doesn't.
+        </h2>
+        <ul
+          class="m-0 grid list-none gap-px border border-base-300 bg-base-300 p-0 sm:grid-cols-2 lg:grid-cols-3"
+        >
+          {
+            FEATURES.map((feature) => (
+              <li class="bg-base-100 p-6 transition-colors hover:bg-base-200 sm:p-8">
+                <h3 class="mb-2 text-[1.0625rem] font-semibold tracking-tight">
+                  {feature.title}
+                </h3>
+                <p class="m-0 text-[0.9375rem] leading-relaxed text-base-content/70">
+                  {feature.body}
+                </p>
+              </li>
+            ))
+          }
+        </ul>
+      </div>
+    </section>
+
+    <!-- 04 · Ownership -->
+    <section class={section} aria-labelledby="own-title">
+      <div class={frame}>
+        <div class="grid gap-10 lg:grid-cols-2 lg:gap-20">
+          <div>
+            <p class={eyebrow}>04 · Ownership</p>
+            <h2 id="own-title" class={h2}>
+              Your server. Your bucket. <em>Your</em> bill.
+            </h2>
+            <p class={`${body} mt-6`}>
+              Noite keeps everything in one S3 bucket: your Git history, your
+              apps' storage and its own state. Use the bundled store to get
+              started, or point it at R2, S3 or Tigris. Lose the server and
+              nothing is lost: a fresh install restores itself from the bucket.
+            </p>
+          </div>
+          <div class="d-stats d-stats-vertical self-end rounded-none bg-transparent">
+            <div class="d-stat border-base-300 px-0">
+              <div class="d-stat-value font-noite text-6xl font-normal">1</div>
+              <div class="d-stat-desc font-mono text-sm">command to install</div>
+            </div>
+            <div class="d-stat border-base-300 px-0">
+              <div class="d-stat-value font-noite text-6xl font-normal">1</div>
+              <div class="d-stat-desc font-mono text-sm">container to run</div>
+            </div>
+            <div class="d-stat border-base-300 px-0">
+              <div class="d-stat-value font-noite text-6xl font-normal">1</div>
+              <div class="d-stat-desc font-mono text-sm">bucket to back up</div>
+            </div>
+          </div>
+        </div>
+        <p
+          class="mt-12 mb-0 border-t border-base-300 pt-5 font-mono text-xs text-base-content/60"
+        >
+          Powered by <a
+            class="d-link"
+            href="https://celld.dev"
+            target="_blank"
+            rel="noopener noreferrer">celld</a
+          >: ~4 ms to wake a sleeping cell, ~0.5 MB of memory per resident cell
+          (celld's own benchmarks).
+        </p>
+      </div>
+    </section>
+
+    <!-- 05 · Security -->
+    <section class={section} aria-labelledby="security-title">
+      <div class={`${frame} grid gap-10 lg:grid-cols-2 lg:gap-20`}>
+        <div>
+          <p class={eyebrow}>05 · Security</p>
+          <h2 id="security-title" class={h2}>
+            Built to let <em>other people</em> push code.
+          </h2>
+        </div>
+        <div>
+          <p class={body}>
+            In multi-tenant mode, builds and release commands run as
+            unprivileged users with a cleared environment, and a firewall
+            blocks tenants from localhost, private networks and cloud metadata.
+            A dedicated hostile test app tries to read platform secrets and
+            reach every internal API, and the isolation test suite checks that
+            every attempt fails.
+          </p>
+          <a class={link} href="/self-hosting/tenancy">How tenant isolation works →</a>
+        </div>
+      </div>
+    </section>
+
+    <!-- 06 · Install: daisyUI radio tabs, no script needed. -->
+    <section class={section} aria-labelledby="install-title">
+      <div class={frame}>
+        <p class={eyebrow}>06 · Install</p>
+        <h2 id="install-title" class={`${h2} mb-10 sm:mb-12`}>
+          Install it <em>your</em> way.
+        </h2>
+        <div class="d-tabs d-tabs-border">
+          {
+            INSTALL_TABS.map((tab, index) => (
+              <>
+                <input
+                  type="radio"
+                  name="install-target"
+                  class="d-tab font-mono text-sm"
+                  aria-label={tab.label}
+                  checked={index === 0}
+                />
+                <div class="d-tab-content border-t-base-300 pt-6">
+                  <div class="flex items-start gap-3 rounded-box border border-base-300 bg-base-200 py-2.5 pr-2.5 pl-4">
+                    <code class="min-w-0 flex-1 overflow-x-auto whitespace-pre py-1 font-mono text-sm">
+                      {tab.code}
+                    </code>
+                    <button
+                      type="button"
+                      class="d-btn d-btn-outline d-btn-xs font-mono"
+                      data-copy={tab.code}
+                      aria-label={`Copy the ${tab.label} instructions`}
+                    >
+                      <span data-copy-label>Copy</span>
+                    </button>
+                  </div>
+                  <p class="mt-3 font-mono text-xs text-base-content/60">
+                    {tab.note}
+                  </p>
+                </div>
+              </>
+            ))
+          }
+        </div>
+        <a class={link} href="/self-hosting/install">Full install guide →</a>
+      </div>
+    </section>
+
+    <!-- 07 · FAQ -->
+    <section class={section} aria-labelledby="faq-title">
+      <div class={`${frame} grid gap-10 lg:grid-cols-2 lg:gap-20`}>
+        <div>
+          <p class={eyebrow}>07 · FAQ</p>
+          <h2 id="faq-title" class={h2}>Questions, <em>answered</em>.</h2>
+        </div>
+        <div class="d-join d-join-vertical w-full">
+          {
+            FAQ.map((item) => (
+              <details class="d-collapse d-collapse-plus d-join-item border border-base-300">
+                <summary class="d-collapse-title font-medium">
+                  {item.question}
+                </summary>
+                <div class="d-collapse-content leading-relaxed text-base-content/70">
+                  <p class="m-0">{item.answer}</p>
+                </div>
+              </details>
+            ))
+          }
+        </div>
+      </div>
+    </section>
+
+    <!-- Final call to action: back to night. -->
+    <section
+      data-theme="noite"
+      class="bg-night-sky relative overflow-hidden bg-base-100 py-[clamp(4.5rem,10vw,8rem)] text-base-content"
+      aria-labelledby="final-title"
+    >
+      <div class="mx-auto flex max-w-[76rem] flex-col items-center px-4 text-center sm:px-10">
+        <h2 id="final-title" class={`${h2} mb-8`}>
+          Your next app is <em>one push</em> away.
+        </h2>
+        <div
+          class="flex w-full max-w-2xl items-center gap-3 rounded-box border border-base-300 bg-base-200/60 py-2.5 pr-2.5 pl-4 text-left"
+        >
+          <code class="min-w-0 flex-1 overflow-x-auto whitespace-pre font-mono text-sm">
+            <span class="mr-2 select-none text-primary" aria-hidden="true">$</span>{INSTALL_COMMAND}
+          </code>
+          <button
+            type="button"
+            class="d-btn d-btn-outline d-btn-xs font-mono"
+            data-copy={INSTALL_COMMAND}
+            aria-label="Copy the install command"
+          >
+            <span data-copy-label>Copy</span>
+          </button>
+        </div>
+        <div class="mt-8 flex flex-wrap justify-center gap-3">
+          <a class="d-btn d-btn-neutral" href="/quickstart">Quickstart →</a>
+          <a class="d-btn d-btn-outline" href="/introduction">Docs</a>
+          <a
+            class="d-btn d-btn-outline"
+            href={GITHUB_URL}
+            target="_blank"
+            rel="noopener noreferrer">GitHub</a
+          >
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <footer slot="footer" class="border-t border-base-300 text-base-content">
+    <div
+      class="d-footer mx-auto max-w-[76rem] px-4 py-12 sm:d-footer-horizontal sm:px-10"
+    >
+      <aside>
+        <a href="/" class="flex items-center gap-3 text-base-content no-underline">
+          <span class="h-8 [&>svg]:h-full [&>svg]:w-auto" aria-hidden="true" set:html={logoSvg} />
+          <span class="font-noite text-3xl">Noite</span>
+        </a>
+        <p class="m-0 font-mono text-xs text-base-content/60">
+          Tiny, self-hosted, yours.
+        </p>
+      </aside>
+      <nav aria-label="Product">
+        <h2 class="d-footer-title">Product</h2>
+        <a class="d-link d-link-hover" href="/quickstart">Quickstart</a>
+        <a class="d-link d-link-hover" href="/how-it-works">How it works</a>
+        <a class="d-link d-link-hover" href="/apps">Deploy apps</a>
+      </nav>
+      <nav aria-label="Self-hosting">
+        <h2 class="d-footer-title">Self-hosting</h2>
+        <a class="d-link d-link-hover" href="/self-hosting/install">Install</a>
+        <a class="d-link d-link-hover" href="/self-hosting/operations">Operations</a>
+        <a class="d-link d-link-hover" href="/reference/environment-variables">Configuration</a>
+      </nav>
+      <nav aria-label="Resources">
+        <h2 class="d-footer-title">Resources</h2>
+        <a class="d-link d-link-hover" href={GITHUB_URL} target="_blank" rel="noopener noreferrer">GitHub</a>
+        <a class="d-link d-link-hover" href={DISCORD_URL} target="_blank" rel="noopener noreferrer">Discord</a>
+        <a class="d-link d-link-hover" href="https://celld.dev" target="_blank" rel="noopener noreferrer">celld</a>
+        <a class="d-link d-link-hover" href="https://www.npmjs.com/package/@noitenow/cli" target="_blank" rel="noopener noreferrer">CLI on npm</a>
+      </nav>
+    </div>
+    <div class="mx-auto max-w-[76rem] px-4 pb-8 sm:px-10">
+      <p
+        class="m-0 border-t border-base-300 pt-5 font-mono text-xs text-base-content/60"
+      >
+        Apache-2.0 · Noite means “night” in Portuguese.
+      </p>
+    </div>
+  </footer>
+</PageLayout>
+
+<script>
+  import "./_home/landing.ts";
+</script>
