@@ -1,11 +1,23 @@
 import { defineConfig } from "blume";
 
+const INTER = {
+  name: "Inter",
+  variants: [
+    {
+      src: "./node_modules/@fontsource-variable/inter/files/inter-latin-wght-normal.woff2",
+      style: "normal",
+      weight: "100..900",
+    },
+  ],
+} as const;
+const PLEX_MONO = "./node_modules/@fontsource/ibm-plex-mono/files";
+
 export default defineConfig({
   deployment: {
     site: "https://noite.now",
   },
   description:
-    "Your Cloudflare Workers, on your own server. A tiny self-hostable PaaS: one command installs it, git push deploys.",
+    "The app platform you own. A tiny self-hostable PaaS: one command installs it, git push deploys.",
   // Header GitHub icon and "Edit on GitHub" page links.
   github: { dir: "apps/website", owner: "ryuzcorp", repo: "noite" },
   // currentColor mark (public/logo.svg, from apps/noite/public/logo.svg):
@@ -27,6 +39,20 @@ export default defineConfig({
       light: "oklch(51% 0.096 186.391)",
     },
     background: { dark: "oklch(15% 0.018 205)" },
+    // Blume's defaults (Inter, IBM Plex Mono), but from Fontsource packages
+    // instead of Google Fonts, so the build never fetches fonts over the
+    // network (fonts.gstatic.com flakes in CI).
+    fonts: {
+      body: INTER,
+      display: INTER,
+      mono: {
+        name: "IBM Plex Mono",
+        variants: [400, 500, 600].map((weight) => ({
+          src: `${PLEX_MONO}/ibm-plex-mono-latin-${weight}-normal.woff2`,
+          weight,
+        })),
+      },
+    },
   },
   title: "Noite",
 });
