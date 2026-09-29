@@ -124,6 +124,10 @@ pub struct App {
     /// Last wake (request-driven, manual start or deploy): the idle clock
     /// never runs from before it.
     pub woke_at: Option<String>,
+    /// Wrangler config (JSON) of the last successful deploy; the source may
+    /// have none (cloudflare.config.ts, built dist/wrangler.json).
+    #[serde(skip)]
+    pub deployed_config: Option<String>,
 }
 
 impl App {

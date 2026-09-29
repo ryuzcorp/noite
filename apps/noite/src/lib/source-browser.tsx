@@ -23,6 +23,8 @@ import {
   sourceDiff,
   sourceTree,
 } from "./apps.server";
+import { collectRef, newLiveRef, whenLive } from "./live-ref";
+import type { LiveRef } from "./live-ref";
 import type { RunnerBlob } from "./runner";
 import { readSwr, writeSwr } from "./swr-store";
 
@@ -164,18 +166,20 @@ type TreeData = Awaited<ReturnType<typeof sourceTree>>;
 /** Per-instance browser state that must outlive re-renders (see below). */
 interface BrowserBox {
   api: BrowserApi;
-  code: HTMLElement | null;
-  diff: HTMLElement | null;
+  /** Pane hosts as live refs: re-renders also hand `ref` detached scratch
+   * copies, so the setup resolves the connected host (live-ref.ts). */
+  code: LiveRef<HTMLElement>;
+  diff: LiveRef<HTMLElement>;
   hostsReady: PromiseWithResolvers<boolean>;
-  tree: HTMLElement | null;
+  tree: LiveRef<HTMLElement>;
 }
 
 const newBrowserBox = (): BrowserBox => ({
   api: { commit: undefined, show: undefined },
-  code: null,
-  diff: null,
+  code: newLiveRef<HTMLElement>(),
+  diff: newLiveRef<HTMLElement>(),
   hostsReady: Promise.withResolvers<boolean>(),
-  tree: null,
+  tree: newLiveRef<HTMLElement>(),
 });
 
 /** Draft/push state reported to the page (which renders the header). */
@@ -234,8 +238,12 @@ export const SourceBrowser = ({
   const box = atom.lazy(newBrowserBox)();
   const attach =
     (slot: "code" | "diff" | "tree") => (host: HTMLElement | null) => {
-      box[slot] = host ? paneIn(host) : null;
-      if (box.tree && box.code && box.diff) {
+      collectRef(box[slot], host);
+      if (
+        box.tree.els.length > 0 &&
+        box.code.els.length > 0 &&
+        box.diff.els.length > 0
+      ) {
         box.hostsReady.resolve(true);
       }
     };
@@ -253,12 +261,20 @@ export const SourceBrowser = ({
     // watch.once runs during render, before the JSX (and its refs) exist:
     // wait for all three host elements to attach.
     await box.hostsReady.promise;
-    const treeEl = box.tree;
-    const codeEl = box.code;
-    const diffEl = box.diff;
-    if (signal.aborted || !treeEl || !codeEl || !diffEl) {
+    // The refs fire before insertion: wait for the hosts that are really in
+    // the document, and only then give each its shadow pane (never on a
+    // scratch copy the morph is about to discard).
+    const [treeHost, codeHost, diffHost] = await Promise.all([
+      whenLive(box.tree, signal),
+      whenLive(box.code, signal),
+      whenLive(box.diff, signal),
+    ]);
+    if (signal.aborted || !treeHost || !codeHost || !diffHost) {
       return;
     }
+    const treeEl = paneIn(treeHost);
+    const codeEl = paneIn(codeHost);
+    const diffEl = paneIn(diffHost);
     const aborted = (): boolean => signal.aborted;
 
     let currentMode: SourceMode = mode();

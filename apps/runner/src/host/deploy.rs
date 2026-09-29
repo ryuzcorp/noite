@@ -296,6 +296,34 @@ async fn deploy_inner(
         }
     }
 
+    // `cf` CLI apps declare the Worker in cloudflare.config.ts; generate the
+    // wrangler.json celld deploys, unless the tree or the build has one.
+    if tokio::fs::try_exists(src_dir.join(CF_CONFIG)).await? && !has_wrangler_config(&src_dir).await? {
+        deploy_id = db::upsert_deploy(
+            pool,
+            Some(&deploy_id),
+            &app.id,
+            DeployStatus::Building.as_str(),
+            Some(&commit_sha),
+            &format!("{CF_CONFIG} → wrangler.json\n"),
+        )
+        .await?;
+        cmd::run_sandboxed(
+            "node",
+            &["--input-type=module", "-e", CF_CONFIG_CONVERTER, CF_CONFIG],
+            &src_dir,
+            &sb,
+            Duration::from_secs(60),
+        )
+        .await
+        // The failure message starts with the argv, i.e. the whole script.
+        .map_err(|e| {
+            let msg = e.to_string();
+            let detail = msg.split_once('\n').map_or(msg.as_str(), |(_, rest)| rest);
+            anyhow::anyhow!("{CF_CONFIG}: {}", detail.trim())
+        })?;
+    }
+
     let deploy_root = find_deploy_root(&src_dir)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no wrangler.json(c) / dist output to deploy"))?;
@@ -414,6 +442,7 @@ async fn deploy_inner(
     if db::get_app(pool, &app.id).await?.is_none() {
         anyhow::bail!("app {} deleted after celld deploy; skipping fleet start", app.id);
     }
+    db::set_deployed_config(pool, &app.id, effective_config(&deploy_root).await.as_deref()).await?;
 
     supervisor::ensure_fleet(pool, cfg, procs, logs, app).await?;
     supervisor::reload_fleet(app).await;
@@ -542,6 +571,33 @@ fn without_noite_keys(text: &str) -> anyhow::Result<Option<String>> {
         return Ok(None);
     }
     Ok(Some(serde_json::to_string_pretty(&value)?))
+}
+
+/// The `cf` CLI config (https://github.com/cloudflare/cf).
+const CF_CONFIG: &str = "cloudflare.config.ts";
+const CF_CONFIG_CONVERTER: &str = include_str!("cf-config.mjs");
+
+/// A Wrangler config at the root of `dir` or in its build output.
+async fn has_wrangler_config(dir: &Path) -> anyhow::Result<bool> {
+    for name in ["wrangler.jsonc", "wrangler.json", "wrangler.toml", "dist/wrangler.json"] {
+        if tokio::fs::try_exists(dir.join(name)).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The config `celld deploy` uploads, as JSON, for the storage views: a
+/// generated or built config is not in the pushed source they otherwise read.
+async fn effective_config(deploy_root: &Path) -> Option<String> {
+    for name in ["wrangler.jsonc", "wrangler.json"] {
+        let Ok(text) = tokio::fs::read_to_string(deploy_root.join(name)).await else {
+            continue;
+        };
+        let value = crate::host::storage::parse_wrangler(&text).ok()?;
+        return serde_json::to_string(&value).ok();
+    }
+    None
 }
 
 async fn find_deploy_root(dir: &PathBuf) -> anyhow::Result<Option<PathBuf>> {

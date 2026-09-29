@@ -7,11 +7,7 @@
 import { atom, watch } from "ilha";
 import type { AtomHandle, View } from "ilha";
 
-interface DialogBox {
-  el: HTMLDialogElement | null;
-}
-
-const newDialogBox = (): DialogBox => ({ el: null });
+import { collectRef, liveEl, newLiveRef } from "./live-ref";
 
 export const Dialog = ({
   children,
@@ -24,30 +20,34 @@ export const Dialog = ({
   onClose?: () => void;
   open: AtomHandle<boolean>;
 }) => {
-  // The element handle must survive re-renders: `watch` always runs the
-  // latest render's callback, and `ref` fires only on mount — so a plain
-  // `let` here is null after the first parent re-render and the dialog
-  // never opens. atom.lazy returns the same box on every render.
-  const box = atom.lazy(newDialogBox)();
-  watch(open, (v) => {
-    const dlg = box.el;
+  // The live <dialog>: ilha also hands `ref` detached scratch copies on
+  // every re-render, so resolve the connected element at use (live-ref.ts).
+  // atom.lazy keeps the holder across re-renders (a body `let` would not).
+  const box = atom.lazy(newLiveRef<HTMLDialogElement>)();
+  const sync = (want: boolean) => {
+    const dlg = liveEl(box);
     if (!dlg) {
       return;
     }
-    if (v && !dlg.open) {
+    if (want && !dlg.open) {
       dlg.showModal();
-    } else if (!v && dlg.open) {
+    } else if (!want && dlg.open) {
       dlg.close();
     }
+  };
+  watch(open, (v) => {
+    sync(v);
   });
   return (
     <dialog
       ref={(el) => {
-        box.el = el;
-        // Already open at mount (e.g. a drawer that mounts visible):
-        // watch() ran during render, before the ref attached.
-        if (el && open() && !el.open) {
-          el.showModal();
+        collectRef(box, el);
+        // Already open at mount (e.g. a drawer that mounts visible): the
+        // ref runs before insertion, so open on the next frame, once live.
+        if (el && open()) {
+          requestAnimationFrame(() => {
+            sync(open());
+          });
         }
       }}
       class={cls}

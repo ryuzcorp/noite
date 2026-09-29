@@ -7,20 +7,21 @@
 #   ├── caddy             edge: TLS, routing (admin 127.0.0.1:2019)
 #   ├── celld             control UI, fleet #0 (127.0.0.1:8090)
 #   ├── celld × N         tenant fleets (uid 10020)
-#   └── bun / sh          tenant builds and release commands (uid 10010)
+#   └── bun / node / sh   tenant builds and release commands (uid 10010)
 #
 # Targets:
 #   noite (default)  the published image
 #   dev              `make dev`: same runtime plus the Rust toolchain,
-#                    cargo-watch and Node; sources are bind-mounted and
+#                    cargo-watch; sources are bind-mounted and
 #                    docker/dev.sh runs the runner (cargo watch) and the
 #                    control UI (vite dev) side by side.
 #
-# One celld, one Caddy and one bun pin; docker/check-versions.ts asserts they
-# appear exactly once. Sidecar versions (esbuild, duckdb) live in
+# One celld, one Caddy, one Node and one bun pin; docker/check-versions.ts
+# asserts they appear exactly once. Sidecar versions (esbuild, duckdb) live in
 # docker/install-sidecars.sh.
 ARG CELLD_VERSION=0.6.0
 ARG CADDY_VERSION=2.10.0
+ARG NODE_VERSION=24.21.0
 
 FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
 
@@ -55,18 +56,30 @@ FROM docker.io/oven/bun:1.3-slim AS base
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 ARG TARGETARCH
 ARG CADDY_VERSION
-# bun: tenant `bun install` / builds. nftables: the tenant egress policy
-# (SPEC, Egress policy). git: the Git smart-HTTP adapter and deploy worktrees.
-# S3 goes through the runner's native client (no awscli, no Python).
+ARG NODE_VERSION
+# bun: tenant `bun install` / builds. node: real Node (not bun's shim) for
+# tenant steps that need it, e.g. loading `cloudflare.config.ts` (the `cf`
+# CLI config needs Node's module hooks); only the binary, no npm.
+# nftables: the tenant egress policy (SPEC, Egress policy). git: the Git
+# smart-HTTP adapter and deploy worktrees. S3 goes through the runner's
+# native client (no awscli, no Python).
 COPY docker/install-sidecars.sh /tmp/install-sidecars.sh
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      tini ca-certificates curl git nftables unzip \
+      tini ca-certificates curl git nftables unzip xz-utils \
   && rm -rf /var/lib/apt/lists/* \
   && sh /tmp/install-sidecars.sh && rm /tmp/install-sidecars.sh \
   && arch="$(dpkg --print-architecture)" \
   && curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_${arch}.tar.gz" \
     | tar -xz -C /usr/local/bin caddy \
-  && caddy version
+  && caddy version \
+  && case "${arch}" in \
+       amd64) NODE_PKG=linux-x64 ;; \
+       arm64) NODE_PKG=linux-arm64 ;; \
+       *) echo "unsupported arch: ${arch}" >&2; exit 1 ;; \
+     esac \
+  && curl -fsSL "https://nodejs.org/download/release/v${NODE_VERSION}/node-v${NODE_VERSION}-${NODE_PKG}.tar.xz" \
+    | tar -xJ --no-same-owner -C /usr/local --strip-components=1 "node-v${NODE_VERSION}-${NODE_PKG}/bin/node" \
+  && node --version | grep -q "^v${NODE_VERSION%%.*}"
 # Sandbox users (SPEC, Tenant isolation): builds and release commands run as `build`,
 # tenant fleets as `fleet`; the nft policy keys on these uids.
 RUN useradd -u 10010 -m -s /bin/sh build \
@@ -94,22 +107,12 @@ EXPOSE 80 443
 
 # --- dev --------------------------------------------------------------------
 FROM base AS dev
-ARG TARGETARCH
-ARG NODE_VERSION=24.21.0
-# Real Node for vite dev (workerd/wrangler), not bun's shim; the Rust
-# toolchain + cargo-watch for the runner. No baked runner or bundle: the
-# sources are bind-mounted (docker/compose.dev.yaml).
+# The Rust toolchain + cargo-watch for the runner (vite dev runs on base's
+# Node). No baked runner or bundle: the sources are bind-mounted
+# (docker/compose.dev.yaml).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      pkg-config libssl-dev gcc libc6-dev inotify-tools xz-utils \
-  && rm -rf /var/lib/apt/lists/* \
-  && case "${TARGETARCH:-amd64}" in \
-       amd64) NODE_PKG=linux-x64 ;; \
-       arm64) NODE_PKG=linux-arm64 ;; \
-       *) echo "unsupported arch: ${TARGETARCH}" >&2; exit 1 ;; \
-     esac \
-  && curl -fsSL "https://nodejs.org/download/release/v${NODE_VERSION}/node-v${NODE_VERSION}-${NODE_PKG}.tar.xz" \
-    | tar -xJ -C /usr/local --strip-components=1 \
-  && node --version | grep -q "^v${NODE_VERSION%%.*}"
+      pkg-config libssl-dev gcc libc6-dev inotify-tools \
+  && rm -rf /var/lib/apt/lists/*
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH="/usr/local/cargo/bin:/usr/local/bin:${PATH}" \

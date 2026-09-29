@@ -10,7 +10,7 @@ use crate::models::{
 
 const APP_COLS: &str = r#"id, slug, name, user_id, status, subdomain, git_prefix, fleet_bucket,
                   listen_port, internal_port, last_deploy_sha, last_error, desired_state,
-                  created_at, updated_at, asleep_since, woke_at"#;
+                  created_at, updated_at, asleep_since, woke_at, deployed_config"#;
 
 pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     if let Some(path) = database_url
@@ -69,7 +69,23 @@ pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     // EXISTS): scale-to-zero state (SPEC, Scale to zero).
     ensure_column(&pool, "app", "asleep_since", "asleep_since TEXT").await?;
     ensure_column(&pool, "app", "woke_at", "woke_at TEXT").await?;
+    // The Wrangler config of the last deploy (host/deploy.rs).
+    ensure_column(&pool, "app", "deployed_config", "deployed_config TEXT").await?;
     Ok(pool)
+}
+
+/// Record the Wrangler config (JSON) the last successful deploy uploaded.
+pub async fn set_deployed_config(
+    pool: &SqlitePool,
+    app_id: &str,
+    config: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE app SET deployed_config = ? WHERE id = ?")
+        .bind(config)
+        .bind(app_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Sibling file holding the high-churn telemetry tables (`metrics.sqlite`

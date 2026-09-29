@@ -99,6 +99,11 @@ pub async fn deployed_wrangler(
     cfg: &Config,
     app: &App,
 ) -> anyhow::Result<serde_json::Value> {
+    // What the last deploy uploaded; covers configs the source does not hold
+    // (cloudflare.config.ts, a built dist/wrangler.json).
+    if let Some(json) = app.deployed_config.as_deref() {
+        return Ok(serde_json::from_str(json)?);
+    }
     let Some(rev) = source::resolve_rev(cfg, app).await? else {
         bail!("no deployed source — push to main first");
     };

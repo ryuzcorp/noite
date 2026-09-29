@@ -2,7 +2,7 @@
 /**
  * Pin guard for the one image (docker/Dockerfile).
  *
- * - celld and Caddy are pinned exactly once (an ARG default); a second pin in
+ * - celld, Caddy and Node are pinned exactly once (an ARG default); a second pin in
  *   the same file is how a stage silently builds against another version.
  * - The access log path the image sets (CADDY_ACCESS_LOG) is the runner's own
  *   default, so the generator (which writes the Caddyfile `log` block from
@@ -27,6 +27,7 @@ const fail = (message: string): void => {
 for (const [name, pattern] of [
   ["celld", /ARG CELLD_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
   ["caddy", /ARG CADDY_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
+  ["node", /ARG NODE_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
 ] as const) {
   const versions = [...dockerfile.matchAll(pattern)].map(
     (m) => m.groups?.version ?? ""

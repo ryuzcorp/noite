@@ -495,6 +495,7 @@ mod tests {
             updated_at: "2026-09-15T00:00:00Z".into(),
             asleep_since: None,
             woke_at: None,
+            deployed_config: None,
         }
     }
 

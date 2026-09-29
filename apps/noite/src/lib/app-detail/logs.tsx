@@ -2,14 +2,20 @@
 import { atom, watch } from "ilha";
 
 import { decodeLogs, feedKeys, liveFeed, logsUrl } from "../feeds";
+import { collectRef, liveEl, newLiveRef } from "../live-ref";
+import type { LiveRef } from "../live-ref";
 
 /** Mutable per-instance pane state (see the atom.lazy note below). */
 interface Pane {
-  pre: HTMLPreElement | null;
+  /** The live <pre>: re-renders hand `ref` detached copies too (live-ref.ts). */
+  pre: LiveRef<HTMLPreElement>;
   stick: boolean;
 }
 
-const newPane = (): Pane => ({ pre: null, stick: true });
+const newPane = (): Pane => ({
+  pre: newLiveRef<HTMLPreElement>(),
+  stick: true,
+});
 
 /**
  * Live tail of the running celld fleet's stdout/stderr (bounded buffer on the
@@ -33,8 +39,9 @@ export const RuntimeLogs = ({ appId }: { appId: string }) => {
     // The watch fires before ilha's (microtask) re-render patches the new
     // lines in; scroll on the next frame, once scrollHeight includes them.
     window.requestAnimationFrame(() => {
-      if (pane.stick && pane.pre) {
-        pane.pre.scrollTop = pane.pre.scrollHeight;
+      const pre = liveEl(pane.pre);
+      if (pane.stick && pre) {
+        pre.scrollTop = pre.scrollHeight;
       }
     });
   });
@@ -54,7 +61,7 @@ export const RuntimeLogs = ({ appId }: { appId: string }) => {
         <pre
           class="max-h-64 overflow-auto rounded font-mono text-xs whitespace-pre-wrap"
           ref={(el) => {
-            pane.pre = el;
+            collectRef(pane.pre, el);
             if (el && pane.stick) {
               el.scrollTop = el.scrollHeight;
             }

@@ -1,10 +1,27 @@
-export class Counter {
-  constructor(state, _env) {
+import type { Env } from "./cloudflare.config.ts";
+
+/** What `Counter.fetch` answers for a counting request. */
+interface CounterBody {
+  n: number;
+  url: string;
+}
+
+interface Visit {
+  id: number;
+  ts: string;
+  url: string;
+}
+
+export class Counter implements DurableObject {
+  private readonly state: DurableObjectState;
+
+  constructor(state: DurableObjectState, _env: Env) {
     this.state = state;
   }
-  async fetch(request) {
+
+  async fetch(request: Request): Promise<Response> {
     console.log("visit", new Date().toISOString(), request.method, request.url);
-    const n = (await this.state.storage.get("n")) ?? 0;
+    const n = (await this.state.storage.get<number>("n")) ?? 0;
     // Read-only probe for the storage preview: `?read=1` reports the count
     // without advancing it.
     if (
@@ -14,11 +31,12 @@ export class Counter {
       return Response.json({ n });
     }
     await this.state.storage.put("n", n + 1);
-    return Response.json({ n: n + 1, url: request.url });
+    return Response.json({ n: n + 1, url: request.url } satisfies CounterBody);
   }
 }
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env): Promise<Response> {
     console.log("visit", new Date().toISOString(), request.url);
     const url = new URL(request.url);
     // Visiting GET /upload-test-txt writes a tiny test.txt to R2.
@@ -73,11 +91,11 @@ export default {
       .run();
     const { results } = await env.DB.prepare(
       "SELECT * FROM visits ORDER BY id DESC LIMIT 10"
-    ).all();
-    const name = new URL(request.url).searchParams.get("name") ?? "default";
+    ).all<Visit>();
+    const name = url.searchParams.get("name") ?? "default";
     const id = env.COUNTER.idFromName(name);
     const counter = await env.COUNTER.get(id).fetch(request);
-    const counterBody = await counter.json();
+    const counterBody = await counter.json<CounterBody>();
     return Response.json({ ...counterBody, visits: results });
   },
-};
+} satisfies ExportedHandler<Env>;
