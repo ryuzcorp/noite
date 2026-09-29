@@ -1,0 +1,48 @@
+---
+title: Configure
+description: Env vars, custom domains, collaborators, source edits, and storage for one app.
+---
+
+All of this lives on the app detail page (`/apps/<id>`, tabs Overview / Deployments / Metrics / Events / Settings).
+
+## Environment variables
+
+Settings → Environment. Variables reach the build, the release command, and the fleet environment. Reads are view-gated, writes admin-gated. Download mirrors the `.dev.vars` file local dev expects. Names starting with `FLAG_` render as on/off toggles (`1`/`0`).
+
+Reserved prefixes are dropped silently: `PORT`, `HOST`, `AWS_*`, `S3_*`, `CELLD_*`, `RUNNER_*`, `NOITE_*`, `BETTER_AUTH_*`, `CADDY_*`, `LD_*`, `NODE_OPTIONS`, `BUN_*` (except the cache var). Full detail: [Environment variables](/reference/environment-variables).
+
+## Custom domains
+
+Settings → Custom Domain. Adding a hostname reserves it; the edge picks it up on the next reconcile (seconds). Then point DNS at the server:
+
+```bash
+dig +short app.<domain>
+```
+
+The certificate issues on the first visit (ask-gated on-demand TLS). Validation rules: lowercase DNS shape, ≥ 2 labels, no wildcard/IP/port/path. Platform hostnames are refused; a taken hostname returns 409. There is no DNS ownership check yet — first claimant wins.
+
+Removing a hostname releases it.
+
+## Collaborators
+
+Settings → Collaborators. Roles, weakest first:
+
+| Role | Can |
+| --- | --- |
+| `view` | Read the app, logs, metrics, storage |
+| `push` | Everything above, plus push code (create + fast-forward only) |
+| `admin` | Everything above, plus settings, env vars, domains, any push, collaborator management |
+
+Instance admins (the [operator track](/self-hosting/install)) manage every app without a grant.
+
+## Source browser and web commits
+
+The **Code** button opens `/apps/<id>/source`: files of the latest pushed commit, a parent diff view, and deep links via `?view=` / `?file=`. Editing files there stages a web commit — it pushes like a deploy and wakes a sleeping app.
+
+:::warning
+The browser caps blobs at 256 KB and diffs at 1 MB. Binary files are detected, not rendered.
+:::
+
+## Storage
+
+The Overview tab lists the app's storage resources; each row opens a detail browser. Kinds: D1 databases, Durable Objects, R2 buckets — as declared by the deployed Wrangler config (read first) or the pushed source. D1 tables page (`?p=`, `?s=`); R2 keys browse by prefix.

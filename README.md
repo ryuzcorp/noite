@@ -1,8 +1,10 @@
 # Noite
 
-Tiny self-hostable PaaS for [celld](https://celld.dev/). Spec: [SPEC.md](SPEC.md), operator guide: [apps/website/docs/deployment.mdx](apps/website/docs/deployment.mdx).
+Tiny self-hostable PaaS for [celld](https://celld.dev/). Spec: [SPEC.md](SPEC.md), operator guide: [apps/website/docs/self-hosting/install.mdx](apps/website/docs/self-hosting/install.mdx).
 
 Noite ships as **one image**, `ghcr.io/<owner>/noite`: the runner (deploy pipeline, API, Git, telemetry) runs as PID 1 and supervises Caddy (the edge), the control UI (a celld node, fleet #0) and one celld fleet per tenant app. `docker compose up -d` runs it from `docker/compose.yaml` next to the bundled RustFS store.
+
+On a fresh Ubuntu or Debian server, `curl -fsSL https://noite.now/install.sh | sudo bash` is the whole install ([`apps/website/public/install.sh`](apps/website/public/install.sh): Docker, `/opt/noite` with generated secrets, start, wait for `/ready`; re-run to upgrade).
 
 Registration is invite-only: the **first** account to sign up bootstraps the instance — it needs no code and is promoted to `admin` — and every later account needs a single-use code. Each member holds two codes to hand out (read them on `/account`), and admins mint more from the Invitations panel in `/god-mode`.
 
@@ -16,7 +18,7 @@ make backup  # tar both volumes into backups/<UTC stamp>/
 
 Restore is destructive and replays a backup directory over the live volumes: `make restore FROM=backups/<stamp>`.
 
-`make up-prod` pulls the release image instead of building. `docker/compose.yaml` pulls by default and gives every variable a default, so on a host with nothing but Compose (a cloud VM, a panel's or registry's template) `docker compose -f docker/compose.yaml up -d` is the whole install. Pin `NOITE_IMAGE` to a SHA tag in production.
+`make up-prod` pulls the release image instead of building. `docker/compose.yaml` pulls by default and gives every variable a default, so on a host with nothing but Compose (a cloud VM, a panel's or registry's template) `docker compose -f docker/compose.yaml up -d` is the whole install. Every install tracks `ghcr.io/ryuzcorp/noite:latest`; a short-SHA tag in `NOITE_IMAGE` only holds back or rolls back one install.
 
 Bring your own S3 (R2, Tigris or S3, the stores celld qualifies; recommended for real installs): set `S3_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and start with `--scale rustfs=0`.
 
@@ -87,7 +89,7 @@ portless alias test.noite 9080 # → https://test.noite.local (hosts + mDNS)
 
 ## Deploy to Coolify
 
-Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `main`): the same file as `make up-prod`, driven by env. In Environment Variables, set `BASE_DOMAIN` to your domain (defaults to `localhost`) and `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` to match, the three secrets (`BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, and `RUSTFS_ACCESS_KEY` + `RUSTFS_SECRET_KEY` or your own S3 keys), and pin `NOITE_IMAGE` to a SHA tag. Nothing generates secrets here; dev-default secrets are refused on real domains. Coolify auto-provisions a generated domain for the `noite` service (boot check via `SERVICE_URL_NOITE_80`), then paste the real hostnames once on that service's Domains field (Coolify can't take custom hostnames from Compose): `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. Behind a terminating proxy set `CADDY_AUTO_HTTPS=off`; Noite's Caddy still mints per-host certs on demand. The apex stays on your marketing site.
+Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `main`): the same file as `make up-prod`, driven by env. In Environment Variables, set `BASE_DOMAIN` to your domain (defaults to `localhost`) and `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` to match, the three secrets (`BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, and `RUSTFS_ACCESS_KEY` + `RUSTFS_SECRET_KEY` or your own S3 keys). `NOITE_IMAGE` stays on `latest`. Nothing generates secrets here; dev-default secrets are refused on real domains. Coolify auto-provisions a generated domain for the `noite` service (boot check via `SERVICE_URL_NOITE_80`), then paste the real hostnames once on that service's Domains field (Coolify can't take custom hostnames from Compose): `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. Behind a terminating proxy set `CADDY_AUTO_HTTPS=off`; Noite's Caddy still mints per-host certs on demand. The apex stays on your marketing site.
 
 A new image restarts the runner and every tenant fleet with it (they cold-boot), so batch upgrades and deploy off-peak.
 
@@ -107,6 +109,6 @@ Then redeploy once and confirm the `noite-tenants` router in the Traefik dashboa
 
 ## Deploy to Railway
 
-One service from the image `ghcr.io/<owner>/noite:<sha>` with a volume at `/data`, plus a bucket: R2 or Tigris (recommended), or a second service from `docker.io/rustfs/rustfs` with its own volume. Set the same variables as above, `S3_ENDPOINT` to the bucket (`http://rustfs.railway.internal:9000` for the RustFS service), `CADDY_AUTO_HTTPS=off` (Railway terminates TLS with the `*.<domain>` custom domain), the domain's target port to `80`, and `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=35` so the stop budget fits. Healthcheck path `/ready` on port `8080` if you set one (first boot can take minutes). Whether Railway grants the capabilities multi-tenant mode needs is unverified: check `make doctor`'s output (or `/ready`) on the deployed service, and run `NOITE_TENANCY=single` if isolation cannot be set up there.
+One service from the image `ghcr.io/ryuzcorp/noite:latest` with a volume at `/data`, plus a bucket: R2 or Tigris (recommended), or a second service from `docker.io/rustfs/rustfs` with its own volume. Set the same variables as above, `S3_ENDPOINT` to the bucket (`http://rustfs.railway.internal:9000` for the RustFS service), `CADDY_AUTO_HTTPS=off` (Railway terminates TLS with the `*.<domain>` custom domain), the domain's target port to `80`, and `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=35` so the stop budget fits. Healthcheck path `/ready` on port `8080` if you set one (first boot can take minutes). Whether Railway grants the capabilities multi-tenant mode needs is unverified: check `make doctor`'s output (or `/ready`) on the deployed service, and run `NOITE_TENANCY=single` if isolation cannot be set up there.
 
-Full guide: [apps/website/docs/deployment.mdx](apps/website/docs/deployment.mdx).
+Full guide: [apps/website/docs/self-hosting/](apps/website/docs/self-hosting/).

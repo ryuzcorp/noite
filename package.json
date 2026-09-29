@@ -15,9 +15,9 @@
   "devDependencies": {
     "@types/bun": "latest",
     "husky": "^9.1.7",
-    "oxfmt": "^0.67.0",
-    "oxlint": "^1.82.0",
+    "oxfmt": "^0.71.0",
+    "oxlint": "^1.86.0",
     "typescript": "^7",
-    "ultracite": "7.11.1"
+    "ultracite": "7.12.2"
   }
 }

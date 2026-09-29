@@ -1,0 +1,75 @@
+---
+title: Quickstart
+description: Install Noite on a fresh server with one command, then deploy your first app with git push.
+---
+
+From a fresh Ubuntu or Debian server to a live app. You need a server with a public IP, ports 80 and 443 free, and 2 GB of memory. Nothing gets cloned or built: the server pulls the release image, and your laptop needs only `git`.
+
+<Steps>
+  <Step title="Point DNS at the server">
+    Add `A` records for `app.<domain>`, `api.<domain>`, `git.<domain>` and `*.<domain>` pointing at the server. To try Noite without a domain, skip this: the installer falls back to `<server-ip>.sslip.io`, which resolves every subdomain to your IP.
+  </Step>
+  <Step title="Run the installer">
+    ```bash
+    curl -fsSL https://noite.now/install.sh | sudo bash
+    ```
+    It installs Docker if missing, asks for the base domain, generates secrets into `/opt/noite/.env`, starts Noite and waits until it is ready. See [Install](/self-hosting/install) for its options.
+  </Step>
+  <Step title="Create the admin account">
+    Open `https://app.<domain>` and register with a passkey. The first account needs no invite code and becomes the admin, so do this right away.
+  </Step>
+  <Step title="Create an app and an API key">
+    In the control UI, go to **Apps → New app** and pick a slug, e.g. `hello`. Then open **Account → API keys** and create a key; it is the password for `git push`.
+  </Step>
+  <Step title="Write a Worker">
+    On your laptop:
+    ```bash
+    mkdir hello && cd hello
+    cat > wrangler.jsonc <<'EOF'
+    {
+      "name": "hello",
+      "main": "index.js",
+      "compatibility_date": "2026-09-01"
+    }
+    EOF
+    cat > index.js <<'EOF'
+    export default {
+      fetch: () => new Response("Hello from Noite"),
+    };
+    EOF
+    ```
+  </Step>
+  <Step title="Push it">
+    ```bash
+    git init -b main
+    git add -A && git commit -m "first deploy"
+    git remote add origin "https://git:<api-key>@git.<domain>/hello"
+    git push -u origin main
+    ```
+    Every push to `main` deploys. The app's **Deployments** tab shows the build log.
+  </Step>
+  <Step title="Open the app">
+    Open `https://hello.<domain>`. The first visit to a new hostname waits a few seconds while its certificate is issued.
+  </Step>
+</Steps>
+
+:::tip
+To try Noite on your own machine instead, no server needed: `curl -fsSLO https://raw.githubusercontent.com/ryuzcorp/noite/main/docker/compose.yaml && docker compose up -d`, then open `http://localhost:9080` and push to `http://git:<api-key>@git.localhost:9080/<slug>`.
+:::
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Deploy apps" href="/apps/deploy" icon="package">
+    Builds, deploying from CI, release commands, and rollback.
+  </Card>
+  <Card title="How it works" href="/how-it-works" icon="diagram">
+    What a push does: receive-pack, bundle, build, release, deploy, reload.
+  </Card>
+  <Card title="Self-hosting" href="/self-hosting" icon="server">
+    Your own bucket, tenancy, Coolify and Railway, backups.
+  </Card>
+  <Card title="API" href="/reference/api" icon="book-open">
+    The full runner API surface.
+  </Card>
+</CardGroup>

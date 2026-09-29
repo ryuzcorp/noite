@@ -1,0 +1,80 @@
+---
+title: Deploy
+description: Create an app and ship it — push over Git, deploy from CI, and what each push triggers.
+---
+
+## Create the app
+
+Open the control UI and go to **Apps → New app**. Enter a name and slug. Creating the app provisions its `git` remote; deploys follow each push.
+
+Slug rules: 1–48 chars, lowercase letters/digits/hyphens, starting and ending with a letter or digit. Reserved: `_control`, `app`, `api`, `git`.
+
+## Push with git
+
+Every app has a Git remote at `https://git.<domain>/<slug>`. Authenticate as user `git` with an account API key (**Account → API keys**) as the password; the push needs the `push` role on the app. Each push to `main` deploys.
+
+The smallest app is a Wrangler config plus a module Worker:
+
+```jsonc title="wrangler.jsonc"
+{
+  "name": "hello",
+  "main": "index.js",
+  "compatibility_date": "2026-09-01",
+}
+```
+
+```js title="index.js"
+export default {
+  fetch: () => new Response("Hello from Noite"),
+};
+```
+
+```bash
+git init -b main
+git add -A && git commit -m "first deploy"
+git remote add origin "https://git:<api-key>@git.<domain>/<slug>"
+git push -u origin main
+```
+
+Open the result at `https://<slug>.<domain>`. With a `package.json`, the runner runs `bun install` and `bun run build` first; without one it deploys the tree as is. Pushes must fast-forward unless you hold the `admin` role.
+
+## Deploy from CI
+
+`@noitenow/cli` pushes a prebuilt `dist/` plus `wrangler.jsonc` as a synthetic fast-forward commit — no server build, `push` role suffices, never force-pushes.
+
+```bash
+bunx @noitenow/cli deploy --slug <slug> --url https://git.<domain> --token "$NOITE_API_KEY"
+```
+
+```yaml
+- run: bun run build
+- run: bunx @noitenow/cli deploy --comment update
+  env:
+    NOITE_API_KEY: ${{ secrets.NOITE_API_KEY }}
+    NOITE_BASE: https://git.<domain>
+```
+
+| Flag | Env | Default |
+| --- | --- | --- |
+| `--dist` | — | `dist` |
+| `--slug` | `NOITE_SLUG` | repo name, slugified |
+| `--url` | `GIT_PUBLIC_BASE` / `NOITE_BASE` | `http://git.localhost:9080` |
+| `--token` | `NOITE_API_KEY` / `NOITE_GIT_TOKEN` | — |
+| `--wrangler` | — | `wrangler.jsonc` |
+| `--message` | — | `deploy <sha12>` |
+| `--comment` | — | `update` (`create` / `off`) |
+
+In Actions it writes `url=` + `sha=` to `$GITHUB_OUTPUT` and posts (or updates, via marker) a PR comment. A `Worker` may be declared in `cloudflare.config.ts` instead of `wrangler.json(c)` — the runner converts it after the build when no Wrangler config exists.
+
+## What happens on push
+
+1. Tip `.bundle` lands; the runner updates its bare mirror and worktree.
+2. Sandboxed `bun install` / `bun run build` run when the tree declares them.
+3. Optional `release` command (e.g. migrations) runs. A failed release keeps the old deployment serving.
+4. The config is stripped of Noite-only keys, then `celld deploy` ships the fleet; a new fleet spawns or the existing one gets `POST /reload`.
+
+The **Deployments** tab shows status per push with a build-log pane. Deploy logs keep a 64 KB tail.
+
+## Rollback
+
+`POST /v1/apps/<id>/rollback {sha}` redeploys a past successful SHA — bundles are immutable per SHA. The UI offers rollback on success rows.

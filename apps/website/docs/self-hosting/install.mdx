@@ -1,0 +1,109 @@
+---
+title: Install
+description: Install Noite on a fresh server with one command, or by hand with Docker Compose — bundled RustFS or your own S3 bucket.
+---
+
+## One-command install
+
+On a fresh Ubuntu or Debian server (amd64 or arm64, 2 GB of memory or more, ports 80 and 443 free):
+
+```bash
+curl -fsSL https://noite.now/install.sh | sudo bash
+```
+
+The script installs Docker Engine and the Compose plugin when missing, asks for the base domain, and writes `/opt/noite/compose.yaml` (option A, from `main`) and `/opt/noite/.env` with generated secrets, `CONTROL_SUBDOMAIN=app` and the edge on 80/443. It then opens 80/443 in `ufw` when it is active, starts the stack and waits for `/ready`. With no terminal to ask on, the domain defaults to `<public-ip>.sslip.io`, which needs no DNS and is enough to try Noite out. For a real domain, point `app.`, `api.`, `git.` and `*.<domain>` at the server first.
+
+:::warning
+Register right away: the first account becomes the admin without an invite code.
+:::
+
+Re-running the script is the upgrade: it refreshes `compose.yaml`, keeps `.env` (the domain and secrets never change after the first install, since passkeys bind to `BETTER_AUTH_URL`), pulls and recreates. Inputs are environment variables; with `sudo`, put them after it (`curl … | sudo NOITE_DOMAIN=example.com bash`):
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `NOITE_DOMAIN` | asked, else `<ip>.sslip.io` | `BASE_DOMAIN` on first install |
+| `NOITE_VERSION` | `latest` | image tag; a short SHA holds back or rolls back |
+| `NOITE_ADMIN_EMAIL` | none | account promoted to admin at boot |
+| `NOITE_TENANCY` | `multi` | `single` when only you push code |
+| `NOITE_DIR` | `/opt/noite` | install directory |
+| `NOITE_REF` | `main` | git ref `compose.yaml` is fetched from |
+| `NOITE_SKIP_DOCKER` | `0` | `1` fails instead of installing Docker |
+
+For your own bucket ([option B](#b-your-own-bucket)), lost-passkey email (`NOITE_EMAIL_WEBHOOK_URL`) or any other setting, edit `/opt/noite/.env` and run `cd /opt/noite && docker compose up -d`. The sections below are the same install by hand, for hosts where you'd rather not run the script.
+
+## Manual install
+
+The same result without the script, on any host with Docker (or Podman) and Compose. Only two files are needed; nothing is cloned or built.
+
+### Prerequisites
+
+- A Docker or Podman host with Compose.
+- DNS: `app.<domain>` (control UI), `api.<domain>`, `git.<domain>`, plus `*.<domain>` for tenant apps. The apex stays free for your marketing site.
+- Ports 80/443 reachable — Caddy terminates per-host TLS itself via on-demand certificates (ask-gated, so only live hosts get certs).
+
+### A: bundled RustFS
+
+```bash
+mkdir -p /opt/noite && cd /opt/noite
+curl -fsSLO https://raw.githubusercontent.com/ryuzcorp/noite/main/docker/compose.yaml
+# write .env (below), then:
+docker compose up -d && docker compose logs -f noite
+```
+
+`.env` next to `compose.yaml`:
+
+```bash
+BASE_DOMAIN=<domain>
+CONTROL_SUBDOMAIN=app
+BETTER_AUTH_URL=https://app.<domain>
+GIT_PUBLIC_BASE=https://git.<domain>
+HTTP_PORT=80
+HTTPS_PORT=443
+NOITE_IMAGE=ghcr.io/ryuzcorp/noite:latest
+RUNNER_TOKEN=<openssl rand -hex 32>        # shared runner↔ui bearer token
+BETTER_AUTH_SECRET=<openssl rand -hex 32>  # session signing secret
+RUSTFS_ACCESS_KEY=<openssl rand -hex 8>    # dev defaults are refused
+RUSTFS_SECRET_KEY=<openssl rand -hex 24>
+```
+
+`CONTROL_SUBDOMAIN` empty means the control UI is served on the bare domain (the `localhost` default); `app` is the production setting. Without an `.env`, `compose.yaml` boots a local trial on `http://localhost:9080`.
+
+:::warning
+Set `BETTER_AUTH_URL` to the final URL **before** anyone registers — passkeys are bound to it.
+:::
+
+Open `https://app.<domain>` and create the owner account (first signup), then deploy an app as in the [Quickstart](/quickstart).
+
+Other variables worth setting: `NOITE_S3_BUCKET`, `NOITE_ADMIN_EMAIL`, `NOITE_EMAIL_WEBHOOK_URL`, `NOITE_SMTP_FROM`, `CONTROL_EXTRA_HOSTS` (extra hostnames serving the control UI), `CADDY_AUTO_HTTPS`, `NOITE_TENANCY` (see [Tenancy](/self-hosting/tenancy)). Full detail for every variable lives in [Environment variables](/reference/environment-variables).
+
+### B: your own bucket
+
+Add the bucket to `.env` (dropping the `RUSTFS_*` keys) and start without the bundled store:
+
+```bash
+S3_ENDPOINT=https://s3.us-east-1.amazonaws.com
+S3_PUBLIC_ENDPOINT=https://s3.us-east-1.amazonaws.com
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+NOITE_S3_BUCKET=noite
+```
+
+```bash
+docker compose up -d --scale rustfs=0
+```
+
+Key requirements: Get/Put/Delete/List on the bucket. The bucket is created if the key allows, otherwise create it first. This works the same for an installer-made `/opt/noite`.
+
+## Verify
+
+```bash
+cd /opt/noite
+docker compose exec noite curl -s http://127.0.0.1:8080/ready   # {"ok":true,...}
+curl https://api.<domain>/health                                 # edge → runner
+```
+
+`/ready` is the summary: 200 only when the first reconcile ran, the bucket answers, isolation holds (in `multi`), the control fleet is healthy and Caddy accepted its config, and its body names whatever is failing; it is also the container's healthcheck. celld's own view of the control node: `docker compose exec noite curl -s http://127.0.0.1:8090/.well-known/celld/health`.
+
+:::note
+Building Noite from source, the dev stack and the e2e lanes are for contributors: see the [repository README](https://github.com/ryuzcorp/noite#readme).
+:::

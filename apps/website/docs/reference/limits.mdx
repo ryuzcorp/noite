@@ -1,0 +1,59 @@
+---
+title: Limits
+description: Quotas, fleet bounds, rate limits, and the scale-to-zero sleep mechanism.
+---
+
+## Quotas
+
+| Knob | Default | Effect |
+| --- | --- | --- |
+| `RUNNER_MAX_APPS_PER_USER` | `10` | Per-account app quota, enforced in the runner on create — API keys cannot bypass it |
+| `RUNNER_BUILD_MAX_MB` | `2048` | Builds refused past this worktree size (MiB) |
+| `RUNNER_BUILD_CACHE_MB` | `512` | Per-app bun cache cap, pruned oldest-first; `0` disables |
+| `RUNNER_TELEMETRY_RETENTION_DAYS` | `14` | Telemetry lifetime in bucket prune, metric tables, and glob floor |
+
+## Fleet bounds
+
+Every app is its own celld fleet on one host, sharing one cgroup. The bounds stop one account — or one busy app — from owning the machine.
+
+:::warning
+`RUNNER_FLEET_MAX_RSS_MB` is container-wide, not per-app: celld compares it against the greater of its own RSS and the cgroup working set, and every fleet shares the one container cgroup. A per-fleet-sized value closes every fleet's admission gate as soon as the container as a whole passes it. Size it to the container; leave `0` for celld's default (80% of container memory).
+:::
+
+| Knob | Default | Effect |
+| --- | --- | --- |
+| `RUNNER_FLEET_MAX_RSS_MB` | `0` | Shed threshold in MiB; over it, fleets refuse cells with `503` + `Retry-After` instead of OOM-ing |
+| `RUNNER_FLEET_IDLE_EVICT_S` | `120` | Idle seconds before a fleet hibernates cells and returns memory |
+| `RUNNER_FLEET_ASSET_CACHE_MB` | `64` | Per-fleet on-disk asset cache (celld default is 512) |
+| `RUNNER_FLEET_DEPLOY_POLL_S` | `300` | Fleet self-poll for deploys; the runner also POSTs `/reload`, so this covers misses only |
+| `RUNNER_FLEET_LOG` | `error,celld=warn` | Fleet log filter; celld warnings reach the per-app log view |
+
+## Rate limits
+
+Two layers, both `600`/min by default, `0` disables either:
+
+| Layer | Var | Scope | Over-limit |
+| --- | --- | --- | --- |
+| Worker limiter | `NOITE_RATE_LIMIT_RPM` | Per client, per route class (`auth`/`invite`) | `429` + `Retry-After`, before better-auth or D1 |
+| better-auth budget | `NOITE_AUTH_RATE_LIMIT` | Per client on `/api/auth/*`, keyed on forwarded address | `429` |
+
+## Sleep (scale to zero)
+
+An app with no requests for `RUNNER_SLEEP_AFTER_H` hours (default 24, `0` disables) stops costing anything; the next request brings it back transparently.
+
+**Sweep.** Every `RUNNER_SLEEP_SWEEP_S` seconds (default 3600) the runner parks apps that are deployed, desired `running`, awake, and request-free for the window.
+
+**Activity** is the newest of: the last minute bucket with requests in `app_metric` (real `celld.fetch` spans), the app's last wake (`woke_at`), its last deploy. A fresh deploy or manual start gets a full window.
+
+**Asleep is not stopped.** `desired_state` stays `running`; sleep is its own column `asleep_since`, and status reads `sleeping`. A stopped app never sleeps or wakes; stopping an asleep app clears the flag. Going to sleep: mark asleep → rewrite Caddy sites to wake-on-demand → stop the fleet with normal SIGTERM drain.
+
+**Wake flow.** Asleep sites route to the fleet port preceded by `forward_auth` to `GET /v1/edge/wake`. Caddy holds the request, body included, while the runner:
+
+1. Resolves the app from `X-Forwarded-Host` (tenant slug or custom domain).
+2. Clears the flag, sets `woke_at`.
+3. Spawns the fleet immediately.
+4. Waits for `/.well-known/celld/health` 200, bounded by `RUNNER_WAKE_TIMEOUT_S` (default 120).
+5. Rewrites the Caddyfile back to the plain proxy.
+6. Answers 200; Caddy proxies the held request as if the app never slept.
+
+Concurrent requests share one wake (per-app lock); only a failed wake answers `503`. A deploy, rollback, or web commit to an asleep app wakes it first; TLS ask treats asleep apps as live so certificates renew. First-request cost after a quiet day: one cold fleet start (celld boot + ready gate, typically seconds).

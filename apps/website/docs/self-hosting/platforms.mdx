@@ -1,0 +1,47 @@
+---
+title: Platforms
+description: Run Noite on Coolify or Railway — env, domains, downtime model, and platform-specific settings.
+---
+
+## Coolify
+
+Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `main`): the same file the installer uses, driven by env. In Environment Variables, set `BASE_DOMAIN` to your domain (defaults to `localhost`) and `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` to match, the secrets (`BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, and `RUSTFS_ACCESS_KEY` + `RUSTFS_SECRET_KEY` or your own bucket's keys) and leave `NOITE_IMAGE` on `latest`. Nothing auto-generates secrets; dev defaults are refused on real domains. Deploy, then paste the real hostnames once on the `noite` service's Domains field: `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. The apex stays on your marketing site. Behind a terminating proxy set `CADDY_AUTO_HTTPS=off`.
+
+### Downtime model
+
+Coolify does not do rolling updates for Compose: `docker compose up` stops a service before starting its replacement. A new image restarts the runner and every tenant fleet with it (they cold-boot, roughly a minute for many apps), so batch upgrades and deploy them off-peak.
+
+Tenant subdomains (`<slug>.<domain>`) are fully automatic: no per-app steps, no wildcard cert, no DNS provider. A Traefik TCP router forwards every `*.<domain>` SNI straight to Noite's Caddy on `:443`, which mints a per-slug certificate on demand (ask-gated by the runner at `/v1/edge/tls-ask`, so only live tenant and platform hosts get certs).
+
+One-time setup (besides `*.<domain>` DNS pointing at the server): save this file under `Servers > server > Proxy > Dynamic Configurations` in Coolify. It is static text that Coolify cannot mangle, and `noite-tenants@docker` resolves the TCP service the `noite` service label defines:
+
+```yaml
+tcp:
+  routers:
+    noite-tenants:
+      entryPoints: [https]
+      rule: 'HostSNIRegexp(`^.+\.<domain>$`)'
+      service: noite-tenants@docker
+      tls: { passthrough: true }
+```
+
+Then redeploy once and confirm the `noite-tenants` router in the Traefik dashboard. The first visit to a new slug pauses a few seconds for certificate issuance; certs persist in the `noite-data` volume. If passthrough misbehaves, the fallback is `https://<slug>.<domain>:80` per app (exact hostnames use the plain HTTP challenge).
+
+## Railway
+
+One service from the image, one volume, one bucket:
+
+| Service | Image | Volume | Public domain |
+| --- | --- | --- | --- |
+| `noite` | `ghcr.io/ryuzcorp/noite:latest` | `/data` | `*.<domain>` → port `80` |
+| `rustfs` (or use R2/Tigris) | `rustfs/rustfs:1.0.0` | `/data` | none |
+
+`noite` takes the same variables as a Compose install: `BASE_DOMAIN`, `CONTROL_SUBDOMAIN=app`, `BETTER_AUTH_URL=https://app.<domain>` (set before the first registration: passkeys bind to it), `GIT_PUBLIC_BASE=https://git.<domain>`, `BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, the bucket (`S3_ENDPOINT=http://rustfs.railway.internal:9000` and its keys, or your R2/Tigris endpoint), plus `CADDY_AUTO_HTTPS=off` (Railway terminates TLS) and `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=35` so the runner's stop budget fits. For a healthcheck, set `PORT=8080` (Railway probes the port in `PORT`; the runner always listens on 8080 and Caddy on 80, so this changes nothing else), path `/ready`, and `RAILWAY_HEALTHCHECK_TIMEOUT_SEC=600`: a first boot deploys the control bundle and can take minutes.
+
+One wildcard domain is the whole DNS story: add the `*` CNAME, the `_acme-challenge` CNAME and the ownership TXT the dashboard returns for `*.<domain>` on the `noite` service. That covers `app.`, `git.`, `api.` and every `{slug}.` host, because the edge dispatches by Host.
+
+:::warning
+Tenancy: Railway does not grant `NET_ADMIN`, so the egress policy `multi` needs cannot run there. Set `NOITE_TENANCY=single` (otherwise `/ready` stays 503 on the `isolation` gate) and do not invite other people to push code. Railway also wraps the entrypoint, so tini is not PID 1; set `TINI_SUBREAPER=1` so it still reaps orphaned processes.
+:::
+
+The volume holds the runner's SQLite, git mirrors, builds and certificates; the runner also snapshots its SQLite into the bucket, so a lost volume restores from there on the next boot. Back up the bucket (Railway volume backups for a RustFS service, provider versioning for R2/Tigris).

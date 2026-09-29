@@ -1,6 +1,6 @@
 # Marketing site + docs (apps/website, Blume) → GitHub Pages.
 #
-# After the first run: repo Settings → Pages → Custom domain = noite.dev
+# After the first run: repo Settings → Pages → Custom domain = noite.now
 # (plus the DNS A/AAAA records), then re-run to stamp the CNAME.
 name: website
 

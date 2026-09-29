@@ -51,8 +51,8 @@ up:
 	$(COMPOSE_BUILD) up -d --build --force-recreate
 	@echo "open http://localhost:$${HTTP_PORT:-9080}"
 
-# Release deploy (any host): pull the image, never build. Pin NOITE_IMAGE to a
-# SHA tag for reproducibility.
+# Release deploy (any host): pull the image (`:latest` unless NOITE_IMAGE
+# overrides it), never build.
 up-prod:
 	$(COMPOSE) up -d --pull always --force-recreate
 

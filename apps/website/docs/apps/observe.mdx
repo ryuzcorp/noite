@@ -1,0 +1,33 @@
+---
+title: Observe
+description: Logs, metrics with spans, product-analytics events, and idle sleep for one app.
+---
+
+## Logs
+
+The Overview tab tails the running fleet's stdout/stderr over SSE and follows the tail while pinned; scroll up to hold still. The buffer is in memory on the runner and resets on restart — recent activity only, not history. Finished deploys keep their own build logs on the Deployments tab.
+
+## Metrics and spans
+
+The **Metrics** tab covers the last 24 h: 24 hourly bars for requests, errors, latency, and CPU, plus stat tiles. Requests count `celld.fetch` spans; errors, latency, and queue wait come from the same spans; CPU is sampled from the celld process tree.
+
+The spans table (`/spans?hours=1`) shows recent slow or failed requests on demand.
+
+## Events, insights, devices, paths, refs
+
+The **Events** tab is tenant-facing product analytics (LogSnag-style), separate from metrics. The app emits events into named channels; the UI offers channel filter, text search, paging, per-event tags and user properties, and insight widgets over the feed.
+
+Before the first event lands, the tab shows an ingest snippet for that app. Identifying users, devices, paths, and referrers feed the breakdown tables on the Metrics detail view (browsers with OS mix, top paths, top refs).
+
+## Sleep
+
+An app with no requests for a day stops costing anything; the next request wakes it.
+
+- **Asleep is not stopped.** Desired state stays `running`; status reads `sleeping`. A stopped app never sleeps or wakes.
+- **Idle window:** 24 h of no requests by default. A fresh deploy or manual start gets a full window before it can sleep.
+- **Wake is invisible.** The edge holds the request — body included — while the fleet cold-starts, typically a few seconds, then proxies it as if the app had never slept. Concurrent requests wait on the same wake; only a failed wake answers 503.
+- **Deploy wakes.** A push, rollback, or web commit to a sleeping app starts the fleet first.
+
+:::tip
+Custom-domain certificates keep renewing while an app sleeps — TLS checks treat sleeping apps as live.
+:::

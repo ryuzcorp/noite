@@ -1,36 +1,26 @@
 ---
-title: Introduction
+title: Noite
 description: Noite is a tiny self-hostable PaaS for celld — accounts, apps, subdomains, deploy logs.
 ---
 
-# Introduction
+Noite is a tiny self-hostable PaaS for [celld](https://celld.dev/docs/). One image runs accounts (passkeys), apps, `{slug}.{domain}` subdomains, and deploy logs on a single small server.
 
-Noite is a tiny self-hostable PaaS for [celld](https://celld.dev/): user accounts (passkeys), apps, `{slug}.{BASE_DOMAIN}` subdomains, thin deploy/build logs and status. It fits on one small server.
+Two audiences, two tracks. App developers ship against an existing install and never need the operator track.
 
-Noite is **one image**, `ghcr.io/<owner>/noite`. One `docker compose up -d` runs it next to a bundled RustFS store (`docker/compose.yaml`); inside the container the runner supervises everything else:
-
-- **runner**: the Rust deploy pipeline and PID 1. Git smart-HTTP, builds, one celld fleet per app, telemetry aggregation, and the edge's config.
-- **caddy**: the edge. Per-host TLS with on-demand certificates, routing to the UI, the API and tenant apps.
-- **control**: the Oxide control UI, a celld fleet whose worker bundle is baked into the image and deployed on first boot.
-- **tenant fleets**: one celld per app, sandboxed from the platform when other people push code (`NOITE_TENANCY=multi`).
-
-State lives in one S3 bucket (`git/` tip bundles, `fleets/` tenant celld, `control/` the UI worker and its D1, `runner/state/` runner snapshots): the bundled RustFS, or your own S3 with `--scale rustfs=0`.
-
-Get started from a checkout:
-
-```bash
-cp .env.example .env
-make up      # build the image and start the stack
-make logs
-make doctor  # verify the install
-```
-
-| URL                            |                       |
-| ------------------------------ | --------------------- |
-| http://localhost:9080          | control UI (passkeys) |
-| http://api.localhost:9080      | runner API            |
-| `http://{slug}.localhost:9080` | deployed apps         |
-
-Then deploy the sample app: `cd apps/noite/test && ./deploy.sh`.
-
-Real domains, external S3, Coolify, image-only hosts, volumes and backups: [Deployment](/deployment).
+<CardGroup cols={2}>
+  <Card title="Quickstart" href="/quickstart" icon="rocket">
+    Install on a server with one command and push a first app.
+  </Card>
+  <Card title="How it works" href="/how-it-works" icon="diagram">
+    Process tree, ports, bucket layout, and a push traced end to end.
+  </Card>
+  <Card title="Apps" href="/apps" icon="package">
+    Create apps, push code, set env vars and domains, read logs and metrics.
+  </Card>
+  <Card title="Self-hosting" href="/self-hosting" icon="server">
+    Install, storage, tenancy, platforms, backups, and troubleshooting.
+  </Card>
+  <Card title="Reference" href="/reference/api" icon="book-open">
+    API, environment variables, limits, and the CLI.
+  </Card>
+</CardGroup>

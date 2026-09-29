@@ -1,0 +1,103 @@
+---
+title: Environment variables
+description: Every runner env var with its default, effect, and owner.
+---
+
+Defaults below are what `docker/compose.yaml` applies when the var is unset. The runner refuses dev secrets off `localhost`. `CELLD_*` vars are passed through to tenant fleets — see [celld.dev](https://celld.dev) for their semantics, not here.
+
+Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (handed to the control UI worker untouched).
+
+## Domain and edge
+
+| Var | Default | Effect | Owner |
+| --- | --- | --- | --- |
+| `BASE_DOMAIN` | `localhost` | Tenant + control DNS base | runner-owned |
+| `CONTROL_SUBDOMAIN` | _(empty)_ | Empty = control on bare domain; prod sets `app` | runner-owned |
+| `CONTROL_EXTRA_HOSTS` | _(empty)_ | Comma-separated extra control hostnames | runner-owned |
+| `CADDY_AUTO_HTTPS` | unset = on except `localhost` | `off` behind a terminating proxy | runner-owned |
+| `HTTP_PORT` | `9080` | Host HTTP port | runner-owned |
+| `HTTPS_PORT` | `9443` | Host HTTPS port | runner-owned |
+| `GIT_PUBLIC_BASE` | `http://git.localhost:9080` / `https://git.<domain>` | Public Git remote base | runner-owned |
+| `BETTER_AUTH_URL` | `http://localhost:9080` | Control origin; set before first registration (passkeys bind to it) | worker-passthrough |
+| `CADDYFILE_PATH` | `/data/caddy/Caddyfile` | Generated Caddyfile location | runner-owned |
+| `CADDY_ACCESS_LOG` | `/data/caddy/access.log` | JSON access log tailed for device/path/ref stats | runner-owned |
+| `CADDY_ADMIN_URL` | `http://127.0.0.1:2019` | Caddy admin endpoint for `/load` writes | runner-owned |
+| `RUNNER_BIND` | `0.0.0.0:8080` | Runner listen address | runner-owned |
+| `RUNNER_WORK_DIR` | `/data/runner` | Fleet working dirs, mirrors, builds | runner-owned |
+| `RUNNER_POLL_MS` | `5000` | Reconcile tick interval | runner-owned |
+| `CELLD_BIN` | `celld` | Fleet binary path | runner-owned |
+| `CONTROL_BUNDLE_DIR` | `/opt/noite/control/dist` | Baked control UI bundle (fleet #0) | runner-owned |
+| `RUST_LOG` | `noite_runner=info,tower_http=info` | Runner log filter | runner-owned |
+
+## Auth
+
+| Var | Default | Effect | Owner |
+| --- | --- | --- | --- |
+| `RUNNER_TOKEN` | `dev-runner-token` | Bearer token for runner API + UI server calls; refused off-localhost at default | runner-owned |
+| `BETTER_AUTH_SECRET` | `dev-only-change-me-to-a-long-random-string` | Session signing secret; `dev-` values refused on real domains | worker-passthrough |
+| `NOITE_ADMIN_EMAIL` | _(empty)_ | Account promoted to admin at startup | worker-passthrough |
+| `NOITE_EMAIL_WEBHOOK_URL` | _(empty)_ | Receives lost-passkey OTP JSON; unset = log on localhost, refuse on real domains | worker-passthrough |
+| `NOITE_SMTP_FROM` | _(empty)_ | OTP sender label | worker-passthrough |
+
+## Store
+
+| Var | Default | Effect | Owner |
+| --- | --- | --- | --- |
+| `NOITE_S3_BUCKET` | `noite` | Single bucket; `git/`, `fleets/`, `control/` prefixes | runner-owned |
+| `S3_ENDPOINT` | `http://rustfs:9000` | Object-store endpoint | runner-owned |
+| `S3_PUBLIC_ENDPOINT` | `http://127.0.0.1:9000` | Endpoint returned to host-side tools | runner-owned |
+| `AWS_REGION` | `us-east-1` | Store region | runner-owned |
+| `AWS_ACCESS_KEY_ID` | `RUSTFS_ACCESS_KEY` → `noiteaccess` | Store key | runner-owned |
+| `AWS_SECRET_ACCESS_KEY` | `RUSTFS_SECRET_KEY` → 32-char dev default | Store secret | runner-owned |
+| `RUSTFS_ACCESS_KEY` | `noiteaccess` | Bundled RustFS key | runner-owned |
+| `RUSTFS_SECRET_KEY` | 32-char dev default | Bundled RustFS secret | runner-owned |
+| `RUSTFS_API_PORT` | `9000` | Bundled RustFS S3 port (loopback) | runner-owned |
+| `RUSTFS_CONSOLE_PORT` | `9001` | Bundled RustFS console port | runner-owned |
+| `NOITE_DB` | `./data/noite.sqlite` | Runner SQLite path (`sqlite:` prefix optional) | runner-owned |
+
+## Tenancy
+
+| Var | Default | Effect | Owner |
+| --- | --- | --- | --- |
+| `NOITE_TENANCY` | unset = `multi` off localhost, `single` on | `multi` sandboxes builds/fleets as users behind egress policy; `single` = operator pushes only | runner-owned |
+| `RUNNER_BUILD_UID` / `RUNNER_BUILD_GID` | `10010` | Build sandbox user | runner-owned |
+| `RUNNER_FLEET_UID` / `RUNNER_FLEET_GID` | `10020` | Tenant fleet user | runner-owned |
+| `NOITE_FLEET_PORTS` | built-in range | Fleet port range, two ports per app | runner-owned |
+| `NOITE_STOP_BUDGET_MS` | `25000` | Graceful-stop budget (min `5000`); fleets stop inside budget − 3 s | runner-owned |
+| `RUNNER_BUILD_MAX_MB` | `2048` | Refuse builds past this worktree size (MiB) | runner-owned |
+
+## Bounds
+
+| Var | Default | Effect | Owner |
+| --- | --- | --- | --- |
+| `RUNNER_MAX_APPS_PER_USER` | `10` | Per-account app quota, enforced on create | runner-owned |
+| `RUNNER_FLEET_MAX_RSS_MB` | `0` | → `CELLD_MAX_RSS_MB` when non-zero; container-wide shed threshold, not per-app; `0` = celld default (80% of container memory) | worker-passthrough (fleet) |
+| `RUNNER_FLEET_IDLE_EVICT_S` | `120` | → `CELLD_IDLE_EVICT_S`; idle seconds before a fleet hibernates cells | worker-passthrough (fleet) |
+| `RUNNER_FLEET_DEPLOY_POLL_S` | `300` | → `CELLD_DEPLOY_POLL_S`; covers missed `/reload` only | worker-passthrough (fleet) |
+| `RUNNER_FLEET_ASSET_CACHE_MB` | `64` | → `CELLD_ASSET_CACHE_BYTES`; per-fleet on-disk asset cache | worker-passthrough (fleet) |
+| `RUNNER_OTEL_FLUSH_MS` | `30000` | → `CELLD_OTEL_FLUSH_MS`; bucket-flush + ingest tick cadence (min `1000`); dashboards lag ~40 s | worker-passthrough (fleet) |
+| `RUNNER_BUILD_CACHE_MB` | `512` | Per-app persistent bun cache cap; `0` disables | runner-owned |
+| `RUNNER_TELEMETRY_RETENTION_DAYS` | `14` | Days kept in bucket prune, metric tables, glob floor (min `1`) | runner-owned |
+| `RUNNER_TIP_SWEEP_S` | `60` | Fallback S3 tip sweep per app; covers out-of-band bundle writes | runner-owned |
+| `RUNNER_FLEET_LOG` | `error,celld=warn` | Fleet `RUST_LOG` (runner's own filter stays separate) | worker-passthrough (fleet) |
+
+## Sleep
+
+| Var | Default | Effect | Owner |
+| --- | --- | --- | --- |
+| `RUNNER_SLEEP_AFTER_H` | `24` | Park apps idle this long; `0` = never | runner-owned |
+| `RUNNER_SLEEP_SWEEP_S` | `3600` | Sleep sweep cadence | runner-owned |
+| `RUNNER_WAKE_TIMEOUT_S` | `120` | Longest a held request waits for a woken fleet; failed wake answers `503` | runner-owned |
+
+See [Limits](/reference/limits) for the sleep mechanism.
+
+## Telemetry and rate limits
+
+| Var | Default | Effect | Owner |
+| --- | --- | --- | --- |
+| `NOITE_RATE_LIMIT_RPM` | `600` | Worker per-route-class (`auth`/`invite`) limit; `429` + `Retry-After`; `0` disables | worker-passthrough |
+| `NOITE_AUTH_RATE_LIMIT` | `600` | better-auth per-client `/api/auth/*` budget; `0` disables | worker-passthrough |
+
+## Platform-only
+
+Set by the platform, not by operators. Railway: `PORT` (listen port), `RAILWAY_DEPLOYMENT_ID`, `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` (must exceed the stop budget + 5 s). `TINI_SUBREAPER` is set by the image's init. None of these go in `.env`.

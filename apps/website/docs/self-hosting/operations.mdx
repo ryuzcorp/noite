@@ -1,0 +1,63 @@
+---
+title: Operations
+description: Update Noite, back up and restore its volumes, and troubleshoot ready gates and boot failures.
+---
+
+## Updating
+
+Re-run the installer, or pull and recreate by hand:
+
+```bash
+curl -fsSL https://noite.now/install.sh | sudo bash
+# or
+cd /opt/noite && docker compose pull && docker compose up -d
+```
+
+The image is disposable and state lives in the volumes and the bucket, so an update is a pull plus a recreate. The runner stops every fleet in parallel inside its stop budget (`NOITE_STOP_BUDGET_MS`, 25 s; Compose's `stop_grace_period` is 35 s), then Caddy, then writes a final state snapshot. A new image restarts every tenant fleet with it (cold boots), so batch upgrades.
+
+Stop-budget tuning lives in [Environment variables](/reference/environment-variables).
+
+## Backups
+
+A consistent backup snapshots the runner database, stops the stack, tars both volumes and starts again. Downtime is the tar time.
+
+```bash
+cd /opt/noite
+STAMP=$(date -u +%Y%m%dT%H%M%SZ) && mkdir -p "backups/$STAMP"
+docker compose exec -T noite sh -c \
+  'curl -fsS -X POST -H "Authorization: Bearer $RUNNER_TOKEN" http://127.0.0.1:8080/v1/admin/snapshot'
+docker compose stop
+for vol in noite-data rustfs-data; do
+  docker run --rm --entrypoint tar -v "noite_$vol:/vol:ro" -v "$PWD/backups/$STAMP:/out" \
+    ghcr.io/ryuzcorp/noite:latest -cf "/out/$vol.tar" -C /vol .
+done
+docker compose up -d
+```
+
+With your own bucket, turn on versioning at the provider instead; `rustfs-data` then does not exist and only `noite-data` needs the tar.
+
+## Restore
+
+:::danger
+Restoring replaces the live volumes: everything written since that backup is gone.
+:::
+
+```bash
+cd /opt/noite
+docker compose down
+for vol in noite-data rustfs-data; do
+  docker volume rm -f "noite_$vol" && docker volume create "noite_$vol"
+  docker run --rm --entrypoint tar -v "noite_$vol:/vol" -v "$PWD/backups/<stamp>:/in:ro" \
+    ghcr.io/ryuzcorp/noite:latest -xf "/in/$vol.tar" -C /vol
+done
+docker compose up -d
+```
+
+Compose warns that the volumes were not created by it; that is expected. Verify with `docker compose exec noite curl -s http://127.0.0.1:8080/ready`, then open an app.
+
+## Troubleshooting
+
+- **`/ready` answers 503**: its body names the failing gate (`reconcile`, `bucket`, `isolation`, `control`, `caddy`). A fresh install waits for the control bundle's first deploy into `s3://<bucket>/control` (seconds; revision-gated, so a restart with the same bundle and vars skips it).
+- **`isolation: …` in multi**: the container lacks a capability or `nft`. Grant `NET_ADMIN`, `SETUID`, `SETGID` and `CHOWN`, or run `NOITE_TENANCY=single`.
+- **Boot stops with `runner state restore failed`**: the volume is empty and the bucket did not answer. The runner refuses to start with an empty database (it would overwrite the good snapshot); fix the store and it retries on restart.
+- **A deploy fails with `celld deploy does not support these config keys`**: a Wrangler key celld does not accept. Noite strips its own `release` key before deploying; anything else must go.

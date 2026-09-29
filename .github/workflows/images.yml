@@ -5,8 +5,8 @@
 #
 # Installs never build in prod: they pull this tag (NOITE_IMAGE) and
 # `docker compose up -d`. A new image restarts the runner and with it every
-# tenant fleet (they cold-boot), so pin a SHA tag for reproducibility
-# (`latest` follows main).
+# tenant fleet (they cold-boot). Every install flow tracks `latest`
+# (follows main); a short-SHA tag holds back or rolls back one install.
 #
 # Tags: `latest` + short SHA on main; version tags (v*) also push the version
 # + `stable`.

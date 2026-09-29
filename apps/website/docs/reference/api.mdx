@@ -1,0 +1,137 @@
+---
+title: API
+description: Runner HTTP API reference — auth, per-resource routes, statuses, and the JSON-RPC mirror.
+---
+
+Base: the runner listens on `127.0.0.1:8080` in-container; Caddy serves it at `api.<domain>`. All routes below are prefixed with that host unless noted.
+
+## Auth
+
+| Credential | Sent as | Used for |
+| --- | --- | --- |
+| `RUNNER_TOKEN` | `Authorization: Bearer <token>` (or `x-runner-token` / `x-host-token` / `x-agent-token` fallback) | Runner API, control UI server calls |
+| Profile API key | Git Basic `git:<key>` | `git push` / `git fetch` on smart-HTTP remotes |
+| Collaborator role | Assigned per app | `view` = fetch only, `push` = create + fast-forward, `admin` = anything |
+
+```bash
+curl -H "Authorization: Bearer $RUNNER_TOKEN" https://api.<domain>/v1/apps
+```
+
+The control UI uses the bearer token server-side; browsers never see it. Git smart-HTTP verifies the API key via the UI's `/internal/git-auth` and enforces the collaborator role per slug. Unknown slugs 404 at auth.
+
+Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
+
+`/v1/edge/*` is internal edge plumbing (fallback page, TLS ask gate, wake hop) — public and credential-less by design; not a client API.
+
+## Apps
+
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` / `POST` | `/v1/apps` | List; create (quota-checked, see [Limits](/reference/limits)) |
+| `GET` / `PATCH` / `DELETE` | `/v1/apps/{id}` | `PATCH` sets `desired_state: running\|stopped` |
+| `POST` | `/v1/apps/{id}/rename` | Renames the app; rotates scoped credentials once a provider exists (none today — see [Tenancy](/self-hosting/tenancy)) |
+| `POST` | `/v1/apps/{id}/sleep` | Parks the app; next request wakes it |
+
+## Deploys
+
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` | `/v1/apps/{id}/deploys` | Deploy history |
+| `GET` | `/v1/apps/{id}/deploys/stream` | SSE stream of deploys |
+| `GET` | `/v1/apps/{id}/deploys/{deploy_id}/log` | Build/deploy log |
+| `POST` | `/v1/apps/{id}/rollback` | Redeploys a previous deploy; wakes asleep apps first |
+| `POST` | `/v1/apps/{id}/git-remote` | Remote URL info for the app's repo |
+
+## Env
+
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` / `POST` | `/v1/apps/{id}/env` | List; set (triggers redeploy flow) |
+| `DELETE` | `/v1/apps/{id}/env/{name}` | Removes one var |
+
+## Domains
+
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` / `POST` | `/v1/apps/{id}/domains` | List; attach a custom hostname |
+| `DELETE` | `/v1/apps/{id}/domains/{hostname}` | Detaches the hostname |
+
+## Source
+
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` | `/v1/apps/{id}/tree` | File tree at tip |
+| `GET` | `/v1/apps/{id}/blob/{*path}` | File contents |
+| `GET` | `/v1/apps/{id}/diff` | Working diff |
+| `POST` | `/v1/apps/{id}/source/commit` | Browser-edit commit (validated paths + message + author email); wakes asleep apps |
+
+## Storage
+
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` | `/v1/apps/{id}/storage` | Storage overview |
+| `GET` | `/v1/apps/{id}/storage/d1/{database_id}` | Query a D1 database |
+| `POST` | `/v1/apps/{id}/storage/d1/{database_id}/write` | Execute a D1 write |
+| `GET` | `/v1/apps/{id}/storage/do/{class_name}` | Durable Object contents |
+| `GET` | `/v1/apps/{id}/storage/r2/{bucket}` | List bucket keys |
+| `GET` / `DELETE` | `/v1/apps/{id}/storage/r2/{bucket}/object` | Read / delete one object |
+| `GET` | `/v1/apps/{id}/storage/r2/{bucket}/raw` | Raw object bytes |
+
+## Metrics and telemetry
+
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` | `/v1/apps/{id}/metrics?hours=24` | Minute buckets (14-day prune) |
+| `GET` | `/v1/apps/{id}/metrics/version` | Schema/watermark version |
+| `GET` | `/v1/apps/{id}/devices` | Device breakdown (tailed from Caddy access log) |
+| `GET` | `/v1/apps/{id}/paths` | Path breakdown |
+| `GET` | `/v1/apps/{id}/refs` | Referrer breakdown |
+| `GET` | `/v1/apps/{id}/spans?hours=1` | On-demand spans |
+| `GET` | `/v1/apps/{id}/logs` | App logs |
+| `GET` | `/v1/apps/{id}/logs/stream` | SSE log stream |
+
+## Events
+
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` / `POST` | `/v1/apps/{id}/events` | List; log an event |
+| `GET` | `/v1/apps/{id}/events/stream` | SSE event stream |
+| `GET` | `/v1/apps/{id}/events/channels` | Known channels |
+| `POST` | `/v1/apps/{id}/identify` | Identify a user |
+| `GET` | `/v1/apps/{id}/users/{user_id}/props` | Stored user props |
+| `GET` / `POST` | `/v1/apps/{id}/insights` | List; set an insight |
+
+## Admin
+
+| Method | Route                | Notes                                   |
+| ------ | -------------------- | --------------------------------------- |
+| `GET`  | `/v1/admin/stats`    | Fleet-wide stats                        |
+| `POST` | `/v1/admin/snapshot` | Writes the state snapshot to the bucket |
+
+## Git smart-HTTP
+
+Stock Git protocol; no `git-remote-s3` on clients. Push to `main` to deploy.
+
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` | `/v1/git/{slug}/info/refs` | Advertisement (`view` suffices) |
+| `POST` | `/v1/git/{slug}/git-upload-pack` | Fetch (`view` suffices) |
+| `POST` | `/v1/git/{slug}/git-receive-pack` | Push (`push` = create + fast-forward; `admin` = anything) |
+
+```bash
+git remote add noite https://git:<key>@git.<domain>/<slug>
+git push noite main
+```
+
+## RPC mirror
+
+`POST /rpc` is a JSON-RPC mirror of the REST routes (same auth, same effects). Prefer REST; use `/rpc` only where batching calls matters.
+
+## Statuses
+
+| Code  | Meaning                                                 |
+| ----- | ------------------------------------------------------- |
+| `401` | Missing or wrong bearer token / API key                 |
+| `404` | Unknown app, slug, deploy, or key                       |
+| `409` | Domain already taken; conflicting sleep/wake transition |
+| `503` | Fleet shedding load (+ `Retry-After`) or failed wake    |

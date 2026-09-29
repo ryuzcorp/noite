@@ -1,0 +1,37 @@
+---
+title: Self-hosting
+description: Run Noite on your own server with Docker Compose — install, storage, tenancy, platforms, and operations.
+---
+
+Noite ships as one image, `ghcr.io/ryuzcorp/noite`. Its runner is PID 1 and supervises everything else in the container: Caddy (the edge), the control UI (a celld node, fleet #0, bundle baked into the image), and one celld fleet per tenant app. `compose.yaml` runs it next to the bundled RustFS store; there is no host-side build or deploy step.
+
+On a fresh Ubuntu or Debian server the whole install is one command:
+
+```bash
+curl -fsSL https://noite.now/install.sh | sudo bash
+```
+
+The same `compose.yaml` also boots as-is on any Docker host, a cloud VM or a Compose store/panel (Arcane, Portainer, Dockge, …), and from Coolify or Railway.
+
+Per-app concerns — creating apps, pushing code, env vars, custom domains, logs, metrics — live in [Apps](/apps). This track covers the install itself.
+
+<CardGroup cols={2}>
+  <Card title="Install" href="/self-hosting/install" icon="download">
+    One-command installer, manual Compose install, your own bucket, verify.
+  </Card>
+  <Card title="Storage" href="/self-hosting/storage" icon="database">
+    Qualified stores, volumes, snapshots, telemetry pipeline.
+  </Card>
+  <Card title="Tenancy" href="/self-hosting/tenancy" icon="lock">
+    Multi vs single tenant isolation and the e2e-isolation proof.
+  </Card>
+  <Card title="Platforms" href="/self-hosting/platforms" icon="cloud">
+    Coolify and Railway layouts, env, downtime model.
+  </Card>
+  <Card title="Operations" href="/self-hosting/operations" icon="wrench">
+    Updating, backups, restore, troubleshooting.
+  </Card>
+  <Card title="Accounts" href="/self-hosting/accounts" icon="users">
+    Invite-only registration, codes, admin panels.
+  </Card>
+</CardGroup>

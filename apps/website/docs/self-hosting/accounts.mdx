@@ -1,0 +1,14 @@
+---
+title: Accounts
+description: Invite-only registration on a Noite install — bootstrap admin, single-use codes, and admin panels.
+---
+
+Registration is invite-only once the instance is bootstrapped. The **first** account to sign up needs no code and is promoted to the `admin` role, so god-mode works without `NOITE_ADMIN_EMAIL`; every later registration must present a single-use invitation code. Each new account receives `INVITES_PER_USER = 2` codes of its own, so an invitee can pass one on without admin rights.
+
+Codes are 12 characters in four-char groups (`ABCD-EFGH-JKLM`) drawn from an unambiguous alphabet, and a code that is used, revoked or unknown is refused with a specific message before any account is created. Redemption is a single atomic claim (`UPDATE ... WHERE usedBy IS NULL`), so one code admits exactly one account even under concurrent signups.
+
+- Members read their unused codes in the "Invitations" card on `/account`.
+- Admins mint 1–50 more and revoke unused ones from the Invitations panel in `/god-mode`.
+- The signup form shows the code field only when `GET /api/invite/status` reports the instance is past its first account, so the bootstrap account never sees it.
+
+`NOITE_ADMIN_EMAIL` promotes the matching account to the admin role at startup; it is documented in [Environment variables](/reference/environment-variables).

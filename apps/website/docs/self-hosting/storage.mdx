@@ -1,0 +1,39 @@
+---
+title: Storage
+description: Object-store backends, volumes, snapshots, and the telemetry pipeline behind a Noite install.
+---
+
+## Backend
+
+celld qualifies Amazon S3, Cloudflare R2, Google Cloud Storage, Tigris, and Azure Blob Storage; the store must provide conditional writes, read-after-write consistency, and ranged reads. celld runs a storage-contract check at node startup — a contract violation stops startup, an ambiguous transport error warns — so a store that fails the contract stops loudly instead of corrupting state later. MinIO community edition passes celld's storage test but is not qualified for production.
+
+:::warning
+Noite's bundled default is RustFS, which is **not** on celld's qualified list. celld's own startup check still runs and passes on it, and every node boots normally, but for production the recommended path is your own bucket on a qualified store. Bundled RustFS stays the zero-config default for trying Noite out and for single-host installs.
+:::
+
+Store connection variables (`S3_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `NOITE_S3_BUCKET`) are documented in [Environment variables](/reference/environment-variables).
+
+## Volumes
+
+| Volume | Holds |
+| --- | --- |
+| `noite-data` | runner SQLite (apps, deploys, env, domains, metrics), git mirrors, builds, fleet working dirs, Caddy config and certificates |
+| `rustfs-data` | the bundled bucket: `git/` tip bundles, `fleets/` tenant celld, `control/` UI worker + its D1 (accounts, invites), `runner/state/` runner snapshots |
+
+Bucket prefixes under the single `NOITE_S3_BUCKET`: `git/` (tip bundles), `fleets/` (tenant celld), `control/` (UI worker + its D1), `runner/state/` (runner snapshots).
+
+## Snapshots
+
+The runner snapshots its SQLite into the bucket about once a minute after changes (and on every graceful stop), and restores it on boot when the volume has none, so the bucket alone is enough to rebuild an install: mirrors rehydrate from the tip bundles and fleets from their prefixes. `docker compose down` keeps volumes; `docker compose down -v` deletes them. With your own bucket, delete its objects at the provider.
+
+The loss window on an ungraceful crash is about 70 s of API mutations. A `claim()` writes `runner/state/owner.json` at boot and every upload re-checks it first, so a replaced runner stops uploading instead of overwriting its successor — a fence rather than a conditional write, because not every S3 store supports those. Boot with an empty volume downloads the snapshot before connecting; any error other than not-found retries and then fails the boot, because an empty database would overwrite the good snapshot.
+
+## Telemetry
+
+Tenant fleets run `CELLD_OTEL=1` with celld's bucket sink: Parquet under `telemetry/traces/` and `telemetry/logs/` in the fleet bucket, no collector service. The flush is `CELLD_OTEL_FLUSH_MS=5000` and retention is `CELLD_OTEL_RETENTION=14d`, matching the runner's `app_metric` prune.
+
+A short flush requires a compaction job — queries grow slow within hours otherwise, and celld does not compact its own files. The runner runs it hourly via `metrics::compact_fleet`: for the hour that just ended, per node directory, one DuckDB `COPY (...) TO .../compacted.parquet (FORMAT parquet, COMPRESSION zstd)` ordered by `start_unix_us`, then the source files are deleted. Deletion happens only after `head-object` proves the compacted file exists, so a failed copy can never lose spans; `union_by_name=true` merges an hour that spans a schema change (the docs call the schema `v0-unstable`). The current hour is never compacted.
+
+Runner queries are day-scoped: the aggregation window stops 10 s behind the flush and names only the day directories it spans, instead of globbing the whole retention.
+
+To read the same data yourself, point DuckDB at the fleet bucket the way the runner does (the `SET s3_endpoint/s3_region/s3_access_key_id/s3_secret_access_key/s3_url_style='path'` preamble in `apps/runner/src/host/metrics.rs`) and aggregate the hourly Parquet under `s3://<bucket>/fleets/<slug>/telemetry/traces/<node>/<yyyy>/<mm>/<dd>/<hh>/*.parquet`; `celld.fetch` spans count as requests, `ok` is the error flag, `duration_us`/`queue_wait_us` the latency and queue wait.

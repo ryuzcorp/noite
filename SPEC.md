@@ -206,7 +206,7 @@ Operator guide: `apps/website/docs/deployment.mdx`.
 - **Dev:** `docker/dev.sh` runs the runner under cargo-watch and `vite dev` on `127.0.0.1:8090`. `celld dev` cannot serve the UI (raw esbuild cannot resolve Oxide's `virtual:oxide/worker`), the one deliberate divergence from celld's documented dev flow.
 - **E2E:** `make e2e` builds the image (or `TAG=<sha>` pulls it), boots it as project `noite-e2e` with its own bucket and ports (UI :8090 through Caddy, API :8080, tenants 20000+, rustfs :19000), resets containers and volumes by label and name (podman-compose's `down -v` aborts on the first missing container), runs doctor and Playwright. `make e2e-isolation` = the same in `multi` plus the hostile suite. `E2E_KEEP=1` leaves the stack up.
 - **Backup:** `make backup` snapshots the runner, stops the stack, tars `noite-data` and `rustfs-data` with a `MANIFEST`, starts again. `make restore FROM=…` is destructive. With your own bucket, use provider versioning.
-- **Updates** restart the runner and every fleet with it (cold boots). Pin `NOITE_IMAGE` to a SHA tag and batch upgrades.
+- **Updates** restart the runner and every fleet with it (cold boots). Every install flow pulls `:latest` (`stable` is not an install target); batch upgrades, and set `NOITE_IMAGE` to a short-SHA tag only to hold back or roll back.
 
 ## Deploy pipeline and Git
 
