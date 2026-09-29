@@ -3,11 +3,10 @@ import {
   AdminInvitesPanel,
   AdminUsersPanel,
 } from "$lib/admin-panel";
-import { adminOverview } from "$lib/admin.server";
 import { SessionSplash } from "$lib/authed";
-import { sleep } from "$lib/sleep";
-import { head, navigate, useRoute } from "@ilha/router";
-import { atom, watch } from "ilha";
+import { adminStatus } from "$lib/resources";
+import { head, navigate, searchParam } from "@ilha/router";
+import { watch } from "ilha";
 
 const TABS = [
   { id: "users", label: "Users" },
@@ -17,77 +16,56 @@ const TABS = [
 
 type TabId = (typeof TABS)[number]["id"];
 
+/** Parse `?t=`: unknown tabs fall back to users. */
+const toTabId = (raw: string): TabId =>
+  TABS.find((tab) => tab.id === raw)?.id ?? "users";
+
 /** Instance administration — admin role or NOITE_ADMIN_EMAIL only.
  * Everyone else bounces to /apps (server actions enforce the same gate).
- * Retries the check briefly: first paint can race the session cookie.
  *
  * Same tab mechanism as the app detail page: the active tab lives in ?t= so a
  * refresh (or a shared link) restores it, and each tab fetches only its own
  * list. */
 export default function GodMode() {
   head({ title: "God Mode · Noite" });
-  const route = useRoute();
-  const ready = atom(false);
-  const email = atom("");
+  const tab = searchParam<TabId>("t", { default: "users", parse: toTabId });
+  const status = adminStatus();
 
-  const activeTab = (): TabId => {
-    const t = new URLSearchParams(route.search()).get("t");
-    return TABS.find((tab) => tab.id === t)?.id ?? "users";
-  };
-  const selectTab = (tab: TabId) => {
-    navigate(`${route.path()}?t=${tab}`, { replace: true });
-  };
-
-  watch.once(() => {
-    void (async () => {
-      try {
-        for (let i = 0; i < 10; i += 1) {
-          try {
-            // oxlint-disable-next-line eslint/no-await-in-loop -- sequential readiness poll; Promise.all would defeat the early-exit
-            const overview = await adminOverview();
-            if (overview.isAdmin) {
-              email.set(overview.email);
-              ready.set(true);
-              return;
-            }
-          } catch {
-            // A throw here is a broken check, not a denial — retry once
-            // more before giving up below.
-          }
-          // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll backoff
-          await sleep(100);
-        }
-        navigate("/apps");
-      } catch {
-        navigate("/apps");
-      }
-    })();
+  const overview = status.data();
+  // Bounce non-admins once the check resolves; a failed check reads as
+  // non-admin (server actions enforce the same gate).
+  watch(status.data, () => {
+    if (!status.loading() && !status.data()?.isAdmin) {
+      navigate("/apps");
+    }
   });
-
-  if (!ready()) {
+  // Skeleton only while cold: a cached admin check paints the panels at
+  // once and revalidates in the background (the watch above bounces if the
+  // fresh answer says otherwise).
+  if (overview === undefined || !overview.isAdmin) {
     return <SessionSplash />;
   }
   return (
     <div class="mx-auto mt-4 flex w-full max-w-5xl flex-col gap-4 px-4 pb-12">
       <div role="tablist" class="tabs tabs-border w-fit">
-        {TABS.map((tab) => (
+        {TABS.map((t) => (
           <button
             type="button"
             role="tab"
-            aria-selected={activeTab() === tab.id ? "true" : "false"}
-            class={`tab ${activeTab() === tab.id ? "tab-active" : ""}`}
+            aria-selected={tab() === t.id ? "true" : "false"}
+            class={`tab ${tab() === t.id ? "tab-active" : ""}`}
             onclick={() => {
-              selectTab(tab.id);
+              tab.set(t.id);
             }}
           >
-            {tab.label}
+            {t.label}
           </button>
         ))}
       </div>
 
-      {activeTab() === "users" ? <AdminUsersPanel email={email()} /> : null}
-      {activeTab() === "apps" ? <AdminAppsPanel /> : null}
-      {activeTab() === "invites" ? <AdminInvitesPanel /> : null}
+      {tab() === "users" ? <AdminUsersPanel email={overview.email} /> : null}
+      {tab() === "apps" ? <AdminAppsPanel /> : null}
+      {tab() === "invites" ? <AdminInvitesPanel /> : null}
     </div>
   );
 }

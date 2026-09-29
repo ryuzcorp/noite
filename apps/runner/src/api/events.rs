@@ -316,6 +316,7 @@ pub async fn list_events_stream(
     let pool = state.pool.clone();
     let app_id = app.id.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, anyhow::Error>>(16);
+    crate::host::stats::sse_enter("events");
     tokio::spawn(async move {
         let mut last: Option<String> = None;
         loop {
@@ -337,8 +338,15 @@ pub async fn list_events_stream(
                     last = Some(data);
                 }
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Stop promptly when the client leaves (T1.2): the send-failure
+            // check above only fires on change, so an idle feed would poll
+            // SQLite every 2 s forever after disconnect.
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(2)) => {}
+                () = tx.closed() => break,
+            }
         }
+        crate::host::stats::sse_exit("events");
     });
     Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::default())

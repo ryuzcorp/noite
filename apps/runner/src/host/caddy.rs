@@ -205,11 +205,13 @@ pub async fn rewrite_caddy(
             // No header_up lines: Caddy's reverse_proxy already forwards Host
             // and sets X-Forwarded-For/Proto/Host by default (it warns on
             // explicit duplicates, and site-level ones fail the whole adapt).
+            let extra = tenant_site_extra(cfg, app);
+            let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
             push_site(
                 &addr_of(&format!("{}.{}", app.slug, base)),
                 edge_tls,
-                TENANT_STARTING,
-                TENANT_PROXY,
+                &extra,
+                tenant_proxy(app),
                 &upstream,
             );
         }
@@ -230,11 +232,13 @@ pub async fn rewrite_caddy(
             continue;
         }
         let upstream = format!("{}:{}", cfg.caddy_upstream_host, port);
+        let extra = tenant_site_extra(cfg, app);
+        let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
         push_site(
             &addr_of(&domain.hostname),
             edge_tls,
-            TENANT_STARTING,
-            TENANT_PROXY,
+            &extra,
+            tenant_proxy(app),
             &upstream,
         );
     }
@@ -319,6 +323,44 @@ const TENANT_STARTING: &[&str] = &[
     "}",
 ];
 
+/// Proxy options for an asleep app's sites: no active health checks. While
+/// the fleet is parked the checker marks it down, and a held request that
+/// `forward_auth` releases would meet that stale "unhealthy" state (then the
+/// starting page) — measured on the dev stack. The wake hop already waited
+/// for celld's health route to answer 200, so the fleet is ready by
+/// construction; `lb_try_*` still retries a transient dial failure.
+const TENANT_PROXY_WAKE: &[&str] = &["lb_try_duration 20s", "lb_try_interval 250ms"];
+
+fn tenant_proxy(app: &App) -> &'static [&'static str] {
+    if app.is_asleep() {
+        TENANT_PROXY_WAKE
+    } else {
+        TENANT_PROXY
+    }
+}
+
+/// Site-level lines for a tenant or custom-domain site. An asleep app
+/// (SPEC, Scale to zero) keeps its route but gains a `forward_auth` hop:
+/// Caddy holds the original request (body included) while the runner's
+/// `/v1/edge/wake` spawns the fleet and waits for its health gate, then
+/// proxies it as if the app had never slept. The header timeout sits above
+/// the runner's own wake budget, so Caddy never gives up first.
+fn tenant_site_extra(cfg: &Config, app: &App) -> Vec<String> {
+    let mut lines: Vec<String> = TENANT_STARTING.iter().map(|l| (*l).to_string()).collect();
+    if app.is_asleep() {
+        lines.push(format!("forward_auth {} {{", cfg.caddy_api_upstream));
+        lines.push("\turi /v1/edge/wake".into());
+        lines.push("\ttransport http {".into());
+        lines.push(format!(
+            "\t\tresponse_header_timeout {}s",
+            cfg.wake_timeout_s.max(1) + 15
+        ));
+        lines.push("\t}".into());
+        lines.push("}".into());
+    }
+    lines
+}
+
 static CADDY_ADMIN_OK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 static CADDY_ADMIN_ERR: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
@@ -402,6 +444,7 @@ mod tests {
             fleet_port_min: 20000,
             fleet_port_max: 29999,
             poll_ms: 5000,
+            tip_sweep_s: 60,
             caddy_upstream_host: "127.0.0.1".into(),
             auto_https,
             caddy_control_upstream: "127.0.0.1:8090".into(),
@@ -413,9 +456,17 @@ mod tests {
             max_apps_per_user: 10,
             fleet_max_rss_mb: 0,
             fleet_idle_evict_s: 300,
+            fleet_deploy_poll_s: 300,
+            sleep_after_h: 24,
+            sleep_sweep_s: 3600,
+            wake_timeout_s: 120,
+            fleet_asset_cache_mb: 64,
             tenancy: crate::config::Tenancy::Single,
             stop_budget_ms: 25000,
             build_max_mb: 2048,
+            build_cache_mb: 512,
+            telemetry_retention_days: 14,
+            otel_flush_ms: 30_000,
             build_uid: None,
             build_gid: None,
             fleet_uid: None,
@@ -442,6 +493,8 @@ mod tests {
             desired_state: "running".into(),
             created_at: "2026-09-15T00:00:00Z".into(),
             updated_at: "2026-09-15T00:00:00Z".into(),
+            asleep_since: None,
+            woke_at: None,
         }
     }
 
@@ -489,6 +542,32 @@ mod tests {
         for addr in ["app.noite.now", "api.noite.now", "git.noite.now"] {
             assert!(!site(addr).contains("health_uri"), "{addr} must not be gated");
         }
+    }
+
+    #[tokio::test]
+    async fn asleep_apps_wake_on_request_instead_of_falling_back() {
+        let cfg = test_config("localhost", "", false, "/tmp/noite-caddy-sleep-test");
+        let mut asleep = test_app();
+        asleep.asleep_since = Some("2026-09-28T00:00:00Z".into());
+        asleep.status = "sleeping".into();
+        let out = rendered(&cfg, &[asleep.clone()]).await;
+        // Still routed to its own port (the held request is proxied there
+        // after the wake), with the wake hop in front of the proxy.
+        assert!(out.contains("reverse_proxy 127.0.0.1:"), "asleep app lost its route:\n{out}");
+        assert!(out.contains("forward_auth"), "asleep app has no wake hop:\n{out}");
+        assert!(out.contains("uri /v1/edge/wake"), "{out}");
+        assert!(out.contains("response_header_timeout 135s"), "wake timeout not above the runner budget:\n{out}");
+        // No active health checks on the wake route: their stale "down"
+        // state would turn the released request into the starting page.
+        assert!(!out.contains("health_uri"), "asleep route still health-checks:\n{out}");
+        // Awake apps pay no wake hop.
+        let awake = rendered(&cfg, &[test_app()]).await;
+        assert!(!awake.contains("forward_auth"), "awake app got a wake hop:\n{awake}");
+        // A stopped app is parked by its owner: no route, no wake.
+        let mut stopped = asleep;
+        stopped.desired_state = "stopped".into();
+        let parked = rendered(&cfg, &[stopped]).await;
+        assert!(!parked.contains("forward_auth"), "stopped app must not wake:\n{parked}");
     }
 
     #[tokio::test]

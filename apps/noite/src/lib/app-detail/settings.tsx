@@ -1,17 +1,13 @@
 //! Settings tab: identity form, collaborators, danger zone.
 import { navigate, useRoute } from "@ilha/router";
-import { atom, watch } from "ilha";
+import { atom } from "ilha";
 
 import { appHost } from "../apps";
 import {
   addDomain,
   deleteEnv,
   envDotVars,
-  get,
   inviteCollaborator,
-  listCollaborators,
-  listDomains,
-  listEnv,
   remove,
   removeCollaborator,
   removeDomain,
@@ -19,21 +15,20 @@ import {
   setEnv,
   updateCollaboratorRole,
 } from "../apps.server";
+import { Dialog } from "../dialog";
+import { LoadError } from "../load-error";
+import {
+  appDetail,
+  collaborators,
+  domains,
+  envVars,
+  invalidate,
+  keys,
+} from "../resources";
 import { parseAppRole } from "../roles";
 import type { AppRole } from "../roles";
-import type { RunnerDomain, RunnerEnv } from "../runner";
-import { fetchSession } from "../session";
+import type { RunnerEnv } from "../runner";
 import { ListSkeleton, SectionSkeleton } from "../skeletons";
-import { readSwrCache, writeSwrCache } from "../swr-cache";
-import type { AppDetailInfo } from "./panel";
-
-interface CollaboratorRow {
-  createdAt: string;
-  email: string;
-  name: string;
-  role: AppRole;
-  userId: string;
-}
 
 const CollaboratorsPanel = ({
   appId,
@@ -42,49 +37,34 @@ const CollaboratorsPanel = ({
   appId: string;
   myRole: AppRole;
 }) => {
-  const seedCollabs = readSwrCache<CollaboratorRow[]>(
-    `app:${appId}:collaborators`
-  );
-  const rows = atom<CollaboratorRow[]>(seedCollabs ?? []);
+  const res = collaborators(appId);
+  const rows = res.data() ?? [];
   const dialogOpen = atom(false);
   const err = atom("");
   const busy = atom(false);
-  const loaded = atom(seedCollabs !== null);
+  const inviteEmail = atom("");
+  const inviteRole = atom("view");
   const isAdmin = myRole === "admin";
 
   const reload = async () => {
     try {
-      const fresh = await listCollaborators(appId);
-      rows.set(fresh);
-      writeSwrCache(`app:${appId}:collaborators`, fresh);
+      await res.refetch();
       err.set("");
     } catch (error) {
       err.set(error instanceof Error ? error.message : String(error));
     }
-    loaded.set(true);
   };
-
-  watch.once(() => {
-    void reload();
-  });
 
   const invite = async () => {
     if (!isAdmin || busy()) {
       return;
     }
-    // Read the form from the DOM: inputs are uncontrolled so typing
-    // never re-renders (and blurs) the fields.
-    const input = document.querySelector("#invite-email");
-    const address = input instanceof HTMLInputElement ? input.value.trim() : "";
+    const address = inviteEmail().trim();
     if (!address) {
       err.set("Email is required");
       return;
     }
-    const roleInput = document.querySelector("#invite-role");
-    const next =
-      roleInput instanceof HTMLSelectElement
-        ? parseAppRole(roleInput.value)
-        : null;
+    const next = parseAppRole(inviteRole());
     busy.set(true);
     try {
       await inviteCollaborator({
@@ -92,9 +72,7 @@ const CollaboratorsPanel = ({
         email: address,
         role: next ?? "view",
       });
-      if (input instanceof HTMLInputElement) {
-        input.value = "";
-      }
+      inviteEmail.set("");
       err.set("");
       dialogOpen.set(false);
       await reload();
@@ -128,11 +106,12 @@ const CollaboratorsPanel = ({
           code, write data · <code>admin</code> members, variables, delete.
         </p>
         {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
-        {!loaded() && rows().length === 0 && !err() ? (
+        {err() ? null : <LoadError error={res.error()} />}
+        {res.loading() && res.data() === undefined ? (
           <ListSkeleton rows={2} />
         ) : null}
         <ul class="m-0 flex list-none flex-col gap-1 p-0 text-sm">
-          {rows().map((c) => (
+          {rows.map((c) => (
             <li
               key={c.userId}
               class="border-base-300 flex flex-wrap items-center gap-2 border-b py-1 last:border-0"
@@ -145,8 +124,7 @@ const CollaboratorsPanel = ({
                 <select
                   class="select select-sm w-24"
                   onchange={async (e) => {
-                    // SAFETY: ilha onchange currentTarget is the <select> that fired.
-                    const raw = (e.currentTarget as HTMLSelectElement).value;
+                    const raw = e.currentTarget.value;
                     const next = parseAppRole(raw);
                     if (!next) {
                       return;
@@ -200,7 +178,7 @@ const CollaboratorsPanel = ({
             </li>
           ))}
         </ul>
-        <div class={`modal ${dialogOpen() ? "modal-open" : ""}`}>
+        <Dialog open={dialogOpen} class="modal">
           <div class="modal-box bg-base-100 dark:bg-base-200">
             <h3 class="m-0 text-lg font-bold">Invite collaborator</h3>
             <p class="m-0 py-2 text-sm opacity-80">
@@ -218,6 +196,10 @@ const CollaboratorsPanel = ({
                   class="input input-sm validator"
                   type="email"
                   placeholder="user@example.com"
+                  value={inviteEmail()}
+                  oninput={(e) => {
+                    inviteEmail.set(e.currentTarget.value);
+                  }}
                 />
                 <p class="validator-hint hidden">Enter a valid email address</p>
               </fieldset>
@@ -225,7 +207,14 @@ const CollaboratorsPanel = ({
                 <label class="label" for="invite-role">
                   Role
                 </label>
-                <select id="invite-role" class="select select-sm">
+                <select
+                  id="invite-role"
+                  class="select select-sm"
+                  value={inviteRole()}
+                  onchange={(e) => {
+                    inviteRole.set(e.currentTarget.value);
+                  }}
+                >
                   <option value="view">view</option>
                   <option value="push">push</option>
                   <option value="admin">admin</option>
@@ -254,27 +243,14 @@ const CollaboratorsPanel = ({
             </div>
           </div>
           <form method="dialog" class="modal-backdrop">
-            <button
-              aria-label="Close dialog"
-              disabled={busy()}
-              onclick={() => dialogOpen.set(false)}
-            >
+            <button aria-label="Close dialog" disabled={busy()}>
               close
             </button>
           </form>
-        </div>
+        </Dialog>
       </div>
     </section>
   );
-};
-
-/** Sync the slug modal's live URL preview without reactive state, so typing
- * never re-renders (and blurs) the input. */
-const setSlugPreview = (value: string) => {
-  const preview = document.querySelector("#slug-preview");
-  if (preview) {
-    preview.textContent = appHost(`${value || "…"}.localhost`);
-  }
 };
 
 const MODAL_RESERVED_SLUGS = new Set(["_control", "app", "api", "git"]);
@@ -303,16 +279,6 @@ const slugValidationMessage = (raw: string): string | null => {
   return null;
 };
 
-/** Validate the slug modal input as typed, showing the message below the
- * input. Direct DOM writes only, so typing never re-renders (and blurs). */
-const showSlugValidation = (value: string) => {
-  setSlugPreview(value.trim().toLowerCase());
-  const error = document.querySelector("#slug-error");
-  if (error) {
-    error.textContent = slugValidationMessage(value) ?? "";
-  }
-};
-
 /** Custom domains: hostnames this app answers on, plus the one DNS step the
  * operator owns. The runner owns validation, collisions and the Caddyfile
  * route; adding a hostname here reserves it and the edge picks it up on the
@@ -324,28 +290,21 @@ const CustomDomainsPanel = ({
   appId: string;
   myRole: AppRole;
 }) => {
-  const rows = atom<RunnerDomain[]>([]);
+  const res = domains(appId);
   const err = atom("");
   const note = atom("");
   const busy = atom(false);
-  const loaded = atom(false);
   const hostname = atom("");
   const isAdmin = myRole === "admin";
 
   const reload = async () => {
     try {
-      const listed = await listDomains(appId);
-      rows.set(listed ?? []);
+      await res.refetch();
       err.set("");
     } catch (error) {
       err.set(error instanceof Error ? error.message : String(error));
     }
-    loaded.set(true);
   };
-
-  watch.once(() => {
-    void reload();
-  });
 
   const add = async (event: SubmitEvent) => {
     event.preventDefault();
@@ -381,7 +340,8 @@ const CustomDomainsPanel = ({
     busy.set(false);
   };
 
-  if (!loaded()) {
+  const rows = res.data() ?? [];
+  if (res.loading() && res.data() === undefined) {
     return <SectionSkeleton lines={2} />;
   }
   return (
@@ -394,11 +354,12 @@ const CustomDomainsPanel = ({
           demand.
         </p>
         {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
-        {rows().length === 0 ? (
+        {err() ? null : <LoadError error={res.error()} />}
+        {rows.length === 0 ? (
           <p class="m-0 text-sm opacity-70">No custom hostnames yet.</p>
         ) : (
           <ul class="m-0 flex list-none flex-col gap-2 p-0">
-            {rows().map((row) => (
+            {rows.map((row) => (
               <li
                 key={row.hostname}
                 class="border-base-300 flex flex-wrap items-center justify-between gap-2 rounded border p-2 text-sm"
@@ -432,8 +393,7 @@ const CustomDomainsPanel = ({
                 value={hostname()}
                 placeholder="app.example.com"
                 oninput={(e) => {
-                  // SAFETY: ilha oninput currentTarget is the <input> that fired.
-                  hostname.set((e.currentTarget as HTMLInputElement).value);
+                  hostname.set(e.currentTarget.value);
                 }}
               />
             </fieldset>
@@ -471,6 +431,8 @@ const AppIdentityForm = ({
   const dialogOpen = atom(false);
   const err = atom("");
   const busy = atom(false);
+  const slugDraft = atom(slug);
+  const slugError = (): string | null => slugValidationMessage(slugDraft());
   const isAdmin = myRole === "admin";
 
   const saveName = async () => {
@@ -498,14 +460,9 @@ const AppIdentityForm = ({
     if (!isAdmin || busy()) {
       return;
     }
-    const input = document.querySelector("#slug-input");
-    const raw = input instanceof HTMLInputElement ? input.value : "";
+    const raw = slugDraft();
     const message = slugValidationMessage(raw);
     if (message) {
-      const error = document.querySelector("#slug-error");
-      if (error) {
-        error.textContent = message;
-      }
       return;
     }
     const next = raw.trim().toLowerCase();
@@ -538,8 +495,7 @@ const AppIdentityForm = ({
             disabled={!isAdmin || busy()}
             placeholder="My Service"
             oninput={(e) => {
-              // SAFETY: ilha oninput currentTarget is the <input> that fired.
-              draftName.set((e.currentTarget as HTMLInputElement).value);
+              draftName.set(e.currentTarget.value);
             }}
           />
         </fieldset>
@@ -577,12 +533,8 @@ const AppIdentityForm = ({
               disabled={busy()}
               onclick={() => {
                 err.set("");
+                slugDraft.set(slug);
                 dialogOpen.set(true);
-                const input = document.querySelector("#slug-input");
-                if (input instanceof HTMLInputElement) {
-                  input.value = slug;
-                }
-                showSlugValidation(slug);
               }}
             >
               Change slug
@@ -594,15 +546,19 @@ const AppIdentityForm = ({
             Only admins can change the name or slug.
           </p>
         )}
-        <div class={`modal ${dialogOpen() ? "modal-open" : ""}`}>
+        <Dialog open={dialogOpen} class="modal">
           <div class="modal-box bg-base-100 dark:bg-base-200">
             <h3 class="m-0 text-lg font-bold">Change slug?</h3>
             <p class="m-0 py-2 text-sm opacity-80">
               This renames the app everywhere: the app URL becomes{" "}
-              <code id="slug-preview">{slug}.localhost</code> and the git origin
-              moves to the new slug — update your local remote (`git remote
-              set-url`) and any bookmarks. The fleet keeps running; deploys are
-              blocked while the move completes.
+              <code id="slug-preview">
+                {appHost(
+                  `${slugDraft().trim().toLowerCase() || "\u2026"}.localhost`
+                )}
+              </code>{" "}
+              and the git origin moves to the new slug — update your local
+              remote (`git remote set-url`) and any bookmarks. The fleet keeps
+              running; deploys are blocked while the move completes.
             </p>
             <fieldset class="fieldset w-full">
               <label class="label" for="slug-input">
@@ -616,15 +572,15 @@ const AppIdentityForm = ({
                 pattern="[a-z0-9]([a-z0-9-]{0,46}[a-z0-9])?"
                 maxlength={48}
                 title="Lowercase letters, digits, and hyphens, 1–48 chars, starting and ending with a letter or digit"
+                value={slugDraft()}
                 oninput={(e) => {
-                  const target = e.currentTarget;
-                  if (target instanceof HTMLInputElement) {
-                    showSlugValidation(target.value);
-                  }
+                  slugDraft.set(e.currentTarget.value);
                 }}
               />
             </fieldset>
-            <p id="slug-error" class="text-error m-0 text-sm" />
+            <p id="slug-error" class="text-error m-0 text-sm">
+              {slugError() ?? ""}
+            </p>
             <div class="modal-action">
               <button
                 type="button"
@@ -637,7 +593,7 @@ const AppIdentityForm = ({
               <button
                 type="button"
                 class="btn btn-sm btn-warning"
-                disabled={busy()}
+                disabled={busy() || slugError() !== null}
                 onclick={() => {
                   void saveSlug();
                 }}
@@ -647,15 +603,11 @@ const AppIdentityForm = ({
             </div>
           </div>
           <form method="dialog" class="modal-backdrop">
-            <button
-              aria-label="Close dialog"
-              disabled={busy()}
-              onclick={() => dialogOpen.set(false)}
-            >
+            <button aria-label="Close dialog" disabled={busy()}>
               close
             </button>
           </form>
-        </div>
+        </Dialog>
       </div>
     </section>
   );
@@ -670,22 +622,6 @@ const AppIdentityForm = ({
 /** A `FLAG_<NAME>` row is a feature flag: the toggle writes `1`/`0`. */
 const isFlag = (name: string) => name.startsWith("FLAG_");
 
-/** Read an uncontrolled modal input from the DOM (see EnvVarsPanel). */
-const readModalInput = (id: string): string => {
-  const el = document.querySelector(`#${id}`);
-  return el instanceof HTMLInputElement ? el.value : "";
-};
-
-/** Clear the Add Variable modal inputs imperatively. */
-const clearModalInputs = () => {
-  for (const id of ["newvar-name", "newvar-value"]) {
-    const el = document.querySelector(`#${id}`);
-    if (el instanceof HTMLInputElement) {
-      el.value = "";
-    }
-  }
-};
-
 const EnvVarsPanel = ({
   appId,
   myRole,
@@ -693,24 +629,22 @@ const EnvVarsPanel = ({
   appId: string;
   myRole: AppRole;
 }) => {
-  const rows = atom<RunnerEnv[]>([]);
+  const res = envVars(appId);
+  const rows = res.data() ?? [];
   const err = atom("");
   const busy = atom(false);
-  const loaded = atom(false);
   const dialogOpen = atom(false);
+  const newVarName = atom("");
+  const newVarValue = atom("");
   const isAdmin = myRole === "admin";
   const reload = async () => {
     try {
-      rows.set(await listEnv(appId));
+      await res.refetch();
       err.set("");
     } catch (error) {
       err.set(error instanceof Error ? error.message : String(error));
     }
-    loaded.set(true);
   };
-  watch.once(() => {
-    void reload();
-  });
   const toggleFlag = (row: RunnerEnv) => {
     if (!isAdmin || busy()) {
       return;
@@ -730,12 +664,11 @@ const EnvVarsPanel = ({
       busy.set(false);
     })();
   };
-  // Modal inputs are uncontrolled (read from the DOM on submit): binding
-  // value={atom()} re-renders on every keystroke and steals input focus.
   const openModal = () => {
     err.set("");
+    newVarName.set("");
+    newVarValue.set("");
     dialogOpen.set(true);
-    clearModalInputs();
   };
   const submit = () => {
     if (busy()) {
@@ -743,18 +676,19 @@ const EnvVarsPanel = ({
     }
     // Names starting with FLAG_ are saved verbatim: the list renders
     // them as boolean toggles (checked when the value is "1").
-    const raw = readModalInput("newvar-name").trim();
+    const raw = newVarName().trim();
     if (!raw) {
       err.set("Name is required");
       return;
     }
-    const finalValue = readModalInput("newvar-value");
+    const finalValue = newVarValue();
     busy.set(true);
     err.set("");
     void (async () => {
       try {
         await setEnv({ appId, name: raw, value: finalValue });
-        clearModalInputs();
+        newVarName.set("");
+        newVarValue.set("");
         dialogOpen.set(false);
         await reload();
       } catch (error) {
@@ -813,16 +747,19 @@ const EnvVarsPanel = ({
           as on/off toggles (<code>1</code>/<code>0</code>).
         </p>
         {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
-        {loaded() ? null : <ListSkeleton rows={2} />}
-        {loaded() && rows().length === 0 ? (
+        {err() ? null : <LoadError error={res.error()} />}
+        {res.loading() && res.data() === undefined ? (
+          <ListSkeleton rows={2} />
+        ) : null}
+        {rows.length === 0 && !(res.loading() && res.data() === undefined) ? (
           <p class="m-0 text-sm opacity-70">
             No variables yet — add one to configure the build, the release
             command, or the fleet.
           </p>
         ) : null}
-        {loaded() && rows().length > 0 ? (
+        {rows.length > 0 ? (
           <ul class="list bg-base-100 dark:bg-base-200 w-full">
-            {rows().map((r) => (
+            {rows.map((r) => (
               <li
                 key={r.name}
                 class="list-row flex items-center justify-between gap-2"
@@ -889,7 +826,7 @@ const EnvVarsPanel = ({
             Only admins can add or remove variables.
           </p>
         )}
-        <div class={`modal ${dialogOpen() ? "modal-open" : ""}`}>
+        <Dialog open={dialogOpen} class="modal">
           <div class="modal-box bg-base-100 dark:bg-base-200">
             <h3 class="m-0 text-lg font-bold">Add Variable</h3>
             <p class="m-0 py-2 text-sm opacity-80">
@@ -905,6 +842,10 @@ const EnvVarsPanel = ({
                 id="newvar-name"
                 class="input input-sm w-full font-mono"
                 placeholder="DATABASE_URL or FLAG_DARK_LAUNCH"
+                value={newVarName()}
+                oninput={(e) => {
+                  newVarName.set(e.currentTarget.value);
+                }}
               />
             </fieldset>
             <fieldset class="fieldset w-full">
@@ -915,6 +856,10 @@ const EnvVarsPanel = ({
                 id="newvar-value"
                 class="input input-sm w-full font-mono"
                 placeholder="postgres://… (flags use 1/0)"
+                value={newVarValue()}
+                oninput={(e) => {
+                  newVarValue.set(e.currentTarget.value);
+                }}
               />
             </fieldset>
             {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
@@ -942,17 +887,11 @@ const EnvVarsPanel = ({
             </div>
           </div>
           <form method="dialog" class="modal-backdrop">
-            <button
-              aria-label="Close dialog"
-              disabled={busy()}
-              onclick={() => {
-                dialogOpen.set(false);
-              }}
-            >
+            <button aria-label="Close dialog" disabled={busy()}>
               close
             </button>
           </form>
-        </div>
+        </Dialog>
       </div>
     </section>
   );
@@ -962,83 +901,30 @@ const EnvVarsPanel = ({
  * own role gate so the tab stays independent of the overview fetch. */
 export const AppSettingsPanel = () => {
   const { params } = useRoute();
-  // Cache-first seed (see AppDetailPanel): first paint carries data.
-  const seedAccess = (() => {
-    const { id } = params();
-    const cached = id ? readSwrCache<AppDetailInfo>(`app:${id}:detail`) : null;
-    return cached
-      ? {
-          appId: cached.app.id,
-          myRole: cached.myRole,
-          name: cached.app.name,
-          slug: cached.app.slug,
-        }
-      : null;
-  })();
-  const ready = atom(seedAccess !== null);
-  const access = atom<{
-    appId: string;
-    myRole: AppRole;
-    name: string;
-    slug: string;
-  } | null>(seedAccess);
-  const loadError = atom("");
+  const { id } = params();
+  const res = appDetail(id ?? "");
   const notice = atom<string | null>(null);
 
-  const reload = async () => {
-    const { id } = params();
-    if (!id) {
-      loadError.set("Missing app id");
-      ready.set(true);
-      return;
-    }
-    const cached = readSwrCache<AppDetailInfo>(`app:${id}:detail`);
-    if (cached) {
-      access.set({
-        appId: cached.app.id,
-        myRole: cached.myRole,
-        name: cached.app.name,
-        slug: cached.app.slug,
-      });
-    }
-    try {
-      const info = await get(id);
-      access.set({
-        appId: info.app.id,
-        myRole: info.myRole,
-        name: info.app.name,
-        slug: info.app.slug,
-      });
-      writeSwrCache(`app:${id}:detail`, info);
-      loadError.set("");
-      ready.set(true);
-    } catch (error) {
-      loadError.set(error instanceof Error ? error.message : String(error));
-      ready.set(true);
-    }
-  };
-
-  watch.once(() => {
-    void (async () => {
-      const { data } = await fetchSession();
-      if (!data?.user) {
-        navigate("/login");
-        return;
-      }
-      await reload();
-    })();
-  });
-
-  if (!ready()) {
+  const info = res.data();
+  if (!id) {
+    return <p class="text-error m-0 text-sm">Missing app id</p>;
+  }
+  if (res.loading() && info === undefined) {
     return <SectionSkeleton lines={4} />;
   }
-  if (loadError()) {
-    return <p class="text-error m-0 text-sm">{loadError()}</p>;
+  const loadError = res.error();
+  if (loadError && !info) {
+    return <p class="text-error m-0 text-sm">{String(loadError)}</p>;
   }
-  const gate = access();
-  if (!gate) {
+  if (!info) {
     return null;
   }
+  const gate = {
+    appId: info.app.id,
+    myRole: info.myRole,
+    name: info.app.name,
+    slug: info.app.slug,
+  };
   return (
     <div class="flex flex-col gap-4">
       <AppIdentityForm
@@ -1047,7 +933,9 @@ export const AppSettingsPanel = () => {
         slug={gate.slug}
         myRole={gate.myRole}
         onSaved={() => {
-          void reload();
+          // invalidate (not res.refetch): the page title and the header
+          // dropdown read this key through their own resource cells.
+          invalidate(keys.appDetail(gate.appId));
         }}
       />
       <CustomDomainsPanel appId={gate.appId} myRole={gate.myRole} />

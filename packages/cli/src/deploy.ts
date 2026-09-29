@@ -1,5 +1,5 @@
 import { Effect } from "effect";
-import { Command, Flag } from "effect/unstable/cli";
+import { Command, Flag } from "effect/cli";
 
 import {
   commentPr,
@@ -126,7 +126,7 @@ export const deploy = Command.make(
           : config.token;
       if (token === "") {
         return yield* Effect.fail(
-          "API key required: --token or NOITE_API_KEY (Profile → API keys)"
+          "API key required: --token or NOITE_API_KEY (Account → API keys)"
         );
       }
       const gitBase = (

@@ -84,19 +84,12 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn bucket_reachable(cfg: &crate::config::Config) -> (bool, String) {
-    let env_owned = crate::host::cmd::aws_env(cfg);
-    let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    match crate::host::cmd::run_cmd(
-        "aws",
-        &["--endpoint-url", &cfg.s3_endpoint, "s3api", "head-bucket", "--bucket", &cfg.s3_bucket],
-        None,
-        &env,
-        std::time::Duration::from_secs(2),
-    )
-    .await
-    {
-        Ok(_) => (true, String::new()),
-        Err(e) => (false, format!("{e:#}")),
+    // One head-bucket per 5 s (cached by the caller): false only on
+    // transport/auth failure, which is exactly "unreachable".
+    if crate::host::cmd::s3_head_bucket(cfg).await {
+        (true, String::new())
+    } else {
+        (false, format!("head-bucket {} unreachable", cfg.s3_bucket))
     }
 }
 
@@ -283,6 +276,19 @@ pub async fn delete_app(
             let _ = crate::host::credentials::revoke(&state.pool, &id).await;
             StatusCode::NO_CONTENT.into_response()
         }
+        Err(e) => ApiError::internal(e.to_string()).into_response(),
+    }
+}
+
+/// Park an app now (SPEC, Scale to zero), skipping the idle check — the
+/// operator's lever, and how tests exercise wake-on-request without waiting
+/// out `RUNNER_SLEEP_AFTER_H`. 409 when the app cannot sleep (stopped,
+/// undeployed, already asleep, or not running yet).
+pub async fn sleep_app(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    match crate::host::sleep::sleep_app(&state.pool, &state.config, &state.procs, &id, true).await {
+        Ok(true) => (StatusCode::OK, Json(json!({ "ok": true, "asleep": true }))).into_response(),
+        Ok(false) => ApiError::conflict("app cannot sleep (stopped, undeployed, already asleep or not running)")
+            .into_response(),
         Err(e) => ApiError::internal(e.to_string()).into_response(),
     }
 }

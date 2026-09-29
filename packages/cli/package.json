@@ -39,8 +39,8 @@
     "prepack": "bun run build"
   },
   "dependencies": {
-    "@effect/platform-bun": "4.0.0-rc.112",
-    "effect": "^4.0.0-rc.112"
+    "@effect/platform-bun": "4.0.0-rc.118",
+    "effect": "^4.0.0-rc.118"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",

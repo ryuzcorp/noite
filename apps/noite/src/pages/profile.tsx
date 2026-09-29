@@ -1,14 +1,12 @@
-import { ProfilePanel } from "$lib/profile-panel";
-import { head } from "@ilha/router";
+import { head, navigate } from "@ilha/router";
+import { watch } from "ilha";
 
-export default function Profile() {
+/** Old URL for the account page: keep bookmarks and older CLI/docs hints
+ * working by forwarding to /account (replace, so Back skips it). */
+export default function ProfileRedirect() {
   head({ title: "Account · Noite" });
-
-  return (
-    <div class="mx-auto mt-4 flex w-full max-w-5xl flex-col gap-4 px-4 pb-12">
-      <div class="w-full max-w-2xl">
-        <ProfilePanel />
-      </div>
-    </div>
-  );
+  watch.once(() => {
+    navigate("/account", { replace: true });
+  });
+  return null;
 }

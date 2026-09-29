@@ -1,7 +1,7 @@
 /* eslint-disable func-names -- Effect.gen uses anonymous generators */
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { SqlClient } from "effect/unstable/sql/SqlClient";
+import { SqlClient } from "effect/sql/SqlClient";
 import { action, useEnv, useRequest } from "oxidejs";
 
 import { checkedSchema } from "./action-schema";

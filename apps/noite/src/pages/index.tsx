@@ -7,11 +7,9 @@ import { watch } from "ilha";
 export default function Home() {
   head({ title: "Noite" });
 
-  watch.once(() => {
-    void (async () => {
-      const { data } = await fetchSession();
-      navigate(data?.user ? "/apps" : "/login");
-    })();
+  watch.once(async () => {
+    const { data } = await fetchSession();
+    navigate(data?.user ? "/apps" : "/login");
   });
 
   return null;

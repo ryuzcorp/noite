@@ -11,7 +11,7 @@ use axum_jrpc::{Id, JsonRpcResponse};
 use serde::Deserialize;
 
 use crate::api::source as api_source;
-use crate::host::{deploy, logs, metrics, purge, rename, source, storage, web_commit};
+use crate::host::{deploy, purge, rename, source, storage, web_commit};
 use crate::lifecycle::slug_ok;
 use crate::models::{App, DesiredState};
 use crate::{db, AppState};
@@ -478,6 +478,26 @@ async fn dispatch_call(
                 Err(e) => internal(&id, e.to_string()),
             }
         }
+        "deploys.log" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: String,
+                deploy_id: String,
+            }
+            let p: P = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let a = match app(state, &p.id, &id).await {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
+            match db::get_deploy_log(&state.pool, &a.id, p.deploy_id.trim()).await {
+                Ok(Some(log)) => JsonRpcResponse::success(id, serde_json::json!({ "log": log })),
+                Ok(None) => not_found(&id, "deploy not found"),
+                Err(e) => internal(&id, e.to_string()),
+            }
+        }
         "deploys.rollback" => {
             #[derive(Deserialize)]
             struct P {
@@ -707,14 +727,18 @@ async fn dispatch_call(
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            let a = match app(state, &p.id, &id).await {
+            let _a = match app(state, &p.id, &id).await {
                 Ok(a) => a,
                 Err(e) => return e,
             };
-            let hours = p.hours.unwrap_or(1).clamp(1, 24);
-            let since = metrics::now_us_pub() - hours * 3_600_000_000;
-            let spans = metrics::top_spans(&state.config, &a.slug, since).await;
-            JsonRpcResponse::success(id, spans)
+            let hours = p.hours.unwrap_or(24).clamp(1, 336);
+            let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
+                .format("%Y-%m-%dT%H:00:00Z")
+                .to_string();
+            match db::list_span_stats(&state.pool, &p.id, &since).await {
+                Ok(spans) => JsonRpcResponse::success(id, spans),
+                Err(e) => internal(&id, e.to_string()),
+            }
         }
         "logs.get" => {
             let p: IdParams = match parse(params, &id) {
@@ -725,8 +749,7 @@ async fn dispatch_call(
                 Ok(a) => a,
                 Err(e) => return e,
             };
-            let mut lines = metrics::recent_logs(&state.config, &a.slug, 500).await;
-            lines.extend(logs::tail(&state.logs, &a.slug, 500).await);
+            let lines = super::observe::merged_lines(&state, &a.id, &a.slug).await;
             JsonRpcResponse::success(id, lines)
         }
         "storage.list" => {

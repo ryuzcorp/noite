@@ -1,16 +1,18 @@
 //! Runner SQLite held in the bucket (SPEC, Runner state).
 //!
 //! Goal: losing `runner-data` loses nothing; backups are bucket versioning.
-//! Key: `s3://{bucket}/runner/state/noite.sqlite` (+ `noite.sqlite.meta.json`
- //! with `{ generation, written_at, schema_hash }`).
+//! Key: `s3://{bucket}/runner/state/noite.sqlite.zst` (+ `noite.sqlite.meta.json`
+//! with `{ generation, written_at, codec, sha256, bytes, raw_bytes }`).
 //!
 //! Write path: a background task holds its own SQLite connection and polls
 //! `PRAGMA data_version`, which changes whenever *another* connection
 //! commits, so every write counts (REST, RPC, deploys, the reconcile loop),
 //! not just the API calls someone remembered to mark. Once dirty, it waits
 //! 10 s for bursts to settle and uploads at most once a minute:
-//! `VACUUM INTO` a temp file, upload, then `meta`. Also on graceful shutdown
-//! (2.1). Loss window on a crash: about 70 s of writes.
+//! `VACUUM INTO` a temp file, skip when its hash matches the last upload
+//! (T4.3), else zstd-compress (T4.2) and upload, then `meta`. Only the main
+//! database is snapshotted — metrics.sqlite is attached, not copied (T4.1).
+//! Also on graceful shutdown (2.1). Loss window on a crash: about 70 s of writes.
 //!
 //! Fencing: the store's conditional writes are not reachable through the aws
 //! CLI we ship, so instead each runner claims `runner/state/owner.json` at
@@ -34,14 +36,17 @@ use crate::config::Config;
 use crate::db;
 use crate::host::cmd;
 
-const STATE_KEY: &str = "runner/state/noite.sqlite";
+const STATE_KEY: &str = "runner/state/noite.sqlite.zst";
+/// Pre-compression key: written before snapshots gained zstd (spec T4.2).
+/// Restore still reads it; nothing writes it anymore.
+const STATE_KEY_LEGACY: &str = "runner/state/noite.sqlite";
 const META_KEY: &str = "runner/state/noite.sqlite.meta.json";
 const OWNER_KEY: &str = "runner/state/owner.json";
-/// Quiet period after the first write before a snapshot, so bursts coalesce.
+/// Snapshot cadence: poll data_version every 10 s, wait 10 s for bursts to
+/// settle, upload at most once a minute.
+const POLL: Duration = Duration::from_secs(10);
 const DEBOUNCE: Duration = Duration::from_secs(10);
-/// Minimum spacing between uploads (telemetry writes every tick otherwise).
 const MIN_INTERVAL: Duration = Duration::from_secs(60);
-const POLL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct StateSync {
@@ -51,6 +56,9 @@ pub struct StateSync {
     instance: Arc<String>,
     /// False once another runner took the claim; uploads stop.
     owner: Arc<AtomicBool>,
+    /// sha256 of the last uploaded snapshot (spec T4.3): an identical
+    /// `VACUUM INTO` output skips the upload entirely.
+    last_hash: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl StateSync {
@@ -60,6 +68,7 @@ impl StateSync {
             generation: Arc::new(AtomicU64::new(0)),
             instance: Arc::new(uuid::Uuid::new_v4().to_string()),
             owner: Arc::new(AtomicBool::new(true)),
+            last_hash: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -81,11 +90,14 @@ impl StateSync {
     /// generation so it stays monotonic across restarts.
     pub async fn claim(&self, cfg: &Config) -> anyhow::Result<()> {
         if let Ok(text) = download_text(cfg, META_KEY).await {
-            if let Some(g) = serde_json::from_str::<serde_json::Value>(&text)
-                .ok()
-                .and_then(|v| v.get("generation").and_then(serde_json::Value::as_u64))
-            {
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            if let Some(g) = v.get("generation").and_then(serde_json::Value::as_u64) {
                 self.generation.store(g, Ordering::Relaxed);
+            }
+            // Seed the identical-skip (T4.3) so the first pass after a
+            // restart doesn't re-upload an unchanged snapshot.
+            if let Some(h) = v.get("sha256").and_then(|x| x.as_str()) {
+                *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = Some(h.to_string());
             }
         }
         let claim = serde_json::json!({
@@ -141,21 +153,53 @@ impl StateSync {
         let Some(target) = tmp.to_str() else {
             anyhow::bail!("snapshot path is not valid UTF-8");
         };
+        // `VACUUM INTO` copies only the main database: metrics.sqlite rides
+        // along on the volume but is never snapshotted (spec T4.1).
         let sql = format!("VACUUM INTO '{}'", target.replace('\'', "''"));
         sqlx::query(&sql).execute(pool).await?;
-        let bytes = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
-        cmd::s3_cp_upload(cfg, &tmp, STATE_KEY).await?;
+        let raw = tokio::fs::read(&tmp).await?;
         let _ = tokio::fs::remove_file(&tmp).await;
+        // Skip identical snapshots (spec T4.3): writes that don't change
+        // bytes (e.g. an upsert of the same row) upload nothing.
+        let hash = {
+            use sha2::Digest;
+            let mut h = sha2::Sha256::new();
+            h.update(&raw);
+            format!("{:x}", h.finalize())
+        };
+        let unchanged = self
+            .last_hash
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .as_deref()
+            == Some(hash.as_str());
+        if unchanged {
+            tracing::debug!(hash = %hash, "runner state unchanged; skipping snapshot upload");
+            return Ok(0);
+        }
+        // zstd level 3 (spec T4.2): saves bucket storage and upload bytes.
+        let packed = zstd::encode_all(&raw[..], 3)?;
+        let packed_len = packed.len() as u64;
+        let src = dir.join(".snapshot.sqlite.zst");
+        tokio::fs::write(&src, &packed).await?;
+        cmd::s3_cp_upload(cfg, &src, STATE_KEY).await?;
+        let _ = tokio::fs::remove_file(&src).await;
+        *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash.clone());
+        crate::host::stats::count_snapshot(packed_len);
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let meta = serde_json::json!({
             "generation": generation,
             "written_at": chrono::Utc::now().to_rfc3339(),
-            "bytes": bytes,
+            "codec": "zstd",
+            "sha256": hash,
+            "bytes": packed_len,
+            "raw_bytes": raw.len(),
             "instance": self.instance.as_str(),
         });
         upload_text(cfg, META_KEY, &serde_json::to_string_pretty(&meta)?).await?;
-        tracing::info!(bytes, generation, "runner state snapshot uploaded");
-        Ok(bytes)
+        tracing::info!(bytes = packed_len, raw_bytes = raw.len(), generation, "runner state snapshot uploaded");
+        Ok(packed_len)
     }
 }
 
@@ -190,17 +234,21 @@ pub async fn restore_if_missing(cfg: &Config) -> anyhow::Result<bool> {
     if let Some(parent) = live.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
-    let uri = format!("s3://{}/{STATE_KEY}", cfg.s3_bucket);
+    // New form first (zstd, spec T4.2), then the legacy raw database.
+    match download_snapshot(cfg, &live).await {
+        Ok(restored) => Ok(restored),
+        Err(e) => Err(e.context("runner state restore failed; refusing to start with an empty database")),
+    }
+}
+
+async fn download_snapshot(cfg: &Config, live: &std::path::Path) -> anyhow::Result<bool> {
     let partial = live.with_extension("sqlite.restoring");
     let mut last_err = None;
     for attempt in 1..=5u64 {
-        match cmd::s3_cp_download(cfg, &uri, &partial).await {
-            Ok(()) => {
-                // Rename into place only once complete: a crash mid-download
-                // must not leave a truncated database that "exists".
-                tokio::fs::rename(&partial, &live).await?;
-                tracing::info!(path = %live.display(), "runner state restored from bucket");
-                return Ok(true);
+        match try_restore_once(cfg, live, &partial).await {
+            Ok(restored) => {
+                let _ = tokio::fs::remove_file(&partial).await;
+                return Ok(restored);
             }
             Err(e) if cmd::is_not_found(&e) => {
                 tracing::info!("no runner state snapshot in the bucket; starting fresh");
@@ -214,9 +262,42 @@ pub async fn restore_if_missing(cfg: &Config) -> anyhow::Result<bool> {
         }
     }
     let _ = tokio::fs::remove_file(&partial).await;
-    Err(last_err
-        .unwrap_or_else(|| anyhow::anyhow!("restore failed"))
-        .context("runner state restore failed; refusing to start with an empty database"))
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("restore failed")))
+}
+
+/// One restore attempt: the compressed snapshot, falling back to the legacy
+/// raw key. Only "both keys missing" counts as no-snapshot — a transport
+/// error must never read as "start fresh".
+async fn try_restore_once(
+    cfg: &Config,
+    live: &std::path::Path,
+    partial: &std::path::Path,
+) -> anyhow::Result<bool> {
+    let uri = format!("s3://{}/{STATE_KEY}", cfg.s3_bucket);
+    match cmd::s3_cp_download(cfg, &uri, partial).await {
+        Ok(()) => {
+            let packed = tokio::fs::read(partial).await?;
+            // The main database is control-plane rows only now (metrics live
+            // in metrics.sqlite), so a whole-file decode is bounded.
+            let raw = zstd::decode_all(&packed[..])?;
+            tokio::fs::write(live, raw).await?;
+            tracing::info!(path = %live.display(), "runner state restored from bucket (zstd)");
+            return Ok(true);
+        }
+        Err(e) if !cmd::is_not_found(&e) => return Err(e),
+        Err(_) => {}
+    }
+    let legacy_uri = format!("s3://{}/{STATE_KEY_LEGACY}", cfg.s3_bucket);
+    match cmd::s3_cp_download(cfg, &legacy_uri, partial).await {
+        Ok(()) => {
+            // Rename into place only once complete: a crash mid-download
+            // must not leave a truncated database that "exists".
+            tokio::fs::rename(partial, live).await?;
+            tracing::info!(path = %live.display(), "runner state restored from bucket (legacy raw)");
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Background sync: poll `data_version` on a dedicated connection, then

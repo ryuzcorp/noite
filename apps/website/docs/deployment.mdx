@@ -88,7 +88,7 @@ Registration is invite-only once the instance is bootstrapped. The **first** acc
 
 Codes are 12 characters in four-char groups (`ABCD-EFGH-JKLM`) drawn from an unambiguous alphabet, and a code that is used, revoked or unknown is refused with a specific message before any account is created. Redemption is a single atomic claim (`UPDATE ... WHERE usedBy IS NULL`), so one code admits exactly one account even under concurrent signups.
 
-- Members read their unused codes in the "Invitations" card on `/profile`.
+- Members read their unused codes in the "Invitations" card on `/account`.
 - Admins mint 1–50 more and revoke unused ones from the Invitations panel in `/god-mode`.
 - The signup form shows the code field only when `GET /api/invite/status` reports the instance is past its first account, so the bootstrap account never sees it.
 

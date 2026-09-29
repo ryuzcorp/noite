@@ -38,6 +38,7 @@ import {
   runnerSourceCommit,
   runnerSourceDiff,
   runnerSourceTree,
+  runnerDeployLog,
   runnerRollback,
   runnerListEnv,
   runnerSetEnv,
@@ -377,6 +378,25 @@ export const rollback = action(
     await requireAppRole(appId, user.id, "push");
     try {
       return await runnerRollback(appId, sha);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }),
+  { error: AuthError }
+);
+
+const DeployLogArgs = Schema.Struct({
+  appId: Schema.String,
+  deployId: Schema.String,
+});
+
+/** One finished deploy's build log (view-gated): the stream omits finished
+ * rows' logs, so the panel fetches them on demand per deploy id. */
+export const deployLog = action(
+  checkedSchema(DeployLogArgs, async ({ appId, deployId }) => {
+    await requireViewApp(appId);
+    try {
+      return await runnerDeployLog(appId, deployId);
     } catch (error) {
       failUnknown(error);
     }

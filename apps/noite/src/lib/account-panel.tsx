@@ -1,10 +1,17 @@
-import { navigate } from "@ilha/router";
-import { atom, watch } from "ilha";
+import { atom } from "ilha";
 
-import { createApiKey, myInviteCodes } from "./apps.server";
+import { createApiKey } from "./apps.server";
 import { authClient } from "./auth-client";
 import { formatDateTime } from "./dates";
-import { fetchSession } from "./session";
+import { Dialog } from "./dialog";
+import { LoadError } from "./load-error";
+import {
+  apiKeys,
+  invalidate,
+  inviteCodes,
+  keys as resourceKeys,
+  session,
+} from "./resources";
 import { SectionSkeleton } from "./skeletons";
 
 interface ApiKeyRow {
@@ -43,19 +50,9 @@ const scopeBadges = (
  * on registration (`INVITES_PER_USER`); this is the only place a non-admin can
  * read them, so it is part of the invite flow rather than a nicety. */
 const MyInvitesCard = () => {
-  const codes = atom<{ code: string; id: string }[]>([]);
+  const res = inviteCodes();
+  const codes = res.data() ?? [];
   const copied = atom("");
-  const loaded = atom(false);
-  watch.once(() => {
-    void (async () => {
-      try {
-        codes.set((await myInviteCodes()) ?? []);
-      } catch {
-        // A failed read leaves the card empty rather than blocking the page.
-      }
-      loaded.set(true);
-    })();
-  });
   const copy = async (code: string) => {
     try {
       await navigator.clipboard.writeText(code);
@@ -67,7 +64,7 @@ const MyInvitesCard = () => {
       copied.set("");
     }
   };
-  if (!loaded()) {
+  if (res.loading() && res.data() === undefined) {
     return <SectionSkeleton lines={2} />;
   }
   return (
@@ -78,13 +75,13 @@ const MyInvitesCard = () => {
           This instance is invite-only. Share a code with someone you want to
           let in; each one works once.
         </p>
-        {codes().length === 0 ? (
+        {codes.length === 0 ? (
           <p class="m-0 text-sm opacity-70">
             No codes left — ask an admin for one.
           </p>
         ) : (
           <ul class="m-0 flex list-none flex-col gap-2 p-0">
-            {codes().map((row) => (
+            {codes.map((row) => (
               <li
                 key={row.id}
                 class="border-base-300 flex items-center justify-between gap-2 rounded border p-2"
@@ -111,69 +108,46 @@ const MyInvitesCard = () => {
 };
 
 /** Create / list / revoke Better Auth API keys (Git push password). */
-export const ProfilePanel = () => {
-  const ready = atom(false);
+export const AccountPanel = () => {
+  const keysRes = apiKeys();
+  const keys: ApiKeyRow[] = keysRes.data() ?? [];
+  const sessionRes = session();
   const busy = atom(false);
   const keyError = atom("");
-  const keys = atom<ApiKeyRow[]>([]);
   const freshKey = atom<string | null>(null);
   const keyModal = atom(false);
   const saveBusy = atom(false);
   const saveError = atom("");
   const saveOk = atom(false);
-
+  // Unsaved edit of the display name; null = untouched, so the field shows
+  // the session's name (including after it loads or refreshes). No session
+  // data is copied into atoms — render-time seeding raced ilha's patching
+  // and intermittently left Name/Email blank.
+  const nameDraft = atom<string | null>(null);
+  const keyName = atom("");
+  const scopeApps = atom(true);
+  const scopeEvents = atom(true);
   const reload = async () => {
-    const result = await authClient.apiKey.list({
-      query: { limit: 50, sortBy: "createdAt", sortDirection: "desc" },
-    });
-    if (result.error) {
-      keyError.set(result.error.message ?? "Failed to list API keys");
-      return;
+    try {
+      await keysRes.refetch();
+      keyError.set("");
+    } catch (error) {
+      keyError.set(error instanceof Error ? error.message : String(error));
     }
-    keys.set(result.data?.apiKeys ?? []);
   };
 
-  watch.once(() => {
-    void (async () => {
-      const { data } = await fetchSession();
-      if (!data?.user) {
-        navigate("/login");
-        return;
-      }
-      await reload();
-      ready.set(true);
-      // Uncontrolled inputs (see key-name): preset after first paint so
-      // typing never re-renders and blurs the fields. The inputs only
-      // exist in the DOM once ready flips, hence the frame delay.
-      window.requestAnimationFrame(() => {
-        const nameInput = document.querySelector("#profile-name");
-        if (nameInput instanceof HTMLInputElement) {
-          nameInput.value = data.user.name ?? "";
-        }
-        const emailInput = document.querySelector("#profile-email");
-        if (emailInput instanceof HTMLInputElement) {
-          emailInput.value = data.user.email ?? "";
-        }
-      });
-    })();
-  });
+  const user = sessionRes.data()?.user;
+  const nameValue = nameDraft() ?? user?.name ?? "";
 
   const createKey = async (event: SubmitEvent) => {
     event.preventDefault();
-    // Read the form from the DOM: inputs are uncontrolled so typing
-    // never re-renders (and blurs) the fields.
-    const input = document.querySelector("#key-name");
-    const label = input instanceof HTMLInputElement ? input.value.trim() : "";
+    const label = keyName().trim();
     if (!label) {
       keyError.set("Name is required");
       return;
     }
-    const appsBox = document.querySelector("#scope-apps");
-    const eventsBox = document.querySelector("#scope-events");
-    const appManagement =
-      !(appsBox instanceof HTMLInputElement) || appsBox.checked;
-    const events =
-      !(eventsBox instanceof HTMLInputElement) || eventsBox.checked;
+    const appManagement = scopeApps();
+    const events = scopeEvents();
     busy.set(true);
     keyError.set("");
     freshKey.set(null);
@@ -209,8 +183,7 @@ export const ProfilePanel = () => {
   };
 
   const saveProfile = async () => {
-    const input = document.querySelector("#profile-name");
-    const next = input instanceof HTMLInputElement ? input.value.trim() : "";
+    const next = nameValue.trim();
     if (!next) {
       saveError.set("Display name is required");
       return;
@@ -225,6 +198,10 @@ export const ProfilePanel = () => {
         return;
       }
       saveOk.set(true);
+      // The sidebar reads the session resource too: refresh it, then let
+      // the field follow the saved name again.
+      invalidate(resourceKeys.session);
+      nameDraft.set(null);
     } catch {
       saveError.set("Failed to update profile");
     } finally {
@@ -232,7 +209,7 @@ export const ProfilePanel = () => {
     }
   };
 
-  if (!ready()) {
+  if (keysRes.loading() && keysRes.data() === undefined) {
     return <SectionSkeleton lines={4} />;
   }
 
@@ -252,6 +229,10 @@ export const ProfilePanel = () => {
             maxlength={64}
             placeholder="Name"
             autocomplete="name"
+            value={nameValue}
+            oninput={(e) => {
+              nameDraft.set(e.currentTarget.value);
+            }}
           />
         </fieldset>
         <fieldset class="fieldset w-full">
@@ -263,6 +244,7 @@ export const ProfilePanel = () => {
             class="input input-sm"
             type="email"
             disabled
+            value={user?.email ?? ""}
           />
         </fieldset>
         {saveError() ? (
@@ -291,16 +273,9 @@ export const ProfilePanel = () => {
             type="button"
             class="btn btn-sm btn-neutral shrink-0"
             onclick={() => {
-              const input = document.querySelector("#key-name");
-              if (input instanceof HTMLInputElement) {
-                input.value = "";
-              }
-              for (const id of ["#scope-apps", "#scope-events"]) {
-                const box = document.querySelector(id);
-                if (box instanceof HTMLInputElement) {
-                  box.checked = true;
-                }
-              }
+              keyName.set("");
+              scopeApps.set(true);
+              scopeEvents.set(true);
               keyError.set("");
               keyModal.set(true);
             }}
@@ -313,7 +288,7 @@ export const ProfilePanel = () => {
           requires collaborator <code>push</code> or <code>admin</code> on that
           app. Events-only keys can't push code.
         </p>
-        <div class={`modal ${keyModal() ? "modal-open" : ""}`}>
+        <Dialog open={keyModal} class="modal">
           <div class="modal-box bg-base-100 dark:bg-base-200">
             <h3 class="m-0 text-lg font-bold">Create API key</h3>
             <form onsubmit={createKey}>
@@ -324,7 +299,10 @@ export const ProfilePanel = () => {
                     id="scope-apps"
                     type="checkbox"
                     class="checkbox checkbox-sm"
-                    checked
+                    checked={scopeApps()}
+                    onchange={(e) => {
+                      scopeApps.set(e.currentTarget.checked);
+                    }}
                   />
                   App Management — git push, deploys, variables
                 </label>
@@ -333,7 +311,10 @@ export const ProfilePanel = () => {
                     id="scope-events"
                     type="checkbox"
                     class="checkbox checkbox-sm"
-                    checked
+                    checked={scopeEvents()}
+                    onchange={(e) => {
+                      scopeEvents.set(e.currentTarget.checked);
+                    }}
                   />
                   Events — publish to the event API
                 </label>
@@ -351,6 +332,10 @@ export const ProfilePanel = () => {
                   placeholder="ci"
                   autofocus
                   required
+                  value={keyName()}
+                  oninput={(e) => {
+                    keyName.set(e.currentTarget.value);
+                  }}
                 />
               </fieldset>
               {keyError() ? (
@@ -378,17 +363,11 @@ export const ProfilePanel = () => {
             </form>
           </div>
           <form method="dialog" class="modal-backdrop">
-            <button
-              aria-label="Close dialog"
-              disabled={busy()}
-              onclick={() => {
-                keyModal.set(false);
-              }}
-            >
+            <button aria-label="Close dialog" disabled={busy()}>
               close
             </button>
           </form>
-        </div>
+        </Dialog>
         {freshKey() ? (
           <div class="bg-base-200 flex flex-col gap-1 rounded p-3 text-xs">
             <p class="m-0 font-medium">Copy now — shown once:</p>
@@ -396,11 +375,14 @@ export const ProfilePanel = () => {
           </div>
         ) : null}
         {keyError() ? <p class="text-error m-0 text-sm">{keyError()}</p> : null}
-        {keys().length === 0 ? (
+        {keyError() ? null : (
+          <LoadError error={keysRes.error()} label="Failed to list API keys" />
+        )}
+        {keys.length === 0 ? (
           <p class="m-0 text-sm opacity-70">No API keys yet.</p>
         ) : (
           <ul class="m-0 flex list-none flex-col gap-2 p-0">
-            {keys().map((row) => (
+            {keys.map((row) => (
               <li
                 key={row.id}
                 class="border-base-300 flex flex-wrap items-center justify-between gap-2 rounded border p-2 text-sm"

@@ -242,6 +242,9 @@ export const runnerRenameApp = (
 export const runnerListDeploys = (id: string) =>
   runnerRpc<RunnerDeploy[]>("deploys.list", { id });
 
+export const runnerDeployLog = (id: string, deployId: string) =>
+  runnerRpc<{ log: string }>("deploys.log", { deploy_id: deployId, id });
+
 export const runnerRollback = (id: string, sha: string) =>
   runnerRpc<{ ok: boolean; sha: string }>("deploys.rollback", { id, sha });
 

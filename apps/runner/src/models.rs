@@ -44,6 +44,10 @@ pub enum AppStatus {
     Stopped,
     #[serde(rename = "failed")]
     Failed,
+    /// Deployed and desired running, but its fleet is stopped until the next
+    /// request (SPEC, Scale to zero).
+    #[serde(rename = "sleeping")]
+    Sleeping,
 }
 
 impl AppStatus {
@@ -55,6 +59,7 @@ impl AppStatus {
             Self::Running => "running",
             Self::Stopped => "stopped",
             Self::Failed => "failed",
+            Self::Sleeping => "sleeping",
         }
     }
 }
@@ -114,6 +119,11 @@ pub struct App {
     pub desired_state: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Set while the app is asleep (scale to zero); NULL when awake.
+    pub asleep_since: Option<String>,
+    /// Last wake (request-driven, manual start or deploy): the idle clock
+    /// never runs from before it.
+    pub woke_at: Option<String>,
 }
 
 impl App {
@@ -123,6 +133,11 @@ impl App {
 
     pub fn is_stopped(&self) -> bool {
         self.desired() == DesiredState::Stopped
+    }
+
+    /// Asleep: desired running, fleet stopped until the next request.
+    pub fn is_asleep(&self) -> bool {
+        self.asleep_since.is_some() && !self.is_stopped()
     }
 
     pub fn is_deployed(&self) -> bool {
@@ -202,6 +217,20 @@ pub struct AppRefStat {
     pub bucket_ts: String,
     pub source: String,
     pub requests: i64,
+}
+
+/// Aggregated span row served to the dashboard (spec T3.2). Same JSON shape
+/// as the old DuckDB-backed `SpanStat` (`qwaitMs`), now read from the
+/// ingested `app_span_stat` ring instead of scanning Parquet per viewer.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSpanStat {
+    pub name: String,
+    pub kind: i64,
+    pub n: i64,
+    pub ms: i64,
+    pub err: i64,
+    pub qwait_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

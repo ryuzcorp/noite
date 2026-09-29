@@ -1,6 +1,6 @@
 /* eslint-disable func-names -- Effect.gen uses anonymous generators */
 import * as Effect from "effect/Effect";
-import { SqlClient } from "effect/unstable/sql/SqlClient";
+import { SqlClient } from "effect/sql/SqlClient";
 
 import { withDb } from "./db";
 
@@ -180,7 +180,7 @@ export const mintInvites = async (
 };
 
 /** The codes one account can still hand out, oldest first. This is the user's
- * own share (`INVITES_PER_USER` on registration) — the profile page shows it,
+ * own share (`INVITES_PER_USER` on registration) — the account page shows it,
  * so an invitee can pass one on without admin rights. */
 export const listUnusedInvitesFor = async (
   userId: string

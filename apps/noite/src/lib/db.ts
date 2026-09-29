@@ -2,7 +2,7 @@ import type { D1Database } from "@cloudflare/workers-types";
 import { D1Client } from "@effect/sql-d1";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { SqlClient } from "effect/unstable/sql/SqlClient";
+import { SqlClient } from "effect/sql/SqlClient";
 import { Kysely } from "kysely";
 import { D1Dialect } from "kysely-d1";
 import { useEnv } from "oxidejs";

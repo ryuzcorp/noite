@@ -1,12 +1,11 @@
 import { DeployList, DeployDropdown } from "$lib/app-detail/deploys";
 import { EventsPanel } from "$lib/app-detail/events";
-import { CODE_SVG } from "$lib/app-detail/icons";
 import { MetricsCard } from "$lib/app-detail/metrics";
 import { AppDetailPanel } from "$lib/app-detail/panel";
 import { AppSettingsPanel } from "$lib/app-detail/settings";
-import { get } from "$lib/apps.server";
-import { useRoute, head, navigate } from "@ilha/router";
-import { unsafe, watch } from "ilha";
+import { Code } from "$lib/icons";
+import { appDetail } from "$lib/resources";
+import { useRoute, head, searchParam } from "@ilha/router";
 
 const TABS = [
   { id: "overview", label: "Overview" },
@@ -18,98 +17,63 @@ const TABS = [
 
 type TabId = (typeof TABS)[number]["id"];
 
-export default function AppPage() {
-  const route = useRoute();
-  const appId = route.params().id;
-  head({ title: "App · Noite" });
+/** Parse `?t=`: unknown tabs fall back to overview. */
+const toTabId = (raw: string): TabId =>
+  TABS.find((tab) => tab.id === raw)?.id ?? "overview";
 
-  // Active tab lives in ?t= so refresh restores it; unknown values fall
-  // back to overview.
-  const activeTab = (): TabId => {
-    const t = new URLSearchParams(route.search()).get("t");
-    return TABS.find((tab) => tab.id === t)?.id ?? "overview";
-  };
-  const selectTab = (tab: TabId) => {
-    navigate(`${route.path()}?t=${tab}`, { replace: true });
-  };
-
-  // Tab title follows the app once loaded (head() only applies on mount).
-  watch.once(() => {
-    if (!appId) {
-      return;
-    }
-    void (async () => {
-      try {
-        const info = await get(appId);
-        if (typeof document !== "undefined") {
-          document.title = `${info.app.name} · Noite`;
-        }
-      } catch {
-        // keep the default title
-      }
-    })();
-  });
+const AppPageBody = ({ appId }: { appId: string }) => {
+  const tab = searchParam<TabId>("t", { default: "overview", parse: toTabId });
+  const name = appDetail(appId).data()?.app.name;
+  head({ title: `${name ?? "App"} · Noite` });
 
   return (
     <div class="mx-auto mt-4 flex w-full max-w-5xl flex-col gap-4 px-4 pb-12">
       <div class="flex items-center justify-between gap-2">
         <div role="tablist" class="tabs tabs-border w-fit">
-          {TABS.map((tab) => (
+          {TABS.map((t) => (
             <button
               type="button"
               role="tab"
-              aria-selected={activeTab() === tab.id ? "true" : "false"}
-              class={`tab ${activeTab() === tab.id ? "tab-active" : ""}`}
+              aria-selected={tab() === t.id ? "true" : "false"}
+              class={`tab ${tab() === t.id ? "tab-active" : ""}`}
               onclick={() => {
-                selectTab(tab.id);
+                tab.set(t.id);
               }}
             >
-              {tab.label}
+              {t.label}
             </button>
           ))}
         </div>
-        {appId ? (
-          <div class="flex shrink-0 items-center gap-2">
-            <a href={`/apps/${appId}/source`} class="btn btn-sm">
-              <span class="inline-flex items-center gap-1">
-                {unsafe(CODE_SVG)}
-                Code
-              </span>
-            </a>
-            <DeployDropdown appId={appId} />
-          </div>
-        ) : null}
+        <div class="flex shrink-0 items-center gap-2">
+          <a href={`/apps/${appId}/source`} class="btn btn-sm">
+            <span class="inline-flex items-center gap-1">
+              <Code />
+              Code
+            </span>
+          </a>
+          <DeployDropdown appId={appId} />
+        </div>
       </div>
 
-      {activeTab() === "overview" ? <AppDetailPanel /> : null}
-      {activeTab() === "deployments" ? (
-        <>
-          {appId ? (
-            <DeployList appId={appId} />
-          ) : (
-            <p class="m-0 text-sm opacity-70">Missing app id.</p>
-          )}
-        </>
-      ) : null}
-      {activeTab() === "metrics" ? (
-        <>
-          {appId ? (
-            <MetricsCard appId={appId} detail />
-          ) : (
-            <p class="m-0 text-sm opacity-70">Missing app id.</p>
-          )}
-        </>
-      ) : null}
-      {activeTab() === "events" ? (
-        <>
-          {appId ? (
-            <EventsPanel appId={appId} />
-          ) : (
-            <p class="m-0 text-sm opacity-70">Missing app id.</p>
-          )}
-        </>
-      ) : null}
-      {activeTab() === "settings" ? <AppSettingsPanel /> : null}
+      {tab() === "overview" ? <AppDetailPanel /> : null}
+      {tab() === "deployments" ? <DeployList appId={appId} /> : null}
+      {tab() === "metrics" ? <MetricsCard appId={appId} detail /> : null}
+      {tab() === "events" ? <EventsPanel appId={appId} /> : null}
+      {tab() === "settings" ? <AppSettingsPanel /> : null}
     </div>
   );
+};
+
+/** Page shell: resolves the route param, then renders a body keyed by it.
+ * Page components are reused across navigations, so /apps/A → /apps/B
+ * would otherwise re-run the same fiber with a new id — and ilha's
+ * resource()/fromEventSource() slots stay bound to the first key/URL.
+ * The key makes an id change remount the whole subtree instead. */
+export default function AppPage() {
+  const appId = useRoute().params().id;
+  if (!appId) {
+    head({ title: "App · Noite" });
+    return <p class="m-0 text-sm opacity-70">Missing app id.</p>;
+  }
+  return <AppPageBody key={appId} appId={appId} />;
 }

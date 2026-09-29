@@ -2,44 +2,27 @@ import { navigate } from "@ilha/router";
 import { atom, watch } from "ilha";
 
 import { authClient } from "./auth-client";
-import { fetchSession } from "./session";
+import { signupPolicy } from "./resources";
+import { fetchSession, invalidateSession } from "./session";
 import { sleep } from "./sleep";
 
 const registrationContext = (email: string, name: string, invite: string) =>
   JSON.stringify({ email, invite, name });
 
-/** Public policy from `/api/invite/status`: the first account on a fresh
- * instance bootstraps it, so only later ones need a code. */
-interface SignupPolicy {
-  firstRun: boolean;
-  invitesPerUser: number;
-  requiresInvite: boolean;
-}
-
-const fetchSignupPolicy = async (): Promise<SignupPolicy> => {
-  try {
-    const res = await fetch("/api/invite/status");
-    if (res.ok) {
-      // SAFETY: the route answers exactly this shape (see handleInviteStatus).
-      return (await res.json()) as SignupPolicy;
-    }
-  } catch {
-    // Fall through to the stricter default below.
-  }
-  return { firstRun: false, invitesPerUser: 0, requiresInvite: true };
-};
-
-/** Page-load/passkey UX: the auth cookie may not be readable immediately, so poll briefly. */
+/** Page-load/passkey UX: the auth cookie may not be readable immediately,
+ * so poll briefly. Then drop the anonymous caches the persistent layout
+ * filled while /login was showing, so the dashboard loads as this user. */
 const waitForSession = async (): Promise<void> => {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     // oxlint-disable-next-line eslint/no-await-in-loop -- sequential cookie-readiness poll; Promise.all would defeat the early-exit
-    const session = await fetchSession({ force: true });
+    const session = await fetchSession();
     if (session.data?.user) {
-      return;
+      break;
     }
     // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll backoff
     await sleep(50);
   }
+  invalidateSession();
 };
 
 /** Passkey register / sign-in. Navigates to `/apps` on success (SPA —
@@ -53,16 +36,14 @@ export const LoginPanel = () => {
   const recovery = atom(false);
   const otpSent = atom(false);
   const otpEmail = atom("");
-  const invite = atom<SignupPolicy | null>(null);
+  const policy = signupPolicy();
+  const invite = () => policy.data();
 
-  watch.once(() => {
-    void (async () => {
-      invite.set(await fetchSignupPolicy());
-      const { data } = await fetchSession();
-      if (data?.user) {
-        navigate("/apps");
-      }
-    })();
+  watch.once(async () => {
+    const { data } = await fetchSession();
+    if (data?.user) {
+      navigate("/apps");
+    }
   });
 
   const register = async (event: SubmitEvent) => {

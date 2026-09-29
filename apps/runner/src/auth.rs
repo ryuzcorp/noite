@@ -16,11 +16,15 @@ pub async fn require_bearer(state: AppState, req: Request, next: Next) -> Respon
     // The edge fallback page does its own lookup and carries no secrets.
     // The TLS ask gate is likewise public: Caddy calls it without
     // credentials and it only answers whether a hostname may have a cert.
+    // The wake hop is public too: it is Caddy's `forward_auth` for an asleep
+    // app's own hostname (SPEC, Scale to zero), and waking an app is exactly
+    // what any request to that hostname does.
     if path == "/health"
         || path == "/ready"
         || path.starts_with("/v1/git/")
         || path == "/v1/edge/fallback"
         || path == "/v1/edge/tls-ask"
+        || path == "/v1/edge/wake"
     {
         return next.run(req).await;
     }

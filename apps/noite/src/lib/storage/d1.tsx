@@ -1,4 +1,5 @@
 //! D1 admin UI: table grid/panel, row drawer, detail panel.
+import { searchParam } from "@ilha/router";
 import {
   columnFilteringFeature,
   constructTable,
@@ -13,12 +14,13 @@ import {
 } from "@tanstack/table-core";
 import { storeReactivityBindings } from "@tanstack/table-core/store-reactivity-bindings";
 import * as Schema from "effect/Schema";
-import { atom, unsafe, watch } from "ilha";
+import { atom } from "ilha";
 
-import type { AppDetailInfo } from "../app-detail/panel";
-import { d1Write, get } from "../apps.server";
+import { d1Write } from "../apps.server";
+import { Dialog } from "../dialog";
+import { Pencil, Trash } from "../icons";
+import { appDetail } from "../resources";
 import type { D1Preview } from "../runner";
-import { readSwrCache, writeSwrCache } from "../swr-cache";
 import { StorageTopCard } from "./list";
 
 /** celld d1 prints each result set as a space-padded table: a header line,
@@ -66,19 +68,6 @@ const parseTable = (text: string): ParsedTable => {
  * not an atom — safe at module scope; table-core recommends defining it
  * once outside components). Client-side filtering/sorting/pagination over
  * the preview rows; the runner bounds the preview itself. */
-/** Set an uncontrolled input's value by id (URL-seed preset helper). */
-const setInputValue = (id: string, value: string) => {
-  const el = document.querySelector(`#${CSS.escape(id)}`);
-  if (el instanceof HTMLInputElement) {
-    el.value = value;
-  }
-};
-
-/** Lucide pencil + trash-2 for the row Actions column. */
-const PENCIL_SVG =
-  '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/></svg>';
-const TRASH_SVG =
-  '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>';
 
 /** Sort-direction mark for table headers (if/else — no nested ternary). */
 const sortIndicator = (sorted: "asc" | "desc" | false) => {
@@ -126,6 +115,22 @@ const d1RowKey = (schema: D1Column[], row: Record<string, string>): D1Key => {
     key[name] = v === "" ? null : v;
   }
   return key;
+};
+
+/** Parse `?p=`-style page indexes: garbage falls back to the first page. */
+const toPageIndex = (raw: string): number =>
+  Math.max(Math.trunc(Number(raw)) || 0, 0);
+
+/** Parse `?s=`-style page sizes: unknown sizes fall back to 10. */
+const toPageSize = (raw: string): number => {
+  const n = Math.trunc(Number(raw));
+  return [10, 25, 50, 100].includes(n) ? n : 10;
+};
+
+/** Encode a table sort for `d1-<table>-sort` (`id:asc|desc`, "" when idle). */
+const serializeSort = (sorting: { desc: boolean; id: string }[]): string => {
+  const [s] = sorting;
+  return s ? `${s.id}:${s.desc ? "desc" : "asc"}` : "";
 };
 
 /** Validate a column seed against known columns (stale URLs fall back). */
@@ -280,7 +285,7 @@ const D1TableGrid = ({
                         onEdit(row.values);
                       }}
                     >
-                      {unsafe(PENCIL_SVG)}
+                      <Pencil />
                     </button>
                     <button
                       type="button"
@@ -291,7 +296,7 @@ const D1TableGrid = ({
                         onDeleteRow(row.values);
                       }}
                     >
-                      {unsafe(TRASH_SVG)}
+                      <Trash />
                     </button>
                   </div>
                 </td>
@@ -310,10 +315,7 @@ const D1TableGrid = ({
             class="select select-sm w-24"
             aria-label="Rows per page"
             onchange={(e) => {
-              const el = e.currentTarget;
-              if (el instanceof HTMLSelectElement) {
-                onSize(Number(el.value) || 10);
-              }
+              onSize(Number(e.currentTarget.value) || 10);
             }}
           >
             {[10, 25, 50, 100].map((n) => (
@@ -366,7 +368,6 @@ const D1TablePanel = ({
   table: string;
   columns: string[];
   rows: string[][];
-  key?: string;
 }) => {
   // Space-split previews can repeat header names — dedupe for stable keys.
   const seen = new Map<string, number>();
@@ -378,72 +379,32 @@ const D1TablePanel = ({
   const data: Record<string, string>[] = rows.map((cells) =>
     Object.fromEntries(unique.map((c, i) => [c, cells[i] ?? ""]))
   );
-  // Filter state mirrors into the URL (per-table `d1-<table>-*` params)
-  // so filtered views are deep-linkable. Plain URLSearchParams +
-  // history.replaceState: no router involvement, no remount risk.
-  const urlKey = (suffix: string) => `d1-${table}-${suffix}`;
-  const urlParams =
-    typeof window === "undefined"
-      ? null
-      : new URLSearchParams(window.location.search);
-  const seededColumn = validColumnSeed(
-    unique,
-    urlParams?.get(urlKey("c")) ?? null
-  );
-  const seededSort = parseSortSeed(
-    unique,
-    urlParams?.get(urlKey("sort")) ?? null
-  );
-  const parsedSize = Math.trunc(Number(urlParams?.get(urlKey("s")) ?? ""));
-  const query = atom(urlParams?.get(urlKey("q")) ?? "");
-  const filterColumn = atom(seededColumn);
-  const filterValue = atom(urlParams?.get(urlKey("f")) ?? "");
-  const pageIndex = atom(
-    Math.max(Math.trunc(Number(urlParams?.get(urlKey("p")) ?? "")) || 0, 0)
-  );
-  const pageSize = atom(
-    [10, 25, 50, 100].includes(parsedSize) ? parsedSize : 10
-  );
-  const sorting = atom(seededSort);
-
-  const syncUrl = () => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    const params = new URLSearchParams(window.location.search);
-    const set = (suffix: string, value: string) => {
-      if (value) {
-        params.set(urlKey(suffix), value);
-      } else {
-        params.delete(urlKey(suffix));
-      }
-    };
-    set("q", query());
-    set("c", filterColumn());
-    set("f", filterValue());
-    set("p", pageIndex() > 0 ? String(pageIndex()) : "");
-    set("s", pageSize() === 10 ? "" : String(pageSize()));
-    const [s] = sorting();
-    set("sort", s ? `${s.id}:${s.desc ? "desc" : "asc"}` : "");
-    const next = params.toString();
-    window.history.replaceState(
-      null,
-      "",
-      next ? `${window.location.pathname}?${next}` : window.location.pathname
-    );
-  };
-
-  // Preset the uncontrolled inputs from URL seeds after mount (same
-  // requestAnimationFrame pattern as the profile name preset).
-  watch.once(() => {
-    if (typeof document === "undefined") {
-      return;
-    }
-    window.requestAnimationFrame(() => {
-      setInputValue(`d1-search-${table}`, query());
-      setInputValue(`d1-filter-${table}`, filterValue());
-    });
+  // Filter state lives in per-table `d1-<table>-*` URL params so filtered
+  // views are deep-linkable (writing a default removes the param).
+  // D1TablePanel is keyed by table, so these bindings rebuild with it.
+  // validColumnSeed / parseSortSeed validate seeds against known columns.
+  const query = searchParam(`d1-${table}-q`, { default: "" });
+  const filterColumn = searchParam(`d1-${table}-c`, {
+    default: "",
+    parse: (raw: string) => validColumnSeed(unique, raw),
   });
+  const filterValue = searchParam(`d1-${table}-f`, { default: "" });
+  const pageIndex = searchParam(`d1-${table}-p`, {
+    default: 0,
+    parse: toPageIndex,
+  });
+  const pageSize = searchParam(`d1-${table}-s`, {
+    default: 10,
+    parse: toPageSize,
+  });
+  const sorting = searchParam<{ desc: boolean; id: string }[]>(
+    `d1-${table}-sort`,
+    {
+      default: [],
+      parse: (raw: string) => parseSortSeed(unique, raw),
+      serialize: serializeSort,
+    }
+  );
 
   const toggleSort = (id: string) => {
     const cur = sorting().find((s) => s.id === id);
@@ -455,7 +416,6 @@ const D1TablePanel = ({
       sorting.set([{ desc: true, id }]);
     }
     pageIndex.set(0);
-    syncUrl();
   };
 
   // Row delete (confirm + write live module-scope; outcome mirrors here).
@@ -482,17 +442,6 @@ const D1TablePanel = ({
     filterValue.set("");
     sorting.set([]);
     pageIndex.set(0);
-    for (const id of [`d1-search-${table}`, `d1-filter-${table}`]) {
-      const el = document.querySelector(`#${CSS.escape(id)}`);
-      if (el instanceof HTMLInputElement) {
-        el.value = "";
-      }
-    }
-    const col = document.querySelector(`#${CSS.escape(`d1-column-${table}`)}`);
-    if (col instanceof HTMLSelectElement) {
-      col.value = "";
-    }
-    syncUrl();
   };
 
   const t = constructTable({
@@ -546,13 +495,10 @@ const D1TablePanel = ({
               class="input input-sm"
               type="search"
               placeholder="filter text…"
-              onchange={(e) => {
-                const el = e.currentTarget;
-                if (el instanceof HTMLInputElement) {
-                  query.set(el.value);
-                  pageIndex.set(0);
-                  syncUrl();
-                }
+              value={query()}
+              oninput={(e) => {
+                query.set(e.currentTarget.value);
+                pageIndex.set(0);
               }}
             />
           </fieldset>
@@ -563,13 +509,10 @@ const D1TablePanel = ({
             <select
               id={`d1-column-${table}`}
               class="select select-sm"
+              value={filterColumn()}
               onchange={(e) => {
-                const el = e.currentTarget;
-                if (el instanceof HTMLSelectElement) {
-                  filterColumn.set(el.value);
-                  pageIndex.set(0);
-                  syncUrl();
-                }
+                filterColumn.set(e.currentTarget.value);
+                pageIndex.set(0);
               }}
             >
               <option value="">All columns</option>
@@ -589,13 +532,10 @@ const D1TablePanel = ({
               class="input input-sm"
               type="search"
               placeholder="value…"
-              onchange={(e) => {
-                const el = e.currentTarget;
-                if (el instanceof HTMLInputElement) {
-                  filterValue.set(el.value);
-                  pageIndex.set(0);
-                  syncUrl();
-                }
+              value={filterValue()}
+              oninput={(e) => {
+                filterValue.set(e.currentTarget.value);
+                pageIndex.set(0);
               }}
             />
           </fieldset>
@@ -622,16 +562,13 @@ const D1TablePanel = ({
           onEdit={onEdit}
           onNext={() => {
             pageIndex.set(pageIndex() + 1);
-            syncUrl();
           }}
           onPrev={() => {
             pageIndex.set(Math.max(pageIndex() - 1, 0));
-            syncUrl();
           }}
           onSize={(n) => {
             pageSize.set(n);
             pageIndex.set(0);
-            syncUrl();
           }}
           onSort={toggleSort}
           pageCount={pageCount}
@@ -727,10 +664,10 @@ const fieldInput = (decltype: string): FieldKind => {
 };
 
 /** Create/edit drawer for one D1 table row (daisyUI modal-end). Shared by
- * Add entry (initial null) and row-ID edit. Inputs are uncontrolled and
- * preset once after mount so typing never re-renders; empty means NULL.
- * PK columns lock in edit mode; without a pk the update matches all
- * original values. */
+ * Add entry (initial null) and row-ID edit. Field values live in a
+ * `values` atom seeded from `initial`; empty means NULL. PK columns
+ * lock in edit mode; without a pk the update matches all original
+ * values. */
 const D1RowDrawer = ({
   appId,
   columns,
@@ -750,26 +687,12 @@ const D1RowDrawer = ({
   schema: D1Column[];
   table: string;
 }) => {
+  // Per-instance: the drawer mounts once per open, so this starts true
+  // every time. (A parent-owned atom stayed false after an Esc/backdrop
+  // close — <Dialog>'s onclose writes it — and the next open never showed.)
+  const open = atom(true);
   const err = atom("");
   const busy = atom(false);
-  // Exit animation without re-render: swapping the modal-box class
-  // imperatively keeps the content mounted, so the full drawer slides
-  // out intact (an atom flip would reconcile the subtree mid-exit).
-  // Unmount via onClose after 100ms (matches noite-drawer-out).
-  const beginClose = () => {
-    const box = document.querySelector("#d1-row-drawer-box");
-    if (
-      !(box instanceof HTMLElement) ||
-      box.classList.contains("noite-drawer-out")
-    ) {
-      return;
-    }
-    box.classList.remove("noite-drawer-in");
-    box.classList.add("noite-drawer-out");
-    setTimeout(() => {
-      onClose();
-    }, 100);
-  };
   const isEdit = initial !== null;
   const fields =
     schema.length > 0
@@ -777,36 +700,31 @@ const D1RowDrawer = ({
       : columns.map((name) => ({ name, pk: false, type: "" }));
   const pkCols = fields.filter((c) => c.pk).map((c) => c.name);
   const source = initial ?? {};
-
-  watch.once(() => {
-    if (typeof document === "undefined") {
-      return;
+  const seedValues = () => {
+    const seeded: Record<string, string> = {};
+    for (const col of fields) {
+      const raw = source[col.name] ?? "";
+      seeded[col.name] =
+        fieldInput(col.type).type === "datetime-local"
+          ? raw.replace(" ", "T")
+          : raw;
     }
-    window.requestAnimationFrame(() => {
-      for (const col of fields) {
-        const raw = source[col.name] ?? "";
-        setInputValue(
-          `d1-field-${table}-${col.name}`,
-          fieldInput(col.type).type === "datetime-local"
-            ? raw.replace(" ", "T")
-            : raw
-        );
-      }
-    });
-  });
+    return seeded;
+  };
+  const values = atom<Record<string, string>>(seedValues());
 
   const save = async () => {
     if (busy()) {
       return;
     }
-    const values: Record<string, string | null> = {};
+    const snapshot = values();
+    const payload: Record<string, string | null> = {};
     for (const col of fields) {
-      const el = document.querySelector(
-        `#${CSS.escape(`d1-field-${table}-${col.name}`)}`
-      );
-      if (el instanceof HTMLInputElement && !el.disabled) {
-        values[col.name] = el.value === "" ? null : el.value;
+      if (isEdit && col.pk) {
+        continue;
       }
+      const current = snapshot[col.name] ?? "";
+      payload[col.name] = current === "" ? null : current;
     }
     const key = isEdit ? d1RowKey(fields, source) : {};
     busy.set(true);
@@ -817,11 +735,11 @@ const D1RowDrawer = ({
         key,
         op: isEdit ? "update" : "insert",
         table,
-        values,
+        values: payload,
       });
       err.set("");
       onSaved();
-      beginClose();
+      onClose();
     } catch (error) {
       err.set(error instanceof Error ? error.message : String(error));
     } finally {
@@ -830,11 +748,8 @@ const D1RowDrawer = ({
   };
 
   return (
-    <div class="modal modal-end modal-open">
-      <div
-        id="d1-row-drawer-box"
-        class="modal-box bg-base-100 dark:bg-base-200 noite-drawer-in w-full max-w-md"
-      >
+    <Dialog open={open} class="modal modal-end" onClose={onClose}>
+      <div class="modal-box bg-base-100 dark:bg-base-200 w-full max-w-md">
         <h3 class="m-0 text-lg font-bold">
           {isEdit ? "Edit entry" : "Add entry"} · {table}
         </h3>
@@ -857,6 +772,13 @@ const D1RowDrawer = ({
                 step={fieldInput(col.type).step}
                 disabled={locked || busy()}
                 placeholder={locked ? "primary key (locked)" : "NULL"}
+                value={values()[col.name] ?? ""}
+                oninput={(e) => {
+                  values.set({
+                    ...values(),
+                    [col.name]: e.currentTarget.value,
+                  });
+                }}
               />
             </fieldset>
           );
@@ -873,7 +795,7 @@ const D1RowDrawer = ({
             class="btn btn-sm btn-ghost"
             disabled={busy()}
             onclick={() => {
-              beginClose();
+              onClose();
             }}
           >
             Cancel
@@ -891,17 +813,11 @@ const D1RowDrawer = ({
         </div>
       </div>
       <form method="dialog" class="modal-backdrop">
-        <button
-          aria-label="Close dialog"
-          disabled={busy()}
-          onclick={() => {
-            beginClose();
-          }}
-        >
+        <button aria-label="Close dialog" disabled={busy()}>
           close
         </button>
       </form>
-    </div>
+    </Dialog>
   );
 };
 
@@ -919,36 +835,18 @@ export const D1DetailPanel = ({
   onSaved: () => void;
 }) => {
   const { tables } = d1Data;
-  // Picker seed (validated below); the select stays in sync via
-  // reactive `selected`, so no preset is needed on remount.
-  const selectedTable = atom(
-    typeof window === "undefined"
-      ? ""
-      : (new URLSearchParams(window.location.search).get("d1-table") ?? "")
-  );
+  // Picker in ?d1-table= (deep-linkable); unknown values fall back below.
+  const selectedTable = searchParam("d1-table", { default: "" });
   // Collaborator role for write UI (fail-closed until confirmed).
-  const seedDetail = readSwrCache<AppDetailInfo>(`app:${appId}:detail`);
-  const myRole = atom(seedDetail?.myRole ?? null);
-  const appName = atom(seedDetail?.app.name ?? "");
+  const detail = appDetail(appId);
+  const myRole = detail.data()?.myRole ?? null;
+  const appName = detail.data()?.app.name ?? "";
   // Create/edit drawer state (table/schema resolve from the selection).
+  // The drawer mounts per open and reports its close through onClose.
   const drawer = atom<null | {
     mode: "create" | "edit";
     row: Record<string, string> | null;
   }>(null);
-
-  watch.once(() => {
-    void (async () => {
-      try {
-        const info = await get(appId);
-        myRole.set(info.myRole);
-        appName.set(info.app.name);
-        writeSwrCache(`app:${appId}:detail`, info);
-      } catch {
-        // Role stays at its seed; write UI stays hidden without push/admin.
-      }
-    })();
-  });
-
   const current = tables.includes(selectedTable())
     ? selectedTable()
     : (tables[0] ?? "");
@@ -957,23 +855,13 @@ export const D1DetailPanel = ({
     currentIndex === -1
       ? { columns: [], rows: [] }
       : parseTable(d1Data.rows[currentIndex] ?? "");
-  const canWrite = myRole() === "push" || myRole() === "admin";
+  const canWrite = myRole === "push" || myRole === "admin";
   const switchTable = (next: string) => {
     if (!tables.includes(next)) {
       return;
     }
     drawer.set(null);
     selectedTable.set(next);
-    if (typeof window === "undefined") {
-      return;
-    }
-    const params = new URLSearchParams(window.location.search);
-    params.set("d1-table", next);
-    window.history.replaceState(
-      null,
-      "",
-      `${window.location.pathname}?${params.toString()}`
-    );
   };
   const currentSchema = parseD1Schema(d1Data.schemas[currentIndex] ?? "[]");
   const activeDrawer = drawer();
@@ -990,10 +878,7 @@ export const D1DetailPanel = ({
                   aria-label="Table"
                   class="select select-sm"
                   onchange={(e) => {
-                    const el = e.currentTarget;
-                    if (el instanceof HTMLSelectElement) {
-                      switchTable(el.value);
-                    }
+                    switchTable(e.currentTarget.value);
                   }}
                 >
                   {tables.map((t) => (
@@ -1019,7 +904,7 @@ export const D1DetailPanel = ({
           )
         }
         appId={appId}
-        appName={appName()}
+        appName={appName}
         badge="D1"
         subtitle={`${tables.length} table(s)`}
         title={databaseId}

@@ -1,6 +1,6 @@
 /* eslint-disable func-names -- Effect.gen uses anonymous generators */
 import * as Effect from "effect/Effect";
-import { SqlClient } from "effect/unstable/sql/SqlClient";
+import { SqlClient } from "effect/sql/SqlClient";
 
 import { resolveAdminEmail, UnauthorizedError } from "./auth";
 import { orm, withDb } from "./db";

@@ -71,8 +71,11 @@ pub async fn deploy_app(
         tracing::info!(slug = %app.slug, "deploy skip (in flight)");
         return;
     }
+    // A deploy is activity (SPEC, Scale to zero): wake an asleep app so the
+    // reconcile loop spawns the fleet this release lands in.
+    crate::host::sleep::wake_for_deploy(pool, &app).await;
     let result = deploy_inner(pool, cfg, procs, logs, &app, object_key, tip_sha).await;
-    if let Err(e) = result {
+    if let Err(e) = &result {
         tracing::error!(slug = %app.slug, error = %e, "deploy failed");
         if let Err(db_e) = db::upsert_deploy(
             pool,
@@ -87,6 +90,9 @@ pub async fn deploy_app(
             tracing::error!(slug = %app.slug, error = %db_e, "failed to record deploy failure");
         }
     }
+    // T5.1: the build just populated the persistent cache; prune it back to
+    // the cap now, on success and on failure alike.
+    cmd::prune_build_cache(&cmd::build_cache_dir(cfg, &app.slug), cfg.build_cache_mb);
     release(deploying, &app.id).await;
 }
 
@@ -158,24 +164,64 @@ async fn deploy_inner(
     )
     .await?;
 
+    // T5.2: the bare mirror (`repos/<slug>.git`, same one the source preview
+    // reads) already has this sha on a warm app — fetch from it instead of
+    // re-downloading the full bundle from S3. The mirror only ever gains the
+    // shas deploys fetched, so `cat-file -e` is the whole check.
+    let bare = cmd::work_root(cfg)
+        .join("repos")
+        .join(format!("{}.git", app.slug));
+    let mirror_warm = bare.join("HEAD").exists()
+        && cmd::run_cmd(
+            "git",
+            &[
+                &format!("--git-dir={}", bare.display()),
+                "cat-file",
+                "-e",
+                &commit_sha,
+            ],
+            Some(&work),
+            &[],
+            Duration::from_secs(30),
+        )
+        .await
+        .is_ok();
     let bundle_path = work.join(format!("{commit_sha}.bundle"));
-    let uri = cfg.s3_uri(object_key);
-    cmd::s3_cp_download(cfg, &uri, &bundle_path).await?;
-    let bytes = tokio::fs::metadata(&bundle_path).await?.len();
-    deploy_id = db::upsert_deploy(
-        pool,
-        Some(&deploy_id),
-        &app.id,
-        DeployStatus::Building.as_str(),
-        Some(&commit_sha),
-        &format!(
-            "downloaded {bytes} bytes · {}\n",
-            &commit_sha[..12.min(commit_sha.len())]
-        ),
-    )
-    .await?;
+    let fetch_from = if mirror_warm {
+        tracing::info!(slug = %app.slug, sha = %&commit_sha[..12.min(commit_sha.len())], "mirror warm; skipping bundle download");
+        deploy_id = db::upsert_deploy(
+            pool,
+            Some(&deploy_id),
+            &app.id,
+            DeployStatus::Building.as_str(),
+            Some(&commit_sha),
+            &format!(
+                "mirror warm ({}); skipping bundle download\n",
+                &commit_sha[..12.min(commit_sha.len())]
+            ),
+        )
+        .await?;
+        bare.clone()
+    } else {
+        let uri = cfg.s3_uri(object_key);
+        cmd::s3_cp_download(cfg, &uri, &bundle_path).await?;
+        let bytes = tokio::fs::metadata(&bundle_path).await?.len();
+        deploy_id = db::upsert_deploy(
+            pool,
+            Some(&deploy_id),
+            &app.id,
+            DeployStatus::Building.as_str(),
+            Some(&commit_sha),
+            &format!(
+                "downloaded {bytes} bytes · {}\n",
+                &commit_sha[..12.min(commit_sha.len())]
+            ),
+        )
+        .await?;
+        bundle_path.clone()
+    };
 
-    let src_dir = materialize_bundle(cfg, app, &work, &bundle_path, &commit_sha).await?;
+    let src_dir = materialize_bundle(cfg, app, &work, &fetch_from, &commit_sha).await?;
     // Tenant env (`.dev.vars` model): build + release see the same vars the
     // fleet gets at spawn. Reserved platform names filtered in db (now
     // including RUNNER_*/NOITE_*/BETTER_AUTH_*/CADDY_*/LD_*/NODE_OPTIONS/BUN_*).
@@ -204,7 +250,22 @@ async fn deploy_inner(
             tracing::warn!(slug = %app.slug, "chown worktree to build uid failed; continuing (needs CAP_CHOWN)");
         }
     }
-    let sb = Sandbox { uid: if sandbox_ok { cfg.build_uid } else { None }, gid: if sandbox_ok { cfg.build_gid } else { None }, env: &tenant_refs };
+    // T5.1: persistent per-app bun cache. Created root-owned (umask 077, so
+    // the fleet uid can never read it) and handed to the build uid exactly
+    // like the worktree. It outlives the per-deploy worktree wiped below.
+    let bun_cache = cmd::build_cache_dir(cfg, &app.slug);
+    tokio::fs::create_dir_all(&bun_cache).await?;
+    #[cfg(unix)]
+    if let Some(parent) = bun_cache.parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
+    }
+    if let (Some(uid), Some(gid)) = (cfg.build_uid, cfg.build_gid) {
+        if sandbox_ok && !cmd::lchown_tree(&bun_cache, uid, gid) {
+            tracing::warn!(slug = %app.slug, "chown bun cache to build uid failed; continuing (needs CAP_CHOWN)");
+        }
+    }
+    let sb = Sandbox { uid: if sandbox_ok { cfg.build_uid } else { None }, gid: if sandbox_ok { cfg.build_gid } else { None }, env: &tenant_refs, bun_cache: Some(&bun_cache) };
 
     cmd::check_work_quota(&work, cfg.build_max_mb)?;
     if tokio::fs::try_exists(src_dir.join("package.json")).await? {
@@ -286,7 +347,7 @@ async fn deploy_inner(
             owned.push(("NOITE_APP_PREFIX".into(), format!("fleets/{}", app.slug)));
             let mut cmd_env: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             cmd_env.extend(tenant_refs.iter().copied());
-            let sb_release = Sandbox { uid: sb.uid, gid: sb.gid, env: &cmd_env };
+            let sb_release = Sandbox { uid: sb.uid, gid: sb.gid, env: &cmd_env, bun_cache: sb.bun_cache };
             let out = cmd::run_sandboxed("sh", &["-c", &release], &src_dir, &sb_release, Duration::from_secs(600)).await?;
             let tail = if out.len() > 4096 { &out[out.len() - 4096..] } else { &out };
             deploy_id = db::upsert_deploy(

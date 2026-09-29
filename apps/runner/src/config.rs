@@ -132,7 +132,11 @@ fn parse_fleet_ports() -> (u16, u16) {
      /// Fleet port range (SPEC, Ports): two ports per app.
      pub fleet_port_min: u16,
      pub fleet_port_max: u16,
-     pub poll_ms: u64,
+    pub poll_ms: u64,
+    /// Fallback S3 tip sweep interval (T2.2): pushes notify the reconcile
+    /// loop over an in-process channel, and this only covers bundles written
+    /// behind the runner's back (another runner, a manual bucket write).
+    pub tip_sweep_s: u64,
      pub caddy_upstream_host: String,
      /// Caddy `auto_https`: unset = on except `localhost`; explicit
      /// `off` for behind-proxy deployments (our Caddy still terminates
@@ -160,10 +164,25 @@ fn parse_fleet_ports() -> (u16, u16) {
      /// runner's RUST_LOG describes the runner's modules, so inheriting it left
      /// a fleet's runtime logs out of the per-app log view entirely.
      pub fleet_log: String,
-     /// Idle seconds after which a fleet's cells hibernate
-     /// (`CELLD_IDLE_EVICT_S`). The docs' default evicts only under memory
-     /// pressure, which keeps idle fleets resident forever.
-     pub fleet_idle_evict_s: u32,
+    /// Idle seconds after which a fleet's cells hibernate
+    /// (`CELLD_IDLE_EVICT_S`). The docs' default evicts only under memory
+    /// pressure, which keeps idle fleets resident forever.
+    pub fleet_idle_evict_s: u32,
+    /// Seconds between a fleet's own polls for new deployments
+    /// (`CELLD_DEPLOY_POLL_S`). The runner POSTs /reload after every deploy,
+    /// so this only covers a missed reload — 300 keeps the fleet quiet.
+    pub fleet_deploy_poll_s: u64,
+    /// Scale to zero: park an app after this many hours without a request
+    /// (`RUNNER_SLEEP_AFTER_H`, 24; 0 disables). SPEC, Scale to zero.
+    pub sleep_after_h: u64,
+    /// How often the sleep sweep runs (`RUNNER_SLEEP_SWEEP_S`, 3600).
+    pub sleep_sweep_s: u64,
+    /// Upper bound a woken request waits for the fleet's health gate
+    /// (`RUNNER_WAKE_TIMEOUT_S`, 120: covers celld's ready gate).
+    pub wake_timeout_s: u64,
+    /// Per-fleet on-disk asset cache in MiB (`CELLD_ASSET_CACHE_BYTES`),
+    /// bounding the 512 MiB celld default per idle app.
+    pub fleet_asset_cache_mb: u64,
      /// Caddy JSON access log the device/path/ref tick tails. The Caddy `log`
      /// block is path-fixed at the volume root; the Caddyfile itself may live
      /// in a subpath (dev `dynamic/`).
@@ -173,14 +192,24 @@ fn parse_fleet_ports() -> (u16, u16) {
      /// Graceful-stop budget in ms (SPEC, Shutdown). Fleets get
      /// budget - 3000 as CELLD_SHUTDOWN_TOTAL_MS.
      pub stop_budget_ms: u64,
-     /// Max worktree bytes before a build is refused (RUNNER_BUILD_MAX_MB).
-     pub build_max_mb: u64,
-     /// Uids for the build sandbox (10010) and tenant fleets (10020).
-     /// None = current user (dev only, single-tenant).
-     pub build_uid: Option<u32>,
-     pub build_gid: Option<u32>,
-     pub fleet_uid: Option<u32>,
-     pub fleet_gid: Option<u32>,
+    /// Max worktree bytes before a build is refused (RUNNER_BUILD_MAX_MB).
+    pub build_max_mb: u64,
+    /// Cap per app on the persistent bun cache (RUNNER_BUILD_CACHE_MB).
+    /// Pruned oldest-first after each deploy; 0 disables persistence.
+    pub build_cache_mb: u64,
+    /// Days of telemetry kept everywhere (RUNNER_TELEMETRY_RETENTION_DAYS):
+    /// celld's bucket prune, the metric table prune and the glob floor.
+    pub telemetry_retention_days: i64,
+    /// celld OTel bucket-flush interval in ms (`CELLD_OTEL_FLUSH_MS`), and the
+    /// ingest tick cadence (spec T3.4). 30 s means ~6x fewer Parquet PUTs and
+    /// files than the old 5 s; dashboards lag live traffic by up to ~40 s.
+    pub otel_flush_ms: u64,
+    /// Uids for the build sandbox (10010) and tenant fleets (10020).
+    /// None = current user (dev only, single-tenant).
+    pub build_uid: Option<u32>,
+    pub build_gid: Option<u32>,
+    pub fleet_uid: Option<u32>,
+    pub fleet_gid: Option<u32>,
      /// Baked control bundle (fleet #0 source; absent in the dev image).
      pub control_bundle_dir: String,
      /// Better-auth origin for boot validation (host must be served).
@@ -251,6 +280,7 @@ impl Config {
             fleet_port_min,
             fleet_port_max,
             poll_ms: env_or(&["RUNNER_POLL_MS"], "5000").parse().unwrap_or(5000),
+            tip_sweep_s: env_or(&["RUNNER_TIP_SWEEP_S"], "60").parse().unwrap_or(60),
             // Everything Caddy proxies to lives in this container.
             caddy_upstream_host: "127.0.0.1".into(),
             auto_https,
@@ -266,9 +296,24 @@ impl Config {
                 .parse()
                 .unwrap_or(0),
             fleet_log: env_or(&["RUNNER_FLEET_LOG"], "error,celld=warn"),
-            fleet_idle_evict_s: env_or(&["RUNNER_FLEET_IDLE_EVICT_S"], "300")
+            fleet_idle_evict_s: env_or(&["RUNNER_FLEET_IDLE_EVICT_S"], "120")
+                .parse()
+                .unwrap_or(120),
+            fleet_deploy_poll_s: env_or(&["RUNNER_FLEET_DEPLOY_POLL_S"], "300")
                 .parse()
                 .unwrap_or(300),
+            sleep_after_h: env_or(&["RUNNER_SLEEP_AFTER_H"], "24")
+                .parse()
+                .unwrap_or(24),
+            sleep_sweep_s: env_or(&["RUNNER_SLEEP_SWEEP_S"], "3600")
+                .parse()
+                .unwrap_or(3600),
+            wake_timeout_s: env_or(&["RUNNER_WAKE_TIMEOUT_S"], "120")
+                .parse()
+                .unwrap_or(120),
+            fleet_asset_cache_mb: env_or(&["RUNNER_FLEET_ASSET_CACHE_MB"], "64")
+                .parse()
+                .unwrap_or(64),
             tenancy,
             stop_budget_ms: env_or(&["NOITE_STOP_BUDGET_MS"], "25000")
                 .parse()
@@ -276,6 +321,15 @@ impl Config {
             build_max_mb: env_or(&["RUNNER_BUILD_MAX_MB"], "2048")
                 .parse()
                 .unwrap_or(2048),
+            build_cache_mb: env_or(&["RUNNER_BUILD_CACHE_MB"], "512")
+                .parse()
+                .unwrap_or(512),
+            telemetry_retention_days: env_or(&["RUNNER_TELEMETRY_RETENTION_DAYS"], "14")
+                .parse()
+                .unwrap_or(14),
+            otel_flush_ms: env_or(&["RUNNER_OTEL_FLUSH_MS"], "30000")
+                .parse()
+                .unwrap_or(30000),
             build_uid: parse_opt_uid(env::var("RUNNER_BUILD_UID").ok().as_deref(), 10010),
             build_gid: parse_opt_uid(env::var("RUNNER_BUILD_GID").ok().as_deref(), 10010),
             fleet_uid: parse_opt_uid(env::var("RUNNER_FLEET_UID").ok().as_deref(), 10020),
@@ -324,6 +378,12 @@ impl Config {
         }
         if self.stop_budget_ms < 5000 {
             problems.push("NOITE_STOP_BUDGET_MS must be >= 5000".into());
+        }
+        if self.telemetry_retention_days < 1 {
+            problems.push("RUNNER_TELEMETRY_RETENTION_DAYS must be >= 1".into());
+        }
+        if self.otel_flush_ms < 1000 {
+            problems.push("RUNNER_OTEL_FLUSH_MS must be >= 1000".into());
         }
         if std::env::var("RAILWAY_DEPLOYMENT_ID").is_ok() {
             if let Ok(grace) = std::env::var("RAILWAY_DEPLOYMENT_DRAINING_SECONDS") {
@@ -488,12 +548,18 @@ mod tests {
             fleet_port_min: 20000,
             fleet_port_max: 29999,
             poll_ms: 5000,
+            tip_sweep_s: 60,
             caddy_upstream_host: "127.0.0.1".into(),
             auto_https: false,
             fleet_log: "error,celld=warn".into(),
             max_apps_per_user: 10,
             fleet_max_rss_mb: 0,
-            fleet_idle_evict_s: 300,
+            fleet_idle_evict_s: 120,
+            fleet_deploy_poll_s: 300,
+            sleep_after_h: 24,
+            sleep_sweep_s: 3600,
+            wake_timeout_s: 120,
+            fleet_asset_cache_mb: 64,
             caddy_control_upstream: CONTROL_UPSTREAM.into(),
             caddy_api_upstream: API_UPSTREAM.into(),
             caddy_admin_url: "http://127.0.0.1:2019".into(),
@@ -502,6 +568,9 @@ mod tests {
             tenancy: Tenancy::Single,
             stop_budget_ms: 25000,
             build_max_mb: 2048,
+            build_cache_mb: 512,
+            telemetry_retention_days: 14,
+            otel_flush_ms: 30000,
             build_uid: None,
             build_gid: None,
             fleet_uid: None,

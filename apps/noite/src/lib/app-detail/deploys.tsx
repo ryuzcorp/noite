@@ -1,42 +1,32 @@
 //! Deploy history: header dropdown + SSE list.
-import { atom, unsafe, watch } from "ilha";
+import { atom } from "ilha";
 
-import { get, rollback } from "../apps.server";
+import { rollback } from "../apps.server";
 import { formatDateTime } from "../dates";
+import { decodeDeploys, deploysUrl, feedKeys, liveFeed } from "../feeds";
+import { Check, ChevronDown, ChevronUp, CloudUpload, Copy } from "../icons";
+import { appDetail, deployLog } from "../resources";
 import type { RunnerDeploy } from "../runner";
 import { ListSkeleton } from "../skeletons";
-import { readSwrCache, writeSwrCache } from "../swr-cache";
-import {
-  CHECK_SVG,
-  CHEVRON_DOWN_SVG,
-  CHEVRON_UP_SVG,
-  CLOUD_UPLOAD_SVG,
-  COPY_SVG,
-  deployBadge,
-} from "./icons";
 import { RuntimeLogs } from "./logs";
-import type { AppDetailInfo } from "./panel";
+
+export const deployBadge = (status: string) => {
+  let tone = "badge-ghost";
+  if (status === "success") {
+    tone = "badge-primary";
+  } else if (status === "failed") {
+    tone = "badge-error";
+  } else if (status === "building" || status === "deploying") {
+    tone = "badge-warning";
+  }
+  return <span class={`badge badge-sm ${tone}`}>{status}</span>;
+};
 
 /** Deploy (git remote) card dropdown. Lives in the page header next to
- * Code so it works on every tab; loads its own detail via the shared SWR
- * key. CSS-only dropdown (focus-based) — no visibility atom needed. */
+ * Code so it works on every tab; loads its own detail via the shared
+ * resource. CSS-only dropdown (focus-based) — no visibility atom needed. */
 export const DeployDropdown = ({ appId }: { appId: string }) => {
-  const detail = atom<AppDetailInfo | null>(
-    readSwrCache<AppDetailInfo>(`app:${appId}:detail`)
-  );
-  watch.once(() => {
-    void (async () => {
-      try {
-        const info = await get(appId);
-        detail.set(info);
-        writeSwrCache(`app:${appId}:detail`, info);
-      } catch {
-        // Header modal stays shut without data.
-      }
-    })();
-  });
-
-  const info = detail();
+  const info = appDetail(appId).data();
   const copied = atom(false);
   const redeploying = atom(false);
   const redeployError = atom("");
@@ -59,7 +49,7 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
     <div class="dropdown dropdown-end">
       <div tabindex={0} role="button" class="btn btn-sm btn-neutral">
         <span class="inline-flex items-center gap-1">
-          {unsafe(CLOUD_UPLOAD_SVG)}
+          <CloudUpload />
           Deploy
         </span>
       </div>
@@ -82,13 +72,13 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
                 void copyRemote();
               }}
             >
-              {unsafe(copied() ? CHECK_SVG : COPY_SVG)}
+              {copied() ? <Check /> : <Copy />}
             </button>
           </div>
           <p class="m-0 text-sm opacity-80">
             Stock Git over HTTP — push <code>main</code> to deploy. Auth:{" "}
             <code>username={info.username}</code>, password = API key from{" "}
-            <a href="/profile" class="link">
+            <a href="/account" class="link">
               Account
             </a>
             .
@@ -144,6 +134,58 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
   );
 };
 
+/** A finished deploy's build log, fetched once per deploy id when its tab
+ * opens (T1.7). The stream omits finished rows' logs, so this resource —
+ * cached forever, since finished deploys never change — is the only read. */
+const FinishedBuildLog = ({
+  appId,
+  deployId,
+}: {
+  appId: string;
+  deployId: string;
+}) => {
+  const res = deployLog(appId, deployId);
+  const log = res.data()?.log;
+  return (
+    <div class="bg-base-200 rounded-lg p-3">
+      <pre class="max-h-64 overflow-auto rounded font-mono text-xs whitespace-pre-wrap">
+        {log ?? "(loading build log…)"}
+      </pre>
+    </div>
+  );
+};
+
+/** Build-log pane for one deploy row: deployment logs, the live log of the
+ * in-flight newest row (the stream carries it), or the on-demand fetch of
+ * a finished row (the stream omits it; cached forever). */
+const BuildLogPane = ({
+  appId,
+  d,
+  tab,
+}: {
+  appId: string;
+  d: RunnerDeploy;
+  tab: "build" | "deploy";
+}) => {
+  if (tab === "deploy") {
+    return (
+      <div class="bg-base-200 rounded-lg p-3">
+        <RuntimeLogs appId={appId} />
+      </div>
+    );
+  }
+  if (d.log) {
+    return (
+      <div class="bg-base-200 rounded-lg p-3">
+        <pre class="max-h-64 overflow-auto rounded font-mono text-xs whitespace-pre-wrap">
+          {d.log}
+        </pre>
+      </div>
+    );
+  }
+  return <FinishedBuildLog appId={appId} deployId={d.id} />;
+};
+
 const DeployRow = ({
   appId,
   currentSha,
@@ -152,13 +194,10 @@ const DeployRow = ({
   appId: string;
   currentSha: string | null;
   d: RunnerDeploy;
-  key?: string;
 }) => {
-  // Atom-driven expansion (no native <details>): ilha binds no `ontoggle`
-  // event and stream re-renders would wipe native open state shut.
-  // The log is a sibling <li> (block layout, full width by construction)
-  // instead of a grid child — immune to list-row span subtleties.
-  // The current deployment starts expanded.
+  // Atom-driven expansion: the log is a sibling <li> (block layout, full
+  // width by construction) instead of a grid child — immune to list-row
+  // span subtleties. The current deployment starts expanded.
   const open = atom(!!d.sha && d.sha === currentSha);
   const logTab = atom<"build" | "deploy">("deploy");
   const rolling = atom(false);
@@ -220,7 +259,7 @@ const DeployRow = ({
         >
           <span class="inline-flex items-center gap-1">
             {open() ? "Hide logs" : "View logs"}
-            {unsafe(open() ? CHEVRON_UP_SVG : CHEVRON_DOWN_SVG)}
+            {open() ? <ChevronUp /> : <ChevronDown />}
           </span>
         </button>
       </li>
@@ -250,87 +289,34 @@ const DeployRow = ({
               Build logs
             </button>
           </div>
-          {logTab() === "deploy" ? (
-            <div class="bg-base-200 rounded-lg p-3">
-              <RuntimeLogs
-                appId={appId}
-                logId={`deploy-logs-${d.sha ?? d.id}`}
-              />
-            </div>
-          ) : (
-            <div class="bg-base-200 rounded-lg p-3">
-              <pre class="max-h-64 overflow-auto rounded font-mono text-xs whitespace-pre-wrap">
-                {d.log || "(no log)"}
-              </pre>
-            </div>
-          )}
+          <BuildLogPane appId={appId} d={d} tab={logTab()} />
         </li>
       ) : null}
     </>
   );
 };
 
-/** Deploy history over SSE (like RuntimeLogs): cache-first seed paints
- * instantly on every mount, then the event stream pushes updates and
- * rewrites the cache — no polling, and rows never remount underneath
+/** Deploy history over SSE: skeleton until the first frame, then the event
+ * stream pushes updates — no polling, and rows never remount underneath
  * an open log. */
 export const DeployList = ({ appId }: { appId: string }) => {
-  const seed = readSwrCache<RunnerDeploy[]>(`app:${appId}:deploys`);
-  const items = atom<RunnerDeploy[]>(seed ?? []);
-  const loadError = atom("");
-  const loaded = atom(seed !== null);
-  const detail = atom<AppDetailInfo | null>(
-    readSwrCache<AppDetailInfo>(`app:${appId}:detail`)
+  const feed = liveFeed(
+    feedKeys.deploys(appId),
+    deploysUrl(appId),
+    decodeDeploys
   );
-  watch.once(() => {
-    void (async () => {
-      try {
-        const info = await get(appId);
-        detail.set(info);
-        writeSwrCache(`app:${appId}:detail`, info);
-      } catch {
-        // Detail only hides the current row's rollback; rows render regardless.
-      }
-    })();
-    let stopped = false;
-    const source = new EventSource(
-      `/api/apps/${encodeURIComponent(appId)}/deploys/stream`
-    );
-    source.addEventListener("message", (event) => {
-      // A frame arrived, so the stream is alive — even when the payload
-      // matches (empty history with no seed would stick on the skeleton).
-      loaded.set(true);
-      try {
-        const next: unknown = JSON.parse(event.data);
-        if (!Array.isArray(next)) {
-          return;
-        }
-        if (JSON.stringify(items()) === JSON.stringify(next)) {
-          return;
-        }
-        // SAFETY: the runner deploys stream emits the same Deploy rows as
-        // the list endpoint; entries flow only into list rendering.
-        items.set(next as RunnerDeploy[]);
-        writeSwrCache(`app:${appId}:deploys`, next);
-        loadError.set("");
-      } catch {
-        loadError.set("Deploy stream sent invalid data");
-      }
-    });
-    source.addEventListener("error", () => {
-      if (!stopped) {
-        loadError.set("Deploy stream disconnected — retrying…");
-      }
-      loaded.set(true);
-    });
-    return () => {
-      stopped = true;
-      source.close();
-    };
-  });
+  const items = (): RunnerDeploy[] => feed.latest() ?? [];
+  const loaded = (): boolean =>
+    feed.latest() !== undefined || feed.status() === "open";
+  const retrying = (): boolean => feed.status() === "retrying";
+  const currentSha = appDetail(appId).data()?.app.lastDeploySha ?? null;
   return (
     <div class="flex w-full flex-col gap-4">
-      {loadError() ? <p class="text-error m-0 text-sm">{loadError()}</p> : null}
+      {retrying() ? (
+        <p class="text-error m-0 text-sm">
+          Deploy stream disconnected — retrying…
+        </p>
+      ) : null}
       <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
         <li class="flex items-center justify-between gap-2 p-4 pb-2">
           <span class="flex items-center gap-2 tracking-wide">
@@ -338,23 +324,18 @@ export const DeployList = ({ appId }: { appId: string }) => {
             <span class="badge badge-sm">{items().length}</span>
           </span>
         </li>
-        {!loaded() && items().length === 0 && !loadError() ? (
+        {!loaded() && items().length === 0 && !retrying() ? (
           <li class="px-4 pt-2 pb-4">
             <ListSkeleton rows={2} />
           </li>
         ) : null}
-        {loaded() && items().length === 0 && !loadError() ? (
+        {loaded() && items().length === 0 && !retrying() ? (
           <li class="text-base-content/70 px-4 pt-2 pb-4 text-sm">
             No deployments yet. Push to main to trigger one.
           </li>
         ) : null}
         {items().map((d) => (
-          <DeployRow
-            key={d.id}
-            appId={appId}
-            currentSha={detail()?.app.lastDeploySha ?? null}
-            d={d}
-          />
+          <DeployRow key={d.id} appId={appId} currentSha={currentSha} d={d} />
         ))}
       </ul>
     </div>

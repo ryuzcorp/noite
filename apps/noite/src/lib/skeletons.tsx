@@ -110,14 +110,3 @@ export const DashboardSkeleton = () => (
     </div>
   </div>
 );
-
-/** Full page: breadcrumb line + header. Replaces the session splash and
- * other whole-view gates. */
-export const PageSkeleton = () => (
-  <div class="mx-auto mt-4 flex w-full max-w-5xl flex-col gap-4 px-4 pb-12">
-    <div class="skeleton h-4 w-32" />
-    <div class="w-full max-w-2xl">
-      <AppHeaderSkeleton />
-    </div>
-  </div>
-);

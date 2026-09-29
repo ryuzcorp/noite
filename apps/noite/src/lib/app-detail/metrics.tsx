@@ -1,7 +1,10 @@
 //! Usage charts: 24h request/CPU bars + spans table.
-import { atom, unsafe, watch } from "ilha";
+import { atom } from "ilha";
 
 import { formatHour } from "../dates";
+import { decodeMetrics, feedKeys, liveFeed, metricsUrl } from "../feeds";
+import type { MetricsFrame } from "../feeds";
+import { Info } from "../icons";
 import type {
   RunnerDevice,
   RunnerMetric,
@@ -9,8 +12,10 @@ import type {
   RunnerRef,
   RunnerSpan,
 } from "../runner";
-import { readSwrCache, writeSwrCache } from "../swr-cache";
-import { INFO_SVG } from "./icons";
+
+/** The period every metric on this card covers — matches the control
+ * route's METRICS_WINDOW_HOURS (all series share one window). */
+const WINDOW_LABEL = "last 24h";
 
 // UTC hour-bucket keys (`2026-09-21T16`) matching the runner's UTC stamps.
 // Display only — labels go through formatHour (viewer-local, no TZ).
@@ -35,25 +40,50 @@ const perReqAvg = (totals: number[], counts: number[]) =>
     return n > 0 ? t / n : 0;
   });
 
-// Inline SVG lives here as a string: ilha mounts JSX in the HTML namespace,
-// where <svg> elements never become real graphics (see the icon SVGs above
-// using unsafe() for the same reason). All interpolated values are numbers
-// or our own hour keys — no user input reaches the markup.
-const barSvg = (values: number[], max: number): string => {
+const BarChart = ({ values, max }: { values: number[]; max: number }) => {
   const width = values.length * 10;
-  const bars = values
-    .map((v, i) => {
-      const height = Math.max(1.5, (v / max) * 62).toFixed(1);
-      const y = (64 - Number(height)).toFixed(1);
-      const shown = Number.isInteger(v) ? `${v}` : v.toFixed(1);
-      // Visible bar plus a transparent full-height capture rect painted
-      // above it: hovering anywhere in the column (not just the green
-      // fill) shows the hour/value tooltip. Transparent fill still takes
-      // pointer events; fill="none" would not.
-      return `<rect x="${i * 10 + 1}" y="${y}" width="8" height="${height}" rx="1.5" fill="currentColor"/><rect x="${i * 10}" y="0" width="10" height="64" fill="transparent"><title>${formatHour(hourKeys()[i] ?? "")} · ${shown}</title></rect>`;
-    })
-    .join("");
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} 64" width="100%" height="100%" preserveAspectRatio="none" role="img"><line x1="0" y1="63.5" x2="${width}" y2="63.5" stroke="currentColor" stroke-width="1" opacity="0.25" vector-effect="non-scaling-stroke"/>${bars}</svg>`;
+  return (
+    <svg
+      viewBox={`0 0 ${width} 64`}
+      width="100%"
+      height="100%"
+      {...{ preserveAspectRatio: "none" }}
+      role="img"
+    >
+      <line
+        x1="0"
+        y1="63.5"
+        x2={width}
+        y2="63.5"
+        stroke="currentColor"
+        stroke-width="1"
+        opacity="0.25"
+        {...{ "vector-effect": "non-scaling-stroke" }}
+      />
+      {values.map((v, i) => {
+        const height = Math.max(1.5, (v / max) * 62).toFixed(1);
+        const y = (64 - Number(height)).toFixed(1);
+        const shown = Number.isInteger(v) ? `${v}` : v.toFixed(1);
+        return (
+          <>
+            <rect
+              x={i * 10 + 1}
+              y={y}
+              width="8"
+              height={height}
+              {...{ rx: "1.5" }}
+              fill="currentColor"
+            />
+            <rect x={i * 10} y="0" width="10" height="64" fill="transparent">
+              <title>
+                {formatHour(hourKeys()[i] ?? "")} · {shown}
+              </title>
+            </rect>
+          </>
+        );
+      })}
+    </svg>
+  );
 };
 
 const BarRow = ({
@@ -71,7 +101,7 @@ const BarRow = ({
       <span class="font-medium">{sum(values)}</span>
     </div>
     <div class="text-primary/70 block h-16 w-full">
-      {unsafe(barSvg(values, max))}
+      <BarChart values={values} max={max} />
     </div>
     <div class="flex justify-between text-[10px] opacity-60">
       <span>{hourEnds()[0]}</span>
@@ -101,10 +131,10 @@ const StatTiles = ({
   const cpu =
     totalCpu >= 1000 ? `${(totalCpu / 1000).toFixed(1)} s` : `${totalCpu} ms`;
   const tiles: [string, string, string][] = [
-    ["Requests", totalReq.toLocaleString(), "last 24h"],
+    ["Requests", totalReq.toLocaleString(), WINDOW_LABEL],
     ["Error rate", errRate, `${totalErr.toLocaleString()} errors`],
     ["Avg latency", avgLat, "per request"],
-    ["CPU time", cpu, "last 24h"],
+    ["CPU time", cpu, WINDOW_LABEL],
   ];
   return (
     <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
@@ -334,8 +364,8 @@ const MetricsDetailCards = ({
           ) : null}
           {spans.length === 0 && !spansError ? (
             <p class="m-0 text-sm opacity-70">
-              No spans in the last hour — spans reflect live fleet traces, not
-              history.
+              No spans in the {WINDOW_LABEL} — spans come from the fleet's
+              traces.
             </p>
           ) : null}
         </div>
@@ -448,91 +478,28 @@ export const MetricsCard = ({
   detail?: boolean;
   viewAllHref?: string;
 }) => {
-  // Cache-first atoms: first paint carries last-good data on EVERY mount
-  // (remount timing must never gate the paint); watch.once revalidates.
-  const seedRows = readSwrCache<RunnerMetric[]>(`app:${appId}:metrics`);
-  const seedSpans = readSwrCache<RunnerSpan[]>(`app:${appId}:spans`);
-  const seedDevices = readSwrCache<RunnerDevice[]>(`app:${appId}:devices`);
-  const seedPaths = readSwrCache<RunnerPath[]>(`app:${appId}:paths`);
-  const seedRefs = readSwrCache<RunnerRef[]>(`app:${appId}:refs`);
-  const rows = atom<RunnerMetric[]>(seedRows ?? []);
-  const spans = atom<RunnerSpan[]>(seedSpans ?? []);
-  const devices = atom<RunnerDevice[]>(seedDevices ?? []);
-  const paths = atom<RunnerPath[]>(seedPaths ?? []);
-  const refs = atom<RunnerRef[]>(seedRefs ?? []);
-  const loadError = atom("");
+  // Usage over SSE: last snapshot (or skeleton when cold) until the first
+  // frame, then the stream pushes a frame only when the request total moves.
+  const feed = liveFeed(
+    feedKeys.metrics(appId),
+    metricsUrl(appId),
+    decodeMetrics
+  );
+  // Read the frame (or its stored snapshot) directly: no copy into atoms,
+  // so a revisit paints the last numbers in the very first render.
+  const rows = (): MetricsFrame["metrics"] => feed.latest()?.metrics ?? [];
+  const spans = (): MetricsFrame["spans"] => feed.latest()?.spans ?? [];
+  const devices = (): NonNullable<MetricsFrame["devices"]> =>
+    feed.latest()?.devices ?? [];
+  const paths = (): NonNullable<MetricsFrame["paths"]> =>
+    feed.latest()?.paths ?? [];
+  const refs = (): NonNullable<MetricsFrame["refs"]> =>
+    feed.latest()?.refs ?? [];
   const spansError = atom("");
-  // Loaded when a previous fetch settled — even an empty one — so
-  // empty-but-fetched states skip the skeleton exactly like cached data.
-  const loaded = atom(seedRows !== null);
-  // Usage over SSE (like DeployList): cache-first seed paints instantly,
-  // then the stream pushes a frame only when the request total moves.
-  watch.once(() => {
-    let stopped = false;
-    const source = new EventSource(
-      `/api/apps/${encodeURIComponent(appId)}/metrics/stream`
-    );
-    source.addEventListener("message", (event) => {
-      // A frame arrived, so the stream is alive — mark loaded before
-      // validation (a malformed frame must not stick the skeleton).
-      loaded.set(true);
-      try {
-        const frame: unknown = JSON.parse(event.data);
-        // SAFETY: frame shape is validated field-by-field below; non-objects fall through to the Array checks and return.
-        const {
-          devices: freshDevices,
-          metrics,
-          paths: freshPaths,
-          refs: freshRefs,
-          spans: freshSpans,
-        } = frame as {
-          devices?: unknown;
-          metrics?: unknown;
-          paths?: unknown;
-          refs?: unknown;
-          spans?: unknown;
-        };
-        if (!Array.isArray(metrics) || !Array.isArray(freshSpans)) {
-          return;
-        }
-        // SAFETY: metrics passed Array.isArray above; rows mirror the retired unary action shape.
-        rows.set(metrics as RunnerMetric[]);
-        // SAFETY: freshSpans passed Array.isArray above; entries flow only into usage rendering.
-        spans.set(freshSpans as RunnerSpan[]);
-        // Devices, paths, and refs ride the same frame but stay optional:
-        // older frames keep last-good data instead of clearing it.
-        if (Array.isArray(freshDevices)) {
-          // SAFETY: freshDevices passed Array.isArray above; entries flow only into usage rendering.
-          devices.set(freshDevices as RunnerDevice[]);
-          writeSwrCache(`app:${appId}:devices`, freshDevices);
-        }
-        if (Array.isArray(freshPaths)) {
-          // SAFETY: freshPaths passed Array.isArray above; entries flow only into usage rendering.
-          paths.set(freshPaths as RunnerPath[]);
-          writeSwrCache(`app:${appId}:paths`, freshPaths);
-        }
-        if (Array.isArray(freshRefs)) {
-          // SAFETY: freshRefs passed Array.isArray above; entries flow only into usage rendering.
-          refs.set(freshRefs as RunnerRef[]);
-          writeSwrCache(`app:${appId}:refs`, freshRefs);
-        }
-        writeSwrCache(`app:${appId}:metrics`, metrics);
-        writeSwrCache(`app:${appId}:spans`, freshSpans);
-      } catch {
-        loadError.set("Usage stream sent invalid data");
-      }
-    });
-    source.addEventListener("error", () => {
-      if (!stopped) {
-        loadError.set("Usage stream disconnected — retrying…");
-      }
-      loaded.set(true);
-    });
-    return () => {
-      stopped = true;
-      source.close();
-    };
-  });
+  const loaded = (): boolean =>
+    feed.latest() !== undefined || feed.status() === "open";
+  const loadError = (): string =>
+    feed.status() === "retrying" ? "Usage stream disconnected — retrying…" : "";
   const pickers = {
     cpuMs: (r: RunnerMetric) => r.cpuMs,
     errors: (r: RunnerMetric) => r.errors,
@@ -577,12 +544,12 @@ export const MetricsCard = ({
           <div class="card-body gap-4">
             <div class="flex items-center justify-between gap-2">
               <h3 class="m-0 flex items-center gap-2 text-lg font-semibold">
-                Metrics · last 24h
+                Metrics · {WINDOW_LABEL}
                 <span
                   class="tooltip tooltip-right inline-flex opacity-60"
-                  data-tip="What celld OTel recorded · last hour: request/cell-fetch/startup spans, execution ms, failed spans, and queued time. Errors now come from the trace `ok` flag."
+                  data-tip={`What celld OTel recorded · ${WINDOW_LABEL}: request/cell-fetch/startup spans, execution ms, failed spans, and queued time. Errors come from the trace \`ok\` flag.`}
                 >
-                  {unsafe(INFO_SVG)}
+                  <Info />
                 </span>
               </h3>
               {viewAllHref && !detail ? (

@@ -42,19 +42,16 @@ CREATE TABLE IF NOT EXISTS deploy (
 
 CREATE INDEX IF NOT EXISTS idx_deploy_app ON deploy(app_id);
 
--- Per-app usage metrics (requests from celld OTel spans, CPU time sampled
--- from the fleet process). Minute-bucketed, UTC text keys sortable.
-CREATE TABLE IF NOT EXISTS app_metric (
-  app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,
-  bucket_ts TEXT NOT NULL,          -- start-of-minute ISO-8601 UTC
-  requests INTEGER NOT NULL DEFAULT 0,
-  errors INTEGER NOT NULL DEFAULT 0,
-  latency_ms INTEGER NOT NULL DEFAULT 0,
-  cpu_ms INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (app_id, bucket_ts)
-);
-
-CREATE INDEX IF NOT EXISTS idx_app_metric_app_bucket ON app_metric(app_id, bucket_ts);
+-- Per-app usage metrics, edge analytics, span stats, log ring, watermarks and
+-- compaction state live in metrics.sqlite (db::METRICS_SCHEMA), ATTACHed as
+-- `metrics` — never in this snapshotted file (spec T4.1). Dropped here so an
+-- existing database migrates its rows once (db::connect) and stops
+-- dirtying `data_version` on every telemetry tick.
+DROP TABLE IF EXISTS app_metric;
+DROP TABLE IF EXISTS app_device_stat;
+DROP TABLE IF EXISTS app_path_stat;
+DROP TABLE IF EXISTS app_ref_stat;
+DROP TABLE IF EXISTS metric_watermark;
 
 -- Tenant env vars (CF `.dev.vars` model). Names starting with `FLAG_`
 -- are feature flags: the settings UI renders them as on/off toggles
@@ -67,40 +64,8 @@ CREATE TABLE IF NOT EXISTS app_env (
   PRIMARY KEY (app_id, name)
 );
 
--- Edge analytics from the Caddy access log (see host/accesslog): device
--- browsers + OS, visited paths, referrer sources. Only aggregates are
--- stored — never raw user-agents, client IPs, query strings, or full
--- referrer URLs. Hour-bucketed UTC text keys, like app_metric.
-CREATE TABLE IF NOT EXISTS app_device_stat (
-  app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,
-  bucket_ts TEXT NOT NULL,          -- start-of-hour ISO-8601 UTC
-  browser TEXT NOT NULL,
-  os TEXT NOT NULL,                 -- '' when undetected, shown as Unknown
-  requests INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (app_id, bucket_ts, browser, os)
-);
-
-CREATE INDEX IF NOT EXISTS idx_app_device_stat_app_bucket ON app_device_stat(app_id, bucket_ts);
-
-CREATE TABLE IF NOT EXISTS app_path_stat (
-  app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,
-  bucket_ts TEXT NOT NULL,          -- start-of-hour ISO-8601 UTC
-  path TEXT NOT NULL,               -- request path, query stripped
-  requests INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (app_id, bucket_ts, path)
-);
-
-CREATE INDEX IF NOT EXISTS idx_app_path_stat_app_bucket ON app_path_stat(app_id, bucket_ts);
-
-CREATE TABLE IF NOT EXISTS app_ref_stat (
-  app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,
-  bucket_ts TEXT NOT NULL,          -- start-of-hour ISO-8601 UTC
-  source TEXT NOT NULL,             -- 'Direct', network/engine name, or host
-  requests INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (app_id, bucket_ts, source)
-);
-
-CREATE INDEX IF NOT EXISTS idx_app_ref_stat_app_bucket ON app_ref_stat(app_id, bucket_ts);
+-- Edge analytics tables (device/path/ref) also live in metrics.sqlite now;
+-- see the note above. Their DDL moved to db::METRICS_SCHEMA.
 
 -- Tenant app events (LogSnag-style): channel-grouped event log, user
 -- property profiles, and latest-value insight widgets. Ingest comes through
@@ -153,13 +118,7 @@ CREATE TABLE IF NOT EXISTS app_domain (
 
 CREATE INDEX IF NOT EXISTS idx_app_domain_app ON app_domain(app_id);
 
--- Telemetry watermark: slug -> last consumed span start (unix micros).
--- Written after bucket persist each metrics tick, so a restart resumes
--- aggregation instead of double-counting.
-CREATE TABLE IF NOT EXISTS metric_watermark (
-  slug TEXT PRIMARY KEY NOT NULL,
-  after_us INTEGER NOT NULL
-);
+-- Telemetry watermark also lives in metrics.sqlite now (see above).
 
 -- Scoped per-app credentials (SPEC, Scoped credentials): one encrypted row per
 -- app. Nonce + AES-GCM ciphertext over JSON {access_key, secret_key}; the KEK

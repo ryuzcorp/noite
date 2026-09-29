@@ -1,11 +1,13 @@
 import { navigate } from "@ilha/router";
-import { atom, unsafe, watch } from "ilha";
+import { atom, watch } from "ilha";
 import { createMutationQueue } from "oxidejs/mutation-queue";
+import { kebabCase } from "scule";
 
 import { create } from "./apps.server";
 import type { App } from "./collaborators";
+import { applistUrl, decodeApps, feedKeys, liveFeed } from "./feeds";
+import { ChevronRight } from "./icons";
 import { ListSkeleton } from "./skeletons";
-import { readSwrCache, writeSwrCache } from "./swr-cache";
 
 const queue = createMutationQueue();
 const createQueued = queue.wrap(create, {
@@ -14,31 +16,12 @@ const createQueued = queue.wrap(create, {
 
 // Letters, digits, plus hyphens: fold whitespace, drop other symbols,
 // and trim edge hyphens so live slugs match the create/rename gate.
-export const slugifyName = async (value: string): Promise<string> => {
-  const { kebabCase } = await import("scule");
-  return kebabCase(value.replaceAll(/\s+/gu, "-"))
+export const slugifyName = (value: string): string =>
+  kebabCase(value.replaceAll(/\s+/gu, "-"))
     .replaceAll(/[^A-Za-z0-9-]+/gu, "")
     .replaceAll(/-{2,}/gu, "-")
     .replaceAll(/^-+|-+$/gu, "")
     .slice(0, 48);
-};
-
-// Mirror the name into the slug while typing, until the user overrides it.
-// Imperative DOM writes (not atoms) so re-renders never steal input focus.
-// Touched/auto state lives on the slug element's dataset, surviving renders.
-const syncSlug = async (value: string) => {
-  const el = document.querySelector("#create-slug");
-  if (!(el instanceof HTMLInputElement) || el.dataset.touched === "1") {
-    return;
-  }
-  const seen = el.dataset.auto ?? "";
-  const next = await slugifyName(value);
-  if (el.dataset.touched === "1" || (el.dataset.auto ?? "") !== seen) {
-    return;
-  }
-  el.value = next;
-  el.dataset.auto = next;
-};
 
 /** Initials for the avatar placeholder: first letters of the first two
  * words ("My Service" → "MS", "test" → "T"). */
@@ -55,25 +38,20 @@ export const initials = (name: string): string => {
   return `${first}${second}`.toUpperCase() || "?";
 };
 
-/** Presence dot tone: running = green, error = red, rest = yellow. */
+/** Presence dot tone: running = green, error = red, sleeping (scale to
+ * zero: healthy, parked until its next request) = neutral, rest = yellow. */
 export const presenceTone = (status: string): string => {
   if (status === "running") {
     return "status-success";
+  }
+  if (status === "sleeping") {
+    return "status-neutral";
   }
   if (status === "failed" || status === "error") {
     return "status-error";
   }
   return "status-warning";
 };
-
-/** Lucide chevron-right body (like the layout menu icons: bodies copied
- * from lucide, rendered via unsafe() to reach the SVG namespace). */
-export const CHEVRON_SVG =
-  '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>';
-
-/** Lucide chevron-down body (same treatment as CHEVRON_SVG). */
-export const CHEVRON_DOWN_SVG =
-  '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>';
 
 /** Reachable host for a stored subdomain on the current page's network.
  * Stored subdomains anchor on the configured base (dev: slug.localhost).
@@ -105,53 +83,22 @@ export const appUrl = (subdomain: string): string => {
   return port ? `http://${host}:${port}` : `https://${host}`;
 };
 
-/** App list over SSE (like DeployList): cache-first seed paints instantly
- * on every mount, then the event stream pushes updates — no polling, and
- * resubscribe is automatic on drop. */
+/** App list over SSE: skeleton until the first frame, then live updates —
+ * no polling, and resubscribe is automatic on drop. */
 export const AppsList = () => {
-  const seed = readSwrCache<App[]>("apps:list");
-  const items = atom<App[]>(seed ?? []);
-  const listError = atom("");
-  const loaded = atom(seed !== null);
-
-  watch.once(() => {
-    let stopped = false;
-    const source = new EventSource("/api/apps/stream");
-    source.addEventListener("message", (event) => {
-      // A frame arrived, so the stream is alive — even when the payload
-      // matches (empty list with no seed would stick on the skeleton).
-      loaded.set(true);
-      try {
-        const next: unknown = JSON.parse(event.data);
-        if (!Array.isArray(next)) {
-          return;
-        }
-        if (JSON.stringify(items()) === JSON.stringify(next)) {
-          return;
-        }
-        // SAFETY: the apps stream emits the same App rows as the list action; entries flow only into list rendering.
-        items.set(next as App[]);
-        writeSwrCache("apps:list", next);
-        listError.set("");
-      } catch {
-        listError.set("App stream sent invalid data");
-      }
-    });
-    source.addEventListener("error", () => {
-      if (!stopped) {
-        listError.set("App stream disconnected — retrying…");
-      }
-      loaded.set(true);
-    });
-    return () => {
-      stopped = true;
-      source.close();
-    };
-  });
+  const feed = liveFeed(feedKeys.apps, applistUrl(), decodeApps);
+  const items = (): App[] => feed.latest() ?? [];
+  const loaded = (): boolean =>
+    feed.latest() !== undefined || feed.status() === "open";
+  const retrying = (): boolean => feed.status() === "retrying";
 
   return (
     <>
-      {listError() ? <p class="text-error m-0 text-sm">{listError()}</p> : null}
+      {retrying() ? (
+        <p class="text-error m-0 text-sm">
+          App stream disconnected — retrying…
+        </p>
+      ) : null}
 
       <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
         <li class="flex items-center justify-between gap-2 p-4 pb-2">
@@ -217,7 +164,7 @@ export const AppsList = () => {
                 aria-label={`Open ${app.name} details`}
               >
                 <span class="inline-flex h-5 w-5 shrink-0">
-                  {unsafe(CHEVRON_SVG)}
+                  <ChevronRight class="h-5 w-5" />
                 </span>
               </a>
             </li>
@@ -232,26 +179,28 @@ export const AppsList = () => {
 export const CreateAppForm = () => {
   const notice = atom<string | null>(null);
   const busy = atom(false);
+  const name = atom("");
+  const slug = atom("");
+  const slugTouched = atom(false);
+
+  watch(name, (value) => {
+    if (!slugTouched()) {
+      slug.set(slugifyName(value));
+    }
+  });
 
   const submit = async (event: SubmitEvent) => {
     event.preventDefault();
-    const form = event.currentTarget;
-    if (!(form instanceof HTMLFormElement)) {
-      return;
+    const trimmedName = name().trim();
+    let nextSlug = slug().trim().toLowerCase();
+    if (!nextSlug && trimmedName) {
+      nextSlug = slugifyName(trimmedName);
     }
-    const data = new FormData(form);
-    const name = String(data.get("name") ?? "").trim();
-    let slug = String(data.get("slug") ?? "")
-      .trim()
-      .toLowerCase();
-    if (!slug && name) {
-      slug = await slugifyName(name);
-    }
-    if (!(name && slug)) {
+    if (!(trimmedName && nextSlug)) {
       notice.set("Name and slug are required");
       return;
     }
-    if (!/^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/u.test(slug)) {
+    if (!/^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/u.test(nextSlug)) {
       notice.set(
         "Slug must be 1–48 chars: lowercase letters, digits, and hyphens, starting and ending with a letter or digit"
       );
@@ -259,7 +208,7 @@ export const CreateAppForm = () => {
     }
     try {
       busy.set(true);
-      await createQueued({ name, slug });
+      await createQueued({ name: trimmedName, slug: nextSlug });
       // SPA nav keeps CSS/DOM parsed; the apps SSE stream adds the new row.
       navigate("/apps");
     } catch (error) {
@@ -285,11 +234,9 @@ export const CreateAppForm = () => {
           name="name"
           class="input w-full"
           placeholder="My Service"
+          value={name()}
           oninput={(e) => {
-            const target = e.currentTarget;
-            if (target instanceof HTMLInputElement) {
-              void syncSlug(target.value);
-            }
+            name.set(e.currentTarget.value);
           }}
           autofocus
           required
@@ -307,11 +254,11 @@ export const CreateAppForm = () => {
           pattern="[a-z0-9]([a-z0-9-]{0,46}[a-z0-9])?"
           maxlength={48}
           title="Lowercase letters, digits, and hyphens, 1–48 chars, starting and ending with a letter or digit"
+          value={slug()}
           oninput={(e) => {
-            const target = e.currentTarget;
-            if (target instanceof HTMLInputElement) {
-              target.dataset.touched = target.value.length > 0 ? "1" : "";
-            }
+            const { value } = e.currentTarget;
+            slug.set(value);
+            slugTouched.set(value.length > 0);
           }}
           required
         />

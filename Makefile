@@ -19,7 +19,7 @@ export
 # pi-lens-ignore: shellcheck-14-1050
 # pi-lens-ignore: shellcheck-14-1072
 
-.PHONY: help up up-prod e2e e2e-isolation dev dev-host logs doctor backup restore down nuke
+.PHONY: help up up-prod e2e e2e-isolation dev dev-host logs doctor backup restore down nuke usage
 
 COMPOSE_BUILD := $(COMPOSE) -f docker/compose.build.yaml
 COMPOSE_DEV := $(COMPOSE) -f docker/compose.dev.yaml
@@ -33,7 +33,7 @@ help:
 	@echo "  make dev       dev: cargo watch runner + vite dev control UI, same service"
 	@echo "  make dev-host  dev + control UI reachable from LAN (Host: <lan-ip>)"
 	@echo "  make logs      follow the noite service + rustfs"
-	@echo "  make doctor    codified health checks"
+	@echo "  make usage     cost harness: stats delta over WINDOW s (default 600)"
 	@echo "  make e2e       pre-release lane: image + doctor + Playwright (TAG=<sha> pulls GHCR)"
 	@echo "  make e2e-isolation  the same lane in multi-tenant mode + hostile-tenant spec"
 	@echo "  make backup    consistent backup of both volumes (brief downtime)"
@@ -84,6 +84,11 @@ restore:
 
 doctor:
 	sh docker/doctor.sh
+
+# Cost harness (spec T0.2): samples /v1/admin/stats, container stats and /data
+# over WINDOW seconds (default 600) and prints one table for baselines.
+usage:
+	sh docker/usage.sh "$${WINDOW:-600}"
 
 # Never destroy data on a plain stop.
 down:

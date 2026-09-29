@@ -5,13 +5,62 @@ import oxide from "oxidejs/vite";
 import { withOxide } from "oxidejs/wrangler";
 import type { DurableWranglerConfig } from "oxidejs/wrangler";
 import { defineConfig } from "vite";
+import type { Plugin } from "vite";
 
 import { controlEnv, hydrateControlEnv } from "./src/lib/control-env.ts";
 
 hydrateControlEnv();
 
+/** Resource opt T6.1: the shiki ids the source browser can request
+ * (mirrors CURATED_LANGS in src/lib/source-browser.tsx; `text` is
+ * built into shiki and never imported as a module). */
+const CURATED_SHIKI_LANGS = {
+  css: true,
+  html: true,
+  javascript: true,
+  json: true,
+  jsonc: true,
+  jsx: true,
+  markdown: true,
+  sql: true,
+  toml: true,
+  tsx: true,
+  typescript: true,
+  yaml: true,
+  zsh: true,
+};
+
+/** Only the curated shiki grammars ship. @pierre/diffs resolves every other
+ * language through a dynamic `import("@shikijs/langs/*")`, which the bundler
+ * would otherwise emit as one chunk per grammar (~25 MB across client+ssr).
+ * The source browser coerces every filename to the curated set or `text`
+ * before pierre ever resolves, so these stubs are unreachable at runtime. */
+const curatedShikiLangs = (): Plugin => ({
+  enforce: "pre",
+  load(id: string) {
+    if (id === "\0shiki-lang-stub") {
+      return "export default {};\n";
+    }
+    return null;
+  },
+  name: "curated-shiki-langs",
+  resolveId(source: string) {
+    if (!source.startsWith("@shikijs/langs/")) {
+      return null;
+    }
+    const lang = source.slice("@shikijs/langs/".length);
+    if (Object.hasOwn(CURATED_SHIKI_LANGS, lang)) {
+      return null;
+    }
+    // One shared id: every excluded grammar resolves to the same empty
+    // module, so the bundler emits a single tiny chunk, not hundreds.
+    return "\0shiki-lang-stub";
+  },
+});
+
 export default defineConfig({
   plugins: [
+    curatedShikiLangs(),
     oxide({
       actions: {
         sameOrigin: true,

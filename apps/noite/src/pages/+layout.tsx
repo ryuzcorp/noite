@@ -1,51 +1,31 @@
-import { adminOverview } from "$lib/admin.server";
 import { initials } from "$lib/apps";
 import { authClient } from "$lib/auth-client";
-import { Authed, clearSessionCache } from "$lib/authed";
-import { fetchSession, invalidateSession } from "$lib/session";
+import { Authed } from "$lib/authed";
+import { List as ListIcon, Menu as MenuIcon } from "$lib/icons";
+import { adminStatus, session } from "$lib/resources";
+import { invalidateSession } from "$lib/session";
 import { defineLayout, navigate, useRoute } from "@ilha/router";
-import { atom, unsafe, watch } from "ilha";
 
 /**
  * Global chrome for the dashboard. Excludes the auth page so /login stays
  * bare — the session gate wraps the ENTIRE chrome (nav included), so a
  * logged-out visitor never sees dashboard pixels, not even the sidebar.
  */
-/** Lucide menu icons as static trusted markup (no user input). unsafe()
- * parses in the SVG namespace, which inline <svg> JSX can't reach under
- * ilha's HTML-namespace mounting. Bodies from lucide; stroke inherits the
- * menu text color via currentColor. */
-const lucideIcon = (body: string): string =>
-  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-5 w-5 shrink-0" aria-hidden="true">${body}</svg>`;
-
-const LAYOUT_LIST =
-  '<rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/><path d="M14 4h7m-7 5h7m-7 6h7m-7 5h7"/>';
-
 const signOut = async () => {
-  clearSessionCache();
-  invalidateSession();
+  // Sign out first: invalidating before the cookie is gone refetched (and
+  // re-cached) the outgoing user's session.
   await authClient.signOut();
+  invalidateSession();
   navigate("/login");
 };
 
 export default defineLayout(({ children }) => {
   const { path } = useRoute();
-  const displayName = atom("");
-  const isAdmin = atom(false);
-  watch.once(() => {
-    void (async () => {
-      const { data } = await fetchSession();
-      displayName.set(data?.user?.name || data?.user?.email || "");
-      if (data?.user) {
-        try {
-          const overview = await adminOverview();
-          isAdmin.set(overview.isAdmin);
-        } catch {
-          isAdmin.set(false);
-        }
-      }
-    })();
-  });
+  const sessionRes = session();
+  const adminRes = adminStatus();
+  const user = sessionRes.data()?.user;
+  const displayName = user?.name || user?.email || "";
+  const isAdmin = adminRes.data()?.isAdmin ?? false;
   if (path() === "/login") {
     return <>{children}</>;
   }
@@ -60,18 +40,7 @@ export default defineLayout(({ children }) => {
             class="btn btn-sm btn-ghost fixed top-3 left-3 z-40 lg:hidden"
             aria-label="Open menu"
           >
-            <svg
-              class="h-5 w-5"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              aria-hidden="true"
-            >
-              <line x1="4" y1="6" x2="20" y2="6" />
-              <line x1="4" y1="12" x2="20" y2="12" />
-              <line x1="4" y1="18" x2="20" y2="18" />
-            </svg>
+            <MenuIcon class="h-5 w-5" />
           </label>
           {children}
         </div>
@@ -100,7 +69,7 @@ export default defineLayout(({ children }) => {
                   href="/apps"
                   class={path().startsWith("/apps") ? "menu-active" : undefined}
                 >
-                  {unsafe(lucideIcon(LAYOUT_LIST))}
+                  <ListIcon class="h-5 w-5 shrink-0" />
                   Apps
                 </a>
               </li>
@@ -115,19 +84,19 @@ export default defineLayout(({ children }) => {
                 >
                   <div class="avatar avatar-placeholder">
                     <div class="bg-neutral text-neutral-content w-8 rounded-full">
-                      <span class="text-xs">{initials(displayName())}</span>
+                      <span class="text-xs">{initials(displayName)}</span>
                     </div>
                   </div>
-                  <span class="truncate text-sm">{displayName() || "…"}</span>
+                  <span class="truncate text-sm">{displayName || "…"}</span>
                 </div>
                 <ul
                   tabindex={0}
                   class="dropdown-content menu bg-base-100 dark:bg-base-200 rounded-box z-10 w-52 p-2 shadow"
                 >
                   <li>
-                    <a href="/profile">Account</a>
+                    <a href="/account">Account</a>
                   </li>
-                  {isAdmin() ? (
+                  {isAdmin ? (
                     <li>
                       <a href="/god-mode">God Mode</a>
                     </li>

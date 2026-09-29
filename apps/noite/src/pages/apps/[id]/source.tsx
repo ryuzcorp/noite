@@ -1,99 +1,80 @@
-import type { AppDetailInfo } from "$lib/app-detail/panel";
-import { get } from "$lib/apps.server";
-import { fetchSession } from "$lib/session";
-import { PageSkeleton } from "$lib/skeletons";
-import {
-  requestSourceMode,
-  requestSourcePush,
-  SourceBrowser,
-} from "$lib/source-browser";
-import type { SourceMode } from "$lib/source-browser";
-import { readSwrCache } from "$lib/swr-cache";
-import { head, navigate, useRoute } from "@ilha/router";
-import { atom, unsafe, watch } from "ilha";
+import { ArrowLeft } from "$lib/icons";
+import { appDetail } from "$lib/resources";
+import { SourceBrowser } from "$lib/source-browser";
+import type { SourceBrowserState, SourceMode } from "$lib/source-browser";
+import { head, searchParam, useRoute } from "@ilha/router";
+import { atom } from "ilha";
+import type { AtomHandle } from "ilha";
 
-/** Lucide arrow-left, matching the detail page's back link. */
-const ARROW_LEFT_SVG =
-  '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>';
+/** Parse `?view=`: unknown views fall back to files. */
+const toSourceMode = (raw: string): SourceMode =>
+  raw === "diff" ? "diff" : "files";
 
-/** Source preview for one app — files of the latest pushed commit. */
-export default function Source() {
-  const route = useRoute();
-  const ready = atom(false);
-  const appId = route.params().id;
-  head({ title: "Source · Noite" });
-
-  // View lives in ?view= so refresh and deep links restore it; unknown
-  // values fall back to files. NOTE: this page must not read reactive
-  // state in JSX after mount — a parent re-render disposes the unkeyed
-  // SourceBrowser hole and remounts it, rerunning its slow setup and
-  // resetting to files. Toggle styling therefore syncs imperatively
-  // from the browser by id (like the status line).
-  const selectView = (view: SourceMode) => {
-    navigate(`${route.path()}?view=${view}`, { replace: true });
-    requestSourceMode(view);
-  };
-  const viewFromUrl = (): SourceMode => {
-    const v = new URLSearchParams(route.search()).get("view");
-    return v === "diff" ? "diff" : "files";
-  };
-
-  // Back-link label: seed from the detail SWR cache (instant when arriving
-  // from the app page), then refresh from the server. Plain const, not an
-  // atom — no subscription, no remount (see the NOTE above).
-  const cached = appId
-    ? readSwrCache<AppDetailInfo>(`app:${appId}:detail`)
-    : null;
-  const backName = cached?.app.name ?? "…";
-
-  watch.once(() => {
-    void (async () => {
-      const { data } = await fetchSession();
-      if (!data?.user) {
-        navigate("/login");
-        return;
-      }
-      ready.set(true);
-    })();
-  });
-
-  // Back/forward buttons change the URL without a toggle click —
-  // re-apply the panes to match. Untracked read: no subscription,
-  // no re-render, no remount.
-  watch.once(() => {
-    const sync = () => {
-      requestSourceMode(viewFromUrl());
-    };
-    window.addEventListener("popstate", sync);
-    return () => {
-      window.removeEventListener("popstate", sync);
-    };
-  });
-
-  // Fill the back-link label imperatively (same no-remount rule).
-  watch.once(() => {
-    if (!appId) {
-      return;
-    }
-    void (async () => {
-      try {
-        const info = await get(appId);
-        const label = document.querySelector("#noite-src-back-name");
-        if (label) {
-          label.textContent = info.app.name;
-        }
-      } catch {
-        // Label keeps its cached/fallback text.
-      }
-    })();
-  });
-
-  if (!ready()) {
-    return <PageSkeleton />;
+/** Push button: the only reader of the browser's draft state. Keeping
+ * that read out of SourceBody matters — every keystroke changes the dirty
+ * count, and a SourceBody re-render detaches and re-attaches the reused
+ * SourceBrowser subtree, which blurs the pierre editor mid-typing (ilha
+ * restores focus via document.activeElement, i.e. only the shadow host). */
+const PushButton = ({
+  push,
+  state,
+}: {
+  push: AtomHandle<number>;
+  state: AtomHandle<SourceBrowserState>;
+}) => {
+  const { dirty, pushError, pushing } = state();
+  let label = "Push";
+  if (pushing) {
+    label = "Pushing…";
+  } else if (pushError) {
+    label = "Push failed — retry";
+  } else if (dirty > 0) {
+    label = `Push (${dirty})`;
   }
-  if (!appId) {
-    return <p class="text-error">Missing app id</p>;
+  return (
+    <button
+      type="button"
+      class="btn btn-sm btn-primary"
+      disabled={dirty === 0 || pushing}
+      onclick={() => {
+        push.update((n) => n + 1);
+      }}
+    >
+      {label}
+    </button>
+  );
+};
+
+const SourceBody = ({ appId }: { appId: string }) => {
+  // View lives in ?view= so refresh and deep links restore it (back/forward
+  // included — searchParam follows navigation). The browser watches the
+  // mirrored mode atom (searchParam handles aren't watchable); the mirror
+  // adopts the URL below.
+  const view = searchParam<SourceMode>("view", {
+    default: "files",
+    parse: toSourceMode,
+  });
+  const mode = atom<SourceMode>(view());
+  if (view() !== mode()) {
+    mode.set(view());
   }
+  const selectView = (next: SourceMode) => {
+    view.set(next);
+    mode.set(next);
+  };
+  // Open file lives in ?file= (deep-linkable); the browser reads + writes it.
+  const file = searchParam("file", { default: "" });
+  // Push requests: the button increments, the browser commits on change.
+  const push = atom(0);
+  const browser = atom<SourceBrowserState>({
+    dirty: 0,
+    pushError: false,
+    pushing: false,
+  });
+
+  // Back-link label follows the app detail (instant from cache on SPA nav).
+  const backName = appDetail(appId).data()?.app.name ?? "…";
+
   return (
     <div class="flex h-screen w-full flex-col overflow-hidden">
       <div class="border-base-300 flex items-center justify-between gap-2 border-b px-4 py-2">
@@ -101,15 +82,14 @@ export default function Source() {
           href={`/apps/${appId}`}
           class="link link-hover inline-flex w-fit items-center gap-1 text-sm opacity-70"
         >
-          {unsafe(ARROW_LEFT_SVG)}
-          <span id="noite-src-back-name">{backName}</span>
+          <ArrowLeft class="h-4 w-4" />
+          <span>{backName}</span>
         </a>
         <div class="flex items-center gap-2">
           <div class="join">
             <button
-              id="noite-src-view-files"
               type="button"
-              class="btn btn-sm join-item btn-neutral"
+              class={`btn btn-sm join-item ${mode() === "files" ? "btn-neutral" : "btn-ghost"}`}
               onclick={() => {
                 selectView("files");
               }}
@@ -117,9 +97,8 @@ export default function Source() {
               Files
             </button>
             <button
-              id="noite-src-view-diff"
               type="button"
-              class="btn btn-sm join-item btn-ghost"
+              class={`btn btn-sm join-item ${mode() === "diff" ? "btn-neutral" : "btn-ghost"}`}
               onclick={() => {
                 selectView("diff");
               }}
@@ -127,20 +106,30 @@ export default function Source() {
               Last push diff
             </button>
           </div>
-          <button
-            id="noite-src-push"
-            type="button"
-            class="btn btn-sm btn-primary"
-            disabled
-            onclick={() => {
-              requestSourcePush();
-            }}
-          >
-            Push
-          </button>
+          <PushButton push={push} state={browser} />
         </div>
       </div>
-      <SourceBrowser appId={appId} />
+      <SourceBrowser
+        appId={appId}
+        file={file}
+        mode={mode}
+        onState={(s) => {
+          browser.set(s);
+        }}
+        push={push}
+      />
     </div>
   );
+};
+
+/** Source preview for one app — files of the latest pushed commit. The
+ * body is keyed by app id so an id change remounts it (see the app page:
+ * reused fibers keep resource()/feed slots bound to their first key). */
+export default function Source() {
+  const appId = useRoute().params().id;
+  head({ title: "Source · Noite" });
+  if (!appId) {
+    return <p class="text-error">Missing app id</p>;
+  }
+  return <SourceBody key={appId} appId={appId} />;
 }

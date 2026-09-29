@@ -93,7 +93,7 @@ pub fn harden_data_dir(cfg: &Config) {
     };
     let work = PathBuf::from(&cfg.work_dir);
     let traverse: Vec<PathBuf> = {
-        let mut dirs = vec![work.join("builds"), work.join("fleets")];
+        let mut dirs = vec![work.join("builds"), work.join("fleets"), work.join("cache")];
         let _ = dirs.iter().try_for_each(std::fs::create_dir_all);
         dirs.push(work.clone());
         if let Some(root) = work.parent() {
@@ -104,10 +104,14 @@ pub fn harden_data_dir(cfg: &Config) {
     for dir in &traverse {
         set(dir, 0o755);
     }
-    // Per-slug build parents: builds/<slug>/ too.
-    if let Ok(entries) = std::fs::read_dir(work.join("builds")) {
-        for entry in entries.flatten() {
-            set(&entry.path(), 0o755);
+    // Per-slug build/cache parents: builds/<slug>/ and cache/<slug>/ too.
+    // The bun cache leaf itself stays owner-only (build uid after the
+    // deploy hands it over), so the fleet uid can traverse but never read.
+    for top in ["builds", "cache"] {
+        if let Ok(entries) = std::fs::read_dir(work.join(top)) {
+            for entry in entries.flatten() {
+                set(&entry.path(), 0o755);
+            }
         }
     }
     // Everything else directly under the volume root and the work dir.

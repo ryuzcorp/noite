@@ -3,26 +3,10 @@ import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
 import { authClient } from "./auth-client";
-import { fetchSession, invalidateSession } from "./session";
+import { session as sessionResource } from "./resources";
+import { invalidateSession } from "./session";
 import { DashboardSkeleton } from "./skeletons";
 import { sleep } from "./sleep";
-
-interface CachedSession {
-  email: string;
-  impersonated: boolean;
-  verifiedAt: number;
-}
-
-/** Last verified session (module scope — survives SPA navigations, dies
- * on document reload). Navigations inside the TTL skip the gate entirely;
- * every mount still revalidates silently so a dead session bounces fast.
- * Server actions enforce auth regardless — this only gates pixels. */
-let sessionCache: CachedSession | null = null;
-const SESSION_TTL_MS = 60_000;
-
-export const clearSessionCache = (): void => {
-  sessionCache = null;
-};
 
 interface SessionWithImpersonation {
   impersonatedBy?: unknown;
@@ -57,77 +41,33 @@ export const Authed = ({
   children: View;
   fallback?: View;
 }) => {
-  const ready = atom(false);
-  const denied = atom(false);
-  const impersonatedEmail = atom("");
+  const res = sessionResource();
   const returning = atom(false);
   const returnError = atom("");
-  watch.once(() => {
-    // Unmount (e.g. the index route bouncing to /login) stops the poll —
-    // an orphaned loop would keep hitting get-session after redirect.
-    let cancelled = false;
-    void (async () => {
-      // Fast path: verified recently — render instantly, revalidate silently.
-      const cached = sessionCache;
-      if (cached && Date.now() - cached.verifiedAt < SESSION_TTL_MS) {
-        if (cached.impersonated) {
-          impersonatedEmail.set(cached.email);
-        }
-        ready.set(true);
-        const { data } = await fetchSession();
-        if (cancelled) {
-          return;
-        }
-        if (data?.user) {
-          const seen = readImpersonated(data.session, data.user.email);
-          sessionCache = {
-            email: data.user.email,
-            impersonated: seen.impersonated,
-            verifiedAt: Date.now(),
-          };
-          if (seen.impersonated) {
-            impersonatedEmail.set(data.user.email);
-          }
-          return;
-        }
-        sessionCache = null;
-        navigate("/login");
+  watch.once(async ({ signal }) => {
+    // Wait for the first answer however long it takes: refetch() joins
+    // the in-flight request, so a slow get-session never counts against
+    // the retry budget below (sleeping through it bounced real users).
+    if (res.loading() || res.data() === undefined) {
+      await res.refetch();
+    }
+    // Post-registration cookie race: the first answer can arrive before
+    // the session cookie is readable, so retry briefly before bouncing.
+    for (let i = 0; i < 20 && !res.data()?.user; i += 1) {
+      if (signal.aborted) {
         return;
       }
-      // Slow path (initial load): retry briefly — first paint after
-      // register can race the session cookie.
-      for (let i = 0; i < 20; i += 1) {
-        if (cancelled) {
-          return;
-        }
-        // oxlint-disable-next-line eslint/no-await-in-loop -- sequential cookie-readiness poll; Promise.all would defeat the early-exit
-        const { data } = await fetchSession();
-        if (data?.user) {
-          const seen = readImpersonated(data.session, data.user.email);
-          sessionCache = {
-            email: data.user.email,
-            impersonated: seen.impersonated,
-            verifiedAt: Date.now(),
-          };
-          if (seen.impersonated) {
-            impersonatedEmail.set(data.user.email);
-          }
-          ready.set(true);
-          return;
-        }
-        // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll backoff
-        await sleep(50);
-      }
-      if (cancelled) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- sequential cookie-readiness poll; Promise.all would defeat the early-exit
+      await sleep(50);
+      if (signal.aborted) {
         return;
       }
-      // No session: leave nothing dashboard-shaped on screen and bounce.
-      denied.set(true);
+      // oxlint-disable-next-line eslint/no-await-in-loop -- same poll cycle: sleep, then re-read
+      await res.refetch();
+    }
+    if (!signal.aborted && !res.data()?.user) {
       navigate("/login");
-    })();
-    return () => {
-      cancelled = true;
-    };
+    }
   });
 
   const stopImpersonating = async () => {
@@ -150,15 +90,18 @@ export const Authed = ({
     }
   };
 
-  if (!ready()) {
-    return denied() ? null : fallback;
+  const data = res.data();
+  const user = data?.user;
+  if (!data || !user) {
+    return fallback;
   }
+  const seen = readImpersonated(data.session, user.email);
   return (
     <>
-      {impersonatedEmail() ? (
+      {seen.impersonated ? (
         <div class="bg-warning text-warning-content px-4 py-2 text-sm">
           <div class="mx-auto flex w-full max-w-5xl flex-wrap items-center justify-between gap-2">
-            <span>Impersonating {impersonatedEmail()}</span>
+            <span>Impersonating {seen.email}</span>
             <span class="flex items-center gap-2">
               {returnError() ? <span>{returnError()}</span> : null}
               <button

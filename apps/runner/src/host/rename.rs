@@ -53,33 +53,44 @@ async fn move_dir(from: &std::path::Path, to: &std::path::Path) -> anyhow::Resul
     Ok(())
 }
 
-/// `aws s3 mv --recursive`, skipped when the source prefix is empty so a
-/// retry after a partial move stays a no-op instead of an error.
+/// Object-by-object prefix move, skipped when the source prefix is empty so a
+/// retry after a partial move stays a no-op instead of an error. Copies run
+/// eight at a time; each key is uploaded before its source is deleted, so a
+/// crash leaves the union of both prefixes (never a loss).
 async fn move_s3_prefix(cfg: &Config, from: &str, to: &str) -> anyhow::Result<()> {
     let bucket = from
         .strip_prefix("s3://")
         .and_then(|s| s.split('/').next())
-        .unwrap_or(&cfg.s3_bucket);
-    let from_key = from.strip_prefix(&format!("s3://{bucket}/")).unwrap_or(from);
-    let json = cmd::s3_list_prefix(cfg, bucket, from_key).await?;
-    let empty = serde_json::from_str::<serde_json::Value>(&json)
+        .unwrap_or(&cfg.s3_bucket)
+        .to_string();
+    let from_key = from.strip_prefix(&format!("s3://{bucket}/")).unwrap_or(from).to_string();
+    let to_key = to.strip_prefix(&format!("s3://{bucket}/")).unwrap_or(to).to_string();
+    let json = cmd::s3_list_prefix(cfg, &bucket, &from_key).await?;
+    let keys: Vec<String> = serde_json::from_str::<serde_json::Value>(&json)
         .ok()
-        .and_then(|v| v.get("Contents")?.as_array().map(|c| c.is_empty()))
-        .unwrap_or(true);
-    if empty {
+        .and_then(|v| v.get("Contents")?.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|o| o.get("Key")?.as_str().map(str::to_string))
+        .collect();
+    if keys.is_empty() {
         return Ok(());
     }
-    let env_owned = cmd::aws_env(cfg);
-    let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    cmd::run_cmd(
-        "aws",
-        &["--endpoint-url", &cfg.s3_endpoint, "s3", "mv", "--recursive", from, to],
-        None,
-        &env,
-        Duration::from_secs(300),
-    )
-    .await
-    .with_context(|| format!("move S3 prefix {from} → {to}"))?;
+    use futures::StreamExt;
+    let moves = futures::stream::iter(keys.into_iter().map(|key| {
+        let rel = key.strip_prefix(&from_key).unwrap_or(&key).to_string();
+        let bucket = bucket.clone();
+        let to_key = format!("{to_key}{rel}");
+        async move {
+            cmd::s3_copy_key(cfg, &bucket, &key, &to_key).await?;
+            cmd::s3_delete_key(cfg, &key).await
+        }
+    }))
+    .buffer_unordered(8)
+    .collect::<Vec<anyhow::Result<()>>>();
+    for r in moves.await {
+        r.with_context(|| format!("move S3 prefix {from} → {to}"))?;
+    }
     Ok(())
 }
 
@@ -161,6 +172,11 @@ async fn rename_slugged(
         (
             root.join("builds").join(&app.slug),
             root.join("builds").join(new_slug),
+        ),
+        // T5.1: the persistent bun cache moves with the app.
+        (
+            root.join("cache").join(&app.slug),
+            root.join("cache").join(new_slug),
         ),
     ];
     for (from, to) in &pairs {

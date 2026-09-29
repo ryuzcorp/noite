@@ -84,7 +84,7 @@ test("hostile tenant is contained", async ({ page, request }) => {
 
   const appId = await findAppId(request, HOSTILE_SLUG);
   expect(appId).not.toBeNull();
-  await page.goto("/profile");
+  await page.goto("/account");
   await page
     .locator('button[type="button"]', { hasText: "Create key" })
     .click();

@@ -1,21 +1,15 @@
 //! App overview panel: header, status, actions, metrics.
-import { navigate, useRoute } from "@ilha/router";
-import { atom, unsafe, watch } from "ilha";
+import { useRoute } from "@ilha/router";
+import { atom, watch } from "ilha";
 
 import { appHost, appUrl, initials, presenceTone } from "../apps";
-import { get, setDesired } from "../apps.server";
+import { setDesired } from "../apps.server";
+import { ArrowLeft, ArrowUpRight, Pause, Play } from "../icons";
+import { appDetail } from "../resources";
 import type { AppRole } from "../roles";
-import { fetchSession } from "../session";
 import { AppHeaderSkeleton } from "../skeletons";
 import { sleep } from "../sleep";
 import { AppStorageList } from "../storage/list";
-import { readSwrCache, writeSwrCache } from "../swr-cache";
-import {
-  ARROW_LEFT_SVG,
-  ARROW_UP_RIGHT_SVG,
-  PAUSE_SVG,
-  PLAY_SVG,
-} from "./icons";
 import { MetricsCard } from "./metrics";
 
 /** Header status line, rendered from the already-fetched detail (no live
@@ -64,47 +58,55 @@ export interface AppDetailInfo {
 
 export const AppDetailPanel = () => {
   const { params } = useRoute();
-  // Cache-first: seed from the last good value at creation so first paint
-  // carries data on every mount; watch.once revalidates in background.
-  const seed = (() => {
-    const { id } = params();
-    return id ? readSwrCache<AppDetailInfo>(`app:${id}:detail`) : null;
-  })();
-  const ready = atom(seed !== null);
-  const detail = atom<AppDetailInfo | null>(seed);
-  const loadError = atom("");
+  const { id } = params();
+  const res = appDetail(id ?? "");
   const notice = atom<string | null>(null);
+  const converging = atom<string | null>(null);
 
-  watch.once(() => {
-    void (async () => {
-      const { data } = await fetchSession();
-      if (!data?.user) {
-        navigate("/login");
-        return;
+  // The fleet converges asynchronously (reconcile loop), so the first
+  // re-fetch still shows the old status. Poll the shared detail until the
+  // live status matches or the budget runs out — then stop (never
+  // endless). Keyed on the pending state so the watch signal stops it on
+  // unmount or when a newer toggle supersedes it.
+  watch(converging, async (pending, { signal }) => {
+    if (!pending) {
+      return;
+    }
+    try {
+      for (let i = 0; i < 20; i += 1) {
+        if (signal.aborted) {
+          return;
+        }
+        // oxlint-disable-next-line eslint/no-await-in-loop -- sequential converge poll; parallel makes no sense here
+        const fresh = await res.refetch();
+        if (signal.aborted) {
+          return;
+        }
+        if (!fresh || fresh.app.status === pending) {
+          break;
+        }
+        // oxlint-disable-next-line eslint/no-await-in-loop -- sequential converge poll; parallel makes no sense here
+        await sleep(3000);
       }
-      const { id } = params();
-      if (!id) {
-        loadError.set("Missing app id");
-        ready.set(true);
-        return;
+    } finally {
+      if (!signal.aborted) {
+        converging.set(null);
       }
-      const cached = readSwrCache<AppDetailInfo>(`app:${id}:detail`);
-      if (cached) {
-        detail.set(cached);
-      }
-      try {
-        const info = await get(id);
-        detail.set(info);
-        writeSwrCache(`app:${id}:detail`, info);
-        ready.set(true);
-      } catch (error) {
-        loadError.set(error instanceof Error ? error.message : String(error));
-        ready.set(true);
-      }
-    })();
+    }
   });
 
-  if (!ready()) {
+  if (!id) {
+    return (
+      <div class="flex flex-col gap-2">
+        <p class="text-error">Missing app id</p>
+        <a href="/" class="link">
+          Back
+        </a>
+      </div>
+    );
+  }
+  const info = res.data();
+  if (res.loading() && info === undefined) {
     return (
       <div class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
         <div class="card-body gap-4">
@@ -113,17 +115,17 @@ export const AppDetailPanel = () => {
       </div>
     );
   }
-  if (loadError() && !detail()) {
+  const loadError = res.error();
+  if (loadError && !info) {
     return (
       <div class="flex flex-col gap-2">
-        <p class="text-error">{loadError()}</p>
+        <p class="text-error">{String(loadError)}</p>
         <a href="/" class="link">
           Back
         </a>
       </div>
     );
   }
-  const info = detail();
   if (!info) {
     return null;
   }
@@ -138,7 +140,7 @@ export const AppDetailPanel = () => {
             href="/apps"
             class="link link-hover inline-flex w-fit items-center gap-1 text-sm opacity-70"
           >
-            {unsafe(ARROW_LEFT_SVG)}
+            <ArrowLeft />
             Apps
           </a>
           <div class="flex items-center justify-between gap-2">
@@ -165,7 +167,7 @@ export const AppDetailPanel = () => {
                 class="btn btn-sm"
               >
                 <span class="inline-flex items-center gap-1">
-                  {unsafe(ARROW_UP_RIGHT_SVG)}
+                  <ArrowUpRight />
                   Visit
                 </span>
               </a>
@@ -179,25 +181,7 @@ export const AppDetailPanel = () => {
                     try {
                       await setDesired({ desiredState: next, id: app.id });
                       notice.set(null);
-                      // The fleet converges asynchronously (reconcile loop),
-                      // so the first re-fetch still shows the old status.
-                      // Poll until the live status matches or the budget
-                      // runs out — then stop (never endless).
-                      let fresh = await get(app.id);
-                      detail.set(fresh);
-                      writeSwrCache(`app:${app.id}:detail`, fresh);
-                      for (
-                        let i = 0;
-                        i < 20 && fresh.app.status !== next;
-                        i += 1
-                      ) {
-                        // oxlint-disable-next-line eslint/no-await-in-loop -- sequential converge poll; parallel makes no sense here
-                        await sleep(3000);
-                        // oxlint-disable-next-line eslint/no-await-in-loop -- same poll cycle: sleep, then read
-                        fresh = await get(app.id);
-                        detail.set(fresh);
-                        writeSwrCache(`app:${app.id}:detail`, fresh);
-                      }
+                      converging.set(next);
                     } catch (error) {
                       notice.set(
                         error instanceof Error ? error.message : String(error)
@@ -206,9 +190,7 @@ export const AppDetailPanel = () => {
                   }}
                 >
                   <span class="inline-flex items-center gap-1">
-                    {unsafe(
-                      app.desiredState === "running" ? PAUSE_SVG : PLAY_SVG
-                    )}
+                    {app.desiredState === "running" ? <Pause /> : <Play />}
                     {app.desiredState === "running" ? "Stop" : "Start"}
                   </span>
                 </button>

@@ -48,17 +48,19 @@ RUN bun run build \
   && rm -f dist/.dev.vars dist/.dev.vars.* dist/ssr/.dev.vars dist/ssr/.dev.vars.* \
   && find dist -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1 >dist/REVISION
 
-# --- runtime shared by `noite` and `dev` -----------------------------------
-FROM docker.io/oven/bun:1.3-debian AS base
+ # --- runtime shared by `noite` and `dev` -----------------------------------
+ # Runtime base is the slim variant (T6.3): ui-build stays on full debian
+ # (build tools); the runtime only needs bun + apt-installed bins.
+FROM docker.io/oven/bun:1.3-slim AS base
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 ARG TARGETARCH
 ARG CADDY_VERSION
-# bun: tenant `bun install` / builds. awscli: the runner's S3 calls (until
-# they move into Rust). nftables: the tenant egress policy (SPEC, Egress policy). git: the
-# Git smart-HTTP adapter and deploy worktrees.
+# bun: tenant `bun install` / builds. nftables: the tenant egress policy
+# (SPEC, Egress policy). git: the Git smart-HTTP adapter and deploy worktrees.
+# S3 goes through the runner's native client (no awscli, no Python).
 COPY docker/install-sidecars.sh /tmp/install-sidecars.sh
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      tini ca-certificates curl git awscli nftables unzip \
+      tini ca-certificates curl git nftables unzip \
   && rm -rf /var/lib/apt/lists/* \
   && sh /tmp/install-sidecars.sh && rm /tmp/install-sidecars.sh \
   && arch="$(dpkg --print-architecture)" \

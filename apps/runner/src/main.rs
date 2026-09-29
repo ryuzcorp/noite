@@ -30,7 +30,6 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
-use crate::host::deploy::Deploying;
 use crate::host::logs::LogState;
 use crate::host::supervisor::ProcMap;
 use crate::lifecycle::DEPLOY_STUCK_MS;
@@ -41,8 +40,14 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub procs: ProcMap,
     pub logs: LogState,
-    pub deploying: Deploying,
+    pub deploying: host::deploy::Deploying,
+    /// Broadcast when the ingest tick appends OTel log rows: the log stream
+    /// wakes on this instead of polling (spec T3.3).
+    pub log_notify: tokio::sync::watch::Sender<u64>,
     pub git_sync: host::git_manifest::GitSync,
+    /// Push-driven tip notifications (T2.2): the Git adapter and web commits
+    /// send here, the reconcile loop drains every tick and deploys.
+    pub tip_tx: host::tips::TipSender,
     /// Set after the first successful reconcile pass (fleets spawned,
     /// Caddyfile written). Gates /ready so the edge never routes to a
     /// runner whose tenants are still cold-booting.
@@ -140,8 +145,19 @@ async fn main() -> anyhow::Result<()> {
         Ok(marks) => host::metrics::set_watermarks(&mut metrics, marks),
         Err(e) => tracing::warn!(error = %e, "watermark restore"),
     }
+    // Resume compaction where it left off (spec T3.5): hours due while the
+    // runner was down compact on the next passes, bounded per pass.
+    match db::get_compacted_hours(&pool).await {
+        Ok(marks) => host::metrics::set_compacted(&mut metrics, marks),
+        Err(e) => tracing::warn!(error = %e, "compaction restore"),
+    }
     let ready = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(AtomicBool::new(false));
+    // Push-driven tips (T2.2): the Git adapter notifies, the loop drains.
+    let (tip_tx, tip_rx) = host::tips::channel();
+    // Ingest "new logs" signal for the log stream (spec T3.3).
+    let (log_tx, _log_rx) = tokio::sync::watch::channel(0u64);
+    let log_tx_loop = log_tx.clone();
     host::state::spawn_sync_task(state_sync.clone(), pool.clone(), (*config).clone());
     let state = AppState {
         pool: pool.clone(),
@@ -150,6 +166,8 @@ async fn main() -> anyhow::Result<()> {
         logs: logs.clone(),
         deploying: deploying.clone(),
         git_sync: host::git_manifest::GitSync::default(),
+        tip_tx: tip_tx.clone(),
+        log_notify: log_tx.clone(),
         ready: ready.clone(),
         isolation: Arc::new(tokio::sync::RwLock::new(isolation)),
         state_sync: state_sync.clone(),
@@ -167,6 +185,8 @@ async fn main() -> anyhow::Result<()> {
         metrics,
         ready.clone(),
         shutdown_loop,
+        tip_rx,
+        log_tx_loop,
     ));
 
 
@@ -176,13 +196,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/admin/snapshot", post(api::snapshot))
         .route("/v1/edge/fallback", get(host::edge::edge_fallback))
         .route("/v1/edge/tls-ask", get(host::edge::tls_ask))
-        .route("/webhook", post(api::webhook))
+        .route("/v1/edge/wake", get(host::edge::wake))
+        .route("/v1/admin/stats", get(api::stats))
         .route("/v1/apps", get(api::list_apps).post(api::create_app))
         .route(
             "/v1/apps/{id}",
             get(api::get_app).patch(api::patch_app).delete(api::delete_app),
         )
         .route("/v1/apps/{id}/rename", post(api::rename_app))
+        .route("/v1/apps/{id}/sleep", post(api::sleep_app))
         .route(
             "/v1/apps/{id}/domains",
             get(api::list_domains).post(api::add_domain),
@@ -192,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
             delete(api::remove_domain),
         )
         .route("/v1/apps/{id}/deploys", get(api::list_deploys))
+        .route("/v1/apps/{id}/deploys/{deploy_id}/log", get(api::deploy_log))
         .route("/v1/apps/{id}/rollback", post(api::rollback))
         .route(
             "/v1/apps/{id}/deploys/stream",
@@ -205,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/apps/{id}/devices", get(api::app_devices))
         .route("/v1/apps/{id}/paths", get(api::app_paths))
         .route("/v1/apps/{id}/refs", get(api::app_refs))
+        .route("/v1/apps/{id}/metrics/version", get(api::app_metrics_version))
         .route("/v1/apps/{id}/spans", get(api::app_spans))
         .route("/v1/apps/{id}/events", get(api::list_events).post(api::log_event))
         .route("/v1/apps/{id}/events/stream", get(api::list_events_stream))

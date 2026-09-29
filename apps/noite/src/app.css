@@ -92,22 +92,12 @@
   border-radius: 9999px;
 }
 
-/* Source preview: the pierre host is content-sized — stretch it to the
- * full pane height so short files still fill the code area. */
-#noite-src-code:not(.hidden) {
-  display: flex;
-  flex-direction: column;
-}
-#noite-src-code:not(.hidden) > * {
-  flex: 1;
-  min-height: 100%;
-}
-
 /* File tree (pierre): DaisyUI tokens onto --trees-*-override (highest
  * precedence in the tree's fallback chain). Token references flip with
  * the light/dark theme for free; bg stays transparent to blend with
- * the pane. Scoped to the tree host so nothing leaks. */
-#noite-src-tree {
+ * the pane. Set on the tree host; custom properties inherit into its
+ * shadow root, where the tree renders (see paneIn in source-browser). */
+.noite-src-tree {
   --trees-accent-override: var(--color-primary);
   --trees-bg-override: transparent;
   --trees-border-color-override: var(--color-base-300);
@@ -130,37 +120,23 @@
   --trees-selected-focused-border-color-override: var(--color-primary);
 }
 
-/* D1 row drawer (modal-end): tiny slide-in from the right on mount,
- * slide-out on close (see D1RowDrawer closing state). */
-@keyframes noite-drawer-in {
-  from {
+/* D1 row drawer (dialog.modal-end): slide-in from the right on open, via
+ * @starting-style. Native <dialog> closes instantly, so there is no exit
+ * transition — the drawer unmounts with the close. `translate` (not
+ * `transform`) avoids clobbering daisyUI's modal-box transforms. */
+dialog.modal.modal-end .modal-box {
+  transition:
+    translate 120ms ease-out,
+    opacity 120ms ease-out;
+}
+@starting-style {
+  dialog.modal.modal-end[open] .modal-box {
+    translate: 2rem 0;
     opacity: 0;
-    transform: translateX(2rem);
   }
-  to {
-    opacity: 1;
-    transform: translateX(0);
-  }
-}
-@keyframes noite-drawer-out {
-  from {
-    opacity: 1;
-    transform: translateX(0);
-  }
-  to {
-    opacity: 0;
-    transform: translateX(2rem);
-  }
-}
-.noite-drawer-in {
-  animation: noite-drawer-in 120ms ease-out;
-}
-.noite-drawer-out {
-  animation: noite-drawer-out 100ms ease-in forwards;
 }
 @media (prefers-reduced-motion: reduce) {
-  .noite-drawer-in,
-  .noite-drawer-out {
-    animation: none;
+  dialog.modal.modal-end .modal-box {
+    transition: none;
   }
 }

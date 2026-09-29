@@ -35,3 +35,11 @@ pub async fn snapshot(State(state): State<AppState>) -> impl IntoResponse {
     let uploaded = state.state_sync.snapshot_now(&state.pool, &state.config).await.ok();
     Json(json!({ "bytes": bytes, "ok": true, "path": target, "bucket_bytes": uploaded })).into_response()
 }
+
+/// Process-wide cost counters (spec T0.1): subprocess spawns by program, S3
+/// operations by verb with bytes, DuckDB runs by purpose, snapshot uploads,
+/// live SSE loops, plus RSS and CPU time. `make usage` diffs this over a
+/// window for the before/after harness.
+pub async fn stats() -> impl IntoResponse {
+    Json(crate::host::stats::snapshot()).into_response()
+}

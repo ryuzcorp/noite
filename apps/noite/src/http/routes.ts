@@ -1,5 +1,5 @@
+import { FindMyWay } from "effect/http";
 import * as Schema from "effect/Schema";
-import { FindMyWay } from "effect/unstable/http";
 import type { FetchHandler } from "oxidejs";
 
 import { authFromEnv, MissingAuthSecretError } from "../lib/auth";
@@ -381,7 +381,13 @@ const proxyRunnerStream = async (
   }
   const upstream = await fetch(
     `${rc.runner}${upstreamPath(encodeURIComponent(appId))}`,
-    { headers: { authorization: `Bearer ${rc.token}` } }
+    {
+      headers: { authorization: `Bearer ${rc.token}` },
+      // T1.2: a browser leaving aborts this proxy, which must abort the
+      // runner request too — otherwise the runner loop only notices on its
+      // next change-send and can poll forever.
+      signal: request.signal,
+    }
   );
   if (!upstream.ok || !upstream.body) {
     const text = await upstream.text().catch(() => upstream.statusText);
@@ -472,6 +478,87 @@ const METRICS_STREAM_POLL_MS = 30_000;
  * frame only when the request total moves — minute buckets mean the rest
  * is noise. Comment heartbeats reset celld's ~60s idle-stream expiry;
  * EventSource auto-reconnect covers the rest. Session + view-role gated. */
+/** Window of the metrics stream, in hours, for every series (requests,
+ * spans, devices, paths, refs). A future range picker (24h / 7d / …) maps
+ * onto this; the runner accepts up to 336 h (its 14-day retention) for the
+ * stored series and 24 h for spans. */
+const METRICS_WINDOW_HOURS = 24;
+/** Runner change counter (spec T3.6): NaN when the check itself fails, so
+ * the poll below runs instead of skipping. */
+const pollMetricsVersion = async (
+  base: string,
+  auth: { authorization: string }
+): Promise<number> => {
+  const vRes = await fetch(`${base}/metrics/version`, { headers: auth });
+  if (!vRes.ok) {
+    return Number.NaN;
+  }
+  const vJson: unknown = await vRes.json();
+  // SAFETY: cast validates at the fetch boundary; missing/non-numeric coerces to NaN.
+  const record = vJson as { version?: string | number | null } | null;
+  return Number(record?.version);
+};
+
+interface MetricsPoll {
+  auth: { authorization: string };
+  base: string;
+  windowQuery: string;
+}
+
+/** One 5-call metrics poll: null when the request total hasn't moved. */
+const pollMetricsFrame = async (
+  poll: MetricsPoll,
+  lastTotal: number
+): Promise<{ frame: string; total: number } | null> => {
+  const { auth, base, windowQuery } = poll;
+  const [mRes, sRes, dRes, pRes, rRes] = await Promise.all([
+    fetch(`${base}/metrics?${windowQuery}`, { headers: auth }),
+    fetch(`${base}/spans?${windowQuery}`, { headers: auth }),
+    fetch(`${base}/devices?${windowQuery}`, { headers: auth }),
+    fetch(`${base}/paths?${windowQuery}`, { headers: auth }),
+    fetch(`${base}/refs?${windowQuery}`, { headers: auth }),
+  ]);
+  if (!mRes.ok || !sRes.ok || !dRes.ok || !pRes.ok || !rRes.ok) {
+    throw new Error(
+      `runner metrics ${mRes.status}/${sRes.status}/${dRes.status}/${pRes.status}/${rRes.status}`
+    );
+  }
+  const [mJson, sJson, dJson, pJson, rJson]: unknown[] = await Promise.all([
+    mRes.json(),
+    sRes.json(),
+    dRes.json(),
+    pRes.json(),
+    rRes.json(),
+  ]);
+  if (
+    !Array.isArray(mJson) ||
+    !Array.isArray(sJson) ||
+    !Array.isArray(dJson) ||
+    !Array.isArray(pJson) ||
+    !Array.isArray(rJson)
+  ) {
+    throw new TypeError("runner metrics sent invalid data");
+  }
+  // SAFETY: mJson passed Array.isArray above; rows match the retired unary action shape.
+  const metrics = mJson as RunnerMetric[];
+  // SAFETY: sJson passed Array.isArray above; entries flow only into the SSE frame.
+  const spans = sJson as RunnerSpan[];
+  // SAFETY: dJson passed Array.isArray above; entries flow only into the SSE frame.
+  const devices = dJson as RunnerDevice[];
+  // SAFETY: pJson passed Array.isArray above; entries flow only into the SSE frame.
+  const paths = pJson as RunnerPath[];
+  // SAFETY: rJson passed Array.isArray above; entries flow only into the SSE frame.
+  const refs = rJson as RunnerRef[];
+  const total = metrics.reduce((a, r) => a + r.requests, 0);
+  if (total === lastTotal) {
+    return null;
+  }
+  return {
+    frame: JSON.stringify({ devices, metrics, paths, refs, spans }),
+    total,
+  };
+};
+
 const handleMetricsStream: RouteHandler = async (request, env, params) => {
   const appId = params?.appId?.trim() ?? "";
   if (!appId) {
@@ -493,58 +580,37 @@ const handleMetricsStream: RouteHandler = async (request, env, params) => {
   }
   const base = `${rc.runner}/v1/apps/${encodeURIComponent(appId)}`;
   const auth = { authorization: `Bearer ${rc.token}` };
+  // One window for every series in the frame, so tiles, charts, spans and
+  // analytics always describe the same period.
+  const windowQuery = `hours=${METRICS_WINDOW_HOURS}`;
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
       let lastReq = -1;
+      let lastVersion: number | null = null;
       while (!request.signal.aborted) {
         let frame: string | null = null;
         try {
-          // oxlint-disable-next-line eslint/no-await-in-loop -- one poll per cycle; parallel polls would race change detection
-          const [mRes, sRes, dRes, pRes, rRes] = await Promise.all([
-            fetch(`${base}/metrics?hours=24`, { headers: auth }),
-            fetch(`${base}/spans?hours=1`, { headers: auth }),
-            fetch(`${base}/devices?hours=24`, { headers: auth }),
-            fetch(`${base}/paths?hours=24`, { headers: auth }),
-            fetch(`${base}/refs?hours=24`, { headers: auth }),
-          ]);
-          if (!mRes.ok || !sRes.ok || !dRes.ok || !pRes.ok || !rRes.ok) {
-            throw new Error(
-              `runner metrics ${mRes.status}/${sRes.status}/${dRes.status}/${pRes.status}/${rRes.status}`
-            );
+          // Cheap change check (spec T3.6): the runner bumps the per-app
+          // version on every ingest with new rows. When it hasn't moved,
+          // the whole 5-call poll below is skipped.
+          // oxlint-disable-next-line eslint/no-await-in-loop -- one sequential cycle per loop by design
+          const v = await pollMetricsVersion(base, auth);
+          if (!Number.isNaN(v) && lastVersion !== null && v === lastVersion) {
+            continue;
           }
-          const [mJson, sJson, dJson, pJson, rJson]: unknown[] =
-            // oxlint-disable-next-line eslint/no-await-in-loop -- same single poll, bodies read together
-            await Promise.all([
-              mRes.json(),
-              sRes.json(),
-              dRes.json(),
-              pRes.json(),
-              rRes.json(),
-            ]);
-          if (
-            !Array.isArray(mJson) ||
-            !Array.isArray(sJson) ||
-            !Array.isArray(dJson) ||
-            !Array.isArray(pJson) ||
-            !Array.isArray(rJson)
-          ) {
-            throw new TypeError("runner metrics sent invalid data");
+          if (!Number.isNaN(v)) {
+            lastVersion = v;
           }
-          // SAFETY: mJson passed Array.isArray above; rows match the retired unary action shape.
-          const metrics = mJson as RunnerMetric[];
-          // SAFETY: sJson passed Array.isArray above; entries flow only into the SSE frame.
-          const spans = sJson as RunnerSpan[];
-          // SAFETY: dJson passed Array.isArray above; entries flow only into the SSE frame.
-          const devices = dJson as RunnerDevice[];
-          // SAFETY: pJson passed Array.isArray above; entries flow only into the SSE frame.
-          const paths = pJson as RunnerPath[];
-          // SAFETY: rJson passed Array.isArray above; entries flow only into the SSE frame.
-          const refs = rJson as RunnerRef[];
-          const total = metrics.reduce((a, r) => a + r.requests, 0);
-          if (total !== lastReq) {
+          // oxlint-disable-next-line eslint/no-await-in-loop -- one sequential cycle per loop by design
+          const polled = await pollMetricsFrame(
+            { auth, base, windowQuery },
+            lastReq
+          );
+          if (polled !== null) {
+            const { frame: nextFrame, total } = polled;
             lastReq = total;
-            frame = JSON.stringify({ devices, metrics, paths, refs, spans });
+            frame = nextFrame;
           }
         } catch (error) {
           // Transient failure: log it; the heartbeat below keeps the

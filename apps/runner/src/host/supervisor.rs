@@ -212,16 +212,26 @@ pub async fn ensure_fleet(
     // misbehaves; the inherited runner filter would suppress them.
     .env("RUST_LOG", &cfg.fleet_log)
     .env("CELLD_IDLE_EVICT_S", cfg.fleet_idle_evict_s.to_string())
-    .env("CELLD_DEPLOY_POLL_S", "5")
+    // T1.5: the runner POSTs /reload after every deploy path (push,
+    // rollback, web commit, rename), so the fleet's own poll only covers a
+    // missed reload — every 300 s instead of every 5 s.
+    .env("CELLD_DEPLOY_POLL_S", cfg.fleet_deploy_poll_s.to_string())
+    // T1.8: bound the per-fleet on-disk asset cache (celld's 512 MiB
+    // default, per idle app, is unbounded across fleets).
+    .env(
+        "CELLD_ASSET_CACHE_BYTES",
+        (cfg.fleet_asset_cache_mb * 1024 * 1024).to_string(),
+    )
     .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
     // Fleet telemetry -> Parquet in the fleet bucket (celld OTel, bucket
     // sink), the documented query path for request counts. The flush is the
     // docs' near-live value and the runner compacts the previous hour
     // (`metrics::compact_fleet`) — a short flush without that job makes DuckDB
-    // read thousands of tiny files. Retention matches the app_metric prune.
+    // read thousands of tiny files. Retention is one knob
+    // (RUNNER_TELEMETRY_RETENTION_DAYS) shared with the metric prune.
     .env("CELLD_OTEL", "1")
-    .env("CELLD_OTEL_FLUSH_MS", crate::host::metrics::OTEL_FLUSH_MS.to_string())
-    .env("CELLD_OTEL_RETENTION", "14d");
+    .env("CELLD_OTEL_FLUSH_MS", cfg.otel_flush_ms.to_string())
+    .env("CELLD_OTEL_RETENTION", format!("{}d", cfg.telemetry_retention_days));
     if cfg.fleet_max_rss_mb > 0 {
         cmd.env("CELLD_MAX_RSS_MB", cfg.fleet_max_rss_mb.to_string());
     }

@@ -28,7 +28,6 @@ use serde_json::json;
 use crate::config::Config;
 use crate::db;
 use crate::host::cmd::{self, TipBundle};
-use crate::host::deploy;
 use crate::host::git_manifest::{self, Manifest, ManifestRef};
 use crate::host::git_policy::{self, PolicyDecision};
 use crate::models::App;
@@ -374,17 +373,9 @@ async fn prune_old_bundles(cfg: &Config, slug: &str, refname: &str, keep_key: &s
 
 /// Best-effort recursive delete of one ref's prefix (ref deletions).
 async fn delete_ref_prefix(cfg: &Config, slug: &str, refname: &str) {
-    let prefix = format!("s3://{}/git/{slug}/{refname}/", cfg.s3_bucket);
-    let env_owned = cmd::aws_env(cfg);
-    let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let _ = cmd::run_cmd(
-        "aws",
-        &["--endpoint-url", &cfg.s3_endpoint, "s3", "rm", "--recursive", &prefix],
-        None,
-        &env,
-        Duration::from_secs(60),
-    )
-    .await;
+    let bucket = cfg.s3_bucket.clone();
+    let prefix = format!("git/{slug}/{refname}/");
+    let _ = cmd::s3_rm_prefix(cfg, &bucket, &prefix).await;
 }
 
 /// `old` must be an ancestor of `new` for a fast-forward update.
@@ -678,19 +669,15 @@ pub async fn receive_pack(
         Ok(o) => o,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     };
-    // Deploy fast-path: the reconcile loop tip-polls S3 independently, so a
-    // crash here only delays the deploy, never loses it.
+    // Push-driven deploy (T2.2): notify the reconcile loop, which drains the
+    // channel every tick and deploys. A crash here only delays the deploy to
+    // the next fallback sweep — the bundle and manifest are already stored.
     match after_receive(&state, &app, &bare, &before).await {
         Ok(Some(tip)) => {
             if !app.is_stopped() {
-                let pool = state.pool.clone();
-                let cfg = state.config.clone();
-                let procs = state.procs.clone();
-                let logs = state.logs.clone();
-                let deploying = state.deploying.clone();
-                let app = app.clone();
-                tokio::spawn(async move {
-                    deploy::deploy_tip(&pool, &cfg, &procs, &logs, &deploying, app, tip).await;
+                let _ = state.tip_tx.send(crate::host::tips::TipNotify {
+                    app_id: app.id.clone(),
+                    tip,
                 });
             }
         }

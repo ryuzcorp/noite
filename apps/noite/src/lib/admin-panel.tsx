@@ -1,17 +1,16 @@
 import { navigate } from "@ilha/router";
-import { atom, watch } from "ilha";
+import { atom } from "ilha";
 
 import {
   adminCreateInvites,
-  adminListInvites,
   adminRevokeInvite,
   banUser,
-  listAllApps,
-  listUsers,
   unbanUser,
 } from "./admin.server";
 import { initials, presenceTone } from "./apps";
 import { authClient } from "./auth-client";
+import { adminListInvites, listAllApps, listUsers } from "./resources";
+import { invalidateSession } from "./session";
 
 interface AdminUser {
   banned: boolean;
@@ -32,7 +31,6 @@ interface AdminApp {
 }
 
 interface AdminUserRowProps {
-  key?: string;
   row: AdminUser;
   isSelf: boolean;
   busy: boolean;
@@ -94,7 +92,7 @@ const AdminUserRow = (props: AdminUserRowProps) => {
   );
 };
 
-const AdminAppRow = ({ row }: { key?: string; row: AdminApp }) => (
+const AdminAppRow = ({ row }: { row: AdminApp }) => (
   <li class="list-row">
     <div>
       <div class="avatar avatar-placeholder">
@@ -144,7 +142,6 @@ const inviteState = (row: AdminInvite): string => {
 };
 
 const InviteRow = (props: {
-  key?: string;
   busy: boolean;
   copied: string;
   inv: AdminInvite;
@@ -227,25 +224,12 @@ const PanelSkeleton = ({ title }: { title: string }) => (
 export const AdminUsersPanel = ({ email }: { email: string }) => {
   const busy = atom(false);
   const impersonating = atom(false);
-  const loadError = atom("");
-  const loading = atom(true);
+  const res = listUsers();
+  const users = res.data() ?? [];
+  const loadError = res.error();
   const panelError = atom("");
-  const users = atom<AdminUser[]>([]);
 
-  const reload = async () => {
-    users.set((await listUsers()) ?? []);
-  };
-
-  watch.once(() => {
-    void (async () => {
-      try {
-        await reload();
-      } catch (error) {
-        loadError.set(error instanceof Error ? error.message : String(error));
-      }
-      loading.set(false);
-    })();
-  });
+  const reload = () => res.refetch();
 
   const impersonate = async (user: AdminUser) => {
     impersonating.set(true);
@@ -259,8 +243,10 @@ export const AdminUsersPanel = ({ email }: { email: string }) => {
         impersonating.set(false);
         return;
       }
-      // SPA nav: the session cookie is swapped server-side; the gate
-      // re-reads it on the next mount with no document reload.
+      // The session cookie is swapped server-side. The layout stays
+      // mounted across navigation, so drop every user-scoped cache —
+      // otherwise the chrome keeps showing the admin's session.
+      invalidateSession();
       navigate("/apps");
     } catch (error) {
       panelError.set(error instanceof Error ? error.message : String(error));
@@ -280,13 +266,15 @@ export const AdminUsersPanel = ({ email }: { email: string }) => {
     busy.set(false);
   };
 
-  if (loading()) {
+  if (res.loading() && res.data() === undefined) {
     return <PanelSkeleton title="Users" />;
   }
   return (
     <>
-      {loadError() ? (
-        <p class="m-0 text-sm opacity-70">Failed to load: {loadError()}</p>
+      {loadError ? (
+        <p class="m-0 text-sm opacity-70">
+          Failed to load: {String(loadError)}
+        </p>
       ) : null}
       <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
         <li class="flex items-center justify-between gap-2 p-4 pb-2">
@@ -295,10 +283,10 @@ export const AdminUsersPanel = ({ email }: { email: string }) => {
         {panelError() ? (
           <li class="text-error px-4 pb-2 text-sm">{panelError()}</li>
         ) : null}
-        {users().length === 0 ? (
+        {users.length === 0 ? (
           <li class="px-4 pt-2 pb-4 text-sm opacity-70">No users yet.</li>
         ) : (
-          users().map((row) => (
+          users.map((row) => (
             <AdminUserRow
               key={row.id}
               row={row}
@@ -321,37 +309,28 @@ export const AdminUsersPanel = ({ email }: { email: string }) => {
 
 /** Every app on the instance, whichever account owns it. */
 export const AdminAppsPanel = () => {
-  const loadError = atom("");
-  const loading = atom(true);
-  const apps = atom<AdminApp[]>([]);
+  const res = listAllApps();
+  const apps = res.data() ?? [];
+  const loadError = res.error();
 
-  watch.once(() => {
-    void (async () => {
-      try {
-        apps.set((await listAllApps()) ?? []);
-      } catch (error) {
-        loadError.set(error instanceof Error ? error.message : String(error));
-      }
-      loading.set(false);
-    })();
-  });
-
-  if (loading()) {
+  if (res.loading() && res.data() === undefined) {
     return <PanelSkeleton title="Apps" />;
   }
   return (
     <>
-      {loadError() ? (
-        <p class="m-0 text-sm opacity-70">Failed to load: {loadError()}</p>
+      {loadError ? (
+        <p class="m-0 text-sm opacity-70">
+          Failed to load: {String(loadError)}
+        </p>
       ) : null}
       <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
         <li class="flex items-center justify-between gap-2 p-4 pb-2">
           <span class="text-lg font-semibold tracking-wide">Apps</span>
         </li>
-        {apps().length === 0 ? (
+        {apps.length === 0 ? (
           <li class="px-4 pt-2 pb-4 text-sm opacity-70">No apps yet.</li>
         ) : (
-          apps().map((row) => <AdminAppRow key={row.id} row={row} />)
+          apps.map((row) => <AdminAppRow key={row.id} row={row} />)
         )}
       </ul>
     </>
@@ -361,27 +340,14 @@ export const AdminAppsPanel = () => {
 /** The invite pool: mint codes, hand them out, revoke what is still open. */
 export const AdminInvitesPanel = () => {
   const busy = atom(false);
-  const loadError = atom("");
-  const loading = atom(true);
+  const res = adminListInvites();
+  const invites = res.data() ?? [];
+  const loadError = res.error();
   const panelError = atom("");
-  const invites = atom<AdminInvite[]>([]);
   const mintCount = atom(3);
   const copied = atom("");
 
-  const reload = async () => {
-    invites.set((await adminListInvites()) ?? []);
-  };
-
-  watch.once(() => {
-    void (async () => {
-      try {
-        await reload();
-      } catch (error) {
-        loadError.set(error instanceof Error ? error.message : String(error));
-      }
-      loading.set(false);
-    })();
-  });
+  const reload = () => res.refetch();
 
   const mint = async () => {
     busy.set(true);
@@ -421,13 +387,15 @@ export const AdminInvitesPanel = () => {
     }
   };
 
-  if (loading()) {
+  if (res.loading() && res.data() === undefined) {
     return <PanelSkeleton title="Invites" />;
   }
   return (
     <>
-      {loadError() ? (
-        <p class="m-0 text-sm opacity-70">Failed to load: {loadError()}</p>
+      {loadError ? (
+        <p class="m-0 text-sm opacity-70">
+          Failed to load: {String(loadError)}
+        </p>
       ) : null}
       <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
         <li class="flex items-center justify-between gap-2 p-4 pb-2">
@@ -444,10 +412,7 @@ export const AdminInvitesPanel = () => {
               class="input input-sm w-20"
               value={mintCount()}
               oninput={(e) => {
-                // SAFETY: ilha oninput currentTarget is the <input> that fired.
-                mintCount.set(
-                  Number((e.currentTarget as HTMLInputElement).value)
-                );
+                mintCount.set(Number(e.currentTarget.value));
               }}
             />
             <button
@@ -469,10 +434,10 @@ export const AdminInvitesPanel = () => {
         {panelError() ? (
           <li class="text-error px-4 pb-2 text-sm">{panelError()}</li>
         ) : null}
-        {invites().length === 0 ? (
+        {invites.length === 0 ? (
           <li class="px-4 pt-2 pb-4 text-sm opacity-70">No codes yet.</li>
         ) : (
-          invites().map((inv) => (
+          invites.map((inv) => (
             <InviteRow
               key={inv.id}
               inv={inv}

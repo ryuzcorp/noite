@@ -2,7 +2,7 @@
 # Push this sample app to Noite via Git smart-HTTP (stock git only).
 # Tip lands at s3://noite/git/test/refs/heads/main/{sha}.bundle → deploy.
 # Always re-inits .git so each run is a fresh commit + push (new deploy).
-# Auth: profile API key (Profile → API keys) as HTTPS password; username=git.
+# Auth: account API key (Account → API keys) as HTTPS password; username=git.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -33,11 +33,11 @@ else
     TOKEN="$NOITE_GIT_TOKEN"
   else
     # -s: hide token; works when stdin is a TTY.
-    read -r -s -p "API key for '${SLUG}' (from Profile → API keys): " TOKEN
+    read -r -s -p "API key for '${SLUG}' (from Account → API keys): " TOKEN
     echo
   fi
   if [[ -z "${TOKEN}" ]]; then
-    echo "empty key — create one under Profile → API keys" >&2
+    echo "empty key — create one under Account → API keys" >&2
     exit 1
   fi
   # http://git.localhost:9080 → http://git:TOKEN@git.localhost:9080/slug

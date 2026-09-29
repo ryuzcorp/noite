@@ -5,12 +5,12 @@ use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 use sqlx::sqlite::SqliteConnection;
 
 use crate::models::{
-    now_iso, new_id, App, AppDeviceStat, AppDomain, AppEnv, AppEvent, AppInsight, AppMetric, AppPathStat, AppRefStat, AppStatus, AppUserProps, Deploy, DeployStatus,
+    now_iso, new_id, App, AppDeviceStat, AppDomain, AppEnv, AppEvent, AppInsight, AppMetric, AppPathStat, AppRefStat, AppSpanStat, AppStatus, AppUserProps, Deploy, DeployStatus,
 };
 
 const APP_COLS: &str = r#"id, slug, name, user_id, status, subdomain, git_prefix, fleet_bucket,
                   listen_port, internal_port, last_deploy_sha, last_error, desired_state,
-                  created_at, updated_at"#;
+                  created_at, updated_at, asleep_since, woke_at"#;
 
 pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     if let Some(path) = database_url
@@ -21,15 +21,25 @@ pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
             std::fs::create_dir_all(parent).ok();
         }
     }
+    // High-churn telemetry lives in metrics.sqlite, ATTACHed as `metrics`
+    // (spec T4.1): every pooled connection attaches it, so all queries below
+    // can name `metrics.*` on any connection. One statement per query call:
+    // a multi-statement script would borrow a local across the executor in a
+    // way the pooled-connection hook rejects.
+    let attach = std::sync::Arc::new(attach_metrics_statements(&metrics_db_path(database_url)));
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         // Deploy log streaming writes constantly while reads serve the UI;
         // without a busy timeout every writer collision fails immediately.
-        .after_connect(|conn: &mut SqliteConnection, _| {
+        .after_connect(move |conn: &mut SqliteConnection, _| {
+            let attach = attach.clone();
             Box::pin(async move {
                 sqlx::query("PRAGMA busy_timeout = 5000;")
                     .execute(&mut *conn)
                     .await?;
+                for stmt in attach.iter() {
+                    sqlx::query(stmt).execute(&mut *conn).await?;
+                }
                 Ok::<_, sqlx::Error>(())
             })
         })
@@ -43,6 +53,9 @@ pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     sqlx::query("PRAGMA foreign_keys = ON")
         .execute(&pool)
         .await?;
+    // Move rows out of the snapshotted file BEFORE schema.sql drops the old
+    // main tables (a fresh database has nothing to move: this is a no-op).
+    migrate_metrics_to_attached(&pool).await?;
     // One idempotent file (embedded at compile time), applied on every boot:
     // it creates whatever is missing and drops what earlier versions retired,
     // so there is no ledger to migrate and no ordering to keep in sync.
@@ -52,7 +65,151 @@ pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
         .await
         .context("apply schema")?;
     tx.commit().await?;
+    // Columns added after the table shipped (SQLite has no ADD COLUMN IF NOT
+    // EXISTS): scale-to-zero state (SPEC, Scale to zero).
+    ensure_column(&pool, "app", "asleep_since", "asleep_since TEXT").await?;
+    ensure_column(&pool, "app", "woke_at", "woke_at TEXT").await?;
     Ok(pool)
+}
+
+/// Sibling file holding the high-churn telemetry tables (`metrics.sqlite`
+/// next to the live database). `:memory:` for in-memory URLs (tests), where
+/// each connection attaches its own scratch database.
+pub fn metrics_db_path(database_url: &str) -> String {
+    if let Some(rest) = database_url.strip_prefix("sqlite:") {
+        let path = rest.split('?').next().unwrap_or(rest);
+        if !path.is_empty() && path != ":memory:" {
+            let dir = std::path::Path::new(path)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default();
+            return dir.join("metrics.sqlite").to_string_lossy().into_owned();
+        }
+    }
+    ":memory:".to_string()
+}
+
+/// High-churn, rebuildable telemetry tables (spec T4.1): minute buckets,
+/// edge analytics, hourly span stats, the log ring, ingest watermarks,
+/// compaction marks and per-app metrics versions. Derived from bucket
+/// telemetry and Caddy logs — losing the volume loses at most the retention
+/// window of dashboard history, never control-plane state. Column order of
+/// the moved tables matches the old main-file DDL exactly, so the one-time
+/// `INSERT INTO metrics.* SELECT * FROM main.*` migration lines up.
+pub const METRICS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS metrics.app_metric (
+  app_id TEXT NOT NULL,
+  bucket_ts TEXT NOT NULL,
+  requests INTEGER NOT NULL DEFAULT 0,
+  errors INTEGER NOT NULL DEFAULT 0,
+  latency_ms INTEGER NOT NULL DEFAULT 0,
+  cpu_ms INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (app_id, bucket_ts)
+);
+CREATE INDEX IF NOT EXISTS metrics.idx_app_metric_app_bucket ON app_metric(app_id, bucket_ts);
+CREATE TABLE IF NOT EXISTS metrics.app_device_stat (
+  app_id TEXT NOT NULL,
+  bucket_ts TEXT NOT NULL,
+  browser TEXT NOT NULL,
+  os TEXT NOT NULL,
+  requests INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (app_id, bucket_ts, browser, os)
+);
+CREATE INDEX IF NOT EXISTS metrics.idx_app_device_stat_app_bucket ON app_device_stat(app_id, bucket_ts);
+CREATE TABLE IF NOT EXISTS metrics.app_path_stat (
+  app_id TEXT NOT NULL,
+  bucket_ts TEXT NOT NULL,
+  path TEXT NOT NULL,
+  requests INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (app_id, bucket_ts, path)
+);
+CREATE INDEX IF NOT EXISTS metrics.idx_app_path_stat_app_bucket ON app_path_stat(app_id, bucket_ts);
+CREATE TABLE IF NOT EXISTS metrics.app_ref_stat (
+  app_id TEXT NOT NULL,
+  bucket_ts TEXT NOT NULL,
+  source TEXT NOT NULL,
+  requests INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (app_id, bucket_ts, source)
+);
+CREATE INDEX IF NOT EXISTS metrics.idx_app_ref_stat_app_bucket ON app_ref_stat(app_id, bucket_ts);
+CREATE TABLE IF NOT EXISTS metrics.metric_watermark (
+  slug TEXT PRIMARY KEY NOT NULL,
+  after_us INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS metrics.app_span_stat (
+  app_id TEXT NOT NULL,
+  bucket_hour TEXT NOT NULL,
+  name TEXT NOT NULL,
+  kind INTEGER NOT NULL DEFAULT 0,
+  n INTEGER NOT NULL DEFAULT 0,
+  ms INTEGER NOT NULL DEFAULT 0,
+  err INTEGER NOT NULL DEFAULT 0,
+  qwait_ms INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (app_id, bucket_hour, name, kind)
+);
+CREATE INDEX IF NOT EXISTS metrics.idx_app_span_stat_app_hour ON app_span_stat(app_id, bucket_hour);
+CREATE TABLE IF NOT EXISTS metrics.app_log (
+  app_id TEXT NOT NULL,
+  ts_us INTEGER NOT NULL,
+  body TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS metrics.idx_app_log_app_ts ON app_log(app_id, ts_us);
+CREATE TABLE IF NOT EXISTS metrics.metric_compaction (
+  slug TEXT NOT NULL,
+  hour TEXT NOT NULL,
+  compacted_at TEXT NOT NULL,
+  PRIMARY KEY (slug, hour)
+);
+CREATE TABLE IF NOT EXISTS metrics.metric_version (
+  app_id TEXT PRIMARY KEY NOT NULL,
+  version INTEGER NOT NULL DEFAULT 0
+);
+"#;
+
+fn attach_metrics_statements(metrics_path: &str) -> Vec<String> {
+    let mut stmts = vec![
+        format!(
+            "ATTACH DATABASE '{}' AS metrics",
+            metrics_path.replace('\'', "''")
+        ),
+        "PRAGMA metrics.journal_mode=WAL".to_string(),
+    ];
+    for part in METRICS_SCHEMA.split(';') {
+        let stmt = part.trim();
+        if !stmt.is_empty() {
+            stmts.push(stmt.to_string());
+        }
+    }
+    stmts
+}
+
+/// One-time move of telemetry rows from the snapshotted main file into the
+/// attached metrics database. Runs before schema.sql drops the old tables.
+async fn migrate_metrics_to_attached(pool: &SqlitePool) -> anyhow::Result<()> {
+    const MOVED: &[&str] = &[
+        "app_metric",
+        "app_device_stat",
+        "app_path_stat",
+        "app_ref_stat",
+        "metric_watermark",
+    ];
+    for table in MOVED {
+        let exists: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM main.sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_optional(pool)
+        .await?;
+        if exists.is_none() {
+            continue;
+        }
+        let copy = format!("INSERT OR IGNORE INTO metrics.{table} SELECT * FROM main.{table}");
+        sqlx::query(&copy).execute(pool).await?;
+        let drop = format!("DROP TABLE main.{table}");
+        sqlx::query(&drop).execute(pool).await?;
+        tracing::info!(table, "migrated telemetry table to metrics.sqlite");
+    }
+    Ok(())
 }
 
 /// Consistent copy of the runner database, written by `VACUUM INTO` next to
@@ -80,10 +237,8 @@ pub fn local_db_path(cfg: &crate::config::Config) -> Option<std::path::PathBuf> 
 /// `CREATE TABLE IF NOT EXISTS` only ever covers whole tables). Guard with
 /// `pragma_table_info` instead: this is the supported path for the next column,
 /// and it is a no-op once applied.
-// Never called yet — it exists for the next column this schema gains, and the
-// unit test below pins the add-once behaviour. Delete it the moment a real call
-// site lands (this allow is the only reason it is not `dead_code`).
-#[allow(dead_code)] // the schema-evolution helper: no column is pending right now
+/// Add a column to an existing table once (guarded by `pragma_table_info`,
+/// a no-op after the first boot). See SPEC, Runner schema evolution.
 pub async fn ensure_column(
     pool: &SqlitePool,
     table: &str,
@@ -249,14 +404,61 @@ pub async fn create_app(
     get_app(pool, &id).await.map(|a| a.expect("just inserted"))
 }
 
+/// Owner start/stop. Either way the app is no longer asleep, and a start
+/// resets the idle clock so a manually started app gets a full window before
+/// the sleep sweep may park it again (SPEC, Scale to zero).
 pub async fn patch_app_desired(pool: &SqlitePool, id: &str, desired: &str) -> sqlx::Result<()> {
-    sqlx::query("UPDATE app SET desired_state = ?, updated_at = ? WHERE id = ?")
-        .bind(desired)
-        .bind(now_iso())
+    let now = now_iso();
+    sqlx::query(
+        r#"UPDATE app SET desired_state = ?, asleep_since = NULL,
+           woke_at = CASE WHEN ? = 'running' THEN ? ELSE woke_at END,
+           updated_at = ? WHERE id = ?"#,
+    )
+    .bind(desired)
+    .bind(desired)
+    .bind(&now)
+    .bind(&now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Park an app (scale to zero): flag it asleep and show `sleeping`.
+pub async fn set_app_asleep(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
+    let now = now_iso();
+    sqlx::query("UPDATE app SET asleep_since = ?, status = 'sleeping', updated_at = ? WHERE id = ?")
+        .bind(&now)
+        .bind(&now)
         .bind(id)
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Wake an app: clear the flag and restart the idle clock. `status` is set
+/// by whoever spawns the fleet (wake handler or reconcile).
+pub async fn set_app_awake(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
+    let now = now_iso();
+    sqlx::query("UPDATE app SET asleep_since = NULL, woke_at = ?, updated_at = ? WHERE id = ?")
+        .bind(&now)
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Newest minute bucket with at least one request (celld `celld.fetch`
+/// spans), or None when the app never served within retention.
+pub async fn last_request_bucket(pool: &SqlitePool, app_id: &str) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar::<_, String>(
+        r#"SELECT bucket_ts FROM metrics.app_metric
+           WHERE app_id = ? AND requests > 0 ORDER BY bucket_ts DESC LIMIT 1"#,
+    )
+    .bind(app_id)
+    .fetch_optional(pool)
+    .await
 }
 
 pub async fn rename_app(
@@ -311,6 +513,60 @@ pub async fn update_app_status(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Newest deploy rows without their build logs: what the reconcile loop
+/// needs for the in-flight check (T1.6). `list_deploys` drags 20 full
+/// build logs every 5 s per app just to answer "is a deploy running".
+pub async fn latest_deploy_status(
+    pool: &SqlitePool,
+    app_id: &str,
+) -> sqlx::Result<Vec<(String, String)>> {
+    sqlx::query_as::<_, (String, String)>(
+        r#"SELECT status, updated_at FROM deploy
+           WHERE app_id = ? ORDER BY created_at DESC LIMIT 5"#,
+    )
+    .bind(app_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Deploy history for the live stream (T1.7): same rows as `list_deploys`
+/// but without build-log text, except the newest row when it is still in
+/// flight (its live log is what the panel shows). Finished rows' logs come
+/// from `get_deploy_log` on demand instead of riding every stream frame.
+pub async fn list_deploys_lean(pool: &SqlitePool, app_id: &str) -> sqlx::Result<Vec<Deploy>> {
+    // Select the log only for the newest row, and only while it is in
+    // flight: reading 20 full build logs to blank 19 of them costs the same
+    // SQLite work as the fat query this replaced.
+    sqlx::query_as::<_, Deploy>(
+        r#"SELECT id, app_id, sha, status,
+                  CASE WHEN rn = 1 AND status IN ('building', 'deploying') THEN log ELSE '' END AS log,
+                  created_at, updated_at
+           FROM (SELECT d.*, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rn
+                 FROM deploy d WHERE app_id = ? ORDER BY created_at DESC LIMIT 20)
+           ORDER BY created_at DESC"#,
+    )
+    .bind(app_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// One deploy's build log, fetched on demand when its panel opens (T1.7).
+/// Finished deploys never change, so callers may cache this forever.
+pub async fn get_deploy_log(
+    pool: &SqlitePool,
+    app_id: &str,
+    deploy_id: &str,
+) -> sqlx::Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as::<_, (String,)>(
+        r#"SELECT log FROM deploy WHERE id = ? AND app_id = ?"#,
+    )
+    .bind(deploy_id)
+    .bind(app_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(log,)| log))
 }
 
 pub async fn list_deploys(pool: &SqlitePool, app_id: &str) -> sqlx::Result<Vec<Deploy>> {
@@ -486,7 +742,7 @@ pub async fn add_app_metric(
     cpu_ms: i64,
 ) -> sqlx::Result<()> {
     sqlx::query(
-        r#"INSERT INTO app_metric (app_id, bucket_ts, requests, errors, latency_ms, cpu_ms)
+        r#"INSERT INTO metrics.app_metric (app_id, bucket_ts, requests, errors, latency_ms, cpu_ms)
            VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT (app_id, bucket_ts) DO UPDATE SET
              requests = requests + excluded.requests,
@@ -512,7 +768,7 @@ pub async fn list_app_metrics(
 ) -> sqlx::Result<Vec<AppMetric>> {
     sqlx::query_as::<_, AppMetric>(
         r#"SELECT app_id, bucket_ts, requests, errors, latency_ms, cpu_ms
-           FROM app_metric WHERE app_id = ? AND bucket_ts >= ?
+           FROM metrics.app_metric WHERE app_id = ? AND bucket_ts >= ?
            ORDER BY bucket_ts ASC"#,
     )
     .bind(app_id)
@@ -522,7 +778,7 @@ pub async fn list_app_metrics(
 }
 
 pub async fn prune_app_metrics(pool: &SqlitePool, older_than_ts: &str) -> sqlx::Result<u64> {
-    let res = sqlx::query("DELETE FROM app_metric WHERE bucket_ts < ?")
+    let res = sqlx::query("DELETE FROM metrics.app_metric WHERE bucket_ts < ?")
         .bind(older_than_ts)
         .execute(pool)
         .await?;
@@ -536,7 +792,7 @@ pub async fn get_metric_watermarks(
     pool: &SqlitePool,
 ) -> sqlx::Result<std::collections::HashMap<String, i64>> {
     let rows: Vec<(String, i64)> =
-        sqlx::query_as("SELECT slug, after_us FROM metric_watermark")
+        sqlx::query_as("SELECT slug, after_us FROM metrics.metric_watermark")
             .fetch_all(pool)
             .await?;
     Ok(rows.into_iter().collect())
@@ -548,7 +804,7 @@ pub async fn set_metric_watermarks(
 ) -> sqlx::Result<()> {
     for (slug, after_us) in marks {
         sqlx::query(
-            r#"INSERT INTO metric_watermark (slug, after_us) VALUES (?, ?)
+            r#"INSERT INTO metrics.metric_watermark (slug, after_us) VALUES (?, ?)
                ON CONFLICT (slug) DO UPDATE SET after_us = excluded.after_us"#,
         )
         .bind(slug)
@@ -570,7 +826,7 @@ pub async fn add_app_device(
     os: &str,
 ) -> sqlx::Result<()> {
     sqlx::query(
-        r#"INSERT INTO app_device_stat (app_id, bucket_ts, browser, os, requests)
+        r#"INSERT INTO metrics.app_device_stat (app_id, bucket_ts, browser, os, requests)
            VALUES (?, ?, ?, ?, 1)
            ON CONFLICT (app_id, bucket_ts, browser, os) DO UPDATE SET
              requests = requests + 1"#,
@@ -591,7 +847,7 @@ pub async fn list_app_devices(
 ) -> sqlx::Result<Vec<AppDeviceStat>> {
     sqlx::query_as::<_, AppDeviceStat>(
         r#"SELECT app_id, bucket_ts, browser, os, requests
-           FROM app_device_stat WHERE app_id = ? AND bucket_ts >= ?
+           FROM metrics.app_device_stat WHERE app_id = ? AND bucket_ts >= ?
            ORDER BY bucket_ts ASC"#,
     )
     .bind(app_id)
@@ -601,7 +857,7 @@ pub async fn list_app_devices(
 }
 
 pub async fn prune_app_devices(pool: &SqlitePool, older_than_ts: &str) -> sqlx::Result<u64> {
-    let res = sqlx::query("DELETE FROM app_device_stat WHERE bucket_ts < ?")
+    let res = sqlx::query("DELETE FROM metrics.app_device_stat WHERE bucket_ts < ?")
         .bind(older_than_ts)
         .execute(pool)
         .await?;
@@ -617,7 +873,7 @@ pub async fn add_app_path(
     path: &str,
 ) -> sqlx::Result<()> {
     sqlx::query(
-        r#"INSERT INTO app_path_stat (app_id, bucket_ts, path, requests)
+        r#"INSERT INTO metrics.app_path_stat (app_id, bucket_ts, path, requests)
            VALUES (?, ?, ?, 1)
            ON CONFLICT (app_id, bucket_ts, path) DO UPDATE SET
              requests = requests + 1"#,
@@ -637,7 +893,7 @@ pub async fn list_app_paths(
 ) -> sqlx::Result<Vec<AppPathStat>> {
     sqlx::query_as::<_, AppPathStat>(
         r#"SELECT app_id, bucket_ts, path, requests
-           FROM app_path_stat WHERE app_id = ? AND bucket_ts >= ?
+           FROM metrics.app_path_stat WHERE app_id = ? AND bucket_ts >= ?
            ORDER BY bucket_ts ASC"#,
     )
     .bind(app_id)
@@ -647,7 +903,7 @@ pub async fn list_app_paths(
 }
 
 pub async fn prune_app_paths(pool: &SqlitePool, older_than_ts: &str) -> sqlx::Result<u64> {
-    let res = sqlx::query("DELETE FROM app_path_stat WHERE bucket_ts < ?")
+    let res = sqlx::query("DELETE FROM metrics.app_path_stat WHERE bucket_ts < ?")
         .bind(older_than_ts)
         .execute(pool)
         .await?;
@@ -663,7 +919,7 @@ pub async fn add_app_ref(
     source: &str,
 ) -> sqlx::Result<()> {
     sqlx::query(
-        r#"INSERT INTO app_ref_stat (app_id, bucket_ts, source, requests)
+        r#"INSERT INTO metrics.app_ref_stat (app_id, bucket_ts, source, requests)
            VALUES (?, ?, ?, 1)
            ON CONFLICT (app_id, bucket_ts, source) DO UPDATE SET
              requests = requests + 1"#,
@@ -683,7 +939,7 @@ pub async fn list_app_refs(
 ) -> sqlx::Result<Vec<AppRefStat>> {
     sqlx::query_as::<_, AppRefStat>(
         r#"SELECT app_id, bucket_ts, source, requests
-           FROM app_ref_stat WHERE app_id = ? AND bucket_ts >= ?
+           FROM metrics.app_ref_stat WHERE app_id = ? AND bucket_ts >= ?
            ORDER BY bucket_ts ASC"#,
     )
     .bind(app_id)
@@ -693,11 +949,201 @@ pub async fn list_app_refs(
 }
 
 pub async fn prune_app_refs(pool: &SqlitePool, older_than_ts: &str) -> sqlx::Result<u64> {
-    let res = sqlx::query("DELETE FROM app_ref_stat WHERE bucket_ts < ?")
+    let res = sqlx::query("DELETE FROM metrics.app_ref_stat WHERE bucket_ts < ?")
         .bind(older_than_ts)
         .execute(pool)
         .await?;
     Ok(res.rows_affected())
+}
+
+/// Accumulate one hour-bucket of span stats (spec T3.2), filled by the
+/// ingest tick. Retention matches the other metric tables.
+#[allow(clippy::too_many_arguments)]
+pub async fn add_span_stat(
+    pool: &SqlitePool,
+    app_id: &str,
+    bucket_hour: &str,
+    name: &str,
+    kind: i64,
+    n: i64,
+    ms: i64,
+    err: i64,
+    qwait_ms: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO metrics.app_span_stat
+           (app_id, bucket_hour, name, kind, n, ms, err, qwait_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (app_id, bucket_hour, name, kind) DO UPDATE SET
+             n = n + excluded.n,
+             ms = ms + excluded.ms,
+             err = err + excluded.err,
+             qwait_ms = qwait_ms + excluded.qwait_ms"#,
+    )
+    .bind(app_id)
+    .bind(bucket_hour)
+    .bind(name)
+    .bind(kind)
+    .bind(n)
+    .bind(ms)
+    .bind(err)
+    .bind(qwait_ms)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Top spans over `[since_hour, now]`, summed across hour buckets
+/// (spec T3.2). A 24 h (or 7 d) window is one indexed SQLite scan.
+pub async fn list_span_stats(
+    pool: &SqlitePool,
+    app_id: &str,
+    since_hour: &str,
+) -> sqlx::Result<Vec<AppSpanStat>> {
+    sqlx::query_as::<_, AppSpanStat>(
+        r#"SELECT name, kind,
+             SUM(n) AS n, SUM(ms) AS ms, SUM(err) AS err, SUM(qwait_ms) AS qwait_ms
+           FROM metrics.app_span_stat
+           WHERE app_id = ? AND bucket_hour >= ?
+           GROUP BY name, kind ORDER BY ms DESC LIMIT 8"#,
+    )
+    .bind(app_id)
+    .bind(since_hour)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn prune_span_stats(pool: &SqlitePool, older_than_hour: &str) -> sqlx::Result<u64> {
+    let res = sqlx::query("DELETE FROM metrics.app_span_stat WHERE bucket_hour < ?")
+        .bind(older_than_hour)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Append ingested OTel log rows to the per-app ring (spec T3.3).
+pub async fn append_app_logs(
+    pool: &SqlitePool,
+    app_id: &str,
+    rows: &[(i64, String)],
+) -> sqlx::Result<()> {
+    for (ts_us, body) in rows {
+        sqlx::query("INSERT INTO metrics.app_log (app_id, ts_us, body) VALUES (?, ?, ?)")
+            .bind(app_id)
+            .bind(ts_us)
+            .bind(body)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Ring contents in chronological order (oldest first), like the old
+/// DuckDB `recent_logs` return.
+pub async fn list_app_logs(
+    pool: &SqlitePool,
+    app_id: &str,
+    since_us: i64,
+    limit: i64,
+) -> sqlx::Result<Vec<(i64, String)>> {
+    sqlx::query_as(
+        "SELECT ts_us, body FROM metrics.app_log \
+         WHERE app_id = ? AND ts_us >= ? ORDER BY ts_us ASC LIMIT ?",
+    )
+    .bind(app_id)
+    .bind(since_us)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Cap the ring per app: last 24 h AND last 2,000 lines, whichever is
+/// smaller (spec T3.3).
+pub async fn prune_app_logs(
+    pool: &SqlitePool,
+    app_id: &str,
+    cutoff_us: i64,
+    keep: i64,
+) -> sqlx::Result<u64> {
+    let mut n = sqlx::query("DELETE FROM metrics.app_log WHERE app_id = ? AND ts_us < ?")
+        .bind(app_id)
+        .bind(cutoff_us)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    // rowid is the insertion order: everything outside the newest `keep`.
+    n += sqlx::query(
+        "DELETE FROM metrics.app_log WHERE app_id = ? AND rowid NOT IN \
+         (SELECT rowid FROM metrics.app_log WHERE app_id = ? \
+          ORDER BY ts_us DESC, rowid DESC LIMIT ?)",
+    )
+    .bind(app_id)
+    .bind(app_id)
+    .bind(keep)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(n)
+}
+
+/// Durable compaction watermark (spec T3.5): the last compacted hour per
+/// slug, so an hour due while the runner was down is still folded later.
+pub async fn get_compacted_hours(
+    pool: &SqlitePool,
+) -> sqlx::Result<std::collections::HashMap<String, String>> {
+    // One row per (slug, hour); the max hour per slug is the watermark.
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT slug, MAX(hour) FROM metrics.metric_compaction GROUP BY slug")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
+pub async fn mark_hour_compacted(
+    pool: &SqlitePool,
+    slug: &str,
+    hour: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO metrics.metric_compaction (slug, hour, compacted_at) \
+         VALUES (?, ?, ?) ON CONFLICT (slug, hour) DO NOTHING",
+    )
+    .bind(slug)
+    .bind(hour)
+    .bind(now_iso())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn prune_compactions(pool: &SqlitePool, older_than_hour: &str) -> sqlx::Result<u64> {
+    let res = sqlx::query("DELETE FROM metrics.metric_compaction WHERE hour < ?")
+        .bind(older_than_hour)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Per-app metrics version (spec T3.6): bumped by the ingest tick whenever
+/// it persists new rows, so dashboard polls can skip unchanged windows.
+pub async fn bump_metric_version(pool: &SqlitePool, app_id: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO metrics.metric_version (app_id, version) VALUES (?, 1) \
+         ON CONFLICT (app_id) DO UPDATE SET version = version + 1",
+    )
+    .bind(app_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_metric_version(pool: &SqlitePool, app_id: &str) -> sqlx::Result<u64> {
+    let v: Option<i64> =
+        sqlx::query_scalar("SELECT version FROM metrics.metric_version WHERE app_id = ?")
+            .bind(app_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(v.unwrap_or(0).max(0) as u64)
 }
 
 /// Encrypted per-app credential row (SPEC, Scoped credentials). Nonce +

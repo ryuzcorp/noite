@@ -38,6 +38,8 @@ pub async fn purge_slug(
         root.join("projects").join(slug),
         root.join("fleets").join(slug),
         root.join("builds").join(slug),
+        // T5.1: the persistent bun cache is per-app tenant data too.
+        root.join("cache").join(slug),
     ] {
         if path.exists() {
             tokio::fs::remove_dir_all(&path)
@@ -55,26 +57,14 @@ pub async fn purge_slug(
 }
 
 async fn clear_s3_prefix(cfg: &Config, prefix: &str) -> anyhow::Result<()> {
-    let env_owned = cmd::aws_env(cfg);
-    let env: Vec<(&str, &str)> = env_owned
-        .iter()
-        .map(|(k, v)| (*k, v.as_str()))
-        .collect();
-    cmd::run_cmd(
-        "aws",
-        &[
-            "--endpoint-url",
-            &cfg.s3_endpoint,
-            "s3",
-            "rm",
-            "--recursive",
-            prefix,
-        ],
-        None,
-        &env,
-        Duration::from_secs(120),
-    )
-    .await
-    .with_context(|| format!("clear S3 prefix {prefix}"))?;
+    let bucket = prefix
+        .strip_prefix("s3://")
+        .and_then(|s| s.split('/').next())
+        .unwrap_or(&cfg.s3_bucket)
+        .to_string();
+    let key = prefix.strip_prefix(&format!("s3://{bucket}/")).unwrap_or(prefix);
+    cmd::s3_rm_prefix(cfg, &bucket, key)
+        .await
+        .with_context(|| format!("clear S3 prefix {prefix}"))?;
     Ok(())
 }

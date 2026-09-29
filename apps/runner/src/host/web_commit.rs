@@ -7,7 +7,6 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 
 use crate::host::cmd;
-use crate::host::deploy;
 use crate::host::git_http::{after_receive, ensure_bare, list_refs};
 use crate::models::App;
 use crate::AppState;
@@ -174,14 +173,9 @@ pub async fn web_commit(
             return Ok(sha);
         };
         if !app.is_stopped() {
-            let pool = state.pool.clone();
-            let cfg = state.config.clone();
-            let procs = state.procs.clone();
-            let logs = state.logs.clone();
-            let deploying = state.deploying.clone();
-            let app = app.clone();
-            tokio::spawn(async move {
-                deploy::deploy_tip(&pool, &cfg, &procs, &logs, &deploying, app, tip).await;
+            let _ = state.tip_tx.send(crate::host::tips::TipNotify {
+                app_id: app.id.clone(),
+                tip,
             });
         }
         Ok::<_, anyhow::Error>(sha)

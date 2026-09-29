@@ -127,6 +127,72 @@ fn page(status: StatusCode, title: &str, body: &str, control: &str) -> impl Into
     (status, Html(html))
 }
 
+/// Resolve a request host to its app: a tenant hostname by slug, anything
+/// else as a registered custom hostname (`app_domain`). Returns the parsed
+/// slug too (None for custom hosts) for the not-found page.
+async fn app_for_host(state: &AppState, host: &str) -> (Option<String>, Option<crate::models::App>) {
+    let cfg = &state.config;
+    let bare = host
+        .split_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host)
+        .trim()
+        .trim_end_matches('.')
+        .to_lowercase();
+    match parse_edge_slug(host, &cfg.tenant_bases(), &cfg.control_subdomain) {
+        Some(slug) => {
+            let app = crate::db::get_app_by_slug(&state.pool, &slug).await.ok().flatten();
+            (Some(slug), app)
+        }
+        None => (
+            None,
+            crate::db::get_app_by_domain(&state.pool, &bare).await.ok().flatten(),
+        ),
+    }
+}
+
+/// `forward_auth` target for an asleep app's sites (SPEC, Scale to zero).
+/// Caddy holds the visitor's request while this runs: wake the fleet, wait
+/// for its health gate, answer 200 — Caddy then proxies the held request
+/// unchanged, so the visitor never sees that the app was asleep. Public like
+/// the other edge routes: waking an app is exactly what a request to its
+/// hostname does anyway. Only a failed wake is visible (503 page).
+pub async fn wake(State(state): State<AppState>, headers: HeaderMap) -> axum::response::Response {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let host = header("x-forwarded-host")
+        .or_else(|| header("host"))
+        .unwrap_or_default();
+    let (_, app) = app_for_host(&state, &host).await;
+    let Some(app) = app else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match crate::host::sleep::wake_app(&state.pool, &state.config, &state.procs, &state.logs, &app.id)
+        .await
+    {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => {
+            tracing::warn!(slug = %app.slug, error = %e, "wake failed");
+            let cfg = &state.config;
+            let control = control_url(&host, &cfg.base_domain, &cfg.control_subdomain, &cfg.tenant_bases());
+            page(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Unavailable",
+                &format!(
+                    "<code>{}</code> could not start. Try again in a moment.",
+                    escape(&app.name)
+                ),
+                &control,
+            )
+            .into_response()
+        }
+    }
+}
+
 pub async fn edge_fallback(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -140,23 +206,7 @@ pub async fn edge_fallback(
     let control = control_url(host, &cfg.base_domain, &cfg.control_subdomain, &bases);
     // A tenant hostname resolves by slug; anything else may be a custom
     // hostname registered for one app (`app_domain`).
-    let bare = host
-        .split_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(host)
-        .trim()
-        .trim_end_matches('.')
-        .to_lowercase();
-    let (slug, app) = match parse_edge_slug(host, &bases, &cfg.control_subdomain) {
-        Some(slug) => (
-            Some(slug.clone()),
-            crate::db::get_app_by_slug(&state.pool, &slug).await.ok().flatten(),
-        ),
-        None => (
-            None,
-            crate::db::get_app_by_domain(&state.pool, &bare).await.ok().flatten(),
-        ),
-    };
+    let (slug, app) = app_for_host(&state, host).await;
     let Some(app) = app else {
         return match slug {
             Some(slug) => page(
