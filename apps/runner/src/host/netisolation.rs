@@ -115,9 +115,16 @@ fn ruleset(build_uid: u32, fleet_uid: u32, storage: &Storage) -> String {
     // gateway, a private address) match the rejects below, and no tenant
     // app is reachable at all.
     rules.push("    ct state established,related accept".to_string());
+    // DNS is matched on the port the socket dialed (conntrack's original
+    // tuple), not the packet's: Docker's embedded resolver answers on
+    // 127.0.0.11:53 through a DNAT to a random high port, and that NAT
+    // (output hook, priority -100) runs before this chain, so a plain
+    // `dport 53` never matched and the loopback reject below refused every
+    // lookup (`bun install` failed with ConnectionRefused on Docker only).
     for uid in [fleet_uid, build_uid] {
-        rules.push(format!("    meta skuid {uid} udp dport 53 accept"));
-        rules.push(format!("    meta skuid {uid} tcp dport 53 accept"));
+        rules.push(format!(
+            "    meta skuid {uid} meta l4proto {{ tcp, udp }} ct original proto-dst 53 accept"
+        ));
     }
     // The fleet's own celld needs the object store, which in Compose sits on a
     // private address (rustfs:9000): allow exactly those addresses and port,
@@ -239,12 +246,13 @@ mod tests {
         let rules = ruleset(10010, 10020, &storage);
         let first_reject = rules.find(" reject").expect("has rejects");
         for uid in [10010, 10020] {
-            for proto in ["udp", "tcp"] {
-                let accept = rules
-                    .find(&format!("meta skuid {uid} {proto} dport 53 accept"))
-                    .expect("dns accept present");
-                assert!(accept < first_reject, "{proto}/53 for {uid} must come first");
-            }
+            // Pre-NAT port: Docker DNATs its resolver off port 53.
+            let accept = rules
+                .find(&format!(
+                    "meta skuid {uid} meta l4proto {{ tcp, udp }} ct original proto-dst 53 accept"
+                ))
+                .expect("dns accept present");
+            assert!(accept < first_reject, "dns for {uid} must come first");
         }
         // The fleet's celld reaches its object store before private ranges close.
         let store = rules

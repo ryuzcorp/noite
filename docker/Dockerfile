@@ -40,7 +40,7 @@ RUN cargo build --release && strip target/release/noite-runner
 # bun install runs inside the image, so the lockfile is the only input that
 # pins UI deps. The ignore file keeps .dev.vars out of the context: a
 # build-time secret would otherwise be baked into the deployed worker vars.
-FROM docker.io/oven/bun:1.3-debian AS ui-build
+FROM docker.io/oven/bun:1.4-debian AS ui-build
 WORKDIR /app
 COPY apps/noite/package.json apps/noite/bun.lock ./
 RUN bun install --frozen-lockfile
@@ -52,7 +52,7 @@ RUN bun run build \
  # --- runtime shared by `noite` and `dev` -----------------------------------
  # Runtime base is the slim variant (T6.3): ui-build stays on full debian
  # (build tools); the runtime only needs bun + apt-installed bins.
-FROM docker.io/oven/bun:1.3-slim AS base
+FROM docker.io/oven/bun:1.4-slim AS base
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 ARG TARGETARCH
 ARG CADDY_VERSION
