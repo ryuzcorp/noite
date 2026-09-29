@@ -22,7 +22,7 @@ import logoSvg from "../public/logo.svg?raw";
 const { config } = data;
 const hasVideo = TOUR.src !== "";
 
-// Shared class strings: the Amp-style frame every section sits in.
+// Shared class strings: the bordered frame every section sits in.
 const section = "border-t border-base-300";
 const frame =
   "mx-auto max-w-[76rem] border-x border-base-300 px-4 py-16 sm:px-10 sm:py-24 max-sm:border-x-0";
@@ -52,7 +52,7 @@ const link =
   page={{
     description: config.description,
     route: "/",
-    title: "Noite: self-hosted PaaS for Cloudflare Workers apps",
+    title: "Noite: the app platform you own",
   }}
 >
   <div data-landing class="text-base-content">
@@ -71,11 +71,11 @@ const link =
           <h1
             class={`${display} m-0 text-[clamp(2.75rem,6.4vw,5.5rem)] [&_em]:text-primary`}
           >
-            Your Cloudflare Workers, <em>on</em> your own server.
+            The app platform <em>you</em> own.
           </h1>
           <p class={`${body} mt-6 mb-8`}>
-            Noite is a tiny, self-hostable platform for Workers apps, with
-            Durable Objects, D1 and R2 included. One command installs it, one
+            Noite is a tiny, self-hostable platform for your apps, with
+            durable objects, SQL databases and object storage included. One command installs it, one
             image runs it, and your data lives in a bucket you own.
           </p>
           <div

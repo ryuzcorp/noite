@@ -8,15 +8,15 @@ Draft copy for `noite.now/`, replacing `docs/index.mdx` as the front door. Every
 
 **Headline** (pick one):
 
-- **Your Cloudflare Workers, on your own server.**
+- **The app platform you own.**
 - **git push. It's live. On a box you own.**
 - **The PaaS that fits on a $5 VPS.**
 
-_Recommendation: lead with the first. It names the thing people already write (Workers) and the thing they want (ownership) in eight words. Use the second as the section title for "How it works"._
+_Recommendation: lead with the first. It leads with what people want (ownership) in five words, without naming another vendor. Use the second as the section title for "How it works"._
 
 **Subhead:**
 
-> Noite is a tiny, self-hostable platform for Workers apps, with Durable Objects, D1 and R2 included. One command installs it, one image runs it, and your data lives in a bucket you own.
+> Noite is a tiny, self-hostable platform for your apps, with durable objects, SQL databases and object storage included. One command installs it, one image runs it, and your data lives in a bucket you own.
 
 **Primary CTA:** the install command, as a copyable block with the copy button, not a button:
 
@@ -58,7 +58,7 @@ git push -u origin main
 
 _Six to nine cards, each an icon, a bold line and one sentence._
 
-- **Workers, unchanged.** Deploy with the `wrangler.jsonc` you already have, or a `cloudflare.config.ts`. Durable Objects, D1, R2 and static assets run on [celld](https://celld.dev).
+- **Bring your Workers app.** Many Cloudflare Workers apps move over as they are: deploy with the `wrangler.jsonc` you already have, or a `cloudflare.config.ts`. Durable Objects, D1, R2 and static assets run on [celld](https://celld.dev), and its docs list every supported API.
 - **Scale to zero, for real.** Apps idle for a day go to sleep and free their memory. The next request wakes them and is served normally: no splash page, no dropped request.
 - **Observability built in.** Live logs, 24 h metrics (requests, errors, latency, CPU) and slow-request spans for every app. No collector to run.
 - **Look inside your data.** Browse each app's D1 tables, R2 objects and Durable Objects from the dashboard.
@@ -113,7 +113,7 @@ _Logos only where the docs have a guide (Coolify, Railway). No hosting-provider 
 
 ## 7. FAQ
 
-**Is it really Cloudflare-compatible?** Noite runs your app on celld, which runs Workers, Durable Objects, D1, R2, KV, Queues, Workflows, Cron and static assets. See celld's [supported APIs](https://celld.dev/docs/) for the details.
+**Can I migrate an app from Cloudflare Workers?** Often, yes, with some limits. Noite runs apps on celld, which supports fetch handlers, Durable Objects, D1, R2, KV, Queues, Workflows, Cron and static assets, and reads your existing `wrangler.jsonc`. Bindings outside that list won't work, and Wrangler config keys celld doesn't accept have to be removed. See celld's [supported APIs](https://celld.dev/docs/) for the details.
 
 **How big a server do I need?** 2 GB of RAM is enough to start. Idle apps sleep and give their memory back, so many small apps fit on one box.
 
@@ -144,7 +144,7 @@ curl -fsSL https://noite.now/install.sh | sudo bash
 ## Implementation notes (not page copy)
 
 - **Route:** Blume mounts `.astro` files from `apps/website/pages/`, and a custom page overrides the generated route at the same path. `pages/index.astro` becomes `/`. Move `docs/index.mdx` to an intro page (e.g. `docs/introduction.mdx`) and point the header's "Docs" link at `/quickstart` or the intro.
-- **SEO:** `<title>` "Noite: self-hosted PaaS for Cloudflare Workers apps"; meta description = the subhead. Blume generates the Open Graph card for static custom pages.
+- **SEO:** `<title>` "Noite: the app platform you own"; meta description = the subhead. Blume generates the Open Graph card for static custom pages.
 - **Claims to keep honest:**
   - "Scale to zero": the first request after a quiet day waits for a cold start of a few seconds. Don't claim "instant wake"; say "served normally".
   - The celld numbers are celld's benchmarks; credit them or leave them out.
