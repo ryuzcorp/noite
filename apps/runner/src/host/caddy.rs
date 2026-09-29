@@ -55,6 +55,13 @@ pub async fn rewrite_caddy(
     // directive, which Caddy refuses to adapt. Everywhere else keep the
     // existing scheme behavior.
     let edge_tls = !local && !cfg.auto_https;
+    // Every public site is gated by on-demand TLS, also when Caddy terminates
+    // TLS directly: since Caddy 2.10 a managed wildcard (`*.{base}`, the
+    // fallback below) stops Caddy from obtaining certificates for the
+    // subdomains it covers, and an on-demand wildcard is never issued — so
+    // app/api/git and every tenant served no certificate at all (TLS alert
+    // `internal_error`). The ask gate already admits exactly those names.
+    let on_demand = !local;
     let addr_of = |host: &str| -> String {
         if edge_tls {
             host.to_string()
@@ -159,7 +166,10 @@ pub async fn rewrite_caddy(
                          site_extra: &[&str],
                          proxy_extra: &[&str],
                          upstream: &str| {
-        if tls && !addr.starts_with("http://") {
+        // Behind a proxy only: with direct TLS, Caddy's own :80 -> HTTPS
+        // redirect must answer instead (a `http://*.{base}` twin would
+        // shadow it for every host).
+        if tls && edge_tls && !addr.starts_with("http://") {
             push_block(
                 &plaintext_hosts(addr),
                 false,
@@ -174,7 +184,7 @@ pub async fn rewrite_caddy(
         // Per-host scheme mapping is handled inside `push_site`, so the joined
         // control list needs no special casing here.
         &control_site,
-        edge_tls,
+        on_demand,
         &[],
         &[],
         &cfg.caddy_control_upstream,
@@ -209,7 +219,7 @@ pub async fn rewrite_caddy(
             let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
             push_site(
                 &addr_of(&format!("{}.{}", app.slug, base)),
-                edge_tls,
+                on_demand,
                 &extra,
                 tenant_proxy(app),
                 &upstream,
@@ -236,7 +246,7 @@ pub async fn rewrite_caddy(
         let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
         push_site(
             &addr_of(&domain.hostname),
-            edge_tls,
+            on_demand,
             &extra,
             tenant_proxy(app),
             &upstream,
@@ -246,7 +256,7 @@ pub async fn rewrite_caddy(
     // API → runner (Bearer-protected REST)
     push_site(
         &addr_of(&format!("api.{}", cfg.base_domain)),
-        edge_tls,
+        on_demand,
         &[],
         &[],
         &cfg.caddy_api_upstream,
@@ -255,7 +265,7 @@ pub async fn rewrite_caddy(
     // Git smart-HTTP → runner `/v1/git/{slug}/…` (Basic auth inside runner)
     push_site(
         &addr_of(&format!("git.{}", cfg.base_domain)),
-        edge_tls,
+        on_demand,
         &["rewrite * /v1/git{uri}"],
         &[],
         &cfg.caddy_api_upstream,
@@ -267,7 +277,7 @@ pub async fn rewrite_caddy(
     for base in cfg.tenant_bases() {
         push_site(
             &addr_of(&format!("*.{base}")),
-            !local,
+            on_demand,
             &["rewrite * /v1/edge/fallback"],
             &[],
             &cfg.caddy_api_upstream,
@@ -702,6 +712,29 @@ mod tests {
         assert!(out.contains("\ttls {"), "on-demand TLS site");
         assert!(out.contains("tls-ask"), "ask endpoint");
         assert!(out.contains("\tencode zstd gzip"), "compressing edge");
+        // Caddy 2.10 skips managed certs for names a wildcard covers, so
+        // every public site must carry the on-demand gate itself.
+        for site in [
+            "app.noite.now {",
+            "api.noite.now {",
+            "git.noite.now {",
+            "test.noite.now {",
+            "*.noite.now {",
+        ] {
+            let block = out.split(&format!("\n{site}\n")).nth(1).expect(site);
+            let block = block.split("\n}\n").next().unwrap_or_default();
+            assert!(block.contains("\t\ton_demand"), "{site} is on-demand gated");
+        }
+        // No plaintext twins: Caddy's own :80 -> HTTPS redirect answers.
+        let plaintext = out
+            .lines()
+            .filter(|l| l.starts_with("http://") && l.ends_with(" {"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            plaintext,
+            vec!["http://127.0.0.1 {"],
+            "only the loopback healthcheck site is plaintext"
+        );
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
     }
 

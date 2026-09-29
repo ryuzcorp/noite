@@ -31,6 +31,26 @@ Re-running the script is the upgrade: it refreshes `compose.yaml`, keeps `.env` 
 
 For your own bucket ([option B](#b-your-own-bucket)), lost-passkey email (`NOITE_EMAIL_WEBHOOK_URL`) or any other setting, edit `/opt/noite/.env` and run `cd /opt/noite && docker compose up -d`. The sections below are the same install by hand, for hosts where you'd rather not run the script.
 
+## Uninstall or start over
+
+```bash
+curl -fsSL https://noite.now/uninstall.sh | sudo bash
+```
+
+The script removes the stack's containers, network and volumes (the runner database, git mirrors, Caddy certificates and the bundled bucket), the Noite and RustFS images, and `/opt/noite` with its `.env`. Docker and the `ufw` rules for 80/443 stay. It asks you to type the base domain first; without a terminal, pass `NOITE_CONFIRM=1`. Then run `install.sh` again for a fresh install, which is also how you change the domain.
+
+:::danger
+Uninstalling deletes every app, account, repository and secret of the install. [Back up](/self-hosting/operations#backups) first if you need any of it.
+:::
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `NOITE_KEEP_DATA` | `0` | `1` removes the containers only; volumes, images and `.env` stay, and `install.sh` brings the same install back |
+| `NOITE_CONFIRM` | `0` | `1` skips the confirmation |
+| `NOITE_DIR` | `/opt/noite` | install directory |
+
+A bucket of your own is never touched: a reinstall pointed at it restores the old state from its snapshot, so empty it or set a new `NOITE_S3_BUCKET` to start fresh. Each full reinstall also issues new TLS certificates, and Let's Encrypt allows 5 certificates per hostname per week, so reinstall a real domain sparingly (`NOITE_KEEP_DATA=1` keeps the certificates).
+
 ## Manual install
 
 The same result without the script, on any host with Docker (or Podman) and Compose. Only two files are needed; nothing is cloned or built.
