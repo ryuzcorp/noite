@@ -16,5 +16,7 @@ services:
       # No proxy in front of the lane: every request shares one client key.
       NOITE_RATE_LIMIT_RPM: "100000"
       NOITE_AUTH_RATE_LIMIT: "100000"
+      NOITE_EDGE_RPM: "0"
+      NOITE_EDGE_GIT_RPM: "0"
       # `E2E_TENANCY=multi` runs the isolation lane (hostile tenant spec).
       NOITE_TENANCY: ${E2E_TENANCY:-single}

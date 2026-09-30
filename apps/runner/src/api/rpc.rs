@@ -13,7 +13,8 @@ use serde::Deserialize;
 use crate::api::source as api_source;
 use crate::host::{deploy, purge, rename, source, storage, web_commit};
 use crate::lifecycle::slug_ok;
-use crate::models::{App, DesiredState};
+use crate::config::Config;
+use crate::models::{App, AppLimit, DesiredState};
 use crate::{db, AppState};
 
 #[derive(Deserialize)]
@@ -124,6 +125,26 @@ async fn dispatch(state: &AppState, raw: serde_json::Value) -> JsonRpcResponse {
         return rpc_err(id, JsonRpcErrorReason::InvalidRequest, "missing method".into());
     };
     dispatch_call(state, &method, call.params, id).await
+}
+
+/// Ceiling on a per-app edge limit (requests per minute): past this the
+/// module's per-client ring buffer stops being small.
+const MAX_EDGE_RPM: i64 = 600_000;
+
+/// An app's edge limits as the settings panel shows them: its own values
+/// (null = default) beside the platform defaults they fall back to.
+/// `perClient` is false behind a proxy the edge does not trust, where
+/// per-client limits cannot apply (`Config::edge_sees_clients`).
+fn limits_view(cfg: &Config, limit: &AppLimit) -> serde_json::Value {
+    serde_json::json!({
+        "clientRpm": limit.client_rpm,
+        "appRpm": limit.app_rpm,
+        "perClient": cfg.edge_sees_clients(),
+        "defaults": {
+            "clientRpm": cfg.edge.client_rpm,
+            "appRpm": cfg.edge.app_rpm,
+        },
+    })
 }
 
 #[derive(Deserialize)]
@@ -520,6 +541,51 @@ async fn dispatch_call(
                 },
                 Err(e) => internal(&id, e.to_string()),
             }
+        }
+        "limits.get" => {
+            let p: IdParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let a = match app(state, &p.id, &id).await {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
+            match db::get_app_limit(&state.pool, &a.id).await {
+                Ok(limit) => JsonRpcResponse::success(id, limits_view(&state.config, &limit)),
+                Err(e) => internal(&id, e.to_string()),
+            }
+        }
+        "limits.set" => {
+            // Requests per minute; null = the platform default, 0 = off.
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                id: String,
+                client_rpm: Option<i64>,
+                app_rpm: Option<i64>,
+            }
+            let p: P = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let in_range = |v: Option<i64>| v.is_none_or(|v| (0..=MAX_EDGE_RPM).contains(&v));
+            if !in_range(p.client_rpm) || !in_range(p.app_rpm) {
+                return bad(&id, &format!("limits must be between 0 and {MAX_EDGE_RPM} requests per minute"));
+            }
+            let a = match app(state, &p.id, &id).await {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
+            let limit = AppLimit {
+                app_id: a.id.clone(),
+                client_rpm: p.client_rpm,
+                app_rpm: p.app_rpm,
+            };
+            if let Err(e) = db::set_app_limit(&state.pool, &limit).await {
+                return internal(&id, e.to_string());
+            }
+            JsonRpcResponse::success(id, limits_view(&state.config, &limit))
         }
         "errors.list" => {
             #[derive(Deserialize)]

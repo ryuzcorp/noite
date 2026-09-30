@@ -18,6 +18,7 @@ import {
   doPreview as fetchDoPreview,
   errorDetail as fetchErrorDetail,
   get,
+  getLimits,
   listErrors,
   listAppStorage,
   listCollaborators,
@@ -95,6 +96,7 @@ export const keys = {
     `app:${appId}:error:${fingerprint}`,
   errors: (id: string, status: ErrorStatus) => `app:${id}:errors:${status}`,
   inviteCodes: "me:invites",
+  limits: (id: string) => `app:${id}:limits`,
   myInvitations: "me:collaborator-invitations",
   passkeys: "me:passkeys",
   pendingInvitations: (id: string) => `app:${id}:pending-invitations`,
@@ -132,6 +134,9 @@ export const myInvitations = () =>
 
 export const domains = (id: string) =>
   tracked(keys.domains(id), () => listDomains(id));
+
+export const limits = (id: string) =>
+  tracked(keys.limits(id), () => getLimits(id));
 
 export const envVars = (id: string) =>
   tracked(keys.envVars(id), () => listEnv(id));

@@ -36,6 +36,7 @@ import {
   runnerListDomains,
   runnerRemoveDomain,
   runnerDeleteApp,
+  runnerGetLimits,
   runnerGitRemote,
   runnerPatchApp,
   runnerRenameApp,
@@ -58,6 +59,7 @@ import {
   runnerGetError,
   runnerListErrors,
   runnerSetErrorStatus,
+  runnerSetLimits,
 } from "./runner";
 
 const CreateApp = Schema.Struct({
@@ -553,6 +555,44 @@ export const removeDomain = action(
     await requireAppRole(appId, user.id, "admin");
     try {
       return await runnerRemoveDomain(appId, hostname);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }),
+  { error: AuthError }
+);
+
+// ---- Edge rate limits (read: view · write: admin) ----
+
+/** Requests per minute; null = the platform default, 0 = off. */
+const Rpm = Schema.Union([Schema.Number, Schema.Null]);
+const LimitArgs = Schema.Struct({
+  appId: Schema.String,
+  appRpm: Rpm,
+  clientRpm: Rpm,
+});
+
+/** The app's edge limits beside the platform defaults they fall back to. */
+export const getLimits = action(
+  checkedSchema(AppId, async (appId) => {
+    await requireViewApp(appId);
+    try {
+      return await runnerGetLimits(appId);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }),
+  { error: AuthError }
+);
+
+/** Set the app's edge limits (admin). The runner owns the range check and
+ * rewrites the edge on its next reconcile. */
+export const setLimits = action(
+  checkedSchema(LimitArgs, async ({ appId, appRpm, clientRpm }) => {
+    const user = await sessionUser();
+    await requireAppRole(appId, user.id, "admin");
+    try {
+      return await runnerSetLimits(appId, clientRpm, appRpm);
     } catch (error) {
       failUnknown(error);
     }

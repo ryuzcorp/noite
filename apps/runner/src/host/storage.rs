@@ -1,6 +1,6 @@
 //! Storage inventory over the deployed wrangler config, plus the shared
 //! wrangler parsing. Backends live in `d1` / `durable` / `r2`.
-use anyhow::{bail, Context};
+use anyhow::Context;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -95,17 +95,19 @@ pub(crate) fn parse_wrangler(text: &str) -> anyhow::Result<serde_json::Value> {
 }
 
 
+/// The deployed wrangler config, or `None` when there is none to read yet
+/// (nothing pushed, or no wrangler.json(c)): such an app has no storage.
 pub async fn deployed_wrangler(
     cfg: &Config,
     app: &App,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<Option<serde_json::Value>> {
     // What the last deploy uploaded; covers configs the source does not hold
     // (cloudflare.config.ts, a built dist/wrangler.json).
     if let Some(json) = app.deployed_config.as_deref() {
-        return Ok(serde_json::from_str(json)?);
+        return Ok(Some(serde_json::from_str(json)?));
     }
     let Some(rev) = source::resolve_rev(cfg, app).await? else {
-        bail!("no deployed source — push to main first");
+        return Ok(None);
     };
     for candidate in ["wrangler.jsonc", "wrangler.json", "wrangler.toml"] {
         if let Ok(blob) = source::read_blob(cfg, app, &rev, candidate).await {
@@ -116,15 +118,17 @@ pub async fn deployed_wrangler(
                 // TOML is out of scope for now (jsonc/json only).
                 continue;
             }
-            return parse_wrangler(&blob.text);
+            return parse_wrangler(&blob.text).map(Some);
         }
     }
-    bail!("no wrangler.json(c) in deployed source")
+    Ok(None)
 }
 
 
 pub async fn list_storage(cfg: &Config, app: &App) -> anyhow::Result<Vec<StorageItem>> {
-    let cfg_v = deployed_wrangler(cfg, app).await?;
+    let Some(cfg_v) = deployed_wrangler(cfg, app).await? else {
+        return Ok(Vec::new());
+    };
     let mut items = Vec::new();
     if let Some(Value::Array(dbs)) = cfg_v.get("d1_databases") {
         for db in dbs {

@@ -1,0 +1,53 @@
+---
+title: Edge protection
+description: Rate limits at the edge, per-app ceilings, and putting Cloudflare in front of Noite to absorb floods.
+---
+
+Noite protects itself at three levels. The edge rejects excess requests before they reach an app. The runner bounds how many apps start up at once. For floods larger than one server can take, a proxy such as Cloudflare goes in front.
+
+## What the edge does
+
+Caddy, Noite's edge, limits every public site before a request reaches a worker. Over a limit it answers `429 Too Many Requests` with a `Retry-After` header.
+
+| Limit | Default | Applies to |
+| --- | --- | --- |
+| `NOITE_EDGE_RPM` | 1800 per minute | Each visitor (client IP) on each site: the control UI, the API, the not-found page, and each app across all its hostnames |
+| `NOITE_EDGE_GIT_RPM` | 120 per minute | Each visitor on `git.` |
+| `NOITE_EDGE_APP_RPM` | none | Each app, across all visitors together |
+
+Set any of them to `0` to turn it off. The edge counts over a sliding 10-second window, so 1800 per minute means up to 300 requests in any 10 seconds. IPv6 visitors are counted per `/64`, the block one subscriber usually holds.
+
+The whole-app ceiling stops traffic from many addresses at once from taking the server's CPU away from every other app. It is off by default because a real traffic spike looks the same. Set a platform-wide ceiling with `NOITE_EDGE_APP_RPM`, or set one app's limits in its **Settings → Rate Limits** (app admins only). There, an empty field uses the platform default and `0` means no limit.
+
+The edge also drops connections that take more than 10 seconds to send their request headers, and closes idle keep-alive connections after 2 minutes.
+
+Asleep apps: when requests wake apps, at most `RUNNER_WAKE_CONCURRENCY` (default 4) cold-start at once. Later wakes wait their turn within `RUNNER_WAKE_TIMEOUT_S`, so a flood aimed at many sleeping apps cannot start all of them together.
+
+## Behind a proxy
+
+Rate limits count per visitor, so the edge must see each visitor's address. Behind a proxy, every request arrives from the proxy's address instead. Tell the edge which proxies to believe with `NOITE_TRUSTED_PROXIES`:
+
+| Value | Meaning |
+| --- | --- |
+| `cloudflare` | Cloudflare's published address ranges; the visitor's address comes from `CF-Connecting-IP` |
+| `private_ranges` | Any private network address (10/8, 172.16/12, 192.168/16, loopback, `fd00::/8`) |
+| IPs or CIDRs | Your own proxy's addresses, such as `203.0.113.7` or `10.1.0.0/16` |
+
+Separate several values with commas. Only list proxies that are actually in front of Noite: a trusted address can claim to be any visitor.
+
+With `CADDY_AUTO_HTTPS=off` on a real domain (Coolify, Railway) and no `NOITE_TRUSTED_PROXIES`, Noite turns per-visitor limits off rather than count every visitor as one. Per-app ceilings still apply, and the runner logs a warning at startup.
+
+## Cloudflare in front
+
+A single server cannot absorb a large flood: the network link fills before any software sees the traffic. Cloudflare's free plan absorbs that in front of Noite.
+
+1. Add your domain to Cloudflare and create **proxied** (orange cloud) `A`/`AAAA` records for `app`, `api`, `git` and `*` pointing at the server. Cloudflare's free certificate covers one level of subdomains, which is every Noite hostname.
+2. Under **SSL/TLS**, choose **Full (strict)**, and leave **Always Use HTTPS** off. Noite's Caddy gets its certificates through the plain-HTTP challenge, which Cloudflare's redirect would break; Caddy redirects everything else to HTTPS itself.
+3. Add `NOITE_TRUSTED_PROXIES=cloudflare` to `/opt/noite/.env` and apply it: `cd /opt/noite && docker compose up -d`.
+4. Let only Cloudflare reach ports 80 and 443. Otherwise an attacker who finds the server's address can skip Cloudflare. Use your hosting provider's firewall (Hetzner, DigitalOcean and most others have one) with [Cloudflare's IP list](https://www.cloudflare.com/ips/). `ufw` is not enough: Docker publishes ports around it.
+
+:::warning
+Cloudflare's free plan caps request bodies at 100 MB, which a push of a large repository can exceed. If that happens, set the `git` record to DNS only (grey cloud). Git then bypasses Cloudflare and still has its own per-visitor limit, but the server's address becomes public.
+:::
+
+Custom domains on apps work the same way: proxy them through Cloudflare in the account that owns them, or point them straight at the server.

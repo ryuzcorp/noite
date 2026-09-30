@@ -37,6 +37,18 @@ export interface RunnerDomain {
   hostname: string;
 }
 
+/** An app's edge rate limits in requests per minute: its own values (null =
+ * the platform default) beside those defaults. 0 turns a limit off.
+ * `perClient` is false when the install sits behind a proxy the edge does
+ * not trust: every request then looks like one client, so per-client limits
+ * are off whatever they are set to. */
+export interface RunnerLimits {
+  appRpm: number | null;
+  clientRpm: number | null;
+  defaults: { appRpm: number; clientRpm: number };
+  perClient: boolean;
+}
+
 export interface RunnerGitRemote {
   remote: string;
   url: string;
@@ -347,6 +359,16 @@ export const runnerAddDomain = (id: string, hostname: string) =>
 
 export const runnerRemoveDomain = (id: string, hostname: string) =>
   runnerRpc<RunnerDomain[]>("domains.remove", { hostname, id });
+
+export const runnerGetLimits = (id: string) =>
+  runnerRpc<RunnerLimits>("limits.get", { id });
+
+/** Replace both limits; null returns one to the platform default. */
+export const runnerSetLimits = (
+  id: string,
+  clientRpm: number | null,
+  appRpm: number | null
+) => runnerRpc<RunnerLimits>("limits.set", { appRpm, clientRpm, id });
 
 export const runnerGitRemote = (id: string) =>
   runnerRpc<RunnerGitRemote>("git.remote", { id });

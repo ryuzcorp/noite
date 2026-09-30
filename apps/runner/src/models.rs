@@ -184,6 +184,18 @@ pub struct AppDomain {
     pub created_at: String,
 }
 
+/// An app's own edge rate limits (requests per minute). `None` takes the
+/// platform default, `Some(0)` turns the limit off.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct AppLimit {
+    pub app_id: String,
+    /// Per client IP, across the app's hostnames.
+    pub client_rpm: Option<i64>,
+    /// Across every client.
+    pub app_rpm: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct AppMetric {

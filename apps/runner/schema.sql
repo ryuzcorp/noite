@@ -113,6 +113,17 @@ CREATE TABLE IF NOT EXISTS app_domain (
 
 CREATE INDEX IF NOT EXISTS idx_app_domain_app ON app_domain(app_id);
 
+-- Per-app edge rate limits (SPEC, Edge limits), requests per minute. NULL
+-- takes the platform default (NOITE_EDGE_RPM / NOITE_EDGE_APP_RPM), 0 turns
+-- the limit off. No row means both defaults. A table of its own rather than
+-- columns on `app`, so an existing install gains it at boot.
+CREATE TABLE IF NOT EXISTS app_limit (
+  app_id TEXT PRIMARY KEY NOT NULL REFERENCES app(id) ON DELETE CASCADE,
+  client_rpm INTEGER,
+  app_rpm INTEGER,
+  updated_at TEXT NOT NULL
+);
+
 -- Scoped per-app credentials (SPEC, Scoped credentials): one encrypted row per
 -- app. Nonce + AES-GCM ciphertext over JSON {access_key, secret_key}; the KEK
 -- derives from RUNNER_TOKEN via HKDF, so the bucket snapshot is not a key dump.

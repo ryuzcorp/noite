@@ -156,6 +156,8 @@ export const AppHeader = ({ appId }: { appId: string }) => {
   const { app } = info;
   const canPush = info.myRole === "push" || info.myRole === "admin";
   const running = app.desiredState === "running";
+  // Never deployed: there is nothing to stop or start yet.
+  const deployed = app.status !== "provisioned";
 
   return (
     <header class="flex flex-col gap-3">
@@ -190,7 +192,7 @@ export const AppHeader = ({ appId }: { appId: string }) => {
               Code
             </span>
           </a>
-          {canPush ? (
+          {canPush && deployed ? (
             <button
               type="button"
               class="btn btn-sm"

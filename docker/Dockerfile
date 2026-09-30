@@ -21,6 +21,11 @@
 # (esbuild, duckdb) live in docker/install-sidecars.sh.
 ARG CELLD_VERSION=0.6.0
 ARG CADDY_VERSION=2.10.0
+# Caddy's rate-limit handler (github.com/mholt/caddy-ratelimit), which the
+# runner writes for every site (SPEC, Edge limits). It has no releases past
+# v0.1.0, so the pin is a commit; bump it together with CADDY_VERSION (its
+# go.mod names the Caddy it builds against).
+ARG CADDY_RATELIMIT_VERSION=5625512f24f6f59d6f64fb3aafe5eecff0b286db
 ARG NODE_VERSION=24.21.0
 # jup (https://github.com/unjs/jup) runs the tenant's npm, pnpm or Yarn at
 # the version the project pins. The npm tarball's sha512, as hex.
@@ -28,6 +33,19 @@ ARG JUP_VERSION=0.6.3
 ARG JUP_SHA512=5b1c2ed95edc02d521a511a4cfc5027a54dc674e29afcfca9c7ad55b285d346c4c4c1c5ed65985e0fa5a758ceaf6c32663b18d117a7d071ce29c56989f63988f
 
 FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
+
+# --- Caddy with the rate-limit module ----------------------------------------
+# Built on the build host's platform and cross-compiled for the target, so an
+# arm64 image does not run the Go toolchain under emulation.
+# The builder image's own CADDY_VERSION env (v-prefixed, from the tag above)
+# is the version xcaddy builds.
+FROM --platform=$BUILDPLATFORM docker.io/library/caddy:${CADDY_VERSION}-builder AS caddy-build
+ARG CADDY_RATELIMIT_VERSION
+ARG TARGETOS
+ARG TARGETARCH
+RUN GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" CGO_ENABLED=0 xcaddy build \
+      --with "github.com/mholt/caddy-ratelimit@${CADDY_RATELIMIT_VERSION}" \
+      --output /out/caddy
 
 # The pinned Node's binary, for the ui-build stage below (`COPY --from` cannot
 # expand variables, so the pin lives in a stage of its own).
@@ -67,7 +85,6 @@ RUN bun run build \
 FROM docker.io/oven/bun:1.4-slim AS base
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 ARG TARGETARCH
-ARG CADDY_VERSION
 ARG NODE_VERSION
 ARG JUP_VERSION
 ARG JUP_SHA512
@@ -85,9 +102,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/* \
   && sh /tmp/install-sidecars.sh && rm /tmp/install-sidecars.sh \
   && arch="$(dpkg --print-architecture)" \
-  && curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_${arch}.tar.gz" \
-    | tar -xz -C /usr/local/bin caddy \
-  && caddy version \
   && case "${arch}" in \
        amd64) NODE_PKG=linux-x64 ;; \
        arm64) NODE_PKG=linux-arm64 ;; \
@@ -110,6 +124,8 @@ RUN useradd -u 10010 -m -s /bin/sh build \
   && useradd -u 10020 -m -s /bin/sh fleet \
   && mkdir -p /data /opt/noite/control
 COPY --from=celld /usr/local/bin/celld /usr/local/bin/celld
+COPY --from=caddy-build /out/caddy /usr/local/bin/caddy
+RUN caddy version && caddy list-modules | grep -qx 'http.handlers.rate_limit'
 # Apache-2.0 §4(a): a distributed image carries a copy of the License.
 COPY LICENSE /licenses/
 WORKDIR /data

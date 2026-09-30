@@ -92,6 +92,143 @@ pub const CONTROL_UPSTREAM_URL: &str = "http://127.0.0.1:8090";
 /// The runner's own API, as Caddy reaches it for `api.` and `git.`.
 pub const API_UPSTREAM: &str = "127.0.0.1:8080";
 
+/// Cloudflare's published edge ranges (cloudflare.com/ips-v4 and ips-v6),
+/// what `NOITE_TRUSTED_PROXIES=cloudflare` expands to. They change rarely;
+/// an out-of-date list only means a request from a new range is keyed on the
+/// proxy's address instead of the visitor's.
+pub const CLOUDFLARE_RANGES: &[&str] = &[
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32",
+];
+
+/// Proxies in front of the edge whose forwarded client address Caddy
+/// believes (`NOITE_TRUSTED_PROXIES`): `cloudflare`, Caddy's
+/// `private_ranges`, or IPs/CIDRs, separated by commas or spaces.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrustedProxies {
+    /// Cloudflare's ranges are in `ranges`; the client address then comes
+    /// from `CF-Connecting-IP` first.
+    pub cloudflare: bool,
+    /// Caddy `trusted_proxies static` arguments (CIDRs, IPs, `private_ranges`).
+    pub ranges: Vec<String>,
+}
+
+impl TrustedProxies {
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+}
+
+/// An IP or CIDR as Caddy's `trusted_proxies static` accepts it.
+fn cidr_ok(raw: &str) -> bool {
+    let (ip, prefix) = match raw.split_once('/') {
+        Some((ip, prefix)) => (ip, Some(prefix)),
+        None => (raw, None),
+    };
+    let Ok(ip) = ip.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    prefix.is_none_or(|p| p.parse::<u8>().is_ok_and(|p| p <= max))
+}
+
+/// Parse `NOITE_TRUSTED_PROXIES`; unknown tokens come back as errors.
+fn parse_trusted_proxies(raw: &str) -> (TrustedProxies, Vec<String>) {
+    let mut out = TrustedProxies::default();
+    let mut bad = Vec::new();
+    for token in raw.split([',', ' ', '\t', '\n']).map(str::trim).filter(|t| !t.is_empty()) {
+        match token.to_ascii_lowercase().as_str() {
+            "cloudflare" => {
+                if !out.cloudflare {
+                    out.cloudflare = true;
+                    out.ranges.extend(CLOUDFLARE_RANGES.iter().map(|r| (*r).to_string()));
+                }
+            }
+            "private_ranges" => out.ranges.push("private_ranges".into()),
+            _ if cidr_ok(token) => out.ranges.push(token.to_string()),
+            _ => bad.push(token.to_string()),
+        }
+    }
+    out.ranges.dedup();
+    (out, bad)
+}
+
+/// Edge protection (SPEC, Edge limits): Caddy's per-client and per-app
+/// request limits, the proxies whose client address the edge believes, and
+/// the host-wide bound on apps cold-starting at once. Every rate is requests per minute; 0 turns
+/// that limit off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EdgeLimits {
+    /// Per client IP, per site: control, API, the fallback page, and each app
+    /// (all of an app's hostnames share one budget). `NOITE_EDGE_RPM`.
+    pub client_rpm: u32,
+    /// Per client IP on `git.` (`NOITE_EDGE_GIT_RPM`): a clone or push is a
+    /// handful of requests, so this is far tighter than `client_rpm`.
+    pub git_rpm: u32,
+    /// Per app, across every client (`NOITE_EDGE_APP_RPM`): the ceiling that
+    /// stops a flood from many addresses taking the host's CPU from the other
+    /// apps. Off by default; an app can set its own in Settings.
+    pub app_rpm: u32,
+    pub trusted_proxies: TrustedProxies,
+    /// Apps allowed to cold-start at once when requests wake them
+    /// (`RUNNER_WAKE_CONCURRENCY`); later wakes queue inside the wake budget.
+    pub wake_concurrency: u32,
+}
+
+impl Default for EdgeLimits {
+    fn default() -> Self {
+        Self {
+            client_rpm: 1800,
+            git_rpm: 120,
+            app_rpm: 0,
+            trusted_proxies: TrustedProxies::default(),
+            wake_concurrency: 4,
+        }
+    }
+}
+
+impl EdgeLimits {
+    fn from_env() -> anyhow::Result<Self> {
+        let d = Self::default();
+        let num = |key: &str, def: u32| env_or(&[key], &def.to_string()).trim().parse().unwrap_or(def);
+        let (trusted_proxies, bad) =
+            parse_trusted_proxies(&env::var("NOITE_TRUSTED_PROXIES").unwrap_or_default());
+        if !bad.is_empty() {
+            anyhow::bail!(
+                "NOITE_TRUSTED_PROXIES: {} not an IP, a CIDR, `cloudflare` or `private_ranges`",
+                bad.join(", ")
+            );
+        }
+        Ok(Self {
+            client_rpm: num("NOITE_EDGE_RPM", d.client_rpm),
+            git_rpm: num("NOITE_EDGE_GIT_RPM", d.git_rpm),
+            app_rpm: num("NOITE_EDGE_APP_RPM", d.app_rpm),
+            trusted_proxies,
+            wake_concurrency: num("RUNNER_WAKE_CONCURRENCY", d.wake_concurrency).max(1),
+        })
+    }
+}
+
 fn parse_fleet_ports() -> (u16, u16) {
     if let Ok(raw) = env::var("NOITE_FLEET_PORTS") {
         let raw = raw.trim();
@@ -216,6 +353,8 @@ fn parse_fleet_ports() -> (u16, u16) {
      pub control_bundle_dir: String,
      /// Better-auth origin for boot validation (host must be served).
      pub better_auth_url: String,
+    /// Edge rate limits, request bounds and trusted proxies.
+    pub edge: EdgeLimits,
  }
 
 impl Config {
@@ -342,6 +481,7 @@ impl Config {
             control_bundle_dir: env::var("CONTROL_BUNDLE_DIR")
                 .unwrap_or_else(|_| "/opt/noite/control/dist".into()),
             better_auth_url: env::var("BETTER_AUTH_URL").unwrap_or_default(),
+            edge: EdgeLimits::from_env()?,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -415,6 +555,15 @@ impl Config {
         }];
         out.extend(self.control_extra_hosts.iter().cloned());
         out
+    }
+
+    /// Whether the edge can tell visitors apart, which per-client limits need.
+    /// Behind a terminating proxy (`CADDY_AUTO_HTTPS=off` on a real domain:
+    /// Coolify, Railway) every request arrives from the proxy, and without
+    /// `NOITE_TRUSTED_PROXIES` a per-client limit would throttle the whole
+    /// install as one client.
+    pub fn edge_sees_clients(&self) -> bool {
+        self.base_domain == "localhost" || self.auto_https || !self.edge.trusted_proxies.is_empty()
     }
 
     /// Fleet shutdown bound for one celld node (budget minus drain margin).
@@ -583,7 +732,23 @@ mod tests {
             fleet_gid: None,
             control_bundle_dir: "/opt/noite/control/dist".into(),
             better_auth_url: "".into(),
+            edge: EdgeLimits::default(),
         };
         assert_eq!(cfg.tenant_bases(), vec!["localhost", "noite.local"]);
+    }
+
+    #[test]
+    fn trusted_proxies_expand_presets_and_reject_junk() {
+        let (tp, bad) = parse_trusted_proxies("cloudflare, 10.0.0.0/8 private_ranges 2001:db8::1");
+        assert!(tp.cloudflare);
+        assert!(tp.ranges.contains(&"173.245.48.0/20".to_string()));
+        assert!(tp.ranges.contains(&"10.0.0.0/8".to_string()));
+        assert!(tp.ranges.contains(&"private_ranges".to_string()));
+        assert!(tp.ranges.contains(&"2001:db8::1".to_string()));
+        assert!(bad.is_empty());
+        let (tp, bad) = parse_trusted_proxies("10.0.0.0/33, example.com, 1.2.3");
+        assert!(tp.is_empty());
+        assert_eq!(bad, vec!["10.0.0.0/33", "example.com", "1.2.3"]);
+        assert!(parse_trusted_proxies("").0.is_empty());
     }
 }

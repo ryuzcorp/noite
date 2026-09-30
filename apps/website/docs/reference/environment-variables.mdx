@@ -89,6 +89,7 @@ Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (hand
 | `RUNNER_SLEEP_AFTER_H` | `24` | Park apps idle this long; `0` = never | runner-owned |
 | `RUNNER_SLEEP_SWEEP_S` | `3600` | Sleep sweep cadence | runner-owned |
 | `RUNNER_WAKE_TIMEOUT_S` | `120` | Longest a held request waits for a woken fleet; failed wake answers `503` | runner-owned |
+| `RUNNER_WAKE_CONCURRENCY` | `4` | Apps allowed to cold-start at once for requests; later wakes queue inside `RUNNER_WAKE_TIMEOUT_S` | runner-owned |
 
 See [Limits](/reference/limits) for the sleep mechanism.
 
@@ -98,6 +99,12 @@ See [Limits](/reference/limits) for the sleep mechanism.
 | --- | --- | --- | --- |
 | `NOITE_RATE_LIMIT_RPM` | `600` | Worker per-route-class (`auth`/`invite`) limit; `429` + `Retry-After`; `0` disables | worker-passthrough |
 | `NOITE_AUTH_RATE_LIMIT` | `600` | better-auth per-client `/api/auth/*` budget; `0` disables | worker-passthrough |
+| `NOITE_EDGE_RPM` | `1800` | Edge limit per client IP, per site (control, API, fallback page, each app across its hostnames); `0` disables | runner-owned (Caddy) |
+| `NOITE_EDGE_GIT_RPM` | `120` | Edge limit per client IP on `git.`; `0` disables | runner-owned (Caddy) |
+| `NOITE_EDGE_APP_RPM` | `0` | Edge ceiling per app across every client; `0` = none | runner-owned (Caddy) |
+| `NOITE_TRUSTED_PROXIES` | unset | Proxies whose forwarded client address the edge believes: `cloudflare`, `private_ranges`, IPs/CIDRs | runner-owned (Caddy) |
+
+See [Edge protection](/self-hosting/protection) for how these fit together.
 
 ## Platform-only
 

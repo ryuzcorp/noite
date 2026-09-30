@@ -132,6 +132,14 @@ async fn main() -> anyhow::Result<()> {
     // The edge: Caddy as a supervised child, with a placeholder config until
     // the first reconcile writes the real one.
     host::children::ensure_bootstrap_caddyfile(&config.caddyfile_path).await?;
+    // Before the first Caddyfile: whether this Caddy can take rate limits.
+    host::caddy::detect_modules().await;
+    if !config.edge_sees_clients() {
+        tracing::warn!(
+            "CADDY_AUTO_HTTPS=off without NOITE_TRUSTED_PROXIES: the edge sees the proxy, not \
+             visitors, so per-visitor rate limits are off (per-app ceilings still apply)"
+        );
+    }
     let caddy_child = supervise_caddy(&config);
 
     let procs = host::supervisor::new_procs();

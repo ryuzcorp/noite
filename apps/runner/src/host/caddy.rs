@@ -1,7 +1,119 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::Config;
-use crate::models::{App, AppDomain};
+use crate::models::{App, AppDomain, AppLimit};
+
+/// Whether the Caddy binary has the `rate_limit` handler
+/// (github.com/mholt/caddy-ratelimit, built into the image). A stock Caddy
+/// rejects the whole Caddyfile at the first `rate_limit`, which would leave
+/// the edge serving its bootstrap config, so without the module the limits
+/// are left out instead. Set once at boot by [`detect_modules`].
+static RATE_LIMIT_MODULE: AtomicBool = AtomicBool::new(true);
+
+/// Ask the Caddy binary for its modules and record whether edge rate limits
+/// can be written.
+pub async fn detect_modules() {
+    let out = tokio::process::Command::new("caddy")
+        .arg("list-modules")
+        .output()
+        .await;
+    let has = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .any(|l| l.trim() == "http.handlers.rate_limit"),
+        _ => false,
+    };
+    if !has {
+        tracing::warn!(
+            "caddy has no http.handlers.rate_limit module: edge rate limits are off \
+             (the image builds it in with github.com/mholt/caddy-ratelimit)"
+        );
+    }
+    RATE_LIMIT_MODULE.store(has, Ordering::Relaxed);
+}
+
+/// Sliding window the edge counts requests over. Limits are configured per
+/// minute and enforced as a sixth of that per 10 s: the ring buffer the
+/// module keeps per client is sized by the event count, so a per-minute
+/// window would cost six times the memory for every address in a wide flood,
+/// and a burst still gets a whole window's budget at once.
+const RATE_WINDOW_S: u32 = 10;
+
+/// One `rate_limit` zone. Zones are shared by name across every site block
+/// (the module keeps limiter state in a process-wide pool), so an app's
+/// subdomain, custom domains and plaintext twins draw from one budget.
+struct Zone {
+    name: String,
+    /// `{client_ip}` for a per-client limit, a constant for one shared limit.
+    key: &'static str,
+    rpm: u32,
+}
+
+impl Zone {
+    /// A per-client zone; off when the edge cannot tell clients apart
+    /// ([`Config::edge_sees_clients`]).
+    fn per_client(cfg: &Config, name: impl Into<String>, rpm: u32) -> Self {
+        let rpm = if cfg.edge_sees_clients() { rpm } else { 0 };
+        Self { name: name.into(), key: "{client_ip}", rpm }
+    }
+    fn shared(name: impl Into<String>, rpm: u32) -> Self {
+        Self { name: name.into(), key: "all", rpm }
+    }
+}
+
+/// A site's `rate_limit` block (a zone at 0 rpm is off). Over the limit, the
+/// module answers 429 with `Retry-After`.
+///
+/// No `request_body` cap next to it: measured on Caddy 2.10 behind
+/// `reverse_proxy`, an oversized body reaches the upstream or fails as a 502
+/// rather than a 413, and on a tenant site a 502 renders the "starting" page.
+fn guard_lines(zones: &[Zone]) -> Vec<String> {
+    guard_lines_with(zones, RATE_LIMIT_MODULE.load(Ordering::Relaxed))
+}
+
+fn guard_lines_with(zones: &[Zone], rate_limit_module: bool) -> Vec<String> {
+    let zones: Vec<&Zone> = zones.iter().filter(|z| z.rpm > 0).collect();
+    if zones.is_empty() || !rate_limit_module {
+        return Vec::new();
+    }
+    let mut lines = vec!["rate_limit {".to_string()];
+    for zone in zones {
+        let per_window = zone.rpm.div_ceil(60 / RATE_WINDOW_S).max(1);
+        lines.push(format!("\tzone {} {{", zone.name));
+        lines.push(format!("\t\tkey {}", zone.key));
+        lines.push(format!("\t\twindow {RATE_WINDOW_S}s"));
+        lines.push(format!("\t\tevents {per_window}"));
+        if zone.key == "{client_ip}" {
+            // One IPv6 subscriber holds a whole /64: counting addresses
+            // separately would let one client rotate past the limit.
+            lines.push("\t\tipv6_prefix 64".into());
+        }
+        lines.push("\t}".into());
+    }
+    lines.push("}".into());
+    lines
+}
+
+/// An app's effective limits: its own setting when it has one, else the
+/// platform default.
+fn app_zones(cfg: &Config, app: &App, limits: &[AppLimit]) -> Vec<Zone> {
+    let own = limits.iter().find(|l| l.app_id == app.id);
+    let pick = |own: Option<i64>, default: u32| {
+        own.map_or(default, |v| u32::try_from(v.max(0)).unwrap_or(u32::MAX))
+    };
+    vec![
+        Zone::per_client(
+            cfg,
+            format!("client_{}", app.slug),
+            pick(own.and_then(|l| l.client_rpm), cfg.edge.client_rpm),
+        ),
+        Zone::shared(
+            format!("app_{}", app.slug),
+            pick(own.and_then(|l| l.app_rpm), cfg.edge.app_rpm),
+        ),
+    ]
+}
 
 /// Pin `http://` on every address of a site line.
 ///
@@ -29,6 +141,7 @@ pub async fn rewrite_caddy(
     cfg: &Config,
     apps: &[App],
     domains: &[AppDomain],
+    limits: &[AppLimit],
 ) -> anyhow::Result<()> {
     let local = cfg.base_domain == "localhost";
     let plain = local || !cfg.auto_https;
@@ -93,6 +206,30 @@ pub async fn rewrite_caddy(
     if !cfg.auto_https {
         lines.push("\tauto_https off".into());
     }
+    // Server-wide request bounds. `read_header` drops a client that trickles
+    // its headers (slowloris) instead of holding the connection open; no
+    // read/write timeout, because event streams and large uploads are
+    // legitimately long. Behind a proxy, `trusted_proxies` makes
+    // `{client_ip}` (the rate-limit key) the visitor, not the proxy.
+    lines.push("\tservers {".into());
+    lines.push("\t\ttimeouts {".into());
+    lines.push("\t\t\tread_header 10s".into());
+    lines.push("\t\t\tidle 2m".into());
+    lines.push("\t\t}".into());
+    let proxies = &cfg.edge.trusted_proxies;
+    if !proxies.is_empty() {
+        lines.push(format!("\t\ttrusted_proxies static {}", proxies.ranges.join(" ")));
+        if proxies.cloudflare {
+            lines.push("\t\tclient_ip_headers CF-Connecting-IP X-Forwarded-For".into());
+        }
+        lines.push("\t\ttrusted_proxies_strict".into());
+    }
+    lines.push("\t}".into());
+    // One line per rejected request would flood `docker logs` during the
+    // very attack the limit is absorbing; the access log records each 429.
+    lines.push("\tlog default {".into());
+    lines.push("\t\texclude http.handlers.rate_limit".into());
+    lines.push("\t}".into());
     lines.push("\ton_demand_tls {".into());
     lines.push(format!(
         "\t\task http://{}/v1/edge/tls-ask",
@@ -180,13 +317,25 @@ pub async fn rewrite_caddy(
         }
         push_block(addr, tls, site_extra, proxy_extra, upstream);
     };
+    let edge = &cfg.edge;
+    let control_guard = guard_lines(&[Zone::per_client(cfg, "client_control", edge.client_rpm)]);
+    // The control worker keys its own auth limits on the right-most
+    // X-Forwarded-For entry. Behind a trusted proxy Caddy appends the
+    // proxy's address there, so hand the worker the resolved visitor instead.
+    let control_proxy: Vec<String> = if edge.trusted_proxies.is_empty() {
+        Vec::new()
+    } else {
+        vec!["header_up X-Forwarded-For {client_ip}".into()]
+    };
+    let control_guard_refs: Vec<&str> = control_guard.iter().map(String::as_str).collect();
+    let control_proxy_refs: Vec<&str> = control_proxy.iter().map(String::as_str).collect();
     push_site(
         // Per-host scheme mapping is handled inside `push_site`, so the joined
         // control list needs no special casing here.
         &control_site,
         on_demand,
-        &[],
-        &[],
+        &control_guard_refs,
+        &control_proxy_refs,
         &cfg.caddy_control_upstream,
     );
     // Plaintext loopback for container healthchecks, independent of TLS mode.
@@ -215,7 +364,8 @@ pub async fn rewrite_caddy(
             // No header_up lines: Caddy's reverse_proxy already forwards Host
             // and sets X-Forwarded-For/Proto/Host by default (it warns on
             // explicit duplicates, and site-level ones fail the whole adapt).
-            let extra = tenant_site_extra(cfg, app);
+            let mut extra = tenant_site_extra(cfg, app);
+            extra.extend(guard_lines(&app_zones(cfg, app, limits)));
             let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
             push_site(
                 &addr_of(&format!("{}.{}", app.slug, base)),
@@ -242,7 +392,8 @@ pub async fn rewrite_caddy(
             continue;
         }
         let upstream = format!("{}:{}", cfg.caddy_upstream_host, port);
-        let extra = tenant_site_extra(cfg, app);
+        let mut extra = tenant_site_extra(cfg, app);
+        extra.extend(guard_lines(&app_zones(cfg, app, limits)));
         let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
         push_site(
             &addr_of(&domain.hostname),
@@ -254,19 +405,24 @@ pub async fn rewrite_caddy(
     }
 
     // API → runner (Bearer-protected REST)
+    let api_guard = guard_lines(&[Zone::per_client(cfg, "client_api", edge.client_rpm)]);
+    let api_guard: Vec<&str> = api_guard.iter().map(String::as_str).collect();
     push_site(
         &addr_of(&format!("api.{}", cfg.base_domain)),
         on_demand,
-        &[],
+        &api_guard,
         &[],
         &cfg.caddy_api_upstream,
     );
 
     // Git smart-HTTP → runner `/v1/git/{slug}/…` (Basic auth inside runner)
+    let mut git_extra = guard_lines(&[Zone::per_client(cfg, "client_git", edge.git_rpm)]);
+    git_extra.push("rewrite * /v1/git{uri}".into());
+    let git_extra: Vec<&str> = git_extra.iter().map(String::as_str).collect();
     push_site(
         &addr_of(&format!("git.{}", cfg.base_domain)),
         on_demand,
-        &["rewrite * /v1/git{uri}"],
+        &git_extra,
         &[],
         &cfg.caddy_api_upstream,
     );
@@ -274,11 +430,16 @@ pub async fn rewrite_caddy(
     // Fallback: unknown slugs + stopped apps → runner edge page (per-Host,
     // on every tenant base). Tenant TLS is minted on demand (ask-gated), so
     // no wildcard cert or DNS-challenge module is needed on any platform.
+    // Random subdomains land here, and each is a runner lookup: the same
+    // per-client budget as a site.
+    let mut fallback_extra = guard_lines(&[Zone::per_client(cfg, "client_fallback", edge.client_rpm)]);
+    fallback_extra.push("rewrite * /v1/edge/fallback".into());
+    let fallback_extra: Vec<&str> = fallback_extra.iter().map(String::as_str).collect();
     for base in cfg.tenant_bases() {
         push_site(
             &addr_of(&format!("*.{base}")),
             on_demand,
-            &["rewrite * /v1/edge/fallback"],
+            &fallback_extra,
             &[],
             &cfg.caddy_api_upstream,
         );
@@ -506,6 +667,7 @@ mod tests {
             fleet_gid: None,
             control_bundle_dir: "/opt/noite/control/dist".into(),
             better_auth_url: "".into(),
+            edge: crate::config::EdgeLimits::default(),
         }
     }
 
@@ -546,7 +708,7 @@ mod tests {
 
     async fn rendered_with(cfg: &Config, apps: &[App], domains: &[AppDomain]) -> String {
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
-        rewrite_caddy(cfg, apps, domains).await.expect("rewrite");
+        rewrite_caddy(cfg, apps, domains, &[]).await.expect("rewrite");
         tokio::fs::read_to_string(&cfg.caddyfile_path)
             .await
             .expect("read back")
@@ -818,6 +980,117 @@ mod tests {
             !out.contains("*.192.168") && !out.contains("test.192.168"),
             "bare IPs are control-only, never tenant bases:\n{out}"
         );
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
+    fn site_block(out: &str, addr: &str) -> String {
+        let start = out
+            .find(&format!("\n{addr} {{"))
+            .unwrap_or_else(|| panic!("no site {addr}:\n{out}"));
+        let rest = &out[start + 1..];
+        rest[..rest.find("\n}\n").expect("site end")].to_string()
+    }
+
+    #[tokio::test]
+    async fn every_public_site_is_rate_limited() {
+        let cfg = test_config("noite.now", "app", true, "/tmp/noite-test-limits");
+        let app = test_app();
+        let domains = [test_domain(&app.id, "shop.example.com")];
+        let out = rendered_with(&cfg, &[app], &domains).await;
+        // 1800 rpm per client is 300 per 10 s window.
+        for (addr, zone) in [
+            ("app.noite.now", "client_control"),
+            ("api.noite.now", "client_api"),
+            ("test.noite.now", "client_test"),
+            ("shop.example.com", "client_test"),
+            ("*.noite.now", "client_fallback"),
+        ] {
+            let block = site_block(&out, addr);
+            assert!(block.contains(&format!("zone {zone} {{")), "{addr} lacks {zone}:\n{block}");
+            assert!(block.contains("key {client_ip}"), "{addr}:\n{block}");
+            assert!(block.contains("events 300"), "{addr}:\n{block}");
+        }
+        // Git: its own tighter budget (120 rpm = 20 per window).
+        let git = site_block(&out, "git.noite.now");
+        assert!(git.contains("zone client_git {") && git.contains("events 20"), "{git}");
+        // The shared per-app ceiling is off by default.
+        assert!(!out.contains("zone app_test"), "app ceiling is off by default:\n{out}");
+        // The container healthcheck is never limited.
+        assert!(!site_block(&out, "http://127.0.0.1").contains("rate_limit"));
+        // Slowloris bound, and 429s stay out of the process log.
+        assert!(out.contains("read_header 10s"), "{out}");
+        assert!(out.contains("exclude http.handlers.rate_limit"), "{out}");
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
+    #[tokio::test]
+    async fn app_limits_override_the_platform_defaults() {
+        let mut cfg = test_config("noite.now", "app", true, "/tmp/noite-test-app-limits");
+        cfg.edge.app_rpm = 6000;
+        let app = test_app();
+        let mut other = test_app();
+        other.id = "other-id".into();
+        other.slug = "other".into();
+        let limits = [AppLimit {
+            app_id: app.id.clone(),
+            client_rpm: Some(0),
+            app_rpm: Some(60),
+        }];
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+        rewrite_caddy(&cfg, &[app, other], &[], &limits).await.expect("rewrite");
+        let out = tokio::fs::read_to_string(&cfg.caddyfile_path).await.expect("read");
+        let own = site_block(&out, "test.noite.now");
+        assert!(!own.contains("zone client_test"), "0 turns the per-client limit off:\n{own}");
+        assert!(own.contains("zone app_test {") && own.contains("key all") && own.contains("events 10"), "{own}");
+        let other = site_block(&out, "other.noite.now");
+        assert!(other.contains("zone client_other {"), "{other}");
+        assert!(other.contains("zone app_other {") && other.contains("events 1000"), "platform app ceiling:\n{other}");
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
+    #[tokio::test]
+    async fn trusted_proxies_resolve_the_visitor() {
+        let mut cfg = test_config("noite.now", "app", true, "/tmp/noite-test-proxies");
+        let out = rendered(&cfg, &[test_app()]).await;
+        assert!(!out.contains("trusted_proxies"), "{out}");
+        assert!(!out.contains("header_up X-Forwarded-For"), "{out}");
+        cfg.edge.trusted_proxies = crate::config::TrustedProxies {
+            cloudflare: true,
+            ranges: vec!["173.245.48.0/20".into(), "private_ranges".into()],
+        };
+        let out = rendered(&cfg, &[test_app()]).await;
+        assert!(out.contains("trusted_proxies static 173.245.48.0/20 private_ranges"), "{out}");
+        assert!(out.contains("client_ip_headers CF-Connecting-IP X-Forwarded-For"), "{out}");
+        assert!(out.contains("trusted_proxies_strict"), "{out}");
+        // The control worker keys auth limits on X-Forwarded-For.
+        let control = site_block(&out, "app.noite.now");
+        assert!(control.contains("header_up X-Forwarded-For {client_ip}"), "{control}");
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
+    #[test]
+    fn without_the_module_no_limits_are_written() {
+        let cfg = test_config("noite.now", "app", true, "/tmp/noite-test-unused");
+        let zones = [Zone::per_client(&cfg, "client_x", 600)];
+        let with = guard_lines_with(&zones, true).join("\n");
+        assert!(with.contains("rate_limit {") && with.contains("events 100"), "{with}");
+        assert!(guard_lines_with(&zones, false).is_empty());
+        assert!(guard_lines_with(&[Zone::per_client(&cfg, "off", 0)], true).is_empty());
+    }
+
+    #[tokio::test]
+    async fn behind_a_blind_proxy_only_app_ceilings_apply() {
+        // Coolify/Railway: every request arrives from the proxy. Per-client
+        // limits would throttle the whole install as one client.
+        let mut cfg = test_config("noite.now", "app", false, "/tmp/noite-test-blind");
+        cfg.edge.app_rpm = 600;
+        let out = rendered(&cfg, &[test_app()]).await;
+        assert!(!out.contains("key {client_ip}"), "{out}");
+        assert!(out.contains("zone app_test {"), "the app ceiling still applies:\n{out}");
+        // Naming the proxy restores them.
+        cfg.edge.trusted_proxies.ranges = vec!["private_ranges".into()];
+        let out = rendered(&cfg, &[test_app()]).await;
+        assert!(out.contains("zone client_test {"), "{out}");
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
     }
 }

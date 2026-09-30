@@ -55,6 +55,14 @@ services:
       NOITE_SMTP_FROM: ${NOITE_SMTP_FROM:-}
       NOITE_RATE_LIMIT_RPM: ${NOITE_RATE_LIMIT_RPM:-600}
       NOITE_AUTH_RATE_LIMIT: ${NOITE_AUTH_RATE_LIMIT:-600}
+      # Edge limits (SPEC, Edge limits): requests per minute per client IP
+      # on each site, per client on git., and per app across all clients
+      # (0 = off). Behind Cloudflare or another proxy, set
+      # NOITE_TRUSTED_PROXIES so limits key on the visitor, not the proxy.
+      NOITE_EDGE_RPM: ${NOITE_EDGE_RPM:-1800}
+      NOITE_EDGE_GIT_RPM: ${NOITE_EDGE_GIT_RPM:-120}
+      NOITE_EDGE_APP_RPM: ${NOITE_EDGE_APP_RPM:-0}
+      NOITE_TRUSTED_PROXIES: ${NOITE_TRUSTED_PROXIES:-}
       # Tenancy and bounds (see .env.example).
       NOITE_TENANCY: ${NOITE_TENANCY:-}
       NOITE_STOP_BUDGET_MS: ${NOITE_STOP_BUDGET_MS:-25000}
@@ -76,6 +84,7 @@ services:
       RUNNER_SLEEP_AFTER_H: ${RUNNER_SLEEP_AFTER_H:-24}
       RUNNER_SLEEP_SWEEP_S: ${RUNNER_SLEEP_SWEEP_S:-3600}
       RUNNER_WAKE_TIMEOUT_S: ${RUNNER_WAKE_TIMEOUT_S:-120}
+      RUNNER_WAKE_CONCURRENCY: ${RUNNER_WAKE_CONCURRENCY:-4}
       # Coolify boot-check domain (ignored elsewhere).
       SERVICE_URL_NOITE_80: /
     ports:

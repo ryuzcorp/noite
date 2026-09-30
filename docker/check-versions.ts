@@ -2,7 +2,7 @@
 /**
  * Pin guard for the one image (docker/Dockerfile).
  *
- * - celld, Caddy, Node and jup (with its tarball digest) are pinned exactly once (an ARG default); a second pin in
+ * - celld, Caddy (and its rate-limit module), Node and jup (with its tarball digest) are pinned exactly once (an ARG default); a second pin in
  *   the same file is how a stage silently builds against another version.
  * - The access log path the image sets (CADDY_ACCESS_LOG) is the runner's own
  *   default, so the generator (which writes the Caddyfile `log` block from
@@ -27,6 +27,7 @@ const fail = (message: string): void => {
 for (const [name, pattern] of [
   ["celld", /ARG CELLD_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
   ["caddy", /ARG CADDY_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
+  ["caddy-ratelimit", /ARG CADDY_RATELIMIT_VERSION=(?<version>[0-9a-f]{40})/gu],
   ["node", /ARG NODE_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
   ["jup", /ARG JUP_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
   ["jup digest", /ARG JUP_SHA512=(?<version>[0-9a-f]{128})/gu],

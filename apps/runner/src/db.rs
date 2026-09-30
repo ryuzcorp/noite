@@ -5,7 +5,7 @@ use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 use sqlx::sqlite::SqliteConnection;
 
 use crate::models::{
-    now_iso, new_id, App, AppDeviceStat, AppDomain, AppEnv, AppEvent, AppInsight, AppMetric, AppPathStat, AppRefStat, AppSpanStat, AppStatus, AppUserProps, Deploy, DeployStatus, ErrorEvent, ErrorIssue,
+    now_iso, new_id, App, AppDeviceStat, AppDomain, AppLimit, AppEnv, AppEvent, AppInsight, AppMetric, AppPathStat, AppRefStat, AppSpanStat, AppStatus, AppUserProps, Deploy, DeployStatus, ErrorEvent, ErrorIssue,
 };
 
 const APP_COLS: &str = r#"id, slug, name, user_id, status, subdomain, git_prefix, fleet_bucket,
@@ -321,6 +321,52 @@ pub async fn domain_owner(pool: &SqlitePool, hostname: &str) -> sqlx::Result<Opt
             .fetch_all(pool)
             .await?;
     Ok(rows.into_iter().map(|(id,)| id).next())
+}
+
+/// Every app's own edge limits (the Caddyfile writer reads these once per
+/// reconcile, next to the custom domains).
+pub async fn list_app_limits(pool: &SqlitePool) -> sqlx::Result<Vec<AppLimit>> {
+    sqlx::query_as::<_, AppLimit>("SELECT app_id, client_rpm, app_rpm FROM app_limit")
+        .fetch_all(pool)
+        .await
+}
+
+/// One app's edge limits; both `None` when it has never set any.
+pub async fn get_app_limit(pool: &SqlitePool, app_id: &str) -> sqlx::Result<AppLimit> {
+    let row = sqlx::query_as::<_, AppLimit>(
+        "SELECT app_id, client_rpm, app_rpm FROM app_limit WHERE app_id = ?",
+    )
+    .bind(app_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.unwrap_or_else(|| AppLimit {
+        app_id: app_id.to_string(),
+        ..AppLimit::default()
+    }))
+}
+
+/// Replace an app's edge limits. Both `None` drops the row: back to the
+/// platform defaults.
+pub async fn set_app_limit(pool: &SqlitePool, limit: &AppLimit) -> sqlx::Result<()> {
+    if limit.client_rpm.is_none() && limit.app_rpm.is_none() {
+        sqlx::query("DELETE FROM app_limit WHERE app_id = ?")
+            .bind(&limit.app_id)
+            .execute(pool)
+            .await?;
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO app_limit (app_id, client_rpm, app_rpm, updated_at) VALUES (?, ?, ?, ?) \
+         ON CONFLICT(app_id) DO UPDATE SET client_rpm = excluded.client_rpm, \
+         app_rpm = excluded.app_rpm, updated_at = excluded.updated_at",
+    )
+    .bind(&limit.app_id)
+    .bind(limit.client_rpm)
+    .bind(limit.app_rpm)
+    .bind(now_iso())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn add_domain(

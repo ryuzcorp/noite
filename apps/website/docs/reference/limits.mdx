@@ -31,12 +31,17 @@ Every app is its own celld fleet on one host, sharing one cgroup. The bounds sto
 
 ## Rate limits
 
-Two layers, both `600`/min by default, `0` disables either:
+The edge (Caddy) limits every site before a request reaches a worker; the control UI adds finer limits of its own on sign-in routes. Requests per minute, `0` disables any of them:
 
-| Layer | Var | Scope | Over-limit |
-| --- | --- | --- | --- |
-| Worker limiter | `NOITE_RATE_LIMIT_RPM` | Per client, per route class (`auth`/`invite`) | `429` + `Retry-After`, before better-auth or D1 |
-| better-auth budget | `NOITE_AUTH_RATE_LIMIT` | Per client on `/api/auth/*`, keyed on forwarded address | `429` |
+| Layer | Var | Default | Scope | Over-limit |
+| --- | --- | --- | --- | --- |
+| Edge, per visitor | `NOITE_EDGE_RPM` | `1800` | Per client IP, per site: control, API, the fallback page, each app across all its hostnames | `429` + `Retry-After` |
+| Edge, git | `NOITE_EDGE_GIT_RPM` | `120` | Per client IP on `git.` | `429` + `Retry-After` |
+| Edge, whole app | `NOITE_EDGE_APP_RPM` | `0` (none) | Per app, across every client | `429` + `Retry-After` |
+| Worker limiter | `NOITE_RATE_LIMIT_RPM` | `600` | Per client, per route class (`auth`/`invite`) | `429` + `Retry-After`, before better-auth or D1 |
+| better-auth budget | `NOITE_AUTH_RATE_LIMIT` | `600` | Per client on `/api/auth/*`, keyed on forwarded address | `429` |
+
+An app admin can override both app limits (per visitor and whole app) in the app's **Settings → Rate Limits**. The edge counts over a sliding 10-second window: a limit of 1800/min lets 300 requests through in any 10 seconds. Per-visitor limits group IPv6 addresses by `/64`. Behind a proxy, see [Edge protection](/self-hosting/protection).
 
 ## Sleep (scale to zero)
 
@@ -57,4 +62,4 @@ An app with no requests for `RUNNER_SLEEP_AFTER_H` hours (default 24, `0` disabl
 5. Rewrites the Caddyfile back to the plain proxy.
 6. Answers 200; Caddy proxies the held request as if the app never slept.
 
-Concurrent requests share one wake (per-app lock); only a failed wake answers `503`. A deploy, rollback, or web commit to an asleep app wakes it first; TLS ask treats asleep apps as live so certificates renew. First-request cost after a quiet day: one cold fleet start (celld boot + ready gate, typically seconds).
+Concurrent requests share one wake (per-app lock), and at most `RUNNER_WAKE_CONCURRENCY` apps (default 4) cold-start at once; the rest queue within the same timeout. Only a failed wake answers `503`. A deploy, rollback, or web commit to an asleep app wakes it first; TLS ask treats asleep apps as live so certificates renew. First-request cost after a quiet day: one cold fleet start (celld boot + ready gate, typically seconds).

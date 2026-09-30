@@ -171,7 +171,8 @@ async fn reconcile_once(
 
     let visible = db::list_apps(pool).await?;
     let domains = db::list_app_domains(pool).await.unwrap_or_default();
-    caddy::rewrite_caddy(cfg, &visible, &domains).await?;
+    let limits = db::list_app_limits(pool).await.unwrap_or_default();
+    caddy::rewrite_caddy(cfg, &visible, &domains, &limits).await?;
 
     metrics::tick(pool, cfg, procs, metrics, log_tx).await?;
     Ok(())

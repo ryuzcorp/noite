@@ -7,6 +7,7 @@ export default defineMeta({
     "storage",
     "tenancy",
     "platforms",
+    "protection",
     "operations",
     "accounts",
   ],

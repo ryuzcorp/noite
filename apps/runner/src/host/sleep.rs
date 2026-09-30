@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::Config;
 use crate::db;
@@ -26,6 +26,15 @@ use crate::models::{parse_time, App, AppStatus};
 fn locks() -> &'static std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>> {
     static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Host-wide bound on apps cold-starting for a request at once
+/// (`RUNNER_WAKE_CONCURRENCY`). Each app's own wakes already coalesce on its
+/// lock; this stops a flood aimed at many asleep apps from starting all
+/// their fleets together. Sized by the first wake (config is fixed at boot).
+fn wake_slots(cfg: &Config) -> &'static Semaphore {
+    static SLOTS: OnceLock<Semaphore> = OnceLock::new();
+    SLOTS.get_or_init(|| Semaphore::new(cfg.edge.wake_concurrency.max(1) as usize))
 }
 
 fn lock_for(app_id: &str) -> Arc<Mutex<()>> {
@@ -105,7 +114,8 @@ pub async fn sweep(pool: &SqlitePool, cfg: &Config, procs: &ProcMap) -> usize {
 async fn rewrite_edge(pool: &SqlitePool, cfg: &Config) -> anyhow::Result<()> {
     let apps = db::list_apps(pool).await?;
     let domains = db::list_app_domains(pool).await.unwrap_or_default();
-    caddy::rewrite_caddy(cfg, &apps, &domains).await
+    let limits = db::list_app_limits(pool).await.unwrap_or_default();
+    caddy::rewrite_caddy(cfg, &apps, &domains, &limits).await
 }
 
 /// Park one app. Order matters: flag it asleep, switch its sites to the
@@ -191,6 +201,19 @@ pub async fn wake_app(
         anyhow::bail!("app has no port");
     };
     let was_asleep = app.is_asleep();
+    // One budget for queueing behind other apps' cold starts and for the
+    // health gate: Caddy stops waiting at `wake_timeout_s` + 15 s.
+    let budget = Duration::from_secs(cfg.wake_timeout_s.max(1));
+    let deadline = tokio::time::Instant::now() + budget;
+    let _slot = if was_asleep {
+        match tokio::time::timeout(budget, wake_slots(cfg).acquire()).await {
+            Ok(Ok(permit)) => Some(permit),
+            Ok(Err(_)) => anyhow::bail!("wake slots closed"),
+            Err(_) => anyhow::bail!("too many apps starting at once; waited {}s", budget.as_secs()),
+        }
+    } else {
+        None
+    };
     if was_asleep {
         db::set_app_awake(pool, &app.id).await?;
         crate::host::stats::record_wake();
@@ -203,7 +226,8 @@ pub async fn wake_app(
     if app.status != AppStatus::Running.as_str() {
         db::update_app_status(pool, &app.id, AppStatus::Running.as_str(), None, None).await?;
     }
-    if !wait_healthy(cfg, port, Duration::from_secs(cfg.wake_timeout_s.max(1))).await {
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if !wait_healthy(cfg, port, left.max(Duration::from_secs(1))).await {
         anyhow::bail!("fleet not healthy within {}s", cfg.wake_timeout_s);
     }
     if was_asleep {
