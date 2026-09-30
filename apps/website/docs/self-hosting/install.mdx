@@ -8,7 +8,7 @@ description: Install Noite on a fresh server with one command, or by hand with D
 On a fresh Ubuntu or Debian server (amd64 or arm64, 2 GB of memory or more, ports 80 and 443 free):
 
 ```bash
-curl -fsSL https://noite.now/install.sh | sudo bash
+curl -fsSL https://noite.now/run.sh | sudo bash -s install
 ```
 
 The script installs Docker Engine and the Compose plugin when missing, asks for the base domain, and writes `/opt/noite/compose.yaml` (option A, from `main`) and `/opt/noite/.env` with generated secrets, `CONTROL_SUBDOMAIN=app` and the edge on 80/443. It then opens 80/443 in `ufw` when it is active, starts the stack and waits for `/ready`. With no terminal to ask on, the domain defaults to `<public-ip>.sslip.io`, which needs no DNS and is enough to try Noite out. For a real domain, point `app.`, `api.`, `git.` and `*.<domain>` at the server first.
@@ -17,27 +17,27 @@ The script installs Docker Engine and the Compose plugin when missing, asks for 
 Register right away: the first account becomes the admin without an invite code.
 :::
 
-Re-running the script is the upgrade: it refreshes `compose.yaml`, keeps `.env` (the domain and secrets never change after the first install, since passkeys bind to `BETTER_AUTH_URL`), pulls and recreates. Inputs are environment variables; with `sudo`, put them after it (`curl … | sudo NOITE_DOMAIN=example.com bash`):
+Re-running the script is the upgrade: it refreshes `compose.yaml`, keeps `.env` (the domain and secrets never change after the first install, since passkeys bind to `BETTER_AUTH_URL`), pulls and recreates. Inputs are environment variables; with `sudo`, put them after it (`curl … | sudo NOITE_DOMAIN=example.com bash -s install`):
 
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `NOITE_DOMAIN` | asked, else `<ip>.sslip.io` | `BASE_DOMAIN` on first install |
 | `NOITE_VERSION` | `latest` | image tag; a short SHA holds back or rolls back |
 | `NOITE_ADMIN_EMAIL` | none | account promoted to admin at boot |
-| `NOITE_TENANCY` | `multi` | `single` when only you push code |
 | `NOITE_DIR` | `/opt/noite` | install directory |
-| `NOITE_REF` | `main` | git ref `compose.yaml` is fetched from |
-| `NOITE_SKIP_DOCKER` | `0` | `1` fails instead of installing Docker |
+| `NOITE_REF` | `main` | git ref the installer and `compose.yaml` are fetched from |
+
+The script always runs the installer from the ref's latest commit, so a CDN-cached copy is never stale.
 
 For your own bucket ([option B](#b-your-own-bucket)), lost-passkey email (`NOITE_EMAIL_WEBHOOK_URL`) or any other setting, edit `/opt/noite/.env` and run `cd /opt/noite && docker compose up -d`. The sections below are the same install by hand, for hosts where you'd rather not run the script.
 
 ## Uninstall or start over
 
 ```bash
-curl -fsSL https://noite.now/uninstall.sh | sudo bash
+curl -fsSL https://noite.now/run.sh | sudo bash -s uninstall
 ```
 
-The script removes the stack's containers, network and volumes (the runner database, git mirrors, Caddy certificates and the bundled bucket), the Noite and RustFS images, and `/opt/noite` with its `.env`. Docker and the `ufw` rules for 80/443 stay. It asks you to type the base domain first; without a terminal, pass `NOITE_CONFIRM=1`. Then run `install.sh` again for a fresh install, which is also how you change the domain.
+The script removes the stack's containers, network and volumes (the runner database, git mirrors, Caddy certificates and the bundled bucket), the Noite and RustFS images, and `/opt/noite` with its `.env`. Docker and the `ufw` rules for 80/443 stay. It asks you to type the base domain first; without a terminal, pass `NOITE_CONFIRM=1`. Then run `install` again for a fresh install, which is also how you change the domain.
 
 :::danger
 Uninstalling deletes every app, account, repository and secret of the install. [Back up](/self-hosting/operations#backups) first if you need any of it.
@@ -45,7 +45,7 @@ Uninstalling deletes every app, account, repository and secret of the install. [
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `NOITE_KEEP_DATA` | `0` | `1` removes the containers only; volumes, images and `.env` stay, and `install.sh` brings the same install back |
+| `NOITE_KEEP_DATA` | `0` | `1` removes the containers only; volumes, images and `.env` stay, and `install` brings the same install back |
 | `NOITE_CONFIRM` | `0` | `1` skips the confirmation |
 | `NOITE_DIR` | `/opt/noite` | install directory |
 

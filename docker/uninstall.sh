@@ -2,7 +2,10 @@
 # Noite uninstaller: removes what install.sh set up, so the host is clean for
 # a fresh install.
 #
-#   curl -fsSL https://noite.now/uninstall.sh | sudo bash
+#   curl -fsSL https://noite.now/run.sh | sudo bash -s uninstall
+#
+# noite.now/run.sh resolves main to a commit and runs this file from it
+# (apps/website/public/run.sh), so every run is the latest.
 #
 # What it removes: the stack's containers and network, its volumes (runner
 # database, git mirrors, Caddy certificates, the bundled bucket), the Noite
@@ -21,8 +24,8 @@
 # A bucket of your own (S3_ENDPOINT in .env) is never touched: a reinstall
 # pointed at it restores the old state from its snapshot.
 #
-# The whole script is one function called on the last line, so a truncated
-# download never runs half an uninstall.
+# Nothing runs before main on the last line, so a truncated download never
+# runs half an uninstall.
 
 set -euo pipefail
 
@@ -57,7 +60,7 @@ has_tty() { [[ -r /dev/tty ]] && (: </dev/tty) 2>/dev/null; }
 env_get() { grep -E "^$1=" "$NOITE_DIR/.env" 2>/dev/null | tail -n 1 | cut -d= -f2-; }
 
 check_system() {
-  [[ "$(id -u)" -eq 0 ]] || die "run as root: curl -fsSL https://noite.now/uninstall.sh | sudo bash"
+  [[ "$(id -u)" -eq 0 ]] || die "run as root: curl -fsSL https://noite.now/run.sh | sudo bash -s uninstall"
   have docker || die "docker is not installed; nothing of Noite can be running"
   docker info >/dev/null 2>&1 || die "the Docker daemon is not running: systemctl start docker"
 }
@@ -170,8 +173,8 @@ summary() {
 
 ${GREEN}${BOLD}Noite is stopped.${RESET} Volumes, images and $NOITE_DIR/.env are kept.
 
-  Start again   curl -fsSL https://noite.now/install.sh | sudo bash
-  Remove all    curl -fsSL https://noite.now/uninstall.sh | sudo bash
+  Start again   curl -fsSL https://noite.now/run.sh | sudo bash -s install
+  Remove all    curl -fsSL https://noite.now/run.sh | sudo bash -s uninstall
 EOF
     return 0
   fi
@@ -180,7 +183,7 @@ EOF
 
 ${GREEN}${BOLD}Noite is removed.${RESET} Docker and the ufw rules for 80/443 are left in place.
 
-  Reinstall     curl -fsSL https://noite.now/install.sh | sudo bash
+  Reinstall     curl -fsSL https://noite.now/run.sh | sudo bash -s install
 EOF
   if [[ -n "${S3_OWN:-}" && "$S3_OWN" != "http://rustfs:9000" ]]; then
     warn "your bucket at $S3_OWN was not touched: a reinstall pointed at it restores"
