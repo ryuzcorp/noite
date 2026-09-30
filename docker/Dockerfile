@@ -40,7 +40,12 @@ RUN cargo build --release && strip target/release/noite-runner
 # bun install runs inside the image, so the lockfile is the only input that
 # pins UI deps. The ignore file keeps .dev.vars out of the context: a
 # build-time secret would otherwise be baked into the deployed worker vars.
+# vite runs under real Node (bun run honours the `node` shebang when a node is
+# on PATH): vite.config.ts loads cloudflare.config.ts through @cloudflare/config,
+# which refuses Bun. Only the binary is copied, from the pinned Node version.
 FROM docker.io/oven/bun:1.4-debian AS ui-build
+ARG NODE_VERSION
+COPY --from=docker.io/library/node:${NODE_VERSION}-slim /usr/local/bin/node /usr/local/bin/node
 WORKDIR /app
 COPY apps/noite/package.json apps/noite/bun.lock ./
 RUN bun install --frozen-lockfile
