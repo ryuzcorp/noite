@@ -19,7 +19,7 @@
 #   NOITE_REF          git ref compose.yaml is fetched from (default: main)
 #   NOITE_DIR          install directory (default: /opt/noite)
 #   NOITE_TENANCY      multi (default off localhost) or single
-#   NOITE_SKIP_DNS_CHECK  1 = skip the DNS check (skipped anyway for a bare IP or *.sslip.io)
+#   NOITE_SKIP_DNS_CHECK  1 = skip the DNS check (skipped anyway for a bare IP, *.sslip.io, *.nip.io or a local name)
 #   NOITE_SKIP_DOCKER  1 = never install Docker, fail if missing
 #
 # The whole script is one function called on the last line, so a truncated
@@ -231,15 +231,26 @@ choose_domain() {
   [[ "$DOMAIN" != "localhost" ]] || die "use make up from a checkout for a localhost install"
 }
 
-check_dns() {
-  [[ -n "${PUBLIC_IP:-}" ]] || return 0
-  # A bare IP or an sslip.io name (LAN/local trial) has no DNS records to check.
+# Wildcard-DNS names resolve to the IP inside the name, and local names never
+# reach public DNS: there is nothing to check for either.
+skip_dns_check() {
   [[ "${NOITE_SKIP_DNS_CHECK:-0}" != "1" ]] || return 0
+  [[ -n "${PUBLIC_IP:-}" ]] || return 0
+  case "$DOMAIN" in
+    localhost | *.localhost | *.local | *.sslip.io | sslip.io | *.nip.io | nip.io) return 0 ;;
+  esac
   [[ ! "$DOMAIN" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 0
-  [[ "$DOMAIN" != *.sslip.io && "$DOMAIN" != sslip.io ]] || return 0
+  return 1
+}
+
+check_dns() {
+  if skip_dns_check; then
+    return 0
+  fi
   local host resolved
   for host in "app.$DOMAIN" "git.$DOMAIN" "noite-dns-check.$DOMAIN"; do
-    resolved=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR == 1 { print $1 }') || true
+    # Bounded: a resolver that never answers must not hang the install.
+    resolved=$(timeout 5 getent ahostsv4 "$host" 2>/dev/null | awk 'NR == 1 { print $1 }') || true
     if [[ -z "$resolved" ]]; then
       warn "$host does not resolve yet; certificates issue once DNS points at $PUBLIC_IP"
     elif [[ "$resolved" != "$PUBLIC_IP" ]]; then
