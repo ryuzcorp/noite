@@ -8,10 +8,11 @@ description: Install Noite on a fresh server with one command, or by hand with D
 On a fresh Ubuntu or Debian server (amd64 or arm64, 2 GB of memory or more, ports 80 and 443 free):
 
 ```bash
-curl -fsSL https://noite.now/run.sh | sudo bash -s install
+curl -fsSL https://noite.now/run.sh | sudo bash -s install              # <public-ip>.sslip.io
+curl -fsSL https://noite.now/run.sh | sudo bash -s install example.com  # your own domain
 ```
 
-The script installs Docker Engine and the Compose plugin when missing, asks for the base domain, and writes `/opt/noite/compose.yaml` (option A, from `main`) and `/opt/noite/.env` with generated secrets, `CONTROL_SUBDOMAIN=app` and the edge on 80/443. It then opens 80/443 in `ufw` when it is active, starts the stack and waits for `/ready`. With no terminal to ask on, the domain defaults to `<public-ip>.sslip.io`, which needs no DNS and is enough to try Noite out. For a real domain, point `app.`, `api.`, `git.` and `*.<domain>` at the server first.
+The script installs Docker Engine and the Compose plugin when missing, and writes `/opt/noite/compose.yaml` (option A, from `main`) and `/opt/noite/.env` with generated secrets, `CONTROL_SUBDOMAIN=app` and the edge on 80/443. It then opens 80/443 in `ufw` when it is active, starts the stack and waits for `/ready`. Without a domain argument it uses `<public-ip>.sslip.io`, which needs no DNS and is enough to try Noite out. It never asks anything, so it cannot hang waiting on the terminal. For a real domain, point `app.`, `api.`, `git.` and `*.<domain>` at the server first.
 
 :::warning
 Register right away: the first account becomes the admin without an invite code.
@@ -21,7 +22,7 @@ Re-running the script is the upgrade: it refreshes `compose.yaml`, keeps `.env` 
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `NOITE_DOMAIN` | asked, else `<ip>.sslip.io` | `BASE_DOMAIN` on first install |
+| `NOITE_DOMAIN` | `<ip>.sslip.io` | same as the domain argument |
 | `NOITE_VERSION` | `latest` | image tag; a short SHA holds back or rolls back |
 | `NOITE_ADMIN_EMAIL` | none | account promoted to admin at boot |
 | `NOITE_DIR` | `/opt/noite` | install directory |
@@ -34,10 +35,11 @@ For your own bucket ([option B](#b-your-own-bucket)), lost-passkey email (`NOITE
 ## Uninstall or start over
 
 ```bash
-curl -fsSL https://noite.now/run.sh | sudo bash -s uninstall
+curl -fsSL https://noite.now/run.sh | sudo bash -s uninstall           # lists what it removes
+curl -fsSL https://noite.now/run.sh | sudo bash -s uninstall <domain>  # removes it
 ```
 
-The script removes the stack's containers, network and volumes (the runner database, git mirrors, Caddy certificates and the bundled bucket), the Noite and RustFS images, and `/opt/noite` with its `.env`. Docker and the `ufw` rules for 80/443 stay. It asks you to type the base domain first; without a terminal, pass `NOITE_CONFIRM=1`. Then run `install` again for a fresh install, which is also how you change the domain.
+The script removes the stack's containers, network and volumes (the runner database, git mirrors, Caddy certificates and the bundled bucket), the Noite and RustFS images, and `/opt/noite` with its `.env`. Docker and the `ufw` rules for 80/443 stay. Without an argument it only lists what it would remove and prints the confirming command, with the install's base domain as its argument. Then run `install` again for a fresh install, which is also how you change the domain.
 
 :::danger
 Uninstalling deletes every app, account, repository and secret of the install. [Back up](/self-hosting/operations#backups) first if you need any of it.
@@ -46,7 +48,6 @@ Uninstalling deletes every app, account, repository and secret of the install. [
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `NOITE_KEEP_DATA` | `0` | `1` removes the containers only; volumes, images and `.env` stay, and `install` brings the same install back |
-| `NOITE_CONFIRM` | `0` | `1` skips the confirmation |
 | `NOITE_DIR` | `/opt/noite` | install directory |
 
 A bucket of your own is never touched: a reinstall pointed at it restores the old state from its snapshot, so empty it or set a new `NOITE_S3_BUCKET` to start fresh. Each full reinstall also issues new TLS certificates, and Let's Encrypt allows 5 certificates per hostname per week, so reinstall a real domain sparingly (`NOITE_KEEP_DATA=1` keeps the certificates).

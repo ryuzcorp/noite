@@ -11,9 +11,9 @@ From a fresh Ubuntu or Debian server to a live app. You need a server with a pub
   </Step>
   <Step title="Run the installer">
     ```bash
-    curl -fsSL https://noite.now/run.sh | sudo bash -s install
+    curl -fsSL https://noite.now/run.sh | sudo bash -s install example.com
     ```
-    It installs Docker if missing, asks for the base domain, generates secrets into `/opt/noite/.env`, starts Noite and waits until it is ready. See [Install](/self-hosting/install) for its options.
+    Leave out `example.com` to use `<server-ip>.sslip.io`. It installs Docker if missing, generates secrets into `/opt/noite/.env`, starts Noite and waits until it is ready. See [Install](/self-hosting/install) for its options.
   </Step>
   <Step title="Create the admin account">
     Open `https://app.<domain>` and register with a passkey. The first account needs no invite code and becomes the admin, so do this right away.

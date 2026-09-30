@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Noite installer: a fresh Ubuntu or Debian server to a running install.
 #
-#   curl -fsSL https://noite.now/run.sh | sudo bash -s install
+#   curl -fsSL https://noite.now/run.sh | sudo bash -s install [domain]
+#
+# The domain (app./api./git./*. must point at this host) defaults to
+# <public-ip>.sslip.io, which needs no DNS. Nothing is asked: under
+# `curl | sudo bash` a read from the terminal can stop the script for good.
 #
 # noite.now/run.sh resolves NOITE_REF to a commit and runs this file from it
 # (apps/website/public/run.sh), so every run is the latest.
@@ -12,8 +16,7 @@
 # image are refreshed, .env (domain, secrets) is kept.
 #
 # Environment (all optional; with sudo, put them after it):
-#   NOITE_DOMAIN       base domain; app./api./git./*. must point at this host
-#                      (default: asked, <public-ip>.sslip.io after 45 s)
+#   NOITE_DOMAIN       same as the domain argument
 #   NOITE_ADMIN_EMAIL  promoted to admin at boot
 #   NOITE_VERSION      image tag (default: latest; a short SHA holds back)
 #   NOITE_REF          git ref the installer and compose.yaml come from (default: main)
@@ -30,13 +33,12 @@ NOITE_DIR="${NOITE_DIR:-/opt/noite}"
 NOITE_VERSION="${NOITE_VERSION:-latest}"
 NOITE_IMAGE_REPO="ghcr.io/ryuzcorp/noite"
 READY_TIMEOUT_S=600
-ASK_TIMEOUT_S=45
 MIN_MEM_MB=1900
 
 if [[ -t 1 ]]; then
-  BOLD=$'\e[1m' DIM=$'\e[2m' RED=$'\e[31m' GREEN=$'\e[32m' YELLOW=$'\e[33m' RESET=$'\e[0m'
+  BOLD=$'\e[1m' RED=$'\e[31m' GREEN=$'\e[32m' YELLOW=$'\e[33m' RESET=$'\e[0m'
 else
-  BOLD="" DIM="" RED="" GREEN="" YELLOW="" RESET=""
+  BOLD="" RED="" GREEN="" YELLOW="" RESET=""
 fi
 
 step() { printf '\n%s==>%s %s%s%s\n' "$GREEN" "$RESET" "$BOLD" "$*" "$RESET"; }
@@ -48,21 +50,6 @@ die() {
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
-
-# stdin is the script itself under `curl | bash`, so questions go to the
-# terminal. Some sudo versions hand the script a terminal that never gets the
-# keyboard, hence the deadline: no answer means the default.
-ask() {
-  local prompt="$1" default="$2" answer=""
-  if [[ -r /dev/tty ]] && (: </dev/tty) 2>/dev/null; then
-    printf '%s %s[%s]%s: ' "$prompt" "$DIM" "$default" "$RESET" >/dev/tty
-    if ! read -r -t "$ASK_TIMEOUT_S" answer </dev/tty; then
-      printf '\n    no answer in %ss, using %s\n' "$ASK_TIMEOUT_S" "$default" >/dev/tty
-      answer=""
-    fi
-  fi
-  printf '%s' "${answer:-$default}"
-}
 
 check_system() {
   step "Checking the system"
@@ -140,24 +127,22 @@ env_set() {
 }
 
 choose_domain() {
+  NOITE_DOMAIN="${1:-${NOITE_DOMAIN:-}}"
   local ip
   ip=$(public_ip)
-  if [[ -n "${NOITE_DOMAIN:-}" ]]; then
-    DOMAIN="$NOITE_DOMAIN"
-  else
-    info "Noite serves app.<domain>, api.<domain>, git.<domain> and *.<domain> (one per app)."
-    info "Point them at ${ip:-this server}, or keep the sslip.io default to try it without DNS."
-    DOMAIN=$(ask "    Base domain" "${ip:+$ip.sslip.io}")
-  fi
+  DOMAIN="${NOITE_DOMAIN:-${ip:+$ip.sslip.io}}"
 
   DOMAIN=$(printf '%s' "$DOMAIN" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#/.*$##')
-  [[ -n "$DOMAIN" ]] || die "no domain: set NOITE_DOMAIN=example.com"
+  [[ -n "$DOMAIN" ]] || die "no public IP found: pass the domain (… | sudo bash -s install example.com)"
   [[ "$DOMAIN" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] ||
     die "\"$DOMAIN\" is not a domain name"
 
   # sslip.io and nip.io resolve to the IP inside the name: nothing to check.
   case "$DOMAIN" in
-    *sslip.io | *nip.io) return 0 ;;
+    *sslip.io | *nip.io)
+      info "using $DOMAIN; for your own domain, uninstall and pass it: … | sudo bash -s install example.com"
+      return 0
+      ;;
   esac
   local resolved
   resolved=$(timeout 5 getent ahostsv4 "app.$DOMAIN" 2>/dev/null | awk 'NR == 1 { print $1 }') || true
@@ -272,6 +257,7 @@ EOF
 }
 
 main() {
+  NOITE_DOMAIN="${1:-${NOITE_DOMAIN:-}}"
   check_system
   install_docker
   check_ports

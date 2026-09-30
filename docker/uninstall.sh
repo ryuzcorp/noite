@@ -3,6 +3,11 @@
 # a fresh install.
 #
 #   curl -fsSL https://noite.now/run.sh | sudo bash -s uninstall
+#   curl -fsSL https://noite.now/run.sh | sudo bash -s uninstall <domain>
+#
+# Without an argument it only lists what it would remove. Passing the install's
+# BASE_DOMAIN confirms (a flag gets pasted without thought). Nothing is asked:
+# under `curl | sudo bash` a read from the terminal can stop the script for good.
 #
 # noite.now/run.sh resolves main to a commit and runs this file from it
 # (apps/website/public/run.sh), so every run is the latest.
@@ -18,8 +23,7 @@
 # Environment (all optional):
 #   NOITE_DIR        install directory (default: /opt/noite)
 #   NOITE_KEEP_DATA  1 = remove the containers only; volumes, images and .env
-#                    stay, and re-running install.sh brings the same install back
-#   NOITE_CONFIRM    1 = do not ask (required without a terminal)
+#                    stay, and re-running install brings the same install back
 #
 # A bucket of your own (S3_ENDPOINT in .env) is never touched: a reinstall
 # pointed at it restores the old state from its snapshot.
@@ -31,7 +35,6 @@ set -euo pipefail
 
 NOITE_DIR="${NOITE_DIR:-/opt/noite}"
 NOITE_KEEP_DATA="${NOITE_KEEP_DATA:-0}"
-NOITE_CONFIRM="${NOITE_CONFIRM:-0}"
 # `name:` in compose.yaml; Compose labels everything it creates with it, so
 # the stack is found even when compose.yaml is gone.
 PROJECT="noite"
@@ -53,9 +56,6 @@ die() {
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
-
-# stdin is the script itself under `curl | bash`; questions go to the terminal.
-has_tty() { [[ -r /dev/tty ]] && (: </dev/tty) 2>/dev/null; }
 
 env_get() { grep -E "^$1=" "$NOITE_DIR/.env" 2>/dev/null | tail -n 1 | cut -d= -f2-; }
 
@@ -99,23 +99,20 @@ survey() {
 }
 
 confirm() {
-  if [[ "$NOITE_CONFIRM" == "1" ]]; then
-    return 0
-  fi
-  has_tty || die "no terminal to confirm on: re-run with NOITE_CONFIRM=1 (… | sudo NOITE_CONFIRM=1 bash)"
-
-  local expected="${DOMAIN:-noite}" answer=""
+  local expected="${DOMAIN:-noite}" keep=""
+  [[ "${1:-}" != "$expected" ]] || return 0
+  [[ -z "${1:-}" ]] || die "\"$1\" is not this install's domain; nothing was removed"
   if [[ "$NOITE_KEEP_DATA" == "1" ]]; then
-    printf '\n%sStops and removes the Noite containers; data and .env stay.%s\n' "$BOLD" "$RESET" >/dev/tty
+    keep="NOITE_KEEP_DATA=1 "
+    printf '\n%sThis stops and removes the Noite containers; data and .env stay.%s\n' "$BOLD" "$RESET"
   else
-    printf '\n%s%sDeletes every app, account, git repository, certificate and secret of this install.%s\n' \
-      "$RED" "$BOLD" "$RESET" >/dev/tty
+    printf '\n%s%sThis deletes every app, account, git repository, certificate and secret of the install.%s\n' \
+      "$RED" "$BOLD" "$RESET"
     printf '%sBack up first if you need any of it: https://noite.now/self-hosting/operations#backups%s\n' \
-      "$DIM" "$RESET" >/dev/tty
+      "$DIM" "$RESET"
   fi
-  printf 'Type %s%s%s to continue: ' "$BOLD" "$expected" "$RESET" >/dev/tty
-  read -r answer </dev/tty || true
-  [[ "$answer" == "$expected" ]] || die "not confirmed; nothing was removed"
+  printf '\nTo go ahead, run:\n\n  curl -fsSL https://noite.now/run.sh | sudo %sbash -s uninstall %s\n' "$keep" "$expected"
+  exit 0
 }
 
 stop_stack() {
@@ -194,7 +191,7 @@ EOF
 main() {
   check_system
   survey
-  confirm
+  confirm "$@"
   stop_stack
   if [[ "$NOITE_KEEP_DATA" != "1" ]]; then
     remove_data
