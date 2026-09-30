@@ -25,6 +25,10 @@ ARG NODE_VERSION=24.21.0
 
 FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
 
+# The pinned Node's binary, for the ui-build stage below (`COPY --from` cannot
+# expand variables, so the pin lives in a stage of its own).
+FROM docker.io/library/node:${NODE_VERSION}-slim AS node
+
 # --- runner binary ----------------------------------------------------------
 FROM docker.io/library/rust:1-bookworm AS runner-build
 WORKDIR /src
@@ -44,8 +48,7 @@ RUN cargo build --release && strip target/release/noite-runner
 # on PATH): vite.config.ts loads cloudflare.config.ts through @cloudflare/config,
 # which refuses Bun. Only the binary is copied, from the pinned Node version.
 FROM docker.io/oven/bun:1.4-debian AS ui-build
-ARG NODE_VERSION
-COPY --from=docker.io/library/node:${NODE_VERSION}-slim /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
 WORKDIR /app
 COPY apps/noite/package.json apps/noite/bun.lock ./
 RUN bun install --frozen-lockfile
