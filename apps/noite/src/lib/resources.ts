@@ -19,7 +19,6 @@ import {
   errorDetail as fetchErrorDetail,
   get,
   getLimits,
-  listErrors,
   listAppStorage,
   listCollaborators,
   listDomains,
@@ -30,7 +29,7 @@ import {
   r2List as fetchR2List,
 } from "./apps.server";
 import { authClient } from "./auth-client";
-import type { D1Preview, DoPreview, ErrorStatus, R2Preview } from "./runner";
+import type { D1Preview, DoPreview, R2Preview } from "./runner";
 import { clearSwrStore, withSnapshot, writeSwr } from "./swr-store";
 
 export { invalidate } from "ilha";
@@ -94,7 +93,6 @@ export const keys = {
   envVars: (id: string) => `app:${id}:env`,
   errorDetail: (appId: string, fingerprint: string) =>
     `app:${appId}:error:${fingerprint}`,
-  errors: (id: string, status: ErrorStatus) => `app:${id}:errors:${status}`,
   inviteCodes: "me:invites",
   limits: (id: string) => `app:${id}:limits`,
   myInvitations: "me:collaborator-invitations",
@@ -140,10 +138,6 @@ export const limits = (id: string) =>
 
 export const envVars = (id: string) =>
   tracked(keys.envVars(id), () => listEnv(id));
-
-/** Grouped errors in one status (open / resolved / ignored). */
-export const errorList = (appId: string, status: ErrorStatus) =>
-  tracked(keys.errors(appId, status), () => listErrors({ appId, status }));
 
 /** One error with its latest occurrences. */
 export const errorDetail = (appId: string, fingerprint: string) =>

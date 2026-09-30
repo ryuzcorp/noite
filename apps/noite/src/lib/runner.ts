@@ -335,9 +335,6 @@ export interface RunnerErrorDetail {
   issue: RunnerErrorIssue;
 }
 
-export const runnerListErrors = (id: string, status: ErrorStatus) =>
-  runnerRpc<RunnerErrorList>("errors.list", { id, status });
-
 export const runnerGetError = (id: string, fingerprint: string) =>
   runnerRpc<RunnerErrorDetail>("errors.get", { fingerprint, id });
 

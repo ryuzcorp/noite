@@ -768,6 +768,19 @@ const handleDeploysStream: RouteHandler = (request, env, params) =>
     (appId) => `/v1/apps/${appId}/deploys/stream`
   );
 
+/** Live grouped-errors proxy (see proxyRunnerStream). `?status=` passes
+ * through; the runner validates it. */
+const handleErrorsStream: RouteHandler = (request, env, params) => {
+  const status = new URL(request.url).searchParams.get("status") ?? "open";
+  return proxyRunnerStream(
+    request,
+    env,
+    params,
+    (appId) =>
+      `/v1/apps/${appId}/errors/stream?status=${encodeURIComponent(status)}`
+  );
+};
+
 /** Live event feed proxy (see proxyRunnerStream). Query (channel/limit)
  * passes through so the client scopes the snapshot server-side. */
 const handleEventsStream: RouteHandler = (request, env, params) => {
@@ -789,6 +802,7 @@ router.on("GET", "/storage/:appId/r2/:bucket/raw", handleR2Raw);
 router.on("GET", "/api/apps/:appId/logs/stream", handleLogsStream);
 router.on("GET", "/api/apps/:appId/deploys/stream", handleDeploysStream);
 router.on("GET", "/api/apps/:appId/events/stream", handleEventsStream);
+router.on("GET", "/api/apps/:appId/errors/stream", handleErrorsStream);
 router.on("GET", "/api/apps/stream", handleAppsStream);
 router.on("GET", "/api/apps/:appId/metrics/stream", handleMetricsStream);
 router.on("POST", "/api/apps/:appId/ingest/:kind", forwardIngest);

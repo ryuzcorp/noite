@@ -1,5 +1,5 @@
 import { DeployList } from "$lib/app-detail/deploys";
-import { ErrorsPanel } from "$lib/app-detail/errors";
+import { ErrorsPanel, liveErrors } from "$lib/app-detail/errors";
 import { EventsPanel } from "$lib/app-detail/events";
 import {
   DEFAULT_METRICS_HOURS,
@@ -9,7 +9,7 @@ import {
 } from "$lib/app-detail/metrics";
 import { AppDetailPanel, AppHeader } from "$lib/app-detail/panel";
 import { AppSettingsPanel } from "$lib/app-detail/settings";
-import { appDetail, errorList } from "$lib/resources";
+import { appDetail } from "$lib/resources";
 import { useRoute, head, searchParam } from "@ilha/router";
 
 const TABS = [
@@ -58,9 +58,9 @@ const AppPageBody = ({ appId }: { appId: string }) => {
   const openError = searchParam("e", { default: "" });
   const name = appDetail(appId).data()?.app.name;
   head({ title: `${name ?? "App"} · Noite` });
-  // Same resource as the Errors tab's open list: the tab label shows how
-  // many errors wait for triage without a second fetch.
-  const openErrors = errorList(appId, "open").data()?.counts.open ?? 0;
+  // Same live feed as the Errors tab's open list, so the tab label's count
+  // of errors waiting for triage never lags the list.
+  const openErrors = liveErrors(appId, "open").data()?.counts.open ?? 0;
 
   return (
     <div class="mx-auto mt-4 flex w-full max-w-5xl flex-col gap-4 px-4 pb-12">

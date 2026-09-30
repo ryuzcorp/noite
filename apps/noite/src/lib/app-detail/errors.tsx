@@ -8,20 +8,16 @@ import { atom } from "ilha";
 import { setErrorStatus } from "../apps.server";
 import { formatAgo, formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
+import { decodeErrors, errorsUrl, feedKeys, liveFeed } from "../feeds";
 import { ArrowLeft } from "../icons";
 import { LoadError } from "../load-error";
-import {
-  appDetail,
-  errorDetail,
-  errorList,
-  invalidate,
-  keys,
-} from "../resources";
+import { appDetail, errorDetail } from "../resources";
 import type {
   ErrorStatus,
   RunnerErrorEvent,
   RunnerErrorFrame,
   RunnerErrorIssue,
+  RunnerErrorList,
 } from "../runner";
 import { ListSkeleton, SectionSkeleton } from "../skeletons";
 
@@ -149,6 +145,28 @@ const IssueRow = ({
   </li>
 );
 
+/** Live issue list for one status over SSE: the last snapshot (or a
+ * skeleton when cold) until the first frame, then the runner pushes a frame
+ * whenever the list, a count or a sparkline moves — no refresh button. */
+export const liveErrors = (appId: string, status: ErrorStatus) => {
+  const feed = liveFeed(
+    feedKeys.errors(appId, status),
+    errorsUrl(appId, status),
+    decodeErrors
+  );
+  const data = (): RunnerErrorList | undefined => feed.latest();
+  const retrying = (): boolean => feed.status() === "retrying";
+  return {
+    data,
+    pending: (): boolean => data() === undefined && !retrying(),
+    retrying,
+  };
+};
+
+const StreamRetrying = () => (
+  <p class="text-error m-0 text-sm">Error stream disconnected — retrying…</p>
+);
+
 const EmptyErrors = ({ status }: { status: ErrorStatus }) => {
   if (status !== "open") {
     return (
@@ -177,25 +195,13 @@ const ErrorList = ({
   onStatus: (status: ErrorStatus) => void;
   status: ErrorStatus;
 }) => {
-  const res = errorList(appId, status);
-  const data = res.data();
+  const live = liveErrors(appId, status);
+  const data = live.data();
   const issues = data?.issues ?? [];
   return (
     <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
       <div class="card-body gap-3">
-        <div class="flex items-center justify-between gap-2">
-          <h2 class="m-0 text-lg font-semibold">Errors</h2>
-          <button
-            type="button"
-            class="btn btn-sm btn-ghost"
-            disabled={res.loading()}
-            onclick={() => {
-              res.refetch();
-            }}
-          >
-            Refresh
-          </button>
-        </div>
+        <h2 class="m-0 text-lg font-semibold">Errors</h2>
         <div class="overflow-x-auto">
           <div role="tablist" class="tabs tabs-box tabs-sm w-fit flex-nowrap">
             {STATUSES.map((s) => (
@@ -218,8 +224,8 @@ const ErrorList = ({
             ))}
           </div>
         </div>
-        <LoadError error={res.error()} />
-        {res.loading() && data === undefined ? <ListSkeleton rows={4} /> : null}
+        {live.retrying() ? <StreamRetrying /> : null}
+        {live.pending() ? <ListSkeleton rows={4} /> : null}
         {data !== undefined && issues.length === 0 ? (
           <EmptyErrors status={status} />
         ) : null}
@@ -450,10 +456,8 @@ const ErrorDetailView = ({
   const { events, issue } = data;
   const index = Math.min(picked(), Math.max(0, events.length - 1));
   const event = events[index];
+  // The lists are live; only this detail view needs a re-read.
   const refresh = async () => {
-    for (const s of STATUSES) {
-      invalidate(keys.errors(appId, s.id));
-    }
     await res.refetch();
   };
   const note = statusNote(issue);
@@ -562,11 +566,12 @@ const ErrorDetailView = ({
 
 const SUMMARY_ISSUES = 3;
 
-/** Overview card: the most recent open errors, linking into the tab. Shares
- * the Errors tab's `open` list resource, so neither fetch is duplicated. */
+/** Overview card: the most recent open errors, linking into the tab. Live
+ * like the tab's list, and shares its `open` snapshot, so either paints
+ * instantly once the other has loaded. */
 export const ErrorsSummary = ({ appId }: { appId: string }) => {
-  const res = errorList(appId, "open");
-  const data = res.data();
+  const live = liveErrors(appId, "open");
+  const data = live.data();
   const issues = (data?.issues ?? []).slice(0, SUMMARY_ISSUES);
   const open = data?.counts.open ?? 0;
   const tabHref = `/apps/${appId}?t=errors`;
@@ -582,8 +587,8 @@ export const ErrorsSummary = ({ appId }: { appId: string }) => {
             View All
           </a>
         </div>
-        <LoadError error={res.error()} />
-        {res.loading() && data === undefined ? <ListSkeleton rows={2} /> : null}
+        {live.retrying() ? <StreamRetrying /> : null}
+        {live.pending() ? <ListSkeleton rows={2} /> : null}
         {data !== undefined && issues.length === 0 ? (
           <p class="m-0 text-sm opacity-70">No open errors.</p>
         ) : null}

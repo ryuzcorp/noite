@@ -7,7 +7,9 @@ import { atom, watch } from "ilha";
 import type { AtomHandle, EventSourceStatus } from "ilha";
 
 import type {
+  ErrorStatus,
   RunnerDeploy,
+  RunnerErrorList,
   RunnerEvent,
   RunnerInsight,
   RunnerApp,
@@ -99,6 +101,8 @@ export const liveFeed = <T>(
 export const feedKeys = {
   apps: "feed:apps",
   deploys: (appId: string) => `feed:${appId}:deploys`,
+  errors: (appId: string, status: ErrorStatus) =>
+    `feed:${appId}:errors:${status}`,
   events: (appId: string, channel: string) => `feed:${appId}:events:${channel}`,
   logs: (appId: string) => `feed:${appId}:logs`,
   metrics: (appId: string, hours: number) => `feed:${appId}:metrics:${hours}`,
@@ -123,6 +127,10 @@ export const applistUrl = (): string => "/api/apps/stream";
 /** Deploy history for one app. */
 export const deploysUrl = (appId: string): string =>
   `/api/apps/${encodeURIComponent(appId)}/deploys/stream`;
+
+/** Grouped errors in one status for one app. */
+export const errorsUrl = (appId: string, status: ErrorStatus): string =>
+  `/api/apps/${encodeURIComponent(appId)}/errors/stream?status=${status}`;
 
 /** Live runtime log tail for one app. */
 export const logsUrl = (appId: string): string =>
@@ -171,6 +179,17 @@ export const decodeDeploys = (raw: string): RunnerDeploy[] => {
   // SAFETY: the runner deploys stream emits the same Deploy rows as the
   // list endpoint; entries flow only into list rendering.
   return next as RunnerDeploy[];
+};
+
+/** Error list frame (same shape as the `errors.list` RPC result). */
+export const decodeErrors = (raw: string): RunnerErrorList => {
+  // SAFETY: field shapes verified below; the runner emits the list result.
+  const frame = parseFrame(raw) as Partial<RunnerErrorList> | null;
+  if (!Array.isArray(frame?.issues) || !frame.counts) {
+    throw badFrame("errors");
+  }
+  // SAFETY: issues array and counts object verified above.
+  return frame as RunnerErrorList;
 };
 
 /** Runtime log lines (string array). */

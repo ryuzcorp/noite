@@ -237,6 +237,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/apps/{id}/paths", get(api::app_paths))
         .route("/v1/apps/{id}/refs", get(api::app_refs))
         .route("/v1/apps/{id}/metrics/version", get(api::app_metrics_version))
+        .route("/v1/apps/{id}/errors/stream", get(api::list_errors_stream))
         .route("/v1/apps/{id}/spans", get(api::app_spans))
         .route("/v1/apps/{id}/events", get(api::list_events).post(api::log_event))
         .route("/v1/apps/{id}/events/stream", get(api::list_events_stream))

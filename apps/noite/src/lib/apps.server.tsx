@@ -57,7 +57,6 @@ import {
   runnerR2List,
   runnerR2Delete,
   runnerGetError,
-  runnerListErrors,
   runnerSetErrorStatus,
   runnerSetLimits,
 } from "./runner";
@@ -607,10 +606,6 @@ const ErrorStatusSchema = Schema.Union([
   Schema.Literal("resolved"),
   Schema.Literal("ignored"),
 ]);
-const ErrorListArgs = Schema.Struct({
-  appId: Schema.String,
-  status: ErrorStatusSchema,
-});
 const ErrorArgs = Schema.Struct({
   appId: Schema.String,
   fingerprint: Schema.String,
@@ -620,19 +615,6 @@ const ErrorStatusArgs = Schema.Struct({
   fingerprint: Schema.String,
   status: ErrorStatusSchema,
 });
-
-/** Grouped errors in one status, most recently seen first. */
-export const listErrors = action(
-  checkedSchema(ErrorListArgs, async ({ appId, status }) => {
-    await requireViewApp(appId);
-    try {
-      return await runnerListErrors(appId, status);
-    } catch (error) {
-      failUnknown(error);
-    }
-  }),
-  { error: AuthError }
-);
 
 /** One error with its recent occurrences (stack, request, trace logs). */
 export const errorDetail = action(

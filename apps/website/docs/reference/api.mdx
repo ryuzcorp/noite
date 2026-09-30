@@ -89,6 +89,7 @@ Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
 | `GET` | `/v1/apps/{id}/spans?hours=1` | Recent slow or failed spans |
 | `GET` | `/v1/apps/{id}/logs` | App logs: 24 h of ingested lines plus the live stdout tail |
 | `GET` | `/v1/apps/{id}/logs/stream` | SSE log stream |
+| `GET` | `/v1/apps/{id}/errors/stream?status=open` | SSE stream of grouped errors in one status (`errors.list` shape) |
 
 ## Events
 

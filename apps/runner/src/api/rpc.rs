@@ -152,7 +152,7 @@ struct IdParams {
     id: String,
 }
 
-const ERROR_STATUSES: &[&str] = &["open", "resolved", "ignored"];
+pub(crate) const ERROR_STATUSES: &[&str] = &["open", "resolved", "ignored"];
 
 /// The last 24 UTC hour buckets, oldest first (`app_error_hour` keys).
 fn error_hour_keys() -> Vec<String> {
@@ -188,6 +188,38 @@ fn with_hourly(issue: &crate::models::ErrorIssue, hourly: Vec<i64>) -> serde_jso
         obj.insert("hourly".into(), serde_json::json!(hourly));
     }
     v
+}
+
+/// One status's issues (newest first, each with its 24 h series) plus the
+/// per-status counts: the `errors.list` result and the errors stream frame.
+pub(crate) async fn error_list(
+    pool: &sqlx::SqlitePool,
+    app_id: &str,
+    status: &str,
+) -> sqlx::Result<serde_json::Value> {
+    let keys = error_hour_keys();
+    let (issues, counts, hours) = tokio::try_join!(
+        db::list_error_issues(pool, app_id, status, 200),
+        db::count_error_issues(pool, app_id),
+        db::list_error_hours(pool, app_id, &keys[0]),
+    )?;
+    let mut series = error_series(&keys, &hours);
+    let issues: Vec<serde_json::Value> = issues
+        .into_iter()
+        .map(|issue| {
+            let hourly = series.remove(&issue.fingerprint).unwrap_or_else(|| vec![0; 24]);
+            with_hourly(&issue, hourly)
+        })
+        .collect();
+    let count = |s: &str| counts.iter().find(|(k, _)| k == s).map_or(0, |(_, n)| *n);
+    Ok(serde_json::json!({
+        "issues": issues,
+        "counts": {
+            "open": count("open"),
+            "resolved": count("resolved"),
+            "ignored": count("ignored"),
+        },
+    }))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -605,35 +637,10 @@ async fn dispatch_call(
                 Ok(a) => a,
                 Err(e) => return e,
             };
-            let keys = error_hour_keys();
-            let (issues, counts, hours) = match tokio::try_join!(
-                db::list_error_issues(&state.pool, &a.id, &status, 200),
-                db::count_error_issues(&state.pool, &a.id),
-                db::list_error_hours(&state.pool, &a.id, &keys[0]),
-            ) {
-                Ok(r) => r,
-                Err(e) => return internal(&id, e.to_string()),
-            };
-            let mut series = error_series(&keys, &hours);
-            let issues: Vec<serde_json::Value> = issues
-                .into_iter()
-                .map(|issue| {
-                    let hourly = series.remove(&issue.fingerprint).unwrap_or_else(|| vec![0; 24]);
-                    with_hourly(&issue, hourly)
-                })
-                .collect();
-            let count = |s: &str| counts.iter().find(|(k, _)| k == s).map_or(0, |(_, n)| *n);
-            JsonRpcResponse::success(
-                id,
-                serde_json::json!({
-                    "issues": issues,
-                    "counts": {
-                        "open": count("open"),
-                        "resolved": count("resolved"),
-                        "ignored": count("ignored"),
-                    },
-                }),
-            )
+            match error_list(&state.pool, &a.id, &status).await {
+                Ok(list) => JsonRpcResponse::success(id, list),
+                Err(e) => internal(&id, e.to_string()),
+            }
         }
         "errors.get" => {
             #[derive(Deserialize)]
