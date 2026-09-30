@@ -10,27 +10,48 @@ use crate::config::Config;
 /// Explicit base environment for tenant builds (SPEC, Build and release sandbox).
 /// Nothing is inherited: `run_sandboxed` starts from `env_clear()` plus
 /// these, then the already-denylisted tenant vars.
-pub fn base_env(work_tmp: &str, bun_cache: &str) -> Vec<(String, String)> {
+///
+/// Every cache lives under the app's own cache root: bun's in `bun/`, jup's
+/// store of package managers in `jup/`, and `HOME` is `home/`, which is
+/// where npm, pnpm and Yarn keep theirs. A shared `HOME` would be one cache
+/// for every tenant.
+pub fn base_env(work_tmp: &str, cache: &Path) -> Vec<(String, String)> {
+    let sub = |name: &str| cache.join(name).to_string_lossy().into_owned();
     vec![
         ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
-        ("HOME".into(), "/home/build".into()),
+        ("HOME".into(), sub(CACHE_HOME)),
         ("TMPDIR".into(), work_tmp.into()),
         ("LANG".into(), "C.UTF-8".into()),
         ("CI".into(), "1".into()),
+        // `CI` alone turns colors on in picocolors (Vite, Rsbuild); the
+        // deploy log is plain text.
+        ("NO_COLOR".into(), "1".into()),
         ("NODE_ENV".into(), "production".into()),
-        ("BUN_INSTALL_CACHE_DIR".into(), bun_cache.into()),
+        ("BUN_INSTALL_CACHE_DIR".into(), sub(CACHE_BUN)),
+        ("JUP_HOME".into(), sub(CACHE_JUP)),
+        // A build never edits the project: jup would otherwise add a
+        // `packageManager` pin to an unpinned package.json.
+        ("JUP_ENABLE_AUTO_PIN".into(), "0".into()),
+        // Its advisories call the runner's spec file (package_manager.rs) a
+        // stray manifest outside the project, which misleads in a deploy log.
+        ("JUP_QUIET_ADVISORIES".into(), "1".into()),
     ]
 }
 
+/// Subdirectories of a per-app build cache root.
+const CACHE_BUN: &str = "bun";
+const CACHE_JUP: &str = "jup";
+const CACHE_HOME: &str = "home";
+
 /// Tenant sandbox: uid/gid drop + explicit env (SPEC, Build and release sandbox).
 /// `uid: None` = current user (dev only, single-tenant).
-/// `bun_cache: None` = a throwaway `.bun-cache` inside the worktree (the old
-/// path); `Some` = the persistent per-app cache (T5.1).
+/// `cache: None` = a throwaway `.build-cache` inside the worktree; `Some` =
+/// the persistent per-app cache root (T5.1).
 pub struct Sandbox<'a> {
     pub uid: Option<u32>,
     pub gid: Option<u32>,
     pub env: &'a [(&'a str, &'a str)],
-    pub bun_cache: Option<&'a Path>,
+    pub cache: Option<&'a Path>,
 }
 
 /// Probe whether uid drops work (needs CAP_SETUID/CAP_SETGID or root).
@@ -125,57 +146,62 @@ pub fn check_work_quota(work: &Path, max_mb: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Persistent per-app bun cache (T5.1): `/data/runner/cache/<slug>/bun`.
-/// Per app, never shared across tenants (a shared cache would let one
-/// tenant's build poison another's packages). Deleted with the app
-/// (`purge_slug`) and moved on rename.
+/// Persistent per-app build cache root (T5.1): `/data/runner/cache/<slug>`,
+/// holding `bun/`, `jup/` and `home/` (see `base_env`). Per app, never shared
+/// across tenants (a shared cache would let one tenant's build poison
+/// another's packages). Deleted with the app (`purge_slug`) and moved on
+/// rename.
 pub fn build_cache_dir(cfg: &Config, slug: &str) -> PathBuf {
-    work_root(cfg).join("cache").join(slug).join("bun")
+    work_root(cfg).join("cache").join(slug)
 }
 
-/// Prune the persistent bun cache oldest-first until it fits `max_mb`
-/// (RUNNER_BUILD_CACHE_MB). Symlinks are never followed: like `lchown_tree`,
-/// a tenant tree can link at `/data/noite.sqlite`, and following it here
-/// would delete platform state. Missing dir is a no-op.
+/// Prune the persistent build cache until it fits `max_mb`
+/// (RUNNER_BUILD_CACHE_MB), dropping whole caches, largest first: a cache
+/// with single files missing (a pnpm release in jup's store, a package in
+/// pnpm's) breaks the next build, and a missing cache only costs a download.
+/// The units are the entries below `bun/`, `jup/` and `home/`; `home/` holds
+/// npm's, pnpm's and Yarn's caches side by side. Symlinks are never followed
+/// (`dir_bytes`, and `remove_dir_all` removes a link, not its target): like
+/// `lchown_tree`, a tenant can link at `/data/noite.sqlite`. Missing dir is a
+/// no-op.
 pub fn prune_build_cache(dir: &Path, max_mb: u64) {
     let max = max_mb.saturating_mul(1024 * 1024);
-    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            // symlink_metadata: never follow tenant links.
-            let Ok(m) = std::fs::symlink_metadata(entry.path()) else {
-                continue;
-            };
-            if m.is_dir() {
-                stack.push(entry.path());
-            } else if m.is_file() {
-                files.push((m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), m.len(), entry.path()));
-            }
-        }
-    }
-    let mut total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    let mut total = dir_bytes(dir);
     if total <= max {
         return;
     }
-    files.sort_by_key(|f| f.0);
-    let mut pruned_files = 0u64;
+    let mut units: Vec<(u64, PathBuf)> = Vec::new();
+    for sub in [CACHE_BUN, CACHE_JUP, CACHE_HOME] {
+        let Ok(rd) = std::fs::read_dir(dir.join(sub)) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let bytes = match entry.file_type() {
+                Ok(t) if t.is_dir() => dir_bytes(&path),
+                _ => entry.metadata().map_or(0, |m| m.len()),
+            };
+            units.push((bytes, path));
+        }
+    }
+    units.sort_by_key(|u| std::cmp::Reverse(u.0));
+    let mut pruned = 0u64;
     let mut pruned_bytes = 0u64;
-    for (_, len, path) in files {
+    for (bytes, path) in units {
         if total <= max {
             break;
         }
-        if std::fs::remove_file(&path).is_ok() {
-            total = total.saturating_sub(len);
-            pruned_files += 1;
-            pruned_bytes += len;
+        let removed = match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+        if removed.is_ok() {
+            total = total.saturating_sub(bytes);
+            pruned += 1;
+            pruned_bytes += bytes;
         }
     }
-    // Empty dirs left behind are harmless; the next build recreates them.
-    tracing::info!(dir = %dir.display(), pruned_files, pruned_bytes, max_mb, "pruned bun build cache");
+    tracing::info!(dir = %dir.display(), pruned, pruned_bytes, max_mb, "pruned build cache");
 }
 
 /// Tenant build/release sandbox: `env_clear`, BASE_ENV + tenant vars, uid/gid
@@ -196,19 +222,18 @@ pub async fn run_sandboxed(
     // Persistent per-app cache (T5.1) when the caller hands one over;
     // otherwise the old throwaway inside the worktree.
     let cache_owned;
-    let cache: &Path = match sb.bun_cache {
-        Some(dir) => {
-            let _ = std::fs::create_dir_all(dir);
-            dir
-        }
+    let cache: &Path = match sb.cache {
+        Some(dir) => dir,
         None => {
-            cache_owned = cwd.join(".bun-cache");
-            let _ = std::fs::create_dir_all(&cache_owned);
+            cache_owned = cwd.join(".build-cache");
             &cache_owned
         }
     };
+    for sub in [CACHE_BUN, CACHE_JUP, CACHE_HOME] {
+        let _ = std::fs::create_dir_all(cache.join(sub));
+    }
     // Created by the runner after the worktree was handed over: give them to
-    // the sandbox user too, or TMPDIR and the bun cache are unwritable.
+    // the sandbox user too, or TMPDIR and the build cache are unwritable.
     if let Some(uid) = sb.uid {
         let gid = sb.gid.unwrap_or(uid);
         lchown_tree(&tmp, uid, gid);
@@ -222,7 +247,7 @@ pub async fn run_sandboxed(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    for (k, v) in base_env(&tmp.to_string_lossy(), &cache.to_string_lossy()) {
+    for (k, v) in base_env(&tmp.to_string_lossy(), cache) {
         cmd.env(k, v);
     }
     for (k, v) in sb.env {
@@ -278,7 +303,9 @@ pub async fn run_sandboxed(
             if !output.status.success() {
                 let err = String::from_utf8_lossy(&output.stderr);
                 let out = String::from_utf8_lossy(&output.stdout);
-                bail!("{program} {:?} exit {:?}\n{err}{out}", args, output.status.code());
+                // stdout first: a build's progress goes there and its error to
+                // stderr, and the deploy log keeps the tail.
+                bail!("{program} {:?} exit {:?}\n{out}{err}", args, output.status.code());
             }
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         }
@@ -1048,6 +1075,35 @@ pub fn work_root(cfg: &Config) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune_drops_whole_caches_largest_first() {
+        let dir = std::env::temp_dir().join(format!("noite-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let write = |rel: &str, bytes: usize| {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, vec![0u8; bytes]).unwrap();
+        };
+        let mb = 1024 * 1024;
+        write("jup/v1/pnpm/12.8.2/pnpm", 2 * mb);
+        write("home/.local/share/pnpm/store/a", mb / 2);
+        write("home/.local/share/pnpm/store/b", mb / 2);
+        write("bun/pkg@1/index.js", mb / 4);
+
+        // 3.25 MiB against a 2 MiB cap: jup's store (2 MiB) goes whole, and
+        // that is enough; nothing is left half-deleted.
+        prune_build_cache(&dir, 2);
+        assert!(!dir.join("jup/v1").exists());
+        assert!(dir.join("home/.local/share/pnpm/store/a").exists());
+        assert!(dir.join("home/.local/share/pnpm/store/b").exists());
+        assert!(dir.join("bun/pkg@1/index.js").exists());
+
+        // Under the cap: untouched.
+        prune_build_cache(&dir, 2);
+        assert!(dir.join("home/.local").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// SigV4 header signer, cross-validated on the IAM ListUsers inputs below:
     /// the Rust `hmac` crate, Python's stdlib `hmac` and `openssl dgst`

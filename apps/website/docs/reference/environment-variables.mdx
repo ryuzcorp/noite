@@ -65,6 +65,7 @@ Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (hand
 | `NOITE_FLEET_PORTS` | built-in range | Fleet port range, two ports per app | runner-owned |
 | `NOITE_STOP_BUDGET_MS` | `25000` | Graceful-stop budget (min `5000`); fleets stop inside budget − 3 s | runner-owned |
 | `RUNNER_BUILD_MAX_MB` | `2048` | Refuse builds past this worktree size (MiB) | runner-owned |
+| `RUNNER_BUILD_TIMEOUT_S` | `300` | Bound on each install and build step (seconds) | runner-owned |
 
 ## Bounds
 
@@ -76,7 +77,7 @@ Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (hand
 | `RUNNER_FLEET_DEPLOY_POLL_S` | `300` | → `CELLD_DEPLOY_POLL_S`; covers missed `/reload` only | worker-passthrough (fleet) |
 | `RUNNER_FLEET_ASSET_CACHE_MB` | `64` | → `CELLD_ASSET_CACHE_BYTES`; per-fleet on-disk asset cache | worker-passthrough (fleet) |
 | `RUNNER_OTEL_FLUSH_MS` | `30000` | → `CELLD_OTEL_FLUSH_MS`; bucket-flush + ingest tick cadence (min `1000`); dashboards lag ~40 s | worker-passthrough (fleet) |
-| `RUNNER_BUILD_CACHE_MB` | `512` | Per-app persistent bun cache cap; `0` disables | runner-owned |
+| `RUNNER_BUILD_CACHE_MB` | `512` | Per-app persistent build cache cap (package managers and their caches); `0` disables | runner-owned |
 | `RUNNER_TELEMETRY_RETENTION_DAYS` | `30` | Days kept in bucket prune, metric tables, glob floor (min `1`) | runner-owned |
 | `RUNNER_TIP_SWEEP_S` | `60` | Fallback S3 tip sweep per app; covers out-of-band bundle writes | runner-owned |
 | `RUNNER_FLEET_LOG` | `error,celld=warn` | Fleet `RUST_LOG` (runner's own filter stays separate) | worker-passthrough (fleet) |

@@ -197,6 +197,8 @@ fn parse_fleet_ports() -> (u16, u16) {
     /// Cap per app on the persistent bun cache (RUNNER_BUILD_CACHE_MB).
     /// Pruned oldest-first after each deploy; 0 disables persistence.
     pub build_cache_mb: u64,
+    /// Bound on each tenant install and build step (RUNNER_BUILD_TIMEOUT_S).
+    pub build_timeout_s: u64,
     /// Days of telemetry kept everywhere (RUNNER_TELEMETRY_RETENTION_DAYS):
     /// celld's bucket prune, the metric table prune and the glob floor.
     pub telemetry_retention_days: i64,
@@ -324,6 +326,9 @@ impl Config {
             build_cache_mb: env_or(&["RUNNER_BUILD_CACHE_MB"], "512")
                 .parse()
                 .unwrap_or(512),
+            build_timeout_s: env_or(&["RUNNER_BUILD_TIMEOUT_S"], "300")
+                .parse()
+                .unwrap_or(300),
             telemetry_retention_days: env_or(&["RUNNER_TELEMETRY_RETENTION_DAYS"], "30")
                 .parse()
                 .unwrap_or(14),
@@ -569,6 +574,7 @@ mod tests {
             stop_budget_ms: 25000,
             build_max_mb: 2048,
             build_cache_mb: 512,
+            build_timeout_s: 300,
             telemetry_retention_days: 14,
             otel_flush_ms: 30000,
             build_uid: None,

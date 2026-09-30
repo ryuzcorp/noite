@@ -16,12 +16,16 @@
 #                    docker/dev.sh runs the runner (cargo watch) and the
 #                    control UI (vite dev) side by side.
 #
-# One celld, one Caddy, one Node and one bun pin; docker/check-versions.ts
-# asserts they appear exactly once. Sidecar versions (esbuild, duckdb) live in
-# docker/install-sidecars.sh.
+# One celld, one Caddy, one Node, one jup and one bun pin;
+# docker/check-versions.ts asserts they appear exactly once. Sidecar versions
+# (esbuild, duckdb) live in docker/install-sidecars.sh.
 ARG CELLD_VERSION=0.6.0
 ARG CADDY_VERSION=2.10.0
 ARG NODE_VERSION=24.21.0
+# jup (https://github.com/unjs/jup) runs the tenant's npm, pnpm or Yarn at
+# the version the project pins. The npm tarball's sha512, as hex.
+ARG JUP_VERSION=0.6.3
+ARG JUP_SHA512=5b1c2ed95edc02d521a511a4cfc5027a54dc674e29afcfca9c7ad55b285d346c4c4c1c5ed65985e0fa5a758ceaf6c32663b18d117a7d071ce29c56989f63988f
 
 FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
 
@@ -65,9 +69,13 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 ARG TARGETARCH
 ARG CADDY_VERSION
 ARG NODE_VERSION
+ARG JUP_VERSION
+ARG JUP_SHA512
 # bun: tenant `bun install` / builds. node: real Node (not bun's shim) for
 # tenant steps that need it, e.g. loading `cloudflare.config.ts` (the `cf`
-# CLI config needs Node's module hooks); only the binary, no npm.
+# CLI config needs Node's module hooks); only the binary, no npm. jup:
+# npm, pnpm and Yarn for tenants that use them, downloaded and verified per
+# app at build time (SPEC, Package managers); plain JS on that Node.
 # nftables: the tenant egress policy (SPEC, Egress policy). git: the Git
 # smart-HTTP adapter and deploy worktrees. S3 goes through the runner's
 # native client (no awscli, no Python).
@@ -87,7 +95,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
      esac \
   && curl -fsSL "https://nodejs.org/download/release/v${NODE_VERSION}/node-v${NODE_VERSION}-${NODE_PKG}.tar.xz" \
     | tar -xJ --no-same-owner -C /usr/local --strip-components=1 "node-v${NODE_VERSION}-${NODE_PKG}/bin/node" \
-  && node --version | grep -q "^v${NODE_VERSION%%.*}"
+  && node --version | grep -q "^v${NODE_VERSION%%.*}" \
+  && curl -fsSL -o /tmp/jup.tgz "https://registry.npmjs.org/jup/-/jup-${JUP_VERSION}.tgz" \
+  && echo "${JUP_SHA512}  /tmp/jup.tgz" | sha512sum -c - \
+  && mkdir -p /opt/jup && tar -xzf /tmp/jup.tgz --no-same-owner -C /opt/jup --strip-components=1 \
+  && rm /tmp/jup.tgz \
+  && ln -s /opt/jup/bin/jup.mjs /usr/local/bin/jup \
+  && jup --version \
+  && JUP_HOME=/tmp/jup-home jup enable --install-directory /usr/local/bin npm pnpm yarn \
+  && rm -rf /tmp/jup-home
 # Sandbox users (SPEC, Tenant isolation): builds and release commands run as `build`,
 # tenant fleets as `fleet`; the nft policy keys on these uids.
 RUN useradd -u 10010 -m -s /bin/sh build \

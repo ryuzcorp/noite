@@ -1,4 +1,5 @@
 pub mod accesslog;
+pub mod build_output;
 pub mod caddy;
 pub mod children;
 pub mod cmd;
@@ -14,6 +15,7 @@ pub mod isolation;
 pub mod loop_;
 pub mod logs;
 pub mod netisolation;
+pub mod package_manager;
 pub mod rehydrate;
 pub mod metrics;
 pub mod purge;

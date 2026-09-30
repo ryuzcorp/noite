@@ -1,0 +1,114 @@
+---
+title: Build
+description: How the runner builds a push — Vite, Rsbuild, custom build commands — and which config it deploys.
+---
+
+Every push to `main` builds on the Noite host, in the build sandbox. You do not need CI for Vite or Rsbuild apps; [deploy from CI](/apps/deploy#deploy-from-ci) when a build needs more than the host allows.
+
+## Steps
+
+| Step | Runs when | Command |
+| --- | --- | --- |
+| install | the tree has a `package.json` | `<manager> install` (devDependencies included) |
+| build | the Wrangler config has `build.command` | `sh -c "<command>"` in `build.cwd` |
+| build | otherwise, `package.json` has a `scripts.build` | `<manager> run build` |
+| convert | `cloudflare.config.ts` and no Wrangler config | `cloudflare.config.ts` → `wrangler.json` |
+| release | the Wrangler config has `release` | `sh -c "<release>"` |
+| deploy | always | `celld deploy` |
+
+Tools whose launcher asks for Node (`vite`, `rsbuild`) get the image's Node 24. The build sees your app's environment variables plus `CI=1`, `NODE_ENV=production` and `NO_COLOR=1`. Each install and build step is bounded by `RUNNER_BUILD_TIMEOUT_S` (300 s by default) and the worktree by `RUNNER_BUILD_MAX_MB`.
+
+## Package managers
+
+npm, pnpm, Yarn (1 and 2+) and Bun all work. The runner picks one per push:
+
+1. **A pin in `package.json`** — `"packageManager": "pnpm@10.18.0"` or `devEngines.packageManager` with a `version`. That exact release runs, Bun included.
+2. **No pin, a lockfile** — the manager that wrote it: `bun.lock`/`bun.lockb` → Bun, `pnpm-lock.yaml` → pnpm (the major its `lockfileVersion` needs), `yarn.lock` → Yarn 1 for a v1 lockfile, else the latest Yarn, `package-lock.json`/`npm-shrinkwrap.json` → npm.
+3. **Neither** — Bun.
+
+Bun ships in the image. Every other manager, and a pinned Bun, runs through [jup](https://github.com/unjs/jup), which downloads the release on first use, verifies it against the registry signature, and keeps it in your app's build cache (`RUNNER_BUILD_CACHE_MB`), so later pushes do not download it again. `npm`, `pnpm` and `yarn` are also on `PATH`, so package scripts and the `release` command can call them; unpinned, they follow the same choice as the install step.
+
+With `CI=1`, pnpm installs with `--frozen-lockfile` and Yarn 2+ with `--immutable`, so a lockfile that no longer matches `package.json` fails the install. pnpm 10 and later also fail on dependency build scripts you have not approved (`ERR_PNPM_IGNORED_BUILDS`): decide them in `pnpm-workspace.yaml`, for example `allowBuilds: { esbuild: false, workerd: false }` for a Cloudflare Vite app, which needs neither. Pin a version to make builds repeatable; the runner never edits your `package.json`. The deploy log names the manager and why: `▸ install: pnpm install (pnpm-lock.yaml)`.
+
+The **Deployments** tab logs each step as `▸ step: command`, followed by its output tail. A failed deploy names the step (`ERROR: build failed`), and the app panel shows the step and the first error line.
+
+## Which config deploys
+
+After a build, the runner deploys what the build produced, in this order:
+
+1. `dist/wrangler.json`, a deployable config the build wrote (Oxide writes one, on Vite and Rsbuild alike).
+2. Wrangler's deploy redirect, `.wrangler/deploy/config.json`, which `@cloudflare/vite-plugin` writes. The runner turns the config it points to into `dist/wrangler.json`: it keeps only the keys celld accepts, rewrites `main` and `assets.directory` relative to `dist/`, and applies `.assetsignore`.
+3. Otherwise, the source config: `wrangler.jsonc`, `wrangler.json` or `wrangler.toml` at the root, then the first one found below it.
+
+Without a build step, only the third applies. The deploy log names the config it used (`config: dist/wrangler.json (from …)`).
+
+## Vite with the Cloudflare plugin
+
+Use `@cloudflare/vite-plugin` exactly as you would for Cloudflare: the Worker, its bindings and the client build come from the same `wrangler.jsonc`.
+
+```jsonc title="wrangler.jsonc"
+{
+  "name": "my-app",
+  "main": "./src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "assets": { "binding": "ASSETS", "not_found_handling": "single-page-application" },
+}
+```
+
+```ts title="vite.config.ts"
+import { cloudflare } from "@cloudflare/vite-plugin";
+import { defineConfig } from "vite";
+
+export default defineConfig({ plugins: [cloudflare()] });
+```
+
+```json title="package.json"
+{
+  "type": "module",
+  "scripts": { "build": "vite build" },
+  "devDependencies": { "@cloudflare/vite-plugin": "^1.62.3", "vite": "^8.3.1" }
+}
+```
+
+Imports only Vite understands (`?raw`, `?url`, virtual modules) work, because the runner deploys Vite's bundle, not your source. Keep `vite build`'s output inside the project (the default `dist/`). One Worker per app, so `auxiliaryWorkers` are refused.
+
+## Static sites (Vite, Rsbuild, anything)
+
+A site with no Worker needs only a Wrangler config that points at the build output:
+
+```jsonc title="wrangler.jsonc"
+{
+  "name": "my-site",
+  "compatibility_date": "2026-09-01",
+  "assets": { "directory": "./dist", "not_found_handling": "single-page-application" },
+}
+```
+
+With `"scripts": { "build": "rsbuild build" }` (or `vite build`), the runner builds `dist/` and celld serves it.
+
+## Rsbuild with a Worker
+
+Add `main` and an `ASSETS` binding to the same config. The Worker is bundled from source by celld's esbuild, and the client by Rsbuild:
+
+```jsonc title="wrangler.jsonc"
+{
+  "name": "my-app",
+  "main": "./worker.ts",
+  "compatibility_date": "2026-09-01",
+  "assets": { "directory": "./dist", "binding": "ASSETS", "not_found_handling": "single-page-application" },
+}
+```
+
+For a Worker that itself needs the bundler (Oxide, framework plugins), have the build write `dist/wrangler.json`.
+
+## Custom build command
+
+Wrangler's `build` block replaces the `build` script, as it does for `wrangler deploy`:
+
+```jsonc title="wrangler.jsonc"
+{
+  "build": { "command": "bun run build:web && bun run build:worker", "cwd": "." },
+}
+```
+
+`cwd` must stay inside the project. The runner strips `build` and `release` before `celld deploy`, which refuses keys it does not know.

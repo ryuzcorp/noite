@@ -1,0 +1,17 @@
+minimumReleaseAgeExclude:
+  - "@cloudflare/vite-plugin@1.62.3"
+  - "@cloudflare/workerd-darwin-64@1.20260930.2"
+  - "@cloudflare/workerd-darwin-arm64@1.20260930.2"
+  - "@cloudflare/workerd-linux-64@1.20260930.2"
+  - "@cloudflare/workerd-linux-arm64@1.20260930.2"
+  - "@cloudflare/workerd-windows-64@1.20260930.2"
+  - miniflare@5.20260930.0-alpha
+  - workerd@1.20260930.2
+  - wrangler@4.145.0
+
+# pnpm 10+ fails a CI install on dependency build scripts nobody approved.
+# Neither is needed to build: esbuild ships its binary as an optional
+# platform package, and workerd only runs under `vite dev`.
+allowBuilds:
+  esbuild: false
+  workerd: false

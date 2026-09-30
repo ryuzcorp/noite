@@ -222,6 +222,12 @@ pub async fn ensure_fleet(
         "CELLD_ASSET_CACHE_BYTES",
         (cfg.fleet_asset_cache_mb * 1024 * 1024).to_string(),
     )
+    // In the fleet's own state dir: celld's default, /tmp/celld/asset-cache,
+    // is one directory for every node in the container, created 0700 by
+    // whichever starts first (the control node, as root), so a fleet serving
+    // assets as the fleet uid crash-looped on EACCES, and tenants would share
+    // one cache even when it opened.
+    .env("CELLD_ASSET_CACHE_DIR", format!("{state_dir}/asset-cache"))
     .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
     // Fleet telemetry -> Parquet in the fleet bucket (celld OTel, bucket
     // sink), the documented query path for request counts. The flush is the

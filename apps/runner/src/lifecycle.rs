@@ -1,12 +1,38 @@
 //! App lifecycle constants and pure helpers shared by API, reconcile, and deploy.
 
-/// Longest deploy step is bun install/build at 300s; stuck sweep must exceed that
-/// so an in-flight deploy is never marked failed while still working.
+/// Default install/build step bound is 300s (`RUNNER_BUILD_TIMEOUT_S`). The
+/// reconcile sweep skips apps whose deploy is claimed in this process, so a
+/// raised bound never fails a working deploy; the boot sweep only finds rows
+/// a previous process abandoned.
 pub const DEPLOY_STUCK_MS: i64 = 360_000;
 
 /// Tip-poll / DB in-flight window: skip spawning another deploy while a recent
 /// building|deploying row exists (Deploying lock is the hard gate).
 pub const DEPLOY_IN_FLIGHT_MS: i64 = 360_000;
+
+/// The last `max` bytes of `s`, cut forward to a char boundary: build output
+/// is full of multi-byte glyphs (`✓`, box drawing), and slicing through one
+/// panics.
+pub fn tail_utf8(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut start = s.len() - max;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
+/// Tool output without ANSI escape sequences (colors, cursor moves), for the
+/// plain-text deploy log.
+pub fn strip_ansi(s: &str) -> std::borrow::Cow<'_, str> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("ansi re")
+    });
+    re.replace_all(s, "")
+}
 
 /// True when two git SHAs name the same object (exact match only — prefix
 /// equality silently skipped real tip changes when bundle names were short).
@@ -60,6 +86,19 @@ pub fn hostname_ok(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_utf8_never_splits_a_char() {
+        // `✓` is 3 bytes; a 4-byte tail starts inside the first one.
+        assert_eq!(tail_utf8("✓✓", 4), "✓");
+        assert_eq!(tail_utf8("abc", 10), "abc");
+        assert_eq!(tail_utf8("abcdef", 3), "def");
+    }
+
+    #[test]
+    fn strip_ansi_removes_colors() {
+        assert_eq!(strip_ansi("\x1b[32m✓\x1b[39m built in \x1b[1m34ms\x1b[22m"), "✓ built in 34ms");
+    }
 
     #[test]
     fn custom_hostname_shape() {

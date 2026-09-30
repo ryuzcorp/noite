@@ -497,6 +497,7 @@ mod tests {
             stop_budget_ms: 25000,
             build_max_mb: 2048,
             build_cache_mb: 512,
+            build_timeout_s: 300,
             telemetry_retention_days: 14,
             otel_flush_ms: 30_000,
             build_uid: None,

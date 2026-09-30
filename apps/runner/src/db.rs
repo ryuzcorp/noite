@@ -615,11 +615,7 @@ pub async fn upsert_deploy(
             // Keep the tail — deploy logs grow with every push and the UI
             // collapsible must stay cheap.
             let combined = format!("{}{append_log}", existing.log);
-            let log = if combined.len() > 64 * 1024 {
-                combined[combined.len() - 64 * 1024..].to_string()
-            } else {
-                combined
-            };
+            let log = crate::lifecycle::tail_utf8(&combined, 64 * 1024).to_string();
             sqlx::query(
                 "UPDATE deploy SET status = ?, sha = COALESCE(?, sha), log = ?, updated_at = ? WHERE id = ?",
             )

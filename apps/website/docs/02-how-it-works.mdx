@@ -41,7 +41,7 @@ The bundled RustFS store provides this bucket with zero config; production uses 
 
 1. `git push` hits smart-HTTP at `git.<domain>/<slug>` (Basic `git` plus a profile API key).
 2. receive-pack writes the tip as `refs/heads/main/<sha>.bundle` plus the `MANIFEST.json` linearization point, so half-written pushes stay invisible.
-3. The runner checks out a worktree and runs sandboxed `bun install` / `bun run build` when declared. A `cloudflare.config.ts` is converted to Wrangler config when no Wrangler file exists.
+3. The runner checks out a worktree and runs the sandboxed install and build with the project's package manager (Bun by default; npm, pnpm and Yarn through jup) when declared. A `cloudflare.config.ts` is converted to Wrangler config when no Wrangler file exists.
 4. The optional `release` command runs (migrations). Noite strips its own `release` key before deploying; celld rejects unknown keys.
 5. `celld deploy` uploads, then the runner spawns the fleet or calls `POST /reload` on its internal listener.
 6. Caddy routes `{slug}.<domain>` to the fleet's port. Deploy logs keep a 64 KB tail; a past successful `<sha>` redeploys via rollback.
@@ -50,7 +50,7 @@ The bundled RustFS store provides this bucket with zero config; production uses 
 flowchart LR
   dev[git push] --> git[smart-HTTP]
   git --> bundle[tip bundle + MANIFEST]
-  bundle --> build[bun install / build]
+  bundle --> build[install / build]
   build --> releaseCmd[release]
   releaseCmd --> deploy[celld deploy]
   deploy --> reload[fleet spawn / reload]

@@ -32,6 +32,7 @@ interface RunnerApp {
 interface RunnerDeploy {
   sha: string | null;
   status: string;
+  log: string;
 }
 
 /** Attach a virtual WebAuthn authenticator (USB, resident key, verified)
@@ -133,12 +134,51 @@ export const waitForDeploy = async (
   }
 };
 
-/** Push the sample app (apps/noite/test) to the slug via stock git CLI.
- * Copies to a temp dir so the checkout's nested sample repo stays clean. */
-export const pushSampleApp = (apiKey: string): string => {
-  const dir = mkdtempSync(nodePath.join(tmpdir(), "noite-e2e-"));
+/** Create an app through the UI and mint an API key for pushing to it,
+ * under the registered session. */
+export const createAppWithKey = async (
+  page: Page,
+  request: APIRequestContext,
+  app: { name: string; slug: string }
+): Promise<{ apiKey: string; appId: string }> => {
+  await page.goto("/apps/new");
+  await page.locator("#create-name").fill(app.name);
+  await page.locator("#create-slug").fill(app.slug);
+  await page.getByRole("button", { name: "Create app" }).click();
+  await page.waitForURL("**/apps", { timeout: 30_000 });
+  const appId = await findAppId(request, app.slug);
+  if (appId === null) {
+    throw new Error(`app ${app.slug} was not created`);
+  }
+
+  await page.goto("/account");
+  await page
+    .locator('button[type="button"]', { hasText: "Create key" })
+    .click();
+  await page.locator("#key-name").fill(`${app.slug}-ci`);
+  await page
+    .locator('button[type="submit"]', { hasText: "Create key" })
+    .click();
+  await page.locator("text=Copy now — shown once").waitFor({ timeout: 30_000 });
+  const rawKey = await page.locator("code.break-all").first().textContent();
+  const apiKey = rawKey?.trim() ?? "";
+  if (apiKey.length === 0) {
+    throw new Error("no API key shown after Create key");
+  }
+  return { apiKey, appId };
+};
+
+/** Push a sample directory as a fresh one-commit repo to `slug` via stock
+ * git CLI. Copies to a temp dir so the checkout's nested sample repo stays
+ * clean; the sample's own .gitignore keeps node_modules and build output out. */
+export const pushAppDir = (
+  apiKey: string,
+  source: URL,
+  slug: string
+): string => {
+  const dir = mkdtempSync(nodePath.join(tmpdir(), `noite-${slug}-`));
   try {
-    cpSync(new URL("../test", import.meta.url), dir, { recursive: true });
+    cpSync(source, dir, { recursive: true });
     // The sample checkout is itself a repo — drop its history so the push
     // is a fresh repo + fresh commit (new deploy), like deploy.sh re-init.
     rmSync(nodePath.join(dir, ".git"), { force: true, recursive: true });
@@ -153,10 +193,10 @@ export const pushSampleApp = (apiKey: string): string => {
       "remote",
       "add",
       "origin",
-      `http://git:${apiKey}@${gitBase.replace(/^https?:\/\//u, "")}/${E2E_SLUG}`,
+      `http://git:${apiKey}@${gitBase.replace(/^https?:\/\//u, "")}/${slug}`,
     ]);
     git(["add", "-A"]);
-    git(["commit", "-m", "e2e deploy"], {
+    git(["commit", "-m", `${slug} deploy`], {
       GIT_AUTHOR_EMAIL: E2E_EMAIL,
       GIT_AUTHOR_NAME: E2E_NAME,
       GIT_COMMITTER_EMAIL: E2E_EMAIL,
@@ -168,6 +208,10 @@ export const pushSampleApp = (apiKey: string): string => {
     rmSync(dir, { force: true, recursive: true });
   }
 };
+
+/** Push the sample app (apps/noite/test) to the e2e slug. */
+export const pushSampleApp = (apiKey: string): string =>
+  pushAppDir(apiKey, new URL("../test", import.meta.url), E2E_SLUG);
 
 /** Read-only probe of the deployed sample (counter `?read=1` never advances). */
 export const readSampleApp = async (
