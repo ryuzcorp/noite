@@ -29,11 +29,16 @@ for v in "${!NOITE_@}"; do vars+=("$v=${!v}"); done
 vars+=("NOITE_REF=$sha")
 
 if [[ "$(id -u)" -ne 0 ]]; then
-  # sudo with the terminal as stdin runs the script in the foreground, where
-  # it can ask questions; `curl | sudo bash` runs it in the background, where
-  # a read from the terminal stops it for good.
+  # The script asks questions on the terminal, which only its foreground
+  # process group may read. sudo hands the terminal on only when it leads its
+  # own process group, and in `curl | bash` curl leads it: with use_pty (the
+  # default since sudo 1.9.14) the script then runs in the background of
+  # sudo's pty and cannot ask. Job control (set -m) starts sudo as its own
+  # foreground group instead of exec'ing it into curl's.
   command -v sudo >/dev/null || { echo "run as root: sudo is not installed" >&2; exit 1; }
   (: </dev/tty) 2>/dev/null || { echo "no terminal for sudo: run as root" >&2; exit 1; }
-  exec sudo env "${vars[@]}" bash -c "$script" "$name.sh" "$@" </dev/tty
+  set -m
+  sudo env "${vars[@]}" bash -c "$script" "$name.sh" "$@" </dev/tty
+  exit
 fi
 exec env "${vars[@]}" bash -c "$script" "$name.sh" "$@"
