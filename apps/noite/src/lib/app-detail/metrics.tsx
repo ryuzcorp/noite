@@ -654,7 +654,7 @@ export const MetricsCard = ({
               <h3 class="m-0 flex items-center gap-2 text-lg font-semibold">
                 Metrics · {windowLabel(hours)}
                 <span
-                  class="tooltip tooltip-right inline-flex opacity-60"
+                  class="tooltip tooltip-bottom sm:tooltip-right inline-flex opacity-60"
                   data-tip={`What celld OTel recorded · ${windowLabel(hours)}: request/cell-fetch/startup spans, execution ms, failed spans, and queued time. Errors come from the trace \`ok\` flag.`}
                 >
                   <Info />

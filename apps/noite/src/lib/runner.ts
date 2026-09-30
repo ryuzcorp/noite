@@ -264,6 +264,78 @@ export const runnerSetEnv = (id: string, name: string, value: string) =>
 export const runnerDeleteEnv = (id: string, name: string) =>
   runnerRpc<{ ok: boolean }>("env.delete", { id, name });
 
+export type ErrorStatus = "open" | "resolved" | "ignored";
+
+/** One grouped error: every occurrence sharing a fingerprint (the runner's
+ * `host/errors.rs`). `hourly` is the last 24 UTC hours, oldest first. */
+export interface RunnerErrorIssue {
+  count: number;
+  culprit: string;
+  fingerprint: string;
+  firstSeenUs: number;
+  firstSha: string | null;
+  handler: string;
+  hourly: number[];
+  kind: string;
+  lastSeenUs: number;
+  lastSha: string | null;
+  message: string;
+  regressed: boolean;
+  source: "uncaught" | "logged";
+  status: ErrorStatus;
+  statusAtUs: number | null;
+}
+
+export interface RunnerErrorFrame {
+  function: string;
+  inApp: boolean;
+  location: string;
+}
+
+/** One stored occurrence. Request fields are empty when the edge had no
+ * trace for it (e.g. the runner restarted in between). */
+export interface RunnerErrorEvent {
+  browser: string;
+  cell: string;
+  context: string;
+  frames: RunnerErrorFrame[];
+  handler: string;
+  httpStatus: number;
+  kind: string;
+  logs: string[];
+  message: string;
+  method: string;
+  os: string;
+  path: string;
+  sha: string;
+  source: "uncaught" | "logged";
+  traceId: string;
+  tsUs: number;
+}
+
+export interface RunnerErrorList {
+  counts: Record<ErrorStatus, number>;
+  issues: RunnerErrorIssue[];
+}
+
+export interface RunnerErrorDetail {
+  events: RunnerErrorEvent[];
+  issue: RunnerErrorIssue;
+}
+
+export const runnerListErrors = (id: string, status: ErrorStatus) =>
+  runnerRpc<RunnerErrorList>("errors.list", { id, status });
+
+export const runnerGetError = (id: string, fingerprint: string) =>
+  runnerRpc<RunnerErrorDetail>("errors.get", { fingerprint, id });
+
+export const runnerSetErrorStatus = (
+  id: string,
+  fingerprint: string,
+  status: ErrorStatus
+) =>
+  runnerRpc<{ ok: boolean }>("errors.set_status", { fingerprint, id, status });
+
 /** Custom hostnames attached to an app (all of them, in hostname order). */
 export const runnerListDomains = (id: string) =>
   runnerRpc<RunnerDomain[]>("domains.list", { id });

@@ -1,42 +1,19 @@
-//! App overview panel: header, status, actions, metrics.
-import { useRoute } from "@ilha/router";
+//! App page chrome and Overview: the header shown above every tab
+//! (identity, status, actions) and the Overview tab's cards.
 import { atom, watch } from "ilha";
 
 import { appHost, appUrl, initials, presenceTone } from "../apps";
 import { setDesired } from "../apps.server";
 import { errorMessage } from "../errors";
-import { ArrowLeft, ArrowUpRight, Pause, Play } from "../icons";
+import { ArrowLeft, ArrowUpRight, Code, Pause, Play } from "../icons";
 import { appDetail } from "../resources";
 import type { AppRole } from "../roles";
 import { AppHeaderSkeleton } from "../skeletons";
 import { sleep } from "../sleep";
 import { AppStorageList } from "../storage/list";
+import { DeployDropdown } from "./deploys";
+import { ErrorsSummary } from "./errors";
 import { MetricsCard } from "./metrics";
-
-/** Header status line, rendered from the already-fetched detail (no live
- * subscription — every overview visit used to open an infinite `list()`
- * stream, and unmount cleanup across tab switches is not guaranteed). */
-const LiveAppStatus = ({
-  app,
-}: {
-  app: { lastDeploySha: string | null; subdomain: string };
-}) => {
-  const url = appUrl(app.subdomain);
-  const host = appHost(app.subdomain);
-  return (
-    <p class="m-0 opacity-70">
-      <a class="link" href={url} target="_blank" rel="noreferrer">
-        {host}
-      </a>
-      {app.lastDeploySha ? " · " : " · not deployed"}
-      {app.lastDeploySha ? (
-        <span class="tooltip font-mono" data-tip={app.lastDeploySha}>
-          {app.lastDeploySha.slice(0, 12)}
-        </span>
-      ) : null}
-    </p>
-  );
-};
 
 export interface AppDetailInfo {
   app: {
@@ -57,10 +34,70 @@ export interface AppDetailInfo {
   username: string;
 }
 
-export const AppDetailPanel = () => {
-  const { params } = useRoute();
-  const { id } = params();
-  const res = appDetail(id ?? "");
+const SHA_CHARS = 7;
+const CONVERGE_POLLS = 20;
+const CONVERGE_INTERVAL_MS = 3000;
+
+const STATUS_LABELS = new Map([
+  ["running", "Running"],
+  ["sleeping", "Sleeping"],
+  ["stopped", "Stopped"],
+  ["deploying", "Deploying"],
+  ["building", "Building"],
+  ["failed", "Failed"],
+  ["error", "Error"],
+]);
+
+const statusLabel = (status: string): string =>
+  STATUS_LABELS.get(status) ?? status;
+
+const BackToApps = () => (
+  <a
+    href="/apps"
+    class="link link-hover inline-flex w-fit items-center gap-1 text-sm opacity-70"
+  >
+    <ArrowLeft />
+    Apps
+  </a>
+);
+
+/** Status · host · commit, under the app name. The full SHA sits in a
+ * native `title` (a daisyUI tooltip's hidden pseudo-element widened the
+ * page on phones). */
+const IdentityLine = ({ app }: { app: AppDetailInfo["app"] }) => (
+  <p class="m-0 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm">
+    <span class="inline-flex items-center gap-1.5">
+      <span class={`status ${presenceTone(app.status)}`} aria-hidden="true" />
+      {statusLabel(app.status)}
+    </span>
+    <span class="opacity-30" aria-hidden="true">
+      ·
+    </span>
+    <a
+      class="link link-hover min-w-0 truncate opacity-80"
+      href={appUrl(app.subdomain)}
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      {appHost(app.subdomain)}
+    </a>
+    <span class="opacity-30" aria-hidden="true">
+      ·
+    </span>
+    {app.lastDeploySha ? (
+      <span class="font-mono opacity-70" title={app.lastDeploySha}>
+        {app.lastDeploySha.slice(0, SHA_CHARS)}
+      </span>
+    ) : (
+      <span class="opacity-70">Not deployed</span>
+    )}
+  </p>
+);
+
+/** Header above every tab: which app, whether it's up, and what you can do
+ * with it (visit, browse code, start/stop, deploy). */
+export const AppHeader = ({ appId }: { appId: string }) => {
+  const res = appDetail(appId);
   const notice = atom<string | null>(null);
   const converging = atom<string | null>(null);
 
@@ -74,7 +111,7 @@ export const AppDetailPanel = () => {
       return;
     }
     try {
-      for (let i = 0; i < 20; i += 1) {
+      for (let i = 0; i < CONVERGE_POLLS; i += 1) {
         if (signal.aborted) {
           return;
         }
@@ -87,7 +124,7 @@ export const AppDetailPanel = () => {
           break;
         }
         // oxlint-disable-next-line eslint/no-await-in-loop -- sequential converge poll; parallel makes no sense here
-        await sleep(3000);
+        await sleep(CONVERGE_INTERVAL_MS);
       }
     } finally {
       if (!signal.aborted) {
@@ -96,106 +133,86 @@ export const AppDetailPanel = () => {
     }
   });
 
-  if (!id) {
-    return (
-      <div class="flex flex-col gap-2">
-        <p class="text-error">Missing app id</p>
-        <a href="/" class="link">
-          Back
-        </a>
-      </div>
-    );
-  }
   const info = res.data();
   if (res.loading() && info === undefined) {
     return (
-      <div class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-        <div class="card-body gap-4">
-          <AppHeaderSkeleton />
-        </div>
-      </div>
+      <header class="flex flex-col gap-3">
+        <BackToApps />
+        <AppHeaderSkeleton />
+      </header>
     );
   }
   const loadError = res.error();
-  if (loadError && !info) {
-    return (
-      <div class="flex flex-col gap-2">
-        <p class="text-error">{errorMessage(loadError)}</p>
-        <a href="/" class="link">
-          Back
-        </a>
-      </div>
-    );
-  }
   if (!info) {
-    return null;
+    return (
+      <header class="flex flex-col gap-3">
+        <BackToApps />
+        <p class="text-error m-0">
+          {loadError ? errorMessage(loadError) : "App not found"}
+        </p>
+      </header>
+    );
   }
   const { app } = info;
   const canPush = info.myRole === "push" || info.myRole === "admin";
+  const running = app.desiredState === "running";
 
   return (
-    <div class="flex flex-col gap-4">
-      <div class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-        <div class="card-body gap-4">
-          <a
-            href="/apps"
-            class="link link-hover inline-flex w-fit items-center gap-1 text-sm opacity-70"
-          >
-            <ArrowLeft />
-            Apps
-          </a>
-          <div class="flex items-center justify-between gap-2">
-            <div class="flex items-center gap-3">
-              <div class="avatar avatar-placeholder shrink-0">
-                <div class="bg-neutral text-neutral-content w-10 rounded-full">
-                  <span class="text-sm">{initials(app.name)}</span>
-                </div>
-                <span
-                  class={`status ${presenceTone(app.status)} absolute right-0 bottom-0`}
-                  title={app.status}
-                />
-              </div>
-              <div>
-                <h1 class="m-0 text-lg font-semibold">{app.name}</h1>
-                <LiveAppStatus app={app} />
-              </div>
-            </div>
-            <div class="flex shrink-0 flex-wrap gap-2">
-              <a
-                href={appUrl(app.subdomain)}
-                target="_blank"
-                rel="noopener noreferrer"
-                class="btn btn-sm"
-              >
-                <span class="inline-flex items-center gap-1">
-                  <ArrowUpRight />
-                  Visit
-                </span>
-              </a>
-              {canPush ? (
-                <button
-                  type="button"
-                  class="btn btn-sm"
-                  onclick={async () => {
-                    const next =
-                      app.desiredState === "running" ? "stopped" : "running";
-                    try {
-                      await setDesired({ desiredState: next, id: app.id });
-                      notice.set(null);
-                      converging.set(next);
-                    } catch (error) {
-                      notice.set(errorMessage(error));
-                    }
-                  }}
-                >
-                  <span class="inline-flex items-center gap-1">
-                    {app.desiredState === "running" ? <Pause /> : <Play />}
-                    {app.desiredState === "running" ? "Stop" : "Start"}
-                  </span>
-                </button>
-              ) : null}
+    <header class="flex flex-col gap-3">
+      <BackToApps />
+      <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
+        <div class="flex min-w-0 items-center gap-3">
+          <div class="avatar avatar-placeholder shrink-0">
+            <div class="bg-neutral text-neutral-content w-11 rounded-full">
+              <span>{initials(app.name)}</span>
             </div>
           </div>
+          <div class="min-w-0">
+            <h1 class="m-0 truncate text-xl font-semibold">{app.name}</h1>
+            <IdentityLine app={app} />
+          </div>
+        </div>
+        <div class="flex shrink-0 flex-wrap items-center gap-2">
+          <a
+            href={appUrl(app.subdomain)}
+            target="_blank"
+            rel="noopener noreferrer"
+            class="btn btn-sm"
+          >
+            <span class="inline-flex items-center gap-1">
+              <ArrowUpRight />
+              Visit
+            </span>
+          </a>
+          <a href={`/apps/${appId}/source`} class="btn btn-sm">
+            <span class="inline-flex items-center gap-1">
+              <Code />
+              Code
+            </span>
+          </a>
+          {canPush ? (
+            <button
+              type="button"
+              class="btn btn-sm"
+              disabled={converging() !== null}
+              onclick={async () => {
+                const next = running ? "stopped" : "running";
+                try {
+                  await setDesired({ desiredState: next, id: app.id });
+                  notice.set(null);
+                  converging.set(next);
+                } catch (error) {
+                  notice.set(errorMessage(error));
+                }
+              }}
+            >
+              <span class="inline-flex items-center gap-1">
+                {running ? <Pause /> : <Play />}
+                {running ? "Stop" : "Start"}
+              </span>
+            </button>
+          ) : null}
+          <DeployDropdown appId={appId} />
         </div>
       </div>
       {notice() ? (
@@ -203,13 +220,20 @@ export const AppDetailPanel = () => {
           <span>{notice()}</span>
         </div>
       ) : null}
-
       {app.lastError ? (
-        <p class="text-error m-0 text-sm">{app.lastError}</p>
+        <div class="alert alert-error alert-soft m-0 py-2" role="alert">
+          <span class="text-sm break-words">{app.lastError}</span>
+        </div>
       ) : null}
-
-      <MetricsCard appId={app.id} viewAllHref={`/apps/${app.id}?t=metrics`} />
-      <AppStorageList appId={app.id} />
-    </div>
+    </header>
   );
 };
+
+/** Overview tab: usage, open errors, storage. */
+export const AppDetailPanel = ({ appId }: { appId: string }) => (
+  <div class="flex flex-col gap-4">
+    <MetricsCard appId={appId} viewAllHref={`/apps/${appId}?t=metrics`} />
+    <ErrorsSummary appId={appId} />
+    <AppStorageList appId={appId} />
+  </div>
+);

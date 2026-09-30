@@ -5,21 +5,23 @@
 
 /** App header: avatar circle + title lines + action buttons. */
 export const AppHeaderSkeleton = () => (
-  <div role="status" aria-label="Loading app" class="flex flex-col gap-4">
-    <div class="flex items-center justify-between gap-2">
-      <div class="flex items-center gap-3">
-        <div class="skeleton h-12 w-12 shrink-0 rounded-full" />
-        <div class="flex flex-col gap-2">
-          <div class="skeleton h-6 w-40" />
-          <div class="skeleton h-4 w-56" />
-        </div>
-      </div>
-      <div class="flex shrink-0 gap-2">
-        <div class="skeleton h-8 w-24" />
-        <div class="skeleton h-8 w-20" />
+  <div
+    role="status"
+    aria-label="Loading app"
+    class="flex flex-wrap items-center justify-between gap-x-4 gap-y-3"
+  >
+    <div class="flex items-center gap-3">
+      <div class="skeleton h-11 w-11 shrink-0 rounded-full" />
+      <div class="flex flex-col gap-2">
+        <div class="skeleton h-6 w-40" />
+        <div class="skeleton h-4 w-56" />
       </div>
     </div>
-    <div class="skeleton h-44 w-full" />
+    <div class="flex shrink-0 gap-2">
+      <div class="skeleton h-8 w-20" />
+      <div class="skeleton h-8 w-20" />
+      <div class="skeleton h-8 w-24" />
+    </div>
   </div>
 );
 

@@ -324,6 +324,22 @@ const TENANT_PROXY: &[&str] = &[
 /// itself, and `Retry-After` for API clients, instead of Caddy's empty error.
 /// celld's own 503s (load shedding) are responses, not errors, and pass
 /// through unchanged.
+/// Trace id per tenant request, from the request's UUID with the dashes
+/// dropped (32 hex = a W3C trace id; the last 16 double as the parent span
+/// id). Not Caddy's `tracing` directive: that one always runs an OTLP
+/// exporter (it dials 127.0.0.1:4317 every few seconds, whatever
+/// `OTEL_TRACES_EXPORTER` says), and an always-off sampler would mark the
+/// trace unsampled, which celld's parent-based sampler honours by recording
+/// nothing. `request_header` replaces any client-sent `traceparent`, so a
+/// client cannot pick the id an error is filed under.
+const TENANT_TRACE: &[&str] = &[
+    "map {http.request.uuid} {noite_trace} {noite_span} {",
+    "\t~^([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})$ \"${1}${2}${3}${4}${5}\" \"${4}${5}\"",
+    "}",
+    "request_header traceparent \"00-{noite_trace}-{noite_span}-01\"",
+    "log_append traceID {noite_trace}",
+];
+
 const TENANT_STARTING: &[&str] = &[
     "handle_errors 502 503 {",
     "\theader Retry-After 5",
@@ -355,8 +371,14 @@ fn tenant_proxy(app: &App) -> &'static [&'static str] {
 /// `/v1/edge/wake` spawns the fleet and waits for its health gate, then
 /// proxies it as if the app had never slept. The header timeout sits above
 /// the runner's own wake budget, so Caddy never gives up first.
+///
+/// Every tenant request also carries a W3C `traceparent` that celld adopts
+/// as its span's trace id, and the access log records the same `traceID`:
+/// the error ingest joins an exception to its method, path and status that
+/// way (host/errors.rs).
 fn tenant_site_extra(cfg: &Config, app: &App) -> Vec<String> {
-    let mut lines: Vec<String> = TENANT_STARTING.iter().map(|l| (*l).to_string()).collect();
+    let mut lines: Vec<String> = TENANT_TRACE.iter().map(|l| (*l).to_string()).collect();
+    lines.extend(TENANT_STARTING.iter().map(|l| (*l).to_string()));
     if app.is_asleep() {
         lines.push(format!("forward_auth {} {{", cfg.caddy_api_upstream));
         lines.push("\turi /v1/edge/wake".into());
@@ -549,9 +571,13 @@ mod tests {
             let block = site(addr);
             assert!(block.contains("health_uri /.well-known/celld/health"), "{addr} ungated:\n{block}");
             assert!(block.contains("handle_errors 502 503"), "{addr} has no starting page:\n{block}");
+            // Error ingest join (host/errors.rs): trace id sent and logged.
+            assert!(block.contains("request_header traceparent"), "{addr} sends no trace:\n{block}");
+            assert!(block.contains("log_append traceID"), "{addr} logs no trace:\n{block}");
         }
         for addr in ["app.noite.now", "api.noite.now", "git.noite.now"] {
             assert!(!site(addr).contains("health_uri"), "{addr} must not be gated");
+            assert!(!site(addr).contains("traceparent"), "{addr} is not a tenant");
         }
     }
 

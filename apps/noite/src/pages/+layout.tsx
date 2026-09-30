@@ -35,13 +35,25 @@ export default defineLayout(({ children }) => {
       <div class="drawer lg:drawer-open">
         <input id="nav-drawer" type="checkbox" class="drawer-toggle" />
         <div class="drawer-content bg-base-200 dark:bg-base-100 flex min-h-screen flex-1 flex-col">
-          <label
-            for="nav-drawer"
-            class="btn btn-sm btn-ghost fixed top-3 left-3 z-40 lg:hidden"
-            aria-label="Open menu"
-          >
-            <MenuIcon class="h-5 w-5" />
-          </label>
+          {/* Phones: a real top bar instead of a floating button, so the
+              menu toggle never sits on top of page content. */}
+          <div class="bg-base-200/90 dark:bg-base-100/90 border-base-300 sticky top-0 z-40 flex items-center gap-2 border-b px-2 py-2 backdrop-blur lg:hidden">
+            <label
+              for="nav-drawer"
+              class="btn btn-sm btn-ghost btn-square"
+              aria-label="Open menu"
+            >
+              <MenuIcon class="h-5 w-5" />
+            </label>
+            <a href="/apps" class="inline-flex" aria-label="Noite dashboard">
+              <img src="/logo.svg" alt="" class="h-5 w-auto dark:hidden" />
+              <img
+                src="/logo-dark.svg"
+                alt=""
+                class="hidden h-5 w-auto dark:block"
+              />
+            </a>
+          </div>
           {children}
         </div>
         <div class="drawer-side">

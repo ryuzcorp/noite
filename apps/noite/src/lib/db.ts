@@ -2,7 +2,7 @@ import type { D1Database } from "@cloudflare/workers-types";
 import { D1Client } from "@effect/sql-d1";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { SqlClient } from "effect/sql/SqlClient";
+import type { SqlClient } from "effect/sql/SqlClient";
 import { Kysely } from "kysely";
 import { D1Dialect } from "kysely-d1";
 import { useEnv } from "oxidejs";
@@ -211,23 +211,11 @@ export const getAuthDb = () =>
 /** D1-backed SqlClient layer for the resolved binding. */
 export const sqlLive = () => D1Client.layer({ db: resolveD1() });
 
-/** The setup pass itself: migrations, the schema heal, and the one-time
- * admin bootstrap below. `ensureDb` runs it at most once per isolate. */
+/** The setup pass itself: the migration and the admin bootstrap below.
+ * `ensureDb` runs it at most once per isolate. No upgrade paths: a schema
+ * change edits `schema` in place and installs are wiped, not migrated. */
 const runDbSetup = Effect.gen(function* runDbSetup() {
   yield* migrator.migrate;
-  // The migrator tracks a single plan id, so a DB created under an older
-  // schema version skips tables added later (e.g. app_collaborator) while
-  // reporting success. Heal by ensuring every current-schema table/index
-  // exists — a no-op on fresh or up-to-date DBs.
-  const sql = yield* SqlClient;
-  for (const plan of migrator.sql()) {
-    for (const stmt of plan.statements) {
-      const healed = stmt.sql
-        .replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-        .replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ");
-      yield* sql.unsafe(healed, stmt.parameters);
-    }
-  }
   // Instance admin bootstrap (runs once per process at startup): if
   // NOITE_ADMIN_EMAIL names an already-registered account, ensure it
   // holds the admin role. No-op when unset or not yet registered.
@@ -250,7 +238,7 @@ const runDbSetup = Effect.gen(function* runDbSetup() {
  * pass is still running awaits that same pass instead of starting another.
  * The old `migrated.done` flag was only set *after* the work finished, so
  * every request already in flight on a cold isolate replayed the whole pass —
- * migrations plus the schema-heal plan, tens of statements each — against a
+ * the migration, tens of statements — against a
  * single-threaded D1 cell. A failed pass clears the cache so the next request
  * retries; a cold isolate still pays it once. */
 let setupOnce: Promise<void> | undefined;

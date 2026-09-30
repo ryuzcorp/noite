@@ -1,12 +1,11 @@
 -- Noite runner schema — ONE idempotent file, applied at every boot
 -- (`db::connect`), with no migration ledger: every statement is
--- CREATE ... IF NOT EXISTS, so a fresh database is built and an existing one
--- is upgraded in place. Nothing to order, nothing to checksum, nothing to
--- rewrite when a table changes shape.
+-- CREATE ... IF NOT EXISTS, so a fresh database gets the whole shape.
 --
--- A table that goes away is DROPPED here (DROP TABLE IF EXISTS) rather than
--- versioned away: this file is the single source of truth for the runner's
--- shape, and leaving orphan tables around would only invite accidental reads.
+-- No upgrade paths: there is one install and it is wiped rather than
+-- migrated (SPEC, no v1 compatibility). A shape change edits the CREATE
+-- statement in place; a table that goes away is deleted from this file.
+-- Nothing here ALTERs or DROPs.
 
 -- Apps: one row per tenant app. Hard DELETE is the only remove path.
 CREATE TABLE IF NOT EXISTS app (
@@ -24,7 +23,12 @@ CREATE TABLE IF NOT EXISTS app (
   last_error TEXT,
   desired_state TEXT NOT NULL DEFAULT 'running',
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  -- Scale to zero (SPEC, Scale to zero): parked since / last woken.
+  asleep_since TEXT,
+  woke_at TEXT,
+  -- The Wrangler config (JSON) the last successful deploy uploaded.
+  deployed_config TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_app_user ON app(user_id);
@@ -42,16 +46,10 @@ CREATE TABLE IF NOT EXISTS deploy (
 
 CREATE INDEX IF NOT EXISTS idx_deploy_app ON deploy(app_id);
 
--- Per-app usage metrics, edge analytics, span stats, log ring, watermarks and
--- compaction state live in metrics.sqlite (db::METRICS_SCHEMA), ATTACHed as
--- `metrics` — never in this snapshotted file (spec T4.1). Dropped here so an
--- existing database migrates its rows once (db::connect) and stops
--- dirtying `data_version` on every telemetry tick.
-DROP TABLE IF EXISTS app_metric;
-DROP TABLE IF EXISTS app_device_stat;
-DROP TABLE IF EXISTS app_path_stat;
-DROP TABLE IF EXISTS app_ref_stat;
-DROP TABLE IF EXISTS metric_watermark;
+-- Per-app usage metrics, edge analytics, span stats, log ring, errors,
+-- watermarks and compaction state live in metrics.sqlite
+-- (db::METRICS_SCHEMA), ATTACHed as `metrics` — never in this snapshotted
+-- file (spec T4.1).
 
 -- Tenant env vars (CF `.dev.vars` model). Names starting with `FLAG_`
 -- are feature flags: the settings UI renders them as on/off toggles
@@ -63,9 +61,6 @@ CREATE TABLE IF NOT EXISTS app_env (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (app_id, name)
 );
-
--- Edge analytics tables (device/path/ref) also live in metrics.sqlite now;
--- see the note above. Their DDL moved to db::METRICS_SCHEMA.
 
 -- Tenant app events (LogSnag-style): channel-grouped event log, user
 -- property profiles, and latest-value insight widgets. Ingest comes through
@@ -117,8 +112,6 @@ CREATE TABLE IF NOT EXISTS app_domain (
 );
 
 CREATE INDEX IF NOT EXISTS idx_app_domain_app ON app_domain(app_id);
-
--- Telemetry watermark also lives in metrics.sqlite now (see above).
 
 -- Scoped per-app credentials (SPEC, Scoped credentials): one encrypted row per
 -- app. Nonce + AES-GCM ciphertext over JSON {access_key, secret_key}; the KEK

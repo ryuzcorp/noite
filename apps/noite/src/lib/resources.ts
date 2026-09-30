@@ -16,7 +16,9 @@ import {
   deployLog as fetchDeployLog,
   d1Preview as fetchD1Preview,
   doPreview as fetchDoPreview,
+  errorDetail as fetchErrorDetail,
   get,
+  listErrors,
   listAppStorage,
   listCollaborators,
   listDomains,
@@ -27,7 +29,7 @@ import {
   r2List as fetchR2List,
 } from "./apps.server";
 import { authClient } from "./auth-client";
-import type { D1Preview, DoPreview, R2Preview } from "./runner";
+import type { D1Preview, DoPreview, ErrorStatus, R2Preview } from "./runner";
 import { clearSwrStore, withSnapshot, writeSwr } from "./swr-store";
 
 export { invalidate } from "ilha";
@@ -89,6 +91,9 @@ export const keys = {
     `app:${appId}:do:${className}`,
   domains: (id: string) => `app:${id}:domains`,
   envVars: (id: string) => `app:${id}:env`,
+  errorDetail: (appId: string, fingerprint: string) =>
+    `app:${appId}:error:${fingerprint}`,
+  errors: (id: string, status: ErrorStatus) => `app:${id}:errors:${status}`,
   inviteCodes: "me:invites",
   myInvitations: "me:collaborator-invitations",
   passkeys: "me:passkeys",
@@ -130,6 +135,16 @@ export const domains = (id: string) =>
 
 export const envVars = (id: string) =>
   tracked(keys.envVars(id), () => listEnv(id));
+
+/** Grouped errors in one status (open / resolved / ignored). */
+export const errorList = (appId: string, status: ErrorStatus) =>
+  tracked(keys.errors(appId, status), () => listErrors({ appId, status }));
+
+/** One error with its latest occurrences. */
+export const errorDetail = (appId: string, fingerprint: string) =>
+  tracked(keys.errorDetail(appId, fingerprint), () =>
+    fetchErrorDetail({ appId, fingerprint })
+  );
 
 /** What the UI renders from the session — and all it may persist. The
  * better-auth payload carries the session token (the httpOnly cookie's

@@ -269,7 +269,7 @@ An app with no requests for a day stops costing anything, and the next request b
   - the last minute bucket with requests in `metrics.app_metric` (celld `celld.fetch` spans, i.e. real requests);
   - the app's last wake (`app.woke_at`);
   - its last deploy. So a fresh deploy or a manual start gets a full window before it can sleep.
-- **Asleep is not stopped.** `desired_state` stays `running` (the owner's intent). Sleep is its own column, `app.asleep_since` (added with `db::ensure_column`), and `status` reads `sleeping` for the UI. A stopped app never sleeps or wakes, and stopping an asleep app clears the flag.
+- **Asleep is not stopped.** `desired_state` stays `running` (the owner's intent). Sleep is its own column, `app.asleep_since`, and `status` reads `sleeping` for the UI. A stopped app never sleeps or wakes, and stopping an asleep app clears the flag.
 - **Going to sleep** (per-app transition lock), in this order:
   1. mark the app asleep;
   2. rewrite the Caddyfile so its sites wake on demand;
@@ -286,7 +286,7 @@ An app with no requests for a day stops costing anything, and the next request b
 
 ### Runner schema evolution
 
-One idempotent `apps/runner/schema.sql`, embedded and applied every boot: no migration ledger. New tables go in it with `CREATE … IF NOT EXISTS`; new columns on existing tables go through `db::ensure_column` (SQLite has no `ADD COLUMN IF NOT EXISTS`).
+One idempotent `apps/runner/schema.sql`, embedded and applied every boot: no migration ledger and no upgrade paths. Installs are wiped rather than migrated, so a new table or column goes straight into its `CREATE … IF NOT EXISTS` and a retired one is deleted from the file; nothing there ALTERs or DROPs (a bare `DROP` would resolve into the ATTACHed `metrics.sqlite`). The control UI's D1 schema follows the same rule.
 
 ## celld alignment
 
@@ -303,7 +303,7 @@ The docs at https://celld.dev/docs/ are the source of truth. What Noite relies o
 ## Worker code rules
 
 - **Nothing crosses requests.** No promise, timer or Effect runtime may be shared between requests unless it is registered with `ctx.waitUntil` or its waiters are time-bounded. celld drops a request's pending work when the request answers or its client leaves, and anything still waiting on that work hangs forever without an error.
-- **Isolate-level setup runs once, concurrently-safe.** `ensureDb` (migrations, schema heal, backfills) is memoized behind an in-flight-aware promise (`apps/noite/src/lib/db.ts`); a request waits at most 5 s on a pass another request started, then runs its own. D1 work is bounded (setup 15 s, `withDb` 10 s).
+- **Isolate-level setup runs once, concurrently-safe.** `ensureDb` (the migration and admin bootstrap) is memoized behind an in-flight-aware promise (`apps/noite/src/lib/db.ts`); a request waits at most 5 s on a pass another request started, then runs its own. D1 work is bounded (setup 15 s, `withDb` 10 s).
 - **Actions are bounded.** `actions.timeout: 15_000` in `apps/noite/vite.config.ts` answers a stuck action with a JSON-RPC error before the edge's 30 s timeout.
 - **Do not write to a live D1 with the `celld d1` CLI.** In the lane, one `celld d1 execute` against the control node's D1 while the UI ran made every later page load hang. The D1 storage browser (`host/storage/d1.rs`) shells out the same way against a tenant's D1; check whether browsing a D1 stalls the app it inspects.
 

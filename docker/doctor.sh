@@ -80,7 +80,9 @@ else
 fi
 
 check "runner API auth" api -H "Authorization: Bearer ${TOKEN}" "${API}/v1/apps"
-check "edge serves the control UI" sh -c "curl -fs -H 'Host: localhost' '${EDGE}/' | grep -qi '<html'"
+# Ask for HTML like a browser: the control worker's page router answers a
+# bare `Accept: */*` with 404 (API routes and assets are unaffected).
+check "edge serves the control UI" sh -c "curl -fs -H 'Host: localhost' -H 'Accept: text/html' '${EDGE}/' | grep -qi '<html'"
 check "control auth routes" sh -c "curl -fs -H 'Host: localhost' '${EDGE}/api/auth/ok' | grep -q ok"
 
 # celld's own view of the control fleet: leases, peers, advertised addresses.

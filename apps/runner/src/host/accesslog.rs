@@ -6,7 +6,9 @@
 //! (browser, os) pair, and accumulates hour buckets in SQLite.
 //!
 //! Privacy: only the classified pair is stored — raw user-agents and
-//! client IPs never leave this module (neither is parsed).
+//! client IPs never leave this module (neither is parsed). The error index
+//! (trace id → method, query-less path, status, device pair) holds the same
+//! fields, in memory only.
 //!
 //! Offset tracking survives restarts via a sidecar file next to the log
 //! (`access-log.offset`, holding `ino:off`). Caddy opens the log O_APPEND,
@@ -21,6 +23,7 @@ use sqlx::SqlitePool;
 use crate::config::Config;
 use crate::db;
 use crate::host::edge::parse_edge_slug;
+use crate::host::errors::{RequestCtx, RequestIndex};
 
 /// Log lines are tiny; past this the file is truncated after consuming.
 const TRUNCATE_BYTES: u64 = 2 * 1024 * 1024;
@@ -210,12 +213,20 @@ fn ref_source(referrer: &str) -> String {
     host.chars().take(64).collect()
 }
 
-/// One parsed line: (app_id, hour bucket, browser, os, path, ref source).
-fn parse_line(
-    line: &str,
-    cfg: &Config,
-    slug_id: &HashMap<String, String>,
-) -> Option<(String, String, &'static str, &'static str, String, String)> {
+/// One parsed tenant line.
+struct Line {
+    app_id: String,
+    bucket: String,
+    browser: &'static str,
+    os: &'static str,
+    path: String,
+    source: String,
+    /// The `traceID` tenant sites log (host/caddy.rs `TENANT_TRACE`) with
+    /// the request it names, for the error ingest (host/errors.rs).
+    trace: Option<(String, RequestCtx)>,
+}
+
+fn parse_line(line: &str, cfg: &Config, slug_id: &HashMap<String, String>) -> Option<Line> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let host = v
         .pointer("/request/host")
@@ -235,14 +246,33 @@ fn parse_line(
     let source = ref_source(first_header(&v, "Referer"));
     let ts = v.pointer("/ts").and_then(|x| x.as_f64()).unwrap_or(0.0) as i64;
     let (browser, os) = device_classify(ua);
-    Some((
+    let trace = v
+        .pointer("/traceID")
+        .and_then(|x| x.as_str())
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            let method = v
+                .pointer("/request/method")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .chars()
+                .take(16)
+                .collect();
+            let status = v.pointer("/status").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            (
+                t.to_string(),
+                RequestCtx { method, path: path.to_string(), status, browser, os },
+            )
+        });
+    Some(Line {
         app_id,
-        hour_bucket(ts),
+        bucket: hour_bucket(ts),
         browser,
         os,
-        path.to_string(),
+        path: path.to_string(),
         source,
-    ))
+        trace,
+    })
 }
 
 /// First value of a Caddy JSON header (arrays) or the plain string.
@@ -273,6 +303,7 @@ pub async fn tick(
     pool: &SqlitePool,
     cfg: &Config,
     slug_id: &HashMap<String, String>,
+    requests: &mut RequestIndex,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -306,10 +337,13 @@ pub async fn tick(
         let Ok(text) = std::str::from_utf8(line) else {
             continue;
         };
-        if let Some((app_id, bucket, browser, os, path, source)) = parse_line(text, cfg, slug_id) {
-            db::add_app_device(pool, &app_id, &bucket, browser, os).await?;
-            db::add_app_path(pool, &app_id, &bucket, &path).await?;
-            db::add_app_ref(pool, &app_id, &bucket, &source).await?;
+        if let Some(l) = parse_line(text, cfg, slug_id) {
+            db::add_app_device(pool, &l.app_id, &l.bucket, l.browser, l.os).await?;
+            db::add_app_path(pool, &l.app_id, &l.bucket, &l.path).await?;
+            db::add_app_ref(pool, &l.app_id, &l.bucket, &l.source).await?;
+            if let Some((trace_id, ctx)) = l.trace {
+                requests.insert(trace_id, ctx);
+            }
         }
     }
     off += consumed as u64;

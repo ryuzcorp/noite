@@ -237,6 +237,50 @@ pub struct AppSpanStat {
     pub qwait_ms: i64,
 }
 
+/// One grouped error (host/errors.rs): every occurrence with the same
+/// fingerprint. `status` is `open`, `resolved` or `ignored`; `regressed`
+/// marks a resolved issue that fired again.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorIssue {
+    pub fingerprint: String,
+    pub kind: String,
+    pub message: String,
+    pub culprit: String,
+    pub handler: String,
+    pub source: String,
+    pub count: i64,
+    pub first_seen_us: i64,
+    pub last_seen_us: i64,
+    pub first_sha: Option<String>,
+    pub last_sha: Option<String>,
+    pub status: String,
+    pub regressed: bool,
+    pub status_at_us: Option<i64>,
+}
+
+/// One stored occurrence. `frames` and `logs` are JSON arrays as text;
+/// the RPC layer inlines them.
+#[derive(Debug, Clone, FromRow)]
+pub struct ErrorEvent {
+    pub ts_us: i64,
+    pub trace_id: String,
+    pub source: String,
+    pub handler: String,
+    pub cell: String,
+    pub kind: String,
+    pub message: String,
+    pub context: String,
+    pub frames: String,
+    pub logs: String,
+    pub method: String,
+    pub path: String,
+    pub http_status: i64,
+    pub browser: String,
+    pub os: String,
+    pub sha: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct AppEvent {

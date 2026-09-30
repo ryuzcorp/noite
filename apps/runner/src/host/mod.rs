@@ -6,6 +6,7 @@ pub mod control;
 pub mod credentials;
 pub mod deploy;
 pub mod edge;
+pub mod errors;
 pub mod git_http;
 pub mod git_manifest;
 pub mod git_policy;

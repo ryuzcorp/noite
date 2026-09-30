@@ -1,6 +1,6 @@
 ---
 title: Observe
-description: Logs, metrics with spans, product-analytics events, and idle sleep for one app.
+description: Logs, metrics with spans, errors, product-analytics events, and idle sleep for one app.
 ---
 
 ## Logs
@@ -12,6 +12,20 @@ The Overview tab tails the running fleet's stdout/stderr over SSE and follows th
 The **Metrics** tab covers the last 24 h: 24 hourly bars for requests, errors, latency, and CPU, plus stat tiles. Requests count `celld.fetch` spans; errors, latency, and queue wait come from the same spans; CPU is sampled from the celld process tree.
 
 The spans table (`/spans?hours=1`) shows recent slow or failed requests on demand.
+
+## Errors
+
+The **Errors** tab collects exceptions without an SDK. Noite reads them from the same telemetry as Metrics, so they show up about a minute after they happen.
+
+- **What counts:** anything a handler throws or rejects (fetch, Durable Objects, alarms, queues, cron), a rejected `ctx.waitUntil()`, and `console.error(err)` when `err` carries a stack. A `console.error("text")` without a stack stays a log line.
+- **Grouping:** occurrences group into one error by type plus the functions in your code on the stack. Line numbers are ignored, so a redeploy doesn't split an error in two. Errors without a stack group by message, with numbers and ids masked.
+- **Each occurrence** keeps the stack trace (runtime frames dimmed), the request's method, path (never the query string), status and browser, the log lines from the same request, and the commit that was live. The last 20 occurrences are kept per error.
+- **Triage:** anyone with push access can resolve, ignore or reopen an error. A resolved error that happens again reopens and is marked _Regressed_. An ignored one keeps counting but never reopens.
+- **Retention** follows telemetry retention (14 days by default).
+
+:::note
+Stack locations point into the bundle celld runs (`worker.js:58`), not your source files. Source-mapped stacks are planned.
+:::
 
 ## Events, insights, devices, paths, refs
 

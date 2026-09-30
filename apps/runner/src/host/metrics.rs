@@ -23,6 +23,7 @@ use crate::config::Config;
 use crate::db;
 use crate::host::accesslog;
 use crate::host::cmd;
+use crate::host::errors;
 use crate::host::stats;
 use crate::host::supervisor::ProcMap;
 use crate::models::{App, AppStatus};
@@ -39,6 +40,9 @@ pub struct MetricsState {
     /// Last ingest pass: the DuckDB ingest runs at most once per
     /// `cfg.otel_flush_ms` (spec T3.4), not every reconcile tick.
     last_ingest: Option<std::time::Instant>,
+    /// Trace id → edge request, from the access log; read when an error's
+    /// span lands one flush later (host/errors.rs).
+    requests: errors::RequestIndex,
     tick: u64,
 }
 
@@ -49,6 +53,7 @@ pub fn new_state() -> MetricsState {
         compacted: HashMap::new(),
         attempted: HashSet::new(),
         last_ingest: None,
+        requests: errors::RequestIndex::default(),
         tick: 0,
     }
 }
@@ -273,10 +278,14 @@ pub fn should_advance_watermark(agg_ok: bool, idle: bool) -> bool {
 pub type SpanRow = (String, String, String, i64, i64, i64, i64, i64);
 
 /// One ingest pass over every live fleet (spec T3.1): a SINGLE DuckDB
-/// invocation whose query unions three tagged result sets —
+/// invocation whose query unions four tagged result sets —
 /// 1. minute buckets for `celld.fetch` (requests, duration, errors),
 /// 2. hourly span stats for every span name (counts, ms, errors, queue wait),
-/// 3. new OTel log lines (timestamp, body).
+/// 3. new OTel log lines (timestamp, body, trace id),
+/// 4. failed spans grouped by their unwrapped `error` text (host/errors.rs),
+///    counted per distinct trace so a Durable Object failure — reported on
+///    the cell span and again on its parent — counts once; capped at 200
+///    groups per fleet per pass.
 ///    The slug comes from the file path (`filename=true`, regex on
 ///    `fleets/<slug>/`), and each slug's exact watermark rides along in a
 ///    `VALUES` bounds table, so windows stay exact per fleet while every
@@ -284,7 +293,8 @@ pub type SpanRow = (String, String, String, i64, i64, i64, i64, i64);
 pub struct IngestRows {
     pub minutes: Vec<(String, String, i64, i64, i64)>, // slug, bucket, n, dur_us, err
     pub spans: Vec<SpanRow>,
-    pub logs: Vec<(String, i64, String)>,                 // slug, ts_us, body
+    pub logs: Vec<errors::LogRow>,
+    pub errors: Vec<errors::SpanErrorRow>,
 }
 
 fn json_str(v: &serde_json::Value, key: &str) -> String {
@@ -300,7 +310,12 @@ async fn ingest_all(
     bounds: &[(String, i64)],
     cutoff: i64,
 ) -> anyhow::Result<IngestRows> {
-    let mut out = IngestRows { minutes: Vec::new(), spans: Vec::new(), logs: Vec::new() };
+    let mut out = IngestRows {
+        minutes: Vec::new(),
+        spans: Vec::new(),
+        logs: Vec::new(),
+        errors: Vec::new(),
+    };
     if bounds.is_empty() {
         return Ok(out);
     }
@@ -329,14 +344,18 @@ async fn ingest_all(
         .join(", ");
     // CAST to BIGINT: DuckDB `/` is floating division, and the -json writer
     // emits BIGINT sums as STRINGS and small integers as numbers — coerce at
-    // the source, parse with `json_i64`.
+    // the source, parse with `json_i64`. Tag 4's `err` is the error text with
+    // celld's `rejected: ` / `Error: rejected: ` wrappers removed, so a cell
+    // span and its parent land in one group (host/errors.rs strips the same).
     let sql = s3_setup(
         cfg,
         &format!(
             "WITH files AS ( \
                SELECT regexp_extract(filename, 'fleets/([^/]+)/', 1) AS slug, \
                       name, kind, start_unix_us, duration_us, ok, \
-                      coalesce(queue_wait_us, 0) AS qwait, time_unix_us, body \
+                      coalesce(queue_wait_us, 0) AS qwait, time_unix_us, body, \
+                      trace_id, cell, \
+                      regexp_replace(error, '^rejected: (Error: rejected: )*', '') AS err \
                  FROM read_parquet([{files}], union_by_name = true, filename = true)), \
              bounds(slug, after_us) AS (VALUES {values}) \
              SELECT 1 AS tag, f.slug AS slug, \
@@ -345,7 +364,8 @@ async fn ingest_all(
                     count(*) AS n, CAST(sum(f.duration_us) AS BIGINT) AS ms, \
                     sum(CASE WHEN NOT f.ok THEN 1 ELSE 0 END) AS e, \
                     CAST(0 AS BIGINT) AS q, CAST(0 AS BIGINT) AS ts, \
-                    CAST(NULL AS VARCHAR) AS body \
+                    CAST(NULL AS VARCHAR) AS body, CAST(NULL AS VARCHAR) AS trace, \
+                    CAST(NULL AS VARCHAR) AS cell, CAST(0 AS BIGINT) AS first_ts \
                FROM files f JOIN bounds b ON f.slug = b.slug \
               WHERE f.name = 'celld.fetch' \
                 AND f.start_unix_us > b.after_us AND f.start_unix_us <= {cutoff} \
@@ -357,7 +377,8 @@ async fn ingest_all(
                     count(*) AS n, CAST(sum(f.duration_us) / 1000 AS BIGINT) AS ms, \
                     sum(CASE WHEN NOT f.ok THEN 1 ELSE 0 END) AS e, \
                     CAST(sum(f.qwait) / 1000 AS BIGINT) AS q, CAST(0 AS BIGINT) AS ts, \
-                    CAST(NULL AS VARCHAR) AS body \
+                    CAST(NULL AS VARCHAR) AS body, CAST(NULL AS VARCHAR) AS trace, \
+                    CAST(NULL AS VARCHAR) AS cell, CAST(0 AS BIGINT) AS first_ts \
                FROM files f JOIN bounds b ON f.slug = b.slug \
               WHERE f.start_unix_us > b.after_us AND f.start_unix_us <= {cutoff} \
               GROUP BY f.slug, bucket, f.name, f.kind \
@@ -366,9 +387,25 @@ async fn ingest_all(
                     CAST(NULL AS VARCHAR) AS bucket, CAST(NULL AS VARCHAR) AS name, \
                     CAST(0 AS BIGINT) AS kind, CAST(0 AS BIGINT) AS n, \
                     CAST(0 AS BIGINT) AS ms, CAST(0 AS BIGINT) AS e, \
-                    CAST(0 AS BIGINT) AS q, f.time_unix_us AS ts, f.body AS body \
+                    CAST(0 AS BIGINT) AS q, f.time_unix_us AS ts, f.body AS body, \
+                    f.trace_id AS trace, CAST(NULL AS VARCHAR) AS cell, \
+                    CAST(0 AS BIGINT) AS first_ts \
                FROM files f JOIN bounds b ON f.slug = b.slug \
-              WHERE f.time_unix_us > b.after_us AND f.time_unix_us <= {cutoff}",
+              WHERE f.time_unix_us > b.after_us AND f.time_unix_us <= {cutoff} \
+              UNION ALL \
+             SELECT * FROM ( \
+               SELECT 4 AS tag, f.slug AS slug, CAST(NULL AS VARCHAR) AS bucket, \
+                      arg_max(f.name, f.start_unix_us) AS name, CAST(0 AS BIGINT) AS kind, \
+                      count(DISTINCT f.trace_id) AS n, CAST(0 AS BIGINT) AS ms, \
+                      CAST(0 AS BIGINT) AS e, CAST(0 AS BIGINT) AS q, \
+                      max(f.start_unix_us) AS ts, f.err AS body, \
+                      arg_max(f.trace_id, f.start_unix_us) AS trace, max(f.cell) AS cell, \
+                      min(f.start_unix_us) AS first_ts \
+                 FROM files f JOIN bounds b ON f.slug = b.slug \
+                WHERE NOT f.ok AND f.err IS NOT NULL AND f.err <> '' \
+                  AND f.start_unix_us > b.after_us AND f.start_unix_us <= {cutoff} \
+                GROUP BY f.slug, f.err \
+               QUALIFY row_number() OVER (PARTITION BY f.slug ORDER BY count(DISTINCT f.trace_id) DESC) <= 200)",
         ),
     );
     let raw = match duckdb_json(&sql, "ingest").await {
@@ -425,7 +462,28 @@ async fn ingest_all(
                 if body.is_empty() {
                     continue;
                 }
-                out.logs.push((slug, json_i64(obj, "ts"), body));
+                out.logs.push(errors::LogRow {
+                    slug,
+                    ts_us: json_i64(obj, "ts"),
+                    body,
+                    trace_id: json_str(obj, "trace"),
+                });
+            }
+            4 => {
+                let error = json_str(obj, "body");
+                if error.is_empty() {
+                    continue;
+                }
+                out.errors.push(errors::SpanErrorRow {
+                    slug,
+                    error,
+                    name: json_str(obj, "name"),
+                    cell: json_str(obj, "cell"),
+                    trace_id: json_str(obj, "trace"),
+                    count: json_i64(obj, "n"),
+                    first_us: json_i64(obj, "first_ts"),
+                    last_us: json_i64(obj, "ts"),
+                });
             }
             _ => {}
         }
@@ -632,10 +690,20 @@ pub async fn tick(
                         touched.insert(id.clone());
                     }
                 }
+                // Errors before the log ring takes the rows: an occurrence
+                // keeps the log lines of its own trace.
+                let app_sha: HashMap<String, String> = apps
+                    .iter()
+                    .filter_map(|a| a.last_deploy_sha.clone().map(|sha| (a.id.clone(), sha)))
+                    .collect();
+                match errors::ingest(pool, &slug_id, &app_sha, &rows.errors, &rows.logs, &state.requests).await {
+                    Ok(ids) => touched.extend(ids),
+                    Err(e) => tracing::warn!(error = %e, "error ingest"),
+                }
                 let mut log_groups: HashMap<String, Vec<(i64, String)>> = HashMap::new();
-                for (slug, ts, body) in rows.logs {
-                    if let Some(id) = slug_id.get(&slug) {
-                        log_groups.entry(id.clone()).or_default().push((ts, body));
+                for row in rows.logs {
+                    if let Some(id) = slug_id.get(&row.slug) {
+                        log_groups.entry(id.clone()).or_default().push((row.ts_us, row.body));
                     }
                 }
                 for (id, mut log_rows) in log_groups {
@@ -668,9 +736,10 @@ pub async fn tick(
             }
         }
     }
-    // 3. Caddy access log → device families. Never fails the tick: a missing
-    //    log (Caddy not yet reloaded) or a corrupt line is a silent skip.
-    if let Err(e) = accesslog::tick(pool, cfg, &slug_id).await {
+    // 3. Caddy access log → device families, plus the trace → request index
+    //    the error ingest joins on. Never fails the tick: a missing log
+    //    (Caddy not yet reloaded) or a corrupt line is a silent skip.
+    if let Err(e) = accesslog::tick(pool, cfg, &slug_id, &mut state.requests).await {
         tracing::warn!(error = %e, "access_log");
     }
 
@@ -769,6 +838,12 @@ pub async fn tick(
         if let Ok(n) = db::prune_span_stats(pool, &hour_cutoff).await {
             if n > 0 {
                 tracing::info!(pruned = n, "pruned old span stats");
+            }
+        }
+        let cutoff_us = now_us() - cfg.telemetry_retention_days * 86_400_000_000;
+        if let Ok(n) = db::prune_errors(pool, cutoff_us, &hour_cutoff).await {
+            if n > 0 {
+                tracing::info!(pruned = n, "pruned old errors");
             }
         }
         if let Ok(n) = db::prune_compactions(

@@ -55,6 +55,9 @@ import {
   runnerR2Get,
   runnerR2List,
   runnerR2Delete,
+  runnerGetError,
+  runnerListErrors,
+  runnerSetErrorStatus,
 } from "./runner";
 
 const CreateApp = Schema.Struct({
@@ -550,6 +553,67 @@ export const removeDomain = action(
     await requireAppRole(appId, user.id, "admin");
     try {
       return await runnerRemoveDomain(appId, hostname);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }),
+  { error: AuthError }
+);
+
+// ---- Errors (view: read · push: resolve, ignore, reopen) ----
+
+const ErrorStatusSchema = Schema.Union([
+  Schema.Literal("open"),
+  Schema.Literal("resolved"),
+  Schema.Literal("ignored"),
+]);
+const ErrorListArgs = Schema.Struct({
+  appId: Schema.String,
+  status: ErrorStatusSchema,
+});
+const ErrorArgs = Schema.Struct({
+  appId: Schema.String,
+  fingerprint: Schema.String,
+});
+const ErrorStatusArgs = Schema.Struct({
+  appId: Schema.String,
+  fingerprint: Schema.String,
+  status: ErrorStatusSchema,
+});
+
+/** Grouped errors in one status, most recently seen first. */
+export const listErrors = action(
+  checkedSchema(ErrorListArgs, async ({ appId, status }) => {
+    await requireViewApp(appId);
+    try {
+      return await runnerListErrors(appId, status);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }),
+  { error: AuthError }
+);
+
+/** One error with its recent occurrences (stack, request, trace logs). */
+export const errorDetail = action(
+  checkedSchema(ErrorArgs, async ({ appId, fingerprint }) => {
+    await requireViewApp(appId);
+    try {
+      return await runnerGetError(appId, fingerprint);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }),
+  { error: AuthError }
+);
+
+/** Resolve, ignore or reopen an error — anyone who can push can triage. */
+export const setErrorStatus = action(
+  checkedSchema(ErrorStatusArgs, async ({ appId, fingerprint, status }) => {
+    const user = await sessionUser();
+    await requireAppRole(appId, user.id, "push");
+    try {
+      return await runnerSetErrorStatus(appId, fingerprint, status);
     } catch (error) {
       failUnknown(error);
     }

@@ -5,7 +5,7 @@ use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 use sqlx::sqlite::SqliteConnection;
 
 use crate::models::{
-    now_iso, new_id, App, AppDeviceStat, AppDomain, AppEnv, AppEvent, AppInsight, AppMetric, AppPathStat, AppRefStat, AppSpanStat, AppStatus, AppUserProps, Deploy, DeployStatus,
+    now_iso, new_id, App, AppDeviceStat, AppDomain, AppEnv, AppEvent, AppInsight, AppMetric, AppPathStat, AppRefStat, AppSpanStat, AppStatus, AppUserProps, Deploy, DeployStatus, ErrorEvent, ErrorIssue,
 };
 
 const APP_COLS: &str = r#"id, slug, name, user_id, status, subdomain, git_prefix, fleet_bucket,
@@ -53,24 +53,15 @@ pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     sqlx::query("PRAGMA foreign_keys = ON")
         .execute(&pool)
         .await?;
-    // Move rows out of the snapshotted file BEFORE schema.sql drops the old
-    // main tables (a fresh database has nothing to move: this is a no-op).
-    migrate_metrics_to_attached(&pool).await?;
     // One idempotent file (embedded at compile time), applied on every boot:
-    // it creates whatever is missing and drops what earlier versions retired,
-    // so there is no ledger to migrate and no ordering to keep in sync.
+    // it creates whatever is missing, so there is no ledger and no ordering.
+    // No upgrade paths — installs are wiped, not migrated.
     let mut tx = pool.begin().await?;
     sqlx::raw_sql(include_str!("../schema.sql"))
         .execute(&mut *tx)
         .await
         .context("apply schema")?;
     tx.commit().await?;
-    // Columns added after the table shipped (SQLite has no ADD COLUMN IF NOT
-    // EXISTS): scale-to-zero state (SPEC, Scale to zero).
-    ensure_column(&pool, "app", "asleep_since", "asleep_since TEXT").await?;
-    ensure_column(&pool, "app", "woke_at", "woke_at TEXT").await?;
-    // The Wrangler config of the last deploy (host/deploy.rs).
-    ensure_column(&pool, "app", "deployed_config", "deployed_config TEXT").await?;
     Ok(pool)
 }
 
@@ -109,9 +100,7 @@ pub fn metrics_db_path(database_url: &str) -> String {
 /// edge analytics, hourly span stats, the log ring, ingest watermarks,
 /// compaction marks and per-app metrics versions. Derived from bucket
 /// telemetry and Caddy logs — losing the volume loses at most the retention
-/// window of dashboard history, never control-plane state. Column order of
-/// the moved tables matches the old main-file DDL exactly, so the one-time
-/// `INSERT INTO metrics.* SELECT * FROM main.*` migration lines up.
+/// window of dashboard history, never control-plane state.
 pub const METRICS_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS metrics.app_metric (
   app_id TEXT NOT NULL,
@@ -180,6 +169,54 @@ CREATE TABLE IF NOT EXISTS metrics.metric_version (
   app_id TEXT PRIMARY KEY NOT NULL,
   version INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS metrics.app_error_issue (
+  app_id TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  message TEXT NOT NULL,
+  culprit TEXT NOT NULL DEFAULT '',
+  handler TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'uncaught',
+  count INTEGER NOT NULL DEFAULT 0,
+  first_seen_us INTEGER NOT NULL,
+  last_seen_us INTEGER NOT NULL,
+  first_sha TEXT,
+  last_sha TEXT,
+  status TEXT NOT NULL DEFAULT 'open',
+  regressed INTEGER NOT NULL DEFAULT 0,
+  status_at_us INTEGER,
+  PRIMARY KEY (app_id, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS metrics.idx_app_error_issue_app_last ON app_error_issue(app_id, last_seen_us);
+CREATE TABLE IF NOT EXISTS metrics.app_error_event (
+  app_id TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  ts_us INTEGER NOT NULL,
+  trace_id TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'uncaught',
+  handler TEXT NOT NULL DEFAULT '',
+  cell TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL,
+  message TEXT NOT NULL,
+  context TEXT NOT NULL DEFAULT '',
+  frames TEXT NOT NULL DEFAULT '[]',
+  logs TEXT NOT NULL DEFAULT '[]',
+  method TEXT NOT NULL DEFAULT '',
+  path TEXT NOT NULL DEFAULT '',
+  http_status INTEGER NOT NULL DEFAULT 0,
+  browser TEXT NOT NULL DEFAULT '',
+  os TEXT NOT NULL DEFAULT '',
+  sha TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS metrics.idx_app_error_event_issue_ts ON app_error_event(app_id, fingerprint, ts_us);
+CREATE TABLE IF NOT EXISTS metrics.app_error_hour (
+  app_id TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  bucket_hour TEXT NOT NULL,
+  n INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (app_id, fingerprint, bucket_hour)
+);
+CREATE INDEX IF NOT EXISTS metrics.idx_app_error_hour_app_hour ON app_error_hour(app_id, bucket_hour);
 "#;
 
 fn attach_metrics_statements(metrics_path: &str) -> Vec<String> {
@@ -197,35 +234,6 @@ fn attach_metrics_statements(metrics_path: &str) -> Vec<String> {
         }
     }
     stmts
-}
-
-/// One-time move of telemetry rows from the snapshotted main file into the
-/// attached metrics database. Runs before schema.sql drops the old tables.
-async fn migrate_metrics_to_attached(pool: &SqlitePool) -> anyhow::Result<()> {
-    const MOVED: &[&str] = &[
-        "app_metric",
-        "app_device_stat",
-        "app_path_stat",
-        "app_ref_stat",
-        "metric_watermark",
-    ];
-    for table in MOVED {
-        let exists: Option<String> = sqlx::query_scalar(
-            "SELECT name FROM main.sqlite_master WHERE type = 'table' AND name = ?",
-        )
-        .bind(table)
-        .fetch_optional(pool)
-        .await?;
-        if exists.is_none() {
-            continue;
-        }
-        let copy = format!("INSERT OR IGNORE INTO metrics.{table} SELECT * FROM main.{table}");
-        sqlx::query(&copy).execute(pool).await?;
-        let drop = format!("DROP TABLE main.{table}");
-        sqlx::query(&drop).execute(pool).await?;
-        tracing::info!(table, "migrated telemetry table to metrics.sqlite");
-    }
-    Ok(())
 }
 
 /// Consistent copy of the runner database, written by `VACUUM INTO` next to
@@ -246,32 +254,6 @@ pub fn local_db_path(cfg: &crate::config::Config) -> Option<std::path::PathBuf> 
         return None;
     }
     Some(std::path::PathBuf::from(path))
-}
-
-/// Additive schema change. SQLite has no `ADD COLUMN IF NOT EXISTS`, so a new
-/// column on an existing table cannot live in `schema.sql` (whose
-/// `CREATE TABLE IF NOT EXISTS` only ever covers whole tables). Guard with
-/// `pragma_table_info` instead: this is the supported path for the next column,
-/// and it is a no-op once applied.
-/// Add a column to an existing table once (guarded by `pragma_table_info`,
-/// a no-op after the first boot). See SPEC, Runner schema evolution.
-pub async fn ensure_column(
-    pool: &SqlitePool,
-    table: &str,
-    column: &str,
-    ddl: &str,
-) -> anyhow::Result<bool> {
-    let rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM pragma_table_info(?)")
-        .bind(table)
-        .fetch_all(pool)
-        .await?;
-    if rows.iter().any(|(name,)| name == column) {
-        return Ok(false);
-    }
-    sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"))
-        .execute(pool)
-        .await?;
-    Ok(true)
 }
 
 pub async fn list_apps(pool: &SqlitePool) -> sqlx::Result<Vec<App>> {
@@ -1102,6 +1084,291 @@ pub async fn prune_app_logs(
     Ok(n)
 }
 
+// ---------------------------------------------------------------------------
+// Errors (host/errors.rs)
+// ---------------------------------------------------------------------------
+
+const ISSUE_COLS: &str = "fingerprint, kind, message, culprit, handler, source, count, \
+     first_seen_us, last_seen_us, first_sha, last_sha, status, regressed, status_at_us";
+
+/// Fold occurrences into their issue. The latest occurrence names the
+/// issue (message, culprit); a resolved issue that fires after it was
+/// resolved reopens as regressed. SET expressions read the pre-update row.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_error_issue(
+    pool: &SqlitePool,
+    app_id: &str,
+    fingerprint: &str,
+    kind: &str,
+    message: &str,
+    culprit: &str,
+    handler: &str,
+    source: &str,
+    count: i64,
+    first_us: i64,
+    last_us: i64,
+    sha: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO metrics.app_error_issue
+           (app_id, fingerprint, kind, message, culprit, handler, source, count,
+            first_seen_us, last_seen_us, first_sha, last_sha)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (app_id, fingerprint) DO UPDATE SET
+             kind = CASE WHEN excluded.last_seen_us >= last_seen_us THEN excluded.kind ELSE kind END,
+             message = CASE WHEN excluded.last_seen_us >= last_seen_us THEN excluded.message ELSE message END,
+             culprit = CASE WHEN excluded.last_seen_us >= last_seen_us THEN excluded.culprit ELSE culprit END,
+             handler = CASE WHEN excluded.last_seen_us >= last_seen_us THEN excluded.handler ELSE handler END,
+             source = CASE WHEN excluded.last_seen_us >= last_seen_us THEN excluded.source ELSE source END,
+             last_sha = CASE WHEN excluded.last_seen_us >= last_seen_us
+                             THEN COALESCE(excluded.last_sha, last_sha) ELSE last_sha END,
+             count = count + excluded.count,
+             first_seen_us = min(first_seen_us, excluded.first_seen_us),
+             last_seen_us = max(last_seen_us, excluded.last_seen_us),
+             regressed = CASE WHEN status = 'resolved' AND excluded.last_seen_us > COALESCE(status_at_us, 0)
+                              THEN 1 ELSE regressed END,
+             status_at_us = CASE WHEN status = 'resolved' AND excluded.last_seen_us > COALESCE(status_at_us, 0)
+                                 THEN excluded.last_seen_us ELSE status_at_us END,
+             status = CASE WHEN status = 'resolved' AND excluded.last_seen_us > COALESCE(status_at_us, 0)
+                           THEN 'open' ELSE status END"#,
+    )
+    .bind(app_id)
+    .bind(fingerprint)
+    .bind(kind)
+    .bind(message)
+    .bind(culprit)
+    .bind(handler)
+    .bind(source)
+    .bind(count)
+    .bind(first_us)
+    .bind(last_us)
+    .bind(sha)
+    .bind(sha)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn add_error_hour(
+    pool: &SqlitePool,
+    app_id: &str,
+    fingerprint: &str,
+    bucket_hour: &str,
+    n: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO metrics.app_error_hour (app_id, fingerprint, bucket_hour, n)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT (app_id, fingerprint, bucket_hour) DO UPDATE SET n = n + excluded.n"#,
+    )
+    .bind(app_id)
+    .bind(fingerprint)
+    .bind(bucket_hour)
+    .bind(n)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub struct NewErrorEvent<'a> {
+    pub app_id: &'a str,
+    pub fingerprint: &'a str,
+    pub ts_us: i64,
+    pub trace_id: &'a str,
+    pub source: &'a str,
+    pub handler: &'a str,
+    pub cell: &'a str,
+    pub kind: &'a str,
+    pub message: &'a str,
+    pub context: &'a str,
+    pub frames: &'a str,
+    pub logs: &'a str,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub http_status: i64,
+    pub browser: &'a str,
+    pub os: &'a str,
+    pub sha: &'a str,
+}
+
+pub async fn insert_error_event(pool: &SqlitePool, e: &NewErrorEvent<'_>) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO metrics.app_error_event
+           (app_id, fingerprint, ts_us, trace_id, source, handler, cell, kind, message,
+            context, frames, logs, method, path, http_status, browser, os, sha)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+    )
+    .bind(e.app_id)
+    .bind(e.fingerprint)
+    .bind(e.ts_us)
+    .bind(e.trace_id)
+    .bind(e.source)
+    .bind(e.handler)
+    .bind(e.cell)
+    .bind(e.kind)
+    .bind(e.message)
+    .bind(e.context)
+    .bind(e.frames)
+    .bind(e.logs)
+    .bind(e.method)
+    .bind(e.path)
+    .bind(e.http_status)
+    .bind(e.browser)
+    .bind(e.os)
+    .bind(e.sha)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Keep the newest `keep` occurrences of one issue.
+pub async fn prune_error_events(
+    pool: &SqlitePool,
+    app_id: &str,
+    fingerprint: &str,
+    keep: i64,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "DELETE FROM metrics.app_error_event WHERE app_id = ? AND fingerprint = ? AND rowid NOT IN \
+         (SELECT rowid FROM metrics.app_error_event WHERE app_id = ? AND fingerprint = ? \
+          ORDER BY ts_us DESC, rowid DESC LIMIT ?)",
+    )
+    .bind(app_id)
+    .bind(fingerprint)
+    .bind(app_id)
+    .bind(fingerprint)
+    .bind(keep)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Issues in one status, most recently seen first.
+pub async fn list_error_issues(
+    pool: &SqlitePool,
+    app_id: &str,
+    status: &str,
+    limit: i64,
+) -> sqlx::Result<Vec<ErrorIssue>> {
+    sqlx::query_as::<_, ErrorIssue>(&format!(
+        "SELECT {ISSUE_COLS} FROM metrics.app_error_issue \
+         WHERE app_id = ? AND status = ? ORDER BY last_seen_us DESC LIMIT ?"
+    ))
+    .bind(app_id)
+    .bind(status)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Issue counts per status (`open`, `resolved`, `ignored`).
+pub async fn count_error_issues(
+    pool: &SqlitePool,
+    app_id: &str,
+) -> sqlx::Result<Vec<(String, i64)>> {
+    sqlx::query_as(
+        "SELECT status, count(*) FROM metrics.app_error_issue WHERE app_id = ? GROUP BY status",
+    )
+    .bind(app_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_error_issue(
+    pool: &SqlitePool,
+    app_id: &str,
+    fingerprint: &str,
+) -> sqlx::Result<Option<ErrorIssue>> {
+    sqlx::query_as::<_, ErrorIssue>(&format!(
+        "SELECT {ISSUE_COLS} FROM metrics.app_error_issue WHERE app_id = ? AND fingerprint = ?"
+    ))
+    .bind(app_id)
+    .bind(fingerprint)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn list_error_events(
+    pool: &SqlitePool,
+    app_id: &str,
+    fingerprint: &str,
+) -> sqlx::Result<Vec<ErrorEvent>> {
+    sqlx::query_as::<_, ErrorEvent>(
+        "SELECT ts_us, trace_id, source, handler, cell, kind, message, context, frames, logs, \
+                method, path, http_status, browser, os, sha \
+         FROM metrics.app_error_event WHERE app_id = ? AND fingerprint = ? \
+         ORDER BY ts_us DESC, rowid DESC",
+    )
+    .bind(app_id)
+    .bind(fingerprint)
+    .fetch_all(pool)
+    .await
+}
+
+/// Hourly counts since `since_hour` for every issue of an app:
+/// (fingerprint, bucket_hour, n).
+pub async fn list_error_hours(
+    pool: &SqlitePool,
+    app_id: &str,
+    since_hour: &str,
+) -> sqlx::Result<Vec<(String, String, i64)>> {
+    sqlx::query_as(
+        "SELECT fingerprint, bucket_hour, n FROM metrics.app_error_hour \
+         WHERE app_id = ? AND bucket_hour >= ?",
+    )
+    .bind(app_id)
+    .bind(since_hour)
+    .fetch_all(pool)
+    .await
+}
+
+/// Resolve, ignore or reopen. Clears `regressed`; `status_at_us` is the
+/// point a resolved issue reopens after.
+pub async fn set_error_status(
+    pool: &SqlitePool,
+    app_id: &str,
+    fingerprint: &str,
+    status: &str,
+    at_us: i64,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE metrics.app_error_issue SET status = ?, regressed = 0, status_at_us = ? \
+         WHERE app_id = ? AND fingerprint = ?",
+    )
+    .bind(status)
+    .bind(at_us)
+    .bind(app_id)
+    .bind(fingerprint)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Retention: occurrences and hour buckets past the window, and issues not
+/// seen inside it.
+pub async fn prune_errors(
+    pool: &SqlitePool,
+    cutoff_us: i64,
+    cutoff_hour: &str,
+) -> sqlx::Result<u64> {
+    let mut n = sqlx::query("DELETE FROM metrics.app_error_event WHERE ts_us < ?")
+        .bind(cutoff_us)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    n += sqlx::query("DELETE FROM metrics.app_error_hour WHERE bucket_hour < ?")
+        .bind(cutoff_hour)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    n += sqlx::query("DELETE FROM metrics.app_error_issue WHERE last_seen_us < ?")
+        .bind(cutoff_us)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(n)
+}
+
 /// Durable compaction watermark (spec T3.5): the last compacted hour per
 /// slug, so an hour due while the runner was down is still folded later.
 pub async fn get_compacted_hours(
@@ -1531,41 +1798,94 @@ pub async fn list_app_insights(
 mod tests {
     use super::*;
 
+    /// Boot applies schema.sql on every connect, with metrics.sqlite
+    /// attached. A bare `DROP TABLE` there once fell through to the attached
+    /// database and wiped the metric history and ingest watermark on every
+    /// restart; a reboot must leave telemetry alone.
     #[tokio::test]
-    async fn ensure_column_adds_once() {
+    async fn telemetry_survives_a_reconnect() {
+        let dir = std::env::temp_dir().join(format!("noite-db-reconnect-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        {
+            let pool = connect(&url).await.expect("first boot");
+            add_app_metric(&pool, "a", "2026-09-30T12:36:00Z", 5, 4, 10, 1)
+                .await
+                .expect("metric");
+            set_metric_watermarks(&pool, &[("test".to_string(), 42)])
+                .await
+                .expect("watermark");
+            add_app_path(&pool, "a", "2026-09-30T12:00:00Z", "/")
+                .await
+                .expect("path");
+            pool.close().await;
+        }
+        let pool = connect(&url).await.expect("second boot");
+        let marks = get_metric_watermarks(&pool).await.expect("watermarks readable");
+        assert_eq!(marks.get("test"), Some(&42));
+        let rows = list_app_metrics(&pool, "a", "2026-09-30T00:00:00Z")
+            .await
+            .expect("metrics readable");
+        assert_eq!(rows.len(), 1);
+        let paths = list_app_paths(&pool, "a", "2026-09-30T00:00:00Z")
+            .await
+            .expect("paths readable");
+        assert_eq!(paths.len(), 1);
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn error_issue_folds_and_regresses_after_resolve() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
+            .after_connect(|conn: &mut SqliteConnection, _| {
+                Box::pin(async move {
+                    for stmt in attach_metrics_statements(":memory:") {
+                        sqlx::query(&stmt).execute(&mut *conn).await?;
+                    }
+                    Ok::<_, sqlx::Error>(())
+                })
+            })
             .connect("sqlite::memory:")
             .await
             .expect("in-memory db");
-        sqlx::query("CREATE TABLE sample (id TEXT PRIMARY KEY NOT NULL)")
-            .execute(&pool)
-            .await
-            .expect("create");
-        // Added the first time, a no-op afterwards — the guard is the point of
-        // the helper, because SQLite has no ADD COLUMN IF NOT EXISTS.
-        assert!(ensure_column(&pool, "sample", "note", "note TEXT")
-            .await
-            .expect("first add"));
-        assert!(!ensure_column(&pool, "sample", "note", "note TEXT")
-            .await
-            .expect("second add"));
-        let rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM pragma_table_info('sample')")
-            .fetch_all(&pool)
-            .await
-            .expect("pragma");
-        assert!(rows.iter().any(|(name,)| name == "note"));
-        // Existing rows survive with the column's default.
-        sqlx::query("INSERT INTO sample (id, note) VALUES ('a', 'kept')")
-            .execute(&pool)
-            .await
-            .expect("insert");
-        let (note,): (String,) = sqlx::query_as("SELECT note FROM sample WHERE id = 'a'")
-            .fetch_one(&pool)
-            .await
-            .expect("read");
-        assert_eq!(note, "kept");
-        // And the snapshot helper resolves next to the live file.
+        let up = |msg: &'static str, n: i64, at: i64, sha: &'static str| {
+            let pool = pool.clone();
+            async move {
+                upsert_error_issue(&pool, "a", "fp", "TypeError", msg, "f (w.js:1)", "fetch", "uncaught", n, at, at, Some(sha))
+                    .await
+                    .expect("upsert");
+            }
+        };
+        up("first", 2, 100, "s1").await;
+        up("second", 3, 200, "s2").await;
+        // A late batch from before the newest occurrence must not rename it.
+        up("stale", 1, 150, "s0").await;
+        let issue = get_error_issue(&pool, "a", "fp").await.expect("get").expect("issue");
+        assert_eq!(issue.count, 6);
+        assert_eq!(issue.message, "second");
+        assert_eq!((issue.first_seen_us, issue.last_seen_us), (100, 200));
+        assert_eq!(issue.first_sha.as_deref(), Some("s1"));
+        assert_eq!(issue.last_sha.as_deref(), Some("s2"));
+        assert_eq!(issue.status, "open");
+
+        set_error_status(&pool, "a", "fp", "resolved", 300).await.expect("resolve");
+        // An occurrence from before the resolve (ingest lag) keeps it resolved.
+        up("second", 1, 250, "s2").await;
+        let issue = get_error_issue(&pool, "a", "fp").await.expect("get").expect("issue");
+        assert_eq!((issue.status.as_str(), issue.regressed), ("resolved", false));
+        // One after it reopens the issue as a regression.
+        up("second", 1, 400, "s3").await;
+        let issue = get_error_issue(&pool, "a", "fp").await.expect("get").expect("issue");
+        assert_eq!((issue.status.as_str(), issue.regressed), ("open", true));
+
+        // Ignored stays ignored however often it fires.
+        set_error_status(&pool, "a", "fp", "ignored", 500).await.expect("ignore");
+        up("second", 1, 600, "s3").await;
+        let issue = get_error_issue(&pool, "a", "fp").await.expect("get").expect("issue");
+        assert_eq!((issue.status.as_str(), issue.regressed), ("ignored", false));
+        assert_eq!(issue.count, 9);
     }
 
     #[test]

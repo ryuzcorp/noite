@@ -131,6 +131,44 @@ struct IdParams {
     id: String,
 }
 
+const ERROR_STATUSES: &[&str] = &["open", "resolved", "ignored"];
+
+/// The last 24 UTC hour buckets, oldest first (`app_error_hour` keys).
+fn error_hour_keys() -> Vec<String> {
+    let now = chrono::Utc::now();
+    (0..24)
+        .rev()
+        .map(|h| {
+            (now - chrono::Duration::hours(h))
+                .format("%Y-%m-%dT%H:00:00Z")
+                .to_string()
+        })
+        .collect()
+}
+
+/// Hour rows → a 24-slot series per fingerprint, aligned to
+/// `error_hour_keys`.
+fn error_series(
+    keys: &[String],
+    rows: &[(String, String, i64)],
+) -> std::collections::HashMap<String, Vec<i64>> {
+    let mut out: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
+    for (fp, hour, n) in rows {
+        if let Some(i) = keys.iter().position(|k| k == hour) {
+            out.entry(fp.clone()).or_insert_with(|| vec![0; 24])[i] += n;
+        }
+    }
+    out
+}
+
+fn with_hourly(issue: &crate::models::ErrorIssue, hourly: Vec<i64>) -> serde_json::Value {
+    let mut v = serde_json::to_value(issue).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("hourly".into(), serde_json::json!(hourly));
+    }
+    v
+}
+
 #[allow(clippy::too_many_lines)]
 async fn dispatch_call(
     state: &AppState,
@@ -480,6 +518,141 @@ async fn dispatch_call(
                     Ok(rows) => JsonRpcResponse::success(id, rows),
                     Err(e) => internal(&id, e.to_string()),
                 },
+                Err(e) => internal(&id, e.to_string()),
+            }
+        }
+        "errors.list" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: String,
+                status: Option<String>,
+            }
+            let p: P = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let status = p.status.unwrap_or_else(|| "open".into());
+            if !ERROR_STATUSES.contains(&status.as_str()) {
+                return bad(&id, "status must be open, resolved or ignored");
+            }
+            let a = match app(state, &p.id, &id).await {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
+            let keys = error_hour_keys();
+            let (issues, counts, hours) = match tokio::try_join!(
+                db::list_error_issues(&state.pool, &a.id, &status, 200),
+                db::count_error_issues(&state.pool, &a.id),
+                db::list_error_hours(&state.pool, &a.id, &keys[0]),
+            ) {
+                Ok(r) => r,
+                Err(e) => return internal(&id, e.to_string()),
+            };
+            let mut series = error_series(&keys, &hours);
+            let issues: Vec<serde_json::Value> = issues
+                .into_iter()
+                .map(|issue| {
+                    let hourly = series.remove(&issue.fingerprint).unwrap_or_else(|| vec![0; 24]);
+                    with_hourly(&issue, hourly)
+                })
+                .collect();
+            let count = |s: &str| counts.iter().find(|(k, _)| k == s).map_or(0, |(_, n)| *n);
+            JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "issues": issues,
+                    "counts": {
+                        "open": count("open"),
+                        "resolved": count("resolved"),
+                        "ignored": count("ignored"),
+                    },
+                }),
+            )
+        }
+        "errors.get" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: String,
+                fingerprint: String,
+            }
+            let p: P = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let a = match app(state, &p.id, &id).await {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
+            let issue = match db::get_error_issue(&state.pool, &a.id, &p.fingerprint).await {
+                Ok(Some(i)) => i,
+                Ok(None) => return not_found(&id, "error not found"),
+                Err(e) => return internal(&id, e.to_string()),
+            };
+            let keys = error_hour_keys();
+            let (events, hours) = match tokio::try_join!(
+                db::list_error_events(&state.pool, &a.id, &p.fingerprint),
+                db::list_error_hours(&state.pool, &a.id, &keys[0]),
+            ) {
+                Ok(r) => r,
+                Err(e) => return internal(&id, e.to_string()),
+            };
+            let hourly = error_series(&keys, &hours)
+                .remove(&issue.fingerprint)
+                .unwrap_or_else(|| vec![0; 24]);
+            let events: Vec<serde_json::Value> = events
+                .into_iter()
+                .map(|e| {
+                    let frames: serde_json::Value =
+                        serde_json::from_str(&e.frames).unwrap_or_else(|_| serde_json::json!([]));
+                    let logs: serde_json::Value =
+                        serde_json::from_str(&e.logs).unwrap_or_else(|_| serde_json::json!([]));
+                    serde_json::json!({
+                        "tsUs": e.ts_us,
+                        "traceId": e.trace_id,
+                        "source": e.source,
+                        "handler": e.handler,
+                        "cell": e.cell,
+                        "kind": e.kind,
+                        "message": e.message,
+                        "context": e.context,
+                        "frames": frames,
+                        "logs": logs,
+                        "method": e.method,
+                        "path": e.path,
+                        "httpStatus": e.http_status,
+                        "browser": e.browser,
+                        "os": e.os,
+                        "sha": e.sha,
+                    })
+                })
+                .collect();
+            JsonRpcResponse::success(
+                id,
+                serde_json::json!({ "issue": with_hourly(&issue, hourly), "events": events }),
+            )
+        }
+        "errors.set_status" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: String,
+                fingerprint: String,
+                status: String,
+            }
+            let p: P = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            if !ERROR_STATUSES.contains(&p.status.as_str()) {
+                return bad(&id, "status must be open, resolved or ignored");
+            }
+            let a = match app(state, &p.id, &id).await {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
+            let now = crate::host::metrics::now_us();
+            match db::set_error_status(&state.pool, &a.id, &p.fingerprint, &p.status, now).await {
+                Ok(0) => not_found(&id, "error not found"),
+                Ok(_) => JsonRpcResponse::success(id, serde_json::json!({ "ok": true })),
                 Err(e) => internal(&id, e.to_string()),
             }
         }

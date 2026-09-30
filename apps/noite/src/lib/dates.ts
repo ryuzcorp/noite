@@ -30,3 +30,32 @@ export const formatHour = (utcHourKey: string): string => {
   const date = toDate(`${utcHourKey}:00:00Z`);
   return date === null ? "—" : hourOnly.format(date);
 };
+
+const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+
+const RELATIVE_STEPS: [Intl.RelativeTimeFormatUnit, number][] = [
+  ["second", 60],
+  ["minute", 60],
+  ["hour", 24],
+  ["day", 30],
+  ["month", 12],
+];
+
+/** How long ago, coarsely: `5 minutes ago`, `yesterday`. */
+export const formatAgo = (
+  value: string | Date | null | undefined,
+  now: number = Date.now()
+): string => {
+  const date = toDate(value);
+  if (date === null) {
+    return "—";
+  }
+  let amount = Math.round((date.getTime() - now) / 1000);
+  for (const [unit, size] of RELATIVE_STEPS) {
+    if (Math.abs(amount) < size) {
+      return relative.format(amount, unit);
+    }
+    amount = Math.round(amount / size);
+  }
+  return relative.format(amount, "year");
+};

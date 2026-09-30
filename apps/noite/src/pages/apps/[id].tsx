@@ -1,4 +1,5 @@
-import { DeployList, DeployDropdown } from "$lib/app-detail/deploys";
+import { DeployList } from "$lib/app-detail/deploys";
+import { ErrorsPanel } from "$lib/app-detail/errors";
 import { EventsPanel } from "$lib/app-detail/events";
 import {
   DEFAULT_METRICS_HOURS,
@@ -6,16 +7,16 @@ import {
   MetricsRangePicker,
   toMetricsHours,
 } from "$lib/app-detail/metrics";
-import { AppDetailPanel } from "$lib/app-detail/panel";
+import { AppDetailPanel, AppHeader } from "$lib/app-detail/panel";
 import { AppSettingsPanel } from "$lib/app-detail/settings";
-import { Code } from "$lib/icons";
-import { appDetail } from "$lib/resources";
+import { appDetail, errorList } from "$lib/resources";
 import { useRoute, head, searchParam } from "@ilha/router";
 
 const TABS = [
   { id: "overview", label: "Overview" },
   { id: "deployments", label: "Deployments" },
   { id: "metrics", label: "Metrics" },
+  { id: "errors", label: "Errors" },
   { id: "events", label: "Events" },
   { id: "settings", label: "Settings" },
 ] as const;
@@ -52,41 +53,46 @@ const MetricsTab = ({ appId }: { appId: string }) => {
 
 const AppPageBody = ({ appId }: { appId: string }) => {
   const tab = searchParam<TabId>("t", { default: "overview", parse: toTabId });
+  // The open error (ErrorsPanel's `?e=`): a tab click always lands on the
+  // tab's top level, so the Errors tab shows the list, not a stale detail.
+  const openError = searchParam("e", { default: "" });
   const name = appDetail(appId).data()?.app.name;
   head({ title: `${name ?? "App"} · Noite` });
+  // Same resource as the Errors tab's open list: the tab label shows how
+  // many errors wait for triage without a second fetch.
+  const openErrors = errorList(appId, "open").data()?.counts.open ?? 0;
 
   return (
     <div class="mx-auto mt-4 flex w-full max-w-5xl flex-col gap-4 px-4 pb-12">
-      <div class="flex items-center justify-between gap-2">
-        <div role="tablist" class="tabs tabs-border w-fit">
+      <AppHeader appId={appId} />
+      {/* One row on every width: narrow screens scroll the tabs sideways
+          instead of wrapping them into a stack. */}
+      <div class="border-base-300 overflow-x-auto border-b">
+        <div role="tablist" class="tabs tabs-border w-max flex-nowrap">
           {TABS.map((t) => (
             <button
               type="button"
               role="tab"
               aria-selected={tab() === t.id ? "true" : "false"}
-              class={`tab ${tab() === t.id ? "tab-active" : ""}`}
+              class={`tab gap-1.5 whitespace-nowrap ${tab() === t.id ? "tab-active" : ""}`}
               onclick={() => {
+                openError.set("");
                 tab.set(t.id);
               }}
             >
               {t.label}
+              {t.id === "errors" && openErrors > 0 ? (
+                <span class="badge badge-sm tabular-nums">{openErrors}</span>
+              ) : null}
             </button>
           ))}
         </div>
-        <div class="flex shrink-0 items-center gap-2">
-          <a href={`/apps/${appId}/source`} class="btn btn-sm">
-            <span class="inline-flex items-center gap-1">
-              <Code />
-              Code
-            </span>
-          </a>
-          <DeployDropdown appId={appId} />
-        </div>
       </div>
 
-      {tab() === "overview" ? <AppDetailPanel /> : null}
+      {tab() === "overview" ? <AppDetailPanel appId={appId} /> : null}
       {tab() === "deployments" ? <DeployList appId={appId} /> : null}
       {tab() === "metrics" ? <MetricsTab appId={appId} /> : null}
+      {tab() === "errors" ? <ErrorsPanel appId={appId} /> : null}
       {tab() === "events" ? <EventsPanel appId={appId} /> : null}
       {tab() === "settings" ? <AppSettingsPanel /> : null}
     </div>

@@ -37,9 +37,6 @@ use crate::db;
 use crate::host::cmd;
 
 const STATE_KEY: &str = "runner/state/noite.sqlite.zst";
-/// Pre-compression key: written before snapshots gained zstd (spec T4.2).
-/// Restore still reads it; nothing writes it anymore.
-const STATE_KEY_LEGACY: &str = "runner/state/noite.sqlite";
 const META_KEY: &str = "runner/state/noite.sqlite.meta.json";
 const OWNER_KEY: &str = "runner/state/owner.json";
 /// Snapshot cadence: poll data_version every 10 s, wait 10 s for bursts to
@@ -234,7 +231,6 @@ pub async fn restore_if_missing(cfg: &Config) -> anyhow::Result<bool> {
     if let Some(parent) = live.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
-    // New form first (zstd, spec T4.2), then the legacy raw database.
     match download_snapshot(cfg, &live).await {
         Ok(restored) => Ok(restored),
         Err(e) => Err(e.context("runner state restore failed; refusing to start with an empty database")),
@@ -265,39 +261,26 @@ async fn download_snapshot(cfg: &Config, live: &std::path::Path) -> anyhow::Resu
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("restore failed")))
 }
 
-/// One restore attempt: the compressed snapshot, falling back to the legacy
-/// raw key. Only "both keys missing" counts as no-snapshot — a transport
-/// error must never read as "start fresh".
+/// One restore attempt. Only a missing key counts as no-snapshot — a
+/// transport error must never read as "start fresh".
 async fn try_restore_once(
     cfg: &Config,
     live: &std::path::Path,
     partial: &std::path::Path,
 ) -> anyhow::Result<bool> {
     let uri = format!("s3://{}/{STATE_KEY}", cfg.s3_bucket);
-    match cmd::s3_cp_download(cfg, &uri, partial).await {
-        Ok(()) => {
-            let packed = tokio::fs::read(partial).await?;
-            // The main database is control-plane rows only now (metrics live
-            // in metrics.sqlite), so a whole-file decode is bounded.
-            let raw = zstd::decode_all(&packed[..])?;
-            tokio::fs::write(live, raw).await?;
-            tracing::info!(path = %live.display(), "runner state restored from bucket (zstd)");
-            return Ok(true);
-        }
-        Err(e) if !cmd::is_not_found(&e) => return Err(e),
-        Err(_) => {}
-    }
-    let legacy_uri = format!("s3://{}/{STATE_KEY_LEGACY}", cfg.s3_bucket);
-    match cmd::s3_cp_download(cfg, &legacy_uri, partial).await {
-        Ok(()) => {
-            // Rename into place only once complete: a crash mid-download
-            // must not leave a truncated database that "exists".
-            tokio::fs::rename(partial, live).await?;
-            tracing::info!(path = %live.display(), "runner state restored from bucket (legacy raw)");
-            Ok(true)
-        }
-        Err(e) => Err(e),
-    }
+    cmd::s3_cp_download(cfg, &uri, partial).await?;
+    let packed = tokio::fs::read(partial).await?;
+    // The main database is control-plane rows only (metrics live in
+    // metrics.sqlite), so a whole-file decode is bounded.
+    let raw = zstd::decode_all(&packed[..])?;
+    // Rename into place only once complete: a crash mid-write must not leave
+    // a truncated database that "exists".
+    let decoded = live.with_extension("sqlite.decoded");
+    tokio::fs::write(&decoded, raw).await?;
+    tokio::fs::rename(&decoded, live).await?;
+    tracing::info!(path = %live.display(), "runner state restored from bucket");
+    Ok(true)
 }
 
 /// Background sync: poll `data_version` on a dedicated connection, then
