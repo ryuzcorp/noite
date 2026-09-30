@@ -2,12 +2,7 @@
 # Noite uninstaller: removes what install.sh set up, so the host is clean for
 # a fresh install.
 #
-#   curl -fsSL https://noite.now/run.sh | sudo bash -s uninstall
-#   curl -fsSL https://noite.now/run.sh | sudo bash -s uninstall <domain>
-#
-# Without an argument it only lists what it would remove. Passing the install's
-# BASE_DOMAIN confirms (a flag gets pasted without thought). Nothing is asked:
-# under `curl | sudo bash` a read from the terminal can stop the script for good.
+#   curl -fsSL https://noite.now/run.sh | bash -s uninstall
 #
 # noite.now/run.sh resolves main to a commit and runs this file from it
 # (apps/website/public/run.sh), so every run is the latest.
@@ -24,6 +19,7 @@
 #   NOITE_DIR        install directory (default: /opt/noite)
 #   NOITE_KEEP_DATA  1 = remove the containers only; volumes, images and .env
 #                    stay, and re-running install brings the same install back
+#   NOITE_CONFIRM    1 = do not ask (required without a terminal)
 #
 # A bucket of your own (S3_ENDPOINT in .env) is never touched: a reinstall
 # pointed at it restores the old state from its snapshot.
@@ -35,6 +31,7 @@ set -euo pipefail
 
 NOITE_DIR="${NOITE_DIR:-/opt/noite}"
 NOITE_KEEP_DATA="${NOITE_KEEP_DATA:-0}"
+NOITE_CONFIRM="${NOITE_CONFIRM:-0}"
 # `name:` in compose.yaml; Compose labels everything it creates with it, so
 # the stack is found even when compose.yaml is gone.
 PROJECT="noite"
@@ -57,10 +54,20 @@ die() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Questions go to /dev/tty, readable only from its foreground process group
+# (see can_ask in install.sh).
+can_ask() {
+  (: </dev/tty) 2>/dev/null || return 1
+  local stat pgrp tpgid
+  stat=$(</proc/$$/stat)
+  read -r _ _ pgrp _ _ tpgid _ <<<"${stat##*) }"
+  [[ "$pgrp" == "$tpgid" ]]
+}
+
 env_get() { grep -E "^$1=" "$NOITE_DIR/.env" 2>/dev/null | tail -n 1 | cut -d= -f2-; }
 
 check_system() {
-  [[ "$(id -u)" -eq 0 ]] || die "run as root: curl -fsSL https://noite.now/run.sh | sudo bash -s uninstall"
+  [[ "$(id -u)" -eq 0 ]] || die "run as root: curl -fsSL https://noite.now/run.sh | bash -s uninstall"
   have docker || die "docker is not installed; nothing of Noite can be running"
   docker info >/dev/null 2>&1 || die "the Docker daemon is not running: systemctl start docker"
 }
@@ -99,20 +106,21 @@ survey() {
 }
 
 confirm() {
-  local expected="${DOMAIN:-noite}" keep=""
-  [[ "${1:-}" != "$expected" ]] || return 0
-  [[ -z "${1:-}" ]] || die "\"$1\" is not this install's domain; nothing was removed"
+  [[ "$NOITE_CONFIRM" != "1" ]] || return 0
+  can_ask || die "no terminal to confirm on: run curl -fsSL https://noite.now/run.sh | bash -s uninstall (no sudo), or set NOITE_CONFIRM=1"
+
+  local expected="${DOMAIN:-noite}" answer=""
   if [[ "$NOITE_KEEP_DATA" == "1" ]]; then
-    keep="NOITE_KEEP_DATA=1 "
-    printf '\n%sThis stops and removes the Noite containers; data and .env stay.%s\n' "$BOLD" "$RESET"
+    printf '\n%sStops and removes the Noite containers; data and .env stay.%s\n' "$BOLD" "$RESET" >/dev/tty
   else
-    printf '\n%s%sThis deletes every app, account, git repository, certificate and secret of the install.%s\n' \
-      "$RED" "$BOLD" "$RESET"
+    printf '\n%s%sDeletes every app, account, git repository, certificate and secret of this install.%s\n' \
+      "$RED" "$BOLD" "$RESET" >/dev/tty
     printf '%sBack up first if you need any of it: https://noite.now/self-hosting/operations#backups%s\n' \
-      "$DIM" "$RESET"
+      "$DIM" "$RESET" >/dev/tty
   fi
-  printf '\nTo go ahead, run:\n\n  curl -fsSL https://noite.now/run.sh | sudo %sbash -s uninstall %s\n' "$keep" "$expected"
-  exit 0
+  printf 'Type %s%s%s to continue: ' "$BOLD" "$expected" "$RESET" >/dev/tty
+  read -r answer </dev/tty || true
+  [[ "$answer" == "$expected" ]] || die "not confirmed; nothing was removed"
 }
 
 stop_stack() {
@@ -170,8 +178,8 @@ summary() {
 
 ${GREEN}${BOLD}Noite is stopped.${RESET} Volumes, images and $NOITE_DIR/.env are kept.
 
-  Start again   curl -fsSL https://noite.now/run.sh | sudo bash -s install
-  Remove all    curl -fsSL https://noite.now/run.sh | sudo bash -s uninstall
+  Start again   curl -fsSL https://noite.now/run.sh | bash -s install
+  Remove all    curl -fsSL https://noite.now/run.sh | bash -s uninstall
 EOF
     return 0
   fi
@@ -180,7 +188,7 @@ EOF
 
 ${GREEN}${BOLD}Noite is removed.${RESET} Docker and the ufw rules for 80/443 are left in place.
 
-  Reinstall     curl -fsSL https://noite.now/run.sh | sudo bash -s install
+  Reinstall     curl -fsSL https://noite.now/run.sh | bash -s install
 EOF
   if [[ -n "${S3_OWN:-}" && "$S3_OWN" != "http://rustfs:9000" ]]; then
     warn "your bucket at $S3_OWN was not touched: a reinstall pointed at it restores"
@@ -191,7 +199,7 @@ EOF
 main() {
   check_system
   survey
-  confirm "$@"
+  confirm
   stop_stack
   if [[ "$NOITE_KEEP_DATA" != "1" ]]; then
     remove_data

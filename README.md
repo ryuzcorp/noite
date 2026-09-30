@@ -4,7 +4,7 @@ Tiny self-hostable PaaS for [celld](https://celld.dev/). Spec: [SPEC.md](SPEC.md
 
 Noite ships as **one image**, `ghcr.io/<owner>/noite`: the runner (deploy pipeline, API, Git, telemetry) runs as PID 1 and supervises Caddy (the edge), the control UI (a celld node, fleet #0) and one celld fleet per tenant app. `docker compose up -d` runs it from `docker/compose.yaml` next to the bundled RustFS store.
 
-On a fresh Ubuntu or Debian server, `curl -fsSL https://noite.now/run.sh | sudo bash -s install` is the whole install ([`docker/install.sh`](docker/install.sh): Docker, `/opt/noite` with generated secrets, start, wait for `/ready`; re-run to upgrade). [`uninstall.sh`](docker/uninstall.sh) removes it again for a clean reinstall.
+On a fresh Ubuntu or Debian server, `curl -fsSL https://noite.now/run.sh | bash -s install` is the whole install ([`docker/install.sh`](docker/install.sh): Docker, `/opt/noite` with generated secrets, start, wait for `/ready`; re-run to upgrade). [`uninstall.sh`](docker/uninstall.sh) removes it again for a clean reinstall.
 
 Registration is invite-only: the **first** account to sign up bootstraps the instance — it needs no code and is promoted to `admin` — and every later account needs a single-use code. Each member holds two codes to hand out (read them on `/account`), and admins mint more from the Invitations panel in `/god-mode`.
 

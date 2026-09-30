@@ -21,7 +21,7 @@ _Recommendation: lead with the first. It leads with what people want (ownership)
 **Primary CTA:** the install command, as a copyable block with the copy button, not a button:
 
 ```bash
-curl -fsSL https://noite.now/run.sh | sudo bash -s install
+curl -fsSL https://noite.now/run.sh | bash -s install
 ```
 
 **Secondary CTAs:** `Read the quickstart →` · `View on GitHub`
@@ -102,7 +102,7 @@ Link: `How tenant isolation works →` (`/self-hosting/tenancy`)
 
 Tabs or logo row:
 
-- **Any VPS:** `curl -fsSL https://noite.now/run.sh | sudo bash -s install`
+- **Any VPS:** `curl -fsSL https://noite.now/run.sh | bash -s install`
 - **Docker Compose:** download `compose.yaml` and run `docker compose up -d`
 - **Coolify:** point a Compose resource at the repo
 - **Railway:** one service, one volume, one bucket
@@ -132,7 +132,7 @@ _Logos only where the docs have a guide (Coolify, Railway). No hosting-provider 
 **Title:** Your next app is one push away.
 
 ```bash
-curl -fsSL https://noite.now/run.sh | sudo bash -s install
+curl -fsSL https://noite.now/run.sh | bash -s install
 ```
 
 `Quickstart →` · `Docs →` · `GitHub →`

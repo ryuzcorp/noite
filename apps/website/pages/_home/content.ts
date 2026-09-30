@@ -2,7 +2,7 @@
 // here is backed by the docs; keep it that way when editing.
 
 export const INSTALL_COMMAND =
-  "curl -fsSL https://noite.now/run.sh | sudo bash -s install";
+  "curl -fsSL https://noite.now/run.sh | bash -s install";
 
 export const GITHUB_URL = "https://github.com/ryuzcorp/noite";
 
@@ -37,7 +37,7 @@ export const TERMINAL = [
   {
     delay: "",
     prefix: "$",
-    text: "curl -fsSL https://noite.now/run.sh | sudo bash -s install",
+    text: "curl -fsSL https://noite.now/run.sh | bash -s install",
     tone: "",
   },
   {

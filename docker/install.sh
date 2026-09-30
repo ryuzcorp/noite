@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
 # Noite installer: a fresh Ubuntu or Debian server to a running install.
 #
-#   curl -fsSL https://noite.now/run.sh | sudo bash -s install [domain]
-#
-# The domain (app./api./git./*. must point at this host) defaults to
-# <public-ip>.sslip.io, which needs no DNS. Nothing is asked: under
-# `curl | sudo bash` a read from the terminal can stop the script for good.
+#   curl -fsSL https://noite.now/run.sh | bash -s install
 #
 # noite.now/run.sh resolves NOITE_REF to a commit and runs this file from it
 # (apps/website/public/run.sh), so every run is the latest.
@@ -15,8 +11,9 @@
 # and waits for /ready. Re-running it is the upgrade: compose.yaml and the
 # image are refreshed, .env (domain, secrets) is kept.
 #
-# Environment (all optional; with sudo, put them after it):
-#   NOITE_DOMAIN       same as the domain argument
+# Environment (all optional; `curl … | NOITE_DOMAIN=example.com bash -s install`):
+#   NOITE_DOMAIN       base domain; app./api./git./*. must point at this host
+#                      (default: asked, <public-ip>.sslip.io on Enter or without a terminal)
 #   NOITE_ADMIN_EMAIL  promoted to admin at boot
 #   NOITE_VERSION      image tag (default: latest; a short SHA holds back)
 #   NOITE_REF          git ref the installer and compose.yaml come from (default: main)
@@ -51,10 +48,21 @@ die() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# stdin is this script under `curl | bash`, so questions go to /dev/tty. Only
+# the terminal's foreground process group may read it: a background process
+# (what `curl | sudo bash` makes of the script) is stopped by SIGTTIN for good.
+can_ask() {
+  (: </dev/tty) 2>/dev/null || return 1
+  local stat pgrp tpgid
+  stat=$(</proc/$$/stat)
+  read -r _ _ pgrp _ _ tpgid _ <<<"${stat##*) }"
+  [[ "$pgrp" == "$tpgid" ]]
+}
+
 check_system() {
   step "Checking the system"
   info "installer ${NOITE_REF:0:12}"
-  [[ "$(id -u)" -eq 0 ]] || die "run as root: curl -fsSL https://noite.now/run.sh | sudo bash -s install"
+  [[ "$(id -u)" -eq 0 ]] || die "run as root: curl -fsSL https://noite.now/run.sh | bash -s install"
   [[ "$(uname -s)" == "Linux" ]] || die "Noite installs on Linux only"
   case "$(uname -m)" in
     x86_64 | amd64 | aarch64 | arm64) ;;
@@ -127,22 +135,29 @@ env_set() {
 }
 
 choose_domain() {
-  NOITE_DOMAIN="${1:-${NOITE_DOMAIN:-}}"
-  local ip
+  local ip default answer=""
   ip=$(public_ip)
-  DOMAIN="${NOITE_DOMAIN:-${ip:+$ip.sslip.io}}"
+  default="${ip:+$ip.sslip.io}"
+  if [[ -n "${NOITE_DOMAIN:-}" ]]; then
+    answer="$NOITE_DOMAIN"
+  elif can_ask; then
+    info "Noite serves app.<domain>, api.<domain>, git.<domain> and *.<domain> (one per app)."
+    info "Point them at ${ip:-this server}, or press Enter for sslip.io to try it without DNS."
+    printf '    Base domain [%s]: ' "$default" >/dev/tty
+    read -r answer </dev/tty || true
+  else
+    warn "no terminal to ask on (\`curl | sudo bash\` runs this in the background); set NOITE_DOMAIN to choose"
+  fi
+  DOMAIN="${answer:-$default}"
 
   DOMAIN=$(printf '%s' "$DOMAIN" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#/.*$##')
-  [[ -n "$DOMAIN" ]] || die "no public IP found: pass the domain (… | sudo bash -s install example.com)"
+  [[ -n "$DOMAIN" ]] || die "no public IP found: set NOITE_DOMAIN (curl … | NOITE_DOMAIN=example.com bash -s install)"
   [[ "$DOMAIN" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] ||
     die "\"$DOMAIN\" is not a domain name"
 
   # sslip.io and nip.io resolve to the IP inside the name: nothing to check.
   case "$DOMAIN" in
-    *sslip.io | *nip.io)
-      info "using $DOMAIN; for your own domain, uninstall and pass it: … | sudo bash -s install example.com"
-      return 0
-      ;;
+    *sslip.io | *nip.io) return 0 ;;
   esac
   local resolved
   resolved=$(timeout 5 getent ahostsv4 "app.$DOMAIN" 2>/dev/null | awk 'NR == 1 { print $1 }') || true
@@ -257,7 +272,6 @@ EOF
 }
 
 main() {
-  NOITE_DOMAIN="${1:-${NOITE_DOMAIN:-}}"
   check_system
   install_docker
   check_ports
