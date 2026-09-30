@@ -222,6 +222,21 @@ async fn dispatch_call(
                 Err(e) => e,
             }
         }
+        "apps.get_by_slug" => {
+            #[derive(Deserialize)]
+            struct P {
+                slug: String,
+            }
+            let p: P = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            match db::get_app_by_slug(&state.pool, &p.slug).await {
+                Ok(Some(a)) => JsonRpcResponse::success(id, a),
+                Ok(None) => not_found(&id, "app not found"),
+                Err(e) => internal(&id, e.to_string()),
+            }
+        }
         "apps.patch" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
@@ -643,7 +658,7 @@ async fn dispatch_call(
             if app(state, &p.id, &id).await.is_err() {
                 return not_found(&id, "app not found");
             }
-            let hours = p.hours.unwrap_or(24).clamp(1, 336);
+            let hours = p.hours.unwrap_or(24).clamp(1, 720);
             let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
                 .format("%Y-%m-%dT%H:%M:00Z")
                 .to_string();
@@ -731,7 +746,7 @@ async fn dispatch_call(
                 Ok(a) => a,
                 Err(e) => return e,
             };
-            let hours = p.hours.unwrap_or(24).clamp(1, 336);
+            let hours = p.hours.unwrap_or(24).clamp(1, 720);
             let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
                 .format("%Y-%m-%dT%H:00:00Z")
                 .to_string();
@@ -749,7 +764,7 @@ async fn dispatch_call(
                 Ok(a) => a,
                 Err(e) => return e,
             };
-            let lines = super::observe::merged_lines(&state, &a.id, &a.slug).await;
+            let lines = super::observe::merged_lines(state, &a.id, &a.slug).await;
             JsonRpcResponse::success(id, lines)
         }
         "storage.list" => {

@@ -3,10 +3,12 @@ import { atom, watch } from "ilha";
 import { createMutationQueue } from "oxidejs/mutation-queue";
 import { kebabCase } from "scule";
 
-import { create } from "./apps.server";
+import { acceptInvitation, create, declineInvitation } from "./apps.server";
 import type { App } from "./collaborators";
+import { errorMessage } from "./errors";
 import { applistUrl, decodeApps, feedKeys, liveFeed } from "./feeds";
 import { ChevronRight } from "./icons";
+import { invalidate, keys, myInvitations } from "./resources";
 import { ListSkeleton } from "./skeletons";
 
 const queue = createMutationQueue();
@@ -83,6 +85,82 @@ export const appUrl = (subdomain: string): string => {
   return port ? `http://${host}:${port}` : `https://${host}`;
 };
 
+/** Collaborator invitations addressed to this account's email: nothing is
+ * granted until the person accepts here. Renders nothing when there are none. */
+const InvitationsBanner = () => {
+  const res = myInvitations();
+  const busy = atom(false);
+  const notice = atom("");
+  const invites = res.data() ?? [];
+  if (invites.length === 0 && !notice()) {
+    return null;
+  }
+  const answer = async (inviteId: string, accept: boolean) => {
+    busy.set(true);
+    notice.set("");
+    try {
+      if (accept) {
+        const { appId } = await acceptInvitation(inviteId);
+        invalidate(keys.myInvitations);
+        navigate(`/apps/${appId}`);
+      } else {
+        await declineInvitation(inviteId);
+        invalidate(keys.myInvitations);
+      }
+    } catch (error) {
+      notice.set(errorMessage(error));
+      invalidate(keys.myInvitations);
+    }
+    busy.set(false);
+  };
+  return (
+    <section
+      class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md"
+      aria-label="Invitations"
+    >
+      <div class="card-body gap-2 p-4">
+        <h2 class="m-0 text-lg font-semibold">Invitations</h2>
+        {notice() ? <p class="text-error m-0 text-sm">{notice()}</p> : null}
+        <ul class="m-0 flex list-none flex-col gap-2 p-0">
+          {invites.map((invite) => (
+            <li
+              key={invite.id}
+              class="flex flex-wrap items-center justify-between gap-2 text-sm"
+            >
+              <span>
+                Join <strong>{invite.appName}</strong> as{" "}
+                <span class="badge badge-ghost badge-sm">{invite.role}</span>
+              </span>
+              <span class="flex gap-2">
+                <button
+                  type="button"
+                  class="btn btn-sm btn-neutral"
+                  disabled={busy()}
+                  onclick={() => {
+                    void answer(invite.id, true);
+                  }}
+                >
+                  Accept
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-sm btn-ghost"
+                  disabled={busy()}
+                  onclick={() => {
+                    void answer(invite.id, false);
+                  }}
+                >
+                  Decline
+                </button>
+              </span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </section>
+  );
+};
+
 /** App list over SSE: skeleton until the first frame, then live updates —
  * no polling, and resubscribe is automatic on drop. */
 export const AppsList = () => {
@@ -94,6 +172,7 @@ export const AppsList = () => {
 
   return (
     <>
+      <InvitationsBanner />
       {retrying() ? (
         <p class="text-error m-0 text-sm">
           App stream disconnected — retrying…
@@ -213,7 +292,7 @@ export const CreateAppForm = () => {
       navigate("/apps");
     } catch (error) {
       busy.set(false);
-      notice.set(error instanceof Error ? error.message : String(error));
+      notice.set(errorMessage(error));
     }
   };
 

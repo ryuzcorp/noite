@@ -7,6 +7,8 @@ import type { D1Database } from "@cloudflare/workers-types";
  * Declared global: this file has imports (making it a module), so a plain
  * interface would be module-scoped and invisible to consumers. */
 declare global {
+  /** Build id stamped by `vite.config.ts` (git sha); absent under plain tsc/dev. */
+  const __CONTROL_BUILD__: string | undefined;
   interface KitEnv {
     DB?: D1Database;
     NOITE_EMAIL_WEBHOOK_URL?: string;
@@ -15,9 +17,6 @@ declare global {
     NOITE_RATE_LIMIT_RPM?: string;
     /** Better-auth's own per-client budget per minute (`/api/auth/*`). */
     NOITE_AUTH_RATE_LIMIT?: string;
-    AWS_ACCESS_KEY_ID?: string;
-    AWS_REGION?: string;
-    AWS_SECRET_ACCESS_KEY?: string;
     BASE_DOMAIN?: string;
     BETTER_AUTH_SECRET?: string;
     BETTER_AUTH_URL?: string;
@@ -25,9 +24,5 @@ declare global {
     NOITE_SMTP_FROM?: string;
     RUNNER_TOKEN?: string;
     RUNNER_URL?: string;
-    RUSTFS_ACCESS_KEY?: string;
-    RUSTFS_SECRET_KEY?: string;
-    S3_ENDPOINT?: string;
-    S3_PUBLIC_ENDPOINT?: string;
   }
 }

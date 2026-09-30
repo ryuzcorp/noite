@@ -77,7 +77,7 @@ Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (hand
 | `RUNNER_FLEET_ASSET_CACHE_MB` | `64` | → `CELLD_ASSET_CACHE_BYTES`; per-fleet on-disk asset cache | worker-passthrough (fleet) |
 | `RUNNER_OTEL_FLUSH_MS` | `30000` | → `CELLD_OTEL_FLUSH_MS`; bucket-flush + ingest tick cadence (min `1000`); dashboards lag ~40 s | worker-passthrough (fleet) |
 | `RUNNER_BUILD_CACHE_MB` | `512` | Per-app persistent bun cache cap; `0` disables | runner-owned |
-| `RUNNER_TELEMETRY_RETENTION_DAYS` | `14` | Days kept in bucket prune, metric tables, glob floor (min `1`) | runner-owned |
+| `RUNNER_TELEMETRY_RETENTION_DAYS` | `30` | Days kept in bucket prune, metric tables, glob floor (min `1`) | runner-owned |
 | `RUNNER_TIP_SWEEP_S` | `60` | Fallback S3 tip sweep per app; covers out-of-band bundle writes | runner-owned |
 | `RUNNER_FLEET_LOG` | `error,celld=warn` | Fleet `RUST_LOG` (runner's own filter stays separate) | worker-passthrough (fleet) |
 

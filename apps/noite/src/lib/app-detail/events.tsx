@@ -2,10 +2,10 @@
 //! expandable rows with tags + user properties, and an ingest snippet.
 import { searchParam } from "@ilha/router";
 import type { SearchParam } from "@ilha/router";
-import { atom, watch } from "ilha";
-import type { AtomHandle } from "ilha";
+import { atom } from "ilha";
 
 import { formatDateTime } from "../dates";
+import { errorMessage } from "../errors";
 import { getUserProps } from "../events.server";
 import type { EventsSnapshot } from "../feeds";
 import { decodeEvents, eventsUrl, feedKeys, liveFeed } from "../feeds";
@@ -277,7 +277,7 @@ const EventsFeed = ({
   clearQuery: () => void;
   pageIndex: SearchParam<number>;
   pageSize: SearchParam<number>;
-  query: AtomHandle<string>;
+  query: SearchParam<string>;
 }) => {
   const feed = liveFeed(
     feedKeys.events(appId, channel()),
@@ -307,8 +307,7 @@ const EventsFeed = ({
         } catch (error) {
           profileError.set({
             ...profileError(),
-            [event.userId]:
-              error instanceof Error ? error.message : String(error),
+            [event.userId]: errorMessage(error),
           });
         }
       })();
@@ -444,41 +443,16 @@ export const EventsPanel = ({ appId }: { appId: string }) => {
   // tab switches restore them; unknown channels just yield an empty feed.
   // Writing a default removes the param, matching the old URLs.
   const channel = searchParam("channel", { default: "" });
+  // The text filter writes the URL on every keystroke (no debounced draft
+  // atom): ilha keeps focus and caret across the re-render, and editing the
+  // filter resets the page in the same handler.
   const q = searchParam("q", { default: "" });
   const pageIndex = searchParam("p", { default: 0, parse: toPageIndex });
   const pageSize = searchParam("s", {
     default: DEFAULT_PAGE_SIZE,
     parse: toPageSize,
   });
-  // Text filter drafts locally and commits to the URL debounced, so typing
-  // never waits on navigation.
-  const query = atom(q());
-  const committed = atom(q());
-  watch(query, (value, { signal }) => {
-    // watch() also fires once on mount; committing then would reset a
-    // deep-linked ?p= to page 0. Only commit real edits.
-    if (value === committed()) {
-      return;
-    }
-    const timer = setTimeout(() => {
-      if (!signal.aborted && query() === value) {
-        committed.set(value);
-        q.set(value);
-        pageIndex.set(0);
-      }
-    }, 150);
-    return () => {
-      clearTimeout(timer);
-    };
-  });
-  // Back/forward moved the URL without us — adopt it into the draft.
-  if (q() !== committed()) {
-    committed.set(q());
-    query.set(q());
-  }
   const clearQuery = () => {
-    committed.set("");
-    query.set("");
     q.set("");
     pageIndex.set(0);
   };
@@ -490,7 +464,7 @@ export const EventsPanel = ({ appId }: { appId: string }) => {
       clearQuery={clearQuery}
       pageIndex={pageIndex}
       pageSize={pageSize}
-      query={query}
+      query={q}
     />
   );
 };

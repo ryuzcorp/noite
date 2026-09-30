@@ -18,6 +18,7 @@ import { atom } from "ilha";
 
 import { d1Write } from "../apps.server";
 import { Dialog } from "../dialog";
+import { errorMessage } from "../errors";
 import { Pencil, Trash } from "../icons";
 import { appDetail } from "../resources";
 import type { D1Preview } from "../runner";
@@ -95,10 +96,6 @@ const D1_FEATURES = tableFeatures({
   sortedRowModel: createSortedRowModel(),
 });
 
-/** One D1 table as an admin panel: global search + column filter +
- * sortable headers + pagination. Inputs are uncontrolled + onchange so
- * filtering never re-renders (and blurs) mid-typing; atoms update on
- * commit and the table rebuilds from them. */
 /** Key for one D1 row update/delete (empty means NULL). */
 interface D1Key {
   [column: string]: string | null;
@@ -178,7 +175,7 @@ const deleteD1Row = async ({
     await d1Write({ appId, databaseId, key, op: "delete", table, values: {} });
     return "";
   } catch (error) {
-    return error instanceof Error ? error.message : String(error);
+    return errorMessage(error);
   }
 };
 
@@ -350,6 +347,9 @@ const D1TableGrid = ({
   );
 };
 
+/** One D1 table as an admin panel: global search + column filter +
+ * sortable headers + pagination. Search inputs commit on every keystroke;
+ * ilha keeps focus and caret across the resulting re-render. */
 const D1TablePanel = ({
   appId,
   databaseId,
@@ -741,7 +741,7 @@ const D1RowDrawer = ({
       onSaved();
       onClose();
     } catch (error) {
-      err.set(error instanceof Error ? error.message : String(error));
+      err.set(errorMessage(error));
     } finally {
       busy.set(false);
     }

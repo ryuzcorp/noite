@@ -12,7 +12,7 @@ import type {
   RunnerInsight,
   RunnerApp,
 } from "./runner";
-import { withSnapshot, writeSwr } from "./swr-store";
+import { readSwr, withSnapshot, writeSwr } from "./swr-store";
 
 /** Live SSE panel state with stale-while-revalidate: `latest` paints the
  * last good frame for `key` (lib/swr-store) until the stream's first frame
@@ -101,8 +101,21 @@ export const feedKeys = {
   deploys: (appId: string) => `feed:${appId}:deploys`,
   events: (appId: string, channel: string) => `feed:${appId}:events:${channel}`,
   logs: (appId: string) => `feed:${appId}:logs`,
-  metrics: (appId: string) => `feed:${appId}:metrics`,
+  metrics: (appId: string, hours: number) => `feed:${appId}:metrics:${hours}`,
 } as const;
+
+/** Forget one app in the cached app-list snapshot. The list feed paints its
+ * last snapshot until the stream's first frame lands, so after a delete the
+ * next visit to /apps would otherwise flash the app that just went away. */
+export const dropAppFromSnapshot = (appId: string): void => {
+  const cached = readSwr<RunnerApp[]>(feedKeys.apps);
+  if (cached) {
+    writeSwr(
+      feedKeys.apps,
+      cached.filter((app) => app.id !== appId)
+    );
+  }
+};
 
 /** Live app list (same rows as the list action). */
 export const applistUrl = (): string => "/api/apps/stream";
@@ -115,9 +128,9 @@ export const deploysUrl = (appId: string): string =>
 export const logsUrl = (appId: string): string =>
   `/api/apps/${encodeURIComponent(appId)}/logs/stream`;
 
-/** Usage frames for one app. */
-export const metricsUrl = (appId: string): string =>
-  `/api/apps/${encodeURIComponent(appId)}/metrics/stream`;
+/** Usage frames for one app over a `hours`-long window (24, 168 or 720). */
+export const metricsUrl = (appId: string, hours: number): string =>
+  `/api/apps/${encodeURIComponent(appId)}/metrics/stream?hours=${hours}`;
 
 /** Event snapshots for one app, scoped server-side by channel. */
 export const eventsUrl = (

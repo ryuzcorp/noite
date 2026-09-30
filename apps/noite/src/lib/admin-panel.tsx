@@ -1,14 +1,19 @@
-import { navigate } from "@ilha/router";
+import { navigate, searchParam } from "@ilha/router";
 import { atom } from "ilha";
 
 import {
   adminCreateInvites,
+  adminDeleteApp,
   adminRevokeInvite,
+  adminSetAppState,
   banUser,
+  deleteUser,
+  setUserRole,
   unbanUser,
 } from "./admin.server";
 import { initials, presenceTone } from "./apps";
 import { authClient } from "./auth-client";
+import { errorMessage } from "./errors";
 import { adminListInvites, listAllApps, listUsers } from "./resources";
 import { invalidateSession } from "./session";
 
@@ -25,6 +30,7 @@ interface AdminApp {
   desiredState: string;
   id: string;
   name: string;
+  ownerEmail: string;
   ownerId: string;
   slug: string;
   status: string;
@@ -37,6 +43,8 @@ interface AdminUserRowProps {
   impersonating: boolean;
   onToggle: (row: AdminUser) => void;
   onImpersonate: (row: AdminUser) => void;
+  onRole: (row: AdminUser) => void;
+  onDelete: (row: AdminUser) => void;
 }
 
 const AdminUserRow = (props: AdminUserRowProps) => {
@@ -65,7 +73,7 @@ const AdminUserRow = (props: AdminUserRowProps) => {
         </div>
       </div>
       {props.isSelf ? null : (
-        <div class="flex gap-1">
+        <div class="flex flex-wrap justify-end gap-1">
           <button
             type="button"
             class="btn btn-sm btn-ghost"
@@ -81,10 +89,30 @@ const AdminUserRow = (props: AdminUserRowProps) => {
             class="btn btn-sm btn-ghost"
             disabled={props.busy}
             onclick={() => {
+              props.onRole(row);
+            }}
+          >
+            {row.role === "admin" ? "Remove admin" : "Make admin"}
+          </button>
+          <button
+            type="button"
+            class="btn btn-sm btn-ghost"
+            disabled={props.busy}
+            onclick={() => {
               props.onToggle(row);
             }}
           >
             {row.banned ? "Unban" : "Ban"}
+          </button>
+          <button
+            type="button"
+            class="btn btn-sm btn-ghost text-error"
+            disabled={props.busy}
+            onclick={() => {
+              props.onDelete(row);
+            }}
+          >
+            Delete
           </button>
         </div>
       )}
@@ -92,7 +120,14 @@ const AdminUserRow = (props: AdminUserRowProps) => {
   );
 };
 
-const AdminAppRow = ({ row }: { row: AdminApp }) => (
+interface AdminAppRowProps {
+  busy: boolean;
+  onDelete: (row: AdminApp) => void;
+  onToggle: (row: AdminApp) => void;
+  row: AdminApp;
+}
+
+const AdminAppRow = ({ busy, onDelete, onToggle, row }: AdminAppRowProps) => (
   <li class="list-row">
     <div>
       <div class="avatar avatar-placeholder">
@@ -119,7 +154,30 @@ const AdminAppRow = ({ row }: { row: AdminApp }) => (
         {row.desiredState && row.desiredState !== row.status
           ? ` → ${row.desiredState}`
           : ""}
+        {row.ownerEmail ? ` · ${row.ownerEmail}` : ""}
       </div>
+    </div>
+    <div class="flex gap-1">
+      <button
+        type="button"
+        class="btn btn-sm btn-ghost"
+        disabled={busy}
+        onclick={() => {
+          onToggle(row);
+        }}
+      >
+        {row.desiredState === "running" ? "Stop" : "Start"}
+      </button>
+      <button
+        type="button"
+        class="btn btn-sm btn-ghost text-error"
+        disabled={busy}
+        onclick={() => {
+          onDelete(row);
+        }}
+      >
+        Delete
+      </button>
     </div>
   </li>
 );
@@ -220,12 +278,36 @@ const PanelSkeleton = ({ title }: { title: string }) => (
  * actions enforce the same check — and the gate result arrives as a prop so
  * the page performs it exactly once. */
 
-/** Every account, with ban / unban and impersonation. */
-export const AdminUsersPanel = ({ email }: { email: string }) => {
+/** Native confirm dialog: the requirement for privilege changes and
+ * destructive deletes. */
+const confirmAction = (message: string): boolean =>
+  // oxlint-disable-next-line no-alert -- native confirm dialog is the requirement for destructive admin actions.
+  window.confirm(message);
+
+/** Parse `?up=` (page index): garbage falls back to the first page. */
+const toPageIndex = (raw: string): number =>
+  Math.max(Math.trunc(Number(raw)) || 0, 0);
+
+interface AdminUsersListProps {
+  email: string;
+  onPage: (page: number) => void;
+  page: number;
+  query: string;
+}
+
+/** One (query, page) of the user list. Keyed by the parent on both, because a
+ * resource key cannot change under a mounted component. */
+const AdminUsersList = ({
+  email,
+  onPage,
+  page,
+  query,
+}: AdminUsersListProps) => {
   const busy = atom(false);
   const impersonating = atom(false);
-  const res = listUsers();
-  const users = res.data() ?? [];
+  const res = listUsers(query, page);
+  const users = res.data()?.users ?? [];
+  const hasMore = res.data()?.hasMore ?? false;
   const loadError = res.error();
   const panelError = atom("");
 
@@ -249,21 +331,48 @@ export const AdminUsersPanel = ({ email }: { email: string }) => {
       invalidateSession();
       navigate("/apps");
     } catch (error) {
-      panelError.set(error instanceof Error ? error.message : String(error));
+      panelError.set(errorMessage(error));
       impersonating.set(false);
     }
   };
 
-  const toggleBan = async (user: AdminUser) => {
+  /** Run one admin mutation, then reload this page of the list. */
+  const mutate = async <T,>(work: () => Promise<T>): Promise<void> => {
     busy.set(true);
     panelError.set("");
     try {
-      await (user.banned ? unbanUser(user.id) : banUser(user.id));
+      await work();
       await reload();
     } catch (error) {
-      panelError.set(error instanceof Error ? error.message : String(error));
+      panelError.set(errorMessage(error));
     }
     busy.set(false);
+  };
+
+  const toggleBan = (user: AdminUser) =>
+    mutate(() => (user.banned ? unbanUser(user.id) : banUser(user.id)));
+
+  const toggleRole = (user: AdminUser) => {
+    const next = user.role === "admin" ? "user" : "admin";
+    if (
+      !confirmAction(
+        `Make ${user.email} ${next === "admin" ? "an admin" : "a regular user"}?`
+      )
+    ) {
+      return Promise.resolve();
+    }
+    return mutate(() => setUserRole({ role: next, userId: user.id }));
+  };
+
+  const removeUser = (user: AdminUser) => {
+    if (
+      !confirmAction(
+        `Delete ${user.email}? Their account, sessions and API keys are removed. This cannot be undone.`
+      )
+    ) {
+      return Promise.resolve();
+    }
+    return mutate(() => deleteUser(user.id));
   };
 
   if (res.loading() && res.data() === undefined) {
@@ -273,18 +382,43 @@ export const AdminUsersPanel = ({ email }: { email: string }) => {
     <>
       {loadError ? (
         <p class="m-0 text-sm opacity-70">
-          Failed to load: {String(loadError)}
+          Failed to load: {errorMessage(loadError)}
         </p>
       ) : null}
       <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
         <li class="flex items-center justify-between gap-2 p-4 pb-2">
           <span class="text-lg font-semibold tracking-wide">Users</span>
+          <span class="flex items-center gap-2">
+            <button
+              type="button"
+              class="btn btn-sm btn-ghost"
+              disabled={page === 0}
+              onclick={() => {
+                onPage(page - 1);
+              }}
+            >
+              Previous
+            </button>
+            <span class="text-xs opacity-70">Page {page + 1}</span>
+            <button
+              type="button"
+              class="btn btn-sm btn-ghost"
+              disabled={!hasMore}
+              onclick={() => {
+                onPage(page + 1);
+              }}
+            >
+              Next
+            </button>
+          </span>
         </li>
         {panelError() ? (
           <li class="text-error px-4 pb-2 text-sm">{panelError()}</li>
         ) : null}
         {users.length === 0 ? (
-          <li class="px-4 pt-2 pb-4 text-sm opacity-70">No users yet.</li>
+          <li class="px-4 pt-2 pb-4 text-sm opacity-70">
+            {query ? "No users match that search." : "No users yet."}
+          </li>
         ) : (
           users.map((row) => (
             <AdminUserRow
@@ -299,6 +433,12 @@ export const AdminUsersPanel = ({ email }: { email: string }) => {
               onImpersonate={(r) => {
                 void impersonate(r);
               }}
+              onRole={(r) => {
+                void toggleRole(r);
+              }}
+              onDelete={(r) => {
+                void removeUser(r);
+              }}
             />
           ))
         )}
@@ -307,11 +447,81 @@ export const AdminUsersPanel = ({ email }: { email: string }) => {
   );
 };
 
-/** Every app on the instance, whichever account owns it. */
+/** Every account: search, page, ban, role, delete, impersonate. The search
+ * and page live in the URL (`?uq=`, `?up=`) like the app tabs' filters, so a
+ * refresh or shared link restores them; the search applies on submit rather
+ * than per keystroke, so typing never fires a query. */
+export const AdminUsersPanel = ({ email }: { email: string }) => {
+  const query = searchParam("uq", { default: "" });
+  const page = searchParam("up", { default: 0, parse: toPageIndex });
+  const draft = atom(query());
+
+  const submit = (event: SubmitEvent) => {
+    event.preventDefault();
+    query.set(draft().trim());
+    page.set(0);
+  };
+
+  return (
+    <>
+      <form class="flex items-center gap-2" onsubmit={submit} role="search">
+        <input
+          id="admin-user-search"
+          class="input input-sm w-64"
+          type="search"
+          placeholder="Search by email or name"
+          aria-label="Search users by email or name"
+          value={draft()}
+          oninput={(e) => {
+            draft.set(e.currentTarget.value);
+          }}
+        />
+        <button type="submit" class="btn btn-sm">
+          Search
+        </button>
+      </form>
+      <AdminUsersList
+        key={`${query()}:${page()}`}
+        email={email}
+        page={page()}
+        query={query()}
+        onPage={(next) => {
+          page.set(next);
+        }}
+      />
+    </>
+  );
+};
+
+/** Every app on the instance, whichever account owns it: filter by name,
+ * slug or owner; start, stop or delete any of them. */
 export const AdminAppsPanel = () => {
   const res = listAllApps();
+  const filter = atom("");
+  const busy = atom(false);
+  const panelError = atom("");
   const apps = res.data() ?? [];
   const loadError = res.error();
+  const needle = filter().trim().toLowerCase();
+  const shown = needle
+    ? apps.filter((app) =>
+        [app.name, app.slug, app.ownerEmail].some((field) =>
+          field.toLowerCase().includes(needle)
+        )
+      )
+    : apps;
+
+  const mutate = async <T,>(work: () => Promise<T>): Promise<void> => {
+    busy.set(true);
+    panelError.set("");
+    try {
+      await work();
+      await res.refetch();
+    } catch (error) {
+      panelError.set(errorMessage(error));
+    }
+    busy.set(false);
+  };
 
   if (res.loading() && res.data() === undefined) {
     return <PanelSkeleton title="Apps" />;
@@ -320,17 +530,58 @@ export const AdminAppsPanel = () => {
     <>
       {loadError ? (
         <p class="m-0 text-sm opacity-70">
-          Failed to load: {String(loadError)}
+          Failed to load: {errorMessage(loadError)}
         </p>
       ) : null}
       <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
         <li class="flex items-center justify-between gap-2 p-4 pb-2">
           <span class="text-lg font-semibold tracking-wide">Apps</span>
+          <input
+            id="admin-app-filter"
+            class="input input-sm w-56"
+            type="search"
+            placeholder="Filter by name, slug or owner"
+            aria-label="Filter apps by name, slug or owner"
+            value={filter()}
+            oninput={(e) => {
+              filter.set(e.currentTarget.value);
+            }}
+          />
         </li>
-        {apps.length === 0 ? (
-          <li class="px-4 pt-2 pb-4 text-sm opacity-70">No apps yet.</li>
+        {panelError() ? (
+          <li class="text-error px-4 pb-2 text-sm">{panelError()}</li>
+        ) : null}
+        {shown.length === 0 ? (
+          <li class="px-4 pt-2 pb-4 text-sm opacity-70">
+            {needle ? "No apps match that filter." : "No apps yet."}
+          </li>
         ) : (
-          apps.map((row) => <AdminAppRow key={row.id} row={row} />)
+          shown.map((row) => (
+            <AdminAppRow
+              key={row.id}
+              row={row}
+              busy={busy()}
+              onToggle={(app) => {
+                void mutate(() =>
+                  adminSetAppState({
+                    desiredState:
+                      app.desiredState === "running" ? "stopped" : "running",
+                    id: app.id,
+                  })
+                );
+              }}
+              onDelete={(app) => {
+                if (
+                  !confirmAction(
+                    `Delete ${app.name} (${app.slug})? This removes the app, its git remote and its fleet.`
+                  )
+                ) {
+                  return;
+                }
+                void mutate(() => adminDeleteApp(app.id));
+              }}
+            />
+          ))
         )}
       </ul>
     </>
@@ -356,7 +607,7 @@ export const AdminInvitesPanel = () => {
       await adminCreateInvites({ count: Number(mintCount()) });
       await reload();
     } catch (error) {
-      panelError.set(error instanceof Error ? error.message : String(error));
+      panelError.set(errorMessage(error));
     }
     busy.set(false);
   };
@@ -368,7 +619,7 @@ export const AdminInvitesPanel = () => {
       await adminRevokeInvite(id);
       await reload();
     } catch (error) {
-      panelError.set(error instanceof Error ? error.message : String(error));
+      panelError.set(errorMessage(error));
     }
     busy.set(false);
   };
@@ -394,7 +645,7 @@ export const AdminInvitesPanel = () => {
     <>
       {loadError ? (
         <p class="m-0 text-sm opacity-70">
-          Failed to load: {String(loadError)}
+          Failed to load: {errorMessage(loadError)}
         </p>
       ) : null}
       <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">

@@ -14,9 +14,10 @@ import {
   resolveAdminEmail,
   UnauthorizedError,
 } from "./auth";
+import { dropAppCollaborators } from "./collaborators";
 import { ensureDbPromise, withDb } from "./db";
 import { listInvites, mintInvites, revokeInvite } from "./invites.server";
-import { runnerListApps } from "./runner";
+import { runnerDeleteApp, runnerListApps, runnerPatchApp } from "./runner";
 import type { RunnerApp } from "./runner";
 
 /** Explicit user-row shape (mirrors the paranorm `user` table). Written
@@ -174,13 +175,30 @@ export const adminOverview = action(
   { error: AuthError }
 );
 
-/** Every account on this instance (admin only). */
+/** Users per page of the god-mode list. */
+export const ADMIN_USERS_PAGE_SIZE = 25;
+
+const ListUsersArgs = Schema.Struct({
+  page: Schema.Number,
+  query: Schema.String,
+});
+
+/** Escape LIKE wildcards so a search for `50%` or `a_b` matches literally. */
+const likePattern = (query: string): string =>
+  `%${query.replaceAll(/[\\%_]/gu, (char) => `\\${char}`)}%`;
+
+/** One page of accounts (admin only), newest first, optionally filtered by a
+ * case-insensitive match on email or name. One query per page: it fetches a
+ * row beyond the page to learn whether a next page exists, instead of a
+ * second COUNT (the control node's D1 stalls on later queries in an action). */
 export const listUsers = action(
-  async () => {
+  checkedSchema(ListUsersArgs, async ({ page, query }) => {
     const admin = await requireAdmin();
     if (!admin) {
       failAction("Admin only");
     }
+    const needle = query.trim().slice(0, 100);
+    const offset = Math.max(0, Math.floor(page)) * ADMIN_USERS_PAGE_SIZE;
     try {
       // Plain SELECT outside the paranorm builder: the builder exceeds
       // tsc's depth budget in some configs, while the untyped call stays
@@ -188,24 +206,38 @@ export const listUsers = action(
       const found = await withDb(
         Effect.gen(function* () {
           const sql = yield* SqlClient;
+          const filter = needle
+            ? `WHERE lower(email) LIKE ? ESCAPE '\\' OR lower(name) LIKE ? ESCAPE '\\'`
+            : "";
+          const params: (string | number)[] = needle
+            ? [
+                likePattern(needle.toLowerCase()),
+                likePattern(needle.toLowerCase()),
+              ]
+            : [];
           return yield* sql.unsafe(
-            `SELECT id, email, name, banned, role, createdAt FROM "user"`
+            `SELECT id, email, name, banned, role, createdAt FROM "user"
+              ${filter} ORDER BY createdAt DESC, id LIMIT ? OFFSET ?`,
+            [...params, ADMIN_USERS_PAGE_SIZE + 1, offset]
           );
         })
       );
       // SAFETY: the column list mirrors DbUser and D1 returns plain row
       // objects.
       const rows = found as DbUser[];
-      const users = rows.map((row) => asUserRow(row));
-      users.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
-      return users.slice(0, 200);
+      return {
+        hasMore: rows.length > ADMIN_USERS_PAGE_SIZE,
+        users: rows
+          .slice(0, ADMIN_USERS_PAGE_SIZE)
+          .map((row) => asUserRow(row)),
+      };
     } catch (error) {
       if (error instanceof UnauthorizedError || error instanceof ActionError) {
         throw error;
       }
-      failUnknown(error);
+      return failUnknown(error);
     }
-  },
+  }),
   { error: AuthError }
 );
 
@@ -213,21 +245,27 @@ export interface AdminAppRow {
   desiredState: string;
   id: string;
   name: string;
+  ownerEmail: string;
   ownerId: string;
   slug: string;
   status: string;
 }
 
-const asAppRow = (app: RunnerApp): AdminAppRow => ({
+const asAppRow = (
+  app: RunnerApp,
+  emails: Map<string, string>
+): AdminAppRow => ({
   desiredState: app.desiredState ?? "",
   id: app.id,
   name: app.name,
+  ownerEmail: emails.get(app.userId) ?? "",
   ownerId: app.userId,
   slug: app.slug,
   status: app.status,
 });
 
-/** Every app on this instance, all owners (admin only; runner is source). */
+/** Every app on this instance, all owners (admin only; runner is source),
+ * each with its owner's email. */
 export const listAllApps = action(
   async () => {
     const admin = await requireAdmin();
@@ -235,15 +273,71 @@ export const listAllApps = action(
       failAction("Admin only");
     }
     try {
-      const apps = await runnerListApps();
-      return apps.map(asAppRow);
+      const [apps, users] = await Promise.all([
+        runnerListApps(),
+        withDb(
+          Effect.gen(function* () {
+            const sql = yield* SqlClient;
+            return yield* sql.unsafe(`SELECT id, email FROM "user"`);
+          })
+        ),
+      ]);
+      // SAFETY: the projection is (id, email); D1 returns plain rows.
+      const emails = new Map(
+        (users as { email: string; id: string }[]).map((u) => [u.id, u.email])
+      );
+      return apps.map((app) => asAppRow(app, emails));
     } catch (error) {
       if (error instanceof UnauthorizedError || error instanceof ActionError) {
         throw error;
       }
-      failUnknown(error);
+      return failUnknown(error);
     }
   },
+  { error: AuthError }
+);
+
+const AdminAppState = Schema.Struct({
+  desiredState: Schema.String,
+  id: Schema.String,
+});
+
+/** Start or stop any app, whoever owns it (admin only). */
+export const adminSetAppState = action(
+  checkedSchema(AdminAppState, async ({ desiredState, id }) => {
+    const admin = await requireAdmin();
+    if (!admin) {
+      failAction("Admin only");
+    }
+    if (desiredState !== "running" && desiredState !== "stopped") {
+      failAction("desiredState must be running or stopped");
+    }
+    try {
+      await runnerPatchApp(id, { desiredState });
+      return { ok: true as const };
+    } catch (error) {
+      return failUnknown(error);
+    }
+  }),
+  { error: AuthError }
+);
+
+/** Delete any app, whoever owns it (admin only): the runner drops the app,
+ * then its grants and pending invitations go with it. */
+export const adminDeleteApp = action(
+  checkedSchema(Schema.String, async (id: string) => {
+    const admin = await requireAdmin();
+    if (!admin) {
+      failAction("Admin only");
+    }
+    try {
+      await runnerDeleteApp(id);
+      await withDb(dropAppCollaborators(id));
+      return { ok: true as const };
+    } catch (error) {
+      return failUnknown(error);
+    }
+  }),
   { error: AuthError }
 );
 
@@ -283,6 +377,93 @@ export const unbanUser = action(
         throw error;
       }
       failUnknown(error);
+    }
+  }),
+  { error: AuthError }
+);
+
+const SetUserRole = Schema.Struct({
+  role: Schema.String,
+  userId: Schema.String,
+});
+
+/** Promote or demote an account (admin only). Never your own: an admin who
+ * demotes themselves cannot undo it, and the acting admin is what guarantees
+ * the instance always has one. */
+export const setUserRole = action(
+  checkedSchema(SetUserRole, async ({ role, userId }) => {
+    const admin = (await requireAdmin()) ?? failAction("Admin only");
+    const nextRole = role === "admin" || role === "user" ? role : null;
+    if (nextRole === null) {
+      return failAction("role must be admin or user");
+    }
+    if (userId === admin.id) {
+      return failAction("Cannot change your own role");
+    }
+    const { auth, headers } = await adminAuth();
+    try {
+      await auth.api.setRole({ body: { role: nextRole, userId }, headers });
+      return { ok: true as const };
+    } catch (error) {
+      if (error instanceof UnauthorizedError || error instanceof ActionError) {
+        throw error;
+      }
+      return failUnknown(error);
+    }
+  }),
+  { error: AuthError }
+);
+
+/** Apps whose only admin is this account: deleting the account would leave
+ * them with nobody to manage them. */
+const soleAdminApps = (userId: string) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient;
+    const rows = yield* sql.unsafe(
+      `SELECT c.appId AS appId FROM app_collaborator c
+        WHERE c.userId = ? AND c.role = 'admin'
+          AND (SELECT count(*) FROM app_collaborator o
+                WHERE o.appId = c.appId AND o.role = 'admin') = 1`,
+      [userId]
+    );
+    return rows.length;
+  });
+
+/** Remove the account rows better-auth does not own a foreign key for. */
+const dropUserLeftovers = (userId: string) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient;
+    yield* sql.unsafe(`DELETE FROM apikey WHERE referenceId = ?`, [userId]);
+    yield* sql.unsafe(`DELETE FROM app_collaborator WHERE userId = ?`, [
+      userId,
+    ]);
+  });
+
+/** Delete an account (admin only), its sessions, keys and grants. Refused for
+ * yourself, and while the account is the only admin of an app (hand the app
+ * over or delete it first). */
+export const deleteUser = action(
+  checkedSchema(UserId, async (userId: string) => {
+    const admin = (await requireAdmin()) ?? failAction("Admin only");
+    if (userId === admin.id) {
+      failAction("Cannot delete your own account");
+    }
+    try {
+      const stranded = await withDb(soleAdminApps(userId));
+      if (stranded > 0) {
+        failAction(
+          `This account is the only admin of ${stranded} app${stranded === 1 ? "" : "s"} — make someone else an admin or delete the app first`
+        );
+      }
+      const { auth, headers } = await adminAuth();
+      await auth.api.removeUser({ body: { userId }, headers });
+      await withDb(dropUserLeftovers(userId));
+      return { ok: true as const };
+    } catch (error) {
+      if (error instanceof UnauthorizedError || error instanceof ActionError) {
+        throw error;
+      }
+      return failUnknown(error);
     }
   }),
   { error: AuthError }

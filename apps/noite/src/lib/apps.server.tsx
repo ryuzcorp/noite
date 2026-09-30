@@ -1,7 +1,7 @@
 /* eslint-disable func-names -- Effect.gen */
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { action, liveQuery, useEnv, useRequest } from "oxidejs";
+import { action, useEnv, useRequest } from "oxidejs";
 
 import { checkedSchema } from "./action-schema";
 import {
@@ -14,16 +14,21 @@ import {
 } from "./auth";
 import type { SessionUser } from "./auth";
 import {
+  acceptPendingInvite,
   countAdmins,
+  declinePendingInvite,
   dropAppCollaborators,
   grantCollaborator,
-  listAppsForCollaborator,
+  listCollaboratorRows,
+  listInvitesForEmail,
+  listPendingInvites,
+  normalizeEmail,
   parseAppRole,
   requireAppRole,
+  revokePendingInvite,
+  upsertPendingInvite,
 } from "./collaborators";
-import type { App } from "./collaborators";
 import { ensureDbPromise, orm, withDb } from "./db";
-import type { AppRole } from "./db";
 import { listUnusedInvitesFor } from "./invites.server";
 import {
   runnerAddDomain,
@@ -71,9 +76,6 @@ const SourceBlobArgs = Schema.Struct({
 
 const SLUG_RE = /^[a-z0-9](?<slug>[a-z0-9-]{0,46}[a-z0-9])?$/u;
 const RESERVED_SLUGS = new Set(["_control", "app", "api", "git"]);
-
-const appsFor = (userId: string) =>
-  liveQuery<App[]>({ topic: `apps:${userId}` });
 
 /** new URL() throws on malformed input — never let a bad request URL 500. */
 const requestOrigin = (request: Request): string | undefined => {
@@ -128,16 +130,20 @@ export const create = action(
         "Slug must be 1–48 chars: lowercase letters, digits, and hyphens, starting and ending with a letter or digit"
       );
     }
-    const hub = appsFor(user.id);
     try {
       const app = await runnerCreateApp({
         name: trimmedName,
         slug: normalized,
         userId: user.id,
       });
-      // The runner owns the app row; the creator's admin grant is ours.
-      await withDb(grantCollaborator(app.id, user.id, "admin"));
-      await hub.mutate(() => listAppsForCollaborator(user.id));
+      // The runner owns the app row; the creator's admin grant is ours. A
+      // failed grant would leave an app nobody can open, so roll it back.
+      try {
+        await withDb(grantCollaborator(app.id, user.id, "admin"));
+      } catch (grantError) {
+        await runnerDeleteApp(app.id).catch(() => null);
+        throw grantError;
+      }
     } catch (error) {
       if (error instanceof ActionError || error instanceof UnauthorizedError) {
         throw error;
@@ -152,12 +158,10 @@ export const remove = action(
   checkedSchema(AppId, async (appId) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "admin");
-    const hub = appsFor(user.id);
     try {
       await runnerDeleteApp(appId);
       // Nothing cascades grants now that the app row lives in the runner.
       await withDb(dropAppCollaborators(appId));
-      await hub.mutate(() => listAppsForCollaborator(user.id));
     } catch (error) {
       if (error instanceof ActionError || error instanceof UnauthorizedError) {
         throw error;
@@ -227,13 +231,11 @@ export const setDesired = action(
       }
       const user = await sessionUser();
       await requireAppRole(id, user.id, "push");
-      const hub = appsFor(user.id);
       try {
         // SAFETY: desiredState is validated above to be exactly "running" | "stopped" before this cast.
         await runnerPatchApp(id, {
           desiredState: desiredState as "running" | "stopped",
         });
-        await hub.mutate(() => listAppsForCollaborator(user.id));
       } catch (error) {
         if (
           error instanceof ActionError ||
@@ -273,10 +275,8 @@ export const renameApp = action(
     }
     const user = await sessionUser();
     await requireAppRole(id, user.id, "admin");
-    const hub = appsFor(user.id);
     try {
       await runnerRenameApp(id, { name: trimmedName, slug: normalized });
-      await hub.mutate(() => listAppsForCollaborator(user.id));
     } catch (error) {
       if (error instanceof ActionError || error instanceof UnauthorizedError) {
         throw error;
@@ -414,10 +414,38 @@ const DeleteEnvArgs = Schema.Struct({
   name: Schema.String,
 });
 
+/** One env row as the browser sees it. Values are write-only: only
+ * `FLAG_*` toggles (non-secret `1`/`0` by convention) carry theirs, so a
+ * view-only collaborator — or anything persisted client-side — never holds a
+ * secret. */
+export interface EnvVarView {
+  name: string;
+  updatedAt: string;
+  value: string;
+}
+
+const FLAG_VALUES = new Set(["0", "1"]);
+
+/** Redact one runner env row for the browser (see {@link EnvVarView}). */
+export const redactEnv = ({
+  name,
+  updatedAt,
+  value,
+}: {
+  name: string;
+  updatedAt: string;
+  value: string;
+}): EnvVarView => ({
+  name,
+  updatedAt,
+  value: name.startsWith("FLAG_") && FLAG_VALUES.has(value) ? value : "",
+});
+
 export const listEnv = action(
-  checkedSchema(AppId, async (appId) => {
+  checkedSchema(AppId, async (appId): Promise<EnvVarView[]> => {
     await requireViewApp(appId);
-    return runnerListEnv(appId);
+    const rows = await runnerListEnv(appId);
+    return rows.map((row) => redactEnv(row));
   }),
   { error: AuthError }
 );
@@ -448,11 +476,12 @@ export const deleteEnv = action(
   { error: AuthError }
 );
 
-/** Render stored env as `.dev.vars` text for local dev (view-gated).
- * Values are shell-escaped. */
+/** Render stored env as `.dev.vars` text for local dev (admin-gated: this is
+ * the one place secret values leave the runner). Values are shell-escaped. */
 export const envDotVars = action(
   checkedSchema(AppId, async (appId) => {
-    await requireViewApp(appId);
+    const user = await sessionUser();
+    await requireAppRole(appId, user.id, "admin");
     const rows = await runnerListEnv(appId);
     const lines = rows.map(({ name, value }) => {
       const escaped = value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
@@ -528,7 +557,7 @@ export const removeDomain = action(
   { error: AuthError }
 );
 
-// ---- Storage preview (curated read-only; ungated — see runner note) ----
+// ---- Storage (view: browse · push: edit and delete) ----
 
 const StorageListArgs = Schema.Struct({ appId: Schema.String });
 const D1PreviewArgs = Schema.Struct({
@@ -692,66 +721,108 @@ export const listCollaborators = action(
   checkedSchema(AppId, async (appId) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "view");
-    const rows = await withDb(
-      Effect.gen(function* run() {
-        const memberships = yield* orm.app_collaborator.findMany({
-          where: { appId },
-        });
-        const out: {
-          userId: string;
-          email: string;
-          name: string;
-          role: AppRole;
-          createdAt: string;
-        }[] = [];
-        for (const m of memberships) {
-          const role = parseAppRole(m.role);
-          if (!role) {
-            continue;
-          }
-          const u = yield* orm.user.findFirst({ where: { id: m.userId } });
-          out.push({
-            createdAt:
-              m.createdAt instanceof Date
-                ? m.createdAt.toISOString()
-                : String(m.createdAt),
-            email: u?.email ?? "",
-            name: u?.name ?? "",
-            role,
-            userId: m.userId,
-          });
-        }
-        out.sort((a, b) => a.email.localeCompare(b.email));
-        return out;
-      })
-    );
-    return rows;
+    return listCollaboratorRows(appId);
   }),
   { error: AuthError }
 );
 
+/** Invite an email to an app. Never reveals whether the address has an
+ * account: an existing collaborator's role is updated in place (they are
+ * already visible in the list), anyone else gets a pending invitation they
+ * accept after signing in with that address. */
 export const inviteCollaborator = action(
   checkedSchema(InviteCollaborator, async ({ appId, email, role }) => {
     const user = await sessionUser();
-    await requireAppRole(appId, user.id, "admin");
+    const { app } = await requireAppRole(appId, user.id, "admin");
     const nextRole = parseAppRole(role.trim().toLowerCase());
     if (nextRole === null) {
       return failAction("role must be view, push, or admin");
     }
-    const normalized = email.trim().toLowerCase();
+    const normalized = normalizeEmail(email);
     if (!normalized.includes("@")) {
       return failAction("Valid email required");
     }
-    const invitee = await withDb(
-      orm.user.findFirst({ where: { email: normalized } })
-    );
-    if (invitee === null) {
-      return failAction(
-        "No Noite user with that email — they must sign in once first"
+    try {
+      const members = await listCollaboratorRows(appId);
+      const member = members.find(
+        (row) => normalizeEmail(row.email) === normalized
       );
+      if (member) {
+        await withDb(grantCollaborator(appId, member.userId, nextRole));
+        return { ok: true as const, status: "updated" as const };
+      }
+      await withDb(
+        upsertPendingInvite({
+          appId,
+          appName: app.name,
+          email: normalized,
+          invitedBy: user.id,
+          role: nextRole,
+        })
+      );
+      return { ok: true as const, status: "invited" as const };
+    } catch (error) {
+      return failUnknown(error);
     }
-    await withDb(grantCollaborator(appId, invitee.id, nextRole));
-    return { ok: true as const, userId: invitee.id };
+  }),
+  { error: AuthError }
+);
+
+/** Invitations waiting on an app (admin only: they carry email addresses). */
+export const listPendingInvitations = action(
+  checkedSchema(AppId, async (appId) => {
+    const user = await sessionUser();
+    await requireAppRole(appId, user.id, "admin");
+    return listPendingInvites(appId);
+  }),
+  { error: AuthError }
+);
+
+export const revokeInvitation = action(
+  checkedSchema(
+    Schema.Struct({ appId: Schema.String, inviteId: Schema.String }),
+    async ({ appId, inviteId }) => {
+      const user = await sessionUser();
+      await requireAppRole(appId, user.id, "admin");
+      await withDb(revokePendingInvite(appId, inviteId));
+      return { ok: true as const };
+    }
+  ),
+  { error: AuthError }
+);
+
+/** Invitations addressed to the signed-in account's email. */
+export const myCollaboratorInvitations = action(
+  async () => {
+    const user = await sessionUser();
+    try {
+      return await listInvitesForEmail(user.email);
+    } catch (error) {
+      return failUnknown(error);
+    }
+  },
+  { error: AuthError }
+);
+
+/** Accept an invitation: the grant is created for the session account only
+ * when the invitation is addressed to its email. */
+export const acceptInvitation = action(
+  checkedSchema(Schema.String, async (inviteId) => {
+    const user = await sessionUser();
+    const accepted = await acceptPendingInvite(inviteId, user.email, user.id);
+    if (!accepted) {
+      return failAction("Invitation not found");
+    }
+    return { appId: accepted.appId, ok: true as const };
+  }),
+  { error: AuthError }
+);
+
+export const declineInvitation = action(
+  checkedSchema(Schema.String, async (inviteId) => {
+    const user = await sessionUser();
+    await withDb(declinePendingInvite(inviteId, user.email));
+    return { ok: true as const };
   }),
   { error: AuthError }
 );

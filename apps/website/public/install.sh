@@ -19,6 +19,7 @@
 #   NOITE_REF          git ref compose.yaml is fetched from (default: main)
 #   NOITE_DIR          install directory (default: /opt/noite)
 #   NOITE_TENANCY      multi (default off localhost) or single
+#   NOITE_SKIP_DNS_CHECK  1 = skip the DNS check (skipped anyway for a bare IP or *.sslip.io)
 #   NOITE_SKIP_DOCKER  1 = never install Docker, fail if missing
 #
 # The whole script is one function called on the last line, so a truncated
@@ -232,6 +233,10 @@ choose_domain() {
 
 check_dns() {
   [[ -n "${PUBLIC_IP:-}" ]] || return 0
+  # A bare IP or an sslip.io name (LAN/local trial) has no DNS records to check.
+  [[ "${NOITE_SKIP_DNS_CHECK:-0}" != "1" ]] || return 0
+  [[ ! "$DOMAIN" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 0
+  [[ "$DOMAIN" != *.sslip.io && "$DOMAIN" != sslip.io ]] || return 0
   local host resolved
   for host in "app.$DOMAIN" "git.$DOMAIN" "noite-dns-check.$DOMAIN"; do
     resolved=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR == 1 { print $1 }') || true

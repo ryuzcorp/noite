@@ -1,6 +1,7 @@
 //! Storage inventory rows: badges, rows, per-app list.
 import type { View } from "ilha";
 
+import { errorMessage } from "../errors";
 import { ArrowLeft, ChevronRight } from "../icons";
 import { appStorage } from "../resources";
 import type { StorageItem } from "../runner";
@@ -81,7 +82,7 @@ export const AppStorageList = ({ appId }: { appId: string }) => {
   return (
     <div class="flex w-full flex-col gap-4">
       {loadError ? (
-        <p class="text-error m-0 text-sm">{String(loadError)}</p>
+        <p class="text-error m-0 text-sm">{errorMessage(loadError)}</p>
       ) : null}
       <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
         <li class="flex items-center gap-2 p-4 pb-2">

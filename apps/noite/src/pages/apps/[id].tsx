@@ -1,6 +1,11 @@
 import { DeployList, DeployDropdown } from "$lib/app-detail/deploys";
 import { EventsPanel } from "$lib/app-detail/events";
-import { MetricsCard } from "$lib/app-detail/metrics";
+import {
+  DEFAULT_METRICS_HOURS,
+  MetricsCard,
+  MetricsRangePicker,
+  toMetricsHours,
+} from "$lib/app-detail/metrics";
 import { AppDetailPanel } from "$lib/app-detail/panel";
 import { AppSettingsPanel } from "$lib/app-detail/settings";
 import { Code } from "$lib/icons";
@@ -20,6 +25,30 @@ type TabId = (typeof TABS)[number]["id"];
 /** Parse `?t=`: unknown tabs fall back to overview. */
 const toTabId = (raw: string): TabId =>
   TABS.find((tab) => tab.id === raw)?.id ?? "overview";
+
+/** Metrics tab: the window lives in `?r=` (24 / 168 / 720 hours) so a refresh
+ * or shared link keeps it. The card is keyed by the window because its live
+ * feed opens one URL for the life of a component. */
+const MetricsTab = ({ appId }: { appId: string }) => {
+  const range = searchParam("r", {
+    default: DEFAULT_METRICS_HOURS,
+    parse: toMetricsHours,
+  });
+  return (
+    <div class="flex flex-col gap-4">
+      <div class="flex items-center justify-between gap-2">
+        <h2 class="m-0 text-lg font-semibold">Metrics</h2>
+        <MetricsRangePicker
+          hours={range()}
+          onPick={(next) => {
+            range.set(next);
+          }}
+        />
+      </div>
+      <MetricsCard key={range()} appId={appId} detail hours={range()} />
+    </div>
+  );
+};
 
 const AppPageBody = ({ appId }: { appId: string }) => {
   const tab = searchParam<TabId>("t", { default: "overview", parse: toTabId });
@@ -57,7 +86,7 @@ const AppPageBody = ({ appId }: { appId: string }) => {
 
       {tab() === "overview" ? <AppDetailPanel /> : null}
       {tab() === "deployments" ? <DeployList appId={appId} /> : null}
-      {tab() === "metrics" ? <MetricsCard appId={appId} detail /> : null}
+      {tab() === "metrics" ? <MetricsTab appId={appId} /> : null}
       {tab() === "events" ? <EventsPanel appId={appId} /> : null}
       {tab() === "settings" ? <AppSettingsPanel /> : null}
     </div>

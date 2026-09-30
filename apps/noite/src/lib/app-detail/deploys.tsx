@@ -3,6 +3,7 @@ import { atom } from "ilha";
 
 import { rollback } from "../apps.server";
 import { formatDateTime } from "../dates";
+import { errorMessage } from "../errors";
 import { decodeDeploys, deploysUrl, feedKeys, liveFeed } from "../feeds";
 import { Check, ChevronDown, ChevronUp, CloudUpload, Copy } from "../icons";
 import { appDetail, deployLog } from "../resources";
@@ -110,9 +111,7 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
                     try {
                       await rollback({ appId, sha });
                     } catch (error) {
-                      redeployError.set(
-                        error instanceof Error ? error.message : String(error)
-                      );
+                      redeployError.set(errorMessage(error));
                     }
                     redeploying.set(false);
                   })();
@@ -238,9 +237,7 @@ const DeployRow = ({
                   // SAFETY: canRollBack guarantees d.sha is a non-empty string here; the early return above narrows it for the linter.
                   await rollback({ appId, sha: d.sha as string });
                 } catch (error) {
-                  rollError.set(
-                    error instanceof Error ? error.message : String(error)
-                  );
+                  rollError.set(errorMessage(error));
                 }
                 rolling.set(false);
               })();

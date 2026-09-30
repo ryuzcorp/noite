@@ -161,7 +161,7 @@ pub fn prune_build_cache(dir: &Path, max_mb: u64) {
     if total <= max {
         return;
     }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files.sort_by_key(|f| f.0);
     let mut pruned_files = 0u64;
     let mut pruned_bytes = 0u64;
     for (_, len, path) in files {
@@ -212,7 +212,7 @@ pub async fn run_sandboxed(
     if let Some(uid) = sb.uid {
         let gid = sb.gid.unwrap_or(uid);
         lchown_tree(&tmp, uid, gid);
-        lchown_tree(&cache, uid, gid);
+        lchown_tree(cache, uid, gid);
     }
     let drops_uid = sb.uid.is_some();
     let mut cmd = Command::new(program);

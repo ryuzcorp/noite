@@ -4,12 +4,14 @@ import { createApiKey } from "./apps.server";
 import { authClient } from "./auth-client";
 import { formatDateTime } from "./dates";
 import { Dialog } from "./dialog";
+import { errorMessage } from "./errors";
 import { LoadError } from "./load-error";
 import {
   apiKeys,
   invalidate,
   inviteCodes,
   keys as resourceKeys,
+  passkeys,
   session,
 } from "./resources";
 import { SectionSkeleton } from "./skeletons";
@@ -107,6 +109,165 @@ const MyInvitesCard = () => {
   );
 };
 
+/** Registered passkeys: list, add another device, rename, remove. This is
+ * also where an account that signed in with an emailed code (its passkey was
+ * lost) registers a replacement. */
+const PasskeysCard = () => {
+  const res = passkeys();
+  const rows = res.data() ?? [];
+  const busy = atom(false);
+  const error = atom("");
+  const nameDraft = atom("");
+  const reload = async () => {
+    try {
+      await res.refetch();
+    } catch (loadError) {
+      error.set(errorMessage(loadError));
+    }
+  };
+  const add = async (event: SubmitEvent) => {
+    event.preventDefault();
+    busy.set(true);
+    error.set("");
+    const label = nameDraft().trim();
+    try {
+      // Signed in, so the server adds it to this account (no registration
+      // context, no invite): see `afterVerification` in auth.ts.
+      const result = await authClient.passkey.addPasskey({
+        name: label || `Passkey ${rows.length + 1}`,
+      });
+      if (result.error) {
+        error.set(result.error.message ?? "Could not add the passkey");
+      } else {
+        nameDraft.set("");
+        await reload();
+      }
+    } catch (addError) {
+      error.set(errorMessage(addError));
+    }
+    busy.set(false);
+  };
+  const rename = async (id: string, current: string) => {
+    // oxlint-disable-next-line no-alert -- native prompt is enough for a one-field rename.
+    const next = window.prompt("Passkey name", current)?.trim();
+    if (!next || next === current) {
+      return;
+    }
+    busy.set(true);
+    error.set("");
+    const result = await authClient.passkey.updatePasskey({ id, name: next });
+    busy.set(false);
+    if (result.error) {
+      error.set(result.error.message ?? "Could not rename the passkey");
+      return;
+    }
+    await reload();
+  };
+  const remove = async (id: string, name: string) => {
+    const last = rows.length <= 1;
+    const warning = last
+      ? `Delete ${name || "this passkey"}? It is your only passkey — you would have to sign in with an emailed code until you add another.`
+      : `Delete ${name || "this passkey"}?`;
+    // oxlint-disable-next-line no-alert -- native confirm dialog is the requirement for destructive deletes.
+    if (!window.confirm(warning)) {
+      return;
+    }
+    busy.set(true);
+    error.set("");
+    const result = await authClient.passkey.deletePasskey({ id });
+    busy.set(false);
+    if (result.error) {
+      error.set(result.error.message ?? "Could not delete the passkey");
+      return;
+    }
+    await reload();
+  };
+  if (res.loading() && res.data() === undefined) {
+    return <SectionSkeleton lines={2} />;
+  }
+  return (
+    <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
+      <h2 class="m-0 text-lg font-semibold">Passkeys</h2>
+      {rows.length === 0 && !res.error() ? (
+        <p class="text-warning m-0 text-sm">
+          This account has no passkey — you are signing in with emailed codes.
+          Add one below so you don't need them.
+        </p>
+      ) : (
+        <p class="m-0 text-sm opacity-80">
+          Passkeys are how you sign in. Add one per device you use; if you lose
+          them all, an emailed code still gets you in.
+        </p>
+      )}
+      {error() ? <p class="text-error m-0 text-sm">{error()}</p> : null}
+      {error() ? null : (
+        <LoadError error={res.error()} label="Failed to list passkeys" />
+      )}
+      <ul class="m-0 flex list-none flex-col gap-2 p-0">
+        {rows.map((row) => (
+          <li
+            key={row.id}
+            class="border-base-300 flex flex-wrap items-center justify-between gap-2 rounded border p-2 text-sm"
+          >
+            <div class="flex flex-col gap-0.5">
+              <span class="font-medium">{row.name || "Unnamed passkey"}</span>
+              <span class="text-xs opacity-70">
+                {row.deviceType === "multiDevice" ? "Synced" : "This device"}
+                {row.backedUp ? " · backed up" : ""}
+                {row.createdAt
+                  ? ` · added ${formatDateTime(row.createdAt)}`
+                  : ""}
+              </span>
+            </div>
+            <span class="flex gap-2">
+              <button
+                type="button"
+                class="btn btn-sm btn-ghost"
+                disabled={busy()}
+                onclick={() => {
+                  void rename(row.id, row.name);
+                }}
+              >
+                Rename
+              </button>
+              <button
+                type="button"
+                class="btn btn-sm btn-ghost"
+                disabled={busy()}
+                onclick={() => {
+                  void remove(row.id, row.name);
+                }}
+              >
+                Delete
+              </button>
+            </span>
+          </li>
+        ))}
+      </ul>
+      <form class="flex flex-wrap items-end gap-2" onsubmit={add}>
+        <fieldset class="fieldset grow">
+          <label class="label" for="passkey-name">
+            Name
+          </label>
+          <input
+            id="passkey-name"
+            class="input input-sm"
+            maxlength={64}
+            placeholder="Laptop, phone, security key…"
+            value={nameDraft()}
+            oninput={(e) => {
+              nameDraft.set(e.currentTarget.value);
+            }}
+          />
+        </fieldset>
+        <button type="submit" class="btn btn-sm btn-neutral" disabled={busy()}>
+          {busy() ? "Waiting…" : "Add passkey"}
+        </button>
+      </form>
+    </section>
+  );
+};
+
 /** Create / list / revoke Better Auth API keys (Git push password). */
 export const AccountPanel = () => {
   const keysRes = apiKeys();
@@ -132,7 +293,7 @@ export const AccountPanel = () => {
       await keysRes.refetch();
       keyError.set("");
     } catch (error) {
-      keyError.set(error instanceof Error ? error.message : String(error));
+      keyError.set(errorMessage(error));
     }
   };
 
@@ -161,7 +322,7 @@ export const AccountPanel = () => {
       keyModal.set(false);
       await reload();
     } catch (error) {
-      keyError.set(error instanceof Error ? error.message : String(error));
+      keyError.set(errorMessage(error));
     } finally {
       busy.set(false);
     }
@@ -266,6 +427,7 @@ export const AccountPanel = () => {
           </button>
         </div>
       </section>
+      <PasskeysCard />
       <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
         <div class="flex items-center justify-between gap-2">
           <h2 class="m-0 text-lg font-semibold">API keys</h2>

@@ -11,8 +11,8 @@ import type { InferSchema, Selectable } from "paranorm";
 
 import { controlEnv } from "./control-env";
 
-// D1 holds auth (better-auth tables) plus collaborator grants — the ONLY
-// app-shaped state the UI owns. App rows and deploy history live in the runner
+// D1 holds auth (better-auth tables) plus collaborator grants and their
+// pending invitations — the ONLY app-shaped state the UI owns. App rows and deploy history live in the runner
 // (single writer, behind its bearer API), so `app_collaborator.appId` is a
 // plain key into that store: no local FK, no mirror, no sync job.
 const schema = defineSchema(`
@@ -122,6 +122,15 @@ const schema = defineSchema(`
     _relations:
       user: belongs_to=user
 
+  collaborator_invite:
+    id: id(uuidv4)
+    appId: string index unique=[collaborator_invite.appId,collaborator_invite.email]
+    appName: string
+    email: string index
+    role: string enum=[view,push,admin]
+    invitedBy: string
+    createdAt: timestamp default=now
+
   invite:
     id: id(uuidv4)
     code: string unique index
@@ -156,7 +165,15 @@ let d1Binding: D1Database | undefined;
 
 /** Stamp the Worker D1 binding for calls outside a request store. */
 export const setD1Binding = (db: D1Database) => {
+  if (d1Binding === db) {
+    return;
+  }
   d1Binding = db;
+  // A different database has never been migrated: drop the cached setup pass
+  // (a Worker isolate keeps one binding, so this only fires for tests that
+  // swap in a fresh database).
+  // oxlint-disable-next-line eslint/no-use-before-define -- declared with the setup cache below, which this must reset
+  clearSetupOnce();
 };
 
 /** Live D1: request ALS env first, then the middleware-stamped binding. */

@@ -4,6 +4,7 @@ import { atom, watch } from "ilha";
 
 import { appHost, appUrl, initials, presenceTone } from "../apps";
 import { setDesired } from "../apps.server";
+import { errorMessage } from "../errors";
 import { ArrowLeft, ArrowUpRight, Pause, Play } from "../icons";
 import { appDetail } from "../resources";
 import type { AppRole } from "../roles";
@@ -119,7 +120,7 @@ export const AppDetailPanel = () => {
   if (loadError && !info) {
     return (
       <div class="flex flex-col gap-2">
-        <p class="text-error">{String(loadError)}</p>
+        <p class="text-error">{errorMessage(loadError)}</p>
         <a href="/" class="link">
           Back
         </a>
@@ -183,9 +184,7 @@ export const AppDetailPanel = () => {
                       notice.set(null);
                       converging.set(next);
                     } catch (error) {
-                      notice.set(
-                        error instanceof Error ? error.message : String(error)
-                      );
+                      notice.set(errorMessage(error));
                     }
                   }}
                 >

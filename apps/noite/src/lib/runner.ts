@@ -228,6 +228,9 @@ export const runnerCreateApp = (body: {
 export const runnerGetApp = (id: string) =>
   runnerRpc<RunnerApp>("apps.get", { id });
 
+export const runnerGetAppBySlug = (slug: string) =>
+  runnerRpc<RunnerApp>("apps.get_by_slug", { slug });
+
 export const runnerPatchApp = (id: string, body: { desiredState: string }) =>
   runnerRpc<RunnerApp>("apps.patch", { desired_state: body.desiredState, id });
 
@@ -238,9 +241,6 @@ export const runnerRenameApp = (
   id: string,
   body: { name?: string; slug?: string }
 ) => runnerRpc<RunnerApp>("apps.rename", { id, ...body });
-
-export const runnerListDeploys = (id: string) =>
-  runnerRpc<RunnerDeploy[]>("deploys.list", { id });
 
 export const runnerDeployLog = (id: string, deployId: string) =>
   runnerRpc<{ log: string }>("deploys.log", { deploy_id: deployId, id });
@@ -319,9 +319,6 @@ export interface RunnerMetric {
   cpuMs: number;
 }
 
-export const runnerAppMetrics = (id: string, hours = 24) =>
-  runnerRpc<RunnerMetric[]>("metrics.get", { hours, id });
-
 export interface RunnerSpan {
   name: string;
   kind: number;
@@ -350,9 +347,6 @@ export interface RunnerRef {
   requests: number;
 }
 
-export const runnerAppSpans = (id: string, hours = 1) =>
-  runnerRpc<RunnerSpan[]>("spans.get", { hours, id });
-
 export interface RunnerEvent {
   id: string;
   appId: string;
@@ -380,15 +374,6 @@ export interface RunnerInsight {
   icon: string;
   updatedAt: string;
 }
-
-export const runnerListEvents = (id: string, channel?: string, limit = 50) =>
-  runnerRpc<RunnerEvent[]>("events.list", { channel, id, limit });
-
-export const runnerListEventChannels = (id: string) =>
-  runnerRpc<string[]>("events.channels", { id });
-
-export const runnerListInsights = (id: string) =>
-  runnerRpc<RunnerInsight[]>("events.insights", { id });
 
 export const runnerGetUserProps = (id: string, userId: string) =>
   runnerRpc<RunnerUserProps | null>("events.user_props", {
@@ -455,6 +440,7 @@ export const runnerStorage = (id: string) =>
 export const runnerD1 = (id: string, databaseId: string, rows = 20) =>
   runnerRpc<D1Preview>("storage.d1.get", { database_id: databaseId, id, rows });
 
+/** Body of a curated tenant-DB write. */
 export interface D1WriteBody {
   key?: Record<string, string | null>;
   op: "insert" | "update" | "delete";
@@ -462,7 +448,6 @@ export interface D1WriteBody {
   values: Record<string, string | null>;
 }
 
-/** Curated tenant-DB write: single INSERT or UPDATE (push-gated in the action). */
 export interface SourceCommitFile {
   content: string;
   path: string;
@@ -479,6 +464,8 @@ export interface SourceCommitBody {
 export const runnerSourceCommit = (id: string, body: SourceCommitBody) =>
   runnerRpc<{ sha: string }>("source.commit", { id, ...body });
 
+/** Curated tenant-DB write: single INSERT, UPDATE or DELETE (push-gated in
+ * the action). */
 export const runnerD1Write = (
   id: string,
   databaseId: string,

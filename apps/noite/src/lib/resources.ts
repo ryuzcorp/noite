@@ -21,6 +21,8 @@ import {
   listCollaborators,
   listDomains,
   listEnv,
+  listPendingInvitations,
+  myCollaboratorInvitations,
   myInviteCodes,
   r2List as fetchR2List,
 } from "./apps.server";
@@ -74,7 +76,7 @@ export const keys = {
   adminApps: "admin:apps",
   adminInvites: "admin:invites",
   adminOverview: "admin:overview",
-  adminUsers: "admin:users",
+  adminUsers: (query: string, page: number) => `admin:users:${page}:${query}`,
   apiKeys: "me:apikeys",
   appDetail: (id: string) => `app:${id}:detail`,
   appStorage: (id: string) => `app:${id}:storage`,
@@ -88,6 +90,9 @@ export const keys = {
   domains: (id: string) => `app:${id}:domains`,
   envVars: (id: string) => `app:${id}:env`,
   inviteCodes: "me:invites",
+  myInvitations: "me:collaborator-invitations",
+  passkeys: "me:passkeys",
+  pendingInvitations: (id: string) => `app:${id}:pending-invitations`,
   r2List: (appId: string, bucket: string) => `app:${appId}:r2:${bucket}`,
   session: "session",
   signupPolicy: "signup:policy",
@@ -108,6 +113,17 @@ export const deployLog = (appId: string, deployId: string) =>
   tracked(keys.deployLog(appId, deployId), () =>
     fetchDeployLog({ appId, deployId })
   );
+
+/** Invitations waiting on one app. Admin-only server side, so other roles
+ * get an empty list without a round trip. */
+export const pendingInvitations = (id: string, isAdmin: boolean) =>
+  tracked(keys.pendingInvitations(id), async () =>
+    isAdmin ? await listPendingInvitations(id) : []
+  );
+
+/** Invitations addressed to the signed-in account. */
+export const myInvitations = () =>
+  tracked(keys.myInvitations, () => myCollaboratorInvitations());
 
 export const domains = (id: string) =>
   tracked(keys.domains(id), () => listDomains(id));
@@ -159,6 +175,30 @@ export const apiKeys = () =>
     return result.data?.apiKeys ?? [];
   });
 
+/** What the account page shows for one registered passkey. */
+export interface PasskeyView {
+  backedUp: boolean;
+  createdAt: string;
+  deviceType: string;
+  id: string;
+  name: string;
+}
+
+export const passkeys = () =>
+  tracked(keys.passkeys, async (): Promise<PasskeyView[]> => {
+    const result = await authClient.passkey.listUserPasskeys();
+    if (result.error) {
+      throw new Error(result.error.message ?? "Failed to list passkeys");
+    }
+    return (result.data ?? []).map((row) => ({
+      backedUp: Boolean(row.backedUp),
+      createdAt: row.createdAt ? new Date(row.createdAt).toISOString() : "",
+      deviceType: row.deviceType,
+      id: row.id,
+      name: row.name ?? "",
+    }));
+  });
+
 /** Public policy from `/api/invite/status` (first account bootstraps). */
 export const signupPolicy = () =>
   tracked(keys.signupPolicy, async () => {
@@ -200,7 +240,11 @@ export const r2List = (appId: string, bucket: string) =>
     return (preview as R2Preview | null) ?? null;
   });
 
-export const listUsers = () => tracked(keys.adminUsers, () => fetchUsers());
+/** One page of the god-mode user list. The key carries the search and page,
+ * so the caller mounts a fresh component per (query, page) — a resource key
+ * cannot change under a mounted component. */
+export const listUsers = (query: string, page: number) =>
+  tracked(keys.adminUsers(query, page), () => fetchUsers({ page, query }));
 
 export const listAllApps = () => tracked(keys.adminApps, () => fetchAllApps());
 

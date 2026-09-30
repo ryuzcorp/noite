@@ -78,8 +78,8 @@ pub fn now_us() -> i64 {
         .expect("epoch literal");
     (Utc::now() - epoch).num_milliseconds() * 1000
 }
-/// Dashboards read ingested SQLite (see `tick`); nothing queries Parquet
-/// outside ingest and the hourly compaction below.
+// Dashboards read ingested SQLite (see `tick`); nothing queries Parquet
+// outside ingest and the hourly compaction below.
 
 // ---------------------------------------------------------------------------
 // CPU sampling from /proc (UTIME + STIME, subtree-wise)
@@ -190,10 +190,10 @@ pub fn agg_lag_us(cfg: &Config) -> i64 {
     otel_flush_ms(cfg) as i64 * 1000 + 10_000_000
 }
 
-/// Retention celld prunes telemetry at (`CELLD_OTEL_RETENTION`), and the bound
-/// on how many hour directories one catch-up query may name. One knob
-/// (RUNNER_TELEMETRY_RETENTION_DAYS, `cfg.telemetry_retention_days`); there is
-/// no const, so the env and the queries cannot drift apart.
+// Retention celld prunes telemetry at (`CELLD_OTEL_RETENTION`), and the bound
+// on how many hour directories one catch-up query may name. One knob
+// (RUNNER_TELEMETRY_RETENTION_DAYS, `cfg.telemetry_retention_days`); there is
+// no const, so the env and the queries cannot drift apart.
 
 /// Parquet globs for one fleet's telemetry over `[from_us, to_us]`. celld
 /// partitions the files by node and by hour
@@ -269,18 +269,21 @@ pub fn should_advance_watermark(agg_ok: bool, idle: bool) -> bool {
     agg_ok || idle
 }
 
+/// One hourly span-stat row: slug, hour, name, kind, n, ms, err, qwait.
+pub type SpanRow = (String, String, String, i64, i64, i64, i64, i64);
+
 /// One ingest pass over every live fleet (spec T3.1): a SINGLE DuckDB
 /// invocation whose query unions three tagged result sets —
 /// 1. minute buckets for `celld.fetch` (requests, duration, errors),
 /// 2. hourly span stats for every span name (counts, ms, errors, queue wait),
 /// 3. new OTel log lines (timestamp, body).
-/// The slug comes from the file path (`filename=true`, regex on
-/// `fleets/<slug>/`), and each slug's exact watermark rides along in a
-/// `VALUES` bounds table, so windows stay exact per fleet while every
-/// Parquet file is read once.
+///    The slug comes from the file path (`filename=true`, regex on
+///    `fleets/<slug>/`), and each slug's exact watermark rides along in a
+///    `VALUES` bounds table, so windows stay exact per fleet while every
+///    Parquet file is read once.
 pub struct IngestRows {
     pub minutes: Vec<(String, String, i64, i64, i64)>, // slug, bucket, n, dur_us, err
-    pub spans: Vec<(String, String, String, i64, i64, i64, i64, i64)>, // slug, hour, name, kind, n, ms, err, qwait
+    pub spans: Vec<SpanRow>,
     pub logs: Vec<(String, i64, String)>,                 // slug, ts_us, body
 }
 

@@ -76,18 +76,31 @@ export const rateLimitDecision = (
   return { allowed: true, remaining: limit - existing.count, retryAfter: 0 };
 };
 
-/** Client identity for the counter: the left-most forwarded address when the
- * proxy chain supplies one (Caddy always does), else the peer-less fallback so
- * a direct hit still counts somewhere. */
+/** Client identity for the counter: the RIGHT-most forwarded address. Caddy
+ * appends the peer it actually saw to whatever `X-Forwarded-For` the client
+ * sent, so the left-most entries are client-controlled (rotating them would
+ * mint a fresh bucket per request) while the last one is the trusted hop's
+ * word. Falls back to `cf-connecting-ip`, then a shared bucket, so a direct
+ * hit still counts somewhere. */
 export const clientKey = (request: Request): string => {
   const forwarded = request.headers.get("x-forwarded-for");
   if (forwarded) {
-    const first = forwarded.split(",", 1)[0]?.trim();
-    if (first) {
-      return first;
+    const last = forwarded.split(",").at(-1)?.trim();
+    if (last) {
+      return last;
     }
   }
   return request.headers.get("cf-connecting-ip")?.trim() || "unknown";
+};
+
+/** The request with `X-Forwarded-For` collapsed to the one trusted address
+ * ({@link clientKey}). better-auth reads the FIRST entry of that header for
+ * its own per-IP limiter, so handing it the raw header would let a client
+ * pick its own bucket. */
+export const withTrustedClientAddress = (request: Request): Request => {
+  const headers = new Headers(request.headers);
+  headers.set("x-forwarded-for", clientKey(request));
+  return new Request(request, { headers });
 };
 
 /** Route classes the platform limiter covers, each with its own budget so a
@@ -100,7 +113,7 @@ export const limitedClass = (pathname: string): string | null => {
   return pathname.startsWith("/api/auth") ? "auth" : null;
 };
 
-/** Test seam: forget every counter. */
+/** Forget every counter (the unit tests reset between cases). */
 export const resetRateLimits = (): void => {
   buckets.clear();
 };

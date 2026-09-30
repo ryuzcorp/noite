@@ -1,3 +1,9 @@
+import { execFileSync } from "node:child_process";
+
+import {
+  convertToWranglerConfig,
+  loadAndParseConfig,
+} from "@cloudflare/config";
 import { cloudflare } from "@cloudflare/vite-plugin";
 import { pages } from "@ilha/router/vite";
 import tailwindcss from "@tailwindcss/vite";
@@ -10,6 +16,21 @@ import type { Plugin } from "vite";
 import { controlEnv, hydrateControlEnv } from "./src/lib/control-env.ts";
 
 hydrateControlEnv();
+
+const git = (...args: string[]): string =>
+  execFileSync("git", args, { encoding: "utf-8" }).trim();
+
+/** Build id for `/health`: the git sha (plus `-dirty` for an unclean tree),
+ * else the build time — so a deploy is always distinguishable from the
+ * previous one without a hand-bumped number. */
+const controlBuild = (): string => {
+  try {
+    const sha = git("rev-parse", "--short", "HEAD");
+    return git("status", "--porcelain", "--", ".") ? `${sha}-dirty` : sha;
+  } catch {
+    return new Date().toISOString();
+  }
+};
 
 /** Resource opt T6.1: the shiki ids the source browser can request
  * (mirrors CURATED_LANGS in src/lib/source-browser.tsx; `text` is
@@ -58,7 +79,27 @@ const curatedShikiLangs = (): Plugin => ({
   },
 });
 
+/** The Worker's wrangler-shaped config, converted from `cloudflare.config.ts`
+ * (the `cf` CLI config). Vite's Cloudflare plugin and withOxide's durable
+ * bindings build on this shape, so there is no wrangler file to keep in step. */
+const loadWorkerConfig = async (): Promise<DurableWranglerConfig> => {
+  const { result } = await loadAndParseConfig("cloudflare.config.ts", {
+    isPreview: false,
+    mode: "production",
+  });
+  if (!result.success) {
+    throw new Error(
+      `cloudflare.config.ts is invalid:\n${result.error.message}`
+    );
+  }
+  // SAFETY: convertToWranglerConfig yields the wrangler JSON shape; DurableWranglerConfig types only the durable slice the plugin customizer reads.
+  return convertToWranglerConfig(result.data) as DurableWranglerConfig;
+};
+
+const workerConfig = await loadWorkerConfig();
+
 export default defineConfig({
+  define: { __CONTROL_BUILD__: JSON.stringify(controlBuild()) },
   plugins: [
     curatedShikiLangs(),
     oxide({
@@ -84,15 +125,10 @@ export default defineConfig({
     cloudflare(
       withOxide({
         config: (c: DurableWranglerConfig) => {
-          // SAFETY: withOxide only types the durable slice of the Cloudflare config; assets is the platform's own key and passes through to both snapshots untouched.
-          // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- bridging withOxide's narrow durable type to the platform assets key.
-          const cfg = c as unknown as {
-            assets?: { directory?: string; not_found_handling?: string };
-          };
-          cfg.assets = {
-            ...cfg.assets,
-            not_found_handling: "single-page-application",
-          };
+          // The plugin starts from an empty config (no wrangler file):
+          // `assets` (with its SPA fallback and ASSETS binding), D1, vars and
+          // the entrypoint all come from cloudflare.config.ts.
+          Object.assign(c, workerConfig);
         },
       })
     ),

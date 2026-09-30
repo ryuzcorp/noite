@@ -4,7 +4,7 @@ import { apiKey } from "@better-auth/api-key";
 import { kyselyAdapter } from "@better-auth/kysely-adapter";
 import { passkey } from "@better-auth/passkey";
 import { betterAuth } from "better-auth";
-import { APIError } from "better-auth/api";
+import { APIError, getSessionFromCtx } from "better-auth/api";
 import { admin } from "better-auth/plugins";
 import { emailOTP } from "better-auth/plugins/email-otp";
 import * as Effect from "effect/Effect";
@@ -12,6 +12,7 @@ import * as Schema from "effect/Schema";
 import { OxideRequest } from "oxidejs";
 
 import { ensureDbPromise, getAuthDb, missingDb, resolveEnv } from "./db";
+import { errorMessage } from "./errors";
 import {
   checkInvite,
   consumeInvite,
@@ -47,7 +48,7 @@ export const failAction = (message: string): never => {
  * Use in action catch blocks instead of repeating the instanceof ternary. */
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site values are unknown by construction; this helper narrows to message
 export const failUnknown = (error: unknown): never => {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = errorMessage(error);
   throw new ActionError({ message });
 };
 
@@ -217,6 +218,9 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
       // better-auth warns that it cannot determine a client IP and falls back
       // to ONE shared bucket per path for every caller — which turns its rate
       // limit into a fleet-wide outage under normal traffic.
+      // routes.ts collapses X-Forwarded-For to the one trusted address before
+      // the request reaches better-auth (a client controls the left-most
+      // entries), so the first value read here is safe to key on.
       ipAddress: {
         ipAddressHeaders: ["x-forwarded-for", "cf-connecting-ip"],
       },
@@ -229,9 +233,12 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
       admin({ allowImpersonatingAdmins: true, defaultRole: "user" }),
       // Lost-passkey recovery: email OTP is deliberately secondary — the
       // login UI keeps passkeys primary and reveals this behind
-      // "Lost passkey?". Sign-in only (no auto-provisioning strangers).
+      // "Lost passkey?". Sign-in only: `disableSignUp` is what stops a code
+      // sent to an unknown address from creating an account, which would walk
+      // around the invite gate that passkey registration enforces.
       emailOTP({
         allowedAttempts: 5,
+        disableSignUp: true,
         expiresIn: 600,
         otpLength: 6,
         async sendVerificationOTP({ email, otp, type }) {
@@ -260,6 +267,13 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
       passkey({
         registration: {
           afterVerification: async ({ context, ctx }) => {
+            // A signed-in account adding another passkey (the account page,
+            // or right after an emailed-code recovery) provisions nothing:
+            // there is no registration context and no user to create.
+            const session = await getSessionFromCtx(ctx);
+            if (session?.user?.id) {
+              return { userId: session.user.id };
+            }
             const parsed = requireRegistration(context);
             const existing = await ctx.context.internalAdapter.findUserByEmail(
               parsed.email
@@ -428,9 +442,6 @@ export interface SessionUser {
   name: string;
 }
 
-/** Instance-admin check by user id: `admin` role, or the env-anchored
- * bootstrap address. Used to let admins manage every app, not just ones
- * they collaborate on. */
 /** Instance-admin anchor from the environment (`NOITE_ADMIN_EMAIL`,
  * lowercased). One definition for the access gate and the admin panel. */
 export const resolveAdminEmail = (): string | null => {

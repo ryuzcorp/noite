@@ -33,6 +33,17 @@ async fn ensure_project(cfg: &Config, app: &App) -> anyhow::Result<PathBuf> {
     };
     let proj = cmd::work_root(cfg).join("projects").join(&app.slug);
     source::checkout_worktree(cfg, &app.slug, &rev, &proj).await?;
+    // Configs generated at deploy time (cloudflare.config.ts, a built
+    // dist/wrangler.json) are not in the source tree; write what the last
+    // deploy uploaded so celld can resolve the database bindings.
+    let has_config = ["wrangler.jsonc", "wrangler.json"]
+        .iter()
+        .any(|name| proj.join(name).exists());
+    if !has_config {
+        if let Some(json) = app.deployed_config.as_deref() {
+            tokio::fs::write(proj.join("wrangler.json"), json).await?;
+        }
+    }
     Ok(proj)
 }
 

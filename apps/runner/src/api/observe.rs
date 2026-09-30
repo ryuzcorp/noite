@@ -33,7 +33,7 @@ pub async fn app_metrics(
         Ok(None) => return ApiError::not_found("app not found").into_response(),
         Err(e) => return ApiError::internal(e.to_string()).into_response(),
     }
-    let hours = q.hours.unwrap_or(24).clamp(1, 336);
+    let hours = q.hours.unwrap_or(24).clamp(1, 720);
     let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
         .format("%Y-%m-%dT%H:%M:00Z")
         .to_string();
@@ -53,7 +53,7 @@ pub async fn app_devices(
         Ok(None) => return ApiError::not_found("app not found").into_response(),
         Err(e) => return ApiError::internal(e.to_string()).into_response(),
     }
-    let hours = q.hours.unwrap_or(24).clamp(1, 336);
+    let hours = q.hours.unwrap_or(24).clamp(1, 720);
     let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
         .format("%Y-%m-%dT%H:00:00Z")
         .to_string();
@@ -73,7 +73,7 @@ pub async fn app_paths(
         Ok(None) => return ApiError::not_found("app not found").into_response(),
         Err(e) => return ApiError::internal(e.to_string()).into_response(),
     }
-    let hours = q.hours.unwrap_or(24).clamp(1, 336);
+    let hours = q.hours.unwrap_or(24).clamp(1, 720);
     let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
         .format("%Y-%m-%dT%H:00:00Z")
         .to_string();
@@ -93,7 +93,7 @@ pub async fn app_refs(
         Ok(None) => return ApiError::not_found("app not found").into_response(),
         Err(e) => return ApiError::internal(e.to_string()).into_response(),
     }
-    let hours = q.hours.unwrap_or(24).clamp(1, 336);
+    let hours = q.hours.unwrap_or(24).clamp(1, 720);
     let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
         .format("%Y-%m-%dT%H:00:00Z")
         .to_string();
@@ -111,8 +111,8 @@ pub async fn app_spans(
     match db::get_app(&state.pool, &id).await {
         Ok(Some(_)) => {
             // Ingested hourly stats (spec T3.2): the 24 h default is one
-            // indexed SQLite scan, like every other series (up to 336 h).
-            let hours = q.hours.unwrap_or(24).clamp(1, 336);
+            // indexed SQLite scan, like every other series (up to 720 h).
+            let hours = q.hours.unwrap_or(24).clamp(1, 720);
             let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
                 .format("%Y-%m-%dT%H:00:00Z")
                 .to_string();

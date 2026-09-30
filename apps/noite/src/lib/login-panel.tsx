@@ -147,7 +147,9 @@ export const LoginPanel = () => {
       return;
     }
     await waitForSession();
-    navigate("/apps");
+    // A recovery sign-in exists because the passkey is gone: land on the
+    // account page, where a new one can be added straight away.
+    navigate("/account");
   };
 
   const showRecovery = () => {

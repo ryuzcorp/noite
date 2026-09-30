@@ -23,6 +23,7 @@ import {
   sourceDiff,
   sourceTree,
 } from "./apps.server";
+import { errorMessage } from "./errors";
 import { collectRef, newLiveRef, whenLive } from "./live-ref";
 import type { LiveRef } from "./live-ref";
 import type { RunnerBlob } from "./runner";
@@ -455,8 +456,7 @@ export const SourceBrowser = ({
           openSeq === modeSeq &&
           !aborted()
         ) {
-          codeEl.textContent =
-            error instanceof Error ? error.message : String(error);
+          codeEl.textContent = errorMessage(error);
         }
       }
     };
@@ -479,17 +479,16 @@ export const SourceBrowser = ({
         filePaths.add(f.path);
       }
       // Deep link wins when it names a real file; otherwise the
-      // wrangler manifest is the sensible default to open — and the
+      // Worker config is the sensible default to open — and the
       // tree highlights whichever file lands open.
       const urlFile = file();
-      let initial: string | undefined;
-      if (urlFile && filePaths.has(urlFile)) {
-        initial = urlFile;
-      } else if (filePaths.has("wrangler.jsonc")) {
-        initial = "wrangler.jsonc";
-      } else if (filePaths.has("wrangler.toml")) {
-        initial = "wrangler.toml";
-      }
+      const configFile = [
+        "cloudflare.config.ts",
+        "wrangler.jsonc",
+        "wrangler.toml",
+      ].find((name) => filePaths.has(name));
+      const initial: string | undefined =
+        urlFile && filePaths.has(urlFile) ? urlFile : configFile;
       // Ancestor dirs of the initial file, so deep links land with
       // parents expanded (collapsed parents hide the selection and
       // block the focus scroll).
@@ -602,8 +601,7 @@ export const SourceBrowser = ({
         }
       } catch (error) {
         if (!aborted() && diffSeq === modeSeq) {
-          diffEl.textContent =
-            error instanceof Error ? error.message : String(error);
+          diffEl.textContent = errorMessage(error);
         }
       }
     };
@@ -637,8 +635,7 @@ export const SourceBrowser = ({
       syncState();
     } catch (error) {
       treeEl.textContent = "";
-      codeEl.textContent =
-        error instanceof Error ? error.message : String(error);
+      codeEl.textContent = errorMessage(error);
     }
 
     box.api.show = (next) => {

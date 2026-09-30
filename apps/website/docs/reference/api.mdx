@@ -81,7 +81,7 @@ Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
 
 | Method | Route | Notes |
 | --- | --- | --- |
-| `GET` | `/v1/apps/{id}/metrics?hours=24` | Minute buckets (14-day prune) |
+| `GET` | `/v1/apps/{id}/metrics?hours=24` | Minute buckets (30-day prune) |
 | `GET` | `/v1/apps/{id}/metrics/version` | Schema/watermark version |
 | `GET` | `/v1/apps/{id}/devices` | Device breakdown (tailed from Caddy access log) |
 | `GET` | `/v1/apps/{id}/paths` | Path breakdown |

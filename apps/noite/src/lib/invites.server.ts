@@ -79,20 +79,27 @@ export const signupPolicy = async (): Promise<{
   };
 };
 
-/** The code's state, without consuming it. */
-const lookup = async (
-  code: string
-): Promise<{ id: string; usedBy: string | null } | null> =>
+interface InviteState {
+  id: string;
+  revoked: boolean;
+  usedBy: string | null;
+}
+
+/** The code's state, without consuming it: one query for everything the
+ * gate and the claim need. */
+const lookup = async (code: string): Promise<InviteState | null> =>
   await withDb(
     Effect.gen(function* () {
       const sql = yield* SqlClient;
       const rows = yield* sql.unsafe(
-        `SELECT id, usedBy FROM invite WHERE code = ?`,
+        `SELECT id, usedBy, revoked FROM invite WHERE code = ?`,
         [normalizeInviteCode(code)]
       );
-      // SAFETY: the projection is (id, usedBy); D1 returns plain rows.
+      // SAFETY: the projection is (id, usedBy, revoked); D1 returns plain rows.
       const [row] = rows as InviteRow[];
-      return row ? { id: row.id, usedBy: row.usedBy } : null;
+      return row
+        ? { id: row.id, revoked: Boolean(row.revoked), usedBy: row.usedBy }
+        : null;
     })
   );
 
@@ -113,19 +120,7 @@ export const checkInvite = async (
   if (row.usedBy) {
     return "used";
   }
-  const revoked = await withDb(
-    Effect.gen(function* () {
-      const sql = yield* SqlClient;
-      const rows = yield* sql.unsafe(
-        `SELECT revoked FROM invite WHERE code = ?`,
-        [normalizeInviteCode(code)]
-      );
-      // SAFETY: the projection is (revoked); D1 returns plain rows.
-      const [entry] = rows as InviteRow[];
-      return entry?.revoked ?? 0;
-    })
-  );
-  return revoked ? "revoked" : null;
+  return row.revoked ? "revoked" : null;
 };
 
 /** Claim a code for an account. The `usedBy IS NULL` guard in the UPDATE is

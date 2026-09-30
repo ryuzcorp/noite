@@ -3,6 +3,7 @@ import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
 import { authClient } from "./auth-client";
+import { errorMessage } from "./errors";
 import { session as sessionResource } from "./resources";
 import { invalidateSession } from "./session";
 import { DashboardSkeleton } from "./skeletons";
@@ -85,7 +86,7 @@ export const Authed = ({
       invalidateSession();
       navigate("/god-mode");
     } catch (error) {
-      returnError.set(error instanceof Error ? error.message : String(error));
+      returnError.set(errorMessage(error));
       returning.set(false);
     }
   };

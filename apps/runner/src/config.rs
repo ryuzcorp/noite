@@ -324,7 +324,7 @@ impl Config {
             build_cache_mb: env_or(&["RUNNER_BUILD_CACHE_MB"], "512")
                 .parse()
                 .unwrap_or(512),
-            telemetry_retention_days: env_or(&["RUNNER_TELEMETRY_RETENTION_DAYS"], "14")
+            telemetry_retention_days: env_or(&["RUNNER_TELEMETRY_RETENTION_DAYS"], "30")
                 .parse()
                 .unwrap_or(14),
             otel_flush_ms: env_or(&["RUNNER_OTEL_FLUSH_MS"], "30000")

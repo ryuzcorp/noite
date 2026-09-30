@@ -1,8 +1,10 @@
 //! Single-resource detail: D1 tables, DO instances, R2 keys + previews.
+import { searchParam } from "@ilha/router";
 import { atom } from "ilha";
 
 import { r2Delete } from "../apps.server";
 import { formatDateTime } from "../dates";
+import { errorMessage } from "../errors";
 import { appDetail, d1Preview, doPreview, r2List } from "../resources";
 import { r2DownloadUrl } from "../runner";
 import { SectionSkeleton } from "../skeletons";
@@ -21,6 +23,7 @@ const R2Detail = ({
 }) => {
   const res = r2List(appId, bucket);
   const fileError = atom("");
+  const query = searchParam(`r2-${bucket}-q`, { default: "" });
 
   const deleteFile = async (key: string) => {
     // oxlint-disable-next-line no-alert -- native confirm dialog is the requirement for destructive deletes.
@@ -31,18 +34,22 @@ const R2Detail = ({
       await r2Delete({ appId, bucket, key });
       await res.refetch();
     } catch (error) {
-      fileError.set(error instanceof Error ? error.message : String(error));
+      fileError.set(errorMessage(error));
     }
   };
 
   const loadError = res.error();
   if (loadError && res.data() === undefined) {
-    return <p class="text-error m-0 text-sm">{String(loadError)}</p>;
+    return <p class="text-error m-0 text-sm">{errorMessage(loadError)}</p>;
   }
   const r2Data = res.data();
   if (!r2Data) {
     return <SectionSkeleton lines={5} />;
   }
+  const needle = query().trim().toLowerCase();
+  const visible = r2Data.objects.filter((object) =>
+    object.key.toLowerCase().includes(needle)
+  );
   return (
     <div class="flex flex-col gap-4">
       <StorageTopCard
@@ -59,6 +66,21 @@ const R2Detail = ({
       ) : (
         <div class="card bg-base-100 dark:bg-base-200 border-base-300 border shadow-md">
           <div class="card-body gap-4">
+            <fieldset class="fieldset max-w-sm">
+              <label class="label" for={`r2-search-${bucket}`}>
+                Search by name or extension
+              </label>
+              <input
+                id={`r2-search-${bucket}`}
+                class="input input-sm"
+                type="search"
+                placeholder="e.g. avatar or .png"
+                value={query()}
+                oninput={(e) => {
+                  query.set(e.currentTarget.value);
+                }}
+              />
+            </fieldset>
             <div class="overflow-x-auto">
               <table class="table-sm table-zebra table">
                 <thead>
@@ -70,7 +92,7 @@ const R2Detail = ({
                   </tr>
                 </thead>
                 <tbody>
-                  {r2Data.objects.map((object) => (
+                  {visible.map((object) => (
                     <tr key={object.key}>
                       <td class="font-mono text-xs">{object.key}</td>
                       <td class="font-mono text-xs">{object.size}</td>
@@ -99,6 +121,11 @@ const R2Detail = ({
                   ))}
                 </tbody>
               </table>
+              {visible.length === 0 ? (
+                <p class="m-0 py-2 text-sm opacity-70">
+                  No objects match the search.
+                </p>
+              ) : null}
             </div>
           </div>
         </div>
@@ -122,7 +149,7 @@ const DoDetail = ({
   const res = doPreview(appId, className);
   const loadError = res.error();
   if (loadError && res.data() === undefined) {
-    return <p class="text-error m-0 text-sm">{String(loadError)}</p>;
+    return <p class="text-error m-0 text-sm">{errorMessage(loadError)}</p>;
   }
   const doData = res.data();
   if (!doData) {
@@ -182,7 +209,7 @@ const D1Detail = ({
   const res = d1Preview(appId, databaseId);
   const loadError = res.error();
   if (loadError && res.data() === undefined) {
-    return <p class="text-error m-0 text-sm">{String(loadError)}</p>;
+    return <p class="text-error m-0 text-sm">{errorMessage(loadError)}</p>;
   }
   const d1Data = res.data();
   if (!d1Data) {

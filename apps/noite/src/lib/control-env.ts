@@ -21,30 +21,16 @@ export const hydrateControlEnv = (
     }
   }
   // Dev-process fallback only (vite dev has no compose env for the worker).
-  // Prod values always arrive via compose environment / wrangler vars /
-  // deploy env — never rely on these outside localhost dev.
+  // Prod values always arrive via compose environment / cloudflare.config.ts vars /
+  // deploy env — never rely on these outside localhost dev. The control
+  // plane only talks to the runner; it holds no S3 credentials of its own.
   const defaults = {
-    AWS_REGION: "us-east-1",
     BASE_DOMAIN: "localhost",
     RUNNER_URL: "http://127.0.0.1:8080",
-    S3_ENDPOINT: "http://rustfs:9000",
-    S3_PUBLIC_ENDPOINT: "http://127.0.0.1:9000",
   } satisfies Record<string, string>;
   for (const [key, value] of Object.entries(defaults)) {
     if (controlEnv[key] === undefined) {
       controlEnv[key] = value;
     }
-  }
-  if (!controlEnv.AWS_ACCESS_KEY_ID && from.RUSTFS_ACCESS_KEY) {
-    controlEnv.AWS_ACCESS_KEY_ID = from.RUSTFS_ACCESS_KEY;
-  }
-  if (!controlEnv.AWS_SECRET_ACCESS_KEY && from.RUSTFS_SECRET_KEY) {
-    controlEnv.AWS_SECRET_ACCESS_KEY = from.RUSTFS_SECRET_KEY;
-  }
-  if (!controlEnv.RUSTFS_ACCESS_KEY && from.RUSTFS_ACCESS_KEY) {
-    controlEnv.RUSTFS_ACCESS_KEY = from.RUSTFS_ACCESS_KEY;
-  }
-  if (!controlEnv.RUSTFS_SECRET_KEY && from.RUSTFS_SECRET_KEY) {
-    controlEnv.RUSTFS_SECRET_KEY = from.RUSTFS_SECRET_KEY;
   }
 };

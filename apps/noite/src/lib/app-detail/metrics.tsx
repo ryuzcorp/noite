@@ -1,7 +1,7 @@
-//! Usage charts: 24h request/CPU bars + spans table.
+//! Usage charts: request/CPU bars over a chosen window (24h / 7d / 1m) + spans table.
 import { atom } from "ilha";
 
-import { formatHour } from "../dates";
+import { formatDateTime, formatHour } from "../dates";
 import { decodeMetrics, feedKeys, liveFeed, metricsUrl } from "../feeds";
 import type { MetricsFrame } from "../feeds";
 import { Info } from "../icons";
@@ -13,23 +13,48 @@ import type {
   RunnerSpan,
 } from "../runner";
 
-/** The period every metric on this card covers — matches the control
- * route's METRICS_WINDOW_HOURS (all series share one window). */
-const WINDOW_LABEL = "last 24h";
+/** Windows the range picker offers, matching the control route's
+ * METRICS_WINDOWS_HOURS (all series share one window). */
+export const METRICS_RANGES = [
+  { hours: 24, label: "last 24h", short: "24h" },
+  { hours: 168, label: "last 7d", short: "7d" },
+  { hours: 720, label: "last 30d", short: "1m" },
+] as const;
 
-// UTC hour-bucket keys (`2026-09-21T16`) matching the runner's UTC stamps.
-// Display only — labels go through formatHour (viewer-local, no TZ).
-const hourKeys = () =>
-  Array.from({ length: 24 }, (_, i) =>
-    new Date(Date.now() - (23 - i) * 3_600_000).toISOString().slice(0, 13)
+export const DEFAULT_METRICS_HOURS = 24;
+
+/** `?r=` → an offered window in hours; anything else is the default. */
+export const toMetricsHours = (raw: string): number => {
+  const asked = Number(raw);
+  return (
+    METRICS_RANGES.find((range) => range.hours === asked)?.hours ??
+    DEFAULT_METRICS_HOURS
+  );
+};
+
+const windowLabel = (hours: number): string =>
+  METRICS_RANGES.find((range) => range.hours === hours)?.label ?? "last 24h";
+
+// UTC hour-bucket keys (`2026-09-21T16`) matching the runner's UTC stamps,
+// oldest first. Display only — labels go through bucketLabel (viewer-local,
+// no TZ).
+const hourKeys = (hours: number) =>
+  Array.from({ length: hours }, (_, i) =>
+    new Date(Date.now() - (hours - 1 - i) * 3_600_000)
+      .toISOString()
+      .slice(0, 13)
   );
 
-// First/last bucket labels for the axis. hourKeys always yields 24
+/** Label for one bucket: the hour alone within a day, date + hour beyond. */
+const bucketLabel = (key: string, hours: number): string =>
+  hours <= 24 ? formatHour(key) : formatDateTime(`${key}:00:00Z`);
+
+// First/last bucket labels for the axis. hourKeys always yields `hours`
 // entries, so the fallbacks never render in practice.
-const hourEnds = (): [string, string] => {
-  const keys = hourKeys();
-  return [formatHour(keys[0] ?? ""), formatHour(keys.at(-1) ?? "")];
-};
+const hourEnds = (keys: string[], hours: number): [string, string] => [
+  bucketLabel(keys[0] ?? "", hours),
+  bucketLabel(keys.at(-1) ?? "", hours),
+];
 
 const sum = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
 
@@ -40,7 +65,17 @@ const perReqAvg = (totals: number[], counts: number[]) =>
     return n > 0 ? t / n : 0;
   });
 
-const BarChart = ({ values, max }: { values: number[]; max: number }) => {
+const BarChart = ({
+  hours,
+  keys,
+  max,
+  values,
+}: {
+  hours: number;
+  keys: string[];
+  max: number;
+  values: number[];
+}) => {
   const width = values.length * 10;
   return (
     <svg
@@ -76,7 +111,7 @@ const BarChart = ({ values, max }: { values: number[]; max: number }) => {
             />
             <rect x={i * 10} y="0" width="10" height="64" fill="transparent">
               <title>
-                {formatHour(hourKeys()[i] ?? "")} · {shown}
+                {bucketLabel(keys[i] ?? "", hours)} · {shown}
               </title>
             </rect>
           </>
@@ -87,25 +122,32 @@ const BarChart = ({ values, max }: { values: number[]; max: number }) => {
 };
 
 const BarRow = ({
+  hours,
+  keys,
   label,
-  values,
   max,
+  values,
 }: {
-  label: string;
-  values: number[];
+  hours: number;
+  keys: string[];
+  /** Header row (label + total); omitted where the card already has a title. */
+  label?: string;
   max: number;
+  values: number[];
 }) => (
   <div class="flex flex-col gap-1">
-    <div class="flex items-center justify-between text-xs opacity-80">
-      <span>{label}</span>
-      <span class="font-medium">{sum(values)}</span>
-    </div>
+    {label ? (
+      <div class="flex items-center justify-between text-xs opacity-80">
+        <span>{label}</span>
+        <span class="font-medium">{sum(values)}</span>
+      </div>
+    ) : null}
     <div class="text-primary/70 block h-16 w-full">
-      <BarChart values={values} max={max} />
+      <BarChart hours={hours} keys={keys} values={values} max={max} />
     </div>
     <div class="flex justify-between text-[10px] opacity-60">
-      <span>{hourEnds()[0]}</span>
-      <span>{hourEnds()[1]}</span>
+      <span>{hourEnds(keys, hours)[0]}</span>
+      <span>{hourEnds(keys, hours)[1]}</span>
     </div>
   </div>
 );
@@ -113,14 +155,17 @@ const BarRow = ({
 const StatTiles = ({
   cpus,
   errs,
+  hours,
   lats,
   reqs,
 }: {
   cpus: number[];
   errs: number[];
+  hours: number;
   lats: number[];
   reqs: number[];
 }) => {
+  const period = windowLabel(hours);
   const totalReq = sum(reqs);
   const totalErr = sum(errs);
   const totalLat = sum(lats);
@@ -131,10 +176,10 @@ const StatTiles = ({
   const cpu =
     totalCpu >= 1000 ? `${(totalCpu / 1000).toFixed(1)} s` : `${totalCpu} ms`;
   const tiles: [string, string, string][] = [
-    ["Requests", totalReq.toLocaleString(), WINDOW_LABEL],
+    ["Requests", totalReq.toLocaleString(), period],
     ["Error rate", errRate, `${totalErr.toLocaleString()} errors`],
     ["Avg latency", avgLat, "per request"],
-    ["CPU time", cpu, WINDOW_LABEL],
+    ["CPU time", cpu, period],
   ];
   return (
     <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
@@ -252,6 +297,7 @@ const MetricsDetailCards = ({
   cpus,
   devices,
   errs,
+  hours,
   lats,
   paths,
   refs,
@@ -262,154 +308,174 @@ const MetricsDetailCards = ({
   cpus: number[];
   devices: RunnerDevice[];
   errs: number[];
+  hours: number;
   lats: number[];
   paths: RunnerPath[];
   refs: RunnerRef[];
   reqs: number[];
   spans: RunnerSpan[];
   spansError: string;
-}) => (
-  <>
-    <StatTiles cpus={cpus} errs={errs} lats={lats} reqs={reqs} />
-    <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
-      <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-        <div class="card-body gap-4">
-          <h3 class="m-0 text-lg font-semibold">Requests</h3>
-          <BarRow
-            label="Requests (fetch spans)"
-            values={reqs}
-            max={Math.max(1, ...reqs)}
-          />
-        </div>
-      </section>
-      <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-        <div class="card-body gap-4">
-          <h3 class="m-0 text-lg font-semibold">Errors</h3>
-          <BarRow
-            label="Errors (failed spans)"
-            values={errs}
-            max={Math.max(1, ...errs)}
-          />
-        </div>
-      </section>
-      <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-        <div class="card-body gap-4">
-          <h3 class="m-0 text-lg font-semibold">Latency</h3>
-          <BarRow
-            label="Avg latency ms per request"
-            values={perReqAvg(lats, reqs)}
-            max={Math.max(1, ...perReqAvg(lats, reqs))}
-          />
-        </div>
-      </section>
-      <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-        <div class="card-body gap-4">
-          <h3 class="m-0 text-lg font-semibold">CPU</h3>
-          <BarRow
-            label="CPU ms (process)"
-            values={cpus}
-            max={Math.max(1, ...cpus)}
-          />
-        </div>
-      </section>
-    </div>
-    <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-      <div class="card-body gap-4">
-        <h3 class="m-0 text-lg font-semibold">Spans</h3>
-        <div class="flex flex-col gap-2">
-          {spansError ? (
-            <p class="text-warning m-0 text-xs">
-              Spans unavailable: {spansError}
-            </p>
-          ) : null}
-          {spans.length > 0 ? (
-            <div class="overflow-x-auto">
-              <table class="table-sm table">
-                <thead>
-                  <tr>
-                    <th>Span</th>
-                    <th class="text-right">n</th>
-                    <th class="text-right">ms</th>
-                    <th class="text-right">err</th>
-                    <th class="text-right">err %</th>
-                    <th class="text-right">queue ms</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {spans
-                    .toSorted((a, b) => b.ms - a.ms)
-                    .map((s) => (
-                      <tr key={s.name}>
-                        <td class="font-mono text-xs">{s.name}</td>
-                        <td class="text-right">{s.n.toLocaleString()}</td>
-                        <td class="text-right">{s.ms.toLocaleString()}</td>
-                        <td class="text-right">
-                          {s.err > 0 ? (
-                            <span class="text-error">{s.err}</span>
-                          ) : (
-                            "0"
-                          )}
-                        </td>
-                        <td class="text-right">
-                          {s.n > 0
-                            ? `${((100 * s.err) / s.n).toFixed(1)}%`
-                            : "—"}
-                        </td>
-                        <td class="text-right">{s.qwaitMs.toLocaleString()}</td>
-                      </tr>
-                    ))}
-                </tbody>
-              </table>
-            </div>
-          ) : null}
-          {spans.length === 0 && !spansError ? (
-            <p class="m-0 text-sm opacity-70">
-              No spans in the {WINDOW_LABEL} — spans come from the fleet's
-              traces.
-            </p>
-          ) : null}
-        </div>
+}) => {
+  const keys = hourKeys(hours);
+  return (
+    <>
+      <StatTiles
+        cpus={cpus}
+        errs={errs}
+        hours={hours}
+        lats={lats}
+        reqs={reqs}
+      />
+      <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
+          <div class="card-body gap-4">
+            <h3 class="m-0 text-lg font-semibold">Requests</h3>
+            <BarRow
+              hours={hours}
+              keys={keys}
+              values={reqs}
+              max={Math.max(1, ...reqs)}
+            />
+          </div>
+        </section>
+        <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
+          <div class="card-body gap-4">
+            <h3 class="m-0 text-lg font-semibold">Errors</h3>
+            <BarRow
+              hours={hours}
+              keys={keys}
+              values={errs}
+              max={Math.max(1, ...errs)}
+            />
+          </div>
+        </section>
+        <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
+          <div class="card-body gap-4">
+            <h3 class="m-0 text-lg font-semibold">Latency</h3>
+            <BarRow
+              hours={hours}
+              keys={keys}
+              values={perReqAvg(lats, reqs)}
+              max={Math.max(1, ...perReqAvg(lats, reqs))}
+            />
+          </div>
+        </section>
+        <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
+          <div class="card-body gap-4">
+            <h3 class="m-0 text-lg font-semibold">CPU</h3>
+            <BarRow
+              hours={hours}
+              keys={keys}
+              values={cpus}
+              max={Math.max(1, ...cpus)}
+            />
+          </div>
+        </section>
       </div>
-    </section>
-    <h3 class="m-0 text-lg font-semibold">Analytics</h3>
-    <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
-      <BreakdownSection
-        empty="No browser data yet — visit the app URL, then reload."
-        entries={devices.map((d): [string, number] => [d.browser, d.requests])}
-        head="Browser"
-        subs={browserOsSubs(devices)}
-        title="Browsers"
-      />
-      <BreakdownSection
-        empty="No OS data yet — visit the app URL, then reload."
-        entries={devices.map((d): [string, number] => [
-          d.os === "" ? "Unknown" : d.os,
-          d.requests,
-        ])}
-        head="OS"
-        title="Operating systems"
-      />
-      <BreakdownSection
-        empty="No visited paths yet — browse the app, then reload."
-        entries={paths.map((p): [string, number] => [p.path, p.requests])}
-        head="Path"
-        title="Paths"
-      />
-      <BreakdownSection
-        empty="No referrer data yet — share a link to the app, then reload."
-        entries={refs.map((r): [string, number] => [r.source, r.requests])}
-        head="Source"
-        title="Referrers"
-      />
-    </div>
-  </>
-);
+      <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
+        <div class="card-body gap-4">
+          <h3 class="m-0 text-lg font-semibold">Spans</h3>
+          <div class="flex flex-col gap-2">
+            {spansError ? (
+              <p class="text-warning m-0 text-xs">
+                Spans unavailable: {spansError}
+              </p>
+            ) : null}
+            {spans.length > 0 ? (
+              <div class="overflow-x-auto">
+                <table class="table-sm table">
+                  <thead>
+                    <tr>
+                      <th>Span</th>
+                      <th class="text-right">n</th>
+                      <th class="text-right">ms</th>
+                      <th class="text-right">err</th>
+                      <th class="text-right">err %</th>
+                      <th class="text-right">queue ms</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {spans
+                      .toSorted((a, b) => b.ms - a.ms)
+                      .map((s) => (
+                        <tr key={s.name}>
+                          <td class="font-mono text-xs">{s.name}</td>
+                          <td class="text-right">{s.n.toLocaleString()}</td>
+                          <td class="text-right">{s.ms.toLocaleString()}</td>
+                          <td class="text-right">
+                            {s.err > 0 ? (
+                              <span class="text-error">{s.err}</span>
+                            ) : (
+                              "0"
+                            )}
+                          </td>
+                          <td class="text-right">
+                            {s.n > 0
+                              ? `${((100 * s.err) / s.n).toFixed(1)}%`
+                              : "—"}
+                          </td>
+                          <td class="text-right">
+                            {s.qwaitMs.toLocaleString()}
+                          </td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+            {spans.length === 0 && !spansError ? (
+              <p class="m-0 text-sm opacity-70">
+                No spans in the {windowLabel(hours)} — spans come from the
+                fleet's traces.
+              </p>
+            ) : null}
+          </div>
+        </div>
+      </section>
+      <h3 class="m-0 text-lg font-semibold">Analytics</h3>
+      <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <BreakdownSection
+          empty="No browser data yet — visit the app URL, then reload."
+          entries={devices.map((d): [string, number] => [
+            d.browser,
+            d.requests,
+          ])}
+          head="Browser"
+          subs={browserOsSubs(devices)}
+          title="Browsers"
+        />
+        <BreakdownSection
+          empty="No OS data yet — visit the app URL, then reload."
+          entries={devices.map((d): [string, number] => [
+            d.os === "" ? "Unknown" : d.os,
+            d.requests,
+          ])}
+          head="OS"
+          title="Operating systems"
+        />
+        <BreakdownSection
+          empty="No visited paths yet — browse the app, then reload."
+          entries={paths.map((p): [string, number] => [p.path, p.requests])}
+          head="Path"
+          title="Paths"
+        />
+        <BreakdownSection
+          empty="No referrer data yet — share a link to the app, then reload."
+          entries={refs.map((r): [string, number] => [r.source, r.requests])}
+          head="Source"
+          title="Referrers"
+        />
+      </div>
+    </>
+  );
+};
 
 const MetricsDetailView = ({
   cpus,
   devices,
   errs,
   hasRows,
+  hours,
   lats,
   loadError,
   loaded,
@@ -423,6 +489,7 @@ const MetricsDetailView = ({
   devices: RunnerDevice[];
   errs: number[];
   hasRows: boolean;
+  hours: number;
   lats: number[];
   loadError: string;
   loaded: boolean;
@@ -458,6 +525,7 @@ const MetricsDetailView = ({
         cpus={cpus}
         devices={devices}
         errs={errs}
+        hours={hours}
         lats={lats}
         paths={paths}
         refs={refs}
@@ -469,20 +537,64 @@ const MetricsDetailView = ({
   </>
 );
 
+/** Per-bucket totals over `keys` (oldest first): one pass over the rows, not
+ * one filter per bucket — a 1-month window has 720 buckets. */
+const totalsByBucket = (
+  rows: MetricsFrame["metrics"],
+  keys: string[],
+  pick: (row: RunnerMetric) => number
+): number[] => {
+  const totals = new Map<string, number>();
+  for (const row of rows) {
+    const key = row.bucketTs.slice(0, 13);
+    totals.set(key, (totals.get(key) ?? 0) + pick(row));
+  }
+  return keys.map((key) => totals.get(key) ?? 0);
+};
+
+/** Segmented control for the metrics window. Rendered by the page that owns
+ * the `?r=` param, next to a `MetricsCard` it remounts per window (the live
+ * feed's URL is fixed for the life of a component). */
+export const MetricsRangePicker = ({
+  hours,
+  onPick,
+}: {
+  hours: number;
+  onPick: (hours: number) => void;
+}) => (
+  <div class="join" role="group" aria-label="Metrics window">
+    {METRICS_RANGES.map((range) => (
+      <button
+        key={range.hours}
+        type="button"
+        class={`btn btn-sm join-item ${hours === range.hours ? "btn-neutral" : "btn-ghost"}`}
+        aria-pressed={hours === range.hours ? "true" : "false"}
+        onclick={() => {
+          onPick(range.hours);
+        }}
+      >
+        {range.short}
+      </button>
+    ))}
+  </div>
+);
+
 export const MetricsCard = ({
   appId,
   detail = false,
+  hours = DEFAULT_METRICS_HOURS,
   viewAllHref,
 }: {
   appId: string;
   detail?: boolean;
+  hours?: number;
   viewAllHref?: string;
 }) => {
   // Usage over SSE: last snapshot (or skeleton when cold) until the first
   // frame, then the stream pushes a frame only when the request total moves.
   const feed = liveFeed(
-    feedKeys.metrics(appId),
-    metricsUrl(appId),
+    feedKeys.metrics(appId, hours),
+    metricsUrl(appId, hours),
     decodeMetrics
   );
   // Read the frame (or its stored snapshot) directly: no copy into atoms,
@@ -506,14 +618,9 @@ export const MetricsCard = ({
     latency: (r: RunnerMetric) => r.latencyMs,
     requests: (r: RunnerMetric) => r.requests,
   };
+  const keys = hourKeys(hours);
   const totalByHour = (kind: keyof typeof pickers) =>
-    hourKeys().map((key) =>
-      sum(
-        rows()
-          .filter((r) => r.bucketTs.slice(0, 13) === key)
-          .map(pickers[kind])
-      )
-    );
+    totalsByBucket(rows(), keys, pickers[kind]);
   const reqs = totalByHour("requests");
   const cpus = totalByHour("cpuMs");
   const errs = totalByHour("errors");
@@ -530,6 +637,7 @@ export const MetricsCard = ({
           devices={devices()}
           errs={errs}
           hasRows={rows().length > 0}
+          hours={hours}
           lats={lats}
           loadError={loadError()}
           loaded={loaded()}
@@ -544,10 +652,10 @@ export const MetricsCard = ({
           <div class="card-body gap-4">
             <div class="flex items-center justify-between gap-2">
               <h3 class="m-0 flex items-center gap-2 text-lg font-semibold">
-                Metrics · {WINDOW_LABEL}
+                Metrics · {windowLabel(hours)}
                 <span
                   class="tooltip tooltip-right inline-flex opacity-60"
-                  data-tip={`What celld OTel recorded · ${WINDOW_LABEL}: request/cell-fetch/startup spans, execution ms, failed spans, and queued time. Errors come from the trace \`ok\` flag.`}
+                  data-tip={`What celld OTel recorded · ${windowLabel(hours)}: request/cell-fetch/startup spans, execution ms, failed spans, and queued time. Errors come from the trace \`ok\` flag.`}
                 >
                   <Info />
                 </span>
@@ -579,6 +687,8 @@ export const MetricsCard = ({
             ) : (
               <>
                 <BarRow
+                  hours={hours}
+                  keys={keys}
                   label="Requests (fetch spans)"
                   values={reqs}
                   max={Math.max(1, ...reqs)}

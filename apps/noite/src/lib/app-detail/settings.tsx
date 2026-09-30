@@ -12,10 +12,14 @@ import {
   removeCollaborator,
   removeDomain,
   renameApp,
+  revokeInvitation,
   setEnv,
   updateCollaboratorRole,
 } from "../apps.server";
+import type { EnvVarView } from "../apps.server";
 import { Dialog } from "../dialog";
+import { errorMessage } from "../errors";
+import { dropAppFromSnapshot } from "../feeds";
 import { LoadError } from "../load-error";
 import {
   appDetail,
@@ -24,10 +28,10 @@ import {
   envVars,
   invalidate,
   keys,
+  pendingInvitations,
 } from "../resources";
 import { parseAppRole } from "../roles";
 import type { AppRole } from "../roles";
-import type { RunnerEnv } from "../runner";
 import { ListSkeleton, SectionSkeleton } from "../skeletons";
 
 const CollaboratorsPanel = ({
@@ -37,21 +41,24 @@ const CollaboratorsPanel = ({
   appId: string;
   myRole: AppRole;
 }) => {
+  const isAdmin = myRole === "admin";
   const res = collaborators(appId);
+  const pending = pendingInvitations(appId, isAdmin);
   const rows = res.data() ?? [];
+  const pendingRows = pending.data() ?? [];
   const dialogOpen = atom(false);
   const err = atom("");
+  const note = atom("");
   const busy = atom(false);
   const inviteEmail = atom("");
   const inviteRole = atom("view");
-  const isAdmin = myRole === "admin";
 
   const reload = async () => {
     try {
-      await res.refetch();
+      await Promise.all([res.refetch(), pending.refetch()]);
       err.set("");
     } catch (error) {
-      err.set(error instanceof Error ? error.message : String(error));
+      err.set(errorMessage(error));
     }
   };
 
@@ -67,17 +74,24 @@ const CollaboratorsPanel = ({
     const next = parseAppRole(inviteRole());
     busy.set(true);
     try {
-      await inviteCollaborator({
+      const result = await inviteCollaborator({
         appId,
         email: address,
         role: next ?? "view",
       });
       inviteEmail.set("");
       err.set("");
+      // The same wording either way: which addresses have accounts is not
+      // the inviter's to learn.
+      note.set(
+        result.status === "updated"
+          ? `${address} is already a collaborator — role updated.`
+          : `Invitation sent to ${address}. They see it in Noite after signing in with that address.`
+      );
       dialogOpen.set(false);
       await reload();
     } catch (error) {
-      err.set(error instanceof Error ? error.message : String(error));
+      err.set(errorMessage(error));
     } finally {
       busy.set(false);
     }
@@ -94,6 +108,7 @@ const CollaboratorsPanel = ({
               class="btn btn-sm btn-neutral"
               onclick={() => {
                 err.set("");
+                note.set("");
                 dialogOpen.set(true);
               }}
             >
@@ -107,6 +122,7 @@ const CollaboratorsPanel = ({
         </p>
         {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
         {err() ? null : <LoadError error={res.error()} />}
+        {note() ? <p class="m-0 text-sm opacity-80">{note()}</p> : null}
         {res.loading() && res.data() === undefined ? (
           <ListSkeleton rows={2} />
         ) : null}
@@ -137,9 +153,7 @@ const CollaboratorsPanel = ({
                       });
                       await reload();
                     } catch (error) {
-                      err.set(
-                        error instanceof Error ? error.message : String(error)
-                      );
+                      err.set(errorMessage(error));
                       await reload();
                     }
                   }}
@@ -166,9 +180,7 @@ const CollaboratorsPanel = ({
                       await removeCollaborator({ appId, userId: c.userId });
                       await reload();
                     } catch (error) {
-                      err.set(
-                        error instanceof Error ? error.message : String(error)
-                      );
+                      err.set(errorMessage(error));
                     }
                   }}
                 >
@@ -178,13 +190,51 @@ const CollaboratorsPanel = ({
             </li>
           ))}
         </ul>
+        {pendingRows.length > 0 ? (
+          <div class="flex flex-col gap-1">
+            <h4 class="m-0 text-sm font-semibold">Pending invitations</h4>
+            <ul class="m-0 flex list-none flex-col gap-1 p-0 text-sm">
+              {pendingRows.map((pendingInvite) => (
+                <li
+                  key={pendingInvite.id}
+                  class="border-base-300 flex flex-wrap items-center gap-2 border-b py-1 last:border-0"
+                >
+                  <span class="min-w-0 flex-1 truncate">
+                    {pendingInvite.email}
+                  </span>
+                  <span class="badge badge-ghost badge-sm">
+                    {pendingInvite.role}
+                  </span>
+                  <button
+                    type="button"
+                    class="btn btn-sm"
+                    onclick={async () => {
+                      try {
+                        await revokeInvitation({
+                          appId,
+                          inviteId: pendingInvite.id,
+                        });
+                        await reload();
+                      } catch (error) {
+                        err.set(errorMessage(error));
+                      }
+                    }}
+                  >
+                    Revoke
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
         <Dialog open={dialogOpen} class="modal">
           <div class="modal-box bg-base-100 dark:bg-base-200">
             <h3 class="m-0 text-lg font-bold">Invite collaborator</h3>
             <p class="m-0 py-2 text-sm opacity-80">
-              They join by signing in with this email address. Roles:{" "}
-              <code>view</code> read-only · <code>push</code> deploy, push code,
-              write data · <code>admin</code> members, variables, delete.
+              They see the invitation after signing in with this email address,
+              and join once they accept it. Roles: <code>view</code> read-only ·{" "}
+              <code>push</code> deploy, push code, write data ·{" "}
+              <code>admin</code> members, variables, delete.
             </p>
             <div class="flex flex-wrap items-end gap-2">
               <fieldset class="fieldset min-w-48 flex-1">
@@ -302,7 +352,7 @@ const CustomDomainsPanel = ({
       await res.refetch();
       err.set("");
     } catch (error) {
-      err.set(error instanceof Error ? error.message : String(error));
+      err.set(errorMessage(error));
     }
   };
 
@@ -323,7 +373,7 @@ const CustomDomainsPanel = ({
       );
       await reload();
     } catch (error) {
-      note.set(error instanceof Error ? error.message : String(error));
+      note.set(errorMessage(error));
     }
     busy.set(false);
   };
@@ -335,7 +385,7 @@ const CustomDomainsPanel = ({
       await removeDomain({ appId, hostname: value });
       await reload();
     } catch (error) {
-      note.set(error instanceof Error ? error.message : String(error));
+      note.set(errorMessage(error));
     }
     busy.set(false);
   };
@@ -450,7 +500,7 @@ const AppIdentityForm = ({
       err.set("");
       onSaved();
     } catch (error) {
-      err.set(error instanceof Error ? error.message : String(error));
+      err.set(errorMessage(error));
     } finally {
       busy.set(false);
     }
@@ -473,7 +523,7 @@ const AppIdentityForm = ({
       dialogOpen.set(false);
       onSaved();
     } catch (error) {
-      err.set(error instanceof Error ? error.message : String(error));
+      err.set(errorMessage(error));
     } finally {
       busy.set(false);
     }
@@ -642,10 +692,10 @@ const EnvVarsPanel = ({
       await res.refetch();
       err.set("");
     } catch (error) {
-      err.set(error instanceof Error ? error.message : String(error));
+      err.set(errorMessage(error));
     }
   };
-  const toggleFlag = (row: RunnerEnv) => {
+  const toggleFlag = (row: EnvVarView) => {
     if (!isAdmin || busy()) {
       return;
     }
@@ -659,7 +709,7 @@ const EnvVarsPanel = ({
         });
         await reload();
       } catch (error) {
-        err.set(error instanceof Error ? error.message : String(error));
+        err.set(errorMessage(error));
       }
       busy.set(false);
     })();
@@ -692,7 +742,7 @@ const EnvVarsPanel = ({
         dialogOpen.set(false);
         await reload();
       } catch (error) {
-        err.set(error instanceof Error ? error.message : String(error));
+        err.set(errorMessage(error));
       }
       busy.set(false);
     })();
@@ -720,9 +770,7 @@ const EnvVarsPanel = ({
                       a.click();
                       URL.revokeObjectURL(url);
                     } catch (error) {
-                      err.set(
-                        error instanceof Error ? error.message : String(error)
-                      );
+                      err.set(errorMessage(error));
                     }
                   })();
                 }}
@@ -803,11 +851,7 @@ const EnvVarsPanel = ({
                             await deleteEnv({ appId, name: r.name });
                             await reload();
                           } catch (error) {
-                            err.set(
-                              error instanceof Error
-                                ? error.message
-                                : String(error)
-                            );
+                            err.set(errorMessage(error));
                           }
                           busy.set(false);
                         })();
@@ -914,7 +958,7 @@ export const AppSettingsPanel = () => {
   }
   const loadError = res.error();
   if (loadError && !info) {
-    return <p class="text-error m-0 text-sm">{String(loadError)}</p>;
+    return <p class="text-error m-0 text-sm">{errorMessage(loadError)}</p>;
   }
   if (!info) {
     return null;
@@ -969,11 +1013,10 @@ export const AppSettingsPanel = () => {
                   }
                   try {
                     await remove(gate.appId);
+                    dropAppFromSnapshot(gate.appId);
                     navigate("/apps");
                   } catch (error) {
-                    notice.set(
-                      error instanceof Error ? error.message : String(error)
-                    );
+                    notice.set(errorMessage(error));
                   }
                 }}
               >
