@@ -1,15 +1,10 @@
 import { execFileSync } from "node:child_process";
 
-import {
-  convertToWranglerConfig,
-  loadAndParseConfig,
-} from "@cloudflare/config";
 import { cloudflare } from "@cloudflare/vite-plugin";
 import { pages } from "@ilha/router/vite";
 import tailwindcss from "@tailwindcss/vite";
 import oxide from "oxidejs/vite";
 import { withOxide } from "oxidejs/wrangler";
-import type { DurableWranglerConfig } from "oxidejs/wrangler";
 import { defineConfig } from "vite";
 import type { Plugin } from "vite";
 
@@ -79,25 +74,6 @@ const curatedShikiLangs = (): Plugin => ({
   },
 });
 
-/** The Worker's wrangler-shaped config, converted from `cloudflare.config.ts`
- * (the `cf` CLI config). Vite's Cloudflare plugin and withOxide's durable
- * bindings build on this shape, so there is no wrangler file to keep in step. */
-const loadWorkerConfig = async (): Promise<DurableWranglerConfig> => {
-  const { result } = await loadAndParseConfig("cloudflare.config.ts", {
-    isPreview: false,
-    mode: "production",
-  });
-  if (!result.success) {
-    throw new Error(
-      `cloudflare.config.ts is invalid:\n${result.error.message}`
-    );
-  }
-  // SAFETY: convertToWranglerConfig yields the wrangler JSON shape; DurableWranglerConfig types only the durable slice the plugin customizer reads.
-  return convertToWranglerConfig(result.data) as DurableWranglerConfig;
-};
-
-const workerConfig = await loadWorkerConfig();
-
 export default defineConfig({
   define: { __CONTROL_BUILD__: JSON.stringify(controlBuild()) },
   plugins: [
@@ -113,20 +89,10 @@ export default defineConfig({
       // SAFETY: controlEnv is a plain-object env bag; oxide only reads known keys off it, so casting to its `never`-indexed env type is safe (the bag holds only strings + durable bindings written before vite boot).
       env: controlEnv as never,
       middleware: ["./src/middleware/db.ts", "@ilha/router/ssr"],
-      // No root wrangler file to auto-detect from (the config lives in
-      // cloudflare.config.ts), so the preset is explicit.
-      preset: "worker",
     }),
-    cloudflare(
-      withOxide({
-        config: (c: DurableWranglerConfig) => {
-          // The plugin starts from an empty config (no wrangler file):
-          // `assets` (with its SPA fallback and ASSETS binding), D1, vars and
-          // the entrypoint all come from cloudflare.config.ts.
-          Object.assign(c, workerConfig);
-        },
-      })
-    ),
+    // oxide() loads cloudflare.config.ts (worker preset auto-detected) and
+    // withOxide() hands it to the Cloudflare plugin: no wrangler file.
+    cloudflare(withOxide()),
     pages(),
     tailwindcss(),
   ],

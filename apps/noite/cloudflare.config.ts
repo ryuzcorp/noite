@@ -1,8 +1,8 @@
 // Worker config for the `cf` CLI (https://github.com/cloudflare/cf) — the
 // control UI's single source for its Worker: bindings, assets, defaults.
-// `vite.config.ts` converts it to the wrangler shape the Cloudflare plugin and
-// withOxide (durable bindings scanned from ops.server.ts) build on, and the
-// build emits `dist/wrangler.json`, which the runner deploys with celld.
+// oxide() loads it (Node ≥ 22.18; edits need a dev server restart) and
+// withOxide() hands it to the Cloudflare plugin, and the build emits
+// `dist/wrangler.json`, which the runner deploys with celld.
 import { bindings, defineConfig, defineWorker } from "cf/config";
 
 const worker = defineWorker({
