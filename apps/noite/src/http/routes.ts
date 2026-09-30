@@ -796,7 +796,7 @@ router.on("GET", "/api/invite/status", handleInviteStatus);
 router.all("/api/auth", handleAuth);
 router.all("/api/auth/*", handleAuth);
 
-/** Shared by Server Entry (prod) and Vite DEV middleware. */
+/** The `src/server.ts` fetch handler (also driven directly by the tests). */
 export const handleHttp = ((request, env) => {
   // SAFETY: the Worker env carries every KitEnv control key the handlers need; unset keys stay undefined as handlers tolerate.
   const kit = env as KitEnv;

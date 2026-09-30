@@ -112,16 +112,11 @@ export default defineConfig({
       },
       // SAFETY: controlEnv is a plain-object env bag; oxide only reads known keys off it, so casting to its `never`-indexed env type is safe (the bag holds only strings + durable bindings written before vite boot).
       env: controlEnv as never,
-      imports: [],
-      middleware: [
-        "./src/middleware/db.ts",
-        "./src/middleware/api.ts",
-        "@ilha/router/ssr",
-      ],
+      middleware: ["./src/middleware/db.ts", "@ilha/router/ssr"],
+      // No root wrangler file to auto-detect from (the config lives in
+      // cloudflare.config.ts), so the preset is explicit.
       preset: "worker",
     }),
-    pages(),
-    tailwindcss(),
     cloudflare(
       withOxide({
         config: (c: DurableWranglerConfig) => {
@@ -132,6 +127,8 @@ export default defineConfig({
         },
       })
     ),
+    pages(),
+    tailwindcss(),
   ],
   resolve: {
     tsconfigPaths: true,

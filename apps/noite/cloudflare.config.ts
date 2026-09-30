@@ -6,7 +6,14 @@
 import { bindings, defineConfig, defineWorker } from "cf/config";
 
 const worker = defineWorker({
-  assets: { notFoundHandling: "single-page-application" },
+  assets: {
+    // Oxide's worker SPA-falls-back document navigations itself. Keep Assets
+    // on real 404s — `single-page-application` would return index.html
+    // (text/html) for a missing `/assets/*.js` and break hashed client
+    // bundles after a deploy. Worker first so every path goes through it.
+    notFoundHandling: "none",
+    runWorkerFirst: true,
+  },
   compatibilityDate: "2026-09-01",
   entrypoint: "./src/worker.ts",
   env: {
