@@ -36,7 +36,7 @@ git remote add origin "https://git:<api-key>@git.<domain>/<slug>"
 git push -u origin main
 ```
 
-Open the result at `https://<slug>.<domain>`. With a `package.json`, the runner installs and builds it first with the project's package manager (npm, pnpm, Yarn or Bun), so Vite and Rsbuild apps need no CI ([Build](/apps/build)); without one it deploys the tree as is. Pushes must fast-forward unless you hold the `admin` role.
+Open the result at `https://<slug>.<domain>`. With a `package.json`, the runner installs and builds it first with the project's package manager (npm, pnpm, Yarn or Bun), so Vite and Rsbuild apps need no CI ([Build](/apps/build)); without one it deploys the tree as is. The Wrangler config is optional: a static site (a build that writes `dist/index.html`) or a `package.json` `main` that exports `fetch` deploys without one ([No config at all](/apps/build#no-config-at-all)). Pushes must fast-forward unless you hold the `admin` role.
 
 ## Deploy from CI
 
@@ -70,7 +70,7 @@ In Actions it writes `url=` + `sha=` to `$GITHUB_OUTPUT` and posts (or updates, 
 
 1. Tip `.bundle` lands; the runner updates its bare mirror and worktree.
 2. The sandboxed install and build (`build.command` or the `build` script) run when the tree declares them, with the project's package manager.
-3. The runner picks the config to deploy: the build's output when it produced one, else the source config ([Which config deploys](/apps/build#which-config-deploys)).
+3. The runner picks the config to deploy: the build's output when it produced one, else the source config, else one it generates ([Which config deploys](/apps/build#which-config-deploys)).
 4. Optional `release` command (e.g. migrations) runs. A failed release keeps the old deployment serving.
 5. The config is stripped of runner-only keys (`release`, `build`), then `celld deploy` ships the fleet; a new fleet spawns or the existing one gets `POST /reload`.
 

@@ -1,6 +1,6 @@
 ---
 title: Build
-description: How the runner builds a push — Vite, Rsbuild, custom build commands — and which config it deploys.
+description: How the runner builds a push — Vite, Rsbuild, static sites, frameworks, custom build commands — and which config it deploys.
 ---
 
 Every push to `main` builds on the Noite host, in the build sandbox. You do not need CI for Vite or Rsbuild apps; [deploy from CI](/apps/deploy#deploy-from-ci) when a build needs more than the host allows.
@@ -13,6 +13,7 @@ Every push to `main` builds on the Noite host, in the build sandbox. You do not 
 | build | the Wrangler config has `build.command` | `sh -c "<command>"` in `build.cwd` |
 | build | otherwise, `package.json` has a `scripts.build` | `<manager> run build` |
 | convert | `cloudflare.config.ts` and no Wrangler config | `cloudflare.config.ts` → `wrangler.json` |
+| generate | no Wrangler config anywhere | `wrangler.json` from the build output or `package.json` `main` ([below](#no-config-at-all)) |
 | release | the Wrangler config has `release` | `sh -c "<release>"` |
 | deploy | always | `celld deploy` |
 
@@ -38,9 +39,28 @@ After a build, the runner deploys what the build produced, in this order:
 
 1. `dist/wrangler.json`, a deployable config the build wrote (Oxide writes one, on Vite and Rsbuild alike).
 2. Wrangler's deploy redirect, `.wrangler/deploy/config.json`, which `@cloudflare/vite-plugin` writes. The runner turns the config it points to into `dist/wrangler.json`: it keeps only the keys celld accepts, rewrites `main` and `assets.directory` relative to `dist/`, and applies `.assetsignore`.
-3. Otherwise, the source config: `wrangler.jsonc`, `wrangler.json` or `wrangler.toml` at the root, then the first one found below it.
+3. Otherwise, the source config: `wrangler.jsonc`, `wrangler.json` or `wrangler.toml` at the root, then the first one found below it (`node_modules` excluded).
+4. With no config at all, one the runner generates ([below](#no-config-at-all)).
 
-Without a build step, only the third applies. The deploy log names the config it used (`config: dist/wrangler.json (from …)`).
+Without a build step, 1 and 2 do not apply. The deploy log names the config it used (`config: dist/wrangler.json (from …)`, `config: generated: static site from dist/ …`).
+
+## No config at all
+
+An app does not need a Wrangler config. When there is none, the runner writes one from what the build left:
+
+- **A static site.** The first of `dist/`, `build/` or `out/` that holds an `index.html` is deployed as static files: Vite, Rsbuild, Astro's static output, Create React App, a Next.js static export. Unknown paths get `404.html` when the build wrote one, and `index.html` otherwise, so a single-page app's client-side routes work.
+- **A Worker.** `package.json` `"main"` names a module whose default export has a `fetch` method: Hono, H3, Elysia, or `export default { fetch(request) { … } }`. The module may be TypeScript; celld bundles it. A static output from the list above is served first, and requests with no matching file reach the Worker, which can also read the files through `env.ASSETS`. The server entry must not sit inside that output, or its source would be public.
+
+```json title="package.json (Hono)"
+{
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": { "build": "vite build" },
+  "dependencies": { "hono": "^4.9.0" }
+}
+```
+
+The generated config has the app's slug as `name`, a fixed `compatibility_date` and, for a Worker, `nodejs_compat`. Commit your own `wrangler.jsonc` as soon as you need more: bindings (D1, R2, Durable Objects), vars, or a different compatibility date.
 
 ## Vite with the Cloudflare plugin
 
@@ -72,9 +92,9 @@ export default defineConfig({ plugins: [cloudflare()] });
 
 Imports only Vite understands (`?raw`, `?url`, virtual modules) work, because the runner deploys Vite's bundle, not your source. Keep `vite build`'s output inside the project (the default `dist/`). One Worker per app, so `auxiliaryWorkers` are refused.
 
-## Static sites (Vite, Rsbuild, anything)
+## Static sites with a config
 
-A site with no Worker needs only a Wrangler config that points at the build output:
+A static site deploys without a config ([above](#no-config-at-all)). Write one to pick the output directory or the not-found behaviour yourself:
 
 ```jsonc title="wrangler.jsonc"
 {
@@ -100,6 +120,15 @@ Add `main` and an `ASSETS` binding to the same config. The Worker is bundled fro
 ```
 
 For a Worker that itself needs the bundler (Oxide, framework plugins), have the build write `dist/wrangler.json`.
+
+## Frameworks and Node servers
+
+Apps run on celld, which runs Cloudflare Workers. A framework deploys when it builds for Workers:
+
+- **Built on `fetch`** (Hono, H3, Elysia): set `main` ([above](#no-config-at-all)) or write a `wrangler.jsonc`.
+- **With a Cloudflare target**: use the framework's own Workers build, which writes a Wrangler config or works through `@cloudflare/vite-plugin`. Examples: Nuxt and Nitro (`cloudflare_module` preset), SvelteKit (`@sveltejs/adapter-cloudflare`), Astro (`@astrojs/cloudflare`), React Router and TanStack Start (the Cloudflare Vite plugin). These targets are Cloudflare's; Noite has not tested each one, and a feature celld lacks fails at deploy or on the first request.
+
+A **Node HTTP server** does not run: Express, Fastify, Koa, `http.createServer`, or anything that calls `app.listen()`. celld implements no `node:http` server and no `IncomingMessage`, so wrapping the app in a fetch adapter does not help either. When `main` looks like such a server, the deploy fails with a message saying so. Move the routes to a `fetch`-based framework (Hono's API is close to Express), or use your framework's Workers target.
 
 ## Custom build command
 

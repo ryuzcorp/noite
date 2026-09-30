@@ -1,13 +1,17 @@
 ---
 title: Configure
-description: Env vars, custom domains, collaborators, source edits, and storage for one app.
+description: Env vars, custom domains, rate limits, collaborators, source edits, and storage for one app.
 ---
 
-All of this lives on the app detail page (`/apps/<id>`, tabs Overview / Deployments / Metrics / Events / Settings).
+All of this lives on the app detail page (`/apps/<id>`, tabs Overview / Deployments / Metrics / Errors / Events / Settings).
 
 ## Environment variables
 
-Settings → Environment. Variables reach the build, the release command, and the fleet environment. Reads are view-gated, writes admin-gated. Download mirrors the `.dev.vars` file local dev expects. Names starting with `FLAG_` render as on/off toggles (`1`/`0`).
+Settings → Environment. Variables reach the install, the build and the release command, so a bundler can inline them (for example Vite's `import.meta.env`). A change applies from the next deploy. Values are hidden after saving; reads are view-gated, writes admin-gated. Download mirrors the `.dev.vars` file local dev expects. Names starting with `FLAG_` render as on/off toggles (`1`/`0`).
+
+:::warning
+Worker code does not see these variables at runtime: `env` has no entry for them and `process.env` is empty. For values the Worker reads while serving, use `vars` in your `wrangler.jsonc`.
+:::
 
 Reserved prefixes are dropped silently: `PORT`, `HOST`, `AWS_*`, `S3_*`, `CELLD_*`, `RUNNER_*`, `NOITE_*`, `BETTER_AUTH_*`, `CADDY_*`, `LD_*`, `NODE_OPTIONS`, `BUN_*` (except the cache var). Full detail: [Environment variables](/reference/environment-variables).
 
@@ -22,6 +26,10 @@ dig +short app.<domain>
 The certificate issues on the first visit (ask-gated on-demand TLS). Validation rules: lowercase DNS shape, ≥ 2 labels, no wildcard/IP/port/path. Platform hostnames are refused; a taken hostname returns 409. There is no DNS ownership check yet — first claimant wins.
 
 Removing a hostname releases it.
+
+## Rate limits
+
+Settings → Rate Limits (admins). Requests per minute the edge lets through to this app, across all its hostnames: per visitor (client IP) and for the whole app. Leave a field empty for the platform default or enter `0` for no limit; the edge applies a change within seconds. Past a limit, visitors get `429 Too Many Requests` with `Retry-After`. Behind a proxy the edge does not trust, per-visitor limits are off and the field says so. See [Edge protection](/self-hosting/protection).
 
 ## Collaborators
 

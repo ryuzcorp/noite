@@ -28,6 +28,7 @@ Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (hand
 | `CELLD_BIN` | `celld` | Fleet binary path | runner-owned |
 | `CONTROL_BUNDLE_DIR` | `/opt/noite/control/dist` | Baked control UI bundle (fleet #0) | runner-owned |
 | `RUST_LOG` | `noite_runner=info,tower_http=info` | Runner log filter | runner-owned |
+| `CELLD_ADVERTISE` | `RAILWAY_PRIVATE_DOMAIN`, else the container hostname | Address other control nodes dial during an overlapping redeploy (`:8091`); must be reachable from a peer | runner-owned |
 
 ## Auth
 
@@ -53,7 +54,7 @@ Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (hand
 | `RUSTFS_SECRET_KEY` | 32-char dev default | Bundled RustFS secret | runner-owned |
 | `RUSTFS_API_PORT` | `9000` | Bundled RustFS S3 port (loopback) | runner-owned |
 | `RUSTFS_CONSOLE_PORT` | `9001` | Bundled RustFS console port | runner-owned |
-| `NOITE_DB` | `./data/noite.sqlite` | Runner SQLite path (`sqlite:` prefix optional) | runner-owned |
+| `NOITE_DB` | `/data/noite.sqlite` (image) | Runner SQLite path (`sqlite:` prefix optional) | runner-owned |
 
 ## Tenancy
 
@@ -62,7 +63,7 @@ Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (hand
 | `NOITE_TENANCY` | unset = `multi` off localhost, `single` on | `multi` sandboxes builds/fleets as users behind egress policy; `single` = operator pushes only | runner-owned |
 | `RUNNER_BUILD_UID` / `RUNNER_BUILD_GID` | `10010` | Build sandbox user | runner-owned |
 | `RUNNER_FLEET_UID` / `RUNNER_FLEET_GID` | `10020` | Tenant fleet user | runner-owned |
-| `NOITE_FLEET_PORTS` | built-in range | Fleet port range, two ports per app | runner-owned |
+| `NOITE_FLEET_PORTS` | `20000-29999` | Fleet port range, two ports per app | runner-owned |
 | `NOITE_STOP_BUDGET_MS` | `25000` | Graceful-stop budget (min `5000`); fleets stop inside budget − 3 s | runner-owned |
 | `RUNNER_BUILD_MAX_MB` | `2048` | Refuse builds past this worktree size (MiB) | runner-owned |
 | `RUNNER_BUILD_TIMEOUT_S` | `300` | Bound on each install and build step (seconds) | runner-owned |

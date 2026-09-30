@@ -30,9 +30,9 @@ The loss window on an ungraceful crash is about 70 s of API mutations. A `claim(
 
 ## Telemetry
 
-Tenant fleets run `CELLD_OTEL=1` with celld's bucket sink: Parquet under `telemetry/traces/` and `telemetry/logs/` in the fleet bucket, no collector service. The flush is `CELLD_OTEL_FLUSH_MS=5000` and retention is `CELLD_OTEL_RETENTION=14d`, matching the runner's `app_metric` prune.
+Tenant fleets run `CELLD_OTEL=1` with celld's bucket sink: Parquet under `telemetry/traces/` and `telemetry/logs/` in the fleet bucket, no collector service. The flush interval comes from `RUNNER_OTEL_FLUSH_MS` (30 s by default) and retention from `RUNNER_TELEMETRY_RETENTION_DAYS` (30 days), which also bounds the runner's `app_metric` prune.
 
-A short flush requires a compaction job — queries grow slow within hours otherwise, and celld does not compact its own files. The runner runs it hourly via `metrics::compact_fleet`: for the hour that just ended, per node directory, one DuckDB `COPY (...) TO .../compacted.parquet (FORMAT parquet, COMPRESSION zstd)` ordered by `start_unix_us`, then the source files are deleted. Deletion happens only after `head-object` proves the compacted file exists, so a failed copy can never lose spans; `union_by_name=true` merges an hour that spans a schema change (the docs call the schema `v0-unstable`). The current hour is never compacted.
+Frequent flushes need a compaction job — queries grow slow within hours otherwise, and celld does not compact its own files. The runner runs it hourly via `metrics::compact_fleet`: for the hour that just ended, per node directory, one DuckDB `COPY (...) TO .../compacted.parquet (FORMAT parquet, COMPRESSION zstd)` ordered by `start_unix_us`, then the source files are deleted. Deletion happens only after `head-object` proves the compacted file exists, so a failed copy can never lose spans; `union_by_name=true` merges an hour that spans a schema change (the docs call the schema `v0-unstable`). The current hour is never compacted.
 
 Runner queries are day-scoped: the aggregation window stops 10 s behind the flush and names only the day directories it spans, instead of globbing the whole retention.
 

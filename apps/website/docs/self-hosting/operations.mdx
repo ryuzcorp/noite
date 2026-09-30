@@ -60,4 +60,7 @@ Compose warns that the volumes were not created by it; that is expected. Verify 
 - **`/ready` answers 503**: its body names the failing gate (`reconcile`, `bucket`, `isolation`, `control`, `caddy`). A fresh install waits for the control bundle's first deploy into `s3://<bucket>/control` (seconds; revision-gated, so a restart with the same bundle and vars skips it).
 - **`isolation: …` in multi**: the container lacks a capability or `nft`. Grant `NET_ADMIN`, `SETUID`, `SETGID` and `CHOWN`, or run `NOITE_TENANCY=single`.
 - **Boot stops with `runner state restore failed`**: the volume is empty and the bucket did not answer. The runner refuses to start with an empty database (it would overwrite the good snapshot); fix the store and it retries on restart.
-- **A deploy fails with `celld deploy does not support these config keys`**: a Wrangler key celld does not accept. Noite strips its own `release` key before deploying; anything else must go.
+- **A deploy fails with `celld deploy does not support these config keys`**: a Wrangler key celld does not accept. Noite strips the keys it consumes (`release`, `build`) before deploying; anything else must go.
+- **A deploy fails with `nothing to deploy`**: the tree has no Wrangler config, no `index.html` in `dist/`, `build/` or `out/`, and no `package.json` `main`. See [No config at all](/apps/build#no-config-at-all).
+- **A deploy fails with `starts a Node HTTP server`**: `package.json` `main` calls `.listen()`. Noite runs Workers; see [Frameworks and Node servers](/apps/build#frameworks-and-node-servers).
+- **Many `429` responses**: the edge rate limits. Behind a proxy, check `NOITE_TRUSTED_PROXIES`; otherwise raise `NOITE_EDGE_RPM` or the app's own limit ([Edge protection](/self-hosting/protection)).

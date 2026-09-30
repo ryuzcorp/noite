@@ -5,13 +5,13 @@ description: Logs, metrics with spans, errors, product-analytics events, and idl
 
 ## Logs
 
-The Overview tab tails the running fleet's stdout/stderr over SSE and follows the tail while pinned; scroll up to hold still. The buffer is in memory on the runner and resets on restart — recent activity only, not history. Finished deploys keep their own build logs on the Deployments tab.
+The Deployments tab shows the app's runtime logs, live over SSE, and follows the tail while pinned; scroll up to hold still. It holds the last 24 hours of logs ingested from celld's telemetry (up to 500 lines, about 40 s behind live traffic) followed by the fleet's live stdout/stderr, which lives in memory and resets when the runner restarts. Each deploy's build log is on its own row in the same tab.
 
 ## Metrics and spans
 
-The **Metrics** tab covers the last 24 h: 24 hourly bars for requests, errors, latency, and CPU, plus stat tiles. Requests count `celld.fetch` spans; errors, latency, and queue wait come from the same spans; CPU is sampled from the celld process tree.
+The **Metrics** tab covers the last 24 hours, 7 days or 30 days (the range picker; `?r=` keeps it across reloads): charts for requests, errors, latency and CPU, plus stat tiles. Requests count `celld.fetch` spans; errors, latency, and queue wait come from the same spans; CPU is sampled from the celld process tree. The Overview tab shows the same numbers in a smaller card.
 
-The spans table (`/spans?hours=1`) shows recent slow or failed requests on demand.
+Below the charts, the spans table lists recent slow or failed requests, and the analytics tables break traffic down by browser and OS, path and referrer.
 
 ## Errors
 
@@ -21,7 +21,7 @@ The **Errors** tab collects exceptions without an SDK. Noite reads them from the
 - **Grouping:** occurrences group into one error by type plus the functions in your code on the stack. Line numbers are ignored, so a redeploy doesn't split an error in two. Errors without a stack group by message, with numbers and ids masked.
 - **Each occurrence** keeps the stack trace (runtime frames dimmed), the request's method, path (never the query string), status and browser, the log lines from the same request, and the commit that was live. The last 20 occurrences are kept per error.
 - **Triage:** anyone with push access can resolve, ignore or reopen an error. A resolved error that happens again reopens and is marked _Regressed_. An ignored one keeps counting but never reopens.
-- **Retention** follows telemetry retention (14 days by default).
+- **Retention** follows telemetry retention (`RUNNER_TELEMETRY_RETENTION_DAYS`, 30 days by default).
 
 :::note
 Stack locations point into the bundle celld runs (`worker.js:58`), not your source files. Source-mapped stacks are planned.
@@ -31,7 +31,7 @@ Stack locations point into the bundle celld runs (`worker.js:58`), not your sour
 
 The **Events** tab is tenant-facing product analytics, separate from metrics. The app emits events into named channels; the UI offers channel filter, text search, paging, per-event tags and user properties, and insight widgets over the feed.
 
-Before the first event lands, the tab shows an ingest snippet for that app. Identifying users, devices, paths, and referrers feed the breakdown tables on the Metrics detail view (browsers with OS mix, top paths, top refs).
+Before the first event lands, the tab shows an ingest snippet for that app. Identified users carry properties that appear with their events.
 
 ## Sleep
 
@@ -39,7 +39,7 @@ An app with no requests for a day stops costing anything; the next request wakes
 
 - **Asleep is not stopped.** Desired state stays `running`; status reads `sleeping`. A stopped app never sleeps or wakes.
 - **Idle window:** 24 h of no requests by default. A fresh deploy or manual start gets a full window before it can sleep.
-- **Wake is invisible.** The edge holds the request — body included — while the fleet cold-starts, typically a few seconds, then proxies it as if the app had never slept. Concurrent requests wait on the same wake; only a failed wake answers 503.
+- **Wake is invisible.** The edge holds the request — body included — while the fleet cold-starts, typically a few seconds, then proxies it as if the app had never slept. Concurrent requests wait on the same wake, and only a few apps start at once host-wide (`RUNNER_WAKE_CONCURRENCY`); only a failed wake answers 503.
 - **Deploy wakes.** A push, rollback, or web commit to a sleeping app starts the fleet first.
 
 :::tip

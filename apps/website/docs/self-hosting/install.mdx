@@ -17,7 +17,7 @@ It elevates itself with `sudo` (no `sudo` in front: piped into `sudo bash`, the 
 Register right away: the first account becomes the admin without an invite code.
 :::
 
-Re-running the script is the upgrade: it refreshes `compose.yaml`, keeps `.env` (the domain and secrets never change after the first install, since passkeys bind to `BETTER_AUTH_URL`), pulls and recreates. Inputs are environment variables, passed on to the script (`curl … | NOITE_DOMAIN=example.com bash -s install`):
+Re-running the script is the upgrade: it refreshes `compose.yaml`, keeps `.env` (the domain and secrets never change after the first install, since passkeys bind to `BETTER_AUTH_URL`), pulls and recreates. Inputs are environment variables, set on `bash`, not on `curl`: `curl … | NOITE_DOMAIN=example.com bash -s install` (a variable in front of `curl` only reaches `curl`).
 
 | Variable | Default | Effect |
 | --- | --- | --- |

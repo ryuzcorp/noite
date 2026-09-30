@@ -10,7 +10,7 @@ description: Quotas, fleet bounds, rate limits, and the scale-to-zero sleep mech
 | `RUNNER_MAX_APPS_PER_USER` | `10` | Per-account app quota, enforced in the runner on create — API keys cannot bypass it |
 | `RUNNER_BUILD_MAX_MB` | `2048` | Builds refused past this worktree size (MiB) |
 | `RUNNER_BUILD_TIMEOUT_S` | `300` | Each install and build step is killed past this (seconds) |
-| `RUNNER_BUILD_CACHE_MB` | `512` | Per-app build cache cap (Bun, npm, pnpm, Yarn and their jup-managed releases), pruned oldest-first; `0` disables |
+| `RUNNER_BUILD_CACHE_MB` | `512` | Per-app build cache cap (Bun, npm, pnpm, Yarn and their jup-managed releases); over it, whole caches are dropped, largest first; `0` disables |
 | `RUNNER_TELEMETRY_RETENTION_DAYS` | `30` | Telemetry lifetime in bucket prune, metric tables, and glob floor |
 
 ## Fleet bounds

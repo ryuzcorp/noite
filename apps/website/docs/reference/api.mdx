@@ -46,7 +46,7 @@ Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
 
 | Method | Route | Notes |
 | --- | --- | --- |
-| `GET` / `POST` | `/v1/apps/{id}/env` | List; set (triggers redeploy flow) |
+| `GET` / `POST` | `/v1/apps/{id}/env` | List; set (applies from the next deploy; not visible to Worker code at runtime) |
 | `DELETE` | `/v1/apps/{id}/env/{name}` | Removes one var |
 
 ## Domains
@@ -86,8 +86,8 @@ Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
 | `GET` | `/v1/apps/{id}/devices` | Device breakdown (tailed from Caddy access log) |
 | `GET` | `/v1/apps/{id}/paths` | Path breakdown |
 | `GET` | `/v1/apps/{id}/refs` | Referrer breakdown |
-| `GET` | `/v1/apps/{id}/spans?hours=1` | On-demand spans |
-| `GET` | `/v1/apps/{id}/logs` | App logs |
+| `GET` | `/v1/apps/{id}/spans?hours=1` | Recent slow or failed spans |
+| `GET` | `/v1/apps/{id}/logs` | App logs: 24 h of ingested lines plus the live stdout tail |
 | `GET` | `/v1/apps/{id}/logs/stream` | SSE log stream |
 
 ## Events
@@ -125,7 +125,13 @@ git push noite main
 
 ## RPC mirror
 
-`POST /rpc` is a JSON-RPC mirror of the REST routes (same auth, same effects). Prefer REST; use `/rpc` only where batching calls matters.
+`POST /rpc` is JSON-RPC 2.0 over the same auth, with a method per REST route (`apps.list`, `env.set`, `deploys.rollback`, `storage.d1.get`, …). A few methods exist only there, because only the control UI uses them:
+
+| Method | Params | Does |
+| --- | --- | --- |
+| `apps.get_by_slug` | `slug` | One app by slug |
+| `limits.get` / `limits.set` | `id`, `clientRpm`, `appRpm` | The app's edge rate limits (requests per minute; `null` = platform default, `0` = off) |
+| `errors.list` / `errors.get` / `errors.set_status` | `id`, `status` / `fingerprint` | Grouped errors, one error with occurrences, resolve / ignore / reopen |
 
 ## Statuses
 
@@ -134,4 +140,5 @@ git push noite main
 | `401` | Missing or wrong bearer token / API key                 |
 | `404` | Unknown app, slug, deploy, or key                       |
 | `409` | Domain already taken; conflicting sleep/wake transition |
+| `429` | Edge rate limit (+ `Retry-After`)                       |
 | `503` | Fleet shedding load (+ `Retry-After`) or failed wake    |

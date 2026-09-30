@@ -3,17 +3,17 @@ title: Apps
 description: What an account holder can do with an app — deploy it, configure it, observe it.
 ---
 
-An app is a celld Worker with a `git` remote. The owner creates it in the UI; deploys follow every push to that remote.
+An app is a Worker or a static site, run by celld, with a `git` remote. The owner creates it in the UI; deploys follow every push to that remote.
 
 <Steps>
 <Step title="Deploy">
-Push code over Git smart-HTTP or from CI. Each push builds, releases, and goes live behind `http://<slug>.<domain>`.
+Push code over Git smart-HTTP or from CI. Each push builds, releases, and goes live behind `https://<slug>.<domain>`.
 </Step>
 <Step title="Configure">
-Env vars, custom domains, collaborators, source edits, and storage inspection — all from the app detail page.
+Env vars, custom domains, rate limits, collaborators, source edits, and storage inspection — all from the app detail page.
 </Step>
 <Step title="Observe">
-Runtime logs, request metrics with spans, product-analytics events, and idle sleep behavior.
+Runtime logs, request metrics with spans, errors, product-analytics events, and idle sleep behavior.
 </Step>
 </Steps>
 
@@ -22,13 +22,13 @@ Runtime logs, request metrics with spans, product-analytics events, and idle sle
     Create an app, push with git, deploy from CI, and what each push triggers.
   </Card>
   <Card title="Build" href="/apps/build" icon="package">
-    Vite, Rsbuild and custom build commands, and which config deploys.
+    Vite, Rsbuild, static sites, frameworks, custom build commands, and which config deploys.
   </Card>
   <Card title="Configure" href="/apps/configure" icon="settings">
-    Env vars, custom domains, collaborator roles, web commits, and storage.
+    Env vars, custom domains, rate limits, collaborator roles, web commits, and storage.
   </Card>
   <Card title="Observe" href="/apps/observe" icon="chart">
-    Logs, metrics and spans, events and insights, and scale-to-zero sleep.
+    Logs, metrics and spans, errors, events and insights, and scale-to-zero sleep.
   </Card>
 </CardGroup>
 

@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use crate::config::{Config, Tenancy};
 use crate::db;
 use crate::host::build_output;
+use crate::host::generated_config;
 use crate::host::package_manager;
 use crate::host::cmd::{self, Sandbox, TipBundle};
 use crate::host::credentials;
@@ -98,7 +99,7 @@ pub async fn deploy_app(
 
 /// The deploy row one run writes to and the step it is in: every line of the
 /// run, its failure included, lands on that one row, and the failure names
-/// the step (`fetch`, `install`, `build`, `convert`, `release`, `deploy`,
+/// the step (`fetch`, `install`, `build`, `convert`, `generate`, `release`, `deploy`,
 /// `start`).
 struct Progress<'a> {
     pool: &'a SqlitePool,
@@ -425,14 +426,33 @@ async fn deploy_inner(
     } else {
         None
     };
+    // No config anywhere: generate one from what the build left
+    // (generated_config.rs). Decided now, so a tree with nothing to deploy
+    // fails before its release command; written only once the tree is the
+    // runner's again, below.
+    let mut generated = None;
     let deploy_root = match built_root {
         Some(built) => {
             progress.log(DeployStatus::Building, &format!("config: {}\n", built.note)).await?;
             built.dir
         }
-        None => find_deploy_root(&src_dir)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("no wrangler.json(c) / dist output to deploy"))?,
+        None => match find_deploy_root(&src_dir).await? {
+            Some(root) => root,
+            None => {
+                progress
+                    .step("generate", DeployStatus::Building, "no Wrangler config: generating one")
+                    .await?;
+                let plan = generated_config::plan(&src_dir, package.as_ref())?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "nothing to deploy: no Wrangler config, no index.html in dist/, build/ or \
+                         out/, and no package.json main exporting a fetch handler"
+                    )
+                })?;
+                progress.log(DeployStatus::Building, &format!("config: {}\n", plan.note())).await?;
+                generated = Some(plan);
+                src_dir.clone()
+            }
+        },
     };
 
     if db::get_app(pool, &app.id).await?.is_none() {
@@ -492,6 +512,9 @@ async fn deploy_inner(
     // config may lead out of the worktree (a `dist` symlink into /data would
     // otherwise ship platform files into the tenant's bucket).
     let src_dir = src_dir.canonicalize()?;
+    if let Some(plan) = &generated {
+        generated_config::write(&src_dir, &app.slug, plan)?;
+    }
     let deploy_root = contained_deploy_root(&src_dir, &deploy_root)?;
     // `release` and `build` are keys the runner consumes: celld deploy
     // refuses any config key it does not know, so drop them once they ran.
@@ -777,7 +800,8 @@ async fn find_deploy_root(dir: &PathBuf) -> anyhow::Result<Option<PathBuf>> {
         }
         let name = ent.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with('.') {
+        // A dependency's own Wrangler file is never the app's.
+        if name.starts_with('.') || name == "node_modules" {
             continue;
         }
         if let Some(found) = Box::pin(find_deploy_root(&ent.path())).await? {

@@ -13,7 +13,7 @@ tini (PID 1: reaps zombies, forwards signals)
     ├── caddy run --watch             :80/:443, admin 127.0.0.1:2019
     ├── celld  control fleet #0       public 127.0.0.1:8090, internal 0.0.0.0:8091
     ├── celld  tenant fleet × N       uid fleet (10020); public 0.0.0.0:{p}, internal 127.0.0.1:{p+1}
-    └── bun / sh                      builds and release, uid build (10010), transient
+    └── bun / node / sh               installs, builds and release, uid build (10010), transient
 ```
 
 The runner owns every child's lifecycle: restart with 1–30 s backoff, SIGTERM then SIGKILL past the stop budget. There is no second supervisor.
@@ -22,7 +22,7 @@ The runner owns every child's lifecycle: restart with 1–30 s backoff, SIGTERM 
 
 Published: `:80`/`:443` (host `HTTP_PORT`/`HTTPS_PORT`, default 9080/9443). `:8080` (runner API) is published only by the e2e lane. Each app takes two fleet ports from `NOITE_FLEET_PORTS` (default `20000-29999`); exhaustion errors instead of wandering into ephemeral ports.
 
-The edge routes by Host: the control subdomain serves the UI, `api.`/`git.` reach the runner, `{slug}.<domain>` reaches the app's fleet.
+The edge routes by Host: the control subdomain serves the UI, `api.`/`git.` reach the runner, `{slug}.<domain>` reaches the app's fleet. It also rate-limits every site before a request reaches a worker; see [Edge protection](/self-hosting/protection).
 
 ## Bucket layout
 
@@ -41,7 +41,7 @@ The bundled RustFS store provides this bucket with zero config; production uses 
 
 1. `git push` hits smart-HTTP at `git.<domain>/<slug>` (Basic `git` plus a profile API key).
 2. receive-pack writes the tip as `refs/heads/main/<sha>.bundle` plus the `MANIFEST.json` linearization point, so half-written pushes stay invisible.
-3. The runner checks out a worktree and runs the sandboxed install and build with the project's package manager (Bun by default; npm, pnpm and Yarn through jup) when declared. A `cloudflare.config.ts` is converted to Wrangler config when no Wrangler file exists.
+3. The runner checks out a worktree and runs the sandboxed install and build with the project's package manager (Bun by default; npm, pnpm and Yarn through jup) when declared. It then picks the config to deploy: what the build wrote, else the source's Wrangler config, else a `cloudflare.config.ts` converted to one, else one it generates for a static site or a `package.json` `main` Worker ([Build](/apps/build#which-config-deploys)).
 4. The optional `release` command runs (migrations). Noite strips its own `release` key before deploying; celld rejects unknown keys.
 5. `celld deploy` uploads, then the runner spawns the fleet or calls `POST /reload` on its internal listener.
 6. Caddy routes `{slug}.<domain>` to the fleet's port. Deploy logs keep a 64 KB tail; a past successful `<sha>` redeploys via rollback.
