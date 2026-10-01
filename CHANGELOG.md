@@ -27,4 +27,7 @@ First alpha: self-hosted only. There is no cloud version.
 
 ### Changed
 
+- God mode: Users, Apps and Invites share one layout and the same search (input and Search button, kept in the URL), so tabs no longer shift.
+- Changing an app's slug moved from the Identity card to its Danger Zone.
+
 - Multi-tenant mode is documented as **semi-trusted tenants** for the alpha: see Self-hosting → Known limits.
