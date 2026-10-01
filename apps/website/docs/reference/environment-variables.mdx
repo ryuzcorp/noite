@@ -7,6 +7,12 @@ Defaults below are what `docker/compose.yaml` applies when the var is unset. The
 
 Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (handed to the control UI worker untouched).
 
+## Image
+
+| Var | Default | Effect | Owner |
+| --- | --- | --- | --- |
+| `NOITE_IMAGE` | `ghcr.io/ryuzcorp/noite:alpha` | Image Compose pulls: a [release channel](/self-hosting/operations#releases-and-channels) (`alpha`, `stable`) or a version tag | Compose |
+
 ## Domain and edge
 
 | Var | Default | Effect | Owner |
@@ -37,7 +43,7 @@ Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (hand
 | `RUNNER_TOKEN` | `dev-runner-token` | Bearer token for runner API + UI server calls; refused off-localhost at default | runner-owned |
 | `BETTER_AUTH_SECRET` | `dev-only-change-me-to-a-long-random-string` | Session signing secret; `dev-` values refused on real domains | worker-passthrough |
 | `NOITE_ADMIN_EMAIL` | _(empty)_ | Account promoted to admin at startup | worker-passthrough |
-| `NOITE_EMAIL_WEBHOOK_URL` | _(empty)_ | Receives lost-passkey OTP JSON; unset = log on localhost, refuse on real domains | worker-passthrough |
+| `NOITE_EMAIL_WEBHOOK_URL` | _(empty)_ | Receives lost-passkey OTP JSON; unset = printed to the control log on `localhost`, not sent (the failure is logged) on real domains. Without it, use [`noite-runner recover`](/self-hosting/accounts#lost-passkey) | worker-passthrough |
 | `NOITE_SMTP_FROM` | _(empty)_ | OTP sender label | worker-passthrough |
 
 ## Store

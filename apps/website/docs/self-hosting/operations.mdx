@@ -3,6 +3,21 @@ title: Operations
 description: Update Noite, back up and restore its volumes, and troubleshoot ready gates and boot failures.
 ---
 
+## Releases and channels
+
+Installs follow releases, not `main`. `NOITE_IMAGE` (or `NOITE_VERSION` for the installer) picks what an update pulls:
+
+| Tag | What it is |
+| --- | --- |
+| `alpha` | The newest release of any kind. The default while Noite is alpha. |
+| `stable` | The newest final release (no `-alpha.N` in its version). Absent until the first one. |
+| `0.1.0-alpha.1` | One release, pinned: an update changes nothing. |
+| short SHA, `edge` | A build of `main`. Not for installs: for CI and rollbacks. |
+
+Every release is tagged `v<version>` and passes the end-to-end lanes (passkey signup, invites, git push, deploys, and the hostile-tenant suite) before its image is published. Its notes are in [CHANGELOG.md](https://github.com/ryuzcorp/noite/blob/main/CHANGELOG.md); each has an **Operator action required** section, even when it is "None". Read it before you update.
+
+To roll back, set `NOITE_IMAGE` to the previous version tag. That works across releases that did not change the database schema; a release that did refuses to be downgraded (see [Troubleshooting](#troubleshooting)), so take a [backup](#backups) first.
+
 ## Updating
 
 Re-run the installer, or pull and recreate by hand:
@@ -29,7 +44,7 @@ docker compose exec -T noite sh -c \
 docker compose stop
 for vol in noite-data rustfs-data; do
   docker run --rm --entrypoint tar -v "noite_$vol:/vol:ro" -v "$PWD/backups/$STAMP:/out" \
-    ghcr.io/ryuzcorp/noite:latest -cf "/out/$vol.tar" -C /vol .
+    ghcr.io/ryuzcorp/noite:alpha -cf "/out/$vol.tar" -C /vol .
 done
 docker compose up -d
 ```
@@ -48,7 +63,7 @@ docker compose down
 for vol in noite-data rustfs-data; do
   docker volume rm -f "noite_$vol" && docker volume create "noite_$vol"
   docker run --rm --entrypoint tar -v "noite_$vol:/vol" -v "$PWD/backups/<stamp>:/in:ro" \
-    ghcr.io/ryuzcorp/noite:latest -xf "/in/$vol.tar" -C /vol
+    ghcr.io/ryuzcorp/noite:alpha -xf "/in/$vol.tar" -C /vol
 done
 docker compose up -d
 ```
@@ -57,6 +72,8 @@ Compose warns that the volumes were not created by it; that is expected. Verify 
 
 ## Troubleshooting
 
+- **Boot stops with `refusing to start: the runner database is schema version N`** (or the same for the control database): the data was written by a newer Noite than the image you started. Run the newer image again, or [restore](#restore) a backup taken before the upgrade. Downgrading across a schema change is not supported, and the refusal is what stops an old image from damaging newer data.
+- **Locked out after losing the passkey**: see [Lost passkey](/self-hosting/accounts#lost-passkey).
 - **`/ready` answers 503**: its body names the failing gate (`reconcile`, `bucket`, `isolation`, `control`, `caddy`). A fresh install waits for the control bundle's first deploy into `s3://<bucket>/control` (seconds; revision-gated, so a restart with the same bundle and vars skips it).
 - **`isolation: …` in multi**: the container lacks a capability or `nft`. Grant `NET_ADMIN`, `SETUID`, `SETGID` and `CHOWN`, or run `NOITE_TENANCY=single`.
 - **Boot stops with `runner state restore failed`**: the volume is empty and the bucket did not answer. The runner refuses to start with an empty database (it would overwrite the good snapshot); fix the store and it retries on restart.

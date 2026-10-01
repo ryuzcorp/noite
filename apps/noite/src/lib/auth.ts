@@ -391,6 +391,17 @@ const defaultSecretRefusal = (env: KitEnv, baseURL: string): string | null => {
   return null;
 };
 
+/** The slice of the worker env better-auth sees. The OTP sender reads its
+ * delivery settings from here: leaving them out made every lost-passkey code
+ * fall through to the console on a real domain instead of the webhook. */
+const authEnv = (env: KitEnv): KitEnv => ({
+  BASE_DOMAIN: env.BASE_DOMAIN,
+  BETTER_AUTH_SECRET: env.BETTER_AUTH_SECRET,
+  BETTER_AUTH_URL: env.BETTER_AUTH_URL,
+  NOITE_EMAIL_WEBHOOK_URL: env.NOITE_EMAIL_WEBHOOK_URL,
+  NOITE_SMTP_FROM: env.NOITE_SMTP_FROM,
+});
+
 export const authFromEnv = (env: KitEnv, origin: string) => {
   if (!env.BETTER_AUTH_SECRET) {
     throw new MissingAuthSecretError({
@@ -402,13 +413,7 @@ export const authFromEnv = (env: KitEnv, origin: string) => {
   if (refusal) {
     throw new MissingAuthSecretError({ message: refusal });
   }
-  return createAuth(
-    {
-      BETTER_AUTH_SECRET: env.BETTER_AUTH_SECRET,
-      BETTER_AUTH_URL: env.BETTER_AUTH_URL,
-    },
-    baseURL
-  );
+  return createAuth(authEnv(env), baseURL);
 };
 
 export const authFromEnvEffect = (env: KitEnv, origin: string) =>
@@ -427,13 +432,7 @@ export const authFromEnvEffect = (env: KitEnv, origin: string) =>
         new MissingAuthSecretError({ message: refusal })
       );
     }
-    return createAuth(
-      {
-        BETTER_AUTH_SECRET: env.BETTER_AUTH_SECRET,
-        BETTER_AUTH_URL: env.BETTER_AUTH_URL,
-      },
-      baseURL
-    );
+    return createAuth(authEnv(env), baseURL);
   });
 
 export interface SessionUser {

@@ -5,8 +5,20 @@ description: NOITE_TENANCY decides whether other people may push code — multi 
 
 `NOITE_TENANCY` decides whether other people may push code to the install. Unset, it is `multi` off `localhost` and `single` on `localhost`.
 
-- **`multi`**: tenant builds and release commands run as the unprivileged `build` user with a cleared environment (no platform secret reaches them), tenant fleets as the `fleet` user, and an nftables policy on those users closes new connections to loopback, private ranges and cloud metadata. The one private address allowed is the object store the fleet's own celld needs; Worker code can reach it but holds no keys. `/data` is private to the runner. Release commands are skipped until scoped per-app bucket keys exist. All of this needs `NET_ADMIN`, `SETUID`, `SETGID` and `CHOWN`, which `docker/compose.yaml` grants; without them the runner keeps `/ready` at 503 with the reason and refuses builds.
+- **`multi`**: tenant builds and release commands run as the unprivileged `build` user with a cleared environment (no platform secret reaches them), tenant fleets as the `fleet` user, and an nftables policy on those users closes new connections to loopback, private ranges and cloud metadata. The one private address allowed is the object store the fleet's own celld needs; Worker code can reach it but holds no keys. `/data` is private to the runner. Release commands are skipped until scoped per-app bucket keys exist ([what that means](#what-multi-does-and-does-not-promise-alpha)). All of this needs `NET_ADMIN`, `SETUID`, `SETGID` and `CHOWN`, which `docker/compose.yaml` grants; without them the runner keeps `/ready` at 503 with the reason and refuses builds.
 - **`single`**: only you push code. No egress policy, and release commands run with the root bucket keys.
+
+## What `multi` does and does not promise (alpha)
+
+`multi` is for **semi-trusted tenants**: people you would invite to your server, running code you do not review, who are not trying to break out. It stops accidents and casual snooping. It is not a boundary you can hand to strangers.
+
+- Fleets hold the object store's **root keys** (scoped per-app keys are not built yet). A compromised tenant process can read and write every app's data in the bucket, including other tenants' git bundles and databases.
+- Builds share one `build` user, so two builds running at once can read each other's worktrees.
+- Worker code can reach the object store's unauthenticated surface.
+- Fleets share the container's memory: one app's growth pushes every app toward the same shed threshold.
+- Release commands (for example D1 migrations) are skipped in `multi`, because they would need those root keys. Apps that need a migration step before they start need `single` for now.
+
+Until scoped credentials land, run `multi` only for people you trust the way you would trust a colleague with shell access to a shared box, and use `single` when you are the only one pushing. The full list is in [Known limits](/self-hosting/known-limits).
 
 The repository's isolation lane (`make e2e-isolation`, also runnable from the CI workflow) proves the `multi` claims: a hostile tenant app tries to read platform secrets and files and to reach every internal API from its build, its release command and its Worker, and the lane asserts every attempt fails while internet egress still works.
 

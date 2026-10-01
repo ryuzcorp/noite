@@ -91,6 +91,7 @@ describe("limitedClass", () => {
   test("covers the public routes only", () => {
     expect(limitedClass("/api/invite/status")).toBe("invite");
     expect(limitedClass("/api/auth/sign-in/passkey")).toBe("auth");
+    expect(limitedClass("/internal/recovery")).toBe("recovery");
     expect(limitedClass("/api/apps/stream")).toBeNull();
   });
 });

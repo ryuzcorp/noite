@@ -33,6 +33,28 @@ With `CI=1`, pnpm installs with `--frozen-lockfile` and Yarn 2+ with `--immutabl
 
 The **Deployments** tab logs each step as `▸ step: command`, followed by its output tail. A failed deploy names the step (`ERROR: build failed`), and the app panel shows the step and the first error line.
 
+## `wrangler.jsonc` or `cloudflare.config.ts`
+
+Either declares the Worker; pick one per app.
+
+- **`wrangler.jsonc`** (or `.json`, `.toml`) is the format celld deploys, so it is what the runner uses as is. Choose it for a plain Worker, a static site, or `@cloudflare/vite-plugin`. Besides Wrangler's own keys it accepts Noite's `release` ([Release command](/apps/deploy#release-command)).
+- **`cloudflare.config.ts`** is the [`cf` CLI](https://github.com/cloudflare/cf)'s typed config. With no Wrangler config in the tree, the runner converts it after the build into the `wrangler.json` celld deploys. Add `cf` to `package.json` `dependencies` (it provides `@cloudflare/config`); a missing `cf` fails the convert step with a line saying so.
+
+```ts title="cloudflare.config.ts"
+import { bindings, defineConfig, defineWorker } from "cf/config";
+
+const worker = defineWorker({
+  compatibilityDate: "2026-09-01",
+  entrypoint: "./src/worker.ts",
+  env: { DB: bindings.d1({ name: "my-app" }) },
+  name: "my-app",
+});
+
+export default defineConfig({ worker });
+```
+
+A Wrangler config in the tree wins over `cloudflare.config.ts`, and a build that writes `dist/wrangler.json` wins over both ([Which config deploys](#which-config-deploys)). Durable Object `exports` are limited to creating classes; renames, deletes and transfers fail the convert step.
+
 ## Which config deploys
 
 After a build, the runner deploys what the build produced, in this order:
@@ -129,6 +151,17 @@ Apps run on celld, which runs Cloudflare Workers. A framework deploys when it bu
 - **With a Cloudflare target**: use the framework's own Workers build, which writes a Wrangler config or works through `@cloudflare/vite-plugin`. Examples: Nuxt and Nitro (`cloudflare_module` preset), SvelteKit (`@sveltejs/adapter-cloudflare`), Astro (`@astrojs/cloudflare`), React Router and TanStack Start (the Cloudflare Vite plugin). These targets are Cloudflare's; Noite has not tested each one, and a feature celld lacks fails at deploy or on the first request.
 
 A **Node HTTP server** does not run: Express, Fastify, Koa, `http.createServer`, or anything that calls `app.listen()`. celld implements no `node:http` server and no `IncomingMessage`, so wrapping the app in a fetch adapter does not help either. When `main` looks like such a server, the deploy fails with a message saying so. Move the routes to a `fetch`-based framework (Hono's API is close to Express), or use your framework's Workers target.
+
+## `_headers` and `_redirects`
+
+Static assets honour Cloudflare's `_headers` and `_redirects` files, with Cloudflare's syntax, placed at the root of the assets directory (`dist/` for a Vite build: put them in `public/` so the build copies them there).
+
+```text title="public/_headers"
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+```
+
+celld serves assets with `Cache-Control: max-age=0, must-revalidate`, so mark content-hashed files immutable as above. The full syntax and limits are in [celld's assets documentation](https://celld.dev/docs/).
 
 ## Custom build command
 

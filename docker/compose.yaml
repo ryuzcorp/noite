@@ -18,7 +18,7 @@ name: noite
 
 services:
   noite:
-    image: ${NOITE_IMAGE:-ghcr.io/ryuzcorp/noite:latest}
+    image: ${NOITE_IMAGE:-ghcr.io/ryuzcorp/noite:alpha}
     restart: unless-stopped
     # Above the runner's stop budget (NOITE_STOP_BUDGET_MS, 25 s): it stops
     # every fleet, then Caddy, then writes the final state snapshot.

@@ -1,7 +1,8 @@
-//! Settings tab: identity form, domains, rate limits, collaborators, env,
+//! Settings tab: identity (name), domains, rate limits, collaborators, env,
 //! danger zone.
 import { navigate, useRoute } from "@ilha/router";
 import { atom } from "ilha";
+import type { View } from "ilha";
 
 import { appHost } from "../apps";
 import {
@@ -621,27 +622,23 @@ const RateLimitsPanel = ({
   );
 };
 
-/** Identity form: display name (regular input) + slug change behind an
- * explicit risk dialog. Admin-only; everyone else sees read-only values. */
+/** Identity form: the display name. Admin-only; everyone else sees the
+ * read-only value. The slug is not here: changing it moves the app's URL and
+ * git remote, so it lives in the Danger Zone. */
 const AppIdentityForm = ({
   appId,
   name,
-  slug,
   myRole,
   onSaved,
 }: {
   appId: string;
   name: string;
-  slug: string;
   myRole: AppRole;
   onSaved: () => void;
 }) => {
   const draftName = atom(name);
-  const dialogOpen = atom(false);
   const err = atom("");
   const busy = atom(false);
-  const slugDraft = atom(slug);
-  const slugError = (): string | null => slugValidationMessage(slugDraft());
   const isAdmin = myRole === "admin";
 
   const saveName = async () => {
@@ -657,29 +654,6 @@ const AppIdentityForm = ({
     try {
       await renameApp({ id: appId, name: next });
       err.set("");
-      onSaved();
-    } catch (error) {
-      err.set(errorMessage(error));
-    } finally {
-      busy.set(false);
-    }
-  };
-
-  const saveSlug = async () => {
-    if (!isAdmin || busy()) {
-      return;
-    }
-    const raw = slugDraft();
-    const message = slugValidationMessage(raw);
-    if (message) {
-      return;
-    }
-    const next = raw.trim().toLowerCase();
-    busy.set(true);
-    try {
-      await renameApp({ id: appId, slug: next });
-      err.set("");
-      dialogOpen.set(false);
       onSaved();
     } catch (error) {
       err.set(errorMessage(error));
@@ -721,40 +695,134 @@ const AppIdentityForm = ({
               {busy() ? "Saving…" : "Save name"}
             </button>
           </div>
+        ) : (
+          <p class="m-0 text-sm opacity-70">Only admins can change the name.</p>
+        )}
+      </div>
+    </section>
+  );
+};
+
+/** One Danger Zone row: what it does, and the button that does it. */
+const DangerRow = ({
+  action,
+  children,
+  title,
+}: {
+  action: View;
+  children: View;
+  title: string;
+}) => (
+  <div class="border-base-300 flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t pt-4 first:border-t-0 first:pt-0">
+    <div class="min-w-0">
+      <p class="m-0 text-sm font-medium">{title}</p>
+      <p class="m-0 text-sm opacity-80">{children}</p>
+    </div>
+    <div class="shrink-0">{action}</div>
+  </div>
+);
+
+/** Danger Zone (admins only): the two actions that cannot be taken back
+ * quietly. Changing the slug moves the app's URL and git remote behind an
+ * explicit risk dialog; deleting removes the app. */
+const AppDangerZone = ({
+  appId,
+  name,
+  onSaved,
+  slug,
+}: {
+  appId: string;
+  name: string;
+  onSaved: () => void;
+  slug: string;
+}) => {
+  const dialogOpen = atom(false);
+  const slugDraft = atom(slug);
+  const slugErr = atom("");
+  const busy = atom(false);
+  const notice = atom<string | null>(null);
+  const slugError = (): string | null => slugValidationMessage(slugDraft());
+
+  const saveSlug = async () => {
+    if (busy()) {
+      return;
+    }
+    const raw = slugDraft();
+    if (slugValidationMessage(raw)) {
+      return;
+    }
+    busy.set(true);
+    try {
+      await renameApp({ id: appId, slug: raw.trim().toLowerCase() });
+      slugErr.set("");
+      dialogOpen.set(false);
+      onSaved();
+    } catch (error) {
+      slugErr.set(errorMessage(error));
+    } finally {
+      busy.set(false);
+    }
+  };
+
+  return (
+    <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
+      <div class="card-body gap-4">
+        <h3 class="text-error m-0 text-lg font-semibold">Danger Zone</h3>
+        {notice() ? (
+          <div class="alert alert-error m-0 py-2" role="alert">
+            <span>{notice()}</span>
+          </div>
         ) : null}
-        <fieldset class="fieldset w-full">
-          <label class="label" for="identity-slug">
-            Slug
-          </label>
-          <input
-            id="identity-slug"
-            class="input input-sm font-mono"
-            value={slug}
-            disabled
-            readonly
-          />
-        </fieldset>
-        {isAdmin ? (
-          <div>
+        <DangerRow
+          title="Change slug"
+          action={
             <button
               type="button"
-              class="btn btn-sm"
+              class="btn btn-sm btn-warning"
               disabled={busy()}
               onclick={() => {
-                err.set("");
+                slugErr.set("");
                 slugDraft.set(slug);
                 dialogOpen.set(true);
               }}
             >
               Change slug
             </button>
-          </div>
-        ) : null}
-        {isAdmin ? null : (
-          <p class="m-0 text-sm opacity-70">
-            Only admins can change the name or slug.
-          </p>
-        )}
+          }
+        >
+          The slug is <code class="font-mono">{slug}</code>. Changing it moves
+          the app URL and the git remote.
+        </DangerRow>
+        <DangerRow
+          title="Delete app"
+          action={
+            <button
+              type="button"
+              class="btn btn-sm btn-error"
+              onclick={async () => {
+                if (
+                  // oxlint-disable-next-line no-alert -- native confirm dialog is the requirement for destructive deletes.
+                  !window.confirm(
+                    `Delete ${name}? This removes the app, its git remote and its fleet.`
+                  )
+                ) {
+                  return;
+                }
+                try {
+                  await remove(appId);
+                  dropAppFromSnapshot(appId);
+                  navigate("/apps");
+                } catch (error) {
+                  notice.set(errorMessage(error));
+                }
+              }}
+            >
+              Delete App
+            </button>
+          }
+        >
+          Removes the app, its git remote and its fleet. This cannot be undone.
+        </DangerRow>
         <Dialog open={dialogOpen} class="modal">
           <div class="modal-box bg-base-100 dark:bg-base-200">
             <h3 class="m-0 text-lg font-bold">Change slug?</h3>
@@ -788,7 +856,7 @@ const AppIdentityForm = ({
               />
             </fieldset>
             <p id="slug-error" class="text-error m-0 text-sm">
-              {slugError() ?? ""}
+              {slugError() ?? slugErr()}
             </p>
             <div class="modal-action">
               <button
@@ -1106,8 +1174,6 @@ export const AppSettingsPanel = () => {
   const { params } = useRoute();
   const { id } = params();
   const res = appDetail(id ?? "");
-  const notice = atom<string | null>(null);
-
   const info = res.data();
   if (!id) {
     return <p class="text-error m-0 text-sm">Missing app id</p>;
@@ -1133,7 +1199,6 @@ export const AppSettingsPanel = () => {
       <AppIdentityForm
         appId={gate.appId}
         name={gate.name}
-        slug={gate.slug}
         myRole={gate.myRole}
         onSaved={() => {
           // invalidate (not res.refetch): the page title and the header
@@ -1146,45 +1211,14 @@ export const AppSettingsPanel = () => {
       <CollaboratorsPanel appId={gate.appId} myRole={gate.myRole} />
       <EnvVarsPanel appId={gate.appId} myRole={gate.myRole} />
       {gate.myRole === "admin" ? (
-        <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-          <div class="card-body gap-4">
-            <h3 class="text-error m-0 text-lg font-semibold">Danger Zone</h3>
-            <p class="m-0 text-sm opacity-80">
-              Deleting removes the app, its git remote and its fleet. This
-              cannot be undone.
-            </p>
-            {notice() ? (
-              <div class="alert alert-error m-0 py-2" role="alert">
-                <span>{notice()}</span>
-              </div>
-            ) : null}
-            <div>
-              <button
-                type="button"
-                class="btn btn-sm btn-error"
-                onclick={async () => {
-                  if (
-                    // oxlint-disable-next-line no-alert -- native confirm dialog is the requirement for destructive deletes.
-                    !window.confirm(
-                      `Delete ${gate.name}? This removes the app, its git remote and its fleet.`
-                    )
-                  ) {
-                    return;
-                  }
-                  try {
-                    await remove(gate.appId);
-                    dropAppFromSnapshot(gate.appId);
-                    navigate("/apps");
-                  } catch (error) {
-                    notice.set(errorMessage(error));
-                  }
-                }}
-              >
-                Delete App
-              </button>
-            </div>
-          </div>
-        </section>
+        <AppDangerZone
+          appId={gate.appId}
+          name={gate.name}
+          slug={gate.slug}
+          onSaved={() => {
+            invalidate(keys.appDetail(gate.appId));
+          }}
+        />
       ) : null}
     </div>
   );

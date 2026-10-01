@@ -110,6 +110,9 @@ export const limitedClass = (pathname: string): string | null => {
   if (pathname === "/api/invite/status") {
     return "invite";
   }
+  if (pathname === "/internal/recovery") {
+    return "recovery";
+  }
   return pathname.startsWith("/api/auth") ? "auth" : null;
 };
 

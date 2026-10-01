@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { findAppId, runnerCall } from "./helpers";
+import { E2E_EMAIL, findAppId, runnerCall } from "./helpers";
 
 // Control-plane hardening, pinned at the HTTP layer (the same layer the
 // lifecycle spec uses, because the action-driven panels are a known-broken
@@ -113,4 +113,40 @@ test("the metrics stream honours ?hours= and pauses between polls", async ({
     method: "DELETE",
   });
   expect([200, 204]).toContain(cleanup.status);
+});
+
+test("/internal/recovery mints a code only for the runner token, and it signs in", async ({
+  playwright,
+  request,
+}) => {
+  const anonymous = await request.post(`${control}/internal/recovery`, {
+    data: {},
+  });
+  expect(anonymous.status()).toBe(401);
+
+  const token = process.env.E2E_RUNNER_TOKEN ?? "";
+  const minted = await request.post(`${control}/internal/recovery`, {
+    data: { email: E2E_EMAIL },
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(minted.status()).toBe(200);
+  // SAFETY: the route answers exactly this shape (see handleRecovery).
+  const { code } = (await minted.json()) as { code: string };
+  expect(code).toMatch(/^\d{6}$/u);
+
+  // A brand-new context (no session, no passkey) signs in with the code, the
+  // way the "Lost passkey?" screen does.
+  const fresh = await playwright.request.newContext({
+    baseURL: control,
+    storageState: { cookies: [], origins: [] },
+  });
+  const signedIn = await fresh.post("/api/auth/sign-in/email-otp", {
+    data: { email: E2E_EMAIL, otp: code },
+  });
+  expect(signedIn.ok()).toBe(true);
+  const session = await fresh.get("/api/auth/get-session");
+  // SAFETY: better-auth answers the session object or null.
+  const body = (await session.json()) as { user?: { email?: string } } | null;
+  expect(body?.user?.email).toBe(E2E_EMAIL);
+  await fresh.dispose();
 });

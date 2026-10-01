@@ -12,3 +12,17 @@ Codes are 12 characters in four-char groups (`ABCD-EFGH-JKLM`) drawn from an una
 - The signup form shows the code field only when `GET /api/invite/status` reports the instance is past its first account, so the bootstrap account never sees it.
 
 `NOITE_ADMIN_EMAIL` promotes the matching account to the admin role at startup; it is documented in [Environment variables](/reference/environment-variables).
+
+## Lost passkey
+
+On the login screen, **Lost passkey?** emails a six-digit code (valid 10 minutes, five attempts) and, once entered, signs the account in on the page where you add a new passkey. Emailing needs `NOITE_EMAIL_WEBHOOK_URL`: the control UI POSTs `{ "email", "otp", "from", "type": "sign-in" }` to it, and whatever you point it at (a mail relay, an automation) delivers it. Without a webhook nothing is sent on a real domain: the control UI logs the failure, and the screen still says a code was sent. Use the command below.
+
+An operator who cannot wait for email, or never set a webhook, mints the same code on the server:
+
+```bash
+cd /opt/noite
+docker compose exec noite noite-runner recover                   # for the instance owner (oldest admin)
+docker compose exec noite noite-runner recover --email me@example.com
+```
+
+It prints a code and where to enter it. The code is the same kind the email carries: it works once, expires after 10 minutes, and anyone holding it can sign in as that account, so treat the output like a password. Running it needs a shell in the container, which already holds every secret of the install, so it grants nothing that access did not.

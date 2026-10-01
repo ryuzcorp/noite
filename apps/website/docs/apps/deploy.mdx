@@ -38,6 +38,34 @@ git push -u origin main
 
 Open the result at `https://<slug>.<domain>`. With a `package.json`, the runner installs and builds it first with the project's package manager (npm, pnpm, Yarn or Bun), so Vite and Rsbuild apps need no CI ([Build](/apps/build)); without one it deploys the tree as is. The Wrangler config is optional: a static site (a build that writes `dist/index.html`) or a `package.json` `main` that exports `fetch` deploys without one ([No config at all](/apps/build#no-config-at-all)). Pushes must fast-forward unless you hold the `admin` role.
 
+## Your first app, in order
+
+1. **Create the app** and an API key (above).
+2. **Describe the Worker** with a `wrangler.jsonc` or, if you use the `cf` CLI, a `cloudflare.config.ts` ([which one](/apps/build#wranglerjsonc-or-cloudflareconfigts)). Or neither, for a static site or a `fetch` module ([no config at all](/apps/build#no-config-at-all)).
+3. **Add a build** if you have one: a `build` script or `build.command` ([Build](/apps/build#steps)).
+4. **Set env vars** in the app's Settings if the build or release command needs them. They do not reach the running Worker; use `vars` in the config for that ([Configure](/apps/configure#environment-variables)).
+5. **Push to `main`**, watch the Deployments tab, open `https://<slug>.<domain>`.
+6. **Check what does not run**: Node HTTP servers (Express, Fastify, `app.listen()`) are refused at deploy ([Frameworks and Node servers](/apps/build#frameworks-and-node-servers)). Quotas, rate limits and memory bounds are on [Limits](/reference/limits).
+
+## Release command
+
+A `release` string in the Wrangler config runs once per deploy, after the build and before `celld deploy`: the place for database migrations.
+
+```jsonc title="wrangler.jsonc"
+{
+  "name": "my-app",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "release": "bun run db:migrate",
+}
+```
+
+It runs with `sh -c` in the project with your app's env vars, and is killed after 10 minutes. The command is capped at 500 characters. A non-zero exit fails the deploy and **the previous deployment keeps serving**. `release` is removed from the config before `celld deploy`.
+
+:::warning
+In multi-tenant mode (`NOITE_TENANCY=multi`, the default off `localhost`) release commands are **skipped**, with a line in the deploy log: running them would need the install's root storage keys. Migrate from the app itself at startup, or ask the operator to run `single`. See [Tenancy](/self-hosting/tenancy#what-multi-does-and-does-not-promise-alpha).
+:::
+
 ## Deploy from CI
 
 `@noitenow/cli` pushes a prebuilt `dist/` plus `wrangler.jsonc` as a synthetic fast-forward commit — no server build, `push` role suffices, never force-pushes.

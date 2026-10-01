@@ -5,7 +5,7 @@ description: Run Noite on Coolify or Railway — env, domains, downtime model, a
 
 ## Coolify
 
-Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `main`): the same file the installer uses, driven by env. In Environment Variables, set `BASE_DOMAIN` to your domain (defaults to `localhost`) and `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` to match, the secrets (`BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, and `RUSTFS_ACCESS_KEY` + `RUSTFS_SECRET_KEY` or your own bucket's keys) and leave `NOITE_IMAGE` on `latest`. Nothing auto-generates secrets; dev defaults are refused on real domains. Deploy, then paste the real hostnames once on the `noite` service's Domains field: `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. The apex stays on your marketing site. Behind a terminating proxy set `CADDY_AUTO_HTTPS=off`.
+Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `main`): the same file the installer uses, driven by env. In Environment Variables, set `BASE_DOMAIN` to your domain (defaults to `localhost`) and `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` to match, the secrets (`BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, and `RUSTFS_ACCESS_KEY` + `RUSTFS_SECRET_KEY` or your own bucket's keys) and leave `NOITE_IMAGE` on a release channel (`alpha`, the default; see [Releases and channels](/self-hosting/operations#releases-and-channels)). Nothing auto-generates secrets; dev defaults are refused on real domains. Deploy, then paste the real hostnames once on the `noite` service's Domains field: `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. The apex stays on your marketing site. Behind a terminating proxy set `CADDY_AUTO_HTTPS=off`.
 
 ### Downtime model
 
@@ -33,7 +33,7 @@ One service from the image, one volume, one bucket:
 
 | Service | Image | Volume | Public domain |
 | --- | --- | --- | --- |
-| `noite` | `ghcr.io/ryuzcorp/noite:latest` | `/data` | `*.<domain>` → port `80` |
+| `noite` | `ghcr.io/ryuzcorp/noite:alpha` | `/data` | `*.<domain>` → port `80` |
 | `rustfs` (or use R2/Tigris) | `rustfs/rustfs:1.0.0` | `/data` | none |
 
 `noite` takes the same variables as a Compose install: `BASE_DOMAIN`, `CONTROL_SUBDOMAIN=app`, `BETTER_AUTH_URL=https://app.<domain>` (set before the first registration: passkeys bind to it), `GIT_PUBLIC_BASE=https://git.<domain>`, `BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, the bucket (`S3_ENDPOINT=http://rustfs.railway.internal:9000` and its keys, or your R2/Tigris endpoint), plus `CADDY_AUTO_HTTPS=off` (Railway terminates TLS) and `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=35` so the runner's stop budget fits. For a healthcheck, set `PORT=8080` (Railway probes the port in `PORT`; the runner always listens on 8080 and Caddy on 80, so this changes nothing else), path `/ready`, and `RAILWAY_HEALTHCHECK_TIMEOUT_SEC=600`: a first boot deploys the control bundle and can take minutes.

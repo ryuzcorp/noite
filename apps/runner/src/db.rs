@@ -4,6 +4,7 @@ use anyhow::Context;
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 use sqlx::sqlite::SqliteConnection;
 
+use crate::schema_version;
 use crate::models::{
     now_iso, new_id, App, AppDeviceStat, AppDomain, AppLimit, AppEnv, AppEvent, AppInsight, AppMetric, AppPathStat, AppRefStat, AppSpanStat, AppStatus, AppUserProps, Deploy, DeployStatus, ErrorEvent, ErrorIssue,
 };
@@ -53,14 +54,18 @@ pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     sqlx::query("PRAGMA foreign_keys = ON")
         .execute(&pool)
         .await?;
-    // One idempotent file (embedded at compile time), applied on every boot:
-    // it creates whatever is missing, so there is no ledger and no ordering.
-    // No upgrade paths — installs are wiped, not migrated.
+    // The shape of a fresh database is one idempotent file (embedded at
+    // compile time). A database that already has data is first brought up by
+    // the numbered steps in `schema_version::MIGRATIONS`, and one stamped by a
+    // newer build is refused.
     let mut tx = pool.begin().await?;
-    sqlx::raw_sql(include_str!("../schema.sql"))
-        .execute(&mut *tx)
-        .await
-        .context("apply schema")?;
+    schema_version::apply(
+        &mut tx,
+        include_str!("../schema.sql"),
+        schema_version::SCHEMA_VERSION,
+        schema_version::MIGRATIONS,
+    )
+    .await?;
     tx.commit().await?;
     Ok(pool)
 }

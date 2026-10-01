@@ -3,13 +3,19 @@
 # platform per native runner, pushed by digest, then merged into a multi-arch
 # manifest list.
 #
-# Installs never build in prod: they pull this tag (NOITE_IMAGE) and
+# Installs never build in prod: they pull a channel tag (NOITE_IMAGE) and
 # `docker compose up -d`. A new image restarts the runner and with it every
-# tenant fleet (they cold-boot). Every install flow tracks `latest`
-# (follows main); a short-SHA tag holds back or rolls back one install.
+# tenant fleet (they cold-boot), so installs follow RELEASES, not main.
 #
-# Tags: `latest` + short SHA on main; version tags (v*) also push the version
-# + `stable`.
+# Tags:
+#   main push        `edge` + short SHA (CI and rollbacks; not an install target)
+#   v* tag           the version (`0.1.0-alpha.1`), short SHA, and the channels:
+#                    `alpha` for every release, `stable` for final ones only
+#                    (no `-` in the tag). A `stable` install never sees an alpha.
+#
+# A release tag is a gate, not a trigger: the e2e lanes (`make e2e`,
+# `make e2e-isolation`) and the CHANGELOG check must pass before anything is
+# pushed to GHCR.
 name: images
 
 on:
@@ -43,6 +49,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - run: bun install
+      - name: changelog entry for this release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: bun docker/check-changelog.ts "${GITHUB_REF_NAME#v}"
       - name: lint
         run: bun run check
       - name: version pins
@@ -54,8 +63,18 @@ jobs:
           docker compose -f docker/compose.yaml -f docker/compose.dev.yaml config > /dev/null
           docker compose -f docker/compose.yaml -f docker/compose.e2e.yaml config > /dev/null
 
-  image:
+  # Release tags only: the same lanes the Actions tab runs by hand, as a gate.
+  # The image below is built from the same commit and Dockerfile.
+  e2e:
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: check
+    uses: ./.github/workflows/e2e.yml
+
+  image:
+    needs: [check, e2e]
+    # `e2e` is skipped off a tag, which would skip this job too: run when it
+    # was skipped or passed, never when it failed.
+    if: ${{ !cancelled() && needs.check.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.e2e.result) }}
     strategy:
       fail-fast: false
       matrix:
@@ -102,6 +121,7 @@ jobs:
 
   merge:
     needs: image
+    if: ${{ !cancelled() && needs.image.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -124,10 +144,11 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/noite
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,prefix=,format=short
             type=semver,pattern={{version}}
-            type=raw,value=stable,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=alpha,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=stable,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
       - run: |
           tags=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           digests=""

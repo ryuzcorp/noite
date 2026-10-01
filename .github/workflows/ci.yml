@@ -2,10 +2,10 @@
 # renders, the Rust crate builds warning-free with its tests, and the worker
 # bundle builds for celld. Release images are a separate workflow (`images.yml`).
 #
-# The end-to-end lane (`make e2e`) needs a container engine plus a few minutes,
-# so it is not a pull-request job: run it from the Actions tab
-# (`workflow_dispatch`) or locally. Its Playwright half is also the only place
-# the browser flows (passkey signup, invites, deploys) are exercised.
+# The end-to-end lanes (`make e2e`, `make e2e-isolation`) need a container
+# engine plus a few minutes, so they are not a pull-request job: run them from
+# the Actions tab (`workflow_dispatch`) or locally. They are the release gate
+# too: `images.yml` runs them on every `v*` tag before pushing an image.
 name: ci
 
 on:
@@ -85,31 +85,8 @@ jobs:
         working-directory: apps/noite
         run: bun run build
 
-  # Manual, because it builds the image and drives a real browser.
+  # Manual, because it builds the image and drives a real browser. The lanes
+  # live in e2e.yml, which `images.yml` also runs as the release gate.
   e2e:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-      - run: bun install
-      - name: install UI deps
-        working-directory: apps/noite
-        run: bun install --frozen-lockfile
-      - name: playwright chromium
-        working-directory: apps/noite
-        run: bunx playwright install --with-deps chromium
-      - name: e2e lane
-        run: make e2e
-      # Multi-tenant mode with the image's capabilities: the hostile-tenant
-      # spec proves builds and fleets cannot reach secrets or internal APIs.
-      - name: e2e isolation lane
-        run: make e2e-isolation
-      - name: upload playwright report
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: playwright-report
-          path: apps/noite/playwright-report/
-          retention-days: 7
+    uses: ./.github/workflows/e2e.yml

@@ -2,7 +2,7 @@ import type { D1Database } from "@cloudflare/workers-types";
 import { D1Client } from "@effect/sql-d1";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import type { SqlClient } from "effect/sql/SqlClient";
+import { SqlClient } from "effect/sql/SqlClient";
 import { Kysely } from "kysely";
 import { D1Dialect } from "kysely-d1";
 import { useEnv } from "oxidejs";
@@ -15,6 +15,10 @@ import { controlEnv } from "./control-env";
 // pending invitations — the ONLY app-shaped state the UI owns. App rows and deploy history live in the runner
 // (single writer, behind its bearer API), so `app_collaborator.appId` is a
 // plain key into that store: no local FK, no mirror, no sync job.
+// The alpha baseline. Schema changes after it are NEW versions appended to
+// `schemaHistory` below (never edits to a shipped one): paranorm diffs
+// consecutive versions into a forward migration and records it in the
+// `paranorm_migrations` ledger, so an install upgrades in place.
 const schema = defineSchema(`
   _version: "1.3.0"
   _extends: [idempotency]
@@ -148,7 +152,54 @@ export type AppRole = "view" | "push" | "admin";
 
 export const orm = paranorm<DB>();
 
-const migrator = createMigrator([schema]);
+/** Every shipped schema, oldest first. Append the next `defineSchema` (with a
+ * higher `_version`) here, and point `schema` above at the newest. Ledger ids
+ * are positions in this list, so never reorder or drop an entry. */
+const schemaHistory = [schema];
+
+const migrator = createMigrator(schemaHistory);
+
+const LEDGER_TABLE = "paranorm_migrations";
+
+/** What the ledger says about this database against the migrations this build
+ * knows: `undefined` when the two agree (or the ledger is empty), else an
+ * operator-facing reason to refuse. */
+export const ledgerMismatch = (
+  recorded: readonly { migration_id: number; name: string }[],
+  known: readonly { id: number; name: string }[]
+): string | undefined => {
+  const names = new Map(known.map(({ id, name }) => [id, name]));
+  const newest = Math.max(0, ...known.map(({ id }) => id));
+  for (const { migration_id: id, name } of recorded) {
+    const expected = names.get(id);
+    if (expected === undefined) {
+      return `the control database was migrated by a newer Noite (migration ${id} "${name}"); this image only knows up to ${newest}. Run the newer image again, or restore a backup taken before the upgrade. Downgrades are not supported.`;
+    }
+    if (expected !== name) {
+      return `the control database has migration ${id} recorded as "${name}", but this image expects "${expected}". It was created by a pre-alpha build; reinstall, or restore a backup from this release line.`;
+    }
+  }
+  return undefined;
+};
+
+/** Refuse to touch a database whose ledger this build cannot honour, before
+ * the migrator would silently run past it. Fresh databases have no ledger. */
+const assertLedgerCompatible = Effect.gen(function* assertLedgerCompatible() {
+  const sql = yield* SqlClient;
+  const tables = yield* sql<{ name: string }>`
+    SELECT name FROM sqlite_master WHERE type = 'table' AND name = ${LEDGER_TABLE}
+  `;
+  if (tables.length === 0) {
+    return;
+  }
+  const recorded = yield* sql<{ migration_id: number; name: string }>`
+    SELECT migration_id, name FROM paranorm_migrations ORDER BY migration_id
+  `;
+  const reason = ledgerMismatch(recorded, migrator.plan());
+  if (reason) {
+    return yield* Effect.fail(new Error(`noite: refusing to start: ${reason}`));
+  }
+});
 
 // oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
 export class MissingDbError extends Schema.TaggedError<MissingDbError>()(
@@ -211,10 +262,10 @@ export const getAuthDb = () =>
 /** D1-backed SqlClient layer for the resolved binding. */
 export const sqlLive = () => D1Client.layer({ db: resolveD1() });
 
-/** The setup pass itself: the migration and the admin bootstrap below.
- * `ensureDb` runs it at most once per isolate. No upgrade paths: a schema
- * change edits `schema` in place and installs are wiped, not migrated. */
+/** The setup pass itself: the ledger check, the migration and the admin
+ * bootstrap below. `ensureDb` runs it at most once per isolate. */
 const runDbSetup = Effect.gen(function* runDbSetup() {
+  yield* assertLedgerCompatible;
   yield* migrator.migrate;
   // Instance admin bootstrap (runs once per process at startup): if
   // NOITE_ADMIN_EMAIL names an already-registered account, ensure it

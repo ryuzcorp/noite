@@ -207,13 +207,13 @@ celld's storage contract (conditional writes, read-after-write, ranged reads) mu
 
 Operator guide: `apps/website/docs/deployment.mdx`.
 
-- **Compose:** `docker/compose.yaml` is the whole install: one `noite` service (image `${NOITE_IMAGE:-ghcr.io/ryuzcorp/noite:latest}`, `cap_add: NET_ADMIN, SETUID, SETGID, CHOWN`, volume `noite-data:/data`, healthcheck `/ready`, stop grace 35 s) and `rustfs` (1.0.0, API on loopback). `noite` depends on `rustfs` with `required: false`, so BYO S3 is `--scale rustfs=0` plus `S3_ENDPOINT` and keys. Every variable is defaulted, so the file boots as-is from a store or panel. Overlays: `compose.build.yaml` (build from the tree: `make up`), `compose.dev.yaml` (the `dev` target with sources bind-mounted: `make dev`), `compose.e2e.yaml` (the test lane).
+- **Compose:** `docker/compose.yaml` is the whole install: one `noite` service (image `${NOITE_IMAGE:-ghcr.io/ryuzcorp/noite:alpha}`, `cap_add: NET_ADMIN, SETUID, SETGID, CHOWN`, volume `noite-data:/data`, healthcheck `/ready`, stop grace 35 s) and `rustfs` (1.0.0, API on loopback). `noite` depends on `rustfs` with `required: false`, so BYO S3 is `--scale rustfs=0` plus `S3_ENDPOINT` and keys. Every variable is defaulted, so the file boots as-is from a store or panel. Overlays: `compose.build.yaml` (build from the tree: `make up`), `compose.dev.yaml` (the `dev` target with sources bind-mounted: `make dev`), `compose.e2e.yaml` (the test lane).
 - **Coolify:** the same file; the Traefik TCP router for `*.<domain>` SNI passthrough is a label on `noite`, and domains go on the `noite` service (`SERVICE_URL_NOITE_80`).
 - **Railway:** one service from the image, one volume at `/data`, R2/Tigris or a `rustfs` service. Domain target port 80, `CADDY_AUTO_HTTPS=off` (Railway terminates TLS; one `*.<domain>` custom domain covers every host), `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=35`, and `PORT=8080` + path `/ready` + `RAILWAY_HEALTHCHECK_TIMEOUT_SEC=600` for a healthcheck (Railway probes `PORT`; the runner never reads it).
 - **Dev:** `docker/dev.sh` runs the runner under cargo-watch and `vite dev` on `127.0.0.1:8090`. `celld dev` cannot serve the UI (raw esbuild cannot resolve Oxide's `virtual:oxide/worker`), the one deliberate divergence from celld's documented dev flow.
 - **E2E:** `make e2e` builds the image (or `TAG=<sha>` pulls it), boots it as project `noite-e2e` with its own bucket and ports (UI :8090 through Caddy, API :8080, tenants 20000+, rustfs :19000), resets containers and volumes by label and name (podman-compose's `down -v` aborts on the first missing container), runs doctor and Playwright. `make e2e-isolation` = the same in `multi` plus the hostile suite. `E2E_KEEP=1` leaves the stack up.
 - **Backup:** `make backup` snapshots the runner, stops the stack, tars `noite-data` and `rustfs-data` with a `MANIFEST`, starts again. `make restore FROM=…` is destructive. With your own bucket, use provider versioning.
-- **Updates** restart the runner and every fleet with it (cold boots). Every install flow pulls `:latest` (`stable` is not an install target); batch upgrades, and set `NOITE_IMAGE` to a short-SHA tag only to hold back or roll back.
+- **Updates** restart the runner and every fleet with it (cold boots). Installs follow a release channel (`alpha`, the default; `stable` for final releases only; a version tag pins). `main` publishes `edge` and a short SHA, which are not install targets. A `v*` tag publishes only after the e2e lanes and the CHANGELOG check pass (`images.yml`, `e2e.yml`, `docker/check-changelog.ts`). Batch upgrades, and set `NOITE_IMAGE` to a version or short-SHA tag to hold back or roll back (a release that changed a schema refuses a downgrade).
 
 ## Deploy pipeline and Git
 
@@ -299,7 +299,10 @@ An app with no requests for a day stops costing anything, and the next request b
 
 ### Runner schema evolution
 
-One idempotent `apps/runner/schema.sql`, embedded and applied every boot: no migration ledger and no upgrade paths. Installs are wiped rather than migrated, so a new table or column goes straight into its `CREATE … IF NOT EXISTS` and a retired one is deleted from the file; nothing there ALTERs or DROPs (a bare `DROP` would resolve into the ATTACHed `metrics.sqlite`). The control UI's D1 schema follows the same rule.
+From the alpha an install is upgraded in place. Two stores, one rule: a shipped schema is never edited, only extended.
+
+- **Runner SQLite.** `apps/runner/schema.sql` is the idempotent shape of a fresh database, applied every boot. `schema_version.rs` holds `SCHEMA_VERSION` (1 = the alpha baseline) and `MIGRATIONS`, one `(version, sql)` per step, applied in order before `schema.sql` inside one transaction that also sets `PRAGMA user_version`. An unstamped database that already has tables is the baseline. A database stamped newer than the binary is refused at boot with a message (run the newer image or restore a backup); there are no downgrades. A change edits the `CREATE` in `schema.sql` and appends a step; steps qualify tables as `main.<name>` (a bare `DROP` would resolve into the ATTACHed `metrics.sqlite`), and `schema.sql` itself never ALTERs or DROPs. `metrics.sqlite` is derived and unversioned.
+- **Control D1.** paranorm's `createMigrator(schemaHistory)` with its `paranorm_migrations` ledger. The shipped `_version: "1.3.0"` schema is frozen; the next change is a new `defineSchema` with a higher `_version` appended to `schemaHistory` (ledger ids are positions). Before migrating, `assertLedgerCompatible` refuses a ledger that is newer than the build, or whose entry was written by a different schema.
 
 ## celld alignment
 
@@ -321,6 +324,35 @@ The docs at https://celld.dev/docs/ are the source of truth. What Noite relies o
 - **Do not write to a live D1 with the `celld d1` CLI.** In the lane, one `celld d1 execute` against the control node's D1 while the UI ran made every later page load hang. The D1 storage browser (`host/storage/d1.rs`) shells out the same way against a tenant's D1; check whether browsing a D1 stalls the app it inspects.
 
 ## Roadmap
+
+### Alpha: self-hosted only
+
+No cloud version: every alpha user runs their own install. The bar moves from "the author's one install" to "strangers' installs that track our releases", so the gaps are upgrades, releases and honesty about isolation more than features.
+
+**Must have** (blocks alpha). All eight are built as of 2026-10-01; what is left is for the maintainer and is named in each item.
+
+1. **Upgrades without a wipe.** Done: [Runner schema evolution](#runner-schema-evolution). Runner `PRAGMA user_version` + ordered migrations, control D1 ledger guard, both refuse a database newer than the build. Both lanes boot on it (2026-10-01), but nothing has run a real upgrade, because no second version exists: the first real schema change is the first real exercise (the unit tests use fake steps).
+2. **Versioned releases.** Done in the tree: channels `alpha`/`stable` (installer, compose, docs), `edge` + SHA from `main`, `CHANGELOG.md` with "Operator action required" per release and a CI check. **Left: cut the tag** (`git tag v0.1.0-alpha.1`; the changelog entry is dated 2026-10-01, fix it if the date slips). Installs still on `:latest` stop at the last `main` build until their `NOITE_IMAGE` changes (the installer rewrites it). Open risk: `run.sh` fetches `install.sh` and `compose.yaml` from `main`, not from the release, so a compose change must stay compatible with the channel's image.
+3. **E2E as the release gate.** Done: `e2e.yml` (both lanes, reusable and manual) runs before `images.yml` pushes on any `v*` tag. It tests the tree at the tag, then the image is rebuilt from the same commit: the bytes tested are not the bytes pushed. Both lanes passed locally on 2026-10-01 (`make e2e` 14 passed + 1 skipped, `make e2e-isolation` 15 passed); the workflow itself has not run on a real tag yet. `vite.spec.ts` depends on `apps/noite/test/vite`'s lockfile (a nested repo): a stale `pnpm-lock.yaml` there fails the gate, so refresh it with the manifest.
+4. **Honest multi-tenancy.** Done by documentation, not code: `multi` is "semi-trusted tenants" in the tenancy docs and the new Known limits page; the CHANGELOG says so. `CredentialProvider` remains the real fix ([Scoped credentials](#scoped-credentials)).
+5. **Operator recovery.** Done: `noite-runner recover [--email]` mints a one-time sign-in code through `POST /internal/recovery` on the control worker, and the installer prints it. Also fixed on the way: the OTP sender never received `NOITE_EMAIL_WEBHOOK_URL`, so on a real domain codes were logged instead of delivered. `e2e` covers the HTTP route and the sign-in with its code, and `e2e-local.sh` runs the CLI inside the image after a green suite (passed 2026-10-01). Still true: better-auth swallows a failed send, so the login screen says "code sent" with no webhook set.
+6. **Upstream fixes confirmed.** Done 2026-10-01: the installed `oxidejs` 0.5.10 and `ilha` 0.14.10 trees are byte-identical to a clean `bun install --frozen-lockfile`, so nothing is hand-patched, and both fixes are in the published code (`isWebcontainerVersions` string check; unconditional `watch.once` in `resource()`). Not re-measured by hand: the 30-concurrent-action A/B and the overview-after-SPA-nav stall; both e2e lanes passed on these versions with neither stall showing.
+7. **App-author docs.** Done: Deploy ("Your first app, in order", "Release command"), Build (`wrangler.jsonc` vs `cloudflare.config.ts`, `_headers`/`_redirects`, Node servers), Configure (env), Limits. `_headers`/`_redirects` rest on celld's one-line statement that it supports both; their syntax is Cloudflare's and untested here.
+8. **Security policy.** Done: `SECURITY.md` (private GitHub advisory reporting, no email) and `self-hosting/known-limits`, linked from Install. **Left: enable "Private vulnerability reporting" on the repository**, or the contact in `SECURITY.md` is a dead link.
+
+**Nice to have:**
+
+- DNS/TXT ownership check for custom domains (a tenant can claim a hostname it does not own).
+- Per-build uids and per-fleet cgroups (`memory.max`), so one fleet's growth stops shedding every app.
+- Upgrades that do not cold-boot every fleet, or at least the expected downtime per upgrade in the docs.
+- A shorter snapshot loss window (open question 3, Litestream).
+- E2E for storage editing, rollback, source-browser commits and god mode (open question 5).
+- The `bwrap` egress fallback, so platforms without `NET_ADMIN` (Railway) can run `multi` (open question 1).
+- An opt-in "new version available" notice in the UI linking the changelog, with no telemetry.
+- Error tracking phase 2 and source maps (below).
+- The tiny forge UI over bare mirrors (history, commit views).
+- `CONTRIBUTING.md`, issue templates asking for `make doctor` output, a community channel.
+- A restore drill for BYO S3 and Railway installs, where `make backup` does not apply.
 
 ### Error tracking, phase 2: Sentry-compatible ingest
 
@@ -345,7 +377,7 @@ The docs at https://celld.dev/docs/ are the source of truth. What Noite relies o
 3. **Snapshot loss window** (about 70 s) vs Litestream.
 4. **Control and runner restart together** on every image update. Accepted: the UI cannot act without the runner, and one node removes the two-node readiness-gate drain that stalled the old topology.
 5. **E2E comments** in `apps/noite/e2e/{helpers.ts,app-lifecycle.spec.ts,a-invite.spec.ts}` still call the app-detail and invite panels a known-broken surface; the stalls were fixed in oxidejs 0.5.6 (History, 2026-09-27), so those surfaces can now get UI-level coverage. Unit tests (`bun run test`) cover the role gate, invitations, invites, rate limiter and stream loop against a SQLite-backed D1 shim; still without e2e: storage editing, rollback, source-browser commits, god mode.
-6. **Not built:** app-author docs ("your first app": `wrangler.jsonc` or `cloudflare.config.ts`, build/release scripts, env, `_headers`/`_redirects`, `deploy.sh`, logs/metrics) and a README for `apps/noite/test`; a tiny forge UI over bare mirrors (history, commit views); DNS/TXT verification for custom domains; pricing.
+6. **Not built:** a README for `apps/noite/test` (app-author docs exist: Apps → Deploy/Build/Configure); a tiny forge UI over bare mirrors (history, commit views); DNS/TXT verification for custom domains; pricing.
 
 ## Out of scope
 
@@ -367,3 +399,4 @@ Condensed; git history has the detail.
 - **2026-09-30 — Vite and Rsbuild builds.** Considered and rejected: `@cloudflare/ci` (Workflows + Sandbox containers, runs only on Cloudflare; celld has neither). The runner already built on push; what broke was deploying the result. A Vite app with `@cloudflare/vite-plugin` failed outright (the source `wrangler.jsonc` has no `assets.directory`, and the built config carries keys celld refuses), and Oxide with a root `wrangler.jsonc` deployed its source instead of `dist/`. Added: build output first (Build output), Wrangler `build.command`/`cwd`, `scripts.build` parsed instead of a substring match, `RUNNER_BUILD_TIMEOUT_S`, named deploy steps with a failure summary on the same row, UTF-8-safe log tails (a multi-byte glyph at the 64 KB cut panicked), and the `vite.spec.ts` e2e over `apps/noite/test/vite`.
 - **2026-09-30 — edge limits.** Caddy built with `caddy-ratelimit`; per-client, git and per-app rate limits written by the runner, per-app overrides (`app_limit`, Settings → Rate Limits), slowloris header timeout, `NOITE_TRUSTED_PROXIES` for Cloudflare and other proxies, and `RUNNER_WAKE_CONCURRENCY`. A per-app concurrency cap was considered and left out: Caddy's `max_conns_per_host` queues without a bound instead of refusing, and each app is its own celld process already covered by the per-app ceiling and `RUNNER_FLEET_MAX_RSS_MB`. Docs: self-hosting/protection (Cloudflare in front).
 - **2026-09-30 — every package manager.** npm, pnpm and Yarn through jup (`unjs/jup` 0.6.3, the Corepack successor: signature-verified downloads per app), picked by pin, then lockfile, then bun (Package managers). Per-app `HOME` for the build sandbox, whole-cache pruning, the Vite sample on pnpm.
+- **2026-10-01 — alpha must-haves.** Schema versioning (runner `user_version` + migrations, control D1 ledger guard), release channels and `CHANGELOG.md`, `e2e.yml` as the tag gate, semi-trusted `multi` documented, `noite-runner recover` + `/internal/recovery`, `SECURITY.md`, app-author docs. Fixed: the emailOTP sender never saw `NOITE_EMAIL_WEBHOOK_URL` (`authEnv`). Removed: the `latest` image tag (it followed `main`). Verified: `make e2e` and `make e2e-isolation` green after refreshing the stale `apps/noite/test/vite/pnpm-lock.yaml` (vite `^8.3.1` vs `^8.3.2`), which had failed `vite.spec.ts` with `ERR_PNPM_OUTDATED_LOCKFILE`; the `e2e-local.sh` recover check also needed its regex loosened (podman-compose prefixes an escape code). The lockfile fix sits uncommitted in the nested repo.

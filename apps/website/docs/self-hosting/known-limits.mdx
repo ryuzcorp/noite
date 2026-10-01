@@ -1,0 +1,35 @@
+---
+title: Known limits
+description: What Noite's alpha does not do yet — tenant isolation depth, custom domain ownership, resource containment, and the restart cost of an upgrade.
+---
+
+Noite is alpha and self-hosted: you run it, so you decide who gets an account. These are the gaps that matter for that decision. Each one is on the roadmap; none is a surprise to the maintainers. To report a vulnerability, see the [security policy](https://github.com/ryuzcorp/noite/blob/main/SECURITY.md).
+
+## Tenant isolation
+
+Under `NOITE_TENANCY=multi` ([Tenancy](/self-hosting/tenancy)) tenant code runs as unprivileged users, with a cleared environment and an egress policy. That is a sandbox for **semi-trusted** tenants, not for adversaries:
+
+- **Shared build user.** Every build runs as the same uid. Two builds at once can read each other's worktrees.
+- **Root bucket keys in fleets.** A fleet's celld process holds the object store's root keys, so a compromised tenant process can reach every prefix: other apps' source bundles, databases and telemetry. Scoped per-app keys are the fix.
+- **Object store reachable from Worker code.** The store's unauthenticated surface (it answers 401/403) is the one private address tenants may reach, because celld needs it.
+- **No per-app memory cap.** Fleets share the container's memory. One app's growth pushes every app toward the same shed threshold.
+- **No container per build.** Depth is uid, environment, resource limits and egress rules. Rootless containers or gVisor are not planned unless tenants are expected to be hostile.
+
+If a tenant is not someone you would give shell access to a shared server, do not give them a push key yet.
+
+## Custom domains
+
+A hostname is reserved on first claim, and Noite does not check DNS or ownership: **a tenant can claim a hostname they do not own**, and the first claimant wins. The certificate is issued on demand on the first visit. Treat custom domains as an admin-trusted feature until a DNS/TXT check ships.
+
+## Platforms
+
+- **Railway** does not grant `NET_ADMIN`, so the egress policy cannot run there: use `NOITE_TENANCY=single` and invite nobody to push code ([Platforms](/self-hosting/platforms)).
+- **Coolify** passes TLS through to Noite, so [per-visitor rate limits](/self-hosting/protection) are off; per-app ceilings still work.
+
+## Operations
+
+- **Upgrades restart every app.** A new image restarts the runner, and every tenant fleet cold-boots with it (about a minute for many apps). There is no rolling upgrade: batch them and run them off-peak.
+- **Downgrades across a schema change are refused.** The runner and control databases carry a schema version; an older image will not start on newer data. Back up before upgrading ([Operations](/self-hosting/operations#releases-and-channels)).
+- **Snapshot loss window.** The runner's SQLite is snapshotted to the bucket about every 70 seconds, so a lost volume loses at most that much recent state.
+- **One node.** The control UI and the runner restart together and nothing fails over; availability is that of the one container and its bucket.
+- **RustFS is not a qualified store.** It is the zero-config default and passes celld's startup check, but for production use one celld qualifies: S3, R2, GCS, Tigris or Azure Blob ([Storage](/self-hosting/storage)).

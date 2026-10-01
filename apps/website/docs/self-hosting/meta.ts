@@ -6,6 +6,7 @@ export default defineMeta({
     "install",
     "storage",
     "tenancy",
+    "known-limits",
     "platforms",
     "protection",
     "operations",

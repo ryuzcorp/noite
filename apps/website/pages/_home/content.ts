@@ -164,7 +164,7 @@ export const INSTALL_TABS = [
     note: "Set the domain and secrets as environment variables, then deploy.",
   },
   {
-    code: "Service: ghcr.io/ryuzcorp/noite:latest\nVolume: /data · Domain: *.<your-domain> → port 80",
+    code: "Service: ghcr.io/ryuzcorp/noite:alpha\nVolume: /data · Domain: *.<your-domain> → port 80",
     id: "railway",
     label: "Railway",
     note: "One service, one volume, and R2, Tigris or a RustFS service as the bucket.",
@@ -189,7 +189,7 @@ export const FAQ = [
   },
   {
     answer:
-      "Re-run the install command. It keeps your configuration and secrets, pulls the latest image and restarts.",
+      "Re-run the install command. It keeps your configuration and secrets, pulls the newest release on your channel and restarts.",
     question: "How do updates work?",
   },
   {

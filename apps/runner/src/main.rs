@@ -13,6 +13,8 @@ mod error;
 mod host;
 mod lifecycle;
 mod models;
+mod recover;
+mod schema_version;
 
 use std::collections::HashSet;
 use std::sync::{
@@ -63,6 +65,14 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Operator subcommands run in the same container as the daemon and exit:
+    // no boot, no logging setup, nothing started.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("recover") {
+        let config = Config::from_env()?;
+        return recover::run(&config, &argv[1..]).await;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

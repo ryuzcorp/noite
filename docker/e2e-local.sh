@@ -2,7 +2,7 @@
 # Local pre-release lane (`make e2e`): boots the production image (the one
 # `noite` container + bundled RustFS) under its own compose project, then
 # runs doctor and the Playwright suite (passkey signup, invites, lifecycle,
-# git push, deploy, tenant serve).
+# git push, deploy, tenant serve), then checks `noite-runner recover`.
 #
 # Topology: the control UI through Caddy on :8090, the runner API and Git on
 # :8080, tenant fleets on their own ports (20000+). See docker/compose.e2e.yaml.
@@ -106,6 +106,20 @@ while [ "$attempt" -lt 30 ]; do
       rc=0
     else
       rc=$?
+    fi
+    if [ "$rc" -eq 0 ]; then
+      # The operator's way back in after a lost passkey, through the image's
+      # own binary (the Playwright suite covers the sign-in the code opens).
+      echo "==> noite-runner recover"
+      # shellcheck disable=SC2086
+      if out="$($CE2E exec -T noite noite-runner recover --email e2e@noite.local 2>&1)" &&
+        printf '%s\n' "$out" | grep -Eq 'Recovery code for e2e@noite\.local: [0-9]{6}$'; then
+        echo "ok"
+      else
+        printf '%s\n' "$out"
+        echo "error: noite-runner recover did not mint a code"
+        rc=1
+      fi
     fi
     if [ "${E2E_KEEP:-0}" = 1 ]; then
       echo "==> E2E_KEEP=1: stack left running (project noite-e2e)"

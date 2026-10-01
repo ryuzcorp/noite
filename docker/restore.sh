@@ -41,7 +41,7 @@ CE="$ENGINE compose -f docker/compose.yaml"
 
 img_ok() { "$ENGINE" image inspect "$1" >/dev/null 2>&1; }
 HELPER=""
-for candidate in "${NOITE_BACKUP_IMAGE:-}" "${NOITE_IMAGE:-}" noite:local noite-dev:local ghcr.io/ryuzcorp/noite:latest; do
+for candidate in "${NOITE_BACKUP_IMAGE:-}" "${NOITE_IMAGE:-}" noite:local noite-dev:local ghcr.io/ryuzcorp/noite:alpha; do
   if [ -n "$candidate" ] && img_ok "$candidate"; then
     HELPER="$candidate"
     break

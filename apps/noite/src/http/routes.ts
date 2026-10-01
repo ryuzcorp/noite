@@ -18,6 +18,10 @@ import {
   rateLimitDecision,
   withTrustedClientAddress,
 } from "../lib/rate-limit";
+import {
+  findRecoveryEmail,
+  RECOVERY_CODE_TTL_SECONDS,
+} from "../lib/recovery.server";
 import type {
   RunnerDevice,
   RunnerMetric,
@@ -157,6 +161,68 @@ const handleInviteStatus: RouteHandler = async () => {
       invitesPerUser: INVITES_PER_USER,
       requiresInvite: true,
     });
+  }
+};
+
+const RecoveryBody = Schema.Struct({ email: Schema.optional(Schema.String) });
+
+/** Operator escape hatch (`noite-runner recover`): mint a sign-in code for an
+ * account without sending it anywhere, for an operator who lost the passkey
+ * and has no email webhook. The caller must hold the runner token — whoever
+ * can run a command in the container — and the code goes through the same
+ * "Lost passkey?" sign-in as an emailed one: it expires, allows few attempts,
+ * and lands on the account page to enrol a new passkey. */
+const handleRecovery: RouteHandler = async (request, env) => {
+  if (!runnerTokenOk(request, env)) {
+    return new Response("unauthorized", { status: 401 });
+  }
+  const text = await readBoundedText(request, MAX_BODY_BYTES);
+  if (text === null) {
+    return tooLarge();
+  }
+  let raw: unknown;
+  try {
+    raw = text.trim() ? JSON.parse(text) : {};
+  } catch {
+    return Response.json({ error: "invalid json", ok: false }, { status: 400 });
+  }
+  const decoded = Schema.decodeUnknownResult(RecoveryBody)(raw);
+  if (decoded._tag === "Failure") {
+    return Response.json(
+      { error: "email must be a string", ok: false },
+      { status: 400 }
+    );
+  }
+  await ensureDbPromise();
+  const email = await findRecoveryEmail(decoded.success.email);
+  if (!email) {
+    return Response.json(
+      {
+        error: decoded.success.email
+          ? `no active account for ${decoded.success.email}`
+          : "no admin account exists yet: open the control UI and sign up first",
+        ok: false,
+      },
+      { status: 404 }
+    );
+  }
+  try {
+    const auth = authFromEnv(env, new URL(request.url).origin);
+    const code = await auth.api.createVerificationOTP({
+      body: { email, type: "sign-in" },
+    });
+    return Response.json(
+      { code, email, expiresInSeconds: RECOVERY_CODE_TTL_SECONDS, ok: true },
+      { headers: { "cache-control": "no-store" } }
+    );
+  } catch (error) {
+    if (error instanceof MissingAuthSecretError) {
+      return Response.json(
+        { error: error.message, ok: false },
+        { status: 500 }
+      );
+    }
+    throw error;
   }
 };
 
@@ -798,6 +864,7 @@ const router = FindMyWay.make<RouteHandler>();
 router.all("/health", handleHealth);
 router.on("POST", "/webhook", handleWebhook);
 router.on("POST", "/internal/git-auth", handleGitAuth);
+router.on("POST", "/internal/recovery", handleRecovery);
 router.on("GET", "/storage/:appId/r2/:bucket/raw", handleR2Raw);
 router.on("GET", "/api/apps/:appId/logs/stream", handleLogsStream);
 router.on("GET", "/api/apps/:appId/deploys/stream", handleDeploysStream);

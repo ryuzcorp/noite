@@ -4,18 +4,24 @@
 #   curl -fsSL https://noite.now/run.sh | bash -s install
 #
 # noite.now/run.sh resolves NOITE_REF to a commit and runs this file from it
-# (apps/website/public/run.sh), so every run is the latest.
+# (apps/website/public/run.sh), so every run uses the current installer.
 #
 # Installs Docker when missing, writes /opt/noite/{compose.yaml,.env} with
 # generated secrets, opens 80/443 in ufw when it is active, starts the stack
 # and waits for /ready. Re-running it is the upgrade: compose.yaml and the
-# image are refreshed, .env (domain, secrets) is kept.
+# image are refreshed to the channel's newest release, .env (domain, secrets)
+# is kept.
 #
 # Environment (all optional; `curl … | NOITE_DOMAIN=example.com bash -s install`):
 #   NOITE_DOMAIN       base domain; app./api./git./*. must point at this host
 #                      (default: asked, <public-ip>.sslip.io on Enter or without a terminal)
 #   NOITE_ADMIN_EMAIL  promoted to admin at boot
-#   NOITE_VERSION      image tag (default: latest; a short SHA holds back)
+#   NOITE_EMAIL_WEBHOOK_URL
+#                      receives lost-passkey sign-in codes as JSON; without it,
+#                      recover with `noite-runner recover` (printed at the end)
+#   NOITE_VERSION      release channel or version (default: alpha; `stable`
+#                      follows final releases only, `0.1.0-alpha.1` or a short
+#                      SHA holds an install in place)
 #   NOITE_REF          git ref the installer and compose.yaml come from (default: main)
 #   NOITE_DIR          install directory (default: /opt/noite)
 #
@@ -27,7 +33,7 @@ set -euo pipefail
 NOITE_REPO="ryuzcorp/noite"
 NOITE_REF="${NOITE_REF:-main}"
 NOITE_DIR="${NOITE_DIR:-/opt/noite}"
-NOITE_VERSION="${NOITE_VERSION:-latest}"
+NOITE_VERSION="${NOITE_VERSION:-alpha}"
 NOITE_IMAGE_REPO="ghcr.io/ryuzcorp/noite"
 READY_TIMEOUT_S=600
 MIN_MEM_MB=1900
@@ -212,7 +218,8 @@ RUSTFS_ACCESS_KEY=noite$(rand_hex 8)
 RUSTFS_SECRET_KEY=$(rand_hex 24)
 
 # Lost-passkey sign-in codes are POSTed to this webhook as JSON; without it
-# a real domain refuses the recovery flow.
+# nothing is emailed, and the operator recovers from the server with
+#   cd $NOITE_DIR && docker compose exec noite noite-runner recover
 # NOITE_EMAIL_WEBHOOK_URL=https://hooks.example.com/noite-otp
 # NOITE_SMTP_FROM=Noite <no-reply@$DOMAIN>
 EOF
@@ -221,6 +228,9 @@ EOF
 
   if [[ -n "${NOITE_ADMIN_EMAIL:-}" ]]; then
     env_set NOITE_ADMIN_EMAIL "$NOITE_ADMIN_EMAIL"
+  fi
+  if [[ -n "${NOITE_EMAIL_WEBHOOK_URL:-}" ]]; then
+    env_set NOITE_EMAIL_WEBHOOK_URL "$NOITE_EMAIL_WEBHOOK_URL"
   fi
 }
 
@@ -252,6 +262,16 @@ start_stack() {
   die "inspect with: cd $NOITE_DIR && docker compose logs -f noite"
 }
 
+# How an operator gets back in after losing the passkey: the webhook when one is
+# set, the server-side command always.
+recovery_note() {
+  if [[ -n "$(env_get NOITE_EMAIL_WEBHOOK_URL)" ]]; then
+    printf '%s' "Lost passkey   codes go to your NOITE_EMAIL_WEBHOOK_URL"
+  else
+    printf '%s' "Lost passkey   no email webhook is set: NOITE_EMAIL_WEBHOOK_URL in .env sends codes"
+  fi
+}
+
 summary() {
   cat <<EOF
 
@@ -266,7 +286,9 @@ no invite code: open https://app.$DOMAIN before anyone else can.
 
   Config       $NOITE_DIR/.env (keep it: it holds the secrets)
   Logs         cd $NOITE_DIR && docker compose logs -f
-  Upgrade      re-run this installer
+  $(recovery_note)
+               either way, from this server: cd $NOITE_DIR && docker compose exec noite noite-runner recover
+  Upgrade      re-run this installer (read CHANGELOG.md's "Operator action required" first)
   Docs         https://noite.now/self-hosting/install
 EOF
 }
