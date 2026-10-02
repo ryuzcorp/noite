@@ -108,6 +108,15 @@ export default defineLayout(({ children }) => {
                   <li>
                     <a href="/account">Account</a>
                   </li>
+                  <li>
+                    <a
+                      href="https://noite.now/introduction/"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      Docs
+                    </a>
+                  </li>
                   {isAdmin ? (
                     <li>
                       <a href="/god-mode">God Mode</a>
