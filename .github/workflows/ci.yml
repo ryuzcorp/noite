@@ -38,8 +38,16 @@ jobs:
           docker compose -f docker/compose.yaml -f docker/compose.build.yaml config > /dev/null
           docker compose -f docker/compose.yaml -f docker/compose.dev.yaml config > /dev/null
           docker compose -f docker/compose.yaml -f docker/compose.e2e.yaml config > /dev/null
+      # Parse each script with its shebang's shell: `sh` is dash here, and
+      # install.sh/uninstall.sh are bash.
       - name: shell scripts parse
-        run: for f in docker/*.sh; do sh -n "$f"; done
+        run: |
+          for f in docker/*.sh; do
+            case "$(head -n1 "$f")" in
+            *bash*) bash -n "$f" ;;
+            *) sh -n "$f" ;;
+            esac
+          done
       - name: runner schema applies twice (idempotent)
         run: |
           sqlite3 /tmp/schema.db < apps/runner/schema.sql
@@ -78,12 +86,14 @@ jobs:
       - name: install UI deps
         working-directory: apps/noite
         run: bun install --frozen-lockfile
-      - name: typecheck
-        working-directory: apps/noite
-        run: bunx tsc --noEmit
+      # Build first: the ilha Vite plugin writes `.ilha/pages.d.ts` (the
+      # `ilha:pages/*` types, gitignored), and tsc cannot resolve them without it.
       - name: build worker bundle
         working-directory: apps/noite
         run: bun run build
+      - name: typecheck
+        working-directory: apps/noite
+        run: bunx tsc --noEmit
 
   # Manual, because it builds the image and drives a real browser. The lanes
   # live in e2e.yml, which `images.yml` also runs as the release gate.

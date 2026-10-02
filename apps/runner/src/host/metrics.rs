@@ -343,10 +343,11 @@ async fn ingest_all(
     // match, and `read_parquet` fails the whole list on one empty glob: a
     // single quiet fleet turned every pass into "idle" and the watermark
     // skipped everyone's rows. `glob()` returns nothing instead of failing.
+    // The bucket and slug ride in the glob, so escape it like `values`.
     let globs = traces
         .iter()
         .chain(logs.iter())
-        .map(|g| format!("SELECT file FROM glob('{g}')"))
+        .map(|g| format!("SELECT file FROM glob('{}')", g.replace('\'', "''")))
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
     // CAST to BIGINT: DuckDB `/` is floating division, and the -json writer
