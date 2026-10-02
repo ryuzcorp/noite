@@ -1,114 +1,217 @@
+<div align="center">
+
+<a href="https://noite.now"><img src="apps/website/public/icon.svg" width="96" alt="Noite logo" /></a>
+
 # Noite
 
-Tiny self-hostable PaaS for [celld](https://celld.dev/). Spec: [SPEC.md](SPEC.md), operator guide: [apps/website/docs/self-hosting/install.mdx](apps/website/docs/self-hosting/install.mdx).
+**The app platform you own.**
 
-Noite ships as **one image**, `ghcr.io/<owner>/noite`: the runner (deploy pipeline, API, Git, telemetry) runs as PID 1 and supervises Caddy (the edge), the control UI (a celld node, fleet #0) and one celld fleet per tenant app. `docker compose up -d` runs it from `docker/compose.yaml` next to the bundled RustFS store.
+A tiny, self-hostable PaaS for [celld](https://celld.dev) apps: `git push` deploys, with Durable Objects, SQL databases and object storage included.<br /> One command installs it, one image runs it, and your data lives in a bucket you own.
 
-On a fresh Ubuntu or Debian server, `curl -fsSL https://noite.now/run.sh | bash -s install` is the whole install ([`docker/install.sh`](docker/install.sh): Docker, `/opt/noite` with generated secrets, start, wait for `/ready`; re-run to upgrade). [`uninstall.sh`](docker/uninstall.sh) removes it again for a clean reinstall.
+<a href="https://github.com/ryuzcorp/noite/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/ryuzcorp/noite/ci.yml?branch=main&style=flat-square&label=ci" /></a> <a href="https://github.com/ryuzcorp/noite/tags"><img alt="Release" src="https://img.shields.io/github/v/tag/ryuzcorp/noite?include_prereleases&sort=semver&style=flat-square&label=release" /></a> <a href="https://github.com/ryuzcorp/noite/pkgs/container/noite"><img alt="Image" src="https://img.shields.io/badge/ghcr.io-ryuzcorp%2Fnoite-2496ED?style=flat-square&logo=docker&logoColor=white" /></a> <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/ryuzcorp/noite?style=flat-square" /></a> <a href="https://discord.gg/WnVTMCTz74"><img alt="Discord" src="https://img.shields.io/badge/discord-join-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
 
-Registration is invite-only: the **first** account to sign up bootstraps the instance — it needs no code and is promoted to `admin` — and every later account needs a single-use code. Each member holds two codes to hand out (read them on `/account`), and admins mint more from the Invitations panel in `/god-mode`.
+**[Docs](https://noite.now/introduction/)** · **[Quickstart](https://noite.now/quickstart/)** · **[How it works](https://noite.now/how-it-works/)** · **[Changelog](CHANGELOG.md)** · **[Discord](https://discord.gg/WnVTMCTz74)**
+
+<br />
+
+<img src=".github/assets/dashboard.png" alt="The Noite dashboard: an app's overview with its 24-hour request metrics, its error list, and its D1, R2 and Durable Object storage" />
+
+</div>
+
+---
+
+> [!IMPORTANT]
+>
+> Noite is in **alpha**. It runs real apps, but read the [known limits](https://noite.now/self-hosting/known-limits/) before you invite people you would not give shell access to a shared server. Upgrades are announced in the [changelog](CHANGELOG.md), each with an "Operator action required" section.
+
+```bash
+curl -fsSL https://noite.now/run.sh | bash -s install
+```
+
+<sub>Ubuntu or Debian · amd64 or arm64 · 2 GB of RAM · no domain needed to try it</sub>
+
+## Why Noite
+
+- **Own the whole stack.** Your server, your bucket, your bill. Noite is open source (Apache-2.0); you pay for a VPS and storage, nothing else.
+- **Bring your Workers app.** Many Cloudflare Workers apps move over as they are: deploy with the `wrangler.jsonc` you already have. Durable Objects, D1, R2, KV, Queues, Workflows, Cron and static assets run on celld ([supported APIs](https://celld.dev/docs/)).
+- **`git push` and it's live.** Every push to `main` installs, builds, runs your release command and deploys to `https://<slug>.<your-domain>`.
+- **Scale to zero.** Apps idle for a day go to sleep and free their memory. The next request waits a few seconds while the app wakes, then is served normally: no splash page, no dropped request.
+- **One bucket holds everything.** Git history, app storage and Noite's own state live in one S3 bucket. Lose the server and a fresh install restores itself from it.
+- **Built to share.** Invite-only sign-up with passkeys, per-app roles, and a sandbox for other people's code.
+
+## Quickstart
+
+### On a server
+
+On a fresh Ubuntu or Debian server with ports 80 and 443 free:
+
+```bash
+curl -fsSL https://noite.now/run.sh | bash -s install
+```
+
+The installer asks for a base domain (press Enter to use `<server-ip>.sslip.io`, which needs no DNS), installs Docker if missing, generates secrets into `/opt/noite/.env`, and waits until Noite is ready. Re-run it to upgrade. Then open `https://app.<domain>` and register: **the first account becomes the admin**.
+
+### On your machine
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/ryuzcorp/noite/main/docker/compose.yaml
+docker compose up -d
+```
+
+Open http://localhost:9080. Apps are served at `http://<slug>.localhost:9080`.
+
+### Deploy your first app
+
+Create an app (for example `hello`) and an API key in the UI, then:
+
+```bash
+mkdir hello && cd hello
+cat > wrangler.jsonc <<'EOF'
+{ "name": "hello", "main": "index.js", "compatibility_date": "2026-09-01" }
+EOF
+echo 'export default { fetch: () => new Response("Hello from Noite") };' > index.js
+
+git init -b main && git add -A && git commit -m "first deploy"
+git remote add origin "https://git:<api-key>@git.<domain>/hello"
+git push -u origin main
+# → https://hello.<domain>
+```
+
+The full walkthrough is in the [Quickstart](https://noite.now/quickstart/).
+
+## Features
+
+|  |  |
+| --- | --- |
+| 🚀 **Deploys** | `git push` to `main`, Vite/Rsbuild/Wrangler builds with npm, pnpm, Yarn or Bun, release commands for migrations, and [one-click rollback](https://noite.now/apps/deploy/) to any earlier deploy. |
+| 🤖 **CI deploys** | `bunx @noitenow/cli deploy` ships a prebuilt `dist/` from GitHub Actions and comments the URL on your pull request ([CLI](https://noite.now/reference/cli/)). |
+| 📈 **Observability** | Live logs, metrics over 24 h, 7 d or 30 d (requests, errors, latency, CPU), slow-request spans and error tracking for every app, with no collector to run ([Observe](https://noite.now/apps/observe/)). |
+| 🗄️ **Data browser** | Browse each app's D1 tables, R2 objects and Durable Objects from the dashboard. |
+| 🌐 **Domains & TLS** | Automatic `<slug>.<domain>` subdomains and custom domains, with certificates issued on demand. No wildcard certificate or DNS API needed. |
+| 🔐 **Accounts** | Passkey sign-in, invite-only registration, and per-app `view`, `push` and `admin` roles for teammates. |
+| 🛡️ **Tenant sandbox** | In multi-tenant mode, builds and apps run as unprivileged users behind an egress firewall, away from the platform's secrets and internal network ([Tenancy](https://noite.now/self-hosting/tenancy/)). |
+| 🧱 **Edge protection** | Per-client, Git and per-app rate limits, with your own overrides and Cloudflare in front if you want it ([Protection](https://noite.now/self-hosting/protection/)). |
+| 💾 **Operations** | Health checks (`/ready`, `make doctor`), backups and restore, release channels, and a recovery code for a lost passkey ([Operations](https://noite.now/self-hosting/operations/)). |
+
+## Install it your way
+
+| Where | How |
+| --- | --- |
+| **Any VPS** | `curl -fsSL https://noite.now/run.sh \| bash -s install` ([Install](https://noite.now/self-hosting/install/)) |
+| **Docker Compose** | `docker compose -f docker/compose.yaml up -d`: every variable has a default |
+| **Coolify** | A Docker Compose resource pointed at this repo ([Platforms](https://noite.now/self-hosting/platforms/)) |
+| **Railway** | One service from the image, a volume at `/data`, and a bucket ([Platforms](https://noite.now/self-hosting/platforms/)) |
+
+Installs follow a release channel: `ghcr.io/ryuzcorp/noite:alpha` by default. `stable` follows final releases only, and a version tag (`0.1.0-alpha.2`) pins one release. For real installs, bring your own S3-compatible bucket (R2, S3, Tigris, GCS or Azure Blob); the bundled RustFS store is for getting started ([Storage](https://noite.now/self-hosting/storage/)).
+
+## How it works
+
+Noite ships as **one image**. The runner is PID 1 and supervises everything else:
+
+```mermaid
+flowchart LR
+  user([Visitors]) --> caddy
+  dev([git push]) --> caddy
+  subgraph noite["noite container"]
+    caddy["Caddy edge<br/>TLS · routing · compression · rate limits"]
+    runner["noite-runner (Rust)<br/>API · Git · builds · telemetry"]
+    control["Control UI<br/>celld fleet #0"]
+    fleets["Tenant apps<br/>one celld fleet per app"]
+    caddy --> control
+    caddy --> runner
+    caddy --> fleets
+    runner -. supervises .-> caddy
+    runner -. supervises .-> control
+    runner -. supervises .-> fleets
+  end
+  runner --> bucket[("S3 bucket<br/>git · app data · telemetry · state")]
+  control --> bucket
+  fleets --> bucket
+```
+
+- **Runner** ([`apps/runner`](apps/runner)): Git smart-HTTP, builds, deploys, the API, telemetry aggregation with DuckDB, and the edge configuration. Its SQLite state is snapshotted into the bucket.
+- **Caddy**: TLS with on-demand certificates, host routing, compression and rate limits, configured by the runner through its admin API.
+- **Control UI** ([`apps/noite`](apps/noite)): an [Oxide](https://github.com/ryuzcorp/oxide) Worker served by its own celld node.
+- **Tenant apps**: one celld fleet per app, run as an unprivileged user, put to sleep when idle and woken by the next request.
+
+More in [How it works](https://noite.now/how-it-works/) and [SPEC.md](SPEC.md).
+
+## Development
+
+You need Docker or Podman with Compose, and `make`.
 
 ```bash
 cp .env.example .env
-make up      # build the image from the tree and start
+make up       # build the image from the tree and start
+make dev      # cargo-watch runner + vite dev control UI, sources bind-mounted
 make logs
-make doctor  # codified health checks
-make backup  # tar both volumes into backups/<UTC stamp>/
+make doctor   # codified health checks
+make e2e      # image + doctor + Playwright; make e2e-isolation for multi-tenant
+make help     # everything else: backup, restore, down, nuke
 ```
 
-Restore is destructive and replays a backup directory over the live volumes: `make restore FROM=backups/<stamp>`.
-
-`make up-prod` pulls the release image instead of building. `docker/compose.yaml` pulls by default and gives every variable a default, so on a host with nothing but Compose (a cloud VM, a panel's or registry's template) `docker compose -f docker/compose.yaml up -d` is the whole install. Installs track a release channel, `ghcr.io/ryuzcorp/noite:alpha` by default (`stable` follows final releases only, a version tag pins one release; see [CHANGELOG.md](CHANGELOG.md) for what each release needs from you). `main` builds are `edge` and short-SHA tags, for CI and rollbacks.
-
-Bring your own S3 (R2, Tigris or S3, the stores celld qualifies; recommended for real installs): set `S3_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and start with `--scale rustfs=0`.
+| URL                            |               |
+| ------------------------------ | ------------- |
+| http://localhost:9080          | control UI    |
+| http://api.localhost:9080      | runner API    |
+| `http://<slug>.localhost:9080` | deployed apps |
 
 | Path |  |
 | --- | --- |
-| `apps/runner` | Rust runner (deploy, fleets, edge config, telemetry, supervision) |
-| `apps/noite` | Oxide control UI (passkeys, app actions → runner) |
-| `apps/noite/test` | sample app + `deploy.sh`; `test/hostile` is the isolation probe app |
-| `docker/Dockerfile` | the one image (`noite` target) and its dev variant (`dev` target) |
-| `docker/compose.yaml` | the whole install: pulls the image, every variable defaulted (Compose, Coolify, stores, VMs) |
-| `docker/compose.build.yaml` | overlay: build the image from the tree (`make up`) |
-| `docker/compose.dev.yaml` | overlay: `cargo watch` runner + `vite dev` UI in the same service (`make dev`) |
-| `docker/compose.e2e.yaml` | overlay: the e2e lane (`make e2e`, `make e2e-isolation`) |
+| [`apps/runner`](apps/runner) | Rust runner: deploys, fleets, edge config, telemetry, supervision |
+| [`apps/noite`](apps/noite) | Oxide control UI |
+| [`apps/noite/test`](apps/noite/test) | sample apps and the hostile-tenant isolation probe |
+| [`apps/website`](apps/website) | [noite.now](https://noite.now) and the docs |
+| [`packages/cli`](packages/cli) | `@noitenow/cli`, deploys from CI |
+| [`docker/`](docker) | the Dockerfile, Compose files and the installer |
 
-| URL                            |                       |
-| ------------------------------ | --------------------- |
-| http://localhost:9080          | control UI (passkeys) |
-| http://api.localhost:9080      | runner API            |
-| `http://{slug}.localhost:9080` | deployed apps         |
+[AGENTS.md](AGENTS.md) holds the repo conventions, and [SPEC.md](SPEC.md) the design and its history. Run `bun x ultracite fix` before committing.
 
-## Architecture
+<details>
+<summary><strong>Passkeys on a phone over the LAN</strong></summary>
 
-- **The `noite` container.** `noite-runner` is PID 1 (under `tini`) and owns every other process:
-  - **Caddy** (edge): TLS with on-demand certificates ask-gated at `/v1/edge/tls-ask`, host routing, and the compression celld does not do (`encode zstd gzip` on every site: the control UI's JS bundle drops 462 KB → 144 KB gzip, CSS 129 KB → 22 KB, while `text/event-stream` responses stay uncompressed). The runner generates the Caddyfile and loads it through Caddy's admin API (`127.0.0.1:2019`); certificates live in the volume.
-  - **Control UI** (fleet #0): the Oxide worker bundle baked into the image, deployed into `s3://<bucket>/control` at boot (revision-gated, vars from the container environment) and served by a supervised celld node on `127.0.0.1:8090`.
-  - **Tenant fleets**: one celld node per app, running as the unprivileged `fleet` user. Builds and release commands run as the `build` user with a cleared environment.
-  - Everything else the runner does: Git smart-HTTP, bare mirrors, builds, telemetry aggregation (DuckDB), and its SQLite state, which it also snapshots into the bucket so a lost volume loses nothing.
-- **rustfs** (bundled, optional): the bucket: `git/` tip bundles, `fleets/` tenant celld, `control/` the UI worker and its D1, `runner/state/` runner snapshots.
+Phones can't use passkeys over `http://<lan-ip>:9080` (not a secure context), and `*.localhost` resolves to the phone itself. Serve the dev stack as `https://noite.local` with [portless](https://github.com/vercel-labs/portless) LAN mode instead.
 
-Content-hashed `/assets/*` chunks are cached immutably (`apps/noite/public/_headers`, `max-age=31536000, immutable`) because celld serves an asset with `max-age=0, must-revalidate` and no `Last-Modified`.
-
-Tenancy: `NOITE_TENANCY=multi` (the default off `localhost`) runs tenant code sandboxed, as unprivileged users behind an egress policy that closes loopback, private ranges and cloud metadata (the object store is the one allowed private address), and refuses builds when the container lacks the capabilities for it. `single` means only you push code to the install. See [SPEC.md](SPEC.md).
-
-Tenant subdomains are automatic: `{slug}.{BASE_DOMAIN}` routes to that app's celld listen port (20000+), decided by the edge config the runner writes. `app`/`api`/`git` slugs are reserved.
-
-Custom hostnames are opt-in per app: add one in the app's settings (or `POST /v1/apps/{id}/domains`), point its DNS at the server, and the first visit mints the certificate — the runner routes a registered hostname to its app's port only while the app is deployed and running, and the on-demand TLS gate only issues for a live app. Platform hostnames and a hostname another app already holds are refused. There is no DNS/TXT control check yet — treat that as later hardening.
-
-## LAN access (dev)
-
-Phones can't do passkeys over `http://<lan-ip>:9080` (not a secure context — the browser hides WebAuthn entirely), and `*.localhost` resolves to the phone itself. Serve the dev stack as `https://noite.local` via [portless](https://github.com/vercel-labs/portless) LAN mode instead.
-
-One-time setup (your terminal — `:443` needs sudo):
+One-time setup (`:443` needs sudo):
 
 ```bash
 npm install -g portless
-portless alias noite 9080 # route lives in ~/.portless, survives restarts
+portless alias noite 9080 # the route lives in ~/.portless and survives restarts
 sudo firewall-cmd --permanent --add-service=https && sudo firewall-cmd --reload
 ```
 
-Auth needs a secret or every `/api/auth/*` call answers 500 (`BETTER_AUTH_SECRET is missing`) on all origins. No extra file: in dev, `vite dev` hands the container's environment to the worker, as the runner does with the control fleet in prod, so `.env` alone is that source.
-
-Set `BETTER_AUTH_URL=https://noite.local` in `.env` for this flow. Passkeys bind to that origin as their rpID, so the laptop and the phone share one credential namespace — the `.env.example` default (`http://localhost:9080`) binds them to `localhost` instead, and a phone registering on `noite.local` then fails with an rpID mismatch. A hand-written `apps/noite/.dev.vars` still overrides the environment when it exists.
+Set `BETTER_AUTH_URL=https://noite.local` in `.env`. Passkeys bind to that origin, so the laptop and the phone share one credential namespace; with the `.env.example` default (`http://localhost:9080`), a phone registering on `noite.local` fails with an rpID mismatch. In dev, `vite dev` passes the container's environment to the worker, so `.env` is the only source needed (a hand-written `apps/noite/.dev.vars` still overrides it).
 
 Per boot:
 
 ```bash
-CONTROL_EXTRA_HOSTS=noite.local make dev-host # route noite.local to control
-portless proxy start --lan --https # https://noite.local (accept sudo)
+CONTROL_EXTRA_HOSTS=noite.local make dev-host # route noite.local to the control UI
+portless proxy start --lan --https            # https://noite.local (accept sudo)
 ```
 
-On the phone: install `~/.portless/ca.pem` as a trusted CA (iOS: tap the file → install profile → enable full trust; Android: Security → install CA certificate), open `https://noite.local`, and register a **fresh** passkey there — `localhost` credentials are rpID-bound and never transfer. Android often can't resolve mDNS `.local` names; iOS works. `portless list` shows routes, `portless proxy stop` kills the proxy.
+On the phone, install `~/.portless/ca.pem` as a trusted CA (iOS: open the file, install the profile, enable full trust; Android: Security → install CA certificate), open `https://noite.local`, and register a **fresh** passkey: `localhost` credentials never transfer. Android often can't resolve mDNS `.local` names; iOS works. `portless list` shows routes and `portless proxy stop` stops the proxy.
 
-Tenant apps follow the same pattern: with `CONTROL_EXTRA_HOSTS=noite.local` the runner also serves `{slug}.noite.local` (same routes + wildcard fallback as `{slug}.localhost`), the UI links rebase onto the host you're browsing from, and one alias per app wires DNS on both machines:
+Tenant apps work the same way: with `CONTROL_EXTRA_HOSTS=noite.local` the runner also serves `<slug>.noite.local`, and one alias per app wires DNS on both machines:
 
 ```bash
-portless alias test.noite 9080 # → https://test.noite.local (hosts + mDNS)
+portless alias test.noite 9080 # → https://test.noite.local
 ```
 
-## Deploy to Coolify
+</details>
 
-Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `main`): the same file as `make up-prod`, driven by env. In Environment Variables, set `BASE_DOMAIN` to your domain (defaults to `localhost`) and `BETTER_AUTH_URL` / `GIT_PUBLIC_BASE` to match, the three secrets (`BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, and `RUSTFS_ACCESS_KEY` + `RUSTFS_SECRET_KEY` or your own S3 keys). `NOITE_IMAGE` stays on a release channel (`alpha`). Nothing generates secrets here; dev-default secrets are refused on real domains. Coolify auto-provisions a generated domain for the `noite` service (boot check via `SERVICE_URL_NOITE_80`), then paste the real hostnames once on that service's Domains field (Coolify can't take custom hostnames from Compose): `https://app.<domain>:80,https://api.<domain>:80,https://git.<domain>:80`. Behind a terminating proxy set `CADDY_AUTO_HTTPS=off`; Noite's Caddy still mints per-host certs on demand. The apex stays on your marketing site.
+## Documentation
 
-A new image restarts the runner and every tenant fleet with it (they cold-boot), so batch upgrades and deploy off-peak.
+- [Introduction](https://noite.now/introduction/) and [Quickstart](https://noite.now/quickstart/)
+- **Apps:** [deploy](https://noite.now/apps/deploy/), [build](https://noite.now/apps/build/), [configure](https://noite.now/apps/configure/), [observe](https://noite.now/apps/observe/)
+- **Self-hosting:** [install](https://noite.now/self-hosting/install/), [storage](https://noite.now/self-hosting/storage/), [tenancy](https://noite.now/self-hosting/tenancy/), [platforms](https://noite.now/self-hosting/platforms/), [operations](https://noite.now/self-hosting/operations/), [known limits](https://noite.now/self-hosting/known-limits/)
+- **Reference:** [API](https://noite.now/reference/api/), [CLI](https://noite.now/reference/cli/), [environment variables](https://noite.now/reference/environment-variables/), [limits](https://noite.now/reference/limits/)
 
-Tenant subdomains (`<slug>.<domain>`) are fully automatic: a Traefik TCP router forwards every `*.<domain>` SNI straight to Noite's Caddy on `:443`, which mints a per-slug cert on demand (ask-gated at `/v1/edge/tls-ask`: only live tenant/platform hosts get certs, no wildcard cert or DNS provider involved). Two one-time prerequisites: `*.<domain>` DNS → the server, and this file saved under `Servers > server > Proxy > Dynamic Configurations` (dashboard-pasted file config is static text that Coolify cannot mangle, and `noite-tenants@docker` resolves the TCP service the `noite` service label defines):
+## Community and support
 
-```yaml
-tcp:
-  routers:
-    noite-tenants:
-      entryPoints: [https]
-      rule: 'HostSNIRegexp(`^.+\.<domain>$`)'
-      service: noite-tenants@docker
-      tls: { passthrough: true }
-```
+- [Discord](https://discord.gg/WnVTMCTz74) for questions and help
+- [GitHub Issues](https://github.com/ryuzcorp/noite/issues) for bugs and feature requests
+- [SECURITY.md](SECURITY.md) to report a vulnerability privately
 
-Then redeploy once and confirm the `noite-tenants` router in the Traefik dashboard. First visit to a new slug pauses a few seconds for issuance; certs persist in the `noite-data` volume. Fallback if passthrough misbehaves: add `https://<slug>.<domain>:80` per app (exact hostnames use the plain HTTP challenge).
+## License
 
-## Deploy to Railway
-
-One service from the image `ghcr.io/ryuzcorp/noite:alpha` with a volume at `/data`, plus a bucket: R2 or Tigris (recommended), or a second service from `docker.io/rustfs/rustfs` with its own volume. Set the same variables as above, `S3_ENDPOINT` to the bucket (`http://rustfs.railway.internal:9000` for the RustFS service), `CADDY_AUTO_HTTPS=off` (Railway terminates TLS with the `*.<domain>` custom domain), the domain's target port to `80`, and `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=35` so the stop budget fits. Healthcheck path `/ready` on port `8080` if you set one (first boot can take minutes). Whether Railway grants the capabilities multi-tenant mode needs is unverified: check `make doctor`'s output (or `/ready`) on the deployed service, and run `NOITE_TENANCY=single` if isolation cannot be set up there.
-
-Full guide: [apps/website/docs/self-hosting/](apps/website/docs/self-hosting/).
+[Apache-2.0](LICENSE). Noite runs apps on [celld](https://celld.dev) by Deno, also Apache-2.0.
