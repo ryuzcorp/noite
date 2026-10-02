@@ -8,6 +8,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Operator action required
+
+- None. Tenant fleets and the control node restart on celld 0.6.1 with the upgrade (a rolling update from 0.6.0).
+
+### Changed
+
+- celld 0.6.1: `kv.list()` iterators no longer block later writes, WebSocket messages on one socket no longer wait for the previous handler, and Durable Object facets keep `ctx.id.name`.
+
+### Fixed
+
+- Errors kept tracking `console.error(err)` and rejected `waitUntil` work: celld 0.6.1 moved the log level out of the message into a severity column, and the ingest now reads it.
+- Metrics, logs and errors are no longer dropped when any running app had no requests or no log lines in the hour being read. One such app made the whole telemetry pass fail for every app, and the pass was skipped as if there were nothing to read. Rows already skipped are not recovered.
+- arm64 images: metrics, logs and errors were never ingested. The image shipped DuckDB 1.2.1, which could not run the ingest query; arm64 now uses 1.5.5 like amd64.
+
 ## [0.1.0-alpha.1] - 2026-10-01
 
 First alpha: self-hosted only. There is no cloud version.

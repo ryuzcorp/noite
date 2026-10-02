@@ -19,7 +19,7 @@
 # One celld, one Caddy, one Node, one jup and one bun pin;
 # docker/check-versions.ts asserts they appear exactly once. Sidecar versions
 # (esbuild, duckdb) live in docker/install-sidecars.sh.
-ARG CELLD_VERSION=0.6.0
+ARG CELLD_VERSION=0.6.1
 ARG CADDY_VERSION=2.10.0
 # Caddy's rate-limit handler (github.com/mholt/caddy-ratelimit), which the
 # runner writes for every site (SPEC, Edge limits). It has no releases past

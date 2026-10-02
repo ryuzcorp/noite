@@ -264,9 +264,11 @@ async fn duckdb_json(sql: &str, purpose: &str) -> anyhow::Result<String> {
     .await
 }
 
-/// True when duckdb failed only because the fleet has no parquet yet (idle).
+/// True when duckdb failed only because the window has no parquet (idle):
+/// a glob that matched nothing, or an expanded file list that came up empty.
 pub fn is_idle_telemetry_err(err: &anyhow::Error) -> bool {
-    err.to_string().contains("No files found")
+    let msg = err.to_string();
+    msg.contains("No files found") || msg.contains("needs at least one file")
 }
 
 /// Whether a telemetry tick should advance the watermark for this result.
@@ -336,27 +338,50 @@ async fn ingest_all(
         .map(|(s, a)| format!("('{}', {a})", s.replace('\'', "''")))
         .collect::<Vec<_>>()
         .join(", ");
-    let files = traces
+    // Expand the globs before reading. celld writes no file for an empty
+    // batch, so an hour without traffic (or without a console line) has no
+    // match, and `read_parquet` fails the whole list on one empty glob: a
+    // single quiet fleet turned every pass into "idle" and the watermark
+    // skipped everyone's rows. `glob()` returns nothing instead of failing.
+    // The bucket and slug ride in the glob, so escape it like `values`.
+    let globs = traces
         .iter()
         .chain(logs.iter())
-        .map(|g| format!("'{g}'"))
+        .map(|g| format!("SELECT file FROM glob('{}')", g.replace('\'', "''")))
         .collect::<Vec<_>>()
-        .join(", ");
+        .join(" UNION ALL ");
     // CAST to BIGINT: DuckDB `/` is floating division, and the -json writer
     // emits BIGINT sums as STRINGS and small integers as numbers — coerce at
     // the source, parse with `json_i64`. Tag 4's `err` is the error text with
     // celld's `rejected: ` / `Error: rejected: ` wrappers removed, so a cell
     // span and its parent land in one group (host/errors.rs strips the same).
+    // Since celld 0.6.1 a log body carries only the message and the level is
+    // `severity_text`; the ingest puts back the `ERROR `/`WARN ` prefix of
+    // the console line, so stored logs and `errors::parse_log_error` read the
+    // same text as 0.6.0's. The empty `UNION ALL BY NAME` arm declares every
+    // column the query reads, so a pass with only trace files, only log
+    // files, or only pre-0.6.1 logs (no severity column) still binds.
     let sql = s3_setup(
         cfg,
         &format!(
-            "WITH files AS ( \
+            "SET VARIABLE files = (SELECT coalesce(list(file), []) FROM ({globs})); \
+             WITH files AS ( \
                SELECT regexp_extract(filename, 'fleets/([^/]+)/', 1) AS slug, \
                       name, kind, start_unix_us, duration_us, ok, \
-                      coalesce(queue_wait_us, 0) AS qwait, time_unix_us, body, \
+                      coalesce(queue_wait_us, 0) AS qwait, time_unix_us, \
+                      CASE WHEN severity_text IN ('ERROR', 'WARN') \
+                           THEN severity_text || ' ' || body ELSE body END AS body, \
                       trace_id, cell, \
                       regexp_replace(error, '^rejected: (Error: rejected: )*', '') AS err \
-                 FROM read_parquet([{files}], union_by_name = true, filename = true)), \
+                 FROM (SELECT * FROM read_parquet(getvariable('files'), union_by_name = true, filename = true) \
+                       UNION ALL BY NAME \
+                       SELECT CAST(NULL AS VARCHAR) AS name, CAST(NULL AS BIGINT) AS kind, \
+                              CAST(NULL AS BIGINT) AS start_unix_us, CAST(NULL AS BIGINT) AS duration_us, \
+                              CAST(NULL AS BOOLEAN) AS ok, CAST(NULL AS BIGINT) AS queue_wait_us, \
+                              CAST(NULL AS BIGINT) AS time_unix_us, CAST(NULL AS VARCHAR) AS severity_text, \
+                              CAST(NULL AS VARCHAR) AS body, CAST(NULL AS VARCHAR) AS trace_id, \
+                              CAST(NULL AS VARCHAR) AS cell, CAST(NULL AS VARCHAR) AS error \
+                        WHERE false)), \
              bounds(slug, after_us) AS (VALUES {values}) \
              SELECT 1 AS tag, f.slug AS slug, \
                     strftime('%Y-%m-%dT%H:%M:00Z', to_timestamp(f.start_unix_us / 1000000)) AS bucket, \
@@ -926,6 +951,8 @@ mod tests {
     #[test]
     fn idle_err_detects_no_files() {
         let e = anyhow::anyhow!("duckdb: No files found that match the pattern");
+        assert!(is_idle_telemetry_err(&e));
+        let e = anyhow::anyhow!("IO Error: read_parquet needs at least one file to read");
         assert!(is_idle_telemetry_err(&e));
         let e2 = anyhow::anyhow!("connection refused");
         assert!(!is_idle_telemetry_err(&e2));

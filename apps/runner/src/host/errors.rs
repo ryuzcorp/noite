@@ -1,6 +1,8 @@
 //! Error tracking from celld telemetry, no SDK required.
 //!
-//! Two signals carry an exception (verified against celld 0.6.0):
+//! Two signals carry an exception (verified against celld 0.6.0; since
+//! 0.6.1 the log level is a severity column, and the ingest puts the prefix
+//! back, host/metrics.rs `ingest_all`):
 //!
 //! 1. A failed span's `error` column for anything a handler throws or
 //!    rejects — `rejected: PaymentError: declined [at chargeCard

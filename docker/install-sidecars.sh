@@ -5,14 +5,13 @@
 #
 # Usage: sh install-sidecars.sh [esbuild] [duckdb]   (no args = both)
 #
-# Env overrides (all optional): ESBUILD_VERSION, DUCKDB_VERSION,
-# DUCKDB_VERSION_AARCH64. Arch comes from $TARGETARCH (docker builds) or
+# Env overrides (all optional): ESBUILD_VERSION, DUCKDB_VERSION.
+# Arch comes from $TARGETARCH (docker builds) or
 # uname -m (native builds). Needs curl + unzip + tar present.
 set -eu
 
 ESBUILD_VERSION="${ESBUILD_VERSION:-0.25.12}"
 DUCKDB_VERSION="${DUCKDB_VERSION:-1.5.5}"
-DUCKDB_VERSION_AARCH64="${DUCKDB_VERSION_AARCH64:-1.2.1}"
 
 wanted_esbuild=0
 wanted_duckdb=0
@@ -36,12 +35,13 @@ case "$arch" in
 amd64 | x86_64)
   ESBUILD_PKG=linux-x64
   DUCKDB_ZIP=duckdb_cli-linux-amd64.zip
-  DUCKDB_VER="$DUCKDB_VERSION"
   ;;
 arm64 | aarch64)
   ESBUILD_PKG=linux-arm64
-  DUCKDB_ZIP=duckdb_cli-linux-aarch64.zip
-  DUCKDB_VER="$DUCKDB_VERSION_AARCH64"
+  # `linux-arm64` since DuckDB 1.3 (`linux-aarch64` before): the old name
+  # held arm64 on 1.2.1, whose CLI cannot strftime a TIMESTAMPTZ and so
+  # failed every telemetry ingest.
+  DUCKDB_ZIP=duckdb_cli-linux-arm64.zip
   ;;
 *)
   echo "unsupported arch: $arch" >&2
@@ -59,7 +59,7 @@ fi
 
 # duckdb CLI: the runner's telemetry aggregation reads Parquet spans with it.
 if [ "$wanted_duckdb" = 1 ]; then
-  curl -fsSL --retry 5 --retry-all-errors --connect-timeout 15 "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VER}/${DUCKDB_ZIP}" -o /tmp/duckdb.zip
+  curl -fsSL --retry 5 --retry-all-errors --connect-timeout 15 "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/${DUCKDB_ZIP}" -o /tmp/duckdb.zip
   unzip -qo /tmp/duckdb.zip -d /usr/local/bin
   rm -f /tmp/duckdb.zip
 fi
