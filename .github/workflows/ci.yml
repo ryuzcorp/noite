@@ -48,11 +48,13 @@ jobs:
             *) sh -n "$f" ;;
             esac
           done
+      # Main-database tables only: app_metric, metric_watermark and the rest of
+      # the telemetry live in metrics.sqlite (`db::METRICS_SCHEMA`).
       - name: runner schema applies twice (idempotent)
         run: |
           sqlite3 /tmp/schema.db < apps/runner/schema.sql
           sqlite3 /tmp/schema.db < apps/runner/schema.sql
-          for t in app app_credential app_env app_metric deploy metric_watermark; do
+          for t in app app_credential app_domain app_env app_limit deploy; do
             sqlite3 /tmp/schema.db "SELECT name FROM sqlite_master WHERE type='table' AND name='$t'" | grep -qx "$t"
           done
 
