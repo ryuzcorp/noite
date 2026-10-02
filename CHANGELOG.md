@@ -8,6 +8,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] - 2026-10-02
+
+celld 0.6.1 and telemetry ingest fixes.
+
 ### Operator action required
 
 - None. Tenant fleets and the control node restart on celld 0.6.1 with the upgrade (a rolling update from 0.6.0).
