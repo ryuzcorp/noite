@@ -1,4 +1,5 @@
 import { defineConfig } from "blume";
+import { posthog } from "blume/analytics";
 
 const INTER = {
   name: "Inter",
@@ -13,6 +14,15 @@ const INTER = {
 const PLEX_MONO = "./node_modules/@fontsource/ibm-plex-mono/files";
 
 export default defineConfig({
+  // PostHog, injected by Blume in production builds only (`blume dev` stays
+  // clean). The project key is public and write-only.
+  analytics: [
+    posthog({
+      defaults: "2026-05-30",
+      host: "https://eu.i.posthog.com",
+      key: "phc_tK7beVmX5qMx6tsBxVQdWATWMQcPpEV4iSYGu8nrNHyG",
+    }),
+  ],
   deployment: {
     site: "https://noite.now",
   },
