@@ -283,7 +283,6 @@ const schema = schema140;
 
 export type DB = InferSchema<typeof schema>;
 export type AppCollaborator = Selectable<DB["app_collaborator"]>;
-export type AppRole = "view" | "push" | "admin";
 
 export const orm = paranorm<DB>();
 

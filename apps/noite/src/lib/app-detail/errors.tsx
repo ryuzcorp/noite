@@ -5,12 +5,9 @@
 import { navigate, searchParam } from "@ilha/router";
 import { atom } from "ilha";
 
-import { setErrorStatus } from "../apps.server";
 import { formatAgo, formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
 import { decodeErrors, errorsUrl, feedKeys, liveFeed } from "../feeds";
-import { ArrowLeft } from "../icons";
-import { LoadError } from "../load-error";
 import { appDetail, errorDetail } from "../resources";
 import type {
   ErrorStatus,
@@ -19,7 +16,10 @@ import type {
   RunnerErrorIssue,
   RunnerErrorList,
 } from "../runner";
-import { ListSkeleton, SectionSkeleton } from "../skeletons";
+import { setErrorStatus } from "../server/errors.server";
+import { ArrowLeft } from "../ui/icons";
+import { LoadError } from "../ui/load-error";
+import { ListSkeleton, SectionSkeleton } from "../ui/skeletons";
 
 const STATUSES: { id: ErrorStatus; label: string }[] = [
   { id: "open", label: "Open" },

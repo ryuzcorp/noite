@@ -54,7 +54,7 @@ CREATE INDEX IF NOT EXISTS idx_deploy_app ON deploy(app_id);
 
 -- Per-app usage metrics, edge analytics, span stats, log ring, errors,
 -- watermarks and compaction state live in metrics.sqlite
--- (db::METRICS_SCHEMA), ATTACHed as `metrics` — never in this snapshotted
+-- (apps/runner/schema.metrics.sql), ATTACHed as `metrics` — never in this snapshotted
 -- file (spec T4.1).
 
 -- Tenant env vars (CF `.dev.vars` model). Names starting with `FLAG_`
@@ -152,4 +152,15 @@ CREATE TABLE IF NOT EXISTS telemetry_replay (
   floor_us INTEGER NOT NULL,
   slug TEXT,
   requested_at TEXT NOT NULL
+);
+
+-- Instance-level settings: key/value rows the runner owns about this install
+-- (not about a tenant). `install_id` (random UUIDv4) and `installed_at` are
+-- written on first boot and live in this snapshotted database, so the identity
+-- survives container recreation; `telemetry_enabled` (absent = on) and
+-- `telemetry_last_sent_at` back the opt-out instance heartbeat
+-- (host::telemetry_report).
+CREATE TABLE IF NOT EXISTS instance_setting (
+  key TEXT PRIMARY KEY NOT NULL,
+  value TEXT NOT NULL
 );

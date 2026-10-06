@@ -9,9 +9,6 @@ import type { AppRole } from "./roles";
 import { runnerGetApp, runnerGetAppBySlug, runnerListApps } from "./runner";
 import type { RunnerApp } from "./runner";
 
-export { parseAppRole, roleAtLeast } from "./roles";
-export type { AppRole } from "./roles";
-
 /** The runner is the single source of truth for apps; D1 keeps collaborator
  * grants only. `App` is that runner row — the UI never holds a second copy. */
 export type App = RunnerApp;

@@ -19,9 +19,10 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use serde::Serialize;
+use ts_rs::TS;
 
 use crate::config::Config;
-use crate::host::cmd;
+use crate::host::{exec, s3};
 use crate::models::App;
 
 /// R2's own key bound (1..=1024 bytes).
@@ -39,16 +40,18 @@ const R2_HEAD_CONCURRENCY: usize = 8;
 const CELD_TIMEOUT: Duration = Duration::from_secs(120);
 const CELD_UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct R2Folder {
     pub name: String,
     /// Key prefix of the folder, including its trailing `/`.
     pub prefix: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct R2Object {
     pub key: String,
     pub name: String,
@@ -58,8 +61,9 @@ pub struct R2Object {
     pub etag: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct R2Preview {
     pub app_id: String,
     pub app_slug: String,
@@ -72,8 +76,9 @@ pub struct R2Preview {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct R2File {
     pub key: String,
     pub size: i64,
@@ -243,7 +248,7 @@ fn normalize_prefix(prefix: &str) -> String {
 }
 
 fn celld_env(cfg: &Config) -> Vec<(&str, String)> {
-    let mut env = cmd::aws_env(cfg);
+    let mut env = s3::aws_env(cfg);
     env.push(("S3_ENDPOINT", cfg.s3_endpoint.clone()));
     env
 }
@@ -255,7 +260,7 @@ async fn run_celld(cfg: &Config, args: &[&str], timeout: Duration) -> anyhow::Re
         .iter()
         .map(|(key, value)| (*key, value.as_str()))
         .collect();
-    cmd::run_cmd(&cfg.celld_bin, args, None, &env, timeout).await
+    exec::run_cmd(&cfg.celld_bin, args, None, &env, timeout).await
 }
 
 /// The fleet options every `celld r2` call carries.
@@ -277,7 +282,7 @@ fn split_page(
     s3_prefix: &str,
     parent: &str,
     stored_prefixes: &[String],
-    stored_objects: &[cmd::S3Object],
+    stored_objects: &[s3::S3Object],
 ) -> (Vec<R2Folder>, Vec<R2Object>) {
     let mut folders = Vec::new();
     for stored in stored_prefixes {
@@ -341,7 +346,7 @@ pub async fn r2_list(
     let prefix = normalize_prefix(prefix);
     let base = r2_base(app, bucket);
     let s3_prefix = format!("{base}{}", r2_encode_prefix(&prefix));
-    let page = cmd::s3_list_page(
+    let page = s3::s3_list_page(
         cfg,
         &cfg.s3_bucket,
         &s3_prefix,
@@ -361,10 +366,10 @@ pub async fn r2_list(
         .map(|object| format!("{base}{}", r2_encode(&object.key)))
         .collect();
     let bucket_name = cfg.s3_bucket.clone();
-    let content_types: Vec<Option<cmd::S3Head>> = futures::stream::iter(full_keys)
+    let content_types: Vec<Option<s3::S3Head>> = futures::stream::iter(full_keys)
         .map(|full| {
             let bucket_name = bucket_name.clone();
-            async move { cmd::s3_head_object(cfg, &bucket_name, &full).await }
+            async move { s3::s3_head_object(cfg, &bucket_name, &full).await }
         })
         .buffered(R2_HEAD_CONCURRENCY)
         .collect()
@@ -396,13 +401,13 @@ pub async fn r2_raw(
         anyhow::bail!("invalid key");
     }
     let full = format!("{}{}", r2_base(app, bucket), r2_encode(key));
-    let Some(head) = cmd::s3_head_object(cfg, &cfg.s3_bucket, &full).await else {
+    let Some(head) = s3::s3_head_object(cfg, &cfg.s3_bucket, &full).await else {
         anyhow::bail!("object not found");
     };
     if head.size > R2_RAW_CAP {
         anyhow::bail!("object too large to download");
     }
-    let bytes = cmd::s3_get_bytes(cfg, &full).await?;
+    let bytes = s3::s3_get_bytes(cfg, &full).await?;
     Ok(R2Raw {
         bytes,
         content_type: head.content_type,
@@ -416,10 +421,10 @@ pub async fn r2_get(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow:
     }
     let full = format!("{}{}", r2_base(app, bucket), r2_encode(key));
     // Size-gate before downloading so a stray multi-GB object can't OOM us.
-    let Some(head) = cmd::s3_head_object(cfg, &cfg.s3_bucket, &full).await else {
+    let Some(head) = s3::s3_head_object(cfg, &cfg.s3_bucket, &full).await else {
         anyhow::bail!("object not found");
     };
-    let bytes = cmd::s3_get_bytes(cfg, &full).await?;
+    let bytes = s3::s3_get_bytes(cfg, &full).await?;
     let truncated = bytes.len() > R2_PREVIEW_CAP;
     let preview = &bytes[..bytes.len().min(R2_PREVIEW_CAP)];
     Ok(R2File {
@@ -598,8 +603,8 @@ mod tests {
         assert!(!r2_header_ok(""));
     }
 
-    fn stored(key: &str) -> cmd::S3Object {
-        cmd::S3Object {
+    fn stored(key: &str) -> s3::S3Object {
+        s3::S3Object {
             key: key.to_string(),
             last_modified: "2026-10-06T11:00:57.528Z".to_string(),
             size: 15,

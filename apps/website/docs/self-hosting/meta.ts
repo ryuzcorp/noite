@@ -7,6 +7,7 @@ export default defineMeta({
     "storage",
     "tenancy",
     "known-limits",
+    "telemetry",
     "platforms",
     "protection",
     "operations",

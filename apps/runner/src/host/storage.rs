@@ -2,6 +2,7 @@
 //! wrangler parsing. Backends live in `d1` / `durable` / `r2`.
 use anyhow::Context;
 use serde::Serialize;
+use ts_rs::TS;
 use serde_json::Value;
 
 use crate::config::Config;
@@ -16,8 +17,9 @@ pub use d1::{d1_delete_rows, d1_rows, d1_schema, d1_tables, d1_write};
 pub use durable::do_instances;
 pub use r2::{r2_delete_many, r2_get, r2_list, r2_put, r2_raw};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct StorageItem {
     pub app_id: String,
     pub app_slug: String,

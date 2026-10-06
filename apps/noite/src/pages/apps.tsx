@@ -1,4 +1,4 @@
-import { AppsList } from "$lib/apps";
+import { AppsList } from "$lib/apps/list";
 import { head } from "@ilha/router";
 
 export default function AppsPage() {

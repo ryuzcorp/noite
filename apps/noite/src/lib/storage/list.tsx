@@ -1,9 +1,9 @@
 //! Storage inventory rows: badges, rows, per-app list.
 import { errorMessage } from "../errors";
-import { ChevronRight } from "../icons";
 import { appStorage } from "../resources";
 import type { StorageItem } from "../runner";
-import { ListSkeleton } from "../skeletons";
+import { ChevronRight } from "../ui/icons";
+import { ListSkeleton } from "../ui/skeletons";
 
 /** Badge label per storage kind (plain badge for every kind). */
 const STORAGE_BADGES = {

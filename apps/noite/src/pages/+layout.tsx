@@ -1,10 +1,10 @@
-import { initials } from "$lib/apps";
 import { authClient } from "$lib/auth-client";
-import { Authed } from "$lib/authed";
-import { List as ListIcon, Menu as MenuIcon } from "$lib/icons";
-import { Onboarding } from "$lib/onboarding";
+import { Authed } from "$lib/auth/authed";
+import { Onboarding } from "$lib/auth/onboarding";
+import { invalidateSession } from "$lib/auth/session";
 import { session } from "$lib/resources";
-import { invalidateSession } from "$lib/session";
+import { Avatar } from "$lib/ui/avatar";
+import { List as ListIcon, Menu as MenuIcon } from "$lib/ui/icons";
 import { defineLayout, navigate, useRoute } from "@ilha/router";
 
 /**
@@ -95,11 +95,7 @@ export default defineLayout(({ children }) => {
                   aria-label="Account menu"
                   class="btn btn-sm btn-ghost flex w-full items-center justify-start gap-2 px-2"
                 >
-                  <div class="avatar avatar-placeholder">
-                    <div class="bg-neutral text-neutral-content w-8 rounded-full">
-                      <span class="text-xs">{initials(displayName)}</span>
-                    </div>
-                  </div>
+                  <Avatar label={displayName} size="sm" />
                   <span class="truncate text-sm">{displayName || "…"}</span>
                 </div>
                 <ul

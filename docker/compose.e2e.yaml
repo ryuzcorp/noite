@@ -10,6 +10,8 @@ services:
       - "20000-20099:20000-20099"
     environment:
       NOITE_S3_BUCKET: noite-e2e
+      # The e2e lane never reports (SPEC, telemetry).
+      NOITE_TELEMETRY: "0"
       BETTER_AUTH_URL: http://localhost:8090
       GIT_PUBLIC_BASE: http://localhost:8080/v1/git
       S3_PUBLIC_ENDPOINT: http://localhost:${RUSTFS_API_PORT:-19000}

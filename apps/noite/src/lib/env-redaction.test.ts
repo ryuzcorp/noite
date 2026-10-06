@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { redactEnv } from "./apps.server";
+import { redactEnv } from "./server/env.server";
 
 const row = (name: string, value: string) => ({
   name,

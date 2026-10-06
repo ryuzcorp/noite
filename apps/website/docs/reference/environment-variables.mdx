@@ -85,7 +85,7 @@ Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (hand
 | `RUNNER_FLEET_ASSET_CACHE_MB` | `64` | → `CELLD_ASSET_CACHE_BYTES`; per-fleet on-disk asset cache | worker-passthrough (fleet) |
 | `RUNNER_OTEL_FLUSH_MS` | `30000` | → `CELLD_OTEL_FLUSH_MS`; bucket-flush + ingest tick cadence (min `1000`); dashboards lag ~40 s | worker-passthrough (fleet) |
 | `RUNNER_BUILD_CACHE_MB` | `512` | Per-app persistent build cache cap (package managers and their caches); `0` disables | runner-owned |
-| `RUNNER_TELEMETRY_RETENTION_DAYS` | `30` | Days kept in bucket prune, metric tables, glob floor (min `1`) | runner-owned |
+| `RUNNER_TELEMETRY_RETENTION_DAYS` | `30` | Days kept in bucket prune, metric tables, glob floor (min `1`; a non-integer or `< 1` value fails boot validation) | runner-owned |
 | `RUNNER_TIP_SWEEP_S` | `60` | Fallback S3 tip sweep per app; covers out-of-band bundle writes | runner-owned |
 | `RUNNER_FLEET_LOG` | `error,celld=warn` | Fleet `RUST_LOG` (runner's own filter stays separate) | worker-passthrough (fleet) |
 
@@ -104,6 +104,8 @@ See [Limits](/reference/limits) for the sleep mechanism.
 
 | Var | Default | Effect | Owner |
 | --- | --- | --- | --- |
+| `NOITE_TELEMETRY` | unset = on | Anonymous instance heartbeat is opt-out; `0`, `false` or `off` disables it and locks the setting ([Telemetry](/self-hosting/telemetry)) | runner-owned |
+| `DO_NOT_TRACK` | unset = on | Any non-empty value other than `0` disables the heartbeat and locks the setting, honouring the Do Not Track convention | runner-owned |
 | `NOITE_RATE_LIMIT_RPM` | `600` | Worker per-route-class (`auth`/`invite`) limit; `429` + `Retry-After`; `0` disables | worker-passthrough |
 | `NOITE_AUTH_RATE_LIMIT` | `600` | better-auth per-client `/api/auth/*` budget; `0` disables | worker-passthrough |
 | `NOITE_EDGE_RPM` | `1800` | Edge limit per client IP, per site (control, API, fallback page, each app across its hostnames); `0` disables | runner-owned (Caddy) |

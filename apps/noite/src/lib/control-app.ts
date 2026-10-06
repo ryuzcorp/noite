@@ -2,7 +2,7 @@
 //! `/apps` whose only storage resource is the control D1 (`noite-control`),
 //! browsed in-process through the worker's own D1 binding. It is NOT a runner
 //! app: no runner row exists, and every control-D1 action re-checks admin +
-//! non-impersonation server-side (see lib/control-d1.server.ts).
+//! non-impersonation server-side (see lib/server/control-d1.server.ts).
 
 /** Reserved pseudo app id. `_control` is already in the runner's
  * `RESERVED_SLUGS` (apps/runner/src/lifecycle.rs), so no real app or slug can

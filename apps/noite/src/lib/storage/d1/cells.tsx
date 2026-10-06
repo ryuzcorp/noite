@@ -2,11 +2,9 @@
 //! relative-time title for timestamps, monospace for ids/numbers, truncation
 //! and a hover copy button. Read-only — the row editor owns editing.
 
-import { atom } from "ilha";
-
 import { formatAgo, formatDateTime } from "../../dates";
-import { Check, Copy } from "../../icons";
 import type { D1Cell } from "../../runner";
+import { CopyButton } from "../../ui/copy-button";
 import { parseTimestamp } from "../d1-values";
 
 const NUMERIC_TYPE_RE = /int|numeric|decimal|double|float|real/iu;
@@ -37,17 +35,6 @@ export const CellValue = ({
   /** Show a viewer-local hint in the title (column looks like a timestamp). */
   timestamp: boolean;
 }) => {
-  const copied = atom(false);
-  const copy = () => {
-    if (cell === null || cell === "") {
-      return;
-    }
-    void navigator.clipboard?.writeText(cell);
-    copied.set(true);
-    setTimeout(() => {
-      copied.set(false);
-    }, 1200);
-  };
   if (redacted) {
     return <span class="italic opacity-60">{cell ?? "•••• redacted"}</span>;
   }
@@ -77,21 +64,13 @@ export const CellValue = ({
       >
         {cell}
       </span>
-      <button
-        type="button"
+      <CopyButton
         class="btn btn-square btn-ghost btn-sm pointer-events-none h-6 min-h-0 w-6 shrink-0 opacity-0 group-hover/cell:pointer-events-auto group-hover/cell:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100"
-        aria-label={`Copy ${columnName}`}
-        onclick={(event) => {
-          event.stopPropagation();
-          copy();
-        }}
-      >
-        {copied() ? (
-          <Check class="h-3.5 w-3.5" />
-        ) : (
-          <Copy class="h-3.5 w-3.5" />
-        )}
-      </button>
+        iconClass="h-3.5 w-3.5"
+        iconOnly
+        label={`Copy ${columnName}`}
+        value={cell}
+      />
     </span>
   );
 };

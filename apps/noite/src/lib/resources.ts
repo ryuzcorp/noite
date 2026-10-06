@@ -6,33 +6,35 @@
 import { invalidate, resource } from "ilha";
 import type { Resource, ResourceFetcher, ResourceOptions } from "ilha";
 
+import { authClient } from "./auth-client";
+import type { D1RowsQuery } from "./runner";
+import { myInviteCodes } from "./server/account.server";
 import {
+  adminOverview,
   adminListInvites as fetchAdminInvites,
   listAllApps as fetchAllApps,
   listUsers as fetchUsers,
-  adminOverview,
-} from "./admin.server";
+} from "./server/admin.server";
+import { deployLog as fetchDeployLog, get } from "./server/apps.server";
 import {
-  deployLog as fetchDeployLog,
+  listCollaborators,
+  listPendingInvitations,
+  myCollaboratorInvitations,
+} from "./server/collaborators.server";
+import { listDomains } from "./server/domains.server";
+import { listEnv } from "./server/env.server";
+import { errorDetail as fetchErrorDetail } from "./server/errors.server";
+import { getLimits } from "./server/limits.server";
+import {
   d1Rows as fetchD1Rows,
   d1Schema as fetchD1Schema,
   d1Tables as fetchD1Tables,
   doPreview as fetchDoPreview,
-  errorDetail as fetchErrorDetail,
-  get,
-  getLimits,
   listAppStorage,
-  listCollaborators,
-  listDomains,
-  listEnv,
-  listPendingInvitations,
-  myCollaboratorInvitations,
-  myInviteCodes,
   r2Get as fetchR2Get,
   r2List as fetchR2List,
-} from "./apps.server";
-import { authClient } from "./auth-client";
-import type { D1RowsQuery } from "./runner";
+} from "./server/storage.server";
+import { getTelemetry } from "./server/telemetry.server";
 import { clearSwrStore, withSnapshot, writeSwr } from "./swr-store";
 
 export { invalidate } from "ilha";
@@ -152,6 +154,7 @@ export const keys = {
   ) => `app:${appId}:r2:${bucket}:${prefix}:${cursor ?? ""}`,
   session: "session",
   signupPolicy: "signup:policy",
+  telemetry: "admin:telemetry",
 } as const;
 
 export const appDetail = (id: string) =>
@@ -241,6 +244,9 @@ export const session = () =>
 
 export const adminStatus = () =>
   tracked(keys.adminOverview, () => adminOverview());
+
+/** Anonymous instance telemetry state (admin-only server side). */
+export const telemetry = () => tracked(keys.telemetry, () => getTelemetry());
 
 export const inviteCodes = () =>
   tracked(keys.inviteCodes, () => myInviteCodes());

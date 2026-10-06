@@ -30,7 +30,7 @@ Under `s3://<bucket>/`:
 
 | Prefix | Holds |
 | --- | --- |
-| `git/{slug}/` | Tip bundles from Git HTTP plus a `MANIFEST.json` linearization point |
+| `git/{slug}/` | Tip bundles from Git HTTP plus a `MANIFEST.json` linearization point (`{seq, refs}`) |
 | `fleets/{slug}/` | Tenant celld state, deploys, and telemetry |
 | `control/` | UI worker bundle, its D1 (accounts, invites) and the control fleet's own telemetry |
 | `runner/state/` | Runner SQLite snapshots plus the `owner.json` fence |

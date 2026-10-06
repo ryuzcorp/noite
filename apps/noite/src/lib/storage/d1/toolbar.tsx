@@ -4,7 +4,6 @@
 
 import { atom } from "ilha";
 
-import { ArrowUpDown, Filter, Plus, Refresh, Search, X } from "../../icons";
 import { collectRef, liveEl, newLiveRef } from "../../live-ref";
 import type {
   D1Column,
@@ -13,6 +12,7 @@ import type {
   D1RowsQuery,
   D1TableCaps,
 } from "../../runner";
+import { ArrowUpDown, Filter, Plus, Refresh, Search, X } from "../../ui/icons";
 import {
   encodeFilters,
   encodeSort,

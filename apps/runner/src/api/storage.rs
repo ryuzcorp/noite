@@ -1,4 +1,6 @@
-//! Tenant storage: inventory, D1 preview/write, DO, R2.
+//! Tenant storage: inventory, D1 preview/write, DO, R2 (thin adapters over
+//! `service::storage`; upload/download bodies stay here because they need the
+//! request/response stream).
 use axum::{
     body::Body,
     extract::{Path, Query, State},
@@ -10,10 +12,10 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::db;
-use crate::error::ApiError;
-use crate::host::cmd;
+use crate::api_error::ApiError;
+use crate::host::exec;
 use crate::host::storage;
+use crate::service;
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -33,45 +35,25 @@ pub async fn app_storage(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let app = match db::get_app(&state.pool, &id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    };
-    match storage::list_storage(&state.config, &app).await {
-        Ok(items) => Json(items).into_response(),
-        Err(e) => ApiError::conflict(format!("{e:#}")).into_response(),
-    }
+    service::storage::list(&state, &id).await.map(Json)
 }
 
 pub async fn app_d1_tables(
     State(state): State<AppState>,
     Path((id, database_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let app = match db::get_app(&state.pool, &id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    };
-    match storage::d1_tables(&state.config, &app, &database_id).await {
-        Ok(t) => Json(t).into_response(),
-        Err(e) => ApiError::conflict(format!("{e:#}")).into_response(),
-    }
+    service::storage::d1_tables(&state, &id, &database_id)
+        .await
+        .map(Json)
 }
 
 pub async fn app_d1_schema(
     State(state): State<AppState>,
     Path((id, database_id, table)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
-    let app = match db::get_app(&state.pool, &id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    };
-    match storage::d1_schema(&state.config, &app, &database_id, &table).await {
-        Ok(s) => Json(s).into_response(),
-        Err(e) => ApiError::conflict(format!("{e:#}")).into_response(),
-    }
+    service::storage::d1_schema(&state, &id, &database_id, &table)
+        .await
+        .map(Json)
 }
 
 pub async fn app_d1_rows(
@@ -79,11 +61,6 @@ pub async fn app_d1_rows(
     Path((id, database_id, table)): Path<(String, String, String)>,
     Json(body): Json<storage::d1::D1RowsBody>,
 ) -> impl IntoResponse {
-    let app = match db::get_app(&state.pool, &id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    };
     let query = storage::d1::D1RowsQuery {
         table,
         page: body.page,
@@ -92,10 +69,9 @@ pub async fn app_d1_rows(
         filters: body.filters,
         search: body.search,
     };
-    match storage::d1_rows(&state.config, &app, &database_id, &query).await {
-        Ok(rows) => Json(rows).into_response(),
-        Err(e) => ApiError::conflict(format!("{e:#}")).into_response(),
-    }
+    service::storage::d1_rows(&state, &id, &database_id, &query)
+        .await
+        .map(Json)
 }
 
 pub async fn app_d1_write(
@@ -103,25 +79,17 @@ pub async fn app_d1_write(
     Path((id, database_id)): Path<(String, String)>,
     Json(body): Json<storage::d1::D1WriteBody>,
 ) -> impl IntoResponse {
-    let app = match db::get_app(&state.pool, &id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    };
-    match storage::d1_write(
-        &state.config,
-        &app,
+    service::storage::d1_write(
+        &state,
+        &id,
         &database_id,
-        &body.op,
+        body.op.as_str(),
         &body.table,
         &body.values,
         &body.key,
     )
     .await
-    {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(e) => ApiError::conflict(format!("{e:#}")).into_response(),
-    }
+    .map(|()| Json(json!({ "ok": true })))
 }
 
 pub async fn app_d1_delete_rows(
@@ -129,31 +97,18 @@ pub async fn app_d1_delete_rows(
     Path((id, database_id)): Path<(String, String)>,
     Json(body): Json<storage::d1::D1DeleteRowsBody>,
 ) -> impl IntoResponse {
-    let app = match db::get_app(&state.pool, &id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    };
-    match storage::d1_delete_rows(&state.config, &app, &database_id, &body.table, &body.keys).await
-    {
-        Ok(deleted) => Json(json!({"ok": true, "deleted": deleted})).into_response(),
-        Err(e) => ApiError::conflict(format!("{e:#}")).into_response(),
-    }
+    service::storage::d1_delete_rows(&state, &id, &database_id, &body.table, &body.keys)
+        .await
+        .map(|deleted| Json(json!({ "ok": true, "deleted": deleted })))
 }
 
 pub async fn app_do(
     State(state): State<AppState>,
     Path((id, class_name)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let app = match db::get_app(&state.pool, &id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    };
-    match storage::do_instances(&state.config, &app, &class_name).await {
-        Ok(p) => Json(p).into_response(),
-        Err(e) => ApiError::conflict(format!("{e:#}")).into_response(),
-    }
+    service::storage::do_instances(&state, &id, &class_name)
+        .await
+        .map(Json)
 }
 
 pub async fn app_r2(
@@ -161,25 +116,17 @@ pub async fn app_r2(
     Path((id, bucket)): Path<(String, String)>,
     Query(q): Query<R2ListQuery>,
 ) -> impl IntoResponse {
-    let app = match db::get_app(&state.pool, &id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    };
     let limit = q.limit.unwrap_or(storage::r2::R2_PAGE_LIMIT);
-    match storage::r2_list(
-        &state.config,
-        &app,
+    service::storage::r2_list(
+        &state,
+        &id,
         &bucket,
         q.prefix.as_deref().unwrap_or(""),
         q.cursor.as_deref(),
         limit,
     )
     .await
-    {
-        Ok(p) => Json(p).into_response(),
-        Err(e) => ApiError::conflict(format!("{e:#}")).into_response(),
-    }
+    .map(Json)
 }
 
 pub async fn app_r2_object(
@@ -187,15 +134,9 @@ pub async fn app_r2_object(
     Path((id, bucket)): Path<(String, String)>,
     Query(q): Query<R2ObjectQuery>,
 ) -> impl IntoResponse {
-    let app = match db::get_app(&state.pool, &id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    };
-    match storage::r2_get(&state.config, &app, &bucket, &q.key).await {
-        Ok(p) => Json(p).into_response(),
-        Err(e) => ApiError::conflict(format!("{e:#}")).into_response(),
-    }
+    service::storage::r2_get(&state, &id, &bucket, &q.key)
+        .await
+        .map(Json)
 }
 
 /// Largest upload the runner spools to disk before `celld r2 put`; the UI
@@ -255,10 +196,9 @@ pub async fn app_r2_put(
     Query(q): Query<R2ObjectQuery>,
     request: axum::extract::Request,
 ) -> Response {
-    let app = match db::get_app(&state.pool, &id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
+    let app = match service::apps::app_or_404(&state, &id).await {
+        Ok(app) => app,
+        Err(e) => return e.into_response(),
     };
     if !storage::r2::r2_key_ok(&q.key) {
         return ApiError::bad("invalid key").into_response();
@@ -273,7 +213,7 @@ pub async fn app_r2_put(
             return ApiError::bad("invalid content type").into_response();
         }
     }
-    let dir = cmd::work_root(&state.config).join("r2-upload");
+    let dir = exec::work_root(&state.config).join("r2-upload");
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         return ApiError::internal(format!("{e:#}")).into_response();
     }
@@ -294,7 +234,7 @@ pub async fn app_r2_put(
     let _ = tokio::fs::remove_file(&dest).await;
     match result {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(e) => ApiError::conflict(format!("{e:#}")).into_response(),
+        Err(e) => service::storage::error(e).into_response(),
     }
 }
 
@@ -311,14 +251,9 @@ pub async fn app_r2_raw(
     Path((id, bucket)): Path<(String, String)>,
     Query(q): Query<R2ObjectQuery>,
 ) -> Response {
-    let app = match db::get_app(&state.pool, &id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    };
-    let raw = match storage::r2_raw(&state.config, &app, &bucket, &q.key).await {
-        Ok(b) => b,
-        Err(e) => return ApiError::conflict(format!("{e:#}")).into_response(),
+    let raw = match service::storage::r2_raw(&state, &id, &bucket, &q.key).await {
+        Ok(raw) => raw,
+        Err(e) => return e.into_response(),
     };
     let content_type = raw
         .content_type
@@ -343,13 +278,7 @@ pub async fn app_r2_delete(
     Path((id, bucket)): Path<(String, String)>,
     Query(q): Query<R2ObjectQuery>,
 ) -> impl IntoResponse {
-    let app = match db::get_app(&state.pool, &id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    };
-    match storage::r2_delete_many(&state.config, &app, &bucket, std::slice::from_ref(&q.key)).await {
-        Ok(deleted) => Json(json!({ "ok": true, "deleted": deleted })).into_response(),
-        Err(e) => ApiError::conflict(format!("{e:#}")).into_response(),
-    }
+    service::storage::r2_delete_many(&state, &id, &bucket, std::slice::from_ref(&q.key))
+        .await
+        .map(|deleted| Json(json!({ "ok": true, "deleted": deleted })))
 }

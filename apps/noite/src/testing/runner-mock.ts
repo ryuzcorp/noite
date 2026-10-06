@@ -6,6 +6,7 @@ import { controlEnv } from "../lib/control-env";
 import type { RunnerApp } from "../lib/runner";
 
 export const makeApp = (over: Partial<RunnerApp> = {}): RunnerApp => ({
+  asleepSince: null,
   createdAt: "2026-01-01T00:00:00Z",
   desiredState: "running",
   fleetBucket: "",
@@ -21,6 +22,7 @@ export const makeApp = (over: Partial<RunnerApp> = {}): RunnerApp => ({
   subdomain: "app-one.localhost",
   updatedAt: "2026-01-01T00:00:00Z",
   userId: "u-creator",
+  wokeAt: null,
   ...over,
 });
 

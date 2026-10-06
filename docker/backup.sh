@@ -19,13 +19,10 @@
 # Downtime is the tar time.
 set -eu
 cd "$(dirname "$0")/.."
-
-if [ -f .env ]; then
-  # shellcheck disable=SC1091
-  set -a
-  . ./.env
-  set +a
-fi
+# shellcheck source=docker/lib.sh
+. "$(dirname "$0")/lib.sh"
+load_env
+detect_engine
 
 PORT="${HTTP_PORT:-9080}"
 TOKEN="${RUNNER_TOKEN:-dev-runner-token}"
@@ -38,31 +35,10 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DEST="${1:-backups/${STAMP}}"
 VOLUMES="noite-data rustfs-data"
 
-if command -v docker >/dev/null 2>&1; then
-  ENGINE=docker
-else
-  ENGINE=podman
-fi
-case "${COMPOSE:-}" in
-*"docker compose"*) ENGINE=docker ;;
-*"podman compose"*) ENGINE=podman ;;
-esac
-CE="$ENGINE compose -f docker/compose.yaml"
+CE="$COMPOSE -f docker/compose.yaml"
 
-img_ok() { "$ENGINE" image inspect "$1" >/dev/null 2>&1; }
 # Any image with `tar` will do; prefer the Noite image already on this host.
-HELPER=""
-for candidate in "${NOITE_BACKUP_IMAGE:-}" "${NOITE_IMAGE:-}" noite:local noite-dev:local ghcr.io/ryuzcorp/noite:alpha; do
-  if [ -n "$candidate" ] && img_ok "$candidate"; then
-    HELPER="$candidate"
-    break
-  fi
-done
-if [ -z "$HELPER" ]; then
-  echo "error: no image available to tar the volumes with."
-  echo "  run 'make up' first, or set NOITE_BACKUP_IMAGE=<image with tar>."
-  exit 1
-fi
+pick_tar_image tar "run 'make up' first, or set NOITE_BACKUP_IMAGE=<image with tar>."
 
 case "$DEST" in
 /*) DEST_DIR="$DEST" ;;

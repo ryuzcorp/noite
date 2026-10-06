@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 
-use crate::host::cmd;
+use crate::host::exec;
 use crate::host::git_http::{after_receive, ensure_bare, list_refs};
 use crate::models::App;
 use crate::AppState;
@@ -80,7 +80,7 @@ pub async fn web_commit(
     let index_str = index.to_string_lossy().to_string();
     let env_index = [("GIT_INDEX_FILE", index_str.as_str())];
     let result = async {
-        cmd::run_cmd(
+        exec::run_cmd(
             "git",
             &[git_dir.as_str(), "read-tree", parent.as_str()],
             None,
@@ -91,7 +91,7 @@ pub async fn web_commit(
         for f in files {
             // Existing mode wins (executable bit survives); new files 644.
             // `:(literal)` keeps glob chars in names from acting as pathspec.
-            let listing = cmd::run_cmd(
+            let listing = exec::run_cmd(
                 "git",
                 &[
                     git_dir.as_str(),
@@ -107,7 +107,7 @@ pub async fn web_commit(
             .await
             .unwrap_or_default();
             let mode = listing.split_whitespace().next().unwrap_or("100644");
-            let blob = cmd::run_cmd_stdin(
+            let blob = exec::run_cmd_stdin(
                 "git",
                 &[git_dir.as_str(), "hash-object", "-w", "--stdin"],
                 f.content.as_bytes(),
@@ -116,7 +116,7 @@ pub async fn web_commit(
             )
             .await?;
             let sha = String::from_utf8(blob)?.trim().to_string();
-            cmd::run_cmd(
+            exec::run_cmd(
                 "git",
                 &[
                     git_dir.as_str(),
@@ -131,7 +131,7 @@ pub async fn web_commit(
             )
             .await?;
         }
-        let tree = cmd::run_cmd(
+        let tree = exec::run_cmd(
             "git",
             &[git_dir.as_str(), "write-tree"],
             None,
@@ -139,7 +139,7 @@ pub async fn web_commit(
             Duration::from_secs(30),
         )
         .await?;
-        let commit = cmd::run_cmd(
+        let commit = exec::run_cmd(
             "git",
             &[
                 git_dir.as_str(),
@@ -163,7 +163,7 @@ pub async fn web_commit(
         let sha = commit.trim().to_string();
         // CAS: a push that landed after our rev-parse fails here instead
         // of interleaving — the UI retries on a fresh tip.
-        cmd::run_cmd(
+        exec::run_cmd(
             "git",
             &[
                 git_dir.as_str(),

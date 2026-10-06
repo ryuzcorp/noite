@@ -12,10 +12,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`RUNNER_BUILD_UID` and `RUNNER_BUILD_GID` are removed** and ignored if still set: delete them from your environment. Builds and release commands now run as one uid per app from a reserved range, `RUNNER_BUILD_UID_BASE` (default `10030`) and `RUNNER_BUILD_UID_RANGE` (default `1024`). The image pre-creates the default range in `/etc/passwd`; a custom range needs matching `/etc/passwd` and `/etc/group` entries, must stay below 65534 and must not contain `RUNNER_FLEET_UID` (10020).
 - **Expect a one-time telemetry replay after the upgrade.** The runner re-reads the stored telemetry for the whole retention window (`RUNNER_TELEMETRY_RETENTION_DAYS`, 30 by default) for every app, to recover the rows the pre-alpha.2 ingest bug skipped. It runs in the background with no downtime; the cost is extra bucket reads and DuckDB CPU in proportion to window × apps. The runner logs `telemetry replay started` and `telemetry replay complete`. Telemetry older than retention was already pruned and cannot be recovered.
-- Both databases upgrade themselves: the runner SQLite goes to schema version 4, the control D1 to 1.4.0. As before, an older image refuses newer data, so back up before upgrading.
+- Both databases upgrade themselves: the runner SQLite goes to schema version 5, the control D1 to 1.4.0. As before, an older image refuses newer data, so back up before upgrading.
+- **This release adds anonymous instance telemetry, and it is on by default.** Once a day the instance sends one count-only heartbeat: the version, platform, storage kind, numbers of apps, deploys and users (users bucketed), install age and uptime. It is keyed by a random install id; no domains, names, emails or IPs are sent, and nothing at all is sent from a local domain. To turn it off, untick it in the Admin section of `/account`, or set `NOITE_TELEMETRY=0` (or `DO_NOT_TRACK=1`) in `.env`, which also locks the checkbox. The full list of fields is on [Telemetry](https://noite.now/self-hosting/telemetry).
+- **A malformed `RUNNER_TELEMETRY_RETENTION_DAYS` now stops the runner at boot** with a config error. Before, it silently fell back to 14 days, though the documented default is 30. Unset still means 30.
+- **Runner REST API callers:** status codes and one response changed; see Changed. Scripts that matched on 409 for storage or source errors, sent extra fields to `PATCH /v1/apps/{id}`, or read `remote` from the git-remote response need updating.
 
 ### Added
 
+- Anonymous instance telemetry. The runner sends PostHog EU one `instance_heartbeat` event a day: no SDK, GeoIP lookup disabled, no person profiles. An Admin section on `/account`, shown to instance admins only and never while impersonating, turns it on or off and shows the exact payload. The runner API has `GET`/`PUT /v1/admin/telemetry` and RPC `telemetry.get`/`telemetry.set`. The installer prints a notice and accepts `NOITE_TELEMETRY`. Dev and e2e stacks never report.
 - New login page: a product panel ("Push code. Get a URL.", three benefits, a deploy preview) next to a clean sign-in form, in light and dark, with a mobile layout. Sign in is the default tab; a fresh instance opens on "Set up Noite" and says the first account becomes the admin. Lost-passkey recovery is a separate view.
 - First-run onboarding: a three-step tour after sign-in (push to deploy, one API key for Git and the CLI, stay in the loop: GitHub releases, Discord, GitHub Sponsors). Story-style progress bars, Back from the second step, arrow keys to move between steps, and a bottom sheet on mobile. The tour never navigates away: steps 1 and 2 spotlight the sidebar's Apps item and your avatar instead (skipped on mobile, where the sidebar is hidden). "Get started", × or Esc ends it for good. Accounts created before this release see it once.
 - Admin home: `/apps` lists the control plane ("Noite · admin") for instance admins, and its page holds every admin tool: Overview, Metrics, Errors, Logs, Users, Apps and Invites tabs. Users, Apps and Invites are the panels god mode used, with the same actions and URL-kept searches. `/god-mode` and the account menu's "God Mode" item are removed. The whole page, and every admin action behind it, is refused while impersonating.
@@ -57,9 +61,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - **Database setup:** the once-per-isolate setup pass uses oxidejs `isolateOnce` (15 s timeout, 5 s wait) instead of a hand-written promise cache. On the release image it ran once per isolate, 3 passes across about 340 requests.
 - Releases go through a pre-release. A `v*` tag publishes the version image and a GitHub pre-release with its CHANGELOG notes, but no longer moves `alpha` or `stable`. `curl -fsSL https://noite.now/run.sh | bash -s install --pre` installs the newest release, pre-releases included, pinned to its version. Marking the pre-release as a full release points `alpha` (and `stable` for a final version) at the same image, so plain installs and upgrades pick it up.
 - Docs: the measured upgrade window replaces "about a minute for many apps".
+- Runner API status codes. Storage and source failures used to answer 409 Conflict whatever went wrong. Now a missing object, table, deployed source or Git mirror is 404, an invalid path is 400, and an internal failure is 500. 409 is kept for real conflicts: a taken slug or hostname, a deploy in flight, or a web commit that lost the race against a push. RPC `events.*` returns 500 for a database error instead of 404.
+- `PATCH /v1/apps/{id}` rejects unknown keys with 422, as RPC `apps.patch` already did, instead of ignoring them.
+- The git-remote response (`GET /v1/apps/{id}/git-remote`, RPC `git.remote`) returns the URL once, as `url`. The duplicate `remote` field is gone.
+- `/profile` is removed. Use `/account`.
+- Invite codes on the account page and in the admin Invites tab stay visible, with a Copy button next to them. Before, the code itself switched to "copied" when clicked. Every copy button in the UI now behaves the same way.
+- Codebase reorganization, no behavior change beyond the entries above:
+  - **Runner API:** one service layer (`src/service/`) now implements both the REST and RPC APIs, replacing two copies that had drifted apart. New handler tests check that both give the same results.
+  - **Large files split:** in the runner, `db.rs`, `host/metrics.rs`, `host/cmd.rs` and `main.rs`; in the control UI, the action modules, HTTP routes and the largest panels. The control UI's server-only code now lives in `lib/server/`.
+  - **Generated types:** the runner's API types are generated for the UI, and CI fails when they are out of date.
+  - **CI:** pull requests and release tags run the same reusable check workflow. Release tags were skipping the shell-script and schema checks.
+  - **Docs:** the roadmap and design history moved from `SPEC.md` to `ROADMAP.md`.
 
 ### Fixed
 
+- Deleting an app over RPC (what the control UI does) did not revoke its stored credentials; only the REST route did. Both now share one code path.
 - Two builds running at once could read each other's worktree and build cache, because both ran as uid 10010.
 - Rows skipped by the pre-alpha.2 ingest bug are recovered within retention by the one-time replay.
 - A failed or partial telemetry pass no longer advances the watermark, one app's failing telemetry no longer stalls every other app, and compaction can no longer double count an hour whose source delete was interrupted.

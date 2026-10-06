@@ -1,17 +1,15 @@
-//! Grouped errors as a live SSE stream (the unary reads stay on JSON-RPC).
+//! Grouped errors as a live SSE stream (the unary reads live in
+//! `service::errors`, served by JSON-RPC and the REST list if one is added).
 use std::time::Duration;
 
 use axum::{
     extract::{Path, Query, State},
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse,
-    },
+    response::{IntoResponse, Response},
 };
-use tokio_stream::wrappers::ReceiverStream;
 
-use crate::api::rpc::{error_list, ERROR_STATUSES};
-use crate::error::ApiError;
+use crate::api::sse::poll_stream;
+use crate::api_error::ApiError;
+use crate::service;
 use crate::AppState;
 
 #[derive(serde::Deserialize)]
@@ -26,44 +24,25 @@ pub async fn list_errors_stream(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<ErrorsStreamQuery>,
-) -> impl IntoResponse {
+) -> Response {
     let status = q.status.unwrap_or_else(|| "open".into());
-    if !ERROR_STATUSES.contains(&status.as_str()) {
+    if !service::errors::ERROR_STATUSES.contains(&status.as_str()) {
         return ApiError::bad("status must be open, resolved or ignored").into_response();
     }
-    let app_id = match crate::api::observe::telemetry_target_or_404(&state.pool, &id).await {
+    let app_id = match service::observe::telemetry_target_or_404(&state.pool, &id).await {
         Ok((app_id, _)) => app_id,
         Err(e) => return e.into_response(),
     };
     let pool = state.pool.clone();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, anyhow::Error>>(16);
-    crate::host::stats::sse_enter("errors");
-    tokio::spawn(async move {
-        let mut last: Option<String> = None;
-        loop {
-            if let Ok(list) = error_list(&pool, &app_id, &status).await {
-                let data = list.to_string();
-                if last.as_ref() != Some(&data) {
-                    if tx
-                        .send(Ok(Event::default().data(data.clone())))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    last = Some(data);
-                }
-            }
-            // Transient DB errors retry on the next tick. Stop promptly when
-            // the client leaves (T1.2), like the deploys stream.
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(2)) => {}
-                () = tx.closed() => break,
-            }
+    poll_stream("errors", Duration::from_secs(2), move || {
+        let pool = pool.clone();
+        let app_id = app_id.clone();
+        let status = status.clone();
+        async move {
+            service::errors::list(&pool, &app_id, &status)
+                .await
+                .ok()
+                .and_then(|list| serde_json::to_string(&list).ok())
         }
-        crate::host::stats::sse_exit("errors");
-    });
-    Sse::new(ReceiverStream::new(rx))
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    })
 }

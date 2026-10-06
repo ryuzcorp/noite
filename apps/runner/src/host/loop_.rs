@@ -12,7 +12,7 @@ use sqlx::SqlitePool;
 use crate::config::Config;
 use crate::db;
 use crate::host::caddy;
-use crate::host::cmd::{self, TipBundle};
+use crate::host::tips::{self, TipBundle};
 use crate::host::deploy::{self, Deploying};
 use crate::host::logs::LogState;
 use crate::host::metrics::{self, MetricsState};
@@ -176,7 +176,7 @@ async fn reconcile_once(
             continue;
         }
 
-        match cmd::head_main_bundle(cfg, &app.slug).await {
+        match tips::head_main_bundle(cfg, &app.slug).await {
             Ok(Some(tip)) => {
                 let already = app
                     .last_deploy_sha

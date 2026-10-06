@@ -10,11 +10,11 @@ import { atom } from "ilha";
 import type { View } from "ilha";
 
 import { errorMessage } from "../../errors";
-import { Refresh, Search } from "../../icons";
 import { doPreview } from "../../resources";
 import type { DoPreview } from "../../runner";
+import { CopyButton } from "../../ui/copy-button";
+import { Refresh, Search } from "../../ui/icons";
 import {
-  CopyButton,
   DetailPanel,
   EmptyState,
   prettyJson,

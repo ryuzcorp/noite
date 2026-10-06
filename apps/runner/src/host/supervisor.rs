@@ -161,7 +161,7 @@ pub async fn ensure_fleet(
     // cells.
     #[cfg(unix)]
     if let Some(uid) = cfg.fleet_uid {
-        if !crate::host::cmd::lchown_tree(
+        if !crate::host::exec::lchown_tree(
             std::path::Path::new(&state_dir),
             uid,
             cfg.fleet_gid.unwrap_or(uid),

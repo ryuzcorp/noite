@@ -1,5 +1,5 @@
-import { CloudUpload, Key, List } from "$lib/icons";
-import { LoginPanel } from "$lib/login-panel";
+import { LoginPanel } from "$lib/auth/login-panel";
+import { CloudUpload, Key, List } from "$lib/ui/icons";
 import { head } from "@ilha/router";
 
 const FEATURES = [

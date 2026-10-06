@@ -4,14 +4,14 @@
 
 import { atom } from "ilha";
 
+import type { D1TableCaps, D1TableInfo } from "../../runner";
 import {
   ArrowLeft,
   Database,
   Lock,
   Search,
   Table as TableIcon,
-} from "../../icons";
-import type { D1TableCaps, D1TableInfo } from "../../runner";
+} from "../../ui/icons";
 
 /** A table the caller cannot write at all (every capability false). */
 const isReadOnly = (caps: D1TableCaps | undefined): boolean =>

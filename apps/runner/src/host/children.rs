@@ -14,6 +14,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Notify;
 
+use crate::config::Config;
 use crate::host::logs::{self, LogState};
 
 /// Restart backoff bounds; a child that ran this long counts as healthy and
@@ -178,4 +179,28 @@ pub async fn ensure_bootstrap_caddyfile(path: &str) -> anyhow::Result<()> {
         tokio::fs::write(path, ":80 {\n\trespond \"noite edge starting\" 200\n}\n").await?;
     }
     Ok(())
+}
+
+/// Caddy: admin on its default 127.0.0.1:2019, where the runner
+/// POSTs each new config (`host::caddy::load_admin`); `--watch` on the same
+/// file stays as the fallback path.
+pub fn supervise_caddy(config: &Config) -> Supervised {
+    let caddyfile = config.caddyfile_path.clone();
+    Supervised::start("caddy", move || {
+        let mut cmd = tokio::process::Command::new("caddy");
+        cmd.args([
+            "run",
+            "--config",
+            &caddyfile,
+            "--adapter",
+            "caddyfile",
+            "--watch",
+        ])
+        // Certificates and ACME state in the volume, not in the
+        // container's $HOME: a recreate must not re-issue every cert
+        // (CA rate limits) or lose the on-demand ones.
+        .env("XDG_DATA_HOME", "/data/caddy/data")
+        .env("XDG_CONFIG_HOME", "/data/caddy/config");
+        cmd
+    })
 }

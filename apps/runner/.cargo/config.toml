@@ -1,0 +1,8 @@
+# Bindings exported by the `#[ts(export)]` derives land in the UI tree, so
+# `cargo test` regenerates `apps/noite/src/lib/runner-types` in place. `relative`
+# resolves against this file's parent (apps/runner/.cargo), hence the walk out.
+# `TS_RS_LARGE_INT = "number"` keeps i64/u64 as TypeScript `number` (the UI
+# has always treated them as numbers; `bigint` would be a runtime change).
+[env]
+TS_RS_EXPORT_DIR = { value = "../noite/src/lib/runner-types", relative = true }
+TS_RS_LARGE_INT = "number"

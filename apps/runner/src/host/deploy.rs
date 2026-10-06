@@ -8,7 +8,9 @@ use tokio::sync::Mutex;
 use crate::config::{Config, Tenancy};
 use crate::db;
 use crate::host::build_output;
-use crate::host::cmd::{self, Sandbox, TipBundle};
+use crate::host::exec::{self, Sandbox};
+use crate::host::s3;
+use crate::host::tips::TipBundle;
 use crate::host::credentials;
 use crate::host::generated_config;
 use crate::host::logs::LogState;
@@ -93,7 +95,7 @@ pub async fn deploy_app(
     }
     // T5.1: the build just populated the persistent cache; prune it back to
     // the cap now, on success and on failure alike.
-    cmd::prune_build_cache(&cmd::build_cache_dir(cfg, &app.slug), cfg.build_cache_mb);
+    exec::prune_build_cache(&exec::build_cache_dir(cfg, &app.slug), cfg.build_cache_mb);
     release(deploying, &app.id).await;
 }
 
@@ -232,7 +234,7 @@ async fn deploy_inner(
         return Ok(());
     }
 
-    let root = cmd::work_root(cfg);
+    let root = exec::work_root(cfg);
     let work = root.join("builds").join(&app.slug).join(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -267,11 +269,11 @@ async fn deploy_inner(
     // reads) already has this sha on a warm app — fetch from it instead of
     // re-downloading the full bundle from S3. The mirror only ever gains the
     // shas deploys fetched, so `cat-file -e` is the whole check.
-    let bare = cmd::work_root(cfg)
+    let bare = exec::work_root(cfg)
         .join("repos")
         .join(format!("{}.git", app.slug));
     let mirror_warm = bare.join("HEAD").exists()
-        && cmd::run_cmd(
+        && exec::run_cmd(
             "git",
             &[
                 &format!("--git-dir={}", bare.display()),
@@ -300,7 +302,7 @@ async fn deploy_inner(
         bare.clone()
     } else {
         let uri = cfg.s3_uri(object_key);
-        cmd::s3_cp_download(cfg, &uri, &bundle_path).await?;
+        s3::s3_cp_download(cfg, &uri, &bundle_path).await?;
         let bytes = tokio::fs::metadata(&bundle_path).await?.len();
         progress
             .log(
@@ -335,9 +337,9 @@ async fn deploy_inner(
     // apps never share an identity, so neither can read the other's worktree
     // or cache. gid mirrors the uid (a group per app).
     let build_uid =
-        db::ensure_app_build_uid(pool, cfg.build_uid_base, cfg.build_uid_range, &app.id).await?;
+        db::alloc::ensure_app_build_uid(pool, cfg.build_uid_base, cfg.build_uid_range, &app.id).await?;
     let sandbox_ok = match build_uid {
-        Some(u) => cmd::can_drop_uid(u, u),
+        Some(u) => exec::can_drop_uid(u, u),
         None => false,
     };
     if multi && build_uid.is_none() {
@@ -376,15 +378,15 @@ async fn deploy_inner(
     // Hand the worktree to the app's build uid before tenant scripts run;
     // 0700 (the runner's umask) means no other app's uid can read into it.
     if let Some(uid) = sandbox_id {
-        if !cmd::lchown_tree(&work, uid, uid) {
+        if !exec::lchown_tree(&work, uid, uid) {
             tracing::warn!(slug = %app.slug, "chown worktree to build uid failed; continuing (needs CAP_CHOWN)");
         }
     }
     // T5.1: persistent per-app build cache (bun, jup's package managers, and
-    // HOME for npm/pnpm/Yarn; cmd::base_env). Created root-owned (umask 077,
+    // HOME for npm/pnpm/Yarn; exec::base_env). Created root-owned (umask 077,
     // so the fleet uid can never read it) and handed to the build uid exactly
     // like the worktree. It outlives the per-deploy worktree wiped below.
-    let cache = cmd::build_cache_dir(cfg, &app.slug);
+    let cache = exec::build_cache_dir(cfg, &app.slug);
     tokio::fs::create_dir_all(&cache).await?;
     #[cfg(unix)]
     if let Some(parent) = cache.parent() {
@@ -392,7 +394,7 @@ async fn deploy_inner(
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
     }
     if let Some(uid) = sandbox_id {
-        if !cmd::lchown_tree(&cache, uid, uid) {
+        if !exec::lchown_tree(&cache, uid, uid) {
             tracing::warn!(slug = %app.slug, "chown build cache to build uid failed; continuing (needs CAP_CHOWN)");
         }
     }
@@ -403,7 +405,7 @@ async fn deploy_inner(
         cache: Some(&cache),
     };
 
-    cmd::check_work_quota(&work, cfg.build_max_mb)?;
+    exec::check_work_quota(&work, cfg.build_max_mb)?;
     let step_timeout = Duration::from_secs(cfg.build_timeout_s);
     let wrangler_build = wrangler_build(&src_dir).await?;
     if let Some(pm) = &manager {
@@ -415,9 +417,9 @@ async fn deploy_inner(
                 &format!("{} install ({})", pm.name, pm.reason),
             )
             .await?;
-        let out = cmd::run_sandboxed(program, &args, &src_dir, &sb, step_timeout).await?;
+        let out = exec::run_sandboxed(program, &args, &src_dir, &sb, step_timeout).await?;
         progress.output(&out).await?;
-        cmd::check_work_quota(&work, cfg.build_max_mb)?;
+        exec::check_work_quota(&work, cfg.build_max_mb)?;
     }
     // Wrangler's own custom build (`build.command`, run from `build.cwd`)
     // wins over the package `build` script, as it does for `wrangler deploy`.
@@ -428,7 +430,7 @@ async fn deploy_inner(
             .await?;
         let cwd = src_dir.join(&build.cwd);
         let out =
-            cmd::run_sandboxed("sh", &["-c", &build.command], &cwd, &sb, step_timeout).await?;
+            exec::run_sandboxed("sh", &["-c", &build.command], &cwd, &sb, step_timeout).await?;
         progress.output(&out).await?;
         built = true;
     } else if let Some(pm) = manager
@@ -443,12 +445,12 @@ async fn deploy_inner(
                 &format!("{} run build", pm.name),
             )
             .await?;
-        let out = cmd::run_sandboxed(program, &args, &src_dir, &sb, step_timeout).await?;
+        let out = exec::run_sandboxed(program, &args, &src_dir, &sb, step_timeout).await?;
         progress.output(&out).await?;
         built = true;
     }
     if built {
-        cmd::check_work_quota(&work, cfg.build_max_mb)?;
+        exec::check_work_quota(&work, cfg.build_max_mb)?;
     }
 
     // `cf` CLI apps declare the Worker in cloudflare.config.ts; generate the
@@ -463,7 +465,7 @@ async fn deploy_inner(
                 &format!("{CF_CONFIG} → wrangler.json"),
             )
             .await?;
-        cmd::run_sandboxed(
+        exec::run_sandboxed(
             "node",
             &["--input-type=module", "-e", CF_CONFIG_CONVERTER, CF_CONFIG],
             &src_dir,
@@ -573,7 +575,7 @@ async fn deploy_inner(
                 env: &cmd_env,
                 cache: sb.cache,
             };
-            let out = cmd::run_sandboxed(
+            let out = exec::run_sandboxed(
                 "sh",
                 &["-c", &release],
                 &src_dir,
@@ -591,7 +593,7 @@ async fn deploy_inner(
     if sb.uid.is_some() {
         // SAFETY: geteuid/getegid cannot fail.
         let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        if !cmd::lchown_tree(&work, uid, gid) {
+        if !exec::lchown_tree(&work, uid, gid) {
             anyhow::bail!(
                 "could not take the worktree back from the build uid; refusing to deploy it"
             );
@@ -620,10 +622,10 @@ async fn deploy_inner(
         )
         .await?;
 
-    let env_owned = cmd::aws_env(cfg);
+    let env_owned = s3::aws_env(cfg);
     let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     env.push(("S3_ENDPOINT", cfg.s3_endpoint.as_str()));
-    cmd::run_cmd(
+    exec::run_cmd(
         &cfg.celld_bin,
         &[
             "deploy",
@@ -673,14 +675,14 @@ async fn materialize_bundle(
     bundle_path: &Path,
     sha: &str,
 ) -> anyhow::Result<PathBuf> {
-    let bare = cmd::work_root(cfg)
+    let bare = exec::work_root(cfg)
         .join("repos")
         .join(format!("{}.git", app.slug));
     let src_dir = work.join("src");
     tokio::fs::create_dir_all(&bare).await?;
     tokio::fs::create_dir_all(&src_dir).await?;
     if !tokio::fs::try_exists(bare.join("HEAD")).await? {
-        cmd::run_cmd(
+        exec::run_cmd(
             "git",
             &["init", "--bare", bare.to_str().unwrap()],
             Some(work),
@@ -690,7 +692,7 @@ async fn materialize_bundle(
         .await?;
     }
     let refspec = format!("+{sha}:refs/heads/main");
-    cmd::run_cmd(
+    exec::run_cmd(
         "git",
         &[
             &format!("--git-dir={}", bare.display()),
@@ -705,7 +707,7 @@ async fn materialize_bundle(
     .await?;
     let _ = tokio::fs::remove_dir_all(&src_dir).await;
     tokio::fs::create_dir_all(&src_dir).await?;
-    cmd::run_cmd(
+    exec::run_cmd(
         "git",
         &[
             &format!("--git-dir={}", bare.display()),

@@ -1,6 +1,7 @@
-# Pull-request gate: lint, formatting, version-pin drift, every compose variant
-# renders, the Rust crate builds warning-free with its tests, and the worker
-# bundle builds for celld. Release images are a separate workflow (`images.yml`).
+# Pull-request gate: the shared checks below (`check.yml`: lint, formatting,
+# version-pin drift, every compose variant, script parsing, schema idempotency,
+# the CLI bundle), the Rust crate warning-free with its tests, and the worker
+# bundle for celld. Release images are a separate workflow (`images.yml`).
 #
 # The end-to-end lanes (`make e2e`, `make e2e-isolation`) need a container
 # engine plus a few minutes, so they are not a pull-request job: run them from
@@ -21,42 +22,7 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-      - run: bun install
-      - name: lint and format
-        run: bun run check
-      - name: version pins
-        run: bun docker/check-versions.ts
-      # `config` needs no daemon, so a broken compose file fails here instead of
-      # on someone's server. Every variant, including the test overlays.
-      - name: render compose (prod, build, dev, e2e)
-        run: |
-          docker compose -f docker/compose.yaml config > /dev/null
-          docker compose -f docker/compose.yaml -f docker/compose.build.yaml config > /dev/null
-          docker compose -f docker/compose.yaml -f docker/compose.dev.yaml config > /dev/null
-          docker compose -f docker/compose.yaml -f docker/compose.e2e.yaml config > /dev/null
-      # Parse each script with its shebang's shell: `sh` is dash here, and
-      # install.sh/uninstall.sh are bash.
-      - name: shell scripts parse
-        run: |
-          for f in docker/*.sh; do
-            case "$(head -n1 "$f")" in
-            *bash*) bash -n "$f" ;;
-            *) sh -n "$f" ;;
-            esac
-          done
-      # Main-database tables only: app_metric, metric_watermark and the rest of
-      # the telemetry live in metrics.sqlite (`db::METRICS_SCHEMA`).
-      - name: runner schema applies twice (idempotent)
-        run: |
-          sqlite3 /tmp/schema.db < apps/runner/schema.sql
-          sqlite3 /tmp/schema.db < apps/runner/schema.sql
-          for t in app app_credential app_domain app_env app_limit deploy; do
-            sqlite3 /tmp/schema.db "SELECT name FROM sqlite_master WHERE type='table' AND name='$t'" | grep -qx "$t"
-          done
+    uses: ./.github/workflows/check.yml
 
   rust:
     runs-on: ubuntu-latest

@@ -2,15 +2,16 @@
 //! (identity, status, actions) and the Overview tab's cards.
 import { atom, watch } from "ilha";
 
-import { appHost, appUrl, initials, presenceTone } from "../apps";
-import { setDesired } from "../apps.server";
+import { appHost, appUrl, presenceTone } from "../apps/identity";
 import { errorMessage } from "../errors";
-import { ArrowLeft, ArrowUpRight, Code, Pause, Play } from "../icons";
 import { appDetail } from "../resources";
 import type { AppRole } from "../roles";
-import { AppHeaderSkeleton } from "../skeletons";
+import { setDesired } from "../server/apps.server";
 import { sleep } from "../sleep";
 import { AppStorageList } from "../storage/list";
+import { Avatar } from "../ui/avatar";
+import { ArrowLeft, ArrowUpRight, Code, Pause, Play } from "../ui/icons";
+import { AppHeaderSkeleton } from "../ui/skeletons";
 import { DeployDropdown } from "./deploys";
 import { ErrorsSummary } from "./errors";
 import { MetricsCard } from "./metrics";
@@ -164,11 +165,7 @@ export const AppHeader = ({ appId }: { appId: string }) => {
       <BackToApps />
       <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
         <div class="flex min-w-0 items-center gap-3">
-          <div class="avatar avatar-placeholder shrink-0">
-            <div class="bg-neutral text-neutral-content w-11 rounded-full">
-              <span>{initials(app.name)}</span>
-            </div>
-          </div>
+          <Avatar class="shrink-0" label={app.name} size="lg" />
           <div class="min-w-0">
             <h1 class="m-0 truncate text-xl font-semibold">{app.name}</h1>
             <IdentityLine app={app} />

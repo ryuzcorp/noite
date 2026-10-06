@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::db;
-use crate::host::{cmd, source};
+use crate::host::{exec, s3, source, tips};
 use sqlx::SqlitePool;
 
 /// Ensure `repos/{slug}.git` exists with at least the tip commit.
@@ -20,14 +20,14 @@ pub async fn ensure_deploy_mirror(cfg: &Config, slug: &str) -> anyhow::Result<bo
     if bare.join("HEAD").exists() {
         return Ok(false);
     }
-    let Some(tip) = cmd::head_main_bundle(cfg, slug).await? else {
+    let Some(tip) = tips::head_main_bundle(cfg, slug).await? else {
         return Ok(false);
     };
-    let root = cmd::work_root(cfg);
+    let root = exec::work_root(cfg);
     tokio::fs::create_dir_all(&bare).await.ok();
     tokio::fs::create_dir_all(&root).await.ok();
     if !bare.join("HEAD").exists() {
-        cmd::run_cmd(
+        exec::run_cmd(
             "git",
             &["init", "--bare", bare.to_str().unwrap()],
             Some(&root),
@@ -40,12 +40,12 @@ pub async fn ensure_deploy_mirror(cfg: &Config, slug: &str) -> anyhow::Result<bo
     // it into the bare mirror (same refspec the deploy pipeline uses).
     let tmp = root.join(format!(".rehydrate-{slug}-{}.bundle", tip.sha));
     let uri = cfg.s3_uri(&tip.key);
-    if let Err(e) = cmd::s3_cp_download(cfg, &uri, &tmp).await {
+    if let Err(e) = s3::s3_cp_download(cfg, &uri, &tmp).await {
         let _ = tokio::fs::remove_file(&tmp).await;
         anyhow::bail!("download tip bundle for {slug} failed: {e:#}");
     }
     let refspec = format!("+{}:refs/heads/main", tip.sha);
-    let fetched = cmd::run_cmd(
+    let fetched = exec::run_cmd(
         "git",
         &[
             &format!("--git-dir={}", bare.display()),

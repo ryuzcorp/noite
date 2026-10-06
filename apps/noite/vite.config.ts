@@ -9,6 +9,7 @@ import { defineConfig } from "vite";
 import type { Plugin } from "vite";
 
 import { controlEnv, hydrateControlEnv } from "./src/lib/control-env.ts";
+import { CURATED_SHIKI_LANGS } from "./src/lib/shiki-langs.ts";
 
 hydrateControlEnv();
 
@@ -25,25 +26,6 @@ const controlBuild = (): string => {
   } catch {
     return new Date().toISOString();
   }
-};
-
-/** Resource opt T6.1: the shiki ids the source browser can request
- * (mirrors CURATED_LANGS in src/lib/source-browser.tsx; `text` is
- * built into shiki and never imported as a module). */
-const CURATED_SHIKI_LANGS = {
-  css: true,
-  html: true,
-  javascript: true,
-  json: true,
-  jsonc: true,
-  jsx: true,
-  markdown: true,
-  sql: true,
-  toml: true,
-  tsx: true,
-  typescript: true,
-  yaml: true,
-  zsh: true,
 };
 
 /** Only the curated shiki grammars ship. @pierre/diffs resolves every other
@@ -65,7 +47,7 @@ const curatedShikiLangs = (): Plugin => ({
       return null;
     }
     const lang = source.slice("@shikijs/langs/".length);
-    if (Object.hasOwn(CURATED_SHIKI_LANGS, lang)) {
+    if (CURATED_SHIKI_LANGS.includes(lang)) {
       return null;
     }
     // One shared id: every excluded grammar resolves to the same empty

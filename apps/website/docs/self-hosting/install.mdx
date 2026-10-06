@@ -25,6 +25,7 @@ Re-running the script is the upgrade: it refreshes `compose.yaml`, keeps `.env` 
 | `NOITE_VERSION` | `alpha` | release channel or version; see [Releases and channels](/self-hosting/operations#releases-and-channels) |
 | `NOITE_ADMIN_EMAIL` | none | account promoted to admin at boot |
 | `NOITE_EMAIL_WEBHOOK_URL` | none | receives lost-passkey sign-in codes; without it, [recover from the server](/self-hosting/accounts#lost-passkey) |
+| `NOITE_TELEMETRY` | unset = on | `0`, `false` or `off` turns off the anonymous daily heartbeat; written to `.env` ([Telemetry](/self-hosting/telemetry)) |
 | `NOITE_DIR` | `/opt/noite` | install directory |
 | `NOITE_REF` | `main` | git ref the installer and `compose.yaml` are fetched from |
 | `NOITE_YES` | none | `1` = skip the upgrade confirmation (same as `--yes`; `NOITE_CONFIRM=1` works too) |

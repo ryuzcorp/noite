@@ -4,12 +4,7 @@
     "jsx": "react-jsx",
     "jsxImportSource": "ilha",
     "paths": {
-      "$lib/*": ["./src/lib/*"],
-      "oxidejs": ["../../packages/oxidejs/dist/index.d.mts"],
-      "oxidejs/client": ["../../packages/oxidejs/client.d.ts"],
-      "oxidejs/virtual": ["../../packages/oxidejs/virtual.d.ts"],
-      "oxidejs/vite": ["../../packages/oxidejs/dist/vite.d.mts"],
-      "oxidejs/wrangler": ["../../packages/oxidejs/dist/wrangler.d.mts"]
+      "$lib/*": ["./src/lib/*"]
     },
     "types": ["vite/client", "oxidejs/client", "oxidejs/virtual"],
     "strictNullChecks": true

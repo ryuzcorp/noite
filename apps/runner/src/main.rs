@@ -9,25 +9,19 @@ mod api;
 mod auth;
 mod config;
 mod db;
-mod error;
+mod api_error;
 mod host;
 mod lifecycle;
 mod models;
 mod recover;
 mod schema_version;
+mod service;
 mod telemetry;
 
 use std::collections::HashSet;
 use std::sync::{atomic::AtomicBool, Arc};
 
-use axum::{
-    middleware,
-    routing::{delete, get, post},
-    Router,
-};
 use sqlx::SqlitePool;
-use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
 use crate::host::logs::LogState;
@@ -59,6 +53,8 @@ pub struct AppState {
     pub state_sync: host::state::StateSync,
     /// Bucket reachability probe (cached 5 s) for /ready.
     pub bucket_ok: Arc<tokio::sync::RwLock<(bool, String, std::time::Instant)>>,
+    /// Process start (whole hours of uptime go into the instance heartbeat).
+    pub started_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[tokio::main]
@@ -90,6 +86,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Wall clock for the boot-phase log lines below (fleet start vs control UI).
     let boot = std::time::Instant::now();
+    // Process start, for the instance heartbeat's whole-hours uptime.
+    let started_at = chrono::Utc::now();
 
     // Signal handling before anything is spawned or uploaded: Caddy, the
     // control fleet and every tenant fleet below are children of this process,
@@ -129,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
         shutdown_signal.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 
-    host::cmd::ensure_buckets(&config).await?;
+    host::s3::ensure_buckets(&config).await?;
 
     // Boot: restore SQLite snapshot when the volume is empty (SPEC, Runner state). A
     // failure other than "no snapshot" stops the boot: starting empty would
@@ -146,6 +144,14 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(0);
     if swept > 0 {
         tracing::info!(swept, "swept stalled deploys on boot");
+    }
+
+    // Install identity for the instance heartbeat: created on first boot and
+    // snapshotted with the database, so a container recreation keeps the same
+    // install id. A failure here is not fatal — the status API retries it.
+    match db::ensure_identity(&pool).await {
+        Ok((install_id, _)) => tracing::debug!(install_id = %install_id, "instance identity"),
+        Err(e) => tracing::warn!(error = %e, "could not read the instance identity"),
     }
 
     // Isolation: nft egress policy first, then self-checks (SPEC, Egress policy + Tenancy mode).
@@ -191,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
              visitors, so per-visitor rate limits are off (per-app ceilings still apply)"
         );
     }
-    let caddy_child = supervise_caddy(&config);
+    let caddy_child = host::children::supervise_caddy(&config);
 
     let procs = host::supervisor::new_procs();
     let logs = host::logs::new_state();
@@ -239,6 +245,7 @@ async fn main() -> anyhow::Result<()> {
             String::new(),
             std::time::Instant::now(),
         ))),
+        started_at,
     };
 
     let cfg_loop = (*config).clone();
@@ -272,6 +279,15 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     tracing::info!(bind = %config.bind, "noite-runner listening");
 
+    // Instance heartbeat, off the boot critical path: the task sleeps ten
+    // minutes before its first attempt, then checks hourly, and is a no-op
+    // once the instance opts out (SPEC, telemetry).
+    tokio::spawn(host::telemetry_report::run_scheduler(
+        pool.clone(),
+        config.clone(),
+        started_at,
+    ));
+
     // Control fleet #0: deploy the bundle baked into the image, then run it.
     // The dev image has no bundle: `vite dev` serves the UI on the same port
     // (docker/dev.sh), so there is nothing to deploy or supervise.
@@ -279,7 +295,7 @@ async fn main() -> anyhow::Result<()> {
         if let Err(e) = host::control::ensure_deployed(&config).await {
             tracing::warn!(error = %e, "control fleet deploy failed; continuing");
         }
-        let child = supervise_control(&config, control_pid.clone(), logs.clone());
+        let child = host::control::supervise(&config, control_pid.clone(), logs.clone());
         tracing::info!(ms = boot.elapsed().as_millis(), "control bundle ready");
         Some(child)
     } else {
@@ -287,146 +303,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let app = Router::new()
-        .route("/health", get(api::health))
-        .route("/ready", get(api::ready))
-        .route("/v1/admin/snapshot", post(api::snapshot))
-        .route("/v1/edge/fallback", get(host::edge::edge_fallback))
-        .route("/v1/edge/tls-ask", get(host::edge::tls_ask))
-        .route("/v1/edge/wake", get(host::edge::wake))
-        .route("/v1/admin/stats", get(api::stats))
-        .route("/v1/apps", get(api::list_apps).post(api::create_app))
-        .route(
-            "/v1/apps/{id}",
-            get(api::get_app)
-                .patch(api::patch_app)
-                .delete(api::delete_app),
-        )
-        .route("/v1/apps/{id}/rename", post(api::rename_app))
-        .route("/v1/apps/{id}/sleep", post(api::sleep_app))
-        .route(
-            "/v1/apps/{id}/domains",
-            get(api::list_domains).post(api::add_domain),
-        )
-        .route(
-            "/v1/apps/{id}/domains/{hostname}",
-            delete(api::remove_domain),
-        )
-        .route("/v1/apps/{id}/deploys", get(api::list_deploys))
-        .route(
-            "/v1/apps/{id}/deploys/{deploy_id}/log",
-            get(api::deploy_log),
-        )
-        .route("/v1/apps/{id}/rollback", post(api::rollback))
-        .route(
-            "/v1/apps/{id}/deploys/stream",
-            get(api::list_deploys_stream),
-        )
-        .route("/v1/apps/{id}/git-remote", post(api::git_remote))
-        .route("/v1/apps/{id}/tree", get(api::source_tree))
-        .route("/v1/apps/{id}/blob/{*path}", get(api::source_blob))
-        .route("/v1/apps/{id}/diff", get(api::source_diff))
-        .route("/v1/apps/{id}/metrics", get(api::app_metrics))
-        .route("/v1/apps/{id}/devices", get(api::app_devices))
-        .route("/v1/apps/{id}/paths", get(api::app_paths))
-        .route("/v1/apps/{id}/refs", get(api::app_refs))
-        .route(
-            "/v1/apps/{id}/metrics/version",
-            get(api::app_metrics_version),
-        )
-        .route("/v1/apps/{id}/errors/stream", get(api::list_errors_stream))
-        .route("/v1/apps/{id}/spans", get(api::app_spans))
-        .route(
-            "/v1/apps/{id}/events",
-            get(api::list_events).post(api::log_event),
-        )
-        .route("/v1/apps/{id}/events/stream", get(api::list_events_stream))
-        .route("/v1/apps/{id}/events/channels", get(api::list_channels))
-        .route("/v1/apps/{id}/identify", post(api::identify_user))
-        .route(
-            "/v1/apps/{id}/users/{user_id}/props",
-            get(api::get_user_props),
-        )
-        .route(
-            "/v1/apps/{id}/insights",
-            get(api::list_insights).post(api::set_insight),
-        )
-        .route("/v1/apps/{id}/logs", get(api::app_logs))
-        .route("/v1/apps/{id}/logs/stream", get(api::app_logs_stream))
-        .route("/v1/apps/{id}/storage", get(api::app_storage))
-        .route(
-            "/v1/apps/{id}/storage/d1/{database_id}/tables",
-            get(api::app_d1_tables),
-        )
-        .route(
-            "/v1/apps/{id}/storage/d1/{database_id}/tables/{table}/schema",
-            get(api::app_d1_schema),
-        )
-        .route(
-            "/v1/apps/{id}/storage/d1/{database_id}/tables/{table}/rows",
-            post(api::app_d1_rows),
-        )
-        .route(
-            "/v1/apps/{id}/storage/d1/{database_id}/write",
-            post(api::app_d1_write),
-        )
-        .route(
-            "/v1/apps/{id}/storage/d1/{database_id}/delete-rows",
-            post(api::app_d1_delete_rows),
-        )
-        .route("/v1/apps/{id}/source/commit", post(api::app_source_commit))
-        .route("/v1/apps/{id}/storage/do/{class_name}", get(api::app_do))
-        .route("/v1/apps/{id}/storage/r2/{bucket}", get(api::app_r2))
-        .route(
-            "/v1/apps/{id}/storage/r2/{bucket}/object",
-            get(api::app_r2_object)
-                .put(api::app_r2_put)
-                .delete(api::app_r2_delete),
-        )
-        .route(
-            "/v1/apps/{id}/storage/r2/{bucket}/raw",
-            get(api::app_r2_raw),
-        )
-        .route("/v1/apps/{id}/env", get(api::list_env).post(api::set_env))
-        .route("/v1/apps/{id}/env/{name}", delete(api::delete_env))
-        .route("/rpc", post(api::handle_rpc))
-        .route("/v1/git/{slug}/info/refs", get(host::git_http::info_refs))
-        .route(
-            "/v1/git/{slug}/git-upload-pack",
-            post(host::git_http::upload_pack),
-        )
-        .route(
-            "/v1/git/{slug}/git-receive-pack",
-            post(host::git_http::receive_pack),
-        )
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            |axum::extract::State(s): axum::extract::State<AppState>, req, next| async move {
-                auth::require_bearer(s, req, next).await
-            },
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            |axum::extract::State(s): axum::extract::State<AppState>,
-             req: axum::http::Request<axum::body::Body>,
-             next: axum::middleware::Next| async move {
-                let dirty = matches!(
-                    req.method(),
-                    &axum::http::Method::POST
-                        | &axum::http::Method::PATCH
-                        | &axum::http::Method::PUT
-                        | &axum::http::Method::DELETE
-                ) && req.uri().path().starts_with("/v1/");
-                let resp = next.run(req).await;
-                if dirty && resp.status().is_success() {
-                    s.state_sync.mark_dirty();
-                }
-                resp
-            },
-        ))
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+    let app = api::router::router(state);
 
     let budget = std::time::Duration::from_millis(config.stop_budget_ms);
     axum::serve(listener, app)
@@ -451,73 +328,4 @@ async fn main() -> anyhow::Result<()> {
     caddy_child.stop(std::time::Duration::from_secs(5)).await;
     host::state::final_snapshot(&state_sync, &pool, &config).await;
     Ok(())
-}
-
-/// Control fleet #0: celld with the public listener on loopback
-/// (Caddy is in the same container) and the internal one on the private
-/// address (see `host::control::control_advertise`). Supervised: restarted
-/// on exit, stopped with the fleets on shutdown. It runs the same telemetry
-/// environment as a tenant fleet (`metrics::otel_env`), so its Parquet lands
-/// under `s3://<bucket>/control/telemetry/...` (celld writes `telemetry/`
-/// relative to `--bucket`) and the ingest, compaction, error grouping and
-/// prune treat it as one more source — keyed `_control`, with no `app` row.
-/// Its pid is mirrored into `control_pid` and its stdout+stderr into the
-/// shared log buffer under the same key.
-fn supervise_control(
-    config: &Config,
-    control_pid: Arc<std::sync::atomic::AtomicU32>,
-    logs: LogState,
-) -> host::children::Supervised {
-    let args = host::control::spawn_args(config);
-    let shutdown_ms = config.fleet_shutdown_ms().to_string();
-    let celld = config.celld_bin.clone();
-    let otel = host::metrics::otel_env(config);
-    host::children::Supervised::start_observed(
-        "control",
-        Some(control_pid),
-        Some((logs, host::control::SLUG.to_string())),
-        move || {
-            let state_dir = "/data/control";
-            let _ = std::fs::create_dir_all(state_dir);
-            let mut cmd = tokio::process::Command::new(&celld);
-            cmd.args(&args)
-                .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
-                .env("CELLD_WATCH", state_dir)
-                .env("CELLD_READY_FLEET_GATE_MS", "15000")
-                .env("CELLD_DURABILITY", "bucket")
-                .env("CELLD_SHUTDOWN_TOTAL_MS", &shutdown_ms)
-                // Piped so the supervisor captures the node's own log into the
-                // shared buffer (the OTel ring carries the worker's console).
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            for (key, value) in &otel {
-                cmd.env(key, value);
-            }
-            cmd
-        },
-    )
-}
-
-/// Caddy: admin on its default 127.0.0.1:2019, where the runner
-/// POSTs each new config (`host::caddy::load_admin`); `--watch` on the same
-/// file stays as the fallback path.
-fn supervise_caddy(config: &Config) -> host::children::Supervised {
-    let caddyfile = config.caddyfile_path.clone();
-    host::children::Supervised::start("caddy", move || {
-        let mut cmd = tokio::process::Command::new("caddy");
-        cmd.args([
-            "run",
-            "--config",
-            &caddyfile,
-            "--adapter",
-            "caddyfile",
-            "--watch",
-        ])
-        // Certificates and ACME state in the volume, not in the
-        // container's $HOME: a recreate must not re-issue every cert
-        // (CA rate limits) or lose the on-demand ones.
-        .env("XDG_DATA_HOME", "/data/caddy/data")
-        .env("XDG_CONFIG_HOME", "/data/caddy/config");
-        cmd
-    })
 }

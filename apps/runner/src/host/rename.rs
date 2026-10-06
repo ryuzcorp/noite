@@ -14,7 +14,7 @@ use anyhow::Context;
 
 use crate::config::Config;
 use crate::db;
-use crate::host::cmd;
+use crate::host::{exec, s3};
 use crate::host::deploy::{self, Deploying};
 use crate::host::logs::LogState;
 use crate::host::source;
@@ -71,7 +71,7 @@ async fn move_s3_prefix(cfg: &Config, from: &str, to: &str) -> anyhow::Result<()
         .strip_prefix(&format!("s3://{bucket}/"))
         .unwrap_or(to)
         .to_string();
-    let json = cmd::s3_list_prefix(cfg, &bucket, &from_key).await?;
+    let json = s3::s3_list_prefix(cfg, &bucket, &from_key).await?;
     let keys: Vec<String> = serde_json::from_str::<serde_json::Value>(&json)
         .ok()
         .and_then(|v| v.get("Contents")?.as_array().cloned())
@@ -88,8 +88,8 @@ async fn move_s3_prefix(cfg: &Config, from: &str, to: &str) -> anyhow::Result<()
         let bucket = bucket.clone();
         let to_key = format!("{to_key}{rel}");
         async move {
-            cmd::s3_copy_key(cfg, &bucket, &key, &to_key).await?;
-            cmd::s3_delete_key(cfg, &key).await
+            s3::s3_copy_key(cfg, &bucket, &key, &to_key).await?;
+            s3::s3_delete_key(cfg, &key).await
         }
     }))
     .buffer_unordered(8)
@@ -157,7 +157,7 @@ async fn rename_slugged(
     // Same settle as purge: don't move S3 under a dying node.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let root = cmd::work_root(cfg);
+    let root = exec::work_root(cfg);
     let pairs = vec![
         (
             source::bare_repo(cfg, &app.slug),

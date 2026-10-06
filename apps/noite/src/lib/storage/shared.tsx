@@ -1,12 +1,12 @@
 //! Shared chrome for the storage views (D1 editor, R2 browser, DO viewer):
-//! toasts, the breadcrumb header, empty states, copy buttons, byte and
-//! media-type formatting. D1 and R2/DO look like one product because they
-//! render these pieces, not three near-copies of them.
+//! toasts, the breadcrumb header, empty states, byte and media-type
+//! formatting. D1 and R2/DO look like one product because they render these
+//! pieces, not three near-copies of them.
 
 import { atom } from "ilha";
 import type { View } from "ilha";
 
-import { Check, ChevronRight, Copy } from "../icons";
+import { ChevronRight } from "../ui/icons";
 
 /** One transient confirmation (top-right, auto-hides). */
 export interface Toast {
@@ -111,34 +111,6 @@ export const EmptyState = ({
     {action}
   </div>
 );
-
-/** Copy one value to the clipboard, confirming in place for a moment. */
-export const CopyButton = ({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
-}) => {
-  const copied = atom(false);
-  return (
-    <button
-      type="button"
-      class="btn btn-sm btn-ghost gap-1"
-      aria-label={label}
-      onclick={() => {
-        void navigator.clipboard?.writeText(value);
-        copied.set(true);
-        window.setTimeout(() => {
-          copied.set(false);
-        }, 1200);
-      }}
-    >
-      {copied() ? <Check class="h-3.5 w-3.5" /> : <Copy class="h-3.5 w-3.5" />}
-      {copied() ? "Copied" : "Copy"}
-    </button>
-  );
-};
 
 const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"] as const;
 

@@ -12,9 +12,10 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use ts_rs::TS;
 
 use crate::config::Config;
-use crate::host::cmd;
+use crate::host::{exec, s3};
 use crate::host::source;
 use crate::models::App;
 
@@ -32,22 +33,25 @@ pub const MAX_PAGE_SIZE: i64 = 100;
 // Outputs (camelCase JSON, mirrored by `apps/noite/src/lib/runner.ts`)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct D1TableInfo {
     pub name: String,
     pub row_count: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct D1Tables {
     pub database_id: String,
     pub tables: Vec<D1TableInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct D1Column {
     pub name: String,
     /// Declared type; "" when the DDL has none.
@@ -60,24 +64,27 @@ pub struct D1Column {
     pub pk: i64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct D1ForeignKey {
     pub from: String,
     pub table: String,
     pub to: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct D1Index {
     pub name: String,
     pub unique: bool,
     pub columns: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct D1TableSchemaRaw {
     pub table: String,
     pub columns: Vec<D1Column>,
@@ -86,8 +93,9 @@ pub struct D1TableSchemaRaw {
     pub sql: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct D1Rows {
     pub table: String,
     /// Column order of `rows`.
@@ -103,8 +111,9 @@ pub struct D1Rows {
 // Inputs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum D1FilterOp {
     Eq,
     Neq,
@@ -117,7 +126,8 @@ pub enum D1FilterOp {
     NotNull,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export)]
 pub struct D1Filter {
     pub column: String,
     pub op: D1FilterOp,
@@ -127,7 +137,8 @@ pub struct D1Filter {
     pub value: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export)]
 pub struct D1Sort {
     pub column: String,
     #[serde(default)]
@@ -172,19 +183,41 @@ pub struct D1RowsBody {
     pub search: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum D1WriteOp {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl D1WriteOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Insert => "insert",
+            Self::Update => "update",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export)]
 pub struct D1WriteBody {
-    pub op: String,
+    pub op: D1WriteOp,
     pub table: String,
     /// update/delete row identity.
     #[serde(default)]
+    #[ts(as = "Option<BTreeMap<String, Option<String>>>", optional)]
     pub key: BTreeMap<String, Option<String>>,
     /// insert/update; null = SQL NULL, "" = empty string.
     #[serde(default)]
     pub values: BTreeMap<String, Option<String>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export)]
 pub struct D1DeleteRowsBody {
     pub table: String,
     pub keys: Vec<BTreeMap<String, Option<String>>>,
@@ -611,7 +644,7 @@ impl<'a> D1<'a> {
     /// validated SQL only — never raw browser input.
     async fn exec(&self, sql: &str, json: bool) -> anyhow::Result<String> {
         let bucket = self.app.fleet_bucket.clone();
-        let env_owned = cmd::aws_env(self.cfg);
+        let env_owned = s3::aws_env(self.cfg);
         let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         env.push(("S3_ENDPOINT", self.cfg.s3_endpoint.as_str()));
         let mut args = vec!["d1", "execute", self.database_id.as_str(), "--command", sql];
@@ -619,7 +652,7 @@ impl<'a> D1<'a> {
             args.push("--json");
         }
         args.extend(["--bucket", bucket.as_str()]);
-        cmd::run_cmd(
+        exec::run_cmd(
             &self.cfg.celld_bin,
             &args,
             Some(&self.proj),
@@ -637,7 +670,7 @@ async fn ensure_project(cfg: &Config, app: &App) -> anyhow::Result<PathBuf> {
     let Some(rev) = source::resolve_rev(cfg, app).await? else {
         bail!("no deployed source — push to main first");
     };
-    let proj = cmd::work_root(cfg).join("projects").join(&app.slug);
+    let proj = exec::work_root(cfg).join("projects").join(&app.slug);
     source::checkout_worktree(cfg, &app.slug, &rev, &proj).await?;
     // Configs generated at deploy time (cloudflare.config.ts, a built
     // dist/wrangler.json) are not in the source tree; write what the last

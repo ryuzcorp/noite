@@ -40,7 +40,7 @@ There is deliberately **no `app` row** for `_control` (`_control` is reserved at
 
 `--slug _control` is the way to replay just the control fleet's window (see below).
 
-Frequent flushes need a compaction job — queries grow slow within hours otherwise, and celld does not compact its own files. The runner runs it hourly via `metrics::compact_fleet`: for the hour that just ended, per node directory, one DuckDB `COPY (...) TO .../compacted.parquet (FORMAT parquet, COMPRESSION zstd)` ordered by `start_unix_us`, then the source files are deleted. Deletion happens only after `head-object` proves the compacted file exists, so a failed copy can never lose spans; `union_by_name=true` merges an hour that spans a schema change (the docs call the schema `v0-unstable`). The current hour is never compacted.
+Frequent flushes need a compaction job — queries grow slow within hours otherwise, and celld does not compact its own files. The runner runs it hourly via `host/metrics/compact.rs::compact_fleet`: for the hour that just ended, per node directory, one DuckDB `COPY (...) TO .../compacted.parquet (FORMAT parquet, COMPRESSION zstd)` ordered by `start_unix_us`, then the source files are deleted. Deletion happens only after `head-object` proves the compacted file exists, so a failed copy can never lose spans; `union_by_name=true` merges an hour that spans a schema change (the docs call the schema `v0-unstable`). The current hour is never compacted.
 
 Runner queries are hour-scoped: the aggregation window stops 10 s behind the flush and names only the hour directories it spans, instead of globbing the whole retention.
 
@@ -74,4 +74,4 @@ docker compose exec noite noite-runner telemetry reingest --slug blog --since 20
 Metrics, logs and errors ingested before this release are correct; the replay only fills in the rows the old ingest skipped.
 :::
 
-To read the same data yourself, point DuckDB at the fleet bucket the way the runner does (the `SET s3_endpoint/s3_region/s3_access_key_id/s3_secret_access_key/s3_url_style='path'` preamble in `apps/runner/src/host/metrics.rs`) and aggregate the hourly Parquet under `s3://<bucket>/fleets/<slug>/telemetry/traces/<node>/<yyyy>/<mm>/<dd>/<hh>/*.parquet`; `celld.fetch` spans count as requests, `ok` is the error flag, `duration_us`/`queue_wait_us` the latency and queue wait.
+To read the same data yourself, point DuckDB at the fleet bucket the way the runner does (the `SET s3_endpoint/s3_region/s3_access_key_id/s3_secret_access_key/s3_url_style='path'` preamble in `apps/runner/src/host/metrics/plan.rs`) and aggregate the hourly Parquet under `s3://<bucket>/fleets/<slug>/telemetry/traces/<node>/<yyyy>/<mm>/<dd>/<hh>/*.parquet`; `celld.fetch` spans count as requests, `ok` is the error flag, `duration_us`/`queue_wait_us` the latency and queue wait.

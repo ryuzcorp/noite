@@ -3,10 +3,12 @@ import { BunRuntime, BunServices } from "@effect/platform-bun";
 import { Effect } from "effect";
 import { Command } from "effect/cli";
 
+import pkg from "../package.json";
 import { deploy } from "./deploy.js";
 
-// Keep in sync with package.json version (single-command CLI, one line).
-const VERSION = "0.1.0";
+// Bundled from package.json at build time (bun inlines the JSON import), so
+// the advertised version can never drift from the published package.
+const VERSION: string = pkg.version;
 
 const root = Command.make("noite").pipe(
   Command.withDescription(

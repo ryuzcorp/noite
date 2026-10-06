@@ -1,35 +1,22 @@
 //! The Definition view: the table's columns, indexes, foreign keys and the
 //! CREATE statement from sqlite_master, all read from the schema resource.
 
-import { atom } from "ilha";
-
-import { Check, Copy } from "../../icons";
 import type { D1Index, D1TableSchema } from "../../runner";
+import { CopyButton } from "../../ui/copy-button";
 
-const SqlBlock = ({ sql }: { sql: string }) => {
-  const copied = atom(false);
-  return (
-    <div class="relative">
-      <button
-        type="button"
-        class="btn btn-square btn-ghost btn-sm absolute top-2 right-2"
-        aria-label="Copy CREATE statement"
-        onclick={() => {
-          void navigator.clipboard?.writeText(sql);
-          copied.set(true);
-          setTimeout(() => {
-            copied.set(false);
-          }, 1200);
-        }}
-      >
-        {copied() ? <Check class="h-4 w-4" /> : <Copy class="h-4 w-4" />}
-      </button>
-      <pre class="bg-base-200 dark:bg-base-300/60 rounded-box m-0 overflow-x-auto p-3 font-mono text-xs">
-        {sql}
-      </pre>
-    </div>
-  );
-};
+const SqlBlock = ({ sql }: { sql: string }) => (
+  <div class="relative">
+    <CopyButton
+      class="btn btn-square btn-ghost btn-sm absolute top-2 right-2"
+      iconOnly
+      label="Copy CREATE statement"
+      value={sql}
+    />
+    <pre class="bg-base-200 dark:bg-base-300/60 rounded-box m-0 overflow-x-auto p-3 font-mono text-xs">
+      {sql}
+    </pre>
+  </div>
+);
 
 const IndexRow = ({ index }: { index: D1Index }) => (
   <tr>

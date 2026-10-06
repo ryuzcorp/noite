@@ -2,7 +2,7 @@
 //!
 //! Two signals carry an exception (verified against celld 0.6.0; since
 //! 0.6.1 the log level is a severity column, and the ingest puts the prefix
-//! back, host/metrics.rs `ingest_all`):
+//! back, host/metrics/ingest.rs `ingest_all`):
 //!
 //! 1. A failed span's `error` column for anything a handler throws or
 //!    rejects — `rejected: PaymentError: declined [at chargeCard
@@ -28,9 +28,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
+use ts_rs::TS;
 
 use crate::db;
 
@@ -55,8 +56,9 @@ const FINGERPRINT_FRAMES: usize = 5;
 const REQUEST_TTL: Duration = Duration::from_secs(15 * 60);
 const REQUEST_CAP: usize = 50_000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct Frame {
     pub function: String,
     pub location: String,

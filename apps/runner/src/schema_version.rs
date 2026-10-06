@@ -21,7 +21,7 @@ use anyhow::{bail, Context};
 use sqlx::SqliteConnection;
 
 /// Version a database has after every migration ran. 1 is the alpha baseline.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`.
@@ -66,6 +66,17 @@ pub const MIGRATIONS: &[Migration] = &[
         // tick consumes the row and deletes it when every fleet has caught up.
         sql: "INSERT OR IGNORE INTO main.telemetry_replay (id, floor_us, slug, requested_at)\
             VALUES (1, 0, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'));",
+    },
+    Migration {
+        version: 5,
+        // Instance-level settings for the opt-out instance heartbeat: the
+        // install identity and the last-sent/opt-out markers. A fresh database
+        // gets the table from schema.sql; an install that predates alpha.3
+        // gains it here.
+        sql: "CREATE TABLE IF NOT EXISTS main.instance_setting (\
+            key TEXT PRIMARY KEY NOT NULL,\
+            value TEXT NOT NULL\
+          );",
     },
 ];
 
@@ -300,5 +311,47 @@ mod tests {
             .execute(&mut conn)
             .await;
         assert!(dup.is_err(), "the unique index must reject a duplicate uid");
+    }
+
+    /// The shipped migration that adds `instance_setting` (the heartbeat's
+    /// install identity and opt-out markers) must apply to a database that
+    /// predates it, and leave the table usable.
+    #[tokio::test]
+    async fn shipped_instance_setting_migration_applies_to_an_old_database() {
+        let mut conn = memory().await;
+        sqlx::raw_sql(
+            "CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT);\
+             PRAGMA main.user_version = 4;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed the alpha.3-minus-one shape");
+        let v5 = "CREATE TABLE IF NOT EXISTS main.app (id TEXT PRIMARY KEY, slug TEXT);\
+                  CREATE TABLE IF NOT EXISTS main.instance_setting (\
+                    key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);";
+        let idx = MIGRATIONS
+            .iter()
+            .position(|m| m.version == 5)
+            .expect("the instance_setting migration is shipped");
+        // Apply just this step: later migrations must not leak into the test.
+        apply(&mut conn, v5, 5, &MIGRATIONS[idx..=idx])
+            .await
+            .expect("upgrade");
+        assert_eq!(version(&mut conn).await, 5);
+        sqlx::raw_sql("INSERT INTO main.instance_setting (key, value) VALUES ('install_id', 'x')")
+            .execute(&mut conn)
+            .await
+            .expect("insert");
+        let value: String =
+            sqlx::query_scalar("SELECT value FROM main.instance_setting WHERE key = 'install_id'")
+                .fetch_one(&mut conn)
+                .await
+                .expect("row survives");
+        assert_eq!(value, "x");
+        // Booting again is a no-op.
+        apply(&mut conn, v5, 5, &MIGRATIONS[idx..=idx])
+            .await
+            .expect("second boot");
+        assert_eq!(version(&mut conn).await, 5);
     }
 }

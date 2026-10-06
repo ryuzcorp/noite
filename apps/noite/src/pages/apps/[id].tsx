@@ -8,9 +8,9 @@ import {
   toMetricsHours,
 } from "$lib/app-detail/metrics";
 import { AppDetailPanel, AppHeader } from "$lib/app-detail/panel";
-import { AppSettingsPanel } from "$lib/app-detail/settings";
+import { AppSettingsPanel } from "$lib/app-detail/settings/panel";
+import { ControlAppDetail } from "$lib/apps/control-panel";
 import { CONTROL_APP_NAME, isControlApp } from "$lib/control-app";
-import { ControlAppDetail } from "$lib/control-app-panel";
 import { appDetail } from "$lib/resources";
 import { useRoute, head, searchParam } from "@ilha/router";
 

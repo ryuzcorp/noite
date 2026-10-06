@@ -51,7 +51,7 @@ fn short(program: &str) -> &str {
     program.rsplit('/').next().unwrap_or(program)
 }
 
-/// One subprocess spawn of `program` (called from `host::cmd`).
+/// One subprocess spawn of `program` (called from `host::exec`).
 pub fn count_spawn(program: &str) {
     bump(&counters().spawns, short(program), 1);
 }

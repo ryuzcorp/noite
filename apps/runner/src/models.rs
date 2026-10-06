@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use ts_rs::TS;
 use uuid::Uuid;
 
 /// Operator intent: only running|stopped. Removal is hard DELETE, not a state.
@@ -101,8 +102,9 @@ impl DeployStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct App {
     pub id: String,
     pub slug: String,
@@ -149,8 +151,9 @@ impl App {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct Deploy {
     pub id: String,
     pub app_id: String,
@@ -167,8 +170,9 @@ impl Deploy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct AppEnv {
     pub app_id: String,
     pub name: String,
@@ -176,8 +180,9 @@ pub struct AppEnv {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct AppDomain {
     pub app_id: String,
     pub hostname: String,
@@ -196,8 +201,9 @@ pub struct AppLimit {
     pub app_rpm: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct AppMetric {
     pub app_id: String,
     pub bucket_ts: String,
@@ -207,8 +213,9 @@ pub struct AppMetric {
     pub cpu_ms: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct AppDeviceStat {
     pub app_id: String,
     pub bucket_ts: String,
@@ -217,8 +224,9 @@ pub struct AppDeviceStat {
     pub requests: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct AppPathStat {
     pub app_id: String,
     pub bucket_ts: String,
@@ -226,8 +234,9 @@ pub struct AppPathStat {
     pub requests: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct AppRefStat {
     pub app_id: String,
     pub bucket_ts: String,
@@ -238,8 +247,9 @@ pub struct AppRefStat {
 /// Aggregated span row served to the dashboard (spec T3.2). Same JSON shape
 /// as the old DuckDB-backed `SpanStat` (`qwaitMs`), now read from the
 /// ingested `app_span_stat` ring instead of scanning Parquet per viewer.
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct AppSpanStat {
     pub name: String,
     pub kind: i64,
@@ -252,8 +262,9 @@ pub struct AppSpanStat {
 /// One grouped error (host/errors.rs): every occurrence with the same
 /// fingerprint. `status` is `open`, `resolved` or `ignored`; `regressed`
 /// marks a resolved issue that fired again.
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ErrorIssue {
     pub fingerprint: String,
     pub kind: String,
@@ -293,8 +304,9 @@ pub struct ErrorEvent {
     pub sha: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct AppEvent {
     pub id: String,
     pub app_id: String,
@@ -307,8 +319,9 @@ pub struct AppEvent {
     pub ts: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct AppUserProps {
     pub app_id: String,
     pub user_id: String,
@@ -316,8 +329,9 @@ pub struct AppUserProps {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct AppInsight {
     pub app_id: String,
     pub title: String,
@@ -338,7 +352,7 @@ pub struct CreateApp {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PatchApp {
     pub desired_state: Option<String>,
 }

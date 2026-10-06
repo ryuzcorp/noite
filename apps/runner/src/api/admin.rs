@@ -6,7 +6,7 @@ use axum::{extract::State, response::IntoResponse, Json};
 use serde_json::json;
 
 use crate::db;
-use crate::error::ApiError;
+use crate::api_error::ApiError;
 use crate::AppState;
 
 /// Write a consistent copy of the runner SQLite (`VACUUM INTO`) and report it.

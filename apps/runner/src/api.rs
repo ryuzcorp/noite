@@ -1,5 +1,11 @@
-//! Runner REST surface: thin handlers grouped by domain; routes live in
-//! `main.rs`, which keeps addressing `api::X` through the re-exports below.
+//! Runner REST surface: thin handlers grouped by domain; the route table
+//! lives in `api::router`, which addresses every handler through the
+//! re-exports below.
+//!
+//! Where handlers live: edge handlers (`host/edge.rs`: `edge_fallback`,
+//! `tls_ask`, `wake`) and git smart-HTTP handlers (`host/git_http.rs`)
+//! deliberately live with their host subsystem; everything else lives in
+//! `api/`.
 pub mod admin;
 pub mod apps;
 pub mod deploys;
@@ -10,8 +16,14 @@ pub mod events;
 pub mod git;
 pub mod observe;
 pub mod rpc;
+pub mod router;
 pub mod source;
+pub mod sse;
 pub mod storage;
+pub mod telemetry;
+
+#[cfg(test)]
+mod tests;
 
 pub use admin::{snapshot, stats};
 pub use apps::{
@@ -36,3 +48,4 @@ pub use storage::{
     app_d1_delete_rows, app_d1_rows, app_d1_schema, app_d1_tables, app_d1_write, app_do, app_r2,
     app_r2_delete, app_r2_object, app_r2_put, app_r2_raw, app_storage,
 };
+pub use telemetry::{get_telemetry, set_telemetry};

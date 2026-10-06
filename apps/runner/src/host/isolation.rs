@@ -8,7 +8,7 @@
 //! checks run and warn, nothing is refused.
 
 use crate::config::{Config, Tenancy};
-use crate::host::{cmd, netisolation};
+use crate::host::{exec, netisolation};
 
 #[derive(Clone, Debug, Default)]
 pub struct IsolationStatus {
@@ -24,12 +24,12 @@ pub struct IsolationStatus {
 pub async fn self_check(cfg: &Config, nft_installed: bool) -> IsolationStatus {
     // One probe is enough: every uid in the range drops the same way.
     let build_uid_ok = match cfg.build_uid_base {
-        Some(base) => cmd::can_drop_uid(base, base),
+        Some(base) => exec::can_drop_uid(base, base),
         None => false,
     };
     let fleet_uid_ok = match (cfg.fleet_uid, cfg.fleet_gid) {
-        (Some(u), Some(g)) => cmd::can_drop_uid(u, g),
-        (Some(u), None) => cmd::can_drop_uid(u, u),
+        (Some(u), Some(g)) => exec::can_drop_uid(u, g),
+        (Some(u), None) => exec::can_drop_uid(u, u),
         _ => false,
     };
     let (nft_ok, nft_detail) = if nft_installed {

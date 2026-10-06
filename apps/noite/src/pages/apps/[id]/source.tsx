@@ -1,7 +1,7 @@
-import { ArrowLeft } from "$lib/icons";
 import { appDetail } from "$lib/resources";
-import { SourceBrowser } from "$lib/source-browser";
-import type { SourceBrowserState, SourceMode } from "$lib/source-browser";
+import { SourceBrowser } from "$lib/source/browser";
+import type { SourceBrowserState, SourceMode } from "$lib/source/browser";
+import { ArrowLeft } from "$lib/ui/icons";
 import { head, searchParam, useRoute } from "@ilha/router";
 import { atom } from "ilha";
 import type { AtomHandle } from "ilha";

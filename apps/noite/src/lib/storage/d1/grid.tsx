@@ -6,11 +6,11 @@
 import { atom } from "ilha";
 import type { View } from "ilha";
 
-import { d1DeleteRows } from "../../apps.server";
 import { errorMessage } from "../../errors";
-import { ChevronLeft, ChevronRight, Key } from "../../icons";
 import { d1Rows } from "../../resources";
 import type { D1Cell, D1RowsQuery, D1TableSchema } from "../../runner";
+import { d1DeleteRows } from "../../server/storage.server";
+import { ChevronLeft, ChevronRight, Key } from "../../ui/icons";
 import { isTimestampColumn, keyFor } from "../d1-values";
 import { CellValue } from "./cells";
 import { DEFAULT_PAGE_SIZE, PAGE_SIZES, pageCount } from "./state";

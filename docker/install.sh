@@ -19,6 +19,8 @@
 #   NOITE_EMAIL_WEBHOOK_URL
 #                      receives lost-passkey sign-in codes as JSON; without it,
 #                      recover with `noite-runner recover` (printed at the end)
+#   NOITE_TELEMETRY=0  turn off the anonymous daily heartbeat (on by default);
+#                      also DO_NOT_TRACK=1. https://noite.now/self-hosting/telemetry
 #   NOITE_VERSION      release channel or version (default: alpha; `stable`
 #                      follows final releases only, `0.1.0-alpha.1` or a short
 #                      SHA holds an install in place; `run.sh … install --pre`
@@ -245,6 +247,9 @@ EOF
   if [[ -n "${NOITE_EMAIL_WEBHOOK_URL:-}" ]]; then
     env_set NOITE_EMAIL_WEBHOOK_URL "$NOITE_EMAIL_WEBHOOK_URL"
   fi
+  if [[ -n "${NOITE_TELEMETRY:-}" ]]; then
+    env_set NOITE_TELEMETRY "$NOITE_TELEMETRY"
+  fi
 }
 
 open_firewall() {
@@ -340,6 +345,12 @@ ${GREEN}${BOLD}Noite is running.${RESET}
 
 ${YELLOW}${BOLD}Register now.${RESET} The first account to sign up becomes the admin and needs
 no invite code: open https://app.$DOMAIN before anyone else can.
+
+${YELLOW}${BOLD}Telemetry.${RESET} On by default: once a day this install sends Noite's maintainers
+an anonymous, count-only summary (version, platform, apps, deploys, users) — no
+domains, names, emails or IPs. Turn it off under Admin on
+https://app.$DOMAIN/account, or set NOITE_TELEMETRY=0 in $NOITE_DIR/.env and run
+  cd $NOITE_DIR && docker compose up -d
 
   Config       $NOITE_DIR/.env (keep it: it holds the secrets)
   Logs         cd $NOITE_DIR && docker compose logs -f

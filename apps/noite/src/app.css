@@ -96,7 +96,7 @@
  * precedence in the tree's fallback chain). Token references flip with
  * the light/dark theme for free; bg stays transparent to blend with
  * the pane. Set on the tree host; custom properties inherit into its
- * shadow root, where the tree renders (see paneIn in source-browser). */
+ * shadow root, where the tree renders (see paneIn in source/browser.tsx). */
 .noite-src-tree {
   --trees-accent-override: var(--color-primary);
   --trees-bg-override: transparent;

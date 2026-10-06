@@ -227,13 +227,19 @@ export type MetricsFrame = {
     qwaitMs: number;
   }[];
   devices?: {
+    appId: string;
     bucketTs: string;
     browser: string;
     os: string;
     requests: number;
   }[];
-  paths?: { bucketTs: string; path: string; requests: number }[];
-  refs?: { bucketTs: string; source: string; requests: number }[];
+  paths?: { appId: string; bucketTs: string; path: string; requests: number }[];
+  refs?: {
+    appId: string;
+    bucketTs: string;
+    source: string;
+    requests: number;
+  }[];
 };
 
 /** Usage frame: `metrics` + `spans` required; `devices`/`paths`/`refs`

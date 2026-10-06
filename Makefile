@@ -95,17 +95,13 @@ down:
 	-$(COMPOSE) down --remove-orphans
 
 # Explicit nuke: every volume of this project and the e2e lane, plus local
-# vite/wrangler state. `nuke` also removes the volumes by name because
-# podman-compose's `down -v` aborts on the first missing container and then
-# never removes named volumes.
+# vite/wrangler state. The extra container/volume sweep lives in
+# `remove_project` (docker/lib.sh): podman-compose's `down -v` is only
+# best-effort, so remove what it leaves behind by project label and name.
+# pi-lens-ignore: shellcheck-14-1091
 nuke:
 	-$(COMPOSE_DEV) down -v --remove-orphans
 	-$(COMPOSE) down -v --remove-orphans
 	-$(COMPOSE) -p noite-e2e -f docker/compose.e2e.yaml down -v --remove-orphans
-	@for p in $(PROJECT) noite-e2e; do \
-	  for k in com.docker.compose.project io.podman.compose.project; do \
-	    ids=$$($(ENGINE) ps -aq --filter label=$$k=$$p); [ -z "$$ids" ] || $(ENGINE) rm -f $$ids; \
-	  done; \
-	  vols=$$($(ENGINE) volume ls -q --filter name=^$${p}_); [ -z "$$vols" ] || $(ENGINE) volume rm -f $$vols; \
-	done
+	@CLI=$(ENGINE) sh -c '. ./docker/lib.sh && remove_project $(PROJECT) noite-e2e'
 	rm -rf apps/noite/.wrangler

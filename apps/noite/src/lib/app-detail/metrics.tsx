@@ -4,7 +4,6 @@ import { atom } from "ilha";
 import { formatDateTime, formatHour } from "../dates";
 import { decodeMetrics, feedKeys, liveFeed, metricsUrl } from "../feeds";
 import type { MetricsFrame } from "../feeds";
-import { Info } from "../icons";
 import type {
   RunnerDevice,
   RunnerMetric,
@@ -12,6 +11,7 @@ import type {
   RunnerRef,
   RunnerSpan,
 } from "../runner";
+import { Info } from "../ui/icons";
 
 /** Windows the range picker offers, matching the control route's
  * METRICS_WINDOWS_HOURS (all series share one window). */

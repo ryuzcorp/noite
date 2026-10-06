@@ -677,6 +677,8 @@ mod tests {
             control_bundle_dir: "/opt/noite/control/dist".into(),
             better_auth_url: "".into(),
             edge: crate::config::EdgeLimits::default(),
+            telemetry_disabled: false,
+            do_not_track: false,
         }
     }
 
