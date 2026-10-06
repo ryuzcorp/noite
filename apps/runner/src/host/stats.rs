@@ -189,16 +189,22 @@ pub fn snapshot() -> serde_json::Value {
 mod tests {
     use super::{count_duckdb, count_s3, count_snapshot, snapshot, sse_enter, sse_exit};
 
+    // The counters are process-wide and other tests (the API parity suite's
+    // S3 stub) bump real verbs concurrently: count under keys nothing else uses.
     #[test]
     fn admin_stats_shape() {
-        count_s3("list", 0, 0);
-        count_duckdb("ingest");
+        count_s3("stats-test-verb", 3, 5);
+        count_duckdb("stats-test-purpose");
         count_snapshot(10);
-        sse_enter("logs");
-        sse_exit("logs");
+        sse_enter("stats-test-kind");
+        sse_exit("stats-test-kind");
         let v = snapshot();
-        assert_eq!(v["s3_ops"]["list"], 1);
-        assert_eq!(v["duckdb"]["ingest"], 1);
+        assert_eq!(v["s3_ops"]["stats-test-verb"], 1);
+        assert_eq!(v["s3_bytes_up"]["stats-test-verb"], 3);
+        assert_eq!(v["s3_bytes_down"]["stats-test-verb"], 5);
+        assert_eq!(v["duckdb"]["stats-test-purpose"], 1);
+        assert_eq!(v["sse"]["stats-test-kind"], 0);
+        assert!(v["snapshots"]["uploads"].as_u64().is_some_and(|n| n >= 1));
         assert!(v["rss_bytes"].is_number());
         assert!(v["cpu_seconds"].is_number());
     }
