@@ -9,7 +9,7 @@ Point a Docker Compose resource at `docker/compose.yaml` (repo root, branch `mai
 
 ### Downtime model
 
-Coolify does not do rolling updates for Compose: `docker compose up` stops a service before starting its replacement. A new image restarts the runner and every tenant fleet with it (they cold-boot, roughly a minute for many apps), so batch upgrades and deploy them off-peak.
+Coolify does not do rolling updates for Compose: `docker compose up` stops a service before starting its replacement. A new image restarts the runner and every tenant fleet with it (they cold-boot; measured ~2-5 s to serve again for 5-15 apps on a 32-core host, with the edge holding a visitor's request until each fleet is up), so batch upgrades and deploy them off-peak.
 
 Tenant subdomains (`<slug>.<domain>`) are fully automatic: no per-app steps, no wildcard cert, no DNS provider. A Traefik TCP router forwards every `*.<domain>` SNI straight to Noite's Caddy on `:443`, which mints a per-slug certificate on demand (ask-gated by the runner at `/v1/edge/tls-ask`, so only live tenant and platform hosts get certs).
 

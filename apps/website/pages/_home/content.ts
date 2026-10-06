@@ -1,5 +1,5 @@
-// Landing page copy (apps/website/LANDING.md is the source draft). Every claim
-// here is backed by the docs; keep it that way when editing.
+// Landing page copy. Every claim here is backed by the docs; keep it that way
+// when editing.
 
 export const INSTALL_COMMAND =
   "curl -fsSL https://noite.now/run.sh | bash -s install";

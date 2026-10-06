@@ -1,231 +1,17 @@
-//! Single-resource detail: D1 tables, DO instances, R2 keys + previews.
-import { searchParam } from "@ilha/router";
-import { atom } from "ilha";
+//! Storage detail dispatch: D1 → the table editor, R2 → the object browser,
+//! DO → the instance viewer. Each view owns its own chrome (breadcrumb,
+//! toolbar, list, detail panel) — see ./d1/panel, ./r2/panel, ./do/panel.
 
-import { r2Delete } from "../apps.server";
-import { formatDateTime } from "../dates";
-import { errorMessage } from "../errors";
-import { appDetail, d1Preview, doPreview, r2List } from "../resources";
-import { r2DownloadUrl } from "../runner";
-import { SectionSkeleton } from "../skeletons";
-import { D1DetailPanel } from "./d1";
-import { StorageTopCard } from "./list";
-
-/** R2 bucket keys with a bounded text preview per file. */
-const R2Detail = ({
-  appId,
-  appName,
-  bucket,
-}: {
-  appId: string;
-  appName: string;
-  bucket: string;
-}) => {
-  const res = r2List(appId, bucket);
-  const fileError = atom("");
-  const query = searchParam(`r2-${bucket}-q`, { default: "" });
-
-  const deleteFile = async (key: string) => {
-    // oxlint-disable-next-line no-alert -- native confirm dialog is the requirement for destructive deletes.
-    if (!window.confirm(`Delete ${key} from ${bucket}?`)) {
-      return;
-    }
-    try {
-      await r2Delete({ appId, bucket, key });
-      await res.refetch();
-    } catch (error) {
-      fileError.set(errorMessage(error));
-    }
-  };
-
-  const loadError = res.error();
-  if (loadError && res.data() === undefined) {
-    return <p class="text-error m-0 text-sm">{errorMessage(loadError)}</p>;
-  }
-  const r2Data = res.data();
-  if (!r2Data) {
-    return <SectionSkeleton lines={5} />;
-  }
-  const needle = query().trim().toLowerCase();
-  const visible = r2Data.objects.filter((object) =>
-    object.key.toLowerCase().includes(needle)
-  );
-  return (
-    <div class="flex flex-col gap-4">
-      <StorageTopCard
-        appId={appId}
-        appName={appName}
-        badge="R2"
-        subtitle={`${r2Data.objects.length} object(s)`}
-        title={bucket}
-      />
-      {r2Data.objects.length === 0 ? (
-        <p class="m-0 text-sm opacity-70">
-          No objects yet — PUT to /files/&lt;key&gt; on the app to upload one.
-        </p>
-      ) : (
-        <div class="card bg-base-100 dark:bg-base-200 border-base-300 border shadow-md">
-          <div class="card-body gap-4">
-            <fieldset class="fieldset max-w-sm">
-              <label class="label" for={`r2-search-${bucket}`}>
-                Search by name or extension
-              </label>
-              <input
-                id={`r2-search-${bucket}`}
-                class="input input-sm"
-                type="search"
-                placeholder="e.g. avatar or .png"
-                value={query()}
-                oninput={(e) => {
-                  query.set(e.currentTarget.value);
-                }}
-              />
-            </fieldset>
-            <div class="overflow-x-auto">
-              <table class="table-sm table-zebra table">
-                <thead>
-                  <tr>
-                    <th>Key</th>
-                    <th>Size</th>
-                    <th>Uploaded</th>
-                    <th></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {visible.map((object) => (
-                    <tr key={object.key}>
-                      <td class="font-mono text-xs">{object.key}</td>
-                      <td class="font-mono text-xs">{object.size}</td>
-                      <td class="font-mono text-xs">
-                        {formatDateTime(object.lastModified)}
-                      </td>
-                      <td class="whitespace-nowrap">
-                        <a
-                          class="btn btn-sm btn-ghost"
-                          href={r2DownloadUrl(appId, bucket, object.key)}
-                          download={object.key.split("/").pop() ?? object.key}
-                        >
-                          Download
-                        </a>
-                        <button
-                          type="button"
-                          class="btn btn-sm btn-ghost text-error"
-                          onclick={() => {
-                            void deleteFile(object.key);
-                          }}
-                        >
-                          Delete
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              {visible.length === 0 ? (
-                <p class="m-0 py-2 text-sm opacity-70">
-                  No objects match the search.
-                </p>
-              ) : null}
-            </div>
-          </div>
-        </div>
-      )}
-      {fileError() ? <p class="text-error m-0 text-sm">{fileError()}</p> : null}
-    </div>
-  );
-};
-
-/** Durable Object class instances. celld exposes no read route for an
- * instance's stored data, so the instance enumeration is the view. */
-const DoDetail = ({
-  appId,
-  appName,
-  className,
-}: {
-  appId: string;
-  appName: string;
-  className: string;
-}) => {
-  const res = doPreview(appId, className);
-  const loadError = res.error();
-  if (loadError && res.data() === undefined) {
-    return <p class="text-error m-0 text-sm">{errorMessage(loadError)}</p>;
-  }
-  const doData = res.data();
-  if (!doData) {
-    return <SectionSkeleton lines={5} />;
-  }
-  return (
-    <div class="flex flex-col gap-4">
-      <StorageTopCard
-        appId={appId}
-        appName={appName}
-        badge="DO"
-        subtitle={`${doData.instances.length} instance(s)`}
-        title={className}
-      />
-      {doData.instances.length === 0 ? (
-        <p class="m-0 text-sm opacity-70">
-          No instances yet — one is created the first time the object is called.
-        </p>
-      ) : (
-        <div class="card bg-base-100 dark:bg-base-200 border-base-300 border shadow-md">
-          <div class="card-body gap-4">
-            <div class="overflow-x-auto">
-              <table class="table-sm table-zebra table">
-                <thead>
-                  <tr>
-                    <th>Instance ID</th>
-                    <th>Preview (?read=1)</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {doData.instances.map((instance) => (
-                    <tr key={instance.id}>
-                      <td class="font-mono text-xs">{instance.id}</td>
-                      <td class="font-mono text-xs whitespace-pre-wrap">
-                        {instance.preview ?? "—"}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-/** D1 database tables + first rows (picker/role/drawer in D1DetailPanel). */
-const D1Detail = ({
-  appId,
-  databaseId,
-}: {
-  appId: string;
-  databaseId: string;
-}) => {
-  const res = d1Preview(appId, databaseId);
-  const loadError = res.error();
-  if (loadError && res.data() === undefined) {
-    return <p class="text-error m-0 text-sm">{errorMessage(loadError)}</p>;
-  }
-  const d1Data = res.data();
-  if (!d1Data) {
-    return <SectionSkeleton lines={5} />;
-  }
-  return (
-    <D1DetailPanel
-      appId={appId}
-      databaseId={databaseId}
-      d1Data={d1Data}
-      onSaved={() => {
-        void res.refetch();
-      }}
-    />
-  );
-};
+import {
+  CONTROL_APP_DATABASE_ID,
+  CONTROL_APP_NAME,
+  isControlApp,
+} from "../control-app";
+import { appDetail } from "../resources";
+import { parseAppRole, roleAtLeast } from "../roles";
+import { D1Editor } from "./d1/panel";
+import { DoBrowser } from "./do/panel";
+import { R2Browser } from "./r2/panel";
 
 /** One storage resource's details, dispatched on the resource-id prefix. */
 export const StorageDetail = ({
@@ -235,20 +21,49 @@ export const StorageDetail = ({
   appId: string;
   resourceId: string;
 }) => {
+  // The control app is not a runner app: its one resource is the control D1,
+  // served in-process by the worker (never a runner lookup).
+  if (isControlApp(appId)) {
+    if (resourceId === `d1:${CONTROL_APP_DATABASE_ID}`) {
+      return (
+        <D1Editor
+          appId={appId}
+          appName={CONTROL_APP_NAME}
+          databaseId={CONTROL_APP_DATABASE_ID}
+        />
+      );
+    }
+    return <p class="m-0 text-sm opacity-70">Unknown storage resource.</p>;
+  }
   const detail = appDetail(appId);
   const appName = detail.data()?.app.name ?? "";
+  // Writes (upload, New folder, delete) need the push role; a viewer still
+  // browses, previews and downloads.
+  const myRole = parseAppRole(detail.data()?.myRole ?? "") ?? "view";
+  const canWrite = roleAtLeast(myRole, "push");
   if (resourceId.startsWith("r2:")) {
     return (
-      <R2Detail appId={appId} appName={appName} bucket={resourceId.slice(3)} />
+      <R2Browser
+        appId={appId}
+        appName={appName}
+        bucket={resourceId.slice(3)}
+        canWrite={canWrite}
+      />
     );
   }
   if (resourceId.startsWith("d1:")) {
-    return <D1Detail appId={appId} databaseId={resourceId.slice(3)} />;
+    return (
+      <D1Editor
+        appId={appId}
+        appName={appName}
+        databaseId={resourceId.slice(3)}
+      />
+    );
   }
   // DO resource ids are "do:{Binding}:{Name}" — the class is everything
   // after the binding, and either part may itself contain a colon.
   const className = resourceId.startsWith("do:")
     ? resourceId.split(":").slice(2).join(":")
     : resourceId;
-  return <DoDetail appId={appId} appName={appName} className={className} />;
+  return <DoBrowser appId={appId} appName={appName} className={className} />;
 };

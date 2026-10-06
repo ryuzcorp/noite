@@ -8,7 +8,9 @@ import {
   toMetricsHours,
 } from "$lib/app-detail/metrics";
 import { AppDetailPanel, AppHeader } from "$lib/app-detail/panel";
-import { AppSettingsPanel } from "$lib/app-detail/settings";
+import { AppSettingsPanel } from "$lib/app-detail/settings/panel";
+import { ControlAppDetail } from "$lib/apps/control-panel";
+import { CONTROL_APP_NAME, isControlApp } from "$lib/control-app";
 import { appDetail } from "$lib/resources";
 import { useRoute, head, searchParam } from "@ilha/router";
 
@@ -52,6 +54,13 @@ const MetricsTab = ({ appId }: { appId: string }) => {
 };
 
 const AppPageBody = ({ appId }: { appId: string }) => {
+  // The reserved control app has no runner row, fleet or telemetry: it gets a
+  // dedicated minimal detail instead of the tenant tabs. Branching before any
+  // appDetail/liveErrors resource keeps the runner out of the loop entirely.
+  if (isControlApp(appId)) {
+    head({ title: `${CONTROL_APP_NAME} · Noite` });
+    return <ControlAppDetail />;
+  }
   const tab = searchParam<TabId>("t", { default: "overview", parse: toTabId });
   // The open error (ErrorsPanel's `?e=`): a tab click always lands on the
   // tab's top level, so the Errors tab shows the list, not a stale detail.

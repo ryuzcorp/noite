@@ -9,9 +9,9 @@ import { admin } from "better-auth/plugins";
 import { emailOTP } from "better-auth/plugins/email-otp";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { OxideRequest } from "oxidejs";
+import { fail } from "oxidejs";
 
-import { ensureDbPromise, getAuthDb, missingDb, resolveEnv } from "./db";
+import { getAuthDb, resolveEnv } from "./db";
 import { errorMessage } from "./errors";
 import {
   checkInvite,
@@ -19,8 +19,8 @@ import {
   INVITES_PER_USER,
   mintInvites,
   signupPolicy,
-} from "./invites.server";
-import type { InviteProblem } from "./invites.server";
+} from "./server/invites.server";
+import type { InviteProblem } from "./server/invites.server";
 
 // oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
 export class MissingAuthSecretError extends Schema.TaggedError<MissingAuthSecretError>()(
@@ -34,23 +34,11 @@ export class UnauthorizedError extends Schema.TaggedError<UnauthorizedError>()(
   { message: Schema.String }
 ) {}
 
-// oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
-export class ActionError extends Schema.TaggedError<ActionError>()(
-  "ActionError",
-  { message: Schema.String }
-) {}
-
-export const failAction = (message: string): never => {
-  throw new ActionError({ message });
-};
-
-/** Map an unknown catch value into a mapped ActionError (client-visible).
- * Use in action catch blocks instead of repeating the instanceof ternary. */
+/** Map an unknown catch value into a client-visible `fail(message)`.
+ * Oxide masks a plain throw as `-32603 Internal error`; this keeps the real
+ * message the user needs. Use in action catch blocks. */
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site values are unknown by construction; this helper narrows to message
-export const failUnknown = (error: unknown): never => {
-  const message = errorMessage(error);
-  throw new ActionError({ message });
-};
+export const failUnknown = (error: unknown): never => fail(errorMessage(error));
 
 // oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
 class InvalidRegistrationContextError extends Schema.TaggedError<InvalidRegistrationContextError>()(
@@ -218,7 +206,8 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
       // better-auth warns that it cannot determine a client IP and falls back
       // to ONE shared bucket per path for every caller — which turns its rate
       // limit into a fleet-wide outage under normal traffic.
-      // routes.ts collapses X-Forwarded-For to the one trusted address before
+      // `withTrustedClientAddress` (lib/rate-limit.ts) collapses
+      // X-Forwarded-For to the one trusted address before
       // the request reaches better-auth (a client controls the left-most
       // entries), so the first value read here is safe to key on.
       ipAddress: {
@@ -228,7 +217,7 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
     baseURL,
     database: kyselyAdapter(getAuthDb()),
     plugins: [
-      // God-mode impersonates any account (including fellow admins) — the
+      // The admin home impersonates any account (including fellow admins) — the
       // impersonator is already an admin, so this grants no new power.
       admin({ allowImpersonatingAdmins: true, defaultRole: "user" }),
       // Lost-passkey recovery: email OTP is deliberately secondary — the
@@ -352,13 +341,25 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
     // budget has to clear a real UI's session polling (each navigation asks for
     // the session, and the login page polls while the cookie settles) — 120/min
     // tripped during an e2e run, which then blocked every later action. The
-    // platform limiter in http/routes.ts is the coarser backstop.
+    // platform limiter in http/router.ts is the coarser backstop.
     rateLimit: {
       enabled: true,
       max: publicAuthRpm(),
       window: 60,
     },
     secret: env.BETTER_AUTH_SECRET,
+    // First-run onboarding marker. `input: false` keeps it server-only: a
+    // client can never POST itself onboarding-complete; only the
+    // `completeOnboarding` action writes it.
+    user: {
+      additionalFields: {
+        onboardedAt: {
+          input: false,
+          required: false,
+          type: "date",
+        },
+      },
+    },
   });
 
 /** Port of the retired joint image's boot gate: never serve auth with
@@ -416,28 +417,12 @@ export const authFromEnv = (env: KitEnv, origin: string) => {
   return createAuth(authEnv(env), baseURL);
 };
 
-export const authFromEnvEffect = (env: KitEnv, origin: string) =>
-  Effect.gen(function* () {
-    if (!env.BETTER_AUTH_SECRET) {
-      return yield* Effect.fail(
-        new MissingAuthSecretError({
-          message: "noite: BETTER_AUTH_SECRET is missing",
-        })
-      );
-    }
-    const baseURL = env.BETTER_AUTH_URL ?? origin;
-    const refusal = defaultSecretRefusal(env, baseURL);
-    if (refusal) {
-      return yield* Effect.fail(
-        new MissingAuthSecretError({ message: refusal })
-      );
-    }
-    return createAuth(authEnv(env), baseURL);
-  });
-
 export interface SessionUser {
   email: string;
   id: string;
+  /** Set only on an impersonated session (the admin plugin). The onboarding
+   * action refuses to mark the target onboarded on such a session. */
+  impersonatedBy: string | null;
   name: string;
 }
 
@@ -451,33 +436,3 @@ export const resolveAdminEmail = (): string | null => {
   const email = raw.trim().toLowerCase();
   return email || null;
 };
-
-export const requireUser = Effect.gen(function* () {
-  const request = yield* OxideRequest;
-  const env = resolveEnv();
-  yield* Effect.promise(() => ensureDbPromise());
-  if (!env.BETTER_AUTH_SECRET) {
-    return yield* Effect.fail(missingDb());
-  }
-  // Malformed request URL must 401 like a missing session, never defect.
-  let origin: string;
-  try {
-    ({ origin } = new URL(request.url));
-  } catch {
-    return yield* Effect.fail(
-      new UnauthorizedError({ message: "Sign in required" })
-    );
-  }
-  const auth = yield* authFromEnvEffect(env, origin);
-  const session = yield* Effect.tryPromise({
-    catch: () => new UnauthorizedError({ message: "Sign in required" }),
-    try: () => auth.api.getSession({ headers: request.headers }),
-  });
-  const user = session?.user;
-  if (!user) {
-    return yield* Effect.fail(
-      new UnauthorizedError({ message: "Sign in required" })
-    );
-  }
-  return { email: user.email, id: user.id, name: user.name };
-});

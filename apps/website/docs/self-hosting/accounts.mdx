@@ -3,15 +3,19 @@ title: Accounts
 description: Invite-only registration on a Noite install — bootstrap admin, single-use codes, and admin panels.
 ---
 
-Registration is invite-only once the instance is bootstrapped. The **first** account to sign up needs no code and is promoted to the `admin` role, so god-mode works without `NOITE_ADMIN_EMAIL`; every later registration must present a single-use invitation code. Each new account receives `INVITES_PER_USER = 2` codes of its own, so an invitee can pass one on without admin rights.
+Registration is invite-only once the instance is bootstrapped. The **first** account to sign up needs no code and is promoted to the `admin` role, so the admin home works without `NOITE_ADMIN_EMAIL`; every later registration must present a single-use invitation code. Each new account receives `INVITES_PER_USER = 2` codes of its own, so an invitee can pass one on without admin rights.
 
 Codes are 12 characters in four-char groups (`ABCD-EFGH-JKLM`) drawn from an unambiguous alphabet, and a code that is used, revoked or unknown is refused with a specific message before any account is created. Redemption is a single atomic claim (`UPDATE ... WHERE usedBy IS NULL`), so one code admits exactly one account even under concurrent signups.
 
 - Members read their unused codes in the "Invitations" card on `/account`.
-- Admins mint 1–50 more and revoke unused ones from the Invitations panel in `/god-mode`.
+- Admins mint 1–50 more and revoke unused ones from the Invites tab of the admin home (the control app's detail page at `/apps/_control`).
 - The signup form shows the code field only when `GET /api/invite/status` reports the instance is past its first account, so the bootstrap account never sees it.
 
 `NOITE_ADMIN_EMAIL` promotes the matching account to the admin role at startup; it is documented in [Environment variables](/reference/environment-variables).
+
+## First-run onboarding
+
+A new account sees a one-time three-step tour the first time it reaches the dashboard: create an app and push to its Git remote, mint an API token (keys live on `/account` — used as the Git HTTPS password with username `git`, or as `NOITE_API_KEY` for the CLI), and where to follow the project. Finishing, skipping, or closing the modal marks the account done (`user.onboardedAt`) and it never returns. An account that signed in before this release sees the tour once and is then marked the same way; no operator action is needed.
 
 ## Lost passkey
 
@@ -26,3 +30,21 @@ docker compose exec noite noite-runner recover --email me@example.com
 ```
 
 It prints a code and where to enter it. The code is the same kind the email carries: it works once, expires after 10 minutes, and anyone holding it can sign in as that account, so treat the output like a password. Running it needs a shell in the container, which already holds every secret of the install, so it grants nothing that access did not.
+
+## The admin home
+
+An instance admin sees the control plane itself in `/apps`: the **Noite** card ("admin"), which is not a user app but a link to a dedicated detail page. That page is the whole admin home — the control plane's telemetry tabs (Overview, Metrics, Errors, Logs) next to instance administration (Users, Apps, Invites), with the control database linked from Overview. Every tab re-checks the same rule server-side: a real instance admin, never an impersonated session.
+
+In `make dev` the control UI runs under vite and supervises no celld, so Metrics, Errors and Logs are hidden — there is no control fleet to record them — while the Users, Apps and Invites tabs and the control database still work.
+
+## Browsing the control database
+
+The Overview tab lists the control database; it opens on its own page (`/storage/_control/d1:noite-control`) in the same D1 grid tenant apps use, served **in-process** from the control node's own database — the worker already owns that binding, so nothing shells out to the `celld d1` CLI (which once hung every later page load; see SPEC.md). Each row also links to the proper admin action: a `user` row offers **Manage in Users** and an `invite` row **Manage in Invites**, pre-filling that tab's search with the row's email or code.
+
+The browser is deliberately narrow:
+
+- Values that would leak credentials are masked and never leave the worker: `session.token`, `account.password`/`accessToken`/`refreshToken`/`idToken`, `verification.value`, `passkey.publicKey`/`credentialID`, `apikey.key`.
+- `session`, `account`, `verification`, `passkey` and `apikey` rows cannot be inserted or edited. The one exception is deleting a `session` row by primary key, which revokes that session.
+- `user`, `invite`, `app_collaborator` and `collaborator_invite` rows can be added, edited and deleted — except `user.role`, `user.banned`, `user.banReason` and `user.banExpires` (change roles and bans in the Users tab). You can edit your own `user` row (e.g. clear `onboardedAt` to see the tour again) but not delete it, so an admin cannot lock themselves out.
+- Everything else is read-only by default, including tables a later release adds, so new auth state can never become silently writable.
+- The browser is unavailable while impersonating, and every read and write re-checks the admin gate and this policy server-side.

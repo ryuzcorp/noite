@@ -29,9 +29,15 @@ const COMPATIBILITY_DATE: &str = "2026-09-01";
 #[derive(Debug, PartialEq, Eq)]
 pub enum Plan {
     /// Assets only.
-    Static { dir: String, not_found: &'static str },
+    Static {
+        dir: String,
+        not_found: &'static str,
+    },
     /// A module exporting `fetch`, optionally with static assets.
-    Worker { main: String, assets: Option<String> },
+    Worker {
+        main: String,
+        assets: Option<String>,
+    },
 }
 
 impl Plan {
@@ -39,10 +45,17 @@ impl Plan {
     pub fn note(&self) -> String {
         match self {
             Plan::Static { dir, not_found } => {
-                let fallback = if *not_found == "404-page" { "404.html" } else { "index.html" };
+                let fallback = if *not_found == "404-page" {
+                    "404.html"
+                } else {
+                    "index.html"
+                };
                 format!("generated: static site from {dir}/ (unknown paths get {fallback})")
             }
-            Plan::Worker { main, assets: Some(dir) } => {
+            Plan::Worker {
+                main,
+                assets: Some(dir),
+            } => {
                 format!("generated: Worker {main} with static assets from {dir}/")
             }
             Plan::Worker { main, assets: None } => format!("generated: Worker {main}"),
@@ -157,7 +170,8 @@ pub fn write(root: &Path, name: &str, plan: &Plan) -> anyhow::Result<()> {
         }
     }
     let text = serde_json::to_string_pretty(&config)?;
-    std::fs::write(root.join("wrangler.json"), format!("{text}\n")).context("write wrangler.json")?;
+    std::fs::write(root.join("wrangler.json"), format!("{text}\n"))
+        .context("write wrangler.json")?;
     Ok(())
 }
 
@@ -190,10 +204,18 @@ mod tests {
         let root = scratch("spa");
         write_file(&root, "dist/index.html", "<!doctype html>");
         write_file(&root, "dist/assets/app.js", "");
-        let plan = plan(&root, Some(&json!({ "scripts": { "build": "vite build" } }))).unwrap().unwrap();
+        let plan = plan(
+            &root,
+            Some(&json!({ "scripts": { "build": "vite build" } })),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             plan,
-            Plan::Static { dir: "dist".into(), not_found: "single-page-application" }
+            Plan::Static {
+                dir: "dist".into(),
+                not_found: "single-page-application"
+            }
         );
         write(&root, "hello", &plan).unwrap();
         let config = written(&root);
@@ -208,7 +230,13 @@ mod tests {
         write_file(&root, "out/index.html", "");
         write_file(&root, "out/404.html", "");
         let plan = plan(&root, None).unwrap().unwrap();
-        assert_eq!(plan, Plan::Static { dir: "out".into(), not_found: "404-page" });
+        assert_eq!(
+            plan,
+            Plan::Static {
+                dir: "out".into(),
+                not_found: "404-page"
+            }
+        );
     }
 
     #[test]
@@ -216,19 +244,28 @@ mod tests {
         let root = scratch("order");
         write_file(&root, "build/index.html", "");
         write_file(&root, "dist/index.html", "");
-        assert!(matches!(plan(&root, None).unwrap(), Some(Plan::Static { dir, .. }) if dir == "dist"));
+        assert!(
+            matches!(plan(&root, None).unwrap(), Some(Plan::Static { dir, .. }) if dir == "dist")
+        );
     }
 
     #[test]
     fn a_fetch_module_deploys_as_a_worker_with_its_assets() {
         let root = scratch("worker");
-        write_file(&root, "server/index.js", "export default { fetch() { return new Response('hi') } }");
+        write_file(
+            &root,
+            "server/index.js",
+            "export default { fetch() { return new Response('hi') } }",
+        );
         write_file(&root, "dist/index.html", "");
         let package = json!({ "main": "./server/index.js" });
         let plan = plan(&root, Some(&package)).unwrap().unwrap();
         assert_eq!(
             plan,
-            Plan::Worker { main: "server/index.js".into(), assets: Some("dist".into()) }
+            Plan::Worker {
+                main: "server/index.js".into(),
+                assets: Some("dist".into())
+            }
         );
         write(&root, "api", &plan).unwrap();
         let config = written(&root);
@@ -241,18 +278,30 @@ mod tests {
     fn an_npm_init_main_that_does_not_exist_is_ignored() {
         let root = scratch("npm-init");
         write_file(&root, "dist/index.html", "");
-        let plan = plan(&root, Some(&json!({ "main": "index.js" }))).unwrap().unwrap();
+        let plan = plan(&root, Some(&json!({ "main": "index.js" })))
+            .unwrap()
+            .unwrap();
         assert!(matches!(plan, Plan::Static { .. }), "{plan:?}");
     }
 
     #[test]
     fn a_node_server_is_refused_with_a_reason() {
         let root = scratch("express");
-        write_file(&root, "index.js", "const app = express(); app.listen(3000);");
-        let err = plan(&root, Some(&json!({ "main": "index.js" }))).unwrap_err().to_string();
+        write_file(
+            &root,
+            "index.js",
+            "const app = express(); app.listen(3000);",
+        );
+        let err = plan(&root, Some(&json!({ "main": "index.js" })))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Node HTTP server"), "{err}");
         // Bun/Deno-style servers that also export fetch are not Node servers.
-        write_file(&root, "index.js", "export default { fetch: app.fetch }; if (dev) server.listen(3000);");
+        write_file(
+            &root,
+            "index.js",
+            "export default { fetch: app.fetch }; if (dev) server.listen(3000);",
+        );
         assert!(plan(&root, Some(&json!({ "main": "index.js" }))).is_ok());
     }
 
@@ -261,7 +310,9 @@ mod tests {
         let root = scratch("leak");
         write_file(&root, "dist/index.html", "");
         write_file(&root, "dist/server.js", "export default { fetch() {} }");
-        let err = plan(&root, Some(&json!({ "main": "dist/server.js" }))).unwrap_err().to_string();
+        let err = plan(&root, Some(&json!({ "main": "dist/server.js" })))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("served publicly"), "{err}");
     }
 
@@ -285,6 +336,8 @@ mod tests {
     fn nothing_deployable_is_none() {
         let root = scratch("empty");
         write_file(&root, "src/main.ts", "");
-        assert!(plan(&root, Some(&json!({ "name": "x" }))).unwrap().is_none());
+        assert!(plan(&root, Some(&json!({ "name": "x" })))
+            .unwrap()
+            .is_none());
     }
 }

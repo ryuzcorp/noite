@@ -6,7 +6,7 @@ import { ensureDbPromise, setD1Binding } from "../lib/db";
 import { resetRateLimits } from "../lib/rate-limit";
 import { createTestD1 } from "../testing/d1";
 import type { TestD1 } from "../testing/d1";
-import { handleHttp } from "./routes";
+import { handleHttp } from "./router";
 
 const ENV = {
   BASE_DOMAIN: "localhost",

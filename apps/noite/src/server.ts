@@ -4,10 +4,10 @@
  * unmatched path returns undefined and falls through to static assets.
  *
  * Default export only: `virtual:oxide/worker` re-exports this module's named
- * exports from the Worker, so route helpers stay in `http/routes.ts`.
+ * exports from the Worker, so route helpers stay in `http/router.ts`.
  */
 import type { ServerEntry } from "oxidejs";
 
-import { handleHttp } from "./http/routes";
+import { handleHttp } from "./http/router";
 
 export default { fetch: handleHttp } satisfies ServerEntry<KitEnv>;

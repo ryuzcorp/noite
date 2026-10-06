@@ -1,46 +1,14 @@
-# dependencies (bun install)
-node_modules
-
-# output
-out
-dist
-*.tgz
+# Generated ilha router types, celld/wrangler local state and dev vars
 .ilha
 .celld
 .wrangler
 .dev.vars
 .dev.vars*
 
-# code coverage
-coverage
-*.lcov
-
 # playwright e2e: reports, traces, authed session
 playwright-report/
 test-results/
 e2e/.auth/
 
-# logs
-logs
-_.log
-report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
-
-# dotenv environment variable files
-.env
-.env.development.local
-.env.test.local
-.env.production.local
-.env.local
-!.env.example
-
-# caches
-.eslintcache
-.cache
-*.tsbuildinfo
-
-# IntelliJ based IDEs
-.idea
-
-# Finder (MacOS) folder config
-.DS_Store
+# local celld/wrangler data
 data/

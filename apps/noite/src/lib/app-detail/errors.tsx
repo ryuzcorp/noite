@@ -5,12 +5,9 @@
 import { navigate, searchParam } from "@ilha/router";
 import { atom } from "ilha";
 
-import { setErrorStatus } from "../apps.server";
 import { formatAgo, formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
 import { decodeErrors, errorsUrl, feedKeys, liveFeed } from "../feeds";
-import { ArrowLeft } from "../icons";
-import { LoadError } from "../load-error";
 import { appDetail, errorDetail } from "../resources";
 import type {
   ErrorStatus,
@@ -19,7 +16,10 @@ import type {
   RunnerErrorIssue,
   RunnerErrorList,
 } from "../runner";
-import { ListSkeleton, SectionSkeleton } from "../skeletons";
+import { setErrorStatus } from "../server/errors.server";
+import { ArrowLeft } from "../ui/icons";
+import { LoadError } from "../ui/load-error";
+import { ListSkeleton, SectionSkeleton } from "../ui/skeletons";
 
 const STATUSES: { id: ErrorStatus; label: string }[] = [
   { id: "open", label: "Open" },
@@ -610,7 +610,16 @@ export const ErrorsSummary = ({ appId }: { appId: string }) => {
   );
 };
 
-export const ErrorsPanel = ({ appId }: { appId: string }) => {
+/** Errors tab. `canTriage` overrides the app-role read for a panel whose
+ * target has no app row (the reserved control app): the caller passes the
+ * gate's answer, and the appDetail resource is never requested. */
+export const ErrorsPanel = ({
+  appId,
+  canTriage: canTriageProp,
+}: {
+  appId: string;
+  canTriage?: boolean;
+}) => {
   // Status and the open issue live in the URL (like ?t=) so a refresh or a
   // shared link lands on the same view.
   const status = searchParam<ErrorStatus>("es", {
@@ -618,8 +627,9 @@ export const ErrorsPanel = ({ appId }: { appId: string }) => {
     parse: toStatus,
   });
   const selected = searchParam("e", { default: "" });
-  const role = appDetail(appId).data()?.myRole;
-  const canTriage = role === "push" || role === "admin";
+  const role =
+    canTriageProp === undefined ? appDetail(appId).data()?.myRole : undefined;
+  const canTriage = canTriageProp ?? (role === "push" || role === "admin");
   if (selected()) {
     return (
       <ErrorDetailView

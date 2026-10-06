@@ -1,7 +1,7 @@
 //! Control UI as fleet #0 (SPEC, Control UI).
 //!
 //! The control worker is a reserved fleet the runner supervises (see
-//! `main::supervise_control`), with three differences from an app: created at
+//! `supervise`), with three differences from an app: created at
 //! boot, bundle from the image (`/opt/noite/control/dist`), cannot be
 //! deleted. At boot: build the worker vars from the runner's config and
 //! environment, revision-gate (`sha256(bundle REVISION ‖ canonical-json(vars))`
@@ -10,12 +10,23 @@
 //! runner at `http://127.0.0.1:8080`.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU32;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::host::cmd;
+use crate::host::children::Supervised;
+use crate::host::logs::LogState;
+use crate::host::{exec, metrics, s3};
 
 const MARKER_KEY: &str = "ui/revision";
+
+/// Reserved telemetry key of the control fleet. There is deliberately no
+/// `app` row for it (nothing that iterates apps — reconcile, Caddy, sleep,
+/// purge, list_apps — may ever see the control plane), so the metrics ingest
+/// attributes its rows to this key and reads its Parquet from its own bucket
+/// prefix (`control/telemetry/...`, see `metrics::telemetry_prefix`).
+pub const SLUG: &str = "_control";
 
 /// Control-worker vars taken verbatim from the environment (see
 /// `control_vars`). Keep in sync with the worker's `KitEnv`.
@@ -35,7 +46,13 @@ fn canonical_json(value: &serde_json::Value) -> String {
             keys.sort();
             let parts: Vec<String> = keys
                 .iter()
-                .map(|k| format!("{}:{}", serde_json::to_string(k).unwrap_or_default(), canonical_json(&map[*k])))
+                .map(|k| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(k).unwrap_or_default(),
+                        canonical_json(&map[*k])
+                    )
+                })
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
@@ -89,12 +106,26 @@ pub fn revision(bundle_rev: &str, vars: &serde_json::Value) -> String {
     format!("{bundle_rev}-{}", &hex[..16.min(hex.len())])
 }
 
+/// True when this image carries the baked control bundle: the release image
+/// does (`docker/Dockerfile` target `noite` copies `dist`), the dev image does
+/// not (`vite dev` serves the UI on the same port). `main` then deploys and
+/// supervises no control fleet at all — no control celld, therefore no control
+/// telemetry — and surfaces that on `GET /v1/admin/stats` as `control_fleet` so
+/// the UI says so instead of showing empty charts.
+pub fn bundle_present(cfg: &Config) -> bool {
+    let dir = Path::new(&cfg.control_bundle_dir);
+    dir.join("wrangler.json").exists() || dir.join("wrangler.jsonc").exists()
+}
+
 /// Deploy the baked bundle when revision differs, then return the vars.
 /// Runner-owned tool path (`celld deploy` via run_cmd, env_clear + explicit).
 pub async fn ensure_deployed(cfg: &Config) -> anyhow::Result<serde_json::Value> {
     let dist = PathBuf::from(&cfg.control_bundle_dir);
-    if !dist.join("wrangler.json").exists() && !dist.join("wrangler.jsonc").exists() {
-        anyhow::bail!("control bundle missing at {} (image without UI stage?)", dist.display());
+    if !bundle_present(cfg) {
+        anyhow::bail!(
+            "control bundle missing at {} (image without UI stage?)",
+            dist.display()
+        );
     }
     let bundle_rev = tokio::fs::read_to_string(dist.join("REVISION"))
         .await
@@ -119,19 +150,19 @@ pub async fn ensure_deployed(cfg: &Config) -> anyhow::Result<serde_json::Value> 
         work.join("wrangler.jsonc")
     };
     let text = tokio::fs::read_to_string(&wrangler).await?;
-    let mut doc: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("control wrangler parse: {e}"))?;
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("control wrangler parse: {e}"))?;
     if let Some(obj) = doc.as_object_mut() {
         obj.insert("vars".to_string(), vars.clone());
     }
     tokio::fs::write(&wrangler, serde_json::to_string_pretty(&doc)?).await?;
     let bucket = format!("s3://{}/control", cfg.s3_bucket);
-    let env_owned = cmd::aws_env(cfg);
+    let env_owned = s3::aws_env(cfg);
     let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     // Retry: S3 can flip 503 mid-deploy (rustfs restart); give up loudly.
     let mut last = anyhow::anyhow!("not attempted");
     for attempt in 1..=5 {
-        match cmd::run_cmd(
+        match exec::run_cmd(
             &cfg.celld_bin,
             &[
                 "deploy",
@@ -173,14 +204,14 @@ async fn fetch_marker(cfg: &Config) -> anyhow::Result<String> {
     let dest = std::env::temp_dir().join("noite-ui-revision-fetch");
     let _ = tokio::fs::remove_file(&dest).await;
     let uri = format!("s3://{}/{MARKER_KEY}", cfg.s3_bucket);
-    cmd::s3_cp_download(cfg, &uri, &dest).await?;
+    s3::s3_cp_download(cfg, &uri, &dest).await?;
     Ok(tokio::fs::read_to_string(&dest).await.unwrap_or_default())
 }
 
 async fn store_marker(cfg: &Config, rev: &str) -> anyhow::Result<()> {
     let dest = std::env::temp_dir().join("noite-ui-revision-store");
     tokio::fs::write(&dest, rev).await?;
-    cmd::s3_cp_upload(cfg, &dest, MARKER_KEY).await?;
+    s3::s3_cp_upload(cfg, &dest, MARKER_KEY).await?;
     Ok(())
 }
 
@@ -197,6 +228,47 @@ async fn copy_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Control fleet #0: celld with the public listener on loopback (Caddy is in
+/// the same container) and the internal one on the private address (see
+/// `control_advertise`). Supervised: restarted on exit, stopped with the
+/// fleets on shutdown. It runs the same telemetry environment as a tenant
+/// fleet (`metrics::otel_env`), so its Parquet lands under
+/// `s3://<bucket>/control/telemetry/...` (celld writes `telemetry/` relative
+/// to `--bucket`) and the ingest, compaction, error grouping and prune treat
+/// it as one more source — keyed `_control`, with no `app` row. Its pid is
+/// mirrored into `control_pid` and its stdout+stderr into the shared log
+/// buffer under the same key.
+pub fn supervise(config: &Config, control_pid: Arc<AtomicU32>, logs: LogState) -> Supervised {
+    let args = spawn_args(config);
+    let shutdown_ms = config.fleet_shutdown_ms().to_string();
+    let celld = config.celld_bin.clone();
+    let otel = metrics::otel_env(config);
+    Supervised::start_observed(
+        "control",
+        Some(control_pid),
+        Some((logs, SLUG.to_string())),
+        move || {
+            let state_dir = "/data/control";
+            let _ = std::fs::create_dir_all(state_dir);
+            let mut cmd = tokio::process::Command::new(&celld);
+            cmd.args(&args)
+                .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
+                .env("CELLD_WATCH", state_dir)
+                .env("CELLD_READY_FLEET_GATE_MS", "15000")
+                .env("CELLD_DURABILITY", "bucket")
+                .env("CELLD_SHUTDOWN_TOTAL_MS", &shutdown_ms)
+                // Piped so the supervisor captures the node's own log into the
+                // shared buffer (the OTel ring carries the worker's console).
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            for (key, value) in &otel {
+                cmd.env(key, value);
+            }
+            cmd
+        },
+    )
 }
 
 /// Spawn arguments for the control fleet (SPEC, Control UI).
@@ -241,4 +313,27 @@ pub fn control_advertise() -> String {
         })
         .unwrap_or_else(|| "127.0.0.1".into());
     format!("{host}:8091")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_presence_needs_a_wrangler_config() {
+        let mut cfg = Config::from_env().expect("config");
+        let dir = std::env::temp_dir().join(format!(
+            "noite-control-bundle-{}",
+            crate::models::new_id()
+        ));
+        cfg.control_bundle_dir = dir.to_string_lossy().into_owned();
+        // The dev image has the env var but no bundle: nothing to deploy, no
+        // control celld, no control telemetry.
+        assert!(!bundle_present(&cfg));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert!(!bundle_present(&cfg));
+        std::fs::write(dir.join("wrangler.json"), "{}").expect("wrangler");
+        assert!(bundle_present(&cfg));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

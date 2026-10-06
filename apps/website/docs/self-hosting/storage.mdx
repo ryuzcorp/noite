@@ -18,9 +18,9 @@ Store connection variables (`S3_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCE
 | Volume | Holds |
 | --- | --- |
 | `noite-data` | runner SQLite (apps, deploys, env, domains, metrics), git mirrors, builds, fleet working dirs, Caddy config and certificates |
-| `rustfs-data` | the bundled bucket: `git/` tip bundles, `fleets/` tenant celld, `control/` UI worker + its D1 (accounts, invites), `runner/state/` runner snapshots |
+| `rustfs-data` | the bundled bucket: `git/` tip bundles, `fleets/` tenant celld, `control/` UI worker + its D1 (accounts, invites) + the control fleet's telemetry, `runner/state/` runner snapshots |
 
-Bucket prefixes under the single `NOITE_S3_BUCKET`: `git/` (tip bundles), `fleets/` (tenant celld), `control/` (UI worker + its D1), `runner/state/` (runner snapshots).
+Bucket prefixes under the single `NOITE_S3_BUCKET`: `git/` (tip bundles), `fleets/` (tenant celld), `control/` (UI worker, its D1 and the control fleet's telemetry), `runner/state/` (runner snapshots).
 
 ## Snapshots
 
@@ -32,8 +32,46 @@ The loss window on an ungraceful crash is about 70 s of API mutations. A `claim(
 
 Tenant fleets run `CELLD_OTEL=1` with celld's bucket sink: Parquet under `telemetry/traces/` and `telemetry/logs/` in the fleet bucket, no collector service. The flush interval comes from `RUNNER_OTEL_FLUSH_MS` (30 s by default) and retention from `RUNNER_TELEMETRY_RETENTION_DAYS` (30 days), which also bounds the runner's `app_metric` prune.
 
-Frequent flushes need a compaction job — queries grow slow within hours otherwise, and celld does not compact its own files. The runner runs it hourly via `metrics::compact_fleet`: for the hour that just ended, per node directory, one DuckDB `COPY (...) TO .../compacted.parquet (FORMAT parquet, COMPRESSION zstd)` ordered by `start_unix_us`, then the source files are deleted. Deletion happens only after `head-object` proves the compacted file exists, so a failed copy can never lose spans; `union_by_name=true` merges an hour that spans a schema change (the docs call the schema `v0-unstable`). The current hour is never compacted.
+### The control fleet's own telemetry
 
-Runner queries are day-scoped: the aggregation window stops 10 s behind the flush and names only the day directories it spans, instead of globbing the whole retention.
+The control UI is a celld fleet too, and it runs the same telemetry environment as a tenant (`RUNNER_OTEL_FLUSH_MS`, `RUNNER_TELEMETRY_RETENTION_DAYS`) with its own bucket prefix, so celld writes under `s3://<bucket>/control/telemetry/{traces,logs}/<node>/<yyyy>/<mm>/<dd>/<hh>/`. It is ingested, compacted, pruned and error-grouped exactly like a tenant fleet, keyed on the reserved `_control` slug, and served on the same runner routes (`/v1/apps/_control/metrics|spans|logs|errors`, the RPC equivalents and the UI's SSE streams).
 
-To read the same data yourself, point DuckDB at the fleet bucket the way the runner does (the `SET s3_endpoint/s3_region/s3_access_key_id/s3_secret_access_key/s3_url_style='path'` preamble in `apps/runner/src/host/metrics.rs`) and aggregate the hourly Parquet under `s3://<bucket>/fleets/<slug>/telemetry/traces/<node>/<yyyy>/<mm>/<dd>/<hh>/*.parquet`; `celld.fetch` spans count as requests, `ok` is the error flag, `duration_us`/`queue_wait_us` the latency and queue wait.
+There is deliberately **no `app` row** for `_control` (`_control` is reserved at create): nothing that iterates apps — reconcile, the Caddyfile writer, scale-to-zero, purge, backup, `GET /v1/apps` — ever sees the control plane. The UI shows the surfaces only to a real instance admin, never an impersonated session. Control traffic includes the dashboard's own polling and event streams, so those numbers are real load, not a baseline to subtract.
+
+`--slug _control` is the way to replay just the control fleet's window (see below).
+
+Frequent flushes need a compaction job — queries grow slow within hours otherwise, and celld does not compact its own files. The runner runs it hourly via `host/metrics/compact.rs::compact_fleet`: for the hour that just ended, per node directory, one DuckDB `COPY (...) TO .../compacted.parquet (FORMAT parquet, COMPRESSION zstd)` ordered by `start_unix_us`, then the source files are deleted. Deletion happens only after `head-object` proves the compacted file exists, so a failed copy can never lose spans; `union_by_name=true` merges an hour that spans a schema change (the docs call the schema `v0-unstable`). The current hour is never compacted.
+
+Runner queries are hour-scoped: the aggregation window stops 10 s behind the flush and names only the hour directories it spans, instead of globbing the whole retention.
+
+### Ingest, re-reads and downtime
+
+The runner ingests telemetry into `metrics.sqlite` (next to the runner database, never snapshotted) with one DuckDB pass per flush interval. Each pass processes **hour-aligned chunks**: the completed hours it still owes, then the partial current hour. Every table it owns is written with **replace** semantics (`app_metric` usage, `app_span_stat`, `app_log`, `app_error_*`), so re-reading a window always yields the same aggregates instead of double counting.
+
+That is what makes failures and downtime safe:
+
+- A failed pass (a DuckDB error, an S3 hiccup) is distinguished from an idle one (the globs matched no file). Idle completes the chunk; **a real error leaves the watermark where it was**, so the chunk is retried — and the retry is exact.
+- One broken fleet cannot hold the others. When a pass covering several fleets fails, the runner immediately retries it **per fleet**: healthy fleets commit and advance, and only the failing fleet keeps its watermark. A fleet that keeps failing is retried after a short backoff, so a persistent problem does not re-fail every tick.
+- After the runner is off for hours or days, the next ticks walk the gap **one hour-chunk at a time**, oldest first, advancing the watermark per committed chunk and bounded by `RUNNER_TELEMETRY_RETENTION_DAYS`. This includes fleets that have stopped, parked or crashed since: any fleet whose watermark is behind is drained through its last complete hour, so a scale-to-zero park does not strand the tail of its telemetry (it lands within the hour it stopped in). Data older than retention has been pruned by celld and cannot be recovered.
+- Compaction cannot change a re-read's counts: an hour directory that holds a `compacted.parquet` is read from that file alone, so the intermediate state of a compaction (compacted file written, sources not yet deleted) never counts twice, and a leftover from an interrupted source delete is cleaned up on the next compaction pass.
+
+### Replaying a window
+
+Because the ingest replaces, a window can be replayed safely — for example to recover rows dropped by the pre-alpha.2 ingest bug (a whole pass was skipped when any running app had no requests or logs in the hour, and the watermark advanced as if there had been nothing to read).
+
+Upgrading an install that predates this ingest (schema version 4) queues **one automatic replay of the retention window** for every fleet; the runner consumes it, rewinds its watermarks to the floor, and runs the same chunked catch-up. The replay is a re-read of already-stored Parquet through the same DuckDB path, so it costs S3 reads and DuckDB time proportional to the window and the fleet count — a handful of fleets over 30 days takes minutes; a large install on a slow store can take longer. It runs in the background and does not block the control plane.
+
+To replay by hand — a later window, one fleet — run:
+
+```bash
+docker compose exec noite noite-runner telemetry reingest --since 7d
+docker compose exec noite noite-runner telemetry reingest --slug blog --since 2026-01-01T00:00:00Z
+```
+
+`--since` takes an RFC3339 timestamp or a duration back from now (`24h`, `7d`); the default is the whole retention window, clamped to what the bucket still holds. Without `--no-wait` the command blocks until the runner reports it has caught up (or `--timeout` seconds pass, after which it continues in the background).
+
+:::note
+Metrics, logs and errors ingested before this release are correct; the replay only fills in the rows the old ingest skipped.
+:::
+
+To read the same data yourself, point DuckDB at the fleet bucket the way the runner does (the `SET s3_endpoint/s3_region/s3_access_key_id/s3_secret_access_key/s3_url_style='path'` preamble in `apps/runner/src/host/metrics/plan.rs`) and aggregate the hourly Parquet under `s3://<bucket>/fleets/<slug>/telemetry/traces/<node>/<yyyy>/<mm>/<dd>/<hh>/*.parquet`; `celld.fetch` spans count as requests, `ok` is the error flag, `duration_us`/`queue_wait_us` the latency and queue wait.

@@ -1,4 +1,4 @@
-import { CreateAppForm } from "$lib/apps";
+import { CreateAppForm } from "$lib/apps/list";
 import { head } from "@ilha/router";
 
 export default function NewAppPage() {

@@ -9,6 +9,9 @@
 # twice before running it on a live install.
 set -eu
 cd "$(dirname "$0")/.."
+# shellcheck source=docker/lib.sh
+. "$(dirname "$0")/lib.sh"
+detect_engine
 
 FROM="${1:-}"
 # A relative path is resolved against the repo (the default destination); an
@@ -28,30 +31,9 @@ if [ ! -f "${FROM_DIR}/MANIFEST" ]; then
 fi
 
 PROJECT="${COMPOSE_PROJECT_NAME:-noite}"
-if command -v docker >/dev/null 2>&1; then
-  ENGINE=docker
-else
-  ENGINE=podman
-fi
-case "${COMPOSE:-}" in
-*"docker compose"*) ENGINE=docker ;;
-*"podman compose"*) ENGINE=podman ;;
-esac
-CE="$ENGINE compose -f docker/compose.yaml"
+CE="$COMPOSE -f docker/compose.yaml"
 
-img_ok() { "$ENGINE" image inspect "$1" >/dev/null 2>&1; }
-HELPER=""
-for candidate in "${NOITE_BACKUP_IMAGE:-}" "${NOITE_IMAGE:-}" noite:local noite-dev:local ghcr.io/ryuzcorp/noite:alpha; do
-  if [ -n "$candidate" ] && img_ok "$candidate"; then
-    HELPER="$candidate"
-    break
-  fi
-done
-if [ -z "$HELPER" ]; then
-  echo "error: no image available to untar the volumes with."
-  echo "  set NOITE_BACKUP_IMAGE=<image with tar>."
-  exit 1
-fi
+pick_tar_image untar "set NOITE_BACKUP_IMAGE=<image with tar>."
 
 echo "==> restoring ${FROM}"
 cat "${FROM_DIR}/MANIFEST"

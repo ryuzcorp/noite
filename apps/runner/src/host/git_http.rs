@@ -27,7 +27,9 @@ use serde_json::json;
 
 use crate::config::Config;
 use crate::db;
-use crate::host::cmd::{self, TipBundle};
+use crate::host::exec;
+use crate::host::s3;
+use crate::host::tips::TipBundle;
 use crate::host::git_manifest::{self, Manifest, ManifestRef};
 use crate::host::git_policy::{self, PolicyDecision};
 use crate::models::App;
@@ -47,7 +49,7 @@ struct GitAuthOk {
 }
 
 pub fn http_bare(cfg: &Config, slug: &str) -> PathBuf {
-    cmd::work_root(cfg)
+    exec::work_root(cfg)
         .join("git-http")
         .join(format!("{slug}.git"))
 }
@@ -129,11 +131,7 @@ async fn authorize(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "git-auth: UI unreachable");
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                "auth service unavailable",
-            )
-                .into_response());
+            return Err((StatusCode::BAD_GATEWAY, "auth service unavailable").into_response());
         }
     };
     if res.status() == StatusCode::UNAUTHORIZED || res.status() == StatusCode::FORBIDDEN {
@@ -166,7 +164,7 @@ pub(crate) async fn ensure_bare(cfg: &Config, slug: &str) -> anyhow::Result<Path
     let bare = http_bare(cfg, slug);
     tokio::fs::create_dir_all(bare.parent().unwrap()).await?;
     if !bare.join("HEAD").exists() {
-        cmd::run_cmd(
+        exec::run_cmd(
             "git",
             &["init", "--bare", bare.to_str().unwrap()],
             None,
@@ -181,7 +179,7 @@ pub(crate) async fn ensure_bare(cfg: &Config, slug: &str) -> anyhow::Result<Path
 
 async fn hydrate_from_s3(cfg: &Config, bare: &Path, slug: &str) -> anyhow::Result<()> {
     let prefix = format!("git/{slug}/refs/");
-    let json = cmd::s3_list_prefix(cfg, &cfg.s3_bucket, &prefix).await?;
+    let json = s3::s3_list_prefix(cfg, &cfg.s3_bucket, &prefix).await?;
     if json.trim().is_empty() || json.trim() == "null" {
         return Ok(());
     }
@@ -223,13 +221,15 @@ async fn hydrate_from_s3(cfg: &Config, bare: &Path, slug: &str) -> anyhow::Resul
             best.insert(ref_path.to_string(), (key.to_string(), sha, lm));
         }
     }
-    let tmp = cmd::work_root(cfg).join("git-http").join(format!(".hydrate-{slug}"));
+    let tmp = exec::work_root(cfg)
+        .join("git-http")
+        .join(format!(".hydrate-{slug}"));
     tokio::fs::create_dir_all(&tmp).await?;
     for (refname, (key, sha, _)) in best {
         let bundle = tmp.join(format!("{sha}.bundle"));
-        cmd::s3_cp_download(cfg, &cfg.s3_uri(&key), &bundle).await?;
+        s3::s3_cp_download(cfg, &cfg.s3_uri(&key), &bundle).await?;
         let refspec = format!("+{sha}:{refname}");
-        cmd::run_cmd(
+        exec::run_cmd(
             "git",
             &[
                 &format!("--git-dir={}", bare.display()),
@@ -249,7 +249,7 @@ async fn hydrate_from_s3(cfg: &Config, bare: &Path, slug: &str) -> anyhow::Resul
 }
 
 pub(crate) async fn list_refs(bare: &Path) -> anyhow::Result<HashMap<String, String>> {
-    let out = cmd::run_cmd(
+    let out = exec::run_cmd(
         "git",
         &[
             &format!("--git-dir={}", bare.display()),
@@ -276,7 +276,7 @@ pub(crate) async fn list_refs(bare: &Path) -> anyhow::Result<HashMap<String, Str
 async fn set_ref(bare: &Path, refname: &str, sha: Option<&str>) -> anyhow::Result<()> {
     match sha {
         Some(sha) => {
-            cmd::run_cmd(
+            exec::run_cmd(
                 "git",
                 &[
                     &format!("--git-dir={}", bare.display()),
@@ -291,7 +291,7 @@ async fn set_ref(bare: &Path, refname: &str, sha: Option<&str>) -> anyhow::Resul
             .await?;
         }
         None => {
-            let _ = cmd::run_cmd(
+            let _ = exec::run_cmd(
                 "git",
                 &[
                     &format!("--git-dir={}", bare.display()),
@@ -319,14 +319,14 @@ async fn write_ref_bundle(
     sha: &str,
 ) -> anyhow::Result<String> {
     let bundle_key = format!("git/{slug}/{refname}/{sha}.bundle");
-    let tmp = cmd::work_root(cfg)
+    let tmp = exec::work_root(cfg)
         .join("git-http")
         .join(format!(".bundle-{slug}-{sha}"));
     if let Some(parent) = tmp.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let result = async {
-        cmd::run_cmd(
+        exec::run_cmd(
             "git",
             &[
                 &format!("--git-dir={}", bare.display()),
@@ -340,7 +340,7 @@ async fn write_ref_bundle(
             Duration::from_secs(120),
         )
         .await?;
-        cmd::s3_cp_upload(cfg, &tmp, &bundle_key).await?;
+        s3::s3_cp_upload(cfg, &tmp, &bundle_key).await?;
         Ok::<_, anyhow::Error>(bundle_key.clone())
     }
     .await;
@@ -352,7 +352,7 @@ async fn write_ref_bundle(
 /// after the manifest flip, so concurrent readers already moved on.
 async fn prune_old_bundles(cfg: &Config, slug: &str, refname: &str, keep_key: &str) {
     let prefix = format!("git/{slug}/{refname}/");
-    let Ok(json) = cmd::s3_list_prefix(cfg, &cfg.s3_bucket, &prefix).await else {
+    let Ok(json) = s3::s3_list_prefix(cfg, &cfg.s3_bucket, &prefix).await else {
         return;
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else {
@@ -366,7 +366,7 @@ async fn prune_old_bundles(cfg: &Config, slug: &str, refname: &str, keep_key: &s
             continue;
         };
         if key != keep_key && key.ends_with(".bundle") {
-            let _ = cmd::s3_delete_key(cfg, key).await;
+            let _ = s3::s3_delete_key(cfg, key).await;
         }
     }
 }
@@ -375,12 +375,12 @@ async fn prune_old_bundles(cfg: &Config, slug: &str, refname: &str, keep_key: &s
 async fn delete_ref_prefix(cfg: &Config, slug: &str, refname: &str) {
     let bucket = cfg.s3_bucket.clone();
     let prefix = format!("git/{slug}/{refname}/");
-    let _ = cmd::s3_rm_prefix(cfg, &bucket, &prefix).await;
+    let _ = s3::s3_rm_prefix(cfg, &bucket, &prefix).await;
 }
 
 /// `old` must be an ancestor of `new` for a fast-forward update.
 async fn is_fast_forward(bare: &Path, old: &str, new: &str) -> bool {
-    cmd::run_cmd(
+    exec::run_cmd(
         "git",
         &[
             &format!("--git-dir={}", bare.display()),
@@ -418,8 +418,7 @@ pub(crate) async fn after_receive(
             Ok(bundle_key) => changed.push((refname.clone(), sha.clone(), bundle_key)),
             Err(e) => {
                 for (refname, _, _) in &changed {
-                    let _ =
-                        set_ref(bare, refname, before.get(refname).map(|s| s.as_str())).await;
+                    let _ = set_ref(bare, refname, before.get(refname).map(|s| s.as_str())).await;
                 }
                 return Err(e);
             }
@@ -438,7 +437,10 @@ pub(crate) async fn after_receive(
     for (refname, sha, bundle_key) in &changed {
         refs.insert(
             refname.clone(),
-            ManifestRef { sha: sha.clone(), bundle: bundle_key.clone() },
+            ManifestRef {
+                sha: sha.clone(),
+                bundle: bundle_key.clone(),
+            },
         );
     }
     for (refname, sha) in &after {
@@ -448,11 +450,21 @@ pub(crate) async fn after_receive(
         // A ref the previous manifest does not carry (every push writes a
         // complete one, so this is a ref git itself created): cut its bundle.
         let bundle = write_ref_bundle(&state.config, bare, &app.slug, refname, sha).await?;
-        refs.insert(refname.clone(), ManifestRef { sha: sha.clone(), bundle });
+        refs.insert(
+            refname.clone(),
+            ManifestRef {
+                sha: sha.clone(),
+                bundle,
+            },
+        );
     }
     // 3. The linearization point: one manifest write.
     let seq = old_manifest.map(|m| m.seq + 1).unwrap_or(1);
-    let manifest = Manifest { version: git_manifest::MANIFEST_VERSION, seq, refs };
+    let manifest = Manifest {
+        version: git_manifest::MANIFEST_VERSION,
+        seq,
+        refs,
+    };
     if let Err(e) = git_manifest::write_manifest(&state.config, &app.slug, &manifest).await {
         for (refname, _, _) in &changed {
             let _ = set_ref(bare, refname, before.get(refname).map(|s| s.as_str())).await;
@@ -477,7 +489,10 @@ pub(crate) async fn after_receive(
     Ok(changed
         .iter()
         .find(|(refname, _, _)| refname == "refs/heads/main")
-        .map(|(_, sha, bundle_key)| TipBundle { key: bundle_key.clone(), sha: sha.clone() }))
+        .map(|(_, sha, bundle_key)| TipBundle {
+            key: bundle_key.clone(),
+            sha: sha.clone(),
+        }))
 }
 
 /// Re-apply the manifest to a bare mirror when it moved under us (another
@@ -534,9 +549,14 @@ pub async fn info_refs(
     } else {
         "receive-pack"
     };
-    let out = match cmd::run_cmd(
+    let out = match exec::run_cmd(
         "git",
-        &[prog, "--stateless-rpc", "--advertise-refs", bare.to_str().unwrap()],
+        &[
+            prog,
+            "--stateless-rpc",
+            "--advertise-refs",
+            bare.to_str().unwrap(),
+        ],
         None,
         &[],
         Duration::from_secs(30),
@@ -578,7 +598,7 @@ pub async fn upload_pack(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     };
     refresh_from_manifest(&state, &app.slug, &bare).await;
-    match cmd::run_cmd_stdin(
+    match exec::run_cmd_stdin(
         "git",
         &[
             "upload-pack",
@@ -593,10 +613,7 @@ pub async fn upload_pack(
     {
         Ok(out) => (
             StatusCode::OK,
-            [(
-                header::CONTENT_TYPE,
-                "application/x-git-upload-pack-result",
-            )],
+            [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
             out,
         )
             .into_response(),
@@ -642,7 +659,9 @@ pub async fn receive_pack(
                 if !is_fast_forward(&bare, old, new).await {
                     return (
                         StatusCode::FORBIDDEN,
-                        format!("rule push-policy: 'push' may not force-push {refname} (admin only)"),
+                        format!(
+                            "rule push-policy: 'push' may not force-push {refname} (admin only)"
+                        ),
                     )
                         .into_response();
                 }
@@ -653,13 +672,9 @@ pub async fn receive_pack(
         Ok(m) => m,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     };
-    let out = match cmd::run_cmd_stdin(
+    let out = match exec::run_cmd_stdin(
         "git",
-        &[
-            "receive-pack",
-            "--stateless-rpc",
-            bare.to_str().unwrap(),
-        ],
+        &["receive-pack", "--stateless-rpc", bare.to_str().unwrap()],
         &body,
         None,
         Duration::from_secs(300),

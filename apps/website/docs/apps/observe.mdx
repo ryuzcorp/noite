@@ -13,6 +13,8 @@ The **Metrics** tab covers the last 24 hours, 7 days or 30 days (the range picke
 
 Below the charts, the spans table lists recent slow or failed requests, and the analytics tables break traffic down by browser and OS, path and referrer.
 
+Ingestion is idempotent and resumable: each pass rewrites the hours it reads, so a failed pass is retried instead of skipped, and after the runner has been down the gap is ingested hour by hour on restart (bounded by telemetry retention). An operator can replay a window by hand with [`noite-runner telemetry reingest`](/self-hosting/storage#replaying-a-window).
+
 ## Errors
 
 The **Errors** tab collects exceptions without an SDK. Noite reads them from the same telemetry as Metrics, so they show up about a minute after they happen.
@@ -32,6 +34,16 @@ Stack locations point into the bundle celld runs (`worker.js:58`), not your sour
 The **Events** tab is tenant-facing product analytics, separate from metrics. The app emits events into named channels; the UI offers channel filter, text search, paging, per-event tags and user properties, and insight widgets over the feed.
 
 Before the first event lands, the tab shows an ingest snippet for that app. Identified users carry properties that appear with their events.
+
+## The control plane's own app
+
+`_control` is a reserved pseudo app in your app list — the Noite control plane itself, labelled "admin". It has no runner `app` row, no fleet to deploy and no source to browse, so its detail carries the control plane's telemetry tabs (Overview with metrics, an errors summary and the control D1, **Metrics**, **Errors**, **Logs**) next to the instance administration tabs (**Users**, **Apps**, **Invites**). The control D1 opens on its own `/storage` page, like any app's storage. This page is the single admin home. The numbers come from the control node's own celld telemetry, ingested exactly like a tenant's (Parquet under `control/telemetry/`), so they include this dashboard's own polling and event streams — real load, not noise to subtract.
+
+It is visible to a **real instance admin only**, never an impersonated session, and both the page and every stream behind it re-check that rule server-side.
+
+:::note
+`make dev` serves the control UI from `vite dev` and runs no control celld, so there is no control telemetry to show: the page hides the Metrics, Errors and Logs tabs and shows a one-line notice on Overview, while the admin tabs and the control database keep working. Use the release image (`make up`/`make e2e`) to see the telemetry surfaces with data.
+:::
 
 ## Sleep
 

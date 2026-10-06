@@ -39,13 +39,17 @@ fn url_host(raw: &str) -> Option<String> {
     let (_, rest) = raw.split_once("://")?;
     let auth = rest.split('/').next().unwrap_or("");
     let auth = auth.split('@').next_back().unwrap_or("");
-    let host = auth.split(':').next().unwrap_or("").trim().trim_matches('.');
+    let host = auth
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('.');
     if host.is_empty() {
         return None;
     }
     Some(host.to_string())
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tenancy {
@@ -63,7 +67,10 @@ impl Tenancy {
 }
 
 fn parse_tenancy(raw: Option<&str>, base_domain: &str) -> Tenancy {
-    let raw = raw.map(str::trim).filter(|v| !v.is_empty()).map(|v| v.to_ascii_lowercase());
+    let raw = raw
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_ascii_lowercase());
     match raw.as_deref() {
         Some("single") => Tenancy::Single,
         Some("multi") => Tenancy::Multi,
@@ -85,6 +92,50 @@ fn parse_opt_uid(raw: Option<&str>, def: u32) -> Option<u32> {
         Some(v) => v.parse().ok().or(Some(def)),
     }
 }
+
+/// `NOITE_TELEMETRY` kill switch: `0`/`false`/`off` (case-insensitive) lock the
+/// instance heartbeat off. Anything else — including unset — leaves it on
+/// (opt-out).
+pub fn parse_telemetry_disabled(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
+/// `DO_NOT_TRACK` (https://donottrack.sh): any non-empty value other than `0`
+/// is a global opt-out and locks telemetry off.
+pub fn parse_do_not_track(raw: Option<&str>) -> bool {
+    raw.map(str::trim)
+        .is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Whether a base domain is local/dev-only: `localhost`, `*.localhost`,
+/// `*.local`, `*.test`, `*.internal`, or an IP literal. Such an install never
+/// reports (a dev box, the e2e lane, or a LAN name); an sslip.io install
+/// resolves to an IP but is a real public host, so it does report.
+pub fn is_local_domain(domain: &str) -> bool {
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() {
+        return false;
+    }
+    if domain.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    domain == "localhost"
+        || domain.ends_with(".localhost")
+        || domain.ends_with(".local")
+        || domain.ends_with(".test")
+        || domain.ends_with(".internal")
+}
+
+/// First uid of the reserved per-app build range. The range must not overlap
+/// the fleet uid (10020) or a system user, and is baked into the image's
+/// `/etc/passwd` (docker/Dockerfile) because Node's `os.userInfo()` throws
+/// for a uid with no passwd entry.
+pub const BUILD_UID_BASE: u32 = 10030;
+/// Apps covered by the build uid range (one uid per app).
+pub const BUILD_UID_RANGE: u32 = 1024;
 
 /// Control UI inside this container: fleet #0 in prod, `vite dev` in dev.
 pub const CONTROL_UPSTREAM: &str = "127.0.0.1:8090";
@@ -156,12 +207,17 @@ fn cidr_ok(raw: &str) -> bool {
 fn parse_trusted_proxies(raw: &str) -> (TrustedProxies, Vec<String>) {
     let mut out = TrustedProxies::default();
     let mut bad = Vec::new();
-    for token in raw.split([',', ' ', '\t', '\n']).map(str::trim).filter(|t| !t.is_empty()) {
+    for token in raw
+        .split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
         match token.to_ascii_lowercase().as_str() {
             "cloudflare" => {
                 if !out.cloudflare {
                     out.cloudflare = true;
-                    out.ranges.extend(CLOUDFLARE_RANGES.iter().map(|r| (*r).to_string()));
+                    out.ranges
+                        .extend(CLOUDFLARE_RANGES.iter().map(|r| (*r).to_string()));
                 }
             }
             "private_ranges" => out.ranges.push("private_ranges".into()),
@@ -210,7 +266,12 @@ impl Default for EdgeLimits {
 impl EdgeLimits {
     fn from_env() -> anyhow::Result<Self> {
         let d = Self::default();
-        let num = |key: &str, def: u32| env_or(&[key], &def.to_string()).trim().parse().unwrap_or(def);
+        let num = |key: &str, def: u32| {
+            env_or(&[key], &def.to_string())
+                .trim()
+                .parse()
+                .unwrap_or(def)
+        };
         let (trusted_proxies, bad) =
             parse_trusted_proxies(&env::var("NOITE_TRUSTED_PROXIES").unwrap_or_default());
         if !bad.is_empty() {
@@ -243,64 +304,64 @@ fn parse_fleet_ports() -> (u16, u16) {
     (20000, 29999)
 }
 
- #[derive(Clone, Debug)]
- pub struct Config {
-     pub bind: String,
-     pub runner_token: String,
-     pub database_url: String,
-     pub s3_endpoint: String,
-     pub s3_public_endpoint: String,
-     /// Single rustfs bucket; git + fleets are prefixes under it.
-     pub s3_bucket: String,
-     pub aws_region: String,
-     pub aws_access_key_id: String,
-     pub aws_secret_access_key: String,
-     pub base_domain: String,
-     /// Control-plane subdomain: empty = bare domain (dev `localhost` — the
-     /// only hostname Bitwarden's matcher accepts without https); prod sets
-     /// `app` so control serves `app.{BASE_DOMAIN}` and the apex stays free.
-     pub control_subdomain: String,
-     /// Extra hostnames serving the control UI (comma-separated
-     /// `CONTROL_EXTRA_HOSTS`) — e.g. Coolify's generated domain.
-     pub control_extra_hosts: Vec<String>,
-     pub work_dir: String,
-     pub caddyfile_path: String,
-     pub celld_bin: String,
-     /// Fleet port range (SPEC, Ports): two ports per app.
-     pub fleet_port_min: u16,
-     pub fleet_port_max: u16,
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub bind: String,
+    pub runner_token: String,
+    pub database_url: String,
+    pub s3_endpoint: String,
+    pub s3_public_endpoint: String,
+    /// Single rustfs bucket; git + fleets are prefixes under it.
+    pub s3_bucket: String,
+    pub aws_region: String,
+    pub aws_access_key_id: String,
+    pub aws_secret_access_key: String,
+    pub base_domain: String,
+    /// Control-plane subdomain: empty = bare domain (dev `localhost` — the
+    /// only hostname Bitwarden's matcher accepts without https); prod sets
+    /// `app` so control serves `app.{BASE_DOMAIN}` and the apex stays free.
+    pub control_subdomain: String,
+    /// Extra hostnames serving the control UI (comma-separated
+    /// `CONTROL_EXTRA_HOSTS`) — e.g. Coolify's generated domain.
+    pub control_extra_hosts: Vec<String>,
+    pub work_dir: String,
+    pub caddyfile_path: String,
+    pub celld_bin: String,
+    /// Fleet port range (SPEC, Ports): two ports per app.
+    pub fleet_port_min: u16,
+    pub fleet_port_max: u16,
     pub poll_ms: u64,
     /// Fallback S3 tip sweep interval (T2.2): pushes notify the reconcile
     /// loop over an in-process channel, and this only covers bundles written
     /// behind the runner's back (another runner, a manual bucket write).
     pub tip_sweep_s: u64,
-     pub caddy_upstream_host: String,
-     /// Caddy `auto_https`: unset = on except `localhost`; explicit
-     /// `off` for behind-proxy deployments (our Caddy still terminates
-     /// per-host TLS itself via on-demand certs).
-     pub auto_https: bool,
-     pub caddy_control_upstream: String,
-     pub caddy_api_upstream: String,
-     /// Caddy admin endpoint (the child's 127.0.0.1:2019). The generator
-     /// stays; the writer POSTs to /load instead of the shared volume.
-     pub caddy_admin_url: String,
-     /// Public base for Git smart-HTTP remotes (no trailing slash).
-     pub git_public_base: String,
-     /// Per-account app quota. Every app is its own celld fleet, so this is the
-     /// knob that bounds how much of the host one account can claim.
-     pub max_apps_per_user: u32,
-     /// celld's shedding threshold in MiB (`CELLD_MAX_RSS_MB`); 0 leaves
-     /// celld's default, 80% of the container's memory. celld compares it with
-     /// the greater of its own RSS and the cgroup's working set, and every
-     /// fleet shares the one container cgroup, so this is a container-wide
-     /// threshold, not a per-tenant cap (SPEC, Limits): a per-fleet value
-     /// such as 512 closes every fleet's admission as soon as the container
-     /// as a whole passes it.
-     pub fleet_max_rss_mb: u32,
-     /// celld's own log filter for tenant fleets (`RUNNER_FLEET_LOG`). The
-     /// runner's RUST_LOG describes the runner's modules, so inheriting it left
-     /// a fleet's runtime logs out of the per-app log view entirely.
-     pub fleet_log: String,
+    pub caddy_upstream_host: String,
+    /// Caddy `auto_https`: unset = on except `localhost`; explicit
+    /// `off` for behind-proxy deployments (our Caddy still terminates
+    /// per-host TLS itself via on-demand certs).
+    pub auto_https: bool,
+    pub caddy_control_upstream: String,
+    pub caddy_api_upstream: String,
+    /// Caddy admin endpoint (the child's 127.0.0.1:2019). The generator
+    /// stays; the writer POSTs to /load instead of the shared volume.
+    pub caddy_admin_url: String,
+    /// Public base for Git smart-HTTP remotes (no trailing slash).
+    pub git_public_base: String,
+    /// Per-account app quota. Every app is its own celld fleet, so this is the
+    /// knob that bounds how much of the host one account can claim.
+    pub max_apps_per_user: u32,
+    /// celld's shedding threshold in MiB (`CELLD_MAX_RSS_MB`); 0 leaves
+    /// celld's default, 80% of the container's memory. celld compares it with
+    /// the greater of its own RSS and the cgroup's working set, and every
+    /// fleet shares the one container cgroup, so this is a container-wide
+    /// threshold, not a per-tenant cap (SPEC, Limits): a per-fleet value
+    /// such as 512 closes every fleet's admission as soon as the container
+    /// as a whole passes it.
+    pub fleet_max_rss_mb: u32,
+    /// celld's own log filter for tenant fleets (`RUNNER_FLEET_LOG`). The
+    /// runner's RUST_LOG describes the runner's modules, so inheriting it left
+    /// a fleet's runtime logs out of the per-app log view entirely.
+    pub fleet_log: String,
     /// Idle seconds after which a fleet's cells hibernate
     /// (`CELLD_IDLE_EVICT_S`). The docs' default evicts only under memory
     /// pressure, which keeps idle fleets resident forever.
@@ -320,15 +381,15 @@ fn parse_fleet_ports() -> (u16, u16) {
     /// Per-fleet on-disk asset cache in MiB (`CELLD_ASSET_CACHE_BYTES`),
     /// bounding the 512 MiB celld default per idle app.
     pub fleet_asset_cache_mb: u64,
-     /// Caddy JSON access log the device/path/ref tick tails. The Caddy `log`
-     /// block is path-fixed at the volume root; the Caddyfile itself may live
-     /// in a subpath (dev `dynamic/`).
-     pub caddy_access_log: String,
-     /// Tenancy mode (SPEC). Default multi off localhost.
-     pub tenancy: Tenancy,
-     /// Graceful-stop budget in ms (SPEC, Shutdown). Fleets get
-     /// budget - 3000 as CELLD_SHUTDOWN_TOTAL_MS.
-     pub stop_budget_ms: u64,
+    /// Caddy JSON access log the device/path/ref tick tails. The Caddy `log`
+    /// block is path-fixed at the volume root; the Caddyfile itself may live
+    /// in a subpath (dev `dynamic/`).
+    pub caddy_access_log: String,
+    /// Tenancy mode (SPEC). Default multi off localhost.
+    pub tenancy: Tenancy,
+    /// Graceful-stop budget in ms (SPEC, Shutdown). Fleets get
+    /// budget - 3000 as CELLD_SHUTDOWN_TOTAL_MS.
+    pub stop_budget_ms: u64,
     /// Max worktree bytes before a build is refused (RUNNER_BUILD_MAX_MB).
     pub build_max_mb: u64,
     /// Cap per app on the persistent bun cache (RUNNER_BUILD_CACHE_MB).
@@ -343,19 +404,28 @@ fn parse_fleet_ports() -> (u16, u16) {
     /// ingest tick cadence (spec T3.4). 30 s means ~6x fewer Parquet PUTs and
     /// files than the old 5 s; dashboards lag live traffic by up to ~40 s.
     pub otel_flush_ms: u64,
-    /// Uids for the build sandbox (10010) and tenant fleets (10020).
-    /// None = current user (dev only, single-tenant).
-    pub build_uid: Option<u32>,
-    pub build_gid: Option<u32>,
+    /// The per-app build uid range: `[base, base + range)`, allocated
+    /// one-to-one to apps (`db::ensure_app_build_uid`). Every app's builds
+    /// and release commands run as their own uid in this range, so two
+    /// concurrent builds cannot read each other's worktree or cache.
+    /// `base: None` = no uid drop (dev only, single-tenant).
+    pub build_uid_base: Option<u32>,
+    pub build_uid_range: u32,
+    /// Tenant fleet uid (10020). None = current user (dev only, single-tenant).
     pub fleet_uid: Option<u32>,
     pub fleet_gid: Option<u32>,
-     /// Baked control bundle (fleet #0 source; absent in the dev image).
-     pub control_bundle_dir: String,
-     /// Better-auth origin for boot validation (host must be served).
-     pub better_auth_url: String,
+    /// Baked control bundle (fleet #0 source; absent in the dev image).
+    pub control_bundle_dir: String,
+    /// Better-auth origin for boot validation (host must be served).
+    pub better_auth_url: String,
     /// Edge rate limits, request bounds and trusted proxies.
     pub edge: EdgeLimits,
- }
+    /// Opt-out instance heartbeat (SPEC, telemetry): `NOITE_TELEMETRY`
+    /// (`0`/`false`/`off`) locks it off.
+    pub telemetry_disabled: bool,
+    /// `DO_NOT_TRACK` set to anything but `0`/empty locks it off.
+    pub do_not_track: bool,
+}
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
@@ -365,7 +435,9 @@ impl Config {
         }
         let base_domain = env::var("BASE_DOMAIN").unwrap_or_else(|_| "localhost".into());
         if base_domain.trim().is_empty() {
-            anyhow::bail!("BASE_DOMAIN must not be empty (got blank); set it to your domain, e.g. noite.now");
+            anyhow::bail!(
+                "BASE_DOMAIN must not be empty (got blank); set it to your domain, e.g. noite.now"
+            );
         }
         if base_domain != "localhost" && runner_token == "dev-runner-token" {
             anyhow::bail!(
@@ -386,10 +458,8 @@ impl Config {
                 format!("https://git.{base_domain}")
             }
         });
-        let auto_https = parse_auto_https(
-            env::var("CADDY_AUTO_HTTPS").ok().as_deref(),
-            &base_domain,
-        );
+        let auto_https =
+            parse_auto_https(env::var("CADDY_AUTO_HTTPS").ok().as_deref(), &base_domain);
         let tenancy = parse_tenancy(env::var("NOITE_TENANCY").ok().as_deref(), &base_domain);
         let (fleet_port_min, fleet_port_max) = parse_fleet_ports();
         let cfg = Self {
@@ -470,18 +540,27 @@ impl Config {
                 .unwrap_or(300),
             telemetry_retention_days: env_or(&["RUNNER_TELEMETRY_RETENTION_DAYS"], "30")
                 .parse()
-                .unwrap_or(14),
+                .unwrap_or(30),
             otel_flush_ms: env_or(&["RUNNER_OTEL_FLUSH_MS"], "30000")
                 .parse()
                 .unwrap_or(30000),
-            build_uid: parse_opt_uid(env::var("RUNNER_BUILD_UID").ok().as_deref(), 10010),
-            build_gid: parse_opt_uid(env::var("RUNNER_BUILD_GID").ok().as_deref(), 10010),
+            build_uid_base: parse_opt_uid(
+                env::var("RUNNER_BUILD_UID_BASE").ok().as_deref(),
+                BUILD_UID_BASE,
+            ),
+            build_uid_range: env_or(&["RUNNER_BUILD_UID_RANGE"], "1024")
+                .parse()
+                .unwrap_or(BUILD_UID_RANGE),
             fleet_uid: parse_opt_uid(env::var("RUNNER_FLEET_UID").ok().as_deref(), 10020),
             fleet_gid: parse_opt_uid(env::var("RUNNER_FLEET_GID").ok().as_deref(), 10020),
             control_bundle_dir: env::var("CONTROL_BUNDLE_DIR")
                 .unwrap_or_else(|_| "/opt/noite/control/dist".into()),
             better_auth_url: env::var("BETTER_AUTH_URL").unwrap_or_default(),
             edge: EdgeLimits::from_env()?,
+            telemetry_disabled: parse_telemetry_disabled(
+                env::var("NOITE_TELEMETRY").ok().as_deref(),
+            ),
+            do_not_track: parse_do_not_track(env::var("DO_NOT_TRACK").ok().as_deref()),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -498,24 +577,33 @@ impl Config {
             || self.aws_secret_access_key == "noitesecretnoitesecretnoite12";
         if self.base_domain != "localhost" {
             if dev_token {
-                problems.push("RUNNER_TOKEN is the dev default on a non-localhost BASE_DOMAIN".into());
+                problems
+                    .push("RUNNER_TOKEN is the dev default on a non-localhost BASE_DOMAIN".into());
             }
             if dev_s3 {
-                problems.push("S3 keys are RustFS dev defaults on a non-localhost BASE_DOMAIN".into());
+                problems
+                    .push("S3 keys are RustFS dev defaults on a non-localhost BASE_DOMAIN".into());
             }
         }
         if !self.better_auth_url.is_empty() {
             match url_host(&self.better_auth_url) {
                 Some(host) => {
-                    let served = self.control_hosts().iter().any(|h| h.eq_ignore_ascii_case(&host));
+                    let served = self
+                        .control_hosts()
+                        .iter()
+                        .any(|h| h.eq_ignore_ascii_case(&host));
                     if !served {
-                        problems.push(format!("BETTER_AUTH_URL host {host} is not a served control host"));
+                        problems.push(format!(
+                            "BETTER_AUTH_URL host {host} is not a served control host"
+                        ));
                     }
                 }
                 None => problems.push("BETTER_AUTH_URL does not parse".into()),
             }
             if dev_auth && self.base_domain != "localhost" {
-                problems.push("BETTER_AUTH_SECRET is a dev default on a non-localhost BASE_DOMAIN".into());
+                problems.push(
+                    "BETTER_AUTH_SECRET is a dev default on a non-localhost BASE_DOMAIN".into(),
+                );
             }
         }
         if self.fleet_port_min >= self.fleet_port_max {
@@ -524,11 +612,42 @@ impl Config {
         if self.stop_budget_ms < 5000 {
             problems.push("NOITE_STOP_BUDGET_MS must be >= 5000".into());
         }
+        // A malformed value would otherwise parse to the fallback silently;
+        // report it like every other boot-invalid setting instead.
+        if let Some(problem) = telemetry_retention_problem(
+            std::env::var("RUNNER_TELEMETRY_RETENTION_DAYS")
+                .ok()
+                .as_deref(),
+        ) {
+            problems.push(problem);
+        }
         if self.telemetry_retention_days < 1 {
             problems.push("RUNNER_TELEMETRY_RETENTION_DAYS must be >= 1".into());
         }
         if self.otel_flush_ms < 1000 {
             problems.push("RUNNER_OTEL_FLUSH_MS must be >= 1000".into());
+        }
+        if self.build_uid_range == 0 {
+            problems.push("RUNNER_BUILD_UID_RANGE must be >= 1".into());
+        }
+        if let Some(base) = self.build_uid_base {
+            let end = base.saturating_add(self.build_uid_range);
+            if base < 1000 {
+                problems.push("RUNNER_BUILD_UID_BASE must be >= 1000 (system users below)".into());
+            }
+            if end > 65534 {
+                problems.push(format!(
+                    "RUNNER_BUILD_UID_BASE({base}) + RUNNER_BUILD_UID_RANGE({}) must stay below 65534",
+                    self.build_uid_range
+                ));
+            }
+            if let Some(fleet) = self.fleet_uid {
+                if fleet >= base && fleet < end {
+                    problems.push(format!(
+                        "RUNNER_BUILD_UID_BASE range {base}..{end} covers the fleet uid {fleet}"
+                    ));
+                }
+            }
         }
         if std::env::var("RAILWAY_DEPLOYMENT_ID").is_ok() {
             if let Ok(grace) = std::env::var("RAILWAY_DEPLOYMENT_DRAINING_SECONDS") {
@@ -557,6 +676,22 @@ impl Config {
         out
     }
 
+    /// Why the instance heartbeat is locked off, if it is: the env kill
+    /// switches first (`NOITE_TELEMETRY` wins over `DO_NOT_TRACK`), then a
+    /// local base domain. `None` means the stored preference decides.
+    pub fn telemetry_lock_reason(&self) -> Option<&'static str> {
+        if self.telemetry_disabled {
+            return Some("NOITE_TELEMETRY=0");
+        }
+        if self.do_not_track {
+            return Some("DO_NOT_TRACK");
+        }
+        if is_local_domain(&self.base_domain) {
+            return Some("local domain");
+        }
+        None
+    }
+
     /// Whether the edge can tell visitors apart, which per-client limits need.
     /// Behind a terminating proxy (`CADDY_AUTO_HTTPS=off` on a real domain:
     /// Coolify, Railway) every request arrives from the proxy, and without
@@ -576,26 +711,12 @@ impl Config {
         format!("git/{slug}/")
     }
 
-    /// Internal S3 layout URL (debug / tip poll); clients use `git_http_remote`.
+    /// Internal S3 layout URL (debug / tip poll); clients use `git_http_url`.
     pub fn s3_git_remote(&self, slug: &str) -> String {
         format!("s3://{}/git/{slug}", self.s3_bucket)
     }
 
     /// Stock Git remote URL (no embedded credentials — use Profile API key).
-    pub fn git_http_remote(&self, slug: &str) -> String {
-        self.git_http_url(slug)
-    }
-
-    /// Embed Basic credentials for local scripts (`git:TOKEN@host/slug`).
-    pub fn git_http_remote_with_token(&self, slug: &str, token: &str) -> String {
-        let base = self.git_public_base.trim_end_matches('/');
-        if let Some((scheme, rest)) = base.split_once("://") {
-            format!("{scheme}://git:{token}@{rest}/{slug}")
-        } else {
-            format!("git:{token}@{base}/{slug}")
-        }
-    }
-
     pub fn git_http_url(&self, slug: &str) -> String {
         format!("{}/{slug}", self.git_public_base.trim_end_matches('/'))
     }
@@ -632,6 +753,75 @@ impl Config {
     pub fn s3_uri(&self, key: &str) -> String {
         let key = key.trim_start_matches('/');
         format!("s3://{}/{key}", self.s3_bucket)
+    }
+}
+
+/// Boot problem for a malformed `RUNNER_TELEMETRY_RETENTION_DAYS` (None when
+/// unset or an integer). Split out from `validate` so the check stays pure.
+fn telemetry_retention_problem(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    raw.trim()
+        .parse::<i64>()
+        .is_err()
+        .then(|| format!("RUNNER_TELEMETRY_RETENTION_DAYS must be an integer, got {raw:?}"))
+}
+
+/// Minimal literal `Config` for tests outside this module (no env, no S3, no
+/// control hosts): callers clone it and mutate the few fields they exercise.
+#[cfg(test)]
+pub(crate) fn config_for_tests() -> Config {
+    Config {
+        bind: "127.0.0.1:0".into(),
+        runner_token: "test-token".into(),
+        database_url: "sqlite::memory:".into(),
+        s3_endpoint: "http://rustfs:9000".into(),
+        s3_public_endpoint: "http://rustfs:9000".into(),
+        s3_bucket: "noite".into(),
+        aws_region: "us-east-1".into(),
+        aws_access_key_id: "key".into(),
+        aws_secret_access_key: "secret".into(),
+        base_domain: "localhost".into(),
+        control_subdomain: "".into(),
+        control_extra_hosts: Vec::new(),
+        work_dir: "/tmp/noite-test".into(),
+        caddyfile_path: "/tmp/noite-test-bases".into(),
+        celld_bin: "celld".into(),
+        fleet_port_min: 20000,
+        fleet_port_max: 29999,
+        poll_ms: 5000,
+        tip_sweep_s: 60,
+        caddy_upstream_host: "127.0.0.1".into(),
+        auto_https: false,
+        fleet_log: "error,celld=warn".into(),
+        max_apps_per_user: 10,
+        fleet_max_rss_mb: 0,
+        fleet_idle_evict_s: 120,
+        fleet_deploy_poll_s: 300,
+        sleep_after_h: 24,
+        sleep_sweep_s: 3600,
+        wake_timeout_s: 120,
+        fleet_asset_cache_mb: 64,
+        caddy_control_upstream: CONTROL_UPSTREAM.into(),
+        caddy_api_upstream: API_UPSTREAM.into(),
+        caddy_admin_url: "http://127.0.0.1:2019".into(),
+        git_public_base: "https://git.localhost".into(),
+        caddy_access_log: "/caddy/access.log".into(),
+        tenancy: Tenancy::Single,
+        stop_budget_ms: 25000,
+        build_max_mb: 2048,
+        build_cache_mb: 512,
+        build_timeout_s: 300,
+        telemetry_retention_days: 30,
+        otel_flush_ms: 30000,
+        build_uid_base: None,
+        build_uid_range: BUILD_UID_RANGE,
+        fleet_uid: None,
+        fleet_gid: None,
+        control_bundle_dir: "/opt/noite/control/dist".into(),
+        better_auth_url: "".into(),
+        edge: EdgeLimits::default(),
+        telemetry_disabled: false,
+        do_not_track: false,
     }
 }
 
@@ -676,64 +866,102 @@ mod tests {
     }
 
     #[test]
+    fn malformed_telemetry_retention_is_a_problem() {
+        assert!(telemetry_retention_problem(None).is_none());
+        assert!(telemetry_retention_problem(Some("30")).is_none());
+        assert!(telemetry_retention_problem(Some(" 7 ")).is_none());
+        let problem = telemetry_retention_problem(Some("thirty")).expect("malformed is a problem");
+        assert!(problem.contains("RUNNER_TELEMETRY_RETENTION_DAYS"));
+        assert!(problem.contains("thirty"));
+    }
+
+    #[test]
+    fn telemetry_kill_switches_parse() {
+        for raw in ["0", "false", "off", " OFF ", "False"] {
+            assert!(
+                parse_telemetry_disabled(Some(raw)),
+                "{raw:?} disables telemetry"
+            );
+        }
+        for raw in ["1", "true", "on", "", "yes"] {
+            assert!(
+                !parse_telemetry_disabled(Some(raw)),
+                "{raw:?} does not disable telemetry"
+            );
+        }
+        assert!(!parse_telemetry_disabled(None), "unset leaves it enabled");
+
+        for raw in ["1", "true", "yes", "false", " 1 "] {
+            assert!(parse_do_not_track(Some(raw)), "{raw:?} opts out");
+        }
+        for raw in ["0", "", "  "] {
+            assert!(!parse_do_not_track(Some(raw)), "{raw:?} does not opt out");
+        }
+        assert!(!parse_do_not_track(None), "unset does not opt out");
+    }
+
+    #[test]
+    fn local_domains_are_detected() {
+        for domain in [
+            "localhost",
+            "LOCALHOST",
+            "localhost.",
+            "dev.localhost",
+            "noite.local",
+            "app.test",
+            "box.internal",
+            "127.0.0.1",
+            "10.0.0.5",
+            "::1",
+        ] {
+            assert!(is_local_domain(domain), "{domain:?} is local");
+        }
+        for domain in [
+            "noite.now",
+            "app.noite.now",
+            "127.0.0.1.sslip.io",
+            "10-0-0-5.nip.io",
+            "local",
+            "test",
+            "internal",
+            "notlocalhost",
+            "",
+        ] {
+            assert!(!is_local_domain(domain), "{domain:?} is public");
+        }
+    }
+
+    #[test]
+    fn telemetry_lock_precedence() {
+        let mut cfg = config_for_tests();
+        // localhost (the test default) is a local domain.
+        assert_eq!(cfg.telemetry_lock_reason(), Some("local domain"));
+
+        cfg.base_domain = "noite.now".into();
+        assert_eq!(cfg.telemetry_lock_reason(), None, "a public domain is open");
+
+        cfg.do_not_track = true;
+        assert_eq!(cfg.telemetry_lock_reason(), Some("DO_NOT_TRACK"));
+
+        // NOITE_TELEMETRY=0 is listed first and wins over DO_NOT_TRACK.
+        cfg.telemetry_disabled = true;
+        assert_eq!(cfg.telemetry_lock_reason(), Some("NOITE_TELEMETRY=0"));
+
+        // A lock from env holds even on a public domain.
+        cfg.do_not_track = false;
+        assert_eq!(cfg.telemetry_lock_reason(), Some("NOITE_TELEMETRY=0"));
+    }
+
+    #[test]
     fn tenant_bases_skips_ips_ports_and_dupes() {
-        let cfg = Config {
-            bind: "0.0.0.0:8080".into(),
-            runner_token: "test-token".into(),
-            database_url: "sqlite::memory:".into(),
-            s3_endpoint: "http://rustfs:9000".into(),
-            s3_public_endpoint: "http://rustfs:9000".into(),
-            s3_bucket: "noite".into(),
-            aws_region: "us-east-1".into(),
-            aws_access_key_id: "key".into(),
-            aws_secret_access_key: "secret".into(),
-            base_domain: "localhost".into(),
-            control_subdomain: "".into(),
-            control_extra_hosts: vec![
-                "noite.local".into(),
-                "192.168.10.62".into(),
-                "noite.local".into(),
-                "weird:9080".into(),
-                "".into(),
-            ],
-            work_dir: "/tmp/noite-test".into(),
-            caddyfile_path: "/tmp/noite-test-bases".into(),
-            celld_bin: "celld".into(),
-            fleet_port_min: 20000,
-            fleet_port_max: 29999,
-            poll_ms: 5000,
-            tip_sweep_s: 60,
-            caddy_upstream_host: "127.0.0.1".into(),
-            auto_https: false,
-            fleet_log: "error,celld=warn".into(),
-            max_apps_per_user: 10,
-            fleet_max_rss_mb: 0,
-            fleet_idle_evict_s: 120,
-            fleet_deploy_poll_s: 300,
-            sleep_after_h: 24,
-            sleep_sweep_s: 3600,
-            wake_timeout_s: 120,
-            fleet_asset_cache_mb: 64,
-            caddy_control_upstream: CONTROL_UPSTREAM.into(),
-            caddy_api_upstream: API_UPSTREAM.into(),
-            caddy_admin_url: "http://127.0.0.1:2019".into(),
-            git_public_base: "https://git.localhost".into(),
-            caddy_access_log: "/caddy/access.log".into(),
-            tenancy: Tenancy::Single,
-            stop_budget_ms: 25000,
-            build_max_mb: 2048,
-            build_cache_mb: 512,
-            build_timeout_s: 300,
-            telemetry_retention_days: 14,
-            otel_flush_ms: 30000,
-            build_uid: None,
-            build_gid: None,
-            fleet_uid: None,
-            fleet_gid: None,
-            control_bundle_dir: "/opt/noite/control/dist".into(),
-            better_auth_url: "".into(),
-            edge: EdgeLimits::default(),
-        };
+        let mut cfg = config_for_tests();
+        cfg.control_extra_hosts = vec![
+            "noite.local".into(),
+            "192.168.10.62".into(),
+            "noite.local".into(),
+            "weird:9080".into(),
+            "".into(),
+        ];
         assert_eq!(cfg.tenant_bases(), vec!["localhost", "noite.local"]);
     }
 

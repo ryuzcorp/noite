@@ -1,4 +1,4 @@
-import { AccountPanel } from "$lib/account-panel";
+import { AccountPanel } from "$lib/account/panel";
 import { head } from "@ilha/router";
 
 export default function Account() {

@@ -96,7 +96,7 @@
  * precedence in the tree's fallback chain). Token references flip with
  * the light/dark theme for free; bg stays transparent to blend with
  * the pane. Set on the tree host; custom properties inherit into its
- * shadow root, where the tree renders (see paneIn in source-browser). */
+ * shadow root, where the tree renders (see paneIn in source/browser.tsx). */
 .noite-src-tree {
   --trees-accent-override: var(--color-primary);
   --trees-bg-override: transparent;
@@ -137,6 +137,50 @@ dialog.modal.modal-end .modal-box {
 }
 @media (prefers-reduced-motion: reduce) {
   dialog.modal.modal-end .modal-box {
+    transition: none;
+  }
+}
+
+/* Onboarding steps fade in from the side as the tour advances. */
+.onboarding-step {
+  animation: onboarding-step-in 220ms ease-out;
+}
+@keyframes onboarding-step-in {
+  from {
+    opacity: 0;
+    translate: 0.75rem 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .onboarding-step {
+    animation: none;
+  }
+}
+
+/* Onboarding spotlight: while a step points at a sidebar item, the dialog's
+ * own dim is turned off and the spotlight's huge box-shadow dims everything
+ * except the target. The ring is an outline (box-shadow is taken). */
+.modal[open].onboarding-spotlit {
+  background-color: transparent;
+}
+.onboarding-spotlight {
+  box-shadow: 0 0 0 9999px oklch(0% 0 0 / 0.45);
+  outline: 2px solid oklch(100% 0 0 / 0.9);
+  transition:
+    top 300ms ease-out,
+    left 300ms ease-out,
+    width 300ms ease-out,
+    height 300ms ease-out;
+  animation: onboarding-spotlight-pulse 1.8s ease-in-out infinite;
+}
+@keyframes onboarding-spotlight-pulse {
+  50% {
+    outline-offset: 3px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .onboarding-spotlight {
+    animation: none;
     transition: none;
   }
 }

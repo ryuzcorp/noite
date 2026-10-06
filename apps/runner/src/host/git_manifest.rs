@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::config::Config;
-use crate::host::cmd;
+use crate::host::{exec, s3};
 
 /// Manifest format version. Readers accept only what they know.
 pub const MANIFEST_VERSION: u8 = 1;
@@ -74,19 +74,19 @@ impl GitSync {
 
 /// Read the manifest, if the slug has one yet.
 pub async fn read_manifest(cfg: &Config, slug: &str) -> anyhow::Result<Option<Manifest>> {
-    let tmp = cmd::work_root(cfg)
+    let tmp = exec::work_root(cfg)
         .join("git-http")
         .join(format!(".manifest-{slug}.json"));
     if let Some(parent) = tmp.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let uri = cfg.s3_uri(&manifest_key(slug));
-    match cmd::s3_cp_download(cfg, &uri, &tmp).await {
+    match s3::s3_cp_download(cfg, &uri, &tmp).await {
         Ok(()) => {}
         // Never pushed. Any other failure is an error: treating an
         // unreachable store as "no manifest" would restart `seq` and write a
         // manifest holding only this push's refs, dropping the others.
-        Err(e) if cmd::is_not_found(&e) => return Ok(None),
+        Err(e) if s3::is_not_found(&e) => return Ok(None),
         Err(e) => return Err(e.context("read git manifest")),
     }
     let bytes = tokio::fs::read(&tmp).await?;
@@ -100,7 +100,7 @@ pub async fn read_manifest(cfg: &Config, slug: &str) -> anyhow::Result<Option<Ma
 
 /// Write the manifest once per push, after all tip bundles land.
 pub async fn write_manifest(cfg: &Config, slug: &str, manifest: &Manifest) -> anyhow::Result<()> {
-    let tmp = cmd::work_root(cfg)
+    let tmp = exec::work_root(cfg)
         .join("git-http")
         .join(format!(".manifest-{slug}.json"));
     if let Some(parent) = tmp.parent() {
@@ -108,13 +108,13 @@ pub async fn write_manifest(cfg: &Config, slug: &str, manifest: &Manifest) -> an
     }
     let bytes = serde_json::to_vec(manifest)?;
     tokio::fs::write(&tmp, &bytes).await?;
-    let result = cmd::s3_cp_upload(cfg, &tmp, &manifest_key(slug)).await;
+    let result = s3::s3_cp_upload(cfg, &tmp, &manifest_key(slug)).await;
     let _ = tokio::fs::remove_file(&tmp).await;
     result
 }
 
 fn bundle_tmp(cfg: &Config, slug: &str, sha: &str) -> PathBuf {
-    cmd::work_root(cfg)
+    exec::work_root(cfg)
         .join("git-http")
         .join(format!(".refresh-{slug}-{sha}.bundle"))
 }
@@ -131,8 +131,8 @@ pub async fn fetch_manifest_ref(
     if let Some(parent) = bundle.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    cmd::s3_cp_download(cfg, &cfg.s3_uri(bundle_key), &bundle).await?;
-    let result = cmd::run_cmd(
+    s3::s3_cp_download(cfg, &cfg.s3_uri(bundle_key), &bundle).await?;
+    let result = exec::run_cmd(
         "git",
         &[
             &format!("--git-dir={}", bare.display()),

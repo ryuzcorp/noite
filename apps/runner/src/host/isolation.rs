@@ -8,7 +8,7 @@
 //! checks run and warn, nothing is refused.
 
 use crate::config::{Config, Tenancy};
-use crate::host::{cmd, netisolation};
+use crate::host::{exec, netisolation};
 
 #[derive(Clone, Debug, Default)]
 pub struct IsolationStatus {
@@ -22,14 +22,14 @@ pub struct IsolationStatus {
 }
 
 pub async fn self_check(cfg: &Config, nft_installed: bool) -> IsolationStatus {
-    let build_uid_ok = match (cfg.build_uid, cfg.build_gid) {
-        (Some(u), Some(g)) => cmd::can_drop_uid(u, g),
-        (Some(u), None) => cmd::can_drop_uid(u, u),
-        _ => false,
+    // One probe is enough: every uid in the range drops the same way.
+    let build_uid_ok = match cfg.build_uid_base {
+        Some(base) => exec::can_drop_uid(base, base),
+        None => false,
     };
     let fleet_uid_ok = match (cfg.fleet_uid, cfg.fleet_gid) {
-        (Some(u), Some(g)) => cmd::can_drop_uid(u, g),
-        (Some(u), None) => cmd::can_drop_uid(u, u),
+        (Some(u), Some(g)) => exec::can_drop_uid(u, g),
+        (Some(u), None) => exec::can_drop_uid(u, u),
         _ => false,
     };
     let (nft_ok, nft_detail) = if nft_installed {
@@ -74,9 +74,9 @@ pub async fn self_check(cfg: &Config, nft_installed: bool) -> IsolationStatus {
 /// are 0755: names are visible, contents are not (everything in them is
 /// owner-only).
 ///
-/// Known limit: every build runs as the one `build` uid, so two builds that
-/// run at the same moment can read each other's worktree until the runner
-/// takes each tree back. A uid per build would close that window.
+/// Each app's builds run as their own uid (`db::ensure_app_build_uid`), so
+/// the 0700 worktree and cache leaves are readable by that app alone — a
+/// sibling build's uid cannot even enter them.
 #[cfg(unix)]
 pub fn harden_data_dir(cfg: &Config) {
     use std::os::unix::fs::PermissionsExt;

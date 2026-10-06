@@ -42,3 +42,10 @@ regex = "1"
 base64 = "0.22"
 zstd = "0.13"
 rusty-s3 = "0.10.2"
+# Generates the TypeScript bindings the UI consumes (apps/noite/src/lib/runner-types)
+# from the structs that cross the JSON boundary. `no-serde-warnings` silences
+# warnings for serde attrs ts-rs does not model (e.g. `alias`).
+ts-rs = { version = "12", features = ["no-serde-warnings"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

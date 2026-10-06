@@ -6,11 +6,11 @@ import { atom } from "ilha";
 
 import { formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
-import { getUserProps } from "../events.server";
 import type { EventsSnapshot } from "../feeds";
 import { decodeEvents, eventsUrl, feedKeys, liveFeed } from "../feeds";
-import { ChevronDown } from "../icons";
 import type { RunnerEvent } from "../runner";
+import { getUserProps } from "../server/events.server";
+import { ChevronDown } from "../ui/icons";
 
 const parseTags = (raw: string): [string, string][] => {
   let parsed: unknown;

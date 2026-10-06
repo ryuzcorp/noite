@@ -2,8 +2,8 @@
 //! Named `loop_` because `loop` is a Rust keyword.
 use std::collections::HashSet;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 use std::time::{Duration, Instant};
 
@@ -12,7 +12,7 @@ use sqlx::SqlitePool;
 use crate::config::Config;
 use crate::db;
 use crate::host::caddy;
-use crate::host::cmd::{self, TipBundle};
+use crate::host::tips::{self, TipBundle};
 use crate::host::deploy::{self, Deploying};
 use crate::host::logs::LogState;
 use crate::host::metrics::{self, MetricsState};
@@ -26,6 +26,9 @@ pub async fn run_forever(
     pool: SqlitePool,
     cfg: Config,
     procs: ProcMap,
+    // Pid of the running control node (0 when none): the metrics ingest
+    // samples its CPU and treats it as a live telemetry source.
+    control_pid: Arc<std::sync::atomic::AtomicU32>,
     logs: LogState,
     deploying: Deploying,
     mut metrics: MetricsState,
@@ -54,8 +57,12 @@ pub async fn run_forever(
             && !sleep_sweeping.swap(true, Ordering::SeqCst)
         {
             last_sleep_sweep = Instant::now();
-            let (pool2, cfg2, procs2, flag) =
-                (pool.clone(), cfg.clone(), procs.clone(), sleep_sweeping.clone());
+            let (pool2, cfg2, procs2, flag) = (
+                pool.clone(),
+                cfg.clone(),
+                procs.clone(),
+                sleep_sweeping.clone(),
+            );
             tokio::spawn(async move {
                 let parked = crate::host::sleep::sweep(&pool2, &cfg2, &procs2).await;
                 if parked > 0 {
@@ -64,9 +71,19 @@ pub async fn run_forever(
                 flag.store(false, Ordering::SeqCst);
             });
         }
-        if let Err(e) =
-            reconcile_once(&pool, &cfg, &procs, &logs, &deploying, &mut metrics, &mut tip_rx, &mut last_sweep, &log_tx)
-                .await
+        if let Err(e) = reconcile_once(
+            &pool,
+            &cfg,
+            &procs,
+            control_pid.load(Ordering::Relaxed),
+            &logs,
+            &deploying,
+            &mut metrics,
+            &mut tip_rx,
+            &mut last_sweep,
+            &log_tx,
+        )
+        .await
         {
             tracing::error!(error = %e, "reconcile");
         } else {
@@ -80,6 +97,7 @@ async fn reconcile_once(
     pool: &SqlitePool,
     cfg: &Config,
     procs: &ProcMap,
+    control_pid: u32,
     logs: &LogState,
     deploying: &Deploying,
     metrics: &mut MetricsState,
@@ -133,8 +151,14 @@ async fn reconcile_once(
                     // Without this, start/resume leaves the stop-time status
                     // stuck until the next deploy flips it.
                     if app.status != AppStatus::Running.as_str() {
-                        db::update_app_status(pool, &app.id, AppStatus::Running.as_str(), None, None)
-                            .await?;
+                        db::update_app_status(
+                            pool,
+                            &app.id,
+                            AppStatus::Running.as_str(),
+                            None,
+                            None,
+                        )
+                        .await?;
                     }
                 }
                 Err(e) => {
@@ -152,7 +176,7 @@ async fn reconcile_once(
             continue;
         }
 
-        match cmd::head_main_bundle(cfg, &app.slug).await {
+        match tips::head_main_bundle(cfg, &app.slug).await {
             Ok(Some(tip)) => {
                 let already = app
                     .last_deploy_sha
@@ -174,7 +198,7 @@ async fn reconcile_once(
     let limits = db::list_app_limits(pool).await.unwrap_or_default();
     caddy::rewrite_caddy(cfg, &visible, &domains, &limits).await?;
 
-    metrics::tick(pool, cfg, procs, metrics, log_tx).await?;
+    metrics::tick(pool, cfg, procs, control_pid, metrics, log_tx).await?;
     Ok(())
 }
 

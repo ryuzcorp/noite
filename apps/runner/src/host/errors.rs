@@ -2,7 +2,7 @@
 //!
 //! Two signals carry an exception (verified against celld 0.6.0; since
 //! 0.6.1 the log level is a severity column, and the ingest puts the prefix
-//! back, host/metrics.rs `ingest_all`):
+//! back, host/metrics/ingest.rs `ingest_all`):
 //!
 //! 1. A failed span's `error` column for anything a handler throws or
 //!    rejects — `rejected: PaymentError: declined [at chargeCard
@@ -25,12 +25,13 @@
 //! `EVENTS_PER_ISSUE` occurrences, and reopen when a resolved issue fires
 //! again. Everything lives in `metrics.sqlite` and ages out with the
 //! telemetry retention.
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
+use ts_rs::TS;
 
 use crate::db;
 
@@ -41,9 +42,11 @@ const LOGS_PER_EVENT: usize = 20;
 /// Frames kept per occurrence: V8 captures 10 by default, a custom
 /// `Error.stackTraceLimit` can raise it arbitrarily.
 const MAX_FRAMES: usize = 50;
-/// Bound on logged errors recorded per app per ingest pass (a hot loop of
-/// `console.error(err)` must not turn into thousands of writes).
-const MAX_LOGGED_PER_PASS: usize = 200;
+/// Bound on logged errors recorded per app per hour bucket (a hot loop of
+/// `console.error(err)` must not turn into thousands of writes). Per hour,
+/// not per pass, so a day-long catch-up chunk keeps the same bound as the
+/// steady-state partial-hour pass.
+const MAX_LOGGED_PER_HOUR: usize = 200;
 /// Stored message cap: messages can embed whole payloads.
 const MAX_MESSAGE: usize = 2000;
 /// Frames that feed the fingerprint.
@@ -53,8 +56,9 @@ const FINGERPRINT_FRAMES: usize = 5;
 const REQUEST_TTL: Duration = Duration::from_secs(15 * 60);
 const REQUEST_CAP: usize = 50_000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct Frame {
     pub function: String,
     pub location: String,
@@ -126,7 +130,11 @@ pub fn parse_frame(raw: &str) -> Frame {
         _ => (String::new(), s.to_string()),
     };
     let in_app = !is_internal(&location);
-    Frame { function, location, in_app }
+    Frame {
+        function,
+        location,
+        in_app,
+    }
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -231,7 +239,8 @@ fn file_of(location: &str) -> &str {
 fn normalize_message(message: &str) -> String {
     static IDS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static DIGITS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let ids = IDS.get_or_init(|| regex::Regex::new(r"[0-9a-fA-F][0-9a-fA-F-]{7,}").expect("ids re"));
+    let ids =
+        IDS.get_or_init(|| regex::Regex::new(r"[0-9a-fA-F][0-9a-fA-F-]{7,}").expect("ids re"));
     let digits = DIGITS.get_or_init(|| regex::Regex::new(r"\d+").expect("digits re"));
     let line = message.lines().next().unwrap_or("");
     let line = ids.replace_all(line, "<id>");
@@ -324,6 +333,7 @@ impl RequestIndex {
 
 /// One failed-span group from the ingest pass: every failed span of a slug
 /// with the same (unwrapped) error text in the window.
+#[derive(Clone)]
 pub struct SpanErrorRow {
     pub slug: String,
     pub error: String,
@@ -336,6 +346,7 @@ pub struct SpanErrorRow {
 }
 
 /// One log record from the ingest pass.
+#[derive(Clone)]
 pub struct LogRow {
     pub slug: String,
     pub ts_us: i64,
@@ -361,7 +372,18 @@ pub struct Occurrence<'a> {
 
 /// `celld.cell_fetch` → `cell_fetch`: the handler that failed.
 fn handler_of(span_name: &str) -> String {
-    span_name.strip_prefix("celld.").unwrap_or(span_name).to_string()
+    span_name
+        .strip_prefix("celld.")
+        .unwrap_or(span_name)
+        .to_string()
+}
+
+/// The hourly bucket an occurrence timestamp falls in, matching the ingest's
+/// `strftime('%Y-%m-%dT%H:00:00Z', …)`.
+fn hour_bucket(us: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_micros(us)
+        .map(|d| d.format("%Y-%m-%dT%H:00:00Z").to_string())
+        .unwrap_or_default()
 }
 
 /// Turn one ingest pass into stored issues. Returns the app ids that got
@@ -390,6 +412,12 @@ pub async fn ingest(
             .unwrap_or_default()
     };
     let mut touched = Vec::new();
+    // (app_id, fingerprint, hour) -> occurrences, and the issues whose derived
+    // count must be refreshed. Kept in memory for the pass so one hour-bucket
+    // is written exactly once (replace semantics), however many span groups
+    // and log lines fold into it.
+    let mut hours: HashMap<(String, String, String), i64> = HashMap::new();
+    let mut issues: HashSet<(String, String)> = HashSet::new();
     for row in spans {
         let Some(app_id) = slug_id.get(&row.slug) else {
             continue;
@@ -408,10 +436,12 @@ pub async fn ingest(
             request: requests.get(&row.trace_id).cloned(),
             sha: app_sha.get(app_id).map(String::as_str),
         };
-        record(pool, &occ).await?;
+        let (fp, hour, n) = record(pool, &occ).await?;
+        *hours.entry((app_id.clone(), fp.clone(), hour)).or_default() += n;
+        issues.insert((app_id.clone(), fp));
         touched.push(app_id.clone());
     }
-    let mut logged: HashMap<&str, usize> = HashMap::new();
+    let mut logged: HashMap<(&str, String), usize> = HashMap::new();
     for row in logs {
         let Some(app_id) = slug_id.get(&row.slug) else {
             continue;
@@ -419,8 +449,10 @@ pub async fn ingest(
         let Some(parsed) = parse_log_error(&row.body) else {
             continue;
         };
-        let n = logged.entry(app_id.as_str()).or_default();
-        if *n >= MAX_LOGGED_PER_PASS {
+        let n = logged
+            .entry((app_id.as_str(), hour_bucket(row.ts_us)))
+            .or_default();
+        if *n >= MAX_LOGGED_PER_HOUR {
             continue;
         }
         *n += 1;
@@ -438,15 +470,30 @@ pub async fn ingest(
             request: requests.get(&row.trace_id).cloned(),
             sha: app_sha.get(app_id).map(String::as_str),
         };
-        record(pool, &occ).await?;
+        let (fp, hour, c) = record(pool, &occ).await?;
+        *hours.entry((app_id.clone(), fp.clone(), hour)).or_default() += c;
+        issues.insert((app_id.clone(), fp));
         touched.push(app_id.clone());
+    }
+    // Hour buckets first (replace), then the issue counts derived from them:
+    // a re-read or replay of a window rewrites the same buckets and leaves the
+    // counts where they were.
+    for ((app_id, fp, hour), n) in &hours {
+        db::set_error_hour(pool, app_id, fp, hour, *n).await?;
+    }
+    for (app_id, fp) in &issues {
+        db::refresh_error_issue_count(pool, app_id, fp).await?;
     }
     touched.sort();
     touched.dedup();
     Ok(touched)
 }
 
-async fn record(pool: &SqlitePool, occ: &Occurrence<'_>) -> anyhow::Result<()> {
+/// Store one occurrence: fold the issue (min/max, latest wins), insert the
+/// occurrence event unless it is already stored, and keep the newest
+/// `EVENTS_PER_ISSUE`. Returns `(fingerprint, hour bucket, count)` so the
+/// caller can aggregate hour buckets and refresh the derived issue count.
+async fn record(pool: &SqlitePool, occ: &Occurrence<'_>) -> anyhow::Result<(String, String, i64)> {
     let fp = fingerprint(&occ.parsed);
     db::upsert_error_issue(
         pool,
@@ -463,10 +510,7 @@ async fn record(pool: &SqlitePool, occ: &Occurrence<'_>) -> anyhow::Result<()> {
         occ.sha,
     )
     .await?;
-    let hour = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(occ.last_us)
-        .map(|d| d.format("%Y-%m-%dT%H:00:00Z").to_string())
-        .unwrap_or_default();
-    db::add_error_hour(pool, occ.app_id, &fp, &hour, occ.count).await?;
+    let hour = hour_bucket(occ.last_us);
     let req = occ.request.as_ref();
     db::insert_error_event(
         pool,
@@ -493,7 +537,7 @@ async fn record(pool: &SqlitePool, occ: &Occurrence<'_>) -> anyhow::Result<()> {
     )
     .await?;
     db::prune_error_events(pool, occ.app_id, &fp, EVENTS_PER_ISSUE).await?;
-    Ok(())
+    Ok((fp, hour, occ.count))
 }
 
 #[cfg(test)]
@@ -520,7 +564,10 @@ mod tests {
             "rejected: SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2) [at JSON.parse (<anonymous>) <- at fetch (worker.js:38:21)]",
         );
         assert_eq!(p.kind, "SyntaxError");
-        assert_eq!(p.message, "Expected property name or '}' in JSON at position 1 (line 1 column 2)");
+        assert_eq!(
+            p.message,
+            "Expected property name or '}' in JSON at position 1 (line 1 column 2)"
+        );
         assert!(!p.frames[0].in_app);
         assert!(p.frames[1].in_app);
         assert_eq!(culprit(&p), "fetch (worker.js:38)");

@@ -1,21 +1,19 @@
-//! Observability: metrics, spans, logs (+ live SSE tail).
+//! Observability: metrics, spans, logs (thin adapters over
+//! `service::observe`) + the notify-driven live log tail.
 use std::time::Duration;
 
 use axum::{
     extract::{Path, Query, State},
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
     Json,
 };
 use serde::Deserialize;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::db;
-use crate::error::ApiError;
-use crate::host::logs;
-use crate::host::metrics;
+use crate::service;
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -28,19 +26,7 @@ pub async fn app_metrics(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    match db::get_app(&state.pool, &id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    }
-    let hours = q.hours.unwrap_or(24).clamp(1, 720);
-    let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
-        .format("%Y-%m-%dT%H:%M:00Z")
-        .to_string();
-    match db::list_app_metrics(&state.pool, &id, &since).await {
-        Ok(rows) => Json(rows).into_response(),
-        Err(e) => ApiError::internal(e.to_string()).into_response(),
-    }
+    service::observe::metrics(&state, &id, q.hours).await.map(Json)
 }
 
 pub async fn app_devices(
@@ -48,19 +34,7 @@ pub async fn app_devices(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    match db::get_app(&state.pool, &id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    }
-    let hours = q.hours.unwrap_or(24).clamp(1, 720);
-    let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
-        .format("%Y-%m-%dT%H:00:00Z")
-        .to_string();
-    match db::list_app_devices(&state.pool, &id, &since).await {
-        Ok(rows) => Json(rows).into_response(),
-        Err(e) => ApiError::internal(e.to_string()).into_response(),
-    }
+    service::observe::devices(&state, &id, q.hours).await.map(Json)
 }
 
 pub async fn app_paths(
@@ -68,19 +42,7 @@ pub async fn app_paths(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    match db::get_app(&state.pool, &id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    }
-    let hours = q.hours.unwrap_or(24).clamp(1, 720);
-    let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
-        .format("%Y-%m-%dT%H:00:00Z")
-        .to_string();
-    match db::list_app_paths(&state.pool, &id, &since).await {
-        Ok(rows) => Json(rows).into_response(),
-        Err(e) => ApiError::internal(e.to_string()).into_response(),
-    }
+    service::observe::paths(&state, &id, q.hours).await.map(Json)
 }
 
 pub async fn app_refs(
@@ -88,19 +50,7 @@ pub async fn app_refs(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    match db::get_app(&state.pool, &id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    }
-    let hours = q.hours.unwrap_or(24).clamp(1, 720);
-    let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
-        .format("%Y-%m-%dT%H:00:00Z")
-        .to_string();
-    match db::list_app_refs(&state.pool, &id, &since).await {
-        Ok(rows) => Json(rows).into_response(),
-        Err(e) => ApiError::internal(e.to_string()).into_response(),
-    }
+    service::observe::refs(&state, &id, q.hours).await.map(Json)
 }
 
 pub async fn app_spans(
@@ -108,22 +58,7 @@ pub async fn app_spans(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    match db::get_app(&state.pool, &id).await {
-        Ok(Some(_)) => {
-            // Ingested hourly stats (spec T3.2): the 24 h default is one
-            // indexed SQLite scan, like every other series (up to 720 h).
-            let hours = q.hours.unwrap_or(24).clamp(1, 720);
-            let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
-                .format("%Y-%m-%dT%H:00:00Z")
-                .to_string();
-            match db::list_span_stats(&state.pool, &id, &since).await {
-                Ok(rows) => Json(rows).into_response(),
-                Err(e) => ApiError::internal(e.to_string()).into_response(),
-            }
-        }
-        Ok(None) => ApiError::not_found("app not found").into_response(),
-        Err(e) => ApiError::internal(e.to_string()).into_response(),
-    }
+    service::observe::spans(&state, &id, q.hours).await.map(Json)
 }
 
 /// Per-app metrics version (spec T3.6): dashboard polls fetch this first and
@@ -132,41 +67,13 @@ pub async fn app_metrics_version(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match db::get_app(&state.pool, &id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    }
-    match db::get_metric_version(&state.pool, &id).await {
-        Ok(v) => Json(serde_json::json!({ "version": v })).into_response(),
-        Err(e) => ApiError::internal(e.to_string()).into_response(),
-    }
-}
-
-/// Merged log view: the ingested OTel ring (up to ~40 s behind live traffic)
-/// plus the in-memory stdout tail (live). Chronological, oldest first.
-pub(crate) async fn merged_lines(state: &AppState, app_id: &str, slug: &str) -> Vec<String> {
-    let since = metrics::now_us() - 24 * 3_600_000_000;
-    let mut lines: Vec<String> = db::list_app_logs(&state.pool, app_id, since, 500)
+    service::observe::metrics_version(&state, &id)
         .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(_, body)| body)
-        .collect();
-    lines.extend(logs::tail(&state.logs, slug, 500).await);
-    lines
+        .map(Json)
 }
 
-pub async fn app_logs(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    let app = match db::get_app(&state.pool, &id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    };
-    Json(merged_lines(&state, &app.id, &app.slug).await).into_response()
+pub async fn app_logs(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    service::observe::logs_lines(&state, &id).await.map(Json)
 }
 
 /// Live log tail as server-sent events: one JSON array per message, sent
@@ -176,12 +83,12 @@ pub async fn app_logs(
 pub async fn app_logs_stream(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> impl IntoResponse {
-    let app = match db::get_app(&state.pool, &id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    };
+) -> Response {
+    let (app_id, slug) =
+        match service::observe::telemetry_target_or_404(&state.pool, &id).await {
+            Ok(target) => target,
+            Err(e) => return e.into_response(),
+        };
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, anyhow::Error>>(16);
     crate::host::stats::sse_enter("logs");
     let mut notify = state.log_notify.subscribe();
@@ -190,7 +97,7 @@ pub async fn app_logs_stream(
     tokio::spawn(async move {
         let mut last: Option<Vec<String>> = None;
         loop {
-            let lines = merged_lines(&state, &app.id, &app.slug).await;
+            let lines = service::observe::merged_lines(&state, &app_id, &slug).await;
             if last.as_ref() != Some(&lines) {
                 let data = serde_json::to_string(&lines).unwrap_or_default();
                 if tx.send(Ok(Event::default().data(data))).await.is_err() {

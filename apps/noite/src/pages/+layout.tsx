@@ -1,9 +1,10 @@
-import { initials } from "$lib/apps";
 import { authClient } from "$lib/auth-client";
-import { Authed } from "$lib/authed";
-import { List as ListIcon, Menu as MenuIcon } from "$lib/icons";
-import { adminStatus, session } from "$lib/resources";
-import { invalidateSession } from "$lib/session";
+import { Authed } from "$lib/auth/authed";
+import { Onboarding } from "$lib/auth/onboarding";
+import { invalidateSession } from "$lib/auth/session";
+import { session } from "$lib/resources";
+import { Avatar } from "$lib/ui/avatar";
+import { List as ListIcon, Menu as MenuIcon } from "$lib/ui/icons";
 import { defineLayout, navigate, useRoute } from "@ilha/router";
 
 /**
@@ -22,10 +23,8 @@ const signOut = async () => {
 export default defineLayout(({ children }) => {
   const { path } = useRoute();
   const sessionRes = session();
-  const adminRes = adminStatus();
   const user = sessionRes.data()?.user;
   const displayName = user?.name || user?.email || "";
-  const isAdmin = adminRes.data()?.isAdmin ?? false;
   if (path() === "/login") {
     return <>{children}</>;
   }
@@ -79,6 +78,7 @@ export default defineLayout(({ children }) => {
               <li>
                 <a
                   href="/apps"
+                  data-tour="apps"
                   class={path().startsWith("/apps") ? "menu-active" : undefined}
                 >
                   <ListIcon class="h-5 w-5 shrink-0" />
@@ -91,14 +91,11 @@ export default defineLayout(({ children }) => {
                 <div
                   tabindex={0}
                   role="button"
+                  data-tour="account"
                   aria-label="Account menu"
                   class="btn btn-sm btn-ghost flex w-full items-center justify-start gap-2 px-2"
                 >
-                  <div class="avatar avatar-placeholder">
-                    <div class="bg-neutral text-neutral-content w-8 rounded-full">
-                      <span class="text-xs">{initials(displayName)}</span>
-                    </div>
-                  </div>
+                  <Avatar label={displayName} size="sm" />
                   <span class="truncate text-sm">{displayName || "…"}</span>
                 </div>
                 <ul
@@ -117,11 +114,6 @@ export default defineLayout(({ children }) => {
                       Docs
                     </a>
                   </li>
-                  {isAdmin ? (
-                    <li>
-                      <a href="/god-mode">God Mode</a>
-                    </li>
-                  ) : null}
                   <li>
                     <button
                       type="button"
@@ -139,6 +131,7 @@ export default defineLayout(({ children }) => {
           </aside>
         </div>
       </div>
+      <Onboarding />
     </Authed>
   );
 });

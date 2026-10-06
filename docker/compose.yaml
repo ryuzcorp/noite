@@ -65,6 +65,11 @@ services:
       NOITE_TRUSTED_PROXIES: ${NOITE_TRUSTED_PROXIES:-}
       # Tenancy and bounds (see .env.example).
       NOITE_TENANCY: ${NOITE_TENANCY:-}
+      # Opt-out instance heartbeat (SPEC, telemetry): pass the host's switches
+      # through. Empty = enabled; `NOITE_TELEMETRY=0` or any `DO_NOT_TRACK`
+      # value but 0 locks it off.
+      NOITE_TELEMETRY: ${NOITE_TELEMETRY:-}
+      DO_NOT_TRACK: ${DO_NOT_TRACK:-}
       NOITE_STOP_BUDGET_MS: ${NOITE_STOP_BUDGET_MS:-25000}
       RUNNER_MAX_APPS_PER_USER: ${RUNNER_MAX_APPS_PER_USER:-10}
       RUNNER_FLEET_MAX_RSS_MB: ${RUNNER_FLEET_MAX_RSS_MB:-0}
@@ -72,7 +77,7 @@ services:
       RUNNER_FLEET_LOG: ${RUNNER_FLEET_LOG:-error,celld=warn}
       RUNNER_BUILD_MAX_MB: ${RUNNER_BUILD_MAX_MB:-2048}
       RUNNER_BUILD_TIMEOUT_S: ${RUNNER_BUILD_TIMEOUT_S:-300}
-      # Resource knobs (SPEC, Limits / Observability; resource-optimization-spec.md).
+      # Resource knobs (SPEC: Limits, Observability).
       RUNNER_BUILD_CACHE_MB: ${RUNNER_BUILD_CACHE_MB:-512}
       RUNNER_FLEET_ASSET_CACHE_MB: ${RUNNER_FLEET_ASSET_CACHE_MB:-64}
       RUNNER_FLEET_DEPLOY_POLL_S: ${RUNNER_FLEET_DEPLOY_POLL_S:-300}
@@ -98,7 +103,7 @@ services:
     labels:
       # Tenant TLS service for Coolify's Traefik (bare port: Coolify rewrites
       # `$` in labels). The TCP router is a dashboard-pasted file; see
-      # apps/website/docs/deployment.mdx. Ignored without Traefik.
+      # apps/website/docs/self-hosting/platforms.mdx. Ignored without Traefik.
       - "traefik.enable=true"
       - "traefik.tcp.services.noite-tenants.loadbalancer.server.port=443"
     depends_on:

@@ -2,6 +2,7 @@
 //! wrangler parsing. Backends live in `d1` / `durable` / `r2`.
 use anyhow::Context;
 use serde::Serialize;
+use ts_rs::TS;
 use serde_json::Value;
 
 use crate::config::Config;
@@ -12,12 +13,13 @@ pub mod d1;
 pub mod durable;
 pub mod r2;
 
-pub use d1::{d1_preview, d1_write};
+pub use d1::{d1_delete_rows, d1_rows, d1_schema, d1_tables, d1_write};
 pub use durable::do_instances;
-pub use r2::{r2_delete, r2_get, r2_list, r2_raw};
+pub use r2::{r2_delete_many, r2_get, r2_list, r2_put, r2_raw};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct StorageItem {
     pub app_id: String,
     pub app_slug: String,
@@ -94,7 +96,6 @@ pub(crate) fn parse_wrangler(text: &str) -> anyhow::Result<serde_json::Value> {
     serde_json::from_str(&clean).context("parse wrangler config")
 }
 
-
 /// The deployed wrangler config, or `None` when there is none to read yet
 /// (nothing pushed, or no wrangler.json(c)): such an app has no storage.
 pub async fn deployed_wrangler(
@@ -124,7 +125,6 @@ pub async fn deployed_wrangler(
     Ok(None)
 }
 
-
 pub async fn list_storage(cfg: &Config, app: &App) -> anyhow::Result<Vec<StorageItem>> {
     let Some(cfg_v) = deployed_wrangler(cfg, app).await? else {
         return Ok(Vec::new());
@@ -132,7 +132,10 @@ pub async fn list_storage(cfg: &Config, app: &App) -> anyhow::Result<Vec<Storage
     let mut items = Vec::new();
     if let Some(Value::Array(dbs)) = cfg_v.get("d1_databases") {
         for db in dbs {
-            let name = db.get("database_name").and_then(|v| v.as_str()).unwrap_or("");
+            let name = db
+                .get("database_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if name.is_empty() {
                 continue;
             }

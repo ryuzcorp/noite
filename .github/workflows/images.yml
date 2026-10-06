@@ -9,9 +9,11 @@
 #
 # Tags:
 #   main push        `edge` + short SHA (CI and rollbacks; not an install target)
-#   v* tag           the version (`0.1.0-alpha.1`), short SHA, and the channels:
-#                    `alpha` for every release, `stable` for final ones only
-#                    (no `-` in the tag). A `stable` install never sees an alpha.
+#   v* tag           the version (`0.1.0-alpha.1`) and short SHA, then a GitHub
+#                    PRE-release with that version's CHANGELOG notes. No channel
+#                    moves: try it with `run.sh | bash -s install --pre`.
+#   release marked   `promote.yml` points `alpha` (and, for a final version, no
+#   as a release     `-` in it, `stable`) at that version's image. No rebuild.
 #
 # A release tag is a gate, not a trigger: the e2e lanes (`make e2e`,
 # `make e2e-isolation`) and the CHANGELOG check must pass before anything is
@@ -29,6 +31,7 @@ on:
       - "docker/install-sidecars.sh"
       - "docker/compose.yaml"
       - ".github/workflows/images.yml"
+      - ".github/workflows/check.yml"
     tags:
       - "v*"
   workflow_dispatch:
@@ -41,27 +44,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Shared with `ci.yml` (`check.yml`); a release tag also needs its CHANGELOG
+  # entry. The `e2e` and `image` jobs below gate on this one.
   check:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-      - run: bun install
-      - name: changelog entry for this release
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: bun docker/check-changelog.ts "${GITHUB_REF_NAME#v}"
-      - name: lint
-        run: bun run check
-      - name: version pins
-        run: bun docker/check-versions.ts
-      - name: render compose (prod, build, dev, e2e)
-        run: |
-          docker compose -f docker/compose.yaml config > /dev/null
-          docker compose -f docker/compose.yaml -f docker/compose.build.yaml config > /dev/null
-          docker compose -f docker/compose.yaml -f docker/compose.dev.yaml config > /dev/null
-          docker compose -f docker/compose.yaml -f docker/compose.e2e.yaml config > /dev/null
+    uses: ./.github/workflows/check.yml
+    with:
+      changelog: ${{ startsWith(github.ref, 'refs/tags/v') }}
 
   # Release tags only: the same lanes the Actions tab runs by hand, as a gate.
   # The image below is built from the same commit and Dockerfile.
@@ -96,6 +84,15 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # The instance heartbeat reports this as `version`: the release tag
+      # without its `v` on a tag build, the short SHA otherwise.
+      - id: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "value=${GITHUB_SHA::7}" >> "${GITHUB_OUTPUT}"
+          fi
       - id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -103,6 +100,7 @@ jobs:
           file: docker/Dockerfile
           target: noite
           platforms: ${{ matrix.platform }}
+          build-args: NOITE_BUILD_VERSION=${{ steps.version.outputs.value }}
           outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/noite,push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=noite-${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=noite-${{ matrix.platform }}
@@ -147,8 +145,6 @@ jobs:
             type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,prefix=,format=short
             type=semver,pattern={{version}}
-            type=raw,value=alpha,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=raw,value=stable,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
       - run: |
           tags=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           digests=""
@@ -160,3 +156,27 @@ jobs:
         env:
           DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
           IMAGE: ghcr.io/${{ github.repository_owner }}/noite
+
+  # After the image exists, so `install --pre` never finds a release whose
+  # image is missing. A release made with GITHUB_TOKEN triggers no workflow,
+  # so this never promotes anything by itself.
+  prerelease:
+    needs: merge
+    if: ${{ !cancelled() && needs.merge.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: GitHub pre-release with this version's CHANGELOG notes
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists: leaving it as it is"
+            exit 0
+          fi
+          awk -v head="## [${TAG#v}]" 'index($0, head) == 1 { found = 1; next } found && /^## \[/ { exit } found' CHANGELOG.md > notes.md
+          gh release create "$TAG" --prerelease --verify-tag --title "$TAG" --notes-file notes.md
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}

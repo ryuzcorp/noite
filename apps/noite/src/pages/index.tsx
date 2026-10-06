@@ -1,4 +1,4 @@
-import { fetchSession } from "$lib/session";
+import { fetchSession } from "$lib/auth/session";
 import { head, navigate } from "@ilha/router";
 import { watch } from "ilha";
 

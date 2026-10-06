@@ -18,27 +18,15 @@
 #   E2E_KEEP=1 make e2e            leave the stack running afterwards (debug)
 set -eu
 cd "$(dirname "$0")/.."
+# shellcheck source=docker/lib.sh
+. "$(dirname "$0")/lib.sh"
+load_env
+detect_engine
 
 command -v bun >/dev/null 2>&1 || {
   echo "error: bun is required (playwright + lockfile checks)"
   exit 1
 }
-
-if command -v docker >/dev/null 2>&1; then
-  ENGINE="docker compose"
-else
-  ENGINE="podman compose"
-fi
-case "${COMPOSE:-}" in
-*"docker compose"*) ENGINE="docker compose" ;;
-*"podman compose"*) ENGINE="podman compose" ;;
-esac
-
-if [ -f .env ]; then
-  set -a
-  . ./.env
-  set +a
-fi
 
 TAG="${TAG:-}"
 FILES="-f docker/compose.yaml -f docker/compose.e2e.yaml"
@@ -62,27 +50,13 @@ export E2E_RAW_PORTS=1
 if [ "$E2E_TENANCY" = multi ]; then
   export E2E_HOSTILE=1
 fi
-CE2E="$ENGINE -p noite-e2e $FILES"
-
-case "$ENGINE" in
-*podman*) CLI=podman ;;
-*) CLI=docker ;;
-esac
+CE2E="$COMPOSE -p noite-e2e $FILES"
 
 echo "==> reset lane state (fresh volumes, fresh bucket, no session)"
 # shellcheck disable=SC2086
 $CE2E down -v --remove-orphans >/dev/null 2>&1 || true
-# podman-compose's `down -v` aborts on the first missing container and then
-# leaves containers and named volumes behind (a stale bucket still holds the
-# last run's accounts). Remove by project label and by name, as `make nuke`.
-for k in com.docker.compose.project io.podman.compose.project; do
-  ids="$($CLI ps -aq --filter "label=$k=noite-e2e" 2>/dev/null || true)"
-  # shellcheck disable=SC2086
-  [ -z "$ids" ] || $CLI rm -f $ids >/dev/null
-done
-vols="$($CLI volume ls -q --filter name=^noite-e2e_ 2>/dev/null || true)"
-# shellcheck disable=SC2086
-[ -z "$vols" ] || $CLI volume rm -f $vols >/dev/null
+# `down -v` is best-effort (podman-compose) — remove whatever it left behind.
+remove_project noite-e2e
 rm -rf apps/noite/e2e/.auth/user.json
 for p in 8080 8090 "$RUSTFS_API_PORT"; do
   if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:${p}/"; then

@@ -7,10 +7,11 @@ set -eu
 
 WINDOW="${1:-600}"
 cd "$(dirname "$0")/.."
+# shellcheck source=docker/lib.sh
+. "$(dirname "$0")/lib.sh"
+load_env
+detect_engine
 
-ENGINE="$(command -v docker >/dev/null 2>&1 && echo docker || echo podman)"
-# shellcheck disable=SC1091
-[ -f .env ] && . ./.env
 HTTP_PORT="${HTTP_PORT:-9080}"
 RUNNER_TOKEN="${RUNNER_TOKEN:-dev-runner-token}"
 

@@ -1,0 +1,67 @@
+# Promotes a release to the install channels: points `alpha` (and, for a final
+# version with no `-`, `stable`) at the image `images.yml` already published for
+# that version. A re-tag of the same multi-arch manifest, no rebuild, so what
+# was tried with `run.sh | bash -s install --pre` is byte-for-byte what every
+# `bash -s install` then pulls.
+#
+# Trigger: a pre-release edited into a full release on GitHub (or a release
+# published as one directly). Only the latest release moves the channels, so
+# promoting an older pre-release by mistake cannot roll every install back.
+# Run it by hand (workflow_dispatch) to re-point a channel on purpose,
+# including a rollback.
+name: promote
+
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag the channels point at (v0.1.0-alpha.3). Not limited to the latest: this is the rollback path."
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: point the channels at this version
+        run: |
+          tag="v${TAG#v}"
+          version="${tag#v}"
+          if [[ "$EVENT" == release ]]; then
+            latest=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)
+            if [[ "$latest" != "$tag" ]]; then
+              echo "::error::$tag is not the latest release ($latest is): the channels stay put. Re-point them by hand with workflow_dispatch."
+              exit 1
+            fi
+          fi
+          if ! docker buildx imagetools inspect "$IMAGE:$version" >/dev/null; then
+            echo "::error::$IMAGE:$version does not exist: images.yml publishes it on the $tag tag push"
+            exit 1
+          fi
+          tags=(-t "$IMAGE:alpha")
+          [[ "$version" == *-* ]] || tags+=(-t "$IMAGE:stable")
+          docker buildx imagetools create "${tags[@]}" "$IMAGE:$version"
+          echo "$IMAGE:$version -> ${tags[*]}" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          EVENT: ${{ github.event_name }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/noite
+          TAG: ${{ github.event.release.tag_name || inputs.version }}

@@ -29,8 +29,13 @@ CREATE TABLE IF NOT EXISTS app (
   asleep_since TEXT,
   woke_at TEXT,
   -- The Wrangler config (JSON) the last successful deploy uploaded.
-  deployed_config TEXT
+  deployed_config TEXT,
+  -- Per-app build/release sandbox uid (host::netisolation, config.rs
+  -- BUILD_UID_BASE): NULL until allocated on the app's first build.
+  build_uid INTEGER
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_app_build_uid ON app(build_uid);
 
 CREATE INDEX IF NOT EXISTS idx_app_user ON app(user_id);
 
@@ -49,7 +54,7 @@ CREATE INDEX IF NOT EXISTS idx_deploy_app ON deploy(app_id);
 
 -- Per-app usage metrics, edge analytics, span stats, log ring, errors,
 -- watermarks and compaction state live in metrics.sqlite
--- (db::METRICS_SCHEMA), ATTACHed as `metrics` — never in this snapshotted
+-- (apps/runner/schema.metrics.sql), ATTACHed as `metrics` — never in this snapshotted
 -- file (spec T4.1).
 
 -- Tenant env vars (CF `.dev.vars` model). Names starting with `FLAG_`
@@ -133,4 +138,29 @@ CREATE TABLE IF NOT EXISTS app_credential (
   nonce BLOB NOT NULL,
   ciphertext BLOB NOT NULL,
   updated_at TEXT NOT NULL
+);
+
+-- One-time telemetry replay request (SPEC, Observability). Written by
+-- `noite-runner telemetry reingest` and by the migration that ships the
+-- idempotent ingest; the metrics tick reads it, rewinds the in-memory
+-- watermarks to `floor_us` (0 = the retention floor) for `slug` (NULL = every
+-- fleet), and deletes the row once it has caught up. A row therefore survives
+-- a restart mid-replay. `ingest` replaces a window's aggregates instead of
+-- adding to them, so replaying an already-read window is exact.
+CREATE TABLE IF NOT EXISTS telemetry_replay (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  floor_us INTEGER NOT NULL,
+  slug TEXT,
+  requested_at TEXT NOT NULL
+);
+
+-- Instance-level settings: key/value rows the runner owns about this install
+-- (not about a tenant). `install_id` (random UUIDv4) and `installed_at` are
+-- written on first boot and live in this snapshotted database, so the identity
+-- survives container recreation; `telemetry_enabled` (absent = on) and
+-- `telemetry_last_sent_at` back the opt-out instance heartbeat
+-- (host::telemetry_report).
+CREATE TABLE IF NOT EXISTS instance_setting (
+  key TEXT PRIMARY KEY NOT NULL,
+  value TEXT NOT NULL
 );

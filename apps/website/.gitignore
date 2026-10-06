@@ -1,4 +1,3 @@
-node_modules/
+# Blume build cache and its verification copy (both generated)
 .blume/
-dist/
 .blume-verify/

@@ -9,9 +9,6 @@ import type { AppRole } from "./roles";
 import { runnerGetApp, runnerGetAppBySlug, runnerListApps } from "./runner";
 import type { RunnerApp } from "./runner";
 
-export { parseAppRole, roleAtLeast } from "./roles";
-export type { AppRole } from "./roles";
-
 /** The runner is the single source of truth for apps; D1 keeps collaborator
  * grants only. `App` is that runner row — the UI never holds a second copy. */
 export type App = RunnerApp;
@@ -132,6 +129,32 @@ export const requireAppRole = async (
 ): Promise<{ app: App; role: AppRole }> =>
   await gate(await findApp({ id: appId }), userId, need);
 
+/** Instance-admin check for a signed-in account: the `admin` role, or an
+ * address matching the `NOITE_ADMIN_EMAIL` anchor. One query, the same
+ * role/anchor test `roleFor` applies — used where there is no app row to gate
+ * on (the control D1 browser, whose pseudo app never reaches the runner). */
+export const isInstanceAdmin = async (
+  userId: string,
+  email: string
+): Promise<boolean> => {
+  const anchored = resolveAdminEmail();
+  const rows = await withDb(
+    Effect.gen(function* run() {
+      const sql = yield* SqlClient;
+      return yield* sql.unsafe(
+        `SELECT CASE WHEN role = 'admin' THEN 1 ELSE 0 END AS isAdmin,
+                CASE WHEN ? IS NOT NULL AND lower(?) = ? THEN 1 ELSE 0 END AS anchored
+           FROM "user" WHERE id = ?`,
+        [anchored, email, anchored, userId]
+      );
+    })
+  );
+  // SAFETY: the projection is exactly those two integer columns; a missing
+  // row yields undefined, handled below.
+  const row = rows[0] as { anchored?: number; isAdmin?: number } | undefined;
+  return row !== undefined && (row.isAdmin === 1 || row.anchored === 1);
+};
+
 /** Same gate as `requireAppRole`, resolved by app slug (Git HTTP auth). */
 export const requireAppRoleBySlug = async (
   slug: string,
@@ -141,8 +164,8 @@ export const requireAppRoleBySlug = async (
   await gate(await findApp({ slug }), userId, need);
 
 /** Apps the user can see (any collaborator role), newest first.
- * Instance admins see only their own apps here too — the global view lives in
- * god-mode (`listAllApps`). */
+ * Instance admins see only their own apps here too — the global view lives on
+ * the admin home's Apps tab (`listAllApps`). */
 export const listAppsForCollaborator = async (
   userId: string
 ): Promise<RunnerApp[]> => {

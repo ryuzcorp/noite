@@ -72,11 +72,7 @@ impl CredentialProvider for RootProvider {
         }))
     }
 
-    async fn revoke(
-        &self,
-        _pool: &sqlx::SqlitePool,
-        _slug: &str,
-    ) -> anyhow::Result<()> {
+    async fn revoke(&self, _pool: &sqlx::SqlitePool, _slug: &str) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -199,7 +195,8 @@ pub async fn mint(
     access_key: &str,
     secret_key: &str,
 ) -> anyhow::Result<()> {
-    let payload = serde_json::json!({ "access_key": access_key, "secret_key": secret_key }).to_string();
+    let payload =
+        serde_json::json!({ "access_key": access_key, "secret_key": secret_key }).to_string();
     let (nonce, ct) = encrypt(&cfg.runner_token, app_id, &payload);
     db::put_app_credential(pool, app_id, &nonce, &ct).await?;
     Ok(())

@@ -74,6 +74,22 @@ test("hostile tenant is contained", async ({ page, request }) => {
   for (const [name, probe] of Object.entries(report.build.probes)) {
     expect(probe.ok, `build probe ${name} leaked: ${probe.detail}`).toBe(false);
   }
+  // The cross-build probe only proves isolation if a sibling app's build
+  // cache actually existed to probe. workers:1 + file order deploy the
+  // sample app first, so at least one other cache is present.
+  const crossBuild = report.build.probes["read:sibling-build-cache"];
+  expect(
+    crossBuild,
+    "build probe read:sibling-build-cache present"
+  ).toBeDefined();
+  const siblings = Number(
+    /siblings=(?<count>\d+)/u.exec(crossBuild?.detail ?? "")?.groups?.count ??
+      "0"
+  );
+  expect(
+    siblings,
+    `needs a sibling app's build cache to probe (${crossBuild?.detail ?? ""})`
+  ).toBeGreaterThan(0);
   for (const [name, probe] of Object.entries(report.release.probes)) {
     if (name === "scoped-prefix") {
       continue;

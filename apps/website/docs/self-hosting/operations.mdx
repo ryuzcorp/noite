@@ -9,12 +9,20 @@ Installs follow releases, not `main`. `NOITE_IMAGE` (or `NOITE_VERSION` for the 
 
 | Tag | What it is |
 | --- | --- |
-| `alpha` | The newest release of any kind. The default while Noite is alpha. |
+| `alpha` | The newest promoted release of any kind. The default while Noite is alpha. |
 | `stable` | The newest final release (no `-alpha.N` in its version). Absent until the first one. |
 | `0.1.0-alpha.1` | One release, pinned: an update changes nothing. |
 | short SHA, `edge` | A build of `main`. Not for installs: for CI and rollbacks. |
 
-Every release is tagged `v<version>` and passes the end-to-end lanes (passkey signup, invites, git push, deploys, and the hostile-tenant suite) before its image is published. Its notes are in [CHANGELOG.md](https://github.com/ryuzcorp/noite/blob/main/CHANGELOG.md); each has an **Operator action required** section, even when it is "None". Read it before you update.
+Every release is tagged `v<version>` and passes the end-to-end lanes (passkey signup, invites, git push, deploys, and the hostile-tenant suite) before its image is published. Its notes are in [CHANGELOG.md](https://github.com/ryuzcorp/noite/blob/main/CHANGELOG.md) and on its [GitHub release](https://github.com/ryuzcorp/noite/releases); each has an **Operator action required** section, even when it is "None". Read it before you update.
+
+A new release starts as a GitHub **pre-release**: its version tag exists, but `alpha` and `stable` don't move. To try it on your own server first, run the installer with `--pre`, which installs the newest release (pre-releases included) pinned to its version, with the installer and `compose.yaml` from its tag:
+
+```bash
+curl -fsSL https://noite.now/run.sh | bash -s install --pre
+```
+
+Once the pre-release is marked as a full release on GitHub, the channels point at the same image (no rebuild): `alpha` always, and `stable` too for a final version. A plain `install` then puts a `--pre` server back on the channel without a restart, since the image is the same. Only the latest release moves the channels; the maintainers re-point them by hand to roll a channel back.
 
 To roll back, set `NOITE_IMAGE` to the previous version tag. That works across releases that did not change the database schema; a release that did refuses to be downgraded (see [Troubleshooting](#troubleshooting)), so take a [backup](#backups) first.
 
@@ -28,7 +36,13 @@ curl -fsSL https://noite.now/run.sh | bash -s install
 cd /opt/noite && docker compose pull && docker compose up -d
 ```
 
-The image is disposable and state lives in the volumes and the bucket, so an update is a pull plus a recreate. The runner stops every fleet in parallel inside its stop budget (`NOITE_STOP_BUDGET_MS`, 25 s; Compose's `stop_grace_period` is 35 s), then Caddy, then writes a final state snapshot. A new image restarts every tenant fleet with it (cold boots), so batch upgrades.
+The image is disposable and state lives in the volumes and the bucket, so an update is a pull plus a recreate. The runner stops every fleet in parallel inside its stop budget (`NOITE_STOP_BUDGET_MS`, 25 s; Compose's `stop_grace_period` is 35 s), then Caddy, then writes a final state snapshot — measured at ~0.3 s for 15 running fleets.
+
+A new image also restarts every tenant fleet, and that is the part you feel. Measured on a 32-core host with 1, 5 and 15 sample apps: the runner spawned every fleet within 50 ms of the new container starting — it starts them *before* it deploys the control UI, so a release whose UI bundle changed no longer delays them (that deploy measures 0.66 s against a local store, more against a remote one; SIGTERM handling is installed before any child starts and the REST listener binds before that deploy, so an upgrade interrupted at any point still stops every fleet cleanly inside the stop budget and writes the final state snapshot) — and every app was serving again within 5.1 s of the container starting, at every fleet count (the fastest fleet answered in ~2.1 s). Fleets boot in parallel, so the window tracks the slowest fleet rather than the number of apps.
+
+What a visitor sees in that window is a delayed response, not an error: the edge holds the request for up to 20 s (`lb_try_duration`) and serves it the moment the fleet is healthy. Only a fleet that takes longer than that answers the short "starting" page (503 with `Retry-After: 5`, which reloads itself). The installer says so and asks once before it recreates a changed image (`--yes`, `NOITE_YES=1` or `NOITE_CONFIRM=1` skips the prompt); with many tenants, batch upgrades and run them off-peak anyway.
+
+An upgrade that changes the telemetry ingest (the 0.1.0-alpha.3 release) also queues a **one-time replay of the retention window**: every fleet's telemetry is re-read through the now-idempotent ingest so rows an older version dropped are recovered. It runs in the background, bounded by `RUNNER_TELEMETRY_RETENTION_DAYS`, and is documented under [Telemetry](/self-hosting/storage#replaying-a-window).
 
 Stop-budget tuning lives in [Environment variables](/reference/environment-variables).
 
@@ -81,3 +95,23 @@ Compose warns that the volumes were not created by it; that is expected. Verify 
 - **A deploy fails with `nothing to deploy`**: the tree has no Wrangler config, no `index.html` in `dist/`, `build/` or `out/`, and no `package.json` `main`. See [No config at all](/apps/build#no-config-at-all).
 - **A deploy fails with `starts a Node HTTP server`**: `package.json` `main` calls `.listen()`. Noite runs Workers; see [Frameworks and Node servers](/apps/build#frameworks-and-node-servers).
 - **Many `429` responses**: the edge rate limits. Behind a proxy, check `NOITE_TRUSTED_PROXIES`; otherwise raise `NOITE_EDGE_RPM` or the app's own limit ([Edge protection](/self-hosting/protection)).
+- **Metrics, logs or errors are missing for a period**: the ingest now holds its watermark on a failed pass and catches up hour by hour, so most gaps fill themselves in within a flush interval or two. If a gap persists — or you upgraded from a release before 0.1.0-alpha.3 and want the rows its ingest skipped — replay the window by hand (idempotent, bounded by retention):
+
+  ```bash
+  docker compose exec noite noite-runner telemetry reingest --since 30d
+  docker compose exec noite noite-runner telemetry reingest --slug blog --since 2026-01-01T00:00:00Z
+  docker compose exec noite noite-runner telemetry reingest --slug _control --since 7d
+  ```
+
+  `--slug _control` replays the control plane's own telemetry (the reserved pseudo app, visible to instance admins only). Its Parquet lives under `s3://<bucket>/control/telemetry/` rather than `fleets/`.
+
+  Add `--no-wait` to return immediately; the runner keeps replaying and logs `telemetry replay complete`. To check how far the ingest has covered a fleet, read the persisted aggregates through the runner's own API (the container has `curl` and the token):
+
+  ```bash
+  docker compose exec noite sh -c 'curl -fsS -H "Authorization: Bearer $RUNNER_TOKEN" \
+    http://127.0.0.1:8080/v1/apps'                       # id + slug per app
+  docker compose exec noite sh -c 'curl -fsS -H "Authorization: Bearer $RUNNER_TOKEN" \
+    "http://127.0.0.1:8080/v1/apps/<id>/metrics?hours=720"'   # minute buckets, 30 days
+  ```
+
+  A missing hour shows as a gap in that list (or in the app's **Metrics** tab); compare it with the hour directories under `s3://<bucket>/fleets/<slug>/telemetry/` to see whether the source data still exists. Nothing older than `RUNNER_TELEMETRY_RETENTION_DAYS` is recoverable: celld has already pruned it from the bucket.

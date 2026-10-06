@@ -7,7 +7,7 @@
 #   ├── caddy             edge: TLS, routing (admin 127.0.0.1:2019)
 #   ├── celld             control UI, fleet #0 (127.0.0.1:8090)
 #   ├── celld × N         tenant fleets (uid 10020)
-#   └── bun / node / sh   tenant builds and release commands (uid 10010)
+#   └── bun / node / sh   tenant builds and release commands (uid 10030+, one per app)
 #
 # Targets:
 #   noite (default)  the published image
@@ -20,6 +20,10 @@
 # docker/check-versions.ts asserts they appear exactly once. Sidecar versions
 # (esbuild, duckdb) live in docker/install-sidecars.sh.
 ARG CELLD_VERSION=0.6.1
+# Noite's own release version, reported by the instance heartbeat
+# (`NOITE_BUILD_VERSION` ENV in the runtime stages): the tag without `v` on a
+# release build (images.yml passes it), `dev` otherwise.
+ARG NOITE_BUILD_VERSION=dev
 ARG CADDY_VERSION=2.10.0
 # Caddy's rate-limit handler (github.com/mholt/caddy-ratelimit), which the
 # runner writes for every site (SPEC, Edge limits). It has no releases past
@@ -58,8 +62,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libs
   && rm -rf /var/lib/apt/lists/*
 COPY apps/runner/Cargo.toml apps/runner/Cargo.lock ./
 COPY apps/runner/src ./src
-# schema.sql is `include_str!`-embedded: needed to build, never shipped.
-COPY apps/runner/schema.sql ./schema.sql
+# The schemas are `include_str!`-embedded: needed to build, never shipped.
+COPY apps/runner/schema.sql apps/runner/schema.metrics.sql ./
 RUN cargo build --release && strip target/release/noite-runner
 
 # --- control UI bundle ------------------------------------------------------
@@ -88,6 +92,10 @@ ARG TARGETARCH
 ARG NODE_VERSION
 ARG JUP_VERSION
 ARG JUP_SHA512
+# Re-declared so they can be read after FROM: the global defaults (or the
+# --build-arg values) are what the ENV block below bakes in.
+ARG CELLD_VERSION
+ARG NOITE_BUILD_VERSION
 # bun: tenant `bun install` / builds. node: real Node (not bun's shim) for
 # tenant steps that need it, e.g. loading `cloudflare.config.ts` (the `cf`
 # CLI config needs Node's module hooks); only the binary, no npm. jup:
@@ -118,10 +126,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && jup --version \
   && JUP_HOME=/tmp/jup-home jup enable --install-directory /usr/local/bin npm pnpm yarn \
   && rm -rf /tmp/jup-home
-# Sandbox users (SPEC, Tenant isolation): builds and release commands run as `build`,
-# tenant fleets as `fleet`; the nft policy keys on these uids.
-RUN useradd -u 10010 -m -s /bin/sh build \
-  && useradd -u 10020 -m -s /bin/sh fleet \
+# Sandbox users (SPEC, Tenant isolation): tenant fleets run as `fleet`; each
+# app's builds and release commands run as their own uid from the reserved
+# per-app range (RUNNER_BUILD_UID_BASE=10030, RUNNER_BUILD_UID_RANGE=1024 in
+# apps/runner/src/config.rs), which the nft policy closes off as one range.
+# The runner assigns those uids numerically — setuid/setgid needs no passwd
+# entry — but the range is pre-created here because Node's os.userInfo()
+# throws for a uid with no /etc/passwd entry, which would break npm/pnpm/Yarn
+# and any Node-based tenant step. Keep the range in step with config.rs.
+RUN useradd -u 10020 -m -s /bin/sh fleet \
+  && for uid in $(seq 10030 11053); do \
+       echo "noite-build-${uid}:x:${uid}:${uid}::/data/runner:/bin/sh" >> /etc/passwd; \
+       echo "noite-build-${uid}:x:${uid}:" >> /etc/group; \
+     done \
   && mkdir -p /data /opt/noite/control
 COPY --from=celld /usr/local/bin/celld /usr/local/bin/celld
 COPY --from=caddy-build /out/caddy /usr/local/bin/caddy
@@ -135,6 +152,8 @@ WORKDIR /data
 ENV RUNNER_BIND=0.0.0.0:8080 \
     PATH="/usr/local/bin:${PATH}" \
     CELLD_ESBUILD=/usr/local/bin/esbuild \
+    NOITE_BUILD_VERSION="${NOITE_BUILD_VERSION}" \
+    CELLD_VERSION="${CELLD_VERSION}" \
     NOITE_DB=/data/noite.sqlite \
     RUNNER_WORK_DIR=/data/runner \
     CONTROL_BUNDLE_DIR=/opt/noite/control/dist \

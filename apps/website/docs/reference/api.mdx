@@ -28,7 +28,7 @@ Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
 | Method | Route | Notes |
 | --- | --- | --- |
 | `GET` / `POST` | `/v1/apps` | List; create (quota-checked, see [Limits](/reference/limits)) |
-| `GET` / `PATCH` / `DELETE` | `/v1/apps/{id}` | `PATCH` sets `desired_state: running\|stopped` |
+| `GET` / `PATCH` / `DELETE` | `/v1/apps/{id}` | `PATCH` sets `desired_state: running\|stopped`; an unknown key is rejected (`422`) |
 | `POST` | `/v1/apps/{id}/rename` | Renames the app; rotates scoped credentials once a provider exists (none today — see [Tenancy](/self-hosting/tenancy)) |
 | `POST` | `/v1/apps/{id}/sleep` | Parks the app; next request wakes it |
 
@@ -40,7 +40,7 @@ Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
 | `GET` | `/v1/apps/{id}/deploys/stream` | SSE stream of deploys |
 | `GET` | `/v1/apps/{id}/deploys/{deploy_id}/log` | Build/deploy log |
 | `POST` | `/v1/apps/{id}/rollback` | Redeploys a previous deploy; wakes asleep apps first |
-| `POST` | `/v1/apps/{id}/git-remote` | Remote URL info for the app's repo |
+| `POST` | `/v1/apps/{id}/git-remote` | Clone coordinates: `url` (the public remote) plus `username` and the internal layout (`s3Remote`, `endpoint`, `bucket`, `prefix`). No `remote` key |
 
 ## Env
 
@@ -65,17 +65,22 @@ Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
 | `GET` | `/v1/apps/{id}/diff` | Working diff |
 | `POST` | `/v1/apps/{id}/source/commit` | Browser-edit commit (validated paths + message + author email); wakes asleep apps |
 
+Storage and source reads classify the backend failure: a missing object, a missing D1 table, or a not-yet-deployed source is `404`, an invalid path is `400`, and every other mirror/S3/celld failure is `500`. (These used to be folded into `409`.)
+
 ## Storage
 
 | Method | Route | Notes |
 | --- | --- | --- |
 | `GET` | `/v1/apps/{id}/storage` | Storage overview |
-| `GET` | `/v1/apps/{id}/storage/d1/{database_id}` | Query a D1 database |
-| `POST` | `/v1/apps/{id}/storage/d1/{database_id}/write` | Execute a D1 write |
-| `GET` | `/v1/apps/{id}/storage/do/{class_name}` | Durable Object contents |
-| `GET` | `/v1/apps/{id}/storage/r2/{bucket}` | List bucket keys |
-| `GET` / `DELETE` | `/v1/apps/{id}/storage/r2/{bucket}/object` | Read / delete one object |
-| `GET` | `/v1/apps/{id}/storage/r2/{bucket}/raw` | Raw object bytes |
+| `GET` | `/v1/apps/{id}/storage/d1/{database_id}/tables` | D1 tables with row counts |
+| `GET` | `/v1/apps/{id}/storage/d1/{database_id}/tables/{table}/schema` | Table columns, foreign keys, indexes, DDL |
+| `POST` | `/v1/apps/{id}/storage/d1/{database_id}/tables/{table}/rows` | One page of rows (body: `page`, `page_size`, `sort`, `filters`, `search`) |
+| `POST` | `/v1/apps/{id}/storage/d1/{database_id}/write` | Execute a D1 write (`insert` / `update` / `delete`) |
+| `POST` | `/v1/apps/{id}/storage/d1/{database_id}/delete-rows` | Delete 1..100 rows by key in one atomic batch |
+| `GET` | `/v1/apps/{id}/storage/do/{class_name}` | Durable Object instances (`id`, `scope`, `?read=1` preview) |
+| `GET` | `/v1/apps/{id}/storage/r2/{bucket}?prefix=&cursor=` | One page of a bucket folder: folders, files (size, content type) and the continuation cursor |
+| `GET` / `PUT` / `DELETE` | `/v1/apps/{id}/storage/r2/{bucket}/object?key=` | Read a text preview / upload one object (streamed body; `celld r2 put`) / delete it |
+| `GET` | `/v1/apps/{id}/storage/r2/{bucket}/raw?key=` | Raw object bytes with the object's own content type |
 
 ## Metrics and telemetry
 
@@ -126,7 +131,7 @@ git push noite main
 
 ## RPC mirror
 
-`POST /rpc` is JSON-RPC 2.0 over the same auth, with a method per REST route (`apps.list`, `env.set`, `deploys.rollback`, `storage.d1.get`, …). A few methods exist only there, because only the control UI uses them:
+`POST /rpc` is JSON-RPC 2.0 over the same auth, with a method per REST route (`apps.list`, `env.set`, `deploys.rollback`, `storage.d1.rows`, …). A few methods exist only there, because only the control UI uses them:
 
 | Method | Params | Does |
 | --- | --- | --- |
@@ -134,12 +139,17 @@ git push noite main
 | `limits.get` / `limits.set` | `id`, `clientRpm`, `appRpm` | The app's edge rate limits (requests per minute; `null` = platform default, `0` = off) |
 | `errors.list` / `errors.get` / `errors.set_status` | `id`, `status` / `fingerprint` | Grouped errors, one error with occurrences, resolve / ignore / reopen |
 
+Errors map like the HTTP statuses: application errors keep `400`/`404`/`409`, a bad param shape is `-32602`, and any internal failure — an `events.*` DB error included — is `-32603`.
+
 ## Statuses
 
 | Code  | Meaning                                                 |
 | ----- | ------------------------------------------------------- |
+| `400` | Invalid path or body (e.g. `blob`, `source/commit`)     |
 | `401` | Missing or wrong bearer token / API key                 |
-| `404` | Unknown app, slug, deploy, or key                       |
-| `409` | Domain already taken; conflicting sleep/wake transition |
+| `404` | Unknown app, slug, deploy, key, object, table or source |
+| `409` | Domain already taken; conflicting sleep/wake transition; lost `source/commit` race |
+| `422` | `PATCH /v1/apps/{id}` body with unknown keys            |
 | `429` | Edge rate limit (+ `Retry-After`)                       |
+| `500` | Runner internal failure (mirror, DuckDB, S3, DB)        |
 | `503` | Fleet shedding load (+ `Retry-After`) or failed wake    |

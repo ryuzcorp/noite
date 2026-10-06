@@ -1,0 +1,75 @@
+---
+title: Telemetry
+description: The anonymous heartbeat a Noite install sends once a day — what it contains, where it goes, how to see the exact payload, and how to turn it off.
+---
+
+Noite installs send one anonymous heartbeat a day, so the maintainers can tell how many installs run which release and roughly how they are used. It is **on by default and opt-out**: the payload is counts, versions and closed buckets, nothing identifies you or your users, and turning it off is one setting.
+
+The runner sends it directly to PostHog's HTTP capture API. There is no PostHog SDK, no cookie and no browser tracking — the request comes from the container, not from a visitor's browser. This is separate from the per-app telemetry Noite collects for you: logs, traces, metrics and errors live in your own bucket and never leave it ([Storage](/self-hosting/storage#replaying-a-window)).
+
+## What is sent
+
+One event per install per day, `instance_heartbeat`, built by the runner from its own database. These are all its properties:
+
+| Property | Example | Meaning |
+| --- | --- | --- |
+| `version` | `0.1.0-alpha.3` | Release version baked into the image (`dev` for a source build) |
+| `celld_version` | `0.6.1` | celld version the image ships (`unknown` if unset) |
+| `arch` | `x86_64` | CPU architecture |
+| `tenancy` | `multi` | `multi` or `single` ([Tenancy](/self-hosting/tenancy)) |
+| `storage` | `bundled` | `bundled` for the bundled RustFS, `external` for your own bucket |
+| `apps` | `4` | Total apps |
+| `apps_running` | `3` | Apps desired running and awake |
+| `apps_sleeping` | `1` | Apps asleep ([Limits](/reference/limits)) |
+| `deploys_24h` | `7` | Deploy rows created in the last 24 hours |
+| `deploys_failed_24h` | `1` | Of those, failed |
+| `users` | `2-5` | Bucket of the account count: `1`, `2-5`, `6-20`, `21+`, or `unknown` when the control worker cannot be reached |
+| `install_age_days` | `12` | Whole days since the install was first created |
+| `uptime_hours` | `813` | Whole hours since the runner started |
+
+## What is never sent
+
+No domains or hostnames. No app names or slugs, no bucket names or endpoints. No account names, email addresses or sign-in data. No IP addresses or geolocation. No request paths, logs, source or deploy output. No environment values, and nothing about the visitors to your apps. The payload is fixed — every field is a count, a version or a closed bucket, and there is no field that carries free-form text.
+
+## The install id
+
+`distinct_id` is a random UUID v4, generated on the install's first boot. It lives in the runner's database (`instance_setting`, key `install_id`), which is snapshotted into your bucket, so it survives container recreation, upgrades and a restore from the bucket — one install stays one install. It is not derived from your domain, server or account, and a fresh install starts a new one.
+
+## Where it goes
+
+`POST https://eu.i.posthog.com/i/v0/e/` — PostHog's EU Cloud — under the project key compiled into the image (write-only, safe to be public). The event sets `$geoip_disable: true` and `$process_person_profile: false`, so PostHog does not geolocate the request or keep a person profile for it. A send has a 10-second timeout; a failure is logged at most once and retried at the next check. Telemetry never blocks or fails a deploy, a request or a boot.
+
+## How often
+
+The first attempt is ten minutes after the runner starts, then it checks hourly and sends when the last successful send was at least 24 hours ago. That time is stored as `telemetry_last_sent_at`. Turning telemetry off stops sends immediately.
+
+## See the exact payload
+
+Instance admins have two ways to see exactly what the next send would post.
+
+On `/account`, the **Admin** section has an **Anonymous usage telemetry** row whose **Show the exact payload** disclosure renders the JSON the next heartbeat would post (with the API key omitted from the display).
+
+The same body comes from the runner, using the `RUNNER_TOKEN` from `/opt/noite/.env`:
+
+```bash
+cd /opt/noite
+RUNNER_TOKEN=$(grep '^RUNNER_TOKEN=' .env | cut -d= -f2-)
+docker compose exec -T noite curl -s \
+  -H "Authorization: Bearer $RUNNER_TOKEN" \
+  http://127.0.0.1:8080/v1/admin/telemetry | jq .preview
+```
+
+`GET /v1/admin/telemetry` returns the effective `enabled` state, the stored `setting`, whether the setting is `locked` and why, `lastSentAt`, the `installId`, and `preview` — the exact JSON body, API key included. The UI hides the key; the raw API does not.
+
+## Turning it off
+
+| Way | How |
+| --- | --- |
+| Admin checkbox | On `/account`, under **Admin** → **Anonymous usage telemetry**, clear **Share anonymous instance telemetry**. Applies immediately. |
+| Environment variable | `NOITE_TELEMETRY=0` in `/opt/noite/.env`, then `cd /opt/noite && docker compose up -d`. `false` and `off` work too. The installer also accepts `NOITE_TELEMETRY` and writes it to `.env`. |
+| Do Not Track | `DO_NOT_TRACK=1` disables it — any non-empty value other than `0`. |
+| Local domains | An install whose base domain is `localhost`, `*.localhost`, `*.local`, `*.test`, `*.internal` or an IP literal never reports. That covers the dev stack and the e2e lanes (which also set `NOITE_TELEMETRY=0`). An `<ip>.sslip.io` install is a public domain and **does** report — the installer's no-DNS default still counts. |
+
+When an environment variable or a local domain applies, the setting is **locked**: the checkbox is disabled and reads `Disabled by NOITE_TELEMETRY=0`, `Disabled by DO_NOT_TRACK` or `Disabled by local domain`, and the runner will not send even if the stored preference is on. Removing the override restores the stored preference.
+
+Nothing is sent about the opt-out itself: turning telemetry off is not an event.

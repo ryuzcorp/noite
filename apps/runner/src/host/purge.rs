@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Context;
 
 use crate::config::Config;
-use crate::host::cmd;
+use crate::host::{exec, s3};
 use crate::host::logs::{self, LogState};
 use crate::host::source;
 use crate::host::supervisor::{self, ProcMap};
@@ -31,7 +31,7 @@ pub async fn purge_slug(
     tokio::time::sleep(Duration::from_millis(500)).await;
     logs::clear(log_state, slug).await;
 
-    let root = cmd::work_root(cfg);
+    let root = exec::work_root(cfg);
     for path in [
         source::bare_repo(cfg, slug),
         root.join("git-http").join(format!("{slug}.git")),
@@ -62,8 +62,10 @@ async fn clear_s3_prefix(cfg: &Config, prefix: &str) -> anyhow::Result<()> {
         .and_then(|s| s.split('/').next())
         .unwrap_or(&cfg.s3_bucket)
         .to_string();
-    let key = prefix.strip_prefix(&format!("s3://{bucket}/")).unwrap_or(prefix);
-    cmd::s3_rm_prefix(cfg, &bucket, key)
+    let key = prefix
+        .strip_prefix(&format!("s3://{bucket}/"))
+        .unwrap_or(prefix);
+    s3::s3_rm_prefix(cfg, &bucket, key)
         .await
         .with_context(|| format!("clear S3 prefix {prefix}"))?;
     Ok(())

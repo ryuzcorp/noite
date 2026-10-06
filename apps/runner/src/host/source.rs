@@ -6,32 +6,36 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 use serde::Serialize;
+use ts_rs::TS;
 
 use crate::config::Config;
-use crate::host::{cmd, rehydrate};
+use crate::host::{exec, rehydrate};
 use crate::models::App;
 
 pub const MAX_BLOB: usize = 256 * 1024;
 pub const MAX_PATCH: usize = 1024 * 1024;
 const MAX_FILES: usize = 2_000;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct TreeEntry {
     pub path: String,
     pub size: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct TreeResponse {
     pub sha: String,
     pub files: Vec<TreeEntry>,
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct BlobResponse {
     pub sha: String,
     pub path: String,
@@ -41,8 +45,9 @@ pub struct BlobResponse {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct DiffResponse {
     pub sha: String,
     pub parent: Option<String>,
@@ -51,7 +56,7 @@ pub struct DiffResponse {
 }
 
 pub fn bare_repo(cfg: &Config, slug: &str) -> PathBuf {
-    cmd::work_root(cfg)
+    exec::work_root(cfg)
         .join("repos")
         .join(format!("{slug}.git"))
 }
@@ -73,7 +78,7 @@ pub async fn checkout_worktree(
         anyhow::bail!("no bare mirror for {slug} yet");
     }
     tokio::fs::create_dir_all(dest).await?;
-    cmd::run_cmd(
+    exec::run_cmd(
         "git",
         &[
             &format!("--git-dir={}", bare.display()),
@@ -108,7 +113,13 @@ pub async fn resolve_rev(cfg: &Config, app: &App) -> anyhow::Result<Option<Strin
     if !repo.join("HEAD").exists() {
         return Ok(None);
     }
-    match git(cfg, &app.slug, &["rev-parse", "--verify", "--quiet", "HEAD"]).await {
+    match git(
+        cfg,
+        &app.slug,
+        &["rev-parse", "--verify", "--quiet", "HEAD"],
+    )
+    .await
+    {
         Ok(out) => Ok(Some(out.trim().to_string())),
         Err(_) => Ok(None),
     }
@@ -116,17 +127,8 @@ pub async fn resolve_rev(cfg: &Config, app: &App) -> anyhow::Result<Option<Strin
 
 /// Full recursive listing (git's own tree order — server-sorted, so the UI
 /// can use preparePresortedFileTreeInput).
-pub async fn list_tree(
-    cfg: &Config,
-    app: &App,
-    rev: &str,
-) -> anyhow::Result<TreeResponse> {
-    let out = git(
-        cfg,
-        &app.slug,
-        &["ls-tree", "-r", "-z", "-l", rev],
-    )
-    .await?;
+pub async fn list_tree(cfg: &Config, app: &App, rev: &str) -> anyhow::Result<TreeResponse> {
+    let out = git(cfg, &app.slug, &["ls-tree", "-r", "-z", "-l", rev]).await?;
     let mut files = Vec::new();
     let mut truncated = false;
     for rec in out.trim_end_matches('\0').split('\0') {
@@ -188,12 +190,7 @@ pub async fn read_blob(
     if !valid_path(path) {
         bail!("invalid path");
     }
-    let out = git(
-        cfg,
-        &app.slug,
-        &["ls-tree", "-z", "-l", rev, "--", path],
-    )
-    .await?;
+    let out = git(cfg, &app.slug, &["ls-tree", "-z", "-l", rev, "--", path]).await?;
     let Some((_, sha, size, _)) = parse_tree_record(out.trim_end_matches('\0')) else {
         bail!("file not found in {rev}");
     };
@@ -216,11 +213,7 @@ pub async fn read_blob(
     })
 }
 
-pub async fn make_patch(
-    cfg: &Config,
-    app: &App,
-    rev: &str,
-) -> anyhow::Result<DiffResponse> {
+pub async fn make_patch(cfg: &Config, app: &App, rev: &str) -> anyhow::Result<DiffResponse> {
     // First push has no parent: diff-tree --root diffs against the empty
     // tree (`diff --root` refuses bare repos — it wants a work tree).
     let parent = git(
@@ -232,12 +225,8 @@ pub async fn make_patch(
     .ok()
     .map(|s| s.trim().to_string());
     let patch = match &parent {
-        Some(p) => {
-            git(cfg, &app.slug, &["diff", p, rev]).await?
-        }
-        None => {
-            git(cfg, &app.slug, &["diff-tree", "-p", "--root", rev]).await?
-        }
+        Some(p) => git(cfg, &app.slug, &["diff", p, rev]).await?,
+        None => git(cfg, &app.slug, &["diff-tree", "-p", "--root", rev]).await?,
     };
     let (patch, truncated) = if patch.len() > MAX_PATCH {
         (patch[..MAX_PATCH].to_string(), true)
@@ -261,7 +250,7 @@ async fn git(cfg: &Config, slug: &str, args: &[&str]) -> anyhow::Result<String> 
     let mut full = Vec::with_capacity(args.len() + 1);
     full.push(git_dir.as_str());
     full.extend_from_slice(args);
-    cmd::run_cmd("git", &full, None, &[], Duration::from_secs(30))
+    exec::run_cmd("git", &full, None, &[], Duration::from_secs(30))
         .await
         .with_context(|| format!("git in {}", repo.display()))
 }

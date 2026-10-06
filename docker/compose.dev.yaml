@@ -23,6 +23,8 @@ services:
       - vite-cache:/app/node_modules/.vite
     environment:
       RUST_LOG: ${RUST_LOG:-noite_runner=debug,tower_http=info}
+      # Dev stacks never report (SPEC, telemetry).
+      NOITE_TELEMETRY: "0"
       RUNNER_DEV_RELEASE: ${RUNNER_DEV_RELEASE:-0}
       # 1 = polling file watcher (flaky rootless inotify).
       VITE_USE_POLLING: ${VITE_USE_POLLING:-0}

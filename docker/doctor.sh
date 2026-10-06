@@ -10,12 +10,9 @@
 # serves the UI through Caddy on :8090 under its own compose project.
 set -eu
 cd "$(dirname "$0")/.."
-
-if [ -f .env ]; then
-  set -a
-  . ./.env
-  set +a
-fi
+# shellcheck source=docker/lib.sh
+. "$(dirname "$0")/lib.sh"
+load_env
 
 TOKEN="${RUNNER_TOKEN:-dev-runner-token}"
 if [ "${E2E_RAW_PORTS:-}" = 1 ]; then
@@ -30,15 +27,7 @@ else
   PROJECT=noite
 fi
 
-if command -v docker >/dev/null 2>&1; then
-  ENGINE=docker
-else
-  ENGINE=podman
-fi
-case "${COMPOSE:-}" in
-*"docker compose"*) ENGINE=docker ;;
-*"podman compose"*) ENGINE=podman ;;
-esac
+detect_engine
 
 fail=0
 check() {

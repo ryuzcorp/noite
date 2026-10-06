@@ -21,7 +21,7 @@ use anyhow::{bail, Context};
 use sqlx::SqliteConnection;
 
 /// Version a database has after every migration ran. 1 is the alpha baseline.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`.
@@ -31,7 +31,54 @@ pub struct Migration {
 }
 
 /// Steps above the baseline, ascending and contiguous (`2..=SCHEMA_VERSION`).
-pub const MIGRATIONS: &[Migration] = &[];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 2,
+        // Pending-telemetry-replay requests (`noite-runner telemetry reingest`
+        // writes one). The shape only; step 4 asks for the one-time replay.
+        sql: "CREATE TABLE IF NOT EXISTS main.telemetry_replay (\
+            id INTEGER PRIMARY KEY CHECK (id = 1),\
+            floor_us INTEGER NOT NULL,\
+            slug TEXT,\
+            requested_at TEXT NOT NULL\
+          );",
+    },
+    Migration {
+        version: 3,
+        // Per-app build uid (SPEC, Tenant isolation): builds and release
+        // commands run as one uid per app so two concurrent builds cannot read
+        // each other's worktree or cache. The column is nullable here — SQLite
+        // rejects a UNIQUE column in ALTER TABLE — and filled on the app's first
+        // build by `db::ensure_app_build_uid`. A fresh database gets it from
+        // schema.sql. The table is qualified in the ALTER; in `CREATE INDEX …
+        // ON app` it cannot be (SQLite rejects a schema-qualified table there),
+        // and `app` is a main table, so the bare name is unambiguous.
+        sql: "ALTER TABLE main.app ADD COLUMN build_uid INTEGER;\
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_app_build_uid ON app(build_uid);",
+    },
+    Migration {
+        version: 4,
+        // One-time replay of the retention window, now that the ingest REPLACES a
+        // window's aggregates instead of adding to them (so the replay cannot
+        // double count). It recovers rows dropped by the pre-alpha.2 ingest bug
+        // wherever the bucket still holds them; data older than retention is
+        // pruned and gone. `floor_us = 0` means the retention floor; the metrics
+        // tick consumes the row and deletes it when every fleet has caught up.
+        sql: "INSERT OR IGNORE INTO main.telemetry_replay (id, floor_us, slug, requested_at)\
+            VALUES (1, 0, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'));",
+    },
+    Migration {
+        version: 5,
+        // Instance-level settings for the opt-out instance heartbeat: the
+        // install identity and the last-sent/opt-out markers. A fresh database
+        // gets the table from schema.sql; an install that predates alpha.3
+        // gains it here.
+        sql: "CREATE TABLE IF NOT EXISTS main.instance_setting (\
+            key TEXT PRIMARY KEY NOT NULL,\
+            value TEXT NOT NULL\
+          );",
+    },
+];
 
 /// What boot must do to bring a database to the latest version.
 #[derive(Debug, PartialEq, Eq)]
@@ -98,9 +145,7 @@ pub async fn apply(
         sqlx::raw_sql(step.sql)
             .execute(&mut *conn)
             .await
-            .with_context(|| {
-                format!("migrate the runner database to schema version {version}")
-            })?;
+            .with_context(|| format!("migrate the runner database to schema version {version}"))?;
     }
     sqlx::raw_sql(schema_sql)
         .execute(&mut *conn)
@@ -135,7 +180,9 @@ mod tests {
     ];
 
     async fn memory() -> SqliteConnection {
-        SqliteConnection::connect("sqlite::memory:").await.expect("memory db")
+        SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("memory db")
     }
 
     async fn version(conn: &mut SqliteConnection) -> i64 {
@@ -194,7 +241,9 @@ mod tests {
             .expect("row survives");
         assert_eq!(slug, "blog");
         // Booting again is a no-op.
-        apply(&mut conn, upgraded, 3, STEPS).await.expect("second boot");
+        apply(&mut conn, upgraded, 3, STEPS)
+            .await
+            .expect("second boot");
         assert_eq!(version(&mut conn).await, 3);
     }
 
@@ -205,10 +254,104 @@ mod tests {
             .execute(&mut conn)
             .await
             .expect("seed");
-        let err = apply(&mut conn, BASELINE, 3, STEPS).await.expect_err("refused");
+        let err = apply(&mut conn, BASELINE, 3, STEPS)
+            .await
+            .expect_err("refused");
         let text = format!("{err:#}");
         assert!(text.contains("schema version 9"), "{text}");
         assert!(text.contains("Downgrades are not supported"), "{text}");
         assert_eq!(version(&mut conn).await, 9);
+    }
+
+    /// The shipped migration that adds `app.build_uid` must apply to a table
+    /// that predates it (alpha.2), qualify `main.app` (a bare `ALTER` can
+    /// resolve into the attached `metrics.sqlite`), and leave the unique
+    /// index enforced.
+    #[tokio::test]
+    async fn shipped_build_uid_migration_applies_to_an_old_app_table() {
+        let mut conn = memory().await;
+        sqlx::raw_sql(
+            "CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT);\
+             INSERT INTO main.app VALUES ('a', 'a');\
+             PRAGMA main.user_version = 2;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed alpha.2 shape");
+        let v3 = "CREATE TABLE IF NOT EXISTS main.app (id TEXT PRIMARY KEY, slug TEXT, build_uid INTEGER);\
+                  CREATE UNIQUE INDEX IF NOT EXISTS idx_app_build_uid ON app(build_uid);";
+        // Apply just this step: later migrations (other features) must not
+        // leak into this test's minimal database.
+        let idx = MIGRATIONS
+            .iter()
+            .position(|m| m.version == 3)
+            .expect("the build_uid migration is shipped");
+        apply(&mut conn, v3, 3, &MIGRATIONS[idx..=idx])
+            .await
+            .expect("upgrade");
+        assert_eq!(version(&mut conn).await, 3);
+        let has_column: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('app') WHERE name = 'build_uid'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("column");
+        assert_eq!(has_column, 1, "build_uid added");
+        // The row survives unallocated (NULL), and the index still arbitrates.
+        let uid: Option<i64> = sqlx::query_scalar("SELECT build_uid FROM main.app WHERE id = 'a'")
+            .fetch_one(&mut conn)
+            .await
+            .expect("row survives");
+        assert_eq!(uid, None);
+        sqlx::raw_sql("INSERT INTO main.app (id, slug, build_uid) VALUES ('b', 'b', 10030)")
+            .execute(&mut conn)
+            .await
+            .expect("first uid");
+        let dup = sqlx::raw_sql("UPDATE main.app SET build_uid = 10030 WHERE id = 'a'")
+            .execute(&mut conn)
+            .await;
+        assert!(dup.is_err(), "the unique index must reject a duplicate uid");
+    }
+
+    /// The shipped migration that adds `instance_setting` (the heartbeat's
+    /// install identity and opt-out markers) must apply to a database that
+    /// predates it, and leave the table usable.
+    #[tokio::test]
+    async fn shipped_instance_setting_migration_applies_to_an_old_database() {
+        let mut conn = memory().await;
+        sqlx::raw_sql(
+            "CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT);\
+             PRAGMA main.user_version = 4;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed the alpha.3-minus-one shape");
+        let v5 = "CREATE TABLE IF NOT EXISTS main.app (id TEXT PRIMARY KEY, slug TEXT);\
+                  CREATE TABLE IF NOT EXISTS main.instance_setting (\
+                    key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);";
+        let idx = MIGRATIONS
+            .iter()
+            .position(|m| m.version == 5)
+            .expect("the instance_setting migration is shipped");
+        // Apply just this step: later migrations must not leak into the test.
+        apply(&mut conn, v5, 5, &MIGRATIONS[idx..=idx])
+            .await
+            .expect("upgrade");
+        assert_eq!(version(&mut conn).await, 5);
+        sqlx::raw_sql("INSERT INTO main.instance_setting (key, value) VALUES ('install_id', 'x')")
+            .execute(&mut conn)
+            .await
+            .expect("insert");
+        let value: String =
+            sqlx::query_scalar("SELECT value FROM main.instance_setting WHERE key = 'install_id'")
+                .fetch_one(&mut conn)
+                .await
+                .expect("row survives");
+        assert_eq!(value, "x");
+        // Booting again is a no-op.
+        apply(&mut conn, v5, 5, &MIGRATIONS[idx..=idx])
+            .await
+            .expect("second boot");
+        assert_eq!(version(&mut conn).await, 5);
     }
 }

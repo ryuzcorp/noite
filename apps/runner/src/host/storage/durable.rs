@@ -3,13 +3,15 @@ use std::time::Duration;
 
 use anyhow::Context;
 use serde::Serialize;
+use ts_rs::TS;
 
 use crate::config::Config;
-use crate::host::cmd;
+use crate::host::{exec, s3};
 use crate::models::App;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct DoInstance {
     pub id: String,
     pub scope: String,
@@ -19,8 +21,9 @@ pub struct DoInstance {
     pub preview: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct DoPreview {
     pub app_id: String,
     pub app_slug: String,
@@ -33,17 +36,12 @@ pub struct DoPreview {
 /// JSON row per instance. celld exposes no generic storage read route for
 /// a DO instance, so each instance is also probed with `GET /do/{scope}
 /// ?read=1` — the object's own handler decides what its preview says.
-pub async fn do_instances(
-    cfg: &Config,
-    app: &App,
-    class_name: &str,
-) -> anyhow::Result<DoPreview> {
+pub async fn do_instances(cfg: &Config, app: &App, class_name: &str) -> anyhow::Result<DoPreview> {
     let bucket = app.fleet_bucket.clone();
-    let env_owned = cmd::aws_env(cfg);
-    let mut env: Vec<(&str, &str)> =
-        env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let env_owned = s3::aws_env(cfg);
+    let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     env.push(("S3_ENDPOINT", cfg.s3_endpoint.as_str()));
-    let out = cmd::run_cmd(
+    let out = exec::run_cmd(
         &cfg.celld_bin,
         &["cell", "list", class_name, "--json", "--bucket", &bucket],
         None,

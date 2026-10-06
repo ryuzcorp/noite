@@ -26,15 +26,15 @@
 //! boot, because starting with an empty database would upload it over the
 //! good snapshot on the next write. If both exist, keep the local file.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sqlx::SqlitePool;
 
 use crate::config::Config;
 use crate::db;
-use crate::host::cmd;
+use crate::host::s3;
 
 const STATE_KEY: &str = "runner/state/noite.sqlite.zst";
 const META_KEY: &str = "runner/state/noite.sqlite.meta.json";
@@ -111,7 +111,10 @@ impl StateSync {
             .await
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .and_then(|v| v.get("instance").and_then(|i| i.as_str().map(str::to_owned)));
+            .and_then(|v| {
+                v.get("instance")
+                    .and_then(|i| i.as_str().map(str::to_owned))
+            });
         let mine = match current {
             Some(instance) => instance == *self.instance,
             // Unreadable claim: keep uploading rather than silently stop.
@@ -180,7 +183,7 @@ impl StateSync {
         let packed_len = packed.len() as u64;
         let src = dir.join(".snapshot.sqlite.zst");
         tokio::fs::write(&src, &packed).await?;
-        cmd::s3_cp_upload(cfg, &src, STATE_KEY).await?;
+        s3::s3_cp_upload(cfg, &src, STATE_KEY).await?;
         let _ = tokio::fs::remove_file(&src).await;
         *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash.clone());
         crate::host::stats::count_snapshot(packed_len);
@@ -195,7 +198,12 @@ impl StateSync {
             "instance": self.instance.as_str(),
         });
         upload_text(cfg, META_KEY, &serde_json::to_string_pretty(&meta)?).await?;
-        tracing::info!(bytes = packed_len, raw_bytes = raw.len(), generation, "runner state snapshot uploaded");
+        tracing::info!(
+            bytes = packed_len,
+            raw_bytes = raw.len(),
+            generation,
+            "runner state snapshot uploaded"
+        );
         Ok(packed_len)
     }
 }
@@ -203,7 +211,7 @@ impl StateSync {
 async fn download_text(cfg: &Config, key: &str) -> anyhow::Result<String> {
     let dest = std::env::temp_dir().join(format!("noite-state-{}", uuid::Uuid::new_v4()));
     let uri = format!("s3://{}/{key}", cfg.s3_bucket);
-    let result = cmd::s3_cp_download(cfg, &uri, &dest).await;
+    let result = s3::s3_cp_download(cfg, &uri, &dest).await;
     let text = tokio::fs::read_to_string(&dest).await;
     let _ = tokio::fs::remove_file(&dest).await;
     result?;
@@ -213,7 +221,7 @@ async fn download_text(cfg: &Config, key: &str) -> anyhow::Result<String> {
 async fn upload_text(cfg: &Config, key: &str, text: &str) -> anyhow::Result<()> {
     let src = std::env::temp_dir().join(format!("noite-state-{}", uuid::Uuid::new_v4()));
     tokio::fs::write(&src, text).await?;
-    let result = cmd::s3_cp_upload(cfg, &src, key).await;
+    let result = s3::s3_cp_upload(cfg, &src, key).await;
     let _ = tokio::fs::remove_file(&src).await;
     result
 }
@@ -223,8 +231,8 @@ async fn upload_text(cfg: &Config, key: &str, text: &str) -> anyhow::Result<()> 
 /// other failure is an error the caller must not start past (see module
 /// docs). Retries a few times first: the store may still be starting.
 pub async fn restore_if_missing(cfg: &Config) -> anyhow::Result<bool> {
-    let live = db::local_db_path(cfg)
-        .unwrap_or_else(|| std::path::PathBuf::from("/data/noite.sqlite"));
+    let live =
+        db::local_db_path(cfg).unwrap_or_else(|| std::path::PathBuf::from("/data/noite.sqlite"));
     if live.exists() {
         return Ok(false);
     }
@@ -233,7 +241,9 @@ pub async fn restore_if_missing(cfg: &Config) -> anyhow::Result<bool> {
     }
     match download_snapshot(cfg, &live).await {
         Ok(restored) => Ok(restored),
-        Err(e) => Err(e.context("runner state restore failed; refusing to start with an empty database")),
+        Err(e) => {
+            Err(e.context("runner state restore failed; refusing to start with an empty database"))
+        }
     }
 }
 
@@ -246,7 +256,7 @@ async fn download_snapshot(cfg: &Config, live: &std::path::Path) -> anyhow::Resu
                 let _ = tokio::fs::remove_file(&partial).await;
                 return Ok(restored);
             }
-            Err(e) if cmd::is_not_found(&e) => {
+            Err(e) if s3::is_not_found(&e) => {
                 tracing::info!("no runner state snapshot in the bucket; starting fresh");
                 return Ok(false);
             }
@@ -269,7 +279,7 @@ async fn try_restore_once(
     partial: &std::path::Path,
 ) -> anyhow::Result<bool> {
     let uri = format!("s3://{}/{STATE_KEY}", cfg.s3_bucket);
-    cmd::s3_cp_download(cfg, &uri, partial).await?;
+    s3::s3_cp_download(cfg, &uri, partial).await?;
     let packed = tokio::fs::read(partial).await?;
     // The main database is control-plane rows only (metrics live in
     // metrics.sqlite), so a whole-file decode is bounded.
@@ -336,13 +346,15 @@ pub async fn final_snapshot(sync: &StateSync, pool: &SqlitePool, cfg: &Config) {
 
 #[cfg(test)]
 mod tests {
-    use crate::host::cmd::is_not_found;
+    use crate::host::s3::is_not_found;
 
     #[test]
     fn only_a_missing_object_counts_as_no_snapshot() {
         let missing = anyhow::anyhow!("aws exit 1\nfatal error: An error occurred (404) when calling the HeadObject operation: Key \"x\" does not exist");
         assert!(is_not_found(&missing));
-        let down = anyhow::anyhow!("aws exit 255\nCould not connect to the endpoint URL: \"http://rustfs:9000/noite\"");
+        let down = anyhow::anyhow!(
+            "aws exit 255\nCould not connect to the endpoint URL: \"http://rustfs:9000/noite\""
+        );
         assert!(!is_not_found(&down));
     }
 }

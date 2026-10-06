@@ -1,14 +1,15 @@
 //! Deploy history: header dropdown + SSE list.
 import { atom } from "ilha";
 
-import { rollback } from "../apps.server";
 import { formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
 import { decodeDeploys, deploysUrl, feedKeys, liveFeed } from "../feeds";
-import { Check, ChevronDown, ChevronUp, CloudUpload, Copy } from "../icons";
 import { appDetail, deployLog } from "../resources";
 import type { RunnerDeploy } from "../runner";
-import { ListSkeleton } from "../skeletons";
+import { rollback } from "../server/apps.server";
+import { CopyButton } from "../ui/copy-button";
+import { ChevronDown, ChevronUp, CloudUpload } from "../ui/icons";
+import { ListSkeleton } from "../ui/skeletons";
 import { RuntimeLogs } from "./logs";
 
 export const deployBadge = (status: string) => {
@@ -28,24 +29,12 @@ export const deployBadge = (status: string) => {
  * resource. CSS-only dropdown (focus-based) — no visibility atom needed. */
 export const DeployDropdown = ({ appId }: { appId: string }) => {
   const info = appDetail(appId).data();
-  const copied = atom(false);
   const redeploying = atom(false);
   const redeployError = atom("");
   if (!info) {
     return null;
   }
   const canPush = info.myRole === "push" || info.myRole === "admin";
-  const copyRemote = async () => {
-    try {
-      await navigator.clipboard.writeText(info.gitRemote);
-      copied.set(true);
-      setTimeout(() => {
-        copied.set(false);
-      }, 1500);
-    } catch {
-      // Clipboard API unavailable — the remote text stays selectable.
-    }
-  };
   return (
     <div class="dropdown dropdown-end">
       <div tabindex={0} role="button" class="btn btn-sm btn-neutral">
@@ -64,17 +53,12 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
             <code class="bg-base-200 block min-w-0 flex-1 overflow-x-auto rounded p-2 font-mono text-xs">
               {info.gitRemote}
             </code>
-            <button
-              type="button"
+            <CopyButton
               class="btn btn-sm shrink-0"
-              title={copied() ? "Copied" : "Copy git remote"}
-              aria-label={copied() ? "Copied" : "Copy git remote"}
-              onclick={() => {
-                void copyRemote();
-              }}
-            >
-              {copied() ? <Check /> : <Copy />}
-            </button>
+              iconOnly
+              label="Copy git remote"
+              value={info.gitRemote}
+            />
           </div>
           <p class="m-0 text-sm opacity-80">
             Stock Git over HTTP — push <code>main</code> to deploy. Auth:{" "}

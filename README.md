@@ -104,6 +104,8 @@ The full walkthrough is in the [Quickstart](https://noite.now/quickstart/).
 
 Installs follow a release channel: `ghcr.io/ryuzcorp/noite:alpha` by default. `stable` follows final releases only, and a version tag (`0.1.0-alpha.2`) pins one release. For real installs, bring your own S3-compatible bucket (R2, S3, Tigris, GCS or Azure Blob); the bundled RustFS store is for getting started ([Storage](https://noite.now/self-hosting/storage/)).
 
+Installs send one anonymous heartbeat a day — release, platform and counts, never domains, names, emails or IPs. It is opt-out: the Admin section on `/account` or `NOITE_TELEMETRY=0` turns it off ([Telemetry](https://noite.now/self-hosting/telemetry/)).
+
 ## How it works
 
 Noite ships as **one image**. The runner is PID 1 and supervises everything else:
@@ -165,7 +167,7 @@ make help     # everything else: backup, restore, down, nuke
 | [`packages/cli`](packages/cli) | `@noitenow/cli`, deploys from CI |
 | [`docker/`](docker) | the Dockerfile, Compose files and the installer |
 
-[AGENTS.md](AGENTS.md) holds the repo conventions, and [SPEC.md](SPEC.md) the design and its history. Run `bun x ultracite fix` before committing.
+[AGENTS.md](AGENTS.md) holds the repo conventions, [SPEC.md](SPEC.md) the design record, and [ROADMAP.md](ROADMAP.md) the roadmap and design history. Run `bun x ultracite fix` before committing.
 
 <details>
 <summary><strong>Passkeys on a phone over the LAN</strong></summary>

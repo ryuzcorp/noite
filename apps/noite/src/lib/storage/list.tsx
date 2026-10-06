@@ -1,11 +1,9 @@
 //! Storage inventory rows: badges, rows, per-app list.
-import type { View } from "ilha";
-
 import { errorMessage } from "../errors";
-import { ArrowLeft, ChevronRight } from "../icons";
 import { appStorage } from "../resources";
 import type { StorageItem } from "../runner";
-import { ListSkeleton } from "../skeletons";
+import { ChevronRight } from "../ui/icons";
+import { ListSkeleton } from "../ui/skeletons";
 
 /** Badge label per storage kind (plain badge for every kind). */
 const STORAGE_BADGES = {
@@ -100,49 +98,3 @@ export const AppStorageList = ({ appId }: { appId: string }) => {
     </div>
   );
 };
-
-/** Shared top card for storage detail pages (D1, R2, DO): back link to the
- * app, kind badge + title + subtitle on the left, optional right-side
- * addons (table picker, buttons) — omit them where there's nothing to act
- * on. */
-export const StorageTopCard = ({
-  actions,
-  appId,
-  appName,
-  badge,
-  subtitle,
-  title,
-}: {
-  actions?: View;
-  appId: string;
-  appName: string;
-  badge: string;
-  subtitle: string;
-  title: string;
-}) => (
-  <div class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-    <div class="card-body gap-4">
-      <a
-        href={`/apps/${appId}`}
-        class="link link-hover inline-flex w-fit items-center gap-1 text-sm opacity-70"
-      >
-        <ArrowLeft />
-        {appName || "…"}
-      </a>
-      <div class="flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <div class="flex items-center gap-2">
-            <span class="badge">{badge}</span>
-            <h1 class="m-0 text-lg font-semibold">{title}</h1>
-          </div>
-          <p class="m-0 text-sm opacity-70">{subtitle}</p>
-        </div>
-        {actions ? (
-          <div class="flex shrink-0 flex-wrap items-center gap-2">
-            {actions}
-          </div>
-        ) : null}
-      </div>
-    </div>
-  </div>
-);

@@ -9,17 +9,19 @@ The Oxide app behind the Noite UI: sign-in, app management, and the dashboards f
 
 ## Layout
 
-- `src/pages/` — file-routed UI (`@ilha/router`): apps, app detail, storage browser, account, god mode (instance admin).
-- `src/lib/*.server.ts(x)` — Oxide actions: session check, role gate (`requireAppRole`: view < push < admin), then a runner call.
-- `src/worker.ts` — thin Wrangler entry re-exporting `virtual:oxide/worker` (middleware → actions → server entry → assets).
-- `src/server.ts` — Oxide server entry; serves the routes in `src/http/routes.ts`.
-- `src/http/routes.ts` — plain HTTP routes: `/api/auth/*` (better-auth), SSE proxies (apps, logs, deploys, events, metrics), machine ingest (`/api/apps/:id/ingest/:kind`, API-key auth), `/internal/git-auth` (runner → UI key check for `git push`), R2 downloads, `/health`.
-- `src/lib/auth.ts` — better-auth: passkeys, email-code recovery (sign-in only, never creates accounts), API keys, admin plugin. Registration is invite-only after the first account.
+- `src/pages/` — file-routed UI (`@ilha/router`): apps, app detail, storage browser, account, and the admin home (`/apps`) for instance admins.
+- `src/lib/server/` — every server-only module (`*.server.ts(x)`; the `.server.` suffix marks an oxidejs action module): session check, role gate (`requireAppRole`: view < push < admin), then a runner call.
+- `src/http/` — plain HTTP layer: `router.ts` and `routes/*` for `/api/auth/*` (better-auth), SSE proxies (apps, logs, deploys, events, metrics), machine ingest (`/api/apps/:id/ingest/:kind`, API-key auth), `/internal/git-auth` (runner → UI key check for `git push`), R2 downloads and `/health`; `config.ts`, `body.ts`, `sse.ts` and `session.ts` are its building blocks.
+- `src/lib/` (root) — the shared data/pure layer: `resources.ts` and `feeds.ts` (SWR + SSE), `swr-store.ts`, `live-ref.ts`, `runner.ts`, `auth.ts`/`auth-client.ts`/`db.ts`, `roles.ts`, `collaborators.ts`, `control-app.ts`/`control-env.ts`, `dates.ts`, `errors.ts`, `sleep.ts`, `rate-limit.ts`, `shiki-langs.ts`.
+- `src/lib/ui/` — shared primitives: `dialog.tsx`, `icons.tsx`, `skeletons.tsx`, `load-error.tsx`, `copy-button.tsx`, `avatar.tsx`.
+- `src/lib/{admin,account,auth,apps,source,app-detail,storage}/` — feature components: `admin/` (the instance-admin Users/Apps/Invites tabs), `account/panel.tsx`, `auth/` (login, onboarding, the `Authed` gate, client session helpers), `apps/` (list + create form, `identity.ts` helpers, control-plane panel), `source/browser.tsx`, `app-detail/` (Overview/Metrics/Errors/Logs/Deploys tabs and `settings/` panels), `storage/` (D1 editor, R2 browser, DO viewer).
+- `src/worker.ts` / `src/server.ts` / `src/client.ts` — Wrangler entry (middleware → actions → server entry → assets), the Oxide server entry, and the client mount.
+- `src/lib/auth.ts` — better-auth wiring: passkeys, email-code recovery (sign-in only, never creates accounts), API keys, admin plugin. Registration is invite-only after the first account.
 
 ## Access model
 
 - Sign-up: the first account bootstraps the instance (and is its admin); every later one needs an invitation code.
-- Per app: `view`, `push`, `admin` grants. Creators get an `admin` grant and can be removed like anyone else while another admin remains. Instance admins can manage every app from god mode.
+- Per app: `view`, `push`, `admin` grants. Creators get an `admin` grant and can be removed like anyone else while another admin remains. Instance admins can manage every app from the admin home.
 - Env var values are write-only for everyone except app admins (`.dev.vars` download); `FLAG_*` toggles are the one non-secret exception.
 
 ## Develop

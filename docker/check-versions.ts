@@ -62,6 +62,32 @@ if (!imageLog || !defaultLog) {
   );
 }
 
+// The per-app build uid range lives in config.rs and is pre-created in the
+// image's /etc/passwd (Node's os.userInfo() throws for a uid with no passwd
+// entry). If the two drift, tenant Node tools fail on a perfectly valid uid.
+const uidBase = /pub const BUILD_UID_BASE: u32 = (?<n>\d+)/u.exec(config)
+  ?.groups?.n;
+const uidRange = /pub const BUILD_UID_RANGE: u32 = (?<n>\d+)/u.exec(config)
+  ?.groups?.n;
+const uidSeq = /seq (?<lo>\d+) (?<hi>\d+)/u.exec(dockerfile)?.groups;
+if (uidBase && uidRange && uidSeq) {
+  const expectedHigh = Number(uidBase) + Number(uidRange) - 1;
+  if (
+    Number(uidSeq.lo) !== Number(uidBase) ||
+    Number(uidSeq.hi) !== expectedHigh
+  ) {
+    fail(
+      `build uid range: config.rs ${uidBase}..${expectedHigh} but the Dockerfile creates ${uidSeq.lo}..${uidSeq.hi}`
+    );
+  } else {
+    console.log(`build uid range: ${uidBase}..${expectedHigh}`);
+  }
+} else {
+  fail(
+    "build uid range: could not read BUILD_UID_BASE/RANGE from config.rs or the seq from the Dockerfile"
+  );
+}
+
 if (failed) {
   process.exit(1);
 }

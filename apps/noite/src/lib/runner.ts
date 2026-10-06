@@ -2,62 +2,81 @@
 import { useEnv } from "oxidejs";
 
 import { controlEnv, hydrateControlEnv } from "./control-env";
+// Wire types, generated from the Rust structs in apps/runner into
+// ./runner-types (never edit those files by hand). Regenerate with `cargo
+// test` in apps/runner; CI fails on drift. The `Runner*` names are the UI's
+// long-standing aliases for the generated Rust names; the ones used in the
+// call signatures below are imported, and every one is re-exported.
+import type { App as RunnerApp } from "./runner-types/App";
+import type { AppDomain as RunnerDomain } from "./runner-types/AppDomain";
+import type { AppEnv as RunnerEnv } from "./runner-types/AppEnv";
+import type { AppUserProps as RunnerUserProps } from "./runner-types/AppUserProps";
+import type { BlobResponse as RunnerBlob } from "./runner-types/BlobResponse";
+import type { D1DeleteRowsBody } from "./runner-types/D1DeleteRowsBody";
+import type { D1Filter } from "./runner-types/D1Filter";
+import type { D1Rows } from "./runner-types/D1Rows";
+import type { D1Sort } from "./runner-types/D1Sort";
+import type { D1TableInfo as D1TableInfoBase } from "./runner-types/D1TableInfo";
+import type { D1Tables as D1TablesRaw } from "./runner-types/D1Tables";
+import type { D1TableSchemaRaw } from "./runner-types/D1TableSchemaRaw";
+import type { D1WriteBody } from "./runner-types/D1WriteBody";
+import type { DiffResponse as RunnerDiff } from "./runner-types/DiffResponse";
+import type { DoPreview } from "./runner-types/DoPreview";
+import type { ErrorIssueDetail as RunnerErrorDetail } from "./runner-types/ErrorIssueDetail";
+import type { GitRemote as RunnerGitRemote } from "./runner-types/GitRemote";
+import type { LimitsView as RunnerLimits } from "./runner-types/LimitsView";
+import type { R2File } from "./runner-types/R2File";
+import type { R2Preview } from "./runner-types/R2Preview";
+import type { SourceCommitBody } from "./runner-types/SourceCommitBody";
+import type { StorageItem } from "./runner-types/StorageItem";
+import type { TelemetryStatus as RunnerTelemetryStatus } from "./runner-types/TelemetryStatus";
+import type { TreeResponse as RunnerTree } from "./runner-types/TreeResponse";
 
-export interface RunnerApp {
-  id: string;
-  slug: string;
-  name: string;
-  userId: string;
-  status: string;
-  subdomain: string;
-  gitPrefix: string;
-  fleetBucket: string;
-  listenPort: number | null;
-  internalPort: number | null;
-  lastDeploySha: string | null;
-  lastError: string | null;
-  desiredState: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface RunnerDeploy {
-  id: string;
-  appId: string;
-  sha: string | null;
-  status: string;
-  log: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface RunnerDomain {
-  appId: string;
-  createdAt: string;
-  hostname: string;
-}
-
-/** An app's edge rate limits in requests per minute: its own values (null =
- * the platform default) beside those defaults. 0 turns a limit off.
- * `perClient` is false when the install sits behind a proxy the edge does
- * not trust: every request then looks like one client, so per-client limits
- * are off whatever they are set to. */
-export interface RunnerLimits {
-  appRpm: number | null;
-  clientRpm: number | null;
-  defaults: { appRpm: number; clientRpm: number };
-  perClient: boolean;
-}
-
-export interface RunnerGitRemote {
-  remote: string;
-  url: string;
-  username: string;
-  s3Remote: string;
-  endpoint: string;
-  bucket: string;
-  prefix: string;
-}
+export type { App as RunnerApp } from "./runner-types/App";
+export type { AppDeviceStat as RunnerDevice } from "./runner-types/AppDeviceStat";
+export type { AppDomain as RunnerDomain } from "./runner-types/AppDomain";
+export type { AppEnv as RunnerEnv } from "./runner-types/AppEnv";
+export type { AppEvent as RunnerEvent } from "./runner-types/AppEvent";
+export type { AppInsight as RunnerInsight } from "./runner-types/AppInsight";
+export type { AppMetric as RunnerMetric } from "./runner-types/AppMetric";
+export type { AppPathStat as RunnerPath } from "./runner-types/AppPathStat";
+export type { AppRefStat as RunnerRef } from "./runner-types/AppRefStat";
+export type { AppSpanStat as RunnerSpan } from "./runner-types/AppSpanStat";
+export type { AppUserProps as RunnerUserProps } from "./runner-types/AppUserProps";
+export type { BlobResponse as RunnerBlob } from "./runner-types/BlobResponse";
+export type { D1Column } from "./runner-types/D1Column";
+export type { D1DeleteRowsBody } from "./runner-types/D1DeleteRowsBody";
+export type { D1Filter } from "./runner-types/D1Filter";
+export type { D1FilterOp } from "./runner-types/D1FilterOp";
+export type { D1ForeignKey } from "./runner-types/D1ForeignKey";
+export type { D1Index } from "./runner-types/D1Index";
+export type { D1Rows } from "./runner-types/D1Rows";
+export type { D1Sort } from "./runner-types/D1Sort";
+export type { D1TableSchemaRaw } from "./runner-types/D1TableSchemaRaw";
+export type { D1WriteBody } from "./runner-types/D1WriteBody";
+export type { D1WriteOp } from "./runner-types/D1WriteOp";
+export type { Deploy as RunnerDeploy } from "./runner-types/Deploy";
+export type { DiffResponse as RunnerDiff } from "./runner-types/DiffResponse";
+export type { DoInstance } from "./runner-types/DoInstance";
+export type { DoPreview } from "./runner-types/DoPreview";
+export type { ErrorEventView as RunnerErrorEvent } from "./runner-types/ErrorEventView";
+export type { ErrorIssueDetail as RunnerErrorDetail } from "./runner-types/ErrorIssueDetail";
+export type { ErrorIssueList as RunnerErrorList } from "./runner-types/ErrorIssueList";
+export type { ErrorIssueView as RunnerErrorIssue } from "./runner-types/ErrorIssueView";
+export type { Frame as RunnerErrorFrame } from "./runner-types/Frame";
+export type { GitRemote as RunnerGitRemote } from "./runner-types/GitRemote";
+export type { LimitsView as RunnerLimits } from "./runner-types/LimitsView";
+export type { R2File } from "./runner-types/R2File";
+export type { R2Folder } from "./runner-types/R2Folder";
+export type { R2Object } from "./runner-types/R2Object";
+export type { R2Preview } from "./runner-types/R2Preview";
+export type { SourceCommitBody } from "./runner-types/SourceCommitBody";
+export type { SourceCommitFile } from "./runner-types/SourceCommitFile";
+export type { StorageItem } from "./runner-types/StorageItem";
+export type { TelemetryEvent as RunnerTelemetryEvent } from "./runner-types/TelemetryEvent";
+export type { TelemetryStatus as RunnerTelemetryStatus } from "./runner-types/TelemetryStatus";
+export type { TreeEntry } from "./runner-types/TreeEntry";
+export type { TreeResponse as RunnerTree } from "./runner-types/TreeResponse";
 
 const alsEnv = (): KitEnv | undefined => {
   try {
@@ -223,6 +242,36 @@ export const runnerRpcBatch = async <T = unknown>(
   });
 };
 
+/** `GET /v1/admin/stats`: the operator counters, plus `control_fleet` —
+ * whether this image supervises the control fleet at all (the dev image does
+ * not: `vite dev` serves the UI, so there is no control celld and no control
+ * telemetry). The runner's JSON keys are snake_case. */
+export interface RunnerAdminStats {
+  control_fleet: boolean;
+}
+
+/** Whether the runner supervises the control fleet. A runner that cannot
+ * answer counts as managing one: the "release image only" notice in
+ * ControlAppDetail must never appear on a healthy release install. */
+export const runnerControlFleet = async (): Promise<boolean> => {
+  try {
+    const stats = await runnerFetch<RunnerAdminStats>("/v1/admin/stats");
+    return stats.control_fleet;
+  } catch {
+    return true;
+  }
+};
+
+/** Anonymous instance telemetry: effective + stored state, the lock, the last
+ * successful send and the exact payload the next send would POST. */
+export const runnerTelemetryGet = () =>
+  runnerRpc<RunnerTelemetryStatus>("telemetry.get", {});
+
+/** Store the opt-out preference; returns the same status shape. While the
+ * setting is locked the preference is stored but effective stays disabled. */
+export const runnerTelemetrySet = (enabled: boolean) =>
+  runnerRpc<RunnerTelemetryStatus>("telemetry.set", { enabled });
+
 export const runnerListApps = () => runnerRpc<RunnerApp[]>("apps.list", {});
 
 export const runnerCreateApp = (body: {
@@ -243,8 +292,10 @@ export const runnerGetApp = (id: string) =>
 export const runnerGetAppBySlug = (slug: string) =>
   runnerRpc<RunnerApp>("apps.get_by_slug", { slug });
 
+// `apps.patch` takes camelCase params (like the REST PATCH body), unlike most
+// RPC methods; the runner rejects unknown keys so a mismatch fails loudly.
 export const runnerPatchApp = (id: string, body: { desiredState: string }) =>
-  runnerRpc<RunnerApp>("apps.patch", { desired_state: body.desiredState, id });
+  runnerRpc<RunnerApp>("apps.patch", { desiredState: body.desiredState, id });
 
 export const runnerDeleteApp = (id: string) =>
   runnerRpc<{ ok: boolean }>("apps.delete", { id });
@@ -260,13 +311,6 @@ export const runnerDeployLog = (id: string, deployId: string) =>
 export const runnerRollback = (id: string, sha: string) =>
   runnerRpc<{ ok: boolean; sha: string }>("deploys.rollback", { id, sha });
 
-export interface RunnerEnv {
-  appId: string;
-  name: string;
-  value: string;
-  updatedAt: string;
-}
-
 export const runnerListEnv = (id: string) =>
   runnerRpc<RunnerEnv[]>("env.list", { id });
 
@@ -278,62 +322,10 @@ export const runnerDeleteEnv = (id: string, name: string) =>
 
 export type ErrorStatus = "open" | "resolved" | "ignored";
 
-/** One grouped error: every occurrence sharing a fingerprint (the runner's
- * `host/errors.rs`). `hourly` is the last 24 UTC hours, oldest first. */
-export interface RunnerErrorIssue {
-  count: number;
-  culprit: string;
-  fingerprint: string;
-  firstSeenUs: number;
-  firstSha: string | null;
-  handler: string;
-  hourly: number[];
-  kind: string;
-  lastSeenUs: number;
-  lastSha: string | null;
-  message: string;
-  regressed: boolean;
-  source: "uncaught" | "logged";
-  status: ErrorStatus;
-  statusAtUs: number | null;
-}
-
-export interface RunnerErrorFrame {
-  function: string;
-  inApp: boolean;
-  location: string;
-}
-
-/** One stored occurrence. Request fields are empty when the edge had no
- * trace for it (e.g. the runner restarted in between). */
-export interface RunnerErrorEvent {
-  browser: string;
-  cell: string;
-  context: string;
-  frames: RunnerErrorFrame[];
-  handler: string;
-  httpStatus: number;
-  kind: string;
-  logs: string[];
-  message: string;
-  method: string;
-  os: string;
-  path: string;
-  sha: string;
-  source: "uncaught" | "logged";
-  traceId: string;
-  tsUs: number;
-}
-
-export interface RunnerErrorList {
-  counts: Record<ErrorStatus, number>;
-  issues: RunnerErrorIssue[];
-}
-
-export interface RunnerErrorDetail {
-  events: RunnerErrorEvent[];
-  issue: RunnerErrorIssue;
-}
+// RunnerErrorIssue/Frame/Event/List/Detail come from ./runner-types
+// (generated from models::ErrorIssue, host::errors::Frame and
+// service::errors::{ErrorIssueView, ErrorEventView, ErrorIssueList,
+// ErrorIssueDetail}).
 
 export const runnerGetError = (id: string, fingerprint: string) =>
   runnerRpc<RunnerErrorDetail>("errors.get", { fingerprint, id });
@@ -370,27 +362,8 @@ export const runnerSetLimits = (
 export const runnerGitRemote = (id: string) =>
   runnerRpc<RunnerGitRemote>("git.remote", { id });
 
-export interface RunnerTree {
-  sha: string;
-  files: { path: string; size: number }[];
-  truncated: boolean;
-}
-
-export interface RunnerBlob {
-  sha: string;
-  path: string;
-  size: number;
-  truncated: boolean;
-  binary: boolean;
-  text: string;
-}
-
-export interface RunnerDiff {
-  sha: string;
-  parent: string | null;
-  patch: string;
-  truncated: boolean;
-}
+// RunnerTree/Blob/Diff are generated from host::source::{TreeResponse,
+// BlobResponse, DiffResponse}.
 
 export const runnerSourceTree = (id: string) =>
   runnerRpc<RunnerTree>("source.tree", { id });
@@ -401,70 +374,9 @@ export const runnerSourceBlob = (id: string, path: string) =>
 export const runnerSourceDiff = (id: string) =>
   runnerRpc<RunnerDiff>("source.diff", { id });
 
-export interface RunnerMetric {
-  appId: string;
-  bucketTs: string;
-  requests: number;
-  errors: number;
-  latencyMs: number;
-  cpuMs: number;
-}
-
-export interface RunnerSpan {
-  name: string;
-  kind: number;
-  n: number;
-  ms: number;
-  err: number;
-  qwaitMs: number;
-}
-
-export interface RunnerDevice {
-  bucketTs: string;
-  browser: string;
-  os: string;
-  requests: number;
-}
-
-export interface RunnerPath {
-  bucketTs: string;
-  path: string;
-  requests: number;
-}
-
-export interface RunnerRef {
-  bucketTs: string;
-  source: string;
-  requests: number;
-}
-
-export interface RunnerEvent {
-  id: string;
-  appId: string;
-  channel: string;
-  event: string;
-  description: string;
-  icon: string;
-  tags: string;
-  userId: string;
-  ts: string;
-}
-
-export interface RunnerUserProps {
-  appId: string;
-  userId: string;
-  properties: string;
-  updatedAt: string;
-}
-
-export interface RunnerInsight {
-  appId: string;
-  title: string;
-  value: string;
-  num: number | null;
-  icon: string;
-  updatedAt: string;
-}
+// RunnerMetric/Span/Device/Path/Ref/Event/UserProps/Insight are generated
+// from the models::App*Stat rows, models::AppEvent, AppUserProps and
+// AppInsight.
 
 export const runnerGetUserProps = (id: string, userId: string) =>
   runnerRpc<RunnerUserProps | null>("events.user_props", {
@@ -472,83 +384,119 @@ export const runnerGetUserProps = (id: string, userId: string) =>
     user_id: userId,
   });
 
-export interface StorageItem {
-  appId: string;
-  appSlug: string;
-  appName: string;
-  // "d1" | "do" | "r2"
-  kind: string;
-  id: string;
-  name: string;
+// StorageItem and the R2Folder/Object/Preview/File shapes are generated from
+// host::storage::StorageItem and host::storage::r2.
+
+/** One cell as the UI sees it: SQL NULL is null; everything else is its exact
+ * text (integers/reals stringified server-side so nothing loses precision in
+ * transit). Blobs: hex string prefixed `x'…'` (read-only in the editor). */
+export type D1Cell = string | null;
+
+/** One table's write capabilities in the D1 editor. */
+export interface D1TableCaps {
+  delete: boolean;
+  insert: boolean;
+  update: boolean;
 }
 
-export interface R2Object {
-  key: string;
-  size: number;
-  lastModified: string;
+/** A runner table row plus the caps the UI server computes for the caller
+ * (the runner reports only name + rowCount). Absent caps means read-only. */
+export interface D1TableInfo extends D1TableInfoBase {
+  caps?: D1TableCaps;
 }
 
-export interface R2Preview {
-  appId: string;
-  appSlug: string;
-  bucket: string;
-  objects: R2Object[];
+/** A D1 database listing where each table carries the caps the UI server
+ * computed (the runner's `storage.d1.tables` has no caps). */
+export interface D1Tables extends Omit<D1TablesRaw, "tables"> {
+  tables: D1TableInfo[];
 }
 
-export interface R2File {
-  key: string;
-  size: number;
-  truncated: boolean;
-  text: string | null;
+/** Link from a row to the admin action that owns it (control D1 only). */
+export interface D1RowAction {
+  /** Column whose cell value prefills the target search. */
+  column: string;
+  label: string;
+  /** Query param the target tab's search form reads (`uq`, `iq`). */
+  param: string;
+  /** Admin-home tab id (`t`). */
+  tab: string;
 }
 
-export interface D1Preview {
-  appId: string;
-  appSlug: string;
-  databaseId: string;
-  tables: string[];
-  rows: string[];
-  /** Per-table PRAGMA table_info --json (parallel to tables). */
-  schemas: string[];
+/** One table's schema plus the policy/role parts the UI server computes on
+ * top of the runner's raw schema (`storage.d1.schema`). */
+export interface D1TableSchema extends D1TableSchemaRaw {
+  /** Computed by the action layer (the caller's role, or the control D1
+   * policy). */
+  caps: D1TableCaps;
+  /** column -> note for columns the editor must not write (e.g. "managed in
+   * Users", "redacted"). {} for tenant tables. */
+  locked: Record<string, string>;
+  /** Columns whose values are masked ("•••• redacted") and cannot be
+   * filtered, sorted or searched (control D1 only; [] otherwise). */
+  redacted: string[];
+  rowAction: D1RowAction | null;
 }
 
-export interface DoPreview {
-  appId: string;
-  appSlug: string;
-  className: string;
-  instances: {
-    id: string;
-    scope: string;
-    preview: string | null;
-  }[];
+// D1FilterOp and D1Filter are generated from host::storage::d1.
+
+export interface D1RowsQuery {
+  table: string;
+  /** 0-based. */
+  page: number;
+  /** One of 25 | 50 | 100; the server clamps to 1..100. */
+  pageSize: number;
+  /** null = primary key order (rowid when the table has no PK). */
+  sort: D1Sort | null;
+  /** AND-ed; at most 10. */
+  filters: D1Filter[];
+  /** "" = none; case-insensitive substring over every non-redacted column. */
+  search: string;
 }
+
+/** Row identity for update/delete: the PK columns' current values; tables
+ * without a PK use every column's value. */
+export type D1Key = Record<string, D1Cell>;
+
+// D1Rows, D1WriteBody and D1DeleteRowsBody are generated from
+// host::storage::d1; the delete body's `keys` are D1Keys.
 
 /** D1 databases + DO classes declared by an app's deployed config. */
 export const runnerStorage = (id: string) =>
   runnerRpc<StorageItem[]>("storage.list", { id });
 
-/** Curated read-only D1 preview: tables + first rows. */
-export const runnerD1 = (id: string, databaseId: string, rows = 20) =>
-  runnerRpc<D1Preview>("storage.d1.get", { database_id: databaseId, id, rows });
+/** Tables + row counts of one app D1 database (counts in one batch). */
+export const runnerD1Tables = (id: string, databaseId: string) =>
+  runnerRpc<D1TablesRaw>("storage.d1.tables", {
+    database_id: databaseId,
+    id,
+  });
 
-/** Body of a curated tenant-DB write. */
-export interface D1WriteBody {
-  key?: Record<string, string | null>;
-  op: "insert" | "update" | "delete";
-  table: string;
-  values: Record<string, string | null>;
-}
+/** One table's schema; the action adds caps (role dependent). */
+export const runnerD1Schema = (id: string, databaseId: string, table: string) =>
+  runnerRpc<D1TableSchemaRaw>("storage.d1.schema", {
+    database_id: databaseId,
+    id,
+    table,
+  });
 
-export interface SourceCommitFile {
-  content: string;
-  path: string;
-}
+/** One server-side page of rows (sort/filters/search applied in SQL). */
+export const runnerD1Rows = (
+  id: string,
+  databaseId: string,
+  query: D1RowsQuery
+) =>
+  runnerRpc<D1Rows>("storage.d1.rows", {
+    database_id: databaseId,
+    filters: query.filters,
+    id,
+    page: query.page,
+    page_size: query.pageSize,
+    search: query.search,
+    sort: query.sort,
+    table: query.table,
+  });
 
-export interface SourceCommitBody {
-  author: string;
-  files: readonly SourceCommitFile[];
-  message: string;
-}
+// SourceCommitFile/Body are generated from service::source.
 
 /** Browser-edit commit: validated files become a main commit that deploys
  * like a stock push (push-gated in the action). */
@@ -568,23 +516,53 @@ export const runnerD1Write = (
     ...body,
   });
 
+/** Delete 1..100 rows by key in one atomic batch (push-gated in the action). */
+export const runnerD1DeleteRows = (
+  id: string,
+  databaseId: string,
+  body: D1DeleteRowsBody
+) =>
+  runnerRpc<{ deleted: number; ok: boolean }>("storage.d1.delete_rows", {
+    database_id: databaseId,
+    id,
+    ...body,
+  });
+
 /** Read-only Durable Object instance list for one class. */
 export const runnerDoInstances = (id: string, className: string) =>
   runnerRpc<DoPreview>("storage.do.list", { class_name: className, id });
 
-/** Read-only R2 key listing for one bucket. */
-export const runnerR2List = (id: string, bucket: string) =>
-  runnerRpc<R2Preview>("storage.r2.list", { bucket, id });
+/** One page of an R2 bucket folder (prefix + delimiter on the store). */
+export const runnerR2List = (
+  id: string,
+  bucket: string,
+  prefix: string,
+  cursor: string | null
+) =>
+  runnerRpc<R2Preview>("storage.r2.list", {
+    bucket,
+    cursor,
+    id,
+    prefix,
+  });
 
 /** Read-only R2 object fetch (bounded text preview, null when binary). */
 export const runnerR2Get = (id: string, bucket: string, key: string) =>
   runnerRpc<R2File>("storage.r2.get", { bucket, id, key });
 
-/** Delete one R2 object by key. */
-export const runnerR2Delete = (id: string, bucket: string, key: string) =>
-  runnerRpc<{ ok: boolean }>("storage.r2.delete", { bucket, id, key });
+/** Delete 1..100 R2 objects in one call (push-gated in the action). */
+export const runnerR2Delete = (id: string, bucket: string, keys: string[]) =>
+  runnerRpc<{ deleted: number }>("storage.r2.delete", { bucket, id, keys });
 
 /** Browser download URL for one R2 object (UI proxy route — the browser
  * never sees RUNNER_TOKEN; the route gates on session + view role). */
 export const r2DownloadUrl = (appId: string, bucket: string, key: string) =>
   `/storage/${encodeURIComponent(appId)}/r2/${encodeURIComponent(bucket)}/raw?key=${encodeURIComponent(key)}`;
+
+/** Browser upload URL for one R2 object: the UI proxy route streams the body
+ * to the runner, which stores it with `celld r2 put` (session + push gate). */
+export const r2UploadUrl = (appId: string, bucket: string, key: string) =>
+  `/storage/${encodeURIComponent(appId)}/r2/${encodeURIComponent(bucket)}/upload?key=${encodeURIComponent(key)}`;
+
+/** Largest upload the UI offers; the runner enforces the same cap. */
+export const R2_UPLOAD_LIMIT = 64 * 1024 * 1024;

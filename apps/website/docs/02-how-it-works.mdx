@@ -13,7 +13,7 @@ tini (PID 1: reaps zombies, forwards signals)
     ├── caddy run --watch             :80/:443, admin 127.0.0.1:2019
     ├── celld  control fleet #0       public 127.0.0.1:8090, internal 0.0.0.0:8091
     ├── celld  tenant fleet × N       uid fleet (10020); public 0.0.0.0:{p}, internal 127.0.0.1:{p+1}
-    └── bun / node / sh               installs, builds and release, uid build (10010), transient
+    └── bun / node / sh               installs, builds and release, one uid per app (10030+), transient
 ```
 
 The runner owns every child's lifecycle: restart with 1–30 s backoff, SIGTERM then SIGKILL past the stop budget. There is no second supervisor.
@@ -30,9 +30,9 @@ Under `s3://<bucket>/`:
 
 | Prefix | Holds |
 | --- | --- |
-| `git/{slug}/` | Tip bundles from Git HTTP plus a `MANIFEST.json` linearization point |
+| `git/{slug}/` | Tip bundles from Git HTTP plus a `MANIFEST.json` linearization point (`{seq, refs}`) |
 | `fleets/{slug}/` | Tenant celld state, deploys, and telemetry |
-| `control/` | UI worker bundle plus its D1 (accounts, invites) |
+| `control/` | UI worker bundle, its D1 (accounts, invites) and the control fleet's own telemetry |
 | `runner/state/` | Runner SQLite snapshots plus the `owner.json` fence |
 
 The bundled RustFS store provides this bucket with zero config; production uses a qualified store. See [Storage](/self-hosting/storage).
