@@ -8,6 +8,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.0-alpha.3] - 2026-10-06
+
+Opt-out instance telemetry, storage editors, the admin home, and a pre-release flow for releases.
+
 ### Operator action required
 
 - **`RUNNER_BUILD_UID` and `RUNNER_BUILD_GID` are removed** and ignored if still set: delete them from your environment. Builds and release commands now run as one uid per app from a reserved range, `RUNNER_BUILD_UID_BASE` (default `10030`) and `RUNNER_BUILD_UID_RANGE` (default `1024`). The image pre-creates the default range in `/etc/passwd`; a custom range needs matching `/etc/passwd` and `/etc/group` entries, must stay below 65534 and must not contain `RUNNER_FLEET_UID` (10020).
