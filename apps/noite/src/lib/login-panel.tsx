@@ -9,6 +9,22 @@ import { sleep } from "./sleep";
 const registrationContext = (email: string, name: string, invite: string) =>
   JSON.stringify({ email, invite, name });
 
+/** Heading + one line under it, per form state. */
+const INTRO = {
+  firstRun: {
+    body: "You're the first one here, so this account becomes the admin.",
+    title: "Set up Noite",
+  },
+  register: {
+    body: "No password needed: you'll sign in with a passkey, using your fingerprint, face or device PIN.",
+    title: "Create your account",
+  },
+  signin: {
+    body: "Sign in with the passkey saved on this device.",
+    title: "Welcome back",
+  },
+};
+
 /** Page-load/passkey UX: the auth cookie may not be readable immediately,
  * so poll briefly. Then drop the anonymous caches the persistent layout
  * filled while /login was showing, so the dashboard loads as this user. */
@@ -32,12 +48,16 @@ const waitForSession = async (): Promise<void> => {
 export const LoginPanel = () => {
   const busy = atom(false);
   const error = atom("");
-  const mode = atom<"register" | "signin">("register");
+  // null = not chosen yet: a fresh instance opens on account creation,
+  // everyone else on sign-in (returning users are the common case).
+  const picked = atom<"register" | "signin" | null>(null);
   const recovery = atom(false);
   const otpSent = atom(false);
   const otpEmail = atom("");
   const policy = signupPolicy();
   const invite = () => policy.data();
+  const mode = (): "register" | "signin" =>
+    picked() ?? (invite()?.firstRun ? "register" : "signin");
 
   watch.once(async () => {
     const { data } = await fetchSession();
@@ -166,22 +186,26 @@ export const LoginPanel = () => {
 
   if (recovery()) {
     return (
-      <div class="flex flex-col gap-4">
-        <h2 class="m-0 text-lg font-semibold">Lost passkey?</h2>
-        <p class="m-0 text-sm opacity-80">
-          We’ll email a one-time code to your account address. Passkeys stay the
-          primary way in — this is only the spare key.
-        </p>
+      <div class="flex flex-col gap-6">
+        <div class="flex flex-col gap-2">
+          <h1 class="m-0 text-2xl font-semibold tracking-tight">
+            Lost your passkey?
+          </h1>
+          <p class="m-0 text-sm leading-relaxed opacity-70">
+            We'll email a one-time code to your account address. Once you're in,
+            add a new passkey from your Account page.
+          </p>
+        </div>
         {otpSent() ? (
-          <form onsubmit={verifyOtp} class="flex flex-col gap-3">
-            <fieldset class="fieldset">
+          <form onsubmit={verifyOtp} class="flex flex-col gap-4">
+            <fieldset class="fieldset p-0">
               <label class="label" for="otp-code">
                 Code sent to {otpEmail()}
               </label>
               <input
                 id="otp-code"
                 name="otp"
-                class="input w-full font-mono"
+                class="input w-full font-mono tracking-widest"
                 placeholder="123456"
                 autocomplete="one-time-code"
                 maxlength={6}
@@ -190,15 +214,15 @@ export const LoginPanel = () => {
             </fieldset>
             <button
               type="submit"
-              class="btn btn-sm btn-primary"
+              class="btn btn-neutral w-full"
               disabled={busy()}
             >
               Sign in
             </button>
           </form>
         ) : (
-          <form onsubmit={sendOtp} class="flex flex-col gap-3">
-            <fieldset class="fieldset">
+          <form onsubmit={sendOtp} class="flex flex-col gap-4">
+            <fieldset class="fieldset p-0">
               <label class="label" for="otp-email">
                 Email
               </label>
@@ -207,7 +231,7 @@ export const LoginPanel = () => {
                 name="email"
                 type="email"
                 class="input validator w-full"
-                placeholder="Email"
+                placeholder="you@example.com"
                 autocomplete="email"
                 required
               />
@@ -215,53 +239,68 @@ export const LoginPanel = () => {
             </fieldset>
             <button
               type="submit"
-              class="btn btn-sm btn-primary"
+              class="btn btn-neutral w-full"
               disabled={busy()}
             >
               Email me a code
             </button>
           </form>
         )}
+        {error() ? <p class="text-error m-0 text-sm">{error()}</p> : null}
         <button
           type="button"
-          class="btn btn-sm btn-ghost w-fit"
+          class="link link-hover w-fit text-sm opacity-70"
           onclick={hideRecovery}
         >
-          Back to passkeys
+          ← Back to sign in
         </button>
-        {error() ? <p class="text-error text-sm">{error()}</p> : null}
       </div>
     );
   }
 
+  let intro = INTRO.register;
+  if (mode() === "signin") {
+    intro = INTRO.signin;
+  } else if (invite()?.firstRun) {
+    intro = INTRO.firstRun;
+  }
   return (
-    <div class="flex flex-col gap-4">
-      <div class="tabs tabs-box w-fit">
+    <div class="flex flex-col gap-6">
+      <div class="flex flex-col gap-2">
+        <h1 class="m-0 text-2xl font-semibold tracking-tight">{intro.title}</h1>
+        <p class="m-0 text-sm leading-relaxed opacity-70">{intro.body}</p>
+      </div>
+
+      <div class="tabs tabs-box w-full" role="tablist">
         <button
           type="button"
-          class={`tab ${mode() === "register" ? "tab-active" : ""}`}
+          role="tab"
+          aria-selected={mode() === "signin" ? "true" : "false"}
+          class={`tab flex-1 ${mode() === "signin" ? "tab-active" : ""}`}
           onclick={() => {
-            mode.set("register");
-            error.set("");
-          }}
-        >
-          Register
-        </button>
-        <button
-          type="button"
-          class={`tab ${mode() === "signin" ? "tab-active" : ""}`}
-          onclick={() => {
-            mode.set("signin");
+            picked.set("signin");
             error.set("");
           }}
         >
           Sign in
         </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={mode() === "register" ? "true" : "false"}
+          class={`tab flex-1 ${mode() === "register" ? "tab-active" : ""}`}
+          onclick={() => {
+            picked.set("register");
+            error.set("");
+          }}
+        >
+          Create account
+        </button>
       </div>
 
       {mode() === "register" ? (
-        <form onsubmit={register} class="flex flex-col gap-3">
-          <fieldset class="fieldset">
+        <form onsubmit={register} class="flex flex-col gap-4">
+          <fieldset class="fieldset p-0">
             <label class="label" for="register-name">
               Name
             </label>
@@ -269,12 +308,12 @@ export const LoginPanel = () => {
               id="register-name"
               name="name"
               class="input w-full"
-              placeholder="Name"
+              placeholder="John Doe"
               autocomplete="name"
               required
             />
           </fieldset>
-          <fieldset class="fieldset">
+          <fieldset class="fieldset p-0">
             <label class="label" for="register-email">
               Email
             </label>
@@ -283,14 +322,14 @@ export const LoginPanel = () => {
               name="email"
               type="email"
               class="input validator w-full"
-              placeholder="Email"
+              placeholder="you@example.com"
               autocomplete="username webauthn"
               required
             />
             <p class="validator-hint hidden">Enter a valid email address</p>
           </fieldset>
           {invite()?.requiresInvite ? (
-            <fieldset class="fieldset">
+            <fieldset class="fieldset p-0">
               <label class="label" for="register-invite">
                 Invitation code
               </label>
@@ -303,38 +342,41 @@ export const LoginPanel = () => {
                 spellcheck={false}
                 required
               />
-              <p class="label">
-                This instance is invite-only. Ask a member for a code.
+              <p class="label whitespace-normal">
+                This instance is invite-only. Any member can share a code from
+                their Account page.
               </p>
             </fieldset>
           ) : null}
           <button
             type="submit"
-            class="btn btn-sm btn-primary"
+            class="btn btn-neutral w-full"
             disabled={busy()}
           >
             Create passkey
           </button>
         </form>
       ) : (
-        <button
-          type="button"
-          class="btn btn-sm btn-primary"
-          disabled={busy()}
-          onclick={signIn}
-        >
-          Sign in with passkey
-        </button>
+        <div class="flex flex-col gap-4">
+          <button
+            type="button"
+            class="btn btn-neutral w-full"
+            disabled={busy()}
+            onclick={signIn}
+          >
+            Sign in with passkey
+          </button>
+          <button
+            type="button"
+            class="link link-hover w-fit self-center text-sm opacity-70"
+            onclick={showRecovery}
+          >
+            Lost passkey?
+          </button>
+        </div>
       )}
 
-      {error() ? <p class="text-error text-sm">{error()}</p> : null}
-      <button
-        type="button"
-        class="link link-hover w-fit text-sm opacity-70"
-        onclick={showRecovery}
-      >
-        Lost passkey?
-      </button>
+      {error() ? <p class="text-error m-0 text-sm">{error()}</p> : null}
     </div>
   );
 };

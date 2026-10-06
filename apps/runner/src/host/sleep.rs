@@ -38,7 +38,9 @@ fn wake_slots(cfg: &Config) -> &'static Semaphore {
 }
 
 fn lock_for(app_id: &str) -> Arc<Mutex<()>> {
-    let mut map = locks().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut map = locks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     map.entry(app_id.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
@@ -138,8 +140,7 @@ pub async fn sleep_app(
     // Re-check under the lock: a request may have woken it, or its owner
     // stopped it, since the sweep read the list.
     if !sleep_candidate(&app)
-        || (!force
-            && !should_sleep(Utc::now(), &activity(pool, &app).await, cfg.sleep_after_h))
+        || (!force && !should_sleep(Utc::now(), &activity(pool, &app).await, cfg.sleep_after_h))
     {
         return Ok(false);
     }
@@ -209,7 +210,10 @@ pub async fn wake_app(
         match tokio::time::timeout(budget, wake_slots(cfg).acquire()).await {
             Ok(Ok(permit)) => Some(permit),
             Ok(Err(_)) => anyhow::bail!("wake slots closed"),
-            Err(_) => anyhow::bail!("too many apps starting at once; waited {}s", budget.as_secs()),
+            Err(_) => anyhow::bail!(
+                "too many apps starting at once; waited {}s",
+                budget.as_secs()
+            ),
         }
     } else {
         None
@@ -255,7 +259,12 @@ mod tests {
     use super::*;
 
     fn at(h: i64) -> Option<DateTime<Utc>> {
-        Some(DateTime::parse_from_rfc3339("2026-09-29T00:00:00Z").unwrap().with_timezone(&Utc) + chrono::Duration::hours(h))
+        Some(
+            DateTime::parse_from_rfc3339("2026-09-29T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+                + chrono::Duration::hours(h),
+        )
     }
 
     #[test]
@@ -263,13 +272,19 @@ mod tests {
         let now = at(48).unwrap();
         assert!(should_sleep(now, &[at(0), None], 24));
         assert!(should_sleep(now, &[at(24)], 24), "exactly 24h idle sleeps");
-        assert!(!should_sleep(now, &[at(0), at(30)], 24), "newest activity wins");
+        assert!(
+            !should_sleep(now, &[at(0), at(30)], 24),
+            "newest activity wins"
+        );
     }
 
     #[test]
     fn disabled_or_unknown_never_sleeps() {
         let now = at(1000).unwrap();
         assert!(!should_sleep(now, &[at(0)], 0), "0 disables");
-        assert!(!should_sleep(now, &[None, None], 24), "no timestamps: never guess idle");
+        assert!(
+            !should_sleep(now, &[None, None], 24),
+            "no timestamps: never guess idle"
+        );
     }
 }

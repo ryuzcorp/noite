@@ -19,7 +19,7 @@ import { controlEnv } from "./control-env";
 // `schemaHistory` below (never edits to a shipped one): paranorm diffs
 // consecutive versions into a forward migration and records it in the
 // `paranorm_migrations` ledger, so an install upgrades in place.
-const schema = defineSchema(`
+const schema130 = defineSchema(`
   _version: "1.3.0"
   _extends: [idempotency]
 
@@ -146,6 +146,141 @@ const schema = defineSchema(`
     createdAt: timestamp default=now
 `);
 
+/** 1.4.0 adds `user.onboardedAt`: NULL means the account has never completed
+ * the first-run onboarding, so the dashboard shows it once. Existing rows stay
+ * NULL and get the tour; the column is server-set only (see auth.ts
+ * `additionalFields`), so a client cannot mark itself onboarded. */
+const schema140 = defineSchema(`
+  _version: "1.4.0"
+  _extends: [idempotency]
+
+  user:
+    id: id
+    name: string
+    email: string unique
+    emailVerified: boolean default=false
+    image: string?
+    role: string default="user"
+    banned: boolean default=false
+    banReason: string?
+    banExpires: timestamp?
+    onboardedAt: timestamp?
+    createdAt: timestamp default=now
+    updatedAt: timestamp default=now
+    _relations:
+      accounts: has_many=account
+      sessions: has_many=session
+      collaborations: has_many=app_collaborator
+
+  session:
+    id: id
+    expiresAt: timestamp
+    token: string unique
+    createdAt: timestamp default=now
+    updatedAt: timestamp default=now
+    ipAddress: string?
+    userAgent: string?
+    userId: references=user.id on_delete=cascade index
+    impersonatedBy: string?
+    _relations:
+      user: belongs_to=user
+
+  account:
+    id: id
+    accountId: string
+    providerId: string
+    userId: references=user.id on_delete=cascade index
+    accessToken: string?
+    refreshToken: string?
+    idToken: string?
+    accessTokenExpiresAt: timestamp?
+    refreshTokenExpiresAt: timestamp?
+    scope: string?
+    password: string?
+    createdAt: timestamp default=now
+    updatedAt: timestamp default=now
+    _relations:
+      user: belongs_to=user
+
+  verification:
+    id: id
+    identifier: string index
+    value: string
+    expiresAt: timestamp
+    createdAt: timestamp default=now
+    updatedAt: timestamp default=now
+
+  passkey:
+    id: id
+    name: string?
+    publicKey: string
+    userId: references=user.id on_delete=cascade index
+    credentialID: string index
+    counter: int
+    deviceType: string
+    backedUp: boolean
+    transports: string?
+    createdAt: timestamp? default=now
+    aaguid: string?
+    _relations:
+      user: belongs_to=user
+
+  apikey:
+    id: id
+    configId: string default="default" index
+    name: string?
+    start: string?
+    referenceId: string index
+    prefix: string?
+    key: string index
+    refillInterval: int?
+    refillAmount: int?
+    lastRefillAt: timestamp?
+    enabled: boolean default=true
+    rateLimitEnabled: boolean default=false
+    rateLimitTimeWindow: int?
+    rateLimitMax: int?
+    requestCount: int default=0
+    remaining: int?
+    lastRequest: timestamp?
+    expiresAt: timestamp?
+    createdAt: timestamp default=now
+    updatedAt: timestamp default=now
+    permissions: string?
+    metadata: string?
+
+  app_collaborator:
+    id: id(uuidv4)
+    appId: string index unique=[app_collaborator.appId,app_collaborator.userId]
+    userId: references=user.id on_delete=cascade index
+    role: string enum=[view,push,admin]
+    createdAt: timestamp default=now
+    _relations:
+      user: belongs_to=user
+
+  collaborator_invite:
+    id: id(uuidv4)
+    appId: string index unique=[collaborator_invite.appId,collaborator_invite.email]
+    appName: string
+    email: string index
+    role: string enum=[view,push,admin]
+    invitedBy: string
+    createdAt: timestamp default=now
+
+  invite:
+    id: id(uuidv4)
+    code: string unique index
+    createdBy: string index
+    usedBy: string?
+    usedAt: timestamp?
+    revoked: boolean default=false
+    note: string?
+    createdAt: timestamp default=now
+`);
+
+/** The newest shipped schema: what `orm` types and the migrator's plan use. */
+const schema = schema140;
+
 export type DB = InferSchema<typeof schema>;
 export type AppCollaborator = Selectable<DB["app_collaborator"]>;
 export type AppRole = "view" | "push" | "admin";
@@ -155,7 +290,7 @@ export const orm = paranorm<DB>();
 /** Every shipped schema, oldest first. Append the next `defineSchema` (with a
  * higher `_version`) here, and point `schema` above at the newest. Ledger ids
  * are positions in this list, so never reorder or drop an entry. */
-const schemaHistory = [schema];
+const schemaHistory = [schema130, schema140];
 
 const migrator = createMigrator(schemaHistory);
 

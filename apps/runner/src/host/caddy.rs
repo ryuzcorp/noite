@@ -55,10 +55,18 @@ impl Zone {
     /// ([`Config::edge_sees_clients`]).
     fn per_client(cfg: &Config, name: impl Into<String>, rpm: u32) -> Self {
         let rpm = if cfg.edge_sees_clients() { rpm } else { 0 };
-        Self { name: name.into(), key: "{client_ip}", rpm }
+        Self {
+            name: name.into(),
+            key: "{client_ip}",
+            rpm,
+        }
     }
     fn shared(name: impl Into<String>, rpm: u32) -> Self {
-        Self { name: name.into(), key: "all", rpm }
+        Self {
+            name: name.into(),
+            key: "all",
+            rpm,
+        }
     }
 }
 
@@ -218,7 +226,10 @@ pub async fn rewrite_caddy(
     lines.push("\t\t}".into());
     let proxies = &cfg.edge.trusted_proxies;
     if !proxies.is_empty() {
-        lines.push(format!("\t\ttrusted_proxies static {}", proxies.ranges.join(" ")));
+        lines.push(format!(
+            "\t\ttrusted_proxies static {}",
+            proxies.ranges.join(" ")
+        ));
         if proxies.cloudflare {
             lines.push("\t\tclient_ip_headers CF-Connecting-IP X-Forwarded-For".into());
         }
@@ -245,78 +256,76 @@ pub async fn rewrite_caddy(
     // Site-level extras (e.g. `rewrite`) go in the site block; proxy options
     // (e.g. `header_up`) MUST go inside `reverse_proxy` — Caddy rejects
     // them at site level and then keeps serving the stale config.
-    let mut push_block = |addr: &str, tls: bool, site_extra: &[&str], proxy_extra: &[&str], upstream: &str| {
-        lines.push(format!("{addr} {{"));
-        // Access log per site as JSON into the file the runner tails
-        // (`CADDY_ACCESS_LOG`: one path for writer and reader, since they
-        // share this container), feeding the device/path/ref breakdown. The
-        // tailer bounds its size itself (host/accesslog.rs truncates after
-        // consuming), so no Caddy-side rolling. Per-request lines leave
-        // `docker logs`; tail the file instead.
-        lines.push("\tlog {".into());
-        lines.push(format!("\t\toutput file {}", cfg.caddy_access_log));
-        lines.push("\t\tformat json".into());
-        lines.push("\t}".into());
-        // Compression, because celld does not compress an asset response and
-        // the docs point at a compressing ingress proxy for clients that want
-        // gzip or brotli. Measured through this edge: the control UI's
-        // content-hashed bundle drops from 462 KiB to 144 KiB and its CSS from
-        // 129 KiB to 22 KiB, while the `text/event-stream` log/deploy/metric
-        // endpoints stay uncompressed, chunked and unbuffered (the proxy below
-        // keeps `flush_interval -1`, and Caddy skips an event stream).
-        lines.push("\tencode zstd gzip".into());
-        if tls {
-            lines.push("\ttls {".into());
-            lines.push("\t\ton_demand".into());
+    let mut push_block =
+        |addr: &str, tls: bool, site_extra: &[&str], proxy_extra: &[&str], upstream: &str| {
+            lines.push(format!("{addr} {{"));
+            // Access log per site as JSON into the file the runner tails
+            // (`CADDY_ACCESS_LOG`: one path for writer and reader, since they
+            // share this container), feeding the device/path/ref breakdown. The
+            // tailer bounds its size itself (host/accesslog.rs truncates after
+            // consuming), so no Caddy-side rolling. Per-request lines leave
+            // `docker logs`; tail the file instead.
+            lines.push("\tlog {".into());
+            lines.push(format!("\t\toutput file {}", cfg.caddy_access_log));
+            lines.push("\t\tformat json".into());
             lines.push("\t}".into());
-        }
-        for line in site_extra {
-            lines.push(format!("\t{line}"));
-        }
-        lines.push(format!("\treverse_proxy {upstream} {{"));
-        for line in proxy_extra {
-            lines.push(format!("\t\t{line}"));
-        }
-        // Bound the upstream waits, but keep the connection pool. celld
-        // answers a subset of concurrent requests never at all (measured on
-        // the production install: every failure is exactly the timeout below,
-        // while the ones that answer take 0.55-0.88 s), and with no bound
-        // Caddy holds such a request until the browser gives up — the client
-        // sees a hang rather than an error it could retry. `dial_timeout`
-        // bounds a stalled connect. Pooling stays ON deliberately: measured
-        // against a 0.6.0 node, an upstream per request (`keepalive off`)
-        // costs ~590 ms per request where the pool costs ~11 ms, because celld
-        // charges a new connection to the Worker, and it also multiplies
-        // simultaneous connections to a node that is already the bottleneck.
-        // `flush_interval -1` below only affects response streaming.
-        lines.push("\t\ttransport http {".into());
-        lines.push("\t\t\tdial_timeout 5s".into());
-        lines.push("\t\t\tresponse_header_timeout 30s".into());
-        lines.push("\t\t}".into());
-        lines.push("\t\tflush_interval -1".into());
-        lines.push("\t}".into());
-        lines.push("}".into());
-        lines.push(String::new());
-    };
-    let mut push_site = |addr: &str,
-                         tls: bool,
-                         site_extra: &[&str],
-                         proxy_extra: &[&str],
-                         upstream: &str| {
-        // Behind a proxy only: with direct TLS, Caddy's own :80 -> HTTPS
-        // redirect must answer instead (a `http://*.{base}` twin would
-        // shadow it for every host).
-        if tls && edge_tls && !addr.starts_with("http://") {
-            push_block(
-                &plaintext_hosts(addr),
-                false,
-                site_extra,
-                proxy_extra,
-                upstream,
-            );
-        }
-        push_block(addr, tls, site_extra, proxy_extra, upstream);
-    };
+            // Compression, because celld does not compress an asset response and
+            // the docs point at a compressing ingress proxy for clients that want
+            // gzip or brotli. Measured through this edge: the control UI's
+            // content-hashed bundle drops from 462 KiB to 144 KiB and its CSS from
+            // 129 KiB to 22 KiB, while the `text/event-stream` log/deploy/metric
+            // endpoints stay uncompressed, chunked and unbuffered (the proxy below
+            // keeps `flush_interval -1`, and Caddy skips an event stream).
+            lines.push("\tencode zstd gzip".into());
+            if tls {
+                lines.push("\ttls {".into());
+                lines.push("\t\ton_demand".into());
+                lines.push("\t}".into());
+            }
+            for line in site_extra {
+                lines.push(format!("\t{line}"));
+            }
+            lines.push(format!("\treverse_proxy {upstream} {{"));
+            for line in proxy_extra {
+                lines.push(format!("\t\t{line}"));
+            }
+            // Bound the upstream waits, but keep the connection pool. celld
+            // answers a subset of concurrent requests never at all (measured on
+            // the production install: every failure is exactly the timeout below,
+            // while the ones that answer take 0.55-0.88 s), and with no bound
+            // Caddy holds such a request until the browser gives up — the client
+            // sees a hang rather than an error it could retry. `dial_timeout`
+            // bounds a stalled connect. Pooling stays ON deliberately: measured
+            // against a 0.6.0 node, an upstream per request (`keepalive off`)
+            // costs ~590 ms per request where the pool costs ~11 ms, because celld
+            // charges a new connection to the Worker, and it also multiplies
+            // simultaneous connections to a node that is already the bottleneck.
+            // `flush_interval -1` below only affects response streaming.
+            lines.push("\t\ttransport http {".into());
+            lines.push("\t\t\tdial_timeout 5s".into());
+            lines.push("\t\t\tresponse_header_timeout 30s".into());
+            lines.push("\t\t}".into());
+            lines.push("\t\tflush_interval -1".into());
+            lines.push("\t}".into());
+            lines.push("}".into());
+            lines.push(String::new());
+        };
+    let mut push_site =
+        |addr: &str, tls: bool, site_extra: &[&str], proxy_extra: &[&str], upstream: &str| {
+            // Behind a proxy only: with direct TLS, Caddy's own :80 -> HTTPS
+            // redirect must answer instead (a `http://*.{base}` twin would
+            // shadow it for every host).
+            if tls && edge_tls && !addr.starts_with("http://") {
+                push_block(
+                    &plaintext_hosts(addr),
+                    false,
+                    site_extra,
+                    proxy_extra,
+                    upstream,
+                );
+            }
+            push_block(addr, tls, site_extra, proxy_extra, upstream);
+        };
     let edge = &cfg.edge;
     let control_guard = guard_lines(&[Zone::per_client(cfg, "client_control", edge.client_rpm)]);
     // The control worker keys its own auth limits on the right-most
@@ -432,7 +441,8 @@ pub async fn rewrite_caddy(
     // no wildcard cert or DNS-challenge module is needed on any platform.
     // Random subdomains land here, and each is a runner lookup: the same
     // per-client budget as a site.
-    let mut fallback_extra = guard_lines(&[Zone::per_client(cfg, "client_fallback", edge.client_rpm)]);
+    let mut fallback_extra =
+        guard_lines(&[Zone::per_client(cfg, "client_fallback", edge.client_rpm)]);
     fallback_extra.push("rewrite * /v1/edge/fallback".into());
     let fallback_extra: Vec<&str> = fallback_extra.iter().map(String::as_str).collect();
     for base in cfg.tenant_bases() {
@@ -554,8 +564,7 @@ fn tenant_site_extra(cfg: &Config, app: &App) -> Vec<String> {
     lines
 }
 
-static CADDY_ADMIN_OK: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+static CADDY_ADMIN_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static CADDY_ADMIN_ERR: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
 
 /// Last admin-load result for /ready.
@@ -661,8 +670,8 @@ mod tests {
             build_timeout_s: 300,
             telemetry_retention_days: 14,
             otel_flush_ms: 30_000,
-            build_uid: None,
-            build_gid: None,
+            build_uid_base: None,
+            build_uid_range: crate::config::BUILD_UID_RANGE,
             fleet_uid: None,
             fleet_gid: None,
             control_bundle_dir: "/opt/noite/control/dist".into(),
@@ -708,7 +717,9 @@ mod tests {
 
     async fn rendered_with(cfg: &Config, apps: &[App], domains: &[AppDomain]) -> String {
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
-        rewrite_caddy(cfg, apps, domains, &[]).await.expect("rewrite");
+        rewrite_caddy(cfg, apps, domains, &[])
+            .await
+            .expect("rewrite");
         tokio::fs::read_to_string(&cfg.caddyfile_path)
             .await
             .expect("read back")
@@ -732,15 +743,33 @@ mod tests {
         };
         for addr in ["test.noite.now", "shop.example.com"] {
             let block = site(addr);
-            assert!(block.contains("health_uri /.well-known/celld/health"), "{addr} ungated:\n{block}");
-            assert!(block.contains("handle_errors 502 503"), "{addr} has no starting page:\n{block}");
+            assert!(
+                block.contains("health_uri /.well-known/celld/health"),
+                "{addr} ungated:\n{block}"
+            );
+            assert!(
+                block.contains("handle_errors 502 503"),
+                "{addr} has no starting page:\n{block}"
+            );
             // Error ingest join (host/errors.rs): trace id sent and logged.
-            assert!(block.contains("request_header traceparent"), "{addr} sends no trace:\n{block}");
-            assert!(block.contains("log_append traceID"), "{addr} logs no trace:\n{block}");
+            assert!(
+                block.contains("request_header traceparent"),
+                "{addr} sends no trace:\n{block}"
+            );
+            assert!(
+                block.contains("log_append traceID"),
+                "{addr} logs no trace:\n{block}"
+            );
         }
         for addr in ["app.noite.now", "api.noite.now", "git.noite.now"] {
-            assert!(!site(addr).contains("health_uri"), "{addr} must not be gated");
-            assert!(!site(addr).contains("traceparent"), "{addr} is not a tenant");
+            assert!(
+                !site(addr).contains("health_uri"),
+                "{addr} must not be gated"
+            );
+            assert!(
+                !site(addr).contains("traceparent"),
+                "{addr} is not a tenant"
+            );
         }
     }
 
@@ -753,21 +782,39 @@ mod tests {
         let out = rendered(&cfg, &[asleep.clone()]).await;
         // Still routed to its own port (the held request is proxied there
         // after the wake), with the wake hop in front of the proxy.
-        assert!(out.contains("reverse_proxy 127.0.0.1:"), "asleep app lost its route:\n{out}");
-        assert!(out.contains("forward_auth"), "asleep app has no wake hop:\n{out}");
+        assert!(
+            out.contains("reverse_proxy 127.0.0.1:"),
+            "asleep app lost its route:\n{out}"
+        );
+        assert!(
+            out.contains("forward_auth"),
+            "asleep app has no wake hop:\n{out}"
+        );
         assert!(out.contains("uri /v1/edge/wake"), "{out}");
-        assert!(out.contains("response_header_timeout 135s"), "wake timeout not above the runner budget:\n{out}");
+        assert!(
+            out.contains("response_header_timeout 135s"),
+            "wake timeout not above the runner budget:\n{out}"
+        );
         // No active health checks on the wake route: their stale "down"
         // state would turn the released request into the starting page.
-        assert!(!out.contains("health_uri"), "asleep route still health-checks:\n{out}");
+        assert!(
+            !out.contains("health_uri"),
+            "asleep route still health-checks:\n{out}"
+        );
         // Awake apps pay no wake hop.
         let awake = rendered(&cfg, &[test_app()]).await;
-        assert!(!awake.contains("forward_auth"), "awake app got a wake hop:\n{awake}");
+        assert!(
+            !awake.contains("forward_auth"),
+            "awake app got a wake hop:\n{awake}"
+        );
         // A stopped app is parked by its owner: no route, no wake.
         let mut stopped = asleep;
         stopped.desired_state = "stopped".into();
         let parked = rendered(&cfg, &[stopped]).await;
-        assert!(!parked.contains("forward_auth"), "stopped app must not wake:\n{parked}");
+        assert!(
+            !parked.contains("forward_auth"),
+            "stopped app must not wake:\n{parked}"
+        );
     }
 
     #[tokio::test]
@@ -1006,15 +1053,24 @@ mod tests {
             ("*.noite.now", "client_fallback"),
         ] {
             let block = site_block(&out, addr);
-            assert!(block.contains(&format!("zone {zone} {{")), "{addr} lacks {zone}:\n{block}");
+            assert!(
+                block.contains(&format!("zone {zone} {{")),
+                "{addr} lacks {zone}:\n{block}"
+            );
             assert!(block.contains("key {client_ip}"), "{addr}:\n{block}");
             assert!(block.contains("events 300"), "{addr}:\n{block}");
         }
         // Git: its own tighter budget (120 rpm = 20 per window).
         let git = site_block(&out, "git.noite.now");
-        assert!(git.contains("zone client_git {") && git.contains("events 20"), "{git}");
+        assert!(
+            git.contains("zone client_git {") && git.contains("events 20"),
+            "{git}"
+        );
         // The shared per-app ceiling is off by default.
-        assert!(!out.contains("zone app_test"), "app ceiling is off by default:\n{out}");
+        assert!(
+            !out.contains("zone app_test"),
+            "app ceiling is off by default:\n{out}"
+        );
         // The container healthcheck is never limited.
         assert!(!site_block(&out, "http://127.0.0.1").contains("rate_limit"));
         // Slowloris bound, and 429s stay out of the process log.
@@ -1037,14 +1093,27 @@ mod tests {
             app_rpm: Some(60),
         }];
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
-        rewrite_caddy(&cfg, &[app, other], &[], &limits).await.expect("rewrite");
-        let out = tokio::fs::read_to_string(&cfg.caddyfile_path).await.expect("read");
+        rewrite_caddy(&cfg, &[app, other], &[], &limits)
+            .await
+            .expect("rewrite");
+        let out = tokio::fs::read_to_string(&cfg.caddyfile_path)
+            .await
+            .expect("read");
         let own = site_block(&out, "test.noite.now");
-        assert!(!own.contains("zone client_test"), "0 turns the per-client limit off:\n{own}");
-        assert!(own.contains("zone app_test {") && own.contains("key all") && own.contains("events 10"), "{own}");
+        assert!(
+            !own.contains("zone client_test"),
+            "0 turns the per-client limit off:\n{own}"
+        );
+        assert!(
+            own.contains("zone app_test {") && own.contains("key all") && own.contains("events 10"),
+            "{own}"
+        );
         let other = site_block(&out, "other.noite.now");
         assert!(other.contains("zone client_other {"), "{other}");
-        assert!(other.contains("zone app_other {") && other.contains("events 1000"), "platform app ceiling:\n{other}");
+        assert!(
+            other.contains("zone app_other {") && other.contains("events 1000"),
+            "platform app ceiling:\n{other}"
+        );
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
     }
 
@@ -1059,12 +1128,21 @@ mod tests {
             ranges: vec!["173.245.48.0/20".into(), "private_ranges".into()],
         };
         let out = rendered(&cfg, &[test_app()]).await;
-        assert!(out.contains("trusted_proxies static 173.245.48.0/20 private_ranges"), "{out}");
-        assert!(out.contains("client_ip_headers CF-Connecting-IP X-Forwarded-For"), "{out}");
+        assert!(
+            out.contains("trusted_proxies static 173.245.48.0/20 private_ranges"),
+            "{out}"
+        );
+        assert!(
+            out.contains("client_ip_headers CF-Connecting-IP X-Forwarded-For"),
+            "{out}"
+        );
         assert!(out.contains("trusted_proxies_strict"), "{out}");
         // The control worker keys auth limits on X-Forwarded-For.
         let control = site_block(&out, "app.noite.now");
-        assert!(control.contains("header_up X-Forwarded-For {client_ip}"), "{control}");
+        assert!(
+            control.contains("header_up X-Forwarded-For {client_ip}"),
+            "{control}"
+        );
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
     }
 
@@ -1073,7 +1151,10 @@ mod tests {
         let cfg = test_config("noite.now", "app", true, "/tmp/noite-test-unused");
         let zones = [Zone::per_client(&cfg, "client_x", 600)];
         let with = guard_lines_with(&zones, true).join("\n");
-        assert!(with.contains("rate_limit {") && with.contains("events 100"), "{with}");
+        assert!(
+            with.contains("rate_limit {") && with.contains("events 100"),
+            "{with}"
+        );
         assert!(guard_lines_with(&zones, false).is_empty());
         assert!(guard_lines_with(&[Zone::per_client(&cfg, "off", 0)], true).is_empty());
     }
@@ -1086,7 +1167,10 @@ mod tests {
         cfg.edge.app_rpm = 600;
         let out = rendered(&cfg, &[test_app()]).await;
         assert!(!out.contains("key {client_ip}"), "{out}");
-        assert!(out.contains("zone app_test {"), "the app ceiling still applies:\n{out}");
+        assert!(
+            out.contains("zone app_test {"),
+            "the app ceiling still applies:\n{out}"
+        );
         // Naming the proxy restores them.
         cfg.edge.trusted_proxies.ranges = vec!["private_ranges".into()];
         let out = rendered(&cfg, &[test_app()]).await;

@@ -14,7 +14,9 @@ import {
 } from "./admin.server";
 import {
   deployLog as fetchDeployLog,
-  d1Preview as fetchD1Preview,
+  d1Rows as fetchD1Rows,
+  d1Schema as fetchD1Schema,
+  d1Tables as fetchD1Tables,
   doPreview as fetchDoPreview,
   errorDetail as fetchErrorDetail,
   get,
@@ -26,10 +28,19 @@ import {
   listPendingInvitations,
   myCollaboratorInvitations,
   myInviteCodes,
+  r2Get as fetchR2Get,
   r2List as fetchR2List,
 } from "./apps.server";
 import { authClient } from "./auth-client";
-import type { D1Preview, DoPreview, R2Preview } from "./runner";
+import type {
+  D1Rows,
+  D1RowsQuery,
+  D1TableSchema,
+  D1Tables,
+  DoPreview,
+  R2File,
+  R2Preview,
+} from "./runner";
 import { clearSwrStore, withSnapshot, writeSwr } from "./swr-store";
 
 export { invalidate } from "ilha";
@@ -74,6 +85,43 @@ export const resetUserCaches = (): void => {
   }
 };
 
+/** Canonical serialization of a rows query for the resource key: the same
+ * query always maps to the same key (object property order is not part of the
+ * query). */
+const rowsQueryKey = (query: D1RowsQuery): string =>
+  JSON.stringify([
+    query.table,
+    query.page,
+    query.pageSize,
+    query.sort ?? null,
+    query.filters ?? [],
+    query.search ?? "",
+  ]);
+
+/** Invalidate every cached D1 key of one database — the tables list, every
+ * schema and every rows page, including the one currently rendered. A write
+ * calls this so it does not need to know the exact page key of each mounted
+ * view. */
+export const invalidateD1 = (appId: string, databaseId: string): void => {
+  const prefix = `app:${appId}:d1:${databaseId}:`;
+  for (const key of usedKeys) {
+    if (key.startsWith(prefix)) {
+      invalidate(key);
+    }
+  }
+};
+
+/** Invalidate every cached R2 page of one bucket — every prefix and every
+ * cursor — so an upload or delete refreshes whichever page is mounted. */
+export const invalidateR2 = (appId: string, bucket: string): void => {
+  const prefix = `app:${appId}:r2:${bucket}:`;
+  for (const key of usedKeys) {
+    if (key.startsWith(prefix)) {
+      invalidate(key);
+    }
+  }
+};
+
 export const keys = {
   adminApps: "admin:apps",
   adminInvites: "admin:invites",
@@ -83,8 +131,12 @@ export const keys = {
   appDetail: (id: string) => `app:${id}:detail`,
   appStorage: (id: string) => `app:${id}:storage`,
   collaborators: (id: string) => `app:${id}:collaborators`,
-  d1Preview: (appId: string, databaseId: string) =>
-    `app:${appId}:d1:${databaseId}`,
+  d1Rows: (appId: string, databaseId: string, query: D1RowsQuery) =>
+    `app:${appId}:d1:${databaseId}:rows:${rowsQueryKey(query)}`,
+  d1Schema: (appId: string, databaseId: string, table: string) =>
+    `app:${appId}:d1:${databaseId}:schema:${table}`,
+  d1Tables: (appId: string, databaseId: string) =>
+    `app:${appId}:d1:${databaseId}:tables`,
   deployLog: (appId: string, deployId: string) =>
     `app:${appId}:deploy:${deployId}:log`,
   doPreview: (appId: string, className: string) =>
@@ -98,7 +150,14 @@ export const keys = {
   myInvitations: "me:collaborator-invitations",
   passkeys: "me:passkeys",
   pendingInvitations: (id: string) => `app:${id}:pending-invitations`,
-  r2List: (appId: string, bucket: string) => `app:${appId}:r2:${bucket}`,
+  r2File: (appId: string, bucket: string, key: string) =>
+    `app:${appId}:r2:${bucket}:file:${key}`,
+  r2List: (
+    appId: string,
+    bucket: string,
+    prefix: string,
+    cursor: string | null
+  ) => `app:${appId}:r2:${bucket}:${prefix}:${cursor ?? ""}`,
   session: "session",
   signupPolicy: "signup:policy",
 } as const;
@@ -150,7 +209,12 @@ export const errorDetail = (appId: string, fingerprint: string) =>
  * secret); it must never reach the script-readable snapshot store. */
 export interface SessionView {
   session: { impersonatedBy: string | null };
-  user: { email: string; name: string };
+  user: {
+    email: string;
+    name: string;
+    /** Server-set first-run marker; null until `completeOnboarding`. */
+    onboardedAt: string | null;
+  };
 }
 
 export const session = () =>
@@ -164,11 +228,22 @@ export const session = () =>
     // SAFETY: read-only probe of the plugin-added id (a user id string when
     // set); only its presence matters, and it is re-stringified below.
     const { impersonatedBy } = data.session as { impersonatedBy?: unknown };
+    // SAFETY: onboardedAt is a better-auth additional field (`type: "date"`),
+    // serialized over JSON as an ISO string or null; a SQLite-backed value
+    // may also arrive as an epoch number, so stringify whatever is set.
+    const { onboardedAt } = data.user as { onboardedAt?: unknown };
     return {
       session: {
         impersonatedBy: impersonatedBy ? String(impersonatedBy) : null,
       },
-      user: { email: data.user.email, name: data.user.name },
+      user: {
+        email: data.user.email,
+        name: data.user.name,
+        onboardedAt:
+          onboardedAt === null || onboardedAt === undefined
+            ? null
+            : String(onboardedAt),
+      },
     };
   });
 
@@ -232,31 +307,64 @@ export const signupPolicy = () =>
     return { firstRun: false, invitesPerUser: 0, requiresInvite: true };
   });
 
-export const d1Preview = (appId: string, databaseId: string) =>
-  tracked(keys.d1Preview(appId, databaseId), async () => {
-    const preview = await fetchD1Preview({ appId, databaseId });
-    // SAFETY: the d1Preview action unwraps to the runner's raw D1Preview
-    // JSON at runtime; the Effect-union variant is only a typing edge.
-    return (preview as D1Preview | null) ?? null;
+/** Tables + row counts of one D1 database (left sidebar). */
+export const d1Tables = (appId: string, databaseId: string) =>
+  tracked(keys.d1Tables(appId, databaseId), async () => {
+    const tables = await fetchD1Tables({ appId, databaseId });
+    // SAFETY: the d1Tables action unwraps to the raw D1Tables JSON at
+    // runtime; the Effect-union variant is only a typing edge.
+    return (tables as D1Tables | null) ?? null;
+  });
+
+/** One table's schema (columns, indexes, caps, locked/redacted columns). */
+export const d1Schema = (appId: string, databaseId: string, table: string) =>
+  tracked(keys.d1Schema(appId, databaseId, table), async () => {
+    const schema = await fetchD1Schema({ appId, databaseId, table });
+    // SAFETY: same unwrap edge as d1Tables — raw D1TableSchema at runtime.
+    return (schema as D1TableSchema | null) ?? null;
+  });
+
+/** One server-side page of rows; the key carries the serialized query so a
+ * mounted component only ever renders the query it was keyed with. */
+export const d1Rows = (appId: string, databaseId: string, query: D1RowsQuery) =>
+  tracked(keys.d1Rows(appId, databaseId, query), async () => {
+    const rows = await fetchD1Rows({ appId, databaseId, ...query });
+    // SAFETY: same unwrap edge as d1Tables — raw D1Rows JSON at runtime.
+    return (rows as D1Rows | null) ?? null;
   });
 
 export const doPreview = (appId: string, className: string) =>
   tracked(keys.doPreview(appId, className), async () => {
     const preview = await fetchDoPreview({ appId, className });
-    // SAFETY: same unwrap edge as d1Preview — raw DoPreview JSON at runtime.
+    // SAFETY: same unwrap edge as d1Tables — raw DoPreview JSON at runtime.
     return (preview as DoPreview | null) ?? null;
   });
 
-export const r2List = (appId: string, bucket: string) =>
-  tracked(keys.r2List(appId, bucket), async () => {
-    const preview = await fetchR2List({ appId, bucket });
-    // SAFETY: same unwrap edge as d1Preview — raw R2Preview JSON at runtime.
+/** One page of an R2 bucket folder; the key carries prefix + cursor so a
+ * mounted component only ever renders the page it was keyed with. */
+export const r2List = (
+  appId: string,
+  bucket: string,
+  prefix: string,
+  cursor: string | null
+) =>
+  tracked(keys.r2List(appId, bucket, prefix, cursor), async () => {
+    const preview = await fetchR2List({ appId, bucket, cursor, prefix });
+    // SAFETY: same unwrap edge as d1Tables — raw R2Preview JSON at runtime.
     return (preview as R2Preview | null) ?? null;
   });
 
-/** One page of the god-mode user list. The key carries the search and page,
- * so the caller mounts a fresh component per (query, page) — a resource key
- * cannot change under a mounted component. */
+/** One object's bounded text preview (null `text` for a binary body). */
+export const r2File = (appId: string, bucket: string, key: string) =>
+  tracked(keys.r2File(appId, bucket, key), async () => {
+    const file = await fetchR2Get({ appId, bucket, key });
+    // SAFETY: same unwrap edge as d1Tables — raw R2File JSON at runtime.
+    return (file as R2File | null) ?? null;
+  });
+
+/** One page of the admin home's user list. The key carries the search and
+ * page, so the caller mounts a fresh component per (query, page) — a resource
+ * key cannot change under a mounted component. */
 export const listUsers = (query: string, page: number) =>
   tracked(keys.adminUsers(query, page), () => fetchUsers({ page, query }));
 

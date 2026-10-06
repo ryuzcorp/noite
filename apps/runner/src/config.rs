@@ -39,13 +39,17 @@ fn url_host(raw: &str) -> Option<String> {
     let (_, rest) = raw.split_once("://")?;
     let auth = rest.split('/').next().unwrap_or("");
     let auth = auth.split('@').next_back().unwrap_or("");
-    let host = auth.split(':').next().unwrap_or("").trim().trim_matches('.');
+    let host = auth
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('.');
     if host.is_empty() {
         return None;
     }
     Some(host.to_string())
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tenancy {
@@ -63,7 +67,10 @@ impl Tenancy {
 }
 
 fn parse_tenancy(raw: Option<&str>, base_domain: &str) -> Tenancy {
-    let raw = raw.map(str::trim).filter(|v| !v.is_empty()).map(|v| v.to_ascii_lowercase());
+    let raw = raw
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_ascii_lowercase());
     match raw.as_deref() {
         Some("single") => Tenancy::Single,
         Some("multi") => Tenancy::Multi,
@@ -85,6 +92,14 @@ fn parse_opt_uid(raw: Option<&str>, def: u32) -> Option<u32> {
         Some(v) => v.parse().ok().or(Some(def)),
     }
 }
+
+/// First uid of the reserved per-app build range. The range must not overlap
+/// the fleet uid (10020) or a system user, and is baked into the image's
+/// `/etc/passwd` (docker/Dockerfile) because Node's `os.userInfo()` throws
+/// for a uid with no passwd entry.
+pub const BUILD_UID_BASE: u32 = 10030;
+/// Apps covered by the build uid range (one uid per app).
+pub const BUILD_UID_RANGE: u32 = 1024;
 
 /// Control UI inside this container: fleet #0 in prod, `vite dev` in dev.
 pub const CONTROL_UPSTREAM: &str = "127.0.0.1:8090";
@@ -156,12 +171,17 @@ fn cidr_ok(raw: &str) -> bool {
 fn parse_trusted_proxies(raw: &str) -> (TrustedProxies, Vec<String>) {
     let mut out = TrustedProxies::default();
     let mut bad = Vec::new();
-    for token in raw.split([',', ' ', '\t', '\n']).map(str::trim).filter(|t| !t.is_empty()) {
+    for token in raw
+        .split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
         match token.to_ascii_lowercase().as_str() {
             "cloudflare" => {
                 if !out.cloudflare {
                     out.cloudflare = true;
-                    out.ranges.extend(CLOUDFLARE_RANGES.iter().map(|r| (*r).to_string()));
+                    out.ranges
+                        .extend(CLOUDFLARE_RANGES.iter().map(|r| (*r).to_string()));
                 }
             }
             "private_ranges" => out.ranges.push("private_ranges".into()),
@@ -210,7 +230,12 @@ impl Default for EdgeLimits {
 impl EdgeLimits {
     fn from_env() -> anyhow::Result<Self> {
         let d = Self::default();
-        let num = |key: &str, def: u32| env_or(&[key], &def.to_string()).trim().parse().unwrap_or(def);
+        let num = |key: &str, def: u32| {
+            env_or(&[key], &def.to_string())
+                .trim()
+                .parse()
+                .unwrap_or(def)
+        };
         let (trusted_proxies, bad) =
             parse_trusted_proxies(&env::var("NOITE_TRUSTED_PROXIES").unwrap_or_default());
         if !bad.is_empty() {
@@ -243,64 +268,64 @@ fn parse_fleet_ports() -> (u16, u16) {
     (20000, 29999)
 }
 
- #[derive(Clone, Debug)]
- pub struct Config {
-     pub bind: String,
-     pub runner_token: String,
-     pub database_url: String,
-     pub s3_endpoint: String,
-     pub s3_public_endpoint: String,
-     /// Single rustfs bucket; git + fleets are prefixes under it.
-     pub s3_bucket: String,
-     pub aws_region: String,
-     pub aws_access_key_id: String,
-     pub aws_secret_access_key: String,
-     pub base_domain: String,
-     /// Control-plane subdomain: empty = bare domain (dev `localhost` — the
-     /// only hostname Bitwarden's matcher accepts without https); prod sets
-     /// `app` so control serves `app.{BASE_DOMAIN}` and the apex stays free.
-     pub control_subdomain: String,
-     /// Extra hostnames serving the control UI (comma-separated
-     /// `CONTROL_EXTRA_HOSTS`) — e.g. Coolify's generated domain.
-     pub control_extra_hosts: Vec<String>,
-     pub work_dir: String,
-     pub caddyfile_path: String,
-     pub celld_bin: String,
-     /// Fleet port range (SPEC, Ports): two ports per app.
-     pub fleet_port_min: u16,
-     pub fleet_port_max: u16,
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub bind: String,
+    pub runner_token: String,
+    pub database_url: String,
+    pub s3_endpoint: String,
+    pub s3_public_endpoint: String,
+    /// Single rustfs bucket; git + fleets are prefixes under it.
+    pub s3_bucket: String,
+    pub aws_region: String,
+    pub aws_access_key_id: String,
+    pub aws_secret_access_key: String,
+    pub base_domain: String,
+    /// Control-plane subdomain: empty = bare domain (dev `localhost` — the
+    /// only hostname Bitwarden's matcher accepts without https); prod sets
+    /// `app` so control serves `app.{BASE_DOMAIN}` and the apex stays free.
+    pub control_subdomain: String,
+    /// Extra hostnames serving the control UI (comma-separated
+    /// `CONTROL_EXTRA_HOSTS`) — e.g. Coolify's generated domain.
+    pub control_extra_hosts: Vec<String>,
+    pub work_dir: String,
+    pub caddyfile_path: String,
+    pub celld_bin: String,
+    /// Fleet port range (SPEC, Ports): two ports per app.
+    pub fleet_port_min: u16,
+    pub fleet_port_max: u16,
     pub poll_ms: u64,
     /// Fallback S3 tip sweep interval (T2.2): pushes notify the reconcile
     /// loop over an in-process channel, and this only covers bundles written
     /// behind the runner's back (another runner, a manual bucket write).
     pub tip_sweep_s: u64,
-     pub caddy_upstream_host: String,
-     /// Caddy `auto_https`: unset = on except `localhost`; explicit
-     /// `off` for behind-proxy deployments (our Caddy still terminates
-     /// per-host TLS itself via on-demand certs).
-     pub auto_https: bool,
-     pub caddy_control_upstream: String,
-     pub caddy_api_upstream: String,
-     /// Caddy admin endpoint (the child's 127.0.0.1:2019). The generator
-     /// stays; the writer POSTs to /load instead of the shared volume.
-     pub caddy_admin_url: String,
-     /// Public base for Git smart-HTTP remotes (no trailing slash).
-     pub git_public_base: String,
-     /// Per-account app quota. Every app is its own celld fleet, so this is the
-     /// knob that bounds how much of the host one account can claim.
-     pub max_apps_per_user: u32,
-     /// celld's shedding threshold in MiB (`CELLD_MAX_RSS_MB`); 0 leaves
-     /// celld's default, 80% of the container's memory. celld compares it with
-     /// the greater of its own RSS and the cgroup's working set, and every
-     /// fleet shares the one container cgroup, so this is a container-wide
-     /// threshold, not a per-tenant cap (SPEC, Limits): a per-fleet value
-     /// such as 512 closes every fleet's admission as soon as the container
-     /// as a whole passes it.
-     pub fleet_max_rss_mb: u32,
-     /// celld's own log filter for tenant fleets (`RUNNER_FLEET_LOG`). The
-     /// runner's RUST_LOG describes the runner's modules, so inheriting it left
-     /// a fleet's runtime logs out of the per-app log view entirely.
-     pub fleet_log: String,
+    pub caddy_upstream_host: String,
+    /// Caddy `auto_https`: unset = on except `localhost`; explicit
+    /// `off` for behind-proxy deployments (our Caddy still terminates
+    /// per-host TLS itself via on-demand certs).
+    pub auto_https: bool,
+    pub caddy_control_upstream: String,
+    pub caddy_api_upstream: String,
+    /// Caddy admin endpoint (the child's 127.0.0.1:2019). The generator
+    /// stays; the writer POSTs to /load instead of the shared volume.
+    pub caddy_admin_url: String,
+    /// Public base for Git smart-HTTP remotes (no trailing slash).
+    pub git_public_base: String,
+    /// Per-account app quota. Every app is its own celld fleet, so this is the
+    /// knob that bounds how much of the host one account can claim.
+    pub max_apps_per_user: u32,
+    /// celld's shedding threshold in MiB (`CELLD_MAX_RSS_MB`); 0 leaves
+    /// celld's default, 80% of the container's memory. celld compares it with
+    /// the greater of its own RSS and the cgroup's working set, and every
+    /// fleet shares the one container cgroup, so this is a container-wide
+    /// threshold, not a per-tenant cap (SPEC, Limits): a per-fleet value
+    /// such as 512 closes every fleet's admission as soon as the container
+    /// as a whole passes it.
+    pub fleet_max_rss_mb: u32,
+    /// celld's own log filter for tenant fleets (`RUNNER_FLEET_LOG`). The
+    /// runner's RUST_LOG describes the runner's modules, so inheriting it left
+    /// a fleet's runtime logs out of the per-app log view entirely.
+    pub fleet_log: String,
     /// Idle seconds after which a fleet's cells hibernate
     /// (`CELLD_IDLE_EVICT_S`). The docs' default evicts only under memory
     /// pressure, which keeps idle fleets resident forever.
@@ -320,15 +345,15 @@ fn parse_fleet_ports() -> (u16, u16) {
     /// Per-fleet on-disk asset cache in MiB (`CELLD_ASSET_CACHE_BYTES`),
     /// bounding the 512 MiB celld default per idle app.
     pub fleet_asset_cache_mb: u64,
-     /// Caddy JSON access log the device/path/ref tick tails. The Caddy `log`
-     /// block is path-fixed at the volume root; the Caddyfile itself may live
-     /// in a subpath (dev `dynamic/`).
-     pub caddy_access_log: String,
-     /// Tenancy mode (SPEC). Default multi off localhost.
-     pub tenancy: Tenancy,
-     /// Graceful-stop budget in ms (SPEC, Shutdown). Fleets get
-     /// budget - 3000 as CELLD_SHUTDOWN_TOTAL_MS.
-     pub stop_budget_ms: u64,
+    /// Caddy JSON access log the device/path/ref tick tails. The Caddy `log`
+    /// block is path-fixed at the volume root; the Caddyfile itself may live
+    /// in a subpath (dev `dynamic/`).
+    pub caddy_access_log: String,
+    /// Tenancy mode (SPEC). Default multi off localhost.
+    pub tenancy: Tenancy,
+    /// Graceful-stop budget in ms (SPEC, Shutdown). Fleets get
+    /// budget - 3000 as CELLD_SHUTDOWN_TOTAL_MS.
+    pub stop_budget_ms: u64,
     /// Max worktree bytes before a build is refused (RUNNER_BUILD_MAX_MB).
     pub build_max_mb: u64,
     /// Cap per app on the persistent bun cache (RUNNER_BUILD_CACHE_MB).
@@ -343,19 +368,23 @@ fn parse_fleet_ports() -> (u16, u16) {
     /// ingest tick cadence (spec T3.4). 30 s means ~6x fewer Parquet PUTs and
     /// files than the old 5 s; dashboards lag live traffic by up to ~40 s.
     pub otel_flush_ms: u64,
-    /// Uids for the build sandbox (10010) and tenant fleets (10020).
-    /// None = current user (dev only, single-tenant).
-    pub build_uid: Option<u32>,
-    pub build_gid: Option<u32>,
+    /// The per-app build uid range: `[base, base + range)`, allocated
+    /// one-to-one to apps (`db::ensure_app_build_uid`). Every app's builds
+    /// and release commands run as their own uid in this range, so two
+    /// concurrent builds cannot read each other's worktree or cache.
+    /// `base: None` = no uid drop (dev only, single-tenant).
+    pub build_uid_base: Option<u32>,
+    pub build_uid_range: u32,
+    /// Tenant fleet uid (10020). None = current user (dev only, single-tenant).
     pub fleet_uid: Option<u32>,
     pub fleet_gid: Option<u32>,
-     /// Baked control bundle (fleet #0 source; absent in the dev image).
-     pub control_bundle_dir: String,
-     /// Better-auth origin for boot validation (host must be served).
-     pub better_auth_url: String,
+    /// Baked control bundle (fleet #0 source; absent in the dev image).
+    pub control_bundle_dir: String,
+    /// Better-auth origin for boot validation (host must be served).
+    pub better_auth_url: String,
     /// Edge rate limits, request bounds and trusted proxies.
     pub edge: EdgeLimits,
- }
+}
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
@@ -365,7 +394,9 @@ impl Config {
         }
         let base_domain = env::var("BASE_DOMAIN").unwrap_or_else(|_| "localhost".into());
         if base_domain.trim().is_empty() {
-            anyhow::bail!("BASE_DOMAIN must not be empty (got blank); set it to your domain, e.g. noite.now");
+            anyhow::bail!(
+                "BASE_DOMAIN must not be empty (got blank); set it to your domain, e.g. noite.now"
+            );
         }
         if base_domain != "localhost" && runner_token == "dev-runner-token" {
             anyhow::bail!(
@@ -386,10 +417,8 @@ impl Config {
                 format!("https://git.{base_domain}")
             }
         });
-        let auto_https = parse_auto_https(
-            env::var("CADDY_AUTO_HTTPS").ok().as_deref(),
-            &base_domain,
-        );
+        let auto_https =
+            parse_auto_https(env::var("CADDY_AUTO_HTTPS").ok().as_deref(), &base_domain);
         let tenancy = parse_tenancy(env::var("NOITE_TENANCY").ok().as_deref(), &base_domain);
         let (fleet_port_min, fleet_port_max) = parse_fleet_ports();
         let cfg = Self {
@@ -474,8 +503,13 @@ impl Config {
             otel_flush_ms: env_or(&["RUNNER_OTEL_FLUSH_MS"], "30000")
                 .parse()
                 .unwrap_or(30000),
-            build_uid: parse_opt_uid(env::var("RUNNER_BUILD_UID").ok().as_deref(), 10010),
-            build_gid: parse_opt_uid(env::var("RUNNER_BUILD_GID").ok().as_deref(), 10010),
+            build_uid_base: parse_opt_uid(
+                env::var("RUNNER_BUILD_UID_BASE").ok().as_deref(),
+                BUILD_UID_BASE,
+            ),
+            build_uid_range: env_or(&["RUNNER_BUILD_UID_RANGE"], "1024")
+                .parse()
+                .unwrap_or(BUILD_UID_RANGE),
             fleet_uid: parse_opt_uid(env::var("RUNNER_FLEET_UID").ok().as_deref(), 10020),
             fleet_gid: parse_opt_uid(env::var("RUNNER_FLEET_GID").ok().as_deref(), 10020),
             control_bundle_dir: env::var("CONTROL_BUNDLE_DIR")
@@ -498,24 +532,33 @@ impl Config {
             || self.aws_secret_access_key == "noitesecretnoitesecretnoite12";
         if self.base_domain != "localhost" {
             if dev_token {
-                problems.push("RUNNER_TOKEN is the dev default on a non-localhost BASE_DOMAIN".into());
+                problems
+                    .push("RUNNER_TOKEN is the dev default on a non-localhost BASE_DOMAIN".into());
             }
             if dev_s3 {
-                problems.push("S3 keys are RustFS dev defaults on a non-localhost BASE_DOMAIN".into());
+                problems
+                    .push("S3 keys are RustFS dev defaults on a non-localhost BASE_DOMAIN".into());
             }
         }
         if !self.better_auth_url.is_empty() {
             match url_host(&self.better_auth_url) {
                 Some(host) => {
-                    let served = self.control_hosts().iter().any(|h| h.eq_ignore_ascii_case(&host));
+                    let served = self
+                        .control_hosts()
+                        .iter()
+                        .any(|h| h.eq_ignore_ascii_case(&host));
                     if !served {
-                        problems.push(format!("BETTER_AUTH_URL host {host} is not a served control host"));
+                        problems.push(format!(
+                            "BETTER_AUTH_URL host {host} is not a served control host"
+                        ));
                     }
                 }
                 None => problems.push("BETTER_AUTH_URL does not parse".into()),
             }
             if dev_auth && self.base_domain != "localhost" {
-                problems.push("BETTER_AUTH_SECRET is a dev default on a non-localhost BASE_DOMAIN".into());
+                problems.push(
+                    "BETTER_AUTH_SECRET is a dev default on a non-localhost BASE_DOMAIN".into(),
+                );
             }
         }
         if self.fleet_port_min >= self.fleet_port_max {
@@ -529,6 +572,28 @@ impl Config {
         }
         if self.otel_flush_ms < 1000 {
             problems.push("RUNNER_OTEL_FLUSH_MS must be >= 1000".into());
+        }
+        if self.build_uid_range == 0 {
+            problems.push("RUNNER_BUILD_UID_RANGE must be >= 1".into());
+        }
+        if let Some(base) = self.build_uid_base {
+            let end = base.saturating_add(self.build_uid_range);
+            if base < 1000 {
+                problems.push("RUNNER_BUILD_UID_BASE must be >= 1000 (system users below)".into());
+            }
+            if end > 65534 {
+                problems.push(format!(
+                    "RUNNER_BUILD_UID_BASE({base}) + RUNNER_BUILD_UID_RANGE({}) must stay below 65534",
+                    self.build_uid_range
+                ));
+            }
+            if let Some(fleet) = self.fleet_uid {
+                if fleet >= base && fleet < end {
+                    problems.push(format!(
+                        "RUNNER_BUILD_UID_BASE range {base}..{end} covers the fleet uid {fleet}"
+                    ));
+                }
+            }
         }
         if std::env::var("RAILWAY_DEPLOYMENT_ID").is_ok() {
             if let Ok(grace) = std::env::var("RAILWAY_DEPLOYMENT_DRAINING_SECONDS") {
@@ -726,8 +791,8 @@ mod tests {
             build_timeout_s: 300,
             telemetry_retention_days: 14,
             otel_flush_ms: 30000,
-            build_uid: None,
-            build_gid: None,
+            build_uid_base: None,
+            build_uid_range: BUILD_UID_RANGE,
             fleet_uid: None,
             fleet_gid: None,
             control_bundle_dir: "/opt/noite/control/dist".into(),

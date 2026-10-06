@@ -53,4 +53,18 @@ The browser caps blobs at 256 KB and diffs at 1 MB. Binary files are detected, n
 
 ## Storage
 
-The Overview tab lists the app's storage resources; each row opens a detail browser. Kinds: D1 databases, Durable Objects, R2 buckets — as declared by the deployed Wrangler config (read first) or the pushed source. D1 tables page (`?p=`, `?s=`); R2 keys browse by prefix.
+The Overview tab lists the app's storage resources; each row opens a detail browser. Kinds: D1 databases, Durable Objects, R2 buckets — as declared by the deployed Wrangler config (read first) or the pushed source. R2 keys browse by prefix.
+
+### D1 table editor
+
+A D1 database opens a full-height table editor. The left rail lists every table with its row count (and a lock on tables the caller may not write), with its own table search; on small screens it collapses into a table picker above the grid.
+
+The toolbar searches rows server-side, and offers a filter popover (column / operator / value, AND-ed, up to 10), a sort picker (clicking a column header cycles ascending → descending → off), refresh, and **Insert**. Filter, sort, page and page size are URL state (`?table=`, `?page=`, `?size=`, `?sort=col:asc`, `?f=`, `?q=`, `?view=`), so a view is deep-linkable.
+
+The grid has a sticky header (primary-key icon, column name, declared type, sort indicator); a NULL cell renders as a `NULL` badge and an empty string as a faint `""`, and long values truncate with the full value in the tooltip plus a hover copy button. Timestamp-looking columns show the raw value with a local-time hint. Tables that allow deletes get a checkbox column with a bulk-delete bar.
+
+Clicking a row opens the right-side row editor: every field stays raw text (never a typed date/number input, so a stored value survives an untouched round-trip), NULL is an explicit toggle, and long, multiline or JSON-looking values get an auto-growing textarea. Helpers never reformat a value the user did not touch: **Now** writes in the field's existing format, **Format JSON** pretty-prints valid JSON (and flags invalid JSON), a boolean column gets a 0/1 toggle, and a foreign key gets an **Open →** jump to the referenced table filtered to that value. Changed fields are highlighted, the footer counts the changes, and only the changed columns travel — an untouched insert field is omitted so its DDL default applies. Delete asks inline and shows the key.
+
+Footer paging (page input, prev/next, 25/50/100 per page, record count) sits next to a **Data | Definition** switch; Definition shows the columns, indexes, foreign keys and the `CREATE TABLE` statement with a copy button.
+
+The control plane's own database (the `_control` admin home) uses the same editor: capabilities come from its write policy per table, secret columns render masked (`•••• redacted`) and are never filtered, sorted or written, and rows of `user`/`invite` link to the Users/Invites tab that owns them. A `view`-role collaborator sees the same editor with no write controls.

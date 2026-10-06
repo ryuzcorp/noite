@@ -61,7 +61,10 @@ pub fn built_deploy_root(src_dir: &Path) -> anyhow::Result<Option<BuiltRoot>> {
         .with_context(|| format!("resolve {}", src_dir.display()))?;
     let dist = src.join("dist");
     if dist.join("wrangler.json").is_file() {
-        return Ok(Some(BuiltRoot { dir: dist, note: "dist/wrangler.json (build output)".into() }));
+        return Ok(Some(BuiltRoot {
+            dir: dist,
+            note: "dist/wrangler.json (build output)".into(),
+        }));
     }
     let redirect = src.join(DEPLOY_REDIRECT);
     if !redirect.is_file() {
@@ -81,9 +84,14 @@ pub fn built_deploy_root(src_dir: &Path) -> anyhow::Result<Option<BuiltRoot>> {
 
 /// The built config Wrangler's redirect names, inside the worktree.
 fn redirected_config(src: &Path, redirect: &Path) -> anyhow::Result<PathBuf> {
-    let text = std::fs::read_to_string(redirect).with_context(|| format!("read {DEPLOY_REDIRECT}"))?;
-    let value: Value = serde_json::from_str(&text).with_context(|| format!("parse {DEPLOY_REDIRECT}"))?;
-    let aux = value.get("auxiliaryWorkers").and_then(Value::as_array).map_or(0, Vec::len);
+    let text =
+        std::fs::read_to_string(redirect).with_context(|| format!("read {DEPLOY_REDIRECT}"))?;
+    let value: Value =
+        serde_json::from_str(&text).with_context(|| format!("parse {DEPLOY_REDIRECT}"))?;
+    let aux = value
+        .get("auxiliaryWorkers")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
     if aux > 0 {
         bail!("{DEPLOY_REDIRECT}: auxiliary Workers are not supported (one Worker per app)");
     }
@@ -100,18 +108,28 @@ fn redirected_config(src: &Path, redirect: &Path) -> anyhow::Result<PathBuf> {
 fn celld_config_from(src: &Path, config: &Path) -> anyhow::Result<PathBuf> {
     let label = display_rel(src, config);
     let text = std::fs::read_to_string(config).with_context(|| format!("read {label}"))?;
-    let mut value = crate::host::storage::parse_wrangler(&text).with_context(|| format!("parse {label}"))?;
+    let mut value =
+        crate::host::storage::parse_wrangler(&text).with_context(|| format!("parse {label}"))?;
     let Some(obj) = value.as_object_mut() else {
         bail!("{label} is not a JSON object");
     };
     let config_dir = config.parent().unwrap_or(src).to_path_buf();
 
     let main = match obj.get("main").and_then(Value::as_str) {
-        Some(m) => Some(inside(src, &config_dir.join(m)).with_context(|| format!("{label}: main {m}"))?),
+        Some(m) => {
+            Some(inside(src, &config_dir.join(m)).with_context(|| format!("{label}: main {m}"))?)
+        }
         None => None,
     };
-    let assets = match obj.get("assets").and_then(|a| a.get("directory")).and_then(Value::as_str) {
-        Some(d) => Some(inside(src, &config_dir.join(d)).with_context(|| format!("{label}: assets.directory {d}"))?),
+    let assets = match obj
+        .get("assets")
+        .and_then(|a| a.get("directory"))
+        .and_then(Value::as_str)
+    {
+        Some(d) => Some(
+            inside(src, &config_dir.join(d))
+                .with_context(|| format!("{label}: assets.directory {d}"))?,
+        ),
         None => None,
     };
 
@@ -141,7 +159,10 @@ fn celld_config_from(src: &Path, config: &Path) -> anyhow::Result<PathBuf> {
     if let Some(main) = &main {
         obj.insert("main".into(), Value::String(relative(&root, main)));
     }
-    if let (Some(assets), Some(block)) = (&assets, obj.get_mut("assets").and_then(Value::as_object_mut)) {
+    if let (Some(assets), Some(block)) = (
+        &assets,
+        obj.get_mut("assets").and_then(Value::as_object_mut),
+    ) {
         block.insert("directory".into(), Value::String(relative(&root, assets)));
     }
     relocate_migrations(obj, &config_dir, &root);
@@ -274,8 +295,14 @@ mod tests {
 
     /// The layout `@cloudflare/vite-plugin` 1.x writes for a Worker with assets.
     fn vite_worker_tree(src: &Path) {
-        write(&src.join("wrangler.jsonc"), r#"{ "name": "app", "main": "src/index.ts", "compatibility_date": "2026-09-01" }"#);
-        write(&src.join(DEPLOY_REDIRECT), r#"{"configPath":"../../dist/app/wrangler.json","auxiliaryWorkers":[]}"#);
+        write(
+            &src.join("wrangler.jsonc"),
+            r#"{ "name": "app", "main": "src/index.ts", "compatibility_date": "2026-09-01" }"#,
+        );
+        write(
+            &src.join(DEPLOY_REDIRECT),
+            r#"{"configPath":"../../dist/app/wrangler.json","auxiliaryWorkers":[]}"#,
+        );
         write(
             &src.join("dist/app/wrangler.json"),
             r#"{"configPath":"/abs/wrangler.jsonc","topLevelName":"app","name":"app","main":"index.js",
@@ -286,7 +313,10 @@ mod tests {
         );
         write(&src.join("dist/app/index.js"), "export default {}");
         write(&src.join("dist/client/index.html"), "<h1>hi</h1>");
-        write(&src.join("dist/client/.assetsignore"), "wrangler.json\n.dev.vars\n");
+        write(
+            &src.join("dist/client/.assetsignore"),
+            "wrangler.json\n.dev.vars\n",
+        );
         write(&src.join("migrations/0001.sql"), "select 1;");
     }
 
@@ -297,40 +327,62 @@ mod tests {
 
         let built = built_deploy_root(&src).unwrap().expect("redirect followed");
         assert_eq!(built.dir, src.join("dist"));
-        assert!(built.note.contains("dist/app/wrangler.json"), "{}", built.note);
+        assert!(
+            built.note.contains("dist/app/wrangler.json"),
+            "{}",
+            built.note
+        );
 
         let v = read_json(&src.join("dist/wrangler.json"));
         assert_eq!(v["main"], "app/index.js");
         assert_eq!(v["assets"]["directory"], "client");
         assert_eq!(v["assets"]["binding"], "ASSETS");
         assert_eq!(v["vars"]["GREETING"], "hi");
-        for dropped in ["configPath", "topLevelName", "no_bundle", "rules", "exports", "dev"] {
+        for dropped in [
+            "configPath",
+            "topLevelName",
+            "no_bundle",
+            "rules",
+            "exports",
+            "dev",
+        ] {
             assert!(v.get(dropped).is_none(), "{dropped} kept");
         }
         // Outside the new root: dropped rather than written with `..`.
         assert!(v["d1_databases"][0].get("migrations_dir").is_none());
         assert!(!src.join("dist/client/.assetsignore").exists());
         // The source config is left alone.
-        assert!(std::fs::read_to_string(src.join("wrangler.jsonc")).unwrap().contains("src/index.ts"));
+        assert!(std::fs::read_to_string(src.join("wrangler.jsonc"))
+            .unwrap()
+            .contains("src/index.ts"));
     }
 
     #[test]
     fn asset_only_output_moves_up_and_unpublishes_its_config() {
         let src = scratch("assets").canonicalize().unwrap();
-        write(&src.join(DEPLOY_REDIRECT), r#"{"configPath":"../../dist/client/wrangler.json"}"#);
+        write(
+            &src.join(DEPLOY_REDIRECT),
+            r#"{"configPath":"../../dist/client/wrangler.json"}"#,
+        );
         write(
             &src.join("dist/client/wrangler.json"),
             r#"{"name":"site","compatibility_date":"2026-09-01","assets":{"directory":"."},"vars":{"K":"v"}}"#,
         );
         write(&src.join("dist/client/index.html"), "<h1>hi</h1>");
-        write(&src.join("dist/client/.assetsignore"), "wrangler.json\n.dev.vars\n");
+        write(
+            &src.join("dist/client/.assetsignore"),
+            "wrangler.json\n.dev.vars\n",
+        );
 
         let built = built_deploy_root(&src).unwrap().unwrap();
         assert_eq!(built.dir, src.join("dist"));
         let v = read_json(&src.join("dist/wrangler.json"));
         assert_eq!(v["assets"]["directory"], "client");
         assert!(v.get("main").is_none());
-        assert!(!src.join("dist/client/wrangler.json").exists(), "config would be served as an asset");
+        assert!(
+            !src.join("dist/client/wrangler.json").exists(),
+            "config would be served as an asset"
+        );
         assert!(src.join("dist/client/index.html").exists());
     }
 
@@ -338,17 +390,26 @@ mod tests {
     fn celld_ready_dist_config_wins() {
         let src = scratch("oxide").canonicalize().unwrap();
         vite_worker_tree(&src);
-        write(&src.join("dist/wrangler.json"), r#"{"name":"app","main":"celld/entry.js"}"#);
+        write(
+            &src.join("dist/wrangler.json"),
+            r#"{"name":"app","main":"celld/entry.js"}"#,
+        );
         let built = built_deploy_root(&src).unwrap().unwrap();
         assert_eq!(built.dir, src.join("dist"));
         // Untouched: already celld's shape.
-        assert_eq!(read_json(&src.join("dist/wrangler.json"))["main"], "celld/entry.js");
+        assert_eq!(
+            read_json(&src.join("dist/wrangler.json"))["main"],
+            "celld/entry.js"
+        );
     }
 
     #[test]
     fn no_build_output_falls_back() {
         let src = scratch("plain").canonicalize().unwrap();
-        write(&src.join("wrangler.jsonc"), r#"{"name":"app","main":"index.js"}"#);
+        write(
+            &src.join("wrangler.jsonc"),
+            r#"{"name":"app","main":"index.js"}"#,
+        );
         assert!(built_deploy_root(&src).unwrap().is_none());
     }
 
@@ -358,17 +419,29 @@ mod tests {
         write(&outside.join("wrangler.json"), r#"{"name":"x"}"#);
         let src = scratch("escape").canonicalize().unwrap();
         let path = outside.join("wrangler.json");
-        write(&src.join(DEPLOY_REDIRECT), &format!(r#"{{"configPath":{}}}"#, serde_json::json!(path)));
+        write(
+            &src.join(DEPLOY_REDIRECT),
+            &format!(r#"{{"configPath":{}}}"#, serde_json::json!(path)),
+        );
         let err = built_deploy_root(&src).unwrap_err();
-        assert!(format!("{err:#}").contains("escapes the worktree"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("escapes the worktree"),
+            "{err:#}"
+        );
     }
 
     #[test]
     fn output_sharing_the_source_root_is_refused() {
         let src = scratch("shared").canonicalize().unwrap();
         write(&src.join("wrangler.jsonc"), r#"{"name":"app"}"#);
-        write(&src.join(DEPLOY_REDIRECT), r#"{"configPath":"../../out/wrangler.json"}"#);
-        write(&src.join("out/wrangler.json"), r#"{"name":"app","main":"index.js","assets":{"directory":"../public"}}"#);
+        write(
+            &src.join(DEPLOY_REDIRECT),
+            r#"{"configPath":"../../out/wrangler.json"}"#,
+        );
+        write(
+            &src.join("out/wrangler.json"),
+            r#"{"name":"app","main":"index.js","assets":{"directory":"../public"}}"#,
+        );
         write(&src.join("out/index.js"), "export default {}");
         write(&src.join("public/index.html"), "hi");
         let err = built_deploy_root(&src).unwrap_err();

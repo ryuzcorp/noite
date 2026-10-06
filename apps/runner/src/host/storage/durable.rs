@@ -33,15 +33,10 @@ pub struct DoPreview {
 /// JSON row per instance. celld exposes no generic storage read route for
 /// a DO instance, so each instance is also probed with `GET /do/{scope}
 /// ?read=1` — the object's own handler decides what its preview says.
-pub async fn do_instances(
-    cfg: &Config,
-    app: &App,
-    class_name: &str,
-) -> anyhow::Result<DoPreview> {
+pub async fn do_instances(cfg: &Config, app: &App, class_name: &str) -> anyhow::Result<DoPreview> {
     let bucket = app.fleet_bucket.clone();
     let env_owned = cmd::aws_env(cfg);
-    let mut env: Vec<(&str, &str)> =
-        env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     env.push(("S3_ENDPOINT", cfg.s3_endpoint.as_str()));
     let out = cmd::run_cmd(
         &cfg.celld_bin,

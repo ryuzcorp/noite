@@ -23,21 +23,54 @@ pub struct MetricsQuery {
     pub hours: Option<i64>,
 }
 
+/// One observability target: the app id the metric tables key on and the slug
+/// the in-memory log tail keys on. For a tenant app both come from its `app`
+/// row; for the control fleet there is no row by design, so the reserved key
+/// stands for both (see `host::control::SLUG`). Returning `None` is a 404 —
+/// the routes stay identical for both kinds of source.
+pub(crate) async fn telemetry_target(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+) -> sqlx::Result<Option<(String, String)>> {
+    if id == crate::host::control::SLUG {
+        return Ok(Some((
+            crate::host::control::SLUG.to_string(),
+            crate::host::control::SLUG.to_string(),
+        )));
+    }
+    Ok(db::get_app(pool, id)
+        .await?
+        .map(|app| (app.id, app.slug)))
+}
+
+/// Resolve one telemetry target or the error to answer with (404 unknown app,
+/// 500 database). Every observability route shares it, so a tenant app and the
+/// control fleet take the same path.
+pub(crate) async fn telemetry_target_or_404(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+) -> Result<(String, String), ApiError> {
+    match telemetry_target(pool, id).await {
+        Ok(Some(target)) => Ok(target),
+        Ok(None) => Err(ApiError::not_found("app not found")),
+        Err(e) => Err(ApiError::internal(e.to_string())),
+    }
+}
+
 pub async fn app_metrics(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    match db::get_app(&state.pool, &id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    }
+    let (app_id, _) = match telemetry_target_or_404(&state.pool, &id).await {
+        Ok(target) => target,
+        Err(e) => return e.into_response(),
+    };
     let hours = q.hours.unwrap_or(24).clamp(1, 720);
     let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
         .format("%Y-%m-%dT%H:%M:00Z")
         .to_string();
-    match db::list_app_metrics(&state.pool, &id, &since).await {
+    match db::list_app_metrics(&state.pool, &app_id, &since).await {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => ApiError::internal(e.to_string()).into_response(),
     }
@@ -48,16 +81,15 @@ pub async fn app_devices(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    match db::get_app(&state.pool, &id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    }
+    let (app_id, _) = match telemetry_target_or_404(&state.pool, &id).await {
+        Ok(target) => target,
+        Err(e) => return e.into_response(),
+    };
     let hours = q.hours.unwrap_or(24).clamp(1, 720);
     let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
         .format("%Y-%m-%dT%H:00:00Z")
         .to_string();
-    match db::list_app_devices(&state.pool, &id, &since).await {
+    match db::list_app_devices(&state.pool, &app_id, &since).await {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => ApiError::internal(e.to_string()).into_response(),
     }
@@ -68,16 +100,15 @@ pub async fn app_paths(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    match db::get_app(&state.pool, &id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    }
+    let (app_id, _) = match telemetry_target_or_404(&state.pool, &id).await {
+        Ok(target) => target,
+        Err(e) => return e.into_response(),
+    };
     let hours = q.hours.unwrap_or(24).clamp(1, 720);
     let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
         .format("%Y-%m-%dT%H:00:00Z")
         .to_string();
-    match db::list_app_paths(&state.pool, &id, &since).await {
+    match db::list_app_paths(&state.pool, &app_id, &since).await {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => ApiError::internal(e.to_string()).into_response(),
     }
@@ -88,16 +119,15 @@ pub async fn app_refs(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    match db::get_app(&state.pool, &id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    }
+    let (app_id, _) = match telemetry_target_or_404(&state.pool, &id).await {
+        Ok(target) => target,
+        Err(e) => return e.into_response(),
+    };
     let hours = q.hours.unwrap_or(24).clamp(1, 720);
     let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
         .format("%Y-%m-%dT%H:00:00Z")
         .to_string();
-    match db::list_app_refs(&state.pool, &id, &since).await {
+    match db::list_app_refs(&state.pool, &app_id, &since).await {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => ApiError::internal(e.to_string()).into_response(),
     }
@@ -108,20 +138,18 @@ pub async fn app_spans(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    match db::get_app(&state.pool, &id).await {
-        Ok(Some(_)) => {
-            // Ingested hourly stats (spec T3.2): the 24 h default is one
-            // indexed SQLite scan, like every other series (up to 720 h).
-            let hours = q.hours.unwrap_or(24).clamp(1, 720);
-            let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
-                .format("%Y-%m-%dT%H:00:00Z")
-                .to_string();
-            match db::list_span_stats(&state.pool, &id, &since).await {
-                Ok(rows) => Json(rows).into_response(),
-                Err(e) => ApiError::internal(e.to_string()).into_response(),
-            }
-        }
-        Ok(None) => ApiError::not_found("app not found").into_response(),
+    let (app_id, _) = match telemetry_target_or_404(&state.pool, &id).await {
+        Ok(target) => target,
+        Err(e) => return e.into_response(),
+    };
+    // Ingested hourly stats (spec T3.2): the 24 h default is one indexed
+    // SQLite scan, like every other series (up to 720 h).
+    let hours = q.hours.unwrap_or(24).clamp(1, 720);
+    let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
+        .format("%Y-%m-%dT%H:00:00Z")
+        .to_string();
+    match db::list_span_stats(&state.pool, &app_id, &since).await {
+        Ok(rows) => Json(rows).into_response(),
         Err(e) => ApiError::internal(e.to_string()).into_response(),
     }
 }
@@ -132,12 +160,11 @@ pub async fn app_metrics_version(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match db::get_app(&state.pool, &id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    }
-    match db::get_metric_version(&state.pool, &id).await {
+    let (app_id, _) = match telemetry_target_or_404(&state.pool, &id).await {
+        Ok(target) => target,
+        Err(e) => return e.into_response(),
+    };
+    match db::get_metric_version(&state.pool, &app_id).await {
         Ok(v) => Json(serde_json::json!({ "version": v })).into_response(),
         Err(e) => ApiError::internal(e.to_string()).into_response(),
     }
@@ -157,16 +184,12 @@ pub(crate) async fn merged_lines(state: &AppState, app_id: &str, slug: &str) -> 
     lines
 }
 
-pub async fn app_logs(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    let app = match db::get_app(&state.pool, &id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
+pub async fn app_logs(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    let (app_id, slug) = match telemetry_target_or_404(&state.pool, &id).await {
+        Ok(target) => target,
+        Err(e) => return e.into_response(),
     };
-    Json(merged_lines(&state, &app.id, &app.slug).await).into_response()
+    Json(merged_lines(&state, &app_id, &slug).await).into_response()
 }
 
 /// Live log tail as server-sent events: one JSON array per message, sent
@@ -177,10 +200,9 @@ pub async fn app_logs_stream(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let app = match db::get_app(&state.pool, &id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return ApiError::not_found("app not found").into_response(),
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
+    let (app_id, slug) = match telemetry_target_or_404(&state.pool, &id).await {
+        Ok(target) => target,
+        Err(e) => return e.into_response(),
     };
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, anyhow::Error>>(16);
     crate::host::stats::sse_enter("logs");
@@ -190,7 +212,7 @@ pub async fn app_logs_stream(
     tokio::spawn(async move {
         let mut last: Option<Vec<String>> = None;
         loop {
-            let lines = merged_lines(&state, &app.id, &app.slug).await;
+            let lines = merged_lines(&state, &app_id, &slug).await;
             if last.as_ref() != Some(&lines) {
                 let data = serde_json::to_string(&lines).unwrap_or_default();
                 if tx.send(Ok(Event::default().data(data))).await.is_err() {

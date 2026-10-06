@@ -359,6 +359,18 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
       window: 60,
     },
     secret: env.BETTER_AUTH_SECRET,
+    // First-run onboarding marker. `input: false` keeps it server-only: a
+    // client can never POST itself onboarding-complete; only the
+    // `completeOnboarding` action writes it.
+    user: {
+      additionalFields: {
+        onboardedAt: {
+          input: false,
+          required: false,
+          type: "date",
+        },
+      },
+    },
   });
 
 /** Port of the retired joint image's boot gate: never serve auth with
@@ -438,6 +450,9 @@ export const authFromEnvEffect = (env: KitEnv, origin: string) =>
 export interface SessionUser {
   email: string;
   id: string;
+  /** Set only on an impersonated session (the admin plugin). The onboarding
+   * action refuses to mark the target onboarded on such a session. */
+  impersonatedBy: string | null;
   name: string;
 }
 

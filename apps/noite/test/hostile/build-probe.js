@@ -5,6 +5,7 @@
 import {
   appendFileSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   writeFileSync,
 } from "node:fs";
@@ -72,6 +73,55 @@ await Promise.all(
 await denyAsync("fetch:metadata", async () => {
   const res = await fetch("http://169.254.169.254/");
   return `status ${res.status}`;
+});
+
+// Cross-build isolation: derive this app's slug from the build cwd
+// (/data/runner/builds/<slug>/<ts>/src), then try to read every *other*
+// app's worktree and persistent build cache. Each app's builds run as their
+// own uid, so those directories are owned 0700 by the other app and every
+// read must fail; under the old single shared build uid they were readable.
+deny("read:sibling-build-cache", () => {
+  const parts = process.cwd().split("/");
+  const buildsIndex = parts.indexOf("builds");
+  const ownSlug = buildsIndex === -1 ? "" : parts[buildsIndex + 1];
+  const seen = [];
+  const readable = [];
+  for (const top of ["cache", "builds"]) {
+    const root = `/data/runner/${top}`;
+    let slugs;
+    try {
+      slugs = readdirSync(root);
+    } catch {
+      continue;
+    }
+    for (const slug of slugs) {
+      if (slug === ownSlug) {
+        continue;
+      }
+      seen.push(`${top}/${slug}`);
+      const dir = `${root}/${slug}`;
+      let leaves;
+      try {
+        leaves = readdirSync(dir);
+      } catch {
+        // Not even listable by this uid: already isolated.
+        continue;
+      }
+      for (const leaf of leaves) {
+        const target = `${dir}/${leaf}`;
+        try {
+          readdirSync(target);
+          readable.push(target);
+        } catch {
+          // EACCES: this app's uid cannot even enter it.
+        }
+      }
+    }
+  }
+  if (readable.length > 0) {
+    return `read ${readable.slice(0, 3).join(", ")}`;
+  }
+  throw new Error(`siblings=${seen.length} readable=0`);
 });
 
 mkdirSync("dist", { recursive: true });

@@ -20,7 +20,6 @@
     "@ilha/router": "0.11.13",
     "@pierre/diffs": "1.5.1",
     "@pierre/trees": "1.0.0-beta.6",
-    "@tanstack/table-core": "^9.2.4",
     "better-auth": "^1.7.7",
     "cf": "1.0.0-beta.10",
     "effect": "^4.0.0",

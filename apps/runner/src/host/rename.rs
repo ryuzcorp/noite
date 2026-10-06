@@ -63,8 +63,14 @@ async fn move_s3_prefix(cfg: &Config, from: &str, to: &str) -> anyhow::Result<()
         .and_then(|s| s.split('/').next())
         .unwrap_or(&cfg.s3_bucket)
         .to_string();
-    let from_key = from.strip_prefix(&format!("s3://{bucket}/")).unwrap_or(from).to_string();
-    let to_key = to.strip_prefix(&format!("s3://{bucket}/")).unwrap_or(to).to_string();
+    let from_key = from
+        .strip_prefix(&format!("s3://{bucket}/"))
+        .unwrap_or(from)
+        .to_string();
+    let to_key = to
+        .strip_prefix(&format!("s3://{bucket}/"))
+        .unwrap_or(to)
+        .to_string();
     let json = cmd::s3_list_prefix(cfg, &bucket, &from_key).await?;
     let keys: Vec<String> = serde_json::from_str::<serde_json::Value>(&json)
         .ok()

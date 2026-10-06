@@ -419,9 +419,9 @@ const InviteRow = (props: {
  * independent (mirroring the app-detail tabs), so opening Users never waits on
  * the invite or app queries and an admin save reloads a single list.
  *
- * All three are rendered only behind the god-mode route gate — the server
- * actions enforce the same check — and the gate result arrives as a prop so
- * the page performs it exactly once. */
+ * All three are rendered only behind the admin home's route gate — the
+ * server actions enforce the same check — and the gate result arrives as a
+ * prop so the page performs it exactly once. */
 
 /** Native confirm dialog: the requirement for privilege changes and
  * destructive deletes. */

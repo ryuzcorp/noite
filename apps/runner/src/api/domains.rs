@@ -73,8 +73,7 @@ pub async fn add_domain(
     }
     if let Err(e) = db::add_domain(&state.pool, &app_id, &hostname).await {
         // The primary key is the final word on a concurrent claim.
-        return ApiError::conflict(format!("hostname is already in use: {e}"))
-            .into_response();
+        return ApiError::conflict(format!("hostname is already in use: {e}")).into_response();
     }
     match db::list_domains_for(&state.pool, &app_id).await {
         Ok(rows) => Json(rows).into_response(),

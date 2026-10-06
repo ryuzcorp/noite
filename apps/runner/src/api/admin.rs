@@ -28,18 +28,36 @@ pub async fn snapshot(State(state): State<AppState>) -> impl IntoResponse {
     if let Err(e) = sqlx::query(&sql).execute(&state.pool).await {
         return ApiError::internal(format!("vacuum failed: {e}")).into_response();
     }
-    let bytes = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+    let bytes = tokio::fs::metadata(&path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
     tracing::info!(path = %path.display(), bytes, "runner db snapshot written");
     // Bucket upload (best-effort surfaced in the response, not a failure:
     // the local file is what `backup.sh` tars today).
-    let uploaded = state.state_sync.snapshot_now(&state.pool, &state.config).await.ok();
-    Json(json!({ "bytes": bytes, "ok": true, "path": target, "bucket_bytes": uploaded })).into_response()
+    let uploaded = state
+        .state_sync
+        .snapshot_now(&state.pool, &state.config)
+        .await
+        .ok();
+    Json(json!({ "bytes": bytes, "ok": true, "path": target, "bucket_bytes": uploaded }))
+        .into_response()
 }
 
 /// Process-wide cost counters (spec T0.1): subprocess spawns by program, S3
 /// operations by verb with bytes, DuckDB runs by purpose, snapshot uploads,
 /// live SSE loops, plus RSS and CPU time. `make usage` diffs this over a
-/// window for the before/after harness.
-pub async fn stats() -> impl IntoResponse {
-    Json(crate::host::stats::snapshot()).into_response()
+/// window for the before/after harness. Also carries `control_fleet`: whether
+/// this image supervises the control fleet at all (the dev image does not —
+/// `vite dev` serves the UI — so the control app has no telemetry and says so
+/// instead of showing empty charts, see `host::control::bundle_present`).
+pub async fn stats(State(state): State<AppState>) -> impl IntoResponse {
+    let mut value = crate::host::stats::snapshot();
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "control_fleet".to_string(),
+            serde_json::Value::Bool(crate::host::control::bundle_present(&state.config)),
+        );
+    }
+    Json(value).into_response()
 }

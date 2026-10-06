@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { resetRateLimits } from "../lib/rate-limit";
 import {
+  controlStreamRefusalDecision,
   handleHttp,
   metricsWindowHours,
   readBoundedText,
@@ -207,6 +208,40 @@ describe("readBoundedText", () => {
       method: "POST",
     });
     expect(await readBoundedText(request, 10)).toBeNull();
+  });
+});
+
+describe("control stream gate", () => {
+  test("admits only a signed-in, non-impersonated instance admin", () => {
+    expect(
+      controlStreamRefusalDecision({
+        impersonatedBy: null,
+        isAdmin: true,
+        signedIn: true,
+      })
+    ).toBeNull();
+    expect(
+      controlStreamRefusalDecision({
+        impersonatedBy: null,
+        isAdmin: true,
+        signedIn: false,
+      })
+    ).toMatchObject({ status: 401 });
+    // An admin touring as another user must not watch the control plane.
+    expect(
+      controlStreamRefusalDecision({
+        impersonatedBy: "admin1",
+        isAdmin: true,
+        signedIn: true,
+      })
+    ).toMatchObject({ status: 403 });
+    expect(
+      controlStreamRefusalDecision({
+        impersonatedBy: null,
+        isAdmin: false,
+        signedIn: true,
+      })
+    ).toMatchObject({ status: 403 });
   });
 });
 

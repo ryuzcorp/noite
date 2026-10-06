@@ -67,7 +67,7 @@ Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (hand
 | Var | Default | Effect | Owner |
 | --- | --- | --- | --- |
 | `NOITE_TENANCY` | unset = `multi` off localhost, `single` on | `multi` sandboxes builds/fleets as users behind egress policy; `single` = operator pushes only | runner-owned |
-| `RUNNER_BUILD_UID` / `RUNNER_BUILD_GID` | `10010` | Build sandbox user | runner-owned |
+| `RUNNER_BUILD_UID_BASE` / `RUNNER_BUILD_UID_RANGE` | `10030` / `1024` | Reserved per-app build uid range `[base, base + range)`; each app's builds and release commands run as their own uid from it | runner-owned |
 | `RUNNER_FLEET_UID` / `RUNNER_FLEET_GID` | `10020` | Tenant fleet user | runner-owned |
 | `NOITE_FLEET_PORTS` | `20000-29999` | Fleet port range, two ports per app | runner-owned |
 | `NOITE_STOP_BUDGET_MS` | `25000` | Graceful-stop budget (min `5000`); fleets stop inside budget − 3 s | runner-owned |

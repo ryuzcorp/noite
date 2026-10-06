@@ -70,12 +70,15 @@ Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
 | Method | Route | Notes |
 | --- | --- | --- |
 | `GET` | `/v1/apps/{id}/storage` | Storage overview |
-| `GET` | `/v1/apps/{id}/storage/d1/{database_id}` | Query a D1 database |
-| `POST` | `/v1/apps/{id}/storage/d1/{database_id}/write` | Execute a D1 write |
-| `GET` | `/v1/apps/{id}/storage/do/{class_name}` | Durable Object contents |
-| `GET` | `/v1/apps/{id}/storage/r2/{bucket}` | List bucket keys |
-| `GET` / `DELETE` | `/v1/apps/{id}/storage/r2/{bucket}/object` | Read / delete one object |
-| `GET` | `/v1/apps/{id}/storage/r2/{bucket}/raw` | Raw object bytes |
+| `GET` | `/v1/apps/{id}/storage/d1/{database_id}/tables` | D1 tables with row counts |
+| `GET` | `/v1/apps/{id}/storage/d1/{database_id}/tables/{table}/schema` | Table columns, foreign keys, indexes, DDL |
+| `POST` | `/v1/apps/{id}/storage/d1/{database_id}/tables/{table}/rows` | One page of rows (body: `page`, `page_size`, `sort`, `filters`, `search`) |
+| `POST` | `/v1/apps/{id}/storage/d1/{database_id}/write` | Execute a D1 write (`insert` / `update` / `delete`) |
+| `POST` | `/v1/apps/{id}/storage/d1/{database_id}/delete-rows` | Delete 1..100 rows by key in one atomic batch |
+| `GET` | `/v1/apps/{id}/storage/do/{class_name}` | Durable Object instances (`id`, `scope`, `?read=1` preview) |
+| `GET` | `/v1/apps/{id}/storage/r2/{bucket}?prefix=&cursor=` | One page of a bucket folder: folders, files (size, content type) and the continuation cursor |
+| `GET` / `PUT` / `DELETE` | `/v1/apps/{id}/storage/r2/{bucket}/object?key=` | Read a text preview / upload one object (streamed body; `celld r2 put`) / delete it |
+| `GET` | `/v1/apps/{id}/storage/r2/{bucket}/raw?key=` | Raw object bytes with the object's own content type |
 
 ## Metrics and telemetry
 
@@ -126,7 +129,7 @@ git push noite main
 
 ## RPC mirror
 
-`POST /rpc` is JSON-RPC 2.0 over the same auth, with a method per REST route (`apps.list`, `env.set`, `deploys.rollback`, `storage.d1.get`, …). A few methods exist only there, because only the control UI uses them:
+`POST /rpc` is JSON-RPC 2.0 over the same auth, with a method per REST route (`apps.list`, `env.set`, `deploys.rollback`, `storage.d1.rows`, …). A few methods exist only there, because only the control UI uses them:
 
 | Method | Params | Does |
 | --- | --- | --- |

@@ -63,7 +63,12 @@ fn escape(text: &str) -> String {
 /// incoming Host (keeps dev ports working without configuration). Visitors
 /// on a LAN/extra host link back to that host, not localhost — which would
 /// resolve to their own machine.
-fn control_url(host: &str, base_domain: &str, control_sub: &str, tenant_bases: &[String]) -> String {
+fn control_url(
+    host: &str,
+    base_domain: &str,
+    control_sub: &str,
+    tenant_bases: &[String],
+) -> String {
     let port = host
         .split_once(':')
         .map(|(_, p)| p)
@@ -130,7 +135,10 @@ fn page(status: StatusCode, title: &str, body: &str, control: &str) -> impl Into
 /// Resolve a request host to its app: a tenant hostname by slug, anything
 /// else as a registered custom hostname (`app_domain`). Returns the parsed
 /// slug too (None for custom hosts) for the not-found page.
-async fn app_for_host(state: &AppState, host: &str) -> (Option<String>, Option<crate::models::App>) {
+async fn app_for_host(
+    state: &AppState,
+    host: &str,
+) -> (Option<String>, Option<crate::models::App>) {
     let cfg = &state.config;
     let bare = host
         .split_once(':')
@@ -141,12 +149,18 @@ async fn app_for_host(state: &AppState, host: &str) -> (Option<String>, Option<c
         .to_lowercase();
     match parse_edge_slug(host, &cfg.tenant_bases(), &cfg.control_subdomain) {
         Some(slug) => {
-            let app = crate::db::get_app_by_slug(&state.pool, &slug).await.ok().flatten();
+            let app = crate::db::get_app_by_slug(&state.pool, &slug)
+                .await
+                .ok()
+                .flatten();
             (Some(slug), app)
         }
         None => (
             None,
-            crate::db::get_app_by_domain(&state.pool, &bare).await.ok().flatten(),
+            crate::db::get_app_by_domain(&state.pool, &bare)
+                .await
+                .ok()
+                .flatten(),
         ),
     }
 }
@@ -171,14 +185,25 @@ pub async fn wake(State(state): State<AppState>, headers: HeaderMap) -> axum::re
     let Some(app) = app else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match crate::host::sleep::wake_app(&state.pool, &state.config, &state.procs, &state.logs, &app.id)
-        .await
+    match crate::host::sleep::wake_app(
+        &state.pool,
+        &state.config,
+        &state.procs,
+        &state.logs,
+        &app.id,
+    )
+    .await
     {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => {
             tracing::warn!(slug = %app.slug, error = %e, "wake failed");
             let cfg = &state.config;
-            let control = control_url(&host, &cfg.base_domain, &cfg.control_subdomain, &cfg.tenant_bases());
+            let control = control_url(
+                &host,
+                &cfg.base_domain,
+                &cfg.control_subdomain,
+                &cfg.tenant_bases(),
+            );
             page(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Unavailable",
@@ -193,10 +218,7 @@ pub async fn wake(State(state): State<AppState>, headers: HeaderMap) -> axum::re
     }
 }
 
-pub async fn edge_fallback(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub async fn edge_fallback(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let host = headers
         .get("host")
         .and_then(|v| v.to_str().ok())
@@ -289,9 +311,7 @@ pub fn tls_ask_static_ok(
     bare == control
         || bare == format!("api.{base_domain}")
         || bare == format!("git.{base_domain}")
-        || extra_hosts
-            .iter()
-            .any(|h| h.trim().to_lowercase() == bare)
+        || extra_hosts.iter().any(|h| h.trim().to_lowercase() == bare)
 }
 
 /// Caddy `on_demand_tls` gate (`GET /v1/edge/tls-ask?domain=`): 200 only
@@ -371,7 +391,10 @@ mod tests {
         assert_eq!(parse_edge_slug("noite.local:9080", &lan, ""), None);
         assert_eq!(parse_edge_slug("api.noite.local", &lan, ""), None);
         assert_eq!(parse_edge_slug("a.b.noite.local", &lan, ""), None);
-        assert_eq!(parse_edge_slug("test.localhost:9080", &lan, ""), Some("test".to_string()));
+        assert_eq!(
+            parse_edge_slug("test.localhost:9080", &lan, ""),
+            Some("test".to_string())
+        );
         assert_eq!(parse_edge_slug("test.evil.local", &lan, ""), None);
     }
 
@@ -394,7 +417,12 @@ mod tests {
             &extra
         ));
         assert!(!tls_ask_static_ok("evil.com", "noite.now", "app", &extra));
-        assert!(!tls_ask_static_ok("test.noite.now", "noite.now", "app", &[]));
+        assert!(!tls_ask_static_ok(
+            "test.noite.now",
+            "noite.now",
+            "app",
+            &[]
+        ));
         assert!(!tls_ask_static_ok("noite.now", "noite.now", "app", &[]));
         assert!(!tls_ask_static_ok("app.noite.now", "localhost", "", &[]));
         assert!(!tls_ask_static_ok("anything", "", "app", &[]));
@@ -419,7 +447,12 @@ mod tests {
     #[test]
     fn control_url_shapes() {
         assert_eq!(
-            control_url("asdf.localhost:9080", "localhost", "", &bases(&["localhost"])),
+            control_url(
+                "asdf.localhost:9080",
+                "localhost",
+                "",
+                &bases(&["localhost"])
+            ),
             "http://localhost:9080"
         );
         assert_eq!(

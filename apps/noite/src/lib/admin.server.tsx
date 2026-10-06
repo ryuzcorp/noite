@@ -17,7 +17,12 @@ import {
 import { dropAppCollaborators } from "./collaborators";
 import { ensureDbPromise, withDb } from "./db";
 import { listInvites, mintInvites, revokeInvite } from "./invites.server";
-import { runnerDeleteApp, runnerListApps, runnerPatchApp } from "./runner";
+import {
+  runnerControlFleet,
+  runnerDeleteApp,
+  runnerListApps,
+  runnerPatchApp,
+} from "./runner";
 import type { RunnerApp } from "./runner";
 
 /** Explicit user-row shape (mirrors the paranorm `user` table). Written
@@ -72,10 +77,12 @@ interface AdminSession {
 }
 
 /** Gate for every admin action: `admin` role, or the env-anchored address
- * (promoted on the way in so the role persists afterwards). Never throws:
- * async actions surface every throw as unmapped "Internal error"
- * (Oxide wraps them with `catch: asDefect`), so denial is a null return
- * and only genuine infra failures escape (logged server-side). */
+ * (promoted on the way in so the role persists afterwards), and never an
+ * impersonated session — the admin home is hidden while impersonating, and
+ * the actions behind it refuse too. Never throws: async actions surface
+ * every throw as unmapped "Internal error" (Oxide wraps them with
+ * `catch: asDefect`), so denial is a null return and only genuine infra
+ * failures escape (logged server-side). */
 const requireAdmin = async (): Promise<AdminSession | null> => {
   try {
     const request = useRequest();
@@ -98,7 +105,7 @@ const requireAdmin = async (): Promise<AdminSession | null> => {
     );
     const session = await auth.api.getSession({ headers: request.headers });
     const user = session?.user;
-    if (!user?.email || !user.id) {
+    if (!user?.email || !user.id || session?.session.impersonatedBy) {
       return null;
     }
     // SAFETY: the admin plugin augments the session user with an optional role string; allowlist known roles.
@@ -163,19 +170,25 @@ const asUserRow = (row: DbUser): AdminUserRow => ({
 });
 
 /** Probe for the admin UI: resolves instead of throwing, so the panel
- * works regardless of framework error mapping. */
+ * works regardless of framework error mapping. `controlFleet` tells the
+ * control app whether this install supervises the control fleet (false on the
+ * dev image, where `vite dev` serves the UI and there is no control celld). */
 export const adminOverview = action(
   async () => {
     const admin = await requireAdmin();
     if (!admin) {
-      return { email: "", isAdmin: false as const };
+      return { controlFleet: true, email: "", isAdmin: false as const };
     }
-    return { email: admin.email, isAdmin: true as const };
+    return {
+      controlFleet: await runnerControlFleet(),
+      email: admin.email,
+      isAdmin: true as const,
+    };
   },
   { error: AuthError }
 );
 
-/** Users per page of the god-mode list. */
+/** Users per page of the admin home's Users tab. */
 export const ADMIN_USERS_PAGE_SIZE = 25;
 
 const ListUsersArgs = Schema.Struct({

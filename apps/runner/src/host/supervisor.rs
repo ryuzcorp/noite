@@ -9,8 +9,8 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::db;
-use crate::host::{credentials, logs};
 use crate::host::logs::LogState;
+use crate::host::{credentials, logs};
 use crate::models::App;
 use sqlx::SqlitePool;
 
@@ -205,7 +205,10 @@ pub async fn ensure_fleet(
     .env("CELLD_DURABILITY", "bucket")
     // Inside the runner's stop budget, so celld seals its node log before
     // the runner's own SIGKILL fallback (SPEC, Shutdown).
-    .env("CELLD_SHUTDOWN_TOTAL_MS", cfg.fleet_shutdown_ms().to_string())
+    .env(
+        "CELLD_SHUTDOWN_TOTAL_MS",
+        cfg.fleet_shutdown_ms().to_string(),
+    )
     // Bounds: idle eviction returns memory when an app goes quiet; the
     // shedding threshold (set below only when configured) is container-wide.
     // celld's own logs are what an app owner reads when a deploy serves but
@@ -228,16 +231,16 @@ pub async fn ensure_fleet(
     // assets as the fleet uid crash-looped on EACCES, and tenants would share
     // one cache even when it opened.
     .env("CELLD_ASSET_CACHE_DIR", format!("{state_dir}/asset-cache"))
-    .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
+    .env("CELLD_TRUST_FORWARDED_HEADERS", "1");
     // Fleet telemetry -> Parquet in the fleet bucket (celld OTel, bucket
-    // sink), the documented query path for request counts. The flush is the
-    // docs' near-live value and the runner compacts the previous hour
-    // (`metrics::compact_fleet`) — a short flush without that job makes DuckDB
-    // read thousands of tiny files. Retention is one knob
-    // (RUNNER_TELEMETRY_RETENTION_DAYS) shared with the metric prune.
-    .env("CELLD_OTEL", "1")
-    .env("CELLD_OTEL_FLUSH_MS", cfg.otel_flush_ms.to_string())
-    .env("CELLD_OTEL_RETENTION", format!("{}d", cfg.telemetry_retention_days));
+    // sink), the documented query path for request counts. The flush / the
+    // runner's compaction of the previous hour (`metrics::compact_fleet`) and
+    // the retention knob (RUNNER_TELEMETRY_RETENTION_DAYS, shared with the
+    // metric prune) come from the same helper the control fleet uses, so the
+    // two sources cannot drift.
+    for (key, value) in crate::host::metrics::otel_env(cfg) {
+        cmd.env(key, value);
+    }
     if cfg.fleet_max_rss_mb > 0 {
         cmd.env("CELLD_MAX_RSS_MB", cfg.fleet_max_rss_mb.to_string());
     }

@@ -1,6 +1,6 @@
 # Security policy
 
-Noite is alpha software that people run on their own servers. Please read [Known limits](https://noite.now/self-hosting/known-limits) first: the isolation gaps listed there (shared build user, root bucket keys in fleets, unverified custom domains, no per-app memory cap) are known and tracked, and need no report.
+Noite is alpha software that people run on their own servers. Please read [Known limits](https://noite.now/self-hosting/known-limits) first: the isolation gaps listed there (root bucket keys in fleets, unverified custom domains, no per-app memory cap) are known and tracked, and need no report.
 
 ## Reporting a vulnerability
 

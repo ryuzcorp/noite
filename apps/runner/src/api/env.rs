@@ -20,10 +20,7 @@ pub(crate) fn name_valid(name: &str) -> bool {
             .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
 }
 
-pub async fn list_env(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+pub async fn list_env(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let app = match db::get_app(&state.pool, &id).await {
         Ok(Some(a)) => a,
         Ok(None) => return ApiError::not_found("app not found").into_response(),
@@ -60,9 +57,7 @@ pub async fn set_env(
         Err(e) => return ApiError::internal(e.to_string()).into_response(),
     };
     match db::set_env(&state.pool, &app.id, &name, &body.value).await {
-        Ok(()) => {
-            Json(serde_json::json!({ "ok": true, "name": name })).into_response()
-        }
+        Ok(()) => Json(serde_json::json!({ "ok": true, "name": name })).into_response(),
         Err(e) => ApiError::internal(e.to_string()).into_response(),
     }
 }
@@ -80,9 +75,7 @@ pub async fn delete_env(
         Err(e) => return ApiError::internal(e.to_string()).into_response(),
     };
     match db::delete_env(&state.pool, &app.id, &name).await {
-        Ok(()) => {
-            Json(serde_json::json!({ "ok": true })).into_response()
-        }
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => ApiError::internal(e.to_string()).into_response(),
     }
 }

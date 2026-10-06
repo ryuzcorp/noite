@@ -115,8 +115,14 @@ mod tests {
     fn parses_commands_with_caps_and_flush() {
         let old = "a".repeat(40);
         let new = "b".repeat(40);
-        let mut body = pkt(format!("{old} {new} refs/heads/main\0report-status side-band-64k\n").as_bytes());
-        body.extend_from_slice(&pkt(format!("{} {} refs/heads/other\n", "c".repeat(40), "d".repeat(40)).as_bytes()));
+        let mut body =
+            pkt(format!("{old} {new} refs/heads/main\0report-status side-band-64k\n").as_bytes());
+        body.extend_from_slice(&pkt(format!(
+            "{} {} refs/heads/other\n",
+            "c".repeat(40),
+            "d".repeat(40)
+        )
+        .as_bytes()));
         body.extend_from_slice(b"0000");
         body.extend_from_slice(b"PACKExtraBytesIgnored");
         let Ok(cmds) = parse_receive_commands(&body) else {
@@ -137,11 +143,25 @@ mod tests {
     #[test]
     fn policy_allows_push_ff_and_creates() {
         let cmds = vec![
-            PushCommand { old: "a".repeat(40), new: "b".repeat(40), refname: "refs/heads/main".into() },
-            PushCommand { old: "0".repeat(40), new: "b".repeat(40), refname: "refs/heads/feat".into() },
+            PushCommand {
+                old: "a".repeat(40),
+                new: "b".repeat(40),
+                refname: "refs/heads/main".into(),
+            },
+            PushCommand {
+                old: "0".repeat(40),
+                new: "b".repeat(40),
+                refname: "refs/heads/feat".into(),
+            },
         ];
-        assert!(matches!(check_push_policy("push", &cmds), PolicyDecision::Allow));
-        assert!(matches!(check_push_policy("admin", &cmds), PolicyDecision::Allow));
+        assert!(matches!(
+            check_push_policy("push", &cmds),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            check_push_policy("admin", &cmds),
+            PolicyDecision::Allow
+        ));
     }
 
     #[test]
@@ -155,21 +175,39 @@ mod tests {
             PolicyDecision::Deny(msg) => assert!(msg.contains("may not delete")),
             PolicyDecision::Allow => panic!("delete allowed for push"),
         }
-        assert!(matches!(check_push_policy("admin", &cmds), PolicyDecision::Allow));
+        assert!(matches!(
+            check_push_policy("admin", &cmds),
+            PolicyDecision::Allow
+        ));
     }
 
     #[test]
     fn policy_denies_non_push_roles() {
         let cmds = vec![];
-        assert!(matches!(check_push_policy("view", &cmds), PolicyDecision::Deny(_)));
+        assert!(matches!(
+            check_push_policy("view", &cmds),
+            PolicyDecision::Deny(_)
+        ));
     }
 
     #[test]
     fn ff_filter_skips_creates_and_deletes() {
         let cmds = vec![
-            PushCommand { old: "0".repeat(40), new: "b".repeat(40), refname: "refs/heads/new".into() },
-            PushCommand { old: "a".repeat(40), new: "b".repeat(40), refname: "refs/heads/main".into() },
-            PushCommand { old: "a".repeat(40), new: "0".repeat(40), refname: "refs/heads/gone".into() },
+            PushCommand {
+                old: "0".repeat(40),
+                new: "b".repeat(40),
+                refname: "refs/heads/new".into(),
+            },
+            PushCommand {
+                old: "a".repeat(40),
+                new: "b".repeat(40),
+                refname: "refs/heads/main".into(),
+            },
+            PushCommand {
+                old: "a".repeat(40),
+                new: "0".repeat(40),
+                refname: "refs/heads/gone".into(),
+            },
         ];
         let ff = updates_needing_ff(&cmds);
         assert_eq!(ff.len(), 1);

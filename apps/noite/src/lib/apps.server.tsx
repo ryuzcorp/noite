@@ -1,6 +1,7 @@
 /* eslint-disable func-names -- Effect.gen */
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { SqlClient } from "effect/sql/SqlClient";
 import { action, useEnv, useRequest } from "oxidejs";
 
 import { checkedSchema } from "./action-schema";
@@ -19,6 +20,7 @@ import {
   declinePendingInvite,
   dropAppCollaborators,
   grantCollaborator,
+  isInstanceAdmin,
   listCollaboratorRows,
   listInvitesForEmail,
   listPendingInvites,
@@ -28,7 +30,22 @@ import {
   revokePendingInvite,
   upsertPendingInvite,
 } from "./collaborators";
-import { ensureDbPromise, orm, withDb } from "./db";
+import type { AppRole } from "./collaborators";
+import {
+  CONTROL_APP_DATABASE_ID,
+  CONTROL_APP_ID,
+  CONTROL_APP_NAME,
+  isControlApp,
+} from "./control-app";
+import {
+  controlAccessRefusal,
+  controlRows,
+  controlSchema,
+  deleteControlRows,
+  listControlTables,
+  writeControlD1,
+} from "./control-d1.server";
+import { ensureDbPromise, orm, resolveD1, withDb } from "./db";
 import { listUnusedInvitesFor } from "./invites.server";
 import {
   runnerAddDomain,
@@ -50,7 +67,10 @@ import {
   runnerSetEnv,
   runnerDeleteEnv,
   runnerStorage,
-  runnerD1,
+  runnerD1DeleteRows,
+  runnerD1Rows,
+  runnerD1Schema,
+  runnerD1Tables,
   runnerD1Write,
   runnerDoInstances,
   runnerR2Get,
@@ -59,6 +79,12 @@ import {
   runnerGetError,
   runnerSetErrorStatus,
   runnerSetLimits,
+} from "./runner";
+import type {
+  D1DeleteRowsBody,
+  D1RowsQuery,
+  D1TableCaps,
+  D1WriteBody,
 } from "./runner";
 
 const CreateApp = Schema.Struct({
@@ -115,8 +141,41 @@ export const sessionUser = async (): Promise<SessionUser> => {
   if (!user) {
     throw new UnauthorizedError({ message: "Sign in required" });
   }
-  return { email: user.email, id: user.id, name: user.name };
+  // The admin plugin adds an optional impersonatedBy id to sessions it
+  // creates; presence means this session is impersonated.
+  const impersonatedBy = session?.session?.impersonatedBy;
+  return {
+    email: user.email,
+    id: user.id,
+    impersonatedBy: impersonatedBy ? String(impersonatedBy) : null,
+    name: user.name,
+  };
 };
+
+/** Mark the signed-in account as having completed the first-run onboarding.
+ * Idempotent: the `onboardedAt IS NULL` guard means a second call (a
+ * double-click, or the close handler racing Finish) writes nothing. Refused
+ * on an impersonated session — an admin touring as another user must not
+ * consume that user's one-time tour. */
+export const completeOnboarding = action(
+  async () => {
+    const user = await sessionUser();
+    if (user.impersonatedBy) {
+      failAction("Onboarding cannot be completed while impersonating");
+    }
+    await withDb(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient;
+        yield* sql.unsafe(
+          `UPDATE user SET onboardedAt = ? WHERE id = ? AND onboardedAt IS NULL`,
+          [new Date().toISOString(), user.id]
+        );
+      })
+    );
+    return { ok: true };
+  },
+  { error: AuthError }
+);
 
 export const create = action(
   checkedSchema(CreateApp, async ({ name, slug }) => {
@@ -313,6 +372,26 @@ export const get = action(
 const requireViewApp = async (appId: string): Promise<void> => {
   const user = await sessionUser();
   await requireAppRole(appId, user.id, "view");
+};
+
+/** Gate for every control-D1 action: a REAL instance admin (the `admin` role
+ * or the `NOITE_ADMIN_EMAIL` anchor) and never an impersonated session — an
+ * admin touring as another user must not read or write the auth database.
+ * Re-checked on every call, not only when the card renders. */
+const requireControlAdmin = async (): Promise<SessionUser> => {
+  const user = await sessionUser();
+  // Skip the admin lookup on an impersonated session: it is refused anyway.
+  const isAdmin =
+    user.impersonatedBy === null &&
+    (await isInstanceAdmin(user.id, user.email));
+  const refusal = controlAccessRefusal({
+    impersonatedBy: user.impersonatedBy,
+    isAdmin,
+  });
+  if (refusal !== null) {
+    failAction(refusal);
+  }
+  return user;
 };
 
 export const sourceTree = action(
@@ -616,10 +695,27 @@ const ErrorStatusArgs = Schema.Struct({
   status: ErrorStatusSchema,
 });
 
+/** Gate for one app's observability surfaces (read and triage alike). The
+ * reserved control app has no runner row and therefore no collaborator role,
+ * so it is gated on the same real-admin / never-impersonating rule as the
+ * control D1; every other app keeps its collaborator role. One function, so
+ * the two paths cannot drift. */
+const requireTelemetryRole = async (
+  appId: string,
+  need: "view" | "push"
+): Promise<void> => {
+  if (isControlApp(appId)) {
+    await requireControlAdmin();
+    return;
+  }
+  const user = await sessionUser();
+  await requireAppRole(appId, user.id, need);
+};
+
 /** One error with its recent occurrences (stack, request, trace logs). */
 export const errorDetail = action(
   checkedSchema(ErrorArgs, async ({ appId, fingerprint }) => {
-    await requireViewApp(appId);
+    await requireTelemetryRole(appId, "view");
     try {
       return await runnerGetError(appId, fingerprint);
     } catch (error) {
@@ -632,8 +728,7 @@ export const errorDetail = action(
 /** Resolve, ignore or reopen an error — anyone who can push can triage. */
 export const setErrorStatus = action(
   checkedSchema(ErrorStatusArgs, async ({ appId, fingerprint, status }) => {
-    const user = await sessionUser();
-    await requireAppRole(appId, user.id, "push");
+    await requireTelemetryRole(appId, "push");
     try {
       return await runnerSetErrorStatus(appId, fingerprint, status);
     } catch (error) {
@@ -646,9 +741,53 @@ export const setErrorStatus = action(
 // ---- Storage (view: browse · push: edit and delete) ----
 
 const StorageListArgs = Schema.Struct({ appId: Schema.String });
-const D1PreviewArgs = Schema.Struct({
+const D1TablesArgs = Schema.Struct({
   appId: Schema.String,
   databaseId: Schema.String,
+});
+const D1TableArgs = Schema.Struct({
+  appId: Schema.String,
+  databaseId: Schema.String,
+  table: Schema.String,
+});
+const D1KeySchema = Schema.Record(
+  Schema.String,
+  Schema.Union([Schema.String, Schema.Null])
+);
+const D1FilterSchema = Schema.Struct({
+  column: Schema.String,
+  op: Schema.Union([
+    Schema.Literal("eq"),
+    Schema.Literal("neq"),
+    Schema.Literal("lt"),
+    Schema.Literal("lte"),
+    Schema.Literal("gt"),
+    Schema.Literal("gte"),
+    Schema.Literal("like"),
+    Schema.Literal("is_null"),
+    Schema.Literal("not_null"),
+  ]),
+  value: Schema.String,
+});
+const D1SortSchema = Schema.Struct({
+  column: Schema.String,
+  desc: Schema.Boolean,
+});
+const D1RowsArgs = Schema.Struct({
+  appId: Schema.String,
+  databaseId: Schema.String,
+  filters: Schema.optional(Schema.Array(D1FilterSchema)),
+  page: Schema.Number,
+  pageSize: Schema.Number,
+  search: Schema.optional(Schema.String),
+  sort: Schema.optional(Schema.NullOr(D1SortSchema)),
+  table: Schema.String,
+});
+const D1DeleteRowsArgs = Schema.Struct({
+  appId: Schema.String,
+  databaseId: Schema.String,
+  keys: Schema.Array(D1KeySchema),
+  table: Schema.String,
 });
 const DoPreviewArgs = Schema.Struct({
   appId: Schema.String,
@@ -657,16 +796,39 @@ const DoPreviewArgs = Schema.Struct({
 const R2ListArgs = Schema.Struct({
   appId: Schema.String,
   bucket: Schema.String,
+  cursor: Schema.optional(Schema.NullOr(Schema.String)),
+  prefix: Schema.optional(Schema.String),
 });
 const R2GetArgs = Schema.Struct({
   appId: Schema.String,
   bucket: Schema.String,
   key: Schema.String,
 });
+const R2DeleteArgs = Schema.Struct({
+  appId: Schema.String,
+  bucket: Schema.String,
+  /** 1..100 keys, every one policy-checked before the single delete call. */
+  keys: Schema.Array(Schema.String),
+});
 
-/** D1 databases + DO classes declared by an app's deployed config. */
+/** D1 databases + DO classes declared by an app's deployed config.
+ * The reserved control app has exactly one resource: the control D1, which
+ * lives in THIS worker's binding, so it never reaches the runner. */
 export const listAppStorage = action(
   checkedSchema(StorageListArgs, async ({ appId }) => {
+    if (appId === CONTROL_APP_ID) {
+      await requireControlAdmin();
+      return [
+        {
+          appId: CONTROL_APP_ID,
+          appName: CONTROL_APP_NAME,
+          appSlug: CONTROL_APP_ID,
+          id: `d1:${CONTROL_APP_DATABASE_ID}`,
+          kind: "d1",
+          name: CONTROL_APP_DATABASE_ID,
+        },
+      ];
+    }
     await requireViewApp(appId);
     try {
       return await runnerStorage(appId);
@@ -677,12 +839,48 @@ export const listAppStorage = action(
   { error: AuthError }
 );
 
-/** Curated read-only D1 preview: tables + first rows. */
-export const d1Preview = action(
-  checkedSchema(D1PreviewArgs, async ({ appId, databaseId }) => {
-    await requireViewApp(appId);
+/** Gate one control-D1 call: real non-impersonating admin, and the reserved
+ * database only (the control app owns exactly one). */
+const requireControlDatabase = async (
+  databaseId: string
+): Promise<SessionUser> => {
+  const user = await requireControlAdmin();
+  if (databaseId !== CONTROL_APP_DATABASE_ID) {
+    failAction(`Unknown control database ${databaseId}`);
+  }
+  return user;
+};
+
+/** Tenant caps from the caller's collaborator role: any write role (push or
+ * admin) gets all three; a viewer none. The control branch computes its own
+ * per-table policy. */
+const capsForRole = (role: AppRole): D1TableCaps =>
+  role === "view"
+    ? { delete: false, insert: false, update: false }
+    : { delete: true, insert: true, update: true };
+
+/** Tables + row counts of an app D1 database (view role). The control
+ * database is read IN-PROCESS from the worker's own binding (never via the
+ * runner, never via `celld d1 execute` — see SPEC). */
+export const d1Tables = action(
+  checkedSchema(D1TablesArgs, async ({ appId, databaseId }) => {
+    if (appId === CONTROL_APP_ID) {
+      await requireControlDatabase(databaseId);
+      try {
+        return await listControlTables(resolveD1());
+      } catch (error) {
+        failUnknown(error);
+      }
+    }
+    const user = await sessionUser();
+    const { role } = await requireAppRole(appId, user.id, "view");
     try {
-      return await runnerD1(appId, databaseId);
+      const listed = await runnerD1Tables(appId, databaseId);
+      const caps = capsForRole(role);
+      return {
+        databaseId: listed.databaseId,
+        tables: listed.tables.map((table) => ({ ...table, caps })),
+      };
     } catch (error) {
       failUnknown(error);
     }
@@ -690,12 +888,81 @@ export const d1Preview = action(
   { error: AuthError }
 );
 
+/** One table's schema with its caps: the tenant role decides there, the
+ * control D1 policy decides for the reserved database. */
+export const d1Schema = action(
+  checkedSchema(D1TableArgs, async ({ appId, databaseId, table }) => {
+    if (appId === CONTROL_APP_ID) {
+      await requireControlDatabase(databaseId);
+      try {
+        return await controlSchema(resolveD1(), table);
+      } catch (error) {
+        failUnknown(error);
+      }
+    }
+    const user = await sessionUser();
+    const { role } = await requireAppRole(appId, user.id, "view");
+    try {
+      const schema = await runnerD1Schema(appId, databaseId, table);
+      return {
+        ...schema,
+        caps: capsForRole(role),
+        locked: {},
+        redacted: [],
+        rowAction: null,
+      };
+    } catch (error) {
+      failUnknown(error);
+    }
+  }),
+  { error: AuthError }
+);
+
+/** One server-side page of rows (view role). */
+export const d1Rows = action(
+  checkedSchema(
+    D1RowsArgs,
+    async ({
+      appId,
+      databaseId,
+      filters,
+      page,
+      pageSize,
+      search,
+      sort,
+      table,
+    }) => {
+      const query: D1RowsQuery = {
+        filters: filters === undefined ? [] : [...filters],
+        page,
+        pageSize,
+        search: search ?? "",
+        sort: sort ?? null,
+        table,
+      };
+      if (appId === CONTROL_APP_ID) {
+        await requireControlDatabase(databaseId);
+        try {
+          return await controlRows(resolveD1(), query);
+        } catch (error) {
+          failUnknown(error);
+        }
+      }
+      await requireViewApp(appId);
+      try {
+        return await runnerD1Rows(appId, databaseId, query);
+      } catch (error) {
+        failUnknown(error);
+      }
+    }
+  ),
+  { error: AuthError }
+);
+
 const D1WriteArgs = Schema.Struct({
   appId: Schema.String,
   databaseId: Schema.String,
-  key: Schema.optional(
-    Schema.Record(Schema.String, Schema.Union([Schema.String, Schema.Null]))
-  ),
+  key: Schema.optional(D1KeySchema),
   op: Schema.Union([
     Schema.Literal("insert"),
     Schema.Literal("update"),
@@ -708,20 +975,66 @@ const D1WriteArgs = Schema.Struct({
   ),
 });
 
-/** Curated tenant-DB write (push-gated): single INSERT or UPDATE. */
+/** Curated tenant-DB write (push-gated): single INSERT, UPDATE or DELETE.
+ * The control database is written IN-PROCESS under the policy in
+ * lib/control-d1.server.ts (admin only, redacted and locked columns refused).
+ * `null` binds SQL NULL, "" an empty string; an omitted insert column takes
+ * its DDL default. */
 export const d1Write = action(
   checkedSchema(
     D1WriteArgs,
     async ({ appId, databaseId, key, op, table, values }) => {
+      const body: D1WriteBody = { key, op, table, values };
+      if (appId === CONTROL_APP_ID) {
+        const user = await requireControlDatabase(databaseId);
+        try {
+          await writeControlD1(resolveD1(), {
+            actorId: user.id,
+            key,
+            op,
+            table,
+            values,
+          });
+          return { ok: true };
+        } catch (error) {
+          failUnknown(error);
+        }
+      }
       const user = await sessionUser();
       await requireAppRole(appId, user.id, "push");
       try {
-        return await runnerD1Write(appId, databaseId, {
-          key,
-          op,
-          table,
-          values,
-        });
+        return await runnerD1Write(appId, databaseId, body);
+      } catch (error) {
+        failUnknown(error);
+      }
+    }
+  ),
+  { error: AuthError }
+);
+
+/** Delete 1..100 rows by key (push-gated): one atomic batch where the backend
+ * allows it, every key policy-checked before anything runs. */
+export const d1DeleteRows = action(
+  checkedSchema(
+    D1DeleteRowsArgs,
+    async ({ appId, databaseId, keys, table }) => {
+      const body: D1DeleteRowsBody = { keys: [...keys], table };
+      if (appId === CONTROL_APP_ID) {
+        const user = await requireControlDatabase(databaseId);
+        try {
+          return await deleteControlRows(resolveD1(), {
+            actorId: user.id,
+            keys: [...keys],
+            table,
+          });
+        } catch (error) {
+          failUnknown(error);
+        }
+      }
+      const user = await sessionUser();
+      await requireAppRole(appId, user.id, "push");
+      try {
+        return await runnerD1DeleteRows(appId, databaseId, body);
       } catch (error) {
         failUnknown(error);
       }
@@ -743,12 +1056,12 @@ export const doPreview = action(
   { error: AuthError }
 );
 
-/** Read-only R2 key listing for one bucket. */
+/** One page of an R2 bucket folder (view role). */
 export const r2List = action(
-  checkedSchema(R2ListArgs, async ({ appId, bucket }) => {
+  checkedSchema(R2ListArgs, async ({ appId, bucket, prefix, cursor }) => {
     await requireViewApp(appId);
     try {
-      return await runnerR2List(appId, bucket);
+      return await runnerR2List(appId, bucket, prefix ?? "", cursor ?? null);
     } catch (error) {
       failUnknown(error);
     }
@@ -769,14 +1082,16 @@ export const r2Get = action(
   { error: AuthError }
 );
 
-/** Delete one R2 object by key (push role — a write). */
+/** Delete 1..100 R2 objects in one call (push role — a write). */
 export const r2Delete = action(
-  checkedSchema(R2GetArgs, async ({ appId, bucket, key }) => {
+  checkedSchema(R2DeleteArgs, async ({ appId, bucket, keys }) => {
+    if (keys.length === 0 || keys.length > 100) {
+      throw new ActionError({ message: "select 1 to 100 objects" });
+    }
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "push");
     try {
-      await runnerR2Delete(appId, bucket, key);
-      return { ok: true as const };
+      return await runnerR2Delete(appId, bucket, [...keys]);
     } catch (error) {
       failUnknown(error);
     }

@@ -6,12 +6,15 @@
 //! Tenant fleets keep their own supervision (`host::supervisor`, driven by
 //! the reconcile loop); these two are not apps and have no desired state.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Notify;
+
+use crate::host::logs::{self, LogState};
 
 /// Restart backoff bounds; a child that ran this long counts as healthy and
 /// resets the backoff.
@@ -36,10 +39,29 @@ impl Supervised {
     where
         F: Fn() -> Command + Send + Sync + 'static,
     {
+        Self::start_observed(name, None, None, make)
+    }
+
+    /// Start with the running pid mirrored into `pid` and, when `capture` is
+    /// set, the child's stdout+stderr appended to the shared log buffer under
+    /// that slug (the caller must pipe both). Both exist for the control
+    /// fleet: the metrics ingest samples its CPU like a tenant fleet's, and
+    /// its node log is what an operator reads next to the worker's OTel logs.
+    /// The pid slot is shared (not created here) so the caller can hand it to
+    /// the reconcile loop before this child exists.
+    pub fn start_observed<F>(
+        name: &'static str,
+        pid: Option<Arc<AtomicU32>>,
+        capture: Option<(LogState, String)>,
+        make: F,
+    ) -> Self
+    where
+        F: Fn() -> Command + Send + Sync + 'static,
+    {
         let sup = Self {
             name,
             stop: Arc::new(AtomicBool::new(false)),
-            pid: Arc::new(AtomicU32::new(0)),
+            pid: pid.unwrap_or_else(|| Arc::new(AtomicU32::new(0))),
             done: Arc::new(Notify::new()),
             finished: Arc::new(AtomicBool::new(false)),
         };
@@ -54,6 +76,9 @@ impl Supervised {
                     Ok(mut child) => {
                         task.pid.store(child.id().unwrap_or(0), Ordering::Relaxed);
                         tracing::info!(child = task.name, "started");
+                        if let Some((state, slug)) = &capture {
+                            capture_output(&mut child, state, slug);
+                        }
                         let status = child.wait().await;
                         task.pid.store(0, Ordering::Relaxed);
                         if task.stop.load(Ordering::Relaxed) {
@@ -105,6 +130,34 @@ impl Supervised {
         }
         tracing::info!(child = self.name, "stopped");
     }
+}
+
+/// Pipe a supervised child's stdout+stderr into the shared per-slug log
+/// buffer. The caller must have set both to piped stdio; a poll cadence of one
+/// reader task per pipe matches `supervisor::ensure_fleet` for tenant fleets.
+/// Readers are per spawn: a restarted child gets fresh pipes and fresh tasks.
+fn capture_output(child: &mut tokio::process::Child, state: &LogState, slug: &str) {
+    if let Some(stdout) = child.stdout.take() {
+        capture_lines(stdout, state, slug);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        capture_lines(stderr, state, slug);
+    }
+}
+
+/// One reader task: every line of one piped stream into the shared buffer.
+fn capture_lines<R>(pipe: R, state: &LogState, slug: &str)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let state = state.clone();
+    let slug = slug.to_string();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(pipe).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            logs::append(&state, &slug, line).await;
+        }
+    });
 }
 
 fn signal(pid: u32, sig: libc::c_int) {

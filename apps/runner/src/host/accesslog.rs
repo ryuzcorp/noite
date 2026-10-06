@@ -129,11 +129,7 @@ pub fn device_classify(ua: &str) -> (&'static str, &'static str) {
 fn hour_bucket(ts_secs: i64) -> String {
     DateTime::<Utc>::from_timestamp(ts_secs, 0)
         .map(|d| d.format("%Y-%m-%dT%H:00:00Z").to_string())
-        .unwrap_or_else(|| {
-            Utc::now()
-                .format("%Y-%m-%dT%H:00:00Z")
-                .to_string()
-        })
+        .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H:00:00Z").to_string())
 }
 
 /// Request path with the query string stripped. Over-long paths (scan
@@ -226,13 +222,43 @@ struct Line {
     trace: Option<(String, RequestCtx)>,
 }
 
+/// True when a request's Host belongs to the control UI itself: the
+/// `CONTROL_SUBDOMAIN` on any base domain, or a `CONTROL_EXTRA_HOSTS` entry.
+/// `parse_edge_slug` already refuses these to keep them out of the tenant
+/// space; the access-log tail uses this to attribute the control plane's own
+/// traffic (its polling and SSE) to the reserved control key instead.
+fn is_control_host(host: &str, control_hosts: &[String]) -> bool {
+    let bare = host
+        .split_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host)
+        .trim()
+        .to_lowercase();
+    if bare.is_empty() {
+        return false;
+    }
+    control_hosts
+        .iter()
+        .any(|candidate| candidate.trim().to_lowercase() == bare)
+}
+
 fn parse_line(line: &str, cfg: &Config, slug_id: &HashMap<String, String>) -> Option<Line> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let host = v
         .pointer("/request/host")
         .and_then(|x| x.as_str())
         .unwrap_or("");
-    let slug = parse_edge_slug(host, &cfg.tenant_bases(), &cfg.control_subdomain)?;
+    let slug = match parse_edge_slug(host, &cfg.tenant_bases(), &cfg.control_subdomain) {
+        Some(slug) => slug,
+        // The control UI's own requests — its polling and SSE — are real load
+        // on the control node, so they land on the reserved control key the
+        // metrics ingest also uses. `api.`/`git.` hosts stay out (the runner's
+        // own edge is not a dashboard).
+        None if is_control_host(host, &cfg.control_hosts()) => {
+            crate::host::control::SLUG.to_string()
+        }
+        None => return None,
+    };
     let app_id = slug_id.get(&slug)?.clone();
     let ua = first_header(&v, "User-Agent");
     let uri = v
@@ -258,10 +284,19 @@ fn parse_line(line: &str, cfg: &Config, slug_id: &HashMap<String, String>) -> Op
                 .chars()
                 .take(16)
                 .collect();
-            let status = v.pointer("/status").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let status = v
+                .pointer("/status")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
             (
                 t.to_string(),
-                RequestCtx { method, path: path.to_string(), status, browser, os },
+                RequestCtx {
+                    method,
+                    path: path.to_string(),
+                    status,
+                    browser,
+                    os,
+                },
             )
         });
     Some(Line {
@@ -291,10 +326,7 @@ fn first_header<'a>(v: &'a serde_json::Value, name: &str) -> &'a str {
 fn read_offset(path: &std::path::Path) -> (u64, u64) {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let (ino, off) = text.trim().split_once(':').unwrap_or(("", ""));
-    (
-        ino.parse().unwrap_or(0),
-        off.parse().unwrap_or(0),
-    )
+    (ino.parse().unwrap_or(0), off.parse().unwrap_or(0))
 }
 
 /// Consume new access-log lines into device stats. Never fails the tick:
@@ -349,7 +381,11 @@ pub async fn tick(
     off += consumed as u64;
     let _ = std::fs::write(offset_path(cfg), format!("{}:{off}", meta.ino()));
     // Bound growth: truncate only when nothing was appended mid-tick.
-    if len > TRUNCATE_BYTES && std::fs::metadata(&path).map(|m| m.len() == len).unwrap_or(false) {
+    if len > TRUNCATE_BYTES
+        && std::fs::metadata(&path)
+            .map(|m| m.len() == len)
+            .unwrap_or(false)
+    {
         // File::create truncates in place: the inode survives, so the
         // saved offset resets to zero under the same inode.
         std::fs::File::create(&path)?;
@@ -363,6 +399,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recognizes_the_control_hosts() {
+        let hosts = vec![
+            "app.localhost".to_string(),
+            "app.example.com".to_string(),
+            "noite.local".to_string(),
+        ];
+        assert!(is_control_host("app.localhost", &hosts));
+        assert!(is_control_host("APP.Example.com:443", &hosts));
+        assert!(is_control_host("noite.local", &hosts));
+        // Tenant and platform hosts are not the control UI.
+        assert!(!is_control_host("blog.localhost", &hosts));
+        assert!(!is_control_host("api.localhost", &hosts));
+        assert!(!is_control_host("git.localhost", &hosts));
+        assert!(!is_control_host("", &hosts));
+        assert!(!is_control_host("notapp.localhost", &hosts));
+    }
+
+    #[test]
     fn classifies_desktop_browsers() {
         assert_eq!(
             device_classify("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
@@ -373,7 +427,9 @@ mod tests {
             ("Safari", "macOS")
         );
         assert_eq!(
-            device_classify("Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0"),
+            device_classify(
+                "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0"
+            ),
             ("Firefox", "Linux")
         );
         assert_eq!(
@@ -405,7 +461,9 @@ mod tests {
     #[test]
     fn classifies_bots_cli_unknown_and_other() {
         assert_eq!(
-            device_classify("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"),
+            device_classify(
+                "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+            ),
             ("Bot", "")
         );
         assert_eq!(device_classify("curl/8.18.0"), ("CLI", ""));

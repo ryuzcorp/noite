@@ -1,13 +1,15 @@
 //! Per-uid egress policy (SPEC, Egress policy).
 //!
-//! Fleets run as `fleet` (uid 10020) and builds as `build` (uid 10010) via
-//! `Command::uid`. The runner installs, at boot, an nftables table that
-//! applies to *new* connections from those uids only: no loopback
-//! (fleet→fleet, fleet→operator APIs, the runner, Caddy's admin), no
-//! RFC1918/link-local/CG NAT (RustFS, peers, cloud metadata), IPv6
+//! Fleets run as `fleet` (uid 10020) and each app's builds/release commands as
+//! its own uid from the reserved per-app range (`db::ensure_app_build_uid`,
+//! `config::BUILD_UID_BASE`) via `Command::uid`. The runner installs, at boot,
+//! an nftables table that applies to *new* connections from those uids only:
+//! no loopback (fleet→fleet, fleet→operator APIs, the runner, Caddy's admin),
+//! no RFC1918/link-local/CG NAT (RustFS, peers, cloud metadata), IPv6
 //! loopback/ULA/link-local closed, DNS (53) allowed, everything else
-//! (internet) accepted. Replies on connections others opened (Caddy → a
-//! fleet, the host's published ports) always pass.
+//! (internet) accepted. The build range is one `skuid lo-hi` match per rule,
+//! so an app allocated any uid in the range is policed. Replies on connections
+//! others opened (Caddy → a fleet, the host's published ports) always pass.
 //!
 //! Requires `CAP_NET_ADMIN`. The runner probes at boot (`nft list tables`)
 //! and exposes the result in `/ready` detail and `make doctor`. Where no
@@ -15,8 +17,8 @@
 //! is documented but not implemented until Railway lacks NET_ADMIN).
 
 use std::net::IpAddr;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 static NFT_OK: AtomicBool = AtomicBool::new(false);
@@ -65,7 +67,7 @@ pub fn skip(why: &str) {
 /// Keep the storage allowance current: the bundled store's container address
 /// can change when it restarts, and a stale rule would cut every fleet off
 /// from its bucket. Re-resolves every 30 s and re-applies on change.
-pub fn spawn_storage_refresh(build_uid: u32, fleet_uid: u32, endpoint: String) {
+pub fn spawn_storage_refresh(build: Option<(u32, u32)>, fleet_uid: u32, endpoint: String) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -79,7 +81,7 @@ pub fn spawn_storage_refresh(build_uid: u32, fleet_uid: u32, endpoint: String) {
                 .unwrap_or(false);
             if changed {
                 tracing::info!(addrs = ?storage.addrs, "object store moved; re-applying egress policy");
-                ensure(build_uid, fleet_uid, &storage).await;
+                ensure(build, fleet_uid, &storage).await;
             }
         }
     });
@@ -95,8 +97,28 @@ pub fn status() -> (bool, String) {
     (ok, detail)
 }
 
-/// The nftables ruleset for the build and fleet uids.
-fn ruleset(build_uid: u32, fleet_uid: u32, storage: &Storage) -> String {
+/// The nftables `skuid` match for the per-app build range: nft takes a
+/// `lo-hi` range, so a whole range is one rule instead of one rule per app.
+/// `None` (uid drops disabled) emits nothing.
+fn build_skuid(build: Option<(u32, u32)>) -> Option<String> {
+    let (base, range) = build?;
+    Some(if range <= 1 {
+        base.to_string()
+    } else {
+        format!("{base}-{}", base.saturating_add(range - 1))
+    })
+}
+
+/// Every sandboxed identity the policy keys on: the fleet uid, then the
+/// per-app build range as one `lo-hi` match.
+fn sandbox_identities(build: Option<(u32, u32)>, fleet_uid: u32) -> Vec<String> {
+    let mut ids = vec![fleet_uid.to_string()];
+    ids.extend(build_skuid(build));
+    ids
+}
+
+/// The nftables ruleset for the build range and fleet uid.
+fn ruleset(build: Option<(u32, u32)>, fleet_uid: u32, storage: &Storage) -> String {
     // Order matters: the first matching rule wins. Replies go first (see
     // below), then DNS, which must be accepted
     // before the private/loopback rejects, because the container resolver
@@ -121,17 +143,26 @@ fn ruleset(build_uid: u32, fleet_uid: u32, storage: &Storage) -> String {
     // (output hook, priority -100) runs before this chain, so a plain
     // `dport 53` never matched and the loopback reject below refused every
     // lookup (`bun install` failed with ConnectionRefused on Docker only).
-    for uid in [fleet_uid, build_uid] {
+    //
+    // The build range is one rule: every app's uid shares the policy.
+    let identities = sandbox_identities(build, fleet_uid);
+    for id in &identities {
         rules.push(format!(
-            "    meta skuid {uid} meta l4proto {{ tcp, udp }} ct original proto-dst 53 accept"
+            "    meta skuid {id} meta l4proto {{ tcp, udp }} ct original proto-dst 53 accept"
         ));
     }
     // The fleet's own celld needs the object store, which in Compose sits on a
     // private address (rustfs:9000): allow exactly those addresses and port,
-    // ahead of the private-range rejects.
+    // ahead of the private-range rejects. Builds are deliberately not allowed
+    // the store (only the runner and celld hold keys).
     let (v4, v6): (Vec<IpAddr>, Vec<IpAddr>) =
         storage.addrs.iter().copied().partition(IpAddr::is_ipv4);
-    let join = |ips: &[IpAddr]| ips.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+    let join = |ips: &[IpAddr]| {
+        ips.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     if !v4.is_empty() {
         rules.push(format!(
             "    meta skuid {fleet_uid} ip daddr {{ {} }} tcp dport {} accept",
@@ -148,14 +179,14 @@ fn ruleset(build_uid: u32, fleet_uid: u32, storage: &Storage) -> String {
     }
     // No new connection to loopback, any protocol: that is where the operator
     // APIs, the runner, Caddy's admin and every other fleet listen.
-    for uid in [fleet_uid, build_uid] {
-        rules.push(format!("    meta skuid {uid} ip daddr 127.0.0.0/8 reject"));
-        rules.push(format!("    meta skuid {uid} ip6 daddr ::1 reject"));
+    for id in &identities {
+        rules.push(format!("    meta skuid {id} ip daddr 127.0.0.0/8 reject"));
+        rules.push(format!("    meta skuid {id} ip6 daddr ::1 reject"));
         rules.push(format!(
-            "    meta skuid {uid} ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 }} reject"
+            "    meta skuid {id} ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 }} reject"
         ));
         rules.push(format!(
-            "    meta skuid {uid} ip6 daddr {{ fc00::/7, fe80::/10 }} reject"
+            "    meta skuid {id} ip6 daddr {{ fc00::/7, fe80::/10 }} reject"
         ));
     }
     format!(
@@ -171,11 +202,10 @@ table inet noite {{
     )
 }
 
-
 /// Install the table (idempotent: the ruleset replaces it atomically). Best-effort: records the
 /// reason and returns false when `nft` is missing or CAP_NET_ADMIN is absent.
-pub async fn ensure(build_uid: u32, fleet_uid: u32, storage: &Storage) -> bool {
-    let rules = ruleset(build_uid, fleet_uid, storage);
+pub async fn ensure(build: Option<(u32, u32)>, fleet_uid: u32, storage: &Storage) -> bool {
+    let rules = ruleset(build, fleet_uid, storage);
     // Probe first: missing binary or capability surfaces here.
     match nft_run(&["list", "tables"], None).await {
         Ok(()) => {}
@@ -193,7 +223,7 @@ pub async fn ensure(build_uid: u32, fleet_uid: u32, storage: &Storage) -> bool {
             if let Ok(mut applied) = APPLIED_STORAGE.lock() {
                 applied.clone_from(&storage.addrs);
             }
-            tracing::info!(build_uid, fleet_uid, "nft egress policy installed");
+            tracing::info!(build_range = ?build, fleet_uid, "nft egress policy installed");
             true
         }
         Err(e) => {
@@ -222,7 +252,9 @@ async fn nft_run(args: &[&str], stdin_text: Option<&str>) -> Result<(), String> 
     if let Some(text) = stdin_text {
         use tokio::io::AsyncWriteExt;
         if let Some(mut pipe) = child.stdin.take() {
-            pipe.write_all(text.as_bytes()).await.map_err(|_| "nft stdin write failed".to_string())?;
+            pipe.write_all(text.as_bytes())
+                .await
+                .map_err(|_| "nft stdin write failed".to_string())?;
         }
     }
     match tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await {
@@ -237,15 +269,17 @@ async fn nft_run(args: &[&str], stdin_text: Option<&str>) -> Result<(), String> 
 mod tests {
     use super::{ruleset, Storage};
 
+    const BUILD: Option<(u32, u32)> = Some((10030, 1024));
+
     #[test]
     fn dns_is_accepted_before_any_private_or_loopback_reject() {
         let storage = Storage {
             addrs: vec!["10.89.0.7".parse().unwrap()],
             port: 9000,
         };
-        let rules = ruleset(10010, 10020, &storage);
+        let rules = ruleset(BUILD, 10020, &storage);
         let first_reject = rules.find(" reject").expect("has rejects");
-        for uid in [10010, 10020] {
+        for uid in ["10020", "10030-11053"] {
             // Pre-NAT port: Docker DNATs its resolver off port 53.
             let accept = rules
                 .find(&format!(
@@ -258,11 +292,71 @@ mod tests {
         let store = rules
             .find("meta skuid 10020 ip daddr { 10.89.0.7 } tcp dport 9000 accept")
             .expect("storage allowance");
-        assert!(store < first_reject, "storage must be allowed before the rejects");
+        assert!(
+            store < first_reject,
+            "storage must be allowed before the rejects"
+        );
         // Replies to inbound connections pass before anything is rejected.
-        let replies = rules.find("ct state established,related accept").expect("reply rule");
-        assert!(replies < first_reject, "established/related must come first");
+        let replies = rules
+            .find("ct state established,related accept")
+            .expect("reply rule");
+        assert!(
+            replies < first_reject,
+            "established/related must come first"
+        );
         // Atomic replace: the file recreates the table in one transaction.
         assert!(rules.starts_with("table inet noite\ndelete table inet noite\n"));
+    }
+
+    /// The whole per-app build range is covered by one `skuid lo-hi` rule for
+    /// every reject class: a build for any app is closed off, not just the
+    /// first uid (or the old single shared build uid).
+    #[test]
+    fn build_uid_range_is_closed_off_in_every_rule() {
+        let storage = Storage::default();
+        let rules = ruleset(BUILD, 10020, &storage);
+        let range = "10030-11053";
+        for prefix in [
+            format!("meta skuid {range} ip daddr 127.0.0.0/8 reject"),
+            format!("meta skuid {range} ip6 daddr ::1 reject"),
+            format!(
+                "meta skuid {range} ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 }} reject"
+            ),
+            format!("meta skuid {range} ip6 daddr {{ fc00::/7, fe80::/10 }} reject"),
+        ] {
+            assert!(rules.contains(&prefix), "missing: {prefix}");
+        }
+        // The old single uid must not appear anywhere: it is no longer used.
+        assert!(
+            !rules.contains("10010"),
+            "stale shared build uid in ruleset"
+        );
+        assert!(
+            !rules.contains("skuid 10030 ip daddr"),
+            "range not used for rejects"
+        );
+    }
+
+    /// A one-uid range degrades to a single match (and no `lo-hi`).
+    #[test]
+    fn single_uid_range_emits_a_plain_match() {
+        let rules = ruleset(Some((10030, 1)), 10020, &Storage::default());
+        assert!(rules.contains("meta skuid 10030 ip daddr 127.0.0.0/8 reject"));
+        assert!(
+            !rules.contains("10030-"),
+            "a one-uid range must not be a lo-hi"
+        );
+    }
+
+    /// No build uids (dev/single): only the fleet is keyed on, and the table
+    /// still installs.
+    #[test]
+    fn without_build_uids_only_the_fleet_is_policed() {
+        let rules = ruleset(None, 10020, &Storage::default());
+        assert!(rules.contains("meta skuid 10020 ip daddr 127.0.0.0/8 reject"));
+        assert!(
+            !rules.contains("meta skuid 10030"),
+            "no build uid configured"
+        );
     }
 }

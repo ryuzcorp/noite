@@ -7,7 +7,7 @@
 #   ├── caddy             edge: TLS, routing (admin 127.0.0.1:2019)
 #   ├── celld             control UI, fleet #0 (127.0.0.1:8090)
 #   ├── celld × N         tenant fleets (uid 10020)
-#   └── bun / node / sh   tenant builds and release commands (uid 10010)
+#   └── bun / node / sh   tenant builds and release commands (uid 10030+, one per app)
 #
 # Targets:
 #   noite (default)  the published image
@@ -118,10 +118,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && jup --version \
   && JUP_HOME=/tmp/jup-home jup enable --install-directory /usr/local/bin npm pnpm yarn \
   && rm -rf /tmp/jup-home
-# Sandbox users (SPEC, Tenant isolation): builds and release commands run as `build`,
-# tenant fleets as `fleet`; the nft policy keys on these uids.
-RUN useradd -u 10010 -m -s /bin/sh build \
-  && useradd -u 10020 -m -s /bin/sh fleet \
+# Sandbox users (SPEC, Tenant isolation): tenant fleets run as `fleet`; each
+# app's builds and release commands run as their own uid from the reserved
+# per-app range (RUNNER_BUILD_UID_BASE=10030, RUNNER_BUILD_UID_RANGE=1024 in
+# apps/runner/src/config.rs), which the nft policy closes off as one range.
+# The runner assigns those uids numerically — setuid/setgid needs no passwd
+# entry — but the range is pre-created here because Node's os.userInfo()
+# throws for a uid with no /etc/passwd entry, which would break npm/pnpm/Yarn
+# and any Node-based tenant step. Keep the range in step with config.rs.
+RUN useradd -u 10020 -m -s /bin/sh fleet \
+  && for uid in $(seq 10030 11053); do \
+       echo "noite-build-${uid}:x:${uid}:${uid}::/data/runner:/bin/sh" >> /etc/passwd; \
+       echo "noite-build-${uid}:x:${uid}:" >> /etc/group; \
+     done \
   && mkdir -p /data /opt/noite/control
 COPY --from=celld /usr/local/bin/celld /usr/local/bin/celld
 COPY --from=caddy-build /out/caddy /usr/local/bin/caddy

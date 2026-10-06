@@ -1,13 +1,15 @@
 use std::collections::HashSet;
 
 use anyhow::Context;
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 use sqlx::sqlite::SqliteConnection;
+use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 
-use crate::schema_version;
 use crate::models::{
-    now_iso, new_id, App, AppDeviceStat, AppDomain, AppLimit, AppEnv, AppEvent, AppInsight, AppMetric, AppPathStat, AppRefStat, AppSpanStat, AppStatus, AppUserProps, Deploy, DeployStatus, ErrorEvent, ErrorIssue,
+    new_id, now_iso, App, AppDeviceStat, AppDomain, AppEnv, AppEvent, AppInsight, AppLimit,
+    AppMetric, AppPathStat, AppRefStat, AppSpanStat, AppStatus, AppUserProps, Deploy, DeployStatus,
+    ErrorEvent, ErrorIssue,
 };
+use crate::schema_version;
 
 const APP_COLS: &str = r#"id, slug, name, user_id, status, subdomain, git_prefix, fleet_bucket,
                   listen_port, internal_port, last_deploy_sha, last_error, desired_state,
@@ -246,7 +248,10 @@ fn attach_metrics_statements(metrics_path: &str) -> Vec<String> {
 /// the volume tar). One copy per run: the caller removes the previous one.
 pub fn snapshot_path(cfg: &crate::config::Config) -> std::path::PathBuf {
     let live = local_db_path(cfg).unwrap_or_else(|| std::path::PathBuf::from("/data/noite.sqlite"));
-    let dir = live.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+    let dir = live
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
     dir.join("noite-snapshot.sqlite")
 }
 
@@ -320,11 +325,10 @@ pub async fn get_app_by_domain(pool: &SqlitePool, hostname: &str) -> sqlx::Resul
 /// The app that already owns a hostname, if any (hostname is the primary key,
 /// so this is the collision check the API runs before inserting).
 pub async fn domain_owner(pool: &SqlitePool, hostname: &str) -> sqlx::Result<Option<String>> {
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT app_id FROM app_domain WHERE hostname = ?")
-            .bind(hostname)
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT app_id FROM app_domain WHERE hostname = ?")
+        .bind(hostname)
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(|(id,)| id).next())
 }
 
@@ -374,11 +378,7 @@ pub async fn set_app_limit(pool: &SqlitePool, limit: &AppLimit) -> sqlx::Result<
     Ok(())
 }
 
-pub async fn add_domain(
-    pool: &SqlitePool,
-    app_id: &str,
-    hostname: &str,
-) -> sqlx::Result<()> {
+pub async fn add_domain(pool: &SqlitePool, app_id: &str, hostname: &str) -> sqlx::Result<()> {
     sqlx::query("INSERT INTO app_domain (app_id, hostname, created_at) VALUES (?, ?, ?)")
         .bind(app_id)
         .bind(hostname)
@@ -388,11 +388,7 @@ pub async fn add_domain(
         .map(|_| ())
 }
 
-pub async fn remove_domain(
-    pool: &SqlitePool,
-    app_id: &str,
-    hostname: &str,
-) -> sqlx::Result<u64> {
+pub async fn remove_domain(pool: &SqlitePool, app_id: &str, hostname: &str) -> sqlx::Result<u64> {
     let res = sqlx::query("DELETE FROM app_domain WHERE app_id = ? AND hostname = ?")
         .bind(app_id)
         .bind(hostname)
@@ -404,11 +400,10 @@ pub async fn remove_domain(
 /// Apps a given owner already has. The per-account quota is enforced here so
 /// an API key cannot slip past the UI's check.
 pub async fn count_apps_for_user(pool: &SqlitePool, user_id: &str) -> sqlx::Result<i64> {
-    let rows: Vec<(i64,)> =
-        sqlx::query_as("SELECT count(*) FROM app WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(i64,)> = sqlx::query_as("SELECT count(*) FROM app WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(|(n,)| n).next().unwrap_or(0))
 }
 
@@ -453,6 +448,77 @@ pub async fn create_app(
     get_app(pool, &id).await.map(|a| a.expect("just inserted"))
 }
 
+/// Lowest free uid in `[base, base + range)`, given every uid SQLite already
+/// holds (NULL rows are absent). `None` when the range is exhausted: callers
+/// fail the build rather than reusing a live app's uid.
+pub fn pick_build_uid(base: u32, range: u32, used: &[i64]) -> Option<u32> {
+    let used: std::collections::HashSet<i64> = used.iter().copied().collect();
+    (base..base.saturating_add(range)).find(|uid| !used.contains(&i64::from(*uid)))
+}
+
+/// A stable per-app build uid (SPEC, Tenant isolation): allocated on the
+/// app's first build and remembered on its row, so two concurrent builds —
+/// of one app or of two different apps — run as different uids and cannot
+/// read each other's worktree or cache. `None` when uid drops are disabled
+/// (`RUNNER_BUILD_UID_BASE=none`, dev/single) or the app row is gone.
+pub async fn ensure_app_build_uid(
+    pool: &SqlitePool,
+    base: Option<u32>,
+    range: u32,
+    app_id: &str,
+) -> sqlx::Result<Option<u32>> {
+    let Some(base) = base else {
+        return Ok(None);
+    };
+    let existing: Option<Option<i64>> =
+        sqlx::query_scalar("SELECT build_uid FROM app WHERE id = ?")
+            .bind(app_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    if let Some(uid) = existing.and_then(|v| u32::try_from(v).ok()) {
+        return Ok(Some(uid));
+    }
+    // Two apps allocating at once can pick the same lowest free uid; the
+    // unique index arbitrates and the loser re-picks.
+    for _ in 0..16 {
+        let used: Vec<i64> =
+            sqlx::query_scalar("SELECT build_uid FROM app WHERE build_uid IS NOT NULL")
+                .fetch_all(pool)
+                .await?;
+        let Some(uid) = pick_build_uid(base, range, &used) else {
+            return Err(sqlx::Error::Protocol(format!(
+                "per-app build uid range {base}..{} exhausted; raise RUNNER_BUILD_UID_RANGE",
+                base.saturating_add(range)
+            )));
+        };
+        let updated =
+            sqlx::query("UPDATE app SET build_uid = ? WHERE id = ? AND build_uid IS NULL")
+                .bind(i64::from(uid))
+                .bind(app_id)
+                .execute(pool)
+                .await;
+        match updated {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => continue,
+            Err(e) => return Err(e),
+        }
+        // Another deploy may have claimed the row first (0 rows updated);
+        // either way the row's value is now the truth.
+        let claimed: Option<i64> = sqlx::query_scalar("SELECT build_uid FROM app WHERE id = ?")
+            .bind(app_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+        return Ok(claimed.and_then(|v| u32::try_from(v).ok()));
+    }
+    Err(sqlx::Error::Protocol(
+        "per-app build uid allocation lost too many races; retry the deploy".into(),
+    ))
+}
+
 /// Owner start/stop. Either way the app is no longer asleep, and a start
 /// resets the idle clock so a manually started app gets a full window before
 /// the sleep sweep may park it again (SPEC, Scale to zero).
@@ -476,12 +542,14 @@ pub async fn patch_app_desired(pool: &SqlitePool, id: &str, desired: &str) -> sq
 /// Park an app (scale to zero): flag it asleep and show `sleeping`.
 pub async fn set_app_asleep(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
     let now = now_iso();
-    sqlx::query("UPDATE app SET asleep_since = ?, status = 'sleeping', updated_at = ? WHERE id = ?")
-        .bind(&now)
-        .bind(&now)
-        .bind(id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE app SET asleep_since = ?, status = 'sleeping', updated_at = ? WHERE id = ?",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -608,13 +676,12 @@ pub async fn get_deploy_log(
     app_id: &str,
     deploy_id: &str,
 ) -> sqlx::Result<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as::<_, (String,)>(
-        r#"SELECT log FROM deploy WHERE id = ? AND app_id = ?"#,
-    )
-    .bind(deploy_id)
-    .bind(app_id)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(String,)> =
+        sqlx::query_as::<_, (String,)>(r#"SELECT log FROM deploy WHERE id = ? AND app_id = ?"#)
+            .bind(deploy_id)
+            .bind(app_id)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.map(|(log,)| log))
 }
 
@@ -776,30 +843,52 @@ fn utc_cutoff(older_than_ms: i64) -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now() - chrono::Duration::milliseconds(older_than_ms)
 }
 
-/// Accumulate one minute-bucket of app usage. Called from the metrics tick.
-pub async fn add_app_metric(
+/// REPLACE one minute-bucket's telemetry columns. The metrics tick recomputes
+/// a whole hour-chunk from its hour boundary every pass, so the values it
+/// carries include everything already stored: replacing (not accumulating)
+/// is what makes a re-read and a replay exact instead of double counting.
+/// `cpu_ms` is left alone — it is sampled, not replayed, and accumulates.
+pub async fn replace_app_metric_usage(
     pool: &SqlitePool,
     app_id: &str,
     bucket_ts: &str,
     requests: i64,
     errors: i64,
     latency_ms: i64,
-    cpu_ms: i64,
 ) -> sqlx::Result<()> {
     sqlx::query(
         r#"INSERT INTO metrics.app_metric (app_id, bucket_ts, requests, errors, latency_ms, cpu_ms)
-           VALUES (?, ?, ?, ?, ?, ?)
+           VALUES (?, ?, ?, ?, ?, 0)
            ON CONFLICT (app_id, bucket_ts) DO UPDATE SET
-             requests = requests + excluded.requests,
-             errors = errors + excluded.errors,
-             latency_ms = latency_ms + excluded.latency_ms,
-             cpu_ms = cpu_ms + excluded.cpu_ms"#,
+             requests = excluded.requests,
+             errors = excluded.errors,
+             latency_ms = excluded.latency_ms"#,
     )
     .bind(app_id)
     .bind(bucket_ts)
     .bind(requests)
     .bind(errors)
     .bind(latency_ms)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Accumulate one minute-bucket of sampled CPU into the same row. CPU is a
+/// per-tick delta from `/proc`, so it adds; telemetry usage replaces.
+pub async fn add_app_metric_cpu(
+    pool: &SqlitePool,
+    app_id: &str,
+    bucket_ts: &str,
+    cpu_ms: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO metrics.app_metric (app_id, bucket_ts, requests, errors, latency_ms, cpu_ms)
+           VALUES (?, ?, 0, 0, 0, ?)
+           ON CONFLICT (app_id, bucket_ts) DO UPDATE SET cpu_ms = cpu_ms + excluded.cpu_ms"#,
+    )
+    .bind(app_id)
+    .bind(bucket_ts)
     .bind(cpu_ms)
     .execute(pool)
     .await?;
@@ -830,9 +919,11 @@ pub async fn prune_app_metrics(pool: &SqlitePool, older_than_ts: &str) -> sqlx::
     Ok(res.rows_affected())
 }
 
-/// Telemetry watermark persistence (slug -> last consumed start_unix_us).
-/// Written after bucket persist each tick; the runner SQLite lives on the
-/// data volume, so restarts resume instead of resetting.
+/// Telemetry watermark persistence: slug -> the START of the last hour-chunk
+/// committed (the ingest recomputes a whole hour from its boundary, so the
+/// value is an hour mark, not a consumed microsecond). Written after a chunk's
+/// rows persist; the runner SQLite lives on the data volume, so restarts
+/// resume instead of resetting.
 pub async fn get_metric_watermarks(
     pool: &SqlitePool,
 ) -> sqlx::Result<std::collections::HashMap<String, i64>> {
@@ -843,10 +934,7 @@ pub async fn get_metric_watermarks(
     Ok(rows.into_iter().collect())
 }
 
-pub async fn set_metric_watermarks(
-    pool: &SqlitePool,
-    marks: &[(String, i64)],
-) -> sqlx::Result<()> {
+pub async fn set_metric_watermarks(pool: &SqlitePool, marks: &[(String, i64)]) -> sqlx::Result<()> {
     for (slug, after_us) in marks {
         sqlx::query(
             r#"INSERT INTO metrics.metric_watermark (slug, after_us) VALUES (?, ?)
@@ -857,6 +945,53 @@ pub async fn set_metric_watermarks(
         .execute(pool)
         .await?;
     }
+    Ok(())
+}
+
+/// One pending telemetry replay request (`main.telemetry_replay`, one row).
+/// `floor_us` 0 means the retention floor; `slug` None means every fleet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayRequest {
+    pub floor_us: i64,
+    pub slug: Option<String>,
+    pub requested_at: String,
+}
+
+pub async fn get_telemetry_replay(pool: &SqlitePool) -> sqlx::Result<Option<ReplayRequest>> {
+    let row: Option<(i64, Option<String>, String)> = sqlx::query_as(
+        "SELECT floor_us, slug, requested_at FROM main.telemetry_replay WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(floor_us, slug, requested_at)| ReplayRequest {
+        floor_us,
+        slug,
+        requested_at,
+    }))
+}
+
+pub async fn set_telemetry_replay(
+    pool: &SqlitePool,
+    floor_us: i64,
+    slug: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO main.telemetry_replay (id, floor_us, slug, requested_at) VALUES (1, ?, ?, ?) \
+         ON CONFLICT (id) DO UPDATE SET floor_us = excluded.floor_us, slug = excluded.slug, \
+           requested_at = excluded.requested_at",
+    )
+    .bind(floor_us)
+    .bind(slug)
+    .bind(now_iso())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn clear_telemetry_replay(pool: &SqlitePool) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM main.telemetry_replay WHERE id = 1")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -1001,10 +1136,12 @@ pub async fn prune_app_refs(pool: &SqlitePool, older_than_ts: &str) -> sqlx::Res
     Ok(res.rows_affected())
 }
 
-/// Accumulate one hour-bucket of span stats (spec T3.2), filled by the
-/// ingest tick. Retention matches the other metric tables.
+/// REPLACE one hour-bucket of span stats (spec T3.2), filled by the ingest
+/// tick. The tick recomputes the whole hour from its boundary, so the values
+/// already include what was stored — replace, never accumulate. Retention
+/// matches the other metric tables.
 #[allow(clippy::too_many_arguments)]
-pub async fn add_span_stat(
+pub async fn replace_span_stat(
     pool: &SqlitePool,
     app_id: &str,
     bucket_hour: &str,
@@ -1020,10 +1157,10 @@ pub async fn add_span_stat(
            (app_id, bucket_hour, name, kind, n, ms, err, qwait_ms)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (app_id, bucket_hour, name, kind) DO UPDATE SET
-             n = n + excluded.n,
-             ms = ms + excluded.ms,
-             err = err + excluded.err,
-             qwait_ms = qwait_ms + excluded.qwait_ms"#,
+             n = excluded.n,
+             ms = excluded.ms,
+             err = excluded.err,
+             qwait_ms = excluded.qwait_ms"#,
     )
     .bind(app_id)
     .bind(bucket_hour)
@@ -1066,20 +1203,34 @@ pub async fn prune_span_stats(pool: &SqlitePool, older_than_hour: &str) -> sqlx:
     Ok(res.rows_affected())
 }
 
-/// Append ingested OTel log rows to the per-app ring (spec T3.3).
-pub async fn append_app_logs(
+/// REPLACE the ingested OTel log rows of one `[from_us, to_us)` window in the
+/// per-app ring (spec T3.3). The tick recomputes a whole hour-chunk each pass,
+/// so it deletes the window before inserting: a re-read or a replay leaves the
+/// same lines instead of appending duplicates. `rows` must lie inside the
+/// window.
+pub async fn replace_app_logs(
     pool: &SqlitePool,
     app_id: &str,
+    from_us: i64,
+    to_us: i64,
     rows: &[(i64, String)],
 ) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM metrics.app_log WHERE app_id = ? AND ts_us >= ? AND ts_us < ?")
+        .bind(app_id)
+        .bind(from_us)
+        .bind(to_us)
+        .execute(&mut *tx)
+        .await?;
     for (ts_us, body) in rows {
         sqlx::query("INSERT INTO metrics.app_log (app_id, ts_us, body) VALUES (?, ?, ?)")
             .bind(app_id)
             .bind(ts_us)
             .bind(body)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1141,6 +1292,11 @@ const ISSUE_COLS: &str = "fingerprint, kind, message, culprit, handler, source, 
 /// Fold occurrences into their issue. The latest occurrence names the
 /// issue (message, culprit); a resolved issue that fires after it was
 /// resolved reopens as regressed. SET expressions read the pre-update row.
+///
+/// `count` is NOT accumulated here: on a replay the same occurrence would be
+/// added again. It is derived from `app_error_hour` (which the tick replaces
+/// per hour) by [`refresh_error_issue_count`]; the insert seeds it only for a
+/// brand-new issue so a reader between the two never sees a missing count.
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_error_issue(
     pool: &SqlitePool,
@@ -1169,7 +1325,6 @@ pub async fn upsert_error_issue(
              source = CASE WHEN excluded.last_seen_us >= last_seen_us THEN excluded.source ELSE source END,
              last_sha = CASE WHEN excluded.last_seen_us >= last_seen_us
                              THEN COALESCE(excluded.last_sha, last_sha) ELSE last_sha END,
-             count = count + excluded.count,
              first_seen_us = min(first_seen_us, excluded.first_seen_us),
              last_seen_us = max(last_seen_us, excluded.last_seen_us),
              regressed = CASE WHEN status = 'resolved' AND excluded.last_seen_us > COALESCE(status_at_us, 0)
@@ -1196,7 +1351,31 @@ pub async fn upsert_error_issue(
     Ok(())
 }
 
-pub async fn add_error_hour(
+/// Recompute an issue's displayed count from its retained hour buckets. The
+/// ingest replaces one hour's bucket at a time, so this stays exact across
+/// re-reads and replays.
+pub async fn refresh_error_issue_count(
+    pool: &SqlitePool,
+    app_id: &str,
+    fingerprint: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE metrics.app_error_issue SET count = COALESCE( \
+           (SELECT SUM(n) FROM metrics.app_error_hour WHERE app_id = ? AND fingerprint = ?), 0) \
+         WHERE app_id = ? AND fingerprint = ?",
+    )
+    .bind(app_id)
+    .bind(fingerprint)
+    .bind(app_id)
+    .bind(fingerprint)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// REPLACE one hour-bucket of an issue's occurrences. The ingest recomputes
+/// the hour from its boundary, so replace, never accumulate.
+pub async fn set_error_hour(
     pool: &SqlitePool,
     app_id: &str,
     fingerprint: &str,
@@ -1206,7 +1385,7 @@ pub async fn add_error_hour(
     sqlx::query(
         r#"INSERT INTO metrics.app_error_hour (app_id, fingerprint, bucket_hour, n)
            VALUES (?, ?, ?, ?)
-           ON CONFLICT (app_id, fingerprint, bucket_hour) DO UPDATE SET n = n + excluded.n"#,
+           ON CONFLICT (app_id, fingerprint, bucket_hour) DO UPDATE SET n = excluded.n"#,
     )
     .bind(app_id)
     .bind(fingerprint)
@@ -1238,12 +1417,20 @@ pub struct NewErrorEvent<'a> {
     pub sha: &'a str,
 }
 
+/// Insert one occurrence unless the same one (issue + timestamp + trace) is
+/// already stored. A re-read or replay of a window therefore adds only the
+/// occurrences that were genuinely missing, and keeps the request context the
+/// first ingest captured (the in-memory trace index is long gone on a replay).
 pub async fn insert_error_event(pool: &SqlitePool, e: &NewErrorEvent<'_>) -> sqlx::Result<()> {
     sqlx::query(
         r#"INSERT INTO metrics.app_error_event
            (app_id, fingerprint, ts_us, trace_id, source, handler, cell, kind, message,
             context, frames, logs, method, path, http_status, browser, os, sha)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           WHERE NOT EXISTS (
+             SELECT 1 FROM metrics.app_error_event
+              WHERE app_id = ? AND fingerprint = ? AND ts_us = ? AND trace_id = ?
+           )"#,
     )
     .bind(e.app_id)
     .bind(e.fingerprint)
@@ -1263,6 +1450,10 @@ pub async fn insert_error_event(pool: &SqlitePool, e: &NewErrorEvent<'_>) -> sql
     .bind(e.browser)
     .bind(e.os)
     .bind(e.sha)
+    .bind(e.app_id)
+    .bind(e.fingerprint)
+    .bind(e.ts_us)
+    .bind(e.trace_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -1429,11 +1620,7 @@ pub async fn get_compacted_hours(
     Ok(rows.into_iter().collect())
 }
 
-pub async fn mark_hour_compacted(
-    pool: &SqlitePool,
-    slug: &str,
-    hour: &str,
-) -> sqlx::Result<()> {
+pub async fn mark_hour_compacted(pool: &SqlitePool, slug: &str, hour: &str) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO metrics.metric_compaction (slug, hour, compacted_at) \
          VALUES (?, ?, ?) ON CONFLICT (slug, hour) DO NOTHING",
@@ -1479,17 +1666,24 @@ pub async fn get_metric_version(pool: &SqlitePool, app_id: &str) -> sqlx::Result
 /// Encrypted per-app credential row (SPEC, Scoped credentials). Nonce +
 /// AES-GCM ciphertext over JSON `{access_key, secret_key}`; the KEK derives
 /// from RUNNER_TOKEN so the bucket snapshot is not a key dump.
-pub async fn get_app_credential(pool: &SqlitePool, app_id: &str) -> sqlx::Result<Option<(Vec<u8>, Vec<u8>)>> {
-    let row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
-        "SELECT nonce, ciphertext FROM app_credential WHERE app_id = ?",
-    )
-    .bind(app_id)
-    .fetch_optional(pool)
-    .await?;
+pub async fn get_app_credential(
+    pool: &SqlitePool,
+    app_id: &str,
+) -> sqlx::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let row: Option<(Vec<u8>, Vec<u8>)> =
+        sqlx::query_as("SELECT nonce, ciphertext FROM app_credential WHERE app_id = ?")
+            .bind(app_id)
+            .fetch_optional(pool)
+            .await?;
     Ok(row)
 }
 
-pub async fn put_app_credential(pool: &SqlitePool, app_id: &str, nonce: &[u8], ciphertext: &[u8]) -> sqlx::Result<()> {
+pub async fn put_app_credential(
+    pool: &SqlitePool,
+    app_id: &str,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> sqlx::Result<()> {
     sqlx::query(
         r#"INSERT INTO app_credential (app_id, nonce, ciphertext, updated_at) VALUES (?, ?, ?, ?)
            ON CONFLICT (app_id) DO UPDATE SET nonce = excluded.nonce,
@@ -1524,12 +1718,7 @@ pub async fn list_env(pool: &SqlitePool, app_id: &str) -> sqlx::Result<Vec<AppEn
     .await
 }
 
-pub async fn set_env(
-    pool: &SqlitePool,
-    app_id: &str,
-    name: &str,
-    value: &str,
-) -> sqlx::Result<()> {
+pub async fn set_env(pool: &SqlitePool, app_id: &str, name: &str, value: &str) -> sqlx::Result<()> {
     sqlx::query(
         r#"INSERT INTO app_env (app_id, name, value, updated_at) VALUES (?, ?, ?, ?)
            ON CONFLICT (app_id, name) DO UPDATE SET value = excluded.value,
@@ -1702,13 +1891,12 @@ pub async fn upsert_app_user_props(
     properties: &str,
 ) -> sqlx::Result<()> {
     let now = now_iso();
-    let existing: Option<String> = sqlx::query_scalar(
-        "SELECT properties FROM app_user_prop WHERE app_id = ? AND user_id = ?",
-    )
-    .bind(app_id)
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await?;
+    let existing: Option<String> =
+        sqlx::query_scalar("SELECT properties FROM app_user_prop WHERE app_id = ? AND user_id = ?")
+            .bind(app_id)
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await?;
     let merged = match existing {
         Some(prev) => {
             let mut map: serde_json::Map<String, serde_json::Value> =
@@ -1785,13 +1973,12 @@ pub async fn inc_app_insight(
     icon: Option<&str>,
 ) -> sqlx::Result<AppInsight> {
     let now = now_iso();
-    let current: Option<(Option<f64>, String)> = sqlx::query_as(
-        "SELECT num, icon FROM app_insight WHERE app_id = ? AND title = ?",
-    )
-    .bind(app_id)
-    .bind(title)
-    .fetch_optional(pool)
-    .await?;
+    let current: Option<(Option<f64>, String)> =
+        sqlx::query_as("SELECT num, icon FROM app_insight WHERE app_id = ? AND title = ?")
+            .bind(app_id)
+            .bind(title)
+            .fetch_optional(pool)
+            .await?;
     let (next, icon_out) = match current {
         Some((n, old_icon)) => (
             n.unwrap_or(0.0) + delta,
@@ -1829,10 +2016,7 @@ pub async fn inc_app_insight(
     })
 }
 
-pub async fn list_app_insights(
-    pool: &SqlitePool,
-    app_id: &str,
-) -> sqlx::Result<Vec<AppInsight>> {
+pub async fn list_app_insights(pool: &SqlitePool, app_id: &str) -> sqlx::Result<Vec<AppInsight>> {
     sqlx::query_as::<_, AppInsight>(
         "SELECT app_id, title, value, num, icon, updated_at FROM app_insight WHERE app_id = ? ORDER BY title ASC",
     )
@@ -1856,9 +2040,12 @@ mod tests {
         let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
         {
             let pool = connect(&url).await.expect("first boot");
-            add_app_metric(&pool, "a", "2026-09-30T12:36:00Z", 5, 4, 10, 1)
+            replace_app_metric_usage(&pool, "a", "2026-09-30T12:36:00Z", 5, 4, 10)
                 .await
                 .expect("metric");
+            add_app_metric_cpu(&pool, "a", "2026-09-30T12:36:00Z", 1)
+                .await
+                .expect("cpu");
             set_metric_watermarks(&pool, &[("test".to_string(), 42)])
                 .await
                 .expect("watermark");
@@ -1868,7 +2055,9 @@ mod tests {
             pool.close().await;
         }
         let pool = connect(&url).await.expect("second boot");
-        let marks = get_metric_watermarks(&pool).await.expect("watermarks readable");
+        let marks = get_metric_watermarks(&pool)
+            .await
+            .expect("watermarks readable");
         assert_eq!(marks.get("test"), Some(&42));
         let rows = list_app_metrics(&pool, "a", "2026-09-30T00:00:00Z")
             .await
@@ -1900,16 +2089,41 @@ mod tests {
         let up = |msg: &'static str, n: i64, at: i64, sha: &'static str| {
             let pool = pool.clone();
             async move {
-                upsert_error_issue(&pool, "a", "fp", "TypeError", msg, "f (w.js:1)", "fetch", "uncaught", n, at, at, Some(sha))
+                upsert_error_issue(
+                    &pool,
+                    "a",
+                    "fp",
+                    "TypeError",
+                    msg,
+                    "f (w.js:1)",
+                    "fetch",
+                    "uncaught",
+                    n,
+                    at,
+                    at,
+                    Some(sha),
+                )
+                .await
+                .expect("upsert");
+                // The displayed count is derived from the per-hour buckets the
+                // ingest replaces, so seed a distinct bucket per call, as a
+                // chunk would.
+                set_error_hour(&pool, "a", "fp", &format!("{at}"), n)
                     .await
-                    .expect("upsert");
+                    .expect("hour");
+                refresh_error_issue_count(&pool, "a", "fp")
+                    .await
+                    .expect("count");
             }
         };
         up("first", 2, 100, "s1").await;
         up("second", 3, 200, "s2").await;
         // A late batch from before the newest occurrence must not rename it.
         up("stale", 1, 150, "s0").await;
-        let issue = get_error_issue(&pool, "a", "fp").await.expect("get").expect("issue");
+        let issue = get_error_issue(&pool, "a", "fp")
+            .await
+            .expect("get")
+            .expect("issue");
         assert_eq!(issue.count, 6);
         assert_eq!(issue.message, "second");
         assert_eq!((issue.first_seen_us, issue.last_seen_us), (100, 200));
@@ -1917,20 +2131,36 @@ mod tests {
         assert_eq!(issue.last_sha.as_deref(), Some("s2"));
         assert_eq!(issue.status, "open");
 
-        set_error_status(&pool, "a", "fp", "resolved", 300).await.expect("resolve");
+        set_error_status(&pool, "a", "fp", "resolved", 300)
+            .await
+            .expect("resolve");
         // An occurrence from before the resolve (ingest lag) keeps it resolved.
         up("second", 1, 250, "s2").await;
-        let issue = get_error_issue(&pool, "a", "fp").await.expect("get").expect("issue");
-        assert_eq!((issue.status.as_str(), issue.regressed), ("resolved", false));
+        let issue = get_error_issue(&pool, "a", "fp")
+            .await
+            .expect("get")
+            .expect("issue");
+        assert_eq!(
+            (issue.status.as_str(), issue.regressed),
+            ("resolved", false)
+        );
         // One after it reopens the issue as a regression.
         up("second", 1, 400, "s3").await;
-        let issue = get_error_issue(&pool, "a", "fp").await.expect("get").expect("issue");
+        let issue = get_error_issue(&pool, "a", "fp")
+            .await
+            .expect("get")
+            .expect("issue");
         assert_eq!((issue.status.as_str(), issue.regressed), ("open", true));
 
         // Ignored stays ignored however often it fires.
-        set_error_status(&pool, "a", "fp", "ignored", 500).await.expect("ignore");
+        set_error_status(&pool, "a", "fp", "ignored", 500)
+            .await
+            .expect("ignore");
         up("second", 1, 600, "s3").await;
-        let issue = get_error_issue(&pool, "a", "fp").await.expect("get").expect("issue");
+        let issue = get_error_issue(&pool, "a", "fp")
+            .await
+            .expect("get")
+            .expect("issue");
         assert_eq!((issue.status.as_str(), issue.regressed), ("ignored", false));
         assert_eq!(issue.count, 9);
     }
@@ -1943,5 +2173,118 @@ mod tests {
             snapshot_path(&cfg),
             std::path::PathBuf::from("/data/noite-snapshot.sqlite")
         );
+    }
+
+    #[test]
+    fn pick_build_uid_takes_the_lowest_free_slot_in_range() {
+        assert_eq!(pick_build_uid(10030, 4, &[]), Some(10030));
+        assert_eq!(pick_build_uid(10030, 4, &[10030, 10032]), Some(10031));
+        assert_eq!(
+            pick_build_uid(10030, 4, &[10030, 10031, 10032, 10033]),
+            None
+        );
+        // Values outside the range (e.g. the fleet uid) never influence it.
+        assert_eq!(pick_build_uid(10030, 2, &[10020, 99999, -1]), Some(10030));
+    }
+
+    async fn insert_app(pool: &SqlitePool, id: &str, slug: &str) {
+        sqlx::query(
+            "INSERT INTO app (id, slug, name, subdomain, git_prefix, fleet_bucket, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(slug)
+        .bind(slug)
+        .bind(format!("{slug}.localhost"))
+        .bind(format!("git/{slug}/"))
+        .bind(format!("s3://noite/fleets/{slug}"))
+        .execute(pool)
+        .await
+        .expect("insert app");
+    }
+
+    /// The per-app build uid contract (SPEC, Tenant isolation): stable per
+    /// app, unique across live apps, inside the range, and reused only after
+    /// the app that held it is deleted.
+    #[tokio::test]
+    async fn per_app_build_uids_are_stable_unique_and_never_shared() {
+        let dir = std::env::temp_dir().join(format!("noite-uid-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        let pool = connect(&url).await.expect("boot");
+        insert_app(&pool, "a", "a").await;
+        insert_app(&pool, "b", "b").await;
+        // Stable across calls ...
+        assert_eq!(
+            ensure_app_build_uid(&pool, Some(10030), 4, "a")
+                .await
+                .unwrap(),
+            Some(10030)
+        );
+        assert_eq!(
+            ensure_app_build_uid(&pool, Some(10030), 4, "a")
+                .await
+                .unwrap(),
+            Some(10030)
+        );
+        // ... and across a restart: the uid lives on the row, not in memory.
+        pool.close().await;
+        let pool = connect(&url).await.expect("reconnect");
+        assert_eq!(
+            ensure_app_build_uid(&pool, Some(10030), 4, "a")
+                .await
+                .unwrap(),
+            Some(10030)
+        );
+        // Unique across live apps.
+        assert_eq!(
+            ensure_app_build_uid(&pool, Some(10030), 4, "b")
+                .await
+                .unwrap(),
+            Some(10031)
+        );
+        let stored: Option<i64> = sqlx::query_scalar("SELECT build_uid FROM app WHERE id = 'b'")
+            .fetch_one(&pool)
+            .await
+            .expect("stored uid");
+        assert_eq!(stored, Some(10031));
+        // Deleting an app is the only way its uid comes back.
+        sqlx::query("DELETE FROM app WHERE id = 'a'")
+            .execute(&pool)
+            .await
+            .expect("delete a");
+        insert_app(&pool, "c", "c").await;
+        assert_eq!(
+            ensure_app_build_uid(&pool, Some(10030), 4, "c")
+                .await
+                .unwrap(),
+            Some(10030)
+        );
+        // Range exhaustion is an error, never a collision.
+        insert_app(&pool, "d", "d").await;
+        insert_app(&pool, "e", "e").await;
+        insert_app(&pool, "f", "f").await;
+        assert_eq!(
+            ensure_app_build_uid(&pool, Some(10030), 4, "d")
+                .await
+                .unwrap(),
+            Some(10032)
+        );
+        assert_eq!(
+            ensure_app_build_uid(&pool, Some(10030), 4, "e")
+                .await
+                .unwrap(),
+            Some(10033)
+        );
+        assert!(ensure_app_build_uid(&pool, Some(10030), 4, "f")
+            .await
+            .is_err());
+        // Disabled drops allocate nothing.
+        assert_eq!(
+            ensure_app_build_uid(&pool, None, 4, "b").await.unwrap(),
+            None
+        );
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

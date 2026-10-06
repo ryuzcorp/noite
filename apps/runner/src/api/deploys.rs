@@ -44,9 +44,7 @@ pub async fn rollback(
     };
     match db::get_success_deploy(&state.pool, &app.id, &sha).await {
         Ok(Some(_)) => {}
-        Ok(None) => {
-            return ApiError::not_found("no successful deploy at that sha").into_response()
-        }
+        Ok(None) => return ApiError::not_found("no successful deploy at that sha").into_response(),
         Err(e) => return ApiError::internal(e.to_string()).into_response(),
     }
     let pool = state.pool.clone();
@@ -57,8 +55,17 @@ pub async fn rollback(
     let key = format!("git/{}/refs/heads/main/{sha}.bundle", app.slug);
     let sha_resp = sha.clone();
     tokio::spawn(async move {
-        deploy::deploy_app(&pool, &cfg, &procs, &logs, &deploying, app, &key, Some(&sha))
-            .await;
+        deploy::deploy_app(
+            &pool,
+            &cfg,
+            &procs,
+            &logs,
+            &deploying,
+            app,
+            &key,
+            Some(&sha),
+        )
+        .await;
     });
     Json(serde_json::json!({ "ok": true, "sha": sha_resp })).into_response()
 }
@@ -115,7 +122,11 @@ pub async fn list_deploys_stream(
                 Ok(rows) => {
                     let data = serde_json::to_string(&rows).unwrap_or_default();
                     if last.as_ref() != Some(&data) {
-                        if tx.send(Ok(Event::default().data(data.clone()))).await.is_err() {
+                        if tx
+                            .send(Ok(Event::default().data(data.clone())))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                         last = Some(data);

@@ -72,7 +72,11 @@ fn sign_in_hint(cfg: &Config) -> String {
         return cfg.better_auth_url.clone();
     }
     let host = cfg.control_hosts().into_iter().next().unwrap_or_default();
-    let scheme = if cfg.base_domain == "localhost" { "http" } else { "https" };
+    let scheme = if cfg.base_domain == "localhost" {
+        "http"
+    } else {
+        "https"
+    };
     format!("{scheme}://{host}")
 }
 
@@ -100,7 +104,10 @@ pub async fn run(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
             .unwrap_or_else(|| format!("control UI answered {status}"));
         bail!("{reason}");
     }
-    let minted: Minted = response.json().await.context("read the control UI's answer")?;
+    let minted: Minted = response
+        .json()
+        .await
+        .context("read the control UI's answer")?;
     println!(
         "Recovery code for {email}: {code}\n\n\
          1. Open {url}\n\

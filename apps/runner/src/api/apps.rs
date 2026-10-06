@@ -20,7 +20,9 @@ use crate::AppState;
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     // Busy when a deploy holds the runner: the control DO extends its idle
     // window on this flag so long builds never sleep mid-flight.
-    let busy = !crate::host::deploy::snapshot_claimed(&state.deploying).await.is_empty();
+    let busy = !crate::host::deploy::snapshot_claimed(&state.deploying)
+        .await
+        .is_empty();
     Json(json!({ "busy": busy, "ok": true, "service": "noite-runner" }))
 }
 
@@ -78,7 +80,10 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     if failing.is_empty() {
         Json(json!({ "ok": true, "service": "noite-runner" })).into_response()
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "ok": false, "failing": failing })))
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ok": false, "failing": failing })),
+        )
             .into_response()
     }
 }
@@ -122,7 +127,13 @@ pub async fn create_app(
     if let Err(e) = purge::purge_slug(&state.config, &state.procs, &state.logs, &slug).await {
         return ApiError::internal(format!("failed to clear slug data: {e:#}")).into_response();
     }
-    let (listen, internal) = match db::next_ports_in(&state.pool, state.config.fleet_port_min, state.config.fleet_port_max).await {
+    let (listen, internal) = match db::next_ports_in(
+        &state.pool,
+        state.config.fleet_port_min,
+        state.config.fleet_port_max,
+    )
+    .await
+    {
         Ok(p) => p,
         Err(e) => {
             return ApiError::internal(e.to_string()).into_response();
@@ -160,7 +171,8 @@ pub async fn create_app(
             user_id: owner,
         },
     )
-    .await {
+    .await
+    {
         Ok(app) => {
             // No credential row: only a scoped provider (Phase 4) mints one.
             state.state_sync.mark_dirty();
@@ -169,7 +181,6 @@ pub async fn create_app(
         Err(e) => ApiError::internal(e.to_string()).into_response(),
     }
 }
-
 
 pub async fn get_app(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     match db::get_app(&state.pool, &id).await {
@@ -204,7 +215,10 @@ pub async fn rename_app(
     Path(id): Path<String>,
     Json(body): Json<RenameApp>,
 ) -> impl IntoResponse {
-    let name = body.name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let name = body
+        .name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let slug = body
         .slug
         .map(|s| s.trim().to_lowercase())
@@ -264,8 +278,7 @@ pub async fn delete_app(
     if !deploy::claim_wait(&state.deploying, &app.id, Duration::from_secs(120)).await {
         return ApiError::conflict("deploy in flight; retry delete shortly").into_response();
     }
-    let purge_result =
-        purge::purge_slug(&state.config, &state.procs, &state.logs, &app.slug).await;
+    let purge_result = purge::purge_slug(&state.config, &state.procs, &state.logs, &app.slug).await;
     deploy::release(&state.deploying, &app.id).await;
     if let Err(e) = purge_result {
         return ApiError::internal(format!("failed to purge app data: {e:#}")).into_response();
@@ -287,8 +300,10 @@ pub async fn delete_app(
 pub async fn sleep_app(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     match crate::host::sleep::sleep_app(&state.pool, &state.config, &state.procs, &id, true).await {
         Ok(true) => (StatusCode::OK, Json(json!({ "ok": true, "asleep": true }))).into_response(),
-        Ok(false) => ApiError::conflict("app cannot sleep (stopped, undeployed, already asleep or not running)")
-            .into_response(),
+        Ok(false) => ApiError::conflict(
+            "app cannot sleep (stopped, undeployed, already asleep or not running)",
+        )
+        .into_response(),
         Err(e) => ApiError::internal(e.to_string()).into_response(),
     }
 }

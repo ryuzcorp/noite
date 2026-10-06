@@ -17,7 +17,7 @@ It elevates itself with `sudo` (no `sudo` in front: piped into `sudo bash`, the 
 Register right away: the first account becomes the admin without an invite code.
 :::
 
-Re-running the script is the upgrade: it refreshes `compose.yaml`, keeps `.env` (the domain and secrets never change after the first install, since passkeys bind to `BETTER_AUTH_URL`), pulls and recreates. Inputs are environment variables, set on `bash`, not on `curl`: `curl … | NOITE_DOMAIN=example.com bash -s install` (a variable in front of `curl` only reaches `curl`).
+Re-running the script is the upgrade: it refreshes `compose.yaml`, keeps `.env` (the domain and secrets never change after the first install, since passkeys bind to `BETTER_AUTH_URL`), pulls and recreates. When the pulled image differs from the running container it says so and asks once before recreating — replacing it restarts the runner and every tenant fleet, which cold-boot in a few seconds (see the [downtime model](/self-hosting/operations#updating)) — and a fresh install or a re-run of the same image asks nothing. `--yes` (or `NOITE_YES=1` / `NOITE_CONFIRM=1`) skips the prompt; without a terminal it warns and continues. Inputs are environment variables, set on `bash`, not on `curl`: `curl … | NOITE_DOMAIN=example.com bash -s install` (a variable in front of `curl` only reaches `curl`).
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -27,6 +27,7 @@ Re-running the script is the upgrade: it refreshes `compose.yaml`, keeps `.env` 
 | `NOITE_EMAIL_WEBHOOK_URL` | none | receives lost-passkey sign-in codes; without it, [recover from the server](/self-hosting/accounts#lost-passkey) |
 | `NOITE_DIR` | `/opt/noite` | install directory |
 | `NOITE_REF` | `main` | git ref the installer and `compose.yaml` are fetched from |
+| `NOITE_YES` | none | `1` = skip the upgrade confirmation (same as `--yes`; `NOITE_CONFIRM=1` works too) |
 
 The script always runs the installer from the ref's latest commit, so a CDN-cached copy is never stale.
 

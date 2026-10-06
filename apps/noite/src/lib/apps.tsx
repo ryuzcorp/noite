@@ -5,10 +5,21 @@ import { kebabCase } from "scule";
 
 import { acceptInvitation, create, declineInvitation } from "./apps.server";
 import type { App } from "./collaborators";
+import {
+  CONTROL_APP_ID,
+  CONTROL_APP_NAME,
+  CONTROL_APP_SUBTITLE,
+} from "./control-app";
 import { errorMessage } from "./errors";
 import { applistUrl, decodeApps, feedKeys, liveFeed } from "./feeds";
 import { ChevronRight } from "./icons";
-import { invalidate, keys, myInvitations } from "./resources";
+import {
+  adminStatus,
+  invalidate,
+  keys,
+  myInvitations,
+  session,
+} from "./resources";
 import { ListSkeleton } from "./skeletons";
 
 const queue = createMutationQueue();
@@ -161,10 +172,62 @@ const InvitationsBanner = () => {
   );
 };
 
+/** The control plane as an extra card above the user's apps. Only a real
+ * instance admin sees it, and never on an impersonated session — the same
+ * gate every control-D1 action re-checks server-side. It links to the
+ * dedicated control app detail, not a runner app row. */
+const ControlAppRow = () => (
+  <li class="list-row">
+    <div>
+      <div class="avatar avatar-placeholder">
+        <div class="bg-neutral text-neutral-content w-10 rounded-full">
+          <span class="text-sm">{initials(CONTROL_APP_NAME)}</span>
+        </div>
+        <span
+          class={`status ${presenceTone("running")} absolute right-0 bottom-0`}
+          title="running"
+        />
+      </div>
+    </div>
+    <div>
+      <div>
+        <a
+          href={`/apps/${CONTROL_APP_ID}`}
+          class="link link-hover block truncate text-lg font-semibold"
+        >
+          {CONTROL_APP_NAME}
+        </a>
+      </div>
+      <div class="text-base-content/70 truncate text-xs">
+        {CONTROL_APP_SUBTITLE}
+      </div>
+    </div>
+    <a
+      href={`/apps/${CONTROL_APP_ID}`}
+      class="btn btn-sm btn-square btn-ghost shrink-0"
+      aria-label={`Open ${CONTROL_APP_NAME}`}
+    >
+      <span class="inline-flex h-5 w-5 shrink-0">
+        <ChevronRight class="h-5 w-5" />
+      </span>
+    </a>
+  </li>
+);
+
 /** App list over SSE: skeleton until the first frame, then live updates —
  * no polling, and resubscribe is automatic on drop. */
 export const AppsList = () => {
   const feed = liveFeed(feedKeys.apps, applistUrl(), decodeApps);
+  // `session()` is shared with the layout; `adminStatus()` is one cached call.
+  const admin = adminStatus();
+  const sess = session();
+  const showControl = (): boolean => {
+    const user = sess.data();
+    if (!user || user.session.impersonatedBy !== null) {
+      return false;
+    }
+    return admin.data()?.isAdmin ?? false;
+  };
   const items = (): App[] => feed.latest() ?? [];
   const loaded = (): boolean =>
     feed.latest() !== undefined || feed.status() === "open";
@@ -189,6 +252,7 @@ export const AppsList = () => {
             New app
           </a>
         </li>
+        {showControl() ? <ControlAppRow /> : null}
         {!loaded() && (
           <li class="px-4 pt-2 pb-4">
             <ListSkeleton rows={3} />

@@ -4,11 +4,14 @@ import type { FetchHandler } from "oxidejs";
 
 import { authFromEnv, MissingAuthSecretError } from "../lib/auth";
 import {
+  isInstanceAdmin,
   listAppsForCollaborator,
   parseAppRole,
   requireAppRole,
   requireAppRoleBySlug,
 } from "../lib/collaborators";
+import { CONTROL_APP_ID, CONTROL_BUILD } from "../lib/control-app";
+import { controlAccessRefusal } from "../lib/control-d1.server";
 import { ensureDbPromise } from "../lib/db";
 import { INVITES_PER_USER, signupPolicy } from "../lib/invites.server";
 import {
@@ -40,11 +43,9 @@ type RouteHandler = (
 /** Deployment generation marker, stamped at build time (`vite.config.ts`
  * defines it from the git sha) so adoption is verifiable — `/health` exposes
  * it — without anyone remembering to bump a number. Without this, worker-code
- * version is indistinguishable from outside and every diagnosis branches. */
-// `typeof` is the one form that is safe when the define is absent.
-const CONTROL_BUILD =
-  typeof __CONTROL_BUILD__ === "undefined" ? "dev" : __CONTROL_BUILD__;
-
+ * version is indistinguishable from outside and every diagnosis branches.
+ * (The marker itself lives in lib/control-app.ts so the control-app detail
+ * page can show it too.) */
 const handleHealth: RouteHandler = () =>
   Response.json({ build: CONTROL_BUILD, ok: true, service: "noite-control" });
 
@@ -310,6 +311,63 @@ const handleGitAuth: RouteHandler = async (request, env) => {
   }
 };
 
+/** Pure decision half of the control stream gate: the status and message a
+ * `_control` stream answers with, or null to proceed. Signed out is 401;
+ * impersonated or not an instance admin is 403 (the same policy as the
+ * control D1, `lib/control-d1.server`). Exported for the unit test. */
+export const controlStreamRefusalDecision = (access: {
+  signedIn: boolean;
+  impersonatedBy: string | null;
+  isAdmin: boolean;
+}): { status: 401 | 403; message: string } | null => {
+  if (!access.signedIn) {
+    return { message: "Sign in required", status: 401 };
+  }
+  const refusal = controlAccessRefusal(access);
+  return refusal === null ? null : { message: refusal, status: 403 };
+};
+
+/** Control-plane stream gate for the reserved `_control` app: a real instance
+ * admin, never an impersonated session — the pseudo app has no collaborator
+ * role to check (mirrors `requireControlAdmin` in lib/apps.server). Returns
+ * the refusal response, or undefined when the caller may proceed. */
+const controlStreamRefusal = async (
+  request: Request,
+  env: KitEnv
+): Promise<Response | undefined> => {
+  let origin: string;
+  try {
+    ({ origin } = new URL(request.url));
+  } catch {
+    return new Response("bad request", { status: 400 });
+  }
+  let session;
+  try {
+    const auth = authFromEnv(env, env.BETTER_AUTH_URL ?? origin);
+    session = await auth.api.getSession({ headers: request.headers });
+  } catch {
+    return new Response("Sign in required", { status: 401 });
+  }
+  const user = session?.user;
+  // The admin plugin adds an optional impersonatedBy id to sessions it
+  // creates; presence means this session is impersonated (lib/apps.server).
+  const impersonatedBy = session?.session?.impersonatedBy
+    ? String(session.session.impersonatedBy)
+    : null;
+  const isAdmin =
+    user !== undefined &&
+    impersonatedBy === null &&
+    (await isInstanceAdmin(user.id, user.email));
+  const refusal = controlStreamRefusalDecision({
+    impersonatedBy,
+    isAdmin,
+    signedIn: user !== undefined,
+  });
+  return refusal === null
+    ? undefined
+    : new Response(refusal.message, { status: refusal.status });
+};
+
 /** Session user id for browser routes (mirrors sessionUser in apps.server,
  * but returns undefined instead of throwing so routes pick their status). */
 const routeUserId = async (
@@ -332,7 +390,41 @@ const routeUserId = async (
   }
 };
 
-/** Fetch one raw R2 object from the runner and re-serve it as a download. */
+/** Content types a browser renders as a document: served inline like the
+ * rest, but under a sandbox, so a direct visit to the proxy URL cannot run
+ * the script an uploaded object might carry. */
+const SANDBOXED_R2_TYPES = {
+  "application/xhtml+xml": true,
+  "application/xml": true,
+  "image/svg+xml": true,
+  "text/html": true,
+  "text/xml": true,
+} satisfies Record<string, true>;
+
+/** Path params + key query for an R2 object route (undefined when bad). */
+const r2ObjectTarget = (
+  request: Request,
+  params?: Record<string, string | undefined>
+): { appId: string; bucket: string; key: string } | undefined => {
+  const appId = params?.appId?.trim() ?? "";
+  const bucket = params?.bucket?.trim() ?? "";
+  let key: string;
+  try {
+    key = new URL(request.url).searchParams.get("key")?.trim() ?? "";
+  } catch {
+    return undefined;
+  }
+  if (!(appId && bucket && key)) {
+    return undefined;
+  }
+  return { appId, bucket, key };
+};
+
+/** Fetch one raw R2 object from the runner and re-serve it to the browser
+ * with the object's own media type (the UI renders images through this URL
+ * and offers it as the download link), unreachable-by-script headers for the
+ * dangerous types, and no sniffing. The body streams through, so a large
+ * download shows progress instead of hanging into the platform deadline. */
 const proxyR2Object = async (
   runner: string,
   token: string,
@@ -351,35 +443,68 @@ const proxyR2Object = async (
     return new Response(text, { status: res.status });
   }
   const filename = key.split("/").pop() ?? key;
+  const type = (res.headers.get("content-type") ?? "application/octet-stream")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
   const headers = new Headers();
-  headers.set("content-type", "application/octet-stream");
+  headers.set("content-type", type || "application/octet-stream");
   headers.set(
     "content-disposition",
-    `attachment; filename="${filename.replaceAll('"', "_")}"`
+    `inline; filename="${filename.replaceAll('"', "_")}"`
   );
-  // Stream the body through (never buffer): large downloads must show
-  // progress, not hang into the platform deadline. Deliberately no total
-  // timeout — only the headers below are awaited before responding.
+  headers.set("x-content-type-options", "nosniff");
+  if (Object.hasOwn(SANDBOXED_R2_TYPES, type)) {
+    headers.set("content-security-policy", "sandbox");
+  }
   return new Response(res.body, { headers, status: res.status });
 };
 
-/** Path params + key query for the R2 download route (undefined when bad). */
-const r2RawTarget = (
-  request: Request,
-  params?: Record<string, string | undefined>
-): { appId: string; bucket: string; key: string } | undefined => {
-  const appId = params?.appId?.trim() ?? "";
-  const bucket = params?.bucket?.trim() ?? "";
-  let key: string;
+/** Browser upload for one R2 object: session + push gate, then stream the
+ * body to the runner (which spools it and calls `celld r2 put`, so the
+ * stored record is what a Worker's `env.BUCKET.put()` writes). Nothing
+ * buffers the file — the browser's body is handed to fetch as it arrives. */
+const handleR2Upload: RouteHandler = async (request, env, params) => {
+  const target = r2ObjectTarget(request, params);
+  if (!target) {
+    return new Response("app, bucket, and key required", { status: 400 });
+  }
+  await ensureDbPromise();
+  const userId = await routeUserId(request, env);
+  if (!userId) {
+    return new Response("Sign in required", { status: 401 });
+  }
   try {
-    key = new URL(request.url).searchParams.get("key")?.trim() ?? "";
+    await requireAppRole(target.appId, userId, "push");
   } catch {
-    return undefined;
+    return new Response("forbidden", { status: 403 });
   }
-  if (!(appId && bucket && key)) {
-    return undefined;
+  const rc = runnerConfig(env);
+  if (!rc) {
+    return new Response("RUNNER_TOKEN is not configured", { status: 500 });
   }
-  return { appId, bucket, key };
+  const upstream =
+    `${rc.runner}/v1/apps/${encodeURIComponent(target.appId)}` +
+    `/storage/r2/${encodeURIComponent(target.bucket)}/object` +
+    `?key=${encodeURIComponent(target.key)}`;
+  // Node/undici require `duplex: "half"` for a streamed request body; workerd
+  // takes the stream either way and ignores the member (RequestInit has no
+  // field for it, hence the widened local).
+  const init: RequestInit & { duplex?: "half" } = {
+    body: request.body,
+    duplex: "half",
+    headers: {
+      authorization: `Bearer ${rc.token}`,
+      "content-type":
+        request.headers.get("content-type") ?? "application/octet-stream",
+    },
+    method: "PUT",
+  };
+  const res = await fetch(upstream, init);
+  return new Response(await res.text(), {
+    headers: { "content-type": "application/json" },
+    status: res.status,
+  });
 };
 
 /** Machine ingest for tenant apps (LogSnag-style event API): Bearer
@@ -451,7 +576,7 @@ const forwardIngest: RouteHandler = async (request, env, params) => {
 /** Browser download for one R2 object: session + view-role gate, then proxy
  * the runner's raw bytes (the browser never sees RUNNER_TOKEN). */
 const handleR2Raw: RouteHandler = async (request, env, params) => {
-  const target = r2RawTarget(request, params);
+  const target = r2ObjectTarget(request, params);
   if (!target) {
     return new Response("app, bucket, and key required", { status: 400 });
   }
@@ -492,14 +617,22 @@ const proxyRunnerStream = async (
     return new Response("app required", { status: 400 });
   }
   await ensureDbPromise();
-  const userId = await routeUserId(request, env);
-  if (!userId) {
-    return new Response("Sign in required", { status: 401 });
-  }
-  try {
-    await requireAppRole(appId, userId, "view");
-  } catch {
-    return new Response("forbidden", { status: 403 });
+  if (appId === CONTROL_APP_ID) {
+    // The control plane's own telemetry: instance admin, never impersonating.
+    const refusal = await controlStreamRefusal(request, env);
+    if (refusal) {
+      return refusal;
+    }
+  } else {
+    const userId = await routeUserId(request, env);
+    if (!userId) {
+      return new Response("Sign in required", { status: 401 });
+    }
+    try {
+      await requireAppRole(appId, userId, "view");
+    } catch {
+      return new Response("forbidden", { status: 403 });
+    }
   }
   const rc = runnerConfig(env);
   if (!rc) {
@@ -793,14 +926,22 @@ const handleMetricsStream: RouteHandler = async (request, env, params) => {
     return new Response("app required", { status: 400 });
   }
   await ensureDbPromise();
-  const userId = await routeUserId(request, env);
-  if (!userId) {
-    return new Response("Sign in required", { status: 401 });
-  }
-  try {
-    await requireAppRole(appId, userId, "view");
-  } catch {
-    return new Response("forbidden", { status: 403 });
+  if (appId === CONTROL_APP_ID) {
+    // The control plane's own telemetry: instance admin, never impersonating.
+    const refusal = await controlStreamRefusal(request, env);
+    if (refusal) {
+      return refusal;
+    }
+  } else {
+    const userId = await routeUserId(request, env);
+    if (!userId) {
+      return new Response("Sign in required", { status: 401 });
+    }
+    try {
+      await requireAppRole(appId, userId, "view");
+    } catch {
+      return new Response("forbidden", { status: 403 });
+    }
   }
   const rc = runnerConfig(env);
   if (!rc) {
@@ -866,6 +1007,7 @@ router.on("POST", "/webhook", handleWebhook);
 router.on("POST", "/internal/git-auth", handleGitAuth);
 router.on("POST", "/internal/recovery", handleRecovery);
 router.on("GET", "/storage/:appId/r2/:bucket/raw", handleR2Raw);
+router.on("PUT", "/storage/:appId/r2/:bucket/upload", handleR2Upload);
 router.on("GET", "/api/apps/:appId/logs/stream", handleLogsStream);
 router.on("GET", "/api/apps/:appId/deploys/stream", handleDeploysStream);
 router.on("GET", "/api/apps/:appId/events/stream", handleEventsStream);

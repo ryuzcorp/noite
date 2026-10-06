@@ -28,9 +28,7 @@ pub fn tail_utf8(s: &str, max: usize) -> &str {
 /// plain-text deploy log.
 pub fn strip_ansi(s: &str) -> std::borrow::Cow<'_, str> {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("ansi re")
-    });
+    let re = RE.get_or_init(|| regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("ansi re"));
     re.replace_all(s, "")
 }
 
@@ -97,7 +95,10 @@ mod tests {
 
     #[test]
     fn strip_ansi_removes_colors() {
-        assert_eq!(strip_ansi("\x1b[32m✓\x1b[39m built in \x1b[1m34ms\x1b[22m"), "✓ built in 34ms");
+        assert_eq!(
+            strip_ansi("\x1b[32m✓\x1b[39m built in \x1b[1m34ms\x1b[22m"),
+            "✓ built in 34ms"
+        );
     }
 
     #[test]

@@ -7,13 +7,14 @@ Noite is alpha and self-hosted: you run it, so you decide who gets an account. T
 
 ## Tenant isolation
 
-Under `NOITE_TENANCY=multi` ([Tenancy](/self-hosting/tenancy)) tenant code runs as unprivileged users, with a cleared environment and an egress policy. That is a sandbox for **semi-trusted** tenants, not for adversaries:
+Under `NOITE_TENANCY=multi` ([Tenancy](/self-hosting/tenancy)) tenant code runs as unprivileged users, with a cleared environment and an egress policy. Builds and release commands run as **one uid per app**, so two concurrent builds cannot read each other's worktrees or caches. That is still a sandbox for **semi-trusted** tenants, not for adversaries:
 
-- **Shared build user.** Every build runs as the same uid. Two builds at once can read each other's worktrees.
 - **Root bucket keys in fleets.** A fleet's celld process holds the object store's root keys, so a compromised tenant process can reach every prefix: other apps' source bundles, databases and telemetry. Scoped per-app keys are the fix.
 - **Object store reachable from Worker code.** The store's unauthenticated surface (it answers 401/403) is the one private address tenants may reach, because celld needs it.
 - **No per-app memory cap.** Fleets share the container's memory. One app's growth pushes every app toward the same shed threshold.
 - **No container per build.** Depth is uid, environment, resource limits and egress rules. Rootless containers or gVisor are not planned unless tenants are expected to be hostile.
+
+The remaining gaps are tracked here: [Noite roadmap board](https://github.com/orgs/ryuzcorp/projects/1) (the "harden multi-tenant mode" item is still a draft).
 
 If a tenant is not someone you would give shell access to a shared server, do not give them a push key yet.
 
@@ -28,8 +29,9 @@ A hostname is reserved on first claim, and Noite does not check DNS or ownership
 
 ## Operations
 
-- **Upgrades restart every app.** A new image restarts the runner, and every tenant fleet cold-boots with it (about a minute for many apps). There is no rolling upgrade: batch them and run them off-peak.
+- **Upgrades restart every app.** A new image restarts the runner, and every tenant fleet cold-boots with it. There is no rolling upgrade, but the window is short: measured on a 32-core host with 1, 5 and 15 apps, every app was serving again within 5.1 s of the new container starting (the fastest fleet in ~2.1 s), because the runner starts every fleet before it deploys the control UI and the fleets boot in parallel. The edge holds a visitor's request for up to 20 s and answers it when the fleet is up, so the wait is a slow response rather than an error; the installer warns and asks before recreating a changed image. Batch them and run them off-peak anyway ([Operations](/self-hosting/operations#updating)).
 - **Downgrades across a schema change are refused.** The runner and control databases carry a schema version; an older image will not start on newer data. Back up before upgrading ([Operations](/self-hosting/operations#releases-and-channels)).
 - **Snapshot loss window.** The runner's SQLite is snapshotted to the bucket about every 70 seconds, so a lost volume loses at most that much recent state.
+- **Telemetry recovery is bounded by retention.** Metrics, logs and errors are rebuilt from bucket Parquet: a failed ingest pass now holds its watermark and catches up hour by hour, and an upgrade replays the retention window once. Nothing older than `RUNNER_TELEMETRY_RETENTION_DAYS` (30 days by default) can be recovered — celld has pruned it ([Telemetry](/self-hosting/storage#replaying-a-window)).
 - **One node.** The control UI and the runner restart together and nothing fails over; availability is that of the one container and its bucket.
 - **RustFS is not a qualified store.** It is the zero-config default and passes celld's startup check, but for production use one celld qualifies: S3, R2, GCS, Tigris or Azure Blob ([Storage](/self-hosting/storage)).

@@ -15,12 +15,10 @@ mod lifecycle;
 mod models;
 mod recover;
 mod schema_version;
+mod telemetry;
 
 use std::collections::HashSet;
-use std::sync::{
-    Arc,
-    atomic::AtomicBool,
-};
+use std::sync::{atomic::AtomicBool, Arc};
 
 use axum::{
     middleware,
@@ -72,6 +70,10 @@ async fn main() -> anyhow::Result<()> {
         let config = Config::from_env()?;
         return recover::run(&config, &argv[1..]).await;
     }
+    if argv.first().map(String::as_str) == Some("telemetry") {
+        let config = Config::from_env()?;
+        return telemetry::run(&config, &argv[1..]).await;
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -85,6 +87,47 @@ async fn main() -> anyhow::Result<()> {
 
     // Before anything writes to /data: private by default (SPEC, Data directory).
     host::isolation::harden_data_dir(&config);
+
+    // Wall clock for the boot-phase log lines below (fleet start vs control UI).
+    let boot = std::time::Instant::now();
+
+    // Signal handling before anything is spawned or uploaded: Caddy, the
+    // control fleet and every tenant fleet below are children of this process,
+    // and a SIGTERM that lands while they are starting must run the whole stop
+    // contract (SIGTERM to each child, the stop budget, the final bucket
+    // snapshot) instead of the default hard exit, which would SIGKILL them with
+    // the container and skip the snapshot. Compose's `stop_grace_period` is the
+    // outer bound (SPEC, Shutdown).
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_signal = shutdown.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+            let mut sigint =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+            loop {
+                tokio::select! {
+                    v = async { match sigterm.as_mut() { Some(s) => s.recv().await, None => std::future::pending().await } } => {
+                        if v.is_some() {
+                            break;
+                        }
+                    }
+                    v = async { match sigint.as_mut() { Some(s) => s.recv().await, None => std::future::pending().await } } => {
+                        if v.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.ok();
+        }
+        shutdown_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
 
     host::cmd::ensure_buckets(&config).await?;
 
@@ -108,12 +151,19 @@ async fn main() -> anyhow::Result<()> {
     // Isolation: nft egress policy first, then self-checks (SPEC, Egress policy + Tenancy mode).
     // Only in multi tenancy: the single tenant is trusted, and the policy
     // would also cut single-tenant release commands off from the bucket.
-    let nft_installed = match (config.tenancy, config.build_uid, config.fleet_uid) {
-        (config::Tenancy::Multi, Some(b), Some(f)) => {
+    // The build range is `None` when uid drops are disabled; fleets are
+    // still policed (builds are refused separately).
+    let build_uids = config.build_uid_base.map(|b| (b, config.build_uid_range));
+    let nft_installed = match (config.tenancy, config.fleet_uid) {
+        (config::Tenancy::Multi, Some(f)) => {
             let storage = host::netisolation::storage_target(&config.s3_endpoint).await;
-            let ok = host::netisolation::ensure(b, f, &storage).await;
+            let ok = host::netisolation::ensure(build_uids, f, &storage).await;
             if ok {
-                host::netisolation::spawn_storage_refresh(b, f, config.s3_endpoint.clone());
+                host::netisolation::spawn_storage_refresh(
+                    build_uids,
+                    f,
+                    config.s3_endpoint.clone(),
+                );
             }
             ok
         }
@@ -127,20 +177,11 @@ async fn main() -> anyhow::Result<()> {
         tracing::error!(detail = %isolation.detail, "multi-tenant isolation checks failed; /ready stays 503");
     }
 
-    // Control fleet #0: deploy the bundle baked into the image, then run it.
-    // The dev image has no bundle: `vite dev` serves the UI on the same port
-    // (docker/dev.sh), so there is nothing to deploy or supervise.
-    let control_child = if control_bundle_present(&config) {
-        if let Err(e) = host::control::ensure_deployed(&config).await {
-            tracing::warn!(error = %e, "control fleet deploy failed; continuing");
-        }
-        Some(supervise_control(&config))
-    } else {
-        tracing::info!("no control bundle (dev image): the UI is served by vite dev");
-        None
-    };
-    // The edge: Caddy as a supervised child, with a placeholder config until
-    // the first reconcile writes the real one.
+    // The edge first: Caddy as a supervised child, on the Caddyfile the volume
+    // already has (or a placeholder until the first reconcile writes the real
+    // one). It starts before the control deploy and before the fleets, so the
+    // route a visitor hits is live — or answering the starting page — for the
+    // whole boot, and nothing below it can hold the tenants up.
     host::children::ensure_bootstrap_caddyfile(&config.caddyfile_path).await?;
     // Before the first Caddyfile: whether this Caddy can take rate limits.
     host::caddy::detect_modules().await;
@@ -170,7 +211,11 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "compaction restore"),
     }
     let ready = Arc::new(AtomicBool::new(false));
-    let shutdown = Arc::new(AtomicBool::new(false));
+    // Pid of the running control node (0 when none). The reconcile loop's
+    // metrics ingest samples its CPU and treats it as a live telemetry source,
+    // exactly like a tenant fleet — the control fleet has no app row, so this
+    // slot is how it reaches the loop.
+    let control_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
     // Push-driven tips (T2.2): the Git adapter notifies, the loop drains.
     let (tip_tx, tip_rx) = host::tips::channel();
     // Ingest "new logs" signal for the log stream (spec T3.3).
@@ -189,7 +234,11 @@ async fn main() -> anyhow::Result<()> {
         ready: ready.clone(),
         isolation: Arc::new(tokio::sync::RwLock::new(isolation)),
         state_sync: state_sync.clone(),
-        bucket_ok: Arc::new(tokio::sync::RwLock::new((true, String::new(), std::time::Instant::now()))),
+        bucket_ok: Arc::new(tokio::sync::RwLock::new((
+            true,
+            String::new(),
+            std::time::Instant::now(),
+        ))),
     };
 
     let cfg_loop = (*config).clone();
@@ -198,6 +247,7 @@ async fn main() -> anyhow::Result<()> {
         pool.clone(),
         cfg_loop,
         procs.clone(),
+        control_pid.clone(),
         logs.clone(),
         deploying.clone(),
         metrics,
@@ -206,7 +256,36 @@ async fn main() -> anyhow::Result<()> {
         tip_rx,
         log_tx_loop,
     ));
+    // Tenant fleets boot from here (the loop's first tick spawns them all, in
+    // this same millisecond). The control UI is deployed after them on purpose:
+    // on an upgrade the baked UI bundle carries a new revision, so
+    // `ensure_deployed` uploads it — measured 0.66 s against a local store and
+    // more against a remote one — and that upload must not delay a tenant.
+    tracing::info!(
+        ms = boot.elapsed().as_millis(),
+        "tenant fleets booting; control UI deploys next"
+    );
 
+    // The socket is listening while the control deploy below runs (a proxied
+    // request waits in the backlog instead of failing to connect); signal
+    // handling is already installed above, before any child was spawned.
+    let listener = tokio::net::TcpListener::bind(&config.bind).await?;
+    tracing::info!(bind = %config.bind, "noite-runner listening");
+
+    // Control fleet #0: deploy the bundle baked into the image, then run it.
+    // The dev image has no bundle: `vite dev` serves the UI on the same port
+    // (docker/dev.sh), so there is nothing to deploy or supervise.
+    let control_child = if host::control::bundle_present(&config) {
+        if let Err(e) = host::control::ensure_deployed(&config).await {
+            tracing::warn!(error = %e, "control fleet deploy failed; continuing");
+        }
+        let child = supervise_control(&config, control_pid.clone(), logs.clone());
+        tracing::info!(ms = boot.elapsed().as_millis(), "control bundle ready");
+        Some(child)
+    } else {
+        tracing::info!("no control bundle (dev image): the UI is served by vite dev");
+        None
+    };
 
     let app = Router::new()
         .route("/health", get(api::health))
@@ -219,7 +298,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/apps", get(api::list_apps).post(api::create_app))
         .route(
             "/v1/apps/{id}",
-            get(api::get_app).patch(api::patch_app).delete(api::delete_app),
+            get(api::get_app)
+                .patch(api::patch_app)
+                .delete(api::delete_app),
         )
         .route("/v1/apps/{id}/rename", post(api::rename_app))
         .route("/v1/apps/{id}/sleep", post(api::sleep_app))
@@ -232,7 +313,10 @@ async fn main() -> anyhow::Result<()> {
             delete(api::remove_domain),
         )
         .route("/v1/apps/{id}/deploys", get(api::list_deploys))
-        .route("/v1/apps/{id}/deploys/{deploy_id}/log", get(api::deploy_log))
+        .route(
+            "/v1/apps/{id}/deploys/{deploy_id}/log",
+            get(api::deploy_log),
+        )
         .route("/v1/apps/{id}/rollback", post(api::rollback))
         .route(
             "/v1/apps/{id}/deploys/stream",
@@ -246,41 +330,58 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/apps/{id}/devices", get(api::app_devices))
         .route("/v1/apps/{id}/paths", get(api::app_paths))
         .route("/v1/apps/{id}/refs", get(api::app_refs))
-        .route("/v1/apps/{id}/metrics/version", get(api::app_metrics_version))
+        .route(
+            "/v1/apps/{id}/metrics/version",
+            get(api::app_metrics_version),
+        )
         .route("/v1/apps/{id}/errors/stream", get(api::list_errors_stream))
         .route("/v1/apps/{id}/spans", get(api::app_spans))
-        .route("/v1/apps/{id}/events", get(api::list_events).post(api::log_event))
+        .route(
+            "/v1/apps/{id}/events",
+            get(api::list_events).post(api::log_event),
+        )
         .route("/v1/apps/{id}/events/stream", get(api::list_events_stream))
         .route("/v1/apps/{id}/events/channels", get(api::list_channels))
         .route("/v1/apps/{id}/identify", post(api::identify_user))
-        .route("/v1/apps/{id}/users/{user_id}/props", get(api::get_user_props))
-        .route("/v1/apps/{id}/insights", get(api::list_insights).post(api::set_insight))
+        .route(
+            "/v1/apps/{id}/users/{user_id}/props",
+            get(api::get_user_props),
+        )
+        .route(
+            "/v1/apps/{id}/insights",
+            get(api::list_insights).post(api::set_insight),
+        )
         .route("/v1/apps/{id}/logs", get(api::app_logs))
         .route("/v1/apps/{id}/logs/stream", get(api::app_logs_stream))
         .route("/v1/apps/{id}/storage", get(api::app_storage))
         .route(
-            "/v1/apps/{id}/storage/d1/{database_id}",
-            get(api::app_d1),
+            "/v1/apps/{id}/storage/d1/{database_id}/tables",
+            get(api::app_d1_tables),
+        )
+        .route(
+            "/v1/apps/{id}/storage/d1/{database_id}/tables/{table}/schema",
+            get(api::app_d1_schema),
+        )
+        .route(
+            "/v1/apps/{id}/storage/d1/{database_id}/tables/{table}/rows",
+            post(api::app_d1_rows),
         )
         .route(
             "/v1/apps/{id}/storage/d1/{database_id}/write",
             post(api::app_d1_write),
         )
         .route(
-            "/v1/apps/{id}/source/commit",
-            post(api::app_source_commit),
+            "/v1/apps/{id}/storage/d1/{database_id}/delete-rows",
+            post(api::app_d1_delete_rows),
         )
-        .route(
-            "/v1/apps/{id}/storage/do/{class_name}",
-            get(api::app_do),
-        )
-        .route(
-            "/v1/apps/{id}/storage/r2/{bucket}",
-            get(api::app_r2),
-        )
+        .route("/v1/apps/{id}/source/commit", post(api::app_source_commit))
+        .route("/v1/apps/{id}/storage/do/{class_name}", get(api::app_do))
+        .route("/v1/apps/{id}/storage/r2/{bucket}", get(api::app_r2))
         .route(
             "/v1/apps/{id}/storage/r2/{bucket}/object",
-            get(api::app_r2_object).delete(api::app_r2_delete),
+            get(api::app_r2_object)
+                .put(api::app_r2_put)
+                .delete(api::app_r2_delete),
         )
         .route(
             "/v1/apps/{id}/storage/r2/{bucket}/raw",
@@ -289,10 +390,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/apps/{id}/env", get(api::list_env).post(api::set_env))
         .route("/v1/apps/{id}/env/{name}", delete(api::delete_env))
         .route("/rpc", post(api::handle_rpc))
-        .route(
-            "/v1/git/{slug}/info/refs",
-            get(host::git_http::info_refs),
-        )
+        .route("/v1/git/{slug}/info/refs", get(host::git_http::info_refs))
         .route(
             "/v1/git/{slug}/git-upload-pack",
             post(host::git_http::upload_pack),
@@ -303,17 +401,22 @@ async fn main() -> anyhow::Result<()> {
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            |axum::extract::State(s): axum::extract::State<AppState>,
-             req,
-             next| async move { auth::require_bearer(s, req, next).await },
+            |axum::extract::State(s): axum::extract::State<AppState>, req, next| async move {
+                auth::require_bearer(s, req, next).await
+            },
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             |axum::extract::State(s): axum::extract::State<AppState>,
              req: axum::http::Request<axum::body::Body>,
              next: axum::middleware::Next| async move {
-                let dirty = matches!(req.method(), &axum::http::Method::POST | &axum::http::Method::PATCH | &axum::http::Method::PUT | &axum::http::Method::DELETE)
-                    && req.uri().path().starts_with("/v1/");
+                let dirty = matches!(
+                    req.method(),
+                    &axum::http::Method::POST
+                        | &axum::http::Method::PATCH
+                        | &axum::http::Method::PUT
+                        | &axum::http::Method::DELETE
+                ) && req.uri().path().starts_with("/v1/");
                 let resp = next.run(req).await;
                 if dirty && resp.status().is_success() {
                     s.state_sync.mark_dirty();
@@ -325,38 +428,6 @@ async fn main() -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(&config.bind).await?;
-    tracing::info!(bind = %config.bind, "noite-runner listening");
-    // Graceful shutdown (SPEC, Shutdown): SIGTERM/SIGINT stops the listener, then all
-    // fleets in parallel under one budget, then a final bucket snapshot.
-    // Caddy stops last so in-flight requests drain.
-    let shutdown_signal = shutdown.clone();
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
-            let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
-            loop {
-                tokio::select! {
-                    v = async { match sigterm.as_mut() { Some(s) => s.recv().await, None => std::future::pending().await } } => {
-                        if v.is_some() {
-                            break;
-                        }
-                    }
-                    v = async { match sigint.as_mut() { Some(s) => s.recv().await, None => std::future::pending().await } } => {
-                        if v.is_some() {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            tokio::signal::ctrl_c().await.ok();
-        }
-        shutdown_signal.store(true, std::sync::atomic::Ordering::Relaxed);
-    });
     let budget = std::time::Duration::from_millis(config.stop_budget_ms);
     axum::serve(listener, app)
         .with_graceful_shutdown({
@@ -382,31 +453,49 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn control_bundle_present(config: &Config) -> bool {
-    let dir = std::path::Path::new(&config.control_bundle_dir);
-    dir.join("wrangler.json").exists() || dir.join("wrangler.jsonc").exists()
-}
-
 /// Control fleet #0: celld with the public listener on loopback
 /// (Caddy is in the same container) and the internal one on the private
 /// address (see `host::control::control_advertise`). Supervised: restarted
-/// on exit, stopped with the fleets on shutdown.
-fn supervise_control(config: &Config) -> host::children::Supervised {
+/// on exit, stopped with the fleets on shutdown. It runs the same telemetry
+/// environment as a tenant fleet (`metrics::otel_env`), so its Parquet lands
+/// under `s3://<bucket>/control/telemetry/...` (celld writes `telemetry/`
+/// relative to `--bucket`) and the ingest, compaction, error grouping and
+/// prune treat it as one more source — keyed `_control`, with no `app` row.
+/// Its pid is mirrored into `control_pid` and its stdout+stderr into the
+/// shared log buffer under the same key.
+fn supervise_control(
+    config: &Config,
+    control_pid: Arc<std::sync::atomic::AtomicU32>,
+    logs: LogState,
+) -> host::children::Supervised {
     let args = host::control::spawn_args(config);
     let shutdown_ms = config.fleet_shutdown_ms().to_string();
     let celld = config.celld_bin.clone();
-    host::children::Supervised::start("control", move || {
-        let state_dir = "/data/control";
-        let _ = std::fs::create_dir_all(state_dir);
-        let mut cmd = tokio::process::Command::new(&celld);
-        cmd.args(&args)
-            .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
-            .env("CELLD_WATCH", state_dir)
-            .env("CELLD_READY_FLEET_GATE_MS", "15000")
-            .env("CELLD_DURABILITY", "bucket")
-            .env("CELLD_SHUTDOWN_TOTAL_MS", &shutdown_ms);
-        cmd
-    })
+    let otel = host::metrics::otel_env(config);
+    host::children::Supervised::start_observed(
+        "control",
+        Some(control_pid),
+        Some((logs, host::control::SLUG.to_string())),
+        move || {
+            let state_dir = "/data/control";
+            let _ = std::fs::create_dir_all(state_dir);
+            let mut cmd = tokio::process::Command::new(&celld);
+            cmd.args(&args)
+                .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
+                .env("CELLD_WATCH", state_dir)
+                .env("CELLD_READY_FLEET_GATE_MS", "15000")
+                .env("CELLD_DURABILITY", "bucket")
+                .env("CELLD_SHUTDOWN_TOTAL_MS", &shutdown_ms)
+                // Piped so the supervisor captures the node's own log into the
+                // shared buffer (the OTel ring carries the worker's console).
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            for (key, value) in &otel {
+                cmd.env(key, value);
+            }
+            cmd
+        },
+    )
 }
 
 /// Caddy: admin on its default 127.0.0.1:2019, where the runner
@@ -416,13 +505,19 @@ fn supervise_caddy(config: &Config) -> host::children::Supervised {
     let caddyfile = config.caddyfile_path.clone();
     host::children::Supervised::start("caddy", move || {
         let mut cmd = tokio::process::Command::new("caddy");
-        cmd.args(["run", "--config", &caddyfile, "--adapter", "caddyfile", "--watch"])
-            // Certificates and ACME state in the volume, not in the
-            // container's $HOME: a recreate must not re-issue every cert
-            // (CA rate limits) or lose the on-demand ones.
-            .env("XDG_DATA_HOME", "/data/caddy/data")
-            .env("XDG_CONFIG_HOME", "/data/caddy/config");
+        cmd.args([
+            "run",
+            "--config",
+            &caddyfile,
+            "--adapter",
+            "caddyfile",
+            "--watch",
+        ])
+        // Certificates and ACME state in the volume, not in the
+        // container's $HOME: a recreate must not re-issue every cert
+        // (CA rate limits) or lose the on-demand ones.
+        .env("XDG_DATA_HOME", "/data/caddy/data")
+        .env("XDG_CONFIG_HOME", "/data/caddy/config");
         cmd
     })
 }
-

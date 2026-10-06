@@ -84,7 +84,7 @@ export const Authed = ({
         return;
       }
       invalidateSession();
-      navigate("/god-mode");
+      navigate("/apps/_control?t=users");
     } catch (error) {
       returnError.set(errorMessage(error));
       returning.set(false);

@@ -88,7 +88,7 @@ pub fn is_not_found(err: &anyhow::Error) -> bool {
 
 /// Recursively hand `path` to (uid, gid) without following symlinks: a tenant
 /// tree can contain `x -> /data/noite.sqlite`, and a following chown run by
-/// the runner (CAP_CHOWN) would give the build user the platform database.
+/// the runner (CAP_CHOWN) would give the build uid the platform database.
 /// `lchown` changes the link itself, and links are never descended into.
 /// Returns false when any entry could not be changed.
 #[cfg(unix)]
@@ -214,7 +214,7 @@ pub async fn run_sandboxed(
     cwd: &Path,
     sb: &Sandbox<'_>,
     timeout: Duration,
- ) -> anyhow::Result<String> {
+) -> anyhow::Result<String> {
     super::stats::count_spawn(program);
     use std::os::unix::process::CommandExt;
     let tmp = cwd.join(".tmp-sandbox");
@@ -268,11 +268,14 @@ pub async fn run_sandboxed(
         unsafe {
             std_cmd.pre_exec(move || {
                 // RLIMIT_NPROC counts every process of the real uid, so it is
-                // only meaningful for the dedicated build user; on the
+                // only meaningful for the dedicated build uid; on the
                 // runner's own uid (dev, single tenancy) it would cap the
                 // runner and its fleets too.
                 if drops_uid {
-                    let nproc = libc::rlimit { rlim_cur: 512, rlim_max: 512 };
+                    let nproc = libc::rlimit {
+                        rlim_cur: 512,
+                        rlim_max: 512,
+                    };
                     libc::setrlimit(libc::RLIMIT_NPROC, &nproc);
                 }
                 let fsize = libc::rlimit {
@@ -289,7 +292,7 @@ pub async fn run_sandboxed(
     let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
     // Whatever happened, nothing the step started may outlive it: a build
     // that leaves a watcher or a server behind would keep running as the
-    // build user between steps. The group id is the child's pid
+    // build uid between steps. The group id is the child's pid
     // (process_group(0)); ESRCH when the group is already empty is fine.
     #[cfg(unix)]
     if let Some(pid) = pid {
@@ -305,7 +308,11 @@ pub async fn run_sandboxed(
                 let out = String::from_utf8_lossy(&output.stdout);
                 // stdout first: a build's progress goes there and its error to
                 // stderr, and the deploy log keeps the tail.
-                bail!("{program} {:?} exit {:?}\n{out}{err}", args, output.status.code());
+                bail!(
+                    "{program} {:?} exit {:?}\n{out}{err}",
+                    args,
+                    output.status.code()
+                );
             }
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         }
@@ -318,45 +325,45 @@ pub async fn run_sandboxed(
     }
 }
 
- pub async fn run_cmd(
-     program: &str,
-     args: &[&str],
-     cwd: Option<&Path>,
-     env: &[(&str, &str)],
-     timeout: Duration,
- ) -> anyhow::Result<String> {
+pub async fn run_cmd(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+    timeout: Duration,
+) -> anyhow::Result<String> {
     super::stats::count_spawn(program);
     let mut cmd = Command::new(program);
-     cmd.args(args)
+    cmd.args(args)
         .env_clear()
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("LANG", "C.UTF-8")
         .env("HOME", "/root")
-         .stdout(std::process::Stdio::piped())
-         .stderr(std::process::Stdio::piped())
-         .kill_on_drop(true);
-     if let Some(cwd) = cwd {
-         cmd.current_dir(cwd);
-     }
-     for (k, v) in env {
-         cmd.env(k, v);
-     }
-     let child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
-     let output = tokio::time::timeout(timeout, child.wait_with_output())
-         .await
-         .context("command timeout")?
-         .context("wait output")?;
-     if !output.status.success() {
-         let err = String::from_utf8_lossy(&output.stderr);
-         let out = String::from_utf8_lossy(&output.stdout);
-         bail!(
-             "{program} {:?} exit {:?}\n{err}{out}",
-             args,
-             output.status.code()
-         );
-     }
-     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
- }
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .context("command timeout")?
+        .context("wait output")?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        let out = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "{program} {:?} exit {:?}\n{err}{out}",
+            args,
+            output.status.code()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
 
 pub fn aws_env(cfg: &Config) -> Vec<(&str, String)> {
     vec![
@@ -392,9 +399,17 @@ fn s3_bucket(cfg: &Config, bucket: &str) -> anyhow::Result<(Bucket, Credentials)
         .s3_endpoint
         .parse()
         .with_context(|| format!("S3_ENDPOINT is not a URL: {}", cfg.s3_endpoint))?;
-    let handle = Bucket::new(endpoint, UrlStyle::Path, bucket.to_string(), cfg.aws_region.clone())
-        .context("S3 bucket handle")?;
-    let creds = Credentials::new(cfg.aws_access_key_id.clone(), cfg.aws_secret_access_key.clone());
+    let handle = Bucket::new(
+        endpoint,
+        UrlStyle::Path,
+        bucket.to_string(),
+        cfg.aws_region.clone(),
+    )
+    .context("S3 bucket handle")?;
+    let creds = Credentials::new(
+        cfg.aws_access_key_id.clone(),
+        cfg.aws_secret_access_key.clone(),
+    );
     Ok((handle, creds))
 }
 
@@ -475,7 +490,9 @@ pub async fn ensure_buckets(cfg: &Config) -> anyhow::Result<()> {
     // without versioning permission.
     match put_bucket_versioning(cfg).await {
         Ok(()) => tracing::info!(bucket, "s3 versioning suspended"),
-        Err(e) => tracing::warn!(bucket, error = %format!("{e:#}"), "s3 versioning not set (non-fatal)"),
+        Err(e) => {
+            tracing::warn!(bucket, error = %format!("{e:#}"), "s3 versioning not set (non-fatal)")
+        }
     }
     // Versioning on its own is unbounded: a celld node rewrites its keys
     // continuously, and this fleet bucket reached 72,390 versions for 647
@@ -491,8 +508,13 @@ pub async fn ensure_buckets(cfg: &Config) -> anyhow::Result<()> {
     // Best-effort like the versioning call above: BYOB keys are often scoped
     // without lifecycle permission.
     match put_bucket_lifecycle(cfg).await {
-        Ok(()) => tracing::info!(bucket, "s3 lifecycle: noncurrent versions expire after a day"),
-        Err(e) => tracing::warn!(bucket, error = %format!("{e:#}"), "s3 lifecycle not set (non-fatal)"),
+        Ok(()) => tracing::info!(
+            bucket,
+            "s3 lifecycle: noncurrent versions expire after a day"
+        ),
+        Err(e) => {
+            tracing::warn!(bucket, error = %format!("{e:#}"), "s3 lifecycle not set (non-fatal)")
+        }
     }
     tracing::info!(bucket, "s3 bucket ready (prefixes git/, fleets/)");
     Ok(())
@@ -506,8 +528,15 @@ pub async fn s3_head_bucket(cfg: &Config) -> bool {
     let Ok((handle, creds)) = s3_bucket(cfg, &bucket) else {
         return false;
     };
-    let url = handle.head_bucket(Some(&creds)).sign(Duration::from_secs(300));
-    let Ok(resp) = http_client().head(url).timeout(Duration::from_secs(10)).send().await else {
+    let url = handle
+        .head_bucket(Some(&creds))
+        .sign(Duration::from_secs(300));
+    let Ok(resp) = http_client()
+        .head(url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    else {
         return false;
     };
     resp.status().is_success()
@@ -522,8 +551,15 @@ async fn s3_endpoint_up(cfg: &Config) -> bool {
     let Ok((handle, creds)) = s3_bucket(cfg, &bucket) else {
         return false;
     };
-    let url = handle.head_bucket(Some(&creds)).sign(Duration::from_secs(300));
-    let Ok(resp) = http_client().head(url).timeout(Duration::from_secs(10)).send().await else {
+    let url = handle
+        .head_bucket(Some(&creds))
+        .sign(Duration::from_secs(300));
+    let Ok(resp) = http_client()
+        .head(url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    else {
         return false;
     };
     !resp.status().is_server_error()
@@ -582,13 +618,19 @@ fn sigv4_authorization(
     let scope = format!("{date_stamp}/{region}/{service}/aws4_request");
     let mut hasher = Sha256::new();
     hasher.update(canonical_request.as_bytes());
-    let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{:x}", hasher.finalize());
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{:x}",
+        hasher.finalize()
+    );
     let sign = |key: &[u8], msg: &[u8]| {
         let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
         mac.update(msg);
         mac.finalize().into_bytes().to_vec()
     };
-    let k_date = sign(format!("AWS4{secret_key}").as_bytes(), date_stamp.as_bytes());
+    let k_date = sign(
+        format!("AWS4{secret_key}").as_bytes(),
+        date_stamp.as_bytes(),
+    );
     let k_region = sign(&k_date, region.as_bytes());
     let k_service = sign(&k_region, service.as_bytes());
     let k_signing = sign(&k_service, b"aws4_request");
@@ -639,7 +681,10 @@ async fn put_bucket_config(cfg: &Config, subresource: &str, body: &str) -> anyho
         &cfg.aws_access_key_id,
         &cfg.aws_secret_access_key,
     );
-    let url = format!("{}{canonical_uri}?{subresource}", cfg.s3_endpoint.trim_end_matches('/'));
+    let url = format!(
+        "{}{canonical_uri}?{subresource}",
+        cfg.s3_endpoint.trim_end_matches('/')
+    );
     let resp = http_client()
         .put(url)
         .header("x-amz-date", amz_date)
@@ -856,11 +901,126 @@ pub async fn run_cmd_stdin(
 }
 
 /// One S3 object plus the fields the CLI's JSON listing carried for it.
-struct S3Object {
-    key: String,
-    last_modified: String,
-    size: u64,
-    etag: String,
+pub(crate) struct S3Object {
+    pub(crate) key: String,
+    pub(crate) last_modified: String,
+    pub(crate) size: u64,
+    pub(crate) etag: String,
+}
+
+/// One native LIST response: one request's objects, common prefixes and the
+/// token that continues it. Callers that page keep the token; callers that
+/// do not use `s3_list_raw`.
+pub(crate) struct S3Page {
+    pub(crate) objects: Vec<S3Object>,
+    pub(crate) prefixes: Vec<String>,
+    pub(crate) next: Option<String>,
+}
+
+/// One bounded LIST request (unlike `s3_list_raw`, which merges every page).
+pub(crate) async fn s3_list_page(
+    cfg: &Config,
+    bucket_name: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    max_keys: usize,
+    continuation: Option<&str>,
+) -> anyhow::Result<S3Page> {
+    let (handle, creds) = s3_bucket(cfg, bucket_name)?;
+    super::stats::count_s3("list", 0, 0);
+    let mut action = handle.list_objects_v2(Some(&creds));
+    action.with_prefix(prefix.to_string());
+    action.with_max_keys(max_keys.clamp(1, 1000));
+    if let Some(delimiter) = delimiter {
+        action.with_delimiter(delimiter.to_string());
+    }
+    if let Some(token) = continuation {
+        action.with_continuation_token(token.to_string());
+    }
+    let url = action.sign(Duration::from_secs(300));
+    let resp = http_client()
+        .get(url)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .context("s3 LIST")?;
+    if !resp.status().is_success() {
+        return Err(s3_err("list", prefix, resp).await);
+    }
+    let text = resp.text().await.context("s3 LIST body")?;
+    let parsed = rusty_s3::actions::ListObjectsV2::parse_response(&text)
+        .with_context(|| "s3 LIST XML parse")?;
+    Ok(S3Page {
+        objects: parsed
+            .contents
+            .into_iter()
+            .map(|object| S3Object {
+                key: object.key,
+                last_modified: object.last_modified,
+                size: object.size,
+                etag: object.etag,
+            })
+            .collect(),
+        prefixes: parsed
+            .common_prefixes
+            .into_iter()
+            .map(|prefix| prefix.prefix)
+            .collect(),
+        next: parsed.next_continuation_token,
+    })
+}
+
+/// One object's record as a HEAD reports it: the size (S3 lists it too, but a
+/// single-key lookup has no listing) and the real `content-type` header celld
+/// writes for an R2 object.
+pub(crate) struct S3Head {
+    pub(crate) size: i64,
+    pub(crate) content_type: Option<String>,
+}
+
+/// `HEAD` one object: `None` when it does not exist (or the store refused).
+pub(crate) async fn s3_head_object(cfg: &Config, bucket: &str, key: &str) -> Option<S3Head> {
+    let (handle, creds) = s3_bucket(cfg, bucket).ok()?;
+    super::stats::count_s3("head", 0, 0);
+    let url = handle
+        .head_object(Some(&creds), key)
+        .sign(Duration::from_secs(300));
+    let resp = http_client()
+        .head(url)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let size = resp
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    Some(S3Head { size, content_type })
+}
+
+/// Download one object's whole body into memory.
+pub(crate) async fn s3_get_bytes(cfg: &Config, full_key: &str) -> anyhow::Result<Vec<u8>> {
+    let dir = work_root(cfg).join("r2-preview");
+    tokio::fs::create_dir_all(&dir).await?;
+    let dest = dir.join(format!(
+        "r2-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    s3_cp_download(cfg, &cfg.s3_uri(full_key), &dest).await?;
+    let bytes = tokio::fs::read(&dest).await?;
+    let _ = tokio::fs::remove_file(&dest).await;
+    Ok(bytes)
 }
 
 /// Paginated native LIST (the CLI returned one 1000-key page; every caller
@@ -928,8 +1088,10 @@ fn listings_json(objects: &[S3Object], prefixes: &[String]) -> String {
             })
         })
         .collect();
-    let common: Vec<serde_json::Value> =
-        prefixes.iter().map(|p| serde_json::json!({ "Prefix": p })).collect();
+    let common: Vec<serde_json::Value> = prefixes
+        .iter()
+        .map(|p| serde_json::json!({ "Prefix": p }))
+        .collect();
     serde_json::json!({ "Contents": contents, "CommonPrefixes": common }).to_string()
 }
 
@@ -947,8 +1109,15 @@ pub async fn s3_object_exists(cfg: &Config, bucket: &str, key: &str) -> bool {
         return false;
     };
     super::stats::count_s3("head", 0, 0);
-    let url = handle.head_object(Some(&creds), key).sign(Duration::from_secs(300));
-    let Ok(resp) = http_client().head(url).timeout(Duration::from_secs(20)).send().await else {
+    let url = handle
+        .head_object(Some(&creds), key)
+        .sign(Duration::from_secs(300));
+    let Ok(resp) = http_client()
+        .head(url)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+    else {
         return false;
     };
     resp.status().is_success()
@@ -965,8 +1134,10 @@ async fn s3_delete_keys(cfg: &Config, bucket_name: &str, keys: &[String]) -> any
     super::stats::count_s3("delete", 0, 0);
     let (handle, creds) = s3_bucket(cfg, bucket_name)?;
     for chunk in keys.chunks(1000) {
-        let ids: Vec<ObjectIdentifier> =
-            chunk.iter().map(|k| ObjectIdentifier::new(k.clone())).collect();
+        let ids: Vec<ObjectIdentifier> = chunk
+            .iter()
+            .map(|k| ObjectIdentifier::new(k.clone()))
+            .collect();
         let action = handle.delete_objects(Some(&creds), ids.iter());
         let url = action.sign(Duration::from_secs(300));
         let (body, md5) = action.body_with_md5();
@@ -982,9 +1153,14 @@ async fn s3_delete_keys(cfg: &Config, bucket_name: &str, keys: &[String]) -> any
             return Err(s3_err("delete-keys", bucket_name, resp).await);
         }
         let text = resp.text().await.context("s3 DeleteObjects body")?;
-        let parsed = DeleteObjectsResponse::parse(&text).with_context(|| "s3 DeleteObjects XML parse")?;
+        let parsed =
+            DeleteObjectsResponse::parse(&text).with_context(|| "s3 DeleteObjects XML parse")?;
         if let Some(first) = parsed.errors.first() {
-            bail!("s3 delete-keys {bucket_name} failed: {} {}", first.code, first.message);
+            bail!(
+                "s3 delete-keys {bucket_name} failed: {} {}",
+                first.code,
+                first.message
+            );
         }
     }
     Ok(())
@@ -992,11 +1168,19 @@ async fn s3_delete_keys(cfg: &Config, bucket_name: &str, keys: &[String]) -> any
 
 /// Recursive delete of one telemetry hour directory, keeping the compacted
 /// file the copy just wrote.
-pub async fn s3_rm_dir_except(cfg: &Config, bucket: &str, prefix: &str, keep: &str) -> anyhow::Result<()> {
+pub async fn s3_rm_dir_except(
+    cfg: &Config,
+    bucket: &str,
+    prefix: &str,
+    keep: &str,
+) -> anyhow::Result<()> {
     let (objects, _) = s3_list_raw(cfg, bucket, prefix, None).await?;
     let keep_full = format!("{prefix}{keep}");
-    let victims: Vec<String> =
-        objects.into_iter().map(|o| o.key).filter(|k| k != &keep_full).collect();
+    let victims: Vec<String> = objects
+        .into_iter()
+        .map(|o| o.key)
+        .filter(|k| k != &keep_full)
+        .collect();
     s3_delete_keys(cfg, bucket, &victims).await
 }
 
@@ -1012,7 +1196,12 @@ pub async fn s3_rm_prefix(cfg: &Config, bucket: &str, prefix: &str) -> anyhow::R
 /// key, delete the old. No server-side COPY (its header must be signed, which
 /// the presigned-URL flow cannot cover); renames are rare enough that the
 /// extra hop doesn't matter.
-pub async fn s3_copy_key(cfg: &Config, bucket: &str, from_key: &str, to_key: &str) -> anyhow::Result<()> {
+pub async fn s3_copy_key(
+    cfg: &Config,
+    bucket: &str,
+    from_key: &str,
+    to_key: &str,
+) -> anyhow::Result<()> {
     let tmp = std::env::temp_dir().join(format!("noite-s3-copy-{}", uuid::Uuid::new_v4()));
     s3_get_to_file(cfg, bucket, from_key, &tmp, Duration::from_secs(120)).await?;
     let uploaded = s3_put_file(cfg, bucket, to_key, &tmp, Duration::from_secs(120)).await;
@@ -1057,7 +1246,11 @@ pub async fn head_main_bundle(cfg: &Config, slug: &str) -> anyhow::Result<Option
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
-        if best.as_ref().map(|b| lm.as_str() >= b.2.as_str()).unwrap_or(true) {
+        if best
+            .as_ref()
+            .map(|b| lm.as_str() >= b.2.as_str())
+            .unwrap_or(true)
+        {
             best = Some((key.to_string(), sha, lm));
         }
     }
@@ -1146,8 +1339,12 @@ mod tests {
             etag: "\"abc\"".into(),
         }];
         let v: serde_json::Value =
-            serde_json::from_str(&listings_json(&objects, &["git/demo/refs/heads/".into()])).unwrap();
-        assert_eq!(v["Contents"][0]["Key"], "git/demo/refs/heads/main/abc1234.bundle");
+            serde_json::from_str(&listings_json(&objects, &["git/demo/refs/heads/".into()]))
+                .unwrap();
+        assert_eq!(
+            v["Contents"][0]["Key"],
+            "git/demo/refs/heads/main/abc1234.bundle"
+        );
         assert_eq!(v["Contents"][0]["LastModified"], "2026-09-29T00:00:00.000Z");
         assert_eq!(v["Contents"][0]["Size"], 42);
         assert_eq!(v["CommonPrefixes"][0]["Prefix"], "git/demo/refs/heads/");

@@ -23,12 +23,10 @@ use crate::models::{new_id, now_iso};
 use crate::AppState;
 
 fn is_key(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 64
-        && {
-            let mut parts = s.split('-');
-            parts.all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase()))
-        }
+    !s.is_empty() && s.len() <= 64 && {
+        let mut parts = s.split('-');
+        parts.all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase()))
+    }
 }
 
 fn tag_value(v: &serde_json::Value) -> bool {
@@ -139,7 +137,11 @@ pub async fn list_events(
         Err(e) => return ApiError::internal(e.to_string()).into_response(),
     };
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
-    let channel = q.channel.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let channel = q
+        .channel
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
     match db::list_app_events(&state.pool, &app.id, channel, limit).await {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => ApiError::internal(e.to_string()).into_response(),
@@ -244,7 +246,15 @@ pub async fn set_insight(
     if let Some(obj) = body.value.as_object() {
         if obj.len() == 1 {
             if let Some(delta) = obj.get("$inc").and_then(|v| v.as_f64()) {
-                match db::inc_app_insight(&state.pool, &app.id, &title, delta, (!icon.is_empty()).then_some(icon.as_str())).await {
+                match db::inc_app_insight(
+                    &state.pool,
+                    &app.id,
+                    &title,
+                    delta,
+                    (!icon.is_empty()).then_some(icon.as_str()),
+                )
+                .await
+                {
                     Ok(row) => return Json(row).into_response(),
                     Err(e) => return ApiError::internal(e.to_string()).into_response(),
                 }
@@ -269,7 +279,10 @@ pub async fn set_insight(
             (s.clone(), None)
         }
         serde_json::Value::Bool(b) => (b.to_string(), None),
-        _ => return ApiError::bad("value must be string, number, boolean, or {\"$inc\": n}").into_response(),
+        _ => {
+            return ApiError::bad("value must be string, number, boolean, or {\"$inc\": n}")
+                .into_response()
+        }
     };
     if let Err(e) = db::set_app_insight(&state.pool, &app.id, &title, &text, num, &icon).await {
         return ApiError::internal(e.to_string()).into_response();
@@ -332,7 +345,11 @@ pub async fn list_events_stream(
                 })
                 .to_string();
                 if last.as_ref() != Some(&data) {
-                    if tx.send(Ok(Event::default().data(data.clone()))).await.is_err() {
+                    if tx
+                        .send(Ok(Event::default().data(data.clone())))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                     last = Some(data);

@@ -104,7 +104,10 @@ pub async fn app_source_commit(
     let files: Vec<web_commit::WebFile> = body
         .files
         .into_iter()
-        .map(|f| web_commit::WebFile { path: f.path, content: f.content })
+        .map(|f| web_commit::WebFile {
+            path: f.path,
+            content: f.content,
+        })
         .collect();
     match web_commit::web_commit(&state, &app, &body.author, &body.message, &files).await {
         Ok(sha) => Json(json!({"sha": sha})).into_response(),

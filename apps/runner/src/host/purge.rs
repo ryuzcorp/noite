@@ -62,7 +62,9 @@ async fn clear_s3_prefix(cfg: &Config, prefix: &str) -> anyhow::Result<()> {
         .and_then(|s| s.split('/').next())
         .unwrap_or(&cfg.s3_bucket)
         .to_string();
-    let key = prefix.strip_prefix(&format!("s3://{bucket}/")).unwrap_or(prefix);
+    let key = prefix
+        .strip_prefix(&format!("s3://{bucket}/"))
+        .unwrap_or(prefix);
     cmd::s3_rm_prefix(cfg, &bucket, key)
         .await
         .with_context(|| format!("clear S3 prefix {prefix}"))?;

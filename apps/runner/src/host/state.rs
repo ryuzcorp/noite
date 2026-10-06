@@ -26,8 +26,8 @@
 //! boot, because starting with an empty database would upload it over the
 //! good snapshot on the next write. If both exist, keep the local file.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sqlx::SqlitePool;
@@ -111,7 +111,10 @@ impl StateSync {
             .await
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .and_then(|v| v.get("instance").and_then(|i| i.as_str().map(str::to_owned)));
+            .and_then(|v| {
+                v.get("instance")
+                    .and_then(|i| i.as_str().map(str::to_owned))
+            });
         let mine = match current {
             Some(instance) => instance == *self.instance,
             // Unreadable claim: keep uploading rather than silently stop.
@@ -195,7 +198,12 @@ impl StateSync {
             "instance": self.instance.as_str(),
         });
         upload_text(cfg, META_KEY, &serde_json::to_string_pretty(&meta)?).await?;
-        tracing::info!(bytes = packed_len, raw_bytes = raw.len(), generation, "runner state snapshot uploaded");
+        tracing::info!(
+            bytes = packed_len,
+            raw_bytes = raw.len(),
+            generation,
+            "runner state snapshot uploaded"
+        );
         Ok(packed_len)
     }
 }
@@ -223,8 +231,8 @@ async fn upload_text(cfg: &Config, key: &str, text: &str) -> anyhow::Result<()> 
 /// other failure is an error the caller must not start past (see module
 /// docs). Retries a few times first: the store may still be starting.
 pub async fn restore_if_missing(cfg: &Config) -> anyhow::Result<bool> {
-    let live = db::local_db_path(cfg)
-        .unwrap_or_else(|| std::path::PathBuf::from("/data/noite.sqlite"));
+    let live =
+        db::local_db_path(cfg).unwrap_or_else(|| std::path::PathBuf::from("/data/noite.sqlite"));
     if live.exists() {
         return Ok(false);
     }
@@ -233,7 +241,9 @@ pub async fn restore_if_missing(cfg: &Config) -> anyhow::Result<bool> {
     }
     match download_snapshot(cfg, &live).await {
         Ok(restored) => Ok(restored),
-        Err(e) => Err(e.context("runner state restore failed; refusing to start with an empty database")),
+        Err(e) => {
+            Err(e.context("runner state restore failed; refusing to start with an empty database"))
+        }
     }
 }
 
@@ -342,7 +352,9 @@ mod tests {
     fn only_a_missing_object_counts_as_no_snapshot() {
         let missing = anyhow::anyhow!("aws exit 1\nfatal error: An error occurred (404) when calling the HeadObject operation: Key \"x\" does not exist");
         assert!(is_not_found(&missing));
-        let down = anyhow::anyhow!("aws exit 255\nCould not connect to the endpoint URL: \"http://rustfs:9000/noite\"");
+        let down = anyhow::anyhow!(
+            "aws exit 255\nCould not connect to the endpoint URL: \"http://rustfs:9000/noite\""
+        );
         assert!(!is_not_found(&down));
     }
 }

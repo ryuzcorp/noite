@@ -11,7 +11,6 @@ use crate::host::git_http::{after_receive, ensure_bare, list_refs};
 use crate::models::App;
 use crate::AppState;
 
-
 /// One browser-edited file: validated path + text content.
 pub struct WebFile {
     pub path: String,
@@ -76,11 +75,8 @@ pub async fn web_commit(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    let index = std::env::temp_dir().join(format!(
-        "noite-web-{}-{}.idx",
-        std::process::id(),
-        nanos
-    ));
+    let index =
+        std::env::temp_dir().join(format!("noite-web-{}-{}.idx", std::process::id(), nanos));
     let index_str = index.to_string_lossy().to_string();
     let env_index = [("GIT_INDEX_FILE", index_str.as_str())];
     let result = async {
@@ -145,7 +141,15 @@ pub async fn web_commit(
         .await?;
         let commit = cmd::run_cmd(
             "git",
-            &[git_dir.as_str(), "commit-tree", tree.trim(), "-p", parent.as_str(), "-m", message],
+            &[
+                git_dir.as_str(),
+                "commit-tree",
+                tree.trim(),
+                "-p",
+                parent.as_str(),
+                "-m",
+                message,
+            ],
             None,
             &[
                 ("GIT_AUTHOR_NAME", "Noite"),
@@ -161,7 +165,13 @@ pub async fn web_commit(
         // of interleaving — the UI retries on a fresh tip.
         cmd::run_cmd(
             "git",
-            &[git_dir.as_str(), "update-ref", "refs/heads/main", sha.as_str(), parent.as_str()],
+            &[
+                git_dir.as_str(),
+                "update-ref",
+                "refs/heads/main",
+                sha.as_str(),
+                parent.as_str(),
+            ],
             None,
             &[],
             Duration::from_secs(15),

@@ -9,8 +9,8 @@ test("control serves the UI", async ({ page }) => {
   await page.goto("/login");
   await expect(
     page
-      .getByRole("button", { name: "Register" })
-      .or(page.getByText("Your Apps"))
+      .getByRole("tab", { name: "Create account" })
+      .or(page.getByText("Your Apps", { exact: true }))
   ).toBeVisible();
 });
 

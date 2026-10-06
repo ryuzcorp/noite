@@ -108,7 +108,13 @@ pub async fn resolve_rev(cfg: &Config, app: &App) -> anyhow::Result<Option<Strin
     if !repo.join("HEAD").exists() {
         return Ok(None);
     }
-    match git(cfg, &app.slug, &["rev-parse", "--verify", "--quiet", "HEAD"]).await {
+    match git(
+        cfg,
+        &app.slug,
+        &["rev-parse", "--verify", "--quiet", "HEAD"],
+    )
+    .await
+    {
         Ok(out) => Ok(Some(out.trim().to_string())),
         Err(_) => Ok(None),
     }
@@ -116,17 +122,8 @@ pub async fn resolve_rev(cfg: &Config, app: &App) -> anyhow::Result<Option<Strin
 
 /// Full recursive listing (git's own tree order — server-sorted, so the UI
 /// can use preparePresortedFileTreeInput).
-pub async fn list_tree(
-    cfg: &Config,
-    app: &App,
-    rev: &str,
-) -> anyhow::Result<TreeResponse> {
-    let out = git(
-        cfg,
-        &app.slug,
-        &["ls-tree", "-r", "-z", "-l", rev],
-    )
-    .await?;
+pub async fn list_tree(cfg: &Config, app: &App, rev: &str) -> anyhow::Result<TreeResponse> {
+    let out = git(cfg, &app.slug, &["ls-tree", "-r", "-z", "-l", rev]).await?;
     let mut files = Vec::new();
     let mut truncated = false;
     for rec in out.trim_end_matches('\0').split('\0') {
@@ -188,12 +185,7 @@ pub async fn read_blob(
     if !valid_path(path) {
         bail!("invalid path");
     }
-    let out = git(
-        cfg,
-        &app.slug,
-        &["ls-tree", "-z", "-l", rev, "--", path],
-    )
-    .await?;
+    let out = git(cfg, &app.slug, &["ls-tree", "-z", "-l", rev, "--", path]).await?;
     let Some((_, sha, size, _)) = parse_tree_record(out.trim_end_matches('\0')) else {
         bail!("file not found in {rev}");
     };
@@ -216,11 +208,7 @@ pub async fn read_blob(
     })
 }
 
-pub async fn make_patch(
-    cfg: &Config,
-    app: &App,
-    rev: &str,
-) -> anyhow::Result<DiffResponse> {
+pub async fn make_patch(cfg: &Config, app: &App, rev: &str) -> anyhow::Result<DiffResponse> {
     // First push has no parent: diff-tree --root diffs against the empty
     // tree (`diff --root` refuses bare repos — it wants a work tree).
     let parent = git(
@@ -232,12 +220,8 @@ pub async fn make_patch(
     .ok()
     .map(|s| s.trim().to_string());
     let patch = match &parent {
-        Some(p) => {
-            git(cfg, &app.slug, &["diff", p, rev]).await?
-        }
-        None => {
-            git(cfg, &app.slug, &["diff-tree", "-p", "--root", rev]).await?
-        }
+        Some(p) => git(cfg, &app.slug, &["diff", p, rev]).await?,
+        None => git(cfg, &app.slug, &["diff-tree", "-p", "--root", rev]).await?,
     };
     let (patch, truncated) = if patch.len() > MAX_PATCH {
         (patch[..MAX_PATCH].to_string(), true)

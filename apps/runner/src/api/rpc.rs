@@ -2,7 +2,6 @@
 //! dispatching CRUD methods that mirror the REST handlers. Bearer-gated
 //! like /v1/*. Stays REST: SSE streams, git smart-HTTP, edge/tls-ask,
 //! webhook, health/ready, and the binary r2_raw download.
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use axum::{extract::State, response::IntoResponse, Json};
@@ -11,9 +10,9 @@ use axum_jrpc::{Id, JsonRpcResponse};
 use serde::Deserialize;
 
 use crate::api::source as api_source;
+use crate::config::Config;
 use crate::host::{deploy, purge, rename, source, storage, web_commit};
 use crate::lifecycle::slug_ok;
-use crate::config::Config;
 use crate::models::{App, AppLimit, DesiredState};
 use crate::{db, AppState};
 
@@ -51,7 +50,11 @@ fn not_found(id: &Id, message: &str) -> JsonRpcResponse {
 }
 
 fn conflict(id: &Id, message: String) -> JsonRpcResponse {
-    rpc_err(id.clone(), JsonRpcErrorReason::ApplicationError(409), message)
+    rpc_err(
+        id.clone(),
+        JsonRpcErrorReason::ApplicationError(409),
+        message,
+    )
 }
 
 fn internal(id: &Id, message: String) -> JsonRpcResponse {
@@ -74,6 +77,21 @@ where
 async fn app(state: &AppState, app_id: &str, id: &Id) -> Result<App, JsonRpcResponse> {
     match db::get_app(&state.pool, app_id).await {
         Ok(Some(a)) => Ok(a),
+        Ok(None) => Err(not_found(id, "app not found")),
+        Err(e) => Err(internal(id, e.to_string())),
+    }
+}
+
+/// Telemetry target for the observability RPCs: a real app id, or the
+/// reserved control key, which has no `app` row by design (see
+/// `host/control.rs`). Same shapes as a tenant app, different key.
+async fn telemetry_target(
+    state: &AppState,
+    app_id: &str,
+    id: &Id,
+) -> Result<String, JsonRpcResponse> {
+    match crate::api::observe::telemetry_target(&state.pool, app_id).await {
+        Ok(Some((app_id, _))) => Ok(app_id),
         Ok(None) => Err(not_found(id, "app not found")),
         Err(e) => Err(internal(id, e.to_string())),
     }
@@ -122,7 +140,11 @@ async fn dispatch(state: &AppState, raw: serde_json::Value) -> JsonRpcResponse {
     };
     let id = call.id.unwrap_or(Id::None(()));
     let Some(method) = call.method else {
-        return rpc_err(id, JsonRpcErrorReason::InvalidRequest, "missing method".into());
+        return rpc_err(
+            id,
+            JsonRpcErrorReason::InvalidRequest,
+            "missing method".into(),
+        );
     };
     dispatch_call(state, &method, call.params, id).await
 }
@@ -207,7 +229,9 @@ pub(crate) async fn error_list(
     let issues: Vec<serde_json::Value> = issues
         .into_iter()
         .map(|issue| {
-            let hourly = series.remove(&issue.fingerprint).unwrap_or_else(|| vec![0; 24]);
+            let hourly = series
+                .remove(&issue.fingerprint)
+                .unwrap_or_else(|| vec![0; 24]);
             with_hourly(&issue, hourly)
         })
         .collect();
@@ -259,11 +283,16 @@ async fn dispatch_call(
             {
                 return internal(&id, format!("failed to clear slug data: {e:#}"));
             }
-            let (listen, internal_port) =
-                match db::next_ports_in(&state.pool, state.config.fleet_port_min, state.config.fleet_port_max).await {
-                    Ok(p) => p,
-                    Err(e) => return internal(&id, e.to_string()),
-                };
+            let (listen, internal_port) = match db::next_ports_in(
+                &state.pool,
+                state.config.fleet_port_min,
+                state.config.fleet_port_max,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => return internal(&id, e.to_string()),
+            };
             let subdomain = format!("{slug}.{}", state.config.base_domain);
             let owner = p
                 .user_id
@@ -276,7 +305,10 @@ async fn dispatch_call(
                     Ok(count) if count >= i64::from(state.config.max_apps_per_user) => {
                         return conflict(
                             &id,
-                            format!("app limit reached ({} per account)", state.config.max_apps_per_user),
+                            format!(
+                                "app limit reached ({} per account)",
+                                state.config.max_apps_per_user
+                            ),
                         );
                     }
                     Ok(_) => {}
@@ -297,9 +329,7 @@ async fn dispatch_call(
             )
             .await
             {
-                Ok(app) => {
-                    JsonRpcResponse::success(id, app)
-                }
+                Ok(app) => JsonRpcResponse::success(id, app),
                 Err(e) => internal(&id, e.to_string()),
             }
         }
@@ -329,8 +359,10 @@ async fn dispatch_call(
             }
         }
         "apps.patch" => {
+            // Unknown keys are refused: a misspelled `desired_state` used to
+            // deserialize to None and make the patch a silent no-op.
             #[derive(Deserialize)]
-            #[serde(rename_all = "camelCase")]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
             struct P {
                 id: String,
                 desired_state: Option<String>,
@@ -371,9 +403,7 @@ async fn dispatch_call(
                 return internal(&id, format!("failed to purge app data: {e:#}"));
             }
             match db::delete_app(&state.pool, &p.id).await {
-                Ok(()) => {
-                    JsonRpcResponse::success(id, serde_json::json!({ "ok": true }))
-                }
+                Ok(()) => JsonRpcResponse::success(id, serde_json::json!({ "ok": true })),
                 Err(e) => internal(&id, e.to_string()),
             }
         }
@@ -388,7 +418,10 @@ async fn dispatch_call(
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            let name = p.name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            let name = p
+                .name
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             let slug = p
                 .slug
                 .map(|s| s.trim().to_lowercase())
@@ -494,9 +527,7 @@ async fn dispatch_call(
                 Err(e) => return e,
             };
             match db::delete_env(&state.pool, &a.id, &p.name).await {
-                Ok(()) => {
-                    JsonRpcResponse::success(id, serde_json::json!({ "ok": true }))
-                }
+                Ok(()) => JsonRpcResponse::success(id, serde_json::json!({ "ok": true })),
                 Err(e) => internal(&id, e.to_string()),
             }
         }
@@ -603,7 +634,10 @@ async fn dispatch_call(
             };
             let in_range = |v: Option<i64>| v.is_none_or(|v| (0..=MAX_EDGE_RPM).contains(&v));
             if !in_range(p.client_rpm) || !in_range(p.app_rpm) {
-                return bad(&id, &format!("limits must be between 0 and {MAX_EDGE_RPM} requests per minute"));
+                return bad(
+                    &id,
+                    &format!("limits must be between 0 and {MAX_EDGE_RPM} requests per minute"),
+                );
             }
             let a = match app(state, &p.id, &id).await {
                 Ok(a) => a,
@@ -633,11 +667,11 @@ async fn dispatch_call(
             if !ERROR_STATUSES.contains(&status.as_str()) {
                 return bad(&id, "status must be open, resolved or ignored");
             }
-            let a = match app(state, &p.id, &id).await {
+            let app_id = match telemetry_target(state, &p.id, &id).await {
                 Ok(a) => a,
                 Err(e) => return e,
             };
-            match error_list(&state.pool, &a.id, &status).await {
+            match error_list(&state.pool, &app_id, &status).await {
                 Ok(list) => JsonRpcResponse::success(id, list),
                 Err(e) => internal(&id, e.to_string()),
             }
@@ -652,19 +686,19 @@ async fn dispatch_call(
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            let a = match app(state, &p.id, &id).await {
+            let app_id = match telemetry_target(state, &p.id, &id).await {
                 Ok(a) => a,
                 Err(e) => return e,
             };
-            let issue = match db::get_error_issue(&state.pool, &a.id, &p.fingerprint).await {
+            let issue = match db::get_error_issue(&state.pool, &app_id, &p.fingerprint).await {
                 Ok(Some(i)) => i,
                 Ok(None) => return not_found(&id, "error not found"),
                 Err(e) => return internal(&id, e.to_string()),
             };
             let keys = error_hour_keys();
             let (events, hours) = match tokio::try_join!(
-                db::list_error_events(&state.pool, &a.id, &p.fingerprint),
-                db::list_error_hours(&state.pool, &a.id, &keys[0]),
+                db::list_error_events(&state.pool, &app_id, &p.fingerprint),
+                db::list_error_hours(&state.pool, &app_id, &keys[0]),
             ) {
                 Ok(r) => r,
                 Err(e) => return internal(&id, e.to_string()),
@@ -718,12 +752,12 @@ async fn dispatch_call(
             if !ERROR_STATUSES.contains(&p.status.as_str()) {
                 return bad(&id, "status must be open, resolved or ignored");
             }
-            let a = match app(state, &p.id, &id).await {
+            let app_id = match telemetry_target(state, &p.id, &id).await {
                 Ok(a) => a,
                 Err(e) => return e,
             };
             let now = crate::host::metrics::now_us();
-            match db::set_error_status(&state.pool, &a.id, &p.fingerprint, &p.status, now).await {
+            match db::set_error_status(&state.pool, &app_id, &p.fingerprint, &p.status, now).await {
                 Ok(0) => not_found(&id, "error not found"),
                 Ok(_) => JsonRpcResponse::success(id, serde_json::json!({ "ok": true })),
                 Err(e) => internal(&id, e.to_string()),
@@ -790,7 +824,8 @@ async fn dispatch_call(
             let key = format!("git/{}/refs/heads/main/{sha}.bundle", a.slug);
             let sha_resp = sha.clone();
             tokio::spawn(async move {
-                deploy::deploy_app(&pool, &cfg, &procs, &logs, &deploying, a, &key, Some(&sha)).await;
+                deploy::deploy_app(&pool, &cfg, &procs, &logs, &deploying, a, &key, Some(&sha))
+                    .await;
             });
             JsonRpcResponse::success(id, serde_json::json!({ "ok": true, "sha": sha_resp }))
         }
@@ -884,7 +919,10 @@ async fn dispatch_call(
             let files: Vec<web_commit::WebFile> = p
                 .files
                 .into_iter()
-                .map(|f| web_commit::WebFile { path: f.path, content: f.content })
+                .map(|f| web_commit::WebFile {
+                    path: f.path,
+                    content: f.content,
+                })
                 .collect();
             match web_commit::web_commit(state, &a, &p.author, &p.message, &files).await {
                 Ok(sha) => JsonRpcResponse::success(id, serde_json::json!({"sha": sha})),
@@ -901,14 +939,15 @@ async fn dispatch_call(
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            if app(state, &p.id, &id).await.is_err() {
-                return not_found(&id, "app not found");
-            }
+            let app_id = match telemetry_target(state, &p.id, &id).await {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
             let hours = p.hours.unwrap_or(24).clamp(1, 720);
             let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
                 .format("%Y-%m-%dT%H:%M:00Z")
                 .to_string();
-            match db::list_app_metrics(&state.pool, &p.id, &since).await {
+            match db::list_app_metrics(&state.pool, &app_id, &since).await {
                 Ok(rows) => JsonRpcResponse::success(id, rows),
                 Err(e) => internal(&id, e.to_string()),
             }
@@ -928,7 +967,11 @@ async fn dispatch_call(
                 return not_found(&id, "app not found");
             }
             let limit = p.limit.unwrap_or(50).clamp(1, 200);
-            let channel = p.channel.as_deref().map(str::trim).filter(|c| !c.is_empty());
+            let channel = p
+                .channel
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty());
             match db::list_app_events(&state.pool, &p.id, channel, limit).await {
                 Ok(rows) => JsonRpcResponse::success(id, rows),
                 Err(e) => internal(&id, e.to_string()),
@@ -988,7 +1031,7 @@ async fn dispatch_call(
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            let _a = match app(state, &p.id, &id).await {
+            let app_id = match telemetry_target(state, &p.id, &id).await {
                 Ok(a) => a,
                 Err(e) => return e,
             };
@@ -996,7 +1039,7 @@ async fn dispatch_call(
             let since = (chrono::Utc::now() - chrono::Duration::hours(hours))
                 .format("%Y-%m-%dT%H:00:00Z")
                 .to_string();
-            match db::list_span_stats(&state.pool, &p.id, &since).await {
+            match db::list_span_stats(&state.pool, &app_id, &since).await {
                 Ok(spans) => JsonRpcResponse::success(id, spans),
                 Err(e) => internal(&id, e.to_string()),
             }
@@ -1006,11 +1049,14 @@ async fn dispatch_call(
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            let a = match app(state, &p.id, &id).await {
-                Ok(a) => a,
-                Err(e) => return e,
+            let (app_id, slug) = match crate::api::observe::telemetry_target(&state.pool, &p.id)
+                .await
+            {
+                Ok(Some(target)) => target,
+                Ok(None) => return not_found(&id, "app not found"),
+                Err(e) => return internal(&id, e.to_string()),
             };
-            let lines = super::observe::merged_lines(state, &a.id, &a.slug).await;
+            let lines = super::observe::merged_lines(state, &app_id, &slug).await;
             JsonRpcResponse::success(id, lines)
         }
         "storage.list" => {
@@ -1027,14 +1073,8 @@ async fn dispatch_call(
                 Err(e) => conflict(&id, format!("{e:#}")),
             }
         }
-        "storage.d1.get" => {
-            #[derive(Deserialize)]
-            struct P {
-                id: String,
-                database_id: String,
-                rows: Option<i64>,
-            }
-            let p: P = match parse(params, &id) {
+        "storage.d1.tables" => {
+            let p: storage::d1::D1TablesParams = match parse(params, &id) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
@@ -1042,23 +1082,41 @@ async fn dispatch_call(
                 Ok(a) => a,
                 Err(e) => return e,
             };
-            let limit = (p.rows.unwrap_or(20) as usize).clamp(1, 100);
-            match storage::d1_preview(&state.config, &a, &p.database_id, limit).await {
-                Ok(pv) => JsonRpcResponse::success(id, pv),
+            match storage::d1_tables(&state.config, &a, &p.database_id).await {
+                Ok(t) => JsonRpcResponse::success(id, t),
+                Err(e) => conflict(&id, format!("{e:#}")),
+            }
+        }
+        "storage.d1.schema" => {
+            let p: storage::d1::D1SchemaParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let a = match app(state, &p.id, &id).await {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
+            match storage::d1_schema(&state.config, &a, &p.database_id, &p.table).await {
+                Ok(s) => JsonRpcResponse::success(id, s),
+                Err(e) => conflict(&id, format!("{e:#}")),
+            }
+        }
+        "storage.d1.rows" => {
+            let p: storage::d1::D1RowsParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let a = match app(state, &p.id, &id).await {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
+            match storage::d1_rows(&state.config, &a, &p.database_id, &p.query).await {
+                Ok(rows) => JsonRpcResponse::success(id, rows),
                 Err(e) => conflict(&id, format!("{e:#}")),
             }
         }
         "storage.d1.write" => {
-            #[derive(Deserialize)]
-            struct P {
-                id: String,
-                database_id: String,
-                table: String,
-                op: String,
-                values: BTreeMap<String, Option<String>>,
-                key: Option<BTreeMap<String, Option<String>>>,
-            }
-            let p: P = match parse(params, &id) {
+            let p: storage::d1::D1WriteParams = match parse(params, &id) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
@@ -1066,11 +1124,37 @@ async fn dispatch_call(
                 Ok(a) => a,
                 Err(e) => return e,
             };
-            let key = p.key.unwrap_or_default();
-            match storage::d1_write(&state.config, &a, &p.database_id, &p.table, &p.op, &p.values, &key)
-                .await
+            match storage::d1_write(
+                &state.config,
+                &a,
+                &p.database_id,
+                &p.body.op,
+                &p.body.table,
+                &p.body.values,
+                &p.body.key,
+            )
+            .await
             {
                 Ok(()) => JsonRpcResponse::success(id, serde_json::json!({"ok": true})),
+                Err(e) => conflict(&id, format!("{e:#}")),
+            }
+        }
+        "storage.d1.delete_rows" => {
+            let p: storage::d1::D1DeleteRowsParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let a = match app(state, &p.id, &id).await {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
+            match storage::d1_delete_rows(&state.config, &a, &p.database_id, &p.table, &p.keys)
+                .await
+            {
+                Ok(deleted) => JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({"ok": true, "deleted": deleted}),
+                ),
                 Err(e) => conflict(&id, format!("{e:#}")),
             }
         }
@@ -1098,6 +1182,12 @@ async fn dispatch_call(
             struct P {
                 id: String,
                 bucket: String,
+                #[serde(default)]
+                prefix: String,
+                #[serde(default)]
+                cursor: Option<String>,
+                #[serde(default)]
+                limit: Option<usize>,
             }
             let p: P = match parse(params, &id) {
                 Ok(p) => p,
@@ -1107,7 +1197,17 @@ async fn dispatch_call(
                 Ok(a) => a,
                 Err(e) => return e,
             };
-            match storage::r2_list(&state.config, &a, &p.bucket, 100).await {
+            let limit = p.limit.unwrap_or(storage::r2::R2_PAGE_LIMIT);
+            match storage::r2_list(
+                &state.config,
+                &a,
+                &p.bucket,
+                &p.prefix,
+                p.cursor.as_deref(),
+                limit,
+            )
+            .await
+            {
                 Ok(v) => JsonRpcResponse::success(id, v),
                 Err(e) => conflict(&id, format!("{e:#}")),
             }
@@ -1137,7 +1237,7 @@ async fn dispatch_call(
             struct P {
                 id: String,
                 bucket: String,
-                key: String,
+                keys: Vec<String>,
             }
             let p: P = match parse(params, &id) {
                 Ok(p) => p,
@@ -1147,11 +1247,18 @@ async fn dispatch_call(
                 Ok(a) => a,
                 Err(e) => return e,
             };
-            match storage::r2_delete(&state.config, &a, &p.bucket, &p.key).await {
-                Ok(()) => JsonRpcResponse::success(id, serde_json::json!({ "ok": true })),
+            match storage::r2_delete_many(&state.config, &a, &p.bucket, &p.keys).await {
+                Ok(deleted) => JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({ "ok": true, "deleted": deleted }),
+                ),
                 Err(e) => conflict(&id, format!("{e:#}")),
             }
         }
-        m => rpc_err(id, JsonRpcErrorReason::MethodNotFound, format!("unknown method: {m}")),
+        m => rpc_err(
+            id,
+            JsonRpcErrorReason::MethodNotFound,
+            format!("unknown method: {m}"),
+        ),
     }
 }

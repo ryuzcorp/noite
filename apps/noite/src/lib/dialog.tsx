@@ -12,11 +12,14 @@ import { collectRef, liveEl, newLiveRef } from "./live-ref";
 export const Dialog = ({
   children,
   class: cls,
+  labelledBy,
   onClose,
   open,
 }: {
   children: View;
   class?: string;
+  /** id of the element naming this dialog (sets `aria-labelledby`). */
+  labelledBy?: string;
   onClose?: () => void;
   open: AtomHandle<boolean>;
 }) => {
@@ -51,6 +54,7 @@ export const Dialog = ({
         }
       }}
       class={cls}
+      aria-labelledby={labelledBy}
       onclose={() => {
         open.set(false);
         onClose?.();

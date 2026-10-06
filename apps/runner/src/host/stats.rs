@@ -159,7 +159,12 @@ fn proc_self() -> (u64, f64) {
 
 pub fn snapshot() -> serde_json::Value {
     let c = counters();
-    let (uploads, bytes) = c.snapshots.lock().ok().map(|s| (s.0, s.1)).unwrap_or((0, 0));
+    let (uploads, bytes) = c
+        .snapshots
+        .lock()
+        .ok()
+        .map(|s| (s.0, s.1))
+        .unwrap_or((0, 0));
     let (rss, cpu_s) = proc_self();
     serde_json::json!({
         "spawns": map_snapshot(&c.spawns),
