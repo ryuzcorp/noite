@@ -173,7 +173,7 @@ export const isVisibleTable = (name: string): boolean => {
 
 /** Why this session may not browse or write the control D1, or null when it
  * may. Pure so the gate is unit-tested without a request store; the action
- * turns the message into a client-visible `failAction`. An impersonated
+ * turns the message into a client-visible `fail(message)`. An impersonated
  * session is refused even when the impersonated account is an admin. */
 export const controlAccessRefusal = (access: {
   impersonatedBy: string | null;

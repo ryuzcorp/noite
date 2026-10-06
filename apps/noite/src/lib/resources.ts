@@ -32,15 +32,7 @@ import {
   r2List as fetchR2List,
 } from "./apps.server";
 import { authClient } from "./auth-client";
-import type {
-  D1Rows,
-  D1RowsQuery,
-  D1TableSchema,
-  D1Tables,
-  DoPreview,
-  R2File,
-  R2Preview,
-} from "./runner";
+import type { D1RowsQuery } from "./runner";
 import { clearSwrStore, withSnapshot, writeSwr } from "./swr-store";
 
 export { invalidate } from "ilha";
@@ -309,36 +301,27 @@ export const signupPolicy = () =>
 
 /** Tables + row counts of one D1 database (left sidebar). */
 export const d1Tables = (appId: string, databaseId: string) =>
-  tracked(keys.d1Tables(appId, databaseId), async () => {
-    const tables = await fetchD1Tables({ appId, databaseId });
-    // SAFETY: the d1Tables action unwraps to the raw D1Tables JSON at
-    // runtime; the Effect-union variant is only a typing edge.
-    return (tables as D1Tables | null) ?? null;
-  });
+  tracked(keys.d1Tables(appId, databaseId), () =>
+    fetchD1Tables({ appId, databaseId })
+  );
 
 /** One table's schema (columns, indexes, caps, locked/redacted columns). */
 export const d1Schema = (appId: string, databaseId: string, table: string) =>
-  tracked(keys.d1Schema(appId, databaseId, table), async () => {
-    const schema = await fetchD1Schema({ appId, databaseId, table });
-    // SAFETY: same unwrap edge as d1Tables — raw D1TableSchema at runtime.
-    return (schema as D1TableSchema | null) ?? null;
-  });
+  tracked(keys.d1Schema(appId, databaseId, table), () =>
+    fetchD1Schema({ appId, databaseId, table })
+  );
 
 /** One server-side page of rows; the key carries the serialized query so a
  * mounted component only ever renders the query it was keyed with. */
 export const d1Rows = (appId: string, databaseId: string, query: D1RowsQuery) =>
-  tracked(keys.d1Rows(appId, databaseId, query), async () => {
-    const rows = await fetchD1Rows({ appId, databaseId, ...query });
-    // SAFETY: same unwrap edge as d1Tables — raw D1Rows JSON at runtime.
-    return (rows as D1Rows | null) ?? null;
-  });
+  tracked(keys.d1Rows(appId, databaseId, query), () =>
+    fetchD1Rows({ appId, databaseId, ...query })
+  );
 
 export const doPreview = (appId: string, className: string) =>
-  tracked(keys.doPreview(appId, className), async () => {
-    const preview = await fetchDoPreview({ appId, className });
-    // SAFETY: same unwrap edge as d1Tables — raw DoPreview JSON at runtime.
-    return (preview as DoPreview | null) ?? null;
-  });
+  tracked(keys.doPreview(appId, className), () =>
+    fetchDoPreview({ appId, className })
+  );
 
 /** One page of an R2 bucket folder; the key carries prefix + cursor so a
  * mounted component only ever renders the page it was keyed with. */
@@ -348,19 +331,15 @@ export const r2List = (
   prefix: string,
   cursor: string | null
 ) =>
-  tracked(keys.r2List(appId, bucket, prefix, cursor), async () => {
-    const preview = await fetchR2List({ appId, bucket, cursor, prefix });
-    // SAFETY: same unwrap edge as d1Tables — raw R2Preview JSON at runtime.
-    return (preview as R2Preview | null) ?? null;
-  });
+  tracked(keys.r2List(appId, bucket, prefix, cursor), () =>
+    fetchR2List({ appId, bucket, cursor, prefix })
+  );
 
 /** One object's bounded text preview (null `text` for a binary body). */
 export const r2File = (appId: string, bucket: string, key: string) =>
-  tracked(keys.r2File(appId, bucket, key), async () => {
-    const file = await fetchR2Get({ appId, bucket, key });
-    // SAFETY: same unwrap edge as d1Tables — raw R2File JSON at runtime.
-    return (file as R2File | null) ?? null;
-  });
+  tracked(keys.r2File(appId, bucket, key), () =>
+    fetchR2Get({ appId, bucket, key })
+  );
 
 /** One page of the admin home's user list. The key carries the search and
  * page, so the caller mounts a fresh component per (query, page) — a resource

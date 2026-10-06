@@ -2,13 +2,10 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { SqlClient } from "effect/sql/SqlClient";
-import { action, useEnv, useRequest } from "oxidejs";
+import { action, fail, useEnv, useRequest, withSchema } from "oxidejs";
 
-import { checkedSchema } from "./action-schema";
 import {
-  ActionError,
   authFromEnv,
-  failAction,
   failUnknown,
   MissingAuthSecretError,
   resolveAdminEmail,
@@ -37,11 +34,7 @@ interface DbUser {
   role: string | null;
 }
 
-const AuthError = Schema.Union([
-  UnauthorizedError,
-  MissingAuthSecretError,
-  ActionError,
-]);
+const AuthError = Schema.Union([UnauthorizedError, MissingAuthSecretError]);
 
 /** Promote the env-anchored address to `admin` (idempotent, no-op if unset
  * or the user does not exist yet — they register first via passkeys). */
@@ -79,10 +72,10 @@ interface AdminSession {
 /** Gate for every admin action: `admin` role, or the env-anchored address
  * (promoted on the way in so the role persists afterwards), and never an
  * impersonated session — the admin home is hidden while impersonating, and
- * the actions behind it refuse too. Never throws: async actions surface
- * every throw as unmapped "Internal error" (Oxide wraps them with
- * `catch: asDefect`), so denial is a null return and only genuine infra
- * failures escape (logged server-side). */
+ * the actions behind it refuse too. Returns null instead of failing so
+ * `adminOverview` can probe for the panel; a denying caller turns it into a
+ * client-visible `fail("Admin only")`. An infra failure is logged and reads
+ * as denial, never as the generic "Internal error". */
 const requireAdmin = async (): Promise<AdminSession | null> => {
   try {
     const request = useRequest();
@@ -205,10 +198,10 @@ const likePattern = (query: string): string =>
  * row beyond the page to learn whether a next page exists, instead of a
  * second COUNT (the control node's D1 stalls on later queries in an action). */
 export const listUsers = action(
-  checkedSchema(ListUsersArgs, async ({ page, query }) => {
+  withSchema(ListUsersArgs, async ({ page, query }) => {
     const admin = await requireAdmin();
     if (!admin) {
-      failAction("Admin only");
+      fail("Admin only");
     }
     const needle = query.trim().slice(0, 100);
     const offset = Math.max(0, Math.floor(page)) * ADMIN_USERS_PAGE_SIZE;
@@ -245,7 +238,7 @@ export const listUsers = action(
           .map((row) => asUserRow(row)),
       };
     } catch (error) {
-      if (error instanceof UnauthorizedError || error instanceof ActionError) {
+      if (error instanceof UnauthorizedError) {
         throw error;
       }
       return failUnknown(error);
@@ -283,7 +276,7 @@ export const listAllApps = action(
   async () => {
     const admin = await requireAdmin();
     if (!admin) {
-      failAction("Admin only");
+      fail("Admin only");
     }
     try {
       const [apps, users] = await Promise.all([
@@ -301,7 +294,7 @@ export const listAllApps = action(
       );
       return apps.map((app) => asAppRow(app, emails));
     } catch (error) {
-      if (error instanceof UnauthorizedError || error instanceof ActionError) {
+      if (error instanceof UnauthorizedError) {
         throw error;
       }
       return failUnknown(error);
@@ -317,13 +310,13 @@ const AdminAppState = Schema.Struct({
 
 /** Start or stop any app, whoever owns it (admin only). */
 export const adminSetAppState = action(
-  checkedSchema(AdminAppState, async ({ desiredState, id }) => {
+  withSchema(AdminAppState, async ({ desiredState, id }) => {
     const admin = await requireAdmin();
     if (!admin) {
-      failAction("Admin only");
+      fail("Admin only");
     }
     if (desiredState !== "running" && desiredState !== "stopped") {
-      failAction("desiredState must be running or stopped");
+      fail("desiredState must be running or stopped");
     }
     try {
       await runnerPatchApp(id, { desiredState });
@@ -338,10 +331,10 @@ export const adminSetAppState = action(
 /** Delete any app, whoever owns it (admin only): the runner drops the app,
  * then its grants and pending invitations go with it. */
 export const adminDeleteApp = action(
-  checkedSchema(Schema.String, async (id: string) => {
+  withSchema(Schema.String, async (id: string) => {
     const admin = await requireAdmin();
     if (!admin) {
-      failAction("Admin only");
+      fail("Admin only");
     }
     try {
       await runnerDeleteApp(id);
@@ -358,16 +351,16 @@ const UserId = Schema.String;
 
 /** Ban (also revokes sessions via the admin plugin). Never self-ban. */
 export const banUser = action(
-  checkedSchema(UserId, async (userId: string) => {
-    const admin = (await requireAdmin()) ?? failAction("Admin only");
+  withSchema(UserId, async (userId: string) => {
+    const admin = (await requireAdmin()) ?? fail("Admin only");
     if (userId === admin.id) {
-      failAction("Cannot ban your own account");
+      fail("Cannot ban your own account");
     }
     const { auth, headers } = await adminAuth();
     try {
       await auth.api.banUser({ body: { userId }, headers });
     } catch (error) {
-      if (error instanceof UnauthorizedError || error instanceof ActionError) {
+      if (error instanceof UnauthorizedError) {
         throw error;
       }
       failUnknown(error);
@@ -377,16 +370,16 @@ export const banUser = action(
 );
 
 export const unbanUser = action(
-  checkedSchema(UserId, async (userId: string) => {
+  withSchema(UserId, async (userId: string) => {
     const admin = await requireAdmin();
     if (!admin) {
-      failAction("Admin only");
+      fail("Admin only");
     }
     const { auth, headers } = await adminAuth();
     try {
       await auth.api.unbanUser({ body: { userId }, headers });
     } catch (error) {
-      if (error instanceof UnauthorizedError || error instanceof ActionError) {
+      if (error instanceof UnauthorizedError) {
         throw error;
       }
       failUnknown(error);
@@ -404,21 +397,21 @@ const SetUserRole = Schema.Struct({
  * demotes themselves cannot undo it, and the acting admin is what guarantees
  * the instance always has one. */
 export const setUserRole = action(
-  checkedSchema(SetUserRole, async ({ role, userId }) => {
-    const admin = (await requireAdmin()) ?? failAction("Admin only");
+  withSchema(SetUserRole, async ({ role, userId }) => {
+    const admin = (await requireAdmin()) ?? fail("Admin only");
     const nextRole = role === "admin" || role === "user" ? role : null;
     if (nextRole === null) {
-      return failAction("role must be admin or user");
+      return fail("role must be admin or user");
     }
     if (userId === admin.id) {
-      return failAction("Cannot change your own role");
+      return fail("Cannot change your own role");
     }
     const { auth, headers } = await adminAuth();
     try {
       await auth.api.setRole({ body: { role: nextRole, userId }, headers });
       return { ok: true as const };
     } catch (error) {
-      if (error instanceof UnauthorizedError || error instanceof ActionError) {
+      if (error instanceof UnauthorizedError) {
         throw error;
       }
       return failUnknown(error);
@@ -456,15 +449,15 @@ const dropUserLeftovers = (userId: string) =>
  * yourself, and while the account is the only admin of an app (hand the app
  * over or delete it first). */
 export const deleteUser = action(
-  checkedSchema(UserId, async (userId: string) => {
-    const admin = (await requireAdmin()) ?? failAction("Admin only");
+  withSchema(UserId, async (userId: string) => {
+    const admin = (await requireAdmin()) ?? fail("Admin only");
     if (userId === admin.id) {
-      failAction("Cannot delete your own account");
+      fail("Cannot delete your own account");
     }
     try {
       const stranded = await withDb(soleAdminApps(userId));
       if (stranded > 0) {
-        failAction(
+        fail(
           `This account is the only admin of ${stranded} app${stranded === 1 ? "" : "s"} — make someone else an admin or delete the app first`
         );
       }
@@ -473,7 +466,7 @@ export const deleteUser = action(
       await withDb(dropUserLeftovers(userId));
       return { ok: true as const };
     } catch (error) {
-      if (error instanceof UnauthorizedError || error instanceof ActionError) {
+      if (error instanceof UnauthorizedError) {
         throw error;
       }
       return failUnknown(error);
@@ -491,12 +484,12 @@ export const adminListInvites = action(
   async () => {
     const admin = await requireAdmin();
     if (!admin) {
-      failAction("Admin only");
+      fail("Admin only");
     }
     try {
       return await listInvites();
     } catch (error) {
-      if (error instanceof UnauthorizedError || error instanceof ActionError) {
+      if (error instanceof UnauthorizedError) {
         throw error;
       }
       failUnknown(error);
@@ -507,15 +500,15 @@ export const adminListInvites = action(
 
 /** Mint more codes for the admin to hand out. */
 export const adminCreateInvites = action(
-  checkedSchema(InviteCount, async ({ count }) => {
-    const admin = (await requireAdmin()) ?? failAction("Admin only");
+  withSchema(InviteCount, async ({ count }) => {
+    const admin = (await requireAdmin()) ?? fail("Admin only");
     if (!Number.isInteger(count) || count < 1 || count > 50) {
-      failAction("Ask for between 1 and 50 codes");
+      fail("Ask for between 1 and 50 codes");
     }
     try {
       return { codes: await mintInvites(admin.id, count, "admin") };
     } catch (error) {
-      if (error instanceof UnauthorizedError || error instanceof ActionError) {
+      if (error instanceof UnauthorizedError) {
         throw error;
       }
       failUnknown(error);
@@ -526,16 +519,16 @@ export const adminCreateInvites = action(
 
 /** Revoke an unused code (a redeemed one is history and stays visible). */
 export const adminRevokeInvite = action(
-  checkedSchema(Schema.String, async (id: string) => {
+  withSchema(Schema.String, async (id: string) => {
     const admin = await requireAdmin();
     if (!admin) {
-      failAction("Admin only");
+      fail("Admin only");
     }
     try {
       await revokeInvite(id);
       return { ok: true as const };
     } catch (error) {
-      if (error instanceof UnauthorizedError || error instanceof ActionError) {
+      if (error instanceof UnauthorizedError) {
         throw error;
       }
       failUnknown(error);

@@ -714,11 +714,14 @@ const closeQuietly = (controller: ReadableStreamDefaultController): void => {
  * heartbeats land well inside celld's ~60s idle-stream expiry. */
 const APPS_STREAM_POLL_MS = 10_000;
 
-/** App list over SSE (like DeployList): the oxide stream action hangs (its
- * first frame never arrives) and idle HTTP streams die on celld's ~60s
- * expiry without reconnect — so this polls D1 here and pushes diffs, with
- * comment heartbeats resetting the expiry and EventSource auto-reconnect
- * covering the rest. Session-gated like every other browser route. */
+/** App list over SSE (like DeployList). Unverified: whether an oxide stream
+ * action's first frame arrives on celld — an earlier 0.5.x attempt hung with
+ * no frame at all (before the per-request runtime fix), and proving it now
+ * needs a celld node, which only the release image runs. SSE is also what
+ * makes the heartbeats possible: an idle HTTP stream dies on celld's ~60 s
+ * expiry, so this polls D1 here and pushes diffs, with comment heartbeats
+ * resetting the expiry and EventSource auto-reconnect covering the rest.
+ * Session-gated like every other browser route. */
 const handleAppsStream: RouteHandler = async (request, env) => {
   await ensureDbPromise();
   const userId = await routeUserId(request, env);

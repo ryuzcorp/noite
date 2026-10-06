@@ -2,13 +2,10 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { SqlClient } from "effect/sql/SqlClient";
-import { action, useEnv, useRequest } from "oxidejs";
+import { action, fail, useEnv, useRequest, withSchema } from "oxidejs";
 
-import { checkedSchema } from "./action-schema";
 import {
-  ActionError,
   authFromEnv,
-  failAction,
   failUnknown,
   MissingAuthSecretError,
   UnauthorizedError,
@@ -92,11 +89,7 @@ const CreateApp = Schema.Struct({
   slug: Schema.String,
 });
 const AppId = Schema.String;
-const AuthError = Schema.Union([
-  UnauthorizedError,
-  MissingAuthSecretError,
-  ActionError,
-]);
+const AuthError = Schema.Union([UnauthorizedError, MissingAuthSecretError]);
 
 /** Source preview — the runner serves from the persistent bare mirror. */
 const SourceBlobArgs = Schema.Struct({
@@ -161,7 +154,7 @@ export const completeOnboarding = action(
   async () => {
     const user = await sessionUser();
     if (user.impersonatedBy) {
-      failAction("Onboarding cannot be completed while impersonating");
+      fail("Onboarding cannot be completed while impersonating");
     }
     await withDb(
       Effect.gen(function* () {
@@ -178,18 +171,18 @@ export const completeOnboarding = action(
 );
 
 export const create = action(
-  checkedSchema(CreateApp, async ({ name, slug }) => {
+  withSchema(CreateApp, async ({ name, slug }) => {
     const user = await sessionUser();
     const trimmedName = name.trim();
     const normalized = slug.trim().toLowerCase();
     if (!trimmedName) {
-      failAction("Name is required");
+      fail("Name is required");
     }
     if (RESERVED_SLUGS.has(normalized)) {
-      failAction("Slug is reserved");
+      fail("Slug is reserved");
     }
     if (!SLUG_RE.test(normalized)) {
-      failAction(
+      fail(
         "Slug must be 1–48 chars: lowercase letters, digits, and hyphens, starting and ending with a letter or digit"
       );
     }
@@ -208,7 +201,7 @@ export const create = action(
         throw grantError;
       }
     } catch (error) {
-      if (error instanceof ActionError || error instanceof UnauthorizedError) {
+      if (error instanceof UnauthorizedError) {
         throw error;
       }
       failUnknown(error);
@@ -218,7 +211,7 @@ export const create = action(
 );
 
 export const remove = action(
-  checkedSchema(AppId, async (appId) => {
+  withSchema(AppId, async (appId) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "admin");
     try {
@@ -226,7 +219,7 @@ export const remove = action(
       // Nothing cascades grants now that the app row lives in the runner.
       await withDb(dropAppCollaborators(appId));
     } catch (error) {
-      if (error instanceof ActionError || error instanceof UnauthorizedError) {
+      if (error instanceof UnauthorizedError) {
         throw error;
       }
       failUnknown(error);
@@ -246,14 +239,14 @@ const CreateApiKey = Schema.Struct({
  * cannot set them). Returns the raw key once — the UI shows it once,
  * like the client flow did. */
 export const createApiKey = action(
-  checkedSchema(CreateApiKey, async ({ appManagement, events, name }) => {
+  withSchema(CreateApiKey, async ({ appManagement, events, name }) => {
     const user = await sessionUser();
     const label = name.trim();
     if (!label) {
-      failAction("Name is required");
+      fail("Name is required");
     }
     if (!appManagement && !events) {
-      failAction("Select at least one scope");
+      fail("Select at least one scope");
     }
     const permissions: Record<string, string[]> = {};
     if (appManagement) {
@@ -278,7 +271,7 @@ export const createApiKey = action(
     });
     const key = created?.key;
     if (!key) {
-      failAction("Failed to create API key");
+      fail("Failed to create API key");
     }
     return { key };
   }),
@@ -286,11 +279,11 @@ export const createApiKey = action(
 );
 
 export const setDesired = action(
-  checkedSchema(
+  withSchema(
     Schema.Struct({ desiredState: Schema.String, id: Schema.String }),
     async ({ id, desiredState }) => {
       if (desiredState !== "running" && desiredState !== "stopped") {
-        failAction("desiredState must be running or stopped");
+        fail("desiredState must be running or stopped");
       }
       const user = await sessionUser();
       await requireAppRole(id, user.id, "push");
@@ -300,10 +293,7 @@ export const setDesired = action(
           desiredState: desiredState as "running" | "stopped",
         });
       } catch (error) {
-        if (
-          error instanceof ActionError ||
-          error instanceof UnauthorizedError
-        ) {
+        if (error instanceof UnauthorizedError) {
           throw error;
         }
         failUnknown(error);
@@ -322,17 +312,17 @@ const RenameApp = Schema.Struct({
 /** Rename an app (display name and/or slug). Admin-gated; a slug change
  * moves the subdomain, git remote, and fleet data via the runner op. */
 export const renameApp = action(
-  checkedSchema(RenameApp, async ({ id, name, slug }) => {
+  withSchema(RenameApp, async ({ id, name, slug }) => {
     const trimmedName = name?.trim() || undefined;
     const normalized = slug?.trim().toLowerCase() || undefined;
     if (!trimmedName && !normalized) {
-      failAction("Name or slug required");
+      fail("Name or slug required");
     }
     if (normalized && RESERVED_SLUGS.has(normalized)) {
-      failAction("Slug is reserved");
+      fail("Slug is reserved");
     }
     if (normalized && !SLUG_RE.test(normalized)) {
-      failAction(
+      fail(
         "Slug must be 1–48 chars: lowercase letters, digits, and hyphens, starting and ending with a letter or digit"
       );
     }
@@ -341,7 +331,7 @@ export const renameApp = action(
     try {
       await runnerRenameApp(id, { name: trimmedName, slug: normalized });
     } catch (error) {
-      if (error instanceof ActionError || error instanceof UnauthorizedError) {
+      if (error instanceof UnauthorizedError) {
         throw error;
       }
       failUnknown(error);
@@ -351,7 +341,7 @@ export const renameApp = action(
 );
 
 export const get = action(
-  checkedSchema(AppId, async (appId) => {
+  withSchema(AppId, async (appId) => {
     const user = await sessionUser();
     const { app, role } = await requireAppRole(appId, user.id, "view");
     const git = await runnerGitRemote(appId);
@@ -389,13 +379,13 @@ const requireControlAdmin = async (): Promise<SessionUser> => {
     isAdmin,
   });
   if (refusal !== null) {
-    failAction(refusal);
+    fail(refusal);
   }
   return user;
 };
 
 export const sourceTree = action(
-  checkedSchema(AppId, async (appId) => {
+  withSchema(AppId, async (appId) => {
     await requireViewApp(appId);
     return runnerSourceTree(appId);
   }),
@@ -403,7 +393,7 @@ export const sourceTree = action(
 );
 
 export const sourceBlob = action(
-  checkedSchema(SourceBlobArgs, async ({ appId, path }) => {
+  withSchema(SourceBlobArgs, async ({ appId, path }) => {
     await requireViewApp(appId);
     return runnerSourceBlob(appId, path);
   }),
@@ -411,7 +401,7 @@ export const sourceBlob = action(
 );
 
 export const sourceDiff = action(
-  checkedSchema(AppId, async (appId) => {
+  withSchema(AppId, async (appId) => {
     await requireViewApp(appId);
     return runnerSourceDiff(appId);
   }),
@@ -429,7 +419,7 @@ const SourceCommitArgs = Schema.Struct({
 /** Browser-edit commit (push-gated): validated files become a main commit
  * that deploys like a stock push. The author is always the session user. */
 export const sourceCommit = action(
-  checkedSchema(SourceCommitArgs, async ({ appId, files, message }) => {
+  withSchema(SourceCommitArgs, async ({ appId, files, message }) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "push");
     try {
@@ -456,7 +446,7 @@ const RollbackArgs = Schema.Struct({
  * the pipeline at the old tip bundle. Progress follows on the deploys
  * stream like a normal deploy. */
 export const rollback = action(
-  checkedSchema(RollbackArgs, async ({ appId, sha }) => {
+  withSchema(RollbackArgs, async ({ appId, sha }) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "push");
     try {
@@ -476,7 +466,7 @@ const DeployLogArgs = Schema.Struct({
 /** One finished deploy's build log (view-gated): the stream omits finished
  * rows' logs, so the panel fetches them on demand per deploy id. */
 export const deployLog = action(
-  checkedSchema(DeployLogArgs, async ({ appId, deployId }) => {
+  withSchema(DeployLogArgs, async ({ appId, deployId }) => {
     await requireViewApp(appId);
     try {
       return await runnerDeployLog(appId, deployId);
@@ -525,7 +515,7 @@ export const redactEnv = ({
 });
 
 export const listEnv = action(
-  checkedSchema(AppId, async (appId): Promise<EnvVarView[]> => {
+  withSchema(AppId, async (appId): Promise<EnvVarView[]> => {
     await requireViewApp(appId);
     const rows = await runnerListEnv(appId);
     return rows.map((row) => redactEnv(row));
@@ -534,7 +524,7 @@ export const listEnv = action(
 );
 
 export const setEnv = action(
-  checkedSchema(SetEnvArgs, async ({ appId, name, value }) => {
+  withSchema(SetEnvArgs, async ({ appId, name, value }) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "admin");
     try {
@@ -547,7 +537,7 @@ export const setEnv = action(
 );
 
 export const deleteEnv = action(
-  checkedSchema(DeleteEnvArgs, async ({ appId, name }) => {
+  withSchema(DeleteEnvArgs, async ({ appId, name }) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "admin");
     try {
@@ -562,7 +552,7 @@ export const deleteEnv = action(
 /** Render stored env as `.dev.vars` text for local dev (admin-gated: this is
  * the one place secret values leave the runner). Values are shell-escaped. */
 export const envDotVars = action(
-  checkedSchema(AppId, async (appId) => {
+  withSchema(AppId, async (appId) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "admin");
     const rows = await runnerListEnv(appId);
@@ -601,7 +591,7 @@ const DomainArgs = Schema.Struct({
 
 /** Hostnames this app answers on, for anyone who can see the app. */
 export const listDomains = action(
-  checkedSchema(AppId, async (appId) => {
+  withSchema(AppId, async (appId) => {
     await requireViewApp(appId);
     try {
       return await runnerListDomains(appId);
@@ -615,7 +605,7 @@ export const listDomains = action(
 /** Reserve a hostname for the app (admin). The runner is the authority on
  * shape, collisions and platform-owned names; its message is surfaced. */
 export const addDomain = action(
-  checkedSchema(DomainArgs, async ({ appId, hostname }) => {
+  withSchema(DomainArgs, async ({ appId, hostname }) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "admin");
     try {
@@ -628,7 +618,7 @@ export const addDomain = action(
 );
 
 export const removeDomain = action(
-  checkedSchema(DomainArgs, async ({ appId, hostname }) => {
+  withSchema(DomainArgs, async ({ appId, hostname }) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "admin");
     try {
@@ -652,7 +642,7 @@ const LimitArgs = Schema.Struct({
 
 /** The app's edge limits beside the platform defaults they fall back to. */
 export const getLimits = action(
-  checkedSchema(AppId, async (appId) => {
+  withSchema(AppId, async (appId) => {
     await requireViewApp(appId);
     try {
       return await runnerGetLimits(appId);
@@ -666,7 +656,7 @@ export const getLimits = action(
 /** Set the app's edge limits (admin). The runner owns the range check and
  * rewrites the edge on its next reconcile. */
 export const setLimits = action(
-  checkedSchema(LimitArgs, async ({ appId, appRpm, clientRpm }) => {
+  withSchema(LimitArgs, async ({ appId, appRpm, clientRpm }) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "admin");
     try {
@@ -714,7 +704,7 @@ const requireTelemetryRole = async (
 
 /** One error with its recent occurrences (stack, request, trace logs). */
 export const errorDetail = action(
-  checkedSchema(ErrorArgs, async ({ appId, fingerprint }) => {
+  withSchema(ErrorArgs, async ({ appId, fingerprint }) => {
     await requireTelemetryRole(appId, "view");
     try {
       return await runnerGetError(appId, fingerprint);
@@ -727,7 +717,7 @@ export const errorDetail = action(
 
 /** Resolve, ignore or reopen an error — anyone who can push can triage. */
 export const setErrorStatus = action(
-  checkedSchema(ErrorStatusArgs, async ({ appId, fingerprint, status }) => {
+  withSchema(ErrorStatusArgs, async ({ appId, fingerprint, status }) => {
     await requireTelemetryRole(appId, "push");
     try {
       return await runnerSetErrorStatus(appId, fingerprint, status);
@@ -815,7 +805,7 @@ const R2DeleteArgs = Schema.Struct({
  * The reserved control app has exactly one resource: the control D1, which
  * lives in THIS worker's binding, so it never reaches the runner. */
 export const listAppStorage = action(
-  checkedSchema(StorageListArgs, async ({ appId }) => {
+  withSchema(StorageListArgs, async ({ appId }) => {
     if (appId === CONTROL_APP_ID) {
       await requireControlAdmin();
       return [
@@ -846,7 +836,7 @@ const requireControlDatabase = async (
 ): Promise<SessionUser> => {
   const user = await requireControlAdmin();
   if (databaseId !== CONTROL_APP_DATABASE_ID) {
-    failAction(`Unknown control database ${databaseId}`);
+    fail(`Unknown control database ${databaseId}`);
   }
   return user;
 };
@@ -863,7 +853,7 @@ const capsForRole = (role: AppRole): D1TableCaps =>
  * database is read IN-PROCESS from the worker's own binding (never via the
  * runner, never via `celld d1 execute` — see SPEC). */
 export const d1Tables = action(
-  checkedSchema(D1TablesArgs, async ({ appId, databaseId }) => {
+  withSchema(D1TablesArgs, async ({ appId, databaseId }) => {
     if (appId === CONTROL_APP_ID) {
       await requireControlDatabase(databaseId);
       try {
@@ -891,7 +881,7 @@ export const d1Tables = action(
 /** One table's schema with its caps: the tenant role decides there, the
  * control D1 policy decides for the reserved database. */
 export const d1Schema = action(
-  checkedSchema(D1TableArgs, async ({ appId, databaseId, table }) => {
+  withSchema(D1TableArgs, async ({ appId, databaseId, table }) => {
     if (appId === CONTROL_APP_ID) {
       await requireControlDatabase(databaseId);
       try {
@@ -920,7 +910,7 @@ export const d1Schema = action(
 
 /** One server-side page of rows (view role). */
 export const d1Rows = action(
-  checkedSchema(
+  withSchema(
     D1RowsArgs,
     async ({
       appId,
@@ -981,7 +971,7 @@ const D1WriteArgs = Schema.Struct({
  * `null` binds SQL NULL, "" an empty string; an omitted insert column takes
  * its DDL default. */
 export const d1Write = action(
-  checkedSchema(
+  withSchema(
     D1WriteArgs,
     async ({ appId, databaseId, key, op, table, values }) => {
       const body: D1WriteBody = { key, op, table, values };
@@ -1015,37 +1005,34 @@ export const d1Write = action(
 /** Delete 1..100 rows by key (push-gated): one atomic batch where the backend
  * allows it, every key policy-checked before anything runs. */
 export const d1DeleteRows = action(
-  checkedSchema(
-    D1DeleteRowsArgs,
-    async ({ appId, databaseId, keys, table }) => {
-      const body: D1DeleteRowsBody = { keys: [...keys], table };
-      if (appId === CONTROL_APP_ID) {
-        const user = await requireControlDatabase(databaseId);
-        try {
-          return await deleteControlRows(resolveD1(), {
-            actorId: user.id,
-            keys: [...keys],
-            table,
-          });
-        } catch (error) {
-          failUnknown(error);
-        }
-      }
-      const user = await sessionUser();
-      await requireAppRole(appId, user.id, "push");
+  withSchema(D1DeleteRowsArgs, async ({ appId, databaseId, keys, table }) => {
+    const body: D1DeleteRowsBody = { keys: [...keys], table };
+    if (appId === CONTROL_APP_ID) {
+      const user = await requireControlDatabase(databaseId);
       try {
-        return await runnerD1DeleteRows(appId, databaseId, body);
+        return await deleteControlRows(resolveD1(), {
+          actorId: user.id,
+          keys: [...keys],
+          table,
+        });
       } catch (error) {
         failUnknown(error);
       }
     }
-  ),
+    const user = await sessionUser();
+    await requireAppRole(appId, user.id, "push");
+    try {
+      return await runnerD1DeleteRows(appId, databaseId, body);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }),
   { error: AuthError }
 );
 
 /** Read-only Durable Object instance list for one class. */
 export const doPreview = action(
-  checkedSchema(DoPreviewArgs, async ({ appId, className }) => {
+  withSchema(DoPreviewArgs, async ({ appId, className }) => {
     await requireViewApp(appId);
     try {
       return await runnerDoInstances(appId, className);
@@ -1058,7 +1045,7 @@ export const doPreview = action(
 
 /** One page of an R2 bucket folder (view role). */
 export const r2List = action(
-  checkedSchema(R2ListArgs, async ({ appId, bucket, prefix, cursor }) => {
+  withSchema(R2ListArgs, async ({ appId, bucket, prefix, cursor }) => {
     await requireViewApp(appId);
     try {
       return await runnerR2List(appId, bucket, prefix ?? "", cursor ?? null);
@@ -1071,7 +1058,7 @@ export const r2List = action(
 
 /** Read-only R2 object fetch (bounded text preview). */
 export const r2Get = action(
-  checkedSchema(R2GetArgs, async ({ appId, bucket, key }) => {
+  withSchema(R2GetArgs, async ({ appId, bucket, key }) => {
     await requireViewApp(appId);
     try {
       return await runnerR2Get(appId, bucket, key);
@@ -1084,9 +1071,9 @@ export const r2Get = action(
 
 /** Delete 1..100 R2 objects in one call (push role — a write). */
 export const r2Delete = action(
-  checkedSchema(R2DeleteArgs, async ({ appId, bucket, keys }) => {
+  withSchema(R2DeleteArgs, async ({ appId, bucket, keys }) => {
     if (keys.length === 0 || keys.length > 100) {
-      throw new ActionError({ message: "select 1 to 100 objects" });
+      fail("select 1 to 100 objects");
     }
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "push");
@@ -1119,7 +1106,7 @@ const RemoveCollaborator = Schema.Struct({
 });
 
 export const listCollaborators = action(
-  checkedSchema(AppId, async (appId) => {
+  withSchema(AppId, async (appId) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "view");
     return listCollaboratorRows(appId);
@@ -1132,16 +1119,16 @@ export const listCollaborators = action(
  * already visible in the list), anyone else gets a pending invitation they
  * accept after signing in with that address. */
 export const inviteCollaborator = action(
-  checkedSchema(InviteCollaborator, async ({ appId, email, role }) => {
+  withSchema(InviteCollaborator, async ({ appId, email, role }) => {
     const user = await sessionUser();
     const { app } = await requireAppRole(appId, user.id, "admin");
     const nextRole = parseAppRole(role.trim().toLowerCase());
     if (nextRole === null) {
-      return failAction("role must be view, push, or admin");
+      return fail("role must be view, push, or admin");
     }
     const normalized = normalizeEmail(email);
     if (!normalized.includes("@")) {
-      return failAction("Valid email required");
+      return fail("Valid email required");
     }
     try {
       const members = await listCollaboratorRows(appId);
@@ -1171,7 +1158,7 @@ export const inviteCollaborator = action(
 
 /** Invitations waiting on an app (admin only: they carry email addresses). */
 export const listPendingInvitations = action(
-  checkedSchema(AppId, async (appId) => {
+  withSchema(AppId, async (appId) => {
     const user = await sessionUser();
     await requireAppRole(appId, user.id, "admin");
     return listPendingInvites(appId);
@@ -1180,7 +1167,7 @@ export const listPendingInvitations = action(
 );
 
 export const revokeInvitation = action(
-  checkedSchema(
+  withSchema(
     Schema.Struct({ appId: Schema.String, inviteId: Schema.String }),
     async ({ appId, inviteId }) => {
       const user = await sessionUser();
@@ -1208,11 +1195,11 @@ export const myCollaboratorInvitations = action(
 /** Accept an invitation: the grant is created for the session account only
  * when the invitation is addressed to its email. */
 export const acceptInvitation = action(
-  checkedSchema(Schema.String, async (inviteId) => {
+  withSchema(Schema.String, async (inviteId) => {
     const user = await sessionUser();
     const accepted = await acceptPendingInvite(inviteId, user.email, user.id);
     if (!accepted) {
-      return failAction("Invitation not found");
+      return fail("Invitation not found");
     }
     return { appId: accepted.appId, ok: true as const };
   }),
@@ -1220,7 +1207,7 @@ export const acceptInvitation = action(
 );
 
 export const declineInvitation = action(
-  checkedSchema(Schema.String, async (inviteId) => {
+  withSchema(Schema.String, async (inviteId) => {
     const user = await sessionUser();
     await withDb(declinePendingInvite(inviteId, user.email));
     return { ok: true as const };
@@ -1229,12 +1216,12 @@ export const declineInvitation = action(
 );
 
 export const updateCollaboratorRole = action(
-  checkedSchema(UpdateCollaborator, async ({ appId, userId, role }) => {
+  withSchema(UpdateCollaborator, async ({ appId, userId, role }) => {
     const actor = await sessionUser();
     await requireAppRole(appId, actor.id, "admin");
     const nextRole = parseAppRole(role.trim().toLowerCase());
     if (nextRole === null) {
-      return failAction("role must be view, push, or admin");
+      return fail("role must be view, push, or admin");
     }
     const err = await withDb(
       Effect.gen(function* run() {
@@ -1259,7 +1246,7 @@ export const updateCollaboratorRole = action(
       })
     );
     if (err) {
-      return failAction(err);
+      return fail(err);
     }
     return { ok: true as const };
   }),
@@ -1267,7 +1254,7 @@ export const updateCollaboratorRole = action(
 );
 
 export const removeCollaborator = action(
-  checkedSchema(RemoveCollaborator, async ({ appId, userId }) => {
+  withSchema(RemoveCollaborator, async ({ appId, userId }) => {
     const actor = await sessionUser();
     await requireAppRole(appId, actor.id, "admin");
     const err = await withDb(
@@ -1289,7 +1276,7 @@ export const removeCollaborator = action(
       })
     );
     if (err) {
-      return failAction(err);
+      return fail(err);
     }
     return { ok: true as const };
   }),

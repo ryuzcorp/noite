@@ -1,18 +1,13 @@
 /* eslint-disable func-names -- Effect.gen uses anonymous generators */
 import * as Schema from "effect/Schema";
-import { action } from "oxidejs";
+import { action, withSchema } from "oxidejs";
 
-import { checkedSchema } from "./action-schema";
 import { sessionUser } from "./apps.server";
-import { ActionError, MissingAuthSecretError, UnauthorizedError } from "./auth";
+import { MissingAuthSecretError, UnauthorizedError } from "./auth";
 import { requireAppRole } from "./collaborators";
 import { runnerGetUserProps } from "./runner";
 
-const AuthError = Schema.Union([
-  UnauthorizedError,
-  MissingAuthSecretError,
-  ActionError,
-]);
+const AuthError = Schema.Union([UnauthorizedError, MissingAuthSecretError]);
 
 const UserPropsArgs = Schema.Struct({
   appId: Schema.String,
@@ -26,7 +21,7 @@ const requireViewApp = async (appId: string): Promise<void> => {
 };
 
 export const getUserProps = action(
-  checkedSchema(UserPropsArgs, async ({ appId, userId }) => {
+  withSchema(UserPropsArgs, async ({ appId, userId }) => {
     await requireViewApp(appId);
     return runnerGetUserProps(appId, userId);
   }),

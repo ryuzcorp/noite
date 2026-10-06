@@ -9,12 +9,20 @@ Installs follow releases, not `main`. `NOITE_IMAGE` (or `NOITE_VERSION` for the 
 
 | Tag | What it is |
 | --- | --- |
-| `alpha` | The newest release of any kind. The default while Noite is alpha. |
+| `alpha` | The newest promoted release of any kind. The default while Noite is alpha. |
 | `stable` | The newest final release (no `-alpha.N` in its version). Absent until the first one. |
 | `0.1.0-alpha.1` | One release, pinned: an update changes nothing. |
 | short SHA, `edge` | A build of `main`. Not for installs: for CI and rollbacks. |
 
-Every release is tagged `v<version>` and passes the end-to-end lanes (passkey signup, invites, git push, deploys, and the hostile-tenant suite) before its image is published. Its notes are in [CHANGELOG.md](https://github.com/ryuzcorp/noite/blob/main/CHANGELOG.md); each has an **Operator action required** section, even when it is "None". Read it before you update.
+Every release is tagged `v<version>` and passes the end-to-end lanes (passkey signup, invites, git push, deploys, and the hostile-tenant suite) before its image is published. Its notes are in [CHANGELOG.md](https://github.com/ryuzcorp/noite/blob/main/CHANGELOG.md) and on its [GitHub release](https://github.com/ryuzcorp/noite/releases); each has an **Operator action required** section, even when it is "None". Read it before you update.
+
+A new release starts as a GitHub **pre-release**: its version tag exists, but `alpha` and `stable` don't move. To try it on your own server first, run the installer with `--pre`, which installs the newest release (pre-releases included) pinned to its version, with the installer and `compose.yaml` from its tag:
+
+```bash
+curl -fsSL https://noite.now/run.sh | bash -s install --pre
+```
+
+Once the pre-release is marked as a full release on GitHub, the channels point at the same image (no rebuild): `alpha` always, and `stable` too for a final version. A plain `install` then puts a `--pre` server back on the channel without a restart, since the image is the same. Only the latest release moves the channels; the maintainers re-point them by hand to roll a channel back.
 
 To roll back, set `NOITE_IMAGE` to the previous version tag. That works across releases that did not change the database schema; a release that did refuses to be downgraded (see [Troubleshooting](#troubleshooting)), so take a [backup](#backups) first.
 

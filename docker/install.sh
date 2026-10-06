@@ -21,7 +21,8 @@
 #                      recover with `noite-runner recover` (printed at the end)
 #   NOITE_VERSION      release channel or version (default: alpha; `stable`
 #                      follows final releases only, `0.1.0-alpha.1` or a short
-#                      SHA holds an install in place)
+#                      SHA holds an install in place; `run.sh … install --pre`
+#                      pins the newest release, pre-releases included)
 #   NOITE_REF          git ref the installer and compose.yaml come from (default: main)
 #   NOITE_DIR          install directory (default: /opt/noite)
 #   NOITE_YES=1        skip the upgrade confirmation (`bash -s install --yes`
@@ -351,7 +352,8 @@ no invite code: open https://app.$DOMAIN before anyone else can.
 EOF
 }
 
-# `run.sh` passes through whatever follows `install`; only --yes is defined.
+# `run.sh` passes through whatever follows `install` (it consumes --pre
+# itself, as NOITE_REF + NOITE_VERSION); only --yes is defined here.
 parse_args() {
   local arg
   for arg in "$@"; do

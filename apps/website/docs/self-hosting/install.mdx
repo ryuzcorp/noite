@@ -29,7 +29,7 @@ Re-running the script is the upgrade: it refreshes `compose.yaml`, keeps `.env` 
 | `NOITE_REF` | `main` | git ref the installer and `compose.yaml` are fetched from |
 | `NOITE_YES` | none | `1` = skip the upgrade confirmation (same as `--yes`; `NOITE_CONFIRM=1` works too) |
 
-The script always runs the installer from the ref's latest commit, so a CDN-cached copy is never stale.
+The script always runs the installer from the ref's latest commit, so a CDN-cached copy is never stale. `bash -s install --pre` installs the newest release, pre-releases included, before it reaches the `alpha` channel (see [Releases and channels](/self-hosting/operations#releases-and-channels)); an explicit `NOITE_VERSION` or `NOITE_REF` wins over it.
 
 Before you invite anyone, read [Known limits](/self-hosting/known-limits): Noite is alpha, and tenant isolation is not a hard boundary yet.
 

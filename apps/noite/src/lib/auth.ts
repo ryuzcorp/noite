@@ -9,7 +9,7 @@ import { admin } from "better-auth/plugins";
 import { emailOTP } from "better-auth/plugins/email-otp";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { OxideRequest } from "oxidejs";
+import { fail, OxideRequest } from "oxidejs";
 
 import { ensureDbPromise, getAuthDb, missingDb, resolveEnv } from "./db";
 import { errorMessage } from "./errors";
@@ -34,23 +34,11 @@ export class UnauthorizedError extends Schema.TaggedError<UnauthorizedError>()(
   { message: Schema.String }
 ) {}
 
-// oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
-export class ActionError extends Schema.TaggedError<ActionError>()(
-  "ActionError",
-  { message: Schema.String }
-) {}
-
-export const failAction = (message: string): never => {
-  throw new ActionError({ message });
-};
-
-/** Map an unknown catch value into a mapped ActionError (client-visible).
- * Use in action catch blocks instead of repeating the instanceof ternary. */
+/** Map an unknown catch value into a client-visible `fail(message)`.
+ * Oxide masks a plain throw as `-32603 Internal error`; this keeps the real
+ * message the user needs. Use in action catch blocks. */
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site values are unknown by construction; this helper narrows to message
-export const failUnknown = (error: unknown): never => {
-  const message = errorMessage(error);
-  throw new ActionError({ message });
-};
+export const failUnknown = (error: unknown): never => fail(errorMessage(error));
 
 // oxlint-disable-next-line unicorn/throw-new-error -- Schema.TaggedError factory
 class InvalidRegistrationContextError extends Schema.TaggedError<InvalidRegistrationContextError>()(

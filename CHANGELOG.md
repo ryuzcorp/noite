@@ -1,6 +1,6 @@
 # Changelog
 
-Noite installs follow releases, not `main`. Pick a channel with `NOITE_IMAGE` (or `NOITE_VERSION` for the installer): `alpha` gets every release, `stable` only final ones, and a version tag (`0.1.0-alpha.1`) holds an install in place. `edge` and short-SHA tags are for CI and rollbacks.
+Noite installs follow releases, not `main`. Pick a channel with `NOITE_IMAGE` (or `NOITE_VERSION` for the installer): `alpha` gets every promoted release, `stable` only final ones, and a version tag (`0.1.0-alpha.1`) holds an install in place. A release starts as a GitHub pre-release that only `run.sh | bash -s install --pre` installs; marking it as a full release moves the channels. `edge` and short-SHA tags are for CI and rollbacks.
 
 Every release has an **Operator action required** section, even when it is "None". Read it before upgrading: an upgrade restarts the runner and every tenant fleet cold-boots, so batch upgrades.
 
@@ -51,6 +51,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The nft egress policy matches the whole build uid range instead of a single build uid. The image no longer has a shared `build` user. `single` tenancy uses the same per-app uid path.
 - Runner D1 API: `storage.d1.get` and its REST route are removed. `storage.d1.{tables,schema,rows,write,delete_rows}` and their REST equivalents under `/v1/apps/{id}/storage/d1/{database_id}/` replace them. Rows are read as JSON (`celld d1 execute --json`), and a write now treats `null` as SQL NULL and `""` as an empty string.
 - Runner R2 API: listing takes `prefix` and `cursor` and returns folders plus content types. `PUT …/storage/r2/{bucket}/object?key=` uploads, and `storage.r2.delete` takes 1–100 `keys`.
+- `oxidejs` 0.5.10 → 0.6.0, which drops the control UI's workarounds for the old behavior:
+  - **Action typing:** the `checkedSchema` cast is gone; the server modules use `withSchema` directly, and the casts around awaited action results are removed.
+  - **Errors:** user-facing action errors use oxide's `fail(message)` instead of the in-house `failAction`/`ActionError`, and error display no longer special-cases plain `{ message }` rejections, since action errors now arrive as `Error` objects.
+  - **Database setup:** the once-per-isolate setup pass uses oxidejs `isolateOnce` (15 s timeout, 5 s wait) instead of a hand-written promise cache. On the release image it ran once per isolate, 3 passes across about 340 requests.
+- Releases go through a pre-release. A `v*` tag publishes the version image and a GitHub pre-release with its CHANGELOG notes, but no longer moves `alpha` or `stable`. `curl -fsSL https://noite.now/run.sh | bash -s install --pre` installs the newest release, pre-releases included, pinned to its version. Marking the pre-release as a full release points `alpha` (and `stable` for a final version) at the same image, so plain installs and upgrades pick it up.
 - Docs: the measured upgrade window replaces "about a minute for many apps".
 
 ### Fixed

@@ -5,7 +5,7 @@ import * as Schema from "effect/Schema";
 import { SqlClient } from "effect/sql/SqlClient";
 import { Kysely } from "kysely";
 import { D1Dialect } from "kysely-d1";
-import { useEnv } from "oxidejs";
+import { isolateOnce, useEnv } from "oxidejs";
 import { createMigrator, defineSchema, paranorm } from "paranorm";
 import type { InferSchema, Selectable } from "paranorm";
 
@@ -349,17 +349,10 @@ export const missingDb = () =>
 
 let d1Binding: D1Database | undefined;
 
-/** Stamp the Worker D1 binding for calls outside a request store. */
+/** Stamp the Worker D1 binding for calls outside a request store. The setup
+ * pass is keyed on the binding, so a new database gets a fresh pass. */
 export const setD1Binding = (db: D1Database) => {
-  if (d1Binding === db) {
-    return;
-  }
   d1Binding = db;
-  // A different database has never been migrated: drop the cached setup pass
-  // (a Worker isolate keeps one binding, so this only fires for tests that
-  // swap in a fresh database).
-  // oxlint-disable-next-line eslint/no-use-before-define -- declared with the setup cache below, which this must reset
-  clearSetupOnce();
 };
 
 /** Live D1: request ALS env first, then the middleware-stamped binding. */
@@ -420,71 +413,35 @@ const runDbSetup = Effect.gen(function* runDbSetup() {
   }
 });
 
-/** At most one setup pass per isolate, and a caller that arrives while the
- * pass is still running awaits that same pass instead of starting another.
- * The old `migrated.done` flag was only set *after* the work finished, so
- * every request already in flight on a cold isolate replayed the whole pass —
- * the migration, tens of statements — against a
- * single-threaded D1 cell. A failed pass clears the cache so the next request
- * retries; a cold isolate still pays it once. */
-let setupOnce: Promise<void> | undefined;
-const clearSetupOnce = () => {
-  setupOnce = undefined;
-};
+/** Bound on one setup pass. Shorter than oxide's 30 s default so a stuck D1
+ * call fails the pass (and clears it) well inside a request's own deadline. */
+const SETUP_TIMEOUT_MS = 15_000;
 
-/** Bound on one setup pass. A D1 call that never answers must fail the pass
- * (and clear the cache) instead of holding every later request. */
-const SETUP_TIMEOUT = "15 seconds";
-
-/** How long a request waits on a pass another request started before it
- * drops that pass and runs its own. celld cancels a request's pending work
- * when that request ends or its client goes away (measured on 0.6.0: a
- * promise started by an aborted request never settles), so a shared pass can
- * be orphaned without ever failing — without this bound, every later request
- * on the isolate would wait on it forever. */
+/** How long a request waits on a pass another request started before it drops
+ * that pass and runs its own. celld cancels a request's pending work when that
+ * request ends or its client goes away, so a shared pass can be orphaned
+ * without ever failing — without this bound, every later request on the
+ * isolate would wait on it forever. */
 const SHARED_SETUP_WAIT_MS = 5000;
 
-const runDbSetupOnce = (): Promise<void> => {
-  setupOnce ??= Effect.runPromise(
-    runDbSetup.pipe(
-      Effect.timeout(SETUP_TIMEOUT),
-      Effect.provide(sqlLive()),
-      Effect.scoped,
-      // A failed pass must not poison the isolate: drop the cache so the next
-      // request retries. Defects count too (a missing D1 binding).
-      Effect.onError(() => Effect.sync(clearSetupOnce))
-    )
-  );
-  return setupOnce;
-};
+/** At most one setup pass per isolate, per D1 binding, through oxidejs
+ * `isolateOnce`: concurrent callers share one pass, a failure or timeout
+ * clears it (so the next request retries), and a caller that has waited
+ * {@link SHARED_SETUP_WAIT_MS} runs its own instead of hanging on a pass
+ * orphaned by a finished request. The binding is the pass key, so a test that
+ * swaps in a fresh database gets a fresh pass. */
+const runDbSetupOnce = isolateOnce(
+  async (db: D1Database) => {
+    await Effect.runPromise(
+      runDbSetup.pipe(Effect.provide(D1Client.layer({ db })), Effect.scoped)
+    );
+  },
+  { timeout: SETUP_TIMEOUT_MS, wait: SHARED_SETUP_WAIT_MS }
+);
 
-/** Await the shared setup pass, but never longer than
- * {@link SHARED_SETUP_WAIT_MS}: past that, replace a pass that may have been
- * orphaned by its request with one this request owns. */
-const awaitDbSetup = async (): Promise<void> => {
-  const pass = runDbSetupOnce();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  // oxlint-disable-next-line promise/avoid-new -- a timer-backed race needs its own Promise
-  const orphaned = new Promise<boolean>((resolve) => {
-    timer = setTimeout(() => resolve(true), SHARED_SETUP_WAIT_MS);
-  });
-  try {
-    const stale = await Promise.race([pass.then(() => false), orphaned]);
-    if (!stale) {
-      return;
-    }
-  } finally {
-    clearTimeout(timer);
-  }
-  if (setupOnce === pass) {
-    clearSetupOnce();
-  }
-  await runDbSetupOnce();
-};
+export const ensureDb = Effect.promise(() => runDbSetupOnce(resolveD1()));
 
-export const ensureDb = Effect.promise(awaitDbSetup);
-
-export const ensureDbPromise = (): Promise<void> => awaitDbSetup();
+export const ensureDbPromise = (): Promise<void> => runDbSetupOnce(resolveD1());
 
 /** Bound on one `withDb` unit of work. A D1 read that never answers fails
  * the action (the client sees an error) instead of leaving it pending. */
