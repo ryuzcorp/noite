@@ -10,7 +10,7 @@
 # generated secrets, opens 80/443 in ufw when it is active, starts the stack
 # and waits for /ready. Re-running it is the upgrade: compose.yaml and the
 # image are refreshed to the channel's newest release, .env (domain, secrets)
-# is kept.
+# is kept, and any required setting it lacks gets the first-install default.
 #
 # Environment (all optional; `curl … | NOITE_DOMAIN=example.com bash -s install`):
 #   NOITE_DOMAIN       base domain; app./api./git./*. must point at this host
@@ -140,7 +140,9 @@ public_ip() {
 
 rand_hex() { od -An -tx1 -N"$1" /dev/urandom | tr -d ' \n'; }
 
-env_get() { grep -E "^$1=" "$NOITE_DIR/.env" 2>/dev/null | tail -n 1 | cut -d= -f2-; }
+# Last value of KEY in .env, empty when absent (never fails: callers assign
+# it under `set -e`, and grep's no-match status would abort the script).
+env_get() { { grep -E "^$1=" "$NOITE_DIR/.env" 2>/dev/null || true; } | tail -n 1 | cut -d= -f2-; }
 
 # Set KEY=VALUE in .env, replacing an existing line.
 env_set() {
@@ -187,6 +189,63 @@ choose_domain() {
   fi
 }
 
+# Set KEY to VALUE when .env has no value for it (absent or empty).
+# `--allow-empty` keeps a present-but-empty line: CONTROL_SUBDOMAIN= is a
+# real choice (the control UI on the bare domain).
+env_default() {
+  local allow_empty=0
+  if [[ "$1" == "--allow-empty" ]]; then
+    allow_empty=1
+    shift
+  fi
+  local key="$1" value="$2"
+  if [[ -n "$(env_get "$key")" ]]; then
+    return 0
+  fi
+  if [[ "$allow_empty" -eq 1 ]] && grep -qE "^$key=" "$NOITE_DIR/.env"; then
+    return 0
+  fi
+  env_set "$key" "$value"
+  ENV_ADDED+=("$key")
+}
+
+# Like env_default, but a value matching compose.yaml's dev default (the glob
+# in $3) counts as missing too: with it the runner refuses to boot on a real
+# domain, so that install never served and nothing depends on the value.
+env_secret() {
+  local key="$1" value="$2" dev_glob="$3" current
+  current=$(env_get "$key")
+  # shellcheck disable=SC2053 # $dev_glob is a glob on purpose
+  if [[ -n "$current" && "$current" == $dev_glob ]]; then
+    env_set "$key" "$value"
+    ENV_ADDED+=("$key")
+    return 0
+  fi
+  env_default "$key" "$value"
+}
+
+# Everything the runner needs to boot on a real domain, with the defaults a
+# first install writes. A re-run fills in what an older or hand-edited .env
+# lacks instead of leaving the runner to refuse its config; a value that is
+# set is never touched. A localhost .env is a dev setup that compose.yaml's
+# defaults already serve, so it is left alone.
+ensure_env_defaults() {
+  ENV_ADDED=()
+  [[ "$DOMAIN" != "localhost" ]] || return 0
+  env_default BASE_DOMAIN "$DOMAIN"
+  env_default --allow-empty CONTROL_SUBDOMAIN app
+  local sub
+  sub=$(env_get CONTROL_SUBDOMAIN)
+  env_default BETTER_AUTH_URL "https://${sub:+$sub.}$DOMAIN"
+  env_default GIT_PUBLIC_BASE "https://git.$DOMAIN"
+  env_default HTTP_PORT 80
+  env_default HTTPS_PORT 443
+  env_secret RUNNER_TOKEN "$(rand_hex 32)" "dev-runner-token"
+  env_secret BETTER_AUTH_SECRET "$(rand_hex 32)" "dev-*"
+  env_secret RUSTFS_ACCESS_KEY "noite$(rand_hex 8)" "noiteaccess"
+  env_secret RUSTFS_SECRET_KEY "$(rand_hex 24)" "noitesecretnoitesecretnoite12"
+}
+
 write_config() {
   step "Writing $NOITE_DIR"
   mkdir -p "$NOITE_DIR"
@@ -197,17 +256,22 @@ write_config() {
   install -m 0644 "$tmp" "$NOITE_DIR/compose.yaml"
   rm -f "$tmp"
 
+  local fresh=0
   if [[ -f "$NOITE_DIR/.env" ]]; then
     # The domain and secrets are fixed at first install: passkeys bind to
-    # BETTER_AUTH_URL and the bucket keys guard existing data.
+    # BETTER_AUTH_URL and the bucket keys guard existing data. Only what is
+    # missing gets a default (ensure_env_defaults); a set value is kept.
     DOMAIN=$(env_get BASE_DOMAIN)
-    [[ -n "$DOMAIN" ]] || die "$NOITE_DIR/.env has no BASE_DOMAIN; fix it or move it away to start over"
-    if [[ -n "${NOITE_DOMAIN:-}" && "$NOITE_DOMAIN" != "$DOMAIN" ]]; then
+    if [[ -z "$DOMAIN" ]]; then
+      warn "$NOITE_DIR/.env has no BASE_DOMAIN; choosing one now"
+      choose_domain
+    elif [[ -n "${NOITE_DOMAIN:-}" && "$NOITE_DOMAIN" != "$DOMAIN" ]]; then
       warn "keeping BASE_DOMAIN=$DOMAIN: changing it breaks every registered passkey (uninstall to start over)"
+    else
+      info "keeping .env (BASE_DOMAIN=$DOMAIN)"
     fi
-    info "keeping .env (BASE_DOMAIN=$DOMAIN)"
-    env_set NOITE_IMAGE "$NOITE_IMAGE_REPO:$NOITE_VERSION"
   else
+    fresh=1
     choose_domain
     umask 077
     cat >"$NOITE_DIR/.env" <<EOF
@@ -217,29 +281,21 @@ write_config() {
 #
 # BASE_DOMAIN and BETTER_AUTH_URL are fixed once someone registers: passkeys
 # bind to that origin. The RustFS keys guard the bundled bucket's data.
-
-BASE_DOMAIN=$DOMAIN
-CONTROL_SUBDOMAIN=app
-BETTER_AUTH_URL=https://app.$DOMAIN
-GIT_PUBLIC_BASE=https://git.$DOMAIN
-HTTP_PORT=80
-HTTPS_PORT=443
-
-NOITE_IMAGE=$NOITE_IMAGE_REPO:$NOITE_VERSION
-
-RUNNER_TOKEN=$(rand_hex 32)
-BETTER_AUTH_SECRET=$(rand_hex 32)
-RUSTFS_ACCESS_KEY=noite$(rand_hex 8)
-RUSTFS_SECRET_KEY=$(rand_hex 24)
-
+#
 # Lost-passkey sign-in codes are POSTed to this webhook as JSON; without it
 # nothing is emailed, and the operator recovers from the server with
 #   cd $NOITE_DIR && docker compose exec noite noite-runner recover
 # NOITE_EMAIL_WEBHOOK_URL=https://hooks.example.com/noite-otp
 # NOITE_SMTP_FROM=Noite <no-reply@$DOMAIN>
+
 EOF
-    info "generated .env with fresh secrets (BASE_DOMAIN=$DOMAIN)"
+    info "generating .env with fresh secrets (BASE_DOMAIN=$DOMAIN)"
   fi
+  ensure_env_defaults
+  if [[ "$fresh" -eq 0 && ${#ENV_ADDED[@]} -gt 0 ]]; then
+    info "added the missing settings to .env: ${ENV_ADDED[*]}"
+  fi
+  env_set NOITE_IMAGE "$NOITE_IMAGE_REPO:$NOITE_VERSION"
 
   if [[ -n "${NOITE_ADMIN_EMAIL:-}" ]]; then
     env_set NOITE_ADMIN_EMAIL "$NOITE_ADMIN_EMAIL"

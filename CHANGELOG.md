@@ -48,6 +48,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Re-running the installer fills in any required `.env` setting that is missing or still at a dev default, instead of leaving the runner to refuse its config: the domain settings, ports, runner token, auth secret and RustFS keys. Values that are set are never changed, and the installer lists what it added. A missing `BASE_DOMAIN` is now asked for (or taken from `NOITE_DOMAIN`). Before, the installer stopped with "fix it or move it away".
 - Telemetry ingest is idempotent and resumable. It works in hour-aligned chunks and replaces each window's minute buckets, span stats, log lines and error buckets instead of adding to them, so a retry, a catch-up after downtime or a replay never counts twice. After downtime the gap is read hour by hour, oldest first, bounded by retention.
 - Telemetry ingest isolates a failing app: healthy apps keep aggregating while the broken one retries after a backoff. Apps that stopped (scale-to-zero, crash, runner shutdown) still get their remaining complete hours aggregated.
 - Error issue counts are derived from the retained hour buckets, and logged-error capture is capped per app per hour (200) instead of per ingest pass.
