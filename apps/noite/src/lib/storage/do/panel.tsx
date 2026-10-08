@@ -4,7 +4,6 @@
 //! celld exposes no generic storage read for a DO instance, so the app's
 //! handler decides what a preview shows — the UI only presents it.
 
-import { searchParam } from "@ilha/router";
 import * as Schema from "effect/Schema";
 import { atom } from "ilha";
 import type { View } from "ilha";
@@ -12,6 +11,7 @@ import type { View } from "ilha";
 import { errorMessage } from "../../errors";
 import { doPreview } from "../../resources";
 import type { DoPreview } from "../../runner";
+import { searchParam } from "../../search-param";
 import { CopyButton } from "../../ui/copy-button";
 import { Refresh, Search } from "../../ui/icons";
 import {

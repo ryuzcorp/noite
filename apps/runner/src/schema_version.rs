@@ -21,7 +21,7 @@ use anyhow::{bail, Context};
 use sqlx::SqliteConnection;
 
 /// Version a database has after every migration ran. 1 is the alpha baseline.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`.
@@ -76,6 +76,74 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: "CREATE TABLE IF NOT EXISTS main.instance_setting (\
             key TEXT PRIMARY KEY NOT NULL,\
             value TEXT NOT NULL\
+          );",
+    },
+    Migration {
+        version: 6,
+        // The `apps.create` source (JSON) an app was imported from (A2/A3):
+        // NULL for a blank app, so a failed GitHub/template import can be
+        // retried with the same URL, ref and actor. `main.app` is qualified
+        // because a bare ALTER can resolve into the ATTACHed `metrics.sqlite`.
+        sql: "ALTER TABLE main.app ADD COLUMN import_source TEXT;",
+    },
+    Migration {
+        version: 7,
+        // Pull requests (F4): the forge's own data — PRs, their comments and
+        // reviews, and the per-app branch protection rule. A fresh database
+        // gets the same shape from schema.sql. Indexes cannot be schema-
+        // qualified (SQLite rejects `ON main.<table>` in CREATE INDEX) and the
+        // names are unique to main, so the bare table name is unambiguous.
+        sql: "CREATE TABLE IF NOT EXISTS main.pull_request (\
+            id TEXT PRIMARY KEY NOT NULL,\
+            app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,\
+            number INTEGER NOT NULL,\
+            title TEXT NOT NULL,\
+            body TEXT NOT NULL DEFAULT '',\
+            author_id TEXT NOT NULL,\
+            base TEXT NOT NULL DEFAULT 'main',\
+            head TEXT NOT NULL,\
+            state TEXT NOT NULL CHECK (state IN ('open','closed','merged')),\
+            head_sha TEXT NOT NULL,\
+            merge_sha TEXT,\
+            merged_by TEXT,\
+            closed_by TEXT,\
+            created_at TEXT NOT NULL,\
+            updated_at TEXT NOT NULL,\
+            closed_at TEXT,\
+            merged_at TEXT,\
+            UNIQUE (app_id, number)\
+          );\
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_pull_request_open \
+            ON pull_request(app_id, base, head) WHERE state = 'open';\
+          CREATE INDEX IF NOT EXISTS idx_pull_request_app ON pull_request(app_id, number DESC);\
+          CREATE TABLE IF NOT EXISTS main.pr_comment (\
+            id TEXT PRIMARY KEY NOT NULL,\
+            pr_id TEXT NOT NULL REFERENCES pull_request(id) ON DELETE CASCADE,\
+            author_id TEXT NOT NULL,\
+            body TEXT NOT NULL,\
+            path TEXT,\
+            line INTEGER,\
+            side TEXT CHECK (side IN ('old','new')),\
+            commit_sha TEXT,\
+            created_at TEXT NOT NULL,\
+            edited_at TEXT\
+          );\
+          CREATE INDEX IF NOT EXISTS idx_pr_comment_pr ON pr_comment(pr_id, created_at);\
+          CREATE TABLE IF NOT EXISTS main.pr_review (\
+            id TEXT PRIMARY KEY NOT NULL,\
+            pr_id TEXT NOT NULL REFERENCES pull_request(id) ON DELETE CASCADE,\
+            reviewer_id TEXT NOT NULL,\
+            state TEXT NOT NULL CHECK (state IN ('approved','changes_requested')),\
+            commit_sha TEXT NOT NULL,\
+            created_at TEXT NOT NULL,\
+            dismissed_at TEXT\
+          );\
+          CREATE INDEX IF NOT EXISTS idx_pr_review_pr ON pr_review(pr_id, created_at);\
+          CREATE TABLE IF NOT EXISTS main.app_branch_rule (\
+            app_id TEXT PRIMARY KEY NOT NULL REFERENCES app(id) ON DELETE CASCADE,\
+            require_pr INTEGER NOT NULL DEFAULT 0,\
+            required_approvals INTEGER NOT NULL DEFAULT 0 \
+              CHECK (required_approvals BETWEEN 0 AND 2)\
           );",
     },
 ];
@@ -353,5 +421,64 @@ mod tests {
             .await
             .expect("second boot");
         assert_eq!(version(&mut conn).await, 5);
+    }
+
+    #[tokio::test]
+    async fn shipped_pull_request_migration_applies_to_an_old_database() {
+        // A fresh database takes schema.sql and skips this step, so only an
+        // upgraded install runs this SQL: it once failed to parse there.
+        let mut conn = memory().await;
+        sqlx::raw_sql(
+            "CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT);\
+             INSERT INTO main.app (id, slug) VALUES ('a1', 'one');\
+             PRAGMA main.user_version = 6;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed the alpha.4-minus-one shape");
+        let v7 = "CREATE TABLE IF NOT EXISTS main.app (id TEXT PRIMARY KEY, slug TEXT);";
+        let idx = MIGRATIONS
+            .iter()
+            .position(|m| m.version == 7)
+            .expect("the pull request migration is shipped");
+        apply(&mut conn, v7, 7, &MIGRATIONS[idx..=idx])
+            .await
+            .expect("upgrade");
+        assert_eq!(version(&mut conn).await, 7);
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM main.sqlite_master WHERE type = 'index' AND name LIKE 'idx_p%' ORDER BY name",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .expect("indexes");
+        assert_eq!(
+            indexes,
+            [
+                "idx_pr_comment_pr",
+                "idx_pr_review_pr",
+                "idx_pull_request_app",
+                "idx_pull_request_open"
+            ]
+        );
+        let open = "INSERT INTO main.pull_request \
+            (id, app_id, number, title, author_id, head, state, head_sha, created_at, updated_at) \
+            VALUES (?, 'a1', ?, 't', 'u', 'feature', 'open', 'abc', 'now', 'now')";
+        sqlx::query(open)
+            .bind("p1")
+            .bind(1)
+            .execute(&mut conn)
+            .await
+            .expect("first open PR");
+        assert!(
+            sqlx::query(open).bind("p2").bind(2).execute(&mut conn).await.is_err(),
+            "a second open PR for the same base/head is refused"
+        );
+        let rule = "INSERT INTO main.app_branch_rule (app_id, required_approvals) VALUES ('a1', ?)";
+        assert!(sqlx::query(rule).bind(3).execute(&mut conn).await.is_err());
+        sqlx::query(rule)
+            .bind(2)
+            .execute(&mut conn)
+            .await
+            .expect("2 approvals allowed");
     }
 }

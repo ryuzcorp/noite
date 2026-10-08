@@ -6,7 +6,7 @@ use ts_rs::TS;
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::host::source;
+use crate::host::{forge, source};
 use crate::models::App;
 
 pub mod d1;
@@ -31,69 +31,84 @@ pub struct StorageItem {
 
 pub(crate) fn parse_wrangler(text: &str) -> anyhow::Result<serde_json::Value> {
     // wrangler.jsonc is JSONC (comments/trailing commas); serde_json is strict.
-    // Strip // and /* */ comments and trailing commas conservatively.
+    // Comments go first, so a comma followed by a comment and then `}` is
+    // still seen as trailing.
+    let uncommented = strip_jsonc_comments(text);
+    serde_json::from_str(&strip_trailing_commas(&uncommented)).context("parse wrangler config")
+}
+
+/// `//` and `/* */` comments removed outside strings (line breaks kept).
+fn strip_jsonc_comments(text: &str) -> String {
     let mut clean = String::with_capacity(text.len());
     let mut in_line_comment = false;
     let mut in_block_comment = false;
     let mut in_string = false;
-    let chars = text.chars().collect::<Vec<_>>();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
         if in_line_comment {
             if c == '\n' {
                 in_line_comment = false;
                 clean.push(c);
             }
         } else if in_block_comment {
-            if c == '*' && next == Some('/') {
+            if c == '*' && chars.peek() == Some(&'/') {
                 in_block_comment = false;
-                i += 1;
+                chars.next();
             }
         } else if in_string {
             clean.push(c);
             if c == '\\' {
-                if let Some(esc) = next {
+                if let Some(esc) = chars.next() {
+                    clean.push(esc);
+                }
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '/' && chars.peek() == Some(&'/') {
+            in_line_comment = true;
+            chars.next();
+        } else if c == '/' && chars.peek() == Some(&'*') {
+            in_block_comment = true;
+            chars.next();
+        } else {
+            in_string = c == '"';
+            clean.push(c);
+        }
+    }
+    clean
+}
+
+/// Commas directly before `}` or `]` (whitespace between) removed outside
+/// strings. Expects comment-free input.
+fn strip_trailing_commas(text: &str) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut clean = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            clean.push(c);
+            if c == '\\' {
+                if let Some(&esc) = chars.get(i + 1) {
                     clean.push(esc);
                     i += 1;
                 }
             } else if c == '"' {
                 in_string = false;
             }
-        } else {
-            match c {
-                '"' => {
-                    in_string = true;
-                    clean.push(c);
-                }
-                '/' if next == Some('/') => {
-                    in_line_comment = true;
-                    i += 1;
-                }
-                '/' if next == Some('*') => {
-                    in_block_comment = true;
-                    i += 1;
-                }
-                ',' => {
-                    // Drop a trailing comma before } or ].
-                    let following = chars
-                        .iter()
-                        .skip(i + 1)
-                        .find(|x| !x.is_whitespace())
-                        .copied();
-                    if following == Some('}') || following == Some(']') {
-                        // skip (do not emit comma)
-                    } else {
-                        clean.push(c);
-                    }
-                }
-                _ => clean.push(c),
+        } else if c == ',' {
+            let following = chars[i + 1..].iter().find(|x| !x.is_whitespace());
+            if !matches!(following, Some('}' | ']')) {
+                clean.push(c);
             }
+        } else {
+            in_string = c == '"';
+            clean.push(c);
         }
         i += 1;
     }
-    serde_json::from_str(&clean).context("parse wrangler config")
+    clean
 }
 
 /// The deployed wrangler config, or `None` when there is none to read yet
@@ -107,11 +122,12 @@ pub async fn deployed_wrangler(
     if let Some(json) = app.deployed_config.as_deref() {
         return Ok(Some(serde_json::from_str(json)?));
     }
-    let Some(rev) = source::resolve_rev(cfg, app).await? else {
+    let bare = forge::read_mirror_cfg(cfg, &app.slug).await?;
+    let Some(rev) = forge::read_rev(&bare, app, None).await? else {
         return Ok(None);
     };
     for candidate in ["wrangler.jsonc", "wrangler.json", "wrangler.toml"] {
-        if let Ok(blob) = source::read_blob(cfg, app, &rev, candidate).await {
+        if let Ok(blob) = source::read_blob(&bare, &rev, candidate).await {
             if blob.text.trim().is_empty() || blob.binary {
                 continue;
             }
@@ -185,4 +201,34 @@ pub async fn list_storage(cfg: &Config, app: &App) -> anyhow::Result<Vec<Storage
         }
     }
     Ok(items)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_wrangler;
+
+    #[test]
+    fn jsonc_comments_and_trailing_commas_are_accepted() {
+        // A trailing comma followed by a comment used to survive comment
+        // stripping and fail the deploy ("trailing comma at line N").
+        let text = r#"{
+  "name": "a", // the worker
+  "assets": { "directory": "./dist/" /* built */, },
+  "vars": { "URL": "https://x.dev/a//b", "Q": "say \"hi\", }" },
+  "flags": ["nodejs_compat", /* more later */ ],
+  // trailing
+}"#;
+        let value = parse_wrangler(text).expect("valid JSONC");
+        assert_eq!(value["name"], "a");
+        assert_eq!(value["assets"]["directory"], "./dist/");
+        assert_eq!(value["vars"]["URL"], "https://x.dev/a//b");
+        assert_eq!(value["vars"]["Q"], "say \"hi\", }");
+        assert_eq!(value["flags"], serde_json::json!(["nodejs_compat"]));
+    }
+
+    #[test]
+    fn a_comma_between_members_is_kept() {
+        assert!(parse_wrangler(r#"{"a": 1 /* x */, "b": 2}"#).is_ok());
+        assert!(parse_wrangler(r#"{"a": 1 "b": 2}"#).is_err());
+    }
 }

@@ -47,7 +47,7 @@ The first attempt is ten minutes after the runner starts, then it checks hourly 
 
 Instance admins have two ways to see exactly what the next send would post.
 
-On `/account`, the **Admin** section has an **Anonymous usage telemetry** row whose **Show the exact payload** disclosure renders the JSON the next heartbeat would post (with the API key omitted from the display).
+On `/account`, the **Admin** tab (shown to instance admins only) has a **Telemetry** card whose **Show the exact payload** disclosure renders the JSON the next heartbeat would post (with the API key omitted from the display).
 
 The same body comes from the runner, using the `RUNNER_TOKEN` from `/opt/noite/.env`:
 
@@ -65,7 +65,7 @@ docker compose exec -T noite curl -s \
 
 | Way | How |
 | --- | --- |
-| Admin checkbox | On `/account`, under **Admin** → **Anonymous usage telemetry**, clear **Share anonymous instance telemetry**. Applies immediately. |
+| Admin checkbox | On `/account`, in the **Admin** tab's **Telemetry** card, clear **Share anonymous instance telemetry**. Applies immediately. |
 | Environment variable | `NOITE_TELEMETRY=0` in `/opt/noite/.env`, then `cd /opt/noite && docker compose up -d`. `false` and `off` work too. The installer also accepts `NOITE_TELEMETRY` and writes it to `.env`. |
 | Do Not Track | `DO_NOT_TRACK=1` disables it — any non-empty value other than `0`. |
 | Local domains | An install whose base domain is `localhost`, `*.localhost`, `*.local`, `*.test`, `*.internal` or an IP literal never reports. That covers the dev stack and the e2e lanes (which also set `NOITE_TELEMETRY=0`). An `<ip>.sslip.io` install is a public domain and **does** report — the installer's no-DNS default still counts. |

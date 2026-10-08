@@ -37,6 +37,7 @@ pub fn router(state: AppState) -> Router {
                 .delete(api::delete_app),
         )
         .route("/v1/apps/{id}/rename", post(api::rename_app))
+        .route("/v1/apps/{id}/retry-import", post(api::retry_import))
         .route("/v1/apps/{id}/sleep", post(api::sleep_app))
         .route(
             "/v1/apps/{id}/domains",
@@ -59,7 +60,22 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/apps/{id}/git-remote", post(api::git_remote))
         .route("/v1/apps/{id}/tree", get(api::source_tree))
         .route("/v1/apps/{id}/blob/{*path}", get(api::source_blob))
-        .route("/v1/apps/{id}/diff", get(api::source_diff))
+        .route("/v1/apps/{id}/bundle", get(api::source_bundle))
+        .route("/v1/apps/{id}/types", get(api::source_types))
+        // Forge mirror for the git.* RPCs. They sit under `/git/` because
+        // `/v1/apps/{id}/refs` is the traffic-referrer endpoint.
+        .route("/v1/apps/{id}/git/refs", get(api::git_refs))
+        .route("/v1/apps/{id}/git/log", get(api::git_log))
+        .route("/v1/apps/{id}/git/commits/{sha}", get(api::git_commit))
+        .route("/v1/apps/{id}/git/compare", get(api::git_compare))
+        .route(
+            "/v1/apps/{id}/git/branches",
+            post(api::git_branch_create),
+        )
+        .route(
+            "/v1/apps/{id}/git/branches/{*name}",
+            delete(api::git_branch_delete),
+        )
         .route("/v1/apps/{id}/metrics", get(api::app_metrics))
         .route("/v1/apps/{id}/devices", get(api::app_devices))
         .route("/v1/apps/{id}/paths", get(api::app_paths))
@@ -109,6 +125,34 @@ pub fn router(state: AppState) -> Router {
             post(api::app_d1_delete_rows),
         )
         .route("/v1/apps/{id}/source/commit", post(api::app_source_commit))
+        .route(
+            "/v1/apps/{id}/pull_requests",
+            get(api::list_prs).post(api::create_pr),
+        )
+        .route(
+            "/v1/apps/{id}/pull_requests/{number}",
+            get(api::get_pr).patch(api::update_pr),
+        )
+        .route(
+            "/v1/apps/{id}/pull_requests/{number}/comments",
+            post(api::add_comment),
+        )
+        .route(
+            "/v1/apps/{id}/comments/{comment_id}",
+            axum::routing::patch(api::edit_comment).delete(api::delete_comment),
+        )
+        .route(
+            "/v1/apps/{id}/pull_requests/{number}/reviews",
+            post(api::add_review),
+        )
+        .route(
+            "/v1/apps/{id}/pull_requests/{number}/merge",
+            post(api::merge_pr),
+        )
+        .route(
+            "/v1/apps/{id}/branch_rules",
+            get(api::get_branch_rules).put(api::set_branch_rules),
+        )
         .route("/v1/apps/{id}/storage/do/{class_name}", get(api::app_do))
         .route("/v1/apps/{id}/storage/r2/{bucket}", get(api::app_r2))
         .route(

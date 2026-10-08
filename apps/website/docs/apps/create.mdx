@@ -1,0 +1,58 @@
+---
+title: Create an app
+description: Start from a blank repository, a one-time GitHub import, or a shipped template — or create an app by pushing to a new slug.
+---
+
+**Apps → New app** opens the creator at `/apps/new`. Every app gets its Git remote at creation, with `main` as the default branch; what you pick is where its code comes from. Name and slug are the only required fields, and the slug is prefilled from the source you pick.
+
+## Three ways to start
+
+| Mode | What it makes |
+| --- | --- |
+| **Blank** | An empty repository. Push when you are ready. |
+| **Import from GitHub** | A one-time copy of a public GitHub repo, history included. |
+| **Template** | A shipped starting point, as one initial commit. |
+
+### Blank
+
+An empty repo with `main` and no commits. Nothing deploys until your first push ([Deploy](/apps/deploy)).
+
+### Import from GitHub
+
+Enter a public repository URL — `https://github.com/<owner>/<repo>`, an optional `.git` suffix is fine — and optionally a branch or tag; empty means the repo's default branch. The repository is copied **once**, full history included, as `main`. Noite's copy becomes the source of truth: there is no upstream link, no sync and no pull from GitHub later.
+
+The new app shows **Importing** while it clones, then deploys the imported `main`. A failed import shows the error with **Retry** and **Delete**; Retry repeats the same URL, ref and account, even after a runner restart.
+
+The runner does the clone, so the import needs outbound HTTPS to `github.com` from the runner host ([Prerequisites](/self-hosting/install#prerequisites)). Only `https://github.com/<owner>/<repo>` is ever fetched, redirects are not followed, no credentials are sent (public repos only), and each import is capped at **500 MiB** and **10 minutes** — a clone over the size cap or the wall clock is killed. An instance with no internet access can still create blank apps and serve pushes.
+
+### Template
+
+Two templates ship with Noite:
+
+| Template | What it is |
+| --- | --- |
+| **Oxide + Ilha** | An Oxide worker with the Ilha router and Vite — the shape the control UI itself runs on. |
+| **TanStack Start** | TanStack Start (Vite plus the Cloudflare plugin) serving SSR, with hydration. |
+
+A template is created through the same import path as a GitHub import, with its history squashed into one commit titled `Initial commit from <owner>/<repo>@<sha>`, authored as you. Both templates build and serve on Noite; after creation the app deploys like any other.
+
+## Create by pushing
+
+`git push` to a slug that does not exist yet creates the app, with you as its `admin`, then deploys the pushed code. The push prints the app's URL.
+
+```bash
+git init -b main
+git add -A && git commit -m "first deploy"
+git remote add origin "https://git:<api-key>@git.<domain>/<slug>"
+git push -u origin main
+```
+
+A reserved or invalid slug answers `repository not found`, exactly as an unknown repository does. An account at its app limit gets a readable refusal as a `remote:` line. **Fetching** an unknown slug is still a 404 — only a push creates.
+
+:::tip
+Slug rules are the same in every path: 1–48 chars, lowercase letters, digits and hyphens, starting and ending with a letter or digit. Reserved: `_control`, `app`, `api`, `git`.
+:::
+
+## Next
+
+The app is provisioned and counted against your per-account quota ([Limits](/reference/limits)). Continue with [Deploy](/apps/deploy) to ship it, [Source and history](/apps/source) to browse and edit code, or [Pull requests](/apps/pull-requests) to review branches before they reach `main`.

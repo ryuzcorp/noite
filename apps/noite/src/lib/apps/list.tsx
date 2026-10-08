@@ -1,9 +1,8 @@
-//! The apps list (live over SSE) and the create-app form, plus the
-//! pending-invitations banner and the control-plane card above the list.
+//! The apps list (live over SSE), the pending-invitations banner and the
+//! control-plane card above it. The create form lives in ./create-form.
 
 import { navigate } from "@ilha/router";
-import { atom, watch } from "ilha";
-import { createMutationQueue } from "oxidejs/mutation-queue";
+import { atom } from "ilha";
 
 import type { App } from "../collaborators";
 import {
@@ -20,7 +19,6 @@ import {
   myInvitations,
   session,
 } from "../resources";
-import { create } from "../server/apps.server";
 import {
   acceptInvitation,
   declineInvitation,
@@ -28,12 +26,7 @@ import {
 import { Avatar } from "../ui/avatar";
 import { ChevronRight } from "../ui/icons";
 import { ListSkeleton } from "../ui/skeletons";
-import { appUrl, presenceTone, slugifyName } from "./identity";
-
-const queue = createMutationQueue();
-const createQueued = queue.wrap(create, {
-  idempotencyKey: ({ slug }) => `create:${slug}`,
-});
+import { appUrl, presenceTone } from "./identity";
 
 /** Collaborator invitations addressed to this account's email: nothing is
  * granted until the person accepts here. Renders nothing when there are none. */
@@ -245,110 +238,5 @@ export const AppsList = () => {
           ))}
       </ul>
     </>
-  );
-};
-
-/** Dedicated create-app form; SPA-navigates to the list on success (the
- * SSE stream picks the new row up live — no document reload, no FOUC). */
-export const CreateAppForm = () => {
-  const notice = atom<string | null>(null);
-  const busy = atom(false);
-  const name = atom("");
-  const slug = atom("");
-  const slugTouched = atom(false);
-
-  watch(name, (value) => {
-    if (!slugTouched()) {
-      slug.set(slugifyName(value));
-    }
-  });
-
-  const submit = async (event: SubmitEvent) => {
-    event.preventDefault();
-    const trimmedName = name().trim();
-    let nextSlug = slug().trim().toLowerCase();
-    if (!nextSlug && trimmedName) {
-      nextSlug = slugifyName(trimmedName);
-    }
-    if (!(trimmedName && nextSlug)) {
-      notice.set("Name and slug are required");
-      return;
-    }
-    if (!/^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/u.test(nextSlug)) {
-      notice.set(
-        "Slug must be 1–48 chars: lowercase letters, digits, and hyphens, starting and ending with a letter or digit"
-      );
-      return;
-    }
-    try {
-      busy.set(true);
-      await createQueued({ name: trimmedName, slug: nextSlug });
-      // SPA nav keeps CSS/DOM parsed; the apps SSE stream adds the new row.
-      navigate("/apps");
-    } catch (error) {
-      busy.set(false);
-      notice.set(errorMessage(error));
-    }
-  };
-
-  return (
-    <form onsubmit={submit} class="flex flex-col gap-4">
-      {notice() ? (
-        <div class="alert alert-error m-0 py-2" role="alert">
-          <span>{notice()}</span>
-        </div>
-      ) : null}
-
-      <fieldset class="fieldset">
-        <label class="label" for="create-name">
-          Name
-        </label>
-        <input
-          id="create-name"
-          name="name"
-          class="input w-full"
-          placeholder="My Service"
-          value={name()}
-          oninput={(e) => {
-            name.set(e.currentTarget.value);
-          }}
-          autofocus
-          required
-        />
-      </fieldset>
-      <fieldset class="fieldset">
-        <label class="label" for="create-slug">
-          Slug
-        </label>
-        <input
-          id="create-slug"
-          name="slug"
-          class="input validator w-full"
-          placeholder="my-app"
-          pattern="[a-z0-9]([a-z0-9-]{0,46}[a-z0-9])?"
-          maxlength={48}
-          title="Lowercase letters, digits, and hyphens, 1–48 chars, starting and ending with a letter or digit"
-          value={slug()}
-          oninput={(e) => {
-            const { value } = e.currentTarget;
-            slug.set(value);
-            slugTouched.set(value.length > 0);
-          }}
-          required
-        />
-        <p class="label">Auto-generated from the name — edit to override.</p>
-        <p class="validator-hint hidden">
-          Lowercase letters, digits, and hyphens, 1–48 chars
-        </p>
-      </fieldset>
-
-      <button
-        type="submit"
-        class="btn btn-sm btn-neutral w-full"
-        disabled={busy()}
-      >
-        {busy() ? "Creating…" : "Create app"}
-      </button>
-    </form>
   );
 };

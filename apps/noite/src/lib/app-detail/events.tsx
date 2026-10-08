@@ -1,7 +1,3 @@
-//! Per-app event feed (LogSnag-style): channel filter, insight widgets,
-//! expandable rows with tags + user properties, and an ingest snippet.
-import { searchParam } from "@ilha/router";
-import type { SearchParam } from "@ilha/router";
 import { atom } from "ilha";
 
 import { formatDateTime } from "../dates";
@@ -9,6 +5,10 @@ import { errorMessage } from "../errors";
 import type { EventsSnapshot } from "../feeds";
 import { decodeEvents, eventsUrl, feedKeys, liveFeed } from "../feeds";
 import type { RunnerEvent } from "../runner";
+//! Per-app event feed (LogSnag-style): channel filter, insight widgets,
+//! expandable rows with tags + user properties, and an ingest snippet.
+import { searchParam } from "../search-param";
+import type { SearchParam } from "../search-param";
 import { getUserProps } from "../server/events.server";
 import { ChevronDown } from "../ui/icons";
 
@@ -125,6 +125,18 @@ const FEED_LIMIT = 200;
 /** Parse `?p=` (page index): garbage falls back to the first page. */
 const toPageIndex = (raw: string): number =>
   Math.max(Math.trunc(Number(raw)) || 0, 0);
+
+/** Events in the all-channels feed, for the Events tab's badge: the same
+ * stream and snapshot as the tab's default view, so the two never disagree
+ * (both stop at the feed's `FEED_LIMIT` newest rows). */
+export const liveEventCount = (appId: string): number => {
+  const feed = liveFeed(
+    feedKeys.events(appId, ""),
+    eventsUrl(appId, "", FEED_LIMIT),
+    decodeEvents
+  );
+  return feed.latest()?.feed.length ?? 0;
+};
 
 /** Parse `?s=` (page size): unknown sizes fall back to the default. */
 const toPageSize = (raw: string): number => {

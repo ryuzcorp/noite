@@ -64,7 +64,16 @@ COPY apps/runner/Cargo.toml apps/runner/Cargo.lock ./
 COPY apps/runner/src ./src
 # The schemas are `include_str!`-embedded: needed to build, never shipped.
 COPY apps/runner/schema.sql apps/runner/schema.metrics.sql ./
-RUN cargo build --release && strip target/release/noite-runner
+# Cache mounts keep the crate registry and target/ between builds, so a source
+# change recompiles the runner crate only, not every dependency. They never
+# reach the image: the binary is copied out of the mount, and `--locked`
+# still builds exactly what Cargo.lock pins.
+RUN --mount=type=cache,id=noite-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=noite-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=noite-runner-target,target=/src/target,sharing=locked \
+    cargo build --release --locked \
+  && install -D -m 0755 target/release/noite-runner /out/noite-runner \
+  && strip /out/noite-runner
 
 # --- control UI bundle ------------------------------------------------------
 # bun install runs inside the image, so the lockfile is the only input that
@@ -77,7 +86,10 @@ FROM docker.io/oven/bun:1.4-debian AS ui-build
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 WORKDIR /app
 COPY apps/noite/package.json apps/noite/bun.lock ./
-RUN bun install --frozen-lockfile
+# The package cache only saves downloads; `--frozen-lockfile` still checks
+# every package against the lockfile's integrity hashes.
+RUN --mount=type=cache,id=noite-bun-cache,target=/root/.bun/install/cache,sharing=locked \
+    bun install --frozen-lockfile
 COPY apps/noite/ ./
 RUN bun run build \
   && rm -f dist/.dev.vars dist/.dev.vars.* dist/ssr/.dev.vars dist/ssr/.dev.vars.* \
@@ -186,6 +198,6 @@ CMD ["/bin/sh", "/opt/noite/dev.sh"]
 
 # --- the published image (default target: last stage) ----------------------
 FROM base AS noite
-COPY --from=runner-build /src/target/release/noite-runner /usr/local/bin/noite-runner
+COPY --from=runner-build /out/noite-runner /usr/local/bin/noite-runner
 COPY --from=ui-build /app/dist /opt/noite/control/dist
 ENTRYPOINT ["/usr/bin/tini", "--", "noite-runner"]

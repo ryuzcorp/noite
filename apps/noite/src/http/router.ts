@@ -18,6 +18,7 @@ import {
   handleTelemetryFacts,
   handleWebhook,
 } from "./routes/internal";
+import { handleMcp } from "./routes/mcp";
 import { handleR2Raw, handleR2Upload } from "./routes/r2";
 import {
   handleAppsStream,
@@ -32,6 +33,7 @@ const router = FindMyWay.make<RouteHandler>();
 router.all("/health", handleHealth);
 router.on("POST", "/webhook", handleWebhook);
 router.on("POST", "/internal/git-auth", handleGitAuth);
+router.all("/mcp", handleMcp);
 router.on("POST", "/internal/recovery", handleRecovery);
 router.on("GET", "/internal/telemetry-facts", handleTelemetryFacts);
 router.on("GET", "/storage/:appId/r2/:bucket/raw", handleR2Raw);

@@ -4,6 +4,8 @@ use sqlx::FromRow;
 use ts_rs::TS;
 use uuid::Uuid;
 
+use crate::host::git_identity::Actor;
+
 /// Operator intent: only running|stopped. Removal is hard DELETE, not a state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DesiredState {
@@ -49,6 +51,10 @@ pub enum AppStatus {
     /// request (SPEC, Scale to zero).
     #[serde(rename = "sleeping")]
     Sleeping,
+    /// A background GitHub/template import is still running (A2); flips to
+    /// `provisioned` (then the deploy pipeline takes over) or `error`.
+    #[serde(rename = "importing")]
+    Importing,
 }
 
 impl AppStatus {
@@ -61,6 +67,7 @@ impl AppStatus {
             Self::Stopped => "stopped",
             Self::Failed => "failed",
             Self::Sleeping => "sleeping",
+            Self::Importing => "importing",
         }
     }
 }
@@ -130,6 +137,13 @@ pub struct App {
     /// have none (cloudflare.config.ts, built dist/wrangler.json).
     #[serde(skip)]
     pub deployed_config: Option<String>,
+    /// The `source` this app was created from, as JSON (A2): lets Retry
+    /// re-run a failed import. `None` for a blank app. Never served to the UI.
+    #[serde(skip)]
+    pub import_source: Option<String>,
+    /// Whether the row carries a stored import source — the UI's Retry gate.
+    /// Derived in SQL (`import_source IS NOT NULL`), never a column.
+    pub imported: bool,
 }
 
 impl App {
@@ -341,6 +355,30 @@ pub struct AppInsight {
     pub updated_at: String,
 }
 
+/// A public GitHub repo cloned once into a new app (A2). `squash` collapses
+/// the history into one root commit of the fetched tree (A3 templates); the
+/// clone URL itself is validated by `host::import::github_url`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitSource {
+    pub url: String,
+    /// Branch, tag or sha to clone; the upstream default branch when absent.
+    #[serde(default, rename = "ref")]
+    pub reference: Option<String>,
+    #[serde(default)]
+    pub squash: bool,
+    /// Who the squashed commit is authored as (the shared commit actor).
+    pub actor: Actor,
+}
+
+/// Where a new app's initial content comes from (`apps.create`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum AppSource {
+    Blank,
+    Git(GitSource),
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateApp {
@@ -349,6 +387,9 @@ pub struct CreateApp {
     /// Owning account (the control UI passes the signed-in user). Absent on
     /// direct API calls, which fall back to the local-operator placeholder.
     pub user_id: Option<String>,
+    /// Initial content (A2/A3); absent = the blank app of A1.
+    #[serde(default)]
+    pub source: Option<AppSource>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -26,7 +26,11 @@ export default defineConfig({
   // Deploys (bun install + celld deploy + fleet boot) take minutes.
   timeout: 10 * 60_000,
   use: {
+    // Bounded, so a missing element fails at its locator instead of waiting
+    // out the 10-minute test deadline.
+    actionTimeout: 30_000,
     baseURL,
+    navigationTimeout: 30_000,
     screenshot: "only-on-failure",
     trace: "retain-on-failure",
   },

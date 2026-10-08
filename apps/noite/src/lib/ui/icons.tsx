@@ -267,3 +267,78 @@ export const Download = (p: IconProps) => (
     <path d="M12 15V3" />
   </svg>
 );
+
+export const Cog = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <path d="M11 10.27 7 3.34m4 10.39-4 6.93M12 22v-2m0-18v2m2 8h8m-5 8.66-1-1.73m1-15.59-1 1.73M2 12h2m16.66 5-1.73-1m1.73-9-1.73 1M3.34 17l1.73-1M3.34 7l1.73 1" />
+    <circle cx="12" cy="12" r="2" />
+    <circle cx="12" cy="12" r="8" />
+  </svg>
+);
+
+export const CircleUser = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <circle cx="12" cy="12" r="10" />
+    <circle cx="12" cy="10" r="3" />
+    <path d="M7 20.662V19a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v1.662" />
+  </svg>
+);
+
+export const BookOpen = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <path d="M12 7v14" />
+    <path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z" />
+  </svg>
+);
+
+export const LogOut = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <path d="m16 17 5-5-5-5" />
+    <path d="M21 12H9" />
+    <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+  </svg>
+);
+
+export const HistoryIcon = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+    <path d="M3 3v5h5" />
+    <path d="M12 7v5l4 2" />
+  </svg>
+);
+
+export const GitPullRequest = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <circle cx="18" cy="18" r="3" />
+    <circle cx="6" cy="6" r="3" />
+    <path d="M13 6h3a2 2 0 0 1 2 2v7" />
+    <path d="M6 9v12" />
+  </svg>
+);
+
+export const FileDiff = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+    <path d="M9 10h6" />
+    <path d="M12 13V7" />
+    <path d="M9 17h6" />
+  </svg>
+);
+
+export const GitBranch = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <path d="M6 3v12" />
+    <circle cx="18" cy="6" r="3" />
+    <circle cx="6" cy="18" r="3" />
+    <path d="M18 9a9 9 0 0 1-9 9" />
+  </svg>
+);
+
+export const LayoutDashboard = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <rect width="7" height="9" x="3" y="3" {...rx(1)} />
+    <rect width="7" height="5" x="14" y="3" {...rx(1)} />
+    <rect width="7" height="9" x="14" y="12" {...rx(1)} />
+    <rect width="7" height="5" x="3" y="16" {...rx(1)} />
+  </svg>
+);

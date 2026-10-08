@@ -4,12 +4,19 @@ import { tmpdir } from "node:os";
 import nodePath from "node:path";
 
 import { sleep } from "$lib/sleep";
-import type { APIRequestContext, Page } from "@playwright/test";
+import { expect } from "@playwright/test";
+import type {
+  APIRequestContext,
+  Browser,
+  BrowserContext,
+  Page,
+} from "@playwright/test";
 
 export const E2E_EMAIL = "e2e@noite.local";
 export const E2E_NAME = "E2E";
 export const E2E_SLUG = "e2e";
 
+const uiBaseURL = process.env.E2E_BASE_URL ?? "http://localhost:8090";
 const apiBase = process.env.E2E_API_BASE ?? "http://localhost:8080";
 const gitBase = process.env.E2E_GIT_BASE ?? "http://localhost:8080/v1/git";
 const tenantBase = (port: number): string => `http://localhost:${port}`;
@@ -68,9 +75,28 @@ export const runnerCall = async (
     headers: { authorization: `Bearer ${runnerToken()}` },
     method: init.method ?? "GET",
   });
-  // 204 and error bodies are not JSON; callers only read status then.
-  const body = await res.json().catch(() => null);
-  return { body, status: res.status() };
+  // Success bodies are JSON, error bodies (and 204) are plain text: read the
+  // text and parse what parses, so a caller asserting on an error message
+  // reads the runner's words instead of a swallowed `null`.
+  const text = await res.text();
+  let parsed: unknown = text;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    // Plain-text body: keep it as-is.
+  }
+  // SAFETY: the runner answers `{ body }`-less JSON on success and plain text
+  // on 204/error; either value fits the union this helper advertises.
+  return {
+    body: parsed as
+      | Record<string, never>
+      | unknown[]
+      | string
+      | number
+      | boolean
+      | null,
+    status: res.status(),
+  };
 };
 
 /** Runner API call direct on :8080 (raw-port lane, no edge). */
@@ -95,6 +121,20 @@ export const findAppId = async (
   return apps.find((app) => app.slug === slug)?.id ?? null;
 };
 
+/** Delete an app by slug, waiting for the runner to drop it. Specs clean up
+ * the apps they create: the account's app quota (10) is shared by a whole
+ * lane run, and a leftover app also poisons the next run's create. */
+export const deleteApp = async (
+  request: APIRequestContext,
+  slug: string
+): Promise<void> => {
+  const appId = await findAppId(request, slug);
+  if (appId === null) {
+    return;
+  }
+  await runnerCall(request, `/v1/apps/${appId}`, { method: "DELETE" });
+};
+
 /** Tenant listen port for raw-port traffic (published 8100-8199). */
 export const appListenPort = async (
   request: APIRequestContext,
@@ -107,6 +147,10 @@ export const appListenPort = async (
   }
   return listenPort;
 };
+
+/** Deploy status poll interval: the runner API is local and a status read is
+ * one row, so a short interval only trims the wait after a deploy ends. */
+export const DEPLOY_POLL_MS = 1000;
 
 /** Poll deploys until the tip reaches a terminal status. Push fast-path
  * spawns within seconds; the reconcile tip poll is the fallback. */
@@ -130,8 +174,97 @@ export const waitForDeploy = async (
       throw new Error(`deploy for ${appId} did not finish in ${timeoutMs}ms`);
     }
     // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll backoff
-    await sleep(10_000);
+    await sleep(DEPLOY_POLL_MS);
   }
+};
+
+/** Mint an API key on the signed-in account's Account page. The raw key is
+ * shown exactly once, so it is read from that one screen. */
+export const mintApiKey = async (
+  page: Page,
+  label: string
+): Promise<string> => {
+  await page.goto("/account");
+  await page
+    .locator('button[type="button"]', { hasText: "Create key" })
+    .click();
+  await page.locator("#key-name").fill(label);
+  await page
+    .locator('button[type="submit"]', { hasText: "Create key" })
+    .click();
+  await page.locator("text=Copy now — shown once").waitFor({ timeout: 30_000 });
+  const raw = await page.locator("code.break-all").first().textContent();
+  const apiKey = raw?.trim() ?? "";
+  if (apiKey.length === 0) {
+    throw new Error("no API key shown after Create key");
+  }
+  return apiKey;
+};
+
+/** One of the signed-in account's unused invite codes: the Account page lists
+ * the share registration minted for it. When the share is used up (every
+ * spec that registers a second account spends one), the admin mints one more
+ * on the admin Invites tab instead of waiting on a code that never appears. */
+export const readInviteCode = async (page: Page): Promise<string> => {
+  const invitesCard = page.locator("div.card", {
+    has: page.getByRole("heading", { name: "Invitations" }),
+  });
+  await page.goto("/account");
+  await expect(invitesCard).toBeVisible();
+  if ((await invitesCard.locator("code").count()) === 0) {
+    await page.goto("/apps/_control?t=invites");
+    await page.locator("#invite-count").fill("1");
+    await page.getByRole("button", { exact: true, name: "Generate" }).click();
+    await expect(page.locator("#admin-invite-search")).toBeVisible();
+    await page.goto("/account");
+  }
+  const raw = await invitesCard
+    .locator("code")
+    .first()
+    .textContent({ timeout: 15_000 });
+  const code = raw?.trim() ?? "";
+  if (code === "") {
+    throw new Error("no invite code on the Account page");
+  }
+  return code;
+};
+
+/** Register a second account with `inviteCode` in a browser context of its
+ * own (virtual authenticator, onboarding dismissed, on /apps). The caller
+ * owns the context and closes it. */
+export const registerInviteeAccount = async (
+  browser: Browser,
+  inviteCode: string,
+  email: string,
+  name: string
+): Promise<{ context: BrowserContext; page: Page }> => {
+  // Signed out: inside a test, newContext() inherits the project's
+  // storageState, which would open this context as the e2e admin.
+  const context = await browser.newContext({
+    baseURL: uiBaseURL,
+    storageState: { cookies: [], origins: [] },
+  });
+  const page = await context.newPage();
+  await addVirtualAuthenticator(page);
+  await page.goto("/login");
+  await page.getByRole("tab", { name: "Create account" }).click();
+  await page.locator("#register-name").fill(name);
+  await page.locator("#register-email").fill(email);
+  await page.locator("#register-invite").fill(inviteCode);
+  await page.getByRole("button", { name: "Create passkey" }).click();
+  await expect(async () => {
+    const res = await page.request.get("/api/auth/get-session");
+    // SAFETY: better-auth answers the session object or null; only the email is read.
+    const session = (await res.json()) as { user?: { email?: string } };
+    expect(session.user?.email).toBe(email);
+  }).toPass({ timeout: 30_000 });
+  await page.goto("/apps");
+  await page.locator("#onboarding-next").click();
+  await page.locator("#onboarding-next").click();
+  await page.locator("#onboarding-finish").click();
+  await page.reload();
+  await expect(page.getByRole("dialog")).toBeHidden();
+  return { context, page };
 };
 
 /** Create an app through the UI and mint an API key for pushing to it,
@@ -150,21 +283,7 @@ export const createAppWithKey = async (
   if (appId === null) {
     throw new Error(`app ${app.slug} was not created`);
   }
-
-  await page.goto("/account");
-  await page
-    .locator('button[type="button"]', { hasText: "Create key" })
-    .click();
-  await page.locator("#key-name").fill(`${app.slug}-ci`);
-  await page
-    .locator('button[type="submit"]', { hasText: "Create key" })
-    .click();
-  await page.locator("text=Copy now — shown once").waitFor({ timeout: 30_000 });
-  const rawKey = await page.locator("code.break-all").first().textContent();
-  const apiKey = rawKey?.trim() ?? "";
-  if (apiKey.length === 0) {
-    throw new Error("no API key shown after Create key");
-  }
+  const apiKey = await mintApiKey(page, `${app.slug}-ci`);
   return { apiKey, appId };
 };
 

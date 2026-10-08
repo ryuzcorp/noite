@@ -15,8 +15,8 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use crate::config::Config;
-use crate::host::{exec, s3};
 use crate::host::source;
+use crate::host::{exec, forge, s3};
 use crate::models::App;
 
 /// Filters are AND-ed and bounded so a query can't grow without limit.
@@ -667,7 +667,8 @@ impl<'a> D1<'a> {
 /// Materialize the deployed source into a persistent project dir so celld's
 /// `d1` can find wrangler.jsonc (resolve_config reads it from the cwd).
 async fn ensure_project(cfg: &Config, app: &App) -> anyhow::Result<PathBuf> {
-    let Some(rev) = source::resolve_rev(cfg, app).await? else {
+    let bare = forge::read_mirror_cfg(cfg, &app.slug).await?;
+    let Some(rev) = forge::read_rev(&bare, app, None).await? else {
         bail!("no deployed source — push to main first");
     };
     let proj = exec::work_root(cfg).join("projects").join(&app.slug);

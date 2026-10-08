@@ -1,13 +1,19 @@
-//! Browser web-commit API: commit edited files as `refs/heads/main` without
-//! a worktree. Extracted from `git_http` (smart-HTTP protocol stays there);
-//! the only caller is `api::app_source_commit`. Shares the bare-mirror
-//! helpers (`ensure_bare`, `list_refs`, `after_receive`) with the receive path.
+//! Browser web-commit API: commit edited files without a worktree.
+//!
+//! The commit is built in the push mirror (blobs via `hash-object`, tree via
+//! a scratch index, `commit-tree`), then handed to [`forge::publish_ref`],
+//! which does the compare-and-swap and publishes exactly like a `git push`
+//! (tip bundle, manifest, deploy notification when `main` moved). A root
+//! commit is allowed when the target branch does not exist yet, so a browser
+//! commit works on a fresh empty repository.
 use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::bail;
 
 use crate::host::exec;
-use crate::host::git_http::{after_receive, ensure_bare, list_refs};
+use crate::host::forge::{self, DEFAULT_BRANCH};
+use crate::host::git_http::list_refs;
+use crate::host::git_identity::Identity;
 use crate::models::App;
 use crate::AppState;
 
@@ -30,17 +36,18 @@ fn validate_web_path(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Commit browser edits as `refs/heads/main` without a worktree: blobs via
-/// hash-object, tree via a scratch index, commit-tree, then a CAS
-/// update-ref so a concurrent push wins instead of interleaving. Reuses
-/// after_receive + the deploy fast-path, so a web commit deploys exactly
-/// like a `git push`. Returns the new main sha.
+/// Commit browser edits as a branch commit without a worktree. `branch`
+/// defaults to `main`; a branch that does not exist yet is created, from
+/// `fromSha` when given, else from `main`, else as a root commit. Returns the
+/// new commit sha.
 pub async fn web_commit(
     state: &AppState,
     app: &App,
-    author: &str,
+    actor: &Identity,
     message: &str,
     files: &[WebFile],
+    branch: Option<&str>,
+    from_sha: Option<&str>,
 ) -> anyhow::Result<String> {
     if files.is_empty() || files.len() > 32 {
         bail!("commit needs 1-32 files");
@@ -49,9 +56,8 @@ pub async fn web_commit(
     if message.is_empty() || message.len() > 500 {
         bail!("commit needs a message (1-500 chars)");
     }
-    let author = author.trim();
-    if author.is_empty() || author.len() > 254 || !author.contains('@') {
-        bail!("commit needs an author email");
+    if actor.email.is_empty() || actor.email.len() > 254 || !actor.email.contains('@') {
+        bail!("commit needs an actor email");
     }
     for f in files {
         validate_web_path(&f.path)?;
@@ -62,14 +68,38 @@ pub async fn web_commit(
             bail!("{} looks binary", f.path);
         }
     }
-    // Serialize with pushes: the CAS + manifest logic below assumes no
-    // interleaving ref update, same as the receive path.
-    let _push_guard = state.git_sync.push_guard(&app.slug).await;
-    let bare = ensure_bare(&state.config, &app.slug).await?;
-    let before = list_refs(&bare).await?;
-    let Some(parent) = before.get("refs/heads/main").cloned() else {
-        bail!("refs/heads/main does not exist — push once before web edits");
+    let branch = branch.unwrap_or(DEFAULT_BRANCH);
+    if !forge::valid_branch_name(branch) {
+        bail!("invalid branch {branch:?}");
+    }
+    let bare = forge::read_mirror(state, &app.slug).await?;
+    let refs = list_refs(&bare).await?;
+    let refname = format!("refs/heads/{branch}");
+    let existing = refs.get(&refname).cloned();
+    // A new branch starts at `fromSha`, else at `main`, else at the root.
+    // An existing branch always grows from its own tip (the CAS below still
+    // rejects a push that moves it first).
+    let parent = match &existing {
+        Some(sha) => Some(sha.clone()),
+        None => match from_sha {
+            Some(from) => Some(forge::resolve_ref(&bare, from).await?),
+            None => refs.get(&format!("refs/heads/{DEFAULT_BRANCH}")).cloned(),
+        },
     };
+    let sha = build_commit(&bare, parent.as_deref(), actor, message, files).await?;
+    forge::publish_ref(state, app, branch, existing.as_deref(), Some(&sha)).await?;
+    Ok(sha)
+}
+
+/// Tree + commit objects for the edited files, in a scratch index so the
+/// repository's own index (there is none) is never touched.
+async fn build_commit(
+    bare: &std::path::Path,
+    parent: Option<&str>,
+    actor: &Identity,
+    message: &str,
+    files: &[WebFile],
+) -> anyhow::Result<String> {
     let git_dir = format!("--git-dir={}", bare.display());
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -80,33 +110,46 @@ pub async fn web_commit(
     let index_str = index.to_string_lossy().to_string();
     let env_index = [("GIT_INDEX_FILE", index_str.as_str())];
     let result = async {
-        exec::run_cmd(
-            "git",
-            &[git_dir.as_str(), "read-tree", parent.as_str()],
-            None,
-            &env_index,
-            Duration::from_secs(30),
-        )
-        .await?;
+        // A root commit starts from an empty index (the scratch file does not
+        // exist yet); any other commit starts from its parent's tree.
+        if let Some(parent) = parent {
+            exec::run_cmd(
+                "git",
+                &[git_dir.as_str(), "read-tree", parent],
+                None,
+                &env_index,
+                Duration::from_secs(30),
+            )
+            .await?;
+        }
         for f in files {
             // Existing mode wins (executable bit survives); new files 644.
             // `:(literal)` keeps glob chars in names from acting as pathspec.
-            let listing = exec::run_cmd(
-                "git",
-                &[
-                    git_dir.as_str(),
-                    "ls-tree",
-                    parent.as_str(),
-                    "--",
-                    &format!(":(literal){}", f.path),
-                ],
-                None,
-                &[],
-                Duration::from_secs(15),
-            )
-            .await
-            .unwrap_or_default();
-            let mode = listing.split_whitespace().next().unwrap_or("100644");
+            let mode = match parent {
+                Some(parent) => {
+                    let listing = exec::run_cmd(
+                        "git",
+                        &[
+                            git_dir.as_str(),
+                            "ls-tree",
+                            parent,
+                            "--",
+                            &format!(":(literal){}", f.path),
+                        ],
+                        None,
+                        &[],
+                        Duration::from_secs(15),
+                    )
+                    .await
+                    .unwrap_or_default();
+                    listing
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("100644")
+                        .to_string()
+                }
+                None => "100644".to_string(),
+            };
             let blob = exec::run_cmd_stdin(
                 "git",
                 &[git_dir.as_str(), "hash-object", "-w", "--stdin"],
@@ -123,7 +166,7 @@ pub async fn web_commit(
                     "update-index",
                     "--add",
                     "--cacheinfo",
-                    &format!("{},{},{}", mode, sha, f.path),
+                    &format!("{mode},{sha},{}", f.path),
                 ],
                 None,
                 &env_index,
@@ -139,56 +182,27 @@ pub async fn web_commit(
             Duration::from_secs(30),
         )
         .await?;
+        let mut args = vec![git_dir.as_str(), "commit-tree", tree.trim()];
+        if let Some(parent) = parent {
+            args.push("-p");
+            args.push(parent);
+        }
+        args.push("-m");
+        args.push(message);
         let commit = exec::run_cmd(
             "git",
-            &[
-                git_dir.as_str(),
-                "commit-tree",
-                tree.trim(),
-                "-p",
-                parent.as_str(),
-                "-m",
-                message,
-            ],
+            &args,
             None,
             &[
-                ("GIT_AUTHOR_NAME", "Noite"),
-                ("GIT_AUTHOR_EMAIL", author),
-                ("GIT_COMMITTER_NAME", "Noite"),
-                ("GIT_COMMITTER_EMAIL", author),
+                ("GIT_AUTHOR_NAME", &actor.name),
+                ("GIT_AUTHOR_EMAIL", &actor.email),
+                ("GIT_COMMITTER_NAME", &actor.name),
+                ("GIT_COMMITTER_EMAIL", &actor.email),
             ],
             Duration::from_secs(30),
         )
         .await?;
-        let sha = commit.trim().to_string();
-        // CAS: a push that landed after our rev-parse fails here instead
-        // of interleaving — the UI retries on a fresh tip.
-        exec::run_cmd(
-            "git",
-            &[
-                git_dir.as_str(),
-                "update-ref",
-                "refs/heads/main",
-                sha.as_str(),
-                parent.as_str(),
-            ],
-            None,
-            &[],
-            Duration::from_secs(15),
-        )
-        .await
-        .with_context(|| "tip moved under this commit — reload and retry")?;
-        // Same linearization + deploy fast-path as a stock push.
-        let Some(tip) = after_receive(state, app, &bare, &before).await? else {
-            return Ok(sha);
-        };
-        if !app.is_stopped() {
-            let _ = state.tip_tx.send(crate::host::tips::TipNotify {
-                app_id: app.id.clone(),
-                tip,
-            });
-        }
-        Ok::<_, anyhow::Error>(sha)
+        Ok::<_, anyhow::Error>(commit.trim().to_string())
     }
     .await;
     let _ = tokio::fs::remove_file(&index).await;

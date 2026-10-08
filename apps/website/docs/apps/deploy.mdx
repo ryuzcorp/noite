@@ -5,7 +5,7 @@ description: Create an app and ship it — push over Git, deploy from CI, and wh
 
 ## Create the app
 
-Open the control UI and go to **Apps → New app**. Enter a name and slug. Creating the app provisions its `git` remote; deploys follow each push.
+Open the control UI and go to **Apps → New app**. Pick what the app starts from — **Blank**, **Import from GitHub**, or a **Template** — then enter a name and slug. Creating the app provisions its `git` remote; deploys follow each push. A `git push` to a slug that does not exist yet creates the app too, with you as admin. The three modes, the import limits and push-to-create are on [Create an app](/apps/create).
 
 Slug rules: 1–48 chars, lowercase letters/digits/hyphens, starting and ending with a letter or digit. Reserved: `_control`, `app`, `api`, `git`.
 

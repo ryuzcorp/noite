@@ -1,0 +1,60 @@
+---
+title: Source and history
+description: Browse any branch, tag or commit, read history and diffs, compare refs, and edit files in the browser.
+---
+
+The **Code** item under an app in the sidebar opens `/apps/<id>/source`; the **App** item beside it goes back to the app's overview. Everything there reads the push mirror, which holds every pushed branch — not only the deployed one.
+
+## Layout
+
+Code mode has one bar: the branch picker on the left, **History** and **Changes** on the right. The files take the page. Each button opens a side panel on the right, a third of the width; on narrow screens the panel covers the files instead. Click the same button again, or the panel's close button, to hide it. The open panel is in the URL as `?panel=history` or `?panel=changes`, so refresh and deep links keep it. The pages below it (a commit, a compare) carry a link back to the files in place of the picker. Pulls have their own pages; see [Pull requests](/apps/pull-requests).
+
+## Branch picker
+
+Code mode opens on the default branch (`main`), the one browser edits are committed to. The branch picker is a dropdown that lists every branch. Once the app has deployed, the first entry is the deployed commit, by its short SHA with a **deployed** badge, to browse exactly what is running. The default branch carries a **default** badge in the same spot. Each other branch shows how far it is ahead of or behind `main`, and has a **Compare** link. Admins also get a **Delete** button, except on the default branch; deleting the branch you are browsing returns to the default branch. The URL carries the browsed ref as `?ref=` (absent for the default branch) and the open file as `?file=`, so a link to a file on a branch is shareable. Any tag or commit works in `?ref=` too.
+
+At the bottom of the dropdown, **Create** makes a branch from the ref you are browsing and switches to it. This needs the `push` role. A create or delete publishes exactly like a push: the tip bundle and manifest are written, and `main` moving deploys.
+
+Browsing is read-only on anything but the default branch. Browser edits are made on the default branch ([below](#browser-edits)).
+
+## Files and diffs
+
+The tree lists the ref's files with sizes; clicking one opens it in the editor. Binary files are detected and not rendered, blobs are capped at 256 KB, and a diff is capped at 1 MB.
+
+## Code intelligence
+
+TypeScript and JavaScript files get the editor help you would expect, computed in a web worker from the ref you are browsing:
+
+- **Diagnostics** appear as inline markers on the offending token — hover a marker for the message. They re-check a moment after you stop typing, using the repository's own `tsconfig.json` (ESNext / `bundler` / `react-jsx` defaults when it has none).
+- **Hover** a symbol for its type and JSDoc. The tip opens once the pointer has rested on the symbol for 0.3 s, as a marker's message does, and highlights the type like the editor does.
+- **Cmd/Ctrl+click** a symbol to jump to its definition, opening the other file at that line. A definition that lives in `node_modules`, or in TypeScript's own libs, has no row in the tree, so its declaration is shown right where you clicked instead.
+- **Inline prediction** offers the completion TypeScript ranks highest at the cursor, as ghost text.
+
+Imports are resolved against the declaration files captured from the app's **last successful build**, so the editor can still make sense of a repo while the next build is deploying.
+
+Read-only refs (anything but the default branch) keep hover and Cmd/Ctrl+click, and never predict. They also show no markers: markers live inside an edit session, and a read-only ref deliberately has none.
+
+## History and commits
+
+The **History** panel lists the browsed ref's commits newest first: subject, author, time and short SHA. **Newer** and **Older** page through them (`?skip=`). With a file open, **Only `<file>`** narrows the list to that file. A commit opens at `/apps/<id>/source/commit/<sha>`, with its metadata and parents, the changed files with additions and deletions (binary files flagged), and the patch against its first parent.
+
+## Compare
+
+The compare page (`/apps/<id>/source/compare?base=&head=`) shows two refs: their commits, the three-dot diff, and whether a squash merge would apply cleanly. Open it from a branch's **Compare** link in the picker, or directly. The **Open pull** button starts one from the pair you are looking at ([Pull requests](/apps/pull-requests)).
+
+## Browser edits
+
+Opening a file and changing it stages a web commit. You can edit as many files as you like: each keeps its draft while you open others. The **Changes** button shows how many files you have changed.
+
+The **Changes** panel shows every draft as a diff against the file as it was. Its form at the bottom takes a commit message (left empty, it is `Web edit: <paths>`) and where to commit:
+
+- **The default branch**, which deploys the commit and wakes a sleeping app, like any push to `main`.
+- **New branch…**, with a name. The branch starts at the default branch's tip, and the default branch stays as it was, so the open file goes back to its old text. The panel then links to a pull request from the new branch.
+
+**Push** sends every draft as one commit, with a validated set of paths. Then the panel says where it landed. If the push fails, the drafts and the form are kept, so you can retry.
+
+- **Edits start on the default branch.** Other refs are read-only, so switch back to the default branch to edit.
+- **Empty repositories work**, so you can seed a blank app from the browser.
+- When the default branch is **protected** (`require_pr` on and you are not an app admin), it is greyed out in the form and only **New branch…** pushes ([Branch protection](/apps/pull-requests#branch-protection)).
+
+Every commit Noite writes — browser edits, merges, template imports — is authored and committed as `<your name> <your user id>@users.noreply.<domain>`, never your email.

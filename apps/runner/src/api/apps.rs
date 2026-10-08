@@ -100,9 +100,23 @@ pub async fn create_app(
     State(state): State<AppState>,
     Json(body): Json<CreateApp>,
 ) -> impl IntoResponse {
-    service::apps::create(&state, &body.name, &body.slug, body.user_id.as_deref())
-        .await
-        .map(|app| (StatusCode::CREATED, Json(app)))
+    service::apps::create(
+        &state,
+        &body.name,
+        &body.slug,
+        body.user_id.as_deref(),
+        body.source.as_ref(),
+    )
+    .await
+    .map(|app| (StatusCode::CREATED, Json(app)))
+}
+
+/// Retry a failed import (A2) with the source the app was created from.
+pub async fn retry_import(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    service::apps::retry_import(&state, &id).await.map(Json)
 }
 
 pub async fn get_app(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {

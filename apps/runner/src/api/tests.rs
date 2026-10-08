@@ -830,3 +830,133 @@ async fn telemetry_status_agrees() {
     );
     h.finish().await;
 }
+
+/// `source.bundle` reads a real push mirror at the requested ref, and
+/// `source.types` serves the capture the deploy pipeline writes — both through
+/// the REST mirror and the RPC, which must agree.
+#[tokio::test]
+async fn source_bundle_and_types_agree() {
+    let h = Harness::new().await;
+    let app = h.seed_app("code-app").await;
+
+    // Nothing captured yet: the empty payload, not an error.
+    let (status, empty) = h
+        .rest("GET", &format!("/v1/apps/{}/types", app.id), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        empty,
+        json!({ "sha": null, "files": [], "truncated": false })
+    );
+    assert_eq!(
+        h.rpc("source.types", json!({ "id": app.id }))
+            .await
+            .expect("source.types"),
+        empty
+    );
+
+    // A push mirror with one commit on `main`.
+    let bare = crate::host::git_http::http_bare(&h.state.config, &app.slug);
+    let work = h.dir.join("bundle-work");
+    std::fs::create_dir_all(work.join("src")).expect("worktree");
+    std::fs::write(work.join("src/index.ts"), "export const a = 1;\n").expect("source");
+    git(&work, &["init", "-q", "--initial-branch=main", "."]).await;
+    git(&work, &["add", "-A"]).await;
+    git(&work, &["commit", "-qm", "init"]).await;
+    let sha = git(&work, &["rev-parse", "HEAD"]).await.trim().to_string();
+    std::fs::create_dir_all(bare.parent().expect("mirror parent")).expect("mirror parent");
+    git(
+        &h.dir,
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "--initial-branch=main",
+            bare.to_str().expect("mirror path"),
+        ],
+    )
+    .await;
+    git(
+        &work,
+        &["push", "-q", bare.to_str().expect("mirror path"), "main:main"],
+    )
+    .await;
+
+    let (status, rest) = h
+        .rest("GET", &format!("/v1/apps/{}/bundle", app.id), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rest["sha"], json!(sha));
+    assert_eq!(rest["files"], json!([{ "path": "src/index.ts", "text": "export const a = 1;\n" }]));
+    assert_eq!(rest["truncated"], json!(false));
+    assert_eq!(
+        h.rpc("source.bundle", json!({ "id": app.id }))
+            .await
+            .expect("source.bundle"),
+        rest
+    );
+    // An explicit ref resolves like `source.tree`, and an empty one must not
+    // 400 (the UI's "deployed" choice sends no ref at all).
+    for query in ["?ref=main", "?ref="] {
+        let (status, value) = h
+            .rest("GET", &format!("/v1/apps/{}/bundle{query}", app.id), None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{query}");
+        assert_eq!(value, rest, "{query}");
+    }
+
+    // The capture the deploy pipeline writes (`host::source_types::capture`)
+    // is served back with its sha.
+    let worktree = h.dir.join("capture-worktree");
+    std::fs::create_dir_all(worktree.join("node_modules/dep")).expect("capture tree");
+    std::fs::write(
+        worktree.join("node_modules/dep/index.d.ts"),
+        "export const b: string;\n",
+    )
+    .expect("declaration");
+    std::fs::write(
+        worktree.join("node_modules/dep/package.json"),
+        "{\"name\":\"dep\"}\n",
+    )
+    .expect("manifest");
+    crate::host::source_types::capture(
+        &crate::host::source_types::store_path(&h.state.config, &app.slug),
+        &worktree,
+        &sha,
+    )
+    .await
+    .expect("capture");
+
+    let (status, rest) = h
+        .rest("GET", &format!("/v1/apps/{}/types", app.id), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rest["sha"], json!(sha));
+    assert_eq!(rest["files"][0]["path"], json!("node_modules/dep/index.d.ts"));
+    assert_eq!(rest["files"][1]["path"], json!("node_modules/dep/package.json"));
+    assert_eq!(
+        h.rpc("source.types", json!({ "id": app.id }))
+            .await
+            .expect("source.types"),
+        rest
+    );
+    h.finish().await;
+}
+
+/// A git command in `dir`, panicking with git's output on failure.
+async fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    crate::host::exec::run_cmd(
+        "git",
+        args,
+        Some(dir),
+        &[
+            ("GIT_AUTHOR_NAME", "Test"),
+            ("GIT_AUTHOR_EMAIL", "test@example.com"),
+            ("GIT_COMMITTER_NAME", "Test"),
+            ("GIT_COMMITTER_EMAIL", "test@example.com"),
+        ],
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("git {args:?}: {e:#}"))
+}

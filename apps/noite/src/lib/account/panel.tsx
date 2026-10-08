@@ -16,7 +16,7 @@ import { CopyButton } from "../ui/copy-button";
 import { Dialog } from "../ui/dialog";
 import { LoadError } from "../ui/load-error";
 import { SectionSkeleton } from "../ui/skeletons";
-import { AdminTelemetrySection } from "./admin-telemetry";
+import { ConnectAgentCard } from "./agent-connect";
 
 interface ApiKeyRow {
   id: string;
@@ -359,8 +359,7 @@ export const AccountPanel = () => {
   }
 
   return (
-    <div class="flex flex-col gap-6">
-      <MyInvitesCard />
+    <div class="flex flex-col gap-4">
       <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
         <h2 class="m-0 text-lg font-semibold">Profile</h2>
         <fieldset class="fieldset w-full">
@@ -563,7 +562,8 @@ export const AccountPanel = () => {
           </ul>
         )}
       </section>
-      <AdminTelemetrySection />
+      <MyInvitesCard />
+      <ConnectAgentCard apiKey={freshKey} />
     </div>
   );
 };

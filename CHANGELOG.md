@@ -8,6 +8,78 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Operator action required
+
+- The runner SQLite upgrades itself to schema version 7 (the import source on `app`, plus the pull request and branch protection tables). As before, an older image refuses newer data, so back up before upgrading.
+- **GitHub imports and templates need outbound HTTPS from the runner to `github.com`.** Only `https://github.com/<owner>/<repo>` is ever fetched, redirects are not followed, and each import is capped at 500 MiB and 10 minutes. Instances without internet access can still create blank apps and push.
+- **Runner REST API callers:** `POST /v1/apps/{id}/source/commit` takes `actor` (`{ userId, name }`) instead of an `author` email, and `GET /v1/apps/{id}/diff` (RPC `source.diff`) is removed; see Changed and Removed.
+
+### Added
+
+- New app creator (`/apps/new`), with three ways to start:
+  - **Blank:** as before.
+  - **Import from GitHub:** a public repository URL and an optional branch. The repo is copied once, full history included, as `main`, and Noite's copy is the source of truth from then on. The app shows "Importing" while it clones, then deploys. A failed import shows the error, with Retry and Delete.
+  - **Template:** "Oxide + Ilha" and "TanStack Start" start from a single "Initial commit from …" commit. Both deploy and serve on Noite (TanStack Start with SSR and hydration).
+  - The slug is prefilled from the repo or template name.
+- Push to create: `git push` to a slug that doesn't exist yet creates the app, with you as admin and counted against your app limit, then deploys it. The push prints the app's URL. Reserved or invalid slugs answer "repository not found", and an account at its limit gets a clear refusal. Fetching an unknown slug is still a 404.
+- Branches and history on the Source page, which now has a single bar: the back link and branch picker on the left; History and Changes on the right. Each opens a side panel that takes a third of the width (`?panel=history|changes`).
+  - **Branch picker:** a dropdown that lists every branch, with how far each is ahead of or behind `main` and a compare link. Admins can delete branches from it. A branch creator at the bottom branches off the browsed ref and switches to the new branch. Any branch, tag or commit can be browsed via `?ref=`.
+  - **History panel:** the commits of the browsed ref, or only those of the open file.
+  - **Commit page:** metadata, changed files with line counts, and the diff.
+  - **Compare:** two refs, with their commits, files, diff and whether they merge cleanly. Deploys link to their commit.
+  - **Browser edits** work on an empty repository. Other branches are read-only in the browser. The Changes button counts the edited files, and its panel shows each edit as a diff, with a form to push them all as one commit: a message (default `Web edit: <paths>`), the target (`main`, or a new branch, after which the panel links to a pull request) and Push. When `main` is protected, only a new branch is offered (see below).
+- Pull requests, for same-repo branches:
+  - **Pages:** pull requests are called "pulls" in the UI and have their own pages, opened from the app's **Pulls** item in the sidebar, which shows the open count. The list (`/apps/{id}/pulls`) filters open, closed and merged pulls; its title repeats the open count and carries "New pull" (`/apps/{id}/pulls/new`). Each pull is at `/apps/{id}/pulls/{number}`. Open one from the Compare page or after pushing browser edits to a new branch. The pull page has a Conversation tab (description, comments, reviews) and a Files tab where you comment on a diff line. When later commits change that line, the comment is marked "Outdated" and stays in the conversation.
+  - **Reviews:** anyone with push access, except the author, can approve or request changes. A new push to the branch dismisses approvals given on older commits.
+  - **Squash merge:** one commit on the base branch, authored by the PR's author, which deploys when the base is `main`. You can delete the branch afterwards. A PR with conflicts can't be merged and lists the conflicting files; fix them locally and push.
+  - **Branch protection** (Settings, admin only, off by default): "Require a pull" keeps the push role off `main` (git push, browser edits and branch deletes), and "Required approvals" (0–2) gates merging. Admins bypass both. With protection on, the Changes panel only pushes to a new branch.
+  - Commits Noite makes (merges, browser edits, templates) use `<user id>@users.noreply.<domain>`, never your email.
+- MCP server for agents at `POST /mcp` (stateless Streamable HTTP). Agents authenticate with a `noite_` API key as a Bearer token and act as that account with its permissions.
+  - **Tools:**
+    - apps: `list_apps`, `get_app`, `list_templates`, `create_app` (blank, GitHub or template; same app limit as the UI)
+    - deploys and runtime: `deploy_status`, `deploy_log`, `app_logs`, `app_errors`
+    - env vars: `env_list` (secrets masked), `env_set`, `env_unset`
+    - repo: `repo_branches`, `repo_tree`, `repo_file`, `repo_log`, `repo_commit`
+  - **Setup:** `/account` has a "Connect an agent" block with copyable setup for Claude Code, Cursor and Codex.
+- Sidebar app list: on the apps pages (`/apps`, an app's pages, its storage editors, the create page), your apps (and the Noite admin home, for instance admins) are listed below **Apps** at the same level, each with a status dot where an icon would be, live as apps are created, renamed or deleted. The app you are on expands into **App** (its overview, tabs and storage), **Code** (Code mode) and **Pulls** (with the open count), and the one you are in is highlighted; the Noite admin home has neither and is highlighted itself. The **Code** button left the app header.
+- Runner API:
+  - `apps.create` takes a `source` (`blank`, or `git` with `url`, `ref` and `squash`); new `apps.retry_import` / `POST /v1/apps/{id}/retry-import`.
+  - Forge: `git.refs`, `git.log`, `git.commit`, `git.compare`, `git.branch_create`, `git.branch_delete`, under `/v1/apps/{id}/git/…`. `source.tree` and `source.blob` take `ref`.
+  - Pull requests: `prs.*` and `branch_rules.*`, under `/v1/apps/{id}/pull_requests` and `/v1/apps/{id}/branch_rules`.
+- **Code intelligence in the browser editor.** Opening a TypeScript or JavaScript file in Code mode now runs a real TypeScript language service in a web worker (started on first use, so the editor's main bundle never carries the compiler) over the repo's own sources at the ref you are browsing plus the declarations captured from the app's last successful build:
+  - Errors and warnings appear as inline markers, re-checked shortly after you stop typing, using the repo's `tsconfig.json` (ESNext/bundler defaults when it has none).
+  - Resting the pointer on a symbol for 0.3 s shows its type, highlighted like the editor, with its JSDoc underneath. Diagnostic popovers wait the same 0.3 s. **Cmd/Ctrl+click** jumps to its definition in the repo, and a definition that lives in `node_modules` shows its highlighted declaration in place, read-only.
+  - Inline prediction offers the completion TypeScript ranks first at the cursor. Read-only refs keep hover and navigation, and never predict.
+
+### Changed
+
+- `source.commit` takes `actor` instead of an `author` email, plus optional `branch` and `fromSha`, and its commits use the noreply identity.
+- Every new app gets its repository at creation, with `main` as the default branch; before, it appeared on the first push with no default branch. Source browsing reads the mirror that holds every pushed branch, not only the deployed one.
+- The app detail page uses the full width, like Code mode and storage, and drops the "← Apps" link above the header (the sidebar lists the apps). The name, actions and tabs stay put while the tab body scrolls. Settings is no longer a tab: the **Settings** button at the end of the tab row opens it as a panel on the right, a third of the width (`?panel=settings`), whose sections now sit between dividers instead of a card each. The panel stays open while you switch tabs. `?t=settings` links now open Overview. The Noite admin page (`_control`) uses the same layout.
+- Code mode's and the app page's side panels cover the page below the `lg` breakpoint instead of squeezing a second column next to it. Code mode also draws a divider between the file tree and the editor, like the ones around its bar and panels.
+- Code mode opens on the default branch (`main`) instead of the deployed commit, so what you see is what browser edits build on and History lists the same branch. The deployed commit stays the first entry of the branch picker. The bar drops its back link to the app (the sidebar lists the apps); the branch picker has a branch icon, and History and Changes have icons too.
+- The app Overview shows the Metrics and Errors cards side by side when the page is wide enough (they stack while the Settings panel is open), the Settings button has a cog icon, and the sidebar's profile menu items (Account, Docs, Sign out) have icons.
+- `/account` uses the same full-width layout as the app pages: your avatar, name and email at the top, then an **Account** tab (profile, passkeys, API keys, invitations, agent setup) and, for instance admins, an **Admin** tab with the telemetry opt-out and a link to the Noite admin page (`?t=admin`).
+- Switching tabs on the app detail page no longer remounts the whole page, so the settings you are editing and the open panels keep their state.
+- The Deployments tab opens only the deploy serving traffic (the newest successful deploy of the live commit), instead of every deploy of that commit.
+- The Events tab label shows how many events the app's feed holds, like the Errors tab's open count (hidden at 0; the feed keeps the newest 200).
+- Rolling back to the commit that is already live (`deploys.rollback`) rebuilds and redeploys it instead of silently doing nothing. Apps deployed before this release have no captured package types for the editor until their next deploy; a push or a rollback to the live commit captures them.
+- `make dev` turns off the per-client edge rate limit (`NOITE_EDGE_RPM=0`): vite dev serves every module as its own request, and the editor's TypeScript worker alone loads about a hundred, so dev pages hit 429s and the worker died.
+
+### Removed
+
+- The Source page's "Last push diff" view, with the runner's `source.diff` RPC and `GET /v1/apps/{id}/diff`. History covers it: open any commit, the deployed one included, to see its changes.
+
+### Fixed
+
+- A deploy failed with "parse wrangler config: trailing comma" when a `wrangler.jsonc` member ended with a comma followed by a comment.
+- Push rules failed open: a push whose commands the runner couldn't parse skipped every check, so a push-role collaborator could force-push or delete `main`. Such a push is now refused, and git also enforces "no force-push, no delete" for every non-admin.
+- Creating apps in parallel could go past the per-account app limit, and a losing create of the same slug could wipe the winner's repository. Creates are now serialized.
+- The UI's git-auth reply no longer defaults to the push role when it names no role.
+- Opening another file in the source browser threw away the unpushed edits of the file before, so a web commit could only ever change one file. Each change of `?file=` remounted the browser. Edits to any number of files now stay until you push them together.
+- A boolean (`FLAG_…`) env var's toggle in Settings could keep showing on after it was turned off, until a reload: the control UI's ilha didn't write `checked={false}` back to a live checkbox. Bumped ilha to 0.15.2 and @ilha/router to 0.11.16, which also keep controlled `<select>` and `<textarea>` values in sync.
+- The same bump made an in-place navigation leave a stale view behind: ilha reuses a keyed component without re-running it when its props are unchanged, and a `?query` read is not a reactive read, so a control that writes one (`?size=`, `?page=`, `?view=`, `?f=`, `?q=`, `?t=`, `?e=`, …) changed the URL while the grid, list or filter kept the old state — the storage editors, the admin searches and Code mode's panels among them. The control UI now reads search params through a wrapper whose reads subscribe the reading component to navigation, whether it reads the param itself or receives the handle as a prop.
+
 ## [0.1.0-alpha.3] - 2026-10-06
 
 Opt-out instance telemetry, storage editors, the admin home, and a pre-release flow for releases.

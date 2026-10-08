@@ -3,12 +3,12 @@
 //! comes from validated URL params (see ./state), so a view is deep-linkable
 //! and a write can invalidate exactly what it changed.
 
-import { searchParam } from "@ilha/router";
 import { atom } from "ilha";
 
 import { errorMessage } from "../../errors";
 import { d1Schema, d1Tables, invalidateD1 } from "../../resources";
 import type { D1Cell, D1Filter, D1RowsQuery } from "../../runner";
+import { searchParam } from "../../search-param";
 import { Toaster, useToasts } from "../shared";
 import { TableDefinition } from "./definition";
 import { RowsGrid } from "./grid";

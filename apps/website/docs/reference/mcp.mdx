@@ -1,0 +1,87 @@
+---
+title: Agents (MCP)
+description: Point an MCP client at a Noite install — the endpoint, the API key, copyable setup, and the tool list.
+---
+
+Noite runs a hosted [Model Context Protocol](https://modelcontextprotocol.io/) server, so a coding agent can list apps, create one, read its code, follow a deploy, debug it and set variables. The agent runs as the account its API key belongs to, with that account's collaborator roles.
+
+## Endpoint
+
+| | |
+| --- | --- |
+| URL | `https://app.<domain>/mcp` (the control UI origin plus `/mcp`) |
+| Method | `POST`, one JSON-RPC 2.0 message per request |
+| Transport | Streamable HTTP in its plain-JSON mode — stateless, no session, no SSE |
+| Auth | `Authorization: Bearer noite_…` |
+
+The server implements protocol revision `2025-06-18` and reports itself as `noite`. Because the transport is stateless, `GET` and `DELETE` answer `405`, and a notification answers `202` with no body. A bearer token is required on every request; there is no OAuth and no session.
+
+## API key
+
+The key is a normal account API key created on `/account` with the **App Management** scope (`apps: manage`) — the same scope `git push` uses. A key without it is refused. The key is shown once at creation; keep it secret, since anyone holding it can act as you.
+
+:::tip
+Every tool takes `app` — an app slug or id — and resolves your role on that app exactly as the UI does. An agent can do what a collaborator of your role can do on that app, and nothing more.
+:::
+
+## Setup
+
+The **Connect an agent** card on `/account` shows all three snippets, filled in with the key you just created and generated from the control UI's own origin. Paste the one for your client:
+
+**Claude Code** — one terminal command:
+
+```bash
+claude mcp add --transport http noite https://app.<domain>/mcp --header "Authorization: Bearer noite_…"
+```
+
+**Cursor** — `.cursor/mcp.json` in the project (or `~/.cursor/mcp.json` for every project):
+
+```json
+{
+  "mcpServers": {
+    "noite": {
+      "headers": {
+        "Authorization": "Bearer noite_…"
+      },
+      "url": "https://app.<domain>/mcp"
+    }
+  }
+}
+```
+
+**Codex** — `~/.codex/config.toml` (or `.codex/config.toml` in a trusted project):
+
+```toml
+[mcp_servers.noite]
+url = "https://app.<domain>/mcp"
+http_headers = { Authorization = "Bearer noite_…" }
+```
+
+After the key's first sighting the card shows the placeholder `noite_…`; mint a new key to get a filled snippet again.
+
+## Tools
+
+| Tool | Does | Role |
+| --- | --- | --- |
+| `list_apps` | Lists the apps this account can see, with slug, status and URL. | `view` |
+| `get_app` | One app's status, your role, URL and git remote. | `view` |
+| `list_templates` | Lists the templates this Noite ships. | — |
+| `create_app` | Creates an app — blank, a public GitHub import, or a template — and returns push instructions. | app quota |
+| `deploy_status` | An app's deploy state and recent deploys; poll this after a push. | `view` |
+| `deploy_log` | One deploy's build log (the newest by default). | `view` |
+| `app_logs` | The app's recent runtime log lines (trailing tail, default 200). | `view` |
+| `app_errors` | Error issues grouped by fingerprint, with 24-hour counts. | `view` |
+| `env_list` | Environment variables; values are hidden unless they are `0`/`1` flags. | `view` |
+| `env_set` | Sets an environment variable for the next deploy. | `admin` |
+| `env_unset` | Removes an environment variable. | `admin` |
+| `repo_branches` | Branches with tip, last commit and distance from the default branch. | `view` |
+| `repo_tree` | The file tree at a ref (default: what is deployed, else the default branch). | `view` |
+| `repo_file` | One file's contents at a ref. | `view` |
+| `repo_log` | Commit history, newest first, optionally scoped to a path. | `view` |
+| `repo_commit` | One commit's metadata, changed files and patch. | `view` |
+
+`create_app` takes a `source` of `blank`, `{ kind: "github", url, ref? }` or `{ kind: "template", template }`, and enforces the same per-account app limit as the UI ([Limits](/reference/limits)). A GitHub import obeys the same rules as the UI: public `https://github.com/<owner>/<repo>` only, one-time copy, 500 MiB and 10 minutes ([Create an app](/apps/create#import-from-github)).
+
+## Pushing instead
+
+`create_app` is not the only way in. An agent with git access can push to a slug that does not exist yet and create the app that way; it becomes the pusher's, with them as admin ([Create by pushing](/apps/create#create-by-pushing)). For everything else, `repo_*` reads and the `deploy_*`, `app_*` and `env_*` tools cover the same ground the app detail page does.

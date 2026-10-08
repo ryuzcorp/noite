@@ -1,10 +1,18 @@
+import { SidebarApps, sidebarPlace } from "$lib/apps/sidebar";
 import { authClient } from "$lib/auth-client";
 import { Authed } from "$lib/auth/authed";
 import { Onboarding } from "$lib/auth/onboarding";
 import { invalidateSession } from "$lib/auth/session";
 import { session } from "$lib/resources";
+import { provideNavigationCell } from "$lib/search-param";
 import { Avatar } from "$lib/ui/avatar";
-import { List as ListIcon, Menu as MenuIcon } from "$lib/ui/icons";
+import {
+  BookOpen,
+  CircleUser,
+  List as ListIcon,
+  LogOut,
+  Menu as MenuIcon,
+} from "$lib/ui/icons";
 import { defineLayout, navigate, useRoute } from "@ilha/router";
 
 /**
@@ -21,7 +29,12 @@ const signOut = async () => {
 };
 
 export default defineLayout(({ children }) => {
+  // The cell every `searchParam` read subscribes to (see $lib/search-param).
+  // It must run on every render, before the /login early return.
+  provideNavigationCell();
   const { path } = useRoute();
+  const { activeAppId, activeView, onAppsPages } = sidebarPlace(path());
+  const appsItemActive = onAppsPages && activeAppId === null;
   const sessionRes = session();
   const user = sessionRes.data()?.user;
   const displayName = user?.name || user?.email || "";
@@ -79,11 +92,15 @@ export default defineLayout(({ children }) => {
                 <a
                   href="/apps"
                   data-tour="apps"
-                  class={path().startsWith("/apps") ? "menu-active" : undefined}
+                  class={appsItemActive ? "menu-active" : undefined}
+                  aria-current={appsItemActive ? "page" : undefined}
                 >
                   <ListIcon class="h-5 w-5 shrink-0" />
                   Apps
                 </a>
+                {onAppsPages ? (
+                  <SidebarApps activeId={activeAppId} activeView={activeView} />
+                ) : null}
               </li>
             </ul>
             <div class="border-base-300 border-t p-2">
@@ -103,7 +120,10 @@ export default defineLayout(({ children }) => {
                   class="dropdown-content menu bg-base-100 dark:bg-base-200 rounded-box z-10 w-52 p-2 shadow"
                 >
                   <li>
-                    <a href="/account">Account</a>
+                    <a href="/account">
+                      <CircleUser />
+                      Account
+                    </a>
                   </li>
                   <li>
                     <a
@@ -111,6 +131,7 @@ export default defineLayout(({ children }) => {
                       target="_blank"
                       rel="noopener noreferrer"
                     >
+                      <BookOpen />
                       Docs
                     </a>
                   </li>
@@ -122,6 +143,7 @@ export default defineLayout(({ children }) => {
                         void signOut();
                       }}
                     >
+                      <LogOut />
                       Sign out
                     </button>
                   </li>

@@ -18,6 +18,7 @@ use crate::host::{exec, s3};
 use crate::host::deploy::{self, Deploying};
 use crate::host::logs::LogState;
 use crate::host::source;
+use crate::host::source_types;
 use crate::host::supervisor::{self, ProcMap};
 use crate::models::App;
 
@@ -188,6 +189,15 @@ async fn rename_slugged(
     for (from, to) in &pairs {
         move_dir(from, to).await?;
     }
+    // The local-only declaration capture follows the slug too. It is one file,
+    // not a mergeable tree, so a leftover for the target slug is dropped rather
+    // than tripping `move_dir`'s "target exists" guard.
+    let (from, to) = (
+        source_types::store_path(cfg, &app.slug),
+        source_types::store_path(cfg, new_slug),
+    );
+    let _ = tokio::fs::remove_file(&to).await;
+    move_dir(&from, &to).await?;
 
     move_s3_prefix(
         cfg,

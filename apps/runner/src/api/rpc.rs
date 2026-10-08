@@ -10,7 +10,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::api_error::ApiError;
+use crate::host::git_identity::Actor;
 use crate::host::storage;
+use crate::models::AppSource;
 use crate::service;
 use crate::AppState;
 
@@ -144,6 +146,9 @@ struct CreateParams {
     slug: String,
     #[serde(default)]
     user_id: Option<String>,
+    /// A2/A3 initial content; absent = the blank app.
+    #[serde(default)]
+    source: Option<AppSource>,
 }
 
 #[derive(Deserialize)]
@@ -222,9 +227,57 @@ struct DeployLogParams {
 }
 
 #[derive(Deserialize)]
+struct SourceRefParams {
+    id: String,
+    #[serde(rename = "ref", default)]
+    reference: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct SourceBlobParams {
     id: String,
     path: String,
+    #[serde(rename = "ref", default)]
+    reference: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GitLogParams {
+    id: String,
+    #[serde(rename = "ref", default)]
+    reference: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    skip: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct GitCommitParams {
+    id: String,
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct GitCompareParams {
+    id: String,
+    base: String,
+    head: String,
+}
+
+#[derive(Deserialize)]
+struct GitBranchCreateParams {
+    id: String,
+    name: String,
+    from: String,
+}
+
+#[derive(Deserialize)]
+struct GitBranchDeleteParams {
+    id: String,
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -232,6 +285,111 @@ struct CommitParams {
     id: String,
     #[serde(flatten)]
     body: service::source::SourceCommitBody,
+}
+
+#[derive(Deserialize)]
+struct PrListParams {
+    id: String,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    skip: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct PrNumberParams {
+    id: String,
+    number: i64,
+}
+
+#[derive(Deserialize)]
+struct PrCreateParams {
+    id: String,
+    actor: Actor,
+    title: String,
+    #[serde(default)]
+    body: String,
+    base: String,
+    head: String,
+}
+
+#[derive(Deserialize)]
+struct PrUpdateParams {
+    id: String,
+    number: i64,
+    actor: Actor,
+    role: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PrCommentParams {
+    id: String,
+    number: i64,
+    actor: Actor,
+    role: String,
+    body: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    line: Option<i64>,
+    #[serde(default)]
+    side: Option<String>,
+    #[serde(rename = "commitSha", default)]
+    commit_sha: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PrCommentEditParams {
+    id: String,
+    #[serde(rename = "commentId")]
+    comment_id: String,
+    actor: Actor,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PrReviewParams {
+    id: String,
+    number: i64,
+    actor: Actor,
+    role: String,
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct PrMergeParams {
+    id: String,
+    number: i64,
+    actor: Actor,
+    role: String,
+    #[serde(rename = "authorName", default)]
+    author_name: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(rename = "deleteBranch", default)]
+    delete_branch: bool,
+}
+
+#[derive(Deserialize)]
+struct BranchRulesSetParams {
+    id: String,
+    #[serde(rename = "requirePr")]
+    require_pr: bool,
+    #[serde(rename = "requiredApprovals")]
+    required_approvals: i64,
 }
 
 #[derive(Deserialize)]
@@ -301,8 +459,22 @@ async fn dispatch_call(
             };
             complete(
                 id,
-                service::apps::create(state, &p.name, &p.slug, p.user_id.as_deref()).await,
+                service::apps::create(
+                    state,
+                    &p.name,
+                    &p.slug,
+                    p.user_id.as_deref(),
+                    p.source.as_ref(),
+                )
+                .await,
             )
+        }
+        "apps.retry_import" => {
+            let p: IdParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(id, service::apps::retry_import(state, &p.id).await)
         }
         "apps.get" => {
             let p: IdParams = match parse(params, &id) {
@@ -493,26 +665,106 @@ async fn dispatch_call(
             };
             complete(id, service::git::remote(state, &p.id).await)
         }
-        "source.tree" => {
+        "git.refs" => {
             let p: IdParams = match parse(params, &id) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            complete(id, service::source::tree(state, &p.id).await)
+            complete(id, service::git::refs(state, &p.id).await)
+        }
+        "git.log" => {
+            let p: GitLogParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::git::log(
+                    state,
+                    &p.id,
+                    p.reference.as_deref(),
+                    p.path.as_deref(),
+                    p.skip,
+                    p.limit,
+                )
+                .await,
+            )
+        }
+        "git.commit" => {
+            let p: GitCommitParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(id, service::git::commit(state, &p.id, &p.sha).await)
+        }
+        "git.compare" => {
+            let p: GitCompareParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::git::compare(state, &p.id, &p.base, &p.head).await,
+            )
+        }
+        "git.branch_create" => {
+            let p: GitBranchCreateParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::git::branch_create(state, &p.id, &p.name, &p.from).await,
+            )
+        }
+        "git.branch_delete" => {
+            let p: GitBranchDeleteParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::git::branch_delete(state, &p.id, &p.name)
+                    .await
+                    .map(|()| json!({ "ok": true })),
+            )
+        }
+        "source.tree" => {
+            let p: SourceRefParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::source::tree(state, &p.id, p.reference.as_deref()).await,
+            )
+        }
+        "source.bundle" => {
+            let p: SourceRefParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::source::bundle(state, &p.id, p.reference.as_deref()).await,
+            )
         }
         "source.blob" => {
             let p: SourceBlobParams = match parse(params, &id) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            complete(id, service::source::blob(state, &p.id, &p.path).await)
+            complete(
+                id,
+                service::source::blob(state, &p.id, &p.path, p.reference.as_deref()).await,
+            )
         }
-        "source.diff" => {
+        "source.types" => {
             let p: IdParams = match parse(params, &id) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            complete(id, service::source::diff(state, &p.id).await)
+            complete(id, service::source::types(state, &p.id).await)
         }
         "source.commit" => {
             let p: CommitParams = match parse(params, &id) {
@@ -524,6 +776,173 @@ async fn dispatch_call(
                 service::source::commit(state, &p.id, &p.body)
                     .await
                     .map(|sha| json!({ "sha": sha })),
+            )
+        }
+        "prs.list" => {
+            let p: PrListParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::prs::list(
+                    state,
+                    &p.id,
+                    p.state.as_deref(),
+                    p.skip.unwrap_or(0),
+                    p.limit.unwrap_or(25),
+                )
+                .await,
+            )
+        }
+        "prs.get" => {
+            let p: PrNumberParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(id, service::prs::get(state, &p.id, p.number).await)
+        }
+        "prs.create" => {
+            let p: PrCreateParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::prs::create(state, &p.id, &p.actor, &p.title, &p.body, &p.base, &p.head)
+                    .await,
+            )
+        }
+        "prs.update" => {
+            let p: PrUpdateParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::prs::update(
+                    state,
+                    &p.id,
+                    p.number,
+                    &p.actor,
+                    &p.role,
+                    p.title.as_deref(),
+                    p.body.as_deref(),
+                    p.state.as_deref(),
+                )
+                .await,
+            )
+        }
+        "prs.comment" => {
+            let p: PrCommentParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::prs::comment(
+                    state,
+                    &p.id,
+                    p.number,
+                    &p.actor,
+                    &p.role,
+                    &p.body,
+                    p.path.as_deref(),
+                    p.line,
+                    p.side.as_deref(),
+                    p.commit_sha.as_deref(),
+                )
+                .await,
+            )
+        }
+        "prs.comment_edit" => {
+            let p: PrCommentEditParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::prs::comment_edit(
+                    state,
+                    &p.id,
+                    &p.comment_id,
+                    &p.actor,
+                    p.body.as_deref().unwrap_or_default(),
+                )
+                .await
+                .map(|()| json!({ "ok": true })),
+            )
+        }
+        "prs.comment_delete" => {
+            let p: PrCommentEditParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::prs::comment_delete(
+                    state,
+                    &p.id,
+                    &p.comment_id,
+                    &p.actor,
+                    p.role.as_deref().unwrap_or("view"),
+                )
+                .await
+                .map(|()| json!({ "ok": true })),
+            )
+        }
+        "prs.review" => {
+            let p: PrReviewParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::prs::review(state, &p.id, p.number, &p.actor, &p.role, &p.state).await,
+            )
+        }
+        "prs.merge" => {
+            let p: PrMergeParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::prs::merge(
+                    state,
+                    &p.id,
+                    p.number,
+                    &p.actor,
+                    &p.role,
+                    p.author_name.as_deref(),
+                    p.title.as_deref(),
+                    p.message.as_deref(),
+                    p.delete_branch,
+                )
+                .await,
+            )
+        }
+        "branch_rules.get" => {
+            let p: IdParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(id, service::prs::branch_rules_get(state, &p.id).await)
+        }
+        "branch_rules.set" => {
+            let p: BranchRulesSetParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::prs::branch_rules_set(
+                    state,
+                    &p.id,
+                    p.require_pr,
+                    p.required_approvals,
+                )
+                .await,
             )
         }
         "metrics.get" => {

@@ -1,3 +1,22 @@
+import { AdminAppsPanel } from "../admin/apps";
+import { AdminInvitesPanel } from "../admin/invites";
+import { AdminUsersPanel } from "../admin/users";
+import { ErrorsPanel, ErrorsSummary, liveErrors } from "../app-detail/errors";
+import { RuntimeLogs } from "../app-detail/logs";
+import {
+  DEFAULT_METRICS_HOURS,
+  MetricsCard,
+  MetricsRangePicker,
+  toMetricsHours,
+} from "../app-detail/metrics";
+import { DetailShell, DetailTabs } from "../app-detail/shell";
+import {
+  CONTROL_APP_ID,
+  CONTROL_APP_NAME,
+  CONTROL_APP_SUBTITLE,
+  CONTROL_BUILD,
+} from "../control-app";
+import { adminStatus, session } from "../resources";
 //! Detail for the reserved control app (`_control`): the control plane as a
 //! tenant-shaped page AND the admin home. The control fleet emits celld
 //! telemetry into the same ingest as every app (reserved key `_control`, no
@@ -17,28 +36,9 @@
 //! this page then hides the telemetry tabs (see `NEEDS_FLEET`) and shows one
 //! notice instead. The admin tabs and the control D1 keep working — neither
 //! depends on the fleet.
-import { searchParam } from "@ilha/router";
-
-import { AdminAppsPanel } from "../admin/apps";
-import { AdminInvitesPanel } from "../admin/invites";
-import { AdminUsersPanel } from "../admin/users";
-import { ErrorsPanel, ErrorsSummary, liveErrors } from "../app-detail/errors";
-import { RuntimeLogs } from "../app-detail/logs";
-import {
-  DEFAULT_METRICS_HOURS,
-  MetricsCard,
-  MetricsRangePicker,
-  toMetricsHours,
-} from "../app-detail/metrics";
-import {
-  CONTROL_APP_ID,
-  CONTROL_APP_NAME,
-  CONTROL_APP_SUBTITLE,
-  CONTROL_BUILD,
-} from "../control-app";
-import { adminStatus, session } from "../resources";
+import { searchParam } from "../search-param";
 import { AppStorageList } from "../storage/list";
-import { ArrowLeft } from "../ui/icons";
+import { Avatar } from "../ui/avatar";
 import { ListSkeleton } from "../ui/skeletons";
 
 const TABS = [
@@ -100,34 +100,28 @@ const ControlMetricsTab = () => {
   );
 };
 
+/** Shaped like a tenant app's header: avatar, name, then one line of facts. */
 const Header = ({ controlFleet }: { controlFleet: boolean }) => (
-  <div class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-    <div class="card-body gap-2">
-      <a
-        href="/apps"
-        class="link link-hover inline-flex w-fit items-center gap-1 text-sm opacity-70"
-      >
-        <ArrowLeft />
-        Apps
-      </a>
-      <h1 class="m-0 text-2xl font-semibold">{CONTROL_APP_NAME}</h1>
+  <header class="flex min-w-0 items-center gap-3">
+    <Avatar class="shrink-0" label={CONTROL_APP_NAME} size="lg" />
+    <div class="min-w-0">
+      <h1 class="m-0 truncate text-xl font-semibold">{CONTROL_APP_NAME}</h1>
       <p class="m-0 flex flex-wrap items-center gap-x-2 text-sm">
         <span class="badge badge-sm">{CONTROL_APP_SUBTITLE}</span>
         <span class="opacity-70">
           build <span class="font-mono">{CONTROL_BUILD}</span>
         </span>
+        {/* The control plane's numbers include this dashboard's own traffic:
+            every page load polls and its logs/errors streams stay open. Only
+            shown where the telemetry tabs exist. */}
+        {controlFleet ? (
+          <span class="opacity-70">
+            · telemetry includes this dashboard's own polling and streams
+          </span>
+        ) : null}
       </p>
-      {/* The control plane's numbers include this dashboard's own traffic:
-          every page load polls and its logs/errors streams stay open. Only
-          shown where the telemetry tabs exist. */}
-      {controlFleet ? (
-        <p class="m-0 text-sm opacity-70">
-          Metrics, errors and logs below cover the control plane's own traffic —
-          including this dashboard's polling and event streams.
-        </p>
-      ) : null}
     </div>
-  </div>
+  </header>
 );
 
 /** Overview for an install that does not supervise the control fleet: the
@@ -173,30 +167,23 @@ const ControlAppDetailBody = ({
     ? (liveErrors(CONTROL_APP_ID, "open").data()?.counts.open ?? 0)
     : 0;
   return (
-    <>
-      <Header controlFleet={controlFleet} />
-      <div class="border-base-300 overflow-x-auto border-b">
-        <div role="tablist" class="tabs tabs-border w-max flex-nowrap">
-          {tabs.map((item) => (
-            <button
-              type="button"
-              role="tab"
-              aria-selected={active === item.id ? "true" : "false"}
-              class={`tab gap-1.5 whitespace-nowrap ${active === item.id ? "tab-active" : ""}`}
-              onclick={() => {
-                openError.set("");
-                tab.set(item.id);
-              }}
-            >
-              {item.label}
-              {item.id === "errors" && openErrors > 0 ? (
-                <span class="badge badge-sm tabular-nums">{openErrors}</span>
-              ) : null}
-            </button>
-          ))}
-        </div>
-      </div>
-
+    <DetailShell
+      panel={null}
+      header={
+        <>
+          <Header controlFleet={controlFleet} />
+          <DetailTabs
+            active={active}
+            counts={{ errors: openErrors }}
+            tabs={tabs}
+            onSelect={(next) => {
+              openError.set("");
+              tab.set(toTabId(next));
+            }}
+          />
+        </>
+      }
+    >
       {active === "overview" && controlFleet ? (
         <>
           <MetricsCard
@@ -218,7 +205,7 @@ const ControlAppDetailBody = ({
       {active === "users" ? <AdminUsersPanel email={email} /> : null}
       {active === "apps" ? <AdminAppsPanel /> : null}
       {active === "invites" ? <AdminInvitesPanel /> : null}
-    </>
+    </DetailShell>
   );
 };
 
@@ -234,29 +221,27 @@ export const ControlAppDetail = () => {
     sess.data()?.session.impersonatedBy === null;
   if (!ready) {
     return (
-      <div class="mx-auto mt-4 w-full max-w-5xl px-4 pb-12">
+      <div class="w-full px-4 pt-4 pb-12">
         <ListSkeleton rows={3} />
       </div>
     );
   }
   if (!allowed) {
     return (
-      <div class="mx-auto mt-4 w-full max-w-5xl px-4 pb-12">
+      <div class="w-full px-4 pt-4 pb-12">
         <p class="m-0 text-sm opacity-70">App not found.</p>
       </div>
     );
   }
+  // `controlFleet` is false only when the runner says it supervises no
+  // control fleet (the dev image: vite dev serves the UI) — then there is no
+  // telemetry to chart and the body hides those tabs. Unknown/loading (the
+  // runner could not answer) reads as managed: a healthy release install
+  // must never show the dev notice.
   return (
-    <div class="mx-auto mt-4 flex w-full max-w-5xl flex-col gap-4 px-4 pb-12">
-      {/* `controlFleet` is false only when the runner says it supervises no
-          control fleet (the dev image: vite dev serves the UI) — then there is
-          no telemetry to chart and the body hides those tabs. Unknown/loading
-          (the runner could not answer) reads as managed: a healthy release
-          install must never show the dev notice. */}
-      <ControlAppDetailBody
-        controlFleet={admin.data()?.controlFleet !== false}
-        email={sess.data()?.user.email ?? ""}
-      />
-    </div>
+    <ControlAppDetailBody
+      controlFleet={admin.data()?.controlFleet !== false}
+      email={sess.data()?.user.email ?? ""}
+    />
   );
 };

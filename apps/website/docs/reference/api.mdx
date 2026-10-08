@@ -60,12 +60,44 @@ Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
 
 | Method | Route | Notes |
 | --- | --- | --- |
-| `GET` | `/v1/apps/{id}/tree` | File tree at tip |
-| `GET` | `/v1/apps/{id}/blob/{*path}` | File contents |
-| `GET` | `/v1/apps/{id}/diff` | Working diff |
-| `POST` | `/v1/apps/{id}/source/commit` | Browser-edit commit (validated paths + message + author email); wakes asleep apps |
+| `GET` | `/v1/apps/{id}/tree?ref=` | File tree at `ref` (branch, tag or sha; defaults to the deployed sha, else `HEAD`) |
+| `GET` | `/v1/apps/{id}/blob/{*path}?ref=` | File contents at `ref` |
+| `GET` | `/v1/apps/{id}/bundle?ref=` | Every text source at `ref` for the code editor's language service (≤ 3000 files, ≤ 256 KiB each, ≤ 8 MiB total; `truncated` marks a capped read) |
+| `GET` | `/v1/apps/{id}/types` | Declaration files (`*.d.ts`/`*.d.mts`/`*.d.cts` + each package's `package.json`) captured from the app's last successful build; `sha: null` and no files until one lands |
+| `POST` | `/v1/apps/{id}/source/commit` | Browser-edit commit: validated paths, a message and the session `actor` (`{userId, name}`), optional `branch` and `fromSha` so a protected `main` can send the edit to a new branch; wakes asleep apps |
+
+## Git forge
+
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` | `/v1/apps/{id}/git/refs` | Branches with tip, age, author and ahead/behind vs `main`, plus the deployed sha |
+| `GET` | `/v1/apps/{id}/git/log?ref=&path=&skip=&limit=` | One page of history (NUL-separated `git log`, 1..100 commits, `nextSkip`), optionally for one file |
+| `GET` | `/v1/apps/{id}/git/commits/{sha}` | One commit: metadata, body, per-file stats and the patch against its first parent (or the empty tree) |
+| `GET` | `/v1/apps/{id}/git/compare?base=&head=` | `base..head` commits, the three-dot diff, and whether a squash merge would conflict (`git merge-tree --write-tree`) |
+| `POST` | `/v1/apps/{id}/git/branches` | Create a branch (body: `name`, `from`); `409` when it exists |
+| `DELETE` | `/v1/apps/{id}/git/branches/{*name}` | Delete a branch; the default branch is refused (`400`) |
+
+Reads resolve against the push mirror, which carries every pushed branch; a branch create or delete publishes exactly like a push (tip bundle, manifest, deploy when `main` moves).
 
 Storage and source reads classify the backend failure: a missing object, a missing D1 table, or a not-yet-deployed source is `404`, an invalid path is `400`, and every other mirror/S3/celld failure is `500`. (These used to be folded into `409`.)
+
+## Pull requests
+
+Same-repo branches only (no forks); merging is always a squash. `actor` is `{userId, name}` and `role` is the caller's app role (`view`/`push`/`admin`).
+
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` | `/v1/apps/{id}/pull_requests?state=&skip=&limit=` | Newest first, with comment counts and per-state totals; `state` is `open`/`closed`/`merged`/`all` |
+| `POST` | `/v1/apps/{id}/pull_requests` | Open one (body: `actor`, `title`, `body`, `base`, `head`); `409` when an open PR exists for the pair |
+| `GET` | `/v1/apps/{id}/pull_requests/{number}` | PR + comments, reviews, the live `base..head` compare, per-comment `outdated`, counted `approvals` and the `mergeState` |
+| `PATCH` | `/v1/apps/{id}/pull_requests/{number}` | Edit `title`/`body` and close/reopen (`state`); the author or an admin |
+| `POST` | `/v1/apps/{id}/pull_requests/{number}/comments` | Comment; a line comment carries `path`, `line`, `side` and `commitSha` |
+| `PATCH` / `DELETE` | `/v1/apps/{id}/comments/{comment_id}` | Edit (author) or delete (author or admin) a comment |
+| `POST` | `/v1/apps/{id}/pull_requests/{number}/reviews` | `approved` / `changes_requested` at the current head; never the PR author |
+| `POST` | `/v1/apps/{id}/pull_requests/{number}/merge` | Squash-merge (`title`, `message`, `deleteBranch`); `409` on conflicts, insufficient approvals or a moved base |
+| `GET` / `PUT` | `/v1/apps/{id}/branch_rules` | Per-app protection: `requirePr` (the `push` role cannot move `main` directly) and `requiredApprovals` (0/1/2) |
+
+Counted approvals are the latest review per reviewer that is `approved`, not dismissed, recorded at the current head and not by the author; admins bypass the threshold. A push moves every open PR whose head branch moved and dismisses its older reviews. Merging writes one commit whose parent is the base tip, publishes it like a push (so a merge into `main` deploys) and optionally deletes the head branch.
 
 ## Storage
 

@@ -702,6 +702,8 @@ mod tests {
             asleep_since: None,
             woke_at: None,
             deployed_config: None,
+            import_source: None,
+            imported: false,
         }
     }
 

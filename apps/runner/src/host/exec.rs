@@ -379,14 +379,20 @@ pub async fn run_cmd_stdin(
         cmd.current_dir(cwd);
     }
     let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
-    if let Some(mut pipe) = child.stdin.take() {
-        pipe.write_all(stdin).await.context("write stdin")?;
-        pipe.shutdown().await.ok();
-    }
+    // Feed stdin from its own task: a command that answers with more than a
+    // pipe buffer holds (batch `git cat-file`) blocks on stdout, and if we
+    // were still blocked writing stdin the two would deadlock.
+    let mut pipe = child.stdin.take().context("stdin pipe")?;
+    let input = stdin.to_vec();
+    let writer = tokio::spawn(async move {
+        let _ = pipe.write_all(&input).await;
+        let _ = pipe.shutdown().await;
+    });
     let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await
         .context("command timeout")?
         .context("wait output")?;
+    let _ = writer.await;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         bail!(

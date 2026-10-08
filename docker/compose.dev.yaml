@@ -33,6 +33,11 @@ services:
       # and without it every /api/auth/* call answers 500 "BETTER_AUTH_SECRET
       # is missing". `apps/noite/.dev.vars` still wins when present.
       CLOUDFLARE_INCLUDE_PROCESS_ENV: "true"
+      # vite dev serves every module as its own request (the editor's
+      # TypeScript worker alone pulls ~100), so a page load or two exhausts the
+      # per-client edge budget and module loads die with 429. Production
+      # bundles them; dev turns the per-client limit off, as e2e does.
+      NOITE_EDGE_RPM: ${NOITE_EDGE_RPM:-0}
     healthcheck:
       # The first boot compiles the runner and installs UI deps: minutes.
       start_period: 900s

@@ -3,7 +3,7 @@ title: Configure
 description: Env vars, custom domains, rate limits, collaborators, source edits, and storage for one app.
 ---
 
-All of this lives on the app detail page (`/apps/<id>`, tabs Overview / Deployments / Metrics / Errors / Events / Settings).
+All of this lives in the **Settings** panel of the app detail page (`/apps/<id>`). The app's name, actions and tabs (Overview / Deployments / Metrics / Errors / Events) stay at the top while the tab below them scrolls. **Settings**, at the end of the tab row, opens the panel on the right, a third of the width, and keeps it open while you switch tabs; on narrow screens it covers the page instead. Click it again, or the panel's close button, to hide it; `?panel=settings` keeps it open across reloads and links.
 
 ## Environment variables
 
@@ -45,7 +45,7 @@ Instance admins (the [operator track](/self-hosting/install)) manage every app w
 
 ## Source browser and web commits
 
-The **Code** button opens `/apps/<id>/source`: files of the latest pushed commit, a parent diff view, and deep links via `?view=` / `?file=`. Editing files there stages a web commit — it pushes like a deploy and wakes a sleeping app.
+While you are on an app, the sidebar lists three items under it: **App** (this page), **Code** and **Pulls** ([Pull requests](/apps/pull-requests)). **Code** opens `/apps/<id>/source`: the files of the default branch, deep-linkable through `?ref=`, `?file=` and `?panel=`. Editing files there stages a web commit, which pushes like a deploy and wakes a sleeping app. The same page browses any branch, tag or commit, shows history and diffs, and compares refs; see [Source and history](/apps/source).
 
 :::warning
 The browser caps blobs at 256 KB and diffs at 1 MB. Binary files are detected, not rendered.

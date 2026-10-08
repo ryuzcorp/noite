@@ -1,4 +1,4 @@
-import { CreateAppForm } from "$lib/apps/list";
+import { CreateAppForm } from "$lib/apps/create-form";
 import { head } from "@ilha/router";
 
 export default function NewAppPage() {
@@ -10,7 +10,8 @@ export default function NewAppPage() {
         <div class="card-body gap-4">
           <p class="text-base-content/80 m-0 text-sm">
             Creating an app provisions a git remote you can push to — deploys
-            follow each push.
+            follow each push. Start empty, copy a public GitHub repo once, or
+            begin from a template.
           </p>
           <CreateAppForm />
         </div>

@@ -1,12 +1,12 @@
 //! Admin tab: every app on the instance, whichever account owns it.
 
-import { searchParam } from "@ilha/router";
 import { atom } from "ilha";
 import type { View } from "ilha";
 
 import { presenceTone } from "../apps/identity";
 import { errorMessage } from "../errors";
 import { listAllApps } from "../resources";
+import { searchParam } from "../search-param";
 import { adminDeleteApp, adminSetAppState } from "../server/admin.server";
 import type { AdminAppRow } from "../server/admin.server";
 import { Avatar } from "../ui/avatar";

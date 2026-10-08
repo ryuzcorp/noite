@@ -71,7 +71,9 @@ $CE2E up -d $UP_FLAGS
 
 echo "==> wait for the stack to serve (5 min)"
 attempt=0
-while [ "$attempt" -lt 30 ]; do
+# Same 5-minute budget, checked every 3 s: the stack is usually up within
+# seconds of the first failed check.
+while [ "$attempt" -lt 100 ]; do
   if sh docker/doctor.sh; then
     echo "==> playwright e2e"
     # `set -e` would abort on a failing suite and skip the teardown below,
@@ -104,7 +106,7 @@ while [ "$attempt" -lt 30 ]; do
     exit "$rc"
   fi
   attempt=$((attempt + 1))
-  sleep 10
+  sleep 3
 done
 echo "stack never became healthy — dumping logs"
 # shellcheck disable=SC2086

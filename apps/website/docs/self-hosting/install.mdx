@@ -65,6 +65,7 @@ The same result without the script, on any host with Docker (or Podman) and Comp
 - A Docker or Podman host with Compose.
 - DNS: `app.<domain>` (control UI), `api.<domain>`, `git.<domain>`, plus `*.<domain>` for tenant apps. The apex stays free for your marketing site.
 - Ports 80/443 reachable — Caddy terminates per-host TLS itself via on-demand certificates (ask-gated, so only live hosts get certs).
+- Outbound HTTPS from the runner host to `github.com` if you want GitHub imports and templates ([Create an app](/apps/create#import-from-github)). Only `https://github.com/<owner>/<repo>` is fetched, redirects are not followed, and each import is capped at 500 MiB and 10 minutes. Without it, blank apps and `git push` still work.
 
 ### A: bundled RustFS
 

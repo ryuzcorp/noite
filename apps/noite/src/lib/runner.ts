@@ -12,6 +12,7 @@ import type { AppDomain as RunnerDomain } from "./runner-types/AppDomain";
 import type { AppEnv as RunnerEnv } from "./runner-types/AppEnv";
 import type { AppUserProps as RunnerUserProps } from "./runner-types/AppUserProps";
 import type { BlobResponse as RunnerBlob } from "./runner-types/BlobResponse";
+import type { BranchRules } from "./runner-types/BranchRules";
 import type { D1DeleteRowsBody } from "./runner-types/D1DeleteRowsBody";
 import type { D1Filter } from "./runner-types/D1Filter";
 import type { D1Rows } from "./runner-types/D1Rows";
@@ -20,14 +21,23 @@ import type { D1TableInfo as D1TableInfoBase } from "./runner-types/D1TableInfo"
 import type { D1Tables as D1TablesRaw } from "./runner-types/D1Tables";
 import type { D1TableSchemaRaw } from "./runner-types/D1TableSchemaRaw";
 import type { D1WriteBody } from "./runner-types/D1WriteBody";
-import type { DiffResponse as RunnerDiff } from "./runner-types/DiffResponse";
 import type { DoPreview } from "./runner-types/DoPreview";
 import type { ErrorIssueDetail as RunnerErrorDetail } from "./runner-types/ErrorIssueDetail";
+import type { GitBranch } from "./runner-types/GitBranch";
+import type { GitCommitDetail } from "./runner-types/GitCommitDetail";
+import type { GitCompare } from "./runner-types/GitCompare";
+import type { GitLog } from "./runner-types/GitLog";
+import type { GitRefs } from "./runner-types/GitRefs";
 import type { GitRemote as RunnerGitRemote } from "./runner-types/GitRemote";
 import type { LimitsView as RunnerLimits } from "./runner-types/LimitsView";
+import type { PrComment } from "./runner-types/PrComment";
+import type { PrDetail } from "./runner-types/PrDetail";
+import type { PrList } from "./runner-types/PrList";
 import type { R2File } from "./runner-types/R2File";
 import type { R2Preview } from "./runner-types/R2Preview";
+import type { SourceBundle as RunnerSourceBundle } from "./runner-types/SourceBundle";
 import type { SourceCommitBody } from "./runner-types/SourceCommitBody";
+import type { SourceTypes as RunnerSourceTypes } from "./runner-types/SourceTypes";
 import type { StorageItem } from "./runner-types/StorageItem";
 import type { TelemetryStatus as RunnerTelemetryStatus } from "./runner-types/TelemetryStatus";
 import type { TreeResponse as RunnerTree } from "./runner-types/TreeResponse";
@@ -56,7 +66,6 @@ export type { D1TableSchemaRaw } from "./runner-types/D1TableSchemaRaw";
 export type { D1WriteBody } from "./runner-types/D1WriteBody";
 export type { D1WriteOp } from "./runner-types/D1WriteOp";
 export type { Deploy as RunnerDeploy } from "./runner-types/Deploy";
-export type { DiffResponse as RunnerDiff } from "./runner-types/DiffResponse";
 export type { DoInstance } from "./runner-types/DoInstance";
 export type { DoPreview } from "./runner-types/DoPreview";
 export type { ErrorEventView as RunnerErrorEvent } from "./runner-types/ErrorEventView";
@@ -64,14 +73,34 @@ export type { ErrorIssueDetail as RunnerErrorDetail } from "./runner-types/Error
 export type { ErrorIssueList as RunnerErrorList } from "./runner-types/ErrorIssueList";
 export type { ErrorIssueView as RunnerErrorIssue } from "./runner-types/ErrorIssueView";
 export type { Frame as RunnerErrorFrame } from "./runner-types/Frame";
+// The forge wire types, generated from host::forge and host::git_identity.
+export type { Actor } from "./runner-types/Actor";
+export type { BranchRules } from "./runner-types/BranchRules";
+export type { GitBranch } from "./runner-types/GitBranch";
+export type { GitCommitDetail } from "./runner-types/GitCommitDetail";
+export type { GitCommitSummary } from "./runner-types/GitCommitSummary";
+export type { GitCompare } from "./runner-types/GitCompare";
+export type { GitFileStat } from "./runner-types/GitFileStat";
+export type { GitFileStatus } from "./runner-types/GitFileStatus";
+export type { GitLog } from "./runner-types/GitLog";
+export type { GitRefs } from "./runner-types/GitRefs";
 export type { GitRemote as RunnerGitRemote } from "./runner-types/GitRemote";
 export type { LimitsView as RunnerLimits } from "./runner-types/LimitsView";
+export type { PrComment } from "./runner-types/PrComment";
+export type { PrCounts } from "./runner-types/PrCounts";
+export type { PrDetail } from "./runner-types/PrDetail";
+export type { PrList } from "./runner-types/PrList";
+export type { PrReview } from "./runner-types/PrReview";
+export type { PrSummary } from "./runner-types/PrSummary";
 export type { R2File } from "./runner-types/R2File";
 export type { R2Folder } from "./runner-types/R2Folder";
 export type { R2Object } from "./runner-types/R2Object";
 export type { R2Preview } from "./runner-types/R2Preview";
+export type { SourceBundle as RunnerSourceBundle } from "./runner-types/SourceBundle";
 export type { SourceCommitBody } from "./runner-types/SourceCommitBody";
 export type { SourceCommitFile } from "./runner-types/SourceCommitFile";
+export type { SourceFile } from "./runner-types/SourceFile";
+export type { SourceTypes as RunnerSourceTypes } from "./runner-types/SourceTypes";
 export type { StorageItem } from "./runner-types/StorageItem";
 export type { TelemetryEvent as RunnerTelemetryEvent } from "./runner-types/TelemetryEvent";
 export type { TelemetryStatus as RunnerTelemetryStatus } from "./runner-types/TelemetryStatus";
@@ -274,17 +303,40 @@ export const runnerTelemetrySet = (enabled: boolean) =>
 
 export const runnerListApps = () => runnerRpc<RunnerApp[]>("apps.list", {});
 
+/** Where a new app's content comes from, as the runner's `apps.create` takes
+ * it (A2/A3). `blank` is the empty repo. A `git` source is the one the runner
+ * allowlists to `https://github.com/<owner>/<repo>` and imports in the
+ * background; `squash` collapses a template's history into one initial commit
+ * authored as `actor`. */
+export type RunnerCreateSource =
+  | { kind: "blank" }
+  | {
+      actor: { name: string; userId: string };
+      kind: "git";
+      ref?: string;
+      squash?: boolean;
+      url: string;
+    };
+
 export const runnerCreateApp = (body: {
   name: string;
   slug: string;
+  source?: RunnerCreateSource;
   userId: string;
 }) =>
   runnerRpc<RunnerApp>("apps.create", {
     name: body.name,
     slug: body.slug,
-    // The runner's RPC params are snake_case.
+    // `source` is camelCase JSON (undefined keys never reach the wire), the
+    // rest of the params are snake_case.
+    source: body.source,
     user_id: body.userId,
   });
+
+/** Retry the import an app was created from (A2): only meaningful when its
+ * stored source is an import and it is not already running. */
+export const runnerRetryImport = (id: string) =>
+  runnerRpc<RunnerApp>("apps.retry_import", { id });
 
 export const runnerGetApp = (id: string) =>
   runnerRpc<RunnerApp>("apps.get", { id });
@@ -362,17 +414,157 @@ export const runnerSetLimits = (
 export const runnerGitRemote = (id: string) =>
   runnerRpc<RunnerGitRemote>("git.remote", { id });
 
-// RunnerTree/Blob/Diff are generated from host::source::{TreeResponse,
-// BlobResponse, DiffResponse}.
+/** Branch tips with distance from `main`, plus the deployed sha. */
+export const runnerGitRefs = (id: string) =>
+  runnerRpc<GitRefs>("git.refs", { id });
 
-export const runnerSourceTree = (id: string) =>
-  runnerRpc<RunnerTree>("source.tree", { id });
+/** One page of history; `ref` defaults to `main`, `limit` to 50 (1..100). */
+export const runnerGitLog = (
+  id: string,
+  query: { ref?: string; path?: string; skip?: number; limit?: number } = {}
+) => runnerRpc<GitLog>("git.log", { id, ...query });
 
-export const runnerSourceBlob = (id: string, path: string) =>
-  runnerRpc<RunnerBlob>("source.blob", { id, path });
+/** One commit: metadata, body, per-file stats and the patch against its
+ * first parent (or the empty tree for a root commit). */
+export const runnerGitCommit = (id: string, sha: string) =>
+  runnerRpc<GitCommitDetail>("git.commit", { id, sha });
 
-export const runnerSourceDiff = (id: string) =>
-  runnerRpc<RunnerDiff>("source.diff", { id });
+/** `base..head` commits, the three-dot diff, and whether a squash merge
+ * would land cleanly. */
+export const runnerGitCompare = (id: string, base: string, head: string) =>
+  runnerRpc<GitCompare>("git.compare", { base, head, id });
+
+/** Create a branch at `from` (a ref or sha); 409 when it exists. */
+export const runnerGitBranchCreate = (id: string, name: string, from: string) =>
+  runnerRpc<GitBranch>("git.branch_create", { from, id, name });
+
+/** Delete a branch; `main` is refused. */
+export const runnerGitBranchDelete = (id: string, name: string) =>
+  runnerRpc<{ ok: boolean }>("git.branch_delete", { id, name });
+
+// Pull requests (F4). `actor` is `{userId, name}`; `role` is the caller's app
+// role, computed by the UI action and trusted by the runner for policy.
+
+export const runnerPrsList = (
+  id: string,
+  query: { state?: string; skip?: number; limit?: number } = {}
+) => runnerRpc<PrList>("prs.list", { id, ...query });
+
+export const runnerPrGet = (id: string, number: number) =>
+  runnerRpc<PrDetail>("prs.get", { id, number });
+
+export const runnerPrCreate = (
+  id: string,
+  body: {
+    actor: { name: string; userId: string };
+    base: string;
+    body?: string;
+    head: string;
+    title: string;
+  }
+) => runnerRpc<PrDetail>("prs.create", { id, ...body });
+
+export const runnerPrUpdate = (
+  id: string,
+  number: number,
+  body: {
+    actor: { name: string; userId: string };
+    body?: string;
+    role: string;
+    state?: string;
+    title?: string;
+  }
+) => runnerRpc<PrDetail>("prs.update", { id, number, ...body });
+
+export const runnerPrComment = (
+  id: string,
+  number: number,
+  body: {
+    actor: { name: string; userId: string };
+    body: string;
+    commitSha?: string;
+    line?: number;
+    path?: string;
+    role: string;
+    side?: string;
+  }
+) => runnerRpc<PrComment>("prs.comment", { id, number, ...body });
+
+export const runnerPrCommentEdit = (
+  id: string,
+  commentId: string,
+  body: { actor: { name: string; userId: string }; body: string }
+) =>
+  runnerRpc<{ ok: boolean }>("prs.comment_edit", {
+    actor: body.actor,
+    body: body.body,
+    commentId,
+    id,
+  });
+
+export const runnerPrCommentDelete = (
+  id: string,
+  commentId: string,
+  body: { actor: { name: string; userId: string }; role: string }
+) =>
+  runnerRpc<{ ok: boolean }>("prs.comment_delete", {
+    commentId,
+    id,
+    ...body,
+  });
+
+export const runnerPrReview = (
+  id: string,
+  number: number,
+  body: {
+    actor: { name: string; userId: string };
+    role: string;
+    state: "approved" | "changes_requested";
+  }
+) => runnerRpc<PrDetail>("prs.review", { id, number, ...body });
+
+export const runnerPrMerge = (
+  id: string,
+  number: number,
+  body: {
+    actor: { name: string; userId: string };
+    authorName?: string;
+    deleteBranch?: boolean;
+    message?: string;
+    role: string;
+    title?: string;
+  }
+) => runnerRpc<PrDetail>("prs.merge", { id, number, ...body });
+
+export const runnerBranchRulesGet = (id: string) =>
+  runnerRpc<BranchRules>("branch_rules.get", { id });
+
+export const runnerBranchRulesSet = (
+  id: string,
+  body: { requirePr: boolean; requiredApprovals: number }
+) => runnerRpc<BranchRules>("branch_rules.set", { id, ...body });
+
+// RunnerTree/Blob are generated from host::source::{TreeResponse,
+// BlobResponse}. `ref` (branch, tag or sha) selects what to browse; absent
+// keeps the deployed-sha resolution.
+
+export const runnerSourceTree = (id: string, ref?: string) =>
+  runnerRpc<RunnerTree>("source.tree", { id, ref });
+
+export const runnerSourceBlob = (id: string, path: string, ref?: string) =>
+  runnerRpc<RunnerBlob>("source.blob", { id, path, ref });
+
+// RunnerSourceBundle/SourceFile/SourceTypes are generated from
+// host::source::{SourceBundle, SourceFile} and host::source_types::SourceTypes.
+// The bundle is the repo's own text sources at `ref` (capped, `truncated`
+// marks a capped read); the types are the declaration files captured from the
+// app's last successful build (`sha: null` until one lands).
+
+export const runnerSourceBundle = (id: string, ref?: string) =>
+  runnerRpc<RunnerSourceBundle>("source.bundle", { id, ref });
+
+export const runnerSourceTypes = (id: string) =>
+  runnerRpc<RunnerSourceTypes>("source.types", { id });
 
 // RunnerMetric/Span/Device/Path/Ref/Event/UserProps/Insight are generated
 // from the models::App*Stat rows, models::AppEvent, AppUserProps and

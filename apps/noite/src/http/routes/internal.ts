@@ -3,7 +3,9 @@ import * as Schema from "effect/Schema";
 import { authFromEnv, MissingAuthSecretError } from "../../lib/auth";
 import { requireAppRoleBySlug } from "../../lib/collaborators";
 import { ensureDbPromise } from "../../lib/db";
+import { errorMessage } from "../../lib/errors";
 import { parseAppRole } from "../../lib/roles";
+import { createAppForUser, slugError } from "../../lib/server/apps.server";
 import {
   findRecoveryEmail,
   RECOVERY_CODE_TTL_SECONDS,
@@ -107,7 +109,62 @@ const GitAuthBody = Schema.Struct({
   slug: Schema.String,
 });
 
-/** Runner → UI: verify profile API key + collaborator role for a slug. */
+/** A5 push-to-create: the runner asks with `need=create` on a receive-pack for
+ * a slug nobody owns yet. The verified key's account gets the app through the
+ * very same create path the create action uses (name = slug, blank source,
+ * admin grant), so the pusher becomes its admin.
+ *
+ * An invalid or reserved slug is a plain 404 — the same answer as any unknown
+ * repo — and the account's app limit is a 403 whose text the pusher reads as a
+ * `remote:` line. A slug taken between our read and the insert (two first
+ * pushes at once) re-reads the app: the pusher may push if it turned out to be
+ * theirs, and sees the 404 otherwise. */
+const gitAuthCreate = async (
+  userId: string,
+  slug: string
+): Promise<Response> => {
+  const notFound = Response.json(
+    { error: "repository not found", ok: false },
+    { status: 404 }
+  );
+  if (slugError(slug)) {
+    return notFound;
+  }
+  try {
+    const app = await createAppForUser({
+      account: { id: userId, name: slug },
+      name: slug,
+      slug,
+    });
+    return Response.json({ appId: app.id, ok: true, role: "admin", userId });
+  } catch (error) {
+    const message = errorMessage(error);
+    if (message.includes("already taken")) {
+      const access = await requireAppRoleBySlug(slug, userId, "admin").catch(
+        () => null
+      );
+      if (!access) {
+        return notFound;
+      }
+      return Response.json({
+        appId: access.app.id,
+        ok: true,
+        role: access.role,
+        userId,
+      });
+    }
+    if (message.includes("app limit reached")) {
+      // Strip the runner RPC envelope ("runner rpc apps.create: 409 …") so the
+      // pusher reads a sentence, not a status code.
+      const readable = message.replace(/^runner rpc \S+: \d+ /u, "");
+      return Response.json({ error: readable, ok: false }, { status: 403 });
+    }
+    throw error;
+  }
+};
+
+/** Runner → UI: verify profile API key + collaborator role for a slug, or
+ * create the app when the push names a slug nobody owns yet (A5). */
 export const handleGitAuth: RouteHandler = async (request, env) => {
   if (!runnerTokenOk(request, env)) {
     return new Response("unauthorized", { status: 401 });
@@ -122,7 +179,7 @@ export const handleGitAuth: RouteHandler = async (request, env) => {
   if (decoded._tag === "Failure") {
     return Response.json(
       {
-        error: "key, slug, and need (view|push|admin) required",
+        error: "key, slug, and need (view|push|admin|create) required",
         ok: false,
       },
       { status: 400 }
@@ -131,11 +188,12 @@ export const handleGitAuth: RouteHandler = async (request, env) => {
   // decodeUnknownResult yields { _tag: "Success", success } — not `.value`.
   const key = decoded.success.key.trim();
   const slug = decoded.success.slug.trim();
-  const need = parseAppRole(decoded.success.need?.trim() || "push");
-  if (!(key && slug && need)) {
+  const wanted = decoded.success.need?.trim() || "push";
+  const need = wanted === "create" ? null : parseAppRole(wanted);
+  if (!(key && slug && (need || wanted === "create"))) {
     return Response.json(
       {
-        error: "key, slug, and need (view|push|admin) required",
+        error: "key, slug, and need (view|push|admin|create) required",
         ok: false,
       },
       { status: 400 }
@@ -157,6 +215,16 @@ export const handleGitAuth: RouteHandler = async (request, env) => {
       );
     }
     const userId = verified.key.referenceId;
+    if (wanted === "create") {
+      return await gitAuthCreate(userId, slug);
+    }
+    // The create branch returned above, so `need` is the parsed role here.
+    if (!need) {
+      return Response.json(
+        { error: "need must be view, push, admin or create", ok: false },
+        { status: 400 }
+      );
+    }
     const access = await requireAppRoleBySlug(slug, userId, need);
     return Response.json({
       appId: access.app.id,

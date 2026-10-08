@@ -12,6 +12,7 @@ export const makeApp = (over: Partial<RunnerApp> = {}): RunnerApp => ({
   fleetBucket: "",
   gitPrefix: "",
   id: "app-1",
+  imported: false,
   internalPort: null,
   lastDeploySha: null,
   lastError: null,

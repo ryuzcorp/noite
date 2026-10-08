@@ -20,6 +20,46 @@ pub async fn set_deployed_config(
     Ok(())
 }
 
+/// Terminal state of a background import (A2): `provisioned` on success — the
+/// deploy pipeline takes over from there — or `error` with the message. Guarded
+/// on `status = 'importing'`, so a push that raced the import and already
+/// started a deploy is never clobbered. Returns the rows affected (0 = the
+/// import lost the race and its outcome is advisory only).
+pub async fn finish_app_import(
+    pool: &SqlitePool,
+    id: &str,
+    status: &str,
+    last_error: Option<&str>,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE app SET status = ?, last_error = ?, updated_at = ? \
+         WHERE id = ? AND status = 'importing'",
+    )
+    .bind(status)
+    .bind(last_error)
+    .bind(now_iso())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Record the `source` (JSON) an app was created from, so a failed import can
+/// be retried (A2). `None` clears it.
+pub async fn set_app_import_source(
+    pool: &SqlitePool,
+    id: &str,
+    source: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE app SET import_source = ?, updated_at = ? WHERE id = ?")
+        .bind(source)
+        .bind(now_iso())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn list_apps(pool: &SqlitePool) -> sqlx::Result<Vec<App>> {
     let sql = format!("SELECT {APP_COLS} FROM app ORDER BY created_at DESC");
     sqlx::query_as::<_, App>(&sql).fetch_all(pool).await

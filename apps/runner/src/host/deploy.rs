@@ -15,6 +15,7 @@ use crate::host::credentials;
 use crate::host::generated_config;
 use crate::host::logs::LogState;
 use crate::host::package_manager;
+use crate::host::source_types;
 use crate::host::supervisor::{self, ProcMap};
 use crate::lifecycle::{self, sha_same};
 use crate::models::{App, AppStatus, DeployStatus};
@@ -61,6 +62,16 @@ pub async fn snapshot_claimed(deploying: &Deploying) -> HashSet<String> {
     deploying.lock().await.clone()
 }
 
+/// Why a deploy runs. A tip deploy is deduped against the sha already live
+/// (the push fast-path and the reconcile poll can both fire for one push); an
+/// explicit one (rollback, redeploy) always builds, so redeploying the live
+/// sha rebuilds it — e.g. to capture package types for the editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeployTrigger {
+    Tip,
+    Explicit,
+}
+
 #[allow(clippy::too_many_arguments)] // shared deps threaded by reference; a context struct would only obfuscate this one call site
 pub async fn deploy_app(
     pool: &SqlitePool,
@@ -71,6 +82,7 @@ pub async fn deploy_app(
     app: App,
     object_key: &str,
     tip_sha: Option<&str>,
+    trigger: DeployTrigger,
 ) {
     if !claim(deploying, &app.id).await {
         tracing::info!(slug = %app.slug, "deploy skip (in flight)");
@@ -86,7 +98,7 @@ pub async fn deploy_app(
         id: None,
         step: "fetch",
     };
-    let result = deploy_inner(pool, cfg, procs, logs, &app, object_key, &mut progress).await;
+    let result = deploy_inner(pool, cfg, procs, logs, &app, object_key, &mut progress, trigger).await;
     if let Err(e) = &result {
         tracing::error!(slug = %app.slug, step = progress.step, error = %e, "deploy failed");
         if let Err(db_e) = progress.fail(e).await {
@@ -197,6 +209,7 @@ fn failure_summary(step: &str, detail: &str) -> String {
     format!("{step} failed: {line}")
 }
 
+#[allow(clippy::too_many_arguments)] // the deploy_app deps plus the trigger; same rationale as deploy_app
 async fn deploy_inner(
     pool: &SqlitePool,
     cfg: &Config,
@@ -205,6 +218,7 @@ async fn deploy_inner(
     app: &App,
     object_key: &str,
     progress: &mut Progress<'_>,
+    trigger: DeployTrigger,
 ) -> anyhow::Result<()> {
     let commit_sha = progress
         .sha
@@ -218,13 +232,15 @@ async fn deploy_inner(
     progress.sha = Some(commit_sha.clone());
 
     // Dedupe: webhook + tip-poll can both fire; claim serializes, re-read sha.
+    // An explicit deploy of the live sha is a rebuild and runs.
     let Some(fresh) = db::get_app(pool, &app.id).await? else {
         anyhow::bail!("app {} gone before deploy (deleted?)", app.id);
     };
-    if fresh
-        .last_deploy_sha
-        .as_deref()
-        .is_some_and(|s| sha_same(s, &commit_sha))
+    if trigger == DeployTrigger::Tip
+        && fresh
+            .last_deploy_sha
+            .as_deref()
+            .is_some_and(|s| sha_same(s, &commit_sha))
     {
         tracing::info!(
             slug = %app.slug,
@@ -664,8 +680,39 @@ async fn deploy_inner(
         .log(DeployStatus::Success, "deploy complete\n")
         .await?;
     tracing::info!(slug = %app.slug, sha = %&commit_sha[..12.min(commit_sha.len())], "deploy ok");
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    // The app is live: status, fleet and reload are all done above, so the
+    // declaration capture for the code editor and the worktree wipe run
+    // detached. Nothing that waits on this deploy — the app lock, the next
+    // push, a delete — is held open by the walk, and the worktree is only
+    // dropped once the capture has read it.
+    tokio::spawn(capture_and_wipe(
+        source_types::store_path(cfg, &app.slug),
+        src_dir,
+        work,
+        app.slug.clone(),
+        commit_sha.clone(),
+    ));
     Ok(())
+}
+
+/// Capture the built tree's declarations (`host::source_types`), then drop the
+/// build worktree they came from. Best-effort by contract: a failure keeps the
+/// previous capture and only costs the next deploy.
+async fn capture_and_wipe(
+    store: PathBuf,
+    worktree: PathBuf,
+    work: PathBuf,
+    slug: String,
+    sha: String,
+) {
+    let short = &sha[..12.min(sha.len())];
+    match source_types::capture(&store, &worktree, &sha).await {
+        Ok(files) => tracing::debug!(slug = %slug, files, sha = %short, "types captured"),
+        Err(e) => {
+            tracing::warn!(slug = %slug, error = %format!("{e:#}"), "types capture failed; keeping previous capture");
+        }
+    }
+    let _ = tokio::fs::remove_dir_all(&work).await;
 }
 
 async fn materialize_bundle(
@@ -951,6 +998,7 @@ pub async fn deploy_tip(
         app,
         &tip.key,
         Some(&tip.sha),
+        DeployTrigger::Tip,
     )
     .await;
 }
@@ -958,8 +1006,8 @@ pub async fn deploy_tip(
 #[cfg(test)]
 mod tests {
     use super::{
-        contained_deploy_root, failure_summary, has_build_script, parse_wrangler_build,
-        without_runner_keys,
+        capture_and_wipe, contained_deploy_root, failure_summary, has_build_script,
+        parse_wrangler_build, without_runner_keys,
     };
     use serde_json::json;
 
@@ -1052,5 +1100,38 @@ mod tests {
             failure_summary("deploy", "celld deploy timed out\nsomething"),
             "deploy failed: celld deploy timed out"
         );
+    }
+
+    /// The detached end-of-deploy step: the capture lands in the store and the
+    /// worktree it read is gone afterwards (never the other way round).
+    #[tokio::test]
+    async fn capture_and_wipe_stores_declarations_then_drops_the_worktree() {
+        let base =
+            std::env::temp_dir().join(format!("noite-capture-wipe-{}", crate::models::new_id()));
+        let work = base.join("build");
+        let worktree = work.join("src");
+        std::fs::create_dir_all(worktree.join("node_modules/dep")).unwrap();
+        std::fs::write(worktree.join("node_modules/dep/index.d.ts"), "export {};\n").unwrap();
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = base.join("work").to_string_lossy().into_owned();
+        let store = crate::host::source_types::store_path(&cfg, "wipe");
+
+        capture_and_wipe(store.clone(), worktree, work, "wipe".into(), "abc123".into()).await;
+        assert!(store.exists(), "the capture landed");
+        assert!(!base.join("build").exists(), "the worktree is wiped");
+
+        let stored = crate::host::source_types::read(&cfg, "wipe")
+            .await
+            .expect("read capture");
+        assert_eq!(stored.sha.as_deref(), Some("abc123"));
+        assert_eq!(
+            stored
+                .files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            ["node_modules/dep/index.d.ts"]
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
