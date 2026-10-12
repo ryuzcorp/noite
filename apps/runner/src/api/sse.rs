@@ -32,7 +32,11 @@ where
         loop {
             if let Some(data) = snapshot().await {
                 if last.as_ref() != Some(&data) {
-                    if tx.send(Ok(Event::default().data(data.clone()))).await.is_err() {
+                    if tx
+                        .send(Ok(Event::default().data(data.clone())))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                     last = Some(data);

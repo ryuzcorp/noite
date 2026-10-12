@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   completionRemainder,
+  diagnosticMessagesAtOffset,
   diagnosticsToMarkers,
   isScriptFile,
   lineStarts,
@@ -107,6 +108,37 @@ describe("diagnosticsToMarkers", () => {
       "unused\n"
     );
     expect(marker?.severity).toBe("warning");
+  });
+});
+
+describe("diagnosticMessagesAtOffset", () => {
+  test("keeps every diagnostic covering the offset, in order", () => {
+    expect(
+      diagnosticMessagesAtOffset(
+        [
+          diagnostic(4, 8, { code: 2322 }),
+          diagnostic(6, 7, { code: 2345, message: "Broken type" }),
+        ],
+        6
+      )
+    ).toEqual([
+      "TS2322: Type 'string' is not assignable to type 'number'.",
+      "TS2345: Broken type",
+    ]);
+  });
+
+  test("covers a zero-width diagnostic at the offset, like the squiggle", () => {
+    const messages = diagnosticMessagesAtOffset(
+      [diagnostic(4, 4, { code: 1005 })],
+      4
+    );
+    expect(messages).toEqual([
+      "TS1005: Type 'string' is not assignable to type 'number'.",
+    ]);
+  });
+
+  test("returns nothing outside every range", () => {
+    expect(diagnosticMessagesAtOffset([diagnostic(4, 8)], 9)).toEqual([]);
   });
 });
 

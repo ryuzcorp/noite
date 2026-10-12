@@ -7,8 +7,9 @@
  */
 import { atom, watch } from "ilha";
 
+import { errorMessage } from "../errors";
 import { collectRef, newLiveRef, whenLive } from "../live-ref";
-import { CURATED_SHIKI_LANGS } from "../shiki-langs";
+import { CURATED_SHIKI_LANGS, curatedLang } from "../shiki-langs";
 
 const THEME = { dark: "pierre-dark", light: "pierre-light" } as const;
 
@@ -46,12 +47,6 @@ interface DiffsModule {
     themes: string[];
   }) => Promise<void>;
 }
-
-/** A highlight language for `name`, capped to the curated set. */
-const langFor = (diffs: DiffsModule, name: string): string => {
-  const lang = diffs.getFiletypeFromFileName(name);
-  return CURATED_SHIKI_LANGS.includes(lang) ? lang : "text";
-};
 
 /** Fill the host and stretch the content-sized diff to the pane height. */
 const PANE_CSS = `
@@ -98,9 +93,8 @@ const PierreDiffs = ({
       // SAFETY: import() resolves the installed @pierre/diffs, which structurally matches DiffsModule.
       // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- vendor types drift from the minimal local interfaces; unknown bridges them.
       diffs = (await import("@pierre/diffs")) as unknown as DiffsModule;
-    } catch {
-      pane.textContent =
-        "@pierre/diffs not installed — run `bun install` in apps/noite";
+    } catch (error) {
+      pane.textContent = `The diff viewer failed to load: ${errorMessage(error)}. Reload the page to retry.`;
       return;
     }
     if (signal.aborted) {
@@ -165,7 +159,7 @@ export const DiffView = ({
           // oxlint-disable-next-line anti-slop/no-runtime-typeof -- parsed patch filenames are untyped vendor data; the string check keeps non-file entries on plain text.
           const name = typeof fileDiff.name === "string" ? fileDiff.name : null;
           if (name !== null && fileDiff.lang === undefined) {
-            fileDiff.lang = langFor(diffs, name);
+            fileDiff.lang = curatedLang(name, diffs.getFiletypeFromFileName);
           }
           return fileDiff;
         })
@@ -186,7 +180,7 @@ export const DraftDiffView = ({
     emptyLabel={emptyLabel}
     entries={(diffs) =>
       files.map(({ after, before, path }) => {
-        const lang = langFor(diffs, path);
+        const lang = curatedLang(path, diffs.getFiletypeFromFileName);
         return diffs.parseDiffFromFile(
           { contents: before, lang, name: path },
           { contents: after, lang, name: path }

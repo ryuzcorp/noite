@@ -194,7 +194,9 @@ pub fn build_event(facts: &Facts) -> TelemetryEvent {
             apps_sleeping: facts.apps_sleeping,
             deploys_24h: facts.deploys_24h,
             deploys_failed_24h: facts.deploys_failed_24h,
-            users: facts.users.map_or_else(|| "unknown".to_string(), |n| users_bucket(n).to_string()),
+            users: facts
+                .users
+                .map_or_else(|| "unknown".to_string(), |n| users_bucket(n).to_string()),
             install_age_days: facts.install_age_days,
             uptime_hours: facts.uptime_hours,
             geoip_disable: true,
@@ -326,7 +328,9 @@ pub async fn run_scheduler(pool: SqlitePool, cfg: Arc<Config>, started_at: DateT
                         let event = build_event(&facts);
                         match send(&client, &event).await {
                             Ok(()) => record_sent(&pool, now).await,
-                            Err(e) => tracing::debug!(error = %e, "instance heartbeat send failed; retrying next tick"),
+                            Err(e) => {
+                                tracing::debug!(error = %e, "instance heartbeat send failed; retrying next tick")
+                            }
                         }
                     }
                     Err(e) => tracing::warn!(error = %e, "instance heartbeat: facts"),
@@ -442,7 +446,10 @@ mod tests {
             "past the window is due"
         );
         assert!(!should_send(now, Some(hours(23)), true, false), "too soon");
-        assert!(!should_send(now, Some(hours(1)), true, false), "much too soon");
+        assert!(
+            !should_send(now, Some(hours(1)), true, false),
+            "much too soon"
+        );
         assert!(!should_send(now, None, false, false), "opt-out never sends");
         assert!(!should_send(now, None, true, true), "locked never sends");
         // The lock beats a due window.
@@ -480,10 +487,7 @@ mod tests {
             }
         });
         assert_eq!(value, expected);
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value).expect("pretty")
-        );
+        println!("{}", serde_json::to_string_pretty(&value).expect("pretty"));
     }
 
     /// An unreachable control worker must not turn into a count.
@@ -506,15 +510,20 @@ mod tests {
             assert!(!due(&pool, &cfg, now).await.expect("due"));
 
             cfg.base_domain = "noite.now".to_string();
-            assert!(due(&pool, &cfg, now).await.expect("due"), "never sent, open");
+            assert!(
+                due(&pool, &cfg, now).await.expect("due"),
+                "never sent, open"
+            );
 
-            let recent = (now - chrono::Duration::hours(2)).to_rfc3339_opts(SecondsFormat::Millis, true);
+            let recent =
+                (now - chrono::Duration::hours(2)).to_rfc3339_opts(SecondsFormat::Millis, true);
             db::set_setting(&pool, db::TELEMETRY_LAST_SENT_AT, &recent)
                 .await
                 .expect("last sent");
             assert!(!due(&pool, &cfg, now).await.expect("due"), "sent 2 h ago");
 
-            let old = (now - chrono::Duration::hours(25)).to_rfc3339_opts(SecondsFormat::Millis, true);
+            let old =
+                (now - chrono::Duration::hours(25)).to_rfc3339_opts(SecondsFormat::Millis, true);
             db::set_setting(&pool, db::TELEMETRY_LAST_SENT_AT, &old)
                 .await
                 .expect("last sent");

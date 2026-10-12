@@ -3,7 +3,7 @@ title: Tenancy
 description: NOITE_TENANCY decides whether other people may push code — multi runs tenant code sandboxed, single is just you.
 ---
 
-`NOITE_TENANCY` decides whether other people may push code to the install. Unset, it is `multi` off `localhost` and `single` on `localhost`.
+`NOITE_TENANCY` decides whether other people may push code to the install. Unset, it is `multi` off a `localhost` base, `single` on.
 
 - **`multi`**: tenant builds and release commands run as the app's own unprivileged uid (one uid per app, from a reserved range) with a cleared environment (no platform secret reaches them), tenant fleets as the `fleet` user, and an nftables policy on those uids closes new connections to loopback, private ranges and cloud metadata. The one private address allowed is the object store the fleet's own celld needs; Worker code can reach it but holds no keys. `/data` is private to the runner. Release commands are skipped until scoped per-app bucket keys exist ([what that means](#what-multi-does-and-does-not-promise-alpha)). All of this needs `NET_ADMIN`, `SETUID`, `SETGID` and `CHOWN`, which `docker/compose.yaml` grants; without them the runner keeps `/ready` at 503 with the reason and refuses builds.
 - **`single`**: only you push code. No egress policy, and release commands run with the root bucket keys.

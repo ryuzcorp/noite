@@ -14,12 +14,12 @@ use anyhow::Context;
 
 use crate::config::Config;
 use crate::db;
-use crate::host::{exec, s3};
 use crate::host::deploy::{self, Deploying};
 use crate::host::logs::LogState;
 use crate::host::source;
 use crate::host::source_types;
 use crate::host::supervisor::{self, ProcMap};
+use crate::host::{exec, s3};
 use crate::models::App;
 
 async fn move_dir(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> {

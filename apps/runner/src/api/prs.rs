@@ -133,7 +133,13 @@ pub async fn create_pr(
     Json(body): Json<CreateBody>,
 ) -> impl IntoResponse {
     service::prs::create(
-        &state, &id, &body.actor, &body.title, &body.body, &body.base, &body.head,
+        &state,
+        &id,
+        &body.actor,
+        &body.title,
+        &body.body,
+        &body.base,
+        &body.head,
     )
     .await
     .map(Json)

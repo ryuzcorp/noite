@@ -1,0 +1,26 @@
+diff --git a/dist/__nodepod_bridge__.js b/dist/__nodepod_bridge__.js
+index ab67beac15ca747dbc0014f62ef4d4f657393f97..940b7e78627022da08d7437e2a55faf37eb5eee1 100644
+--- a/dist/__nodepod_bridge__.js
++++ b/dist/__nodepod_bridge__.js
+@@ -229,6 +229,21 @@
+       scope: "/",
+       updateViaCache: "none",
+     });
++    // A preview origin reused across pod boots still has the previous boot's
++    // worker active (its script URL carries the old instance id) while the
++    // new one installs; `ready` would hand back the old one. Wait for the
++    // worker this call registered to activate.
++    const pending = registration.installing || registration.waiting;
++    if (pending && pending.state !== "activated") {
++      await new Promise((resolve, reject) => {
++        pending.addEventListener("statechange", () => {
++          if (pending.state === "activated") resolve();
++          if (pending.state === "redundant") {
++            reject(new Error("Preview service worker failed to install"));
++          }
++        });
++      });
++    }
+     await navigator.serviceWorker.ready;
+     const worker = registration.active || navigator.serviceWorker.controller;
+     if (!worker) throw new Error("Preview service worker has no active worker");

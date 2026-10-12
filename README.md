@@ -58,7 +58,7 @@ curl -fsSLO https://raw.githubusercontent.com/ryuzcorp/noite/main/docker/compose
 docker compose up -d
 ```
 
-Open http://localhost:9080. Apps are served at `http://<slug>.localhost:9080`.
+Open http://noite.localhost:9080. Apps are served at `http://<slug>.noite.localhost:9080`.
 
 ### Deploy your first app
 
@@ -152,11 +152,13 @@ make e2e      # image + doctor + Playwright; make e2e-isolation for multi-tenant
 make help     # everything else: backup, restore, down, nuke
 ```
 
-| URL                            |               |
-| ------------------------------ | ------------- |
-| http://localhost:9080          | control UI    |
-| http://api.localhost:9080      | runner API    |
-| `http://<slug>.localhost:9080` | deployed apps |
+| URL                                  |               |
+| ------------------------------------ | ------------- |
+| http://noite.localhost:9080          | control UI    |
+| http://api.noite.localhost:9080      | runner API    |
+| `http://<slug>.noite.localhost:9080` | deployed apps |
+
+The dev base is `noite.localhost`, never bare `localhost`: the control UI and every app and preview host then share one registrable domain, so the workspace frame's IndexedDB and service workers are same-site. Browsers resolve every `*.localhost` host to loopback and treat it as a secure context.
 
 | Path |  |
 | --- | --- |
@@ -182,7 +184,7 @@ portless alias noite 9080 # the route lives in ~/.portless and survives restarts
 sudo firewall-cmd --permanent --add-service=https && sudo firewall-cmd --reload
 ```
 
-Set `BETTER_AUTH_URL=https://noite.local` in `.env`. Passkeys bind to that origin, so the laptop and the phone share one credential namespace; with the `.env.example` default (`http://localhost:9080`), a phone registering on `noite.local` fails with an rpID mismatch. In dev, `vite dev` passes the container's environment to the worker, so `.env` is the only source needed (a hand-written `apps/noite/.dev.vars` still overrides it).
+Set `BETTER_AUTH_URL=https://noite.local` in `.env`. Passkeys bind to that origin, so the laptop and the phone share one credential namespace; with the `.env.example` default (`http://noite.localhost:9080`), a phone registering on `noite.local` fails with an rpID mismatch. In dev, `vite dev` passes the container's environment to the worker, so `.env` is the only source needed (a hand-written `apps/noite/.dev.vars` still overrides it).
 
 Per boot:
 
@@ -193,10 +195,11 @@ portless proxy start --lan --https            # https://noite.local (accept sudo
 
 On the phone, install `~/.portless/ca.pem` as a trusted CA (iOS: open the file, install the profile, enable full trust; Android: Security → install CA certificate), open `https://noite.local`, and register a **fresh** passkey: `localhost` credentials never transfer. Android often can't resolve mDNS `.local` names; iOS works. `portless list` shows routes and `portless proxy stop` stops the proxy.
 
-Tenant apps work the same way: with `CONTROL_EXTRA_HOSTS=noite.local` the runner also serves `<slug>.noite.local`, and one alias per app wires DNS on both machines:
+Tenant apps work the same way: with `CONTROL_EXTRA_HOSTS=noite.local` the runner also serves `<slug>.noite.local`, and one alias per app wires DNS on both machines. Code mode's Preview runs on the app's preview host under the same name, so add that alias too:
 
 ```bash
-portless alias test.noite 9080 # → https://test.noite.local
+portless alias test.noite 9080                # → https://test.noite.local
+portless alias app-0.preview.test.noite 9080  # → Code mode Preview for `test`
 ```
 
 </details>

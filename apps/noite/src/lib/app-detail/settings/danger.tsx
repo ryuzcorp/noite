@@ -8,6 +8,7 @@ import { appHost } from "../../apps/identity";
 import { errorMessage } from "../../errors";
 import { dropAppFromSnapshot } from "../../feeds";
 import { remove, renameApp } from "../../server/apps.server";
+import { confirmDialog } from "../../ui/confirm";
 import { Dialog } from "../../ui/dialog";
 import { SettingsSection } from "./section";
 
@@ -69,11 +70,13 @@ export const AppDangerZone = ({
   name,
   onSaved,
   slug,
+  subdomain,
 }: {
   appId: string;
   name: string;
   onSaved: () => void;
   slug: string;
+  subdomain: string;
 }) => {
   const dialogOpen = atom(false);
   const slugDraft = atom(slug);
@@ -81,6 +84,17 @@ export const AppDangerZone = ({
   const busy = atom(false);
   const notice = atom<string | null>(null);
   const slugError = (): string | null => slugValidationMessage(slugDraft());
+
+  /** The app's host under the drafted slug: the stored subdomain with its
+   * slug label replaced (a rename never moves the base domain), rebased onto
+   * the network this page is served from. */
+  const slugPreview = (): string =>
+    appHost(
+      subdomain.replace(
+        /^[^.]*/u,
+        () => slugDraft().trim().toLowerCase() || "\u2026"
+      )
+    );
 
   const saveSlug = async () => {
     if (busy()) {
@@ -138,12 +152,13 @@ export const AppDangerZone = ({
             type="button"
             class="btn btn-sm btn-error"
             onclick={async () => {
-              if (
-                // oxlint-disable-next-line no-alert -- native confirm dialog is the requirement for destructive deletes.
-                !window.confirm(
-                  `Delete ${name}? This removes the app, its git remote and its fleet.`
-                )
-              ) {
+              const ok = await confirmDialog({
+                confirmLabel: "Delete",
+                message:
+                  "This removes the app, its git remote and its fleet. This cannot be undone.",
+                title: `Delete ${name}?`,
+              });
+              if (!ok) {
                 return;
               }
               try {
@@ -166,14 +181,10 @@ export const AppDangerZone = ({
           <h3 class="m-0 text-lg font-bold">Change slug?</h3>
           <p class="m-0 py-2 text-sm opacity-80">
             This renames the app everywhere: the app URL becomes{" "}
-            <code id="slug-preview">
-              {appHost(
-                `${slugDraft().trim().toLowerCase() || "\u2026"}.localhost`
-              )}
-            </code>{" "}
-            and the git origin moves to the new slug — update your local remote
-            (`git remote set-url`) and any bookmarks. The fleet keeps running;
-            deploys are blocked while the move completes.
+            <code id="slug-preview">{slugPreview()}</code> and the git origin
+            moves to the new slug — update your local remote (`git remote
+            set-url`) and any bookmarks. The fleet keeps running; deploys are
+            blocked while the move completes.
           </p>
           <fieldset class="fieldset w-full">
             <label class="label" for="slug-input">

@@ -8,15 +8,15 @@ use tokio::sync::Mutex;
 use crate::config::{Config, Tenancy};
 use crate::db;
 use crate::host::build_output;
-use crate::host::exec::{self, Sandbox};
-use crate::host::s3;
-use crate::host::tips::TipBundle;
 use crate::host::credentials;
+use crate::host::exec::{self, Sandbox};
 use crate::host::generated_config;
 use crate::host::logs::LogState;
 use crate::host::package_manager;
+use crate::host::s3;
 use crate::host::source_types;
 use crate::host::supervisor::{self, ProcMap};
+use crate::host::tips::TipBundle;
 use crate::lifecycle::{self, sha_same};
 use crate::models::{App, AppStatus, DeployStatus};
 use sqlx::SqlitePool;
@@ -98,7 +98,17 @@ pub async fn deploy_app(
         id: None,
         step: "fetch",
     };
-    let result = deploy_inner(pool, cfg, procs, logs, &app, object_key, &mut progress, trigger).await;
+    let result = deploy_inner(
+        pool,
+        cfg,
+        procs,
+        logs,
+        &app,
+        object_key,
+        &mut progress,
+        trigger,
+    )
+    .await;
     if let Err(e) = &result {
         tracing::error!(slug = %app.slug, step = progress.step, error = %e, "deploy failed");
         if let Err(db_e) = progress.fail(e).await {
@@ -353,7 +363,8 @@ async fn deploy_inner(
     // apps never share an identity, so neither can read the other's worktree
     // or cache. gid mirrors the uid (a group per app).
     let build_uid =
-        db::alloc::ensure_app_build_uid(pool, cfg.build_uid_base, cfg.build_uid_range, &app.id).await?;
+        db::alloc::ensure_app_build_uid(pool, cfg.build_uid_base, cfg.build_uid_range, &app.id)
+            .await?;
     let sandbox_ok = match build_uid {
         Some(u) => exec::can_drop_uid(u, u),
         None => false,
@@ -1116,7 +1127,14 @@ mod tests {
         cfg.work_dir = base.join("work").to_string_lossy().into_owned();
         let store = crate::host::source_types::store_path(&cfg, "wipe");
 
-        capture_and_wipe(store.clone(), worktree, work, "wipe".into(), "abc123".into()).await;
+        capture_and_wipe(
+            store.clone(),
+            worktree,
+            work,
+            "wipe".into(),
+            "abc123".into(),
+        )
+        .await;
         assert!(store.exists(), "the capture landed");
         assert!(!base.join("build").exists(), "the worktree is wiped");
 

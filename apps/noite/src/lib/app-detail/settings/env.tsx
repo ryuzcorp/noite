@@ -7,6 +7,7 @@ import { envVars } from "../../resources";
 import type { AppRole } from "../../roles";
 import { deleteEnv, envDotVars, setEnv } from "../../server/env.server";
 import type { EnvVarView } from "../../server/env.server";
+import { confirmDialog } from "../../ui/confirm";
 import { Dialog } from "../../ui/dialog";
 import { LoadError } from "../../ui/load-error";
 import { ListSkeleton } from "../../ui/skeletons";
@@ -188,21 +189,22 @@ export const EnvVarsPanel = ({
                     type="button"
                     class="btn btn-sm btn-ghost shrink-0"
                     disabled={busy()}
-                    onclick={() => {
-                      // oxlint-disable-next-line no-alert -- native confirm dialog is the requirement for destructive deletes.
-                      if (!confirm(`Delete ${r.name}?`)) {
+                    onclick={async () => {
+                      const ok = await confirmDialog({
+                        confirmLabel: "Delete",
+                        title: `Delete ${r.name}?`,
+                      });
+                      if (!ok) {
                         return;
                       }
                       busy.set(true);
-                      void (async () => {
-                        try {
-                          await deleteEnv({ appId, name: r.name });
-                          await reload();
-                        } catch (error) {
-                          err.set(errorMessage(error));
-                        }
-                        busy.set(false);
-                      })();
+                      try {
+                        await deleteEnv({ appId, name: r.name });
+                        await reload();
+                      } catch (error) {
+                        err.set(errorMessage(error));
+                      }
+                      busy.set(false);
                     }}
                   >
                     Delete

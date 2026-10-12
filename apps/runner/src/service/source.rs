@@ -99,6 +99,26 @@ pub async fn blob(
     serde_json::to_value(blob).map_err(|e| ApiError::internal(e.to_string()))
 }
 
+/// The `source.archive` target, with the Workspace caps already checked from
+/// the tree listing: an over-cap repo is a 413, an unknown ref a 404. The
+/// caller streams `git archive` from the returned mirror + rev.
+pub async fn archive_target(
+    state: &AppState,
+    id: &str,
+    reference: Option<&str>,
+) -> Result<(PathBuf, String), ApiError> {
+    let (_app, bare, rev) = app_with_rev(state, id, reference).await?;
+    source::archive_guard(&bare, &rev).await.map_err(|e| {
+        let msg = format!("{e:#}");
+        if msg.contains("too large") {
+            ApiError::too_large(msg)
+        } else {
+            ApiError::from_anyhow(e)
+        }
+    })?;
+    Ok((bare, rev))
+}
+
 /// `source.types`: the declaration files captured from the app's last
 /// successful build (`host::source_types`). Nothing captured yet is the empty
 /// payload (`sha: null`, no files), not an error.
@@ -110,24 +130,45 @@ pub async fn types(state: &AppState, id: &str) -> Result<serde_json::Value, ApiE
     serde_json::to_value(types).map_err(|e| ApiError::internal(e.to_string()))
 }
 
-/// One browser-edited file: validated path + text content.
+/// One browser-edited file: validated path + content, text or a base64
+/// upload (`encoding` absent means `utf8`).
 #[derive(serde::Deserialize, ts_rs::TS)]
 #[ts(export)]
 pub struct SourceCommitFile {
     pub path: String,
     pub content: String,
+    #[serde(default)]
+    #[ts(optional)]
+    pub encoding: Option<web_commit::WebEncoding>,
 }
 
-/// Browser-edit commit body: validated paths + text contents, a short
-/// message, the session user the commit is attributed to, and — when the UI
-/// commits to something other than `main` — the target branch, plus the ref a
-/// new branch starts from.
+/// One browser file move: the blob at `from` is re-pointed at `to` without
+/// reading it.
+#[derive(serde::Deserialize, ts_rs::TS)]
+#[ts(export)]
+pub struct SourceCommitMove {
+    pub from: String,
+    pub to: String,
+}
+
+/// Browser-edit commit body: validated paths + text contents, the file moves
+/// and the paths to delete, a short message, the session user the commit is
+/// attributed to, and — when the UI commits to something other than `main` —
+/// the target branch, plus the ref a new branch starts from.
 #[derive(serde::Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct SourceCommitBody {
     pub actor: git_identity::Actor,
     pub files: Vec<SourceCommitFile>,
+    /// File moves; absent or empty means none.
+    #[serde(default)]
+    #[ts(as = "Option<Vec<SourceCommitMove>>", optional)]
+    pub moves: Vec<SourceCommitMove>,
+    /// Paths to delete; absent or empty means none.
+    #[serde(default)]
+    #[ts(as = "Option<Vec<String>>", optional)]
+    pub deletes: Vec<String>,
     pub message: String,
     #[serde(default)]
     #[ts(optional)]
@@ -155,6 +196,10 @@ fn commit_error(e: anyhow::Error) -> ApiError {
         || msg.contains("bad path")
         || msg.contains("exceeds ")
         || msg.contains("looks binary")
+        || msg.contains("both written and deleted")
+        || msg.contains("invalid move")
+        || msg.contains("already exists")
+        || msg.contains("not valid base64")
         || msg.contains("invalid branch")
         || msg.contains("invalid ref")
     {
@@ -184,12 +229,21 @@ pub async fn commit(
         }
     }
     let actor = git_identity::noreply(&state.config, &body.actor.user_id, &body.actor.name);
-    let files: Vec<web_commit::WebFile> = body
-        .files
-        .iter()
-        .map(|f| web_commit::WebFile {
+    let mut files: Vec<web_commit::WebFile> = Vec::with_capacity(body.files.len());
+    for f in &body.files {
+        let encoding = f.encoding.unwrap_or(web_commit::WebEncoding::Utf8);
+        let content = encoding.decode(&f.path, &f.content).map_err(commit_error)?;
+        files.push(web_commit::WebFile {
             path: f.path.clone(),
-            content: f.content.clone(),
+            content,
+        });
+    }
+    let moves: Vec<web_commit::WebMove> = body
+        .moves
+        .iter()
+        .map(|m| web_commit::WebMove {
+            from: m.from.clone(),
+            to: m.to.clone(),
         })
         .collect();
     let sha = web_commit::web_commit(
@@ -197,7 +251,11 @@ pub async fn commit(
         &app,
         &actor,
         &body.message,
-        &files,
+        web_commit::WebChanges {
+            files: &files,
+            moves: &moves,
+            deletes: &body.deletes,
+        },
         body.branch.as_deref(),
         body.from_sha.as_deref(),
     )

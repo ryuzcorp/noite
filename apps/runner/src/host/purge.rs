@@ -9,11 +9,11 @@ use std::time::Duration;
 use anyhow::Context;
 
 use crate::config::Config;
-use crate::host::{exec, s3};
 use crate::host::logs::{self, LogState};
 use crate::host::source;
 use crate::host::source_types;
 use crate::host::supervisor::{self, ProcMap};
+use crate::host::{exec, s3};
 
 /// Wipe every on-disk and S3 artifact for `slug`. Does **not** touch the DB row
 /// — callers decide when to delete that (after a successful purge).

@@ -2,12 +2,13 @@
 
 import { atom } from "ilha";
 
+import { formatBytes } from "../../bytes";
 import { formatAgo, formatDateTime } from "../../dates";
 import { r2DownloadUrl } from "../../runner";
 import type { R2Object } from "../../runner";
 import { CopyButton } from "../../ui/copy-button";
 import { Download, Trash } from "../../ui/icons";
-import { DetailPanel, formatBytes, previewKind } from "../shared";
+import { DetailPanel, previewKind } from "../shared";
 import { R2TextPreview } from "./preview";
 
 /** Delete control for one object: two steps, inline (no browser dialog). */

@@ -22,10 +22,12 @@ export const hydrateControlEnv = (
   }
   // Dev-process fallback only (vite dev has no compose env for the worker).
   // Prod values always arrive via compose environment / cloudflare.config.ts vars /
-  // deploy env — never rely on these outside localhost dev. The control
-  // plane only talks to the runner; it holds no S3 credentials of its own.
+  // deploy env — never rely on these outside localhost dev. `noite.localhost`
+  // is the dev base every `*.localhost` workaround keys on (`isLocalhostDomain`).
+  // The control plane only talks to the runner; it holds no S3 credentials of
+  // its own.
   const defaults = {
-    BASE_DOMAIN: "localhost",
+    BASE_DOMAIN: "noite.localhost",
     RUNNER_URL: "http://127.0.0.1:8080",
   } satisfies Record<string, string>;
   for (const [key, value] of Object.entries(defaults)) {

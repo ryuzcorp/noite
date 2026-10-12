@@ -158,8 +158,11 @@ test("browse a branch, its history, a commit and a compare; create and delete a 
   await page.getByRole("button", { exact: true, name: "Create" }).click();
   await expect(page).toHaveURL(/ref=topic/u, { timeout: 30_000 });
   await page.getByLabel("Branch or ref").click();
-  page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "Delete branch topic" }).click();
+  await page
+    .getByRole("alertdialog")
+    .getByRole("button", { name: "Delete" })
+    .click();
   await expect(page.getByRole("button", { name: /^topic\b/u })).toBeHidden({
     timeout: 30_000,
   });

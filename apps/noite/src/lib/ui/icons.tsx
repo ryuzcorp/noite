@@ -78,13 +78,6 @@ export const CloudUpload = (p: IconProps) => (
   </svg>
 );
 
-export const Pencil = (p: IconProps) => (
-  <svg {...base(p, 14)}>
-    <path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" />
-    <path d="m15 5 4 4" />
-  </svg>
-);
-
 export const Trash = (p: IconProps) => (
   <svg {...base(p, 14)}>
     <path d="M3 6h18" />
@@ -126,6 +119,14 @@ export const Pause = (p: IconProps) => (
 export const Play = (p: IconProps) => (
   <svg {...base(p, 16)}>
     <polygon points="6 3 20 12 6 21 6 3" />
+  </svg>
+);
+
+export const Monitor = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <rect height="14" width="20" x="2" y="3" {...rx(2)} {...{ ry: 2 }} />
+    <path d="M8 21h8" />
+    <path d="M12 17v4" />
   </svg>
 );
 
@@ -231,14 +232,6 @@ export const Lock = (p: IconProps) => (
   </svg>
 );
 
-export const AlertTriangle = (p: IconProps) => (
-  <svg {...base(p, 16)}>
-    <path d="M12 9v4" />
-    <path d="M10.36 3.59 2.26 17.13a1.91 1.91 0 0 0 1.64 2.87h16.21a1.91 1.91 0 0 0 1.64-2.87L13.64 3.59a1.91 1.91 0 0 0-3.28 0z" />
-    <path d="M12 16h.01" />
-  </svg>
-);
-
 export const Folder = (p: IconProps) => (
   <svg {...base(p, 16)}>
     <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z" />
@@ -340,5 +333,13 @@ export const LayoutDashboard = (p: IconProps) => (
     <rect width="7" height="5" x="14" y="3" {...rx(1)} />
     <rect width="7" height="9" x="14" y="12" {...rx(1)} />
     <rect width="7" height="5" x="3" y="16" {...rx(1)} />
+  </svg>
+);
+
+export const SquareTerminal = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <rect width="18" height="18" x="3" y="3" {...rx(2)} />
+    <path d="m7 7 3 3-3 3" />
+    <path d="M13 17h4" />
   </svg>
 );

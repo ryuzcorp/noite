@@ -15,12 +15,12 @@ use std::collections::HashMap;
 use serde::Serialize;
 use ts_rs::TS;
 
+use crate::api_error::ApiError;
 use crate::db::prs::{self, PrCommentRow, PrReviewRow, PullRequestRow};
 use crate::host::forge;
 use crate::host::git_identity::{self, Actor};
 use crate::host::prs as host_prs;
 use crate::models::App;
-use crate::api_error::ApiError;
 use crate::service::apps::app_or_404;
 use crate::AppState;
 
@@ -243,7 +243,8 @@ async fn outdated_flags(
     comments: &[PrCommentRow],
 ) -> HashMap<String, bool> {
     let mut flags = HashMap::new();
-    let mut caches: HashMap<(String, String), HashMap<String, host_prs::HunkRanges>> = HashMap::new();
+    let mut caches: HashMap<(String, String), HashMap<String, host_prs::HunkRanges>> =
+        HashMap::new();
     for comment in comments {
         let Some(commit_sha) = comment.commit_sha.as_deref() else {
             continue;
@@ -489,7 +490,9 @@ pub async fn update(
         .map_err(internal_error)?
         .ok_or_else(|| ApiError::not_found(format!("pull request #{number} not found")))?;
     if actor.user_id != row.author_id && role != "admin" {
-        return Err(ApiError::bad("only the author or an admin may edit this pull request"));
+        return Err(ApiError::bad(
+            "only the author or an admin may edit this pull request",
+        ));
     }
     if let Some(title) = title {
         if title.trim().is_empty() {
@@ -531,7 +534,11 @@ pub async fn update(
                     .map_err(internal_error)?;
             }
         }
-        Some(other) => return Err(ApiError::bad(format!("cannot set state {other:?} directly"))),
+        Some(other) => {
+            return Err(ApiError::bad(format!(
+                "cannot set state {other:?} directly"
+            )))
+        }
     }
     get(state, id, number).await
 }
@@ -564,8 +571,7 @@ pub async fn comment(
         .ok_or_else(|| ApiError::not_found(format!("pull request #{number} not found")))?;
     let anchored = path.is_some() || line.is_some() || side.is_some() || commit_sha.is_some();
     let target_ref = if anchored {
-        let (Some(path), Some(line), Some(side), Some(commit_sha)) =
-            (path, line, side, commit_sha)
+        let (Some(path), Some(line), Some(side), Some(commit_sha)) = (path, line, side, commit_sha)
         else {
             return Err(ApiError::bad(
                 "a line comment needs path, line, side and commitSha",
@@ -639,7 +645,9 @@ pub async fn comment_delete(
         return Err(ApiError::not_found("comment not found"));
     }
     if comment.author_id != actor.user_id && role != "admin" {
-        return Err(ApiError::bad("only the author or an admin may delete this comment"));
+        return Err(ApiError::bad(
+            "only the author or an admin may delete this comment",
+        ));
     }
     prs::delete_comment(&state.pool, &comment.id)
         .await
@@ -680,7 +688,9 @@ pub async fn review(
         return Err(ApiError::bad("viewers may not review"));
     }
     if !matches!(review_state, "approved" | "changes_requested") {
-        return Err(ApiError::bad("state must be 'approved' or 'changes_requested'"));
+        return Err(ApiError::bad(
+            "state must be 'approved' or 'changes_requested'",
+        ));
     }
     let (app, bare) = app_repo(state, id).await?;
     let row = prs::get_by_number(&state.pool, &app.id, number)
@@ -696,9 +706,15 @@ pub async fn review(
     let head_sha = forge::resolve_ref(&bare, &row.head)
         .await
         .map_err(|_| ApiError::conflict("the head branch no longer exists"))?;
-    prs::insert_review(&state.pool, &row.id, &actor.user_id, review_state, &head_sha)
-        .await
-        .map_err(internal_error)?;
+    prs::insert_review(
+        &state.pool,
+        &row.id,
+        &actor.user_id,
+        review_state,
+        &head_sha,
+    )
+    .await
+    .map_err(internal_error)?;
     detail(state, &app, &bare, row).await
 }
 
@@ -764,9 +780,16 @@ pub async fn merge(
         )));
     };
 
-    let title = title.map(str::trim).filter(|t| !t.is_empty()).unwrap_or(&row.title);
+    let title = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or(&row.title);
     let commit_message = squash_message(&bare, title, number, &base_sha, &head_sha, message).await;
-    let author = git_identity::noreply(&state.config, &row.author_id, author_name.unwrap_or_default());
+    let author = git_identity::noreply(
+        &state.config,
+        &row.author_id,
+        author_name.unwrap_or_default(),
+    );
     let committer = git_identity::noreply(&state.config, &actor.user_id, &actor.name);
     let merge_sha = host_prs::squash_commit(
         &bare,
@@ -901,7 +924,13 @@ mod tests {
         assert_eq!(counted_approvals(&reviews, head, "author"), 1);
         // The author's own approval is excluded.
         let mut with_author = reviews.clone();
-        with_author.push(review("5", "author", "approved", head, "2026-01-04T00:00:00Z"));
+        with_author.push(review(
+            "5",
+            "author",
+            "approved",
+            head,
+            "2026-01-04T00:00:00Z",
+        ));
         assert_eq!(counted_approvals(&with_author, head, "author"), 1);
         // A dismissed approval does not count.
         let mut dismissed = reviews.clone();
@@ -1198,7 +1227,10 @@ mod tests {
         async fn commit(&self, message: &str) -> String {
             git(&self.dir, &["add", "-A"]).await;
             git(&self.dir, &["commit", "-qm", message]).await;
-            git(&self.dir, &["rev-parse", "HEAD"]).await.trim().to_string()
+            git(&self.dir, &["rev-parse", "HEAD"])
+                .await
+                .trim()
+                .to_string()
         }
 
         async fn branch(&self, name: &str, start: &str) {
@@ -1321,7 +1353,9 @@ mod tests {
         prs::insert_review(&h.state.pool, &pr.id, "user_b", "approved", "sha")
             .await
             .expect("review");
-        db::delete_app(&h.state.pool, &app_id).await.expect("delete");
+        db::delete_app(&h.state.pool, &app_id)
+            .await
+            .expect("delete");
         let prs_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pull_request")
             .fetch_one(&h.state.pool)
             .await
@@ -1367,7 +1401,12 @@ mod tests {
         let tip = git(&bare, &["rev-parse", "main"]).await;
         assert_eq!(tip.trim(), merge_sha);
         // One parent: the base tip. Author/committer are the noreply pair.
-        assert_eq!(git(&bare, &["log", "-1", "--format=%P", &merge_sha]).await.trim(), base);
+        assert_eq!(
+            git(&bare, &["log", "-1", "--format=%P", &merge_sha])
+                .await
+                .trim(),
+            base
+        );
         assert_eq!(
             git(&bare, &["log", "-1", "--format=%an <%ae>|%cn <%ce>", &merge_sha]).await.trim(),
             "Author <user_author@users.noreply.noite.test>|Merger <user_merger@users.noreply.noite.test>"
@@ -1399,9 +1438,17 @@ mod tests {
             .await
             .expect("feat");
         let author = actor("user_author", "Author");
-        create(&h.state, &h.app.id, &author, "Conflicting", "", "main", "feat")
-            .await
-            .expect("open");
+        create(
+            &h.state,
+            &h.app.id,
+            &author,
+            "Conflicting",
+            "",
+            "main",
+            "feat",
+        )
+        .await
+        .expect("open");
         let err = merge(
             &h.state,
             &h.app.id,

@@ -5,11 +5,12 @@
 import type { View } from "ilha";
 
 import { appDetail } from "../resources";
-import { ArrowLeft, FileDiff, HistoryIcon } from "../ui/icons";
+import { ArrowLeft, FileDiff, HistoryIcon, Monitor } from "../ui/icons";
 
 export const CODE_PANELS = [
   { icon: HistoryIcon, id: "history", label: "History" },
   { icon: FileDiff, id: "changes", label: "Changes" },
+  { icon: Monitor, id: "preview", label: "Preview" },
 ] as const;
 
 /** The source page's side panel: `""` is closed. */

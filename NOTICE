@@ -1,0 +1,236 @@
+Noite
+Copyright 2026 the Noite authors
+
+This product includes software developed by third parties, distributed with
+or bundled into the Noite image. The notices below apply to those components;
+Noite itself is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+================================================================================
+
+ghostty-web
+https://github.com/coder/ghostty-web
+
+Bundled into the control UI's client build (apps/noite) and served to the
+browser with the rest of the Control UI bundle; used as the Code-mode
+terminal's renderer (the xterm.js-compatible `Terminal` the workspace shell
+runs on).
+
+--------------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2025 Coder
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+
+@pierre/diffs
+https://github.com/pierrecomputer/pierre/tree/main/packages/diffs
+
+Bundled into the control UI's client build (apps/noite) and served to the
+browser with the rest of the Control UI bundle; used as the Code-mode
+editor, code preview and diff renderer. Its `@pierre/theming` dependency
+(Apache-2.0, Copyright 2025 Pierre Computer Company) is bundled with it.
+
+Licensed under the Apache License, Version 2.0 (the same license text as the
+one distributed with Noite in LICENSE).
+
+--------------------------------------------------------------------------------
+Copyright 2025 Pierre Computer Company
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+================================================================================
+
+@pierre/highlights
+https://github.com/pierrecomputer/pierre/tree/main/packages/highlights
+
+Bundled into the control UI's client build (apps/noite) and served to the
+browser with the rest of the Control UI bundle; highlights the code in
+Code mode's hover tips. Only its `pierre-dark` and `pierre-light` themes are
+bundled, none of the third-party themes its NOTICE.md credits.
+
+Licensed under the Apache License, Version 2.0 (the same license text as the
+one distributed with Noite in LICENSE), Copyright 2026 Pierre Computer
+Company.
+
+================================================================================
+
+@pierre/trees
+https://github.com/pierrecomputer/pierre/tree/main/packages/trees
+
+Bundled into the control UI's client build (apps/noite) and served to the
+browser with the rest of the Control UI bundle; used as the Code-mode file
+tree (including its inline rename and drag-and-drop).
+
+Licensed under the Apache License, Version 2.0 (the same license text as the
+one distributed with Noite in LICENSE), Copyright 2025 Pierre Computer
+Company, with the notice reproduced verbatim below.
+
+--------------------------------------------------------------------------------
+This project includes some code derived from
+[@headless-tree/core](https://github.com/lukasbach/headless-tree).
+
+The initial version of this project used `headless-tree` as the underlying tree
+implementation. We have since written our own core at `packages/path-store`, but
+many of the best ideas from `headless-tree` made their way to `path-store` and
+`trees`. It's hard to identify exactly which code this is at this point, but
+definitely things like the drag and drop implementation and the general list
+approach to rendering and I'm sure more. The work that `@lukasbach` has
+contributed to this space is greatly appreciated. `<3`
+
+Original license for `headless-tree/core`:
+
+```
+MIT License
+
+Copyright (c) 2023 Lukas Bach
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+================================================================================
+
+@pierre/theme
+https://github.com/pierrecomputer/pierre/tree/main/packages/theme
+
+Bundled into the control UI's client build (apps/noite) as the editor's syntax
+themes; served to the browser with the rest of the Control UI bundle.
+
+Licensed under the Apache License, Version 2.0 (the same license text as the
+one distributed with Noite in LICENSE), Copyright 2025 Pierre Computer
+Company, with the notice reproduced verbatim below.
+
+--------------------------------------------------------------------------------
+This theme was built on top of
+[GitHub's Visual Studio Code Theme](https://github.com/primer/github-vscode-theme),
+reusing its technique and build tooling, which we have since iterated on for
+more specific language tokens.
+
+`@pierre/theme` is licensed under Apache-2.0 (see `LICENSE`). The original MIT
+license for `primer/github-vscode-theme` is included below for attribution.
+
+Original license for `primer/github-vscode-theme`:
+
+```
+MIT License
+
+Copyright (c) 2020 Primer
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+================================================================================
+
+@r1ck404/nodepod (Nodepod)
+https://github.com/R1ck404/Nodepod
+
+Bundled into the control UI's client build (apps/noite) as the pod host entry
+and served to the browser from each app's preview origin; used as the Code-mode
+workspace's in-browser Node runtime and virtual filesystem.
+
+Licensed under the MIT License, with the Commons Clause License Condition
+v1.0. Noite uses Nodepod as a component of a larger application whose primary
+value derives from Noite's own original work, which the Commons Clause
+expressly permits; Noite does not sell Nodepod itself.
+
+--------------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2026 R1ck404 / ScelarOrg
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------------
+Commons Clause License Condition v1.0
+
+The Software is provided to you by the Licensor under the License, as defined
+below, subject to the following condition.
+
+Without limiting other conditions in the License, the grant of rights under
+the License will not include, and the License does not grant to you, the right
+to Sell the Software.
+
+For purposes of the foregoing, "Sell" means practicing any or all of the rights
+granted to you under the License to provide to third parties, for a fee or
+other consideration (including without limitation fees for hosting or
+consulting/support services related to the Software), a product or service
+whose value derives, entirely or substantially, from the functionality of the
+Software. Any licensee who utilizes the Software as a component of a larger
+application or service — where the primary value is derived from the licensee's
+own original work — is not considered to be Selling the Software.
+
+Licensor: R1ck404 / ScelarOrg
+Software: Nodepod
+License: MIT

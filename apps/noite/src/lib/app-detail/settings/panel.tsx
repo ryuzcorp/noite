@@ -47,6 +47,7 @@ export const AppSettingsPanel = () => {
     myRole: info.myRole,
     name: info.app.name,
     slug: info.app.slug,
+    subdomain: info.app.subdomain,
   };
   const isAdmin = gate.myRole === "admin";
   return (
@@ -86,6 +87,7 @@ export const AppSettingsPanel = () => {
             appId={gate.appId}
             name={gate.name}
             slug={gate.slug}
+            subdomain={gate.subdomain}
             onSaved={() => {
               invalidate(keys.appDetail(gate.appId));
             }}

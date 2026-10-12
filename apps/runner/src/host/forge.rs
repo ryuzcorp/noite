@@ -911,6 +911,14 @@ mod tests {
     use super::*;
     use crate::host::exec;
 
+    /// A text (`utf8`) browser file.
+    fn text_file(path: &str, content: &str) -> crate::host::web_commit::WebFile {
+        crate::host::web_commit::WebFile {
+            path: path.to_string(),
+            content: crate::host::web_commit::WebContent::Text(content.to_string()),
+        }
+    }
+
     /// In-memory S3: `{bucket}/{key}` -> bytes, plus the two LIST/delete
     /// request shapes the forge uses.
     type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
@@ -1534,12 +1542,19 @@ mod tests {
         let h = Harness::new("webcommit").await;
         let actor = crate::host::git_identity::noreply(&h.state.config, "user_1", "Ada");
         // No mirror at all: the first browser commit creates one.
-        let files = vec![crate::host::web_commit::WebFile {
-            path: "README.md".to_string(),
-            content: "# hello\n".to_string(),
-        }];
+        let files = vec![text_file("README.md", "# hello\n")];
         let first = crate::host::web_commit::web_commit(
-            &h.state, &h.app, &actor, "first", &files, None, None,
+            &h.state,
+            &h.app,
+            &actor,
+            "first",
+            crate::host::web_commit::WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
+            None,
+            None,
         )
         .await
         .expect("root commit");
@@ -1556,16 +1571,17 @@ mod tests {
         assert_eq!(detail.commit.author_email, "user_1@users.noreply.localhost");
 
         // `require_pr`-style UI flow: commit to a new branch off main.
-        let files = vec![crate::host::web_commit::WebFile {
-            path: "feature.txt".to_string(),
-            content: "wip\n".to_string(),
-        }];
+        let files = vec![text_file("feature.txt", "wip\n")];
         let second = crate::host::web_commit::web_commit(
             &h.state,
             &h.app,
             &actor,
             "on a branch",
-            &files,
+            crate::host::web_commit::WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
             Some("feature/x"),
             Some(&first),
         )
@@ -1594,16 +1610,17 @@ mod tests {
 
         // A commit to an existing branch appends (and a stale `fromSha` does
         // not fight the CAS).
-        let files = vec![crate::host::web_commit::WebFile {
-            path: "feature.txt".to_string(),
-            content: "more\n".to_string(),
-        }];
+        let files = vec![text_file("feature.txt", "more\n")];
         let third = crate::host::web_commit::web_commit(
             &h.state,
             &h.app,
             &actor,
             "more",
-            &files,
+            crate::host::web_commit::WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
             Some("feature/x"),
             None,
         )
@@ -1619,33 +1636,517 @@ mod tests {
     async fn web_commit_rejects_bad_input() {
         let h = Harness::new("webbad").await;
         let actor = crate::host::git_identity::noreply(&h.state.config, "user_1", "Ada");
-        let files = vec![crate::host::web_commit::WebFile {
-            path: "../escape".to_string(),
-            content: "x".to_string(),
-        }];
+        let files = vec![text_file("../escape", "x")];
         let err = crate::host::web_commit::web_commit(
-            &h.state, &h.app, &actor, "bad", &files, None, None,
+            &h.state,
+            &h.app,
+            &actor,
+            "bad",
+            crate::host::web_commit::WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
+            None,
+            None,
         )
         .await
         .expect_err("traversal");
         assert!(format!("{err:#}").contains("bad path"), "{err:#}");
 
-        let files = vec![crate::host::web_commit::WebFile {
-            path: "ok.txt".to_string(),
-            content: "x".to_string(),
-        }];
+        let files = vec![text_file("ok.txt", "x")];
         let err = crate::host::web_commit::web_commit(
             &h.state,
             &h.app,
             &actor,
             "bad branch",
-            &files,
+            crate::host::web_commit::WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
             Some("a..b"),
             None,
         )
         .await
         .expect_err("bad branch");
         assert!(format!("{err:#}").contains("invalid branch"), "{err:#}");
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn web_commit_deletes_files_and_rejects_missing() {
+        let h = Harness::new("webdelete").await;
+        let actor = crate::host::git_identity::noreply(&h.state.config, "user_1", "Ada");
+        let files = vec![
+            text_file("keep.txt", "keep\n"),
+            text_file("gone.txt", "gone\n"),
+        ];
+        let first = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "first",
+            crate::host::web_commit::WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("root commit");
+
+        // One commit: delete a file and write another.
+        let files = vec![text_file("added.txt", "added\n")];
+        let deletes = vec!["gone.txt".to_string()];
+        let second = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "delete gone",
+            crate::host::web_commit::WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &deletes,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("delete commit");
+
+        let bare = http_bare(&h.state.config, &h.app.slug);
+        let detail = commit_detail(&bare, &second).await.expect("detail");
+        assert_eq!(detail.commit.parents, vec![first.clone()]);
+        let status = |path: &str| {
+            detail
+                .files
+                .iter()
+                .find(|f| f.path == path)
+                .map(|f| f.status)
+        };
+        assert_eq!(status("gone.txt"), Some(GitFileStatus::Deleted));
+        assert_eq!(status("added.txt"), Some(GitFileStatus::Added));
+
+        // The new tree holds the written files and no longer the deleted one.
+        let git_dir = format!("--git-dir={}", bare.display());
+        let tree = exec::run_cmd(
+            "git",
+            &[
+                git_dir.as_str(),
+                "ls-tree",
+                "-r",
+                "--name-only",
+                second.as_str(),
+            ],
+            None,
+            &[],
+            Duration::from_secs(15),
+        )
+        .await
+        .expect("ls-tree");
+        let names: Vec<&str> = tree.split_whitespace().collect();
+        assert!(names.contains(&"keep.txt"), "{names:?}");
+        assert!(names.contains(&"added.txt"), "{names:?}");
+        assert!(!names.contains(&"gone.txt"), "{names:?}");
+
+        // Deleting a path that is not a file in the base tree is refused.
+        let deletes = vec!["missing.txt".to_string()];
+        let err = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "bad delete",
+            crate::host::web_commit::WebChanges {
+                files: &[],
+                moves: &[],
+                deletes: &deletes,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect_err("missing delete");
+        assert!(
+            format!("{err:#}").contains("missing.txt not found"),
+            "{err:#}"
+        );
+
+        h.finish().await;
+    }
+
+    /// One `GET /v1/edge/tls-ask?domain=` (public route) and its status.
+    async fn ask_tls(router: &axum::Router, domain: &str) -> axum::http::StatusCode {
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/v1/edge/tls-ask?domain={domain}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("dispatch")
+            .status()
+    }
+
+    /// The raw `ls-tree` line for `path` in `tree` (empty when absent).
+    async fn tree_line(bare: &std::path::Path, tree: &str, path: &str) -> String {
+        exec::run_cmd(
+            "git",
+            &[
+                &format!("--git-dir={}", bare.display()),
+                "ls-tree",
+                tree,
+                "--",
+                &format!(":(literal){}", path),
+            ],
+            None,
+            &[],
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn web_commit_moves_files() {
+        let h = Harness::new("webmove").await;
+        let actor = crate::host::git_identity::noreply(&h.state.config, "user_1", "Ada");
+        let files = vec![
+            text_file("keep.txt", "keep\n"),
+            text_file("a.txt", "a\n"),
+            text_file("b.txt", "b\n"),
+        ];
+        let first = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "first",
+            crate::host::web_commit::WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("root commit");
+
+        let bare = http_bare(&h.state.config, &h.app.slug);
+        let a_blob = tree_line(&bare, &first, "a.txt")
+            .await
+            .split_whitespace()
+            .nth(2)
+            .expect("a.txt blob")
+            .to_string();
+        let b_blob = tree_line(&bare, &first, "b.txt")
+            .await
+            .split_whitespace()
+            .nth(2)
+            .expect("b.txt blob")
+            .to_string();
+
+        // A move re-points the blob and drops the old path, without reading it.
+        let moves = vec![crate::host::web_commit::WebMove {
+            from: "a.txt".to_string(),
+            to: "renamed.txt".to_string(),
+        }];
+        let second = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "move a",
+            crate::host::web_commit::WebChanges {
+                files: &[],
+                moves: &moves,
+                deletes: &[],
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("move commit");
+        assert!(
+            tree_line(&bare, &second, "a.txt").await.is_empty(),
+            "a.txt still in the tree"
+        );
+        assert_eq!(
+            tree_line(&bare, &second, "renamed.txt")
+                .await
+                .split_whitespace()
+                .nth(2),
+            Some(a_blob.as_str()),
+            "moved blob sha"
+        );
+
+        // A write targeting a move's `to` wins (moved + edited).
+        let moves = vec![crate::host::web_commit::WebMove {
+            from: "b.txt".to_string(),
+            to: "c.txt".to_string(),
+        }];
+        let files = vec![text_file("c.txt", "edited\n")];
+        let third = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "move and edit",
+            crate::host::web_commit::WebChanges {
+                files: &files,
+                moves: &moves,
+                deletes: &[],
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("move+write commit");
+        assert!(
+            tree_line(&bare, &third, "b.txt").await.is_empty(),
+            "b.txt still in the tree"
+        );
+        let tree = tree_line(&bare, &third, "c.txt").await;
+        let c_sha = tree.split_whitespace().nth(2).expect("c.txt blob");
+        assert_ne!(c_sha, b_blob.as_str(), "write replaced the moved blob");
+        let content = exec::run_cmd(
+            "git",
+            &[
+                &format!("--git-dir={}", bare.display()),
+                "cat-file",
+                "blob",
+                c_sha,
+            ],
+            None,
+            &[],
+            Duration::from_secs(15),
+        )
+        .await
+        .expect("cat-file");
+        assert_eq!(content, "edited\n");
+
+        // A swap works because each `to` is the other move's `from`.
+        let renamed_sha = tree_line(&bare, &third, "renamed.txt")
+            .await
+            .split_whitespace()
+            .nth(2)
+            .expect("renamed.txt blob")
+            .to_string();
+        let moves = vec![
+            crate::host::web_commit::WebMove {
+                from: "renamed.txt".to_string(),
+                to: "c.txt".to_string(),
+            },
+            crate::host::web_commit::WebMove {
+                from: "c.txt".to_string(),
+                to: "renamed.txt".to_string(),
+            },
+        ];
+        let fourth = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "swap",
+            crate::host::web_commit::WebChanges {
+                files: &[],
+                moves: &moves,
+                deletes: &[],
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("swap commit");
+        assert_eq!(
+            tree_line(&bare, &fourth, "c.txt")
+                .await
+                .split_whitespace()
+                .nth(2),
+            Some(renamed_sha.as_str()),
+            "c.txt got renamed.txt's blob"
+        );
+        assert_eq!(
+            tree_line(&bare, &fourth, "renamed.txt")
+                .await
+                .split_whitespace()
+                .nth(2),
+            Some(c_sha),
+            "renamed.txt got c.txt's blob"
+        );
+
+        // Moving onto a path this commit does not vacate is refused.
+        let moves = vec![crate::host::web_commit::WebMove {
+            from: "renamed.txt".to_string(),
+            to: "keep.txt".to_string(),
+        }];
+        let err = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "bad move",
+            crate::host::web_commit::WebChanges {
+                files: &[],
+                moves: &moves,
+                deletes: &[],
+            },
+            None,
+            None,
+        )
+        .await
+        .expect_err("move onto an existing path");
+        assert!(
+            format!("{err:#}").contains("keep.txt already exists"),
+            "{err:#}"
+        );
+
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn web_commit_uploaded_files() {
+        use crate::host::web_commit::{WebChanges, WebContent, WebFile};
+
+        let h = Harness::new("webupload").await;
+        let actor = crate::host::git_identity::noreply(&h.state.config, "user_1", "Ada");
+        // A PNG-ish payload: NUL and non-UTF-8 bytes must survive verbatim.
+        let png: Vec<u8> = vec![
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x49, 0xff, 0xfe, 0x00,
+        ];
+        let files = vec![
+            WebFile {
+                path: "logo.png".to_string(),
+                content: WebContent::Bytes(png.clone()),
+            },
+            text_file("readme.md", "# hi\n"),
+        ];
+        let first = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "upload",
+            WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("upload commit");
+
+        let bare = http_bare(&h.state.config, &h.app.slug);
+        let blob = tree_line(&bare, &first, "logo.png")
+            .await
+            .split_whitespace()
+            .nth(2)
+            .expect("logo blob")
+            .to_string();
+        let git_dir = format!("--git-dir={}", bare.display());
+        let bytes = exec::run_cmd_stdin(
+            "git",
+            &[git_dir.as_str(), "cat-file", "blob", blob.as_str()],
+            &[],
+            None,
+            &[],
+            Duration::from_secs(15),
+        )
+        .await
+        .expect("cat-file");
+        assert_eq!(bytes, png, "uploaded bytes round-trip exactly");
+        assert!(
+            tree_line(&bare, &first, "logo.png")
+                .await
+                .starts_with("100644"),
+            "uploaded file mode"
+        );
+
+        // A NUL in a utf8 file is still refused.
+        let files = vec![WebFile {
+            path: "text.txt".to_string(),
+            content: WebContent::Text("a\0b".to_string()),
+        }];
+        let err = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "nul",
+            WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
+            None,
+            None,
+        )
+        .await
+        .expect_err("nul in text");
+        assert!(format!("{err:#}").contains("looks binary"), "{err:#}");
+
+        // An upload over the 10 MiB decoded per-file cap is refused.
+        let files = vec![WebFile {
+            path: "big.bin".to_string(),
+            content: WebContent::Bytes(vec![0u8; 10 * 1024 * 1024 + 1]),
+        }];
+        let err = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "too big",
+            WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
+            None,
+            None,
+        )
+        .await
+        .expect_err("oversized upload");
+        assert!(
+            format!("{err:#}").contains("big.bin exceeds 10 MB"),
+            "{err:#}"
+        );
+
+        // Three files within the per-file cap but over the 25 MiB total are
+        // refused too.
+        let chunk = vec![0u8; 9 * 1024 * 1024];
+        let files = vec![
+            WebFile {
+                path: "a.bin".to_string(),
+                content: WebContent::Bytes(chunk.clone()),
+            },
+            WebFile {
+                path: "b.bin".to_string(),
+                content: WebContent::Bytes(chunk.clone()),
+            },
+            WebFile {
+                path: "c.bin".to_string(),
+                content: WebContent::Bytes(chunk),
+            },
+        ];
+        let err = crate::host::web_commit::web_commit(
+            &h.state,
+            &h.app,
+            &actor,
+            "too big total",
+            WebChanges {
+                files: &files,
+                moves: &[],
+                deletes: &[],
+            },
+            None,
+            None,
+        )
+        .await
+        .expect_err("oversized total");
+        assert!(
+            format!("{err:#}").contains("commit exceeds 25 MB"),
+            "{err:#}"
+        );
+
         h.finish().await;
     }
 
@@ -1933,6 +2434,7 @@ mod tests {
                 "actor": { "userId": "user_test", "name": "Test User" },
                 "message": "onto main",
                 "files": [{ "path": "new.txt", "content": "there\n" }],
+                "deletes": ["f.txt"],
             }),
         )
         .await;
@@ -1940,7 +2442,329 @@ mod tests {
         let refs_now = list_refs(&bare).await.expect("list");
         assert_eq!(refs_now.get("refs/heads/main"), Some(&main_sha));
         assert_ne!(main_sha, main);
+        let main_detail = commit_detail(&bare, &main_sha).await.expect("detail");
+        let deleted = main_detail
+            .files
+            .iter()
+            .find(|f| f.path == "f.txt")
+            .expect("f.txt in diff");
+        assert_eq!(deleted.status, GitFileStatus::Deleted);
 
+        // A base64 upload round-trips byte-exact through the API.
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff];
+        let encoded = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        };
+        let uploaded = rpc(
+            &router,
+            "source.commit",
+            json!({
+                "id": id,
+                "actor": { "userId": "user_test", "name": "Test User" },
+                "message": "upload",
+                "files": [{ "path": "logo.png", "content": encoded, "encoding": "base64" }],
+            }),
+        )
+        .await;
+        let upload_sha = uploaded["sha"].as_str().expect("sha").to_string();
+        let logo_blob = tree_line(&bare, &upload_sha, "logo.png")
+            .await
+            .split_whitespace()
+            .nth(2)
+            .expect("logo blob")
+            .to_string();
+        let git_dir = format!("--git-dir={}", bare.display());
+        let bytes = exec::run_cmd_stdin(
+            "git",
+            &[git_dir.as_str(), "cat-file", "blob", logo_blob.as_str()],
+            &[],
+            None,
+            &[],
+            Duration::from_secs(15),
+        )
+        .await
+        .expect("cat-file");
+        assert_eq!(bytes, png, "uploaded bytes round-trip exactly");
+
+        // Invalid base64 is a 400 naming the file.
+        let (code, message) = rpc_error(
+            &router,
+            "source.commit",
+            json!({
+                "id": id,
+                "actor": { "userId": "user_test", "name": "Test User" },
+                "message": "bad upload",
+                "files": [{ "path": "bad.bin", "content": "not base64!", "encoding": "base64" }],
+            }),
+        )
+        .await;
+        assert_eq!(code, 400, "{message}");
+        assert!(message.contains("bad.bin is not valid base64"), "{message}");
+
+        // A body above axum's 2 MiB default reaches the commit route.
+        let big = json!({
+            "actor": { "userId": "user_test", "name": "Test User" },
+            "message": "big upload",
+            "files": [{
+                "path": "big.bin",
+                "content": "A".repeat(3 * 1024 * 1024),
+                "encoding": "base64",
+            }],
+        })
+        .to_string();
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/apps/{}/source/commit", app.id))
+            .header("authorization", "Bearer test-token")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(big))
+            .expect("build request");
+        let response = router.clone().oneshot(request).await.expect("dispatch");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        h.finish().await;
+    }
+
+    /// The runner-token gate runs ahead of the body limit: an unauthenticated
+    /// body larger than the default 2 MiB is refused with 401, never buffered.
+    #[tokio::test]
+    async fn unauthenticated_bodies_are_refused_before_the_limit() {
+        let h = Harness::new("bodyauth").await;
+        let router = crate::api::router::router(h.state.clone());
+        let big = format!("{{\"pad\":\"{}\"}}", "x".repeat(2 * 1024 * 1024 + 16));
+        for path in ["/rpc", "/v1/apps/anything/source/commit"] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(big.clone()))
+                .expect("build request");
+            let response = router.clone().oneshot(request).await.expect("dispatch");
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{path}"
+            );
+        }
+        h.finish().await;
+    }
+
+    /// The archive streams the committed tree (binary, executable, symlink)
+    /// and the listing carries each blob's sha and mode.
+    #[tokio::test]
+    async fn source_archive_round_trips() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let h = Harness::new("archive").await;
+        let app = crate::db::create_app(
+            &h.state.pool,
+            &h.state.config,
+            crate::db::NewApp {
+                name: "archive",
+                slug: "archive",
+                user_id: "user_test",
+                subdomain: "archive.localhost",
+                listen: 30000,
+                internal: 30001,
+            },
+        )
+        .await
+        .expect("seed app");
+        let bare = h.mirror().await;
+        let work = Work::new(&h.dir.join("scratch")).await;
+        work.write("dir/file.txt", "hello\n");
+        work.write("run.sh", "#!/bin/sh\n");
+        std::fs::write(work.dir.join("bin.dat"), [0x00_u8, 0xff, 0x01, 0x80]).expect("binary");
+        std::fs::set_permissions(
+            work.dir.join("run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+        std::os::unix::fs::symlink("bin.dat", work.dir.join("link")).expect("symlink");
+        let main = work.commit("initial").await;
+        let tips = seed_objects(&bare, &work).await;
+        for (branch, sha) in &tips {
+            publish_ref(&h.state, &app, branch, None, Some(sha.as_str()))
+                .await
+                .expect("publish");
+        }
+
+        let router = crate::api::router::router(h.state.clone());
+        let tree = rest(&router, &format!("/v1/apps/{}/tree?ref=main", app.id)).await;
+        assert_eq!(tree["sha"], json!(main));
+        let entries = tree["files"].as_array().expect("files").clone();
+        let entry = |path: &str| {
+            entries
+                .iter()
+                .find(|f| f["path"] == path)
+                .unwrap_or_else(|| panic!("{path} missing"))
+                .clone()
+        };
+        assert_eq!(entry("run.sh")["mode"], "100755");
+        assert_eq!(entry("link")["mode"], "120000");
+        let binary = entry("bin.dat");
+        assert_eq!(binary["mode"], "100644");
+        assert_eq!(binary["size"], 4);
+        let blob = git(&bare, &["rev-parse", &format!("{main}:bin.dat")])
+            .await
+            .trim()
+            .to_string();
+        assert_eq!(binary["sha"], json!(blob), "tree carries the blob id");
+
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{}/source/archive?ref=main", app.id))
+            .header("authorization", "Bearer test-token")
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let response = router.clone().oneshot(request).await.expect("dispatch");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/x-tar")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("tar body");
+        let tar = h.dir.join("archive.tar");
+        std::fs::write(&tar, &bytes).expect("write tar");
+        let out = h.dir.join("untar");
+        std::fs::create_dir_all(&out).expect("untar dir");
+        exec::run_cmd(
+            "tar",
+            &[
+                "-xf",
+                tar.to_str().expect("tar path"),
+                "-C",
+                out.to_str().expect("out path"),
+            ],
+            None,
+            &[],
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("untar");
+        assert_eq!(
+            std::fs::read(out.join("bin.dat")).expect("bin"),
+            vec![0x00_u8, 0xff, 0x01, 0x80]
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join("dir/file.txt")).expect("text"),
+            "hello\n"
+        );
+        let meta = std::fs::symlink_metadata(out.join("run.sh")).expect("run.sh");
+        assert_ne!(meta.permissions().mode() & 0o111, 0, "exec bit survives");
+        let link = std::fs::symlink_metadata(out.join("link")).expect("link");
+        assert!(link.file_type().is_symlink(), "symlink survives");
+        assert_eq!(
+            std::fs::read_link(out.join("link")).expect("link target"),
+            std::path::PathBuf::from("bin.dat")
+        );
+
+        h.finish().await;
+    }
+
+    /// A checkout over the Workspace caps is refused from the listing, before
+    /// the archive streams.
+    #[tokio::test]
+    async fn source_archive_refuses_a_repo_over_the_cap() {
+        let h = Harness::new("archivecap").await;
+        let app = crate::db::create_app(
+            &h.state.pool,
+            &h.state.config,
+            crate::db::NewApp {
+                name: "archivecap",
+                slug: "archivecap",
+                user_id: "user_test",
+                subdomain: "archivecap.localhost",
+                listen: 30000,
+                internal: 30001,
+            },
+        )
+        .await
+        .expect("seed app");
+        let bare = h.mirror().await;
+        let work = Work::new(&h.dir.join("scratch")).await;
+        // Sparse: 100 MiB + 1 without writing the bytes.
+        let big = std::fs::File::create(work.dir.join("big.bin")).expect("create");
+        big.set_len(crate::host::source::MAX_WORKSPACE_BYTES + 1)
+            .expect("set len");
+        drop(big);
+        work.commit("huge").await;
+        let tips = seed_objects(&bare, &work).await;
+        for (branch, sha) in &tips {
+            publish_ref(&h.state, &app, branch, None, Some(sha.as_str()))
+                .await
+                .expect("publish");
+        }
+
+        let router = crate::api::router::router(h.state.clone());
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{}/source/archive?ref=main", app.id))
+            .header("authorization", "Bearer test-token")
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let response = router.clone().oneshot(request).await.expect("dispatch");
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        let text = String::from_utf8_lossy(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .to_string();
+        assert!(
+            text.contains("repository too large for Code mode"),
+            "{text}"
+        );
+
+        h.finish().await;
+    }
+
+    /// The TLS ask admits a preview host for an existing app only: the pod runs
+    /// in the browser, so the fleet need not be up, but an unknown slug gets no
+    /// certificate.
+    #[tokio::test]
+    async fn tls_ask_admits_preview_hosts_for_existing_apps() {
+        let h = Harness::new("previewtls").await;
+        crate::db::create_app(
+            &h.state.pool,
+            &h.state.config,
+            crate::db::NewApp {
+                name: "previewtls",
+                slug: "previewtls",
+                user_id: "user_test",
+                subdomain: "previewtls.localhost",
+                listen: 30000,
+                internal: 30001,
+            },
+        )
+        .await
+        .expect("seed app");
+        let router = crate::api::router::router(h.state.clone());
+        assert_eq!(
+            ask_tls(&router, "app-0.preview.previewtls.localhost").await,
+            axum::http::StatusCode::OK
+        );
+        // Only that one stable label is admitted: a random pod host gets no
+        // certificate (no per-session issuance, no CA-limit drain).
+        assert_eq!(
+            ask_tls(&router, "pod123-4444.preview.previewtls.localhost").await,
+            axum::http::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            ask_tls(&router, "app-0.preview.ghost.localhost").await,
+            axum::http::StatusCode::NOT_FOUND
+        );
+        // The bare tenant host still needs a deployed, running fleet.
+        assert_eq!(
+            ask_tls(&router, "previewtls.localhost").await,
+            axum::http::StatusCode::NOT_FOUND
+        );
         h.finish().await;
     }
 

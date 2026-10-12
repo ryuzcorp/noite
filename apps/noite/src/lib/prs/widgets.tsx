@@ -12,6 +12,7 @@ import {
   prsCommentEdit,
 } from "../server/prs.server";
 import { Avatar } from "../ui/avatar";
+import { confirmDialog } from "../ui/confirm";
 import { lineAnchor } from "./data";
 import type { DiffSide, LineAnchor } from "./data";
 import { invalidatePr } from "./resources";
@@ -270,12 +271,15 @@ export const CommentCard = ({
                 type="button"
                 class="link link-hover text-error"
                 disabled={busy()}
-                onclick={() => {
-                  // oxlint-disable-next-line no-alert -- native confirm is the destructive-action guard used elsewhere.
-                  if (!confirm("Delete this comment?")) {
+                onclick={async () => {
+                  const ok = await confirmDialog({
+                    confirmLabel: "Delete",
+                    title: "Delete this comment?",
+                  });
+                  if (!ok) {
                     return;
                   }
-                  void run(async () => {
+                  await run(async () => {
                     await prsCommentDelete({ appId, commentId: comment.id });
                   });
                 }}

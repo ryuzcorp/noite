@@ -1,18 +1,13 @@
 import * as Schema from "effect/Schema";
-import type { Mutable } from "effect/Types";
 import { action, withSchema } from "oxidejs";
 
-import { failUnknown } from "../auth";
-import { requireAppRole } from "../collaborators";
 import {
   runnerSourceBlob,
   runnerSourceBundle,
-  runnerSourceCommit,
   runnerSourceTree,
   runnerSourceTypes,
 } from "../runner";
-import type { SourceCommitBody } from "../runner";
-import { AuthError, requireViewApp, sessionUser } from "./session.server";
+import { AuthError, requireViewApp } from "./session.server";
 
 /** Every source read takes an optional `ref` (branch, tag or SHA); Code mode
  * always sends one. Absent or `""` keeps the runner's deployed-SHA-then-HEAD
@@ -64,48 +59,5 @@ export const sourceTypes = action(
     await requireViewApp(appId);
     return runnerSourceTypes(appId);
   }),
-  { error: AuthError }
-);
-
-const SourceCommitArgs = Schema.Struct({
-  appId: Schema.String,
-  branch: Schema.optional(Schema.String),
-  files: Schema.Array(
-    Schema.Struct({ content: Schema.String, path: Schema.String })
-  ),
-  fromSha: Schema.optional(Schema.String),
-  message: Schema.String,
-});
-/** What `sourceCommit` takes; optional fields are omitted, never `undefined`. */
-export type SourceCommitInput = Mutable<typeof SourceCommitArgs.Type>;
-
-/** Browser-edit commit (push-gated): validated files become a commit on
- * `main` (or on `branch`) that deploys like a stock push. The commit is
- * attributed to the session user through the noreply identity. */
-export const sourceCommit = action(
-  withSchema(
-    SourceCommitArgs,
-    async ({ appId, files, message, branch, fromSha }) => {
-      const user = await sessionUser();
-      const { role } = await requireAppRole(appId, user.id, "push");
-      const body: SourceCommitBody = {
-        actor: { name: user.name, userId: user.id },
-        files: [...files],
-        message,
-        role,
-      };
-      if (branch !== undefined) {
-        body.branch = branch;
-      }
-      if (fromSha !== undefined) {
-        body.fromSha = fromSha;
-      }
-      try {
-        return await runnerSourceCommit(appId, body);
-      } catch (error) {
-        failUnknown(error);
-      }
-    }
-  ),
   { error: AuthError }
 );

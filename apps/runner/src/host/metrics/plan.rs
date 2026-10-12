@@ -133,7 +133,12 @@ pub(super) fn ingest_backed_off(state: &MetricsState, slug: &str, from: i64) -> 
 /// the hour the cutoff falls in is always last and may be partial (`until_us`
 /// == cutoff_us). The ingest REPLACES every window it reads, so the tiling
 /// only decides how much one DuckDB query touches — never what is counted.
-pub(super) fn plan_chunks(after_us: i64, cutoff_us: i64, floor_us: i64, max_chunks: usize) -> Vec<(i64, i64)> {
+pub(super) fn plan_chunks(
+    after_us: i64,
+    cutoff_us: i64,
+    floor_us: i64,
+    max_chunks: usize,
+) -> Vec<(i64, i64)> {
     let mut out = Vec::new();
     let mut start = floor_hour_us(after_us.max(floor_us));
     let complete_end = floor_hour_us(cutoff_us);
@@ -155,7 +160,13 @@ pub(super) fn plan_chunks(after_us: i64, cutoff_us: i64, floor_us: i64, max_chun
 /// touches instead of the whole retention (a 10 s window names one or two
 /// hour directories). The node stays a wildcard so history written by an
 /// earlier node id still aggregates.
-pub(super) fn telemetry_globs(cfg: &Config, slug: &str, kind: &str, from_us: i64, to_us: i64) -> Vec<String> {
+pub(super) fn telemetry_globs(
+    cfg: &Config,
+    slug: &str,
+    kind: &str,
+    from_us: i64,
+    to_us: i64,
+) -> Vec<String> {
     let prefix = telemetry_prefix(slug);
     let Some(mut hour) = chrono::DateTime::from_timestamp_micros(from_us.max(0)) else {
         return vec![format!(

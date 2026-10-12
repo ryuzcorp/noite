@@ -7,6 +7,7 @@ import { decodeDeploys, deploysUrl, feedKeys, liveFeed } from "../feeds";
 import { appDetail, deployLog } from "../resources";
 import type { RunnerDeploy } from "../runner";
 import { rollback } from "../server/apps.server";
+import { confirmDialog } from "../ui/confirm";
 import { CopyButton } from "../ui/copy-button";
 import { ChevronDown, ChevronUp, CloudUpload } from "../ui/icons";
 import { ListSkeleton } from "../ui/skeletons";
@@ -219,25 +220,26 @@ const DeployRow = ({
             type="button"
             class="btn btn-sm btn-ghost shrink-0"
             disabled={rolling()}
-            onclick={() => {
-              if (!d.sha) {
+            onclick={async () => {
+              const { sha } = d;
+              if (!sha) {
                 return;
               }
-              // oxlint-disable-next-line no-alert -- native confirm dialog is the requirement for destructive rollback.
-              if (!confirm(`Roll back to ${d.sha.slice(0, 12)}?`)) {
+              const ok = await confirmDialog({
+                confirmLabel: "Roll back",
+                title: `Roll back to ${sha.slice(0, 12)}?`,
+              });
+              if (!ok) {
                 return;
               }
               rolling.set(true);
               rollError.set("");
-              void (async () => {
-                try {
-                  // SAFETY: canRollBack guarantees d.sha is a non-empty string here; the early return above narrows it for the linter.
-                  await rollback({ appId, sha: d.sha as string });
-                } catch (error) {
-                  rollError.set(errorMessage(error));
-                }
-                rolling.set(false);
-              })();
+              try {
+                await rollback({ appId, sha });
+              } catch (error) {
+                rollError.set(errorMessage(error));
+              }
+              rolling.set(false);
             }}
           >
             {rolling() ? "Rolling back…" : "Roll back"}

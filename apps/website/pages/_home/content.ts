@@ -155,7 +155,7 @@ export const INSTALL_TABS = [
     code: "curl -fsSLO https://raw.githubusercontent.com/ryuzcorp/noite/main/docker/compose.yaml\ndocker compose up -d",
     id: "compose",
     label: "Docker Compose",
-    note: "Boots a local trial on http://localhost:9080 with no .env at all.",
+    note: "Boots a local trial on http://noite.localhost:9080 with no .env at all.",
   },
   {
     code: "Docker Compose resource → repo ryuzcorp/noite\nCompose file: docker/compose.yaml · branch main",

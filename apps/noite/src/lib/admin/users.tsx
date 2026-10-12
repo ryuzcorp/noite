@@ -17,6 +17,7 @@ import {
 } from "../server/admin.server";
 import type { AdminUserRow } from "../server/admin.server";
 import { Avatar } from "../ui/avatar";
+import { confirmDialog } from "../ui/confirm";
 import {
   ACTION,
   AdminRow,
@@ -28,7 +29,6 @@ import {
   SkeletonRows,
   W_LG,
   W_SM,
-  confirmAction,
   toPageIndex,
 } from "./shared";
 
@@ -177,27 +177,30 @@ const AdminUsersRows = ({
   const toggleBan = (user: AdminUserRow) =>
     mutate(() => (user.banned ? unbanUser(user.id) : banUser(user.id)));
 
-  const toggleRole = (user: AdminUserRow) => {
+  const toggleRole = async (user: AdminUserRow) => {
     const next = user.role === "admin" ? "user" : "admin";
-    if (
-      !confirmAction(
-        `Make ${user.email} ${next === "admin" ? "an admin" : "a regular user"}?`
-      )
-    ) {
-      return Promise.resolve();
+    const ok = await confirmDialog({
+      confirmLabel: next === "admin" ? "Make admin" : "Remove admin",
+      title: `Make ${user.email} ${next === "admin" ? "an admin" : "a regular user"}?`,
+      tone: "neutral",
+    });
+    if (!ok) {
+      return;
     }
-    return mutate(() => setUserRole({ role: next, userId: user.id }));
+    await mutate(() => setUserRole({ role: next, userId: user.id }));
   };
 
-  const removeUser = (user: AdminUserRow) => {
-    if (
-      !confirmAction(
-        `Delete ${user.email}? Their account, sessions and API keys are removed. This cannot be undone.`
-      )
-    ) {
-      return Promise.resolve();
+  const removeUser = async (user: AdminUserRow) => {
+    const ok = await confirmDialog({
+      confirmLabel: "Delete",
+      message:
+        "Their account, sessions and API keys are removed. This cannot be undone.",
+      title: `Delete ${user.email}?`,
+    });
+    if (!ok) {
+      return;
     }
-    return mutate(() => deleteUser(user.id));
+    await mutate(() => deleteUser(user.id));
   };
 
   const loading = res.loading() && res.data() === undefined;

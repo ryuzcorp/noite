@@ -1,10 +1,11 @@
 import { defineConfig } from "@playwright/test";
 
-// Raw-port lane locally (control UI direct on localhost:8090; runner API
-// direct on localhost:8080; tenants on their 81xx ports). No Caddy, no
-// subdomains, no /etc/hosts. Plain `localhost` (never 127.0.0.1) so the
-// WebAuthn RP ID validates.
-const baseURL = process.env.E2E_BASE_URL ?? "http://localhost:8090";
+// Raw-port lane locally (control UI through Caddy on noite.localhost:8090;
+// runner API direct on localhost:8080; tenants on their 81xx ports). No Caddy
+// site per app, no /etc/hosts entry: the lane's base is `*.localhost`, which
+// the browser resolves to loopback and treats as a secure context (the
+// WebAuthn RP ID must be a host, never 127.0.0.1).
+const baseURL = process.env.E2E_BASE_URL ?? "http://noite.localhost:8090";
 
 export default defineConfig({
   expect: { timeout: 30_000 },

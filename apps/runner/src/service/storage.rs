@@ -12,7 +12,7 @@ use crate::host::storage::{
     self,
     d1::{D1Rows, D1RowsQuery, D1TableSchemaRaw, D1Tables},
     durable::DoPreview,
-    r2::{R2File, R2Raw, R2Preview},
+    r2::{R2File, R2Preview, R2Raw},
     StorageItem,
 };
 use crate::AppState;

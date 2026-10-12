@@ -36,8 +36,6 @@ export interface RepoConfig {
   options: ts.CompilerOptions;
   /** Program roots: repository-relative script paths, `/`-rooted. */
   roots: string[];
-  /** Whether `/tsconfig.json` was found and parsed (vs. the fallback). */
-  fromTsconfig: boolean;
 }
 
 /** What a repo gets without a config: the shared modern-app baseline.
@@ -102,11 +100,11 @@ export const resolveRepoConfig = (
   const roots = fallbackRoots(repoPaths);
   const text = fs.read(CONFIG_PATH);
   if (text === undefined) {
-    return { fromTsconfig: false, options: defaultCompilerOptions(), roots };
+    return { options: defaultCompilerOptions(), roots };
   }
   const parsed = parseConfig(fs, text);
   if (!parsed) {
-    return { fromTsconfig: false, options: defaultCompilerOptions(), roots };
+    return { options: defaultCompilerOptions(), roots };
   }
   const merged: ts.CompilerOptions = {
     ...defaultCompilerOptions(),
@@ -126,7 +124,6 @@ export const resolveRepoConfig = (
     (path) => known.has(path) && isScriptFile(path)
   );
   return {
-    fromTsconfig: true,
     options: merged,
     roots:
       declared.length > 0 && declared.length <= ROOT_FILE_LIMIT

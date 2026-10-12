@@ -12,6 +12,7 @@ import {
   session,
 } from "../resources";
 import { createApiKey } from "../server/account.server";
+import { confirmDialog } from "../ui/confirm";
 import { CopyButton } from "../ui/copy-button";
 import { Dialog } from "../ui/dialog";
 import { LoadError } from "../ui/load-error";
@@ -149,11 +150,14 @@ const PasskeysCard = () => {
   };
   const remove = async (id: string, name: string) => {
     const last = rows.length <= 1;
-    const warning = last
-      ? `Delete ${name || "this passkey"}? It is your only passkey — you would have to sign in with an emailed code until you add another.`
-      : `Delete ${name || "this passkey"}?`;
-    // oxlint-disable-next-line no-alert -- native confirm dialog is the requirement for destructive deletes.
-    if (!window.confirm(warning)) {
+    const ok = await confirmDialog({
+      confirmLabel: "Delete",
+      message: last
+        ? "It is your only passkey — you would have to sign in with an emailed code until you add another."
+        : "You can no longer sign in with it.",
+      title: `Delete ${name || "this passkey"}?`,
+    });
+    if (!ok) {
       return;
     }
     busy.set(true);

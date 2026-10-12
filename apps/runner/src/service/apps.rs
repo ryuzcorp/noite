@@ -17,7 +17,8 @@ use crate::AppState;
 /// the mirrors of a slug another create just landed. Creating an app is
 /// human-paced (and the push-to-create path), so one process-wide lock is the
 /// honest fix: the whole check → purge → quota → insert sequence runs alone.
-static CREATE_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+static CREATE_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// The single "load the app or answer 404" helper every domain uses, so the
 /// not-found body is uniform across REST and RPC.
@@ -191,11 +192,7 @@ pub async fn retry_import(state: &AppState, id: &str) -> Result<App, ApiError> {
     Ok(app)
 }
 
-pub async fn patch(
-    state: &AppState,
-    id: &str,
-    desired: Option<&str>,
-) -> Result<App, ApiError> {
+pub async fn patch(state: &AppState, id: &str, desired: Option<&str>) -> Result<App, ApiError> {
     if let Some(desired) = desired {
         let Some(ds) = DesiredState::parse(desired) else {
             return Err(ApiError::bad("desiredState must be running|stopped"));
@@ -214,7 +211,9 @@ pub async fn rename(
     slug: Option<&str>,
 ) -> Result<App, ApiError> {
     let name = name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let slug = slug.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+    let slug = slug
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
     if name.is_none() && slug.is_none() {
         return Err(ApiError::bad("name or slug required"));
     }

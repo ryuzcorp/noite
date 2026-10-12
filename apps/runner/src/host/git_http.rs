@@ -28,10 +28,10 @@ use serde_json::json;
 use crate::config::Config;
 use crate::db;
 use crate::host::exec;
-use crate::host::s3;
-use crate::host::tips::TipBundle;
 use crate::host::git_manifest::{self, Manifest, ManifestRef};
 use crate::host::git_policy::{self, PolicyDecision};
+use crate::host::s3;
+use crate::host::tips::TipBundle;
 use crate::models::App;
 use crate::AppState;
 
@@ -717,6 +717,7 @@ pub async fn upload_pack(
         ],
         &body,
         None,
+        &[],
         Duration::from_secs(300),
     )
     .await
@@ -837,11 +838,11 @@ pub async fn receive_pack(
     // divergence can never become a force-push or a delete (NOITE-GIT-001).
     let argv = receive_argv(&bare, role != "admin");
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let out = match exec::run_cmd_stdin("git", &argv, &body, None, Duration::from_secs(300)).await
-    {
-        Ok(o) => o,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
-    };
+    let out =
+        match exec::run_cmd_stdin("git", &argv, &body, None, &[], Duration::from_secs(300)).await {
+            Ok(o) => o,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+        };
     // Push-driven deploy (T2.2): notify the reconcile loop, which drains the
     // channel every tick and deploys. A crash here only delays the deploy to
     // the next fallback sweep — the bundle and manifest are already stored.
@@ -865,7 +866,8 @@ pub async fn receive_pack(
     // Best-effort — the push already landed and a PR-table hiccup must not
     // turn it into a failed push.
     if let Ok(post_refs) = list_refs(&bare).await {
-        if let Err(e) = crate::host::prs::on_refs_moved(&state, &app.id, &before, &post_refs).await {
+        if let Err(e) = crate::host::prs::on_refs_moved(&state, &app.id, &before, &post_refs).await
+        {
             tracing::warn!(slug = %app.slug, error = %format!("{e:#}"), "pr head sync");
         }
     }
@@ -964,7 +966,10 @@ mod tests {
     fn app_url_keeps_the_public_scheme_and_port() {
         let mut cfg = crate::config::config_for_tests();
         cfg.git_public_base = "http://git.localhost:9080".into();
-        assert_eq!(app_url(&cfg, "blog.localhost"), "http://blog.localhost:9080");
+        assert_eq!(
+            app_url(&cfg, "blog.localhost"),
+            "http://blog.localhost:9080"
+        );
         cfg.git_public_base = "https://git.noite.now".into();
         assert_eq!(app_url(&cfg, "blog.noite.now"), "https://blog.noite.now");
         cfg.git_public_base = "https://git.noite.now/".into();
@@ -1073,7 +1078,10 @@ mod tests {
         std::fs::write(work.join("f.txt"), "hi").expect("write");
         git_in(&work, &["add", "-A"]).await;
         git_in(&work, &["commit", "-m", "one"]).await;
-        let sha = git_in(&work, &["rev-parse", "HEAD"]).await.trim().to_string();
+        let sha = git_in(&work, &["rev-parse", "HEAD"])
+            .await
+            .trim()
+            .to_string();
         // `main` is HEAD; `gone`/`kept` are ordinary branches, so a refused
         // delete of those can only be `receive.denyDeletes`.
         for branch in ["main", "gone", "kept"] {
@@ -1098,7 +1106,7 @@ mod tests {
             let argv = receive_argv(&bare, deny);
             async move {
                 let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-                exec::run_cmd_stdin("git", &refs, &body, None, Duration::from_secs(60))
+                exec::run_cmd_stdin("git", &refs, &body, None, &[], Duration::from_secs(60))
                     .await
                     .expect("receive-pack")
             }
@@ -1123,12 +1131,10 @@ mod tests {
         let allowed = run(false, delete_request("refs/heads/kept")).await;
         let text = String::from_utf8_lossy(&allowed).into_owned();
         assert!(text.contains("ok refs/heads/kept"), "{text}");
-        assert!(
-            !list_refs(&bare)
-                .await
-                .expect("refs")
-                .contains_key("refs/heads/kept")
-        );
+        assert!(!list_refs(&bare)
+            .await
+            .expect("refs")
+            .contains_key("refs/heads/kept"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

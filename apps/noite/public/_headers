@@ -8,3 +8,26 @@
 # the file can be cached forever.
 /assets/*
   Cache-Control: public, max-age=31536000, immutable
+
+# Cross-origin isolation for the whole control UI. Every document, module and
+# worker script needs `Cross-Origin-Opener-Policy: same-origin` +
+# `Cross-Origin-Embedder-Policy: require-corp`, because Nodepod's workspace and
+# the TypeScript language service pass `SharedArrayBuffer` to workers, which a
+# browser only exposes in a cross-origin-isolated agent cluster. The Vite dev
+# server sets the same three headers on every response (`vite.config.ts`:
+# `server.headers` plus a top-of-stack middleware for the responses Vite does
+# not pass them to) so dev and prod match.
+#
+# `require-corp` (not `credentialless`): the UI loads no third-party
+# subresource — every script, stylesheet, font and image is same-origin (the
+# avatars are initials, the docs links are plain `<a>` navigations) — so
+# nothing legitimate needs the looser `credentialless` escape hatch.
+# `Cross-Origin-Resource-Policy: same-origin` keeps our own assets from being
+# embedded elsewhere, the counterpart to the isolation above.
+#
+# celld applies every matching rule and combines repeated header names, so
+# these live in their own `/*` block, separate from the `/assets/*` cache rule.
+/*
+  Cross-Origin-Embedder-Policy: require-corp
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Resource-Policy: same-origin

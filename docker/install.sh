@@ -231,7 +231,11 @@ env_secret() {
 # defaults already serve, so it is left alone.
 ensure_env_defaults() {
   ENV_ADDED=()
-  [[ "$DOMAIN" != "localhost" ]] || return 0
+  # A `localhost`-family .env is a dev setup that compose.yaml's defaults
+  # already serve, so it is left alone.
+  case "$DOMAIN" in
+  localhost | *.localhost) return 0 ;;
+  esac
   env_default BASE_DOMAIN "$DOMAIN"
   env_default --allow-empty CONTROL_SUBDOMAIN app
   local sub

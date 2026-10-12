@@ -36,7 +36,6 @@ import type { PrList } from "./runner-types/PrList";
 import type { R2File } from "./runner-types/R2File";
 import type { R2Preview } from "./runner-types/R2Preview";
 import type { SourceBundle as RunnerSourceBundle } from "./runner-types/SourceBundle";
-import type { SourceCommitBody } from "./runner-types/SourceCommitBody";
 import type { SourceTypes as RunnerSourceTypes } from "./runner-types/SourceTypes";
 import type { StorageItem } from "./runner-types/StorageItem";
 import type { TelemetryStatus as RunnerTelemetryStatus } from "./runner-types/TelemetryStatus";
@@ -99,6 +98,7 @@ export type { R2Preview } from "./runner-types/R2Preview";
 export type { SourceBundle as RunnerSourceBundle } from "./runner-types/SourceBundle";
 export type { SourceCommitBody } from "./runner-types/SourceCommitBody";
 export type { SourceCommitFile } from "./runner-types/SourceCommitFile";
+export type { SourceCommitMove } from "./runner-types/SourceCommitMove";
 export type { SourceFile } from "./runner-types/SourceFile";
 export type { SourceTypes as RunnerSourceTypes } from "./runner-types/SourceTypes";
 export type { StorageItem } from "./runner-types/StorageItem";
@@ -136,8 +136,8 @@ const runnerBase = () =>
 
 /** Stamp the platform env for runner calls made on the edge fetch path.
  * Oxide only enters its ALS (readEnv) for actions, workflows and queues, so a
- * plain route handler — `/internal/git-auth`, the SSE pollers — otherwise sees
- * the localhost dev defaults and misses the real RUNNER_URL/RUNNER_TOKEN. */
+ * a plain route handler — `/internal/git-auth`, the SSE pollers — otherwise sees
+ * the localhost-family dev defaults and misses the real RUNNER_URL/RUNNER_TOKEN. */
 export const stampRunnerEnv = (env: KitEnv): void => {
   for (const key of ["RUNNER_TOKEN", "RUNNER_URL"] as const) {
     const value = env[key];
@@ -689,11 +689,6 @@ export const runnerD1Rows = (
   });
 
 // SourceCommitFile/Body are generated from service::source.
-
-/** Browser-edit commit: validated files become a main commit that deploys
- * like a stock push (push-gated in the action). */
-export const runnerSourceCommit = (id: string, body: SourceCommitBody) =>
-  runnerRpc<{ sha: string }>("source.commit", { id, ...body });
 
 /** Curated tenant-DB write: single INSERT, UPDATE or DELETE (push-gated in
  * the action). */

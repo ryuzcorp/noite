@@ -74,13 +74,20 @@ mod tests {
     #[tokio::test]
     async fn settings_round_trip_and_absent_is_none() {
         let pool = db::connect("sqlite::memory:").await.expect("memory db");
-        assert_eq!(get_setting(&pool, TELEMETRY_ENABLED).await.expect("read"), None);
-        set_setting(&pool, TELEMETRY_ENABLED, "0").await.expect("write");
+        assert_eq!(
+            get_setting(&pool, TELEMETRY_ENABLED).await.expect("read"),
+            None
+        );
+        set_setting(&pool, TELEMETRY_ENABLED, "0")
+            .await
+            .expect("write");
         assert_eq!(
             get_setting(&pool, TELEMETRY_ENABLED).await.expect("read"),
             Some("0".to_string())
         );
-        set_setting(&pool, TELEMETRY_ENABLED, "1").await.expect("overwrite");
+        set_setting(&pool, TELEMETRY_ENABLED, "1")
+            .await
+            .expect("overwrite");
         assert_eq!(
             get_setting(&pool, TELEMETRY_ENABLED).await.expect("read"),
             Some("1".to_string())

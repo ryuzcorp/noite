@@ -89,9 +89,12 @@ test("the editor reports diagnostics, hover and go-to-definition", async ({
     markerBox.x + markerBox.width / 2,
     markerBox.y + markerBox.height / 2
   );
-  await expect(page.locator("[data-marker-message]")).toContainText("TS2322", {
-    timeout: 30_000,
-  });
+  // One tip, type first and the diagnostic under it (pierre's own marker
+  // popover is hidden so the two never overlap).
+  const tip = page.getByRole("tooltip");
+  await expect(tip).toContainText("TS2322", { timeout: 30_000 });
+  await expect(tip).toHaveText(/const bad: number.*TS2322/su);
+  await expect(page.locator("[data-marker-message]")).toBeHidden();
 
   // Cmd/Ctrl+click an imported symbol: the file that declares it opens (and
   // the caret is asked for at the definition — pierre delivers that focus on

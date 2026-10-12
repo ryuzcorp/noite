@@ -355,12 +355,39 @@ pub async fn run_cmd(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Spawn `program` with stdout and stderr piped so a caller can stream the
+/// output (an archive, a download) instead of buffering it; env mirrors
+/// `run_cmd`. The caller owns the child — dropping it kills the process.
+pub fn spawn_stream(
+    program: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> anyhow::Result<tokio::process::Child> {
+    use tokio::process::Command;
+    super::stats::count_spawn(program);
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("LANG", "C.UTF-8")
+        .env("HOME", "/root")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.spawn().with_context(|| format!("spawn {program}"))
+}
+
 /// Run a command with stdin bytes; returns raw stdout (no UTF-8 requirement).
 pub async fn run_cmd_stdin(
     program: &str,
     args: &[&str],
     stdin: &[u8],
     cwd: Option<&Path>,
+    env: &[(&str, &str)],
     timeout: Duration,
 ) -> anyhow::Result<Vec<u8>> {
     use tokio::io::AsyncWriteExt;
@@ -377,6 +404,9 @@ pub async fn run_cmd_stdin(
         .kill_on_drop(true);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
     }
     let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
     // Feed stdin from its own task: a command that answers with more than a

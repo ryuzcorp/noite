@@ -15,7 +15,11 @@ use crate::host::{exec, forge, rehydrate};
 
 pub const MAX_BLOB: usize = 256 * 1024;
 pub const MAX_PATCH: usize = 1024 * 1024;
-const MAX_FILES: usize = 2_000;
+
+/// Code-mode Workspace caps: the tree listing and `git archive` agree on what
+/// fits in one checkout (the archive refuses above these before it streams).
+pub const MAX_WORKSPACE_FILES: usize = 5_000;
+pub const MAX_WORKSPACE_BYTES: u64 = 100 * 1024 * 1024;
 
 /// `source.bundle` caps: file count, per-file size and the whole payload.
 pub const MAX_BUNDLE_FILES: usize = 3_000;
@@ -32,6 +36,11 @@ const BUNDLE_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mj
 pub struct TreeEntry {
     pub path: String,
     pub size: u64,
+    /// Git blob id (40 hex): the Workspace hashes its checkout against it.
+    pub sha: String,
+    /// Blob mode: `100644`, `100755` or `120000` (symlink).
+    #[ts(type = "\"100644\" | \"100755\" | \"120000\"")]
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -126,17 +135,22 @@ pub async fn list_tree(bare: &std::path::Path, rev: &str) -> anyhow::Result<Tree
         if rec.is_empty() {
             continue;
         }
-        if files.len() >= MAX_FILES {
+        if files.len() >= MAX_WORKSPACE_FILES {
             truncated = true;
             break;
         }
-        let Some((ty, _, size, path)) = parse_tree_record(rec) else {
+        let Some((ty, sha, size, path, mode)) = parse_tree_record(rec) else {
             continue;
         };
         if ty != "blob" {
             continue;
         }
-        files.push(TreeEntry { path, size });
+        files.push(TreeEntry {
+            path,
+            size,
+            sha,
+            mode,
+        });
     }
     Ok(TreeResponse {
         sha: rev.to_string(),
@@ -145,7 +159,42 @@ pub async fn list_tree(bare: &std::path::Path, rev: &str) -> anyhow::Result<Tree
     })
 }
 
-fn parse_tree_record(rec: &str) -> Option<(String, String, u64, String)> {
+/// Refuse a Workspace checkout that cannot fit the caps, from the tree listing
+/// (before `git archive` streams a byte). The API layer maps the message to a
+/// 413.
+pub async fn archive_guard(bare: &std::path::Path, rev: &str) -> anyhow::Result<()> {
+    let tree = list_tree(bare, rev).await?;
+    if tree.truncated {
+        bail!("repository too large for Code mode: more than {MAX_WORKSPACE_FILES} files");
+    }
+    let bytes: u64 = tree.files.iter().map(|f| f.size).sum();
+    if bytes > MAX_WORKSPACE_BYTES {
+        bail!(
+            "repository too large for Code mode: {} MiB (cap {} MiB)",
+            bytes / (1024 * 1024),
+            MAX_WORKSPACE_BYTES / (1024 * 1024)
+        );
+    }
+    Ok(())
+}
+
+/// Spawn `git archive --format=tar <rev>`; the caller streams stdout. The tree
+/// is listed first (`archive_guard`), so the commit exists and the archive
+/// normally cannot fail.
+pub fn archive_child(bare: &std::path::Path, rev: &str) -> anyhow::Result<tokio::process::Child> {
+    exec::spawn_stream(
+        "git",
+        &[
+            &format!("--git-dir={}", bare.display()),
+            "archive",
+            "--format=tar",
+            rev,
+        ],
+        &[],
+    )
+}
+
+fn parse_tree_record(rec: &str) -> Option<(String, String, u64, String, String)> {
     // Layout varies: with -z the size is space-padded into the head
     // ("<mode> <type> <sha>   <size>\t<path>"); without -z it is its own
     // column ("<mode> <type> <sha>\t<size>\t<path>"). The one invariant is
@@ -155,13 +204,14 @@ fn parse_tree_record(rec: &str) -> Option<(String, String, u64, String)> {
     if tokens.len() < 3 {
         return None;
     }
+    let mode = tokens[0].to_string();
     let ty = tokens[1].to_string();
     let sha = tokens[2].to_string();
     let size: u64 = match tokens.get(3) {
         Some(s) => s.parse().unwrap_or(0),
         None => 0,
     };
-    Some((ty, sha, size, path.to_string()))
+    Some((ty, sha, size, path.to_string(), mode))
 }
 
 /// Validate a browser-supplied path before it touches git.
@@ -181,7 +231,7 @@ pub async fn read_blob(
         bail!("invalid path");
     }
     let out = forge::git_out(bare, &["ls-tree", "-z", "-l", rev, "--", path]).await?;
-    let Some((_, sha, size, _)) = parse_tree_record(out.trim_end_matches('\0')) else {
+    let Some((_, sha, size, _, _)) = parse_tree_record(out.trim_end_matches('\0')) else {
         bail!("file not found in {rev}");
     };
     let truncated = size > MAX_BLOB as u64;
@@ -226,7 +276,7 @@ pub async fn bundle(bare: &std::path::Path, rev: &str) -> anyhow::Result<SourceB
         if rec.is_empty() {
             continue;
         }
-        let Some((ty, oid, size, path)) = parse_tree_record(rec) else {
+        let Some((ty, oid, size, path, _)) = parse_tree_record(rec) else {
             continue;
         };
         if ty == "blob" && bundle_path(&path) && size <= MAX_BUNDLE_FILE {
@@ -244,9 +294,14 @@ pub async fn bundle(bare: &std::path::Path, rev: &str) -> anyhow::Result<SourceB
         .collect();
     let raw = exec::run_cmd_stdin(
         "git",
-        &[&format!("--git-dir={}", bare.display()), "cat-file", "--batch"],
+        &[
+            &format!("--git-dir={}", bare.display()),
+            "cat-file",
+            "--batch",
+        ],
         stdin.as_bytes(),
         None,
+        &[],
         Duration::from_secs(120),
     )
     .await?;
@@ -271,7 +326,9 @@ fn read_batch(raw: &[u8], wanted: &[(String, String)], budget: u64) -> (Vec<Sour
         let Some(nl) = raw[idx..].iter().position(|b| *b == b'\n') else {
             break;
         };
-        let mut header = raw[idx..idx + nl].split(|b| *b == b' ').filter(|p| !p.is_empty());
+        let mut header = raw[idx..idx + nl]
+            .split(|b| *b == b' ')
+            .filter(|p| !p.is_empty());
         let kind = header.nth(1).unwrap_or_default();
         idx += nl + 1;
         if kind == b"missing" {

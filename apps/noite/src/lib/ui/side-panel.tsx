@@ -14,6 +14,7 @@ export const splitColumns = (open: boolean): string =>
 export const SidePanel = ({
   actions,
   children,
+  classes,
   extras,
   onClose,
   title,
@@ -22,27 +23,30 @@ export const SidePanel = ({
   actions?: View;
   /** The body; it owns its padding and scrolling. */
   children: View;
+  /** Extra classes on the panel itself (a page grid's placement). */
+  classes?: string;
   /** Next to the title (a count, a filter). */
   extras?: View;
   onClose: () => void;
   title: string;
 }) => (
   <aside
-    class="border-base-300 bg-base-200 dark:bg-base-100 flex min-h-0 min-w-0 flex-col max-lg:absolute max-lg:inset-0 max-lg:z-30 lg:border-l"
+    class={`border-base-300 bg-base-200 dark:bg-base-100 flex min-h-0 min-w-0 flex-col max-lg:absolute max-lg:inset-0 max-lg:z-30 lg:border-l ${classes ?? ""}`}
     aria-label={title}
   >
-    <div class="border-base-300 flex items-center gap-2 border-b px-3 py-2">
+    <div class="border-base-300 flex min-h-9 items-center gap-2 border-b py-1 pr-1.5 pl-3">
       <h2 class="m-0 text-sm font-semibold">{title}</h2>
       {extras}
       <div class="ml-auto flex items-center gap-1">
         {actions}
         <button
           type="button"
-          class="btn btn-ghost btn-sm btn-square"
+          class="btn btn-ghost btn-xs btn-square opacity-70 hover:opacity-100"
           aria-label="Close panel"
+          title="Close panel"
           onclick={onClose}
         >
-          <X class="h-4 w-4" />
+          <X class="h-3.5 w-3.5" />
         </button>
       </div>
     </div>

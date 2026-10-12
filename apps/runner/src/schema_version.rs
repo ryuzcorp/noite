@@ -470,7 +470,12 @@ mod tests {
             .await
             .expect("first open PR");
         assert!(
-            sqlx::query(open).bind("p2").bind(2).execute(&mut conn).await.is_err(),
+            sqlx::query(open)
+                .bind("p2")
+                .bind(2)
+                .execute(&mut conn)
+                .await
+                .is_err(),
             "a second open PR for the same base/head is refused"
         );
         let rule = "INSERT INTO main.app_branch_rule (app_id, required_approvals) VALUES ('a1', ?)";

@@ -1,10 +1,11 @@
 //! R2 listing rows: the list table and the dense columns view.
 
+import { formatBytes } from "../../bytes";
 import { formatAgo, formatDateTime } from "../../dates";
 import type { R2Object, R2Preview } from "../../runner";
 import { FileIcon, Folder, ImageIcon } from "../../ui/icons";
 import type { PreviewKind } from "../shared";
-import { formatBytes, previewKind } from "../shared";
+import { previewKind } from "../shared";
 import { r2Href } from "./state";
 
 const FileTypeIcon = ({ kind }: { kind: PreviewKind }) => {

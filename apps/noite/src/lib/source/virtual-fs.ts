@@ -76,7 +76,6 @@ export const specMatches = (path: string, spec: string): boolean => {
 };
 
 export class VirtualFs {
-  readonly useCaseSensitiveFileNames = true;
   #directories = new Set<string>(["/"]);
   #files = new Map<string, VirtualEntry>();
 
@@ -129,10 +128,6 @@ export class VirtualFs {
 
   versionOf(path: string): number {
     return this.#files.get(normalizePath(path))?.version ?? 0;
-  }
-
-  paths(): string[] {
-    return [...this.#files.keys()];
   }
 
   /** `LanguageServiceHost` / `ModuleResolutionHost` surface, kept as bound

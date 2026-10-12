@@ -20,7 +20,7 @@ export const makeApp = (over: Partial<RunnerApp> = {}): RunnerApp => ({
   name: "App One",
   slug: "app-one",
   status: "running",
-  subdomain: "app-one.localhost",
+  subdomain: "app-one.noite.localhost",
   updatedAt: "2026-01-01T00:00:00Z",
   userId: "u-creator",
   wokeAt: null,

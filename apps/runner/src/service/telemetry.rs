@@ -26,7 +26,10 @@ async fn status(state: &AppState) -> anyhow::Result<TelemetryStatus> {
     let pool = &state.pool;
     let cfg = &state.config;
     let now = chrono::Utc::now();
-    let setting = db::get_setting(pool, db::TELEMETRY_ENABLED).await?.as_deref() != Some("0");
+    let setting = db::get_setting(pool, db::TELEMETRY_ENABLED)
+        .await?
+        .as_deref()
+        != Some("0");
     let last_sent_at = db::get_setting(pool, db::TELEMETRY_LAST_SENT_AT).await?;
     let lock_reason = cfg.telemetry_lock_reason();
     let locked = lock_reason.is_some();

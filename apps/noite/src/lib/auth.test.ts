@@ -109,3 +109,24 @@ describe("email-code sign-in", () => {
     expect(onboardedAt ?? null).toBeNull();
   });
 });
+
+describe("dev-only shortcuts key on the localhost family", () => {
+  test("a *.localhost base still delivers the code on the console", async () => {
+    db.raw.run(
+      `INSERT INTO "user" (id, name, email, emailVerified) VALUES ('u4', 'Dev', 'dev@example.com', 1)`
+    );
+    const env = { ...ENV, BASE_DOMAIN: "noite.localhost" };
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await createAuth(env, env.BETTER_AUTH_URL).api.sendVerificationOTP({
+        body: { email: "dev@example.com", type: "sign-in" },
+      });
+      const printed = log.mock.calls
+        .map((args) => String(args[0]))
+        .some((text) => text.includes("[noite:otp]"));
+      expect(printed).toBe(true);
+    } finally {
+      log.mockRestore();
+    }
+  });
+});

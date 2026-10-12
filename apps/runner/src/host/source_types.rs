@@ -226,7 +226,8 @@ pub async fn read(cfg: &Config, slug: &str) -> anyhow::Result<SourceTypes> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SourceTypes::empty()),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
-    let raw = zstd::decode_all(&packed[..]).with_context(|| format!("decompress {}", path.display()))?;
+    let raw =
+        zstd::decode_all(&packed[..]).with_context(|| format!("decompress {}", path.display()))?;
     serde_json::from_slice(&raw).with_context(|| format!("decode {}", path.display()))
 }
 
@@ -270,7 +271,8 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("noite-types-{tag}-{}", crate::models::new_id()));
+        let dir =
+            std::env::temp_dir().join(format!("noite-types-{tag}-{}", crate::models::new_id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir.canonicalize().expect("canonical temp dir")
     }
@@ -360,7 +362,8 @@ mod tests {
             .expect("pnpm link");
         write(&dir.join("packages/lib/index.d.ts"), "export {};\n");
         std::fs::create_dir_all(nm.join("@w")).expect("scope dir");
-        std::os::unix::fs::symlink("../../packages/lib", nm.join("@w/lib")).expect("workspace link");
+        std::os::unix::fs::symlink("../../packages/lib", nm.join("@w/lib"))
+            .expect("workspace link");
 
         let (files, truncated) = walk(&nm, &dir);
         assert!(!truncated);
@@ -431,8 +434,14 @@ mod tests {
         let dir = tmp("store");
         let cfg = test_cfg(&dir);
         let worktree = dir.join("build");
-        write(&worktree.join("node_modules/dep/index.d.ts"), "export {};\n");
-        write(&worktree.join("node_modules/dep/package.json"), "{\"name\":\"dep\"}\n");
+        write(
+            &worktree.join("node_modules/dep/index.d.ts"),
+            "export {};\n",
+        );
+        write(
+            &worktree.join("node_modules/dep/package.json"),
+            "{\"name\":\"dep\"}\n",
+        );
 
         assert_eq!(
             capture(&store_path(&cfg, "app-a"), &worktree, "abc123")
@@ -444,7 +453,10 @@ mod tests {
         assert_eq!(stored.sha.as_deref(), Some("abc123"));
         assert_eq!(
             paths(&stored.files),
-            ["node_modules/dep/index.d.ts", "node_modules/dep/package.json"]
+            [
+                "node_modules/dep/index.d.ts",
+                "node_modules/dep/package.json"
+            ]
         );
         assert!(!stored.truncated);
         assert!(store_path(&cfg, "app-a").exists());

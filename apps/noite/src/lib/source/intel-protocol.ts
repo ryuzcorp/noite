@@ -212,6 +212,21 @@ export const diagnosticsToMarkers = (
   }));
 };
 
+/** The messages the hover stack shows for the diagnostics covering `offset`.
+ * Zero-width ranges are widened exactly like `diagnosticsToMarkers` widens
+ * them for the squiggle, so the popup covers what the mark underlines. */
+export const diagnosticMessagesAtOffset = (
+  diagnostics: readonly IntelDiagnostic[],
+  offset: number
+): string[] =>
+  diagnostics
+    .filter(
+      (diagnostic) =>
+        offset >= diagnostic.start &&
+        offset < Math.max(diagnostic.end, diagnostic.start + 1)
+    )
+    .map((diagnostic) => `TS${diagnostic.code}: ${diagnostic.message}`);
+
 /** The identifier characters a completion may extend leftwards. */
 const IDENTIFIER_TAIL = /[\w$]+$/u;
 

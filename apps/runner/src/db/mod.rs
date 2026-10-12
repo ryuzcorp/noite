@@ -26,9 +26,9 @@ pub mod prs;
 pub use apps::{
     add_domain, count_apps_for_user, create_app, delete_app, domain_owner, finish_app_import,
     get_app, get_app_by_domain, get_app_by_slug, get_app_limit, list_all_apps, list_app_domains,
-    list_app_limits, list_apps, list_domains_for, patch_app_desired, remove_domain, rename_app,
-    set_app_awake, set_app_asleep, set_app_import_source, set_app_limit, set_deployed_config,
-    update_app_status, NewApp,
+    list_app_limits, list_apps, list_domains_for, patch_app_desired, rebind_local_subdomains,
+    remove_domain, rename_app, set_app_asleep, set_app_awake, set_app_import_source, set_app_limit,
+    set_deployed_config, update_app_status, NewApp,
 };
 pub use compaction::{
     bump_metric_version, get_compacted_hours, get_metric_version, mark_hour_compacted,
@@ -42,8 +42,8 @@ pub use deploys::{
 pub use env::{delete_env, list_env, set_env, tenant_env};
 pub use errors::{
     count_error_issues, get_error_issue, insert_error_event, list_error_events, list_error_hours,
-    list_error_issues, prune_error_events, prune_errors, refresh_error_issue_count,
-    set_error_hour, set_error_status, upsert_error_issue, NewErrorEvent,
+    list_error_issues, prune_error_events, prune_errors, refresh_error_issue_count, set_error_hour,
+    set_error_status, upsert_error_issue, NewErrorEvent,
 };
 pub use events::{
     get_app_user_props, inc_app_insight, insert_app_event, list_app_channels, list_app_events,

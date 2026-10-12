@@ -63,7 +63,7 @@ A `release` string in the Wrangler config runs once per deploy, after the build 
 It runs with `sh -c` in the project with your app's env vars, and is killed after 10 minutes. The command is capped at 500 characters. A non-zero exit fails the deploy and **the previous deployment keeps serving**. `release` is removed from the config before `celld deploy`.
 
 :::warning
-In multi-tenant mode (`NOITE_TENANCY=multi`, the default off `localhost`) release commands are **skipped**, with a line in the deploy log: running them would need the install's root storage keys. Migrate from the app itself at startup, or ask the operator to run `single`. See [Tenancy](/self-hosting/tenancy#what-multi-does-and-does-not-promise-alpha).
+In multi-tenant mode (`NOITE_TENANCY=multi`, the default off a `localhost` base) release commands are **skipped**, with a line in the deploy log: running them would need the install's root storage keys. Migrate from the app itself at startup, or ask the operator to run `single`. See [Tenancy](/self-hosting/tenancy#what-multi-does-and-does-not-promise-alpha).
 :::
 
 ## Deploy from CI
@@ -86,7 +86,7 @@ bunx @noitenow/cli deploy --slug <slug> --url https://git.<domain> --token "$NOI
 | --- | --- | --- |
 | `--dist` | — | `dist` |
 | `--slug` | `NOITE_SLUG` | repo name, slugified |
-| `--url` | `GIT_PUBLIC_BASE` / `NOITE_BASE` | `http://git.localhost:9080` |
+| `--url` | `GIT_PUBLIC_BASE` / `NOITE_BASE` | `http://git.noite.localhost:9080` |
 | `--token` | `NOITE_API_KEY` / `NOITE_GIT_TOKEN` | — |
 | `--wrangler` | — | `wrangler.jsonc` |
 | `--message` | — | `deploy <sha12>` |

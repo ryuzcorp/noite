@@ -256,7 +256,10 @@ async fn apps_patch_agrees() {
     assert_eq!(rest_app["desiredState"], "stopped");
 
     let rpc_app = h
-        .rpc("apps.patch", json!({ "id": b.id, "desiredState": "stopped" }))
+        .rpc(
+            "apps.patch",
+            json!({ "id": b.id, "desiredState": "stopped" }),
+        )
         .await
         .expect("apps.patch");
     assert_eq!(rpc_app["desiredState"], "stopped");
@@ -499,8 +502,11 @@ async fn not_found_statuses_agree() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(
-        h.rpc("env.set", json!({ "id": "missing", "name": "A", "value": "1" }))
-            .await,
+        h.rpc(
+            "env.set",
+            json!({ "id": "missing", "name": "A", "value": "1" })
+        )
+        .await,
         Err((404, "app not found".into()))
     );
 
@@ -546,11 +552,8 @@ async fn conflict_statuses_agree() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(
-        h.rpc(
-            "apps.rename",
-            json!({ "id": b.id, "slug": "conflict-a" })
-        )
-        .await,
+        h.rpc("apps.rename", json!({ "id": b.id, "slug": "conflict-a" }))
+            .await,
         Err((409, "slug already taken".into()))
     );
 
@@ -611,8 +614,11 @@ async fn validation_statuses_agree() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
-        h.rpc("apps.patch", json!({ "id": app.id, "desiredState": "bogus" }))
-            .await,
+        h.rpc(
+            "apps.patch",
+            json!({ "id": app.id, "desiredState": "bogus" })
+        )
+        .await,
         Err((400, "desiredState must be running|stopped".into()))
     );
 
@@ -660,11 +666,8 @@ async fn validation_statuses_agree() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "rest {hostname}");
         assert!(
             matches!(
-                h.rpc(
-                    "domains.add",
-                    json!({ "id": app.id, "hostname": hostname })
-                )
-                .await,
+                h.rpc("domains.add", json!({ "id": app.id, "hostname": hostname }))
+                    .await,
                 Err((400, _))
             ),
             "rpc {hostname}"
@@ -808,7 +811,11 @@ async fn telemetry_status_agrees() {
 
     // The preference moves through either transport while the lock holds.
     let (status, put) = h
-        .rest("PUT", "/v1/admin/telemetry", Some(json!({ "enabled": true })))
+        .rest(
+            "PUT",
+            "/v1/admin/telemetry",
+            Some(json!({ "enabled": true })),
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(put["setting"], json!(true));
@@ -878,7 +885,12 @@ async fn source_bundle_and_types_agree() {
     .await;
     git(
         &work,
-        &["push", "-q", bare.to_str().expect("mirror path"), "main:main"],
+        &[
+            "push",
+            "-q",
+            bare.to_str().expect("mirror path"),
+            "main:main",
+        ],
     )
     .await;
 
@@ -887,7 +899,10 @@ async fn source_bundle_and_types_agree() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(rest["sha"], json!(sha));
-    assert_eq!(rest["files"], json!([{ "path": "src/index.ts", "text": "export const a = 1;\n" }]));
+    assert_eq!(
+        rest["files"],
+        json!([{ "path": "src/index.ts", "text": "export const a = 1;\n" }])
+    );
     assert_eq!(rest["truncated"], json!(false));
     assert_eq!(
         h.rpc("source.bundle", json!({ "id": app.id }))
@@ -932,8 +947,14 @@ async fn source_bundle_and_types_agree() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(rest["sha"], json!(sha));
-    assert_eq!(rest["files"][0]["path"], json!("node_modules/dep/index.d.ts"));
-    assert_eq!(rest["files"][1]["path"], json!("node_modules/dep/package.json"));
+    assert_eq!(
+        rest["files"][0]["path"],
+        json!("node_modules/dep/index.d.ts")
+    );
+    assert_eq!(
+        rest["files"][1]["path"],
+        json!("node_modules/dep/package.json")
+    );
     assert_eq!(
         h.rpc("source.types", json!({ "id": app.id }))
             .await

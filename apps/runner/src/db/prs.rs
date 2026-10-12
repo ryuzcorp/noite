@@ -195,12 +195,11 @@ pub async fn list_prs(
 
 /// `(open, closed, merged)` counts for one app's filter chips.
 pub async fn counts(pool: &SqlitePool, app_id: &str) -> sqlx::Result<(i64, i64, i64)> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT state, COUNT(*) FROM pull_request WHERE app_id = ? GROUP BY state",
-    )
-    .bind(app_id)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT state, COUNT(*) FROM pull_request WHERE app_id = ? GROUP BY state")
+            .bind(app_id)
+            .fetch_all(pool)
+            .await?;
     let mut counts = (0, 0, 0);
     for (state, count) in rows {
         match state.as_str() {
@@ -273,7 +272,12 @@ pub async fn reopen_pr(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
     Ok(())
 }
 
-pub async fn merge_pr(pool: &SqlitePool, id: &str, merge_sha: &str, merged_by: &str) -> sqlx::Result<()> {
+pub async fn merge_pr(
+    pool: &SqlitePool,
+    id: &str,
+    merge_sha: &str,
+    merged_by: &str,
+) -> sqlx::Result<()> {
     let now = now_iso();
     sqlx::query(
         "UPDATE pull_request SET state = 'merged', merge_sha = ?, merged_by = ?, \
@@ -311,7 +315,12 @@ pub async fn open_prs_for_head(
 
 /// Move every open PR whose head branch is `head` to `sha`. A no-op when the
 /// sha is unchanged, so a re-push of the same tip never bumps `updated_at`.
-pub async fn move_heads(pool: &SqlitePool, app_id: &str, head: &str, sha: &str) -> sqlx::Result<u64> {
+pub async fn move_heads(
+    pool: &SqlitePool,
+    app_id: &str,
+    head: &str,
+    sha: &str,
+) -> sqlx::Result<u64> {
     let res = sqlx::query(
         "UPDATE pull_request SET head_sha = ?, updated_at = ? \
          WHERE app_id = ? AND head = ? AND state = 'open' AND head_sha != ?",
@@ -329,7 +338,11 @@ pub async fn move_heads(pool: &SqlitePool, app_id: &str, head: &str, sha: &str) 
 /// Dismiss every undismissed review recorded at a different sha than the
 /// current head. Keyed on the sha, not the branch, so a force-move that lands
 /// on an older commit dismisses too.
-pub async fn dismiss_reviews_before(pool: &SqlitePool, pr_id: &str, head_sha: &str) -> sqlx::Result<()> {
+pub async fn dismiss_reviews_before(
+    pool: &SqlitePool,
+    pr_id: &str,
+    head_sha: &str,
+) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE pr_review SET dismissed_at = ? \
          WHERE pr_id = ? AND commit_sha != ? AND dismissed_at IS NULL",

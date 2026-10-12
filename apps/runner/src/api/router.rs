@@ -4,6 +4,7 @@
 //! `axum::serve`.
 
 use axum::{
+    extract::DefaultBodyLimit,
     middleware,
     routing::{delete, get, post},
     Router,
@@ -68,10 +69,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/apps/{id}/git/log", get(api::git_log))
         .route("/v1/apps/{id}/git/commits/{sha}", get(api::git_commit))
         .route("/v1/apps/{id}/git/compare", get(api::git_compare))
-        .route(
-            "/v1/apps/{id}/git/branches",
-            post(api::git_branch_create),
-        )
+        .route("/v1/apps/{id}/git/branches", post(api::git_branch_create))
         .route(
             "/v1/apps/{id}/git/branches/{*name}",
             delete(api::git_branch_delete),
@@ -124,7 +122,13 @@ pub fn router(state: AppState) -> Router {
             "/v1/apps/{id}/storage/d1/{database_id}/delete-rows",
             post(api::app_d1_delete_rows),
         )
-        .route("/v1/apps/{id}/source/commit", post(api::app_source_commit))
+        .route(
+            "/v1/apps/{id}/source/commit",
+            post(api::app_source_commit).layer(DefaultBodyLimit::max(
+                crate::host::web_commit::MAX_COMMIT_BODY_BYTES,
+            )),
+        )
+        .route("/v1/apps/{id}/source/archive", get(api::source_archive))
         .route(
             "/v1/apps/{id}/pull_requests",
             get(api::list_prs).post(api::create_pr),

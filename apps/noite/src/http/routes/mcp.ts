@@ -29,6 +29,7 @@ import type { JsonRpcFailure } from "../../lib/mcp/protocol";
 import { MCP_TOOLS } from "../../lib/mcp/tools";
 import { MAX_BODY_BYTES, readBoundedText, tooLarge } from "../body";
 import type { RouteHandler } from "../config";
+import { originAllowed } from "../origin";
 
 const unauthorized = (): Response =>
   Response.json(
@@ -52,34 +53,6 @@ const parseFailure = (): Response => {
     headers: { "cache-control": "no-store" },
     status: 400,
   });
-};
-
-/** Whether a browser may call this endpoint from where it says it is: this
- * site (the control UI's own fetch), plus the configured auth URL when a proxy
- * makes the two differ. A request without `Origin` (any non-browser MCP
- * client) is unaffected. */
-const originAllowed = (request: Request, env: KitEnv): boolean => {
-  const origin = request.headers.get("origin");
-  if (!origin) {
-    return true;
-  }
-  try {
-    if (origin === new URL(request.url).origin) {
-      return true;
-    }
-  } catch {
-    return false;
-  }
-  if (!env.BETTER_AUTH_URL) {
-    return false;
-  }
-  try {
-    return origin === new URL(env.BETTER_AUTH_URL).origin;
-  } catch {
-    // A malformed BETTER_AUTH_URL already fails loudly on the auth path; it
-    // does not widen what this endpoint accepts.
-    return false;
-  }
 };
 
 const bearerKey = (request: Request): string | null => {

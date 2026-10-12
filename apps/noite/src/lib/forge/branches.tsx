@@ -8,6 +8,7 @@ import { collectRef, liveEl, newLiveRef } from "../live-ref";
 import { appDetail } from "../resources";
 import type { GitBranch } from "../runner";
 import { gitBranchCreate, gitBranchDelete } from "../server/forge.server";
+import { confirmDialog } from "../ui/confirm";
 import {
   ArrowUpDown,
   Check,
@@ -269,16 +270,21 @@ export const BranchPicker = ({
               defaultBranch={defaultBranch}
               onPick={pick}
               onDelete={(target) => {
-                // oxlint-disable-next-line no-alert -- native confirm is the destructive-action guard used elsewhere.
-                if (!confirm(`Delete branch ${target}?`)) {
-                  return;
-                }
-                void run(async () => {
-                  await gitBranchDelete({ appId, name: target });
-                  if (target === value) {
-                    onChange(defaultBranch);
+                void (async () => {
+                  const ok = await confirmDialog({
+                    confirmLabel: "Delete",
+                    title: `Delete branch ${target}?`,
+                  });
+                  if (!ok) {
+                    return;
                   }
-                });
+                  await run(async () => {
+                    await gitBranchDelete({ appId, name: target });
+                    if (target === value) {
+                      onChange(defaultBranch);
+                    }
+                  });
+                })();
               }}
             />
           ))}

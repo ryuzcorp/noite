@@ -25,7 +25,15 @@ if [[ -z "${GIT_PUBLIC_BASE:-}" ]]; then
   fi
 fi
 
-SLUG="${NOITE_GIT_SLUG:-test}"
+if [[ -n "${NOITE_GIT_SLUG:-}" ]]; then
+  SLUG="$NOITE_GIT_SLUG"
+else
+  read -r -p "App slug to deploy to: " SLUG
+fi
+if [[ ! "$SLUG" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+  echo "invalid slug '${SLUG}' — lowercase letters, digits and inner hyphens" >&2
+  exit 1
+fi
 GIT_BASE="${GIT_PUBLIC_BASE:-https://git.noite.now}"
 GIT_BASE="${GIT_BASE%/}"
 

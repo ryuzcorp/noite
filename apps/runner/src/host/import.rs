@@ -153,7 +153,10 @@ pub fn import_ref(reference: &str) -> Result<(), String> {
     if reference.starts_with('-') {
         return bad("must not start with '-'");
     }
-    if reference.chars().any(|c| c.is_control() || c.is_whitespace()) {
+    if reference
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace())
+    {
         return bad("must not contain whitespace");
     }
     if reference.contains("..") || reference.contains("@{") || reference.contains('\\') {
@@ -263,9 +266,10 @@ async fn import_once(
     if let Some(reference) = &source.reference {
         import_ref(reference).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    let scratch = exec::work_root(&state.config)
-        .join("import")
-        .join(format!("{}-{}", app.slug, new_id()));
+    let scratch =
+        exec::work_root(&state.config)
+            .join("import")
+            .join(format!("{}-{}", app.slug, new_id()));
     tokio::fs::create_dir_all(&scratch).await?;
     let result = import_into(state, app, source, &target, &scratch, protocols).await;
     let _ = tokio::fs::remove_dir_all(&scratch).await;
@@ -284,7 +288,8 @@ async fn import_into(
 ) -> anyhow::Result<String> {
     // The clone itself enforces the size cap while it runs and on exit
     // (`run_grouped`), so by here the repository is within it.
-    let upstream_sha = clone_scratch(target, source.reference.as_deref(), scratch, protocols).await?;
+    let upstream_sha =
+        clone_scratch(target, source.reference.as_deref(), scratch, protocols).await?;
     let mirror = git_http::ensure_bare(&state.config, &app.slug).await?;
     // Objects only: moving a ref here would make `after_receive` see no change
     // and publish nothing, so the temp ref is the fetch target and `publish_ref`
@@ -300,7 +305,8 @@ async fn import_into(
             target.repo,
             &upstream_sha[..upstream_sha.len().min(7)]
         );
-        let identity = git_identity::noreply(&state.config, &source.actor.user_id, &source.actor.name);
+        let identity =
+            git_identity::noreply(&state.config, &source.actor.user_id, &source.actor.name);
         let sha = squash_root(&mirror, &tree, &message, &identity).await?;
         drop_ref(&mirror, IMPORT_REF).await?;
         sha
@@ -382,7 +388,10 @@ async fn run_grouped(
                 let status = status.with_context(|| format!("wait for {program}"))?;
                 let bytes = dir_bytes(work_dir)?;
                 if bytes > cap {
-                    bail!("repository is over the {}-MiB import cap", cap / (1024 * 1024));
+                    bail!(
+                        "repository is over the {}-MiB import cap",
+                        cap / (1024 * 1024)
+                    );
                 }
                 if !status.success() {
                     bail!("{program} failed ({status}): {}", log_tail(&log_path));
@@ -401,7 +410,10 @@ async fn run_grouped(
                 if tokio::time::Instant::now() >= deadline {
                     kill_group(group);
                     let _ = tokio::time::timeout(REAP, child.wait()).await;
-                    bail!("clone timed out after {}s and was killed", timeout.as_secs());
+                    bail!(
+                        "clone timed out after {}s and was killed",
+                        timeout.as_secs()
+                    );
                 }
             }
         }
@@ -440,16 +452,7 @@ async fn clone_scratch(
     // The clone path is also the process cwd, so it must exist first.
     tokio::fs::create_dir_all(scratch).await?;
     let mut args = protocols.args();
-    args.extend(
-        [
-            "clone",
-            "--bare",
-            "--single-branch",
-            "--no-tags",
-            "--quiet",
-        ]
-        .map(str::to_string),
-    );
+    args.extend(["clone", "--bare", "--single-branch", "--no-tags", "--quiet"].map(str::to_string));
     if let Some(reference) = reference {
         // `--branch=<ref>` (value attached) so a ref can never read as an option.
         args.push(format!("--branch={reference}"));
@@ -787,7 +790,10 @@ mod tests {
             .await
             .expect("mirror");
 
-        let upstream_sha = git_in(&upstream, &["rev-parse", "HEAD"]).await.trim().to_string();
+        let upstream_sha = git_in(&upstream, &["rev-parse", "HEAD"])
+            .await
+            .trim()
+            .to_string();
         let scratch = root.join("scratch");
         let cloned = clone_scratch(&target, None, &scratch, Protocols { file: true })
             .await
@@ -800,10 +806,7 @@ mod tests {
             .await
             .expect("tree");
         let identity = git_identity::noreply(&cfg, "user-1", "Ryuz");
-        let message = format!(
-            "Initial commit from fixture/fixture@{}",
-            &upstream_sha[..7]
-        );
+        let message = format!("Initial commit from fixture/fixture@{}", &upstream_sha[..7]);
         let squashed = squash_root(&mirror, &tree, &message, &identity)
             .await
             .expect("squash");

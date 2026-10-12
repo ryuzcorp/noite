@@ -3,12 +3,13 @@
 
 import { atom } from "ilha";
 
+import { formatBytes } from "../../bytes";
 import { errorMessage } from "../../errors";
 import { invalidateR2, r2List } from "../../resources";
 import { R2_UPLOAD_LIMIT } from "../../runner";
 import { r2Delete } from "../../server/storage.server";
 import { ChevronLeft, ChevronRight, Refresh, Search } from "../../ui/icons";
-import { DetailPanel, EmptyState, formatBytes } from "../shared";
+import { DetailPanel, EmptyState } from "../shared";
 import { R2DetailPanel } from "./detail";
 import { R2ColumnRows, R2ListRows } from "./rows";
 import { R2_VIEW_LABELS, R2_VIEWS, toggledKey } from "./state";

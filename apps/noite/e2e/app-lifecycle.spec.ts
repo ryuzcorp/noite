@@ -28,7 +28,7 @@ test("custom domains, env vars and deletion behave", async ({
   expect(invalid.status).toBe(400);
 
   const platform = await runnerCall(request, `/v1/apps/${id}/domains`, {
-    body: { hostname: "api.localhost" },
+    body: { hostname: "api.noite.localhost" },
     method: "POST",
   });
   expect(platform.status).toBe(400);
@@ -79,7 +79,7 @@ test("custom domains, env vars and deletion behave", async ({
   // No Caddy in this lane, so this asks the runner directly: the fallback page
   // is what a wildcard edge serves for an unknown tenant host.
   const fallback = await request.get("http://localhost:8080/v1/edge/fallback", {
-    headers: { host: "nope.localhost" },
+    headers: { host: "nope.noite.localhost" },
   });
   expect(fallback.status()).toBe(404);
   expect(await fallback.text()).toContain("no app for this slug");

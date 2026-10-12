@@ -85,12 +85,22 @@ RUN --mount=type=cache,id=noite-cargo-registry,target=/usr/local/cargo/registry,
 FROM docker.io/oven/bun:1.4-debian AS ui-build
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 WORKDIR /app
+# The preview inlines Poder's `dist/` from beside its importer
+# (`apps/noite/poder-dist/`): build it here, and the UI install's
+# `postinstall` copies it over before the bundle is built.
+COPY packages/poder/ /packages/poder/
+RUN --mount=type=cache,id=noite-bun-cache,target=/root/.bun/install/cache,sharing=locked \
+    sh -c 'cd /packages/poder && bun install && bun run build'
 COPY apps/noite/package.json apps/noite/bun.lock ./
+COPY apps/noite/patches/ ./patches/
 # The package cache only saves downloads; `--frozen-lockfile` still checks
 # every package against the lockfile's integrity hashes.
 RUN --mount=type=cache,id=noite-bun-cache,target=/root/.bun/install/cache,sharing=locked \
     bun install --frozen-lockfile
 COPY apps/noite/ ./
+# Explicit (the install's `postinstall` does the same): the bundle inlines
+# this directory, so it must exist no matter how the install ran.
+RUN mkdir -p poder-dist && cp /packages/poder/dist/*.mjs poder-dist/
 RUN bun run build \
   && rm -f dist/.dev.vars dist/.dev.vars.* dist/ssr/.dev.vars dist/ssr/.dev.vars.* \
   && find dist -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1 >dist/REVISION
@@ -155,8 +165,9 @@ RUN useradd -u 10020 -m -s /bin/sh fleet \
 COPY --from=celld /usr/local/bin/celld /usr/local/bin/celld
 COPY --from=caddy-build /out/caddy /usr/local/bin/caddy
 RUN caddy version && caddy list-modules | grep -qx 'http.handlers.rate_limit'
-# Apache-2.0 §4(a): a distributed image carries a copy of the License.
-COPY LICENSE /licenses/
+# Apache-2.0 §4(a): a distributed image carries a copy of the License, and
+# §4(d) its NOTICE (third-party attributions, e.g. the bundled Nodepod).
+COPY LICENSE NOTICE /licenses/
 WORKDIR /data
 # Everything the edge proxies to lives in this container (tenant fleets,
 # control on 127.0.0.1:8090, the runner API on 127.0.0.1:8080); the runner

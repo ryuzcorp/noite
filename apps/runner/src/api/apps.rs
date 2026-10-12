@@ -138,17 +138,15 @@ pub async fn rename_app(
     Path(id): Path<String>,
     Json(body): Json<RenameApp>,
 ) -> impl IntoResponse {
-    service::apps::rename(
-        &state,
-        &id,
-        body.name.as_deref(),
-        body.slug.as_deref(),
-    )
-    .await
-    .map(Json)
+    service::apps::rename(&state, &id, body.name.as_deref(), body.slug.as_deref())
+        .await
+        .map(Json)
 }
 
-pub async fn delete_app(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+pub async fn delete_app(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
     service::apps::delete(&state, &id)
         .await
         .map(|()| StatusCode::NO_CONTENT)

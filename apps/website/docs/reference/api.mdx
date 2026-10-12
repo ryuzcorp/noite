@@ -60,11 +60,12 @@ Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
 
 | Method | Route | Notes |
 | --- | --- | --- |
-| `GET` | `/v1/apps/{id}/tree?ref=` | File tree at `ref` (branch, tag or sha; defaults to the deployed sha, else `HEAD`) |
+| `GET` | `/v1/apps/{id}/tree?ref=` | File tree at `ref` (branch, tag or sha; defaults to the deployed sha, else `HEAD`). Each file carries `path`, `size`, the git blob `sha` and `mode` (`100644`/`100755`/`120000`); ≤ 5000 files, `truncated` above that |
+| `GET` | `/v1/apps/{id}/source/archive?ref=` | The tree at `ref` as an uncompressed tar (`application/x-tar`), streamed for Code mode's workspace checkout. Caps are checked from the listing before streaming: ≤ 5000 files and ≤ 100 MiB, else `413` "repository too large for Code mode: …" |
 | `GET` | `/v1/apps/{id}/blob/{*path}?ref=` | File contents at `ref` |
 | `GET` | `/v1/apps/{id}/bundle?ref=` | Every text source at `ref` for the code editor's language service (≤ 3000 files, ≤ 256 KiB each, ≤ 8 MiB total; `truncated` marks a capped read) |
 | `GET` | `/v1/apps/{id}/types` | Declaration files (`*.d.ts`/`*.d.mts`/`*.d.cts` + each package's `package.json`) captured from the app's last successful build; `sha: null` and no files until one lands |
-| `POST` | `/v1/apps/{id}/source/commit` | Browser-edit commit: validated paths, a message and the session `actor` (`{userId, name}`), optional `branch` and `fromSha` so a protected `main` can send the edit to a new branch; wakes asleep apps |
+| `POST` | `/v1/apps/{id}/source/commit` | Browser-edit commit: up to 100 `files` (text, or `base64` uploads chosen by a per-file optional `encoding`), optional `deletes` paths and optional `moves` (`{ from, to }` pairs), a message and the session `actor` (`{userId, name}`), optional `branch` and `fromSha` so a protected `main` can send the edit to a new branch; body cap 40 MiB (the runner caps a commit at 25 MiB decoded); wakes asleep apps |
 
 ## Git forge
 
@@ -163,7 +164,7 @@ git push noite main
 
 ## RPC mirror
 
-`POST /rpc` is JSON-RPC 2.0 over the same auth, with a method per REST route (`apps.list`, `env.set`, `deploys.rollback`, `storage.d1.rows`, …). A few methods exist only there, because only the control UI uses them:
+`POST /rpc` is JSON-RPC 2.0 over the same auth, with a method per REST route (`apps.list`, `env.set`, `deploys.rollback`, `storage.d1.rows`, …). A few methods exist only there, because only the control UI uses them. Request bodies are capped at 2 MiB (axum's default), so a `source.commit` carrying uploads must use the REST route above (40 MiB):
 
 | Method | Params | Does |
 | --- | --- | --- |

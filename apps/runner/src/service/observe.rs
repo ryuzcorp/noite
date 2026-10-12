@@ -113,10 +113,7 @@ pub async fn spans(
 
 /// Per-app metrics version (spec T3.6): dashboard polls fetch this first and
 /// skip their window queries when it hasn't moved.
-pub async fn metrics_version(
-    state: &AppState,
-    id: &str,
-) -> Result<serde_json::Value, ApiError> {
+pub async fn metrics_version(state: &AppState, id: &str) -> Result<serde_json::Value, ApiError> {
     let (app_id, _) = telemetry_target_or_404(&state.pool, id).await?;
     match db::get_metric_version(&state.pool, &app_id).await {
         Ok(v) => Ok(serde_json::json!({ "version": v })),
@@ -124,15 +121,14 @@ pub async fn metrics_version(
     }
 }
 
-pub async fn logs_lines(
-    state: &AppState,
-    id: &str,
-) -> Result<Vec<String>, ApiError> {
+pub async fn logs_lines(state: &AppState, id: &str) -> Result<Vec<String>, ApiError> {
     let (app_id, slug) = telemetry_target_or_404(&state.pool, id).await?;
     Ok(merged_lines(state, &app_id, &slug).await)
 }
 
-fn json_rows<T: serde::Serialize>(rows: sqlx::Result<Vec<T>>) -> Result<serde_json::Value, ApiError> {
+fn json_rows<T: serde::Serialize>(
+    rows: sqlx::Result<Vec<T>>,
+) -> Result<serde_json::Value, ApiError> {
     let rows = rows.map_err(|e| ApiError::internal(e.to_string()))?;
     serde_json::to_value(rows).map_err(|e| ApiError::internal(e.to_string()))
 }

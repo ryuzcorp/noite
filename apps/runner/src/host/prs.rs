@@ -104,7 +104,9 @@ pub struct HunkRanges {
 impl HunkRanges {
     /// Whether `line` sits inside one of the ranges.
     pub fn covers(ranges: &[(i64, i64)], line: i64) -> bool {
-        ranges.iter().any(|(start, end)| line >= *start && line <= *end)
+        ranges
+            .iter()
+            .any(|(start, end)| line >= *start && line <= *end)
     }
 }
 

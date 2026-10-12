@@ -26,7 +26,6 @@ describe("resolveRepoConfig", () => {
       "src/util.tsx": "export const B = () => null;\n",
     };
     const config = resolveRepoConfig(repoFs(files), paths(files));
-    expect(config.fromTsconfig).toBe(false);
     expect(config.options).toEqual(defaultCompilerOptions());
     expect(config.options.target).toBe(ts.ScriptTarget.ESNext);
     expect(config.options.module).toBe(ts.ModuleKind.ESNext);
@@ -54,7 +53,6 @@ describe("resolveRepoConfig", () => {
       }),
     };
     const config = resolveRepoConfig(repoFs(files), paths(files));
-    expect(config.fromTsconfig).toBe(true);
     expect(config.options.target).toBe(ts.ScriptTarget.ES2022);
     expect(config.options.jsx).toBe(ts.JsxEmit.ReactJSX);
     expect(config.options.strict).toBe(false);
@@ -160,7 +158,9 @@ describe("virtual fs", () => {
   test("clear() keeps only what the predicate selects", () => {
     const fs = repoFs({ "__libs/lib.es5.d.ts": "lib", "src/a.ts": "" });
     fs.clear((path) => path.startsWith("/__libs/"));
-    expect(fs.paths()).toEqual(["/__libs/lib.es5.d.ts"]);
+    expect(fs.read("/__libs/lib.es5.d.ts")).toBe("lib");
+    expect(fs.read("/src/a.ts")).toBeUndefined();
     expect(fs.getDirectories("/")).toEqual(["__libs"]);
+    expect(fs.has("/src/a.ts")).toBe(false);
   });
 });

@@ -50,7 +50,11 @@ fn not_found(id: &Id, message: &str) -> JsonRpcResponse {
 }
 
 fn conflict(id: &Id, message: String) -> JsonRpcResponse {
-    rpc_err(id.clone(), JsonRpcErrorReason::ApplicationError(409), message)
+    rpc_err(
+        id.clone(),
+        JsonRpcErrorReason::ApplicationError(409),
+        message,
+    )
 }
 
 fn internal(id: &Id, message: String) -> JsonRpcResponse {
@@ -58,13 +62,16 @@ fn internal(id: &Id, message: String) -> JsonRpcResponse {
 }
 
 /// Encode one service result: the JSON-RPC mirror of `ApiError`'s HTTP status
-/// (400/404/409, `InternalError` for 500).
+/// (400/404/409/413, `InternalError` for 500).
 fn complete<T: serde::Serialize>(id: Id, result: Result<T, ApiError>) -> JsonRpcResponse {
     match result {
         Ok(value) => JsonRpcResponse::success(id, value),
         Err(ApiError::BadRequest(message)) => bad(&id, &message),
         Err(ApiError::NotFound(message)) => not_found(&id, &message),
         Err(ApiError::Conflict(message)) => conflict(&id, message),
+        Err(ApiError::TooLarge(message)) => {
+            rpc_err(id, JsonRpcErrorReason::ApplicationError(413), message)
+        }
         Err(ApiError::Internal(message)) => internal(&id, message),
     }
 }
@@ -936,13 +943,8 @@ async fn dispatch_call(
             };
             complete(
                 id,
-                service::prs::branch_rules_set(
-                    state,
-                    &p.id,
-                    p.require_pr,
-                    p.required_approvals,
-                )
-                .await,
+                service::prs::branch_rules_set(state, &p.id, p.require_pr, p.required_approvals)
+                    .await,
             )
         }
         "metrics.get" => {
@@ -1072,15 +1074,9 @@ async fn dispatch_call(
             };
             complete(
                 id,
-                service::storage::d1_delete_rows(
-                    state,
-                    &p.id,
-                    &p.database_id,
-                    &p.table,
-                    &p.keys,
-                )
-                .await
-                .map(|deleted| json!({ "ok": true, "deleted": deleted })),
+                service::storage::d1_delete_rows(state, &p.id, &p.database_id, &p.table, &p.keys)
+                    .await
+                    .map(|deleted| json!({ "ok": true, "deleted": deleted })),
             )
         }
         "storage.do.list" => {

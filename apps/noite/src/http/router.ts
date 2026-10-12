@@ -2,6 +2,10 @@ import { FindMyWay } from "effect/http";
 import type { FetchHandler } from "oxidejs";
 
 import {
+  CONTROL_HOST_DENIED_ASSETS,
+  PREVIEW_ASSET_PREFIX,
+} from "../lib/preview-host";
+import {
   clientKey,
   DEFAULT_RPM,
   limitedClass,
@@ -19,7 +23,9 @@ import {
   handleWebhook,
 } from "./routes/internal";
 import { handleMcp } from "./routes/mcp";
+import { handlePreviewHostAsset } from "./routes/nodepod";
 import { handleR2Raw, handleR2Upload } from "./routes/r2";
+import { handleSourceArchive, handleSourceCommit } from "./routes/source";
 import {
   handleAppsStream,
   handleDeploysStream,
@@ -31,6 +37,20 @@ import {
 
 const router = FindMyWay.make<RouteHandler>();
 router.all("/health", handleHealth);
+// A pod's assets have a route only so they run before the static-asset
+// fallback — the handler 404s every host but the app's Preview host. That
+// includes the bridge pair (see `POD_BRIDGE_PATHS`): a request on the control
+// host has to be decided here, not by whatever the asset fallback would answer.
+for (const path of CONTROL_HOST_DENIED_ASSETS) {
+  router.on("GET", path, handlePreviewHostAsset);
+  router.on("HEAD", path, handlePreviewHostAsset);
+}
+// The frame bundle's own chunks live in the control UI's asset directory
+// (`PREVIEW_ASSET_PREFIX`). On the Preview host they are the pod's; on any
+// other host they are the control UI's own assets, and the handler declines
+// them so the platform serves them exactly as before this route existed.
+router.on("GET", `${PREVIEW_ASSET_PREFIX}*`, handlePreviewHostAsset);
+router.on("HEAD", `${PREVIEW_ASSET_PREFIX}*`, handlePreviewHostAsset);
 router.on("POST", "/webhook", handleWebhook);
 router.on("POST", "/internal/git-auth", handleGitAuth);
 router.all("/mcp", handleMcp);
@@ -38,6 +58,8 @@ router.on("POST", "/internal/recovery", handleRecovery);
 router.on("GET", "/internal/telemetry-facts", handleTelemetryFacts);
 router.on("GET", "/storage/:appId/r2/:bucket/raw", handleR2Raw);
 router.on("PUT", "/storage/:appId/r2/:bucket/upload", handleR2Upload);
+router.on("POST", "/api/apps/:appId/source/commit", handleSourceCommit);
+router.on("GET", "/api/apps/:appId/source/archive", handleSourceArchive);
 router.on("GET", "/api/apps/:appId/logs/stream", handleLogsStream);
 router.on("GET", "/api/apps/:appId/deploys/stream", handleDeploysStream);
 router.on("GET", "/api/apps/:appId/events/stream", handleEventsStream);

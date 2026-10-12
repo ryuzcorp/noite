@@ -16,7 +16,7 @@ export const E2E_EMAIL = "e2e@noite.local";
 export const E2E_NAME = "E2E";
 export const E2E_SLUG = "e2e";
 
-const uiBaseURL = process.env.E2E_BASE_URL ?? "http://localhost:8090";
+const uiBaseURL = process.env.E2E_BASE_URL ?? "http://noite.localhost:8090";
 const apiBase = process.env.E2E_API_BASE ?? "http://localhost:8080";
 const gitBase = process.env.E2E_GIT_BASE ?? "http://localhost:8080/v1/git";
 const tenantBase = (port: number): string => `http://localhost:${port}`;

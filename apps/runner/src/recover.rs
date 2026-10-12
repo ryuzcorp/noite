@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use serde::Deserialize;
 
-use crate::config::{Config, CONTROL_UPSTREAM_URL};
+use crate::config::{is_localhost_domain, Config, CONTROL_UPSTREAM_URL};
 
 const USAGE: &str = "usage: noite-runner recover [--email <address>]
 
@@ -72,7 +72,7 @@ fn sign_in_hint(cfg: &Config) -> String {
         return cfg.better_auth_url.clone();
     }
     let host = cfg.control_hosts().into_iter().next().unwrap_or_default();
-    let scheme = if cfg.base_domain == "localhost" {
+    let scheme = if is_localhost_domain(&cfg.base_domain) {
         "http"
     } else {
         "https"

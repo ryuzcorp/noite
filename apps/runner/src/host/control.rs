@@ -322,10 +322,8 @@ mod tests {
     #[test]
     fn bundle_presence_needs_a_wrangler_config() {
         let mut cfg = Config::from_env().expect("config");
-        let dir = std::env::temp_dir().join(format!(
-            "noite-control-bundle-{}",
-            crate::models::new_id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("noite-control-bundle-{}", crate::models::new_id()));
         cfg.control_bundle_dir = dir.to_string_lossy().into_owned();
         // The dev image has the env var but no bundle: nothing to deploy, no
         // control celld, no control telemetry.
