@@ -8,6 +8,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.0-alpha.4] - 2026-10-13
+
+Code mode (editor, Preview and Terminal in the browser), branches and pull requests, a new app creator with GitHub, template and folder imports, push to create, and an MCP server for agents.
+
 ### Operator action required
 
 - The runner SQLite upgrades itself to schema version 7 (the import source on `app`, plus the pull request and branch protection tables). As before, an older image refuses newer data, so back up before upgrading.
