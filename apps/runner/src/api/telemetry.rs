@@ -1,10 +1,6 @@
 //! Instance telemetry admin endpoints (thin adapters over `service::telemetry`).
 
-use axum::{
-    extract::State,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, response::IntoResponse, Json};
 use serde::Deserialize;
 
 use crate::service;
@@ -24,5 +20,7 @@ pub async fn set_telemetry(
     State(state): State<AppState>,
     Json(body): Json<SetTelemetryBody>,
 ) -> impl IntoResponse {
-    service::telemetry::set(&state, body.enabled).await.map(Json)
+    service::telemetry::set(&state, body.enabled)
+        .await
+        .map(Json)
 }

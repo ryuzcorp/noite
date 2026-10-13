@@ -200,8 +200,7 @@ pub async fn set_insight(
                 )
                 .await
                 .map_err(|e| ApiError::internal(e.to_string()))?;
-                return serde_json::to_value(row)
-                    .map_err(|e| ApiError::internal(e.to_string()));
+                return serde_json::to_value(row).map_err(|e| ApiError::internal(e.to_string()));
             }
         }
         return Err(ApiError::bad(

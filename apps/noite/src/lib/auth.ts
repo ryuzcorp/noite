@@ -13,6 +13,7 @@ import { fail } from "oxidejs";
 
 import { getAuthDb, resolveEnv } from "./db";
 import { errorMessage } from "./errors";
+import { isLocalhostDomain } from "./local-host";
 import {
   checkInvite,
   consumeInvite,
@@ -168,7 +169,7 @@ const sendSignInOTP = async (
     }
     return;
   }
-  if ((env.BASE_DOMAIN ?? "localhost") === "localhost") {
+  if (isLocalhostDomain(env.BASE_DOMAIN ?? "localhost")) {
     // oxlint-disable-next-line no-console-except-error -- dev-only OTP delivery channel; prod uses the webhook or refuses loudly below.
     console.log(`[noite:otp] sign-in code for ${email}: ${otp}`);
     return;

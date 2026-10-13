@@ -15,6 +15,8 @@ pub enum ApiError {
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
+    TooLarge(String),
+    #[error("{0}")]
     Internal(String),
 }
 
@@ -27,6 +29,9 @@ impl ApiError {
     }
     pub fn conflict(msg: impl Into<String>) -> Self {
         Self::Conflict(msg.into())
+    }
+    pub fn too_large(msg: impl Into<String>) -> Self {
+        Self::TooLarge(msg.into())
     }
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
@@ -42,6 +47,7 @@ impl IntoResponse for ApiError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, self.to_string()).into_response()

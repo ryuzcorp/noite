@@ -391,12 +391,7 @@ pub async fn r2_list(
 }
 
 /// Download one object's bytes (capped) and the media type to re-serve it.
-pub async fn r2_raw(
-    cfg: &Config,
-    app: &App,
-    bucket: &str,
-    key: &str,
-) -> anyhow::Result<R2Raw> {
+pub async fn r2_raw(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow::Result<R2Raw> {
     if !r2_key_ok(key) {
         anyhow::bail!("invalid key");
     }
@@ -639,7 +634,8 @@ mod tests {
     fn an_empty_segment_folder_browses_as_empty() {
         let base = "fleets/app/r2/bucket/a/";
         let prefixes = vec![format!("{base}%/")];
-        let (folders, objects) = split_page(base, "a/", &prefixes, &[stored(&format!("{base}%/b"))]);
+        let (folders, objects) =
+            split_page(base, "a/", &prefixes, &[stored(&format!("{base}%/b"))]);
         assert_eq!(folders[0].name, "(empty)");
         assert_eq!(folders[0].prefix, "a//");
         // A key with an empty segment round-trips through the parent prefix.

@@ -1,10 +1,10 @@
-//! The card every settings panel sits in: one section wrapping a padded
-//! `card-body`, so the panels carry only their heading and their content.
+//! One settings section: the panels carry only their heading and their
+//! content. They sit in the Settings side panel, which separates them with
+//! dividers rather than a card each (a card per section inside the bordered
+//! panel only cost width).
 
 import type { View } from "ilha";
 
 export const SettingsSection = ({ children }: { children: View }) => (
-  <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
-    <div class="card-body gap-4">{children}</div>
-  </section>
+  <section class="flex w-full flex-col gap-4">{children}</section>
 );

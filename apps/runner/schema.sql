@@ -32,7 +32,10 @@ CREATE TABLE IF NOT EXISTS app (
   deployed_config TEXT,
   -- Per-app build/release sandbox uid (host::netisolation, config.rs
   -- BUILD_UID_BASE): NULL until allocated on the app's first build.
-  build_uid INTEGER
+  build_uid INTEGER,
+  -- The `apps.create` source (JSON) this app was imported from: NULL for a
+  -- blank app; lets a failed GitHub/template import be retried (A2).
+  import_source TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_app_build_uid ON app(build_uid);
@@ -128,6 +131,76 @@ CREATE TABLE IF NOT EXISTS app_limit (
   client_rpm INTEGER,
   app_rpm INTEGER,
   updated_at TEXT NOT NULL
+);
+
+-- Pull requests (F4): same-repo branches only, squash-merged. `number` is
+-- unique per app; at most one open PR exists per (app, base, head), which the
+-- partial index enforces. `head_sha` is the head branch tip a merge would use;
+-- it moves with the branch and dismisses reviews recorded at an older sha.
+CREATE TABLE IF NOT EXISTS pull_request (
+  id TEXT PRIMARY KEY NOT NULL,
+  app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,
+  number INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL DEFAULT '',
+  author_id TEXT NOT NULL,
+  base TEXT NOT NULL DEFAULT 'main',
+  head TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('open','closed','merged')),
+  head_sha TEXT NOT NULL,
+  merge_sha TEXT,
+  merged_by TEXT,
+  closed_by TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  closed_at TEXT,
+  merged_at TEXT,
+  UNIQUE (app_id, number)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pull_request_open
+  ON pull_request(app_id, base, head) WHERE state = 'open';
+CREATE INDEX IF NOT EXISTS idx_pull_request_app ON pull_request(app_id, number DESC);
+
+-- PR conversation. A line comment carries path/line/side and the commit_sha it
+-- was written against; once that line changed in the current diff the comment
+-- is shown as outdated but stays in the conversation.
+CREATE TABLE IF NOT EXISTS pr_comment (
+  id TEXT PRIMARY KEY NOT NULL,
+  pr_id TEXT NOT NULL REFERENCES pull_request(id) ON DELETE CASCADE,
+  author_id TEXT NOT NULL,
+  body TEXT NOT NULL,
+  path TEXT,
+  line INTEGER,
+  side TEXT CHECK (side IN ('old','new')),
+  commit_sha TEXT,
+  created_at TEXT NOT NULL,
+  edited_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pr_comment_pr ON pr_comment(pr_id, created_at);
+
+-- One review per submission; the latest per reviewer that is `approved`, not
+-- dismissed and recorded at the current head counts toward the threshold.
+CREATE TABLE IF NOT EXISTS pr_review (
+  id TEXT PRIMARY KEY NOT NULL,
+  pr_id TEXT NOT NULL REFERENCES pull_request(id) ON DELETE CASCADE,
+  reviewer_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('approved','changes_requested')),
+  commit_sha TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  dismissed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pr_review_pr ON pr_review(pr_id, created_at);
+
+-- Per-app branch protection (off by default): with `require_pr` the push role
+-- cannot move `main` directly, and a merge needs `required_approvals`.
+CREATE TABLE IF NOT EXISTS app_branch_rule (
+  app_id TEXT PRIMARY KEY NOT NULL REFERENCES app(id) ON DELETE CASCADE,
+  require_pr INTEGER NOT NULL DEFAULT 0,
+  required_approvals INTEGER NOT NULL DEFAULT 0
+    CHECK (required_approvals BETWEEN 0 AND 2)
 );
 
 -- Scoped per-app credentials (SPEC, Scoped credentials): one encrypted row per

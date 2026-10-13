@@ -37,13 +37,15 @@ else
   FILES="$FILES -f docker/compose.build.yaml"
   UP_FLAGS="--build"
 fi
-# The lane owns these values whatever .env says: localhost, the lane's ports.
-export BASE_DOMAIN=localhost HTTP_PORT=8090 HTTPS_PORT=8443
+# The lane owns these values whatever .env says: its own `*.localhost` base
+# (the browser resolves it to loopback, so the control UI and every preview
+# host stay same-site) and the lane's ports.
+export BASE_DOMAIN=noite.localhost HTTP_PORT=8090 HTTPS_PORT=8443
 # The lane's own store port, so a dev stack on :9000 can keep running.
 export RUSTFS_API_PORT="${E2E_RUSTFS_PORT:-19000}"
 export E2E_TENANCY="${E2E_TENANCY:-single}"
 export E2E_RUNNER_TOKEN="${RUNNER_TOKEN:-dev-runner-token}"
-export E2E_BASE_URL=http://localhost:8090
+export E2E_BASE_URL=http://noite.localhost:8090
 export E2E_API_BASE=http://localhost:8080
 export E2E_GIT_BASE=http://localhost:8080/v1/git
 export E2E_RAW_PORTS=1
@@ -71,7 +73,9 @@ $CE2E up -d $UP_FLAGS
 
 echo "==> wait for the stack to serve (5 min)"
 attempt=0
-while [ "$attempt" -lt 30 ]; do
+# Same 5-minute budget, checked every 3 s: the stack is usually up within
+# seconds of the first failed check.
+while [ "$attempt" -lt 100 ]; do
   if sh docker/doctor.sh; then
     echo "==> playwright e2e"
     # `set -e` would abort on a failing suite and skip the teardown below,
@@ -104,7 +108,7 @@ while [ "$attempt" -lt 30 ]; do
     exit "$rc"
   fi
   attempt=$((attempt + 1))
-  sleep 10
+  sleep 3
 done
 echo "stack never became healthy — dumping logs"
 # shellcheck disable=SC2086

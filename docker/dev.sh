@@ -28,6 +28,19 @@ ui_install() {
   fi
 }
 
+# The preview inlines Poder's dist from beside the importer: build it when
+# missing or older than its sources, and copy it into the UI tree. Skipped
+# where `/packages` is not mounted.
+poder_build() {
+  [ -d /packages/poder ] || return 0
+  if [ ! -f /packages/poder/dist/index.mjs ] || [ -n "$(find /packages/poder/src -newer /packages/poder/dist/index.mjs -print -quit 2>/dev/null)" ]; then
+    echo "dev: building Poder's dist"
+    (cd /packages/poder && bun run build)
+  fi
+  mkdir -p /app/poder-dist
+  cp /packages/poder/dist/*.mjs /app/poder-dist/
+}
+
 # Keep vite running: a crash (bad edit) restarts it after a pause instead of
 # leaving the UI down until the container restarts.
 ui_loop() {
@@ -43,6 +56,7 @@ ui_loop() {
   done
 }
 
+poder_build
 ui_install
 ui_loop &
 UI_PID=$!

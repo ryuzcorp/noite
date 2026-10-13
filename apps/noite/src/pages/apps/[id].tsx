@@ -1,6 +1,6 @@
 import { DeployList } from "$lib/app-detail/deploys";
 import { ErrorsPanel, liveErrors } from "$lib/app-detail/errors";
-import { EventsPanel } from "$lib/app-detail/events";
+import { EventsPanel, liveEventCount } from "$lib/app-detail/events";
 import {
   DEFAULT_METRICS_HOURS,
   MetricsCard,
@@ -9,10 +9,14 @@ import {
 } from "$lib/app-detail/metrics";
 import { AppDetailPanel, AppHeader } from "$lib/app-detail/panel";
 import { AppSettingsPanel } from "$lib/app-detail/settings/panel";
+import { DetailShell, DetailTabs } from "$lib/app-detail/shell";
 import { ControlAppDetail } from "$lib/apps/control-panel";
 import { CONTROL_APP_NAME, isControlApp } from "$lib/control-app";
 import { appDetail } from "$lib/resources";
-import { useRoute, head, searchParam } from "@ilha/router";
+import { searchParam } from "$lib/search-param";
+import { Cog } from "$lib/ui/icons";
+import { SidePanel } from "$lib/ui/side-panel";
+import { useRoute, head } from "@ilha/router";
 
 const TABS = [
   { id: "overview", label: "Overview" },
@@ -20,7 +24,6 @@ const TABS = [
   { id: "metrics", label: "Metrics" },
   { id: "errors", label: "Errors" },
   { id: "events", label: "Events" },
-  { id: "settings", label: "Settings" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -29,6 +32,12 @@ type TabId = (typeof TABS)[number]["id"];
 const toTabId = (raw: string): TabId =>
   TABS.find((tab) => tab.id === raw)?.id ?? "overview";
 
+/** The right panel beside the tabs: Settings, or closed (`""`). */
+type AppPanel = "settings" | "";
+
+/** Parse `?panel=`: anything but `settings` closes the panel. */
+const toAppPanel = (raw: string): AppPanel =>
+  raw === "settings" ? "settings" : "";
 /** Metrics tab: the window lives in `?r=` (24 / 168 / 720 hours) so a refresh
  * or shared link keeps it. The card is keyed by the window because its live
  * feed opens one URL for the life of a component. */
@@ -53,6 +62,15 @@ const MetricsTab = ({ appId }: { appId: string }) => {
   );
 };
 
+/** Settings beside the tabs, a third of the width, like Code mode's panels. */
+const SettingsAside = ({ onClose }: { onClose: () => void }) => (
+  <SidePanel title="Settings" onClose={onClose}>
+    <div class="min-h-0 flex-1 overflow-auto">
+      <AppSettingsPanel />
+    </div>
+  </SidePanel>
+);
+
 const AppPageBody = ({ appId }: { appId: string }) => {
   // The reserved control app has no runner row, fleet or telemetry: it gets a
   // dedicated minimal detail instead of the tenant tabs. Branching before any
@@ -62,49 +80,70 @@ const AppPageBody = ({ appId }: { appId: string }) => {
     return <ControlAppDetail />;
   }
   const tab = searchParam<TabId>("t", { default: "overview", parse: toTabId });
+  // Settings opens beside the tabs (`?panel=settings`), so it stays open
+  // while they switch.
+  const panel = searchParam<AppPanel>("panel", {
+    default: "",
+    parse: toAppPanel,
+  });
   // The open error (ErrorsPanel's `?e=`): a tab click always lands on the
   // tab's top level, so the Errors tab shows the list, not a stale detail.
   const openError = searchParam("e", { default: "" });
   const name = appDetail(appId).data()?.app.name;
   head({ title: `${name ?? "App"} · Noite` });
-  // Same live feed as the Errors tab's open list, so the tab label's count
-  // of errors waiting for triage never lags the list.
-  const openErrors = liveErrors(appId, "open").data()?.counts.open ?? 0;
+  // Same live feeds as the Errors tab's open list and the Events tab's
+  // default view, so the tab badges never lag the lists.
+  const counts = {
+    errors: liveErrors(appId, "open").data()?.counts.open ?? 0,
+    events: liveEventCount(appId),
+  };
+  const settingsOpen = panel() === "settings";
 
   return (
-    <div class="mx-auto mt-4 flex w-full max-w-5xl flex-col gap-4 px-4 pb-12">
-      <AppHeader appId={appId} />
-      {/* One row on every width: narrow screens scroll the tabs sideways
-          instead of wrapping them into a stack. */}
-      <div class="border-base-300 overflow-x-auto border-b">
-        <div role="tablist" class="tabs tabs-border w-max flex-nowrap">
-          {TABS.map((t) => (
-            <button
-              type="button"
-              role="tab"
-              aria-selected={tab() === t.id ? "true" : "false"}
-              class={`tab gap-1.5 whitespace-nowrap ${tab() === t.id ? "tab-active" : ""}`}
-              onclick={() => {
-                openError.set("");
-                tab.set(t.id);
-              }}
-            >
-              {t.label}
-              {t.id === "errors" && openErrors > 0 ? (
-                <span class="badge badge-sm tabular-nums">{openErrors}</span>
-              ) : null}
-            </button>
-          ))}
-        </div>
-      </div>
-
+    <DetailShell
+      header={
+        <>
+          <AppHeader appId={appId} />
+          <DetailTabs
+            active={tab()}
+            counts={counts}
+            tabs={TABS}
+            onSelect={(next) => {
+              openError.set("");
+              tab.set(toTabId(next));
+            }}
+            trailing={
+              <button
+                type="button"
+                class={`btn btn-ghost btn-sm mb-1 shrink-0 ${settingsOpen ? "btn-active" : ""}`}
+                aria-pressed={settingsOpen ? "true" : "false"}
+                onclick={() => {
+                  panel.set(settingsOpen ? "" : "settings");
+                }}
+              >
+                <Cog />
+                Settings
+              </button>
+            }
+          />
+        </>
+      }
+      panel={
+        settingsOpen ? (
+          <SettingsAside
+            onClose={() => {
+              panel.set("");
+            }}
+          />
+        ) : null
+      }
+    >
       {tab() === "overview" ? <AppDetailPanel appId={appId} /> : null}
       {tab() === "deployments" ? <DeployList appId={appId} /> : null}
       {tab() === "metrics" ? <MetricsTab appId={appId} /> : null}
       {tab() === "errors" ? <ErrorsPanel appId={appId} /> : null}
       {tab() === "events" ? <EventsPanel appId={appId} /> : null}
-      {tab() === "settings" ? <AppSettingsPanel /> : null}
-    </div>
+    </DetailShell>
   );
 };
 
@@ -112,12 +151,14 @@ const AppPageBody = ({ appId }: { appId: string }) => {
  * Page components are reused across navigations, so /apps/A → /apps/B
  * would otherwise re-run the same fiber with a new id — and ilha's
  * resource()/fromEventSource() slots stay bound to the first key/URL.
- * The key makes an id change remount the whole subtree instead. */
+ * The key makes an id change remount the whole subtree; the one-item keyed
+ * list keeps a tab switch from remounting it (the id is the only prop, so
+ * ilha reuses the row, and the body repaints through its own param reads). */
 export default function AppPage() {
   const appId = useRoute().params().id;
   if (!appId) {
     head({ title: "App · Noite" });
     return <p class="m-0 text-sm opacity-70">Missing app id.</p>;
   }
-  return <AppPageBody key={appId} appId={appId} />;
+  return [<AppPageBody key={appId} appId={appId} />];
 }

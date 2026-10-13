@@ -12,11 +12,12 @@ import {
   session,
 } from "../resources";
 import { createApiKey } from "../server/account.server";
+import { confirmDialog } from "../ui/confirm";
 import { CopyButton } from "../ui/copy-button";
 import { Dialog } from "../ui/dialog";
 import { LoadError } from "../ui/load-error";
 import { SectionSkeleton } from "../ui/skeletons";
-import { AdminTelemetrySection } from "./admin-telemetry";
+import { ConnectAgentCard } from "./agent-connect";
 
 interface ApiKeyRow {
   id: string;
@@ -149,11 +150,14 @@ const PasskeysCard = () => {
   };
   const remove = async (id: string, name: string) => {
     const last = rows.length <= 1;
-    const warning = last
-      ? `Delete ${name || "this passkey"}? It is your only passkey — you would have to sign in with an emailed code until you add another.`
-      : `Delete ${name || "this passkey"}?`;
-    // oxlint-disable-next-line no-alert -- native confirm dialog is the requirement for destructive deletes.
-    if (!window.confirm(warning)) {
+    const ok = await confirmDialog({
+      confirmLabel: "Delete",
+      message: last
+        ? "It is your only passkey — you would have to sign in with an emailed code until you add another."
+        : "You can no longer sign in with it.",
+      title: `Delete ${name || "this passkey"}?`,
+    });
+    if (!ok) {
       return;
     }
     busy.set(true);
@@ -359,8 +363,7 @@ export const AccountPanel = () => {
   }
 
   return (
-    <div class="flex flex-col gap-6">
-      <MyInvitesCard />
+    <div class="flex flex-col gap-4">
       <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
         <h2 class="m-0 text-lg font-semibold">Profile</h2>
         <fieldset class="fieldset w-full">
@@ -563,7 +566,8 @@ export const AccountPanel = () => {
           </ul>
         )}
       </section>
-      <AdminTelemetrySection />
+      <MyInvitesCard />
+      <ConnectAgentCard apiKey={freshKey} />
     </div>
   );
 };

@@ -1,15 +1,16 @@
 //! Admin tab: every app on the instance, whichever account owns it.
 
-import { searchParam } from "@ilha/router";
 import { atom } from "ilha";
 import type { View } from "ilha";
 
 import { presenceTone } from "../apps/identity";
 import { errorMessage } from "../errors";
 import { listAllApps } from "../resources";
+import { searchParam } from "../search-param";
 import { adminDeleteApp, adminSetAppState } from "../server/admin.server";
 import type { AdminAppRow } from "../server/admin.server";
 import { Avatar } from "../ui/avatar";
+import { confirmDialog } from "../ui/confirm";
 import {
   ACTION,
   AdminRow,
@@ -20,7 +21,6 @@ import {
   SearchForm,
   SkeletonRows,
   W_SM,
-  confirmAction,
 } from "./shared";
 
 interface AdminAppRowProps {
@@ -146,14 +146,18 @@ export const AdminAppsPanel = () => {
               );
             }}
             onDelete={(app) => {
-              if (
-                !confirmAction(
-                  `Delete ${app.name} (${app.slug})? This removes the app, its git remote and its fleet.`
-                )
-              ) {
-                return;
-              }
-              void mutate(() => adminDeleteApp(app.id));
+              void (async () => {
+                const ok = await confirmDialog({
+                  confirmLabel: "Delete",
+                  message:
+                    "This removes the app, its git remote and its fleet.",
+                  title: `Delete ${app.name} (${app.slug})?`,
+                });
+                if (!ok) {
+                  return;
+                }
+                await mutate(() => adminDeleteApp(app.id));
+              })();
             }}
           />
         ))}

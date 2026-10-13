@@ -37,6 +37,12 @@ Separate several values with commas. Only list proxies that are actually in fron
 
 With `CADDY_AUTO_HTTPS=off` on a real domain (Coolify, Railway) and no `NOITE_TRUSTED_PROXIES`, Noite turns per-visitor limits off rather than count every visitor as one. Per-app ceilings still apply, and the runner logs a warning at startup.
 
+## Cross-origin isolation
+
+The control UI is served cross-origin isolated: every document, module and worker script carries `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp` and `Cross-Origin-Resource-Policy: same-origin`. Code mode's in-browser workspace needs `SharedArrayBuffer`, which a browser only exposes in an isolated agent cluster.
+
+Noite sets these headers itself and its own Caddy passes them through. A proxy you put in front — Cloudflare, Coolify's Traefik, Railway's edge — must pass response headers through unchanged: do not add a `header_down` / `replace` rule that drops them, and do not rewrite the control UI's HTML, or the isolation silently disappears. `curl -sI https://app.<domain>/` shows the three headers on the document; if they are missing, the proxy is stripping them.
+
 ## Cloudflare in front
 
 A single server cannot absorb a large flood: the network link fills before any software sees the traffic. Cloudflare's free plan absorbs that in front of Noite.

@@ -355,12 +355,39 @@ pub async fn run_cmd(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Spawn `program` with stdout and stderr piped so a caller can stream the
+/// output (an archive, a download) instead of buffering it; env mirrors
+/// `run_cmd`. The caller owns the child — dropping it kills the process.
+pub fn spawn_stream(
+    program: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> anyhow::Result<tokio::process::Child> {
+    use tokio::process::Command;
+    super::stats::count_spawn(program);
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("LANG", "C.UTF-8")
+        .env("HOME", "/root")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.spawn().with_context(|| format!("spawn {program}"))
+}
+
 /// Run a command with stdin bytes; returns raw stdout (no UTF-8 requirement).
 pub async fn run_cmd_stdin(
     program: &str,
     args: &[&str],
     stdin: &[u8],
     cwd: Option<&Path>,
+    env: &[(&str, &str)],
     timeout: Duration,
 ) -> anyhow::Result<Vec<u8>> {
     use tokio::io::AsyncWriteExt;
@@ -378,15 +405,24 @@ pub async fn run_cmd_stdin(
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
-    let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
-    if let Some(mut pipe) = child.stdin.take() {
-        pipe.write_all(stdin).await.context("write stdin")?;
-        pipe.shutdown().await.ok();
+    for (k, v) in env {
+        cmd.env(k, v);
     }
+    let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
+    // Feed stdin from its own task: a command that answers with more than a
+    // pipe buffer holds (batch `git cat-file`) blocks on stdout, and if we
+    // were still blocked writing stdin the two would deadlock.
+    let mut pipe = child.stdin.take().context("stdin pipe")?;
+    let input = stdin.to_vec();
+    let writer = tokio::spawn(async move {
+        let _ = pipe.write_all(&input).await;
+        let _ = pipe.shutdown().await;
+    });
     let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await
         .context("command timeout")?
         .context("wait output")?;
+    let _ = writer.await;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         bail!(

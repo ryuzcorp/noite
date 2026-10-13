@@ -210,8 +210,7 @@ async fn ingest_step(
             ) else {
                 continue;
             };
-            if let Some((from, until)) =
-                plan_chunks(after, cutoff, floor_us, 1).into_iter().next()
+            if let Some((from, until)) = plan_chunks(after, cutoff, floor_us, 1).into_iter().next()
             {
                 if ingest_backed_off(state, slug, from) {
                     continue;
@@ -240,8 +239,16 @@ async fn ingest_step(
                     continue;
                 }
             };
-            match commit_chunk(pool, state, slug_id, &app_sha, &chunk, rows, cutoff - 86_400_000_000)
-                .await
+            match commit_chunk(
+                pool,
+                state,
+                slug_id,
+                &app_sha,
+                &chunk,
+                rows,
+                cutoff - 86_400_000_000,
+            )
+            .await
             {
                 Ok(w) => {
                     touched.extend(w.touched);
@@ -261,7 +268,9 @@ async fn ingest_step(
     if let Some(r) = &replay {
         let hour = floor_hour_us(now_us() - lag);
         let caught_up = match &r.slug {
-            Some(s) => !slug_id.contains_key(s) || state.watermark.get(s).is_none_or(|w| *w >= hour),
+            Some(s) => {
+                !slug_id.contains_key(s) || state.watermark.get(s).is_none_or(|w| *w >= hour)
+            }
             None => slug_id
                 .keys()
                 .all(|s| state.watermark.get(s).is_none_or(|w| *w >= hour)),

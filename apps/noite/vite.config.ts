@@ -1,7 +1,9 @@
 import { execFileSync } from "node:child_process";
+import path from "node:path";
 
 import { cloudflare } from "@cloudflare/vite-plugin";
 import { pages } from "@ilha/router/vite";
+import { nodepod } from "@r1ck404/nodepod/vite";
 import tailwindcss from "@tailwindcss/vite";
 import oxide from "oxidejs/vite";
 import { withOxide } from "oxidejs/wrangler";
@@ -9,6 +11,17 @@ import { defineConfig } from "vite";
 import type { Plugin } from "vite";
 
 import { controlEnv, hydrateControlEnv } from "./src/lib/control-env.ts";
+import {
+  POD_HOST_DEV_JS,
+  POD_HOST_HEADERS,
+  podHostHtml,
+} from "./src/lib/pod-host-document.ts";
+import {
+  isControlDeniedAsset,
+  isPreviewHost,
+  POD_HOST_HTML_PATH,
+  PREVIEW_HOST_ASSETS,
+} from "./src/lib/preview-host.ts";
 import { CURATED_SHIKI_LANGS } from "./src/lib/shiki-langs.ts";
 
 hydrateControlEnv();
@@ -56,10 +69,200 @@ const curatedShikiLangs = (): Plugin => ({
   },
 });
 
+/** Cross-origin isolation for the whole control UI (documents, modules,
+ * worker scripts and static assets alike). Nodepod's workspace and the
+ * TypeScript language service pass `SharedArrayBuffer` to workers, which a
+ * browser only exposes in a cross-origin-isolated agent cluster.
+ *
+ * `require-corp` rather than `credentialless`: the UI loads no third-party
+ * subresource (avatars are initials, docs links are plain navigations), so
+ * nothing legitimate needs the looser policy. Production mirrors this in
+ * `public/_headers` (celld serves the very same files). */
+const ISOLATION_HEADERS = {
+  "Cross-Origin-Embedder-Policy": "require-corp",
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Resource-Policy": "same-origin",
+} as const;
+
+/** `server.headers` only reach Vite's own middlewares (HTML, static, the
+ * transform pipeline). A plugin that answers a request itself — Nodepod's
+ * `__sw__.js` / `__worker__.js` / bridge middleware — would miss them, so
+ * stamp every dev response at the top of the connect stack. Registered
+ * before `nodepod()` in the plugin list, so it runs first. */
+const crossOriginIsolation = (): Plugin => ({
+  configureServer(server) {
+    server.middlewares.use((_request, response, next) => {
+      for (const [name, value] of Object.entries(ISOLATION_HEADERS)) {
+        response.setHeader(name, value);
+      }
+      next();
+    });
+  },
+  name: "cross-origin-isolation",
+});
+
+/** The pod asset paths, for the dev server's own routing decision (see
+ * `podHostFrame` below): a plain membership table over the list the production
+ * router and Caddy share. */
+const POD_ASSETS: Record<string, true> = Object.fromEntries(
+  PREVIEW_HOST_ASSETS.map((assetPath) => [assetPath, true] as const)
+);
+
+/** The app root: this config file's own directory, which is Vite's default
+ * `root` and where `index.html` and `src/` live. */
+const APP_ROOT = import.meta.dirname;
+
+/** `src/pod-host/main.ts`, the whole pod — Nodepod, the checkout, the preview
+ * and the shell — as one client-side entry. */
+const POD_HOST_ENTRY = "noite-pod-host";
+const POD_HOST_ENTRY_MODULE = "src/pod-host/main.ts";
+
+/** One response the dev server serves for the pod host document. */
+interface PodHostFile {
+  body: string;
+  type: string;
+}
+
+/** The pod host document for `pathname`, the same response
+ * `src/http/routes/nodepod.ts` returns in production, or null for every other
+ * path (the bundle and Nodepod's own assets come from Vite's own pipeline in
+ * dev, from the built assets in production).
+ *
+ * Dev points the document at the module graph (`POD_HOST_DEV_JS`) instead of
+ * the built bundle: not built yet, and HMR then reaches the frame. */
+const podHostFile = (pathname: string): PodHostFile | null => {
+  if (pathname === POD_HOST_HTML_PATH) {
+    return {
+      body: podHostHtml(POD_HOST_DEV_JS),
+      type: "text/html; charset=utf-8",
+    };
+  }
+  return null;
+};
+
+/** The frame entry, built with the control UI's client bundle: one extra entry
+ * and the one file name that cannot carry a content hash, because the preview
+ * host serves it at the fixed path `/noite-pod-host.js` (`POD_HOST_JS_PATH`) —
+ * the document is a string, so nothing can interpolate a hashed name into it.
+ * Every other entry keeps Vite's hashed name.
+ *
+ * Client environment only: the worker environment builds `src/worker.ts`. */
+const podHostEntry = (): Plugin => ({
+  applyToEnvironment: (environment) => environment.name === "client",
+  configEnvironment(environmentName) {
+    if (environmentName !== "client") {
+      return;
+    }
+    return {
+      build: {
+        rollupOptions: {
+          input: {
+            index: path.resolve(APP_ROOT, "index.html"),
+            [POD_HOST_ENTRY]: path.resolve(APP_ROOT, POD_HOST_ENTRY_MODULE),
+          },
+          output: {
+            entryFileNames: ({ name: chunkName }) =>
+              chunkName === POD_HOST_ENTRY
+                ? "noite-pod-host.js"
+                : "assets/[name]-[hash].js",
+          },
+        },
+      },
+    };
+  },
+  name: "pod-host-entry",
+});
+
+/** The dev server's half of the pod assets' routing, which production splits
+ * between the router (`src/http/routes/nodepod.ts`) and Caddy's preview site:
+ *
+ * - the pod host document is the app's own response, with `POD_HOST_HEADERS`,
+ *   on the app's preview host only;
+ * - every other pod asset path answers 404 on any other host, so the control
+ *   UI's origin serves neither a worker script nor a service worker. Nodepod's
+ *   own middleware is host-agnostic, so this has to run before it (the plugin
+ *   sits ahead of `nodepodClient` below). */
+const podHostFrame = (): Plugin => ({
+  configureServer(server) {
+    server.middlewares.use((request, response, next) => {
+      const pathname = (request.url ?? "").split("?")[0] ?? "";
+      if (isPreviewHost(request.headers.host ?? null)) {
+        if (!(pathname in POD_ASSETS)) {
+          // Nodepod's own assets and the preview bridge: not this plugin's.
+          next();
+          return;
+        }
+        const file = podHostFile(pathname);
+        if (file === null) {
+          // Nodepod's own assets, on the host that serves them.
+          next();
+          return;
+        }
+        for (const [name, value] of Object.entries(POD_HOST_HEADERS)) {
+          response.setHeader(name, value);
+        }
+        response.setHeader("Content-Type", file.type);
+        response.statusCode = 200;
+        response.end(file.body);
+        return;
+      }
+      // The control UI's own host: nothing that could put a worker or a
+      // registerable service worker there answers (see
+      // `CONTROL_HOST_DENIED_ASSETS`).
+      if (isControlDeniedAsset(pathname)) {
+        response.statusCode = 404;
+        response.end("Not Found");
+        return;
+      }
+      next();
+    });
+  },
+  name: "pod-host-frame",
+});
+
+/** Nodepod's Vite plugin, scoped to the client environment. Its
+ * `generateBundle` has no environment filter, so as-is it also drops the four
+ * runtime assets into the SSR output (`dist/ssr`), which celld never serves —
+ * the deployment's asset directory is `dist/client`. Dev is unaffected (the
+ * client is the only environment that answers those paths). */
+const nodepodClient = (): Plugin => ({
+  ...nodepod(),
+  applyToEnvironment: (environment) => environment.name === "client",
+});
+
+/** Nodepod registers its browser `RuntimeHost` as a top-level side effect of
+ * an internal chunk (`dist/index-<hash>.js`), but its package.json
+ * `sideEffects` list names only the entry files, so the production bundler
+ * tree-shakes the registration away and every boot fails with "No
+ * RuntimeHost registered" (dev, which doesn't tree-shake, works). Mark the
+ * package's own modules side-effectful. */
+const nodepodSideEffects = (): Plugin => ({
+  name: "nodepod-side-effects",
+  transform: {
+    filter: { id: /[\\/]@r1ck404[\\/]nodepod[\\/]dist[\\/]/u },
+    handler: () => ({ moduleSideEffects: true }),
+  },
+});
+
 export default defineConfig({
   define: { __CONTROL_BUILD__: JSON.stringify(controlBuild()) },
   plugins: [
+    crossOriginIsolation(),
     curatedShikiLangs(),
+    podHostFrame(),
+    // The pod host entry: the whole workspace, built as a second client entry
+    // at the fixed path `/noite-pod-host.js` (see `podHostEntry`).
+    podHostEntry(),
+    // Nodepod's static runtime: `__sw__.js`, `__worker__.js` and the dead
+    // `__nodepod_bridge__` pair. Dev serves them from the plugin's middleware;
+    // the build emits them next to the client assets (dist/client) so celld
+    // serves them with the rest of the bundle. This sits ahead of the worker
+    // pipeline (oxide/cloudflare), whose dev HTML handling answers 404 to
+    // iframe-destination navigations — a preview document would never load if
+    // it ran first. It answers only those paths (plus every preview-host
+    // document), so nothing else changes hands, and `podHostFrame` above has
+    // already decided the pod's own paths by host.
+    nodepodClient(),
     oxide({
       actions: {
         sameOrigin: true,
@@ -76,6 +279,7 @@ export default defineConfig({
     // withOxide() hands it to the Cloudflare plugin: no wrangler file.
     cloudflare(withOxide()),
     pages(),
+    nodepodSideEffects(),
     tailwindcss(),
   ],
   resolve: {
@@ -83,6 +287,10 @@ export default defineConfig({
   },
   server: {
     allowedHosts: true,
+    // The isolation policy for Vite's own middlewares; the `crossOriginIsolation`
+    // plugin above covers the responses Vite does not pass these to (Nodepod's
+    // assets and any other direct handler).
+    headers: { ...ISOLATION_HEADERS },
     host: true,
     port: Number(process.env.PORT ?? 8080),
     // Runtime state lives inside the project root: local D1/R2/DO sqlite

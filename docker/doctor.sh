@@ -15,6 +15,9 @@ cd "$(dirname "$0")/.."
 load_env
 
 TOKEN="${RUNNER_TOKEN:-dev-runner-token}"
+# The host the edge answers on: the configured base, else the shipped dev
+# default. Both dev and the e2e lane serve the control UI on the bare base.
+BASE_HOST="${BASE_DOMAIN:-noite.localhost}"
 if [ "${E2E_RAW_PORTS:-}" = 1 ]; then
   EDGE="http://127.0.0.1:8090"
   API="http://127.0.0.1:8080"
@@ -23,7 +26,7 @@ if [ "${E2E_RAW_PORTS:-}" = 1 ]; then
 else
   EDGE="http://127.0.0.1:${HTTP_PORT:-9080}"
   API="$EDGE"
-  API_HOST="api.localhost"
+  API_HOST="api.${BASE_HOST}"
   PROJECT=noite
 fi
 
@@ -71,8 +74,8 @@ fi
 check "runner API auth" api -H "Authorization: Bearer ${TOKEN}" "${API}/v1/apps"
 # Ask for HTML like a browser: the control worker's page router answers a
 # bare `Accept: */*` with 404 (API routes and assets are unaffected).
-check "edge serves the control UI" sh -c "curl -fs -H 'Host: localhost' -H 'Accept: text/html' '${EDGE}/' | grep -qi '<html'"
-check "control auth routes" sh -c "curl -fs -H 'Host: localhost' '${EDGE}/api/auth/ok' | grep -q ok"
+check "edge serves the control UI" sh -c "curl -fs -H 'Host: ${BASE_HOST}' -H 'Accept: text/html' '${EDGE}/' | grep -qi '<html'"
+check "control auth routes" sh -c "curl -fs -H 'Host: ${BASE_HOST}' '${EDGE}/api/auth/ok' | grep -q ok"
 
 # celld's own view of the control fleet: leases, peers, advertised addresses.
 # Skipped in the dev image (vite dev serves the UI; there is no control node).

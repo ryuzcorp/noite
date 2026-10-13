@@ -2,6 +2,14 @@ import { defineMeta } from "blume";
 
 export default defineMeta({
   order: 3,
-  pages: ["deploy", "build", "configure", "observe"],
+  pages: [
+    "create",
+    "deploy",
+    "build",
+    "configure",
+    "source",
+    "pull-requests",
+    "observe",
+  ],
   title: "Apps",
 });

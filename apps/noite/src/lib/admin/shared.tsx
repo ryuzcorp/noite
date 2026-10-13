@@ -1,6 +1,6 @@
 //! Shared furniture for the admin tabs: the card shell every tab is, its
-//! search control, its skeleton/problem rows, the row layout, and the native
-//! confirm gate for destructive actions. Each tab file holds only its rows.
+//! search control, its skeleton/problem rows, and the row layout. Each tab file
+//! holds only its rows.
 
 import { atom } from "ilha";
 import type { View } from "ilha";
@@ -145,12 +145,6 @@ export const AdminRow = ({
     <div class={ACTIONS}>{actions}</div>
   </li>
 );
-
-/** Native confirm dialog: the requirement for privilege changes and
- * destructive deletes. */
-export const confirmAction = (message: string): boolean =>
-  // oxlint-disable-next-line no-alert -- native confirm dialog is the requirement for destructive admin actions.
-  window.confirm(message);
 
 /** Parse `?up=` (page index): garbage falls back to the first page. */
 export const toPageIndex = (raw: string): number =>

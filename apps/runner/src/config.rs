@@ -2,7 +2,8 @@ use std::env;
 
 /// Caddy `auto_https`: explicit off wins (behind-proxy deployments like
 /// Coolify, where Traefik TCP-forwards SNI and our Caddy terminates per-host
-/// TLS itself via on-demand certs); otherwise on except `localhost`.
+/// TLS itself via on-demand certs); otherwise on except the `localhost`
+/// family (a `*.localhost` dev base serves plain http too).
 /// Comma-separated hostname list (`CONTROL_EXTRA_HOSTS`).
 fn parse_host_list(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -19,7 +20,7 @@ fn parse_auto_https(raw: Option<&str>, base_domain: &str) -> bool {
     match raw {
         Some("off") | Some("0") | Some("false") => false,
         Some(_) => true,
-        None => base_domain != "localhost",
+        None => !is_localhost_domain(base_domain),
     }
 }
 
@@ -75,7 +76,7 @@ fn parse_tenancy(raw: Option<&str>, base_domain: &str) -> Tenancy {
         Some("single") => Tenancy::Single,
         Some("multi") => Tenancy::Multi,
         _ => {
-            if base_domain == "localhost" {
+            if is_localhost_domain(base_domain) {
                 Tenancy::Single
             } else {
                 Tenancy::Multi
@@ -110,10 +111,25 @@ pub fn parse_do_not_track(raw: Option<&str>) -> bool {
         .is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-/// Whether a base domain is local/dev-only: `localhost`, `*.localhost`,
-/// `*.local`, `*.test`, `*.internal`, or an IP literal. Such an install never
-/// reports (a dev box, the e2e lane, or a LAN name); an sslip.io install
-/// resolves to an IP but is a real public host, so it does report.
+/// Whether a base domain is the `localhost` family: bare `localhost` or any
+/// `*.localhost` name. Browsers resolve every `*.localhost` host to loopback
+/// and treat it as a secure context, so the dev stack runs on
+/// `noite.localhost` (same registrable domain for the control UI and every
+/// app/preview host — privacy browsers refuse a cross-site frame's IndexedDB
+/// and service workers). Every dev-only shortcut keys on this, never on the
+/// literal `localhost`, or a `*.localhost` dev install would be treated as a
+/// real domain (TLS on the plaintext dev edge, refused dev secrets, multi
+/// tenancy).
+pub fn is_localhost_domain(domain: &str) -> bool {
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    domain == "localhost" || domain.ends_with(".localhost")
+}
+
+/// Whether a base domain is local/dev-only: the `localhost` family (see
+/// [`is_localhost_domain`]), `*.local`, `*.test`, `*.internal`, or an IP
+/// literal. Such an install never reports (a dev box, the e2e lane, or a LAN
+/// name); an sslip.io install resolves to an IP but is a real public host, so
+/// it does report.
 pub fn is_local_domain(domain: &str) -> bool {
     let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
     if domain.is_empty() {
@@ -122,8 +138,7 @@ pub fn is_local_domain(domain: &str) -> bool {
     if domain.parse::<std::net::IpAddr>().is_ok() {
         return true;
     }
-    domain == "localhost"
-        || domain.ends_with(".localhost")
+    is_localhost_domain(&domain)
         || domain.ends_with(".local")
         || domain.ends_with(".test")
         || domain.ends_with(".internal")
@@ -439,7 +454,7 @@ impl Config {
                 "BASE_DOMAIN must not be empty (got blank); set it to your domain, e.g. noite.now"
             );
         }
-        if base_domain != "localhost" && runner_token == "dev-runner-token" {
+        if !is_localhost_domain(&base_domain) && runner_token == "dev-runner-token" {
             anyhow::bail!(
                 "refusing default RUNNER_TOKEN on non-localhost {base_domain}; set RUNNER_TOKEN in .env"
             );
@@ -451,9 +466,9 @@ impl Config {
             format!("sqlite:{db}?mode=rwc")
         };
         let git_public_base = env::var("GIT_PUBLIC_BASE").unwrap_or_else(|_| {
-            if base_domain == "localhost" {
+            if is_localhost_domain(&base_domain) {
                 let port = env_or(&["HTTP_PORT"], "9080");
-                format!("http://git.localhost:{port}")
+                format!("http://git.{base_domain}:{port}")
             } else {
                 format!("https://git.{base_domain}")
             }
@@ -575,7 +590,7 @@ impl Config {
             .unwrap_or(true);
         let dev_s3 = self.aws_access_key_id == "noiteaccess"
             || self.aws_secret_access_key == "noitesecretnoitesecretnoite12";
-        if self.base_domain != "localhost" {
+        if !is_localhost_domain(&self.base_domain) {
             if dev_token {
                 problems
                     .push("RUNNER_TOKEN is the dev default on a non-localhost BASE_DOMAIN".into());
@@ -600,7 +615,7 @@ impl Config {
                 }
                 None => problems.push("BETTER_AUTH_URL does not parse".into()),
             }
-            if dev_auth && self.base_domain != "localhost" {
+            if dev_auth && !is_localhost_domain(&self.base_domain) {
                 problems.push(
                     "BETTER_AUTH_SECRET is a dev default on a non-localhost BASE_DOMAIN".into(),
                 );
@@ -698,7 +713,9 @@ impl Config {
     /// `NOITE_TRUSTED_PROXIES` a per-client limit would throttle the whole
     /// install as one client.
     pub fn edge_sees_clients(&self) -> bool {
-        self.base_domain == "localhost" || self.auto_https || !self.edge.trusted_proxies.is_empty()
+        is_localhost_domain(&self.base_domain)
+            || self.auto_https
+            || !self.edge.trusted_proxies.is_empty()
     }
 
     /// Fleet shutdown bound for one celld node (budget minus drain margin).
@@ -862,7 +879,64 @@ mod tests {
     #[test]
     fn auto_https_defaults_by_domain() {
         assert!(!parse_auto_https(None, "localhost"));
+        // The dev stack's `*.localhost` base is a loopback, plain-http install
+        // exactly like bare `localhost`.
+        assert!(!parse_auto_https(None, "noite.localhost"));
         assert!(parse_auto_https(None, "noite.now"));
+    }
+
+    #[test]
+    fn localhost_family_is_detected() {
+        for domain in [
+            "localhost",
+            "LOCALHOST",
+            "localhost.",
+            "noite.localhost",
+            " app.noite.localhost ",
+        ] {
+            assert!(
+                is_localhost_domain(domain),
+                "{domain:?} is the localhost family"
+            );
+        }
+        for domain in [
+            "noite.now",
+            "noite.local",
+            "notlocalhost",
+            "localhost.noite.now",
+            "noite.now.local",
+            "",
+        ] {
+            assert!(
+                !is_localhost_domain(domain),
+                "{domain:?} is not the localhost family"
+            );
+        }
+    }
+
+    #[test]
+    fn tenancy_defaults_single_on_the_localhost_family() {
+        assert_eq!(parse_tenancy(None, "localhost"), Tenancy::Single);
+        assert_eq!(parse_tenancy(None, "noite.localhost"), Tenancy::Single);
+        assert_eq!(parse_tenancy(None, "noite.now"), Tenancy::Multi);
+        assert_eq!(
+            parse_tenancy(Some("multi"), "noite.localhost"),
+            Tenancy::Multi
+        );
+        assert_eq!(parse_tenancy(Some("single"), "noite.now"), Tenancy::Single);
+    }
+
+    #[test]
+    fn the_edge_sees_clients_on_a_dev_base() {
+        let mut cfg = config_for_tests();
+        assert!(cfg.edge_sees_clients(), "bare localhost dev");
+        cfg.base_domain = "noite.localhost".into();
+        assert!(cfg.edge_sees_clients(), "a *.localhost dev base");
+        cfg.base_domain = "noite.now".into();
+        cfg.auto_https = true;
+        assert!(cfg.edge_sees_clients(), "TLS terminated here");
+        cfg.auto_https = false;
+        assert!(!cfg.edge_sees_clients(), "behind a proxy, no trusted list");
     }
 
     #[test]

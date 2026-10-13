@@ -78,13 +78,6 @@ export const CloudUpload = (p: IconProps) => (
   </svg>
 );
 
-export const Pencil = (p: IconProps) => (
-  <svg {...base(p, 14)}>
-    <path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" />
-    <path d="m15 5 4 4" />
-  </svg>
-);
-
 export const Trash = (p: IconProps) => (
   <svg {...base(p, 14)}>
     <path d="M3 6h18" />
@@ -126,6 +119,14 @@ export const Pause = (p: IconProps) => (
 export const Play = (p: IconProps) => (
   <svg {...base(p, 16)}>
     <polygon points="6 3 20 12 6 21 6 3" />
+  </svg>
+);
+
+export const Monitor = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <rect height="14" width="20" x="2" y="3" {...rx(2)} {...{ ry: 2 }} />
+    <path d="M8 21h8" />
+    <path d="M12 17v4" />
   </svg>
 );
 
@@ -231,14 +232,6 @@ export const Lock = (p: IconProps) => (
   </svg>
 );
 
-export const AlertTriangle = (p: IconProps) => (
-  <svg {...base(p, 16)}>
-    <path d="M12 9v4" />
-    <path d="M10.36 3.59 2.26 17.13a1.91 1.91 0 0 0 1.64 2.87h16.21a1.91 1.91 0 0 0 1.64-2.87L13.64 3.59a1.91 1.91 0 0 0-3.28 0z" />
-    <path d="M12 16h.01" />
-  </svg>
-);
-
 export const Folder = (p: IconProps) => (
   <svg {...base(p, 16)}>
     <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z" />
@@ -265,5 +258,103 @@ export const Download = (p: IconProps) => (
     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
     <path d="M7 10l5 5 5-5" />
     <path d="M12 15V3" />
+  </svg>
+);
+
+export const Cog = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <path d="M11 10.27 7 3.34m4 10.39-4 6.93M12 22v-2m0-18v2m2 8h8m-5 8.66-1-1.73m1-15.59-1 1.73M2 12h2m16.66 5-1.73-1m1.73-9-1.73 1M3.34 17l1.73-1M3.34 7l1.73 1" />
+    <circle cx="12" cy="12" r="2" />
+    <circle cx="12" cy="12" r="8" />
+  </svg>
+);
+
+export const CircleUser = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <circle cx="12" cy="12" r="10" />
+    <circle cx="12" cy="10" r="3" />
+    <path d="M7 20.662V19a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v1.662" />
+  </svg>
+);
+
+export const BookOpen = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <path d="M12 7v14" />
+    <path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z" />
+  </svg>
+);
+
+export const LogOut = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <path d="m16 17 5-5-5-5" />
+    <path d="M21 12H9" />
+    <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+  </svg>
+);
+
+export const HistoryIcon = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+    <path d="M3 3v5h5" />
+    <path d="M12 7v5l4 2" />
+  </svg>
+);
+
+export const GitPullRequest = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <circle cx="18" cy="18" r="3" />
+    <circle cx="6" cy="6" r="3" />
+    <path d="M13 6h3a2 2 0 0 1 2 2v7" />
+    <path d="M6 9v12" />
+  </svg>
+);
+
+export const FileDiff = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+    <path d="M9 10h6" />
+    <path d="M12 13V7" />
+    <path d="M9 17h6" />
+  </svg>
+);
+
+export const GitBranch = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <path d="M6 3v12" />
+    <circle cx="18" cy="6" r="3" />
+    <circle cx="6" cy="18" r="3" />
+    <path d="M18 9a9 9 0 0 1-9 9" />
+  </svg>
+);
+
+export const LayoutDashboard = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <rect width="7" height="9" x="3" y="3" {...rx(1)} />
+    <rect width="7" height="5" x="14" y="3" {...rx(1)} />
+    <rect width="7" height="9" x="14" y="12" {...rx(1)} />
+    <rect width="7" height="5" x="3" y="16" {...rx(1)} />
+  </svg>
+);
+
+export const SquareTerminal = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <rect width="18" height="18" x="3" y="3" {...rx(2)} />
+    <path d="m7 7 3 3-3 3" />
+    <path d="M13 17h4" />
+  </svg>
+);
+
+export const Github = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4" />
+    <path d="M9 18c-4.51 2-5-2-7-2" />
+  </svg>
+);
+
+export const LayoutTemplate = (p: IconProps) => (
+  <svg {...base(p, 16)}>
+    <rect width="18" height="7" x="3" y="3" {...rx(1)} />
+    <rect width="9" height="7" x="3" y="14" {...rx(1)} />
+    <rect width="5" height="7" x="16" y="14" {...rx(1)} />
   </svg>
 );

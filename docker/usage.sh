@@ -16,7 +16,7 @@ HTTP_PORT="${HTTP_PORT:-9080}"
 RUNNER_TOKEN="${RUNNER_TOKEN:-dev-runner-token}"
 
 stats() {
-  curl -s -m 10 -H "Host: api.localhost" \
+  curl -s -m 10 -H "Host: api.${BASE_DOMAIN:-noite.localhost}" \
     -H "Authorization: Bearer ${RUNNER_TOKEN}" \
     "http://127.0.0.1:${HTTP_PORT}/v1/admin/stats" || true
 }

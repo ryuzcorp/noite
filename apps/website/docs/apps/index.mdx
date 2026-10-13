@@ -6,6 +6,9 @@ description: What an account holder can do with an app — deploy it, configure 
 An app is a Worker or a static site, run by celld, with a `git` remote. The owner creates it in the UI; deploys follow every push to that remote.
 
 <Steps>
+<Step title="Create">
+Start blank, import a public GitHub repo once, pick a template, or create the app by pushing to a new slug.
+</Step>
 <Step title="Deploy">
 Push code over Git smart-HTTP or from CI. Each push builds, releases, and goes live behind `https://<slug>.<domain>`.
 </Step>
@@ -18,6 +21,9 @@ Runtime logs, request metrics with spans, errors, product-analytics events, and 
 </Steps>
 
 <CardGroup cols={2}>
+  <Card title="Create an app" href="/apps/create" icon="rocket">
+    Blank, GitHub import, templates, and creating an app by pushing to a new slug.
+  </Card>
   <Card title="Deploy" href="/apps/deploy" icon="upload">
     Create an app, push with git, deploy from CI, and what each push triggers.
   </Card>
@@ -26,6 +32,12 @@ Runtime logs, request metrics with spans, errors, product-analytics events, and 
   </Card>
   <Card title="Configure" href="/apps/configure" icon="settings">
     Env vars, custom domains, rate limits, collaborator roles, web commits, and storage.
+  </Card>
+  <Card title="Source and history" href="/apps/source" icon="diagram">
+    Browse branches and commits, compare refs, and edit files in the browser.
+  </Card>
+  <Card title="Pull requests" href="/apps/pull-requests" icon="users">
+    Open, review and squash-merge pull requests, and protect main with branch rules.
   </Card>
   <Card title="Observe" href="/apps/observe" icon="chart">
     Logs, metrics and spans, errors, events and insights, and scale-to-zero sleep.

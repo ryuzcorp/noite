@@ -13,6 +13,7 @@ use axum::{
     response::{Html, IntoResponse},
 };
 
+use crate::config::is_localhost_domain;
 use crate::AppState;
 
 /// Tenant slug from a Host header, if it addresses `{slug}.{base}` under any
@@ -40,6 +41,48 @@ pub fn parse_edge_slug(host: &str, bases: &[String], control_sub: &str) -> Optio
         }
         if slug == control_sub || slug == "api" || slug == "git" {
             return None;
+        }
+        return Some(slug.to_string());
+    }
+    None
+}
+
+/// The preview origin's pod label. One **stable** hostname per app, so
+/// on-demand TLS issues a certificate once per app instead of one per preview
+/// session — the pod's instance id is random per boot, and a wildcard label
+/// would let anyone drain the CA's per-domain issuance limit. The pod host
+/// document, its bundle, its process workers and its preview service worker all
+/// live on this one origin, and the pod boots with path URLs there, so nothing
+/// has to interpolate an instance id into a hostname.
+pub const PREVIEW_LABEL: &str = "app-0";
+
+/// Preview slug from a pod's preview host
+/// (`{PREVIEW_LABEL}.preview.{slug}.{base}`): the app's own preview origin, one
+/// label under the instance wildcard. `None` for anything else — a plain tenant
+/// host, another base, a dotted slug, or any other pod label.
+pub fn parse_preview_slug(host: &str, bases: &[String]) -> Option<String> {
+    let bare = host
+        .split_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host)
+        .trim()
+        .trim_end_matches('.')
+        .to_lowercase();
+    if bare.is_empty() {
+        return None;
+    }
+    for base in bases {
+        if base.trim().is_empty() {
+            continue;
+        }
+        let Some(rest) = bare.strip_suffix(format!(".{base}").as_str()) else {
+            continue;
+        };
+        let Some((pod, slug)) = rest.split_once(".preview.") else {
+            continue;
+        };
+        if pod != PREVIEW_LABEL || slug.is_empty() || slug.contains('.') {
+            continue;
         }
         return Some(slug.to_string());
     }
@@ -86,7 +129,7 @@ fn control_url(
         .iter()
         .find(|b| *b != base_domain && (bare == **b || bare.ends_with(format!(".{b}").as_str())))
     {
-        if base_domain == "localhost" {
+        if is_localhost_domain(base_domain) {
             return format!("http://{extra}{port}");
         }
         return format!("https://{extra}");
@@ -96,7 +139,7 @@ fn control_url(
     } else {
         format!("{control_sub}.{base_domain}")
     };
-    if base_domain == "localhost" {
+    if is_localhost_domain(base_domain) {
         format!("http://{name}{port}")
     } else {
         format!("https://{name}")
@@ -283,15 +326,15 @@ pub async fn edge_fallback(State(state): State<AppState>, headers: HeaderMap) ->
 
 /// Structural allowlist for the Caddy `on_demand_tls` ask gate: platform
 /// hosts (control/api/git + extra) are always ours; tenant slugs need a DB
-/// liveness check (done by the caller). Never localhost — dev has no public
-/// TLS and must not trigger issuance attempts.
+/// liveness check (done by the caller). Never the `localhost` family — dev
+/// has no public TLS and must not trigger issuance attempts.
 pub fn tls_ask_static_ok(
     host: &str,
     base_domain: &str,
     control_sub: &str,
     extra_hosts: &[String],
 ) -> bool {
-    if base_domain == "localhost" || base_domain.trim().is_empty() {
+    if is_localhost_domain(base_domain) || base_domain.trim().is_empty() {
         return false;
     }
     let bare = host
@@ -331,6 +374,16 @@ pub async fn tls_ask(
         &cfg.control_extra_hosts,
     ) {
         return StatusCode::OK;
+    }
+    // A preview host (`{instanceId}-{port}.{slug}.preview.{base}`) is the app's
+    // own origin for the in-browser pod, so an existing app is enough — its
+    // fleet need not be up. Anything else falls through to the tenant/custom
+    // checks, and an unknown preview host gets 404 (no cert minted).
+    if let Some(slug) = parse_preview_slug(domain, &cfg.tenant_bases()) {
+        return match crate::db::get_app_by_slug(&state.pool, &slug).await {
+            Ok(Some(_)) => StatusCode::OK,
+            _ => StatusCode::NOT_FOUND,
+        };
     }
     // A tenant hostname or a registered custom hostname. Both must belong to
     // an app that is deployed and running, so a certificate is never minted for
@@ -425,8 +478,52 @@ mod tests {
         ));
         assert!(!tls_ask_static_ok("noite.now", "noite.now", "app", &[]));
         assert!(!tls_ask_static_ok("app.noite.now", "localhost", "", &[]));
+        // The dev `*.localhost` base mints nothing either: it is plain http.
+        assert!(!tls_ask_static_ok(
+            "app.noite.localhost",
+            "noite.localhost",
+            "",
+            &[]
+        ));
         assert!(!tls_ask_static_ok("anything", "", "app", &[]));
     }
+    #[test]
+    fn parses_preview_hosts() {
+        let bases = bases(&["noite.now", "noite.local"]);
+        assert_eq!(
+            parse_preview_slug("app-0.preview.test.noite.now", &bases),
+            Some("test".to_string())
+        );
+        assert_eq!(
+            parse_preview_slug("app-0.preview.test.noite.local:9080", &bases),
+            Some("test".to_string())
+        );
+        // One stable label per app: every other pod label is refused, and the
+        // shape Nodepod used to need (`{instanceId}-{port}`) is not admitted.
+        assert_eq!(
+            parse_preview_slug("pod123-4444.preview.test.noite.now", &bases),
+            None
+        );
+        assert_eq!(
+            parse_preview_slug("app-1.preview.test.noite.now", &bases),
+            None
+        );
+        // No pod label, a dotted slug, an empty slug, a foreign base.
+        assert_eq!(parse_preview_slug("preview.test.noite.now", &bases), None);
+        assert_eq!(
+            parse_preview_slug("app-0.preview.a.b.noite.now", &bases),
+            None
+        );
+        assert_eq!(parse_preview_slug("app-0.preview.noite.now", &bases), None);
+        assert_eq!(
+            parse_preview_slug("app-0.preview.test.evil.com", &bases),
+            None
+        );
+        // A tenant host is never a preview host.
+        assert_eq!(parse_preview_slug("test.noite.now", &bases), None);
+        assert_eq!(parse_preview_slug("app-0.noite.now", &bases), None);
+    }
+
     #[test]
     fn rejects_platform_hosts() {
         let dev = bases(&["localhost"]);
@@ -454,6 +551,16 @@ mod tests {
                 &bases(&["localhost"])
             ),
             "http://localhost:9080"
+        );
+        // The dev stack's `*.localhost` base: plain http, the visitor's port.
+        assert_eq!(
+            control_url(
+                "asdf.noite.localhost:9080",
+                "noite.localhost",
+                "",
+                &bases(&["noite.localhost"])
+            ),
+            "http://noite.localhost:9080"
         );
         assert_eq!(
             control_url("x.noite.now", "noite.now", "app", &bases(&["noite.now"])),

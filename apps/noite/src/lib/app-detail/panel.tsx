@@ -6,11 +6,12 @@ import { appHost, appUrl, presenceTone } from "../apps/identity";
 import { errorMessage } from "../errors";
 import { appDetail } from "../resources";
 import type { AppRole } from "../roles";
-import { setDesired } from "../server/apps.server";
+import { setDesired, retryImport } from "../server/apps.server";
 import { sleep } from "../sleep";
 import { AppStorageList } from "../storage/list";
 import { Avatar } from "../ui/avatar";
-import { ArrowLeft, ArrowUpRight, Code, Pause, Play } from "../ui/icons";
+import { CopyButton } from "../ui/copy-button";
+import { ArrowUpRight, Pause, Play, Refresh } from "../ui/icons";
 import { AppHeaderSkeleton } from "../ui/skeletons";
 import { DeployDropdown } from "./deploys";
 import { ErrorsSummary } from "./errors";
@@ -21,6 +22,7 @@ export interface AppDetailInfo {
     desiredState: string;
     fleetBucket: string;
     id: string;
+    imported: boolean;
     lastDeploySha: string | null;
     lastError: string | null;
     name: string;
@@ -38,6 +40,14 @@ export interface AppDetailInfo {
 const SHA_CHARS = 7;
 const CONVERGE_POLLS = 20;
 const CONVERGE_INTERVAL_MS = 3000;
+// Retry of a failed import (A2): the runner's clone can take minutes, and the
+// app page is the only place that shows the outcome, so poll the detail.
+const IMPORT_POLLS = 60;
+const IMPORT_INTERVAL_MS = 3000;
+// A failed import offers Retry, and so does one that a restart interrupted
+// (still `importing`, with no task behind it — the runner refuses the retry
+// while an import really is running).
+const RETRY_IMPORT_STATUSES = new Set(["error", "importing"]);
 
 const STATUS_LABELS = new Map([
   ["running", "Running"],
@@ -47,20 +57,11 @@ const STATUS_LABELS = new Map([
   ["building", "Building"],
   ["failed", "Failed"],
   ["error", "Error"],
+  ["importing", "Importing"],
 ]);
 
 const statusLabel = (status: string): string =>
   STATUS_LABELS.get(status) ?? status;
-
-const BackToApps = () => (
-  <a
-    href="/apps"
-    class="link link-hover inline-flex w-fit items-center gap-1 text-sm opacity-70"
-  >
-    <ArrowLeft />
-    Apps
-  </a>
-);
 
 /** Status · host · commit, under the app name. The full SHA sits in a
  * native `title` (a daisyUI tooltip's hidden pseudo-element widened the
@@ -101,6 +102,7 @@ export const AppHeader = ({ appId }: { appId: string }) => {
   const res = appDetail(appId);
   const notice = atom<string | null>(null);
   const converging = atom<string | null>(null);
+  const importBusy = atom(false);
 
   // The fleet converges asynchronously (reconcile loop), so the first
   // re-fetch still shows the old status. Poll the shared detail until the
@@ -138,7 +140,6 @@ export const AppHeader = ({ appId }: { appId: string }) => {
   if (res.loading() && info === undefined) {
     return (
       <header class="flex flex-col gap-3">
-        <BackToApps />
         <AppHeaderSkeleton />
       </header>
     );
@@ -147,7 +148,6 @@ export const AppHeader = ({ appId }: { appId: string }) => {
   if (!info) {
     return (
       <header class="flex flex-col gap-3">
-        <BackToApps />
         <p class="text-error m-0">
           {loadError ? errorMessage(loadError) : "App not found"}
         </p>
@@ -162,7 +162,6 @@ export const AppHeader = ({ appId }: { appId: string }) => {
 
   return (
     <header class="flex flex-col gap-3">
-      <BackToApps />
       <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
         <div class="flex min-w-0 items-center gap-3">
           <Avatar class="shrink-0" label={app.name} size="lg" />
@@ -181,12 +180,6 @@ export const AppHeader = ({ appId }: { appId: string }) => {
             <span class="inline-flex items-center gap-1">
               <ArrowUpRight />
               Visit
-            </span>
-          </a>
-          <a href={`/apps/${appId}/source`} class="btn btn-sm">
-            <span class="inline-flex items-center gap-1">
-              <Code />
-              Code
             </span>
           </a>
           {canPush && deployed ? (
@@ -211,6 +204,40 @@ export const AppHeader = ({ appId }: { appId: string }) => {
               </span>
             </button>
           ) : null}
+          {canPush && app.imported && RETRY_IMPORT_STATUSES.has(app.status) ? (
+            <button
+              type="button"
+              class="btn btn-sm"
+              disabled={importBusy()}
+              onclick={async () => {
+                importBusy.set(true);
+                try {
+                  await retryImport(app.id);
+                  notice.set(null);
+                  // The import runs in the background: poll the shared detail
+                  // until the app leaves `importing` (then the deploy, or a
+                  // fresh error, is what the page shows).
+                  for (let i = 0; i < IMPORT_POLLS; i += 1) {
+                    // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll backoff
+                    await sleep(IMPORT_INTERVAL_MS);
+                    // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll; parallel makes no sense here
+                    const fresh = await res.refetch();
+                    if (!fresh || fresh.app.status !== "importing") {
+                      break;
+                    }
+                  }
+                } catch (error) {
+                  notice.set(errorMessage(error));
+                }
+                importBusy.set(false);
+              }}
+            >
+              <span class="inline-flex items-center gap-1">
+                <Refresh />
+                Retry import
+              </span>
+            </button>
+          ) : null}
           <DeployDropdown appId={appId} />
         </div>
       </div>
@@ -228,11 +255,58 @@ export const AppHeader = ({ appId }: { appId: string }) => {
   );
 };
 
-/** Overview tab: usage, open errors, storage. */
+/** Overview's first card for an app nothing has been pushed to yet (a blank
+ * create): the remote and the two commands that deploy it. Gone after the
+ * first deploy; an import or template builds on its own, so never shown. */
+const FirstPushCard = ({ appId }: { appId: string }) => {
+  const info = appDetail(appId).data();
+  if (
+    !info ||
+    info.app.lastDeploySha ||
+    info.app.imported ||
+    !(info.myRole === "push" || info.myRole === "admin")
+  ) {
+    return null;
+  }
+  const snippet = `git remote add noite ${info.gitRemote}\ngit push noite main`;
+  return (
+    <section class="card bg-base-100 dark:bg-base-200 border-base-300 border">
+      <div class="card-body gap-3">
+        <h2 class="card-title m-0 text-base">Push your first commit</h2>
+        <p class="m-0 text-sm opacity-80">
+          This app has no code yet. Push <code>main</code> from your project and
+          it deploys.
+        </p>
+        <div class="bg-base-200 dark:bg-base-300 rounded-box flex items-start gap-2 p-3">
+          <pre class="m-0 min-w-0 flex-1 overflow-x-auto font-mono text-xs leading-relaxed">
+            {snippet}
+          </pre>
+          <CopyButton iconOnly label="Copy commands" value={snippet} />
+        </div>
+        <p class="m-0 text-xs opacity-70">
+          Git asks for credentials: username <code>{info.username}</code>,
+          password an API key from{" "}
+          <a href="/account" class="link">
+            Account
+          </a>
+          .
+        </p>
+      </div>
+    </section>
+  );
+};
+
+/** Overview tab: the first-push steps (until something is deployed), usage,
+ * open errors, storage. */
 export const AppDetailPanel = ({ appId }: { appId: string }) => (
-  <div class="flex flex-col gap-4">
-    <MetricsCard appId={appId} viewAllHref={`/apps/${appId}?t=metrics`} />
-    <ErrorsSummary appId={appId} />
+  <div class="@container flex flex-col gap-4">
+    <FirstPushCard appId={appId} />
+    {/* Columns follow the tab body's width, not the viewport's, so an open
+        Settings panel stacks the cards instead of squeezing them. */}
+    <div class="grid grid-cols-1 gap-4 @4xl:grid-cols-2">
+      <MetricsCard appId={appId} viewAllHref={`/apps/${appId}?t=metrics`} />
+      <ErrorsSummary appId={appId} />
+    </div>
     <AppStorageList appId={appId} />
   </div>
 );

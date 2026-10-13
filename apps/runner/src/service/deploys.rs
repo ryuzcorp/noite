@@ -49,8 +49,20 @@ pub async fn rollback(state: &AppState, id: &str, sha: &str) -> Result<String, A
     let deploying = state.deploying.clone();
     let key = format!("git/{}/refs/heads/main/{sha}.bundle", app.slug);
     let sha_resp = sha.clone();
+    // Explicit: rolling back to the live sha rebuilds it (a redeploy).
     tokio::spawn(async move {
-        deploy::deploy_app(&pool, &cfg, &procs, &logs, &deploying, app, &key, Some(&sha)).await;
+        deploy::deploy_app(
+            &pool,
+            &cfg,
+            &procs,
+            &logs,
+            &deploying,
+            app,
+            &key,
+            Some(&sha),
+            deploy::DeployTrigger::Explicit,
+        )
+        .await;
     });
     Ok(sha_resp)
 }

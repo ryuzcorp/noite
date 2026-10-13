@@ -76,7 +76,7 @@ const TelemetrySettings = ({
 
   return (
     <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
-      <h2 class="m-0 text-lg font-semibold">Admin</h2>
+      <h2 class="m-0 text-lg font-semibold">Telemetry</h2>
       <div class="flex flex-col gap-1">
         <p class="m-0 text-sm font-medium">Anonymous usage telemetry</p>
         <label class="flex cursor-pointer items-center gap-2 text-sm">
@@ -134,7 +134,8 @@ const TelemetrySettings = ({
   );
 };
 
-const TelemetryCard = () => {
+/** The `/account` Admin tab's card: the anonymous instance-telemetry opt-out. */
+export const TelemetryCard = () => {
   const res = telemetry();
   const status = res.data();
   // Lives here, not in the body: the invalidate below blanks `status` for a
@@ -146,7 +147,7 @@ const TelemetryCard = () => {
   if (status === undefined) {
     return (
       <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
-        <h2 class="m-0 text-lg font-semibold">Admin</h2>
+        <h2 class="m-0 text-lg font-semibold">Telemetry</h2>
         <LoadError
           error={res.error()}
           label="Failed to load telemetry settings"
@@ -157,19 +158,11 @@ const TelemetryCard = () => {
   return <TelemetrySettings saved={saved} status={status} />;
 };
 
-/** The `/account` page's Admin section: the anonymous instance-telemetry
- * opt-out. Rendered only for a real (non-impersonating) instance admin; the
- * actions behind it re-check the same gate server-side, so hiding the card is
- * presentation, not security. */
-export const AdminTelemetrySection = () => {
-  const admin = adminStatus();
-  const sess = session();
-  const ready = admin.data() !== undefined && sess.data() !== undefined;
-  const allowed =
-    (admin.data()?.isAdmin ?? false) &&
-    sess.data()?.session.impersonatedBy === null;
-  if (!(ready && allowed)) {
-    return null;
-  }
-  return <TelemetryCard />;
+/** A real (non-impersonating) instance admin, once both resources load. Gates
+ * the `/account` Admin tab; the actions behind it re-check the same gate
+ * server-side, so hiding the tab is presentation, not security. */
+export const isInstanceAdmin = (): boolean => {
+  const admin = adminStatus().data();
+  const sess = session().data();
+  return (admin?.isAdmin ?? false) && sess?.session.impersonatedBy === null;
 };

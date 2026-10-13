@@ -1,10 +1,20 @@
 /* oxlint-disable eslint/require-await, anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: they mirror async platform interfaces and stand in for bindings they only partly implement */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
+import {
+  CONTROL_HOST_DENIED_ASSETS,
+  POD_HOST_HTML_PATH,
+  PREVIEW_ASSET_PREFIX,
+} from "../lib/preview-host";
 import { resetRateLimits } from "../lib/rate-limit";
 import { handleHttp } from "./router";
 
 const ENV = { RUNNER_TOKEN: "runner-secret", RUNNER_URL: "http://runner.test" };
+
+/** The Worker env slice these tests stand in for. */
+type TestEnv = KitEnv & {
+  ASSETS?: { fetch: (request: Request) => Promise<Response> };
+};
 
 const realFetch = globalThis.fetch;
 const setFetch = (
@@ -23,7 +33,7 @@ afterEach(() => {
   globalThis.fetch = realFetch;
 });
 
-const call = (request: Request, env: Record<string, string> = ENV) =>
+const call = (request: Request, env: TestEnv = ENV) =>
   // SAFETY: the handler reads only string env keys.
   // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- minimal KitEnv for the route under test.
   Promise.resolve(handleHttp(request, env as unknown as never));
@@ -115,5 +125,66 @@ describe("platform rate limit", () => {
       statuses.push(res?.status);
     }
     expect(statuses.slice(2)).toEqual([429, 429]);
+  });
+});
+
+describe("preview host assets", () => {
+  test("registers every pod path and the bundle's chunks", async () => {
+    const seen: string[] = [];
+    const env = {
+      ...ENV,
+      ASSETS: {
+        fetch: (request: Request) => {
+          seen.push(new URL(request.url).pathname);
+          return Promise.resolve(new Response("asset", { status: 200 }));
+        },
+      },
+    };
+    const paths = [
+      ...CONTROL_HOST_DENIED_ASSETS,
+      `${PREVIEW_ASSET_PREFIX}bundle-CKoOeS2C.js`,
+    ];
+    for (const path of paths) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- sequential: each path is asserted before the next
+      const res = await call(
+        new Request(`http://app-0.preview.shop.noite.test${path}`, {
+          headers: { host: "app-0.preview.shop.noite.test" },
+        }),
+        env
+      );
+      // A route (not the platform's static-asset fallback) answers each path.
+      expect(`${path} -> ${res?.status}`).toBe(`${path} -> 200`);
+    }
+    // Every path but the pod host document: that one is the app's own
+    // response, so the static assets are never asked for it.
+    expect(seen).toEqual(paths.filter((path) => path !== POD_HOST_HTML_PATH));
+  });
+
+  test("declines the asset directory on the control origin", async () => {
+    // `/assets/*` is the control UI's own bundle there: the route must let the
+    // platform serve it exactly as it did before this route existed.
+    const res = await call(
+      new Request("http://localhost/assets/index-CKoOeS2C.js", {
+        headers: { host: "localhost" },
+      })
+    );
+    expect(res).toBeUndefined();
+  });
+
+  test("registers HEAD alongside GET", async () => {
+    const env = {
+      ...ENV,
+      ASSETS: {
+        fetch: () => Promise.resolve(new Response(null, { status: 200 })),
+      },
+    };
+    const res = await call(
+      new Request("http://app-0.preview.shop.noite.test/__sw__.js", {
+        headers: { host: "app-0.preview.shop.noite.test" },
+        method: "HEAD",
+      }),
+      env
+    );
+    expect(res?.status).toBe(200);
   });
 });

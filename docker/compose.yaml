@@ -29,14 +29,15 @@ services:
     cap_add: [NET_ADMIN, SETUID, SETGID, CHOWN]
     environment:
       RUST_LOG: ${RUST_LOG:-noite_runner=info,tower_http=info}
-      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
-      # Empty = control on the bare domain (dev `localhost`); prod sets `app`.
+      BASE_DOMAIN: ${BASE_DOMAIN:-noite.localhost}
+      # Empty = control on the bare domain (dev `noite.localhost`); prod sets
+      # `app`.
       CONTROL_SUBDOMAIN: ${CONTROL_SUBDOMAIN:-}
       CONTROL_EXTRA_HOSTS: ${CONTROL_EXTRA_HOSTS:-}
-      # Unset = on except localhost; `off` behind a terminating proxy.
+      # Unset = on except a `localhost` base; `off` behind a terminating proxy.
       CADDY_AUTO_HTTPS: ${CADDY_AUTO_HTTPS:-}
       HTTP_PORT: ${HTTP_PORT:-9080}
-      GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-http://git.localhost:${HTTP_PORT:-9080}}
+      GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-http://git.noite.localhost:${HTTP_PORT:-9080}}
       RUNNER_TOKEN: ${RUNNER_TOKEN:-dev-runner-token}
       # Object store (bundled RustFS by default).
       S3_ENDPOINT: ${S3_ENDPOINT:-http://rustfs:9000}
@@ -48,7 +49,7 @@ services:
       AWS_EC2_METADATA_DISABLED: "true"
       # Control UI (passed to the worker by the runner). Passkeys bind to
       # BETTER_AUTH_URL: set it before anyone registers.
-      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:${HTTP_PORT:-9080}}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://noite.localhost:${HTTP_PORT:-9080}}
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-dev-only-change-me-to-a-long-random-string}
       NOITE_ADMIN_EMAIL: ${NOITE_ADMIN_EMAIL:-}
       NOITE_EMAIL_WEBHOOK_URL: ${NOITE_EMAIL_WEBHOOK_URL:-}

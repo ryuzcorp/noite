@@ -26,7 +26,9 @@ pub async fn app_metrics(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    service::observe::metrics(&state, &id, q.hours).await.map(Json)
+    service::observe::metrics(&state, &id, q.hours)
+        .await
+        .map(Json)
 }
 
 pub async fn app_devices(
@@ -34,7 +36,9 @@ pub async fn app_devices(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    service::observe::devices(&state, &id, q.hours).await.map(Json)
+    service::observe::devices(&state, &id, q.hours)
+        .await
+        .map(Json)
 }
 
 pub async fn app_paths(
@@ -42,7 +46,9 @@ pub async fn app_paths(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    service::observe::paths(&state, &id, q.hours).await.map(Json)
+    service::observe::paths(&state, &id, q.hours)
+        .await
+        .map(Json)
 }
 
 pub async fn app_refs(
@@ -58,7 +64,9 @@ pub async fn app_spans(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    service::observe::spans(&state, &id, q.hours).await.map(Json)
+    service::observe::spans(&state, &id, q.hours)
+        .await
+        .map(Json)
 }
 
 /// Per-app metrics version (spec T3.6): dashboard polls fetch this first and
@@ -80,15 +88,11 @@ pub async fn app_logs(State(state): State<AppState>, Path(id): Path<String>) -> 
 /// only when the snapshot changed (plus keep-alive comments). Wakes on the
 /// ingest tick's "new logs" signal (spec T3.3) instead of polling DuckDB, and
 /// ends when the client disconnects.
-pub async fn app_logs_stream(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
-    let (app_id, slug) =
-        match service::observe::telemetry_target_or_404(&state.pool, &id).await {
-            Ok(target) => target,
-            Err(e) => return e.into_response(),
-        };
+pub async fn app_logs_stream(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let (app_id, slug) = match service::observe::telemetry_target_or_404(&state.pool, &id).await {
+        Ok(target) => target,
+        Err(e) => return e.into_response(),
+    };
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, anyhow::Error>>(16);
     crate::host::stats::sse_enter("logs");
     let mut notify = state.log_notify.subscribe();

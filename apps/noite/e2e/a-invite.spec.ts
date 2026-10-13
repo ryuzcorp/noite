@@ -10,10 +10,12 @@ import { expect, test } from "@playwright/test";
 // code (validate → claim → mint is several D1 round trips inside one action,
 // and the control node's D1 stalls under that) and reading an account's own
 // codes (the profile panel, an action-driven surface).
+const control = process.env.E2E_BASE_URL ?? "http://noite.localhost:8090";
+
 test("the signup policy flips to invite-only after the first account", async ({
   request,
 }) => {
-  const res = await request.get("http://localhost:8090/api/invite/status");
+  const res = await request.get(`${control}/api/invite/status`);
   expect(res.ok()).toBe(true);
   // SAFETY: the route answers exactly this shape (see handleInviteStatus).
   const policy = (await res.json()) as {

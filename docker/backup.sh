@@ -29,7 +29,7 @@ TOKEN="${RUNNER_TOKEN:-dev-runner-token}"
 API_URL="${NOITE_API_URL:-http://127.0.0.1:${PORT}/v1}"
 # Behind the edge the runner is reached by Host, not by port (raw-port lanes
 # set NOITE_API_URL and skip this).
-API_HOST_HEADER="${NOITE_API_HOST_HEADER:-api.localhost}"
+API_HOST_HEADER="${NOITE_API_HOST_HEADER:-api.${BASE_DOMAIN:-noite.localhost}}"
 PROJECT="${COMPOSE_PROJECT_NAME:-noite}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DEST="${1:-backups/${STAMP}}"

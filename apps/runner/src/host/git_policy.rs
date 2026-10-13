@@ -100,6 +100,29 @@ pub fn updates_needing_ff(cmds: &[PushCommand]) -> Vec<(&str, &str, &str)> {
         .collect()
 }
 
+/// Branch protection (`app_branch_rule.require_pr`): with the rule on, only
+/// `admin` may move `refs/heads/main`; a `push` caller must open a pull request
+/// instead. Off by default, and admins always bypass.
+pub fn check_branch_protection(
+    role: &str,
+    cmds: &[PushCommand],
+    require_pr: bool,
+) -> PolicyDecision {
+    if !require_pr || role == "admin" {
+        return PolicyDecision::Allow;
+    }
+    for cmd in cmds {
+        if cmd.refname == "refs/heads/main" {
+            return PolicyDecision::Deny(
+                "rule branch-protection: refs/heads/main is protected; \
+                 open a pull request instead of pushing directly"
+                    .to_string(),
+            );
+        }
+    }
+    PolicyDecision::Allow
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +235,38 @@ mod tests {
         let ff = updates_needing_ff(&cmds);
         assert_eq!(ff.len(), 1);
         assert_eq!(ff[0].0, "refs/heads/main");
+    }
+
+    #[test]
+    fn branch_protection_rejects_push_role_main_only() {
+        let main = vec![PushCommand {
+            old: "a".repeat(40),
+            new: "b".repeat(40),
+            refname: "refs/heads/main".into(),
+        }];
+        let feat = vec![PushCommand {
+            old: "0".repeat(40),
+            new: "b".repeat(40),
+            refname: "refs/heads/feat".into(),
+        }];
+        // Rule off: everything is allowed.
+        assert!(matches!(
+            check_branch_protection("push", &main, false),
+            PolicyDecision::Allow
+        ));
+        // Rule on: push may not touch main, but may push other branches.
+        match check_branch_protection("push", &main, true) {
+            PolicyDecision::Deny(msg) => assert!(msg.contains("protected")),
+            PolicyDecision::Allow => panic!("main push allowed under require_pr"),
+        }
+        assert!(matches!(
+            check_branch_protection("push", &feat, true),
+            PolicyDecision::Allow
+        ));
+        // Admins bypass.
+        assert!(matches!(
+            check_branch_protection("admin", &main, true),
+            PolicyDecision::Allow
+        ));
     }
 }

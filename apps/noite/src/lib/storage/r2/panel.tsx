@@ -3,8 +3,7 @@
 //! the UI's proxy route, which hands the body to the runner's `celld r2 put`,
 //! so the stored record is exactly what a Worker's `env.BUCKET.put()` writes.
 
-import { searchParam } from "@ilha/router";
-
+import { searchParam } from "../../search-param";
 import { StorageBreadcrumb, Toaster, useToasts } from "../shared";
 import { R2Folder } from "./browser";
 import { r2Crumbs, toR2View } from "./state";

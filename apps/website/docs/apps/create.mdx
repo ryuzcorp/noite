@@ -1,0 +1,68 @@
+---
+title: Create an app
+description: Start from a blank repository, a one-time GitHub import, or a shipped template — or create an app by pushing to a new slug.
+---
+
+**Apps → New app** opens the creator at `/apps/new`. Every app gets its Git remote at creation, with `main` as the default branch; what you pick under **Start from** is where its code comes from. Name and slug are the only required fields, and the slug is prefilled from the name, the repository or the template you pick.
+
+The slug is checked while you type. A slug that is reserved or already used by another app is flagged under the field, with a free variant (`oxide-2`) you can take in one click; a free slug shows the URL and Git remote the app will get. After **Create app**, a blank app opens on its Overview, which shows the two `git` commands for the first push; an import or template opens on Deployments, where its first build is already running.
+
+## Three ways to start
+
+| Mode | What it makes |
+| --- | --- |
+| **Blank** | An empty repository. Push when you are ready. |
+| **Import from GitHub** | A one-time copy of a public GitHub repo, history included. |
+| **Template** | A shipped starting point, as one initial commit. |
+
+### Blank
+
+An empty repo with `main` and no commits. Nothing deploys until your first push ([Deploy](/apps/deploy)).
+
+### Import from GitHub
+
+Enter a public repository URL — `https://github.com/<owner>/<repo>`, an optional `.git` suffix is fine. The creator shows the `owner/repo` it read from the URL. Under **Branch, tag or folder (optional)**, a branch or tag picks another ref (empty means the repo's default branch). The repository is copied **once**, full history included, as `main`. Noite's copy becomes the source of truth: there is no upstream link, no sync and no pull from GitHub later.
+
+**From a monorepo**, set **Folder** (for example `apps/web`) to import just that folder: it becomes the app's root, as one commit (`Initial commit from <owner>/<repo>/<folder>@<sha>`) without the repository's history. Pasting a folder link from GitHub — `https://github.com/<owner>/<repo>/tree/<branch>/<folder>` — fills the branch and the folder, and names the app after the folder. A branch name with a slash in it (`release/1.x`) can't be told apart from the folder in such a link, so check both fields. The whole repository is still cloned under the caps below. A folder that doesn't exist at that ref fails the import with `folder <path> not found in <owner>/<repo>@<sha>`.
+
+The new app shows **Importing** while it clones, then deploys the imported `main`. A failed import shows the error with **Retry** and **Delete**; Retry repeats the same URL, ref, folder and account, even after a runner restart.
+
+The runner does the clone, so the import needs outbound HTTPS to `github.com` from the runner host ([Prerequisites](/self-hosting/install#prerequisites)). Only `https://github.com/<owner>/<repo>` is ever fetched, redirects are not followed, no credentials are sent (public repos only), and each import is capped at **500 MiB** and **10 minutes** — a clone over the size cap or the wall clock is killed. An instance with no internet access can still create blank apps and serve pushes.
+
+### Template
+
+Two templates ship with Noite. Each card in the creator lists its stack and links to its source repository:
+
+| Template | What it is |
+| --- | --- |
+| **Oxide + Ilha** | An Oxide worker with the Ilha router and Vite — the shape the control UI itself runs on. |
+| **TanStack Start** | TanStack Start (Vite plus the Cloudflare plugin) serving SSR, with hydration. |
+
+A template is created through the same import path as a GitHub import, with its history squashed into one commit titled `Initial commit from <owner>/<repo>@<sha>`, authored as you. Both templates build and serve on Noite; after creation the app deploys like any other.
+
+### Drop a folder
+
+Drag a project folder from your computer anywhere onto the creator page. The app is named after the folder, starts blank, and the folder becomes its first commit on `main` (`Upload <folder>`), which deploys like a push. The **Start from** row shows how many files and bytes will be committed; **Remove** goes back to the three modes.
+
+Left out of the commit: `node_modules`, `.git`, build output and tool caches (`dist`, `build`, `coverage`, `.next`, `.nuxt`, `.output`, `.svelte-kit`, `.turbo`, `.vercel`, `.wrangler`, `.cache`), OS files (`.DS_Store`, `Thumbs.db`, `desktop.ini`), and local env files (`.env`, `.env.*` and `.dev.vars`; `.env.example`, `.env.sample` and `.env.template` stay). `.gitignore` is not read. What is left must fit one browser commit: up to 100 files, 10 MiB each and 25 MiB in total. Push larger projects with git.
+
+## Create by pushing
+
+`git push` to a slug that does not exist yet creates the app, with you as its `admin`, then deploys the pushed code. The push prints the app's URL.
+
+```bash
+git init -b main
+git add -A && git commit -m "first deploy"
+git remote add origin "https://git:<api-key>@git.<domain>/<slug>"
+git push -u origin main
+```
+
+A reserved or invalid slug answers `repository not found`, exactly as an unknown repository does. An account at its app limit gets a readable refusal as a `remote:` line. **Fetching** an unknown slug is still a 404 — only a push creates.
+
+:::tip
+Slug rules are the same in every path: 1–48 chars, lowercase letters, digits and hyphens, starting and ending with a letter or digit. Reserved: `_control`, `app`, `api`, `git`.
+:::
+
+## Next
+
+The app is provisioned and counted against your per-account quota ([Limits](/reference/limits)). Continue with [Deploy](/apps/deploy) to ship it, [Source and history](/apps/source) to browse and edit code, or [Pull requests](/apps/pull-requests) to review branches before they reach `main`.

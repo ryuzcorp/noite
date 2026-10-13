@@ -112,19 +112,9 @@ export const EmptyState = ({
   </div>
 );
 
-const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"] as const;
-
-/** Human size for a listing or detail row (1024-based, one decimal below 10). */
-export const formatBytes = (bytes: number): string => {
-  let value = Math.max(bytes, 0);
-  let unit = 0;
-  while (value >= 1024 && unit < BYTE_UNITS.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  const digits = unit > 0 && value < 10 ? 1 : 0;
-  return `${value.toFixed(digits)} ${BYTE_UNITS[unit]}`;
-};
+/** Human sizes in the storage views come from the source uploads' formatter
+ * (one spelling of `12 KB` everywhere); re-exported so the views keep one
+ * import. */
 
 /** What the R2 detail panel can show for one object. */
 export type PreviewKind = "image" | "text" | "binary";

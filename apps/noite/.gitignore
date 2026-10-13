@@ -12,3 +12,6 @@ e2e/.auth/
 
 # local celld/wrangler data
 data/
+
+# Poder's dist, copied in for the preview to inline (see poder-source.ts)
+poder-dist/

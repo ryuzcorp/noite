@@ -2,7 +2,7 @@
 //! runner (`host/errors.rs`) — no SDK in the app. List by status, detail
 //! with stack, request and the failing trace's logs; anyone who can push
 //! resolves, ignores or reopens.
-import { navigate, searchParam } from "@ilha/router";
+import { navigate } from "@ilha/router";
 import { atom } from "ilha";
 
 import { formatAgo, formatDateTime } from "../dates";
@@ -16,6 +16,7 @@ import type {
   RunnerErrorIssue,
   RunnerErrorList,
 } from "../runner";
+import { searchParam } from "../search-param";
 import { setErrorStatus } from "../server/errors.server";
 import { ArrowLeft } from "../ui/icons";
 import { LoadError } from "../ui/load-error";

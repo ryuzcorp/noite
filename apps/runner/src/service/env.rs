@@ -27,15 +27,12 @@ pub async fn list(state: &AppState, id: &str) -> Result<Vec<AppEnv>, ApiError> {
 }
 
 /// Set one variable; returns its canonical (trimmed) name.
-pub async fn set(
-    state: &AppState,
-    id: &str,
-    name: &str,
-    value: &str,
-) -> Result<String, ApiError> {
+pub async fn set(state: &AppState, id: &str, name: &str, value: &str) -> Result<String, ApiError> {
     let name = name.trim().to_string();
     if !name_valid(&name) {
-        return Err(ApiError::bad("name must match [A-Za-z_][A-Za-z0-9_]* (≤64)"));
+        return Err(ApiError::bad(
+            "name must match [A-Za-z_][A-Za-z0-9_]* (≤64)",
+        ));
     }
     if value.len() > 32 * 1024 {
         return Err(ApiError::bad("value exceeds 32 KiB"));

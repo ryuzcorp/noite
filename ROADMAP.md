@@ -29,7 +29,6 @@ No cloud version: every alpha user runs their own install. The bar moves from "t
 - The `bwrap` egress fallback, so platforms without `NET_ADMIN` (Railway) can run `multi` ([open question 1](#open-questions-and-known-issues)).
 - An opt-in "new version available" notice in the UI linking the changelog, with no telemetry.
 - Error tracking phase 2 and source maps (below).
-- The tiny forge UI over bare mirrors (history, commit views).
 - `CONTRIBUTING.md`, issue templates asking for `make doctor` output, a community channel.
 - A restore drill for BYO S3 and Railway installs, where `make backup` does not apply.
 
@@ -56,7 +55,7 @@ No cloud version: every alpha user runs their own install. The bar moves from "t
 3. **Snapshot loss window** (about 70 s) vs Litestream.
 4. **Control and runner restart together** on every image update. Accepted: the UI cannot act without the runner, and one node removes the two-node readiness-gate drain that stalled the old topology.
 5. **E2E comments** in `apps/noite/e2e/{helpers.ts,app-lifecycle.spec.ts,a-invite.spec.ts}` still call the app-detail and invite panels a known-broken surface; the stalls were fixed in oxidejs 0.5.6 ([Design history](#design-history), 2026-09-27), so those surfaces can now get UI-level coverage. Unit tests (`bun run test`) cover the role gate, invitations, invites, rate limiter and stream loop against a SQLite-backed D1 shim; still without e2e: storage editing, rollback, commits from the source browser, the admin page.
-6. **Not built:** a README for `apps/noite/test` (app-author docs exist: Apps → Deploy/Build/Configure); a tiny forge UI over bare mirrors (history, commit views); DNS/TXT verification for custom domains; pricing.
+6. **Not built:** a README for `apps/noite/test` (app-author docs exist: Apps → Deploy/Build/Configure); DNS/TXT verification for custom domains; pricing. Forge follow-ups after alpha.4: forks, branch/PR preview deployments, notifications, a conflict-resolution UI, merge methods other than squash, issues.
 
 ## Design history
 

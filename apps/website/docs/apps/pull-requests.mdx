@@ -1,0 +1,58 @@
+---
+title: Pull requests
+description: Open, review, comment on and squash-merge pull requests for an app's branches, then gate main with branch protection.
+---
+
+Pull requests (called **pulls** in the UI) work between branches of the **same app**; there are no forks. They have their own pages: the **Pulls** item under the app in the sidebar shows the open count and opens the list (`/apps/<id>/pulls`). The title repeats the open count and carries **New pull**, and the list filters by **Open**, **Closed**, **Merged** or **All**, with a count for each. A pull is at `/apps/<id>/pulls/<number>`.
+
+## Open one
+
+Two ways:
+
+- **From Compare.** Pick a base and head on the compare page and press **Open pull** ([Source and history](/apps/source#compare)).
+- **From the list.** **New pull** (`/apps/<id>/pulls/new`) takes a base branch, a head branch, a title and an optional description.
+
+Opening a pull request when one is already open for the same base/head pair is refused. Closing and reopening are done from the pull request page; you need `push` access, and only the author or an admin may edit or close it.
+
+## Conversation and Files
+
+A pull request has two tabs.
+
+**Conversation** holds the description, the comment and review timeline, and the comment box. The description is editable in place. Comments and reviews appear oldest first.
+
+**Files** shows the live `base..head` diff. Click a line to leave a comment anchored to it; anchored threads render next to their line, side by side with the diff. Line comments can be edited by their author and deleted by the author or an admin.
+
+When a later commit changes the line a comment was anchored to, the comment is marked **Outdated** and moves to the Conversation tab, where it keeps its file, line and original text.
+
+## Reviews
+
+A reviewer with `push` access — anyone except the pull request's author — can **Approve** or **Request changes** at the current head. Each new push to the head branch **dismisses reviews recorded on older commits**, so an approval always refers to the code you approved.
+
+Counted approvals are the latest review per reviewer that is `approved`, has not been dismissed, was recorded at the current head, and is not by the author. An admin bypasses the threshold.
+
+## Squash merge
+
+Merging is always a **squash**: one commit on the base branch, authored by the pull request's author. If the base is `main`, that commit deploys like any push. You can delete the head branch as part of the merge.
+
+The merge box reports one state at a time:
+
+| State | Meaning |
+| --- | --- |
+| **Ready to merge** | No conflicts and enough approvals. |
+| **Merge conflicts** | The head does not merge cleanly; the conflicting files are listed. |
+| **Waiting for approvals** | Fewer counted approvals than `required_approvals`. |
+| **Closed** / **Merged** | Not open. |
+| **Head branch is gone** | The head branch was deleted. |
+
+A pull request with conflicts cannot be merged. Merge the base into the head locally, resolve, and push — the page re-checks on the next load.
+
+Commits Noite makes use the noreply identity: `<your name> <your user id>@users.noreply.<domain>`, never your email.
+
+## Branch protection
+
+**Settings → Branch protection** (app admins only, off by default) protects `main`:
+
+- **Require a pull before merging into `main`** (`require_pr`): the `push` role can no longer move `main` directly — not by `git push`, not by browser edits, and not by deleting the branch. Everyone except admins commits to a branch and opens a pull. In the browser, the Changes panel then only pushes to a new branch, and links to opening the pull afterwards.
+- **Required approvals** (`required_approvals`): `0`, `1` or `2` approvals a merge into `main` needs. `0` means none.
+
+Admins bypass both rules. The same gate is enforced in git, in the browser and by the runner API, so a protected `main` cannot be force-pushed or deleted by a `push`-role collaborator.

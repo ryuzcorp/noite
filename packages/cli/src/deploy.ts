@@ -133,7 +133,7 @@ export const deploy = Command.make(
         config.url === ""
           ? (env.GIT_PUBLIC_BASE ??
             env.NOITE_BASE ??
-            "http://git.localhost:9080")
+            "http://git.noite.localhost:9080")
           : config.url
       ).replace(/\/+$/u, "");
       const remoteUrl = remoteUrlOf(gitBase, resolvedSlug, token);

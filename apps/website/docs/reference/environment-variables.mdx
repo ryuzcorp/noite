@@ -3,7 +3,7 @@ title: Environment variables
 description: Every runner env var with its default, effect, and owner.
 ---
 
-Defaults below are what `docker/compose.yaml` applies when the var is unset. The runner refuses dev secrets off `localhost`. `CELLD_*` vars are passed through to tenant fleets — see [celld.dev](https://celld.dev) for their semantics, not here.
+Defaults below are what `docker/compose.yaml` applies when the var is unset. The runner refuses dev secrets off a `localhost` base. `CELLD_*` vars are passed through to tenant fleets — see [celld.dev](https://celld.dev) for their semantics, not here.
 
 Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (handed to the control UI worker untouched).
 
@@ -17,14 +17,14 @@ Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (hand
 
 | Var | Default | Effect | Owner |
 | --- | --- | --- | --- |
-| `BASE_DOMAIN` | `localhost` | Tenant + control DNS base | runner-owned |
+| `BASE_DOMAIN` | `noite.localhost` | Tenant + control DNS base | runner-owned |
 | `CONTROL_SUBDOMAIN` | _(empty)_ | Empty = control on bare domain; prod sets `app` | runner-owned |
 | `CONTROL_EXTRA_HOSTS` | _(empty)_ | Comma-separated extra control hostnames | runner-owned |
-| `CADDY_AUTO_HTTPS` | unset = on except `localhost` | `off` behind a terminating proxy | runner-owned |
+| `CADDY_AUTO_HTTPS` | unset = on except a `localhost` base | `off` behind a terminating proxy | runner-owned |
 | `HTTP_PORT` | `9080` | Host HTTP port | runner-owned |
 | `HTTPS_PORT` | `9443` | Host HTTPS port | runner-owned |
-| `GIT_PUBLIC_BASE` | `http://git.localhost:9080` / `https://git.<domain>` | Public Git remote base | runner-owned |
-| `BETTER_AUTH_URL` | `http://localhost:9080` | Control origin; set before first registration (passkeys bind to it) | worker-passthrough |
+| `GIT_PUBLIC_BASE` | `http://git.noite.localhost:9080` / `https://git.<domain>` | Public Git remote base | runner-owned |
+| `BETTER_AUTH_URL` | `http://noite.localhost:9080` | Control origin; set before first registration (passkeys bind to it) | worker-passthrough |
 | `CADDYFILE_PATH` | `/data/caddy/Caddyfile` | Generated Caddyfile location | runner-owned |
 | `CADDY_ACCESS_LOG` | `/data/caddy/access.log` | JSON access log tailed for device/path/ref stats | runner-owned |
 | `CADDY_ADMIN_URL` | `http://127.0.0.1:2019` | Caddy admin endpoint for `/load` writes | runner-owned |
@@ -40,10 +40,10 @@ Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (hand
 
 | Var | Default | Effect | Owner |
 | --- | --- | --- | --- |
-| `RUNNER_TOKEN` | `dev-runner-token` | Bearer token for runner API + UI server calls; refused off-localhost at default | runner-owned |
+| `RUNNER_TOKEN` | `dev-runner-token` | Bearer token for runner API + UI server calls; refused off a `localhost` base at default | runner-owned |
 | `BETTER_AUTH_SECRET` | `dev-only-change-me-to-a-long-random-string` | Session signing secret; `dev-` values refused on real domains | worker-passthrough |
 | `NOITE_ADMIN_EMAIL` | _(empty)_ | Account promoted to admin at startup | worker-passthrough |
-| `NOITE_EMAIL_WEBHOOK_URL` | _(empty)_ | Receives lost-passkey OTP JSON; unset = printed to the control log on `localhost`, not sent (the failure is logged) on real domains. Without it, use [`noite-runner recover`](/self-hosting/accounts#lost-passkey) | worker-passthrough |
+| `NOITE_EMAIL_WEBHOOK_URL` | _(empty)_ | Receives lost-passkey OTP JSON; unset = printed to the control log on a `localhost` base, not sent (the failure is logged) on real domains. Without it, use [`noite-runner recover`](/self-hosting/accounts#lost-passkey) | worker-passthrough |
 | `NOITE_SMTP_FROM` | _(empty)_ | OTP sender label | worker-passthrough |
 
 ## Store
@@ -66,7 +66,7 @@ Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (hand
 
 | Var | Default | Effect | Owner |
 | --- | --- | --- | --- |
-| `NOITE_TENANCY` | unset = `multi` off localhost, `single` on | `multi` sandboxes builds/fleets as users behind egress policy; `single` = operator pushes only | runner-owned |
+| `NOITE_TENANCY` | unset = `multi` off a `localhost` base, `single` on | `multi` sandboxes builds/fleets as users behind egress policy; `single` = operator pushes only | runner-owned |
 | `RUNNER_BUILD_UID_BASE` / `RUNNER_BUILD_UID_RANGE` | `10030` / `1024` | Reserved per-app build uid range `[base, base + range)`; each app's builds and release commands run as their own uid from it | runner-owned |
 | `RUNNER_FLEET_UID` / `RUNNER_FLEET_GID` | `10020` | Tenant fleet user | runner-owned |
 | `NOITE_FLEET_PORTS` | `20000-29999` | Fleet port range, two ports per app | runner-owned |

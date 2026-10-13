@@ -6,10 +6,10 @@
 //! 3. `desired_state` is only running|stopped; removal is hard DELETE.
 //! 4. Metrics watermark advances only after a successful telemetry agg.
 mod api;
+mod api_error;
 mod auth;
 mod config;
 mod db;
-mod api_error;
 mod host;
 mod lifecycle;
 mod models;
@@ -139,6 +139,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let pool = db::connect(&config.database_url).await?;
+    // A dev install that changed its base domain (localhost → noite.localhost)
+    // keeps links coherent: the stored subdomain is derived from the slug.
+    match db::rebind_local_subdomains(&pool, &config.base_domain).await {
+        Ok(0) => {}
+        Ok(rewritten) => tracing::info!(
+            rewritten,
+            base_domain = %config.base_domain,
+            "rewrote app subdomains onto the configured base domain"
+        ),
+        Err(e) => tracing::warn!(error = %e, "could not rebind app subdomains"),
+    }
     let swept = db::fail_stuck_deploys(&pool, DEPLOY_STUCK_MS, &HashSet::new())
         .await
         .unwrap_or(0);

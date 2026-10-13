@@ -1,7 +1,7 @@
 # E2E lane (`make e2e`, docker/e2e-local.sh): its own project (`-p
 # noite-e2e`) and bucket, raw ports for the Playwright helpers. The control
 # UI is reached through Caddy (the lane sets HTTP_PORT=8090, so
-# http://localhost:8090 serves it); the runner API and Git on :8080; tenant
+# http://noite.localhost:8090 serves it); the runner API and Git on :8080; tenant
 # fleets on their own ports.
 services:
   noite:
@@ -12,7 +12,7 @@ services:
       NOITE_S3_BUCKET: noite-e2e
       # The e2e lane never reports (SPEC, telemetry).
       NOITE_TELEMETRY: "0"
-      BETTER_AUTH_URL: http://localhost:8090
+      BETTER_AUTH_URL: http://noite.localhost:8090
       GIT_PUBLIC_BASE: http://localhost:8080/v1/git
       S3_PUBLIC_ENDPOINT: http://localhost:${RUSTFS_API_PORT:-19000}
       # No proxy in front of the lane: every request shares one client key.

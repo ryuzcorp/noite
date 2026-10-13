@@ -4,6 +4,8 @@
 
 import { kebabCase } from "scule";
 
+import { isLocalhostDomain } from "../local-host";
+
 // Letters, digits, plus hyphens: fold whitespace, drop other symbols,
 // and trim edge hyphens so live slugs match the create/rename gate.
 export const slugifyName = (value: string): string =>
@@ -44,20 +46,21 @@ export const presenceTone = (status: string): string => {
 };
 
 /** Reachable host for a stored subdomain on the current page's network.
- * Stored subdomains anchor on the configured base (dev: slug.localhost).
+ * Stored subdomains anchor on the configured base (dev: `slug.noite.localhost`).
  * When this UI is served from outside that family (dev-host LAN name/IP),
  * rebase the slug onto the current host so the link stays on this network.
- * Loopback forms and same-family hosts keep the stored value untouched. */
+ * Loopback forms (bare `localhost` and every `*.localhost`, which browsers all
+ * resolve to loopback) and same-family hosts keep the stored value untouched. */
 export const appHost = (subdomain: string): string => {
   const { hostname } = window.location;
   const host = hostname.toLowerCase();
   const dot = subdomain.indexOf(".");
   const base = dot === -1 ? "" : subdomain.slice(dot + 1).toLowerCase();
   const loopback =
-    host === "localhost" ||
     host === "127.0.0.1" ||
     host === "::1" ||
-    host === "[::1]";
+    host === "[::1]" ||
+    isLocalhostDomain(host);
   if (loopback || host === base || (base !== "" && host.endsWith(`.${base}`))) {
     return subdomain;
   }

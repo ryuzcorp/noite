@@ -160,7 +160,12 @@ pub(super) fn uncompacted_hours(done: Option<&String>, current: &str, cfg: &Conf
     hours
 }
 
-pub(super) async fn mark_compacted(pool: &SqlitePool, state: &mut MetricsState, slug: &str, hour: &str) {
+pub(super) async fn mark_compacted(
+    pool: &SqlitePool,
+    state: &mut MetricsState,
+    slug: &str,
+    hour: &str,
+) {
     if let Err(e) = db::mark_hour_compacted(pool, slug, hour).await {
         tracing::warn!(error = %e, "compaction mark");
         return;

@@ -1,11 +1,11 @@
 //! Admin tab: the invite pool — search it, mint codes, revoke what is open.
 
-import { searchParam } from "@ilha/router";
 import { atom } from "ilha";
 import type { View } from "ilha";
 
 import { errorMessage } from "../errors";
 import { adminListInvites } from "../resources";
+import { searchParam } from "../search-param";
 import { adminCreateInvites, adminRevokeInvite } from "../server/admin.server";
 import { Avatar } from "../ui/avatar";
 import { CopyButton } from "../ui/copy-button";

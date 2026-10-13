@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { findAppId, runnerCall } from "./helpers";
+import { deleteApp, findAppId, runnerCall, waitForCreatedApp } from "./helpers";
 
 // Custom domains, tenant env vars and app lifecycle, driven through the runner
 // API the control UI uses. The app-detail panels that surface the same calls
@@ -14,7 +14,7 @@ test("custom domains, env vars and deletion behave", async ({
   await page.locator("#create-name").fill("Lifecycle");
   await page.locator("#create-slug").fill("lifecycle");
   await page.getByRole("button", { name: "Create app" }).click();
-  await page.waitForURL("**/apps", { timeout: 30_000 });
+  await waitForCreatedApp(page);
   const appId = await findAppId(request, "lifecycle");
   expect(appId).not.toBeNull();
   const id = appId ?? "";
@@ -28,7 +28,7 @@ test("custom domains, env vars and deletion behave", async ({
   expect(invalid.status).toBe(400);
 
   const platform = await runnerCall(request, `/v1/apps/${id}/domains`, {
-    body: { hostname: "api.localhost" },
+    body: { hostname: "api.noite.localhost" },
     method: "POST",
   });
   expect(platform.status).toBe(400);
@@ -79,7 +79,7 @@ test("custom domains, env vars and deletion behave", async ({
   // No Caddy in this lane, so this asks the runner directly: the fallback page
   // is what a wildcard edge serves for an unknown tenant host.
   const fallback = await request.get("http://localhost:8080/v1/edge/fallback", {
-    headers: { host: "nope.localhost" },
+    headers: { host: "nope.noite.localhost" },
   });
   expect(fallback.status()).toBe(404);
   expect(await fallback.text()).toContain("no app for this slug");
@@ -90,4 +90,10 @@ test("custom domains, env vars and deletion behave", async ({
   });
   expect([200, 204]).toContain(gone.status);
   expect(await findAppId(request, "lifecycle")).toBeNull();
+
+  // The second app existed only to claim a hostname: drop it too, or the next
+  // run's create on `claimant` conflicts and the account's app quota pays for
+  // the leftover.
+  await deleteApp(request, "claimant");
+  expect(await findAppId(request, "claimant")).toBeNull();
 });

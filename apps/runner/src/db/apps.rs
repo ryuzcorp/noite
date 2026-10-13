@@ -2,6 +2,7 @@
 
 use sqlx::SqlitePool;
 
+use crate::config::is_local_domain;
 use crate::models::{new_id, now_iso, App, AppDomain, AppLimit, AppStatus};
 
 use super::APP_COLS;
@@ -15,6 +16,46 @@ pub async fn set_deployed_config(
     sqlx::query("UPDATE app SET deployed_config = ? WHERE id = ?")
         .bind(config)
         .bind(app_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Terminal state of a background import (A2): `provisioned` on success — the
+/// deploy pipeline takes over from there — or `error` with the message. Guarded
+/// on `status = 'importing'`, so a push that raced the import and already
+/// started a deploy is never clobbered. Returns the rows affected (0 = the
+/// import lost the race and its outcome is advisory only).
+pub async fn finish_app_import(
+    pool: &SqlitePool,
+    id: &str,
+    status: &str,
+    last_error: Option<&str>,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE app SET status = ?, last_error = ?, updated_at = ? \
+         WHERE id = ? AND status = 'importing'",
+    )
+    .bind(status)
+    .bind(last_error)
+    .bind(now_iso())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Record the `source` (JSON) an app was created from, so a failed import can
+/// be retried (A2). `None` clears it.
+pub async fn set_app_import_source(
+    pool: &SqlitePool,
+    id: &str,
+    source: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE app SET import_source = ?, updated_at = ? WHERE id = ?")
+        .bind(source)
+        .bind(now_iso())
+        .bind(id)
         .execute(pool)
         .await?;
     Ok(())
@@ -274,6 +315,42 @@ pub async fn rename_app(
     Ok(())
 }
 
+/// Rewrite app subdomains whose base is a local domain other than the
+/// configured one. The slug is identity and the subdomain is derived
+/// (`{slug}.{base}`), so a dev install that moved from `localhost` to
+/// `noite.localhost` would otherwise keep linking to `test.localhost` — a host
+/// the edge no longer serves. Rows whose suffix is not a local domain are left
+/// alone: changing a public base is the operator's call, and `host::rename` is
+/// the supported path there. Returns how many rows were rewritten.
+pub async fn rebind_local_subdomains(pool: &SqlitePool, base_domain: &str) -> sqlx::Result<u64> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as("SELECT id, slug, subdomain FROM app")
+        .fetch_all(pool)
+        .await?;
+    let mut rewritten = 0_u64;
+    for (id, slug, subdomain) in rows {
+        let subdomain = subdomain.trim();
+        let wanted = format!("{}.{}", slug, base_domain.trim());
+        if subdomain == wanted {
+            continue;
+        }
+        let stale_base = subdomain
+            .split_once('.')
+            .map(|(_, rest)| rest)
+            .unwrap_or("");
+        if !is_local_domain(stale_base) {
+            continue;
+        }
+        sqlx::query("UPDATE app SET subdomain = ?, updated_at = ? WHERE id = ?")
+            .bind(&wanted)
+            .bind(now_iso())
+            .bind(&id)
+            .execute(pool)
+            .await?;
+        rewritten += 1;
+    }
+    Ok(rewritten)
+}
+
 pub async fn delete_app(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
     sqlx::query("DELETE FROM app WHERE id = ?")
         .bind(id)
@@ -301,4 +378,67 @@ pub async fn update_app_status(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::db::connect;
+
+    async fn insert_app(pool: &SqlitePool, id: &str, slug: &str, subdomain: &str) {
+        sqlx::query(
+            "INSERT INTO app (id, slug, name, subdomain, git_prefix, fleet_bucket, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(slug)
+        .bind(slug)
+        .bind(subdomain)
+        .bind(format!("git/{slug}/"))
+        .bind(format!("s3://noite/fleets/{slug}"))
+        .execute(pool)
+        .await
+        .expect("insert app");
+    }
+
+    /// A dev install that changed its base domain keeps coherent links; a
+    /// public base is the operator's to change, so those rows are untouched.
+    #[tokio::test]
+    async fn rebind_moves_local_subdomains_only_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("noite-rebind-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let url = format!("sqlite:{}/noite.sqlite?mode=rwc", dir.display());
+        let pool = connect(&url).await.expect("connect");
+
+        insert_app(&pool, "a", "test", "test.localhost").await;
+        insert_app(&pool, "b", "keep", "keep.noite.now").await;
+        insert_app(&pool, "c", "old", "old.noite.local").await;
+
+        let rewritten = rebind_local_subdomains(&pool, "noite.localhost")
+            .await
+            .expect("rebind");
+        assert_eq!(rewritten, 2, "the two local bases move");
+
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT slug, subdomain FROM app ORDER BY slug")
+                .fetch_all(&pool)
+                .await
+                .expect("read back");
+        assert_eq!(
+            rows,
+            vec![
+                ("keep".to_string(), "keep.noite.now".to_string()),
+                ("old".to_string(), "old.noite.localhost".to_string()),
+                ("test".to_string(), "test.noite.localhost".to_string()),
+            ]
+        );
+
+        let again = rebind_local_subdomains(&pool, "noite.localhost")
+            .await
+            .expect("rebind again");
+        assert_eq!(again, 0, "nothing left to rewrite");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

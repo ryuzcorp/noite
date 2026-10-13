@@ -9,4 +9,9 @@ asleepSince: string | null,
  * Last wake (request-driven, manual start or deploy): the idle clock
  * never runs from before it.
  */
-wokeAt: string | null, };
+wokeAt: string | null, 
+/**
+ * Whether the row carries a stored import source — the UI's Retry gate.
+ * Derived in SQL (`import_source IS NOT NULL`), never a column.
+ */
+imported: boolean, };

@@ -7,6 +7,7 @@ import { decodeDeploys, deploysUrl, feedKeys, liveFeed } from "../feeds";
 import { appDetail, deployLog } from "../resources";
 import type { RunnerDeploy } from "../runner";
 import { rollback } from "../server/apps.server";
+import { confirmDialog } from "../ui/confirm";
 import { CopyButton } from "../ui/copy-button";
 import { ChevronDown, ChevronUp, CloudUpload } from "../ui/icons";
 import { ListSkeleton } from "../ui/skeletons";
@@ -173,15 +174,18 @@ const DeployRow = ({
   appId,
   currentSha,
   d,
+  live,
 }: {
   appId: string;
   currentSha: string | null;
   d: RunnerDeploy;
+  /** The deploy serving traffic now, which starts expanded. */
+  live: boolean;
 }) => {
   // Atom-driven expansion: the log is a sibling <li> (block layout, full
   // width by construction) instead of a grid child — immune to list-row
-  // span subtleties. The current deployment starts expanded.
-  const open = atom(!!d.sha && d.sha === currentSha);
+  // span subtleties.
+  const open = atom(live);
   const logTab = atom<"build" | "deploy">("deploy");
   const rolling = atom(false);
   const rollError = atom("");
@@ -192,7 +196,17 @@ const DeployRow = ({
         <div>{deployBadge(d.status)}</div>
         <div>
           <div class="font-mono text-sm">
-            {d.sha ? d.sha.slice(0, 12) : "—"}
+            {d.sha ? (
+              <a
+                class="link link-hover"
+                href={`/apps/${appId}/source/commit/${d.sha}`}
+                title={d.sha}
+              >
+                {d.sha.slice(0, 12)}
+              </a>
+            ) : (
+              "—"
+            )}
           </div>
           <div class="text-base-content/70 text-xs">
             {formatDateTime(d.createdAt)}
@@ -206,25 +220,26 @@ const DeployRow = ({
             type="button"
             class="btn btn-sm btn-ghost shrink-0"
             disabled={rolling()}
-            onclick={() => {
-              if (!d.sha) {
+            onclick={async () => {
+              const { sha } = d;
+              if (!sha) {
                 return;
               }
-              // oxlint-disable-next-line no-alert -- native confirm dialog is the requirement for destructive rollback.
-              if (!confirm(`Roll back to ${d.sha.slice(0, 12)}?`)) {
+              const ok = await confirmDialog({
+                confirmLabel: "Roll back",
+                title: `Roll back to ${sha.slice(0, 12)}?`,
+              });
+              if (!ok) {
                 return;
               }
               rolling.set(true);
               rollError.set("");
-              void (async () => {
-                try {
-                  // SAFETY: canRollBack guarantees d.sha is a non-empty string here; the early return above narrows it for the linter.
-                  await rollback({ appId, sha: d.sha as string });
-                } catch (error) {
-                  rollError.set(errorMessage(error));
-                }
-                rolling.set(false);
-              })();
+              try {
+                await rollback({ appId, sha });
+              } catch (error) {
+                rollError.set(errorMessage(error));
+              }
+              rolling.set(false);
             }}
           >
             {rolling() ? "Rolling back…" : "Roll back"}
@@ -291,6 +306,14 @@ export const DeployList = ({ appId }: { appId: string }) => {
     feed.latest() !== undefined || feed.status() === "open";
   const retrying = (): boolean => feed.status() === "retrying";
   const currentSha = appDetail(appId).data()?.app.lastDeploySha ?? null;
+  // One sha can be deployed many times (redeploys, rollbacks); only the
+  // newest successful deploy of the live sha is the one serving traffic.
+  // The feed is newest-first.
+  const liveId =
+    currentSha === null
+      ? null
+      : (items().find((d) => d.sha === currentSha && d.status === "success")
+          ?.id ?? null);
   return (
     <div class="flex w-full flex-col gap-4">
       {retrying() ? (
@@ -316,7 +339,13 @@ export const DeployList = ({ appId }: { appId: string }) => {
           </li>
         ) : null}
         {items().map((d) => (
-          <DeployRow key={d.id} appId={appId} currentSha={currentSha} d={d} />
+          <DeployRow
+            key={d.id}
+            appId={appId}
+            currentSha={currentSha}
+            d={d}
+            live={d.id === liveId}
+          />
         ))}
       </ul>
     </div>
