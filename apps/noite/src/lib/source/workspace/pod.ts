@@ -34,9 +34,12 @@ import {
   POD_WORKER_PATH,
 } from "../../preview-host";
 import {
-  mirrorStateDir,
+  PREVIEW_STATE,
+  UNPERSISTED_DIRS,
+  UNSAVED_PROJECT,
   mirrorStorage,
-  restoreMirroredState,
+  restoreMirror,
+  startMirror,
 } from "./state-mirror";
 import type { MirrorMutation, MirrorVolume } from "./state-mirror";
 import { syncChannelName, syncTabs } from "./tab-sync";
@@ -64,17 +67,13 @@ const toMirrorMutation = (mutation: VolumeMutation): MirrorMutation => {
   return { op: "ignore" };
 };
 
-/** Directory names never worth persisting: a restored `node_modules` is
- * rebuilt from `package.json` anyway, and the caches are the installer's. */
-const EXCLUDED_DIRS = ["node_modules", ".cache", ".npm"];
-
 /** The quiet time before a save: long enough that a keystroke burst is one
  * commit to IndexedDB, short enough that closing the tab loses nothing. */
 const PERSIST_DEBOUNCE_MS = 250;
 
 const persistenceOptions = (id: string): PersistenceOptions => ({
   debounceMs: PERSIST_DEBOUNCE_MS,
-  excludeDirNames: EXCLUDED_DIRS,
+  excludeDirNames: UNPERSISTED_DIRS,
   id,
   lock: "error",
   requestPersistentStorage: true,
@@ -128,7 +127,7 @@ interface HeldPod {
    * refused until it is granted the lock (see `gatedStore`), and a refusal is
    * not this tab's error to report. Absent: always. */
   saves?: () => boolean;
-  /** Ends the preview state's synchronous write-through. */
+  /** Ends the synchronous write-through mirrors (see `startMirrors`). */
   stopMirror?: () => void;
   sync?: TabSync;
 }
@@ -183,29 +182,62 @@ const classifyMutation =
 const mirrorVolume = (pod: Nodepod): MirrorVolume => {
   const { volume } = pod.fs;
   return {
+    existsSync: (path) => volume.existsSync(path),
     mkdirSync: (path, options) => {
       volume.mkdirSync(path, options);
     },
     onMutation: (listener) => volume.onMutation(classifyMutation(listener)),
     readFileSync: (path) => volume.readFileSync(path),
+    readdirSync: (path) => volume.readdirSync(path),
+    removeTreeSync: (path) => {
+      volume.removeTreeSync(path);
+    },
     writeFileSync: (path, data) => {
       volume.writeFileSync(path, data);
     },
   };
 };
 
-/** Overlay the preview state's synchronous mirror onto a booted pod: after
- * the IndexedDB restore, before anything reads binding state. The mirror is
- * this tab's own record, newer-or-equal to the restore; a tab with none
- * stored overlays nothing. */
-const restorePreviewState = (pod: Nodepod, id: string): void => {
-  restoreMirroredState(mirrorVolume(pod), id, mirrorStorage());
+/** Overlay this tab's synchronous mirrors onto a booted pod: after the
+ * IndexedDB restore, before anything reads the volume. A mirror is this tab's
+ * own record, newer-or-equal to the restore; a tab with none overlays
+ * nothing. A read-only ref has no edits to replay, only preview state. */
+const restoreMirrors = (pod: Nodepod, id: string, editable: boolean): void => {
+  const volume = mirrorVolume(pod);
+  const storage = mirrorStorage();
+  restoreMirror(volume, PREVIEW_STATE, id, storage);
+  if (editable) {
+    restoreMirror(volume, UNSAVED_PROJECT, id, storage);
+  }
 };
 
-/** Record the preview state's writes synchronously. The mirror is the tab's
- * own sessionStorage, so every tab keeps its own preview's state. */
-const mirrorPreviewState = (pod: Nodepod, id: string): (() => void) =>
-  mirrorStateDir(mirrorVolume(pod), id, mirrorStorage());
+/** Record the preview state and the checkout's unsaved writes synchronously,
+ * into this tab's sessionStorage, and answer with the way to stop. The
+ * project mirror only has to outlive IndexedDB's debounce: once a save leaves
+ * nothing pending, everything in it is saved, so it is emptied — it never
+ * replays text older than the saved copy, and a fresh checkout's first save
+ * (which outgrows it) lets it record again. */
+const startMirrors = (
+  pod: Nodepod,
+  id: string,
+  persistence: WorkspacePersistence | null
+): (() => void) => {
+  const volume = mirrorVolume(pod);
+  const storage = mirrorStorage();
+  const preview = startMirror(volume, PREVIEW_STATE, id, storage);
+  const project = startMirror(volume, UNSAVED_PROJECT, id, storage);
+  const onSaved = (): void => {
+    if (persistence?.pendingChanges === 0) {
+      project.clear();
+    }
+  };
+  persistence?.on("saved", onSaved);
+  return () => {
+    persistence?.off("saved", onSaved);
+    preview.stop();
+    project.stop();
+  };
+};
 
 /** The tabs' channel, over the pod's own volume (the SDK's `MemoryVolume` is
  * the sync's `SyncVolume` as is). */
@@ -320,7 +352,7 @@ const holdSaving = (
   id: string,
   onSaveError: SaveErrorReporter
 ): OpenPod => {
-  restorePreviewState(pod, id);
+  restoreMirrors(pod, id, true);
   const sync = openSync(pod, id);
   const { persistence } = pod;
   if (persistence) {
@@ -331,7 +363,7 @@ const holdSaving = (
   return hold(pod, {
     editable: true,
     persistence,
-    stopMirror: mirrorPreviewState(pod, id),
+    stopMirror: startMirrors(pod, id, persistence),
     sync,
   });
 };
@@ -356,7 +388,7 @@ const holdFollowing = async (
       id,
       pod.fs.volume,
       gatedStore(store, saves),
-      { debounceMs: PERSIST_DEBOUNCE_MS, excludeDirNames: EXCLUDED_DIRS },
+      { debounceMs: PERSIST_DEBOUNCE_MS, excludeDirNames: UNPERSISTED_DIRS },
       queued.lock
     );
     // Refused saves are expected until the lock is granted; the pod would
@@ -374,13 +406,13 @@ const holdFollowing = async (
       held.on("error", onSaveError);
     });
   }
-  restorePreviewState(pod, id);
+  restoreMirrors(pod, id, true);
   sync.start();
   return hold(pod, {
     editable: true,
     persistence,
     saves,
-    stopMirror: mirrorPreviewState(pod, id),
+    stopMirror: startMirrors(pod, id, persistence),
     sync,
   });
 };
@@ -394,7 +426,7 @@ export const openPod = async (options: PodOptions): Promise<OpenPod> => {
   const boot = bootOptions();
   if (!editable) {
     const pod = await Nodepod.boot(boot);
-    restorePreviewState(pod, id);
+    restoreMirrors(pod, id, false);
     return hold(pod, { editable: false, persistence: null });
   }
   try {

@@ -229,6 +229,38 @@ export const openSourceWorkspace = async (
     })();
   };
 
+  /** Ship the text `drain` is still holding, one write per path, without
+   * waiting for the write already in flight: the port delivers it after that
+   * one, so the pod ends up with the newest text. Callers waiting on it settle
+   * on this write's own answer (a promise that may never settle if the page
+   * goes right away, which is what unload looks like). */
+  const shipPending = (): void => {
+    for (const [path, writer] of writers) {
+      const text = writer.pending;
+      if (text === null) {
+        continue;
+      }
+      writer.pending = null;
+      const { waiting } = writer;
+      writer.waiting = [];
+      void (async () => {
+        try {
+          await connection.call("fs.write", {
+            data: text,
+            path: projectPath(path),
+          });
+          for (const call of waiting) {
+            call.resolve();
+          }
+        } catch (error) {
+          for (const call of waiting) {
+            call.reject(error);
+          }
+        }
+      })();
+    }
+  };
+
   /** The write behind `writeText`: the caller's promise lands when the pod
    * holds its text or a later one. */
   const writeText = (path: string, text: string): Promise<void> => {
@@ -244,6 +276,19 @@ export const openSourceWorkspace = async (
     writer.waiting.push({ reject: written.reject, resolve: written.resolve });
     drain(path);
     return written.promise;
+  };
+
+  /** Land what this page still holds, then have the frame save it. `drain`
+   * keeps a burst's later text here until the write in flight answers, so a
+   * flush asked for in between would save what the pod's volume held *then*:
+   * the last keystrokes of an edit the UI already counts as a change would be
+   * lost by a reload. Both messages go out back to back — the flight's text
+   * reaches the pod's volume, and the frame's own save, right behind it on the
+   * same port, persists exactly that. */
+  const flushWrites = async (): Promise<void> => {
+    shipPending();
+    // oxlint-disable-next-line unicorn/no-useless-undefined -- the protocol's `flush` takes no params, and the slot is part of one request envelope (see the `workspace` literal below).
+    await connection.call("flush", undefined);
   };
 
   const fs: SourceFs = {
@@ -296,7 +341,7 @@ export const openSourceWorkspace = async (
       // The preview and the terminal stop before this (the browser's order),
       // so what is left is the pod's own last save and its teardown.
       try {
-        await connection.call("flush", undefined);
+        await flushWrites();
       } catch {
         // Nothing left to do about a save that failed: the pod goes away
         // either way, and the frame's own `saveError` already said so.
@@ -312,7 +357,7 @@ export const openSourceWorkspace = async (
     discardAll: () => connection.call("discardAll", undefined),
     editable: opened.editable,
     flush: async () => {
-      await connection.call("flush", undefined);
+      await flushWrites();
     },
     fs,
     listing: () => connection.call("listing", undefined),

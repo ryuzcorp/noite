@@ -1,39 +1,58 @@
-//! A synchronous write-through mirror of the preview's binding state.
+//! A synchronous write-through mirror of part of the pod's volume.
 //!
-//! Binding data (Durable Objects, D1 and KV on SQLite; R2 as files) lives
-//! under `/home/.noite/s` in the pod's main volume, and the pod saves that
-//! volume to IndexedDB debounced — 250 ms after the last write. A reload
-//! inside that window, or while the save is still in flight, loses writes
-//! the preview already answered: the pagehide/visibilitychange flush is
-//! fire-and-forget and the context dies with it. Process writes reach the
-//! main volume synchronously, so every mutation is mirrored here
-//! synchronously too, into sessionStorage — the one store with a synchronous
-//! write that survives a same-tab reload. On boot the mirror is overlaid
-//! after the IndexedDB restore. sessionStorage is per tab, and so is the
-//! preview (`tab-sync.ts` never shares this directory): every tab records and
-//! overlays its own preview's state. States past the size cap fall back to
-//! IndexedDB alone.
+//! The pod saves its volume to IndexedDB debounced — 250 ms after the last
+//! write — and that save is asynchronous. A reload inside that window, or
+//! while the save is still in flight, loses writes the pod already holds: the
+//! pagehide/visibilitychange flush is fire-and-forget, and the frame's
+//! document is torn down mid-commit. Writes reach the volume synchronously, so
+//! every mutation under a mirrored root is copied here synchronously too, into
+//! sessionStorage — the one store with a synchronous write that survives a
+//! same-tab reload. On boot the mirror is overlaid after the IndexedDB
+//! restore, removals included. sessionStorage is per tab: every tab records
+//! and overlays its own writes. A mirror past the size cap drops out and
+//! IndexedDB is the only copy again.
+//!
+//! Two scopes use it:
+//! - `PREVIEW_STATE`: the preview's binding data, kept for the life of the tab.
+//! - `UNSAVED_PROJECT`: the checkout's files, holding only what IndexedDB has
+//!   not saved yet — `pod.ts` clears it whenever a save leaves nothing
+//!   pending, so it never replays text older than the saved copy.
 //!
 //! This module never imports the pod SDK (see `pod.ts`): the volume is the
 //! structural slice it needs, and mutations arrive already classified.
 
 import { base64ToBytes, bytesToBase64 } from "../../bytes";
+import { PROJECT_ROOT } from "./types";
+
 /** Where the preview server keeps binding data (`HARNESS_STATE_DIR` in
- * `preview/server.ts` — pinned equal by the test below, never drifted). */
+ * `preview/server.ts` — pinned equal by the test, never drifted). */
 export const MIRRORED_STATE_ROOT = "/home/.noite/s";
 
-/** sessionStorage is ~5 MB; past this the mirror drops out and IndexedDB is
- * the only copy again. Binding state is kilobytes (SQLite files, sidecars);
- * only large R2 objects can push past it. */
+/** Directory names never worth persisting: a restored `node_modules` is
+ * rebuilt from `package.json` anyway, and the caches are the installer's.
+ * IndexedDB skips them (`pod.ts`), and so does the project mirror. */
+export const UNPERSISTED_DIRS = ["node_modules", ".cache", ".npm"];
+
+/** sessionStorage is ~5 MB; past this a mirror drops out and IndexedDB is
+ * the only copy again. Binding state and unsaved edits are kilobytes; only
+ * large R2 objects or a fresh checkout's first save can push past it. */
 const MAX_MIRROR_CHARS = 1_000_000;
 
 /** Mirror payload version, so a future shape never parses as this one. */
 const MIRROR_VERSION = 1;
 
+/** One mirrored part of the volume: the root it covers, its storage key
+ * prefix, and the paths under the root it never records. */
+export interface MirrorScope {
+  key: string;
+  root: string;
+  skip: (relative: string) => boolean;
+}
+
 /** Files that are never durable state: R2's write-then-rename temporaries,
  * and SQLite's crash-recovery sidecars (restoring a stale journal would roll
  * a healthy database back). */
-const isEphemeral = (relative: string): boolean => {
+const isEphemeralState = (relative: string): boolean => {
   const segments = relative.split("/");
   if (segments.some((segment) => segment.includes(".tmp-"))) {
     return true;
@@ -42,6 +61,21 @@ const isEphemeral = (relative: string): boolean => {
   return (
     base.endsWith("-journal") || base.endsWith("-wal") || base.endsWith("-shm")
   );
+};
+
+/** The preview's binding data, for the life of the tab. */
+export const PREVIEW_STATE: MirrorScope = {
+  key: "noite:preview-state",
+  root: MIRRORED_STATE_ROOT,
+  skip: isEphemeralState,
+};
+
+/** The checkout's writes IndexedDB has not saved yet. */
+export const UNSAVED_PROJECT: MirrorScope = {
+  key: "noite:unsaved-project",
+  root: PROJECT_ROOT,
+  skip: (relative) =>
+    relative.split("/").some((segment) => UNPERSISTED_DIRS.includes(segment)),
 };
 
 /** The synchronous storage the mirror writes through (sessionStorage in the
@@ -55,9 +89,12 @@ export interface MirrorStorage {
 /** The slice of the pod's volume the mirror needs — every call synchronous
  * on the main thread. */
 export interface MirrorVolume {
+  existsSync: (path: string) => boolean;
   mkdirSync: (path: string, options?: { recursive?: boolean }) => void;
   onMutation: (callback: (mutation: MirrorMutation) => void) => () => void;
+  readdirSync: (path: string) => string[];
   readFileSync: (path: string) => Uint8Array;
+  removeTreeSync: (path: string) => void;
   writeFileSync: (path: string, data: Uint8Array) => void;
 }
 
@@ -68,6 +105,13 @@ export type MirrorMutation =
   | { op: "ignore" }
   | { op: "remove"; path: string }
   | { op: "write"; path: string };
+
+/** A running mirror: `stop` ends the recording, `clear` empties it (and lets
+ * a mirror that outgrew the cap record again). */
+export interface Mirror {
+  clear: () => void;
+  stop: () => void;
+}
 
 /** sessionStorage's own access can throw (blocked storage); null means no
  * mirror this session, and IndexedDB stays the only copy. */
@@ -82,11 +126,16 @@ export const mirrorStorage = (): MirrorStorage | null => {
   }
 };
 
-/** The mirror's key: the workspace's own persistence id under its own
- * prefix, so one app and branch is one mirror. */
-export const mirrorKey = (id: string): string => `noite:preview-state:${id}`;
+/** The mirror's key: the workspace's own persistence id under the scope's
+ * prefix, so one app and branch is one mirror per scope. */
+const mirrorKey = (scope: MirrorScope, id: string): string =>
+  `${scope.key}:${id}`;
+
+/** Stored shape: the newest bytes per relative path, and the paths removed
+ * since (so a rename or delete is not undone by the older saved copy). */
 interface MirrorDocument {
   files: Record<string, string>;
+  removed?: string[];
   v: number;
 }
 
@@ -107,15 +156,21 @@ const isDocument = (value: unknown): value is MirrorDocument => {
     return false;
   }
   const { files, v } = value;
-  return v === MIRROR_VERSION && isStringRecord(files);
+  const removed = "removed" in value ? value.removed : undefined;
+  const removedOk =
+    removed === undefined ||
+    (Array.isArray(removed) && removed.every(isString));
+  return v === MIRROR_VERSION && isStringRecord(files) && removedOk;
 };
+
 const readDocument = (
   storage: MirrorStorage,
+  scope: MirrorScope,
   id: string
 ): MirrorDocument | null => {
   let raw: string | null = null;
   try {
-    raw = storage.getItem(mirrorKey(id));
+    raw = storage.getItem(mirrorKey(scope, id));
   } catch {
     return null;
   }
@@ -130,50 +185,63 @@ const readDocument = (
   }
 };
 
-const relativePath = (path: string): string | null => {
-  if (!path.startsWith(`${MIRRORED_STATE_ROOT}/`)) {
-    return null;
-  }
-  return path.slice(MIRRORED_STATE_ROOT.length + 1);
-};
+/** A relative path a mirror may act on: under the root, no `..`, not one
+ * the scope skips. */
+const usable = (scope: MirrorScope, relative: string): boolean =>
+  relative !== "" && !relative.includes("..") && !scope.skip(relative);
 
 /** Overlay the mirror onto the volume (after the IndexedDB restore, before
- * anything reads binding state) and answer with how many files landed. A
- * missing or corrupt mirror is a no-op — corrupt entries are dropped so they
- * can never resurrect. */
-export const restoreMirroredState = (
+ * anything reads it) and answer with how many paths it changed. Removals go
+ * first, so a path removed and written again ends up written. A missing or
+ * corrupt mirror is a no-op — corrupt entries are dropped so they can never
+ * resurrect. */
+export const restoreMirror = (
   volume: MirrorVolume,
+  scope: MirrorScope,
   id: string,
   storage: MirrorStorage | null
 ): number => {
   if (storage === null) {
     return 0;
   }
-  const document = readDocument(storage, id);
+  const document = readDocument(storage, scope, id);
   if (document === null) {
     return 0;
   }
-  let restored = 0;
-  for (const [relative, base64] of Object.entries(document.files)) {
-    if (relative === "" || relative.includes("..") || isEphemeral(relative)) {
+  let changed = 0;
+  for (const relative of document.removed ?? []) {
+    const path = `${scope.root}/${relative}`;
+    if (!usable(scope, relative) || !volume.existsSync(path)) {
       continue;
     }
     try {
-      const path = `${MIRRORED_STATE_ROOT}/${relative}`;
+      volume.removeTreeSync(path);
+      changed += 1;
+    } catch {
+      // A path that will not go stays on the restored copy.
+    }
+  }
+  for (const [relative, base64] of Object.entries(document.files)) {
+    if (!usable(scope, relative)) {
+      continue;
+    }
+    try {
+      const path = `${scope.root}/${relative}`;
       volume.mkdirSync(path.slice(0, path.lastIndexOf("/")), {
         recursive: true,
       });
       volume.writeFileSync(path, base64ToBytes(base64));
-      restored += 1;
+      changed += 1;
     } catch {
       // A file that will not decode or write stays on the restored copy.
     }
   }
-  return restored;
+  return changed;
 };
 
-/** Drop the mirror (a forgotten workspace forgets its preview state too). */
-export const clearMirroredState = (
+/** Drop the stored mirror. */
+export const clearMirror = (
+  scope: MirrorScope,
   id: string,
   storage: MirrorStorage | null
 ): void => {
@@ -181,88 +249,115 @@ export const clearMirroredState = (
     return;
   }
   try {
-    storage.removeItem(mirrorKey(id));
+    storage.removeItem(mirrorKey(scope, id));
   } catch {
     // Storage already gone; nothing to forget.
   }
 };
 
-/** Mirror every mutation under the state root into sessionStorage,
- * synchronously. Answers with the unsubscribe. Starts from the stored
- * mirror so an unrelated file never evicts the rest. */
-export const mirrorStateDir = (
+const NO_MIRROR: Mirror = {
+  clear: () => {
+    // No storage, no mirror: nothing to clear.
+  },
+  stop: () => {
+    // No storage, no subscription: nothing to stop.
+  },
+};
+
+/** Mirror every mutation under the scope's root into sessionStorage,
+ * synchronously. Starts from the stored mirror so an unrelated file never
+ * evicts the rest. */
+// oxlint-disable-next-line max-lines-per-function -- one closure over the mirror's state: splitting it would only pass that state around
+export const startMirror = (
   volume: MirrorVolume,
+  scope: MirrorScope,
   id: string,
   storage: MirrorStorage | null
-): (() => void) => {
+): Mirror => {
   if (storage === null) {
-    return () => {
-      // No storage, no subscription: nothing to stop.
-    };
+    return NO_MIRROR;
   }
-  const files = new Map<string, string>(
-    Object.entries(readDocument(storage, id)?.files ?? {})
-  );
-  let chars = [...files.values()].reduce((sum, entry) => sum + entry.length, 0);
+  const stored = readDocument(storage, scope, id);
+  const files = new Map<string, string>(Object.entries(stored?.files ?? {}));
+  const removed = new Set<string>(stored?.removed);
   let suspended = false;
 
   const store = (): void => {
     const document: MirrorDocument = {
       files: Object.fromEntries(files),
+      removed: [...removed],
       v: MIRROR_VERSION,
     };
     const raw = JSON.stringify(document);
     if (raw.length > MAX_MIRROR_CHARS) {
       suspended = true;
-      clearMirroredState(id, storage);
+      clearMirror(scope, id, storage);
       return;
     }
     try {
-      storage.setItem(mirrorKey(id), raw);
+      storage.setItem(mirrorKey(scope, id), raw);
     } catch {
       suspended = true;
-      clearMirroredState(id, storage);
+      clearMirror(scope, id, storage);
+    }
+  };
+
+  const relativeOf = (path: string): string | null =>
+    path.startsWith(`${scope.root}/`)
+      ? path.slice(scope.root.length + 1)
+      : null;
+
+  /** Record the file at `path`, or every file under it when it is a
+   * directory (a renamed folder arrives as one mutation). */
+  const collect = (path: string, relative: string): void => {
+    try {
+      files.set(relative, bytesToBase64(volume.readFileSync(path)));
+      removed.delete(relative);
+      return;
+    } catch {
+      // Not a readable file: a directory, or gone mid-write.
+    }
+    let names: string[];
+    try {
+      names = volume.readdirSync(path);
+    } catch {
+      // Gone mid-write; the next mutation records it.
+      return;
+    }
+    removed.delete(relative);
+    for (const name of names) {
+      const child = `${relative}/${name}`;
+      if (usable(scope, child)) {
+        collect(`${path}/${name}`, child);
+      }
     }
   };
 
   const record = (path: string): void => {
-    const relative = relativePath(path);
-    if (relative === null || relative === "" || isEphemeral(relative)) {
+    const relative = relativeOf(path);
+    if (relative === null || !usable(scope, relative)) {
       return;
     }
-    let base64: string;
-    try {
-      base64 = bytesToBase64(volume.readFileSync(path));
-    } catch {
-      // Paged out or gone mid-write; the next mutation records it.
-      return;
-    }
-    const previous = files.get(relative);
-    files.set(relative, base64);
-    chars += base64.length - (previous?.length ?? 0);
+    collect(path, relative);
     store();
   };
 
   const forget = (path: string): void => {
-    const relative = relativePath(path);
-    if (relative === null || relative === "") {
+    const relative = relativeOf(path);
+    if (relative === null || !usable(scope, relative)) {
       return;
     }
-    let dropped = 0;
     for (const key of files.keys()) {
       if (key === relative || key.startsWith(`${relative}/`)) {
-        dropped += files.get(key)?.length ?? 0;
         files.delete(key);
       }
     }
-    if (dropped > 0) {
-      chars -= dropped;
-      store();
-    }
+    removed.add(relative);
+    store();
   };
 
   // oxlint-disable-next-line promise/prefer-await-to-callbacks -- volume mutations arrive as events, not promises
-  return volume.onMutation((mutation) => {
+  const unsubscribe = volume.onMutation((mutation) => {
     if (suspended) {
       return;
     }
@@ -279,4 +374,14 @@ export const mirrorStateDir = (
       // The mirror must never break a write; IndexedDB still saves it.
     }
   });
+
+  return {
+    clear: () => {
+      files.clear();
+      removed.clear();
+      suspended = false;
+      clearMirror(scope, id, storage);
+    },
+    stop: unsubscribe,
+  };
 };
