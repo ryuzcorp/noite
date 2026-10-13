@@ -154,6 +154,12 @@ const CreateSourceParams = Schema.Union([
     kind: Schema.Literal("github").annotate({
       description: "Import a public GitHub repository.",
     }),
+    path: Schema.optional(
+      Schema.String.check(Schema.isNonEmpty()).annotate({
+        description:
+          "Import only this folder of the repo (a monorepo package, e.g. apps/web) as the app's root, as one commit.",
+      })
+    ),
     ref: Schema.optional(SourceRef),
     url: Schema.String.annotate({
       description: "https://github.com/<owner>/<repo>",
@@ -190,7 +196,12 @@ const toCreateSource = (
     return { kind: "blank" };
   }
   if (source.kind === "github") {
-    return { kind: "git", ref: source.ref, url: source.url };
+    return {
+      kind: "git",
+      path: source.path,
+      ref: source.ref,
+      url: source.url,
+    };
   }
   return { id: source.template, kind: "template" };
 };

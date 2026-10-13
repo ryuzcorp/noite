@@ -12,6 +12,7 @@ import {
   findAppId,
   runnerApi,
   runnerCall,
+  waitForCreatedApp,
   waitForDeploy,
 } from "./helpers";
 
@@ -96,13 +97,13 @@ test("imports a public GitHub repo with its history", async ({
 }) => {
   createdApps.push("hello-world");
   await page.goto("/apps/new");
-  await page.getByRole("tab", { name: "Import from GitHub" }).click();
+  await page.getByRole("radio", { name: /Import from GitHub/u }).check();
   await page.locator("#create-url").fill(UPSTREAM);
   // The slug prefills from the repo; the name stays the user's to write.
   await expect(page.locator("#create-slug")).toHaveValue("hello-world");
   await page.locator("#create-name").fill("Hello World");
   await page.getByRole("button", { name: "Create app" }).click();
-  await page.waitForURL("**/apps", { timeout: 30_000 });
+  await waitForCreatedApp(page);
 
   const appId = await findAppId(request, "hello-world");
   expect(appId).not.toBeNull();
@@ -130,7 +131,7 @@ test("rejects an import URL that is not a public GitHub repo", async ({
 }) => {
   // The form refuses it before submitting…
   await page.goto("/apps/new");
-  await page.getByRole("tab", { name: "Import from GitHub" }).click();
+  await page.getByRole("radio", { name: /Import from GitHub/u }).check();
   await page
     .locator("#create-url")
     .fill("https://gitlab.com/octocat/Hello-World");
@@ -205,12 +206,12 @@ test("a reserved slug cannot be pushed into existence", async ({
 
 test("the template picker lists the shipped templates", async ({ page }) => {
   await page.goto("/apps/new");
-  await page.getByRole("tab", { name: "Template" }).click();
+  await page.getByRole("radio", { name: /^Template/u }).check();
   await expect(
-    page.getByRole("button", { name: /Oxide \+ ilha/u })
+    page.getByRole("radio", { name: /Oxide \+ ilha/u })
   ).toBeVisible();
   // Picking one prefills Name and Slug from the template (the slug from its id).
-  await page.getByRole("button", { name: /TanStack Start/u }).click();
+  await page.getByRole("radio", { name: /TanStack Start/u }).check();
   await expect(page.locator("#create-name")).toHaveValue("TanStack Start");
   await expect(page.locator("#create-slug")).toHaveValue("tanstack-start");
 });

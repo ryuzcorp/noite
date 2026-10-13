@@ -313,6 +313,8 @@ export type RunnerCreateSource =
   | {
       actor: { name: string; userId: string };
       kind: "git";
+      /** Import only this subdirectory (a monorepo package), squashed. */
+      path?: string;
       ref?: string;
       squash?: boolean;
       url: string;

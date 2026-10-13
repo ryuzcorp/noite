@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::api_error::ApiError;
 use crate::db;
-use crate::host::{deploy, git_http, import, purge, rename, sleep};
+use crate::host::{deploy, git_http, import, purge, rename, sleep, supervisor};
 use crate::lifecycle::slug_ok;
 use crate::models::{App, AppSource, AppStatus, DesiredState};
 use crate::AppState;
@@ -67,6 +67,9 @@ pub async fn create(
             import::github_url(&git.url).map_err(ApiError::bad)?;
             if let Some(reference) = &git.reference {
                 import::import_ref(reference).map_err(ApiError::bad)?;
+            }
+            if let Some(path) = &git.path {
+                import::import_path(path).map_err(ApiError::bad)?;
             }
             Some(git)
         }
@@ -263,6 +266,13 @@ pub async fn delete(state: &AppState, id: &str) -> Result<(), ApiError> {
     if !deploy::claim_wait(&state.deploying, &app.id, Duration::from_secs(120)).await {
         return Err(ApiError::conflict("deploy in flight; retry delete shortly"));
     }
+    // Mark it stopped before the fleet goes down: the purge takes seconds
+    // (S3 prefixes), and an app still marked running is respawned in that
+    // window by the reconcile loop or by a wake. A failed purge leaves the
+    // app stopped, which a retried delete finishes.
+    db::patch_app_desired(&state.pool, &app.id, DesiredState::Stopped.as_str())
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let purge_result = purge::purge_slug(&state.config, &state.procs, &state.logs, &app.slug).await;
     deploy::release(&state.deploying, &app.id).await;
     if let Err(e) = purge_result {
@@ -273,6 +283,9 @@ pub async fn delete(state: &AppState, id: &str) -> Result<(), ApiError> {
     db::delete_app(&state.pool, id)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    // A reconcile tick that listed apps before the stop above can still have
+    // started the fleet again; with the row gone nothing else would stop it.
+    supervisor::stop_fleet(&state.procs, &app.slug).await;
     // Both transports revoke: the RPC path used to skip this and leak the row.
     let _ = crate::host::credentials::revoke(&state.pool, id).await;
     Ok(())

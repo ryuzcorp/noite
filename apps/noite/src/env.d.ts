@@ -20,6 +20,8 @@ declare global {
     BASE_DOMAIN?: string;
     /** Extra control hostnames, comma-separated (runner-owned). */
     CONTROL_EXTRA_HOSTS?: string;
+    /** Public git base the runner builds remotes on (runner-owned). */
+    GIT_PUBLIC_BASE?: string;
     BETTER_AUTH_SECRET?: string;
     BETTER_AUTH_URL?: string;
     NOITE_ADMIN_EMAIL?: string;

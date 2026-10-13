@@ -892,8 +892,11 @@ mod tests {
         // so the preview site takes the asset matcher, not the dev proxy.
         cfg.control_bundle_dir = "/tmp/noite-test-preview-bundle".into();
         std::fs::create_dir_all(Path::new(&cfg.control_bundle_dir)).expect("bundle dir");
-        std::fs::write(Path::new(&cfg.control_bundle_dir).join("wrangler.json"), "{}")
-            .expect("bundle marker");
+        std::fs::write(
+            Path::new(&cfg.control_bundle_dir).join("wrangler.json"),
+            "{}",
+        )
+        .expect("bundle marker");
         let out = rendered(&cfg, &[test_app()]).await;
         let addr = "app-0.preview.test.noite.now";
         let start = out

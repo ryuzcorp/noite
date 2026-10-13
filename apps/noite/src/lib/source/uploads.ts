@@ -164,15 +164,24 @@ const isDirectoryEntry = (
   entry: FileSystemEntry
 ): entry is FileSystemDirectoryEntry => entry.isDirectory;
 
+/** Entries a drop leaves out unread (a project's `node_modules`, say), by the
+ * entry and the path it would land at. */
+export type DropSkip = (entry: FileSystemEntry, path: string) => boolean;
+
 /** Walk one dropped entry: a file is read, a directory's subtree is read under
- * `path` (its place relative to the drop), and anything else is skipped. A
- * directory that cannot be listed — or a file the platform will not hand over
- * — becomes an error read at its own path instead of failing the whole drop.
+ * `path` (its place relative to the drop), and anything else — or anything
+ * `skip` names — is left out. A directory that cannot be listed — or a file
+ * the platform will not hand over — becomes an error read at its own path
+ * instead of failing the whole drop.
  */
 const readEntry = async (
   entry: FileSystemEntry,
-  path: string
+  path: string,
+  skip?: DropSkip
 ): Promise<UploadRead[]> => {
+  if (skip?.(entry, path)) {
+    return [];
+  }
   try {
     if (isFileEntry(entry)) {
       return [await readOne(await fileOf(entry), path)];
@@ -180,7 +189,7 @@ const readEntry = async (
     if (isDirectoryEntry(entry)) {
       const children = await readAllEntries(entry.createReader());
       const nested = await Promise.all(
-        children.map((child) => readEntry(child, `${path}/${child.name}`))
+        children.map((child) => readEntry(child, `${path}/${child.name}`, skip))
       );
       return nested.flat();
     }
@@ -198,10 +207,13 @@ const readEntry = async (
 
 /** One dropped item. `webkitGetAsEntry` is Chromium-only, so a browser without
  * it falls back to the plain file the item also carries. */
-const readItem = async (item: DataTransferItem): Promise<UploadRead[]> => {
+const readItem = async (
+  item: DataTransferItem,
+  skip?: DropSkip
+): Promise<UploadRead[]> => {
   const entry = item.webkitGetAsEntry?.() ?? null;
   if (entry !== null) {
-    return readEntry(entry, entry.name);
+    return readEntry(entry, entry.name, skip);
   }
   const file = item.getAsFile();
   return file === null ? [] : [await readOne(file, file.name)];
@@ -210,11 +222,15 @@ const readItem = async (item: DataTransferItem): Promise<UploadRead[]> => {
 /** Read a drop, directories and all: dropping a folder `assets` yields paths
  * like `assets/logo.png`. The items are snapshotted first, because a
  * `DataTransferItemList` empties once the drop event returns. Items that are
- * neither files nor directories (a dragged string) are skipped. */
+ * neither files nor directories (a dragged string) are skipped, and so is
+ * whatever `skip` names. */
 export const readDroppedItems = async (
-  items: DataTransferItemList
+  items: DataTransferItemList,
+  skip?: DropSkip
 ): Promise<UploadRead[]> => {
-  const reads = await Promise.all([...items].map((item) => readItem(item)));
+  const reads = await Promise.all(
+    [...items].map((item) => readItem(item, skip))
+  );
   return reads.flat();
 };
 

@@ -323,10 +323,9 @@ pub async fn rename_app(
 /// alone: changing a public base is the operator's call, and `host::rename` is
 /// the supported path there. Returns how many rows were rewritten.
 pub async fn rebind_local_subdomains(pool: &SqlitePool, base_domain: &str) -> sqlx::Result<u64> {
-    let rows: Vec<(String, String, String)> =
-        sqlx::query_as("SELECT id, slug, subdomain FROM app")
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(String, String, String)> = sqlx::query_as("SELECT id, slug, subdomain FROM app")
+        .fetch_all(pool)
+        .await?;
     let mut rewritten = 0_u64;
     for (id, slug, subdomain) in rows {
         let subdomain = subdomain.trim();
@@ -334,7 +333,10 @@ pub async fn rebind_local_subdomains(pool: &SqlitePool, base_domain: &str) -> sq
         if subdomain == wanted {
             continue;
         }
-        let stale_base = subdomain.split_once('.').map(|(_, rest)| rest).unwrap_or("");
+        let stale_base = subdomain
+            .split_once('.')
+            .map(|(_, rest)| rest)
+            .unwrap_or("");
         if !is_local_domain(stale_base) {
             continue;
         }

@@ -9,6 +9,8 @@ export interface AppTemplate {
   readonly id: string;
   readonly name: string;
   readonly ref: string;
+  /** Short tags for the picker card (framework, renderer, build tool). */
+  readonly stack: readonly string[];
   readonly url: string;
 }
 
@@ -19,6 +21,7 @@ export const TEMPLATES: readonly AppTemplate[] = [
     id: "oxide",
     name: "Oxide + ilha",
     ref: "main",
+    stack: ["Oxide", "ilha", "Vite"],
     url: "https://github.com/ryuzcorp/noite-template-oxide",
   },
   {
@@ -26,6 +29,7 @@ export const TEMPLATES: readonly AppTemplate[] = [
     id: "tanstack-start",
     name: "TanStack Start",
     ref: "main",
+    stack: ["TanStack Start", "SSR", "Vite"],
     url: "https://github.com/ryuzcorp/noite-template-tanstack-start",
   },
 ];

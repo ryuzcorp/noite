@@ -1,5 +1,5 @@
 import * as Schema from "effect/Schema";
-import { action, fail, withSchema } from "oxidejs";
+import { action, fail, useEnv, withSchema } from "oxidejs";
 
 import type { CreateSourceInput } from "../apps/create-source";
 import { TEMPLATES } from "../apps/templates";
@@ -15,6 +15,7 @@ import {
   runnerDeleteApp,
   runnerDeployLog,
   runnerGitRemote,
+  runnerListApps,
   runnerPatchApp,
   runnerRenameApp,
   runnerRetryImport,
@@ -27,6 +28,7 @@ const CreateSource = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("blank") }),
   Schema.Struct({
     kind: Schema.Literal("git"),
+    path: Schema.optional(Schema.String),
     ref: Schema.optional(Schema.String),
     url: Schema.String,
   }),
@@ -57,6 +59,71 @@ export const slugError = (slug: string): string | null => {
   }
   return null;
 };
+
+/** How many numbered variants (`slug-2` … ) a taken slug's suggestion tries. */
+const SUGGESTION_TRIES = 50;
+
+/** The first free `<slug>-<n>` (n ≥ 2) that is still a valid slug, or null. */
+const freeVariant = (
+  slug: string,
+  taken: ReadonlySet<string>
+): string | null => {
+  for (let n = 2; n < SUGGESTION_TRIES + 2; n += 1) {
+    const suffix = `-${n}`;
+    const candidate = `${slug.slice(0, 48 - suffix.length).replace(/-+$/u, "")}${suffix}`;
+    if (!(taken.has(candidate) || slugError(candidate))) {
+      return candidate;
+    }
+  }
+  return null;
+};
+
+/** What the create form shows under its Slug field while you type. */
+export interface SlugCheck {
+  /** Why the slug cannot be used, or null when it is free. */
+  error: string | null;
+  /** The git remote it would get; empty when the instance has no public git
+   * base configured. */
+  gitRemote: string;
+  /** `<slug>.<BASE_DOMAIN>`: the host the app is served on. */
+  host: string;
+  /** A free variant to offer when the slug is taken. */
+  suggestion: string | null;
+}
+
+/** Check a slug before create: shape, reserved names, and whether an app
+ * already holds it (slugs are instance-wide: one hostname per slug), plus the
+ * addresses it would get. A slug's existence is already public — it is a
+ * hostname — so answering "taken" leaks nothing a request to it would not. */
+export const slugCheck = action(
+  withSchema(Schema.Struct({ slug: Schema.String }), async ({ slug }) => {
+    await sessionUser();
+    const env = useEnv<KitEnv>();
+    const normalized = slug.trim().toLowerCase();
+    const gitBase = (env?.GIT_PUBLIC_BASE ?? "").replace(/\/+$/u, "");
+    const result: SlugCheck = {
+      error: slugError(normalized),
+      gitRemote: gitBase === "" ? "" : `${gitBase}/${normalized}`,
+      host: `${normalized}.${env?.BASE_DOMAIN ?? "localhost"}`,
+      suggestion: null,
+    };
+    if (result.error) {
+      return result;
+    }
+    try {
+      const apps = await runnerListApps();
+      const taken = new Set(apps.map((app) => app.slug));
+      if (taken.has(normalized)) {
+        result.error = `${normalized} is already taken`;
+        result.suggestion = freeVariant(normalized, taken);
+      }
+    } catch (error) {
+      failUnknown(error);
+    }
+    return result;
+  }),
+  { error: AuthError }
+);
 
 /** The account a create runs for — the session user, or the API-key owner on
  * the push-to-create path (/internal/git-auth). */
@@ -90,7 +157,13 @@ const toRunnerSource = (
       url: picked.url,
     };
   }
-  return { actor, kind: "git", ref: source.ref, url: source.url };
+  return {
+    actor,
+    kind: "git",
+    path: source.path,
+    ref: source.ref,
+    url: source.url,
+  };
 };
 
 /** Create an app for one account and grant that account admin — the single
@@ -131,17 +204,18 @@ export const create = action(
       fail(slugProblem);
     }
     try {
-      await createAppForUser({
+      const app = await createAppForUser({
         account: { id: user.id, name: user.name },
         name: trimmedName,
         slug: normalized,
         source,
       });
+      return { id: app.id };
     } catch (error) {
       if (error instanceof UnauthorizedError) {
         throw error;
       }
-      failUnknown(error);
+      return failUnknown(error);
     }
   }),
   { error: AuthError }

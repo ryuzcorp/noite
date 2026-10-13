@@ -894,7 +894,10 @@ mod tests {
             "noite.localhost",
             " app.noite.localhost ",
         ] {
-            assert!(is_localhost_domain(domain), "{domain:?} is the localhost family");
+            assert!(
+                is_localhost_domain(domain),
+                "{domain:?} is the localhost family"
+            );
         }
         for domain in [
             "noite.now",
@@ -916,7 +919,10 @@ mod tests {
         assert_eq!(parse_tenancy(None, "localhost"), Tenancy::Single);
         assert_eq!(parse_tenancy(None, "noite.localhost"), Tenancy::Single);
         assert_eq!(parse_tenancy(None, "noite.now"), Tenancy::Multi);
-        assert_eq!(parse_tenancy(Some("multi"), "noite.localhost"), Tenancy::Multi);
+        assert_eq!(
+            parse_tenancy(Some("multi"), "noite.localhost"),
+            Tenancy::Multi
+        );
         assert_eq!(parse_tenancy(Some("single"), "noite.now"), Tenancy::Single);
     }
 

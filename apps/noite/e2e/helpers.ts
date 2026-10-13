@@ -113,6 +113,15 @@ export const runnerApi = async <T>(
   // SAFETY: the runner returns raw JSON objects matching the caller's shape (runnerFetch contract — never a { body } envelope).
   return (await res.json()) as T;
 };
+
+/** After the create form submits: it opens the new app's page
+ * (`/apps/<id>`, plus `?t=deployments` for an import or template). */
+export const waitForCreatedApp = async (page: Page): Promise<void> => {
+  await page.waitForURL(
+    (url) => /^\/apps\/(?!new$)[^/]+$/u.test(url.pathname),
+    { timeout: 30_000 }
+  );
+};
 export const findAppId = async (
   request: APIRequestContext,
   slug: string
@@ -278,7 +287,7 @@ export const createAppWithKey = async (
   await page.locator("#create-name").fill(app.name);
   await page.locator("#create-slug").fill(app.slug);
   await page.getByRole("button", { name: "Create app" }).click();
-  await page.waitForURL("**/apps", { timeout: 30_000 });
+  await waitForCreatedApp(page);
   const appId = await findAppId(request, app.slug);
   if (appId === null) {
     throw new Error(`app ${app.slug} was not created`);

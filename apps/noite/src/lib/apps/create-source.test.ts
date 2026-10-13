@@ -19,6 +19,27 @@ test("a GitHub URL prefills the slug from the repo name", () => {
   );
 });
 
+test("a GitHub folder link names the ref and the monorepo folder", () => {
+  expect(
+    parseGitHubRepo("https://github.com/acme/mono/tree/main/apps/web-site")
+  ).toEqual({
+    name: "web-site",
+    owner: "acme",
+    path: "apps/web-site",
+    ref: "main",
+    repo: "mono",
+    slug: "web-site",
+  });
+  // A branch link with no folder: the ref only, named after the repo.
+  expect(parseGitHubRepo("https://github.com/acme/mono/tree/v2")).toEqual({
+    name: "mono",
+    owner: "acme",
+    ref: "v2",
+    repo: "mono",
+    slug: "mono",
+  });
+});
+
 test("only the exact GitHub https shape prefills", () => {
   for (const bad of [
     "",
@@ -35,6 +56,8 @@ test("only the exact GitHub https shape prefills", () => {
     "https://github.com/octocat/Hello-World#main",
     "https://github.com/octocat",
     "https://github.com/octocat/Hello-World/extra",
+    "https://github.com/octocat/Hello-World/tree",
+    "https://github.com/octocat/Hello-World/blob/main/README.md",
     "https://github.com/-octocat/Hello-World",
   ]) {
     expect(parseGitHubRepo(bad)).toBeNull();

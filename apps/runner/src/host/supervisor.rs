@@ -76,6 +76,23 @@ pub async fn stop_fleet(procs: &ProcMap, slug: &str) {
     tracing::info!(slug, "stopped celld");
 }
 
+/// Stop every running fleet whose app no longer exists. A delete stops its
+/// fleet before purging, but a reconcile tick (or a wake) that read the app
+/// before the delete can start it again, and once the row is gone nothing
+/// else manages that process: it keeps the app's port, so the next app given
+/// that port crash-loops on "Address already in use". Each candidate is
+/// re-read by slug before it is stopped, so an app created or renamed since
+/// the caller listed apps keeps its fleet.
+pub async fn stop_orphan_fleets(pool: &SqlitePool, procs: &ProcMap) {
+    let running: Vec<String> = procs.lock().await.keys().cloned().collect();
+    for slug in running {
+        if matches!(db::get_app_by_slug(pool, &slug).await, Ok(None)) {
+            tracing::warn!(slug, "stopping fleet of a deleted app");
+            stop_fleet(procs, &slug).await;
+        }
+    }
+}
+
 /// Signal every fleet at once, then join waits under one budget
 /// (SPEC, Shutdown). Survivors past the budget get SIGKILL. Caddy
 /// is stopped last by the caller so in-flight requests drain.
@@ -299,5 +316,57 @@ pub async fn reload_fleet(app: &App) {
     let url = format!("http://127.0.0.1:{port}/reload");
     if let Err(e) = reqwest::Client::new().post(&url).send().await {
         tracing::warn!(slug = %app.slug, error = %e, "reload failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spawn_sleeper() -> Child {
+        Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    /// A fleet whose app row is gone (a delete raced by a reconcile respawn)
+    /// is stopped; a fleet whose app still exists keeps running.
+    #[tokio::test]
+    async fn orphan_fleets_stop_and_live_ones_stay() {
+        let pool = db::connect("sqlite::memory:").await.expect("memory db");
+        let cfg = crate::config::config_for_tests();
+        db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "alive",
+                slug: "alive",
+                user_id: "user_test",
+                subdomain: "alive.localhost",
+                listen: 30000,
+                internal: 30001,
+            },
+        )
+        .await
+        .expect("seed app");
+        let procs = new_procs();
+        let orphan = spawn_sleeper();
+        let orphan_pid = orphan.id().expect("orphan pid");
+        {
+            let mut map = procs.lock().await;
+            map.insert("alive".into(), spawn_sleeper());
+            map.insert("deleted".into(), orphan);
+        }
+
+        stop_orphan_fleets(&pool, &procs).await;
+
+        let map = procs.lock().await;
+        assert!(map.contains_key("alive"));
+        assert!(!map.contains_key("deleted"));
+        drop(map);
+        // The orphan's process is really gone, not just forgotten.
+        assert!(!std::path::Path::new(&format!("/proc/{orphan_pid}")).exists());
     }
 }

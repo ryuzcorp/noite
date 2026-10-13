@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { deleteApp, findAppId, runnerCall } from "./helpers";
+import { deleteApp, findAppId, runnerCall, waitForCreatedApp } from "./helpers";
 
 // Custom domains, tenant env vars and app lifecycle, driven through the runner
 // API the control UI uses. The app-detail panels that surface the same calls
@@ -14,7 +14,7 @@ test("custom domains, env vars and deletion behave", async ({
   await page.locator("#create-name").fill("Lifecycle");
   await page.locator("#create-slug").fill("lifecycle");
   await page.getByRole("button", { name: "Create app" }).click();
-  await page.waitForURL("**/apps", { timeout: 30_000 });
+  await waitForCreatedApp(page);
   const appId = await findAppId(request, "lifecycle");
   expect(appId).not.toBeNull();
   const id = appId ?? "";

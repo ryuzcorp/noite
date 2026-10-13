@@ -367,6 +367,12 @@ pub struct GitSource {
     pub reference: Option<String>,
     #[serde(default)]
     pub squash: bool,
+    /// Repository subdirectory to import instead of the whole tree (a
+    /// monorepo package). Its tree becomes the app's root as one squashed
+    /// commit: the subdirectory has no history of its own to keep. Validated
+    /// by `host::import::import_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     /// Who the squashed commit is authored as (the shared commit actor).
     pub actor: Actor,
 }

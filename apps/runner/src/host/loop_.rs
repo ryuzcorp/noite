@@ -197,6 +197,8 @@ async fn reconcile_once(
     let domains = db::list_app_domains(pool).await.unwrap_or_default();
     let limits = db::list_app_limits(pool).await.unwrap_or_default();
     caddy::rewrite_caddy(cfg, &visible, &domains, &limits).await?;
+    // Backstop for a fleet left running after its app's row was deleted.
+    supervisor::stop_orphan_fleets(pool, procs).await;
 
     metrics::tick(pool, cfg, procs, control_pid, metrics, log_tx).await?;
     Ok(())

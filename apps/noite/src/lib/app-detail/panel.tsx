@@ -10,6 +10,7 @@ import { setDesired, retryImport } from "../server/apps.server";
 import { sleep } from "../sleep";
 import { AppStorageList } from "../storage/list";
 import { Avatar } from "../ui/avatar";
+import { CopyButton } from "../ui/copy-button";
 import { ArrowUpRight, Pause, Play, Refresh } from "../ui/icons";
 import { AppHeaderSkeleton } from "../ui/skeletons";
 import { DeployDropdown } from "./deploys";
@@ -254,9 +255,52 @@ export const AppHeader = ({ appId }: { appId: string }) => {
   );
 };
 
-/** Overview tab: usage, open errors, storage. */
+/** Overview's first card for an app nothing has been pushed to yet (a blank
+ * create): the remote and the two commands that deploy it. Gone after the
+ * first deploy; an import or template builds on its own, so never shown. */
+const FirstPushCard = ({ appId }: { appId: string }) => {
+  const info = appDetail(appId).data();
+  if (
+    !info ||
+    info.app.lastDeploySha ||
+    info.app.imported ||
+    !(info.myRole === "push" || info.myRole === "admin")
+  ) {
+    return null;
+  }
+  const snippet = `git remote add noite ${info.gitRemote}\ngit push noite main`;
+  return (
+    <section class="card bg-base-100 dark:bg-base-200 border-base-300 border">
+      <div class="card-body gap-3">
+        <h2 class="card-title m-0 text-base">Push your first commit</h2>
+        <p class="m-0 text-sm opacity-80">
+          This app has no code yet. Push <code>main</code> from your project and
+          it deploys.
+        </p>
+        <div class="bg-base-200 dark:bg-base-300 rounded-box flex items-start gap-2 p-3">
+          <pre class="m-0 min-w-0 flex-1 overflow-x-auto font-mono text-xs leading-relaxed">
+            {snippet}
+          </pre>
+          <CopyButton iconOnly label="Copy commands" value={snippet} />
+        </div>
+        <p class="m-0 text-xs opacity-70">
+          Git asks for credentials: username <code>{info.username}</code>,
+          password an API key from{" "}
+          <a href="/account" class="link">
+            Account
+          </a>
+          .
+        </p>
+      </div>
+    </section>
+  );
+};
+
+/** Overview tab: the first-push steps (until something is deployed), usage,
+ * open errors, storage. */
 export const AppDetailPanel = ({ appId }: { appId: string }) => (
   <div class="@container flex flex-col gap-4">
+    <FirstPushCard appId={appId} />
     {/* Columns follow the tab body's width, not the viewport's, so an open
         Settings panel stacks the cards instead of squeezing them. */}
     <div class="grid grid-cols-1 gap-4 @4xl:grid-cols-2">

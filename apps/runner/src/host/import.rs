@@ -10,7 +10,12 @@
 //! is published.
 //!
 //! Setup (`apps.create`) validates the source and stores it on the app row, so
-//! a failure can be retried with the same URL, ref and actor (A2).
+//! a failure can be retried with the same URL, ref, path and actor (A2).
+//!
+//! A `path` imports one subdirectory of the repo (a monorepo package): the
+//! whole repo is cloned under the same caps, and that directory's tree becomes
+//! the app's root as one squashed commit — the same snapshot a tarball
+//! extractor such as giget makes, without a second host to allow.
 
 use std::collections::HashSet;
 use std::os::unix::process::CommandExt;
@@ -173,6 +178,38 @@ pub fn import_ref(reference: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate and normalize the optional subdirectory `path` (surrounding
+/// slashes dropped). It is only ever used as `<sha>:<path>` in `rev-parse`, so
+/// it must stay a plain relative path: no `.`/`..`/`.git` segment, nothing
+/// option- or revision-shaped (`-`, `:`, `^`, `~`, `@{`), no backslash,
+/// whitespace or control characters.
+pub fn import_path(path: &str) -> Result<String, String> {
+    let bad = |why: &str| Err(format!("path {why}"));
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() || trimmed.len() > MAX_REF {
+        return bad("must be 1..=200 chars");
+    }
+    if trimmed.starts_with('-') {
+        return bad("must not start with '-'");
+    }
+    if trimmed
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\\' | ':' | '^' | '~' | '?' | '*' | '['))
+        || trimmed.contains("@{")
+    {
+        return bad("must be a plain folder path, like packages/web");
+    }
+    for segment in trimmed.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." || segment == ".git" {
+            return bad("must be a plain folder path, like packages/web");
+        }
+        if segment.trim() != segment {
+            return bad("must not have spaces around a folder name");
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
 /// `app_event` line for the import feed (best effort: a lost event never fails
 /// the import itself).
 async fn note(state: &AppState, app_id: &str, event: &str, description: &str) {
@@ -266,6 +303,9 @@ async fn import_once(
     if let Some(reference) = &source.reference {
         import_ref(reference).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
+    if let Some(path) = &source.path {
+        import_path(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     let scratch =
         exec::work_root(&state.config)
             .join("import")
@@ -296,15 +336,23 @@ async fn import_into(
     // does the one visible ref move below.
     fetch_into(&mirror, &scratch.join("upstream.git"), "HEAD", IMPORT_REF).await?;
     let staged = rev_parse(&mirror, IMPORT_REF).await?;
-    let published = if source.squash {
-        let tree = format!("{staged}^{{tree}}");
-        let tree = rev_parse(&mirror, &tree).await?;
-        let message = format!(
-            "Initial commit from {}/{}@{}",
-            target.owner,
-            target.repo,
-            &upstream_sha[..upstream_sha.len().min(7)]
-        );
+    let subdir = source
+        .path
+        .as_deref()
+        .map(import_path)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let published = if source.squash || subdir.is_some() {
+        let short = &upstream_sha[..upstream_sha.len().min(7)];
+        let (tree, origin) =
+            match squash_tree(&mirror, &staged, target, subdir.as_deref(), short).await {
+                Ok(found) => found,
+                Err(e) => {
+                    drop_ref(&mirror, IMPORT_REF).await?;
+                    return Err(e);
+                }
+            };
+        let message = format!("Initial commit from {origin}@{short}");
         let identity =
             git_identity::noreply(&state.config, &source.actor.user_id, &source.actor.name);
         let sha = squash_root(&mirror, &tree, &message, &identity).await?;
@@ -314,6 +362,7 @@ async fn import_into(
         drop_ref(&mirror, IMPORT_REF).await?;
         staged
     };
+
     // Retry after a partial landing: `expected_old` is the ref as it stands now.
     // `None` (a fresh app) means "must not exist", which is exactly right here.
     let current = git_http::list_refs(&mirror)
@@ -329,6 +378,40 @@ async fn import_into(
     )
     .await?;
     Ok(published)
+}
+
+/// The tree a squashed import commits, and the `owner/repo[/path]` its commit
+/// message names: the whole fetched tree, or — for a `path` import — that
+/// subdirectory's own tree, so it becomes the app's root. A path that is
+/// missing, or names a file, fails with a message the app's import error shows.
+async fn squash_tree(
+    mirror: &Path,
+    staged: &str,
+    target: &ImportTarget,
+    subdir: Option<&str>,
+    short: &str,
+) -> anyhow::Result<(String, String)> {
+    let repo = format!("{}/{}", target.owner, target.repo);
+    let Some(path) = subdir else {
+        return Ok((
+            rev_parse(mirror, &format!("{staged}^{{tree}}")).await?,
+            repo,
+        ));
+    };
+    // `<rev>:<path>` takes everything after the colon as the path, so a peel
+    // like `^{tree}` cannot be appended: resolve it, then ask its type.
+    let found = match rev_parse(mirror, &format!("{staged}:{path}")).await {
+        Ok(id) => object_type(mirror, &id)
+            .await
+            .ok()
+            .filter(|t| t == "tree")
+            .map(|_| id),
+        Err(_) => None,
+    };
+    match found {
+        Some(tree) => Ok((tree, format!("{repo}/{path}"))),
+        None => bail!("folder {path} not found in {repo}@{short}"),
+    }
 }
 
 /// Temp ref the clone is staged under in the push mirror, deleted before the
@@ -489,6 +572,20 @@ async fn rev_parse(repo: &Path, rev: &str) -> anyhow::Result<String> {
     let out = exec::run_cmd(
         "git",
         &[&dir, "rev-parse", "--verify", "--end-of-options", rev],
+        None,
+        &[],
+        Duration::from_secs(30),
+    )
+    .await?;
+    Ok(out.trim().to_string())
+}
+
+/// `git cat-file -t`: `tree`, `blob`, `commit` or `tag`.
+async fn object_type(repo: &Path, id: &str) -> anyhow::Result<String> {
+    let dir = git_dir(repo);
+    let out = exec::run_cmd(
+        "git",
+        &[&dir, "cat-file", "-t", id],
         None,
         &[],
         Duration::from_secs(30),
@@ -660,6 +757,98 @@ mod tests {
         ] {
             assert!(import_ref(reference).is_err(), "should reject {reference}");
         }
+    }
+
+    #[test]
+    fn path_validation() {
+        for (path, normalized) in [
+            ("apps/web", "apps/web"),
+            ("/packages/site/", "packages/site"),
+            ("examples/hello-world", "examples/hello-world"),
+            (".github", ".github"),
+        ] {
+            assert_eq!(import_path(path).as_deref(), Ok(normalized), "{path}");
+        }
+        for path in [
+            "",
+            "/",
+            "-x",
+            "a/../b",
+            "./a",
+            "a//b",
+            ".git/hooks",
+            "a\\b",
+            "HEAD:a",
+            "a^{tree}",
+            "a~1",
+            "a@{1}",
+            "a/ b",
+        ] {
+            assert!(import_path(path).is_err(), "should reject {path:?}");
+        }
+    }
+
+    /// A monorepo import commits one subdirectory's tree as the app's root;
+    /// a folder that does not exist, or names a file, is a readable error.
+    #[tokio::test]
+    async fn a_path_import_roots_the_app_at_that_folder() {
+        let root = dir();
+        let upstream = root.join("upstream");
+        std::fs::create_dir_all(upstream.join("apps/web/src")).expect("dirs");
+        std::fs::write(upstream.join("README.md"), "monorepo").expect("write");
+        std::fs::write(upstream.join("apps/web/package.json"), "{}").expect("write");
+        std::fs::write(upstream.join("apps/web/src/index.js"), "1").expect("write");
+        git_in(&upstream, &["init", "-b", "main"]).await;
+        git_in(&upstream, &["add", "-A"]).await;
+        git_in(&upstream, &["commit", "-m", "one"]).await;
+        let mirror = root.join("mirror.git");
+        crate::host::git_http::init_bare(&mirror)
+            .await
+            .expect("mirror");
+        let target = ImportTarget {
+            owner: "acme".into(),
+            repo: "mono".into(),
+            clone_url: format!("file://{}", upstream.display()),
+        };
+        let scratch = root.join("scratch");
+        clone_scratch(&target, None, &scratch, Protocols { file: true })
+            .await
+            .expect("clone");
+        fetch_into(&mirror, &scratch.join("upstream.git"), "HEAD", IMPORT_REF)
+            .await
+            .expect("fetch");
+        let staged = rev_parse(&mirror, IMPORT_REF).await.expect("staged");
+
+        let (tree, origin) = squash_tree(&mirror, &staged, &target, Some("apps/web"), "abc1234")
+            .await
+            .expect("subdir tree");
+        assert_eq!(origin, "acme/mono/apps/web");
+        let listing = git_in(
+            &root,
+            &[
+                &format!("--git-dir={}", mirror.display()),
+                "ls-tree",
+                "-r",
+                "--name-only",
+                &tree,
+            ],
+        )
+        .await;
+        assert_eq!(
+            listing.lines().collect::<Vec<_>>(),
+            ["package.json", "src/index.js"]
+        );
+
+        for missing in ["apps/api", "README.md"] {
+            let err = squash_tree(&mirror, &staged, &target, Some(missing), "abc1234")
+                .await
+                .expect_err("not a folder");
+            assert_eq!(
+                format!("{err:#}"),
+                format!("folder {missing} not found in acme/mono@abc1234")
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Run git in one directory with a fixed test identity (panics on failure).
