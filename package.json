@@ -16,7 +16,7 @@
     "@types/bun": "latest",
     "husky": "^9.1.7",
     "oxfmt": "^0.71.0",
-    "oxlint": "^1.86.0",
+    "oxlint": "^1.88.0",
     "typescript": "^7",
     "ultracite": "7.12.2"
   },

@@ -88,6 +88,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - New control action `apps.slugCheck`; `apps.create` now returns the new app's id.
   - **Drop a folder:** the whole creator page is a drop zone for a project folder. The app is named after it and the folder becomes its first commit on `main` (up to 100 files, 25 MiB), leaving out `node_modules`, `.git`, build output, tool caches and local `.env` files. A line under the card says so. If the app is created but the commit fails, the error links to the app.
   - **Import a monorepo folder:** **Branch, tag or folder (optional)** takes a folder (`apps/web`) as well as a branch or tag. That folder alone becomes the app's root, as one commit (`Initial commit from <owner>/<repo>/<folder>@<sha>`, no upstream history). Pasting a GitHub folder link (`…/tree/<branch>/<folder>`) fills both fields and names the app after the folder. The runner clones the whole repo under the usual caps and commits the folder's tree with git, so no new host is fetched from. `apps.create` (RPC and REST), the control action and the MCP `create_app` tool take an optional `path` on a git source; a missing folder fails the import with `folder <path> not found in <owner>/<repo>@<sha>`.
+- Dependencies: `oxidejs` 0.6.0 → 0.6.1, `effect` (with `@effect/sql-d1` and `@effect/platform-bun`) 4.0.0 → 4.0.4, `@pierre/diffs` 1.5.2, `vite` 8.3.4, `wrangler` 4.150.0, `@cloudflare/vite-plugin` 1.63.2, `@playwright/test` 1.64.0, `blume` 2.2.3, `daisyui` 5.7.48, `oxlint` 1.88.0.
 
 ### Removed
 
