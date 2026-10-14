@@ -8,21 +8,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Operator action required
-
-- None.
-
-### Fixed
-
-- **Code mode's Changes panel pushed a "New branch…" commit to the browsed branch.** Picking **New branch…** and naming it still committed onto the branch you were browsing (often `main`): the target select's rework stopped sending the new branch's name. The push now creates the named branch at the browsed tip again.
-- **An environment created while production was deploying failed at once** with "another deploy of this app is in flight" and deployed nothing until the next push. A deploy with a visible queued row (creating or redeploying an environment, a workspace preview) now waits for the app's running deploy to finish instead of failing; background tip deploys still skip and are picked up by the next reconcile.
-- The branch picker stayed open after **Create**, so the next click on it closed it instead of opening it: a parent repaint wrote back a stale open state. The dropdown now owns its open state, which repaints leave alone.
-- The Changes toggle's count badge holds the number alone again; the words around it are screen-reader text.
-
-### Changed
-
-- The release gate's two e2e lanes (single-tenant and multi-tenant/isolation) run as parallel jobs instead of one after the other, so the gate takes as long as the slower lane (~11 min, was ~19). `E2E_SPECS="e2e/a.spec.ts …" make e2e` runs only those spec files locally.
-
 ## [0.1.0-alpha.5] - 2026-10-14
 
 Preview environments (one deployment per branch, and Deploy preview from Code mode), resizable Code mode panes, and a pass over Code mode and pull request UX.
@@ -66,6 +51,14 @@ Preview environments (one deployment per branch, and Deploy preview from Code mo
 - Code mode's Terminal panel came back **empty** when it was reopened (`?terminal=1`): ghostty-web's render loop redraws only the rows its WASM render state marks dirty and clears that state after every render, so a canvas that had lost its pixels — the bitmap is thrown away whenever a resize assigns the canvas its new `width`/`height` — stayed blank until the shell next wrote something (the prompt of a command, an echo, any output), and the reopen itself repainted nothing: the fit addon does nothing while its container has no size (the shell is out of the document, or the panel is not laid out yet) or for 50 ms after a resize, and `Terminal.resize` returns early when the grid already has the size proposed. The panel now measures the pane the shell actually sits in (its `ResizeObserver` used to keep watching the pane the previous mount had built), fits on the frame the box is real, and forces the full repaint ghostty otherwise reserves for a resize, so the shell's screen is on show from the first frame.
 - **Code mode switches branches in place.** Every `?ref=` change used to remount the whole browser: the tree and the editor went back to their "Opening checkout…" skeletons, a second pod frame booted cold (fetching and untarring the ref again), a second language-service worker was spawned, and a ref whose listing or pod frame did not answer in time left the panes on skeletons for good. The browser is now mounted once per app and installs the new ref's checkout under the panes it already has: the tree and the editor keep showing the branch the user came from (marked _Switching to `<ref>`…_, input blocked) until the new ref's rows and file are ready, the intel worker re-syncs to the new ref instead of being rebuilt, and the checkout the user came from stays open for 90 s, so toggling between two branches is instant and each branch's unpushed drafts are exactly where they were left (drafts are per app **and** branch, in the pod's own IndexedDB workspace — nothing crosses). A ref that cannot be opened — a listing or a pod frame that times out, a frame that dies mid-session — leaves what was on screen standing and offers **Retry** instead of a stuck skeleton. `?file=` reopens on the new ref when it exists there and falls back to the Worker config the way a first open does.
 - **Code mode's diagnostics came back wrong until a reload after switching branches in place.** With `cloudflare.config.ts` open, a switch to another branch left `TS2307: Cannot find module 'cf/config'` under the import — the declaration was in the language-service worker's FS the whole time — and opening another file did not clear it; only a reload did. A switch re-set the versions the worker resolves packages against from the new ref's lockfile, which dropped **every** specifier's resolution, including the ones both lockfiles pin identically, and re-acquiring them only re-pointed the declaration URLs already fetched: no file landed, so the pane was never told to check the open file again. What a specifier resolved to now survives a lockfile unless that lockfile moved its package's version, a round that publishes a resolution without fetching anything still tells the pane to re-check, and a round that outlives the lockfile it started under drops its answer instead of publishing it.
+- **Code mode's Changes panel pushed a "New branch…" commit to the browsed branch.** Picking **New branch…** and naming it still committed onto the branch you were browsing (often `main`): the target select's rework stopped sending the new branch's name. The push now creates the named branch at the browsed tip again.
+- **An environment created while production was deploying failed at once** with "another deploy of this app is in flight" and deployed nothing until the next push. A deploy with a visible queued row (creating or redeploying an environment, a workspace preview) now waits for the app's running deploy to finish instead of failing; background tip deploys still skip and are picked up by the next reconcile.
+- The branch picker stayed open after **Create**, so the next click on it closed it instead of opening it: a parent repaint wrote back a stale open state. The dropdown now owns its open state, which repaints leave alone.
+- The Changes toggle's count badge holds the number alone again; the words around it are screen-reader text.
+
+### Changed
+
+- The release gate's two e2e lanes (single-tenant and multi-tenant/isolation) run as parallel jobs instead of one after the other, so the gate takes as long as the slower lane (~11 min, was ~19). `E2E_SPECS="e2e/a.spec.ts …" make e2e` runs only those spec files locally.
 
 ### Removed
 
