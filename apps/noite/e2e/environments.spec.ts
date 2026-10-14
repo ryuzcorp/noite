@@ -11,6 +11,7 @@ import {
   createAppWithKey,
   deleteApp,
   pushAppDir,
+  waitForDeploy,
 } from "./helpers";
 
 // Preview environments: creating one from a branch lists its URL as its group
@@ -18,6 +19,11 @@ import {
 // branch's own deployment.
 
 const SLUG = "envs";
+
+/** The sample app: both branches must really deploy, since the panel frames
+ * production only once it has deployed, and a failed environment shows its
+ * status instead of a frame. */
+const SAMPLE = new URL("../test", import.meta.url);
 
 const gitBase = process.env.E2E_GIT_BASE ?? "http://localhost:8080/v1/git";
 
@@ -74,8 +80,8 @@ test("a branch becomes an environment and Code mode frames it", async ({
     name: "Environments",
     slug: SLUG,
   });
-  pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), SLUG);
-  pushBranch(apiKey, new URL("fixtures/intel", import.meta.url), SLUG);
+  pushAppDir(apiKey, SAMPLE, SLUG);
+  pushBranch(apiKey, SAMPLE, SLUG);
 
   // --- create an environment from the branch ------------------------------
   await page.goto(`/apps/${appId}?t=deployments`);
@@ -94,6 +100,10 @@ test("a branch becomes an environment and Code mode frames it", async ({
   ).toBeVisible();
 
   // --- Code mode: the Preview panel frames what each branch deploys --------
+  // Production's deploy ran while the environment was created; the default
+  // branch frames it once it has a commit live.
+  const deploy = await waitForDeploy(request, appId);
+  expect(deploy.status).toBe("success");
   await page.goto(`/apps/${appId}/source?ref=main&panel=preview`);
   const panel = page.getByRole("complementary", { name: "Preview" });
   const frame = panel.locator("iframe");

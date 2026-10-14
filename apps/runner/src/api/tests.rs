@@ -923,6 +923,74 @@ async fn seed_env(
     .expect("seed environment")
 }
 
+/// An environment deploy someone is watching (its "queued" row already
+/// exists) waits out the app's in-flight production deploy instead of failing
+/// as skipped: creating an environment while production builds used to leave
+/// it `failed` with nothing deployed.
+#[tokio::test]
+async fn a_watched_environment_deploy_waits_for_the_apps_other_deploy() {
+    let h = Harness::new().await;
+    let app = h.seed_app("env-wait").await;
+    let env = seed_env(
+        &h,
+        &app,
+        "feature",
+        crate::models::EnvironmentKind::Branch,
+        "refs/heads/feature",
+    )
+    .await;
+    let deploy_id = crate::db::upsert_deploy(
+        &h.state.pool,
+        None,
+        &app.id,
+        Some(&env.id),
+        "building",
+        Some("0123456789abcdef0123456789abcdef01234567"),
+        "▸ queued\n",
+    )
+    .await
+    .expect("queued row");
+    // Production holds the app's lock.
+    assert!(crate::host::deploy::claim(&h.state.deploying, &app.id).await);
+    let state = h.state.clone();
+    let (task_app, task_id) = (app.clone(), deploy_id.clone());
+    let task = tokio::spawn(async move {
+        crate::host::deploy::deploy_app(
+            &state.pool,
+            &state.config,
+            &state.procs,
+            &state.logs,
+            &state.deploying,
+            task_app,
+            crate::host::deploy::DeployTarget::Environment(Box::new(env)),
+            "git/env-wait/refs/heads/feature/missing.bundle",
+            Some("0123456789abcdef0123456789abcdef01234567"),
+            crate::host::deploy::DeployTrigger::Explicit,
+            Some(&task_id),
+        )
+        .await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let waiting = crate::db::get_deploy_log(&h.state.pool, &app.id, &deploy_id)
+        .await
+        .expect("log")
+        .expect("row");
+    assert!(!task.is_finished(), "the deploy waits for the lock");
+    assert!(!waiting.contains("skipped"), "{waiting}");
+    // Production ends: the environment's deploy runs (and fails at fetch —
+    // there is no bundle here — which is a real attempt, not a skip).
+    crate::host::deploy::release(&h.state.deploying, &app.id).await;
+    tokio::time::timeout(std::time::Duration::from_secs(30), task)
+        .await
+        .expect("deploy ran after the lock freed")
+        .expect("task");
+    let log = crate::db::get_deploy_log(&h.state.pool, &app.id, &deploy_id)
+        .await
+        .expect("log")
+        .expect("row");
+    assert!(!log.contains("skipped"), "{log}");
+}
+
 /// Environments agree across transports, and the role gates are real: a read
 /// needs `view`, toggling public and deleting need `admin`.
 #[tokio::test]

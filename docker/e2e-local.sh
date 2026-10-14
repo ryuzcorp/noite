@@ -16,6 +16,9 @@
 #   E2E_TENANCY=multi make e2e     isolation lane: multi-tenant mode and the
 #                                  hostile-tenant spec (E2E_HOSTILE=1)
 #   E2E_KEEP=1 make e2e            leave the stack running afterwards (debug)
+#   E2E_SPECS="e2e/forge.spec.ts e2e/prs.spec.ts" make e2e
+#                                  run only those spec files (the setup project
+#                                  still runs first); quick to check one fix
 set -eu
 cd "$(dirname "$0")/.."
 # shellcheck source=docker/lib.sh
@@ -80,7 +83,9 @@ while [ "$attempt" -lt 100 ]; do
     echo "==> playwright e2e"
     # `set -e` would abort on a failing suite and skip the teardown below,
     # leaving the stack holding the host ports; capture the status instead.
-    if (cd apps/noite && npx playwright test); then
+    # E2E_SPECS is a word list of spec paths, split on purpose.
+    # shellcheck disable=SC2086
+    if (cd apps/noite && npx playwright test ${E2E_SPECS:-}); then
       rc=0
     else
       rc=$?

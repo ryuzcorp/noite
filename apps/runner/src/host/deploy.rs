@@ -138,7 +138,20 @@ pub async fn deploy_app(
     // immediately). `None` = this run creates its own.
     deploy_id: Option<&str>,
 ) {
-    if !claim(deploying, &app.id).await {
+    // One deploy per app at a time: its builds share the app's build cache,
+    // which every deploy prunes when it ends. A deploy someone is watching —
+    // the caller pre-created its "queued" row (an environment's create or
+    // redeploy, a workspace preview) — waits its turn: a preview must not fail
+    // because production is building. A background tip deploy has no row and
+    // skips; the next reconcile tick picks the tip up again.
+    let claimed = match deploy_id {
+        Some(_) => {
+            let wait = Duration::from_millis(crate::lifecycle::DEPLOY_STUCK_MS.unsigned_abs());
+            claim_wait(deploying, &app.id, wait).await
+        }
+        None => claim(deploying, &app.id).await,
+    };
+    if !claimed {
         // The caller may be waiting on that pre-created row: close it, or it
         // sits "building" until the stuck-deploy sweep.
         if let Some(id) = deploy_id {
@@ -149,7 +162,7 @@ pub async fn deploy_app(
                 target.environment_id(),
                 DeployStatus::Failed.as_str(),
                 tip_sha,
-                "ERROR: deploy skipped, another deploy of this app is in flight\n",
+                "ERROR: deploy skipped, another deploy of this app did not finish in time\n",
             )
             .await;
         }
