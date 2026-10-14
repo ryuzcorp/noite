@@ -13,10 +13,6 @@ services:
     volumes:
       - ../apps/runner:/src:z
       - ../apps/noite:/app:z
-      # `@noitenow/poder` is a `file:` dep of the UI: the workspace symlink
-      # resolves here, so vite dev and `bun install` see the same layout as
-      # the image build (`/packages/poder`).
-      - ../packages:/packages:z
       - ../docker/dev.sh:/opt/noite/dev.sh:ro,z
       - cargo-registry:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git

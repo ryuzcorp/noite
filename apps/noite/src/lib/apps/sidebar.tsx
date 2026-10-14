@@ -119,7 +119,7 @@ const SidebarAppLink = ({
           </MenuLink>
           <MenuLink active={view === "pulls"} href={`${href}/pulls`}>
             <GitPullRequest class="shrink-0" />
-            Pulls
+            Pull requests
             <OpenPrBadge appId={appId} class="ms-auto" />
           </MenuLink>
         </ul>

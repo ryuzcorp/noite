@@ -92,8 +92,14 @@ export interface EditorHost {
    * the pane a read of its own write will see it. */
   editChanged: (path: string, text: string) => Promise<void>;
   file: SearchParam<string>;
-  gitRef: string;
-  workspace: Workspace;
+  /** The ref the checkout under the pane is browsing: read, never captured —
+   * a branch switch installs another checkout under this same pane, and every
+   * read here (the committed text, the worker's sources) has to follow it. */
+  gitRef: () => string;
+  /** The checkout the pane drives, as of now: the browser installs another one
+   * when the browsed ref changes, and the pane follows it without being
+   * rebuilt (its edit session and its intel worker are the pane's own). */
+  workspace: () => Workspace;
 }
 
 /** The editor pane's surface for the browser and the tree wiring. */
@@ -105,6 +111,11 @@ export interface EditorPane {
   dispose: () => void;
   /** Close the open file without reopening it (a change that took it away). */
   dropOpen: () => void;
+  /** The checkout under the pane changed (a branch switch): the open file's
+   * text and path, its edit session and the worker's session all belong to the
+   * checkout that went, so they go — while what the pane *shows* stays
+   * standing, until the next `openFile` paints the new ref's file over it. */
+  rebase: () => void;
   /** Re-key the open file's path and text when a move carried it off (a folder
    * move carries everything under it). */
   followMove: (from: string, to: string) => void;
@@ -122,7 +133,7 @@ export interface EditorPane {
 }
 
 export const createEditorPane = (host: EditorHost): EditorPane => {
-  const { diffs, workspace } = host;
+  const { diffs } = host;
   // Live text per open path: the editor's own copy is the truth while a file
   // is open, and every editor position (token, cursor) becomes an offset
   // against it before the worker sees it.
@@ -238,14 +249,14 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
    * folder row, or a path that never was one). */
   const readDisk = async (path: string): Promise<DiskRead | null> => {
     const abs = projectPath(path);
-    if (!(await workspace.fs.exists(abs))) {
+    if (!(await host.workspace().fs.exists(abs))) {
       return null;
     }
-    const { isFile } = await workspace.fs.stat(abs);
+    const { isFile } = await host.workspace().fs.stat(abs);
     if (!isFile) {
       return null;
     }
-    const bytes = await workspace.fs.readFile(abs);
+    const bytes = await host.workspace().fs.readFile(abs);
     if (!isTextBytes(bytes)) {
       return { placeholder: BINARY_PLACEHOLDER, text: "" };
     }
@@ -265,12 +276,12 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
       return disk.placeholder === null
         ? {
             contents: disk.text,
-            editable: workspace.editable,
+            editable: host.workspace().editable,
             placeholder: null,
           }
         : { contents: "", editable: false, placeholder: disk.placeholder };
     }
-    const committed = await workspace.baseText(path);
+    const committed = await host.workspace().baseText(path);
     return committed === null
       ? null
       : { contents: committed, editable: false, placeholder: null };
@@ -415,6 +426,23 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
     paintStatus(null);
   };
 
+  /** The checkout under the pane changed: the open file, its edit session and
+   * the worker's session are the old ref's, so they go — what the pane shows
+   * stays standing until the next `openFile` paints over it. In-flight opens
+   * of the old checkout answer into nothing (their token is spent). */
+  const rebase = () => {
+    activePreview += 1;
+    currentPath = null;
+    currentEditable = false;
+    shown = null;
+    disposeEdit?.();
+    disposeEdit = undefined;
+    intel.detachSession();
+    liveText.clear();
+    pendingWrites.clear();
+    paintStatus(null);
+  };
+
   /** The pod moved under the pane: repaint whatever the code surface is not
    * already showing — a discard, a restore, an upload replacing the bytes, a
    * push that landed on another branch, a staged deletion — and close the pane
@@ -527,6 +555,7 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
     getCurrentPath: () => currentPath,
     openFile,
     placeCaret: intel.placeCaret,
+    rebase,
     resetIntel: intel.reset,
     startedIntel: intel.started,
     syncOpen,

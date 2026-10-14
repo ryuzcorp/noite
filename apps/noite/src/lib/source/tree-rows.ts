@@ -53,6 +53,9 @@ export interface TreeRowsHost {
   /** The pane's `followMove(from, to)`: re-keys the open file's text and path. */
   followMove: (from: string, to: string) => void;
   getCurrentPath: () => string | null;
+  /** Whether the checkout's rules exclude a path: such a row is in the pod but
+   * in no commit, so a delete must not count it as the repository's own. */
+  ignoredPath: (path: string) => boolean;
   /** The pane's toast corner, for a write the pod refused. */
   notify: (message: string) => void;
   openFile: (path: string, caret?: IntelPosition) => Promise<boolean>;
@@ -65,7 +68,9 @@ export interface TreeRowsHost {
   signal: AbortSignal;
   /** The pane's `syncOpen()`: put the open file back in step with the pod. */
   syncOpen: () => Promise<void>;
-  workspace: Workspace;
+  /** The checkout the rows write into, as of now: a branch switch installs
+   * another one under this tree (see `./tree`). */
+  workspace: () => Workspace;
 }
 
 /** The row flows' surface for the tree wiring. */
@@ -96,7 +101,7 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
       return;
     }
     try {
-      await host.workspace.rename(from, to);
+      await host.workspace().rename(from, to);
     } catch (error) {
       host.notify(errorMessage(error));
     }
@@ -180,8 +185,8 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
     void (async () => {
       try {
         await (add.isFolder
-          ? host.workspace.mkdir(add.path)
-          : host.workspace.writeText(add.path, ""));
+          ? host.workspace().mkdir(add.path)
+          : host.workspace().writeText(add.path, ""));
       } catch (error) {
         host.notify(errorMessage(error));
       }
@@ -228,8 +233,10 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
           : [withoutSlash(path)]
       )
     );
+    // What the commit holds and the delete would push: an excluded file is not
+    // in the repository and an added one is not pushed yet, so neither counts.
     const committed = [...files].filter(
-      (one) => host.changeAt(one)?.kind !== "added"
+      (one) => !host.ignoredPath(one) && host.changeAt(one)?.kind !== "added"
     ).length;
     const [only] = targets;
     const ok = await confirmDialog({
@@ -247,7 +254,7 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
     await Promise.all(
       targets.map(async (path) => {
         try {
-          await host.workspace.remove(withoutSlash(path));
+          await host.workspace().remove(withoutSlash(path));
         } catch (error) {
           host.notify(errorMessage(error));
         }
@@ -266,7 +273,7 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
     }
     void (async () => {
       try {
-        await host.workspace.discard(path);
+        await host.workspace().discard(path);
       } catch (error) {
         host.notify(errorMessage(error));
       }
@@ -294,7 +301,7 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
     const wasOpen = host.getCurrentPath();
     void (async () => {
       try {
-        await host.workspace.restore(path);
+        await host.workspace().restore(path);
         if (origin !== undefined) {
           host.followMove(path, origin);
         }

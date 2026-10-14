@@ -1,7 +1,7 @@
 //! The source UI's workspace, as a proxy over the pod frame's RPC.
 //!
 //! The pod — the filesystem, the checkout, the derive, the push — lives in a
-//! document on the app's preview origin (see `pod-client.ts`), and this is what
+//! document on the app's pod host origin (see `pod-client.ts`), and this is what
 //! the panes drive: the same `Workspace` the browser has always talked to,
 //! with every call answered by that document. Nothing here holds a pod, an SDK
 //! type or a worker; `fs` is the small read surface the editor and the tree
@@ -55,19 +55,24 @@ export interface SourceWorkspaceOptions {
   onSaveError: SaveErrorReporter;
   /** The unrecoverable frame failure: the page says so and tears down. */
   onFatal?: (message: string) => void;
-  /** How the frame is opened. The default frames the app's preview origin and
+  /** How the frame is opened. The default frames the app's pod host and
    * binds a port to it; a test hands in a connection over its own
    * `MessageChannel` pair — and its own scripted frame — which is the only
    * reason it is a parameter. */
   openFrame?: (frame: PodFrameOptions) => Promise<PodConnection>;
-  /** The app's preview origin: the only origin the frame may live on. */
+  /** The app's pod host origin: the only origin the frame may live on. */
   previewOrigin: string;
   /** The resolved commit of the browsed ref (see `PodOpenParams`). */
   sha: string;
+  /** Aborted when the pane goes. A checkout that is still opening has no
+   * owner to close it yet (it reaches the browser's map only once it is
+   * open), so the frame follows this signal instead — with no `open` deadline
+   * to turn to, a boot that hangs would otherwise outlive the page's pane. */
+  signal?: AbortSignal;
 }
 
 /** An open source workspace: the proxy the panes call, and the frame
- * connection the preview and the terminal share with it. */
+ * connection the terminal shares with it. */
 export interface SourceCheckout {
   connection: PodConnection;
   workspace: Workspace;
@@ -90,6 +95,33 @@ interface WaitingWrite {
   reject: (error: unknown) => void;
   resolve: () => void;
 }
+
+/** Close `connection` when `signal` aborts, and answer the way to stop
+ * listening: the frame is removed with it (see `PodConnection.close`), and an
+ * already-aborted signal closes it right away. */
+const tieToSignal = (
+  connection: PodConnection,
+  signal: AbortSignal | undefined
+): (() => void) => {
+  if (signal === undefined) {
+    return () => {
+      // No signal: nothing was tied, nothing to untie.
+    };
+  }
+  const close = (): void => {
+    void connection.close();
+  };
+  if (signal.aborted) {
+    close();
+    return () => {
+      // Already closed above.
+    };
+  }
+  signal.addEventListener("abort", close, { once: true });
+  return () => {
+    signal.removeEventListener("abort", close);
+  };
+};
 
 /** Open the frame for one ref and answer with the workspace over it. */
 export const openSourceWorkspace = async (
@@ -133,13 +165,20 @@ export const openSourceWorkspace = async (
     previewOrigin,
   });
 
+  // Nothing holds this connection yet — it reaches the caller only when the
+  // open answers — so while the open is up, the pane's own signal is what
+  // closes the frame if the pane goes. Past the open, the checkout owns it.
+  const untie = tieToSignal(connection, options.signal);
+
   // The state the frame's events keep: the rows (the open's first derive lands
   // as an event, before `open` even answers), the commit they were derived
   // against, and the fs watches the page holds.
   let changes: WorkspaceChange[] = [];
   let base = "";
   const subscribers = new Set<(next: WorkspaceChange[]) => void>();
-  const peerSubscribers = new Set<(structural: boolean) => void>();
+  const peerSubscribers = new Set<
+    (structural: boolean, paths: readonly string[]) => void
+  >();
   const watches = new Map<
     number,
     (event: string, filename: string | null) => void
@@ -153,9 +192,9 @@ export const openSourceWorkspace = async (
       notify(rows);
     }
   });
-  connection.on("peer", ({ structural }) => {
+  connection.on("peer", ({ paths, structural }) => {
     for (const notify of peerSubscribers) {
-      notify(structural);
+      notify(structural, paths);
     }
   });
   connection.on("saveError", ({ message }) => {
@@ -180,6 +219,7 @@ export const openSourceWorkspace = async (
     throw error;
   } finally {
     opening = false;
+    untie();
   }
   base = opened.baseSha;
 
@@ -218,7 +258,14 @@ export const openSourceWorkspace = async (
         } catch (error) {
           writer.writing = false;
           writers.delete(path);
-          for (const call of waiting) {
+          // Everything the slot still holds goes with the failed write: the
+          // callers this value carried, and the waiters a later keystroke
+          // queued behind it. A caller whose promise never settles would hold
+          // the editor's own write queue for that path forever.
+          const stranded = [...waiting, ...writer.waiting];
+          writer.pending = null;
+          writer.waiting = [];
+          for (const call of stranded) {
             call.reject(error);
           }
           return;
@@ -338,8 +385,8 @@ export const openSourceWorkspace = async (
     baseText: (path) => connection.call("baseText", { path }),
     changes: () => changes,
     close: async () => {
-      // The preview and the terminal stop before this (the browser's order),
-      // so what is left is the pod's own last save and its teardown.
+      // The terminal stops before this (the browser's order), so what is left
+      // is the pod's own last save and its teardown.
       try {
         await flushWrites();
       } catch {

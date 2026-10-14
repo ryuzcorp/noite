@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::{IntoResponse, Response},
     Json,
 };
@@ -32,11 +32,23 @@ pub async fn rollback(
         .map(|sha| Json(json!({ "ok": true, "sha": sha })))
 }
 
+/// `?environmentId=` — one preview environment's history; absent is
+/// production's.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeployQuery {
+    #[serde(default)]
+    pub environment_id: Option<String>,
+}
+
 pub async fn list_deploys(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<DeployQuery>,
 ) -> impl IntoResponse {
-    service::deploys::list(&state, &id).await.map(Json)
+    service::deploys::list(&state, &id, q.environment_id.as_deref())
+        .await
+        .map(Json)
 }
 
 /// One deploy's full build log (T1.7). The stream omits finished rows' logs,
@@ -57,6 +69,7 @@ pub async fn deploy_log(
 pub async fn list_deploys_stream(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<DeployQuery>,
 ) -> Response {
     let app = match service::apps::app_or_404(&state, &id).await {
         Ok(app) => app,
@@ -64,11 +77,13 @@ pub async fn list_deploys_stream(
     };
     let pool = state.pool.clone();
     let app_id = app.id.clone();
+    let env_id = q.environment_id;
     poll_stream("deploys", Duration::from_secs(2), move || {
         let pool = pool.clone();
         let app_id = app_id.clone();
+        let env_id = env_id.clone();
         async move {
-            db::list_deploys_lean(&pool, &app_id)
+            db::list_deploys_lean(&pool, &app_id, env_id.as_deref())
                 .await
                 .ok()
                 .map(|rows| serde_json::to_string(&rows).unwrap_or_default())

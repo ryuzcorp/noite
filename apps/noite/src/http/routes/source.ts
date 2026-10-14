@@ -1,7 +1,7 @@
 import { requireAppRole } from "../../lib/collaborators";
 import {
-  COMMIT_FORWARD_TIMEOUT_MS,
-  MAX_COMMIT_BODY_BYTES,
+  MAX_SOURCE_BODY_BYTES,
+  SOURCE_FORWARD_TIMEOUT_MS,
 } from "../../lib/commit-source";
 import { ensureDbPromise } from "../../lib/db";
 import type {
@@ -15,8 +15,9 @@ import { runnerConfig } from "../config";
 import type { RouteHandler } from "../config";
 import { originAllowed } from "../origin";
 
-/** The commit payload the browser posts (the runner validates its contents). */
-interface CommitPayload {
+/** The commit-shaped payload the browser posts to either source route (the
+ * runner validates its contents). */
+interface SourcePayload {
   branch?: string;
   deletes?: string[];
   files: SourceCommitFile[];
@@ -25,8 +26,9 @@ interface CommitPayload {
   moves?: SourceCommitMove[];
 }
 
-/** Shape check only: the runner is the authority on paths, sizes and encodings. */
-const isCommitPayload = (value: unknown): value is CommitPayload => {
+/** Both source routes' payload, shape-checked only: the runner is the
+ * authority on paths, sizes and encodings. */
+const isSourcePayload = (value: unknown): value is SourcePayload => {
   if (typeof value !== "object" || value === null) {
     return false;
   }
@@ -59,7 +61,7 @@ const crossSiteRefusal = (request: Request, env: KitEnv): Response | null => {
 /** The runner's body: identity and role come from the session, never the
  * browser; empty optional lists are omitted. */
 const runnerBody = (
-  payload: CommitPayload,
+  payload: SourcePayload,
   actor: SourceCommitBody["actor"],
   role: string
 ): SourceCommitBody => {
@@ -84,16 +86,18 @@ const runnerBody = (
   return body;
 };
 
-/** Browser commit: only the control UI's own fetch calls this, so the
- * cross-site gate, the session and the push role are all checked before a
- * byte of the body is read; then a bounded read and a forward to the runner.
- * The oxide action transport caps every action's body, so the commit is its
- * own route, like the R2 upload. */
-export const handleSourceCommit: RouteHandler = async (
-  request,
-  env,
-  params
-) => {
+/** Both source routes' one gate and one forward: only the control UI's own
+ * fetch calls them, so the cross-site gate, the session and the push role are
+ * all checked before a byte of the body is read; then a bounded read and a
+ * forward to the runner's own `source/{endpoint}`. A commit can be a folder of
+ * uploads and a preview is the same payload, so neither fits the oxide action
+ * transport's body cap: they are their own routes, like the R2 upload. */
+const forwardSourceBody = async (
+  request: Request,
+  env: KitEnv,
+  params: Record<string, string | undefined> | undefined,
+  endpoint: "commit" | "preview"
+): Promise<Response> => {
   const appId = params?.appId?.trim() ?? "";
   if (!appId) {
     return new Response("app required", { status: 400 });
@@ -116,7 +120,7 @@ export const handleSourceCommit: RouteHandler = async (
   if (!rc) {
     return new Response("RUNNER_TOKEN is not configured", { status: 500 });
   }
-  const raw = await readBoundedText(request, MAX_COMMIT_BODY_BYTES);
+  const raw = await readBoundedText(request, MAX_SOURCE_BODY_BYTES);
   if (raw === null) {
     return tooLarge();
   }
@@ -126,8 +130,8 @@ export const handleSourceCommit: RouteHandler = async (
   } catch {
     return new Response("invalid JSON", { status: 400 });
   }
-  if (!isCommitPayload(payload)) {
-    return new Response("invalid commit body", { status: 400 });
+  if (!isSourcePayload(payload)) {
+    return new Response(`invalid ${endpoint} body`, { status: 400 });
   }
   const body = runnerBody(
     payload,
@@ -135,7 +139,7 @@ export const handleSourceCommit: RouteHandler = async (
     grant.role
   );
   const res = await fetch(
-    `${rc.runner}/v1/apps/${encodeURIComponent(appId)}/source/commit`,
+    `${rc.runner}/v1/apps/${encodeURIComponent(appId)}/source/${endpoint}`,
     {
       body: JSON.stringify(body),
       headers: {
@@ -143,7 +147,7 @@ export const handleSourceCommit: RouteHandler = async (
         "content-type": "application/json",
       },
       method: "POST",
-      signal: AbortSignal.timeout(COMMIT_FORWARD_TIMEOUT_MS),
+      signal: AbortSignal.timeout(SOURCE_FORWARD_TIMEOUT_MS),
     }
   );
   return new Response(await res.text(), {
@@ -151,6 +155,17 @@ export const handleSourceCommit: RouteHandler = async (
     status: res.status,
   });
 };
+
+export const handleSourceCommit: RouteHandler = (request, env, params) =>
+  forwardSourceBody(request, env, params, "commit");
+
+/** Browser deploy preview: the same body and gate as a commit, forwarded to
+ * the runner's `source/preview`, which snapshots it onto the viewer's hidden
+ * `refs/previews/<user>/<branch>` ref and deploys that (user, branch)
+ * environment — creating it on first use — and answers the environment, the
+ * commit and the deploy row. */
+export const handleSourcePreview: RouteHandler = (request, env, params) =>
+  forwardSourceBody(request, env, params, "preview");
 
 /** Browser archive download: session + view role, and for a GET the cross-site
  * gate is `Sec-Fetch-Site` — browsers send `Origin` on GETs only when

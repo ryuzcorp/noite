@@ -111,10 +111,17 @@ export interface WorkspaceChange {
 /** The checkout as the tree renders it: every file, and every directory that
  * holds no file under it — git keeps no empty folder, so one only exists
  * because it was made here, and the tree is the only place it shows. Both
- * lists are checkout-relative and in path order. */
+ * lists are checkout-relative and in path order.
+ *
+ * The `ignored*` lists are the paths the checkout's own `.gitignore` rules
+ * exclude (folders without their slash): what git would not list at all, and
+ * which the tree paints dimmed — the one place the user can still see it. No
+ * row of the Changes panel and no push ever comes from them. */
 export interface CheckoutListing {
   dirs: string[];
   files: string[];
+  ignoredDirs: string[];
+  ignoredFiles: string[];
 }
 
 /** The blob-id memo a derive keeps between runs: one entry per path, holding
@@ -151,7 +158,7 @@ export interface SourceFs {
   readFile: (path: string) => Promise<Uint8Array>;
   stat: (path: string) => Promise<WorkspaceStat>;
   /** Follow the pod's own filesystem events under `path`; `close` stops them.
-   * The frame's watcher is the pod's, so an install, a preview process or the
+   * The frame's watcher is the pod's, so an install or the
    * shell creating a file reaches the tree through here. */
   watch: (
     path: string,
@@ -194,8 +201,8 @@ export interface WorkspaceFs {
 export type SaveErrorReporter = (error: unknown) => void;
 
 /** What `openPod` takes: whose workspace, whether it may write, and where a
- * failed save is reported. The preview is not a parameter: this runs in the
- * pod frame, whose own origin is the app's preview origin. */
+ * failed save is reported. The preview origin is not a parameter: this runs in
+ * the pod frame, whose own origin is the app's pod host. */
 export interface PodOptions {
   appId: string;
   branch: string;
@@ -213,8 +220,11 @@ export interface OpenPod {
   flush: () => Promise<void>;
   fs: NodepodFS;
   /** Called after another tab's edits land in this pod (see `tab-sync.ts`);
-   * `structural` when a path came, went or moved. */
-  onPeerChange: (notify: (structural: boolean) => void) => () => void;
+   * `structural` when a path came, went or moved, and `paths` when a peer
+   * overwrote one this tab holds a change to. */
+  onPeerChange: (
+    notify: (structural: boolean, paths: readonly string[]) => void
+  ) => () => void;
   persistence: WorkspacePersistence | null;
   pod: Nodepod;
 }
@@ -301,8 +311,12 @@ export interface Workspace {
    * folder. */
   listing: () => Promise<CheckoutListing>;
   /** Called after another tab's edits land in this workspace; `structural`
-   * when a path came, went or moved, which the tree's rows have to follow. */
-  onPeerChange: (notify: (structural: boolean) => void) => () => void;
+   * when a path came, went or moved, which the tree's rows have to follow, and
+   * `paths` (checkout-relative, deduped) when a peer overwrote a path this tab
+   * also holds a change to — the conflict the Changes panel names. */
+  onPeerChange: (
+    notify: (structural: boolean, paths: readonly string[]) => void
+  ) => () => void;
   mkdir: (path: string) => Promise<void>;
   onChanges: (notify: (changes: WorkspaceChange[]) => void) => () => void;
   /** Send every unpushed change to `request` — a branch name, which may or

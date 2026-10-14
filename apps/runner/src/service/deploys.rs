@@ -12,8 +12,15 @@ pub fn sha_valid(sha: &str) -> bool {
     (7..=40).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-pub async fn list(state: &AppState, id: &str) -> Result<Vec<Deploy>, ApiError> {
-    db::list_deploys(&state.pool, id)
+/// Deploy history, filtered by target: `environment_id = None` is the app's
+/// production history, `Some` one preview environment's (ROADMAP, the
+/// Deployments tab filters by environment).
+pub async fn list(
+    state: &AppState,
+    id: &str,
+    environment_id: Option<&str>,
+) -> Result<Vec<Deploy>, ApiError> {
+    db::list_deploys(&state.pool, id, environment_id)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))
 }
@@ -58,9 +65,11 @@ pub async fn rollback(state: &AppState, id: &str, sha: &str) -> Result<String, A
             &logs,
             &deploying,
             app,
+            deploy::DeployTarget::Production,
             &key,
             Some(&sha),
             deploy::DeployTrigger::Explicit,
+            None,
         )
         .await;
     });

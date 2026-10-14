@@ -34,6 +34,9 @@ interface FileDiffInstance {
 interface DiffsModule {
   FileDiff: new (opts?: {
     diffStyle?: string;
+    /** `wrap` breaks long lines into view instead of clipping them (the
+     * Changes panel diff is wide-content in a narrow pane). */
+    overflow?: "scroll" | "wrap";
     theme?: unknown;
   }) => FileDiffInstance;
   getFiletypeFromFileName: (filename: string) => string;
@@ -70,19 +73,64 @@ const paneIn = (host: HTMLElement): HTMLElement => {
   return pane;
 };
 
+/** The line a click landed on, read from pierre's rows: content rows carry
+ * `data-line`, gutter rows `data-column-number`, both with `data-line-type`.
+ * A composed-path walk, so it also sees nodes inside pierre's shadow root. */
+export const diffLineFromEvent = (
+  event: MouseEvent
+): { line: number; side: "old" | "new" } | null => {
+  for (const node of event.composedPath()) {
+    if (!(node instanceof HTMLElement)) {
+      continue;
+    }
+    const raw = node.dataset.line ?? node.dataset.columnNumber;
+    if (raw === undefined) {
+      continue;
+    }
+    const line = Math.trunc(Number(raw));
+    if (!Number.isSafeInteger(line) || line <= 0) {
+      continue;
+    }
+    return {
+      line,
+      side: (node.dataset.lineType ?? "").includes("deletion") ? "old" : "new",
+    };
+  }
+  return null;
+};
+
 /** Mounts pierre, then one FileDiff per entry `entries` builds. */
 const PierreDiffs = ({
   emptyLabel,
   entries,
+  onLineClick,
+  overflow = "scroll",
 }: {
   emptyLabel: string;
   entries: (diffs: DiffsModule) => PatchFileEntry[];
+  onLineClick?: (hit: { line: number; side: "old" | "new" }) => void;
+  overflow?: "scroll" | "wrap";
 }) => {
   const host = atom.lazy(() => newLiveRef<HTMLDivElement>())();
   watch.once(async ({ onCleanup, signal }) => {
     const el = await whenLive(host, signal);
     if (signal.aborted || !el) {
       return;
+    }
+    if (onLineClick) {
+      el.addEventListener(
+        "click",
+        (event) => {
+          if (!window.getSelection()?.isCollapsed) {
+            return;
+          }
+          const hit = diffLineFromEvent(event);
+          if (hit) {
+            onLineClick(hit);
+          }
+        },
+        { signal }
+      );
     }
     const pane = paneIn(el);
     let diffs: DiffsModule;
@@ -116,6 +164,7 @@ const PierreDiffs = ({
       pane.append(wrap);
       const instance = new diffs.FileDiff({
         diffStyle: "unified",
+        overflow,
         theme: THEME,
       });
       instance.render({ containerWrapper: wrap, fileDiff });
@@ -140,17 +189,23 @@ const PierreDiffs = ({
   );
 };
 
-/** A unified patch (commit, compare, pull request). */
+/** A unified patch (commit, compare, pull request). With `onLineClick`, a
+ * click on a line number (gutter) or content row reports the line it hit, so
+ * a caller can anchor a comment there. */
 export const DiffView = ({
   emptyLabel,
+  onLineClick,
   patch,
 }: {
   /** Shown when the patch parses to no files (e.g. an empty commit). */
   emptyLabel: string;
+  /** Called with the clicked line (not when text is selected). */
+  onLineClick?: (hit: { line: number; side: "old" | "new" }) => void;
   patch: string;
 }) => (
   <PierreDiffs
     emptyLabel={emptyLabel}
+    onLineClick={onLineClick}
     entries={(diffs) =>
       diffs.parsePatchFiles(patch).flatMap((parsed) =>
         parsed.files.map((fileDiff) => {
@@ -178,6 +233,9 @@ export const DraftDiffView = ({
 }) => (
   <PierreDiffs
     emptyLabel={emptyLabel}
+    // The panel is a narrow column of wide lines: wrap so an edit at the end
+    // of a long line is visible instead of clipped.
+    overflow="wrap"
     entries={(diffs) =>
       files.map(({ after, before, path }) => {
         const lang = curatedLang(path, diffs.getFiletypeFromFileName);

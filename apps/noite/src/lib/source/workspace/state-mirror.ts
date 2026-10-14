@@ -12,11 +12,9 @@
 //! and overlays its own writes. A mirror past the size cap drops out and
 //! IndexedDB is the only copy again.
 //!
-//! Two scopes use it:
-//! - `PREVIEW_STATE`: the preview's binding data, kept for the life of the tab.
-//! - `UNSAVED_PROJECT`: the checkout's files, holding only what IndexedDB has
-//!   not saved yet — `pod.ts` clears it whenever a save leaves nothing
-//!   pending, so it never replays text older than the saved copy.
+//! `UNSAVED_PROJECT` uses it: the checkout's files, holding only what
+//! IndexedDB has not saved yet — `pod.ts` clears it whenever a save leaves
+//! nothing pending, so it never replays text older than the saved copy.
 //!
 //! This module never imports the pod SDK (see `pod.ts`): the volume is the
 //! structural slice it needs, and mutations arrive already classified.
@@ -24,18 +22,14 @@
 import { base64ToBytes, bytesToBase64 } from "../../bytes";
 import { PROJECT_ROOT } from "./types";
 
-/** Where the preview server keeps binding data (`HARNESS_STATE_DIR` in
- * `preview/server.ts` — pinned equal by the test, never drifted). */
-export const MIRRORED_STATE_ROOT = "/home/.noite/s";
-
 /** Directory names never worth persisting: a restored `node_modules` is
  * rebuilt from `package.json` anyway, and the caches are the installer's.
  * IndexedDB skips them (`pod.ts`), and so does the project mirror. */
 export const UNPERSISTED_DIRS = ["node_modules", ".cache", ".npm"];
 
 /** sessionStorage is ~5 MB; past this a mirror drops out and IndexedDB is
- * the only copy again. Binding state and unsaved edits are kilobytes; only
- * large R2 objects or a fresh checkout's first save can push past it. */
+ * the only copy again. Unsaved edits are kilobytes; only a fresh checkout's
+ * first save can push past it. */
 const MAX_MIRROR_CHARS = 1_000_000;
 
 /** Mirror payload version, so a future shape never parses as this one. */
@@ -48,27 +42,6 @@ export interface MirrorScope {
   root: string;
   skip: (relative: string) => boolean;
 }
-
-/** Files that are never durable state: R2's write-then-rename temporaries,
- * and SQLite's crash-recovery sidecars (restoring a stale journal would roll
- * a healthy database back). */
-const isEphemeralState = (relative: string): boolean => {
-  const segments = relative.split("/");
-  if (segments.some((segment) => segment.includes(".tmp-"))) {
-    return true;
-  }
-  const base = segments.at(-1) ?? "";
-  return (
-    base.endsWith("-journal") || base.endsWith("-wal") || base.endsWith("-shm")
-  );
-};
-
-/** The preview's binding data, for the life of the tab. */
-export const PREVIEW_STATE: MirrorScope = {
-  key: "noite:preview-state",
-  root: MIRRORED_STATE_ROOT,
-  skip: isEphemeralState,
-};
 
 /** The checkout's writes IndexedDB has not saved yet. */
 export const UNSAVED_PROJECT: MirrorScope = {
@@ -240,7 +213,7 @@ export const restoreMirror = (
 };
 
 /** Drop the stored mirror. */
-export const clearMirror = (
+const clearMirror = (
   scope: MirrorScope,
   id: string,
   storage: MirrorStorage | null

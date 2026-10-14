@@ -72,14 +72,23 @@ const proxyRunnerStream = async (
   return new Response(upstream.body, { headers, status: upstream.status });
 };
 
-/** Live log tail proxy (see proxyRunnerStream). */
-export const handleLogsStream: RouteHandler = (request, env, params) =>
-  proxyRunnerStream(
+/** Live log tail proxy (see proxyRunnerStream). `?environmentId=` passes
+ * through so the tail can be scoped to one preview environment. */
+export const handleLogsStream: RouteHandler = (request, env, params) => {
+  const environmentId =
+    new URL(request.url).searchParams.get("environmentId") ?? "";
+  return proxyRunnerStream(
     request,
     env,
     params,
-    (appId) => `/v1/apps/${appId}/logs/stream`
+    (appId) =>
+      `/v1/apps/${appId}/logs/stream${
+        environmentId === ""
+          ? ""
+          : `?environmentId=${encodeURIComponent(environmentId)}`
+      }`
   );
+};
 
 /** App list snapshot poll cadence: change diffs push immediately, comment
  * heartbeats land well inside celld's ~60s idle-stream expiry. */
@@ -344,14 +353,23 @@ export const handleMetricsStream: RouteHandler = async (
   return sseResponse(stream);
 };
 
-/** Live deploy history proxy (see proxyRunnerStream). */
-export const handleDeploysStream: RouteHandler = (request, env, params) =>
-  proxyRunnerStream(
+/** Live deploy history proxy (see proxyRunnerStream). `?environmentId=`
+ * passes through so the feed can be scoped to one preview environment. */
+export const handleDeploysStream: RouteHandler = (request, env, params) => {
+  const environmentId =
+    new URL(request.url).searchParams.get("environmentId") ?? "";
+  return proxyRunnerStream(
     request,
     env,
     params,
-    (appId) => `/v1/apps/${appId}/deploys/stream`
+    (appId) =>
+      `/v1/apps/${appId}/deploys/stream${
+        environmentId === ""
+          ? ""
+          : `?environmentId=${encodeURIComponent(environmentId)}`
+      }`
   );
+};
 
 /** Live grouped-errors proxy (see proxyRunnerStream). `?status=` passes
  * through; the runner validates it. */

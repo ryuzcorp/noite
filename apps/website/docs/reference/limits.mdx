@@ -8,6 +8,9 @@ description: Quotas, fleet bounds, rate limits, and the scale-to-zero sleep mech
 | Knob | Default | Effect |
 | --- | --- | --- |
 | `RUNNER_MAX_APPS_PER_USER` | `10` | Per-account app quota, enforced in the runner on create — API keys cannot bypass it |
+| `RUNNER_MAX_ENVIRONMENTS_PER_APP` | `5` | [Preview environments](/apps/environments) per app, enforced at create |
+| `RUNNER_MAX_ENVIRONMENTS` | `25` | Preview environments per instance, enforced at create; each one is a celld fleet and one on-demand certificate |
+| `RUNNER_ENVIRONMENT_TTL_H` | `168` | Hours without a deploy before a workspace preview is swept (7 days); `0` disables the sweep |
 | `RUNNER_BUILD_MAX_MB` | `2048` | Builds refused past this worktree size (MiB) |
 | `RUNNER_BUILD_TIMEOUT_S` | `300` | Each install and build step is killed past this (seconds) |
 | `RUNNER_BUILD_CACHE_MB` | `512` | Per-app build cache cap (Bun, npm, pnpm, Yarn and their jup-managed releases); over it, whole caches are dropped, largest first; `0` disables |

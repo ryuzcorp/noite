@@ -19,24 +19,14 @@ export interface IntelFile {
   text: string;
 }
 
-/** `source.bundle` payload: the repo's own text sources at the browsing ref. */
+/** `source.bundle` payload: the repo's own text sources at the browsing ref.
+ * The lockfiles (`bun.lock`, `package-lock.json`, `pnpm-lock.yaml`,
+ * `yarn.lock`) ride along: the worker pins each package's declarations to the
+ * version they hold (`esm-types.ts`). */
 export interface IntelBundle {
   sha: string;
   files: IntelFile[];
   truncated: boolean;
-}
-
-/** `source.types` payload: declarations from the app's last successful build. */
-export interface IntelTypes {
-  sha: string | null;
-  files: IntelFile[];
-  truncated: boolean;
-}
-
-/** Both payloads, as the client's `sync`/`reset` take them. */
-export interface IntelSources {
-  bundle: IntelBundle;
-  types: IntelTypes;
 }
 
 /** Pierre position: 0-based line, 0-based character inside that line. */
@@ -88,7 +78,6 @@ export type IntelRequest =
       id: number;
       kind: "sync";
       bundle: IntelBundle;
-      types: IntelTypes;
       drafts: IntelFile[];
     }
   | { kind: "update"; path: string; text: string }
@@ -111,6 +100,16 @@ export type IntelReply = { id: number } & (
   | { ok: true; value: IntelResult }
   | { ok: false; error: string }
 );
+
+/** What the worker says without being asked: the declarations it fetched from
+ * esm.sh have landed, so the pane's diagnostics are worth re-running (they were
+ * answered before their imports existed). */
+export interface IntelEvent {
+  kind: "typesChanged";
+}
+
+/** Everything that crosses the wire worker → main thread. */
+export type IntelMessage = IntelEvent | IntelReply;
 
 /** Extensions the language service can work with (`.d.ts` included: the
  * browser opens declarations and still wants hover/definition there). */

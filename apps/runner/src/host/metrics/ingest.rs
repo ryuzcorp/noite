@@ -86,6 +86,10 @@ fn canonical_file_list_sql(globs: &str) -> String {
 ///    while every Parquet file is read once. Chunks are hour-aligned (whole
 ///    hours, then the partial current hour), which is what lets the writers
 ///    replace whole minute/span/hour buckets instead of accumulating them.
+///    A preview environment's files live under `envs/<slug>/<label>/` and are
+///    never named by a glob (`metrics::plan::telemetry_prefix`), so they
+///    cannot reach this query at all — Phase 1 makes env telemetry invisible,
+///    never mis-keyed onto the app (ROADMAP Phase 3 adds the env dimension).
 async fn ingest_all(cfg: &Config, bounds: &[(String, i64, i64)]) -> anyhow::Result<IngestRows> {
     let mut out = IngestRows {
         minutes: Vec::new(),

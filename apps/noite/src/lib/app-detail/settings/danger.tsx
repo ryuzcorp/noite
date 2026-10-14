@@ -43,17 +43,23 @@ const slugValidationMessage = (raw: string): string | null => {
   return null;
 };
 
-/** One Danger Zone row: what it does, and the button that does it. */
+/** One Danger Zone row: what it does, and the button that does it. `divided`
+ * rules it off from the row above (passed, not `first:`: a component's root
+ * sits in its own wrapper, so `first:` would match every row). */
 const DangerRow = ({
   action,
   children,
+  divided = false,
   title,
 }: {
   action: View;
   children: View;
+  divided?: boolean;
   title: string;
 }) => (
-  <div class="border-base-300 flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t pt-4 first:border-t-0 first:pt-0">
+  <div
+    class={`flex flex-wrap items-center justify-between gap-x-4 gap-y-2 ${divided ? "border-base-300 border-t pt-4" : ""}`}
+  >
     <div class="min-w-0">
       <p class="m-0 text-sm font-medium">{title}</p>
       <p class="m-0 text-sm opacity-80">{children}</p>
@@ -146,6 +152,7 @@ export const AppDangerZone = ({
         app URL and the git remote.
       </DangerRow>
       <DangerRow
+        divided
         title="Delete app"
         action={
           <button

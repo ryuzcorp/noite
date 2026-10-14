@@ -75,3 +75,16 @@ export const appUrl = (subdomain: string): string => {
   const host = appHost(subdomain);
   return port ? `http://${host}:${port}` : `https://${host}`;
 };
+
+/** Reachable host of one of an app's environments on the current page's
+ * network: `<label>.<app host>`, so it follows `appHost`'s rebasing. */
+export const environmentHost = (subdomain: string, label: string): string =>
+  `${label}.${appHost(subdomain)}`;
+
+/** Live environment URL on the current host (the same scheme/port rule as
+ * `appUrl`). */
+export const environmentUrl = (subdomain: string, label: string): string => {
+  const { port } = window.location;
+  const host = environmentHost(subdomain, label);
+  return port ? `http://${host}:${port}` : `https://${host}`;
+};

@@ -5,6 +5,10 @@ import {
   attachesTo,
   buildTimeline,
   groupLineComments,
+  isLargeDiff,
+  LARGE_DIFF_BYTES,
+  LARGE_DIFF_LINES,
+  latestReviews,
   lineAnchor,
   splitPatchFiles,
   threadsForPath,
@@ -184,6 +188,41 @@ describe("splitPatchFiles", () => {
     const single = "diff --git a/only.ts b/only.ts\n+++ b/only.ts\n";
     expect(splitPatchFiles(single)).toHaveLength(1);
     expect(splitPatchFiles("")).toEqual([]);
+  });
+});
+
+describe("latestReviews", () => {
+  test("keeps one review per reviewer, newest wins, ties by id", () => {
+    const reviews = [
+      review({ createdAt: "2026-01-01T00:00:00Z", id: "r1", reviewerId: "a" }),
+      review({ createdAt: "2026-01-02T00:00:00Z", id: "r2", reviewerId: "a" }),
+      review({ createdAt: "2026-01-01T00:00:00Z", id: "r3", reviewerId: "b" }),
+      // Same stamp as r2: the higher id wins.
+      review({
+        createdAt: "2026-01-02T00:00:00Z",
+        id: "r4",
+        reviewerId: "a",
+        state: "changes_requested",
+      }),
+    ];
+    const latest = latestReviews(reviews);
+    expect(latest.map((entry) => entry.id).toSorted()).toEqual(["r3", "r4"]);
+    expect(latest.find((entry) => entry.reviewerId === "a")?.state).toBe(
+      "changes_requested"
+    );
+  });
+});
+
+describe("isLargeDiff", () => {
+  test("collapses over the line or patch-size threshold only", () => {
+    expect(isLargeDiff("diff", 10, 20)).toBe(false);
+    expect(isLargeDiff("diff", LARGE_DIFF_LINES + 1, 0)).toBe(true);
+    expect(isLargeDiff("diff", 0, LARGE_DIFF_LINES)).toBe(false);
+    // Binary/absent stats fall back to the patch text length.
+    expect(isLargeDiff("x".repeat(LARGE_DIFF_BYTES + 1), null, null)).toBe(
+      true
+    );
+    expect(isLargeDiff("x".repeat(LARGE_DIFF_BYTES), null, null)).toBe(false);
   });
 });
 

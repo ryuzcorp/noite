@@ -2,13 +2,11 @@
 //! The browser globals the pod frame's own code reaches for, faked for tests.
 //!
 //! The frame always runs in a real document, but `bun test` has no DOM, and
-//! two things the frame does touch it: the SDK's `attach` (it creates its
+//! one thing the frame does touches it: the SDK's `attach` (it creates its
 //! `Terminal`, loads the fit addon, opens it on an element, listens for window
-//! resizes, and fits on the next frame) and Nodepod's preview launch (it
-//! debounces restarts on `window.setTimeout`). This module installs exactly
+//! resizes, and fits on the next frame). This module installs exactly
 //! that much — no layout, no events, nothing that could stand in for a real
-//! assertion — so the tap, the wiring and a preview start can be driven in a
-//! unit test.
+//! assertion — so the tap and the wiring can be driven in a unit test.
 
 /** One element as the frame's code uses it: a hidden host node, appended once
  * and removed on teardown. */

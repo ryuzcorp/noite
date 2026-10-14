@@ -9,9 +9,8 @@
 //! arrived in the meantime, so nothing slips between the two. Concurrent
 //! writes to one file resolve as last write wins.
 //!
-//! What never crosses: `node_modules` (each tab installs its own) and the
-//! preview's own directories — every tab runs its own preview, with its own
-//! binding state.
+//! What never crosses: `node_modules` (each tab installs its own) and
+//! everything outside the checkout — the pod's own runtime state.
 //!
 //! This module never imports the pod SDK (see `pod.ts`): the volume is the
 //! structural slice it needs, and mutations arrive already classified.
@@ -81,8 +80,13 @@ export interface TabSync {
    * `timeoutMs` when no tab answers (none is saving). */
   flushPeers: (timeoutMs: number) => Promise<void>;
   /** Called after peer mutations land; `structural` when a path came, went
-   * or moved (a plain rewrite of a file is not). */
-  onApplied: (notify: (structural: boolean) => void) => () => void;
+   * or moved (a plain rewrite of a file is not), and `paths` the
+   * checkout-relative paths that batch touched (a rename reports its
+   * destination). A tab holding unsaved edits to one of them has been
+   * overwritten by the peer. */
+  onApplied: (
+    notify: (structural: boolean, paths: readonly string[]) => void
+  ) => () => void;
   /** Answer the other tabs' flush requests: this tab saves the workspace. */
   serveFlush: (flush: () => Promise<void>) => void;
   /** Start sending this tab's mutations and applying the peers', the ones
@@ -224,7 +228,9 @@ export const syncTabs = (
   channel: SyncChannel,
   self: string = crypto.randomUUID()
 ): TabSync => {
-  const listeners = new Set<(structural: boolean) => void>();
+  const listeners = new Set<
+    (structural: boolean, paths: readonly string[]) => void
+  >();
   const pending: SyncOp[] = [];
   const flushWaiters = new Set<() => void>();
   let started = false;
@@ -241,16 +247,20 @@ export const syncTabs = (
 
   const applyAll = (ops: readonly SyncOp[]): void => {
     let structural = false;
+    // Deduped, in arrival order: a batch may touch one path more than once.
+    const changed = new Set<string>();
     applying = true;
     try {
       for (const op of ops) {
         structural = apply(volume, op) || structural;
+        changed.add(op.op === "rename" ? op.to : op.path);
       }
     } finally {
       applying = false;
     }
+    const paths = [...changed];
     for (const listener of listeners) {
-      listener(structural);
+      listener(structural, paths);
     }
   };
 

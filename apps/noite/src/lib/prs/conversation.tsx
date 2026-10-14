@@ -62,7 +62,7 @@ const PrDescription = ({
       >
         <input
           class="input w-full"
-          aria-label="Pull title"
+          aria-label="Pull request title"
           value={title()}
           oninput={(event) => {
             title.set(event.currentTarget.value);
@@ -71,7 +71,7 @@ const PrDescription = ({
         <textarea
           class="textarea w-full"
           rows={6}
-          aria-label="Pull description"
+          aria-label="Pull request description"
           value={body()}
           oninput={(event) => {
             body.set(event.currentTarget.value);
@@ -110,7 +110,7 @@ const PrDescription = ({
     <div class="border-base-300 flex flex-col gap-2 rounded-lg border p-3">
       <div class="flex items-center justify-between gap-2">
         <span class="text-sm font-medium">
-          {nameFor(names, pullRequest.authorId)} opened this pull
+          {nameFor(names, pullRequest.authorId)} opened this pull request
         </span>
         {canEdit ? (
           <button
@@ -151,6 +151,7 @@ export const PrConversationTab = ({
   const { pullRequest } = detail;
   const canEdit =
     role === "admin" || (viewerId !== "" && pullRequest.authorId === viewerId);
+  const canComment = role === "push" || role === "admin";
   const timeline = buildTimeline(detail.comments, detail.reviews);
   return (
     <div class="flex flex-col gap-4">
@@ -175,7 +176,13 @@ export const PrConversationTab = ({
           <ReviewCard key={entry.id} names={names} review={entry.review} />
         )
       )}
-      <CommentComposer appId={appId} number={pullRequest.number} />
+      {canComment ? (
+        <CommentComposer appId={appId} number={pullRequest.number} />
+      ) : (
+        <p class="text-base-content/70 m-0 text-sm">
+          You need push access to comment.
+        </p>
+      )}
     </div>
   );
 };

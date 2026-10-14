@@ -1,5 +1,5 @@
 //! The pod frame's entry: the document the control UI opens on the app's
-//! preview origin, holding the whole pod.
+//! pod host origin, holding the whole pod.
 //!
 //! This file is the frame's front door and nothing else. It reads what the
 //! frame was opened for off its own URL, answers the handshake of the one
@@ -9,7 +9,7 @@
 //! Why the pod lives here: Nodepod shares one `MemoryVolume` with its workers
 //! through a `SharedArrayBuffer`, and an agent cluster is keyed by origin, so a
 //! worker on another origin cannot receive it. A worker takes the origin of the
-//! document that creates it, so this document — on the app's preview host,
+//! document that creates it, so this document — on the app's pod host,
 //! which holds none of the control UI's authority — is the only place the
 //! workspace's own code may execute. There is no fallback: a frame that is not
 //! cross-origin isolated, or was not opened the way the control opens it, does
@@ -17,8 +17,6 @@
 
 import { POD_PROTOCOL_VERSION } from "../lib/source/pod-protocol";
 import type { PodReady } from "../lib/source/pod-protocol";
-import { planPreview } from "../lib/source/preview/plan";
-import { startPreview } from "../lib/source/preview/start";
 import { frameAddress, handshakeMessage } from "./handshake";
 import type { PodAddress } from "./handshake";
 import { createPodServer } from "./rpc-server";
@@ -70,10 +68,7 @@ const serve = (address: PodAddress): void => {
     server = createPodServer({
       appId,
       branch,
-      origin: window.location.origin,
-      plan: planPreview,
       port: message.port,
-      start: startPreview,
     });
   };
 

@@ -1,13 +1,13 @@
 //! The wire contract between the control UI and the pod frame: the types of
 //! every message that crosses between this page and the document that holds
-//! the pod, on the app's preview origin. Both bundles compile this file, so it
+//! the pod, on the app's pod host origin. Both bundles compile this file, so it
 //! imports nothing that runs — only the vocabulary the two sides already
 //! share — and it is frozen before either side is written.
 //!
-//! Why a protocol at all: the pod is the workspace's whole filesystem, the
-//! place every command runs and the origin of every preview URL, so it belongs
-//! to the app's preview origin and never to the control UI's own. A worker
-//! takes the origin of the document that creates it, and Nodepod shares one
+//! Why a protocol at all: the pod is the workspace's whole filesystem and the
+//! place every command runs, so it belongs to the app's pod host origin and
+//! never to the control UI's own. A worker takes the origin of the document
+//! that creates it, and Nodepod shares one
 //! `MemoryVolume` with its workers through a `SharedArrayBuffer` — which an
 //! agent cluster is keyed by origin for, so nothing about the pod can be built
 //! on the control page and moved. The whole pod lives in the frame
@@ -16,9 +16,9 @@
 //! # Transport
 //!
 //! 1. The page frames
-//!    `<previewOrigin>/noite-pod-host.html?parentOrigin=<this origin>&appId=&branch=&nonce=`
+//!    `<podHostOrigin>/noite-pod-host.html?parentOrigin=<this origin>&appId=&branch=&nonce=`
 //!    with `allow="cross-origin-isolated"`, then posts `PodHello` (the nonce
-//!    it minted) to the frame's window, targeted at the preview origin.
+//!    it minted) to the frame's window, targeted at the pod host origin.
 //! 2. The frame accepts a `hello` only from `parentOrigin` (both window and
 //!    script are the parent's, so it checks `event.source === window.parent`)
 //!    with the nonce it read from its own URL, answers `PodReady`, and refuses
@@ -28,11 +28,11 @@
 //!    `PodConnect` with `port2` transferred. From then on, everything is on
 //!    that port.
 //!
-//! The nonce is the capability: a document that shares the preview origin (the
-//! app's own preview, which *is* same-origin with the frame) can post to the
-//! frame's window, but it cannot know a nonce minted after the frame was
-//! opened and never written anywhere the frame's origin can read. Nothing else
-//! about the frame is a secret — the app owns the origin.
+//! The nonce is the capability: a document on the pod host origin — the pod's
+//! own virtual servers included — can post to the frame's window, but it
+//! cannot know a nonce minted after the frame was opened and never written
+//! anywhere the frame's origin can read. Nothing else about the frame is a
+//! secret — the pod owns the origin.
 //!
 //! # Shape
 //!
@@ -48,18 +48,14 @@
 //! `archive` is the frame's *only* ask. There is no reverse `commit`: the frame
 //! builds a push payload (`push.prepare`) and this page commits it from the
 //! user's Push click, with its own session cookies (`push.settle` says how that
-//! went). The app's preview document shares the frame's origin and can reach
-//! the frame's globals, so a frame able to ask for a commit would be an app
-//! able to commit through the viewer's session. Likewise the `archive` answer
+//! went). App-controlled code served on this origin (the pod's own servers)
+//! shares the frame's origin and can reach the frame's globals, so a frame
+//! able to ask for a commit would be code able to commit through the viewer's
+//! session. Likewise the `archive` answer
 //! is only ever sent while an `open` request is in flight, so a compromised
 //! frame cannot use this page as a general fetch proxy.
 
 import type { TreeEntry } from "../runner";
-import type {
-  PreviewLogStream,
-  PreviewPlan,
-  PreviewState,
-} from "./preview/types";
 import type {
   CheckoutListing,
   PushPayload,
@@ -77,11 +73,6 @@ export type {
   WorkspacePush,
   WorkspaceStat,
 } from "./workspace/types";
-export type {
-  PreviewLogStream,
-  PreviewPlan,
-  PreviewState,
-} from "./preview/types";
 
 /** The protocol revision both ends speak. A `hello`/`ready` whose `v` is not
  * this one is refused rather than guessed at. */
@@ -143,11 +134,6 @@ export interface PodRequestMap {
   /** How the page's commit went: `sha` settles the pod on the commit, and a
    * failure leaves it exactly as it was (the Push panel shows the error). */
   "push.settle": { p: PushSettleParams; r: undefined };
-  "preview.open": { p: undefined; r: PodPreviewView };
-  "preview.close": { p: undefined; r: PodPreviewView };
-  "preview.restart": { p: undefined; r: PodPreviewView };
-  "preview.stop": { p: undefined; r: PodPreviewView };
-  "preview.view": { p: undefined; r: PodPreviewView };
   "terminal.open": {
     p: { cols: number; rows: number };
     r: { sessionId: number };
@@ -166,16 +152,17 @@ export interface PodEventMap {
   /** A path under a watch was touched. */
   "fs.event": PodFsEvent;
   /** Another tab's edits landed in this pod (see `tab-sync.ts`); `structural`
-   * when a path came, went or moved, which the tree's rows have to follow. */
-  peer: { structural: boolean };
+   * when a path came, went or moved, which the tree's rows have to follow, and
+   * `paths` the checkout-relative paths that batch touched (a rename reports
+   * its destination). A page holding unsaved edits to one of them has been
+   * overwritten by the peer. */
+  peer: { paths: readonly string[]; structural: boolean };
   /** The pod's saved copy could not be written: what the page shows is not
    * being kept (the pod keeps retrying on its own). */
   saveError: { message: string };
-  /** Everything the shell writes: the prompt, the echo, output, the preview's
-   * foreground job. Batched by the frame, flushed once per frame by the page. */
+  /** Everything the shell writes: the prompt, the echo, output. Batched by
+   * the frame, flushed once per frame by the page. */
   "terminal.write": { data: string };
-  "preview.state": PodPreviewStateEvent;
-  "preview.log": { stream: PreviewLogStream; text: string };
   /** An error the frame cannot recover from: the page shows it and tears the
    * workspace down. */
   fatal: { message: string };
@@ -249,35 +236,6 @@ export interface PodFsEvent {
   event: string;
   filename: string | null;
   watchId: number;
-}
-
-/** The preview's state without its log: what the panel draws above the log,
- * and what a `preview.state` event carries. */
-export interface PodPreviewStateEvent {
-  /** What the preview is doing — the detail `onState` last reported. */
-  detail: string;
-  /** The failure verbatim: a start that threw, or a restart that did. */
-  error: string;
-  plan: PreviewPlan | null;
-  /** The preview's live child processes, oldest first — what the terminal's
-   * `preview` command reads. */
-  processes: string[];
-  state: PreviewState | "idle";
-  /** The running preview's URL: what the panel's iframe loads. */
-  url: string;
-}
-
-/** The whole view, log included: what the page's `preview.view` (and every
- * other preview request) answers with, so a panel that mounts late draws the
- * same thing as one that watched. */
-export interface PodPreviewView extends PodPreviewStateEvent {
-  logs: PodPreviewLog[];
-}
-
-/** One line the preview printed. */
-export interface PodPreviewLog {
-  stream: PreviewLogStream;
-  text: string;
 }
 
 /** One request: an id the answer reuses, its kind, and the kind's params. */

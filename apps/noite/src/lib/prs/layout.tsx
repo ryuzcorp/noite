@@ -1,50 +1,58 @@
-/** The pulls pages' frame (`/apps/[id]/pulls…`, beside App and Code in the
- * sidebar) and the open-pull count the sidebar and the list title show. */
+/** The pull-request pages' frame (`/apps/[id]/pulls…`, beside App and Code in
+ * the sidebar) and the open count the sidebar shows. */
 import type { View } from "ilha";
 
+import { DetailShell } from "../app-detail/shell";
 import { ArrowLeft } from "../ui/icons";
 import { prList } from "./resources";
 
-/** The open-pull count: hidden at zero unless `showZero` (the list title,
- * once the list has loaded). Its own component, so the list request landing
- * re-renders only the badge, never the page or sidebar around it. */
+/** The open-pull count, hidden at zero. Its own component, so the list
+ * request landing re-renders only the badge, never the sidebar around it. */
 export const OpenPrBadge = ({
   appId,
   class: extra = "",
-  showZero = false,
 }: {
   appId: string;
   class?: string;
-  showZero?: boolean;
 }) => {
   const open = prList(appId, "open").data()?.counts.open;
-  if (open === undefined || (open === 0 && !showZero)) {
+  if (open === undefined || open === 0) {
     return null;
   }
   return <span class={`badge badge-sm tabular-nums ${extra}`}>{open}</span>;
 };
 
-/** One pulls page. `back` set: a pull or the new-pull form, which link back
- * to the list. */
+/** One pulls page, on the detail layout the app pages use: `header` stays put
+ * above the scrolling body. `back` set: a pull or the new-pull form, which
+ * link back to the list. */
 export const PullsPage = ({
   appId,
   back = false,
   children,
+  header = null,
 }: {
   appId: string;
   back?: boolean;
   children: View;
+  header?: View | null;
 }) => (
-  <div class="mx-auto flex w-full max-w-6xl flex-col gap-4 px-4 pt-4 pb-12">
-    {back ? (
-      <a
-        href={`/apps/${appId}/pulls`}
-        class="link link-hover inline-flex w-fit items-center gap-1 text-sm opacity-70"
-      >
-        <ArrowLeft class="h-4 w-4" />
-        Pulls
-      </a>
-    ) : null}
+  <DetailShell
+    header={
+      <>
+        {back ? (
+          <a
+            href={`/apps/${appId}/pulls`}
+            class="link link-hover inline-flex w-fit items-center gap-1 text-sm opacity-70"
+          >
+            <ArrowLeft class="h-4 w-4" />
+            Pull requests
+          </a>
+        ) : null}
+        {header}
+      </>
+    }
+    panel={null}
+  >
     {children}
-  </div>
+  </DetailShell>
 );

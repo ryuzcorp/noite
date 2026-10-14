@@ -1,26 +1,25 @@
 //! The control page's side of the pod frame: the handshake that opens it, the
 //! `MessageChannel` it is bound with, and the RPC that runs over that port.
 //!
-//! The frame is a document on the app's preview origin (`POD_HOST_HTML_PATH`),
-//! and the *whole* pod — Nodepod, its workers, the preview's servers, the
-//! shell — lives in it. Nothing app-controlled therefore runs in this page's
-//! agent cluster, and nothing here touches the pod except through the protocol
-//! in `./pod-protocol`.
+//! The frame is a document on the app's pod host (`POD_HOST_HTML_PATH`),
+//! and the *whole* pod — Nodepod, its workers, the shell — lives in it. Nothing
+//! app-controlled therefore runs in this page's agent cluster, and nothing here
+//! touches the pod except through the protocol in `./pod-protocol`.
 //!
 //! The handshake is the only place an origin is checked: the frame is opened
 //! with `allow="cross-origin-isolated"` (a permissions-policy feature whose
 //! default allowlist is `self`), this page posts `hello` carrying a nonce it
-//! minted, and only a `ready` that echoes that nonce — from the preview origin
+//! minted, and only a `ready` that echoes that nonce — from the pod host origin
 //! and the frame's own window, and carrying a cross-origin-isolated agent
 //! cluster — gets `port2` transferred to it. The nonce is the capability:
-//! another document on the preview origin (the app's own preview, which *is*
+//! another document on the pod host origin (the pod's own servers, which *are*
 //! same-origin with the frame) can post to the frame's window but cannot know
 //! the nonce, so it can never bind the port. Everything after that is inside
 //! the port, which no other document can reach.
 //!
 //! A frame that never answers is loaded again every `HANDSHAKE_RETRY_MS` (a
 //! refused response leaves an error page that will never answer) until the
-//! `HANDSHAKE_TIMEOUT_MS` deadline — a new app's preview host only starts
+//! `HANDSHAKE_TIMEOUT_MS` deadline — a new app's pod host only starts
 //! answering once the edge has picked the app up.
 
 import { NO_POD_HOST_MESSAGE, POD_HOST_HTML_PATH } from "../preview-host";
@@ -42,7 +41,7 @@ const HANDSHAKE_TIMEOUT_MS = 30_000;
 const HANDSHAKE_RETRY_MS = 2000;
 
 /** How long an ordinary request may wait for its answer. The few requests
- * whose work is minutes long (`open`, the preview's `open`/`restart`) pass
+ * whose work is minutes long (`open`) pass
  * `0`: their progress arrives as events, and a deadline over an install would
  * fail work that is going fine. */
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -99,7 +98,7 @@ export interface PodFrameOptions {
   onAsk: PodAskHandler;
   /** The unrecoverable failure the frame reported; the page says so. */
   onFatal?: (message: string) => void;
-  /** The app's preview origin — the one origin the frame may live on. */
+  /** The app's pod host origin — the one origin the frame may live on. */
   previewOrigin: string;
 }
 
@@ -436,7 +435,7 @@ export const openPodFrame = async (
   const nonce = crypto.randomUUID();
   const frame = document.createElement("iframe");
   // Hidden, not sandboxed: a sandboxed frame has an opaque origin, and this
-  // frame's origin — the app's preview host, never this page's — is the whole
+  // frame's origin — the app's pod host, never this page's — is the whole
   // point. `cross-origin-isolated` is the permissions-policy its agent cluster
   // needs for `SharedArrayBuffer`: without it neither the frame nor its
   // workers get one, whatever headers the response carries.
@@ -465,7 +464,7 @@ export const openPodFrame = async (
   };
   const onWindowMessage = (event: MessageEvent): void => {
     // Both the origin and the source window are checked: another document on
-    // the preview origin may post to the frame, but only the frame's own
+    // the pod host origin may post to the frame, but only the frame's own
     // window can post to this page as the frame.
     if (event.origin !== previewOrigin || event.source !== frameWindow()) {
       return;
@@ -485,7 +484,7 @@ export const openPodFrame = async (
   const onFrameLoad = (): void => {
     // The first `hello` that can land: until the frame's document commits, its
     // window is still the initial `about:blank`, which inherits *this* page's
-    // origin and drops a message targeted at the preview origin. The frame
+    // origin and drops a message targeted at the pod host origin. The frame
     // also answers its handshake unsolicited, so this is a second ask —
     // repeated on every load, including the retry's own reload.
     hello();

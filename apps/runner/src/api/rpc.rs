@@ -67,6 +67,9 @@ fn complete<T: serde::Serialize>(id: Id, result: Result<T, ApiError>) -> JsonRpc
     match result {
         Ok(value) => JsonRpcResponse::success(id, value),
         Err(ApiError::BadRequest(message)) => bad(&id, &message),
+        Err(ApiError::Forbidden(message)) => {
+            rpc_err(id, JsonRpcErrorReason::ApplicationError(403), message)
+        }
         Err(ApiError::NotFound(message)) => not_found(&id, &message),
         Err(ApiError::Conflict(message)) => conflict(&id, message),
         Err(ApiError::TooLarge(message)) => {
@@ -144,6 +147,59 @@ async fn dispatch(state: &AppState, raw: serde_json::Value) -> JsonRpcResponse {
 #[derive(Deserialize)]
 struct IdParams {
     id: String,
+}
+
+/// `environments.*`: the app id plus the environment id (the service refuses a
+/// pair whose rows do not match).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvIdParams {
+    id: String,
+    env_id: String,
+    #[serde(default)]
+    role: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateEnvironmentParams {
+    id: String,
+    branch: String,
+    #[serde(default)]
+    actor: Option<Actor>,
+    #[serde(default)]
+    role: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateEnvironmentParams {
+    id: String,
+    env_id: String,
+    public: bool,
+    #[serde(default)]
+    role: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentVarParams {
+    id: String,
+    env_id: String,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvGrantParams {
+    id: String,
+    env_id: String,
+    user_id: String,
 }
 
 /// Params for the few methods whose RPC shape is not just `{id, ...}`.
@@ -566,6 +622,137 @@ async fn dispatch_call(
                     .map(|()| json!({ "ok": true })),
             )
         }
+        "environments.list" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: String,
+                #[serde(default)]
+                role: Option<String>,
+            }
+            let p: P = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::environments::list(state, &p.id, p.role.as_deref()).await,
+            )
+        }
+        "environments.create" => {
+            let p: CreateEnvironmentParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::environments::create(
+                    state,
+                    &p.id,
+                    &p.branch,
+                    p.actor.as_ref(),
+                    p.role.as_deref(),
+                )
+                .await,
+            )
+        }
+        "environments.delete" => {
+            let p: EnvIdParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::environments::delete(state, &p.id, &p.env_id, p.role.as_deref())
+                    .await
+                    .map(|()| json!({ "ok": true })),
+            )
+        }
+        "environments.update" => {
+            let p: UpdateEnvironmentParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::environments::update(state, &p.id, &p.env_id, p.public, p.role.as_deref())
+                    .await,
+            )
+        }
+        "environments.deploy" => {
+            let p: EnvIdParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::environments::deploy(state, &p.id, &p.env_id, p.role.as_deref())
+                    .await
+                    .map(|(deploy_id, sha)| json!({ "deployId": deploy_id, "sha": sha })),
+            )
+        }
+        "environments.vars.get" => {
+            let p: EnvIdParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::environments::vars(state, &p.id, &p.env_id, p.role.as_deref()).await,
+            )
+        }
+        "environments.vars.set" => {
+            let p: EnvironmentVarParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let (Some(name), Some(value)) = (p.name.as_deref(), p.value.as_deref()) else {
+                return bad(&id, "name and value are required");
+            };
+            complete(
+                id,
+                service::environments::vars_set(
+                    state,
+                    &p.id,
+                    &p.env_id,
+                    name,
+                    value,
+                    p.role.as_deref(),
+                )
+                .await
+                .map(|name| json!({ "ok": true, "name": name })),
+            )
+        }
+        "environments.vars.delete" => {
+            let p: EnvironmentVarParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let Some(name) = p.name.as_deref() else {
+                return bad(&id, "name is required");
+            };
+            complete(
+                id,
+                service::environments::vars_delete(
+                    state,
+                    &p.id,
+                    &p.env_id,
+                    name,
+                    p.role.as_deref(),
+                )
+                .await
+                .map(|()| json!({ "ok": true })),
+            )
+        }
+        "environments.grant" => {
+            let p: EnvGrantParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::env_gate::grant(state, &p.id, &p.env_id, &p.user_id).await,
+            )
+        }
         "domains.list" => {
             let p: IdParams = match parse(params, &id) {
                 Ok(p) => p,
@@ -635,11 +822,21 @@ async fn dispatch_call(
             )
         }
         "deploys.list" => {
-            let p: IdParams = match parse(params, &id) {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                id: String,
+                #[serde(default)]
+                environment_id: Option<String>,
+            }
+            let p: P = match parse(params, &id) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            complete(id, service::deploys::list(state, &p.id).await)
+            complete(
+                id,
+                service::deploys::list(state, &p.id, p.environment_id.as_deref()).await,
+            )
         }
         "deploys.log" => {
             let p: DeployLogParams = match parse(params, &id) {
@@ -766,13 +963,6 @@ async fn dispatch_call(
                 service::source::blob(state, &p.id, &p.path, p.reference.as_deref()).await,
             )
         }
-        "source.types" => {
-            let p: IdParams = match parse(params, &id) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            complete(id, service::source::types(state, &p.id).await)
-        }
         "source.commit" => {
             let p: CommitParams = match parse(params, &id) {
                 Ok(p) => p,
@@ -783,6 +973,16 @@ async fn dispatch_call(
                 service::source::commit(state, &p.id, &p.body)
                     .await
                     .map(|sha| json!({ "sha": sha })),
+            )
+        }
+        "source.preview" => {
+            let p: CommitParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::environments::preview(state, &p.id, &p.body).await,
             )
         }
         "prs.list" => {
@@ -962,11 +1162,21 @@ async fn dispatch_call(
             complete(id, service::observe::spans(state, &p.id, p.hours).await)
         }
         "logs.get" => {
-            let p: IdParams = match parse(params, &id) {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                id: String,
+                #[serde(default)]
+                environment_id: Option<String>,
+            }
+            let p: P = match parse(params, &id) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            complete(id, service::observe::logs_lines(state, &p.id).await)
+            complete(
+                id,
+                service::observe::logs_lines(state, &p.id, p.environment_id.as_deref()).await,
+            )
         }
         "events.list" => {
             #[derive(Deserialize)]

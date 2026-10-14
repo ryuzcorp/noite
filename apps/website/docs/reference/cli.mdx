@@ -54,3 +54,23 @@ In Actions it writes `url=` + `sha=` to `$GITHUB_OUTPUT` for downstream steps, a
 - `--comment off`: no comment.
 
 Commenting soft-fails: missing `gh`, missing token, or no PR number only warns — the deploy already succeeded.
+
+## Environments
+
+`noite environments` manages an app's [preview environments](/apps/environments) — list, create, delete, redeploy, public toggle and variable overrides:
+
+```bash
+noite environments list --slug my-app
+noite environments create --slug my-app --branch feature-x
+noite environments deploy staging --slug my-app
+noite environments public staging on --slug my-app      # or `off`
+noite environments vars get staging --slug my-app
+noite environments vars set staging API_URL https://api.example.com --slug my-app
+noite environments delete staging --slug my-app
+```
+
+An environment is named by its **label** (e.g. `staging`) or its id. The app is resolved from `--slug`/`NOITE_SLUG`/the repo name, and the API key from `--token`/`NOITE_API_KEY` — the same profile key `deploy` uses, which needs `view` to read, `push` to create, redeploy or set overrides, and `admin` to delete or toggle public.
+
+These commands do not use Git: they talk to the control UI's MCP endpoint ([Agents](/reference/mcp)), so they need the control UI's **origin** rather than the git base. `--app-url`/`NOITE_APP_URL` names it; without either it is derived from `--url`: `https://git.<domain>` → `https://app.<domain>`, and the bare base on a localhost install (`http://git.noite.localhost:9080` → `http://noite.localhost:9080`, where control runs).
+
+The same flags (`--slug`, `--token`, `--url`, `--app-url`) apply to every subcommand. Nothing is written to `$GITHUB_OUTPUT`, and no PR comment is posted: these are interactive commands, not the deploy step.

@@ -1,6 +1,7 @@
 import { Effect } from "effect";
 import { Command, Flag } from "effect/cli";
 
+import { connection } from "./config.js";
 import {
   commentPr,
   parseCommentMode,
@@ -8,27 +9,6 @@ import {
   writeOutputs,
 } from "./gh.js";
 import { pushTree } from "./git.js";
-
-/** Lowercase slug-safe. Mirrors the server's naming rule loosely; the
- * runner is the final arbiter (unknown slugs 404 at auth). */
-const sanitizeSlug = (raw: string): string =>
-  raw
-    .toLowerCase()
-    .replaceAll(/[^a-z0-9-]+/gu, "-")
-    .replaceAll(/^-+|-+$/gu, "")
-    .slice(0, 63);
-
-/** Resolve the deploy slug from --slug/NOITE_SLUG or the repo name. */
-const resolveSlug = (flag: string, repo: string | null): string => {
-  const direct = sanitizeSlug(flag);
-  if (direct !== "") {
-    return direct;
-  }
-  if (repo === null) {
-    return "";
-  }
-  return sanitizeSlug(repo.split("/")[1] ?? "");
-};
 
 /** Default deploy message from the action sha or a timestamp. */
 const defaultMessage = (sha: string | null): string =>
@@ -104,38 +84,14 @@ export const deploy = Command.make(
         return yield* Effect.fail("--comment must be update, create, or off");
       }
       const ctx = yield* readActionContext();
-      const { env } = process;
-
-      const resolvedSlug = resolveSlug(
-        config.slug === "" ? (env.NOITE_SLUG ?? "") : config.slug,
-        ctx.repo
-      );
-      if (resolvedSlug === "") {
-        return yield* Effect.fail(
-          "slug required: --slug, NOITE_SLUG, or GITHUB_REPOSITORY"
-        );
-      }
+      const conn = yield* connection(config, ctx.repo);
+      const resolvedSlug = conn.slug;
       if (["app", "api", "git"].includes(resolvedSlug)) {
         return yield* Effect.fail(
           `slug ${resolvedSlug} is reserved (app/api/git)`
         );
       }
-      const token =
-        config.token === ""
-          ? (env.NOITE_API_KEY ?? env.NOITE_GIT_TOKEN ?? "")
-          : config.token;
-      if (token === "") {
-        return yield* Effect.fail(
-          "API key required: --token or NOITE_API_KEY (Account → API keys)"
-        );
-      }
-      const gitBase = (
-        config.url === ""
-          ? (env.GIT_PUBLIC_BASE ??
-            env.NOITE_BASE ??
-            "http://git.noite.localhost:9080")
-          : config.url
-      ).replace(/\/+$/u, "");
+      const { gitBase, token } = conn;
       const remoteUrl = remoteUrlOf(gitBase, resolvedSlug, token);
       if (remoteUrl === null) {
         return yield* Effect.fail(`git base URL is malformed: ${gitBase}`);

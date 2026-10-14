@@ -365,6 +365,19 @@ pub struct Config {
     /// Per-account app quota. Every app is its own celld fleet, so this is the
     /// knob that bounds how much of the host one account can claim.
     pub max_apps_per_user: u32,
+    /// Preview environments one app may have at once
+    /// (`RUNNER_MAX_ENVIRONMENTS_PER_APP`, 5 — ROADMAP). Each environment is
+    /// its own celld process against the container-wide memory budget.
+    pub max_environments_per_app: u32,
+    /// Preview environments the whole install may have at once
+    /// (`RUNNER_MAX_ENVIRONMENTS`, 25). The per-app cap bounds one busy app;
+    /// this bounds the host, which is what keeps a crowd of previews from
+    /// shedding production (SPEC, Limits).
+    pub max_environments: u32,
+    /// Hours a workspace preview lives without a deploy
+    /// (`RUNNER_ENVIRONMENT_TTL_H`, 168 = 7 days — ROADMAP); 0 disables the
+    /// expiry sweep.
+    pub environment_ttl_h: u64,
     /// celld's shedding threshold in MiB (`CELLD_MAX_RSS_MB`); 0 leaves
     /// celld's default, 80% of the container's memory. celld compares it with
     /// the greater of its own RSS and the cgroup's working set, and every
@@ -518,6 +531,15 @@ impl Config {
             max_apps_per_user: env_or(&["RUNNER_MAX_APPS_PER_USER"], "10")
                 .parse()
                 .unwrap_or(10),
+            max_environments_per_app: env_or(&["RUNNER_MAX_ENVIRONMENTS_PER_APP"], "5")
+                .parse()
+                .unwrap_or(5),
+            max_environments: env_or(&["RUNNER_MAX_ENVIRONMENTS"], "25")
+                .parse()
+                .unwrap_or(25),
+            environment_ttl_h: env_or(&["RUNNER_ENVIRONMENT_TTL_H"], "168")
+                .parse()
+                .unwrap_or(168),
             fleet_max_rss_mb: env_or(&["RUNNER_FLEET_MAX_RSS_MB"], "0")
                 .parse()
                 .unwrap_or(0),
@@ -743,6 +765,19 @@ impl Config {
         format!("s3://{}/fleets/{slug}", self.s3_bucket)
     }
 
+    /// celld bucket URI of one preview environment:
+    /// `s3://{bucket}/envs/{slug}/{label}` (ROADMAP: a sibling prefix, never
+    /// `fleets/{slug}--{label}` — a slug may itself contain `--`).
+    pub fn envs_uri(&self, slug: &str, label: &str) -> String {
+        format!("s3://{}/envs/{slug}/{label}", self.s3_bucket)
+    }
+
+    /// Every environment of one app, as an S3 prefix (`envs/{slug}/`): what
+    /// delete, purge and rename walk.
+    pub fn envs_prefix(&self, slug: &str) -> String {
+        format!("envs/{slug}/")
+    }
+
     /// DNS bases tenants are served under: the configured domain first, then
     /// every extra control hostname that is a DNS name (dev-host LAN name,
     /// Coolify domain). Bare IPs can't parent subdomains (`*.1.2.3.4` never
@@ -811,6 +846,9 @@ pub(crate) fn config_for_tests() -> Config {
         auto_https: false,
         fleet_log: "error,celld=warn".into(),
         max_apps_per_user: 10,
+        max_environments_per_app: 5,
+        max_environments: 25,
+        environment_ttl_h: 168,
         fleet_max_rss_mb: 0,
         fleet_idle_evict_s: 120,
         fleet_deploy_poll_s: 300,

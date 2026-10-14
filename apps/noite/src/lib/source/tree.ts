@@ -23,6 +23,7 @@ import {
   openTreeMenu,
   renameInput,
   sortTreePaths,
+  withoutSlash,
 } from "./tree-menu";
 import type { MenuTarget, Toaster, TreeMenu } from "./tree-menu";
 import { createTreeNaming } from "./tree-naming";
@@ -73,7 +74,9 @@ export interface TreeHost {
   syncOpen: () => Promise<void>;
   treeEl: HTMLElement;
   trees: TreesModule;
-  workspace: Workspace;
+  /** The checkout the rows read and write, as of now: a branch switch installs
+   * another one under this same tree (the rows are rebuilt from its listing). */
+  workspace: () => Workspace;
 }
 
 /** The tree wiring's surface for the browser. */
@@ -110,12 +113,28 @@ const markers = (changes: readonly WorkspaceChange[]): TreeStatusEntry[] =>
     status: STATUS[change.kind],
   }));
 
+/** The paths the checkout's rules exclude, as pierre paints them: its own
+ * `ignored` status, which dims the row — and a folder under it with it. */
+const ignoredMarkers = (listing: CheckoutListing): TreeStatusEntry[] => [
+  ...listing.ignoredDirs.map((dir) => ({
+    path: `${dir}/`,
+    status: "ignored" as const,
+  })),
+  ...listing.ignoredFiles.map((path) => ({
+    path,
+    status: "ignored" as const,
+  })),
+];
+
 /** The checkout as the tree's rows: `dir/` for a folder, the path itself for a
  * file. A folder the checkout holds no file under is a row of its own — the
- * only place such a folder shows. */
+ * only place such a folder shows — and so is a path the rules exclude, which
+ * the markers below paint dimmed. */
 const rowPaths = (listing: CheckoutListing): string[] => [
   ...listing.files,
+  ...listing.ignoredFiles,
   ...listing.dirs.map((dir) => `${dir}/`),
+  ...listing.ignoredDirs.map((dir) => `${dir}/`),
 ];
 
 export const createTreeWiring = (host: TreeHost): TreeWiring => {
@@ -123,6 +142,11 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
   /** The row paths pierre holds, as one set: pierre's store cannot be
    * enumerated, so the wiring keeps the same set beside it. */
   let held = new Set<string>();
+  /** The paths the checkout's rules exclude, as the tree paints them (dimmed —
+   * see `ignoredMarkers`) and as one set the row flows read. A listing replaces
+   * both, so they always describe the rows in the tree. */
+  let ignored: TreeStatusEntry[] = [];
+  let excluded = new Set<string>();
   /** The open context menu, torn down with the pane (it lives on
    * `document.body`, outside the panes ilha rebuilds). */
   let menu: TreeMenu | null = null;
@@ -163,11 +187,25 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     );
   };
 
-  /** Push the changes into the tree. A no-op while the set of changed paths is
-   * unchanged, so typing never repaints the tree. */
+  /** Take one listing's excluded paths as the tree's own: the dimmed markers,
+   * and the set the row flows ask about (`ignoredPath`). */
+  const holdIgnored = (listing: CheckoutListing) => {
+    ignored = ignoredMarkers(listing);
+    excluded = new Set([...listing.ignoredDirs, ...listing.ignoredFiles]);
+  };
+
+  /** Whether the checkout's rules exclude a row — a path git is not tracking,
+   * whatever the pod holds there. A delete does not count one as part of the
+   * repository, and nothing about it is ever pushed. */
+  const ignoredPath = (path: string): boolean =>
+    excluded.has(withoutSlash(path));
+
+  /** Push the changes into the tree: the markers of the derive, plus the paths
+   * the checkout's rules exclude, which pierre paints dimmed beside them. A
+   * no-op while neither set moved, so typing never repaints the tree. */
   let treeStatusKey = "";
   const syncStatus = () => {
-    const entries = markers(host.changes());
+    const entries = [...markers(host.changes()), ...ignored];
     const key = statusKey(entries);
     if (key === treeStatusKey) {
       return;
@@ -188,14 +226,32 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
    * placeholder is in no listing yet, and dropping it would kill the inline
    * input mid-name. A derive or a row pierre refuses is reported and leaves
    * the rows as they are. */
-  const resync = async (): Promise<void> => {
+  const syncRows = async (): Promise<void> => {
     try {
-      await host.workspace.refresh();
-      const next = rowPaths(await host.workspace.listing());
+      await host.workspace().refresh();
+      const listing = await host.workspace().listing();
+      holdIgnored(listing);
+      const next = rowPaths(listing);
       const wanted = new Set(next);
+      // Every folder the listing's rows sit under. A folder row the pod no
+      // longer names in its own right is not a row to drop while these hold it
+      // up: pierre refuses to remove a folder that still has children, and
+      // those children are exactly what implies the folder now — an empty or
+      // ignored folder that just gained a file is the usual way to get here.
+      const implied = new Set<string>();
+      for (const row of next) {
+        const parts = row.split("/");
+        for (let i = 1; i < parts.length; i += 1) {
+          implied.add(`${parts.slice(0, i).join("/")}/`);
+        }
+      }
       const pending = pendingPath === undefined ? undefined : pendingPath();
       for (const path of [...held].toSorted((a, b) => b.length - a.length)) {
-        if (!wanted.has(path) && path !== pending) {
+        if (
+          !wanted.has(path) &&
+          path !== pending &&
+          !(path.endsWith("/") && implied.has(path))
+        ) {
           dropRow(path);
         }
       }
@@ -214,6 +270,31 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     }
   };
 
+  /** The runs are one at a time, and the last ask wins: a gesture, the pod's
+   * own watcher and a `.gitignore` write all ask for one, and two listings
+   * landing out of order would put back a row the pod no longer holds (the
+   * empty-folder and ignored-folder rows are the ones nothing else implies).
+   * A caller that arrives mid-run is answered by the run after it. */
+  let syncing: Promise<void> | null = null;
+  let again = false;
+  const resync = async (): Promise<void> => {
+    if (syncing !== null) {
+      again = true;
+      await syncing;
+      return;
+    }
+    do {
+      again = false;
+      syncing = syncRows();
+      try {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- one run at a time is the point: a later listing must not overtake an earlier one.
+        await syncing;
+      } finally {
+        syncing = null;
+      }
+    } while (again);
+  };
+
   const flow = createTreeRows({
     aborted: host.aborted,
     changeAt,
@@ -221,6 +302,7 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     filesUnder,
     followMove: host.followMove,
     getCurrentPath: host.getCurrentPath,
+    ignoredPath,
     notify: (message) => {
       toaster.notify(message);
     },
@@ -342,9 +424,14 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
   };
 
   /** Right-click below the rows: pierre opens its menu on rows only, so the
-   * pane offers the same one for the tree's root there. */
+   * pane offers the same one for the tree's root there. A read-only checkout
+   * has no row actions at all, so the pane says why instead of doing nothing. */
   const onTreeContextMenu = (event: MouseEvent) => {
-    if (!host.editable() || isTreeRow(event)) {
+    if (!host.editable()) {
+      toaster.notify("This checkout is read-only.");
+      return;
+    }
+    if (isTreeRow(event)) {
       return;
     }
     event.preventDefault();
@@ -398,9 +485,10 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
   });
 
   /** Build the file tree from the checkout: one row per file and per empty
-   * folder, with the commit's markers. Returns the file to open first, if
-   * any. */
+   * folder, one per path the rules exclude (which the markers paint dimmed),
+   * with the commit's own markers. Returns the file to open first, if any. */
   const buildTree = (listing: CheckoutListing): string | undefined => {
+    holdIgnored(listing);
     const paths = rowPaths(listing);
     held = new Set(paths);
     // Deep link wins when it names a real row; otherwise the Worker config is
@@ -428,7 +516,7 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     closeMenu();
     naming.clearPending();
     const { FileTree, preparePresortedFileTreeInput } = host.trees;
-    const entries = markers(host.changes());
+    const entries = [...markers(host.changes()), ...ignored];
     treeStatusKey = statusKey(entries);
     tree = new FileTree({
       composition: host.editable()
@@ -467,7 +555,7 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
         }
       },
       preparedInput: preparePresortedFileTreeInput(
-        sortTreePaths(listing.files)
+        sortTreePaths([...listing.files, ...listing.ignoredFiles])
       ),
       // Top-level, not under `composition`: see `FileTreeOptions`.
       renaming: host.editable()
@@ -487,8 +575,9 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     tree.render({ fileTreeContainer: host.treeEl });
     // An empty folder is a row nothing implies — git keeps none, so the
     // checkout only has one because someone made it here: pierre is told about
-    // it by name.
-    for (const dir of listing.dirs) {
+    // it by name. An excluded folder is named for the same reason: nothing
+    // under it was listed, so no row of its own implies it either.
+    for (const dir of [...listing.dirs, ...listing.ignoredDirs]) {
       const row = `${dir}/`;
       if (!hasRow(row)) {
         tree.add(row);
@@ -507,7 +596,7 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     void (async () => {
       const wasOpen = host.getCurrentPath();
       try {
-        await host.workspace.discardAll();
+        await host.workspace().discardAll();
       } catch (error) {
         toaster.notify(errorMessage(error));
       }

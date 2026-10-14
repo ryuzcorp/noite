@@ -3,38 +3,40 @@ title: Pull requests
 description: Open, review, comment on and squash-merge pull requests for an app's branches, then gate main with branch protection.
 ---
 
-Pull requests (called **pulls** in the UI) work between branches of the **same app**; there are no forks. They have their own pages: the **Pulls** item under the app in the sidebar shows the open count and opens the list (`/apps/<id>/pulls`). The title repeats the open count and carries **New pull**, and the list filters by **Open**, **Closed**, **Merged** or **All**, with a count for each. A pull is at `/apps/<id>/pulls/<number>`.
+Pull requests work between branches of the **same app**; there are no forks. They have their own pages: the **Pull requests** item under the app in the sidebar shows the open count and opens the list (`/apps/<id>/pulls`). The title carries **New pull request**, and the list filters by **Open**, **Closed**, **Merged** or **All**, with a count on every filter (including `0`). A pull request is at `/apps/<id>/pulls/<number>`.
 
 ## Open one
 
 Two ways:
 
-- **From Compare.** Pick a base and head on the compare page and press **Open pull** ([Source and history](/apps/source#compare)).
-- **From the list.** **New pull** (`/apps/<id>/pulls/new`) takes a base branch, a head branch, a title and an optional description.
+- **From Compare.** Pick a base and head on the compare page and press **Open pull request** ([Source and history](/apps/source#compare)).
+- **From the list.** **New pull request** (`/apps/<id>/pulls/new`) takes a base branch, a head branch, a title and an optional description. The form shows a compare summary (commits and files ahead) and, while Create is off, the reason: no other branch, base equal to head, no title, an already-open pull for the pair (with a link to it), or a head with no commits over the base.
 
-Opening a pull request when one is already open for the same base/head pair is refused. Closing and reopening are done from the pull request page; you need `push` access, and only the author or an admin may edit or close it.
+Opening is refused when one is already open for the same base/head pair, and when the head has no commits over the base — push a commit to the head first. Closing and reopening are done from the pull request page; you need `push` access, and only the author or an admin may edit or close it.
 
-## Conversation and Files
+## Conversation, Commits and Files
 
-A pull request has two tabs.
+A pull request has three tabs (Left/Right/Home/End move between them).
 
 **Conversation** holds the description, the comment and review timeline, and the comment box. The description is editable in place. Comments and reviews appear oldest first.
 
-**Files** shows the live `base..head` diff. Click a line to leave a comment anchored to it; anchored threads render next to their line, side by side with the diff. Line comments can be edited by their author and deleted by the author or an admin.
+**Commits** lists the commits only on the head branch (oldest first, like the compare page), each linking to its commit page.
+
+**Files** shows the live `base..head` diff. Click a line, or **Comment on a line**, to leave a comment anchored to it; anchored threads render next to their line, with **Reply** to answer in place. A very large file's diff is collapsed behind **Large diff — show anyway**. Line comments can be edited by their author and deleted by the author or an admin. Commenting needs `push` access; viewers see a note instead of the composer.
 
 When a later commit changes the line a comment was anchored to, the comment is marked **Outdated** and moves to the Conversation tab, where it keeps its file, line and original text.
 
 ## Reviews
 
-A reviewer with `push` access — anyone except the pull request's author — can **Approve** or **Request changes** at the current head. Each new push to the head branch **dismisses reviews recorded on older commits**, so an approval always refers to the code you approved.
+A reviewer with `push` access — anyone except the pull request's author — can **Approve** or **Request changes** at the current head; the box also shows **You approved** or **You requested changes**, and the button that would repeat your latest review is disabled. Each new push to the head branch **dismisses reviews recorded on older commits**, so an approval always refers to the code you approved.
 
-Counted approvals are the latest review per reviewer that is `approved`, has not been dismissed, was recorded at the current head, and is not by the author. An admin bypasses the threshold.
+Counted approvals are the latest review per reviewer that is `approved`, has not been dismissed, was recorded at the current head, and is not by the author. An admin bypasses the threshold. **Request changes** does **not** block the merge at `required_approvals=0` (GitHub semantics); the merge area shows a `<name> requested changes` warning instead.
 
 ## Squash merge
 
-Merging is always a **squash**: one commit on the base branch, authored by the pull request's author. If the base is `main`, that commit deploys like any push. You can delete the head branch as part of the merge.
+Merging is always a **squash**: one commit on the base branch, authored by the pull request's author. If the base is `main`, that commit deploys like any push.
 
-The merge box reports one state at a time:
+**Merge**, on the right of the pull's title, opens the squash form: the commit title (the pull's title by default), an optional extended description, and **Delete `<head>` after merging** — off by default. When the head branch has a preview environment, the checkbox warns that deleting the branch also deletes that environment and its data. **Close** (and **Reopen**, for the author or an app admin) sits next to it. The header's second line shows the merge state with the approval count, `<approvals> of <required> approvals · …` when approvals gate the merge (never a bare `0/0`) — one state at a time:
 
 | State | Meaning |
 | --- | --- |
@@ -45,6 +47,8 @@ The merge box reports one state at a time:
 | **Head branch is gone** | The head branch was deleted. |
 
 A pull request with conflicts cannot be merged. Merge the base into the head locally, resolve, and push — the page re-checks on the next load.
+
+The head and base names in the header link into Code mode at those branches, and **Compare** opens the compare page. When a merge deleted the head branch, the page says so.
 
 Commits Noite makes use the noreply identity: `<your name> <your user id>@users.noreply.<domain>`, never your email.
 

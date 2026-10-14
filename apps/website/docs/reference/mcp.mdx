@@ -67,7 +67,7 @@ After the key's first sighting the card shows the placeholder `noite_…`; mint 
 | `get_app` | One app's status, your role, URL and git remote. | `view` |
 | `list_templates` | Lists the templates this Noite ships. | — |
 | `create_app` | Creates an app — blank, a public GitHub import, or a template — and returns push instructions. | app quota |
-| `deploy_status` | An app's deploy state and recent deploys; poll this after a push. | `view` |
+| `deploy_status` | An app's deploy state and recent deploys; pass `environment` for one preview environment. Poll this after a push. | `view` |
 | `deploy_log` | One deploy's build log (the newest by default). | `view` |
 | `app_logs` | The app's recent runtime log lines (trailing tail, default 200). | `view` |
 | `app_errors` | Error issues grouped by fingerprint, with 24-hour counts. | `view` |
@@ -79,6 +79,21 @@ After the key's first sighting the card shows the placeholder `noite_…`; mint 
 | `repo_file` | One file's contents at a ref. | `view` |
 | `repo_log` | Commit history, newest first, optionally scoped to a path. | `view` |
 | `repo_commit` | One commit's metadata, changed files and patch. | `view` |
+
+Preview environments have their own tools. Each takes `app`, and an `environment` is named by its label or its id:
+
+| Tool | Does | Role |
+| --- | --- | --- |
+| `list_environments` | Lists an app's environments: label, what each tracks, status, URL, public flag. | `view` |
+| `create_environment` | Creates a branch's environment and deploys its head. `main` is refused; the label follows the branch. | `push` |
+| `deploy_environment` | Re-deploys an environment at its ref's current head. | `push` |
+| `delete_environment` | Deletes an environment, its fleet, its storage and its deploys. | `admin` |
+| `set_environment_public` | Serves an environment to anyone with the URL, or back to members only. | `admin` |
+| `environment_env_list` | The environment's variable overrides (values hidden unless they are `0`/`1` flags); it inherits the app's variables. | `view` |
+| `environment_env_set` | Sets one override for the environment. | `push` |
+| `environment_env_unset` | Removes an override, falling back to the app's value. | `push` |
+
+Every environment tool reports the environment's URL, `<label>.<slug>.<base>`, and `deploy_environment` returns the deploy id `deploy_log` reads. The same surface is on the command line: `noite environments` ([CLI](/reference/cli#environments)).
 
 `create_app` takes a `source` of `blank`, `{ kind: "github", url, ref? }` or `{ kind: "template", template }`, and enforces the same per-account app limit as the UI ([Limits](/reference/limits)). A GitHub import obeys the same rules as the UI: public `https://github.com/<owner>/<repo>` only, one-time copy, 500 MiB and 10 minutes ([Create an app](/apps/create#import-from-github)).
 

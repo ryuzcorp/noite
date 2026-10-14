@@ -8,15 +8,15 @@
 //! drag ~13 MB into the main bundle, so nothing in this file may.
 
 import type {
+  IntelBundle,
   IntelCompletion,
   IntelDefinition,
   IntelDiagnostic,
   IntelFile,
+  IntelMessage,
   IntelQuickInfo,
-  IntelReply,
   IntelRequest,
   IntelResult,
-  IntelSources,
 } from "./intel-protocol";
 import { createIntelWorker } from "./ts-worker-client";
 
@@ -28,10 +28,12 @@ interface IntelPending {
 /** TypeScript intelligence for one browser mount.
  *
  * The worker is created on the first `sync` (the first TS/JS file opened) and
- * holds the virtual FS: repository sources at the browsing ref, the declaration
- * files captured from the last successful build, and every draft the editor
- * hands over. Requests never wait on the network — they wait on the worker's
- * own sync, which the caller starts (and restarts after a push). */
+ * holds the virtual FS: repository sources at the browsing ref, every draft the
+ * editor hands over, and the package declarations it fetches from esm.sh
+ * itself. Requests never wait on the network — they wait on the worker's own
+ * sync, which the caller starts (and restarts after a push). Declarations that
+ * arrive later come back as a `typesChanged` event, which `onTypesChanged`
+ * turns into a fresh check of the open file. */
 export class SourceIntel {
   #generation = 0;
   #pending = new Map<number, IntelPending>();
@@ -41,13 +43,18 @@ export class SourceIntel {
   #sent = new Map<string, string>();
   #started: Promise<void> | undefined;
   #worker: Worker | undefined;
+  readonly #onTypesChanged: (() => void) | undefined;
+
+  constructor(onTypesChanged?: () => void) {
+    this.#onTypesChanged = onTypesChanged;
+  }
 
   /** Build the worker's program from `load`'s payload plus the current drafts.
    * Memoized: concurrent callers share one sync (a second call while the first
    * bundle is still in flight is the common case — the page opens several
    * files, or a stale open competes with a fresh one). */
   sync(
-    load: () => Promise<IntelSources>,
+    load: () => Promise<IntelBundle>,
     drafts: readonly IntelFile[]
   ): Promise<void> {
     this.#started ??= this.#start(load, drafts);
@@ -57,7 +64,7 @@ export class SourceIntel {
   /** Re-sync from scratch (a push changed the repo): the replies still in
    * flight answer a program that no longer exists, so they are dropped. */
   reset(
-    load: () => Promise<IntelSources>,
+    load: () => Promise<IntelBundle>,
     drafts: readonly IntelFile[]
   ): Promise<void> {
     this.#generation += 1;
@@ -189,52 +196,79 @@ export class SourceIntel {
   }
 
   async #start(
-    load: () => Promise<IntelSources>,
+    load: () => Promise<IntelBundle>,
     drafts: readonly IntelFile[]
   ): Promise<void> {
+    // A reset or a dispose mid-sync supersedes this attempt: the catch below
+    // must not clear the `#started` the newer one installed.
+    const generation = this.#generation;
     const worker = this.#worker ?? this.#createWorker();
-    let sources: IntelSources;
+    let bundle: IntelBundle;
     try {
-      sources = await load();
+      bundle = await load();
     } catch {
-      // The bundle/declaration fetch is the one step that fails for reasons the
-      // editor cannot fix (auth, network). Forget the attempt so the next file
-      // the user opens retries; until then every request answers null.
-      this.#started = undefined;
+      // The bundle fetch is the one step that fails for reasons the editor
+      // cannot fix (auth, network). Forget the attempt so the next file the
+      // user opens retries; until then every request answers null.
+      if (generation === this.#generation) {
+        this.#started = undefined;
+      }
       return;
     }
     this.#sent = new Map(drafts.map((draft) => [draft.path, draft.text]));
     try {
       await this.#post(worker, {
-        bundle: sources.bundle,
+        bundle,
         drafts: [...drafts],
         id: this.#nextId(),
         kind: "sync",
-        types: sources.types,
       });
     } catch {
       // The worker died installing the snapshot (only reachable through its
-      // own failure): same recovery as a failed load.
-      this.#started = undefined;
+      // own failure): same recovery as a failed load, and the worker itself is
+      // dropped so the next attempt builds a live one instead of posting into
+      // a scope that will never answer.
+      this.#drop(worker);
+      if (generation === this.#generation) {
+        this.#started = undefined;
+      }
+    }
+  }
+
+  /** Forget a worker that is dead or superseded: a `postMessage` into it is
+   * never answered, so reusing it would hang every later request. */
+  #drop(worker: Worker): void {
+    worker.terminate();
+    if (this.#worker === worker) {
+      this.#worker = undefined;
     }
   }
 
   #createWorker(): Worker {
     const worker = createIntelWorker();
-    worker.addEventListener("message", (event: MessageEvent<IntelReply>) => {
-      const reply = event.data;
-      const pending = this.#pending.get(reply.id);
+    worker.addEventListener("message", (event: MessageEvent<IntelMessage>) => {
+      const message = event.data;
+      if (!("id" in message)) {
+        // Unsolicited: declarations landed after a reply the pane already
+        // painted, so what it painted is worth re-checking.
+        this.#onTypesChanged?.();
+        return;
+      }
+      const pending = this.#pending.get(message.id);
       if (!pending) {
         return;
       }
-      this.#pending.delete(reply.id);
-      if (reply.ok) {
-        pending.resolve(reply.value);
+      this.#pending.delete(message.id);
+      if (message.ok) {
+        pending.resolve(message.value);
       } else {
-        pending.reject(new Error(reply.error));
+        pending.reject(new Error(message.error));
       }
     });
     worker.addEventListener("error", (event) => {
+      // A worker that failed (a bad chunk, an evaluation error) never answers
+      // again, so it is dropped here and the next sync builds a new one.
+      this.#drop(worker);
       this.#failPending(new Error(event.message || "language worker failed"));
     });
     this.#worker = worker;

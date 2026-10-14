@@ -20,7 +20,7 @@ use crate::db;
 use crate::host::caddy;
 use crate::host::logs::LogState;
 use crate::host::supervisor::{self, ProcMap};
-use crate::models::{parse_time, App, AppStatus};
+use crate::models::{parse_time, App, AppStatus, Environment};
 
 /// Per-app transition locks (keyed by app id, which survives renames).
 fn locks() -> &'static std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>> {
@@ -89,8 +89,18 @@ fn sleep_candidate(app: &App) -> bool {
         && app.status == AppStatus::Running.as_str()
 }
 
-/// The scheduled sweep: park every running app idle past the threshold.
-/// Returns how many apps went to sleep.
+/// The same rule for an environment (ROADMAP: environments scale to zero like
+/// apps).
+fn sleep_candidate_env(env: &Environment) -> bool {
+    !env.is_stopped()
+        && !env.is_asleep()
+        && env.is_deployed()
+        && env.listen_port.is_some()
+        && env.status == AppStatus::Running.as_str()
+}
+
+/// The scheduled sweep: park every running app — and every running preview
+/// environment — idle past the threshold. Returns how many fleets slept.
 pub async fn sweep(pool: &SqlitePool, cfg: &Config, procs: &ProcMap) -> usize {
     if cfg.sleep_after_h == 0 {
         return 0;
@@ -110,14 +120,43 @@ pub async fn sweep(pool: &SqlitePool, cfg: &Config, procs: &ProcMap) -> usize {
             Err(e) => tracing::warn!(slug = %app.slug, error = %e, "sleep app"),
         }
     }
+    let Ok(envs) = db::list_all_environments(pool).await else {
+        return parked;
+    };
+    for env in envs.iter().filter(|e| sleep_candidate_env(e)) {
+        if !should_sleep(now, &environment_activity(env), cfg.sleep_after_h) {
+            continue;
+        }
+        match sleep_environment(pool, cfg, procs, &env.id, false).await {
+            Ok(true) => parked += 1,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(fleet = %format!("{}.{}", env.app_slug, env.label), error = %e, "sleep environment");
+            }
+        }
+    }
     parked
 }
 
-async fn rewrite_edge(pool: &SqlitePool, cfg: &Config) -> anyhow::Result<()> {
+/// Idle signal for an environment: its own deploy / wake / creation clock.
+/// Phase 1 does not key telemetry by environment (ROADMAP Phase 3), so unlike
+/// an app there is no request bucket to read — and parking a preview that is
+/// actually busy only costs the next visitor a cold start, because the edge
+/// wakes it.
+fn environment_activity(env: &Environment) -> Vec<Option<DateTime<Utc>>> {
+    vec![
+        env.asleep_since.as_deref().and_then(parse_time),
+        env.woke_at.as_deref().and_then(parse_time),
+        parse_time(&env.created_at),
+    ]
+}
+
+pub async fn rewrite_edge(pool: &SqlitePool, cfg: &Config) -> anyhow::Result<()> {
     let apps = db::list_apps(pool).await?;
     let domains = db::list_app_domains(pool).await.unwrap_or_default();
     let limits = db::list_app_limits(pool).await.unwrap_or_default();
-    caddy::rewrite_caddy(cfg, &apps, &domains, &limits).await
+    let envs = db::list_environment_routes(pool).await.unwrap_or_default();
+    caddy::rewrite_caddy(cfg, &apps, &domains, &limits, &envs).await
 }
 
 /// Park one app. Order matters: flag it asleep, switch its sites to the
@@ -239,6 +278,119 @@ pub async fn wake_app(
         rewrite_edge(pool, cfg).await?;
     }
     Ok(())
+}
+
+/// Park one environment. Same order as `sleep_app`: flag it asleep, switch its
+/// site to the wake-on-request route, *then* stop the fleet. `false` when it
+/// no longer qualifies (re-checked under the lock); `force` skips the idle
+/// check.
+pub async fn sleep_environment(
+    pool: &SqlitePool,
+    cfg: &Config,
+    procs: &ProcMap,
+    env_id: &str,
+    force: bool,
+) -> anyhow::Result<bool> {
+    let lock = lock_for(env_id);
+    let _held = lock.lock().await;
+    let Some(env) = db::get_environment(pool, env_id).await? else {
+        return Ok(false);
+    };
+    if !sleep_candidate_env(&env)
+        || (!force && !should_sleep(Utc::now(), &environment_activity(&env), cfg.sleep_after_h))
+    {
+        return Ok(false);
+    }
+    db::set_environment_asleep(pool, &env.id).await?;
+    rewrite_edge(pool, cfg).await?;
+    supervisor::stop_environment_fleet(procs, &env.app_slug, &env.label).await;
+    crate::host::stats::record_sleep();
+    tracing::info!(
+        fleet = %format!("{}.{}", env.app_slug, env.label),
+        force,
+        "environment asleep"
+    );
+    Ok(true)
+}
+
+/// Wake one environment for a held request (the edge's env gate and public env
+/// sites call this): clear the flag, spawn its fleet, wait for its health
+/// gate, then restore the plain proxy route. Concurrent callers queue on the
+/// environment's lock.
+pub async fn wake_environment(
+    pool: &SqlitePool,
+    cfg: &Config,
+    procs: &ProcMap,
+    logs: &LogState,
+    env_id: &str,
+) -> anyhow::Result<()> {
+    let lock = lock_for(env_id);
+    let _held = lock.lock().await;
+    let Some(env) = db::get_environment(pool, env_id).await? else {
+        anyhow::bail!("environment not found");
+    };
+    if env.is_stopped() {
+        anyhow::bail!("environment is stopped");
+    }
+    let Some(port) = env.listen_port else {
+        anyhow::bail!("environment has no port");
+    };
+    let was_asleep = env.is_asleep();
+    let budget = Duration::from_secs(cfg.wake_timeout_s.max(1));
+    let deadline = tokio::time::Instant::now() + budget;
+    let _slot = if was_asleep {
+        match tokio::time::timeout(budget, wake_slots(cfg).acquire()).await {
+            Ok(Ok(permit)) => Some(permit),
+            Ok(Err(_)) => anyhow::bail!("wake slots closed"),
+            Err(_) => anyhow::bail!(
+                "too many fleets starting at once; waited {}s",
+                budget.as_secs()
+            ),
+        }
+    } else {
+        None
+    };
+    if was_asleep {
+        db::set_environment_awake(pool, &env.id).await?;
+        crate::host::stats::record_wake();
+        tracing::info!(
+            fleet = %format!("{}.{}", env.app_slug, env.label),
+            "waking environment for a request"
+        );
+    }
+    let env = db::get_environment(pool, env_id).await?.unwrap_or(env);
+    supervisor::ensure_environment_fleet(pool, cfg, procs, logs, &env).await?;
+    if env.status != AppStatus::Running.as_str() {
+        db::update_environment_status(pool, &env.id, AppStatus::Running.as_str(), None).await?;
+    }
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if !wait_healthy(cfg, port, left.max(Duration::from_secs(1))).await {
+        anyhow::bail!(
+            "environment fleet not healthy within {}s",
+            cfg.wake_timeout_s
+        );
+    }
+    if was_asleep {
+        rewrite_edge(pool, cfg).await?;
+    }
+    Ok(())
+}
+
+/// A deploy is activity: wake an asleep environment before its pipeline runs,
+/// so the reconcile loop spawns the fleet the new release lands in.
+pub async fn wake_environment_for_deploy(pool: &SqlitePool, env: &Environment) {
+    if !env.is_asleep() {
+        return;
+    }
+    let lock = lock_for(&env.id);
+    let _held = lock.lock().await;
+    if let Err(e) = db::set_environment_awake(pool, &env.id).await {
+        tracing::warn!(
+            fleet = %format!("{}.{}", env.app_slug, env.label),
+            error = %e,
+            "wake environment for deploy"
+        );
+    }
 }
 
 /// A deploy is activity: wake an asleep app before its pipeline runs so the

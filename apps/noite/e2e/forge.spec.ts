@@ -133,22 +133,21 @@ test("browse a branch, its history, a commit and a compare; create and delete a 
   await expect(page.getByText("ready to squash-merge")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Commits" })).toBeVisible();
 
-  // Compare opens the new-pull page; the sidebar's Pulls item opens the
-  // app's pulls list, whose title carries New pull.
-  await page.getByRole("link", { name: "Open pull" }).click();
+  // Compare opens the new-pull page; the sidebar's Pull requests item opens
+  // the app's list, whose title carries New pull request.
+  await page.getByRole("link", { name: "Open pull request" }).click();
   await expect(page).toHaveURL(
     new RegExp(`/apps/${appId}/pulls/new\\?base=main&head=feature`, "u")
   );
   await page
     .getByRole("list", { name: "Your apps" })
-    .getByRole("link", { name: /^Pulls/u })
+    .getByRole("link", { name: /^Pull requests/u })
     .click();
   await expect(page).toHaveURL(new RegExp(`/apps/${appId}/pulls$`, "u"));
-  await expect(page.getByText("No open pulls.")).toBeVisible();
-  await expect(page.getByRole("link", { name: "New pull" })).toHaveAttribute(
-    "href",
-    `/apps/${appId}/pulls/new`
-  );
+  await expect(page.getByText("No open pull requests.")).toBeVisible();
+  await expect(
+    page.getByRole("link", { name: "New pull request" })
+  ).toHaveAttribute("href", `/apps/${appId}/pulls/new`);
 
   // The picker's creator branches off the browsed ref and switches to it;
   // the admin deletes it from the same list.

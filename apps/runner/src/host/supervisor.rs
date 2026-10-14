@@ -76,73 +76,91 @@ pub async fn stop_fleet(procs: &ProcMap, slug: &str) {
     tracing::info!(slug, "stopped celld");
 }
 
-/// Stop every running fleet whose app no longer exists. A delete stops its
-/// fleet before purging, but a reconcile tick (or a wake) that read the app
-/// before the delete can start it again, and once the row is gone nothing
-/// else manages that process: it keeps the app's port, so the next app given
-/// that port crash-loops on "Address already in use". Each candidate is
-/// re-read by slug before it is stopped, so an app created or renamed since
-/// the caller listed apps keeps its fleet.
+/// Stop every running fleet whose app — or whose environment — no longer
+/// exists. A delete stops its fleet before purging, but a reconcile tick (or a
+/// wake) that read the row before the delete can start it again, and once the
+/// row is gone nothing else manages that process: it keeps the fleet's port,
+/// so the next fleet given that port crash-loops on "Address already in use".
+/// Each candidate is re-read before it is stopped, so an app created or
+/// renamed since the caller listed apps keeps its fleet. A sick database reads
+/// as "still wanted": never kill live fleets on a failed lookup.
 pub async fn stop_orphan_fleets(pool: &SqlitePool, procs: &ProcMap) {
     let running: Vec<String> = procs.lock().await.keys().cloned().collect();
-    for slug in running {
-        if matches!(db::get_app_by_slug(pool, &slug).await, Ok(None)) {
-            tracing::warn!(slug, "stopping fleet of a deleted app");
-            stop_fleet(procs, &slug).await;
+    for key in running {
+        if !fleet_still_wanted(pool, &key).await {
+            tracing::warn!(fleet = %key, "stopping fleet with no app/environment row");
+            stop_fleet(procs, &key).await;
         }
     }
 }
 
-/// Signal every fleet at once, then join waits under one budget
-/// (SPEC, Shutdown). Survivors past the budget get SIGKILL. Caddy
-/// is stopped last by the caller so in-flight requests drain.
-pub async fn stop_all(procs: &ProcMap, budget: Duration) {
-    let mut children: Vec<(String, Child, Option<u32>)> = Vec::new();
-    {
-        let mut map = procs.lock().await;
-        for (slug, child) in map.drain() {
-            let pid = child.id();
-            children.push((slug, child, pid));
-        }
-    }
-    for (_, _, pid) in &children {
-        if let Some(pid) = pid {
-            sigterm(*pid);
-        }
-    }
-    if children.is_empty() {
-        return;
-    }
-    let deadline = tokio::time::sleep(budget);
-    tokio::pin!(deadline);
-    let mut remaining: Vec<(String, Child)> =
-        children.into_iter().map(|(s, c, _)| (s, c)).collect();
-    let waits = remaining.iter_mut().map(|(s, c)| async move {
-        let st = c.wait().await.ok();
-        (s.clone(), st)
-    });
-    tokio::select! {
-        done = futures::future::join_all(waits) => {
-            for (slug, _) in done {
-                tracing::info!(slug, "stopped celld");
-            }
-        }
-        _ = &mut deadline => {
-            for (slug, child) in &mut remaining {
-                tracing::warn!(slug, "fleet past stop budget; killing");
-                if let Some(pid) = child.id() {
-                    sigkill(pid);
-                } else {
-                    let _ = child.kill().await;
-                }
-            }
-            for (_, mut child) in remaining {
-                let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-            }
-        }
+/// Whether the `ProcMap` key still names something: a plain key is an app
+/// slug, `slug.label` a preview environment (`Environment::fleet_key`).
+async fn fleet_still_wanted(pool: &SqlitePool, key: &str) -> bool {
+    match key.split_once('.') {
+        Some((slug, label)) => match db::get_app_by_slug(pool, slug).await {
+            Ok(Some(app)) => match db::get_environment_by_label(pool, &app.id, label).await {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(_) => true,
+            },
+            Ok(None) => false,
+            Err(_) => true,
+        },
+        None => !matches!(db::get_app_by_slug(pool, key).await, Ok(None)),
     }
 }
 
+/// The `ProcMap` key and log-ring key of an environment fleet: the app slug
+/// cannot contain `.` (`lifecycle::slug_ok`), so `slug.label` never collides
+/// with a production fleet's key.
+pub fn env_fleet_key(slug: &str, label: &str) -> String {
+    format!("{slug}.{label}")
+}
+
+/// Local state dir of an environment fleet: `envs/<slug>/<label>`, the local
+/// mirror of its bucket prefix, so purge and rename walk one shape.
+pub fn env_state_dir(cfg: &Config, slug: &str, label: &str) -> std::path::PathBuf {
+    std::path::Path::new(&cfg.work_dir)
+        .join("envs")
+        .join(slug)
+        .join(label)
+}
+
+/// Stop one environment fleet.
+pub async fn stop_environment_fleet(procs: &ProcMap, slug: &str, label: &str) {
+    stop_fleet(procs, &env_fleet_key(slug, label)).await;
+}
+
+/// Stop every environment fleet of one app (`slug.*`): what a delete, a purge
+/// and a rename need before touching the envs/<slug>/ prefix.
+pub async fn stop_environment_fleets(procs: &ProcMap, slug: &str) {
+    let keys: Vec<String> = procs
+        .lock()
+        .await
+        .keys()
+        .filter(|key| key.split_once('.').is_some_and(|(owner, _)| owner == slug))
+        .cloned()
+        .collect();
+    for key in keys {
+        stop_fleet(procs, &key).await;
+    }
+}
+
+/// One celld fleet to (re)spawn: identity, bucket, ports, state dir, env.
+struct FleetSpec {
+    /// `ProcMap` key and log-ring key (`slug`, or `slug.label`).
+    key: String,
+    /// Owning app slug: scoped credentials and logs are per app.
+    slug: String,
+    bucket: String,
+    listen: i64,
+    internal: i64,
+    state_dir: std::path::PathBuf,
+    env: Vec<(String, String)>,
+}
+
+/// App fleet: celld on the app's bucket and ports (SPEC, Fleet lifecycle).
 pub async fn ensure_fleet(
     pool: &SqlitePool,
     cfg: &Config,
@@ -153,28 +171,88 @@ pub async fn ensure_fleet(
     let (Some(listen), Some(internal)) = (app.listen_port, app.internal_port) else {
         return Ok(());
     };
+    let spec = FleetSpec {
+        key: app.slug.clone(),
+        slug: app.slug.clone(),
+        bucket: app.fleet_bucket.clone(),
+        listen,
+        internal,
+        state_dir: std::path::Path::new(&cfg.work_dir)
+            .join("fleets")
+            .join(&app.slug),
+        env: db::tenant_env(pool, &app.id).await,
+    };
+    ensure_spawned(pool, cfg, procs, logs, spec).await
+}
+
+/// Environment fleet: its own celld on the environment's bucket and ports,
+/// with the app's variables plus the environment's overrides. Nothing here
+/// reads or writes the app's bucket, ports or `last_deploy_sha`.
+pub async fn ensure_environment_fleet(
+    pool: &SqlitePool,
+    cfg: &Config,
+    procs: &ProcMap,
+    logs: &LogState,
+    env: &crate::models::Environment,
+) -> anyhow::Result<()> {
+    let (Some(listen), Some(internal)) = (env.listen_port, env.internal_port) else {
+        return Ok(());
+    };
+    let state_dir = env_state_dir(cfg, &env.app_slug, &env.label);
+    // `envs/` and `envs/<slug>/` are created under the runner's umask 077,
+    // and the fleet uid has to traverse them to reach its own state dir
+    // (`harden_data_dir` keeps them 0755 across boots, as for `fleets/`).
+    #[cfg(unix)]
+    if let Some(slug_dir) = state_dir.parent() {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::create_dir_all(slug_dir).await?;
+        for dir in [Some(slug_dir), slug_dir.parent()].into_iter().flatten() {
+            tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).await?;
+        }
+    }
+    let spec = FleetSpec {
+        key: env_fleet_key(&env.app_slug, &env.label),
+        slug: env.app_slug.clone(),
+        bucket: env.fleet_bucket.clone(),
+        listen,
+        internal,
+        state_dir,
+        env: db::environment_tenant_env(pool, &env.app_id, &env.id).await,
+    };
+    ensure_spawned(pool, cfg, procs, logs, spec).await
+}
+
+/// Spawn (or confirm) one celld fleet, whoever owns it.
+async fn ensure_spawned(
+    pool: &SqlitePool,
+    cfg: &Config,
+    procs: &ProcMap,
+    logs: &LogState,
+    spec: FleetSpec,
+) -> anyhow::Result<()> {
+    let key = spec.key.clone();
     {
         let mut map = procs.lock().await;
-        if let Some(child) = map.get_mut(&app.slug) {
+        if let Some(child) = map.get_mut(&key) {
             match child.try_wait() {
                 Ok(None) => return Ok(()), // still running
                 Ok(Some(status)) => {
-                    tracing::warn!(slug = %app.slug, ?status, "celld exited; restarting");
-                    map.remove(&app.slug);
+                    tracing::warn!(fleet = %key, ?status, "celld exited; restarting");
+                    map.remove(&key);
                 }
                 Err(e) => {
-                    tracing::warn!(slug = %app.slug, error = %e, "celld status; restarting");
-                    map.remove(&app.slug);
+                    tracing::warn!(fleet = %key, error = %e, "celld status; restarting");
+                    map.remove(&key);
                 }
             }
         }
     }
 
-    let state_dir = format!("{}/fleets/{}", cfg.work_dir, app.slug);
+    let state_dir = spec.state_dir.to_string_lossy().into_owned();
     tokio::fs::create_dir_all(&state_dir).await?;
     // celld runs as the fleet user: the whole state dir must be its own,
-    // including SQLite / replication files an earlier runner (root, or the
-    // an older build of this image) left there, or the fleet cannot open its
+    // including SQLite / replication files an earlier runner (root, or an
+    // older build of this image) left there, or the fleet cannot open its
     // cells.
     #[cfg(unix)]
     if let Some(uid) = cfg.fleet_uid {
@@ -183,10 +261,13 @@ pub async fn ensure_fleet(
             uid,
             cfg.fleet_gid.unwrap_or(uid),
         ) {
-            tracing::warn!(slug = %app.slug, "could not hand the fleet state dir to the fleet user");
+            tracing::warn!(fleet = %key, "could not hand the fleet state dir to the fleet user");
         }
     }
-    let creds = credentials::fleet_credentials(pool, cfg, &app.slug).await?;
+    // Scoped credentials are per app prefix: until a provider that also scopes
+    // `envs/<slug>/` lands, an environment fleet shares its app's pair
+    // (SPEC, Scoped credentials).
+    let creds = credentials::fleet_credentials(pool, cfg, &spec.slug).await?;
     let (access, secret_key) = (creds.access_key, creds.secret_key);
     // Advertise on loopback: a tenant fleet is a single node, a child of the
     // runner in its own network namespace, and the runner already reaches it
@@ -195,13 +276,13 @@ pub async fn ensure_fleet(
     // node discovery (d1/diagnose read the lease and dial `addr`). The
     // internal listener binds loopback too: it carries celld's
     // unauthenticated operator API (SPEC, Egress policy).
-    let listen_addr = format!("0.0.0.0:{listen}");
-    let internal_addr = format!("127.0.0.1:{internal}");
-    let advertise_addr = format!("127.0.0.1:{internal}");
+    let listen_addr = format!("0.0.0.0:{}", spec.listen);
+    let internal_addr = format!("127.0.0.1:{}", spec.internal);
+    let advertise_addr = internal_addr.clone();
     let mut cmd = Command::new(&cfg.celld_bin);
     cmd.args([
         "--bucket",
-        &app.fleet_bucket,
+        &spec.bucket,
         "--endpoint",
         &cfg.s3_endpoint,
         "--region",
@@ -254,7 +335,9 @@ pub async fn ensure_fleet(
     // runner's compaction of the previous hour (`metrics::compact_fleet`) and
     // the retention knob (RUNNER_TELEMETRY_RETENTION_DAYS, shared with the
     // metric prune) come from the same helper the control fleet uses, so the
-    // two sources cannot drift.
+    // two sources cannot drift. An environment's files land under
+    // `envs/<slug>/<label>/telemetry/...` (its own `--bucket`), which the
+    // Phase 1 ingest does not read (ROADMAP Phase 3).
     for (key, value) in crate::host::metrics::otel_env(cfg) {
         cmd.env(key, value);
     }
@@ -271,7 +354,7 @@ pub async fn ensure_fleet(
             cmd.as_std_mut().gid(gid);
         }
     }
-    for (k, v) in db::tenant_env(pool, &app.id).await {
+    for (k, v) in spec.env {
         cmd.env(k, v);
     }
     let mut child = cmd
@@ -280,42 +363,104 @@ pub async fn ensure_fleet(
         .kill_on_drop(true)
         .spawn()?;
 
-    // Capture the fleet's stdout+stderr into the shared per-app log buffer
+    // Capture the fleet's stdout+stderr into the shared per-fleet log buffer
     // (was Stdio::inherit, which lost it to the runner's console).
-    let slug = app.slug.clone();
     if let Some(out) = child.stdout.take() {
         let state = logs.clone();
-        let slug = slug.clone();
+        let ring = key.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(out).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                logs::append(&state, &slug, line).await;
+                logs::append(&state, &ring, line).await;
             }
         });
     }
     if let Some(err) = child.stderr.take() {
         let state = logs.clone();
-        let slug = slug.clone();
+        let ring = key.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(err).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                logs::append(&state, &slug, line).await;
+                logs::append(&state, &ring, line).await;
             }
         });
     }
 
-    procs.lock().await.insert(app.slug.clone(), child);
-    tracing::info!(slug = %app.slug, listen, internal, "started celld");
+    procs.lock().await.insert(key.clone(), child);
+    tracing::info!(fleet = %key, listen = spec.listen, internal = spec.internal, "started celld");
     Ok(())
+}
+
+/// Signal every fleet at once, then join waits under one budget
+/// (SPEC, Shutdown). Survivors past the budget get SIGKILL. Caddy
+/// is stopped last by the caller so in-flight requests drain.
+pub async fn stop_all(procs: &ProcMap, budget: Duration) {
+    let mut children: Vec<(String, Child, Option<u32>)> = Vec::new();
+    {
+        let mut map = procs.lock().await;
+        for (slug, child) in map.drain() {
+            let pid = child.id();
+            children.push((slug, child, pid));
+        }
+    }
+    for (_, _, pid) in &children {
+        if let Some(pid) = pid {
+            sigterm(*pid);
+        }
+    }
+    if children.is_empty() {
+        return;
+    }
+    let deadline = tokio::time::sleep(budget);
+    tokio::pin!(deadline);
+    let mut remaining: Vec<(String, Child)> =
+        children.into_iter().map(|(s, c, _)| (s, c)).collect();
+    let waits = remaining.iter_mut().map(|(s, c)| async move {
+        let st = c.wait().await.ok();
+        (s.clone(), st)
+    });
+    tokio::select! {
+        done = futures::future::join_all(waits) => {
+            for (slug, _) in done {
+                tracing::info!(slug, "stopped celld");
+            }
+        }
+        _ = &mut deadline => {
+            for (slug, child) in &mut remaining {
+                tracing::warn!(slug, "fleet past stop budget; killing");
+                if let Some(pid) = child.id() {
+                    sigkill(pid);
+                } else {
+                    let _ = child.kill().await;
+                }
+            }
+            for (_, mut child) in remaining {
+                let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+            }
+        }
+    }
 }
 
 pub async fn reload_fleet(app: &App) {
     let Some(port) = app.internal_port else {
         return;
     };
+    reload_at(&app.slug, port).await;
+}
+
+/// POST /reload on an environment fleet, so a preview deploy goes live
+/// without waiting for celld's own poll.
+pub async fn reload_environment_fleet(env: &crate::models::Environment) {
+    let Some(port) = env.internal_port else {
+        return;
+    };
+    reload_at(&env_fleet_key(&env.app_slug, &env.label), port).await;
+}
+
+async fn reload_at(fleet: &str, port: i64) {
     let url = format!("http://127.0.0.1:{port}/reload");
     if let Err(e) = reqwest::Client::new().post(&url).send().await {
-        tracing::warn!(slug = %app.slug, error = %e, "reload failed");
+        tracing::warn!(fleet = %fleet, error = %e, "reload failed");
     }
 }
 
@@ -368,5 +513,87 @@ mod tests {
         drop(map);
         // The orphan's process is really gone, not just forgotten.
         assert!(!std::path::Path::new(&format!("/proc/{orphan_pid}")).exists());
+    }
+
+    /// Environment fleets are keyed `slug.label` and swept by their own row:
+    /// a deleted environment's fleet stops, a live one's stays, and a plain
+    /// app key is never mistaken for one.
+    #[tokio::test]
+    async fn environment_fleets_are_swept_by_their_own_row() {
+        use crate::models::EnvironmentKind;
+        let pool = db::connect("sqlite::memory:").await.expect("memory db");
+        let cfg = crate::config::config_for_tests();
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "env",
+                slug: "env",
+                user_id: "user_test",
+                subdomain: "env.localhost",
+                listen: 30100,
+                internal: 30101,
+            },
+        )
+        .await
+        .expect("seed app");
+        for (label, git_ref, listen) in [
+            ("live", "refs/heads/live", 30110),
+            ("gone", "refs/heads/gone", 30120),
+        ] {
+            db::create_environment(
+                &pool,
+                &cfg,
+                db::NewEnvironment {
+                    app_id: &app.id,
+                    slug: "env",
+                    label,
+                    kind: EnvironmentKind::Branch,
+                    git_ref,
+                    created_by: "user_test",
+                    listen,
+                    internal: listen + 1,
+                },
+            )
+            .await
+            .expect("seed environment");
+        }
+        let procs = new_procs();
+        {
+            let mut map = procs.lock().await;
+            map.insert("env".into(), spawn_sleeper());
+            map.insert(env_fleet_key("env", "live"), spawn_sleeper());
+            map.insert(env_fleet_key("env", "gone"), spawn_sleeper());
+            map.insert(env_fleet_key("env", "never"), spawn_sleeper());
+        }
+        // Delete the `gone` row while its process is still registered.
+        let gone = db::get_environment_by_label(&pool, &app.id, "gone")
+            .await
+            .expect("lookup")
+            .expect("row");
+        db::delete_environment(&pool, &gone.id)
+            .await
+            .expect("delete");
+
+        stop_orphan_fleets(&pool, &procs).await;
+
+        let map = procs.lock().await;
+        assert!(map.contains_key("env"), "the app fleet stays");
+        assert!(map.contains_key(&env_fleet_key("env", "live")));
+        assert!(!map.contains_key(&env_fleet_key("env", "gone")));
+        assert!(!map.contains_key(&env_fleet_key("env", "never")));
+    }
+
+    #[test]
+    fn environment_state_dir_mirrors_the_bucket_prefix() {
+        let cfg = crate::config::config_for_tests();
+        assert_eq!(
+            env_state_dir(&cfg, "blog", "feature"),
+            std::path::Path::new(&cfg.work_dir)
+                .join("envs")
+                .join("blog")
+                .join("feature")
+        );
+        assert_eq!(env_fleet_key("blog", "feature"), "blog.feature");
     }
 }

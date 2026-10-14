@@ -216,6 +216,43 @@ export const splitPatchFiles = (patch: string): PatchFile[] => {
   return files;
 };
 
+// ---- Reviews ----
+
+/** The latest review per reviewer, ties broken by id (what the merge box and
+ * the reviewer's own buttons act on). */
+export const latestReviews = (reviews: readonly PrReview[]): PrReview[] => {
+  const latest = new Map<string, PrReview>();
+  for (const review of reviews) {
+    const prev = latest.get(review.reviewerId);
+    const newer =
+      prev === undefined ||
+      review.createdAt > prev.createdAt ||
+      (review.createdAt === prev.createdAt && review.id >= prev.id);
+    if (newer) {
+      latest.set(review.reviewerId, review);
+    }
+  }
+  return [...latest.values()];
+};
+
+// ---- Large diffs ----
+
+/** A file's diff over this many changed lines renders collapsed. */
+export const LARGE_DIFF_LINES = 1500;
+
+/** Or over this many patch characters (a rough byte proxy). */
+export const LARGE_DIFF_BYTES = 400_000;
+
+/** Whether a file's diff is big enough to collapse by default: its changed
+ * line count, or the patch text itself when the stat is binary/absent. */
+export const isLargeDiff = (
+  patch: string,
+  additions: number | null,
+  deletions: number | null
+): boolean =>
+  (additions ?? 0) + (deletions ?? 0) > LARGE_DIFF_LINES ||
+  patch.length > LARGE_DIFF_BYTES;
+
 // ---- List filters ----
 
 export type PrStateFilter = "all" | "closed" | "merged" | "open";

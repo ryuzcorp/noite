@@ -14,6 +14,7 @@ import {
 import { stampRunnerEnv } from "../lib/runner";
 import type { RouteHandler } from "./config";
 import { handleAuth, handleInviteStatus } from "./routes/auth";
+import { handleEnvAuth } from "./routes/env-auth";
 import { handleHealth } from "./routes/health";
 import { forwardIngest } from "./routes/ingest";
 import {
@@ -25,7 +26,11 @@ import {
 import { handleMcp } from "./routes/mcp";
 import { handlePreviewHostAsset } from "./routes/nodepod";
 import { handleR2Raw, handleR2Upload } from "./routes/r2";
-import { handleSourceArchive, handleSourceCommit } from "./routes/source";
+import {
+  handleSourceArchive,
+  handleSourceCommit,
+  handleSourcePreview,
+} from "./routes/source";
 import {
   handleAppsStream,
   handleDeploysStream,
@@ -38,7 +43,7 @@ import {
 const router = FindMyWay.make<RouteHandler>();
 router.all("/health", handleHealth);
 // A pod's assets have a route only so they run before the static-asset
-// fallback — the handler 404s every host but the app's Preview host. That
+// fallback — the handler 404s every host but the app's pod host. That
 // includes the bridge pair (see `POD_BRIDGE_PATHS`): a request on the control
 // host has to be decided here, not by whatever the asset fallback would answer.
 for (const path of CONTROL_HOST_DENIED_ASSETS) {
@@ -59,6 +64,8 @@ router.on("GET", "/internal/telemetry-facts", handleTelemetryFacts);
 router.on("GET", "/storage/:appId/r2/:bucket/raw", handleR2Raw);
 router.on("PUT", "/storage/:appId/r2/:bucket/upload", handleR2Upload);
 router.on("POST", "/api/apps/:appId/source/commit", handleSourceCommit);
+router.on("POST", "/api/apps/:appId/source/preview", handleSourcePreview);
+router.on("GET", "/api/env-auth", handleEnvAuth);
 router.on("GET", "/api/apps/:appId/source/archive", handleSourceArchive);
 router.on("GET", "/api/apps/:appId/logs/stream", handleLogsStream);
 router.on("GET", "/api/apps/:appId/deploys/stream", handleDeploysStream);

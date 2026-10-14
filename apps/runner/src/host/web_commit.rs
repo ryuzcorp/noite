@@ -98,6 +98,14 @@ fn validate_web_path(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Where a browser commit lands.
+enum WebTarget<'a> {
+    /// A branch (`None` = the default branch).
+    Branch(Option<&'a str>),
+    /// A workspace preview's hidden ref, committed on top of `branch`'s head.
+    Preview { git_ref: &'a str, branch: &'a str },
+}
+
 /// Commit browser edits as a branch commit without a worktree: the changes'
 /// files are written (added or modified) and its deletes removed. `branch`
 /// defaults to `main`; a branch that does not exist yet is created, from
@@ -110,6 +118,53 @@ pub async fn web_commit(
     message: &str,
     changes: WebChanges<'_>,
     branch: Option<&str>,
+    from_sha: Option<&str>,
+) -> anyhow::Result<String> {
+    commit_into(
+        state,
+        app,
+        actor,
+        message,
+        changes,
+        WebTarget::Branch(branch),
+        from_sha,
+    )
+    .await
+}
+
+/// Commit uncommitted Code mode changes to a workspace preview's hidden ref
+/// (`refs/previews/<userId>/<branch>`), on top of `branch`'s head. The branch
+/// itself is never moved and no PR sees the commit: hidden refs are not
+/// advertised, not listed as branches and not used as PR heads.
+pub async fn web_commit_preview(
+    state: &AppState,
+    app: &App,
+    actor: &Identity,
+    message: &str,
+    changes: WebChanges<'_>,
+    git_ref: &str,
+    branch: &str,
+) -> anyhow::Result<String> {
+    commit_into(
+        state,
+        app,
+        actor,
+        message,
+        changes,
+        WebTarget::Preview { git_ref, branch },
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // the public surface shares one implementation
+async fn commit_into(
+    state: &AppState,
+    app: &App,
+    actor: &Identity,
+    message: &str,
+    changes: WebChanges<'_>,
+    target: WebTarget<'_>,
     from_sha: Option<&str>,
 ) -> anyhow::Result<String> {
     let WebChanges {
@@ -167,23 +222,43 @@ pub async fn web_commit(
         }
     }
     validate_moves(moves, files, deletes)?;
-    let branch = branch.unwrap_or(DEFAULT_BRANCH);
-    if !forge::valid_branch_name(branch) {
-        bail!("invalid branch {branch:?}");
-    }
     let bare = forge::read_mirror(state, &app.slug).await?;
     let refs = list_refs(&bare).await?;
-    let refname = format!("refs/heads/{branch}");
-    let existing = refs.get(&refname).cloned();
-    // A new branch starts at `fromSha`, else at `main`, else at the root.
-    // An existing branch always grows from its own tip (the CAS below still
-    // rejects a push that moves it first).
-    let parent = match &existing {
-        Some(sha) => Some(sha.clone()),
-        None => match from_sha {
-            Some(from) => Some(forge::resolve_ref(&bare, from).await?),
-            None => refs.get(&format!("refs/heads/{DEFAULT_BRANCH}")).cloned(),
-        },
+    // The ref this commit moves, and the parent it grows from: a branch grows
+    // from its own tip (fromSha/main/root on creation); a workspace preview
+    // grows from its branch's head, so each snapshot is "the branch plus my
+    // uncommitted changes" rather than a chain of snapshots.
+    let (refname, parent) = match target {
+        WebTarget::Branch(branch) => {
+            let branch = branch.unwrap_or(DEFAULT_BRANCH);
+            if !forge::valid_branch_name(branch) {
+                bail!("invalid branch {branch:?}");
+            }
+            let refname = format!("refs/heads/{branch}");
+            let existing = refs.get(&refname).cloned();
+            let parent = match &existing {
+                Some(sha) => Some(sha.clone()),
+                None => match from_sha {
+                    Some(from) => Some(forge::resolve_ref(&bare, from).await?),
+                    None => refs.get(&format!("refs/heads/{DEFAULT_BRANCH}")).cloned(),
+                },
+            };
+            (refname, parent)
+        }
+        WebTarget::Preview { git_ref, branch } => {
+            if !forge::publishable_ref(git_ref) {
+                bail!("invalid ref {git_ref:?}");
+            }
+            if !forge::valid_branch_name(branch) {
+                bail!("invalid branch {branch:?}");
+            }
+            let branch_ref = format!("refs/heads/{branch}");
+            let parent = refs
+                .get(&branch_ref)
+                .cloned()
+                .or_else(|| refs.get(git_ref).cloned());
+            (git_ref.to_string(), parent)
+        }
     };
     let sha = build_commit(
         &bare,
@@ -195,7 +270,14 @@ pub async fn web_commit(
         deletes,
     )
     .await?;
-    forge::publish_ref(state, app, branch, existing.as_deref(), Some(&sha)).await?;
+    forge::publish_refname(
+        state,
+        app,
+        &refname,
+        refs.get(&refname).map(String::as_str),
+        Some(&sha),
+    )
+    .await?;
     Ok(sha)
 }
 

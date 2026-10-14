@@ -42,7 +42,7 @@ pub async fn delete_env(pool: &SqlitePool, app_id: &str, name: &str) -> sqlx::Re
 
 /// Reserved prefixes/names the platform owns — tenant values for these are
 /// dropped (logged) rather than injected into fleet/build/release env.
-fn env_reserved(name: &str) -> bool {
+pub(crate) fn env_reserved(name: &str) -> bool {
     name == "PORT"
         || name == "HOST"
         || name.starts_with("AWS_")

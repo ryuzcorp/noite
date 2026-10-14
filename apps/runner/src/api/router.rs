@@ -25,6 +25,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/edge/fallback", get(host::edge::edge_fallback))
         .route("/v1/edge/tls-ask", get(host::edge::tls_ask))
         .route("/v1/edge/wake", get(host::edge::wake))
+        .route("/v1/edge/env-gate", get(host::env_gate::env_gate))
+        .route("/v1/edge/env-auth", get(host::env_gate::env_auth))
         .route("/v1/admin/stats", get(api::stats))
         .route(
             "/v1/admin/telemetry",
@@ -62,7 +64,6 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/apps/{id}/tree", get(api::source_tree))
         .route("/v1/apps/{id}/blob/{*path}", get(api::source_blob))
         .route("/v1/apps/{id}/bundle", get(api::source_bundle))
-        .route("/v1/apps/{id}/types", get(api::source_types))
         // Forge mirror for the git.* RPCs. They sit under `/git/` because
         // `/v1/apps/{id}/refs` is the traffic-referrer endpoint.
         .route("/v1/apps/{id}/git/refs", get(api::git_refs))
@@ -128,6 +129,12 @@ pub fn router(state: AppState) -> Router {
                 crate::host::web_commit::MAX_COMMIT_BODY_BYTES,
             )),
         )
+        .route(
+            "/v1/apps/{id}/source/preview",
+            post(api::app_source_preview).layer(DefaultBodyLimit::max(
+                crate::host::web_commit::MAX_COMMIT_BODY_BYTES,
+            )),
+        )
         .route("/v1/apps/{id}/source/archive", get(api::source_archive))
         .route(
             "/v1/apps/{id}/pull_requests",
@@ -168,6 +175,30 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/apps/{id}/storage/r2/{bucket}/raw",
             get(api::app_r2_raw),
+        )
+        .route(
+            "/v1/apps/{id}/environments",
+            get(api::list_environments).post(api::create_environment),
+        )
+        .route(
+            "/v1/apps/{id}/environments/{env_id}",
+            axum::routing::patch(api::update_environment).delete(api::delete_environment),
+        )
+        .route(
+            "/v1/apps/{id}/environments/{env_id}/deploy",
+            post(api::deploy_environment),
+        )
+        .route(
+            "/v1/apps/{id}/environments/{env_id}/env",
+            get(api::list_environment_env).post(api::set_environment_env),
+        )
+        .route(
+            "/v1/apps/{id}/environments/{env_id}/env/{name}",
+            delete(api::delete_environment_env),
+        )
+        .route(
+            "/v1/apps/{id}/environments/{env_id}/grant",
+            post(api::grant_environment),
         )
         .route("/v1/apps/{id}/env", get(api::list_env).post(api::set_env))
         .route("/v1/apps/{id}/env/{name}", delete(api::delete_env))

@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { Nodepod } from "@r1ck404/nodepod/headless";
 import type { NodepodFS } from "@r1ck404/nodepod/headless";
 
-import { deriveChanges, fileSha, listFiles } from "./changes";
+import { deriveChanges, fileSha, listCheckout, listFiles } from "./changes";
 import {
   objectPath,
   readJournal,
@@ -120,6 +120,12 @@ const row = (
     throw new Error(`no change for ${path}`);
   }
   return found;
+};
+
+/** What the derive reports, as the paths the panel lists them by. */
+const derivedPaths = async (state: WorkspaceState): Promise<string[]> => {
+  const changes = await deriveChanges(state);
+  return changes.map((change) => change.path);
 };
 
 const TREE = {
@@ -293,8 +299,8 @@ describe("deriving the changes", () => {
 
   test("the walk reports files, deepest names last, and their stats", async () => {
     await withPod(async (fs) => {
-      await seed(fs, TREE);
-      const files = await listFiles(fs);
+      const state = await seed(fs, TREE);
+      const files = await listFiles(fs, state.base);
       expect(files.map((file) => file.path)).toEqual([
         "README.md",
         "src/main.ts",
@@ -503,6 +509,98 @@ describe("discarding", () => {
       await expect(discardChange(state, changes[0])).rejects.toThrow(
         "no committed copy of src/main.ts"
       );
+    });
+  });
+});
+
+describe("the checkout's .gitignore", () => {
+  test("an excluded path is a row in the tree but never a change", async () => {
+    await withPod(async (fs) => {
+      const state = await seed(fs, { ".gitignore": "dist/\n", "a.txt": "a\n" });
+      await put(fs, "dist/a.js", "built\n");
+      expect(await deriveChanges(state)).toEqual([]);
+      expect(await listCheckout(fs, state.base)).toEqual({
+        dirs: [],
+        files: [".gitignore", "a.txt"],
+        ignoredDirs: ["dist"],
+        ignoredFiles: [],
+      });
+    });
+  });
+
+  test("the dependency folder is always excluded, and never walked", async () => {
+    await withPod(async (fs) => {
+      const state = await seed(fs, { "a.txt": "a\n" });
+      await put(fs, "node_modules/pkg/index.js", "installed\n");
+      expect(await deriveChanges(state)).toEqual([]);
+      const listing = await listCheckout(fs, state.base);
+      expect(listing.files).toEqual(["a.txt"]);
+      expect(listing.ignoredDirs).toEqual(["node_modules"]);
+      // Not one row under it: git does not look inside an excluded folder
+      // either, and an install's tree is unbounded.
+      expect(listing.ignoredFiles).toEqual([]);
+    });
+  });
+
+  test("a committed path is a change even where the rules would exclude it", async () => {
+    await withPod(async (fs) => {
+      const state = await seed(fs, {
+        ".gitignore": "dist/\n",
+        "dist/a.js": "one\n",
+      });
+      await put(fs, "dist/a.js", "two\n");
+      await put(fs, "dist/new.js", "new\n");
+      // Git keeps tracking what it has committed: a.js is a change, and the
+      // folder above it is no more dimmed than git dims it. What the same
+      // folder gained since is excluded, exactly as `git status` leaves it.
+      expect(await derivedPaths(state)).toEqual(["dist/a.js"]);
+      const listing = await listCheckout(fs, state.base);
+      expect(listing.files).toEqual([".gitignore", "dist/a.js"]);
+      expect(listing.ignoredDirs).toEqual([]);
+      expect(listing.ignoredFiles).toEqual(["dist/new.js"]);
+    });
+  });
+
+  test("a nested .gitignore rules over its own directory only", async () => {
+    await withPod(async (fs) => {
+      const state = await seed(fs, {
+        "src/.gitignore": "*.map\n",
+        "src/a.ts": "a\n",
+      });
+      await put(fs, "src/a.ts.map", "map\n");
+      await put(fs, "a.ts.map", "map\n");
+      expect(await derivedPaths(state)).toEqual(["a.ts.map"]);
+      const listing = await listCheckout(fs, state.base);
+      expect(listing.ignoredFiles).toEqual(["src/a.ts.map"]);
+    });
+  });
+
+  test("a ! rule keeps its path a change", async () => {
+    await withPod(async (fs) => {
+      const state = await seed(fs, { ".gitignore": "*.log\n!keep.log\n" });
+      await put(fs, "x.log", "x\n");
+      await put(fs, "keep.log", "keep\n");
+      expect(await derivedPaths(state)).toEqual(["keep.log"]);
+      const listing = await listCheckout(fs, state.base);
+      expect(listing.ignoredFiles).toEqual(["x.log"]);
+    });
+  });
+
+  test("rules reach the derive as soon as the file holding them lands", async () => {
+    await withPod(async (fs) => {
+      const state = await seed(fs, { ".gitignore": "", "a.txt": "a\n" });
+      await put(fs, "dist/a.js", "built\n");
+      expect(await derivedPaths(state)).toEqual(["dist/a.js"]);
+      // The write itself is an ordinary change; what it announces is not.
+      await put(fs, ".gitignore", "dist/\n");
+      expect(await derivedPaths(state)).toEqual([".gitignore"]);
+      const ruled = await listCheckout(fs, state.base);
+      expect(ruled.ignoredDirs).toEqual(["dist"]);
+      // Taking the rule back out gives the path back with it.
+      await put(fs, ".gitignore", "");
+      expect(await derivedPaths(state)).toEqual(["dist/a.js"]);
+      const listing = await listCheckout(fs, state.base);
+      expect(listing.ignoredDirs).toEqual([]);
     });
   });
 });

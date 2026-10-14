@@ -2,13 +2,16 @@ import { afterEach, describe, expect, test } from "bun:test";
 
 import { MemoryVolume } from "@r1ck404/nodepod/headless";
 
-import { MIRRORED_STATE_ROOT } from "./state-mirror";
 import { syncTabs } from "./tab-sync";
 import type { TabSync } from "./tab-sync";
 import { BASE_FILE, PROJECT_ROOT } from "./types";
 
 const ENCODER = new TextEncoder();
 const DECODER = new TextDecoder();
+
+/** A pod path outside the checkout: the pod's own runtime state, which never
+ * crosses between tabs. */
+const POD_STATE_ROOT = "/home/.noite/state";
 
 const open: TabSync[] = [];
 afterEach(() => {
@@ -108,19 +111,19 @@ describe("tabs on one workspace", () => {
     expect(batches).toBe(1);
   });
 
-  test("installs and the preview's state stay in their own tab; the base index crosses", async () => {
+  test("installs and paths outside the checkout stay in their own tab; the base index crosses", async () => {
     const { a, b } = tabs();
     a.volume.mkdirSync(`${PROJECT_ROOT}/node_modules/x`, { recursive: true });
     put(a.volume, `${PROJECT_ROOT}/node_modules/x/i.js`, "x");
-    a.volume.mkdirSync(MIRRORED_STATE_ROOT, { recursive: true });
-    put(a.volume, `${MIRRORED_STATE_ROOT}/db`, "x");
+    a.volume.mkdirSync(POD_STATE_ROOT, { recursive: true });
+    put(a.volume, `${POD_STATE_ROOT}/db`, "x");
     // Sent last, so it lands last: anything shared before it is in by then.
     const landed = appliedUntil(b.sync, () => b.volume.existsSync(BASE_FILE));
     put(a.volume, BASE_FILE, "{}");
     await landed;
     expect(text(b.volume, BASE_FILE)).toBe("{}");
     expect(b.volume.existsSync(`${PROJECT_ROOT}/node_modules`)).toBe(false);
-    expect(b.volume.existsSync(MIRRORED_STATE_ROOT)).toBe(false);
+    expect(b.volume.existsSync(POD_STATE_ROOT)).toBe(false);
   });
 
   test("a tab applies what arrived before it started, in one batch", async () => {
@@ -151,5 +154,22 @@ describe("tabs on one workspace", () => {
     });
     await b.sync.flushPeers(5000);
     expect(flushed).toBe(1);
+  });
+
+  test("an applied batch reports the paths it touched, a rename its destination", async () => {
+    const { a, b } = tabs();
+    const file = `${PROJECT_ROOT}/a.ts`;
+    const moved = `${PROJECT_ROOT}/b.ts`;
+    const seen: (readonly string[])[] = [];
+    b.sync.onApplied((_structural, paths) => {
+      seen.push(paths);
+    });
+    let landed = appliedUntil(b.sync, () => b.volume.existsSync(file));
+    put(a.volume, file, "one");
+    await landed;
+    landed = appliedUntil(b.sync, () => b.volume.existsSync(moved));
+    a.volume.renameSync(file, moved);
+    await landed;
+    expect(seen).toEqual([[file], [moved]]);
   });
 });

@@ -22,6 +22,8 @@ import type { D1Tables as D1TablesRaw } from "./runner-types/D1Tables";
 import type { D1TableSchemaRaw } from "./runner-types/D1TableSchemaRaw";
 import type { D1WriteBody } from "./runner-types/D1WriteBody";
 import type { DoPreview } from "./runner-types/DoPreview";
+import type { EnvGrant } from "./runner-types/EnvGrant";
+import type { Environment as RunnerEnvironment } from "./runner-types/Environment";
 import type { ErrorIssueDetail as RunnerErrorDetail } from "./runner-types/ErrorIssueDetail";
 import type { GitBranch } from "./runner-types/GitBranch";
 import type { GitCommitDetail } from "./runner-types/GitCommitDetail";
@@ -36,7 +38,7 @@ import type { PrList } from "./runner-types/PrList";
 import type { R2File } from "./runner-types/R2File";
 import type { R2Preview } from "./runner-types/R2Preview";
 import type { SourceBundle as RunnerSourceBundle } from "./runner-types/SourceBundle";
-import type { SourceTypes as RunnerSourceTypes } from "./runner-types/SourceTypes";
+import type { SourceCommitBody } from "./runner-types/SourceCommitBody";
 import type { StorageItem } from "./runner-types/StorageItem";
 import type { TelemetryStatus as RunnerTelemetryStatus } from "./runner-types/TelemetryStatus";
 import type { TreeResponse as RunnerTree } from "./runner-types/TreeResponse";
@@ -67,6 +69,9 @@ export type { D1WriteOp } from "./runner-types/D1WriteOp";
 export type { Deploy as RunnerDeploy } from "./runner-types/Deploy";
 export type { DoInstance } from "./runner-types/DoInstance";
 export type { DoPreview } from "./runner-types/DoPreview";
+export type { EnvGrant } from "./runner-types/EnvGrant";
+export type { Environment as RunnerEnvironment } from "./runner-types/Environment";
+export type { EnvironmentKind } from "./runner-types/EnvironmentKind";
 export type { ErrorEventView as RunnerErrorEvent } from "./runner-types/ErrorEventView";
 export type { ErrorIssueDetail as RunnerErrorDetail } from "./runner-types/ErrorIssueDetail";
 export type { ErrorIssueList as RunnerErrorList } from "./runner-types/ErrorIssueList";
@@ -89,6 +94,7 @@ export type { PrComment } from "./runner-types/PrComment";
 export type { PrCounts } from "./runner-types/PrCounts";
 export type { PrDetail } from "./runner-types/PrDetail";
 export type { PrList } from "./runner-types/PrList";
+export type { PreviewResult } from "./runner-types/PreviewResult";
 export type { PrReview } from "./runner-types/PrReview";
 export type { PrSummary } from "./runner-types/PrSummary";
 export type { R2File } from "./runner-types/R2File";
@@ -100,7 +106,6 @@ export type { SourceCommitBody } from "./runner-types/SourceCommitBody";
 export type { SourceCommitFile } from "./runner-types/SourceCommitFile";
 export type { SourceCommitMove } from "./runner-types/SourceCommitMove";
 export type { SourceFile } from "./runner-types/SourceFile";
-export type { SourceTypes as RunnerSourceTypes } from "./runner-types/SourceTypes";
 export type { StorageItem } from "./runner-types/StorageItem";
 export type { TelemetryEvent as RunnerTelemetryEvent } from "./runner-types/TelemetryEvent";
 export type { TelemetryStatus as RunnerTelemetryStatus } from "./runner-types/TelemetryStatus";
@@ -556,17 +561,112 @@ export const runnerSourceTree = (id: string, ref?: string) =>
 export const runnerSourceBlob = (id: string, path: string, ref?: string) =>
   runnerRpc<RunnerBlob>("source.blob", { id, path, ref });
 
-// RunnerSourceBundle/SourceFile/SourceTypes are generated from
-// host::source::{SourceBundle, SourceFile} and host::source_types::SourceTypes.
-// The bundle is the repo's own text sources at `ref` (capped, `truncated`
-// marks a capped read); the types are the declaration files captured from the
-// app's last successful build (`sha: null` until one lands).
+// RunnerSourceBundle/SourceFile are generated from
+// host::source::{SourceBundle, SourceFile}. The bundle is the repo's own text
+// sources at `ref` (capped, `truncated` marks a capped read).
 
 export const runnerSourceBundle = (id: string, ref?: string) =>
   runnerRpc<RunnerSourceBundle>("source.bundle", { id, ref });
 
-export const runnerSourceTypes = (id: string) =>
-  runnerRpc<RunnerSourceTypes>("source.types", { id });
+// Preview environments (ROADMAP: Preview environments). The runner enforces
+// the app role on every call, so the UI resolves the caller's role and passes
+// it: `view` to read, `push` to create/deploy and set variables, `admin` to
+// delete and to flip an environment public. `main` is never an environment.
+
+export const runnerEnvironmentsList = (id: string, role: string) =>
+  runnerRpc<RunnerEnvironment[]>("environments.list", { id, role });
+
+/** Create the branch's environment (using `label`, no override) and deploy its
+ * head; `actor` names the creator. */
+export const runnerEnvironmentCreate = (
+  id: string,
+  branch: string,
+  role: string,
+  actor?: SourceCommitBody["actor"]
+) =>
+  runnerRpc<RunnerEnvironment>("environments.create", {
+    actor,
+    branch,
+    id,
+    role,
+  });
+
+export const runnerEnvironmentDelete = async (
+  id: string,
+  envId: string,
+  role: string
+): Promise<void> => {
+  await runnerRpc<{ ok: boolean }>("environments.delete", { envId, id, role });
+};
+
+export const runnerEnvironmentUpdate = (
+  id: string,
+  envId: string,
+  isPublic: boolean,
+  role: string
+) =>
+  runnerRpc<RunnerEnvironment>("environments.update", {
+    envId,
+    id,
+    public: isPublic,
+    role,
+  });
+
+export const runnerEnvironmentDeploy = (
+  id: string,
+  envId: string,
+  role: string
+) =>
+  runnerRpc<{ deployId: string; sha: string }>("environments.deploy", {
+    envId,
+    id,
+    role,
+  });
+
+/** One environment's variable overrides (raw rows: the caller redacts). */
+export const runnerEnvironmentVars = (
+  id: string,
+  envId: string,
+  role: string
+) => runnerRpc<RunnerEnv[]>("environments.vars.get", { envId, id, role });
+
+export const runnerEnvironmentVarSet = (
+  id: string,
+  envId: string,
+  name: string,
+  value: string,
+  role: string
+) =>
+  runnerRpc<{ ok: boolean; name: string }>("environments.vars.set", {
+    envId,
+    id,
+    name,
+    role,
+    value,
+  });
+
+export const runnerEnvironmentVarDelete = async (
+  id: string,
+  envId: string,
+  name: string,
+  role: string
+): Promise<void> => {
+  await runnerRpc<{ ok: boolean }>("environments.vars.delete", {
+    envId,
+    id,
+    name,
+    role,
+  });
+};
+
+/** Mint the short-lived hand-back token the control UI's `/api/env-auth` route
+ * redirects a browser with (the runner has no session; this is what turns
+ * "this viewer may see this environment" into a token). */
+export const runnerEnvironmentGrant = (
+  id: string,
+  envId: string,
+  userId: string
+) => runnerRpc<EnvGrant>("environments.grant", { envId, id, userId });
 
 // RunnerMetric/Span/Device/Path/Ref/Event/UserProps/Insight are generated
 // from the models::App*Stat rows, models::AppEvent, AppUserProps and

@@ -51,14 +51,6 @@ pub async fn source_bundle(
         .map(Json)
 }
 
-/// Declaration files captured from the app's last successful build.
-pub async fn source_types(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    service::source::types(&state, &id).await.map(Json)
-}
-
 /// The repo at `ref` as an uncompressed tar, streamed. The Workspace caps were
 /// checked from the tree listing first, so an over-cap repo already answered
 /// 413 and a byte of archive is never buffered.

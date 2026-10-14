@@ -45,79 +45,77 @@ export const FileStats = ({ files }: { files: GitFileStat[] }) => {
   );
 };
 
-/** One commit: subject linking to its page, author and relative time. */
-export const CommitRow = ({
-  appId,
-  commit,
-  showParents = false,
-}: {
-  appId: string;
-  commit: GitCommitSummary;
-  showParents?: boolean;
-}) => (
-  <li class="flex flex-col gap-0.5 px-1 py-2">
-    <a
-      class="link link-hover min-w-0 truncate font-medium"
-      href={commitHref(appId, commit.sha)}
-      title={commit.subject}
-    >
-      {commit.subject}
-    </a>
-    <div class="text-base-content/70 flex flex-wrap items-center gap-x-2 text-xs">
-      <span>{commit.authorName}</span>
-      <span aria-hidden="true">·</span>
-      <span>{formatAgo(gitTime(commit.authoredAt))}</span>
-      <a
-        class="link link-hover font-mono"
-        href={commitHref(appId, commit.sha)}
-        title={commit.sha}
-      >
-        {shortSha(commit.sha)}
-      </a>
-      {showParents && commit.parents.length > 0 ? (
-        <span class="flex items-center gap-1">
-          <span aria-hidden="true">·</span>
-          <span>parent{commit.parents.length > 1 ? "s" : ""}</span>
-          {commit.parents.map((parent) => (
-            <a
-              key={parent}
-              class="link link-hover font-mono"
-              href={commitHref(appId, parent)}
-              title={parent}
-            >
-              {shortSha(parent)}
-            </a>
-          ))}
-        </span>
-      ) : null}
-    </div>
-  </li>
-);
-
-/** A commit list with an empty state. */
+/** A commit list with an empty state: per commit its subject (linking to its
+ * page), author, relative time and short SHA. The rows are written inline,
+ * not as a component: a component's row sits in its own `display: contents`
+ * wrapper, so `last:` would match every row and drop every divider. */
 export const CommitList = ({
   appId,
   commits,
   emptyLabel,
+  file = "",
+  gitRef = "",
   showParents = false,
 }: {
   appId: string;
   commits: GitCommitSummary[];
   emptyLabel: string;
+  /** The open file, carried into each commit link so its back link returns to
+   * it (see `commitHref`). */
+  file?: string;
+  /** The browsed ref, carried into each commit link the same way. */
+  gitRef?: string;
   showParents?: boolean;
 }) => {
   if (commits.length === 0) {
     return <p class="m-0 text-sm opacity-70">{emptyLabel}</p>;
   }
+  const from = { file, ref: gitRef };
   return (
-    <ul class="divide-base-300 m-0 flex list-none flex-col divide-y p-0">
+    <ul class="m-0 flex list-none flex-col p-0 text-sm">
       {commits.map((commit) => (
-        <CommitRow
+        <li
           key={commit.sha}
-          appId={appId}
-          commit={commit}
-          showParents={showParents}
-        />
+          class="border-base-300 flex items-start gap-2 border-b py-2 last:border-0"
+        >
+          <div class="min-w-0 flex-1">
+            <a
+              class="link link-hover line-clamp-2 font-medium break-words"
+              href={commitHref(appId, commit.sha, from)}
+              title={commit.subject}
+            >
+              {commit.subject}
+            </a>
+            <div class="text-base-content/70 flex flex-wrap items-center gap-x-1.5 text-xs">
+              <span>{commit.authorName}</span>
+              <span aria-hidden="true">·</span>
+              <span>{formatAgo(gitTime(commit.authoredAt))}</span>
+              {showParents && commit.parents.length > 0 ? (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span>parent{commit.parents.length > 1 ? "s" : ""}</span>
+                  {commit.parents.map((parent) => (
+                    <a
+                      key={parent}
+                      class="link link-hover font-mono"
+                      href={commitHref(appId, parent, from)}
+                      title={parent}
+                    >
+                      {shortSha(parent)}
+                    </a>
+                  ))}
+                </>
+              ) : null}
+            </div>
+          </div>
+          <a
+            class="link link-hover text-base-content/70 shrink-0 font-mono text-xs"
+            href={commitHref(appId, commit.sha, from)}
+            title={commit.sha}
+          >
+            {shortSha(commit.sha)}
+          </a>
+        </li>
       ))}
     </ul>
   );

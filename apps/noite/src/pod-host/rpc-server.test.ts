@@ -11,7 +11,6 @@ import type {
   PodRequestKind,
   PodRequestMap,
 } from "../lib/source/pod-protocol";
-import { planPreview } from "../lib/source/preview/plan";
 import { writeBase, writeObject } from "../lib/source/workspace/checkout";
 import { gitBlobSha } from "../lib/source/workspace/git";
 import {
@@ -25,7 +24,6 @@ import type {
   PodOptions,
 } from "../lib/source/workspace/types";
 import { installDomFixture } from "../testing/dom";
-import type { PreviewStarter } from "./preview-runtime";
 import { createPodServer } from "./rpc-server";
 
 beforeAll(() => {
@@ -35,10 +33,6 @@ beforeAll(() => {
 const ENCODER = new TextEncoder();
 const APP_ID = "app1";
 const BRANCH = "main";
-/** This document's own origin: what a preview URL has to be on. */
-const ORIGIN = "https://app-0.preview.demo.example";
-/** The preview URL a fake spawner answers with, on that origin. */
-const ON_ORIGIN = `${ORIGIN}/__virtual__/pod/5173/`;
 /** How long a test waits for an event before saying the frame never sent it:
  * a safety net, not a wait — the test's own signal is the event. */
 const EVENT_TIMEOUT_MS = 3000;
@@ -77,8 +71,8 @@ interface Control {
   /** The next event of `kind`, waiting for one if none has arrived. */
   next: <K extends PodEventKind>(kind: K) => Promise<PodEventMap[K]>;
   /** The first event of `kind` that `accept`s — for a frame that reports the
-   * same kind more than once (a derive, a preview state), the one the test
-   * means, whatever order the buffer holds them in. */
+   * same kind more than once (a derive), the one the test means, whatever
+   * order the buffer holds them in. */
   waitFor: <K extends PodEventKind>(
     kind: K,
     accept: (payload: PodEventMap[K]) => boolean
@@ -292,38 +286,9 @@ interface Harness {
   closed: () => boolean;
   /** The hook the frame reported a failed save through. */
   reportSaveError: (error: unknown) => void;
-  /** What a spawned preview answered with, and how it was driven. */
-  preview: {
-    logs: [PodEventMap["preview.log"]["stream"], string][];
-    restartFailure?: string;
-    url: string;
-  };
   /** The pod's own `onPeerChange` notify. */
-  peerChanged: (structural: boolean) => void;
+  peerChanged: (structural: boolean, paths: readonly string[]) => void;
 }
-
-/** The fake spawner: it reports readiness the way `startPreview` does. */
-const fakeStarter =
-  (harness: () => Harness): PreviewStarter =>
-  async (pod, plan, options) => {
-    void pod;
-    void plan;
-    const script = harness().preview;
-    options.onState("installing", "installing the app's dependencies");
-    for (const [stream, text] of script.logs) {
-      options.onLog(text, stream);
-    }
-    options.onState("ready", script.url);
-    return {
-      processes: () => ["npm run dev"],
-      restart: () =>
-        script.restartFailure === undefined
-          ? Promise.resolve()
-          : Promise.reject(new Error(script.restartFailure)),
-      stop: () => Promise.resolve(),
-      url: script.url,
-    };
-  };
 
 /** Boot the pod the server serves, open the port, and tear it all down. */
 const withServer = async (
@@ -346,7 +311,10 @@ const withServer = async (
       "the frame reported a save error before a workspace opened"
     );
   };
-  let peerChanged: (structural: boolean) => void = () => {
+  let peerChanged: (
+    structural: boolean,
+    paths: readonly string[]
+  ) => void = () => {
     throw new Error("the frame reported a peer change before one opened");
   };
   let closed = false;
@@ -383,10 +351,9 @@ const withServer = async (
     closed: () => closed,
     control: control(port1),
     fs,
-    peerChanged: (structural) => {
-      peerChanged(structural);
+    peerChanged: (structural, paths) => {
+      peerChanged(structural, paths);
     },
-    preview: { logs: [], url: ON_ORIGIN },
     reportSaveError: (error) => {
       reportSaveError(error);
     },
@@ -395,10 +362,7 @@ const withServer = async (
     appId: APP_ID,
     branch: BRANCH,
     openPod: opener,
-    origin: ORIGIN,
-    plan: planPreview,
     port: port2,
-    start: fakeStarter(() => harness),
   });
   try {
     await run(harness);
@@ -474,6 +438,8 @@ describe("the frame's RPC server", () => {
       await expect(page.request("listing")).resolves.toEqual({
         dirs: [],
         files: [],
+        ignoredDirs: [],
+        ignoredFiles: [],
       });
     });
   });
@@ -549,6 +515,8 @@ describe("the frame's RPC server", () => {
       expect(await page.request("listing")).toEqual({
         dirs: ["empty"],
         files: ["a.txt"],
+        ignoredDirs: [],
+        ignoredFiles: [],
       });
       // A rename is only a row once a derive has run: the panel's `restore`
       // looks the row up by path.
@@ -625,8 +593,11 @@ describe("the frame's RPC server", () => {
         expect(await page.next("saveError")).toEqual({
           message: "QuotaExceededError",
         });
-        peerChanged(true);
-        expect(await page.next("peer")).toEqual({ structural: true });
+        peerChanged(true, ["a.txt"]);
+        expect(await page.next("peer")).toEqual({
+          paths: ["a.txt"],
+          structural: true,
+        });
       }
     );
   });
@@ -760,48 +731,6 @@ describe("the frame's RPC server", () => {
       expect(
         page.events.filter((event) => event.ev === "terminal.write")
       ).toEqual([]);
-    });
-  });
-
-  test("runs the preview the page asked for, and streams its state and log", async () => {
-    await withServer(async ({ control: page, fs, preview }) => {
-      await seed(fs, {
-        "package.json": JSON.stringify({ scripts: { dev: "vite" } }),
-      });
-      preview.logs = [["stdout", "ready in 120ms"]];
-      await page.request("open", opening());
-      await expect(page.request("preview.view")).resolves.toMatchObject({
-        logs: [],
-        state: "idle",
-        url: "",
-      });
-      await page.request("preview.open");
-      expect(await page.next("preview.log")).toEqual({
-        stream: "stdout",
-        text: "ready in 120ms",
-      });
-      const view = await page.request("preview.view");
-      expect(view.state).toBe("ready");
-      expect(view.url).toBe(ON_ORIGIN);
-      expect(view.processes).toEqual(["npm run dev"]);
-      await page.request("preview.stop");
-      expect(
-        await page.waitFor(
-          "preview.state",
-          (payload) => payload.state === "idle"
-        )
-      ).toMatchObject({ state: "idle" });
-      await page.request("preview.restart");
-      // The verb's own answer is the view after it: the panel gets the same
-      // news as an event, and this is the deterministic half.
-      await expect(page.request("preview.view")).resolves.toMatchObject({
-        state: "ready",
-        url: ON_ORIGIN,
-      });
-      await expect(page.request("preview.close")).resolves.toMatchObject({
-        state: "idle",
-        url: "",
-      });
     });
   });
 

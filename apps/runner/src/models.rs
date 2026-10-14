@@ -171,6 +171,8 @@ impl App {
 pub struct Deploy {
     pub id: String,
     pub app_id: String,
+    /// The preview environment this deploy targets; `None` is production.
+    pub environment_id: Option<String>,
     pub sha: Option<String>,
     pub status: String,
     pub log: String,
@@ -192,6 +194,79 @@ pub struct AppEnv {
     pub name: String,
     pub value: String,
     pub updated_at: String,
+}
+
+/// What an environment was created from (ROADMAP): a pushed branch, or a
+/// workspace preview of uncommitted Code mode changes (a hidden ref).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum EnvironmentKind {
+    Branch,
+    Workspace,
+}
+
+impl EnvironmentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Branch => "branch",
+            Self::Workspace => "workspace",
+        }
+    }
+}
+
+/// One preview environment: its own celld fleet at `<label>.<slug>.<base>`,
+/// with its own bucket prefix (`envs/<slug>/<label>`) and its own storage.
+/// `main` is the app itself, never an environment.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Environment {
+    pub id: String,
+    pub app_id: String,
+    pub label: String,
+    /// `EnvironmentKind` as stored: `branch` or `workspace`.
+    pub kind: String,
+    /// `refs/heads/<branch>` or `refs/previews/<userId>/<branch>`.
+    pub git_ref: String,
+    pub created_by: String,
+    pub fleet_bucket: String,
+    pub listen_port: Option<i64>,
+    pub internal_port: Option<i64>,
+    /// Observed status, as `AppStatus` strings.
+    pub status: String,
+    pub desired_state: String,
+    pub asleep_since: Option<String>,
+    pub woke_at: Option<String>,
+    pub last_deploy_sha: Option<String>,
+    pub last_deployed_at: Option<String>,
+    /// Members-only by default; a public environment serves without the gate.
+    pub public: bool,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// The owning app's slug: joined in, never a column (the edge and the
+    /// host shape `<label>.<slug>.<base>` need it).
+    pub app_slug: String,
+}
+
+impl Environment {
+    pub fn desired(&self) -> DesiredState {
+        DesiredState::parse(&self.desired_state).unwrap_or(DesiredState::Running)
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.desired() == DesiredState::Stopped
+    }
+
+    /// Asleep: desired running, fleet stopped until the next request.
+    pub fn is_asleep(&self) -> bool {
+        self.asleep_since.is_some() && !self.is_stopped()
+    }
+
+    pub fn is_deployed(&self) -> bool {
+        self.status == AppStatus::Running.as_str() || self.last_deploy_sha.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]

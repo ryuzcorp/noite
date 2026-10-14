@@ -21,7 +21,7 @@ use anyhow::{bail, Context};
 use sqlx::SqliteConnection;
 
 /// Version a database has after every migration ran. 1 is the alpha baseline.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`.
@@ -145,6 +145,51 @@ pub const MIGRATIONS: &[Migration] = &[
             required_approvals INTEGER NOT NULL DEFAULT 0 \
               CHECK (required_approvals BETWEEN 0 AND 2)\
           );",
+    },
+    Migration {
+        version: 8,
+        // Preview environments (ROADMAP, Preview environments): one row per
+        // branch or workspace preview, each its own celld fleet with its own
+        // `envs/<slug>/<label>` bucket prefix, plus its variable overrides.
+        // `deploy.environment_id` targets a preview deploy; NULL stays
+        // production, whose `app.last_deploy_sha` this never touches. A fresh
+        // database gets the same shape from schema.sql. Indexes cannot be
+        // schema-qualified (SQLite rejects `ON main.<table>` in CREATE INDEX)
+        // and these names are unique to main.
+        sql: "CREATE TABLE IF NOT EXISTS main.environment (\
+            id TEXT PRIMARY KEY NOT NULL,\
+            app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,\
+            label TEXT NOT NULL,\
+            kind TEXT NOT NULL CHECK (kind IN ('branch','workspace')),\
+            git_ref TEXT NOT NULL,\
+            created_by TEXT NOT NULL DEFAULT '',\
+            fleet_bucket TEXT NOT NULL,\
+            listen_port INTEGER,\
+            internal_port INTEGER,\
+            status TEXT NOT NULL DEFAULT 'pending',\
+            desired_state TEXT NOT NULL DEFAULT 'running',\
+            asleep_since TEXT,\
+            woke_at TEXT,\
+            last_deploy_sha TEXT,\
+            last_deployed_at TEXT,\
+            public INTEGER NOT NULL DEFAULT 0,\
+            last_error TEXT,\
+            created_at TEXT NOT NULL,\
+            updated_at TEXT NOT NULL,\
+            UNIQUE (app_id, label)\
+          );\
+          CREATE INDEX IF NOT EXISTS idx_environment_app ON environment(app_id);\
+          CREATE INDEX IF NOT EXISTS idx_environment_ref ON environment(app_id, git_ref);\
+          CREATE INDEX IF NOT EXISTS idx_environment_deployed ON environment(last_deployed_at);\
+          CREATE TABLE IF NOT EXISTS main.environment_env (\
+            environment_id TEXT NOT NULL REFERENCES environment(id) ON DELETE CASCADE,\
+            name TEXT NOT NULL,\
+            value TEXT NOT NULL DEFAULT '',\
+            updated_at TEXT NOT NULL,\
+            PRIMARY KEY (environment_id, name)\
+          );\
+          ALTER TABLE main.deploy ADD COLUMN environment_id TEXT REFERENCES environment(id) ON DELETE CASCADE;\
+          CREATE INDEX IF NOT EXISTS idx_deploy_environment ON deploy(environment_id);",
     },
 ];
 

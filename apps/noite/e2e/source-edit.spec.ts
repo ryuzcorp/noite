@@ -8,6 +8,7 @@ import { createAppWithKey, deleteApp, pushAppDir } from "./helpers";
 // `?file=` write; that once remounted the browser and dropped the drafts.
 
 const SLUG = "source-edit";
+const BRANCH_SLUG = "source-branch";
 
 /** Every app this spec creates, dropped after the file: the account's app
  * quota (10) is shared by the whole lane. */
@@ -95,4 +96,60 @@ test("edits to several files push as one commit from the Changes panel", async (
   await expect(panel).toContainText("Pushed to topic.", { timeout: 30_000 });
   await expect(panel.getByRole("link", { name: "Open a pull" })).toBeVisible();
   await expect(editor).not.toContainText("// edit on a branch");
+});
+
+// A non-default branch opens editable too, and the Changes panel commits to it
+// rather than to `main`: creating a branch in the picker and pushing there was
+// read-only until the editor learned a branch from a tag or a raw sha.
+test("a branch opens editable and pushes to itself", async ({
+  page,
+  request,
+}) => {
+  createdApps.push(BRANCH_SLUG);
+  const { apiKey, appId } = await createAppWithKey(page, request, {
+    name: "Source Branch",
+    slug: BRANCH_SLUG,
+  });
+  pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), BRANCH_SLUG);
+
+  await page.goto(`/apps/${appId}/source?file=index.ts&ref=main`);
+  await expect(page.locator('[contenteditable="true"]').first()).toBeVisible({
+    timeout: 60_000,
+  });
+
+  // Create `staging` from the browsed ref; the picker switches to it.
+  await page.getByLabel("Branch or ref").click();
+  const picker = page.locator(".dropdown-content");
+  await picker.getByLabel("New branch name").fill("staging");
+  await picker.getByRole("button", { name: "Create" }).click();
+  await expect(page).toHaveURL(/ref=staging/u);
+
+  // A ref change installs the new branch's checkout under the panes the page
+  // already has (see `./source/browser`): until it lands, the rows and the
+  // editor on screen are the branch the user came from. Wait for the switch to
+  // settle — rows alone, which both branches have, prove nothing.
+  await expect(page.locator("[data-source-switch]")).toHaveCount(0, {
+    timeout: 60_000,
+  });
+  await expect(page.getByRole("treeitem", { name: "index.ts" })).toBeVisible({
+    timeout: 60_000,
+  });
+  await appendLine(page, "// edit on staging");
+  const changes = page.getByRole("button", { name: /^Changes/u });
+  await expect(changes.locator(".badge")).toHaveText("1");
+
+  // The form commits to the browsed branch by default, and it lands there.
+  await changes.click();
+  const panel = page.getByRole("complementary", { name: "Changes" });
+  await expect(panel.locator("option:checked")).toHaveText("staging");
+  await panel.getByLabel("Commit message").fill("Edit on staging");
+  await panel.getByRole("button", { exact: true, name: "Push" }).click();
+  await expect(panel).toContainText("Pushed to staging.", { timeout: 30_000 });
+  await expect(changes.locator(".badge")).toBeHidden();
+
+  // The commit is on the browsed branch's log, not on `main`'s.
+  await page.getByRole("button", { exact: true, name: "History" }).click();
+  await expect(page.getByRole("link", { name: "Edit on staging" })).toBeVisible(
+    { timeout: 30_000 }
+  );
 });

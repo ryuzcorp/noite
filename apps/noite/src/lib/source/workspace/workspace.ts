@@ -38,7 +38,7 @@ import type {
 export type { Workspace, WorkspaceOptions } from "./types";
 
 /** The workspace as the frame's own runtime talks to it: the shared facade,
- * plus the pod itself — the preview's servers and the shell run on it — and
+ * plus the pod itself — the shell runs on it — and
  * the pod's whole filesystem, where the control page only ever gets the
  * `SourceFs` slice it reads. */
 export interface FrameWorkspace extends Omit<Workspace, "fs"> {
@@ -207,6 +207,20 @@ export const createWorkspace = async (
     }
   };
 
+  /** One scheduled derive. The walk reads a live filesystem — the terminal and
+   * an installer write to it while the pass runs — so a file that went away
+   * between the listing and the read is ordinary: the pass keeps the rows it
+   * last published (the panel is stale, never half-updated) and the next
+   * filesystem event, or the next operation, derives again. Nothing here may
+   * escape as an unhandled rejection. */
+  const deriveScheduled = async (): Promise<void> => {
+    try {
+      await refresh();
+    } catch {
+      // Left to the next pass (see above).
+    }
+  };
+
   const schedule = (): void => {
     if (cooling) {
       return;
@@ -215,7 +229,7 @@ export const createWorkspace = async (
     setTimeout(() => {
       cooling = false;
       if (!closed) {
-        void refresh();
+        void deriveScheduled();
       }
     }, COALESCE_MS);
   };
@@ -313,7 +327,7 @@ export const createWorkspace = async (
       await opened.flush();
     },
     fs,
-    listing: () => listCheckout(fs),
+    listing: () => listCheckout(fs, state.base),
     mkdir: async (path: string) => {
       requireWritable();
       await fs.mkdir(projectPath(path), { recursive: true });
@@ -324,7 +338,15 @@ export const createWorkspace = async (
         subscribers.delete(notify);
       };
     },
-    onPeerChange: opened.onPeerChange,
+    /** The peer paths arrive as pod paths; this facade speaks
+     * checkout-relative ones (see `./types`). */
+    onPeerChange: (notify) =>
+      opened.onPeerChange((structural, paths) =>
+        notify(
+          structural,
+          paths.map((path) => relPath(path))
+        )
+      ),
     pod: opened.pod,
     push: async (
       request: WorkspacePush,

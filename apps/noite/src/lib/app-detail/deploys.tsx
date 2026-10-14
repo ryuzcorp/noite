@@ -1,16 +1,25 @@
 //! Deploy history: header dropdown + SSE list.
 import { atom } from "ilha";
 
+import { appHost, appUrl } from "../apps/identity";
 import { formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
 import { decodeDeploys, deploysUrl, feedKeys, liveFeed } from "../feeds";
-import { appDetail, deployLog } from "../resources";
+import { appDetail, deployLog, environments } from "../resources";
+import type { AppRole } from "../roles";
 import type { RunnerDeploy } from "../runner";
+import { searchParam } from "../search-param";
 import { rollback } from "../server/apps.server";
 import { confirmDialog } from "../ui/confirm";
 import { CopyButton } from "../ui/copy-button";
-import { ChevronDown, ChevronUp, CloudUpload } from "../ui/icons";
+import { ChevronDown, ChevronUp, CloudUpload, Plus } from "../ui/icons";
+import { LoadError } from "../ui/load-error";
 import { ListSkeleton } from "../ui/skeletons";
+import {
+  CreateEnvironmentDialog,
+  DeployGroupMeta,
+  EnvironmentGroup,
+} from "./environments";
 import { RuntimeLogs } from "./logs";
 
 export const deployBadge = (status: string) => {
@@ -145,16 +154,19 @@ const FinishedBuildLog = ({
 const BuildLogPane = ({
   appId,
   d,
+  environmentId,
   tab,
 }: {
   appId: string;
   d: RunnerDeploy;
+  /** The row's environment ("" = production): its fleet's runtime logs. */
+  environmentId: string;
   tab: "build" | "deploy";
 }) => {
   if (tab === "deploy") {
     return (
       <div class="bg-base-200 rounded-lg p-3">
-        <RuntimeLogs appId={appId} />
+        <RuntimeLogs appId={appId} environmentId={environmentId} />
       </div>
     );
   }
@@ -174,11 +186,14 @@ const DeployRow = ({
   appId,
   currentSha,
   d,
+  environmentId,
   live,
 }: {
   appId: string;
   currentSha: string | null;
   d: RunnerDeploy;
+  /** The row's environment ("" = production). */
+  environmentId: string;
   /** The deploy serving traffic now, which starts expanded. */
   live: boolean;
 }) => {
@@ -189,7 +204,14 @@ const DeployRow = ({
   const logTab = atom<"build" | "deploy">("deploy");
   const rolling = atom(false);
   const rollError = atom("");
-  const canRollBack = d.status === "success" && !!d.sha && d.sha !== currentSha;
+  // Roll back re-runs production's pipeline at that sha, so it belongs to
+  // production rows only — an environment row must never deploy its sha to
+  // production (its header's Redeploy covers redeploying the environment).
+  const canRollBack =
+    environmentId === "" &&
+    d.status === "success" &&
+    !!d.sha &&
+    d.sha !== currentSha;
   return (
     <>
       <li class="list-row">
@@ -285,35 +307,60 @@ const DeployRow = ({
               Build logs
             </button>
           </div>
-          <BuildLogPane appId={appId} d={d} tab={logTab()} />
+          <BuildLogPane
+            appId={appId}
+            d={d}
+            environmentId={environmentId}
+            tab={logTab()}
+          />
         </li>
       ) : null}
     </>
   );
 };
 
-/** Deploy history over SSE: skeleton until the first frame, then the event
- * stream pushes updates — no polling, and rows never remount underneath
- * an open log. */
-export const DeployList = ({ appId }: { appId: string }) => {
+/** One environment's deploy history over SSE: skeleton until the first frame,
+ * then the event stream pushes updates — no polling, and rows never remount
+ * underneath an open log. `environmentId` is `""` for production. */
+const DeployFeedList = ({
+  appId,
+  emptyText,
+  environmentId,
+}: {
+  appId: string;
+  /** Shown once the feed has loaded with no rows. */
+  emptyText: string;
+  environmentId: string;
+}) => {
   const feed = liveFeed(
-    feedKeys.deploys(appId),
-    deploysUrl(appId),
+    feedKeys.deploys(appId, environmentId),
+    deploysUrl(appId, environmentId),
     decodeDeploys
   );
   const items = (): RunnerDeploy[] => feed.latest() ?? [];
   const loaded = (): boolean =>
     feed.latest() !== undefined || feed.status() === "open";
   const retrying = (): boolean => feed.status() === "retrying";
-  const currentSha = appDetail(appId).data()?.app.lastDeploySha ?? null;
+  const currentSha =
+    environmentId === ""
+      ? (appDetail(appId).data()?.app.lastDeploySha ?? null)
+      : null;
   // One sha can be deployed many times (redeploys, rollbacks); only the
   // newest successful deploy of the live sha is the one serving traffic.
-  // The feed is newest-first.
-  const liveId =
-    currentSha === null
-      ? null
-      : (items().find((d) => d.sha === currentSha && d.status === "success")
-          ?.id ?? null);
+  // The feed is newest-first. In an environment's feed the newest successful
+  // deploy is that environment's live one.
+  const liveId = (): string | null => {
+    if (environmentId !== "") {
+      return items().find((d) => d.status === "success")?.id ?? null;
+    }
+    if (currentSha === null) {
+      return null;
+    }
+    return (
+      items().find((d) => d.sha === currentSha && d.status === "success")?.id ??
+      null
+    );
+  };
   return (
     <div class="flex w-full flex-col gap-4">
       {retrying() ? (
@@ -322,20 +369,14 @@ export const DeployList = ({ appId }: { appId: string }) => {
         </p>
       ) : null}
       <ul class="list bg-base-100 dark:bg-base-200 border-base-300 rounded-box w-full border shadow-md">
-        <li class="flex items-center justify-between gap-2 p-4 pb-2">
-          <span class="flex items-center gap-2 tracking-wide">
-            <span class="text-lg font-semibold">Deployments</span>
-            <span class="badge badge-sm">{items().length}</span>
-          </span>
-        </li>
         {!loaded() && items().length === 0 && !retrying() ? (
-          <li class="px-4 pt-2 pb-4">
+          <li class="px-4 pt-4 pb-4">
             <ListSkeleton rows={2} />
           </li>
         ) : null}
         {loaded() && items().length === 0 && !retrying() ? (
-          <li class="text-base-content/70 px-4 pt-2 pb-4 text-sm">
-            No deployments yet. Push to main to trigger one.
+          <li class="text-base-content/70 px-4 pt-4 pb-4 text-sm">
+            {emptyText}
           </li>
         ) : null}
         {items().map((d) => (
@@ -344,10 +385,99 @@ export const DeployList = ({ appId }: { appId: string }) => {
             appId={appId}
             currentSha={currentSha}
             d={d}
-            live={d.id === liveId}
+            environmentId={environmentId}
+            live={d.id === liveId()}
           />
         ))}
       </ul>
+    </div>
+  );
+};
+
+/** The Deployments tab: Production's live feed first, then one group per
+ * environment (header + its own scoped feed), and **Create environment** in
+ * the header. A `?env=<id>` query deep-links a group — it starts expanded. */
+export const DeployList = ({
+  appId,
+  myRole,
+  subdomain,
+}: {
+  appId: string;
+  myRole: AppRole | undefined;
+  subdomain: string;
+}) => {
+  const res = environments(appId);
+  const app = appDetail(appId).data()?.app;
+  const envs = res.data() ?? [];
+  const open = atom(false);
+  const deep = searchParam("env", { default: "" });
+  const canPush = myRole === "push" || myRole === "admin";
+  return (
+    <div class="flex w-full flex-col gap-4">
+      <div class="flex items-center justify-between gap-2">
+        <h2 class="m-0 text-lg font-semibold">Deployments</h2>
+        {canPush ? (
+          <button
+            type="button"
+            class="btn btn-sm btn-neutral"
+            onclick={() => {
+              open.set(true);
+            }}
+          >
+            <Plus />
+            Create environment
+          </button>
+        ) : null}
+      </div>
+      <div class="flex w-full flex-col gap-2">
+        <div class="bg-base-100 dark:bg-base-200 border-base-300 rounded-box flex w-full flex-wrap items-center gap-x-3 gap-y-2 border px-4 py-3 shadow-md">
+          <span class="text-lg font-semibold">Production</span>
+          {app ? (
+            <DeployGroupMeta
+              appId={appId}
+              host={appHost(subdomain)}
+              sha={app.lastDeploySha}
+              status={app.status}
+              url={appUrl(subdomain)}
+            />
+          ) : null}
+        </div>
+        <DeployFeedList
+          appId={appId}
+          emptyText="No deployments yet. Push to main to trigger one."
+          environmentId=""
+        />
+      </div>
+      <LoadError error={res.error()} />
+      {envs.map((env) => (
+        <EnvironmentGroup
+          key={env.id}
+          appId={appId}
+          defaultOpen={deep() === env.id}
+          env={env}
+          myRole={myRole}
+          subdomain={subdomain}
+        >
+          <DeployFeedList
+            appId={appId}
+            emptyText="No deployments yet for this environment."
+            environmentId={env.id}
+          />
+        </EnvironmentGroup>
+      ))}
+      {envs.length === 0 && res.data() !== undefined ? (
+        <p class="m-0 text-sm opacity-70">
+          No environments yet — create one from a branch above, or deploy a
+          preview from Code mode.
+        </p>
+      ) : null}
+      <CreateEnvironmentDialog
+        appId={appId}
+        onCreated={(env) => {
+          deep.set(env.id);
+        }}
+        open={open}
+      />
     </div>
   );
 };

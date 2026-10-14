@@ -23,6 +23,10 @@ import {
 } from "./server/collaborators.server";
 import { listDomains } from "./server/domains.server";
 import { listEnv } from "./server/env.server";
+import {
+  environmentVars as fetchEnvironmentVars,
+  listEnvironments,
+} from "./server/environments.server";
 import { errorDetail as fetchErrorDetail } from "./server/errors.server";
 import { getLimits } from "./server/limits.server";
 import {
@@ -137,6 +141,9 @@ export const keys = {
     `app:${appId}:do:${className}`,
   domains: (id: string) => `app:${id}:domains`,
   envVars: (id: string) => `app:${id}:env`,
+  environmentVars: (appId: string, envId: string) =>
+    `app:${appId}:environment:${envId}:vars`,
+  environments: (id: string) => `app:${id}:environments`,
   errorDetail: (appId: string, fingerprint: string) =>
     `app:${appId}:error:${fingerprint}`,
   inviteCodes: "me:invites",
@@ -193,6 +200,23 @@ export const limits = (id: string) =>
 export const envVars = (id: string) =>
   tracked(keys.envVars(id), () => listEnv(id));
 
+/** Every preview environment of one app (view-gated server side). */
+export const environments = (id: string) =>
+  tracked(keys.environments(id), () => listEnvironments(id));
+
+/** Drop the cached environment rows of one app: a deploy created one, moved
+ * one's tip or changed its status, and every reader of the list (the Preview
+ * panel, the Deployments tab) must read them again. */
+export const invalidateEnvironments = (id: string): void => {
+  invalidate(keys.environments(id));
+};
+
+/** One environment's variable overrides, redacted (view-gated server side). */
+export const environmentVars = (appId: string, envId: string) =>
+  tracked(keys.environmentVars(appId, envId), () =>
+    fetchEnvironmentVars({ appId, envId })
+  );
+
 /** One error with its latest occurrences. */
 export const errorDetail = (appId: string, fingerprint: string) =>
   tracked(keys.errorDetail(appId, fingerprint), () =>
@@ -206,6 +230,11 @@ export interface SessionView {
   session: { impersonatedBy: string | null };
   user: {
     email: string;
+    /** The viewer's user id: the segment of their hidden preview refs
+     * (`refs/previews/<id>/<branch>`), and what tells their own workspace
+     * preview from another collaborator's. Never a secret — an environment's
+     * host is minted from it. */
+    id: string;
     name: string;
     /** Server-set first-run marker; null until `completeOnboarding`. */
     onboardedAt: string | null;
@@ -233,6 +262,7 @@ export const session = () =>
       },
       user: {
         email: data.user.email,
+        id: data.user.id,
         name: data.user.name,
         onboardedAt:
           onboardedAt === null || onboardedAt === undefined

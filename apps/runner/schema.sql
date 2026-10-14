@@ -42,10 +42,50 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_app_build_uid ON app(build_uid);
 
 CREATE INDEX IF NOT EXISTS idx_app_user ON app(user_id);
 
+-- Preview environments (ROADMAP, Preview environments): one row per branch or
+-- workspace preview. An environment is its own celld fleet with its own bucket
+-- prefix (`envs/<slug>/<label>`), so it can neither read nor wipe production's
+-- bucket, ports or `last_deploy_sha`; `main` is the app itself, never an
+-- environment. Hard DELETE is the only remove path, like `app`.
+CREATE TABLE IF NOT EXISTS environment (
+  id TEXT PRIMARY KEY NOT NULL,
+  app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,
+  -- DNS label: unique per app, the host is `<label>.<slug>.<base>`.
+  label TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('branch','workspace')),
+  -- `refs/heads/<branch>` for a branch environment,
+  -- `refs/previews/<userId>/<branch>` for a workspace preview.
+  git_ref TEXT NOT NULL,
+  created_by TEXT NOT NULL DEFAULT '',
+  fleet_bucket TEXT NOT NULL,
+  listen_port INTEGER,
+  internal_port INTEGER,
+  -- Observed status (AppStatus strings) written by deploy / reconcile.
+  status TEXT NOT NULL DEFAULT 'pending',
+  desired_state TEXT NOT NULL DEFAULT 'running',
+  asleep_since TEXT,
+  woke_at TEXT,
+  last_deploy_sha TEXT,
+  last_deployed_at TEXT,
+  -- Members-only by default (ROADMAP): 1 serves the environment publicly.
+  public INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (app_id, label)
+);
+
+CREATE INDEX IF NOT EXISTS idx_environment_app ON environment(app_id);
+CREATE INDEX IF NOT EXISTS idx_environment_ref ON environment(app_id, git_ref);
+CREATE INDEX IF NOT EXISTS idx_environment_deployed ON environment(last_deployed_at);
+
 -- Deploy attempts: status + capped build/deploy log tail per push.
 CREATE TABLE IF NOT EXISTS deploy (
   id TEXT PRIMARY KEY NOT NULL,
   app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,
+  -- NULL = production. Set for a preview environment's deploy, which never
+  -- touches `app.last_deploy_sha` or the app's own status.
+  environment_id TEXT REFERENCES environment(id) ON DELETE CASCADE,
   sha TEXT,
   status TEXT NOT NULL DEFAULT 'queued',
   log TEXT NOT NULL DEFAULT '',
@@ -54,6 +94,7 @@ CREATE TABLE IF NOT EXISTS deploy (
 );
 
 CREATE INDEX IF NOT EXISTS idx_deploy_app ON deploy(app_id);
+CREATE INDEX IF NOT EXISTS idx_deploy_environment ON deploy(environment_id);
 
 -- Per-app usage metrics, edge analytics, span stats, log ring, errors,
 -- watermarks and compaction state live in metrics.sqlite
@@ -69,6 +110,17 @@ CREATE TABLE IF NOT EXISTS app_env (
   value TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL,
   PRIMARY KEY (app_id, name)
+);
+
+-- Per-environment overrides on top of the app's variables (ROADMAP: an
+-- environment inherits the app's variables, with optional per-environment
+-- overrides). Same reserved-name filtering as `app_env` at inject time.
+CREATE TABLE IF NOT EXISTS environment_env (
+  environment_id TEXT NOT NULL REFERENCES environment(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  value TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (environment_id, name)
 );
 
 -- Tenant app events (LogSnag-style): channel-grouped event log, user

@@ -131,6 +131,11 @@ async fn reconcile_once(
     }
 
     let apps = db::list_apps(pool).await?;
+    let stopped_apps: HashSet<String> = apps
+        .iter()
+        .filter(|a| a.desired() == DesiredState::Stopped)
+        .map(|a| a.id.clone())
+        .collect();
     for app in &apps {
         if app.desired() == DesiredState::Stopped {
             supervisor::stop_fleet(procs, &app.slug).await;
@@ -178,30 +183,130 @@ async fn reconcile_once(
 
         match tips::head_main_bundle(cfg, &app.slug).await {
             Ok(Some(tip)) => {
-                let already = app
-                    .last_deploy_sha
-                    .as_ref()
+                let target = deploy::DeployTarget::Production;
+                let already = target
+                    .last_deploy_sha(app)
+                    .as_deref()
                     .is_some_and(|s| sha_same(s, &tip.sha));
                 if already {
                     continue;
                 }
                 tracing::info!(slug = %app.slug, sha = %&tip.sha[..12.min(tip.sha.len())], "git tip changed");
-                spawn_tip_deploy(pool, cfg, procs, logs, deploying, app.clone(), tip);
+                spawn_tip_deploy(pool, cfg, procs, logs, deploying, app.clone(), target, tip);
             }
             Ok(None) => {}
             Err(e) => tracing::warn!(slug = %app.slug, error = %e, "list tip"),
         }
     }
 
+    // Preview environments are fleets of their own: same desired_state rule,
+    // same wake-aware parking, and their own ref drives their deploys.
+    let environments = db::list_all_environments(pool).await?;
+    for env in &environments {
+        let fleet = format!("{}.{}", env.app_slug, env.label);
+        if env.is_stopped() || stopped_apps.contains(&env.app_id) {
+            supervisor::stop_environment_fleet(procs, &env.app_slug, &env.label).await;
+            if env.is_stopped() && env.status != AppStatus::Stopped.as_str() {
+                db::update_environment_status(pool, &env.id, AppStatus::Stopped.as_str(), None)
+                    .await?;
+            }
+            continue;
+        }
+        if env.listen_port.is_some() && env.is_deployed() && !env.is_asleep() {
+            match supervisor::ensure_environment_fleet(pool, cfg, procs, logs, env).await {
+                Ok(()) => {
+                    if env.status != AppStatus::Running.as_str() {
+                        db::update_environment_status(
+                            pool,
+                            &env.id,
+                            AppStatus::Running.as_str(),
+                            None,
+                        )
+                        .await?;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(fleet = %fleet, error = %e, "ensure_environment_fleet");
+                    let msg = format!("{e:#}");
+                    db::update_environment_status(pool, &env.id, &env.status, Some(&msg)).await?;
+                }
+            }
+        }
+
+        if !sweep_due {
+            continue;
+        }
+        if env_has_in_flight(pool, &env.id).await || claimed.contains(&env.app_id) {
+            continue;
+        }
+        match tips::head_ref_bundle(cfg, &env.app_slug, &env.git_ref).await {
+            Ok(Some(tip)) => {
+                let Some(app) = apps.iter().find(|a| a.id == env.app_id).cloned() else {
+                    continue;
+                };
+                let target = deploy::DeployTarget::Environment(Box::new(env.clone()));
+                let already = target
+                    .last_deploy_sha(&app)
+                    .as_deref()
+                    .is_some_and(|s| sha_same(s, &tip.sha));
+                if already {
+                    continue;
+                }
+                tracing::info!(fleet = %fleet, sha = %&tip.sha[..12.min(tip.sha.len())], "git tip changed");
+                spawn_tip_deploy(pool, cfg, procs, logs, deploying, app, target, tip);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(fleet = %fleet, error = %e, "list tip"),
+        }
+    }
+
+    if sweep_due {
+        sweep_expired_environments(pool, cfg, procs, logs).await;
+    }
+
     let visible = db::list_apps(pool).await?;
     let domains = db::list_app_domains(pool).await.unwrap_or_default();
     let limits = db::list_app_limits(pool).await.unwrap_or_default();
-    caddy::rewrite_caddy(cfg, &visible, &domains, &limits).await?;
-    // Backstop for a fleet left running after its app's row was deleted.
+    let routes = db::list_environment_routes(pool).await.unwrap_or_default();
+    caddy::rewrite_caddy(cfg, &visible, &domains, &limits, &routes).await?;
+    // Backstop for a fleet left running after its app's (or environment's)
+    // row was deleted.
     supervisor::stop_orphan_fleets(pool, procs).await;
 
     metrics::tick(pool, cfg, procs, control_pid, metrics, log_tx).await?;
     Ok(())
+}
+
+/// Remove workspace previews with no deploy for `RUNNER_ENVIRONMENT_TTL_H`
+/// (ROADMAP: 7 days). Branch environments are never swept here — they live
+/// until their branch or their owner deletes them.
+async fn sweep_expired_environments(
+    pool: &SqlitePool,
+    cfg: &Config,
+    procs: &ProcMap,
+    logs: &LogState,
+) {
+    if cfg.environment_ttl_h == 0 {
+        return;
+    }
+    let cutoff = (chrono::Utc::now() - chrono::Duration::hours(cfg.environment_ttl_h as i64))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let Ok(expired) = db::expired_workspace_environments(pool, &cutoff).await else {
+        return;
+    };
+    for env in expired {
+        tracing::info!(
+            fleet = %format!("{}.{}", env.app_slug, env.label),
+            "workspace preview expired; removing"
+        );
+        if let Err(e) = crate::host::env_teardown::teardown(cfg, pool, procs, logs, &env).await {
+            tracing::warn!(
+                fleet = %format!("{}.{}", env.app_slug, env.label),
+                error = %format!("{e:#}"),
+                "expired environment teardown failed"
+            );
+        }
+    }
 }
 
 /// True while a recent deploy row is still in flight (T1.6's log-free check):
@@ -225,11 +330,35 @@ async fn app_has_in_flight(pool: &SqlitePool, app_id: &str) -> bool {
     })
 }
 
+/// True while a recent deploy row of one environment is still in flight; the
+/// same "busy on a sick database" rule as [`app_has_in_flight`].
+async fn env_has_in_flight(pool: &SqlitePool, environment_id: &str) -> bool {
+    let Ok(recent) = db::latest_deploy_status_for_env(pool, environment_id).await else {
+        return true;
+    };
+    recent.iter().any(|(status, updated_at)| {
+        let Some(st) = crate::models::DeployStatus::parse(status) else {
+            return false;
+        };
+        if !st.is_in_flight() {
+            return false;
+        }
+        crate::models::parse_time(updated_at)
+            .map(|t| (chrono::Utc::now() - t).num_milliseconds() < DEPLOY_IN_FLIGHT_MS)
+            .unwrap_or(false)
+    })
+}
+
 /// One queued push notification: look the app up fresh (it may have stopped
-/// since the push), skip stale/in-flight tips, and deploy the rest. Stopped
-/// apps keep accumulating tips in the bucket for the sweep that runs when
-/// they resume — the sweep compares against `last_deploy_sha`, so nothing is
-/// lost by skipping here.
+/// since the push), resolve what the moved ref deploys, skip stale/in-flight
+/// tips, and deploy the rest.
+///
+/// `refs/heads/main` is production; any other ref deploys the environment that
+/// tracks it, and a ref nothing tracks is not a deploy at all (an ordinary
+/// branch push without an environment must stay cheap). Stopped apps and
+/// environments keep accumulating tips in the bucket for the sweep that runs
+/// when they resume — the sweep compares against `last_deploy_sha`, so nothing
+/// is lost by skipping here.
 async fn drain_tip(
     pool: &SqlitePool,
     cfg: &Config,
@@ -245,23 +374,52 @@ async fn drain_tip(
     if app.desired() == DesiredState::Stopped {
         return;
     }
-    if app
-        .last_deploy_sha
-        .as_ref()
+    let target = if notify.git_ref == "refs/heads/main" {
+        deploy::DeployTarget::Production
+    } else {
+        match db::get_environment_by_ref(pool, &app.id, &notify.git_ref).await {
+            Ok(Some(env)) => {
+                if env.is_stopped() {
+                    return;
+                }
+                deploy::DeployTarget::Environment(Box::new(env))
+            }
+            // Nothing tracks this ref: a plain branch push deploys nothing.
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(slug = %app.slug, error = %e, "environment lookup for tip");
+                return;
+            }
+        }
+    };
+    if target
+        .last_deploy_sha(&app)
+        .as_deref()
         .is_some_and(|s| sha_same(s, &notify.tip.sha))
     {
         return;
     }
-    if claimed.contains(&app.id) || app_has_in_flight(pool, &app.id).await {
+    // Builds are serialized per app, so one claim covers both targets; the
+    // in-flight check is per target, because a preview's build must not block
+    // production's (and vice versa) once the lock is free.
+    if claimed.contains(&app.id) {
         return;
     }
-    tracing::info!(slug = %app.slug, sha = %&notify.tip.sha[..12.min(notify.tip.sha.len())], "push notified tip");
-    spawn_tip_deploy(pool, cfg, procs, logs, deploying, app, notify.tip);
+    let busy = match target.environment_id() {
+        Some(env_id) => env_has_in_flight(pool, env_id).await,
+        None => app_has_in_flight(pool, &app.id).await,
+    };
+    if busy {
+        return;
+    }
+    tracing::info!(slug = %app.slug, git_ref = %notify.git_ref, sha = %&notify.tip.sha[..12.min(notify.tip.sha.len())], "push notified tip");
+    spawn_tip_deploy(pool, cfg, procs, logs, deploying, app, target, notify.tip);
 }
 
 /// Hand a fresh tip to the deploy pipeline on its own task: the loop must
 /// never block behind a build. `deploy_tip` re-checks the sha, so a tip that
 /// went stale between the check above and the spawn is still safe.
+#[allow(clippy::too_many_arguments)] // the loop's shared deps plus the resolved target
 fn spawn_tip_deploy(
     pool: &SqlitePool,
     cfg: &Config,
@@ -269,6 +427,7 @@ fn spawn_tip_deploy(
     logs: &LogState,
     deploying: &Deploying,
     app: App,
+    target: deploy::DeployTarget,
     tip: TipBundle,
 ) {
     let pool = pool.clone();
@@ -277,6 +436,113 @@ fn spawn_tip_deploy(
     let logs = logs.clone();
     let deploying = deploying.clone();
     tokio::spawn(async move {
-        deploy::deploy_tip(&pool, &cfg, &procs, &logs, &deploying, app, tip).await;
+        deploy::deploy_tip(&pool, &cfg, &procs, &logs, &deploying, app, target, tip).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The expiry sweep removes workspace previews with no deploy for the TTL
+    /// and never touches a branch environment (ROADMAP, lifecycle).
+    /// `expired_workspace_environments` is the query it drives; this proves the
+    /// sweep wires it to a real teardown.
+    #[tokio::test]
+    async fn expiry_sweep_removes_only_stale_workspace_previews() {
+        use crate::models::EnvironmentKind;
+        let base =
+            std::env::temp_dir().join(format!("noite-env-expiry-{}", crate::models::new_id()));
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = base.join("work").to_string_lossy().into_owned();
+        cfg.s3_endpoint = crate::testutil::spawn_s3_stub().await;
+        cfg.environment_ttl_h = 168;
+        let pool = db::connect("sqlite::memory:").await.expect("memory db");
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "ttl",
+                slug: "ttl",
+                user_id: "local",
+                subdomain: "ttl.localhost",
+                listen: 30300,
+                internal: 30301,
+            },
+        )
+        .await
+        .expect("app");
+        let workspace = db::create_environment(
+            &pool,
+            &cfg,
+            db::NewEnvironment {
+                app_id: &app.id,
+                slug: "ttl",
+                label: "wip-user",
+                kind: EnvironmentKind::Workspace,
+                git_ref: "refs/previews/user/wip",
+                created_by: "user",
+                listen: 30310,
+                internal: 30311,
+            },
+        )
+        .await
+        .expect("workspace env");
+        let branch = db::create_environment(
+            &pool,
+            &cfg,
+            db::NewEnvironment {
+                app_id: &app.id,
+                slug: "ttl",
+                label: "kept",
+                kind: EnvironmentKind::Branch,
+                git_ref: "refs/heads/kept",
+                created_by: "user",
+                listen: 30320,
+                internal: 30321,
+            },
+        )
+        .await
+        .expect("branch env");
+        // Age the workspace preview (and its deploy clock) past the TTL.
+        sqlx::query(
+            "UPDATE environment SET created_at = '2020-01-01T00:00:00.000Z', \
+                     last_deployed_at = NULL WHERE id = ?",
+        )
+        .bind(&workspace.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let procs = supervisor::new_procs();
+        let logs = crate::host::logs::new_state();
+        sweep_expired_environments(&pool, &cfg, &procs, &logs).await;
+
+        assert!(
+            db::get_environment(&pool, &workspace.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the stale workspace preview is gone"
+        );
+        assert!(db::get_environment(&pool, &branch.id)
+            .await
+            .unwrap()
+            .is_some());
+
+        // TTL 0 disables the sweep entirely.
+        cfg.environment_ttl_h = 0;
+        sqlx::query("UPDATE environment SET created_at = '2020-01-01T00:00:00.000Z' WHERE id = ?")
+            .bind(&branch.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sweep_expired_environments(&pool, &cfg, &procs, &logs).await;
+        assert!(db::get_environment(&pool, &branch.id)
+            .await
+            .unwrap()
+            .is_some());
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

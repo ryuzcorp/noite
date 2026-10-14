@@ -80,17 +80,39 @@ pub async fn app_metrics_version(
         .map(Json)
 }
 
-pub async fn app_logs(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    service::observe::logs_lines(&state, &id).await.map(Json)
+/// `?environmentId=` — one preview environment's live log; absent is the
+/// app's own fleet (production, or the control fleet).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogsQuery {
+    #[serde(default)]
+    pub environment_id: Option<String>,
+}
+
+pub async fn app_logs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<LogsQuery>,
+) -> impl IntoResponse {
+    service::observe::logs_lines(&state, &id, q.environment_id.as_deref())
+        .await
+        .map(Json)
 }
 
 /// Live log tail as server-sent events: one JSON array per message, sent
 /// only when the snapshot changed (plus keep-alive comments). Wakes on the
 /// ingest tick's "new logs" signal (spec T3.3) instead of polling DuckDB, and
-/// ends when the client disconnects.
-pub async fn app_logs_stream(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let (app_id, slug) = match service::observe::telemetry_target_or_404(&state.pool, &id).await {
-        Ok(target) => target,
+/// ends when the client disconnects. `?environmentId=` serves that
+/// environment's ring instead (its telemetry is not ingested, so there is no
+/// OTel merge and no production data in it).
+pub async fn app_logs_stream(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<LogsQuery>,
+) -> Response {
+    let source = match service::observe::log_source(&state, &id, q.environment_id.as_deref()).await
+    {
+        Ok(source) => source,
         Err(e) => return e.into_response(),
     };
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, anyhow::Error>>(16);
@@ -101,7 +123,7 @@ pub async fn app_logs_stream(State(state): State<AppState>, Path(id): Path<Strin
     tokio::spawn(async move {
         let mut last: Option<Vec<String>> = None;
         loop {
-            let lines = service::observe::merged_lines(&state, &app_id, &slug).await;
+            let lines = source.lines(&state).await;
             if last.as_ref() != Some(&lines) {
                 let data = serde_json::to_string(&lines).unwrap_or_default();
                 if tx.send(Ok(Event::default().data(data))).await.is_err() {

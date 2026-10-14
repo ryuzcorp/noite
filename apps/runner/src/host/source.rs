@@ -27,8 +27,13 @@ pub const MAX_BUNDLE_FILE: u64 = 256 * 1024;
 pub const MAX_BUNDLE_TOTAL: u64 = 8 * 1024 * 1024;
 
 /// Extensions the code editor loads. `.d.ts`/`.d.mts`/`.d.cts` all end in one
-/// of these, so the declaration files ride along.
-const BUNDLE_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "json"];
+/// of these, so the declaration files ride along. The lockfiles
+/// (`bun.lock`/`pnpm-lock.yaml`/`yarn.lock`) come too so the editor can pin
+/// package versions; `.lock` also matches other lockfile flavors, which is
+/// harmless text.
+const BUNDLE_EXTENSIONS: &[&str] = &[
+    "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "json", "lock", "yaml",
+];
 
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -64,8 +69,8 @@ pub struct BlobResponse {
     pub text: String,
 }
 
-/// One text source crossing the wire: the same shape `source.bundle` and
-/// `source.types` both use, so the editor loads either into one map.
+/// One text source crossing the wire, the shape `source.bundle` uses so the
+/// editor loads it into one map.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]

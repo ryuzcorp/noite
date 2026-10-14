@@ -6,38 +6,91 @@ import { atom } from "ilha";
 import { DiffView } from "../forge/diff";
 import type { AppRole } from "../roles";
 import type { PrDetail } from "../runner";
-import { groupLineComments, splitPatchFiles } from "./data";
-import type { DiffSide, LineThread } from "./data";
+import { groupLineComments, isLargeDiff, splitPatchFiles } from "./data";
+import type { LineThread } from "./data";
 import { CommentCard, CommentComposer, SIDE_LABEL } from "./widgets";
 import type { ComposerAnchor } from "./widgets";
 
-/** The line a click landed on, read from pierre's rows: content rows carry
- * `data-line`, gutter rows `data-column-number`, both with `data-line-type`. */
-const lineFromEvent = (
-  event: MouseEvent
-): { line: number; side: DiffSide } | null => {
-  for (const node of event.composedPath()) {
-    if (!(node instanceof HTMLElement)) {
-      continue;
-    }
-    const raw = node.dataset.line ?? node.dataset.columnNumber;
-    if (raw === undefined) {
-      continue;
-    }
-    const line = Math.trunc(Number(raw));
-    if (!Number.isSafeInteger(line) || line <= 0) {
-      continue;
-    }
-    return {
-      line,
-      side: (node.dataset.lineType ?? "").includes("deletion") ? "old" : "new",
-    };
+/** A file's diff over the large-diff thresholds, collapsed until asked for. */
+const LargeDiff = ({ patch }: { patch: string }) => {
+  const shown = atom(false);
+  return (
+    <div class="border-base-300 flex flex-col items-start gap-2 rounded-lg border p-3">
+      {shown() ? (
+        <div class="w-full">
+          <DiffView emptyLabel="(no changes)" patch={patch} />
+        </div>
+      ) : (
+        <button
+          type="button"
+          class="btn btn-sm btn-ghost"
+          onclick={() => {
+            shown.set(true);
+          }}
+        >
+          Large diff — show anyway
+        </button>
+      )}
+    </div>
+  );
+};
+
+/** One thread's reply state: a composer while replying, a Reply link
+ * otherwise. Rendered only when the viewer can comment. */
+const ReplyBox = ({
+  appId,
+  commitSha,
+  number,
+  thread,
+}: {
+  appId: string;
+  commitSha: string;
+  number: number;
+  thread: LineThread;
+}) => {
+  const replying = atom(false);
+  if (!replying()) {
+    return (
+      <button
+        type="button"
+        class="link link-hover w-fit text-xs"
+        onclick={() => {
+          replying.set(true);
+        }}
+      >
+        Reply
+      </button>
+    );
   }
-  return null;
+  return (
+    <div class="flex flex-col gap-2">
+      <CommentComposer
+        appId={appId}
+        anchor={{ ...thread.anchor, commitSha }}
+        number={number}
+        placeholder="Reply"
+        submitLabel="Reply"
+        onPosted={() => {
+          replying.set(false);
+        }}
+      />
+      <button
+        type="button"
+        class="link link-hover w-fit text-xs"
+        onclick={() => {
+          replying.set(false);
+        }}
+      >
+        Cancel
+      </button>
+    </div>
+  );
 };
 
 const Thread = ({
   appId,
+  canComment,
+  commitSha,
   number,
   thread,
   names,
@@ -45,45 +98,41 @@ const Thread = ({
   viewerId,
 }: {
   appId: string;
+  canComment: boolean;
+  commitSha: string;
   number: number;
   thread: LineThread;
   names: Record<string, string> | undefined;
   role: AppRole | undefined;
   viewerId: string;
-}) => {
-  const replying = atom(false);
-  return (
-    <div class="border-base-300 flex flex-col gap-2 border-l-2 pl-3">
-      <span class="text-base-content/70 font-mono text-xs">
-        {thread.anchor.path}:{thread.anchor.line} ·{" "}
-        {SIDE_LABEL[thread.anchor.side]}
-      </span>
-      {thread.comments.map((comment) => (
-        <CommentCard
-          key={comment.id}
-          appId={appId}
-          comment={comment}
-          names={names}
-          number={number}
-          role={role}
-          showAnchor={false}
-          viewerId={viewerId}
-        />
-      ))}
-      {replying() ? null : (
-        <button
-          type="button"
-          class="link link-hover w-fit text-xs"
-          onclick={() => {
-            replying.set(true);
-          }}
-        >
-          Reply
-        </button>
-      )}
-    </div>
-  );
-};
+}) => (
+  <div class="border-base-300 flex flex-col gap-2 border-l-2 pl-3">
+    <span class="text-base-content/70 font-mono text-xs">
+      {thread.anchor.path}:{thread.anchor.line} ·{" "}
+      {SIDE_LABEL[thread.anchor.side]}
+    </span>
+    {thread.comments.map((comment) => (
+      <CommentCard
+        key={comment.id}
+        appId={appId}
+        comment={comment}
+        names={names}
+        number={number}
+        role={role}
+        showAnchor={false}
+        viewerId={viewerId}
+      />
+    ))}
+    {canComment ? (
+      <ReplyBox
+        appId={appId}
+        commitSha={commitSha}
+        number={number}
+        thread={thread}
+      />
+    ) : null}
+  </div>
+);
 
 export const PrFilesTab = ({
   appId,
@@ -116,18 +165,30 @@ export const PrFilesTab = ({
     );
   }
   const threads = groupLineComments(detail.comments);
+  const canComment = role === "push" || role === "admin";
 
   return (
     <div class="flex flex-col gap-6">
+      {canComment ? null : (
+        <p class="text-base-content/70 m-0 text-sm">
+          You need push access to comment.
+        </p>
+      )}
       {files.map((file) => {
         const stat = compare.files.find((entry) => entry.path === file.path);
+        const touchesFile = active()?.path === file.path;
+        const composer = touchesFile ? active() : null;
         const fileThreads = (threads.get(file.path) ?? [])
           .map((thread) => ({
             anchor: thread.anchor,
             comments: thread.comments.filter((comment) => !comment.outdated),
           }))
           .filter((thread) => thread.comments.length > 0);
-        const composer = active()?.path === file.path ? active() : null;
+        const large = isLargeDiff(
+          file.patch,
+          stat?.additions ?? null,
+          stat?.deletions ?? null
+        );
         return (
           <section key={file.path} class="flex flex-col gap-2">
             <header class="flex flex-wrap items-center gap-2">
@@ -139,40 +200,46 @@ export const PrFilesTab = ({
                     : `+${stat.additions} −${stat.deletions}`}
                 </span>
               )}
-              <button
-                type="button"
-                class="link link-hover text-xs"
-                onclick={() => {
-                  active.set({
-                    commitSha: compare.headSha,
-                    line: 1,
-                    path: file.path,
-                    side: "new",
-                  });
-                }}
-              >
-                Comment on a line
-              </button>
+              {canComment ? (
+                <button
+                  type="button"
+                  class="link link-hover text-xs"
+                  onclick={() => {
+                    active.set({
+                      commitSha: compare.headSha,
+                      line: 1,
+                      path: file.path,
+                      side: "new",
+                    });
+                  }}
+                >
+                  Comment on a line
+                </button>
+              ) : null}
             </header>
-            <div
-              class="border-base-300 overflow-hidden rounded-lg border"
-              onclick={(event) => {
-                if (!window.getSelection()?.isCollapsed) {
-                  return;
-                }
-                const hit = lineFromEvent(event);
-                if (hit) {
-                  active.set({
-                    commitSha: compare.headSha,
-                    line: hit.line,
-                    path: file.path,
-                    side: hit.side,
-                  });
-                }
-              }}
-            >
-              <DiffView emptyLabel="(no changes)" patch={file.patch} />
-            </div>
+            {large ? (
+              <LargeDiff patch={file.patch} />
+            ) : (
+              <div class="border-base-300 overflow-hidden rounded-lg border">
+                <DiffView
+                  key={canComment ? "commentable" : "read-only"}
+                  emptyLabel="(no changes)"
+                  onLineClick={
+                    canComment
+                      ? (hit) => {
+                          active.set({
+                            commitSha: compare.headSha,
+                            line: hit.line,
+                            path: file.path,
+                            side: hit.side,
+                          });
+                        }
+                      : undefined
+                  }
+                  patch={file.patch}
+                />
+              </div>
+            )}
             {composer ? (
               <div class="border-base-300 flex flex-col gap-2 rounded-lg border p-3">
                 <div class="flex flex-wrap items-center gap-2">
@@ -236,6 +303,8 @@ export const PrFilesTab = ({
               <Thread
                 key={`${thread.anchor.line}:${thread.anchor.side}`}
                 appId={appId}
+                canComment={canComment}
+                commitSha={compare.headSha}
                 names={names}
                 number={detail.pullRequest.number}
                 role={role}

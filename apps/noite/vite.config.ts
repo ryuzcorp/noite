@@ -112,8 +112,8 @@ const POD_ASSETS: Record<string, true> = Object.fromEntries(
  * `root` and where `index.html` and `src/` live. */
 const APP_ROOT = import.meta.dirname;
 
-/** `src/pod-host/main.ts`, the whole pod — Nodepod, the checkout, the preview
- * and the shell — as one client-side entry. */
+/** `src/pod-host/main.ts`, the whole pod — Nodepod, the checkout and the
+ * shell — as one client-side entry. */
 const POD_HOST_ENTRY = "noite-pod-host";
 const POD_HOST_ENTRY_MODULE = "src/pod-host/main.ts";
 
@@ -141,7 +141,7 @@ const podHostFile = (pathname: string): PodHostFile | null => {
 };
 
 /** The frame entry, built with the control UI's client bundle: one extra entry
- * and the one file name that cannot carry a content hash, because the preview
+ * and the one file name that cannot carry a content hash, because the pod
  * host serves it at the fixed path `/noite-pod-host.js` (`POD_HOST_JS_PATH`) —
  * the document is a string, so nothing can interpolate a hashed name into it.
  * Every other entry keeps Vite's hashed name.
@@ -174,10 +174,10 @@ const podHostEntry = (): Plugin => ({
 });
 
 /** The dev server's half of the pod assets' routing, which production splits
- * between the router (`src/http/routes/nodepod.ts`) and Caddy's preview site:
+ * between the router (`src/http/routes/nodepod.ts`) and Caddy's pod-host site:
  *
  * - the pod host document is the app's own response, with `POD_HOST_HEADERS`,
- *   on the app's preview host only;
+ *   on the app's pod host only;
  * - every other pod asset path answers 404 on any other host, so the control
  *   UI's origin serves neither a worker script nor a service worker. Nodepod's
  *   own middleware is host-agnostic, so this has to run before it (the plugin
@@ -220,6 +220,85 @@ const podHostFrame = (): Plugin => ({
   name: "pod-host-frame",
 });
 
+/** Deps only a dynamic `import()` or a late-loaded feature reaches. Vite's
+ * dep-optimizer scan walks static imports only, so the browser "discovers"
+ * these when the feature first loads (Code mode's pierre bundle, the terminal,
+ * the language-service worker); the discovery re-optimizes the environment and
+ * every client full-reloads — mid-session, taking the in-flight actions with
+ * it. Naming them here bundles them up front, so discovery never fires then. */
+const LATE_DEPS = [
+  "@better-auth/api-key/client",
+  "@better-auth/passkey/client",
+  "@ilha/router",
+  "@pierre/diffs",
+  "@pierre/diffs/edit",
+  "@pierre/highlights",
+  "@pierre/highlights/themes/pierre-dark",
+  "@pierre/highlights/themes/pierre-light",
+  "@pierre/trees",
+  "better-auth/client",
+  "better-auth/client/plugins",
+  "effect/Schema",
+  "effect/reactivity/Atom",
+  "ghostty-web",
+  "ilha/jsx-dev-runtime",
+  "oxidejs/mutation-queue",
+  "scule",
+  "typescript-ls",
+] as const;
+
+/** The worker environment's dependencies. The Cloudflare plugin scans
+ * `src/worker.ts` for them, but that file is only
+ * `export … from "virtual:oxide/worker"` — esbuild cannot walk a virtual id,
+ * so the scan finds almost nothing and the worker discovers its whole dep set
+ * at runtime instead. Each discovery re-optimizes the worker environment: the
+ * optimized-bundle hash changes with it, so the module runner inside workerd
+ * discards its cache and re-imports every module of the graph — measured at
+ * ~60 s of workerd CPU (30 s wall) per pass, once per discovered batch, and
+ * the worker answers nothing while it runs. That is the dev cold start: the
+ * action dies at the 15 s server bound and the client's 20 s one, and the edge
+ * 504s at 30 s. Bundling the set up front leaves discovery nothing to find. */
+const WORKER_DEPS = [
+  "@better-auth/api-key",
+  "@better-auth/api-key/client",
+  "@better-auth/kysely-adapter",
+  "@better-auth/passkey",
+  "@better-auth/passkey/client",
+  "@effect/sql-d1",
+  "@ilha/router",
+  "@ilha/router/ssr",
+  "@pierre/diffs",
+  "@pierre/diffs/edit",
+  "@pierre/highlights",
+  "@pierre/highlights/themes/pierre-dark",
+  "@pierre/highlights/themes/pierre-light",
+  "@pierre/trees",
+  "better-auth",
+  "better-auth/api",
+  "better-auth/client",
+  "better-auth/client/plugins",
+  "better-auth/plugins",
+  "better-auth/plugins/email-otp",
+  "effect",
+  "effect/Effect",
+  "effect/Schema",
+  "effect/http",
+  "effect/reactivity/Atom",
+  "effect/rpc",
+  "effect/sql/SqlClient",
+  "ghostty-web",
+  "ilha",
+  "ilha/jsx-dev-runtime",
+  "kysely",
+  "kysely-d1",
+  "oxidejs",
+  "oxidejs/mutation-queue",
+  "oxidejs/rpc",
+  "oxidejs/worker-dom/install",
+  "paranorm",
+  "scule",
+] as const;
+
 /** Nodepod's Vite plugin, scoped to the client environment. Its
  * `generateBundle` has no environment filter, so as-is it also drops the four
  * runtime assets into the SSR output (`dist/ssr`), which celld never serves —
@@ -246,6 +325,12 @@ const nodepodSideEffects = (): Plugin => ({
 
 export default defineConfig({
   define: { __CONTROL_BUILD__: JSON.stringify(controlBuild()) },
+  // The worker environment's scan entry is unresolvable (see `WORKER_DEPS`),
+  // so its dep set is declared instead of discovered.
+  environments: {
+    ssr: { optimizeDeps: { include: [...WORKER_DEPS] } },
+  },
+  optimizeDeps: { include: [...LATE_DEPS] },
   plugins: [
     crossOriginIsolation(),
     curatedShikiLangs(),
@@ -258,8 +343,8 @@ export default defineConfig({
     // the build emits them next to the client assets (dist/client) so celld
     // serves them with the rest of the bundle. This sits ahead of the worker
     // pipeline (oxide/cloudflare), whose dev HTML handling answers 404 to
-    // iframe-destination navigations — a preview document would never load if
-    // it ran first. It answers only those paths (plus every preview-host
+    // iframe-destination navigations — the pod host document would never load
+    // if it ran first. It answers only those paths (plus every pod-host
     // document), so nothing else changes hands, and `podHostFrame` above has
     // already decided the pod's own paths by host.
     nodepodClient(),

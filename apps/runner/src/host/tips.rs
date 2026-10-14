@@ -1,11 +1,15 @@
 //! Push-driven tip channel (T2.2): the Git smart-HTTP adapter and web
-//! commits already know when `main` moves, so they notify the reconcile loop
-//! directly instead of making it poll S3. `head_main_bundle` stays as the
-//! fallback sweep for bundles written behind the runner's back.
+//! commits already know when a ref moves, so they notify the reconcile loop
+//! directly instead of making it poll S3. The `head_*` sweep stays as the
+//! fallback for bundles written behind the runner's back.
+//!
+//! A tip is per ref, not per app: `refs/heads/main` deploys production, and
+//! any ref a preview environment tracks (`refs/heads/<branch>`,
+//! `refs/previews/<userId>/<branch>`) deploys that environment.
 use crate::config::Config;
 use crate::host::s3;
 
-/// The tip bundle for one app: the S3 key the push wrote and the sha it
+/// The tip bundle for one ref: the S3 key the push wrote and the sha it
 /// carries.
 #[derive(Debug, Clone)]
 pub struct TipBundle {
@@ -13,10 +17,21 @@ pub struct TipBundle {
     pub sha: String,
 }
 
-/// One moved tip: which app, and the bundle key + sha the push wrote.
+/// One moved ref's tip bundle.
+#[derive(Debug, Clone)]
+pub struct RefTip {
+    /// Full ref name (`refs/heads/<branch>`, `refs/previews/<user>/<branch>`).
+    pub git_ref: String,
+    pub bundle: TipBundle,
+}
+
+/// One moved tip: which app, which ref, and the bundle key + sha the write
+/// produced.
 #[derive(Debug, Clone)]
 pub struct TipNotify {
     pub app_id: String,
+    /// Full ref name; the loop resolves what (if anything) tracks it.
+    pub git_ref: String,
     pub tip: TipBundle,
 }
 
@@ -27,8 +42,13 @@ pub fn channel() -> (TipSender, TipReceiver) {
     tokio::sync::mpsc::unbounded_channel()
 }
 
-pub async fn head_main_bundle(cfg: &Config, slug: &str) -> anyhow::Result<Option<TipBundle>> {
-    let prefix = format!("git/{slug}/refs/heads/main/");
+/// Newest tip bundle under one ref's prefix (the fallback sweep's read).
+pub async fn head_ref_bundle(
+    cfg: &Config,
+    slug: &str,
+    git_ref: &str,
+) -> anyhow::Result<Option<TipBundle>> {
+    let prefix = format!("git/{slug}/{git_ref}/");
     let json = s3::s3_list_prefix(cfg, &cfg.s3_bucket, &prefix).await?;
     if json.trim().is_empty() || json.trim() == "null" {
         return Ok(None);
@@ -62,6 +82,11 @@ pub async fn head_main_bundle(cfg: &Config, slug: &str) -> anyhow::Result<Option
         }
     }
     Ok(best.map(|(key, sha, _)| TipBundle { key, sha }))
+}
+
+/// Production's tip: `refs/heads/main` only (`head_ref_bundle` generalized).
+pub async fn head_main_bundle(cfg: &Config, slug: &str) -> anyhow::Result<Option<TipBundle>> {
+    head_ref_bundle(cfg, slug, "refs/heads/main").await
 }
 
 fn regex_lite_bundle() -> regex::Regex {

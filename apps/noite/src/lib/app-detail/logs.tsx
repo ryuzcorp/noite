@@ -21,10 +21,21 @@ const newPane = (): Pane => ({
  * Live tail of the running celld fleet's stdout/stderr (bounded buffer on the
  * runner). Streams SSE and follows the tail while pinned to the bottom;
  * scrolled-up stays put. The buffer resets on runner restart, so this is
- * recent activity only.
+ * recent activity only. `environmentId` tails one preview environment's own
+ * fleet; absent/"" is the app's (production's, or the control fleet's).
  */
-export const RuntimeLogs = ({ appId }: { appId: string }) => {
-  const feed = liveFeed(feedKeys.logs(appId), logsUrl(appId), decodeLogs);
+export const RuntimeLogs = ({
+  appId,
+  environmentId = "",
+}: {
+  appId: string;
+  environmentId?: string;
+}) => {
+  const feed = liveFeed(
+    feedKeys.logs(appId, environmentId),
+    logsUrl(appId, environmentId),
+    decodeLogs
+  );
   const lines = (): string[] => feed.latest() ?? [];
   const retrying = (): boolean => feed.status() === "retrying";
   // Pane state must survive re-renders: this body re-runs on every frame

@@ -17,6 +17,8 @@ mod recover;
 mod schema_version;
 mod service;
 mod telemetry;
+#[cfg(test)]
+mod testutil;
 
 use std::collections::HashSet;
 use std::sync::{atomic::AtomicBool, Arc};

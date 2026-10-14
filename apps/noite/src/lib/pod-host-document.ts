@@ -10,13 +10,13 @@
 //! path (`/*`'s `CORP: same-origin` is applied by celld to every asset, and a
 //! second value makes a browser refuse the frame), and the deployed edge only
 //! fixes it up on the preview host. So `src/http/routes/nodepod.ts` answers the
-//! document — on the preview host only — and the dev server mirrors it, with
+//! document — on the pod host only — and the dev server mirrors it, with
 //! `POD_HOST_HEADERS` either way.
 //!
-//! The document is the whole workspace: it boots Nodepod, the checkout, the
-//! preview and the shell *on the app's preview origin*, and the control page
+//! The document is the whole workspace: it boots Nodepod, the checkout and the
+//! shell *on the app's pod host origin*, and the control page
 //! talks to it over `src/lib/source/pod-protocol.ts`. App-controlled code —
-//! install scripts, the dev script, builds, terminal commands — therefore runs
+//! install scripts, builds, terminal commands — therefore runs
 //! in its own agent cluster, never the control UI's.
 
 /** The isolation headers the frame's response needs, and why: `cross-origin`

@@ -18,9 +18,9 @@ Store connection variables (`S3_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCE
 | Volume | Holds |
 | --- | --- |
 | `noite-data` | runner SQLite (apps, deploys, env, domains, metrics), git mirrors, builds, fleet working dirs, Caddy config and certificates |
-| `rustfs-data` | the bundled bucket: `git/` tip bundles, `fleets/` tenant celld, `control/` UI worker + its D1 (accounts, invites) + the control fleet's telemetry, `runner/state/` runner snapshots |
+| `rustfs-data` | the bundled bucket: `git/` tip bundles, `fleets/` tenant celld, `envs/` one prefix per [preview environment](/apps/environments), `control/` UI worker + its D1 (accounts, invites) + the control fleet's telemetry, `runner/state/` runner snapshots |
 
-Bucket prefixes under the single `NOITE_S3_BUCKET`: `git/` (tip bundles), `fleets/` (tenant celld), `control/` (UI worker, its D1 and the control fleet's telemetry), `runner/state/` (runner snapshots).
+Bucket prefixes under the single `NOITE_S3_BUCKET`: `git/` (tip bundles), `fleets/` (tenant celld), `envs/<slug>/<label>/` (one [preview environment](/apps/environments)'s celld and storage), `control/` (UI worker, its D1 and the control fleet's telemetry), `runner/state/` (runner snapshots).
 
 ## Snapshots
 
