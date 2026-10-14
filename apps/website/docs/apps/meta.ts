@@ -8,6 +8,7 @@ export default defineMeta({
     "build",
     "configure",
     "source",
+    "environments",
     "pull-requests",
     "observe",
   ],

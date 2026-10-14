@@ -21,7 +21,7 @@ const hasAssets = (env: KitEnv): env is KitEnv & { ASSETS: AssetsBinding } =>
 
 /** Every path that belongs to a pod — the host document, its bundle, the
  * process-worker bundle and the service worker — is answered on the app's
- * Preview host. On any other host, the control UI's own included, they answer
+ * pod host. On any other host, the control UI's own included, they answer
  * 404 (`isControlDeniedAsset`): a worker inherits its creator document's
  * origin, so a path that let a guest app create one on the control origin would
  * run its code inside the control UI's agent cluster, cookies and storage.

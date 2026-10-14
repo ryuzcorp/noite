@@ -17,6 +17,7 @@ mod compaction;
 mod credentials;
 mod deploys;
 mod env;
+pub mod environments;
 mod errors;
 mod events;
 mod instance_setting;
@@ -36,10 +37,18 @@ pub use compaction::{
 };
 pub use credentials::{delete_app_credential, get_app_credential, put_app_credential};
 pub use deploys::{
-    fail_stuck_deploys, get_deploy_log, get_success_deploy, latest_deploy_status, list_deploys,
-    list_deploys_lean, upsert_deploy,
+    fail_stuck_deploys, get_deploy_log, get_success_deploy, latest_deploy_status,
+    latest_deploy_status_for_env, list_deploys, list_deploys_lean, upsert_deploy,
 };
 pub use env::{delete_env, list_env, set_env, tenant_env};
+pub use environments::{
+    count_environments, count_environments_for_app, create_environment, delete_env_override,
+    delete_environment, environment_route, environment_tenant_env, expired_workspace_environments,
+    get_environment, get_environment_by_label, get_environment_by_ref, list_all_environments,
+    list_env_override, list_environment_routes, list_environments, set_env_override,
+    set_environment_asleep, set_environment_awake, set_environment_bucket, set_environment_public,
+    update_environment_status, EnvironmentRoute, NewEnvironment,
+};
 pub use errors::{
     count_error_issues, get_error_issue, insert_error_event, list_error_events, list_error_hours,
     list_error_issues, prune_error_events, prune_errors, refresh_error_issue_count, set_error_hour,

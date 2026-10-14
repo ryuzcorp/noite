@@ -1,12 +1,7 @@
 import * as Schema from "effect/Schema";
 import { action, withSchema } from "oxidejs";
 
-import {
-  runnerSourceBlob,
-  runnerSourceBundle,
-  runnerSourceTree,
-  runnerSourceTypes,
-} from "../runner";
+import { runnerSourceBundle, runnerSourceTree } from "../runner";
 import { AuthError, requireViewApp } from "./session.server";
 
 /** Every source read takes an optional `ref` (branch, tag or SHA); Code mode
@@ -17,24 +12,10 @@ const SourceRefArgs = Schema.Struct({
   ref: Schema.optional(Schema.String),
 });
 
-/** Source preview — the runner serves from the persistent bare mirror. */
-const SourceBlobArgs = Schema.Struct({
-  appId: Schema.String,
-  path: Schema.String,
-  ref: Schema.optional(Schema.String),
-});
 export const sourceTree = action(
   withSchema(SourceRefArgs, async ({ appId, ref }) => {
     await requireViewApp(appId);
     return runnerSourceTree(appId, ref || undefined);
-  }),
-  { error: AuthError }
-);
-
-export const sourceBlob = action(
-  withSchema(SourceBlobArgs, async ({ appId, path, ref }) => {
-    await requireViewApp(appId);
-    return runnerSourceBlob(appId, path, ref || undefined);
   }),
   { error: AuthError }
 );
@@ -46,18 +27,6 @@ export const sourceBundle = action(
   withSchema(SourceRefArgs, async ({ appId, ref }) => {
     await requireViewApp(appId);
     return runnerSourceBundle(appId, ref || undefined);
-  }),
-  { error: AuthError }
-);
-
-/** Declaration files captured from the app's last successful build — the
- * `node_modules` types the worker resolves imports against. No `ref`: the
- * capture belongs to the deployed build, whatever is being browsed. */
-const SourceTypesArgs = Schema.Struct({ appId: Schema.String });
-export const sourceTypes = action(
-  withSchema(SourceTypesArgs, async ({ appId }) => {
-    await requireViewApp(appId);
-    return runnerSourceTypes(appId);
   }),
   { error: AuthError }
 );

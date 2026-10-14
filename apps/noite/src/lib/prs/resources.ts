@@ -4,6 +4,8 @@
 import { invalidate, resource } from "ilha";
 import type { Resource, ResourceFetcher, ResourceOptions } from "ilha";
 
+import { forgeKeys } from "../forge/data";
+import { keys } from "../resources";
 import type { PrDetail, PrList } from "../runner";
 import { prsGet, prsList, prsUserNames, prsViewer } from "../server/prs.server";
 import { withSnapshot, writeSwr } from "../swr-store";
@@ -74,7 +76,9 @@ export const prNames = (
 export const prViewer = (appId: string) =>
   tracked(prKeys.viewer(appId), () => prsViewer({ appId }));
 
-/** Drop a PR's detail and every list page after a mutation. */
+/** Drop the list pages and, alongside a PR's detail, refresh the branch
+ * picker's tips and the environment box: a merge can delete the head branch
+ * (and its preview environment) or move `main`. */
 export const invalidatePr = (appId: string, number?: number): void => {
   if (number !== undefined) {
     invalidate(prKeys.detail(appId, number));
@@ -85,4 +89,6 @@ export const invalidatePr = (appId: string, number?: number): void => {
       invalidate(key);
     }
   }
+  invalidate(forgeKeys.refs(appId));
+  invalidate(keys.environments(appId));
 };

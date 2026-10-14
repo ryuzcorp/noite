@@ -8,6 +8,7 @@
         "@better-auth/api-key": "^1.7.7",
         "@better-auth/kysely-adapter": "^1.7.7",
         "@better-auth/passkey": "^1.7.7",
+        "@data-slot/resizable": "^1.1.2",
         "@effect/sql-d1": "4.0.4",
         "@fontsource-variable/geist": "^5.3.0",
         "@fontsource-variable/geist-mono": "^5.3.0",
@@ -96,6 +97,10 @@
     "@cloudflare/workers-types": ["@cloudflare/workers-types@5.20261013.1", "", {}, "sha512-0SfkM/MA+oSIAzFFmjr0wZLH54oeCtugaOn8GpJDBnerQiML+rOPq2W6j6bBGE51o+N4DOd0tvMruLmkAQzlpw=="],
 
     "@cspotcode/source-map-support": ["@cspotcode/source-map-support@0.8.1", "", { "dependencies": { "@jridgewell/trace-mapping": "0.3.9" } }, "sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw=="],
+
+    "@data-slot/core": ["@data-slot/core@1.1.2", "", {}, "sha512-xcxdiWJ/fPUqobE2PZdi96FIT/xASSsmtRtlyTWOro/mh5ZSJ8blB7t2anV12J7irNSKMov2+WpWFvAeikR5Vw=="],
+
+    "@data-slot/resizable": ["@data-slot/resizable@1.1.2", "", { "dependencies": { "@data-slot/core": "1.1.2" } }, "sha512-03jiq/Kdzw8kOymMP1IYrPect1ulu8CMIRf2JpfOygd2tYfZxUe9T/el6R+KtU8wYQfGYoK4d/GFcDICWCVhiA=="],
 
     "@effect/sql-d1": ["@effect/sql-d1@4.0.4", "", { "dependencies": { "@cloudflare/workers-types": "^5.20261010.1" }, "peerDependencies": { "effect": "^4.0.4" } }, "sha512-zE5zzv8RCg9DqsrR64N3PPG8+5gtV/IO/xQtJDjssrKbcfkQZqGXrOJ7veqmmoJ2G3dGJqpIa1u1njpzUDnjTA=="],
 

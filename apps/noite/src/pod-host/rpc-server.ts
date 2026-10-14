@@ -1,9 +1,9 @@
 //! The frame's RPC server: the pod's whole surface, as the page drives it.
 //!
 //! Everything the control UI used to do in-process — open the workspace, read
-//! and write the checkout, derive the Changes rows, watch the filesystem, plan
-//! and run the preview, create the shell, push — happens on this side of the
-//! port, on the app's preview origin, and answers one request at a time. The
+//! and write the checkout, derive the Changes rows, watch the filesystem,
+//! create the shell, push — happens on this side of the
+//! port, on the app's pod host origin, and answers one request at a time. The
 //! wire is `pod-protocol.ts`; the state is one booted pod.
 //!
 //! Nothing here trusts a message: the port is a channel this document was
@@ -11,8 +11,8 @@
 //! used, and every request is answered — a kind nobody serves, a request
 //! before the workspace is open, work that threw. The page learns what the pod
 //! does through events, which carry the truth the requests do not: the change
-//! rows after every derive, a peer tab's edits, a failed save, the preview's
-//! state and log, and everything the shell prints.
+//! rows after every derive, a peer tab's edits, a failed save, and everything
+//! the shell prints.
 //!
 //! Only two things the page sees come from here without being asked for: the
 //! `changes` events (a derive that a filesystem event started) and `fatal`,
@@ -29,8 +29,6 @@ import type {
   PodEventMap,
   PodOpenParams,
   PodOpenResult,
-  PodPreviewStateEvent,
-  PodPreviewView,
   PodRequestKind,
   PodRequestMap,
   PodResponse,
@@ -42,12 +40,6 @@ import { parentDir } from "../lib/source/workspace/types";
 import type { OpenPodOpener } from "../lib/source/workspace/types";
 import { createWorkspace } from "../lib/source/workspace/workspace";
 import type { FrameWorkspace } from "../lib/source/workspace/workspace";
-import { createPreviewRuntime } from "./preview-runtime";
-import type {
-  PodPreviewRuntime,
-  PreviewPlanner,
-  PreviewStarter,
-} from "./preview-runtime";
 import { createTerminalBackend } from "./terminal-backend";
 import type { TerminalBackend } from "./terminal-backend";
 
@@ -143,17 +135,6 @@ const incoming = (value: unknown): Incoming | null => {
 };
 /* oxlint-enable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof */
 
-/** The view without its log: what a `preview.state` event carries, while the
- * log arrives line by line as `preview.log`. */
-const previewState = (view: PodPreviewView): PodPreviewStateEvent => ({
-  detail: view.detail,
-  error: view.error,
-  plan: view.plan,
-  processes: view.processes,
-  state: view.state,
-  url: view.url,
-});
-
 /* oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof -- the page's answer to an ask is I/O: it is read field by field and checked before anything uses it. */
 /** The bytes one `archive` answer carried, or null when it carried none (the
  * page refuses the ask, or answers with something that is not an archive). */
@@ -178,27 +159,19 @@ export interface PodServer {
 
 /** Serve the whole pod over `port`, for the ref this frame was opened for.
  * The frame's URL and the `open` request both name the app and the branch, and
- * they have to agree: a port that crossed origins by accident serves nothing.
- * `origin` is this document's own origin (`main.ts` reads it off its own
- * URL): the one origin a preview may be served from. `plan` and `start` are
- * how a preview is planned and launched, handed in from the frame's entry
- * rather than imported here (see `PreviewStarter`). */
+ * they have to agree: a port that crossed origins by accident serves nothing. */
 export const createPodServer = (options: {
   appId: string;
   branch: string;
   openPod?: OpenPodOpener;
-  origin: string;
-  plan: PreviewPlanner;
   port: MessagePort;
-  start: PreviewStarter;
 }): PodServer => {
-  const { appId, branch, openPod, origin, plan, port, start } = options;
+  const { appId, branch, openPod, port } = options;
   /** The open checkout. Null until `open` has answered, and again once `close`
    * has: every other request is refused in between. */
   let workspace: FrameWorkspace | null = null;
   /** The boot in flight, so a second `open` cannot boot a second pod. */
   let opening: Promise<PodOpenResult> | null = null;
-  let preview: PodPreviewRuntime | null = null;
   let terminal: TerminalBackend | null = null;
   /** Bumped by every publish, so the page can order the rows it keeps. */
   let revision = 0;
@@ -242,13 +215,6 @@ export const createPodServer = (options: {
       );
     }
     return open;
-  };
-
-  const requirePreview = (): PodPreviewRuntime => {
-    if (preview === null) {
-      throw new PodRequestError("not-open", "pod: no workspace is open");
-    }
-    return preview;
   };
 
   /** Ask the page for one ref's archive, through its own session: the bytes
@@ -315,25 +281,12 @@ export const createPodServer = (options: {
       sha: params.sha,
     });
     workspace = open;
-    const session = createPreviewRuntime({
-      origin: () => origin,
-      plan,
-      start,
-    });
-    preview = session;
-    session.attach(open);
     stops.push(
       open.onChanges(() => {
         publishChanges();
       }),
-      open.onPeerChange((structural) => {
-        emit("peer", { structural });
-      }),
-      session.subscribe(() => {
-        emit("preview.state", previewState(session.view()));
-      }),
-      session.onLog((line) => {
-        emit("preview.log", line);
+      open.onPeerChange((structural, paths) => {
+        emit("peer", { paths, structural });
       })
     );
     // The rows the open itself derived: the page has its own subscription
@@ -367,17 +320,25 @@ export const createPodServer = (options: {
     return booting;
   };
 
-  /** Tear the pod down. The page sends `preview.close` and `terminal.close`
-   * first; doing both again here costs nothing and is what a page that died
-   * mid-teardown leaves behind. */
+  /** Tear the pod down. The page sends `terminal.close` first; doing it again
+   * here costs nothing and is what a page that died mid-teardown leaves
+   * behind. A boot that is still in flight (a `close` right behind an `open`
+   * the page gave up on) lands a live workspace: it is waited for and torn
+   * down too, rather than left holding the saved copy's lock. */
   const closeWorkspace = async (): Promise<void> => {
+    const booting = opening;
+    if (booting !== null) {
+      try {
+        await booting;
+      } catch {
+        // The boot's own failure is its request's to report.
+      }
+    }
     const open = workspace;
     if (open === null) {
       return;
     }
-    const session = preview;
     workspace = null;
-    preview = null;
     for (const stop of stops.splice(0)) {
       stop();
     }
@@ -388,9 +349,6 @@ export const createPodServer = (options: {
     terminal?.close();
     terminal = null;
     push = null;
-    // The preview first: its servers are the pod's own children, and the pod
-    // is about to go.
-    await session?.close();
     await open.close();
   };
 
@@ -533,27 +491,6 @@ export const createPodServer = (options: {
     listing: () => requireWorkspace().listing(),
     mkdir: ({ path }) => requireWorkspace().mkdir(path),
     open: (params) => openWorkspace(params),
-    "preview.close": async () => {
-      const session = requirePreview();
-      await session.close();
-      return session.view();
-    },
-    "preview.open": async () => {
-      const session = requirePreview();
-      await session.open();
-      return session.view();
-    },
-    "preview.restart": async () => {
-      const session = requirePreview();
-      await session.restart();
-      return session.view();
-    },
-    "preview.stop": async () => {
-      const session = requirePreview();
-      await session.stop();
-      return session.view();
-    },
-    "preview.view": () => requirePreview().view(),
     "push.prepare": (params) => pushPrepare(params),
     "push.settle": (params) => pushSettle(params),
     refresh: () => requireWorkspace().refresh(),
@@ -575,7 +512,6 @@ export const createPodServer = (options: {
           emit("terminal.write", { data });
         },
         pod: open.pod,
-        preview: requirePreview(),
       });
       backend.open(cols, rows);
       terminal = backend;

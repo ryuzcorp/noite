@@ -6,33 +6,141 @@ import { atom, watch } from "ilha";
 import type { AtomHandle } from "ilha";
 
 import { formatBytes } from "../bytes";
+import { branchNameError } from "../forge/branch-name";
 import { DraftDiffView } from "../forge/diff";
+import type { GitBranch } from "../runner";
 import { confirmDialog } from "../ui/confirm";
+import { X } from "../ui/icons";
 import type { CommitDrafts, PushRequest, SourceBrowserState } from "./drafts";
-import type { WorkspaceChange } from "./workspace/types";
+import type { ChangeKind, WorkspaceChange } from "./workspace/types";
 
-/** Where the commit goes: the default branch, or a new branch off its tip. */
-type Target = "default" | "new";
+/** The target select's entry for a new branch. A space is illegal in a git
+ * branch name, so the sentinel can never collide with one — as the option's
+ * value or as its key (an unkeyed option is matched by position, and a
+ * repaint that inserts a branch above it would leave the branch's `<option>`
+ * with this one's value). */
+const NEW_BRANCH = " new";
 
-/** The commit message when the field is left empty. */
-const defaultMessage = (state: SourceBrowserState): string =>
-  `Web edit: ${state.files.map((file) => file.path).join(", ")}`;
+/** The commit targets, in the select's order: the browsed ref first (the
+ * default target), then the default branch, then every other branch
+ * newest-first. A ref that is not a branch (a tag or a commit) has no row in
+ * `branches` and still leads. */
+const commitTargets = (
+  branches: readonly GitBranch[],
+  browsed: string,
+  defaultBranch: string
+): string[] => {
+  const names = branches.map((branch) => branch.name);
+  const head = [browsed];
+  if (defaultBranch !== browsed && names.includes(defaultBranch)) {
+    head.push(defaultBranch);
+  }
+  return [
+    ...head,
+    ...branches
+      .filter(
+        (branch) => branch.name !== browsed && branch.name !== defaultBranch
+      )
+      .toSorted((a, b) => b.committedAt - a.committedAt)
+      .map((branch) => branch.name),
+  ];
+};
+
+/** The verb a change's kind contributes to the default message. A move reads
+ * as "Rename": the path changed, whatever the bytes did. */
+const KIND_VERBS: Record<ChangeKind, string> = {
+  added: "Add",
+  deleted: "Delete",
+  modified: "Update",
+  moved: "Rename",
+};
+
+/** The verb of one change: a new binary file is an upload, not an add. */
+const changeVerb = (file: WorkspaceChange): string =>
+  file.binary !== undefined && file.kind === "added"
+    ? "Upload"
+    : KIND_VERBS[file.kind];
+
+/** The commit message when the field is left empty. A single file reads
+ * "<Verb> <basename>" so History is not a wall of identical subjects; a set of
+ * changes sharing one verb reads "<Verb> N files", and a mixed one "Update N
+ * files". */
+const defaultMessage = (state: SourceBrowserState): string => {
+  const { files } = state;
+  if (files.length === 0) {
+    return "Update files";
+  }
+  if (files.length === 1) {
+    const [file] = files;
+    return `${changeVerb(file)} ${file.path.slice(file.path.lastIndexOf("/") + 1)}`;
+  }
+  const [first] = files;
+  const verb = changeVerb(first);
+  return files.every((file) => changeVerb(file) === verb)
+    ? `${verb} ${files.length} files`
+    : `Update ${files.length} files`;
+};
+
+/** Why the checkout cannot be edited, and what to do about it. */
+const READ_ONLY_NOTICE: Record<
+  Exclude<SourceBrowserState["readOnly"], "">,
+  string
+> = {
+  commit:
+    "Read-only: this is a single commit, not a branch. Switch to a branch to edit files.",
+  role: "Read-only: your role on this app can't push. Ask an admin for the push role to edit files.",
+  tag: "Read-only: this is a tag, not a branch. Switch to a branch to edit files.",
+};
+
+/** A push error as the user reads it: known runner and workspace refusals get
+ * copy that says what to do; anything else keeps its own words. */
+const pushErrorCopy = (
+  raw: string,
+  readOnly: SourceBrowserState["readOnly"]
+): string => {
+  const lower = raw.toLowerCase();
+  if (lower.includes("read-only")) {
+    return readOnly === ""
+      ? "This checkout is read-only, so nothing was pushed."
+      : READ_ONLY_NOTICE[readOnly];
+  }
+  if (lower.includes("protected")) {
+    return "That branch is protected. Push to a new branch and open a pull request instead.";
+  }
+  if (lower.includes("tip moved")) {
+    return "The branch moved while you were editing. Refresh the page to see the new commits, then push again.";
+  }
+  if (lower.includes("invalid branch")) {
+    return "That branch name is not valid.";
+  }
+  if (lower.includes("branch") && lower.includes("exists")) {
+    return "A branch with that name already exists.";
+  }
+  if (lower.includes("failed to fetch") || lower.includes("network")) {
+    return "Could not reach the server. Check your connection and try again.";
+  }
+  return raw;
+};
 
 /** The outcome line under the form: the error, or where the push landed
  * (with the pull-request shortcut after a push to a new branch). */
 const PushOutcome = ({
   appId,
-  defaultBranch,
+  base,
   state,
   title,
 }: {
   appId: string;
-  defaultBranch: string;
+  base: string;
   state: SourceBrowserState;
   title: string;
 }) => {
   if (state.pushError !== "") {
-    return <p class="text-error m-0 text-xs">{state.pushError}</p>;
+    return (
+      <p class="text-error m-0 text-xs" role="alert">
+        {pushErrorCopy(state.pushError, state.readOnly)}
+      </p>
+    );
   }
   const { pushed } = state;
   if (!pushed) {
@@ -50,7 +158,7 @@ const PushOutcome = ({
       Pushed to <span class="font-mono">{pushed.branch}</span>.{" "}
       <a
         class="link"
-        href={`/apps/${appId}/pulls/new?base=${encodeURIComponent(defaultBranch)}&head=${encodeURIComponent(pushed.branch)}&title=${encodeURIComponent(title)}`}
+        href={`/apps/${appId}/pulls/new?base=${encodeURIComponent(base)}&head=${encodeURIComponent(pushed.branch)}&title=${encodeURIComponent(title)}`}
       >
         Open a pull
       </a>
@@ -58,33 +166,66 @@ const PushOutcome = ({
   );
 };
 
+/** The commit target the user chose, and a new branch's name, with the ref they
+ * were chosen on. This form's fiber survives a ref switch (the Changes tab
+ * keeps what it holds), so the ref is part of the state: a target left over
+ * from the branch the user came from would commit to *that* branch. */
+interface CommitChoice {
+  branch: string;
+  /** A new branch's name, while the target is `NEW_BRANCH`. */
+  name: string;
+  /** A branch name, or `NEW_BRANCH`. */
+  target: string;
+}
+
 /** Message, target branch and Push. */
 const CommitForm = ({
   appId,
+  branch,
+  branches,
   commit,
   defaultBranch,
-  protectedMain,
+  isProtected,
   state,
 }: {
   appId: string;
+  /** The branch being browsed: where the commit goes by default. */
+  branch: string;
+  /** The app's branches, as the target select lists them (the browsed ref may
+   * be a tag or a commit, which has no row there). */
+  branches: readonly GitBranch[];
   commit: CommitDrafts;
+  /** The app's default branch: the one branch protection covers. */
   defaultBranch: string;
-  protectedMain: boolean;
+  /** Whether a branch refuses a direct commit (see `./push-target`). */
+  isProtected: (branch: string) => boolean;
   state: AtomHandle<SourceBrowserState>;
 }) => {
   const message = atom("");
-  const target = atom<Target>("default");
-  const branchName = atom("");
+  /** The commit target: a branch name, or `NEW_BRANCH` for a new branch off the
+   * browsed ref's tip. It starts on the browsed branch. */
+  const choice = atom<CommitChoice>({ branch, name: "", target: branch });
   // The title the pull-request shortcut prefills: the last pushed message.
   const lastMessage = atom("");
   const current = state();
-  // A protected default branch only takes commits through a pull.
-  const into: Target = protectedMain ? "new" : target();
-  const branch = branchName().trim();
+  const held = choice();
+  // What the form shows: the choice made on this ref, or the fresh one a switch
+  // to another ref starts from (the browsed branch itself).
+  const mine =
+    held.branch === branch ? held : { branch, name: "", target: branch };
+  const { name: newBranch, target } = mine;
+  const targets = commitTargets(branches, branch, defaultBranch);
+  // A protected branch only takes commits through a pull.
+  const into = isProtected(target) ? NEW_BRANCH : target;
+  const branchName = newBranch.trim();
+  const nameError =
+    into === NEW_BRANCH && branchName !== ""
+      ? branchNameError(branchName)
+      : null;
   const blocked =
     current.files.length === 0 ||
     current.pushing ||
-    (into === "new" && branch === "");
+    (into === NEW_BRANCH && (branchName === "" || nameError !== null));
   return (
     <form
       class="border-base-300 flex flex-col gap-2 border-t px-3 py-3"
@@ -95,16 +236,23 @@ const CommitForm = ({
         }
         const text = message().trim() || defaultMessage(current);
         const request: PushRequest = { message: text };
-        if (into === "new") {
-          request.branch = branch;
+        // Naming the browsed branch is the same as naming none — the commit
+        // lands there either way. Any other target names its branch: one the
+        // runner grows from its own tip, or one it creates at the browsed tip.
+        if (into !== NEW_BRANCH && into !== branch) {
+          request.branch = into;
         }
         lastMessage.set(text);
         void (async () => {
           // A landed push empties the form for the next commit; a failed one
-          // keeps it for the retry.
+          // keeps it for the retry. Only this ref's choice is cleared — a
+          // switch mid-push has its own.
           if (await commit(request)) {
             message.set("");
-            branchName.set("");
+            const now = choice();
+            if (now.branch === branch) {
+              choice.set({ ...now, name: "" });
+            }
           }
         })();
       }}
@@ -126,17 +274,27 @@ const CommitForm = ({
           aria-label="Commit to"
           value={into}
           onchange={(event) => {
-            target.set(event.currentTarget.value === "new" ? "new" : "default");
+            choice.set({ ...mine, target: event.currentTarget.value });
           }}
         >
+          {targets.map((name) => {
+            const locked = isProtected(name);
+            return (
+              <option
+                key={name}
+                value={name}
+                selected={into === name}
+                disabled={locked}
+              >
+                {locked ? `${name} (protected)` : name}
+              </option>
+            );
+          })}
           <option
-            value="default"
-            selected={into === "default"}
-            disabled={protectedMain}
+            key={NEW_BRANCH}
+            value={NEW_BRANCH}
+            selected={into === NEW_BRANCH}
           >
-            {protectedMain ? `${defaultBranch} (protected)` : defaultBranch}
-          </option>
-          <option value="new" selected={into === "new"}>
             New branch…
           </option>
         </select>
@@ -144,20 +302,28 @@ const CommitForm = ({
           {current.pushing ? "Pushing…" : "Push"}
         </button>
       </div>
-      {into === "new" ? (
-        <input
-          class="input input-sm w-full font-mono"
-          aria-label="New branch name"
-          placeholder="my-change"
-          value={branchName()}
-          oninput={(event) => {
-            branchName.set(event.currentTarget.value);
-          }}
-        />
+      {into === NEW_BRANCH ? (
+        <>
+          <input
+            class="input input-sm w-full font-mono"
+            aria-label="New branch name"
+            aria-invalid={nameError === null ? undefined : "true"}
+            placeholder="my-change"
+            value={newBranch}
+            oninput={(event) => {
+              choice.set({ ...mine, name: event.currentTarget.value });
+            }}
+          />
+          {nameError === null ? null : (
+            <p class="text-error m-0 text-xs" role="alert">
+              {nameError}
+            </p>
+          )}
+        </>
       ) : null}
       <PushOutcome
         appId={appId}
-        defaultBranch={defaultBranch}
+        base={branch}
         state={current}
         title={lastMessage()}
       />
@@ -167,14 +333,25 @@ const CommitForm = ({
 
 export interface ChangesPanelProps {
   appId: string;
+  /** The branch being browsed: the commit target by default, and the base the
+   * pull-request shortcut points at. */
+  branch: string;
+  /** The app's branches, as the commit target select lists them. */
+  branches: readonly GitBranch[];
   commit: CommitDrafts;
+  /** The app's default branch: the one branch protection covers. */
   defaultBranch: string;
   /** Throw one row's change away (the panel has asked first). */
   discard: (path: string) => void;
   /** Throw every change away, back to the last commit (asked first). */
   discardAll: () => void;
-  /** `require_pr` on and the caller below admin: new branches only. */
-  protectedMain: boolean;
+  /** Drop one "changed in another tab" notice (the peer overwrite it names
+   * has already landed in the file). */
+  dismissConflicts: (path: string) => void;
+  /** Whether a branch refuses a direct commit — `require_pr` on, the caller
+   * below admin, the default branch (see `./push-target`): the select disables
+   * it and the commit goes to a new branch instead. */
+  isProtected: (branch: string) => boolean;
   /** Undo of a deletion draft — the file returns to the tree. */
   restore: (path: string) => void;
   state: AtomHandle<SourceBrowserState>;
@@ -214,20 +391,26 @@ const rowBadge = (file: WorkspaceChange): RowBadge => {
 };
 
 /** One change: what it is, where it sits, and what can be done with it. An
- * upload shows its size where a diff would be — there is no text to compare. */
+ * upload shows its size where a diff would be — there is no text to compare.
+ * `last` drops the divider (passed, not `last:`: a component's root sits in
+ * its own wrapper, so `last:` would match every row). */
 const ChangeRow = ({
   file,
+  last,
   onDiscard,
   restore,
 }: {
   file: WorkspaceChange;
+  last: boolean;
   onDiscard: (file: WorkspaceChange) => void;
   restore: (path: string) => void;
 }) => {
   const badge = rowBadge(file);
   const undoing = file.kind === "deleted" || file.kind === "moved";
   return (
-    <li class="border-base-300 flex items-center gap-2 border-b px-3 py-2 last:border-b-0">
+    <li
+      class={`border-base-300 flex items-center gap-2 px-3 py-2 ${last ? "" : "border-b"}`}
+    >
       <span class={`badge badge-sm ${badge.class}`}>{badge.label}</span>
       <span class="min-w-0 flex-1 truncate font-mono text-xs">
         {rowLabel(file)}
@@ -243,7 +426,7 @@ const ChangeRow = ({
       (file.kind === "moved" && !hasEdit(file)) ? null : (
         <button
           type="button"
-          class="btn btn-xs btn-neutral"
+          class="btn btn-xs btn-ghost hover:bg-error/10 hover:text-error"
           aria-label={`Discard changes to ${file.path}`}
           onclick={() => {
             onDiscard(file);
@@ -272,15 +455,18 @@ const ChangeRow = ({
  * change with its discard and undo, then the commit form. */
 export const ChangesPanel = ({
   appId,
+  branch,
+  branches,
   commit,
   defaultBranch,
   discard,
   discardAll,
-  protectedMain,
+  dismissConflicts,
+  isProtected,
   restore,
   state,
 }: ChangesPanelProps) => {
-  const { files, revision, stale } = state();
+  const { conflicts, files, readOnly, revision, stale } = state();
   // One controller per mounted panel: a dialog left open by a close is torn
   // down with it instead of blocking the page.
   const dialogs = atom.lazy(() => new AbortController())();
@@ -343,10 +529,43 @@ export const ChangesPanel = ({
         </p>
       )}
       <div class="min-h-0 flex-1 overflow-auto">
+        {conflicts.length === 0 ? null : (
+          <ul class="m-0 list-none p-0" aria-label="Changes from other tabs">
+            {conflicts.map((path) => (
+              <li
+                key={path}
+                class="bg-warning/20 text-base-content border-base-300 flex items-center gap-2 border-b px-3 py-2 text-xs"
+                role="status"
+              >
+                <span class="min-w-0 flex-1 truncate">
+                  <span class="font-mono">{path}</span> was changed in another
+                  tab
+                </span>
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-xs btn-square"
+                  aria-label={`Dismiss notice for ${path}`}
+                  title="Dismiss"
+                  onclick={() => {
+                    dismissConflicts(path);
+                  }}
+                >
+                  <X class="h-3.5 w-3.5" />
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
         {files.length === 0 ? (
           <p class="m-0 px-3 py-3 text-sm opacity-70">
-            No changes. Edits to files on{" "}
-            <span class="font-mono">{defaultBranch}</span> show up here.
+            {readOnly === "" ? (
+              <>
+                No changes. Edits to files on{" "}
+                <span class="font-mono">{branch}</span> show up here.
+              </>
+            ) : (
+              READ_ONLY_NOTICE[readOnly]
+            )}
           </p>
         ) : (
           <div class="flex flex-col">
@@ -356,12 +575,21 @@ export const ChangesPanel = ({
               </span>
               <button
                 type="button"
-                class="btn btn-xs btn-neutral"
+                class="btn btn-xs btn-ghost hover:bg-error/10 hover:text-error"
                 onclick={askDiscardAll}
               >
                 Discard all
               </button>
             </div>
+            {readOnly === "" ? null : (
+              <p
+                class="bg-warning/20 text-base-content border-base-300 m-0 border-b px-3 py-2 text-xs"
+                role="status"
+              >
+                These changes were made outside the editor and can't be pushed
+                here. {READ_ONLY_NOTICE[readOnly]}
+              </p>
+            )}
             {diffed.length === 0 ? null : (
               <DraftDiffView
                 key={`drafts:${revision}`}
@@ -374,10 +602,11 @@ export const ChangesPanel = ({
               aria-label="Changed files"
               role="list"
             >
-              {files.map((file) => (
+              {files.map((file, index) => (
                 <ChangeRow
                   key={file.path}
                   file={file}
+                  last={index === files.length - 1}
                   onDiscard={askDiscard}
                   restore={restore}
                 />
@@ -386,13 +615,17 @@ export const ChangesPanel = ({
           </div>
         )}
       </div>
-      <CommitForm
-        appId={appId}
-        commit={commit}
-        defaultBranch={defaultBranch}
-        protectedMain={protectedMain}
-        state={state}
-      />
+      {readOnly === "" ? (
+        <CommitForm
+          appId={appId}
+          branch={branch}
+          branches={branches}
+          commit={commit}
+          defaultBranch={defaultBranch}
+          isProtected={isProtected}
+          state={state}
+        />
+      ) : null}
     </div>
   );
 };

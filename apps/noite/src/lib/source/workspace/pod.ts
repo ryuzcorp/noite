@@ -6,10 +6,10 @@
 //! saving tab goes.
 //!
 //! The pod's *code* does not run in the control UI. This module boots inside
-//! the pod frame — a document on the app's preview origin (`pod-host/main.ts`)
+//! the pod frame — a document on the app's pod host origin (`pod-host/main.ts`)
 //! — so the commands a workspace runs (installs and their scripts, the app's
 //! own dev script, builds, the terminal) execute on an origin that holds none
-//! of the control page's authority. The pod boots with path preview URLs on
+//! of the control page's authority. The pod boots with path URLs on
 //! that same origin, the one origin the frame's own service worker may route.
 //!
 //! This is the only module in the directory that imports the SDK; everything
@@ -34,7 +34,6 @@ import {
   POD_WORKER_PATH,
 } from "../../preview-host";
 import {
-  PREVIEW_STATE,
   UNPERSISTED_DIRS,
   UNSAVED_PROJECT,
   mirrorStorage,
@@ -81,15 +80,15 @@ const persistenceOptions = (id: string): PersistenceOptions => ({
 
 /** The boot options every pod carries: the checkout as the working directory —
  * so the installer's `node_modules` lands beside the `package.json` it installs
- * from, the way every experiment and the preview's own paths assume — the
- * process-worker bundle this frame serves, and the paths the preview origin's
- * service worker must leave to the host: this frame's document and bundle, its
- * worker asset and the worker script itself. Those are the host's: once a
- * preview has claimed the origin, the worker would otherwise route the very
- * document that runs the pod — and the assets it loads — to a pod.
+ * from — the process-worker bundle this frame serves, and the paths the pod
+ * host's service worker must leave to the host: this frame's document and
+ * bundle, its worker asset and the worker script itself. Those are the host's:
+ * once a pod's own server has claimed the origin, the worker would otherwise
+ * route the very document that runs the pod — and the assets it loads — to a
+ * pod.
  *
  * `previewOrigin: false` is the shape the frame needs: this document *is* the
- * app's preview origin, so a virtual server's URL is a path on it
+ * app's pod host origin, so a virtual server's URL is a path on it
  * (`${location.origin}/__virtual__/…`) rather than a host of its own, which is
  * unambiguous per tab and avoids Nodepod's origin-bound service-worker mode.
  *
@@ -198,34 +197,34 @@ const mirrorVolume = (pod: Nodepod): MirrorVolume => {
   };
 };
 
-/** Overlay this tab's synchronous mirrors onto a booted pod: after the
- * IndexedDB restore, before anything reads the volume. A mirror is this tab's
- * own record, newer-or-equal to the restore; a tab with none overlays
- * nothing. A read-only ref has no edits to replay, only preview state. */
+/** Overlay this tab's synchronous mirror onto a booted pod: after the
+ * IndexedDB restore, before anything reads the volume. The mirror is this
+ * tab's own record, newer-or-equal to the restore; a tab with none overlays
+ * nothing, and a read-only ref has no edits to replay. */
 const restoreMirrors = (pod: Nodepod, id: string, editable: boolean): void => {
-  const volume = mirrorVolume(pod);
-  const storage = mirrorStorage();
-  restoreMirror(volume, PREVIEW_STATE, id, storage);
-  if (editable) {
-    restoreMirror(volume, UNSAVED_PROJECT, id, storage);
+  if (!editable) {
+    return;
   }
+  restoreMirror(mirrorVolume(pod), UNSAVED_PROJECT, id, mirrorStorage());
 };
 
-/** Record the preview state and the checkout's unsaved writes synchronously,
- * into this tab's sessionStorage, and answer with the way to stop. The
- * project mirror only has to outlive IndexedDB's debounce: once a save leaves
- * nothing pending, everything in it is saved, so it is emptied — it never
- * replays text older than the saved copy, and a fresh checkout's first save
- * (which outgrows it) lets it record again. */
+/** Record the checkout's unsaved writes synchronously, into this tab's
+ * sessionStorage, and answer with the way to stop. The project mirror only
+ * has to outlive IndexedDB's debounce: once a save leaves nothing pending,
+ * everything in it is saved, so it is emptied — it never replays text older
+ * than the saved copy, and a fresh checkout's first save (which outgrows it)
+ * lets it record again. */
 const startMirrors = (
   pod: Nodepod,
   id: string,
   persistence: WorkspacePersistence | null
 ): (() => void) => {
-  const volume = mirrorVolume(pod);
-  const storage = mirrorStorage();
-  const preview = startMirror(volume, PREVIEW_STATE, id, storage);
-  const project = startMirror(volume, UNSAVED_PROJECT, id, storage);
+  const project = startMirror(
+    mirrorVolume(pod),
+    UNSAVED_PROJECT,
+    id,
+    mirrorStorage()
+  );
   const onSaved = (): void => {
     if (persistence?.pendingChanges === 0) {
       project.clear();
@@ -234,7 +233,6 @@ const startMirrors = (
   persistence?.on("saved", onSaved);
   return () => {
     persistence?.off("saved", onSaved);
-    preview.stop();
     project.stop();
   };
 };

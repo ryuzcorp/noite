@@ -29,44 +29,98 @@ export const DetailShell = ({
 );
 
 /** One row of tabs on every width: narrow screens scroll it sideways instead
- * of wrapping it into a stack. `trailing` sits at the row's end. */
+ * of wrapping it into a stack. `trailing` sits at the row's end. The tabs are
+ * a real tablist: roving tabindex and Left/Right/Home/End. Pass `idPrefix` to
+ * also emit `id`/`aria-controls` for `<idPrefix>-panel-<id>` (render the panel
+ * with that id and `role="tabpanel"`). */
 export const DetailTabs = ({
   active,
   counts,
+  idPrefix,
   onSelect,
+  showZeroCounts = false,
   tabs,
   trailing,
 }: {
   active: string;
-  /** Badge numbers by tab id; a tab without one, or at 0, shows none. */
+  /** Badge numbers by tab id; a tab without one shows none. */
   counts?: Readonly<Record<string, number>>;
+  /** Wires the tabs to their panel ids when set (see the component docs). */
+  idPrefix?: string;
   onSelect: (id: string) => void;
+  /** Also badge a count of 0 (the pulls list wants every state visible). */
+  showZeroCounts?: boolean;
   tabs: readonly { id: string; label: string }[];
   trailing?: View;
-}) => (
-  <div class="border-base-300 flex items-center gap-2 border-b">
-    <div class="min-w-0 flex-1 overflow-x-auto">
-      <div role="tablist" class="tabs tabs-border w-max flex-nowrap">
-        {tabs.map((item) => (
-          <button
-            type="button"
-            role="tab"
-            aria-selected={active === item.id ? "true" : "false"}
-            class={`tab gap-1.5 whitespace-nowrap ${active === item.id ? "tab-active" : ""}`}
-            onclick={() => {
-              onSelect(item.id);
-            }}
-          >
-            {item.label}
-            {(counts?.[item.id] ?? 0) > 0 ? (
-              <span class="badge badge-sm tabular-nums">
-                {counts?.[item.id]}
-              </span>
-            ) : null}
-          </button>
-        ))}
+}) => {
+  const onKeyDown = (event: KeyboardEvent): void => {
+    const index = tabs.findIndex((item) => item.id === active);
+    let next = -1;
+    if (event.key === "ArrowRight") {
+      next = (index + 1) % tabs.length;
+    } else if (event.key === "ArrowLeft") {
+      next = (index - 1 + tabs.length) % tabs.length;
+    } else if (event.key === "Home") {
+      next = 0;
+    } else if (event.key === "End") {
+      next = tabs.length - 1;
+    }
+    if (next === -1) {
+      return;
+    }
+    event.preventDefault();
+    const target = tabs[next];
+    onSelect(target.id);
+    const list =
+      event.target instanceof HTMLElement
+        ? event.target.closest('[role="tablist"]')
+        : null;
+    list?.querySelectorAll<HTMLElement>('[role="tab"]')[next]?.focus();
+  };
+  return (
+    <div class="border-base-300 flex items-center gap-2 border-b">
+      <div class="min-w-0 flex-1 overflow-x-auto">
+        <div
+          role="tablist"
+          class="tabs tabs-border w-max flex-nowrap"
+          onkeydown={onKeyDown}
+        >
+          {tabs.map((item) => {
+            const count = counts?.[item.id];
+            const showCount =
+              count !== undefined && (showZeroCounts || count > 0);
+            return (
+              <button
+                key={item.id}
+                type="button"
+                role="tab"
+                id={
+                  idPrefix === undefined
+                    ? undefined
+                    : `${idPrefix}-tab-${item.id}`
+                }
+                aria-controls={
+                  idPrefix === undefined
+                    ? undefined
+                    : `${idPrefix}-panel-${item.id}`
+                }
+                aria-selected={active === item.id ? "true" : "false"}
+                tabindex={active === item.id ? 0 : -1}
+                class={`tab gap-1.5 whitespace-nowrap ${active === item.id ? "tab-active" : ""}`}
+                onclick={() => {
+                  onSelect(item.id);
+                }}
+              >
+                {item.label}
+                {showCount ? (
+                  <span class="badge badge-sm tabular-nums">{count}</span>
+                ) : null}
+              </button>
+            );
+          })}
+        </div>
       </div>
+      {trailing}
     </div>
-    {trailing}
-  </div>
-);
+  );
+};

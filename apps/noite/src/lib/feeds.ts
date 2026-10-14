@@ -100,11 +100,13 @@ export const liveFeed = <T>(
 /** Snapshot keys for the live panels (one per app / channel). */
 export const feedKeys = {
   apps: "feed:apps",
-  deploys: (appId: string) => `feed:${appId}:deploys`,
+  deploys: (appId: string, environmentId = "") =>
+    `feed:${appId}:deploys${environmentId === "" ? "" : `:${environmentId}`}`,
   errors: (appId: string, status: ErrorStatus) =>
     `feed:${appId}:errors:${status}`,
   events: (appId: string, channel: string) => `feed:${appId}:events:${channel}`,
-  logs: (appId: string) => `feed:${appId}:logs`,
+  logs: (appId: string, environmentId = "") =>
+    `feed:${appId}:logs${environmentId === "" ? "" : `:${environmentId}`}`,
   metrics: (appId: string, hours: number) => `feed:${appId}:metrics:${hours}`,
 } as const;
 
@@ -124,17 +126,27 @@ export const dropAppFromSnapshot = (appId: string): void => {
 /** Live app list (same rows as the list action). */
 export const applistUrl = (): string => "/api/apps/stream";
 
-/** Deploy history for one app. */
-export const deploysUrl = (appId: string): string =>
-  `/api/apps/${encodeURIComponent(appId)}/deploys/stream`;
+/** Deploy history for one app; `environmentId` scopes it to one preview
+ * environment (absent/"" is production). */
+export const deploysUrl = (appId: string, environmentId = ""): string =>
+  `/api/apps/${encodeURIComponent(appId)}/deploys/stream${
+    environmentId === ""
+      ? ""
+      : `?environmentId=${encodeURIComponent(environmentId)}`
+  }`;
 
 /** Grouped errors in one status for one app. */
 export const errorsUrl = (appId: string, status: ErrorStatus): string =>
   `/api/apps/${encodeURIComponent(appId)}/errors/stream?status=${status}`;
 
-/** Live runtime log tail for one app. */
-export const logsUrl = (appId: string): string =>
-  `/api/apps/${encodeURIComponent(appId)}/logs/stream`;
+/** Live runtime log tail for one app's own fleet, or for one environment
+ * (`environmentId`; absent/"" is production). */
+export const logsUrl = (appId: string, environmentId = ""): string =>
+  `/api/apps/${encodeURIComponent(appId)}/logs/stream${
+    environmentId === ""
+      ? ""
+      : `?environmentId=${encodeURIComponent(environmentId)}`
+  }`;
 
 /** Usage frames for one app over a `hours`-long window (24, 168 or 720). */
 export const metricsUrl = (appId: string, hours: number): string =>

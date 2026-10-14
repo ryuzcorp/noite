@@ -19,12 +19,20 @@ pub async fn require_bearer(state: AppState, req: Request, next: Next) -> Respon
     // The wake hop is public too: it is Caddy's `forward_auth` for an asleep
     // app's own hostname (SPEC, Scale to zero), and waking an app is exactly
     // what any request to that hostname does.
+    //
+    // The preview-environment gate pair is the same shape: Caddy's
+    // `forward_auth` calls `/v1/edge/env-gate` for a members-only environment
+    // site, and `/v1/edge/env-auth` is the hand-off the control UI redirects
+    // to. Neither carries the runner token; both verify their own credential
+    // (the signed short-lived token), which is why they are public here.
     if path == "/health"
         || path == "/ready"
         || path.starts_with("/v1/git/")
         || path == "/v1/edge/fallback"
         || path == "/v1/edge/tls-ask"
         || path == "/v1/edge/wake"
+        || path == "/v1/edge/env-gate"
+        || path == "/v1/edge/env-auth"
     {
         return next.run(req).await;
     }

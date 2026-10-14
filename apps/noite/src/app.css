@@ -141,6 +141,45 @@ dialog.modal.modal-end .modal-box {
   }
 }
 
+/* Resizable panes ($lib/ui/resizable): a collapse/expand slides the pane and
+ * the body inside it. The transition is only in place while a slide runs —
+ * `noite-resizing` is on <html> for exactly that long — so dragging a divider
+ * stays 1:1 with the pointer, and none of it exists below `lg`, where the
+ * panes are laid out by classes and a panel closed for the phone must not
+ * carry the collapsed state's translate into its overlay. The duration mirrors
+ * SLIDE_MS in $lib/ui/resizable. */
+@media (width >= 64rem) {
+  :root.noite-resizing [data-slot="resizable-panel"] {
+    transition: flex-grow 200ms ease;
+  }
+  :root.noite-resizing .noite-panel-slide {
+    transition: translate 200ms ease;
+  }
+  [data-slot="resizable-panel"][data-collapsed] .noite-panel-slide {
+    translate: 100% 0;
+  }
+  /* A closed pane takes no space, but its own edge border would still draw a
+   * hairline beside the divider that closed it. */
+  [data-slot="resizable-panel"][data-collapsed] {
+    border-width: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  :root.noite-resizing [data-slot="resizable-panel"],
+  :root.noite-resizing .noite-panel-slide {
+    transition: none;
+  }
+}
+
+/* While a divider is dragged, nothing under the pointer may swallow a move
+ * (the pod's own frame, the Preview panel's frame) and nothing selects. */
+:root.noite-dragging iframe {
+  pointer-events: none;
+}
+:root.noite-dragging {
+  user-select: none;
+}
+
 /* Onboarding steps fade in from the side as the tour advances. */
 .onboarding-step {
   animation: onboarding-step-in 220ms ease-out;

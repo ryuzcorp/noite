@@ -8,7 +8,19 @@ import { DiffView } from "./diff";
 import { commitHref, gitTime, shortSha } from "./format";
 import { FileStats } from "./parts";
 
-export const CommitView = ({ appId, sha }: { appId: string; sha: string }) => {
+export const CommitView = ({
+  appId,
+  gitRef = "",
+  file = "",
+  sha,
+}: {
+  appId: string;
+  /** The browsed ref and open file carried from the source page, so parent
+   * links (and the page's back link) return to them. */
+  gitRef?: string;
+  file?: string;
+  sha: string;
+}) => {
   const res = forgeCommit(appId, sha);
   const data = res.data();
   const error = res.error();
@@ -21,6 +33,7 @@ export const CommitView = ({ appId, sha }: { appId: string; sha: string }) => {
     );
   }
   const c = data.commit;
+  const from = { file, ref: gitRef };
   return (
     <div class="flex flex-col gap-6">
       <header class="flex flex-col gap-2">
@@ -43,7 +56,7 @@ export const CommitView = ({ appId, sha }: { appId: string; sha: string }) => {
                 <a
                   key={parent}
                   class="link link-hover font-mono"
-                  href={commitHref(appId, parent)}
+                  href={commitHref(appId, parent, from)}
                   title={parent}
                 >
                   {shortSha(parent)}

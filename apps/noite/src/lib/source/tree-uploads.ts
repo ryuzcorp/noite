@@ -39,7 +39,8 @@ export interface TreeUploadsHost {
   resync: () => Promise<void>;
   signal: AbortSignal;
   treeEl: HTMLElement;
-  workspace: Workspace;
+  /** The checkout an upload writes into, as of now (see `./tree`). */
+  workspace: () => Workspace;
 }
 
 /** The upload flow's surface for the tree wiring. */
@@ -126,8 +127,8 @@ export const createTreeUploads = (host: TreeUploadsHost): TreeUploads => {
         (async () => {
           try {
             await (read.kind === "text"
-              ? host.workspace.writeText(path, read.text)
-              : host.workspace.writeBytes(path, base64ToBytes(read.base64)));
+              ? host.workspace().writeText(path, read.text)
+              : host.workspace().writeBytes(path, base64ToBytes(read.base64)));
           } catch (error) {
             host.notify(errorMessage(error));
           }

@@ -11,6 +11,8 @@ pub mod apps;
 pub mod deploys;
 pub mod domains;
 pub mod env;
+pub mod env_gate;
+pub mod environments;
 pub mod errors;
 pub mod events;
 pub mod git;
@@ -24,6 +26,9 @@ pub mod storage;
 pub mod telemetry;
 
 #[cfg(test)]
+mod env_gate_tests;
+
+#[cfg(test)]
 mod tests;
 
 pub use admin::{snapshot, stats};
@@ -34,6 +39,12 @@ pub use apps::{
 pub use deploys::{deploy_log, list_deploys, list_deploys_stream, rollback};
 pub use domains::{add_domain, list_domains, remove_domain};
 pub use env::{delete_env, list_env, set_env};
+pub use env_gate::grant_environment;
+pub use environments::{
+    app_source_preview, create_environment, delete_environment, delete_environment_env,
+    deploy_environment, list_environment_env, list_environments, set_environment_env,
+    update_environment,
+};
 pub use errors::list_errors_stream;
 pub use events::{
     get_user_props, identify_user, list_channels, list_events, list_events_stream, list_insights,
@@ -51,9 +62,7 @@ pub use prs::{
     list_prs, merge_pr, set_branch_rules, update_pr,
 };
 pub use rpc::handle_rpc;
-pub use source::{
-    app_source_commit, source_archive, source_blob, source_bundle, source_tree, source_types,
-};
+pub use source::{app_source_commit, source_archive, source_blob, source_bundle, source_tree};
 pub use storage::{
     app_d1_delete_rows, app_d1_rows, app_d1_schema, app_d1_tables, app_d1_write, app_do, app_r2,
     app_r2_delete, app_r2_object, app_r2_put, app_r2_raw, app_storage,

@@ -9,6 +9,7 @@ import { atom, watch } from "ilha";
 
 import { collectRef, newLiveRef, whenLive } from "../live-ref";
 import { X } from "../ui/icons";
+import { MORPH_PRESERVE } from "../ui/resizable";
 import type { TerminalSession } from "./terminal-session";
 
 /** Styles inside the terminal's shadow root: fill the host (a flex-1 body)
@@ -36,9 +37,14 @@ const shadowPane = (host: HTMLElement): HTMLElement => {
 };
 
 export const TerminalPanel = ({
+  defaultSize,
   onClose,
   terminal,
 }: {
+  /** The share of the group the pane opens at (`data-default-size`, in
+   * percent) — the split the user last dragged it to, or nothing for the
+   * page's own third. */
+  defaultSize?: number;
   terminal: TerminalSession;
   onClose: () => void;
 }) => {
@@ -73,11 +79,15 @@ export const TerminalPanel = ({
   });
   const current = terminalView();
   return (
-    // Grid placement: below the editor and the side panel, spanning both —
-    // the page grid owns rows and columns, this root only fills its cell.
+    // The pane itself: the page's own resizable group owns the rows and the
+    // split (see $lib/ui/resizable); below `lg` this root only fills its own
+    // third of the column.
     <section
       aria-label="Terminal"
-      class="border-base-300 bg-base-100 col-start-2 col-end-[-1] row-start-2 flex min-h-0 min-w-0 flex-col overflow-hidden border-t"
+      data-slot="resizable-panel"
+      data-default-size={defaultSize}
+      data-morph-preserve={MORPH_PRESERVE}
+      class="border-base-300 bg-base-100 flex min-h-0 min-w-0 shrink-0 grow-0 basis-1/3 flex-col overflow-hidden border-t"
     >
       <div class="border-base-300 flex min-h-9 items-center gap-2 border-b py-1 pr-1.5 pl-3">
         <h2 class="m-0 text-sm font-semibold">Terminal</h2>

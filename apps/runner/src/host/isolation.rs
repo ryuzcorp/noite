@@ -69,7 +69,8 @@ pub async fn self_check(cfg: &Config, nft_installed: bool) -> IsolationStatus {
 /// is private. Existing state from earlier boots is tightened too: the
 /// SQLite database, git mirrors, control and Caddy state become owner-only.
 /// The sandboxed users need to reach what was handed to them
-/// (`builds/<slug>/<ts>` for builds, `fleets/<slug>` for fleets), and bun
+/// (`builds/<slug>/<ts>` for builds, `fleets/<slug>` and
+/// `envs/<slug>/<label>` for fleets), and bun
 /// resolves a project by listing its parent directories, so those parents
 /// are 0755: names are visible, contents are not (everything in them is
 /// owner-only).
@@ -93,7 +94,12 @@ pub fn harden_data_dir(cfg: &Config) {
     };
     let work = PathBuf::from(&cfg.work_dir);
     let traverse: Vec<PathBuf> = {
-        let mut dirs = vec![work.join("builds"), work.join("fleets"), work.join("cache")];
+        let mut dirs = vec![
+            work.join("builds"),
+            work.join("fleets"),
+            work.join("envs"),
+            work.join("cache"),
+        ];
         let _ = dirs.iter().try_for_each(std::fs::create_dir_all);
         dirs.push(work.clone());
         if let Some(root) = work.parent() {
@@ -104,10 +110,11 @@ pub fn harden_data_dir(cfg: &Config) {
     for dir in &traverse {
         set(dir, 0o755);
     }
-    // Per-slug build/cache parents: builds/<slug>/ and cache/<slug>/ too.
-    // The bun cache leaf itself stays owner-only (build uid after the
-    // deploy hands it over), so the fleet uid can traverse but never read.
-    for top in ["builds", "cache"] {
+    // Per-slug build/cache/environment parents: builds/<slug>/, cache/<slug>/
+    // and envs/<slug>/ too. The bun cache leaf itself stays owner-only (build
+    // uid after the deploy hands it over), so the fleet uid can traverse but
+    // never read.
+    for top in ["builds", "cache", "envs"] {
         if let Ok(entries) = std::fs::read_dir(work.join(top)) {
             for entry in entries.flatten() {
                 set(&entry.path(), 0o755);

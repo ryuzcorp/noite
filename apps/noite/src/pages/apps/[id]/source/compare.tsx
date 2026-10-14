@@ -10,6 +10,9 @@ export default function ComparePage() {
   // source page link straight here with both set).
   const base = searchParam("base", { default: "main" });
   const headRef = searchParam("head", { default: "" });
+  // The ref the compare was opened from (the branch picker sets it), so the
+  // back link and the commit links return to that checkout.
+  const gitRef = searchParam("ref", { default: "" });
   head({ title: `Compare ${base()}…${headRef()} · Noite` });
   if (!appId) {
     return <p class="text-error m-0 p-4 text-sm">Missing app id.</p>;
@@ -19,7 +22,7 @@ export default function ComparePage() {
     headRef.set(nextHead);
   };
   return (
-    <CodePage appId={appId}>
+    <CodePage appId={appId} backRef={gitRef()}>
       <div class="flex flex-wrap items-center justify-between gap-2">
         <h1 class="m-0 text-xl font-semibold">Compare</h1>
         {headRef() === "" ? null : (
@@ -27,7 +30,7 @@ export default function ComparePage() {
             class="btn btn-sm btn-neutral"
             href={`/apps/${appId}/pulls/new?base=${encodeURIComponent(base())}&head=${encodeURIComponent(headRef())}`}
           >
-            Open pull
+            Open pull request
           </a>
         )}
       </div>
@@ -46,6 +49,7 @@ export default function ComparePage() {
           key={`${appId}:${base()}:${headRef()}`}
           appId={appId}
           base={base()}
+          gitRef={gitRef()}
           head={headRef()}
           onPick={pick}
         />

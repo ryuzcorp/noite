@@ -89,7 +89,8 @@ const AppPageBody = ({ appId }: { appId: string }) => {
   // The open error (ErrorsPanel's `?e=`): a tab click always lands on the
   // tab's top level, so the Errors tab shows the list, not a stale detail.
   const openError = searchParam("e", { default: "" });
-  const name = appDetail(appId).data()?.app.name;
+  const detail = appDetail(appId).data();
+  const name = detail?.app.name;
   head({ title: `${name ?? "App"} · Noite` });
   // Same live feeds as the Errors tab's open list and the Events tab's
   // default view, so the tab badges never lag the lists.
@@ -139,7 +140,13 @@ const AppPageBody = ({ appId }: { appId: string }) => {
       }
     >
       {tab() === "overview" ? <AppDetailPanel appId={appId} /> : null}
-      {tab() === "deployments" ? <DeployList appId={appId} /> : null}
+      {tab() === "deployments" ? (
+        <DeployList
+          appId={appId}
+          myRole={detail?.myRole}
+          subdomain={detail?.app.subdomain ?? ""}
+        />
+      ) : null}
       {tab() === "metrics" ? <MetricsTab appId={appId} /> : null}
       {tab() === "errors" ? <ErrorsPanel appId={appId} /> : null}
       {tab() === "events" ? <EventsPanel appId={appId} /> : null}

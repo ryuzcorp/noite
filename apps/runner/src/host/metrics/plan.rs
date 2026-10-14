@@ -47,6 +47,14 @@ pub(super) fn s3_setup(cfg: &Config, query: &str) -> String {
 /// celld `--bucket` (`fleets/<slug>`); the control fleet's `--bucket` is
 /// `control`, so its traces and logs land at `control/telemetry/...` — the
 /// control prefix, never `fleets/_control`.
+///
+/// A preview environment's celld writes under its own `--bucket`
+/// (`envs/<slug>/<label>`), so its files land at
+/// `envs/<slug>/<label>/telemetry/...`. Phase 1 does **not** ingest them
+/// (ROADMAP Phase 3): nothing globs `envs/`, and the ingest's slug extraction
+/// reads `fleets/<slug>/` paths only, so those files are invisible rather than
+/// mis-keyed. An environment therefore shows deploy and live logs, not
+/// metrics — which is exactly what the contract says.
 pub(super) fn telemetry_prefix(slug: &str) -> String {
     if slug == crate::host::control::SLUG {
         "control".to_string()
@@ -342,5 +350,30 @@ mod tests {
             tenant.iter().all(|g| g.starts_with(&tenant_root)),
             "{tenant:?}"
         );
+    }
+
+    /// Preview environments write their telemetry under `envs/<slug>/<label>/`
+    /// (their own `--bucket`). Phase 1 must not ingest it — and it does not,
+    /// because every glob is built from the source's own prefix — so an
+    /// environment bug can never key its rows onto the app (ROADMAP Phase 3
+    /// adds the env dimension).
+    #[test]
+    fn environment_telemetry_is_never_globbed() {
+        let cfg = crate::config::Config::from_env().expect("config");
+        let now = now_us();
+        let (from, to) = (now - HOUR_US, now);
+        for kind in ["traces", "logs"] {
+            let globs = telemetry_globs(&cfg, "blog", kind, from, to);
+            assert!(
+                globs
+                    .iter()
+                    .all(|g| !g.contains("/envs/") && !g.contains("envs/blog")),
+                "{kind}: {globs:?}"
+            );
+        }
+        // The filter that would name an environment lives nowhere: only the
+        // two shapes above are prefixes.
+        assert_eq!(telemetry_prefix(crate::host::control::SLUG), "control");
+        assert_eq!(telemetry_prefix("blog"), "fleets/blog");
     }
 }

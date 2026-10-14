@@ -79,16 +79,21 @@ pub async fn ensure_app_build_uid(
 /// Range-bounded allocator (SPEC, Ports): new fleets come from the
 /// configured range. Exhaustion errors instead of wandering past max into
 /// ephemeral ports.
+///
+/// Both fleets are read: an app's pair **and** every preview environment's,
+/// because an environment is its own celld process with its own pair on the
+/// same range and two fleets on one port crash-loop.
 pub async fn next_ports_in(pool: &SqlitePool, min: u16, max: u16) -> sqlx::Result<(i64, i64)> {
     let apps = list_all_apps(pool).await?;
+    let envs = super::environments::list_all_environments(pool).await?;
     let mut used = std::collections::HashSet::new();
-    for a in apps {
-        if let Some(p) = a.listen_port {
-            used.insert(p as u16);
-        }
-        if let Some(p) = a.internal_port {
-            used.insert(p as u16);
-        }
+    for p in apps
+        .iter()
+        .flat_map(|a| [a.listen_port, a.internal_port])
+        .chain(envs.iter().flat_map(|e| [e.listen_port, e.internal_port]))
+        .flatten()
+    {
+        used.insert(p as u16);
     }
     let mut listen = min;
     loop {

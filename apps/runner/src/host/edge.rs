@@ -89,7 +89,62 @@ pub fn parse_preview_slug(host: &str, bases: &[String]) -> Option<String> {
     None
 }
 
-fn escape(text: &str) -> String {
+/// Environment host `<label>.<slug>.<base>` — exactly one **stable** hostname
+/// per environment (ROADMAP, Preview environments): a branch's data survives
+/// its redeploys, so the address must not change per commit, and on-demand TLS
+/// then issues one certificate per environment instead of one per push.
+///
+/// `None` for everything else. A tenant host has one label below the base; the
+/// pod host has three (`{PREVIEW_LABEL}.preview.{slug}`), so it can never be
+/// read as `<label>.<slug>`; and the two labels the preview hosts own are
+/// refused here as well (`preview`, `{PREVIEW_LABEL}`) because the environment
+/// labeler refuses to mint them ([`crate::host::env_label`]), so a
+/// hand-written host must not become an environment either.
+pub fn parse_env_host(host: &str, bases: &[String]) -> Option<(String, String)> {
+    let bare = host
+        .split_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host)
+        .trim()
+        .trim_end_matches('.')
+        .to_lowercase();
+    if bare.is_empty() {
+        return None;
+    }
+    for base in bases {
+        if base.trim().is_empty() {
+            continue;
+        }
+        let Some(rest) = bare.strip_suffix(format!(".{base}").as_str()) else {
+            continue;
+        };
+        let Some((label, slug)) = rest.split_once('.') else {
+            continue;
+        };
+        if label.is_empty() || slug.is_empty() || slug.contains('.') {
+            continue;
+        }
+        // The labels the preview hosts own are refused here exactly as the
+        // labeler refuses to mint them, so a hand-written host can never
+        // shadow `preview.{slug}` or the pod host's label.
+        if crate::host::env_label::RESERVED_LABELS.contains(&label) {
+            continue;
+        }
+        return Some((slug.to_string(), label.to_string()));
+    }
+    None
+}
+
+/// Whether an environment host is served by its own fleet. A stopped or
+/// never-deployed environment keeps its host — and its certificate — but
+/// answers the fallback page, exactly like a tenant site with no live fleet.
+pub fn env_live(route: &crate::db::EnvironmentRoute) -> bool {
+    route.listen_port.is_some()
+        && route.last_deployed_at.is_some()
+        && route.desired_state != crate::models::DesiredState::Stopped.as_str()
+}
+
+pub(crate) fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
@@ -106,7 +161,7 @@ fn escape(text: &str) -> String {
 /// incoming Host (keeps dev ports working without configuration). Visitors
 /// on a LAN/extra host link back to that host, not localhost — which would
 /// resolve to their own machine.
-fn control_url(
+pub(crate) fn control_url(
     host: &str,
     base_domain: &str,
     control_sub: &str,
@@ -146,7 +201,12 @@ fn control_url(
     }
 }
 
-fn page(status: StatusCode, title: &str, body: &str, control: &str) -> impl IntoResponse {
+pub(crate) fn page(
+    status: StatusCode,
+    title: &str,
+    body: &str,
+    control: &str,
+) -> impl IntoResponse {
     let html = format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
@@ -208,12 +268,15 @@ async fn app_for_host(
     }
 }
 
-/// `forward_auth` target for an asleep app's sites (SPEC, Scale to zero).
+/// `forward_auth` target for an asleep site (SPEC, Scale to zero).
 /// Caddy holds the visitor's request while this runs: wake the fleet, wait
 /// for its health gate, answer 200 — Caddy then proxies the held request
 /// unchanged, so the visitor never sees that the app was asleep. Public like
 /// the other edge routes: waking an app is exactly what a request to its
 /// hostname does anyway. Only a failed wake is visible (503 page).
+///
+/// One hostname family per fleet: a tenant/custom host wakes the app's fleet,
+/// an environment host (`<label>.<slug>.<base>`) wakes that environment's.
 pub async fn wake(State(state): State<AppState>, headers: HeaderMap) -> axum::response::Response {
     let header = |name: &str| {
         headers
@@ -224,29 +287,55 @@ pub async fn wake(State(state): State<AppState>, headers: HeaderMap) -> axum::re
     let host = header("x-forwarded-host")
         .or_else(|| header("host"))
         .unwrap_or_default();
+    let cfg = &state.config;
+    let control = control_url(
+        &host,
+        &cfg.base_domain,
+        &cfg.control_subdomain,
+        &cfg.tenant_bases(),
+    );
+    // An environment host wakes *its* fleet (its own bucket, its own ports),
+    // not the app's: the environment id, not the app id, keys the wake.
+    if let Some((slug, label)) = parse_env_host(&host, &cfg.tenant_bases()) {
+        let route = match crate::db::environment_route(&state.pool, &slug, &label).await {
+            Ok(Some(route)) => route,
+            _ => return StatusCode::NOT_FOUND.into_response(),
+        };
+        let woken = crate::host::sleep::wake_environment(
+            &state.pool,
+            cfg,
+            &state.procs,
+            &state.logs,
+            &route.id,
+        )
+        .await;
+        return match woken {
+            Ok(()) => StatusCode::OK.into_response(),
+            Err(e) => {
+                tracing::warn!(slug = %route.app_slug, label = %route.label, error = %e, "env wake failed");
+                page(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Unavailable",
+                    &format!(
+                        "The preview <code>{}</code> could not start. Try again in a moment.",
+                        escape(&route.label)
+                    ),
+                    &control,
+                )
+                .into_response()
+            }
+        };
+    }
     let (_, app) = app_for_host(&state, &host).await;
     let Some(app) = app else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match crate::host::sleep::wake_app(
-        &state.pool,
-        &state.config,
-        &state.procs,
-        &state.logs,
-        &app.id,
-    )
-    .await
-    {
+    let woken =
+        crate::host::sleep::wake_app(&state.pool, cfg, &state.procs, &state.logs, &app.id).await;
+    match woken {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => {
             tracing::warn!(slug = %app.slug, error = %e, "wake failed");
-            let cfg = &state.config;
-            let control = control_url(
-                &host,
-                &cfg.base_domain,
-                &cfg.control_subdomain,
-                &cfg.tenant_bases(),
-            );
             page(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Unavailable",
@@ -269,6 +358,59 @@ pub async fn edge_fallback(State(state): State<AppState>, headers: HeaderMap) ->
     let cfg = &state.config;
     let bases = cfg.tenant_bases();
     let control = control_url(host, &cfg.base_domain, &cfg.control_subdomain, &bases);
+    // An environment host (`<label>.<slug>.<base>`) resolves by environment:
+    // the exact site exists for a live one, so this page answers a parked
+    // environment, a label no environment owns, and the moment between a
+    // change and the next Caddyfile rewrite.
+    if let Some((slug, label)) = parse_env_host(host, &bases) {
+        let route = crate::db::environment_route(&state.pool, &slug, &label)
+            .await
+            .ok()
+            .flatten();
+        let Some(route) = route else {
+            return page(
+                StatusCode::NOT_FOUND,
+                "Not found",
+                &format!(
+                    "<code>{}</code> has no environment called <code>{}</code>.",
+                    escape(&slug),
+                    escape(&label)
+                ),
+                &control,
+            );
+        };
+        if route.desired_state == crate::models::DesiredState::Stopped.as_str() {
+            return page(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Paused",
+                &format!(
+                    "Preview <code>{}</code> is paused. Start it from the control panel to bring it back.",
+                    escape(&route.label)
+                ),
+                &control,
+            );
+        }
+        if !env_live(&route) {
+            return page(
+                StatusCode::NOT_FOUND,
+                "Not deployed yet",
+                &format!(
+                    "Preview <code>{}</code> exists but has no deploy yet — push to its branch to launch it.",
+                    escape(&route.label)
+                ),
+                &control,
+            );
+        }
+        return page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Starting",
+            &format!(
+                "Preview <code>{}</code> is starting — retry in a few seconds.",
+                escape(&route.label)
+            ),
+            &control,
+        );
+    }
     // A tenant hostname resolves by slug; anything else may be a custom
     // hostname registered for one app (`app_domain`).
     let (slug, app) = app_for_host(&state, host).await;
@@ -385,6 +527,17 @@ pub async fn tls_ask(
             _ => StatusCode::NOT_FOUND,
         };
     }
+    // An environment host (`<label>.<slug>.<base>`) is ours when the
+    // environment exists: its own stable host means one certificate per
+    // environment, and the fleet need not be up (a newly created environment
+    // still gets the host it will serve on). A label no environment owns is
+    // refused, so a typo can never drain CA issuance.
+    if let Some((slug, label)) = parse_env_host(domain, &cfg.tenant_bases()) {
+        return match crate::db::environment_route(&state.pool, &slug, &label).await {
+            Ok(Some(_)) => StatusCode::OK,
+            _ => StatusCode::NOT_FOUND,
+        };
+    }
     // A tenant hostname or a registered custom hostname. Both must belong to
     // an app that is deployed and running, so a certificate is never minted for
     // a name this fleet does not serve.
@@ -449,6 +602,96 @@ mod tests {
             Some("test".to_string())
         );
         assert_eq!(parse_edge_slug("test.evil.local", &lan, ""), None);
+    }
+
+    #[test]
+    fn parses_environment_hosts() {
+        let bases = bases(&["noite.now", "noite.local"]);
+        assert_eq!(
+            parse_env_host("feat-x.test.noite.now", &bases),
+            Some(("test".to_string(), "feat-x".to_string()))
+        );
+        assert_eq!(
+            parse_env_host("feat-x.test.noite.local:9080", &bases),
+            Some(("test".to_string(), "feat-x".to_string()))
+        );
+        assert_eq!(
+            parse_env_host("FEAT-X.Test.Noite.Now.", &bases),
+            Some(("test".to_string(), "feat-x".to_string()))
+        );
+        // A label with a dash suffix (`unique_label`) still parses.
+        assert_eq!(
+            parse_env_host("feat-x-2.my--app.noite.now", &bases),
+            Some(("my--app".to_string(), "feat-x-2".to_string()))
+        );
+    }
+
+    #[test]
+    fn environment_hosts_never_collide_with_tenant_pod_or_platform_hosts() {
+        let bases = bases(&["noite.now", "localhost", "noite.local"]);
+        // A tenant host has one label below the base.
+        assert_eq!(parse_env_host("test.noite.now", &bases), None);
+        assert_eq!(parse_env_host("app.noite.now", &bases), None);
+        assert_eq!(parse_env_host("api.noite.now", &bases), None);
+        assert_eq!(parse_env_host("git.noite.now", &bases), None);
+        assert_eq!(parse_env_host("noite.now", &bases), None);
+        // The pod host is one label deeper, and the label catch-all under it
+        // (`*.preview.{slug}.{base}`) is not an environment either.
+        assert_eq!(parse_env_host("app-0.preview.test.noite.now", &bases), None);
+        assert_eq!(parse_env_host("pod-1.preview.test.noite.now", &bases), None);
+        assert_eq!(parse_env_host("x.preview.test.noite.now", &bases), None);
+        // Labels the preview hosts own are refused, like the labeler does.
+        assert_eq!(parse_env_host("preview.test.noite.now", &bases), None);
+        assert_eq!(parse_env_host("app-0.test.noite.now", &bases), None);
+        // A custom domain is not on a tenant base at all.
+        assert_eq!(parse_env_host("feat-x.test.example.com", &bases), None);
+        assert_eq!(parse_env_host("feat-x.test.evil.noite.now", &bases), None);
+        // Empty pieces, no slug, too many labels.
+        assert_eq!(parse_env_host(".test.noite.now", &bases), None);
+        assert_eq!(parse_env_host("feat-x..noite.now", &bases), None);
+        assert_eq!(parse_env_host("a.b.c.noite.now", &bases), None);
+        assert_eq!(parse_env_host("", &bases), None);
+        // The dev base has tenant hosts too (`test.localhost`).
+        assert_eq!(
+            parse_env_host("feat-x.test.localhost", &bases),
+            Some(("test".to_string(), "feat-x".to_string()))
+        );
+    }
+
+    #[test]
+    fn environment_host_threads_are_not_tenants() {
+        // No host may resolve to two different fleets: whatever the tenant
+        // parser claims, the environment parser must refuse, and the pod host
+        // belongs to neither (`parse_preview_slug` owns it).
+        let bases = bases(&["noite.now", "noite.local", "localhost"]);
+        for host in [
+            "feat-x.test.noite.now",
+            "feat-x.test.noite.local",
+            "feat-x.test.localhost",
+            "test.noite.now",
+            "shop.noite.local",
+            "shop.localhost",
+            // Two labels that are not a platform host: the environment parser
+            // claims it (the app `b` would have to exist, which is a DB
+            // question), the tenant parser never does.
+            "a.b.noite.now",
+        ] {
+            let env = parse_env_host(host, &bases);
+            let tenant = parse_edge_slug(host, &bases, "app");
+            assert!(
+                env.is_some() ^ tenant.is_some(),
+                "{host}: env {env:?} tenant {tenant:?}"
+            );
+        }
+        for host in ["app-0.preview.test.noite.now", "x.preview.test.noite.now"] {
+            assert_eq!(parse_env_host(host, &bases), None);
+            assert_eq!(parse_edge_slug(host, &bases, "app"), None);
+        }
+        assert_eq!(
+            parse_preview_slug("app-0.preview.test.noite.now", &bases),
+            Some("test".to_string()),
+            "the pod host keeps its own parser"
+        );
     }
 
     #[test]

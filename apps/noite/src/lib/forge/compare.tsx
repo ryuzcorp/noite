@@ -46,11 +46,15 @@ export const CompareBar = ({
 export const CompareView = ({
   appId,
   base,
+  gitRef,
   head,
   onPick,
 }: {
   appId: string;
   base: string;
+  /** The browsed ref (the branch the compare was opened from), carried into
+   * the commit links so their back link returns to it. */
+  gitRef: string;
   head: string;
   onPick: (base: string, head: string) => void;
 }) => {
@@ -103,6 +107,7 @@ export const CompareView = ({
               appId={appId}
               commits={data.commits}
               emptyLabel="No commits between the refs."
+              gitRef={gitRef}
             />
           </section>
           <section class="flex flex-col gap-2">

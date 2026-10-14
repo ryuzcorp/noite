@@ -26,6 +26,13 @@ import type { AtomHandle } from "ilha";
 
 export type { SearchParam, SearchParamOptions } from "@ilha/router";
 
+/** Parse a paging cursor (`?skip=`): a positive integer, anything else
+ * (missing, `0`, negative, fractional, not a number) is the first page. */
+export const parseSkip = (raw: string): number => {
+  const value = Math.trunc(Number(raw));
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
+};
+
 /** Version bumped after every navigation; every param read subscribes to it. */
 let cell: AtomHandle<number> | undefined;
 

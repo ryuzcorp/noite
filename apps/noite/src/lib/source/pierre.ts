@@ -17,8 +17,15 @@ export interface PreparedTreeInput {
   presorted: true;
 }
 
-/** The statuses this pane paints in the tree, as pierre names them. */
-export type TreeGitStatus = "added" | "deleted" | "modified" | "renamed";
+/** The statuses this pane paints in the tree, as pierre names them: the four a
+ * change has, plus the one a path the checkout's rules exclude carries (pierre
+ * dims that row, and everything under it). */
+export type TreeGitStatus =
+  | "added"
+  | "deleted"
+  | "ignored"
+  | "modified"
+  | "renamed";
 
 export interface TreeStatusEntry {
   path: string;

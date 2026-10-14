@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::{is_localhost_domain, Config};
+use crate::db::EnvironmentRoute;
 use crate::models::{App, AppDomain, AppLimit};
 
 /// Whether the Caddy binary has the `rate_limit` handler
@@ -145,11 +146,112 @@ fn plaintext_hosts(addr: &str) -> String {
         .join(", ")
 }
 
+/// One reverse-proxy site block. `tls` adds an on-demand TLS gate so the site
+/// serves HTTPS with per-hostname certs (no wildcard cert needed); a tls-gated
+/// site does NOT proxy plaintext :80 (empty 200s), which is what [`push_site`]
+/// compensates for. Site-level extras (e.g. `rewrite`) go in the site block;
+/// proxy options (e.g. `header_up`) MUST go inside `reverse_proxy` — Caddy
+/// rejects them at site level and then keeps serving the stale config.
+///
+/// Free functions rather than closures: the environment sites (and their
+/// plaintext twins) are emitted from the same `lines` buffer, and a closure
+/// capturing it mutably would lock every other writer out.
+fn push_block(
+    lines: &mut Vec<String>,
+    cfg: &Config,
+    addr: &str,
+    tls: bool,
+    site_extra: &[&str],
+    proxy_extra: &[&str],
+    upstream: &str,
+) {
+    lines.push(format!("{addr} {{"));
+    // Access log per site as JSON into the file the runner tails
+    // (`CADDY_ACCESS_LOG`: one path for writer and reader, since they share
+    // this container), feeding the device/path/ref breakdown. The tailer
+    // bounds its size itself (host/accesslog.rs truncates after consuming), so
+    // no Caddy-side rolling. Per-request lines leave `docker logs`; tail the
+    // file instead.
+    lines.push("\tlog {".into());
+    lines.push(format!("\t\toutput file {}", cfg.caddy_access_log));
+    lines.push("\t\tformat json".into());
+    lines.push("\t}".into());
+    // Compression, because celld does not compress an asset response and the
+    // docs point at a compressing ingress proxy for clients that want gzip or
+    // brotli. Measured through this edge: the control UI's content-hashed
+    // bundle drops from 462 KiB to 144 KiB and its CSS from 129 KiB to 22 KiB,
+    // while the `text/event-stream` log/deploy/metric endpoints stay
+    // uncompressed, chunked and unbuffered (the proxy below keeps
+    // `flush_interval -1`, and Caddy skips an event stream).
+    lines.push("\tencode zstd gzip".into());
+    if tls {
+        lines.push("\ttls {".into());
+        lines.push("\t\ton_demand".into());
+        lines.push("\t}".into());
+    }
+    for line in site_extra {
+        lines.push(format!("\t{line}"));
+    }
+    lines.push(format!("\treverse_proxy {upstream} {{"));
+    for line in proxy_extra {
+        lines.push(format!("\t\t{line}"));
+    }
+    // Bound the upstream waits, but keep the connection pool. celld answers a
+    // subset of concurrent requests never at all (measured on the production
+    // install: every failure is exactly the timeout below, while the ones that
+    // answer take 0.55-0.88 s), and with no bound Caddy holds such a request
+    // until the browser gives up — the client sees a hang rather than an error
+    // it could retry. `dial_timeout` bounds a stalled connect. Pooling stays ON
+    // deliberately: measured against a 0.6.0 node, an upstream per request
+    // (`keepalive off`) costs ~590 ms per request where the pool costs ~11 ms,
+    // because celld charges a new connection to the Worker, and it also
+    // multiplies simultaneous connections to a node that is already the
+    // bottleneck. `flush_interval -1` below only affects response streaming.
+    lines.push("\t\ttransport http {".into());
+    lines.push("\t\t\tdial_timeout 5s".into());
+    lines.push("\t\t\tresponse_header_timeout 30s".into());
+    lines.push("\t\t}".into());
+    lines.push("\t\tflush_interval -1".into());
+    lines.push("\t}".into());
+    lines.push("}".into());
+    lines.push(String::new());
+}
+
+/// [`push_block`] plus, behind a terminating proxy, the plaintext twin that
+/// carries the same handlers in clear. Behind a proxy only: with direct TLS,
+/// Caddy's own :80 → HTTPS redirect must answer instead (a `http://*.{base}`
+/// twin would shadow it for every host).
+fn push_site(
+    lines: &mut Vec<String>,
+    cfg: &Config,
+    addr: &str,
+    tls: bool,
+    site_extra: &[&str],
+    proxy_extra: &[&str],
+    upstream: &str,
+) {
+    // `rewrite_caddy`'s own definition of "behind a terminating proxy".
+    let edge_tls = !is_localhost_domain(&cfg.base_domain) && !cfg.auto_https;
+    if tls && edge_tls && !addr.starts_with("http://") {
+        push_block(
+            lines,
+            cfg,
+            &plaintext_hosts(addr),
+            false,
+            site_extra,
+            proxy_extra,
+            upstream,
+        );
+    }
+    push_block(lines, cfg, addr, tls, site_extra, proxy_extra, upstream);
+}
+
 pub async fn rewrite_caddy(
     cfg: &Config,
     apps: &[App],
     domains: &[AppDomain],
     limits: &[AppLimit],
+    envs: &[EnvironmentRoute],
 ) -> anyhow::Result<()> {
     let local = is_localhost_domain(&cfg.base_domain);
     let plain = local || !cfg.auto_https;
@@ -256,76 +358,6 @@ pub async fn rewrite_caddy(
     // Site-level extras (e.g. `rewrite`) go in the site block; proxy options
     // (e.g. `header_up`) MUST go inside `reverse_proxy` — Caddy rejects
     // them at site level and then keeps serving the stale config.
-    let mut push_block =
-        |addr: &str, tls: bool, site_extra: &[&str], proxy_extra: &[&str], upstream: &str| {
-            lines.push(format!("{addr} {{"));
-            // Access log per site as JSON into the file the runner tails
-            // (`CADDY_ACCESS_LOG`: one path for writer and reader, since they
-            // share this container), feeding the device/path/ref breakdown. The
-            // tailer bounds its size itself (host/accesslog.rs truncates after
-            // consuming), so no Caddy-side rolling. Per-request lines leave
-            // `docker logs`; tail the file instead.
-            lines.push("\tlog {".into());
-            lines.push(format!("\t\toutput file {}", cfg.caddy_access_log));
-            lines.push("\t\tformat json".into());
-            lines.push("\t}".into());
-            // Compression, because celld does not compress an asset response and
-            // the docs point at a compressing ingress proxy for clients that want
-            // gzip or brotli. Measured through this edge: the control UI's
-            // content-hashed bundle drops from 462 KiB to 144 KiB and its CSS from
-            // 129 KiB to 22 KiB, while the `text/event-stream` log/deploy/metric
-            // endpoints stay uncompressed, chunked and unbuffered (the proxy below
-            // keeps `flush_interval -1`, and Caddy skips an event stream).
-            lines.push("\tencode zstd gzip".into());
-            if tls {
-                lines.push("\ttls {".into());
-                lines.push("\t\ton_demand".into());
-                lines.push("\t}".into());
-            }
-            for line in site_extra {
-                lines.push(format!("\t{line}"));
-            }
-            lines.push(format!("\treverse_proxy {upstream} {{"));
-            for line in proxy_extra {
-                lines.push(format!("\t\t{line}"));
-            }
-            // Bound the upstream waits, but keep the connection pool. celld
-            // answers a subset of concurrent requests never at all (measured on
-            // the production install: every failure is exactly the timeout below,
-            // while the ones that answer take 0.55-0.88 s), and with no bound
-            // Caddy holds such a request until the browser gives up — the client
-            // sees a hang rather than an error it could retry. `dial_timeout`
-            // bounds a stalled connect. Pooling stays ON deliberately: measured
-            // against a 0.6.0 node, an upstream per request (`keepalive off`)
-            // costs ~590 ms per request where the pool costs ~11 ms, because celld
-            // charges a new connection to the Worker, and it also multiplies
-            // simultaneous connections to a node that is already the bottleneck.
-            // `flush_interval -1` below only affects response streaming.
-            lines.push("\t\ttransport http {".into());
-            lines.push("\t\t\tdial_timeout 5s".into());
-            lines.push("\t\t\tresponse_header_timeout 30s".into());
-            lines.push("\t\t}".into());
-            lines.push("\t\tflush_interval -1".into());
-            lines.push("\t}".into());
-            lines.push("}".into());
-            lines.push(String::new());
-        };
-    let mut push_site =
-        |addr: &str, tls: bool, site_extra: &[&str], proxy_extra: &[&str], upstream: &str| {
-            // Behind a proxy only: with direct TLS, Caddy's own :80 -> HTTPS
-            // redirect must answer instead (a `http://*.{base}` twin would
-            // shadow it for every host).
-            if tls && edge_tls && !addr.starts_with("http://") {
-                push_block(
-                    &plaintext_hosts(addr),
-                    false,
-                    site_extra,
-                    proxy_extra,
-                    upstream,
-                );
-            }
-            push_block(addr, tls, site_extra, proxy_extra, upstream);
-        };
     let edge = &cfg.edge;
     let control_guard = guard_lines(&[Zone::per_client(cfg, "client_control", edge.client_rpm)]);
     // The control worker keys its own auth limits on the right-most
@@ -339,6 +371,8 @@ pub async fn rewrite_caddy(
     let control_guard_refs: Vec<&str> = control_guard.iter().map(String::as_str).collect();
     let control_proxy_refs: Vec<&str> = control_proxy.iter().map(String::as_str).collect();
     push_site(
+        &mut lines,
+        cfg,
         // Per-host scheme mapping is handled inside `push_site`, so the joined
         // control list needs no special casing here.
         &control_site,
@@ -349,6 +383,8 @@ pub async fn rewrite_caddy(
     );
     // Plaintext loopback for container healthchecks, independent of TLS mode.
     push_site(
+        &mut lines,
+        cfg,
         "http://127.0.0.1",
         false,
         &[],
@@ -373,10 +409,19 @@ pub async fn rewrite_caddy(
             // No header_up lines: Caddy's reverse_proxy already forwards Host
             // and sets X-Forwarded-For/Proto/Host by default (it warns on
             // explicit duplicates, and site-level ones fail the whole adapt).
-            let mut extra = tenant_site_extra(cfg, app);
+            // The Code mode Preview panel frames production for the default
+            // branch, so a frame load gets the same opt-in an environment
+            // site carries (see `PRODUCTION_FRAME_HEADERS`).
+            let mut extra: Vec<String> = PRODUCTION_FRAME_HEADERS
+                .iter()
+                .map(|l| (*l).to_string())
+                .collect();
+            extra.extend(tenant_site_extra(cfg, app));
             extra.extend(guard_lines(&app_zones(cfg, app, limits)));
             let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
             push_site(
+                &mut lines,
+                cfg,
                 &addr_of(&format!("{}.{}", app.slug, base)),
                 on_demand,
                 &extra,
@@ -405,6 +450,8 @@ pub async fn rewrite_caddy(
         extra.extend(guard_lines(&app_zones(cfg, app, limits)));
         let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
         push_site(
+            &mut lines,
+            cfg,
             &addr_of(&domain.hostname),
             on_demand,
             &extra,
@@ -413,10 +460,103 @@ pub async fn rewrite_caddy(
         );
     }
 
+    // Preview environments (ROADMAP, Preview environments → Phase 2): one
+    // site per environment at `<label>.<slug>.<base>`, routed to that
+    // environment's own fleet port, under every tenant base. `main` is the app
+    // itself and never an environment, so no host here can collide with a
+    // tenant host (`parse_edge_slug` refuses a dotted slug) or with the pod
+    // host (one label deeper).
+    //
+    // Same rate-limit zones as the app — an environment is the same app's
+    // traffic and the caps are per app — the same trace header and the same
+    // wake-on-request hop; members-only environments (the default) additionally
+    // put the access gate in front (host/env_gate.rs).
+    let env_fallback = {
+        let mut extra = guard_lines(&[Zone::per_client(cfg, "client_fallback", edge.client_rpm)]);
+        extra.push("rewrite * /v1/edge/fallback".into());
+        extra
+    };
+    let env_fallback: Vec<&str> = env_fallback.iter().map(String::as_str).collect();
+    for base in cfg.tenant_bases() {
+        for env in envs {
+            let Some(app) = apps.iter().find(|a| a.id == env.app_id) else {
+                continue;
+            };
+            let live = crate::host::edge::env_live(env);
+            let addr = addr_of(&format!("{}.{}.{}", env.label, app.slug, base));
+            // Site-level lines, in the order they are written: the frameable
+            // header, then (live) the trace + retry page or (parked) the
+            // rewrite to the runner's page, then the app's rate-limit zones.
+            let mut extras: Vec<String> = FRAME_HEADERS.iter().map(|l| (*l).to_string()).collect();
+            if live {
+                extras.extend(fleet_site_extra());
+            } else {
+                extras.push("rewrite * /v1/edge/fallback".into());
+            }
+            extras.extend(guard_lines(&app_zones(cfg, app, limits)));
+            let shape = EnvShape {
+                live,
+                gated: !env.public,
+                asleep: env.asleep_since.is_some(),
+                proxy: if !live {
+                    &[]
+                } else if env.asleep_since.is_some() {
+                    TENANT_PROXY_WAKE
+                } else {
+                    TENANT_PROXY
+                },
+            };
+            // A parked environment has no fleet of its own to proxy to; the
+            // runner answers on the same host.
+            let upstream = match env.listen_port {
+                Some(port) if live => format!("{}:{}", cfg.caddy_upstream_host, port),
+                _ => cfg.caddy_api_upstream.clone(),
+            };
+            // Behind a terminating proxy the same plaintext twin a tenant site
+            // gets: a tls-gated site answers :80 with empty 200s, so the twin
+            // carries the same handlers in clear (gate and `/__noite/auth`
+            // included — the browser is admitted on the http origin it was
+            // redirected to).
+            if on_demand && edge_tls && !addr.starts_with("http://") {
+                push_env_block(
+                    &mut lines,
+                    cfg,
+                    &plaintext_hosts(&addr),
+                    false,
+                    &extras,
+                    &shape,
+                    &upstream,
+                );
+            }
+            push_env_block(
+                &mut lines, cfg, &addr, on_demand, &extras, &shape, &upstream,
+            );
+        }
+        // Every label under an app that owns an environment resolves: one no
+        // environment owns (a deleted environment, a typo) answers the runner's
+        // page instead of Caddy's empty 404, exactly like the tenant wildcard.
+        for app in apps {
+            if !envs.iter().any(|env| env.app_id == app.id) {
+                continue;
+            }
+            push_site(
+                &mut lines,
+                cfg,
+                &addr_of(&format!("*.{}.{}", app.slug, base)),
+                on_demand,
+                &env_fallback,
+                &[],
+                &cfg.caddy_api_upstream,
+            );
+        }
+    }
+
     // API → runner (Bearer-protected REST)
     let api_guard = guard_lines(&[Zone::per_client(cfg, "client_api", edge.client_rpm)]);
     let api_guard: Vec<&str> = api_guard.iter().map(String::as_str).collect();
     push_site(
+        &mut lines,
+        cfg,
         &addr_of(&format!("api.{}", cfg.base_domain)),
         on_demand,
         &api_guard,
@@ -429,6 +569,8 @@ pub async fn rewrite_caddy(
     git_extra.push("rewrite * /v1/git{uri}".into());
     let git_extra: Vec<&str> = git_extra.iter().map(String::as_str).collect();
     push_site(
+        &mut lines,
+        cfg,
         &addr_of(&format!("git.{}", cfg.base_domain)),
         on_demand,
         &git_extra,
@@ -447,6 +589,8 @@ pub async fn rewrite_caddy(
     let fallback_extra: Vec<&str> = fallback_extra.iter().map(String::as_str).collect();
     for base in cfg.tenant_bases() {
         push_site(
+            &mut lines,
+            cfg,
             &addr_of(&format!("*.{base}")),
             on_demand,
             &fallback_extra,
@@ -568,10 +712,10 @@ fn push_preview_block(
     // answers this host — the pod's document, its module graph and Nodepod's
     // assets — so the site is a plain proxy. Matchers would have to enumerate
     // the dev server's own URL space (`/src/*`, the prebundled deps,
-    // `/@fs/*`, the app's `poder-dist/*` raw imports, Vite's client), and a
-    // preview that 404s one of those never boots. Production takes the
-    // matcher path below: there the deployment's assets are the whole answer,
-    // and every path but the pod's own is a 404 by design.
+    // `/@fs/*`, Vite's client), and a preview that 404s one of those never
+    // boots. Production takes the matcher path below: there the deployment's
+    // assets are the whole answer, and every path but the pod's own is a 404
+    // by design.
     if !crate::host::control::bundle_present(cfg) {
         lines.push(format!("\treverse_proxy {upstream} {{"));
         for line in proxy_extra {
@@ -629,6 +773,199 @@ fn push_preview_block(
     lines.push("}".into());
     lines.push(String::new());
 }
+
+/// Site-level header lines every environment site carries: the Code mode page
+/// is cross-origin-isolated (`COEP: require-corp`), so it can only frame a
+/// document that opted in — `Cross-Origin-Resource-Policy` for the embed, and
+/// a COEP of its own on the framed document. The COEP is `credentialless` and
+/// only on frame loads (`Sec-Fetch-Dest: iframe`): the app's cross-origin
+/// subresources still load (without credentials) inside the frame, and a
+/// top-level visit gets no COEP at all. `defer` *replaces* rather than
+/// appends — two `Cross-Origin-Resource-Policy` lines make a browser refuse
+/// the frame. Plus [`PREVIEW_DEST`].
+const FRAME_HEADERS: &[&str] = &[
+    "header {",
+    "\tdefer",
+    "\tCross-Origin-Resource-Policy same-site",
+    "}",
+    "@noite_framed header Sec-Fetch-Dest iframe",
+    "header @noite_framed {",
+    "\tdefer",
+    "\tCross-Origin-Embedder-Policy credentialless",
+    "}",
+    PREVIEW_DEST[0],
+    PREVIEW_DEST[1],
+    PREVIEW_DEST[2],
+    PREVIEW_DEST[3],
+    PREVIEW_DEST[4],
+];
+
+/// The Preview panel's frame reaches the app as a top-level page load. The
+/// browser marks a framed load `Sec-Fetch-Dest: iframe`, and a server that
+/// renders only `document` navigations (oxidejs 0.6's worker, for one)
+/// answers the frame with its own 404 while the same URL renders in a tab. A
+/// same-site frame — the control UI framing it — is rewritten to `document`
+/// on the way upstream; a cross-site embedder's request is left as sent.
+/// Only the request changes: the app's own framing headers (X-Frame-Options,
+/// CSP `frame-ancestors`) still decide whether the browser shows it. Caddy
+/// runs `header` before `request_header`, so `@noite_framed` above still
+/// sees `iframe`.
+const PREVIEW_DEST: [&str; 5] = [
+    "@noite_preview {",
+    "\theader Sec-Fetch-Dest iframe",
+    "\theader Sec-Fetch-Site same-site",
+    "}",
+    "request_header @noite_preview Sec-Fetch-Dest document",
+];
+
+/// [`FRAME_HEADERS`] for a production tenant site, frame loads only: the Code
+/// mode Preview panel frames production for the default branch, and its
+/// cross-origin-isolated page refuses a frame without both headers. Production
+/// keeps its own `Cross-Origin-Resource-Policy` everywhere else, so another
+/// site embedding the app's images or scripts behaves as before. Plus
+/// [`PREVIEW_DEST`].
+const PRODUCTION_FRAME_HEADERS: &[&str] = &[
+    "@noite_framed header Sec-Fetch-Dest iframe",
+    "header @noite_framed {",
+    "\tdefer",
+    "\tCross-Origin-Resource-Policy same-site",
+    "\tCross-Origin-Embedder-Policy credentialless",
+    "}",
+    PREVIEW_DEST[0],
+    PREVIEW_DEST[1],
+    PREVIEW_DEST[2],
+    PREVIEW_DEST[3],
+    PREVIEW_DEST[4],
+];
+
+/// What one environment's site must do, all of it from the environment row —
+/// never from the request.
+struct EnvShape<'a> {
+    /// Deployed and desired running: its own fleet serves it.
+    live: bool,
+    /// Members-only (the default): the access gate in front.
+    gated: bool,
+    /// Parked by scale-to-zero: the request wakes the fleet first.
+    asleep: bool,
+    /// `reverse_proxy` health/retry options for a live fleet.
+    proxy: &'a [&'a str],
+}
+
+/// One environment's site (`<label>.<slug>.<base>`).
+///
+/// A live site reuses the tenant shape — the same rate-limit zones, the trace
+/// header, the fleet-ready gate — plus [`FRAME_HEADERS`]. A members-only
+/// environment puts the access gate in front: `/__noite/auth` is served by the
+/// runner itself (the token the control UI hands back), and every other path
+/// goes through `forward_auth /v1/edge/env-gate`. Both branches are `handle`
+/// blocks, and Caddy runs at most one sibling `handle`, so a request never
+/// reaches both the gate and the app.
+///
+/// A parked environment (never deployed, or stopped) keeps its host — the
+/// certificate is per environment — and answers the runner's page instead of a
+/// dead upstream.
+fn push_env_block(
+    lines: &mut Vec<String>,
+    cfg: &Config,
+    addr: &str,
+    tls: bool,
+    site_extra: &[String],
+    shape: &EnvShape,
+    upstream: &str,
+) {
+    lines.push(format!("{addr} {{"));
+    lines.push("\tlog {".into());
+    lines.push(format!("\t\toutput file {}", cfg.caddy_access_log));
+    lines.push("\t\tformat json".into());
+    lines.push("\t}".into());
+    lines.push("\tencode zstd gzip".into());
+    if tls {
+        lines.push("\ttls {".into());
+        lines.push("\t\ton_demand".into());
+        lines.push("\t}".into());
+    }
+    for line in site_extra {
+        lines.push(format!("\t{line}"));
+    }
+    if !shape.live {
+        lines.push(format!("\treverse_proxy {upstream} {{"));
+        lines.push("\t\ttransport http {".into());
+        lines.push("\t\t\tdial_timeout 5s".into());
+        lines.push("\t\t\tresponse_header_timeout 30s".into());
+        lines.push("\t\t}".into());
+        lines.push("\t\tflush_interval -1".into());
+        lines.push("\t}".into());
+        lines.push("}".into());
+        lines.push(String::new());
+        return;
+    }
+    if shape.gated {
+        // The runner owns this path: it verifies the token the control UI
+        // redirects with, sets the gate cookie and 302s to the return path. It
+        // must never be proxied to the app, and it must never be gated.
+        lines.push(format!("\thandle {}* {{", crate::host::env_gate::AUTH_PATH));
+        lines.push("\t\trewrite * /v1/edge/env-auth".into());
+        lines.push(format!("\t\treverse_proxy {} {{", cfg.caddy_api_upstream));
+        lines.push("\t\t\ttransport http {".into());
+        lines.push("\t\t\t\tdial_timeout 5s".into());
+        lines.push("\t\t\t\tresponse_header_timeout 30s".into());
+        lines.push("\t\t\t}".into());
+        lines.push("\t\t}".into());
+        lines.push("\t}".into());
+    }
+    lines.push("\thandle {".into());
+    // `route` keeps the written order: the gate reads the cookie, the strip
+    // removes it, the fleet never sees it. A plain directive list would sort
+    // `map`/`request_header` *before* `forward_auth` and the gate would never
+    // find the cookie it just set.
+    lines.push("\t\troute {".into());
+    if shape.gated {
+        // Members-only: every request is admitted by the runner's gate (and a
+        // gate that admits an asleep environment wakes it, so a members-only
+        // site needs no second hop — and an unauthenticated visitor never
+        // spawns a fleet).
+        push_forward_auth(lines, cfg, "/v1/edge/env-gate", "\t\t\t");
+        for line in COOKIE_STRIP {
+            lines.push(format!("\t\t\t{line}"));
+        }
+    } else if shape.asleep {
+        push_forward_auth(lines, cfg, "/v1/edge/wake", "\t\t\t");
+    }
+    lines.push(format!("\t\t\treverse_proxy {upstream} {{"));
+    for line in shape.proxy {
+        lines.push(format!("\t\t\t\t{line}"));
+    }
+    lines.push("\t\t\t\ttransport http {".into());
+    lines.push("\t\t\t\t\tdial_timeout 5s".into());
+    lines.push("\t\t\t\t\tresponse_header_timeout 30s".into());
+    lines.push("\t\t\t\t}".into());
+    lines.push("\t\t\t\tflush_interval -1".into());
+    lines.push("\t\t\t}".into());
+    lines.push("\t\t}".into());
+    lines.push("\t}".into());
+    lines.push("}".into());
+    lines.push(String::new());
+}
+
+/// Removes the gate's own cookie from the request before it reaches the app
+/// (ROADMAP: "the gate strips its own cookie and path before the request
+/// reaches the app"). Caddy can only address the whole `Cookie` field, so this
+/// is a `map` over that header covering the three shapes the cookie can take —
+/// first, middle, last — with the input itself as the `default`, which leaves
+/// every other cookie (and an app with no cookies at all) exactly as it was.
+///
+/// These lines must run *after* `forward_auth` (the gate reads the cookie) and
+/// *before* the fleet, which is why they live in a `route` block: it is the one
+/// Caddyfile construct that keeps the order it is written in.
+const COOKIE_STRIP: &[&str] = &[
+    "map {http.request.header.Cookie} {noite_env_cookie} {",
+    "\t~^__noite_env=[^;]*;?\\s*(.*)$ ${1}",
+    "\t~^(.*)__noite_env=[^;]*;\\s*(.*)$ ${1}${2}",
+    "\t~^(.*);\\s*__noite_env=[^;]*$ ${1}",
+    "\tdefault {http.request.header.Cookie}",
+    "}",
+    "request_header Cookie {noite_env_cookie}",
+];
 
 /// Proxy options for a tenant fleet. celld answers its public
 /// `/.well-known/celld/health` 503 until its ready gate opens (memory
@@ -692,6 +1029,39 @@ fn tenant_proxy(app: &App) -> &'static [&'static str] {
     }
 }
 
+/// Site-level lines every fleet site shares: the W3C `traceparent` celld
+/// adopts as its span's trace id (the access log records the same `traceID`, so
+/// the error ingest joins an exception to its method, path and status —
+/// host/errors.rs), and the retry page a fleet that stays unready answers.
+fn fleet_site_extra() -> Vec<String> {
+    let mut lines: Vec<String> = TENANT_TRACE.iter().map(|l| (*l).to_string()).collect();
+    lines.extend(TENANT_STARTING.iter().map(|l| (*l).to_string()));
+    lines
+}
+
+/// `forward_auth` hop into the runner, indented for its site or handle block.
+///
+/// Caddy holds the original request (body included) while the hop runs and
+/// proxies it unchanged when the hop answers 200; any other status — the
+/// gate's 302, a failed wake's 503 — is copied back to the visitor. The header
+/// timeout sits above the runner's own wake budget, so Caddy never gives up
+/// first. The trace header above covers the wake case too: a held request
+/// carries no trace of its own until it is released.
+fn push_forward_auth(lines: &mut Vec<String>, cfg: &Config, uri: &str, indent: &str) {
+    lines.push(format!(
+        "{indent}forward_auth {} {{",
+        cfg.caddy_api_upstream
+    ));
+    lines.push(format!("{indent}\turi {uri}"));
+    lines.push(format!("{indent}\ttransport http {{"));
+    lines.push(format!(
+        "{indent}\t\tresponse_header_timeout {}s",
+        cfg.wake_timeout_s.max(1) + 15
+    ));
+    lines.push(format!("{indent}\t}}"));
+    lines.push(format!("{indent}}}"));
+}
+
 /// Site-level lines for a tenant or custom-domain site. An asleep app
 /// (SPEC, Scale to zero) keeps its route but gains a `forward_auth` hop:
 /// Caddy holds the original request (body included) while the runner's
@@ -704,18 +1074,9 @@ fn tenant_proxy(app: &App) -> &'static [&'static str] {
 /// the error ingest joins an exception to its method, path and status that
 /// way (host/errors.rs).
 fn tenant_site_extra(cfg: &Config, app: &App) -> Vec<String> {
-    let mut lines: Vec<String> = TENANT_TRACE.iter().map(|l| (*l).to_string()).collect();
-    lines.extend(TENANT_STARTING.iter().map(|l| (*l).to_string()));
+    let mut lines = fleet_site_extra();
     if app.is_asleep() {
-        lines.push(format!("forward_auth {} {{", cfg.caddy_api_upstream));
-        lines.push("\turi /v1/edge/wake".into());
-        lines.push("\ttransport http {".into());
-        lines.push(format!(
-            "\t\tresponse_header_timeout {}s",
-            cfg.wake_timeout_s.max(1) + 15
-        ));
-        lines.push("\t}".into());
-        lines.push("}".into());
+        push_forward_auth(&mut lines, cfg, "/v1/edge/wake", "\t");
     }
     lines
 }
@@ -813,6 +1174,9 @@ mod tests {
             fleet_log: "error,celld=warn".into(),
             max_apps_per_user: 10,
             fleet_max_rss_mb: 0,
+            max_environments_per_app: 5,
+            max_environments: 25,
+            environment_ttl_h: 168,
             fleet_idle_evict_s: 300,
             fleet_deploy_poll_s: 300,
             sleep_after_h: 24,
@@ -876,13 +1240,38 @@ mod tests {
     }
 
     async fn rendered_with(cfg: &Config, apps: &[App], domains: &[AppDomain]) -> String {
+        rendered_envs(cfg, apps, domains, &[]).await
+    }
+
+    async fn rendered_envs(
+        cfg: &Config,
+        apps: &[App],
+        domains: &[AppDomain],
+        envs: &[EnvironmentRoute],
+    ) -> String {
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
-        rewrite_caddy(cfg, apps, domains, &[])
+        rewrite_caddy(cfg, apps, domains, &[], envs)
             .await
             .expect("rewrite");
         tokio::fs::read_to_string(&cfg.caddyfile_path)
             .await
             .expect("read back")
+    }
+
+    /// One environment route, deployed and members-only unless a test says
+    /// otherwise (its own fleet on 127.0.0.1:8200).
+    fn test_env(app: &App, label: &str) -> EnvironmentRoute {
+        EnvironmentRoute {
+            id: format!("env-{label}"),
+            app_id: app.id.clone(),
+            app_slug: app.slug.clone(),
+            label: label.into(),
+            listen_port: Some(8200),
+            public: false,
+            desired_state: "running".into(),
+            asleep_since: None,
+            last_deployed_at: Some("2026-10-13T00:00:00Z".into()),
+        }
     }
 
     #[tokio::test]
@@ -1319,6 +1708,262 @@ mod tests {
         rest[..rest.find("\n}\n").expect("site end")].to_string()
     }
 
+    /// Production is framed by Code mode's Preview for the default branch: a
+    /// frame load opts in (CORP + COEP, replacing the app's own), while every
+    /// other request keeps whatever CORP the app sets.
+    #[tokio::test]
+    async fn production_site_opts_frame_loads_into_code_mode() {
+        let cfg = test_config("noite.now", "app", true, "/tmp/noite-test-prod-frame");
+        let out = rendered(&cfg, &[test_app()]).await;
+        let block = site_block(&out, "test.noite.now");
+        let framed = block
+            .find("header @noite_framed {")
+            .map(|at| &block[at..])
+            .and_then(|rest| rest.find("\n\t}").map(|end| &rest[..end]))
+            .unwrap_or_else(|| panic!("no framed header block:\n{block}"));
+        assert!(framed.contains("defer"), "{framed}");
+        assert!(
+            framed.contains("Cross-Origin-Resource-Policy same-site"),
+            "{framed}"
+        );
+        assert!(
+            framed.contains("Cross-Origin-Embedder-Policy credentialless"),
+            "{framed}"
+        );
+        assert!(
+            block.contains("@noite_framed header Sec-Fetch-Dest iframe"),
+            "{block}"
+        );
+        // A same-site frame (the control UI) reaches the app as a page load.
+        assert!(
+            block.contains("\theader Sec-Fetch-Site same-site")
+                && block.contains("request_header @noite_preview Sec-Fetch-Dest document"),
+            "{block}"
+        );
+        // Only the frame load: no site-wide CORP on production.
+        assert_eq!(
+            block.matches("Cross-Origin-Resource-Policy").count(),
+            1,
+            "{block}"
+        );
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
+    /// A public environment is exactly a tenant site plus the frameable
+    /// header: its own port, the app's rate-limit zones, the fleet-ready gate,
+    /// the trace header, on-demand TLS — and no gate at all.
+    #[tokio::test]
+    async fn public_environment_site_is_a_tenant_site_on_its_own_port() {
+        let mut cfg = test_config("noite.now", "app", true, "/tmp/noite-test-env-public");
+        // The shared per-app ceiling is off by default; turn it on so the site
+        // proves it draws from the app's own zones.
+        cfg.edge.app_rpm = 600;
+        let app = test_app();
+        let mut env = test_env(&app, "staging");
+        env.public = true;
+        let out = rendered_envs(&cfg, &[app], &[], &[env]).await;
+        let block = site_block(&out, "staging.test.noite.now");
+        assert!(
+            block.contains("reverse_proxy 127.0.0.1:8200"),
+            "environment must route to its own fleet port:\n{block}"
+        );
+        assert!(
+            block.contains("health_uri /.well-known/celld/health"),
+            "an environment fleet waits for its ready gate too:\n{block}"
+        );
+        assert!(block.contains("handle_errors 502 503"), "{block}");
+        assert!(block.contains("request_header traceparent"), "{block}");
+        // The app's own zones: an environment is the same app's traffic.
+        assert!(block.contains("zone client_test {"), "{block}");
+        assert!(block.contains("zone app_test {"), "{block}");
+        // Frameable by the cross-origin-isolated Code mode page, replacing any
+        // header the app set (a duplicate CORP breaks the frame).
+        assert!(
+            block.contains("\tCross-Origin-Resource-Policy same-site"),
+            "{block}"
+        );
+        assert!(block.contains("\tdefer"), "{block}");
+        // A framed load also carries a COEP of its own (a require-corp page
+        // refuses a frame without one); a top-level visit does not.
+        assert!(
+            block.contains("@noite_framed header Sec-Fetch-Dest iframe"),
+            "{block}"
+        );
+        assert!(
+            block.contains("\tCross-Origin-Embedder-Policy credentialless"),
+            "{block}"
+        );
+        assert!(block.contains("tls {"), "on-demand certificate:\n{block}");
+        // No gate, and no wake hop while it is awake.
+        assert!(!block.contains("env-gate"), "{block}");
+        assert!(!block.contains("/__noite/auth"), "{block}");
+        assert!(!block.contains("forward_auth"), "{block}");
+        // Nothing set a cookie here, so nothing strips one either.
+        assert!(!block.contains("{noite_env_cookie}"), "{block}");
+        // A label under an app that owns environments resolves to the runner's
+        // page rather than Caddy's empty 404.
+        assert!(
+            out.contains("\n*.test.noite.now {") && out.contains("rewrite * /v1/edge/fallback"),
+            "no label catch-all:\n{out}"
+        );
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
+    /// A members-only environment (the default) is gated: the runner owns
+    /// `/__noite/auth` on the environment's own host, and every other path
+    /// passes through `forward_auth /v1/edge/env-gate` before the fleet.
+    #[tokio::test]
+    async fn members_only_environment_site_is_gated() {
+        let cfg = test_config("noite.now", "app", true, "/tmp/noite-test-env-gated");
+        let app = test_app();
+        let out = rendered_envs(
+            &cfg,
+            std::slice::from_ref(&app),
+            &[],
+            &[test_env(&app, "feat-x")],
+        )
+        .await;
+        let block = site_block(&out, "feat-x.test.noite.now");
+        // The auth path is the runner's, never the app's.
+        assert!(block.contains("handle /__noite/auth* {"), "{block}");
+        assert!(block.contains("rewrite * /v1/edge/env-auth"), "{block}");
+        assert!(
+            block.contains("forward_auth 127.0.0.1:8080 {"),
+            "no gate hop:\n{block}"
+        );
+        assert!(block.contains("uri /v1/edge/env-gate"), "{block}");
+        // The gate owns the wake: one hop, and it holds the request while the
+        // gate answers, so the timeout must cover the runner's wake budget.
+        assert!(!block.contains("/v1/edge/wake"), "{block}");
+        assert!(block.contains("response_header_timeout 135s"), "{block}");
+        // The fleet is still the upstream of the catch-all branch.
+        assert!(block.contains("reverse_proxy 127.0.0.1:8200"), "{block}");
+        assert!(block.contains("zone client_test {"), "{block}");
+        assert!(
+            block.contains("Cross-Origin-Resource-Policy same-site"),
+            "{block}"
+        );
+        // The gate's own cookie is stripped before the app (ROADMAP): the
+        // strip has to run after `forward_auth` (which reads the cookie) and
+        // before the fleet, which is what the `route` block is for.
+        assert!(
+            block.contains("map {http.request.header.Cookie} {noite_env_cookie} {"),
+            "{block}"
+        );
+        assert!(
+            block.contains("request_header Cookie {noite_env_cookie}"),
+            "{block}"
+        );
+        let strip = block.find("request_header Cookie").expect("strip");
+        let gate = block.find("uri /v1/edge/env-gate").expect("gate");
+        let fleet = block.find("reverse_proxy 127.0.0.1:8200").expect("fleet");
+        assert!(
+            gate < strip && strip < fleet,
+            "gate → strip → fleet:\n{block}"
+        );
+        assert!(
+            block.contains("handle {\n\t\troute {"),
+            "the ordered block is a route:\n{block}"
+        );
+
+        // Behind a terminating proxy the same plaintext twin a tenant site
+        // gets, gate and hand-back included (the visitor was admitted on that
+        // origin, so the cookie must be set there).
+        let proxied = test_config("noite.now", "app", false, "/tmp/noite-test-env-gated-proxy");
+        let out = rendered_envs(&proxied, &[app], &[], &[test_env(&test_app(), "feat-x")]).await;
+        assert!(out.contains("\nfeat-x.test.noite.now {"), "{out}");
+        let twin = site_block(&out, "http://feat-x.test.noite.now");
+        assert!(twin.contains("handle /__noite/auth* {"), "{twin}");
+        assert!(twin.contains("uri /v1/edge/env-gate"), "{twin}");
+        assert!(twin.contains("reverse_proxy 127.0.0.1:8200"), "{twin}");
+        assert!(!twin.contains("\ttls {"), "the twin is plaintext:\n{twin}");
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
+    #[tokio::test]
+    async fn asleep_environments_wake_on_request() {
+        let cfg = test_config("noite.now", "app", true, "/tmp/noite-test-env-asleep");
+        let app = test_app();
+        // Public and asleep: the tenant wake hop, inside the catch-all handle.
+        let mut public = test_env(&app, "staging");
+        public.public = true;
+        public.asleep_since = Some("2026-10-13T00:00:00Z".into());
+        let out = rendered_envs(&cfg, std::slice::from_ref(&app), &[], &[public]).await;
+        let block = site_block(&out, "staging.test.noite.now");
+        assert!(block.contains("uri /v1/edge/wake"), "{block}");
+        assert!(
+            !block.contains("health_uri"),
+            "a woken route must skip the stale health check:\n{block}"
+        );
+        assert!(block.contains("reverse_proxy 127.0.0.1:8200"), "{block}");
+        // Members-only and asleep: the gate woke it, so no second hop.
+        let mut gated = test_env(&app, "feat-x");
+        gated.asleep_since = Some("2026-10-13T00:00:00Z".into());
+        let out = rendered_envs(&cfg, &[app], &[], &[gated]).await;
+        let block = site_block(&out, "feat-x.test.noite.now");
+        assert!(block.contains("uri /v1/edge/env-gate"), "{block}");
+        assert!(!block.contains("/v1/edge/wake"), "{block}");
+        assert!(!block.contains("health_uri"), "{block}");
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
+    /// A never-deployed or stopped environment keeps its host (the certificate
+    /// is per environment) and answers the runner's page.
+    #[tokio::test]
+    async fn parked_environments_answer_the_fallback_page() {
+        let cfg = test_config("noite.now", "app", true, "/tmp/noite-test-env-parked");
+        let app = test_app();
+        let mut fresh = test_env(&app, "wip");
+        fresh.last_deployed_at = None;
+        let mut stopped = test_env(&app, "paused");
+        stopped.desired_state = "stopped".into();
+        let out = rendered_envs(&cfg, &[app], &[], &[fresh, stopped]).await;
+        for addr in ["wip.test.noite.now", "paused.test.noite.now"] {
+            let block = site_block(&out, addr);
+            assert!(
+                block.contains("rewrite * /v1/edge/fallback"),
+                "{addr} must answer the runner's page:\n{block}"
+            );
+            assert!(
+                block.contains("reverse_proxy 127.0.0.1:8080"),
+                "{addr} must go to the runner:\n{block}"
+            );
+            assert!(!block.contains("health_uri"), "{addr}:\n{block}");
+            assert!(!block.contains("env-gate"), "{addr}:\n{block}");
+            assert!(!block.contains("8200"), "{addr} proxies no fleet:\n{block}");
+            assert!(
+                block.contains("tls {"),
+                "{addr} keeps its certificate:\n{block}"
+            );
+            assert!(
+                block.contains("Cross-Origin-Resource-Policy same-site"),
+                "{addr}:\n{block}"
+            );
+            assert!(block.contains("zone client_test {"), "{addr}:\n{block}");
+        }
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
+    #[tokio::test]
+    async fn environments_without_an_app_or_without_envs_emit_nothing() {
+        let cfg = test_config("noite.now", "app", true, "/tmp/noite-test-env-none");
+        let app = test_app();
+        // No environments: no label catch-all, no environment site.
+        let out = rendered(&cfg, std::slice::from_ref(&app)).await;
+        assert!(!out.contains("env-gate"), "{out}");
+        assert!(!out.contains("staging.test"), "{out}");
+        // An environment whose app row is gone is skipped, not emitted with a
+        // guessed host.
+        let env = test_env(&app, "orphan");
+        let out = rendered_envs(&cfg, &[], &[], &[env]).await;
+        assert!(!out.contains("orphan.test"), "{out}");
+        assert!(
+            !out.contains("*.test.noite.now"),
+            "no app, no label catch-all:\n{out}"
+        );
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
     #[tokio::test]
     async fn every_public_site_is_rate_limited() {
         let cfg = test_config("noite.now", "app", true, "/tmp/noite-test-limits");
@@ -1374,7 +2019,7 @@ mod tests {
             app_rpm: Some(60),
         }];
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
-        rewrite_caddy(&cfg, &[app, other], &[], &limits)
+        rewrite_caddy(&cfg, &[app, other], &[], &limits, &[])
             .await
             .expect("rewrite");
         let out = tokio::fs::read_to_string(&cfg.caddyfile_path)

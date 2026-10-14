@@ -4,22 +4,22 @@
 //! the URL the frame was opened with (below), and the messages that arrive on
 //! its window (`handshakeMessage`). Everything this module returns has been
 //! checked field by field, because a window on this origin is not private —
-//! the app's own preview document shares it.
+//! the pod's own servers share it.
 //!
 //! The control page builds the frame's URL (`?parentOrigin=&appId=&branch=&
 //! nonce=`), and this is the frame's only source for all four: the page's
 //! origin it will answer, the ref whose pod it serves, and the nonce that is
-//! the handshake's capability. Nothing else about the frame is a secret — the
-//! app's own preview document shares this origin and can reach this window —
-//! so the URL's fields are the frame's whole identity, and a URL that does not
+//! the handshake's capability. Nothing else about the frame is a secret — a
+//! document on this origin can reach this window — so the URL's fields are the
+//! frame's whole identity, and a URL that does not
 //! name all four is a document nobody opened on purpose: it serves nothing at
 //! all rather than guessing.
 //!
 //! The page's origin is checked to be an *origin*, and to be an origin other
-//! than this document's own. The control UI never shares the app's preview
-//! host, and a document that framed itself would be answering a parent that is
-//! this same origin — the shape a preview document would use to open a pod
-//! frame of its own and speak to it as if it were the control.
+//! than this document's own. The control UI never shares the app's pod host,
+//! and a document that framed itself would be answering a parent that is
+//! this same origin — the shape a document on this origin would use to open a
+//! pod frame of its own and speak to it as if it were the control.
 
 import type { PodConnect, PodHello } from "../lib/source/pod-protocol";
 

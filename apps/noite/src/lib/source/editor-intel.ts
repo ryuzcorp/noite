@@ -14,7 +14,7 @@ import type {
   Position,
 } from "@pierre/diffs/edit";
 
-import { sourceBundle, sourceTypes } from "../server/source.server";
+import { sourceBundle } from "../server/source.server";
 import { curatedLang } from "../shiki-langs";
 import { HOVER_DELAY, createHoverTip } from "./hover-tip";
 import { SourceIntel } from "./intel";
@@ -29,10 +29,10 @@ import {
   supportsPrediction,
 } from "./intel-protocol";
 import type {
+  IntelBundle,
   IntelDiagnostic,
   IntelFile,
   IntelPosition,
-  IntelSources,
 } from "./intel-protocol";
 import type { DiffsModule, MarkerTarget } from "./pierre";
 import type { WorkspaceChange } from "./workspace/types";
@@ -64,7 +64,9 @@ export interface EditorIntelHost {
   currentEditable: () => boolean;
   currentPath: () => string | null;
   diffs: DiffsModule;
-  gitRef: string;
+  /** The ref the worker's sources are fetched for: read, never captured, so a
+   * branch switch re-reads them for the ref the pane now browses. */
+  gitRef: () => string;
   /** Live text per open path: the pane's own map, kept current by every edit. */
   liveText: Map<string, string>;
 }
@@ -124,7 +126,11 @@ export interface EditorIntel {
 
 export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
   const { diffs, liveText } = host;
-  const intel = new SourceIntel();
+  // The declarations the worker fetches from esm.sh land after the first reply
+  // the pane painted: re-check the open file then, so what it showed before
+  // them stops reading as a missing module.
+  // oxlint-disable-next-line eslint/no-use-before-define -- `scheduleDiagnostics` is defined below, after the layers that call it; the worker's event cannot arrive before this returns.
+  const intel = new SourceIntel(() => scheduleDiagnostics());
   // The tip hangs in the pane, beside the body the pane paints its files,
   // placeholders and notes into: a paint that wipes the body must not take the
   // tip with it (see `pane.ts`).
@@ -153,16 +159,24 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
   let sessionReady = false;
   const pendingIntel: PendingIntel = {};
 
-  /** The worker's FS: the repo's sources at the browsing ref plus the
-   * declarations captured from the last successful build. Fetched once per
-   * mount (twice if a push lands) — a multi-megabyte transfer, so it waits
-   * for the first TS/JS file the user actually opens. */
-  const loadSources = async (): Promise<IntelSources> => {
-    const [bundle, types] = await Promise.all([
-      sourceBundle({ appId: host.appId, ref: host.gitRef }),
-      sourceTypes({ appId: host.appId }),
-    ]);
-    return { bundle, types };
+  /** The server payload — the ref's own text sources — for the revision this
+   * layer is on. One multi-megabyte transfer, so it is fetched once and shared
+   * by every sync. A push drops it (the repo moved under the worker), and so
+   * does a failed fetch, so opening a file retries. */
+  let serverBundle: Promise<IntelBundle> | undefined;
+  const fetchServerBundle = async (): Promise<IntelBundle> => {
+    const fetched = serverBundle;
+    if (fetched !== undefined) {
+      return await fetched;
+    }
+    const loading = sourceBundle({ appId: host.appId, ref: host.gitRef() });
+    serverBundle = loading;
+    try {
+      return await loading;
+    } catch (error) {
+      serverBundle = undefined;
+      throw error;
+    }
   };
 
   /** The changed files the worker compiles instead of the commit's copy: a
@@ -177,10 +191,11 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
 
   /** Start (or join) the language-service worker, with the changed text files
    * as the copy of the program the commit does not have. Memoized inside
-   * `SourceIntel`. */
+   * `SourceIntel`; the package declarations the worker fetches from esm.sh
+   * arrive later, as a `typesChanged` event. */
   const ensureIntel = (): Promise<void> => {
     intelStarted = true;
-    return intel.sync(loadSources, workerDrafts());
+    return intel.sync(fetchServerBundle, workerDrafts());
   };
 
   /** Inline prediction: the completion TypeScript ranks first, inserted as
@@ -476,7 +491,11 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
   };
 
   const reset = () => {
-    void intel.reset(loadSources, workerDrafts());
+    // The repo moved: the ref's sources (and with them the lockfile the
+    // declarations were pinned to) are whatever the push left, so the memo goes
+    // with the worker.
+    serverBundle = undefined;
+    void intel.reset(fetchServerBundle, workerDrafts());
   };
 
   const dispose = () => {

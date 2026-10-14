@@ -3,7 +3,7 @@
 
 use crate::api_error::ApiError;
 use crate::db;
-use crate::host::{logs, metrics};
+use crate::host::{logs, metrics, supervisor};
 use crate::AppState;
 
 /// One observability target: the app id the metric tables key on and the slug
@@ -121,9 +121,60 @@ pub async fn metrics_version(state: &AppState, id: &str) -> Result<serde_json::V
     }
 }
 
-pub async fn logs_lines(state: &AppState, id: &str) -> Result<Vec<String>, ApiError> {
-    let (app_id, slug) = telemetry_target_or_404(&state.pool, id).await?;
-    Ok(merged_lines(state, &app_id, &slug).await)
+/// One resolved live-log source. Production merges the ingested OTel view
+/// with the fleet's in-memory ring; an environment serves its own fleet ring
+/// only — its celld writes telemetry to `envs/<slug>/<label>/telemetry/`, which
+/// the ingest does not read yet (ROADMAP Phase 3), so there is nothing to
+/// merge and nothing to leak from production.
+pub enum LogSource {
+    Production { app_id: String, slug: String },
+    Environment { key: String },
+}
+
+impl LogSource {
+    pub async fn lines(&self, state: &AppState) -> Vec<String> {
+        match self {
+            Self::Production { app_id, slug } => merged_lines(state, app_id, slug).await,
+            Self::Environment { key } => logs::tail(&state.logs, key, 500).await,
+        }
+    }
+}
+
+/// Resolve the live-log source for one app (or the control fleet) and, when
+/// given, one of its environments. An environment that is not this app's is a
+/// 404: environment rings are keyed `slug.label` and must never answer for
+/// another app.
+pub async fn log_source(
+    state: &AppState,
+    id: &str,
+    environment_id: Option<&str>,
+) -> Result<LogSource, ApiError> {
+    let Some(env_id) = environment_id.filter(|raw| !raw.is_empty()) else {
+        let (app_id, slug) = telemetry_target_or_404(&state.pool, id).await?;
+        return Ok(LogSource::Production { app_id, slug });
+    };
+    let app = db::get_app(&state.pool, id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found("app not found"))?;
+    let env = db::get_environment(&state.pool, env_id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    match env {
+        Some(env) if env.app_id == app.id => Ok(LogSource::Environment {
+            key: supervisor::env_fleet_key(&app.slug, &env.label),
+        }),
+        _ => Err(ApiError::not_found("environment not found")),
+    }
+}
+
+pub async fn logs_lines(
+    state: &AppState,
+    id: &str,
+    environment_id: Option<&str>,
+) -> Result<Vec<String>, ApiError> {
+    let source = log_source(state, id, environment_id).await?;
+    Ok(source.lines(state).await)
 }
 
 fn json_rows<T: serde::Serialize>(

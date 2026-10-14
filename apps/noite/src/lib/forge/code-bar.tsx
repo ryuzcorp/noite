@@ -6,6 +6,8 @@ import type { View } from "ilha";
 
 import { appDetail } from "../resources";
 import { ArrowLeft, FileDiff, HistoryIcon, Monitor } from "../ui/icons";
+import { sourceQuery } from "./format";
+import type { SourceFrom } from "./format";
 
 export const CODE_PANELS = [
   { icon: HistoryIcon, id: "history", label: "History" },
@@ -20,28 +22,57 @@ export type CodePanel = (typeof CODE_PANELS)[number]["id"] | "";
 export const toCodePanel = (raw: string): CodePanel =>
   CODE_PANELS.find((panel) => panel.id === raw)?.id ?? "";
 
-/** The changed-file count beside Changes. `count` reads an atom, and calling
- * it here subscribes only this badge: a keystroke repaints the number, never
- * the bar or the page. */
+/** The changed-file count on the Changes toggle. `count` reads an atom, and
+ * calling it here subscribes only this badge: a keystroke repaints the number,
+ * never the bar or the page. It sits on the button's corner, out of the flow,
+ * so the button keeps the size of its siblings whatever the count. */
 const ChangeBadge = ({ count }: { count: () => number }) => {
   const changed = count();
-  return changed > 0 ? (
-    <span class="badge badge-sm ml-1.5 tabular-nums">{changed}</span>
-  ) : null;
+  if (changed === 0) {
+    return null;
+  }
+  return (
+    <span class="badge badge-xs badge-primary pointer-events-none absolute -top-1.5 -right-1.5 min-w-4 px-1 tabular-nums">
+      <span class="sr-only">, </span>
+      {changed}
+      <span class="sr-only"> changed</span>
+    </span>
+  );
+};
+
+/** `/source?panel=` link that also keeps the browsed ref and open file. */
+const sourcePanelHref = (
+  appId: string,
+  panel: string,
+  { file, ref }: SourceFrom
+): string => {
+  const params = new URLSearchParams({ panel });
+  if (ref !== "") {
+    params.set("ref", ref);
+  }
+  if (file !== "") {
+    params.set("file", file);
+  }
+  return `/apps/${appId}/source?${params}`;
 };
 
 /** The panel toggles. The source page opens and closes its panel in place
  * (`onToggle`) and passes `changeCount`; the pages below it link to
- * `/source?panel=` and have no Changes. */
+ * `/source?panel=` and have no Changes, carrying the browsed ref and open file
+ * so History opens on what the user left. */
 export const PanelToggles = ({
   active,
   appId,
   changeCount,
+  file = "",
+  gitRef = "",
   onToggle,
 }: {
   active: CodePanel;
   appId: string;
   changeCount?: () => number;
+  file?: string;
+  gitRef?: string;
   onToggle?: (panel: CodePanel) => void;
 }) => (
   <nav class="flex items-center gap-1" aria-label="Code panels">
@@ -50,7 +81,7 @@ export const PanelToggles = ({
         return null;
       }
       const open = active === entry.id;
-      const cls = `btn btn-sm ${open ? "btn-neutral" : "btn-ghost"}`;
+      const cls = `btn btn-sm relative ${open ? "btn-neutral" : "btn-ghost"}`;
       const label = (
         <>
           <entry.icon />
@@ -76,7 +107,7 @@ export const PanelToggles = ({
         <a
           key={entry.id}
           class={cls}
-          href={`/apps/${appId}/source?panel=${entry.id}`}
+          href={sourcePanelHref(appId, entry.id, { file, ref: gitRef })}
         >
           {label}
         </a>
@@ -86,11 +117,11 @@ export const PanelToggles = ({
 );
 
 /** The pages below the source page link back to it, labelled with the app's
- * name; the source page itself has no back link (the sidebar lists the
- * apps). */
-const CodeBackLink = ({ appId }: { appId: string }) => (
+ * name, returning to the ref and file the user came from; the source page
+ * itself has no back link (the sidebar lists the apps). */
+const CodeBackLink = ({ appId, from }: { appId: string; from: SourceFrom }) => (
   <a
-    href={`/apps/${appId}/source`}
+    href={`/apps/${appId}/source${sourceQuery(from)}`}
     class="link link-hover inline-flex w-fit shrink-0 items-center gap-1 text-sm opacity-70"
   >
     <ArrowLeft class="h-4 w-4" />
@@ -101,18 +132,32 @@ const CodeBackLink = ({ appId }: { appId: string }) => (
 /** Layout for a page below the source page: the Code bar, then the page. */
 export const CodePage = ({
   appId,
+  backFile = "",
+  backRef = "",
   children,
 }: {
   appId: string;
+  /** The ref and open file the sub-page was opened from, so the back link and
+   * the panel links return to them. */
+  backFile?: string;
+  backRef?: string;
   children: View;
-}) => (
-  <div class="flex min-h-screen w-full flex-col">
-    <div class="border-base-300 flex items-center justify-between gap-2 border-b px-4 py-2">
-      <CodeBackLink appId={appId} />
-      <PanelToggles active="" appId={appId} />
+}) => {
+  const from = { file: backFile, ref: backRef };
+  return (
+    <div class="flex min-h-screen w-full flex-col">
+      <div class="border-base-300 flex items-center justify-between gap-2 border-b px-4 py-2">
+        <CodeBackLink appId={appId} from={from} />
+        <PanelToggles
+          active=""
+          appId={appId}
+          file={backFile}
+          gitRef={backRef}
+        />
+      </div>
+      <div class="mx-auto flex w-full max-w-6xl flex-col gap-4 px-4 pt-4 pb-12">
+        {children}
+      </div>
     </div>
-    <div class="mx-auto flex w-full max-w-6xl flex-col gap-4 px-4 pt-4 pb-12">
-      {children}
-    </div>
-  </div>
-);
+  );
+};

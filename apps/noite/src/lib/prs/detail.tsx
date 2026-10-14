@@ -1,40 +1,143 @@
-import { appDetail } from "../resources";
-/** Pull-request detail: header, Conversation/Files tabs and the merge box. */
+/** Pull-request detail: header (title, state and the Close/Merge actions),
+ * the review box, and the Conversation/Files tabs. */
+import { environmentUrl } from "../apps/identity";
+import { formatDateTime } from "../dates";
+import { shortSha } from "../forge/format";
+import { CommitList } from "../forge/parts";
+import { appDetail, environments } from "../resources";
+import type { PrDetail } from "../runner";
 import { searchParam } from "../search-param";
 import type { SearchParam } from "../search-param";
 import { LoadError } from "../ui/load-error";
 import { SectionSkeleton } from "../ui/skeletons";
 import { PrConversationTab } from "./conversation";
+import { latestReviews } from "./data";
 import { PrFilesTab } from "./files";
-import { PrMergeBox } from "./merge-box";
+import { PrHeaderActions, PrMergeState, PrReviewBox } from "./merge-box";
 import { prDetail, prNames, prViewer } from "./resources";
 import { nameFor, PrStateBadge } from "./widgets";
 
-const VIEWS = ["conversation", "files"] as const;
+const VIEWS = ["conversation", "commits", "files"] as const;
 
 type DetailView = (typeof VIEWS)[number];
 
 const toView = (raw: string): DetailView =>
   VIEWS.find((view) => view === raw) ?? "conversation";
 
-const ViewTabs = ({ view }: { view: SearchParam<DetailView> }) => (
-  <div role="tablist" class="tabs tabs-border">
-    {VIEWS.map((entry) => (
-      <button
-        key={entry}
-        type="button"
-        role="tab"
-        aria-selected={view() === entry ? "true" : "false"}
-        class={`tab capitalize ${view() === entry ? "tab-active" : ""}`}
-        onclick={() => {
-          view.set(entry);
-        }}
-      >
-        {entry}
-      </button>
-    ))}
-  </div>
-);
+const VIEW_LABELS: Record<DetailView, string> = {
+  commits: "Commits",
+  conversation: "Conversation",
+  files: "Files",
+};
+
+/** The tab row: roving tabindex, Left/Right/Home/End move and select, and the
+ * panel is wired back with `aria-controls`/`aria-labelledby`. */
+const ViewTabs = ({ view }: { view: SearchParam<DetailView> }) => {
+  const onKeyDown = (event: KeyboardEvent): void => {
+    const index = VIEWS.indexOf(view());
+    let next = -1;
+    if (event.key === "ArrowRight") {
+      next = (index + 1) % VIEWS.length;
+    } else if (event.key === "ArrowLeft") {
+      next = (index - 1 + VIEWS.length) % VIEWS.length;
+    } else if (event.key === "Home") {
+      next = 0;
+    } else if (event.key === "End") {
+      next = VIEWS.length - 1;
+    }
+    if (next === -1) {
+      return;
+    }
+    event.preventDefault();
+    const target = VIEWS[next];
+    view.set(target);
+    document.querySelector<HTMLElement>(`#pr-tab-${target}`)?.focus();
+  };
+  return (
+    <div role="tablist" class="tabs tabs-border" onkeydown={onKeyDown}>
+      {VIEWS.map((entry) => (
+        <button
+          key={entry}
+          type="button"
+          role="tab"
+          id={`pr-tab-${entry}`}
+          aria-controls={`pr-panel-${entry}`}
+          aria-selected={view() === entry ? "true" : "false"}
+          tabindex={view() === entry ? 0 : -1}
+          class={`tab ${view() === entry ? "tab-active" : ""}`}
+          onclick={() => {
+            view.set(entry);
+          }}
+        >
+          {VIEW_LABELS[entry]}
+        </button>
+      ))}
+    </div>
+  );
+};
+
+/** The commits only on the head branch (oldest first, like the compare page),
+ * each linking to its commit page. */
+const PrCommitsTab = ({
+  appId,
+  detail,
+}: {
+  appId: string;
+  detail: PrDetail;
+}) => {
+  const { compare } = detail;
+  if (compare === null) {
+    return (
+      <p class="m-0 text-sm opacity-70">
+        The head branch is gone — the commits cannot be listed.
+      </p>
+    );
+  }
+  return (
+    <CommitList
+      appId={appId}
+      commits={compare.commits}
+      emptyLabel={`No commits between ${compare.base} and ${compare.head}.`}
+      gitRef={compare.head}
+    />
+  );
+};
+
+/** The head branch's own environment, when it has one (a preview environment
+ * is per branch; `main` never has one). */
+const PrEnvironment = ({ appId, head }: { appId: string; head: string }) => {
+  const environment = (environments(appId).data() ?? []).find(
+    (row) => row.gitRef === `refs/heads/${head}`
+  );
+  if (!environment) {
+    return null;
+  }
+  const subdomain = appDetail(appId).data()?.app.subdomain ?? "";
+  return (
+    <div class="border-base-300 bg-base-100 dark:bg-base-200 flex flex-wrap items-center gap-2 rounded-lg border p-3 text-sm">
+      <span class="opacity-70">Environment</span>
+      <span class="font-mono text-xs">{environment.label}</span>
+      <span class="badge badge-sm">{environment.status}</span>
+      <span class="text-base-content/70 text-xs">
+        {environment.lastDeploySha
+          ? `${shortSha(environment.lastDeploySha)} · ${formatDateTime(
+              environment.lastDeployedAt ?? environment.updatedAt
+            )}`
+          : "no deploy yet"}
+      </span>
+      {subdomain === "" ? null : (
+        <a
+          class="link link-hover ml-auto font-mono text-xs"
+          href={environmentUrl(subdomain, environment.label)}
+          target="_blank"
+          rel="noopener"
+        >
+          Open environment
+        </a>
+      )}
+    </div>
+  );
+};
 
 export const PrDetailView = ({
   appId,
@@ -68,36 +171,90 @@ export const PrDetailView = ({
   if (detail === undefined) {
     return (
       <div class="flex flex-col gap-4">
-        <LoadError error={error} label="Failed to load pull" />
+        <LoadError error={error} label="Failed to load pull request" />
         {error ? null : <SectionSkeleton lines={5} />}
       </div>
     );
   }
 
   const { pullRequest } = detail;
+  const requesting = latestReviews(detail.reviews).filter(
+    (review) =>
+      review.state === "changes_requested" && review.dismissedAt === null
+  );
+  const compareHref = `/apps/${appId}/source/compare?base=${encodeURIComponent(
+    pullRequest.base
+  )}&head=${encodeURIComponent(pullRequest.head)}`;
   return (
     <div class="flex flex-col gap-4">
       <header class="flex flex-col gap-2">
-        <h1 class="m-0 text-xl font-semibold break-words">
-          {pullRequest.title}{" "}
-          <span class="text-base-content/70 font-mono text-base">
-            #{pullRequest.number}
-          </span>
-        </h1>
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <h1 class="m-0 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xl font-semibold break-words">
+            <span class="min-w-0">{pullRequest.title}</span>
+            <span class="text-base-content/70 font-mono text-base">
+              #{pullRequest.number}
+            </span>
+            <PrStateBadge state={pullRequest.state} />
+          </h1>
+          <PrHeaderActions
+            appId={appId}
+            detail={detail}
+            role={role}
+            viewerId={viewer?.id ?? ""}
+          />
+        </div>
         <div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
-          <PrStateBadge state={pullRequest.state} />
+          {pullRequest.state === "open" ? (
+            <PrMergeState detail={detail} />
+          ) : null}
           <span class="text-base-content/70">
             {nameFor(names, pullRequest.authorId)} wants to merge
           </span>
           <span class="font-mono text-xs">
-            {pullRequest.head} into {pullRequest.base}
+            <a
+              class="link link-hover"
+              href={`/apps/${appId}/source?ref=${encodeURIComponent(pullRequest.head)}`}
+            >
+              {pullRequest.head}
+            </a>{" "}
+            into{" "}
+            <a
+              class="link link-hover"
+              href={`/apps/${appId}/source?ref=${encodeURIComponent(pullRequest.base)}`}
+            >
+              {pullRequest.base}
+            </a>
           </span>
+          <a class="link link-hover text-xs" href={compareHref}>
+            Compare
+          </a>
         </div>
+        {requesting.length > 0 ? (
+          <p class="text-warning m-0 text-sm" role="status">
+            {requesting
+              .map((review) => nameFor(names, review.reviewerId))
+              .join(", ")}{" "}
+            requested changes.
+          </p>
+        ) : null}
+        <PrEnvironment appId={appId} head={pullRequest.head} />
       </header>
 
-      <div class="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_20rem]">
-        <div class="flex min-w-0 flex-col gap-4">
-          <ViewTabs view={view} />
+      <PrReviewBox
+        appId={appId}
+        detail={detail}
+        role={role}
+        viewerId={viewer?.id ?? ""}
+      />
+      <div class="flex min-w-0 flex-col gap-4">
+        <ViewTabs view={view} />
+        <div
+          id={`pr-panel-${view()}`}
+          role="tabpanel"
+          aria-labelledby={`pr-tab-${view()}`}
+          tabindex={0}
+          class="flex min-w-0 flex-col gap-4"
+        >
           {view() === "conversation" ? (
             <PrConversationTab
               appId={appId}
@@ -106,7 +263,11 @@ export const PrDetailView = ({
               role={role}
               viewerId={viewer?.id ?? ""}
             />
-          ) : (
+          ) : null}
+          {view() === "commits" ? (
+            <PrCommitsTab appId={appId} detail={detail} />
+          ) : null}
+          {view() === "files" ? (
             <PrFilesTab
               appId={appId}
               detail={detail}
@@ -114,16 +275,8 @@ export const PrDetailView = ({
               role={role}
               viewerId={viewer?.id ?? ""}
             />
-          )}
+          ) : null}
         </div>
-        <aside class="min-w-0">
-          <PrMergeBox
-            appId={appId}
-            detail={detail}
-            role={role}
-            viewerId={viewer?.id ?? ""}
-          />
-        </aside>
       </div>
     </div>
   );

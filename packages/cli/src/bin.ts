@@ -5,6 +5,7 @@ import { Command } from "effect/cli";
 
 import pkg from "../package.json";
 import { deploy } from "./deploy.js";
+import { environments } from "./environments.js";
 
 // Bundled from package.json at build time (bun inlines the JSON import), so
 // the advertised version can never drift from the published package.
@@ -14,7 +15,7 @@ const root = Command.make("noite").pipe(
   Command.withDescription(
     "Noite CLI: deploy prebuilt dist to your own hardware"
   ),
-  Command.withSubcommands([deploy])
+  Command.withSubcommands([deploy, environments])
 );
 
 BunRuntime.runMain(

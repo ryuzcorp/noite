@@ -443,12 +443,15 @@ describe("the frame's events", () => {
 
   test("another tab's structural change reaches the tree", async () => {
     const { checkpoint, frame } = await open();
-    const last = Promise.withResolvers<boolean>();
-    checkpoint.workspace.onPeerChange((structural) => {
-      last.resolve(structural);
+    const last = Promise.withResolvers<{
+      paths: readonly string[];
+      structural: boolean;
+    }>();
+    checkpoint.workspace.onPeerChange((structural, paths) => {
+      last.resolve({ paths, structural });
     });
-    frame.emit("peer", { structural: true });
-    expect(await last.promise).toBe(true);
+    frame.emit("peer", { paths: ["a.txt"], structural: true });
+    expect(await last.promise).toEqual({ paths: ["a.txt"], structural: true });
   });
 
   test("a save the frame could not write is reported to the page", async () => {

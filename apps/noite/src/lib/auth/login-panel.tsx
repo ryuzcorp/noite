@@ -2,7 +2,9 @@ import { navigate } from "@ilha/router";
 import { atom, watch } from "ilha";
 
 import { authClient } from "../auth-client";
+import { sameOriginPath } from "../env-auth";
 import { signupPolicy } from "../resources";
+import { searchParam } from "../search-param";
 import { sleep } from "../sleep";
 import { fetchSession, invalidateSession } from "./session";
 
@@ -56,13 +58,19 @@ export const LoginPanel = () => {
   const otpEmail = atom("");
   const policy = signupPolicy();
   const invite = () => policy.data();
+  // Where a gated flow (the environment gate) asked to come back to. Always a
+  // rooted path on this origin; anything else falls back to the flow's own
+  // landing page.
+  const returnTo = searchParam("return", { default: "" });
+  const landing = (fallback: string): string =>
+    sameOriginPath(returnTo()) ?? fallback;
   const mode = (): "register" | "signin" =>
     picked() ?? (invite()?.firstRun ? "register" : "signin");
 
   watch.once(async () => {
     const { data } = await fetchSession();
     if (data?.user) {
-      navigate("/apps");
+      navigate(landing("/apps"));
     }
   });
 
@@ -99,7 +107,7 @@ export const LoginPanel = () => {
     if (result.data?.user) {
       // Cookie may not be readable for the very next document request yet.
       await waitForSession();
-      navigate("/apps");
+      navigate(landing("/apps"));
       return;
     }
     error.set("Registration completed without a session");
@@ -115,7 +123,7 @@ export const LoginPanel = () => {
       return;
     }
     await waitForSession();
-    navigate("/apps");
+    navigate(landing("/apps"));
   };
 
   const sendOtp = async (event: SubmitEvent) => {
@@ -169,7 +177,7 @@ export const LoginPanel = () => {
     await waitForSession();
     // A recovery sign-in exists because the passkey is gone: land on the
     // account page, where a new one can be added straight away.
-    navigate("/account");
+    navigate(landing("/account"));
   };
 
   const showRecovery = () => {

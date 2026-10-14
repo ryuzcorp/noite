@@ -441,9 +441,23 @@ pub async fn create(
     let head_sha = forge::resolve_ref(&bare, head)
         .await
         .map_err(|_| ApiError::not_found(format!("branch {head:?} not found")))?;
-    forge::resolve_ref(&bare, base)
+    let base_sha = forge::resolve_ref(&bare, base)
         .await
         .map_err(|_| ApiError::not_found(format!("branch {base:?} not found")))?;
+    // A pull request with nothing on its head is meaningless: refuse it with a
+    // message the caller can act on. `rev-list --count base..head` is 0 for an
+    // unchanged or behind head, and cheap (no diff is computed).
+    let ahead = forge::git_out(
+        &bare,
+        &["rev-list", "--count", &format!("{base_sha}..{head_sha}")],
+    )
+    .await
+    .map_err(repo_error)?;
+    if ahead.trim() == "0" {
+        return Err(ApiError::bad(format!(
+            "no commits on {head} over {base}; push a commit to {head} first"
+        )));
+    }
     if prs::open_for_pair(&state.pool, &app.id, base, head)
         .await
         .map_err(internal_error)?
@@ -1512,6 +1526,36 @@ mod tests {
         )
         .await
         .expect("admin merges");
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_head_with_no_new_commits() {
+        let h = Harness::new("prnocommits").await;
+        let bare = h.mirror().await;
+        let (base, _head) = clean_pair(&h, &bare).await;
+        // `same` sits exactly on main's tip: nothing to review.
+        forge::publish_ref(&h.state, &h.app, "same", None, Some(&base))
+            .await
+            .expect("publish same");
+        let author = actor("user_author", "Author");
+        let err = create(
+            &h.state,
+            &h.app.id,
+            &author,
+            "No changes",
+            "",
+            "main",
+            "same",
+        )
+        .await
+        .expect_err("refused");
+        match err {
+            ApiError::BadRequest(message) => {
+                assert!(message.contains("no commits"), "{message}");
+            }
+            other => panic!("expected bad request, got {other:?}"),
+        }
         h.finish().await;
     }
 

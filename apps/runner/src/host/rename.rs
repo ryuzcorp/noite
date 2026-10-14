@@ -17,7 +17,6 @@ use crate::db;
 use crate::host::deploy::{self, Deploying};
 use crate::host::logs::LogState;
 use crate::host::source;
-use crate::host::source_types;
 use crate::host::supervisor::{self, ProcMap};
 use crate::host::{exec, s3};
 use crate::models::App;
@@ -155,6 +154,10 @@ async fn rename_slugged(
     new_slug: &str,
 ) -> anyhow::Result<App> {
     supervisor::stop_fleet(procs, &app.slug).await;
+    // Environment fleets are keyed `slug.label`, so the rename has to stop
+    // them too; the reconcile loop respawns them under the new key from the
+    // updated rows.
+    supervisor::stop_environment_fleets(procs, &app.slug).await;
     // Same settle as purge: don't move S3 under a dying node.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -185,19 +188,15 @@ async fn rename_slugged(
             root.join("cache").join(&app.slug),
             root.join("cache").join(new_slug),
         ),
+        // Every preview environment's local state dir (`envs/<slug>/`).
+        (
+            root.join("envs").join(&app.slug),
+            root.join("envs").join(new_slug),
+        ),
     ];
     for (from, to) in &pairs {
         move_dir(from, to).await?;
     }
-    // The local-only declaration capture follows the slug too. It is one file,
-    // not a mergeable tree, so a leftover for the target slug is dropped rather
-    // than tripping `move_dir`'s "target exists" guard.
-    let (from, to) = (
-        source_types::store_path(cfg, &app.slug),
-        source_types::store_path(cfg, new_slug),
-    );
-    let _ = tokio::fs::remove_file(&to).await;
-    move_dir(&from, &to).await?;
 
     move_s3_prefix(
         cfg,
@@ -211,11 +210,30 @@ async fn rename_slugged(
         &format!("s3://{}/fleets/{new_slug}/", cfg.s3_bucket),
     )
     .await?;
+    // Every preview environment's bucket prefix (`envs/<slug>/`) moves with
+    // the slug, and each environment row's stored bucket follows.
+    move_s3_prefix(
+        cfg,
+        &format!("s3://{}/{}", cfg.s3_bucket, cfg.envs_prefix(&app.slug)),
+        &format!("s3://{}/{}", cfg.s3_bucket, cfg.envs_prefix(new_slug)),
+    )
+    .await?;
 
-    // Carry the in-memory log ring to the new slug.
+    // Carry the in-memory log rings to the new keys (`fleets/<slug>` and each
+    // `slug.label` environment ring).
     let ring = logs.lock().await.remove(&app.slug).unwrap_or_default();
     if !ring.is_empty() {
         logs.lock().await.insert(new_slug.to_string(), ring);
+    }
+    let envs = db::list_all_environments(pool).await.unwrap_or_default();
+    for env in envs.iter().filter(|e| e.app_id == app.id) {
+        let from = supervisor::env_fleet_key(&app.slug, &env.label);
+        let to = supervisor::env_fleet_key(new_slug, &env.label);
+        let ring = logs.lock().await.remove(&from).unwrap_or_default();
+        if !ring.is_empty() {
+            logs.lock().await.insert(to, ring);
+        }
+        db::set_environment_bucket(pool, &env.id, &cfg.envs_uri(new_slug, &env.label)).await?;
     }
 
     let subdomain = format!("{new_slug}.{}", cfg.base_domain);
@@ -236,6 +254,7 @@ async fn rename_slugged(
     // pre-update row); kill it and re-sweep both prefixes so late writes
     // land under the new slug instead of orphaning under the old one.
     supervisor::stop_fleet(procs, &app.slug).await;
+    supervisor::stop_environment_fleets(procs, &app.slug).await;
     move_s3_prefix(
         cfg,
         &format!("s3://{}/git/{}/", cfg.s3_bucket, app.slug),
@@ -246,6 +265,12 @@ async fn rename_slugged(
         cfg,
         &format!("s3://{}/fleets/{}/", cfg.s3_bucket, app.slug),
         &format!("s3://{}/fleets/{new_slug}/", cfg.s3_bucket),
+    )
+    .await?;
+    move_s3_prefix(
+        cfg,
+        &format!("s3://{}/{}", cfg.s3_bucket, cfg.envs_prefix(&app.slug)),
+        &format!("s3://{}/{}", cfg.s3_bucket, cfg.envs_prefix(new_slug)),
     )
     .await?;
     db::get_app(pool, &app.id)

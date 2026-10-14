@@ -3,9 +3,13 @@ title: Observe
 description: Logs, metrics with spans, errors, product-analytics events, and idle sleep for one app.
 ---
 
+:::note
+Everything here is per **app**. A [preview environment](/apps/environments) is its own fleet with its own deploy log and live log, but the telemetry ingest does not read an environment's prefix yet, so metrics, errors and analytics cover the app (its production fleet) and not each environment.
+:::
+
 ## Logs
 
-The Deployments tab shows the app's runtime logs, live over SSE, and follows the tail while pinned; scroll up to hold still. It holds the last 24 hours of logs ingested from celld's telemetry (up to 500 lines, about 40 s behind live traffic) followed by the fleet's live stdout/stderr, which lives in memory and resets when the runner restarts. Each deploy's build log is on its own row in the same tab.
+The Deployments tab shows the app's runtime logs, live over SSE, and follows the tail while pinned; scroll up to hold still. It holds the last 24 hours of logs ingested from celld's telemetry (up to 500 lines, about 40 s behind live traffic) followed by the fleet's live stdout/stderr, which lives in memory and resets when the runner restarts. Each deploy's build log is on its own row in the same tab. A deploy row inside a [preview environment](/apps/environments)'s group shows that environment's own fleet instead: its live stdout/stderr only (an environment's telemetry is not ingested yet), never production's lines.
 
 ## Metrics and spans
 

@@ -85,12 +85,6 @@ RUN --mount=type=cache,id=noite-cargo-registry,target=/usr/local/cargo/registry,
 FROM docker.io/oven/bun:1.4-debian AS ui-build
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 WORKDIR /app
-# The preview inlines Poder's `dist/` from beside its importer
-# (`apps/noite/poder-dist/`): build it here, and the UI install's
-# `postinstall` copies it over before the bundle is built.
-COPY packages/poder/ /packages/poder/
-RUN --mount=type=cache,id=noite-bun-cache,target=/root/.bun/install/cache,sharing=locked \
-    sh -c 'cd /packages/poder && bun install && bun run build'
 COPY apps/noite/package.json apps/noite/bun.lock ./
 COPY apps/noite/patches/ ./patches/
 # The package cache only saves downloads; `--frozen-lockfile` still checks
@@ -98,9 +92,6 @@ COPY apps/noite/patches/ ./patches/
 RUN --mount=type=cache,id=noite-bun-cache,target=/root/.bun/install/cache,sharing=locked \
     bun install --frozen-lockfile
 COPY apps/noite/ ./
-# Explicit (the install's `postinstall` does the same): the bundle inlines
-# this directory, so it must exist no matter how the install ran.
-RUN mkdir -p poder-dist && cp /packages/poder/dist/*.mjs poder-dist/
 RUN bun run build \
   && rm -f dist/.dev.vars dist/.dev.vars.* dist/ssr/.dev.vars dist/ssr/.dev.vars.* \
   && find dist -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1 >dist/REVISION

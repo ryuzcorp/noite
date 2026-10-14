@@ -89,9 +89,9 @@ const parseConfig = (
 /** The options and roots for a program over `fs`.
  *
  * `parsed.errors` is deliberately ignored: a repo may extend a config we
- * cannot see (a package's tsconfig lives in `node_modules`, and only its
- * *declarations* were captured from the build), and the options that did parse
- * still beat guessing. */
+ * cannot see (a package's tsconfig lives in `node_modules`, whose declarations
+ * the editor resolves through module resolution), and the options that did
+ * parse still beat guessing. */
 export const resolveRepoConfig = (
   fs: VirtualFs,
   repoPaths: readonly string[]

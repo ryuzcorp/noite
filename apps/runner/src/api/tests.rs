@@ -18,53 +18,21 @@ use tower::ServiceExt;
 use crate::models::new_id;
 use crate::AppState;
 
-const TOKEN: &str = "test-token";
+pub(crate) const TOKEN: &str = "test-token";
 
-/// In-process S3 stand-in: every LIST answers an empty `ListObjectsV2` page,
-/// so the S3 side of purge/rename is a no-op. Object bodies and deletes are
-/// never reached by these tests (empty listings short-circuit both).
-async fn spawn_s3_stub() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind s3 stub");
-    let addr = listener.local_addr().expect("stub addr");
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut sock, _)) = listener.accept().await else {
-                break;
-            };
-            tokio::spawn(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = vec![0u8; 8192];
-                let _ = sock.read(&mut buf).await;
-                let body = concat!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
-                    "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
-                    "<Name>noite</Name><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>",
-                    "</ListBucketResult>"
-                );
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-            });
-        }
-    });
-    format!("http://{addr}")
-}
-
-struct Harness {
-    router: axum::Router,
-    state: AppState,
-    dir: std::path::PathBuf,
+/// Shared by every `crate::api` test module (this one and
+/// `super::env_gate_tests`): the same router, state and temp dir.
+pub(crate) struct Harness {
+    pub(crate) router: axum::Router,
+    pub(crate) state: AppState,
+    pub(crate) dir: std::path::PathBuf,
 }
 
 impl Harness {
-    async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         let dir = std::env::temp_dir().join(format!("noite-api-tests-{}", new_id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let s3 = spawn_s3_stub().await;
+        let s3 = crate::testutil::spawn_s3_stub().await;
         let mut cfg = crate::config::config_for_tests();
         cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
         cfg.s3_endpoint = s3.clone();
@@ -103,11 +71,11 @@ impl Harness {
         Self { router, state, dir }
     }
 
-    async fn seed_app(&self, slug: &str) -> crate::models::App {
+    pub(crate) async fn seed_app(&self, slug: &str) -> crate::models::App {
         self.seed_app_named(slug, slug).await
     }
 
-    async fn seed_app_named(&self, slug: &str, name: &str) -> crate::models::App {
+    pub(crate) async fn seed_app_named(&self, slug: &str, name: &str) -> crate::models::App {
         crate::db::create_app(
             &self.state.pool,
             &self.state.config,
@@ -124,7 +92,12 @@ impl Harness {
         .expect("seed app")
     }
 
-    async fn rest(&self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
+    pub(crate) async fn rest(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
         let mut builder = Request::builder()
             .method(method)
             .uri(path)
@@ -151,7 +124,7 @@ impl Harness {
     }
 
     /// One JSON-RPC call: `Ok(result)` or `Err((code, message))`.
-    async fn rpc(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
+    pub(crate) async fn rpc(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
         let payload = json!({ "id": 1, "jsonrpc": "2.0", "method": method, "params": params });
         let (status, value) = self.rest("POST", "/rpc", Some(payload)).await;
         assert_eq!(status, StatusCode::OK, "rpc {method} transport");
@@ -164,7 +137,7 @@ impl Harness {
         Ok(value.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    async fn finish(&self) {
+    pub(crate) async fn finish(&self) {
         self.state.pool.clone().close().await;
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -838,29 +811,12 @@ async fn telemetry_status_agrees() {
     h.finish().await;
 }
 
-/// `source.bundle` reads a real push mirror at the requested ref, and
-/// `source.types` serves the capture the deploy pipeline writes — both through
-/// the REST mirror and the RPC, which must agree.
+/// `source.bundle` reads a real push mirror at the requested ref, through the
+/// REST mirror and the RPC, which must agree.
 #[tokio::test]
-async fn source_bundle_and_types_agree() {
+async fn source_bundle_agrees() {
     let h = Harness::new().await;
     let app = h.seed_app("code-app").await;
-
-    // Nothing captured yet: the empty payload, not an error.
-    let (status, empty) = h
-        .rest("GET", &format!("/v1/apps/{}/types", app.id), None)
-        .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        empty,
-        json!({ "sha": null, "files": [], "truncated": false })
-    );
-    assert_eq!(
-        h.rpc("source.types", json!({ "id": app.id }))
-            .await
-            .expect("source.types"),
-        empty
-    );
 
     // A push mirror with one commit on `main`.
     let bare = crate::host::git_http::http_bare(&h.state.config, &app.slug);
@@ -920,47 +876,6 @@ async fn source_bundle_and_types_agree() {
         assert_eq!(value, rest, "{query}");
     }
 
-    // The capture the deploy pipeline writes (`host::source_types::capture`)
-    // is served back with its sha.
-    let worktree = h.dir.join("capture-worktree");
-    std::fs::create_dir_all(worktree.join("node_modules/dep")).expect("capture tree");
-    std::fs::write(
-        worktree.join("node_modules/dep/index.d.ts"),
-        "export const b: string;\n",
-    )
-    .expect("declaration");
-    std::fs::write(
-        worktree.join("node_modules/dep/package.json"),
-        "{\"name\":\"dep\"}\n",
-    )
-    .expect("manifest");
-    crate::host::source_types::capture(
-        &crate::host::source_types::store_path(&h.state.config, &app.slug),
-        &worktree,
-        &sha,
-    )
-    .await
-    .expect("capture");
-
-    let (status, rest) = h
-        .rest("GET", &format!("/v1/apps/{}/types", app.id), None)
-        .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(rest["sha"], json!(sha));
-    assert_eq!(
-        rest["files"][0]["path"],
-        json!("node_modules/dep/index.d.ts")
-    );
-    assert_eq!(
-        rest["files"][1]["path"],
-        json!("node_modules/dep/package.json")
-    );
-    assert_eq!(
-        h.rpc("source.types", json!({ "id": app.id }))
-            .await
-            .expect("source.types"),
-        rest
-    );
     h.finish().await;
 }
 
@@ -980,4 +895,419 @@ async fn git(dir: &std::path::Path, args: &[&str]) -> String {
     )
     .await
     .unwrap_or_else(|e| panic!("git {args:?}: {e:#}"))
+}
+
+/// Seed one preview environment of `app` directly (no mirror needed).
+async fn seed_env(
+    h: &Harness,
+    app: &crate::models::App,
+    label: &str,
+    kind: crate::models::EnvironmentKind,
+    git_ref: &str,
+) -> crate::models::Environment {
+    crate::db::create_environment(
+        &h.state.pool,
+        &h.state.config,
+        crate::db::NewEnvironment {
+            app_id: &app.id,
+            slug: &app.slug,
+            label,
+            kind,
+            git_ref,
+            created_by: "user_1",
+            listen: 31000,
+            internal: 31001,
+        },
+    )
+    .await
+    .expect("seed environment")
+}
+
+/// Environments agree across transports, and the role gates are real: a read
+/// needs `view`, toggling public and deleting need `admin`.
+#[tokio::test]
+async fn environments_agree_and_gate_on_role() {
+    let h = Harness::new().await;
+    let app = h.seed_app("env-api").await;
+    let branch = seed_env(
+        &h,
+        &app,
+        "feature",
+        crate::models::EnvironmentKind::Branch,
+        "refs/heads/feature",
+    )
+    .await;
+
+    let (status, rest) = h
+        .rest(
+            "GET",
+            &format!("/v1/apps/{}/environments?role=view", app.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let rpc = h
+        .rpc("environments.list", json!({ "id": app.id, "role": "view" }))
+        .await
+        .expect("environments.list");
+    assert_eq!(rest, rpc);
+    assert_eq!(rest[0]["label"], json!("feature"));
+    assert_eq!(rest[0]["kind"], json!("branch"));
+    assert_eq!(rest[0]["public"], json!(false));
+    assert_eq!(
+        rest[0]["fleetBucket"],
+        json!(format!(
+            "s3://{}/envs/env-api/feature",
+            h.state.config.s3_bucket
+        ))
+    );
+    assert_eq!(rest[0]["appSlug"], json!("env-api"));
+
+    // A read without a role is refused (never defaulted to view).
+    assert_eq!(
+        h.rpc("environments.list", json!({ "id": app.id }))
+            .await
+            .expect_err("role required")
+            .0,
+        403
+    );
+
+    // Public toggle: admin only.
+    let (status, _) = h
+        .rest(
+            "PATCH",
+            &format!("/v1/apps/{}/environments/{}", app.id, branch.id),
+            Some(json!({ "public": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, updated) = h
+        .rest(
+            "PATCH",
+            &format!("/v1/apps/{}/environments/{}", app.id, branch.id),
+            Some(json!({ "public": true, "role": "admin" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["public"], json!(true));
+
+    // Overrides: push may write them, view may read them.
+    let (status, _) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/environments/{}/env", app.id, branch.id),
+            Some(json!({ "name": "SHARED", "value": "env", "role": "view" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/environments/{}/env", app.id, branch.id),
+            Some(json!({ "name": "SHARED", "value": "env", "role": "push" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, vars) = h
+        .rest(
+            "GET",
+            &format!(
+                "/v1/apps/{}/environments/{}/env?role=view",
+                app.id, branch.id
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(vars[0]["name"], json!("SHARED"));
+    assert_eq!(vars[0]["value"], json!("env"));
+    assert_eq!(
+        h.rpc(
+            "environments.vars.get",
+            json!({ "id": app.id, "envId": branch.id, "role": "view" }),
+        )
+        .await
+        .expect("vars.get"),
+        vars
+    );
+
+    // Delete: admin only, and it takes the row with it.
+    let (status, _) = h
+        .rest(
+            "DELETE",
+            &format!("/v1/apps/{}/environments/{}?role=push", app.id, branch.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = h
+        .rest(
+            "DELETE",
+            &format!("/v1/apps/{}/environments/{}?role=admin", app.id, branch.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(crate::db::list_environments(&h.state.pool, &app.id)
+        .await
+        .expect("list")
+        .is_empty());
+    h.finish().await;
+}
+
+/// An environment's deploy history is its own: the app's list stays
+/// production-only, and the filter returns the environment's rows.
+#[tokio::test]
+async fn deploys_filter_by_environment() {
+    let h = Harness::new().await;
+    let app = h.seed_app("env-deploys").await;
+    let env = seed_env(
+        &h,
+        &app,
+        "staging",
+        crate::models::EnvironmentKind::Branch,
+        "refs/heads/staging",
+    )
+    .await;
+    let pool = &h.state.pool;
+    crate::db::upsert_deploy(pool, None, &app.id, None, "success", Some("aaa1111"), "")
+        .await
+        .expect("production deploy");
+    crate::db::upsert_deploy(
+        pool,
+        None,
+        &app.id,
+        Some(&env.id),
+        "success",
+        Some("bbb2222"),
+        "",
+    )
+    .await
+    .expect("environment deploy");
+
+    let (_, rest) = h
+        .rest("GET", &format!("/v1/apps/{}/deploys", app.id), None)
+        .await;
+    assert_eq!(rest.as_array().expect("array").len(), 1);
+    assert_eq!(rest[0]["sha"], json!("aaa1111"));
+    assert_eq!(rest[0]["environmentId"], Value::Null);
+
+    let (_, rest) = h
+        .rest(
+            "GET",
+            &format!("/v1/apps/{}/deploys?environmentId={}", app.id, env.id),
+            None,
+        )
+        .await;
+    let rpc = h
+        .rpc(
+            "deploys.list",
+            json!({ "id": app.id, "environmentId": env.id }),
+        )
+        .await
+        .expect("deploys.list");
+    assert_eq!(rest, rpc);
+    assert_eq!(rest[0]["sha"], json!("bbb2222"));
+    assert_eq!(rest[0]["environmentId"], json!(env.id));
+
+    // The environment deploy never wrote the app's own pointer: it still
+    // carries the production sha, not the preview's.
+    let fresh = crate::db::get_app(pool, &app.id)
+        .await
+        .expect("app")
+        .expect("row");
+    assert_eq!(fresh.last_deploy_sha.as_deref(), Some("aaa1111"));
+    // And the app's production list is empty of environment rows.
+    assert!(crate::db::list_deploys(pool, &app.id, None)
+        .await
+        .expect("list")
+        .iter()
+        .all(|d| d.environment_id.is_none()));
+
+    // A snapshot of an environment JSON row carries the fields the UI needs.
+    let (_, one) = h
+        .rest(
+            "GET",
+            &format!("/v1/apps/{}/environments?role=view", app.id),
+            None,
+        )
+        .await;
+    assert_eq!(one[0]["desiredState"], json!("running"));
+    // The environment's own deploy marked it live at its own sha.
+    assert_eq!(one[0]["status"], json!("running"));
+    assert_eq!(one[0]["lastDeploySha"], json!("bbb2222"));
+    assert_eq!(one[0]["listenPort"], json!(31000));
+    h.finish().await;
+}
+
+/// Per-app and instance caps are enforced before a row lands, and a workspace
+/// preview's label carries its owner.
+#[tokio::test]
+async fn environment_caps_and_labels() {
+    use crate::host::env_label;
+    let h = Harness::new().await;
+    let app = h.seed_app("env-caps").await;
+    assert_eq!(h.state.config.max_environments_per_app, 5);
+    for i in 0..5 {
+        let label = env_label::unique_label(
+            &env_label::sanitize_label(&format!("feature/{i}")),
+            &crate::db::list_environments(&h.state.pool, &app.id)
+                .await
+                .expect("list")
+                .iter()
+                .map(|e| e.label.clone())
+                .collect::<Vec<_>>(),
+        );
+        seed_env(
+            &h,
+            &app,
+            &label,
+            crate::models::EnvironmentKind::Branch,
+            &format!("refs/heads/feature/{i}"),
+        )
+        .await;
+    }
+    // The cap is what `environments.create` checks; at the limit it refuses
+    // with a conflict before any git work.
+    let (status, body) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/environments", app.id),
+            Some(json!({ "branch": "feature/9", "role": "push" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    // A workspace preview of the same branch by two users is two labels.
+    assert_ne!(
+        env_label::workspace_label("feature/x", "user_1"),
+        env_label::workspace_label("feature/x", "user_2")
+    );
+    h.finish().await;
+}
+
+/// The hidden-ref plumbing `source.preview` rides on: the ref shape, the
+/// publishability rules, and ref-addressed environment lookup (the deploy
+/// routing input).
+#[tokio::test]
+async fn preview_refs_are_hidden_and_ref_routed() {
+    use crate::host::{forge, git_http};
+    use crate::service::environments;
+    let h = Harness::new().await;
+    let app = h.seed_app("env-refs").await;
+    let git_ref = environments::preview_ref("3f1a9c22-0000-4000-8000-000000000001", "feature/x");
+    assert_eq!(
+        git_ref, "refs/previews/3f1a9c22-0000-4000-8000-000000000001/feature/x",
+        "a UUID survives sanitizing unchanged"
+    );
+    assert!(git_ref.len() <= 40 + "refs/previews/".len() + "/feature/x".len());
+    // An exotic user id cannot escape the ref grammar either.
+    let odd = environments::preview_ref("../../etc", "feature/x");
+    assert!(forge::publishable_ref(&odd), "{odd}");
+    assert!(!odd.contains(".."));
+    assert!(forge::publishable_ref(&git_ref));
+    assert!(forge::publishable_ref("refs/heads/feature"));
+    assert!(!forge::publishable_ref("refs/tags/v1"));
+    assert!(!forge::publishable_ref("refs/previews//feature"));
+    assert!(git_http::PREVIEW_REF_PREFIX == "refs/previews/");
+
+    let env = seed_env(
+        &h,
+        &app,
+        &environments::preview_ref("user_1", "feature/x"),
+        crate::models::EnvironmentKind::Workspace,
+        &git_ref,
+    )
+    .await;
+    assert_eq!(env.kind, "workspace");
+    // Routing: only the environment that tracks the ref is found.
+    let found = crate::db::get_environment_by_ref(&h.state.pool, &app.id, &git_ref)
+        .await
+        .expect("lookup")
+        .expect("row");
+    assert_eq!(found.id, env.id);
+    assert!(crate::db::get_environment_by_ref(
+        &h.state.pool,
+        &app.id,
+        "refs/previews/other/feature/x"
+    )
+    .await
+    .expect("lookup")
+    .is_none());
+    h.finish().await;
+}
+
+/// Live logs follow the deploy target: the app's own ring by default, one
+/// environment's ring when asked (and never production's lines), and an
+/// environment of another app is a 404 rather than that app's slug key.
+#[tokio::test]
+async fn logs_scope_to_environment() {
+    let h = Harness::new().await;
+    let app = h.seed_app("env-logs").await;
+    let env = seed_env(
+        &h,
+        &app,
+        "staging",
+        crate::models::EnvironmentKind::Branch,
+        "refs/heads/staging",
+    )
+    .await;
+    // A sibling app with its own environment: its ring key must not cross.
+    let other = h.seed_app("other-logs").await;
+    let other_env = seed_env(
+        &h,
+        &other,
+        "staging",
+        crate::models::EnvironmentKind::Branch,
+        "refs/heads/staging",
+    )
+    .await;
+
+    crate::host::logs::append(&h.state.logs, &app.slug, "prod line".into()).await;
+    crate::host::logs::append(
+        &h.state.logs,
+        &crate::host::supervisor::env_fleet_key(&app.slug, &env.label),
+        "env line".into(),
+    )
+    .await;
+
+    let (status, rest) = h
+        .rest("GET", &format!("/v1/apps/{}/logs", app.id), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rest, json!(["prod line"]));
+
+    let (status, rest) = h
+        .rest(
+            "GET",
+            &format!("/v1/apps/{}/logs?environmentId={}", app.id, env.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rest, json!(["env line"]));
+    assert_eq!(
+        h.rpc("logs.get", json!({ "id": app.id, "environmentId": env.id }))
+            .await
+            .expect("logs.get"),
+        rest
+    );
+
+    // Another app's environment is a 404, never its own (or production's) key.
+    let (status, _) = h
+        .rest(
+            "GET",
+            &format!("/v1/apps/{}/logs?environmentId={}", app.id, other_env.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // An unknown environment is a 404 too.
+    let (status, _) = h
+        .rest(
+            "GET",
+            &format!("/v1/apps/{}/logs?environmentId=nope", app.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    h.finish().await;
 }

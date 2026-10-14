@@ -8,11 +8,15 @@ import { CommitList } from "./parts";
 
 export const HistoryView = ({
   appId,
+  file = "",
   gitRef,
   path,
   skip,
 }: {
   appId: string;
+  /** The open file, carried into commit links so their back link returns to
+   * it. */
+  file?: string;
   gitRef: string;
   /** Restrict the log to one path (the panel's "Only this file" scope). */
   path: string;
@@ -23,6 +27,9 @@ export const HistoryView = ({
   const error = res.error();
   const current = skip();
   const loading = data === undefined && error === undefined;
+  // One page only: both directions are already disabled, so the pager is
+  // noise. Hide it rather than show two dead buttons.
+  const singlePage = current === 0 && data?.nextSkip === null;
   return (
     <div class="flex flex-col gap-3">
       <LoadError error={error} label="Failed to load history" />
@@ -33,32 +40,36 @@ export const HistoryView = ({
             appId={appId}
             commits={data.commits}
             emptyLabel="No commits on this ref."
+            file={file}
+            gitRef={gitRef}
           />
-          <div class="flex items-center gap-2 text-sm">
-            <button
-              type="button"
-              class="btn btn-sm btn-ghost"
-              disabled={current === 0}
-              onclick={() => {
-                skip.set(Math.max(0, current - LOG_PAGE_SIZE));
-              }}
-            >
-              ‹ Newer
-            </button>
-            <button
-              type="button"
-              class="btn btn-sm btn-ghost"
-              disabled={data.nextSkip === null}
-              onclick={() => {
-                const next = data.nextSkip;
-                if (next !== null) {
-                  skip.set(next);
-                }
-              }}
-            >
-              Older ›
-            </button>
-          </div>
+          {singlePage ? null : (
+            <div class="flex items-center gap-2 text-sm">
+              <button
+                type="button"
+                class="btn btn-sm btn-ghost"
+                disabled={current === 0}
+                onclick={() => {
+                  skip.set(Math.max(0, current - LOG_PAGE_SIZE));
+                }}
+              >
+                ‹ Newer
+              </button>
+              <button
+                type="button"
+                class="btn btn-sm btn-ghost"
+                disabled={data.nextSkip === null}
+                onclick={() => {
+                  const next = data.nextSkip;
+                  if (next !== null) {
+                    skip.set(next);
+                  }
+                }}
+              >
+                Older ›
+              </button>
+            </div>
+          )}
         </>
       )}
     </div>

@@ -36,7 +36,9 @@ export const SERVER_INFO = {
 export const SERVER_INSTRUCTIONS =
   "Noite deploys apps from a git push. Use create_app (or push to a new slug) to make one, " +
   "repo_* to read its code, deploy_status and deploy_log to follow a deploy, app_logs and " +
-  "app_errors to debug it, and env_* to set variables. Every tool takes `app`: an app slug or id.";
+  "app_errors to debug it, env_* to set variables, and *_environment (list_environments, " +
+  "create_environment, deploy_environment, delete_environment) to preview a branch on its own " +
+  "host and storage. Every tool takes `app`: an app slug or id.";
 
 /** JSON-RPC 2.0 error codes used on the wire. */
 export const RPC_CODES = {

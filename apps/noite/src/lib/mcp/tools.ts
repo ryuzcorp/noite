@@ -29,6 +29,14 @@ import type { AppRole } from "../roles";
 import {
   runnerDeleteEnv,
   runnerDeployLog,
+  runnerEnvironmentCreate,
+  runnerEnvironmentDelete,
+  runnerEnvironmentDeploy,
+  runnerEnvironmentUpdate,
+  runnerEnvironmentVarDelete,
+  runnerEnvironmentVarSet,
+  runnerEnvironmentVars,
+  runnerEnvironmentsList,
   runnerGitCommit,
   runnerGitLog,
   runnerGitRefs,
@@ -47,6 +55,7 @@ import type {
   RunnerApp,
   RunnerBlob,
   RunnerDeploy,
+  RunnerEnvironment,
   RunnerErrorList,
   RunnerGitRemote,
   RunnerTree,
@@ -119,6 +128,77 @@ const appUrl = (remoteUrl: string, subdomain: string): string => {
   return `${parsed.protocol}//${subdomain}${port}`;
 };
 
+/** An environment's public URL: `<label>.<slug>.<base>`, with the same scheme
+ * and dev port as the app's own host (`app.subdomain` already carries
+ * `slug.<base>`), one DNS label in front of it. */
+const envUrl = (
+  remoteUrl: string,
+  subdomain: string,
+  label: string
+): string => {
+  const parsed = new URL(remoteUrl);
+  const port = parsed.port === "" ? "" : `:${parsed.port}`;
+  return `${parsed.protocol}//${label}.${subdomain}${port}`;
+};
+
+/** Every environment of one app. `role` is the caller's role on that app,
+ * resolved above; the runner refuses a missing one. */
+const appEnvironments = (
+  appId: string,
+  role: AppRole
+): Promise<RunnerEnvironment[]> => runnerEnvironmentsList(appId, role);
+
+/** The environment one tool call names, by label or by id — one list covers
+ * both lookups. A miss is the one message, like `requireApp`'s. */
+const requireEnvironment = async (
+  app: { id: string; slug: string },
+  role: AppRole,
+  ref: string
+): Promise<RunnerEnvironment> => {
+  const environments = await appEnvironments(app.id, role);
+  const found = environments.find((env) => env.id === ref || env.label === ref);
+  if (!found) {
+    throw new McpToolError(
+      `No environment "${ref}" in ${app.slug}. List them with list_environments (a label or an id).`
+    );
+  }
+  return found;
+};
+
+/** One environment as every tool reports it: the fields a caller acts on plus
+ * the URL it answers on (`<label>.<slug>.<base>`). The shape is inferred on
+ * purpose: `structuredContent` is JSON, and a named interface has no implicit
+ * index signature to satisfy it. */
+const environmentRow = (
+  env: RunnerEnvironment,
+  subdomain: string,
+  remoteUrl: string
+) => ({
+  asleepSince: env.asleepSince,
+  desiredState: env.desiredState,
+  gitRef: env.gitRef,
+  id: env.id,
+  kind: env.kind,
+  label: env.label,
+  lastDeploySha: env.lastDeploySha,
+  lastDeployedAt: env.lastDeployedAt,
+  lastError: env.lastError,
+  public: env.public,
+  status: env.status,
+  url: envUrl(remoteUrl, subdomain, env.label),
+});
+
+/** The one text line an environment row reads as. */
+const environmentLine = (row: {
+  kind: string;
+  label: string;
+  lastDeploySha: string | null;
+  public: boolean;
+  status: string;
+  url: string;
+}): string =>
+  `- ${row.label} (${row.kind}) ${row.url} — ${row.status}${row.public ? ", public" : ", members-only"}${row.lastDeploySha === null ? "" : `, ${sha10(row.lastDeploySha)}`}`;
+
 const AppRef = Schema.String.check(Schema.isNonEmpty()).annotate({
   description: "App slug or id.",
 });
@@ -132,6 +212,10 @@ const PathRef = Schema.String.check(Schema.isNonEmpty()).annotate({
 });
 
 const AppParams = Schema.Struct({ app: AppRef });
+
+const EnvironmentRef = Schema.String.check(Schema.isNonEmpty()).annotate({
+  description: "Environment label (e.g. staging) or id.",
+});
 
 /** A tool that takes nothing: `arguments` is accepted and ignored, and
  * `tools/list` still publishes a plain object — an empty `Schema.Struct`
@@ -332,32 +416,44 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
   }),
   defineTool({
     description:
-      "An app's deploy state: status, whether it is live, and its recent deploys. Poll this after a push.",
+      "An app's deploy state: status, whether it is live, and its recent deploys. Pass `environment` for one preview environment instead of production. Poll this after a push.",
     name: "deploy_status",
-    params: AppParams,
-    run: async ({ userId }, { app: ref }) => {
-      const { app } = await requireApp(userId, ref, "view");
-      const deploys = await runnerRpc<RunnerDeploy[]>("deploys.list", {
-        id: app.id,
-      });
+    params: appParams({ environment: Schema.optional(EnvironmentRef) }),
+    run: async ({ userId }, { app: ref, environment }) => {
+      const { app, role } = await requireApp(userId, ref, "view");
+      const env = environment
+        ? await requireEnvironment(app, role, environment)
+        : null;
+      const deploys = await runnerRpc<RunnerDeploy[]>(
+        "deploys.list",
+        env === null ? { id: app.id } : { environmentId: env.id, id: app.id }
+      );
       const recent = deploys.slice(0, 5);
       const latest = recent.at(0) ?? null;
-      const live = app.status === "running";
+      // An environment has no `subdomain`: its host is `<label>.<app host>`.
+      const where = env === null ? app.slug : `${app.slug}/${env.label}`;
+      const status = env === null ? app.status : env.status;
+      const desiredState = env === null ? app.desiredState : env.desiredState;
+      const lastDeploySha =
+        env === null ? app.lastDeploySha : env.lastDeploySha;
+      const lastError = env === null ? app.lastError : env.lastError;
+      const live = status === "running";
       return {
         structured: {
           appId: app.id,
           deploy: latest,
-          desiredState: app.desiredState,
-          lastDeploySha: app.lastDeploySha,
+          desiredState,
+          environmentId: env?.id ?? null,
+          lastDeploySha,
           live,
           name: app.name,
           recent,
           slug: app.slug,
-          status: app.status,
+          status,
         },
         text: [
-          `${app.slug}: ${app.status}${live ? " (live)" : ""}, desired ${app.desiredState}.`,
-          app.lastError === null ? "" : `last error: ${app.lastError}`,
+          `${where}: ${status}${live ? " (live)" : ""}, desired ${desiredState}.`,
+          lastError === null ? "" : `last error: ${lastError}`,
           ...recent.map(
             (deploy) =>
               `- ${deploy.id}: ${deploy.status}${deploy.sha === null ? "" : ` @ ${sha10(deploy.sha)}`} (${deploy.updatedAt})`
@@ -530,6 +626,212 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       return {
         structured: { appId: app.id, key, ok: true, slug: app.slug },
         text: `Removed ${key} from ${app.slug}.`,
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "List an app's preview environments: label, what each tracks, status, URL and whether it is public. An environment is members-only unless made public. `main` is the app itself, never an environment.",
+    name: "list_environments",
+    params: AppParams,
+    run: async ({ userId }, { app: ref }) => {
+      const { app, role } = await requireApp(userId, ref, "view");
+      const environments = await appEnvironments(app.id, role);
+      const remote = await runnerGitRemote(app.id);
+      const rows = environments.map((env) =>
+        environmentRow(env, app.subdomain, remote.url)
+      );
+      return {
+        structured: { appId: app.id, environments: rows, slug: app.slug },
+        text:
+          rows.length === 0
+            ? `${app.slug}: no environments. Create one from a branch with create_environment.`
+            : [
+                `${rows.length} environment${rows.length === 1 ? "" : "s"} in ${app.slug}:`,
+                ...rows.map((row) => environmentLine(row)),
+              ].join("\n"),
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Create a preview environment from a branch and deploy its head: its own host, its own empty storage. `main` is the app itself and is refused, and the label is derived from the branch name.",
+    name: "create_environment",
+    params: appParams({
+      branch: Schema.String.check(Schema.isNonEmpty()).annotate({
+        description: "A branch of the app's repository (not main).",
+      }),
+    }),
+    run: async ({ userId }, { app: ref, branch }) => {
+      const { app, role } = await requireApp(userId, ref, "push");
+      const env = await runnerEnvironmentCreate(app.id, branch, role);
+      const remote = await runnerGitRemote(app.id);
+      const row = environmentRow(env, app.subdomain, remote.url);
+      return {
+        structured: { appId: app.id, environment: row, slug: app.slug },
+        text: [
+          `Created ${row.label} in ${app.slug} from ${branch}.`,
+          environmentLine(row),
+          `The branch head is deploying now — poll deploy_status with environment ${row.label}.`,
+        ].join("\n"),
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Delete one preview environment: its fleet is stopped and its storage, host and deploys are gone.",
+    name: "delete_environment",
+    params: appParams({ environment: EnvironmentRef }),
+    run: async ({ userId }, { app: ref, environment }) => {
+      const { app, role } = await requireApp(userId, ref, "admin");
+      const env = await requireEnvironment(app, role, environment);
+      await runnerEnvironmentDelete(app.id, env.id, role);
+      return {
+        structured: {
+          appId: app.id,
+          deleted: env.label,
+          environmentId: env.id,
+          ok: true,
+          slug: app.slug,
+        },
+        text: `Deleted ${env.label} from ${app.slug}: its fleet, storage and host are gone.`,
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Re-deploy one preview environment at its ref's current head (the same commit rebuilds).",
+    name: "deploy_environment",
+    params: appParams({ environment: EnvironmentRef }),
+    run: async ({ userId }, { app: ref, environment }) => {
+      const { app, role } = await requireApp(userId, ref, "push");
+      const env = await requireEnvironment(app, role, environment);
+      const result = await runnerEnvironmentDeploy(app.id, env.id, role);
+      return {
+        structured: {
+          appId: app.id,
+          deployId: result.deployId,
+          environmentId: env.id,
+          sha: result.sha,
+          slug: app.slug,
+        },
+        text: `Deploying ${env.label} at ${sha10(result.sha)} (deploy ${result.deployId}) — read it with deploy_log.`,
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Make one preview environment public (anyone with the URL) or members-only again (the default).",
+    name: "set_environment_public",
+    params: appParams({
+      environment: EnvironmentRef,
+      public: Schema.Boolean.annotate({
+        description:
+          "true = anyone with the URL can open it; false = collaborators only.",
+      }),
+    }),
+    run: async ({ userId }, { app: ref, environment, public: isPublic }) => {
+      const { app, role } = await requireApp(userId, ref, "admin");
+      const before = await requireEnvironment(app, role, environment);
+      const env = await runnerEnvironmentUpdate(
+        app.id,
+        before.id,
+        isPublic,
+        role
+      );
+      const remote = await runnerGitRemote(app.id);
+      const row = environmentRow(env, app.subdomain, remote.url);
+      return {
+        structured: { appId: app.id, environment: row, slug: app.slug },
+        text: `${row.label} is now ${isPublic ? "public" : "members-only"}: ${row.url}`,
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "One preview environment's variable overrides. App variables are inherited; these win for this environment only. Values are hidden unless they are 0/1 flags, exactly as the UI shows them.",
+    name: "environment_env_list",
+    params: appParams({ environment: EnvironmentRef }),
+    run: async ({ userId }, { app: ref, environment }) => {
+      const { app, role } = await requireApp(userId, ref, "view");
+      const env = await requireEnvironment(app, role, environment);
+      const rows = await runnerEnvironmentVars(app.id, env.id, role);
+      const env2 = rows.map((row) => {
+        const { name, updatedAt, value } = redactEnv(row);
+        return { name, updatedAt, value };
+      });
+      return {
+        structured: {
+          appId: app.id,
+          environmentId: env.id,
+          label: env.label,
+          overrides: env2,
+          slug: app.slug,
+        },
+        text:
+          env2.length === 0
+            ? `${app.slug}/${env.label}: no overrides (it inherits the app's variables).`
+            : env2
+                .map(
+                  (row) =>
+                    `${row.name}=${row.value === "" ? "<hidden>" : row.value}`
+                )
+                .join("\n"),
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Set a variable override on one preview environment (needs the push role). The environment inherits the app's variables; this name wins for it alone.",
+    name: "environment_env_set",
+    params: appParams({
+      environment: EnvironmentRef,
+      key: Schema.String.check(Schema.isNonEmpty()).annotate({
+        description: "Variable name.",
+      }),
+      value: Schema.String.annotate({ description: "Variable value." }),
+    }),
+    run: async ({ userId }, { app: ref, environment, key, value }) => {
+      const { app, role } = await requireApp(userId, ref, "push");
+      const env = await requireEnvironment(app, role, environment);
+      await runnerEnvironmentVarSet(app.id, env.id, key, value, role);
+      return {
+        structured: {
+          appId: app.id,
+          environmentId: env.id,
+          key,
+          label: env.label,
+          ok: true,
+          slug: app.slug,
+        },
+        text: `Set ${key} on ${app.slug}/${env.label}. The next deploy of that environment picks it up.`,
+      };
+    },
+  }),
+  defineTool({
+    description:
+      "Remove a variable override from one preview environment, so the name falls back to the app's value (needs the push role).",
+    name: "environment_env_unset",
+    params: appParams({
+      environment: EnvironmentRef,
+      key: Schema.String.check(Schema.isNonEmpty()).annotate({
+        description: "Variable name.",
+      }),
+    }),
+    run: async ({ userId }, { app: ref, environment, key }) => {
+      const { app, role } = await requireApp(userId, ref, "push");
+      const env = await requireEnvironment(app, role, environment);
+      await runnerEnvironmentVarDelete(app.id, env.id, key, role);
+      return {
+        structured: {
+          appId: app.id,
+          environmentId: env.id,
+          key,
+          label: env.label,
+          ok: true,
+          slug: app.slug,
+        },
+        text: `Removed ${key} from ${app.slug}/${env.label}.`,
       };
     },
   }),

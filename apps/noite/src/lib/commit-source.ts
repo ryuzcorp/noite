@@ -1,38 +1,49 @@
-/** Browser commit client + the shared limits for the control route that
- * carries it. Commits go through `POST /api/apps/{id}/source/commit` (not an
- * oxide action) because an action body is capped for every action, and an
- * action reads its body before any auth — a browser commit can be a folder of
- * uploads (see `apps/runner/src/host/web_commit.rs`). */
+/** Browser commit/preview client + the shared limits for the control routes
+ * that carry them. Both go through `POST /api/apps/{id}/source/{commit,preview}`
+ * (not an oxide action) because an action body is capped for every action
+ * (1 MiB), and an action reads its body before any auth — a browser commit can
+ * be a folder of uploads (see `apps/runner/src/host/web_commit.rs`). */
 
-import type { SourceCommitFile, SourceCommitMove } from "./runner";
+import type {
+  PreviewResult,
+  SourceCommitFile,
+  SourceCommitMove,
+} from "./runner";
 
-/** Largest commit body the route reads. Must match `MAX_COMMIT_BODY_BYTES` in
- * `apps/runner/src/host/web_commit.rs`: the runner caps a commit at 25 MiB
+/** Largest source body the routes read. Must match `MAX_COMMIT_BODY_BYTES` in
+ * `apps/runner/src/host/web_commit.rs`: the runner caps a commit — and a
+ * preview, which is the same commit shape onto a hidden ref — at 25 MiB
  * decoded, which base64 inflates by 4/3. */
-export const MAX_COMMIT_BODY_BYTES = 40 * 1024 * 1024;
+export const MAX_SOURCE_BODY_BYTES = 40 * 1024 * 1024;
 
-/** How long the route waits on the runner for a commit before failing. */
-export const COMMIT_FORWARD_TIMEOUT_MS = 12_000;
+/** How long the routes wait on the runner for the write before failing. */
+export const SOURCE_FORWARD_TIMEOUT_MS = 12_000;
 
-/** What `commitSource` takes; optional fields are omitted, never `undefined`. */
+/** What `commitSource` and `previewSource` take; optional fields are omitted,
+ * never `undefined`. */
 export interface SourceCommitInput {
   appId: string;
   branch?: string;
   deletes?: readonly string[];
   files: readonly SourceCommitFile[];
+  /** The commit a `branch` this push creates starts from: the tip of the
+   * branch being browsed. Unused when `branch` already exists — the runner
+   * grows an existing branch from its own tip — and unused by a preview, which
+   * always commits on top of the branch's head. */
   fromSha?: string;
   message: string;
   moves?: readonly SourceCommitMove[];
 }
 
-/** Commit browser drafts: session + push gate happen on the route before the
- * body is read, then the runner makes the commit and answers `{ sha }`. */
-export const commitSource = async (
+/** POST one web-commit body to `/api/apps/{id}/source/{endpoint}` and read the
+ * runner's answer back. */
+const postSourceBody = async <T>(
+  endpoint: "commit" | "preview",
   input: SourceCommitInput
-): Promise<{ sha: string }> => {
+): Promise<T> => {
   const { appId, ...body } = input;
   const res = await fetch(
-    `/api/apps/${encodeURIComponent(appId)}/source/commit`,
+    `/api/apps/${encodeURIComponent(appId)}/source/${endpoint}`,
     {
       body: JSON.stringify(body),
       headers: { "content-type": "application/json" },
@@ -41,8 +52,23 @@ export const commitSource = async (
   );
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
-    throw new Error(`commit failed: ${res.status} ${text}`);
+    throw new Error(`${endpoint} failed: ${res.status} ${text}`);
   }
-  // SAFETY: the route re-serves the runner's `{ sha }` JSON verbatim.
-  return (await res.json()) as { sha: string };
+  // SAFETY: each route re-serves the runner's own JSON for its endpoint
+  // verbatim (`{ sha }` for a commit, `PreviewResult` for a preview).
+  return (await res.json()) as T;
 };
+
+/** Commit browser drafts: session + push gate happen on the route before the
+ * body is read, then the runner makes the commit and answers `{ sha }`. */
+export const commitSource = (input: SourceCommitInput) =>
+  postSourceBody<{ sha: string }>("commit", input);
+
+/** Deploy preview: the same body as a commit, which the runner snapshots onto
+ * the viewer's hidden `refs/previews/<user>/<branch>` ref and deploys as that
+ * (user, branch) environment — the branch never moves and the changes stay
+ * uncommitted. Answers the environment it deployed, the commit it snapshotted
+ * and the deploy row to stream. */
+export const previewSource = (
+  input: SourceCommitInput
+): Promise<PreviewResult> => postSourceBody<PreviewResult>("preview", input);

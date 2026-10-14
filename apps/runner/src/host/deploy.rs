@@ -14,7 +14,6 @@ use crate::host::generated_config;
 use crate::host::logs::LogState;
 use crate::host::package_manager;
 use crate::host::s3;
-use crate::host::source_types;
 use crate::host::supervisor::{self, ProcMap};
 use crate::host::tips::TipBundle;
 use crate::lifecycle::{self, sha_same};
@@ -65,11 +64,62 @@ pub async fn snapshot_claimed(deploying: &Deploying) -> HashSet<String> {
 /// Why a deploy runs. A tip deploy is deduped against the sha already live
 /// (the push fast-path and the reconcile poll can both fire for one push); an
 /// explicit one (rollback, redeploy) always builds, so redeploying the live
-/// sha rebuilds it — e.g. to capture package types for the editor.
+/// sha rebuilds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeployTrigger {
     Tip,
     Explicit,
+}
+
+/// Where a deploy lands: production (the app itself), or one preview
+/// environment with its own bucket, ports and git ref. An environment deploy
+/// can never rewrite production's bucket, ports or `last_deploy_sha` — the two
+/// targets share only the build (serialized per app by [`AppLock`]).
+#[derive(Debug, Clone)]
+pub enum DeployTarget {
+    Production,
+    Environment(Box<crate::models::Environment>),
+}
+
+impl DeployTarget {
+    /// The deploy row's target: `None` (NULL) for production.
+    pub fn environment_id(&self) -> Option<&str> {
+        match self {
+            Self::Production => None,
+            Self::Environment(env) => Some(&env.id),
+        }
+    }
+
+    /// The celld bucket this deploy writes durability into.
+    pub fn bucket(&self, app: &App) -> String {
+        match self {
+            Self::Production => app.fleet_bucket.clone(),
+            Self::Environment(env) => env.fleet_bucket.clone(),
+        }
+    }
+
+    /// The ref the worktree is materialized at.
+    pub fn git_ref(&self) -> &str {
+        match self {
+            Self::Production => "refs/heads/main",
+            Self::Environment(env) => &env.git_ref,
+        }
+    }
+
+    /// The sha already live for this target (a tip deploy dedupes against it).
+    pub fn last_deploy_sha(&self, app: &App) -> Option<String> {
+        match self {
+            Self::Production => app.last_deploy_sha.clone(),
+            Self::Environment(env) => env.last_deploy_sha.clone(),
+        }
+    }
+
+    pub fn environment(&self) -> Option<&crate::models::Environment> {
+        match self {
+            Self::Production => None,
+            Self::Environment(env) => Some(env),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // shared deps threaded by reference; a context struct would only obfuscate this one call site
@@ -80,22 +130,47 @@ pub async fn deploy_app(
     logs: &LogState,
     deploying: &Deploying,
     app: App,
+    target: DeployTarget,
     object_key: &str,
     tip_sha: Option<&str>,
     trigger: DeployTrigger,
+    // A deploy row the caller already created (so it could hand the id back
+    // immediately). `None` = this run creates its own.
+    deploy_id: Option<&str>,
 ) {
     if !claim(deploying, &app.id).await {
+        // The caller may be waiting on that pre-created row: close it, or it
+        // sits "building" until the stuck-deploy sweep.
+        if let Some(id) = deploy_id {
+            let _ = db::upsert_deploy(
+                pool,
+                Some(id),
+                &app.id,
+                target.environment_id(),
+                DeployStatus::Failed.as_str(),
+                tip_sha,
+                "ERROR: deploy skipped, another deploy of this app is in flight\n",
+            )
+            .await;
+        }
         tracing::info!(slug = %app.slug, "deploy skip (in flight)");
         return;
     }
-    // A deploy is activity (SPEC, Scale to zero): wake an asleep app so the
-    // reconcile loop spawns the fleet this release lands in.
-    crate::host::sleep::wake_for_deploy(pool, &app).await;
+    // A deploy is activity (SPEC, Scale to zero): wake an asleep app — or
+    // preview environment — so the reconcile loop spawns the fleet this
+    // release lands in.
+    match &target {
+        DeployTarget::Production => crate::host::sleep::wake_for_deploy(pool, &app).await,
+        DeployTarget::Environment(env) => {
+            crate::host::sleep::wake_environment_for_deploy(pool, env).await;
+        }
+    }
     let mut progress = Progress {
         pool,
         app_id: &app.id,
+        environment_id: target.environment_id().map(str::to_string),
         sha: tip_sha.map(str::to_string),
-        id: None,
+        id: deploy_id.map(str::to_string),
         step: "fetch",
     };
     let result = deploy_inner(
@@ -104,21 +179,31 @@ pub async fn deploy_app(
         procs,
         logs,
         &app,
+        &target,
         object_key,
         &mut progress,
         trigger,
     )
     .await;
     if let Err(e) = &result {
-        tracing::error!(slug = %app.slug, step = progress.step, error = %e, "deploy failed");
+        let fleet = fleet_label(&app, &target);
+        tracing::error!(slug = %fleet, step = progress.step, error = %e, "deploy failed");
         if let Err(db_e) = progress.fail(e).await {
-            tracing::error!(slug = %app.slug, error = %db_e, "failed to record deploy failure");
+            tracing::error!(slug = %fleet, error = %db_e, "failed to record deploy failure");
         }
     }
     // T5.1: the build just populated the persistent cache; prune it back to
     // the cap now, on success and on failure alike.
     exec::prune_build_cache(&exec::build_cache_dir(cfg, &app.slug), cfg.build_cache_mb);
     release(deploying, &app.id).await;
+}
+
+/// Log label for a target: the slug, or `slug.label` for an environment.
+fn fleet_label(app: &App, target: &DeployTarget) -> String {
+    match target.environment() {
+        Some(env) => format!("{}.{}", app.slug, env.label),
+        None => app.slug.clone(),
+    }
 }
 
 /// The deploy row one run writes to and the step it is in: every line of the
@@ -128,6 +213,9 @@ pub async fn deploy_app(
 struct Progress<'a> {
     pool: &'a SqlitePool,
     app_id: &'a str,
+    /// The environment this run targets; `None` is production. Decides which
+    /// row the status lands on (the app, or the environment).
+    environment_id: Option<String>,
     sha: Option<String>,
     id: Option<String>,
     step: &'static str,
@@ -139,6 +227,7 @@ impl Progress<'_> {
             self.pool,
             self.id.as_deref(),
             self.app_id,
+            self.environment_id.as_deref(),
             status.as_str(),
             self.sha.as_deref(),
             text,
@@ -169,7 +258,8 @@ impl Progress<'_> {
         self.log(DeployStatus::Building, &format!("{tail}\n")).await
     }
 
-    /// Record `err` on the row and a one-line summary on the app.
+    /// Record `err` on the row and a one-line summary on the target (the app
+    /// for production, the environment for a preview).
     async fn fail(&mut self, err: &anyhow::Error) -> sqlx::Result<()> {
         let detail = lifecycle::strip_ansi(&format!("{err:#}")).into_owned();
         let detail = lifecycle::tail_utf8(detail.trim_end(), FAILURE_TAIL);
@@ -178,14 +268,30 @@ impl Progress<'_> {
             &format!("ERROR: {} failed\n{detail}\n", self.step),
         )
         .await?;
-        db::update_app_status(
-            self.pool,
-            self.app_id,
-            AppStatus::Failed.as_str(),
-            Some(&failure_summary(self.step, detail)),
-            None,
-        )
-        .await
+        let summary = failure_summary(self.step, detail);
+        match self.environment_id.as_deref() {
+            // `upsert_deploy` already moved the environment to failed with the
+            // log tail; this adds the one-line summary the UI lists.
+            Some(env_id) => {
+                db::update_environment_status(
+                    self.pool,
+                    env_id,
+                    AppStatus::Failed.as_str(),
+                    Some(&summary),
+                )
+                .await
+            }
+            None => {
+                db::update_app_status(
+                    self.pool,
+                    self.app_id,
+                    AppStatus::Failed.as_str(),
+                    Some(&summary),
+                    None,
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -226,10 +332,12 @@ async fn deploy_inner(
     procs: &ProcMap,
     logs: &LogState,
     app: &App,
+    target: &DeployTarget,
     object_key: &str,
     progress: &mut Progress<'_>,
     trigger: DeployTrigger,
 ) -> anyhow::Result<()> {
+    let fleet = fleet_label(app, target);
     let commit_sha = progress
         .sha
         .clone()
@@ -242,23 +350,40 @@ async fn deploy_inner(
     progress.sha = Some(commit_sha.clone());
 
     // Dedupe: webhook + tip-poll can both fire; claim serializes, re-read sha.
-    // An explicit deploy of the live sha is a rebuild and runs.
-    let Some(fresh) = db::get_app(pool, &app.id).await? else {
-        anyhow::bail!("app {} gone before deploy (deleted?)", app.id);
+    // An explicit deploy of the live sha is a rebuild and runs. Production
+    // dedupes against `app.last_deploy_sha`; an environment against its own,
+    // so a preview can never make production skip (or the reverse).
+    let (live_sha, production_bucket) = match target {
+        DeployTarget::Production => {
+            let Some(fresh) = db::get_app(pool, &app.id).await? else {
+                anyhow::bail!("app {} gone before deploy (deleted?)", app.id);
+            };
+            (fresh.last_deploy_sha.clone(), Some(fresh.fleet_bucket))
+        }
+        DeployTarget::Environment(env) => match db::get_environment(pool, &env.id).await? {
+            Some(fresh) => (fresh.last_deploy_sha, None),
+            None => anyhow::bail!("environment {} gone before deploy", env.id),
+        },
     };
     if trigger == DeployTrigger::Tip
-        && fresh
-            .last_deploy_sha
+        && live_sha
             .as_deref()
             .is_some_and(|s| sha_same(s, &commit_sha))
     {
         tracing::info!(
-            slug = %app.slug,
+            slug = %fleet,
             sha = %&commit_sha[..12.min(commit_sha.len())],
             "deploy skip (already at sha)"
         );
         return Ok(());
     }
+    // An environment deploy writes its own bucket; production keeps the app's
+    // (re-read above so a concurrent rename cannot leave us writing the old
+    // prefix).
+    let bucket = match production_bucket {
+        Some(bucket) => bucket,
+        None => target.bucket(app),
+    };
 
     let root = exec::work_root(cfg);
     let work = root.join("builds").join(&app.slug).join(
@@ -342,11 +467,17 @@ async fn deploy_inner(
         bundle_path.clone()
     };
 
-    let src_dir = materialize_bundle(cfg, app, &work, &fetch_from, &commit_sha).await?;
+    let src_dir =
+        materialize_bundle(cfg, app, &work, &fetch_from, &commit_sha, target.git_ref()).await?;
     // Tenant env (`.dev.vars` model): build + release see the same vars the
     // fleet gets at spawn. Reserved platform names filtered in db (now
     // including RUNNER_*/NOITE_*/BETTER_AUTH_*/CADDY_*/LD_*/NODE_OPTIONS/BUN_*).
-    let tenant = db::tenant_env(pool, &app.id).await;
+    // An environment inherits the app's variables with its own overrides on
+    // top.
+    let tenant = match target.environment() {
+        Some(env) => db::environment_tenant_env(pool, &app.id, &env.id).await,
+        None => db::tenant_env(pool, &app.id).await,
+    };
     let tenant_refs: Vec<(&str, &str)> = tenant
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -590,7 +721,14 @@ async fn deploy_inner(
             }
             owned.push(("S3_ENDPOINT".into(), cfg.s3_endpoint.clone()));
             owned.push(("NOITE_S3_BUCKET".into(), cfg.s3_bucket.clone()));
-            owned.push(("NOITE_APP_PREFIX".into(), format!("fleets/{}", app.slug)));
+            // The prefix this deploy owns: production's fleet bucket, or the
+            // environment's own — a release command must never touch the
+            // other.
+            let prefix = match target.environment() {
+                Some(env) => format!("envs/{}/{}", app.slug, env.label),
+                None => format!("fleets/{}", app.slug),
+            };
+            owned.push(("NOITE_APP_PREFIX".into(), prefix));
             let mut cmd_env: Vec<(&str, &str)> = owned
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -645,7 +783,7 @@ async fn deploy_inner(
         .step(
             "deploy",
             DeployStatus::Deploying,
-            &format!("celld deploy → {}", app.fleet_bucket),
+            &format!("celld deploy → {bucket}"),
         )
         .await?;
 
@@ -658,7 +796,7 @@ async fn deploy_inner(
             "deploy",
             deploy_root.to_str().unwrap(),
             "--bucket",
-            &app.fleet_bucket,
+            &bucket,
             "--endpoint",
             &cfg.s3_endpoint,
             "--region",
@@ -670,68 +808,81 @@ async fn deploy_inner(
     )
     .await?;
 
-    if db::get_app(pool, &app.id).await?.is_none() {
-        anyhow::bail!(
-            "app {} deleted after celld deploy; skipping fleet start",
-            app.id
-        );
+    // The row the deploy targets must still be there before the fleet starts:
+    // for a preview, the environment's row (a delete raced this build).
+    let environment = match target {
+        DeployTarget::Production => {
+            if db::get_app(pool, &app.id).await?.is_none() {
+                anyhow::bail!(
+                    "app {} deleted after celld deploy; skipping fleet start",
+                    app.id
+                );
+            }
+            None
+        }
+        DeployTarget::Environment(env) => match db::get_environment(pool, &env.id).await? {
+            Some(fresh) => Some(fresh),
+            None => anyhow::bail!(
+                "environment {} deleted after celld deploy; skipping fleet start",
+                env.id
+            ),
+        },
+    };
+    // Only production records the deployed Wrangler config: it is what the
+    // app's storage views render, and a preview's config must not overwrite it.
+    if environment.is_none() {
+        db::set_deployed_config(
+            pool,
+            &app.id,
+            effective_config(&deploy_root).await.as_deref(),
+        )
+        .await?;
     }
-    db::set_deployed_config(
-        pool,
-        &app.id,
-        effective_config(&deploy_root).await.as_deref(),
-    )
-    .await?;
 
     progress.step = "start";
-    supervisor::ensure_fleet(pool, cfg, procs, logs, app).await?;
-    supervisor::reload_fleet(app).await;
+    match &environment {
+        Some(_) => {
+            let env = target
+                .environment()
+                .expect("environment target carries its row");
+            supervisor::ensure_environment_fleet(pool, cfg, procs, logs, env).await?;
+            supervisor::reload_environment_fleet(env).await;
+        }
+        None => {
+            supervisor::ensure_fleet(pool, cfg, procs, logs, app).await?;
+            supervisor::reload_fleet(app).await;
+        }
+    }
 
     progress
         .log(DeployStatus::Success, "deploy complete\n")
         .await?;
-    tracing::info!(slug = %app.slug, sha = %&commit_sha[..12.min(commit_sha.len())], "deploy ok");
-    // The app is live: status, fleet and reload are all done above, so the
-    // declaration capture for the code editor and the worktree wipe run
-    // detached. Nothing that waits on this deploy — the app lock, the next
-    // push, a delete — is held open by the walk, and the worktree is only
-    // dropped once the capture has read it.
-    tokio::spawn(capture_and_wipe(
-        source_types::store_path(cfg, &app.slug),
-        src_dir,
-        work,
-        app.slug.clone(),
-        commit_sha.clone(),
-    ));
+    tracing::info!(fleet = %fleet, sha = %&commit_sha[..12.min(commit_sha.len())], "deploy ok");
+    // It is live: status, fleet and reload are all done above, so the
+    // worktree wipe runs detached. Nothing that waits on this deploy — the app
+    // lock, the next push, a delete — is held open by it.
+    tokio::spawn(wipe_worktree(work));
     Ok(())
 }
 
-/// Capture the built tree's declarations (`host::source_types`), then drop the
-/// build worktree they came from. Best-effort by contract: a failure keeps the
-/// previous capture and only costs the next deploy.
-async fn capture_and_wipe(
-    store: PathBuf,
-    worktree: PathBuf,
-    work: PathBuf,
-    slug: String,
-    sha: String,
-) {
-    let short = &sha[..12.min(sha.len())];
-    match source_types::capture(&store, &worktree, &sha).await {
-        Ok(files) => tracing::debug!(slug = %slug, files, sha = %short, "types captured"),
-        Err(e) => {
-            tracing::warn!(slug = %slug, error = %format!("{e:#}"), "types capture failed; keeping previous capture");
-        }
-    }
+/// Drop the build worktree after a successful deploy. Best-effort by contract:
+/// a failure only leaks the tree until the next deploy replaces it.
+async fn wipe_worktree(work: PathBuf) {
     let _ = tokio::fs::remove_dir_all(&work).await;
 }
 
+/// Fetch one bundle's sha into the app's bare mirror at `git_ref` and check
+/// that ref out into the worktree. Production checks out `refs/heads/main`;
+/// an environment checks out its own branch or hidden preview ref, so two
+/// targets of one app share the mirror (and the serialized build) without
+/// checking out each other's tree.
 async fn materialize_bundle(
     cfg: &Config,
     app: &App,
     work: &Path,
     bundle_path: &Path,
     sha: &str,
+    git_ref: &str,
 ) -> anyhow::Result<PathBuf> {
     let bare = exec::work_root(cfg)
         .join("repos")
@@ -749,7 +900,7 @@ async fn materialize_bundle(
         )
         .await?;
     }
-    let refspec = format!("+{sha}:refs/heads/main");
+    let refspec = format!("+{sha}:{git_ref}");
     exec::run_cmd(
         "git",
         &[
@@ -772,7 +923,7 @@ async fn materialize_bundle(
             &format!("--work-tree={}", src_dir.display()),
             "checkout",
             "-f",
-            "main",
+            git_ref,
         ],
         Some(work),
         &[],
@@ -984,6 +1135,7 @@ async fn find_deploy_root(dir: &PathBuf) -> anyhow::Result<Option<PathBuf>> {
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)] // deploy_app's deps; same rationale
 pub async fn deploy_tip(
     pool: &SqlitePool,
     cfg: &Config,
@@ -991,10 +1143,11 @@ pub async fn deploy_tip(
     logs: &LogState,
     deploying: &Deploying,
     app: App,
+    target: DeployTarget,
     tip: TipBundle,
 ) {
-    if app
-        .last_deploy_sha
+    if target
+        .last_deploy_sha(&app)
         .as_deref()
         .is_some_and(|s| sha_same(s, &tip.sha))
     {
@@ -1007,9 +1160,11 @@ pub async fn deploy_tip(
         logs,
         deploying,
         app,
+        target,
         &tip.key,
         Some(&tip.sha),
         DeployTrigger::Tip,
+        None,
     )
     .await;
 }
@@ -1017,8 +1172,8 @@ pub async fn deploy_tip(
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_and_wipe, contained_deploy_root, failure_summary, has_build_script,
-        parse_wrangler_build, without_runner_keys,
+        contained_deploy_root, failure_summary, has_build_script, parse_wrangler_build,
+        wipe_worktree, without_runner_keys,
     };
     use serde_json::json;
 
@@ -1113,43 +1268,18 @@ mod tests {
         );
     }
 
-    /// The detached end-of-deploy step: the capture lands in the store and the
-    /// worktree it read is gone afterwards (never the other way round).
+    /// The detached end-of-deploy step: the build worktree is gone afterwards.
     #[tokio::test]
-    async fn capture_and_wipe_stores_declarations_then_drops_the_worktree() {
+    async fn wipe_worktree_drops_the_build_worktree() {
         let base =
-            std::env::temp_dir().join(format!("noite-capture-wipe-{}", crate::models::new_id()));
+            std::env::temp_dir().join(format!("noite-wipe-worktree-{}", crate::models::new_id()));
         let work = base.join("build");
-        let worktree = work.join("src");
-        std::fs::create_dir_all(worktree.join("node_modules/dep")).unwrap();
-        std::fs::write(worktree.join("node_modules/dep/index.d.ts"), "export {};\n").unwrap();
-        let mut cfg = crate::config::config_for_tests();
-        cfg.work_dir = base.join("work").to_string_lossy().into_owned();
-        let store = crate::host::source_types::store_path(&cfg, "wipe");
+        std::fs::create_dir_all(work.join("src/node_modules/dep")).unwrap();
+        std::fs::write(work.join("src/node_modules/dep/index.d.ts"), "export {};\n").unwrap();
 
-        capture_and_wipe(
-            store.clone(),
-            worktree,
-            work,
-            "wipe".into(),
-            "abc123".into(),
-        )
-        .await;
-        assert!(store.exists(), "the capture landed");
-        assert!(!base.join("build").exists(), "the worktree is wiped");
+        wipe_worktree(work.clone()).await;
 
-        let stored = crate::host::source_types::read(&cfg, "wipe")
-            .await
-            .expect("read capture");
-        assert_eq!(stored.sha.as_deref(), Some("abc123"));
-        assert_eq!(
-            stored
-                .files
-                .iter()
-                .map(|f| f.path.as_str())
-                .collect::<Vec<_>>(),
-            ["node_modules/dep/index.d.ts"]
-        );
+        assert!(!work.exists(), "the worktree is wiped");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

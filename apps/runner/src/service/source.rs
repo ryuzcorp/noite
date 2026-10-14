@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use crate::api_error::ApiError;
-use crate::host::{forge, git_identity, source, source_types, web_commit};
+use crate::host::{forge, git_identity, source, web_commit};
 use crate::models::App;
 use crate::AppState;
 
@@ -119,17 +119,6 @@ pub async fn archive_target(
     Ok((bare, rev))
 }
 
-/// `source.types`: the declaration files captured from the app's last
-/// successful build (`host::source_types`). Nothing captured yet is the empty
-/// payload (`sha: null`, no files), not an error.
-pub async fn types(state: &AppState, id: &str) -> Result<serde_json::Value, ApiError> {
-    let app = app_or_404(state, id).await?;
-    let types = source_types::read(&state.config, &app.slug)
-        .await
-        .map_err(ApiError::from_anyhow)?;
-    serde_json::to_value(types).map_err(|e| ApiError::internal(e.to_string()))
-}
-
 /// One browser-edited file: validated path + content, text or a base64
 /// upload (`encoding` absent means `utf8`).
 #[derive(serde::Deserialize, ts_rs::TS)]
@@ -185,8 +174,9 @@ pub struct SourceCommitBody {
 
 /// Browser edits are input validation first (400), a lost CAS race is a real
 /// 409 conflict, and an unknown branch to start from is a 404. A genuine
-/// git/exec failure stays 500.
-fn commit_error(e: anyhow::Error) -> ApiError {
+/// git/exec failure stays 500. `service::environments` reuses it for
+/// `source.preview`, so both commit surfaces report identically.
+pub(super) fn commit_error(e: anyhow::Error) -> ApiError {
     let msg = format!("{e:#}");
     if msg.contains("tip moved") {
         ApiError::conflict(msg)

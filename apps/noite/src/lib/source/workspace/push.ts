@@ -122,7 +122,7 @@ export const markPushed = async (
   sha: string
 ): Promise<void> => {
   const { cache, fs } = state;
-  const files = await listFiles(fs);
+  const files = await listFiles(fs, state.base);
   const entries = await Promise.all(
     files.map(async (file): Promise<[string, BaseEntry]> => {
       const digest = await fileSha(fs, cache, file);

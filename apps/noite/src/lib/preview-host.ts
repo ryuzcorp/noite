@@ -110,27 +110,22 @@ export const PREVIEW_ASSET_PREFIX = "/assets/";
  *
  * In dev the frame's document loads Vite's module graph (`POD_HOST_DEV_JS`)
  * instead of the built bundle, so the frame's own assets are spread over the
- * app root: the control UI's and the pod host's sources under `src/`, the raw
- * Poder ESM the harness inlines (`poder-dist/`), and Vite's prebundled
- * dependencies (`node_modules/.vite/deps/`). A *build* needs none of this: its
- * entry is one file at `POD_HOST_JS_PATH`, and `/assets/*` (see
- * `PREVIEW_ASSET_PREFIX`) is the only other root it reads.
+ * app root: the control UI's and the pod host's sources under `src/`, and
+ * Vite's prebundled dependencies (`node_modules/.vite/deps/`). A *build* needs
+ * none of this: its entry is one file at `POD_HOST_JS_PATH`, and `/assets/*`
+ * (see `PREVIEW_ASSET_PREFIX`) is the only other root it reads.
  *
- * Reserving them is what keeps the frame loadable once a preview has claimed
- * the origin root. Nodepod's service worker routes a same-origin request that
+ * Reserving them is what keeps the frame loadable once a pod has claimed the
+ * origin root. Nodepod's service worker routes a same-origin request that
  * is neither a reserved host path nor a subresource of a reserved host document
  * to the pod that claimed its referrer's path — walking the path up to `/`,
- * where a preview document's own claim sits. A module fetch carries the
+ * where a pod's own claim sits. A module fetch carries the
  * *importing* module as its referrer, so the frame's graph is only the host's
  * while every module in it is reserved (the frame's document is, and its first
  * imports are too, but each deeper module refers to an unreserved one). Without
  * this, the second load of the frame — the handshake retry, a reload, a second
  * tab — has its modules answered by the app's own dev server. */
-export const POD_HOST_DEV_PATHS = [
-  "/src/",
-  "/poder-dist/",
-  "/node_modules/",
-] as const;
+export const POD_HOST_DEV_PATHS = ["/src/", "/node_modules/"] as const;
 
 /** Nodepod's preview bridge: the document (and its script) that registers a
  * service worker against its own origin with `swUrl` taken from the query.

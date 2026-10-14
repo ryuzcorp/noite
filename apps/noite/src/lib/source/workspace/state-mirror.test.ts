@@ -1,20 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
-import { HARNESS_STATE_DIR } from "../preview/server";
 import type {
   MirrorMutation,
   MirrorStorage,
   MirrorVolume,
 } from "./state-mirror";
-import {
-  MIRRORED_STATE_ROOT,
-  PREVIEW_STATE,
-  UNSAVED_PROJECT,
-  clearMirror,
-  mirrorStorage,
-  restoreMirror,
-  startMirror,
-} from "./state-mirror";
+import { UNSAVED_PROJECT, restoreMirror, startMirror } from "./state-mirror";
 
 const ENCODER = new TextEncoder();
 const DECODER = new TextDecoder();
@@ -112,76 +103,6 @@ const savedCopy = (): FakeVolume => {
   volume.writeFileSync("/home/project/lib/a.ts", ENCODER.encode("a"));
   return volume;
 };
-
-describe("preview state mirror", () => {
-  test("tracks the preview server's state directory", () => {
-    expect(MIRRORED_STATE_ROOT).toBe(HARNESS_STATE_DIR);
-  });
-
-  test("records writes and restores them after a reload", () => {
-    const storage = fakeStorage();
-    const before = fakeVolume();
-    const mirror = startMirror(before, PREVIEW_STATE, ID, storage);
-    put(before, "/home/.noite/s/db/do-abc.sqlite", "counter-bytes");
-    put(before, "/home/.noite/s/r2/uploads/test.txt", "hello");
-    put(before, "/home/project/index.ts", "not preview state");
-    mirror.stop();
-
-    const after = fakeVolume();
-    expect(restoreMirror(after, PREVIEW_STATE, ID, storage)).toBe(2);
-    expect(after.text("/home/.noite/s/db/do-abc.sqlite")).toBe("counter-bytes");
-    expect(after.text("/home/.noite/s/r2/uploads/test.txt")).toBe("hello");
-    expect(after.text("/home/project/index.ts")).toBe(null);
-  });
-
-  test("follows R2's write-then-rename and skips SQLite sidecars", () => {
-    const storage = fakeStorage();
-    const before = fakeVolume();
-    const mirror = startMirror(before, PREVIEW_STATE, ID, storage);
-    put(before, "/home/.noite/s/r2/uploads/data.tmp-1", "staged");
-    // A rename lands its bytes atomically: the destination reads back at
-    // the mutation, so the fake moves the bytes before emitting it.
-    before.writeFileSync(
-      "/home/.noite/s/r2/uploads/data",
-      ENCODER.encode("staged")
-    );
-    before.emit({
-      from: "/home/.noite/s/r2/uploads/data.tmp-1",
-      op: "rename",
-      to: "/home/.noite/s/r2/uploads/data",
-    });
-    put(before, "/home/.noite/s/db/d1-abc.sqlite", "committed");
-    put(before, "/home/.noite/s/db/d1-abc.sqlite-journal", "rollback-pages");
-    mirror.stop();
-
-    const after = fakeVolume();
-    restoreMirror(after, PREVIEW_STATE, ID, storage);
-    expect(after.text("/home/.noite/s/r2/uploads/data")).toBe("staged");
-    expect(after.text("/home/.noite/s/r2/uploads/data.tmp-1")).toBe(null);
-    expect(after.text("/home/.noite/s/db/d1-abc.sqlite")).toBe("committed");
-    expect(after.text("/home/.noite/s/db/d1-abc.sqlite-journal")).toBe(null);
-  });
-
-  test("a corrupt or cleared mirror restores nothing, and storage may be absent", () => {
-    const storage = fakeStorage();
-    storage.setItem(`noite:preview-state:${ID}`, "{broken");
-    expect(restoreMirror(fakeVolume(), PREVIEW_STATE, ID, storage)).toBe(0);
-
-    const volume = fakeVolume();
-    const mirror = startMirror(volume, PREVIEW_STATE, ID, storage);
-    put(volume, "/home/.noite/s/db/do-abc.sqlite", "n");
-    mirror.stop();
-    clearMirror(PREVIEW_STATE, ID, storage);
-    expect(restoreMirror(fakeVolume(), PREVIEW_STATE, ID, storage)).toBe(0);
-
-    const without = fakeVolume();
-    const none = startMirror(without, PREVIEW_STATE, ID, null);
-    put(without, "/home/.noite/s/db/do-abc.sqlite", "n");
-    none.stop();
-    expect(restoreMirror(fakeVolume(), PREVIEW_STATE, ID, null)).toBe(0);
-    expect(mirrorStorage()).toBe(null);
-  });
-});
 
 describe("unsaved project mirror", () => {
   test("an edit IndexedDB has not saved yet survives a reload", () => {

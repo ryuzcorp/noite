@@ -5,7 +5,16 @@
 //!
 //! Empty directories are not changes — git cannot commit one — and the base
 //! bytes always come from the pod's own object cache, never the network.
+//!
+//! The walk is also where a checkout's `.gitignore` applies (see
+//! `../gitignore`): a path the rules exclude is never a change — a `dist/`
+//! a Terminal build just wrote is not the panel's business — and the walk
+//! neither descends into it nor hashes it. The listing still carries those
+//! paths, because the tree is the one place that shows what git is not
+//! tracking.
 
+import { addIgnoreFile, IGNORE_FILE, isIgnored, NO_RULES } from "../gitignore";
+import type { Committed, IgnoreRules } from "../gitignore";
 import { readObject } from "./checkout";
 import { gitBlobSha, hashKey, isBinary } from "./git";
 import { PROJECT_ROOT, projectPath, relPath } from "./types";
@@ -49,19 +58,43 @@ interface RowInput {
 
 /** Every file under `dir`, and the directories that hold no file anywhere
  * under them: the tree draws those as rows of their own, because nothing else
- * would. */
+ * would. The `ignored*` lists are the paths the walk passed over — the rules
+ * exclude them — which the tree shows dimmed and no derive ever counts. */
 interface Walked {
   dirs: string[];
   files: DiskFile[];
+  ignoredDirs: string[];
+  ignoredFiles: string[];
 }
 
-/** Installed dependencies (`npm install`, the preview's installs) live in the
- * checkout but are never part of it: Nodepod doesn't persist them either. */
-const DEPENDENCY_DIR = "node_modules";
+/** The commit's own paths, as the matcher's `committed` answer. Git keeps
+ * tracking what it has committed, whatever a `.gitignore` later says about it:
+ * a committed file is never excluded, and neither is a folder that holds one
+ * (dropping it would drop the committed file off the tree with it). */
+const committedPaths = (base: BaseIndex): Committed => {
+  const files = new Set(Object.keys(base.entries));
+  const dirs = new Set<string>();
+  for (const path of files) {
+    const parts = path.split("/");
+    for (let i = 1; i < parts.length; i += 1) {
+      dirs.add(parts.slice(0, i).join("/"));
+    }
+  }
+  return (path, isDir) => (isDir ? dirs.has(path) : files.has(path));
+};
 
-/** Walk `dir` once: the files it holds at this level, then the children of
- * every folder under it (dependency folders skipped), in name order. */
-const walk = async (fs: WorkspaceFs, dir: string): Promise<Walked> => {
+/** Walk `dir` once: the files it holds at this level and the folders under it,
+ * in name order, under the rules of every `.gitignore` the walk has passed so
+ * far (a deeper file's rules win over its parents'). A folder the rules exclude
+ * is a row of its own and is not walked — git does not look inside one either,
+ * and the dependency folder is exactly the folder that would make this walk
+ * unbounded. */
+const walk = async (
+  fs: WorkspaceFs,
+  dir: string,
+  rules: IgnoreRules,
+  committed: Committed
+): Promise<Walked> => {
   const names = await fs.readdir(dir);
   const entries = await Promise.all(
     names.toSorted().map(async (name) => {
@@ -69,53 +102,87 @@ const walk = async (fs: WorkspaceFs, dir: string): Promise<Walked> => {
       return { abs, stat: await fs.stat(abs) };
     })
   );
+  // A `.gitignore` here layers over the ones above it, and is read before
+  // anything beside it is judged. Writing one is an ordinary change: the next
+  // walk reads it again, so an edit to the rules re-applies on its own.
+  const held = names.includes(IGNORE_FILE)
+    ? addIgnoreFile(
+        rules,
+        await fs.readFile(`${dir}/${IGNORE_FILE}`, "utf-8"),
+        relPath(dir)
+      )
+    : rules;
   const files: DiskFile[] = [];
   const folders: string[] = [];
+  const ignoredFiles: string[] = [];
+  const ignoredDirs: string[] = [];
   for (const entry of entries) {
+    const path = relPath(entry.abs);
     if (entry.stat.isFile) {
-      files.push({
-        mtime: entry.stat.mtime,
-        path: relPath(entry.abs),
-        size: entry.stat.size,
-      });
-    } else if (
-      entry.stat.isDirectory &&
-      !entry.abs.endsWith(`/${DEPENDENCY_DIR}`)
-    ) {
-      folders.push(entry.abs);
+      if (isIgnored(held, path, false, committed)) {
+        ignoredFiles.push(path);
+      } else {
+        files.push({ mtime: entry.stat.mtime, path, size: entry.stat.size });
+      }
+    } else if (entry.stat.isDirectory) {
+      if (isIgnored(held, path, true, committed)) {
+        ignoredDirs.push(path);
+      } else {
+        folders.push(entry.abs);
+      }
     }
   }
   const dirs: string[] = [];
   const children = await Promise.all(
-    folders.map(async (folder) => ({ folder, walked: await walk(fs, folder) }))
+    folders.map(async (folder) => ({
+      folder,
+      walked: await walk(fs, folder, held, committed),
+    }))
   );
   for (const { folder, walked } of children) {
     files.push(...walked.files);
     dirs.push(...walked.dirs);
+    ignoredFiles.push(...walked.ignoredFiles);
+    ignoredDirs.push(...walked.ignoredDirs);
     if (walked.files.length === 0) {
       dirs.push(relPath(folder));
     }
   }
-  return { dirs, files };
+  return { dirs, files, ignoredDirs, ignoredFiles };
 };
 
 /** Every file in the checkout, in path order — the same order the base index
- * keeps its keys in. */
-export const listFiles = async (fs: WorkspaceFs): Promise<DiskFile[]> => {
-  const walked = await walk(fs, PROJECT_ROOT);
+ * keeps its keys in. What the rules exclude is not in here: it is not the
+ * checkout's own content, and a path git never sees must never become a row
+ * of the Changes panel. */
+export const listFiles = async (
+  fs: WorkspaceFs,
+  base: BaseIndex
+): Promise<DiskFile[]> => {
+  const walked = await walk(fs, PROJECT_ROOT, NO_RULES, committedPaths(base));
   return walked.files.toSorted((a, b) => (a.path < b.path ? -1 : 1));
 };
 
 /** The checkout as the tree renders it: every file, plus the folders that hold
  * no file under them. A folder like that is the user's own placeholder — git
- * cannot commit one, so this listing is the only place it exists. */
+ * cannot commit one, so this listing is the only place it exists. The ignored
+ * lists come along: the tree is where a path git leaves out is still visible,
+ * dimmed, and it is the one caller that wants them. */
 export const listCheckout = async (
-  fs: WorkspaceFs
+  fs: WorkspaceFs,
+  base: BaseIndex
 ): Promise<CheckoutListing> => {
-  const { dirs, files } = await walk(fs, PROJECT_ROOT);
+  const { dirs, files, ignoredDirs, ignoredFiles } = await walk(
+    fs,
+    PROJECT_ROOT,
+    NO_RULES,
+    committedPaths(base)
+  );
   return {
     dirs: dirs.toSorted(),
     files: files.map((file) => file.path).toSorted(),
+    ignoredDirs: ignoredDirs.toSorted(),
+    ignoredFiles: ignoredFiles.toSorted(),
   };
 };
 
@@ -222,7 +289,7 @@ export const deriveChanges = async (
   state: WorkspaceState
 ): Promise<WorkspaceChange[]> => {
   const { base, cache, fs, journal } = state;
-  const disk = await listFiles(fs);
+  const disk = await listFiles(fs, base);
   const onDisk = new Set(disk.map((file) => file.path));
   // A journaled move only pairs while the file it names is where it landed and
   // the commit's copy is gone: a path that still holds its own file is a copy.

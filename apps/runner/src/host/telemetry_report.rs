@@ -573,10 +573,10 @@ mod tests {
             }
             let apps = db::list_apps(&pool).await.expect("list");
             db::set_app_asleep(&pool, &apps[0].id).await.expect("sleep");
-            db::upsert_deploy(&pool, None, &apps[0].id, "success", Some("sha1"), "")
+            db::upsert_deploy(&pool, None, &apps[0].id, None, "success", Some("sha1"), "")
                 .await
                 .expect("deploy");
-            db::upsert_deploy(&pool, None, &apps[1].id, "failed", Some("sha2"), "")
+            db::upsert_deploy(&pool, None, &apps[1].id, None, "failed", Some("sha2"), "")
                 .await
                 .expect("deploy");
 

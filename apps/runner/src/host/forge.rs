@@ -329,25 +329,99 @@ pub async fn publish_ref(
     if !valid_branch_name(branch) {
         bail!("invalid branch name {branch:?}");
     }
+    publish_refname(
+        state,
+        app,
+        &format!("refs/heads/{branch}"),
+        expected_old,
+        new,
+    )
+    .await
+}
+
+/// [`publish_ref`] for a full ref name: `refs/heads/<branch>` (a branch) or
+/// `refs/previews/<userId>/<branch>` (a workspace preview's hidden ref, which
+/// is never advertised or browsed). Anything else is refused.
+pub async fn publish_refname(
+    state: &AppState,
+    app: &App,
+    refname: &str,
+    expected_old: Option<&str>,
+    new: Option<&str>,
+) -> anyhow::Result<()> {
+    if !publishable_ref(refname) {
+        bail!("invalid ref name {refname:?}");
+    }
     if new.is_none() && expected_old.is_none() {
-        bail!("nothing to publish for {branch}");
+        bail!("nothing to publish for {refname}");
     }
     // Serialize with pushes and other server-side ref moves.
     let _push_guard = state.git_sync.push_guard(&app.slug).await;
     let bare = read_mirror(state, &app.slug).await?;
-    let refname = format!("refs/heads/{branch}");
+    if refname.starts_with(crate::host::git_http::PREVIEW_REF_PREFIX) {
+        // A mirror hydrated before preview environments existed has no hidden
+        // refs configured yet, and this is the first write that can create
+        // one.
+        hide_preview_refs(&bare).await;
+    }
     let before = list_refs(&bare).await?;
-    cas_update(&bare, &refname, expected_old, new).await?;
-    let Some(tip) = after_receive(state, app, &bare, &before).await? else {
-        return Ok(());
-    };
+    cas_update(&bare, refname, expected_old, new).await?;
+    let moved = after_receive(state, app, &bare, &before).await?;
+    crate::host::env_teardown::on_refs_deleted(state, app, &moved.deleted).await;
     if !app.is_stopped() {
-        let _ = state.tip_tx.send(crate::host::tips::TipNotify {
-            app_id: app.id.clone(),
-            tip,
-        });
+        for tip in &moved.tips {
+            let _ = state.tip_tx.send(crate::host::tips::TipNotify {
+                app_id: app.id.clone(),
+                git_ref: tip.git_ref.clone(),
+                tip: tip.bundle.clone(),
+            });
+        }
     }
     Ok(())
+}
+
+/// A ref a server-side move may write: a branch, or a workspace preview's
+/// hidden ref (`refs/previews/<userId>/<branch>`).
+pub fn publishable_ref(refname: &str) -> bool {
+    match refname.strip_prefix("refs/heads/") {
+        Some(branch) => valid_branch_name(branch),
+        None => match refname.strip_prefix(crate::host::git_http::PREVIEW_REF_PREFIX) {
+            Some(rest) => {
+                let (user, branch) = rest.split_once('/').unwrap_or_default();
+                !user.is_empty()
+                    && user.len() <= 64
+                    && valid_branch_name(branch)
+                    && !user.contains('/')
+            }
+            None => false,
+        },
+    }
+}
+
+/// Make `refs/previews/*` invisible to every git client of this mirror: a
+/// clone or `ls-refs` never advertises them, and a fetch of one is refused.
+/// Idempotent (a plain config write) and cheap, so it runs on repo init and on
+/// the first preview ref written into an older mirror.
+pub async fn hide_preview_refs(bare: &Path) {
+    let git_dir = format!("--git-dir={}", bare.display());
+    for key in ["uploadpack.hideRefs", "transfer.hideRefs"] {
+        if let Err(e) = exec::run_cmd(
+            "git",
+            &[
+                &git_dir,
+                "config",
+                key,
+                crate::host::git_http::PREVIEW_REF_PREFIX,
+            ],
+            None,
+            &[],
+            Duration::from_secs(15),
+        )
+        .await
+        {
+            tracing::warn!(error = %format!("{e:#}"), "could not hide preview refs");
+        }
+    }
 }
 
 /// Compare-and-swap one head ref. Distinguishes "the ref moved" from a real
