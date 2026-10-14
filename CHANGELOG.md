@@ -8,6 +8,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.0-alpha.5] - 2026-10-14
+
+Preview environments (one deployment per branch, and Deploy preview from Code mode), resizable Code mode panes, and a pass over Code mode and pull request UX.
+
 ### Operator action required
 
 - The runner SQLite upgrades itself to **schema version 8** (the `environment` and `environment_env` tables, and `deploy.environment_id`). As before, an older image refuses newer data, so back up before upgrading.
