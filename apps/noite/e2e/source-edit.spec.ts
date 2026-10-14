@@ -90,7 +90,8 @@ test("edits to several files push as one commit from the Changes panel", async (
   await appendLine(page, "// edit on a branch");
   await expect(changed).toHaveText("1");
   await changes.click();
-  await panel.getByLabel("Commit to").selectOption("new");
+  // The option's value is a sentinel no branch name can be; pick it by label.
+  await panel.getByLabel("Commit to").selectOption({ label: "New branch…" });
   await panel.getByLabel("New branch name").fill("topic");
   await panel.getByRole("button", { exact: true, name: "Push" }).click();
   await expect(panel).toContainText("Pushed to topic.", { timeout: 30_000 });

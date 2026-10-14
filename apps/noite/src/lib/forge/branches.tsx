@@ -288,12 +288,11 @@ export const BranchPicker = ({
   const refs = refsRes.data();
   const role = appDetail(appId).data()?.myRole;
   const details = atom.lazy(newLiveRef<HTMLDetailsElement>)();
-  /** Whether the dropdown is open, declared in the JSX (and kept in step with
-   * the element's own toggling) because ilha's morph rewrites the attributes
-   * the JSX does not declare: any repaint of an ancestor — the source page
-   * repaints on every draft report and on every switch — used to close a
-   * dropdown the user had just opened. */
-  const open = atom(false);
+  // The dropdown's open state lives on the element alone: `data-morph-preserve`
+  // keeps ilha's morph off the `open` attribute, which a render does not name.
+  // Without it an ancestor's repaint — the source page repaints on every draft
+  // report and every switch — closed a dropdown the user had just opened, and
+  // a render-held copy of the state reopened one `pick` had just closed.
   const busy = atom(false);
   const failure = atom("");
   const branches = refs?.branches ?? [];
@@ -308,7 +307,6 @@ export const BranchPicker = ({
     if (element) {
       element.open = false;
     }
-    open.set(false);
     onChange(ref);
   };
   const run = async (action: () => Promise<void>): Promise<boolean> => {
@@ -329,10 +327,7 @@ export const BranchPicker = ({
   return (
     <details
       class="dropdown"
-      open={open()}
-      ontoggle={(event) => {
-        open.set(event.currentTarget.open);
-      }}
+      data-morph-preserve="open"
       ref={(el) => {
         collectRef(details, el);
       }}

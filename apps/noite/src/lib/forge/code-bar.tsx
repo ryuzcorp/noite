@@ -31,12 +31,16 @@ const ChangeBadge = ({ count }: { count: () => number }) => {
   if (changed === 0) {
     return null;
   }
+  // The badge holds the number alone; the words around it are for screen
+  // readers only ("Changes, 2 changed").
   return (
-    <span class="badge badge-xs badge-primary pointer-events-none absolute -top-1.5 -right-1.5 min-w-4 px-1 tabular-nums">
+    <>
       <span class="sr-only">, </span>
-      {changed}
+      <span class="badge badge-xs badge-primary pointer-events-none absolute -top-1.5 -right-1.5 min-w-4 px-1 tabular-nums">
+        {changed}
+      </span>
       <span class="sr-only"> changed</span>
-    </span>
+    </>
   );
 };
 

@@ -8,6 +8,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Operator action required
+
+- None.
+
+### Fixed
+
+- **Code mode's Changes panel pushed a "New branch…" commit to the browsed branch.** Picking **New branch…** and naming it still committed onto the branch you were browsing (often `main`): the target select's rework stopped sending the new branch's name. The push now creates the named branch at the browsed tip again.
+- **An environment created while production was deploying failed at once** with "another deploy of this app is in flight" and deployed nothing until the next push. A deploy with a visible queued row (creating or redeploying an environment, a workspace preview) now waits for the app's running deploy to finish instead of failing; background tip deploys still skip and are picked up by the next reconcile.
+- The branch picker stayed open after **Create**, so the next click on it closed it instead of opening it: a parent repaint wrote back a stale open state. The dropdown now owns its open state, which repaints leave alone.
+- The Changes toggle's count badge holds the number alone again; the words around it are screen-reader text.
+
+### Changed
+
+- The release gate's two e2e lanes (single-tenant and multi-tenant/isolation) run as parallel jobs instead of one after the other, so the gate takes as long as the slower lane (~11 min, was ~19). `E2E_SPECS="e2e/a.spec.ts …" make e2e` runs only those spec files locally.
+
 ## [0.1.0-alpha.5] - 2026-10-14
 
 Preview environments (one deployment per branch, and Deploy preview from Code mode), resizable Code mode panes, and a pass over Code mode and pull request UX.

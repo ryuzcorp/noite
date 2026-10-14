@@ -290,9 +290,19 @@ test("a change survives a tab restart, and Discard all clears it", async ({
   const source = `/apps/${appId}/source?file=util.ts&ref=main`;
   await page.goto(source);
   await editOpenFile(page, "// kept across a tab restart");
+  const before = page.getByRole("button", { name: /^Changes/u });
+  await expect(before.locator(".badge")).toHaveText("1");
+  // Each keystroke reaches the pod as its own write; the badge counts the file
+  // from the first one. The Changes diff is derived from the pod, so once it
+  // shows the whole line the pod holds all of it, and closing the page saves
+  // that, not a prefix still in flight.
+  await before.click();
   await expect(
-    page.getByRole("button", { name: /^Changes/u }).locator(".badge")
-  ).toHaveText("1");
+    page
+      .getByRole("complementary", { name: "Changes" })
+      .locator("span", { hasText: "// kept across a tab restart" })
+      .first()
+  ).toBeVisible();
 
   // The first page goes away entirely: its pod is handed back to IndexedDB and
   // its lock released, so the fresh page in this context reopens it editable.

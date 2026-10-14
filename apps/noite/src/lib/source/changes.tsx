@@ -237,9 +237,12 @@ const CommitForm = ({
         const text = message().trim() || defaultMessage(current);
         const request: PushRequest = { message: text };
         // Naming the browsed branch is the same as naming none — the commit
-        // lands there either way. Any other target names its branch: one the
-        // runner grows from its own tip, or one it creates at the browsed tip.
-        if (into !== NEW_BRANCH && into !== branch) {
+        // lands there either way. A new branch names itself, and the runner
+        // creates it at the browsed tip; any other target names its branch,
+        // which the runner grows from its own tip.
+        if (into === NEW_BRANCH) {
+          request.branch = branchName;
+        } else if (into !== branch) {
           request.branch = into;
         }
         lastMessage.set(text);
