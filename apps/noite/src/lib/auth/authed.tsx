@@ -47,6 +47,11 @@ export const Authed = ({
   const returning = atom(false);
   const returnError = atom("");
   watch.once(async ({ signal }) => {
+    if (typeof window === "undefined") {
+      // SSR: the session resolves client-side (resources never fetch on
+      // the server); the gate paints its fallback until hydration lands.
+      return;
+    }
     // Wait for the first answer however long it takes: refetch() joins
     // the in-flight request, so a slow get-session never counts against
     // the retry budget below (sleeping through it bounced real users).
@@ -67,7 +72,7 @@ export const Authed = ({
       // oxlint-disable-next-line eslint/no-await-in-loop -- same poll cycle: sleep, then re-read
       await res.refetch();
     }
-    if (!signal.aborted && !res.data()?.user && typeof window !== "undefined") {
+    if (!signal.aborted && !res.data()?.user) {
       router.visit("/login");
     }
   });

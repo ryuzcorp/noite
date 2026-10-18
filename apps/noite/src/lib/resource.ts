@@ -172,6 +172,12 @@ export const tracked = <T>(
   const error = atom<unknown>(undefined);
   const loading = atom<boolean>(true);
   watch.once(() => {
+    if (typeof document === "undefined") {
+      // SSR: never fetch through the server (a self-fetch through the
+      // public hostname fails DNS in the worker). The client's own mount
+      // kicks the key when it hydrates; SSR paints the skeleton.
+      return;
+    }
     const sub: KeySub = {
       blank: (): void => {
         data.set(undefined);

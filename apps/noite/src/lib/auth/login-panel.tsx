@@ -69,6 +69,11 @@ export const LoginPanel = () => {
     picked() ?? (invite()?.firstRun ? "register" : "signin");
 
   watch.once(async () => {
+    if (typeof window === "undefined") {
+      // SSR: the signed-in redirect resolves client-side (resources never
+      // fetch on the server); SSR paints the form.
+      return;
+    }
     const { data } = await fetchSession();
     if (data?.user) {
       router.visit(landing("/apps"));
