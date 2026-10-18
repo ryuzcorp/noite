@@ -241,6 +241,32 @@ const LATE_DEPS = [
   "typescript-ls",
 ] as const;
 
+/** Deps the `void_worker` environment reaches while SSR-rendering and serving
+ * API routes. The worker env optimizes lazily like the client did before
+ * `LATE_DEPS`: the first request to touch one re-optimizes that environment
+ * and reloads the worker mid-boot, so a cold start serves 500s until the
+ * discoveries settle. Naming them here prebundles the worker up front, so a
+ * cold boot does no re-optimization. The set mirrors what the dev log reports
+ * as `(void_worker) dependencies optimized` on a cold boot; extend it the
+ * same way when a new server import shows up there. */
+const WORKER_DEPS = [
+  "@better-auth/api-key/client",
+  "@better-auth/passkey/client",
+  "@data-slot/resizable",
+  "@effect/sql-d1",
+  "better-auth/client",
+  "better-auth/client/plugins",
+  "effect/Cache",
+  "effect/Effect",
+  "effect/Schema",
+  "effect/reactivity/Atom",
+  "effect/sql/SqlClient",
+  "kysely",
+  "kysely-d1",
+  "paranorm",
+  "scule",
+] as const;
+
 /** Nodepod's Vite plugin, scoped to the client environment. Its
  * `generateBundle` has no environment filter, so as-is it also drops the four
  * runtime assets into the SSR output (`dist/ssr`), which celld never serves —
@@ -363,6 +389,9 @@ const nodepodSideEffects = (): Plugin => ({
 
 export default defineConfig({
   define: { __CONTROL_BUILD__: JSON.stringify(controlBuild()) },
+  environments: {
+    void_worker: { optimizeDeps: { include: [...WORKER_DEPS] } },
+  },
   optimizeDeps: { include: [...LATE_DEPS] },
   plugins: [
     crossOriginIsolation(),
