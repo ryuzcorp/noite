@@ -18,14 +18,8 @@ import {
 } from "../collaborators";
 import { orm, withDb } from "../db";
 import { parseAppRole } from "../roles";
-import {
-  action,
-  fail,
-  useEnv,
-  useRequest,
-  withSchema,
-} from "../server-context";
-import { AuthError, sessionUser } from "./session.server";
+import { apiAction, apiActionNoInput, fail } from "./api";
+import { sessionUser } from "./session.server";
 
 const AppId = Schema.String;
 
@@ -46,22 +40,23 @@ const RemoveCollaborator = Schema.Struct({
   userId: Schema.String,
 });
 
-export const listCollaborators = action(
-  withSchema(AppId, async (appId) => {
-    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
+export const listCollaborators = apiAction(
+  AppId,
+  async (appId, { env, request }) => {
+    const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "view");
     return listCollaboratorRows(appId);
-  }),
-  { error: AuthError }
+  }
 );
 
 /** Invite an email to an app. Never reveals whether the address has an
  * account: an existing collaborator's role is updated in place (they are
  * already visible in the list), anyone else gets a pending invitation they
  * accept after signing in with that address. */
-export const inviteCollaborator = action(
-  withSchema(InviteCollaborator, async ({ appId, email, role }) => {
-    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
+export const inviteCollaborator = apiAction(
+  InviteCollaborator,
+  async ({ appId, email, role }, { env, request }) => {
+    const user = await sessionUser(request, env);
     const { app } = await requireAppRole(appId, user.id, "admin");
     const nextRole = parseAppRole(role.trim().toLowerCase());
     if (nextRole === null) {
@@ -93,72 +88,68 @@ export const inviteCollaborator = action(
     } catch (error) {
       return failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 /** Invitations waiting on an app (admin only: they carry email addresses). */
-export const listPendingInvitations = action(
-  withSchema(AppId, async (appId) => {
-    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
+export const listPendingInvitations = apiAction(
+  AppId,
+  async (appId, { env, request }) => {
+    const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "admin");
     return listPendingInvites(appId);
-  }),
-  { error: AuthError }
+  }
 );
 
-export const revokeInvitation = action(
-  withSchema(
-    Schema.Struct({ appId: Schema.String, inviteId: Schema.String }),
-    async ({ appId, inviteId }) => {
-      const user = await sessionUser(useRequest(), useEnv<KitEnv>());
-      await requireAppRole(appId, user.id, "admin");
-      await withDb(revokePendingInvite(appId, inviteId));
-      return { ok: true as const };
-    }
-  ),
-  { error: AuthError }
+export const revokeInvitation = apiAction(
+  Schema.Struct({ appId: Schema.String, inviteId: Schema.String }),
+  async ({ appId, inviteId }, { env, request }) => {
+    const user = await sessionUser(request, env);
+    await requireAppRole(appId, user.id, "admin");
+    await withDb(revokePendingInvite(appId, inviteId));
+    return { ok: true as const };
+  }
 );
 
 /** Invitations addressed to the signed-in account's email. */
-export const myCollaboratorInvitations = action(
-  async () => {
-    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
+export const myCollaboratorInvitations = apiActionNoInput(
+  async ({ env, request }) => {
+    const user = await sessionUser(request, env);
     try {
       return await listInvitesForEmail(user.email);
     } catch (error) {
       return failUnknown(error);
     }
-  },
-  { error: AuthError }
+  }
 );
 
 /** Accept an invitation: the grant is created for the session account only
  * when the invitation is addressed to its email. */
-export const acceptInvitation = action(
-  withSchema(Schema.String, async (inviteId) => {
-    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
+export const acceptInvitation = apiAction(
+  Schema.String,
+  async (inviteId, { env, request }) => {
+    const user = await sessionUser(request, env);
     const accepted = await acceptPendingInvite(inviteId, user.email, user.id);
     if (!accepted) {
       return fail("Invitation not found");
     }
     return { appId: accepted.appId, ok: true as const };
-  }),
-  { error: AuthError }
+  }
 );
 
-export const declineInvitation = action(
-  withSchema(Schema.String, async (inviteId) => {
-    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
+export const declineInvitation = apiAction(
+  Schema.String,
+  async (inviteId, { env, request }) => {
+    const user = await sessionUser(request, env);
     await withDb(declinePendingInvite(inviteId, user.email));
     return { ok: true as const };
-  }),
-  { error: AuthError }
+  }
 );
 
-export const updateCollaboratorRole = action(
-  withSchema(UpdateCollaborator, async ({ appId, userId, role }) => {
-    const actor = await sessionUser(useRequest(), useEnv<KitEnv>());
+export const updateCollaboratorRole = apiAction(
+  UpdateCollaborator,
+  async ({ appId, userId, role }, { env, request }) => {
+    const actor = await sessionUser(request, env);
     await requireAppRole(appId, actor.id, "admin");
     const nextRole = parseAppRole(role.trim().toLowerCase());
     if (nextRole === null) {
@@ -190,13 +181,13 @@ export const updateCollaboratorRole = action(
       return fail(err);
     }
     return { ok: true as const };
-  }),
-  { error: AuthError }
+  }
 );
 
-export const removeCollaborator = action(
-  withSchema(RemoveCollaborator, async ({ appId, userId }) => {
-    const actor = await sessionUser(useRequest(), useEnv<KitEnv>());
+export const removeCollaborator = apiAction(
+  RemoveCollaborator,
+  async ({ appId, userId }, { env, request }) => {
+    const actor = await sessionUser(request, env);
     await requireAppRole(appId, actor.id, "admin");
     const err = await withDb(
       Effect.gen(function* run() {
@@ -220,6 +211,5 @@ export const removeCollaborator = action(
       return fail(err);
     }
     return { ok: true as const };
-  }),
-  { error: AuthError }
+  }
 );

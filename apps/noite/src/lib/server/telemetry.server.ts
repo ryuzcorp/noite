@@ -6,8 +6,8 @@ import { SqlClient } from "effect/sql/SqlClient";
 import { failUnknown } from "../auth";
 import { withDb } from "../db";
 import { runnerTelemetryGet, runnerTelemetrySet } from "../runner";
-import { action, useEnv, useRequest, withSchema } from "../server-context";
-import { AuthError, requireControlAdmin } from "./session.server";
+import { apiAction, apiActionNoInput } from "./api";
+import { requireControlAdmin } from "./session.server";
 
 /** Accounts on this instance, for the runner's bucketed `users` heartbeat
  * property. Served to the runner by `GET /internal/telemetry-facts`. */
@@ -23,30 +23,27 @@ export const countControlUsers = (): Promise<number> =>
 /** The telemetry opt-out state behind the `/account` admin section. A real
  * instance admin only, never an impersonated session: the runner takes any
  * bearer call, so the gate has to live here. */
-export const getTelemetry = action(
-  async () => {
-    await requireControlAdmin(useRequest(), useEnv<KitEnv>());
-    try {
-      return await runnerTelemetryGet();
-    } catch (error) {
-      return failUnknown(error);
-    }
-  },
-  { error: AuthError }
-);
+export const getTelemetry = apiActionNoInput(async ({ env, request }) => {
+  await requireControlAdmin(request, env);
+  try {
+    return await runnerTelemetryGet();
+  } catch (error) {
+    return failUnknown(error);
+  }
+});
 
 const SetTelemetry = Schema.Struct({ enabled: Schema.Boolean });
 
 /** Store the preference; the runner keeps it even while the setting is locked
  * (effective stays disabled). Same admin gate as the read. */
-export const setTelemetry = action(
-  withSchema(SetTelemetry, async ({ enabled }) => {
-    await requireControlAdmin(useRequest(), useEnv<KitEnv>());
+export const setTelemetry = apiAction(
+  SetTelemetry,
+  async ({ enabled }, { env, request }) => {
+    await requireControlAdmin(request, env);
     try {
       return await runnerTelemetrySet(enabled);
     } catch (error) {
       return failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );

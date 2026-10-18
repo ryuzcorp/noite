@@ -5,7 +5,6 @@
  * delete is `admin` (contract §"Forge read RPCs").
  */
 import * as Schema from "effect/Schema";
-import type { Mutable } from "effect/Types";
 
 import { requireAppRole } from "../collaborators";
 import {
@@ -16,8 +15,8 @@ import {
   runnerGitLog,
   runnerGitRefs,
 } from "../runner";
-import { action, useEnv, useRequest, withSchema } from "../server-context";
-import { AuthError, requireViewApp, sessionUser } from "./session.server";
+import { apiAction } from "./api";
+import { requireViewApp, sessionUser } from "./session.server";
 
 const GitRefsArgs = Schema.Struct({ appId: Schema.String });
 const GitLogArgs = Schema.Struct({
@@ -27,8 +26,6 @@ const GitLogArgs = Schema.Struct({
   ref: Schema.optional(Schema.String),
   skip: Schema.optional(Schema.Number),
 });
-/** What `gitLog` takes; optional fields are omitted, never `undefined`. */
-export type GitLogInput = Mutable<typeof GitLogArgs.Type>;
 const GitCommitArgs = Schema.Struct({
   appId: Schema.String,
   sha: Schema.String,
@@ -49,57 +46,57 @@ const GitBranchDeleteArgs = Schema.Struct({
 });
 
 /** Branches with their tip, last commit and ahead/behind vs main. */
-export const gitRefs = action(
-  withSchema(GitRefsArgs, async ({ appId }) => {
-    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
+export const gitRefs = apiAction(
+  GitRefsArgs,
+  async ({ appId }, { env, request }) => {
+    await requireViewApp(request, env, appId);
     return runnerGitRefs(appId);
-  }),
-  { error: AuthError }
+  }
 );
 
 /** One page of a ref's history, optionally scoped to a path. */
-export const gitLog = action(
-  withSchema(GitLogArgs, async ({ appId, limit, path, ref, skip }) => {
-    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
+export const gitLog = apiAction(
+  GitLogArgs,
+  async ({ appId, limit, path, ref, skip }, { env, request }) => {
+    await requireViewApp(request, env, appId);
     return runnerGitLog(appId, { limit, path, ref, skip });
-  }),
-  { error: AuthError }
+  }
 );
 
 /** One commit with its first-parent diff. */
-export const gitCommit = action(
-  withSchema(GitCommitArgs, async ({ appId, sha }) => {
-    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
+export const gitCommit = apiAction(
+  GitCommitArgs,
+  async ({ appId, sha }, { env, request }) => {
+    await requireViewApp(request, env, appId);
     return runnerGitCommit(appId, sha);
-  }),
-  { error: AuthError }
+  }
 );
 
 /** Merge-base, `base..head` commits, three-dot diff and mergeability. */
-export const gitCompare = action(
-  withSchema(GitCompareArgs, async ({ appId, base, head }) => {
-    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
+export const gitCompare = apiAction(
+  GitCompareArgs,
+  async ({ appId, base, head }, { env, request }) => {
+    await requireViewApp(request, env, appId);
     return runnerGitCompare(appId, base, head);
-  }),
-  { error: AuthError }
+  }
 );
 
 /** Create a branch from a ref or SHA (push-gated). */
-export const gitBranchCreate = action(
-  withSchema(GitBranchCreateArgs, async ({ appId, from, name }) => {
-    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
+export const gitBranchCreate = apiAction(
+  GitBranchCreateArgs,
+  async ({ appId, from, name }, { env, request }) => {
+    const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "push");
     return runnerGitBranchCreate(appId, name, from);
-  }),
-  { error: AuthError }
+  }
 );
 
 /** Delete a branch (admin only; the runner refuses `main`). */
-export const gitBranchDelete = action(
-  withSchema(GitBranchDeleteArgs, async ({ appId, name }) => {
-    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
+export const gitBranchDelete = apiAction(
+  GitBranchDeleteArgs,
+  async ({ appId, name }, { env, request }) => {
+    const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "admin");
     return runnerGitBranchDelete(appId, name);
-  }),
-  { error: AuthError }
+  }
 );

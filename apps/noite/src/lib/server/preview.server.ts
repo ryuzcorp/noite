@@ -7,8 +7,8 @@ import {
   previewBase,
   previewOrigin,
 } from "../preview-host";
-import { action, useEnv, useRequest, withSchema } from "../server-context";
-import { AuthError, sessionUser } from "./session.server";
+import { apiAction, fail } from "./api";
+import { sessionUser } from "./session.server";
 
 const PreviewOriginArgs = Schema.Struct({ appId: Schema.String });
 
@@ -20,10 +20,9 @@ const PreviewOriginArgs = Schema.Struct({ appId: Schema.String });
  * `https://app-0.preview.<slug>.noite.local`. Refuses a secure page with a
  * plain http pod host (`PREVIEW_MIXED_CONTENT_MESSAGE`) instead of an
  * origin that cannot connect. */
-export const sourcePreviewOrigin = action(
-  withSchema(PreviewOriginArgs, async ({ appId }) => {
-    const env = useEnv<KitEnv>();
-    const request = useRequest();
+export const sourcePreviewOrigin = apiAction(
+  PreviewOriginArgs,
+  async ({ appId }, { env, request }) => {
     const user = await sessionUser(request, env);
     const { app } = await requireAppRole(appId, user.id, "view");
     const url = new URL(request.url);
@@ -43,11 +42,10 @@ export const sourcePreviewOrigin = action(
     const origin = previewOrigin(app.slug, base, port);
     // Fail closed: a localhost pod host is plain http, which browsers
     // block inside a secure page as mixed content. The action surfaces the
-    // message through `failUnknown`, and the browser shows it verbatim.
+    // message through `fail`, and the browser shows it verbatim.
     if (scheme === "https" && origin.startsWith("http://")) {
-      throw new Error(PREVIEW_MIXED_CONTENT_MESSAGE);
+      fail(PREVIEW_MIXED_CONTENT_MESSAGE);
     }
     return { previewOrigin: origin };
-  }),
-  { error: AuthError }
+  }
 );

@@ -4,8 +4,8 @@ import { failUnknown } from "../auth";
 import { requireAppRole } from "../collaborators";
 import { isControlApp } from "../control-app";
 import { runnerGetError, runnerSetErrorStatus } from "../runner";
-import { action, useEnv, useRequest, withSchema } from "../server-context";
-import { AuthError, requireControlAdmin, sessionUser } from "./session.server";
+import { apiAction } from "./api";
+import { requireControlAdmin, sessionUser } from "./session.server";
 
 const ErrorStatusSchema = Schema.Union([
   Schema.Literal("open"),
@@ -28,39 +28,41 @@ const ErrorStatusArgs = Schema.Struct({
  * control D1; every other app keeps its collaborator role. One function, so
  * the two paths cannot drift. */
 const requireTelemetryRole = async (
+  request: Request,
+  env: KitEnv,
   appId: string,
   need: "view" | "push"
 ): Promise<void> => {
   if (isControlApp(appId)) {
-    await requireControlAdmin(useRequest(), useEnv<KitEnv>());
+    await requireControlAdmin(request, env);
     return;
   }
-  const user = await sessionUser(useRequest(), useEnv<KitEnv>());
+  const user = await sessionUser(request, env);
   await requireAppRole(appId, user.id, need);
 };
 
 /** One error with its recent occurrences (stack, request, trace logs). */
-export const errorDetail = action(
-  withSchema(ErrorArgs, async ({ appId, fingerprint }) => {
-    await requireTelemetryRole(appId, "view");
+export const errorDetail = apiAction(
+  ErrorArgs,
+  async ({ appId, fingerprint }, { env, request }) => {
+    await requireTelemetryRole(request, env, appId, "view");
     try {
       return await runnerGetError(appId, fingerprint);
     } catch (error) {
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 /** Resolve, ignore or reopen an error — anyone who can push can triage. */
-export const setErrorStatus = action(
-  withSchema(ErrorStatusArgs, async ({ appId, fingerprint, status }) => {
-    await requireTelemetryRole(appId, "push");
+export const setErrorStatus = apiAction(
+  ErrorStatusArgs,
+  async ({ appId, fingerprint, status }, { env, request }) => {
+    await requireTelemetryRole(request, env, appId, "push");
     try {
       return await runnerSetErrorStatus(appId, fingerprint, status);
     } catch (error) {
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );

@@ -8,7 +8,7 @@ import {
 import type { SessionUser } from "../auth";
 import { isInstanceAdmin, requireAppRole } from "../collaborators";
 import { ensureDbPromise } from "../db";
-import { fail } from "../server-context";
+import { fail } from "./api";
 import { controlAccessRefusal } from "./control-d1.server";
 
 /** The error union every session-gated action declares: a caller is either

@@ -1,5 +1,6 @@
 import * as Schema from "effect/Schema";
 
+import type { AppDetail, SlugCheck } from "../api-types";
 import type { CreateSourceInput } from "../apps/create-source";
 import { TEMPLATES } from "../apps/templates";
 import { failUnknown, UnauthorizedError } from "../auth";
@@ -21,14 +22,8 @@ import {
   runnerRollback,
 } from "../runner";
 import type { RunnerApp, RunnerCreateSource } from "../runner";
-import {
-  action,
-  fail,
-  useEnv,
-  useRequest,
-  withSchema,
-} from "../server-context";
-import { AuthError, requireViewApp, sessionUser } from "./session.server";
+import { apiAction, fail } from "./api";
+import { requireViewApp, sessionUser } from "./session.server";
 
 const CreateSource = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("blank") }),
@@ -84,27 +79,14 @@ const freeVariant = (
   return null;
 };
 
-/** What the create form shows under its Slug field while you type. */
-export interface SlugCheck {
-  /** Why the slug cannot be used, or null when it is free. */
-  error: string | null;
-  /** The git remote it would get; empty when the instance has no public git
-   * base configured. */
-  gitRemote: string;
-  /** `<slug>.<BASE_DOMAIN>`: the host the app is served on. */
-  host: string;
-  /** A free variant to offer when the slug is taken. */
-  suggestion: string | null;
-}
-
 /** Check a slug before create: shape, reserved names, and whether an app
  * already holds it (slugs are instance-wide: one hostname per slug), plus the
  * addresses it would get. A slug's existence is already public — it is a
  * hostname — so answering "taken" leaks nothing a request to it would not. */
-export const slugCheck = action(
-  withSchema(Schema.Struct({ slug: Schema.String }), async ({ slug }) => {
-    const env = useEnv<KitEnv>();
-    await sessionUser(useRequest(), env);
+export const slugCheck = apiAction(
+  Schema.Struct({ slug: Schema.String }),
+  async ({ slug }, { env, request }) => {
+    await sessionUser(request, env);
     const normalized = slug.trim().toLowerCase();
     const gitBase = (env?.GIT_PUBLIC_BASE ?? "").replace(/\/+$/u, "");
     const result: SlugCheck = {
@@ -127,8 +109,7 @@ export const slugCheck = action(
       failUnknown(error);
     }
     return result;
-  }),
-  { error: AuthError }
+  }
 );
 
 /** The account a create runs for — the session user, or the API-key owner on
@@ -198,9 +179,10 @@ export const createAppForUser = async (input: {
   return app;
 };
 
-export const create = action(
-  withSchema(CreateApp, async ({ name, slug, source }) => {
-    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
+export const create = apiAction(
+  CreateApp,
+  async ({ name, slug, source }, { env, request }) => {
+    const user = await sessionUser(request, env);
     const trimmedName = name.trim();
     const normalized = slug.trim().toLowerCase();
     if (!trimmedName) {
@@ -224,65 +206,55 @@ export const create = action(
       }
       return failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 /** Retry a failed GitHub/template import (A2) with the source stored on the
  * app row: the app page offers this whenever the import ended in `error`. */
-export const retryImport = action(
-  withSchema(AppId, async (appId) => {
-    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
-    await requireAppRole(appId, user.id, "push");
-    try {
-      return await runnerRetryImport(appId);
-    } catch (error) {
-      failUnknown(error);
-    }
-  }),
-  { error: AuthError }
-);
+export const retryImport = apiAction(AppId, async (appId, { env, request }) => {
+  const user = await sessionUser(request, env);
+  await requireAppRole(appId, user.id, "push");
+  try {
+    return await runnerRetryImport(appId);
+  } catch (error) {
+    failUnknown(error);
+  }
+});
 
-export const remove = action(
-  withSchema(AppId, async (appId) => {
-    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
-    await requireAppRole(appId, user.id, "admin");
+export const remove = apiAction(AppId, async (appId, { env, request }) => {
+  const user = await sessionUser(request, env);
+  await requireAppRole(appId, user.id, "admin");
+  try {
+    await runnerDeleteApp(appId);
+    // Nothing cascades grants now that the app row lives in the runner.
+    await withDb(dropAppCollaborators(appId));
+  } catch (error) {
+    if (error instanceof UnauthorizedError) {
+      throw error;
+    }
+    failUnknown(error);
+  }
+});
+export const setDesired = apiAction(
+  Schema.Struct({ desiredState: Schema.String, id: Schema.String }),
+  async ({ id, desiredState }, { env, request }) => {
+    if (desiredState !== "running" && desiredState !== "stopped") {
+      fail("desiredState must be running or stopped");
+    }
+    const user = await sessionUser(request, env);
+    await requireAppRole(id, user.id, "push");
     try {
-      await runnerDeleteApp(appId);
-      // Nothing cascades grants now that the app row lives in the runner.
-      await withDb(dropAppCollaborators(appId));
+      // SAFETY: desiredState is validated above to be exactly "running" | "stopped" before this cast.
+      await runnerPatchApp(id, {
+        desiredState: desiredState as "running" | "stopped",
+      });
     } catch (error) {
       if (error instanceof UnauthorizedError) {
         throw error;
       }
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
-);
-export const setDesired = action(
-  withSchema(
-    Schema.Struct({ desiredState: Schema.String, id: Schema.String }),
-    async ({ id, desiredState }) => {
-      if (desiredState !== "running" && desiredState !== "stopped") {
-        fail("desiredState must be running or stopped");
-      }
-      const user = await sessionUser(useRequest(), useEnv<KitEnv>());
-      await requireAppRole(id, user.id, "push");
-      try {
-        // SAFETY: desiredState is validated above to be exactly "running" | "stopped" before this cast.
-        await runnerPatchApp(id, {
-          desiredState: desiredState as "running" | "stopped",
-        });
-      } catch (error) {
-        if (error instanceof UnauthorizedError) {
-          throw error;
-        }
-        failUnknown(error);
-      }
-    }
-  ),
-  { error: AuthError }
+  }
 );
 
 const RenameApp = Schema.Struct({
@@ -293,8 +265,9 @@ const RenameApp = Schema.Struct({
 
 /** Rename an app (display name and/or slug). Admin-gated; a slug change
  * moves the subdomain, git remote, and fleet data via the runner op. */
-export const renameApp = action(
-  withSchema(RenameApp, async ({ id, name, slug }) => {
+export const renameApp = apiAction(
+  RenameApp,
+  async ({ id, name, slug }, { env, request }) => {
     const trimmedName = name?.trim() || undefined;
     const normalized = slug?.trim().toLowerCase() || undefined;
     if (!trimmedName && !normalized) {
@@ -304,7 +277,7 @@ export const renameApp = action(
     if (slugProblem) {
       fail(slugProblem);
     }
-    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
+    const user = await sessionUser(request, env);
     await requireAppRole(id, user.id, "admin");
     try {
       await runnerRenameApp(id, { name: trimmedName, slug: normalized });
@@ -314,13 +287,13 @@ export const renameApp = action(
       }
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
-export const get = action(
-  withSchema(AppId, async (appId) => {
-    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
+export const get = apiAction(
+  AppId,
+  async (appId, { env, request }): Promise<AppDetail> => {
+    const user = await sessionUser(request, env);
     const { app, role } = await requireAppRole(appId, user.id, "view");
     const git = await runnerGitRemote(appId);
     return {
@@ -332,8 +305,7 @@ export const get = action(
       s3Endpoint: git.endpoint,
       username: git.username,
     };
-  }),
-  { error: AuthError }
+  }
 );
 
 const RollbackArgs = Schema.Struct({
@@ -344,17 +316,17 @@ const RollbackArgs = Schema.Struct({
 /** Rollback to a previous successful deploy sha (push-gated): re-runs
  * the pipeline at the old tip bundle. Progress follows on the deploys
  * stream like a normal deploy. */
-export const rollback = action(
-  withSchema(RollbackArgs, async ({ appId, sha }) => {
-    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
+export const rollback = apiAction(
+  RollbackArgs,
+  async ({ appId, sha }, { env, request }) => {
+    const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "push");
     try {
       return await runnerRollback(appId, sha);
     } catch (error) {
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 const DeployLogArgs = Schema.Struct({
@@ -364,14 +336,14 @@ const DeployLogArgs = Schema.Struct({
 
 /** One finished deploy's build log (view-gated): the stream omits finished
  * rows' logs, so the panel fetches them on demand per deploy id. */
-export const deployLog = action(
-  withSchema(DeployLogArgs, async ({ appId, deployId }) => {
-    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
+export const deployLog = apiAction(
+  DeployLogArgs,
+  async ({ appId, deployId }, { env, request }) => {
+    await requireViewApp(request, env, appId);
     try {
       return await runnerDeployLog(appId, deployId);
     } catch (error) {
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
