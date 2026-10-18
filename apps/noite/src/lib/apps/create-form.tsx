@@ -4,6 +4,7 @@
 //! Cancel / Create footer; the Slug row checks the slug while you type and
 //! shows the URL and git remote it would get.
 
+import { Link, useRouter } from "@ilha/void";
 import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
@@ -12,7 +13,6 @@ import type { SlugCheck } from "../api-types";
 import { formatBytes } from "../bytes";
 import { commitSource } from "../commit-source";
 import { errorMessage } from "../errors";
-import { navigate } from "../navigation";
 import { readDroppedItems } from "../source/uploads";
 import {
   ArrowUpRight,
@@ -29,14 +29,12 @@ import type { ProjectUpload } from "./folder-drop";
 import { appUrl, slugifyName } from "./identity";
 import { TEMPLATES } from "./templates";
 
-// The Void form story for this page: the create endpoint answers the 422
-// `{errors}` shape every Void form reads, and the pending guard below
-// replaces oxidejs's mutation queue — while a create is in flight the button
-// is disabled and a re-submit returns early, so a double submit creates one
-// app. Offline replay and cross-reload persistence (what the queue added)
-// wait for the pages slice's `useForm` adoption: a successful create must
-// navigate with the new id (and possibly commit an upload first), not reload
-// like `useIslandForm` does.
+// Submitting posts straight to the JSON action (`api()`), guarded while a
+// create is in flight: the button is disabled and a re-submit returns early,
+// so a double submit creates one app. `useForm` does not fit here — it posts
+// to a page action and refreshes page props, but a create must read the new
+// id from the response (and possibly commit an upload first) before
+// navigating to the new app.
 
 const MODES = [
   {
@@ -381,9 +379,9 @@ const CreateNotice = ({
           {stranded ? (
             <>
               {" "}
-              <a href={`/apps/${stranded}`} class="link">
+              <Link href={`/apps/${stranded}`} class="link">
                 Open the app
-              </a>
+              </Link>
             </>
           ) : null}
         </span>
@@ -392,6 +390,7 @@ const CreateNotice = ({
   ) : null;
 
 export const CreateAppForm = () => {
+  const router = useRouter();
   const notice = atom<string | null>(null);
   const busy = atom(false);
   const mode = atom<ModeId>("blank");
@@ -674,7 +673,7 @@ export const CreateAppForm = () => {
     // A blank app's next step is a push, which its Overview explains; an
     // upload, import or template is already building, which Deployments
     // shows.
-    navigate(
+    router.visit(
       source.kind === "blank" && !upload
         ? `/apps/${createdId}`
         : `/apps/${createdId}?t=deployments`
@@ -920,9 +919,9 @@ export const CreateAppForm = () => {
         <CreateNotice message={notice()} stranded={stranded()} />
 
         <footer class="border-base-300 bg-base-200/50 dark:bg-base-300/40 flex items-center justify-end gap-2 border-t px-6 py-3">
-          <a href="/apps" class="btn btn-ghost btn-sm">
+          <Link href="/apps" class="btn btn-ghost btn-sm">
             Cancel
-          </a>
+          </Link>
           <button
             type="submit"
             class="btn btn-neutral btn-sm"

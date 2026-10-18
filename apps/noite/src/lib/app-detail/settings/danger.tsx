@@ -1,5 +1,6 @@
 //! Settings panel: the two destructive app actions (change slug, delete).
 
+import { useRouter } from "@ilha/void";
 import { atom } from "ilha";
 import type { View } from "ilha";
 
@@ -7,7 +8,6 @@ import { api } from "../../api";
 import { appHost } from "../../apps/identity";
 import { errorMessage } from "../../errors";
 import { dropAppFromSnapshot } from "../../feeds";
-import { navigate } from "../../navigation";
 import { confirmDialog } from "../../ui/confirm";
 import { Dialog } from "../../ui/dialog";
 import { SettingsSection } from "./section";
@@ -84,6 +84,7 @@ export const AppDangerZone = ({
   slug: string;
   subdomain: string;
 }) => {
+  const router = useRouter();
   const dialogOpen = atom(false);
   const slugDraft = atom(slug);
   const slugErr = atom("");
@@ -174,7 +175,7 @@ export const AppDangerZone = ({
               try {
                 await api<{ ok: true }>("/api/apps/remove", appId);
                 dropAppFromSnapshot(appId);
-                navigate("/apps");
+                router.visit("/apps");
               } catch (error) {
                 notice.set(errorMessage(error));
               }

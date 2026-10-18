@@ -6,6 +6,7 @@
 //! The runner enforces the app role on every call; this only mirrors it in the
 //! UI (create/redeploy/overrides = `push`, public toggle/delete = `admin`).
 
+import { Link } from "@ilha/void";
 import { atom, watch } from "ilha";
 import type { AtomHandle, View } from "ilha";
 
@@ -83,13 +84,13 @@ export const DeployGroupMeta = ({
       <span class="sr-only">{status}</span>
     </span>
     {sha ? (
-      <a
+      <Link
         class="link link-hover text-base-content/70 font-mono text-xs"
         href={commitHref(appId, sha)}
         title={sha}
       >
         {shortSha(sha)}
-      </a>
+      </Link>
     ) : (
       <span class="text-base-content/60 text-xs">not deployed</span>
     )}

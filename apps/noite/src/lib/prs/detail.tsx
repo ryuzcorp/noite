@@ -1,5 +1,7 @@
 /** Pull-request detail: header (title, state and the Close/Merge actions),
  * the review box, and the Conversation/Files tabs. */
+import { Link } from "@ilha/void";
+
 import { environmentUrl } from "../apps/identity";
 import { formatDateTime } from "../dates";
 import { shortSha } from "../forge/format";
@@ -211,23 +213,23 @@ export const PrDetailView = ({
             {nameFor(names, pullRequest.authorId)} wants to merge
           </span>
           <span class="font-mono text-xs">
-            <a
+            <Link
               class="link link-hover"
               href={`/apps/${appId}/source?ref=${encodeURIComponent(pullRequest.head)}`}
             >
               {pullRequest.head}
-            </a>{" "}
+            </Link>{" "}
             into{" "}
-            <a
+            <Link
               class="link link-hover"
               href={`/apps/${appId}/source?ref=${encodeURIComponent(pullRequest.base)}`}
             >
               {pullRequest.base}
-            </a>
+            </Link>
           </span>
-          <a class="link link-hover text-xs" href={compareHref}>
+          <Link class="link link-hover text-xs" href={compareHref}>
             Compare
-          </a>
+          </Link>
         </div>
         {requesting.length > 0 ? (
           <p class="text-warning m-0 text-sm" role="status">

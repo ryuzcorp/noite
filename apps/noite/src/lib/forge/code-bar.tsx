@@ -2,6 +2,7 @@
  * (commit, compare): the source page's branch picker or a sub-page's link
  * back to the files on the left, the panel toggles on the right. Changes
  * only exists on the source page, where the drafts live. */
+import { Link } from "@ilha/void";
 import type { View } from "ilha";
 
 import { appDetail } from "../resources";
@@ -108,13 +109,13 @@ export const PanelToggles = ({
           {label}
         </button>
       ) : (
-        <a
+        <Link
           key={entry.id}
           class={cls}
           href={sourcePanelHref(appId, entry.id, { file, ref: gitRef })}
         >
           {label}
-        </a>
+        </Link>
       );
     })}
   </nav>
@@ -124,13 +125,13 @@ export const PanelToggles = ({
  * name, returning to the ref and file the user came from; the source page
  * itself has no back link (the sidebar lists the apps). */
 const CodeBackLink = ({ appId, from }: { appId: string; from: SourceFrom }) => (
-  <a
+  <Link
     href={`/apps/${appId}/source${sourceQuery(from)}`}
     class="link link-hover inline-flex w-fit shrink-0 items-center gap-1 text-sm opacity-70"
   >
     <ArrowLeft class="h-4 w-4" />
     <span>{appDetail(appId).data()?.app.name ?? "…"}</span>
-  </a>
+  </Link>
 );
 
 /** Layout for a page below the source page: the Code bar, then the page. */

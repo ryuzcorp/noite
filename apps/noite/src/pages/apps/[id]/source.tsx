@@ -5,7 +5,6 @@ import type { CodePanel } from "$lib/forge/code-bar";
 import { forgeRefs } from "$lib/forge/data";
 import { HistoryView } from "$lib/forge/history";
 import { collectRef, newLiveRef } from "$lib/live-ref";
-import { head, useRoute } from "$lib/navigation";
 import { PREVIEW_MIXED_CONTENT_MESSAGE } from "$lib/preview-host";
 import { appDetail } from "$lib/resources";
 import type { AppRole } from "$lib/roles";
@@ -30,6 +29,7 @@ import { SquareTerminal } from "$lib/ui/icons";
 import { createPaneGroup, MORPH_PRESERVE } from "$lib/ui/resizable";
 import { ResizeHandle } from "$lib/ui/resize-handle";
 import { SidePanel } from "$lib/ui/side-panel";
+import { useParams } from "@ilha/void";
 import * as Equal from "effect/Equal";
 import { atom, watch } from "ilha";
 import type { AtomHandle, View } from "ilha";
@@ -638,8 +638,7 @@ const SourceBody = ({ appId }: { appId: string }) => {
  * it and drop its drafts: with the id as the only prop ilha reuses the row,
  * and the body repaints through its own param reads. */
 export default function Source() {
-  const appId = useRoute().params().id;
-  head({ title: "Code · Noite" });
+  const { id: appId } = useParams();
   if (!appId) {
     return <p class="text-error">Missing app id</p>;
   }

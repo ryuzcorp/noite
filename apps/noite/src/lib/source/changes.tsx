@@ -2,6 +2,7 @@
  * the discard behind each of them, and the commit form under it (message,
  * target branch, Push). The drafts live in the browser; this reads the state
  * it reports and asks it to commit or throw away. */
+import { Link } from "@ilha/void";
 import { atom, watch } from "ilha";
 import type { AtomHandle } from "ilha";
 
@@ -156,12 +157,12 @@ const PushOutcome = ({
   return (
     <p class="m-0 text-xs opacity-70">
       Pushed to <span class="font-mono">{pushed.branch}</span>.{" "}
-      <a
+      <Link
         class="link"
         href={`/apps/${appId}/pulls/new?base=${encodeURIComponent(base)}&head=${encodeURIComponent(pushed.branch)}&title=${encodeURIComponent(title)}`}
       >
         Open a pull
-      </a>
+      </Link>
     </p>
   );
 };

@@ -1,5 +1,6 @@
 //! App page chrome and Overview: the header shown above every tab
 //! (identity, status, actions) and the Overview tab's cards.
+import { Link } from "@ilha/void";
 import { atom, watch } from "ilha";
 
 import { api } from "../api";
@@ -289,9 +290,9 @@ const FirstPushCard = ({ appId }: { appId: string }) => {
         <p class="m-0 text-xs opacity-70">
           Git asks for credentials: username <code>{info.username}</code>,
           password an API key from{" "}
-          <a href="/account" class="link">
+          <Link href="/account" class="link">
             Account
-          </a>
+          </Link>
           .
         </p>
       </div>

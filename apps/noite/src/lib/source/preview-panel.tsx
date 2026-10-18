@@ -18,6 +18,7 @@
 //! the gate's redirect both work there — `/api/env-auth` answers the cases the
 //! gate cannot, as its own small pages).
 
+import { Link } from "@ilha/void";
 import { atom, watch } from "ilha";
 import type { AtomHandle, View } from "ilha";
 
@@ -581,14 +582,14 @@ const TargetPreview = ({
           >
             <ArrowUpRight class="h-3.5 w-3.5" />
           </a>
-          <a
+          <Link
             class={ICON_BUTTON}
             href={deploysHref}
             aria-label={`Deploys for ${target.label}`}
             title={`Deploys for ${target.label}`}
           >
             <List class="h-3.5 w-3.5" />
-          </a>
+          </Link>
         </div>
       </div>
       {missing === 0 ? null : (
@@ -938,9 +939,9 @@ export const PreviewPanel = ({
               <span class="font-mono">{branch}</span> has no environment yet.
               Deploy a preview of your changes, or create the branch's
               environment on the{" "}
-              <a class="link" href={`/apps/${appId}?t=deployments`}>
+              <Link class="link" href={`/apps/${appId}?t=deployments`}>
                 Deployments
-              </a>{" "}
+              </Link>
               tab — it deploys every push to the branch.
             </>
           )}

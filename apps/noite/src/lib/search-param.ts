@@ -1,16 +1,15 @@
 //! `searchParam` that re-renders the reader when the URL changes.
 //!
-//! TRANSIENT (slice 2, Oxide→Void): this used to read and write through
-//! `@ilha/router`'s in-place navigation. It now reads the live document
-//! location and writes with `history.replaceState`, with the same
-//! navigation-cell subscription so a component below a keyed boundary still
-//! repaints after an in-place write (`.set()`, tab clicks, paging). The
-//! pages slice replaces this with Void's search handling.
+//! Query-string state for tab switches, paging cursors, panel toggles and
+//! other deep-linkable UI. Reads subscribe the rendering component to the
+//! layout-provided cell; writes go through `history.replaceState` — no
+//! navigation, no remount, no refetch — and bump the cell so a component
+//! below a keyed boundary still repaints after an in-place write (`.set()`,
+//! tab clicks, paging). Void's router has no query-state hook, so this is
+//! the app's own state module, not a wrapper around one.
 
 import { atom } from "ilha";
 import type { AtomHandle } from "ilha";
-
-import { afterNavigate, notifyNavigated } from "./navigation";
 
 /** One query param: call to read, `set`/`update` to write in place. */
 export interface SearchParam<T> {
@@ -45,26 +44,27 @@ export const parseSkip = (raw: string): number => {
   return Number.isSafeInteger(value) && value > 0 ? value : 0;
 };
 
-/** Version bumped after every navigation; every param read subscribes to it. */
+/** Version bumped after every in-place write; every param read subscribes. */
 let cell: AtomHandle<number> | undefined;
 
-afterNavigate(() => {
-  cell?.update((version) => version + 1);
-});
-
-/** Mount the shared navigation cell.
+/** Mount the shared query cell.
  *
  * The root layout calls this on every render, ahead of any early return:
  * `atom` allocates one slot per fiber, so the call has to stay unconditional
  * and in a fixed position. The layout renders above every page, so the cell
  * exists before the first param read; a route change that remounts the layout
  * (a different page component) replaces it. */
-export const provideNavigationCell = (): void => {
+export const provideQueryCell = (): void => {
   cell = atom(0);
 };
 
+/** An in-place write landed: repaint every query-param reader. */
+export const notifyQueryChanged = (): void => {
+  cell?.update((version) => version + 1);
+};
+
 /** Read and write one query param in the live document location. Unlike a
- * plain read, reading subscribes the reading component to navigations. */
+ * plain read, reading subscribes the reading component to in-place writes. */
 export const searchParam: SearchParamFn = <T>(
   name: string,
   opts: SearchParamOptions<T>
@@ -97,7 +97,7 @@ export const searchParam: SearchParamFn = <T>(
         (query ? `?${query}` : "") +
         window.location.hash
     );
-    notifyNavigated();
+    notifyQueryChanged();
   };
   const param: SearchParam<T> = Object.assign(
     (): T => {

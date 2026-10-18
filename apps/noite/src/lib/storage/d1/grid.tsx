@@ -3,6 +3,7 @@
 //! pager footer. Rows come from the server for exactly the URL query handed
 //! in, so this component is mounted per query (`key` in ./panel).
 
+import { Link } from "@ilha/void";
 import { atom } from "ilha";
 import type { View } from "ilha";
 
@@ -48,7 +49,7 @@ const RowActionLink = ({
     return null;
   }
   return (
-    <a
+    <Link
       class="link link-hover text-xs"
       href={`/apps/${appId}?t=${encodeURIComponent(action.tab)}&${action.param}=${encodeURIComponent(value)}`}
       onclick={(event) => {
@@ -56,7 +57,7 @@ const RowActionLink = ({
       }}
     >
       {action.label}
-    </a>
+    </Link>
   );
 };
 

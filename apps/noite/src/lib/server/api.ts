@@ -11,8 +11,7 @@
  *   the `{errors}` shape Void's `getValidationErrors` reads, so a form can
  *   paint it without knowing the action.
  * - signed out / misconfigured auth (`UnauthorizedError`,
- *   `MissingAuthSecretError` — the `AuthError` union every action declared
- *   to Oxide) → 401 `{error: message}`.
+ *   `MissingAuthSecretError`) → 401 `{error: message}`.
  * - anything else (a bug, an unmapped throw) → 500 `{error: "Internal
  *   error"}`, preserving Oxide's masking: a plain throw never leaks an
  *   implementation message to the browser.

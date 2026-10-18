@@ -1,13 +1,8 @@
-import { useRoute, head } from "$lib/navigation";
 import { StorageDetail } from "$lib/storage/detail";
-import { resourceDisplayName } from "$lib/storage/list";
+import { useParams } from "@ilha/void";
 
 export default function StorageDetailPage() {
-  const { params } = useRoute();
-  const { appId, "resource-id": resourceId } = params();
-  head({
-    title: `${resourceId ? resourceDisplayName(resourceId) : "Storage"} · Noite`,
-  });
+  const { appId, "resource-id": resourceId } = useParams();
   if (!appId || !resourceId) {
     return (
       <div class="mx-auto mt-4 flex w-full max-w-5xl flex-col gap-4 px-4 pb-12">
@@ -18,7 +13,7 @@ export default function StorageDetailPage() {
   // Every storage view is full-height: the D1 editor (sidebar + grid + row
   // panel), the R2 browser (toolbar + listing + detail panel) and the DO
   // viewer (list + preview panel). Height is the viewport minus the
-  // small-screen top bar (see +layout).
+  // small-screen top bar (see the root layout).
   //
   // Keyed: a param change must remount, not reuse, the detail fiber (its
   // resource() slots stay bound to their first key otherwise).

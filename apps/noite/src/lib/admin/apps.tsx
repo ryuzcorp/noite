@@ -1,5 +1,6 @@
 //! Admin tab: every app on the instance, whichever account owns it.
 
+import { Link } from "@ilha/void";
 import { atom } from "ilha";
 import type { View } from "ilha";
 
@@ -69,12 +70,12 @@ const AdminAppRowItem = ({
       </>
     }
   >
-    <a
+    <Link
       href={`/apps/${row.id}`}
       class="link link-hover block truncate font-medium"
     >
       {row.name}
-    </a>
+    </Link>
     <div class="truncate text-xs opacity-70">
       <code>{row.slug}</code>
       {" · "}

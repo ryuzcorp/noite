@@ -75,7 +75,7 @@ describe("actionErrorResponse", () => {
     });
   });
 
-  test("the AuthError union maps to 401 {error}", async () => {
+  test("the auth errors map to 401 {error}", async () => {
     const signedOut = actionErrorResponse(
       new UnauthorizedError({ message: "Sign in required" })
     );

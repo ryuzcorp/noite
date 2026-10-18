@@ -1,5 +1,7 @@
 //! R2 listing rows: the list table and the dense columns view.
 
+import { Link } from "@ilha/void";
+
 import { formatBytes } from "../../bytes";
 import { formatAgo, formatDateTime } from "../../dates";
 import type { R2Object, R2Preview } from "../../runner";
@@ -71,13 +73,13 @@ export const R2ListRows = ({
             <tr key={folder.prefix} class="hover">
               {canWrite ? <td /> : null}
               <td class="max-w-md">
-                <a
+                <Link
                   class="link link-hover inline-flex min-w-0 items-center gap-2"
                   href={r2Href(appId, bucket, folder.prefix)}
                 >
                   <Folder class="h-4 w-4 shrink-0 opacity-60" />
                   <span class="truncate">{folder.name}</span>
-                </a>
+                </Link>
               </td>
               <td class="text-xs opacity-60">Folder</td>
               <td class="text-xs opacity-60">—</td>
@@ -160,14 +162,14 @@ export const R2ColumnRows = ({
     <ul class="menu m-0 w-full gap-0.5 p-2">
       {folders.map((folder) => (
         <li key={folder.prefix}>
-          <a
+          <Link
             class="gap-2"
             href={r2Href(appId, bucket, folder.prefix)}
             title={folder.prefix}
           >
             <Folder class="h-4 w-4 shrink-0 opacity-60" />
             <span class="min-w-0 flex-1 truncate">{folder.name}</span>
-          </a>
+          </Link>
         </li>
       ))}
       {files.map((object) => (

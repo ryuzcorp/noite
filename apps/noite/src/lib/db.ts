@@ -456,8 +456,8 @@ const startSetupPass = (db: D1Database): SetupPass => {
   return pass;
 };
 
-/** At most one setup pass per isolate, per D1 binding (ported from oxidejs
- * `isolateOnce`, whose semantics this keeps: concurrent callers share one
+/** At most one setup pass per isolate, per D1 binding (an isolate-once
+ * helper, whose semantics this keeps: concurrent callers share one
  * pass, a failure or timeout clears it so the next request retries, and a
  * caller that has waited {@link SHARED_SETUP_WAIT_MS} runs its own instead
  * of hanging on a pass orphaned by a finished request. The binding is the

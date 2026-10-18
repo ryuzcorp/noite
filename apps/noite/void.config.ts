@@ -24,6 +24,17 @@ export default defineConfig({
     d1_databases: [{ binding: "DB", database_name: "noite-control" }],
     name: "noite-control",
   },
+  // The document shell `index.html` used to carry (Void generates the shell
+  // now): language, favicon and viewport on every page, under each page's
+  // own title.
+  head: {
+    htmlAttrs: { lang: "en" },
+    link: [{ href: "/favicon.svg", rel: "icon", type: "image/svg+xml" }],
+    meta: [
+      { charset: "utf-8" },
+      { content: "width=device-width, initial-scale=1.0", name: "viewport" },
+    ],
+  },
   routing: {
     headers: {
       "/*": [

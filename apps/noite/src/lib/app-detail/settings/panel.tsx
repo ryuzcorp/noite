@@ -2,8 +2,9 @@
 //! sections (identity, domains, rate limits, collaborators, env, branch
 //! protection, danger), separated by dividers.
 
+import { useParams } from "@ilha/void";
+
 import { errorMessage } from "../../errors";
-import { useRoute } from "../../navigation";
 import { appDetail, invalidate, keys } from "../../resources";
 import { SectionSkeleton } from "../../ui/skeletons";
 import { BranchProtectionPanel } from "./branch-protection";
@@ -20,8 +21,7 @@ const SECTION_CLASS = "py-5";
 /** Settings panel: identity form above collaborator management. Fetches its
  * own role gate so it stays independent of the overview fetch. */
 export const AppSettingsPanel = () => {
-  const { params } = useRoute();
-  const { id } = params();
+  const { id } = useParams();
   const res = appDetail(id ?? "");
   const info = res.data();
   if (!id) {

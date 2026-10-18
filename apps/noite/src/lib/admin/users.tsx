@@ -1,5 +1,6 @@
 //! Admin tab: every account — search, page, ban, role, delete, impersonate.
 
+import { useRouter } from "@ilha/void";
 import { atom } from "ilha";
 import type { View } from "ilha";
 
@@ -8,7 +9,6 @@ import type { AdminUserRow } from "../api-types";
 import { authClient } from "../auth-client";
 import { invalidateSession } from "../auth/session";
 import { errorMessage } from "../errors";
-import { navigate } from "../navigation";
 import { listUsers } from "../resources";
 import { searchParam } from "../search-param";
 import { Avatar } from "../ui/avatar";
@@ -123,6 +123,7 @@ const AdminUsersRows = ({
   page,
   query,
 }: AdminUsersListProps) => {
+  const router = useRouter();
   const busy = atom(false);
   const impersonating = atom(false);
   const res = listUsers(query, page);
@@ -149,7 +150,7 @@ const AdminUsersRows = ({
       // mounted across navigation, so drop every user-scoped cache —
       // otherwise the chrome keeps showing the admin's session.
       invalidateSession();
-      navigate("/apps");
+      router.visit("/apps");
     } catch (error) {
       panelError.set(errorMessage(error));
       impersonating.set(false);

@@ -1,4 +1,5 @@
 //! Deploy history: header dropdown + SSE list.
+import { Link } from "@ilha/void";
 import { atom } from "ilha";
 
 import { api } from "../api";
@@ -73,9 +74,9 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
           <p class="m-0 text-sm opacity-80">
             Stock Git over HTTP — push <code>main</code> to deploy. Auth:{" "}
             <code>username={info.username}</code>, password = API key from{" "}
-            <a href="/account" class="link">
+            <Link href="/account" class="link">
               Account
-            </a>
+            </Link>
             .
           </p>
           {canPush ? null : (
@@ -222,13 +223,13 @@ const DeployRow = ({
         <div>
           <div class="font-mono text-sm">
             {d.sha ? (
-              <a
+              <Link
                 class="link link-hover"
                 href={`/apps/${appId}/source/commit/${d.sha}`}
                 title={d.sha}
               >
                 {d.sha.slice(0, 12)}
-              </a>
+              </Link>
             ) : (
               "—"
             )}

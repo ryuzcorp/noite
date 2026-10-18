@@ -1,9 +1,12 @@
 //! Storage inventory rows: badges, rows, per-app list.
+import { Link } from "@ilha/void";
+
 import { errorMessage } from "../errors";
 import { appStorage } from "../resources";
 import type { StorageItem } from "../runner";
 import { ChevronRight } from "../ui/icons";
 import { ListSkeleton } from "../ui/skeletons";
+import { resourceDisplayName } from "./names";
 
 /** Badge label per storage kind (plain badge for every kind). */
 const STORAGE_BADGES = {
@@ -18,17 +21,6 @@ const storageBadge = (kind: string) =>
     label: "DO",
   };
 
-/** Display name for a storage resource id (mirrors StorageDetail's parsing). */
-export const resourceDisplayName = (resourceId: string): string => {
-  if (resourceId.startsWith("d1:") || resourceId.startsWith("r2:")) {
-    return resourceId.slice(3);
-  }
-  if (resourceId.startsWith("do:")) {
-    return resourceId.split(":").slice(2).join(":");
-  }
-  return resourceId;
-};
-
 const storageHref = (s: StorageItem): string =>
   `/storage/${encodeURIComponent(s.appId)}/${encodeURIComponent(s.id)}`;
 
@@ -40,15 +32,15 @@ const StorageRow = ({ item: s }: { item: StorageItem }) => (
     </div>
     <div>
       <div>
-        <a href={storageHref(s)} class="link link-hover block truncate">
+        <Link href={storageHref(s)} class="link link-hover block truncate">
           {s.name}
-        </a>
+        </Link>
       </div>
       <div class="text-base-content/70 truncate font-mono text-xs">
         {resourceDisplayName(s.id)}
       </div>
     </div>
-    <a
+    <Link
       href={storageHref(s)}
       class="btn btn-sm btn-square btn-ghost shrink-0"
       aria-label={`Open ${s.name} details`}
@@ -56,7 +48,7 @@ const StorageRow = ({ item: s }: { item: StorageItem }) => (
       <span class="inline-flex h-5 w-5 shrink-0">
         <ChevronRight class="h-5 w-5" />
       </span>
-    </a>
+    </Link>
   </li>
 );
 

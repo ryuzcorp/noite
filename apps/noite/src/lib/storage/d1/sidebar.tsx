@@ -2,6 +2,7 @@
 //! table list with row counts and a lock for read-only tables. Collapses to
 //! a `<select>` on small screens (see `TableSelect`).
 
+import { Link } from "@ilha/void";
 import { atom } from "ilha";
 
 import type { D1TableCaps, D1TableInfo } from "../../runner";
@@ -44,13 +45,13 @@ export const TableSidebar = ({
   return (
     <aside class="bg-base-100 dark:bg-base-200 border-base-300 hidden w-64 shrink-0 flex-col border-r md:flex">
       <div class="border-base-300 flex flex-col gap-1 border-b p-3">
-        <a
+        <Link
           class="link link-hover inline-flex w-fit items-center gap-1 text-sm opacity-70"
           href={`/apps/${appId}`}
         >
           <ArrowLeft />
           {appName || "App"}
-        </a>
+        </Link>
         <div class="flex items-center gap-2">
           <Database class="h-4 w-4 shrink-0 opacity-60" />
           <span class="truncate font-semibold" title={databaseId}>
@@ -128,13 +129,13 @@ export const TableSelect = ({
   tables: D1TableInfo[];
 }) => (
   <div class="border-base-300 flex flex-wrap items-center gap-2 border-b px-3 py-2 md:hidden">
-    <a
+    <Link
       class="link link-hover inline-flex items-center gap-1 text-sm opacity-70"
       href={`/apps/${appId}`}
     >
       <ArrowLeft />
       {appName || "App"}
-    </a>
+    </Link>
     <span class="truncate text-sm font-semibold">{databaseId}</span>
     <span class="badge badge-sm">D1</span>
     <label class="ml-auto flex items-center gap-2 text-sm">

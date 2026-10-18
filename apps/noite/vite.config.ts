@@ -105,7 +105,7 @@ const POD_ASSETS: Record<string, true> = Object.fromEntries(
 );
 
 /** The app root: this config file's own directory, which is Vite's default
- * `root` and where `index.html` and `src/` live. */
+ * `root` and where `src/` lives (Void generates the HTML shell and entries). */
 const APP_ROOT = import.meta.dirname;
 
 /** `src/pod-host/main.ts`, the whole pod — Nodepod, the checkout and the
@@ -142,7 +142,8 @@ const podHostFile = (pathname: string): PodHostFile | null => {
  * the document is a string, so nothing can interpolate a hashed name into it.
  * Every other entry keeps Vite's hashed name.
  *
- * Client environment only: Void's worker entry is generated (no source entry). */
+ * Client environment only: Void's worker entry is generated (no source entry),
+ * and the pages client entry comes from `voidIlha()`'s pages plugin. */
 const podHostEntry = (): Plugin => ({
   applyToEnvironment: (environment) => environment.name === "client",
   configEnvironment(environmentName) {
@@ -153,7 +154,6 @@ const podHostEntry = (): Plugin => ({
       build: {
         rollupOptions: {
           input: {
-            index: path.resolve(APP_ROOT, "index.html"),
             [POD_HOST_ENTRY]: path.resolve(APP_ROOT, POD_HOST_ENTRY_MODULE),
           },
           output: {

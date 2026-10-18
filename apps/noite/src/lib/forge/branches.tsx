@@ -1,3 +1,4 @@
+import { Link, useRouter } from "@ilha/void";
 import { atom } from "ilha";
 
 import { api } from "../api";
@@ -6,7 +7,6 @@ import { collectRef, liveEl, newLiveRef } from "../live-ref";
 /** Branch UI: the compare/new-PR ref select, and the source page's branch
  * picker — a dropdown listing the branches, with the branch creator at its
  * foot (per contract: create needs `push`, delete needs `admin`). */
-import { navigate } from "../navigation";
 import { appDetail, environments, invalidate, keys } from "../resources";
 import type { GitBranch, RunnerEnvironment } from "../runner";
 import { confirmDialog } from "../ui/confirm";
@@ -165,14 +165,14 @@ const BranchItem = ({
       </button>
       <span class="flex shrink-0 items-center gap-1">
         {isDefault ? null : (
-          <a
+          <Link
             class={ROW_ACTION}
             href={`/apps/${appId}/source/compare?base=${encodeURIComponent(defaultBranch)}&head=${encodeURIComponent(branch.name)}&ref=${encodeURIComponent(browsed)}`}
             aria-label={`Compare ${branch.name} with ${defaultBranch}`}
             title={`Compare ${branch.name} with ${defaultBranch}`}
           >
             <ArrowUpDown class="h-3.5 w-3.5" />
-          </a>
+          </Link>
         )}
         {canDelete && !isDefault ? (
           <button
@@ -189,14 +189,14 @@ const BranchItem = ({
           </button>
         ) : null}
         {canEnv && !isDefault && envId !== null ? (
-          <a
+          <Link
             class={ROW_ACTION}
             href={`/apps/${appId}?t=deployments&env=${envId}`}
             aria-label={`Open the ${branch.name} environment`}
             title={`Open the ${branch.name} environment`}
           >
             <Monitor class="h-3.5 w-3.5" />
-          </a>
+          </Link>
         ) : null}
         {canEnv && !isDefault && envId === null ? (
           <button
@@ -283,6 +283,7 @@ export const BranchPicker = ({
   onChange: (ref: string) => void;
   value: string;
 }) => {
+  const router = useRouter();
   const refsRes = forgeRefs(appId);
   const refs = refsRes.data();
   const role = appDetail(appId).data()?.myRole;
@@ -396,7 +397,7 @@ export const BranchPicker = ({
                     }
                   );
                   invalidate(keys.environments(appId));
-                  navigate(
+                  router.visit(
                     env
                       ? `/apps/${appId}?t=deployments&env=${env.id}`
                       : `/apps/${appId}?t=deployments`

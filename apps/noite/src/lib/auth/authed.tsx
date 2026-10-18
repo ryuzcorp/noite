@@ -1,9 +1,9 @@
+import { useRouter } from "@ilha/void";
 import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
 import { authClient } from "../auth-client";
 import { errorMessage } from "../errors";
-import { navigate } from "../navigation";
 import { session as sessionResource } from "../resources";
 import { sleep } from "../sleep";
 import { DashboardSkeleton } from "../ui/skeletons";
@@ -42,6 +42,7 @@ export const Authed = ({
   children: View;
   fallback?: View;
 }) => {
+  const router = useRouter();
   const res = sessionResource();
   const returning = atom(false);
   const returnError = atom("");
@@ -66,8 +67,8 @@ export const Authed = ({
       // oxlint-disable-next-line eslint/no-await-in-loop -- same poll cycle: sleep, then re-read
       await res.refetch();
     }
-    if (!signal.aborted && !res.data()?.user) {
-      navigate("/login");
+    if (!signal.aborted && !res.data()?.user && typeof window !== "undefined") {
+      router.visit("/login");
     }
   });
 
@@ -84,7 +85,7 @@ export const Authed = ({
         return;
       }
       invalidateSession();
-      navigate("/apps/_control?t=users");
+      router.visit("/apps/_control?t=users");
     } catch (error) {
       returnError.set(errorMessage(error));
       returning.set(false);

@@ -1,6 +1,6 @@
 import { LoginPanel } from "$lib/auth/login-panel";
-import { head } from "$lib/navigation";
 import { CloudUpload, Key, List } from "$lib/ui/icons";
+import { Link } from "@ilha/void";
 
 const FEATURES = [
   {
@@ -42,14 +42,12 @@ const DeployPreview = () => (
 );
 
 export default function Login() {
-  head({ title: "Sign in · Noite" });
-
   return (
     <div class="bg-base-100 grid min-h-screen lg:grid-cols-2">
       <aside class="bg-base-200 dark:bg-base-200 hidden flex-col justify-between gap-10 p-12 lg:flex">
-        <a href="/" class="inline-flex w-fit" aria-label="Noite">
+        <Link href="/" class="inline-flex w-fit" aria-label="Noite">
           <Logo class="h-8 w-auto" />
-        </a>
+        </Link>
         <div class="flex max-w-lg flex-col gap-10">
           <div class="flex flex-col gap-4">
             <h1 class="m-0 text-4xl leading-tight font-semibold tracking-tight">
@@ -80,9 +78,9 @@ export default function Login() {
 
       <main class="flex flex-col items-center justify-center px-6 py-12">
         <div class="flex w-full max-w-sm flex-col gap-8">
-          <a href="/" class="inline-flex w-fit lg:hidden" aria-label="Noite">
+          <Link href="/" class="inline-flex w-fit lg:hidden" aria-label="Noite">
             <Logo class="h-7 w-auto" />
-          </a>
+          </Link>
           <LoginPanel />
         </div>
         <footer class="mt-12 flex items-center gap-5 text-sm opacity-60">

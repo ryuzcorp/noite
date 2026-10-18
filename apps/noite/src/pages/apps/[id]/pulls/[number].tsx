@@ -1,12 +1,11 @@
-import { head, useRoute } from "$lib/navigation";
 import { PrDetailView } from "$lib/prs/detail";
 import { PullsPage } from "$lib/prs/layout";
+import { useParams } from "@ilha/void";
 
-/** One pull request (`/apps/[id]/pulls/[number]`). */
+/** One pull request (`/apps/[id]/pulls/[number]`). The title comes from
+ * `pulls/[number].server.ts`. */
 export default function PrPage() {
-  const { params } = useRoute();
-  const { id: appId, number: raw } = params();
-  head({ title: `Pull request #${raw ?? ""} · Noite` });
+  const { id: appId, number: raw } = useParams();
   const number = Math.trunc(Number(raw));
   if (!appId) {
     return <p class="text-error m-0 p-4 text-sm">Missing app id.</p>;

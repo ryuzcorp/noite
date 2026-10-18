@@ -3,6 +3,7 @@
  * it. Live over the same stream as the /apps list, so a new, renamed or
  * deleted app shows up without a reload. Its own component, so a stream
  * frame re-renders only this list, never the page beside it. */
+import { Link } from "@ilha/void";
 import type { View } from "ilha";
 
 import { CONTROL_APP_ID, CONTROL_APP_NAME } from "../control-app";
@@ -63,13 +64,13 @@ const MenuLink = ({
   href: string;
 }) => (
   <li>
-    <a
+    <Link
       href={href}
       class={`gap-2 ${active ? "menu-active" : ""}`}
       aria-current={active ? "page" : undefined}
     >
       {children}
-    </a>
+    </Link>
   </li>
 );
 
@@ -91,7 +92,7 @@ const SidebarAppLink = ({
   const expanded = view !== null && appId !== CONTROL_APP_ID;
   return (
     <li>
-      <a
+      <Link
         href={href}
         class={`gap-2 ${view !== null && !expanded ? "menu-active" : ""}`}
         aria-current={view !== null && !expanded ? "page" : undefined}
@@ -106,7 +107,7 @@ const SidebarAppLink = ({
           />
         </span>
         <span class="truncate">{name}</span>
-      </a>
+      </Link>
       {expanded ? (
         <ul aria-label={name}>
           <MenuLink active={view === "app"} href={href}>

@@ -1,4 +1,6 @@
 /** Shared forge rows: commit lists and changed-file stats. */
+import { Link } from "@ilha/void";
+
 import { formatAgo } from "../dates";
 import type { GitCommitSummary, GitFileStat } from "../runner";
 import { commitHref, gitTime, shortSha } from "./format";
@@ -79,13 +81,13 @@ export const CommitList = ({
           class="border-base-300 flex items-start gap-2 border-b py-2 last:border-0"
         >
           <div class="min-w-0 flex-1">
-            <a
+            <Link
               class="link link-hover line-clamp-2 font-medium break-words"
               href={commitHref(appId, commit.sha, from)}
               title={commit.subject}
             >
               {commit.subject}
-            </a>
+            </Link>
             <div class="text-base-content/70 flex flex-wrap items-center gap-x-1.5 text-xs">
               <span>{commit.authorName}</span>
               <span aria-hidden="true">·</span>
@@ -95,26 +97,26 @@ export const CommitList = ({
                   <span aria-hidden="true">·</span>
                   <span>parent{commit.parents.length > 1 ? "s" : ""}</span>
                   {commit.parents.map((parent) => (
-                    <a
+                    <Link
                       key={parent}
                       class="link link-hover font-mono"
                       href={commitHref(appId, parent, from)}
                       title={parent}
                     >
                       {shortSha(parent)}
-                    </a>
+                    </Link>
                   ))}
                 </>
               ) : null}
             </div>
           </div>
-          <a
+          <Link
             class="link link-hover text-base-content/70 shrink-0 font-mono text-xs"
             href={commitHref(appId, commit.sha, from)}
             title={commit.sha}
           >
             {shortSha(commit.sha)}
-          </a>
+          </Link>
         </li>
       ))}
     </ul>

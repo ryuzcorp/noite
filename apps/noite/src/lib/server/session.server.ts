@@ -1,22 +1,9 @@
-import * as Schema from "effect/Schema";
-
-import {
-  authFromEnv,
-  MissingAuthSecretError,
-  UnauthorizedError,
-} from "../auth";
+import { authFromEnv, UnauthorizedError } from "../auth";
 import type { SessionUser } from "../auth";
 import { isInstanceAdmin, requireAppRole } from "../collaborators";
 import { ensureDbPromise } from "../db";
 import { fail } from "./api";
 import { controlAccessRefusal } from "./control-d1.server";
-
-/** The error union every session-gated action declares: a caller is either
- * signed out or the instance has no usable auth secret. */
-export const AuthError = Schema.Union([
-  UnauthorizedError,
-  MissingAuthSecretError,
-]);
 
 /** The raw better-auth user plus the impersonation marker. */
 export interface RequestSession {

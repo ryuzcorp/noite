@@ -1,3 +1,4 @@
+import { Link, useRouter } from "@ilha/void";
 import { atom } from "ilha";
 import type { AtomHandle } from "ilha";
 
@@ -9,7 +10,6 @@ import { forgeCompare, forgeRefs } from "../forge/data";
 /** New-pull-request form: base/head branch pickers (from `gitRefs`), title
  * and body; it explains why Create is off and lands on the detail page on
  * success. */
-import { navigate } from "../navigation";
 import type { GitCompare, PrDetail } from "../runner";
 import { invalidatePr, prList } from "./resources";
 
@@ -95,6 +95,7 @@ const submitNewPr = async ({
   notice,
   problem,
   title,
+  visit,
 }: {
   appId: string;
   base: string;
@@ -104,6 +105,7 @@ const submitNewPr = async ({
   notice: AtomHandle<string>;
   problem: string | null;
   title: string;
+  visit: (to: string) => void;
 }): Promise<void> => {
   if (problem !== null) {
     notice.set(problem);
@@ -118,7 +120,7 @@ const submitNewPr = async ({
     }
     const detail = await api<PrDetail>("/api/prs/prsCreate", args);
     invalidatePr(appId);
-    navigate(`/apps/${appId}/pulls/${detail.pullRequest.number}`);
+    visit(`/apps/${appId}/pulls/${detail.pullRequest.number}`);
   } catch (error) {
     busy.set(false);
     notice.set(errorMessage(error));
@@ -199,17 +201,17 @@ const FormFooter = ({
 }) => (
   <div class="flex items-center justify-end gap-3">
     {existingNumber === undefined ? null : (
-      <a
+      <Link
         class="link link-hover text-sm"
         href={`/apps/${appId}/pulls/${existingNumber}`}
       >
         View the open pull request →
-      </a>
+      </Link>
     )}
     {loading || otherBranchCount > 0 ? null : (
-      <a class="link link-hover text-sm" href={`/apps/${appId}/source`}>
+      <Link class="link link-hover text-sm" href={`/apps/${appId}/source`}>
         Create a branch in Code mode →
-      </a>
+      </Link>
     )}
     <button
       type="submit"
@@ -232,6 +234,7 @@ export const NewPrForm = ({
   headDefault: string;
   titleDefault: string;
 }) => {
+  const router = useRouter();
   const base = atom(baseDefault);
   const head = atom(headDefault);
   const title = atom(titleDefault);
@@ -294,6 +297,7 @@ export const NewPrForm = ({
             title: nextTitle,
           }),
           title: nextTitle,
+          visit: (to) => router.visit(to),
         });
       }}
     >
