@@ -96,8 +96,8 @@ export const handleLogsStream: RouteHandler = (request, env, params) => {
  * heartbeats land well inside celld's ~60s idle-stream expiry. */
 const APPS_STREAM_POLL_MS = 10_000;
 
-/** App list over SSE (like DeployList). Unverified: whether an oxide stream
- * action's first frame arrives on celld — an earlier 0.5.x attempt hung with
+/** App list over SSE (like DeployList). Unverified: whether a Void SSE
+ * route's first frame arrives on celld — an earlier 0.5.x attempt hung with
  * no frame at all (before the per-request runtime fix), and proving it now
  * needs a celld node, which only the release image runs. SSE is also what
  * makes the heartbeats possible: an idle HTTP stream dies on celld's ~60 s

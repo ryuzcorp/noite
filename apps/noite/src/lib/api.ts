@@ -1,10 +1,10 @@
 /**
  * Typed `fetch` for the Void JSON-action endpoints (`POST /api/<module>/
- * <action>`, built by `lib/server/api.ts`): the client half of the Oxide→
- * Void actions cutover. Every former Oxide action call becomes `api<T>(path,
- * input)` — a POST with a JSON body whose session cookie rides along, so
- * `errorMessage(error)` at the call site keeps rendering the user-facing
- * text exactly as it did for action rejections.
+ * <action>`, built by `lib/server/api.ts`): the client half of the
+ * server-action story. Every action call is `api<T>(path, input)` — a POST
+ * with a JSON body whose session cookie rides along, so `errorMessage(error)`
+ * at the call site keeps rendering the user-facing text exactly as it did
+ * for action rejections.
  */
 import type { FieldErrors } from "@ilha/void";
 

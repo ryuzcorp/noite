@@ -90,8 +90,8 @@ const runnerBody = (
  * fetch calls them, so the cross-site gate, the session and the push role are
  * all checked before a byte of the body is read; then a bounded read and a
  * forward to the runner's own `source/{endpoint}`. A commit can be a folder of
- * uploads and a preview is the same payload, so neither fits the oxide action
- * transport's body cap: they are their own routes, like the R2 upload. */
+ * uploads and a preview is the same payload, so neither fits the Void
+ * JSON-action transport's body cap: they are their own routes, like the R2 upload. */
 const forwardSourceBody = async (
   request: Request,
   env: KitEnv,

@@ -1,7 +1,8 @@
 /**
- * The 15 s per-route bound Oxide enforced (`actions.timeout` in
- * `vite.config.ts`): a stuck handler answers a JSON 504 before the edge's
- * 30 s timeout, instead of hanging into the platform request deadline.
+ * The 15 s per-route bound (formerly Oxide's `actions.timeout` in
+ * `vite.config.ts`; Void has no action timeout): a stuck handler answers a
+ * JSON 504 before the edge's 30 s timeout, instead of hanging into the
+ * platform request deadline.
  *
  * Exempt: any path containing `/stream`, the R2 object routes under
  * `/storage/`, and the source archive (`.../archive`, a tar download) --

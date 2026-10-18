@@ -1,4 +1,4 @@
-//! Noite runner — Oxide UI talks bearer REST; this process owns fleets, Caddy, and S3.
+//! Noite runner — the control UI talks bearer REST; this process owns fleets, Caddy, and S3.
 //!
 //! Lifecycle invariants (see also `lifecycle`):
 //! 1. Deploy and purge share `AppLock` — never overlapping S3 writers for a slug.

@@ -1,7 +1,7 @@
 /**
- * Void JSON-action endpoints (slice D, Oxide→Void actions cutover): the one
- * factory every `lib/server/*.server.ts` action module builds its route
- * handlers from, plus the user-facing failure the actions throw.
+ * Void JSON-action endpoints: the one factory every `lib/server/*.server.ts`
+ * action module builds its route handlers from, plus the user-facing failure
+ * the actions throw.
  *
  * Wire protocol (what the client in `lib/api.ts` and the `@ilha/void` form
  * story both read):
@@ -13,8 +13,8 @@
  * - signed out / misconfigured auth (`UnauthorizedError`,
  *   `MissingAuthSecretError`) → 401 `{error: message}`.
  * - anything else (a bug, an unmapped throw) → 500 `{error: "Internal
- *   error"}`, preserving Oxide's masking: a plain throw never leaks an
- *   implementation message to the browser.
+ *   error"}`: a plain throw never leaks an implementation message to the
+ *   browser (the old Oxide masking, kept).
  * - unreadable input → 400 `{error: "Invalid JSON"}` (oversize bodies reuse
  *   the HTTP layer's 413), a schema decode failure → 422
  *   `{errors: {form: "Invalid input"}}`.

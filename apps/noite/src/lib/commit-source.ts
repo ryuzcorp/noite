@@ -1,8 +1,8 @@
 /** Browser commit/preview client + the shared limits for the control routes
  * that carry them. Both go through `POST /api/apps/{id}/source/{commit,preview}`
- * (not an oxide action) because an action body is capped for every action
- * (1 MiB), and an action reads its body before any auth — a browser commit can
- * be a folder of uploads (see `apps/runner/src/host/web_commit.rs`). */
+ * (not a Void JSON action) because an action body is capped (256 KiB,
+ * `MAX_BODY_BYTES`), and the transport reads it before any auth — a browser
+ * commit can be a folder of uploads (see `apps/runner/src/host/web_commit.rs`). */
 
 import type {
   PreviewResult,

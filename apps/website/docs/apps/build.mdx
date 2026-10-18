@@ -59,7 +59,7 @@ A Wrangler config in the tree wins over `cloudflare.config.ts`, and a build that
 
 After a build, the runner deploys what the build produced, in this order:
 
-1. `dist/wrangler.json`, a deployable config the build wrote (Oxide writes one, on Vite and Rsbuild alike).
+1. `dist/wrangler.json`, a deployable config the build wrote (Void and Oxide write one, on Vite alike, Oxide also on Rsbuild).
 2. Wrangler's deploy redirect, `.wrangler/deploy/config.json`, which `@cloudflare/vite-plugin` writes. The runner turns the config it points to into `dist/wrangler.json`: it keeps only the keys celld accepts, rewrites `main` and `assets.directory` relative to `dist/`, and applies `.assetsignore`.
 3. Otherwise, the source config: `wrangler.jsonc`, `wrangler.json` or `wrangler.toml` at the root, then the first one found below it (`node_modules` excluded).
 4. With no config at all, one the runner generates ([below](#no-config-at-all)).
@@ -141,7 +141,7 @@ Add `main` and an `ASSETS` binding to the same config. The Worker is bundled fro
 }
 ```
 
-For a Worker that itself needs the bundler (Oxide, framework plugins), have the build write `dist/wrangler.json`.
+For a Worker that itself needs the bundler (Void, Oxide, framework plugins), have the build write `dist/wrangler.json`.
 
 ## Frameworks and Node servers
 
