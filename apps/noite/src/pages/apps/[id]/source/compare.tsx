@@ -1,7 +1,7 @@
 import { CodePage } from "$lib/forge/code-bar";
 import { CompareBar, CompareView } from "$lib/forge/compare";
+import { head, useRoute } from "$lib/navigation";
 import { searchParam } from "$lib/search-param";
-import { head, useRoute } from "@ilha/router";
 
 export default function ComparePage() {
   const appId = useRoute().params().id;

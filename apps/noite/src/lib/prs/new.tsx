@@ -1,13 +1,13 @@
-/** New-pull-request form: base/head branch pickers (from `gitRefs`), title
- * and body; it explains why Create is off and lands on the detail page on
- * success. */
-import { navigate } from "@ilha/router";
 import { atom } from "ilha";
 import type { AtomHandle } from "ilha";
 
 import { errorMessage } from "../errors";
 import { RefSelect } from "../forge/branches";
 import { forgeCompare, forgeRefs } from "../forge/data";
+/** New-pull-request form: base/head branch pickers (from `gitRefs`), title
+ * and body; it explains why Create is off and lands on the detail page on
+ * success. */
+import { navigate } from "../navigation";
 import type { GitCompare } from "../runner";
 import { prsCreate } from "../server/prs.server";
 import type { PrCreateInput } from "../server/prs.server";

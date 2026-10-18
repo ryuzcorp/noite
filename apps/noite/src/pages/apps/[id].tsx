@@ -12,11 +12,11 @@ import { AppSettingsPanel } from "$lib/app-detail/settings/panel";
 import { DetailShell, DetailTabs } from "$lib/app-detail/shell";
 import { ControlAppDetail } from "$lib/apps/control-panel";
 import { CONTROL_APP_NAME, isControlApp } from "$lib/control-app";
+import { useRoute, head } from "$lib/navigation";
 import { appDetail } from "$lib/resources";
 import { searchParam } from "$lib/search-param";
 import { Cog } from "$lib/ui/icons";
 import { SidePanel } from "$lib/ui/side-panel";
-import { useRoute, head } from "@ilha/router";
 
 const TABS = [
   { id: "overview", label: "Overview" },

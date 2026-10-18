@@ -12,7 +12,6 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { SqlClient } from "effect/sql/SqlClient";
 import type { Mutable } from "effect/Types";
-import { action, withSchema } from "oxidejs";
 
 import { requireAppRole } from "../collaborators";
 import { withDb } from "../db";
@@ -29,6 +28,7 @@ import {
   runnerPrsList,
   runnerPrUpdate,
 } from "../runner";
+import { action, withSchema } from "../server-context";
 import { AuthError, requireViewApp, sessionUser } from "./session.server";
 
 const AppIdArgs = Schema.Struct({ appId: Schema.String });

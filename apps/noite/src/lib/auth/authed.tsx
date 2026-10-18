@@ -1,9 +1,9 @@
-import { navigate } from "@ilha/router";
 import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
 import { authClient } from "../auth-client";
 import { errorMessage } from "../errors";
+import { navigate } from "../navigation";
 import { session as sessionResource } from "../resources";
 import { sleep } from "../sleep";
 import { DashboardSkeleton } from "../ui/skeletons";

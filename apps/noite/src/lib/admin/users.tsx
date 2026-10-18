@@ -1,12 +1,12 @@
 //! Admin tab: every account — search, page, ban, role, delete, impersonate.
 
-import { navigate } from "@ilha/router";
 import { atom } from "ilha";
 import type { View } from "ilha";
 
 import { authClient } from "../auth-client";
 import { invalidateSession } from "../auth/session";
 import { errorMessage } from "../errors";
+import { navigate } from "../navigation";
 import { listUsers } from "../resources";
 import { searchParam } from "../search-param";
 import {

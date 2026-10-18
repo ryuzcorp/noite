@@ -1,16 +1,14 @@
 import { execFileSync } from "node:child_process";
+import { readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
-import { cloudflare } from "@cloudflare/vite-plugin";
-import { pages } from "@ilha/router/vite";
+import { voidIlha } from "@ilha/void/plugin";
 import { nodepod } from "@r1ck404/nodepod/vite";
 import tailwindcss from "@tailwindcss/vite";
-import oxide from "oxidejs/vite";
-import { withOxide } from "oxidejs/wrangler";
 import { defineConfig } from "vite";
 import type { Plugin } from "vite";
+import { voidPlugin } from "void";
 
-import { controlEnv, hydrateControlEnv } from "./src/lib/control-env.ts";
 import {
   POD_HOST_DEV_JS,
   POD_HOST_HEADERS,
@@ -23,8 +21,6 @@ import {
   PREVIEW_HOST_ASSETS,
 } from "./src/lib/preview-host.ts";
 import { CURATED_SHIKI_LANGS } from "./src/lib/shiki-langs.ts";
-
-hydrateControlEnv();
 
 const git = (...args: string[]): string =>
   execFileSync("git", args, { encoding: "utf-8" }).trim();
@@ -146,7 +142,7 @@ const podHostFile = (pathname: string): PodHostFile | null => {
  * the document is a string, so nothing can interpolate a hashed name into it.
  * Every other entry keeps Vite's hashed name.
  *
- * Client environment only: the worker environment builds `src/worker.ts`. */
+ * Client environment only: Void's worker entry is generated (no source entry). */
 const podHostEntry = (): Plugin => ({
   applyToEnvironment: (environment) => environment.name === "client",
   configEnvironment(environmentName) {
@@ -229,7 +225,6 @@ const podHostFrame = (): Plugin => ({
 const LATE_DEPS = [
   "@better-auth/api-key/client",
   "@better-auth/passkey/client",
-  "@ilha/router",
   "@pierre/diffs",
   "@pierre/diffs/edit",
   "@pierre/highlights",
@@ -242,61 +237,8 @@ const LATE_DEPS = [
   "effect/reactivity/Atom",
   "ghostty-web",
   "ilha/jsx-dev-runtime",
-  "oxidejs/mutation-queue",
   "scule",
   "typescript-ls",
-] as const;
-
-/** The worker environment's dependencies. The Cloudflare plugin scans
- * `src/worker.ts` for them, but that file is only
- * `export … from "virtual:oxide/worker"` — esbuild cannot walk a virtual id,
- * so the scan finds almost nothing and the worker discovers its whole dep set
- * at runtime instead. Each discovery re-optimizes the worker environment: the
- * optimized-bundle hash changes with it, so the module runner inside workerd
- * discards its cache and re-imports every module of the graph — measured at
- * ~60 s of workerd CPU (30 s wall) per pass, once per discovered batch, and
- * the worker answers nothing while it runs. That is the dev cold start: the
- * action dies at the 15 s server bound and the client's 20 s one, and the edge
- * 504s at 30 s. Bundling the set up front leaves discovery nothing to find. */
-const WORKER_DEPS = [
-  "@better-auth/api-key",
-  "@better-auth/api-key/client",
-  "@better-auth/kysely-adapter",
-  "@better-auth/passkey",
-  "@better-auth/passkey/client",
-  "@effect/sql-d1",
-  "@ilha/router",
-  "@ilha/router/ssr",
-  "@pierre/diffs",
-  "@pierre/diffs/edit",
-  "@pierre/highlights",
-  "@pierre/highlights/themes/pierre-dark",
-  "@pierre/highlights/themes/pierre-light",
-  "@pierre/trees",
-  "better-auth",
-  "better-auth/api",
-  "better-auth/client",
-  "better-auth/client/plugins",
-  "better-auth/plugins",
-  "better-auth/plugins/email-otp",
-  "effect",
-  "effect/Effect",
-  "effect/Schema",
-  "effect/http",
-  "effect/reactivity/Atom",
-  "effect/rpc",
-  "effect/sql/SqlClient",
-  "ghostty-web",
-  "ilha",
-  "ilha/jsx-dev-runtime",
-  "kysely",
-  "kysely-d1",
-  "oxidejs",
-  "oxidejs/mutation-queue",
-  "oxidejs/rpc",
-  "oxidejs/worker-dom/install",
-  "paranorm",
-  "scule",
 ] as const;
 
 /** Nodepod's Vite plugin, scoped to the client environment. Its
@@ -307,6 +249,102 @@ const WORKER_DEPS = [
 const nodepodClient = (): Plugin => ({
   ...nodepod(),
   applyToEnvironment: (environment) => environment.name === "client",
+});
+
+/** Top-level keys `celld deploy` accepts. Mirrors `CELLD_KEYS` in
+ * `apps/runner/src/host/build_output.rs` — an unknown key fails the deploy,
+ * so anything Void emits outside this set is dropped, never passed through. */
+const CELLD_KEYS = [
+  "$schema",
+  "name",
+  "main",
+  "compatibility_date",
+  "compatibility_flags",
+  "durable_objects",
+  "migrations",
+  "assets",
+  "services",
+  "triggers",
+  "vars",
+  "d1_databases",
+  "kv_namespaces",
+  "queues",
+  "workflows",
+  "r2_buckets",
+] as const;
+/** One D1 binding entry in Void's generated `dist/ssr/wrangler.json`. */
+interface D1DatabaseEntry {
+  binding?: string;
+  database_name?: string;
+  migrations_dir?: string;
+}
+
+/** Write the deploy-root `dist/wrangler.json` celld deploys, derived from
+ * Void's own `dist/ssr/wrangler.json` (never handwritten): `main` rewrites
+ * to deploy-root-relative `ssr/…`, the asset directory to `client`, and
+ * `vars` to `{}` (the runner patches the real vars at deploy time).
+ * Local-only `.dev.vars` files are removed from `dist/` and `dist/ssr/` so
+ * they never ship inside the bundle (the Dockerfile strips them too).
+ * Last in the plugin list so its `closeBundle` runs after Void's emit; when
+ * the SSR bundle hasn't closed yet it does nothing and the SSR close writes. */
+const emitCelldConfig = (): Plugin => ({
+  closeBundle() {
+    const dist = path.resolve(APP_ROOT, "dist");
+    const dirs = [dist, path.join(dist, "ssr")];
+    for (const dir of dirs) {
+      let entries: string[] = [];
+      try {
+        entries = readdirSync(dir);
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        if (entry === ".dev.vars" || entry.startsWith(".dev.vars.")) {
+          rmSync(path.join(dir, entry), { force: true });
+        }
+      }
+    }
+    let emitted: string;
+    try {
+      emitted = readFileSync(path.join(dist, "ssr", "wrangler.json"), "utf-8");
+    } catch {
+      return;
+    }
+    /* oxlint-disable anti-slop/no-unknown-returns, anti-slop/no-unsafe-dictionary-type, anti-slop/no-runtime-typeof, anti-slop/require-safety-comment-for-type-assertion -- the build boundary: Void's generated wrangler.json is JSON whose keys are celld's config surface, so its shape is an open dictionary and this is the one place that takes it apart. Every field is checked here before it is read, and only CELLD_KEYS allowlisted entries leave this section. */
+    const ssr = JSON.parse(emitted) as Record<string, unknown>;
+    const ssrAssets =
+      typeof ssr["assets"] === "object" && ssr["assets"] !== null
+        ? (ssr["assets"] as Record<string, unknown>)
+        : {};
+    const ssrMain =
+      typeof ssr["main"] === "string" && ssr["main"] ? ssr["main"] : "index.js";
+    const config: Record<string, unknown> = {};
+    for (const key of CELLD_KEYS) {
+      if (key in ssr) {
+        config[key] = ssr[key];
+      }
+    }
+    config["main"] = `ssr/${ssrMain}`;
+    config["assets"] = { ...ssrAssets, directory: "client" };
+    // D1 is keyed by name: drop Void's default `migrations_dir` (it points
+    // at a directory that does not exist; schema migrates at runtime via
+    // `ensureDb`, never through wrangler migrations).
+    if (Array.isArray(config["d1_databases"])) {
+      for (const entry of config["d1_databases"]) {
+        if (typeof entry === "object" && entry !== null) {
+          // SAFETY: d1_databases entries are binding objects; only the optional migrations_dir is removed.
+          delete (entry as Partial<D1DatabaseEntry>)["migrations_dir"];
+        }
+      }
+    }
+    /* oxlint-enable anti-slop/no-unknown-returns, anti-slop/no-unsafe-dictionary-type, anti-slop/no-runtime-typeof, anti-slop/require-safety-comment-for-type-assertion */
+    config["vars"] = {};
+    writeFileSync(
+      path.join(dist, "wrangler.json"),
+      `${JSON.stringify(config, null, 2)}\n`
+    );
+  },
+  name: "celld-config",
 });
 
 /** Nodepod registers its browser `RuntimeHost` as a top-level side effect of
@@ -325,11 +363,6 @@ const nodepodSideEffects = (): Plugin => ({
 
 export default defineConfig({
   define: { __CONTROL_BUILD__: JSON.stringify(controlBuild()) },
-  // The worker environment's scan entry is unresolvable (see `WORKER_DEPS`),
-  // so its dep set is declared instead of discovered.
-  environments: {
-    ssr: { optimizeDeps: { include: [...WORKER_DEPS] } },
-  },
   optimizeDeps: { include: [...LATE_DEPS] },
   plugins: [
     crossOriginIsolation(),
@@ -341,31 +374,25 @@ export default defineConfig({
     // Nodepod's static runtime: `__sw__.js`, `__worker__.js` and the dead
     // `__nodepod_bridge__` pair. Dev serves them from the plugin's middleware;
     // the build emits them next to the client assets (dist/client) so celld
-    // serves them with the rest of the bundle. This sits ahead of the worker
-    // pipeline (oxide/cloudflare), whose dev HTML handling answers 404 to
-    // iframe-destination navigations — the pod host document would never load
-    // if it ran first. It answers only those paths (plus every pod-host
-    // document), so nothing else changes hands, and `podHostFrame` above has
-    // already decided the pod's own paths by host.
+    // serves them with the rest of the bundle. This sits ahead of Void's
+    // worker entry, whose dev HTML handling answers 404 to iframe-destination
+    // navigations — the pod host document would never load if it ran first.
+    // It answers only those paths (plus every pod-host document), so nothing
+    // else changes hands, and `podHostFrame` above has already decided the
+    // pod's own paths by host.
     nodepodClient(),
-    oxide({
-      actions: {
-        sameOrigin: true,
-        // Below the edge's 30 s response_header_timeout: a stuck action
-        // answers with a JSON-RPC error instead of an edge 504.
-        timeout: 15_000,
-        transport: "http",
-      },
-      // SAFETY: controlEnv is a plain-object env bag; oxide only reads known keys off it, so casting to its `never`-indexed env type is safe (the bag holds only strings + durable bindings written before vite boot).
-      env: controlEnv as never,
-      middleware: ["./src/middleware/db.ts", "@ilha/router/ssr"],
-    }),
-    // oxide() loads cloudflare.config.ts (worker preset auto-detected) and
-    // withOxide() hands it to the Cloudflare plugin: no wrangler file.
-    cloudflare(withOxide()),
-    pages(),
+    // Void owns the worker entry (middleware → routes → pages → static
+    // assets), generated from root `middleware/` plus `void.config.ts` — no
+    // wrangler file, no `src/worker.ts`. `voidIlha()` renders Void pages
+    // with ilha (none exist yet; the pages slice adds them).
+    // The 15 s per-action bound oxide enforced has no Void equivalent (no
+    // per-action or per-handler timeout exists in void 1.1.11) — named gap.
+    voidPlugin(),
+    voidIlha(),
     nodepodSideEffects(),
     tailwindcss(),
+    // Deploy-root celld config + `.dev.vars` stripping, after Void's emit.
+    emitCelldConfig(),
   ],
   resolve: {
     tsconfigPaths: true,
@@ -378,13 +405,13 @@ export default defineConfig({
     headers: { ...ISOLATION_HEADERS },
     host: true,
     port: Number(process.env.PORT ?? 8080),
-    // Runtime state lives inside the project root: local D1/R2/DO sqlite
-    // under .wrangler and build output under dist. Every deploy status
-    // write flips those files, and the default watcher (everything except
+    // Runtime state lives inside the project root: Void local state under
+    // .void and build output under dist. Every deploy status write flips
+    // those files, and the default watcher (everything except
     // node_modules/.git) answers with a full document reload. Ignore them —
     // source edits still HMR normally.
     watch: {
-      ignored: ["**/.wrangler/**", "**/dist/**"],
+      ignored: ["**/.void/**", "**/.wrangler/**", "**/dist/**"],
     },
   },
 });

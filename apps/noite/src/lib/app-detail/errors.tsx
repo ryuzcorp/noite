@@ -1,13 +1,13 @@
-//! Errors tab: exceptions from celld telemetry grouped into issues by the
-//! runner (`host/errors.rs`) — no SDK in the app. List by status, detail
-//! with stack, request and the failing trace's logs; anyone who can push
-//! resolves, ignores or reopens.
-import { navigate } from "@ilha/router";
 import { atom } from "ilha";
 
 import { formatAgo, formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
 import { decodeErrors, errorsUrl, feedKeys, liveFeed } from "../feeds";
+//! Errors tab: exceptions from celld telemetry grouped into issues by the
+//! runner (`host/errors.rs`) — no SDK in the app. List by status, detail
+//! with stack, request and the failing trace's logs; anyone who can push
+//! resolves, ignores or reopens.
+import { navigate } from "../navigation";
 import { appDetail, errorDetail } from "../resources";
 import type {
   ErrorStatus,

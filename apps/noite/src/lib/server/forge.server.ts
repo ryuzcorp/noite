@@ -6,7 +6,6 @@
  */
 import * as Schema from "effect/Schema";
 import type { Mutable } from "effect/Types";
-import { action, withSchema } from "oxidejs";
 
 import { requireAppRole } from "../collaborators";
 import {
@@ -17,6 +16,7 @@ import {
   runnerGitLog,
   runnerGitRefs,
 } from "../runner";
+import { action, withSchema } from "../server-context";
 import { AuthError, requireViewApp, sessionUser } from "./session.server";
 
 const GitRefsArgs = Schema.Struct({ appId: Schema.String });

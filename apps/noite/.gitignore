@@ -1,6 +1,8 @@
-# Generated ilha router types, celld/wrangler local state and dev vars
+# Generated router types, celld/wrangler/void local state and dev vars
 .ilha
 .celld
+.void
+.void-wrangler.jsonc
 .wrangler
 .dev.vars
 .dev.vars*

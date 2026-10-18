@@ -9,11 +9,11 @@ import { admin } from "better-auth/plugins";
 import { emailOTP } from "better-auth/plugins/email-otp";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { fail } from "oxidejs";
 
 import { getAuthDb, resolveEnv } from "./db";
 import { errorMessage } from "./errors";
 import { isLocalhostDomain } from "./local-host";
+import { fail } from "./server-context";
 import {
   checkInvite,
   consumeInvite,

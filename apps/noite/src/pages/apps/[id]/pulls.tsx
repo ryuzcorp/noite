@@ -1,11 +1,11 @@
 import { DetailTabs } from "$lib/app-detail/shell";
+import { head, useRoute } from "$lib/navigation";
 import type { PrStateFilter } from "$lib/prs/data";
 import { toPrStateFilter } from "$lib/prs/data";
 import { PullsPage } from "$lib/prs/layout";
 import { PR_FILTERS, PrsList } from "$lib/prs/list";
 import { prList } from "$lib/prs/resources";
 import { parseSkip, searchParam } from "$lib/search-param";
-import { head, useRoute } from "@ilha/router";
 
 /** The app's pull requests (`/apps/[id]/pulls`), laid out like the app's own
  * pages: a title row, the state tabs (`?state=`, every count shown) under it,

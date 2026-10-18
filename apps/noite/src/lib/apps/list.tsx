@@ -1,7 +1,6 @@
 //! The apps list (live over SSE), the pending-invitations banner and the
 //! control-plane card above it. The create form lives in ./create-form.
 
-import { navigate } from "@ilha/router";
 import { atom } from "ilha";
 
 import type { App } from "../collaborators";
@@ -12,6 +11,7 @@ import {
 } from "../control-app";
 import { errorMessage } from "../errors";
 import { applistUrl, decodeApps, feedKeys, liveFeed } from "../feeds";
+import { navigate } from "../navigation";
 import {
   adminStatus,
   invalidate,

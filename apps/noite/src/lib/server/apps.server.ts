@@ -1,5 +1,4 @@
 import * as Schema from "effect/Schema";
-import { action, fail, useEnv, withSchema } from "oxidejs";
 
 import type { CreateSourceInput } from "../apps/create-source";
 import { TEMPLATES } from "../apps/templates";
@@ -22,6 +21,7 @@ import {
   runnerRollback,
 } from "../runner";
 import type { RunnerApp, RunnerCreateSource } from "../runner";
+import { action, fail, useEnv, withSchema } from "../server-context";
 import { AuthError, requireViewApp, sessionUser } from "./session.server";
 
 const CreateSource = Schema.Union([
@@ -145,10 +145,11 @@ const toRunnerSource = (
   }
   const actor = { name: account.name, userId: account.id };
   if (source.kind === "template") {
-    const picked = TEMPLATES.find((template) => template.id === source.id);
-    if (!picked) {
+    // `?? fail()` (not an `if` guard): this toolchain does not narrow on
+    // never-returning calls, but does narrow a `never`-typed `??` branch.
+    const picked =
+      TEMPLATES.find((template) => template.id === source.id) ??
       fail(`Unknown template: ${source.id}`);
-    }
     return {
       actor,
       kind: "git",

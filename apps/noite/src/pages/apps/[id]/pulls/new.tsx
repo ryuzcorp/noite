@@ -1,7 +1,7 @@
+import { head, useRoute } from "$lib/navigation";
 import { PullsPage } from "$lib/prs/layout";
 import { NewPrForm } from "$lib/prs/new";
 import { searchParam } from "$lib/search-param";
-import { head, useRoute } from "@ilha/router";
 
 /** New pull request (`/apps/[id]/pulls/new`). Base defaults to `main`; head, and a
  * prefilled title, can arrive from the Changes panel or Compare. */

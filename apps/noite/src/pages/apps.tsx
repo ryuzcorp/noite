@@ -1,5 +1,5 @@
 import { AppsList } from "$lib/apps/list";
-import { head } from "@ilha/router";
+import { head } from "$lib/navigation";
 
 export default function AppsPage() {
   head({ title: "Apps · Noite" });

@@ -1,20 +1,32 @@
 {
-  "extends": "oxidejs/tsconfig",
   "compilerOptions": {
+    "target": "ESNext",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "moduleDetection": "force",
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "allowJs": true,
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "noImplicitOverride": true,
     "jsx": "react-jsx",
     "jsxImportSource": "ilha",
     "paths": {
       "$lib/*": ["./src/lib/*"]
     },
-    "types": ["vite/client", "oxidejs/client", "oxidejs/virtual"],
-    "strictNullChecks": true
+    "types": ["vite/client", "bun"]
   },
   "include": [
     "src",
     "e2e",
+    "middleware",
     "vite.config.ts",
-    "cloudflare.config.ts",
-    "playwright.config.ts",
-    ".ilha/pages.d.ts"
+    "void.config.ts",
+    "playwright.config.ts"
   ]
 }

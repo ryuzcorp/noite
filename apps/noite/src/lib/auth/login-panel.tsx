@@ -1,8 +1,8 @@
-import { navigate } from "@ilha/router";
 import { atom, watch } from "ilha";
 
 import { authClient } from "../auth-client";
 import { sameOriginPath } from "../env-auth";
+import { navigate } from "../navigation";
 import { signupPolicy } from "../resources";
 import { searchParam } from "../search-param";
 import { sleep } from "../sleep";

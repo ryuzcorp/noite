@@ -1,8 +1,8 @@
 import { CodePage } from "$lib/forge/code-bar";
 import { CommitView } from "$lib/forge/commit";
 import { shortSha } from "$lib/forge/format";
+import { head, useRoute } from "$lib/navigation";
 import { searchParam } from "$lib/search-param";
-import { head, useRoute } from "@ilha/router";
 
 export default function CommitPage() {
   const { params } = useRoute();

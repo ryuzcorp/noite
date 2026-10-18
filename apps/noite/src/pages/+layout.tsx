@@ -3,6 +3,7 @@ import { authClient } from "$lib/auth-client";
 import { Authed } from "$lib/auth/authed";
 import { Onboarding } from "$lib/auth/onboarding";
 import { invalidateSession } from "$lib/auth/session";
+import { defineLayout, navigate, useRoute } from "$lib/navigation";
 import { session } from "$lib/resources";
 import { provideNavigationCell } from "$lib/search-param";
 import { Avatar } from "$lib/ui/avatar";
@@ -15,7 +16,6 @@ import {
 } from "$lib/ui/icons";
 import { createPaneGroup, MORPH_PRESERVE } from "$lib/ui/resizable";
 import { ResizeHandle } from "$lib/ui/resize-handle";
-import { defineLayout, navigate, useRoute } from "@ilha/router";
 import { atom, watch } from "ilha";
 
 /**

@@ -1,6 +1,3 @@
-/** Server-side client for the Rust runner. Browser never sees RUNNER_TOKEN. */
-import { useEnv } from "oxidejs";
-
 import { controlEnv, hydrateControlEnv } from "./control-env";
 // Wire types, generated from the Rust structs in apps/runner into
 // ./runner-types (never edit those files by hand). Regenerate with `cargo
@@ -42,6 +39,8 @@ import type { SourceCommitBody } from "./runner-types/SourceCommitBody";
 import type { StorageItem } from "./runner-types/StorageItem";
 import type { TelemetryStatus as RunnerTelemetryStatus } from "./runner-types/TelemetryStatus";
 import type { TreeResponse as RunnerTree } from "./runner-types/TreeResponse";
+/** Server-side client for the Rust runner. Browser never sees RUNNER_TOKEN. */
+import { useEnv } from "./server-context";
 
 export type { App as RunnerApp } from "./runner-types/App";
 export type { AppDeviceStat as RunnerDevice } from "./runner-types/AppDeviceStat";
@@ -140,9 +139,10 @@ const runnerBase = () =>
   (readEnv().RUNNER_URL ?? RUNNER_DEFAULT_URL).replace(/\/$/u, "");
 
 /** Stamp the platform env for runner calls made on the edge fetch path.
- * Oxide only enters its ALS (readEnv) for actions, workflows and queues, so a
- * a plain route handler — `/internal/git-auth`, the SSE pollers — otherwise sees
- * the localhost-family dev defaults and misses the real RUNNER_URL/RUNNER_TOKEN. */
+ * Only an entered request scope feeds `readEnv` (actions, workflows and
+ * queues), so a plain route handler — `/internal/git-auth`, the SSE
+ * pollers — otherwise sees the localhost-family dev defaults and misses the
+ * real RUNNER_URL/RUNNER_TOKEN. */
 export const stampRunnerEnv = (env: KitEnv): void => {
   for (const key of ["RUNNER_TOKEN", "RUNNER_URL"] as const) {
     const value = env[key];

@@ -9,7 +9,6 @@
 //! default.
 
 import * as Schema from "effect/Schema";
-import { action, withSchema } from "oxidejs";
 
 import { failUnknown } from "../auth";
 import { requireAppRole } from "../collaborators";
@@ -23,6 +22,7 @@ import {
   runnerEnvironmentVarSet,
   runnerEnvironmentsList,
 } from "../runner";
+import { action, withSchema } from "../server-context";
 import { redactEnv } from "./env.server";
 import type { EnvVarView } from "./env.server";
 import { AuthError, sessionUser } from "./session.server";

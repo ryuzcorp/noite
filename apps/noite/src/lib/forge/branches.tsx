@@ -1,11 +1,11 @@
-/** Branch UI: the compare/new-PR ref select, and the source page's branch
- * picker — a dropdown listing the branches, with the branch creator at its
- * foot (per contract: create needs `push`, delete needs `admin`). */
-import { navigate } from "@ilha/router";
 import { atom } from "ilha";
 
 import { errorMessage } from "../errors";
 import { collectRef, liveEl, newLiveRef } from "../live-ref";
+/** Branch UI: the compare/new-PR ref select, and the source page's branch
+ * picker — a dropdown listing the branches, with the branch creator at its
+ * foot (per contract: create needs `push`, delete needs `admin`). */
+import { navigate } from "../navigation";
 import { appDetail, environments, invalidate, keys } from "../resources";
 import type { GitBranch } from "../runner";
 import { createEnvironment } from "../server/environments.server";

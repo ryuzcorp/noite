@@ -1,6 +1,6 @@
+import { useRoute, head } from "$lib/navigation";
 import { StorageDetail } from "$lib/storage/detail";
 import { resourceDisplayName } from "$lib/storage/list";
-import { useRoute, head } from "@ilha/router";
 
 export default function StorageDetailPage() {
   const { params } = useRoute();

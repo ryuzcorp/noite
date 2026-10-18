@@ -1,5 +1,5 @@
 import { fetchSession } from "$lib/auth/session";
-import { head, navigate } from "@ilha/router";
+import { head, navigate } from "$lib/navigation";
 import { watch } from "ilha";
 
 /** Home resolves by session: signed in → apps, otherwise login. The layout

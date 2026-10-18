@@ -1,30 +1,42 @@
 //! `searchParam` that re-renders the reader when the URL changes.
 //!
-//! `@ilha/router` keeps the query string in a module variable and re-renders
-//! the route in place, and ilha reuses a keyed component without re-running it
-//! when its props are shallow-equal — so a plain `searchParam` read is not a
-//! reactive read. A component that reads a param below such a keyed boundary,
-//! or that receives a `SearchParam` handle as a prop, kept painting the old
-//! query after an in-place navigation (`.set()`, tab clicks, paging).
-//!
-//! Every read here also reads one shared navigation cell, bumped after each
-//! navigation: that read is what subscribes the reading component, whether the
-//! handle was created there or handed down as a prop. The cell is installed by
-//! the root layout instead of being created on first read because `atom`
-//! claims a slot in the calling fiber's render — creating it lazily would
-//! shift the slots of every later atom in whichever component read a param
-//! first. Reads and writes still go through the router.
+//! TRANSIENT (slice 2, Oxide→Void): this used to read and write through
+//! `@ilha/router`'s in-place navigation. It now reads the live document
+//! location and writes with `history.replaceState`, with the same
+//! navigation-cell subscription so a component below a keyed boundary still
+//! repaints after an in-place write (`.set()`, tab clicks, paging). The
+//! pages slice replaces this with Void's search handling.
 
-import { afterNavigate, searchParam as routeParam } from "@ilha/router";
-import type {
-  SearchParam,
-  SearchParamFn,
-  SearchParamOptions,
-} from "@ilha/router";
 import { atom } from "ilha";
 import type { AtomHandle } from "ilha";
 
-export type { SearchParam, SearchParamOptions } from "@ilha/router";
+import { afterNavigate, notifyNavigated } from "./navigation";
+
+/** One query param: call to read, `set`/`update` to write in place. */
+export interface SearchParam<T> {
+  (): T;
+  set: (next: T) => void;
+  update: (f: (current: T) => T) => void;
+}
+
+export interface SearchParamOptions<T> {
+  /** Value when the param is absent. Writing it removes the param. */
+  default: T;
+  /** Decode the raw param. Default: the raw string. */
+  parse?: (raw: string) => T;
+  /** Encode a value for the URL. Default: `String(value)`. */
+  serialize?: (value: T) => string;
+}
+
+export interface SearchParamFn {
+  /** String param: `parse` is optional. */
+  (name: string, opts: SearchParamOptions<string>): SearchParam<string>;
+  /** Non-string param: `parse` is required to decode the raw string. */
+  <T>(
+    name: string,
+    opts: SearchParamOptions<T> & { parse: (raw: string) => T }
+  ): SearchParam<T>;
+}
 
 /** Parse a paging cursor (`?skip=`): a positive integer, anything else
  * (missing, `0`, negative, fractional, not a number) is the first page. */
@@ -51,37 +63,55 @@ export const provideNavigationCell = (): void => {
   cell = atom(0);
 };
 
-/** The router's factory at its unconstrained overload.
- *
- * Its two overloads differ only in whether `parse` is required, and this one
- * takes `SearchParamOptions<T>`, which already leaves it optional. */
-const makeParam = <T>(
-  name: string,
-  opts: SearchParamOptions<T>
-): SearchParam<T> => {
-  // SAFETY: the implementation applies `parse` when it is there and returns
-  // the raw string otherwise — exactly what `SearchParamOptions<T>` describes.
-  const routeCall = routeParam as (
-    name: string,
-    opts: SearchParamOptions<T>
-  ) => SearchParam<T>;
-  return routeCall(name, opts);
-};
-
-/** Read and write one query param through the router. Unlike the router's own
- * `searchParam`, reading it subscribes the reading component to navigations. */
+/** Read and write one query param in the live document location. Unlike a
+ * plain read, reading subscribes the reading component to navigations. */
 export const searchParam: SearchParamFn = <T>(
   name: string,
   opts: SearchParamOptions<T>
 ): SearchParam<T> => {
-  const param = makeParam(name, opts);
-  return Object.assign(
+  // SAFETY: the default parser is the identity; T is inferred from opts.default, so callers without parse get T = string and raw already is one.
+  const parse = opts.parse ?? ((raw: string): T => raw as T);
+  const serialize = opts.serialize ?? String;
+  const read = (): T => {
+    if (typeof window === "undefined") {
+      return opts.default;
+    }
+    const raw = new URLSearchParams(window.location.search).get(name);
+    return raw === null ? opts.default : parse(raw);
+  };
+  const write = (next: T): void => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const params = new URLSearchParams(window.location.search);
+    if (next === opts.default) {
+      params.delete(name);
+    } else {
+      params.set(name, serialize(next));
+    }
+    const query = params.toString();
+    window.history.replaceState(
+      null,
+      "",
+      window.location.pathname +
+        (query ? `?${query}` : "") +
+        window.location.hash
+    );
+    notifyNavigated();
+  };
+  const param: SearchParam<T> = Object.assign(
     (): T => {
       // The value is not used: reading the cell is what registers the
       // subscription on the component that is rendering right now.
       cell?.();
-      return param();
+      return read();
     },
-    { set: param.set, update: param.update }
+    {
+      set: write,
+      update: (f: (current: T) => T): void => {
+        write(f(read()));
+      },
+    }
   );
+  return param;
 };

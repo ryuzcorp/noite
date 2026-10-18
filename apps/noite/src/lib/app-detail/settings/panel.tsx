@@ -2,9 +2,8 @@
 //! sections (identity, domains, rate limits, collaborators, env, branch
 //! protection, danger), separated by dividers.
 
-import { useRoute } from "@ilha/router";
-
 import { errorMessage } from "../../errors";
+import { useRoute } from "../../navigation";
 import { appDetail, invalidate, keys } from "../../resources";
 import { SectionSkeleton } from "../../ui/skeletons";
 import { BranchProtectionPanel } from "./branch-protection";

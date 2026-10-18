@@ -4,14 +4,13 @@
 //! Cancel / Create footer; the Slug row checks the slug while you type and
 //! shows the URL and git remote it would get.
 
-import { navigate } from "@ilha/router";
 import { atom, watch } from "ilha";
 import type { View } from "ilha";
-import { createMutationQueue } from "oxidejs/mutation-queue";
 
 import { formatBytes } from "../bytes";
 import { commitSource } from "../commit-source";
 import { errorMessage } from "../errors";
+import { navigate } from "../navigation";
 import { create, slugCheck } from "../server/apps.server";
 import type { SlugCheck } from "../server/apps.server";
 import { readDroppedItems } from "../source/uploads";
@@ -30,11 +29,35 @@ import type { ProjectUpload } from "./folder-drop";
 import { appUrl, slugifyName } from "./identity";
 import { TEMPLATES } from "./templates";
 
-// Same queue the old form used: a double submit for one slug creates one app.
-const queue = createMutationQueue();
-const createQueued = queue.wrap(create, {
-  idempotencyKey: ({ slug }) => `create:${slug}`,
-});
+// TRANSIENT (slice 2): same-key dedupe replacing oxidejs's mutation queue —
+// a double submit for one slug creates one app. Offline replay and
+// cross-reload persistence (what the queue added) wait for the pages slice's
+// form story. Concurrent submits for one slug share the in-flight call.
+const inFlight = new Map<string, Promise<{ id: string }>>();
+const createQueued = (input: {
+  name: string;
+  slug: string;
+  source?: CreateSourceInput;
+}): Promise<{ id: string }> => {
+  const key = `create:${input.slug}`;
+  const running = inFlight.get(key);
+  if (running !== undefined) {
+    return running;
+  }
+  const call = create(input);
+  inFlight.set(key, call);
+  void (async (): Promise<void> => {
+    try {
+      await call;
+    } catch {
+      // The caller's own await rethrows; the queue only tracks liveness.
+    }
+    if (inFlight.get(key) === call) {
+      inFlight.delete(key);
+    }
+  })();
+  return call;
+};
 
 const MODES = [
   {

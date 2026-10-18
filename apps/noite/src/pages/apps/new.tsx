@@ -1,5 +1,5 @@
 import { CreateAppForm } from "$lib/apps/create-form";
-import { head } from "@ilha/router";
+import { head } from "$lib/navigation";
 
 export default function NewAppPage() {
   head({ title: "New app · Noite" });

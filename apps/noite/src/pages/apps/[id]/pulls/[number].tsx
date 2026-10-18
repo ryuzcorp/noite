@@ -1,6 +1,6 @@
+import { head, useRoute } from "$lib/navigation";
 import { PrDetailView } from "$lib/prs/detail";
 import { PullsPage } from "$lib/prs/layout";
-import { head, useRoute } from "@ilha/router";
 
 /** One pull request (`/apps/[id]/pulls/[number]`). */
 export default function PrPage() {

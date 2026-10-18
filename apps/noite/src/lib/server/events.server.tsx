@@ -1,8 +1,8 @@
 /* eslint-disable func-names -- Effect.gen uses anonymous generators */
 import * as Schema from "effect/Schema";
-import { action, withSchema } from "oxidejs";
 
 import { runnerGetUserProps } from "../runner";
+import { action, withSchema } from "../server-context";
 import { AuthError, requireViewApp } from "./session.server";
 
 const UserPropsArgs = Schema.Struct({

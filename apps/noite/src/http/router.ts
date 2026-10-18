@@ -1,5 +1,4 @@
 import { FindMyWay } from "effect/http";
-import type { FetchHandler } from "oxidejs";
 
 import {
   CONTROL_HOST_DENIED_ASSETS,
@@ -39,6 +38,12 @@ import {
   handleLogsStream,
   handleMetricsStream,
 } from "./routes/streams";
+/** Worker fetch handler (was oxidejs `FetchHandler`): answers or declines
+ * (undefined falls through to static assets). */
+type FetchHandler<E> = (
+  request: Request,
+  env: E
+) => Response | undefined | Promise<Response | undefined>;
 
 const router = FindMyWay.make<RouteHandler>();
 router.all("/health", handleHealth);

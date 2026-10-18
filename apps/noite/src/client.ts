@@ -1,9 +1,9 @@
 import "@fontsource-variable/geist";
 import "@fontsource-variable/geist-mono";
 import "./app.css";
-import { pageRouter } from "ilha:pages/client";
-
-pageRouter.mount("#app");
+// TRANSIENT (slice 2): the Oxide page router is gone — Void generates the
+// client entry from `pages/` + `routes/` (pages slice). This module is dead
+// until the client slice rewrites the boot; the dropdown wiring below stays.
 
 // daisyUI dropdowns are open while focus is inside them. SPA navigation keeps
 // focus on the clicked item, so the menu stayed open after "Account".

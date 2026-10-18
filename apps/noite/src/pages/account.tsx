@@ -2,10 +2,10 @@ import { isInstanceAdmin, TelemetryCard } from "$lib/account/admin-telemetry";
 import { AccountPanel } from "$lib/account/panel";
 import { DetailShell, DetailTabs } from "$lib/app-detail/shell";
 import { CONTROL_APP_ID, CONTROL_APP_NAME } from "$lib/control-app";
+import { head } from "$lib/navigation";
 import { session } from "$lib/resources";
 import { searchParam } from "$lib/search-param";
 import { Avatar } from "$lib/ui/avatar";
-import { head } from "@ilha/router";
 
 const TABS = [
   { id: "account", label: "Account" },

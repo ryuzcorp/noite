@@ -1,12 +1,12 @@
 //! Settings panel: the two destructive app actions (change slug, delete).
 
-import { navigate } from "@ilha/router";
 import { atom } from "ilha";
 import type { View } from "ilha";
 
 import { appHost } from "../../apps/identity";
 import { errorMessage } from "../../errors";
 import { dropAppFromSnapshot } from "../../feeds";
+import { navigate } from "../../navigation";
 import { remove, renameApp } from "../../server/apps.server";
 import { confirmDialog } from "../../ui/confirm";
 import { Dialog } from "../../ui/dialog";
