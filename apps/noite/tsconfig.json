@@ -24,7 +24,6 @@
   "include": [
     "src",
     "e2e",
-    "middleware",
     "vite.config.ts",
     "void.config.ts",
     "playwright.config.ts"

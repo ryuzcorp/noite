@@ -1,5 +1,13 @@
 /* oxlint-disable eslint/require-await, anti-slop/no-unknown-returns, anti-slop/no-known-value-widening, anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: a fake session, runner fetch and env stand in for the platform */
-import { beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  test,
+} from "bun:test";
 
 import { grantCollaborator } from "../../lib/collaborators";
 import { controlEnv } from "../../lib/control-env";
@@ -95,6 +103,13 @@ beforeEach(() => {
     "Stranger",
     "stranger@example.com",
   ]);
+});
+
+// The `mock.module` session double above leaks into later test files in a
+// full-suite run (one shared module registry): leave it signed out so a
+// signed-in case here cannot turn another file's 401 into a 403.
+afterEach(() => {
+  sessionUser = null;
 });
 
 const signIn = (id: string) => {

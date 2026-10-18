@@ -4,9 +4,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { authFromEnv } from "../lib/auth";
 import { ensureDbPromise, setD1Binding } from "../lib/db";
 import { resetRateLimits } from "../lib/rate-limit";
+import rateLimitMiddleware from "../middleware/04-rate-limit";
+import { testRouteContext } from "../testing/context";
 import { createTestD1 } from "../testing/d1";
 import type { TestD1 } from "../testing/d1";
-import { handleHttp } from "./router";
+import { handleRecovery } from "./routes/internal";
 
 const ENV = {
   BASE_DOMAIN: "localhost",
@@ -41,7 +43,7 @@ const mint = (
   env: Record<string, string> = ENV
 ) =>
   Promise.resolve(
-    handleHttp(
+    handleRecovery(
       new Request("http://localhost:9080/internal/recovery", {
         body: JSON.stringify(body),
         headers: { authorization: `Bearer ${token}` },
@@ -106,14 +108,25 @@ describe("POST /internal/recovery", () => {
   });
 
   test("is rate limited like the other public machine routes", async () => {
+    // The limiter is a middleware now, not part of the route logic: drive
+    // it with the recovery path and count pass-throughs vs refusals.
+    resetRateLimits();
     const env = { ...ENV, NOITE_RATE_LIMIT_RPM: "2" };
-    const statuses: number[] = [];
+    const statuses: (number | undefined)[] = [];
     for (let i = 0; i < 4; i += 1) {
       // oxlint-disable-next-line eslint/no-await-in-loop -- the limiter counts in order
-      const response = await mint({}, "wrong", env);
-      statuses.push(response.status);
+      const response = await rateLimitMiddleware(
+        testRouteContext(
+          new Request("http://localhost:9080/internal/recovery", {
+            method: "POST",
+          }),
+          env as unknown as never
+        ),
+        () => Promise.resolve()
+      );
+      statuses.push(response?.status);
     }
-    expect(statuses).toEqual([401, 401, 429, 429]);
+    expect(statuses).toEqual([undefined, undefined, 429, 429]);
   });
 });
 

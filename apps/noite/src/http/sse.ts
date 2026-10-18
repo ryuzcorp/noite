@@ -1,12 +1,3 @@
-/** Response for a hand-rolled SSE stream. */
-export const sseResponse = (stream: ReadableStream): Response => {
-  const headers = new Headers();
-  headers.set("content-type", "text/event-stream");
-  headers.set("cache-control", "no-cache");
-  headers.set("connection", "keep-alive");
-  return new Response(stream, { headers });
-};
-
 /** Sleep `ms`, waking early when `signal` aborts. The abort listener is
  * removed on every exit path: a long-lived stream sleeps once per cycle, and
  * a listener left behind each time would pile up on `request.signal` for as
@@ -30,14 +21,3 @@ export const sleepUnlessAborted = (
     const timer = setTimeout(wake, ms);
     signal.addEventListener("abort", wake, { once: true });
   });
-
-/** Close a stream controller the client may already have cancelled. */
-export const closeQuietly = (
-  controller: ReadableStreamDefaultController
-): void => {
-  try {
-    controller.close();
-  } catch {
-    // Already closed by the client going away.
-  }
-};

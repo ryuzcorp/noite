@@ -34,6 +34,10 @@ export default defineConfig({
       "/assets/*": ["Cache-Control: public, max-age=31536000, immutable"],
     },
   },
+  // The web root is `src`: Void scans `src/routes`, `src/middleware` (and,
+  // from the pages slice, `src/pages`) there. Project files (this config,
+  // `vite.config.ts`, `package.json`, `public/`) stay at the project root.
+  sourceDir: "src",
   worker: {
     compatibility_date: "2026-09-01",
     vars: {

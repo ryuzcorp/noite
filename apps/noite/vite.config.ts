@@ -382,11 +382,12 @@ export default defineConfig({
     // pod's own paths by host.
     nodepodClient(),
     // Void owns the worker entry (middleware → routes → pages → static
-    // assets), generated from root `middleware/` plus `void.config.ts` — no
-    // wrangler file, no `src/worker.ts`. `voidIlha()` renders Void pages
-    // with ilha (none exist yet; the pages slice adds them).
-    // The 15 s per-action bound oxide enforced has no Void equivalent (no
-    // per-action or per-handler timeout exists in void 1.1.11) — named gap.
+    // assets), generated from `src/middleware/` + `src/routes/` plus
+    // `void.config.ts` (`sourceDir: "src"`) — no wrangler file, no
+    // `src/worker.ts`. `voidIlha()` renders Void pages with ilha (none
+    // exist yet; the pages slice adds them). The 15 s per-route bound
+    // oxide enforced lives in `src/middleware/01-timeout.ts` (JSON 504,
+    // stream/R2/archive exempt).
     voidPlugin(),
     voidIlha(),
     nodepodSideEffects(),
