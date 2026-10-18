@@ -13,7 +13,7 @@ import * as Schema from "effect/Schema";
 import { getAuthDb, resolveEnv } from "./db";
 import { errorMessage } from "./errors";
 import { isLocalhostDomain } from "./local-host";
-import { fail } from "./server-context";
+import { fail } from "./server/api";
 import {
   checkInvite,
   consumeInvite,

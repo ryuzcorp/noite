@@ -2,11 +2,11 @@
 //! (identity, status, actions) and the Overview tab's cards.
 import { atom, watch } from "ilha";
 
+import { api } from "../api";
 import { appHost, appUrl, presenceTone } from "../apps/identity";
 import { errorMessage } from "../errors";
 import { appDetail } from "../resources";
 import type { AppRole } from "../roles";
-import { setDesired, retryImport } from "../server/apps.server";
 import { sleep } from "../sleep";
 import { AppStorageList } from "../storage/list";
 import { Avatar } from "../ui/avatar";
@@ -190,7 +190,10 @@ export const AppHeader = ({ appId }: { appId: string }) => {
               onclick={async () => {
                 const next = running ? "stopped" : "running";
                 try {
-                  await setDesired({ desiredState: next, id: app.id });
+                  await api<{ ok: true }>("/api/apps/setDesired", {
+                    desiredState: next,
+                    id: app.id,
+                  });
                   notice.set(null);
                   converging.set(next);
                 } catch (error) {
@@ -212,7 +215,7 @@ export const AppHeader = ({ appId }: { appId: string }) => {
               onclick={async () => {
                 importBusy.set(true);
                 try {
-                  await retryImport(app.id);
+                  await api<{ ok: true }>("/api/apps/retryImport", app.id);
                   notice.set(null);
                   // The import runs in the background: poll the shared detail
                   // until the app leaves `importing` (then the deploy, or a

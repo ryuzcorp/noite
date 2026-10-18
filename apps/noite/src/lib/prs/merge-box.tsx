@@ -5,13 +5,13 @@
  * review buttons. */
 import { atom, watch } from "ilha";
 
+import { api } from "../api";
+import type { PrMergeInput } from "../api-types";
 import { errorMessage } from "../errors";
 import { collectRef, liveEl, newLiveRef } from "../live-ref";
 import { environments } from "../resources";
 import type { AppRole } from "../roles";
 import type { PrDetail } from "../runner";
-import { prsMerge, prsReview, prsUpdate } from "../server/prs.server";
-import type { PrMergeInput } from "../server/prs.server";
 import { latestReviews } from "./data";
 import { invalidatePr } from "./resources";
 
@@ -227,7 +227,7 @@ const MergeDropdown = ({
                   if (squashMessage !== "") {
                     args.message = squashMessage;
                   }
-                  await prsMerge(args);
+                  await api<{ ok: true }>("/api/prs/prsMerge", args);
                   open.set(false);
                 });
               }}
@@ -274,7 +274,7 @@ export const PrHeaderActions = ({
             disabled={busy()}
             onclick={() => {
               void run(async () => {
-                await prsUpdate({
+                await api<{ ok: true }>("/api/prs/prsUpdate", {
                   appId,
                   number: pullRequest.number,
                   state: pullRequest.state === "open" ? "closed" : "open",
@@ -411,7 +411,11 @@ export const PrReviewBox = ({
   }
   const review = (state: "approved" | "changes_requested") => {
     void run(async () => {
-      await prsReview({ appId, number: pullRequest.number, state });
+      await api<{ ok: true }>("/api/prs/prsReview", {
+        appId,
+        number: pullRequest.number,
+        state,
+      });
     });
   };
   return (

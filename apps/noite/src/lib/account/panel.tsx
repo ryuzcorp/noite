@@ -1,5 +1,6 @@
 import { atom } from "ilha";
 
+import { api } from "../api";
 import { authClient } from "../auth-client";
 import { formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
@@ -11,7 +12,6 @@ import {
   passkeys,
   session,
 } from "../resources";
-import { createApiKey } from "../server/account.server";
 import { confirmDialog } from "../ui/confirm";
 import { CopyButton } from "../ui/copy-button";
 import { Dialog } from "../ui/dialog";
@@ -301,7 +301,7 @@ export const AccountPanel = () => {
     keyError.set("");
     freshKey.set(null);
     try {
-      const { key } = await createApiKey({
+      const { key } = await api<{ key: string }>("/api/account/createApiKey", {
         appManagement,
         events,
         name: label,

@@ -7,12 +7,12 @@
 import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
+import { api } from "../api";
+import type { SlugCheck } from "../api-types";
 import { formatBytes } from "../bytes";
 import { commitSource } from "../commit-source";
 import { errorMessage } from "../errors";
 import { navigate } from "../navigation";
-import { create, slugCheck } from "../server/apps.server";
-import type { SlugCheck } from "../server/apps.server";
 import { readDroppedItems } from "../source/uploads";
 import {
   ArrowUpRight,
@@ -29,35 +29,14 @@ import type { ProjectUpload } from "./folder-drop";
 import { appUrl, slugifyName } from "./identity";
 import { TEMPLATES } from "./templates";
 
-// TRANSIENT (slice 2): same-key dedupe replacing oxidejs's mutation queue —
-// a double submit for one slug creates one app. Offline replay and
-// cross-reload persistence (what the queue added) wait for the pages slice's
-// form story. Concurrent submits for one slug share the in-flight call.
-const inFlight = new Map<string, Promise<{ id: string }>>();
-const createQueued = (input: {
-  name: string;
-  slug: string;
-  source?: CreateSourceInput;
-}): Promise<{ id: string }> => {
-  const key = `create:${input.slug}`;
-  const running = inFlight.get(key);
-  if (running !== undefined) {
-    return running;
-  }
-  const call = create(input);
-  inFlight.set(key, call);
-  void (async (): Promise<void> => {
-    try {
-      await call;
-    } catch {
-      // The caller's own await rethrows; the queue only tracks liveness.
-    }
-    if (inFlight.get(key) === call) {
-      inFlight.delete(key);
-    }
-  })();
-  return call;
-};
+// The Void form story for this page: the create endpoint answers the 422
+// `{errors}` shape every Void form reads, and the pending guard below
+// replaces oxidejs's mutation queue — while a create is in flight the button
+// is disabled and a re-submit returns early, so a double submit creates one
+// app. Offline replay and cross-reload persistence (what the queue added)
+// wait for the pages slice's `useForm` adoption: a successful create must
+// navigate with the new id (and possibly commit an upload first), not reload
+// like `useIslandForm` does.
 
 const MODES = [
   {
@@ -460,7 +439,9 @@ export const CreateAppForm = () => {
   const checkNow = async (value: string): Promise<SlugCheck | null> => {
     slugState.set({ slug: value, status: "checking" });
     try {
-      const result = await slugCheck({ slug: value });
+      const result = await api<SlugCheck>("/api/apps/slugCheck", {
+        slug: value,
+      });
       if (slug().trim().toLowerCase() === value) {
         slugState.set({ result, slug: value, status: "done" });
       }
@@ -601,6 +582,23 @@ export const CreateAppForm = () => {
     });
   };
 
+  /** Show a failed create: a slug lost to a race (or reserved) belongs under
+   * the Slug field, not in a banner quoting the runner — ask again and show
+   * it there; anything else goes in the notice. */
+  const failCreate = async (
+    slugValue: string,
+    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site values are unknown by construction; this maps them to the notice.
+    error: unknown
+  ): Promise<void> => {
+    busy.set(false);
+    const recheck = await checkNow(slugValue);
+    if (recheck?.error) {
+      document.querySelector<HTMLElement>("#create-slug")?.focus();
+      return;
+    }
+    notice.set(errorMessage(error));
+  };
+
   const submit = async (event: SubmitEvent) => {
     event.preventDefault();
     notice.set(null);
@@ -638,24 +636,21 @@ export const CreateAppForm = () => {
     }
     const { source } = picked;
     const upload = folder();
+    // Pending guard: the button is already disabled while busy, and a second
+    // submit (double Enter) returns here instead of creating a second app.
+    if (busy()) {
+      return;
+    }
     busy.set(true);
     let createdId: string;
     try {
-      ({ id: createdId } = await createQueued({
+      ({ id: createdId } = await api<{ id: string }>("/api/apps/create", {
         name: trimmedName,
         slug: nextSlug,
         source: upload ? { kind: "blank" } : source,
       }));
     } catch (error) {
-      busy.set(false);
-      // A slug lost to a race (or reserved) belongs under the Slug field, not
-      // in a banner quoting the runner: ask again and show it there.
-      const recheck = await checkNow(nextSlug);
-      if (recheck?.error) {
-        document.querySelector<HTMLElement>("#create-slug")?.focus();
-        return;
-      }
-      notice.set(errorMessage(error));
+      await failCreate(nextSlug, error);
       return;
     }
     if (upload) {

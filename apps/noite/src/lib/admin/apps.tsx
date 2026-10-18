@@ -3,12 +3,12 @@
 import { atom } from "ilha";
 import type { View } from "ilha";
 
+import { api } from "../api";
+import type { AdminAppRow } from "../api-types";
 import { presenceTone } from "../apps/identity";
 import { errorMessage } from "../errors";
 import { listAllApps } from "../resources";
 import { searchParam } from "../search-param";
-import { adminDeleteApp, adminSetAppState } from "../server/admin.server";
-import type { AdminAppRow } from "../server/admin.server";
 import { Avatar } from "../ui/avatar";
 import { confirmDialog } from "../ui/confirm";
 import {
@@ -138,7 +138,7 @@ export const AdminAppsPanel = () => {
             busy={busy()}
             onToggle={(app) => {
               void mutate(() =>
-                adminSetAppState({
+                api<{ ok: true }>("/api/admin/adminSetAppState", {
                   desiredState:
                     app.desiredState === "running" ? "stopped" : "running",
                   id: app.id,
@@ -156,7 +156,9 @@ export const AdminAppsPanel = () => {
                 if (!ok) {
                   return;
                 }
-                await mutate(() => adminDeleteApp(app.id));
+                await mutate(() =>
+                  api<{ ok: true }>("/api/admin/adminDeleteApp", app.id)
+                );
               })();
             }}
           />

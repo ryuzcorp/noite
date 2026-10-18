@@ -40,7 +40,6 @@ import type { StorageItem } from "./runner-types/StorageItem";
 import type { TelemetryStatus as RunnerTelemetryStatus } from "./runner-types/TelemetryStatus";
 import type { TreeResponse as RunnerTree } from "./runner-types/TreeResponse";
 /** Server-side client for the Rust runner. Browser never sees RUNNER_TOKEN. */
-import { useEnv } from "./server-context";
 
 export type { App as RunnerApp } from "./runner-types/App";
 export type { AppDeviceStat as RunnerDevice } from "./runner-types/AppDeviceStat";
@@ -110,23 +109,13 @@ export type { TelemetryEvent as RunnerTelemetryEvent } from "./runner-types/Tele
 export type { TelemetryStatus as RunnerTelemetryStatus } from "./runner-types/TelemetryStatus";
 export type { TreeEntry } from "./runner-types/TreeEntry";
 export type { TreeResponse as RunnerTree } from "./runner-types/TreeResponse";
-
-const alsEnv = (): KitEnv | undefined => {
-  try {
-    return useEnv<KitEnv>();
-  } catch {
-    return undefined;
-  }
-};
-
 const readEnv = (): KitEnv => {
   hydrateControlEnv();
   const merged = {
     ...controlEnv,
     ...(typeof process === "undefined" ? undefined : process.env),
-    ...alsEnv(),
   };
-  // SAFETY: merged carries the union of controlEnv defaults, process.env, and the ALS env — all keyed by the same env names KitEnv declares; unset string keys are left undefined which callers already tolerate.
+  // SAFETY: merged carries the union of controlEnv defaults (stamped per request by the middleware) and process.env — all keyed by the same env names KitEnv declares; unset string keys are left undefined which callers already tolerate.
   return merged as KitEnv;
 };
 
@@ -138,11 +127,10 @@ export const RUNNER_DEFAULT_URL = "http://127.0.0.1:8080";
 const runnerBase = () =>
   (readEnv().RUNNER_URL ?? RUNNER_DEFAULT_URL).replace(/\/$/u, "");
 
-/** Stamp the platform env for runner calls made on the edge fetch path.
- * Only an entered request scope feeds `readEnv` (actions, workflows and
- * queues), so a plain route handler — `/internal/git-auth`, the SSE
- * pollers — otherwise sees the localhost-family dev defaults and misses the
- * real RUNNER_URL/RUNNER_TOKEN. */
+/** Stamp the platform env for runner calls made outside an endpoint handler.
+ * The middleware stamps every request, so a plain route handler —
+ * `/internal/git-auth`, the SSE pollers — otherwise sees the
+ * localhost-family dev defaults and misses the real RUNNER_URL/RUNNER_TOKEN. */
 export const stampRunnerEnv = (env: KitEnv): void => {
   for (const key of ["RUNNER_TOKEN", "RUNNER_URL"] as const) {
     const value = env[key];

@@ -1,15 +1,15 @@
 import { atom } from "ilha";
 
+import { api } from "../api";
 import { formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
 import type { EventsSnapshot } from "../feeds";
 import { decodeEvents, eventsUrl, feedKeys, liveFeed } from "../feeds";
-import type { RunnerEvent } from "../runner";
+import type { RunnerEvent, RunnerUserProps } from "../runner";
 //! Per-app event feed (LogSnag-style): channel filter, insight widgets,
 //! expandable rows with tags + user properties, and an ingest snippet.
 import { searchParam } from "../search-param";
 import type { SearchParam } from "../search-param";
-import { getUserProps } from "../server/events.server";
 import { ChevronDown } from "../ui/icons";
 
 const parseTags = (raw: string): [string, string][] => {
@@ -311,7 +311,10 @@ const EventsFeed = ({
     if (open && event.userId && !(event.userId in profiles())) {
       void (async () => {
         try {
-          const row = await getUserProps({ appId, userId: event.userId });
+          const row = await api<RunnerUserProps | null>(
+            "/api/events/getUserProps",
+            { appId, userId: event.userId }
+          );
           profiles.set({
             ...profiles(),
             [event.userId]: row?.properties ?? "",

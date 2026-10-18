@@ -2,15 +2,11 @@
  * comment/review cards the Conversation and Files tabs both render. */
 import { atom } from "ilha";
 
+import { api } from "../api";
 import { formatAgo } from "../dates";
 import { errorMessage } from "../errors";
 import type { AppRole } from "../roles";
 import type { PrComment, PrReview } from "../runner";
-import {
-  prsComment,
-  prsCommentDelete,
-  prsCommentEdit,
-} from "../server/prs.server";
 import { Avatar } from "../ui/avatar";
 import { confirmDialog } from "../ui/confirm";
 import { lineAnchor } from "./data";
@@ -81,7 +77,7 @@ export const CommentComposer = ({
     notice.set("");
     try {
       await (anchor
-        ? prsComment({
+        ? api<{ ok: true }>("/api/prs/prsComment", {
             appId,
             body,
             commitSha: anchor.commitSha,
@@ -90,7 +86,7 @@ export const CommentComposer = ({
             path: anchor.path,
             side: anchor.side,
           })
-        : prsComment({ appId, body, number }));
+        : api<{ ok: true }>("/api/prs/prsComment", { appId, body, number }));
       draft.set("");
       invalidatePr(appId, number);
       onPosted?.();
@@ -209,7 +205,11 @@ export const CommentCard = ({
                 return;
               }
               void run(async () => {
-                await prsCommentEdit({ appId, body, commentId: comment.id });
+                await api<{ ok: true }>("/api/prs/prsCommentEdit", {
+                  appId,
+                  body,
+                  commentId: comment.id,
+                });
                 editing.set(false);
               });
             }}
@@ -280,7 +280,10 @@ export const CommentCard = ({
                     return;
                   }
                   await run(async () => {
-                    await prsCommentDelete({ appId, commentId: comment.id });
+                    await api<{ ok: true }>("/api/prs/prsCommentDelete", {
+                      appId,
+                      commentId: comment.id,
+                    });
                   });
                 }}
               >

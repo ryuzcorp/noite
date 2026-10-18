@@ -1,5 +1,6 @@
 import { atom } from "ilha";
 
+import { api } from "../api";
 import { formatAgo, formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
 import { decodeErrors, errorsUrl, feedKeys, liveFeed } from "../feeds";
@@ -17,7 +18,6 @@ import type {
   RunnerErrorList,
 } from "../runner";
 import { searchParam } from "../search-param";
-import { setErrorStatus } from "../server/errors.server";
 import { ArrowLeft } from "../ui/icons";
 import { LoadError } from "../ui/load-error";
 import { ListSkeleton, SectionSkeleton } from "../ui/skeletons";
@@ -358,7 +358,11 @@ const TriageButtons = ({
     busy.set(true);
     failure.set("");
     try {
-      await setErrorStatus({ appId, fingerprint: issue.fingerprint, status });
+      await api<{ ok: true }>("/api/errors/setErrorStatus", {
+        appId,
+        fingerprint: issue.fingerprint,
+        status,
+      });
       await onDone();
     } catch (error) {
       failure.set(errorMessage(error));

@@ -3,6 +3,7 @@
 
 import { atom } from "ilha";
 
+import { api } from "../api";
 import type { App } from "../collaborators";
 import {
   CONTROL_APP_ID,
@@ -19,10 +20,6 @@ import {
   myInvitations,
   session,
 } from "../resources";
-import {
-  acceptInvitation,
-  declineInvitation,
-} from "../server/collaborators.server";
 import { Avatar } from "../ui/avatar";
 import { ChevronRight } from "../ui/icons";
 import { ListSkeleton } from "../ui/skeletons";
@@ -43,11 +40,17 @@ const InvitationsBanner = () => {
     notice.set("");
     try {
       if (accept) {
-        const { appId } = await acceptInvitation(inviteId);
+        const { appId } = await api<{ appId: string }>(
+          "/api/collaborators/acceptInvitation",
+          inviteId
+        );
         invalidate(keys.myInvitations);
         navigate(`/apps/${appId}`);
       } else {
-        await declineInvitation(inviteId);
+        await api<{ ok: true }>(
+          "/api/collaborators/declineInvitation",
+          inviteId
+        );
         invalidate(keys.myInvitations);
       }
     } catch (error) {

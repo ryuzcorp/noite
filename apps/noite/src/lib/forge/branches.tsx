@@ -1,5 +1,6 @@
 import { atom } from "ilha";
 
+import { api } from "../api";
 import { errorMessage } from "../errors";
 import { collectRef, liveEl, newLiveRef } from "../live-ref";
 /** Branch UI: the compare/new-PR ref select, and the source page's branch
@@ -7,9 +8,7 @@ import { collectRef, liveEl, newLiveRef } from "../live-ref";
  * foot (per contract: create needs `push`, delete needs `admin`). */
 import { navigate } from "../navigation";
 import { appDetail, environments, invalidate, keys } from "../resources";
-import type { GitBranch } from "../runner";
-import { createEnvironment } from "../server/environments.server";
-import { gitBranchCreate, gitBranchDelete } from "../server/forge.server";
+import type { GitBranch, RunnerEnvironment } from "../runner";
 import { confirmDialog } from "../ui/confirm";
 import {
   ArrowUpDown,
@@ -389,10 +388,13 @@ export const BranchPicker = ({
               onPick={pick}
               onEnvironment={(target) => {
                 void run(async () => {
-                  const env = await createEnvironment({
-                    appId,
-                    branch: target,
-                  });
+                  const env = await api<RunnerEnvironment | null>(
+                    "/api/environments/createEnvironment",
+                    {
+                      appId,
+                      branch: target,
+                    }
+                  );
                   invalidate(keys.environments(appId));
                   navigate(
                     env
@@ -426,7 +428,10 @@ export const BranchPicker = ({
                     return;
                   }
                   await run(async () => {
-                    await gitBranchDelete({ appId, name: target });
+                    await api<{ ok: true }>("/api/forge/gitBranchDelete", {
+                      appId,
+                      name: target,
+                    });
                     if (target === value) {
                       onChange(defaultBranch);
                     }
@@ -466,7 +471,7 @@ export const BranchPicker = ({
                 // (see `canEditRef` in the source page), and only the next read
                 // of that list holds the branch this just created.
                 const created = await run(async () => {
-                  await gitBranchCreate({
+                  await api<{ ok: true }>("/api/forge/gitBranchCreate", {
                     appId,
                     from: value,
                     name,

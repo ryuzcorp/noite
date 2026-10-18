@@ -2,16 +2,11 @@
 
 import { atom } from "ilha";
 
+import { api } from "../../api";
 import { errorMessage } from "../../errors";
 import { collaborators, pendingInvitations } from "../../resources";
 import { parseAppRole } from "../../roles";
 import type { AppRole } from "../../roles";
-import {
-  inviteCollaborator,
-  removeCollaborator,
-  revokeInvitation,
-  updateCollaboratorRole,
-} from "../../server/collaborators.server";
 import { Dialog } from "../../ui/dialog";
 import { LoadError } from "../../ui/load-error";
 import { ListSkeleton } from "../../ui/skeletons";
@@ -57,11 +52,14 @@ export const CollaboratorsPanel = ({
     const next = parseAppRole(inviteRole());
     busy.set(true);
     try {
-      const result = await inviteCollaborator({
-        appId,
-        email: address,
-        role: next ?? "view",
-      });
+      const result = await api<{ ok: true; status: "updated" | "invited" }>(
+        "/api/collaborators/inviteCollaborator",
+        {
+          appId,
+          email: address,
+          role: next ?? "view",
+        }
+      );
       inviteEmail.set("");
       err.set("");
       // The same wording either way: which addresses have accounts is not
@@ -128,11 +126,14 @@ export const CollaboratorsPanel = ({
                     return;
                   }
                   try {
-                    await updateCollaboratorRole({
-                      appId,
-                      role: next,
-                      userId: c.userId,
-                    });
+                    await api<{ ok: true }>(
+                      "/api/collaborators/updateCollaboratorRole",
+                      {
+                        appId,
+                        role: next,
+                        userId: c.userId,
+                      }
+                    );
                     await reload();
                   } catch (error) {
                     err.set(errorMessage(error));
@@ -159,7 +160,10 @@ export const CollaboratorsPanel = ({
                 class="btn btn-sm"
                 onclick={async () => {
                   try {
-                    await removeCollaborator({ appId, userId: c.userId });
+                    await api<{ ok: true }>(
+                      "/api/collaborators/removeCollaborator",
+                      { appId, userId: c.userId }
+                    );
                     await reload();
                   } catch (error) {
                     err.set(errorMessage(error));
@@ -192,10 +196,13 @@ export const CollaboratorsPanel = ({
                   class="btn btn-sm"
                   onclick={async () => {
                     try {
-                      await revokeInvitation({
-                        appId,
-                        inviteId: pendingInvite.id,
-                      });
+                      await api<{ ok: true }>(
+                        "/api/collaborators/revokeInvitation",
+                        {
+                          appId,
+                          inviteId: pendingInvite.id,
+                        }
+                      );
                       await reload();
                     } catch (error) {
                       err.set(errorMessage(error));

@@ -3,11 +3,11 @@
 
 import { atom } from "ilha";
 
+import { api } from "../../api";
 import { formatBytes } from "../../bytes";
 import { errorMessage } from "../../errors";
 import { invalidateR2, r2List } from "../../resources";
 import { R2_UPLOAD_LIMIT } from "../../runner";
-import { r2Delete } from "../../server/storage.server";
 import { ChevronLeft, ChevronRight, Refresh, Search } from "../../ui/icons";
 import { DetailPanel, EmptyState } from "../shared";
 import { R2DetailPanel } from "./detail";
@@ -169,7 +169,11 @@ const R2Page = ({
   const runDelete = (keys: string[]) => {
     void write(
       async () => {
-        await r2Delete({ appId, bucket, keys });
+        await api<{ ok: true }>("/api/storage/r2Delete", {
+          appId,
+          bucket,
+          keys,
+        });
         checked.set(new Set());
         confirming.set(false);
         if (keys.includes(selected() ?? "")) {

@@ -1,3 +1,4 @@
+import { api } from "$lib/api";
 import { BranchPicker } from "$lib/forge/branches";
 import { CODE_PANELS, PanelToggles, toCodePanel } from "$lib/forge/code-bar";
 import type { CodePanel } from "$lib/forge/code-bar";
@@ -11,7 +12,6 @@ import type { AppRole } from "$lib/roles";
 import type { GitRefs, RunnerEnvironment } from "$lib/runner";
 import { parseSkip, searchParam } from "$lib/search-param";
 import type { SearchParam } from "$lib/search-param";
-import { sourcePreviewOrigin } from "$lib/server/preview.server";
 import { branchRules } from "$lib/source/branch-rules";
 import { SourceBrowser } from "$lib/source/browser";
 import type { SourceBrowserProps } from "$lib/source/browser";
@@ -335,7 +335,10 @@ const SourceBody = ({ appId }: { appId: string }) => {
   // origin for this app (the edge serves the pod's four assets there), so guest
   // code never runs on this page's origin.
   const podHostOrigin = async (): Promise<string> => {
-    const { previewOrigin } = await sourcePreviewOrigin({ appId });
+    const { previewOrigin } = await api<{ previewOrigin: string }>(
+      "/api/preview/sourcePreviewOrigin",
+      { appId }
+    );
     // The action cannot see the page's scheme through a TLS-terminating
     // proxy: repeat its mixed-content refusal here with the real one, so the
     // browser fails closed instead of framing an origin that cannot connect.

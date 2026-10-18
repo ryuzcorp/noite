@@ -1,6 +1,8 @@
 import { atom } from "ilha";
 import type { AtomHandle } from "ilha";
 
+import { api } from "../api";
+import type { PrCreateInput } from "../api-types";
 import { errorMessage } from "../errors";
 import { RefSelect } from "../forge/branches";
 import { forgeCompare, forgeRefs } from "../forge/data";
@@ -8,9 +10,7 @@ import { forgeCompare, forgeRefs } from "../forge/data";
  * and body; it explains why Create is off and lands on the detail page on
  * success. */
 import { navigate } from "../navigation";
-import type { GitCompare } from "../runner";
-import { prsCreate } from "../server/prs.server";
-import type { PrCreateInput } from "../server/prs.server";
+import type { GitCompare, PrDetail } from "../runner";
 import { invalidatePr, prList } from "./resources";
 
 /** The reasons Create is off, in the order the form reads them. Passed
@@ -116,7 +116,7 @@ const submitNewPr = async ({
     if (body !== "") {
       args.body = body;
     }
-    const detail = await prsCreate(args);
+    const detail = await api<PrDetail>("/api/prs/prsCreate", args);
     invalidatePr(appId);
     navigate(`/apps/${appId}/pulls/${detail.pullRequest.number}`);
   } catch (error) {

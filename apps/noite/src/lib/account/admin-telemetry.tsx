@@ -1,6 +1,7 @@
 import { atom } from "ilha";
 import type { AtomHandle } from "ilha";
 
+import { api } from "../api";
 import { formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
 import {
@@ -11,7 +12,6 @@ import {
   telemetry,
 } from "../resources";
 import type { RunnerTelemetryStatus } from "../runner";
-import { setTelemetry } from "../server/telemetry.server";
 import { LoadError } from "../ui/load-error";
 import { SectionSkeleton } from "../ui/skeletons";
 
@@ -61,7 +61,7 @@ const TelemetrySettings = ({
     busy.set(true);
     error.set("");
     try {
-      await setTelemetry({ enabled });
+      await api<{ ok: true }>("/api/telemetry/setTelemetry", { enabled });
       draft.set(null);
       saved.set(true);
       // Detail rows (last sent, payload, effective state) come from the

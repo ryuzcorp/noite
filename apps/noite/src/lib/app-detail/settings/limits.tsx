@@ -2,10 +2,10 @@
 
 import { atom } from "ilha";
 
+import { api } from "../../api";
 import { errorMessage } from "../../errors";
 import { limits } from "../../resources";
 import type { AppRole } from "../../roles";
-import { setLimits } from "../../server/limits.server";
 import { LoadError } from "../../ui/load-error";
 import { SectionSkeleton } from "../../ui/skeletons";
 import { SettingsSection } from "./section";
@@ -76,7 +76,11 @@ export const RateLimitsPanel = ({
     err.set("");
     note.set("");
     try {
-      await setLimits({ appId, appRpm, clientRpm });
+      await api<{ ok: true }>("/api/limits/setLimits", {
+        appId,
+        appRpm,
+        clientRpm,
+      });
       clientDraft.set(null);
       appDraft.set(null);
       await res.refetch();

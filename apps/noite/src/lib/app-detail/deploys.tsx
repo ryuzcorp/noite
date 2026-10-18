@@ -1,6 +1,7 @@
 //! Deploy history: header dropdown + SSE list.
 import { atom } from "ilha";
 
+import { api } from "../api";
 import { appHost, appUrl } from "../apps/identity";
 import { formatDateTime } from "../dates";
 import { errorMessage } from "../errors";
@@ -9,7 +10,6 @@ import { appDetail, deployLog, environments } from "../resources";
 import type { AppRole } from "../roles";
 import type { RunnerDeploy } from "../runner";
 import { searchParam } from "../search-param";
-import { rollback } from "../server/apps.server";
 import { confirmDialog } from "../ui/confirm";
 import { CopyButton } from "../ui/copy-button";
 import { ChevronDown, ChevronUp, CloudUpload, Plus } from "../ui/icons";
@@ -103,7 +103,10 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
                   redeployError.set("");
                   void (async () => {
                     try {
-                      await rollback({ appId, sha });
+                      await api<{ ok: true }>("/api/apps/rollback", {
+                        appId,
+                        sha,
+                      });
                     } catch (error) {
                       redeployError.set(errorMessage(error));
                     }
@@ -257,7 +260,7 @@ const DeployRow = ({
               rolling.set(true);
               rollError.set("");
               try {
-                await rollback({ appId, sha });
+                await api<{ ok: true }>("/api/apps/rollback", { appId, sha });
               } catch (error) {
                 rollError.set(errorMessage(error));
               }

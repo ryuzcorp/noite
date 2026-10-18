@@ -9,7 +9,6 @@ import { createMigrator, defineSchema, paranorm } from "paranorm";
 import type { InferSchema, Selectable } from "paranorm";
 
 import { controlEnv } from "./control-env";
-import { useEnv } from "./server-context";
 
 // D1 holds auth (better-auth tables) plus collaborator grants and their
 // pending invitations — the ONLY app-shaped state the UI owns. App rows and deploy history live in the runner
@@ -354,33 +353,20 @@ export const setD1Binding = (db: D1Database) => {
   d1Binding = db;
 };
 
-/** Live D1: request ALS env first, then the middleware-stamped binding. */
+/** Live D1: the middleware-stamped binding (`src/middleware/03-db.ts` stamps
+ * it on every request; tests stamp it by hand). */
 export const resolveD1 = (): D1Database => {
-  try {
-    const live = useEnv<KitEnv>()?.DB;
-    if (live) {
-      return live;
-    }
-  } catch {
-    // Outside a request store — fall through to the stamped binding.
-  }
   if (d1Binding) {
     return d1Binding;
   }
   throw missingDb();
 };
 
-/** Request-scoped env over process defaults (Worker-safe: no bare process.env). */
-export const resolveEnv = (): KitEnv => {
-  let live: KitEnv | undefined;
-  try {
-    live = useEnv<KitEnv>();
-  } catch {
-    // Outside a request store — defaults only.
-  }
-  // SAFETY: the merged bag mirrors KitEnv (control defaults + live Worker env); unset keys stay undefined as callers tolerate.
-  return { ...controlEnv, ...live } as KitEnv;
-};
+/** Request-scoped env over control defaults (Worker-safe: no bare process.env).
+ * The middleware stamps the live Worker env onto `controlEnv` per request, so
+ * readers here see it without threading `c.env` through every query. */
+// SAFETY: the spread mirrors KitEnv (control defaults, stamped per request by the middleware); unset keys stay undefined as callers tolerate.
+export const resolveEnv = (): KitEnv => ({ ...controlEnv }) as KitEnv;
 
 /** Better Auth database: Kysely over D1 (fresh handle per call — D1 has no connections to pool). */
 export const getAuthDb = () =>

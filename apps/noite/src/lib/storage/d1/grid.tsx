@@ -6,10 +6,10 @@
 import { atom } from "ilha";
 import type { View } from "ilha";
 
+import { api } from "../../api";
 import { errorMessage } from "../../errors";
 import { d1Rows } from "../../resources";
 import type { D1Cell, D1RowsQuery, D1TableSchema } from "../../runner";
-import { d1DeleteRows } from "../../server/storage.server";
 import { ChevronLeft, ChevronRight, Key } from "../../ui/icons";
 import { isTimestampColumn, keyFor } from "../d1-values";
 import { CellValue } from "./cells";
@@ -202,12 +202,15 @@ export const RowsGrid = ({
           rowRecord(data.columns, data.rows[Number(index)] ?? [])
         )
       );
-      const result = await d1DeleteRows({
-        appId,
-        databaseId,
-        keys,
-        table: data.table,
-      });
+      const result = await api<{ deleted: number; ok: boolean }>(
+        "/api/storage/d1DeleteRows",
+        {
+          appId,
+          databaseId,
+          keys,
+          table: data.table,
+        }
+      );
       const deleted = result?.deleted ?? keys.length;
       failure.set("");
       selected.set({});
