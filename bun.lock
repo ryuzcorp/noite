@@ -32,7 +32,7 @@
         "cf": "1.0.0-beta.10",
         "effect": "^4.0.4",
         "ghostty-web": "0.4.0",
-        "ilha": "0.15.2",
+        "ilha": "^0.16.0",
         "kysely": "^0.29.6",
         "kysely-d1": "^0.4.0",
         "paranorm": "^0.3.5",
@@ -1397,7 +1397,7 @@
 
     "iconv-lite": ["iconv-lite@0.7.3", "", { "dependencies": { "safer-buffer": ">= 2.1.2 < 3.0.0" } }, "sha512-IKXpvIzjnC9XTAUbVBcMfGS0EPaIXtW6v+zr+RRp+hqULEpo0owZax6wyRwPOJbWbzjYspQwusTsfVr0ifh4uQ=="],
 
-    "ilha": ["ilha@0.15.2", "", { "peerDependencies": { "effect": "^4.0.0" } }, "sha512-mzV8+sKv2c8ry91ffzRJWG81Vtg0Zo8PQupe1w5kR5Bk1zvjJ8wGp8XKyA300pnt4FP9kgvwoCpetHrJaB7g7w=="],
+    "ilha": ["ilha@0.16.0", "", { "peerDependencies": { "effect": "^4.0.0" } }, "sha512-UHBvUIphsIN8DT+Q/if97w95m0ymJtQXZT+xYxToIYX8V+R7/yVY+ReqIAzLUBHZzb4NjK0po5IXCzOmVHshEg=="],
 
     "immediate": ["immediate@3.0.6", "", {}, "sha512-XXOFtyqDjNDAQxVfYxuF7g9Il/IbWmmlQg2MYKOH8ExIT1qg6xc4zyS3HaEEATgs1btfzxq15ciUiY7gjSXRGQ=="],
 

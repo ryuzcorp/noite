@@ -21,7 +21,7 @@
         "cf": "1.0.0-beta.10",
         "effect": "^4.0.4",
         "ghostty-web": "0.4.0",
-        "ilha": "0.15.2",
+        "ilha": "^0.16.0",
         "kysely": "^0.29.6",
         "kysely-d1": "^0.4.0",
         "paranorm": "^0.3.5",
@@ -522,7 +522,7 @@
 
     "htmlparser2": ["htmlparser2@10.1.0", "", { "dependencies": { "domelementtype": "^2.3.0", "domhandler": "^5.0.3", "domutils": "^3.2.2", "entities": "^7.0.1" } }, "sha512-VTZkM9GWRAtEpveh7MSF6SjjrpNVNNVJfFup7xTY3UpFtm67foy9HDVXneLtFVt4pMz5kZtgNcvCniNFb1hlEQ=="],
 
-    "ilha": ["ilha@0.15.2", "", { "peerDependencies": { "effect": "^4.0.0" } }, "sha512-mzV8+sKv2c8ry91ffzRJWG81Vtg0Zo8PQupe1w5kR5Bk1zvjJ8wGp8XKyA300pnt4FP9kgvwoCpetHrJaB7g7w=="],
+    "ilha": ["ilha@0.16.0", "", { "peerDependencies": { "effect": "^4.0.0" } }, "sha512-UHBvUIphsIN8DT+Q/if97w95m0ymJtQXZT+xYxToIYX8V+R7/yVY+ReqIAzLUBHZzb4NjK0po5IXCzOmVHshEg=="],
 
     "jiti": ["jiti@2.7.0", "", { "bin": { "jiti": "lib/jiti-cli.mjs" } }, "sha512-AC/7JofJvZGrrneWNaEnJeOLUx+JlGt7tNa0wZiRPT4MY1wmfKjt2+6O2p2uz2+skll8OZZmJMNqeke7kKbNgQ=="],
 

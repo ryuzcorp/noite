@@ -4,9 +4,8 @@
  * views. Same stale-while-revalidate contract as `lib/resources` (last good
  * snapshot paints until the fresh fetch lands).
  */
-import { invalidate, resource } from "ilha";
-import type { Resource, ResourceFetcher, ResourceOptions } from "ilha";
-
+import { invalidate, tracked as trackResource } from "../resource";
+import type { Resource, ResourceFetcher } from "../resource";
 import type { GitLog, GitRefs } from "../runner";
 import {
   gitCommit as fetchCommit,
@@ -15,27 +14,12 @@ import {
   gitRefs as fetchRefs,
 } from "../server/forge.server";
 import type { GitLogInput } from "../server/forge.server";
-import { withSnapshot, writeSwr } from "../swr-store";
 
 /** Commits per history page (the runner caps `limit` at 100). */
 export const LOG_PAGE_SIZE = 50;
 
-const tracked = <T>(
-  key: string,
-  fetcher: ResourceFetcher<T>,
-  opts?: ResourceOptions
-): Resource<T> => {
-  const res = resource<T>(
-    key,
-    async (k, ctx) => {
-      const value = await fetcher(k, ctx);
-      writeSwr(k, value);
-      return value;
-    },
-    opts
-  );
-  return { ...res, data: withSnapshot(key, res.data) };
-};
+const tracked = <T>(key: string, fetcher: ResourceFetcher<T>): Resource<T> =>
+  trackResource(key, fetcher);
 
 export const forgeKeys = {
   commit: (appId: string, sha: string) => `forge:commit:${appId}:${sha}`,

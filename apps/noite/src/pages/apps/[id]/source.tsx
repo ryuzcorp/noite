@@ -30,13 +30,14 @@ import { createPaneGroup, MORPH_PRESERVE } from "$lib/ui/resizable";
 import { ResizeHandle } from "$lib/ui/resize-handle";
 import { SidePanel } from "$lib/ui/side-panel";
 import { head, useRoute } from "@ilha/router";
-import { atom, structuralEqual, watch } from "ilha";
+import * as Equal from "effect/Equal";
+import { atom, watch } from "ilha";
 import type { AtomHandle, View } from "ilha";
 
 /** Keep a component atom in step with a value derived from props/resources
  * (an `atom(init)` only seeds on the first render). */
 const syncAtom = <T,>(handle: AtomHandle<T>, value: T): void => {
-  if (!structuralEqual(handle(), value)) {
+  if (!Equal.equals(handle(), value)) {
     handle.set(value);
   }
 };

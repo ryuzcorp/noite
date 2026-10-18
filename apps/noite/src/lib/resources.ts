@@ -1,12 +1,15 @@
-//! Shared async data: every resource key and fetcher in one module so
-//! keys can't drift between components. All hooks wrap ilha's `resource()`
-//! (deduped, abort signal) and paint the last good snapshot from
-//! lib/swr-store until fresh data lands — across SPA remounts and reloads.
-//! After a mutation call `invalidate(key)` or `res.refetch()`.
-import { invalidate, resource } from "ilha";
-import type { Resource, ResourceFetcher, ResourceOptions } from "ilha";
-
 import { authClient } from "./auth-client";
+//! Shared async data: every resource key and fetcher in one module so
+//! keys can't drift between components. All hooks wrap the shared Effect
+//! Cache in lib/resource (deduped lookups, abort signal) and paint the last
+//! good snapshot from lib/swr-store until fresh data lands — across SPA
+//! remounts and reloads. After a mutation call `invalidate(key)` or
+//! `res.refetch()`.
+import {
+  invalidate as invalidateKey,
+  tracked as trackResource,
+} from "./resource";
+import type { Resource, ResourceFetcher } from "./resource";
 import type { D1RowsQuery } from "./runner";
 import { myInviteCodes } from "./server/account.server";
 import {
@@ -39,37 +42,24 @@ import {
   r2List as fetchR2List,
 } from "./server/storage.server";
 import { getTelemetry } from "./server/telemetry.server";
-import { clearSwrStore, withSnapshot, writeSwr } from "./swr-store";
+import { clearSwrStore } from "./swr-store";
 
-export { invalidate } from "ilha";
+export { invalidate } from "./resource";
 
 /** Every key a hook has used this document. All cached data here is
  * user-scoped, so an auth change (sign-in, sign-out, impersonation) must
  * drop all of it — see `resetUserCaches`. */
 const usedKeys = new Set<string>();
 
-/** `resource()` with stale-while-revalidate across remounts *and* reloads:
- * `data` paints the last good snapshot (lib/swr-store) until the fresh
- * fetch lands, so panels skip skeletons whenever this key loaded before.
- * Each successful fetch writes the snapshot through. Consumers keep the
- * usual `loading() && data() === undefined` skeleton check — it now only
- * fires on a genuinely cold key. */
-const tracked = <T>(
-  key: string,
-  fetcher: ResourceFetcher<T>,
-  opts?: ResourceOptions
-): Resource<T> => {
+/** One mounted reader of `key` (lib/resource) with stale-while-revalidate
+ * across remounts *and* reloads: `data` paints the last good snapshot
+ * (lib/swr-store) until the fresh fetch lands, so panels skip skeletons
+ * whenever this key loaded before. Each successful fetch writes the snapshot
+ * through. Consumers keep the usual `loading() && data() === undefined`
+ * skeleton check — it now only fires on a genuinely cold key. */
+const tracked = <T>(key: string, fetcher: ResourceFetcher<T>): Resource<T> => {
   usedKeys.add(key);
-  const res = resource<T>(
-    key,
-    async (k, ctx) => {
-      const value = await fetcher(k, ctx);
-      writeSwr(k, value);
-      return value;
-    },
-    opts
-  );
-  return { ...res, data: withSnapshot(key, res.data) };
+  return trackResource(key, fetcher);
 };
 
 /** Drop every cached resource and snapshot, and refetch the live ones.
@@ -79,7 +69,7 @@ const tracked = <T>(
 export const resetUserCaches = (): void => {
   clearSwrStore();
   for (const key of usedKeys) {
-    invalidate(key);
+    invalidateKey(key);
   }
 };
 
@@ -104,7 +94,7 @@ export const invalidateD1 = (appId: string, databaseId: string): void => {
   const prefix = `app:${appId}:d1:${databaseId}:`;
   for (const key of usedKeys) {
     if (key.startsWith(prefix)) {
-      invalidate(key);
+      invalidateKey(key);
     }
   }
 };
@@ -115,7 +105,7 @@ export const invalidateR2 = (appId: string, bucket: string): void => {
   const prefix = `app:${appId}:r2:${bucket}:`;
   for (const key of usedKeys) {
     if (key.startsWith(prefix)) {
-      invalidate(key);
+      invalidateKey(key);
     }
   }
 };
@@ -208,7 +198,7 @@ export const environments = (id: string) =>
  * one's tip or changed its status, and every reader of the list (the Preview
  * panel, the Deployments tab) must read them again. */
 export const invalidateEnvironments = (id: string): void => {
-  invalidate(keys.environments(id));
+  invalidateKey(keys.environments(id));
 };
 
 /** One environment's variable overrides, redacted (view-gated server side). */
