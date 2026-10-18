@@ -3,7 +3,7 @@ import * as Schema from "effect/Schema";
 import { failUnknown } from "../auth";
 import { requireAppRole } from "../collaborators";
 import { runnerDeleteEnv, runnerListEnv, runnerSetEnv } from "../runner";
-import { action, withSchema } from "../server-context";
+import { action, useEnv, useRequest, withSchema } from "../server-context";
 import { AuthError, requireViewApp, sessionUser } from "./session.server";
 
 const AppId = Schema.String;
@@ -47,7 +47,7 @@ export const redactEnv = ({
 
 export const listEnv = action(
   withSchema(AppId, async (appId): Promise<EnvVarView[]> => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     const rows = await runnerListEnv(appId);
     return rows.map((row) => redactEnv(row));
   }),
@@ -56,7 +56,7 @@ export const listEnv = action(
 
 export const setEnv = action(
   withSchema(SetEnvArgs, async ({ appId, name, value }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "admin");
     try {
       return await runnerSetEnv(appId, name, value);
@@ -69,7 +69,7 @@ export const setEnv = action(
 
 export const deleteEnv = action(
   withSchema(DeleteEnvArgs, async ({ appId, name }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "admin");
     try {
       return await runnerDeleteEnv(appId, name);
@@ -84,7 +84,7 @@ export const deleteEnv = action(
  * the one place secret values leave the runner). Values are shell-escaped. */
 export const envDotVars = action(
   withSchema(AppId, async (appId) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "admin");
     const rows = await runnerListEnv(appId);
     const lines = rows.map(({ name, value }) => {

@@ -6,7 +6,7 @@ import { SqlClient } from "effect/sql/SqlClient";
 import { failUnknown } from "../auth";
 import { withDb } from "../db";
 import { runnerTelemetryGet, runnerTelemetrySet } from "../runner";
-import { action, withSchema } from "../server-context";
+import { action, useEnv, useRequest, withSchema } from "../server-context";
 import { AuthError, requireControlAdmin } from "./session.server";
 
 /** Accounts on this instance, for the runner's bucketed `users` heartbeat
@@ -25,7 +25,7 @@ export const countControlUsers = (): Promise<number> =>
  * bearer call, so the gate has to live here. */
 export const getTelemetry = action(
   async () => {
-    await requireControlAdmin();
+    await requireControlAdmin(useRequest(), useEnv<KitEnv>());
     try {
       return await runnerTelemetryGet();
     } catch (error) {
@@ -41,7 +41,7 @@ const SetTelemetry = Schema.Struct({ enabled: Schema.Boolean });
  * (effective stays disabled). Same admin gate as the read. */
 export const setTelemetry = action(
   withSchema(SetTelemetry, async ({ enabled }) => {
-    await requireControlAdmin();
+    await requireControlAdmin(useRequest(), useEnv<KitEnv>());
     try {
       return await runnerTelemetrySet(enabled);
     } catch (error) {

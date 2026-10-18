@@ -22,7 +22,7 @@ import { AuthError, requestOrigin, sessionUser } from "./session.server";
  * consume that user's one-time tour. */
 export const completeOnboarding = action(
   async () => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     if (user.impersonatedBy) {
       fail("Onboarding cannot be completed while impersonating");
     }
@@ -51,7 +51,7 @@ const CreateApiKey = Schema.Struct({
  * like the client flow did. */
 export const createApiKey = action(
   withSchema(CreateApiKey, async ({ appManagement, events, name }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const label = name.trim();
     if (!label) {
       fail("Name is required");
@@ -93,7 +93,7 @@ export const createApiKey = action(
 /** The signed-in account's unused codes (see `INVITES_PER_USER`). */
 export const myInviteCodes = action(
   async () => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     try {
       return await listUnusedInvitesFor(user.id);
     } catch (error) {

@@ -22,7 +22,7 @@ import {
   runnerEnvironmentVarSet,
   runnerEnvironmentsList,
 } from "../runner";
-import { action, withSchema } from "../server-context";
+import { action, useEnv, useRequest, withSchema } from "../server-context";
 import { redactEnv } from "./env.server";
 import type { EnvVarView } from "./env.server";
 import { AuthError, sessionUser } from "./session.server";
@@ -57,7 +57,7 @@ export type EnvironmentVarView = EnvVarView;
 /** Every environment of one app (view-gated). */
 export const listEnvironments = action(
   withSchema(AppId, async (appId) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const { role } = await requireAppRole(appId, user.id, "view");
     try {
       return await runnerEnvironmentsList(appId, role);
@@ -72,7 +72,7 @@ export const listEnvironments = action(
  * label is derived by the runner from the branch. */
 export const createEnvironment = action(
   withSchema(BranchArgs, async ({ appId, branch }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const { role } = await requireAppRole(appId, user.id, "push");
     try {
       return await runnerEnvironmentCreate(appId, branch, role, {
@@ -89,7 +89,7 @@ export const createEnvironment = action(
 /** Delete one environment and its fleet (admin-gated). */
 export const deleteEnvironment = action(
   withSchema(EnvId, async ({ appId, envId }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const { role } = await requireAppRole(appId, user.id, "admin");
     try {
       await runnerEnvironmentDelete(appId, envId, role);
@@ -103,7 +103,7 @@ export const deleteEnvironment = action(
 /** Flip one environment between members-only and public (admin-gated). */
 export const updateEnvironment = action(
   withSchema(PublicArgs, async ({ appId, envId, public: isPublic }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const { role } = await requireAppRole(appId, user.id, "admin");
     try {
       return await runnerEnvironmentUpdate(appId, envId, isPublic, role);
@@ -117,7 +117,7 @@ export const updateEnvironment = action(
 /** Redeploy one environment at its ref's current tip (push-gated). */
 export const deployEnvironment = action(
   withSchema(EnvId, async ({ appId, envId }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const { role } = await requireAppRole(appId, user.id, "push");
     try {
       return await runnerEnvironmentDeploy(appId, envId, role);
@@ -132,7 +132,7 @@ export const deployEnvironment = action(
  * (view-gated). */
 export const environmentVars = action(
   withSchema(EnvId, async ({ appId, envId }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const { role } = await requireAppRole(appId, user.id, "view");
     try {
       const rows = await runnerEnvironmentVars(appId, envId, role);
@@ -147,7 +147,7 @@ export const environmentVars = action(
 /** Set one variable override on an environment (push-gated). */
 export const setEnvironmentVar = action(
   withSchema(VarArgs, async ({ appId, envId, name, value }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const { role } = await requireAppRole(appId, user.id, "push");
     try {
       return await runnerEnvironmentVarSet(appId, envId, name, value, role);
@@ -161,7 +161,7 @@ export const setEnvironmentVar = action(
 /** Delete one variable override (push-gated). */
 export const deleteEnvironmentVar = action(
   withSchema(VarNameArgs, async ({ appId, envId, name }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const { role } = await requireAppRole(appId, user.id, "push");
     try {
       await runnerEnvironmentVarDelete(appId, envId, name, role);

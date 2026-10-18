@@ -7,7 +7,7 @@ import {
   runnerListDomains,
   runnerRemoveDomain,
 } from "../runner";
-import { action, withSchema } from "../server-context";
+import { action, useEnv, useRequest, withSchema } from "../server-context";
 import { AuthError, requireViewApp, sessionUser } from "./session.server";
 
 const AppId = Schema.String;
@@ -20,7 +20,7 @@ const DomainArgs = Schema.Struct({
 /** Hostnames this app answers on, for anyone who can see the app. */
 export const listDomains = action(
   withSchema(AppId, async (appId) => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     try {
       return await runnerListDomains(appId);
     } catch (error) {
@@ -34,7 +34,7 @@ export const listDomains = action(
  * shape, collisions and platform-owned names; its message is surfaced. */
 export const addDomain = action(
   withSchema(DomainArgs, async ({ appId, hostname }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "admin");
     try {
       return await runnerAddDomain(appId, hostname);
@@ -47,7 +47,7 @@ export const addDomain = action(
 
 export const removeDomain = action(
   withSchema(DomainArgs, async ({ appId, hostname }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "admin");
     try {
       return await runnerRemoveDomain(appId, hostname);

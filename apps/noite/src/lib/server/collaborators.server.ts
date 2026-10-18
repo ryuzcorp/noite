@@ -18,7 +18,13 @@ import {
 } from "../collaborators";
 import { orm, withDb } from "../db";
 import { parseAppRole } from "../roles";
-import { action, fail, withSchema } from "../server-context";
+import {
+  action,
+  fail,
+  useEnv,
+  useRequest,
+  withSchema,
+} from "../server-context";
 import { AuthError, sessionUser } from "./session.server";
 
 const AppId = Schema.String;
@@ -42,7 +48,7 @@ const RemoveCollaborator = Schema.Struct({
 
 export const listCollaborators = action(
   withSchema(AppId, async (appId) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "view");
     return listCollaboratorRows(appId);
   }),
@@ -55,7 +61,7 @@ export const listCollaborators = action(
  * accept after signing in with that address. */
 export const inviteCollaborator = action(
   withSchema(InviteCollaborator, async ({ appId, email, role }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const { app } = await requireAppRole(appId, user.id, "admin");
     const nextRole = parseAppRole(role.trim().toLowerCase());
     if (nextRole === null) {
@@ -94,7 +100,7 @@ export const inviteCollaborator = action(
 /** Invitations waiting on an app (admin only: they carry email addresses). */
 export const listPendingInvitations = action(
   withSchema(AppId, async (appId) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "admin");
     return listPendingInvites(appId);
   }),
@@ -105,7 +111,7 @@ export const revokeInvitation = action(
   withSchema(
     Schema.Struct({ appId: Schema.String, inviteId: Schema.String }),
     async ({ appId, inviteId }) => {
-      const user = await sessionUser();
+      const user = await sessionUser(useRequest(), useEnv<KitEnv>());
       await requireAppRole(appId, user.id, "admin");
       await withDb(revokePendingInvite(appId, inviteId));
       return { ok: true as const };
@@ -117,7 +123,7 @@ export const revokeInvitation = action(
 /** Invitations addressed to the signed-in account's email. */
 export const myCollaboratorInvitations = action(
   async () => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     try {
       return await listInvitesForEmail(user.email);
     } catch (error) {
@@ -131,7 +137,7 @@ export const myCollaboratorInvitations = action(
  * when the invitation is addressed to its email. */
 export const acceptInvitation = action(
   withSchema(Schema.String, async (inviteId) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const accepted = await acceptPendingInvite(inviteId, user.email, user.id);
     if (!accepted) {
       return fail("Invitation not found");
@@ -143,7 +149,7 @@ export const acceptInvitation = action(
 
 export const declineInvitation = action(
   withSchema(Schema.String, async (inviteId) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await withDb(declinePendingInvite(inviteId, user.email));
     return { ok: true as const };
   }),
@@ -152,7 +158,7 @@ export const declineInvitation = action(
 
 export const updateCollaboratorRole = action(
   withSchema(UpdateCollaborator, async ({ appId, userId, role }) => {
-    const actor = await sessionUser();
+    const actor = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, actor.id, "admin");
     const nextRole = parseAppRole(role.trim().toLowerCase());
     if (nextRole === null) {
@@ -190,7 +196,7 @@ export const updateCollaboratorRole = action(
 
 export const removeCollaborator = action(
   withSchema(RemoveCollaborator, async ({ appId, userId }) => {
-    const actor = await sessionUser();
+    const actor = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, actor.id, "admin");
     const err = await withDb(
       Effect.gen(function* run() {

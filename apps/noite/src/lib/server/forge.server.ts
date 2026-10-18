@@ -16,7 +16,7 @@ import {
   runnerGitLog,
   runnerGitRefs,
 } from "../runner";
-import { action, withSchema } from "../server-context";
+import { action, useEnv, useRequest, withSchema } from "../server-context";
 import { AuthError, requireViewApp, sessionUser } from "./session.server";
 
 const GitRefsArgs = Schema.Struct({ appId: Schema.String });
@@ -51,7 +51,7 @@ const GitBranchDeleteArgs = Schema.Struct({
 /** Branches with their tip, last commit and ahead/behind vs main. */
 export const gitRefs = action(
   withSchema(GitRefsArgs, async ({ appId }) => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     return runnerGitRefs(appId);
   }),
   { error: AuthError }
@@ -60,7 +60,7 @@ export const gitRefs = action(
 /** One page of a ref's history, optionally scoped to a path. */
 export const gitLog = action(
   withSchema(GitLogArgs, async ({ appId, limit, path, ref, skip }) => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     return runnerGitLog(appId, { limit, path, ref, skip });
   }),
   { error: AuthError }
@@ -69,7 +69,7 @@ export const gitLog = action(
 /** One commit with its first-parent diff. */
 export const gitCommit = action(
   withSchema(GitCommitArgs, async ({ appId, sha }) => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     return runnerGitCommit(appId, sha);
   }),
   { error: AuthError }
@@ -78,7 +78,7 @@ export const gitCommit = action(
 /** Merge-base, `base..head` commits, three-dot diff and mergeability. */
 export const gitCompare = action(
   withSchema(GitCompareArgs, async ({ appId, base, head }) => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     return runnerGitCompare(appId, base, head);
   }),
   { error: AuthError }
@@ -87,7 +87,7 @@ export const gitCompare = action(
 /** Create a branch from a ref or SHA (push-gated). */
 export const gitBranchCreate = action(
   withSchema(GitBranchCreateArgs, async ({ appId, from, name }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "push");
     return runnerGitBranchCreate(appId, name, from);
   }),
@@ -97,7 +97,7 @@ export const gitBranchCreate = action(
 /** Delete a branch (admin only; the runner refuses `main`). */
 export const gitBranchDelete = action(
   withSchema(GitBranchDeleteArgs, async ({ appId, name }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "admin");
     return runnerGitBranchDelete(appId, name);
   }),

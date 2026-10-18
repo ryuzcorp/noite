@@ -21,7 +21,13 @@ import {
   runnerRollback,
 } from "../runner";
 import type { RunnerApp, RunnerCreateSource } from "../runner";
-import { action, fail, useEnv, withSchema } from "../server-context";
+import {
+  action,
+  fail,
+  useEnv,
+  useRequest,
+  withSchema,
+} from "../server-context";
 import { AuthError, requireViewApp, sessionUser } from "./session.server";
 
 const CreateSource = Schema.Union([
@@ -97,8 +103,8 @@ export interface SlugCheck {
  * hostname — so answering "taken" leaks nothing a request to it would not. */
 export const slugCheck = action(
   withSchema(Schema.Struct({ slug: Schema.String }), async ({ slug }) => {
-    await sessionUser();
     const env = useEnv<KitEnv>();
+    await sessionUser(useRequest(), env);
     const normalized = slug.trim().toLowerCase();
     const gitBase = (env?.GIT_PUBLIC_BASE ?? "").replace(/\/+$/u, "");
     const result: SlugCheck = {
@@ -194,7 +200,7 @@ export const createAppForUser = async (input: {
 
 export const create = action(
   withSchema(CreateApp, async ({ name, slug, source }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const trimmedName = name.trim();
     const normalized = slug.trim().toLowerCase();
     if (!trimmedName) {
@@ -226,7 +232,7 @@ export const create = action(
  * app row: the app page offers this whenever the import ended in `error`. */
 export const retryImport = action(
   withSchema(AppId, async (appId) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "push");
     try {
       return await runnerRetryImport(appId);
@@ -239,7 +245,7 @@ export const retryImport = action(
 
 export const remove = action(
   withSchema(AppId, async (appId) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "admin");
     try {
       await runnerDeleteApp(appId);
@@ -261,7 +267,7 @@ export const setDesired = action(
       if (desiredState !== "running" && desiredState !== "stopped") {
         fail("desiredState must be running or stopped");
       }
-      const user = await sessionUser();
+      const user = await sessionUser(useRequest(), useEnv<KitEnv>());
       await requireAppRole(id, user.id, "push");
       try {
         // SAFETY: desiredState is validated above to be exactly "running" | "stopped" before this cast.
@@ -298,7 +304,7 @@ export const renameApp = action(
     if (slugProblem) {
       fail(slugProblem);
     }
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(id, user.id, "admin");
     try {
       await runnerRenameApp(id, { name: trimmedName, slug: normalized });
@@ -314,7 +320,7 @@ export const renameApp = action(
 
 export const get = action(
   withSchema(AppId, async (appId) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const { app, role } = await requireAppRole(appId, user.id, "view");
     const git = await runnerGitRemote(appId);
     return {
@@ -340,7 +346,7 @@ const RollbackArgs = Schema.Struct({
  * stream like a normal deploy. */
 export const rollback = action(
   withSchema(RollbackArgs, async ({ appId, sha }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "push");
     try {
       return await runnerRollback(appId, sha);
@@ -360,7 +366,7 @@ const DeployLogArgs = Schema.Struct({
  * rows' logs, so the panel fetches them on demand per deploy id. */
 export const deployLog = action(
   withSchema(DeployLogArgs, async ({ appId, deployId }) => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     try {
       return await runnerDeployLog(appId, deployId);
     } catch (error) {

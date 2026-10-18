@@ -4,7 +4,7 @@ import { failUnknown } from "../auth";
 import { requireAppRole } from "../collaborators";
 import { isControlApp } from "../control-app";
 import { runnerGetError, runnerSetErrorStatus } from "../runner";
-import { action, withSchema } from "../server-context";
+import { action, useEnv, useRequest, withSchema } from "../server-context";
 import { AuthError, requireControlAdmin, sessionUser } from "./session.server";
 
 const ErrorStatusSchema = Schema.Union([
@@ -32,10 +32,10 @@ const requireTelemetryRole = async (
   need: "view" | "push"
 ): Promise<void> => {
   if (isControlApp(appId)) {
-    await requireControlAdmin();
+    await requireControlAdmin(useRequest(), useEnv<KitEnv>());
     return;
   }
-  const user = await sessionUser();
+  const user = await sessionUser(useRequest(), useEnv<KitEnv>());
   await requireAppRole(appId, user.id, need);
 };
 

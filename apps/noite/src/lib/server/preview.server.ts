@@ -22,10 +22,10 @@ const PreviewOriginArgs = Schema.Struct({ appId: Schema.String });
  * origin that cannot connect. */
 export const sourcePreviewOrigin = action(
   withSchema(PreviewOriginArgs, async ({ appId }) => {
-    const user = await sessionUser();
-    const { app } = await requireAppRole(appId, user.id, "view");
     const env = useEnv<KitEnv>();
     const request = useRequest();
+    const user = await sessionUser(request, env);
+    const { app } = await requireAppRole(appId, user.id, "view");
     const url = new URL(request.url);
     // Behind the edge the action sees the internal http URL: the page's real
     // scheme and host ride `X-Forwarded-Proto`/`X-Forwarded-Host`, which Caddy

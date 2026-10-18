@@ -28,7 +28,7 @@ import {
   runnerPrsList,
   runnerPrUpdate,
 } from "../runner";
-import { action, withSchema } from "../server-context";
+import { action, useEnv, useRequest, withSchema } from "../server-context";
 import { AuthError, requireViewApp, sessionUser } from "./session.server";
 
 const AppIdArgs = Schema.Struct({ appId: Schema.String });
@@ -141,7 +141,7 @@ export const resolveUserNames = async (
 /** Names for the ids a pull-request page renders (view-gated). */
 export const prsUserNames = action(
   withSchema(PrNamesArgs, async ({ appId, userIds }) => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     return resolveUserNames(userIds);
   }),
   { error: AuthError }
@@ -151,7 +151,7 @@ export const prsUserNames = action(
  * against it to show edit/delete only for own work. */
 export const prsViewer = action(
   withSchema(AppIdArgs, async ({ appId }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const { role } = await requireAppRole(appId, user.id, "view");
     return { id: user.id, name: user.name, role };
   }),
@@ -161,7 +161,7 @@ export const prsViewer = action(
 /** The app's branch protection rule (anyone who can view the app). */
 export const branchRulesGet = action(
   withSchema(AppIdArgs, async ({ appId }) => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     return runnerBranchRulesGet(appId);
   }),
   { error: AuthError }
@@ -172,7 +172,7 @@ export const branchRulesSet = action(
   withSchema(
     BranchRulesSetArgs,
     async ({ appId, requirePr, requiredApprovals }) => {
-      const user = await sessionUser();
+      const user = await sessionUser(useRequest(), useEnv<KitEnv>());
       await requireAppRole(appId, user.id, "admin");
       return runnerBranchRulesSet(appId, { requirePr, requiredApprovals });
     }
@@ -183,7 +183,7 @@ export const branchRulesSet = action(
 /** Newest-first pull requests with their state counts. */
 export const prsList = action(
   withSchema(PrListArgs, async ({ appId, limit, skip, state }) => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     return runnerPrsList(appId, { limit, skip, state });
   }),
   { error: AuthError }
@@ -192,7 +192,7 @@ export const prsList = action(
 /** One pull request: comments, reviews, live compare and merge state. */
 export const prsGet = action(
   withSchema(PrGetArgs, async ({ appId, number }) => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     return runnerPrGet(appId, number);
   }),
   { error: AuthError }
@@ -201,7 +201,7 @@ export const prsGet = action(
 /** Open a pull request (push-gated). */
 export const prsCreate = action(
   withSchema(PrCreateArgs, async ({ appId, base, body, head, title }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "push");
     return runnerPrCreate(appId, {
       actor: { name: user.name, userId: user.id },
@@ -218,7 +218,7 @@ export const prsCreate = action(
  * author or an admin). */
 export const prsUpdate = action(
   withSchema(PrUpdateArgs, async ({ appId, number, body, state, title }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const { role } = await requireAppRole(appId, user.id, "push");
     return runnerPrUpdate(appId, number, {
       actor: { name: user.name, userId: user.id },
@@ -237,7 +237,7 @@ export const prsComment = action(
   withSchema(
     PrCommentArgs,
     async ({ appId, number, body, commitSha, line, path, side }) => {
-      const user = await sessionUser();
+      const user = await sessionUser(useRequest(), useEnv<KitEnv>());
       const { role } = await requireAppRole(appId, user.id, "push");
       return runnerPrComment(appId, number, {
         actor: { name: user.name, userId: user.id },
@@ -256,7 +256,7 @@ export const prsComment = action(
 /** Edit one's own comment (push-gated; the runner allows only the author). */
 export const prsCommentEdit = action(
   withSchema(PrCommentEditArgs, async ({ appId, commentId, body }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "push");
     return runnerPrCommentEdit(appId, commentId, {
       actor: { name: user.name, userId: user.id },
@@ -269,7 +269,7 @@ export const prsCommentEdit = action(
 /** Delete a comment (push-gated; the runner allows the author or an admin). */
 export const prsCommentDelete = action(
   withSchema(PrCommentDeleteArgs, async ({ appId, commentId }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const { role } = await requireAppRole(appId, user.id, "push");
     return runnerPrCommentDelete(appId, commentId, {
       actor: { name: user.name, userId: user.id },
@@ -282,7 +282,7 @@ export const prsCommentDelete = action(
 /** Approve or request changes (push-gated; nobody approves their own). */
 export const prsReview = action(
   withSchema(PrReviewArgs, async ({ appId, number, state }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const { role } = await requireAppRole(appId, user.id, "push");
     return runnerPrReview(appId, number, {
       actor: { name: user.name, userId: user.id },
@@ -300,7 +300,7 @@ export const prsMerge = action(
   withSchema(
     PrMergeArgs,
     async ({ appId, number, deleteBranch, message, title }) => {
-      const user = await sessionUser();
+      const user = await sessionUser(useRequest(), useEnv<KitEnv>());
       const { role } = await requireAppRole(appId, user.id, "push");
       const detail = await runnerPrGet(appId, number);
       const names = await resolveUserNames([detail.pullRequest.authorId]);

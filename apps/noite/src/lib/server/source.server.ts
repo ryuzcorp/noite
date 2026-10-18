@@ -1,7 +1,7 @@
 import * as Schema from "effect/Schema";
 
 import { runnerSourceBundle, runnerSourceTree } from "../runner";
-import { action, withSchema } from "../server-context";
+import { action, useEnv, useRequest, withSchema } from "../server-context";
 import { AuthError, requireViewApp } from "./session.server";
 
 /** Every source read takes an optional `ref` (branch, tag or SHA); Code mode
@@ -14,7 +14,7 @@ const SourceRefArgs = Schema.Struct({
 
 export const sourceTree = action(
   withSchema(SourceRefArgs, async ({ appId, ref }) => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     return runnerSourceTree(appId, ref || undefined);
   }),
   { error: AuthError }
@@ -25,7 +25,7 @@ export const sourceTree = action(
  * `sourceTree`. */
 export const sourceBundle = action(
   withSchema(SourceRefArgs, async ({ appId, ref }) => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     return runnerSourceBundle(appId, ref || undefined);
   }),
   { error: AuthError }

@@ -3,7 +3,7 @@ import * as Schema from "effect/Schema";
 import { failUnknown } from "../auth";
 import { requireAppRole } from "../collaborators";
 import { runnerGetLimits, runnerSetLimits } from "../runner";
-import { action, withSchema } from "../server-context";
+import { action, useEnv, useRequest, withSchema } from "../server-context";
 import { AuthError, requireViewApp, sessionUser } from "./session.server";
 
 const AppId = Schema.String;
@@ -18,7 +18,7 @@ const LimitArgs = Schema.Struct({
 /** The app's edge limits beside the platform defaults they fall back to. */
 export const getLimits = action(
   withSchema(AppId, async (appId) => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     try {
       return await runnerGetLimits(appId);
     } catch (error) {
@@ -32,7 +32,7 @@ export const getLimits = action(
  * rewrites the edge on its next reconcile. */
 export const setLimits = action(
   withSchema(LimitArgs, async ({ appId, appRpm, clientRpm }) => {
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "admin");
     try {
       return await runnerSetLimits(appId, clientRpm, appRpm);

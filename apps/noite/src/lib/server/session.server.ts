@@ -8,7 +8,7 @@ import {
 import type { SessionUser } from "../auth";
 import { isInstanceAdmin, requireAppRole } from "../collaborators";
 import { ensureDbPromise } from "../db";
-import { fail, useEnv, useRequest } from "../server-context";
+import { fail } from "../server-context";
 import { controlAccessRefusal } from "./control-d1.server";
 
 /** The error union every session-gated action declares: a caller is either
@@ -68,12 +68,11 @@ export const getSessionOrNull = async (
   };
 };
 
-export const sessionUser = async (): Promise<SessionUser> => {
-  const request = useRequest();
-  const env = useEnv<KitEnv>() ?? process.env;
-  // SAFETY: the ALS env (or process.env fallback) provides the same KitEnv
-  // control keys used by every action.
-  const session = await getSessionOrNull(request, env as KitEnv);
+export const sessionUser = async (
+  request: Request,
+  env: KitEnv
+): Promise<SessionUser> => {
+  const session = await getSessionOrNull(request, env);
   if (!session) {
     throw new UnauthorizedError({ message: "Sign in required" });
   }
@@ -86,8 +85,12 @@ export const sessionUser = async (): Promise<SessionUser> => {
 };
 
 /** Ownership gate for view-gated reads — the runner is the data source. */
-export const requireViewApp = async (appId: string): Promise<void> => {
-  const user = await sessionUser();
+export const requireViewApp = async (
+  request: Request,
+  env: KitEnv,
+  appId: string
+): Promise<void> => {
+  const user = await sessionUser(request, env);
   await requireAppRole(appId, user.id, "view");
 };
 
@@ -95,8 +98,11 @@ export const requireViewApp = async (appId: string): Promise<void> => {
  * or the `NOITE_ADMIN_EMAIL` anchor) and never an impersonated session — an
  * admin touring as another user must not read or write the auth database.
  * Re-checked on every call, not only when the card renders. */
-export const requireControlAdmin = async (): Promise<SessionUser> => {
-  const user = await sessionUser();
+export const requireControlAdmin = async (
+  request: Request,
+  env: KitEnv
+): Promise<SessionUser> => {
+  const user = await sessionUser(request, env);
   // Skip the admin lookup on an impersonated session: it is refused anyway.
   const isAdmin =
     user.impersonatedBy === null &&

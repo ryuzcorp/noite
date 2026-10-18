@@ -28,7 +28,13 @@ import type {
   D1TableCaps,
   D1WriteBody,
 } from "../runner";
-import { action, fail, withSchema } from "../server-context";
+import {
+  action,
+  fail,
+  useEnv,
+  useRequest,
+  withSchema,
+} from "../server-context";
 import {
   controlRows,
   controlSchema,
@@ -120,7 +126,7 @@ const R2DeleteArgs = Schema.Struct({
 export const listAppStorage = action(
   withSchema(StorageListArgs, async ({ appId }) => {
     if (appId === CONTROL_APP_ID) {
-      await requireControlAdmin();
+      await requireControlAdmin(useRequest(), useEnv<KitEnv>());
       return [
         {
           appId: CONTROL_APP_ID,
@@ -132,7 +138,7 @@ export const listAppStorage = action(
         },
       ];
     }
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     try {
       return await runnerStorage(appId);
     } catch (error) {
@@ -147,7 +153,7 @@ export const listAppStorage = action(
 const requireControlDatabase = async (
   databaseId: string
 ): Promise<SessionUser> => {
-  const user = await requireControlAdmin();
+  const user = await requireControlAdmin(useRequest(), useEnv<KitEnv>());
   if (databaseId !== CONTROL_APP_DATABASE_ID) {
     fail(`Unknown control database ${databaseId}`);
   }
@@ -175,7 +181,7 @@ export const d1Tables = action(
         failUnknown(error);
       }
     }
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const { role } = await requireAppRole(appId, user.id, "view");
     try {
       const listed = await runnerD1Tables(appId, databaseId);
@@ -203,7 +209,7 @@ export const d1Schema = action(
         failUnknown(error);
       }
     }
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     const { role } = await requireAppRole(appId, user.id, "view");
     try {
       const schema = await runnerD1Schema(appId, databaseId, table);
@@ -251,7 +257,7 @@ export const d1Rows = action(
           failUnknown(error);
         }
       }
-      await requireViewApp(appId);
+      await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
       try {
         return await runnerD1Rows(appId, databaseId, query);
       } catch (error) {
@@ -303,7 +309,7 @@ export const d1Write = action(
           failUnknown(error);
         }
       }
-      const user = await sessionUser();
+      const user = await sessionUser(useRequest(), useEnv<KitEnv>());
       await requireAppRole(appId, user.id, "push");
       try {
         return await runnerD1Write(appId, databaseId, body);
@@ -332,7 +338,7 @@ export const d1DeleteRows = action(
         failUnknown(error);
       }
     }
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "push");
     try {
       return await runnerD1DeleteRows(appId, databaseId, body);
@@ -346,7 +352,7 @@ export const d1DeleteRows = action(
 /** Read-only Durable Object instance list for one class. */
 export const doPreview = action(
   withSchema(DoPreviewArgs, async ({ appId, className }) => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     try {
       return await runnerDoInstances(appId, className);
     } catch (error) {
@@ -359,7 +365,7 @@ export const doPreview = action(
 /** One page of an R2 bucket folder (view role). */
 export const r2List = action(
   withSchema(R2ListArgs, async ({ appId, bucket, prefix, cursor }) => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     try {
       return await runnerR2List(appId, bucket, prefix ?? "", cursor ?? null);
     } catch (error) {
@@ -372,7 +378,7 @@ export const r2List = action(
 /** Read-only R2 object fetch (bounded text preview). */
 export const r2Get = action(
   withSchema(R2GetArgs, async ({ appId, bucket, key }) => {
-    await requireViewApp(appId);
+    await requireViewApp(useRequest(), useEnv<KitEnv>(), appId);
     try {
       return await runnerR2Get(appId, bucket, key);
     } catch (error) {
@@ -388,7 +394,7 @@ export const r2Delete = action(
     if (keys.length === 0 || keys.length > 100) {
       fail("select 1 to 100 objects");
     }
-    const user = await sessionUser();
+    const user = await sessionUser(useRequest(), useEnv<KitEnv>());
     await requireAppRole(appId, user.id, "push");
     try {
       return await runnerR2Delete(appId, bucket, [...keys]);
