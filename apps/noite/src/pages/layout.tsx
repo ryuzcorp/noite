@@ -18,7 +18,7 @@ import {
 } from "$lib/ui/icons";
 import { createPaneGroup, MORPH_PRESERVE } from "$lib/ui/resizable";
 import { ResizeHandle } from "$lib/ui/resize-handle";
-import { Link, useRouter } from "@ilha/void";
+import { Link, useLink, useRouter } from "@ilha/void";
 import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
@@ -123,6 +123,10 @@ export default function DashboardLayout({ children }: { children?: View }) {
     });
   });
   const router = useRouter();
+  // Native `<a>`s below: the Apps and Account items sit as `li > a` under
+  // daisyUI `menu` CSS (child combinators), where a `Link` host span would
+  // break the item styling.
+  const link = useLink();
   const signOut = async () => {
     // Sign out first: invalidating before the cookie is gone refetched (and
     // re-cached) the outgoing user's session.
@@ -187,15 +191,15 @@ export default function DashboardLayout({ children }: { children?: View }) {
             </Link>
             <ul class="menu w-full flex-1">
               <li>
-                <Link
-                  href="/apps"
+                <a
+                  {...link("/apps")}
                   data-tour="apps"
                   class={appsItemActive ? "menu-active" : undefined}
                   aria-current={appsItemActive ? "page" : undefined}
                 >
                   <ListIcon class="h-5 w-5 shrink-0" />
                   Apps
-                </Link>
+                </a>
                 {onAppsPages ? (
                   <SidebarApps activeId={activeAppId} activeView={activeView} />
                 ) : null}
@@ -218,10 +222,10 @@ export default function DashboardLayout({ children }: { children?: View }) {
                   class="dropdown-content menu bg-base-100 dark:bg-base-200 rounded-box z-10 w-52 p-2 shadow"
                 >
                   <li>
-                    <Link href="/account">
+                    <a {...link("/account")}>
                       <CircleUser />
                       Account
-                    </Link>
+                    </a>
                   </li>
                   <li>
                     <a

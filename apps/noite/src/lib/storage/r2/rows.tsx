@@ -1,6 +1,6 @@
 //! R2 listing rows: the list table and the dense columns view.
 
-import { Link } from "@ilha/void";
+import { Link, useLink } from "@ilha/void";
 
 import { formatBytes } from "../../bytes";
 import { formatAgo, formatDateTime } from "../../dates";
@@ -157,52 +157,57 @@ export const R2ColumnRows = ({
   onOpen: (key: string) => void;
   onToggle: (key: string, on: boolean) => void;
   selected: string | null;
-}) => (
-  <div class="min-h-0 flex-1 overflow-auto">
-    <ul class="menu m-0 w-full gap-0.5 p-2">
-      {folders.map((folder) => (
-        <li key={folder.prefix}>
-          <Link
-            class="gap-2"
-            href={r2Href(appId, bucket, folder.prefix)}
-            title={folder.prefix}
-          >
-            <Folder class="h-4 w-4 shrink-0 opacity-60" />
-            <span class="min-w-0 flex-1 truncate">{folder.name}</span>
-          </Link>
-        </li>
-      ))}
-      {files.map((object) => (
-        <li key={object.key}>
-          <button
-            type="button"
-            class={`gap-2 text-left ${selected === object.key ? "menu-active" : ""}`}
-            onclick={() => {
-              onOpen(object.key);
-            }}
-          >
-            {canWrite ? (
-              <input
-                class="checkbox checkbox-sm"
-                type="checkbox"
-                aria-label={`Select ${object.name}`}
-                checked={checked.has(object.key)}
-                onclick={(event) => {
-                  event.stopPropagation();
-                  onToggle(object.key, event.currentTarget.checked);
-                }}
-              />
-            ) : null}
-            <FileTypeIcon kind={previewKind(object.contentType)} />
-            <span class="min-w-0 flex-1 truncate" title={object.key}>
-              {object.name}
-            </span>
-            <span class="shrink-0 text-xs tabular-nums opacity-50">
-              {formatBytes(object.size)}
-            </span>
-          </button>
-        </li>
-      ))}
-    </ul>
-  </div>
-);
+}) => {
+  // Native `<a>`s below: folder rows sit as `li > a` under daisyUI `menu`
+  // CSS (child combinators), where a `Link` host span would break styling.
+  const link = useLink();
+  return (
+    <div class="min-h-0 flex-1 overflow-auto">
+      <ul class="menu m-0 w-full gap-0.5 p-2">
+        {folders.map((folder) => (
+          <li key={folder.prefix}>
+            <a
+              {...link(r2Href(appId, bucket, folder.prefix))}
+              class="gap-2"
+              title={folder.prefix}
+            >
+              <Folder class="h-4 w-4 shrink-0 opacity-60" />
+              <span class="min-w-0 flex-1 truncate">{folder.name}</span>
+            </a>
+          </li>
+        ))}
+        {files.map((object) => (
+          <li key={object.key}>
+            <button
+              type="button"
+              class={`gap-2 text-left ${selected === object.key ? "menu-active" : ""}`}
+              onclick={() => {
+                onOpen(object.key);
+              }}
+            >
+              {canWrite ? (
+                <input
+                  class="checkbox checkbox-sm"
+                  type="checkbox"
+                  aria-label={`Select ${object.name}`}
+                  checked={checked.has(object.key)}
+                  onclick={(event) => {
+                    event.stopPropagation();
+                    onToggle(object.key, event.currentTarget.checked);
+                  }}
+                />
+              ) : null}
+              <FileTypeIcon kind={previewKind(object.contentType)} />
+              <span class="min-w-0 flex-1 truncate" title={object.key}>
+                {object.name}
+              </span>
+              <span class="shrink-0 text-xs tabular-nums opacity-50">
+                {formatBytes(object.size)}
+              </span>
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+};

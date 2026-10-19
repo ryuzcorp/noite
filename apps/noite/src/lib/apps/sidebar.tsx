@@ -3,7 +3,7 @@
  * it. Live over the same stream as the /apps list, so a new, renamed or
  * deleted app shows up without a reload. Its own component, so a stream
  * frame re-renders only this list, never the page beside it. */
-import { Link } from "@ilha/void";
+import { useLink } from "@ilha/void";
 import type { View } from "ilha";
 
 import { CONTROL_APP_ID, CONTROL_APP_NAME } from "../control-app";
@@ -62,17 +62,22 @@ const MenuLink = ({
   active: boolean;
   children: View;
   href: string;
-}) => (
-  <li>
-    <Link
-      href={href}
-      class={`gap-2 ${active ? "menu-active" : ""}`}
-      aria-current={active ? "page" : undefined}
-    >
-      {children}
-    </Link>
-  </li>
-);
+}) => {
+  // Native `<a>`: this sits as `li > a` under daisyUI `menu` CSS (child
+  // combinators), where a `Link` host span would break the item styling.
+  const link = useLink();
+  return (
+    <li>
+      <a
+        {...link(href)}
+        class={`gap-2 ${active ? "menu-active" : ""}`}
+        aria-current={active ? "page" : undefined}
+      >
+        {children}
+      </a>
+    </li>
+  );
+};
 
 /** One app. The open app (`view` set) expands into App, Code and Pulls, and
  * the highlight moves to whichever the page is in; the Noite admin home has
@@ -90,10 +95,12 @@ const SidebarAppLink = ({
 }) => {
   const href = `/apps/${appId}`;
   const expanded = view !== null && appId !== CONTROL_APP_ID;
+  // Native `<a>`: `li > a` under daisyUI `menu` CSS (see MenuLink).
+  const link = useLink();
   return (
     <li>
-      <Link
-        href={href}
+      <a
+        {...link(href)}
         class={`gap-2 ${view !== null && !expanded ? "menu-active" : ""}`}
         aria-current={view !== null && !expanded ? "page" : undefined}
       >
@@ -107,7 +114,7 @@ const SidebarAppLink = ({
           />
         </span>
         <span class="truncate">{name}</span>
-      </Link>
+      </a>
       {expanded ? (
         <ul aria-label={name}>
           <MenuLink active={view === "app"} href={href}>
