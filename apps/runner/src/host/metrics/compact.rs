@@ -11,8 +11,9 @@ use super::plan::{s3_setup, telemetry_prefix};
 use super::MetricsState;
 
 /// Split one hour directory's keys into `(already_compacted, foldable
-/// sources)`. A compacted file is authoritative: every other key in its
-/// directory is a leftover from an interrupted source delete.
+/// sources)`. A compacted file plus extra sources means a flush landed after
+/// (or during) the last compaction: the extras are late arrivals, not
+/// leftovers, and must be folded in — never deleted unread.
 fn compaction_plan(keys: &[String], target: &str) -> (bool, Vec<String>) {
     let has_target = keys.iter().any(|k| k == target);
     let sources = keys
@@ -21,6 +22,28 @@ fn compaction_plan(keys: &[String], target: &str) -> (bool, Vec<String>) {
         .cloned()
         .collect();
     (has_target, sources)
+}
+
+/// What one pass over an hour directory must do: `None` when there is nothing
+/// to fold, otherwise the exact input list for the re-COPY. The existing
+/// target always leads the inputs when it exists, so a flush that landed
+/// between COPY and delete — or after a completed compaction — is folded
+/// into the compacted file instead of being destroyed unread.
+fn compaction_inputs(keys: &[String], target: &str) -> Option<Vec<String>> {
+    let (has_target, sources) = compaction_plan(keys, target);
+    if has_target {
+        if sources.is_empty() {
+            return None;
+        }
+        let mut inputs = Vec::with_capacity(sources.len() + 1);
+        inputs.push(target.to_string());
+        inputs.extend(sources);
+        Some(inputs)
+    } else if sources.len() < 2 {
+        None
+    } else {
+        Some(sources)
+    }
 }
 
 /// `yyyy/mm/dd/hh` for a timestamp, as celld partitions telemetry.
@@ -75,57 +98,80 @@ pub(super) async fn compact_fleet(cfg: &Config, slug: &str, hour: &str) -> anyho
                 })
                 .unwrap_or_default();
             let target = format!("{dir}compacted.parquet");
-            // A previous run wrote the compacted file but its source delete
-            // did not finish. The compacted file was copied from every source,
-            // and the ingest reads an hour from the compacted file alone when
-            // it exists, so dropping the leftovers is safe and leaves the
-            // directory in its stable one-file shape.
-            let (has_target, sources) = compaction_plan(&keys, &target);
-            if has_target {
-                if !sources.is_empty() {
-                    s3::s3_rm_dir_except(cfg, &cfg.s3_bucket, &dir, "compacted.parquet").await?;
-                    compacted += 1;
-                }
+            // Nothing to fold: a lone compacted file is stable, and one
+            // source is already one file.
+            let Some(inputs) = compaction_inputs(&keys, &target) else {
                 continue;
-            }
-            // One file is already one file; nothing to fold.
-            if sources.len() < 2 {
-                continue;
-            }
-            let list = sources
-                .iter()
-                .map(|k| format!("'s3://{}/{}'", cfg.s3_bucket, k))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = s3_setup(
-                cfg,
-                &format!(
-                    // union_by_name: the docs call the telemetry schema
-                    // `v0-unstable`, so an hour that spans a node upgrade can
-                    // hold two shapes — merge them instead of refusing the
-                    // whole hour (sources are only deleted after the copy).
-                    "COPY (SELECT * FROM read_parquet([{list}], union_by_name=true) ORDER BY {sort_col}) \
-                       TO 's3://{}/{}' (FORMAT parquet, COMPRESSION zstd);",
-                    cfg.s3_bucket, target,
-                ),
-            );
-            stats::count_duckdb("compact");
-            exec::run_cmd(
-                "/usr/local/bin/duckdb",
-                &["-c", &sql],
-                None,
-                &[],
-                std::time::Duration::from_secs(120),
-            )
-            .await?;
-            if !s3::s3_object_exists(cfg, &cfg.s3_bucket, &target).await {
-                anyhow::bail!("compacted object missing after copy: {target}");
-            }
+            };
+            copy_union(cfg, &dir, &target, &inputs, sort_col).await?;
             s3::s3_rm_dir_except(cfg, &cfg.s3_bucket, &dir, "compacted.parquet").await?;
             compacted += 1;
         }
     }
     Ok(compacted)
+}
+
+/// COPY the union of `inputs` into `target`, proved with a HEAD before the
+/// caller deletes anything. When `target` is itself one of the inputs (a
+/// re-fold of late arrivals), the COPY goes to a staging key first: DuckDB
+/// streams the read, so writing the file it reads would corrupt the hour.
+/// The staging key never ends in `.parquet`, so neither the ingest globs
+/// (`*.parquet`) nor another compact pass can see it mid-write; the final
+/// `rm_dir_except` (keep `compacted.parquet`) removes it along with the
+/// folded sources.
+async fn copy_union(
+    cfg: &Config,
+    dir: &str,
+    target: &str,
+    inputs: &[String],
+    sort_col: &str,
+) -> anyhow::Result<()> {
+    let refold = inputs.iter().any(|k| k == target);
+    let dest = if refold {
+        format!("{dir}compacted.staging-{}", uuid::Uuid::new_v4())
+    } else {
+        target.to_string()
+    };
+    let list = inputs
+        .iter()
+        .map(|k| format!("'s3://{}/{}'", cfg.s3_bucket, k))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = s3_setup(
+        cfg,
+        &format!(
+            // union_by_name: the docs call the telemetry schema
+            // `v0-unstable`, so an hour that spans a node upgrade can
+            // hold two shapes — merge them instead of refusing the
+            // whole hour (sources are only deleted after the copy).
+            "COPY (SELECT * FROM read_parquet([{list}], union_by_name=true) ORDER BY {sort_col}) \
+               TO 's3://{}/{}' (FORMAT parquet, COMPRESSION zstd);",
+            cfg.s3_bucket, dest,
+        ),
+    );
+    stats::count_duckdb("compact");
+    exec::run_cmd(
+        "/usr/local/bin/duckdb",
+        &["-c", &sql],
+        None,
+        &[],
+        std::time::Duration::from_secs(120),
+    )
+    .await?;
+    if !s3::s3_object_exists(cfg, &cfg.s3_bucket, &dest).await {
+        anyhow::bail!("compacted object missing after copy: {dest}");
+    }
+    if refold {
+        // Publish complete-over-complete: the staging object is whole (HEAD
+        // proved), so promoting it keeps a compacted file in the hour at
+        // every instant — a crash leaves the old target plus staging, which
+        // the next pass re-folds instead of deleting.
+        s3::s3_copy_key(cfg, &cfg.s3_bucket, &dest, target).await?;
+        if !s3::s3_object_exists(cfg, &cfg.s3_bucket, target).await {
+            anyhow::bail!("compacted object missing after promote: {target}");
+        }
+    }
+    Ok(())
 }
 
 /// Completed, uncompacted hours in `(done, current)`, oldest first.
@@ -210,10 +256,35 @@ mod tests {
         let (has, sources) = compaction_plan(std::slice::from_ref(&target), &target);
         assert!(has);
         assert!(sources.is_empty());
-        // An interrupted source delete leaves both: the compacted file is
-        // authoritative and the leftovers are removed, never read.
+        // A flush that landed after (or during) the last compaction leaves
+        // both: the extras are late arrivals, folded back in — never deleted
+        // unread.
         let (has, sources) = compaction_plan(&[target.clone(), src("a")], &target);
         assert!(has);
         assert_eq!(sources, vec![src("a")]);
+    }
+
+    /// Late sources are re-folded, never dropped: a pass over
+    /// `[compacted, late]` must COPY both into the target. The old code
+    /// deleted `late` here, so spans flushed mid-pass were destroyed unread —
+    /// this test fails on that behavior (no inputs to copy).
+    #[test]
+    fn late_sources_are_refolded_not_deleted() {
+        let dir = "fleets/blog/telemetry/traces/node/2026/01/01/00/";
+        let target = format!("{dir}compacted.parquet");
+        let src = |n: &str| format!("{dir}{n}.parquet");
+        // A flush landing between COPY and delete, or after a completed
+        // compaction: the target leads the COPY inputs, the late source
+        // follows — every byte stays in the hour.
+        let inputs = compaction_inputs(&[target.clone(), src("late")], &target)
+            .expect("late source must be folded");
+        assert_eq!(inputs, vec![target.clone(), src("late")]);
+        // Stable hour: nothing to do.
+        assert!(compaction_inputs(std::slice::from_ref(&target), &target).is_none());
+        // One source is already one file: nothing to do.
+        assert!(compaction_inputs(std::slice::from_ref(&src("only")), &target).is_none());
+        // Fresh hour: every source is folded.
+        let inputs = compaction_inputs(&[src("a"), src("b")], &target).expect("fresh fold");
+        assert_eq!(inputs, vec![src("a"), src("b")]);
     }
 }
