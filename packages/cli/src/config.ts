@@ -86,7 +86,7 @@ export const connection = (
         : flags.token;
     if (token === "") {
       return yield* Effect.fail(
-        "API key required: --token or NOITE_API_KEY (Account → API keys)"
+        "API key required: --token, NOITE_API_KEY or NOITE_GIT_TOKEN (Account → API keys)"
       );
     }
     const gitBase = (

@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { Effect } from "effect";
 
-import { deployUrlOf, stageDist } from "./deploy.js";
+import { deployUrlOf, remoteUrlOf, stageDist } from "./deploy.js";
 
 /** A dist tree with the entries a `*` glob drops: top-level dotfiles and a
  * dotdir (ACME `/.well-known/`, dotfiles like `/.headers`). */
@@ -49,6 +50,27 @@ describe("deployUrlOf", () => {
   });
 });
 
+describe("remoteUrlOf", () => {
+  test("Basic git + token against the base host", () => {
+    expect(remoteUrlOf("https://git.noite.now", "my-app", "key")).toBe(
+      "https://git:key@git.noite.now/my-app"
+    );
+  });
+
+  test("a base path survives (the lane serves git under /v1/git)", () => {
+    expect(remoteUrlOf("http://localhost:8080/v1/git", "my-app", "key")).toBe(
+      "http://git:key@localhost:8080/v1/git/my-app"
+    );
+    expect(remoteUrlOf("http://localhost:8080/v1/git/", "my-app", "key")).toBe(
+      "http://git:key@localhost:8080/v1/git/my-app"
+    );
+  });
+
+  test("a malformed git base is null, not a garbage URL", () => {
+    expect(remoteUrlOf("not a url", "shop", "key")).toBeNull();
+  });
+});
+
 describe("stageDist", () => {
   test("stages dotfiles and dotdirs alongside visible entries", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "noite-stage-"));
@@ -61,20 +83,12 @@ describe("stageDist", () => {
       const wrangler = path.join(root, "wrangler.jsonc");
       await writeFile(wrangler, "{}\n");
       await Effect.runPromise(stageDist(dist, staging, wrangler));
-      expect(await Bun.file(path.join(staging, "visible.js")).exists()).toBe(
-        true
-      );
-      expect(await Bun.file(path.join(staging, ".dotfile")).exists()).toBe(
-        true
-      );
+      expect(existsSync(path.join(staging, "visible.js"))).toBe(true);
+      expect(existsSync(path.join(staging, ".dotfile"))).toBe(true);
       expect(
-        await Bun.file(
-          path.join(staging, ".well-known", "security.txt")
-        ).exists()
+        existsSync(path.join(staging, ".well-known", "security.txt"))
       ).toBe(true);
-      expect(
-        await Bun.file(path.join(staging, "wrangler.jsonc")).exists()
-      ).toBe(true);
+      expect(existsSync(path.join(staging, "wrangler.jsonc"))).toBe(true);
     } finally {
       await rm(root, { force: true, recursive: true });
     }

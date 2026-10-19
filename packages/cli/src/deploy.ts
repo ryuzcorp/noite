@@ -1,3 +1,6 @@
+import { existsSync } from "node:fs";
+import { cp } from "node:fs/promises";
+
 import { Effect } from "effect";
 import { Command, Flag } from "effect/cli";
 
@@ -57,12 +60,15 @@ export const stageDist = (
       catch: () =>
         new Error(`assembling dist tree from ${distDir} failed (built yet?)`),
       try: async (): Promise<void> => {
-        await Bun.$`cp ${wrangler} ${staging}/wrangler.jsonc`.quiet();
+        await cp(wrangler, `${staging}/wrangler.jsonc`);
       },
     });
   });
 
-const remoteUrlOf = (
+/** Stock remote URL for `slug`: the runner serves smart-HTTP at
+ * `{GIT_PUBLIC_BASE}/{slug}` (`config.rs:git_http_url`), so a base with a
+ * path (`http://localhost:8080/v1/git`) keeps it. */
+export const remoteUrlOf = (
   gitBase: string,
   slug: string,
   token: string
@@ -74,7 +80,8 @@ const remoteUrlOf = (
     return null;
   }
   // Basic `git` + profile API key, same shape as deploy.sh remotes.
-  return `${url.protocol}//git:${token}@${url.host}/${slug}`;
+  const base = url.pathname.replace(/\/+$/u, "");
+  return `${url.protocol}//git:${token}@${url.host}${base}/${slug}`;
 };
 
 export const deploy = Command.make(
@@ -139,8 +146,7 @@ export const deploy = Command.make(
 
       // Assemble the tree: dist contents + wrangler config at root, no
       // package.json — the runner skips its source build and deploys dist.
-      const wranglerFile = Bun.file(config.wrangler);
-      if (!(yield* Effect.promise(() => wranglerFile.exists()))) {
+      if (!existsSync(config.wrangler)) {
         return yield* Effect.fail(
           `wrangler config not found: ${config.wrangler}`
         );

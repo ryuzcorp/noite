@@ -14,7 +14,7 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
-    "types": ["bun"]
+    "types": ["bun", "node"]
   },
   "include": ["src"]
 }

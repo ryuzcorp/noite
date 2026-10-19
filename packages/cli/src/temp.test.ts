@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { stat } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { rm, stat, writeFile } from "node:fs/promises";
 
 import { Effect } from "effect";
 
@@ -21,7 +22,7 @@ describe("withTempDir", () => {
       withTempDir((dir) =>
         Effect.gen(function* probe() {
           kept = dir;
-          yield* Effect.promise(() => Bun.write(`${dir}/probe.txt`, "x"));
+          yield* Effect.promise(() => writeFile(`${dir}/probe.txt`, "x"));
         })
       )
     );
@@ -35,14 +36,14 @@ describe("withTempDir", () => {
       withTempDir((dir) =>
         Effect.gen(function* probe() {
           kept = dir;
-          yield* Effect.promise(() => Bun.write(`${dir}/probe.txt`, "x"));
+          yield* Effect.promise(() => writeFile(`${dir}/probe.txt`, "x"));
           return yield* Effect.fail(new Error("boom"));
         })
       ).pipe(Effect.flip)
     );
     expect(error.message).toBe("boom");
-    expect(await Bun.file(`${kept}/probe.txt`).exists()).toBe(true);
-    await Bun.$`rm -rf ${kept}`.quiet();
+    expect(existsSync(`${kept}/probe.txt`)).toBe(true);
+    await rm(kept, { force: true, recursive: true });
     expect(await exists(kept)).toBe(false);
   });
 });
