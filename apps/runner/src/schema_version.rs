@@ -228,7 +228,9 @@ pub fn plan(stored: i64, populated: bool, latest: i64, steps: &[Migration]) -> P
 /// caller owns the transaction.
 pub async fn apply(
     conn: &mut SqliteConnection,
-    schema_sql: &str,
+    // Always a compile-time schema (`include_str!` in production, literals
+    // in tests): sqlx 0.9 only takes `&'static str` or an audited wrapper.
+    schema_sql: &'static str,
     latest: i64,
     steps: &[Migration],
 ) -> anyhow::Result<()> {
@@ -265,7 +267,7 @@ pub async fn apply(
         .await
         .context("apply schema")?;
     // PRAGMA takes no bind parameters; `latest` is a constant integer.
-    sqlx::raw_sql(&format!("PRAGMA main.user_version = {latest}"))
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("PRAGMA main.user_version = {latest}")))
         .execute(&mut *conn)
         .await
         .context("stamp schema version")?;

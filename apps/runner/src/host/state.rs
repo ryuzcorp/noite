@@ -182,7 +182,7 @@ impl StateSync {
         // `VACUUM INTO` copies only the main database: metrics.sqlite rides
         // along on the volume but is never snapshotted (spec T4.1).
         let sql = format!("VACUUM INTO '{}'", target.replace('\'', "''"));
-        if let Err(e) = sqlx::query(&sql).execute(pool).await {
+        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(sql)).execute(pool).await {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(e.into());
         }

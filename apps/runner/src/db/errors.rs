@@ -205,10 +205,10 @@ pub async fn list_error_issues(
     status: &str,
     limit: i64,
 ) -> sqlx::Result<Vec<ErrorIssue>> {
-    sqlx::query_as::<_, ErrorIssue>(&format!(
+    sqlx::query_as::<_, ErrorIssue>(sqlx::AssertSqlSafe(format!(
         "SELECT {ISSUE_COLS} FROM metrics.app_error_issue \
          WHERE app_id = ? AND status = ? ORDER BY last_seen_us DESC LIMIT ?"
-    ))
+    )))
     .bind(app_id)
     .bind(status)
     .bind(limit)
@@ -234,9 +234,9 @@ pub async fn get_error_issue(
     app_id: &str,
     fingerprint: &str,
 ) -> sqlx::Result<Option<ErrorIssue>> {
-    sqlx::query_as::<_, ErrorIssue>(&format!(
+    sqlx::query_as::<_, ErrorIssue>(sqlx::AssertSqlSafe(format!(
         "SELECT {ISSUE_COLS} FROM metrics.app_error_issue WHERE app_id = ? AND fingerprint = ?"
-    ))
+    )))
     .bind(app_id)
     .bind(fingerprint)
     .fetch_optional(pool)

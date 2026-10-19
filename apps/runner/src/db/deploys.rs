@@ -79,7 +79,7 @@ pub async fn list_deploys_lean(
                  ORDER BY created_at DESC LIMIT 20)
            ORDER BY created_at DESC"#,
     );
-    sqlx::query_as::<_, Deploy>(&sql)
+    sqlx::query_as::<_, Deploy>(sqlx::AssertSqlSafe(sql))
         .bind(app_id)
         .bind(environment_id)
         .fetch_all(pool)
@@ -113,7 +113,7 @@ pub async fn list_deploys(
         "SELECT {DEPLOY_COLS} FROM deploy WHERE app_id = ? AND {TARGET_CLAUSE} \
          ORDER BY created_at DESC LIMIT 20",
     );
-    sqlx::query_as::<_, Deploy>(&sql)
+    sqlx::query_as::<_, Deploy>(sqlx::AssertSqlSafe(sql))
         .bind(app_id)
         .bind(environment_id)
         .fetch_all(pool)
@@ -132,7 +132,7 @@ pub async fn get_success_deploy(
          WHERE app_id = ? AND sha = ? AND status = 'success' AND environment_id IS NULL \
          ORDER BY created_at DESC LIMIT 1"
     );
-    sqlx::query_as::<_, Deploy>(&sql)
+    sqlx::query_as::<_, Deploy>(sqlx::AssertSqlSafe(sql))
         .bind(app_id)
         .bind(sha)
         .fetch_optional(pool)
@@ -155,7 +155,9 @@ pub async fn upsert_deploy(
     let ts = now_iso();
     if let Some(id) = id {
         if let Some(existing) =
-            sqlx::query_as::<_, Deploy>(&format!("SELECT {DEPLOY_COLS} FROM deploy WHERE id = ?"))
+            sqlx::query_as::<_, Deploy>(sqlx::AssertSqlSafe(format!(
+                "SELECT {DEPLOY_COLS} FROM deploy WHERE id = ?"
+            )))
                 .bind(id)
                 .fetch_optional(pool)
                 .await?
@@ -253,9 +255,9 @@ pub async fn fail_stuck_deploys(
     older_than_ms: i64,
     skip_app_ids: &HashSet<String>,
 ) -> sqlx::Result<u64> {
-    let rows = sqlx::query_as::<_, Deploy>(&format!(
+    let rows = sqlx::query_as::<_, Deploy>(sqlx::AssertSqlSafe(format!(
         "SELECT {DEPLOY_COLS} FROM deploy ORDER BY updated_at DESC LIMIT 200"
-    ))
+    )))
     .fetch_all(pool)
     .await?;
     let cutoff = utc_cutoff(older_than_ms);

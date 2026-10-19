@@ -159,10 +159,10 @@ pub fn metrics_db_path(database_url: &str) -> String {
 /// `&mut SqliteConnection` is not "general enough" for the `Executor` bound.
 macro_rules! attach_metrics {
     ($conn:expr, $metrics_path:expr) => {{
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ATTACH DATABASE '{}' AS metrics",
             $metrics_path.replace('\'', "''")
-        ))
+        )))
         .execute(&mut *$conn)
         .await?;
         sqlx::query("PRAGMA metrics.journal_mode=WAL")

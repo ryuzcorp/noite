@@ -130,7 +130,7 @@ pub async fn next_number(pool: &SqlitePool, app_id: &str) -> sqlx::Result<i64> {
 
 pub async fn get_pr(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<PullRequestRow>> {
     let sql = format!("SELECT {PR_COLS} FROM pull_request WHERE id = ?");
-    sqlx::query_as::<_, PullRequestRow>(&sql)
+    sqlx::query_as::<_, PullRequestRow>(sqlx::AssertSqlSafe(sql))
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -142,7 +142,7 @@ pub async fn get_by_number(
     number: i64,
 ) -> sqlx::Result<Option<PullRequestRow>> {
     let sql = format!("SELECT {PR_COLS} FROM pull_request WHERE app_id = ? AND number = ?");
-    sqlx::query_as::<_, PullRequestRow>(&sql)
+    sqlx::query_as::<_, PullRequestRow>(sqlx::AssertSqlSafe(sql))
         .bind(app_id)
         .bind(number)
         .fetch_optional(pool)
@@ -160,7 +160,7 @@ pub async fn open_for_pair(
         "SELECT {PR_COLS} FROM pull_request \
          WHERE app_id = ? AND base = ? AND head = ? AND state = 'open'"
     );
-    sqlx::query_as::<_, PullRequestRow>(&sql)
+    sqlx::query_as::<_, PullRequestRow>(sqlx::AssertSqlSafe(sql))
         .bind(app_id)
         .bind(base)
         .bind(head)
@@ -186,7 +186,7 @@ pub async fn list_prs(
              ORDER BY number DESC LIMIT ? OFFSET ?"
         ),
     };
-    let mut query = sqlx::query_as::<_, PullRequestRow>(&sql).bind(app_id);
+    let mut query = sqlx::query_as::<_, PullRequestRow>(sqlx::AssertSqlSafe(sql)).bind(app_id);
     if let Some(state) = state {
         query = query.bind(state);
     }
@@ -306,7 +306,7 @@ pub async fn open_prs_for_head(
         "SELECT {PR_COLS} FROM pull_request \
          WHERE app_id = ? AND head = ? AND state = 'open'"
     );
-    sqlx::query_as::<_, PullRequestRow>(&sql)
+    sqlx::query_as::<_, PullRequestRow>(sqlx::AssertSqlSafe(sql))
         .bind(app_id)
         .bind(head)
         .fetch_all(pool)
