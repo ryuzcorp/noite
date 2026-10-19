@@ -23,7 +23,7 @@
         "@effect/sql-d1": "4.0.4",
         "@fontsource-variable/geist": "^5.3.0",
         "@fontsource-variable/geist-mono": "^5.3.0",
-        "@ilha/void": "^0.1.2",
+        "@ilha/void": "^0.1.3",
         "@pierre/diffs": "1.5.2",
         "@pierre/highlights": "0.1.3",
         "@pierre/trees": "1.0.0-beta.6",
@@ -77,6 +77,10 @@
       },
     },
   },
+  "trustedDependencies": [
+    "esbuild",
+    "workerd",
+  ],
   "patchedDependencies": {
     "@r1ck404/nodepod@1.11.2": "apps/noite/patches/@r1ck404%2Fnodepod@1.11.2.patch",
   },
@@ -347,7 +351,7 @@
 
     "@iconify/utils": ["@iconify/utils@3.1.7", "", { "dependencies": { "@antfu/install-pkg": "^2.0.1", "@iconify/types": "^2.0.0", "import-meta-resolve": "^4.2.0" } }, "sha512-JZHlwdID+dy+lTgbYC8NEC4zeugqeYsc6jewvzb4c58kHauJn+X7rNwQjxz5p2qSjqaEeQoLkCIQ9v/H4PK0/w=="],
 
-    "@ilha/void": ["@ilha/void@0.1.2", "", { "peerDependencies": { "ilha": ">=0.16.0", "vite": "^8.0.0", "void": "^1.1.0" } }, "sha512-v0GaiZbjMs/Ly6wgaCNrQ2hgZexavYvgoBWBZtYUWBRWHacqHSuHiCadGe7e0vGnjpRBjaSDqiTy8UmZDcvylA=="],
+    "@ilha/void": ["@ilha/void@0.1.3", "", { "peerDependencies": { "ilha": ">=0.16.0", "vite": "^8.0.0", "void": "^1.1.0" } }, "sha512-3KyT1X5jb5zngECakv7KfyJVRvpFsX+gu7y05cMbvavmQ5z7AJ/8p/yz3xnyz+LI+kPaWLWfBSCnrJxY43DqXg=="],
 
     "@img/colour": ["@img/colour@1.1.0", "", {}, "sha512-Td76q7j57o/tLVdgS746cYARfSyxk8iEfRxewL9h4OMzYhbW4TAcppl0mT4eyqXddh6L/jwoM75mo7ixa/pCeQ=="],
 
