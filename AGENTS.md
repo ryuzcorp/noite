@@ -102,7 +102,7 @@ Operational do-nots and gotchas not carried by SPEC:
 
 ## Tips
 
-For UI tasks refer to: https://ilha.build/llms.txt and https://context7.com/websites/daisyui/llms.txt?tokens=10000. For back end and API tasks refer to: https://oxide.build/llms.txt
+For UI tasks refer to: https://ilha.build/llms.txt and https://context7.com/websites/daisyui/llms.txt?tokens=10000. For back end and API tasks refer to: https://ilha.build/llms.txt (tenant Oxide build output is documented in SPEC.md and `apps/runner/src/host/build_output.rs`, not in the Oxide framework docs)
 
 ---
 

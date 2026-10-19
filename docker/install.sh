@@ -22,7 +22,7 @@
 #   NOITE_TELEMETRY=0  turn off the anonymous daily heartbeat (on by default);
 #                      also DO_NOT_TRACK=1. https://noite.now/self-hosting/telemetry
 #   NOITE_VERSION      release channel or version (default: alpha; `stable`
-#                      follows final releases only, `0.1.0-alpha.1` or a short
+#                      follows final releases only, `0.1.0-alpha.5` or a short
 #                      SHA holds an install in place; `run.sh … install --pre`
 #                      pins the newest release, pre-releases included)
 #   NOITE_REF          git ref the installer and compose.yaml come from (default: main)
