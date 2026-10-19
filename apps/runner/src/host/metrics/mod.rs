@@ -90,6 +90,7 @@ fn minute_bucket_now() -> String {
 pub fn now_us() -> i64 {
     // Epoch-relative time via the loop_.rs pattern (chrono DateTime math,
     // num_milliseconds).
+    // Static invariant: the epoch is a hard-coded RFC 3339 literal, so parsing never fails.
     let epoch = chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
         .ok()
         .map(|d| d.with_timezone(&Utc))

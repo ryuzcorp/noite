@@ -862,9 +862,9 @@ async fn deploy_inner(
     progress.step = "start";
     match &environment {
         Some(_) => {
-            let env = target
-                .environment()
-                .expect("environment target carries its row");
+            let Some(env) = target.environment() else {
+                anyhow::bail!("environment deploy without its environment row");
+            };
             supervisor::ensure_environment_fleet(pool, cfg, procs, logs, env).await?;
             supervisor::reload_environment_fleet(env).await;
         }

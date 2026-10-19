@@ -67,6 +67,7 @@ pub async fn head_ref_bundle(
         let Some(caps) = re.captures(name) else {
             continue;
         };
+        // Static invariant: group 1 is present in the literal below, so a match always yields it.
         let sha = caps.get(1).unwrap().as_str().to_lowercase();
         let lm = obj
             .get("LastModified")
@@ -89,6 +90,7 @@ pub async fn head_main_bundle(cfg: &Config, slug: &str) -> anyhow::Result<Option
     head_ref_bundle(cfg, slug, "refs/heads/main").await
 }
 
+/// Static invariant: a compile-time literal, so construction never fails.
 fn regex_lite_bundle() -> regex::Regex {
     regex::Regex::new(r"(?i)^([0-9a-f]{7,40})\.bundle$").expect("bundle re")
 }

@@ -28,6 +28,7 @@ pub fn tail_utf8(s: &str, max: usize) -> &str {
 /// plain-text deploy log.
 pub fn strip_ansi(s: &str) -> std::borrow::Cow<'_, str> {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    // Static invariant: a compile-time literal, so construction never fails.
     let re = RE.get_or_init(|| regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("ansi re"));
     re.replace_all(s, "")
 }
@@ -50,6 +51,7 @@ pub fn slug_ok(slug: &str) -> bool {
     }
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
+        // Static invariant: a compile-time literal, so construction never fails.
         regex::Regex::new(r"^[a-z0-9]([a-z0-9\-]{0,46}[a-z0-9])?$").expect("slug re")
     });
     re.is_match(slug)

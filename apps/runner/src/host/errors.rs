@@ -239,6 +239,7 @@ fn file_of(location: &str) -> &str {
 fn normalize_message(message: &str) -> String {
     static IDS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static DIGITS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    // Static invariant: both patterns are compile-time literals, so construction never fails.
     let ids =
         IDS.get_or_init(|| regex::Regex::new(r"[0-9a-fA-F][0-9a-fA-F-]{7,}").expect("ids re"));
     let digits = DIGITS.get_or_init(|| regex::Regex::new(r"\d+").expect("digits re"));
