@@ -54,7 +54,7 @@ export type Committed = (path: string, isDir: boolean) => boolean;
 const REGEX_METACHARACTERS = /[.*+?^${}()|[\]\\]/gu;
 
 const literal = (text: string): string =>
-  text.replace(REGEX_METACHARACTERS, "\\$&");
+  text.replaceAll(REGEX_METACHARACTERS, "\\$&");
 
 /** Where a `[...]` class ends, looking from `start` (the index after the
  * bracket, or after its `!`): a `]` right at the start is one of its members,
