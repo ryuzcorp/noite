@@ -36,7 +36,7 @@ NOITE_CONFIRM="${NOITE_CONFIRM:-0}"
 # the stack is found even when compose.yaml is gone.
 PROJECT="noite"
 PROJECT_LABEL="com.docker.compose.project=$PROJECT"
-IMAGE_REPOS=("ghcr.io/ryuzcorp/noite" "rustfs/rustfs" "docker.io/rustfs/rustfs")
+IMAGE_REPOS=("ghcr.io/ryuzcorp/noite" "rustfs/rustfs" "docker.io/rustfs/rustfs" "noite:local" "noite-dev:local")
 
 if [[ -t 1 ]]; then
   BOLD=$'\e[1m' DIM=$'\e[2m' RED=$'\e[31m' GREEN=$'\e[32m' YELLOW=$'\e[33m' RESET=$'\e[0m'
