@@ -1326,7 +1326,7 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-jrpc",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "constant_time_eq",

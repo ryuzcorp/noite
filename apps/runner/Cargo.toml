@@ -39,7 +39,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 bytes = "1"
 constant_time_eq = "0.3"
 regex = "1"
-base64 = "0.22"
+base64 = "0.23"
 zstd = "0.13"
 rusty-s3 = "0.10.2"
 # Generates the TypeScript bindings the UI consumes (apps/noite/src/lib/runner-types)
