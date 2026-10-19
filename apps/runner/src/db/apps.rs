@@ -240,7 +240,9 @@ pub async fn create_app(
     .bind(&ts)
     .execute(pool)
     .await?;
-    get_app(pool, &id).await.map(|a| a.expect("just inserted"))
+    get_app(pool, &id)
+        .await
+        .map(|app| app.ok_or(sqlx::Error::RowNotFound))?
 }
 
 /// Owner start/stop. Either way the app is no longer asleep, and a start
