@@ -40,6 +40,10 @@
       },
     },
   },
+  "trustedDependencies": [
+    "esbuild",
+    "workerd",
+  ],
   "patchedDependencies": {
     "@r1ck404/nodepod@1.11.2": "patches/@r1ck404%2Fnodepod@1.11.2.patch",
   },
