@@ -22,9 +22,9 @@ import {
 
 // F4: pull requests and branch protection. The PR data is exercised on the
 // runner's REST mirror (the same raw-port lane the hardening/lifecycle specs
-// use — the panels are a known-broken surface under celld), while the branch
-// protection rule is set through the settings panel it belongs to and the
-// protected-`main` push is a real git push against the runner's git policy.
+// use), while the branch protection rule is set through the settings panel it
+// belongs to and the protected-`main` push is a real git push against the
+// runner's git policy.
 
 const gitBase = process.env.E2E_GIT_BASE ?? "http://localhost:8080/v1/git";
 

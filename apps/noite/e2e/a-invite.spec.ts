@@ -6,10 +6,9 @@ import { expect, test } from "@playwright/test";
 // instance; from then on `/api/invite/status` must tell every client that a
 // code is required and how many each new account receives.
 //
-// Not covered here, both blocked by the known issue in SPEC.md: redeeming a
-// code (validate → claim → mint is several D1 round trips inside one action,
-// and the control node's D1 stalls under that) and reading an account's own
-// codes (the profile panel, an action-driven surface).
+// Not covered here: redeeming a code (validate → claim → mint is several D1
+// round trips inside one action) and reading an account's own codes (the
+// profile panel, an action-driven surface).
 const control = process.env.E2E_BASE_URL ?? "http://noite.localhost:8090";
 
 test("the signup policy flips to invite-only after the first account", async ({
