@@ -1218,6 +1218,8 @@ mod tests {
             poll_ms: 5000,
             tip_sweep_s: 60,
             caddy_upstream_host: "127.0.0.1".into(),
+            http_port: 9080,
+            https_port: 9443,
             auto_https,
             caddy_control_upstream: "127.0.0.1:8090".into(),
             caddy_api_upstream: "127.0.0.1:8080".into(),

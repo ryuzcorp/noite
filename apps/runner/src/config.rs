@@ -421,6 +421,12 @@ pub struct Config {
     /// behind the runner's back (another runner, a manual bucket write).
     pub tip_sweep_s: u64,
     pub caddy_upstream_host: String,
+    /// Host HTTP port the edge is published on (`HTTP_PORT`, 9080; 80 in
+    /// prod): what a plaintext tenant URL carries after the host.
+    pub http_port: u16,
+    /// Host HTTPS port the edge is published on (`HTTPS_PORT`, 9443; 443 in
+    /// prod): carried only when non-default, like a browser would show.
+    pub https_port: u16,
     /// Caddy `auto_https`: unset = on except `localhost`; explicit
     /// `off` for behind-proxy deployments (our Caddy still terminates
     /// per-host TLS itself via on-demand certs).
@@ -552,10 +558,12 @@ impl Config {
         } else {
             format!("sqlite:{db}?mode=rwc")
         };
+        let mut env_problems: Vec<String> = Vec::new();
+        let http_port: u16 = env_num("HTTP_PORT", 9080, "a port number", &mut env_problems);
+        let https_port: u16 = env_num("HTTPS_PORT", 9443, "a port number", &mut env_problems);
         let git_public_base = env::var("GIT_PUBLIC_BASE").unwrap_or_else(|_| {
             if is_localhost_domain(&base_domain) {
-                let port = env_or(&["HTTP_PORT"], "9080");
-                format!("http://git.{base_domain}:{port}")
+                format!("http://git.{base_domain}:{http_port}")
             } else {
                 format!("https://git.{base_domain}")
             }
@@ -563,7 +571,6 @@ impl Config {
         let auto_https =
             parse_auto_https(env::var("CADDY_AUTO_HTTPS").ok().as_deref(), &base_domain);
         let tenancy = parse_tenancy(env::var("NOITE_TENANCY").ok().as_deref(), &base_domain);
-        let mut env_problems: Vec<String> = Vec::new();
         let (fleet_port_min, fleet_port_max) = parse_fleet_ports(&mut env_problems);
         let cfg = Self {
             bind: env_or(&["RUNNER_BIND"], "0.0.0.0:8080"),
@@ -607,6 +614,8 @@ impl Config {
             ),
             // Everything Caddy proxies to lives in this container.
             caddy_upstream_host: "127.0.0.1".into(),
+            http_port,
+            https_port,
             auto_https,
             caddy_control_upstream: CONTROL_UPSTREAM.into(),
             caddy_api_upstream: API_UPSTREAM.into(),
@@ -891,6 +900,28 @@ impl Config {
         format!("{}/{slug}", self.git_public_base.trim_end_matches('/'))
     }
 
+    /// Browser URL of an app from its stored subdomain (`{slug}.{base}`).
+    /// The edge serves tenants there, so the scheme and port follow the edge
+    /// — never the git remote (the runner API's raw port is not reachable
+    /// from a browser). Mirrors the control UI's `appUrl` and the CLI's
+    /// `deployUrlOf`: dev carries the public HTTP port over http, prod links
+    /// plain https (a non-default HTTPS port is carried), and
+    /// `CADDY_AUTO_HTTPS=off` answers plaintext http behind the proxy.
+    pub fn public_app_url(&self, subdomain: &str) -> String {
+        let host = subdomain.trim().trim_end_matches('.');
+        if is_localhost_domain(&self.base_domain) || !self.auto_https {
+            if self.http_port == 80 {
+                format!("http://{}", host)
+            } else {
+                format!("http://{}:{}", host, self.http_port)
+            }
+        } else if self.https_port == 443 {
+            format!("https://{}", host)
+        } else {
+            format!("https://{}:{}", host, self.https_port)
+        }
+    }
+
     /// celld fleet bucket URI: `s3://{bucket}/fleets/{slug}`.
     pub fn fleets_uri(&self, slug: &str) -> String {
         format!("s3://{}/fleets/{slug}", self.s3_bucket)
@@ -964,6 +995,8 @@ pub(crate) fn config_for_tests() -> Config {
         poll_ms: 5000,
         tip_sweep_s: 60,
         caddy_upstream_host: "127.0.0.1".into(),
+        http_port: 9080,
+        https_port: 9443,
         auto_https: false,
         fleet_log: "error,celld=warn".into(),
         max_apps_per_user: 10,
@@ -1102,8 +1135,9 @@ mod tests {
     /// Every numeric env var `from_env` parses strictly. Kept next to the
     /// parse sites so a new knob must add its name here too.
     const STRICT_NUMERIC_VARS: &[&str] = &[
+        "HTTP_PORT",
+        "HTTPS_PORT",
         "RUNNER_POLL_MS",
-        "RUNNER_TIP_SWEEP_S",
         "RUNNER_MAX_APPS_PER_USER",
         "RUNNER_MAX_ENVIRONMENTS_PER_APP",
         "RUNNER_MAX_ENVIRONMENTS",
@@ -1170,6 +1204,7 @@ mod tests {
     fn every_malformed_numeric_is_listed_at_once() {
         with_env(
             &[
+                ("HTTP_PORT", "eighty"),
                 ("RUNNER_POLL_MS", "abc"),
                 ("RUNNER_MAX_APPS_PER_USER", "ten"),
                 ("RUNNER_TELEMETRY_RETENTION_DAYS", "thirty"),
@@ -1182,6 +1217,7 @@ mod tests {
                 let err = Config::from_env().expect_err("malformed values must fail boot");
                 let msg = format!("{err:#}");
                 for (key, value) in [
+                    ("HTTP_PORT", "eighty"),
                     ("RUNNER_POLL_MS", "abc"),
                     ("RUNNER_MAX_APPS_PER_USER", "ten"),
                     ("RUNNER_TELEMETRY_RETENTION_DAYS", "thirty"),
@@ -1202,6 +1238,8 @@ mod tests {
         with_env(&[], || {
             let cfg = Config::from_env().expect("unset numerics must boot");
             assert!(cfg.env_problems.is_empty());
+            assert_eq!(cfg.http_port, 9080);
+            assert_eq!(cfg.https_port, 9443);
             assert_eq!(cfg.poll_ms, 5000);
             assert_eq!(cfg.tip_sweep_s, 60);
             assert_eq!(cfg.max_apps_per_user, 10);
@@ -1392,5 +1430,40 @@ mod tests {
         assert!(tp.is_empty());
         assert_eq!(bad, vec!["10.0.0.0/33", "example.com", "1.2.3"]);
         assert!(parse_trusted_proxies("").0.is_empty());
+    }
+
+    #[test]
+    fn public_app_url_follows_the_edge_not_the_git_remote() {
+        // Dev: http with the public (non-default) port, whatever the git
+        // remote's port says — the runner API's raw port is unreachable.
+        let mut cfg = config_for_tests();
+        cfg.base_domain = "noite.localhost".into();
+        cfg.git_public_base = "http://localhost:8080/v1/git".into();
+        assert_eq!(
+            cfg.public_app_url("blog.noite.localhost"),
+            "http://blog.noite.localhost:9080"
+        );
+        // Prod: plain https, the default port omitted.
+        cfg.base_domain = "noite.now".into();
+        cfg.auto_https = true;
+        cfg.https_port = 443;
+        assert_eq!(
+            cfg.public_app_url("blog.noite.now"),
+            "https://blog.noite.now"
+        );
+        // A non-default HTTPS port is carried, like a browser would show.
+        cfg.https_port = 9443;
+        assert_eq!(
+            cfg.public_app_url("blog.noite.now"),
+            "https://blog.noite.now:9443"
+        );
+        // Behind a terminating proxy (`CADDY_AUTO_HTTPS=off`) the edge
+        // answers plaintext http on the public HTTP port.
+        cfg.auto_https = false;
+        cfg.http_port = 80;
+        assert_eq!(
+            cfg.public_app_url("blog.noite.now"),
+            "http://blog.noite.now"
+        );
     }
 }
