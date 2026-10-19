@@ -83,10 +83,22 @@ pub async fn list_deploys_stream(
         let app_id = app_id.clone();
         let env_id = env_id.clone();
         async move {
-            db::list_deploys_lean(&pool, &app_id, env_id.as_deref())
-                .await
-                .ok()
-                .map(|rows| serde_json::to_string(&rows).unwrap_or_default())
+            let rows = match db::list_deploys_lean(&pool, &app_id, env_id.as_deref()).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!(error = %e, "deploys stream: skipping failed snapshot");
+                    return None;
+                }
+            };
+            // A blank event would paint a fake empty history; skip the tick
+            // instead so the next one retries.
+            match serde_json::to_string(&rows) {
+                Ok(json) => Some(json),
+                Err(e) => {
+                    tracing::warn!(error = %e, "deploys stream: dropping unserializable snapshot");
+                    None
+                }
+            }
         }
     })
 }

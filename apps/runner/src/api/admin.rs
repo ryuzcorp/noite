@@ -16,14 +16,23 @@ use crate::AppState;
 pub async fn snapshot(State(state): State<AppState>) -> impl IntoResponse {
     let path = db::snapshot_path(&state.config);
     if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return ApiError::internal(format!("snapshot setup failed: {e:#}")).into_response();
+        }
     }
-    let _ = tokio::fs::remove_file(&path).await;
+    // A missing previous copy is the normal first-run case; any other
+    // removal failure must surface now, not late as a confusing vacuum
+    // error.
+    if let Err(e) = tokio::fs::remove_file(&path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return ApiError::internal(format!("snapshot setup failed: {e:#}")).into_response();
+        }
+    }
+    // Path is ours (derived from the configured database location), and the
+    // escaping keeps a quote in it from ending the literal.
     let Some(target) = path.to_str() else {
         return ApiError::internal("snapshot path is not valid UTF-8").into_response();
     };
-    // Path is ours (derived from the configured database location), and the
-    // escaping keeps a quote in it from ending the literal.
     let sql = format!("VACUUM INTO '{}'", target.replace('\'', "''"));
     if let Err(e) = sqlx::query(&sql).execute(&state.pool).await {
         return ApiError::internal(format!("vacuum failed: {e}")).into_response();
