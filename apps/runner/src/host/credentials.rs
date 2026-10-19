@@ -187,7 +187,10 @@ mod tests {
         // Random 96-bit nonce per encryption: GCM breaks outright on a repeated
         // (key, nonce) pair, and every row shares one key.
         let mut nonce_bytes = [0u8; 12];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce_bytes);
+        use rand::TryRng;
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut nonce_bytes)
+            .expect("os randomness");
         let nonce = Nonce::from(nonce_bytes);
         // The app id is associated data: a row copied onto another app fails to
         // decrypt instead of handing that app someone else's keys.
