@@ -484,6 +484,7 @@ pub fn tls_ask_static_ok(
         .map(|(h, _)| h)
         .unwrap_or(host)
         .trim()
+        .trim_end_matches('.')
         .to_lowercase();
     if bare.is_empty() {
         return false;
@@ -729,6 +730,11 @@ mod tests {
             &[]
         ));
         assert!(!tls_ask_static_ok("anything", "", "app", &[]));
+        // A trailing-dot FQDN is the same name (DNS root): the custom-domain
+        // branch already accepts it, the static gate must too.
+        assert!(tls_ask_static_ok("app.noite.now.", "noite.now", "app", &[]));
+        assert!(tls_ask_static_ok("API.NOITE.NOW.", "noite.now", "app", &[]));
+        assert!(!tls_ask_static_ok(".", "noite.now", "app", &[]));
     }
     #[test]
     fn parses_preview_hosts() {

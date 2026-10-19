@@ -125,11 +125,19 @@ pub async fn app_logs_stream(
         loop {
             let lines = source.lines(&state).await;
             if last.as_ref() != Some(&lines) {
-                let data = serde_json::to_string(&lines).unwrap_or_default();
-                if tx.send(Ok(Event::default().data(data))).await.is_err() {
-                    break;
+                // A blank event would paint a fake empty tail; skip the tick
+                // instead so the next one retries.
+                match serde_json::to_string(&lines) {
+                    Ok(data) => {
+                        if tx.send(Ok(Event::default().data(data))).await.is_err() {
+                            break;
+                        }
+                        last = Some(lines);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "logs stream: dropping unserializable snapshot");
+                    }
                 }
-                last = Some(lines);
             }
             // Wake on new ingested logs, on a 30 s heartbeat cadence, or stop
             // promptly when the client leaves (T1.2): the send-failure check

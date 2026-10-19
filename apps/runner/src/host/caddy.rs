@@ -359,6 +359,18 @@ pub async fn rewrite_caddy(
     // (e.g. `header_up`) MUST go inside `reverse_proxy` — Caddy rejects
     // them at site level and then keeps serving the stale config.
     let edge = &cfg.edge;
+    // Per-client zones vanish without a word when the edge cannot tell
+    // clients apart (`guard_lines` drops every 0-rpm zone): say so loudly,
+    // or an operator behind a proxy believes each client is capped while the
+    // shared per-app ceiling is the only limit standing.
+    if !cfg.edge_sees_clients()
+        && (edge.client_rpm > 0 || limits.iter().any(|l| l.client_rpm.is_some_and(|v| v > 0)))
+    {
+        tracing::warn!(
+            "per-client rate limits disabled: the edge sees one client IP (no trusted_proxies); \
+             set trusted_proxies or rely on the per-app shared limits"
+        );
+    }
     // The pod assets no control site ever serves: the edge answers 404 before
     // proxying, in every mode. The worker's own `02-pod-host` gate answers 404
     // too, but Void's generated entry wraps every app response in
@@ -843,7 +855,7 @@ const FRAME_HEADERS: &[&str] = &[
 
 /// The Preview panel's frame reaches the app as a top-level page load. The
 /// browser marks a framed load `Sec-Fetch-Dest: iframe`, and a server that
-/// renders only `document` navigations (oxidejs 0.6's worker, for one)
+/// renders only `document` navigations (the control worker, for one)
 /// answers the frame with its own 404 while the same URL renders in a tab. A
 /// same-site frame — the control UI framing it — is rewritten to `document`
 /// on the way upstream; a cross-site embedder's request is left as sent.

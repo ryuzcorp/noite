@@ -8,8 +8,8 @@
 //!
 //! Providers (4.2): RustFS IAM (verify), MinIO (supported), AWS STS
 //! (supported), R2/Tigris bucket-per-app (optional/verify). No scoped
-//! provider exists yet, so no row is minted today: `mint` is only for a real
-//! per-prefix key pair. Two consumers, two rules:
+//! provider exists yet, so no row is minted today; the Phase 4 provider
+//! (SPEC, Scoped credentials) re-adds the write path. Two consumers, two rules:
 //!
 //! - **Tenant processes** (release scripts run tenant code with the key in
 //!   their env): scoped keys only; root keys only with `NOITE_TENANCY=single`.
@@ -83,28 +83,6 @@ fn kek(runner_token: &str) -> [u8; 32] {
     hk.expand(b"noite-app-credential-v1", &mut out)
         .expect("hkdf expand");
     out
-}
-
-fn encrypt(runner_token: &str, app_id: &str, plaintext: &str) -> (Vec<u8>, Vec<u8>) {
-    let key = kek(runner_token);
-    let cipher = Aes256Gcm::new_from_slice(&key).expect("kek len");
-    // Random 96-bit nonce per encryption: GCM breaks outright on a repeated
-    // (key, nonce) pair, and every row shares one key.
-    let mut nonce_bytes = [0u8; 12];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    // The app id is associated data: a row copied onto another app fails to
-    // decrypt instead of handing that app someone else's keys.
-    let ct = cipher
-        .encrypt(
-            nonce,
-            Payload {
-                aad: app_id.as_bytes(),
-                msg: plaintext.as_bytes(),
-            },
-        )
-        .expect("encrypt");
-    (nonce_bytes.to_vec(), ct)
 }
 
 fn decrypt(runner_token: &str, app_id: &str, nonce: &[u8], ct: &[u8]) -> anyhow::Result<String> {
@@ -184,24 +162,6 @@ pub async fn fleet_credentials(
     })
 }
 
-/// Store a scoped key pair for an app. Only a real per-prefix provider may
-/// call this: a row here is trusted as scoped by tenant processes, so
-/// storing root keys would hand them to tenant release scripts.
-#[allow(dead_code)] // first caller is the Phase 4 provider
-pub async fn mint(
-    pool: &sqlx::SqlitePool,
-    cfg: &Config,
-    app_id: &str,
-    access_key: &str,
-    secret_key: &str,
-) -> anyhow::Result<()> {
-    let payload =
-        serde_json::json!({ "access_key": access_key, "secret_key": secret_key }).to_string();
-    let (nonce, ct) = encrypt(&cfg.runner_token, app_id, &payload);
-    db::put_app_credential(pool, app_id, &nonce, &ct).await?;
-    Ok(())
-}
-
 pub async fn revoke(pool: &sqlx::SqlitePool, app_id: &str) -> anyhow::Result<()> {
     db::delete_app_credential(pool, app_id).await?;
     Ok(())
@@ -209,7 +169,36 @@ pub async fn revoke(pool: &sqlx::SqlitePool, app_id: &str) -> anyhow::Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::{decrypt, encrypt};
+    use super::{decrypt, kek};
+    use aes_gcm::{
+        aead::{Aead, Payload},
+        Aes256Gcm, KeyInit, Nonce,
+    };
+
+    /// Test-only row writer: production no longer mints rows (Phase 4
+    /// re-adds the write path), but the round-trip below still guards the
+    /// live read path (`decrypt` + app binding).
+    fn encrypt(runner_token: &str, app_id: &str, plaintext: &str) -> (Vec<u8>, Vec<u8>) {
+        let key = kek(runner_token);
+        let cipher = Aes256Gcm::new_from_slice(&key).expect("kek len");
+        // Random 96-bit nonce per encryption: GCM breaks outright on a repeated
+        // (key, nonce) pair, and every row shares one key.
+        let mut nonce_bytes = [0u8; 12];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        // The app id is associated data: a row copied onto another app fails to
+        // decrypt instead of handing that app someone else's keys.
+        let ct = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    aad: app_id.as_bytes(),
+                    msg: plaintext.as_bytes(),
+                },
+            )
+            .expect("encrypt");
+        (nonce_bytes.to_vec(), ct)
+    }
 
     #[test]
     fn credential_rows_round_trip_and_bind_to_their_app() {

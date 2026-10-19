@@ -28,6 +28,8 @@ fn tag_value(v: &serde_json::Value) -> bool {
 #[derive(Deserialize)]
 // Alpha cut: `notify` (no push delivery) and `parser` (no markdown
 // rendering) are accepted and ignored — the fields must stay for API shape.
+// The `allow` covers those two never-read fields, not the type: without it
+// the build warns.
 #[allow(dead_code)]
 pub struct LogBody {
     pub channel: String,

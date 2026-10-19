@@ -1,8 +1,8 @@
 //! The config `celld deploy` takes after a build (SPEC, Deploy pipeline):
 //! what the build produced, not the pushed source config.
 //!
-//! 1. `dist/wrangler.json`, a celld-ready config the build wrote (Void or
-//!    Oxide, on Vite or Rsbuild alike).
+//! 1. `dist/wrangler.json`, a celld-ready config the build wrote (on Vite or
+//!    Rsbuild alike).
 //! 2. Wrangler's deploy redirect, `.wrangler/deploy/config.json`, which
 //!    `@cloudflare/vite-plugin` writes beside `dist/<worker>/wrangler.json`.
 //!    celld refuses that output as is (Wrangler-only keys, an assets

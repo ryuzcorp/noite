@@ -30,11 +30,27 @@ fn sigterm(pid: u32) -> bool {
     }
 }
 
-fn sigkill(pid: u32) {
+/// SIGKILL a fleet's whole process tree. When `pid` leads its own group (a
+/// fleet this supervisor spawned with `process_group(0)`), the group dies —
+/// including workers orphaned after the leader already exited, which still
+/// hold the group (and the fleet's port) until they are signaled. A foreign
+/// child shares its parent's group — `killpg` there would signal the runner
+/// itself — so those get a single-pid kill instead. ESRCH on a fully gone
+/// group is fine either way.
+fn sigkill_tree(pid: u32) {
     #[cfg(unix)]
     {
+        // SAFETY: getpgid only reads; kill/killpg signal at most the group
+        // the pid leads (or led — a reaped leader's orphans keep its group
+        // alive, and only an immediate pid recycle could misdirect that,
+        // the same exposure `run_sandboxed` already accepts).
         unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
+            let pgid = libc::getpgid(pid as i32);
+            if pgid == pid as i32 || pgid < 0 {
+                libc::killpg(pid as i32, libc::SIGKILL);
+            } else {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
         }
     }
     #[cfg(not(unix))]
@@ -51,14 +67,20 @@ pub fn new_procs() -> ProcMap {
 
 /// Stop one tenant fleet. The docs are explicit: celld shuts down gracefully
 /// on SIGTERM/SIGINT (cancel work, prove durability, release leases, seal
-/// the node log). SIGKILL only as a bounded fallback.
+/// the node log). SIGKILL only as a bounded fallback — delivered to the whole
+/// process group, so an orphaned worker can never keep the fleet's port into
+/// the next spawn.
 pub async fn stop_fleet(procs: &ProcMap, slug: &str) {
     let mut map = procs.lock().await;
     let Some(mut child) = map.remove(slug) else {
         return;
     };
     drop(map);
-    if let Some(pid) = child.id() {
+    // Read before the wait: `id()` goes `None` once the child is reaped, and
+    // the fallback below needs the pid (the old code signaled `None` and
+    // fell back to a `kill()` on an already-waited child — a no-op).
+    let pid = child.id();
+    if let Some(pid) = pid {
         sigterm(pid);
     }
     if tokio::time::timeout(Duration::from_secs(15), child.wait())
@@ -66,12 +88,18 @@ pub async fn stop_fleet(procs: &ProcMap, slug: &str) {
         .is_err()
     {
         tracing::warn!(slug, "celld did not stop within 15s; killing");
-        if let Some(pid) = child.id() {
-            sigkill(pid);
-        } else {
-            let _ = child.kill().await;
+        match pid {
+            Some(pid) => sigkill_tree(pid),
+            None => {
+                let _ = child.kill().await;
+            }
         }
         let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    }
+    // Whatever survived — a worker that ignored SIGTERM — must not outlive
+    // the stop: reap the whole group, like `run_sandboxed`.
+    if let Some(pid) = pid {
+        sigkill_tree(pid);
     }
     tracing::info!(slug, "stopped celld");
 }
@@ -353,6 +381,10 @@ async fn ensure_spawned(
         if let Some(gid) = cfg.fleet_gid {
             cmd.as_std_mut().gid(gid);
         }
+        // Its own process group (like `run_sandboxed`): the stops below kill
+        // the whole tree, so an orphaned worker can never keep the fleet's
+        // port into the next spawn. Uid drop above is untouched.
+        cmd.as_std_mut().process_group(0);
     }
     for (k, v) in spec.env {
         cmd.env(k, v);
@@ -413,9 +445,8 @@ pub async fn stop_all(procs: &ProcMap, budget: Duration) {
     }
     let deadline = tokio::time::sleep(budget);
     tokio::pin!(deadline);
-    let mut remaining: Vec<(String, Child)> =
-        children.into_iter().map(|(s, c, _)| (s, c)).collect();
-    let waits = remaining.iter_mut().map(|(s, c)| async move {
+    let mut remaining: Vec<(String, Child, Option<u32>)> = children;
+    let waits = remaining.iter_mut().map(|(s, c, _)| async move {
         let st = c.wait().await.ok();
         (s.clone(), st)
     });
@@ -426,15 +457,16 @@ pub async fn stop_all(procs: &ProcMap, budget: Duration) {
             }
         }
         _ = &mut deadline => {
-            for (slug, child) in &mut remaining {
+            for (slug, child, pid) in &mut remaining {
                 tracing::warn!(slug, "fleet past stop budget; killing");
-                if let Some(pid) = child.id() {
-                    sigkill(pid);
-                } else {
-                    let _ = child.kill().await;
+                match pid {
+                    Some(pid) => sigkill_tree(*pid),
+                    None => {
+                        let _ = child.kill().await;
+                    }
                 }
             }
-            for (_, mut child) in remaining {
+            for (_, mut child, _) in remaining {
                 let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
             }
         }
@@ -595,5 +627,32 @@ mod tests {
                 .join("feature")
         );
         assert_eq!(env_fleet_key("blog", "feature"), "blog.feature");
+    }
+
+    /// Stopping a fleet reaps the whole tree: a worker the fleet left behind
+    /// (same process group) dies with it instead of keeping the fleet's port
+    /// for the next spawn to crash-loop on.
+    #[tokio::test]
+    async fn stop_fleet_kills_the_process_group() {
+        use std::os::unix::process::CommandExt;
+        // A sleep duration no other process can plausibly share, so the
+        // /proc scan below cannot false-positive.
+        let marker = "31337378";
+        let mut cmd = Command::new("sh");
+        let script = format!("sleep {marker} & wait");
+        cmd.args(["-c", script.as_str()]);
+        cmd.as_std_mut().process_group(0);
+        cmd.kill_on_drop(true);
+        let child = cmd.spawn().expect("spawn sleeper tree");
+        let procs = new_procs();
+        procs.lock().await.insert("probe".into(), child);
+
+        stop_fleet(&procs, "probe").await;
+
+        assert!(!procs.lock().await.contains_key("probe"));
+        assert!(
+            !crate::testutil::live_cmdline_has(marker),
+            "stopped fleet left a worker behind"
+        );
     }
 }

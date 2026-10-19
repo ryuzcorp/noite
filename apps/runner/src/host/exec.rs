@@ -315,6 +315,20 @@ pub async fn run_sandboxed(
     }
 }
 
+/// SIGKILL a process group this module created (group id = leader pid).
+/// ESRCH when the group is already empty is fine — the call sites run it
+/// unconditionally after the wait, exactly like `run_sandboxed`.
+#[cfg(unix)]
+fn kill_group(pid: u32) {
+    // SAFETY: signals only the process group this call created.
+    unsafe {
+        libc::killpg(pid as i32, libc::SIGKILL);
+    }
+}
+
+/// Runner-owned command (git, celld, duckdb): explicit env, piped output, and
+/// — like [`run_sandboxed`] — its own process group, so a timed-out step's
+/// grandchildren die with it instead of keeping its port or lock.
 pub async fn run_cmd(
     program: &str,
     args: &[&str],
@@ -338,11 +352,21 @@ pub async fn run_cmd(
     for (k, v) in env {
         cmd.env(k, v);
     }
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.as_std_mut().process_group(0);
+    }
     let child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
-    let output = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .context("command timeout")?
-        .context("wait output")?;
+    let pid = child.id();
+    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    // Whatever happened, nothing the step started may outlive it: the group
+    // id is the child's pid (process_group(0)); ESRCH when the group is
+    // already empty is fine.
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        kill_group(pid);
+    }
+    let output = result.context("command timeout")?.context("wait output")?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         let out = String::from_utf8_lossy(&output.stdout);
@@ -358,6 +382,8 @@ pub async fn run_cmd(
 /// Spawn `program` with stdout and stderr piped so a caller can stream the
 /// output (an archive, a download) instead of buffering it; env mirrors
 /// `run_cmd`. The caller owns the child — dropping it kills the process.
+/// The child leads its own process group (like [`run_cmd`]), so a caller
+/// that needs the whole tree gone can kill the group by the child's pid.
 pub fn spawn_stream(
     program: &str,
     args: &[&str],
@@ -378,10 +404,15 @@ pub fn spawn_stream(
     for (k, v) in env {
         cmd.env(k, v);
     }
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.as_std_mut().process_group(0);
+    }
     cmd.spawn().with_context(|| format!("spawn {program}"))
 }
 
 /// Run a command with stdin bytes; returns raw stdout (no UTF-8 requirement).
+/// Grouped like [`run_cmd`]: a timed-out step's grandchildren die with it.
 pub async fn run_cmd_stdin(
     program: &str,
     args: &[&str],
@@ -408,7 +439,12 @@ pub async fn run_cmd_stdin(
     for (k, v) in env {
         cmd.env(k, v);
     }
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.as_std_mut().process_group(0);
+    }
     let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
+    let pid = child.id();
     // Feed stdin from its own task: a command that answers with more than a
     // pipe buffer holds (batch `git cat-file`) blocks on stdout, and if we
     // were still blocked writing stdin the two would deadlock.
@@ -418,10 +454,13 @@ pub async fn run_cmd_stdin(
         let _ = pipe.write_all(&input).await;
         let _ = pipe.shutdown().await;
     });
-    let output = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .context("command timeout")?
-        .context("wait output")?;
+    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    // Nothing the step started may outlive it (see `run_cmd`).
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        kill_group(pid);
+    }
+    let output = result.context("command timeout")?.context("wait output")?;
     let _ = writer.await;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
@@ -469,5 +508,31 @@ mod tests {
         prune_build_cache(&dir, 2);
         assert!(dir.join("home/.local").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A timed-out step must not leave grandchildren: `sh` backgrounds a
+    /// `sleep` (the step's grandchild, in its process group) and waits, the
+    /// timeout fires, and the group kill must reap the whole tree — the old
+    /// `kill_on_drop`-only code left the sleep holding the step's port.
+    #[tokio::test]
+    async fn run_cmd_timeout_kills_grandchildren() {
+        // A sleep duration no other process on the machine can plausibly
+        // share, so the /proc scan below cannot false-positive.
+        let marker = "31337377";
+        let script = format!("sleep {marker} & wait");
+        let err = run_cmd(
+            "sh",
+            &["-c", script.as_str()],
+            None,
+            &[],
+            Duration::from_secs(2),
+        )
+        .await
+        .expect_err("sleep must hit the timeout");
+        assert!(err.to_string().contains("command timeout"), "{err:#}");
+        assert!(
+            !crate::testutil::live_cmdline_has(marker),
+            "timed-out step left a grandchild behind"
+        );
     }
 }

@@ -399,10 +399,12 @@ async fn deploy_inner(
     };
 
     let root = exec::work_root(cfg);
+    // A clock before the epoch (operator-set time) must not panic the deploy
+    // task: fall back to zero instead of unwrapping.
     let work = root.join("builds").join(&app.slug).join(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis()
             .to_string(),
     );
@@ -803,11 +805,16 @@ async fn deploy_inner(
     let env_owned = s3::aws_env(cfg);
     let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     env.push(("S3_ENDPOINT", cfg.s3_endpoint.as_str()));
+    // Work-dir-derived paths are operator-influenced (a non-UTF-8 mount):
+    // fail the deploy instead of panicking the deploy task.
+    let Some(deploy_arg) = deploy_root.to_str() else {
+        anyhow::bail!("deploy root is not valid UTF-8: {}", deploy_root.display());
+    };
     exec::run_cmd(
         &cfg.celld_bin,
         &[
             "deploy",
-            deploy_root.to_str().unwrap(),
+            deploy_arg,
             "--bucket",
             &bucket,
             "--endpoint",
@@ -904,9 +911,12 @@ async fn materialize_bundle(
     tokio::fs::create_dir_all(&bare).await?;
     tokio::fs::create_dir_all(&src_dir).await?;
     if !tokio::fs::try_exists(bare.join("HEAD")).await? {
+        let Some(bare_arg) = bare.to_str() else {
+            anyhow::bail!("bare mirror path is not valid UTF-8: {}", bare.display());
+        };
         exec::run_cmd(
             "git",
-            &["init", "--bare", bare.to_str().unwrap()],
+            &["init", "--bare", bare_arg],
             Some(work),
             &[],
             Duration::from_secs(30),
@@ -914,12 +924,18 @@ async fn materialize_bundle(
         .await?;
     }
     let refspec = format!("+{sha}:{git_ref}");
+    let Some(bundle_arg) = bundle_path.to_str() else {
+        anyhow::bail!(
+            "bundle path is not valid UTF-8: {}",
+            bundle_path.display()
+        );
+    };
     exec::run_cmd(
         "git",
         &[
             &format!("--git-dir={}", bare.display()),
             "fetch",
-            bundle_path.to_str().unwrap(),
+            bundle_arg,
             &refspec,
         ],
         Some(work),

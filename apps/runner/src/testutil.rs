@@ -36,3 +36,23 @@ pub async fn spawn_s3_stub() -> String {
     });
     format!("http://{addr}")
 }
+
+/// Whether any live process still carries `marker` in its command line.
+/// Process-group kill tests use it to prove no grandchild survived: a
+/// lingering zombie's cmdline reads empty, so only a truly live process
+/// matches.
+pub fn live_cmdline_has(marker: &str) -> bool {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    dir.flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .chars()
+                .all(|c| c.is_ascii_digit())
+        })
+        .filter_map(|entry| std::fs::read(entry.path().join("cmdline")).ok())
+        .any(|raw| String::from_utf8_lossy(&raw).contains(marker))
+}
