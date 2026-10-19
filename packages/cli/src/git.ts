@@ -1,4 +1,8 @@
+import { readdir } from "node:fs/promises";
+
 import { Effect } from "effect";
+
+import { withTempDir } from "./temp.js";
 
 /** Run git in cwd, resolving stdout. Rejects with scrubbed stderr. */
 const runGit = (
@@ -53,68 +57,83 @@ export interface PushInput {
 }
 
 /**
+ * Copy every top-level entry of `src` into `dest`. `readdir` (unlike a `*`
+ * glob) sees dotfiles, so `.well-known/` and friends survive the trip.
+ */
+export const copyTreeEntries = (
+  src: string,
+  dest: string
+): Effect.Effect<void, Error> =>
+  Effect.tryPromise({
+    catch: () => new Error(`copying ${src} failed`),
+    try: async (): Promise<void> => {
+      const entries = await readdir(src);
+      await Promise.all(
+        entries.map((entry) =>
+          Bun.$`cp -r ${`${src}/${entry}`} ${`${dest}/${entry}`}`.quiet()
+        )
+      );
+    },
+  });
+
+/**
+ * Empty a fresh clone's workdir, keeping `.git` for ancestry. Dotfiles are
+ * removed too — a previous deploy's `.well-known/` must not survive a
+ * redeploy that drops it.
+ */
+export const clearWorkdir = (workdir: string): Effect.Effect<void, Error> =>
+  Effect.tryPromise({
+    catch: () => new Error("clearing previous dist failed"),
+    try: async (): Promise<void> => {
+      const entries = await readdir(workdir);
+      await Promise.all(
+        entries
+          .filter((entry) => entry !== ".git")
+          .map((entry) => Bun.$`rm -rf ${`${workdir}/${entry}`}`.quiet())
+      );
+    },
+  });
+
+/**
  * Push a dist tree as a synthetic commit parented on the remote tip, so
  * the push is always fast-forward (works with the `push` role — never
  * force). First deploy (no remote ref) creates it. Resolves the new sha.
+ * The workdir is removed on success; on failure it is kept and warned
+ * about (`withTempDir`) — its `.git/config` holds the profile API key.
  */
 export const pushTree = (input: PushInput): Effect.Effect<string, Error> =>
   Effect.gen(function* run() {
     const tip = yield* lsRemoteTip(input.remoteUrl);
-    const workdir = yield* Effect.tryPromise({
-      catch: () => new Error("mktemp failed"),
-      try: () => Bun.$`mktemp -d`.text().then((s) => s.trim()),
-    });
-    if (tip === null) {
-      yield* runGit(["init", "-b", "main"], workdir);
-      yield* runGit(["remote", "add", "origin", input.remoteUrl], workdir);
-    } else {
-      yield* runGit(
-        ["clone", "--depth", "1", "--branch", "main", input.remoteUrl, "."],
-        workdir
-      );
-      // Empty the old dist, keep the fresh clone's .git for ancestry.
-      yield* runGit(["rm", "-r", "--cached", "."], workdir);
-      yield* Effect.tryPromise({
-        catch: () => new Error("clearing previous dist failed"),
-        try: async (): Promise<void> => {
-          const glob = new Bun.Glob("*");
-          for await (const entry of glob.scan({
-            cwd: workdir,
-            onlyFiles: false,
-          })) {
-            if (entry === ".git" || entry.startsWith(".git/")) {
-              continue;
-            }
-            await Bun.$`rm -rf ${workdir}/${entry}`.quiet();
-          }
-        },
-      });
-    }
-    yield* Effect.tryPromise({
-      catch: () => new Error(`copying ${input.treeDir} failed`),
-      try: async (): Promise<void> => {
-        const glob = new Bun.Glob("*");
-        for await (const entry of glob.scan({
-          cwd: input.treeDir,
-          onlyFiles: false,
-        })) {
-          await Bun.$`cp -r ${`${input.treeDir}/${entry}`} ${`${workdir}/${entry}`}`.quiet();
+    return yield* withTempDir((workdir) =>
+      Effect.gen(function* push() {
+        if (tip === null) {
+          yield* runGit(["init", "-b", "main"], workdir);
+          yield* runGit(["remote", "add", "origin", input.remoteUrl], workdir);
+        } else {
+          yield* runGit(
+            ["clone", "--depth", "1", "--branch", "main", input.remoteUrl, "."],
+            workdir
+          );
+          // Empty the old dist, keep the fresh clone's .git for ancestry.
+          yield* runGit(["rm", "-r", "--cached", "."], workdir);
+          yield* clearWorkdir(workdir);
         }
-      },
-    });
-    yield* runGit(["add", "-A"], workdir);
-    yield* runGit(
-      [
-        "-c",
-        "user.name=Noite",
-        "-c",
-        "user.email=noite@local",
-        "commit",
-        "-m",
-        input.message,
-      ],
-      workdir
+        yield* copyTreeEntries(input.treeDir, workdir);
+        yield* runGit(["add", "-A"], workdir);
+        yield* runGit(
+          [
+            "-c",
+            "user.name=Noite",
+            "-c",
+            "user.email=noite@local",
+            "commit",
+            "-m",
+            input.message,
+          ],
+          workdir
+        );
+        yield* runGit(["push", "-u", "origin", "main"], workdir);
+        return yield* runGit(["rev-parse", "HEAD"], workdir);
+      })
     );
-    yield* runGit(["push", "-u", "origin", "main"], workdir);
-    return yield* runGit(["rev-parse", "HEAD"], workdir);
   });

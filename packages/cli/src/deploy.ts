@@ -8,23 +8,59 @@ import {
   readActionContext,
   writeOutputs,
 } from "./gh.js";
-import { pushTree } from "./git.js";
+import { copyTreeEntries, pushTree } from "./git.js";
+import { withTempDir } from "./temp.js";
 
 /** Default deploy message from the action sha or a timestamp. */
 const defaultMessage = (sha: string | null): string =>
   `deploy ${sha === null ? new Date().toISOString() : sha.slice(0, 12)}`;
-const appBaseOf = (gitBase: string): string | null => {
+
+/** The app's public URL, derived from the git base the same way the edge
+ * routes it: tenants serve at `{slug}.{base}` (the runner's Caddy tenant
+ * sites), so `https://git.<domain>` deploys to `https://<slug>.<domain>`.
+ * Scheme and port come from the git base itself:
+ * `http://git.noite.localhost:9080` → `http://<slug>.noite.localhost:9080`.
+ * `null` when the git base is not a URL. */
+export const deployUrlOf = (gitBase: string, slug: string): string | null => {
   let url: URL;
   try {
     url = new URL(gitBase);
   } catch {
     return null;
   }
-  const host = url.hostname.startsWith("git.")
+  const bare = url.hostname.startsWith("git.")
     ? url.hostname.slice("git.".length)
     : url.hostname;
-  return `${url.protocol}//${host}${url.port === "" ? "" : `:${url.port}`}`;
+  const base = bare.replace(/\.+$/u, "");
+  if (base === "") {
+    return null;
+  }
+  return `${url.protocol}//${slug}.${base}${url.port === "" ? "" : `:${url.port}`}`;
 };
+
+/** Assemble the deploy tree in `staging`: every top-level entry of the dist
+ * dir (dotfiles included — `*` globs skip `.well-known/`) plus the wrangler
+ * config at the root. */
+export const stageDist = (
+  distDir: string,
+  staging: string,
+  wrangler: string
+): Effect.Effect<void, Error> =>
+  Effect.gen(function* stage() {
+    yield* copyTreeEntries(distDir, staging).pipe(
+      Effect.mapError(
+        () =>
+          new Error(`assembling dist tree from ${distDir} failed (built yet?)`)
+      )
+    );
+    yield* Effect.tryPromise({
+      catch: () =>
+        new Error(`assembling dist tree from ${distDir} failed (built yet?)`),
+      try: async (): Promise<void> => {
+        await Bun.$`cp ${wrangler} ${staging}/wrangler.jsonc`.quiet();
+      },
+    });
+  });
 
 const remoteUrlOf = (
   gitBase: string,
@@ -96,8 +132,8 @@ export const deploy = Command.make(
       if (remoteUrl === null) {
         return yield* Effect.fail(`git base URL is malformed: ${gitBase}`);
       }
-      const appBase = appBaseOf(gitBase);
-      if (appBase === null) {
+      const url = deployUrlOf(gitBase, resolvedSlug);
+      if (url === null) {
         return yield* Effect.fail(`git base URL is malformed: ${gitBase}`);
       }
 
@@ -110,29 +146,16 @@ export const deploy = Command.make(
         );
       }
       const distDir = config.dist.replace(/\/+$/u, "");
-      const staging = yield* Effect.tryPromise({
-        catch: () => new Error("mktemp failed"),
-        try: () => Bun.$`mktemp -d`.text().then((s) => s.trim()),
-      });
-      yield* Effect.tryPromise({
-        catch: () =>
-          new Error(`assembling dist tree from ${distDir} failed (built yet?)`),
-        try: async (): Promise<void> => {
-          const glob = new Bun.Glob("*");
-          for await (const entry of glob.scan({
-            cwd: distDir,
-            onlyFiles: false,
-          })) {
-            await Bun.$`cp -r ${`${distDir}/${entry}`} ${`${staging}/${entry}`}`.quiet();
-          }
-          await Bun.$`cp ${config.wrangler} ${staging}/wrangler.jsonc`.quiet();
-        },
-      });
-
       const message =
         config.message === "" ? defaultMessage(ctx.sha) : config.message;
-      const sha = yield* pushTree({ message, remoteUrl, treeDir: staging });
-      const url = `${appBase}/${resolvedSlug}`;
+      // The staging dir is removed on success; on failure it is kept and
+      // warned about (`withTempDir`) for post-mortem.
+      const sha = yield* withTempDir((staging) =>
+        Effect.gen(function* stage() {
+          yield* stageDist(distDir, staging, config.wrangler);
+          return yield* pushTree({ message, remoteUrl, treeDir: staging });
+        })
+      );
       yield* Effect.logInfo(
         `deployed ${resolvedSlug}@${sha.slice(0, 12)} → ${url}`
       );
