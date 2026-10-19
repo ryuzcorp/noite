@@ -1,5 +1,9 @@
+import { appendFile, readFile } from "node:fs/promises";
+
 import { Effect } from "effect";
 import * as Schema from "effect/Schema";
+
+import { runProc } from "./proc.js";
 
 export interface ActionContext {
   readonly isActions: boolean;
@@ -40,17 +44,17 @@ export const readActionContext = (): Effect.Effect<ActionContext, never> =>
     let prNumber: number | null = null;
     const eventPath = env.GITHUB_EVENT_PATH;
     if (eventPath !== undefined && eventPath !== "") {
-      const parsed: unknown = yield* Effect.promise(() =>
-        Bun.file(eventPath)
-          .json()
-          .catch(() => null)
+      const eventText = yield* Effect.promise(() =>
+        readFile(eventPath, "utf-8").catch(() => null)
       );
-      try {
-        prNumber =
-          Schema.decodeUnknownSync(EventPayload)(parsed).pull_request?.number ??
-          null;
-      } catch {
-        prNumber = null;
+      if (eventText !== null) {
+        try {
+          prNumber =
+            Schema.decodeUnknownSync(EventPayload)(JSON.parse(eventText))
+              .pull_request?.number ?? null;
+        } catch {
+          prNumber = null;
+        }
       }
     }
     return {
@@ -76,12 +80,9 @@ export const writeOutputs = (args: {
         catch: () => new Error("writing $GITHUB_OUTPUT failed"),
         try: async (): Promise<void> => {
           // SAFETY: outputFile is null-checked by the outer ternary; inside tryPromise it stays a non-empty string.
-          const file = Bun.file(args.outputFile as string);
-          const prev = (await file.exists()) ? await file.text() : "";
-          await Bun.write(
-            // SAFETY: same null-check as above; the closure cannot observe a reassignment.
+          await appendFile(
             args.outputFile as string,
-            `${prev}url=${args.url}\nsha=${args.sha}\n`
+            `url=${args.url}\nsha=${args.sha}\n`
           );
         },
       });
@@ -112,69 +113,56 @@ export const commentPr = (args: {
       return;
     }
     const fullBody = `${args.body}\n\n${COMMENT_MARKER}`;
-    yield* Effect.tryPromise({
-      catch: () => new Error("pr comment failed"),
-      try: async (): Promise<void> => {
-        if (args.mode === "create") {
-          await Bun.spawn([
-            "gh",
-            "pr",
-            "comment",
-            String(args.prNumber),
-            "--repo",
-            // SAFETY: early return above guarantees repo is a non-null string here.
-            args.repo as string,
-            "--body",
-            fullBody,
-          ]).exited;
-          return;
-        }
-        const proc = Bun.spawn(
-          [
-            "gh",
-            "api",
-            `repos/${args.repo}/issues/${args.prNumber}/comments`,
-            "--paginate",
-          ],
-          { stderr: "pipe", stdout: "pipe" }
+    // SAFETY: the early return above guarantees repo is a non-null string here.
+    const repo = args.repo as string;
+    const comment = [
+      "pr",
+      "comment",
+      String(args.prNumber),
+      "--repo",
+      repo,
+      "--body",
+      fullBody,
+    ];
+    yield* Effect.gen(function* post() {
+      if (args.mode === "create") {
+        yield* runProc("gh", comment);
+        return;
+      }
+      const listed = yield* runProc("gh", [
+        "api",
+        `repos/${repo}/issues/${args.prNumber}/comments`,
+        "--paginate",
+      ]);
+      if (listed.code !== 0) {
+        return yield* Effect.fail(new Error("listing PR comments failed"));
+      }
+      let comments: readonly GhComment[];
+      try {
+        comments = Schema.decodeUnknownSync(GhApiComments)(
+          JSON.parse(listed.stdout)
         );
-        const [out, code] = await Promise.all([
-          new Response(proc.stdout).text(),
-          proc.exited,
-        ]);
-        if (code !== 0) {
-          throw new Error("listing PR comments failed");
-        }
-        let comments: readonly GhComment[];
-        try {
-          comments = Schema.decodeUnknownSync(GhApiComments)(JSON.parse(out));
-        } catch {
-          throw new Error("listing PR comments returned invalid JSON");
-        }
-        const existing = comments.find((c) => c.body.includes(COMMENT_MARKER));
-        void (existing === undefined
-          ? await Bun.spawn([
-              "gh",
-              "pr",
-              "comment",
-              String(args.prNumber),
-              "--repo",
-              // SAFETY: early return above guarantees repo is a non-null string here.
-              args.repo as string,
-              "--body",
-              fullBody,
-            ]).exited
-          : await Bun.spawn([
-              "gh",
+      } catch {
+        return yield* Effect.fail(
+          new Error("listing PR comments returned invalid JSON")
+        );
+      }
+      const existing = comments.find((c) => c.body.includes(COMMENT_MARKER));
+      yield* runProc(
+        "gh",
+        existing === undefined
+          ? comment
+          : [
               "api",
-              `repos/${args.repo}/issues/comments/${existing.id}`,
+              `repos/${repo}/issues/comments/${existing.id}`,
               "-X",
               "PATCH",
               "-f",
               `body=${fullBody}`,
-            ]).exited);
-      },
+            ]
+      );
     }).pipe(
+      Effect.mapError(() => new Error("pr comment failed")),
       Effect.tapError((cause) =>
         Effect.sync(() =>
           console.warn(`warning: ${cause.message} (deploy unaffected)`)

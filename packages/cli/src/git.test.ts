@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -20,11 +21,9 @@ describe("copyTreeEntries", () => {
       await mkdir(path.join(src, ".well-known"));
       await writeFile(path.join(src, ".well-known", "x"), "y\n");
       await Effect.runPromise(copyTreeEntries(src, dest));
-      expect(await Bun.file(path.join(dest, "visible.js")).exists()).toBe(true);
-      expect(await Bun.file(path.join(dest, ".dotfile")).exists()).toBe(true);
-      expect(await Bun.file(path.join(dest, ".well-known", "x")).exists()).toBe(
-        true
-      );
+      expect(existsSync(path.join(dest, "visible.js"))).toBe(true);
+      expect(existsSync(path.join(dest, ".dotfile"))).toBe(true);
+      expect(existsSync(path.join(dest, ".well-known", "x"))).toBe(true);
     } finally {
       await rm(root, { force: true, recursive: true });
     }
@@ -43,18 +42,12 @@ describe("clearWorkdir", () => {
       await mkdir(path.join(workdir, ".well-known"));
       await writeFile(path.join(workdir, ".well-known", "old.txt"), "stale\n");
       await Effect.runPromise(clearWorkdir(workdir));
-      expect(await Bun.file(path.join(workdir, ".git", "HEAD")).exists()).toBe(
-        true
-      );
-      expect(await Bun.file(path.join(workdir, "index.html")).exists()).toBe(
+      expect(existsSync(path.join(workdir, ".git", "HEAD"))).toBe(true);
+      expect(existsSync(path.join(workdir, "index.html"))).toBe(false);
+      expect(existsSync(path.join(workdir, ".dotfile"))).toBe(false);
+      expect(existsSync(path.join(workdir, ".well-known", "old.txt"))).toBe(
         false
       );
-      expect(await Bun.file(path.join(workdir, ".dotfile")).exists()).toBe(
-        false
-      );
-      expect(
-        await Bun.file(path.join(workdir, ".well-known", "old.txt")).exists()
-      ).toBe(false);
     } finally {
       await rm(root, { force: true, recursive: true });
     }

@@ -7,7 +7,7 @@ bun add -g @noitenow/cli   # or: npm i -g @noitenow/cli
 bunx @noitenow/cli deploy --slug <slug> --url https://git.<domain> --token $NOITE_API_KEY
 ```
 
-Bun must be on the machine that runs it (ships as a Bun bundle). Full reference — flags, environment fallbacks, the GitHub Actions workflow, outputs and PR comments — lives in the docs: <https://noite.now/reference/cli>.
+Node 20+ must be on the machine that runs it (ships as a plain Node bundle — Bun works too). Full reference — flags, environment fallbacks, the GitHub Actions workflow, outputs and PR comments — lives in the docs: <https://noite.now/reference/cli>.
 
 ```sh
 noite environments vars get staging --slug <slug>

@@ -10,10 +10,10 @@
 # Tags:
 #   main push        `edge` + short SHA (CI and rollbacks; not an install target)
 #   v* tag           the version (`0.1.0-alpha.1`) and short SHA, then a GitHub
-#                    PRE-release with that version's CHANGELOG notes. No channel
+#                    PRE-release with that version's CHANGELOG notes, then
+#                    `@noitenow/cli` at that exact version to npm (dist-tag
+#                    `alpha` for a prerelease, `latest` for a final). No channel
 #                    moves: try it with `run.sh | bash -s install --pre`.
-#   release marked   `promote.yml` points `alpha` (and, for a final version, no
-#   as a release     `-` in it, `stable`) at that version's image. No rebuild.
 #
 # A release tag is a gate, not a trigger: the e2e lanes (`make e2e`,
 # `make e2e-isolation`) and the CHANGELOG check must pass before anything is
@@ -180,3 +180,65 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
+
+  # Release tags only, after everything above passed: `@noitenow/cli` to npm
+  # at the tag's exact version — or a logged skip when that version is
+  # already published (the owner hand-publishes the first one, so the
+  # bootstrap tag must stay green). OIDC trusted publishing
+  # (`id-token: write`),
+  # so there is no npm token to rotate or leak; the trusted-publisher entry
+  # on npmjs.com names this workflow file (`images.yml`). Provenance is
+  # automatic for OIDC publishes from a public repo (no `--provenance`
+  # flag). `publishConfig.access: public` in the package sets visibility;
+  # `--tag` keeps prereleases off `latest` without needing dist-tag rights.
+  npm-cli:
+    needs: prerelease
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && needs.prerelease.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      # npm >= 11.5.1 speaks OIDC; node 24 ships it.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+      - run: bun install
+      - name: build
+        working-directory: packages/cli
+        run: bun run build
+      - name: publish at the tag's exact version
+        working-directory: packages/cli
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::packages/cli is $version but the tag is $tag: bump it in the release commit (docker/check-versions.ts guards this)"
+            exit 1
+          fi
+          # Idempotent: the owner publishes the first version by hand
+          # (bootstrap), so the tag's own run must skip, not fail, when the
+          # version is already on npm. Only E404 means "not published";
+          # any other `npm view` failure (network, auth) fails the job.
+          if view_out="$(npm view "@noitenow/cli@${version}" version 2>&1)"; then
+            echo "version ${version} is already published (${view_out}): skipping"
+            exit 0
+          fi
+          case "$view_out" in
+            *E404*)
+              echo "version ${version} is not on npm yet: publishing"
+              ;;
+            *)
+              echo "::error::npm view for @noitenow/cli@${version} failed:"
+              printf '%s\n' "$view_out"
+              exit 1
+              ;;
+          esac
+          case "$version" in
+            *-* ) dist_tag=alpha ;;
+            * ) dist_tag=latest ;;
+          esac
+          npm publish --tag "$dist_tag"

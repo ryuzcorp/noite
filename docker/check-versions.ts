@@ -30,6 +30,36 @@ const fail = (message: string): void => {
   failed = true;
 };
 
+/** Minimal semver compare: numeric core, then prerelease (absent wins). */
+const splitVersion = (v: string) => {
+  const [core, ...pre] = v.split("-");
+  return {
+    core: (core ?? "").split(".").map(Number),
+    pre: pre.join("-"),
+  };
+};
+
+const compareVersions = (a: string, b: string): number => {
+  const x = splitVersion(a);
+  const y = splitVersion(b);
+  for (let i = 0; i < 3; i += 1) {
+    const d = (x.core[i] ?? 0) - (y.core[i] ?? 0);
+    if (d !== 0) {
+      return d < 0 ? -1 : 1;
+    }
+  }
+  if (x.pre === y.pre) {
+    return 0;
+  }
+  if (x.pre === "") {
+    return 1;
+  }
+  if (y.pre === "") {
+    return -1;
+  }
+  return x.pre < y.pre ? -1 : 1;
+};
+
 for (const [name, pattern] of [
   ["celld", /ARG CELLD_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
   ["caddy", /ARG CADDY_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
@@ -157,6 +187,29 @@ for (const name of ["ESBUILD_VERSION", "DUCKDB_VERSION"] as const) {
       `${name}: docker/Dockerfile must not pin its own version (single source is install-sidecars.sh)`
     );
   }
+}
+// `@noitenow/cli` ships its version to npm: the release commit bumps
+// packages/cli/package.json alongside the CHANGELOG section, and the tag's
+// publish job refuses anything but an exact match. Between releases the
+// guard below only asks for monotonicity (the CLI must never fall behind
+// the latest dated section), so bumping early in a cycle stays green.
+const cliVersion =
+  /"version":\s*"(?<version>[^"]+)"/u.exec(read("packages/cli/package.json"))
+    ?.groups?.version ?? "";
+const latestRelease =
+  [...read("CHANGELOG.md").matchAll(/^## \[(?<v>[^\]]+)\]/gmu)]
+    .map((m) => m.groups?.v ?? "")
+    .find((v) => v !== "Unreleased") ?? "";
+if (!/^\d+\.\d+\.\d+(?<pre>-[0-9A-Za-z.-]+)?$/u.test(cliVersion)) {
+  fail(`cli: packages/cli/package.json version is not semver (${cliVersion})`);
+} else if (latestRelease === "") {
+  fail("cli: CHANGELOG.md has no dated section to compare against");
+} else if (compareVersions(cliVersion, latestRelease) < 0) {
+  fail(
+    `cli: ${cliVersion} is behind the latest CHANGELOG section [${latestRelease}] (bump packages/cli/package.json in the release commit)`
+  );
+} else {
+  console.log(`cli: ${cliVersion} (>= [${latestRelease}])`);
 }
 if (!dockerfile.includes("install-sidecars.sh")) {
   fail("sidecars: docker/Dockerfile no longer invokes install-sidecars.sh");

@@ -1,3 +1,7 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
 import { Effect, Exit } from "effect";
 
 /** Run `use` with a fresh empty temp dir, removing it afterwards. A failure
@@ -9,18 +13,15 @@ export const withTempDir = <A, E>(
 ): Effect.Effect<A, E | Error> =>
   Effect.acquireUseRelease(
     Effect.tryPromise({
-      catch: () => new Error("mktemp failed"),
-      try: async (): Promise<string> => {
-        const out = await Bun.$`mktemp -d`.text();
-        return out.trim();
-      },
+      catch: () => new Error("creating temp dir failed"),
+      try: () => mkdtemp(path.join(tmpdir(), "noite-")),
     }),
     use,
     (dir, exit) =>
       Exit.isSuccess(exit)
         ? Effect.tryPromise({
             catch: () => new Error(`removing temp dir ${dir} failed`),
-            try: () => Bun.$`rm -rf ${dir}`.quiet(),
+            try: () => rm(dir, { force: true, recursive: true }),
           })
         : Effect.logWarning(`keeping temp dir for inspection: ${dir}`).pipe(
             Effect.asVoid

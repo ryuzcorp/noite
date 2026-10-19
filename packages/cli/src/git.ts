@@ -1,7 +1,9 @@
-import { readdir } from "node:fs/promises";
+import { cp, readdir, rm } from "node:fs/promises";
+import path from "node:path";
 
 import { Effect } from "effect";
 
+import { runProc } from "./proc.js";
 import { withTempDir } from "./temp.js";
 
 /** Run git in cwd, resolving stdout. Rejects with scrubbed stderr. */
@@ -9,29 +11,16 @@ const runGit = (
   args: readonly string[],
   cwd: string
 ): Effect.Effect<string, Error> =>
-  Effect.tryPromise({
-    catch: (cause) =>
-      cause instanceof Error
-        ? cause
-        : new Error(`git failed: ${String(cause)}`),
-    try: async (): Promise<string> => {
-      const proc = Bun.spawn(["git", ...args], {
-        cwd,
-        stderr: "pipe",
-        stdout: "pipe",
-      });
-      const [out, err, code] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
-      if (code !== 0) {
-        throw new Error(
-          `git ${args[0] ?? ""} failed: ${err.trim() || `exit ${code}`}`
-        );
-      }
-      return out.trim();
-    },
+  Effect.gen(function* run() {
+    const proc = yield* runProc("git", args, cwd);
+    if (proc.code !== 0) {
+      return yield* Effect.fail(
+        new Error(
+          `git ${args[0] ?? ""} failed: ${proc.stderr || `exit ${proc.code}`}`
+        )
+      );
+    }
+    return proc.stdout;
   });
 
 /** Current `refs/heads/main` tip on the remote, if the ref exists yet. */
@@ -70,7 +59,9 @@ export const copyTreeEntries = (
       const entries = await readdir(src);
       await Promise.all(
         entries.map((entry) =>
-          Bun.$`cp -r ${`${src}/${entry}`} ${`${dest}/${entry}`}`.quiet()
+          cp(path.join(src, entry), path.join(dest, entry), {
+            recursive: true,
+          })
         )
       );
     },
@@ -89,7 +80,9 @@ export const clearWorkdir = (workdir: string): Effect.Effect<void, Error> =>
       await Promise.all(
         entries
           .filter((entry) => entry !== ".git")
-          .map((entry) => Bun.$`rm -rf ${`${workdir}/${entry}`}`.quiet())
+          .map((entry) =>
+            rm(path.join(workdir, entry), { force: true, recursive: true })
+          )
       );
     },
   });
