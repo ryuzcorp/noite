@@ -90,10 +90,11 @@ fn kek(runner_token: &str) -> [u8; 32] {
 fn decrypt(runner_token: &str, app_id: &str, nonce: &[u8], ct: &[u8]) -> anyhow::Result<String> {
     let key = kek(runner_token);
     let cipher = Aes256Gcm::new_from_slice(&key)?;
-    let nonce = Nonce::from_slice(nonce);
+    let nonce =
+        Nonce::try_from(nonce).map_err(|_| anyhow::anyhow!("app credential decrypt failed"))?;
     let pt = cipher
         .decrypt(
-            nonce,
+            &nonce,
             Payload {
                 aad: app_id.as_bytes(),
                 msg: ct,
@@ -187,12 +188,12 @@ mod tests {
         // (key, nonce) pair, and every row shares one key.
         let mut nonce_bytes = [0u8; 12];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::from(nonce_bytes);
         // The app id is associated data: a row copied onto another app fails to
         // decrypt instead of handing that app someone else's keys.
         let ct = cipher
             .encrypt(
-                nonce,
+                &nonce,
                 Payload {
                     aad: app_id.as_bytes(),
                     msg: plaintext.as_bytes(),
@@ -202,6 +203,103 @@ mod tests {
         (nonce_bytes.to_vec(), ct)
     }
 
+    fn unhex(s: &str) -> Vec<u8> {
+        let b = s.as_bytes();
+        let digit = |c: u8| match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("bad hex"),
+        };
+        (0..b.len())
+            .step_by(2)
+            .map(|i| (digit(b[i]) << 4) | digit(b[i + 1]))
+            .collect()
+    }
+
+    /// The encrypted-credential pipeline is byte-stable: a row written by an
+    /// older build (HKDF-SHA256 KEK `noite-app-credential-v1`, AES-256-GCM
+    /// with the app id as associated data) decrypts identically, and the
+    /// same inputs re-encrypt to the same bytes. The vector below was
+    /// produced by the pre-bump implementation; a crypto upgrade that
+    /// silently changed outputs would strand every stored credential and
+    /// every env token in the field.
+    #[test]
+    fn encrypted_rows_are_byte_stable() {
+        let token = "noite-golden-token-v1";
+        let app_id = "app-golden";
+        let nonce = unhex("07132a03ff00804009c80b4d");
+        let ct = unhex(
+            "6aaaffc0eef1009cbfe6f07e917190f41f1acafdb54ef0f955dc09e7199c0016db09be1c3881fc576c35113\
+             4c1425e4e17379a205d4ec649be6032a98a4539e67c84",
+        );
+        let pt = r#"{"access_key":"AKGOLDEN","secret_key":"sk-golden"}"#;
+        assert_eq!(decrypt(token, app_id, &nonce, &ct).unwrap(), pt);
+        // Same key, nonce, associated data and plaintext: same bytes out.
+        let cipher = Aes256Gcm::new_from_slice(&kek(token)).expect("kek len");
+        let again = cipher
+            .encrypt(
+                &Nonce::try_from(nonce.as_slice()).expect("golden nonce len"),
+                Payload {
+                    aad: app_id.as_bytes(),
+                    msg: pt.as_bytes(),
+                },
+            )
+            .expect("encrypt");
+        assert_eq!(again, ct);
+    }
+
+    /// The primitives underneath are byte-stable against their published
+    /// test vectors (independent of our code): NIST GCM test case 2,
+    /// RFC 5869 HKDF-SHA256 case 1, RFC 4231 HMAC-SHA256 case 1, and
+    /// SHA-256("abc").
+    #[test]
+    fn crypto_primitives_are_byte_stable() {
+        use aes_gcm::Aes128Gcm;
+        use hkdf::Hkdf;
+        use hmac::{Hmac, Mac};
+        use sha2::{Digest, Sha256};
+
+        let zero16 = [0u8; 16];
+        let cipher = Aes128Gcm::new_from_slice(&zero16).expect("key len");
+        let gcm = cipher
+            .encrypt(
+                &Nonce::from([0u8; 12]),
+                Payload {
+                    msg: &zero16[..],
+                    aad: b"",
+                },
+            )
+            .expect("encrypt");
+        assert_eq!(
+            gcm,
+            unhex("0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf")
+        );
+
+        let hk = Hkdf::<Sha256>::new(Some(&unhex("000102030405060708090a0b0c")[..]), &[0x0bu8; 22]);
+        let mut okm = [0u8; 42];
+        hk.expand(&unhex("f0f1f2f3f4f5f6f7f8f9"), &mut okm)
+            .expect("hkdf expand");
+        assert_eq!(
+            okm,
+            unhex(
+                "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+            )[..]
+        );
+
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&[0x0bu8; 20]).expect("hmac key");
+        mac.update(b"Hi There");
+        assert_eq!(
+            mac.finalize().into_bytes()[..],
+            unhex("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")[..]
+        );
+
+        let mut h = Sha256::new();
+        h.update(b"abc");
+        assert_eq!(
+            h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
     #[test]
     fn credential_rows_round_trip_and_bind_to_their_app() {
         let (nonce, ct) = encrypt("token", "app-a", "secret");

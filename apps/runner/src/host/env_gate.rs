@@ -35,7 +35,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::config::{is_localhost_domain, Config};
@@ -74,7 +74,11 @@ fn mac(cfg: &Config, kind: &str, env_id: &str, subject: &str, exp: i64) -> Strin
         h.update(b"\n");
     }
     h.update(exp.to_string().as_bytes());
-    format!("{:x}", h.finalize().into_bytes())
+    h.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn now_unix() -> i64 {

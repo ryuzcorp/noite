@@ -341,7 +341,7 @@ fn sigv4_authorization(
     access_key: &str,
     secret_key: &str,
 ) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::{Digest, Sha256};
     let canonical_request = format!(
         "{method}\n{canonical_uri}\n{canonical_qs}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
@@ -349,10 +349,12 @@ fn sigv4_authorization(
     let scope = format!("{date_stamp}/{region}/{service}/aws4_request");
     let mut hasher = Sha256::new();
     hasher.update(canonical_request.as_bytes());
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{:x}",
-        hasher.finalize()
-    );
+    let hashed: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{hashed}");
     let sign = |key: &[u8], msg: &[u8]| {
         // Static invariant: HMAC accepts keys of any length, so construction never fails.
         let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
@@ -394,7 +396,11 @@ async fn put_bucket_config(cfg: &Config, subresource: &str, body: &str) -> anyho
     let date_stamp = now.format("%Y%m%d").to_string();
     let mut hasher = Sha256::new();
     hasher.update(body.as_bytes());
-    let payload_hash = format!("{:x}", hasher.finalize());
+    let payload_hash: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     let canonical_uri = format!("/{}", cfg.s3_bucket);
     let canonical_qs = format!("{subresource}=");
     let canonical_headers =

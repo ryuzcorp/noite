@@ -196,11 +196,11 @@ impl StateSync {
         let _ = tokio::fs::remove_file(&tmp).await;
         // Skip identical snapshots (spec T4.3): writes that don't change
         // bytes (e.g. an upsert of the same row) upload nothing.
-        let hash = {
+        let hash: String = {
             use sha2::Digest;
             let mut h = sha2::Sha256::new();
             h.update(&raw);
-            format!("{:x}", h.finalize())
+            h.finalize().iter().map(|b| format!("{b:02x}")).collect()
         };
         let unchanged = self
             .last_hash

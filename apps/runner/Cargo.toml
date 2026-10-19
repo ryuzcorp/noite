@@ -26,12 +26,12 @@ reqwest = { version = "0.13", default-features = false, features = [
   "rustls",
   "stream",
 ] }
-hmac = "0.12"
+hmac = "0.13"
 anyhow = "1"
 libc = "0.2"
-aes-gcm = { version = "0.10", features = ["std"] }
-hkdf = "0.12"
-sha2 = "0.10"
+aes-gcm = "0.11"
+hkdf = "0.13"
+sha2 = "0.11"
 rand = "0.8"
 thiserror = "2"
 futures = "0.3"
