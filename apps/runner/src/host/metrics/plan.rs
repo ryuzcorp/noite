@@ -333,6 +333,9 @@ mod tests {
 
     #[test]
     fn telemetry_globs_name_each_sources_prefix() {
+        let _env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let cfg = crate::config::Config::from_env().expect("config");
         let now = now_us();
         let (from, to) = (now - HOUR_US, now);
@@ -359,6 +362,9 @@ mod tests {
     /// adds the env dimension).
     #[test]
     fn environment_telemetry_is_never_globbed() {
+        let _env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let cfg = crate::config::Config::from_env().expect("config");
         let now = now_us();
         let (from, to) = (now - HOUR_US, now);
