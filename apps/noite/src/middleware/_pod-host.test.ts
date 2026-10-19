@@ -36,6 +36,7 @@ const gate = async (
   const raw = await podHost(
     testRouteContext(
       new Request(`http://${host}${path}`, { headers: { host }, method }),
+      // SAFETY: the gate takes the full Worker env; the test env carries the ASSETS binding it reads.
       env as unknown as never
     ),
     () => {

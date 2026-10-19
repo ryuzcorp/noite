@@ -13,6 +13,7 @@ const ENV = {};
 const contextFor = (path: string) =>
   testRouteContext(
     new Request(`http://localhost${path}`),
+    // SAFETY: the middleware reads no env; the empty object only satisfies the context shape.
     ENV as unknown as never
   );
 

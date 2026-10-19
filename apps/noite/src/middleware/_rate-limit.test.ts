@@ -15,6 +15,7 @@ const limited = (host: string, env: KitEnv = {}) =>
       new Request("http://localhost/api/invite/status", {
         headers: { "x-forwarded-for": `${host}, 203.0.113.9` },
       }),
+      // SAFETY: the middleware takes the full Worker env; the test env carries the rate-limit key it reads.
       env as unknown as never
     ),
     () => Promise.resolve()
@@ -49,6 +50,7 @@ describe("rate-limit middleware", () => {
     const result = await rateLimit(
       testRouteContext(
         new Request("http://localhost/health"),
+        // SAFETY: the unlimited-path case reads no env at all; the empty object only satisfies the context shape.
         {} as unknown as never
       ),
       () => {

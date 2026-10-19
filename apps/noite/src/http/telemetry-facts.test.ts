@@ -39,6 +39,7 @@ const facts = (token?: string) =>
         headers:
           token === undefined ? {} : { authorization: `Bearer ${token}` },
       }),
+      // SAFETY: the handler takes the full Worker env; the test env carries the token key this gate reads.
       ENV as unknown as never
     )
   );
