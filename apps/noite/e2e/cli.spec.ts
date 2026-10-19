@@ -162,8 +162,20 @@ test("noite deploy ships a prebuilt dist and the printed URL serves it", async (
     const deploy = await waitForDeploy(request, appId);
     expect(deploy.status, deploy.log).toBe("success");
 
-    await page.goto(printed);
-    await expect(page.getByText("hello from cli")).toBeVisible();
+    // A first deploy spawns the fleet; the edge answers 503 until celld
+    // listens, so poll the printed URL itself (not the raw port — the
+    // point is the address the CLI hands out).
+    await expect
+      .poll(
+        async (): Promise<string> => {
+          await page.goto(printed);
+          return (await page.getByText("hello from cli").count()) === 0
+            ? ""
+            : "hello from cli";
+        },
+        { timeout: 180_000 }
+      )
+      .toBe("hello from cli");
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }
