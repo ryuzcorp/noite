@@ -452,6 +452,10 @@ const TargetPreview = ({
     }, LOAD_TIMEOUT_MS);
   };
   watch.once(({ onCleanup }) => {
+    if (typeof document === "undefined") {
+      // SSR: no frame to time; the client's own mount arms it.
+      return;
+    }
     armFrame();
     onCleanup(() => {
       window.clearTimeout(loadTimer.id);
@@ -643,6 +647,7 @@ const TargetPreview = ({
             // `src` always navigates, even to the same URL, so a new token —
             // a deploy that went live, or the reload button — reloads here.
             if (
+              typeof HTMLIFrameElement !== "undefined" &&
               el instanceof HTMLIFrameElement &&
               loaded.token !== reloadToken
             ) {

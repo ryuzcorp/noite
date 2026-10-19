@@ -128,6 +128,10 @@ export const Onboarding = () => {
     spot.set(onScreen ? rect : null);
   };
   watch(step, () => {
+    if (typeof document === "undefined") {
+      // SSR: nothing to measure; the client's own mount measures on show.
+      return;
+    }
     measure();
   });
   watch(open, (isOpen, { onCleanup, signal }) => {

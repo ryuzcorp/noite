@@ -52,6 +52,10 @@ export const presenceTone = (status: string): string => {
  * Loopback forms (bare `localhost` and every `*.localhost`, which browsers all
  * resolve to loopback) and same-family hosts keep the stored value untouched. */
 export const appHost = (subdomain: string): string => {
+  if (typeof window === "undefined") {
+    // SSR: no current host to rebase onto; hydration recomputes the link.
+    return subdomain;
+  }
   const { hostname } = window.location;
   const host = hostname.toLowerCase();
   const dot = subdomain.indexOf(".");
@@ -71,6 +75,10 @@ export const appHost = (subdomain: string): string => {
 /** Live-app URL on the current host (mirrors LiveAppStatus in app-detail).
  * Dev carries the port over http; prod (no port) links plain https. */
 export const appUrl = (subdomain: string): string => {
+  if (typeof window === "undefined") {
+    // SSR: no port to carry; hydration recomputes the link.
+    return `https://${subdomain}`;
+  }
   const { port } = window.location;
   const host = appHost(subdomain);
   return port ? `http://${host}:${port}` : `https://${host}`;
@@ -84,6 +92,10 @@ export const environmentHost = (subdomain: string, label: string): string =>
 /** Live environment URL on the current host (the same scheme/port rule as
  * `appUrl`). */
 export const environmentUrl = (subdomain: string, label: string): string => {
+  if (typeof window === "undefined") {
+    // SSR: no port to carry; hydration recomputes the link.
+    return `https://${label}.${subdomain}`;
+  }
   const { port } = window.location;
   const host = environmentHost(subdomain, label);
   return port ? `http://${host}:${port}` : `https://${host}`;
