@@ -321,6 +321,9 @@ mod tests {
 
     #[test]
     fn bundle_presence_needs_a_wrangler_config() {
+        let _env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut cfg = Config::from_env().expect("config");
         let dir =
             std::env::temp_dir().join(format!("noite-control-bundle-{}", crate::models::new_id()));

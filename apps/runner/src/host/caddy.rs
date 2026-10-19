@@ -1252,6 +1252,7 @@ mod tests {
             edge: crate::config::EdgeLimits::default(),
             telemetry_disabled: false,
             do_not_track: false,
+            env_problems: Vec::new(),
         }
     }
 

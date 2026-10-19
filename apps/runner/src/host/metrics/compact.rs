@@ -232,6 +232,9 @@ mod tests {
 
     #[test]
     fn uncompacted_hours_never_names_the_running_hour() {
+        let _env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let cfg = crate::config::Config::from_env().expect("config");
         // Watermarked through 13:00, now 15:xx → only 14:00 is pending.
         let hours = uncompacted_hours(Some(&"2026/09/29/13".to_string()), "2026/09/29/15", &cfg);

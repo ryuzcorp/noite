@@ -1,5 +1,12 @@
 use std::env;
 
+/// Process-wide lock serializing tests that mutate process env (and every
+/// other test that reads the whole env through `Config::from_env`): tests run
+/// in threads, so an uncleared `RUNNER_POLL_MS=abc` would otherwise fail a
+/// parallel `from_env().expect(...)` elsewhere.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Caddy `auto_https`: explicit off wins (behind-proxy deployments like
 /// Coolify, where Traefik TCP-forwards SNI and our Caddy terminates per-host
 /// TLS itself via on-demand certs); otherwise on except the `localhost`
@@ -85,12 +92,49 @@ fn parse_tenancy(raw: Option<&str>, base_domain: &str) -> Tenancy {
     }
 }
 
-fn parse_opt_uid(raw: Option<&str>, def: u32) -> Option<u32> {
-    match raw.map(str::trim) {
-        None => Some(def),
-        Some("") => Some(def),
-        Some("none") | Some("disabled") | Some("-1") => None,
-        Some(v) => v.parse().ok().or(Some(def)),
+/// Parse one numeric env var: unset or blank means the default (compose
+/// renders an unset var as an empty string, so blank counts as unset — never
+/// as a value). A set-but-malformed value records a boot problem naming the
+/// var, its value and the expected form, and yields the default so `from_env`
+/// still builds a `Config` for `validate` to refuse all at once.
+fn env_num<T>(key: &str, default: T, expected: &str, problems: &mut Vec<String>) -> T
+where
+    T: std::str::FromStr + Copy,
+{
+    let raw = match env::var(key) {
+        Err(_) => return default,
+        Ok(v) if v.trim().is_empty() => return default,
+        Ok(v) => v,
+    };
+    match raw.trim().parse() {
+        Ok(v) => v,
+        Err(_) => {
+            problems.push(format!("{key} must be {expected}, got {:?}", raw.trim()));
+            default
+        }
+    }
+}
+
+/// Strict `Option<u32>` env var (`RUNNER_BUILD_UID_BASE`, `RUNNER_FLEET_UID`,
+/// `RUNNER_FLEET_GID`): unset/blank is the default, `none`/`disabled`/`-1`
+/// unsets it, anything else must be a user id.
+fn env_opt_uid(key: &str, default: u32, problems: &mut Vec<String>) -> Option<u32> {
+    let raw = match env::var(key) {
+        Err(_) => return Some(default),
+        Ok(v) if v.trim().is_empty() => return Some(default),
+        Ok(v) => v,
+    };
+    match raw.trim() {
+        "none" | "disabled" | "-1" => None,
+        v => match v.parse() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                problems.push(format!(
+                    "{key} must be a user id, `none`, `disabled` or `-1`, got {v:?}"
+                ));
+                Some(default)
+            }
+        },
     }
 }
 
@@ -279,14 +323,8 @@ impl Default for EdgeLimits {
 }
 
 impl EdgeLimits {
-    fn from_env() -> anyhow::Result<Self> {
+    fn from_env(problems: &mut Vec<String>) -> anyhow::Result<Self> {
         let d = Self::default();
-        let num = |key: &str, def: u32| {
-            env_or(&[key], &def.to_string())
-                .trim()
-                .parse()
-                .unwrap_or(def)
-        };
         let (trusted_proxies, bad) =
             parse_trusted_proxies(&env::var("NOITE_TRUSTED_PROXIES").unwrap_or_default());
         if !bad.is_empty() {
@@ -296,27 +334,59 @@ impl EdgeLimits {
             );
         }
         Ok(Self {
-            client_rpm: num("NOITE_EDGE_RPM", d.client_rpm),
-            git_rpm: num("NOITE_EDGE_GIT_RPM", d.git_rpm),
-            app_rpm: num("NOITE_EDGE_APP_RPM", d.app_rpm),
+            client_rpm: env_num(
+                "NOITE_EDGE_RPM",
+                d.client_rpm,
+                "a non-negative integer",
+                problems,
+            ),
+            git_rpm: env_num(
+                "NOITE_EDGE_GIT_RPM",
+                d.git_rpm,
+                "a non-negative integer",
+                problems,
+            ),
+            app_rpm: env_num(
+                "NOITE_EDGE_APP_RPM",
+                d.app_rpm,
+                "a non-negative integer",
+                problems,
+            ),
             trusted_proxies,
-            wake_concurrency: num("RUNNER_WAKE_CONCURRENCY", d.wake_concurrency).max(1),
+            wake_concurrency: env_num(
+                "RUNNER_WAKE_CONCURRENCY",
+                d.wake_concurrency,
+                "a non-negative integer",
+                problems,
+            )
+            .max(1),
         })
     }
 }
 
-fn parse_fleet_ports() -> (u16, u16) {
-    if let Ok(raw) = env::var("NOITE_FLEET_PORTS") {
-        let raw = raw.trim();
-        if let Some((a, b)) = raw.split_once('-') {
-            if let (Ok(lo), Ok(hi)) = (a.trim().parse::<u16>(), b.trim().parse::<u16>()) {
-                if lo != 0 && hi > lo {
-                    return (lo, hi);
-                }
-            }
+fn parse_fleet_ports(problems: &mut Vec<String>) -> (u16, u16) {
+    const DEFAULT: (u16, u16) = (20000, 29999);
+    let raw = match env::var("NOITE_FLEET_PORTS") {
+        Err(_) => return DEFAULT,
+        Ok(v) if v.trim().is_empty() => return DEFAULT,
+        Ok(v) => v,
+    };
+    let trimmed = raw.trim();
+    let parsed = trimmed.split_once('-').and_then(|(a, b)| {
+        let (Ok(lo), Ok(hi)) = (a.trim().parse::<u16>(), b.trim().parse::<u16>()) else {
+            return None;
+        };
+        (lo != 0 && hi > lo).then_some((lo, hi))
+    });
+    match parsed {
+        Some(ports) => ports,
+        None => {
+            problems.push(format!(
+                "NOITE_FLEET_PORTS must be `<min>-<max>` (e.g. `20000-29999`), got {trimmed:?}"
+            ));
+            DEFAULT
         }
     }
-    (20000, 29999)
 }
 
 #[derive(Clone, Debug)]
@@ -453,6 +523,10 @@ pub struct Config {
     pub telemetry_disabled: bool,
     /// `DO_NOT_TRACK` set to anything but `0`/empty locks it off.
     pub do_not_track: bool,
+    /// Malformed numeric env values seen by `from_env` (var, value and
+    /// expected form per entry). `validate` refuses the boot with all of
+    /// them at once; empty for configs built any other way.
+    pub env_problems: Vec<String>,
 }
 
 impl Config {
@@ -489,7 +563,8 @@ impl Config {
         let auto_https =
             parse_auto_https(env::var("CADDY_AUTO_HTTPS").ok().as_deref(), &base_domain);
         let tenancy = parse_tenancy(env::var("NOITE_TENANCY").ok().as_deref(), &base_domain);
-        let (fleet_port_min, fleet_port_max) = parse_fleet_ports();
+        let mut env_problems: Vec<String> = Vec::new();
+        let (fleet_port_min, fleet_port_max) = parse_fleet_ports(&mut env_problems);
         let cfg = Self {
             bind: env_or(&["RUNNER_BIND"], "0.0.0.0:8080"),
             runner_token,
@@ -518,8 +593,18 @@ impl Config {
             celld_bin: env::var("CELLD_BIN").unwrap_or_else(|_| "celld".into()),
             fleet_port_min,
             fleet_port_max,
-            poll_ms: env_or(&["RUNNER_POLL_MS"], "5000").parse().unwrap_or(5000),
-            tip_sweep_s: env_or(&["RUNNER_TIP_SWEEP_S"], "60").parse().unwrap_or(60),
+            poll_ms: env_num(
+                "RUNNER_POLL_MS",
+                5000,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            tip_sweep_s: env_num(
+                "RUNNER_TIP_SWEEP_S",
+                60,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
             // Everything Caddy proxies to lives in this container.
             caddy_upstream_host: "127.0.0.1".into(),
             auto_https,
@@ -528,76 +613,128 @@ impl Config {
             caddy_admin_url: env::var("CADDY_ADMIN_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:2019".into()),
             git_public_base,
-            max_apps_per_user: env_or(&["RUNNER_MAX_APPS_PER_USER"], "10")
-                .parse()
-                .unwrap_or(10),
-            max_environments_per_app: env_or(&["RUNNER_MAX_ENVIRONMENTS_PER_APP"], "5")
-                .parse()
-                .unwrap_or(5),
-            max_environments: env_or(&["RUNNER_MAX_ENVIRONMENTS"], "25")
-                .parse()
-                .unwrap_or(25),
-            environment_ttl_h: env_or(&["RUNNER_ENVIRONMENT_TTL_H"], "168")
-                .parse()
-                .unwrap_or(168),
-            fleet_max_rss_mb: env_or(&["RUNNER_FLEET_MAX_RSS_MB"], "0")
-                .parse()
-                .unwrap_or(0),
-            fleet_log: env_or(&["RUNNER_FLEET_LOG"], "error,celld=warn"),
-            fleet_idle_evict_s: env_or(&["RUNNER_FLEET_IDLE_EVICT_S"], "120")
-                .parse()
-                .unwrap_or(120),
-            fleet_deploy_poll_s: env_or(&["RUNNER_FLEET_DEPLOY_POLL_S"], "300")
-                .parse()
-                .unwrap_or(300),
-            sleep_after_h: env_or(&["RUNNER_SLEEP_AFTER_H"], "24")
-                .parse()
-                .unwrap_or(24),
-            sleep_sweep_s: env_or(&["RUNNER_SLEEP_SWEEP_S"], "3600")
-                .parse()
-                .unwrap_or(3600),
-            wake_timeout_s: env_or(&["RUNNER_WAKE_TIMEOUT_S"], "120")
-                .parse()
-                .unwrap_or(120),
-            fleet_asset_cache_mb: env_or(&["RUNNER_FLEET_ASSET_CACHE_MB"], "64")
-                .parse()
-                .unwrap_or(64),
-            tenancy,
-            stop_budget_ms: env_or(&["NOITE_STOP_BUDGET_MS"], "25000")
-                .parse()
-                .unwrap_or(25000),
-            build_max_mb: env_or(&["RUNNER_BUILD_MAX_MB"], "2048")
-                .parse()
-                .unwrap_or(2048),
-            build_cache_mb: env_or(&["RUNNER_BUILD_CACHE_MB"], "512")
-                .parse()
-                .unwrap_or(512),
-            build_timeout_s: env_or(&["RUNNER_BUILD_TIMEOUT_S"], "300")
-                .parse()
-                .unwrap_or(300),
-            telemetry_retention_days: env_or(&["RUNNER_TELEMETRY_RETENTION_DAYS"], "30")
-                .parse()
-                .unwrap_or(30),
-            otel_flush_ms: env_or(&["RUNNER_OTEL_FLUSH_MS"], "30000")
-                .parse()
-                .unwrap_or(30000),
-            build_uid_base: parse_opt_uid(
-                env::var("RUNNER_BUILD_UID_BASE").ok().as_deref(),
-                BUILD_UID_BASE,
+            max_apps_per_user: env_num(
+                "RUNNER_MAX_APPS_PER_USER",
+                10,
+                "a non-negative integer",
+                &mut env_problems,
             ),
-            build_uid_range: env_or(&["RUNNER_BUILD_UID_RANGE"], "1024")
-                .parse()
-                .unwrap_or(BUILD_UID_RANGE),
-            fleet_uid: parse_opt_uid(env::var("RUNNER_FLEET_UID").ok().as_deref(), 10020),
-            fleet_gid: parse_opt_uid(env::var("RUNNER_FLEET_GID").ok().as_deref(), 10020),
+            max_environments_per_app: env_num(
+                "RUNNER_MAX_ENVIRONMENTS_PER_APP",
+                5,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            max_environments: env_num(
+                "RUNNER_MAX_ENVIRONMENTS",
+                25,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            environment_ttl_h: env_num(
+                "RUNNER_ENVIRONMENT_TTL_H",
+                168,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            fleet_max_rss_mb: env_num(
+                "RUNNER_FLEET_MAX_RSS_MB",
+                0,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            fleet_log: env_or(&["RUNNER_FLEET_LOG"], "error,celld=warn"),
+            fleet_idle_evict_s: env_num(
+                "RUNNER_FLEET_IDLE_EVICT_S",
+                120,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            fleet_deploy_poll_s: env_num(
+                "RUNNER_FLEET_DEPLOY_POLL_S",
+                300,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            sleep_after_h: env_num(
+                "RUNNER_SLEEP_AFTER_H",
+                24,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            sleep_sweep_s: env_num(
+                "RUNNER_SLEEP_SWEEP_S",
+                3600,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            wake_timeout_s: env_num(
+                "RUNNER_WAKE_TIMEOUT_S",
+                120,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            fleet_asset_cache_mb: env_num(
+                "RUNNER_FLEET_ASSET_CACHE_MB",
+                64,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            tenancy,
+            stop_budget_ms: env_num(
+                "NOITE_STOP_BUDGET_MS",
+                25000,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            build_max_mb: env_num(
+                "RUNNER_BUILD_MAX_MB",
+                2048,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            build_cache_mb: env_num(
+                "RUNNER_BUILD_CACHE_MB",
+                512,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            build_timeout_s: env_num(
+                "RUNNER_BUILD_TIMEOUT_S",
+                300,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            telemetry_retention_days: env_num(
+                "RUNNER_TELEMETRY_RETENTION_DAYS",
+                30,
+                "an integer",
+                &mut env_problems,
+            ),
+            otel_flush_ms: env_num(
+                "RUNNER_OTEL_FLUSH_MS",
+                30000,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            build_uid_base: env_opt_uid("RUNNER_BUILD_UID_BASE", BUILD_UID_BASE, &mut env_problems),
+            build_uid_range: env_num(
+                "RUNNER_BUILD_UID_RANGE",
+                BUILD_UID_RANGE,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            fleet_uid: env_opt_uid("RUNNER_FLEET_UID", 10020, &mut env_problems),
+            fleet_gid: env_opt_uid("RUNNER_FLEET_GID", 10020, &mut env_problems),
             control_bundle_dir: env::var("CONTROL_BUNDLE_DIR")
                 .unwrap_or_else(|_| "/opt/noite/control/dist".into()),
             better_auth_url: env::var("BETTER_AUTH_URL").unwrap_or_default(),
-            edge: EdgeLimits::from_env()?,
+            edge: EdgeLimits::from_env(&mut env_problems)?,
             telemetry_disabled: parse_telemetry_disabled(
                 env::var("NOITE_TELEMETRY").ok().as_deref(),
             ),
             do_not_track: parse_do_not_track(env::var("DO_NOT_TRACK").ok().as_deref()),
+            env_problems,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -605,7 +742,10 @@ impl Config {
     /// Boot validation (SPEC, Configuration): fail fast with a
     /// list of problems instead of serving half-configured.
     pub fn validate(&self) -> anyhow::Result<()> {
-        let mut problems: Vec<String> = Vec::new();
+        // Malformed numeric env values never fall back silently: `from_env`
+        // records each one (var, value, expected form) and the boot fails
+        // here naming them all, before any range complaint below.
+        let mut problems: Vec<String> = self.env_problems.clone();
         let dev_token = self.runner_token == "dev-runner-token";
         let dev_auth = std::env::var("BETTER_AUTH_SECRET")
             .map(|v| v.trim().is_empty() || v.starts_with("dev-"))
@@ -648,15 +788,6 @@ impl Config {
         }
         if self.stop_budget_ms < 5000 {
             problems.push("NOITE_STOP_BUDGET_MS must be >= 5000".into());
-        }
-        // A malformed value would otherwise parse to the fallback silently;
-        // report it like every other boot-invalid setting instead.
-        if let Some(problem) = telemetry_retention_problem(
-            std::env::var("RUNNER_TELEMETRY_RETENTION_DAYS")
-                .ok()
-                .as_deref(),
-        ) {
-            problems.push(problem);
         }
         if self.telemetry_retention_days < 1 {
             problems.push("RUNNER_TELEMETRY_RETENTION_DAYS must be >= 1".into());
@@ -808,16 +939,6 @@ impl Config {
     }
 }
 
-/// Boot problem for a malformed `RUNNER_TELEMETRY_RETENTION_DAYS` (None when
-/// unset or an integer). Split out from `validate` so the check stays pure.
-fn telemetry_retention_problem(raw: Option<&str>) -> Option<String> {
-    let raw = raw?;
-    raw.trim()
-        .parse::<i64>()
-        .is_err()
-        .then(|| format!("RUNNER_TELEMETRY_RETENTION_DAYS must be an integer, got {raw:?}"))
-}
-
 /// Minimal literal `Config` for tests outside this module (no env, no S3, no
 /// control hosts): callers clone it and mutate the few fields they exercise.
 #[cfg(test)]
@@ -877,6 +998,7 @@ pub(crate) fn config_for_tests() -> Config {
         edge: EdgeLimits::default(),
         telemetry_disabled: false,
         do_not_track: false,
+        env_problems: Vec::new(),
     }
 }
 
@@ -977,14 +1099,194 @@ mod tests {
         assert!(!cfg.edge_sees_clients(), "behind a proxy, no trusted list");
     }
 
+    /// Every numeric env var `from_env` parses strictly. Kept next to the
+    /// parse sites so a new knob must add its name here too.
+    const STRICT_NUMERIC_VARS: &[&str] = &[
+        "RUNNER_POLL_MS",
+        "RUNNER_TIP_SWEEP_S",
+        "RUNNER_MAX_APPS_PER_USER",
+        "RUNNER_MAX_ENVIRONMENTS_PER_APP",
+        "RUNNER_MAX_ENVIRONMENTS",
+        "RUNNER_ENVIRONMENT_TTL_H",
+        "RUNNER_FLEET_MAX_RSS_MB",
+        "RUNNER_FLEET_IDLE_EVICT_S",
+        "RUNNER_FLEET_DEPLOY_POLL_S",
+        "RUNNER_SLEEP_AFTER_H",
+        "RUNNER_SLEEP_SWEEP_S",
+        "RUNNER_WAKE_TIMEOUT_S",
+        "RUNNER_FLEET_ASSET_CACHE_MB",
+        "NOITE_STOP_BUDGET_MS",
+        "RUNNER_BUILD_MAX_MB",
+        "RUNNER_BUILD_CACHE_MB",
+        "RUNNER_BUILD_TIMEOUT_S",
+        "RUNNER_TELEMETRY_RETENTION_DAYS",
+        "RUNNER_OTEL_FLUSH_MS",
+        "RUNNER_BUILD_UID_RANGE",
+        "RUNNER_BUILD_UID_BASE",
+        "RUNNER_FLEET_UID",
+        "RUNNER_FLEET_GID",
+        "NOITE_FLEET_PORTS",
+        "NOITE_EDGE_RPM",
+        "NOITE_EDGE_GIT_RPM",
+        "NOITE_EDGE_APP_RPM",
+        "RUNNER_WAKE_CONCURRENCY",
+    ];
+
+    /// Run `f` with a hermetic env: every strictly-parsed numeric var
+    /// cleared, `BASE_DOMAIN` pinned to the dev base, then `set` applied.
+    /// Holds `ENV_LOCK` throughout and restores everything after, so a
+    /// parallel `from_env` elsewhere never observes the mutation.
+    fn with_env(set: &[(&str, &str)], f: impl FnOnce()) {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut saved: Vec<(&str, Option<String>)> = Vec::new();
+        for key in STRICT_NUMERIC_VARS.iter().copied().chain(["BASE_DOMAIN"]) {
+            saved.push((key, env::var(key).ok()));
+            env::remove_var(key);
+        }
+        env::set_var("BASE_DOMAIN", "noite.localhost");
+        for (key, value) in set {
+            env::set_var(key, value);
+        }
+        f();
+        for (key, old) in saved {
+            match old {
+                Some(v) => env::set_var(key, v),
+                None => env::remove_var(key),
+            }
+        }
+    }
+
     #[test]
-    fn malformed_telemetry_retention_is_a_problem() {
-        assert!(telemetry_retention_problem(None).is_none());
-        assert!(telemetry_retention_problem(Some("30")).is_none());
-        assert!(telemetry_retention_problem(Some(" 7 ")).is_none());
-        let problem = telemetry_retention_problem(Some("thirty")).expect("malformed is a problem");
-        assert!(problem.contains("RUNNER_TELEMETRY_RETENTION_DAYS"));
-        assert!(problem.contains("thirty"));
+    fn malformed_numeric_refuses_boot_naming_the_var() {
+        with_env(&[("RUNNER_POLL_MS", "abc")], || {
+            let err = Config::from_env().expect_err("malformed RUNNER_POLL_MS must fail boot");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("RUNNER_POLL_MS"), "names the var: {msg}");
+            assert!(msg.contains("abc"), "names the bad value: {msg}");
+        });
+    }
+
+    #[test]
+    fn every_malformed_numeric_is_listed_at_once() {
+        with_env(
+            &[
+                ("RUNNER_POLL_MS", "abc"),
+                ("RUNNER_MAX_APPS_PER_USER", "ten"),
+                ("RUNNER_TELEMETRY_RETENTION_DAYS", "thirty"),
+                ("NOITE_FLEET_PORTS", "banana"),
+                ("NOITE_EDGE_RPM", "lots"),
+                ("RUNNER_BUILD_UID_BASE", "nope"),
+                ("RUNNER_WAKE_CONCURRENCY", "4.5"),
+            ],
+            || {
+                let err = Config::from_env().expect_err("malformed values must fail boot");
+                let msg = format!("{err:#}");
+                for (key, value) in [
+                    ("RUNNER_POLL_MS", "abc"),
+                    ("RUNNER_MAX_APPS_PER_USER", "ten"),
+                    ("RUNNER_TELEMETRY_RETENTION_DAYS", "thirty"),
+                    ("NOITE_FLEET_PORTS", "banana"),
+                    ("NOITE_EDGE_RPM", "lots"),
+                    ("RUNNER_BUILD_UID_BASE", "nope"),
+                    ("RUNNER_WAKE_CONCURRENCY", "4.5"),
+                ] {
+                    assert!(msg.contains(key), "lists {key}: {msg}");
+                    assert!(msg.contains(value), "lists the bad {value}: {msg}");
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn unset_numerics_mean_defaults() {
+        with_env(&[], || {
+            let cfg = Config::from_env().expect("unset numerics must boot");
+            assert!(cfg.env_problems.is_empty());
+            assert_eq!(cfg.poll_ms, 5000);
+            assert_eq!(cfg.tip_sweep_s, 60);
+            assert_eq!(cfg.max_apps_per_user, 10);
+            assert_eq!(cfg.max_environments_per_app, 5);
+            assert_eq!(cfg.max_environments, 25);
+            assert_eq!(cfg.environment_ttl_h, 168);
+            assert_eq!(cfg.fleet_max_rss_mb, 0);
+            assert_eq!(cfg.fleet_idle_evict_s, 120);
+            assert_eq!(cfg.fleet_deploy_poll_s, 300);
+            assert_eq!(cfg.sleep_after_h, 24);
+            assert_eq!(cfg.sleep_sweep_s, 3600);
+            assert_eq!(cfg.wake_timeout_s, 120);
+            assert_eq!(cfg.fleet_asset_cache_mb, 64);
+            assert_eq!(cfg.stop_budget_ms, 25000);
+            assert_eq!(cfg.build_max_mb, 2048);
+            assert_eq!(cfg.build_cache_mb, 512);
+            assert_eq!(cfg.build_timeout_s, 300);
+            assert_eq!(cfg.telemetry_retention_days, 30);
+            assert_eq!(cfg.otel_flush_ms, 30000);
+            assert_eq!(cfg.build_uid_range, BUILD_UID_RANGE);
+            assert_eq!((cfg.fleet_port_min, cfg.fleet_port_max), (20000, 29999));
+            assert_eq!(cfg.build_uid_base, Some(BUILD_UID_BASE));
+            assert_eq!(cfg.fleet_uid, Some(10020));
+            assert_eq!(cfg.fleet_gid, Some(10020));
+            assert_eq!(cfg.edge.client_rpm, 1800);
+            assert_eq!(cfg.edge.git_rpm, 120);
+            assert_eq!(cfg.edge.app_rpm, 0);
+            assert_eq!(cfg.edge.wake_concurrency, 4);
+        });
+    }
+
+    #[test]
+    fn blank_numerics_mean_defaults() {
+        // Compose renders an unset var as an empty string: still the default,
+        // never a boot failure.
+        with_env(
+            &[("RUNNER_POLL_MS", ""), ("NOITE_FLEET_PORTS", "  ")],
+            || {
+                let cfg = Config::from_env().expect("blank numerics must boot");
+                assert!(cfg.env_problems.is_empty());
+                assert_eq!(cfg.poll_ms, 5000);
+                assert_eq!((cfg.fleet_port_min, cfg.fleet_port_max), (20000, 29999));
+            },
+        );
+    }
+
+    #[test]
+    fn valid_numerics_parse() {
+        with_env(
+            &[
+                ("RUNNER_POLL_MS", "1000"),
+                ("RUNNER_MAX_APPS_PER_USER", "3"),
+                ("RUNNER_TELEMETRY_RETENTION_DAYS", " 7 "),
+                ("NOITE_FLEET_PORTS", "21000-21999"),
+                ("NOITE_EDGE_RPM", "60"),
+                ("RUNNER_WAKE_CONCURRENCY", "2"),
+                ("RUNNER_BUILD_UID_BASE", "20000"),
+                ("RUNNER_FLEET_UID", "10020"),
+                ("RUNNER_SLEEP_AFTER_H", "0"),
+                ("NOITE_STOP_BUDGET_MS", "5000"),
+            ],
+            || {
+                let cfg = Config::from_env().expect("valid numerics must boot");
+                assert!(cfg.env_problems.is_empty());
+                assert_eq!(cfg.poll_ms, 1000);
+                assert_eq!(cfg.max_apps_per_user, 3);
+                assert_eq!(cfg.telemetry_retention_days, 7);
+                assert_eq!((cfg.fleet_port_min, cfg.fleet_port_max), (21000, 21999));
+                assert_eq!(cfg.edge.client_rpm, 60);
+                assert_eq!(cfg.edge.wake_concurrency, 2);
+                assert_eq!(cfg.build_uid_base, Some(20000));
+                assert_eq!(cfg.fleet_uid, Some(10020));
+                assert_eq!(cfg.sleep_after_h, 0);
+                assert_eq!(cfg.stop_budget_ms, 5000);
+            },
+        );
+    }
+
+    #[test]
+    fn uid_sentinels_unset_the_id() {
+        with_env(&[("RUNNER_BUILD_UID_BASE", "none")], || {
+            let cfg = Config::from_env().expect("`none` must boot");
+            assert!(cfg.env_problems.is_empty());
+            assert_eq!(cfg.build_uid_base, None);
+        });
     }
 
     #[test]

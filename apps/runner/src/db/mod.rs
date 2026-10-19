@@ -251,6 +251,9 @@ mod tests {
 
     #[test]
     fn snapshot_sits_beside_the_database() {
+        let _env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut cfg = crate::config::Config::from_env().expect("config");
         cfg.database_url = "sqlite:/data/noite.sqlite?mode=rwc".into();
         assert_eq!(
