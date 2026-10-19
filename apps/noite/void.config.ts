@@ -19,7 +19,12 @@ export default defineConfig({
     assets: {
       binding: "ASSETS",
       not_found_handling: "none",
-      run_worker_first: ["/**"],
+      // Boolean, not the pattern-array form (same form `cloudflare.config.ts`
+      // used on main: worker first so every path goes through it). Void's own
+      // build normalizes this to `["/**"]` when routing rules exist anyway;
+      // `emitCelldConfig` in `vite.config.ts` coerces celld's copy back to
+      // `true`, which is the only form celld reads.
+      run_worker_first: true,
     },
     d1_databases: [{ binding: "DB", database_name: "noite-control" }],
     name: "noite-control",

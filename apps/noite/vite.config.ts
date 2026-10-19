@@ -356,7 +356,17 @@ const emitCelldConfig = (): Plugin => ({
       }
     }
     config["main"] = `ssr/${ssrMain}`;
-    config["assets"] = { ...ssrAssets, directory: "client" };
+    // celld reads `run_worker_first` only as a boolean, but Void's build
+    // forces the pattern-array form whenever routing rules exist (ours do:
+    // the isolation headers). Coerce it here — this file is celld's config
+    // surface only; `dist/ssr/wrangler.json` keeps Void's own form. Without
+    // worker-first, celld serves every existing static file itself and the
+    // worker (with the pod-host gate) never sees it.
+    config["assets"] = {
+      ...ssrAssets,
+      directory: "client",
+      run_worker_first: true,
+    };
     // D1 is keyed by name: drop Void's default `migrations_dir` (it points
     // at a directory that does not exist; schema migrates at runtime via
     // `ensureDb`, never through wrangler migrations).
