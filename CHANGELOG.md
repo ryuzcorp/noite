@@ -20,7 +20,7 @@ The control UI moves to the Void framework, the CLI ships on npm as `@noitenow/c
 
 ### Added
 
-- **Control UI on Void:** the control UI (`apps/noite`) migrates from Oxide to the Void framework on ilha 0.16 (`void@1.1.11` + `@ilha/void`), with the same routes, actions and serving contract. Behaviour is unchanged apart from the fixes below.
+- **Control UI on Void:** the control UI (`apps/noite`) migrates from Oxide to the Void framework on ilha 0.16 (`void@1.1.12` + `@ilha/void@0.1.4`), with the same routes, actions and serving contract. Behaviour is unchanged apart from the fixes below.
 - **`@noitenow/cli` 0.1.0-alpha.6 on npm:** the published bundle runs on plain Node 20+ (previously it required Bun even when installed via npm). Every `v*` tag publishes the CLI at that exact version (dist-tag `alpha` for prereleases, `latest` for finals) after the release gate passes.
 - `noite environments vars unset <environment> <name>` removes an environment variable override.
 - A rollback end-to-end spec pins that rolling back to an earlier deploy serves that revision again.
@@ -37,7 +37,7 @@ The control UI moves to the Void framework, the CLI ships on npm as `@noitenow/c
 
 ### Changed
 
-- **JS deps (patch/minor):** `better-auth` 1.7.7 → 1.7.11, `effect` + `@effect/sql-d1` + `@effect/platform-node` 4.0.4 → 4.0.5, `kysely` 0.29.6 → 0.29.7, plus `blume`, `daisyui`, `@cloudflare/workers-types`, `@playwright/test`, `@types/bun`, `@types/node` and `oxfmt` bumps. Runner deps get a semver-compatible `cargo update`; the lint toolchain moves to ultracite 8. `void` stays at exact 1.1.11 until `@ilha/void` catches up (see the PR for the upstream blocker).
+- **JS deps (patch/minor):** `better-auth` 1.7.7 → 1.7.11, `effect` + `@effect/sql-d1` + `@effect/platform-node` 4.0.4 → 4.0.5, `kysely` 0.29.6 → 0.29.7, `void` 1.1.11 → 1.1.12 with `@ilha/void` 0.1.4, plus `blume`, `daisyui`, `@cloudflare/workers-types`, `@playwright/test`, `@types/bun`, `@types/node` and `oxfmt` bumps. Runner deps get a semver-compatible `cargo update`; the lint toolchain moves to ultracite 8.
 - **CI:** the release image target now builds on every PR (no push), and the e2e lanes run on PRs carrying the `e2e` label (plus manual dispatch). GitHub Action pins move to current majors, and the schema gate diffs the full 17-table allowlist.
 - Docs refresh: release references to 0.1.0-alpha.5, control-host denied-asset 404s, preview environments starting empty, and the environments bucket prefix; dev installs derive `BETTER_AUTH_URL`/`GIT_PUBLIC_BASE` from `BASE_DOMAIN`, and `make nuke` also removes the UI's `.wrangler`/`.void` dirs.
 
