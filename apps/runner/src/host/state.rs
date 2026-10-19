@@ -56,6 +56,12 @@ pub struct StateSync {
     /// sha256 of the last uploaded snapshot (spec T4.3): an identical
     /// `VACUUM INTO` output skips the upload entirely.
     last_hash: Arc<std::sync::Mutex<Option<String>>>,
+    /// Serializes concurrent snapshots (R-08): the sync tick, the admin
+    /// endpoint and the shutdown snapshot share one runner and one bucket,
+    /// so without this two runs interleave on one temp path and upload
+    /// each other's partial bytes. Unique temp names per run (see
+    /// `snapshot_tmp_paths`) are the second half of the fix.
+    snapshot_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl StateSync {
@@ -66,6 +72,7 @@ impl StateSync {
             instance: Arc::new(uuid::Uuid::new_v4().to_string()),
             owner: Arc::new(AtomicBool::new(true)),
             last_hash: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -84,17 +91,29 @@ impl StateSync {
     }
 
     /// Claim the bucket state for this runner (boot). Continues the stored
-    /// generation so it stays monotonic across restarts.
+    /// generation so it stays monotonic across restarts. R-18: only a missing
+    /// meta object counts as "first boot" — a transport error refuses the
+    /// boot instead of seeding generation 0, which would defeat the
+    /// identical-skip and let the next upload overwrite a good snapshot with
+    /// an empty database.
     pub async fn claim(&self, cfg: &Config) -> anyhow::Result<()> {
-        if let Ok(text) = download_text(cfg, META_KEY).await {
-            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-            if let Some(g) = v.get("generation").and_then(serde_json::Value::as_u64) {
-                self.generation.store(g, Ordering::Relaxed);
+        match download_text(cfg, META_KEY).await {
+            Ok(text) => {
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                if let Some(g) = v.get("generation").and_then(serde_json::Value::as_u64) {
+                    self.generation.store(g, Ordering::Relaxed);
+                }
+                // Seed the identical-skip (T4.3) so the first pass after a
+                // restart doesn't re-upload an unchanged snapshot.
+                if let Some(h) = v.get("sha256").and_then(|x| x.as_str()) {
+                    *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = Some(h.to_string());
+                }
             }
-            // Seed the identical-skip (T4.3) so the first pass after a
-            // restart doesn't re-upload an unchanged snapshot.
-            if let Some(h) = v.get("sha256").and_then(|x| x.as_str()) {
-                *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = Some(h.to_string());
+            Err(e) if s3::is_not_found(&e) => {}
+            Err(e) => {
+                return Err(e.context(
+                    "runner state meta download failed; refusing to claim the bucket state",
+                ));
             }
         }
         let claim = serde_json::json!({
@@ -129,8 +148,12 @@ impl StateSync {
         mine
     }
 
-    /// Snapshot now: VACUUM INTO a temp file, upload, update meta.
+    /// Snapshot now: VACUUM INTO a temp file, upload, update meta. Serialized
+    /// by `snapshot_lock`: the sync tick, the admin endpoint and the shutdown
+    /// path share this runner, and overlapping runs used to interleave on one
+    /// fixed temp path and upload each other's partial bytes (R-08).
     pub async fn snapshot_now(&self, pool: &SqlitePool, cfg: &Config) -> anyhow::Result<u64> {
+        let _snapshot = self.snapshot_lock.lock().await;
         if !self.still_owner(cfg).await {
             anyhow::bail!("runner state is owned by another runner; not uploading");
         }
@@ -148,16 +171,28 @@ impl StateSync {
         let live = db::local_db_path(cfg)
             .unwrap_or_else(|| std::path::PathBuf::from("/data/noite.sqlite"));
         let dir = live.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        let tmp = dir.join(".snapshot.sqlite");
-        let _ = tokio::fs::remove_file(&tmp).await;
+        // R-08: unique temp names per run — a fixed `.snapshot.sqlite` lets a
+        // second concurrent run truncate the first's VACUUM output mid-read.
+        // (Runs are also serialized by `snapshot_lock`; the names are defense
+        // in depth against any future unlocked caller.)
+        let (tmp, src) = snapshot_tmp_paths(&dir);
         let Some(target) = tmp.to_str() else {
             anyhow::bail!("snapshot path is not valid UTF-8");
         };
         // `VACUUM INTO` copies only the main database: metrics.sqlite rides
         // along on the volume but is never snapshotted (spec T4.1).
         let sql = format!("VACUUM INTO '{}'", target.replace('\'', "''"));
-        sqlx::query(&sql).execute(pool).await?;
-        let raw = tokio::fs::read(&tmp).await?;
+        if let Err(e) = sqlx::query(&sql).execute(pool).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e.into());
+        }
+        let raw = match tokio::fs::read(&tmp).await {
+            Ok(raw) => raw,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(e.into());
+            }
+        };
         let _ = tokio::fs::remove_file(&tmp).await;
         // Skip identical snapshots (spec T4.3): writes that don't change
         // bytes (e.g. an upsert of the same row) upload nothing.
@@ -181,10 +216,13 @@ impl StateSync {
         // zstd level 3 (spec T4.2): saves bucket storage and upload bytes.
         let packed = zstd::encode_all(&raw[..], 3)?;
         let packed_len = packed.len() as u64;
-        let src = dir.join(".snapshot.sqlite.zst");
-        tokio::fs::write(&src, &packed).await?;
-        s3::s3_cp_upload(cfg, &src, STATE_KEY).await?;
+        if let Err(e) = tokio::fs::write(&src, &packed).await {
+            let _ = tokio::fs::remove_file(&src).await;
+            return Err(e.into());
+        }
+        let uploaded = s3::s3_cp_upload(cfg, &src, STATE_KEY).await;
         let _ = tokio::fs::remove_file(&src).await;
+        uploaded?;
         *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash.clone());
         crate::host::stats::count_snapshot(packed_len);
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
@@ -206,6 +244,17 @@ impl StateSync {
         );
         Ok(packed_len)
     }
+}
+
+/// Unique temp paths for one snapshot run (R-08): the sqlite dump and its
+/// zstd packing never share names across runs, so overlapping sync-tick,
+/// admin and shutdown snapshots cannot truncate or read each other's bytes.
+fn snapshot_tmp_paths(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let tag = uuid::Uuid::new_v4();
+    (
+        dir.join(format!(".snapshot-{tag}.sqlite")),
+        dir.join(format!(".snapshot-{tag}.sqlite.zst")),
+    )
 }
 
 async fn download_text(cfg: &Config, key: &str) -> anyhow::Result<String> {
@@ -346,6 +395,7 @@ pub async fn final_snapshot(sync: &StateSync, pool: &SqlitePool, cfg: &Config) {
 
 #[cfg(test)]
 mod tests {
+    use super::snapshot_tmp_paths;
     use crate::host::s3::is_not_found;
 
     #[test]
@@ -356,5 +406,47 @@ mod tests {
             "aws exit 255\nCould not connect to the endpoint URL: \"http://rustfs:9000/noite\""
         );
         assert!(!is_not_found(&down));
+    }
+
+    /// R-08: every snapshot run gets its own temp names — two runs never
+    /// share a path, so overlapping sync-tick/admin/shutdown snapshots
+    /// cannot truncate or read each other's bytes.
+    #[test]
+    fn snapshot_tmp_paths_are_unique_per_run() {
+        let dir = std::path::Path::new("/data");
+        let (a_sqlite, a_zst) = snapshot_tmp_paths(dir);
+        let (b_sqlite, b_zst) = snapshot_tmp_paths(dir);
+        assert_ne!(a_sqlite, b_sqlite);
+        assert_ne!(a_zst, b_zst);
+        assert_ne!(a_sqlite, a_zst);
+        for path in [&a_sqlite, &a_zst, &b_sqlite, &b_zst] {
+            assert_eq!(path.parent(), Some(dir));
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            assert!(name.starts_with(".snapshot-"), "{name}");
+        }
+    }
+
+    /// R-18: `claim` refuses the boot when the meta download fails with a
+    /// transport error (it must not seed generation 0 and upload an empty
+    /// database over the good snapshot). An unreachable store errors; only
+    /// a real 404 counts as first boot. Pointed at a closed port so no
+    /// stub is needed — the failure is a certain connection refusal.
+    #[tokio::test]
+    async fn claim_refuses_boot_on_transport_error() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.s3_endpoint = "http://127.0.0.1:1".to_string();
+        cfg.s3_public_endpoint = "http://127.0.0.1:1".to_string();
+        let sync = super::StateSync::new();
+        let err = sync
+            .claim(&cfg)
+            .await
+            .expect_err("claim must fail when the store is unreachable");
+        assert!(
+            format!("{err:#}").contains("refusing to claim"),
+            "unexpected error: {err:#}"
+        );
     }
 }
