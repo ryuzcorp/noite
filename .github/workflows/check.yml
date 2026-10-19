@@ -23,7 +23,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - run: bun install
       - name: changelog entry for this release
@@ -53,13 +53,35 @@ jobs:
           done
       # Main-database tables only: app_metric, metric_watermark and the rest of
       # the telemetry live in metrics.sqlite (apps/runner/schema.metrics.sql).
+      # Strict: the rendered table list must equal the allowlist exactly, so a
+      # migration that adds a table without updating this list fails here
+      # instead of going unchecked (the alpha.4/alpha.5 tables were silently
+      # skipped by the old existence-only loop).
       - name: runner schema applies twice (idempotent)
         run: |
+          rm -f /tmp/schema.db
           sqlite3 /tmp/schema.db < apps/runner/schema.sql
           sqlite3 /tmp/schema.db < apps/runner/schema.sql
-          for t in app app_credential app_domain app_env app_limit deploy; do
-            sqlite3 /tmp/schema.db "SELECT name FROM sqlite_master WHERE type='table' AND name='$t'" | grep -qx "$t"
-          done
+          sqlite3 /tmp/schema.db "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name" > /tmp/tables.txt
+          diff /tmp/tables.txt - <<'EOF'
+          app
+          app_branch_rule
+          app_credential
+          app_domain
+          app_env
+          app_event
+          app_insight
+          app_limit
+          app_user_prop
+          deploy
+          environment
+          environment_env
+          instance_setting
+          pr_comment
+          pr_review
+          pull_request
+          telemetry_replay
+          EOF
 
   # The UI's runner contract is generated from the Rust structs (apps/runner
   # `#[ts(export)]` derives -> apps/noite/src/lib/runner-types). A Rust change
@@ -73,7 +95,7 @@ jobs:
       run:
         working-directory: apps/runner
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -92,7 +114,7 @@ jobs:
   cli:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - run: bun install
       - name: build

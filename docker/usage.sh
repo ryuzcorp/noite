@@ -28,7 +28,10 @@ if [ -z "${BEFORE}" ] || [ "${BEFORE}" = "Unauthorized" ]; then
 fi
 echo "${BEFORE}" > "/tmp/noite-usage-before.json"
 
-CONTAINER="$(${ENGINE} ps --format '{{.Names}}' 2>/dev/null | grep -E 'noite' | head -1 || true)"
+# Match the `noite` service only: container names are `<project>-noite-<n>`
+# (rustfs is `<project>-rustfs-<n>`), so a bare `noite` match typically
+# records the bucket store's CPU/RSS and /data as the runner baselines.
+CONTAINER="$(${ENGINE} ps --format '{{.Names}}' 2>/dev/null | grep -E -- '[-_]noite([-_][0-9]+)?$' | head -1 || true)"
 if [ -n "${CONTAINER}" ]; then
   echo "--- container stats (start) ---"
   ${ENGINE} stats --no-stream "${CONTAINER}" 2>/dev/null || true

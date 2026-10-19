@@ -2,8 +2,9 @@
 # and driven by Playwright (passkey signup, invites, git push, deploys, tenant
 # serve), then the same lane in multi-tenant mode with the hostile-tenant spec.
 #
-# Run by hand from the Actions tab, and by `images.yml` as the gate in front of
-# every release tag. Locally: `make e2e` and `make e2e-isolation`.
+# Run on pull requests carrying the `e2e` label (via `ci.yml`), by hand from
+# the Actions tab, and by `images.yml` as the gate in front of every release
+# tag. Locally: `make e2e` and `make e2e-isolation`.
 name: e2e
 
 on:
@@ -34,7 +35,7 @@ jobs:
           - lane: multi
             target: e2e-isolation
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - run: bun install
       - name: install UI deps
@@ -47,7 +48,7 @@ jobs:
         run: make ${{ matrix.target }}
       - name: upload playwright report
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: playwright-report-${{ matrix.lane }}
           path: apps/noite/playwright-report/

@@ -184,7 +184,7 @@ portless alias noite 9080 # the route lives in ~/.portless and survives restarts
 sudo firewall-cmd --permanent --add-service=https && sudo firewall-cmd --reload
 ```
 
-Set `BETTER_AUTH_URL=https://noite.local` in `.env`. Passkeys bind to that origin, so the laptop and the phone share one credential namespace; with the `.env.example` default (`http://noite.localhost:9080`), a phone registering on `noite.local` fails with an rpID mismatch. In dev, `vite dev` passes the container's environment to the worker, so `.env` is the only source needed (a hand-written `apps/noite/.dev.vars` still overrides it).
+Set `BETTER_AUTH_URL=https://noite.local` in `.env`. Passkeys bind to that origin, so the laptop and the phone share one credential namespace; with the stock default (`http://noite.localhost:9080`, derived from `BASE_DOMAIN`), a phone registering on `noite.local` fails with an rpID mismatch. In dev, `vite dev` passes the container's environment to the worker, so `.env` is the only source needed (a hand-written `apps/noite/.dev.vars` still overrides it).
 
 Per boot:
 
