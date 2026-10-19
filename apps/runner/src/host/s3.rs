@@ -4,8 +4,9 @@
 //! change; listings keep the aws CLI's JSON shape for the same reason.
 
 use anyhow::{bail, Context};
+use std::future::Future;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 
@@ -17,12 +18,19 @@ use crate::host::exec::work_root;
 /// store's `NoSuchKey` body, which the same matchers catch. Callers that
 /// treat "missing" as "start fresh" must not do so on a transport error, or
 /// they overwrite good state.
+///
+/// The matchers are status-anchored on purpose: the target key rides inside
+/// the same message (`s3 download 404.html failed: HTTP 500 ...`), so a bare
+/// `"404"` reads a transport failure on a numeric key as "missing". `(404)`
+/// is the legacy aws-CLI shape (`An error occurred (404) ...`), kept so old
+/// snapshots still count as absent.
 pub fn is_not_found(err: &anyhow::Error) -> bool {
     let text = format!("{err:#}");
-    text.contains("404")
-        || text.contains("Not Found")
+    text.contains("HTTP 404")
+        || text.contains("(404)")
         || text.contains("NoSuchKey")
-        || text.contains("does not exist")
+        || text.contains("NoSuchBucket")
+        || text.contains("NotFound")
 }
 
 pub fn aws_env(cfg: &Config) -> Vec<(&str, String)> {
@@ -66,14 +74,82 @@ fn s3_bucket(cfg: &Config, bucket: &str) -> anyhow::Result<(Bucket, Credentials)
     Ok((handle, creds))
 }
 
-/// Rich S3 failure: HTTP status plus the store's XML error body. `is_not_found`
-/// matches on "404"/"NoSuchKey", so "missing" vs "unreachable" keeps working
-/// without knowing the transport.
+/// Rich S3 failure: HTTP status plus the store's XML error body.
+/// [`is_not_found`] matches on the status-anchored `HTTP 404`/`NoSuchKey`, so
+/// "missing" vs "unreachable" keeps working without knowing the transport.
 async fn s3_err(op: &str, target: &str, resp: reqwest::Response) -> anyhow::Error {
     let status = resp.status().as_u16();
     let body = resp.text().await.unwrap_or_default();
+    s3_err_msg(op, target, status, &body)
+}
+
+/// Same failure without the response: the retryable attempts classify before
+/// they would consume the body, so the message is built from parts.
+fn s3_err_msg(op: &str, target: &str, status: u16, body: &str) -> anyhow::Error {
     let snippet: String = body.trim().chars().take(300).collect();
     anyhow::anyhow!("s3 {op} {target} failed: HTTP {status} {snippet}")
+}
+
+/// How many times an idempotent S3 call is attempted before giving up.
+const S3_MAX_ATTEMPTS: u32 = 3;
+
+/// Backoff between S3 attempts: 250 ms doubling per failure plus up to one
+/// base of jitter, so a rustfs restart does not get every caller retrying in
+/// lockstep.
+fn s3_retry_delay(failed: u32) -> Duration {
+    let base_ms: u64 = 250 << failed.min(3);
+    let jitter_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()) % (base_ms + 1))
+        .unwrap_or(0);
+    Duration::from_millis(base_ms + jitter_ms)
+}
+
+/// One S3 attempt's outcome. Only idempotent calls retry — GET, PUT of a full
+/// key (an overwrite, never an append) and LIST — so a repeated attempt can
+/// never duplicate or corrupt state.
+enum S3Fail {
+    /// Worth one more attempt: a 5xx, a SlowDown body, or a request that
+    /// never reached the store.
+    Retryable(anyhow::Error),
+    /// Retrying cannot help: 4xx, auth, local disk, XML parse.
+    Final(anyhow::Error),
+}
+
+/// Run `run` until it succeeds, fails finally, or exhausts
+/// [`S3_MAX_ATTEMPTS`] on retryable errors. 4xx responses are never retried:
+/// a missing key or a refused credential comes back identically every time.
+async fn with_s3_retry<T, F, Fut>(op: &str, target: &str, mut run: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, S3Fail>>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        match run().await {
+            Ok(value) => return Ok(value),
+            Err(S3Fail::Final(e)) => return Err(e),
+            Err(S3Fail::Retryable(e)) => {
+                attempt += 1;
+                if attempt >= S3_MAX_ATTEMPTS {
+                    return Err(e);
+                }
+                tracing::debug!(op, target, attempt, error = %e, "s3 attempt failed; retrying");
+                tokio::time::sleep(s3_retry_delay(attempt)).await;
+            }
+        }
+    }
+}
+
+/// Classify a non-success status: 5xx and SlowDown may be retried, everything
+/// else (including every other 4xx) is final.
+fn classify_status(op: &str, target: &str, status: reqwest::StatusCode, body: &str) -> S3Fail {
+    let err = s3_err_msg(op, target, status.as_u16(), body);
+    if status.is_server_error() || body.contains("SlowDown") {
+        S3Fail::Retryable(err)
+    } else {
+        S3Fail::Final(err)
+    }
 }
 
 /// Split an `s3://bucket/key` URI (callers pass `cfg.s3_uri(key)` results).
@@ -377,6 +453,10 @@ async fn put_bucket_lifecycle(cfg: &Config) -> anyhow::Result<()> {
 
 /// Stream one object to `dest` (bundles, snapshots, manifests). The body is
 /// written chunk by chunk, never buffered whole.
+///
+/// Retried on 5xx/SlowDown/transport only, never on 4xx: a missing key comes
+/// back identically every time, while one transient 503 used to fail the
+/// whole deploy/restore/compaction.
 async fn s3_get_to_file(
     cfg: &Config,
     bucket_name: &str,
@@ -384,32 +464,67 @@ async fn s3_get_to_file(
     dest: &Path,
     timeout: Duration,
 ) -> anyhow::Result<u64> {
+    with_s3_retry("download", key, || {
+        get_once(cfg, bucket_name, key, dest, timeout)
+    })
+    .await
+}
+
+async fn get_once(
+    cfg: &Config,
+    bucket_name: &str,
+    key: &str,
+    dest: &Path,
+    timeout: Duration,
+) -> Result<u64, S3Fail> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
-    let (handle, creds) = s3_bucket(cfg, bucket_name)?;
+    let (handle, creds) = s3_bucket(cfg, bucket_name).map_err(S3Fail::Final)?;
     let url = handle
         .get_object(Some(&creds), key)
         .sign(Duration::from_secs(PRESIGN_SECS));
-    let resp = http_client()
+    let resp = match http_client()
         .get(url)
         .timeout(timeout)
         .send()
         .await
-        .context("s3 GET")?;
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return Err(S3Fail::Retryable(anyhow::anyhow!(
+                "s3 download {key} transport: {e:#}"
+            )));
+        }
+    };
     if !resp.status().is_success() {
-        return Err(s3_err("download", key, resp).await);
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(classify_status("download", key, status, &body));
     }
+    // Created per attempt, so a retry truncates the partial body instead of
+    // appending a second copy after it.
     let mut file = tokio::fs::File::create(dest)
         .await
-        .with_context(|| format!("create {}", dest.display()))?;
+        .map_err(|e| S3Fail::Final(anyhow::anyhow!("create {}: {e:#}", dest.display())))?;
     let mut stream = resp.bytes_stream();
     let mut bytes = 0u64;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("s3 download body")?;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                return Err(S3Fail::Retryable(anyhow::anyhow!(
+                    "s3 download {key} body: {e:#}"
+                )));
+            }
+        };
         bytes += chunk.len() as u64;
-        file.write_all(&chunk).await.context("write download")?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| S3Fail::Final(anyhow::anyhow!("write download: {e:#}")))?;
     }
-    file.flush().await.context("flush download")?;
+    file.flush()
+        .await
+        .map_err(|e| S3Fail::Final(anyhow::anyhow!("flush download: {e:#}")))?;
     super::stats::count_s3("download", 0, bytes);
     Ok(bytes)
 }
@@ -446,6 +561,9 @@ impl futures::Stream for FileChunks {
 }
 
 /// Stream one file to `key` with its length up front (S3 needs it).
+///
+/// Retried like the download: a full-key PUT is an overwrite, so repeating
+/// one is idempotent.
 async fn s3_put_file(
     cfg: &Config,
     bucket_name: &str,
@@ -453,24 +571,52 @@ async fn s3_put_file(
     src: &Path,
     timeout: Duration,
 ) -> anyhow::Result<u64> {
-    let (handle, creds) = s3_bucket(cfg, bucket_name)?;
+    with_s3_retry("upload", key, || {
+        put_once(cfg, bucket_name, key, src, timeout)
+    })
+    .await
+}
+
+async fn put_once(
+    cfg: &Config,
+    bucket_name: &str,
+    key: &str,
+    src: &Path,
+    timeout: Duration,
+) -> Result<u64, S3Fail> {
+    let (handle, creds) = s3_bucket(cfg, bucket_name).map_err(S3Fail::Final)?;
+    // Opened per attempt: the streaming body consumes the file, so a retry
+    // must re-read it instead of uploading the first attempt's EOF.
     let file = tokio::fs::File::open(src)
         .await
-        .with_context(|| format!("open {}", src.display()))?;
-    let len = file.metadata().await.context("stat upload")?.len();
+        .map_err(|e| S3Fail::Final(anyhow::anyhow!("open {}: {e:#}", src.display())))?;
+    let len = file
+        .metadata()
+        .await
+        .map_err(|e| S3Fail::Final(anyhow::anyhow!("stat upload: {e:#}")))?
+        .len();
     let url = handle
         .put_object(Some(&creds), key)
         .sign(Duration::from_secs(PRESIGN_SECS));
-    let resp = http_client()
+    let resp = match http_client()
         .put(url)
         .header(reqwest::header::CONTENT_LENGTH, len)
         .body(reqwest::Body::wrap_stream(FileChunks { file }))
         .timeout(timeout)
         .send()
         .await
-        .context("s3 PUT")?;
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return Err(S3Fail::Retryable(anyhow::anyhow!(
+                "s3 upload {key} transport: {e:#}"
+            )));
+        }
+    };
     if !resp.status().is_success() {
-        return Err(s3_err("upload", key, resp).await);
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(classify_status("upload", key, status, &body));
     }
     super::stats::count_s3("upload", len, 0);
     Ok(len)
@@ -635,13 +781,29 @@ pub(crate) async fn s3_get_bytes(cfg: &Config, full_key: &str) -> anyhow::Result
 
 /// Paginated native LIST (the CLI returned one 1000-key page; every caller
 /// handles full arrays, so merging pages is strictly more correct).
+///
+/// Retried like the download: a listing reads nothing, so repeating one is
+/// idempotent. A retry restarts from the first page — pages are small and a
+/// partial merge could otherwise duplicate keys.
 async fn s3_list_raw(
     cfg: &Config,
     bucket_name: &str,
     prefix: &str,
     delimiter: Option<&str>,
 ) -> anyhow::Result<(Vec<S3Object>, Vec<String>)> {
-    let (handle, creds) = s3_bucket(cfg, bucket_name)?;
+    with_s3_retry("list", prefix, || {
+        list_once(cfg, bucket_name, prefix, delimiter)
+    })
+    .await
+}
+
+async fn list_once(
+    cfg: &Config,
+    bucket_name: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+) -> Result<(Vec<S3Object>, Vec<String>), S3Fail> {
+    let (handle, creds) = s3_bucket(cfg, bucket_name).map_err(S3Fail::Final)?;
     super::stats::count_s3("list", 0, 0);
     let mut objects = Vec::new();
     let mut prefixes = Vec::new();
@@ -656,18 +818,30 @@ async fn s3_list_raw(
             action.with_continuation_token(t);
         }
         let url = action.sign(Duration::from_secs(300));
-        let resp = http_client()
+        let resp = match http_client()
             .get(url)
             .timeout(Duration::from_secs(20))
             .send()
             .await
-            .context("s3 LIST")?;
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                return Err(S3Fail::Retryable(anyhow::anyhow!(
+                    "s3 list {prefix} transport: {e:#}"
+                )));
+            }
+        };
         if !resp.status().is_success() {
-            return Err(s3_err("list", prefix, resp).await);
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(classify_status("list", prefix, status, &body));
         }
-        let text = resp.text().await.context("s3 LIST body")?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| S3Fail::Final(anyhow::anyhow!("s3 LIST body: {e:#}")))?;
         let parsed = rusty_s3::actions::ListObjectsV2::parse_response(&text)
-            .with_context(|| "s3 LIST XML parse")?;
+            .map_err(|e| S3Fail::Final(anyhow::anyhow!("s3 LIST XML parse: {e:#}")))?;
         objects.extend(parsed.contents.into_iter().map(|o| S3Object {
             key: o.key,
             last_modified: o.last_modified,
@@ -888,5 +1062,82 @@ mod tests {
         assert!(split_uri("https://b/k").is_err());
         assert!(split_uri("s3://b/").is_err());
         assert!(split_uri("s3://b").is_err());
+    }
+
+    fn is_retryable(fail: S3Fail) -> bool {
+        matches!(fail, S3Fail::Retryable(_))
+    }
+
+    /// Only 5xx/SlowDown may be retried: a 4xx comes back identically every
+    /// time, so retrying one just burns three timeouts before failing.
+    #[test]
+    fn retry_covers_5xx_and_slowdown_but_never_4xx() {
+        use reqwest::StatusCode;
+        assert!(is_retryable(classify_status(
+            "download",
+            "k",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable"
+        )));
+        assert!(is_retryable(classify_status(
+            "upload",
+            "k",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ""
+        )));
+        assert!(is_retryable(classify_status(
+            "list",
+            "p",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "<Code>SlowDown</Code>"
+        )));
+        assert!(!is_retryable(classify_status(
+            "download",
+            "missing",
+            StatusCode::NOT_FOUND,
+            "<Code>NoSuchKey</Code>"
+        )));
+        assert!(!is_retryable(classify_status(
+            "upload",
+            "k",
+            StatusCode::FORBIDDEN,
+            "AccessDenied"
+        )));
+        assert!(!is_retryable(classify_status(
+            "list",
+            "p",
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest"
+        )));
+    }
+
+    /// Backoff grows per failure and stays bounded: three attempts cost
+    /// seconds, not minutes, on top of the per-attempt timeout.
+    #[test]
+    fn retry_delay_backs_off_with_jitter() {
+        let first = s3_retry_delay(1);
+        let second = s3_retry_delay(2);
+        assert!(first >= Duration::from_millis(250));
+        assert!(second >= Duration::from_millis(500));
+        assert!(second <= Duration::from_millis(2500));
+    }
+
+    /// A transport failure on a numeric key is unreachable, not missing: the
+    /// old bare-`"404"` arm read `s3 download 404.html failed: HTTP 500` as
+    /// "start fresh" and callers uploaded an empty database over a good one.
+    #[test]
+    fn not_found_ignores_key_names_and_transport_failures() {
+        let missing = anyhow::anyhow!("s3 download tip.bundle failed: HTTP 404 <Code>NoSuchKey</Code>");
+        assert!(is_not_found(&missing));
+        let legacy =
+            anyhow::anyhow!("aws exit 1\nfatal error: An error occurred (404) when calling the HeadObject operation");
+        assert!(is_not_found(&legacy));
+        let numeric_key_on_500 =
+            anyhow::anyhow!("s3 download 404.html failed: HTTP 500 ServiceUnavailable");
+        assert!(!is_not_found(&numeric_key_on_500));
+        let down = anyhow::anyhow!(
+            "s3 download tip.bundle transport: error sending request for url (http://rustfs:9000/noite)"
+        );
+        assert!(!is_not_found(&down));
     }
 }
