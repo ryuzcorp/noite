@@ -50,9 +50,13 @@ const usedKeys = new Set<string>();
  * whenever this key loaded before. Each successful fetch writes the snapshot
  * through. Consumers keep the usual `loading() && data() === undefined`
  * skeleton check — it now only fires on a genuinely cold key. */
-const tracked = <T>(key: string, fetcher: ResourceFetcher<T>): Resource<T> => {
+const tracked = <T>(
+  key: string,
+  fetcher: ResourceFetcher<T>,
+  opts?: { persist?: boolean }
+): Resource<T> => {
   usedKeys.add(key);
-  return trackResource(key, fetcher);
+  return trackResource(key, fetcher, opts);
 };
 
 /** Drop every cached resource and snapshot, and refetch the live ones.
@@ -161,10 +165,13 @@ export const collaborators = (id: string) =>
   );
 
 /** One finished deploy's build log, fetched when its tab opens and cached
- * per deploy id (finished deploys never change). */
+ * per deploy id (finished deploys never change). 64 KB tails stay in memory
+ * only: persisting them would crowd the small sessionStorage quota. */
 export const deployLog = (appId: string, deployId: string) =>
-  tracked(keys.deployLog(appId, deployId), () =>
-    api<{ log: string }>("/api/apps/deployLog", { appId, deployId })
+  tracked(
+    keys.deployLog(appId, deployId),
+    () => api<{ log: string }>("/api/apps/deployLog", { appId, deployId }),
+    { persist: false }
   );
 
 /** Invitations waiting on one app. Admin-only server side, so other roles
@@ -389,10 +396,14 @@ export const r2List = (
     api<R2Preview>("/api/storage/r2List", { appId, bucket, cursor, prefix })
   );
 
-/** One object's bounded text preview (null `text` for a binary body). */
+/** One object's bounded text preview (null `text` for a binary body).
+ * Arbitrary file text stays in memory only: persisting it would crowd the
+ * small sessionStorage quota. */
 export const r2File = (appId: string, bucket: string, key: string) =>
-  tracked(keys.r2File(appId, bucket, key), () =>
-    api<R2File>("/api/storage/r2Get", { appId, bucket, key })
+  tracked(
+    keys.r2File(appId, bucket, key),
+    () => api<R2File>("/api/storage/r2Get", { appId, bucket, key }),
+    { persist: false }
   );
 
 /** One page of the admin home's user list. The key carries the search and
