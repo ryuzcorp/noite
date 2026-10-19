@@ -231,7 +231,7 @@ const TIME_TOKENS = {
 const CAMEL_RE = /(?<lower>[a-z0-9])(?<upper>[A-Z])/gu;
 
 export const isTimestampColumn = (name: string, type: string): boolean => {
-  const snake = name.replace(CAMEL_RE, "$<lower>_$<upper>").toLowerCase();
+  const snake = name.replaceAll(CAMEL_RE, "$<lower>_$<upper>").toLowerCase();
 
   for (const token of snake.split("_")) {
     if (Object.hasOwn(TIME_TOKENS, token)) {
