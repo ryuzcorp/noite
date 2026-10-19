@@ -310,7 +310,11 @@ interface D1DatabaseEntry {
  * to deploy-root-relative `ssr/…`, the asset directory to `client`, and
  * `vars` to `{}` (the runner patches the real vars at deploy time).
  * Local-only `.dev.vars` files are removed from `dist/` and `dist/ssr/` so
- * they never ship inside the bundle (the Dockerfile strips them too).
+ * they never ship inside the bundle (the Dockerfile strips them too), and
+ * Void's Cloudflare-only `dist/client/.assetsignore` is removed: `celld
+ * deploy` refuses it outright, and its two entries need no replacement —
+ * `wrangler.json` is celld's config surface (never an asset) and `.dev.vars`
+ * is removed just above.
  * Last in the plugin list so its `closeBundle` runs after Void's emit; when
  * the SSR bundle hasn't closed yet it does nothing and the SSR close writes. */
 const emitCelldConfig = (): Plugin => ({
@@ -330,6 +334,7 @@ const emitCelldConfig = (): Plugin => ({
         }
       }
     }
+    rmSync(path.join(dist, "client", ".assetsignore"), { force: true });
     let emitted: string;
     try {
       emitted = readFileSync(path.join(dist, "ssr", "wrangler.json"), "utf-8");
