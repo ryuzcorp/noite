@@ -103,6 +103,13 @@ test("uploading and deleting round-trips through the Worker", async ({
   // Enter it and upload a file whose key contains that space.
   await page.getByRole("link", { name: "my docs" }).click();
   await expect(page).toHaveURL(/p=my%20docs%2F/u);
+  // The folder view remounts keyed by prefix a tick after the URL flips: wait
+  // for its own empty state, or the upload below fires on the still-mounted
+  // root view's input (whose prefix is "") and the object lands outside the
+  // folder.
+  await expect(
+    page.getByText("This folder is empty — upload a file into it.")
+  ).toBeVisible();
   await page
     .locator('input[type="file"]')
     .first()
