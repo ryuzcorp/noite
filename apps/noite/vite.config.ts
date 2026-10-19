@@ -356,12 +356,14 @@ const emitCelldConfig = (): Plugin => ({
       }
     }
     config["main"] = `ssr/${ssrMain}`;
-    // celld reads `run_worker_first` only as a boolean, but Void's build
-    // forces the pattern-array form whenever routing rules exist (ours do:
-    // the isolation headers). Coerce it here — this file is celld's config
-    // surface only; `dist/ssr/wrangler.json` keeps Void's own form. Without
-    // worker-first, celld serves every existing static file itself and the
-    // worker (with the pod-host gate) never sees it.
+    // Boolean `true`: the same form `cloudflare.config.ts` used on main (the
+    // lane-green shape), kept because Void's build forces the pattern-array
+    // form whenever routing rules exist (ours do: the isolation headers).
+    // This file is celld's config surface only; `dist/ssr/wrangler.json`
+    // keeps Void's own form. (The control-origin 404 for pod assets is not
+    // enforced here — Void's generated entry retries an app 404 against
+    // `ASSETS`, so the worker gate's 404 becomes the file's 200 — but at the
+    // edge, by the runner's Caddyfile; see `apps/runner/src/host/caddy.rs`.)
     config["assets"] = {
       ...ssrAssets,
       directory: "client",

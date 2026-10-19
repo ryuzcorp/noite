@@ -8,6 +8,14 @@
  * (What `src/http/routes/nodepod.ts` decided from the route table before the
  * Void routes slice; a middleware owns it now because `__sw__.js`-style
  * paths start with `_` and Void never scans those as routes.)
+ *
+ * Defense in depth, not the enforcement: Void's generated worker entry wraps
+ * every app response in `createAssetFallback`, which retries an app 404
+ * against `env.ASSETS` — so this gate's 404 still answers the static file's
+ * 200. The control-host 404 the edge spec asserts is enforced one layer out,
+ * by the runner's Caddyfile (`CONTROL_DENIED_ASSETS` in
+ * `apps/runner/src/host/caddy.rs`), which answers those paths before
+ * proxying. This gate still matters for direct-to-worker access.
  */
 import { defineMiddleware } from "void";
 
