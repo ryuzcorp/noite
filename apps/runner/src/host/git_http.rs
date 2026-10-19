@@ -961,7 +961,7 @@ pub async fn receive_pack(
     // `remote:` line, where the client already looks for push feedback.
     let mut out = out;
     if first_main_push && wants_sideband(&body) {
-        let url = app_url(&state.config, &app.subdomain);
+        let url = state.config.public_app_url(&app.subdomain);
         out = with_notes(out, &[format!("noite: {url}")]);
     }
     (
@@ -1006,24 +1006,35 @@ fn with_notes(out: Vec<u8>, notes: &[String]) -> Vec<u8> {
     merged
 }
 
-/// Browser URL of an app from its stored subdomain: the public git base carries
-/// the scheme and (dev) the port, the subdomain the host — dev
-/// `http://git.localhost:9080` → `http://my-app.localhost:9080`.
-fn app_url(cfg: &Config, subdomain: &str) -> String {
-    let base = cfg.git_public_base.trim_end_matches('/');
-    let Some((scheme, rest)) = base.split_once("://") else {
-        return format!("https://{subdomain}");
-    };
-    let authority = rest.split('/').next().unwrap_or_default();
-    match authority.split_once(':') {
-        Some((_, port)) if !port.is_empty() => format!("{scheme}://{subdomain}:{port}"),
-        _ => format!("{scheme}://{subdomain}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_push_note_links_the_public_edge_url() {
+        // The note must name the edge tenants serve on — never the runner
+        // API's raw port, even when the git remote points straight at it.
+        let mut cfg = crate::config::config_for_tests();
+        cfg.base_domain = "noite.localhost".into();
+        cfg.git_public_base = "http://localhost:8080/v1/git".into();
+        assert_eq!(
+            cfg.public_app_url("blog.noite.localhost"),
+            "http://blog.noite.localhost:9080"
+        );
+        cfg.base_domain = "noite.now".into();
+        cfg.auto_https = true;
+        cfg.https_port = 443;
+        assert_eq!(
+            cfg.public_app_url("blog.noite.now"),
+            "https://blog.noite.now"
+        );
+        cfg.auto_https = false;
+        cfg.http_port = 80;
+        assert_eq!(
+            cfg.public_app_url("blog.noite.now"),
+            "http://blog.noite.now"
+        );
+    }
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("noite-git-http-{tag}-{}", std::process::id()));
@@ -1045,20 +1056,6 @@ mod tests {
         // callers, but the helper itself must not need an empty directory.
         init_bare(&repo).await.expect("re-init");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn app_url_keeps_the_public_scheme_and_port() {
-        let mut cfg = crate::config::config_for_tests();
-        cfg.git_public_base = "http://git.localhost:9080".into();
-        assert_eq!(
-            app_url(&cfg, "blog.localhost"),
-            "http://blog.localhost:9080"
-        );
-        cfg.git_public_base = "https://git.noite.now".into();
-        assert_eq!(app_url(&cfg, "blog.noite.now"), "https://blog.noite.now");
-        cfg.git_public_base = "https://git.noite.now/".into();
-        assert_eq!(app_url(&cfg, "blog.noite.now"), "https://blog.noite.now");
     }
 
     /// The first-push note is a sideband packet before the flush (after it the

@@ -123,9 +123,9 @@ const sha10 = (sha: string): string => sha.slice(0, 10);
 const iso = (unixSeconds: number): string =>
   new Date(unixSeconds * 1000).toISOString();
 
-/** The public URL of an app: the runner derives it from the git base's scheme
- * and port plus the app's own subdomain (`app_url` in the runner), so the
- * remote the API hands over carries both. */
+/** The public URL of an app: edge scheme and port from the git remote the API
+ * hands over, plus the app's own subdomain (same rule as the runner's
+ * `public_app_url`). */
 const appUrl = (remoteUrl: string, subdomain: string): string => {
   const parsed = new URL(remoteUrl);
   const port = parsed.port === "" ? "" : `:${parsed.port}`;
