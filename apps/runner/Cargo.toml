@@ -10,37 +10,37 @@ axum-jrpc = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", features = [
+sqlx = { version = "0.9", features = [
   "runtime-tokio",
   "sqlite",
   "chrono",
   "uuid",
 ] }
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
-reqwest = { version = "0.12", default-features = false, features = [
+reqwest = { version = "0.13", default-features = false, features = [
   "json",
-  "rustls-tls",
+  "rustls",
   "stream",
 ] }
-hmac = "0.12"
+hmac = "0.13"
 anyhow = "1"
 libc = "0.2"
-aes-gcm = { version = "0.10", features = ["std"] }
-hkdf = "0.12"
-sha2 = "0.10"
-rand = "0.8"
+aes-gcm = "0.11"
+hkdf = "0.13"
+sha2 = "0.11"
+rand = "0.10"
 thiserror = "2"
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 bytes = "1"
-constant_time_eq = "0.3"
+constant_time_eq = "0.6"
 regex = "1"
-base64 = "0.22"
-zstd = "0.13"
+base64 = "0.23"
+zstd = "0.14"
 rusty-s3 = "0.10.2"
 # Generates the TypeScript bindings the UI consumes (apps/noite/src/lib/runner-types)
 # from the structs that cross the JSON boundary. `no-serde-warnings` silences

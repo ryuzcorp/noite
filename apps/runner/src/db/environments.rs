@@ -87,7 +87,7 @@ pub async fn get_environment(pool: &SqlitePool, id: &str) -> sqlx::Result<Option
     let sql = format!(
         "SELECT {ENV_COLS} FROM environment e JOIN app a ON a.id = e.app_id WHERE e.id = ?"
     );
-    sqlx::query_as::<_, Environment>(&sql)
+    sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql))
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -102,7 +102,7 @@ pub async fn get_environment_by_label(
         "SELECT {ENV_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
          WHERE e.app_id = ? AND e.label = ?"
     );
-    sqlx::query_as::<_, Environment>(&sql)
+    sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql))
         .bind(app_id)
         .bind(label)
         .fetch_optional(pool)
@@ -120,7 +120,7 @@ pub async fn get_environment_by_ref(
         "SELECT {ENV_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
          WHERE e.app_id = ? AND e.git_ref = ?"
     );
-    sqlx::query_as::<_, Environment>(&sql)
+    sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql))
         .bind(app_id)
         .bind(git_ref)
         .fetch_optional(pool)
@@ -132,7 +132,7 @@ pub async fn list_environments(pool: &SqlitePool, app_id: &str) -> sqlx::Result<
         "SELECT {ENV_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
          WHERE e.app_id = ? ORDER BY e.created_at DESC"
     );
-    sqlx::query_as::<_, Environment>(&sql)
+    sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql))
         .bind(app_id)
         .fetch_all(pool)
         .await
@@ -145,7 +145,7 @@ pub async fn list_all_environments(pool: &SqlitePool) -> sqlx::Result<Vec<Enviro
         "SELECT {ENV_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
          ORDER BY e.created_at ASC"
     );
-    sqlx::query_as::<_, Environment>(&sql).fetch_all(pool).await
+    sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql)).fetch_all(pool).await
 }
 
 /// Every environment the edge should route (the Caddyfile writer and the TLS
@@ -154,7 +154,7 @@ pub async fn list_environment_routes(pool: &SqlitePool) -> sqlx::Result<Vec<Envi
     let sql = format!(
         "SELECT {ROUTE_COLS} FROM environment e JOIN app a ON a.id = e.app_id ORDER BY e.label"
     );
-    sqlx::query_as::<_, EnvironmentRoute>(&sql)
+    sqlx::query_as::<_, EnvironmentRoute>(sqlx::AssertSqlSafe(sql))
         .fetch_all(pool)
         .await
 }
@@ -170,7 +170,7 @@ pub async fn environment_route(
         "SELECT {ROUTE_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
          WHERE a.slug = ? AND e.label = ?"
     );
-    sqlx::query_as::<_, EnvironmentRoute>(&sql)
+    sqlx::query_as::<_, EnvironmentRoute>(sqlx::AssertSqlSafe(sql))
         .bind(slug)
         .bind(label)
         .fetch_optional(pool)
@@ -311,7 +311,7 @@ pub async fn expired_workspace_environments(
            AND coalesce(e.last_deployed_at, e.created_at) < ? \
          ORDER BY e.created_at ASC"
     );
-    sqlx::query_as::<_, Environment>(&sql)
+    sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql))
         .bind(older_than_iso)
         .fetch_all(pool)
         .await

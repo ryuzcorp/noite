@@ -63,17 +63,17 @@ pub async fn set_app_import_source(
 
 pub async fn list_apps(pool: &SqlitePool) -> sqlx::Result<Vec<App>> {
     let sql = format!("SELECT {APP_COLS} FROM app ORDER BY created_at DESC");
-    sqlx::query_as::<_, App>(&sql).fetch_all(pool).await
+    sqlx::query_as::<_, App>(sqlx::AssertSqlSafe(sql)).fetch_all(pool).await
 }
 
 pub async fn list_all_apps(pool: &SqlitePool) -> sqlx::Result<Vec<App>> {
     let sql = format!("SELECT {APP_COLS} FROM app ORDER BY created_at ASC");
-    sqlx::query_as::<_, App>(&sql).fetch_all(pool).await
+    sqlx::query_as::<_, App>(sqlx::AssertSqlSafe(sql)).fetch_all(pool).await
 }
 
 pub async fn get_app(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<App>> {
     let sql = format!("SELECT {APP_COLS} FROM app WHERE id = ?");
-    sqlx::query_as::<_, App>(&sql)
+    sqlx::query_as::<_, App>(sqlx::AssertSqlSafe(sql))
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -81,7 +81,7 @@ pub async fn get_app(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<App>> {
 
 pub async fn get_app_by_slug(pool: &SqlitePool, slug: &str) -> sqlx::Result<Option<App>> {
     let sql = format!("SELECT {APP_COLS} FROM app WHERE slug = ?");
-    sqlx::query_as::<_, App>(&sql)
+    sqlx::query_as::<_, App>(sqlx::AssertSqlSafe(sql))
         .bind(slug)
         .fetch_optional(pool)
         .await
@@ -111,7 +111,7 @@ pub async fn get_app_by_domain(pool: &SqlitePool, hostname: &str) -> sqlx::Resul
     let sql = format!(
         "SELECT {APP_COLS} FROM app WHERE id = (SELECT app_id FROM app_domain WHERE hostname = ?)"
     );
-    sqlx::query_as::<_, App>(&sql)
+    sqlx::query_as::<_, App>(sqlx::AssertSqlSafe(sql))
         .bind(hostname)
         .fetch_optional(pool)
         .await
