@@ -58,9 +58,12 @@ pick_tar_image() {
 }
 
 # remove_project <project>...: remove a compose project's containers and named
-# volumes by filter. Needed because podman-compose's `down -v` aborts on the
-# first missing container and then leaves containers and volumes behind (a
-# stale bucket still holds the last run's accounts).
+# volumes. Needed because podman-compose's `down -v` aborts on the first
+# missing container and then leaves containers and volumes behind (a stale
+# bucket still holds the last run's accounts). Volumes are matched in-shell:
+# the engine `name=` filter is a substring match on docker (so `^noite_`
+# matches nothing there) and a regex on podman — anchoring with grep behaves
+# the same on both.
 remove_project() {
   for p in "$@"; do
     for k in com.docker.compose.project io.podman.compose.project; do
@@ -68,7 +71,7 @@ remove_project() {
       # shellcheck disable=SC2086
       [ -z "$ids" ] || "$CLI" rm -f $ids >/dev/null
     done
-    vols="$("$CLI" volume ls -q --filter "name=^${p}_" 2>/dev/null || true)"
+    vols="$("$CLI" volume ls -q 2>/dev/null | grep "^${p}_" || true)"
     # shellcheck disable=SC2086
     [ -z "$vols" ] || "$CLI" volume rm -f $vols >/dev/null
   done
