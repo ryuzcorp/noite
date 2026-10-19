@@ -37,7 +37,9 @@ services:
       # Unset = on except a `localhost` base; `off` behind a terminating proxy.
       CADDY_AUTO_HTTPS: ${CADDY_AUTO_HTTPS:-}
       HTTP_PORT: ${HTTP_PORT:-9080}
-      GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-http://git.noite.localhost:${HTTP_PORT:-9080}}
+      # Derived from BASE_DOMAIN (same rule as BETTER_AUTH_URL below), so a
+      # custom base needs no override; an explicit GIT_PUBLIC_BASE still wins.
+      GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-http://git.${BASE_DOMAIN:-noite.localhost}:${HTTP_PORT:-9080}}
       RUNNER_TOKEN: ${RUNNER_TOKEN:-dev-runner-token}
       # Object store (bundled RustFS by default).
       S3_ENDPOINT: ${S3_ENDPOINT:-http://rustfs:9000}
@@ -48,8 +50,11 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-${RUSTFS_SECRET_KEY:-noitesecretnoitesecretnoite12}}
       AWS_EC2_METADATA_DISABLED: "true"
       # Control UI (passed to the worker by the runner). Passkeys bind to
-      # BETTER_AUTH_URL: set it before anyone registers.
-      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://noite.localhost:${HTTP_PORT:-9080}}
+      # BETTER_AUTH_URL: set it before anyone registers. The default derives
+      # from BASE_DOMAIN, so a LAN base for `make dev-host` (or any custom
+      # domain) boots with no overrides; prod installs get an explicit https
+      # URL from install.sh, and an explicit value here still wins.
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://${BASE_DOMAIN:-noite.localhost}:${HTTP_PORT:-9080}}
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-dev-only-change-me-to-a-long-random-string}
       NOITE_ADMIN_EMAIL: ${NOITE_ADMIN_EMAIL:-}
       NOITE_EMAIL_WEBHOOK_URL: ${NOITE_EMAIL_WEBHOOK_URL:-}
