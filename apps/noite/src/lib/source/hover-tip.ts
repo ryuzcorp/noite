@@ -66,12 +66,14 @@ const loadHighlighter = async (): Promise<TipHighlighter> => {
     import("@pierre/highlights/themes/pierre-dark"),
     import("@pierre/highlights/themes/pierre-light"),
   ]);
+
   return {
     codeToTokens: highlights.codeToTokens,
     isSupportedLanguage: highlights.isSupportedLanguage,
     themes: { dark: dark.default, light: light.default },
   };
 };
+
 let highlighterLoad: Promise<TipHighlighter> | undefined;
 
 /** `code` as one span per token, colored through pierre's variables; plain
@@ -81,6 +83,7 @@ const highlightInto = async (
   { code, lang }: TipContent
 ): Promise<void> => {
   let lines: ThemedToken[][];
+
   try {
     highlighterLoad ??= loadHighlighter();
     const highlighter = await highlighterLoad;
@@ -93,18 +96,23 @@ const highlightInto = async (
   } catch {
     highlighterLoad = undefined;
     el.textContent = code;
+
     return;
   }
+
   for (const [index, line] of lines.entries()) {
     if (index > 0) {
       el.append("\n");
     }
+
     for (const token of line) {
       const span = document.createElement("span");
       span.textContent = token.content;
+
       for (const [name, value] of Object.entries(token.htmlStyle ?? {})) {
         span.style.setProperty(name, value);
       }
+
       el.append(span);
     }
   }
@@ -122,25 +130,31 @@ export const createHoverTip = (pane: HTMLElement): HoverTip => {
   // lands must not open.
   let generation = 0;
   let hideTimer: number | undefined;
+
   const cancelHide = () => {
     clearTimeout(hideTimer);
     hideTimer = undefined;
   };
+
   const hide = () => {
     cancelHide();
     generation += 1;
     tip.hidden = true;
   };
+
   const leave = () => {
     // A show still highlighting for the token just left must not open.
     generation += 1;
     cancelHide();
+
     if (!tip.hidden) {
       hideTimer = window.setTimeout(hide, HIDE_GRACE);
     }
   };
+
   tip.addEventListener("pointerenter", cancelHide);
   tip.addEventListener("pointerleave", leave);
+
   return {
     dispose: () => {
       // The pane (and its shadow root) outlives this wiring, so the node has
@@ -155,37 +169,44 @@ export const createHoverTip = (pane: HTMLElement): HoverTip => {
       generation += 1;
       const mine = generation;
       const body = document.createElement("div");
+
       if (content.header) {
         const head = document.createElement("div");
         head.className = "intel-head";
         head.textContent = content.header;
         body.append(head);
       }
+
       if (content.code !== "") {
         const code = document.createElement("div");
         code.className = "intel-code";
         await highlightInto(code, content);
         body.append(code);
       }
+
       if (content.docs.length > 0) {
         const docs = document.createElement("div");
         docs.className = "intel-docs";
         docs.textContent = content.docs.join("\n");
         body.append(docs);
       }
+
       if (content.errors.length > 0) {
         const errors = document.createElement("div");
         errors.className = "intel-errors";
         errors.textContent = content.errors.join("\n");
         body.append(errors);
       }
+
       if (mine !== generation || !anchor.isConnected) {
         return;
       }
+
       tip.replaceChildren(...body.childNodes);
       tip.hidden = false;
       const paneBox = pane.getBoundingClientRect();
       const anchorBox = anchor.getBoundingClientRect();
+
       // Clamp into the pane: the tip must not introduce horizontal scroll.
       const left = Math.max(
         0,
@@ -194,6 +215,7 @@ export const createHoverTip = (pane: HTMLElement): HoverTip => {
           pane.clientWidth - tip.offsetWidth - 8
         )
       );
+
       tip.style.left = `${left}px`;
       tip.style.top = `${anchorBox.bottom - paneBox.top + 4}px`;
     },

@@ -20,6 +20,7 @@ const DeleteFileButton = ({
   onDelete: () => void;
 }) => {
   const confirming = atom(false);
+
   if (!confirming()) {
     return (
       <button
@@ -34,6 +35,7 @@ const DeleteFileButton = ({
       </button>
     );
   }
+
   return (
     <span class="flex items-center gap-2">
       <span class="text-error text-sm">Delete this file?</span>
@@ -76,6 +78,7 @@ export const R2DetailPanel = ({
 }) => {
   const url = r2DownloadUrl(appId, bucket, object.key);
   const kind = previewKind(object.contentType);
+
   return (
     <DetailPanel title={object.name}>
       {kind === "image" ? (

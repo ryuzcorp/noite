@@ -41,9 +41,11 @@ test.afterAll(async ({ request }) => {
  * so the app has a real ref that is not the default branch. */
 const pushBranch = (apiKey: string, source: URL, slug: string): void => {
   const dir = mkdtempSync(nodePath.join(tmpdir(), `noite-${slug}-branch-`));
+
   try {
     cpSync(source, dir, { recursive: true });
     rmSync(nodePath.join(dir, ".git"), { force: true, recursive: true });
+
     const git = (args: string[]) =>
       execFileSync("git", args, {
         cwd: dir,
@@ -56,6 +58,7 @@ const pushBranch = (apiKey: string, source: URL, slug: string): void => {
           GIT_COMMITTER_NAME: E2E_NAME,
         },
       });
+
     git(["init", "-b", "main"]);
     git([
       "remote",
@@ -76,10 +79,12 @@ test("a branch becomes an environment and Code mode frames it", async ({
   request,
 }) => {
   createdApps.push(SLUG);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Environments",
     slug: SLUG,
   });
+
   pushAppDir(apiKey, SAMPLE, SLUG);
   pushBranch(apiKey, SAMPLE, SLUG);
 

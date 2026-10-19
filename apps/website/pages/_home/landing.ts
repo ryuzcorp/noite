@@ -11,8 +11,10 @@ const initCopyButtons = (): void => {
     button.addEventListener("click", async () => {
       const text = button.dataset.copy ?? "";
       const label = button.querySelector("[data-copy-label]");
+
       try {
         await navigator.clipboard.writeText(text);
+
         if (label) {
           label.textContent = "Copied";
           setTimeout(() => {
@@ -29,14 +31,17 @@ const initCopyButtons = (): void => {
 
 const initChapters = (): void => {
   const video = document.querySelector<HTMLVideoElement>("[data-tour-video]");
+
   if (!video) {
     return;
   }
+
   for (const button of document.querySelectorAll<HTMLButtonElement>(
     "[data-chapter]"
   )) {
     button.addEventListener("click", async () => {
       video.currentTime = Number(button.dataset.chapter ?? 0);
+
       try {
         await video.play();
       } catch {
@@ -50,6 +55,7 @@ document.addEventListener("astro:page-load", () => {
   if (!document.querySelector("[data-landing]")) {
     return;
   }
+
   initCopyButtons();
   initChapters();
 });

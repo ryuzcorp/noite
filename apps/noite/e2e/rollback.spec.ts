@@ -15,6 +15,7 @@ import {
 } from "./helpers";
 
 const SLUG = "rollback";
+
 // What `/files/test.txt` serves. The sample source spells the trailing
 // newline as a `\n` escape, so the source is matched on the text before it.
 const V1_MARKER = "hello from noite test app\n";
@@ -40,9 +41,11 @@ const pushMarkerRevision = (apiKey: string, marker: string): string =>
   pushAppDir(apiKey, new URL("../test", import.meta.url), SLUG, (dir) => {
     const file = nodePath.join(dir, "index.ts");
     const before = readFileSync(file, "utf-8");
+
     if (!before.includes(sourceText(V1_MARKER))) {
       throw new Error("the R2 probe text moved; update the marker");
     }
+
     const after = before.replace(sourceText(V1_MARKER), sourceText(marker));
     writeFileSync(file, after);
   });
@@ -54,13 +57,17 @@ const readMarker = async (
 ): Promise<string> => {
   const base = `http://localhost:${port}`;
   const stored = await request.get(`${base}/upload-test-txt`);
+
   if (!stored.ok()) {
     throw new Error(`probe write ${stored.status()} ${await stored.text()}`);
   }
+
   const res = await request.get(`${base}/files/test.txt`);
+
   if (!res.ok()) {
     throw new Error(`probe read ${res.status()} ${await res.text()}`);
   }
+
   return res.text();
 };
 
@@ -69,6 +76,7 @@ const readMarker = async (
 // revision serves again.
 test("rollback restores the earlier deploy", async ({ page, request }) => {
   createdApps.push(SLUG);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Rollback",
     slug: SLUG,
@@ -91,6 +99,7 @@ test("rollback restores the earlier deploy", async ({ page, request }) => {
     body: { sha: sha1 },
     method: "POST",
   });
+
   expect(rolled.status).toBe(200);
   expect(JSON.stringify(rolled.body)).toContain(sha1);
 

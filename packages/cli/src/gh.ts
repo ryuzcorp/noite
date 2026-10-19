@@ -27,9 +27,11 @@ const GhApiComments = Schema.Array(
 
 const nonEmpty = (value: string | undefined): string | null =>
   value !== undefined && value !== "" ? value : null;
+
 export const readActionContext = (): Effect.Effect<ActionContext, never> =>
   Effect.gen(function* run() {
     const { env } = process;
+
     if (env.GITHUB_ACTIONS !== "true") {
       return {
         isActions: false,
@@ -41,12 +43,15 @@ export const readActionContext = (): Effect.Effect<ActionContext, never> =>
         sha: null,
       } satisfies ActionContext;
     }
+
     let prNumber: number | null = null;
     const eventPath = env.GITHUB_EVENT_PATH;
+
     if (eventPath !== undefined && eventPath !== "") {
       const eventText = yield* Effect.promise(() =>
         readFile(eventPath, "utf-8").catch(() => null)
       );
+
       if (eventText !== null) {
         try {
           prNumber =
@@ -57,6 +62,7 @@ export const readActionContext = (): Effect.Effect<ActionContext, never> =>
         }
       }
     }
+
     return {
       isActions: true,
       outputFile: nonEmpty(env.GITHUB_OUTPUT),
@@ -112,9 +118,11 @@ export const commentPr = (args: {
     if (args.mode === "off" || args.repo === null || args.prNumber === null) {
       return;
     }
+
     const fullBody = `${args.body}\n\n${COMMENT_MARKER}`;
     // SAFETY: the early return above guarantees repo is a non-null string here.
     const repo = args.repo as string;
+
     const comment = [
       "pr",
       "comment",
@@ -124,20 +132,26 @@ export const commentPr = (args: {
       "--body",
       fullBody,
     ];
+
     yield* Effect.gen(function* post() {
       if (args.mode === "create") {
         yield* runProc("gh", comment);
+
         return;
       }
+
       const listed = yield* runProc("gh", [
         "api",
         `repos/${repo}/issues/${args.prNumber}/comments`,
         "--paginate",
       ]);
+
       if (listed.code !== 0) {
         return yield* Effect.fail(new Error("listing PR comments failed"));
       }
+
       let comments: readonly GhComment[];
+
       try {
         comments = Schema.decodeUnknownSync(GhApiComments)(
           JSON.parse(listed.stdout)
@@ -147,6 +161,7 @@ export const commentPr = (args: {
           new Error("listing PR comments returned invalid JSON")
         );
       }
+
       const existing = comments.find((c) => c.body.includes(COMMENT_MARKER));
       yield* runProc(
         "gh",

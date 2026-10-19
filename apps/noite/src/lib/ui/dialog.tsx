@@ -27,24 +27,30 @@ export const Dialog = ({
   // every re-render, so resolve the connected element at use (live-ref.ts).
   // atom.lazy keeps the holder across re-renders (a body `let` would not).
   const box = atom.lazy(newLiveRef<HTMLDialogElement>)();
+
   const sync = (want: boolean) => {
     const dlg = liveEl(box);
+
     if (!dlg) {
       return;
     }
+
     if (want && !dlg.open) {
       dlg.showModal();
     } else if (!want && dlg.open) {
       dlg.close();
     }
   };
+
   watch(open, (v) => {
     sync(v);
   });
+
   return (
     <dialog
       ref={(el) => {
         collectRef(box, el);
+
         // Already open at mount (e.g. a drawer that mounts visible): the
         // ref runs before insertion, so open on the next frame, once live.
         if (el && open()) {

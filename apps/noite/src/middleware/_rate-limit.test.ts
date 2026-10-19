@@ -25,11 +25,13 @@ describe("rate-limit middleware", () => {
   test("rotating the client-supplied X-Forwarded-For prefix does not dodge it", async () => {
     const env = { NOITE_RATE_LIMIT_RPM: "2" };
     const statuses: (number | undefined)[] = [];
+
     for (const spoofed of ["1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"]) {
       // oxlint-disable-next-line eslint/no-await-in-loop -- sequential: the limiter counts in order
       const res = await limited(spoofed, env);
       statuses.push(res?.status);
     }
+
     // The first two pass through (undefined = downstream ran); the rest 429.
     expect(statuses.slice(0, 2)).toEqual([undefined, undefined]);
     expect(statuses.slice(2)).toEqual([429, 429]);
@@ -47,6 +49,7 @@ describe("rate-limit middleware", () => {
 
   test("leaves unlimited paths alone", async () => {
     let nextCalls = 0;
+
     const result = await rateLimit(
       testRouteContext(
         new Request("http://localhost/health"),
@@ -55,9 +58,11 @@ describe("rate-limit middleware", () => {
       ),
       () => {
         nextCalls += 1;
+
         return Promise.resolve();
       }
     );
+
     expect(nextCalls).toBe(1);
     expect(result).toBeUndefined();
   });

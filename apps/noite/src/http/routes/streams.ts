@@ -28,31 +28,40 @@ const proxyRunnerStream = async (
   upstreamPath: (appId: string) => string
 ): Promise<Response> => {
   const appId = params?.appId?.trim() ?? "";
+
   if (!appId) {
     return new Response("app required", { status: 400 });
   }
+
   await ensureDbPromise();
+
   if (appId === CONTROL_APP_ID) {
     // The control plane's own telemetry: instance admin, never impersonating.
     const refusal = await controlStreamRefusal(request, env);
+
     if (refusal) {
       return refusal;
     }
   } else {
     const userId = await routeUserId(request, env);
+
     if (!userId) {
       return new Response("Sign in required", { status: 401 });
     }
+
     try {
       await requireAppRole(appId, userId, "view");
     } catch {
       return new Response("forbidden", { status: 403 });
     }
   }
+
   const rc = runnerConfig(env);
+
   if (!rc) {
     return new Response("RUNNER_TOKEN is not configured", { status: 500 });
   }
+
   const upstream = await fetch(
     `${rc.runner}${upstreamPath(encodeURIComponent(appId))}`,
     {
@@ -63,14 +72,18 @@ const proxyRunnerStream = async (
       signal: request.signal,
     }
   );
+
   if (!upstream.ok || !upstream.body) {
     const text = await upstream.text().catch(() => upstream.statusText);
+
     return new Response(text, { status: upstream.status });
   }
+
   const headers = new Headers();
   headers.set("content-type", "text/event-stream");
   headers.set("cache-control", "no-cache");
   headers.set("connection", "keep-alive");
+
   return new Response(upstream.body, { headers, status: upstream.status });
 };
 
@@ -79,6 +92,7 @@ const proxyRunnerStream = async (
 export const handleLogsStream: RouteHandler = (request, env, params) => {
   const environmentId =
     new URL(request.url).searchParams.get("environmentId") ?? "";
+
   return proxyRunnerStream(
     request,
     env,
@@ -107,14 +121,18 @@ const APPS_STREAM_POLL_MS = 10_000;
 export const handleAppsStream: RouteHandler = async (request, env) => {
   await ensureDbPromise();
   const userId = await routeUserId(request, env);
+
   if (!userId) {
     return new Response("Sign in required", { status: 401 });
   }
+
   return eventStream(
     async (stream) => {
       let last = "";
+
       while (!request.signal.aborted) {
         let json: string | null = null;
+
         try {
           // oxlint-disable-next-line eslint/no-await-in-loop -- one poll per cycle; parallel polls would race change detection
           const apps = await listAppsForCollaborator(userId);
@@ -125,6 +143,7 @@ export const handleAppsStream: RouteHandler = async (request, env) => {
           // ~60 s idle-stream expiry between polls.
           console.error("apps stream poll failed", error);
         }
+
         if (json !== null && json !== last) {
           last = json;
           // A string payload goes out raw, so the frame keeps the exact
@@ -132,6 +151,7 @@ export const handleAppsStream: RouteHandler = async (request, env) => {
           // oxlint-disable-next-line eslint/no-await-in-loop -- one send per cycle, in poll order
           await stream.send({ data: json });
         }
+
         // oxlint-disable-next-line eslint/no-await-in-loop -- sequential abortable sleep between polls
         await sleepUnlessAborted(APPS_STREAM_POLL_MS, request.signal);
       }
@@ -152,6 +172,7 @@ const METRICS_WINDOWS_HOURS = [24, 168, 720] as const;
 /** `?hours=` → one of {@link METRICS_WINDOWS_HOURS}. */
 export const metricsWindowHours = (request: Request): number => {
   const asked = Number(new URL(request.url).searchParams.get("hours"));
+
   return METRICS_WINDOWS_HOURS.find((hours) => hours === asked) ?? 24;
 };
 
@@ -162,12 +183,15 @@ const pollMetricsVersion = async (
   auth: { authorization: string }
 ): Promise<number> => {
   const vRes = await fetch(`${base}/metrics/version`, { headers: auth });
+
   if (!vRes.ok) {
     return Number.NaN;
   }
+
   const vJson: unknown = await vRes.json();
   // SAFETY: cast validates at the fetch boundary; missing/non-numeric coerces to NaN.
   const record = vJson as { version?: string | number | null } | null;
+
   return Number(record?.version);
 };
 
@@ -183,6 +207,7 @@ const pollMetricsFrame = async (
   lastTotal: number
 ): Promise<{ frame: string; total: number } | null> => {
   const { auth, base, windowQuery } = poll;
+
   const [mRes, sRes, dRes, pRes, rRes] = await Promise.all([
     fetch(`${base}/metrics?${windowQuery}`, { headers: auth }),
     fetch(`${base}/spans?${windowQuery}`, { headers: auth }),
@@ -190,11 +215,13 @@ const pollMetricsFrame = async (
     fetch(`${base}/paths?${windowQuery}`, { headers: auth }),
     fetch(`${base}/refs?${windowQuery}`, { headers: auth }),
   ]);
+
   if (!mRes.ok || !sRes.ok || !dRes.ok || !pRes.ok || !rRes.ok) {
     throw new Error(
       `runner metrics ${mRes.status}/${sRes.status}/${dRes.status}/${pRes.status}/${rRes.status}`
     );
   }
+
   const [mJson, sJson, dJson, pJson, rJson]: unknown[] = await Promise.all([
     mRes.json(),
     sRes.json(),
@@ -202,6 +229,7 @@ const pollMetricsFrame = async (
     pRes.json(),
     rRes.json(),
   ]);
+
   if (
     !Array.isArray(mJson) ||
     !Array.isArray(sJson) ||
@@ -211,6 +239,7 @@ const pollMetricsFrame = async (
   ) {
     throw new TypeError("runner metrics sent invalid data");
   }
+
   // SAFETY: mJson passed Array.isArray above; rows match the retired unary action shape.
   const metrics = mJson as RunnerMetric[];
   // SAFETY: sJson passed Array.isArray above; entries flow only into the SSE frame.
@@ -222,9 +251,11 @@ const pollMetricsFrame = async (
   // SAFETY: rJson passed Array.isArray above; entries flow only into the SSE frame.
   const refs = rJson as RunnerRef[];
   const total = metrics.reduce((a, r) => a + r.requests, 0);
+
   if (total === lastTotal) {
     return null;
   }
+
   return {
     frame: JSON.stringify({ devices, metrics, paths, refs, spans }),
     total,
@@ -254,8 +285,10 @@ export const streamMetrics = async (
   const { auth, base, sink, pollMs, signal, windowQuery } = options;
   let lastReq = -1;
   let lastVersion: number | null = null;
+
   while (!signal.aborted) {
     let frame: string | null = null;
+
     try {
       // Cheap change check (spec T3.6): the runner bumps the per-app
       // version on every ingest with new rows. When it hasn't moved,
@@ -263,19 +296,23 @@ export const streamMetrics = async (
       // the sleep below (a bare `continue` here would spin the loop).
       // oxlint-disable-next-line eslint/no-await-in-loop -- one sequential cycle per loop by design
       const v = await pollMetricsVersion(base, auth);
+
       const unchanged =
         !Number.isNaN(v) && lastVersion !== null && v === lastVersion;
+
       if (!unchanged) {
         // oxlint-disable-next-line eslint/no-await-in-loop -- one sequential cycle per loop by design
         const polled = await pollMetricsFrame(
           { auth, base, windowQuery },
           lastReq
         );
+
         // Remember the version only once its poll succeeded, so a failed
         // poll is retried next cycle instead of being skipped as "seen".
         if (!Number.isNaN(v)) {
           lastVersion = v;
         }
+
         if (polled !== null) {
           const { frame: nextFrame, total } = polled;
           lastReq = total;
@@ -287,12 +324,14 @@ export const streamMetrics = async (
       // alive and the next poll heals.
       console.error("metrics stream poll failed", error);
     }
+
     if (frame !== null) {
       // A string payload goes out raw, so the frame keeps the exact
       // `data: <json>` wire shape the hand-rolled stream sent.
       // oxlint-disable-next-line eslint/no-await-in-loop -- one send per cycle, in poll order
       await sink.send({ data: frame });
     }
+
     // oxlint-disable-next-line eslint/no-await-in-loop -- sequential abortable sleep between polls
     await sleepUnlessAborted(pollMs, signal);
   }
@@ -310,36 +349,46 @@ export const handleMetricsStream: RouteHandler = async (
   params
 ) => {
   const appId = params?.appId?.trim() ?? "";
+
   if (!appId) {
     return new Response("app required", { status: 400 });
   }
+
   await ensureDbPromise();
+
   if (appId === CONTROL_APP_ID) {
     // The control plane's own telemetry: instance admin, never impersonating.
     const refusal = await controlStreamRefusal(request, env);
+
     if (refusal) {
       return refusal;
     }
   } else {
     const userId = await routeUserId(request, env);
+
     if (!userId) {
       return new Response("Sign in required", { status: 401 });
     }
+
     try {
       await requireAppRole(appId, userId, "view");
     } catch {
       return new Response("forbidden", { status: 403 });
     }
   }
+
   const rc = runnerConfig(env);
+
   if (!rc) {
     return new Response("RUNNER_TOKEN is not configured", { status: 500 });
   }
+
   const base = `${rc.runner}/v1/apps/${encodeURIComponent(appId)}`;
   const auth = { authorization: `Bearer ${rc.token}` };
   // One window for every series in the frame, so tiles, charts, spans and
   // analytics always describe the same period.
   const windowQuery = `hours=${metricsWindowHours(request)}`;
+
   return eventStream(
     (stream) =>
       streamMetrics({
@@ -359,6 +408,7 @@ export const handleMetricsStream: RouteHandler = async (
 export const handleDeploysStream: RouteHandler = (request, env, params) => {
   const environmentId =
     new URL(request.url).searchParams.get("environmentId") ?? "";
+
   return proxyRunnerStream(
     request,
     env,
@@ -376,6 +426,7 @@ export const handleDeploysStream: RouteHandler = (request, env, params) => {
  * through; the runner validates it. */
 export const handleErrorsStream: RouteHandler = (request, env, params) => {
   const status = new URL(request.url).searchParams.get("status") ?? "open";
+
   return proxyRunnerStream(
     request,
     env,
@@ -390,6 +441,7 @@ export const handleErrorsStream: RouteHandler = (request, env, params) => {
 export const handleEventsStream: RouteHandler = (request, env, params) => {
   const url = new URL(request.url);
   const query = url.search;
+
   return proxyRunnerStream(
     request,
     env,

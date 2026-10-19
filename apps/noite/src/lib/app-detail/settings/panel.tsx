@@ -24,9 +24,11 @@ export const AppSettingsPanel = () => {
   const { id } = useParams();
   const res = appDetail(id ?? "");
   const info = res.data();
+
   if (!id) {
     return <p class="text-error m-0 p-4 text-sm">Missing app id</p>;
   }
+
   if (res.loading() && info === undefined) {
     return (
       <div class="p-4">
@@ -34,13 +36,17 @@ export const AppSettingsPanel = () => {
       </div>
     );
   }
+
   const loadError = res.error();
+
   if (loadError && !info) {
     return <p class="text-error m-0 p-4 text-sm">{errorMessage(loadError)}</p>;
   }
+
   if (!info) {
     return null;
   }
+
   const gate = {
     appId: info.app.id,
     myRole: info.myRole,
@@ -48,7 +54,9 @@ export const AppSettingsPanel = () => {
     slug: info.app.slug,
     subdomain: info.app.subdomain,
   };
+
   const isAdmin = gate.myRole === "admin";
+
   return (
     <div class="divide-base-300 flex flex-col divide-y px-4">
       <div class={SECTION_CLASS}>

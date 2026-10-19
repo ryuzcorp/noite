@@ -26,6 +26,7 @@ export const CommitView = ({
   const res = forgeCommit(appId, sha);
   const data = res.data();
   const error = res.error();
+
   if (data === undefined) {
     return (
       <div class="flex flex-col gap-4">
@@ -34,8 +35,10 @@ export const CommitView = ({
       </div>
     );
   }
+
   const c = data.commit;
   const from = { file, ref: gitRef };
+
   return (
     <div class="flex flex-col gap-6">
       <header class="flex flex-col gap-2">

@@ -60,16 +60,20 @@ const DECODER = new TextDecoder();
 const remapJournal = (journal: Journal, from: string, to: string): Journal => {
   const prefix = `${from}/`;
   const moved: Journal = {};
+
   for (const [current, committed] of Object.entries(journal)) {
     if (current === from) {
       continue;
     }
+
     if (current.startsWith(prefix)) {
       moved[`${to}${current.slice(from.length)}`] = committed;
       continue;
     }
+
     moved[current] = committed;
   }
+
   return moved;
 };
 
@@ -78,11 +82,13 @@ const remapJournal = (journal: Journal, from: string, to: string): Journal => {
 const forgetUnder = (journal: Journal, path: string): Journal => {
   const prefix = `${path}/`;
   const kept: Journal = {};
+
   for (const [current, committed] of Object.entries(journal)) {
     if (current !== path && !current.startsWith(prefix)) {
       kept[current] = committed;
     }
   }
+
   return kept;
 };
 
@@ -92,12 +98,15 @@ const relOfEvent = (name: string | null): string | null => {
   if (name === null) {
     return null;
   }
+
   if (name === PROJECT_ROOT) {
     return "";
   }
+
   if (name.startsWith(`${PROJECT_ROOT}/`)) {
     return relPath(name);
   }
+
   return name.startsWith("/") ? null : name;
 };
 
@@ -108,12 +117,14 @@ export const createWorkspace = async (
 ): Promise<FrameWorkspace> => {
   const { appId, branch, editable, fetchArchive, files, onSaveError, sha } =
     options;
+
   const opened = await (options.openPod ?? openPod)({
     appId,
     branch,
     editable,
     onSaveError,
   });
+
   const { fs } = opened;
   const canWrite = editable && opened.editable;
   const cache: HashCache = new Map();
@@ -121,24 +132,30 @@ export const createWorkspace = async (
   let stale: string | null = null;
   let base = await readBase(fs);
   let journal = base === null ? {} : await readJournal(fs);
+
   if (base !== null && base.baseSha !== sha) {
     // The ref moved under the saved workspace. Unpushed work is kept — the
     // panel is told the checkout is stale — but a clean pod is simply replaced.
     const held = await deriveChanges({ base, cache, fs, journal });
+
     if (held.length > 0) {
       stale = sha;
     } else {
       base = null;
     }
   }
+
   if (base === null) {
     await checkout(fs, { fetchArchive, files, sha });
     base = await readBase(fs);
+
     if (base === null) {
       throw new Error("workspace: the checkout left no base index behind");
     }
+
     journal = {};
   }
+
   const state: WorkspaceState = { base, cache, fs, journal };
   let changes: WorkspaceChange[] = [];
   let running: Promise<void> | null = null;
@@ -148,6 +165,7 @@ export const createWorkspace = async (
 
   const publish = (next: WorkspaceChange[]): void => {
     changes = next;
+
     for (const subscriber of subscribers) {
       subscriber(next);
     }
@@ -173,6 +191,7 @@ export const createWorkspace = async (
     ) {
       return;
     }
+
     try {
       await opened.flush();
     } catch {
@@ -193,14 +212,18 @@ export const createWorkspace = async (
     if (running !== null) {
       again = true;
       await running;
+
       return;
     }
+
     running = deriveOnce();
+
     try {
       await running;
     } finally {
       running = null;
     }
+
     if (again) {
       again = false;
       await refresh();
@@ -225,9 +248,11 @@ export const createWorkspace = async (
     if (cooling) {
       return;
     }
+
     cooling = true;
     setTimeout(() => {
       cooling = false;
+
       if (!closed) {
         void deriveScheduled();
       }
@@ -239,10 +264,12 @@ export const createWorkspace = async (
     { recursive: true },
     (_event, filename) => {
       const path = relOfEvent(filename);
+
       // An install writes thousands of dependency files the walk skips anyway.
       if (path?.split("/").includes("node_modules")) {
         return;
       }
+
       // The size+mtime key already guards a stale id; dropping the path (or
       // everything, when the event names no path) closes the one gap left —
       // two writes of the same length inside the same millisecond.
@@ -251,6 +278,7 @@ export const createWorkspace = async (
       } else {
         cache.delete(path);
       }
+
       schedule();
     }
   );
@@ -260,6 +288,7 @@ export const createWorkspace = async (
   const stopPeers = opened.onPeerChange(() => {
     void (async () => {
       const next = await readBase(fs);
+
       if (next !== null && !closed) {
         state.base = next;
         schedule();
@@ -288,10 +317,13 @@ export const createWorkspace = async (
      * and never from the network. */
     baseText: async (path: string): Promise<string | null> => {
       const entry = state.base.entries[path];
+
       if (entry === undefined) {
         return null;
       }
+
       const bytes = await readObject(fs, entry.sha);
+
       return bytes === null || isBinary(bytes) ? null : DECODER.decode(bytes);
     },
     changes: () => changes,
@@ -299,6 +331,7 @@ export const createWorkspace = async (
       closed = true;
       watching.close();
       stopPeers();
+
       // The pod's last save is debounced too: what the last keystroke left is
       // saved before the handle goes (a save that fails here is the pod's own
       // to retry, and `opened.close()` still captures what is left).
@@ -307,11 +340,13 @@ export const createWorkspace = async (
       } catch {
         // Nothing left to do about it: the pod is going away either way.
       }
+
       await opened.close();
     },
     discard: async (path: string) => {
       requireWritable();
       const change = changes.find((row) => row.path === path);
+
       if (change !== undefined) {
         await discardChange(state, change);
         await refresh();
@@ -334,6 +369,7 @@ export const createWorkspace = async (
     },
     onChanges: (notify: (next: WorkspaceChange[]) => void) => {
       subscribers.add(notify);
+
       return () => {
         subscribers.delete(notify);
       };
@@ -382,17 +418,21 @@ export const createWorkspace = async (
       await fs.rename(projectPath(from), projectPath(to));
       const moved = await fs.stat(projectPath(to));
       state.journal = remapJournal(state.journal, from, to);
+
       if (!moved.isDirectory) {
         state.journal[to] = origin;
       }
+
       await writeJournal(fs, state.journal);
     },
     restore: async (path: string) => {
       requireWritable();
       const change = changes.find((row) => row.path === path);
+
       if (change === undefined) {
         return;
       }
+
       await (change.kind === "moved"
         ? restoreMove(state, change)
         : discardChange(state, change));

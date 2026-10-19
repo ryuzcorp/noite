@@ -27,9 +27,11 @@ const appendLine = async (page: Page, line: string): Promise<void> => {
   const editor = page.locator('[contenteditable="true"]').first();
   await expect(editor).toBeVisible({ timeout: 60_000 });
   const box = await editor.boundingBox();
+
   if (box === null) {
     throw new TypeError("the editor has no box");
   }
+
   await editor.click({ position: { x: 8, y: box.height - 8 } });
   await page.keyboard.press("ControlOrMeta+End");
   await page.keyboard.press("Enter");
@@ -41,10 +43,12 @@ test("edits to several files push as one commit from the Changes panel", async (
   request,
 }) => {
   createdApps.push(SLUG);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Source Edit",
     slug: SLUG,
   });
+
   pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), SLUG);
 
   await page.goto(`/apps/${appId}/source?file=index.ts&ref=main`);
@@ -68,6 +72,7 @@ test("edits to several files push as one commit from the Changes panel", async (
   // The panel diffs both drafts; one Push commits them with the message.
   await changes.click();
   const panel = page.getByRole("complementary", { name: "Changes" });
+
   // The diff renders in pierre's shadow root: locate its spans, not the
   // panel's own text.
   for (const line of ["// edit in index", "// edit in util"]) {
@@ -76,6 +81,7 @@ test("edits to several files push as one commit from the Changes panel", async (
       panel.locator("span", { hasText: line }).first()
     ).toBeVisible();
   }
+
   await panel.getByLabel("Commit message").fill("Edit two files");
   await panel.getByRole("button", { exact: true, name: "Push" }).click();
   await expect(panel).toContainText("Pushed to main.", { timeout: 30_000 });
@@ -107,10 +113,12 @@ test("a branch opens editable and pushes to itself", async ({
   request,
 }) => {
   createdApps.push(BRANCH_SLUG);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Source Branch",
     slug: BRANCH_SLUG,
   });
+
   pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), BRANCH_SLUG);
 
   await page.goto(`/apps/${appId}/source?file=index.ts&ref=main`);

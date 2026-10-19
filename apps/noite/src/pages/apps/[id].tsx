@@ -39,6 +39,7 @@ type AppPanel = "settings" | "";
 /** Parse `?panel=`: anything but `settings` closes the panel. */
 const toAppPanel = (raw: string): AppPanel =>
   raw === "settings" ? "settings" : "";
+
 /** Metrics tab: the window lives in `?r=` (24 / 168 / 720 hours) so a refresh
  * or shared link keeps it. The card is keyed by the window because its live
  * feed opens one URL for the life of a component. */
@@ -47,6 +48,7 @@ const MetricsTab = ({ appId }: { appId: string }) => {
     default: DEFAULT_METRICS_HOURS,
     parse: toMetricsHours,
   });
+
   return (
     <div class="flex flex-col gap-4">
       <div class="flex items-center justify-between gap-2">
@@ -84,18 +86,22 @@ const AppPageBody = ({ appId }: { appId: string }) => {
       </>
     );
   }
+
   const tab = searchParam<TabId>("t", { default: "overview", parse: toTabId });
+
   // Settings opens beside the tabs (`?panel=settings`), so it stays open
   // while they switch.
   const panel = searchParam<AppPanel>("panel", {
     default: "",
     parse: toAppPanel,
   });
+
   // The open error (ErrorsPanel's `?e=`): a tab click always lands on the
   // tab's top level, so the Errors tab shows the list, not a stale detail.
   const openError = searchParam("e", { default: "" });
   const detail = appDetail(appId).data();
   const name = detail?.app.name;
+
   // The server head only knows the fallback; refine once the detail loads.
   // Same live feeds as the Errors tab's open list and the Events tab's
   // default view, so the tab badges never lag the lists.
@@ -103,6 +109,7 @@ const AppPageBody = ({ appId }: { appId: string }) => {
     errors: liveErrors(appId, "open").data()?.counts.open ?? 0,
     events: liveEventCount(appId),
   };
+
   const settingsOpen = panel() === "settings";
 
   return (
@@ -171,8 +178,10 @@ const AppPageBody = ({ appId }: { appId: string }) => {
  * ilha reuses the row, and the body repaints through its own param reads). */
 export default function AppPage() {
   const { id: appId } = useParams();
+
   if (!appId) {
     return <p class="m-0 text-sm opacity-70">Missing app id.</p>;
   }
+
   return [<AppPageBody key={appId} appId={appId} />];
 }

@@ -46,29 +46,37 @@ export const frameAddress = (
   if (!framed) {
     return null;
   }
+
   let parsed: URL;
+
   try {
     parsed = new URL(url);
   } catch {
     return null;
   }
+
   const params = parsed.searchParams;
   const appId = params.get("appId") ?? "";
   const branch = params.get("branch") ?? "";
   const nonce = params.get("nonce") ?? "";
   const parentOrigin = params.get("parentOrigin") ?? "";
+
   if (appId === "" || branch === "" || nonce === "" || parentOrigin === "") {
     return null;
   }
+
   let parent: URL;
+
   try {
     parent = new URL(parentOrigin);
   } catch {
     return null;
   }
+
   if (parent.origin !== parentOrigin || parent.origin === parsed.origin) {
     return null;
   }
+
   return { appId, branch, nonce, parentOrigin };
 };
 
@@ -84,10 +92,12 @@ export const handshakeMessage = (
   if (typeof value !== "object" || value === null) {
     return null;
   }
+
   const fields = new Map(Object.entries(value));
   const t = fields.get("t");
   const v = fields.get("v");
   const nonce = fields.get("nonce");
+
   if (
     typeof t !== "string" ||
     typeof v !== "number" ||
@@ -95,13 +105,17 @@ export const handshakeMessage = (
   ) {
     return null;
   }
+
   if (t === "hello") {
     return { nonce, t: "hello", v };
   }
+
   const port = fields.get("port");
+
   if (t === "connect" && port instanceof MessagePort) {
     return { nonce, port, t: "connect", v };
   }
+
   return null;
 };
 /* oxlint-enable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof */

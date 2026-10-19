@@ -281,6 +281,7 @@ const schema140 = defineSchema(`
 const schema = schema140;
 
 export type DB = InferSchema<typeof schema>;
+
 export type AppCollaborator = Selectable<DB["app_collaborator"]>;
 
 export const orm = paranorm<DB>();
@@ -303,15 +304,19 @@ export const ledgerMismatch = (
 ): string | undefined => {
   const names = new Map(known.map(({ id, name }) => [id, name]));
   const newest = Math.max(0, ...known.map(({ id }) => id));
+
   for (const { migration_id: id, name } of recorded) {
     const expected = names.get(id);
+
     if (expected === undefined) {
       return `the control database was migrated by a newer Noite (migration ${id} "${name}"); this image only knows up to ${newest}. Run the newer image again, or restore a backup taken before the upgrade. Downgrades are not supported.`;
     }
+
     if (expected !== name) {
       return `the control database has migration ${id} recorded as "${name}", but this image expects "${expected}". It was created by a pre-alpha build; reinstall, or restore a backup from this release line.`;
     }
   }
+
   return undefined;
 };
 
@@ -319,16 +324,21 @@ export const ledgerMismatch = (
  * the migrator would silently run past it. Fresh databases have no ledger. */
 const assertLedgerCompatible = Effect.gen(function* assertLedgerCompatible() {
   const sql = yield* SqlClient;
+
   const tables = yield* sql<{ name: string }>`
     SELECT name FROM sqlite_master WHERE type = 'table' AND name = ${LEDGER_TABLE}
   `;
+
   if (tables.length === 0) {
     return;
   }
+
   const recorded = yield* sql<{ migration_id: number; name: string }>`
     SELECT migration_id, name FROM paranorm_migrations ORDER BY migration_id
   `;
+
   const reason = ledgerMismatch(recorded, migrator.plan());
+
   if (reason) {
     return yield* Effect.fail(new Error(`noite: refusing to start: ${reason}`));
   }
@@ -359,6 +369,7 @@ export const resolveD1 = (): D1Database => {
   if (d1Binding) {
     return d1Binding;
   }
+
   throw missingDb();
 };
 
@@ -380,15 +391,18 @@ export const sqlLive = () => D1Client.layer({ db: resolveD1() });
 const runDbSetup = Effect.gen(function* runDbSetup() {
   yield* assertLedgerCompatible;
   yield* migrator.migrate;
+
   // Instance admin bootstrap (runs once per process at startup): if
   // NOITE_ADMIN_EMAIL names an already-registered account, ensure it
   // holds the admin role. No-op when unset or not yet registered.
   const adminEmail =
     resolveEnv().NOITE_ADMIN_EMAIL?.trim().toLowerCase() || null;
+
   if (adminEmail) {
     const existing = yield* orm.user.findFirst({
       where: { email: adminEmail },
     });
+
     if (existing && existing.role !== "admin") {
       yield* orm.user.update({
         data: { role: "admin" },
@@ -425,6 +439,7 @@ const failAfter = async (promise: Promise<void>, ms: number): Promise<void> => {
       Effect.fail(new Error(`noite: db setup did not settle within ${ms}ms`))
     )
   );
+
   // `Promise.race` (unlike `Effect.race`, where only the first *success*
   // wins) lets the first *settlement* win, so a fast setup failure rejects
   // here instead of waiting out the sleep. The race handles both branches,
@@ -439,6 +454,7 @@ const startSetupPass = (db: D1Database): SetupPass => {
     ),
     SETUP_TIMEOUT_MS
   );
+
   const pass: SetupPass = { promise, settled: false };
   setupPasses.set(db, pass);
   void (async (): Promise<void> => {
@@ -451,8 +467,10 @@ const startSetupPass = (db: D1Database): SetupPass => {
         setupPasses.delete(db);
       }
     }
+
     pass.settled = true;
   })();
+
   return pass;
 };
 
@@ -464,9 +482,11 @@ const startSetupPass = (db: D1Database): SetupPass => {
  * pass key, so a test that swaps in a fresh database gets a fresh pass. */
 const runDbSetupOnce = async (db: D1Database): Promise<void> => {
   const cached = setupPasses.get(db);
+
   if (cached === undefined) {
     return startSetupPass(db).promise;
   }
+
   // A settled pass (ok or failed) answers false so the caller shares it;
   // only an expired wait runs a fresh pass. `Promise.race` lets the first
   // *settlement* win (see `failAfter`); the race handles both branches.
@@ -477,18 +497,24 @@ const runDbSetupOnce = async (db: D1Database): Promise<void> => {
       // A failed pass still counts as settled: the caller shares its
       // rejection through `cached.promise` below.
     }
+
     return false;
   })();
+
   const elapsed = Effect.runPromise(
     Effect.as(Effect.sleep(SHARED_SETUP_WAIT_MS), true)
   );
+
   const waited = await Promise.race([shared, elapsed]);
+
   if (!waited) {
     return cached.promise;
   }
+
   if (!cached.settled && setupPasses.get(db) === cached) {
     setupPasses.delete(db);
   }
+
   return startSetupPass(db).promise;
 };
 
@@ -509,7 +535,9 @@ export const withDb = <A, E, R>(
     Effect.provide(sqlLive()),
     Effect.scoped
   );
+
   // SAFETY: providing the D1 layer and scope collapses the R channel, so runPromise sees a closed effect resolving to exactly A.
   const promise = Effect.runPromise(open as Effect.Effect<A, never, never>);
+
   return promise;
 };

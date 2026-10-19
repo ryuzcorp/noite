@@ -21,6 +21,7 @@ export const putObject = async (
     headers: { "content-type": contentType },
     method: "PUT",
   });
+
   if (!response.ok) {
     const detail = await response.text().catch(() => response.statusText);
     throw new Error(
@@ -42,17 +43,23 @@ export const NewFolderButton = ({
 }) => {
   const name = atom("");
   const details = atom.lazy(newLiveRef<HTMLDetailsElement>)();
+
   const close = () => {
     const element = liveEl(details);
+
     if (element) {
       element.open = false;
     }
   };
+
   const cleaned = name().trim();
+
   const invalid =
     cleaned !== "" &&
     (cleaned.includes("/") || cleaned === ".." || cleaned === ".");
+
   const valid = cleaned !== "" && !invalid;
+
   return (
     <details
       class="dropdown dropdown-end"
@@ -99,6 +106,7 @@ export const NewFolderButton = ({
               if (!valid) {
                 return;
               }
+
               onCreate(cleaned);
               name.set("");
               close();
@@ -124,6 +132,7 @@ export const UploadButton = ({
   onUpload: (files: File[]) => void;
 }) => {
   const input = atom.lazy(newLiveRef<HTMLInputElement>)();
+
   return (
     <>
       <input
@@ -137,6 +146,7 @@ export const UploadButton = ({
           const files = [...(event.currentTarget.files ?? [])];
           // Reset so picking the same file again still fires a change.
           event.currentTarget.value = "";
+
           if (files.length > 0) {
             onUpload(files);
           }

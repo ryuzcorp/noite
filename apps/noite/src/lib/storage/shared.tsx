@@ -19,6 +19,7 @@ export interface Toast {
 export const useToasts = () => {
   const toasts = atom<Toast[]>([]);
   const ids = atom.lazy(() => ({ n: 0 }))();
+
   const notify = (text: string) => {
     ids.n += 1;
     const id = ids.n;
@@ -27,6 +28,7 @@ export const useToasts = () => {
       toasts.set(toasts().filter((toast) => toast.id !== id));
     }, 4000);
   };
+
   return { notify, toasts };
 };
 
@@ -122,9 +124,11 @@ export type PreviewKind = "image" | "text" | "binary";
 
 export const previewKind = (contentType: string | null): PreviewKind => {
   const type = (contentType ?? "").toLowerCase();
+
   if (type.startsWith("image/")) {
     return "image";
   }
+
   if (
     type.startsWith("text/") ||
     type.includes("json") ||
@@ -132,6 +136,7 @@ export const previewKind = (contentType: string | null): PreviewKind => {
   ) {
     return "text";
   }
+
   return "binary";
 };
 

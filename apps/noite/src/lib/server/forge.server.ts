@@ -19,6 +19,7 @@ import { apiAction } from "./api";
 import { requireViewApp, sessionUser } from "./session.server";
 
 const GitRefsArgs = Schema.Struct({ appId: Schema.String });
+
 const GitLogArgs = Schema.Struct({
   appId: Schema.String,
   limit: Schema.optional(Schema.Number),
@@ -26,20 +27,24 @@ const GitLogArgs = Schema.Struct({
   ref: Schema.optional(Schema.String),
   skip: Schema.optional(Schema.Number),
 });
+
 const GitCommitArgs = Schema.Struct({
   appId: Schema.String,
   sha: Schema.String,
 });
+
 const GitCompareArgs = Schema.Struct({
   appId: Schema.String,
   base: Schema.String,
   head: Schema.String,
 });
+
 const GitBranchCreateArgs = Schema.Struct({
   appId: Schema.String,
   from: Schema.String,
   name: Schema.String,
 });
+
 const GitBranchDeleteArgs = Schema.Struct({
   appId: Schema.String,
   name: Schema.String,
@@ -50,6 +55,7 @@ export const gitRefs = apiAction(
   GitRefsArgs,
   async ({ appId }, { env, request }) => {
     await requireViewApp(request, env, appId);
+
     return runnerGitRefs(appId);
   }
 );
@@ -59,6 +65,7 @@ export const gitLog = apiAction(
   GitLogArgs,
   async ({ appId, limit, path, ref, skip }, { env, request }) => {
     await requireViewApp(request, env, appId);
+
     return runnerGitLog(appId, { limit, path, ref, skip });
   }
 );
@@ -68,6 +75,7 @@ export const gitCommit = apiAction(
   GitCommitArgs,
   async ({ appId, sha }, { env, request }) => {
     await requireViewApp(request, env, appId);
+
     return runnerGitCommit(appId, sha);
   }
 );
@@ -77,6 +85,7 @@ export const gitCompare = apiAction(
   GitCompareArgs,
   async ({ appId, base, head }, { env, request }) => {
     await requireViewApp(request, env, appId);
+
     return runnerGitCompare(appId, base, head);
   }
 );
@@ -87,6 +96,7 @@ export const gitBranchCreate = apiAction(
   async ({ appId, from, name }, { env, request }) => {
     const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "push");
+
     return runnerGitBranchCreate(appId, name, from);
   }
 );
@@ -97,6 +107,7 @@ export const gitBranchDelete = apiAction(
   async ({ appId, name }, { env, request }) => {
     const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "admin");
+
     return runnerGitBranchDelete(appId, name);
   }
 );

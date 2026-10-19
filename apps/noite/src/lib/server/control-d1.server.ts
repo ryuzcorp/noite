@@ -106,6 +106,7 @@ const lookup = <R extends Record<string, unknown>>(
   if (!Object.hasOwn(record, table)) {
     return undefined;
   }
+
   // SAFETY: Object.hasOwn proved the key is in `record`; the cast only tells
   // the compiler which member to read back.
   return record[table as keyof R];
@@ -114,6 +115,7 @@ const lookup = <R extends Record<string, unknown>>(
 /** The write capabilities the UI should offer for one table. */
 export const controlTableCaps = (table: string): D1TableCaps => {
   const rule = lookup(table, WRITE_POLICY);
+
   return {
     delete: rule?.delete ?? false,
     insert: rule?.insert ?? false,
@@ -168,6 +170,7 @@ export const isVisibleTable = (name: string): boolean => {
   if (name.startsWith("_") || name.startsWith("sqlite_")) {
     return false;
   }
+
   return name !== "d1_migrations";
 };
 
@@ -182,9 +185,11 @@ export const controlAccessRefusal = (access: {
   if (access.impersonatedBy !== null) {
     return "The control database is not available while impersonating";
   }
+
   if (!access.isAdmin) {
     return "Instance admins only";
   }
+
   return null;
 };
 
@@ -220,6 +225,7 @@ const decodeRows = <S extends Schema.ConstraintDecoder<unknown>>(
 ): S["Type"][] => {
   const decode = Schema.decodeUnknownSync(schema);
   const out: S["Type"][] = [];
+
   for (const row of rows) {
     try {
       out.push(decode(row));
@@ -227,6 +233,7 @@ const decodeRows = <S extends Schema.ConstraintDecoder<unknown>>(
       // Skip the malformed row.
     }
   }
+
   return out;
 };
 
@@ -302,15 +309,18 @@ const toColumn = (
 /** Read one result set's `COUNT(*) AS n` (0 when absent). */
 const countOf = (result: D1Result<unknown> | undefined): number => {
   const [row] = decodeRows(CountRow, result?.results ?? []);
+
   return row === undefined ? 0 : Number(row.n) || 0;
 };
 
 /** Decode a blob as the editor's read-only `x'…'` hex form. */
 const bytesToHex = (bytes: Uint8Array): string => {
   let hex = "";
+
   for (const byte of bytes) {
     hex += byte.toString(16).padStart(2, "0");
   }
+
   return `x'${hex}'`;
 };
 
@@ -321,24 +331,31 @@ const cellValue = (value: unknown): D1Cell => {
   if (value === null || value === undefined) {
     return null;
   }
+
   if (typeof value === "string") {
     return value;
   }
+
   if (typeof value === "number") {
     return String(value);
   }
+
   if (typeof value === "bigint") {
     return value.toString();
   }
+
   if (typeof value === "boolean") {
     return value ? "1" : "0";
   }
+
   if (value instanceof ArrayBuffer) {
     return bytesToHex(new Uint8Array(value));
   }
+
   if (value instanceof Uint8Array) {
     return bytesToHex(value);
   }
+
   // D1 only returns the shapes above; anything else is rendered as text
   // rather than dropped.
   return String(value);
@@ -352,6 +369,7 @@ const readColumns = async (
   const result = await db
     .prepare(`PRAGMA table_info(${quoteIdent(table)})`)
     .all<unknown>();
+
   return decodeRows(PragmaColumnRow, result.results ?? []).map(toColumn);
 };
 
@@ -362,9 +380,11 @@ const requireColumns = async (
 ): Promise<D1Column[]> => {
   assertVisibleTable(table);
   const cols = await readColumns(db, table);
+
   if (cols.length === 0) {
     refuse(`unknown table ${table}`);
   }
+
   return cols;
 };
 
@@ -377,6 +397,7 @@ const namesMatch = (
 ): boolean => {
   const a = [...left].toSorted();
   const b = [...right].toSorted();
+
   return a.length === b.length && a.every((name, index) => name === b[index]);
 };
 
@@ -388,22 +409,27 @@ export const listControlTables = async (db: D1Database): Promise<D1Tables> => {
       `SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`
     )
     .all<unknown>();
+
   const names = decodeRows(TableNameRow, result.results ?? [])
     .map((row) => row.name)
     .filter(isVisibleTable);
+
   if (names.length === 0) {
     return { databaseId: CONTROL_APP_DATABASE_ID, tables: [] };
   }
+
   const counts = await db.batch<unknown>(
     names.map((name) =>
       db.prepare(`SELECT COUNT(*) AS n FROM ${quoteIdent(name)}`)
     )
   );
+
   const tables: D1TableInfo[] = names.map((name, index) => ({
     caps: controlTableCaps(name),
     name,
     rowCount: countOf(counts[index]),
   }));
+
   return { databaseId: CONTROL_APP_DATABASE_ID, tables };
 };
 
@@ -415,6 +441,7 @@ export const controlSchema = async (
 ): Promise<D1TableSchema> => {
   assertVisibleTable(table);
   const quoted = quoteIdent(table);
+
   const [infoResult, fkResult, indexResult, sqlResult] =
     await db.batch<unknown>([
       db.prepare(`PRAGMA table_info(${quoted})`),
@@ -426,23 +453,29 @@ export const controlSchema = async (
         )
         .bind(table),
     ]);
+
   const columns = decodeRows(PragmaColumnRow, infoResult?.results ?? []).map(
     toColumn
   );
+
   if (columns.length === 0) {
     refuse(`unknown table ${table}`);
   }
+
   const foreignKeys = decodeRows(ForeignKeyRow, fkResult?.results ?? []).map(
     (row) => ({ from: row.from, table: row.table, to: row.to })
   );
+
   const indexRows = decodeRows(IndexListRow, indexResult?.results ?? []);
   let indexes: D1TableSchema["indexes"] = [];
+
   if (indexRows.length > 0) {
     const infos = await db.batch<unknown>(
       indexRows.map((row) =>
         db.prepare(`PRAGMA index_info(${quoteIdent(row.name)})`)
       )
     );
+
     indexes = indexRows.map((row, index) => ({
       columns: decodeRows(IndexInfoRow, infos[index]?.results ?? [])
         .map((info) => info.name)
@@ -451,8 +484,10 @@ export const controlSchema = async (
       unique: row.unique === true || Number(row.unique ?? 0) === 1,
     }));
   }
+
   const [sqlRow] = decodeRows(TableSqlRow, sqlResult?.results ?? []);
   const sql = sqlRow?.sql ?? null;
+
   return {
     caps: controlTableCaps(table),
     columns,
@@ -476,6 +511,7 @@ const clampPageSize = (size: number): number => {
   if (!Number.isFinite(size)) {
     return 25;
   }
+
   return Math.min(Math.max(Math.trunc(size), 1), D1_ROWS_MAX);
 };
 
@@ -496,48 +532,59 @@ const whereClause = (
   if (filters.length > D1_FILTERS_MAX) {
     refuse(`at most ${D1_FILTERS_MAX} filters`);
   }
+
   const known = new Set(namesOf(cols));
   const sql: string[] = [];
   const params: (string | null)[] = [];
+
   for (const filter of filters) {
     if (!known.has(filter.column)) {
       refuse(`unknown column ${filter.column}`);
     }
+
     if (redacted.has(filter.column)) {
       refuse(`${filter.column} is redacted and cannot be filtered`);
     }
+
     const column = quoteIdent(filter.column);
+
     switch (filter.op) {
       case "eq": {
         sql.push(`${column} = ?`);
         params.push(filter.value);
         break;
       }
+
       case "neq": {
         sql.push(`${column} <> ?`);
         params.push(filter.value);
         break;
       }
+
       case "lt": {
         sql.push(`${column} < ?`);
         params.push(filter.value);
         break;
       }
+
       case "lte": {
         sql.push(`${column} <= ?`);
         params.push(filter.value);
         break;
       }
+
       case "gt": {
         sql.push(`${column} > ?`);
         params.push(filter.value);
         break;
       }
+
       case "gte": {
         sql.push(`${column} >= ?`);
         params.push(filter.value);
         break;
       }
+
       case "like": {
         // The user's pattern as typed — no extra escaping (the runner's
         // tenant path emits the same plain LIKE).
@@ -545,33 +592,41 @@ const whereClause = (
         params.push(filter.value);
         break;
       }
+
       case "is_null": {
         sql.push(`${column} IS NULL`);
         break;
       }
+
       case "not_null": {
         sql.push(`${column} IS NOT NULL`);
         break;
       }
+
       default: {
         refuse(`unknown filter op ${String(filter.op)}`);
       }
     }
   }
+
   if (search !== "") {
     const pattern = `%${escapeLike(search)}%`;
     const matches: string[] = [];
+
     for (const col of cols) {
       if (redacted.has(col.name)) {
         continue;
       }
+
       matches.push(`CAST(${quoteIdent(col.name)} AS TEXT) LIKE ? ESCAPE '\\'`);
       params.push(pattern);
     }
+
     if (matches.length > 0) {
       sql.push(`(${matches.join(" OR ")})`);
     }
   }
+
   return { params, sql };
 };
 
@@ -584,20 +639,26 @@ const orderClause = (
 ): string => {
   if (sort !== null) {
     const known = new Set(namesOf(cols));
+
     if (!known.has(sort.column)) {
       refuse(`unknown column ${sort.column}`);
     }
+
     if (redacted.has(sort.column)) {
       refuse(`${sort.column} is redacted and cannot be sorted`);
     }
+
     return `${quoteIdent(sort.column)} ${sort.desc ? "DESC" : "ASC"}`;
   }
+
   const pk = cols
     .filter((col) => col.pk > 0)
     .toSorted((left, right) => left.pk - right.pk);
+
   if (pk.length > 0) {
     return pk.map((col) => `${quoteIdent(col.name)} ASC`).join(", ");
   }
+
   return "rowid ASC";
 };
 
@@ -609,20 +670,26 @@ export const controlRows = async (
 ): Promise<D1Rows> => {
   const cols = await requireColumns(db, query.table);
   const redacted = new Set(redactedColumnsFor(query.table));
+
   const page = Number.isFinite(query.page)
     ? Math.max(Math.trunc(query.page), 0)
     : 0;
+
   const pageSize = clampPageSize(query.pageSize);
+
   const where = whereClause(
     cols,
     redacted,
     query.filters ?? [],
     query.search ?? ""
   );
+
   const whereSql =
     where.sql.length > 0 ? ` WHERE ${where.sql.join(" AND ")}` : "";
+
   const columns = namesOf(cols);
   const select = columns.map(quoteIdent).join(", ");
+
   const [countResult, rowsResult] = await db.batch<unknown>([
     db
       .prepare(
@@ -635,7 +702,9 @@ export const controlRows = async (
       )
       .bind(...where.params, pageSize, page * pageSize),
   ]);
+
   const rows: D1Cell[][] = [];
+
   for (const entry of decodeRows(DataRow, rowsResult?.results ?? [])) {
     rows.push(
       columns.map((name) =>
@@ -643,6 +712,7 @@ export const controlRows = async (
       )
     );
   }
+
   return {
     columns,
     page,
@@ -685,13 +755,16 @@ const assertColumnsWritable = (
   record: Record<string, D1Cell>
 ): void => {
   const known = new Set(namesOf(cols));
+
   for (const name of Object.keys(record)) {
     if (!known.has(name)) {
       refuse(`unknown column ${name} on ${table}`);
     }
+
     if (redacted.has(name)) {
       refuse(`${table}.${name} is never written here`);
     }
+
     if (locked.has(name)) {
       refuse(
         `${table}.${name} is managed in the admin home's Users tab and cannot be edited here`
@@ -709,14 +782,18 @@ const assertKey = (
   key: Record<string, D1Cell>
 ): void => {
   const keyCols = Object.keys(key);
+
   if (keyCols.length === 0) {
     refuse(`${op} needs a key`);
   }
+
   const pk = cols
     .filter((col) => col.pk > 0)
     .toSorted((left, right) => left.pk - right.pk)
     .map((col) => col.name);
+
   const expected = pk.length > 0 ? pk : namesOf(cols);
+
   if (!namesMatch(expected, keyCols)) {
     const what = pk.length > 0 ? "primary key" : "every column";
     refuse(`${op} must be keyed by the ${what} (${expected.join(", ")})`);
@@ -727,14 +804,17 @@ const assertKey = (
 const keyClause = (key: Record<string, D1Cell>) => {
   const clauses: string[] = [];
   const params: (string | null)[] = [];
+
   for (const [name, value] of Object.entries(key)) {
     if (value === null) {
       clauses.push(`${quoteIdent(name)} IS NULL`);
       continue;
     }
+
     clauses.push(`${quoteIdent(name)} = ?`);
     params.push(value);
   }
+
   return { clauses, params };
 };
 
@@ -750,7 +830,9 @@ const buildInsert = (
   if (Object.keys(values).length === 0) {
     refuse("no values to insert");
   }
+
   const filled = { ...values };
+
   const idColumn = cols.find(
     (col) =>
       col.name === "id" &&
@@ -758,13 +840,17 @@ const buildInsert = (
       col.notNull &&
       col.defaultValue === null
   );
+
   if (idColumn !== undefined) {
     const { id } = filled;
+
     if (id === undefined || id === null || id === "") {
       filled.id = crypto.randomUUID();
     }
   }
+
   const names = Object.keys(filled);
+
   for (const col of cols) {
     if (
       col.notNull &&
@@ -774,6 +860,7 @@ const buildInsert = (
       refuse(`${table}.${col.name} is required`);
     }
   }
+
   return {
     params: names.map((name) => filled[name] ?? null),
     sql: `INSERT INTO ${quoteIdent(table)} (${names.map(quoteIdent).join(", ")}) VALUES (${names.map(() => "?").join(", ")})`,
@@ -787,10 +874,13 @@ const buildUpdate = (
   key: Record<string, D1Cell>
 ): Statement => {
   const names = Object.keys(values);
+
   if (names.length === 0) {
     refuse("no values to update");
   }
+
   const where = keyClause(key);
+
   return {
     params: [...names.map((name) => values[name] ?? null), ...where.params],
     sql: `UPDATE ${quoteIdent(table)} SET ${names.map((name) => `${quoteIdent(name)} = ?`).join(", ")} WHERE ${where.clauses.join(" AND ")}`,
@@ -800,6 +890,7 @@ const buildUpdate = (
 /** Build the DELETE for one row, keyed by the validated columns. */
 const buildDelete = (table: string, key: Record<string, D1Cell>): Statement => {
   const where = keyClause(key);
+
   return {
     params: where.params,
     sql: `DELETE FROM ${quoteIdent(table)} WHERE ${where.clauses.join(" AND ")}`,
@@ -811,14 +902,17 @@ const buildDelete = (table: string, key: Record<string, D1Cell>): Statement => {
 const changedRows = (results: readonly D1Result<unknown>[]): number | null => {
   let total = 0;
   let saw = false;
+
   for (const result of results) {
     const changes = result?.meta?.changes;
+
     // oxlint-disable-next-line anti-slop/no-runtime-typeof -- the driver's meta is untyped at the edge (the test shim reports no `changes`).
     if (typeof changes === "number" && Number.isFinite(changes)) {
       total += changes;
       saw = true;
     }
   }
+
   return saw ? total : null;
 };
 
@@ -833,9 +927,11 @@ const buildStatement = (
   if (op === "insert") {
     return buildInsert(table, cols, values);
   }
+
   if (op === "update") {
     return buildUpdate(table, values, key);
   }
+
   return buildDelete(table, key);
 };
 
@@ -851,28 +947,36 @@ export const writeControlD1 = async (
   const values = write.values ?? {};
   const key = write.key ?? {};
   assertVisibleTable(table);
+
   const rule =
     lookup(table, WRITE_POLICY) ??
     refuse(`${table} is read-only in the control database`);
+
   const cols = await readColumns(db, table);
+
   if (cols.length === 0) {
     refuse(`unknown table ${table}`);
   }
+
   if (!rule[op]) {
     if (op === "update" && table === "session") {
       refuse(
         "session rows cannot be edited here — delete the row to revoke the session"
       );
     }
+
     refuse(`${op} is not allowed on ${table} in the control database`);
   }
+
   const redacted = new Set(redactedColumnsFor(table));
   const locked = new Set(rule.lockedColumns);
   assertColumnsWritable(table, cols, redacted, locked, values);
+
   if (op !== "insert") {
     assertColumnsWritable(table, cols, redacted, locked, key);
     assertKey(op, table, cols, key);
   }
+
   // Editing your own row is safe: role and ban are locked above and the id is
   // the key. Deleting it would remove the signed-in admin.
   if (table === "user" && op === "delete" && key.id === actorId) {
@@ -880,6 +984,7 @@ export const writeControlD1 = async (
       "your own account cannot be deleted here — use the admin home's Users tab"
     );
   }
+
   const statement = buildStatement(op, table, cols, values, key);
   await db
     .prepare(statement.sql)
@@ -894,33 +999,46 @@ export const deleteControlRows = async (
   body: ControlD1DeleteRows
 ): Promise<{ deleted: number; ok: true }> => {
   const { actorId, keys, table } = body;
+
   if (keys.length === 0 || keys.length > D1_DELETE_MAX) {
     refuse(`delete 1 to ${D1_DELETE_MAX} rows at a time`);
   }
+
   assertVisibleTable(table);
+
   const rule =
     lookup(table, WRITE_POLICY) ??
     refuse(`${table} is read-only in the control database`);
+
   if (!rule.delete) {
     refuse(`delete is not allowed on ${table} in the control database`);
   }
+
   const cols = await readColumns(db, table);
+
   if (cols.length === 0) {
     refuse(`unknown table ${table}`);
   }
+
   const redacted = new Set(redactedColumnsFor(table));
   const locked = new Set(rule.lockedColumns);
+
   const statements = keys.map((key) => {
     assertColumnsWritable(table, cols, redacted, locked, key);
     assertKey("delete", table, cols, key);
+
     if (table === "user" && key.id === actorId) {
       refuse(
         "your own account cannot be deleted here — use the admin home's Users tab"
       );
     }
+
     const statement = buildDelete(table, key);
+
     return db.prepare(statement.sql).bind(...statement.params);
   });
+
   const results = await db.batch<unknown>(statements);
+
   return { deleted: changedRows(results) ?? keys.length, ok: true };
 };

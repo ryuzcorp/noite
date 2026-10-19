@@ -9,6 +9,7 @@ import type { D1Database } from "@cloudflare/workers-types";
 declare global {
   /** Build id stamped by `vite.config.ts` (git sha); absent under plain tsc/dev. */
   const __CONTROL_BUILD__: string | undefined;
+
   interface KitEnv {
     DB?: D1Database;
     NOITE_EMAIL_WEBHOOK_URL?: string;

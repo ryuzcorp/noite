@@ -44,6 +44,7 @@ const noticePage = (
     action === undefined
       ? ""
       : `<p><a href="${action.href}" target="_top" rel="noopener">${action.label}</a></p>`;
+
   return new Response(
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>${NOTICE_CSS}</style></head><body><main><h1>${title}</h1><p>${message}</p>${link}</main></body></html>`,
     {
@@ -60,10 +61,13 @@ const noticePage = (
  * Only ever used on a localhost base, where the port is not browser-optional. */
 const forwardedPort = (host: string): string => {
   const at = host.lastIndexOf(":");
+
   if (at === -1) {
     return "";
   }
+
   const port = host.slice(at + 1);
+
   return /^\d+$/u.test(port) ? port : "";
 };
 
@@ -82,15 +86,18 @@ const envOriginFor = (
     env.BASE_DOMAIN ?? "localhost",
     env.CONTROL_EXTRA_HOSTS
   );
+
   const localhost = isLocalhostDomain(base);
   const port = localhost ? forwardedPort(forwarded) || url.port : "";
   const host = environmentHost(label, slug, base, port);
+
   return { host, origin: `${localhost ? "http" : "https"}://${host}` };
 };
 
 /** A signed-out viewer goes back to this exact hand-off after signing in. */
 const loginPath = (url: URL): string => {
   const back = sameOriginPath(`${url.pathname}${url.search}`) ?? "/apps";
+
   return `/login?return=${encodeURIComponent(back)}`;
 };
 
@@ -105,6 +112,7 @@ const resolveEnvironment = async (
   role: string
 ): Promise<{ label: string } | Response> => {
   let label: string | undefined;
+
   try {
     const list = await runnerEnvironmentsList(appId, role);
     label = list.find((row) => row.id === envId)?.label;
@@ -115,6 +123,7 @@ const resolveEnvironment = async (
       "The runner did not answer. This is usually momentary — retry in a moment."
     );
   }
+
   if (!label) {
     return noticePage(
       404,
@@ -122,24 +131,30 @@ const resolveEnvironment = async (
       "Deploy a preview of this branch from Code mode's Preview panel, or create the branch's environment on the Deployments tab."
     );
   }
+
   return { label };
 };
 
 export const handleEnvAuth: RouteHandler = async (request, env) => {
   let url: URL;
+
   try {
     url = new URL(request.url);
   } catch {
     return new Response("bad request", { status: 400 });
   }
+
   const envId = url.searchParams.get("env")?.trim() ?? "";
   const appId = url.searchParams.get("app")?.trim() ?? "";
+
   if (!envId || !appId) {
     return new Response("env and app are required", { status: 400 });
   }
+
   await ensureDbPromise();
   const session = await getSessionOrNull(request, env).catch(() => null);
   const user = session?.user;
+
   if (!user) {
     // Inside a preview frame the login form is not an answer (the frame's
     // visitor cannot complete it there): the page says so and offers the
@@ -152,9 +167,12 @@ export const handleEnvAuth: RouteHandler = async (request, env) => {
         { href: loginPath(url), label: "Sign in" }
       );
     }
+
     return loginRedirect(url);
   }
+
   const grant = await requireAppRole(appId, user.id, "view").catch(() => null);
+
   if (!grant) {
     return noticePage(
       403,
@@ -162,11 +180,15 @@ export const handleEnvAuth: RouteHandler = async (request, env) => {
       "This preview is members-only. Ask an app admin to add you as a collaborator, then reload it."
     );
   }
+
   const resolved = await resolveEnvironment(appId, envId, grant.role);
+
   if (resolved instanceof Response) {
     return resolved;
   }
+
   const forwarded = request.headers.get("x-forwarded-host") ?? "";
+
   const { host, origin } = envOriginFor(
     url,
     forwarded,
@@ -174,10 +196,13 @@ export const handleEnvAuth: RouteHandler = async (request, env) => {
     grant.app.slug,
     resolved.label
   );
+
   const returnPath = environmentReturnPath(
     url.searchParams.get("return") ?? "",
     host
   );
+
   const { token } = await runnerEnvironmentGrant(appId, envId, user.id);
+
   return redirect(envAuthLocation(origin, token, returnPath));
 };

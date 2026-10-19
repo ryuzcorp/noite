@@ -33,11 +33,13 @@ const hasAssets = (env: KitEnv): env is KitEnv & { ASSETS: AssetsBinding } =>
  * are ordinary static files, served from the deployment's own assets. */
 export const handlePreviewHostAsset: RouteHandler = async (request, env) => {
   const path = new URL(request.url).pathname;
+
   if (!isPreviewHost(request.headers.get("host"))) {
     return isControlDeniedAsset(path)
       ? new Response("Not Found", { status: 404 })
       : undefined;
   }
+
   if (path === POD_HOST_HTML_PATH) {
     return new Response(podHostHtml(POD_HOST_JS_PATH), {
       headers: {
@@ -47,8 +49,10 @@ export const handlePreviewHostAsset: RouteHandler = async (request, env) => {
       status: 200,
     });
   }
+
   if (!hasAssets(env)) {
     return new Response("Not Found", { status: 404 });
   }
+
   return await env.ASSETS.fetch(request);
 };

@@ -25,6 +25,7 @@ export const hydrateControlEnv = (
       controlEnv[key] = value;
     }
   }
+
   // Dev-process fallback only (vite dev has no compose env for the worker).
   // Prod values always arrive via compose environment / void.config.ts vars /
   // deploy env — never rely on these outside localhost dev. `noite.localhost`
@@ -35,6 +36,7 @@ export const hydrateControlEnv = (
     BASE_DOMAIN: "noite.localhost",
     RUNNER_URL: "http://127.0.0.1:8080",
   } satisfies Record<string, string>;
+
   for (const [key, value] of Object.entries(defaults)) {
     if (controlEnv[key] === undefined) {
       controlEnv[key] = value;

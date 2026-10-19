@@ -30,12 +30,17 @@ export const AppIdentityForm = ({
     if (!isAdmin || busy()) {
       return;
     }
+
     const next = draftName().trim();
+
     if (!next) {
       err.set("Name is required");
+
       return;
     }
+
     busy.set(true);
+
     try {
       await api<{ ok: true }>("/api/apps/renameApp", { id: appId, name: next });
       err.set("");

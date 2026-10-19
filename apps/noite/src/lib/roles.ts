@@ -10,6 +10,7 @@ export const parseAppRole = (role: string): AppRole | null => {
   if (role === "view" || role === "push" || role === "admin") {
     return role;
   }
+
   return null;
 };
 

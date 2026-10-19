@@ -57,17 +57,21 @@ const FilterPopover = ({
 }) => {
   const rows = atom<D1Filter[]>(applied);
   const details = atom.lazy(newLiveRef<HTMLDetailsElement>)();
+
   const close = () => {
     const element = liveEl(details);
+
     if (element) {
       element.open = false;
     }
   };
+
   const update = (index: number, patch: Partial<D1Filter>) => {
     rows.set(
       rows().map((row, i) => (i === index ? { ...row, ...patch } : row))
     );
   };
+
   return (
     <details
       class="dropdown"
@@ -202,12 +206,15 @@ const SortPopover = ({
   const column = atom(applied?.column ?? columns[0]?.name ?? "");
   const desc = atom(applied?.desc ?? false);
   const details = atom.lazy(newLiveRef<HTMLDetailsElement>)();
+
   const close = () => {
     const element = liveEl(details);
+
     if (element) {
       element.open = false;
     }
   };
+
   return (
     <details
       class="dropdown"
@@ -323,6 +330,7 @@ export const TableToolbar = ({
 }) => {
   const typed = atom(applied.search);
   const timer = atom.lazy(() => ({ id: 0 }))();
+
   return (
     <div class="border-base-300 flex flex-wrap items-center gap-2 border-b px-3 py-2">
       <label class="input input-sm w-56 max-w-full">

@@ -40,6 +40,7 @@ interface AdminUserRowItemProps {
 
 const AdminUserRowItem = (props: AdminUserRowItemProps) => {
   const { row } = props;
+
   return (
     <AdminRow
       avatar={<Avatar label={row.name || row.email} />}
@@ -137,15 +138,19 @@ const AdminUsersRows = ({
   const impersonate = async (user: AdminUserRow) => {
     impersonating.set(true);
     panelError.set("");
+
     try {
       const result = await authClient.admin.impersonateUser({
         userId: user.id,
       });
+
       if (result.error) {
         panelError.set(result.error.message ?? "Failed to impersonate user");
         impersonating.set(false);
+
         return;
       }
+
       // The session cookie is swapped server-side. The layout stays
       // mounted across navigation, so drop every user-scoped cache —
       // otherwise the chrome keeps showing the admin's session.
@@ -161,12 +166,14 @@ const AdminUsersRows = ({
   const mutate = async <T,>(work: () => Promise<T>): Promise<void> => {
     busy.set(true);
     panelError.set("");
+
     try {
       await work();
       await reload();
     } catch (error) {
       panelError.set(errorMessage(error));
     }
+
     busy.set(false);
   };
 
@@ -179,14 +186,17 @@ const AdminUsersRows = ({
 
   const toggleRole = async (user: AdminUserRow) => {
     const next = user.role === "admin" ? "user" : "admin";
+
     const ok = await confirmDialog({
       confirmLabel: next === "admin" ? "Make admin" : "Remove admin",
       title: `Make ${user.email} ${next === "admin" ? "an admin" : "a regular user"}?`,
       tone: "neutral",
     });
+
     if (!ok) {
       return;
     }
+
     await mutate(() =>
       api<{ ok: true }>("/api/admin/setUserRole", {
         role: next,
@@ -202,14 +212,17 @@ const AdminUsersRows = ({
         "Their account, sessions and API keys are removed. This cannot be undone.",
       title: `Delete ${user.email}?`,
     });
+
     if (!ok) {
       return;
     }
+
     await mutate(() => api<{ ok: true }>("/api/admin/deleteUser", user.id));
   };
 
   const loading = res.loading() && res.data() === undefined;
   let body: View;
+
   if (loading) {
     body = <SkeletonRows />;
   } else if (users.length === 0) {
@@ -245,6 +258,7 @@ const AdminUsersRows = ({
       </>
     );
   }
+
   return (
     <>
       <Problems load={loadError} panel={panelError()} />

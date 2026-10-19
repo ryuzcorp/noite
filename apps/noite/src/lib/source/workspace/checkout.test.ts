@@ -31,9 +31,11 @@ const header = (
   link = ""
 ): Uint8Array => {
   const block = new Uint8Array(512);
+
   const put = (text: string, start: number, length: number): void => {
     block.set(ENCODER.encode(text).subarray(0, length), start);
   };
+
   put(name, 0, 100);
   put(`${mode.toString(8).padStart(7, "0")}\u0000`, 100, 8);
   put("0000000\u0000", 108, 8);
@@ -46,10 +48,13 @@ const header = (
   put("ustar\u0000", 257, 6);
   put("00", 263, 2);
   let sum = 0;
+
   for (const byte of block) {
     sum += byte;
   }
+
   put(`${sum.toString(8).padStart(6, "0")}\u0000 `, 148, 8);
+
   return block;
 };
 
@@ -66,6 +71,7 @@ const block = (
   const out = new Uint8Array(512 + data.byteLength + padding);
   out.set(header(name, mode, data.byteLength, type, link), 0);
   out.set(data, 512);
+
   return out;
 };
 
@@ -74,23 +80,29 @@ const block = (
 const paxRecord = (key: string, value: string): string => {
   const body = ` ${key}=${value}\n`;
   let total = body.length + 1;
+
   while (String(total).length + body.length !== total) {
     total = body.length + String(total).length;
   }
+
   return `${total}${body}`;
 };
 
 /** The blocks of an archive, followed by the two zero blocks that end it. */
 const archive = (...parts: Uint8Array[]): Uint8Array => {
   const end = new Uint8Array(1024);
+
   const out = new Uint8Array(
     parts.reduce((total, part) => total + part.byteLength, end.byteLength)
   );
+
   let offset = 0;
+
   for (const part of [...parts, end]) {
     out.set(part, offset);
     offset += part.byteLength;
   }
+
   return out;
 };
 
@@ -104,6 +116,7 @@ describe("the tar reader", () => {
         block("bin/run.sh", 0o755, "echo hi\n")
       )
     );
+
     expect(entries.map((entry) => entry.name)).toEqual([
       "README.md",
       "bin/run.sh",
@@ -117,6 +130,7 @@ describe("the tar reader", () => {
     const entries = readTar(
       archive(block("link.md", 0o777, "", "2", "docs/README.md"))
     );
+
     expect(entries[0]?.gitMode).toBe("120000");
     expect(DECODER.decode(entries[0]?.bytes)).toBe("docs/README.md");
   });
@@ -132,6 +146,7 @@ describe("the tar reader", () => {
         block("deep/a-name-tha", 0o644, "long\n")
       )
     );
+
     expect(entries.map((entry) => entry.name)).toEqual([LONG_NAME]);
     expect(DECODER.decode(entries[0]?.bytes)).toBe("long\n");
   });
@@ -143,6 +158,7 @@ describe("the tar reader", () => {
         block("./long", 0o644, "x")
       )
     );
+
     expect(entries.map((entry) => entry.name)).toEqual([LONG_NAME]);
   });
 
@@ -157,6 +173,7 @@ const withPod = async (
   run: (fs: NodepodFS) => Promise<void>
 ): Promise<void> => {
   const pod = await Nodepod.boot();
+
   try {
     await run(pod.fs);
   } finally {
@@ -169,6 +186,7 @@ const listing = (files: readonly [string, string][]): Promise<TreeEntry[]> =>
   Promise.all(
     files.map(async ([path, text]): Promise<TreeEntry> => {
       const bytes = ENCODER.encode(text);
+
       return {
         mode: "100644",
         path,

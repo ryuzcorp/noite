@@ -18,12 +18,15 @@ const defaultLabel = (rpm: number) =>
  * whole number of requests per minute. `undefined` = not a valid number. */
 const parseRpm = (raw: string): number | null | undefined => {
   const value = raw.trim();
+
   if (!value) {
     return null;
   }
+
   if (!/^\d+$/u.test(value)) {
     return undefined;
   }
+
   return Number(value);
 };
 
@@ -50,9 +53,11 @@ export const RateLimitsPanel = ({
   const isAdmin = myRole === "admin";
 
   const current = res.data();
+
   if (res.loading() && current === undefined) {
     return <SectionSkeleton lines={2} />;
   }
+
   if (!current) {
     return (
       <SettingsSection>
@@ -61,6 +66,7 @@ export const RateLimitsPanel = ({
       </SettingsSection>
     );
   }
+
   const clientText = shownRpm(clientDraft(), current.clientRpm);
   const appText = shownRpm(appDraft(), current.appRpm);
 
@@ -68,13 +74,17 @@ export const RateLimitsPanel = ({
     event.preventDefault();
     const clientRpm = parseRpm(clientText);
     const appRpm = parseRpm(appText);
+
     if (clientRpm === undefined || appRpm === undefined) {
       err.set("Limits are whole numbers of requests per minute.");
+
       return;
     }
+
     busy.set(true);
     err.set("");
     note.set("");
+
     try {
       await api<{ ok: true }>("/api/limits/setLimits", {
         appId,
@@ -88,6 +98,7 @@ export const RateLimitsPanel = ({
     } catch (error) {
       err.set(errorMessage(error));
     }
+
     busy.set(false);
   };
 

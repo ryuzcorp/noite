@@ -17,9 +17,11 @@ export const OpenPrBadge = ({
   class?: string;
 }) => {
   const open = prList(appId, "open").data()?.counts.open;
+
   if (open === undefined || open === 0) {
     return null;
   }
+
   return <span class={`badge badge-sm tabular-nums ${extra}`}>{open}</span>;
 };
 

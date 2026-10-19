@@ -62,14 +62,17 @@ const PANE_CSS = `
 const paneIn = (host: HTMLElement): HTMLElement => {
   const root = host.shadowRoot ?? host.attachShadow({ mode: "open" });
   const existing = root.querySelector<HTMLElement>(".pane");
+
   if (existing) {
     return existing;
   }
+
   const style = document.createElement("style");
   style.textContent = PANE_CSS;
   const pane = document.createElement("div");
   pane.className = "pane";
   root.append(style, pane);
+
   return pane;
 };
 
@@ -83,19 +86,25 @@ export const diffLineFromEvent = (
     if (!(node instanceof HTMLElement)) {
       continue;
     }
+
     const raw = node.dataset.line ?? node.dataset.columnNumber;
+
     if (raw === undefined) {
       continue;
     }
+
     const line = Math.trunc(Number(raw));
+
     if (!Number.isSafeInteger(line) || line <= 0) {
       continue;
     }
+
     return {
       line,
       side: (node.dataset.lineType ?? "").includes("deletion") ? "old" : "new",
     };
   }
+
   return null;
 };
 
@@ -114,9 +123,11 @@ const PierreDiffs = ({
   const host = atom.lazy(() => newLiveRef<HTMLDivElement>())();
   watch.once(async ({ onCleanup, signal }) => {
     const el = await whenLive(host, signal);
+
     if (signal.aborted || !el) {
       return;
     }
+
     if (onLineClick) {
       el.addEventListener(
         "click",
@@ -124,7 +135,9 @@ const PierreDiffs = ({
           if (!window.getSelection()?.isCollapsed) {
             return;
           }
+
           const hit = diffLineFromEvent(event);
+
           if (hit) {
             onLineClick(hit);
           }
@@ -132,8 +145,10 @@ const PierreDiffs = ({
         { signal }
       );
     }
+
     const pane = paneIn(el);
     let diffs: DiffsModule;
+
     try {
       // Canonical modules only load here: a static import would carry the
       // whole syntax highlighter into every page's entry chunk, and
@@ -143,11 +158,14 @@ const PierreDiffs = ({
       diffs = (await import("@pierre/diffs")) as unknown as DiffsModule;
     } catch (error) {
       pane.textContent = `The diff viewer failed to load: ${errorMessage(error)}. Reload the page to retry.`;
+
       return;
     }
+
     if (signal.aborted) {
       return;
     }
+
     void (async () => {
       try {
         await diffs.preloadHighlighter({
@@ -158,27 +176,34 @@ const PierreDiffs = ({
         // Falls back to on-demand per-file grammar loads.
       }
     })();
+
     const views: FileDiffInstance[] = [];
+
     for (const fileDiff of entries(diffs)) {
       const wrap = document.createElement("div");
       pane.append(wrap);
+
       const instance = new diffs.FileDiff({
         diffStyle: "unified",
         overflow,
         theme: THEME,
       });
+
       instance.render({ containerWrapper: wrap, fileDiff });
       views.push(instance);
     }
+
     if (views.length === 0) {
       pane.textContent = emptyLabel;
     }
+
     onCleanup(() => {
       for (const view of views) {
         view.cleanUp();
       }
     });
   });
+
   return (
     <div
       ref={(el) => {
@@ -213,9 +238,11 @@ export const DiffView = ({
           // keeps non-file entries on plain text (same guard as the browser).
           // oxlint-disable-next-line anti-slop/no-runtime-typeof -- parsed patch filenames are untyped vendor data; the string check keeps non-file entries on plain text.
           const name = typeof fileDiff.name === "string" ? fileDiff.name : null;
+
           if (name !== null && fileDiff.lang === undefined) {
             fileDiff.lang = curatedLang(name, diffs.getFiletypeFromFileName);
           }
+
           return fileDiff;
         })
       )
@@ -239,6 +266,7 @@ export const DraftDiffView = ({
     entries={(diffs) =>
       files.map(({ after, before, path }) => {
         const lang = curatedLang(path, diffs.getFiletypeFromFileName);
+
         return diffs.parseDiffFromFile(
           { contents: before, lang, name: path },
           { contents: after, lang, name: path }

@@ -56,10 +56,12 @@ export const createTerminalBackend = (options: {
       if (shell !== null) {
         return;
       }
+
       const next = pod.createTerminal({
         FitAddon: StubFitAddon,
         Terminal: stubTerminalClass(onWrite),
       });
+
       next.setCwd(PROJECT_ROOT);
       // The tap draws nothing, but it still needs somewhere to be "open": a
       // node in the frame's own document, hidden, that never lays out.

@@ -18,9 +18,11 @@ import { DEFAULT_PAGE_SIZE, PAGE_SIZES, pageCount } from "./state";
 
 const rowRecord = (columns: string[], cells: D1Cell[]) => {
   const record: Record<string, D1Cell> = {};
+
   for (const [index, name] of columns.entries()) {
     record[name] = cells[index] ?? null;
   }
+
   return record;
 };
 
@@ -30,6 +32,7 @@ const sortMark = (sort: D1RowsQuery["sort"], column: string): string | null => {
   if (sort === null || sort.column !== column) {
     return null;
   }
+
   return sort.desc ? "▼" : "▲";
 };
 
@@ -45,9 +48,11 @@ const RowActionLink = ({
   record: Record<string, D1Cell>;
 }) => {
   const value = record[action.column] ?? "";
+
   if (value === "") {
     return null;
   }
+
   return (
     <Link
       class="link link-hover text-xs"
@@ -76,6 +81,7 @@ const Pager = ({
   total: number;
 }) => {
   const pages = pageCount(total, pageSize);
+
   return (
     <div class="flex flex-wrap items-center gap-2 text-sm">
       <label class="flex items-center gap-1">
@@ -173,9 +179,11 @@ export const RowsGrid = ({
   const failure = atom("");
   const data = resource.data();
   const loadError = resource.error();
+
   if (loadError && data === undefined) {
     return <p class="text-error m-0 p-4 text-sm">{errorMessage(loadError)}</p>;
   }
+
   if (!data) {
     return (
       <div class="flex flex-col gap-2 p-4">
@@ -185,17 +193,23 @@ export const RowsGrid = ({
       </div>
     );
   }
+
   const schemaColumn = (name: string) =>
     schema.columns.find((column) => column.name === name);
+
   const selectable = schema.caps.delete;
   const selectedIndexes = Object.keys(selected());
+
   const allSelected =
     data.rows.length > 0 && selectedIndexes.length === data.rows.length;
+
   const bulkDelete = async () => {
     if (busy()) {
       return;
     }
+
     busy.set(true);
+
     try {
       const keys = selectedIndexes.map((index) =>
         keyFor(
@@ -203,6 +217,7 @@ export const RowsGrid = ({
           rowRecord(data.columns, data.rows[Number(index)] ?? [])
         )
       );
+
       const result = await api<{ deleted: number; ok: boolean }>(
         "/api/storage/d1DeleteRows",
         {
@@ -212,6 +227,7 @@ export const RowsGrid = ({
           table: data.table,
         }
       );
+
       const deleted = result?.deleted ?? keys.length;
       failure.set("");
       selected.set({});
@@ -224,6 +240,7 @@ export const RowsGrid = ({
       busy.set(false);
     }
   };
+
   return (
     <div class="flex min-h-0 flex-1 flex-col">
       {selectedIndexes.length > 0 ? (
@@ -301,12 +318,16 @@ export const RowsGrid = ({
                       onchange={() => {
                         if (allSelected) {
                           selected.set({});
+
                           return;
                         }
+
                         const next: Record<string, true> = {};
+
                         for (const [index] of data.rows.entries()) {
                           next[String(index)] = true;
                         }
+
                         selected.set(next);
                       }}
                     />
@@ -315,6 +336,7 @@ export const RowsGrid = ({
                 {data.columns.map((name) => {
                   const column = schemaColumn(name);
                   const mark = sortMark(query.sort, name);
+
                   return (
                     <th key={name} class="whitespace-nowrap">
                       <button
@@ -345,6 +367,7 @@ export const RowsGrid = ({
             <tbody>
               {data.rows.map((cells, index) => {
                 const record = rowRecord(data.columns, cells);
+
                 return (
                   <tr
                     key={String(index)}
@@ -366,14 +389,17 @@ export const RowsGrid = ({
                           checked={selected()[String(index)] === true}
                           onchange={(event) => {
                             const next: Record<string, true> = {};
+
                             for (const [key] of Object.entries(selected())) {
                               if (key !== String(index)) {
                                 next[key] = true;
                               }
                             }
+
                             if (event.currentTarget.checked) {
                               next[String(index)] = true;
                             }
+
                             selected.set(next);
                           }}
                         />
@@ -381,6 +407,7 @@ export const RowsGrid = ({
                     ) : null}
                     {data.columns.map((name, columnIndex) => {
                       const column = schemaColumn(name);
+
                       return (
                         <td key={name} class="align-middle">
                           <CellValue

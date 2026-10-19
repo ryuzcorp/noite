@@ -18,6 +18,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 
 const root = new URL("../", import.meta.url).pathname;
+
 const read = (rel: string): string =>
   readFileSync(path.join(root, rel), "utf-8");
 
@@ -25,6 +26,7 @@ const dockerfile = read("docker/Dockerfile");
 const config = read("apps/runner/src/config.rs");
 
 let failed = false;
+
 const fail = (message: string): void => {
   console.error(message);
   failed = true;
@@ -33,6 +35,7 @@ const fail = (message: string): void => {
 /** Minimal semver compare: numeric core, then prerelease (absent wins). */
 const splitVersion = (v: string) => {
   const [core, ...pre] = v.split("-");
+
   return {
     core: (core ?? "").split(".").map(Number),
     pre: pre.join("-"),
@@ -42,21 +45,27 @@ const splitVersion = (v: string) => {
 const compareVersions = (a: string, b: string): number => {
   const x = splitVersion(a);
   const y = splitVersion(b);
+
   for (let i = 0; i < 3; i += 1) {
     const d = (x.core[i] ?? 0) - (y.core[i] ?? 0);
+
     if (d !== 0) {
       return d < 0 ? -1 : 1;
     }
   }
+
   if (x.pre === y.pre) {
     return 0;
   }
+
   if (x.pre === "") {
     return 1;
   }
+
   if (y.pre === "") {
     return -1;
   }
+
   return x.pre < y.pre ? -1 : 1;
 };
 
@@ -71,6 +80,7 @@ for (const [name, pattern] of [
   const versions = [...dockerfile.matchAll(pattern)].map(
     (m) => m.groups?.version ?? ""
   );
+
   if (versions.length === 1) {
     console.log(`${name}: ${versions[0]}`);
   } else {
@@ -82,10 +92,12 @@ for (const [name, pattern] of [
 
 const imageLog = /CADDY_ACCESS_LOG=(?<sink>\S+)/u.exec(dockerfile)?.groups
   ?.sink;
+
 const defaultLog =
   /"CADDY_ACCESS_LOG"\)\s*\.unwrap_or_else\(\|_\| "(?<sink>[^"]+)"/u.exec(
     config
   )?.groups?.sink;
+
 if (!imageLog || !defaultLog) {
   fail(
     "access log: could not read CADDY_ACCESS_LOG from the Dockerfile or config.rs"
@@ -103,11 +115,15 @@ if (!imageLog || !defaultLog) {
 // entry). If the two drift, tenant Node tools fail on a perfectly valid uid.
 const uidBase = /pub const BUILD_UID_BASE: u32 = (?<n>\d+)/u.exec(config)
   ?.groups?.n;
+
 const uidRange = /pub const BUILD_UID_RANGE: u32 = (?<n>\d+)/u.exec(config)
   ?.groups?.n;
+
 const uidSeq = /seq (?<lo>\d+) (?<hi>\d+)/u.exec(dockerfile)?.groups;
+
 if (uidBase && uidRange && uidSeq) {
   const expectedHigh = Number(uidBase) + Number(uidRange) - 1;
+
   if (
     Number(uidSeq.lo) !== Number(uidBase) ||
     Number(uidSeq.hi) !== expectedHigh
@@ -123,12 +139,14 @@ if (uidBase && uidRange && uidSeq) {
     "build uid range: could not read BUILD_UID_BASE/RANGE from config.rs or the seq from the Dockerfile"
   );
 }
+
 // Floating image lines: bun must agree across stages (ui-build on full
 // debian, the runtime on slim), and the rust line must stay a single pin —
 // neither may silently split into two versions.
 const bunRefs = [
   ...dockerfile.matchAll(/oven\/bun:(?<version>[^-:\s]+)-/gu),
 ].map((m) => m.groups?.version ?? "");
+
 if (bunRefs.length === 0) {
   fail("bun: no oven/bun image ref found in docker/Dockerfile");
 } else if (bunRefs.every((v) => v === bunRefs[0])) {
@@ -136,9 +154,11 @@ if (bunRefs.length === 0) {
 } else {
   fail(`bun: stages disagree (${bunRefs.join(", ")}); pin one line everywhere`);
 }
+
 const rustRefs = [
   ...dockerfile.matchAll(/library\/rust:(?<version>[^-:\s]+)-bookworm/gu),
 ].map((m) => m.groups?.version ?? "");
+
 if (rustRefs.length === 1) {
   console.log(`rust: ${rustRefs[0]}-bookworm`);
 } else {
@@ -146,14 +166,19 @@ if (rustRefs.length === 1) {
     `rust: docker/Dockerfile must pin exactly once (found ${rustRefs.length}: ${rustRefs.join(", ")})`
   );
 }
+
 // The bundled store: compose.yaml must serve the version platforms.mdx
 // documents, or installs and docs disagree about what runs.
 const composeYaml = read("docker/compose.yaml");
+
 const rustfsCompose = /rustfs\/rustfs:(?<version>[^\s"']+)/u.exec(composeYaml)
   ?.groups?.version;
+
 const platformsDoc = read("apps/website/docs/self-hosting/platforms.mdx");
+
 const rustfsDoc = /rustfs\/rustfs:(?<version>[0-9.]+)/u.exec(platformsDoc)
   ?.groups?.version;
+
 if (!rustfsCompose || !rustfsDoc) {
   fail(
     "rustfs: could not read the image tag from compose.yaml or platforms.mdx"
@@ -165,16 +190,19 @@ if (!rustfsCompose || !rustfsDoc) {
     `rustfs: compose.yaml serves ${rustfsCompose} but platforms.mdx documents ${rustfsDoc}`
   );
 }
+
 // Sidecars (esbuild, duckdb): install-sidecars.sh is the single source of
 // truth — each default must appear exactly once and be well-formed, and the
 // Dockerfile must not carry its own version (it only invokes the script).
 const sidecars = read("docker/install-sidecars.sh");
+
 for (const name of ["ESBUILD_VERSION", "DUCKDB_VERSION"] as const) {
   const defaults = [
     ...sidecars.matchAll(
       new RegExp(`^${name}="\\$\\{${name}:-(?<v>[^}]+)\\}"`, "gmu")
     ),
   ].map((m) => m.groups?.v ?? "");
+
   if (defaults.length !== 1 || !/^\d+\.\d+\.\d+$/u.test(defaults[0] ?? "")) {
     fail(
       `${name}: install-sidecars.sh must default it exactly once to x.y.z (found: ${defaults.join(", ")})`
@@ -182,12 +210,14 @@ for (const name of ["ESBUILD_VERSION", "DUCKDB_VERSION"] as const) {
   } else {
     console.log(`${name}: ${defaults[0]}`);
   }
+
   if (new RegExp(`\\b${name}=`, "u").test(dockerfile)) {
     fail(
       `${name}: docker/Dockerfile must not pin its own version (single source is install-sidecars.sh)`
     );
   }
 }
+
 // `@noitenow/cli` ships its version to npm: the release commit bumps
 // packages/cli/package.json alongside the CHANGELOG section, and the tag's
 // publish job refuses anything but an exact match. Between releases the
@@ -196,10 +226,12 @@ for (const name of ["ESBUILD_VERSION", "DUCKDB_VERSION"] as const) {
 const cliVersion =
   /"version":\s*"(?<version>[^"]+)"/u.exec(read("packages/cli/package.json"))
     ?.groups?.version ?? "";
+
 const latestRelease =
   [...read("CHANGELOG.md").matchAll(/^## \[(?<v>[^\]]+)\]/gmu)]
     .map((m) => m.groups?.v ?? "")
     .find((v) => v !== "Unreleased") ?? "";
+
 if (!/^\d+\.\d+\.\d+(?<pre>-[0-9A-Za-z.-]+)?$/u.test(cliVersion)) {
   fail(`cli: packages/cli/package.json version is not semver (${cliVersion})`);
 } else if (latestRelease === "") {
@@ -211,6 +243,7 @@ if (!/^\d+\.\d+\.\d+(?<pre>-[0-9A-Za-z.-]+)?$/u.test(cliVersion)) {
 } else {
   console.log(`cli: ${cliVersion} (>= [${latestRelease}])`);
 }
+
 if (!dockerfile.includes("install-sidecars.sh")) {
   fail("sidecars: docker/Dockerfile no longer invokes install-sidecars.sh");
 }

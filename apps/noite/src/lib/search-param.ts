@@ -41,6 +41,7 @@ export interface SearchParamFn {
  * (missing, `0`, negative, fractional, not a number) is the first page. */
 export const parseSkip = (raw: string): number => {
   const value = Math.trunc(Number(raw));
+
   return Number.isSafeInteger(value) && value > 0 ? value : 0;
 };
 
@@ -71,10 +72,12 @@ export const notifyQueryChanged = (): void => {
  * an extra bump is one harmless repaint. Client-only: the server never
  * navigates, and there is exactly one history per page. */
 let historyWatched = false;
+
 if (typeof window !== "undefined") {
   const bump = (): void => {
     notifyQueryChanged();
   };
+
   const { history } = window;
   const pushState = history.pushState.bind(history);
   history.pushState = (
@@ -83,6 +86,7 @@ if (typeof window !== "undefined") {
     pushState(...args);
     bump();
   };
+
   const replaceState = history.replaceState.bind(history);
   history.replaceState = (
     ...args: [data: unknown, unused: string, url?: string | URL | null]
@@ -90,6 +94,7 @@ if (typeof window !== "undefined") {
     replaceState(...args);
     bump();
   };
+
   if (!historyWatched) {
     historyWatched = true;
     window.addEventListener("popstate", bump);
@@ -105,23 +110,30 @@ export const searchParam: SearchParamFn = <T>(
   // SAFETY: the default parser is the identity; T is inferred from opts.default, so callers without parse get T = string and raw already is one.
   const parse = opts.parse ?? ((raw: string): T => raw as T);
   const serialize = opts.serialize ?? String;
+
   const read = (): T => {
     if (typeof window === "undefined") {
       return opts.default;
     }
+
     const raw = new URLSearchParams(window.location.search).get(name);
+
     return raw === null ? opts.default : parse(raw);
   };
+
   const write = (next: T): void => {
     if (typeof window === "undefined") {
       return;
     }
+
     const params = new URLSearchParams(window.location.search);
+
     if (next === opts.default) {
       params.delete(name);
     } else {
       params.set(name, serialize(next));
     }
+
     const query = params.toString();
     window.history.replaceState(
       null,
@@ -132,11 +144,13 @@ export const searchParam: SearchParamFn = <T>(
     );
     notifyQueryChanged();
   };
+
   const param: SearchParam<T> = Object.assign(
     (): T => {
       // The value is not used: reading the cell is what registers the
       // subscription on the component that is rendering right now.
       cell?.();
+
       return read();
     },
     {
@@ -146,5 +160,6 @@ export const searchParam: SearchParamFn = <T>(
       },
     }
   );
+
   return param;
 };

@@ -26,6 +26,7 @@ const rules = (requirePr: boolean): BranchRules => ({
 
 test("only a name in the refs list opens editable", () => {
   const known = refs(["main", "staging"]);
+
   for (const role of ["push", "admin"] as const) {
     expect(editableRef(known, role, "main")).toBe(true);
     expect(editableRef(known, role, "staging")).toBe(true);
@@ -35,6 +36,7 @@ test("only a name in the refs list opens editable", () => {
     expect(editableRef(known, role, SHA)).toBe(false);
     expect(editableRef(undefined, role, "main")).toBe(false);
   }
+
   // A view-only collaborator and an unresolved role stay read-only.
   expect(editableRef(known, "view", "main")).toBe(false);
   expect(editableRef(known, undefined, "main")).toBe(false);

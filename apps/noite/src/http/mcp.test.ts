@@ -38,6 +38,7 @@ const mintKey = async (
     userId,
     `${userId}@example.com`,
   ]);
+
   const created = await authFromEnv(ENV, ENV.BETTER_AUTH_URL).api.createApiKey({
     body: {
       name: "mcp-test",
@@ -45,10 +46,13 @@ const mintKey = async (
       userId,
     },
   });
+
   const key = created?.key;
+
   if (!key) {
     throw new Error("better-auth minted no API key");
   }
+
   return key;
 };
 
@@ -60,10 +64,12 @@ const call = async (
     headers: { "content-type": "application/json", ...init?.headers },
     method: init?.method ?? "POST",
   };
+
   // A GET carries no body: `new Request` throws on one.
   if (body !== "") {
     requestInit.body = body;
   }
+
   return await handleMcp(
     new Request(MCP_URL, requestInit),
     // SAFETY: the handler takes the full Worker env; the test env carries the auth/runner keys this path reads.
@@ -87,6 +93,7 @@ describe("POST /mcp", () => {
     // better-auth logs every rejected key at ERROR level; this case is about
     // the HTTP answer, so keep the lane's output clean.
     const logged = spyOn(console, "error").mockImplementation(() => {});
+
     try {
       const missing = await call(`{"id":1,"method":"ping"}`);
       expect(missing?.status).toBe(401);
@@ -96,6 +103,7 @@ describe("POST /mcp", () => {
       const wrong = await call(`{"id":1,"method":"ping"}`, {
         headers: bearer("noite_not-a-real-key"),
       });
+
       expect(wrong?.status).toBe(401);
       expect(wrong?.headers.get("www-authenticate")).toBe("Bearer");
     } finally {
@@ -105,11 +113,14 @@ describe("POST /mcp", () => {
 
   test("refuses a key without the app-management scope", async () => {
     const logged = spyOn(console, "error").mockImplementation(() => {});
+
     try {
       const eventsOnly = await mintKey("u-events", { events: ["push"] });
+
       const response = await call(`{"id":1,"method":"ping"}`, {
         headers: bearer(eventsOnly),
       });
+
       expect(response?.status).toBe(401);
     } finally {
       logged.mockRestore();
@@ -118,19 +129,23 @@ describe("POST /mcp", () => {
 
   test("rejects a browser origin that is not this control site", async () => {
     const key = await mintKey("u-origin");
+
     const hostile = await call(`{"id":1,"method":"ping"}`, {
       headers: { ...bearer(key), origin: "https://evil.example" },
     });
+
     expect(hostile?.status).toBe(403);
 
     const sameSite = await call(`{"id":1,"method":"ping"}`, {
       headers: { ...bearer(key), origin: "http://localhost:9080" },
     });
+
     expect(sameSite?.status).toBe(200);
   });
 
   test("answers initialize, tools/list and ping for a real key", async () => {
     const key = await mintKey("u-ok");
+
     const initialized = await call(
       JSON.stringify({
         id: 1,
@@ -140,6 +155,7 @@ describe("POST /mcp", () => {
       }),
       { headers: bearer(key) }
     );
+
     expect(initialized?.status).toBe(200);
     expect(initialized?.headers.get("content-type")).toContain(
       "application/json"
@@ -156,10 +172,12 @@ describe("POST /mcp", () => {
     const listed = await call(JSON.stringify({ id: 2, method: "tools/list" }), {
       headers: bearer(key),
     });
+
     // SAFETY: handleHttp answers JSON for a tools/list request (asserted 200 above by the initialize probe).
     const payload = (await listed?.json()) as {
       result?: { tools?: { name: string }[] };
     };
+
     const names = payload.result?.tools?.map((tool) => tool.name) ?? [];
     expect(names).toContain("list_apps");
     expect(names).toContain("create_app");
@@ -169,20 +187,24 @@ describe("POST /mcp", () => {
 
   test("a notification is 202 with no body", async () => {
     const key = await mintKey("u-notify");
+
     const response = await call(
       JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
       { headers: bearer(key) }
     );
+
     expect(response?.status).toBe(202);
     expect(await response?.text()).toBe("");
   });
 
   test("an unknown method is a JSON-RPC error, not a 404", async () => {
     const key = await mintKey("u-method");
+
     const response = await call(
       JSON.stringify({ id: 3, method: "resources/list" }),
       { headers: bearer(key) }
     );
+
     expect(response?.status).toBe(200);
     expect(await response?.json()).toMatchObject({
       error: { code: -32_601 },
@@ -202,22 +224,27 @@ describe("POST /mcp", () => {
 
   test("a body over the bound is refused before it is read", async () => {
     const key = await mintKey("u-big");
+
     const response = await call("x".repeat(MAX_BODY_BYTES + 1), {
       headers: bearer(key),
     });
+
     expect(response?.status).toBe(413);
   });
 
   test("rejects an unsupported MCP-Protocol-Version header", async () => {
     const key = await mintKey("u-version");
+
     const response = await call(`{"id":1,"method":"ping"}`, {
       headers: { ...bearer(key), "mcp-protocol-version": "1999-01-01" },
     });
+
     expect(response?.status).toBe(400);
 
     const supported = await call(`{"id":1,"method":"ping"}`, {
       headers: { ...bearer(key), "mcp-protocol-version": "2025-06-18" },
     });
+
     expect(supported?.status).toBe(200);
   });
 });

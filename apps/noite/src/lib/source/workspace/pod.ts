@@ -52,17 +52,21 @@ export type { OpenPod, PodOptions } from "./types";
  * workspaces, so the id has to name the app and the branch and nothing else. */
 export const persistenceId = (appId: string, branch: string): string =>
   `noite:${appId}:${branch}`;
+
 /** The SDK's mutation union down to what the state mirror records. */
 const toMirrorMutation = (mutation: VolumeMutation): MirrorMutation => {
   if (mutation.op === "write") {
     return { op: "write", path: mutation.path };
   }
+
   if (mutation.op === "remove") {
     return { op: "remove", path: mutation.path };
   }
+
   if (mutation.op === "rename") {
     return { from: mutation.from, op: "rename", to: mutation.to };
   }
+
   return { op: "ignore" };
 };
 
@@ -135,6 +139,7 @@ interface HeldPod {
  * make a save land right now, and the way back out. */
 const hold = (pod: Nodepod, held: HeldPod): OpenPod => {
   const { editable, persistence, saves = () => true, stopMirror, sync } = held;
+
   // A refused save is not this tab's error to report (see `gatedStore`).
   const save = async (run: () => Promise<void>): Promise<void> => {
     try {
@@ -145,13 +150,16 @@ const hold = (pod: Nodepod, held: HeldPod): OpenPod => {
       }
     }
   };
+
   return {
     close: async () => {
       sync?.close();
       stopMirror?.();
+
       if (persistence) {
         await save(() => persistence.close());
       }
+
       await pod.teardown();
     },
     editable,
@@ -170,6 +178,7 @@ const hold = (pod: Nodepod, held: HeldPod): OpenPod => {
     pod,
   };
 };
+
 /** The pod's volume as the SDK-free mirror sees it: the same synchronous
  * calls, with mutations classified down at this boundary. */
 const classifyMutation =
@@ -180,6 +189,7 @@ const classifyMutation =
 
 const mirrorVolume = (pod: Nodepod): MirrorVolume => {
   const { volume } = pod.fs;
+
   return {
     existsSync: (path) => volume.existsSync(path),
     mkdirSync: (path, options) => {
@@ -205,6 +215,7 @@ const restoreMirrors = (pod: Nodepod, id: string, editable: boolean): void => {
   if (!editable) {
     return;
   }
+
   restoreMirror(mirrorVolume(pod), UNSAVED_PROJECT, id, mirrorStorage());
 };
 
@@ -225,12 +236,15 @@ const startMirrors = (
     id,
     mirrorStorage()
   );
+
   const onSaved = (): void => {
     if (persistence?.pendingChanges === 0) {
       project.clear();
     }
   };
+
   persistence?.on("saved", onSaved);
+
   return () => {
     persistence?.off("saved", onSaved);
     project.stop();
@@ -251,10 +265,12 @@ const queueForLock = (id: string) => {
   const leave = new AbortController();
   const released = Promise.withResolvers<undefined>();
   const granted = Promise.withResolvers<boolean>();
+
   const release = (): void => {
     leave.abort();
     released.resolve();
   };
+
   const lock = {
     onLost: null,
     release,
@@ -264,9 +280,11 @@ const queueForLock = (id: string) => {
       } catch {
         // Settled is all the release waits for.
       }
+
       release();
     },
   };
+
   const request = async (): Promise<void> => {
     try {
       await navigator.locks.request(
@@ -274,15 +292,19 @@ const queueForLock = (id: string) => {
         { signal: leave.signal },
         () => {
           granted.resolve(true);
+
           return released.promise;
         }
       );
     } catch {
       // Left the queue before it was granted (the tab closed first).
     }
+
     granted.resolve(false);
   };
+
   void request();
+
   return { granted: granted.promise, lock };
 };
 
@@ -309,6 +331,7 @@ const gatedStore = (
     if (!saves()) {
       throw new Error("workspace: another tab saves this workspace");
     }
+
     await store.commit(batch);
   },
   load: () => store.load(),
@@ -331,8 +354,10 @@ const saveWhenGranted = async (
   if (!(await granted) || persistence.status === "closed") {
     return;
   }
+
   takeOver();
   sync.serveFlush(() => persistence.flush());
+
   try {
     await persistence.flush();
   } catch {
@@ -353,11 +378,14 @@ const holdSaving = (
   restoreMirrors(pod, id, true);
   const sync = openSync(pod, id);
   const { persistence } = pod;
+
   if (persistence) {
     sync.serveFlush(() => persistence.flush());
     persistence.on("error", onSaveError);
   }
+
   sync.start();
+
   return hold(pod, {
     editable: true,
     persistence,
@@ -380,6 +408,7 @@ const holdFollowing = async (
   let saving = false;
   const saves = (): boolean => saving;
   let persistence: WorkspacePersistence | null = null;
+
   if (store !== null) {
     const queued = queueForLock(id);
     persistence = new WorkspacePersistence(
@@ -404,8 +433,10 @@ const holdFollowing = async (
       held.on("error", onSaveError);
     });
   }
+
   restoreMirrors(pod, id, true);
   sync.start();
+
   return hold(pod, {
     editable: true,
     persistence,
@@ -422,23 +453,29 @@ export const openPod = async (options: PodOptions): Promise<OpenPod> => {
   const { appId, branch, editable, onSaveError } = options;
   const id = persistenceId(appId, branch);
   const boot = bootOptions();
+
   if (!editable) {
     const pod = await Nodepod.boot(boot);
     restoreMirrors(pod, id, false);
+
     return hold(pod, { editable: false, persistence: null });
   }
+
   try {
     const pod = await Nodepod.boot({
       ...boot,
       persistence: persistenceOptions(id),
     });
+
     return holdSaving(pod, id, onSaveError);
   } catch (error) {
     const lockedOut =
       error instanceof Error && "code" in error && error.code === LOCKED_CODE;
+
     if (!lockedOut) {
       throw error;
     }
+
     return holdFollowing(await Nodepod.boot(boot), id, onSaveError);
   }
 };

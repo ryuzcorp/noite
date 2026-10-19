@@ -16,6 +16,7 @@ export const ConnectAgentCard = ({
 }) => {
   const { origin } = window.location;
   const endpoint = `${origin}/mcp`;
+
   return (
     <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
       <div class="flex items-center justify-between gap-2">

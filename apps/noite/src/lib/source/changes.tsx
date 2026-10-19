@@ -33,9 +33,11 @@ const commitTargets = (
 ): string[] => {
   const names = branches.map((branch) => branch.name);
   const head = [browsed];
+
   if (defaultBranch !== browsed && names.includes(defaultBranch)) {
     head.push(defaultBranch);
   }
+
   return [
     ...head,
     ...branches
@@ -68,15 +70,20 @@ const changeVerb = (file: WorkspaceChange): string =>
  * files". */
 const defaultMessage = (state: SourceBrowserState): string => {
   const { files } = state;
+
   if (files.length === 0) {
     return "Update files";
   }
+
   if (files.length === 1) {
     const [file] = files;
+
     return `${changeVerb(file)} ${file.path.slice(file.path.lastIndexOf("/") + 1)}`;
   }
+
   const [first] = files;
   const verb = changeVerb(first);
+
   return files.every((file) => changeVerb(file) === verb)
     ? `${verb} ${files.length} files`
     : `Update ${files.length} files`;
@@ -100,26 +107,33 @@ const pushErrorCopy = (
   readOnly: SourceBrowserState["readOnly"]
 ): string => {
   const lower = raw.toLowerCase();
+
   if (lower.includes("read-only")) {
     return readOnly === ""
       ? "This checkout is read-only, so nothing was pushed."
       : READ_ONLY_NOTICE[readOnly];
   }
+
   if (lower.includes("protected")) {
     return "That branch is protected. Push to a new branch and open a pull request instead.";
   }
+
   if (lower.includes("tip moved")) {
     return "The branch moved while you were editing. Refresh the page to see the new commits, then push again.";
   }
+
   if (lower.includes("invalid branch")) {
     return "That branch name is not valid.";
   }
+
   if (lower.includes("branch") && lower.includes("exists")) {
     return "A branch with that name already exists.";
   }
+
   if (lower.includes("failed to fetch") || lower.includes("network")) {
     return "Could not reach the server. Check your connection and try again.";
   }
+
   return raw;
 };
 
@@ -143,10 +157,13 @@ const PushOutcome = ({
       </p>
     );
   }
+
   const { pushed } = state;
+
   if (!pushed) {
     return null;
   }
+
   if (!pushed.newBranch) {
     return (
       <p class="m-0 text-xs opacity-70">
@@ -154,6 +171,7 @@ const PushOutcome = ({
       </p>
     );
   }
+
   return (
     <p class="m-0 text-xs opacity-70">
       Pushed to <span class="font-mono">{pushed.branch}</span>.{" "}
@@ -210,33 +228,41 @@ const CommitForm = ({
   const lastMessage = atom("");
   const current = state();
   const held = choice();
+
   // What the form shows: the choice made on this ref, or the fresh one a switch
   // to another ref starts from (the browsed branch itself).
   const mine =
     held.branch === branch ? held : { branch, name: "", target: branch };
+
   const { name: newBranch, target } = mine;
   const targets = commitTargets(branches, branch, defaultBranch);
   // A protected branch only takes commits through a pull.
   const into = isProtected(target) ? NEW_BRANCH : target;
   const branchName = newBranch.trim();
+
   const nameError =
     into === NEW_BRANCH && branchName !== ""
       ? branchNameError(branchName)
       : null;
+
   const blocked =
     current.files.length === 0 ||
     current.pushing ||
     (into === NEW_BRANCH && (branchName === "" || nameError !== null));
+
   return (
     <form
       class="border-base-300 flex flex-col gap-2 border-t px-3 py-3"
       onsubmit={(event) => {
         event.preventDefault();
+
         if (blocked) {
           return;
         }
+
         const text = message().trim() || defaultMessage(current);
         const request: PushRequest = { message: text };
+
         // Naming the browsed branch is the same as naming none — the commit
         // lands there either way. A new branch names itself, and the runner
         // creates it at the browsed tip; any other target names its branch,
@@ -246,6 +272,7 @@ const CommitForm = ({
         } else if (into !== branch) {
           request.branch = into;
         }
+
         lastMessage.set(text);
         void (async () => {
           // A landed push empties the form for the next commit; a failed one
@@ -254,6 +281,7 @@ const CommitForm = ({
           if (await commit(request)) {
             message.set("");
             const now = choice();
+
             if (now.branch === branch) {
               choice.set({ ...now, name: "" });
             }
@@ -283,6 +311,7 @@ const CommitForm = ({
         >
           {targets.map((name) => {
             const locked = isProtected(name);
+
             return (
               <option
                 key={name}
@@ -385,12 +414,15 @@ const rowBadge = (file: WorkspaceChange): RowBadge => {
   if (file.binary !== undefined) {
     return { class: "badge-neutral", label: "binary" };
   }
+
   if (file.kind === "deleted") {
     return { class: "badge-error", label: "deleted" };
   }
+
   if (file.kind === "moved") {
     return { class: "badge-warning", label: "moved" };
   }
+
   return { class: "badge-neutral", label: file.kind };
 };
 
@@ -411,6 +443,7 @@ const ChangeRow = ({
 }) => {
   const badge = rowBadge(file);
   const undoing = file.kind === "deleted" || file.kind === "moved";
+
   return (
     <li
       class={`border-base-300 flex items-center gap-2 px-3 py-2 ${last ? "" : "border-b"}`}
@@ -471,6 +504,7 @@ export const ChangesPanel = ({
   state,
 }: ChangesPanelProps) => {
   const { conflicts, files, readOnly, revision, stale } = state();
+
   // One controller per mounted panel: a dialog left open by a close is torn
   // down with it instead of blocking the page.
   // A live controller does not survive the SSR snapshot: out of it, so the
@@ -478,11 +512,13 @@ export const ChangesPanel = ({
   const dialogs = atom.lazy(() => new AbortController(), {
     snapshot: false,
   })();
+
   watch.once(({ onCleanup }) => {
     onCleanup(() => {
       dialogs.abort();
     });
   });
+
   // Text changes carry a diff; an upload has no text to compare, a pure move
   // or a staged deletion has none either, and a row whose committed text is
   // still being read has nothing to compare against yet.
@@ -493,6 +529,7 @@ export const ChangesPanel = ({
       file.kind !== "deleted" &&
       (file.kind !== "moved" || hasEdit(file))
   );
+
   const ask = (title: string, message: string, confirmLabel: string) =>
     confirmDialog({
       confirmLabel,
@@ -500,6 +537,7 @@ export const ChangesPanel = ({
       signal: dialogs.signal,
       title,
     });
+
   const askDiscard = (file: WorkspaceChange) => {
     void (async () => {
       const ok = await ask(
@@ -507,11 +545,13 @@ export const ChangesPanel = ({
         "The file goes back to the last commit.",
         "Discard"
       );
+
       if (ok) {
         discard(file.path);
       }
     })();
   };
+
   const askDiscardAll = () => {
     void (async () => {
       const ok = await ask(
@@ -519,11 +559,13 @@ export const ChangesPanel = ({
         `All ${files.length} changes go back to the last commit.`,
         "Discard all"
       );
+
       if (ok) {
         discardAll();
       }
     })();
   };
+
   return (
     <div class="flex min-h-0 flex-1 flex-col">
       {stale === null ? null : (

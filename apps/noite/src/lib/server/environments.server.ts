@@ -27,22 +27,27 @@ import { redactEnv } from "./env.server";
 import { sessionUser } from "./session.server";
 
 const AppId = Schema.String;
+
 const BranchArgs = Schema.Struct({
   appId: Schema.String,
   branch: Schema.String,
 });
+
 const EnvId = Schema.Struct({ appId: Schema.String, envId: Schema.String });
+
 const PublicArgs = Schema.Struct({
   appId: Schema.String,
   envId: Schema.String,
   public: Schema.Boolean,
 });
+
 const VarArgs = Schema.Struct({
   appId: Schema.String,
   envId: Schema.String,
   name: Schema.String,
   value: Schema.String,
 });
+
 const VarNameArgs = Schema.Struct({
   appId: Schema.String,
   envId: Schema.String,
@@ -55,6 +60,7 @@ export const listEnvironments = apiAction(
   async (appId, { env, request }) => {
     const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "view");
+
     try {
       return await runnerEnvironmentsList(appId, role);
     } catch (error) {
@@ -70,6 +76,7 @@ export const createEnvironment = apiAction(
   async ({ appId, branch }, { env, request }) => {
     const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "push");
+
     try {
       return await runnerEnvironmentCreate(appId, branch, role, {
         name: user.name,
@@ -87,6 +94,7 @@ export const deleteEnvironment = apiAction(
   async ({ appId, envId }, { env, request }) => {
     const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "admin");
+
     try {
       await runnerEnvironmentDelete(appId, envId, role);
     } catch (error) {
@@ -101,6 +109,7 @@ export const updateEnvironment = apiAction(
   async ({ appId, envId, public: isPublic }, { env, request }) => {
     const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "admin");
+
     try {
       return await runnerEnvironmentUpdate(appId, envId, isPublic, role);
     } catch (error) {
@@ -115,6 +124,7 @@ export const deployEnvironment = apiAction(
   async ({ appId, envId }, { env, request }) => {
     const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "push");
+
     try {
       return await runnerEnvironmentDeploy(appId, envId, role);
     } catch (error) {
@@ -130,8 +140,10 @@ export const environmentVars = apiAction(
   async ({ appId, envId }, { env, request }) => {
     const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "view");
+
     try {
       const rows = await runnerEnvironmentVars(appId, envId, role);
+
       return rows.map((row) => redactEnv(row));
     } catch (error) {
       failUnknown(error);
@@ -145,6 +157,7 @@ export const setEnvironmentVar = apiAction(
   async ({ appId, envId, name, value }, { env, request }) => {
     const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "push");
+
     try {
       return await runnerEnvironmentVarSet(appId, envId, name, value, role);
     } catch (error) {
@@ -159,6 +172,7 @@ export const deleteEnvironmentVar = apiAction(
   async ({ appId, envId, name }, { env, request }) => {
     const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "push");
+
     try {
       await runnerEnvironmentVarDelete(appId, envId, name, role);
     } catch (error) {

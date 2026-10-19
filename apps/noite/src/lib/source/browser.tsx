@@ -213,6 +213,7 @@ export const SourceBrowser = ({
    * show is the failed ref's own state, and the card over them offers a retry
    * that opens the ref again. */
   const failure = atom("");
+
   /** Report a failure that would otherwise lose work quietly: a save the
    * browser refused (a full store, a denied quota, a partition that went away)
    * or a teardown step that threw. The pod keeps retrying its own saves, so the
@@ -224,6 +225,7 @@ export const SourceBrowser = ({
       `This workspace is not being saved in this browser: ${errorMessage(error)}`
     );
   };
+
   /** One step of the teardown, with its failure reported: the pod's own
    * teardown — and with it the last save — must run whatever a step before it
    * did, and nothing here may reject into a console nobody reads. */
@@ -236,9 +238,11 @@ export const SourceBrowser = ({
       reportFailure(error);
     }
   };
+
   const attach = (host: HTMLElement | null) => {
     collectRef(box.code, host);
   };
+
   watch.once(async ({ onCleanup, signal }) => {
     // The refs fire before insertion: wait for the hosts that are really in
     // the document, and only then give each its shadow pane (never on a
@@ -248,9 +252,11 @@ export const SourceBrowser = ({
       whenLive(treeHost, signal),
       whenLive(box.code, signal),
     ]);
+
     if (signal.aborted || !treeColumn || !codeColumn) {
       return;
     }
+
     const treeEl = paneIn(treeColumn);
     const codeEl = paneIn(codeColumn);
     // Nothing is painted until the checkout is open, and opening it means a
@@ -265,12 +271,14 @@ export const SourceBrowser = ({
     let trees: TreesModule;
     let diffs: DiffsModule;
     let editMod: EditModule;
+
     try {
       const modulesPromise = Promise.all([
         import("@pierre/trees"),
         import("@pierre/diffs"),
         import("@pierre/diffs/edit"),
       ]);
+
       // SAFETY: import() resolves the installed @pierre modules which structurally match TreesModule/DiffsModule/EditModule.
       // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- vendor types drift from the minimal local interfaces; unknown bridges them.
       const loaded = (await modulesPromise) as unknown as [
@@ -278,6 +286,7 @@ export const SourceBrowser = ({
         DiffsModule,
         EditModule,
       ];
+
       const [treesMod, diffsMod, editModLoaded] = loaded;
       trees = treesMod;
       diffs = diffsMod;
@@ -288,8 +297,10 @@ export const SourceBrowser = ({
       // code pane's own wait note goes: nothing more is coming.
       codeEl.textContent = "";
       treeEl.textContent = `The editor failed to load: ${errorMessage(error)}. Reload the page to retry.`;
+
       return;
     }
+
     if (aborted()) {
       return;
     }
@@ -354,8 +365,10 @@ export const SourceBrowser = ({
       if (current === null) {
         throw new Error("the checkout is not open yet");
       }
+
       return current.workspace;
     };
+
     const syncState = () => {
       const workspace = current?.workspace ?? null;
       const changed = new Set(changes.map((change) => change.path));
@@ -407,9 +420,11 @@ export const SourceBrowser = ({
      * one whose frame died) ends. */
     const drop = (ref: string): void => {
       const held = checkouts.get(ref);
+
       if (held === undefined) {
         return;
       }
+
       checkouts.delete(ref);
       void teardown(() => held.checkout.workspace.close());
     };
@@ -418,6 +433,7 @@ export const SourceBrowser = ({
      * again — nothing can be read from that one — and the user hears why. */
     const failed = (ref: string, message: string): void => {
       drop(ref);
+
       if (current?.ref === ref) {
         failure.set(message);
       }
@@ -431,6 +447,7 @@ export const SourceBrowser = ({
       const idle = [...checkouts.entries()]
         .filter(([ref]) => ref !== current?.ref)
         .toSorted((a, b) => b[1].at - a[1].at);
+
       for (const [ref] of idle.slice(1)) {
         drop(ref);
       }
@@ -446,6 +463,7 @@ export const SourceBrowser = ({
       editChanged: (path, text) => {
         const written = writeText(path, text);
         report();
+
         return written;
       },
       file,
@@ -488,11 +506,13 @@ export const SourceBrowser = ({
         podOrigin(),
         canEditRef(ref),
       ]);
+
       const editable = reason === "";
       // The frame the fatal arrives on, for the handler below: the open
       // answers with it, and a pod that dies before that answer reports
       // itself through the open's own rejection.
       let frame: PodConnection | null = null;
+
       const checkout = await openSourceWorkspace({
         appId,
         branch: ref,
@@ -503,6 +523,7 @@ export const SourceBrowser = ({
           if (frame !== null) {
             dead.add(frame);
           }
+
           failed(ref, message);
         },
         onSaveError: reportFailure,
@@ -512,13 +533,16 @@ export const SourceBrowser = ({
         // holds it before the open answers (see `SourceWorkspaceOptions.signal`).
         signal,
       });
+
       const { connection, workspace: opened } = checkout;
       frame = connection;
+
       if (closed || aborted()) {
         // The pane went while the frame was coming up: nothing will read it.
         void teardown(() => opened.close());
         throw new Error("the source pane closed while the checkout opened");
       }
+
       return {
         connection,
         readOnly: reason,
@@ -534,6 +558,7 @@ export const SourceBrowser = ({
      * (see the staleness rule in `./workspace/workspace`). */
     const ensure = async (ref: string): Promise<Checkout> => {
       const held = checkouts.get(ref);
+
       if (held !== undefined) {
         if (
           !dead.has(held.checkout.connection) &&
@@ -541,16 +566,21 @@ export const SourceBrowser = ({
         ) {
           return held.checkout;
         }
+
         drop(ref);
       }
+
       if (opening?.ref === ref) {
         return await opening.checkout;
       }
+
       const pending = openCheckout(ref);
       opening = { checkout: pending, ref };
+
       try {
         const checkout = await pending;
         checkouts.set(ref, { at: Date.now(), checkout });
+
         return checkout;
       } finally {
         if (opening?.ref === ref) {
@@ -577,11 +607,14 @@ export const SourceBrowser = ({
           if (filename?.split("/").includes("node_modules")) {
             return;
           }
+
           const structural =
             event === "rename" || filename?.split("/").at(-1) === IGNORE_FILE;
+
           if (!structural) {
             return;
           }
+
           clearTimeout(resyncTimer);
           resyncTimer = window.setTimeout(() => {
             void tree.resync();
@@ -605,9 +638,11 @@ export const SourceBrowser = ({
      * terminal and the reported state to the checkout that is now on screen. */
     const install = async (next: Checkout, mine: number): Promise<void> => {
       const listing = await next.workspace.listing();
+
       if (closed || aborted() || mine !== generation) {
         return;
       }
+
       const previous = current;
       unsubscribe?.();
       unsubscribe = null;
@@ -648,14 +683,17 @@ export const SourceBrowser = ({
       // rest of this checkout.
       stopPeers = next.workspace.onPeerChange((structural, paths) => {
         const changed = new Set(changes.map((change) => change.path));
+
         const hit = paths.filter(
           (path) => changed.has(path) && !dismissed.has(path)
         );
+
         if (hit.length > 0) {
           const fresh = new Set(hit);
           conflicts = [...hit, ...conflicts.filter((path) => !fresh.has(path))];
           syncState();
         }
+
         if (structural) {
           void tree.resync();
         }
@@ -666,16 +704,19 @@ export const SourceBrowser = ({
       // went. It goes without clearing what the pane shows: the open below
       // paints the new ref's file over it.
       editor.rebase();
+
       if (editor.startedIntel()) {
         // The repo under the worker changed: it re-reads the new ref's sources
         // instead of checking against the old one's.
         editor.resetIntel();
       }
+
       // Paint the checkout: every file and every empty folder as a row, and
       // the commit's own markers, with the file the browse names (or the
       // Worker config) opened over it — a file the new ref does not have falls
       // back to the config the same way a first open does.
       const initial = tree.buildTree(listing);
+
       if (initial === undefined) {
         // Nothing to open: say what the pane is waiting for, rather than
         // leaving the "Opening checkout…" note standing over an open checkout.
@@ -684,19 +725,23 @@ export const SourceBrowser = ({
       } else {
         await editor.openFile(initial);
       }
+
       // The paint awaited; a newer request may have installed and painted its
       // own checkout by now. The state it reported and the terminal it attached
       // are the newest request's to write, not this one's.
       if (closed || aborted() || mine !== generation) {
         return;
       }
+
       syncState();
+
       // The shell runs on the checkout the panes now drive: the one it was on
       // goes first, because a process left on a pod that is torn down later is
       // a leaked process and a leaked port.
       if (previous !== null) {
         await teardown(() => terminal.detach(previous.connection));
       }
+
       terminal.attach(next.connection);
     };
 
@@ -711,6 +756,7 @@ export const SourceBrowser = ({
       } else if (current?.ref === ref || wanted === ref) {
         return;
       }
+
       wanted = ref;
       generation += 1;
       const mine = generation;
@@ -721,30 +767,39 @@ export const SourceBrowser = ({
       void (async () => {
         try {
           const checkout = await ensure(ref);
+
           if (mine !== generation || closed) {
             return;
           }
+
           await install(checkout, mine);
+
           if (mine !== generation || closed) {
             return;
           }
+
           const held = checkouts.get(ref);
+
           if (held !== undefined) {
             held.at = Date.now();
           }
+
           switching.set("");
         } catch (error) {
           if (mine !== generation || closed) {
             return;
           }
+
           wanted = null;
           switching.set("");
+
           if (current === null) {
             // Nothing but the panes' own note is on screen: say what failed,
             // and leave what a switch kept standing alone when it did not.
             treeEl.textContent = "";
             codeEl.textContent = errorMessage(error);
           }
+
           failure.set(errorMessage(error));
         } finally {
           evict();
@@ -777,25 +832,31 @@ export const SourceBrowser = ({
         ),
         UPLOAD_LIMITS
       );
+
       if (breach !== null) {
         tree.notify(breach);
         throw new Error(breach);
       }
+
       const args: SourceCommitInput = {
         appId,
         branch,
         files: payload.files,
         message,
       };
+
       if (fromSha !== null) {
         args.fromSha = fromSha;
       }
+
       if (payload.moves.length > 0) {
         args.moves = payload.moves;
       }
+
       if (payload.deletes.length > 0) {
         args.deletes = payload.deletes;
       }
+
       return args;
     };
 
@@ -803,9 +864,11 @@ export const SourceBrowser = ({
     // to a new branch started at its tip.
     const commit: CommitDrafts = async ({ branch, message }) => {
       const checkout = current;
+
       if (pushing || changes.length === 0 || checkout === null) {
         return false;
       }
+
       pushing = true;
       pushError = "";
       syncState();
@@ -814,15 +877,19 @@ export const SourceBrowser = ({
       // named none. Naming a branch that does not exist yet is the only case
       // that starts somewhere else than its own tip.
       const target = branch ?? checkout.ref;
+
       // Whether the push leaves a branch behind to pull from: a named branch
       // the refs already hold is grown from its own tip, never created.
       const created =
         branch !== undefined &&
         refs.data()?.branches.some((known) => known.name === branch) !== true;
+
       const push: WorkspacePush = { message, target };
+
       if (branch !== undefined) {
         push.branch = branch;
       }
+
       try {
         await checkout.workspace.push(push, (payload) =>
           commitSource(
@@ -834,20 +901,24 @@ export const SourceBrowser = ({
         // about yet: its tip, its distance from the default branch and every
         // History page were read before the commit and are stale now.
         invalidateForge(appId);
+
         if (branch !== undefined) {
           // The pod went back to its own base (the commit lives on the branch
           // the form named), so the rows follow what the checkout holds now.
           void tree.resync();
         }
+
         if (editor.startedIntel()) {
           // The repo moved: every file that is not the open one now exists at a
           // newer commit, so the worker re-reads the bundle (and re-parses the
           // config) instead of checking against the previous one.
           editor.resetIntel();
         }
+
         return true;
       } catch (error) {
         pushError = errorMessage(error);
+
         return false;
       } finally {
         pushing = false;
@@ -866,12 +937,15 @@ export const SourceBrowser = ({
      * panel's staleness notice. A failure lands in `pushError`, like a push's. */
     const preview: PreviewDrafts = async () => {
       const checkout = current;
+
       if (previewing || checkout === null || changes.length === 0) {
         return null;
       }
+
       previewing = true;
       pushError = "";
       syncState();
+
       try {
         await checkout.workspace.refresh();
         const payload = await previewPayload(checkout.workspace.fs, changes);
@@ -879,6 +953,7 @@ export const SourceBrowser = ({
         // lands while the runner works is not part of it, and the panel has to
         // go on saying so.
         const snapshot = changesFingerprint(changes);
+
         const deployed = await previewSource({
           appId,
           branch: checkout.ref,
@@ -887,10 +962,13 @@ export const SourceBrowser = ({
           message: PREVIEW_MESSAGE,
           moves: payload.moves,
         });
+
         previewed = { branch: checkout.ref, fingerprint: snapshot };
+
         return deployed;
       } catch (error) {
         pushError = errorMessage(error);
+
         return null;
       } finally {
         previewing = false;
@@ -917,11 +995,13 @@ export const SourceBrowser = ({
         }
       })();
     };
+
     const onHidden = () => {
       if (document.visibilityState === "hidden") {
         savePending();
       }
     };
+
     addEventListener("pagehide", savePending);
     document.addEventListener("visibilitychange", onHidden);
 
@@ -942,9 +1022,11 @@ export const SourceBrowser = ({
         // torn-down pod is a leaked process and a leaked port.
         const open = current;
         current = null;
+
         if (open !== null) {
           await teardown(() => terminal.detach(open.connection));
         }
+
         for (const ref of checkouts.keys()) {
           drop(ref);
         }

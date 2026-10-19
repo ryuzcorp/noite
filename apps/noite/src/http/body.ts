@@ -11,28 +11,37 @@ export const readBoundedText = async (
   max: number
 ): Promise<string | null> => {
   const declared = Number(request.headers.get("content-length"));
+
   if (Number.isFinite(declared) && declared > max) {
     return null;
   }
+
   if (!request.body) {
     return "";
   }
+
   const reader = request.body.getReader();
   const decoder = new TextDecoder();
   let received = 0;
   let text = "";
+
   for (;;) {
     // oxlint-disable-next-line eslint/no-await-in-loop -- chunks must be counted in arrival order
     const { done, value } = await reader.read();
+
     if (done) {
       return text + decoder.decode();
     }
+
     received += value.byteLength;
+
     if (received > max) {
       // oxlint-disable-next-line eslint/no-await-in-loop -- stop the upload as soon as it is over the bound
       await reader.cancel();
+
       return null;
     }
+
     text += decoder.decode(value, { stream: true });
   }
 };

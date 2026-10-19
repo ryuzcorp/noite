@@ -136,6 +136,7 @@ const TREE_ROWS: readonly (readonly [indent: number, width: number])[] = [
   [0, 4.5],
   [0, 6],
 ];
+
 const CODE_ROWS: readonly (readonly [indent: number, width: number])[] = [
   [0, 22],
   [0, 18],
@@ -166,6 +167,7 @@ const skeletonRow = (
   const row = document.createElement("div");
   row.className = "skel-row";
   const head = document.createElement("div");
+
   if (lead === "icon") {
     head.className = "skeleton skel-icon";
     head.style.marginLeft = `${indent * 0.9}rem`;
@@ -173,13 +175,16 @@ const skeletonRow = (
     head.className = "skeleton skel-bar skel-gutter";
     head.style.marginRight = `${indent * 1.2}rem`;
   }
+
   row.append(head);
+
   if (width > 0) {
     const bar = document.createElement("div");
     bar.className = "skeleton skel-bar";
     bar.style.width = `${width}rem`;
     row.append(bar);
   }
+
   return row;
 };
 
@@ -199,6 +204,7 @@ export const paintSkeleton = (
   text.className = "skel-label";
   text.textContent = label;
   skel.append(text);
+
   if (kind === "tree") {
     for (const [indent, width] of TREE_ROWS) {
       skel.append(skeletonRow("icon", indent, width));
@@ -207,10 +213,12 @@ export const paintSkeleton = (
     const head = skeletonRow("icon", 0, 9);
     head.classList.add("skel-head");
     skel.append(head);
+
     for (const [indent, width] of CODE_ROWS) {
       skel.append(skeletonRow("gutter", indent, width));
     }
   }
+
   body.replaceChildren(skel);
 };
 
@@ -225,6 +233,7 @@ export const paintSkeleton = (
 export const paneIn = (host: HTMLElement): HTMLElement => {
   const root = host.shadowRoot ?? host.attachShadow({ mode: "open" });
   let pane = root.querySelector<HTMLElement>(".pane");
+
   if (pane === null) {
     const style = document.createElement("style");
     style.textContent = PANE_CSS;
@@ -232,12 +241,16 @@ export const paneIn = (host: HTMLElement): HTMLElement => {
     pane.className = "pane";
     root.append(style, pane);
   }
+
   const existing = pane.querySelector<HTMLElement>(".pane-body");
+
   if (existing !== null) {
     return existing;
   }
+
   const body = document.createElement("div");
   body.className = "pane-body";
   pane.append(body);
+
   return body;
 };

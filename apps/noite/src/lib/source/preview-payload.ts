@@ -27,6 +27,7 @@ const snapshotFile = async (
   change: WorkspaceChange
 ): Promise<PushFile> => {
   const bytes = await fs.readFile(projectPath(change.path));
+
   return isBinary(bytes)
     ? { content: bytesToBase64(bytes), encoding: "base64", path: change.path }
     : { content: DECODER.decode(bytes), path: change.path };
@@ -41,21 +42,26 @@ const splitRemovals = (
 ) => {
   const deletes: string[] = [];
   const moves: PushMove[] = [];
+
   for (const change of changes) {
     if (change.kind === "deleted") {
       deletes.push(change.path);
       continue;
     }
+
     const { movedFrom } = change;
+
     if (change.kind !== "moved" || movedFrom === undefined) {
       continue;
     }
+
     if (journal[change.path] === movedFrom) {
       moves.push({ from: movedFrom, to: change.path });
     } else {
       deletes.push(movedFrom);
     }
   }
+
   return { deletes, moves };
 };
 
@@ -76,12 +82,15 @@ const readJournal = async (fs: SourceFs): Promise<Journal> => {
   if (!(await fs.exists(JOURNAL_FILE))) {
     return {};
   }
+
   const parsed: unknown = JSON.parse(
     DECODER.decode(await fs.readFile(JOURNAL_FILE))
   );
+
   if (!isJournal(parsed)) {
     throw new Error("workspace: moves.json does not hold a move journal");
   }
+
   return parsed;
 };
 
@@ -92,11 +101,14 @@ export const previewPayload = async (
   changes: readonly WorkspaceChange[]
 ): Promise<PushPayload> => {
   const journal = await readJournal(fs);
+
   const files = await Promise.all(
-    changes
-      .filter((change) => change.kind !== "deleted")
-      .map((change) => snapshotFile(fs, change))
+    changes.flatMap((change) =>
+      change.kind === "deleted" ? [] : [snapshotFile(fs, change)]
+    )
   );
+
   const { deletes, moves } = splitRemovals(changes, journal);
+
   return { deletes, files, moves };
 };

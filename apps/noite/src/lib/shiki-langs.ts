@@ -27,5 +27,6 @@ export const curatedLang = (
   resolve: (filename: string) => string
 ): string => {
   const lang = resolve(name);
+
   return CURATED_SHIKI_LANGS.includes(lang) ? lang : "text";
 };

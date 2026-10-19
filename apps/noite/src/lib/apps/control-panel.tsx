@@ -79,6 +79,7 @@ const ControlMetricsTab = () => {
     default: DEFAULT_METRICS_HOURS,
     parse: toMetricsHours,
   });
+
   return (
     <div class="flex flex-col gap-4">
       <div class="flex items-center justify-between gap-2">
@@ -152,20 +153,25 @@ const ControlAppDetailBody = ({
 }) => {
   const tab = searchParam<TabId>("t", { default: "overview", parse: toTabId });
   const requested = tab();
+
   // A stale `?t=metrics` on an install without the control fleet falls back
   // to Overview rather than rendering an empty panel.
   const active =
     controlFleet || !NEEDS_FLEET[requested] ? requested : "overview";
+
   const tabs = controlFleet
     ? TABS
     : TABS.filter((item) => !NEEDS_FLEET[item.id]);
+
   // The open error (ErrorsPanel's `?e=`) lives in the URL too: a tab click
   // lands on the tab's top level, so Errors shows the list, not a stale
   // detail. Same live feed as the Errors tab, so the badge never lags it.
   const openError = searchParam("e", { default: "" });
+
   const openErrors = controlFleet
     ? (liveErrors(CONTROL_APP_ID, "open").data()?.counts.open ?? 0)
     : 0;
+
   return (
     <DetailShell
       panel={null}
@@ -216,9 +222,11 @@ export const ControlAppDetail = () => {
   const admin = adminStatus();
   const sess = session();
   const ready = admin.data() !== undefined && sess.data() !== undefined;
+
   const allowed =
     (admin.data()?.isAdmin ?? false) &&
     sess.data()?.session.impersonatedBy === null;
+
   if (!ready) {
     return (
       <div class="w-full px-4 pt-4 pb-12">
@@ -226,6 +234,7 @@ export const ControlAppDetail = () => {
       </div>
     );
   }
+
   if (!allowed) {
     return (
       <div class="w-full px-4 pt-4 pb-12">
@@ -233,6 +242,7 @@ export const ControlAppDetail = () => {
       </div>
     );
   }
+
   // `controlFleet` is false only when the runner says it supervises no
   // control fleet (the dev image: vite dev serves the UI) — then there is no
   // telemetry to chart and the body hides those tabs. Unknown/loading (the

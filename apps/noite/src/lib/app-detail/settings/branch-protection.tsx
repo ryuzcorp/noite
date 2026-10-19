@@ -34,9 +34,11 @@ export const BranchProtectionPanel = ({
   const isAdmin = myRole === "admin";
 
   const current = res.data();
+
   if (res.loading() && current === undefined) {
     return <SectionSkeleton lines={2} />;
   }
+
   if (!current) {
     return (
       <SettingsSection>
@@ -45,6 +47,7 @@ export const BranchProtectionPanel = ({
       </SettingsSection>
     );
   }
+
   const requirePr = requireDraft() ?? current.requirePr;
   const approvals = approvalsDraft() ?? current.requiredApprovals;
 
@@ -52,9 +55,11 @@ export const BranchProtectionPanel = ({
     if (!isAdmin || busy()) {
       return;
     }
+
     busy.set(true);
     err.set("");
     note.set("");
+
     try {
       await api<BranchRules>("/api/prs/branchRulesSet", {
         appId,

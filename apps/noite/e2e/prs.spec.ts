@@ -81,7 +81,9 @@ const openPr = async (
     },
     method: "POST",
   });
+
   expect(res.status).toBe(200);
+
   return asJson<PrDetail>(res.body);
 };
 
@@ -94,7 +96,9 @@ const fetchPr = async (
     request,
     `/v1/apps/${appId}/pull_requests/${number}`
   );
+
   expect(res.status).toBe(200);
+
   return asJson<PrDetail>(res.body);
 };
 
@@ -169,6 +173,7 @@ test.afterEach(async () => {
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { force: true, recursive: true });
   }
+
   const closing = contexts.splice(0);
   await Promise.all(closing.map((context) => context.close()));
 });
@@ -186,6 +191,7 @@ const cloneRepo = (apiKey: string, slug: string) => {
     ],
     { encoding: "utf-8" }
   );
+
   const run = (args: string[]): string =>
     execFileSync("git", args, {
       cwd: dir,
@@ -199,6 +205,7 @@ const cloneRepo = (apiKey: string, slug: string) => {
         GIT_TERMINAL_PROMPT: "0",
       },
     });
+
   return { dir, run };
 };
 
@@ -211,8 +218,10 @@ const commitFiles = (
   for (const [name, content] of Object.entries(files)) {
     writeFileSync(nodePath.join(repo.dir, name), content);
   }
+
   repo.run(["add", "-A"]);
   repo.run(["commit", "-m", message]);
+
   return repo.run(["rev-parse", "HEAD"]).trim();
 };
 
@@ -224,6 +233,7 @@ const branchNames = async (
     request,
     `/v1/apps/${appId}/git/refs`
   );
+
   return refs.branches.map((branch) => branch.name);
 };
 
@@ -236,15 +246,18 @@ test("a pull request is commented, approved, rebased onto a new head and merged"
 }) => {
   const slug = "prs-lifecycle";
   createdApps.push(slug);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "PRs Lifecycle",
     slug,
   });
+
   pushAppDir(apiKey, new URL("../test", import.meta.url), slug);
 
   // Feature branch with one commit to review.
   const repo = cloneRepo(apiKey, slug);
   repo.run(["checkout", "-b", "feature"]);
+
   const featureSha = commitFiles(
     repo,
     {
@@ -252,6 +265,7 @@ test("a pull request is commented, approved, rebased onto a new head and merged"
     },
     "prs: feature commit"
   );
+
   repo.run(["push", "-u", "origin", "feature"]);
 
   // (1) Open the PR and leave a line comment on the new head.
@@ -261,8 +275,10 @@ test("a pull request is commented, approved, rebased onto a new head and merged"
     head: "feature",
     title: "Add a feature",
   });
+
   const { number } = opened.pullRequest;
   expect(opened.pullRequest.headSha).toBe(featureSha);
+
   // Anchored on the line the next commit rewrites, so the push strands it.
   const comment = await commentOnLine(request, appId, number, {
     commitSha: featureSha,
@@ -270,6 +286,7 @@ test("a pull request is commented, approved, rebased onto a new head and merged"
     path: "FEATURE.md",
     side: "new",
   });
+
   expect(comment.status).toBe(200);
   const commented = await fetchPr(request, appId, number);
   expect(commented.pullRequest.commentCount).toBe(1);
@@ -281,6 +298,7 @@ test("a pull request is commented, approved, rebased onto a new head and merged"
   expect(asJson<PrDetail>(approved.body).approvals).toBe(1);
 
   repo.run(["checkout", "feature"]);
+
   const newHead = commitFiles(
     repo,
     {
@@ -288,6 +306,7 @@ test("a pull request is commented, approved, rebased onto a new head and merged"
     },
     "prs: rework the first line"
   );
+
   repo.run(["push", "origin", "feature"]);
   expect(newHead).not.toBe(featureSha);
 
@@ -328,10 +347,12 @@ test("a conflicting pull request reports conflicts and refuses to merge", async 
 }) => {
   const slug = "prs-conflict";
   createdApps.push(slug);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "PRs Conflict",
     slug,
   });
+
   pushAppDir(apiKey, new URL("../test", import.meta.url), slug);
 
   // Both branches add the same file with different content → add/add conflict.
@@ -349,6 +370,7 @@ test("a conflicting pull request reports conflicts and refuses to merge", async 
     head: "clash",
     title: "Clashing change",
   });
+
   expect(detail.mergeState).toBe("conflicts");
 
   const refused = await mergePr(
@@ -358,6 +380,7 @@ test("a conflicting pull request reports conflicts and refuses to merge", async 
     "pr-author",
     "admin"
   );
+
   expect(refused.status).toBe(409);
 
   // The PR is still open and its branch still there.
@@ -372,10 +395,12 @@ test("an author cannot approve their own pull request", async ({
 }) => {
   const slug = "prs-self-approve";
   createdApps.push(slug);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "PRs Self Approve",
     slug,
   });
+
   pushAppDir(apiKey, new URL("../test", import.meta.url), slug);
 
   const repo = cloneRepo(apiKey, slug);
@@ -389,12 +414,14 @@ test("an author cannot approve their own pull request", async ({
     head: "feature",
     title: "My own change",
   });
+
   const denied = await reviewPr(
     request,
     appId,
     detail.pullRequest.number,
     "pr-author"
   );
+
   expect(denied.status).toBe(400);
 
   const unchanged = await fetchPr(request, appId, detail.pullRequest.number);
@@ -409,10 +436,12 @@ test("require_pr rejects a push-role push to main while an admin push lands", as
 }) => {
   const slug = "prs-protect";
   createdApps.push(slug);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "PRs Protect",
     slug,
   });
+
   pushAppDir(apiKey, new URL("../test", import.meta.url), slug);
 
   // The settings panel is where the rule lives: save it, then reload to prove
@@ -438,6 +467,7 @@ test("require_pr rejects a push-role push to main while an admin push lands", as
     email,
     "Push User"
   );
+
   contexts.push(invitee.context);
   const pushKey = await mintApiKey(invitee.page, `${slug}-push`);
 
@@ -468,11 +498,13 @@ test("require_pr rejects a push-role push to main while an admin push lands", as
 
   // …but an admin's push goes straight through and deploys.
   const adminRepo = cloneRepo(apiKey, slug);
+
   const adminSha = commitFiles(
     adminRepo,
     { "ADMIN.md": "from the admin\n" },
     "admin pushes main"
   );
+
   adminRepo.run(["push", "origin", "main"]);
   await expect(async () => {
     const deploy = await waitForDeploy(request, appId);

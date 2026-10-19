@@ -93,6 +93,7 @@ export const mirrorStorage = (): MirrorStorage | null => {
     if (typeof sessionStorage === "undefined") {
       return null;
     }
+
     return sessionStorage;
   } catch {
     return null;
@@ -118,6 +119,7 @@ const isStringRecord = (value: unknown): value is Record<string, string> => {
   if (typeof value !== "object" || value === null) {
     return false;
   }
+
   return Object.values(value).every(isString);
 };
 
@@ -125,14 +127,18 @@ const isDocument = (value: unknown): value is MirrorDocument => {
   if (typeof value !== "object" || value === null) {
     return false;
   }
+
   if (!("files" in value) || !("v" in value)) {
     return false;
   }
+
   const { files, v } = value;
   const removed = "removed" in value ? value.removed : undefined;
+
   const removedOk =
     removed === undefined ||
     (Array.isArray(removed) && removed.every(isString));
+
   return v === MIRROR_VERSION && isStringRecord(files) && removedOk;
 };
 
@@ -142,16 +148,20 @@ const readDocument = (
   id: string
 ): MirrorDocument | null => {
   let raw: string | null = null;
+
   try {
     raw = storage.getItem(mirrorKey(scope, id));
   } catch {
     return null;
   }
+
   if (raw === null) {
     return null;
   }
+
   try {
     const parsed: unknown = JSON.parse(raw);
+
     return isDocument(parsed) ? parsed : null;
   } catch {
     return null;
@@ -177,16 +187,22 @@ export const restoreMirror = (
   if (storage === null) {
     return 0;
   }
+
   const document = readDocument(storage, scope, id);
+
   if (document === null) {
     return 0;
   }
+
   let changed = 0;
+
   for (const relative of document.removed ?? []) {
     const path = `${scope.root}/${relative}`;
+
     if (!usable(scope, relative) || !volume.existsSync(path)) {
       continue;
     }
+
     try {
       volume.removeTreeSync(path);
       changed += 1;
@@ -194,10 +210,12 @@ export const restoreMirror = (
       // A path that will not go stays on the restored copy.
     }
   }
+
   for (const [relative, base64] of Object.entries(document.files)) {
     if (!usable(scope, relative)) {
       continue;
     }
+
     try {
       const path = `${scope.root}/${relative}`;
       volume.mkdirSync(path.slice(0, path.lastIndexOf("/")), {
@@ -209,6 +227,7 @@ export const restoreMirror = (
       // A file that will not decode or write stays on the restored copy.
     }
   }
+
   return changed;
 };
 
@@ -221,6 +240,7 @@ const clearMirror = (
   if (storage === null) {
     return;
   }
+
   try {
     storage.removeItem(mirrorKey(scope, id));
   } catch {
@@ -250,6 +270,7 @@ export const startMirror = (
   if (storage === null) {
     return NO_MIRROR;
   }
+
   const stored = readDocument(storage, scope, id);
   const files = new Map<string, string>(Object.entries(stored?.files ?? {}));
   const removed = new Set<string>(stored?.removed);
@@ -261,12 +282,16 @@ export const startMirror = (
       removed: [...removed],
       v: MIRROR_VERSION,
     };
+
     const raw = JSON.stringify(document);
+
     if (raw.length > MAX_MIRROR_CHARS) {
       suspended = true;
       clearMirror(scope, id, storage);
+
       return;
     }
+
     try {
       storage.setItem(mirrorKey(scope, id), raw);
     } catch {
@@ -286,20 +311,26 @@ export const startMirror = (
     try {
       files.set(relative, bytesToBase64(volume.readFileSync(path)));
       removed.delete(relative);
+
       return;
     } catch {
       // Not a readable file: a directory, or gone mid-write.
     }
+
     let names: string[];
+
     try {
       names = volume.readdirSync(path);
     } catch {
       // Gone mid-write; the next mutation records it.
       return;
     }
+
     removed.delete(relative);
+
     for (const name of names) {
       const child = `${relative}/${name}`;
+
       if (usable(scope, child)) {
         collect(`${path}/${name}`, child);
       }
@@ -308,23 +339,28 @@ export const startMirror = (
 
   const record = (path: string): void => {
     const relative = relativeOf(path);
+
     if (relative === null || !usable(scope, relative)) {
       return;
     }
+
     collect(path, relative);
     store();
   };
 
   const forget = (path: string): void => {
     const relative = relativeOf(path);
+
     if (relative === null || !usable(scope, relative)) {
       return;
     }
+
     for (const key of files.keys()) {
       if (key === relative || key.startsWith(`${relative}/`)) {
         files.delete(key);
       }
     }
+
     removed.add(relative);
     store();
   };
@@ -334,6 +370,7 @@ export const startMirror = (
     if (suspended) {
       return;
     }
+
     try {
       if (mutation.op === "write") {
         record(mutation.path);

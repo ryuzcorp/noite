@@ -38,6 +38,7 @@ const PREDICTION_INCLUDE = [
   "**/*.mjs",
   "**/*.cjs",
 ] as const;
+
 const PREDICTION_EXCLUDE = ["**/*.d.ts", "**/*.d.mts", "**/*.d.cts"] as const;
 
 /** What the pane shows for a file it will not render as text — bytes that are
@@ -158,6 +159,7 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
   statusChip.className = "noite-src-change";
   statusChip.slot = "header-filename-suffix";
   statusChip.hidden = true;
+
   /** Paint the change at `path` into the header chip, or hide it when the
    * workspace has none there. */
   const paintStatus = (path: string | null): void => {
@@ -165,14 +167,18 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
       path === null
         ? undefined
         : host.changes().find((one) => one.path === path);
+
     if (change === undefined) {
       statusChip.hidden = true;
+
       return;
     }
+
     statusChip.dataset.changeKind = change.kind;
     statusChip.textContent = CHANGE_LETTER[change.kind];
     statusChip.hidden = false;
   };
+
   /** Put the chip in the header slot: pierre renders the header from a shadow
    * root, and the chip carries the header's slot as its light DOM. */
   const attachStatus = (container: Element | null): void => {
@@ -180,6 +186,7 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
       container.append(statusChip);
     }
   };
+
   // The intelligence layer is built before the editor it paints through, so
   // the open file reaches it as live accessors rather than as values.
   const intel = createEditorIntel({
@@ -193,6 +200,7 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
     gitRef: host.gitRef,
     liveText,
   });
+
   let disposeEdit: (() => void) | undefined;
   let activePreview = 0;
 
@@ -210,11 +218,14 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
   // own — the text goes to the pod either way.
   const handleEditChange = () => {
     const path = currentPath;
+
     if (path === null || !currentEditable) {
       return;
     }
+
     const text = editor.getText();
     liveText.set(path, text);
+
     if (shown !== null) {
       shown = {
         contents: text,
@@ -223,7 +234,9 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
         placeholder: shown.placeholder,
       };
     }
+
     pendingWrites.set(path, text);
+
     const settle = async () => {
       try {
         await host.editChanged(path, text);
@@ -231,10 +244,12 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
         // The pod refused the write: the pane keeps the text it has, and the
         // next derive re-reads whatever the pod really holds (see `syncOpen`).
       }
+
       if (pendingWrites.get(path) === text) {
         pendingWrites.delete(path);
       }
     };
+
     void settle();
     intel.scheduleDiagnostics();
   };
@@ -249,20 +264,27 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
    * folder row, or a path that never was one). */
   const readDisk = async (path: string): Promise<DiskRead | null> => {
     const abs = projectPath(path);
+
     if (!(await host.workspace().fs.exists(abs))) {
       return null;
     }
+
     const { isFile } = await host.workspace().fs.stat(abs);
+
     if (!isFile) {
       return null;
     }
+
     const bytes = await host.workspace().fs.readFile(abs);
+
     if (!isTextBytes(bytes)) {
       return { placeholder: BINARY_PLACEHOLDER, text: "" };
     }
+
     if (bytes.byteLength > TEXT_MAX_BYTES) {
       return { placeholder: OVERSIZE_PLACEHOLDER, text: "" };
     }
+
     return { placeholder: null, text: DECODER.decode(bytes) };
   };
 
@@ -272,6 +294,7 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
    * file. */
   const resolveShow = async (path: string): Promise<Show | null> => {
     const disk = await readDisk(path);
+
     if (disk !== null) {
       return disk.placeholder === null
         ? {
@@ -281,7 +304,9 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
           }
         : { contents: "", editable: false, placeholder: disk.placeholder };
     }
+
     const committed = await host.workspace().baseText(path);
+
     return committed === null
       ? null
       : { contents: committed, editable: false, placeholder: null };
@@ -322,25 +347,32 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
       path,
       placeholder: show.placeholder,
     };
+
     if (show.placeholder !== null) {
       liveText.delete(path);
       host.codeEl.textContent = show.placeholder;
       paintStatus(path);
+
       return;
     }
+
     // The note a wait or a click painted, or the last placeholder, goes:
     // leaving it would stack the file under stale text. Pierre's own container
     // stays — a repaint of the same view renders into it and never appends it
     // again. The pane's own furniture (the hover tip) is outside this
     // container (see `pane.ts`).
     let node = host.codeEl.firstChild;
+
     while (node !== null) {
       const next = node.nextSibling;
+
       if (node.nodeName.toLowerCase() !== "diffs-container") {
         node.remove();
       }
+
       node = next;
     }
+
     liveText.set(path, show.contents);
     fileView.render({
       containerWrapper: host.codeEl,
@@ -352,12 +384,15 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
     });
     attachStatus(host.codeEl.querySelector("diffs-container"));
     paintStatus(path);
+
     if (currentEditable) {
       disposeEdit = editor.edit(fileView);
+
       if (caret) {
         intel.placeCaret(caret);
       }
     }
+
     if (isScriptFile(path)) {
       void intel.ensure();
       void intel.runDiagnostics(path);
@@ -375,16 +410,21 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
     if (host.aborted()) {
       return false;
     }
+
     activePreview += 1;
     const previewToken = activePreview;
+
     try {
       const show = await resolveShow(path);
+
       if (previewToken !== activePreview || host.aborted()) {
         return false;
       }
+
       if (show === null) {
         return false;
       }
+
       // The pane may be asked for what it already holds — the tree's own
       // selection follows the open, and a move re-keys the open file without
       // repainting it. Painting that again would rebuild the same document for
@@ -394,17 +434,22 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
         if (host.file() !== path) {
           host.file.set(path);
         }
+
         if (caret) {
           intel.placeCaret(caret);
         }
+
         return true;
       }
+
       paint(path, show, caret);
+
       return true;
     } catch (error) {
       if (previewToken === activePreview && !host.aborted()) {
         host.codeEl.textContent = errorMessage(error);
       }
+
       return false;
     }
   };
@@ -412,9 +457,11 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
   /** Close the open file: nothing shows it any more. */
   const dropOpen = () => {
     const path = currentPath;
+
     if (path === null) {
       return;
     }
+
     currentPath = null;
     currentEditable = false;
     shown = null;
@@ -452,9 +499,11 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
    * derive comes back here with bytes it can trust). */
   const syncOpen = async (): Promise<void> => {
     const path = currentPath;
+
     if (path === null || host.aborted()) {
       return;
     }
+
     // The change may be all that moved (an edit settling on the commit's text
     // leaves no change, a new one arrives): the header follows it here, before
     // any of the reads below can short-circuit.
@@ -466,6 +515,7 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
     // older than the editor, so this read is not one to compare against.
     const writing = pendingWrites.has(path);
     const show = await resolveShow(path);
+
     if (
       previewToken !== activePreview ||
       path !== currentPath ||
@@ -473,18 +523,25 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
     ) {
       return;
     }
+
     if (writing || pendingWrites.has(path)) {
       intel.scheduleDiagnostics();
+
       return;
     }
+
     if (show === null) {
       dropOpen();
+
       return;
     }
+
     if (shows(path, show)) {
       intel.scheduleDiagnostics();
+
       return;
     }
+
     paint(path, show);
   };
 
@@ -493,18 +550,22 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
       path === from || path.startsWith(`${from}/`)
         ? `${to}${path.slice(from.length)}`
         : path;
+
     // Re-keying the entry being visited is safe: the map holds the open files
     // only, and a move never lands inside the path it came from.
     for (const [path, text] of liveText) {
       const next = moved(path);
+
       if (next !== path) {
         liveText.delete(path);
         liveText.set(next, text);
       }
     }
+
     if (currentPath !== null) {
       currentPath = moved(currentPath);
     }
+
     if (shown !== null) {
       shown = {
         contents: shown.contents,

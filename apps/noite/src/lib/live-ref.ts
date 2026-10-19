@@ -24,6 +24,7 @@ export const collectRef = <T extends Element>(
   if (!el) {
     return;
   }
+
   box.els = box.els.filter((e) => e !== el && e.isConnected);
   box.els.push(el);
 };
@@ -32,10 +33,12 @@ export const collectRef = <T extends Element>(
 export const liveEl = <T extends Element>(box: LiveRef<T>): T | null => {
   for (let i = box.els.length - 1; i >= 0; i -= 1) {
     const el = box.els[i];
+
     if (el?.isConnected) {
       return el;
     }
   }
+
   return null;
 };
 
@@ -48,9 +51,11 @@ export const whenLive = async <T extends Element>(
 ): Promise<T | null> => {
   for (let i = 0; i < maxFrames && !signal.aborted; i += 1) {
     const el = liveEl(box);
+
     if (el) {
       return el;
     }
+
     // oxlint-disable-next-line eslint/no-await-in-loop, promise/avoid-new -- frame-paced wait for insertion; each check must see the previous frame
     await new Promise<void>((resolve) => {
       requestAnimationFrame(() => {
@@ -58,5 +63,6 @@ export const whenLive = async <T extends Element>(
       });
     });
   }
+
   return liveEl(box);
 };

@@ -37,6 +37,7 @@ export const EnvVarsPanel = ({
   const newVarName = atom("");
   const newVarValue = atom("");
   const isAdmin = myRole === "admin";
+
   const reload = async () => {
     try {
       await res.refetch();
@@ -45,10 +46,12 @@ export const EnvVarsPanel = ({
       err.set(errorMessage(error));
     }
   };
+
   const toggleFlag = (row: EnvVarView) => {
     if (!isAdmin || busy()) {
       return;
     }
+
     busy.set(true);
     void (async () => {
       try {
@@ -61,26 +64,33 @@ export const EnvVarsPanel = ({
       } catch (error) {
         err.set(errorMessage(error));
       }
+
       busy.set(false);
     })();
   };
+
   const openModal = () => {
     err.set("");
     newVarName.set("");
     newVarValue.set("");
     dialogOpen.set(true);
   };
+
   const submit = () => {
     if (busy()) {
       return;
     }
+
     // Names starting with FLAG_ are saved verbatim: the list renders
     // them as boolean toggles (checked when the value is "1").
     const raw = newVarName().trim();
+
     if (!raw) {
       err.set("Name is required");
+
       return;
     }
+
     const finalValue = newVarValue();
     busy.set(true);
     err.set("");
@@ -98,9 +108,11 @@ export const EnvVarsPanel = ({
       } catch (error) {
         err.set(errorMessage(error));
       }
+
       busy.set(false);
     })();
   };
+
   return (
     <SettingsSection>
       <div class="flex items-center justify-between gap-2">
@@ -117,9 +129,11 @@ export const EnvVarsPanel = ({
                       "/api/env/envDotVars",
                       appId
                     );
+
                     const url = URL.createObjectURL(
                       new Blob([text], { type: "text/plain" })
                     );
+
                     const a = document.createElement("a");
                     a.href = url;
                     a.download = ".dev.vars";
@@ -201,10 +215,13 @@ export const EnvVarsPanel = ({
                         confirmLabel: "Delete",
                         title: `Delete ${r.name}?`,
                       });
+
                       if (!ok) {
                         return;
                       }
+
                       busy.set(true);
+
                       try {
                         await api<{ ok: true }>("/api/env/deleteEnv", {
                           appId,
@@ -214,6 +231,7 @@ export const EnvVarsPanel = ({
                       } catch (error) {
                         err.set(errorMessage(error));
                       }
+
                       busy.set(false);
                     }}
                   >

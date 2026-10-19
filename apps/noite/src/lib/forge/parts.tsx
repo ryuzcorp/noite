@@ -35,6 +35,7 @@ export const FileStats = ({ files }: { files: GitFileStat[] }) => {
   if (files.length === 0) {
     return <p class="m-0 text-sm opacity-70">No files changed.</p>;
   }
+
   return (
     <ul class="m-0 flex list-none flex-col p-0">
       {files.map((file) => (
@@ -72,7 +73,9 @@ export const CommitList = ({
   if (commits.length === 0) {
     return <p class="m-0 text-sm opacity-70">{emptyLabel}</p>;
   }
+
   const from = { file, ref: gitRef };
+
   return (
     <ul class="m-0 flex list-none flex-col p-0 text-sm">
       {commits.map((commit) => (

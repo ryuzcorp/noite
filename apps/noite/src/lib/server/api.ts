@@ -49,16 +49,20 @@ export interface ActionContext {
 export const actionErrorResponse = (error: unknown): Response => {
   const tag =
     error instanceof Error && "_tag" in error ? error._tag : undefined;
+
   if (tag === "UnauthorizedError" || tag === "MissingAuthSecretError") {
     return Response.json({ error: errorMessage(error) }, { status: 401 });
   }
+
   if (error instanceof ActionFailure) {
     return Response.json({ errors: { form: error.message } }, { status: 422 });
   }
+
   console.error(
     "[api]",
     error instanceof Error ? (error.stack ?? error.message) : String(error)
   );
+
   return Response.json({ error: "Internal error" }, { status: 500 });
 };
 
@@ -67,10 +71,13 @@ const readInput = async (
   schema: Schema.ConstraintDecoder<unknown>
 ): Promise<{ input: unknown } | { response: Response }> => {
   const text = await readBoundedText(request, MAX_BODY_BYTES);
+
   if (text === null) {
     return { response: tooLarge() };
   }
+
   let raw: unknown;
+
   try {
     raw = text.trim() === "" ? {} : JSON.parse(text);
   } catch {
@@ -78,6 +85,7 @@ const readInput = async (
       response: Response.json({ error: "Invalid JSON" }, { status: 400 }),
     };
   }
+
   try {
     return { input: Schema.decodeUnknownSync(schema)(raw) };
   } catch {
@@ -103,12 +111,15 @@ export const apiAction = <S extends Schema.ConstraintDecoder<unknown>>(
     // SAFETY: the platform injects every KitEnv control key the actions read; unset keys stay undefined as actions tolerate.
     const env = c.env as KitEnv;
     const read = await readInput(request, schema);
+
     if ("response" in read) {
       return read.response;
     }
+
     try {
       // SAFETY: readInput decoded this body through the same schema, so the unknown input is the schema's Type.
       const output = await fn(read.input as S["Type"], { env, request });
+
       return Response.json(output === undefined ? { ok: true } : output);
     } catch (error) {
       return actionErrorResponse(error);
@@ -124,8 +135,10 @@ export const apiActionNoInput = (
     const request = c.req.raw;
     // SAFETY: the platform injects every KitEnv control key the actions read; unset keys stay undefined as actions tolerate.
     const env = c.env as KitEnv;
+
     try {
       const output = await fn({ env, request });
+
       return Response.json(output === undefined ? { ok: true } : output);
     } catch (error) {
       return actionErrorResponse(error);

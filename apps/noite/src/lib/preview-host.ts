@@ -31,6 +31,7 @@ export const previewOrigin = (
 ): string => {
   const scheme = isLocalhostDomain(baseDomain) ? "http" : "https";
   const devPort = port === "" ? "" : `:${port}`;
+
   return `${scheme}://${previewHost(slug, baseDomain)}${devPort}`;
 };
 
@@ -49,6 +50,7 @@ export const previewBase = (
   extraHosts = ""
 ): string => {
   const host = (pageHost.split(":")[0] ?? "").toLowerCase();
+
   const match = extraHosts
     .split(",")
     .map((entry) =>
@@ -64,6 +66,7 @@ export const previewBase = (
         !entry.includes("/") &&
         !IPV4.test(entry)
     );
+
   return match ?? baseDomain;
 };
 
@@ -161,6 +164,7 @@ export const isControlDeniedAsset = (path: string): boolean => {
       return true;
     }
   }
+
   return false;
 };
 
@@ -172,7 +176,9 @@ export const isPreviewHost = (host: string | null): boolean => {
   if (host === null) {
     return false;
   }
+
   const name = host.split(":")[0] ?? "";
+
   return name.toLowerCase().startsWith(`${PREVIEW_LABEL}.preview.`);
 };
 

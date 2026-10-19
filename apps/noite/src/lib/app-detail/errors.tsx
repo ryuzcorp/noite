@@ -51,6 +51,7 @@ const handlerLabel = (handler: string, source: string): string => {
   if (source === "logged") {
     return "console.error";
   }
+
   return HANDLER_LABELS.get(handler) ?? handler;
 };
 
@@ -70,6 +71,7 @@ const Sparkline = ({
 }) => {
   const peak = Math.max(1, ...hourly);
   const total = hourly.reduce((sum, n) => sum + n, 0);
+
   return (
     <span
       class={`flex items-end gap-px ${tall ? "h-10 w-48" : "h-6 w-24"}`}
@@ -91,6 +93,7 @@ const Sparkline = ({
 
 const IssueBadges = ({ issue }: { issue: RunnerErrorIssue }) => {
   const isNew = Date.now() - issue.firstSeenUs / US_PER_MS < DAY_MS;
+
   return (
     <>
       <span class="badge badge-ghost badge-sm">
@@ -155,8 +158,10 @@ export const liveErrors = (appId: string, status: ErrorStatus) => {
     errorsUrl(appId, status),
     decodeErrors
   );
+
   const data = (): RunnerErrorList | undefined => feed.latest();
   const retrying = (): boolean => feed.status() === "retrying";
+
   return {
     data,
     pending: (): boolean => data() === undefined && !retrying(),
@@ -174,6 +179,7 @@ const EmptyErrors = ({ status }: { status: ErrorStatus }) => {
       <p class="m-0 py-6 text-center text-sm opacity-70">No {status} errors.</p>
     );
   }
+
   return (
     <div class="flex flex-col gap-1 py-6 text-center">
       <p class="m-0 text-sm font-medium">No open errors</p>
@@ -199,6 +205,7 @@ const ErrorList = ({
   const live = liveErrors(appId, status);
   const data = live.data();
   const issues = data?.issues ?? [];
+
   return (
     <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
       <div class="card-body gap-3">
@@ -263,7 +270,9 @@ const RequestLine = ({ event }: { event: RunnerErrorEvent }) => {
   if (!event.path) {
     return <span class="opacity-60">No request context</span>;
   }
+
   const device = [event.browser, event.os].filter(Boolean).join(" · ");
+
   return (
     <span class="font-mono">
       {event.method} {event.path}
@@ -354,9 +363,11 @@ const TriageButtons = ({
 }) => {
   const busy = atom(false);
   const failure = atom("");
+
   const apply = async (status: ErrorStatus) => {
     busy.set(true);
     failure.set("");
+
     try {
       await api<{ ok: true }>("/api/errors/setErrorStatus", {
         appId,
@@ -370,6 +381,7 @@ const TriageButtons = ({
       busy.set(false);
     }
   };
+
   return (
     <div class="flex flex-col items-end gap-1">
       <div class="flex gap-2">
@@ -412,9 +424,11 @@ const statusNote = (issue: RunnerErrorIssue): string => {
   if (issue.status === "resolved") {
     return "Resolved — reopens if it happens again.";
   }
+
   if (issue.status === "ignored") {
     return "Ignored — still counted, never reopened.";
   }
+
   return "";
 };
 
@@ -432,6 +446,7 @@ const ErrorDetailView = ({
   const res = errorDetail(appId, fingerprint);
   const picked = atom(0);
   const data = res.data();
+
   const back = (
     <button
       type="button"
@@ -442,6 +457,7 @@ const ErrorDetailView = ({
       All errors
     </button>
   );
+
   if (res.loading() && data === undefined) {
     return (
       <div class="flex flex-col gap-3">
@@ -450,6 +466,7 @@ const ErrorDetailView = ({
       </div>
     );
   }
+
   if (!data) {
     return (
       <div class="flex flex-col gap-3">
@@ -458,14 +475,18 @@ const ErrorDetailView = ({
       </div>
     );
   }
+
   const { events, issue } = data;
   const index = Math.min(picked(), Math.max(0, events.length - 1));
   const event = events[index];
+
   // The lists are live; only this detail view needs a re-read.
   const refresh = async () => {
     await res.refetch();
   };
+
   const note = statusNote(issue);
+
   return (
     <div class="flex flex-col gap-4">
       {back}
@@ -581,6 +602,7 @@ export const ErrorsSummary = ({ appId }: { appId: string }) => {
   const issues = (data?.issues ?? []).slice(0, SUMMARY_ISSUES);
   const open = data?.counts.open ?? 0;
   const tabHref = `/apps/${appId}?t=errors`;
+
   return (
     <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
       <div class="card-body gap-3">
@@ -632,10 +654,14 @@ export const ErrorsPanel = ({
     default: "open",
     parse: toStatus,
   });
+
   const selected = searchParam("e", { default: "" });
+
   const role =
     canTriageProp === undefined ? appDetail(appId).data()?.myRole : undefined;
+
   const canTriage = canTriageProp ?? (role === "push" || role === "admin");
+
   if (selected()) {
     return (
       <ErrorDetailView
@@ -649,6 +675,7 @@ export const ErrorsPanel = ({
       />
     );
   }
+
   return (
     <ErrorList
       key={status()}

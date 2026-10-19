@@ -60,6 +60,7 @@ const TelemetrySettings = ({
   const save = async () => {
     busy.set(true);
     error.set("");
+
     try {
       await api<{ ok: true }>("/api/telemetry/setTelemetry", { enabled });
       draft.set(null);
@@ -141,9 +142,11 @@ export const TelemetryCard = () => {
   // Lives here, not in the body: the invalidate below blanks `status` for a
   // beat and remounts the body, which must keep the save confirmation.
   const saved = atom(false);
+
   if (res.loading() && status === undefined) {
     return <SectionSkeleton lines={3} />;
   }
+
   if (status === undefined) {
     return (
       <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
@@ -155,6 +158,7 @@ export const TelemetryCard = () => {
       </section>
     );
   }
+
   return <TelemetrySettings saved={saved} status={status} />;
 };
 
@@ -164,5 +168,6 @@ export const TelemetryCard = () => {
 export const isInstanceAdmin = (): boolean => {
   const admin = adminStatus().data();
   const sess = session().data();
+
   return (admin?.isAdmin ?? false) && sess?.session.impersonatedBy === null;
 };

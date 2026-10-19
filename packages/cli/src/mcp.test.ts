@@ -22,8 +22,10 @@ const stubFetch = (response: Response): void => {
       headers: new Headers(requestInit?.headers),
       url: String(input),
     };
+
     return Promise.resolve(response);
   };
+
   // SAFETY: the stub has the call signature and no `fetch.preconnect` (which
   // nothing here uses) — the same narrowing Bun's own `FetchSession.fetch` docs
   // prescribe.
@@ -51,11 +53,13 @@ describe("callTool", () => {
         },
       })
     );
+
     const answer = await Effect.runPromise(
       callTool<{ ok: boolean }>(CONNECTION, "list_environments", {
         app: "my-app",
       })
     );
+
     expect(answer).toEqual({ structured: { ok: true }, text: "the text" });
     expect(sent?.url).toBe("https://app.noite.now/mcp");
     expect(sent?.headers.get("authorization")).toBe("Bearer noite_key");
@@ -79,9 +83,11 @@ describe("callTool", () => {
         },
       })
     );
+
     const failure = await Effect.runPromise(
       Effect.flip(callTool(CONNECTION, "delete_environment", {}))
     );
+
     expect(failure.message).toBe("no such environment");
   });
 
@@ -92,9 +98,11 @@ describe("callTool", () => {
         { status: 401, statusText: "Unauthorized" }
       )
     );
+
     const failure = await Effect.runPromise(
       Effect.flip(callTool(CONNECTION, "list_environments", {}))
     );
+
     expect(failure.message).toBe(
       "https://app.noite.now/mcp: 401 missing or invalid API key"
     );
@@ -104,9 +112,11 @@ describe("callTool", () => {
     stubFetch(
       Response.json({ error: { code: -32_601, message: "not found" }, id: 1 })
     );
+
     const failure = await Effect.runPromise(
       Effect.flip(callTool(CONNECTION, "nope", {}))
     );
+
     expect(failure.message).toBe("MCP nope: -32601 not found");
   });
 
@@ -114,9 +124,11 @@ describe("callTool", () => {
     stubFetch(
       Response.json({ id: 1, jsonrpc: "2.0", result: { content: [] } })
     );
+
     const failure = await Effect.runPromise(
       Effect.flip(callTool(CONNECTION, "list_environments", {}))
     );
+
     expect(failure.message).toBe(
       "MCP list_environments: no structured content"
     );
@@ -124,9 +136,11 @@ describe("callTool", () => {
 
   test("fails when the response is not a JSON-RPC message", async () => {
     stubFetch(new Response("<html>gateway</html>", { status: 200 }));
+
     const failure = await Effect.runPromise(
       Effect.flip(callTool(CONNECTION, "list_environments", {}))
     );
+
     expect(failure.message).toBe(
       "list_environments: the MCP response is not a JSON-RPC message"
     );

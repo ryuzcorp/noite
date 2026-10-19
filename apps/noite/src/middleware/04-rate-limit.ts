@@ -14,15 +14,18 @@ import {
 
 export default defineMiddleware((c, next) => {
   const klass = limitedClass(c.req.path);
+
   if (klass) {
     // SAFETY: the limiter reads only the string control keys off the Worker env.
     const kit = c.env as KitEnv;
     const rpm = Number(kit.NOITE_RATE_LIMIT_RPM ?? DEFAULT_RPM);
+
     const decision = rateLimitDecision(
       `${klass}:${clientKey(c.req.raw)}`,
       Number.isFinite(rpm) ? rpm : DEFAULT_RPM,
       Date.now()
     );
+
     if (!decision.allowed) {
       return Promise.resolve(
         new Response("Too many requests", {
@@ -35,5 +38,6 @@ export default defineMiddleware((c, next) => {
       );
     }
   }
+
   return next();
 });

@@ -42,20 +42,25 @@ const ensureAdminAccount = (email: string | null) =>
     if (!email) {
       return;
     }
+
     const found = yield* Effect.gen(function* () {
       const sql = yield* SqlClient;
+
       return yield* sql.unsafe(
         `SELECT id, email, name, banned, role, createdAt FROM "user" WHERE "email" = ?`,
         [email]
       );
     });
+
     // SAFETY: the column list mirrors DbUser and D1 returns plain row
     // objects; the paranorm builder for this table exceeds tsc's depth
     // budget, so raw SQL stays shallow in every config.
     const existing = (found[0] ?? null) as DbUser | null;
+
     if (!existing || existing.role === "admin") {
       return;
     }
+
     const sql = yield* SqlClient;
     yield* sql.unsafe(`UPDATE "user" SET "role" = 'admin' WHERE "id" = ?`, [
       existing.id,
@@ -82,27 +87,34 @@ const requireAdmin = async (
   try {
     const session = await getSessionOrNull(request, env);
     const user = session?.user;
+
     if (!session || !user?.email || !user.id || session.impersonatedBy) {
       return null;
     }
+
     // SAFETY: the admin plugin augments the session user with an optional role string; allowlist known roles.
     const roleField = (user as { role?: unknown }).role;
     const role = roleField === "admin" ? "admin" : "user";
     const email = user.email.trim().toLowerCase();
     const anchored = resolveAdminEmail();
+
     if (anchored && email === anchored) {
       await withDb(ensureAdminAccount(anchored));
+
       return { email, id: user.id, isAdmin: true };
     }
+
     if (role !== "admin") {
       return null;
     }
+
     return { email, id: user.id, isAdmin: true };
   } catch (error) {
     console.error(
       "[requireAdmin]",
       error instanceof Error ? (error.stack ?? error.message) : String(error)
     );
+
     return null;
   }
 };
@@ -115,7 +127,9 @@ const adminAuth = (request: Request, env: KitEnv) => {
       throw new UnauthorizedError({ message: "Sign in required" });
     }
   })();
+
   const auth = authFromEnv(env, origin);
+
   return { auth, headers: request.headers };
 };
 
@@ -137,9 +151,11 @@ const asUserRow = (row: DbUser): AdminUserRow => ({
  * dev image, where `vite dev` serves the UI and there is no control celld). */
 export const adminOverview = apiActionNoInput(async ({ env, request }) => {
   const admin = await requireAdmin(request, env);
+
   if (!admin) {
     return { controlFleet: true, email: "", isAdmin: false as const };
   }
+
   return {
     controlFleet: await runnerControlFleet(),
     email: admin.email,
@@ -167,11 +183,14 @@ export const listUsers = apiAction(
   ListUsersArgs,
   async ({ page, query }, { env, request }) => {
     const admin = await requireAdmin(request, env);
+
     if (!admin) {
       fail("Admin only");
     }
+
     const needle = query.trim().slice(0, 100);
     const offset = Math.max(0, Math.floor(page)) * ADMIN_USERS_PAGE_SIZE;
+
     try {
       // Plain SELECT outside the paranorm builder: the builder exceeds
       // tsc's depth budget in some configs, while the untyped call stays
@@ -179,15 +198,18 @@ export const listUsers = apiAction(
       const found = await withDb(
         Effect.gen(function* () {
           const sql = yield* SqlClient;
+
           const filter = needle
             ? `WHERE lower(email) LIKE ? ESCAPE '\\' OR lower(name) LIKE ? ESCAPE '\\'`
             : "";
+
           const params: (string | number)[] = needle
             ? [
                 likePattern(needle.toLowerCase()),
                 likePattern(needle.toLowerCase()),
               ]
             : [];
+
           return yield* sql.unsafe(
             `SELECT id, email, name, banned, role, createdAt FROM "user"
               ${filter} ORDER BY createdAt DESC, id LIMIT ? OFFSET ?`,
@@ -195,9 +217,11 @@ export const listUsers = apiAction(
           );
         })
       );
+
       // SAFETY: the column list mirrors DbUser and D1 returns plain row
       // objects.
       const rows = found as DbUser[];
+
       return {
         hasMore: rows.length > ADMIN_USERS_PAGE_SIZE,
         users: rows
@@ -208,6 +232,7 @@ export const listUsers = apiAction(
       if (error instanceof UnauthorizedError) {
         throw error;
       }
+
       return failUnknown(error);
     }
   }
@@ -230,28 +255,34 @@ const asAppRow = (
  * each with its owner's email. */
 export const listAllApps = apiActionNoInput(async ({ env, request }) => {
   const admin = await requireAdmin(request, env);
+
   if (!admin) {
     fail("Admin only");
   }
+
   try {
     const [apps, users] = await Promise.all([
       runnerListApps(),
       withDb(
         Effect.gen(function* () {
           const sql = yield* SqlClient;
+
           return yield* sql.unsafe(`SELECT id, email FROM "user"`);
         })
       ),
     ]);
+
     // SAFETY: the projection is (id, email); D1 returns plain rows.
     const emails = new Map(
       (users as { email: string; id: string }[]).map((u) => [u.id, u.email])
     );
+
     return apps.map((app) => asAppRow(app, emails));
   } catch (error) {
     if (error instanceof UnauthorizedError) {
       throw error;
     }
+
     return failUnknown(error);
   }
 });
@@ -266,14 +297,18 @@ export const adminSetAppState = apiAction(
   AdminAppState,
   async ({ desiredState, id }, { env, request }) => {
     const admin = await requireAdmin(request, env);
+
     if (!admin) {
       fail("Admin only");
     }
+
     if (desiredState !== "running" && desiredState !== "stopped") {
       fail("desiredState must be running or stopped");
     }
+
     try {
       await runnerPatchApp(id, { desiredState });
+
       return { ok: true as const };
     } catch (error) {
       return failUnknown(error);
@@ -287,12 +322,15 @@ export const adminDeleteApp = apiAction(
   Schema.String,
   async (id: string, { env, request }) => {
     const admin = await requireAdmin(request, env);
+
     if (!admin) {
       fail("Admin only");
     }
+
     try {
       await runnerDeleteApp(id);
       await withDb(dropAppCollaborators(id));
+
       return { ok: true as const };
     } catch (error) {
       return failUnknown(error);
@@ -307,16 +345,20 @@ export const banUser = apiAction(
   UserId,
   async (userId: string, { env, request }) => {
     const admin = (await requireAdmin(request, env)) ?? fail("Admin only");
+
     if (userId === admin.id) {
       fail("Cannot ban your own account");
     }
+
     const { auth, headers } = await adminAuth(request, env);
+
     try {
       await auth.api.banUser({ body: { userId }, headers });
     } catch (error) {
       if (error instanceof UnauthorizedError) {
         throw error;
       }
+
       failUnknown(error);
     }
   }
@@ -326,16 +368,20 @@ export const unbanUser = apiAction(
   UserId,
   async (userId: string, { env, request }) => {
     const admin = await requireAdmin(request, env);
+
     if (!admin) {
       fail("Admin only");
     }
+
     const { auth, headers } = await adminAuth(request, env);
+
     try {
       await auth.api.unbanUser({ body: { userId }, headers });
     } catch (error) {
       if (error instanceof UnauthorizedError) {
         throw error;
       }
+
       failUnknown(error);
     }
   }
@@ -354,20 +400,26 @@ export const setUserRole = apiAction(
   async ({ role, userId }, { env, request }) => {
     const admin = (await requireAdmin(request, env)) ?? fail("Admin only");
     const nextRole = role === "admin" || role === "user" ? role : null;
+
     if (nextRole === null) {
       return fail("role must be admin or user");
     }
+
     if (userId === admin.id) {
       return fail("Cannot change your own role");
     }
+
     const { auth, headers } = await adminAuth(request, env);
+
     try {
       await auth.api.setRole({ body: { role: nextRole, userId }, headers });
+
       return { ok: true as const };
     } catch (error) {
       if (error instanceof UnauthorizedError) {
         throw error;
       }
+
       return failUnknown(error);
     }
   }
@@ -378,6 +430,7 @@ export const setUserRole = apiAction(
 const soleAdminApps = (userId: string) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient;
+
     const rows = yield* sql.unsafe(
       `SELECT c.appId AS appId FROM app_collaborator c
         WHERE c.userId = ? AND c.role = 'admin'
@@ -385,6 +438,7 @@ const soleAdminApps = (userId: string) =>
                 WHERE o.appId = c.appId AND o.role = 'admin') = 1`,
       [userId]
     );
+
     return rows.length;
   });
 
@@ -405,24 +459,30 @@ export const deleteUser = apiAction(
   UserId,
   async (userId: string, { env, request }) => {
     const admin = (await requireAdmin(request, env)) ?? fail("Admin only");
+
     if (userId === admin.id) {
       fail("Cannot delete your own account");
     }
+
     try {
       const stranded = await withDb(soleAdminApps(userId));
+
       if (stranded > 0) {
         fail(
           `This account is the only admin of ${stranded} app${stranded === 1 ? "" : "s"} — make someone else an admin or delete the app first`
         );
       }
+
       const { auth, headers } = await adminAuth(request, env);
       await auth.api.removeUser({ body: { userId }, headers });
       await withDb(dropUserLeftovers(userId));
+
       return { ok: true as const };
     } catch (error) {
       if (error instanceof UnauthorizedError) {
         throw error;
       }
+
       return failUnknown(error);
     }
   }
@@ -435,15 +495,18 @@ const InviteCount = Schema.Struct({ count: Schema.Number });
 /** Every invitation code with both ends of the exchange. */
 export const adminListInvites = apiActionNoInput(async ({ env, request }) => {
   const admin = await requireAdmin(request, env);
+
   if (!admin) {
     fail("Admin only");
   }
+
   try {
     return await listInvites();
   } catch (error) {
     if (error instanceof UnauthorizedError) {
       throw error;
     }
+
     failUnknown(error);
   }
 });
@@ -453,15 +516,18 @@ export const adminCreateInvites = apiAction(
   InviteCount,
   async ({ count }, { env, request }) => {
     const admin = (await requireAdmin(request, env)) ?? fail("Admin only");
+
     if (!Number.isInteger(count) || count < 1 || count > 50) {
       fail("Ask for between 1 and 50 codes");
     }
+
     try {
       return { codes: await mintInvites(admin.id, count, "admin") };
     } catch (error) {
       if (error instanceof UnauthorizedError) {
         throw error;
       }
+
       failUnknown(error);
     }
   }
@@ -472,16 +538,20 @@ export const adminRevokeInvite = apiAction(
   Schema.String,
   async (id: string, { env, request }) => {
     const admin = await requireAdmin(request, env);
+
     if (!admin) {
       fail("Admin only");
     }
+
     try {
       await revokeInvite(id);
+
       return { ok: true as const };
     } catch (error) {
       if (error instanceof UnauthorizedError) {
         throw error;
       }
+
       failUnknown(error);
     }
   }

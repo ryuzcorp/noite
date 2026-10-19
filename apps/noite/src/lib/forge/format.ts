@@ -18,13 +18,17 @@ export interface SourceFrom {
  * set), so History → commit → back returns to the ref and file it left. */
 export const sourceQuery = ({ file, ref }: SourceFrom): string => {
   const params = new URLSearchParams();
+
   if (ref !== "") {
     params.set("ref", ref);
   }
+
   if (file !== "") {
     params.set("file", file);
   }
+
   const query = params.toString();
+
   return query === "" ? "" : `?${query}`;
 };
 
@@ -40,11 +44,14 @@ export const commitHref = (
 /** Ahead/behind label vs main, or null when the branch is level. */
 export const divergeLabel = (ahead: number, behind: number): string | null => {
   const parts: string[] = [];
+
   if (ahead > 0) {
     parts.push(`${ahead} ahead`);
   }
+
   if (behind > 0) {
     parts.push(`${behind} behind`);
   }
+
   return parts.length === 0 ? null : parts.join(", ");
 };

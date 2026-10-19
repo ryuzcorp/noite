@@ -15,6 +15,7 @@ const frameUrl = (over: Record<string, string> = {}): string => {
     parentOrigin: CONTROL,
     ...over,
   });
+
   return `${PREVIEW}/noite-pod-host.html?${query}`;
 };
 
@@ -73,12 +74,14 @@ describe("a message on the frame's window", () => {
 
   test("a connect carries the port", () => {
     const { port1, port2 } = new MessageChannel();
+
     const message = handshakeMessage({
       nonce: NONCE,
       port: port2,
       t: "connect",
       v: 1,
     });
+
     expect(message?.t).toBe("connect");
     expect(message?.t === "connect" ? message.port : null).toBe(port2);
     port1.close();
@@ -87,6 +90,7 @@ describe("a message on the frame's window", () => {
 
   test("anything that is not a handshake is refused", () => {
     const { port1, port2 } = new MessageChannel();
+
     const wrong = [
       null,
       undefined,
@@ -102,9 +106,11 @@ describe("a message on the frame's window", () => {
       { nonce: NONCE, port: "port", t: "connect", v: 1 },
       { nonce: NONCE, port: port1, t: "postMessage", v: 1 },
     ];
+
     for (const value of wrong) {
       expect(handshakeMessage(value)).toBeNull();
     }
+
     port1.close();
     port2.close();
   });

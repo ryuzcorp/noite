@@ -57,6 +57,7 @@ describe("lineStarts / positions", () => {
 
   test("round-trips an offset through a position", () => {
     const text = "const x = 1;\nconst y = 2;\n";
+
     for (const offset of [0, 5, 12, 13, 25, 26]) {
       expect(
         offsetAtPosition(text, positionAtOffset(lineStarts(text), offset))
@@ -107,6 +108,7 @@ describe("diagnosticsToMarkers", () => {
       [diagnostic(0, 1, { code: 6133, severity: "warning" })],
       "unused\n"
     );
+
     expect(marker?.severity).toBe("warning");
   });
 });
@@ -132,6 +134,7 @@ describe("diagnosticMessagesAtOffset", () => {
       [diagnostic(4, 4, { code: 1005 })],
       4
     );
+
     expect(messages).toEqual([
       "TS1005: Type 'string' is not assignable to type 'number'.",
     ]);
@@ -203,6 +206,7 @@ describe("script files", () => {
     ]) {
       expect(isScriptFile(path)).toBe(true);
     }
+
     for (const path of ["README.md", "package.json", "src/style.css"]) {
       expect(isScriptFile(path)).toBe(false);
     }

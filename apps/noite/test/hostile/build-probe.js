@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 
 const out = {};
+
 const deny = (name, fn) => {
   try {
     const detail = fn();
@@ -19,6 +20,7 @@ const deny = (name, fn) => {
     out[name] = { detail: String(error).slice(0, 200), ok: false };
   }
 };
+
 const denyAsync = async (name, fn) => {
   try {
     const detail = await fn();
@@ -37,22 +39,28 @@ for (const key of [
     ? { detail: "present", ok: true }
     : { detail: "absent", ok: false };
 }
+
 deny(
   "read:/data/noite.sqlite",
   () => readFileSync("/data/noite.sqlite", "utf-8").length
 );
+
 deny("read:/proc/self/environ:secrets", () => {
   const raw = readFileSync("/proc/self/environ", "utf-8");
+
   const hit = [
     "RUNNER_TOKEN",
     "AWS_SECRET_ACCESS_KEY",
     "BETTER_AUTH_SECRET",
   ].filter((k) => raw.includes(k));
+
   if (hit.length > 0) {
     return `leaked ${hit.join(",")}`;
   }
+
   throw new Error("no platform secrets in environ");
 });
+
 // Real targets only: a probe at an address nothing listens on "fails" with
 // or without isolation and proves nothing. Builds run in the one Noite
 // container, so the runner, the control node's internal port and Caddy's
@@ -66,12 +74,15 @@ await Promise.all(
   ].map(([name, target]) =>
     denyAsync(name, async () => {
       const res = await fetch(target, { signal: AbortSignal.timeout(3000) });
+
       return `status ${res.status}`;
     })
   )
 );
+
 await denyAsync("fetch:metadata", async () => {
   const res = await fetch("http://169.254.169.254/");
+
   return `status ${res.status}`;
 });
 
@@ -86,29 +97,36 @@ deny("read:sibling-build-cache", () => {
   const ownSlug = buildsIndex === -1 ? "" : parts[buildsIndex + 1];
   const seen = [];
   const readable = [];
+
   for (const top of ["cache", "builds"]) {
     const root = `/data/runner/${top}`;
     let slugs;
+
     try {
       slugs = readdirSync(root);
     } catch {
       continue;
     }
+
     for (const slug of slugs) {
       if (slug === ownSlug) {
         continue;
       }
+
       seen.push(`${top}/${slug}`);
       const dir = `${root}/${slug}`;
       let leaves;
+
       try {
         leaves = readdirSync(dir);
       } catch {
         // Not even listable by this uid: already isolated.
         continue;
       }
+
       for (const leaf of leaves) {
         const target = `${dir}/${leaf}`;
+
         try {
           readdirSync(target);
           readable.push(target);
@@ -118,22 +136,28 @@ deny("read:sibling-build-cache", () => {
       }
     }
   }
+
   if (readable.length > 0) {
     return `read ${readable.slice(0, 3).join(", ")}`;
   }
+
   throw new Error(`siblings=${seen.length} readable=0`);
 });
 
 mkdirSync("dist", { recursive: true });
+
 // Placeholder for the Worker import: in multi-tenant mode without scoped
 // credentials the release step is skipped, and release-probe.js never runs.
 writeFileSync(
   "dist/release-probe.json",
   JSON.stringify({ phase: "release", probes: {}, skipped: true }, null, 2)
 );
+
 writeFileSync(
   "dist/probe.json",
   JSON.stringify({ phase: "build", probes: out }, null, 2)
 );
+
 appendFileSync("dist/probe.log", `build probes ${JSON.stringify(out)}\n`);
+
 console.log(`hostile build probes: ${JSON.stringify(out)}`);

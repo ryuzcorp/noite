@@ -12,6 +12,7 @@ export default function Home() {
     if (typeof window === "undefined") {
       return;
     }
+
     const { data } = await fetchSession();
     await router.visit(data?.user ? "/apps" : "/login");
   });

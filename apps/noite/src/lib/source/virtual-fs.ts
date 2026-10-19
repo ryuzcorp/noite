@@ -21,16 +21,20 @@ interface VirtualEntry {
  * paths, but module resolution composes its own, so normalize defensively. */
 export const normalizePath = (path: string): string => {
   const segments: string[] = [];
+
   for (const segment of path.split("/")) {
     if (segment === "" || segment === ".") {
       continue;
     }
+
     if (segment === "..") {
       segments.pop();
       continue;
     }
+
     segments.push(segment);
   }
+
   return `/${segments.join("/")}`;
 };
 
@@ -42,15 +46,19 @@ const globPiece = (token: string): string | undefined => {
   if (token === "**/") {
     return "(?:.*/)?";
   }
+
   if (token === "**") {
     return ".*";
   }
+
   if (token === "*") {
     return "[^/]*";
   }
+
   if (token === "?") {
     return "[^/]";
   }
+
   return undefined;
 };
 
@@ -64,14 +72,17 @@ const GLOB_TOKEN = /\\|\*\*\/|\*\*|\*|\?|[.+^${}()|[\]]/gu;
  * segments (`**` crossing them). */
 export const specMatches = (path: string, spec: string): boolean => {
   const target = normalizePath(spec);
+
   if (!/[?*]/u.test(target)) {
     return path === target || path.startsWith(`${target}/`);
   }
+
   // One pass: a second one would rewrite the wildcards the first produced.
   const pattern = target.replaceAll(
     GLOB_TOKEN,
     (token) => globPiece(token) ?? `\\${token}`
   );
+
   return new RegExp(`^${pattern}$`, "u").test(path);
 };
 
@@ -84,11 +95,14 @@ export class VirtualFs {
   write(path: string, text: string): void {
     const target = normalizePath(path);
     const existing = this.#files.get(target);
+
     if (existing?.text === text) {
       return;
     }
+
     this.#files.set(target, { text, version: (existing?.version ?? 0) + 1 });
     let parent = target.slice(0, target.lastIndexOf("/")) || "/";
+
     while (!this.#directories.has(parent)) {
       this.#directories.add(parent);
       parent = parent.slice(0, parent.lastIndexOf("/")) || "/";
@@ -103,18 +117,24 @@ export class VirtualFs {
         this.#files.delete(path);
       }
     }
+
     if (!keep) {
       this.#directories = new Set(["/"]);
+
       return;
     }
+
     const directories = new Set<string>(["/"]);
+
     for (const path of this.#files.keys()) {
       let parent = path.slice(0, path.lastIndexOf("/")) || "/";
+
       while (!directories.has(parent)) {
         directories.add(parent);
         parent = parent.slice(0, parent.lastIndexOf("/")) || "/";
       }
     }
+
     this.#directories = directories;
   }
 
@@ -143,15 +163,19 @@ export class VirtualFs {
     const root = normalizePath(path);
     const prefix = root === "/" ? "/" : `${root}/`;
     const names = new Set<string>();
+
     for (const directory of this.#directories) {
       if (directory === prefix || !directory.startsWith(prefix)) {
         continue;
       }
+
       const [name] = directory.slice(prefix.length).split("/");
+
       if (name) {
         names.add(name);
       }
     }
+
     return [...names].toSorted();
   };
 
@@ -168,24 +192,30 @@ export class VirtualFs {
     const root = normalizePath(rootDir);
     const prefix = root === "/" ? "/" : `${root}/`;
     const paths: string[] = [];
+
     for (const path of this.#files.keys()) {
       if (!path.startsWith(prefix) && path !== root) {
         continue;
       }
+
       if (!extensions.some((extension) => path.endsWith(extension))) {
         continue;
       }
+
       if ((excludes ?? []).some((spec) => specMatches(path, spec))) {
         continue;
       }
+
       if (
         includes.length > 0 &&
         !includes.some((spec) => specMatches(path, spec))
       ) {
         continue;
       }
+
       paths.push(path);
     }
+
     return paths.toSorted();
   };
 }

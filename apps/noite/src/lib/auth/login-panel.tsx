@@ -34,12 +34,15 @@ const waitForSession = async (): Promise<void> => {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     // oxlint-disable-next-line eslint/no-await-in-loop -- sequential cookie-readiness poll; Promise.all would defeat the early-exit
     const session = await fetchSession();
+
     if (session.data?.user) {
       break;
     }
+
     // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll backoff
     await sleep(50);
   }
+
   invalidateSession();
 };
 
@@ -63,8 +66,10 @@ export const LoginPanel = () => {
   // rooted path on this origin; anything else falls back to the flow's own
   // landing page.
   const returnTo = searchParam("return", { default: "" });
+
   const landing = (fallback: string): string =>
     sameOriginPath(returnTo()) ?? fallback;
+
   const mode = (): "register" | "signin" =>
     picked() ?? (invite()?.firstRun ? "register" : "signin");
 
@@ -74,7 +79,9 @@ export const LoginPanel = () => {
       // fetch on the server); SSR paints the form.
       return;
     }
+
     const { data } = await fetchSession();
+
     if (data?.user) {
       router.visit(landing("/apps"));
     }
@@ -83,39 +90,53 @@ export const LoginPanel = () => {
   const register = async (event: SubmitEvent) => {
     event.preventDefault();
     const form = event.currentTarget;
+
     if (!(form instanceof HTMLFormElement)) {
       return;
     }
+
     const data = new FormData(form);
     const email = String(data.get("email") ?? "").trim();
     const name = String(data.get("name") ?? "").trim();
     const code = String(data.get("invite") ?? "").trim();
+
     if (!(email && name)) {
       error.set("Name and email are required");
+
       return;
     }
+
     if (invite()?.requiresInvite && !code) {
       error.set("An invitation code is required on this instance");
+
       return;
     }
+
     busy.set(true);
     error.set("");
+
     const result = await authClient.passkey.addPasskey({
       context: registrationContext(email, name, code),
       createSession: true,
       name: "Primary",
     });
+
     busy.set(false);
+
     if (result.error) {
       error.set(result.error.message ?? "Registration failed");
+
       return;
     }
+
     if (result.data?.user) {
       // Cookie may not be readable for the very next document request yet.
       await waitForSession();
       router.visit(landing("/apps"));
+
       return;
     }
+
     error.set("Registration completed without a session");
   };
 
@@ -124,10 +145,13 @@ export const LoginPanel = () => {
     error.set("");
     const result = await authClient.signIn.passkey();
     busy.set(false);
+
     if (result.error) {
       error.set(result.error.message ?? "Sign-in failed");
+
       return;
     }
+
     await waitForSession();
     router.visit(landing("/apps"));
   };
@@ -135,25 +159,35 @@ export const LoginPanel = () => {
   const sendOtp = async (event: SubmitEvent) => {
     event.preventDefault();
     const form = event.currentTarget;
+
     if (!(form instanceof HTMLFormElement)) {
       return;
     }
+
     const email = String(new FormData(form).get("email") ?? "").trim();
+
     if (!email) {
       error.set("Email is required");
+
       return;
     }
+
     busy.set(true);
     error.set("");
+
     const result = await authClient.emailOtp.sendVerificationOtp({
       email,
       type: "sign-in",
     });
+
     busy.set(false);
+
     if (result.error) {
       error.set(result.error.message ?? "Failed to send code");
+
       return;
     }
+
     otpEmail.set(email);
     otpSent.set(true);
   };
@@ -161,25 +195,35 @@ export const LoginPanel = () => {
   const verifyOtp = async (event: SubmitEvent) => {
     event.preventDefault();
     const form = event.currentTarget;
+
     if (!(form instanceof HTMLFormElement)) {
       return;
     }
+
     const otp = String(new FormData(form).get("otp") ?? "").trim();
+
     if (!otp) {
       error.set("Code is required");
+
       return;
     }
+
     busy.set(true);
     error.set("");
+
     const result = await authClient.signIn.emailOtp({
       email: otpEmail(),
       otp,
     });
+
     busy.set(false);
+
     if (result.error) {
       error.set(result.error.message ?? "Sign-in failed");
+
       return;
     }
+
     await waitForSession();
     // A recovery sign-in exists because the passkey is gone: land on the
     // account page, where a new one can be added straight away.
@@ -273,11 +317,13 @@ export const LoginPanel = () => {
   }
 
   let intro = INTRO.register;
+
   if (mode() === "signin") {
     intro = INTRO.signin;
   } else if (invite()?.firstRun) {
     intro = INTRO.firstRun;
   }
+
   return (
     <div class="flex flex-col gap-6">
       <div class="flex flex-col gap-2">

@@ -48,7 +48,9 @@ export const rateLimitDecision = (
   if (limit <= 0) {
     return { allowed: true, remaining: 0, retryAfter: 0 };
   }
+
   const existing = buckets.get(key);
+
   if (!existing || existing.resetAt <= now) {
     if (buckets.size >= MAX_BUCKETS) {
       // Drop everything already expired, then give up on the oldest entry.
@@ -57,14 +59,19 @@ export const rateLimitDecision = (
           buckets.delete(k);
         }
       }
+
       const oldest = buckets.keys().next();
+
       if (!oldest.done) {
         buckets.delete(oldest.value);
       }
     }
+
     buckets.set(key, { count: 1, resetAt: now + WINDOW_MS });
+
     return { allowed: true, remaining: limit - 1, retryAfter: 0 };
   }
+
   if (existing.count >= limit) {
     return {
       allowed: false,
@@ -72,7 +79,9 @@ export const rateLimitDecision = (
       retryAfter: Math.max(1, Math.ceil((existing.resetAt - now) / 1000)),
     };
   }
+
   existing.count += 1;
+
   return { allowed: true, remaining: limit - existing.count, retryAfter: 0 };
 };
 
@@ -84,12 +93,15 @@ export const rateLimitDecision = (
  * hit still counts somewhere. */
 export const clientKey = (request: Request): string => {
   const forwarded = request.headers.get("x-forwarded-for");
+
   if (forwarded) {
     const last = forwarded.split(",").at(-1)?.trim();
+
     if (last) {
       return last;
     }
   }
+
   return request.headers.get("cf-connecting-ip")?.trim() || "unknown";
 };
 
@@ -100,6 +112,7 @@ export const clientKey = (request: Request): string => {
 export const withTrustedClientAddress = (request: Request): Request => {
   const headers = new Headers(request.headers);
   headers.set("x-forwarded-for", clientKey(request));
+
   return new Request(request, { headers });
 };
 
@@ -110,9 +123,11 @@ export const limitedClass = (pathname: string): string | null => {
   if (pathname === "/api/invite/status") {
     return "invite";
   }
+
   if (pathname === "/internal/recovery") {
     return "recovery";
   }
+
   return pathname.startsWith("/api/auth") ? "auth" : null;
 };
 

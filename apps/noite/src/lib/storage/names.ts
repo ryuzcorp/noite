@@ -6,8 +6,10 @@ export const resourceDisplayName = (resourceId: string): string => {
   if (resourceId.startsWith("d1:") || resourceId.startsWith("r2:")) {
     return resourceId.slice(3);
   }
+
   if (resourceId.startsWith("do:")) {
     return resourceId.split(":").slice(2).join(":");
   }
+
   return resourceId;
 };

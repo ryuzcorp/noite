@@ -15,10 +15,10 @@
   "devDependencies": {
     "@types/bun": "latest",
     "husky": "^9.1.7",
-    "oxfmt": "^0.71.0",
+    "oxfmt": "^0.73.0",
     "oxlint": "^1.88.0",
     "typescript": "^7",
-    "ultracite": "7.12.2"
+    "ultracite": "8.0.1"
   },
   "patchedDependencies": {
     "@r1ck404/nodepod@1.11.2": "apps/noite/patches/@r1ck404%2Fnodepod@1.11.2.patch"

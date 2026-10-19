@@ -11,5 +11,6 @@ export const DocumentTitle = ({ title }: { title: string }) => {
   if (typeof document !== "undefined") {
     document.title = title;
   }
+
   return null;
 };

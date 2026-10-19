@@ -99,19 +99,24 @@ export const resolveRepoConfig = (
   const known = new Set(repoPaths);
   const roots = fallbackRoots(repoPaths);
   const text = fs.read(CONFIG_PATH);
+
   if (text === undefined) {
     return { options: defaultCompilerOptions(), roots };
   }
+
   const parsed = parseConfig(fs, text);
+
   if (!parsed) {
     return { options: defaultCompilerOptions(), roots };
   }
+
   const merged: ts.CompilerOptions = {
     ...defaultCompilerOptions(),
     ...parsed.options,
     allowJs: true,
     noEmit: true,
   };
+
   if (
     parsed.options.module !== undefined &&
     parsed.options.moduleResolution === undefined
@@ -120,9 +125,11 @@ export const resolveRepoConfig = (
     // is invalid next to, say, `commonjs`, so let the compiler derive it.
     merged.moduleResolution = undefined;
   }
+
   const declared = parsed.fileNames.filter(
     (path) => known.has(path) && isScriptFile(path)
   );
+
   return {
     options: merged,
     roots:

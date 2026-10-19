@@ -22,11 +22,14 @@ export const initials = (name: string): string => {
     .trim()
     .split(/\s+/u)
     .filter((p) => p.length > 0);
+
   if (parts.length === 0) {
     return "?";
   }
+
   const first = parts[0]?.[0] ?? "";
   const second = parts.length > 1 ? (parts[1]?.[0] ?? "") : "";
+
   return `${first}${second}`.toUpperCase() || "?";
 };
 
@@ -36,12 +39,15 @@ export const presenceTone = (status: string): string => {
   if (status === "running") {
     return "status-success";
   }
+
   if (status === "sleeping") {
     return "status-neutral";
   }
+
   if (status === "failed" || status === "error") {
     return "status-error";
   }
+
   return "status-warning";
 };
 
@@ -56,19 +62,24 @@ export const appHost = (subdomain: string): string => {
     // SSR: no current host to rebase onto; hydration recomputes the link.
     return subdomain;
   }
+
   const { hostname } = window.location;
   const host = hostname.toLowerCase();
   const dot = subdomain.indexOf(".");
   const base = dot === -1 ? "" : subdomain.slice(dot + 1).toLowerCase();
+
   const loopback =
     host === "127.0.0.1" ||
     host === "::1" ||
     host === "[::1]" ||
     isLocalhostDomain(host);
+
   if (loopback || host === base || (base !== "" && host.endsWith(`.${base}`))) {
     return subdomain;
   }
+
   const slug = dot === -1 ? subdomain : subdomain.slice(0, dot);
+
   return `${slug}.${hostname}`;
 };
 
@@ -79,8 +90,10 @@ export const appUrl = (subdomain: string): string => {
     // SSR: no port to carry; hydration recomputes the link.
     return `https://${subdomain}`;
   }
+
   const { port } = window.location;
   const host = appHost(subdomain);
+
   return port ? `http://${host}:${port}` : `https://${host}`;
 };
 
@@ -96,7 +109,9 @@ export const environmentUrl = (subdomain: string, label: string): string => {
     // SSR: no port to carry; hydration recomputes the link.
     return `https://${label}.${subdomain}`;
   }
+
   const { port } = window.location;
   const host = environmentHost(subdomain, label);
+
   return port ? `http://${host}:${port}` : `https://${host}`;
 };

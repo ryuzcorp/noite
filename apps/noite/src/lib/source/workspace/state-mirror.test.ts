@@ -20,8 +20,10 @@ interface FakeVolume extends MirrorVolume {
 const fakeVolume = (): FakeVolume => {
   const files = new Map<string, Uint8Array>();
   const listeners = new Set<(mutation: MirrorMutation) => void>();
+
   const under = (path: string): string[] =>
     [...files.keys()].filter((key) => key.startsWith(`${path}/`));
+
   return {
     emit: (mutation) => {
       for (const listener of listeners) {
@@ -35,22 +37,27 @@ const fakeVolume = (): FakeVolume => {
     // oxlint-disable-next-line promise/prefer-await-to-callbacks -- the fake delivers mutations as events, like the volume
     onMutation: (callback) => {
       listeners.add(callback);
+
       return () => {
         listeners.delete(callback);
       };
     },
     readFileSync: (path) => {
       const bytes = files.get(path);
+
       if (bytes === undefined) {
         throw new Error(`ENOENT: ${path}`);
       }
+
       return bytes;
     },
     readdirSync: (path) => {
       const children = under(path);
+
       if (children.length === 0) {
         throw new Error(`ENOENT: ${path}`);
       }
+
       return [
         ...new Set(
           children.map((key) => key.slice(path.length + 1).split("/")[0] ?? "")
@@ -59,12 +66,14 @@ const fakeVolume = (): FakeVolume => {
     },
     removeTreeSync: (path) => {
       files.delete(path);
+
       for (const key of under(path)) {
         files.delete(key);
       }
     },
     text: (path) => {
       const bytes = files.get(path);
+
       return bytes === undefined ? null : DECODER.decode(bytes);
     },
     writeFileSync: (path, data) => {
@@ -75,6 +84,7 @@ const fakeVolume = (): FakeVolume => {
 
 const fakeStorage = (): MirrorStorage => {
   const values = new Map<string, string>();
+
   return {
     getItem: (key) => values.get(key) ?? null,
     removeItem: (key) => {
@@ -101,6 +111,7 @@ const savedCopy = (): FakeVolume => {
   volume.writeFileSync("/home/project/util.ts", ENCODER.encode("old"));
   volume.writeFileSync("/home/project/gone.ts", ENCODER.encode("old"));
   volume.writeFileSync("/home/project/lib/a.ts", ENCODER.encode("a"));
+
   return volume;
 };
 

@@ -50,11 +50,13 @@ const initialDrafts = (
   row: Record<string, D1Cell> | null
 ): FieldDrafts => {
   const drafts: FieldDrafts = {};
+
   for (const column of columns) {
     drafts[column.name] = draftFromCell(
       row === null ? "" : (row[column.name] ?? null)
     );
   }
+
   return drafts;
 };
 
@@ -68,6 +70,7 @@ const pkBadgeFor = (column: D1Column, pkCount: number): string | null => {
   if (column.pk === 0) {
     return null;
   }
+
   return pkCount > 1 ? `PK ${column.pk}` : "PK";
 };
 
@@ -76,6 +79,7 @@ const editorTitle = (isEdit: boolean, canUpdate: boolean): string => {
   if (!isEdit) {
     return "Insert row";
   }
+
   return canUpdate ? "Update row" : "View row";
 };
 
@@ -106,6 +110,7 @@ const DeleteControl = ({
       </button>
     );
   }
+
   return (
     <div class="flex flex-wrap items-center gap-2 text-sm">
       <span class="text-error">Delete row where {keyLabel}?</span>
@@ -139,13 +144,17 @@ const noteFor = (
   if (schema.redacted.includes(column.name)) {
     return "redacted";
   }
+
   const note = schema.locked[column.name];
+
   if (note !== undefined) {
     return note;
   }
+
   if (cell !== null && isBlobText(cell)) {
     return "binary";
   }
+
   return null;
 };
 
@@ -224,9 +233,11 @@ const FieldValue = ({
 }) => {
   const value = draft.text;
   const fieldDisabled = disabled || draft.isNull;
+
   const setText = (text: string) => {
     onChange({ text, touched: true });
   };
+
   if (isBoolType(column.type) && !disabled) {
     return (
       <div class="join w-full">
@@ -246,6 +257,7 @@ const FieldValue = ({
       </div>
     );
   }
+
   if (!draft.isNull && prefersTextarea(value)) {
     return (
       <textarea
@@ -260,6 +272,7 @@ const FieldValue = ({
       />
     );
   }
+
   return (
     <input
       id={inputId}
@@ -300,6 +313,7 @@ const FieldHelpers = ({
   const date = draft.isNull ? null : parseTimestamp(value);
   const json = draft.isNull || disabled ? null : jsonValid(value);
   const showNow = !disabled && isTimestampColumn(column.name, column.type);
+
   return (
     <div class="flex flex-wrap items-center gap-2 pt-1 text-xs">
       {showNow ? (
@@ -324,6 +338,7 @@ const FieldHelpers = ({
           class="btn btn-sm btn-ghost"
           onclick={() => {
             const pretty = formatJson(value);
+
             if (pretty !== null) {
               onChange({ text: pretty, touched: true });
             }
@@ -445,25 +460,32 @@ export const RowEditor = ({
    * ref also fires for ilha's detached scratch copies) and only once. */
   const focusInitial = () => {
     let frames = 0;
+
     const attempt = () => {
       frames += 1;
       const root = liveEl(box);
+
       const target =
         root?.querySelector<HTMLElement>(FIELD_SELECTOR) ??
         root?.querySelector<HTMLElement>("h3");
+
       if (target) {
         focused.done = true;
         target.focus();
+
         return;
       }
+
       if (frames < 10) {
         requestAnimationFrame(attempt);
       }
     };
+
     requestAnimationFrame(attempt);
   };
 
   const lockedColumns = [...Object.keys(schema.locked), ...schema.redacted];
+
   const scope = {
     columns: schema.columns,
     drafts: drafts(),
@@ -471,6 +493,7 @@ export const RowEditor = ({
     locked: lockedColumns,
     original,
   };
+
   const values = writeValues(scope);
   const changeCount = Object.keys(values).length;
   const dirty = changeCount > 0;
@@ -487,7 +510,9 @@ export const RowEditor = ({
     if (busy() || !dirty || !canUpdate) {
       return;
     }
+
     busy.set(true);
+
     try {
       // An INSERT omits `key` entirely: the action transport encodes args as
       // JSON, where an explicit `undefined` is not a JSON value.
@@ -496,9 +521,11 @@ export const RowEditor = ({
         table: schema.table,
         values,
       };
+
       if (isEdit) {
         body.key = keyFor(schema.columns, original);
       }
+
       await api<{ ok: true }>("/api/storage/d1Write", {
         appId,
         databaseId,
@@ -518,7 +545,9 @@ export const RowEditor = ({
     if (busy()) {
       return;
     }
+
     busy.set(true);
+
     try {
       await api<{ ok: true }>("/api/storage/d1Write", {
         appId,
@@ -542,33 +571,42 @@ export const RowEditor = ({
     if (dirty) {
       pending.set({ kind: "close" });
       open.set(true);
+
       return;
     }
+
     onClose();
   };
 
   const openFk = (column: D1Column) => {
     const fk = schema.foreignKeys.find((key) => key.from === column.name);
+
     if (fk === undefined) {
       return;
     }
+
     const draft = drafts()[column.name] ?? draftFromCell(null);
+
     const target: Pending = {
       column: fk.to,
       kind: "fk",
       table: fk.table,
       value: cellFromDraft(draft),
     };
+
     if (dirty) {
       pending.set(target);
       open.set(true);
+
       return;
     }
+
     onOpenFk(target);
   };
 
   const keyLabel = (): string => {
     const key = keyFor(schema.columns, original);
+
     return Object.entries(key)
       .map(([name, value]) => `${name} = ${value === null ? "NULL" : value}`)
       .join(", ");
@@ -578,15 +616,18 @@ export const RowEditor = ({
     if (dirty) {
       return `${changeCount} change${changeCount === 1 ? "" : "s"}`;
     }
+
     if (isEdit) {
       return "No changes";
     }
+
     return "Untouched fields use their DDL default";
   };
 
   const titleId = `d1-editor-title-${schema.table}`;
   const activePending = pending();
   const title = editorTitle(isEdit, canUpdate);
+
   return (
     <Dialog
       open={open}
@@ -598,6 +639,7 @@ export const RowEditor = ({
         class="modal-box bg-base-100 dark:bg-base-200 flex max-h-[calc(100dvh-2rem)] w-full max-w-xl flex-col overflow-hidden p-0"
         ref={(el) => {
           collectRef(box, el);
+
           if (el && !focused.done) {
             focusInitial();
           }
@@ -640,10 +682,13 @@ export const RowEditor = ({
                 class="btn btn-sm btn-neutral"
                 onclick={() => {
                   pending.set(null);
+
                   if (activePending.kind === "close") {
                     onClose();
+
                     return;
                   }
+
                   onOpenFk(activePending);
                 }}
               >
@@ -667,10 +712,13 @@ export const RowEditor = ({
             const draft =
               drafts()[column.name] ??
               draftFromCell(original[column.name] ?? null);
+
             const fk = schema.foreignKeys.find(
               (key) => key.from === column.name
             );
+
             const note = noteFor(column, schema, original[column.name] ?? null);
+
             return (
               <FieldRow
                 key={column.name}

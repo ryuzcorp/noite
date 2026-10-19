@@ -10,5 +10,6 @@
  * `apps/runner/src/config.rs`. */
 export const isLocalhostDomain = (domain: string): boolean => {
   const trimmed = domain.trim().toLowerCase().replace(/\.+$/u, "");
+
   return trimmed === "localhost" || trimmed.endsWith(".localhost");
 };

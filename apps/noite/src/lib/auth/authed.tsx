@@ -21,6 +21,7 @@ const readImpersonated = (
   // creates; presence means this session is impersonated.
   const impersonated =
     session?.impersonatedBy !== undefined && session.impersonatedBy !== null;
+
   return {
     email: fallbackEmail,
     impersonated,
@@ -52,26 +53,32 @@ export const Authed = ({
       // the server); the gate paints its fallback until hydration lands.
       return;
     }
+
     // Wait for the first answer however long it takes: refetch() joins
     // the in-flight request, so a slow get-session never counts against
     // the retry budget below (sleeping through it bounced real users).
     if (res.loading() || res.data() === undefined) {
       await res.refetch();
     }
+
     // Post-registration cookie race: the first answer can arrive before
     // the session cookie is readable, so retry briefly before bouncing.
     for (let i = 0; i < 20 && !res.data()?.user; i += 1) {
       if (signal.aborted) {
         return;
       }
+
       // oxlint-disable-next-line eslint/no-await-in-loop -- sequential cookie-readiness poll; Promise.all would defeat the early-exit
       await sleep(50);
+
       if (signal.aborted) {
         return;
       }
+
       // oxlint-disable-next-line eslint/no-await-in-loop -- same poll cycle: sleep, then re-read
       await res.refetch();
     }
+
     if (!signal.aborted && !res.data()?.user) {
       router.visit("/login");
     }
@@ -80,15 +87,19 @@ export const Authed = ({
   const stopImpersonating = async () => {
     returning.set(true);
     returnError.set("");
+
     try {
       const result = await authClient.admin.stopImpersonating({});
+
       if (result.error) {
         returnError.set(
           result.error.message ?? "Failed to return to admin session"
         );
         returning.set(false);
+
         return;
       }
+
       invalidateSession();
       router.visit("/apps/_control?t=users");
     } catch (error) {
@@ -99,10 +110,13 @@ export const Authed = ({
 
   const data = res.data();
   const user = data?.user;
+
   if (!data || !user) {
     return fallback;
   }
+
   const seen = readImpersonated(data.session, user.email);
+
   return (
     <>
       {seen.impersonated ? (

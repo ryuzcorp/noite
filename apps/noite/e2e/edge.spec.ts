@@ -22,6 +22,7 @@ test("control UI is cross-origin isolated", async ({ page, request }) => {
   // the browser refuses to expose it.
   await page.goto("/login");
   expect(await page.evaluate(() => crossOriginIsolated)).toBe(true);
+
   // The workspace — its code, its workers, its preview service worker — belongs
   // to the app's preview origin, never this one. Every pod path is absent here:
   // nothing on the control origin may create a process worker or register a
@@ -30,9 +31,11 @@ test("control UI is cross-origin isolated", async ({ page, request }) => {
   const answers = await Promise.all(
     CONTROL_HOST_DENIED_ASSETS.map(async (path) => {
       const res = await request.get(path);
+
       return `${path} -> ${res.status()}`;
     })
   );
+
   expect(answers).toEqual(
     CONTROL_HOST_DENIED_ASSETS.map((path) => `${path} -> 404`)
   );
@@ -45,9 +48,12 @@ test("control UI still serves its own bundle", async ({ request }) => {
   const response = await request.get("/login", {
     headers: { accept: "text/html" },
   });
+
   const html = await response.text();
+
   const entry =
     /src="(?<chunk>\/assets\/[^"]+)"/u.exec(html)?.groups?.chunk ?? "";
+
   expect(entry).not.toBe("");
   const asset = await request.get(entry);
   expect(asset.status()).toBe(200);
@@ -69,5 +75,6 @@ test("git smart-http is gated, not missing", async ({ request }) => {
   const res = await request.get(
     "http://localhost:8080/v1/git/e2e/info/refs?service=git-upload-pack"
   );
+
   expect(res.status()).toBe(401);
 });

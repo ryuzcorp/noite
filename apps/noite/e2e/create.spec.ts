@@ -51,20 +51,25 @@ const gitLog = (request: APIRequestContext, appId: string) =>
  * where the first-push `remote:` line lands). */
 const pushNewRepo = (apiKey: string, slug: string) => {
   const dir = mkdtempSync(nodePath.join(tmpdir(), `noite-${slug}-`));
+
   try {
     cpSync(new URL("../test", import.meta.url), dir, { recursive: true });
     rmSync(nodePath.join(dir, ".git"), { force: true, recursive: true });
+
     const git = (args: string[], env: Record<string, string> = {}) => {
       const run = spawnSync("git", args, {
         cwd: dir,
         encoding: "utf-8",
         env: { ...process.env, ...env },
       });
+
       if (run.status !== 0) {
         throw new Error(`git ${args.join(" ")}: ${run.stderr}`);
       }
+
       return { stderr: run.stderr, stdout: run.stdout };
     };
+
     git(["init", "-b", "main"]);
     git(["add", "-A"]);
     git(["commit", "-m", `${slug} deploy`], {
@@ -79,9 +84,11 @@ const pushNewRepo = (apiKey: string, slug: string) => {
       "origin",
       `http://git:${apiKey}@${gitBase.replace(/^https?:\/\//u, "")}/${slug}`,
     ]);
+
     const push = git(["push", "-u", "origin", "main"], {
       GIT_TERMINAL_PROMPT: "0",
     });
+
     return {
       sha: git(["rev-parse", "HEAD"]).stdout.trim(),
       stderr: push.stderr,
@@ -113,11 +120,13 @@ test("imports a public GitHub repo with its history", async ({
   expect(created.imported).toBe(true);
 
   const deploy = await waitForDeploy(request, id);
+
   const [upstreamHead] = execFileSync("git", ["ls-remote", UPSTREAM, "HEAD"], {
     encoding: "utf-8",
   })
     .trim()
     .split(/\s+/u);
+
   // One-time copy: Noite's main is the upstream tip, history included.
   expect(deploy.sha).toBe(upstreamHead);
   const log = await gitLog(request, id);
@@ -154,6 +163,7 @@ test("rejects an import URL that is not a public GitHub repo", async ({
     },
     method: "POST",
   });
+
   expect(rejected.status).toBe(400);
   expect(String(rejected.body)).toContain("github.com");
   expect(await findAppId(request, "nope-import")).toBeNull();
@@ -164,12 +174,14 @@ test("pushing to a new slug creates the app and serves the push", async ({
   request,
 }) => {
   createdApps.push("key-holder", "pushed-app");
+
   // Any account's API key may create an app this way; mint one on a throwaway
   // app through the same UI a user would.
   const { apiKey } = await createAppWithKey(page, request, {
     name: "Key Holder",
     slug: "key-holder",
   });
+
   const pushed = pushNewRepo(apiKey, "pushed-app");
   const appId = await findAppId(request, "pushed-app");
   expect(appId).not.toBeNull();
@@ -188,10 +200,12 @@ test("a reserved slug cannot be pushed into existence", async ({
   request,
 }) => {
   createdApps.push("reserved-probe");
+
   const { apiKey } = await createAppWithKey(page, request, {
     name: "Reserved Probe",
     slug: "reserved-probe",
   });
+
   // The receive-pack advertisement for a reserved slug is a 404 whose body is
   // the same "repository not found" any unknown repo gets — the runner asks the
   // UI, which refuses the slug.
@@ -199,6 +213,7 @@ test("a reserved slug cannot be pushed into existence", async ({
     `${gitBase}/api/info/refs?service=git-receive-pack`,
     { headers: { authorization: `Basic ${btoa(`git:${apiKey}`)}` } }
   );
+
   expect(res.status()).toBe(404);
   expect(await res.text()).toContain("repository not found");
   expect(await findAppId(request, "api")).toBeNull();

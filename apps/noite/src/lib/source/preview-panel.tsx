@@ -63,6 +63,7 @@ const FinishedLog = ({
   deployId: string;
 }) => {
   const res = deployLog(appId, deployId);
+
   if (res.error()) {
     return (
       <div class="flex flex-col items-start gap-2 px-3 pb-2">
@@ -79,6 +80,7 @@ const FinishedLog = ({
       </div>
     );
   }
+
   return (
     <pre class="max-h-40 overflow-auto px-3 pb-2 font-mono text-xs whitespace-pre-wrap">
       {res.data()?.log ?? "(loading build log…)"}
@@ -100,6 +102,7 @@ const DeployLog = ({
       <p class="m-0 px-3 pb-2 text-xs opacity-70">Waiting for the deploy…</p>
     );
   }
+
   if (row.log !== "") {
     return (
       <pre class="max-h-40 overflow-auto px-3 pb-2 font-mono text-xs whitespace-pre-wrap">
@@ -107,12 +110,14 @@ const DeployLog = ({
       </pre>
     );
   }
+
   // A running deploy's log is still in the stream (the row carries it as it
   // arrives); a finished row's is read once.
   const finished =
     row.status !== "building" &&
     row.status !== "deploying" &&
     row.status !== "queued";
+
   return finished ? (
     <FinishedLog appId={appId} deployId={row.id} />
   ) : (
@@ -126,6 +131,7 @@ const deployRunning = (status: string): boolean => {
   if (status === "queued" || status === "building" || status === "deploying") {
     return true;
   }
+
   return false;
 };
 
@@ -147,9 +153,11 @@ const targetTitle = (target: FrameTarget): string => {
   if (target.kind === "production") {
     return `production · ${target.status}`;
   }
+
   if (target.kind === "workspace") {
     return `your preview of this branch · ${target.status}`;
   }
+
   return `the branch's environment · ${target.status}`;
 };
 
@@ -189,6 +197,7 @@ const candidatesFor = (
   branch: string
 ) => {
   const previewRef = workspacePreviewRef(viewerId, branch);
+
   return {
     branchEnv: rows.find(
       (row) => row.kind === "branch" && row.gitRef === `refs/heads/${branch}`
@@ -221,20 +230,26 @@ const pickTarget = ({
   workspaceFresh: boolean;
 }): FrameTarget | null => {
   let branchTarget: FrameTarget | null = null;
+
   if (branchEnv !== undefined) {
     branchTarget = environmentTarget(app, branchEnv);
   } else if (branch === defaultBranch) {
     branchTarget = productionTarget(app);
   }
+
   const workspaceTarget =
     workspace === undefined ? null : environmentTarget(app, workspace);
+
   if (scope === "workspace") {
     return workspaceTarget ?? branchTarget;
   }
+
   if (scope === "branch") {
     return branchTarget ?? workspaceTarget;
   }
+
   const preferred = workspaceFresh ? workspaceTarget : null;
+
   return preferred ?? branchTarget ?? workspaceTarget;
 };
 
@@ -340,6 +355,7 @@ const ScopeSwitch = ({
 const resolveAddress = (typed: string, current: string): string | null => {
   try {
     const url = new URL(typed.trim(), current);
+
     return url.protocol === "http:" || url.protocol === "https:"
       ? url.href
       : null;
@@ -372,9 +388,11 @@ const statusNote = (status: string): string | null => {
   if (status === "failed" || status === "error") {
     return "This preview failed. The build log below says why, and a new deploy retries it.";
   }
+
   if (status === "stopped") {
     return "This preview is stopped, so nothing is serving here. Deploy again to bring it back.";
   }
+
   return null;
 };
 
@@ -399,6 +417,7 @@ const TargetPreview = ({
     deploysUrl(appId, target.environmentId),
     decodeDeploys
   );
+
   const rows = feed.latest() ?? [];
   const [row] = rows;
   // What is serving: the newest deploy that succeeded (the feed is newest
@@ -432,16 +451,19 @@ const TargetPreview = ({
   const loadTimer = atom.lazy(() => ({ id: 0 }))();
   watch(feed.latest, (next) => {
     const status = (next ?? [])[0]?.status ?? "";
+
     if (status !== seen.status) {
       // A deploy that just finished moved the environment's own status
       // (building → running/failed) too: read it again so the dot follows.
       if (deployRunning(seen.status) && !deployRunning(status)) {
         invalidateEnvironments(appId);
       }
+
       seen.status = status;
       logOpen.set(status !== "" && status !== "success");
     }
   });
+
   /** Give the frame `LOAD_TIMEOUT_MS` to load again: what a reload and a
    * fresh target start with. */
   const armFrame = () => {
@@ -451,27 +473,33 @@ const TargetPreview = ({
       timedOut.set(true);
     }, LOAD_TIMEOUT_MS);
   };
+
   watch.once(({ onCleanup }) => {
     if (typeof document === "undefined") {
       // SSR: no frame to time; the client's own mount arms it.
       return;
     }
+
     armFrame();
     onCleanup(() => {
       window.clearTimeout(loadTimer.id);
     });
   });
+
   const reload = () => {
     loads.set(loads() + 1);
     armFrame();
   };
+
   // Read here, in the render, so a reload bump repaints (the frame's `ref`
   // runs on each paint, but reads made inside it are not tracked).
   const reloadToken = `${live?.id ?? ""}:${loads()}`;
+
   const deploysHref =
     target.environmentId === ""
       ? `/apps/${appId}?t=deployments`
       : `/apps/${appId}?t=deployments&env=${target.environmentId}`;
+
   return (
     <>
       <div class={BAR}>
@@ -504,24 +532,32 @@ const TargetPreview = ({
             onsubmit={(event) => {
               event.preventDefault();
               const raw = typed().trim();
+
               // An empty field is not a navigation: it puts the current address
               // back (and never reloads, which is where an empty URL would have
               // landed).
               if (raw === "") {
                 typed.set(address());
                 invalid.set(false);
+
                 return;
               }
+
               const next = resolveAddress(raw, address());
+
               if (next === null) {
                 invalid.set(true);
+
                 return;
               }
+
               if (next === address()) {
                 // The address already loaded: Enter is a reload.
                 reload();
+
                 return;
               }
+
               address.set(next);
               typed.set(next);
             }}
@@ -654,6 +690,7 @@ const TargetPreview = ({
               if (loaded.token !== "") {
                 el.src = address();
               }
+
               loaded.token = reloadToken;
             }
           }}
@@ -703,9 +740,11 @@ const deployOffReason = (
   if (current.readOnly !== "") {
     return READ_ONLY_DEPLOY[current.readOnly];
   }
+
   if (current.files.length === 0) {
     return "There are no uncommitted changes to deploy.";
   }
+
   return deploying ? "Snapshotting your changes…" : null;
 };
 
@@ -729,6 +768,7 @@ const switchScope = (
   if (branchEnv === undefined || workspace === undefined) {
     return null;
   }
+
   return target?.kind === "workspace" ? "workspace" : "branch";
 };
 
@@ -768,10 +808,12 @@ const panelView = ({
   // What the checkout holds right now, and what this browser last deployed for
   // this branch: the panel compares them (see `changesFingerprint`).
   const fingerprint = changesFingerprint(current.files);
+
   const snapshotted =
     current.previewed !== null && current.previewed.branch === branch
       ? current.previewed.fingerprint
       : null;
+
   const target = pickTarget({
     app,
     branch,
@@ -781,8 +823,10 @@ const panelView = ({
     workspace,
     workspaceFresh: current.files.length > 0 || snapshotted === fingerprint,
   });
+
   const fresh = snapshotCurrent(target, snapshotted, fingerprint);
   const deployedBefore = workspace !== undefined || snapshotted !== null;
+
   return {
     deployLabel: deployedBefore ? "Redeploy" : "Deploy preview",
     deployOff: deployOffReason(current, deploying),
@@ -823,6 +867,7 @@ const DeployError = ({
   if (!attempted || current.pushError === "") {
     return null;
   }
+
   return (
     <p
       class="bg-error/15 text-error border-base-300 m-0 border-b px-3 py-1.5 text-xs"
@@ -855,6 +900,7 @@ export const PreviewPanel = ({
   const current = state();
   const viewer = session().data()?.user.id ?? "";
   const envs = environments(appId);
+
   // The scope the viewer picked, and the branch they picked it on: a branch
   // switch goes back to the automatic choice. An atom rather than a field, so
   // the switch repaints the bar.
@@ -862,27 +908,32 @@ export const PreviewPanel = ({
     branch: string;
     value: "auto" | "branch" | "workspace";
   }>({ branch, value: "auto" });
+
   // What Deploy preview returned, before the environments read catches up: the
   // frame moves to what was just deployed, not to what was known before it.
   const deployed = atom<{
     branch: string;
     environment: RunnerEnvironment;
   } | null>(null);
+
   const deploying = atom(false);
   // Whether this mount asked for a deploy at all: the state's push error slot
   // is shared with the Changes panel's push, and a push is not this panel's
   // business to report.
   const attempted = atom(false);
+
   const runDeploy = () => {
     if (deploying()) {
       return;
     }
+
     deploying.set(true);
     attempted.set(true);
     scope.set({ branch, value: "workspace" });
     void (async () => {
       try {
         const previewed = await onDeployPreview();
+
         if (previewed !== null) {
           deployed.set({ branch, environment: previewed });
           // The Deployments tab read its rows (and the app's own deploy
@@ -894,6 +945,7 @@ export const PreviewPanel = ({
       }
     })();
   };
+
   if (!app) {
     return (
       <div class="p-3">
@@ -901,10 +953,12 @@ export const PreviewPanel = ({
       </div>
     );
   }
+
   const defaultBranch = forgeRefs(appId).data()?.defaultBranch ?? "main";
   const mine = justDeployedFor(deployed(), branch);
   const all = withDeployed(envs.data() ?? [], mine);
   const picked = scope();
+
   const view = panelView({
     app,
     branch,
@@ -915,6 +969,7 @@ export const PreviewPanel = ({
     scope: picked.branch === branch ? picked.value : "auto",
     viewer,
   });
+
   if (view.target === null) {
     return (
       <div class="flex min-h-0 flex-1 flex-col">
@@ -954,7 +1009,9 @@ export const PreviewPanel = ({
       </div>
     );
   }
+
   const { target } = view;
+
   const scopeSwitch =
     view.scope === null ? null : (
       <ScopeSwitch
@@ -964,6 +1021,7 @@ export const PreviewPanel = ({
         scope={view.scope}
       />
     );
+
   return (
     <div class="flex min-h-0 flex-1 flex-col">
       <DeployError attempted={attempted()} current={current} />

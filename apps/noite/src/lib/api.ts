@@ -41,16 +41,21 @@ export const apiErrors = (body: unknown): FieldErrors | null => {
   ) {
     return null;
   }
+
   const raw = body.errors;
+
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     return null;
   }
+
   const fields: Record<string, string> = {};
+
   for (const [key, value] of Object.entries(raw)) {
     if (typeof value === "string") {
       fields[key] = value;
     }
   }
+
   return Object.keys(fields).length > 0 ? fields : null;
 };
 
@@ -58,11 +63,14 @@ const errorBody = (body: unknown): string | null => {
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
     return null;
   }
+
   if (!("error" in body) || typeof body.error !== "string") {
     return null;
   }
+
   return body.error;
 };
+
 /* oxlint-enable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof */
 /** POST `input` as JSON to a JSON-action endpoint and read the value back.
  * Rejects with `ApiError` whose `message` is the user-facing text. */
@@ -74,11 +82,14 @@ export const api = async <T>(path: string, input: unknown): Promise<T> => {
     headers: { "content-type": "application/json" },
     method: "POST",
   });
+
   if (response.ok) {
     // SAFETY: the endpoint answers the action's value as JSON; the caller names its type.
     return (await response.json()) as T;
   }
+
   let body: unknown;
+
   try {
     body = await response.json();
   } catch {
@@ -88,13 +99,17 @@ export const api = async <T>(path: string, input: unknown): Promise<T> => {
       null
     );
   }
+
   const errors = response.status === 422 ? apiErrors(body) : null;
+
   const fields = errors
     ? Object.values(errors).filter((value) => value !== "")
     : [];
+
   const message =
     fields.length > 0
       ? fields.join(". ")
       : (errorBody(body) ?? `Request failed (${response.status})`);
+
   throw new ApiError(response.status, message, errors);
 };

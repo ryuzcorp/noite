@@ -22,11 +22,14 @@ export const R2Browser = ({
   canWrite: boolean;
 }) => {
   const prefix = searchParam("p", { default: "" });
+
   const viewParam = searchParam<R2View>("v", {
     default: "list",
     parse: toR2View,
   });
+
   const { notify, toasts } = useToasts();
+
   return (
     <div class="flex h-full min-h-0 w-full flex-col overflow-hidden">
       <div class="border-base-300 flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-3 py-2">

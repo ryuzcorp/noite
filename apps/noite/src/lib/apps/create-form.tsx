@@ -72,6 +72,7 @@ const SLUG_ORIGIN_HINT: Record<SlugOrigin, string> = {
 };
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/u;
+
 const SLUG_HINT =
   "Slug must be 1–48 chars: lowercase letters, digits, and hyphens, starting and ending with a letter or digit";
 
@@ -117,8 +118,10 @@ const Row = ({
  * click on the radio; a link inside sits above it (`CHOICE_ABOVE`). */
 const CHOICE_CARD =
   "border-base-300 hover:border-base-content/30 has-checked:border-base-content has-checked:bg-base-200 dark:has-checked:bg-base-300 has-focus-visible:outline-base-content rounded-box relative flex gap-3 border p-3 transition-colors has-focus-visible:outline-2 has-focus-visible:outline-offset-2";
+
 const CHOICE_INPUT =
   "absolute inset-0 z-0 m-0 h-full w-full cursor-pointer appearance-none opacity-0";
+
 const CHOICE_ABOVE = "relative z-10";
 
 /** The last folder of a repository path (`apps/web` → `web`). */
@@ -143,8 +146,10 @@ const ImportSummary = ({
       </span>
     );
   }
+
   const folder = path.trim().replaceAll(/^\/+|\/+$/gu, "");
   const branch = reference.trim();
+
   return (
     <span class="text-base-content/70 inline-flex items-center gap-1.5 text-xs">
       <Github class="h-3.5 w-3.5" />
@@ -217,35 +222,44 @@ const sourceFor = (
 ): { error: string } | { source: CreateSourceInput } => {
   if (mode === "import") {
     const repo = parseGitHubRepo(fields.url);
+
     if (!repo) {
       return {
         error:
           "Enter a public GitHub repository URL, e.g. https://github.com/owner/repo",
       };
     }
+
     // The branch and folder stay out when their fields are empty: an
     // explicit `undefined` is not a JSON value, and the action's RPC encoder
     // refuses the whole call over it ("Expected JSON value at [args][0]").
     const branch = fields.ref.trim();
     const folder = fields.path.trim().replaceAll(/^\/+|\/+$/gu, "");
+
     const imported: Extract<CreateSourceInput, { kind: "git" }> = {
       kind: "git",
       url: `https://github.com/${repo.owner}/${repo.repo}`,
     };
+
     if (branch !== "") {
       imported.ref = branch;
     }
+
     if (folder !== "") {
       imported.path = folder;
     }
+
     return { source: imported };
   }
+
   if (mode === "template") {
     const picked = TEMPLATES.find((t) => t.id === fields.templateId);
+
     return picked
       ? { source: { id: picked.id, kind: "template" } }
       : { error: "Pick a template" };
   }
+
   return { source: { kind: "blank" } };
 };
 
@@ -410,6 +424,7 @@ export const CreateAppForm = () => {
   const reading = atom(false);
   /** An app created whose upload then failed: the notice links to it. */
   const stranded = atom<string | null>(null);
+
   /** Fill Name and Slug from a pick — a template, or the repo a URL names.
    * `priorName` is what the previous pick put in the field: a name the user
    * typed themselves is anything else, and it stays. Picking a second
@@ -421,9 +436,11 @@ export const CreateAppForm = () => {
   ) => {
     slugOrigin.set(origin);
     const current = name().trim();
+
     if (picked.name && (current === "" || current === priorName.trim())) {
       name.set(picked.name);
     }
+
     slug.set(picked.slug);
   };
 
@@ -437,13 +454,16 @@ export const CreateAppForm = () => {
    * still holds it. */
   const checkNow = async (value: string): Promise<SlugCheck | null> => {
     slugState.set({ slug: value, status: "checking" });
+
     try {
       const result = await api<SlugCheck>("/api/apps/slugCheck", {
         slug: value,
       });
+
       if (slug().trim().toLowerCase() === value) {
         slugState.set({ result, slug: value, status: "done" });
       }
+
       return result;
     } catch {
       // The check is advisory: create re-validates, so a failed check leaves
@@ -451,6 +471,7 @@ export const CreateAppForm = () => {
       if (slug().trim().toLowerCase() === value) {
         slugState.set({ slug: value, status: "idle" });
       }
+
       return null;
     }
   };
@@ -459,14 +480,19 @@ export const CreateAppForm = () => {
   // and `checkNow` drops an answer for a slug the field no longer holds.
   watch(slug, (raw, { onCleanup }) => {
     const value = raw.trim().toLowerCase();
+
     if (value === "" || !SLUG_RE.test(value)) {
       slugState.set({ slug: value, status: "idle" });
+
       return;
     }
+
     slugState.set({ slug: value, status: "checking" });
+
     const timer = window.setTimeout(() => {
       void checkNow(value);
     }, SLUG_CHECK_DEBOUNCE_MS);
+
     onCleanup(() => {
       window.clearTimeout(timer);
     });
@@ -477,20 +503,26 @@ export const CreateAppForm = () => {
   const dropFolder = async (items: DataTransferItemList) => {
     const entries = [...items].map((item) => item.webkitGetAsEntry?.() ?? null);
     const [root] = entries;
+
     if (entries.length !== 1 || !root?.isDirectory) {
       notice.set("Drop one folder: your project's root.");
+
       return;
     }
+
     notice.set(null);
     stranded.set(null);
     reading.set(true);
     const reads = await readDroppedItems(items, projectSkip);
     reading.set(false);
     const result = projectUpload(root.name, reads);
+
     if ("error" in result) {
       notice.set(result.error);
+
       return;
     }
+
     const previous = folder();
     folder.set(result.upload);
     mode.set("blank");
@@ -509,40 +541,51 @@ export const CreateAppForm = () => {
       // SSR: no document to listen on; the client's own mount attaches them.
       return;
     }
+
     let depth = 0;
+
     const enter = (event: DragEvent) => {
       if (!isFileDrag(event)) {
         return;
       }
+
       event.preventDefault();
       depth += 1;
       dragging.set(true);
     };
+
     const leave = (event: DragEvent) => {
       if (!isFileDrag(event)) {
         return;
       }
+
       depth = Math.max(0, depth - 1);
+
       if (depth === 0) {
         dragging.set(false);
       }
     };
+
     const drop = (event: DragEvent) => {
       if (!isFileDrag(event)) {
         return;
       }
+
       event.preventDefault();
       depth = 0;
       dragging.set(false);
       const items = event.dataTransfer?.items;
+
       if (items && !busy()) {
         void dropFolder(items);
       }
     };
+
     document.addEventListener("dragenter", enter);
     document.addEventListener("dragover", allowFileDrop);
     document.addEventListener("dragleave", leave);
     document.addEventListener("drop", drop);
+
     return () => {
       document.removeEventListener("dragenter", enter);
       document.removeEventListener("dragover", allowFileDrop);
@@ -554,6 +597,7 @@ export const CreateAppForm = () => {
   const pickMode = (next: ModeId) => {
     mode.set(next);
     notice.set(null);
+
     if (next === "blank") {
       // A blank app has no repo to take the slug from: let the name drive
       // it again, unless the user typed one.
@@ -561,10 +605,13 @@ export const CreateAppForm = () => {
         slugOrigin.set("name");
         slug.set(slugifyName(name()));
       }
+
       return;
     }
+
     if (next === "template") {
       const picked = TEMPLATES.find((t) => t.id === templateId());
+
       if (picked) {
         applySource(
           { name: picked.name, slug: slugifyName(picked.id) },
@@ -572,12 +619,16 @@ export const CreateAppForm = () => {
           picked.name
         );
       }
+
       return;
     }
+
     const repo = parseGitHubRepo(url());
+
     if (repo) {
       applySource({ name: repo.name, slug: repo.slug }, "repo", repo.name);
     }
+
     // The URL is the first thing an import needs: put the caret there once
     // the row is in the page.
     requestAnimationFrame(() => {
@@ -595,10 +646,13 @@ export const CreateAppForm = () => {
   ): Promise<void> => {
     busy.set(false);
     const recheck = await checkNow(slugValue);
+
     if (recheck?.error) {
       document.querySelector<HTMLElement>("#create-slug")?.focus();
+
       return;
     }
+
     notice.set(errorMessage(error));
   };
 
@@ -607,45 +661,60 @@ export const CreateAppForm = () => {
     notice.set(null);
     const trimmedName = name().trim();
     let nextSlug = slug().trim().toLowerCase();
+
     if (!nextSlug && trimmedName) {
       nextSlug = slugifyName(trimmedName);
     }
+
     if (!(trimmedName && nextSlug)) {
       notice.set("Name and slug are required");
+
       return;
     }
+
     if (!SLUG_RE.test(nextSlug)) {
       notice.set(SLUG_HINT);
+
       return;
     }
+
     const state = slugState();
+
     if (
       state.status === "done" &&
       state.slug === nextSlug &&
       state.result.error
     ) {
       document.querySelector<HTMLElement>("#create-slug")?.focus();
+
       return;
     }
+
     const picked = sourceFor(mode(), {
       path: subpath(),
       ref: ref(),
       templateId: templateId(),
       url: url(),
     });
+
     if ("error" in picked) {
       notice.set(picked.error);
+
       return;
     }
+
     const { source } = picked;
     const upload = folder();
+
     // Pending guard: the button is already disabled while busy, and a second
     // submit (double Enter) returns here instead of creating a second app.
     if (busy()) {
       return;
     }
+
     busy.set(true);
     let createdId: string;
+
     try {
       ({ id: createdId } = await api<{ id: string }>("/api/apps/create", {
         name: trimmedName,
@@ -654,8 +723,10 @@ export const CreateAppForm = () => {
       }));
     } catch (error) {
       await failCreate(nextSlug, error);
+
       return;
     }
+
     if (upload) {
       try {
         // The dropped folder lands as the first commit on `main`, which
@@ -671,9 +742,11 @@ export const CreateAppForm = () => {
         notice.set(
           `The app was created, but the folder could not be committed: ${errorMessage(error)}`
         );
+
         return;
       }
     }
+
     // A blank app's next step is a push, which its Overview explains; an
     // upload, import or template is already building, which Deployments
     // shows.
@@ -686,8 +759,10 @@ export const CreateAppForm = () => {
 
   const state = slugState();
   const currentSlug = slug().trim().toLowerCase();
+
   const verdict =
     state.status === "done" && state.slug === currentSlug ? state.result : null;
+
   const repo = parseGitHubRepo(url());
   const dropped = folder();
 
@@ -712,6 +787,7 @@ export const CreateAppForm = () => {
               folder={dropped}
               onRemove={() => {
                 folder.set(null);
+
                 if (slugOrigin() === "folder") {
                   slugOrigin.set("name");
                   slug.set(slugifyName(name()));
@@ -767,12 +843,14 @@ export const CreateAppForm = () => {
                 const previous = parseGitHubRepo(url());
                 url.set(e.currentTarget.value);
                 const parsed = parseGitHubRepo(e.currentTarget.value);
+
                 if (parsed) {
                   // A pasted folder link fills the branch and folder too.
                   if (parsed.ref !== undefined) {
                     ref.set(parsed.ref);
                     subpath.set(parsed.path ?? "");
                   }
+
                   applySource(
                     { name: parsed.name, slug: parsed.slug },
                     "repo",
@@ -790,6 +868,7 @@ export const CreateAppForm = () => {
                 const previous = folderName(subpath());
                 subpath.set(value);
                 const named = folderName(value) || repo?.name || "";
+
                 // A folder names the app, like a repo does, until the user
                 // types a name or slug of their own.
                 if (slugOrigin() === "repo" && repo) {
@@ -826,6 +905,7 @@ export const CreateAppForm = () => {
                       const previous = TEMPLATES.find(
                         (template) => template.id === templateId()
                       );
+
                       templateId.set(t.id);
                       applySource(
                         { name: t.name, slug: slugifyName(t.id) },

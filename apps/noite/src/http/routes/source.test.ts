@@ -28,6 +28,7 @@ const call = async (
     "content-type": "application/json",
     origin: "http://localhost:9080",
   });
+
   for (const [name, value] of Object.entries(init.headers ?? {})) {
     if (value === "") {
       headers.delete(name);
@@ -35,12 +36,15 @@ const call = async (
       headers.set(name, value);
     }
   }
+
   const request = new Request(url, {
     body: init.body ?? `{"message":"m","files":[]}`,
     headers,
     method: "POST",
   });
+
   const handle = url === PREVIEW_URL ? handleSourcePreview : handleSourceCommit;
+
   // SAFETY: the handler takes the full Worker env; the test env carries the auth/runner keys this path reads.
   return await handle(request, ENV as unknown as never, { appId: "app_1" });
 };
@@ -57,6 +61,7 @@ const archiveCall = async (
     headers: { "sec-fetch-site": "same-origin", ...headers },
     method: "GET",
   });
+
   // SAFETY: the handler takes the full Worker env; the test env carries the auth/runner keys this path reads.
   return await handleSourceArchive(request, ENV as unknown as never, {
     appId: "app_1",
@@ -79,6 +84,7 @@ describe("POST /api/apps/:appId/source/commit", () => {
     const response = await call({
       headers: { origin: "https://tenant.example" },
     });
+
     expect(response?.status).toBe(403);
   });
 
@@ -101,11 +107,14 @@ describe("POST /api/apps/:appId/source/preview", () => {
       { headers: { "content-type": "text/plain" } },
       PREVIEW_URL
     );
+
     expect(wrongType?.status).toBe(415);
+
     const foreign = await call(
       { headers: { origin: "https://tenant.example" } },
       PREVIEW_URL
     );
+
     expect(foreign?.status).toBe(403);
     const signedOut = await call({}, PREVIEW_URL);
     expect(signedOut?.status).toBe(401);

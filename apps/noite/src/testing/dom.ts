@@ -49,6 +49,7 @@ export const installDomFixture = (): void => {
   };
   globals.requestAnimationFrame = (frame: (time: number) => void): number => {
     frame(0);
+
     return 0;
   };
 };

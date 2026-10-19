@@ -17,6 +17,7 @@ const fail = (message) => {
 };
 
 let cfConfig;
+
 try {
   cfConfig = await import("@cloudflare/config");
 } catch {
@@ -29,9 +30,11 @@ const { result } = await cfConfig.loadAndParseConfig(configFile, {
   isPreview: false,
   mode: "production",
 });
+
 if (!result.success) {
   fail(`${configFile} is invalid:\n${result.error.message}`);
 }
+
 const wrangler = cfConfig.convertToWranglerConfig(result.data);
 
 // The loader anchors `cf-worker` entrypoints as absolute paths; celld
@@ -46,23 +49,30 @@ if (wrangler.main && path.isAbsolute(wrangler.main)) {
 if (wrangler.exports) {
   const sqlite = [];
   const kv = [];
+
   for (const [name, value] of Object.entries(wrangler.exports)) {
     const created =
       value.type === "durable-object" && value.state === undefined;
+
     if (!created) {
       const kind = value.state ? `${value.type} (${value.state})` : value.type;
       fail(`exports.${name}: ${kind} is not supported on Noite`);
     }
+
     (value.storage === "sqlite" ? sqlite : kv).push(name);
   }
+
   delete wrangler.exports;
   const migration = { tag: "v1" };
+
   if (sqlite.length > 0) {
     migration.new_sqlite_classes = sqlite;
   }
+
   if (kv.length > 0) {
     migration.new_classes = kv;
   }
+
   wrangler.migrations = [migration];
 }
 
@@ -83,4 +93,5 @@ for (const db of wrangler.d1_databases ?? []) {
 delete wrangler.secrets;
 
 writeFileSync("wrangler.json", `${JSON.stringify(wrangler, null, 2)}\n`);
+
 console.log(`${configFile} → wrangler.json`);

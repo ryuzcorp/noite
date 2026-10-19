@@ -76,11 +76,13 @@ const PREVIEW_RADIUS = 4;
 
 const fs = new VirtualFs();
 const libPaths = new Set<string>();
+
 for (const [specifier, text] of Object.entries(libModules)) {
   const name = specifier.slice(specifier.lastIndexOf("/") + 1);
   fs.write(`${LIB_DIR}/${name}`, text);
   libPaths.add(`${LIB_DIR}/${name}`);
 }
+
 if (libPaths.size === 0) {
   throw new Error("ts-worker: TypeScript's lib .d.ts were not bundled");
 }
@@ -89,11 +91,13 @@ if (libPaths.size === 0) {
  * therefore the only go-to-definition targets that navigate. The declarations
  * fetched from esm.sh are in the FS but not in the tree. */
 let treeFiles = new Set<string>();
+
 /** Program roots: the config's file list, plus every file the editor asks
  * about (a file outside the repo's `include` must still answer). */
 const roots = new Set<string>();
 let options: ts.CompilerOptions = defaultCompilerOptions();
 let service: ts.LanguageService | undefined;
+
 const snapshots = new Map<
   string,
   { snapshot: ts.IScriptSnapshot; version: number }
@@ -103,16 +107,21 @@ const snapshots = new Map<
  * `fromString` is the expensive part. */
 const snapshotFor = (fileName: string): ts.IScriptSnapshot | undefined => {
   const text = fs.read(fileName);
+
   if (text === undefined) {
     return undefined;
   }
+
   const version = fs.versionOf(fileName);
   const cached = snapshots.get(fileName);
+
   if (cached?.version === version) {
     return cached.snapshot;
   }
+
   const snapshot = ts.ScriptSnapshot.fromString(text);
   snapshots.set(fileName, { snapshot, version });
+
   return snapshot;
 };
 
@@ -129,6 +138,7 @@ const resolutionHost: ts.ModuleResolutionHost = {
  * in). */
 const libFileNameFor = (compilation: ts.CompilerOptions): string => {
   const name = `${LIB_DIR}/${ts.getDefaultLibFileName(compilation)}`;
+
   return libPaths.has(name) ? name : LIB_FALLBACK;
 };
 
@@ -138,24 +148,31 @@ const extensionOf = (path: string): ts.Extension => {
   if (path.endsWith(".d.mts")) {
     return ts.Extension.Dmts;
   }
+
   if (path.endsWith(".d.cts")) {
     return ts.Extension.Dcts;
   }
+
   if (path.endsWith(".d.ts")) {
     return ts.Extension.Dts;
   }
+
   if (path.endsWith(".mts")) {
     return ts.Extension.Mts;
   }
+
   if (path.endsWith(".cts")) {
     return ts.Extension.Cts;
   }
+
   if (path.endsWith(".tsx")) {
     return ts.Extension.Tsx;
   }
+
   if (path.endsWith(".ts")) {
     return ts.Extension.Ts;
   }
+
   return ts.Extension.Js;
 };
 
@@ -235,10 +252,13 @@ const host: ts.LanguageServiceHost = {
         options,
         resolutionHost
       ).resolvedModule;
+
       if (resolved) {
         return resolved;
       }
+
       const mapped = esm.resolve(name, containingFile);
+
       return mapped === undefined
         ? undefined
         : {
@@ -254,16 +274,20 @@ const host: ts.LanguageServiceHost = {
   resolveTypeReferenceDirectives: (names, containingFile) =>
     names.map((entry) => {
       const name = isDirectiveName(entry) ? entry : entry.fileName;
+
       const resolved = ts.resolveTypeReferenceDirective(
         name,
         containingFile,
         options,
         resolutionHost
       ).resolvedTypeReferenceDirective;
+
       if (resolved) {
         return resolved;
       }
+
       const mapped = esm.resolve(name, containingFile);
+
       return mapped === undefined
         ? undefined
         : {
@@ -280,6 +304,7 @@ const registry = ts.createDocumentRegistry(true, "/");
 
 const languageService = (): ts.LanguageService => {
   service ??= ts.createLanguageService(host, registry);
+
   return service;
 };
 
@@ -298,12 +323,15 @@ const jsxModeOf = (jsx: ts.JsxEmit | undefined): JsxMode => {
   if (jsx === ts.JsxEmit.ReactJSXDev) {
     return "react-jsxdev";
   }
+
   if (jsx === ts.JsxEmit.ReactJSX) {
     return "react-jsx";
   }
+
   if (jsx === ts.JsxEmit.Preserve) {
     return "preserve";
   }
+
   return "classic";
 };
 
@@ -321,22 +349,29 @@ let jsxMode: JsxMode = "classic";
  * wrangler's graphs. */
 const programSpecifiers = (entry: string): string[] => {
   const cached = programs.get(entry);
+
   if (cached !== undefined) {
     return cached;
   }
+
   const specifiers = new Set<string>();
   const seen = new Set<string>();
   const queue = [entry];
+
   while (queue.length > 0 && seen.size < LOCAL_FILES_LIMIT) {
     const file = queue.pop();
+
     if (file === undefined || seen.has(file)) {
       continue;
     }
+
     seen.add(file);
     const text = fs.read(file);
+
     if (text === undefined) {
       continue;
     }
+
     for (const specifier of jsxRuntimeSpecifiers({
       file,
       importSource: options.jsxImportSource,
@@ -345,22 +380,26 @@ const programSpecifiers = (entry: string): string[] => {
     })) {
       specifiers.add(specifier);
     }
+
     for (const specifier of collectSpecifiers(text)) {
       if (parsePackageSpecifier(specifier) !== null) {
         specifiers.add(specifier);
         continue;
       }
+
       if (!(specifier.startsWith(".") || specifier.startsWith("/"))) {
         // A scheme (`node:fs`) or an absolute URL: neither is a repository
         // file this walk can descend into, and nothing types either.
         continue;
       }
+
       const target = ts.resolveModuleName(
         specifier,
         file,
         options,
         resolutionHost
       ).resolvedModule?.resolvedFileName;
+
       if (
         target !== undefined &&
         isScriptFile(target) &&
@@ -370,8 +409,10 @@ const programSpecifiers = (entry: string): string[] => {
       }
     }
   }
+
   const list = [...specifiers];
   programs.set(entry, list);
+
   return list;
 };
 
@@ -388,6 +429,7 @@ let configTypes: readonly string[] = [];
  * when the whole graph has. */
 const ensureTypes = (path: string): void => {
   void esm.acquire(programSpecifiers(`/${path}`));
+
   if (configTypes.length > 0) {
     void esm.acquire(configTypes);
   }
@@ -402,25 +444,32 @@ const install = (request: Extract<IntelRequest, { kind: "sync" }>): void => {
   programs.clear();
   service = undefined;
   treeFiles = new Set(request.bundle.files.map((file) => `/${file.path}`));
+
   for (const file of request.bundle.files) {
     fs.write(`/${file.path}`, file.text);
   }
+
   for (const draft of request.drafts) {
     fs.write(`/${draft.path}`, draft.text);
   }
+
   const { options: compilation, roots: configRoots } = resolveRepoConfig(fs, [
     ...treeFiles,
   ]);
+
   options = compilation;
   configTypes = compilation.types ?? [];
   jsxMode = jsxModeOf(compilation.jsx);
   roots.clear();
+
   for (const root of configRoots) {
     roots.add(root);
   }
+
   for (const draft of request.drafts) {
     roots.add(`/${draft.path}`);
   }
+
   // The declarations are fetched, not received: the versions come from the
   // lockfile the bundle carries, and the fetch runs detached so the pane
   // answers from the repo's own sources meanwhile.
@@ -432,20 +481,25 @@ const install = (request: Extract<IntelRequest, { kind: "sync" }>): void => {
 const rooted = (path: string): string => {
   const target = `/${path}`;
   roots.add(target);
+
   return target;
 };
 
 const diagnosticsFor = (path: string): IntelDiagnostic[] => {
   const target = rooted(path);
+
   const found = [
     ...languageService().getSyntacticDiagnostics(target),
     ...languageService().getSemanticDiagnostics(target),
   ];
+
   const diagnostics: IntelDiagnostic[] = [];
+
   for (const diagnostic of found) {
     if (diagnostic.start === undefined) {
       continue;
     }
+
     diagnostics.push({
       code: diagnostic.code,
       end: diagnostic.start + (diagnostic.length ?? 0),
@@ -453,46 +507,58 @@ const diagnosticsFor = (path: string): IntelDiagnostic[] => {
       severity: severityFromCategory(diagnostic.category),
       start: diagnostic.start,
     });
+
     if (diagnostics.length >= MAX_DIAGNOSTICS) {
       break;
     }
   }
+
   return diagnostics;
 };
 
 const quickInfoAt = (path: string, offset: number): IntelQuickInfo | null => {
   const info = languageService().getQuickInfoAtPosition(rooted(path), offset);
+
   if (!info) {
     return null;
   }
+
   const signature = ts
     .displayPartsToString(info.displayParts)
     .split("\n")
     .slice(0, MAX_HOVER_LINES)
     .join("\n");
+
   const docs: string[] = [];
   const documentation = ts.displayPartsToString(info.documentation);
+
   if (documentation !== "") {
     docs.push(...documentation.split("\n"));
   }
+
   for (const tag of info.tags ?? []) {
     const text = ts.displayPartsToString(tag.text).trim();
     docs.push(text === "" ? `@${tag.name}` : `@${tag.name} ${text}`);
   }
+
   if (signature === "" && docs.length === 0) {
     return null;
   }
+
   return { docs: docs.slice(0, MAX_HOVER_LINES), signature };
 };
 
 /** The declaration lines around `line`, for a target the pane cannot open. */
 const previewAround = (target: string, line: number): string[] | undefined => {
   const text = fs.read(target);
+
   if (text === undefined) {
     return undefined;
   }
+
   const lines = text.split("\n");
   const first = Math.max(0, line - PREVIEW_RADIUS);
+
   return lines.slice(first, Math.min(lines.length, line + PREVIEW_RADIUS + 1));
 };
 
@@ -501,15 +567,19 @@ const definitionAt = (path: string, offset: number): IntelDefinition | null => {
     rooted(path),
     offset
   )?.[0];
+
   if (!first) {
     return null;
   }
+
   const target = first.fileName;
   const text = fs.read(target);
+
   const start = positionAtOffset(
     text === undefined ? [0] : lineStarts(text),
     first.textSpan.start
   );
+
   // Files from the tree open in the pane; the declarations fetched from
   // esm.sh and the bundled libs have no tree entry, so they answer with the
   // declaration text around the target instead (the caller renders it
@@ -517,7 +587,9 @@ const definitionAt = (path: string, offset: number): IntelDefinition | null => {
   if (treeFiles.has(target)) {
     return { path: target.slice(1), start };
   }
+
   const preview = previewAround(target, start.line);
+
   return preview ? { path: target.slice(1), preview, start } : null;
 };
 
@@ -529,10 +601,13 @@ const completionAt = (path: string, offset: number): IntelCompletion | null => {
     offset,
     {}
   );
+
   const entry = info?.entries[0];
+
   if (!entry) {
     return null;
   }
+
   return {
     insertText: entry.insertText ?? entry.name,
     kind: String(entry.kind),
@@ -561,6 +636,7 @@ const scheduleScan = (path: string): void => {
     if (scans.get(path) !== generation) {
       return;
     }
+
     scans.delete(path);
     ensureTypes(path);
   }, SCAN_DELAY_MS);
@@ -578,6 +654,7 @@ const respond = (id: number, run: () => IntelResult): void => {
       id,
       ok: false,
     };
+
     // oxlint-disable-next-line unicorn/require-post-message-target-origin -- a worker's postMessage has no target origin
     scope.postMessage(message);
   }
@@ -585,14 +662,17 @@ const respond = (id: number, run: () => IntelResult): void => {
 
 scope.addEventListener("message", (event) => {
   const request = event.data;
+
   switch (request.kind) {
     case "sync": {
       respond(request.id, () => {
         install(request);
+
         return null;
       });
       break;
     }
+
     case "update": {
       fs.write(`/${request.path}`, request.text);
       // The draft moved the sources, so the closure the memo holds for that
@@ -601,21 +681,25 @@ scope.addEventListener("message", (event) => {
       scheduleScan(request.path);
       break;
     }
+
     case "diagnostics": {
       ensureTypes(request.path);
       respond(request.id, () => diagnosticsFor(request.path));
       break;
     }
+
     case "quickInfo": {
       ensureTypes(request.path);
       respond(request.id, () => quickInfoAt(request.path, request.offset));
       break;
     }
+
     case "definition": {
       ensureTypes(request.path);
       respond(request.id, () => definitionAt(request.path, request.offset));
       break;
     }
+
     default: {
       ensureTypes(request.path);
       respond(request.id, () => completionAt(request.path, request.offset));

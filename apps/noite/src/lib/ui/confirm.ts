@@ -22,6 +22,7 @@ const button = (label: string, className: string): HTMLButtonElement => {
   element.type = "button";
   element.className = className;
   element.textContent = label;
+
   return element;
 };
 
@@ -33,10 +34,13 @@ export const confirmDialog = ({
   tone = "danger",
 }: ConfirmOptions): Promise<boolean> => {
   const answered = Promise.withResolvers<boolean>();
+
   if (signal?.aborted) {
     answered.resolve(false);
+
     return answered.promise;
   }
+
   const dialog = document.createElement("dialog");
   dialog.className = "modal";
   dialog.setAttribute("role", "alertdialog");
@@ -48,17 +52,21 @@ export const confirmDialog = ({
   heading.textContent = title;
   dialog.setAttribute("aria-labelledby", heading.id);
   box.append(heading);
+
   if (message !== undefined) {
     const text = document.createElement("p");
     text.className = "m-0 py-2 text-sm opacity-80";
     text.textContent = message;
     box.append(text);
   }
+
   const cancel = button("Cancel", "btn btn-sm btn-ghost");
+
   const confirm = button(
     confirmLabel,
     `btn btn-sm ${tone === "danger" ? "btn-error" : "btn-neutral"}`
   );
+
   const actions = document.createElement("div");
   actions.className = "modal-action";
   actions.append(cancel, confirm);
@@ -73,9 +81,11 @@ export const confirmDialog = ({
   dialog.append(box, backdrop);
 
   let confirmed = false;
+
   const onAbort = () => {
     dialog.close();
   };
+
   dialog.addEventListener("close", () => {
     signal?.removeEventListener("abort", onAbort);
     dialog.remove();
@@ -92,5 +102,6 @@ export const confirmDialog = ({
   document.body.append(dialog);
   dialog.showModal();
   confirm.focus();
+
   return answered.promise;
 };

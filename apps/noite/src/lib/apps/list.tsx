@@ -33,18 +33,22 @@ const InvitationsBanner = () => {
   const busy = atom(false);
   const notice = atom("");
   const invites = res.data() ?? [];
+
   if (invites.length === 0 && !notice()) {
     return null;
   }
+
   const answer = async (inviteId: string, accept: boolean) => {
     busy.set(true);
     notice.set("");
+
     try {
       if (accept) {
         const { appId } = await api<{ appId: string }>(
           "/api/collaborators/acceptInvitation",
           inviteId
         );
+
         invalidate(keys.myInvitations);
         router.visit(`/apps/${appId}`);
       } else {
@@ -58,8 +62,10 @@ const InvitationsBanner = () => {
       notice.set(errorMessage(error));
       invalidate(keys.myInvitations);
     }
+
     busy.set(false);
   };
+
   return (
     <section
       class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md"
@@ -153,16 +159,22 @@ export const AppsList = () => {
   // `session()` is shared with the layout; `adminStatus()` is one cached call.
   const admin = adminStatus();
   const sess = session();
+
   const showControl = (): boolean => {
     const user = sess.data();
+
     if (!user || user.session.impersonatedBy !== null) {
       return false;
     }
+
     return admin.data()?.isAdmin ?? false;
   };
+
   const items = (): App[] => feed.latest() ?? [];
+
   const loaded = (): boolean =>
     feed.latest() !== undefined || feed.status() === "open";
+
   const retrying = (): boolean => feed.status() === "retrying";
 
   return (

@@ -38,10 +38,12 @@ export const TableSidebar = ({
 }) => {
   const query = atom("");
   const needle = query().trim().toLowerCase();
+
   const visible =
     needle === ""
       ? tables
       : tables.filter((table) => table.name.toLowerCase().includes(needle));
+
   return (
     <aside class="bg-base-100 dark:bg-base-200 border-base-300 hidden w-64 shrink-0 flex-col border-r md:flex">
       <div class="border-base-300 flex flex-col gap-1 border-b p-3">

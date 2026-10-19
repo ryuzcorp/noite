@@ -40,12 +40,16 @@ export const CustomDomainsPanel = ({
   const add = async (event: SubmitEvent) => {
     event.preventDefault();
     const value = hostname().trim();
+
     if (!value) {
       note.set("Enter a hostname first.");
+
       return;
     }
+
     busy.set(true);
     note.set("");
+
     try {
       await api<{ ok: true }>("/api/domains/addDomain", {
         appId,
@@ -59,12 +63,14 @@ export const CustomDomainsPanel = ({
     } catch (error) {
       note.set(errorMessage(error));
     }
+
     busy.set(false);
   };
 
   const removeDomainRow = async (value: string) => {
     busy.set(true);
     note.set("");
+
     try {
       await api<{ ok: true }>("/api/domains/removeDomain", {
         appId,
@@ -74,13 +80,16 @@ export const CustomDomainsPanel = ({
     } catch (error) {
       note.set(errorMessage(error));
     }
+
     busy.set(false);
   };
 
   const rows = res.data() ?? [];
+
   if (res.loading() && res.data() === undefined) {
     return <SectionSkeleton lines={2} />;
   }
+
   return (
     <SettingsSection>
       <h3 class="m-0 text-lg font-semibold">Custom Domain</h3>

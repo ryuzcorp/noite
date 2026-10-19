@@ -23,8 +23,10 @@ import {
 // The representation better-auth/paranorm writes today: ISO 8601 with
 // milliseconds and a Z suffix.
 const ISO = "2026-10-06T07:29:28.530Z";
+
 // What SQLite's `CURRENT_TIMESTAMP` default writes into the same column.
 const SQLITE_NOW = "2026-10-06 07:29:28";
+
 // An epoch-millisecond int and a seconds int, as the runner stringifies them.
 const EPOCH_MS = "1759735768530";
 const EPOCH_S = "1759735768";
@@ -67,9 +69,11 @@ const draftsFrom = (
   const drafts = Object.fromEntries(
     columns.map((c) => [c.name, draftFromCell(row[c.name] ?? null)])
   );
+
   for (const [name, value] of Object.entries(patch)) {
     drafts[name] = { isNull: value === null, text: value ?? "", touched: true };
   }
+
   return drafts;
 };
 

@@ -10,14 +10,17 @@ export const sleepUnlessAborted = (
   new Promise<void>((resolve) => {
     if (signal.aborted) {
       resolve();
+
       return;
     }
+
     const wake = () => {
       // oxlint-disable-next-line eslint/no-use-before-define -- the timer and the abort listener each cancel the other
       clearTimeout(timer);
       signal.removeEventListener("abort", wake);
       resolve();
     };
+
     const timer = setTimeout(wake, ms);
     signal.addEventListener("abort", wake, { once: true });
   });

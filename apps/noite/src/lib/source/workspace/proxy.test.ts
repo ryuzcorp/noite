@@ -62,15 +62,20 @@ const readMessage = (
   if (typeof value !== "object" || value === null) {
     return null;
   }
+
   const fields = new Map(Object.entries(value));
   const answer = fields.get("answer");
+
   if (typeof answer === "number") {
     const v = fields.get("v");
+
     const bytes =
       typeof v === "object" && v !== null
         ? new Map(Object.entries(v)).get("bytes")
         : undefined;
+
     const e = fields.get("e");
+
     return {
       answer,
       bytes,
@@ -81,11 +86,14 @@ const readMessage = (
       ok: fields.get("ok") === true,
     };
   }
+
   const i = fields.get("i");
   const k = fields.get("k");
+
   if (typeof i === "number" && typeof k === "string") {
     return { i, k, p: fields.get("p") };
   }
+
   return null;
 };
 
@@ -109,11 +117,13 @@ const newFakeFrame = (port: MessagePort): FakeFrame => {
   const announce = (kind: string): void => {
     const count = requests.filter((request) => request.k === kind).length;
     const waiting = arrived.get(kind) ?? [];
+
     for (const arrival of waiting) {
       if (arrival.count <= count) {
         arrival.resolve();
       }
     }
+
     arrived.set(
       kind,
       waiting.filter((arrival) => arrival.count > count)
@@ -122,15 +132,21 @@ const newFakeFrame = (port: MessagePort): FakeFrame => {
 
   const respond = async (i: number, k: string): Promise<void> => {
     const held = withheld.get(k);
+
     if (held !== undefined) {
       held.push(i);
+
       return;
     }
+
     const handler = handlers.get(k);
+
     if (handler === undefined) {
       send({ e: { message: `unhandled ${k}` }, i, ok: false });
+
       return;
     }
+
     try {
       send({ i, ok: true, v: await handler() });
     } catch (error) {
@@ -140,19 +156,24 @@ const newFakeFrame = (port: MessagePort): FakeFrame => {
 
   port.onmessage = (event: MessageEvent) => {
     const message = readMessage(event.data);
+
     if (message === null) {
       return;
     }
+
     if ("answer" in message) {
       const pending = archiveAsks.get(message.answer);
       archiveAsks.delete(message.answer);
+
       if (message.ok && message.bytes instanceof ArrayBuffer) {
         pending?.resolve(new Uint8Array(message.bytes));
       } else {
         pending?.reject(new Error(message.error));
       }
+
       return;
     }
+
     requests.push({ k: message.k, p: message.p });
     // The answer goes out before a waiting test is told the request arrived:
     // the response is then queued ahead of anything the test sends next, which
@@ -172,6 +193,7 @@ const newFakeFrame = (port: MessagePort): FakeFrame => {
       const answered = Promise.withResolvers<Uint8Array>();
       archiveAsks.set(id, answered);
       send({ ask: "archive", i: id, p: { sha } });
+
       return answered.promise;
     },
     emit: (kind, payload) => {
@@ -181,9 +203,11 @@ const newFakeFrame = (port: MessagePort): FakeFrame => {
       // The kind's handler (if a test registered one) stays: releasing a hold
       // answers what was held, and the requests that follow still go to it.
       withheld.set(kind, []);
+
       return () => {
         const held = withheld.get(kind) ?? [];
         withheld.delete(kind);
+
         for (const i of held) {
           send({ i, ok: true, v: undefined });
         }
@@ -191,11 +215,14 @@ const newFakeFrame = (port: MessagePort): FakeFrame => {
     },
     received: (kind, count = 1) => {
       const seen = requests.filter((request) => request.k === kind).length;
+
       if (seen >= count) {
         return Promise.resolve();
       }
+
       const { promise, resolve } = Promise.withResolvers<void>();
       arrived.set(kind, [...(arrived.get(kind) ?? []), { count, resolve }]);
+
       return promise;
     },
     requests,
@@ -230,6 +257,7 @@ const openAnswer =
   (frame: FakeFrame) =>
   (): { baseSha: string; editable: boolean; stale: string | null } => {
     frame.emit("changes", { baseSha: SHA, changes: [], revision: 1 });
+
     return { baseSha: SHA, editable: true, stale: null };
   };
 
@@ -250,12 +278,14 @@ const open = async (options?: {
   frame.answer("close", () => {});
   frame.answer("flush", () => {});
   options?.beforeOpen?.(frame);
+
   const checkpoint = await openSourceWorkspace({
     appId: APP_ID,
     branch: "main",
     editable: options?.editable ?? true,
     fetchArchive: (ref) => {
       archives.push(ref);
+
       return Promise.resolve(new Uint8Array([1, 2, 3, 4]));
     },
     files: [],
@@ -278,6 +308,7 @@ const open = async (options?: {
     previewOrigin: PREVIEW_ORIGIN,
     sha: options?.sha ?? SHA,
   });
+
   return {
     archives,
     checkpoint,
@@ -343,16 +374,19 @@ describe("open", () => {
 
   test("an archive asked for while the open is in flight is answered with the ref's bytes", async () => {
     const received: number[] = [];
+
     const { archives, checkpoint, frame } = await open({
       beforeOpen: (scripted) => {
         scripted.answer("open", async () => {
           const bytes = await scripted.askArchive("deadbeef");
           received.push(bytes.byteLength);
           scripted.emit("changes", { baseSha: SHA, changes: [], revision: 1 });
+
           return { baseSha: SHA, editable: true, stale: null };
         });
       },
     });
+
     // The frame asked, the page read the ref, and the bytes came back.
     expect(archives).toEqual(["deadbeef"]);
     expect(received).toEqual([4]);
@@ -374,11 +408,13 @@ describe("write coalescing", () => {
     const { checkpoint, frame } = await open();
     frame.answer("fs.write", () => {});
     const release = frame.hold("fs.write");
+
     const typed = [
       checkpoint.workspace.writeText("src/a.ts", "a"),
       checkpoint.workspace.writeText("src/a.ts", "ab"),
       checkpoint.workspace.writeText("src/a.ts", "abc"),
     ];
+
     await frame.received("fs.write");
     // One write went out; the two later keystrokes are the pending value.
     expect(writes(frame)).toEqual([
@@ -443,10 +479,12 @@ describe("the frame's events", () => {
 
   test("another tab's structural change reaches the tree", async () => {
     const { checkpoint, frame } = await open();
+
     const last = Promise.withResolvers<{
       paths: readonly string[];
       structural: boolean;
     }>();
+
     checkpoint.workspace.onPeerChange((structural, paths) => {
       last.resolve({ paths, structural });
     });
@@ -466,6 +504,7 @@ describe("the frame's events", () => {
     frame.answer("fs.watch", () => ({ watchId: 7 }));
     frame.answer("fs.unwatch", () => {});
     const arrived = Promise.withResolvers<string>();
+
     const watch = checkpoint.workspace.fs.watch(
       "/home/project",
       { recursive: true },
@@ -473,6 +512,7 @@ describe("the frame's events", () => {
         arrived.resolve(`${event}:${filename ?? ""}`);
       }
     );
+
     await frame.received("fs.watch");
     frame.emit("fs.event", {
       event: "rename",
@@ -490,6 +530,7 @@ describe("the frame's events", () => {
     const frame = newFakeFrame(port2);
     frame.answer("open", openAnswer(frame));
     let disposed = false;
+
     const checkpoint = await openSourceWorkspace({
       appId: APP_ID,
       branch: "main",
@@ -514,6 +555,7 @@ describe("the frame's events", () => {
       previewOrigin: PREVIEW_ORIGIN,
       sha: SHA,
     });
+
     const pending = checkpoint.workspace.listing();
     frame.emit("fatal", { message: "the pod's volume went away" });
     expect(await refusal(pending)).toBe("the pod's volume went away");
@@ -540,11 +582,13 @@ describe("push", () => {
         scripted.answer("push.settle", () => {});
       },
     });
+
     const committed: PushPayload[] = [];
     await checkpoint.workspace.push(
       { branch: "feat", message: "Web edit", target: "feat" },
       (next) => {
         committed.push(next);
+
         return Promise.resolve({ sha: "beef2" });
       }
     );
@@ -562,10 +606,12 @@ describe("push", () => {
         scripted.answer("push.settle", () => {});
       },
     });
+
     const pushed = checkpoint.workspace.push(
       { message: "Web edit", target: "main" },
       () => Promise.reject(new Error("commit failed: 413 too large"))
     );
+
     expect(await refusal(pushed)).toBe("commit failed: 413 too large");
     // The pod is told the push is over: nothing is left half-open in it.
     expect(settles(frame)).toEqual([

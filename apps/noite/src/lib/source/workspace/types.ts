@@ -41,14 +41,17 @@ const LEADING_SLASHES = /^\/+/u;
  * checkout, never reach Noite's metadata beside it. */
 export const projectPath = (rel: string): string => {
   const trimmed = rel.replace(LEADING_SLASHES, "");
+
   if (trimmed === "") {
     return PROJECT_ROOT;
   }
+
   if (
     trimmed.split("/").some((segment) => segment === "." || segment === "..")
   ) {
     throw new Error(`"${rel}" leaves the checkout`);
   }
+
   return `${PROJECT_ROOT}/${trimmed}`;
 };
 
@@ -56,15 +59,18 @@ export const projectPath = (rel: string): string => {
  * returned as it came (the workspace only ever hands back checkout paths). */
 export const relPath = (abs: string): string => {
   const prefix = `${PROJECT_ROOT}/`;
+
   if (abs === PROJECT_ROOT) {
     return "";
   }
+
   return abs.startsWith(prefix) ? abs.slice(prefix.length) : abs;
 };
 
 /** The directory holding `abs` (the pod path of a file being written). */
 export const parentDir = (abs: string): string => {
   const cut = abs.lastIndexOf("/");
+
   return cut <= 0 ? "/" : abs.slice(0, cut);
 };
 

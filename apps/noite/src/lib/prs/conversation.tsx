@@ -30,11 +30,14 @@ const PrDescription = ({
 
   const save = async (): Promise<void> => {
     const nextTitle = title().trim();
+
     if (nextTitle === "" || busy()) {
       return;
     }
+
     busy.set(true);
     notice.set("");
+
     try {
       await api<{ ok: true }>("/api/prs/prsUpdate", {
         appId,
@@ -149,10 +152,13 @@ export const PrConversationTab = ({
   viewerId: string;
 }) => {
   const { pullRequest } = detail;
+
   const canEdit =
     role === "admin" || (viewerId !== "" && pullRequest.authorId === viewerId);
+
   const canComment = role === "push" || role === "admin";
   const timeline = buildTimeline(detail.comments, detail.reviews);
+
   return (
     <div class="flex flex-col gap-4">
       <PrDescription

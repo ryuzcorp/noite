@@ -33,11 +33,14 @@ beforeAll(() => {
 const ENCODER = new TextEncoder();
 const APP_ID = "app1";
 const BRANCH = "main";
+
 /** How long a test waits for an event before saying the frame never sent it:
  * a safety net, not a wait — the test's own signal is the event. */
 const EVENT_TIMEOUT_MS = 3000;
+
 /** How long a request may wait for its answer, for the same reason. */
 const CALL_TIMEOUT_MS = 5000;
+
 /** Two zero-filled tar blocks: the end-of-archive marker, and a checkout with
  * nothing in it — enough to prove the archive ask end to end. */
 const EMPTY_TAR = new ArrayBuffer(1024);
@@ -57,9 +60,11 @@ const seed = async (
       await fs.writeFile(abs, bytes);
       const sha = await gitBlobSha(bytes);
       await writeObject(fs, sha, bytes);
+
       return [path, { mode: "100644", sha }] as const;
     })
   );
+
   await writeBase(fs, { baseSha, entries: Object.fromEntries(entries) });
 };
 
@@ -120,6 +125,7 @@ const loopback = (): [MessagePort, MessagePort] => {
   const page = new LoopbackPort();
   frame.peer = page;
   page.peer = frame;
+
   // SAFETY: LoopbackPort implements the postMessage/message-event surface the server uses; real ports are never needed.
   return [frame as unknown as MessagePort, page as unknown as MessagePort];
 };
@@ -129,11 +135,14 @@ const loopback = (): [MessagePort, MessagePort] => {
 const control = (port: MessagePort): Control => {
   let nextId = 1;
   const archived: string[] = [];
+
   const calls = new Map<
     number,
     { reject: (error: Error) => void; resolve: (value: unknown) => void }
   >();
+
   const events: PodEvent[] = [];
+
   const waiting: {
     accept: (payload: unknown) => boolean;
     kind: string;
@@ -146,10 +155,13 @@ const control = (port: MessagePort): Control => {
     const wanted = waiting.findIndex(
       (entry) => entry.kind === received.ev && entry.accept(received.p)
     );
+
     if (wanted === -1) {
       events.push(received);
+
       return;
     }
+
     waiting.splice(wanted, 1)[0]?.resolve(received.p);
   };
 
@@ -163,12 +175,15 @@ const control = (port: MessagePort): Control => {
     const taken = (event: PodEvent): PodEventMap[K] =>
       // SAFETY: the kind's own payload came off this event.
       event.p as PodEventMap[K];
+
     const found = events.findIndex(
       (event) => event.ev === kind && accept(taken(event))
     );
+
     if (found !== -1) {
       return taken(events.splice(found, 1)[0] as PodEvent);
     }
+
     const answeredEvent = Promise.withResolvers<PodEventMap[K]>();
     waiting.push({
       accept: (payload) => accept(payload as PodEventMap[K]),
@@ -177,9 +192,11 @@ const control = (port: MessagePort): Control => {
         answeredEvent.resolve(payload as PodEventMap[K]);
       },
     });
+
     const timer = setTimeout(() => {
       answeredEvent.reject(new Error(`the frame sent no ${kind} event`));
     }, EVENT_TIMEOUT_MS);
+
     try {
       return await answeredEvent.promise;
     } finally {
@@ -192,6 +209,7 @@ const control = (port: MessagePort): Control => {
     // protocol's own shapes.
     const message = event.data as Record<string, unknown>;
     const { ask } = message;
+
     if (typeof ask === "string") {
       // SAFETY: `archive` is the protocol's only ask, and its params are the
       // ref's sha.
@@ -202,28 +220,38 @@ const control = (port: MessagePort): Control => {
         ok: true,
         v: { bytes: EMPTY_TAR },
       });
+
       return;
     }
+
     const id = message["i"];
+
     if (typeof id !== "number") {
       const kind = message["ev"];
       const payload = message["p"];
+
       if (typeof kind !== "string" || typeof payload !== "object") {
         throw new TypeError(
           `not a protocol message: ${JSON.stringify(message)}`
         );
       }
+
       // SAFETY: the kind and its payload are the protocol's own (the frame
       // sent them).
       delivered({ ev: kind, p: payload } as PodEvent);
+
       return;
     }
+
     const call = calls.get(id);
     calls.delete(id);
+
     if (message["ok"] === true) {
       call?.resolve(message["v"]);
+
       return;
     }
+
     // SAFETY: the frame's failure is the protocol's own error shape.
     const failure = message["e"] as { message?: string };
     call?.reject(new Error(failure.message ?? "the frame failed"));
@@ -240,12 +268,14 @@ const control = (port: MessagePort): Control => {
       const id = nextId;
       nextId += 1;
       const answered = Promise.withResolvers<PodRequestMap[K]["r"]>();
+
       // A deadline only so a frame that never answers fails the test with the
       // kind that hung, instead of running to the suite's own timeout.
       const timer = setTimeout(() => {
         calls.delete(id);
         answered.reject(new Error(`${kind}: the frame did not answer`));
       }, CALL_TIMEOUT_MS);
+
       calls.set(id, {
         reject: (error) => {
           clearTimeout(timer);
@@ -259,6 +289,7 @@ const control = (port: MessagePort): Control => {
         },
       });
       port.postMessage({ i: id, k: kind, p: params });
+
       return await answered.promise;
     },
     unknown: (kind) => {
@@ -270,6 +301,7 @@ const control = (port: MessagePort): Control => {
         resolve: () => answered.resolve("answered"),
       });
       port.postMessage({ i: id, k: kind, p: undefined });
+
       return answered.promise;
     },
     waitFor,
@@ -305,29 +337,36 @@ const withServer = async (
     if (breakMeta) {
       throw new Error("the pod's store is full");
     }
+
     await writeFile(path, data);
   };
+
   let reportSaveError: (error: unknown) => void = () => {
     throw new Error(
       "the frame reported a save error before a workspace opened"
     );
   };
+
   let peerChanged: (
     structural: boolean,
     paths: readonly string[]
   ) => void = () => {
     throw new Error("the frame reported a peer change before one opened");
   };
+
   let closed = false;
   let openedOnce = false;
+
   const opener: OpenPodOpener = (opened: PodOptions): Promise<OpenPod> => {
     openedOnce = true;
     reportSaveError = (error) => {
       opened.onSaveError(error);
     };
+
     return Promise.resolve({
       close: () => {
         closed = true;
+
         return pod.teardown();
       },
       editable: opened.editable,
@@ -336,6 +375,7 @@ const withServer = async (
       // The notify the frame subscribes to is what the test fires.
       onPeerChange: (notify) => {
         peerChanged = notify;
+
         return () => {
           peerChanged = () => {};
         };
@@ -344,7 +384,9 @@ const withServer = async (
       pod,
     });
   };
+
   const [port2, port1] = loopback();
+
   const harness: Harness = {
     breakMeta: (broken) => {
       breakMeta = broken;
@@ -359,12 +401,14 @@ const withServer = async (
       reportSaveError(error);
     },
   };
+
   createPodServer({
     appId: APP_ID,
     branch: BRANCH,
     openPod: opener,
     port: port2,
   });
+
   try {
     await run(harness);
   } finally {
@@ -373,8 +417,10 @@ const withServer = async (
     if (openedOnce && !closed) {
       await harness.control.request("close");
     }
+
     port1.close();
     port2.close();
+
     if (!closed) {
       await pod.teardown();
     }
@@ -562,10 +608,12 @@ describe("the frame's RPC server", () => {
     await withServer(async ({ control: page, fs }) => {
       await seed(fs, { "a.txt": "one\n" });
       await page.request("open", opening());
+
       const { watchId } = await page.request("fs.watch", {
         path: projectPath(""),
         recursive: true,
       });
+
       await fs.writeFile(projectPath("a.txt"), ENCODER.encode("watched\n"));
       // The pod's own watcher reports the checkout-relative name and the
       // event it saw.
@@ -618,6 +666,7 @@ describe("the frame's RPC server", () => {
         message: "a push",
         target: BRANCH,
       });
+
       expect(payload).toEqual({
         deletes: [],
         files: [{ content: "pushed\n", path: "a.txt" }],
@@ -714,10 +763,12 @@ describe("the frame's RPC server", () => {
     await withServer(async ({ control: page, fs }) => {
       await seed(fs, { "a.txt": "one\n" });
       await page.request("open", opening());
+
       const opened = await page.request("terminal.open", {
         cols: 100,
         rows: 30,
       });
+
       expect(opened).toEqual({ sessionId: 1 });
       const prompt = await page.next("terminal.write");
       expect(prompt.data).toEndWith("$ ");

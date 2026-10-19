@@ -33,15 +33,19 @@ const previewEntries = (
   preview: string
 ): { key: string; value: string }[] | null => {
   let raw: unknown;
+
   try {
     raw = JSON.parse(preview);
   } catch {
     return null;
   }
+
   const decoded = Schema.decodeUnknownResult(PreviewRecord)(raw);
+
   if (decoded._tag === "Failure") {
     return null;
   }
+
   return Object.entries(decoded.success).map(([key, value]) => ({
     key,
     value: JSON.stringify(value, null, 2) ?? String(value),
@@ -53,13 +57,17 @@ const summarizePreview = (preview: string | null): string => {
   if (preview === null) {
     return "unavailable";
   }
+
   const entries = previewEntries(preview);
+
   if (entries === null) {
     return preview.replaceAll(/\s+/gu, " ").trim().slice(0, 80);
   }
+
   if (entries.length === 0) {
     return "{} (empty)";
   }
+
   return entries
     .map((entry) => `${entry.key}=${entry.value.replaceAll(/\s+/gu, " ")}`)
     .join(" · ")
@@ -72,7 +80,9 @@ const summarizePreview = (preview: string | null): string => {
 const DoInstancePanel = ({ instance }: { instance: DoInstance }) => {
   const entries =
     instance.preview === null ? null : previewEntries(instance.preview);
+
   let body: View;
+
   if (instance.preview === null) {
     body = (
       <p class="m-0 text-sm opacity-60">
@@ -131,6 +141,7 @@ const DoInstancePanel = ({ instance }: { instance: DoInstance }) => {
       </table>
     );
   }
+
   return (
     <DetailPanel title={instance.id}>
       <p class="m-0 flex items-center gap-2 text-xs opacity-60">
@@ -164,9 +175,11 @@ export const DoBrowser = ({
   const selected = atom<string | null>(null);
   const data = res.data();
   const loadError = res.error();
+
   if (loadError && data === undefined) {
     return <p class="text-error m-0 p-4 text-sm">{errorMessage(loadError)}</p>;
   }
+
   if (!data) {
     return (
       <div class="flex flex-col gap-2 p-4">
@@ -176,7 +189,9 @@ export const DoBrowser = ({
       </div>
     );
   }
+
   const needle = query().trim().toLowerCase();
+
   const instances =
     needle === ""
       ? data.instances
@@ -185,9 +200,12 @@ export const DoBrowser = ({
             instance.id.toLowerCase().includes(needle) ||
             instance.scope.toLowerCase().includes(needle)
         );
+
   const selectedInstance =
     data.instances.find((instance) => instance.id === selected()) ?? null;
+
   let body: View;
+
   if (data.instances.length === 0) {
     body = (
       <EmptyState
@@ -241,6 +259,7 @@ export const DoBrowser = ({
       </div>
     );
   }
+
   return (
     <div class="flex h-full min-h-0 w-full flex-col overflow-hidden">
       <div class="border-base-300 flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-3 py-2">

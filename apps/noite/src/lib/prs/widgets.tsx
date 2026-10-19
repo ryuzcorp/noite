@@ -32,6 +32,7 @@ export const nameFor = (
 
 export const PrStateBadge = ({ state }: { state: string }) => {
   const info = PR_STATES.find((entry) => entry.id === state);
+
   return (
     <span class={`badge badge-sm ${info?.badge ?? "badge-ghost"}`}>
       {info?.label ?? state}
@@ -70,11 +71,14 @@ export const CommentComposer = ({
 
   const submit = async (): Promise<void> => {
     const body = draft().trim();
+
     if (body === "" || busy()) {
       return;
     }
+
     busy.set(true);
     notice.set("");
+
     try {
       await (anchor
         ? api<{ ok: true }>("/api/prs/prsComment", {
@@ -164,6 +168,7 @@ export const CommentCard = ({
   const run = async (work: () => Promise<void>): Promise<void> => {
     busy.set(true);
     notice.set("");
+
     try {
       await work();
       invalidatePr(appId, number);
@@ -201,9 +206,11 @@ export const CommentCard = ({
             onsubmit={(event) => {
               event.preventDefault();
               const body = draft().trim();
+
               if (body === "") {
                 return;
               }
+
               void run(async () => {
                 await api<{ ok: true }>("/api/prs/prsCommentEdit", {
                   appId,
@@ -276,9 +283,11 @@ export const CommentCard = ({
                     confirmLabel: "Delete",
                     title: "Delete this comment?",
                   });
+
                   if (!ok) {
                     return;
                   }
+
                   await run(async () => {
                     await api<{ ok: true }>("/api/prs/prsCommentDelete", {
                       appId,
@@ -306,6 +315,7 @@ export const ReviewCard = ({
   review: PrReview;
 }) => {
   const info = REVIEW_STATES.find((entry) => entry.id === review.state);
+
   return (
     <article class="border-base-300 flex items-center gap-3 rounded-lg border p-3">
       <Avatar label={nameFor(names, review.reviewerId)} size="sm" />

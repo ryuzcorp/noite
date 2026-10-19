@@ -27,7 +27,9 @@ const deleteMessage = (files: number, committed: number): string => {
       ? "It is not pushed yet, so it is just discarded."
       : "Nothing here is pushed yet, so it is just discarded.";
   }
+
   const count = `${committed} ${committed === 1 ? "file" : "files"}`;
+
   return `Push removes ${count} from the repository.`;
 };
 
@@ -100,11 +102,13 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
     if (from === to) {
       return;
     }
+
     try {
       await host.workspace().rename(from, to);
     } catch (error) {
       host.notify(errorMessage(error));
     }
+
     // The pane's live text and its open path re-key with the move.
     host.followMove(from, to);
   };
@@ -115,9 +119,11 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
    * over). */
   const followOpen = (wasOpen: string | null) => {
     const path = host.getCurrentPath();
+
     if (path === null || path === wasOpen) {
       return;
     }
+
     void host.openFile(path);
   };
 
@@ -132,6 +138,7 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
     if (!host.editable()) {
       return false;
     }
+
     return drop.draggedPaths.every(
       (path) =>
         host.changeAt(dropDestination(path, drop.target))?.kind !== "deleted"
@@ -145,6 +152,7 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
     if (!host.editable() || drop.draggedPaths.length === 0) {
       return;
     }
+
     const wasOpen = host.getCurrentPath();
     void (async () => {
       await Promise.all(
@@ -167,6 +175,7 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
     if (!host.editable()) {
       return;
     }
+
     const wasOpen = host.getCurrentPath();
     void (async () => {
       await moveRow(
@@ -190,10 +199,13 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
       } catch (error) {
         host.notify(errorMessage(error));
       }
+
       await settle();
+
       if (add.isFolder) {
         return;
       }
+
       // A file that just appeared should be ready to type in: the open parks
       // the caret and pierre's attach places it, which needs no click (pierre
       // only takes text where its own caret sits). The row pierre named is its
@@ -206,6 +218,7 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
           resolve();
         });
       });
+
       if (host.getCurrentPath() === add.path) {
         host.placeCaret({ character: 0, line: 0 });
       }
@@ -219,6 +232,7 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
     if (!host.editable() || paths.length === 0) {
       return;
     }
+
     const targets = paths.filter(
       (path) =>
         !paths.some(
@@ -226,6 +240,7 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
             other !== path && other.endsWith("/") && path.startsWith(other)
         )
     );
+
     const files = new Set(
       targets.flatMap((path) =>
         path.endsWith("/")
@@ -233,12 +248,15 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
           : [withoutSlash(path)]
       )
     );
+
     // What the commit holds and the delete would push: an excluded file is not
     // in the repository and an added one is not pushed yet, so neither counts.
     const committed = [...files].filter(
       (one) => !host.ignoredPath(one) && host.changeAt(one)?.kind !== "added"
     ).length;
+
     const [only] = targets;
+
     const ok = await confirmDialog({
       confirmLabel: "Delete",
       message: deleteMessage(files.size, committed),
@@ -248,9 +266,11 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
           ? `Delete ${withoutSlash(only)}?`
           : `Delete ${targets.length} items?`,
     });
+
     if (!ok || host.aborted()) {
       return;
     }
+
     await Promise.all(
       targets.map(async (path) => {
         try {
@@ -271,12 +291,14 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
     if (!host.editable()) {
       return;
     }
+
     void (async () => {
       try {
         await host.workspace().discard(path);
       } catch (error) {
         host.notify(errorMessage(error));
       }
+
       await settle();
       await host.syncOpen();
     })();
@@ -289,25 +311,31 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
     if (!host.editable()) {
       return;
     }
+
     const change = host.changeAt(path);
     const origin = change?.kind === "moved" ? change.movedFrom : undefined;
+
     // Something else claimed the committed path (a new file made there while
     // the move was staged): the undo cannot land, and pierre's store would
     // refuse it anyway.
     if (origin !== undefined && host.rows.has(origin)) {
       host.notify(`"${origin}" already exists.`);
+
       return;
     }
+
     const wasOpen = host.getCurrentPath();
     void (async () => {
       try {
         await host.workspace().restore(path);
+
         if (origin !== undefined) {
           host.followMove(path, origin);
         }
       } catch (error) {
         host.notify(errorMessage(error));
       }
+
       await settle();
       followOpen(wasOpen);
       await host.syncOpen();

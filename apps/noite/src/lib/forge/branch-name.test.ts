@@ -46,6 +46,7 @@ describe("branchNameError", () => {
     ]) {
       expect(branchNameError(name)).not.toBeNull();
     }
+
     expect(branchNameError("a\u007Fb")).not.toBeNull();
   });
 

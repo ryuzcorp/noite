@@ -132,6 +132,7 @@ describe("subpath and miss rules", () => {
     for (const subpath of ["", "config", "vite", "x.d.ts", "config.d.mts"]) {
       expect(isCodeSubpath(subpath)).toBe(true);
     }
+
     for (const subpath of [
       "package.json",
       "assets/style.css",
@@ -188,6 +189,7 @@ describe("jsx runtimes", () => {
   test("the file's own pragma wins over the configured source", () => {
     const text =
       "/** @jsxImportSource preact */\nexport default () => <main />;\n";
+
     expect(jsxImportSourceOf(text)).toBe("preact");
     expect(
       jsxRuntimeSpecifiers({
@@ -210,6 +212,7 @@ describe("jsx runtimes", () => {
       // A pragma in a `.ts` file is inert: JSX is not syntax there.
       { file: "/src/index.ts", mode: "react-jsx" as const },
     ];
+
     for (const { file, mode } of cases) {
       expect(
         jsxRuntimeSpecifiers({
@@ -334,6 +337,7 @@ describe("lockfile versions", () => {
       },
       { path: "bun.lock", text: BUN_LOCK },
     ]);
+
     expect(versions.get("cf")).toBe("1.0.0-beta.5");
     // Not in the lockfile: the range is the only version there is.
     expect(versions.get("ilha")).toBe("^0.15.2");
@@ -346,6 +350,7 @@ describe("lockfile versions", () => {
         text: '{"dependencies":{"cf":"1.0.0-beta.10","ilha":"workspace:*","local":"file:../x","gh":"github:a/b"}}',
       },
     ]);
+
     expect(versions.get("cf")).toBe("1.0.0-beta.10");
     // Ranges esm.sh cannot serve are dropped rather than guessed.
     expect(versions.has("ilha")).toBe(false);
@@ -363,6 +368,7 @@ const lazy = import("@ilha/router/vite");
 import "./local";
 // import "commented-out";
 `;
+
     expect(new Set(collectSpecifiers(text))).toEqual(
       new Set([
         "cf/config",
@@ -399,12 +405,14 @@ const recorded = (url: string): Response => {
         }
       );
     }
+
     case "https://esm.sh/cf@1.0.0-beta.10/dist/config.d.mts": {
       return respond(
         200,
         '\nexport * from "https://esm.sh/@cloudflare/config@0.22.0/dist/public.d.mts";\n'
       );
     }
+
     // The same package at the version another branch pins: a lockfile that
     // moved is the one thing that re-resolves a specifier.
     case "https://esm.sh/cf@1.1.0/config": {
@@ -412,9 +420,11 @@ const recorded = (url: string): Response => {
         "x-typescript-types": "https://esm.sh/cf@1.1.0/dist/config.d.mts",
       });
     }
+
     case "https://esm.sh/cf@1.1.0/dist/config.d.mts": {
       return respond(200, "export declare const defineWorker: unknown;\n");
     }
+
     // The package `cf/config` re-exports, as the open file's own import: a
     // lockfile that pins it is answered by the header, and its declaration is
     // already in the FS from the absolute URL above.
@@ -424,52 +434,62 @@ const recorded = (url: string): Response => {
           "https://esm.sh/@cloudflare/config@0.22.0/dist/public.d.mts",
       });
     }
+
     case "https://esm.sh/@cloudflare/config@0.22.0/dist/public.d.mts": {
       return respond(
         500,
         "Failed to build types: registry.npmjs.org: 400 Bad Request"
       );
     }
+
     case "https://esm.sh/@cloudflare/config@0.22.0/dist/public.d.mts?raw": {
       return respond(
         200,
         'import { X as defineWorker } from "./public-DFY8wDEh.mjs";\nexport { defineWorker };\n'
       );
     }
+
     case "https://esm.sh/@cloudflare/config@0.22.0/dist/public-DFY8wDEh.d.mts": {
       return respond(
         500,
         "Failed to build types: registry.npmjs.org: 400 Bad Request"
       );
     }
+
     case "https://esm.sh/@cloudflare/config@0.22.0/dist/public-DFY8wDEh.d.mts?raw": {
       return respond(
         200,
         "declare const defineWorker: (config: unknown) => unknown;\n"
       );
     }
+
     // A types-only package: no JavaScript entry at all, so every module URL
     // fails and the declaration is only reachable through `?raw`.
     case "https://esm.sh/@cloudflare/workers-types@5.20261013.1": {
       return respond(500, "registry.npmjs.org: 400 Bad Request");
     }
+
     case "https://esm.sh/@cloudflare/workers-types@5.20261013.1.d.ts": {
       return respond(404, "File Not Found");
     }
+
     case "https://esm.sh/@cloudflare/workers-types@5.20261013.1/index.d.ts": {
       return respond(
         500,
         "Failed to build types: registry.npmjs.org: 400 Bad Request"
       );
     }
+
     case "https://esm.sh/@cloudflare/workers-types@5.20261013.1/index.d.ts?raw": {
       return respond(200, "interface DurableObjectState { id: unknown }\n");
     }
+
     // A plain JavaScript package: it builds, and it ships no declarations, so
     // the response carries no `X-TypeScript-Types` header.
     case "https://esm.sh/plain-js@2.0.0": {
       return respond(200, "export const plain = 1;\n");
     }
+
     default: {
       return respond(404, "File Not Found");
     }
@@ -503,8 +523,10 @@ const withRecordedFetch = async (
   globalThis.fetch = ((input: RequestInfo | URL) => {
     const url = String(input);
     fetches.push(url);
+
     return Promise.resolve(recorded(url));
   }) as unknown as typeof fetch;
+
   try {
     const esm = new EsmTypes({
       changed: () => {
@@ -520,6 +542,7 @@ const withRecordedFetch = async (
         written.set(path, text);
       },
     });
+
     await run({ changed: () => changed, esm, fetches, notes, written });
   } finally {
     globalThis.fetch = original;

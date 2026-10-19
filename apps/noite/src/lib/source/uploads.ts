@@ -55,6 +55,7 @@ const decodeText = (bytes: Uint8Array): string | null => {
   if (bytes.includes(0)) {
     return null;
   }
+
   try {
     return UTF8_DECODER.decode(bytes);
   } catch {
@@ -71,11 +72,13 @@ export const isTextBytes = (bytes: Uint8Array): boolean =>
  * lands in the commit, not on the encoded text). */
 export const base64Bytes = (base64: string): number => {
   let padding = 0;
+
   if (base64.endsWith("==")) {
     padding = 2;
   } else if (base64.endsWith("=")) {
     padding = 1;
   }
+
   return Math.floor((base64.length * 3) / 4) - padding;
 };
 
@@ -90,6 +93,7 @@ const readOne = async (file: File, path: string): Promise<UploadRead> => {
   try {
     const bytes = new Uint8Array(await file.arrayBuffer());
     const text = bytes.byteLength <= TEXT_MAX_BYTES ? decodeText(bytes) : null;
+
     if (text === null) {
       return {
         base64: bytesToBase64(bytes),
@@ -98,6 +102,7 @@ const readOne = async (file: File, path: string): Promise<UploadRead> => {
         path,
       };
     }
+
     return { kind: "text", path, text };
   } catch (error) {
     return {
@@ -128,7 +133,9 @@ const readEntriesBatch = (
 ): Promise<FileSystemEntry[]> => {
   const { promise, reject, resolve } =
     Promise.withResolvers<FileSystemEntry[]>();
+
   reader.readEntries(resolve, reject);
+
   return promise;
 };
 
@@ -137,12 +144,15 @@ const readAllEntries = async (
   reader: FileSystemDirectoryReader
 ): Promise<FileSystemEntry[]> => {
   const entries: FileSystemEntry[] = [];
+
   for (;;) {
     // oxlint-disable-next-line no-await-in-loop -- the batches come from one stateful reader: each call advances it, so they cannot run in parallel.
     const batch = await readEntriesBatch(reader);
+
     if (batch.length === 0) {
       return entries;
     }
+
     entries.push(...batch);
   }
 };
@@ -151,6 +161,7 @@ const readAllEntries = async (
 const fileOf = (entry: FileSystemFileEntry): Promise<File> => {
   const { promise, reject, resolve } = Promise.withResolvers<File>();
   entry.file(resolve, reject);
+
   return promise;
 };
 
@@ -182,17 +193,22 @@ const readEntry = async (
   if (skip?.(entry, path)) {
     return [];
   }
+
   try {
     if (isFileEntry(entry)) {
       return [await readOne(await fileOf(entry), path)];
     }
+
     if (isDirectoryEntry(entry)) {
       const children = await readAllEntries(entry.createReader());
+
       const nested = await Promise.all(
         children.map((child) => readEntry(child, `${path}/${child.name}`, skip))
       );
+
       return nested.flat();
     }
+
     return [];
   } catch (error) {
     return [
@@ -212,10 +228,13 @@ const readItem = async (
   skip?: DropSkip
 ): Promise<UploadRead[]> => {
   const entry = item.webkitGetAsEntry?.() ?? null;
+
   if (entry !== null) {
     return readEntry(entry, entry.name, skip);
   }
+
   const file = item.getAsFile();
+
   return file === null ? [] : [await readOne(file, file.name)];
 };
 
@@ -231,6 +250,7 @@ export const readDroppedItems = async (
   const reads = await Promise.all(
     [...items].map((item) => readItem(item, skip))
   );
+
   return reads.flat();
 };
 
@@ -244,27 +264,34 @@ export const checkLimits = (
 ): string | null => {
   let total = 0;
   let files = 0;
+
   for (const read of reads) {
     if (read.kind === "error") {
       continue;
     }
+
     // A text write weighs what it will take as a source file: a character
     // count would undercount anything non-ASCII.
     const size =
       read.kind === "binary"
         ? read.bytes
         : UTF8_ENCODER.encode(read.text).byteLength;
+
     if (size > limits.maxFileBytes) {
       return `${read.path} is larger than ${formatBytes(limits.maxFileBytes)}.`;
     }
+
     total += size;
     files += 1;
   }
+
   if (total > limits.maxTotalBytes) {
     return `The upload is larger than ${formatBytes(limits.maxTotalBytes)} in total.`;
   }
+
   if (files > limits.maxFiles) {
     return `Up to ${limits.maxFiles} files per commit.`;
   }
+
   return null;
 };

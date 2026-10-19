@@ -27,6 +27,7 @@ export const DEFAULT_METRICS_HOURS = 24;
 /** `?r=` → an offered window in hours; anything else is the default. */
 export const toMetricsHours = (raw: string): number => {
   const asked = Number(raw);
+
   return (
     METRICS_RANGES.find((range) => range.hours === asked)?.hours ??
     DEFAULT_METRICS_HOURS
@@ -63,6 +64,7 @@ const sum = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
 const perReqAvg = (totals: number[], counts: number[]) =>
   totals.map((t, i) => {
     const n = counts[i] ?? 0;
+
     return n > 0 ? t / n : 0;
   });
 
@@ -78,6 +80,7 @@ const BarChart = ({
   values: number[];
 }) => {
   const width = values.length * 10;
+
   return (
     <svg
       viewBox={`0 0 ${width} 64`}
@@ -100,6 +103,7 @@ const BarChart = ({
         const height = Math.max(1.5, (v / max) * 62).toFixed(1);
         const y = (64 - Number(height)).toFixed(1);
         const shown = Number.isInteger(v) ? `${v}` : v.toFixed(1);
+
         return (
           <>
             <rect
@@ -171,17 +175,22 @@ const StatTiles = ({
   const totalErr = sum(errs);
   const totalLat = sum(lats);
   const totalCpu = sum(cpus);
+
   const errRate =
     totalReq > 0 ? `${((100 * totalErr) / totalReq).toFixed(1)}%` : "—";
+
   const avgLat = totalReq > 0 ? `${Math.round(totalLat / totalReq)} ms` : "—";
+
   const cpu =
     totalCpu >= 1000 ? `${(totalCpu / 1000).toFixed(1)} s` : `${totalCpu} ms`;
+
   const tiles: [string, string, string][] = [
     ["Requests", totalReq.toLocaleString(), period],
     ["Error rate", errRate, `${totalErr.toLocaleString()} errors`],
     ["Avg latency", avgLat, "per request"],
     ["CPU time", cpu, period],
   ];
+
   return (
     <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
       {tiles.map(([label, value, sub]) => (
@@ -204,16 +213,21 @@ const StatTiles = ({
  * share of that browser's own traffic (`macOS 60% · Windows 40%`). */
 const browserOsSubs = (devices: RunnerDevice[]) => {
   const perBrowser: Record<string, Record<string, number>> = {};
+
   for (const d of devices) {
     const os = d.os === "" ? "Unknown" : d.os;
     let byOs = perBrowser[d.browser];
+
     if (!byOs) {
       byOs = {};
       perBrowser[d.browser] = byOs;
     }
+
     byOs[os] = (byOs[os] ?? 0) + d.requests;
   }
+
   const subs: Record<string, string> = {};
+
   for (const [browser, oses] of Object.entries(perBrowser)) {
     const total = sum(Object.values(oses));
     subs[browser] = Object.entries(oses)
@@ -224,6 +238,7 @@ const browserOsSubs = (devices: RunnerDevice[]) => {
       )
       .join(" · ");
   }
+
   return subs;
 };
 
@@ -242,13 +257,16 @@ const BreakdownSection = ({
 }) => {
   const total = sum(entries.map(([, n]) => n));
   const grouped: Record<string, number> = {};
+
   for (const [label, n] of entries) {
     grouped[label] = (grouped[label] ?? 0) + n;
   }
+
   const ranked = Object.entries(grouped).toSorted((a, b) => b[1] - a[1]);
   // Analytics tables stay scannable: top 5 rows, overflow as a count.
   const shown = ranked.slice(0, 5);
   const extra = ranked.length - shown.length;
+
   return (
     <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
       <div class="card-body gap-4">
@@ -318,6 +336,7 @@ const MetricsDetailCards = ({
   spansError: string;
 }) => {
   const keys = hourKeys(hours);
+
   return (
     <>
       <StatTiles
@@ -546,10 +565,12 @@ const totalsByBucket = (
   pick: (row: RunnerMetric) => number
 ): number[] => {
   const totals = new Map<string, number>();
+
   for (const row of rows) {
     const key = row.bucketTs.slice(0, 13);
     totals.set(key, (totals.get(key) ?? 0) + pick(row));
   }
+
   return keys.map((key) => totals.get(key) ?? 0);
 };
 
@@ -598,30 +619,41 @@ export const MetricsCard = ({
     metricsUrl(appId, hours),
     decodeMetrics
   );
+
   // Read the frame (or its stored snapshot) directly: no copy into atoms,
   // so a revisit paints the last numbers in the very first render.
   const rows = (): MetricsFrame["metrics"] => feed.latest()?.metrics ?? [];
   const spans = (): MetricsFrame["spans"] => feed.latest()?.spans ?? [];
+
   const devices = (): NonNullable<MetricsFrame["devices"]> =>
     feed.latest()?.devices ?? [];
+
   const paths = (): NonNullable<MetricsFrame["paths"]> =>
     feed.latest()?.paths ?? [];
+
   const refs = (): NonNullable<MetricsFrame["refs"]> =>
     feed.latest()?.refs ?? [];
+
   const spansError = atom("");
+
   const loaded = (): boolean =>
     feed.latest() !== undefined || feed.status() === "open";
+
   const loadError = (): string =>
     feed.status() === "retrying" ? "Usage stream disconnected — retrying…" : "";
+
   const pickers = {
     cpuMs: (r: RunnerMetric) => r.cpuMs,
     errors: (r: RunnerMetric) => r.errors,
     latency: (r: RunnerMetric) => r.latencyMs,
     requests: (r: RunnerMetric) => r.requests,
   };
+
   const keys = hourKeys(hours);
+
   const totalByHour = (kind: keyof typeof pickers) =>
     totalsByBucket(rows(), keys, pickers[kind]);
+
   const reqs = totalByHour("requests");
   const cpus = totalByHour("cpuMs");
   const errs = totalByHour("errors");
@@ -630,6 +662,7 @@ export const MetricsCard = ({
   const totalErr = rows().reduce((a, r) => a + r.errors, 0);
   const totalCpu = sum(cpus);
   const totalLat = rows().reduce((a, r) => a + r.latencyMs, 0);
+
   return (
     <>
       {detail ? (

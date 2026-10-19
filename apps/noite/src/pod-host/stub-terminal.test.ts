@@ -6,6 +6,7 @@ import { StubFitAddon, StubTerminal, stubTerminalClass } from "./stub-terminal";
 /** What one write was handed, and what the sink saw, in order. */
 const tap = (): { sink: string[]; terminal: StubTerminal } => {
   const sink: string[] = [];
+
   return {
     sink,
     terminal: new StubTerminal({ theme: { background: "#000" } }, (text) => {
@@ -37,9 +38,11 @@ describe("the terminal tap", () => {
   test("hands its keystrokes to whatever the SDK attached", () => {
     const { terminal } = tap();
     const typed: string[] = [];
+
     const attached = terminal.onData((data) => {
       typed.push(data);
     });
+
     terminal.feed("npm run dev\r");
     expect(typed).toEqual(["npm run dev\r"]);
     attached.dispose();
@@ -50,9 +53,11 @@ describe("the terminal tap", () => {
   test("tells the SDK the grid changed, once per listener", () => {
     const { terminal } = tap();
     let resizes = 0;
+
     const attached = terminal.onResize(() => {
       resizes += 1;
     });
+
     terminal.resize(120, 40);
     expect([terminal.cols, terminal.rows]).toEqual([120, 40]);
     expect(resizes).toBe(1);
@@ -84,9 +89,11 @@ describe("the terminal tap", () => {
 
   test("the class the SDK is handed writes to that session's sink", () => {
     const seen: string[] = [];
+
     const Terminal = stubTerminalClass((text) => {
       seen.push(text);
     });
+
     const instance = new Terminal({});
     instance.write("prompt$ ");
     expect(seen).toEqual(["prompt$ "]);

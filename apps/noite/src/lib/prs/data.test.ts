@@ -49,6 +49,7 @@ describe("buildTimeline", () => {
         review({ createdAt: "2026-01-02T00:00:00Z", id: "r2" }),
       ]
     );
+
     expect(timeline.map((entry) => entry.id)).toEqual(["c1", "r2", "c3", "r4"]);
     expect(timeline.map((entry) => entry.kind)).toEqual([
       "comment",
@@ -65,6 +66,7 @@ describe("buildTimeline", () => {
 
   test("equal timestamps tie-break by id, deterministically", () => {
     const same = "2026-05-05T12:00:00Z";
+
     const timeline = buildTimeline(
       [
         comment({ createdAt: same, id: "b" }),
@@ -72,6 +74,7 @@ describe("buildTimeline", () => {
       ],
       [review({ createdAt: same, id: "c" })]
     );
+
     expect(timeline.map((entry) => entry.id)).toEqual(["a", "b", "c"]);
   });
 });
@@ -95,6 +98,7 @@ describe("line anchors", () => {
       path: "a.ts",
       side: "new",
     });
+
     expect(attachesTo(anchored, "a.ts", 4, "new")).toBe(true);
     expect(attachesTo(anchored, "a.ts", 4, "old")).toBe(false);
     expect(attachesTo(anchored, "a.ts", 5, "new")).toBe(false);
@@ -124,6 +128,7 @@ describe("groupLineComments", () => {
       }),
       comment({ id: "t3", line: 1, path: "b.ts", side: "old" }),
     ];
+
     const groups = groupLineComments(comments);
     expect([...groups.keys()].toSorted()).toEqual(["a.ts", "b.ts"]);
     expect(groups.get("a.ts")?.map((thread) => thread.anchor.line)).toEqual([
@@ -143,6 +148,7 @@ describe("groupLineComments", () => {
     const comments = [
       comment({ id: "one", line: 1, path: "a.ts", side: "old" }),
     ];
+
     expect(threadsForPath(comments, "a.ts")).toHaveLength(1);
     expect(threadsForPath(comments, "other.ts")).toEqual([]);
   });
@@ -181,6 +187,7 @@ describe("splitPatchFiles", () => {
       "@@ -1 +0,0 @@",
       "-gone",
     ].join("\n");
+
     expect(splitPatchFiles(deleted)[0]?.path).toBe("gone.ts");
   });
 
@@ -205,6 +212,7 @@ describe("latestReviews", () => {
         state: "changes_requested",
       }),
     ];
+
     const latest = latestReviews(reviews);
     expect(latest.map((entry) => entry.id).toSorted()).toEqual(["r3", "r4"]);
     expect(latest.find((entry) => entry.reviewerId === "a")?.state).toBe(

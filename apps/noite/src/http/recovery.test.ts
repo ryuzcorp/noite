@@ -67,19 +67,23 @@ describe("POST /internal/recovery", () => {
     const response = await mint({});
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
+
     const minted = (await response.json()) as {
       code: string;
       email: string;
       ok: boolean;
     };
+
     expect(minted.email).toBe("owner@example.com");
     expect(minted.code).toMatch(/^\d{6}$/u);
 
     // SAFETY: authFromEnv takes the full KitEnv; the test env carries the auth keys it reads.
     const auth = authFromEnv(ENV as unknown as KitEnv, ENV.BETTER_AUTH_URL);
+
     const signedIn = await auth.api.signInEmailOTP({
       body: { email: minted.email, otp: minted.code },
     });
+
     expect(signedIn.user.email).toBe("owner@example.com");
   });
 
@@ -115,6 +119,7 @@ describe("POST /internal/recovery", () => {
     resetRateLimits();
     const env = { ...ENV, NOITE_RATE_LIMIT_RPM: "2" };
     const statuses: (number | undefined)[] = [];
+
     for (let i = 0; i < 4; i += 1) {
       // oxlint-disable-next-line eslint/no-await-in-loop -- the limiter counts in order
       const response = await rateLimitMiddleware(
@@ -127,8 +132,10 @@ describe("POST /internal/recovery", () => {
         ),
         () => Promise.resolve()
       );
+
       statuses.push(response?.status);
     }
+
     expect(statuses).toEqual([undefined, undefined, 429, 429]);
   });
 });
@@ -145,14 +152,17 @@ describe("emailed codes", () => {
     // SAFETY: authentication only calls fetch(url, init) for the webhook post.
     globalThis.fetch = ((url: string, init?: RequestInit) => {
       posted.push({ body: String(init?.body), url });
+
       return Promise.resolve(new Response("ok"));
     }) as unknown as typeof fetch;
+
     const env = {
       ...ENV,
       BASE_DOMAIN: "noite.example",
       BETTER_AUTH_URL: "https://app.noite.example",
       NOITE_EMAIL_WEBHOOK_URL: "https://hooks.example/otp",
     };
+
     // SAFETY: authFromEnv takes the full KitEnv; the test env carries the auth + webhook keys it reads.
     const auth = authFromEnv(env as unknown as KitEnv, env.BETTER_AUTH_URL);
     await auth.api.sendVerificationOTP({
@@ -168,20 +178,24 @@ describe("emailed codes", () => {
 
   test("are never written to the console on a real domain with no webhook", async () => {
     addUser("owner", "admin");
+
     const env = {
       ...ENV,
       BASE_DOMAIN: "noite.example",
       BETTER_AUTH_URL: "https://app.noite.example",
     };
+
     const logged: string[] = [];
     const realLog = console.log;
     const realError = console.error;
     console.log = (...args: unknown[]) => {
       logged.push(`log ${args.join(" ")}`);
     };
+
     console.error = (...args: unknown[]) => {
       logged.push(`error ${args.join(" ")}`);
     };
+
     try {
       // SAFETY: authFromEnv takes the full KitEnv; the test env carries the auth keys it reads.
       const auth = authFromEnv(env as unknown as KitEnv, env.BETTER_AUTH_URL);
@@ -194,6 +208,7 @@ describe("emailed codes", () => {
       console.log = realLog;
       console.error = realError;
     }
+
     expect(logged.some((line) => line.startsWith("log "))).toBe(false);
     expect(logged.join("\n")).toContain("NOITE_EMAIL_WEBHOOK_URL");
   });

@@ -4,9 +4,11 @@
  * only the control UI calls must also require the header to be present. */
 export const originAllowed = (request: Request, env: KitEnv): boolean => {
   const origin = request.headers.get("origin");
+
   if (!origin) {
     return true;
   }
+
   try {
     if (origin === new URL(request.url).origin) {
       return true;
@@ -14,9 +16,11 @@ export const originAllowed = (request: Request, env: KitEnv): boolean => {
   } catch {
     return false;
   }
+
   if (!env.BETTER_AUTH_URL) {
     return false;
   }
+
   try {
     return origin === new URL(env.BETTER_AUTH_URL).origin;
   } catch {

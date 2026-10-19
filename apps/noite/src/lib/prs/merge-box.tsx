@@ -34,9 +34,11 @@ const MERGE_STATES = [
 const prAction = (appId: string, number: number) => {
   const busy = atom(false);
   const notice = atom("");
+
   const run = async (work: () => Promise<void>): Promise<void> => {
     busy.set(true);
     notice.set("");
+
     try {
       await work();
       invalidatePr(appId, number);
@@ -46,6 +48,7 @@ const prAction = (appId: string, number: number) => {
       busy.set(false);
     }
   };
+
   return { busy, notice, run };
 };
 
@@ -53,14 +56,18 @@ const prAction = (appId: string, number: number) => {
  * merge (never a bare "0/0"), then what it means. */
 export const PrMergeState = ({ detail }: { detail: PrDetail }) => {
   const info = MERGE_STATES.find((entry) => entry.id === detail.mergeState);
+
   const gated =
     detail.mergeState === "mergeable" ||
     detail.mergeState === "blocked_approvals";
+
   const approvals =
     gated && detail.requiredApprovals > 0
       ? `${detail.approvals} of ${detail.requiredApprovals} approvals`
       : null;
+
   const label = info?.label ?? detail.mergeState;
+
   return (
     <span
       class={`badge badge-sm ${info?.badge ?? "badge-ghost"}`}
@@ -90,35 +97,43 @@ const MergeDropdown = ({
   const box = atom.lazy(() => newLiveRef<HTMLElement>())();
   const trigger = atom.lazy(() => newLiveRef<HTMLButtonElement>())();
   const canMerge = detail.mergeState === "mergeable";
+
   const reason = MERGE_STATES.find(
     (entry) => entry.id === detail.mergeState
   )?.label;
+
   // The head branch's own environment, when it has one: deleting the branch
   // deletes the environment and everything it stored.
   const environment = (environments(appId).data() ?? []).find(
     (row) => row.gitRef === `refs/heads/${pullRequest.head}`
   );
+
   const close = (): void => {
     open.set(false);
     liveEl(trigger)?.focus();
   };
+
   // Clicking outside the form closes it, the way the branch picker's dropdown
   // does (its own focus handling is native).
   const onPointerDown = (event: PointerEvent): void => {
     const el = liveEl(box);
+
     if (el !== null && !event.composedPath().includes(el)) {
       open.set(false);
     }
   };
+
   watch(open, (isOpen, { onCleanup }) => {
     if (!isOpen) {
       return;
     }
+
     document.addEventListener("pointerdown", onPointerDown, true);
     onCleanup(() => {
       document.removeEventListener("pointerdown", onPointerDown, true);
     });
   });
+
   return (
     <div
       class="relative"
@@ -219,14 +234,19 @@ const MergeDropdown = ({
                     deleteBranch: deleteBranch(),
                     number: pullRequest.number,
                   };
+
                   const squashTitle = title().trim();
+
                   if (squashTitle !== "") {
                     args.title = squashTitle;
                   }
+
                   const squashMessage = message().trim();
+
                   if (squashMessage !== "") {
                     args.message = squashMessage;
                   }
+
                   await api<{ ok: true }>("/api/prs/prsMerge", args);
                   open.set(false);
                 });
@@ -258,12 +278,16 @@ export const PrHeaderActions = ({
   const { busy, notice, run } = prAction(appId, pullRequest.number);
   const isAuthor = viewerId !== "" && pullRequest.authorId === viewerId;
   const canPush = role === "push" || role === "admin";
+
   const canClose =
     canPush && (isAuthor || role === "admin") && pullRequest.state !== "merged";
+
   const canMerge = canPush && pullRequest.state === "open";
+
   if (!(canClose || canMerge)) {
     return null;
   }
+
   return (
     <div class="flex shrink-0 flex-col items-end gap-1">
       <div class="flex items-center gap-2">
@@ -300,10 +324,13 @@ export const PrHeaderActions = ({
 const EndedNotice = ({ detail }: { detail: PrDetail }) => {
   const { pullRequest } = detail;
   let message = "This pull request is closed.";
+
   if (pullRequest.mergeSha !== null) {
     message = `Merged as ${pullRequest.mergeSha}.`;
   }
+
   const deleted = pullRequest.mergeSha !== null && detail.compare === null;
+
   return (
     <p class="m-0 text-xs opacity-70">
       {message}
@@ -392,10 +419,12 @@ export const PrReviewBox = ({
   const { pullRequest } = detail;
   const { busy, notice, run } = prAction(appId, pullRequest.number);
   const isAuthor = viewerId !== "" && pullRequest.authorId === viewerId;
+
   const canReview =
     (role === "push" || role === "admin") &&
     !isAuthor &&
     pullRequest.state === "open";
+
   const conflicts = detail.compare?.conflicts ?? [];
   const ended = pullRequest.state !== "open";
   const latest = latestReviews(detail.reviews);
@@ -406,9 +435,11 @@ export const PrReviewBox = ({
   const requested = myLatest?.state === "changes_requested";
   const approvedStill = approved && !myLatest?.dismissedAt;
   const requestedStill = requested && !myLatest?.dismissedAt;
+
   if (!(canReview || conflicts.length > 0 || ended)) {
     return null;
   }
+
   const review = (state: "approved" | "changes_requested") => {
     void run(async () => {
       await api<{ ok: true }>("/api/prs/prsReview", {
@@ -418,6 +449,7 @@ export const PrReviewBox = ({
       });
     });
   };
+
   return (
     <section class="border-base-300 flex flex-col gap-3 rounded-lg border p-3">
       {ended ? <EndedNotice detail={detail} /> : null}

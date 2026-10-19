@@ -19,10 +19,12 @@ setup("register e2e account", async ({ page }) => {
   await page.getByRole("button", { name: "Create passkey" }).click();
   await expect(async () => {
     const res = await page.request.get("/api/auth/get-session");
+
     // SAFETY: better-auth get-session answers { user } on success (verified ok above).
     const body = (await res.json()) as {
       user?: { email?: string };
     };
+
     expect(body.user?.email).toBe(E2E_EMAIL);
   }).toPass({ timeout: 30_000 });
 

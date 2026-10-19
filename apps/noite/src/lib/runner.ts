@@ -42,79 +42,148 @@ import type { TreeResponse as RunnerTree } from "./runner-types/TreeResponse";
 /** Server-side client for the Rust runner. Browser never sees RUNNER_TOKEN. */
 
 export type { App as RunnerApp } from "./runner-types/App";
+
 export type { AppDeviceStat as RunnerDevice } from "./runner-types/AppDeviceStat";
+
 export type { AppDomain as RunnerDomain } from "./runner-types/AppDomain";
+
 export type { AppEnv as RunnerEnv } from "./runner-types/AppEnv";
+
 export type { AppEvent as RunnerEvent } from "./runner-types/AppEvent";
+
 export type { AppInsight as RunnerInsight } from "./runner-types/AppInsight";
+
 export type { AppMetric as RunnerMetric } from "./runner-types/AppMetric";
+
 export type { AppPathStat as RunnerPath } from "./runner-types/AppPathStat";
+
 export type { AppRefStat as RunnerRef } from "./runner-types/AppRefStat";
+
 export type { AppSpanStat as RunnerSpan } from "./runner-types/AppSpanStat";
+
 export type { AppUserProps as RunnerUserProps } from "./runner-types/AppUserProps";
+
 export type { BlobResponse as RunnerBlob } from "./runner-types/BlobResponse";
+
 export type { D1Column } from "./runner-types/D1Column";
+
 export type { D1DeleteRowsBody } from "./runner-types/D1DeleteRowsBody";
+
 export type { D1Filter } from "./runner-types/D1Filter";
+
 export type { D1FilterOp } from "./runner-types/D1FilterOp";
+
 export type { D1ForeignKey } from "./runner-types/D1ForeignKey";
+
 export type { D1Index } from "./runner-types/D1Index";
+
 export type { D1Rows } from "./runner-types/D1Rows";
+
 export type { D1Sort } from "./runner-types/D1Sort";
+
 export type { D1TableSchemaRaw } from "./runner-types/D1TableSchemaRaw";
+
 export type { D1WriteBody } from "./runner-types/D1WriteBody";
+
 export type { D1WriteOp } from "./runner-types/D1WriteOp";
+
 export type { Deploy as RunnerDeploy } from "./runner-types/Deploy";
+
 export type { DoInstance } from "./runner-types/DoInstance";
+
 export type { DoPreview } from "./runner-types/DoPreview";
+
 export type { EnvGrant } from "./runner-types/EnvGrant";
+
 export type { Environment as RunnerEnvironment } from "./runner-types/Environment";
+
 export type { EnvironmentKind } from "./runner-types/EnvironmentKind";
+
 export type { ErrorEventView as RunnerErrorEvent } from "./runner-types/ErrorEventView";
+
 export type { ErrorIssueDetail as RunnerErrorDetail } from "./runner-types/ErrorIssueDetail";
+
 export type { ErrorIssueList as RunnerErrorList } from "./runner-types/ErrorIssueList";
+
 export type { ErrorIssueView as RunnerErrorIssue } from "./runner-types/ErrorIssueView";
+
 export type { Frame as RunnerErrorFrame } from "./runner-types/Frame";
+
 // The forge wire types, generated from host::forge and host::git_identity.
 export type { Actor } from "./runner-types/Actor";
+
 export type { BranchRules } from "./runner-types/BranchRules";
+
 export type { GitBranch } from "./runner-types/GitBranch";
+
 export type { GitCommitDetail } from "./runner-types/GitCommitDetail";
+
 export type { GitCommitSummary } from "./runner-types/GitCommitSummary";
+
 export type { GitCompare } from "./runner-types/GitCompare";
+
 export type { GitFileStat } from "./runner-types/GitFileStat";
+
 export type { GitFileStatus } from "./runner-types/GitFileStatus";
+
 export type { GitLog } from "./runner-types/GitLog";
+
 export type { GitRefs } from "./runner-types/GitRefs";
+
 export type { GitRemote as RunnerGitRemote } from "./runner-types/GitRemote";
+
 export type { LimitsView as RunnerLimits } from "./runner-types/LimitsView";
+
 export type { PrComment } from "./runner-types/PrComment";
+
 export type { PrCounts } from "./runner-types/PrCounts";
+
 export type { PrDetail } from "./runner-types/PrDetail";
+
 export type { PrList } from "./runner-types/PrList";
+
 export type { PreviewResult } from "./runner-types/PreviewResult";
+
 export type { PrReview } from "./runner-types/PrReview";
+
 export type { PrSummary } from "./runner-types/PrSummary";
+
 export type { R2File } from "./runner-types/R2File";
+
 export type { R2Folder } from "./runner-types/R2Folder";
+
 export type { R2Object } from "./runner-types/R2Object";
+
 export type { R2Preview } from "./runner-types/R2Preview";
+
 export type { SourceBundle as RunnerSourceBundle } from "./runner-types/SourceBundle";
+
 export type { SourceCommitBody } from "./runner-types/SourceCommitBody";
+
 export type { SourceCommitFile } from "./runner-types/SourceCommitFile";
+
 export type { SourceCommitMove } from "./runner-types/SourceCommitMove";
+
 export type { SourceFile } from "./runner-types/SourceFile";
+
 export type { StorageItem } from "./runner-types/StorageItem";
+
 export type { TelemetryEvent as RunnerTelemetryEvent } from "./runner-types/TelemetryEvent";
+
 export type { TelemetryStatus as RunnerTelemetryStatus } from "./runner-types/TelemetryStatus";
+
 export type { TreeEntry } from "./runner-types/TreeEntry";
+
 export type { TreeResponse as RunnerTree } from "./runner-types/TreeResponse";
+
 const readEnv = (): KitEnv => {
   hydrateControlEnv();
+
   const merged = {
     ...controlEnv,
     ...(typeof process === "undefined" ? undefined : process.env),
   };
+
   // SAFETY: merged carries the union of controlEnv defaults (stamped per request by the middleware) and process.env — all keyed by the same env names KitEnv declares; unset string keys are left undefined which callers already tolerate.
   return merged as KitEnv;
 };
@@ -134,6 +203,7 @@ const runnerBase = () =>
 export const stampRunnerEnv = (env: KitEnv): void => {
   for (const key of ["RUNNER_TOKEN", "RUNNER_URL"] as const) {
     const value = env[key];
+
     if (value) {
       controlEnv[key] = value;
     }
@@ -142,9 +212,11 @@ export const stampRunnerEnv = (env: KitEnv): void => {
 
 const runnerToken = () => {
   const token = readEnv().RUNNER_TOKEN ?? "";
+
   if (!token) {
     throw new Error("RUNNER_TOKEN is not configured");
   }
+
   return token;
 };
 
@@ -155,6 +227,7 @@ const runnerToken = () => {
  * the slow queries (metrics/spans read Parquet) while still failing well
  * before a browser gives up — a 10s bound surfaced as a mystery hang. */
 const RUNNER_TIMEOUT_MS = 5000;
+
 /** Log anything slower than this, with the path and the base URL: when the
  * deployed worker is the only thing we can observe, this is what attributes
  * an intermittent stall instead of guessing. */
@@ -166,34 +239,43 @@ export const runnerFetch = async <T = unknown>(
 ): Promise<T> => {
   const headers = new Headers(init.headers);
   headers.set("authorization", `Bearer ${runnerToken()}`);
+
   if (init.body && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
   }
+
   const base = runnerBase();
   const started = Date.now();
+
   const res = await fetch(`${base}${path}`, {
     ...init,
     headers,
     signal: init.signal ?? AbortSignal.timeout(RUNNER_TIMEOUT_MS),
   });
+
   const elapsed = Date.now() - started;
+
   if (elapsed >= RUNNER_SLOW_MS) {
     console.warn(
       `[runner] slow ${init.method ?? "GET"} ${path} ${elapsed}ms via ${base}`
     );
   }
+
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     throw new Error(
       `runner ${init.method ?? "GET"} ${path}: ${res.status} ${text}`
     );
   }
+
   if (res.status === 204) {
     // SAFETY: 204 (no content) is only used by void/empty responses; callers type those `T`s as `void` or discard the value.
     // oxlint-disable-next-line typescript/no-invalid-void-type
     return undefined as T;
   }
+
   const payload = await res.json();
+
   // SAFETY: the runner returns the response object directly (no `{ body }` envelope); the JSON already matches the caller's requested `T`.
   return payload as T;
 };
@@ -213,15 +295,18 @@ export const runnerRpc = async <T = unknown>(
   params: Record<string, unknown>
 ): Promise<T> => {
   rpcId += 1;
+
   const payload = await runnerFetch<JsonRpcEnvelope<T>>("/rpc", {
     body: JSON.stringify({ id: rpcId, jsonrpc: "2.0", method, params }),
     method: "POST",
   });
+
   if (payload.error) {
     throw new Error(
       `runner rpc ${method}: ${payload.error.code} ${payload.error.message}`
     );
   }
+
   // SAFETY: JSON-RPC success responses always carry `result`; error responses throw above.
   return payload.result as T;
 };
@@ -238,27 +323,34 @@ export const runnerRpcBatch = async <T = unknown>(
   calls: RpcCall[]
 ): Promise<T[]> => {
   const base = rpcId;
+
   const body = calls.map((call, i) => ({
     id: base + i + 1,
     jsonrpc: "2.0",
     method: call.method,
     params: call.params,
   }));
+
   rpcId += calls.length;
+
   const payload = await runnerFetch<JsonRpcEnvelope<T>[]>("/rpc", {
     body: JSON.stringify(body),
     method: "POST",
   });
+
   return body.map((call) => {
     const res = payload.find((p) => p.id === call.id);
+
     if (!res) {
       throw new Error(`runner rpc batch: missing response for ${call.method}`);
     }
+
     if (res.error) {
       throw new Error(
         `runner rpc ${call.method}: ${res.error.code} ${res.error.message}`
       );
     }
+
     // SAFETY: same envelope contract as runnerRpc; errors throw above.
     return res.result as T;
   });
@@ -278,6 +370,7 @@ export interface RunnerAdminStats {
 export const runnerControlFleet = async (): Promise<boolean> => {
   try {
     const stats = await runnerFetch<RunnerAdminStats>("/v1/admin/stats");
+
     return stats.control_fleet;
   } catch {
     return true;

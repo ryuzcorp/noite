@@ -38,6 +38,7 @@ const ViewTabs = ({ view }: { view: SearchParam<DetailView> }) => {
   const onKeyDown = (event: KeyboardEvent): void => {
     const index = VIEWS.indexOf(view());
     let next = -1;
+
     if (event.key === "ArrowRight") {
       next = (index + 1) % VIEWS.length;
     } else if (event.key === "ArrowLeft") {
@@ -47,14 +48,17 @@ const ViewTabs = ({ view }: { view: SearchParam<DetailView> }) => {
     } else if (event.key === "End") {
       next = VIEWS.length - 1;
     }
+
     if (next === -1) {
       return;
     }
+
     event.preventDefault();
     const target = VIEWS[next];
     view.set(target);
     document.querySelector<HTMLElement>(`#pr-tab-${target}`)?.focus();
   };
+
   return (
     <div role="tablist" class="tabs tabs-border" onkeydown={onKeyDown}>
       {VIEWS.map((entry) => (
@@ -88,6 +92,7 @@ const PrCommitsTab = ({
   detail: PrDetail;
 }) => {
   const { compare } = detail;
+
   if (compare === null) {
     return (
       <p class="m-0 text-sm opacity-70">
@@ -95,6 +100,7 @@ const PrCommitsTab = ({
       </p>
     );
   }
+
   return (
     <CommitList
       appId={appId}
@@ -111,10 +117,13 @@ const PrEnvironment = ({ appId, head }: { appId: string; head: string }) => {
   const environment = (environments(appId).data() ?? []).find(
     (row) => row.gitRef === `refs/heads/${head}`
   );
+
   if (!environment) {
     return null;
   }
+
   const subdomain = appDetail(appId).data()?.app.subdomain ?? "";
+
   return (
     <div class="border-base-300 bg-base-100 dark:bg-base-200 flex flex-wrap items-center gap-2 rounded-lg border p-3 text-sm">
       <span class="opacity-70">Environment</span>
@@ -152,6 +161,7 @@ export const PrDetailView = ({
     default: "conversation",
     parse: toView,
   });
+
   const res = prDetail(appId, number);
   const detail = res.data();
   const error = res.error();
@@ -159,6 +169,7 @@ export const PrDetailView = ({
   // `myRole` comes from the cached app detail; the viewer action covers a
   // cold cache and the standalone page.
   const role = appDetail(appId).data()?.myRole ?? viewer?.role;
+
   const names = prNames(
     appId,
     detail === undefined
@@ -180,13 +191,16 @@ export const PrDetailView = ({
   }
 
   const { pullRequest } = detail;
+
   const requesting = latestReviews(detail.reviews).filter(
     (review) =>
       review.state === "changes_requested" && review.dismissedAt === null
   );
+
   const compareHref = `/apps/${appId}/source/compare?base=${encodeURIComponent(
     pullRequest.base
   )}&head=${encodeURIComponent(pullRequest.head)}`;
+
   return (
     <div class="flex flex-col gap-4">
       <header class="flex flex-col gap-2">

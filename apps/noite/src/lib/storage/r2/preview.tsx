@@ -20,12 +20,15 @@ export const R2TextPreview = ({
   const res = r2File(appId, bucket, object.key);
   const data = res.data();
   const loadError = res.error();
+
   if (loadError && data === undefined) {
     return <p class="text-error m-0 text-sm">{errorMessage(loadError)}</p>;
   }
+
   if (!data) {
     return <span class="skeleton h-24 w-full" />;
   }
+
   if (data.text === null) {
     return (
       <p class="m-0 text-sm opacity-60">
@@ -33,10 +36,13 @@ export const R2TextPreview = ({
       </p>
     );
   }
+
   const isJson =
     (object.contentType ?? "").includes("json") ||
     (data.contentType ?? "").includes("json");
+
   const body = isJson ? prettyJson(data.text) : data.text;
+
   return (
     <div class="flex flex-col gap-1">
       <pre class="bg-base-200 dark:bg-base-300/50 m-0 max-h-64 overflow-auto rounded-lg p-2 text-xs whitespace-pre-wrap">

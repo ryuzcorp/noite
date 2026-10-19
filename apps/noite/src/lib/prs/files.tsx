@@ -14,6 +14,7 @@ import type { ComposerAnchor } from "./widgets";
 /** A file's diff over the large-diff thresholds, collapsed until asked for. */
 const LargeDiff = ({ patch }: { patch: string }) => {
   const shown = atom(false);
+
   return (
     <div class="border-base-300 flex flex-col items-start gap-2 rounded-lg border p-3">
       {shown() ? (
@@ -49,6 +50,7 @@ const ReplyBox = ({
   thread: LineThread;
 }) => {
   const replying = atom(false);
+
   if (!replying()) {
     return (
       <button
@@ -62,6 +64,7 @@ const ReplyBox = ({
       </button>
     );
   }
+
   return (
     <div class="flex flex-col gap-2">
       <CommentComposer
@@ -149,6 +152,7 @@ export const PrFilesTab = ({
 }) => {
   const active = atom<ComposerAnchor | null>(null);
   const { compare } = detail;
+
   if (compare === null) {
     return (
       <p class="m-0 text-sm opacity-70">
@@ -156,7 +160,9 @@ export const PrFilesTab = ({
       </p>
     );
   }
+
   const files = splitPatchFiles(compare.patch);
+
   if (files.length === 0) {
     return (
       <p class="m-0 text-sm opacity-70">
@@ -164,6 +170,7 @@ export const PrFilesTab = ({
       </p>
     );
   }
+
   const threads = groupLineComments(detail.comments);
   const canComment = role === "push" || role === "admin";
 
@@ -178,17 +185,20 @@ export const PrFilesTab = ({
         const stat = compare.files.find((entry) => entry.path === file.path);
         const touchesFile = active()?.path === file.path;
         const composer = touchesFile ? active() : null;
+
         const fileThreads = (threads.get(file.path) ?? [])
           .map((thread) => ({
             anchor: thread.anchor,
             comments: thread.comments.filter((comment) => !comment.outdated),
           }))
           .filter((thread) => thread.comments.length > 0);
+
         const large = isLargeDiff(
           file.patch,
           stat?.additions ?? null,
           stat?.deletions ?? null
         );
+
         return (
           <section key={file.path} class="flex flex-col gap-2">
             <header class="flex flex-wrap items-center gap-2">
@@ -256,6 +266,7 @@ export const PrFilesTab = ({
                       const line = Math.trunc(
                         Number(event.currentTarget.value)
                       );
+
                       if (Number.isSafeInteger(line) && line > 0) {
                         active.set({ ...composer, line });
                       }
@@ -267,6 +278,7 @@ export const PrFilesTab = ({
                     value={composer.side}
                     onchange={(event) => {
                       const side = event.currentTarget.value;
+
                       if (side === "old" || side === "new") {
                         active.set({ ...composer, side });
                       }

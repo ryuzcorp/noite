@@ -67,9 +67,11 @@ const nameError = (
   if (leaf === "" || leaf.includes("/")) {
     return null;
   }
+
   if (leaf === "." || leaf === "..") {
     return `"${leaf}" is not a usable name.`;
   }
+
   return change?.kind === "deleted" ? `"${leaf}" already exists.` : null;
 };
 
@@ -85,8 +87,10 @@ export const createTreeNaming = (host: TreeNamingHost): TreeNaming => {
     for (let n = 1; ; n += 1) {
       const leaf = n === 1 ? stem : `${stem}-${n}`;
       const path = `${dir}${leaf}`;
+
       const taken =
         host.hasRow(path) || host.changeAt(path)?.kind === "deleted";
+
       if (!taken) {
         return leaf;
       }
@@ -105,7 +109,9 @@ export const createTreeNaming = (host: TreeNamingHost): TreeNaming => {
       if (pendingAdd !== add) {
         return;
       }
+
       pendingAdd = null;
+
       if (host.hasRow(add.path)) {
         host.landAdd(add);
       }
@@ -120,17 +126,22 @@ export const createTreeNaming = (host: TreeNamingHost): TreeNaming => {
     if (!host.editable() || !host.treeReady()) {
       return;
     }
+
     const prefix = dir === "" ? "" : `${dir}/`;
     const stem = isFolder ? "new-folder" : "untitled";
     const path = `${prefix}${uniqueLeaf(prefix, stem)}`;
     const row = isFolder ? `${path}/` : path;
+
     try {
       host.rowAdd(row);
     } catch (error) {
       host.toaster.notify(errorMessage(error));
+
       return;
     }
+
     pendingAdd = { isFolder, path };
+
     if (!host.startRenaming(path)) {
       pendingAdd = null;
       host.dropRow(row);
@@ -143,23 +154,30 @@ export const createTreeNaming = (host: TreeNamingHost): TreeNaming => {
    * it. A name pierre takes but reports as unchanged is settled here. */
   const guardNameKey = (event: KeyboardEvent) => {
     const add = pendingAdd;
+
     if (event.key !== "Enter" || add === null) {
       return;
     }
+
     const input = renameInput(event);
+
     if (input === null) {
       return;
     }
+
     const name = input.value.trim();
     const dir = parentDir(add.path);
     const path = dir === "" ? name : `${dir}/${name}`;
     const error = nameError(name, host.changeAt(path));
+
     if (error !== null) {
       event.preventDefault();
       event.stopPropagation();
       host.toaster.notify(error);
+
       return;
     }
+
     if (name === add.path.slice(add.path.lastIndexOf("/") + 1)) {
       settleAdd(add);
     }
@@ -170,9 +188,11 @@ export const createTreeNaming = (host: TreeNamingHost): TreeNaming => {
    * untouched one lands here. */
   const onNameBlur = (event: FocusEvent) => {
     const add = pendingAdd;
+
     if (add === null || renameInput(event) === null) {
       return;
     }
+
     settleAdd(add);
   };
 
@@ -182,9 +202,11 @@ export const createTreeNaming = (host: TreeNamingHost): TreeNaming => {
   const nameRefused = (error: string) => {
     const add = pendingAdd;
     pendingAdd = null;
+
     if (add !== null) {
       host.dropRow(add.isFolder ? `${add.path}/` : add.path);
     }
+
     host.toaster.notify(error);
   };
 
@@ -193,17 +215,22 @@ export const createTreeNaming = (host: TreeNamingHost): TreeNaming => {
   const finishAdd = (event: TreeRenameEvent) => {
     const add = pendingAdd;
     pendingAdd = null;
+
     // Anything but the placeholder this browser parked is a row the checkout
     // or the browser already held: pierre renamed it, so it is a move.
     if (add === null || event.sourcePath !== add.path) {
       host.onRenamed(event);
+
       return;
     }
+
     const dest = withoutSlash(event.destinationPath);
+
     const error = nameError(
       dest.slice(dest.lastIndexOf("/") + 1),
       host.changeAt(dest)
     );
+
     if (error !== null) {
       // pierre moves the row after this callback returns: drop it then.
       const row = event.isFolder ? `${dest}/` : dest;
@@ -211,8 +238,10 @@ export const createTreeNaming = (host: TreeNamingHost): TreeNaming => {
         host.dropRow(row);
       });
       host.toaster.notify(error);
+
       return;
     }
+
     host.landAdd({ isFolder: event.isFolder, path: dest });
   };
 

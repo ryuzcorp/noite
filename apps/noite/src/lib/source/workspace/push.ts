@@ -38,6 +38,7 @@ const pushFile = async (
   change: WorkspaceChange
 ): Promise<PushFile> => {
   const bytes = await fs.readFile(projectPath(change.path));
+
   if (isBinary(bytes)) {
     return {
       content: bytesToBase64(bytes),
@@ -45,6 +46,7 @@ const pushFile = async (
       path: change.path,
     };
   }
+
   return { content: DECODER.decode(bytes), path: change.path };
 };
 
@@ -56,12 +58,15 @@ const deletePaths = (
   journal: Journal
 ): string[] => {
   const deletes: string[] = [];
+
   for (const change of changes) {
     if (change.kind === "deleted") {
       deletes.push(change.path);
       continue;
     }
+
     const { movedFrom } = change;
+
     if (
       change.kind === "moved" &&
       movedFrom !== undefined &&
@@ -70,6 +75,7 @@ const deletePaths = (
       deletes.push(movedFrom);
     }
   }
+
   return deletes;
 };
 
@@ -80,8 +86,10 @@ const movePaths = (
   journal: Journal
 ): PushMove[] => {
   const moves: PushMove[] = [];
+
   for (const change of changes) {
     const { movedFrom } = change;
+
     if (
       change.kind === "moved" &&
       movedFrom !== undefined &&
@@ -90,6 +98,7 @@ const movePaths = (
       moves.push({ from: movedFrom, to: change.path });
     }
   }
+
   return moves;
 };
 
@@ -101,11 +110,13 @@ export const pushPayload = async (
 ): Promise<PushPayload> => {
   const { fs, journal } = state;
   const changes = await deriveChanges(state);
+
   const files = await Promise.all(
     changes
       .filter((change) => change.kind !== "deleted")
       .map((change) => pushFile(fs, change))
   );
+
   return {
     deletes: deletePaths(changes, journal),
     files,
@@ -123,9 +134,11 @@ export const markPushed = async (
 ): Promise<void> => {
   const { cache, fs } = state;
   const files = await listFiles(fs, state.base);
+
   const entries = await Promise.all(
     files.map(async (file): Promise<[string, BaseEntry]> => {
       const digest = await fileSha(fs, cache, file);
+
       if (!(await fs.exists(objectPath(digest.sha)))) {
         await writeObject(
           fs,
@@ -133,6 +146,7 @@ export const markPushed = async (
           digest.bytes ?? (await fs.readFile(projectPath(file.path)))
         );
       }
+
       return [
         file.path,
         {
@@ -142,6 +156,7 @@ export const markPushed = async (
       ];
     })
   );
+
   state.base = { baseSha: sha, entries: Object.fromEntries(entries) };
   await writeBase(fs, state.base);
   state.journal = {};

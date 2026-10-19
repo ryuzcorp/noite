@@ -13,7 +13,9 @@ export const LoadError = ({
   if (!error) {
     return null;
   }
+
   const message = errorMessage(error);
+
   return (
     <p class="text-error m-0 text-sm">
       {label}: {message}

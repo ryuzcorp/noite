@@ -14,8 +14,10 @@ const restore = (key: string, value: string | undefined): void => {
   if (value === undefined) {
     // oxlint-disable-next-line typescript/no-dynamic-delete -- `key` is one of the six fixed names restored below, one by one.
     delete process.env[key];
+
     return;
   }
+
   process.env[key] = value;
 };
 
@@ -74,12 +76,14 @@ describe("connection", () => {
         "owner/my-app"
       )
     );
+
     expect(prod).toEqual({
       appUrl: "https://app.noite.now",
       gitBase: "https://git.noite.now",
       slug: "my-app",
       token: "k",
     });
+
     // A localhost install serves control on the bare base domain, not `app.`.
     const dev = await Effect.runPromise(
       connection(
@@ -87,6 +91,7 @@ describe("connection", () => {
         "owner/my-app"
       )
     );
+
     expect(dev.appUrl).toBe("http://noite.localhost:9080");
   });
 
@@ -101,14 +106,17 @@ describe("connection", () => {
         "owner/my-app"
       )
     );
+
     expect(explicit.appUrl).toBe("https://control.example.com");
     process.env.NOITE_APP_URL = "http://noite.localhost:9080";
+
     const fromEnv = await Effect.runPromise(
       connection(
         flags({ token: "k", url: "https://git.noite.now" }),
         "owner/my-app"
       )
     );
+
     expect(fromEnv.appUrl).toBe("http://noite.localhost:9080");
   });
 

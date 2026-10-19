@@ -12,10 +12,12 @@ const ErrorStatusSchema = Schema.Union([
   Schema.Literal("resolved"),
   Schema.Literal("ignored"),
 ]);
+
 const ErrorArgs = Schema.Struct({
   appId: Schema.String,
   fingerprint: Schema.String,
 });
+
 const ErrorStatusArgs = Schema.Struct({
   appId: Schema.String,
   fingerprint: Schema.String,
@@ -35,8 +37,10 @@ const requireTelemetryRole = async (
 ): Promise<void> => {
   if (isControlApp(appId)) {
     await requireControlAdmin(request, env);
+
     return;
   }
+
   const user = await sessionUser(request, env);
   await requireAppRole(appId, user.id, need);
 };
@@ -46,6 +50,7 @@ export const errorDetail = apiAction(
   ErrorArgs,
   async ({ appId, fingerprint }, { env, request }) => {
     await requireTelemetryRole(request, env, appId, "view");
+
     try {
       return await runnerGetError(appId, fingerprint);
     } catch (error) {
@@ -59,6 +64,7 @@ export const setErrorStatus = apiAction(
   ErrorStatusArgs,
   async ({ appId, fingerprint, status }, { env, request }) => {
     await requireTelemetryRole(request, env, appId, "push");
+
     try {
       return await runnerSetErrorStatus(appId, fingerprint, status);
     } catch (error) {

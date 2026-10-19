@@ -13,6 +13,7 @@
  * backslash is normalized to `/` by browsers, so both are refused. */
 export const sameOriginPath = (raw: string): string | null => {
   const trimmed = raw.trim();
+
   if (
     !trimmed.startsWith("/") ||
     trimmed.startsWith("//") ||
@@ -20,6 +21,7 @@ export const sameOriginPath = (raw: string): string | null => {
   ) {
     return null;
   }
+
   return trimmed;
 };
 
@@ -42,15 +44,19 @@ export const environmentReturnPath = (
   if (raw.trim() === "") {
     return "/";
   }
+
   let url: URL;
+
   try {
     url = new URL(raw);
   } catch {
     return "/";
   }
+
   if (url.host.toLowerCase() !== expectedHost.toLowerCase()) {
     return "/";
   }
+
   return `${url.pathname}${url.search}`;
 };
 

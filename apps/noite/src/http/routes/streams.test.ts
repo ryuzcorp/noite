@@ -6,6 +6,7 @@ import { sleepUnlessAborted } from "../sse";
 import { metricsWindowHours, streamMetrics } from "./streams";
 
 const realFetch = globalThis.fetch;
+
 const setFetch = (
   impl: (url: string, init?: RequestInit) => Promise<Response>
 ) => {
@@ -31,10 +32,12 @@ const countingSignal = () => {
     live += 1;
     add(...args);
   };
+
   signal.removeEventListener = (...args: Parameters<typeof remove>) => {
     live -= 1;
     remove(...args);
   };
+
   return { controller, live: () => live };
 };
 
@@ -44,11 +47,14 @@ const runMetricsStream = async (versionFor: (call: number) => number) => {
   setFetch(async (url) => {
     if (url.includes("/metrics/version")) {
       versionCalls += 1;
+
       return Response.json({ version: versionFor(versionCalls) });
     }
+
     return Response.json([]);
   });
   const controller = new AbortController();
+
   const done = streamMetrics({
     auth: { authorization: "Bearer t" },
     base: "http://runner.test/v1/apps/a",
@@ -57,14 +63,17 @@ const runMetricsStream = async (versionFor: (call: number) => number) => {
     sink: {
       send: (message: { data: string }) => {
         chunks.push(`data: ${message.data}\n\n`);
+
         return Promise.resolve();
       },
     },
     windowQuery: "hours=24",
   });
+
   await Bun.sleep(200);
   controller.abort();
   await done;
+
   return { chunks, versionCalls };
 };
 
@@ -116,10 +125,12 @@ describe("metricsWindowHours", () => {
 describe("sleepUnlessAborted", () => {
   test("leaves no abort listener behind, however many cycles sleep", async () => {
     const { controller, live } = countingSignal();
+
     for (let i = 0; i < 20; i += 1) {
       // oxlint-disable-next-line eslint/no-await-in-loop -- sequential sleeps, like the stream loop
       await sleepUnlessAborted(1, controller.signal);
     }
+
     expect(live()).toBe(0);
   });
 

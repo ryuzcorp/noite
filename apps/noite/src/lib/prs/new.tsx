@@ -33,27 +33,33 @@ const newPrBlockers = ({
   title: string;
 }): string[] => {
   const reasons: string[] = [];
+
   if (!loading) {
     if (otherBranchCount === 0) {
       reasons.push("Create a branch first");
     }
+
     if (base === "" || head === "") {
       reasons.push("Pick both a base and a head branch");
     } else if (base === head) {
       reasons.push("Head must differ from base");
     }
+
     if (existingNumber !== undefined) {
       reasons.push(
         `A pull request for this pair is already open (#${existingNumber})`
       );
     }
+
     if (ahead === 0) {
       reasons.push(`No commits on ${head} over ${base}`);
     }
   }
+
   if (title === "") {
     reasons.push("Add a title");
   }
+
   return reasons;
 };
 
@@ -72,15 +78,19 @@ const newPrProblem = ({
   if (title === "") {
     return "Title is required";
   }
+
   if (base === "" || head === "") {
     return "Pick both a base and a head branch";
   }
+
   if (base === head) {
     return "Head must differ from base";
   }
+
   if (ahead === 0) {
     return `No commits on ${head} over ${base}; push a commit first`;
   }
+
   return null;
 };
 
@@ -109,15 +119,20 @@ const submitNewPr = async ({
 }): Promise<void> => {
   if (problem !== null) {
     notice.set(problem);
+
     return;
   }
+
   busy.set(true);
   notice.set("");
+
   try {
     const args: PrCreateInput = { appId, base, head, title };
+
     if (body !== "") {
       args.body = body;
     }
+
     const detail = await api<PrDetail>("/api/prs/prsCreate", args);
     invalidatePr(appId);
     visit(`/apps/${appId}/pulls/${detail.pullRequest.number}`);
@@ -244,23 +259,30 @@ export const NewPrForm = ({
   const refs = forgeRefs(appId).data();
   const branchNames = refs?.branches.map((branch) => branch.name) ?? [];
   const baseValue = base() || "main";
+
   const headValue =
     head() === ""
       ? (branchNames.find((name) => name !== baseValue) ?? "")
       : head();
+
   const otherBranches = branchNames.filter((name) => name !== baseValue);
+
   const picksDiffer =
     baseValue.trim() !== "" &&
     headValue.trim() !== "" &&
     baseValue.trim() !== headValue.trim();
+
   // Cheap: the compare runs only once both picks are real, distinct branches.
   const compare = picksDiffer
     ? forgeCompare(appId, baseValue.trim(), headValue.trim()).data()
     : undefined;
+
   const openPulls = prList(appId, "open").data()?.pullRequests ?? [];
+
   const existing = openPulls.find(
     (pull) => pull.base === baseValue.trim() && pull.head === headValue.trim()
   );
+
   const loading = refs === undefined;
 
   const reasons = newPrBlockers({

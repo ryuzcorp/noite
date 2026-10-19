@@ -74,6 +74,7 @@ describe("readPickedFiles", () => {
     const reads = await readPickedFiles([
       new File([new Uint8Array([0x68, 0x00, 0x69])], "blob.bin"),
     ]);
+
     expect(reads).toEqual([
       { base64: "aABp", bytes: 3, kind: "binary", path: "blob.bin" },
     ]);
@@ -83,6 +84,7 @@ describe("readPickedFiles", () => {
     const reads = await readPickedFiles([
       new File([new Uint8Array([0xff, 0xfe, 0xfd])], "junk.dat"),
     ]);
+
     expect(reads).toEqual([
       { base64: "//79", bytes: 3, kind: "binary", path: "junk.dat" },
     ]);
@@ -92,6 +94,7 @@ describe("readPickedFiles", () => {
     const reads = await readPickedFiles([
       new File(["a".repeat(TEXT_MAX_BYTES)], "edge.txt"),
     ]);
+
     expect(reads[0]?.kind).toBe("text");
   });
 
@@ -99,6 +102,7 @@ describe("readPickedFiles", () => {
     const reads = await readPickedFiles([
       new File(["a".repeat(TEXT_MAX_BYTES + 1)], "over.txt"),
     ]);
+
     expect(reads[0]?.kind).toBe("binary");
     expect(reads[0]).toMatchObject({ bytes: TEXT_MAX_BYTES + 1 });
   });
@@ -108,6 +112,7 @@ describe("readPickedFiles", () => {
       new File(["one"], "one.txt"),
       new File([new Uint8Array([0x00])], "two.bin"),
     ]);
+
     expect(reads.map((read) => read.path)).toEqual(["one.txt", "two.bin"]);
     expect(reads.map((read) => read.kind)).toEqual(["text", "binary"]);
   });
@@ -144,6 +149,7 @@ describe("checkLimits", () => {
       binary("b.bin", 9 * MIB),
       binary("c.bin", 9 * MIB),
     ];
+
     expect(checkLimits(reads, UPLOAD_LIMITS)).toBe(
       "The upload is larger than 25 MB in total."
     );
@@ -153,6 +159,7 @@ describe("checkLimits", () => {
     const reads = Array.from({ length: 101 }, (_, index) =>
       binary(`file-${index}.txt`, 1)
     );
+
     expect(checkLimits(reads, UPLOAD_LIMITS)).toBe(
       "Up to 100 files per commit."
     );
@@ -164,6 +171,7 @@ describe("checkLimits", () => {
       binary("b.bin", 10 * MIB),
       binary("c.bin", 5 * MIB),
     ];
+
     expect(checkLimits(reads, UPLOAD_LIMITS)).toBeNull();
   });
 
@@ -173,6 +181,7 @@ describe("checkLimits", () => {
       maxFiles: 1,
       maxTotalBytes: 10,
     };
+
     expect(
       checkLimits([unreadable("gone.txt"), text("a.txt", "hi")], limits)
     ).toBeNull();
@@ -184,6 +193,7 @@ describe("checkLimits", () => {
       maxFiles: 2,
       maxTotalBytes: 3,
     };
+
     expect(checkLimits([text("a.txt", "éé")], limits)).toBe(
       "The upload is larger than 3 B in total."
     );
@@ -195,6 +205,7 @@ describe("checkLimits", () => {
       maxFiles: 5,
       maxTotalBytes: 8,
     };
+
     const reads = [text("a.txt", "hello"), binary("b.bin", 4)];
     expect(checkLimits(reads, limits)).toBe(
       "The upload is larger than 8 B in total."

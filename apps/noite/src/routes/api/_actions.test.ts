@@ -49,15 +49,19 @@ const post = async (
     headers: { "content-type": "application/json" },
     method: "POST",
   });
+
   // SAFETY: the test env carries the KitEnv keys the handlers read; unset keys stay undefined as handlers tolerate.
   const raw = await handler(
     testRouteContext(request, env as unknown as KitEnv)
   );
+
   if (raw instanceof Response) {
     return raw;
   }
+
   throw new Error("the handler did not answer a Response");
 };
+
 describe("actionErrorResponse", () => {
   test("fail(message) maps to 422 {errors}", async () => {
     const thrown = (() => {
@@ -66,8 +70,10 @@ describe("actionErrorResponse", () => {
       } catch (error) {
         return error;
       }
+
       throw new Error("fail did not throw");
     })();
+
     const response = actionErrorResponse(thrown);
     expect(response.status).toBe(422);
     expect(await response.json()).toEqual({
@@ -79,11 +85,14 @@ describe("actionErrorResponse", () => {
     const signedOut = actionErrorResponse(
       new UnauthorizedError({ message: "Sign in required" })
     );
+
     expect(signedOut.status).toBe(401);
     expect(await signedOut.json()).toEqual({ error: "Sign in required" });
+
     const misconfigured = actionErrorResponse(
       new MissingAuthSecretError({ message: "no secret" })
     );
+
     expect(misconfigured.status).toBe(401);
     expect(await misconfigured.json()).toEqual({ error: "no secret" });
   });
@@ -130,10 +139,12 @@ describe("apiAction", () => {
       headers: { "content-type": "application/json" },
       method: "POST",
     });
+
     // SAFETY: the echo handler only reads the request body.
     const response = (await echo(
       testRouteContext(request, {} as unknown as KitEnv)
     )) as Response;
+
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ error: "Invalid JSON" });
   });
@@ -141,8 +152,10 @@ describe("apiAction", () => {
   test("a thrown fail answers 422 with its message", async () => {
     const refusing = apiAction(Schema.Struct({}), () => {
       fail("taken");
+
       return null;
     });
+
     const response = await post(refusing, "/api/test/refusing", {}, {});
     expect(response.status).toBe(422);
     expect(await response.json()).toEqual({ errors: { form: "taken" } });
@@ -161,6 +174,7 @@ describe("endpoint auth gating", () => {
     const response = await post(slugCheckPost, "/api/apps/slugCheck", ENV, {
       slug: "my-app",
     });
+
     expect(response.status).toBe(401);
     expect(await response.json()).toEqual({ error: "Sign in required" });
   });
@@ -171,6 +185,7 @@ describe("endpoint auth gating", () => {
       "/api/account/myInviteCodes",
       ENV
     );
+
     expect(response.status).toBe(401);
     expect(await response.json()).toEqual({ error: "Sign in required" });
   });
@@ -182,6 +197,7 @@ describe("endpoint auth gating", () => {
       {},
       { slug: "my-app" }
     );
+
     expect(response.status).toBe(401);
   });
 });
@@ -209,8 +225,10 @@ const fails = async (path: string, input: unknown): Promise<ApiError> => {
     if (error instanceof ApiError) {
       return error;
     }
+
     throw error;
   }
+
   throw new Error(`expected ${path} to reject`);
 };
 

@@ -104,12 +104,15 @@ export const isSynced = (path: string): boolean => {
   if (path === BASE_FILE || path === JOURNAL_FILE) {
     return true;
   }
+
   if (path.startsWith(`${OBJECTS_DIR}/`)) {
     return true;
   }
+
   if (path !== PROJECT_ROOT && !path.startsWith(`${PROJECT_ROOT}/`)) {
     return false;
   }
+
   return !path.split("/").includes(NODE_MODULES);
 };
 
@@ -120,12 +123,15 @@ const isMessage = (value: unknown): value is SyncMessage => {
   if (typeof value !== "object" || value === null || !("kind" in value)) {
     return false;
   }
+
   if (value.kind === "flushed") {
     return "to" in value && typeof value.to === "string";
   }
+
   if (!("from" in value) || typeof value.from !== "string") {
     return false;
   }
+
   return (
     value.kind === "flush" ||
     (value.kind === "op" &&
@@ -141,29 +147,37 @@ const toOp = (volume: SyncVolume, mutation: SyncMutation): SyncOp | null => {
   if (mutation.op === "link" || mutation.op === "mount") {
     return null;
   }
+
   if (mutation.op === "rename") {
     const from = isSynced(mutation.from);
     const to = isSynced(mutation.to);
+
     if (from && to) {
       return { from: mutation.from, op: "rename", to: mutation.to };
     }
+
     if (from) {
       return { op: "remove", path: mutation.from };
     }
+
     // Moved in from outside: what lands is new to the peers.
     return to ? toOp(volume, { op: "write", path: mutation.to }) : null;
   }
+
   if (!isSynced(mutation.path)) {
     return null;
   }
+
   if (mutation.op === "mkdir" || mutation.op === "remove") {
     return { op: mutation.op, path: mutation.path };
   }
+
   if (mutation.op === "meta") {
     return mutation.mode === undefined
       ? null
       : { mode: mutation.mode, op: "mode", path: mutation.path };
   }
+
   try {
     return mutation.op === "write"
       ? {
@@ -192,29 +206,40 @@ const apply = (volume: SyncVolume, op: SyncOp): boolean => {
       case "write": {
         volume.mkdirSync(parentDir(op.path), { recursive: true });
         volume.writeFileSync(op.path, op.bytes);
+
         return false;
       }
+
       case "mkdir": {
         volume.mkdirSync(op.path, { recursive: true });
+
         return true;
       }
+
       case "remove": {
         volume.removeTreeSync(op.path);
+
         return true;
       }
+
       case "rename": {
         volume.mkdirSync(parentDir(op.to), { recursive: true });
         volume.renameSync(op.from, op.to);
+
         return true;
       }
+
       case "symlink": {
         volume.mkdirSync(parentDir(op.path), { recursive: true });
         volume.removeTreeSync(op.path);
         volume.symlinkSync(op.target, op.path);
+
         return true;
       }
+
       default: {
         volume.lchmodSync(op.path, op.mode);
+
         return false;
       }
     }
@@ -231,6 +256,7 @@ export const syncTabs = (
   const listeners = new Set<
     (structural: boolean, paths: readonly string[]) => void
   >();
+
   const pending: SyncOp[] = [];
   const flushWaiters = new Set<() => void>();
   let started = false;
@@ -250,6 +276,7 @@ export const syncTabs = (
     // Deduped, in arrival order: a batch may touch one path more than once.
     const changed = new Set<string>();
     applying = true;
+
     try {
       for (const op of ops) {
         structural = apply(volume, op) || structural;
@@ -258,7 +285,9 @@ export const syncTabs = (
     } finally {
       applying = false;
     }
+
     const paths = [...changed];
+
     for (const listener of listeners) {
       listener(structural, paths);
     }
@@ -268,11 +297,13 @@ export const syncTabs = (
     if (serving === null) {
       return;
     }
+
     try {
       await serving();
     } catch {
       // The saving tab retries its own save; the peer restores what landed.
     }
+
     if (!closed) {
       send({ kind: "flushed", to });
     }
@@ -280,35 +311,45 @@ export const syncTabs = (
 
   const onMessage = (event: MessageEvent): void => {
     const message: unknown = event.data;
+
     if (closed || !isMessage(message)) {
       return;
     }
+
     if (message.kind === "flushed") {
       if (message.to === self) {
         for (const resolve of flushWaiters) {
           resolve();
         }
+
         flushWaiters.clear();
       }
+
       return;
     }
+
     if (message.kind === "flush") {
       void answerFlush(message.from);
+
       return;
     }
+
     if (started) {
       applyAll([message.op]);
     } else {
       pending.push(message.op);
     }
   };
+
   channel.addEventListener("message", onMessage);
 
   const stopWatching = volume.onMutation((mutation) => {
     if (applying || !started || closed) {
       return;
     }
+
     const op = toOp(volume, mutation);
+
     if (op !== null) {
       send({ from: self, kind: "op", op });
     }
@@ -319,30 +360,38 @@ export const syncTabs = (
       closed = true;
       stopWatching();
       channel.close();
+
       for (const resolve of flushWaiters) {
         resolve();
       }
+
       flushWaiters.clear();
       listeners.clear();
     },
     flushPeers: (timeoutMs) => {
       const { promise, resolve } = Promise.withResolvers<undefined>();
+
       const answered = (): void => {
         resolve();
       };
+
       flushWaiters.add(answered);
       const timer = setTimeout(answered, timeoutMs);
+
       const cleanUp = async (): Promise<void> => {
         await promise;
         clearTimeout(timer);
         flushWaiters.delete(answered);
       };
+
       void cleanUp();
       send({ from: self, kind: "flush" });
+
       return promise;
     },
     onApplied: (notify) => {
       listeners.add(notify);
+
       return () => {
         listeners.delete(notify);
       };
@@ -354,6 +403,7 @@ export const syncTabs = (
       if (started) {
         return;
       }
+
       started = true;
       applyAll(pending.splice(0));
     },

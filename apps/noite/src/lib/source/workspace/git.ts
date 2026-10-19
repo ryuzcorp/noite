@@ -10,9 +10,11 @@ import type { GitMode } from "./types";
 /** A digest as lowercase hex — the shape a git blob id travels in. */
 const hex = (bytes: Uint8Array): string => {
   let out = "";
+
   for (const byte of bytes) {
     out += byte.toString(16).padStart(2, "0");
   }
+
   return out;
 };
 
@@ -27,6 +29,7 @@ export const gitBlobSha = async (bytes: Uint8Array): Promise<string> => {
   const framed = new Uint8Array(header.byteLength + bytes.byteLength);
   framed.set(header);
   framed.set(bytes, header.byteLength);
+
   return hex(new Uint8Array(await crypto.subtle.digest("SHA-1", framed)));
 };
 
@@ -47,8 +50,10 @@ export const isBinary = (bytes: Uint8Array): boolean =>
  * from the header's type flag, which the tar reader reads. */
 export const formatMode = (mode: number): GitMode => {
   const permissions = mode.toString(8).slice(-3);
+
   const executes = [...permissions].some(
     (digit) => Number.parseInt(digit, 8) % 2 === 1
   );
+
   return executes ? "100755" : "100644";
 };

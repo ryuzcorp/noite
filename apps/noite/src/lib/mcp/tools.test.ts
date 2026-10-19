@@ -25,12 +25,15 @@ const PublishedSchema = Schema.Struct({
 describe("MCP tool table", () => {
   test("publishes every environment tool with its required arguments", () => {
     const byName = new Map(MCP_TOOLS.map((tool) => [tool.name, tool]));
+
     for (const [name, required] of Object.entries(ENVIRONMENT_TOOLS)) {
       const tool = byName.get(name);
       expect(tool, `${name} is missing from MCP_TOOLS`).toBeDefined();
+
       const published = Schema.decodeUnknownSync(PublishedSchema)(
         tool?.inputSchema
       );
+
       expect(
         published.required,
         `${name} requires ${required.join(", ")}`

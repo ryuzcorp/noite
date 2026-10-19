@@ -42,6 +42,7 @@ describe("preview hosts", () => {
 
   test("any other page host keeps the configured base", () => {
     const extras = "noite.local, 192.168.10.97 ,lan:9080";
+
     for (const host of [
       "noite.localhost:9080",
       "192.168.10.97:9080",
@@ -53,6 +54,7 @@ describe("preview hosts", () => {
         "noite.localhost"
       );
     }
+
     expect(previewBase("noite.local", "noite.localhost")).toBe(
       "noite.localhost"
     );

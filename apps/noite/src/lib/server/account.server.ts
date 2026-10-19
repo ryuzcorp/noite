@@ -16,9 +16,11 @@ import { requestOrigin, sessionUser } from "./session.server";
  * consume that user's one-time tour. */
 export const completeOnboarding = apiActionNoInput(async ({ env, request }) => {
   const user = await sessionUser(request, env);
+
   if (user.impersonatedBy) {
     fail("Onboarding cannot be completed while impersonating");
   }
+
   await withDb(
     Effect.gen(function* () {
       const sql = yield* SqlClient;
@@ -28,8 +30,10 @@ export const completeOnboarding = apiActionNoInput(async ({ env, request }) => {
       );
     })
   );
+
   return { ok: true };
 });
+
 const CreateApiKey = Schema.Struct({
   appManagement: Schema.Boolean,
   events: Schema.Boolean,
@@ -45,31 +49,43 @@ export const createApiKey = apiAction(
   async ({ appManagement, events, name }, { env, request }) => {
     const user = await sessionUser(request, env);
     const label = name.trim();
+
     if (!label) {
       fail("Name is required");
     }
+
     if (!appManagement && !events) {
       fail("Select at least one scope");
     }
+
     const permissions: Record<string, string[]> = {};
+
     if (appManagement) {
       permissions.apps = ["manage"];
     }
+
     if (events) {
       permissions.events = ["push"];
     }
+
     const origin = requestOrigin(request);
+
     if (!origin) {
       throw new UnauthorizedError({ message: "Sign in required" });
     }
+
     const auth = authFromEnv(env, origin);
+
     const created = await auth.api.createApiKey({
       body: { name: label, permissions, userId: user.id },
     });
+
     const key = created?.key;
+
     if (!key) {
       fail("Failed to create API key");
     }
+
     return { key };
   }
 );
@@ -78,6 +94,7 @@ export const createApiKey = apiAction(
 /** The signed-in account's unused codes (see `INVITES_PER_USER`). */
 export const myInviteCodes = apiActionNoInput(async ({ env, request }) => {
   const user = await sessionUser(request, env);
+
   try {
     return await listUnusedInvitesFor(user.id);
   } catch (error) {

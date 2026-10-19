@@ -35,13 +35,16 @@ const CreateSource = Schema.Union([
   }),
   Schema.Struct({ id: Schema.String, kind: Schema.Literal("template") }),
 ]);
+
 const CreateApp = Schema.Struct({
   name: Schema.String,
   slug: Schema.String,
   source: Schema.optional(CreateSource),
 });
+
 const AppId = Schema.String;
 const SLUG_RE = /^[a-z0-9](?<slug>[a-z0-9-]{0,46}[a-z0-9])?$/u;
+
 /** Slugs the platform owns (the runner's own `RESERVED_SLUGS`, `lifecycle.rs`). */
 const RESERVED_SLUGS = {
   _control: true,
@@ -49,15 +52,18 @@ const RESERVED_SLUGS = {
   app: true,
   git: true,
 } satisfies Record<string, true>;
+
 /** Why a slug cannot be used, or null when it can — the one gate create,
  * rename and the push-to-create path (A5) all apply. */
 export const slugError = (slug: string): string | null => {
   if (Object.hasOwn(RESERVED_SLUGS, slug)) {
     return "Slug is reserved";
   }
+
   if (!SLUG_RE.test(slug)) {
     return "Slug must be 1–48 chars: lowercase letters, digits, and hyphens, starting and ending with a letter or digit";
   }
+
   return null;
 };
 
@@ -72,10 +78,12 @@ const freeVariant = (
   for (let n = 2; n < SUGGESTION_TRIES + 2; n += 1) {
     const suffix = `-${n}`;
     const candidate = `${slug.slice(0, 48 - suffix.length).replace(/-+$/u, "")}${suffix}`;
+
     if (!(taken.has(candidate) || slugError(candidate))) {
       return candidate;
     }
   }
+
   return null;
 };
 
@@ -89,18 +97,22 @@ export const slugCheck = apiAction(
     await sessionUser(request, env);
     const normalized = slug.trim().toLowerCase();
     const gitBase = (env?.GIT_PUBLIC_BASE ?? "").replace(/\/+$/u, "");
+
     const result: SlugCheck = {
       error: slugError(normalized),
       gitRemote: gitBase === "" ? "" : `${gitBase}/${normalized}`,
       host: `${normalized}.${env?.BASE_DOMAIN ?? "localhost"}`,
       suggestion: null,
     };
+
     if (result.error) {
       return result;
     }
+
     try {
       const apps = await runnerListApps();
       const taken = new Set(apps.map((app) => app.slug));
+
       if (taken.has(normalized)) {
         result.error = `${normalized} is already taken`;
         result.suggestion = freeVariant(normalized, taken);
@@ -108,6 +120,7 @@ export const slugCheck = apiAction(
     } catch (error) {
       failUnknown(error);
     }
+
     return result;
   }
 );
@@ -130,13 +143,16 @@ const toRunnerSource = (
   if (!source || source.kind === "blank") {
     return { kind: "blank" };
   }
+
   const actor = { name: account.name, userId: account.id };
+
   if (source.kind === "template") {
     // `?? fail()` (not an `if` guard): this toolchain does not narrow on
     // never-returning calls, but does narrow a `never`-typed `??` branch.
     const picked =
       TEMPLATES.find((template) => template.id === source.id) ??
       fail(`Unknown template: ${source.id}`);
+
     return {
       actor,
       kind: "git",
@@ -145,6 +161,7 @@ const toRunnerSource = (
       url: picked.url,
     };
   }
+
   return {
     actor,
     kind: "git",
@@ -170,12 +187,14 @@ export const createAppForUser = async (input: {
     source: toRunnerSource(input.source, input.account),
     userId: input.account.id,
   });
+
   try {
     await withDb(grantCollaborator(app.id, input.account.id, "admin"));
   } catch (grantError) {
     await runnerDeleteApp(app.id).catch(() => null);
     failUnknown(grantError);
   }
+
   return app;
 };
 
@@ -185,13 +204,17 @@ export const create = apiAction(
     const user = await sessionUser(request, env);
     const trimmedName = name.trim();
     const normalized = slug.trim().toLowerCase();
+
     if (!trimmedName) {
       fail("Name is required");
     }
+
     const slugProblem = slugError(normalized);
+
     if (slugProblem) {
       fail(slugProblem);
     }
+
     try {
       const app = await createAppForUser({
         account: { id: user.id, name: user.name },
@@ -199,11 +222,13 @@ export const create = apiAction(
         slug: normalized,
         source,
       });
+
       return { id: app.id };
     } catch (error) {
       if (error instanceof UnauthorizedError) {
         throw error;
       }
+
       return failUnknown(error);
     }
   }
@@ -214,6 +239,7 @@ export const create = apiAction(
 export const retryImport = apiAction(AppId, async (appId, { env, request }) => {
   const user = await sessionUser(request, env);
   await requireAppRole(appId, user.id, "push");
+
   try {
     return await runnerRetryImport(appId);
   } catch (error) {
@@ -224,6 +250,7 @@ export const retryImport = apiAction(AppId, async (appId, { env, request }) => {
 export const remove = apiAction(AppId, async (appId, { env, request }) => {
   const user = await sessionUser(request, env);
   await requireAppRole(appId, user.id, "admin");
+
   try {
     await runnerDeleteApp(appId);
     // Nothing cascades grants now that the app row lives in the runner.
@@ -232,17 +259,21 @@ export const remove = apiAction(AppId, async (appId, { env, request }) => {
     if (error instanceof UnauthorizedError) {
       throw error;
     }
+
     failUnknown(error);
   }
 });
+
 export const setDesired = apiAction(
   Schema.Struct({ desiredState: Schema.String, id: Schema.String }),
   async ({ id, desiredState }, { env, request }) => {
     if (desiredState !== "running" && desiredState !== "stopped") {
       fail("desiredState must be running or stopped");
     }
+
     const user = await sessionUser(request, env);
     await requireAppRole(id, user.id, "push");
+
     try {
       // SAFETY: desiredState is validated above to be exactly "running" | "stopped" before this cast.
       await runnerPatchApp(id, {
@@ -252,6 +283,7 @@ export const setDesired = apiAction(
       if (error instanceof UnauthorizedError) {
         throw error;
       }
+
       failUnknown(error);
     }
   }
@@ -270,21 +302,27 @@ export const renameApp = apiAction(
   async ({ id, name, slug }, { env, request }) => {
     const trimmedName = name?.trim() || undefined;
     const normalized = slug?.trim().toLowerCase() || undefined;
+
     if (!trimmedName && !normalized) {
       fail("Name or slug required");
     }
+
     const slugProblem = normalized ? slugError(normalized) : null;
+
     if (slugProblem) {
       fail(slugProblem);
     }
+
     const user = await sessionUser(request, env);
     await requireAppRole(id, user.id, "admin");
+
     try {
       await runnerRenameApp(id, { name: trimmedName, slug: normalized });
     } catch (error) {
       if (error instanceof UnauthorizedError) {
         throw error;
       }
+
       failUnknown(error);
     }
   }
@@ -296,6 +334,7 @@ export const get = apiAction(
     const user = await sessionUser(request, env);
     const { app, role } = await requireAppRole(appId, user.id, "view");
     const git = await runnerGitRemote(appId);
+
     return {
       app,
       gitHint: `git remote add origin ${git.url}`,
@@ -321,6 +360,7 @@ export const rollback = apiAction(
   async ({ appId, sha }, { env, request }) => {
     const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "push");
+
     try {
       return await runnerRollback(appId, sha);
     } catch (error) {
@@ -340,6 +380,7 @@ export const deployLog = apiAction(
   DeployLogArgs,
   async ({ appId, deployId }, { env, request }) => {
     await requireViewApp(request, env, appId);
+
     try {
       return await runnerDeployLog(appId, deployId);
     } catch (error) {

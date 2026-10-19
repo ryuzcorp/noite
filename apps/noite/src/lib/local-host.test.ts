@@ -12,6 +12,7 @@ describe("isLocalhostDomain", () => {
       " app.noite.localhost ",
       "app-0.preview.test2.noite.localhost",
     ].filter((domain) => !isLocalhostDomain(domain));
+
     expect(missed).toEqual([]);
   });
 
@@ -24,6 +25,7 @@ describe("isLocalhostDomain", () => {
       "noite.noite",
       "",
     ].filter((domain) => isLocalhostDomain(domain));
+
     expect(wrong).toEqual([]);
   });
 });

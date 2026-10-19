@@ -28,6 +28,7 @@ export const agentSnippets = ({
 }): AgentSnippet[] => {
   const key = apiKey ?? KEY_PLACEHOLDER;
   const url = `${origin}/mcp`;
+
   return [
     {
       hint: "One command in your terminal:",

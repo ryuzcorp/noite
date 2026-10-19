@@ -71,14 +71,17 @@ const seed = async (
         await put(fs, path, text);
         const sha = await gitBlobSha(bytes);
         await writeObject(fs, sha, bytes);
+
         return [path, { mode: "100644", sha }];
       }
     )
   );
+
   const base: BaseIndex = {
     baseSha,
     entries: Object.fromEntries(entries),
   };
+
   await writeBase(fs, base);
 };
 
@@ -89,6 +92,7 @@ const withPod = async (run: (pod: TestPod) => Promise<void>): Promise<void> => {
   const persistence: FakePersistence = { log: [], pendingChanges: 0 };
   let alive = true;
   let closed = false;
+
   const opener: OpenPodOpener = (options: PodOptions): Promise<OpenPod> =>
     Promise.resolve({
       close: async () => {
@@ -100,6 +104,7 @@ const withPod = async (run: (pod: TestPod) => Promise<void>): Promise<void> => {
       flush: () => {
         persistence.pendingChanges = 0;
         persistence.log.push("saved");
+
         return Promise.resolve();
       },
       fs: pod.fs,
@@ -113,6 +118,7 @@ const withPod = async (run: (pod: TestPod) => Promise<void>): Promise<void> => {
       } as WorkspacePersistence,
       pod,
     });
+
   const options = (opening: Opening): WorkspaceOptions => ({
     appId: "app1",
     branch: "main",
@@ -128,6 +134,7 @@ const withPod = async (run: (pod: TestPod) => Promise<void>): Promise<void> => {
     openPod: opener,
     sha: opening.sha ?? "tip",
   });
+
   try {
     await run({
       closed: () => closed,
@@ -145,10 +152,12 @@ const withPod = async (run: (pod: TestPod) => Promise<void>): Promise<void> => {
 /** The next rows the workspace publishes. */
 const nextChange = (ws: Workspace): Promise<WorkspaceChange[]> => {
   const { promise, resolve } = Promise.withResolvers<WorkspaceChange[]>();
+
   const off = ws.onChanges((changes) => {
     off();
     resolve(changes);
   });
+
   return promise;
 };
 
@@ -376,6 +385,7 @@ describe("finishing with the changes", () => {
       const sent: PushPayload[] = [];
       await ws.push({ message: "a push", target: "main" }, (payload) => {
         sent.push(payload);
+
         return Promise.resolve({ sha: "commit2" });
       });
       expect(sent).toEqual([
@@ -418,6 +428,7 @@ describe("finishing with the changes", () => {
       const sent: PushPayload[] = [];
       await ws.push({ message: "a push", target: "topic" }, (payload) => {
         sent.push(payload);
+
         return Promise.resolve({ sha: "topic1" });
       });
       // The commit went to `topic` with every change on it...
@@ -452,9 +463,11 @@ describe("finishing with the changes", () => {
     await withPod(async (pod) => {
       await seed(pod.fs, { "a.txt": "one\n" });
       const ws = await pod.workspace();
+
       const off = ws.onChanges(() => {
         pod.persistence.log.push("published");
       });
+
       // The pod's own save is debounced: the write is in the filesystem but
       // still owed to IndexedDB when the derive runs.
       pod.persistence.pendingChanges = 1;

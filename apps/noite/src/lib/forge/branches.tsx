@@ -41,16 +41,21 @@ const moveBranchFocus = (event: KeyboardEvent): void => {
   if (event.key !== "ArrowDown" && event.key !== "ArrowUp") {
     return;
   }
+
   const list = event.currentTarget;
+
   if (!(list instanceof HTMLElement)) {
     return;
   }
+
   const items = [
     ...list.querySelectorAll<HTMLElement>("button:not([disabled]), a[href]"),
   ];
+
   if (items.length === 0) {
     return;
   }
+
   event.preventDefault();
   const active = document.activeElement;
   const index = active instanceof HTMLElement ? items.indexOf(active) : -1;
@@ -75,6 +80,7 @@ export const RefSelect = ({
   const refs = forgeRefs(appId).data();
   const branches = refs?.branches ?? [];
   const known = branches.some((branch) => branch.name === value);
+
   return (
     <select
       class="select select-sm max-w-56"
@@ -141,6 +147,7 @@ const BranchItem = ({
 }) => {
   const isDefault = branch.name === defaultBranch;
   const diverge = divergeLabel(branch.ahead, branch.behind);
+
   return (
     <li class="group flex items-center gap-1">
       <button
@@ -230,15 +237,18 @@ const BranchCreator = ({
   const name = atom("");
   const next = name().trim();
   const invalid = next === "" ? null : branchNameError(next);
+
   return (
     <div class="border-base-300 flex flex-col gap-1 border-t pt-2">
       <form
         class="flex items-center gap-2"
         onsubmit={(event) => {
           event.preventDefault();
+
           if (next === "" || busy || invalid !== null) {
             return;
           }
+
           onCreate(next);
           name.set("");
         }}
@@ -299,20 +309,25 @@ export const BranchPicker = ({
   const defaultBranch = refs?.defaultBranch ?? "main";
   const deployed = refs?.deployedSha ?? null;
   const envs = environments(appId).data() ?? [];
+
   const known =
     value === deployed || branches.some((branch) => branch.name === value);
 
   const pick = (ref: string) => {
     const element = liveEl(details);
+
     if (element) {
       element.open = false;
     }
+
     onChange(ref);
   };
+
   const run = async (action: () => Promise<void>): Promise<boolean> => {
     busy.set(true);
     failure.set("");
     let done = true;
+
     try {
       await action();
       invalidateForge(appId);
@@ -320,7 +335,9 @@ export const BranchPicker = ({
       done = false;
       failure.set(errorMessage(error));
     }
+
     busy.set(false);
+
     return done;
   };
 
@@ -396,6 +413,7 @@ export const BranchPicker = ({
                       branch: target,
                     }
                   );
+
                   invalidate(keys.environments(appId));
                   router.visit(
                     env
@@ -411,28 +429,35 @@ export const BranchPicker = ({
                       env.kind === "branch" &&
                       env.gitRef === `refs/heads/${target}`
                   );
+
                   const lines = [`Deleting ${target} is permanent.`];
+
                   if (tracked) {
                     lines.push(
                       "Its preview environment, and that environment's own data, are deleted too."
                     );
                   }
+
                   lines.push(
                     "Any open pull request from this branch loses its head."
                   );
+
                   const ok = await confirmDialog({
                     confirmLabel: "Delete",
                     message: lines.join(" "),
                     title: `Delete branch ${target}?`,
                   });
+
                   if (!ok) {
                     return;
                   }
+
                   await run(async () => {
                     await api<{ ok: true }>("/api/forge/gitBranchDelete", {
                       appId,
                       name: target,
                     });
+
                     if (target === value) {
                       onChange(defaultBranch);
                     }
@@ -478,6 +503,7 @@ export const BranchPicker = ({
                     name,
                   });
                 });
+
                 if (created) {
                   pick(name);
                 }

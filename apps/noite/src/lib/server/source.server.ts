@@ -16,6 +16,7 @@ export const sourceTree = apiAction(
   SourceRefArgs,
   async ({ appId, ref }, { env, request }) => {
     await requireViewApp(request, env, appId);
+
     return runnerSourceTree(appId, ref || undefined);
   }
 );
@@ -27,6 +28,7 @@ export const sourceBundle = apiAction(
   SourceRefArgs,
   async ({ appId, ref }, { env, request }) => {
     await requireViewApp(request, env, appId);
+
     return runnerSourceBundle(appId, ref || undefined);
   }
 );

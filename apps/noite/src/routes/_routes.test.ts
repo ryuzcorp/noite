@@ -12,6 +12,7 @@ import { POST as webhookPost } from "./webhook";
 const ENV = { RUNNER_TOKEN: "runner-secret", RUNNER_URL: "http://runner.test" };
 
 const realFetch = globalThis.fetch;
+
 const setFetch = (
   impl: (url: string, init?: RequestInit) => Promise<Response>
 ) => {
@@ -65,13 +66,17 @@ describe("POST /webhook", () => {
     let forwarded = false;
     setFetch(() => {
       forwarded = true;
+
       return Promise.resolve(new Response("ok"));
     });
+
     const anonymous = await drive(
       webhookPost,
       new Request("http://localhost/webhook", { body: "{}", method: "POST" })
     );
+
     expect(anonymous.status).toBe(401);
+
     const wrong = await drive(
       webhookPost,
       new Request("http://localhost/webhook", {
@@ -80,6 +85,7 @@ describe("POST /webhook", () => {
         method: "POST",
       })
     );
+
     expect(wrong.status).toBe(401);
     expect(forwarded).toBe(false);
   });
@@ -88,8 +94,10 @@ describe("POST /webhook", () => {
     let seen: { headers: Headers; url: string } | undefined;
     setFetch((url, init) => {
       seen = { headers: new Headers(init?.headers), url };
+
       return Promise.resolve(new Response("nudged"));
     });
+
     const res = await drive(
       webhookPost,
       new Request("http://localhost/webhook", {
@@ -103,6 +111,7 @@ describe("POST /webhook", () => {
         method: "POST",
       })
     );
+
     expect(res.status).toBe(200);
     expect(seen?.url).toBe("http://runner.test/webhook");
     expect(seen?.headers.get("authorization")).toBe("Bearer runner-secret");
@@ -112,6 +121,7 @@ describe("POST /webhook", () => {
 
   test("refuses an oversized body", async () => {
     setFetch(() => Promise.resolve(new Response("ok")));
+
     const res = await drive(
       webhookPost,
       new Request("http://localhost/webhook", {
@@ -120,6 +130,7 @@ describe("POST /webhook", () => {
         method: "POST",
       })
     );
+
     expect(res.status).toBe(413);
   });
 });

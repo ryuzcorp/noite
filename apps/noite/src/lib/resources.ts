@@ -56,6 +56,7 @@ const tracked = <T>(
   opts?: { persist?: boolean }
 ): Resource<T> => {
   usedKeys.add(key);
+
   return trackResource(key, fetcher, opts);
 };
 
@@ -65,6 +66,7 @@ const tracked = <T>(
  * data — and stored snapshots belong to the previous user. */
 export const resetUserCaches = (): void => {
   clearSwrStore();
+
   for (const key of usedKeys) {
     invalidateKey(key);
   }
@@ -89,6 +91,7 @@ const rowsQueryKey = (query: D1RowsQuery): string =>
  * view. */
 export const invalidateD1 = (appId: string, databaseId: string): void => {
   const prefix = `app:${appId}:d1:${databaseId}:`;
+
   for (const key of usedKeys) {
     if (key.startsWith(prefix)) {
       invalidateKey(key);
@@ -100,6 +103,7 @@ export const invalidateD1 = (appId: string, databaseId: string): void => {
  * cursor — so an upload or delete refreshes whichever page is mounted. */
 export const invalidateR2 = (appId: string, bucket: string): void => {
   const prefix = `app:${appId}:r2:${bucket}:`;
+
   for (const key of usedKeys) {
     if (key.startsWith(prefix)) {
       invalidateKey(key);
@@ -254,9 +258,11 @@ export interface SessionView {
 export const session = () =>
   tracked(keys.session, async (): Promise<SessionView | null> => {
     const { data } = await authClient.getSession();
+
     if (!data) {
       return null;
     }
+
     // The admin plugin adds an optional impersonatedBy id to sessions it
     // creates; presence means this session is impersonated.
     // SAFETY: read-only probe of the plugin-added id (a user id string when
@@ -266,6 +272,7 @@ export const session = () =>
     // serialized over JSON as an ISO string or null; a SQLite-backed value
     // may also arrive as an epoch number, so stringify whatever is set.
     const { onboardedAt } = data.user as { onboardedAt?: unknown };
+
     return {
       session: {
         impersonatedBy: impersonatedBy ? String(impersonatedBy) : null,
@@ -311,9 +318,11 @@ export const apiKeys = () =>
     const result = await authClient.apiKey.list({
       query: { limit: 50, sortBy: "createdAt", sortDirection: "desc" },
     });
+
     if (result.error) {
       throw new Error(result.error.message ?? "Failed to list API keys");
     }
+
     return result.data?.apiKeys ?? [];
   });
 
@@ -329,9 +338,11 @@ export interface PasskeyView {
 export const passkeys = () =>
   tracked(keys.passkeys, async (): Promise<PasskeyView[]> => {
     const result = await authClient.passkey.listUserPasskeys();
+
     if (result.error) {
       throw new Error(result.error.message ?? "Failed to list passkeys");
     }
+
     return (result.data ?? []).map((row) => ({
       backedUp: Boolean(row.backedUp),
       createdAt: row.createdAt ? new Date(row.createdAt).toISOString() : "",
@@ -346,6 +357,7 @@ export const signupPolicy = () =>
   tracked(keys.signupPolicy, async () => {
     try {
       const res = await fetch("/api/invite/status");
+
       if (res.ok) {
         // SAFETY: the route answers exactly this shape (see handleInviteStatus).
         return (await res.json()) as {
@@ -357,6 +369,7 @@ export const signupPolicy = () =>
     } catch {
       // Fall through to the stricter default below.
     }
+
     return { firstRun: false, invitesPerUser: 0, requiresInvite: true };
   });
 

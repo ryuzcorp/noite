@@ -83,10 +83,12 @@ describe("checkInvite", () => {
     const [used = "", revoked = ""] = await mintInvites("owner", 2);
     expect(await consumeInvite(used, "joiner")).toBe(true);
     expect(await checkInvite(used)).toBe("used");
+
     // SAFETY: the code was minted above, so exactly one { id } row matches.
     const row = db.raw
       .query(`SELECT id FROM invite WHERE code = ?`)
       .get(revoked) as { id: string };
+
     await revokeInvite(row.id);
     expect(await checkInvite(revoked)).toBe("revoked");
   });
@@ -98,10 +100,12 @@ describe("consumeInvite", () => {
     addUser("a");
     addUser("b");
     const [code = ""] = await mintInvites("owner", 1);
+
     const [first, second] = await Promise.all([
       consumeInvite(code, "a"),
       consumeInvite(code, "b"),
     ]);
+
     expect([first, second].filter(Boolean)).toHaveLength(1);
   });
 

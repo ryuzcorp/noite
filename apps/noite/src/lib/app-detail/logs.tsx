@@ -36,6 +36,7 @@ export const RuntimeLogs = ({
     logsUrl(appId, environmentId),
     decodeLogs
   );
+
   const lines = (): string[] => feed.latest() ?? [];
   const retrying = (): boolean => feed.status() === "retrying";
   // Pane state must survive re-renders: this body re-runs on every frame
@@ -47,10 +48,12 @@ export const RuntimeLogs = ({
     if (!next) {
       return;
     }
+
     // The watch fires before ilha's (microtask) re-render patches the new
     // lines in; scroll on the next frame, once scrollHeight includes them.
     window.requestAnimationFrame(() => {
       const pre = liveEl(pane.pre);
+
       if (pane.stick && pre) {
         pre.scrollTop = pre.scrollHeight;
       }
@@ -73,6 +76,7 @@ export const RuntimeLogs = ({
           class="max-h-64 overflow-auto rounded font-mono text-xs whitespace-pre-wrap"
           ref={(el) => {
             collectRef(pane.pre, el);
+
             if (el && pane.stick) {
               el.scrollTop = el.scrollHeight;
             }

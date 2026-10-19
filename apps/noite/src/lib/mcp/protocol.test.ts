@@ -23,12 +23,14 @@ const ECHO = defineTool({
     text: `said ${text}`,
   }),
 });
+
 const STRICT = defineTool({
   description: "Needs a text argument.",
   name: "strict",
   params: Schema.Struct({ text: Schema.String }),
   run: () => ({ structured: {}, text: "ok" }),
 });
+
 const BROKEN = defineTool({
   description: "Fails while running.",
   name: "broken",
@@ -50,6 +52,7 @@ const errorOf = (response: JsonRpcResponse | null): JsonRpcError => {
       `expected a JSON-RPC error, got ${JSON.stringify(response)}`
     );
   }
+
   return response.error;
 };
 
@@ -57,6 +60,7 @@ const resultOf = (response: JsonRpcResponse | null): unknown => {
   if (!response || !("result" in response)) {
     throw new Error(`expected a result, got ${JSON.stringify(response)}`);
   }
+
   return response.result;
 };
 
@@ -68,6 +72,7 @@ describe("MCP protocol", () => {
       method: "initialize",
       params: { clientInfo: { name: "probe" }, protocolVersion: "2025-06-18" },
     });
+
     expect(resultOf(supported)).toMatchObject({
       capabilities: { tools: {} },
       protocolVersion: "2025-06-18",
@@ -79,6 +84,7 @@ describe("MCP protocol", () => {
       method: "initialize",
       params: { protocolVersion: "2099-01-01" },
     });
+
     expect(resultOf(unknown)).toMatchObject({ protocolVersion: "2025-06-18" });
 
     const bare = await send({ id: 3, method: "initialize" });
@@ -122,6 +128,7 @@ describe("MCP protocol", () => {
       method: "tools/call",
       params: { arguments: { text: "hi" }, name: "echo" },
     });
+
     expect(resultOf(response)).toMatchObject({
       content: [{ text: "said hi", type: "text" }],
       structuredContent: { said: "hi" },
@@ -134,6 +141,7 @@ describe("MCP protocol", () => {
       method: "tools/call",
       params: { arguments: { nope: 1 }, name: "strict" },
     });
+
     expect(errorOf(bad)).toMatchObject({ code: RPC_CODES.invalidParams });
     expect(errorOf(bad).message).toBe(
       'strict: "arguments" do not match the tool\'s inputSchema'
@@ -146,6 +154,7 @@ describe("MCP protocol", () => {
       method: "tools/call",
       params: { name: "broken" },
     });
+
     expect(resultOf(response)).toMatchObject({
       content: [{ text: "The runner is unreachable.", type: "text" }],
       isError: true,
@@ -158,6 +167,7 @@ describe("MCP protocol", () => {
       method: "tools/call",
       params: {},
     });
+
     expect(errorOf(missingName).code).toBe(RPC_CODES.invalidParams);
 
     const wrongArgs = await send({
@@ -165,6 +175,7 @@ describe("MCP protocol", () => {
       method: "tools/call",
       params: { arguments: "text", name: "echo" },
     });
+
     expect(errorOf(wrongArgs).code).toBe(RPC_CODES.invalidParams);
 
     const noParams = await send({ id: 14, method: "tools/call" });
@@ -175,6 +186,7 @@ describe("MCP protocol", () => {
       method: "tools/call",
       params: { name: "delete_everything" },
     });
+
     expect(errorOf(unknown)).toMatchObject({
       code: RPC_CODES.invalidParams,
       message: "Unknown tool: delete_everything",

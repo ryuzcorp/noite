@@ -35,6 +35,7 @@ const inviteState = (row: AdminInvite): string => {
   if (row.usedByEmail) {
     return `used by ${row.usedByEmail}`;
   }
+
   return row.revoked ? "revoked" : "available";
 };
 
@@ -42,6 +43,7 @@ const inviteTone = (row: AdminInvite): string => {
   if (row.usedByEmail) {
     return "status-neutral";
   }
+
   return row.revoked ? "status-error" : "status-success";
 };
 
@@ -52,6 +54,7 @@ const InviteRow = (props: {
 }) => {
   const { inv } = props;
   const open = !(inv.usedByEmail || inv.revoked);
+
   return (
     <AdminRow
       avatar={
@@ -104,6 +107,7 @@ export const AdminInvitesPanel = () => {
   const mintCount = atom(3);
   const search = searchParam("iq", { default: "" });
   const needle = search().trim().toLowerCase();
+
   const shown = needle
     ? invites.filter((inv) =>
         [inv.code, inv.createdByEmail, inv.usedByEmail, inviteState(inv)].some(
@@ -117,6 +121,7 @@ export const AdminInvitesPanel = () => {
   const mint = async () => {
     busy.set(true);
     panelError.set("");
+
     try {
       await api<{ ok: true }>("/api/admin/adminCreateInvites", {
         count: Number(mintCount()),
@@ -125,23 +130,27 @@ export const AdminInvitesPanel = () => {
     } catch (error) {
       panelError.set(errorMessage(error));
     }
+
     busy.set(false);
   };
 
   const revoke = async (id: string) => {
     busy.set(true);
     panelError.set("");
+
     try {
       await api<{ ok: true }>("/api/admin/adminRevokeInvite", id);
       await reload();
     } catch (error) {
       panelError.set(errorMessage(error));
     }
+
     busy.set(false);
   };
 
   const loading = res.loading() && res.data() === undefined;
   let body: View;
+
   if (loading) {
     body = <SkeletonRows />;
   } else if (shown.length === 0) {
@@ -166,6 +175,7 @@ export const AdminInvitesPanel = () => {
       </>
     );
   }
+
   return (
     <PanelCard
       title="Invites"

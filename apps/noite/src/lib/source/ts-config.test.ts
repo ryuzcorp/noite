@@ -8,9 +8,11 @@ import { normalizePath, specMatches, VirtualFs } from "./virtual-fs";
 /** A repo-shaped virtual FS: `text` per repository-relative path. */
 const repoFs = (files: Record<string, string>): VirtualFs => {
   const fs = new VirtualFs();
+
   for (const [path, text] of Object.entries(files)) {
     fs.write(`/${path}`, text);
   }
+
   return fs;
 };
 
@@ -25,6 +27,7 @@ describe("resolveRepoConfig", () => {
       "src/main.ts": "export const a = 1;\n",
       "src/util.tsx": "export const B = () => null;\n",
     };
+
     const config = resolveRepoConfig(repoFs(files), paths(files));
     expect(config.options).toEqual(defaultCompilerOptions());
     expect(config.options.target).toBe(ts.ScriptTarget.ESNext);
@@ -52,6 +55,7 @@ describe("resolveRepoConfig", () => {
         include: ["src"],
       }),
     };
+
     const config = resolveRepoConfig(repoFs(files), paths(files));
     expect(config.options.target).toBe(ts.ScriptTarget.ES2022);
     expect(config.options.jsx).toBe(ts.JsxEmit.ReactJSX);
@@ -72,6 +76,7 @@ describe("resolveRepoConfig", () => {
         include: ["src"],
       }),
     };
+
     const config = resolveRepoConfig(repoFs(files), paths(files));
     expect(config.roots).toEqual(["/src/main.ts"]);
   });
@@ -81,6 +86,7 @@ describe("resolveRepoConfig", () => {
       "src/main.ts": "export const a = 1;\n",
       "tsconfig.json": "{ nope",
     };
+
     const config = resolveRepoConfig(repoFs(files), paths(files));
     // The parser stamps the config's own path onto the options it returns;
     // every actual option stays the fallback.
@@ -98,6 +104,7 @@ describe("resolveRepoConfig", () => {
         compilerOptions: { module: "commonjs" },
       }),
     };
+
     const config = resolveRepoConfig(repoFs(files), paths(files));
     expect(config.options.module).toBe(ts.ModuleKind.CommonJS);
     expect(config.options.moduleResolution).toBeUndefined();
@@ -108,9 +115,11 @@ describe("resolveRepoConfig", () => {
 
   test("caps the fallback root set", () => {
     const files: Record<string, string> = {};
+
     for (let i = 0; i < 420; i += 1) {
       files[`src/file${String(i).padStart(3, "0")}.ts`] = "export {};\n";
     }
+
     const config = resolveRepoConfig(repoFs(files), paths(files));
     expect(config.roots).toHaveLength(400);
   });

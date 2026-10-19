@@ -31,6 +31,7 @@ const git = (...args: string[]): string =>
 const controlBuild = (): string => {
   try {
     const sha = git("rev-parse", "--short", "HEAD");
+
     return git("status", "--porcelain", "--", ".") ? `${sha}-dirty` : sha;
   } catch {
     return new Date().toISOString();
@@ -48,6 +49,7 @@ const curatedShikiLangs = (): Plugin => ({
     if (id === "\0shiki-lang-stub") {
       return "export default {};\n";
     }
+
     return null;
   },
   name: "curated-shiki-langs",
@@ -55,10 +57,13 @@ const curatedShikiLangs = (): Plugin => ({
     if (!source.startsWith("@shikijs/langs/")) {
       return null;
     }
+
     const lang = source.slice("@shikijs/langs/".length);
+
     if (CURATED_SHIKI_LANGS.includes(lang)) {
       return null;
     }
+
     // One shared id: every excluded grammar resolves to the same empty
     // module, so the bundler emits a single tiny chunk, not hundreds.
     return "\0shiki-lang-stub";
@@ -91,6 +96,7 @@ const crossOriginIsolation = (): Plugin => ({
       for (const [name, value] of Object.entries(ISOLATION_HEADERS)) {
         response.setHeader(name, value);
       }
+
       next();
     });
   },
@@ -133,6 +139,7 @@ const podHostFile = (pathname: string): PodHostFile | null => {
       type: "text/html; charset=utf-8",
     };
   }
+
   return null;
 };
 
@@ -150,6 +157,7 @@ const podHostEntry = (): Plugin => ({
     if (environmentName !== "client") {
       return;
     }
+
     return {
       build: {
         rollupOptions: {
@@ -182,34 +190,45 @@ const podHostFrame = (): Plugin => ({
   configureServer(server) {
     server.middlewares.use((request, response, next) => {
       const pathname = (request.url ?? "").split("?")[0] ?? "";
+
       if (isPreviewHost(request.headers.host ?? null)) {
         if (!(pathname in POD_ASSETS)) {
           // Nodepod's own assets and the preview bridge: not this plugin's.
           next();
+
           return;
         }
+
         const file = podHostFile(pathname);
+
         if (file === null) {
           // Nodepod's own assets, on the host that serves them.
           next();
+
           return;
         }
+
         for (const [name, value] of Object.entries(POD_HOST_HEADERS)) {
           response.setHeader(name, value);
         }
+
         response.setHeader("Content-Type", file.type);
         response.statusCode = 200;
         response.end(file.body);
+
         return;
       }
+
       // The control UI's own host: nothing that could put a worker or a
       // registerable service worker there answers (see
       // `CONTROL_HOST_DENIED_ASSETS`).
       if (isControlDeniedAsset(pathname)) {
         response.statusCode = 404;
         response.end("Not Found");
+
         return;
       }
+
       next();
     });
   },
@@ -298,6 +317,7 @@ const CELLD_KEYS = [
   "workflows",
   "r2_buckets",
 ] as const;
+
 /** One D1 binding entry in Void's generated `dist/ssr/wrangler.json`. */
 interface D1DatabaseEntry {
   binding?: string;
@@ -321,40 +341,51 @@ const emitCelldConfig = (): Plugin => ({
   closeBundle() {
     const dist = path.resolve(APP_ROOT, "dist");
     const dirs = [dist, path.join(dist, "ssr")];
+
     for (const dir of dirs) {
       let entries: string[] = [];
+
       try {
         entries = readdirSync(dir);
       } catch {
         continue;
       }
+
       for (const entry of entries) {
         if (entry === ".dev.vars" || entry.startsWith(".dev.vars.")) {
           rmSync(path.join(dir, entry), { force: true });
         }
       }
     }
+
     rmSync(path.join(dist, "client", ".assetsignore"), { force: true });
     let emitted: string;
+
     try {
       emitted = readFileSync(path.join(dist, "ssr", "wrangler.json"), "utf-8");
     } catch {
       return;
     }
+
     /* oxlint-disable anti-slop/no-unknown-returns, anti-slop/no-unsafe-dictionary-type, anti-slop/no-runtime-typeof, anti-slop/require-safety-comment-for-type-assertion -- the build boundary: Void's generated wrangler.json is JSON whose keys are celld's config surface, so its shape is an open dictionary and this is the one place that takes it apart. Every field is checked here before it is read, and only CELLD_KEYS allowlisted entries leave this section. */
     const ssr = JSON.parse(emitted) as Record<string, unknown>;
+
     const ssrAssets =
       typeof ssr["assets"] === "object" && ssr["assets"] !== null
         ? (ssr["assets"] as Record<string, unknown>)
         : {};
+
     const ssrMain =
       typeof ssr["main"] === "string" && ssr["main"] ? ssr["main"] : "index.js";
+
     const config: Record<string, unknown> = {};
+
     for (const key of CELLD_KEYS) {
       if (key in ssr) {
         config[key] = ssr[key];
       }
     }
+
     config["main"] = `ssr/${ssrMain}`;
     // Boolean `true`: the same form `cloudflare.config.ts` used on main (the
     // lane-green shape), kept because Void's build forces the pattern-array
@@ -369,6 +400,7 @@ const emitCelldConfig = (): Plugin => ({
       directory: "client",
       run_worker_first: true,
     };
+
     // D1 is keyed by name: drop Void's default `migrations_dir` (it points
     // at a directory that does not exist; schema migrates at runtime via
     // `ensureDb`, never through wrangler migrations).
@@ -380,6 +412,7 @@ const emitCelldConfig = (): Plugin => ({
         }
       }
     }
+
     /* oxlint-enable anti-slop/no-unknown-returns, anti-slop/no-unsafe-dictionary-type, anti-slop/no-runtime-typeof, anti-slop/require-safety-comment-for-type-assertion */
     config["vars"] = {};
     writeFileSync(

@@ -16,6 +16,7 @@ export const countControlUsers = (): Promise<number> =>
     Effect.gen(function* countUsers() {
       const sql = yield* SqlClient;
       const rows = yield* sql<{ n: number }>`SELECT COUNT(*) AS n FROM "user"`;
+
       return Number(rows[0]?.n ?? 0);
     })
   );
@@ -25,6 +26,7 @@ export const countControlUsers = (): Promise<number> =>
  * bearer call, so the gate has to live here. */
 export const getTelemetry = apiActionNoInput(async ({ env, request }) => {
   await requireControlAdmin(request, env);
+
   try {
     return await runnerTelemetryGet();
   } catch (error) {
@@ -40,6 +42,7 @@ export const setTelemetry = apiAction(
   SetTelemetry,
   async ({ enabled }, { env, request }) => {
     await requireControlAdmin(request, env);
+
     try {
       return await runnerTelemetrySet(enabled);
     } catch (error) {

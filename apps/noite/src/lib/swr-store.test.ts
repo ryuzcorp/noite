@@ -15,6 +15,7 @@ import { clearSwrStore, readSwr, writeSwr } from "./swr-store";
 
 const backing = new Map<string, string>();
 let failWrites = false;
+
 const stub: Storage = {
   clear: () => {
     backing.clear();
@@ -31,6 +32,7 @@ const stub: Storage = {
     if (failWrites) {
       throw new Error("quota exceeded");
     }
+
     backing.set(key, value);
   },
 };

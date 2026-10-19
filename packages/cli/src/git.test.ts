@@ -11,6 +11,7 @@ import { clearWorkdir, copyTreeEntries } from "./git.js";
 describe("copyTreeEntries", () => {
   test("copies dotfiles and dotdirs a * glob would drop", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "noite-copy-"));
+
     try {
       const src = path.join(root, "src");
       const dest = path.join(root, "dest");
@@ -33,6 +34,7 @@ describe("copyTreeEntries", () => {
 describe("clearWorkdir", () => {
   test("removes stale dotfiles but keeps .git for ancestry", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "noite-clear-"));
+
     try {
       const workdir = path.join(root, "work");
       await mkdir(path.join(workdir, ".git"), { recursive: true });

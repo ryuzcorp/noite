@@ -26,18 +26,23 @@ const defaultMessage = (sha: string | null): string =>
  * `null` when the git base is not a URL. */
 export const deployUrlOf = (gitBase: string, slug: string): string | null => {
   let url: URL;
+
   try {
     url = new URL(gitBase);
   } catch {
     return null;
   }
+
   const bare = url.hostname.startsWith("git.")
     ? url.hostname.slice("git.".length)
     : url.hostname;
+
   const base = bare.replace(/\.+$/u, "");
+
   if (base === "") {
     return null;
   }
+
   return `${url.protocol}//${slug}.${base}${url.port === "" ? "" : `:${url.port}`}`;
 };
 
@@ -74,13 +79,16 @@ export const remoteUrlOf = (
   token: string
 ): string | null => {
   let url: URL;
+
   try {
     url = new URL(gitBase);
   } catch {
     return null;
   }
+
   // Basic `git` + profile API key, same shape as deploy.sh remotes.
   const base = url.pathname.replace(/\/+$/u, "");
+
   return `${url.protocol}//git:${token}@${url.host}${base}/${slug}`;
 };
 
@@ -123,23 +131,30 @@ export const deploy = Command.make(
   (config) =>
     Effect.gen(function* run() {
       const commentMode = parseCommentMode(config.comment);
+
       if (commentMode === null) {
         return yield* Effect.fail("--comment must be update, create, or off");
       }
+
       const ctx = yield* readActionContext();
       const conn = yield* connection(config, ctx.repo);
       const resolvedSlug = conn.slug;
+
       if (["app", "api", "git"].includes(resolvedSlug)) {
         return yield* Effect.fail(
           `slug ${resolvedSlug} is reserved (app/api/git)`
         );
       }
+
       const { gitBase, token } = conn;
       const remoteUrl = remoteUrlOf(gitBase, resolvedSlug, token);
+
       if (remoteUrl === null) {
         return yield* Effect.fail(`git base URL is malformed: ${gitBase}`);
       }
+
       const url = deployUrlOf(gitBase, resolvedSlug);
+
       if (url === null) {
         return yield* Effect.fail(`git base URL is malformed: ${gitBase}`);
       }
@@ -151,17 +166,22 @@ export const deploy = Command.make(
           `wrangler config not found: ${config.wrangler}`
         );
       }
+
       const distDir = config.dist.replace(/\/+$/u, "");
+
       const message =
         config.message === "" ? defaultMessage(ctx.sha) : config.message;
+
       // The staging dir is removed on success; on failure it is kept and
       // warned about (`withTempDir`) for post-mortem.
       const sha = yield* withTempDir((staging) =>
         Effect.gen(function* stage() {
           yield* stageDist(distDir, staging, config.wrangler);
+
           return yield* pushTree({ message, remoteUrl, treeDir: staging });
         })
       );
+
       yield* Effect.logInfo(
         `deployed ${resolvedSlug}@${sha.slice(0, 12)} → ${url}`
       );
