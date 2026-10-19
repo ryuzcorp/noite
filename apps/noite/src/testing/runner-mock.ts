@@ -60,6 +60,20 @@ export const installRunnerMock = (apps: RunnerApp[]): RunnerMock => {
       case "apps.get_by_slug": {
         return mock.apps.find((app) => app.slug === call.params.slug) ?? null;
       }
+      case "apps.create": {
+        const created = makeApp({
+          id: `app-${mock.apps.length + 1}`,
+          name: String(call.params.name ?? "Created"),
+          slug: String(call.params.slug ?? "created"),
+          userId: String(call.params.userId ?? ""),
+        });
+        mock.apps.push(created);
+        return created;
+      }
+      case "apps.delete": {
+        mock.apps = mock.apps.filter((app) => app.id !== call.params.id);
+        return { ok: true };
+      }
       default: {
         return null;
       }
