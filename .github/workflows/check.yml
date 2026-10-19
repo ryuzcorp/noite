@@ -41,6 +41,15 @@ jobs:
           docker compose -f docker/compose.yaml -f docker/compose.build.yaml config > /dev/null
           docker compose -f docker/compose.yaml -f docker/compose.dev.yaml config > /dev/null
           docker compose -f docker/compose.yaml -f docker/compose.e2e.yaml config > /dev/null
+      # The runner prints tenant URLs from its own env: both public ports
+      # must reach the container, or prod links a dev-default port (the
+      # first-push note once printed :9443 on a :443 install).
+      - name: runner sees both public ports
+        run: |
+          docker compose -f docker/compose.yaml config | grep -qE "HTTP_PORT: ['\"]?9080['\"]?"
+          docker compose -f docker/compose.yaml config | grep -qE "HTTPS_PORT: ['\"]?9443['\"]?"
+          HTTPS_PORT=443 docker compose -f docker/compose.yaml config | grep -qE "HTTPS_PORT: ['\"]?443['\"]?"
+          HTTP_PORT=8090 HTTPS_PORT=8443 docker compose -f docker/compose.yaml -f docker/compose.e2e.yaml config | grep -qE "HTTPS_PORT: ['\"]?8443['\"]?"
       # Parse each script with its shebang's shell: `sh` is dash here, and
       # install.sh/uninstall.sh are bash.
       - name: shell scripts parse

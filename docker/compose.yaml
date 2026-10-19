@@ -37,6 +37,11 @@ services:
       # Unset = on except a `localhost` base; `off` behind a terminating proxy.
       CADDY_AUTO_HTTPS: ${CADDY_AUTO_HTTPS:-}
       HTTP_PORT: ${HTTP_PORT:-9080}
+      # The runner prints tenant URLs from these two (never the git remote):
+      # dev `http://{slug}.{base}:$HTTP_PORT`, prod `https://{slug}.{domain}`
+      # (`:443` omitted, any other HTTPS_PORT carried). A prod install that
+      # leaves HTTPS_PORT unset links the 9443 dev default — unreachable.
+      HTTPS_PORT: ${HTTPS_PORT:-9443}
       # Derived from BASE_DOMAIN (same rule as BETTER_AUTH_URL below), so a
       # custom base needs no override; an explicit GIT_PUBLIC_BASE still wins.
       GIT_PUBLIC_BASE: ${GIT_PUBLIC_BASE:-http://git.${BASE_DOMAIN:-noite.localhost}:${HTTP_PORT:-9080}}
