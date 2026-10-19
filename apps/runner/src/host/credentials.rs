@@ -80,6 +80,8 @@ impl CredentialProvider for RootProvider {
 fn kek(runner_token: &str) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(None, runner_token.as_bytes());
     let mut out = [0u8; 32];
+    // Static invariant: a 32-byte output never exceeds the HKDF length limit,
+    // so expansion cannot fail.
     hk.expand(b"noite-app-credential-v1", &mut out)
         .expect("hkdf expand");
     out

@@ -45,6 +45,8 @@ pub fn aws_env(cfg: &Config) -> Vec<(&str, String)> {
 
 /// Connection-pooled HTTP client shared by every S3 call: one pool for the
 /// process instead of one Python heap per call.
+// Static invariant: the default builder carries no fallible configuration —
+// a failure here is a process-start condition, never request data.
 static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| reqwest::Client::builder().build().expect("reqwest client"));
 
@@ -352,6 +354,7 @@ fn sigv4_authorization(
         hasher.finalize()
     );
     let sign = |key: &[u8], msg: &[u8]| {
+        // Static invariant: HMAC accepts keys of any length, so construction never fails.
         let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
         mac.update(msg);
         mac.finalize().into_bytes().to_vec()

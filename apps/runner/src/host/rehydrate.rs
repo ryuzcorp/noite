@@ -27,9 +27,14 @@ pub async fn ensure_deploy_mirror(cfg: &Config, slug: &str) -> anyhow::Result<bo
     tokio::fs::create_dir_all(&bare).await.ok();
     tokio::fs::create_dir_all(&root).await.ok();
     if !bare.join("HEAD").exists() {
+        // Work-dir-derived paths are operator-influenced (a non-UTF-8 mount):
+        // fail the rehydrate instead of panicking the task.
+        let Some(bare_arg) = bare.to_str() else {
+            anyhow::bail!("bare mirror path is not valid UTF-8: {}", bare.display());
+        };
         exec::run_cmd(
             "git",
-            &["init", "--bare", bare.to_str().unwrap()],
+            &["init", "--bare", bare_arg],
             Some(&root),
             &[],
             Duration::from_secs(30),
@@ -45,12 +50,16 @@ pub async fn ensure_deploy_mirror(cfg: &Config, slug: &str) -> anyhow::Result<bo
         anyhow::bail!("download tip bundle for {slug} failed: {e:#}");
     }
     let refspec = format!("+{}:refs/heads/main", tip.sha);
+    let Some(tmp_arg) = tmp.to_str() else {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        anyhow::bail!("bundle path is not valid UTF-8: {}", tmp.display());
+    };
     let fetched = exec::run_cmd(
         "git",
         &[
             &format!("--git-dir={}", bare.display()),
             "fetch",
-            tmp.to_str().unwrap(),
+            tmp_arg,
             &refspec,
         ],
         Some(&root),

@@ -264,7 +264,12 @@ pub(crate) async fn init_bare(repo: &Path) -> anyhow::Result<()> {
 
 pub(crate) async fn ensure_bare(cfg: &Config, slug: &str) -> anyhow::Result<PathBuf> {
     let bare = http_bare(cfg, slug);
-    tokio::fs::create_dir_all(bare.parent().unwrap()).await?;
+    // Work-dir-derived paths are operator-influenced (a non-UTF-8 mount):
+    // fail the request instead of panicking the task.
+    let Some(parent) = bare.parent() else {
+        anyhow::bail!("bare mirror path has no parent: {}", bare.display());
+    };
+    tokio::fs::create_dir_all(parent).await?;
     if !bare.join("HEAD").exists() {
         init_bare(&bare).await?;
         hydrate_from_s3(cfg, &bare, slug).await?;
@@ -300,6 +305,7 @@ async fn hydrate_from_s3(cfg: &Config, bare: &Path, slug: &str) -> anyhow::Resul
     let Some(contents) = v.get("Contents").and_then(|c| c.as_array()) else {
         return Ok(());
     };
+    // Static invariant: a compile-time literal, so construction never fails.
     let re = regex::Regex::new(r"(?i)/([0-9a-f]{7,40})\.bundle$").expect("bundle re");
     // ref → (key, sha, last_modified)
     let mut best: HashMap<String, (String, String, String)> = HashMap::new();
@@ -310,6 +316,7 @@ async fn hydrate_from_s3(cfg: &Config, bare: &Path, slug: &str) -> anyhow::Resul
         let Some(caps) = re.captures(key) else {
             continue;
         };
+        // Static invariant: group 1 is present in the literal above, so a match always yields it.
         let sha = caps.get(1).unwrap().as_str().to_lowercase();
         // git/{slug}/refs/heads/main/{sha}.bundle → refs/heads/main
         let Some(after) = key.strip_prefix(&format!("git/{slug}/")) else {
@@ -342,12 +349,15 @@ async fn hydrate_from_s3(cfg: &Config, bare: &Path, slug: &str) -> anyhow::Resul
         let bundle = tmp.join(format!("{sha}.bundle"));
         s3::s3_cp_download(cfg, &cfg.s3_uri(&key), &bundle).await?;
         let refspec = format!("+{sha}:{refname}");
+        let Some(bundle_arg) = bundle.to_str() else {
+            anyhow::bail!("bundle path is not valid UTF-8: {}", bundle.display());
+        };
         exec::run_cmd(
             "git",
             &[
                 &format!("--git-dir={}", bare.display()),
                 "fetch",
-                bundle.to_str().unwrap(),
+                bundle_arg,
                 &refspec,
             ],
             None,
@@ -714,14 +724,16 @@ pub async fn info_refs(
     } else {
         "receive-pack"
     };
+    let Some(bare_arg) = bare.to_str() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("bare mirror path is not valid UTF-8: {}", bare.display()),
+        )
+            .into_response();
+    };
     let out = match exec::run_cmd(
         "git",
-        &[
-            prog,
-            "--stateless-rpc",
-            "--advertise-refs",
-            bare.to_str().unwrap(),
-        ],
+        &[prog, "--stateless-rpc", "--advertise-refs", bare_arg],
         None,
         &[],
         Duration::from_secs(30),
@@ -763,13 +775,16 @@ pub async fn upload_pack(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     };
     refresh_from_manifest(&state, &app.slug, &bare).await;
+    let Some(bare_arg) = bare.to_str() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("bare mirror path is not valid UTF-8: {}", bare.display()),
+        )
+            .into_response();
+    };
     match exec::run_cmd_stdin(
         "git",
-        &[
-            "upload-pack",
-            "--stateless-rpc",
-            bare.to_str().unwrap_or_default(),
-        ],
+        &["upload-pack", "--stateless-rpc", bare_arg],
         &body,
         None,
         &[],
@@ -807,7 +822,7 @@ fn policy_head(body: &[u8]) -> Result<Vec<git_policy::PushCommand>, (StatusCode,
 /// git itself (non-fast-forward updates and ref deletions need admin), so a
 /// parsing divergence cannot become a force-push or a delete (NOITE-GIT-001).
 /// `-c` must precede the subcommand.
-fn receive_argv(bare: &Path, deny: bool) -> Vec<String> {
+fn receive_argv(bare: &Path, deny: bool) -> anyhow::Result<Vec<String>> {
     let mut argv: Vec<String> = Vec::new();
     if deny {
         argv.extend(
@@ -820,8 +835,11 @@ fn receive_argv(bare: &Path, deny: bool) -> Vec<String> {
             .map(str::to_string),
         );
     }
-    argv.extend(["receive-pack", "--stateless-rpc", bare.to_str().unwrap()].map(str::to_string));
-    argv
+    let Some(bare_arg) = bare.to_str() else {
+        anyhow::bail!("bare mirror path is not valid UTF-8: {}", bare.display());
+    };
+    argv.extend(["receive-pack", "--stateless-rpc", bare_arg].map(str::to_string));
+    Ok(argv)
 }
 
 pub async fn receive_pack(
@@ -894,7 +912,10 @@ pub async fn receive_pack(
     // Defense in depth for the policy above: git itself refuses non-fast-forward
     // updates and ref deletions for anything below admin, so a parsing
     // divergence can never become a force-push or a delete (NOITE-GIT-001).
-    let argv = receive_argv(&bare, role != "admin");
+    let argv = match receive_argv(&bare, role != "admin") {
+        Ok(argv) => argv,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    };
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     let out =
         match exec::run_cmd_stdin("git", &argv, &body, None, &[], Duration::from_secs(300)).await {
@@ -1115,6 +1136,17 @@ mod tests {
         assert!(policy_head(&weird).is_err());
     }
 
+    /// A non-UTF-8 mirror path (an operator mount) is an error, never a panic:
+    /// every argv/path conversion in this module reports instead of unwrapping.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_mirror_paths_are_errors_not_panics() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/\xff.git"));
+        let err = receive_argv(bad, true).expect_err("refused");
+        assert!(format!("{err:#}").contains("not valid UTF-8"), "{err:#}");
+    }
+
     /// NOITE-GIT-002: the UI's reply must name a known role — an absent one is
     /// a refusal, never "push".
     #[test]
@@ -1167,7 +1199,7 @@ mod tests {
             body
         };
         let run = |deny: bool, body: Vec<u8>| {
-            let argv = receive_argv(&bare, deny);
+            let argv = receive_argv(&bare, deny).expect("argv");
             async move {
                 let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
                 exec::run_cmd_stdin("git", &refs, &body, None, &[], Duration::from_secs(60))
