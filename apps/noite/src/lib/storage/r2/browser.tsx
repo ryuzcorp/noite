@@ -71,7 +71,9 @@ const R2Page = ({
   const res = r2List(appId, bucket, prefix, cursor);
   const search = atom("");
   const selected = atom<string | null>(null);
-  const checked = atom<Set<string>>(new Set<string>());
+  // A Set serializes as `{}`: out of the SSR snapshot, rebuilt by the
+  // client on hydration.
+  const checked = atom<Set<string>>(new Set<string>(), { snapshot: false });
   const confirming = atom(false);
   const busy = atom(false);
   const failure = atom("");

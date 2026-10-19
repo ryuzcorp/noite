@@ -202,7 +202,11 @@ const CodeSidePanel = ({
   // The tabs this panel has opened, one set per panel mount: a tab is drawn
   // from its first visit on, so a deep link (`?panel=history`) mounts only the
   // tab it names, and no tab fetches before it is opened.
-  const opened = atom.lazy(() => new Set<Exclude<CodePanel, "">>())();
+  // A Set does not survive the SSR snapshot (serializes as `{}`), so it
+  // stays out of it; the client builds its own on hydration.
+  const opened = atom.lazy(() => new Set<Exclude<CodePanel, "">>(), {
+    snapshot: false,
+  })();
   if (open) {
     opened.add(tab);
   }
@@ -353,7 +357,11 @@ const SourceBody = ({ appId }: { appId: string }) => {
   // The terminal panel's session: the canvas shows the shell the pod frame
   // runs, and a panel left open keeps it across a ref change (the new browser
   // attaches on mount).
-  const terminalSession = atom.lazy(() => createTerminalSession())();
+  // The session is closures over the shell (functions do not serialize), so
+  // it stays out of the SSR snapshot; the client builds its own on hydration.
+  const terminalSession = atom.lazy(() => createTerminalSession(), {
+    snapshot: false,
+  })();
   // The state every group below is seeded with: which tab `?panel=` names
   // ("" = closed) and whether the terminal is open.
   const openPanel = panel();
@@ -368,17 +376,25 @@ const SourceBody = ({ appId }: { appId: string }) => {
   // The page's pane groups. Each keeps its own split in localStorage and binds
   // to the elements below at `lg` and up; the side panel's own state follows
   // `?panel=` (see `setOpen` in the render).
-  const treePanes = atom.lazy(() => createPaneGroup(TREE_PANES))();
-  const panelPanes = atom.lazy(() =>
-    createPaneGroup({
-      ...PANEL_PANES,
-      closed: openPanel === "" ? [...PANEL_PANES.collapsible] : [],
-      onCollapsed: () => {
-        closePanel();
-      },
-    })
+  // Pane groups hold functions and DOM state (see layout.tsx): out of the
+  // snapshot, rebuilt by the client on hydration.
+  const treePanes = atom.lazy(() => createPaneGroup(TREE_PANES), {
+    snapshot: false,
+  })();
+  const panelPanes = atom.lazy(
+    () =>
+      createPaneGroup({
+        ...PANEL_PANES,
+        closed: openPanel === "" ? [...PANEL_PANES.collapsible] : [],
+        onCollapsed: () => {
+          closePanel();
+        },
+      }),
+    { snapshot: false }
   )();
-  const terminalPanes = atom.lazy(() => createPaneGroup(TERMINAL_PANES))();
+  const terminalPanes = atom.lazy(() => createPaneGroup(TERMINAL_PANES), {
+    snapshot: false,
+  })();
   // The tree column's shadow-pane host: the column is a pane of this page's
   // own group, so the page renders it and hands the browser the mount point
   // (see `./source/browser`).

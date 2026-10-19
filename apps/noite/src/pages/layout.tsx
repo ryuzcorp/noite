@@ -111,7 +111,12 @@ export default function DashboardLayout({ children }: { children?: View }) {
   // The chrome's own state, like the cell above: the sidebar is part of the
   // shell, so it is created before the /login early return — nothing binds
   // there, because the drawer is not rendered.
-  const sidebar = atom.lazy(() => createPaneGroup(SIDEBAR_PANES))();
+  // The group holds functions and DOM state: it cannot cross the SSR
+  // snapshot (functions do not serialize), so it stays out of it and the
+  // client builds its own on hydration.
+  const sidebar = atom.lazy(() => createPaneGroup(SIDEBAR_PANES), {
+    snapshot: false,
+  })();
   watch.once(({ onCleanup }) => {
     onCleanup(() => {
       sidebar.destroy();

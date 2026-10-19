@@ -473,7 +473,11 @@ export const ChangesPanel = ({
   const { conflicts, files, readOnly, revision, stale } = state();
   // One controller per mounted panel: a dialog left open by a close is torn
   // down with it instead of blocking the page.
-  const dialogs = atom.lazy(() => new AbortController())();
+  // A live controller does not survive the SSR snapshot: out of it, so the
+  // client builds its own on hydration.
+  const dialogs = atom.lazy(() => new AbortController(), {
+    snapshot: false,
+  })();
   watch.once(({ onCleanup }) => {
     onCleanup(() => {
       dialogs.abort();

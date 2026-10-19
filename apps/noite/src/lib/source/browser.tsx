@@ -188,7 +188,9 @@ export const SourceBrowser = ({
 }: SourceBrowserProps) => {
   // Per-instance state that must outlive re-renders; atom.lazy returns the
   // same box every render.
-  const box = atom.lazy(newBrowserBox)();
+  // The box carries the installed `request` closure (functions do not
+  // serialize): out of the SSR snapshot, rebuilt by the client on hydration.
+  const box = atom.lazy(newBrowserBox, { snapshot: false })();
   /** The app's branches. A push reads them to tell a branch it creates from
    * one the runner grows from its own tip, and it reads them when the push
    * runs — never during a render, so this component does not repaint with
