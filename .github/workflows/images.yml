@@ -182,7 +182,10 @@ jobs:
           TAG: ${{ github.ref_name }}
 
   # Release tags only, after everything above passed: `@noitenow/cli` to npm
-  # at the tag's exact version. OIDC trusted publishing (`id-token: write`),
+  # at the tag's exact version — or a logged skip when that version is
+  # already published (the owner hand-publishes the first one, so the
+  # bootstrap tag must stay green). OIDC trusted publishing
+  # (`id-token: write`),
   # so there is no npm token to rotate or leak; the trusted-publisher entry
   # on npmjs.com names this workflow file (`images.yml`). Provenance is
   # automatic for OIDC publishes from a public repo (no `--provenance`
@@ -199,7 +202,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       # npm >= 11.5.1 speaks OIDC; node 24 ships it.
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           registry-url: "https://registry.npmjs.org"
@@ -216,6 +219,24 @@ jobs:
             echo "::error::packages/cli is $version but the tag is $tag: bump it in the release commit (docker/check-versions.ts guards this)"
             exit 1
           fi
+          # Idempotent: the owner publishes the first version by hand
+          # (bootstrap), so the tag's own run must skip, not fail, when the
+          # version is already on npm. Only E404 means "not published";
+          # any other `npm view` failure (network, auth) fails the job.
+          if view_out="$(npm view "@noitenow/cli@${version}" version 2>&1)"; then
+            echo "version ${version} is already published (${view_out}): skipping"
+            exit 0
+          fi
+          case "$view_out" in
+            *E404*)
+              echo "version ${version} is not on npm yet: publishing"
+              ;;
+            *)
+              echo "::error::npm view for @noitenow/cli@${version} failed:"
+              printf '%s\n' "$view_out"
+              exit 1
+              ;;
+          esac
           case "$version" in
             *-* ) dist_tag=alpha ;;
             * ) dist_tag=latest ;;
