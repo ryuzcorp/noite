@@ -8,3 +8,11 @@ bunx @noitenow/cli deploy --slug <slug> --url https://git.<domain> --token $NOIT
 ```
 
 Bun must be on the machine that runs it (ships as a Bun bundle). Full reference — flags, environment fallbacks, the GitHub Actions workflow, outputs and PR comments — lives in the docs: <https://noite.now/reference/cli>.
+
+```sh
+noite environments vars get staging --slug <slug>
+noite environments vars set staging API_URL https://api.example.com --slug <slug>
+noite environments vars unset staging API_URL --slug <slug>
+```
+
+`noite environments` manages preview environments (list, create, delete, redeploy, public toggle, variable overrides) over the control UI's origin — see [the CLI reference](https://noite.now/reference/cli#environments).

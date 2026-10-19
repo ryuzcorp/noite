@@ -47,7 +47,7 @@ Flags fall back to env, then to GitHub Actions context:
 
 ## Outputs and PR comments
 
-In Actions it writes `url=` + `sha=` to `$GITHUB_OUTPUT` for downstream steps, and posts (or updates via marker) a PR comment with `gh` — no GitHub App needed:
+In Actions it writes `url=` + `sha=` to `$GITHUB_OUTPUT` for downstream steps, and posts (or updates via marker) a PR comment with `gh` — no GitHub App needed. The URL is the tenant host, `https://<slug>.<domain>` (`http://<slug>.noite.localhost:9080` for a localhost git base) — the same origin stdout and the comment link to.
 
 - `--comment update` (default): one comment per PR, updated on each deploy.
 - `--comment create`: a new comment per deploy.
@@ -66,6 +66,7 @@ noite environments deploy staging --slug my-app
 noite environments public staging on --slug my-app      # or `off`
 noite environments vars get staging --slug my-app
 noite environments vars set staging API_URL https://api.example.com --slug my-app
+noite environments vars unset staging API_URL --slug my-app
 noite environments delete staging --slug my-app
 ```
 

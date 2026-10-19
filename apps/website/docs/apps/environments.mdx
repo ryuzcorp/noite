@@ -58,7 +58,9 @@ noite environments list --slug my-app
 noite environments create --slug my-app --branch feature-x
 noite environments public staging on --slug my-app
 noite environments deploy staging --slug my-app
+noite environments vars get staging --slug my-app
 noite environments vars set staging API_URL https://api.example.com --slug my-app
+noite environments vars unset staging API_URL --slug my-app
 noite environments delete staging --slug my-app
 ```
 
