@@ -15,8 +15,11 @@ import {
 } from "./helpers";
 
 const SLUG = "rollback";
+// What `/files/test.txt` serves. The sample source spells the trailing
+// newline as a `\n` escape, so the source is matched on the text before it.
 const V1_MARKER = "hello from noite test app\n";
 const V2_MARKER = "hello from rollback probe v2\n";
+const sourceText = (marker: string): string => marker.trimEnd();
 
 /** The app this spec creates, dropped afterwards: the account's app quota
  * (10) is shared by the whole lane, and a leftover slug fails the next run's
@@ -37,10 +40,10 @@ const pushMarkerRevision = (apiKey: string, marker: string): string =>
   pushAppDir(apiKey, new URL("../test", import.meta.url), SLUG, (dir) => {
     const file = nodePath.join(dir, "index.ts");
     const before = readFileSync(file, "utf-8");
-    const after = before.replace(V1_MARKER, marker);
-    if (after === before) {
+    if (!before.includes(sourceText(V1_MARKER))) {
       throw new Error("the R2 probe text moved; update the marker");
     }
+    const after = before.replace(sourceText(V1_MARKER), sourceText(marker));
     writeFileSync(file, after);
   });
 
