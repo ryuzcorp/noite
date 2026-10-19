@@ -63,6 +63,39 @@ export const notifyQueryChanged = (): void => {
   cell?.update((version) => version + 1);
 };
 
+/** A client navigation (a Void visit, back/forward) changes the query string
+ * without remounting the layout — so `provideQueryCell` never re-runs — and
+ * without an in-place write, so param readers would stay stale until an
+ * unrelated repaint. Void's router has no query-state hook (see the module
+ * doc), so watch the history methods instead and bump the cell on every one;
+ * an extra bump is one harmless repaint. Client-only: the server never
+ * navigates, and there is exactly one history per page. */
+let historyWatched = false;
+if (typeof window !== "undefined") {
+  const bump = (): void => {
+    notifyQueryChanged();
+  };
+  const { history } = window;
+  const pushState = history.pushState.bind(history);
+  history.pushState = (
+    ...args: [data: unknown, unused: string, url?: string | URL | null]
+  ): void => {
+    pushState(...args);
+    bump();
+  };
+  const replaceState = history.replaceState.bind(history);
+  history.replaceState = (
+    ...args: [data: unknown, unused: string, url?: string | URL | null]
+  ): void => {
+    replaceState(...args);
+    bump();
+  };
+  if (!historyWatched) {
+    historyWatched = true;
+    window.addEventListener("popstate", bump);
+  }
+}
+
 /** Read and write one query param in the live document location. Unlike a
  * plain read, reading subscribes the reading component to in-place writes. */
 export const searchParam: SearchParamFn = <T>(
