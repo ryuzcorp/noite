@@ -133,12 +133,31 @@ const toggle = Command.make(
   Command.withDescription("Make an environment public, or members-only again")
 );
 
+/** Argument mapping for `vars get/set/unset`, exported for tests: the MCP
+ * tools take `key`, the CLI spells it `name`. */
+export const varsGetArgs = (flags: {
+  readonly environment: string;
+}): ToolArgs => ({ environment: flags.environment });
+
+export const varsSetArgs = (flags: {
+  readonly environment: string;
+  readonly name: string;
+  readonly value: string;
+}): ToolArgs => ({
+  environment: flags.environment,
+  key: flags.name,
+  value: flags.value,
+});
+
+export const varsUnsetArgs = (flags: {
+  readonly environment: string;
+  readonly name: string;
+}): ToolArgs => ({ environment: flags.environment, key: flags.name });
+
 const varsGet = Command.make(
   "get",
   { ...connFlags, environment: Argument.String("environment") },
-  run<ConnFlags & { environment: string }>("environment_env_list", (flags) => ({
-    environment: flags.environment,
-  }))
+  run<ConnFlags & { environment: string }>("environment_env_list", varsGetArgs)
 ).pipe(Command.withDescription("List an environment's variable overrides"));
 
 const varsSet = Command.make(
@@ -151,19 +170,32 @@ const varsSet = Command.make(
   },
   run<ConnFlags & { environment: string; name: string; value: string }>(
     "environment_env_set",
-    (flags) => ({
-      environment: flags.environment,
-      key: flags.name,
-      value: flags.value,
-    })
+    varsSetArgs
   )
 ).pipe(Command.withDescription("Set one variable override for an environment"));
+
+const varsUnset = Command.make(
+  "unset",
+  {
+    ...connFlags,
+    environment: Argument.String("environment"),
+    name: Argument.String("name"),
+  },
+  run<ConnFlags & { environment: string; name: string }>(
+    "environment_env_unset",
+    varsUnsetArgs
+  )
+).pipe(
+  Command.withDescription(
+    "Remove one variable override, falling back to the app's value"
+  )
+);
 
 const vars = Command.make("vars").pipe(
   Command.withDescription(
     "An environment's variable overrides (the app's variables are inherited)"
   ),
-  Command.withSubcommands([varsGet, varsSet])
+  Command.withSubcommands([varsGet, varsSet, varsUnset])
 );
 
 export const environments = Command.make("environments").pipe(
