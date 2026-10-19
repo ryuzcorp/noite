@@ -17,6 +17,12 @@ use crate::AppState;
 /// the mirrors of a slug another create just landed. Creating an app is
 /// human-paced (and the push-to-create path), so one process-wide lock is the
 /// honest fix: the whole check → purge → quota → insert sequence runs alone.
+///
+/// Lock ordering with the other guards (deadlock rule, see
+/// [`crate::host::git_manifest::GitSync`]): `CREATE_LOCK` is outermost, then
+/// the per-app `AppLock`, then the per-slug `push_guard`. Create holds
+/// `CREATE_LOCK` + its slug's `push_guard`; a slug-changing rename holds all
+/// three; delete holds `AppLock` + its slug's `push_guard`.
 static CREATE_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -79,13 +85,21 @@ pub async fn create(
     // runs under one lock — the slug re-check, the purge, the quota count and
     // the insert cannot interleave with another create.
     let _create = CREATE_LOCK.lock().await;
+    // R-12: the purge destroys the same `git/<slug>/` + `fleets/<slug>/`
+    // prefixes pushes write under `push_guard(&slug)`, so the guard stays
+    // held across purge → init → insert (ordering: CREATE_LOCK → push_guard).
+    // A push to a half-created slug either lands fully before the purge or
+    // waits for the row.
+    let _push = state.git_sync.push_guard(&slug).await;
     match db::get_app_by_slug(&state.pool, &slug).await {
         Ok(Some(_)) => return Err(ApiError::conflict("slug already taken")),
         Ok(None) => {}
         Err(e) => return Err(ApiError::internal(e.to_string())),
     }
     // Always wipe leftover S3/local data for this slug before the new row lands
-    // — safe now: no row exists for it (checked just above, under this lock).
+    // — safe now: no row exists for it (checked just above, under these locks).
+    // Callers of `purge_slug` hold the slug's push guard (see its docs); the
+    // `_push` guard above is that holder for this path.
     if let Err(e) = purge::purge_slug(&state.config, &state.procs, &state.logs, &slug).await {
         return Err(ApiError::internal(format!(
             "failed to clear slug data: {e:#}"
@@ -220,6 +234,18 @@ pub async fn rename(
     if name.is_none() && slug.is_none() {
         return Err(ApiError::bad("name or slug required"));
     }
+    // R-03: the slug-taken check is per-slug but the rename lock is per app
+    // id, so two apps renaming onto one slug could both pass and both move
+    // prefixes before the second fails at the row write. A slug-changing
+    // rename therefore holds CREATE_LOCK across check → move → row update
+    // (ordering: CREATE_LOCK → AppLock → push_guard), serializing it against
+    // creates and every other slug rename. Name-only renames move nothing
+    // and skip it.
+    let _create = if slug.is_some() {
+        Some(CREATE_LOCK.lock().await)
+    } else {
+        None
+    };
     if let Some(s) = &slug {
         if !slug_ok(s) {
             return Err(ApiError::bad("invalid slug"));
@@ -238,6 +264,7 @@ pub async fn rename(
         &state.procs,
         &state.logs,
         &state.deploying,
+        &state.git_sync,
         id,
         name.as_deref(),
         slug.as_deref(),
@@ -253,6 +280,10 @@ pub async fn rename(
                 Err(ApiError::conflict(msg))
             } else if msg.contains("invalid slug") || msg.contains("app not found") {
                 Err(ApiError::bad(msg))
+            } else if msg.contains("slug already taken") || msg.contains("UNIQUE constraint") {
+                // Late loser of a slug race: the row write refused it after
+                // the moves. Still a 409, never a 500.
+                Err(ApiError::conflict("slug already taken"))
             } else {
                 Err(ApiError::internal(msg))
             }
@@ -263,31 +294,46 @@ pub async fn rename(
 pub async fn delete(state: &AppState, id: &str) -> Result<(), ApiError> {
     let app = app_or_404(state, id).await?;
     // Same lock as deploy: wait out an in-flight build, then purge exclusively.
+    // The row is deleted while the claim is still held (R-01): a waiter that
+    // acquires after us must find no row and bail instead of building into
+    // the just-purged prefix. Ordering here is AppLock → push_guard (see
+    // [`crate::host::git_manifest::GitSync`]); `purge_slug` requires its
+    // callers to hold the slug's push guard.
     if !deploy::claim_wait(&state.deploying, &app.id, Duration::from_secs(120)).await {
         return Err(ApiError::conflict("deploy in flight; retry delete shortly"));
     }
+    // R-02: a concurrent push writes under `push_guard(&slug)` across git +
+    // S3 + manifest; the purge must not run inside one of those writes.
+    let _push = state.git_sync.push_guard(&app.slug).await;
     // Mark it stopped before the fleet goes down: the purge takes seconds
     // (S3 prefixes), and an app still marked running is respawned in that
     // window by the reconcile loop or by a wake. A failed purge leaves the
     // app stopped, which a retried delete finishes.
-    db::patch_app_desired(&state.pool, &app.id, DesiredState::Stopped.as_str())
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if let Err(e) =
+        db::patch_app_desired(&state.pool, &app.id, DesiredState::Stopped.as_str()).await
+    {
+        deploy::release(&state.deploying, &app.id).await;
+        return Err(ApiError::internal(e.to_string()));
+    }
     let purge_result = purge::purge_slug(&state.config, &state.procs, &state.logs, &app.slug).await;
-    deploy::release(&state.deploying, &app.id).await;
     if let Err(e) = purge_result {
+        deploy::release(&state.deploying, &app.id).await;
         return Err(ApiError::internal(format!(
             "failed to purge app data: {e:#}"
         )));
     }
-    db::delete_app(&state.pool, id)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let delete_result = db::delete_app(&state.pool, id).await;
+    deploy::release(&state.deploying, &app.id).await;
+    delete_result.map_err(|e| ApiError::internal(e.to_string()))?;
     // A reconcile tick that listed apps before the stop above can still have
     // started the fleet again; with the row gone nothing else would stop it.
     supervisor::stop_fleet(&state.procs, &app.slug).await;
     // Both transports revoke: the RPC path used to skip this and leak the row.
-    let _ = crate::host::credentials::revoke(&state.pool, id).await;
+    // R-10: a revoke failure must not vanish — warn loudly so the orphaned
+    // credential row is visible instead of silently kept.
+    if let Err(e) = crate::host::credentials::revoke(&state.pool, id).await {
+        tracing::warn!(app_id = %id, error = %format!("{e:#}"), "app deleted but credential revoke failed");
+    }
     Ok(())
 }
 
@@ -431,6 +477,160 @@ mod tests {
                 .exists(),
             "the winner's source mirror survived the loser's create"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R-01: delete waits out an in-flight deploy claim, and the row is gone
+    /// before the claim releases — so a waiter that acquires after the delete
+    /// finds no row and bails instead of building into the purged prefix.
+    #[tokio::test]
+    async fn delete_waits_then_leaves_no_row_for_waiters() {
+        let (state, dir) = test_state(10).await;
+        let app = create(&state, "Doomed", "doomed", Some("u1"), None)
+            .await
+            .expect("create");
+        // A fake in-flight deploy holding the AppLock.
+        assert!(deploy::claim(&state.deploying, &app.id).await);
+        let owned = state.clone();
+        let id = app.id.clone();
+        let deleting = tokio::spawn(async move { delete(&owned, &id).await });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !deleting.is_finished(),
+            "delete must wait out the deploy claim"
+        );
+        // The delete holds the claim through purge + row delete: wait until
+        // it owns the claim, then queue a waiter behind it (an explicit
+        // deploy's `claim_wait`). The purge's settle sleep keeps this window
+        // wide open.
+        deploy::release(&state.deploying, &app.id).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !deploy::snapshot_claimed(&state.deploying)
+            .await
+            .contains(&app.id)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "delete never took the claim"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let owned = state.clone();
+        let id = app.id.clone();
+        let waiter = tokio::spawn(async move {
+            assert!(
+                deploy::claim_wait(&owned.deploying, &id, Duration::from_secs(30)).await,
+                "waiter acquires once delete releases"
+            );
+            let row = db::get_app(&owned.pool, &id).await.expect("lookup");
+            deploy::release(&owned.deploying, &id).await;
+            row
+        });
+        tokio::time::timeout(Duration::from_secs(30), deleting)
+            .await
+            .expect("delete finishes")
+            .expect("delete task")
+            .expect("delete ok");
+        let row = tokio::time::timeout(Duration::from_secs(30), waiter)
+            .await
+            .expect("waiter finishes")
+            .expect("waiter task");
+        assert!(
+            row.is_none(),
+            "a deploy that waits behind delete finds no row"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R-03: two apps renaming onto one slug serialize under CREATE_LOCK —
+    /// exactly one wins and the loser is a 409, with no prefix moves leaking
+    /// onto the target before the conflict.
+    #[tokio::test]
+    async fn concurrent_renames_onto_one_slug_leave_one_winner() {
+        let (state, dir) = test_state(10).await;
+        let a = create(&state, "Alpha", "r3-alpha", Some("u1"), None)
+            .await
+            .expect("create a");
+        let b = create(&state, "Beta", "r3-beta", Some("u1"), None)
+            .await
+            .expect("create b");
+        let (first, second) = tokio::join!(
+            rename(&state, &a.id, None, Some("r3-target")),
+            rename(&state, &b.id, None, Some("r3-target")),
+        );
+        assert_eq!(
+            [&first, &second].iter().filter(|r| r.is_ok()).count(),
+            1,
+            "one rename must win: {first:?} {second:?}"
+        );
+        let loser = [&first, &second]
+            .into_iter()
+            .find(|r| r.is_err())
+            .expect("one rename has to lose");
+        assert!(matches!(loser, Err(ApiError::Conflict(_))), "{loser:?}");
+        let winner = crate::db::get_app_by_slug(&state.pool, "r3-target")
+            .await
+            .expect("slug lookup")
+            .expect("the winner's row");
+        assert!(
+            winner.id == a.id || winner.id == b.id,
+            "the target belongs to one of the racers"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R-12: create holds the slug's push guard across purge → init →
+    /// insert, so a create queued behind a push (or vice versa) serializes
+    /// instead of wiping a half-written prefix.
+    #[tokio::test]
+    async fn create_waits_for_an_in_flight_push_guard() {
+        let (state, dir) = test_state(10).await;
+        let _push = state.git_sync.push_guard("guarded").await;
+        let owned = state.clone();
+        let creating =
+            tokio::spawn(
+                async move { create(&owned, "Guarded", "guarded", Some("u1"), None).await },
+            );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !creating.is_finished(),
+            "create must wait for the slug push guard"
+        );
+        drop(_push);
+        let app = tokio::time::timeout(Duration::from_secs(30), creating)
+            .await
+            .expect("create finishes")
+            .expect("create task")
+            .expect("create ok");
+        assert_eq!(app.slug, "guarded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R-02: a slug rename holds both slugs' push guards across the whole
+    /// move, so a rename queued behind a push serializes instead of moving
+    /// prefixes under a live git+S3+manifest write.
+    #[tokio::test]
+    async fn rename_waits_for_an_in_flight_push_guard() {
+        let (state, dir) = test_state(10).await;
+        let app = create(&state, "Mover", "ps-old", Some("u1"), None)
+            .await
+            .expect("create");
+        let _push = state.git_sync.push_guard("ps-old").await;
+        let owned = state.clone();
+        let id = app.id.clone();
+        let renaming = tokio::spawn(async move { rename(&owned, &id, None, Some("ps-new")).await });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !renaming.is_finished(),
+            "rename must wait for the old-slug push guard"
+        );
+        drop(_push);
+        let renamed = tokio::time::timeout(Duration::from_secs(30), renaming)
+            .await
+            .expect("rename finishes")
+            .expect("rename task")
+            .expect("rename ok");
+        assert_eq!(renamed.slug, "ps-new");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

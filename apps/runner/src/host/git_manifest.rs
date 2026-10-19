@@ -44,6 +44,19 @@ pub struct Manifest {
 
 /// Single-writer coordination for git pushes: per-slug push mutex plus the
 /// last manifest seq applied to each local bare mirror.
+///
+/// Lock ordering (deadlock rule — every path below follows it, outer first):
+/// `CREATE_LOCK` (service/apps.rs, the create/rename critical section) →
+/// `AppLock` (host/deploy.rs, the per-app-id deploy/delete/rename claim) →
+/// `push_guard` (here, the per-slug git+S3+manifest mutex). A path that needs
+/// fewer locks skips one, never reorders: create holds `CREATE_LOCK` then its
+/// slug's `push_guard`; delete holds `AppLock` then its slug's `push_guard`;
+/// a slug-changing rename holds all three (`CREATE_LOCK`, then `AppLock`,
+/// then both slugs' `push_guard`s). Pushes hold only their slug's
+/// `push_guard` and never claim `AppLock` while holding it, so waiting on an
+/// outer-held lock while holding an inner one cannot happen. Two slug guards
+/// are always taken in lexical slug order (see `push_guards`), so opposite
+/// renames cannot deadlock against each other.
 #[derive(Clone, Default)]
 pub struct GitSync {
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -52,6 +65,8 @@ pub struct GitSync {
 
 impl GitSync {
     /// Hold across a whole push (policy check → git → S3 → manifest).
+    /// Callers that also hold `CREATE_LOCK` and/or the `AppLock` take this
+    /// guard last (see the ordering rule on [`GitSync`]).
     pub async fn push_guard(&self, slug: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let mut locks = self.locks.lock().await;
@@ -61,6 +76,31 @@ impl GitSync {
                 .clone()
         };
         lock.lock_owned().await
+    }
+
+    /// Both slug guards for a rename, taken in lexical order so two renames
+    /// over the same pair in opposite directions serialize instead of
+    /// deadlocking. Returns the first guard and, when the slugs differ, the
+    /// second; a same-slug call returns one guard and `None`.
+    pub async fn push_guards(
+        &self,
+        old_slug: &str,
+        new_slug: &str,
+    ) -> (
+        tokio::sync::OwnedMutexGuard<()>,
+        Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) {
+        let (first, second) = if new_slug < old_slug {
+            (new_slug, old_slug)
+        } else {
+            (old_slug, new_slug)
+        };
+        let first_guard = self.push_guard(first).await;
+        if first == second {
+            return (first_guard, None);
+        }
+        let second_guard = self.push_guard(second).await;
+        (first_guard, Some(second_guard))
     }
 
     pub async fn applied_seq(&self, slug: &str) -> Option<u64> {
@@ -207,5 +247,39 @@ mod tests {
     #[test]
     fn manifest_key_shape() {
         assert_eq!(manifest_key("demo"), "git/demo/MANIFEST.json");
+    }
+
+    /// Same-slug guards exclude each other, and opposite-order pairs still
+    /// serialize (lexical acquisition): with real mutexes an inversion here
+    /// would hang this test under `tokio::time::timeout`.
+    #[tokio::test]
+    async fn push_guards_serialize_and_never_invert() {
+        let sync = GitSync::default();
+        let first = sync.push_guard("demo").await;
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            sync.push_guard("demo"),
+        )
+        .await;
+        assert!(probe.is_err(), "a second guard for one slug must wait");
+        drop(first);
+        let held = tokio::time::timeout(std::time::Duration::from_secs(5), sync.push_guard("demo"))
+            .await
+            .expect("the guard releases");
+        drop(held);
+        // Opposite directions over one pair: both finish, so no inversion.
+        let a = sync.clone();
+        let b = sync.clone();
+        let pair = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let left = tokio::spawn(async move { a.push_guards("alpha", "beta").await });
+            let right = tokio::spawn(async move { b.push_guards("beta", "alpha").await });
+            let _ = left.await.expect("left rename guards");
+            let _ = right.await.expect("right rename guards");
+        })
+        .await;
+        assert!(pair.is_ok(), "opposite rename pairs must not deadlock");
+        // Same slug collapses to one guard.
+        let (_, second) = sync.push_guards("demo", "demo").await;
+        assert!(second.is_none(), "same-slug rename holds one guard");
     }
 }
