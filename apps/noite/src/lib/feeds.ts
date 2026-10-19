@@ -4,7 +4,7 @@
 //! `liveFeed` skips it). Shape checks are `Array.isArray` guards —
 //! the runner ships no effect/Schema codecs for these payloads.
 import { atom, watch } from "ilha";
-import type { AtomHandle, EventSourceStatus } from "ilha";
+import type { AtomHandle } from "ilha";
 
 import type {
   ErrorStatus,
@@ -15,6 +15,11 @@ import type {
   RunnerApp,
 } from "./runner";
 import { readSwr, withSnapshot, writeSwr } from "./swr-store";
+
+/** Connection state of a `liveFeed` event stream (ilha 0.15's
+ * `EventSourceStatus`, removed with `fromEventSource`; this feed manages its
+ * own `EventSource`). */
+export type EventSourceStatus = "connecting" | "open" | "retrying" | "closed";
 
 /** Live SSE panel state with stale-while-revalidate: `latest` paints the
  * last good frame for `key` (lib/swr-store) until the stream's first frame

@@ -1,5 +1,4 @@
 import * as Schema from "effect/Schema";
-import { action, useEnv, useRequest, withSchema } from "oxidejs";
 
 import { requireAppRole } from "../collaborators";
 import { isLocalhostDomain } from "../local-host";
@@ -8,7 +7,8 @@ import {
   previewBase,
   previewOrigin,
 } from "../preview-host";
-import { AuthError, sessionUser } from "./session.server";
+import { apiAction, fail } from "./api";
+import { sessionUser } from "./session.server";
 
 const PreviewOriginArgs = Schema.Struct({ appId: Schema.String });
 
@@ -20,12 +20,11 @@ const PreviewOriginArgs = Schema.Struct({ appId: Schema.String });
  * `https://app-0.preview.<slug>.noite.local`. Refuses a secure page with a
  * plain http pod host (`PREVIEW_MIXED_CONTENT_MESSAGE`) instead of an
  * origin that cannot connect. */
-export const sourcePreviewOrigin = action(
-  withSchema(PreviewOriginArgs, async ({ appId }) => {
-    const user = await sessionUser();
+export const sourcePreviewOrigin = apiAction(
+  PreviewOriginArgs,
+  async ({ appId }, { env, request }) => {
+    const user = await sessionUser(request, env);
     const { app } = await requireAppRole(appId, user.id, "view");
-    const env = useEnv<KitEnv>();
-    const request = useRequest();
     const url = new URL(request.url);
     // Behind the edge the action sees the internal http URL: the page's real
     // scheme and host ride `X-Forwarded-Proto`/`X-Forwarded-Host`, which Caddy
@@ -43,11 +42,10 @@ export const sourcePreviewOrigin = action(
     const origin = previewOrigin(app.slug, base, port);
     // Fail closed: a localhost pod host is plain http, which browsers
     // block inside a secure page as mixed content. The action surfaces the
-    // message through `failUnknown`, and the browser shows it verbatim.
+    // message through `fail`, and the browser shows it verbatim.
     if (scheme === "https" && origin.startsWith("http://")) {
-      throw new Error(PREVIEW_MIXED_CONTENT_MESSAGE);
+      fail(PREVIEW_MIXED_CONTENT_MESSAGE);
     }
     return { previewOrigin: origin };
-  }),
-  { error: AuthError }
+  }
 );

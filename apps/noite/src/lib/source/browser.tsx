@@ -39,14 +39,15 @@
 import { atom, watch } from "ilha";
 import type { AtomHandle } from "ilha";
 
+import { api } from "../api";
 import { commitSource, previewSource } from "../commit-source";
 import type { SourceCommitInput } from "../commit-source";
 import { errorMessage } from "../errors";
 import { forgeRefs, invalidateForge } from "../forge/data";
 import { collectRef, newLiveRef, whenLive } from "../live-ref";
 import type { LiveRef } from "../live-ref";
+import type { RunnerTree } from "../runner";
 import type { SearchParam } from "../search-param";
-import { sourceTree } from "../server/source.server";
 import { fetchSourceArchive } from "../source-archive";
 import { MORPH_PRESERVE } from "../ui/resizable";
 import type {
@@ -187,7 +188,9 @@ export const SourceBrowser = ({
 }: SourceBrowserProps) => {
   // Per-instance state that must outlive re-renders; atom.lazy returns the
   // same box every render.
-  const box = atom.lazy(newBrowserBox)();
+  // The box carries the installed `request` closure (functions do not
+  // serialize): out of the SSR snapshot, rebuilt by the client on hydration.
+  const box = atom.lazy(newBrowserBox, { snapshot: false })();
   /** The app's branches. A push reads them to tell a branch it creates from
    * one the runner grows from its own tip, and it reads them when the push
    * runs — never during a render, so this component does not repaint with
@@ -481,7 +484,7 @@ export const SourceBrowser = ({
      * whether the ref opens editable is the page's answer (see `canEditRef`). */
     const openCheckout = async (ref: string): Promise<Checkout> => {
       const [listing, origin, reason] = await Promise.all([
-        sourceTree({ appId, ref }),
+        api<RunnerTree>("/api/source/sourceTree", { appId, ref }),
         podOrigin(),
         canEditRef(ref),
       ]);

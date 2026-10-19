@@ -1,9 +1,10 @@
 //! The apps list (live over SSE), the pending-invitations banner and the
 //! control-plane card above it. The create form lives in ./create-form.
 
-import { navigate } from "@ilha/router";
+import { Link, useRouter } from "@ilha/void";
 import { atom } from "ilha";
 
+import { api } from "../api";
 import type { App } from "../collaborators";
 import {
   CONTROL_APP_ID,
@@ -19,10 +20,6 @@ import {
   myInvitations,
   session,
 } from "../resources";
-import {
-  acceptInvitation,
-  declineInvitation,
-} from "../server/collaborators.server";
 import { Avatar } from "../ui/avatar";
 import { ChevronRight } from "../ui/icons";
 import { ListSkeleton } from "../ui/skeletons";
@@ -31,6 +28,7 @@ import { appUrl, presenceTone } from "./identity";
 /** Collaborator invitations addressed to this account's email: nothing is
  * granted until the person accepts here. Renders nothing when there are none. */
 const InvitationsBanner = () => {
+  const router = useRouter();
   const res = myInvitations();
   const busy = atom(false);
   const notice = atom("");
@@ -43,11 +41,17 @@ const InvitationsBanner = () => {
     notice.set("");
     try {
       if (accept) {
-        const { appId } = await acceptInvitation(inviteId);
+        const { appId } = await api<{ appId: string }>(
+          "/api/collaborators/acceptInvitation",
+          inviteId
+        );
         invalidate(keys.myInvitations);
-        navigate(`/apps/${appId}`);
+        router.visit(`/apps/${appId}`);
       } else {
-        await declineInvitation(inviteId);
+        await api<{ ok: true }>(
+          "/api/collaborators/declineInvitation",
+          inviteId
+        );
         invalidate(keys.myInvitations);
       }
     } catch (error) {
@@ -119,18 +123,18 @@ const ControlAppRow = () => (
     </div>
     <div>
       <div>
-        <a
+        <Link
           href={`/apps/${CONTROL_APP_ID}`}
           class="link link-hover block truncate text-lg font-semibold"
         >
           {CONTROL_APP_NAME}
-        </a>
+        </Link>
       </div>
       <div class="text-base-content/70 truncate text-xs">
         {CONTROL_APP_SUBTITLE}
       </div>
     </div>
-    <a
+    <Link
       href={`/apps/${CONTROL_APP_ID}`}
       class="btn btn-sm btn-square btn-ghost shrink-0"
       aria-label={`Open ${CONTROL_APP_NAME}`}
@@ -138,7 +142,7 @@ const ControlAppRow = () => (
       <span class="inline-flex h-5 w-5 shrink-0">
         <ChevronRight class="h-5 w-5" />
       </span>
-    </a>
+    </Link>
   </li>
 );
 
@@ -176,9 +180,9 @@ export const AppsList = () => {
             <span class="text-lg font-semibold">Your Apps</span>
             <span class="badge badge-sm">{items().length}</span>
           </span>
-          <a href="/apps/new" class="btn btn-sm btn-neutral">
+          <Link href="/apps/new" class="btn btn-sm btn-neutral">
             New app
-          </a>
+          </Link>
         </li>
         {showControl() ? <ControlAppRow /> : null}
         {!loaded() && (
@@ -189,9 +193,9 @@ export const AppsList = () => {
         {loaded() && items().length === 0 && (
           <li class="px-4 pt-2 pb-4 text-sm">
             <span class="text-base-content/70">No apps yet. </span>
-            <a href="/apps/new" class="link">
+            <Link href="/apps/new" class="link">
               Create one
-            </a>
+            </Link>
             <span class="text-base-content/70"> to get a git remote.</span>
           </li>
         )}
@@ -207,12 +211,12 @@ export const AppsList = () => {
               </div>
               <div>
                 <div>
-                  <a
+                  <Link
                     href={`/apps/${app.id}`}
                     class="link link-hover block truncate text-lg font-semibold"
                   >
                     {app.name}
-                  </a>
+                  </Link>
                 </div>
                 <div class="text-base-content/70 truncate text-xs">
                   <a
@@ -225,7 +229,7 @@ export const AppsList = () => {
                   </a>
                 </div>
               </div>
-              <a
+              <Link
                 href={`/apps/${app.id}`}
                 class="btn btn-sm btn-square btn-ghost shrink-0"
                 aria-label={`Open ${app.name} details`}
@@ -233,7 +237,7 @@ export const AppsList = () => {
                 <span class="inline-flex h-5 w-5 shrink-0">
                   <ChevronRight class="h-5 w-5" />
                 </span>
-              </a>
+              </Link>
             </li>
           ))}
       </ul>

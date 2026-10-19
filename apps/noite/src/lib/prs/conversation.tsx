@@ -2,10 +2,10 @@
  * timeline (outdated comments carry their file/line) and the comment box. */
 import { atom } from "ilha";
 
+import { api } from "../api";
 import { errorMessage } from "../errors";
 import type { AppRole } from "../roles";
 import type { PrDetail } from "../runner";
-import { prsUpdate } from "../server/prs.server";
 import { buildTimeline } from "./data";
 import { invalidatePr } from "./resources";
 import { CommentCard, CommentComposer, nameFor, ReviewCard } from "./widgets";
@@ -36,7 +36,7 @@ const PrDescription = ({
     busy.set(true);
     notice.set("");
     try {
-      await prsUpdate({
+      await api<{ ok: true }>("/api/prs/prsUpdate", {
         appId,
         body: body(),
         number: pullRequest.number,

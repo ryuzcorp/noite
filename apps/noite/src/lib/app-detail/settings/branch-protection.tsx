@@ -4,9 +4,10 @@
 
 import { atom } from "ilha";
 
+import { api } from "../../api";
 import { errorMessage } from "../../errors";
 import type { AppRole } from "../../roles";
-import { branchRulesSet } from "../../server/prs.server";
+import type { BranchRules } from "../../runner";
 import { branchRules } from "../../source/branch-rules";
 import { LoadError } from "../../ui/load-error";
 import { SectionSkeleton } from "../../ui/skeletons";
@@ -55,7 +56,7 @@ export const BranchProtectionPanel = ({
     err.set("");
     note.set("");
     try {
-      await branchRulesSet({
+      await api<BranchRules>("/api/prs/branchRulesSet", {
         appId,
         requirePr,
         requiredApprovals: approvals,

@@ -1,4 +1,4 @@
-import { navigate } from "@ilha/router";
+import { useRouter } from "@ilha/void";
 import { atom, watch } from "ilha";
 
 import { authClient } from "../auth-client";
@@ -48,6 +48,7 @@ const waitForSession = async (): Promise<void> => {
  * revalidates instantly with no document reload). Email OTP stays
  * behind "Lost passkey?" — recovery for passkey-less devices, not primary. */
 export const LoginPanel = () => {
+  const router = useRouter();
   const busy = atom(false);
   const error = atom("");
   // null = not chosen yet: a fresh instance opens on account creation,
@@ -68,9 +69,14 @@ export const LoginPanel = () => {
     picked() ?? (invite()?.firstRun ? "register" : "signin");
 
   watch.once(async () => {
+    if (typeof window === "undefined") {
+      // SSR: the signed-in redirect resolves client-side (resources never
+      // fetch on the server); SSR paints the form.
+      return;
+    }
     const { data } = await fetchSession();
     if (data?.user) {
-      navigate(landing("/apps"));
+      router.visit(landing("/apps"));
     }
   });
 
@@ -107,7 +113,7 @@ export const LoginPanel = () => {
     if (result.data?.user) {
       // Cookie may not be readable for the very next document request yet.
       await waitForSession();
-      navigate(landing("/apps"));
+      router.visit(landing("/apps"));
       return;
     }
     error.set("Registration completed without a session");
@@ -123,7 +129,7 @@ export const LoginPanel = () => {
       return;
     }
     await waitForSession();
-    navigate(landing("/apps"));
+    router.visit(landing("/apps"));
   };
 
   const sendOtp = async (event: SubmitEvent) => {
@@ -177,7 +183,7 @@ export const LoginPanel = () => {
     await waitForSession();
     // A recovery sign-in exists because the passkey is gone: land on the
     // account page, where a new one can be added straight away.
-    navigate(landing("/account"));
+    router.visit(landing("/account"));
   };
 
   const showRecovery = () => {

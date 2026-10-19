@@ -3,7 +3,11 @@ import { beforeEach, describe, expect, test } from "bun:test";
 
 import { ensureDbPromise, setD1Binding } from "../../lib/db";
 import { createTestD1 } from "../../testing/d1";
-import { handleHttp } from "../router";
+import {
+  handleSourceArchive,
+  handleSourceCommit,
+  handleSourcePreview,
+} from "./source";
 
 const ENV = {
   BASE_DOMAIN: "localhost",
@@ -36,7 +40,8 @@ const call = async (
     headers,
     method: "POST",
   });
-  return await Promise.resolve(handleHttp(request, ENV as unknown as never));
+  const handle = url === PREVIEW_URL ? handleSourcePreview : handleSourceCommit;
+  return await handle(request, ENV as unknown as never, { appId: "app_1" });
 };
 
 const ARCHIVE_URL =
@@ -51,7 +56,9 @@ const archiveCall = async (
     headers: { "sec-fetch-site": "same-origin", ...headers },
     method: "GET",
   });
-  return await Promise.resolve(handleHttp(request, ENV as unknown as never));
+  return await handleSourceArchive(request, ENV as unknown as never, {
+    appId: "app_1",
+  });
 };
 
 beforeEach(async () => {

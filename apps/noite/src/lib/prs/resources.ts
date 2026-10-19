@@ -1,35 +1,20 @@
+import { api } from "../api";
+import { forgeKeys } from "../forge/data";
 /** Pull-request data: resource keys and fetchers shared by the list, new and
  * detail views, with the same stale-while-revalidate contract as
  * `lib/resources` and `lib/forge/data`. */
-import { invalidate, resource } from "ilha";
-import type { Resource, ResourceFetcher, ResourceOptions } from "ilha";
-
-import { forgeKeys } from "../forge/data";
+import { invalidate, tracked as trackResource } from "../resource";
+import type { Resource, ResourceFetcher } from "../resource";
 import { keys } from "../resources";
+import type { AppRole } from "../roles";
 import type { PrDetail, PrList } from "../runner";
-import { prsGet, prsList, prsUserNames, prsViewer } from "../server/prs.server";
-import { withSnapshot, writeSwr } from "../swr-store";
 import type { PrStateFilter } from "./data";
 
 /** Pull requests per list page (the runner caps `limit` at 100). */
 export const PR_PAGE_SIZE = 30;
 
-const tracked = <T>(
-  key: string,
-  fetcher: ResourceFetcher<T>,
-  opts?: ResourceOptions
-): Resource<T> => {
-  const res = resource<T>(
-    key,
-    async (k, ctx) => {
-      const value = await fetcher(k, ctx);
-      writeSwr(k, value);
-      return value;
-    },
-    opts
-  );
-  return { ...res, data: withSnapshot(key, res.data) };
-};
+const tracked = <T>(key: string, fetcher: ResourceFetcher<T>): Resource<T> =>
+  trackResource(key, fetcher);
 
 export const prKeys = {
   detail: (appId: string, number: number) => `prs:detail:${appId}:${number}`,
@@ -53,13 +38,15 @@ export const prList = (
   const key = prKeys.list(appId, state, skip);
   listKeys.add(key);
   return tracked(key, () =>
-    prsList({ appId, limit: PR_PAGE_SIZE, skip, state })
+    api<PrList>("/api/prs/prsList", { appId, limit: PR_PAGE_SIZE, skip, state })
   );
 };
 
 /** One pull request with comments, reviews, compare and merge state. */
 export const prDetail = (appId: string, number: number): Resource<PrDetail> =>
-  tracked(prKeys.detail(appId, number), () => prsGet({ appId, number }));
+  tracked(prKeys.detail(appId, number), () =>
+    api<PrDetail>("/api/prs/prsGet", { appId, number })
+  );
 
 /** Display names for a set of user ids (empty set short-circuits). */
 export const prNames = (
@@ -69,12 +56,23 @@ export const prNames = (
   tracked<Record<string, string>>(prKeys.names(appId, userIds), () =>
     userIds.length === 0
       ? Promise.resolve({})
-      : prsUserNames({ appId, userIds: [...userIds] })
+      : api<Record<string, string>>("/api/prs/prsUserNames", {
+          appId,
+          userIds: [...userIds],
+        })
   );
 
 /** The signed-in viewer's id/name/role on this app. */
+export interface PrViewer {
+  id: string;
+  name: string;
+  role: AppRole;
+}
+
 export const prViewer = (appId: string) =>
-  tracked(prKeys.viewer(appId), () => prsViewer({ appId }));
+  tracked(prKeys.viewer(appId), () =>
+    api<PrViewer>("/api/prs/prsViewer", { appId })
+  );
 
 /** Drop the list pages and, alongside a PR's detail, refresh the branch
  * picker's tips and the environment box: a merge can delete the head branch

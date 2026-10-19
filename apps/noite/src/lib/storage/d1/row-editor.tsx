@@ -6,6 +6,7 @@
 import { atom } from "ilha";
 import type { View } from "ilha";
 
+import { api } from "../../api";
 import { formatAgo, formatDateTime } from "../../dates";
 import { errorMessage } from "../../errors";
 import { collectRef, liveEl, newLiveRef } from "../../live-ref";
@@ -16,7 +17,6 @@ import type {
   D1TableSchema,
   D1WriteBody,
 } from "../../runner";
-import { d1Write } from "../../server/storage.server";
 import { Dialog } from "../../ui/dialog";
 import { X } from "../../ui/icons";
 import {
@@ -499,7 +499,11 @@ export const RowEditor = ({
       if (isEdit) {
         body.key = keyFor(schema.columns, original);
       }
-      await d1Write({ appId, databaseId, ...body });
+      await api<{ ok: true }>("/api/storage/d1Write", {
+        appId,
+        databaseId,
+        ...body,
+      });
       onToast(isEdit ? "Row updated" : "Row created");
       onSaved();
       onClose();
@@ -516,7 +520,7 @@ export const RowEditor = ({
     }
     busy.set(true);
     try {
-      await d1Write({
+      await api<{ ok: true }>("/api/storage/d1Write", {
         appId,
         databaseId,
         key: keyFor(schema.columns, original),

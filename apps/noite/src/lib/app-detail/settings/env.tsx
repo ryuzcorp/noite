@@ -2,11 +2,11 @@
 
 import { atom } from "ilha";
 
+import { api } from "../../api";
+import type { EnvVarView } from "../../api-types";
 import { errorMessage } from "../../errors";
 import { envVars } from "../../resources";
 import type { AppRole } from "../../roles";
-import { deleteEnv, envDotVars, setEnv } from "../../server/env.server";
-import type { EnvVarView } from "../../server/env.server";
 import { confirmDialog } from "../../ui/confirm";
 import { Dialog } from "../../ui/dialog";
 import { LoadError } from "../../ui/load-error";
@@ -52,7 +52,7 @@ export const EnvVarsPanel = ({
     busy.set(true);
     void (async () => {
       try {
-        await setEnv({
+        await api<{ ok: true }>("/api/env/setEnv", {
           appId,
           name: row.name,
           value: row.value === "1" ? "0" : "1",
@@ -86,7 +86,11 @@ export const EnvVarsPanel = ({
     err.set("");
     void (async () => {
       try {
-        await setEnv({ appId, name: raw, value: finalValue });
+        await api<{ ok: true }>("/api/env/setEnv", {
+          appId,
+          name: raw,
+          value: finalValue,
+        });
         newVarName.set("");
         newVarValue.set("");
         dialogOpen.set(false);
@@ -109,7 +113,10 @@ export const EnvVarsPanel = ({
               onclick={() => {
                 void (async () => {
                   try {
-                    const text = await envDotVars(appId);
+                    const text = await api<string>(
+                      "/api/env/envDotVars",
+                      appId
+                    );
                     const url = URL.createObjectURL(
                       new Blob([text], { type: "text/plain" })
                     );
@@ -199,7 +206,10 @@ export const EnvVarsPanel = ({
                       }
                       busy.set(true);
                       try {
-                        await deleteEnv({ appId, name: r.name });
+                        await api<{ ok: true }>("/api/env/deleteEnv", {
+                          appId,
+                          name: r.name,
+                        });
                         await reload();
                       } catch (error) {
                         err.set(errorMessage(error));

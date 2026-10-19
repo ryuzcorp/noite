@@ -359,7 +359,23 @@ pub async fn rewrite_caddy(
     // (e.g. `header_up`) MUST go inside `reverse_proxy` — Caddy rejects
     // them at site level and then keeps serving the stale config.
     let edge = &cfg.edge;
-    let control_guard = guard_lines(&[Zone::per_client(cfg, "client_control", edge.client_rpm)]);
+    // The pod assets no control site ever serves: the edge answers 404 before
+    // proxying, in every mode. The worker's own `02-pod-host` gate answers 404
+    // too, but Void's generated entry wraps every app response in
+    // `createAssetFallback`, which retries an app 404 against `env.ASSETS` —
+    // so the gate's 404 still serves the static file's 200, and the edge is
+    // the real enforcement (edge.spec.ts "cross-origin isolated"). The deny is
+    // origin policy, not bundle layout: the dev site (`vite dev`, no control
+    // bundle) carries it as well, because dev serves the same pod files on
+    // this origin — while the preview host, which serves them in dev too, is
+    // untouched. `respond` with a matcher is terminal and ordered before
+    // `reverse_proxy`, so these two site lines 404 exactly the six paths and
+    // everything else still proxies.
+    let control_deny_matcher = format!("@control_denied path {}", control_denied_assets());
+    let mut control_extra =
+        guard_lines(&[Zone::per_client(cfg, "client_control", edge.client_rpm)]);
+    control_extra.push(control_deny_matcher.clone());
+    control_extra.push("respond @control_denied 404".into());
     // The control worker keys its own auth limits on the right-most
     // X-Forwarded-For entry. Behind a trusted proxy Caddy appends the
     // proxy's address there, so hand the worker the resolved visitor instead.
@@ -368,7 +384,7 @@ pub async fn rewrite_caddy(
     } else {
         vec!["header_up X-Forwarded-For {client_ip}".into()]
     };
-    let control_guard_refs: Vec<&str> = control_guard.iter().map(String::as_str).collect();
+    let control_extra_refs: Vec<&str> = control_extra.iter().map(String::as_str).collect();
     let control_proxy_refs: Vec<&str> = control_proxy.iter().map(String::as_str).collect();
     push_site(
         &mut lines,
@@ -377,17 +393,19 @@ pub async fn rewrite_caddy(
         // control list needs no special casing here.
         &control_site,
         on_demand,
-        &control_guard_refs,
+        &control_extra_refs,
         &control_proxy_refs,
         &cfg.caddy_control_upstream,
     );
     // Plaintext loopback for container healthchecks, independent of TLS mode.
+    // It proxies the same control upstream, so it carries the same deny.
+    let loopback_deny = [control_deny_matcher.as_str(), "respond @control_denied 404"];
     push_site(
         &mut lines,
         cfg,
         "http://127.0.0.1",
         false,
-        &[],
+        &loopback_deny,
         &[],
         &cfg.caddy_control_upstream,
     );
@@ -670,16 +688,39 @@ pub async fn rewrite_caddy(
     Ok(())
 }
 
+/// The dead Nodepod preview bridge (document + script): never created by this
+/// build, but still emitted into the client bundle — and a bridge document is
+/// a registerable service worker on whatever origin serves it, so neither the
+/// preview host nor any control site serves it. Must match `POD_BRIDGE_PATHS`
+/// in `apps/noite/src/lib/preview-host.ts`.
+const POD_BRIDGE_ASSETS: &str = "/__nodepod_bridge__.html /__nodepod_bridge__.js";
+
 /// The only paths a preview origin serves (everything else 404s): the pod's
-/// host document and bundle, Nodepod's worker and service worker, and the
-/// `/assets/*` chunks the frame bundle loads at runtime (Vite's own runtime and
-/// preload helper, and any module it shares with the control UI). The dev image
-/// has no control bundle and takes the plain proxy branch below instead.
+/// own files below plus the `/assets/*` chunks the frame bundle loads at
+/// runtime (Vite's own runtime and preload helper, and any module it shares
+/// with the control UI). The pod paths here must match `PREVIEW_HOST_ASSETS`
+/// in `apps/noite/src/lib/preview-host.ts`. The dev image has no control
+/// bundle and takes the plain proxy branch below instead.
 const PREVIEW_ASSETS: &str = concat!(
     "/noite-pod-host.html /noite-pod-host.js ",
     "/__sw__.js /__worker__.js ",
     "/assets/*"
 );
+
+/// Every path a control site answers 404 for: the preview host's pod assets
+/// minus the frame chunks (on this origin `/assets/*` is the control UI's own
+/// bundle, served exactly as before), plus the dead bridge pair. Derived from
+/// `PREVIEW_ASSETS` so the pod paths live in one place on this side too; the
+/// result must match `CONTROL_HOST_DENIED_ASSETS` in
+/// `apps/noite/src/lib/preview-host.ts` (a test below pins the shape).
+fn control_denied_assets() -> String {
+    let mut denied: Vec<&str> = PREVIEW_ASSETS
+        .split_whitespace()
+        .filter(|p| *p != "/assets/*")
+        .collect();
+    denied.extend(POD_BRIDGE_ASSETS.split_whitespace());
+    denied.join(" ")
+}
 
 /// One app's preview host: the host document and those Nodepod assets proxied
 /// from the control deployment with the headers their document, workers and
@@ -1390,6 +1431,107 @@ mod tests {
             !dev_block.contains("@nodepod") && !dev_block.contains("respond 404"),
             "dev preview must not match paths:\n{dev_block}"
         );
+    }
+
+    /// Control sites answer 404 for the pod assets before proxying: the
+    /// worker's own gate 404s them too, but Void's `createAssetFallback`
+    /// retries an app 404 against `env.ASSETS`, so the gate's 404 would still
+    /// serve the file — the edge is the real enforcement (edge.spec.ts
+    /// "cross-origin isolated"). The preview host keeps serving them (pinned
+    /// by the test above).
+    #[tokio::test]
+    async fn control_sites_deny_the_pod_assets() {
+        let denied = [
+            "/noite-pod-host.html",
+            "/noite-pod-host.js",
+            "/__sw__.js",
+            "/__worker__.js",
+            "/__nodepod_bridge__.html",
+            "/__nodepod_bridge__.js",
+        ];
+        // The runner-side derivation holds: the preview host's pod list minus
+        // the frame chunks, plus the dead bridge pair — one source of truth,
+        // pinned so a const edit that drops a path fails here, not in the lane.
+        let derived: Vec<&str> = PREVIEW_ASSETS
+            .split_whitespace()
+            .filter(|p| *p != "/assets/*")
+            .chain(POD_BRIDGE_ASSETS.split_whitespace())
+            .collect();
+        assert_eq!(derived.join(" "), denied.join(" "), "deny list drifted");
+        assert_eq!(control_denied_assets(), denied.join(" "));
+        // The production shape: a control bundle is present (`bundle_present`),
+        // matching the e2e lane the edge spec runs in.
+        let mut cfg = test_config("noite.now", "app", true, "/tmp/noite-test-control-deny");
+        cfg.control_bundle_dir = "/tmp/noite-test-control-deny-bundle".into();
+        std::fs::create_dir_all(Path::new(&cfg.control_bundle_dir)).expect("bundle dir");
+        std::fs::write(
+            Path::new(&cfg.control_bundle_dir).join("wrangler.json"),
+            "{}",
+        )
+        .expect("bundle marker");
+        let out = rendered(&cfg, &[test_app()]).await;
+        let block = site_block(&out, "app.noite.now");
+        // The deny is a terminal `respond` ahead of the proxy: the six paths
+        // 404, everything else still reaches the control upstream.
+        let matcher = denied.join(" ");
+        assert!(
+            block.contains(&format!("@control_denied path {}", matcher)),
+            "control misses the deny matcher:\n{block}"
+        );
+        assert!(block.contains("respond @control_denied 404"), "{block}");
+        assert!(
+            block.contains("reverse_proxy 127.0.0.1:8090"),
+            "control must still proxy:\n{block}"
+        );
+        // The control UI's own bundle is not denied: `/assets/*` stays
+        // proxyable (edge.spec.ts "still serves its own bundle").
+        let deny_line = block
+            .lines()
+            .find(|l| l.contains("@control_denied path"))
+            .expect("deny line");
+        assert!(!deny_line.contains("/assets/"), "{deny_line}");
+        for path in denied {
+            assert!(deny_line.contains(path), "{path} missing:\n{deny_line}");
+        }
+        // The container loopback proxies the same upstream, so it denies too.
+        let loopback = site_block(&out, "http://127.0.0.1");
+        assert!(
+            loopback.contains("respond @control_denied 404"),
+            "{loopback}"
+        );
+        assert!(
+            loopback.contains("reverse_proxy 127.0.0.1:8090"),
+            "{loopback}"
+        );
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+        // Behind a terminating proxy the plaintext twin carries the same deny,
+        // including across joined extra control hosts.
+        let mut proxied = test_config("noite.now", "app", false, "/tmp/noite-test-control-deny-proxy");
+        proxied.control_bundle_dir = "/tmp/noite-test-control-deny-bundle".into();
+        proxied.control_extra_hosts = vec!["lab.netbird.cloud".into()];
+        let out = rendered(&proxied, &[test_app()]).await;
+        let twin = site_block(&out, "http://app.noite.now, http://lab.netbird.cloud");
+        assert!(twin.contains("respond @control_denied 404"), "{twin}");
+        assert!(
+            twin.contains("reverse_proxy 127.0.0.1:8090"),
+            "twin must still proxy:\n{twin}"
+        );
+        let _ = tokio::fs::remove_file(&proxied.caddyfile_path).await;
+        // Dev (`vite dev`, no control bundle) denies as well: the deny is
+        // origin policy, not bundle layout — dev serves the same pod files on
+        // this origin, while the dev preview host still proxies whole.
+        let dev = test_config("noite.now", "app", true, "/tmp/noite-test-control-deny-dev");
+        let out = rendered(&dev, &[test_app()]).await;
+        let block = site_block(&out, "app.noite.now");
+        assert!(
+            block.contains("respond @control_denied 404"),
+            "dev control must deny too:\n{block}"
+        );
+        assert!(
+            block.contains("reverse_proxy 127.0.0.1:8090"),
+            "dev control must still proxy:\n{block}"
+        );
+        let _ = tokio::fs::remove_file(&dev.caddyfile_path).await;
     }
 
     /// Tenant sites wait for celld's ready gate: a request routed before it

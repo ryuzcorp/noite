@@ -1,5 +1,7 @@
 /** Commit page body: metadata, body, changed-file stats and the
  * first-parent diff (rendered by the shared pierre viewer). */
+import { Link } from "@ilha/void";
+
 import { formatDateTime } from "../dates";
 import { LoadError } from "../ui/load-error";
 import { SectionSkeleton } from "../ui/skeletons";
@@ -53,14 +55,14 @@ export const CommitView = ({
               <span aria-hidden="true">·</span>
               <span>parent{c.parents.length > 1 ? "s" : ""}</span>
               {c.parents.map((parent) => (
-                <a
+                <Link
                   key={parent}
                   class="link link-hover font-mono"
                   href={commitHref(appId, parent, from)}
                   title={parent}
                 >
                   {shortSha(parent)}
-                </a>
+                </Link>
               ))}
             </>
           ) : (

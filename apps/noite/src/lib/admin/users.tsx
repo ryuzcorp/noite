@@ -1,21 +1,16 @@
 //! Admin tab: every account — search, page, ban, role, delete, impersonate.
 
-import { navigate } from "@ilha/router";
+import { useRouter } from "@ilha/void";
 import { atom } from "ilha";
 import type { View } from "ilha";
 
+import { api } from "../api";
+import type { AdminUserRow } from "../api-types";
 import { authClient } from "../auth-client";
 import { invalidateSession } from "../auth/session";
 import { errorMessage } from "../errors";
 import { listUsers } from "../resources";
 import { searchParam } from "../search-param";
-import {
-  banUser,
-  deleteUser,
-  setUserRole,
-  unbanUser,
-} from "../server/admin.server";
-import type { AdminUserRow } from "../server/admin.server";
 import { Avatar } from "../ui/avatar";
 import { confirmDialog } from "../ui/confirm";
 import {
@@ -128,6 +123,7 @@ const AdminUsersRows = ({
   page,
   query,
 }: AdminUsersListProps) => {
+  const router = useRouter();
   const busy = atom(false);
   const impersonating = atom(false);
   const res = listUsers(query, page);
@@ -154,7 +150,7 @@ const AdminUsersRows = ({
       // mounted across navigation, so drop every user-scoped cache —
       // otherwise the chrome keeps showing the admin's session.
       invalidateSession();
-      navigate("/apps");
+      router.visit("/apps");
     } catch (error) {
       panelError.set(errorMessage(error));
       impersonating.set(false);
@@ -175,7 +171,11 @@ const AdminUsersRows = ({
   };
 
   const toggleBan = (user: AdminUserRow) =>
-    mutate(() => (user.banned ? unbanUser(user.id) : banUser(user.id)));
+    mutate(() =>
+      user.banned
+        ? api<{ ok: true }>("/api/admin/unbanUser", user.id)
+        : api<{ ok: true }>("/api/admin/banUser", user.id)
+    );
 
   const toggleRole = async (user: AdminUserRow) => {
     const next = user.role === "admin" ? "user" : "admin";
@@ -187,7 +187,12 @@ const AdminUsersRows = ({
     if (!ok) {
       return;
     }
-    await mutate(() => setUserRole({ role: next, userId: user.id }));
+    await mutate(() =>
+      api<{ ok: true }>("/api/admin/setUserRole", {
+        role: next,
+        userId: user.id,
+      })
+    );
   };
 
   const removeUser = async (user: AdminUserRow) => {
@@ -200,7 +205,7 @@ const AdminUsersRows = ({
     if (!ok) {
       return;
     }
-    await mutate(() => deleteUser(user.id));
+    await mutate(() => api<{ ok: true }>("/api/admin/deleteUser", user.id));
   };
 
   const loading = res.loading() && res.data() === undefined;

@@ -1,4 +1,4 @@
-import { navigate } from "@ilha/router";
+import { useRouter } from "@ilha/void";
 import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
@@ -42,10 +42,16 @@ export const Authed = ({
   children: View;
   fallback?: View;
 }) => {
+  const router = useRouter();
   const res = sessionResource();
   const returning = atom(false);
   const returnError = atom("");
   watch.once(async ({ signal }) => {
+    if (typeof window === "undefined") {
+      // SSR: the session resolves client-side (resources never fetch on
+      // the server); the gate paints its fallback until hydration lands.
+      return;
+    }
     // Wait for the first answer however long it takes: refetch() joins
     // the in-flight request, so a slow get-session never counts against
     // the retry budget below (sleeping through it bounced real users).
@@ -67,7 +73,7 @@ export const Authed = ({
       await res.refetch();
     }
     if (!signal.aborted && !res.data()?.user) {
-      navigate("/login");
+      router.visit("/login");
     }
   });
 
@@ -84,7 +90,7 @@ export const Authed = ({
         return;
       }
       invalidateSession();
-      navigate("/apps/_control?t=users");
+      router.visit("/apps/_control?t=users");
     } catch (error) {
       returnError.set(errorMessage(error));
       returning.set(false);

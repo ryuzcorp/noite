@@ -3,6 +3,7 @@
 //! formatting. D1 and R2/DO look like one product because they render these
 //! pieces, not three near-copies of them.
 
+import { Link } from "@ilha/void";
 import { atom } from "ilha";
 import type { View } from "ilha";
 
@@ -62,9 +63,9 @@ export const StorageBreadcrumb = ({ crumbs }: { crumbs: Crumb[] }) => (
               {crumb.label}
             </span>
           ) : (
-            <a class="link link-hover truncate opacity-70" href={crumb.href}>
+            <Link class="link link-hover truncate opacity-70" href={crumb.href}>
               {crumb.label}
-            </a>
+            </Link>
           )}
         </li>
       ))}

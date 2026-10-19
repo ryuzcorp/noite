@@ -3,9 +3,10 @@ import { beforeEach, describe, expect, test } from "bun:test";
 
 import { ensureDbPromise, setD1Binding } from "../lib/db";
 import { resetRateLimits } from "../lib/rate-limit";
+import * as telemetryFactsRoute from "../routes/internal/telemetry-facts";
 import { createTestD1 } from "../testing/d1";
 import type { TestD1 } from "../testing/d1";
-import { handleHttp } from "./router";
+import { handleTelemetryFacts } from "./routes/internal";
 
 const ENV = {
   BASE_DOMAIN: "localhost",
@@ -33,7 +34,7 @@ const addUser = (id: string) => {
 
 const facts = (token?: string) =>
   Promise.resolve(
-    handleHttp(
+    handleTelemetryFacts(
       new Request("http://localhost:9080/internal/telemetry-facts", {
         headers:
           token === undefined ? {} : { authorization: `Bearer ${token}` },
@@ -62,16 +63,10 @@ describe("GET /internal/telemetry-facts", () => {
     expect(await counted?.json()).toEqual({ users: 2 });
   });
 
-  test("serves GET only", async () => {
-    const response = await Promise.resolve(
-      handleHttp(
-        new Request("http://localhost:9080/internal/telemetry-facts", {
-          headers: { authorization: `Bearer ${ENV.RUNNER_TOKEN}` },
-          method: "POST",
-        }),
-        ENV as unknown as never
-      )
-    );
-    expect(response).toBeUndefined();
+  test("serves GET only", () => {
+    // The Void route file answers GET and nothing else: an unregistered
+    // method never reaches the logic (the platform answers 404).
+    expect(telemetryFactsRoute.GET).toBeDefined();
+    expect("POST" in telemetryFactsRoute).toBe(false);
   });
 });

@@ -1,3 +1,5 @@
+import { eventStream } from "void/sse";
+
 import {
   listAppsForCollaborator,
   requireAppRole,
@@ -14,7 +16,7 @@ import type {
 import { runnerConfig } from "../config";
 import type { RouteHandler } from "../config";
 import { controlStreamRefusal, routeUserId } from "../session";
-import { closeQuietly, sleepUnlessAborted, sseResponse } from "../sse";
+import { sleepUnlessAborted } from "../sse";
 
 /** Runner SSE proxy shared by the log tail and deploy history streams:
  * session + view-role gate, then pipe the runner events (the browser
@@ -94,8 +96,8 @@ export const handleLogsStream: RouteHandler = (request, env, params) => {
  * heartbeats land well inside celld's ~60s idle-stream expiry. */
 const APPS_STREAM_POLL_MS = 10_000;
 
-/** App list over SSE (like DeployList). Unverified: whether an oxide stream
- * action's first frame arrives on celld — an earlier 0.5.x attempt hung with
+/** App list over SSE (like DeployList). Unverified: whether a Void SSE
+ * route's first frame arrives on celld — an earlier 0.5.x attempt hung with
  * no frame at all (before the per-request runtime fix), and proving it now
  * needs a celld node, which only the release image runs. SSE is also what
  * makes the heartbeats possible: an idle HTTP stream dies on celld's ~60 s
@@ -108,11 +110,9 @@ export const handleAppsStream: RouteHandler = async (request, env) => {
   if (!userId) {
     return new Response("Sign in required", { status: 401 });
   }
-  const encoder = new TextEncoder();
-  const stream = new ReadableStream({
-    async start(controller) {
+  return eventStream(
+    async (stream) => {
       let last = "";
-      let quiet = 0;
       while (!request.signal.aborted) {
         let json: string | null = null;
         try {
@@ -120,27 +120,24 @@ export const handleAppsStream: RouteHandler = async (request, env) => {
           const apps = await listAppsForCollaborator(userId);
           json = JSON.stringify(apps);
         } catch (error) {
-          // Transient failure: log it; the heartbeat below keeps the
-          // stream alive and the next poll heals.
+          // Transient failure: log it and keep the stream alive; the next
+          // poll heals. `eventStream`'s keep-alive comments hold celld's
+          // ~60 s idle-stream expiry between polls.
           console.error("apps stream poll failed", error);
         }
         if (json !== null && json !== last) {
           last = json;
-          quiet = 0;
-          controller.enqueue(encoder.encode(`data: ${json}\n\n`));
-        } else {
-          quiet += 1;
-          if (quiet % 2 === 0) {
-            controller.enqueue(encoder.encode(": ping\n\n"));
-          }
+          // A string payload goes out raw, so the frame keeps the exact
+          // `data: <json>` wire shape the hand-rolled stream sent.
+          // oxlint-disable-next-line eslint/no-await-in-loop -- one send per cycle, in poll order
+          await stream.send({ data: json });
         }
         // oxlint-disable-next-line eslint/no-await-in-loop -- sequential abortable sleep between polls
         await sleepUnlessAborted(APPS_STREAM_POLL_MS, request.signal);
       }
-      closeQuietly(controller);
     },
-  });
-  return sseResponse(stream);
+    { signal: request.signal }
+  );
 };
 
 /** Usage-stats poll cadence: the runner rolls minute buckets, so 30s
@@ -234,21 +231,27 @@ const pollMetricsFrame = async (
   };
 };
 
+/** The SSE writes a stream loop needs (the real `SseStream` satisfies it). */
+export interface MetricsSink {
+  send: (message: { data: string }) => Promise<void>;
+}
+
 interface MetricsStreamOptions extends MetricsPoll {
-  controller: ReadableStreamDefaultController;
-  /** Pause between cycles, heartbeat included. */
+  sink: MetricsSink;
+  /** Pause between cycles. */
   pollMs: number;
   signal: AbortSignal;
 }
 
 /** The metrics stream's poll loop: every cycle checks the runner's change
- * counter, polls the full frame only when it moved, then writes exactly one
- * SSE chunk (frame or heartbeat) and sleeps. Exported for the unit tests. */
+ * counter, polls the full frame only when it moved, sends it when there is
+ * one, then sleeps. Unchanged cycles send nothing — `eventStream`'s
+ * keep-alive comments hold celld's ~60 s idle-stream expiry instead of
+ * per-cycle pings. Exported for the unit tests. */
 export const streamMetrics = async (
   options: MetricsStreamOptions
 ): Promise<void> => {
-  const { auth, base, controller, pollMs, signal, windowQuery } = options;
-  const encoder = new TextEncoder();
+  const { auth, base, sink, pollMs, signal, windowQuery } = options;
   let lastReq = -1;
   let lastVersion: number | null = null;
   while (!signal.aborted) {
@@ -257,8 +260,7 @@ export const streamMetrics = async (
       // Cheap change check (spec T3.6): the runner bumps the per-app
       // version on every ingest with new rows. When it hasn't moved,
       // the whole 5-call poll is skipped — but the cycle still ends in
-      // the heartbeat and sleep below (a bare `continue` here would spin
-      // the loop with no pause).
+      // the sleep below (a bare `continue` here would spin the loop).
       // oxlint-disable-next-line eslint/no-await-in-loop -- one sequential cycle per loop by design
       const v = await pollMetricsVersion(base, auth);
       const unchanged =
@@ -281,28 +283,27 @@ export const streamMetrics = async (
         }
       }
     } catch (error) {
-      // Transient failure: log it; the heartbeat below keeps the
-      // stream alive and the next poll heals.
+      // Transient failure: log it; the keep-alive below keeps the stream
+      // alive and the next poll heals.
       console.error("metrics stream poll failed", error);
     }
-    if (frame === null) {
-      // No change (or a failed poll): heartbeat every cycle — 30s
-      // cadence stays well inside the ~60s idle-stream expiry.
-      controller.enqueue(encoder.encode(": ping\n\n"));
-    } else {
-      controller.enqueue(encoder.encode(`data: ${frame}\n\n`));
+    if (frame !== null) {
+      // A string payload goes out raw, so the frame keeps the exact
+      // `data: <json>` wire shape the hand-rolled stream sent.
+      // oxlint-disable-next-line eslint/no-await-in-loop -- one send per cycle, in poll order
+      await sink.send({ data: frame });
     }
     // oxlint-disable-next-line eslint/no-await-in-loop -- sequential abortable sleep between polls
     await sleepUnlessAborted(pollMs, signal);
   }
-  closeQuietly(controller);
 };
 
 /** Usage stats over SSE (like the apps stream): the runner only exposes
  * unary metrics/spans endpoints, so this polls them here and pushes one
  * frame only when the request total moves — minute buckets mean the rest
- * is noise. Comment heartbeats reset celld's ~60s idle-stream expiry;
- * EventSource auto-reconnect covers the rest. Session + view-role gated. */
+ * is noise. `eventStream`'s keep-alive comments hold celld's ~60 s
+ * idle-stream expiry; EventSource auto-reconnect covers the rest.
+ * Session + view-role gated. */
 export const handleMetricsStream: RouteHandler = async (
   request,
   env,
@@ -339,18 +340,18 @@ export const handleMetricsStream: RouteHandler = async (
   // One window for every series in the frame, so tiles, charts, spans and
   // analytics always describe the same period.
   const windowQuery = `hours=${metricsWindowHours(request)}`;
-  const stream = new ReadableStream({
-    start: (controller) =>
+  return eventStream(
+    (stream) =>
       streamMetrics({
         auth,
         base,
-        controller,
         pollMs: METRICS_STREAM_POLL_MS,
         signal: request.signal,
+        sink: stream,
         windowQuery,
       }),
-  });
-  return sseResponse(stream);
+    { signal: request.signal }
+  );
 };
 
 /** Live deploy history proxy (see proxyRunnerStream). `?environmentId=`

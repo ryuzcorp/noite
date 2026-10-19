@@ -1,75 +1,58 @@
-//! Shared async data: every resource key and fetcher in one module so
-//! keys can't drift between components. All hooks wrap ilha's `resource()`
-//! (deduped, abort signal) and paint the last good snapshot from
-//! lib/swr-store until fresh data lands — across SPA remounts and reloads.
-//! After a mutation call `invalidate(key)` or `res.refetch()`.
-import { invalidate, resource } from "ilha";
-import type { Resource, ResourceFetcher, ResourceOptions } from "ilha";
-
+import { api } from "./api";
+import type {
+  AdminAppRow,
+  AdminUserRow,
+  AppDetail,
+  EnvironmentVarView,
+  EnvVarView,
+  InviteCode,
+} from "./api-types";
 import { authClient } from "./auth-client";
-import type { D1RowsQuery } from "./runner";
-import { myInviteCodes } from "./server/account.server";
+import type { CollaboratorRow, PendingInvite } from "./collaborators";
+//! Shared async data: every resource key and fetcher in one module so
+//! keys can't drift between components. All hooks wrap the shared Effect
+//! Cache in lib/resource (deduped lookups, abort signal) and paint the last
+//! good snapshot from lib/swr-store until fresh data lands — across SPA
+//! remounts and reloads. After a mutation call `invalidate(key)` or
+//! `res.refetch()`.
 import {
-  adminOverview,
-  adminListInvites as fetchAdminInvites,
-  listAllApps as fetchAllApps,
-  listUsers as fetchUsers,
-} from "./server/admin.server";
-import { deployLog as fetchDeployLog, get } from "./server/apps.server";
-import {
-  listCollaborators,
-  listPendingInvitations,
-  myCollaboratorInvitations,
-} from "./server/collaborators.server";
-import { listDomains } from "./server/domains.server";
-import { listEnv } from "./server/env.server";
-import {
-  environmentVars as fetchEnvironmentVars,
-  listEnvironments,
-} from "./server/environments.server";
-import { errorDetail as fetchErrorDetail } from "./server/errors.server";
-import { getLimits } from "./server/limits.server";
-import {
-  d1Rows as fetchD1Rows,
-  d1Schema as fetchD1Schema,
-  d1Tables as fetchD1Tables,
-  doPreview as fetchDoPreview,
-  listAppStorage,
-  r2Get as fetchR2Get,
-  r2List as fetchR2List,
-} from "./server/storage.server";
-import { getTelemetry } from "./server/telemetry.server";
-import { clearSwrStore, withSnapshot, writeSwr } from "./swr-store";
+  invalidate as invalidateKey,
+  tracked as trackResource,
+} from "./resource";
+import type { Resource, ResourceFetcher } from "./resource";
+import type {
+  D1Rows,
+  D1RowsQuery,
+  D1Tables,
+  D1TableSchema,
+  DoPreview,
+  R2File,
+  R2Preview,
+  RunnerDomain,
+  RunnerEnvironment,
+  RunnerErrorDetail,
+  RunnerLimits,
+  RunnerTelemetryStatus,
+  StorageItem,
+} from "./runner";
+import { clearSwrStore } from "./swr-store";
 
-export { invalidate } from "ilha";
+export { invalidate } from "./resource";
 
 /** Every key a hook has used this document. All cached data here is
  * user-scoped, so an auth change (sign-in, sign-out, impersonation) must
  * drop all of it — see `resetUserCaches`. */
 const usedKeys = new Set<string>();
 
-/** `resource()` with stale-while-revalidate across remounts *and* reloads:
- * `data` paints the last good snapshot (lib/swr-store) until the fresh
- * fetch lands, so panels skip skeletons whenever this key loaded before.
- * Each successful fetch writes the snapshot through. Consumers keep the
- * usual `loading() && data() === undefined` skeleton check — it now only
- * fires on a genuinely cold key. */
-const tracked = <T>(
-  key: string,
-  fetcher: ResourceFetcher<T>,
-  opts?: ResourceOptions
-): Resource<T> => {
+/** One mounted reader of `key` (lib/resource) with stale-while-revalidate
+ * across remounts *and* reloads: `data` paints the last good snapshot
+ * (lib/swr-store) until the fresh fetch lands, so panels skip skeletons
+ * whenever this key loaded before. Each successful fetch writes the snapshot
+ * through. Consumers keep the usual `loading() && data() === undefined`
+ * skeleton check — it now only fires on a genuinely cold key. */
+const tracked = <T>(key: string, fetcher: ResourceFetcher<T>): Resource<T> => {
   usedKeys.add(key);
-  const res = resource<T>(
-    key,
-    async (k, ctx) => {
-      const value = await fetcher(k, ctx);
-      writeSwr(k, value);
-      return value;
-    },
-    opts
-  );
-  return { ...res, data: withSnapshot(key, res.data) };
+  return trackResource(key, fetcher);
 };
 
 /** Drop every cached resource and snapshot, and refetch the live ones.
@@ -79,7 +62,7 @@ const tracked = <T>(
 export const resetUserCaches = (): void => {
   clearSwrStore();
   for (const key of usedKeys) {
-    invalidate(key);
+    invalidateKey(key);
   }
 };
 
@@ -104,7 +87,7 @@ export const invalidateD1 = (appId: string, databaseId: string): void => {
   const prefix = `app:${appId}:d1:${databaseId}:`;
   for (const key of usedKeys) {
     if (key.startsWith(prefix)) {
-      invalidate(key);
+      invalidateKey(key);
     }
   }
 };
@@ -115,7 +98,7 @@ export const invalidateR2 = (appId: string, bucket: string): void => {
   const prefix = `app:${appId}:r2:${bucket}:`;
   for (const key of usedKeys) {
     if (key.startsWith(prefix)) {
-      invalidate(key);
+      invalidateKey(key);
     }
   }
 };
@@ -165,62 +148,82 @@ export const keys = {
 } as const;
 
 export const appDetail = (id: string) =>
-  tracked(keys.appDetail(id), () => get(id));
+  tracked(keys.appDetail(id), () => api<AppDetail>("/api/apps/get", id));
 
 export const appStorage = (id: string) =>
-  tracked(keys.appStorage(id), () => listAppStorage({ appId: id }));
+  tracked(keys.appStorage(id), () =>
+    api<StorageItem[]>("/api/storage/listAppStorage", { appId: id })
+  );
 
 export const collaborators = (id: string) =>
-  tracked(keys.collaborators(id), () => listCollaborators(id));
+  tracked(keys.collaborators(id), () =>
+    api<CollaboratorRow[]>("/api/collaborators/listCollaborators", id)
+  );
 
 /** One finished deploy's build log, fetched when its tab opens and cached
  * per deploy id (finished deploys never change). */
 export const deployLog = (appId: string, deployId: string) =>
   tracked(keys.deployLog(appId, deployId), () =>
-    fetchDeployLog({ appId, deployId })
+    api<{ log: string }>("/api/apps/deployLog", { appId, deployId })
   );
 
 /** Invitations waiting on one app. Admin-only server side, so other roles
  * get an empty list without a round trip. */
 export const pendingInvitations = (id: string, isAdmin: boolean) =>
   tracked(keys.pendingInvitations(id), async () =>
-    isAdmin ? await listPendingInvitations(id) : []
+    isAdmin
+      ? await api<PendingInvite[]>(
+          "/api/collaborators/listPendingInvitations",
+          id
+        )
+      : []
   );
 
 /** Invitations addressed to the signed-in account. */
 export const myInvitations = () =>
-  tracked(keys.myInvitations, () => myCollaboratorInvitations());
+  tracked(keys.myInvitations, () =>
+    api<PendingInvite[]>("/api/collaborators/myCollaboratorInvitations", {})
+  );
 
 export const domains = (id: string) =>
-  tracked(keys.domains(id), () => listDomains(id));
+  tracked(keys.domains(id), () =>
+    api<RunnerDomain[]>("/api/domains/listDomains", id)
+  );
 
 export const limits = (id: string) =>
-  tracked(keys.limits(id), () => getLimits(id));
+  tracked(keys.limits(id), () =>
+    api<RunnerLimits>("/api/limits/getLimits", id)
+  );
 
 export const envVars = (id: string) =>
-  tracked(keys.envVars(id), () => listEnv(id));
+  tracked(keys.envVars(id), () => api<EnvVarView[]>("/api/env/listEnv", id));
 
 /** Every preview environment of one app (view-gated server side). */
 export const environments = (id: string) =>
-  tracked(keys.environments(id), () => listEnvironments(id));
+  tracked(keys.environments(id), () =>
+    api<RunnerEnvironment[]>("/api/environments/listEnvironments", id)
+  );
 
 /** Drop the cached environment rows of one app: a deploy created one, moved
  * one's tip or changed its status, and every reader of the list (the Preview
  * panel, the Deployments tab) must read them again. */
 export const invalidateEnvironments = (id: string): void => {
-  invalidate(keys.environments(id));
+  invalidateKey(keys.environments(id));
 };
 
 /** One environment's variable overrides, redacted (view-gated server side). */
 export const environmentVars = (appId: string, envId: string) =>
   tracked(keys.environmentVars(appId, envId), () =>
-    fetchEnvironmentVars({ appId, envId })
+    api<EnvironmentVarView[]>("/api/environments/environmentVars", {
+      appId,
+      envId,
+    })
   );
 
 /** One error with its latest occurrences. */
 export const errorDetail = (appId: string, fingerprint: string) =>
   tracked(keys.errorDetail(appId, fingerprint), () =>
-    fetchErrorDetail({ appId, fingerprint })
+    api<RunnerErrorDetail>("/api/errors/errorDetail", { appId, fingerprint })
   );
 
 /** What the UI renders from the session — and all it may persist. The
@@ -272,14 +275,29 @@ export const session = () =>
     };
   });
 
+/** What the admin shell gates on: the probe resolves instead of throwing,
+ * so the panel renders for non-admins too. */
+export interface AdminOverview {
+  controlFleet: boolean;
+  email: string;
+  isAdmin: boolean;
+}
+
 export const adminStatus = () =>
-  tracked(keys.adminOverview, () => adminOverview());
+  tracked(keys.adminOverview, () =>
+    api<AdminOverview>("/api/admin/adminOverview", {})
+  );
 
 /** Anonymous instance telemetry state (admin-only server side). */
-export const telemetry = () => tracked(keys.telemetry, () => getTelemetry());
+export const telemetry = () =>
+  tracked(keys.telemetry, () =>
+    api<RunnerTelemetryStatus>("/api/telemetry/getTelemetry", {})
+  );
 
 export const inviteCodes = () =>
-  tracked(keys.inviteCodes, () => myInviteCodes());
+  tracked(keys.inviteCodes, () =>
+    api<InviteCode[]>("/api/account/myInviteCodes", {})
+  );
 
 export const apiKeys = () =>
   tracked(keys.apiKeys, async () => {
@@ -338,25 +356,25 @@ export const signupPolicy = () =>
 /** Tables + row counts of one D1 database (left sidebar). */
 export const d1Tables = (appId: string, databaseId: string) =>
   tracked(keys.d1Tables(appId, databaseId), () =>
-    fetchD1Tables({ appId, databaseId })
+    api<D1Tables>("/api/storage/d1Tables", { appId, databaseId })
   );
 
 /** One table's schema (columns, indexes, caps, locked/redacted columns). */
 export const d1Schema = (appId: string, databaseId: string, table: string) =>
   tracked(keys.d1Schema(appId, databaseId, table), () =>
-    fetchD1Schema({ appId, databaseId, table })
+    api<D1TableSchema>("/api/storage/d1Schema", { appId, databaseId, table })
   );
 
 /** One server-side page of rows; the key carries the serialized query so a
  * mounted component only ever renders the query it was keyed with. */
 export const d1Rows = (appId: string, databaseId: string, query: D1RowsQuery) =>
   tracked(keys.d1Rows(appId, databaseId, query), () =>
-    fetchD1Rows({ appId, databaseId, ...query })
+    api<D1Rows>("/api/storage/d1Rows", { appId, databaseId, ...query })
   );
 
 export const doPreview = (appId: string, className: string) =>
   tracked(keys.doPreview(appId, className), () =>
-    fetchDoPreview({ appId, className })
+    api<DoPreview>("/api/storage/doPreview", { appId, className })
   );
 
 /** One page of an R2 bucket folder; the key carries prefix + cursor so a
@@ -368,22 +386,43 @@ export const r2List = (
   cursor: string | null
 ) =>
   tracked(keys.r2List(appId, bucket, prefix, cursor), () =>
-    fetchR2List({ appId, bucket, cursor, prefix })
+    api<R2Preview>("/api/storage/r2List", { appId, bucket, cursor, prefix })
   );
 
 /** One object's bounded text preview (null `text` for a binary body). */
 export const r2File = (appId: string, bucket: string, key: string) =>
   tracked(keys.r2File(appId, bucket, key), () =>
-    fetchR2Get({ appId, bucket, key })
+    api<R2File>("/api/storage/r2Get", { appId, bucket, key })
   );
 
 /** One page of the admin home's user list. The key carries the search and
  * page, so the caller mounts a fresh component per (query, page) — a resource
  * key cannot change under a mounted component. */
 export const listUsers = (query: string, page: number) =>
-  tracked(keys.adminUsers(query, page), () => fetchUsers({ page, query }));
+  tracked(keys.adminUsers(query, page), () =>
+    api<{ hasMore: boolean; users: AdminUserRow[] }>("/api/admin/listUsers", {
+      page,
+      query,
+    })
+  );
 
-export const listAllApps = () => tracked(keys.adminApps, () => fetchAllApps());
+export const listAllApps = () =>
+  tracked(keys.adminApps, () =>
+    api<AdminAppRow[]>("/api/admin/listAllApps", {})
+  );
+
+/** Every invitation code with both ends of the exchange (admin panel). */
+export interface AdminInviteView {
+  code: string;
+  createdAt: string;
+  createdByEmail: string;
+  id: string;
+  revoked: boolean;
+  usedAt: string;
+  usedByEmail: string;
+}
 
 export const adminListInvites = () =>
-  tracked(keys.adminInvites, () => fetchAdminInvites());
+  tracked(keys.adminInvites, () =>
+    api<AdminInviteView[]>("/api/admin/adminListInvites", {})
+  );

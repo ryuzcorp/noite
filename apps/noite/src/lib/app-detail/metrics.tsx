@@ -1,4 +1,5 @@
 //! Usage charts: request/CPU bars over a chosen window (24h / 7d / 1m) + spans table.
+import { Link } from "@ilha/void";
 import { atom } from "ilha";
 
 import { formatDateTime, formatHour } from "../dates";
@@ -661,9 +662,9 @@ export const MetricsCard = ({
                 </span>
               </h3>
               {viewAllHref && !detail ? (
-                <a href={viewAllHref} class="btn btn-sm">
+                <Link href={viewAllHref} class="btn btn-sm">
                   View All
-                </a>
+                </Link>
               ) : null}
             </div>
             {loadError() ? (

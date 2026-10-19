@@ -6,9 +6,12 @@
 //! The runner enforces the app role on every call; this only mirrors it in the
 //! UI (create/redeploy/overrides = `push`, public toggle/delete = `admin`).
 
+import { Link } from "@ilha/void";
 import { atom, watch } from "ilha";
 import type { AtomHandle, View } from "ilha";
 
+import { api } from "../api";
+import type { EnvironmentVarView } from "../api-types";
 import {
   environmentHost,
   environmentUrl,
@@ -21,15 +24,6 @@ import { collectRef, newLiveRef, whenLive } from "../live-ref";
 import { environments, environmentVars, invalidate, keys } from "../resources";
 import type { AppRole } from "../roles";
 import type { RunnerEnvironment } from "../runner";
-import type { EnvironmentVarView } from "../server/environments.server";
-import {
-  createEnvironment,
-  deleteEnvironment,
-  deleteEnvironmentVar,
-  deployEnvironment,
-  setEnvironmentVar,
-  updateEnvironment,
-} from "../server/environments.server";
 import { confirmDialog } from "../ui/confirm";
 import { Dialog } from "../ui/dialog";
 import {
@@ -90,13 +84,13 @@ export const DeployGroupMeta = ({
       <span class="sr-only">{status}</span>
     </span>
     {sha ? (
-      <a
+      <Link
         class="link link-hover text-base-content/70 font-mono text-xs"
         href={commitHref(appId, sha)}
         title={sha}
       >
         {shortSha(sha)}
-      </a>
+      </Link>
     ) : (
       <span class="text-base-content/60 text-xs">not deployed</span>
     )}
@@ -153,7 +147,12 @@ const EnvironmentVars = ({
     err.set("");
     void (async () => {
       try {
-        await setEnvironmentVar({ appId, envId, name: raw, value: value() });
+        await api<{ ok: true }>("/api/environments/setEnvironmentVar", {
+          appId,
+          envId,
+          name: raw,
+          value: value(),
+        });
         name.set("");
         value.set("");
         open.set(false);
@@ -174,7 +173,11 @@ const EnvironmentVars = ({
     }
     busy.set(true);
     try {
-      await deleteEnvironmentVar({ appId, envId, name: row.name });
+      await api<{ ok: true }>("/api/environments/deleteEnvironmentVar", {
+        appId,
+        envId,
+        name: row.name,
+      });
       await reload();
     } catch (error) {
       err.set(errorMessage(error));
@@ -417,11 +420,14 @@ export const EnvironmentGroup = ({
                     err.set("");
                     void (async () => {
                       try {
-                        await updateEnvironment({
-                          appId,
-                          envId: env.id,
-                          public: next,
-                        });
+                        await api<{ ok: true }>(
+                          "/api/environments/updateEnvironment",
+                          {
+                            appId,
+                            envId: env.id,
+                            public: next,
+                          }
+                        );
                         invalidate(keys.environments(appId));
                       } catch (error) {
                         err.set(errorMessage(error));
@@ -448,7 +454,10 @@ export const EnvironmentGroup = ({
                   err.set("");
                   void (async () => {
                     try {
-                      await deployEnvironment({ appId, envId: env.id });
+                      await api<{ ok: true }>(
+                        "/api/environments/deployEnvironment",
+                        { appId, envId: env.id }
+                      );
                       invalidate(keys.environments(appId));
                     } catch (error) {
                       err.set(errorMessage(error));
@@ -489,7 +498,10 @@ export const EnvironmentGroup = ({
                   }
                   busy.set(true);
                   try {
-                    await deleteEnvironment({ appId, envId: env.id });
+                    await api<{ ok: true }>(
+                      "/api/environments/deleteEnvironment",
+                      { appId, envId: env.id }
+                    );
                     invalidate(keys.environments(appId));
                   } catch (error) {
                     err.set(errorMessage(error));
@@ -554,7 +566,10 @@ export const CreateEnvironmentDialog = ({
     err.set("");
     void (async () => {
       try {
-        const env = await createEnvironment({ appId, branch: target });
+        const env = await api<RunnerEnvironment | null>(
+          "/api/environments/createEnvironment",
+          { appId, branch: target }
+        );
         invalidate(keys.environments(appId));
         open.set(false);
         if (env) {

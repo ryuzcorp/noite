@@ -1,3 +1,4 @@
+import { api } from "$lib/api";
 import { BranchPicker } from "$lib/forge/branches";
 import { CODE_PANELS, PanelToggles, toCodePanel } from "$lib/forge/code-bar";
 import type { CodePanel } from "$lib/forge/code-bar";
@@ -10,7 +11,6 @@ import type { AppRole } from "$lib/roles";
 import type { GitRefs, RunnerEnvironment } from "$lib/runner";
 import { parseSkip, searchParam } from "$lib/search-param";
 import type { SearchParam } from "$lib/search-param";
-import { sourcePreviewOrigin } from "$lib/server/preview.server";
 import { branchRules } from "$lib/source/branch-rules";
 import { SourceBrowser } from "$lib/source/browser";
 import type { SourceBrowserProps } from "$lib/source/browser";
@@ -29,14 +29,15 @@ import { SquareTerminal } from "$lib/ui/icons";
 import { createPaneGroup, MORPH_PRESERVE } from "$lib/ui/resizable";
 import { ResizeHandle } from "$lib/ui/resize-handle";
 import { SidePanel } from "$lib/ui/side-panel";
-import { head, useRoute } from "@ilha/router";
-import { atom, structuralEqual, watch } from "ilha";
+import { useParams } from "@ilha/void";
+import * as Equal from "effect/Equal";
+import { atom, watch } from "ilha";
 import type { AtomHandle, View } from "ilha";
 
 /** Keep a component atom in step with a value derived from props/resources
  * (an `atom(init)` only seeds on the first render). */
 const syncAtom = <T,>(handle: AtomHandle<T>, value: T): void => {
-  if (!structuralEqual(handle(), value)) {
+  if (!Equal.equals(handle(), value)) {
     handle.set(value);
   }
 };
@@ -201,7 +202,11 @@ const CodeSidePanel = ({
   // The tabs this panel has opened, one set per panel mount: a tab is drawn
   // from its first visit on, so a deep link (`?panel=history`) mounts only the
   // tab it names, and no tab fetches before it is opened.
-  const opened = atom.lazy(() => new Set<Exclude<CodePanel, "">>())();
+  // A Set does not survive the SSR snapshot (serializes as `{}`), so it
+  // stays out of it; the client builds its own on hydration.
+  const opened = atom.lazy(() => new Set<Exclude<CodePanel, "">>(), {
+    snapshot: false,
+  })();
   if (open) {
     opened.add(tab);
   }
@@ -334,7 +339,10 @@ const SourceBody = ({ appId }: { appId: string }) => {
   // origin for this app (the edge serves the pod's four assets there), so guest
   // code never runs on this page's origin.
   const podHostOrigin = async (): Promise<string> => {
-    const { previewOrigin } = await sourcePreviewOrigin({ appId });
+    const { previewOrigin } = await api<{ previewOrigin: string }>(
+      "/api/preview/sourcePreviewOrigin",
+      { appId }
+    );
     // The action cannot see the page's scheme through a TLS-terminating
     // proxy: repeat its mixed-content refusal here with the real one, so the
     // browser fails closed instead of framing an origin that cannot connect.
@@ -349,7 +357,11 @@ const SourceBody = ({ appId }: { appId: string }) => {
   // The terminal panel's session: the canvas shows the shell the pod frame
   // runs, and a panel left open keeps it across a ref change (the new browser
   // attaches on mount).
-  const terminalSession = atom.lazy(() => createTerminalSession())();
+  // The session is closures over the shell (functions do not serialize), so
+  // it stays out of the SSR snapshot; the client builds its own on hydration.
+  const terminalSession = atom.lazy(() => createTerminalSession(), {
+    snapshot: false,
+  })();
   // The state every group below is seeded with: which tab `?panel=` names
   // ("" = closed) and whether the terminal is open.
   const openPanel = panel();
@@ -364,17 +376,25 @@ const SourceBody = ({ appId }: { appId: string }) => {
   // The page's pane groups. Each keeps its own split in localStorage and binds
   // to the elements below at `lg` and up; the side panel's own state follows
   // `?panel=` (see `setOpen` in the render).
-  const treePanes = atom.lazy(() => createPaneGroup(TREE_PANES))();
-  const panelPanes = atom.lazy(() =>
-    createPaneGroup({
-      ...PANEL_PANES,
-      closed: openPanel === "" ? [...PANEL_PANES.collapsible] : [],
-      onCollapsed: () => {
-        closePanel();
-      },
-    })
+  // Pane groups hold functions and DOM state (see layout.tsx): out of the
+  // snapshot, rebuilt by the client on hydration.
+  const treePanes = atom.lazy(() => createPaneGroup(TREE_PANES), {
+    snapshot: false,
+  })();
+  const panelPanes = atom.lazy(
+    () =>
+      createPaneGroup({
+        ...PANEL_PANES,
+        closed: openPanel === "" ? [...PANEL_PANES.collapsible] : [],
+        onCollapsed: () => {
+          closePanel();
+        },
+      }),
+    { snapshot: false }
   )();
-  const terminalPanes = atom.lazy(() => createPaneGroup(TERMINAL_PANES))();
+  const terminalPanes = atom.lazy(() => createPaneGroup(TERMINAL_PANES), {
+    snapshot: false,
+  })();
   // The tree column's shadow-pane host: the column is a pane of this page's
   // own group, so the page renders it and hands the browser the mount point
   // (see `./source/browser`).
@@ -634,8 +654,7 @@ const SourceBody = ({ appId }: { appId: string }) => {
  * it and drop its drafts: with the id as the only prop ilha reuses the row,
  * and the body repaints through its own param reads. */
 export default function Source() {
-  const appId = useRoute().params().id;
-  head({ title: "Code · Noite" });
+  const { id: appId } = useParams();
   if (!appId) {
     return <p class="text-error">Missing app id</p>;
   }

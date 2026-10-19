@@ -3,10 +3,10 @@
 import { atom } from "ilha";
 import type { View } from "ilha";
 
+import { api } from "../api";
 import { errorMessage } from "../errors";
 import { adminListInvites } from "../resources";
 import { searchParam } from "../search-param";
-import { adminCreateInvites, adminRevokeInvite } from "../server/admin.server";
 import { Avatar } from "../ui/avatar";
 import { CopyButton } from "../ui/copy-button";
 import {
@@ -118,7 +118,9 @@ export const AdminInvitesPanel = () => {
     busy.set(true);
     panelError.set("");
     try {
-      await adminCreateInvites({ count: Number(mintCount()) });
+      await api<{ ok: true }>("/api/admin/adminCreateInvites", {
+        count: Number(mintCount()),
+      });
       await reload();
     } catch (error) {
       panelError.set(errorMessage(error));
@@ -130,7 +132,7 @@ export const AdminInvitesPanel = () => {
     busy.set(true);
     panelError.set("");
     try {
-      await adminRevokeInvite(id);
+      await api<{ ok: true }>("/api/admin/adminRevokeInvite", id);
       await reload();
     } catch (error) {
       panelError.set(errorMessage(error));

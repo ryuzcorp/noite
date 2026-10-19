@@ -2,14 +2,14 @@
 # `make dev` inside the one Noite container (docker/Dockerfile target `dev`):
 #
 #   control UI  `vite dev` on 127.0.0.1:8090 — where Caddy expects control, so
-#               routing is the same as prod (the Oxide + Cloudflare plugin
-#               pipeline: workerd, local D1, HMR). The dev image has no baked
+#               routing is the same as prod (the Void pipeline: workerd,
+#               local D1, HMR). The dev image has no baked
 #               bundle, so the runner does not start fleet #0.
 #   runner      `cargo watch` on the bind-mounted source; the runner then
 #               supervises Caddy and the tenant fleets exactly as in prod.
 #
 # `celld dev` cannot serve the control app: it bundles `main` with raw
-# esbuild, which cannot resolve the Oxide plugin's `virtual:oxide/worker`
+# esbuild, which cannot resolve the Void plugin's `virtual:void-routes`
 # entry. Only the Vite pipeline can (`vite build` for the image).
 set -eu
 

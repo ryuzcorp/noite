@@ -1,41 +1,20 @@
+import { api } from "../api";
+import type { GitLogInput } from "../api-types";
 /**
  * Forge data: the resource keys and fetchers the forge pages share, so a
  * key can never drift between the branch picker, history, commit and compare
  * views. Same stale-while-revalidate contract as `lib/resources` (last good
  * snapshot paints until the fresh fetch lands).
  */
-import { invalidate, resource } from "ilha";
-import type { Resource, ResourceFetcher, ResourceOptions } from "ilha";
-
-import type { GitLog, GitRefs } from "../runner";
-import {
-  gitCommit as fetchCommit,
-  gitCompare as fetchCompare,
-  gitLog as fetchLog,
-  gitRefs as fetchRefs,
-} from "../server/forge.server";
-import type { GitLogInput } from "../server/forge.server";
-import { withSnapshot, writeSwr } from "../swr-store";
+import { invalidate, tracked as trackResource } from "../resource";
+import type { Resource, ResourceFetcher } from "../resource";
+import type { GitCommitDetail, GitCompare, GitLog, GitRefs } from "../runner";
 
 /** Commits per history page (the runner caps `limit` at 100). */
 export const LOG_PAGE_SIZE = 50;
 
-const tracked = <T>(
-  key: string,
-  fetcher: ResourceFetcher<T>,
-  opts?: ResourceOptions
-): Resource<T> => {
-  const res = resource<T>(
-    key,
-    async (k, ctx) => {
-      const value = await fetcher(k, ctx);
-      writeSwr(k, value);
-      return value;
-    },
-    opts
-  );
-  return { ...res, data: withSnapshot(key, res.data) };
-};
+const tracked = <T>(key: string, fetcher: ResourceFetcher<T>): Resource<T> =>
+  trackResource(key, fetcher);
 
 export const forgeKeys = {
   commit: (appId: string, sha: string) => `forge:commit:${appId}:${sha}`,
@@ -48,7 +27,9 @@ export const forgeKeys = {
 
 /** Branches with their tip, last commit and ahead/behind vs main. */
 export const forgeRefs = (appId: string): Resource<GitRefs> =>
-  tracked(forgeKeys.refs(appId), () => fetchRefs({ appId }));
+  tracked(forgeKeys.refs(appId), () =>
+    api<GitRefs>("/api/forge/gitRefs", { appId })
+  );
 
 /** Every history page this document has requested: a branch mutation drops
  * them all without knowing which page is mounted. */
@@ -72,18 +53,20 @@ export const forgeLog = (
     if (ref !== "") {
       args.ref = ref;
     }
-    return fetchLog(args);
+    return api<GitLog>("/api/forge/gitLog", args);
   });
 };
 
 /** One commit with its first-parent diff. */
 export const forgeCommit = (appId: string, sha: string) =>
-  tracked(forgeKeys.commit(appId, sha), () => fetchCommit({ appId, sha }));
+  tracked(forgeKeys.commit(appId, sha), () =>
+    api<GitCommitDetail>("/api/forge/gitCommit", { appId, sha })
+  );
 
 /** Three-dot compare of two refs plus the squash-merge verdict. */
 export const forgeCompare = (appId: string, base: string, head: string) =>
   tracked(forgeKeys.compare(appId, base, head), () =>
-    fetchCompare({ appId, base, head })
+    api<GitCompare>("/api/forge/gitCompare", { appId, base, head })
   );
 
 /** Refetch the branch list and every history page after a branch create or

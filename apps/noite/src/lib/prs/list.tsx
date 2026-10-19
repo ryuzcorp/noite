@@ -1,5 +1,6 @@
 /** Pull-request list: the state tabs the Pull requests page's header shows,
  * and the body — rows and paging (`/apps/[id]/pulls`). */
+import { Link } from "@ilha/void";
 import { watch } from "ilha";
 
 import { formatAgo } from "../dates";
@@ -74,9 +75,12 @@ export const PrsList = ({
     emptyMessage = "No pull requests.";
   }
   const compareLink = (
-    <a class="link link-hover text-sm" href={`/apps/${appId}/source/compare`}>
+    <Link
+      class="link link-hover text-sm"
+      href={`/apps/${appId}/source/compare`}
+    >
       Compare branches on the Compare page →
-    </a>
+    </Link>
   );
 
   return (
@@ -97,41 +101,41 @@ export const PrsList = ({
                 <PrStateBadge state={pull.state} />
               </div>
               <div class="min-w-0">
-                <a
+                <Link
                   class="link link-hover block truncate font-medium"
                   href={`/apps/${appId}/pulls/${pull.number}`}
                   title={pull.title}
                 >
                   {pull.title}
-                </a>
+                </Link>
                 <div class="text-base-content/70 flex flex-wrap items-center gap-x-1.5 text-xs">
                   <span class="font-mono">#{pull.number}</span>
                   <span aria-hidden="true">·</span>
                   <span>{nameFor(names, pull.authorId)}</span>
                   <span aria-hidden="true">·</span>
                   <span class="font-mono">
-                    <a
+                    <Link
                       class="link link-hover"
                       href={`/apps/${appId}/source?ref=${encodeURIComponent(pull.head)}`}
                     >
                       {pull.head}
-                    </a>{" "}
+                    </Link>{" "}
                     into{" "}
-                    <a
+                    <Link
                       class="link link-hover"
                       href={`/apps/${appId}/source?ref=${encodeURIComponent(pull.base)}`}
                     >
                       {pull.base}
-                    </a>
+                    </Link>
                   </span>
-                  <a
+                  <Link
                     class="link link-hover"
                     href={`/apps/${appId}/source/compare?base=${encodeURIComponent(
                       pull.base
                     )}&head=${encodeURIComponent(pull.head)}`}
                   >
                     Compare
-                  </a>
+                  </Link>
                 </div>
               </div>
               <div class="text-base-content/70 flex shrink-0 items-center gap-3 text-xs">

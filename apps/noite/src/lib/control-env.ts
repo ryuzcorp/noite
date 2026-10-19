@@ -1,6 +1,11 @@
-/** Shared Oxide env bag (must be a plain object — process.env stringifies values). */
-// oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type
-export const controlEnv: Record<string, unknown> = {};
+import type { D1Database } from "@cloudflare/workers-types";
+
+/** Values the control env bag carries: strings from process/compose env plus
+ * the platform's pre-built D1 binding object. */
+export type ControlEnvValue = string | D1Database;
+
+/** Shared control env bag (must be a plain object — process.env stringifies values). */
+export const controlEnv: Record<string, ControlEnvValue> = {};
 
 export const hydrateControlEnv = (
   // SAFETY: defaulting to process.env crashes on Workers (no process) — guard with typeof, which is safe on undefined globals.
@@ -21,7 +26,7 @@ export const hydrateControlEnv = (
     }
   }
   // Dev-process fallback only (vite dev has no compose env for the worker).
-  // Prod values always arrive via compose environment / cloudflare.config.ts vars /
+  // Prod values always arrive via compose environment / void.config.ts vars /
   // deploy env — never rely on these outside localhost dev. `noite.localhost`
   // is the dev base every `*.localhost` workaround keys on (`isLocalhostDomain`).
   // The control plane only talks to the runner; it holds no S3 credentials of

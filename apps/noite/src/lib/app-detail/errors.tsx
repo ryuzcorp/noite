@@ -1,13 +1,14 @@
+import { Link, useRouter } from "@ilha/void";
+import { atom } from "ilha";
+
+import { api } from "../api";
+import { formatAgo, formatDateTime } from "../dates";
+import { errorMessage } from "../errors";
+import { decodeErrors, errorsUrl, feedKeys, liveFeed } from "../feeds";
 //! Errors tab: exceptions from celld telemetry grouped into issues by the
 //! runner (`host/errors.rs`) — no SDK in the app. List by status, detail
 //! with stack, request and the failing trace's logs; anyone who can push
 //! resolves, ignores or reopens.
-import { navigate } from "@ilha/router";
-import { atom } from "ilha";
-
-import { formatAgo, formatDateTime } from "../dates";
-import { errorMessage } from "../errors";
-import { decodeErrors, errorsUrl, feedKeys, liveFeed } from "../feeds";
 import { appDetail, errorDetail } from "../resources";
 import type {
   ErrorStatus,
@@ -17,7 +18,6 @@ import type {
   RunnerErrorList,
 } from "../runner";
 import { searchParam } from "../search-param";
-import { setErrorStatus } from "../server/errors.server";
 import { ArrowLeft } from "../ui/icons";
 import { LoadError } from "../ui/load-error";
 import { ListSkeleton, SectionSkeleton } from "../ui/skeletons";
@@ -358,7 +358,11 @@ const TriageButtons = ({
     busy.set(true);
     failure.set("");
     try {
-      await setErrorStatus({ appId, fingerprint: issue.fingerprint, status });
+      await api<{ ok: true }>("/api/errors/setErrorStatus", {
+        appId,
+        fingerprint: issue.fingerprint,
+        status,
+      });
       await onDone();
     } catch (error) {
       failure.set(errorMessage(error));
@@ -571,6 +575,7 @@ const SUMMARY_ISSUES = 3;
  * like the tab's list, and shares its `open` snapshot, so either paints
  * instantly once the other has loaded. */
 export const ErrorsSummary = ({ appId }: { appId: string }) => {
+  const router = useRouter();
   const live = liveErrors(appId, "open");
   const data = live.data();
   const issues = (data?.issues ?? []).slice(0, SUMMARY_ISSUES);
@@ -584,9 +589,9 @@ export const ErrorsSummary = ({ appId }: { appId: string }) => {
             <h2 class="m-0 text-lg font-semibold">Errors</h2>
             {data ? <span class="badge badge-sm">{open}</span> : null}
           </span>
-          <a href={tabHref} class="btn btn-sm">
+          <Link href={tabHref} class="btn btn-sm">
             View All
-          </a>
+          </Link>
         </div>
         {live.retrying() ? <StreamRetrying /> : null}
         {live.pending() ? <ListSkeleton rows={2} /> : null}
@@ -600,7 +605,7 @@ export const ErrorsSummary = ({ appId }: { appId: string }) => {
                 key={issue.fingerprint}
                 issue={issue}
                 onPick={() => {
-                  navigate(`${tabHref}&e=${issue.fingerprint}`);
+                  router.visit(`${tabHref}&e=${issue.fingerprint}`);
                 }}
               />
             ))}

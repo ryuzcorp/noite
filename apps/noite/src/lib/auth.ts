@@ -9,11 +9,11 @@ import { admin } from "better-auth/plugins";
 import { emailOTP } from "better-auth/plugins/email-otp";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { fail } from "oxidejs";
 
 import { getAuthDb, resolveEnv } from "./db";
 import { errorMessage } from "./errors";
 import { isLocalhostDomain } from "./local-host";
+import { fail } from "./server/api";
 import {
   checkInvite,
   consumeInvite,
@@ -35,9 +35,9 @@ export class UnauthorizedError extends Schema.TaggedError<UnauthorizedError>()(
   { message: Schema.String }
 ) {}
 
-/** Map an unknown catch value into a client-visible `fail(message)`.
- * Oxide masks a plain throw as `-32603 Internal error`; this keeps the real
- * message the user needs. Use in action catch blocks. */
+/** Map an unknown catch value into a client-visible `fail(message)`. The
+ * action transport answers a plain throw with a 500 `Internal error`; this
+ * keeps the real message the user needs. Use in action catch blocks. */
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site values are unknown by construction; this helper narrows to message
 export const failUnknown = (error: unknown): never => fail(errorMessage(error));
 

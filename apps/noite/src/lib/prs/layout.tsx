@@ -1,5 +1,6 @@
 /** The pull-request pages' frame (`/apps/[id]/pulls…`, beside App and Code in
  * the sidebar) and the open count the sidebar shows. */
+import { Link } from "@ilha/void";
 import type { View } from "ilha";
 
 import { DetailShell } from "../app-detail/shell";
@@ -40,13 +41,13 @@ export const PullsPage = ({
     header={
       <>
         {back ? (
-          <a
+          <Link
             href={`/apps/${appId}/pulls`}
             class="link link-hover inline-flex w-fit items-center gap-1 text-sm opacity-70"
           >
             <ArrowLeft class="h-4 w-4" />
             Pull requests
-          </a>
+          </Link>
         ) : null}
         {header}
       </>

@@ -14,7 +14,8 @@ import type {
   Position,
 } from "@pierre/diffs/edit";
 
-import { sourceBundle } from "../server/source.server";
+import { api } from "../api";
+import type { RunnerSourceBundle } from "../runner";
 import { curatedLang } from "../shiki-langs";
 import { HOVER_DELAY, createHoverTip } from "./hover-tip";
 import { SourceIntel } from "./intel";
@@ -169,7 +170,10 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
     if (fetched !== undefined) {
       return await fetched;
     }
-    const loading = sourceBundle({ appId: host.appId, ref: host.gitRef() });
+    const loading = api<RunnerSourceBundle>("/api/source/sourceBundle", {
+      appId: host.appId,
+      ref: host.gitRef(),
+    });
     serverBundle = loading;
     try {
       return await loading;

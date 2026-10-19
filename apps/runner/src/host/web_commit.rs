@@ -29,8 +29,9 @@ const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 const MAX_COMMIT_BYTES: usize = 25 * 1024 * 1024;
 /// Request-body cap for the commit routes. Base64 inflates the 25 MiB decoded
 /// total by 4/3 (~33.3 MiB), plus room for paths, moves and JSON keys. The
-/// runner's axum `DefaultBodyLimit` and the control worker's oxide `bodyLimit`
-/// both use it, so a max-size commit is never refused by a hop below it.
+/// runner's axum `DefaultBodyLimit` and the control worker's
+/// `MAX_SOURCE_BODY_BYTES` (`apps/noite/src/lib/commit-source.ts`) both use
+/// it, so a max-size commit is never refused by a hop below it.
 pub const MAX_COMMIT_BODY_BYTES: usize = 40 * 1024 * 1024;
 
 /// How a commit file's `content` is carried: `utf8` (or absent) is text,

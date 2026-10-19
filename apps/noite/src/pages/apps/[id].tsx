@@ -14,9 +14,10 @@ import { ControlAppDetail } from "$lib/apps/control-panel";
 import { CONTROL_APP_NAME, isControlApp } from "$lib/control-app";
 import { appDetail } from "$lib/resources";
 import { searchParam } from "$lib/search-param";
+import { DocumentTitle } from "$lib/ui/document-title";
 import { Cog } from "$lib/ui/icons";
 import { SidePanel } from "$lib/ui/side-panel";
-import { useRoute, head } from "@ilha/router";
+import { useParams } from "@ilha/void";
 
 const TABS = [
   { id: "overview", label: "Overview" },
@@ -76,8 +77,12 @@ const AppPageBody = ({ appId }: { appId: string }) => {
   // dedicated minimal detail instead of the tenant tabs. Branching before any
   // appDetail/liveErrors resource keeps the runner out of the loop entirely.
   if (isControlApp(appId)) {
-    head({ title: `${CONTROL_APP_NAME} · Noite` });
-    return <ControlAppDetail />;
+    return (
+      <>
+        <DocumentTitle title={`${CONTROL_APP_NAME} · Noite`} />
+        <ControlAppDetail />
+      </>
+    );
   }
   const tab = searchParam<TabId>("t", { default: "overview", parse: toTabId });
   // Settings opens beside the tabs (`?panel=settings`), so it stays open
@@ -91,7 +96,7 @@ const AppPageBody = ({ appId }: { appId: string }) => {
   const openError = searchParam("e", { default: "" });
   const detail = appDetail(appId).data();
   const name = detail?.app.name;
-  head({ title: `${name ?? "App"} · Noite` });
+  // The server head only knows the fallback; refine once the detail loads.
   // Same live feeds as the Errors tab's open list and the Events tab's
   // default view, so the tab badges never lag the lists.
   const counts = {
@@ -101,56 +106,59 @@ const AppPageBody = ({ appId }: { appId: string }) => {
   const settingsOpen = panel() === "settings";
 
   return (
-    <DetailShell
-      header={
-        <>
-          <AppHeader appId={appId} />
-          <DetailTabs
-            active={tab()}
-            counts={counts}
-            tabs={TABS}
-            onSelect={(next) => {
-              openError.set("");
-              tab.set(toTabId(next));
-            }}
-            trailing={
-              <button
-                type="button"
-                class={`btn btn-ghost btn-sm mb-1 shrink-0 ${settingsOpen ? "btn-active" : ""}`}
-                aria-pressed={settingsOpen ? "true" : "false"}
-                onclick={() => {
-                  panel.set(settingsOpen ? "" : "settings");
-                }}
-              >
-                <Cog />
-                Settings
-              </button>
-            }
+    <>
+      <DocumentTitle title={`${name ?? "App"} · Noite`} />
+      <DetailShell
+        header={
+          <>
+            <AppHeader appId={appId} />
+            <DetailTabs
+              active={tab()}
+              counts={counts}
+              tabs={TABS}
+              onSelect={(next) => {
+                openError.set("");
+                tab.set(toTabId(next));
+              }}
+              trailing={
+                <button
+                  type="button"
+                  class={`btn btn-ghost btn-sm mb-1 shrink-0 ${settingsOpen ? "btn-active" : ""}`}
+                  aria-pressed={settingsOpen ? "true" : "false"}
+                  onclick={() => {
+                    panel.set(settingsOpen ? "" : "settings");
+                  }}
+                >
+                  <Cog />
+                  Settings
+                </button>
+              }
+            />
+          </>
+        }
+        panel={
+          settingsOpen ? (
+            <SettingsAside
+              onClose={() => {
+                panel.set("");
+              }}
+            />
+          ) : null
+        }
+      >
+        {tab() === "overview" ? <AppDetailPanel appId={appId} /> : null}
+        {tab() === "deployments" ? (
+          <DeployList
+            appId={appId}
+            myRole={detail?.myRole}
+            subdomain={detail?.app.subdomain ?? ""}
           />
-        </>
-      }
-      panel={
-        settingsOpen ? (
-          <SettingsAside
-            onClose={() => {
-              panel.set("");
-            }}
-          />
-        ) : null
-      }
-    >
-      {tab() === "overview" ? <AppDetailPanel appId={appId} /> : null}
-      {tab() === "deployments" ? (
-        <DeployList
-          appId={appId}
-          myRole={detail?.myRole}
-          subdomain={detail?.app.subdomain ?? ""}
-        />
-      ) : null}
-      {tab() === "metrics" ? <MetricsTab appId={appId} /> : null}
-      {tab() === "errors" ? <ErrorsPanel appId={appId} /> : null}
-      {tab() === "events" ? <EventsPanel appId={appId} /> : null}
-    </DetailShell>
+        ) : null}
+        {tab() === "metrics" ? <MetricsTab appId={appId} /> : null}
+        {tab() === "errors" ? <ErrorsPanel appId={appId} /> : null}
+        {tab() === "events" ? <EventsPanel appId={appId} /> : null}
+      </DetailShell>
+    </>
   );
 };
 
@@ -162,9 +170,8 @@ const AppPageBody = ({ appId }: { appId: string }) => {
  * list keeps a tab switch from remounting it (the id is the only prop, so
  * ilha reuses the row, and the body repaints through its own param reads). */
 export default function AppPage() {
-  const appId = useRoute().params().id;
+  const { id: appId } = useParams();
   if (!appId) {
-    head({ title: "App · Noite" });
     return <p class="m-0 text-sm opacity-70">Missing app id.</p>;
   }
   return [<AppPageBody key={appId} appId={appId} />];

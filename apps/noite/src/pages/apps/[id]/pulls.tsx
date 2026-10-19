@@ -5,14 +5,13 @@ import { PullsPage } from "$lib/prs/layout";
 import { PR_FILTERS, PrsList } from "$lib/prs/list";
 import { prList } from "$lib/prs/resources";
 import { parseSkip, searchParam } from "$lib/search-param";
-import { head, useRoute } from "@ilha/router";
+import { Link, useParams } from "@ilha/void";
 
 /** The app's pull requests (`/apps/[id]/pulls`), laid out like the app's own
  * pages: a title row, the state tabs (`?state=`, every count shown) under it,
  * and the list below. */
 export default function PullsListPage() {
-  const appId = useRoute().params().id;
-  head({ title: "Pull requests · Noite" });
+  const { id: appId } = useParams();
   const state = searchParam<PrStateFilter>("state", {
     default: "open",
     parse: toPrStateFilter,
@@ -30,9 +29,12 @@ export default function PullsListPage() {
         <>
           <div class="flex flex-wrap items-center justify-between gap-2">
             <h1 class="m-0 text-xl font-semibold">Pull requests</h1>
-            <a class="btn btn-sm btn-neutral" href={`/apps/${appId}/pulls/new`}>
+            <Link
+              class="btn btn-sm btn-neutral"
+              href={`/apps/${appId}/pulls/new`}
+            >
               New pull request
-            </a>
+            </Link>
           </div>
           <DetailTabs
             active={active}

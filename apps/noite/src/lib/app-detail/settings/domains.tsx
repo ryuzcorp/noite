@@ -2,10 +2,10 @@
 
 import { atom } from "ilha";
 
+import { api } from "../../api";
 import { errorMessage } from "../../errors";
 import { domains } from "../../resources";
 import type { AppRole } from "../../roles";
-import { addDomain, removeDomain } from "../../server/domains.server";
 import { LoadError } from "../../ui/load-error";
 import { SectionSkeleton } from "../../ui/skeletons";
 import { SettingsSection } from "./section";
@@ -47,7 +47,10 @@ export const CustomDomainsPanel = ({
     busy.set(true);
     note.set("");
     try {
-      await addDomain({ appId, hostname: value });
+      await api<{ ok: true }>("/api/domains/addDomain", {
+        appId,
+        hostname: value,
+      });
       hostname.set("");
       note.set(
         "Saved. Point an A/AAAA record for it at this server; the certificate issues on the first visit."
@@ -63,7 +66,10 @@ export const CustomDomainsPanel = ({
     busy.set(true);
     note.set("");
     try {
-      await removeDomain({ appId, hostname: value });
+      await api<{ ok: true }>("/api/domains/removeDomain", {
+        appId,
+        hostname: value,
+      });
       await reload();
     } catch (error) {
       note.set(errorMessage(error));

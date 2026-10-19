@@ -1,5 +1,4 @@
 import * as Schema from "effect/Schema";
-import { action, fail, withSchema } from "oxidejs";
 
 import { failUnknown } from "../auth";
 import type { SessionUser } from "../auth";
@@ -29,6 +28,7 @@ import type {
   D1TableCaps,
   D1WriteBody,
 } from "../runner";
+import { apiAction, fail } from "./api";
 import {
   controlRows,
   controlSchema,
@@ -37,7 +37,6 @@ import {
   writeControlD1,
 } from "./control-d1.server";
 import {
-  AuthError,
   requireControlAdmin,
   requireViewApp,
   sessionUser,
@@ -117,10 +116,11 @@ const R2DeleteArgs = Schema.Struct({
 /** D1 databases + DO classes declared by an app's deployed config.
  * The reserved control app has exactly one resource: the control D1, which
  * lives in THIS worker's binding, so it never reaches the runner. */
-export const listAppStorage = action(
-  withSchema(StorageListArgs, async ({ appId }) => {
+export const listAppStorage = apiAction(
+  StorageListArgs,
+  async ({ appId }, { env, request }) => {
     if (appId === CONTROL_APP_ID) {
-      await requireControlAdmin();
+      await requireControlAdmin(request, env);
       return [
         {
           appId: CONTROL_APP_ID,
@@ -132,22 +132,23 @@ export const listAppStorage = action(
         },
       ];
     }
-    await requireViewApp(appId);
+    await requireViewApp(request, env, appId);
     try {
       return await runnerStorage(appId);
     } catch (error) {
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 /** Gate one control-D1 call: real non-impersonating admin, and the reserved
  * database only (the control app owns exactly one). */
 const requireControlDatabase = async (
+  request: Request,
+  env: KitEnv,
   databaseId: string
 ): Promise<SessionUser> => {
-  const user = await requireControlAdmin();
+  const user = await requireControlAdmin(request, env);
   if (databaseId !== CONTROL_APP_DATABASE_ID) {
     fail(`Unknown control database ${databaseId}`);
   }
@@ -165,17 +166,18 @@ const capsForRole = (role: AppRole): D1TableCaps =>
 /** Tables + row counts of an app D1 database (view role). The control
  * database is read IN-PROCESS from the worker's own binding (never via the
  * runner, never via `celld d1 execute` — see SPEC). */
-export const d1Tables = action(
-  withSchema(D1TablesArgs, async ({ appId, databaseId }) => {
+export const d1Tables = apiAction(
+  D1TablesArgs,
+  async ({ appId, databaseId }, { env, request }) => {
     if (appId === CONTROL_APP_ID) {
-      await requireControlDatabase(databaseId);
+      await requireControlDatabase(request, env, databaseId);
       try {
         return await listControlTables(resolveD1());
       } catch (error) {
         failUnknown(error);
       }
     }
-    const user = await sessionUser();
+    const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "view");
     try {
       const listed = await runnerD1Tables(appId, databaseId);
@@ -187,23 +189,23 @@ export const d1Tables = action(
     } catch (error) {
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 /** One table's schema with its caps: the tenant role decides there, the
  * control D1 policy decides for the reserved database. */
-export const d1Schema = action(
-  withSchema(D1TableArgs, async ({ appId, databaseId, table }) => {
+export const d1Schema = apiAction(
+  D1TableArgs,
+  async ({ appId, databaseId, table }, { env, request }) => {
     if (appId === CONTROL_APP_ID) {
-      await requireControlDatabase(databaseId);
+      await requireControlDatabase(request, env, databaseId);
       try {
         return await controlSchema(resolveD1(), table);
       } catch (error) {
         failUnknown(error);
       }
     }
-    const user = await sessionUser();
+    const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "view");
     try {
       const schema = await runnerD1Schema(appId, databaseId, table);
@@ -217,49 +219,39 @@ export const d1Schema = action(
     } catch (error) {
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 /** One server-side page of rows (view role). */
-export const d1Rows = action(
-  withSchema(
-    D1RowsArgs,
-    async ({
-      appId,
-      databaseId,
-      filters,
+export const d1Rows = apiAction(
+  D1RowsArgs,
+  async (
+    { appId, databaseId, filters, page, pageSize, search, sort, table },
+    { env, request }
+  ) => {
+    const query: D1RowsQuery = {
+      filters: filters === undefined ? [] : [...filters],
       page,
       pageSize,
-      search,
-      sort,
+      search: search ?? "",
+      sort: sort ?? null,
       table,
-    }) => {
-      const query: D1RowsQuery = {
-        filters: filters === undefined ? [] : [...filters],
-        page,
-        pageSize,
-        search: search ?? "",
-        sort: sort ?? null,
-        table,
-      };
-      if (appId === CONTROL_APP_ID) {
-        await requireControlDatabase(databaseId);
-        try {
-          return await controlRows(resolveD1(), query);
-        } catch (error) {
-          failUnknown(error);
-        }
-      }
-      await requireViewApp(appId);
+    };
+    if (appId === CONTROL_APP_ID) {
+      await requireControlDatabase(request, env, databaseId);
       try {
-        return await runnerD1Rows(appId, databaseId, query);
+        return await controlRows(resolveD1(), query);
       } catch (error) {
         failUnknown(error);
       }
     }
-  ),
-  { error: AuthError }
+    await requireViewApp(request, env, appId);
+    try {
+      return await runnerD1Rows(appId, databaseId, query);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }
 );
 
 const D1WriteArgs = Schema.Struct({
@@ -283,45 +275,43 @@ const D1WriteArgs = Schema.Struct({
  * lib/server/control-d1.server.ts (admin only, redacted and locked columns refused).
  * `null` binds SQL NULL, "" an empty string; an omitted insert column takes
  * its DDL default. */
-export const d1Write = action(
-  withSchema(
-    D1WriteArgs,
-    async ({ appId, databaseId, key, op, table, values }) => {
-      const body: D1WriteBody = { key, op, table, values };
-      if (appId === CONTROL_APP_ID) {
-        const user = await requireControlDatabase(databaseId);
-        try {
-          await writeControlD1(resolveD1(), {
-            actorId: user.id,
-            key,
-            op,
-            table,
-            values,
-          });
-          return { ok: true };
-        } catch (error) {
-          failUnknown(error);
-        }
-      }
-      const user = await sessionUser();
-      await requireAppRole(appId, user.id, "push");
+export const d1Write = apiAction(
+  D1WriteArgs,
+  async ({ appId, databaseId, key, op, table, values }, { env, request }) => {
+    const body: D1WriteBody = { key, op, table, values };
+    if (appId === CONTROL_APP_ID) {
+      const user = await requireControlDatabase(request, env, databaseId);
       try {
-        return await runnerD1Write(appId, databaseId, body);
+        await writeControlD1(resolveD1(), {
+          actorId: user.id,
+          key,
+          op,
+          table,
+          values,
+        });
+        return { ok: true };
       } catch (error) {
         failUnknown(error);
       }
     }
-  ),
-  { error: AuthError }
+    const user = await sessionUser(request, env);
+    await requireAppRole(appId, user.id, "push");
+    try {
+      return await runnerD1Write(appId, databaseId, body);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }
 );
 
 /** Delete 1..100 rows by key (push-gated): one atomic batch where the backend
  * allows it, every key policy-checked before anything runs. */
-export const d1DeleteRows = action(
-  withSchema(D1DeleteRowsArgs, async ({ appId, databaseId, keys, table }) => {
+export const d1DeleteRows = apiAction(
+  D1DeleteRowsArgs,
+  async ({ appId, databaseId, keys, table }, { env, request }) => {
     const body: D1DeleteRowsBody = { keys: [...keys], table };
     if (appId === CONTROL_APP_ID) {
-      const user = await requireControlDatabase(databaseId);
+      const user = await requireControlDatabase(request, env, databaseId);
       try {
         return await deleteControlRows(resolveD1(), {
           actorId: user.id,
@@ -332,69 +322,68 @@ export const d1DeleteRows = action(
         failUnknown(error);
       }
     }
-    const user = await sessionUser();
+    const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "push");
     try {
       return await runnerD1DeleteRows(appId, databaseId, body);
     } catch (error) {
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 /** Read-only Durable Object instance list for one class. */
-export const doPreview = action(
-  withSchema(DoPreviewArgs, async ({ appId, className }) => {
-    await requireViewApp(appId);
+export const doPreview = apiAction(
+  DoPreviewArgs,
+  async ({ appId, className }, { env, request }) => {
+    await requireViewApp(request, env, appId);
     try {
       return await runnerDoInstances(appId, className);
     } catch (error) {
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 /** One page of an R2 bucket folder (view role). */
-export const r2List = action(
-  withSchema(R2ListArgs, async ({ appId, bucket, prefix, cursor }) => {
-    await requireViewApp(appId);
+export const r2List = apiAction(
+  R2ListArgs,
+  async ({ appId, bucket, prefix, cursor }, { env, request }) => {
+    await requireViewApp(request, env, appId);
     try {
       return await runnerR2List(appId, bucket, prefix ?? "", cursor ?? null);
     } catch (error) {
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 /** Read-only R2 object fetch (bounded text preview). */
-export const r2Get = action(
-  withSchema(R2GetArgs, async ({ appId, bucket, key }) => {
-    await requireViewApp(appId);
+export const r2Get = apiAction(
+  R2GetArgs,
+  async ({ appId, bucket, key }, { env, request }) => {
+    await requireViewApp(request, env, appId);
     try {
       return await runnerR2Get(appId, bucket, key);
     } catch (error) {
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 /** Delete 1..100 R2 objects in one call (push role — a write). */
-export const r2Delete = action(
-  withSchema(R2DeleteArgs, async ({ appId, bucket, keys }) => {
+export const r2Delete = apiAction(
+  R2DeleteArgs,
+  async ({ appId, bucket, keys }, { env, request }) => {
     if (keys.length === 0 || keys.length > 100) {
       fail("select 1 to 100 objects");
     }
-    const user = await sessionUser();
+    const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "push");
     try {
       return await runnerR2Delete(appId, bucket, [...keys]);
     } catch (error) {
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );

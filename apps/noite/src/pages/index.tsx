@@ -1,15 +1,19 @@
 import { fetchSession } from "$lib/auth/session";
-import { head, navigate } from "@ilha/router";
+import { useRouter } from "@ilha/void";
 import { watch } from "ilha";
 
 /** Home resolves by session: signed in → apps, otherwise login. The layout
- * splash covers the check, so this renders nothing itself. */
+ * splash covers the check, so this renders nothing itself. The title comes
+ * from `index.server.ts`. */
 export default function Home() {
-  head({ title: "Noite" });
+  const router = useRouter();
 
   watch.once(async () => {
+    if (typeof window === "undefined") {
+      return;
+    }
     const { data } = await fetchSession();
-    navigate(data?.user ? "/apps" : "/login");
+    await router.visit(data?.user ? "/apps" : "/login");
   });
 
   return null;

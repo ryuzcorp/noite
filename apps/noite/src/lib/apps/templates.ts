@@ -16,8 +16,7 @@ export interface AppTemplate {
 
 export const TEMPLATES: readonly AppTemplate[] = [
   {
-    description:
-      "Oxide worker with the ilha router and Vite — the shape this control UI runs on.",
+    description: "Oxide worker with the ilha router and Vite.",
     id: "oxide",
     name: "Oxide + ilha",
     ref: "main",

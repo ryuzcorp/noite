@@ -133,7 +133,7 @@ flowchart LR
 
 - **Runner** ([`apps/runner`](apps/runner)): Git smart-HTTP, builds, deploys, the API, telemetry aggregation with DuckDB, and the edge configuration. Its SQLite state is snapshotted into the bucket.
 - **Caddy**: TLS with on-demand certificates, host routing, compression and rate limits, configured by the runner through its admin API.
-- **Control UI** ([`apps/noite`](apps/noite)): an [Oxide](https://github.com/ryuzcorp/oxide) Worker served by its own celld node.
+- **Control UI** ([`apps/noite`](apps/noite)): a [Void](https://void.cloud) Worker (ilha UI via `@ilha/void`) served by its own celld node.
 - **Tenant apps**: one celld fleet per app, run as an unprivileged user, put to sleep when idle and woken by the next request.
 
 More in [How it works](https://noite.now/how-it-works/) and [SPEC.md](SPEC.md).
@@ -163,7 +163,7 @@ The dev base is `noite.localhost`, never bare `localhost`: the control UI and ev
 | Path |  |
 | --- | --- |
 | [`apps/runner`](apps/runner) | Rust runner: deploys, fleets, edge config, telemetry, supervision |
-| [`apps/noite`](apps/noite) | Oxide control UI |
+| [`apps/noite`](apps/noite) | Void control UI |
 | [`apps/noite/test`](apps/noite/test) | sample apps and the hostile-tenant isolation probe |
 | [`apps/website`](apps/website) | [noite.now](https://noite.now) and the docs |
 | [`packages/cli`](packages/cli) | `@noitenow/cli`, deploys from CI |

@@ -9,9 +9,9 @@ import * as Atom from "effect/reactivity/Atom";
 import { atom, watch } from "ilha";
 import type { View } from "ilha";
 
+import { api } from "../api";
 import { session } from "../resources";
 import type { SessionView } from "../resources";
-import { completeOnboarding } from "../server/account.server";
 import { Dialog } from "../ui/dialog";
 import {
   ArrowLeft,
@@ -168,7 +168,7 @@ export const Onboarding = () => {
     }
     closed.set(true);
     try {
-      await completeOnboarding();
+      await api<{ ok: true }>("/api/account/completeOnboarding", {});
     } catch {
       // A failed write must not trap the user in the modal; worst case the
       // tour shows again on the next load.

@@ -5,7 +5,7 @@ import { CONTROL_APP_ID, CONTROL_APP_NAME } from "$lib/control-app";
 import { session } from "$lib/resources";
 import { searchParam } from "$lib/search-param";
 import { Avatar } from "$lib/ui/avatar";
-import { head } from "@ilha/router";
+import { Link } from "@ilha/void";
 
 const TABS = [
   { id: "account", label: "Account" },
@@ -42,16 +42,15 @@ const AdminHomeCard = () => (
     <h2 class="m-0 text-lg font-semibold">Users, apps and invites</h2>
     <p class="m-0 text-sm opacity-80">
       Managed on the{" "}
-      <a class="link" href={`/apps/${CONTROL_APP_ID}?t=users`}>
+      <Link class="link" href={`/apps/${CONTROL_APP_ID}?t=users`}>
         {CONTROL_APP_NAME} admin page
-      </a>
+      </Link>
       .
     </p>
   </section>
 );
 
 export default function Account() {
-  head({ title: "Account · Noite" });
   const tab = searchParam<TabId>("t", { default: "account", parse: toTabId });
   const admin = isInstanceAdmin();
   // The Admin tab exists for a real instance admin only; a stale `?t=admin`

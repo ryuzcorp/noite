@@ -1,30 +1,41 @@
 //! `searchParam` that re-renders the reader when the URL changes.
 //!
-//! `@ilha/router` keeps the query string in a module variable and re-renders
-//! the route in place, and ilha reuses a keyed component without re-running it
-//! when its props are shallow-equal — so a plain `searchParam` read is not a
-//! reactive read. A component that reads a param below such a keyed boundary,
-//! or that receives a `SearchParam` handle as a prop, kept painting the old
-//! query after an in-place navigation (`.set()`, tab clicks, paging).
-//!
-//! Every read here also reads one shared navigation cell, bumped after each
-//! navigation: that read is what subscribes the reading component, whether the
-//! handle was created there or handed down as a prop. The cell is installed by
-//! the root layout instead of being created on first read because `atom`
-//! claims a slot in the calling fiber's render — creating it lazily would
-//! shift the slots of every later atom in whichever component read a param
-//! first. Reads and writes still go through the router.
+//! Query-string state for tab switches, paging cursors, panel toggles and
+//! other deep-linkable UI. Reads subscribe the rendering component to the
+//! layout-provided cell; writes go through `history.replaceState` — no
+//! navigation, no remount, no refetch — and bump the cell so a component
+//! below a keyed boundary still repaints after an in-place write (`.set()`,
+//! tab clicks, paging). Void's router has no query-state hook, so this is
+//! the app's own state module, not a wrapper around one.
 
-import { afterNavigate, searchParam as routeParam } from "@ilha/router";
-import type {
-  SearchParam,
-  SearchParamFn,
-  SearchParamOptions,
-} from "@ilha/router";
 import { atom } from "ilha";
 import type { AtomHandle } from "ilha";
 
-export type { SearchParam, SearchParamOptions } from "@ilha/router";
+/** One query param: call to read, `set`/`update` to write in place. */
+export interface SearchParam<T> {
+  (): T;
+  set: (next: T) => void;
+  update: (f: (current: T) => T) => void;
+}
+
+export interface SearchParamOptions<T> {
+  /** Value when the param is absent. Writing it removes the param. */
+  default: T;
+  /** Decode the raw param. Default: the raw string. */
+  parse?: (raw: string) => T;
+  /** Encode a value for the URL. Default: `String(value)`. */
+  serialize?: (value: T) => string;
+}
+
+export interface SearchParamFn {
+  /** String param: `parse` is optional. */
+  (name: string, opts: SearchParamOptions<string>): SearchParam<string>;
+  /** Non-string param: `parse` is required to decode the raw string. */
+  <T>(
+    name: string,
+    opts: SearchParamOptions<T> & { parse: (raw: string) => T }
+  ): SearchParam<T>;
+}
 
 /** Parse a paging cursor (`?skip=`): a positive integer, anything else
  * (missing, `0`, negative, fractional, not a number) is the first page. */
@@ -33,55 +44,107 @@ export const parseSkip = (raw: string): number => {
   return Number.isSafeInteger(value) && value > 0 ? value : 0;
 };
 
-/** Version bumped after every navigation; every param read subscribes to it. */
+/** Version bumped after every in-place write; every param read subscribes. */
 let cell: AtomHandle<number> | undefined;
 
-afterNavigate(() => {
-  cell?.update((version) => version + 1);
-});
-
-/** Mount the shared navigation cell.
+/** Mount the shared query cell.
  *
  * The root layout calls this on every render, ahead of any early return:
  * `atom` allocates one slot per fiber, so the call has to stay unconditional
  * and in a fixed position. The layout renders above every page, so the cell
  * exists before the first param read; a route change that remounts the layout
  * (a different page component) replaces it. */
-export const provideNavigationCell = (): void => {
+export const provideQueryCell = (): void => {
   cell = atom(0);
 };
 
-/** The router's factory at its unconstrained overload.
- *
- * Its two overloads differ only in whether `parse` is required, and this one
- * takes `SearchParamOptions<T>`, which already leaves it optional. */
-const makeParam = <T>(
-  name: string,
-  opts: SearchParamOptions<T>
-): SearchParam<T> => {
-  // SAFETY: the implementation applies `parse` when it is there and returns
-  // the raw string otherwise — exactly what `SearchParamOptions<T>` describes.
-  const routeCall = routeParam as (
-    name: string,
-    opts: SearchParamOptions<T>
-  ) => SearchParam<T>;
-  return routeCall(name, opts);
+/** An in-place write landed: repaint every query-param reader. */
+export const notifyQueryChanged = (): void => {
+  cell?.update((version) => version + 1);
 };
 
-/** Read and write one query param through the router. Unlike the router's own
- * `searchParam`, reading it subscribes the reading component to navigations. */
+/** A client navigation (a Void visit, back/forward) changes the query string
+ * without remounting the layout — so `provideQueryCell` never re-runs — and
+ * without an in-place write, so param readers would stay stale until an
+ * unrelated repaint. Void's router has no query-state hook (see the module
+ * doc), so watch the history methods instead and bump the cell on every one;
+ * an extra bump is one harmless repaint. Client-only: the server never
+ * navigates, and there is exactly one history per page. */
+let historyWatched = false;
+if (typeof window !== "undefined") {
+  const bump = (): void => {
+    notifyQueryChanged();
+  };
+  const { history } = window;
+  const pushState = history.pushState.bind(history);
+  history.pushState = (
+    ...args: [data: unknown, unused: string, url?: string | URL | null]
+  ): void => {
+    pushState(...args);
+    bump();
+  };
+  const replaceState = history.replaceState.bind(history);
+  history.replaceState = (
+    ...args: [data: unknown, unused: string, url?: string | URL | null]
+  ): void => {
+    replaceState(...args);
+    bump();
+  };
+  if (!historyWatched) {
+    historyWatched = true;
+    window.addEventListener("popstate", bump);
+  }
+}
+
+/** Read and write one query param in the live document location. Unlike a
+ * plain read, reading subscribes the reading component to in-place writes. */
 export const searchParam: SearchParamFn = <T>(
   name: string,
   opts: SearchParamOptions<T>
 ): SearchParam<T> => {
-  const param = makeParam(name, opts);
-  return Object.assign(
+  // SAFETY: the default parser is the identity; T is inferred from opts.default, so callers without parse get T = string and raw already is one.
+  const parse = opts.parse ?? ((raw: string): T => raw as T);
+  const serialize = opts.serialize ?? String;
+  const read = (): T => {
+    if (typeof window === "undefined") {
+      return opts.default;
+    }
+    const raw = new URLSearchParams(window.location.search).get(name);
+    return raw === null ? opts.default : parse(raw);
+  };
+  const write = (next: T): void => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const params = new URLSearchParams(window.location.search);
+    if (next === opts.default) {
+      params.delete(name);
+    } else {
+      params.set(name, serialize(next));
+    }
+    const query = params.toString();
+    window.history.replaceState(
+      null,
+      "",
+      window.location.pathname +
+        (query ? `?${query}` : "") +
+        window.location.hash
+    );
+    notifyQueryChanged();
+  };
+  const param: SearchParam<T> = Object.assign(
     (): T => {
       // The value is not used: reading the cell is what registers the
       // subscription on the component that is rendering right now.
       cell?.();
-      return param();
+      return read();
     },
-    { set: param.set, update: param.update }
+    {
+      set: write,
+      update: (f: (current: T) => T): void => {
+        write(f(read()));
+      },
+    }
   );
+  return param;
 };

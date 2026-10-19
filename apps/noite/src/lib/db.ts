@@ -5,7 +5,6 @@ import * as Schema from "effect/Schema";
 import { SqlClient } from "effect/sql/SqlClient";
 import { Kysely } from "kysely";
 import { D1Dialect } from "kysely-d1";
-import { isolateOnce, useEnv } from "oxidejs";
 import { createMigrator, defineSchema, paranorm } from "paranorm";
 import type { InferSchema, Selectable } from "paranorm";
 
@@ -354,33 +353,20 @@ export const setD1Binding = (db: D1Database) => {
   d1Binding = db;
 };
 
-/** Live D1: request ALS env first, then the middleware-stamped binding. */
+/** Live D1: the middleware-stamped binding (`src/middleware/03-db.ts` stamps
+ * it on every request; tests stamp it by hand). */
 export const resolveD1 = (): D1Database => {
-  try {
-    const live = useEnv<KitEnv>()?.DB;
-    if (live) {
-      return live;
-    }
-  } catch {
-    // Outside a request store — fall through to the stamped binding.
-  }
   if (d1Binding) {
     return d1Binding;
   }
   throw missingDb();
 };
 
-/** Request-scoped env over process defaults (Worker-safe: no bare process.env). */
-export const resolveEnv = (): KitEnv => {
-  let live: KitEnv | undefined;
-  try {
-    live = useEnv<KitEnv>();
-  } catch {
-    // Outside a request store — defaults only.
-  }
-  // SAFETY: the merged bag mirrors KitEnv (control defaults + live Worker env); unset keys stay undefined as callers tolerate.
-  return { ...controlEnv, ...live } as KitEnv;
-};
+/** Request-scoped env over control defaults (Worker-safe: no bare process.env).
+ * The middleware stamps the live Worker env onto `controlEnv` per request, so
+ * readers here see it without threading `c.env` through every query. */
+// SAFETY: the spread mirrors KitEnv (control defaults, stamped per request by the middleware); unset keys stay undefined as callers tolerate.
+export const resolveEnv = (): KitEnv => ({ ...controlEnv }) as KitEnv;
 
 /** Better Auth database: Kysely over D1 (fresh handle per call — D1 has no connections to pool). */
 export const getAuthDb = () =>
@@ -412,8 +398,8 @@ const runDbSetup = Effect.gen(function* runDbSetup() {
   }
 });
 
-/** Bound on one setup pass. Shorter than oxide's 30 s default so a stuck D1
- * call fails the pass (and clears it) well inside a request's own deadline. */
+/** Bound on one setup pass. A stuck D1 call fails the pass (and clears it)
+ * well inside a request's own deadline instead of hanging it. */
 const SETUP_TIMEOUT_MS = 15_000;
 
 /** How long a request waits on a pass another request started before it drops
@@ -423,20 +409,88 @@ const SETUP_TIMEOUT_MS = 15_000;
  * isolate would wait on it forever. */
 const SHARED_SETUP_WAIT_MS = 5000;
 
-/** At most one setup pass per isolate, per D1 binding, through oxidejs
- * `isolateOnce`: concurrent callers share one pass, a failure or timeout
- * clears it (so the next request retries), and a caller that has waited
- * {@link SHARED_SETUP_WAIT_MS} runs its own instead of hanging on a pass
- * orphaned by a finished request. The binding is the pass key, so a test that
- * swaps in a fresh database gets a fresh pass. */
-const runDbSetupOnce = isolateOnce(
-  async (db: D1Database) => {
-    await Effect.runPromise(
+/** One in-flight setup pass: its promise plus whether it settled. A settled
+ * failure is dropped from the table so the next caller retries. */
+interface SetupPass {
+  promise: Promise<void>;
+  settled: boolean;
+}
+
+const setupPasses = new WeakMap<D1Database, SetupPass>();
+
+const failAfter = async (promise: Promise<void>, ms: number): Promise<void> => {
+  const expiry = Effect.runPromise(
+    Effect.andThen(
+      Effect.sleep(ms),
+      Effect.fail(new Error(`noite: db setup did not settle within ${ms}ms`))
+    )
+  );
+  // `Promise.race` (unlike `Effect.race`, where only the first *success*
+  // wins) lets the first *settlement* win, so a fast setup failure rejects
+  // here instead of waiting out the sleep. The race handles both branches,
+  // so neither rejection is ever unhandled.
+  await Promise.race([promise, expiry]);
+};
+
+const startSetupPass = (db: D1Database): SetupPass => {
+  const promise = failAfter(
+    Effect.runPromise(
       runDbSetup.pipe(Effect.provide(D1Client.layer({ db })), Effect.scoped)
-    );
-  },
-  { timeout: SETUP_TIMEOUT_MS, wait: SHARED_SETUP_WAIT_MS }
-);
+    ),
+    SETUP_TIMEOUT_MS
+  );
+  const pass: SetupPass = { promise, settled: false };
+  setupPasses.set(db, pass);
+  void (async (): Promise<void> => {
+    try {
+      await promise;
+    } catch {
+      // The setup failure travels on the pass promise itself; here it only
+      // ends the wait so a settled failure is dropped and retried next call.
+      if (setupPasses.get(db) === pass) {
+        setupPasses.delete(db);
+      }
+    }
+    pass.settled = true;
+  })();
+  return pass;
+};
+
+/** At most one setup pass per isolate, per D1 binding (an isolate-once
+ * helper, whose semantics this keeps: concurrent callers share one
+ * pass, a failure or timeout clears it so the next request retries, and a
+ * caller that has waited {@link SHARED_SETUP_WAIT_MS} runs its own instead
+ * of hanging on a pass orphaned by a finished request. The binding is the
+ * pass key, so a test that swaps in a fresh database gets a fresh pass. */
+const runDbSetupOnce = async (db: D1Database): Promise<void> => {
+  const cached = setupPasses.get(db);
+  if (cached === undefined) {
+    return startSetupPass(db).promise;
+  }
+  // A settled pass (ok or failed) answers false so the caller shares it;
+  // only an expired wait runs a fresh pass. `Promise.race` lets the first
+  // *settlement* win (see `failAfter`); the race handles both branches.
+  const shared = (async (): Promise<boolean> => {
+    try {
+      await cached.promise;
+    } catch {
+      // A failed pass still counts as settled: the caller shares its
+      // rejection through `cached.promise` below.
+    }
+    return false;
+  })();
+  const elapsed = Effect.runPromise(
+    Effect.as(Effect.sleep(SHARED_SETUP_WAIT_MS), true)
+  );
+  const waited = await Promise.race([shared, elapsed]);
+  if (!waited) {
+    return cached.promise;
+  }
+  if (!cached.settled && setupPasses.get(db) === cached) {
+    setupPasses.delete(db);
+  }
+  return startSetupPass(db).promise;
+};
 
 export const ensureDb = Effect.promise(() => runDbSetupOnce(resolveD1()));
 

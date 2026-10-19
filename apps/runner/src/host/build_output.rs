@@ -1,8 +1,8 @@
 //! The config `celld deploy` takes after a build (SPEC, Deploy pipeline):
 //! what the build produced, not the pushed source config.
 //!
-//! 1. `dist/wrangler.json`, a celld-ready config the build wrote (Oxide, on
-//!    Vite and Rsbuild alike).
+//! 1. `dist/wrangler.json`, a celld-ready config the build wrote (Void or
+//!    Oxide, on Vite or Rsbuild alike).
 //! 2. Wrangler's deploy redirect, `.wrangler/deploy/config.json`, which
 //!    `@cloudflare/vite-plugin` writes beside `dist/<worker>/wrangler.json`.
 //!    celld refuses that output as is (Wrangler-only keys, an assets
@@ -22,7 +22,7 @@ use serde_json::Value;
 pub const DEPLOY_REDIRECT: &str = ".wrangler/deploy/config.json";
 
 /// Top-level keys `celld deploy` 0.6 accepts; any other key fails the deploy
-/// (oxidejs `CELLD_WRANGLER_KEYS`). celld also accepts `no_bundle`, but it is
+/// (the celld key allowlist). celld also accepts `no_bundle`, but it is
 /// dropped on purpose: the Vite plugin sets it so Wrangler skips esbuild, and
 /// celld would then load split chunks it cannot resolve.
 const CELLD_KEYS: &[&str] = &[
@@ -182,7 +182,7 @@ fn celld_config_from(src: &Path, config: &Path) -> anyhow::Result<PathBuf> {
 }
 
 /// D1 `migrations_dir` values relative to the new root; one that is missing
-/// or outside it is dropped (celld refuses `..`), as oxidejs does.
+/// or outside it is dropped (celld refuses `..`).
 fn relocate_migrations(obj: &mut serde_json::Map<String, Value>, config_dir: &Path, root: &Path) {
     let Some(dbs) = obj.get_mut("d1_databases").and_then(Value::as_array_mut) else {
         return;

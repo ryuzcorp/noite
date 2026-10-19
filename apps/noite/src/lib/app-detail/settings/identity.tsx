@@ -2,9 +2,9 @@
 
 import { atom } from "ilha";
 
+import { api } from "../../api";
 import { errorMessage } from "../../errors";
 import type { AppRole } from "../../roles";
-import { renameApp } from "../../server/apps.server";
 import { SettingsSection } from "./section";
 
 /** Identity form: the display name. Admin-only; everyone else sees the
@@ -37,7 +37,7 @@ export const AppIdentityForm = ({
     }
     busy.set(true);
     try {
-      await renameApp({ id: appId, name: next });
+      await api<{ ok: true }>("/api/apps/renameApp", { id: appId, name: next });
       err.set("");
       onSaved();
     } catch (error) {

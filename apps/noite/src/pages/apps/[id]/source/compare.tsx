@@ -1,10 +1,11 @@
 import { CodePage } from "$lib/forge/code-bar";
 import { CompareBar, CompareView } from "$lib/forge/compare";
 import { searchParam } from "$lib/search-param";
-import { head, useRoute } from "@ilha/router";
+import { DocumentTitle } from "$lib/ui/document-title";
+import { Link, useParams } from "@ilha/void";
 
 export default function ComparePage() {
-  const appId = useRoute().params().id;
+  const { id: appId } = useParams();
   // Base defaults to the platform's default branch; head has no sensible
   // default, so the empty state just asks for one (the branch rows and the
   // source page link straight here with both set).
@@ -13,7 +14,6 @@ export default function ComparePage() {
   // The ref the compare was opened from (the branch picker sets it), so the
   // back link and the commit links return to that checkout.
   const gitRef = searchParam("ref", { default: "" });
-  head({ title: `Compare ${base()}…${headRef()} · Noite` });
   if (!appId) {
     return <p class="text-error m-0 p-4 text-sm">Missing app id.</p>;
   }
@@ -23,15 +23,16 @@ export default function ComparePage() {
   };
   return (
     <CodePage appId={appId} backRef={gitRef()}>
+      <DocumentTitle title={`Compare ${base()}…${headRef()} · Noite`} />
       <div class="flex flex-wrap items-center justify-between gap-2">
         <h1 class="m-0 text-xl font-semibold">Compare</h1>
         {headRef() === "" ? null : (
-          <a
+          <Link
             class="btn btn-sm btn-neutral"
             href={`/apps/${appId}/pulls/new?base=${encodeURIComponent(base())}&head=${encodeURIComponent(headRef())}`}
           >
             Open pull request
-          </a>
+          </Link>
         )}
       </div>
       {headRef() === "" ? (

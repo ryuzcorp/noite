@@ -4,16 +4,15 @@
 //! Cancel / Create footer; the Slug row checks the slug while you type and
 //! shows the URL and git remote it would get.
 
-import { navigate } from "@ilha/router";
+import { Link, useRouter } from "@ilha/void";
 import { atom, watch } from "ilha";
 import type { View } from "ilha";
-import { createMutationQueue } from "oxidejs/mutation-queue";
 
+import { api } from "../api";
+import type { SlugCheck } from "../api-types";
 import { formatBytes } from "../bytes";
 import { commitSource } from "../commit-source";
 import { errorMessage } from "../errors";
-import { create, slugCheck } from "../server/apps.server";
-import type { SlugCheck } from "../server/apps.server";
 import { readDroppedItems } from "../source/uploads";
 import {
   ArrowUpRight,
@@ -30,11 +29,12 @@ import type { ProjectUpload } from "./folder-drop";
 import { appUrl, slugifyName } from "./identity";
 import { TEMPLATES } from "./templates";
 
-// Same queue the old form used: a double submit for one slug creates one app.
-const queue = createMutationQueue();
-const createQueued = queue.wrap(create, {
-  idempotencyKey: ({ slug }) => `create:${slug}`,
-});
+// Submitting posts straight to the JSON action (`api()`), guarded while a
+// create is in flight: the button is disabled and a re-submit returns early,
+// so a double submit creates one app. `useForm` does not fit here — it posts
+// to a page action and refreshes page props, but a create must read the new
+// id from the response (and possibly commit an upload first) before
+// navigating to the new app.
 
 const MODES = [
   {
@@ -379,9 +379,9 @@ const CreateNotice = ({
           {stranded ? (
             <>
               {" "}
-              <a href={`/apps/${stranded}`} class="link">
+              <Link href={`/apps/${stranded}`} class="link">
                 Open the app
-              </a>
+              </Link>
             </>
           ) : null}
         </span>
@@ -390,6 +390,7 @@ const CreateNotice = ({
   ) : null;
 
 export const CreateAppForm = () => {
+  const router = useRouter();
   const notice = atom<string | null>(null);
   const busy = atom(false);
   const mode = atom<ModeId>("blank");
@@ -437,7 +438,9 @@ export const CreateAppForm = () => {
   const checkNow = async (value: string): Promise<SlugCheck | null> => {
     slugState.set({ slug: value, status: "checking" });
     try {
-      const result = await slugCheck({ slug: value });
+      const result = await api<SlugCheck>("/api/apps/slugCheck", {
+        slug: value,
+      });
       if (slug().trim().toLowerCase() === value) {
         slugState.set({ result, slug: value, status: "done" });
       }
@@ -578,6 +581,23 @@ export const CreateAppForm = () => {
     });
   };
 
+  /** Show a failed create: a slug lost to a race (or reserved) belongs under
+   * the Slug field, not in a banner quoting the runner — ask again and show
+   * it there; anything else goes in the notice. */
+  const failCreate = async (
+    slugValue: string,
+    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-site values are unknown by construction; this maps them to the notice.
+    error: unknown
+  ): Promise<void> => {
+    busy.set(false);
+    const recheck = await checkNow(slugValue);
+    if (recheck?.error) {
+      document.querySelector<HTMLElement>("#create-slug")?.focus();
+      return;
+    }
+    notice.set(errorMessage(error));
+  };
+
   const submit = async (event: SubmitEvent) => {
     event.preventDefault();
     notice.set(null);
@@ -615,24 +635,21 @@ export const CreateAppForm = () => {
     }
     const { source } = picked;
     const upload = folder();
+    // Pending guard: the button is already disabled while busy, and a second
+    // submit (double Enter) returns here instead of creating a second app.
+    if (busy()) {
+      return;
+    }
     busy.set(true);
     let createdId: string;
     try {
-      ({ id: createdId } = await createQueued({
+      ({ id: createdId } = await api<{ id: string }>("/api/apps/create", {
         name: trimmedName,
         slug: nextSlug,
         source: upload ? { kind: "blank" } : source,
       }));
     } catch (error) {
-      busy.set(false);
-      // A slug lost to a race (or reserved) belongs under the Slug field, not
-      // in a banner quoting the runner: ask again and show it there.
-      const recheck = await checkNow(nextSlug);
-      if (recheck?.error) {
-        document.querySelector<HTMLElement>("#create-slug")?.focus();
-        return;
-      }
-      notice.set(errorMessage(error));
+      await failCreate(nextSlug, error);
       return;
     }
     if (upload) {
@@ -656,7 +673,7 @@ export const CreateAppForm = () => {
     // A blank app's next step is a push, which its Overview explains; an
     // upload, import or template is already building, which Deployments
     // shows.
-    navigate(
+    router.visit(
       source.kind === "blank" && !upload
         ? `/apps/${createdId}`
         : `/apps/${createdId}?t=deployments`
@@ -902,9 +919,9 @@ export const CreateAppForm = () => {
         <CreateNotice message={notice()} stranded={stranded()} />
 
         <footer class="border-base-300 bg-base-200/50 dark:bg-base-300/40 flex items-center justify-end gap-2 border-t px-6 py-3">
-          <a href="/apps" class="btn btn-ghost btn-sm">
+          <Link href="/apps" class="btn btn-ghost btn-sm">
             Cancel
-          </a>
+          </Link>
           <button
             type="submit"
             class="btn btn-neutral btn-sm"

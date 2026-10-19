@@ -7,7 +7,7 @@ import { resetRateLimits } from "../lib/rate-limit";
 import { createTestD1 } from "../testing/d1";
 import type { TestD1 } from "../testing/d1";
 import { MAX_BODY_BYTES } from "./body";
-import { handleHttp } from "./router";
+import { handleMcp } from "./routes/mcp";
 
 const ENV = {
   BASE_DOMAIN: "localhost",
@@ -64,8 +64,9 @@ const call = async (
   if (body !== "") {
     requestInit.body = body;
   }
-  return await Promise.resolve(
-    handleHttp(new Request(MCP_URL, requestInit), ENV as unknown as never)
+  return await handleMcp(
+    new Request(MCP_URL, requestInit),
+    ENV as unknown as never
   );
 };
 

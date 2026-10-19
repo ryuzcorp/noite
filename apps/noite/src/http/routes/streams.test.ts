@@ -49,19 +49,17 @@ const runMetricsStream = async (versionFor: (call: number) => number) => {
     return Response.json([]);
   });
   const controller = new AbortController();
-  const decoder = new TextDecoder();
   const done = streamMetrics({
     auth: { authorization: "Bearer t" },
     base: "http://runner.test/v1/apps/a",
-    controller: {
-      close: () => {},
-      enqueue: (chunk: Uint8Array) => {
-        chunks.push(decoder.decode(chunk));
-      },
-      // SAFETY: streamMetrics only calls enqueue and close.
-    } as unknown as ReadableStreamDefaultController,
     pollMs: 20,
     signal: controller.signal,
+    sink: {
+      send: (message: { data: string }) => {
+        chunks.push(`data: ${message.data}\n\n`);
+        return Promise.resolve();
+      },
+    },
     windowQuery: "hours=24",
   });
   await Bun.sleep(200);
@@ -151,9 +149,10 @@ describe("streamMetrics", () => {
     // would make thousands of calls in the same time.
     expect(versionCalls).toBeGreaterThanOrEqual(3);
     expect(versionCalls).toBeLessThan(40);
-    // One frame for the first poll, heartbeats for every unchanged cycle.
-    expect(chunks[0]?.startsWith("data: ")).toBe(true);
-    expect(chunks.slice(1).every((chunk) => chunk === ": ping\n\n")).toBe(true);
+    // The first poll sends its frame; unchanged cycles send nothing (the
+    // keep-alive comments come from `eventStream`, not the loop).
+    expect(chunks.length).toBeGreaterThanOrEqual(1);
+    expect(chunks.every((chunk) => chunk.startsWith("data: "))).toBe(true);
   });
 
   test("a moved version polls again", async () => {

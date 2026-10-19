@@ -315,6 +315,10 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
     sliding?.abort();
     sliding = null;
     clearTimeout(timer);
+    if (typeof document === "undefined") {
+      // SSR: no binding ever ran, so there is no slide class to take off.
+      return;
+    }
     document.documentElement.classList.remove(SLIDING);
   };
 
@@ -324,7 +328,9 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
   const unbind = (): void => {
     endSlide();
     dragging = false;
-    document.documentElement.classList.remove(DRAGGING);
+    if (typeof document !== "undefined") {
+      document.documentElement.classList.remove(DRAGGING);
+    }
     for (const el of [root, ...panels]) {
       el?.removeAttribute("style");
     }

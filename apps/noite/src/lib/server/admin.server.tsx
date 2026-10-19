@@ -2,8 +2,8 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { SqlClient } from "effect/sql/SqlClient";
-import { action, fail, useEnv, useRequest, withSchema } from "oxidejs";
 
+import type { AdminAppRow, AdminUserRow } from "../api-types";
 import {
   authFromEnv,
   failUnknown,
@@ -19,8 +19,9 @@ import {
   runnerPatchApp,
 } from "../runner";
 import type { RunnerApp } from "../runner";
+import { apiAction, apiActionNoInput, fail } from "./api";
 import { listInvites, mintInvites, revokeInvite } from "./invites.server";
-import { AuthError, getSessionOrNull } from "./session.server";
+import { getSessionOrNull } from "./session.server";
 
 /** Explicit user-row shape (mirrors the paranorm `user` table). Written
  * out instead of `Selectable<DB["user"]>`, whose instantiation blows up
@@ -74,13 +75,12 @@ interface AdminSession {
  * `adminOverview` can probe for the panel; a denying caller turns it into a
  * client-visible `fail("Admin only")`. An infra failure is logged and reads
  * as denial, never as the generic "Internal error". */
-const requireAdmin = async (): Promise<AdminSession | null> => {
+const requireAdmin = async (
+  request: Request,
+  env: KitEnv
+): Promise<AdminSession | null> => {
   try {
-    const request = useRequest();
-    const env = useEnv<KitEnv>() ?? process.env;
-    // SAFETY: the request-scoped env (or process.env fallback) provides the
-    // same KitEnv control keys used by every action.
-    const session = await getSessionOrNull(request, env as KitEnv);
+    const session = await getSessionOrNull(request, env);
     const user = session?.user;
     if (!session || !user?.email || !user.id || session.impersonatedBy) {
       return null;
@@ -107,9 +107,7 @@ const requireAdmin = async (): Promise<AdminSession | null> => {
   }
 };
 
-const adminAuth = () => {
-  const request = useRequest();
-  const env = useEnv<KitEnv>() ?? process.env;
+const adminAuth = (request: Request, env: KitEnv) => {
   const origin = (() => {
     try {
       return new URL(request.url).origin;
@@ -117,22 +115,9 @@ const adminAuth = () => {
       throw new UnauthorizedError({ message: "Sign in required" });
     }
   })();
-  const auth = authFromEnv(
-    // SAFETY: same KitEnv control keys as every other server action.
-    env as KitEnv,
-    origin
-  );
+  const auth = authFromEnv(env, origin);
   return { auth, headers: request.headers };
 };
-
-export interface AdminUserRow {
-  banned: boolean;
-  createdAt: string;
-  email: string;
-  id: string;
-  name: string;
-  role: string;
-}
 
 const asUserRow = (row: DbUser): AdminUserRow => ({
   banned: row.banned ?? false,
@@ -150,20 +135,17 @@ const asUserRow = (row: DbUser): AdminUserRow => ({
  * works regardless of framework error mapping. `controlFleet` tells the
  * control app whether this install supervises the control fleet (false on the
  * dev image, where `vite dev` serves the UI and there is no control celld). */
-export const adminOverview = action(
-  async () => {
-    const admin = await requireAdmin();
-    if (!admin) {
-      return { controlFleet: true, email: "", isAdmin: false as const };
-    }
-    return {
-      controlFleet: await runnerControlFleet(),
-      email: admin.email,
-      isAdmin: true as const,
-    };
-  },
-  { error: AuthError }
-);
+export const adminOverview = apiActionNoInput(async ({ env, request }) => {
+  const admin = await requireAdmin(request, env);
+  if (!admin) {
+    return { controlFleet: true, email: "", isAdmin: false as const };
+  }
+  return {
+    controlFleet: await runnerControlFleet(),
+    email: admin.email,
+    isAdmin: true as const,
+  };
+});
 
 /** Users per page of the admin home's Users tab. */
 export const ADMIN_USERS_PAGE_SIZE = 25;
@@ -181,9 +163,10 @@ const likePattern = (query: string): string =>
  * case-insensitive match on email or name. One query per page: it fetches a
  * row beyond the page to learn whether a next page exists, instead of a
  * second COUNT (the control node's D1 stalls on later queries in an action). */
-export const listUsers = action(
-  withSchema(ListUsersArgs, async ({ page, query }) => {
-    const admin = await requireAdmin();
+export const listUsers = apiAction(
+  ListUsersArgs,
+  async ({ page, query }, { env, request }) => {
+    const admin = await requireAdmin(request, env);
     if (!admin) {
       fail("Admin only");
     }
@@ -227,19 +210,8 @@ export const listUsers = action(
       }
       return failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
-
-export interface AdminAppRow {
-  desiredState: string;
-  id: string;
-  name: string;
-  ownerEmail: string;
-  ownerId: string;
-  slug: string;
-  status: string;
-}
 
 const asAppRow = (
   app: RunnerApp,
@@ -256,36 +228,33 @@ const asAppRow = (
 
 /** Every app on this instance, all owners (admin only; runner is source),
  * each with its owner's email. */
-export const listAllApps = action(
-  async () => {
-    const admin = await requireAdmin();
-    if (!admin) {
-      fail("Admin only");
+export const listAllApps = apiActionNoInput(async ({ env, request }) => {
+  const admin = await requireAdmin(request, env);
+  if (!admin) {
+    fail("Admin only");
+  }
+  try {
+    const [apps, users] = await Promise.all([
+      runnerListApps(),
+      withDb(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient;
+          return yield* sql.unsafe(`SELECT id, email FROM "user"`);
+        })
+      ),
+    ]);
+    // SAFETY: the projection is (id, email); D1 returns plain rows.
+    const emails = new Map(
+      (users as { email: string; id: string }[]).map((u) => [u.id, u.email])
+    );
+    return apps.map((app) => asAppRow(app, emails));
+  } catch (error) {
+    if (error instanceof UnauthorizedError) {
+      throw error;
     }
-    try {
-      const [apps, users] = await Promise.all([
-        runnerListApps(),
-        withDb(
-          Effect.gen(function* () {
-            const sql = yield* SqlClient;
-            return yield* sql.unsafe(`SELECT id, email FROM "user"`);
-          })
-        ),
-      ]);
-      // SAFETY: the projection is (id, email); D1 returns plain rows.
-      const emails = new Map(
-        (users as { email: string; id: string }[]).map((u) => [u.id, u.email])
-      );
-      return apps.map((app) => asAppRow(app, emails));
-    } catch (error) {
-      if (error instanceof UnauthorizedError) {
-        throw error;
-      }
-      return failUnknown(error);
-    }
-  },
-  { error: AuthError }
-);
+    return failUnknown(error);
+  }
+});
 
 const AdminAppState = Schema.Struct({
   desiredState: Schema.String,
@@ -293,9 +262,10 @@ const AdminAppState = Schema.Struct({
 });
 
 /** Start or stop any app, whoever owns it (admin only). */
-export const adminSetAppState = action(
-  withSchema(AdminAppState, async ({ desiredState, id }) => {
-    const admin = await requireAdmin();
+export const adminSetAppState = apiAction(
+  AdminAppState,
+  async ({ desiredState, id }, { env, request }) => {
+    const admin = await requireAdmin(request, env);
     if (!admin) {
       fail("Admin only");
     }
@@ -308,15 +278,15 @@ export const adminSetAppState = action(
     } catch (error) {
       return failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 /** Delete any app, whoever owns it (admin only): the runner drops the app,
  * then its grants and pending invitations go with it. */
-export const adminDeleteApp = action(
-  withSchema(Schema.String, async (id: string) => {
-    const admin = await requireAdmin();
+export const adminDeleteApp = apiAction(
+  Schema.String,
+  async (id: string, { env, request }) => {
+    const admin = await requireAdmin(request, env);
     if (!admin) {
       fail("Admin only");
     }
@@ -327,20 +297,20 @@ export const adminDeleteApp = action(
     } catch (error) {
       return failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 const UserId = Schema.String;
 
 /** Ban (also revokes sessions via the admin plugin). Never self-ban. */
-export const banUser = action(
-  withSchema(UserId, async (userId: string) => {
-    const admin = (await requireAdmin()) ?? fail("Admin only");
+export const banUser = apiAction(
+  UserId,
+  async (userId: string, { env, request }) => {
+    const admin = (await requireAdmin(request, env)) ?? fail("Admin only");
     if (userId === admin.id) {
       fail("Cannot ban your own account");
     }
-    const { auth, headers } = await adminAuth();
+    const { auth, headers } = await adminAuth(request, env);
     try {
       await auth.api.banUser({ body: { userId }, headers });
     } catch (error) {
@@ -349,17 +319,17 @@ export const banUser = action(
       }
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
-export const unbanUser = action(
-  withSchema(UserId, async (userId: string) => {
-    const admin = await requireAdmin();
+export const unbanUser = apiAction(
+  UserId,
+  async (userId: string, { env, request }) => {
+    const admin = await requireAdmin(request, env);
     if (!admin) {
       fail("Admin only");
     }
-    const { auth, headers } = await adminAuth();
+    const { auth, headers } = await adminAuth(request, env);
     try {
       await auth.api.unbanUser({ body: { userId }, headers });
     } catch (error) {
@@ -368,8 +338,7 @@ export const unbanUser = action(
       }
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 const SetUserRole = Schema.Struct({
@@ -380,9 +349,10 @@ const SetUserRole = Schema.Struct({
 /** Promote or demote an account (admin only). Never your own: an admin who
  * demotes themselves cannot undo it, and the acting admin is what guarantees
  * the instance always has one. */
-export const setUserRole = action(
-  withSchema(SetUserRole, async ({ role, userId }) => {
-    const admin = (await requireAdmin()) ?? fail("Admin only");
+export const setUserRole = apiAction(
+  SetUserRole,
+  async ({ role, userId }, { env, request }) => {
+    const admin = (await requireAdmin(request, env)) ?? fail("Admin only");
     const nextRole = role === "admin" || role === "user" ? role : null;
     if (nextRole === null) {
       return fail("role must be admin or user");
@@ -390,7 +360,7 @@ export const setUserRole = action(
     if (userId === admin.id) {
       return fail("Cannot change your own role");
     }
-    const { auth, headers } = await adminAuth();
+    const { auth, headers } = await adminAuth(request, env);
     try {
       await auth.api.setRole({ body: { role: nextRole, userId }, headers });
       return { ok: true as const };
@@ -400,8 +370,7 @@ export const setUserRole = action(
       }
       return failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 /** Apps whose only admin is this account: deleting the account would leave
@@ -432,9 +401,10 @@ const dropUserLeftovers = (userId: string) =>
 /** Delete an account (admin only), its sessions, keys and grants. Refused for
  * yourself, and while the account is the only admin of an app (hand the app
  * over or delete it first). */
-export const deleteUser = action(
-  withSchema(UserId, async (userId: string) => {
-    const admin = (await requireAdmin()) ?? fail("Admin only");
+export const deleteUser = apiAction(
+  UserId,
+  async (userId: string, { env, request }) => {
+    const admin = (await requireAdmin(request, env)) ?? fail("Admin only");
     if (userId === admin.id) {
       fail("Cannot delete your own account");
     }
@@ -445,7 +415,7 @@ export const deleteUser = action(
           `This account is the only admin of ${stranded} app${stranded === 1 ? "" : "s"} — make someone else an admin or delete the app first`
         );
       }
-      const { auth, headers } = await adminAuth();
+      const { auth, headers } = await adminAuth(request, env);
       await auth.api.removeUser({ body: { userId }, headers });
       await withDb(dropUserLeftovers(userId));
       return { ok: true as const };
@@ -455,8 +425,7 @@ export const deleteUser = action(
       }
       return failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 // ---- Invitations (admin-gated; see invites.server.ts for the code rules) ----
@@ -464,28 +433,26 @@ export const deleteUser = action(
 const InviteCount = Schema.Struct({ count: Schema.Number });
 
 /** Every invitation code with both ends of the exchange. */
-export const adminListInvites = action(
-  async () => {
-    const admin = await requireAdmin();
-    if (!admin) {
-      fail("Admin only");
+export const adminListInvites = apiActionNoInput(async ({ env, request }) => {
+  const admin = await requireAdmin(request, env);
+  if (!admin) {
+    fail("Admin only");
+  }
+  try {
+    return await listInvites();
+  } catch (error) {
+    if (error instanceof UnauthorizedError) {
+      throw error;
     }
-    try {
-      return await listInvites();
-    } catch (error) {
-      if (error instanceof UnauthorizedError) {
-        throw error;
-      }
-      failUnknown(error);
-    }
-  },
-  { error: AuthError }
-);
+    failUnknown(error);
+  }
+});
 
 /** Mint more codes for the admin to hand out. */
-export const adminCreateInvites = action(
-  withSchema(InviteCount, async ({ count }) => {
-    const admin = (await requireAdmin()) ?? fail("Admin only");
+export const adminCreateInvites = apiAction(
+  InviteCount,
+  async ({ count }, { env, request }) => {
+    const admin = (await requireAdmin(request, env)) ?? fail("Admin only");
     if (!Number.isInteger(count) || count < 1 || count > 50) {
       fail("Ask for between 1 and 50 codes");
     }
@@ -497,14 +464,14 @@ export const adminCreateInvites = action(
       }
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
 
 /** Revoke an unused code (a redeemed one is history and stays visible). */
-export const adminRevokeInvite = action(
-  withSchema(Schema.String, async (id: string) => {
-    const admin = await requireAdmin();
+export const adminRevokeInvite = apiAction(
+  Schema.String,
+  async (id: string, { env, request }) => {
+    const admin = await requireAdmin(request, env);
     if (!admin) {
       fail("Admin only");
     }
@@ -517,6 +484,5 @@ export const adminRevokeInvite = action(
       }
       failUnknown(error);
     }
-  }),
-  { error: AuthError }
+  }
 );
