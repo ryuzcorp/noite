@@ -51,6 +51,9 @@ interface KeySub {
  * and every mounted reader per key. */
 const fetchers = new Map<string, ResourceFetcher<unknown>>();
 const generations = new Map<string, number>();
+/** Keys whose snapshots stay in memory only (`tracked(..., { persist: false
+ * })`): bulky entries that would crowd the small sessionStorage quota. */
+const memoryOnly = new Set<string>();
 const subs = new Map<string, Set<KeySub>>();
 
 /** One cache for every resource key: concurrent reads share one lookup,
@@ -71,7 +74,11 @@ const cache = Effect.runSync(
                   new Error(`no fetcher registered for resource "${key}"`)
                 )
               : await run(key, { signal });
-          writeSwr(key, value);
+          writeSwr(
+            key,
+            value,
+            memoryOnly.has(key) ? { persist: false } : undefined
+          );
           return value;
         },
       }),
@@ -161,12 +168,21 @@ export const invalidate = (key: string): void => {
  * subscribed to reloads, with the last good snapshot (lib/swr-store) painting
  * until the fresh fetch lands. `data` seeds from the snapshot, so warm keys
  * skip skeletons; consumers keep the usual `loading() && data() ===
- * undefined` skeleton check — it now only fires on a genuinely cold key. */
+ * undefined` skeleton check — it now only fires on a genuinely cold key.
+ * `persist: false` keeps the snapshot in memory only, for bulky entries
+ * (file contents, build logs) that would crowd the small sessionStorage
+ * quota. */
 export const tracked = <T>(
   key: string,
-  fetcher: ResourceFetcher<T>
+  fetcher: ResourceFetcher<T>,
+  opts?: { persist?: boolean }
 ): Resource<T> => {
   fetchers.set(key, fetcher);
+  if (opts?.persist === false) {
+    memoryOnly.add(key);
+  } else {
+    memoryOnly.delete(key);
+  }
   const data = atom<T | undefined>(readSwr<T>(key));
   // oxlint-disable-next-line unicorn/no-useless-undefined -- the cell starts without an error; undefined is the seed
   const error = atom<unknown>(undefined);

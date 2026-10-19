@@ -505,6 +505,10 @@ export const CreateAppForm = () => {
   // for as long as the creator is mounted. `depth` counts nested
   // enter/leave pairs, which fire for every element the drag crosses.
   watch.once(() => {
+    if (typeof document === "undefined") {
+      // SSR: no document to listen on; the client's own mount attaches them.
+      return;
+    }
     let depth = 0;
     const enter = (event: DragEvent) => {
       if (!isFileDrag(event)) {

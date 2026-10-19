@@ -63,6 +63,7 @@ describe("the terminal tap", () => {
 
   test("opens on the element it is handed, and nothing after dispose", () => {
     const { sink, terminal } = tap();
+    // SAFETY: the terminal double only keeps the host reference; no DOM member is read.
     const host = { id: "shell" } as unknown as Element;
     terminal.open(host);
     expect(terminal.target).toBe(host);

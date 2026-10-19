@@ -66,6 +66,7 @@ const call = async (
   }
   return await handleMcp(
     new Request(MCP_URL, requestInit),
+    // SAFETY: the handler takes the full Worker env; the test env carries the auth/runner keys this path reads.
     ENV as unknown as never
   );
 };

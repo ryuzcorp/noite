@@ -20,11 +20,13 @@ const fakeElement = (): HTMLElement =>
     remove: () => {
       // Detached from nothing.
     },
+    // SAFETY: the fixture implements the element surface the terminal attach path touches (append/hidden/remove).
   }) as unknown as HTMLElement;
 
 /** Install the globals. A test that never touches the SDK's terminal does not
  * need this; one that does has to call it before the code under test runs. */
 export const installDomFixture = (): void => {
+  // SAFETY: installing named globals needs index access; only the documented fixture keys are set.
   const globals = globalThis as unknown as Record<string, unknown>;
   globals.document = {
     body: {

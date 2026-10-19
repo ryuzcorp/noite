@@ -120,6 +120,7 @@ const loopback = (): [MessagePort, MessagePort] => {
   const page = new LoopbackPort();
   frame.peer = page;
   page.peer = frame;
+  // SAFETY: LoopbackPort implements the postMessage/message-event surface the server uses; real ports are never needed.
   return [frame as unknown as MessagePort, page as unknown as MessagePort];
 };
 

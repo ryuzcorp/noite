@@ -26,4 +26,5 @@ export const testRouteContext = (
       path: new URL(request.url).pathname,
       raw: request,
     },
+    // SAFETY: handlers under test read only the stubbed members above; the rest of CloudContext is never touched.
   }) as unknown as CloudContext;

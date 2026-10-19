@@ -3,9 +3,8 @@ import { expect, test } from "@playwright/test";
 import { deleteApp, findAppId, runnerCall, waitForCreatedApp } from "./helpers";
 
 // Custom domains, tenant env vars and app lifecycle, driven through the runner
-// API the control UI uses. The app-detail panels that surface the same calls
-// are a known-broken surface under celld (see SPEC.md: their actions stall), so
-// the lane pins the behaviour at the API layer and the edge fallback here.
+// API the control UI uses. The lane pins the behaviour at the API layer and
+// the edge fallback here.
 test("custom domains, env vars and deletion behave", async ({
   page,
   request,

@@ -49,6 +49,7 @@ const mint = (
         headers: { authorization: `Bearer ${token}` },
         method: "POST",
       }),
+      // SAFETY: the handler takes the full Worker env; the test env carries the token/rate-limit keys this path reads.
       env as unknown as never
     )
   ) as Promise<Response>;
@@ -74,6 +75,7 @@ describe("POST /internal/recovery", () => {
     expect(minted.email).toBe("owner@example.com");
     expect(minted.code).toMatch(/^\d{6}$/u);
 
+    // SAFETY: authFromEnv takes the full KitEnv; the test env carries the auth keys it reads.
     const auth = authFromEnv(ENV as unknown as KitEnv, ENV.BETTER_AUTH_URL);
     const signedIn = await auth.api.signInEmailOTP({
       body: { email: minted.email, otp: minted.code },
@@ -120,6 +122,7 @@ describe("POST /internal/recovery", () => {
           new Request("http://localhost:9080/internal/recovery", {
             method: "POST",
           }),
+          // SAFETY: the middleware takes the full Worker env; the test env carries the rate-limit key it reads.
           env as unknown as never
         ),
         () => Promise.resolve()
@@ -150,6 +153,7 @@ describe("emailed codes", () => {
       BETTER_AUTH_URL: "https://app.noite.example",
       NOITE_EMAIL_WEBHOOK_URL: "https://hooks.example/otp",
     };
+    // SAFETY: authFromEnv takes the full KitEnv; the test env carries the auth + webhook keys it reads.
     const auth = authFromEnv(env as unknown as KitEnv, env.BETTER_AUTH_URL);
     await auth.api.sendVerificationOTP({
       body: { email: "owner@example.com", type: "sign-in" },
@@ -179,6 +183,7 @@ describe("emailed codes", () => {
       logged.push(`error ${args.join(" ")}`);
     };
     try {
+      // SAFETY: authFromEnv takes the full KitEnv; the test env carries the auth keys it reads.
       const auth = authFromEnv(env as unknown as KitEnv, env.BETTER_AUTH_URL);
       // better-auth catches a sender failure and logs it, so the request
       // itself resolves: what matters is that no code reaches the console.

@@ -174,7 +174,7 @@ export const createAppForUser = async (input: {
     await withDb(grantCollaborator(app.id, input.account.id, "admin"));
   } catch (grantError) {
     await runnerDeleteApp(app.id).catch(() => null);
-    throw grantError;
+    failUnknown(grantError);
   }
   return app;
 };

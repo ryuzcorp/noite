@@ -61,7 +61,7 @@ export const addVirtualAuthenticator = async (page: Page): Promise<void> => {
 };
 /** Authenticated runner call (raw-port lane: direct on :8080). The runner is
  * the platform's API, so feature checks that do not need a browser belong
- * here — the app-detail panels are a known-broken surface (see SPEC.md). */
+ * here. */
 export const runnerCall = async (
   request: APIRequestContext,
   path: string,
@@ -162,11 +162,14 @@ export const appListenPort = async (
 export const DEPLOY_POLL_MS = 1000;
 
 /** Poll deploys until the tip reaches a terminal status. Push fast-path
- * spawns within seconds; the reconcile tip poll is the fallback. */
+ * spawns within seconds; the reconcile tip poll is the fallback. `sha`
+ * waits for that revision's own row: without it a second push (or a
+ * rollback) would return the previous deploy's terminal row. */
 export const waitForDeploy = async (
   request: APIRequestContext,
   appId: string,
-  timeoutMs = 8 * 60_000
+  timeoutMs = 8 * 60_000,
+  sha?: string
 ): Promise<RunnerDeploy> => {
   const start = Date.now();
   for (;;) {
@@ -176,7 +179,11 @@ export const waitForDeploy = async (
       `/v1/apps/${appId}/deploys`
     );
     const [latest] = deploys;
-    if (latest && (latest.status === "success" || latest.status === "failed")) {
+    if (
+      latest &&
+      (latest.status === "success" || latest.status === "failed") &&
+      (sha === undefined || latest.sha === sha)
+    ) {
       return latest;
     }
     if (Date.now() - start > timeoutMs) {
@@ -186,7 +193,6 @@ export const waitForDeploy = async (
     await sleep(DEPLOY_POLL_MS);
   }
 };
-
 /** Mint an API key on the signed-in account's Account page. The raw key is
  * shown exactly once, so it is read from that one screen. */
 export const mintApiKey = async (
@@ -298,15 +304,19 @@ export const createAppWithKey = async (
 
 /** Push a sample directory as a fresh one-commit repo to `slug` via stock
  * git CLI. Copies to a temp dir so the checkout's nested sample repo stays
- * clean; the sample's own .gitignore keeps node_modules and build output out. */
+ * clean; the sample's own .gitignore keeps node_modules and build output out.
+ * `mutate` edits the copy before the commit, so a spec can push a second
+ * revision of the same app. */
 export const pushAppDir = (
   apiKey: string,
   source: URL,
-  slug: string
+  slug: string,
+  mutate?: (dir: string) => void
 ): string => {
   const dir = mkdtempSync(nodePath.join(tmpdir(), `noite-${slug}-`));
   try {
     cpSync(source, dir, { recursive: true });
+    mutate?.(dir);
     // The sample checkout is itself a repo — drop its history so the push
     // is a fresh repo + fresh commit (new deploy), like deploy.sh re-init.
     rmSync(nodePath.join(dir, ".git"), { force: true, recursive: true });

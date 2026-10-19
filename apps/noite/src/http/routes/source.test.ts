@@ -41,6 +41,7 @@ const call = async (
     method: "POST",
   });
   const handle = url === PREVIEW_URL ? handleSourcePreview : handleSourceCommit;
+  // SAFETY: the handler takes the full Worker env; the test env carries the auth/runner keys this path reads.
   return await handle(request, ENV as unknown as never, { appId: "app_1" });
 };
 
@@ -56,6 +57,7 @@ const archiveCall = async (
     headers: { "sec-fetch-site": "same-origin", ...headers },
     method: "GET",
   });
+  // SAFETY: the handler takes the full Worker env; the test env carries the auth/runner keys this path reads.
   return await handleSourceArchive(request, ENV as unknown as never, {
     appId: "app_1",
   });

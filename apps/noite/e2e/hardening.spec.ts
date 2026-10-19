@@ -3,8 +3,7 @@ import { expect, test } from "@playwright/test";
 import { E2E_EMAIL, findAppId, runnerCall, waitForCreatedApp } from "./helpers";
 
 // Control-plane hardening, pinned at the HTTP layer (the same layer the
-// lifecycle spec uses, because the action-driven panels are a known-broken
-// surface under celld — see SPEC.md). Unit tests in src/**/*.test.ts cover the
+// lifecycle spec uses). Unit tests in src/**/*.test.ts cover the
 // role gate, invitations and rate limiter against a real SQLite; this lane
 // proves the pieces are wired into the deployed worker.
 const control = process.env.E2E_BASE_URL ?? "http://noite.localhost:8090";
