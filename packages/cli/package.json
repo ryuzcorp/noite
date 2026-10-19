@@ -22,7 +22,7 @@
     "directory": "packages/cli"
   },
   "bin": {
-    "noite": "./dist/bin.js"
+    "noite": "dist/bin.js"
   },
   "files": [
     "dist",
