@@ -6,8 +6,13 @@
 //! reconcile loop respawns the fleet and rewrites Caddy from the DB on
 //! its next tick, so no explicit restart/rewrite is needed here.
 //!
-//! Callers must hold no deploy: like delete, bail when the app lock is
-//! claimed (409 at the API layer).
+//! Locking (ordering: CREATE_LOCK → AppLock → push_guard, see
+//! [`crate::host::git_manifest::GitSync`]): the service layer holds
+//! `CREATE_LOCK` across slug-changing renames (serializing the slug-taken
+//! check → move → row update against creates and other renames); this module
+//! claims the `AppLock` (bailing on an in-flight deploy, 409 at the API
+//! layer) and then holds both slugs' `push_guard`s across the whole move so
+//! no push can write under the old prefix mid-move.
 use std::time::Duration;
 
 use anyhow::Context;
@@ -53,6 +58,23 @@ async fn move_dir(from: &std::path::Path, to: &std::path::Path) -> anyhow::Resul
     Ok(())
 }
 
+/// Parse one `s3_list_prefix` listing into its object keys. R-06: a listing
+/// that does not parse (or has no `Contents` array) is an error, never an
+/// empty prefix — treating it as empty skips the move while the row update
+/// still points the app at the new prefix, orphaning data under the old one.
+fn parse_listing_keys(json: &str, from: &str, to: &str) -> anyhow::Result<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .with_context(|| format!("parse S3 listing for move {from} → {to}"))?;
+    let contents = value
+        .get("Contents")
+        .and_then(|v| v.as_array())
+        .with_context(|| format!("S3 listing for move {from} → {to} has no Contents"))?;
+    Ok(contents
+        .iter()
+        .filter_map(|o| o.get("Key")?.as_str().map(str::to_string))
+        .collect())
+}
+
 /// Object-by-object prefix move, skipped when the source prefix is empty so a
 /// retry after a partial move stays a no-op instead of an error. Copies run
 /// eight at a time; each key is uploaded before its source is deleted, so a
@@ -72,13 +94,7 @@ async fn move_s3_prefix(cfg: &Config, from: &str, to: &str) -> anyhow::Result<()
         .unwrap_or(to)
         .to_string();
     let json = s3::s3_list_prefix(cfg, &bucket, &from_key).await?;
-    let keys: Vec<String> = serde_json::from_str::<serde_json::Value>(&json)
-        .ok()
-        .and_then(|v| v.get("Contents")?.as_array().cloned())
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|o| o.get("Key")?.as_str().map(str::to_string))
-        .collect();
+    let keys = parse_listing_keys(&json, from, to)?;
     if keys.is_empty() {
         return Ok(());
     }
@@ -100,7 +116,7 @@ async fn move_s3_prefix(cfg: &Config, from: &str, to: &str) -> anyhow::Result<()
     Ok(())
 }
 
-// Eight params thread the rename through every subsystem (db, fleets, git,
+// Nine params thread the rename through every subsystem (db, fleets, git,
 // caddy, logs) in one call — a params struct would just rename the problem.
 #[allow(clippy::too_many_arguments)]
 pub async fn rename_app(
@@ -109,6 +125,7 @@ pub async fn rename_app(
     procs: &ProcMap,
     logs: &LogState,
     deploying: &Deploying,
+    git_sync: &crate::host::git_manifest::GitSync,
     app_id: &str,
     name: Option<&str>,
     slug: Option<&str>,
@@ -139,6 +156,12 @@ pub async fn rename_app(
     if !deploy::claim_wait(deploying, app_id, Duration::from_secs(120)).await {
         anyhow::bail!("deploy in flight; retry rename shortly");
     }
+    // R-02: pushes hold `push_guard(slug)` across git + S3 + manifest, so the
+    // whole move (dirs, both S3 prefixes, row update, re-sweep) runs under
+    // both slugs' guards — a push to either slug lands fully before or fully
+    // after. Taken after the AppLock (ordering: AppLock → push_guard), in
+    // lexical order so opposite renames cannot invert.
+    let (_old_push, _new_push) = git_sync.push_guards(&app.slug, new_slug).await;
     let result = rename_slugged(cfg, pool, procs, logs, &app, new_name, new_slug).await;
     deploy::release(deploying, app_id).await;
     result
@@ -249,7 +272,10 @@ async fn rename_slugged(
     .await?;
     // The prefix changed, so a scoped pair for the old prefix must not
     // survive (SPEC, Scoped credentials). A scoped provider mints the new-prefix pair here.
-    let _ = crate::host::credentials::revoke(pool, &app.id).await;
+    // R-10: a revoke failure must not vanish — warn loudly instead of `let _`.
+    if let Err(e) = crate::host::credentials::revoke(pool, &app.id).await {
+        tracing::warn!(app_id = %app.id, error = %format!("{e:#}"), "slug renamed but credential revoke failed");
+    }
     // The loop may have respawned the old-slug fleet mid-move (it reads the
     // pre-update row); kill it and re-sweep both prefixes so late writes
     // land under the new slug instead of orphaning under the old one.
@@ -276,4 +302,36 @@ async fn rename_slugged(
     db::get_app(pool, &app.id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("app not found"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_listing_keys;
+
+    /// R-06: an empty `Contents` is the only "nothing to move" shape. Garbage
+    /// and a missing `Contents` are errors — the move must fail instead of
+    /// pointing the row at an empty prefix while data sits under the old one.
+    #[test]
+    fn listing_parse_refuses_to_read_garbage_as_empty() {
+        let empty = r#"{"Contents":[],"CommonPrefixes":[]}"#;
+        assert!(parse_listing_keys(empty, "s3://b/git/a/", "s3://b/git/c/")
+            .expect("empty listing parses")
+            .is_empty());
+        let keys = parse_listing_keys(
+            r#"{"Contents":[{"Key":"git/a/x.bundle"},{"Key":"git/a/y.bundle"}]}"#,
+            "s3://b/git/a/",
+            "s3://b/git/c/",
+        )
+        .expect("keyed listing parses");
+        assert_eq!(keys, vec!["git/a/x.bundle", "git/a/y.bundle"]);
+        assert!(
+            parse_listing_keys("not json at all", "s3://b/git/a/", "s3://b/git/c/").is_err(),
+            "malformed listings must error, never skip"
+        );
+        assert!(
+            parse_listing_keys(r#"{"CommonPrefixes":[]}"#, "s3://b/git/a/", "s3://b/git/c/")
+                .is_err(),
+            "a listing without Contents must error, never skip"
+        );
+    }
 }

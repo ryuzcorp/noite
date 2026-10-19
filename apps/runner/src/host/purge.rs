@@ -1,9 +1,14 @@
 // Full app teardown: stop the fleet, wipe local work dirs, and empty the
 // S3 prefixes that hold the git mirror + fleet durability (D1 / DO / telemetry).
-// Used by DELETE /v1/apps/{id}.
+// Used by DELETE /v1/apps/{id} and by create's leftover wipe.
 //
-// Must hold the same AppLock as deploy (callers claim before calling) so a
-// finishing deploy cannot rewrite fleets/git after we clear them.
+// Locking (ordering: CREATE_LOCK → AppLock → push_guard, see
+// [`crate::host::git_manifest::GitSync`]): callers hold the outer locks AND
+// the slug's `push_guard` before calling — delete holds AppLock + push_guard,
+// create holds CREATE_LOCK + push_guard — so a push writing under the same
+// prefixes (git + S3 + manifest) cannot interleave with the wipe. This
+// function takes no locks itself: taking another guard for the same slug
+// here would self-deadlock against the caller's.
 use std::time::Duration;
 
 use anyhow::Context;
@@ -17,7 +22,9 @@ use crate::host::{exec, s3};
 /// Wipe every on-disk and S3 artifact for `slug`. Does **not** touch the DB row
 /// — callers decide when to delete that (after a successful purge).
 ///
-/// Order matters: stop celld first so it cannot rewrite leases / D1 / telemetry
+/// Requires the caller to hold the slug's `push_guard` (plus AppLock for
+/// delete, CREATE_LOCK for create — see the module docs). Order matters
+/// inside, too: stop celld first so it cannot rewrite leases / D1 / telemetry
 /// into the prefix we are about to empty.
 pub async fn purge_slug(
     cfg: &Config,
@@ -147,6 +154,10 @@ mod tests {
             child,
         );
 
+        // The production contract: callers hold the slug's push guard across
+        // the purge so no push writes under the wiped prefixes mid-teardown.
+        let git_sync = crate::host::git_manifest::GitSync::default();
+        let _push = git_sync.push_guard("purge").await;
         purge_slug(&cfg, &procs, &crate::host::logs::new_state(), "purge")
             .await
             .expect("purge");

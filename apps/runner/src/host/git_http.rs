@@ -865,7 +865,10 @@ pub async fn receive_pack(
         return (StatusCode::FORBIDDEN, msg).into_response();
     }
     // Serialize pushes per slug: policy + fast-forward checks stay valid
-    // through git + S3 + manifest with no interleaving push.
+    // through git + S3 + manifest with no interleaving push. This is the
+    // innermost lock (CREATE_LOCK → AppLock → push_guard, see `GitSync`):
+    // rename/purge/create hold this same guard across their own moves and
+    // wipes, so a push lands fully before or fully after those operations.
     let _push_guard = state.git_sync.push_guard(&app.slug).await;
     let bare = match ensure_bare(&state.config, &app.slug).await {
         Ok(b) => b,
