@@ -357,12 +357,13 @@ const emitCelldConfig = (): Plugin => ({
       }
     }
     config["main"] = `ssr/${ssrMain}`;
-    // celld matches `run_worker_first` per path: neither `true` nor `["/**"]`
-    // sends existing static files to the worker (both validate, neither
-    // routes), so the pod-host gate never fires for them. Name the pod paths
-    // explicitly — same list the gate denies on the control origin, so the
-    // two cannot drift. This file is celld's config surface only;
-    // `dist/ssr/wrangler.json` keeps Void's own form.
+    // `run_worker_first` names the pod paths explicitly — same list the gate
+    // denies on the control origin, so the two cannot drift. Proven inert in
+    // celld 0.6.1 (2026-10-19 lane: `true` and this list both validate, both
+    // leave existing static files serving direct, so the gate still only
+    // fires for missing files) — kept because it is the correct form if
+    // celld ever routes on it, and harmless meanwhile. This file is celld's
+    // config surface only; `dist/ssr/wrangler.json` keeps Void's own form.
     config["assets"] = {
       ...ssrAssets,
       directory: "client",
