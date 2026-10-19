@@ -8,6 +8,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.0-alpha.6] - 2026-10-19
+
+The control UI moves to the Void framework, the CLI ships on npm as `@noitenow/cli`, and the runner gets stricter boot validation plus a round of concurrency and robustness fixes.
+
+### Operator action required
+
+- **Malformed numeric runner env vars now refuse boot.** A typo in any numeric `RUNNER_*`/`NOITE_*` setting, `NOITE_FLEET_PORTS`, the `RUNNER_BUILD_UID_BASE`/`RUNNER_FLEET_UID`/`RUNNER_FLEET_GID` sentinels, or the edge `NOITE_EDGE_*_RPM`/`RUNNER_WAKE_CONCURRENCY` knobs used to be silently ignored in favour of the default; the runner now fails once with a `config invalid` error naming each var, its bad value and the expected form. After upgrading, check `make doctor`/the runner logs for that error and fix the named variables. Unset (or empty, as Compose renders it) still means the default.
+- **`HTTPS_PORT` now reaches the runner**, so the first-push URL follows the public edge instead of the runner API's raw port. Coolify/Railway installs should set `HTTP_PORT=80`/`HTTPS_PORT=443` (see the platforms docs); a prod install that leaves `HTTPS_PORT` unset links the 9443 dev default, which is unreachable.
+- Otherwise none. No schema, DNS, or certificate change; no other env-var change.
+
+### Added
+
+- **Control UI on Void:** the control UI (`apps/noite`) migrates from Oxide to the Void framework on ilha 0.16 (`void@1.1.11` + `@ilha/void`), with the same routes, actions and serving contract. Behaviour is unchanged apart from the fixes below.
+- **`@noitenow/cli` 0.1.0-alpha.6 on npm:** the published bundle runs on plain Node 20+ (previously it required Bun even when installed via npm). Every `v*` tag publishes the CLI at that exact version (dist-tag `alpha` for prereleases, `latest` for finals) after the release gate passes.
+- `noite environments vars unset <environment> <name>` removes an environment variable override.
+- A rollback end-to-end spec pins that rolling back to an earlier deploy serves that revision again.
+
+### Fixed
+
+- **Deployments include dotfiles** and redeploys drop stale ones; `noite deploy` prints the tenant's public host (`https://{slug}.{base}`, scheme/port from the git base) and keeps a path in the git base URL (`GIT_PUBLIC_BASE=http://host/v1/git` works now).
+- **The first-push `remote: noite: …` line links the public edge URL** (`http://<slug>.noite.localhost:9080` in dev, `https://<slug>.<domain>` in prod) instead of the runner API's raw port.
+- **Pod assets answer 404 on control hosts:** the runner-owned Caddyfile denies the six pod-asset paths (`/noite-pod-host.html/.js`, `/__sw__.js`, `/__worker__.js`, `/__nodepod_bridge__.html/.js`) on every control-host site before proxying, because the worker's asset fallback would otherwise serve them with a 200. The control UI's own bundle under `/assets/*` still serves, and preview-host behaviour is unchanged.
+- **Runner concurrency:** creating, renaming or deleting apps while deploys or pushes are in flight no longer resurrects deleted data, races renames onto one slug, or orphans storage on malformed listings; snapshot runs no longer share temp paths, and a failed storage check at boot refuses to start instead of seeding a fresh generation.
+- **Runner robustness:** S3 GET/PUT/LIST retry transient 5xx/SlowDown/transport errors (never 4xx); missing-key detection no longer mistakes key names or transport failures for "not found"; timed-out commands and stopped fleets kill the whole process group including grandchildren; deploy/log streams drop unserializable snapshots with a warning instead of blank events; snapshot setup failures surface as errors; expired or revoked credentials on delete/rename are logged; trailing-dot FQDNs pass the TLS gate like the custom-domain branch.
+- Non-UTF-8 work-dir paths now fail the git request/deploy/rehydrate with an error instead of panicking the task, and a deploy whose target environment row is missing reports an error instead of crashing.
+- Control UI server-rendering no longer crashes on the app-creation, onboarding and preview paths (browser-only globals guarded); a failed app grant rolls back the created row and surfaces the cause instead of masking it as a 500; deploy logs and file previews stay out of persistent snapshots.
+
+### Changed
+
+- **JS deps (patch/minor):** `better-auth` 1.7.7 → 1.7.11, `effect` + `@effect/sql-d1` + `@effect/platform-node` 4.0.4 → 4.0.5, `kysely` 0.29.6 → 0.29.7, plus `blume`, `daisyui`, `@cloudflare/workers-types`, `@playwright/test`, `@types/bun`, `@types/node` and `oxfmt` bumps. Runner deps get a semver-compatible `cargo update`; the lint toolchain moves to ultracite 8. `void` stays at exact 1.1.11 until `@ilha/void` catches up (see the PR for the upstream blocker).
+- **CI:** the release image target now builds on every PR (no push), and the e2e lanes run on PRs carrying the `e2e` label (plus manual dispatch). GitHub Action pins move to current majors, and the schema gate diffs the full 17-table allowlist.
+- Docs refresh: release references to 0.1.0-alpha.5, control-host denied-asset 404s, preview environments starting empty, and the environments bucket prefix; dev installs derive `BETTER_AUTH_URL`/`GIT_PUBLIC_BASE` from `BASE_DOMAIN`, and `make nuke` also removes the UI's `.wrangler`/`.void` dirs.
+
 ## [0.1.0-alpha.5] - 2026-10-14
 
 Preview environments (one deployment per branch, and Deploy preview from Code mode), resizable Code mode panes, and a pass over Code mode and pull request UX.
