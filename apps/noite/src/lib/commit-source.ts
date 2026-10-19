@@ -42,6 +42,7 @@ const postSourceBody = async <T>(
   input: SourceCommitInput
 ): Promise<T> => {
   const { appId, ...body } = input;
+
   const res = await fetch(
     `/api/apps/${encodeURIComponent(appId)}/source/${endpoint}`,
     {
@@ -50,10 +51,12 @@ const postSourceBody = async <T>(
       method: "POST",
     }
   );
+
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     throw new Error(`${endpoint} failed: ${res.status} ${text}`);
   }
+
   // SAFETY: each route re-serves the runner's own JSON for its endpoint
   // verbatim (`{ sha }` for a commit, `PreviewResult` for a preview).
   return (await res.json()) as T;

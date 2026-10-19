@@ -13,6 +13,7 @@ const hourOnly = new Intl.DateTimeFormat(undefined, { hour: "numeric" });
 
 const toDate = (value: string | Date | null | undefined): Date | null => {
   const date = value instanceof Date ? value : new Date(String(value ?? ""));
+
   return Number.isNaN(date.getTime()) ? null : date;
 };
 
@@ -21,6 +22,7 @@ export const formatDateTime = (
   value: string | Date | null | undefined
 ): string => {
   const date = toDate(value);
+
   return date === null ? "—" : dateTime.format(date);
 };
 
@@ -28,6 +30,7 @@ export const formatDateTime = (
  * still covers that UTC hour — same instant, honest label. */
 export const formatHour = (utcHourKey: string): string => {
   const date = toDate(`${utcHourKey}:00:00Z`);
+
   return date === null ? "—" : hourOnly.format(date);
 };
 
@@ -47,15 +50,20 @@ export const formatAgo = (
   now: number = Date.now()
 ): string => {
   const date = toDate(value);
+
   if (date === null) {
     return "—";
   }
+
   let amount = Math.round((date.getTime() - now) / 1000);
+
   for (const [unit, size] of RELATIVE_STEPS) {
     if (Math.abs(amount) < size) {
       return relative.format(amount, unit);
     }
+
     amount = Math.round(amount / size);
   }
+
   return relative.format(amount, "year");
 };

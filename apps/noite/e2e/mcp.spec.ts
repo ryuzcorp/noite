@@ -86,8 +86,10 @@ const callMcp = async (
     data: { jsonrpc: "2.0", ...message },
     headers: { authorization: `Bearer ${key}` },
   });
+
   // SAFETY: the endpoint answers application/json for every POST it accepts or rejects (never SSE).
   const body = (await res.json()) as McpBody;
+
   return { body, status: res.status() };
 };
 
@@ -105,12 +107,15 @@ const callTool = async <T>(
     method: "tools/call",
     params: { arguments: args ?? {}, name },
   });
+
   const { result } = body;
+
   if (!result || result.isError) {
     throw new Error(
       `MCP tool ${name} failed: ${result?.content?.[0]?.text ?? JSON.stringify(body.error)}`
     );
   }
+
   // SAFETY: each call site names the tool whose structuredContent it reads.
   return result.structuredContent as T;
 };
@@ -128,6 +133,7 @@ test("an MCP client creates an app, pushes, follows the deploy, reads it back an
     method: "initialize",
     params: { clientInfo: { name: "e2e" }, protocolVersion: "2025-06-18" },
   });
+
   expect(initialize.status).toBe(200);
   expect(initialize.body.result?.protocolVersion).toBe("2025-06-18");
   expect(initialize.body.result?.serverInfo?.name).toBe("noite");
@@ -144,6 +150,7 @@ test("an MCP client creates an app, pushes, follows the deploy, reads it back an
     slug: MCP_SLUG,
     source: { kind: "blank" },
   });
+
   expect(created.app.slug).toBe(MCP_SLUG);
   expect(created.gitRemote).toContain(MCP_SLUG);
   expect(created.pushInstructions).toContain("git push -u origin main");
@@ -155,13 +162,16 @@ test("an MCP client creates an app, pushes, follows the deploy, reads it back an
     4,
     "list_apps"
   );
+
   expect(apps.apps.map((app) => app.slug)).toContain(MCP_SLUG);
+
   const templates = await callTool<{ templates: { id: string }[] }>(
     request,
     key,
     5,
     "list_templates"
   );
+
   expect(templates.templates.map((template) => template.id)).toContain("oxide");
 
   // Push the sample app with the same key, then follow the deploy over MCP.
@@ -173,22 +183,27 @@ test("an MCP client creates an app, pushes, follows the deploy, reads it back an
 
   let status: DeployStatus | null = null;
   const deadline = Date.now() + 8 * 60_000;
+
   for (;;) {
     // oxlint-disable-next-line eslint/no-await-in-loop -- sequential deploy poll with an early exit
     status = await callTool<DeployStatus>(request, key, 6, "deploy_status", {
       app: MCP_SLUG,
     });
+
     if (status.live && status.deploy?.status === "success") {
       break;
     }
+
     if (Date.now() > deadline) {
       throw new Error(
         `deploy did not go live in time: ${JSON.stringify(status)}`
       );
     }
+
     // oxlint-disable-next-line eslint/no-await-in-loop -- poll backoff
     await sleep(DEPLOY_POLL_MS);
   }
+
   expect(status.deploy?.sha).toBe(pushedSha);
 
   const buildLog = await callTool<{ log: string }>(
@@ -200,17 +215,22 @@ test("an MCP client creates an app, pushes, follows the deploy, reads it back an
       app: MCP_SLUG,
     }
   );
+
   expect(buildLog.log.length).toBeGreaterThan(0);
 
   // The commit the push made is what the repo tools report.
   const log = await callTool<RepoLog>(request, key, 8, "repo_log", {
     app: MCP_SLUG,
   });
+
   expect(log.log.commits[0]?.sha).toBe(pushedSha);
+
   const branches = await callTool<{
     refs: { branches: { name: string }[]; defaultBranch: string };
   }>(request, key, 9, "repo_branches", { app: MCP_SLUG });
+
   expect(branches.refs.defaultBranch).toBe("main");
+
   const tree = await callTool<{ tree: { files: { path: string }[] } }>(
     request,
     key,
@@ -218,12 +238,16 @@ test("an MCP client creates an app, pushes, follows the deploy, reads it back an
     "repo_tree",
     { app: MCP_SLUG }
   );
+
   expect(tree.tree.files.map((file) => file.path)).toContain("package.json");
+
   const file = await callTool<RepoFile>(request, key, 11, "repo_file", {
     app: MCP_SLUG,
     path: "package.json",
   });
+
   expect(file.blob.text).toContain("counter");
+
   const commit = await callTool<{ detail: { patch: string } }>(
     request,
     key,
@@ -231,6 +255,7 @@ test("an MCP client creates an app, pushes, follows the deploy, reads it back an
     "repo_commit",
     { app: MCP_SLUG, sha: pushedSha }
   );
+
   expect(commit.detail.patch.length).toBeGreaterThan(0);
 
   const detail = await callTool<{ app: { role: string; status: string } }>(
@@ -240,6 +265,7 @@ test("an MCP client creates an app, pushes, follows the deploy, reads it back an
     "get_app",
     { app: MCP_SLUG }
   );
+
   expect(detail.app.role).toBe("admin");
   expect(detail.app.status).toBe("running");
 
@@ -253,7 +279,9 @@ test("an MCP client creates an app, pushes, follows the deploy, reads it back an
       limit: 20,
     }
   );
+
   expect(Array.isArray(logs.lines)).toBe(true);
+
   const errors = await callTool<{ counts: { open: number } }>(
     request,
     key,
@@ -261,6 +289,7 @@ test("an MCP client creates an app, pushes, follows the deploy, reads it back an
     "app_errors",
     { app: MCP_SLUG }
   );
+
   expect(errors.counts.open).toBe(0);
 
   // Variables: a flag shows its value, anything else stays hidden.
@@ -274,9 +303,11 @@ test("an MCP client creates an app, pushes, follows the deploy, reads it back an
     key: "MCP_SECRET",
     value: "shh",
   });
+
   const env = await callTool<EnvList>(request, key, 18, "env_list", {
     app: MCP_SLUG,
   });
+
   expect(env.env.find((row) => row.name === "FLAG_MCP_E2E")?.value).toBe("1");
   // Everything that is not a 0/1 flag stays hidden, like the UI shows it.
   expect(env.env.find((row) => row.name === "MCP_SECRET")?.value).toBe("");
@@ -284,9 +315,11 @@ test("an MCP client creates an app, pushes, follows the deploy, reads it back an
     app: MCP_SLUG,
     key: "FLAG_MCP_E2E",
   });
+
   const after = await callTool<EnvList>(request, key, 20, "env_list", {
     app: MCP_SLUG,
   });
+
   expect(after.env.map((row) => row.name)).not.toContain("FLAG_MCP_E2E");
 
   // The transport itself: GET (the SSE probe) is refused, not SPA-fallback.
@@ -304,18 +337,21 @@ test("a wrong key is refused and another account's app is denied", async ({
   // (docs/reference/mcp). The denial has to come from a plain account's key —
   // register one with an invite code the admin's Account page hands out.
   const inviteCode = await readInviteCode(page);
+
   const invitee = await registerInviteeAccount(
     browser,
     inviteCode,
     `mcp-denied-${Date.now()}@example.com`,
     "MCP Denied"
   );
+
   const key = await mintApiKey(invitee.page, "mcp-e2e-denied");
   await invitee.context.close();
 
   const noKey = await request.post("/mcp", {
     data: { id: 1, jsonrpc: "2.0", method: "ping" },
   });
+
   expect(noKey.status()).toBe(401);
   expect(noKey.headers()["www-authenticate"]).toBe("Bearer");
 
@@ -323,15 +359,18 @@ test("a wrong key is refused and another account's app is denied", async ({
     data: { id: 1, jsonrpc: "2.0", method: "ping" },
     headers: { authorization: "Bearer noite_not-a-real-key" },
   });
+
   expect(wrongKey.status()).toBe(401);
 
   // An app no account has a grant on: created straight through the runner as
   // somebody else, so no collaborator row exists for our key's account.
   createdApps.push(FOREIGN_SLUG);
+
   const foreign = await runnerCall(request, "/v1/apps", {
     body: { name: "Foreign App", slug: FOREIGN_SLUG, user_id: "someone-else" },
     method: "POST",
   });
+
   expect(foreign.status).toBe(201);
 
   const denied = await callMcp(request, key, {
@@ -339,6 +378,7 @@ test("a wrong key is refused and another account's app is denied", async ({
     method: "tools/call",
     params: { arguments: { app: FOREIGN_SLUG }, name: "repo_log" },
   });
+
   expect(denied.body.result?.isError).toBe(true);
   expect(denied.body.result?.content?.[0]?.text).toContain(FOREIGN_SLUG);
 });

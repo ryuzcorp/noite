@@ -49,9 +49,11 @@ export const projectSkip: DropSkip = (entry, path) => {
   if (!path.includes("/")) {
     return false;
   }
+
   if (entry.isDirectory) {
     return Object.hasOwn(SKIPPED_DIRS, entry.name);
   }
+
   return Object.hasOwn(SKIPPED_FILES, entry.name) || isSecretFile(entry.name);
 };
 
@@ -73,24 +75,31 @@ export const projectUpload = (
   reads: readonly UploadRead[]
 ): { error: string } | { upload: ProjectUpload } => {
   const unreadable = reads.find((read) => read.kind === "error");
+
   if (unreadable) {
     return { error: `${unreadable.path} could not be read.` };
   }
+
   if (reads.length === 0) {
     return {
       error: `${root} has nothing to upload once dependencies, build output and env files are left out.`,
     };
   }
+
   const tooBig = checkLimits(reads, UPLOAD_LIMITS);
+
   if (tooBig) {
     return {
       error: `${tooBig} Push larger projects with git instead.`,
     };
   }
+
   let bytes = 0;
   const files: SourceCommitFile[] = [];
+
   for (const read of reads) {
     const path = read.path.slice(root.length + 1);
+
     if (read.kind === "text") {
       bytes += UTF8.encode(read.text).byteLength;
       // Text is the commit route's default encoding.
@@ -100,5 +109,6 @@ export const projectUpload = (
       files.push({ content: read.base64, encoding: "base64", path });
     }
   }
+
   return { upload: { bytes, files, name: root } };
 };

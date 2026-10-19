@@ -48,6 +48,7 @@ export const withoutSlash = (path: string): string =>
 /** The folder holding `path` ("" at the root). */
 export const parentDir = (path: string): string => {
   const slash = path.lastIndexOf("/");
+
   return slash === -1 ? "" : path.slice(0, slash);
 };
 
@@ -57,6 +58,7 @@ export const menuDir = (path: string | null): string => {
   if (path === null) {
     return "";
   }
+
   return path.endsWith("/") ? withoutSlash(path) : parentDir(path);
 };
 
@@ -67,18 +69,23 @@ export const sortTreePaths = (paths: string[]): string[] =>
     const as = a.split("/");
     const bs = b.split("/");
     const len = Math.min(as.length, bs.length);
+
     for (let i = 0; i < len; i += 1) {
       const charA = as[i] ?? "";
       const charB = bs[i] ?? "";
+
       if (charA !== charB) {
         const aIsDir = i < as.length - 1;
         const bIsDir = i < bs.length - 1;
+
         if (aIsDir !== bIsDir) {
           return aIsDir ? -1 : 1;
         }
+
         return charA < charB ? -1 : 1;
       }
     }
+
     return as.length - bs.length;
   });
 
@@ -91,9 +98,11 @@ export const dropDestination = (
   const trimmed = withoutSlash(path);
   const name = trimmed.slice(trimmed.lastIndexOf("/") + 1);
   const leaf = path.endsWith("/") ? `${name}/` : name;
+
   if (target.kind === "root" || target.directoryPath === null) {
     return leaf;
   }
+
   return `${target.directoryPath}${leaf}`;
 };
 
@@ -117,6 +126,7 @@ export const renameInput = (event: Event): HTMLInputElement | null => {
       return node;
     }
   }
+
   return null;
 };
 
@@ -124,6 +134,7 @@ export const newToaster = (): Toaster => {
   const host = document.createElement("div");
   host.className = "toast toast-top toast-end z-[100]";
   document.body.append(host);
+
   return {
     host,
     notify: (message) => {
@@ -148,6 +159,7 @@ export const newTreeMenu = (actions: MenuActions): HTMLElement => {
     "menu bg-base-100 rounded-box border-base-300 border w-48 p-1 text-sm shadow";
   menu.setAttribute("aria-label", "Tree actions");
   menu.setAttribute("role", "menu");
+
   const add = (label: string, run: () => void, cls?: string) => {
     const item = document.createElement("li");
     item.setAttribute("role", "none");
@@ -155,23 +167,29 @@ export const newTreeMenu = (actions: MenuActions): HTMLElement => {
     button.type = "button";
     button.setAttribute("role", "menuitem");
     button.textContent = label;
+
     if (cls !== undefined) {
       button.className = cls;
     }
+
     button.addEventListener("click", () => {
       run();
     });
     item.append(button);
     menu.append(item);
   };
+
   add("New File", actions.newFile);
   add("New Folder", actions.newFolder);
+
   if (actions.onUpload !== undefined) {
     add("Upload files…", actions.onUpload);
   }
+
   if (actions.onRename !== undefined) {
     add("Rename", actions.onRename);
   }
+
   if (actions.onDelete !== undefined) {
     const count = actions.deleteCount ?? 1;
     add(
@@ -180,6 +198,7 @@ export const newTreeMenu = (actions: MenuActions): HTMLElement => {
       "text-error"
     );
   }
+
   return menu;
 };
 
@@ -198,35 +217,45 @@ export const openTreeMenu = (
   element.style.left = `${Math.max(8, Math.min(point.x, window.innerWidth - element.offsetWidth - 8))}px`;
   element.style.top = `${Math.max(8, Math.min(point.y, window.innerHeight - element.offsetHeight - 8))}px`;
   const buttons = [...element.querySelectorAll<HTMLButtonElement>("button")];
+
   const onKeyDown = (event: KeyboardEvent) => {
     if (event.key === "Escape") {
       dismiss();
+
       return;
     }
+
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") {
       return;
     }
+
     event.preventDefault();
     const active = document.activeElement;
+
     const from =
       active instanceof HTMLButtonElement
         ? Math.max(0, buttons.indexOf(active))
         : 0;
+
     const step = event.key === "ArrowDown" ? 1 : buttons.length - 1;
     buttons[(from + step) % buttons.length]?.focus();
   };
+
   const onPointerDown = (event: PointerEvent) => {
     if (!event.composedPath().includes(element)) {
       dismiss();
     }
   };
+
   const close = () => {
     document.removeEventListener("keydown", onKeyDown);
     document.removeEventListener("pointerdown", onPointerDown, true);
     element.remove();
   };
+
   document.addEventListener("keydown", onKeyDown);
   document.addEventListener("pointerdown", onPointerDown, true);
   buttons[0]?.focus();
+
   return { close, element };
 };

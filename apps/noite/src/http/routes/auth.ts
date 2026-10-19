@@ -13,6 +13,7 @@ import type { RouteHandler } from "../config";
  * stricter policy on failure. */
 export const handleInviteStatus: RouteHandler = async () => {
   await ensureDbPromise();
+
   try {
     return Response.json(await signupPolicy());
   } catch {
@@ -23,15 +24,19 @@ export const handleInviteStatus: RouteHandler = async () => {
     });
   }
 };
+
 export const handleAuth: RouteHandler = async (request, env) => {
   await ensureDbPromise();
+
   try {
     const auth = authFromEnv(env, new URL(request.url).origin);
+
     return await auth.handler(withTrustedClientAddress(request));
   } catch (error) {
     if (error instanceof MissingAuthSecretError) {
       return new Response(error.message, { status: 500 });
     }
+
     throw error;
   }
 };

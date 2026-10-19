@@ -84,6 +84,7 @@ export class StubTerminal {
     if (this.disposed) {
       return;
     }
+
     this.output.push(text);
     this.sink(text);
   }
@@ -106,6 +107,7 @@ export class StubTerminal {
 
   onData(listener: (data: string) => void): TapDisposable {
     this.dataListeners.add(listener);
+
     return {
       dispose: () => {
         this.dataListeners.delete(listener);
@@ -124,6 +126,7 @@ export class StubTerminal {
 
   onResize(listener: () => void): TapDisposable {
     this.resizeListeners.add(listener);
+
     return {
       dispose: () => {
         this.resizeListeners.delete(listener);
@@ -137,8 +140,10 @@ export class StubTerminal {
     if (this.disposed) {
       return;
     }
+
     this.cols = cols;
     this.rows = rows;
+
     for (const listener of this.resizeListeners) {
       listener();
     }
@@ -152,6 +157,7 @@ export class StubTerminal {
     this.disposed = true;
     this.dataListeners.clear();
     this.resizeListeners.clear();
+
     for (const addon of this.addons.splice(0)) {
       addon.dispose?.();
     }

@@ -34,9 +34,11 @@ const scopeLabel = (key: string): string => {
   if (key === "apps") {
     return "App Management";
   }
+
   if (key === "events") {
     return "Events";
   }
+
   return key;
 };
 
@@ -47,7 +49,9 @@ const scopeBadges = (
   if (!permissions) {
     return ["Full access"];
   }
+
   const badges = Object.keys(permissions).map(scopeLabel);
+
   return badges.length > 0 ? badges : ["Full access"];
 };
 
@@ -57,9 +61,11 @@ const scopeBadges = (
 const MyInvitesCard = () => {
   const res = inviteCodes();
   const codes = res.data() ?? [];
+
   if (res.loading() && res.data() === undefined) {
     return <SectionSkeleton lines={2} />;
   }
+
   return (
     <div class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
       <div class="card-body gap-3">
@@ -103,6 +109,7 @@ const PasskeysCard = () => {
   const busy = atom(false);
   const error = atom("");
   const nameDraft = atom("");
+
   const reload = async () => {
     try {
       await res.refetch();
@@ -110,17 +117,20 @@ const PasskeysCard = () => {
       error.set(errorMessage(loadError));
     }
   };
+
   const add = async (event: SubmitEvent) => {
     event.preventDefault();
     busy.set(true);
     error.set("");
     const label = nameDraft().trim();
+
     try {
       // Signed in, so the server adds it to this account (no registration
       // context, no invite): see `afterVerification` in auth.ts.
       const result = await authClient.passkey.addPasskey({
         name: label || `Passkey ${rows.length + 1}`,
       });
+
       if (result.error) {
         error.set(result.error.message ?? "Could not add the passkey");
       } else {
@@ -130,26 +140,35 @@ const PasskeysCard = () => {
     } catch (addError) {
       error.set(errorMessage(addError));
     }
+
     busy.set(false);
   };
+
   const rename = async (id: string, current: string) => {
     // oxlint-disable-next-line no-alert -- native prompt is enough for a one-field rename.
     const next = window.prompt("Passkey name", current)?.trim();
+
     if (!next || next === current) {
       return;
     }
+
     busy.set(true);
     error.set("");
     const result = await authClient.passkey.updatePasskey({ id, name: next });
     busy.set(false);
+
     if (result.error) {
       error.set(result.error.message ?? "Could not rename the passkey");
+
       return;
     }
+
     await reload();
   };
+
   const remove = async (id: string, name: string) => {
     const last = rows.length <= 1;
+
     const ok = await confirmDialog({
       confirmLabel: "Delete",
       message: last
@@ -157,22 +176,29 @@ const PasskeysCard = () => {
         : "You can no longer sign in with it.",
       title: `Delete ${name || "this passkey"}?`,
     });
+
     if (!ok) {
       return;
     }
+
     busy.set(true);
     error.set("");
     const result = await authClient.passkey.deletePasskey({ id });
     busy.set(false);
+
     if (result.error) {
       error.set(result.error.message ?? "Could not delete the passkey");
+
       return;
     }
+
     await reload();
   };
+
   if (res.loading() && res.data() === undefined) {
     return <SectionSkeleton lines={2} />;
   }
+
   return (
     <section class="border-base-300 bg-base-100 dark:bg-base-200 rounded-box flex flex-col gap-4 border p-4 shadow-md">
       <h2 class="m-0 text-lg font-semibold">Passkeys</h2>
@@ -276,6 +302,7 @@ export const AccountPanel = () => {
   const keyName = atom("");
   const scopeApps = atom(true);
   const scopeEvents = atom(true);
+
   const reload = async () => {
     try {
       await keysRes.refetch();
@@ -291,21 +318,26 @@ export const AccountPanel = () => {
   const createKey = async (event: SubmitEvent) => {
     event.preventDefault();
     const label = keyName().trim();
+
     if (!label) {
       keyError.set("Name is required");
+
       return;
     }
+
     const appManagement = scopeApps();
     const events = scopeEvents();
     busy.set(true);
     keyError.set("");
     freshKey.set(null);
+
     try {
       const { key } = await api<{ key: string }>("/api/account/createApiKey", {
         appManagement,
         events,
         name: label,
       });
+
       freshKey.set(key);
       keyModal.set(false);
       await reload();
@@ -321,31 +353,42 @@ export const AccountPanel = () => {
     keyError.set("");
     const result = await authClient.apiKey.delete({ keyId });
     busy.set(false);
+
     if (result.error) {
       keyError.set(result.error.message ?? "Failed to revoke API key");
+
       return;
     }
+
     if (freshKey()) {
       freshKey.set(null);
     }
+
     await reload();
   };
 
   const saveProfile = async () => {
     const next = nameValue.trim();
+
     if (!next) {
       saveError.set("Display name is required");
+
       return;
     }
+
     saveBusy.set(true);
     saveError.set("");
     saveOk.set(false);
+
     try {
       const result = await authClient.updateUser({ name: next });
+
       if (result.error) {
         saveError.set(result.error.message ?? "Failed to update profile");
+
         return;
       }
+
       saveOk.set(true);
       // The sidebar reads the session resource too: refresh it, then let
       // the field follow the saved name again.

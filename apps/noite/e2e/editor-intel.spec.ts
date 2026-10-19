@@ -32,10 +32,12 @@ test("the editor reports diagnostics, hover and go-to-definition", async ({
   request,
 }) => {
   createdApps.push(SLUG);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Editor Intel",
     slug: SLUG,
   });
+
   pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), SLUG);
 
   await page.goto(`/apps/${appId}/source?file=index.ts&ref=main`);
@@ -44,6 +46,7 @@ test("the editor reports diagnostics, hover and go-to-definition", async ({
   // these locators pierce.
   const editor = page.locator('[contenteditable="true"]').first();
   await expect(editor).toBeVisible({ timeout: 60_000 });
+
   // The rendered code: the `<pre>` that carries pierre's token spans. Reading
   // is never blocked by the language service — a broken worker must not take
   // the pane down with it, so the file's own text stays on screen.
@@ -51,6 +54,7 @@ test("the editor reports diagnostics, hover and go-to-definition", async ({
     .locator("pre")
     .filter({ has: page.locator("[data-char]") })
     .first();
+
   await expect(rendered).toContainText("describe");
 
   // Hover: the tooltip shows the symbol's type, computed by the language
@@ -67,9 +71,11 @@ test("the editor reports diagnostics, hover and go-to-definition", async ({
   // TypeScript message. The fixture is clean, so exactly one marker appears —
   // which is also the proof that the repo's own `tsconfig.json` was honoured.
   const box = await editor.boundingBox();
+
   if (box === null) {
     throw new TypeError("the editor has no box");
   }
+
   // The pane stretches past the text: clicking below the last line focuses the
   // content element (a click on a line is pierre's, and it does not take focus).
   await editor.click({ position: { x: 8, y: box.height - 8 } });
@@ -82,9 +88,11 @@ test("the editor reports diagnostics, hover and go-to-definition", async ({
   // is a pointer-events-free overlay, so this is a raw mouse move over it: the
   // text underneath is what pierre listens to.
   const markerBox = await markers.first().boundingBox();
+
   if (markerBox === null) {
     throw new TypeError("the marker has no box");
   }
+
   await page.mouse.move(
     markerBox.x + markerBox.width / 2,
     markerBox.y + markerBox.height / 2

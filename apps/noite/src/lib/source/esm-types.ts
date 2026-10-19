@@ -69,11 +69,14 @@ export const isCodeSubpath = (subpath: string): boolean => {
   if (subpath === "") {
     return true;
   }
+
   const name = subpath.slice(subpath.lastIndexOf("/") + 1);
   const dot = name.lastIndexOf(".");
+
   if (dot === -1) {
     return true;
   }
+
   return CODE_EXTENSION.test(name.slice(dot).toLowerCase());
 };
 
@@ -117,7 +120,9 @@ export const jsxRuntimeSpecifiers = (input: {
   ) {
     return [];
   }
+
   const source = jsxImportSourceOf(input.text) ?? input.importSource ?? "react";
+
   return input.mode === "react-jsxdev"
     ? [`${source}/jsx-runtime`, `${source}/jsx-dev-runtime`]
     : [`${source}/jsx-runtime`];
@@ -141,15 +146,20 @@ export const parsePackageSpecifier = (
   ) {
     return null;
   }
+
   const segments = specifier.split("/");
   const scoped = specifier.startsWith("@");
+
   if (scoped && segments.length < 2) {
     return null;
   }
+
   const name = scoped ? segments.slice(0, 2).join("/") : (segments[0] ?? "");
+
   if (name === "") {
     return null;
   }
+
   return { name, subpath: specifier.slice(name.length).replace(/^\//u, "") };
 };
 
@@ -169,6 +179,7 @@ export const esmModuleUrl = (
  * file as the transformed URL, so both have to land on one virtual path. */
 export const canonicalUrl = (url: string): string => {
   const parsed = new URL(url);
+
   return `${parsed.origin}${parsed.pathname}`;
 };
 
@@ -176,6 +187,7 @@ export const canonicalUrl = (url: string): string => {
  * path under `/__esm`. */
 export const typesVirtualPath = (url: string): string => {
   const parsed = new URL(url);
+
   return `${ESM_TYPES_DIR}/${parsed.host}${parsed.pathname}`;
 };
 
@@ -197,16 +209,19 @@ const declarationOfExt = (extension: string): string | undefined => {
     case ".cts": {
       return ".d.cts";
     }
+
     case ".js":
     case ".jsx":
     case ".ts":
     case ".tsx": {
       return ".d.ts";
     }
+
     case ".mjs":
     case ".mts": {
       return ".d.mts";
     }
+
     default: {
       return undefined;
     }
@@ -223,17 +238,24 @@ export const declarationTargets = (
   containing: string
 ): string[] => {
   const { origin, pathname: path } = new URL(specifier, containing);
+
   if (DECLARATION_EXT.test(path)) {
     return [`${origin}${path}`];
   }
+
   const dot = path.lastIndexOf(".");
+
   const extension =
     dot > path.lastIndexOf("/") ? path.slice(dot).toLowerCase() : "";
+
   const swapped = declarationOfExt(extension);
+
   if (swapped !== undefined) {
     return [`${origin}${path.slice(0, dot)}${swapped}`];
   }
+
   const base = `${origin}${path}`;
+
   return [
     `${base}.d.ts`,
     `${base}.d.mts`,
@@ -268,9 +290,11 @@ const splitNameVersion = (
   spec: string
 ): { name: string; version: string } | undefined => {
   const at = spec.lastIndexOf("@");
+
   if (at <= 0 || at === spec.length - 1) {
     return undefined;
   }
+
   return { name: spec.slice(0, at), version: spec.slice(at + 1) };
 };
 
@@ -316,24 +340,32 @@ interface Manifest {
 export const parseBunLock = (text: string): Map<string, string> => {
   const versions = new Map<string, string>();
   const lock = parseJsonc(text);
+
   if (typeof lock !== "object" || lock === null) {
     return versions;
   }
+
   const { packages } = lock as BunLock;
+
   if (typeof packages !== "object" || packages === null) {
     return versions;
   }
+
   for (const entry of Object.values(packages)) {
     // Only the first element is read: `["name@version", …]`.
     const first = Array.isArray(entry) ? (entry as unknown[])[0] : undefined;
+
     if (typeof first !== "string") {
       continue;
     }
+
     const split = splitNameVersion(first);
+
     if (split) {
       versions.set(split.name, split.version);
     }
   }
+
   return versions;
 };
 
@@ -341,35 +373,45 @@ export const parseBunLock = (text: string): Map<string, string> => {
 export const parsePackageLock = (text: string): Map<string, string> => {
   const versions = new Map<string, string>();
   const parsed = parseJsonc(text);
+
   if (typeof parsed !== "object" || parsed === null) {
     return versions;
   }
+
   const lock = parsed as PackageLock;
+
   if (lock.packages !== undefined) {
     for (const [path, entry] of Object.entries(lock.packages)) {
       const at = path.lastIndexOf("node_modules/");
+
       if (typeof entry.version !== "string" || at === -1) {
         continue;
       }
+
       const name = path.slice(at + "node_modules/".length);
+
       if (name !== "") {
         versions.set(name, entry.version);
       }
     }
   }
+
   const walk = (dependencies: Record<string, PackageLockEntry>): void => {
     for (const [name, entry] of Object.entries(dependencies)) {
       if (typeof entry.version === "string") {
         versions.set(name, entry.version);
       }
+
       if (entry.dependencies !== undefined) {
         walk(entry.dependencies);
       }
     }
   };
+
   if (lock.dependencies !== undefined) {
     walk(lock.dependencies);
   }
+
   return versions;
 };
 
@@ -379,32 +421,42 @@ export const parsePackageLock = (text: string): Map<string, string> => {
 export const parsePnpmLock = (text: string): Map<string, string> => {
   const versions = new Map<string, string>();
   let inPackages = false;
+
   for (const line of text.split("\n")) {
     if (line !== "" && !/^\s/u.test(line)) {
       inPackages = line.startsWith("packages:");
       continue;
     }
+
     if (!inPackages) {
       continue;
     }
+
     const key = /^ {2,}(?<quote>["']?)(?<key>[^\s:'"]+)\k<quote>:\s*$/u.exec(
       line
     )?.groups?.key;
+
     if (key === undefined) {
       continue;
     }
+
     const bare = key.startsWith("/") ? key.slice(1) : key;
+
     const at = bare.startsWith("@")
       ? bare.indexOf("@", bare.indexOf("/") + 1)
       : bare.indexOf("@");
+
     if (at <= 0) {
       continue;
     }
+
     const version = bare.slice(at + 1).replace(/[(_].*$/u, "");
+
     if (version !== "") {
       versions.set(bare.slice(0, at), version);
     }
   }
+
   return versions;
 };
 
@@ -413,10 +465,12 @@ export const parsePnpmLock = (text: string): Map<string, string> => {
 export const parseYarnLock = (text: string): Map<string, string> => {
   const versions = new Map<string, string>();
   let keys: string[] = [];
+
   for (const line of text.split("\n")) {
     if (line.trim() === "" || line.startsWith("#")) {
       continue;
     }
+
     if (!/^\s/u.test(line)) {
       keys = line
         .replace(/:$/u, "")
@@ -424,19 +478,25 @@ export const parseYarnLock = (text: string): Map<string, string> => {
         .map((key) => key.trim().replaceAll(/^"|"$/gu, ""));
       continue;
     }
+
     const version = /^\s+version\s+"(?<version>[^"]+)"/u.exec(line)?.groups
       ?.version;
+
     if (version === undefined) {
       continue;
     }
+
     for (const key of keys) {
       const split = splitNameVersion(key);
+
       if (split) {
         versions.set(split.name, version);
       }
     }
+
     keys = [];
   }
+
   return versions;
 };
 
@@ -456,21 +516,27 @@ const MANIFEST_FIELDS = [
 const packageJsonRanges = (text: string): Map<string, string> => {
   const ranges = new Map<string, string>();
   const parsed = parseJsonc(text);
+
   if (typeof parsed !== "object" || parsed === null) {
     return ranges;
   }
+
   const manifest = parsed as Manifest;
+
   for (const field of MANIFEST_FIELDS) {
     const block = manifest[field];
+
     if (block === undefined) {
       continue;
     }
+
     for (const [name, range] of Object.entries(block)) {
       if (typeof range === "string" && USABLE_RANGE.test(range)) {
         ranges.set(name, range);
       }
     }
   }
+
   return ranges;
 };
 
@@ -499,22 +565,28 @@ export const collectVersions = (
 ): Map<string, string> => {
   const versions = new Map<string, string>();
   const byPath = new Map(files.map((file) => [file.path, file.text]));
+
   for (const [name, read] of LOCKFILE_READERS) {
     const text = byPath.get(name);
+
     if (text === undefined) {
       continue;
     }
+
     for (const [pkg, version] of read(text)) {
       versions.set(pkg, version);
     }
+
     break;
   }
+
   const manifests = files
     .filter(
       (file) =>
         file.path === "package.json" || file.path.endsWith("/package.json")
     )
     .toSorted((a, b) => a.path.split("/").length - b.path.split("/").length);
+
   for (const manifest of manifests) {
     for (const [name, range] of packageJsonRanges(manifest.text)) {
       if (!versions.has(name)) {
@@ -522,5 +594,6 @@ export const collectVersions = (
       }
     }
   }
+
   return versions;
 };

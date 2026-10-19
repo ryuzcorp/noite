@@ -42,11 +42,14 @@ export interface SidebarPlace {
 export const sidebarPlace = (path: string): SidebarPlace => {
   const [section = "", segment = "", sub = ""] = path.split("/").slice(1);
   const onAppsPages = section === "apps" || section === "storage";
+
   const isAppPage =
     onAppsPages && segment !== "" && !(section === "apps" && segment === "new");
+
   if (!isAppPage) {
     return { activeAppId: null, activeView: null, onAppsPages };
   }
+
   return {
     activeAppId: decodeURIComponent(segment),
     activeView: section === "apps" && isSubView(sub) ? SUB_VIEWS[sub] : "app",
@@ -66,6 +69,7 @@ const MenuLink = ({
   // Native `<a>`: this sits as `li > a` under daisyUI `menu` CSS (child
   // combinators), where a `Link` host span would break the item styling.
   const link = useLink();
+
   return (
     <li>
       <a
@@ -97,6 +101,7 @@ const SidebarAppLink = ({
   const expanded = view !== null && appId !== CONTROL_APP_ID;
   // Native `<a>`: `li > a` under daisyUI `menu` CSS (see MenuLink).
   const link = useLink();
+
   return (
     <li>
       <a
@@ -145,16 +150,20 @@ export const SidebarApps = ({
 }) => {
   const feed = liveFeed(feedKeys.apps, applistUrl(), decodeApps);
   const user = session().data();
+
   // The control plane is listed for instance admins, never while
   // impersonating — the same rule as its card on /apps.
   const showControl =
     user !== undefined &&
     user !== null &&
     (adminStatus().data()?.isAdmin ?? false);
+
   const apps = feed.latest() ?? [];
+
   if (!showControl && apps.length === 0) {
     return null;
   }
+
   return (
     // Flush with Apps: no nested-menu indent or guide line.
     <ul aria-label="Your apps" class="ms-0 ps-0 before:hidden">

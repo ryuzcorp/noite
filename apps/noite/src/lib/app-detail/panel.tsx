@@ -41,10 +41,12 @@ export interface AppDetailInfo {
 const SHA_CHARS = 7;
 const CONVERGE_POLLS = 20;
 const CONVERGE_INTERVAL_MS = 3000;
+
 // Retry of a failed import (A2): the runner's clone can take minutes, and the
 // app page is the only place that shows the outcome, so poll the detail.
 const IMPORT_POLLS = 60;
 const IMPORT_INTERVAL_MS = 3000;
+
 // A failed import offers Retry, and so does one that a restart interrupted
 // (still `importing`, with no task behind it — the runner refuses the retry
 // while an import really is running).
@@ -114,19 +116,24 @@ export const AppHeader = ({ appId }: { appId: string }) => {
     if (!pending) {
       return;
     }
+
     try {
       for (let i = 0; i < CONVERGE_POLLS; i += 1) {
         if (signal.aborted) {
           return;
         }
+
         // oxlint-disable-next-line eslint/no-await-in-loop -- sequential converge poll; parallel makes no sense here
         const fresh = await res.refetch();
+
         if (signal.aborted) {
           return;
         }
+
         if (!fresh || fresh.app.status === pending) {
           break;
         }
+
         // oxlint-disable-next-line eslint/no-await-in-loop -- sequential converge poll; parallel makes no sense here
         await sleep(CONVERGE_INTERVAL_MS);
       }
@@ -138,6 +145,7 @@ export const AppHeader = ({ appId }: { appId: string }) => {
   });
 
   const info = res.data();
+
   if (res.loading() && info === undefined) {
     return (
       <header class="flex flex-col gap-3">
@@ -145,7 +153,9 @@ export const AppHeader = ({ appId }: { appId: string }) => {
       </header>
     );
   }
+
   const loadError = res.error();
+
   if (!info) {
     return (
       <header class="flex flex-col gap-3">
@@ -155,6 +165,7 @@ export const AppHeader = ({ appId }: { appId: string }) => {
       </header>
     );
   }
+
   const { app } = info;
   const canPush = info.myRole === "push" || info.myRole === "admin";
   const running = app.desiredState === "running";
@@ -190,6 +201,7 @@ export const AppHeader = ({ appId }: { appId: string }) => {
               disabled={converging() !== null}
               onclick={async () => {
                 const next = running ? "stopped" : "running";
+
                 try {
                   await api<{ ok: true }>("/api/apps/setDesired", {
                     desiredState: next,
@@ -215,9 +227,11 @@ export const AppHeader = ({ appId }: { appId: string }) => {
               disabled={importBusy()}
               onclick={async () => {
                 importBusy.set(true);
+
                 try {
                   await api<{ ok: true }>("/api/apps/retryImport", app.id);
                   notice.set(null);
+
                   // The import runs in the background: poll the shared detail
                   // until the app leaves `importing` (then the deploy, or a
                   // fresh error, is what the page shows).
@@ -226,6 +240,7 @@ export const AppHeader = ({ appId }: { appId: string }) => {
                     await sleep(IMPORT_INTERVAL_MS);
                     // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll; parallel makes no sense here
                     const fresh = await res.refetch();
+
                     if (!fresh || fresh.app.status !== "importing") {
                       break;
                     }
@@ -233,6 +248,7 @@ export const AppHeader = ({ appId }: { appId: string }) => {
                 } catch (error) {
                   notice.set(errorMessage(error));
                 }
+
                 importBusy.set(false);
               }}
             >
@@ -264,6 +280,7 @@ export const AppHeader = ({ appId }: { appId: string }) => {
  * first deploy; an import or template builds on its own, so never shown. */
 const FirstPushCard = ({ appId }: { appId: string }) => {
   const info = appDetail(appId).data();
+
   if (
     !info ||
     info.app.lastDeploySha ||
@@ -272,7 +289,9 @@ const FirstPushCard = ({ appId }: { appId: string }) => {
   ) {
     return null;
   }
+
   const snippet = `git remote add noite ${info.gitRemote}\ngit push noite main`;
+
   return (
     <section class="card bg-base-100 dark:bg-base-200 border-base-300 border">
       <div class="card-body gap-3">

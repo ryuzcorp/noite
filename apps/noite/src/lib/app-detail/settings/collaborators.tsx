@@ -44,13 +44,18 @@ export const CollaboratorsPanel = ({
     if (!isAdmin || busy()) {
       return;
     }
+
     const address = inviteEmail().trim();
+
     if (!address) {
       err.set("Email is required");
+
       return;
     }
+
     const next = parseAppRole(inviteRole());
     busy.set(true);
+
     try {
       const result = await api<{ ok: true; status: "updated" | "invited" }>(
         "/api/collaborators/inviteCollaborator",
@@ -60,6 +65,7 @@ export const CollaboratorsPanel = ({
           role: next ?? "view",
         }
       );
+
       inviteEmail.set("");
       err.set("");
       // The same wording either way: which addresses have accounts is not
@@ -122,9 +128,11 @@ export const CollaboratorsPanel = ({
                 onchange={async (e) => {
                   const raw = e.currentTarget.value;
                   const next = parseAppRole(raw);
+
                   if (!next) {
                     return;
                   }
+
                   try {
                     await api<{ ok: true }>(
                       "/api/collaborators/updateCollaboratorRole",

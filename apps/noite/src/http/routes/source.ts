@@ -32,9 +32,11 @@ const isSourcePayload = (value: unknown): value is SourcePayload => {
   if (typeof value !== "object" || value === null) {
     return false;
   }
+
   // SAFETY: `value` is a non-null object; both fields are read as `unknown`
   // and checked below before the guard says anything about them.
   const { files, message } = value as { files?: unknown; message?: unknown };
+
   return typeof message === "string" && Array.isArray(files);
 };
 
@@ -47,14 +49,17 @@ const crossSiteRefusal = (request: Request, env: KitEnv): Response | null => {
   const [mediaType = ""] = (request.headers.get("content-type") ?? "").split(
     ";"
   );
+
   if (mediaType.trim().toLowerCase() !== "application/json") {
     return new Response("content-type must be application/json", {
       status: 415,
     });
   }
+
   if (!request.headers.get("origin") || !originAllowed(request, env)) {
     return new Response("origin not allowed", { status: 403 });
   }
+
   return null;
 };
 
@@ -71,18 +76,23 @@ const runnerBody = (
     message: payload.message,
     role,
   };
+
   if (payload.branch !== undefined) {
     body.branch = payload.branch;
   }
+
   if (payload.fromSha !== undefined) {
     body.fromSha = payload.fromSha;
   }
+
   if (payload.deletes !== undefined && payload.deletes.length > 0) {
     body.deletes = payload.deletes;
   }
+
   if (payload.moves !== undefined && payload.moves.length > 0) {
     body.moves = payload.moves;
   }
+
   return body;
 };
 
@@ -99,45 +109,61 @@ const forwardSourceBody = async (
   endpoint: "commit" | "preview"
 ): Promise<Response> => {
   const appId = params?.appId?.trim() ?? "";
+
   if (!appId) {
     return new Response("app required", { status: 400 });
   }
+
   const refused = crossSiteRefusal(request, env);
+
   if (refused) {
     return refused;
   }
+
   await ensureDbPromise();
   const session = await getSessionOrNull(request, env).catch(() => null);
   const user = session?.user;
+
   if (!user) {
     return new Response("Sign in required", { status: 401 });
   }
+
   const grant = await requireAppRole(appId, user.id, "push").catch(() => null);
+
   if (!grant) {
     return new Response("forbidden", { status: 403 });
   }
+
   const rc = runnerConfig(env);
+
   if (!rc) {
     return new Response("RUNNER_TOKEN is not configured", { status: 500 });
   }
+
   const raw = await readBoundedText(request, MAX_SOURCE_BODY_BYTES);
+
   if (raw === null) {
     return tooLarge();
   }
+
   let payload: unknown;
+
   try {
     payload = JSON.parse(raw);
   } catch {
     return new Response("invalid JSON", { status: 400 });
   }
+
   if (!isSourcePayload(payload)) {
     return new Response(`invalid ${endpoint} body`, { status: 400 });
   }
+
   const body = runnerBody(
     payload,
     { name: user.name, userId: user.id },
     grant.role
   );
+
   const res = await fetch(
     `${rc.runner}/v1/apps/${encodeURIComponent(appId)}/source/${endpoint}`,
     {
@@ -150,6 +176,7 @@ const forwardSourceBody = async (
       signal: AbortSignal.timeout(SOURCE_FORWARD_TIMEOUT_MS),
     }
   );
+
   return new Response(await res.text(), {
     headers: { "content-type": "application/json" },
     status: res.status,
@@ -177,41 +204,55 @@ export const handleSourceArchive: RouteHandler = async (
   params
 ) => {
   const appId = params?.appId?.trim() ?? "";
+
   if (!appId) {
     return new Response("app required", { status: 400 });
   }
+
   const site = request.headers.get("sec-fetch-site");
+
   if (
     (site !== null && site !== "same-origin") ||
     !originAllowed(request, env)
   ) {
     return new Response("origin not allowed", { status: 403 });
   }
+
   let ref: string;
+
   try {
     ref = new URL(request.url).searchParams.get("ref")?.trim() ?? "";
   } catch {
     return new Response("bad request", { status: 400 });
   }
+
   await ensureDbPromise();
   const session = await getSessionOrNull(request, env).catch(() => null);
   const user = session?.user;
+
   if (!user) {
     return new Response("Sign in required", { status: 401 });
   }
+
   const grant = await requireAppRole(appId, user.id, "view").catch(() => null);
+
   if (!grant) {
     return new Response("forbidden", { status: 403 });
   }
+
   const rc = runnerConfig(env);
+
   if (!rc) {
     return new Response("RUNNER_TOKEN is not configured", { status: 500 });
   }
+
   const query = ref === "" ? "" : `?ref=${encodeURIComponent(ref)}`;
+
   const res = await fetch(
     `${rc.runner}/v1/apps/${encodeURIComponent(appId)}/source/archive${query}`,
     { headers: { authorization: `Bearer ${rc.token}` } }
   );
+
   return new Response(res.body, {
     headers: {
       "content-type": res.headers.get("content-type") ?? "application/x-tar",

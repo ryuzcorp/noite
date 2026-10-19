@@ -99,9 +99,11 @@ const readOnlyReason = (
   if (editableRef(refs, role, ref)) {
     return "";
   }
+
   if (refs?.branches.some((branch) => branch.name === ref) === true) {
     return "role";
   }
+
   return SHA_REF.test(ref) ? "commit" : "tag";
 };
 
@@ -117,12 +119,14 @@ const TREE_PANES = {
   key: "code-tree",
   minPx: [180, 320],
 } as const;
+
 const PANEL_PANES = {
   collapsible: [1],
   direction: "horizontal",
   key: "code-panel",
   minPx: [320, 280],
 } as const;
+
 const TERMINAL_PANES = {
   direction: "vertical",
   key: "code-terminal",
@@ -133,6 +137,7 @@ const TERMINAL_PANES = {
  * bar's panel toggles. */
 const TerminalToggle = ({ param }: { param: SearchParam<string> }) => {
   const open = param() === "1";
+
   return (
     <button
       type="button"
@@ -199,6 +204,7 @@ const CodeSidePanel = ({
   // (`?panel=` says nothing) — and it never shows, because a closed pane is
   // clipped to nothing and inert.
   const tab = panel === "" ? "history" : panel;
+
   // The tabs this panel has opened, one set per panel mount: a tab is drawn
   // from its first visit on, so a deep link (`?panel=history`) mounts only the
   // tab it names, and no tab fetches before it is opened.
@@ -207,9 +213,11 @@ const CodeSidePanel = ({
   const opened = atom.lazy(() => new Set<Exclude<CodePanel, "">>(), {
     snapshot: false,
   })();
+
   if (open) {
     opened.add(tab);
   }
+
   // `?file=` scopes History to the open file. The scope is read off the open
   // file alone, never off the tab that is showing, so `?file=` writes while
   // another tab holds the panel leave History's body key alone instead of
@@ -217,6 +225,7 @@ const CodeSidePanel = ({
   const scoped = fileOnly() && file() !== "";
   const path = scoped ? file() : "";
   let extras: View | null = null;
+
   if (tab === "history" && file() !== "") {
     extras = (
       <label class="flex min-w-0 cursor-pointer items-center gap-1.5 text-xs">
@@ -235,6 +244,7 @@ const CodeSidePanel = ({
       </label>
     );
   }
+
   /** One tab's body, keyed by the tab (see above). History is keyed by what it
    * reads — the ref, the scope and the cursor — so a change there remounts it
    * and fetches that page: its `forgeLog` resource stays bound to the key it
@@ -243,6 +253,7 @@ const CodeSidePanel = ({
     if (body === "changes") {
       return <ChangesPanel key={body} {...changes} />;
     }
+
     if (body === "preview") {
       return (
         <PreviewPanel
@@ -255,6 +266,7 @@ const CodeSidePanel = ({
         />
       );
     }
+
     return (
       <HistoryView
         key={`${gitRef}:${path}:${skip()}`}
@@ -266,17 +278,21 @@ const CodeSidePanel = ({
       />
     );
   };
+
   const bodies: View[] = [];
+
   for (const drawn of TAB_ORDER) {
     if (!opened.has(drawn)) {
       continue;
     }
+
     bodies.push(
       <div key={drawn} class={drawn === tab ? TAB_CLASS[drawn] : "hidden"}>
         {tabBody(drawn)}
       </div>
     );
   }
+
   return (
     // The panel is a pane of the page's own group: it closes to nothing (the
     // divider between the editor and it is the page's), and while it is closed
@@ -314,6 +330,7 @@ const SourceBody = ({ appId }: { appId: string }) => {
     default: "",
     parse: toCodePanel,
   });
+
   const refsRes = forgeRefs(appId);
   const refs = refsRes.data();
   const defaultBranch = refs?.defaultBranch ?? "main";
@@ -325,15 +342,18 @@ const SourceBody = ({ appId }: { appId: string }) => {
   const file = searchParam("file", { default: "" });
   // Paging cursor of whichever panel is open.
   const skip = searchParam<number>("skip", { default: 0, parse: parseSkip });
+
   // The terminal panel (`?terminal=1` keeps refresh and deep links working,
   // like `?panel=`).
   const terminalParam = searchParam("terminal", {
     default: "",
     parse: (raw: string): string => (raw === "1" ? "1" : ""),
   });
+
   // The browser hands its commit function over on mount; the Changes panel
   // calls it.
   const committer = atom.lazy(newCommitter)();
+
   // The pod host origin, resolved when a checkout opens: every ref the user
   // browses frames the pod host there. The action answers with the control's
   // origin for this app (the edge serves the pod's four assets there), so guest
@@ -343,6 +363,7 @@ const SourceBody = ({ appId }: { appId: string }) => {
       "/api/preview/sourcePreviewOrigin",
       { appId }
     );
+
     // The action cannot see the page's scheme through a TLS-terminating
     // proxy: repeat its mixed-content refusal here with the real one, so the
     // browser fails closed instead of framing an origin that cannot connect.
@@ -352,8 +373,10 @@ const SourceBody = ({ appId }: { appId: string }) => {
     ) {
       throw new Error(PREVIEW_MIXED_CONTENT_MESSAGE);
     }
+
     return previewOrigin;
   };
+
   // The terminal panel's session: the canvas shows the shell the pod frame
   // runs, and a panel left open keeps it across a ref change (the new browser
   // attaches on mount).
@@ -362,10 +385,12 @@ const SourceBody = ({ appId }: { appId: string }) => {
   const terminalSession = atom.lazy(() => createTerminalSession(), {
     snapshot: false,
   })();
+
   // The state every group below is seeded with: which tab `?panel=` names
   // ("" = closed) and whether the terminal is open.
   const openPanel = panel();
   const terminalOpen = terminalParam() === "1";
+
   /** Close the side panel: the URL is the panel's state, so the pane, the
    * toggle and the tabs all follow it from there. A drag that takes the pane
    * past its minimum goes through here too (see `onCollapsed`). */
@@ -373,6 +398,7 @@ const SourceBody = ({ appId }: { appId: string }) => {
     skip.set(0);
     panel.set("");
   };
+
   // The page's pane groups. Each keeps its own split in localStorage and binds
   // to the elements below at `lg` and up; the side panel's own state follows
   // `?panel=` (see `setOpen` in the render).
@@ -381,6 +407,7 @@ const SourceBody = ({ appId }: { appId: string }) => {
   const treePanes = atom.lazy(() => createPaneGroup(TREE_PANES), {
     snapshot: false,
   })();
+
   const panelPanes = atom.lazy(
     () =>
       createPaneGroup({
@@ -392,13 +419,16 @@ const SourceBody = ({ appId }: { appId: string }) => {
       }),
     { snapshot: false }
   )();
+
   const terminalPanes = atom.lazy(() => createPaneGroup(TERMINAL_PANES), {
     snapshot: false,
   })();
+
   // The tree column's shadow-pane host: the column is a pane of this page's
   // own group, so the page renders it and hands the browser the mount point
   // (see `./source/browser`).
   const treeHost = atom.lazy(() => newLiveRef<HTMLElement>())();
+
   const browser = atom<SourceBrowserState>({
     conflicts: [],
     files: [],
@@ -417,6 +447,7 @@ const SourceBody = ({ appId }: { appId: string }) => {
   const detailRes = appDetail(appId);
   const myRole = detailRes.data()?.myRole;
   const browsing = gitRef();
+
   /** Why the browsed ref opens read-only ("" = editable — see
    * `readOnlyReason`). Asked when the browser opens the checkout rather than
    * handed over, because both answers arrive after the browser mounts — and
@@ -427,17 +458,22 @@ const SourceBody = ({ appId }: { appId: string }) => {
    * absent again, and stays read-only). */
   const canEditRef = async (ref: string): Promise<ReadOnlyRef> => {
     const loaded = refsRes.data();
+
     const stale =
       loaded === undefined ||
       !loaded.branches.some((branch) => branch.name === ref);
+
     const known = stale || refsRes.loading() ? await refsRes.refetch() : loaded;
     let role = myRole;
+
     if (role === undefined) {
       const detail = await detailRes.refetch();
       role = detail?.myRole;
     }
+
     return readOnlyReason(known, role, ref);
   };
+
   // The ref the browser browses, kept in step with `?ref=` here: the browser
   // watches it and installs that ref's checkout under the panes it already has
   // (see `./source/browser`), so `?ref=` no longer remounts it — the keyed
@@ -452,19 +488,24 @@ const SourceBody = ({ appId }: { appId: string }) => {
   // content stay in step — and idempotent, so a repaint never re-opens a pane
   // the user dragged shut.
   panelPanes.setOpen(1, openPanel !== "");
+
   const togglePanel = (next: CodePanel) => {
     // A panel that opens or closes starts History on its first page; switching
     // between open tabs keeps `?skip=`, and with it the page History has
     // loaded, since the tab it pages stays mounted either way.
     if (next === "") {
       closePanel();
+
       return;
     }
+
     if (openPanel === "") {
       skip.set(0);
     }
+
     panel.set(next);
   };
+
   // Everything the page holds is let go with it.
   watch.once(({ onCleanup }) => {
     onCleanup(() => {
@@ -619,6 +660,7 @@ const SourceBody = ({ appId }: { appId: string }) => {
                   }}
                   onDeployPreview={async () => {
                     const previewed = await committer.actions?.preview();
+
                     return previewed?.environment ?? null;
                   }}
                   open={openPanel !== ""}
@@ -655,8 +697,10 @@ const SourceBody = ({ appId }: { appId: string }) => {
  * and the body repaints through its own param reads. */
 export default function Source() {
   const { id: appId } = useParams();
+
   if (!appId) {
     return <p class="text-error">Missing app id</p>;
   }
+
   return [<SourceBody key={appId} appId={appId} />];
 }

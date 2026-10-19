@@ -25,11 +25,14 @@ export const createTestD1 = (): TestD1 => {
     const run = () => {
       executed.push(sql);
       const stmt = raw.query(sql);
+
       return stmt;
     };
+
     return {
       all: async () => {
         const rows = run().all(...params);
+
         return { meta: {}, results: rows, success: true };
       },
       bind: (...next: Param[]) => statement(sql, next),
@@ -37,6 +40,7 @@ export const createTestD1 = (): TestD1 => {
       raw: async () => run().values(...params),
       run: async () => {
         run().run(...params);
+
         return { meta: {}, results: [], success: true };
       },
     };
@@ -45,14 +49,17 @@ export const createTestD1 = (): TestD1 => {
   const db = {
     batch: async (statements: { all: () => Promise<unknown> }[]) => {
       const out: unknown[] = [];
+
       for (const item of statements) {
         // oxlint-disable-next-line eslint/no-await-in-loop -- batch statements run in order
         out.push(await item.all());
       }
+
       return out;
     },
     prepare: (sql: string) => statement(sql),
   };
+
   // SAFETY: the shim implements the D1 surface the SQL client and the
   // migrator call; nothing else in the app touches the binding directly.
   // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- test double for a platform binding.

@@ -63,10 +63,12 @@ const run =
     Effect.gen(function* tool() {
       const ctx = yield* readActionContext();
       const conn: Connection = yield* connection(flags, ctx.repo);
+
       const result = yield* callTool<unknown>(conn, name, {
         app: conn.slug,
         ...argsOf(flags),
       });
+
       yield* print(result.text);
     });
 

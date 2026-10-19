@@ -69,6 +69,7 @@ test("a template's id is already the slug the picker prefills", () => {
     "oxide",
     "tanstack-start",
   ]);
+
   for (const template of TEMPLATES) {
     expect(slugifyName(template.id)).toBe(template.id);
     expect(parseGitHubRepo(template.url)?.slug).toBe(

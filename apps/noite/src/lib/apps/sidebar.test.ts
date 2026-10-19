@@ -30,6 +30,7 @@ describe("sidebarPlace", () => {
         onAppsPages: true,
       });
     }
+
     expect(sidebarPlace("/apps/_control").activeAppId).toBe("_control");
   });
 

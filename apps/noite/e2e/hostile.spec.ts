@@ -38,6 +38,7 @@ test("hostile tenant is contained", async ({ page, request }) => {
     process.env.E2E_HOSTILE !== "1",
     "needs the isolation lane (E2E_HOSTILE=1, single image, NOITE_TENANCY=multi)"
   );
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Hostile",
     slug: HOSTILE_SLUG,
@@ -48,6 +49,7 @@ test("hostile tenant is contained", async ({ page, request }) => {
   expect(deploy.status).toBe("success");
 
   const port = await appListenPort(request, appId);
+
   // A real neighbour: another deployed app (the deploy spec's). Its internal
   // (operator) port is the probe target; its public port is how the lane
   // checks it still serves afterwards. Without one the probe would aim at a
@@ -55,18 +57,22 @@ test("hostile tenant is contained", async ({ page, request }) => {
   const apps = await runnerApi<
     { internalPort: number | null; listenPort: number | null; slug: string }[]
   >(request, "/v1/apps");
+
   const other = apps.find(
     (a) =>
       a.slug !== HOSTILE_SLUG &&
       a.internalPort !== null &&
       a.listenPort !== null
   );
+
   expect(other, "needs a second deployed app as the neighbour").toBeDefined();
   const neighbour = other?.internalPort ?? 0;
   const neighbourPublic = other?.listenPort ?? 0;
+
   const res = await request.get(
     `http://localhost:${port}/probes?neighbour=${neighbour}`
   );
+
   expect(res.ok()).toBe(true);
   // SAFETY: the hostile worker answers /probes with { build, release, worker, secrets } (test/hostile/index.js).
   const report = (await res.json()) as ProbeReport;
@@ -74,6 +80,7 @@ test("hostile tenant is contained", async ({ page, request }) => {
   for (const [name, probe] of Object.entries(report.build.probes)) {
     expect(probe.ok, `build probe ${name} leaked: ${probe.detail}`).toBe(false);
   }
+
   // The cross-build probe only proves isolation if a sibling app's build
   // cache actually existed to probe. workers:1 + file order deploy the
   // sample app first, so at least one other cache is present.
@@ -82,22 +89,27 @@ test("hostile tenant is contained", async ({ page, request }) => {
     crossBuild,
     "build probe read:sibling-build-cache present"
   ).toBeDefined();
+
   const siblings = Number(
     /siblings=(?<count>\d+)/u.exec(crossBuild?.detail ?? "")?.groups?.count ??
       "0"
   );
+
   expect(
     siblings,
     `needs a sibling app's build cache to probe (${crossBuild?.detail ?? ""})`
   ).toBeGreaterThan(0);
+
   for (const [name, probe] of Object.entries(report.release.probes)) {
     if (name === "scoped-prefix") {
       continue;
     }
+
     expect(probe.ok, `release probe ${name} leaked: ${probe.detail}`).toBe(
       false
     );
   }
+
   for (const [name, probe] of Object.entries(report.worker)) {
     if (probe.mustSucceed === true) {
       expect(probe.ok, `worker egress ${name} must succeed`).toBe(true);
@@ -107,6 +119,7 @@ test("hostile tenant is contained", async ({ page, request }) => {
       );
     }
   }
+
   for (const [key, value] of Object.entries(report.secrets)) {
     expect(value, `worker env ${key} leaked`).toBe("absent");
   }
@@ -115,5 +128,6 @@ test("hostile tenant is contained", async ({ page, request }) => {
   const neighbourRes = await request.get(
     `http://localhost:${neighbourPublic}/`
   );
+
   expect([200, 404]).toContain(neighbourRes.status());
 });

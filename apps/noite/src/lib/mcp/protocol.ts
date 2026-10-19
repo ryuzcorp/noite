@@ -131,12 +131,14 @@ export const defineTool = <Args>(
   inputSchema: Schema.toJsonSchemaDocument(spec.params).schema,
   invoke: async (context, args) => {
     const decoded = Schema.decodeUnknownResult(spec.params)(args);
+
     if (decoded._tag === "Failure") {
       throw new McpToolError(
         `${spec.name}: "arguments" do not match the tool's inputSchema`,
         { invalid: true }
       );
     }
+
     return await spec.run(context, decoded.success);
   },
   name: spec.name,
@@ -184,6 +186,7 @@ const callTool = async (
   tools: readonly McpToolDefinition[]
 ): Promise<JsonRpcResponse> => {
   const decoded = Schema.decodeUnknownResult(ToolCallParams)(params ?? {});
+
   if (decoded._tag === "Failure") {
     return failure(
       id,
@@ -191,13 +194,17 @@ const callTool = async (
       'Invalid params: expected { "name": string, "arguments"?: object }'
     );
   }
+
   const { arguments: args, name } = decoded.success;
   const tool = tools.find((candidate) => candidate.name === name);
+
   if (!tool) {
     return failure(id, RPC_CODES.invalidParams, `Unknown tool: ${name}`);
   }
+
   try {
     const result = await tool.invoke(context, args ?? {});
+
     return {
       id,
       jsonrpc: "2.0",
@@ -210,11 +217,13 @@ const callTool = async (
     if (error instanceof McpToolError && error.invalid) {
       return failure(id, RPC_CODES.invalidParams, error.message);
     }
+
     // Strip the runner envelope ("runner rpc git.log: 404 …") so a tool error
     // reads as a sentence, like the push-to-create path does.
     const message = (
       error instanceof Error ? error.message : String(error)
     ).replace(/^runner (?:rpc \S+: \d+|GET \S+: \d+) /u, "");
+
     return {
       id,
       jsonrpc: "2.0",
@@ -232,6 +241,7 @@ export const handleMcpMessage = async (
   tools: readonly McpToolDefinition[]
 ): Promise<JsonRpcResponse | null> => {
   const decoded = Schema.decodeUnknownResult(RpcRequest)(message);
+
   if (decoded._tag === "Failure") {
     return failure(
       null,
@@ -239,19 +249,23 @@ export const handleMcpMessage = async (
       'Invalid Request: expected a JSON-RPC request with a "method"'
     );
   }
+
   const request = decoded.success;
   const id: JsonRpcId = request.id ?? null;
+
   // No `id`, or a `notifications/*` method, means notification: answer with
   // nothing (the transport replies 202). `id: null` is a real (discouraged)
   // id and still gets a response.
   if (request.id === undefined || request.method.startsWith("notifications/")) {
     return null;
   }
+
   switch (request.method) {
     case "initialize": {
       const params = Schema.decodeUnknownResult(InitializeParams)(
         request.params ?? {}
       );
+
       return {
         id,
         jsonrpc: "2.0",
@@ -267,9 +281,11 @@ export const handleMcpMessage = async (
         },
       };
     }
+
     case "ping": {
       return { id, jsonrpc: "2.0", result: {} };
     }
+
     case "tools/list": {
       return {
         id,
@@ -283,9 +299,11 @@ export const handleMcpMessage = async (
         },
       };
     }
+
     case "tools/call": {
       return await callTool(context, id, request.params, tools);
     }
+
     default: {
       return failure(
         id,

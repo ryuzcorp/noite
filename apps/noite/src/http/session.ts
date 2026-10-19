@@ -14,7 +14,9 @@ export const controlStreamRefusalDecision = (access: {
   if (!access.signedIn) {
     return { message: "Sign in required", status: 401 };
   }
+
   const refusal = controlAccessRefusal(access);
+
   return refusal === null ? null : { message: refusal, status: 403 };
 };
 
@@ -29,17 +31,21 @@ export const controlStreamRefusal = async (
   if (!requestOrigin(request)) {
     return new Response("bad request", { status: 400 });
   }
+
   const session = await getSessionOrNull(request, env).catch(() => null);
   const user = session?.user;
+
   const isAdmin =
     user !== undefined &&
     session?.impersonatedBy === null &&
     (await isInstanceAdmin(user.id, user.email));
+
   const refusal = controlStreamRefusalDecision({
     impersonatedBy: session?.impersonatedBy ?? null,
     isAdmin,
     signedIn: user !== undefined,
   });
+
   return refusal === null
     ? undefined
     : new Response(refusal.message, { status: refusal.status });
@@ -53,5 +59,6 @@ export const routeUserId = async (
   env: KitEnv
 ): Promise<string | undefined> => {
   const session = await getSessionOrNull(request, env).catch(() => null);
+
   return session?.user.id;
 };

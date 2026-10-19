@@ -25,9 +25,11 @@ export const CopyButton = ({
 }) => {
   const copied = atom(false);
   const size = iconClass ?? (iconOnly ? "h-4 w-4" : "h-3.5 w-3.5");
+
   const variant = iconOnly
     ? "btn btn-square btn-ghost btn-sm"
     : "btn btn-sm btn-ghost gap-1";
+
   return (
     <button
       type="button"

@@ -23,6 +23,7 @@ export type TimelineEntry =
  * mixed formats honest (invalid stamps read as epoch 0). */
 const timeOf = (value: string): number => {
   const time = Date.parse(value);
+
   return Number.isNaN(time) ? 0 : time;
 };
 
@@ -33,6 +34,7 @@ export const buildTimeline = (
   reviews: readonly PrReview[]
 ): TimelineEntry[] => {
   const entries: TimelineEntry[] = [];
+
   for (const comment of comments) {
     entries.push({
       comment,
@@ -41,6 +43,7 @@ export const buildTimeline = (
       kind: "comment",
     });
   }
+
   for (const review of reviews) {
     entries.push({
       createdAt: review.createdAt,
@@ -49,14 +52,18 @@ export const buildTimeline = (
       review,
     });
   }
+
   return entries.toSorted((a, b) => {
     const delta = timeOf(a.createdAt) - timeOf(b.createdAt);
+
     if (delta !== 0) {
       return delta;
     }
+
     if (a.id < b.id) {
       return -1;
     }
+
     return a.id > b.id ? 1 : 0;
   });
 };
@@ -78,9 +85,11 @@ const toSide = (side: string | null): DiffSide | null =>
  * (any of path/line/side missing or unrecognized). */
 export const lineAnchor = (comment: PrComment): LineAnchor | null => {
   const side = toSide(comment.side);
+
   if (comment.path === null || comment.line === null || side === null) {
     return null;
   }
+
   return { line: comment.line, path: comment.path, side };
 };
 
@@ -92,6 +101,7 @@ export const attachesTo = (
   side: string
 ): boolean => {
   const anchor = lineAnchor(comment);
+
   return (
     anchor !== null &&
     anchor.path === path &&
@@ -112,36 +122,47 @@ export const groupLineComments = (
   comments: readonly PrComment[]
 ): Map<string, LineThread[]> => {
   const pending = new Map<string, Map<string, LineThread>>();
+
   for (const comment of comments) {
     const anchor = lineAnchor(comment);
+
     if (anchor === null) {
       continue;
     }
+
     const key = `${anchor.line}:${anchor.side}`;
     let threads = pending.get(anchor.path);
+
     if (!threads) {
       threads = new Map();
       pending.set(anchor.path, threads);
     }
+
     const thread = threads.get(key);
+
     if (thread) {
       thread.comments.push(comment);
     } else {
       threads.set(key, { anchor, comments: [comment] });
     }
   }
+
   const grouped = new Map<string, LineThread[]>();
+
   for (const [path, threads] of pending) {
     const out = [...threads.values()].toSorted(
       (a, b) =>
         a.anchor.line - b.anchor.line ||
         (a.anchor.side === "old" ? 0 : 1) - (b.anchor.side === "old" ? 0 : 1)
     );
+
     for (const thread of out) {
       thread.comments.sort((a, b) => timeOf(a.createdAt) - timeOf(b.createdAt));
     }
+
     grouped.set(path, out);
   }
+
   return grouped;
 };
 
@@ -160,6 +181,7 @@ export interface PatchFile {
 
 const stripQuotes = (value: string): string => {
   const trimmed = value.trim();
+
   return trimmed.startsWith('"') && trimmed.endsWith('"')
     ? trimmed.slice(1, -1)
     : trimmed;
@@ -169,9 +191,11 @@ const stripQuotes = (value: string): string => {
  * `/dev/null` side of an add/delete yields null. */
 const headerPath = (line: string, prefix: "a/" | "b/"): string | null => {
   const value = stripQuotes(line.slice(4)).split("\t")[0] ?? "";
+
   if (value === "/dev/null" || value === "") {
     return null;
   }
+
   return value.startsWith(prefix) ? value.slice(prefix.length) : value;
 };
 
@@ -189,6 +213,7 @@ export const splitPatchFiles = (patch: string): PatchFile[] => {
     if (current.length > 0) {
       files.push({ patch: current.join("\n"), path: path ?? oldPath ?? "" });
     }
+
     current = [];
     path = null;
     oldPath = null;
@@ -203,16 +228,20 @@ export const splitPatchFiles = (patch: string): PatchFile[] => {
       current.push(line);
       continue;
     }
+
     if (current.length > 0) {
       if (line.startsWith("+++ ")) {
         path = headerPath(line, "b/") ?? path;
       } else if (line.startsWith("--- ")) {
         oldPath = headerPath(line, "a/");
       }
+
       current.push(line);
     }
   }
+
   flush();
+
   return files;
 };
 
@@ -222,16 +251,20 @@ export const splitPatchFiles = (patch: string): PatchFile[] => {
  * the reviewer's own buttons act on). */
 export const latestReviews = (reviews: readonly PrReview[]): PrReview[] => {
   const latest = new Map<string, PrReview>();
+
   for (const review of reviews) {
     const prev = latest.get(review.reviewerId);
+
     const newer =
       prev === undefined ||
       review.createdAt > prev.createdAt ||
       (review.createdAt === prev.createdAt && review.id >= prev.id);
+
     if (newer) {
       latest.set(review.reviewerId, review);
     }
   }
+
   return [...latest.values()];
 };
 
@@ -262,5 +295,6 @@ export const toPrStateFilter = (raw: string): PrStateFilter => {
   if (raw === "all" || raw === "closed" || raw === "merged" || raw === "open") {
     return raw;
   }
+
   return "open";
 };

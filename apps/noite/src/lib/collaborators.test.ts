@@ -70,16 +70,19 @@ const roleOf = async (
   gate: ReturnType<typeof requireAppRole>
 ): Promise<string> => {
   const access = await gate;
+
   return access.role;
 };
 
 const denied = async (work: Promise<unknown>) => {
   let failed = false;
+
   try {
     await work;
   } catch {
     failed = true;
   }
+
   return failed;
 };
 
@@ -116,10 +119,12 @@ describe("access gate", () => {
     expect(await denied(requireAppRole(APP.id, "u-creator", "view"))).toBe(
       true
     );
+
     // SAFETY: a COUNT query always yields one { n } row.
     const rows = db.raw
       .query(`SELECT count(*) AS n FROM app_collaborator WHERE userId = ?`)
       .get("u-creator") as { n: number };
+
     expect(rows.n).toBe(0);
   });
 
@@ -244,9 +249,11 @@ describe("pending invitations", () => {
     await invite("stranger@example.com");
     await invite("view@example.com");
     const pending = await listPendingInvites(APP.id);
+
     const strangerInvite = pending.find(
       (p) => p.email === "stranger@example.com"
     );
+
     const viewInvite = pending.find((p) => p.email === "view@example.com");
     // Declining someone else's invitation is a no-op.
     await withDb(

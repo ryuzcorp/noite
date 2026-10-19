@@ -24,6 +24,7 @@ const DATE = /^\d{4}-\d{2}-\d{2}$/u;
 const ACTION = /^### Operator action required\s*$/mu;
 
 const marks = [...changelog.matchAll(SECTION)];
+
 const sections = marks.map((mark, index) => ({
   body: changelog.slice(
     (mark.index ?? 0) + mark[0].length,
@@ -34,6 +35,7 @@ const sections = marks.map((mark, index) => ({
 }));
 
 let failed = false;
+
 const fail = (message: string): void => {
   console.error(message);
   failed = true;
@@ -43,9 +45,11 @@ for (const { body, date, name } of sections) {
   if (name === "Unreleased") {
     continue;
   }
+
   if (!(date && DATE.test(date))) {
     fail(`CHANGELOG.md: [${name}] needs a date (## [${name}] - YYYY-MM-DD)`);
   }
+
   if (!ACTION.test(body)) {
     fail(
       `CHANGELOG.md: [${name}] has no "### Operator action required" section`
@@ -54,6 +58,7 @@ for (const { body, date, name } of sections) {
 }
 
 const wanted = process.argv.slice(2).at(0);
+
 if (wanted && !sections.some(({ name }) => name === wanted)) {
   fail(
     `CHANGELOG.md has no [${wanted}] section: move the Unreleased notes under it before tagging`
@@ -63,6 +68,7 @@ if (wanted && !sections.some(({ name }) => name === wanted)) {
 if (failed) {
   process.exit(1);
 }
+
 console.log(
   `changelog: ${sections.length} section(s) ok${wanted ? `, ${wanted} present` : ""}`
 );

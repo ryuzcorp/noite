@@ -62,6 +62,7 @@ const parseRegistration = (context: string | null | undefined) =>
         })
       );
     }
+
     const raw = yield* Effect.try({
       catch: () =>
         new InvalidRegistrationContextError({
@@ -77,6 +78,7 @@ const parseRegistration = (context: string | null | undefined) =>
         }
       },
     });
+
     const decoded = yield* Schema.decodeUnknownEffect(RegistrationContext)(
       raw
     ).pipe(
@@ -87,8 +89,10 @@ const parseRegistration = (context: string | null | undefined) =>
           })
       )
     );
+
     const email = decoded.email.trim().toLowerCase();
     const name = decoded.name.trim();
+
     if (!(email && name)) {
       return yield* Effect.fail(
         new InvalidRegistrationContextError({
@@ -96,6 +100,7 @@ const parseRegistration = (context: string | null | undefined) =>
         })
       );
     }
+
     return { email, invite: decoded.invite?.trim() || undefined, name };
   });
 
@@ -105,12 +110,15 @@ const inviteProblemMessage = (problem: InviteProblem): string => {
     case "missing": {
       return "This instance is invite-only. Enter an invitation code.";
     }
+
     case "unknown": {
       return "That invitation code is not valid.";
     }
+
     case "revoked": {
       return "That invitation code was revoked. Ask for a new one.";
     }
+
     default: {
       return "That invitation code has already been used. Ask for a new one.";
     }
@@ -127,6 +135,7 @@ const requireRegistration = (context: string | null | undefined) => {
         message: error.message,
       });
     }
+
     throw error;
   }
 };
@@ -140,11 +149,13 @@ const sendSignInOTP = async (
   env: KitEnv
 ): Promise<void> => {
   const webhook = env.NOITE_EMAIL_WEBHOOK_URL?.trim();
+
   if (webhook) {
     // Operator-configured URL (same trust as the SMTP URL it replaces),
     // but still constrained to http(s) before use as a fetch target.
     try {
       const { protocol } = new URL(webhook);
+
       if (protocol !== "http:" && protocol !== "https:") {
         throw new Error("NOITE_EMAIL_WEBHOOK_URL must be http(s)");
       }
@@ -153,6 +164,7 @@ const sendSignInOTP = async (
         ? error
         : new Error("NOITE_EMAIL_WEBHOOK_URL is invalid");
     }
+
     // pi-lens-ignore: ts-ssrf -- operator-configured, scheme-validated URL (same trust as the SMTP URL it replaces); never user input.
     const response = await fetch(webhook, {
       body: JSON.stringify({
@@ -164,16 +176,21 @@ const sendSignInOTP = async (
       headers: { "content-type": "application/json" },
       method: "POST",
     });
+
     if (!response.ok) {
       throw new Error(`OTP webhook failed with status ${response.status}`);
     }
+
     return;
   }
+
   if (isLocalhostDomain(env.BASE_DOMAIN ?? "localhost")) {
     // oxlint-disable-next-line no-console-except-error -- dev-only OTP delivery channel; prod uses the webhook or refuses loudly below.
     console.log(`[noite:otp] sign-in code for ${email}: ${otp}`);
+
     return;
   }
+
   throw new Error("Email delivery is not configured (NOITE_EMAIL_WEBHOOK_URL)");
 };
 
@@ -194,6 +211,7 @@ const rpHostname = (baseURL: string): string => {
 const publicAuthRpm = (): number => {
   const raw = resolveEnv().NOITE_AUTH_RATE_LIMIT;
   const parsed = Number(raw);
+
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 600;
 };
 
@@ -235,6 +253,7 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
           if (type !== "sign-in") {
             return;
           }
+
           await sendSignInOTP(email, otp, env);
         },
       }),
@@ -261,13 +280,17 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
             // or right after an emailed-code recovery) provisions nothing:
             // there is no registration context and no user to create.
             const session = await getSessionFromCtx(ctx);
+
             if (session?.user?.id) {
               return { userId: session.user.id };
             }
+
             const parsed = requireRegistration(context);
+
             const existing = await ctx.context.internalAdapter.findUserByEmail(
               parsed.email
             );
+
             if (existing?.user) {
               throw APIError.from("BAD_REQUEST", {
                 code: "USER_ALREADY_EXISTS",
@@ -275,11 +298,14 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
                   "An account with this email already exists. Sign in instead.",
               });
             }
+
             // Invite-only: the first account bootstraps the instance (it owns
             // it, so it also becomes the admin), every later one needs a code.
             const policy = await signupPolicy();
+
             if (!policy.firstRun) {
               const problem = await checkInvite(parsed.invite);
+
               if (problem) {
                 throw APIError.from("FORBIDDEN", {
                   code: "INVITE_REQUIRED",
@@ -287,6 +313,7 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
                 });
               }
             }
+
             const user = await ctx.context.internalAdapter.createUser(
               {
                 email: parsed.email,
@@ -295,8 +322,10 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
               },
               { method: "passkey" }
             );
+
             if (!policy.firstRun && parsed.invite) {
               const claimed = await consumeInvite(parsed.invite, user.id);
+
               if (!claimed) {
                 // Lost the race for this code: drop the half-created account
                 // instead of leaving one that no invite covers. Best effort —
@@ -306,12 +335,14 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
                 } catch {
                   // Nothing to do: the account is unusable without a passkey.
                 }
+
                 throw APIError.from("FORBIDDEN", {
                   code: "INVITE_REQUIRED",
                   message: inviteProblemMessage("used"),
                 });
               }
             }
+
             if (policy.firstRun) {
               // The bootstrap account owns the instance; the role persists even
               // when NOITE_ADMIN_EMAIL is unset.
@@ -319,13 +350,16 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
                 role: "admin",
               });
             }
+
             // Every account can invite its own share.
             await mintInvites(user.id, INVITES_PER_USER);
+
             return { userId: user.id };
           },
           requireSession: false,
           resolveUser: ({ context }) => {
             const parsed = requireRegistration(context);
+
             return {
               displayName: parsed.name,
               id: crypto.randomUUID(),
@@ -370,6 +404,7 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
  * or null when the credentials may serve. */
 const defaultSecretRefusal = (env: KitEnv, baseURL: string): string | null => {
   let local = false;
+
   try {
     const host = new URL(baseURL).hostname.toLowerCase();
     local =
@@ -383,13 +418,17 @@ const defaultSecretRefusal = (env: KitEnv, baseURL: string): string | null => {
   } catch {
     local = false;
   }
+
   if (local) {
     return null;
   }
+
   const secret = env.BETTER_AUTH_SECRET ?? "";
+
   if (!secret || secret.startsWith("dev-")) {
     return `noite: refusing default BETTER_AUTH_SECRET on ${baseURL}`;
   }
+
   return null;
 };
 
@@ -410,11 +449,14 @@ export const authFromEnv = (env: KitEnv, origin: string) => {
       message: "noite: BETTER_AUTH_SECRET is missing",
     });
   }
+
   const baseURL = env.BETTER_AUTH_URL ?? origin;
   const refusal = defaultSecretRefusal(env, baseURL);
+
   if (refusal) {
     throw new MissingAuthSecretError({ message: refusal });
   }
+
   return createAuth(authEnv(env), baseURL);
 };
 
@@ -431,9 +473,12 @@ export interface SessionUser {
  * lowercased). One definition for the access gate and the admin panel. */
 export const resolveAdminEmail = (): string | null => {
   const raw = resolveEnv().NOITE_ADMIN_EMAIL;
+
   if (raw === undefined) {
     return null;
   }
+
   const email = raw.trim().toLowerCase();
+
   return email || null;
 };

@@ -17,9 +17,12 @@ export default defineMiddleware(async (c, next) => {
   stampRunnerEnv(c.env as KitEnv);
   // SAFETY: DB is the D1 binding declared in void.config.ts; the middleware only stamps it when the platform injected a real binding.
   const d1 = c.env.DB as D1Database | undefined;
+
   if (d1) {
     setD1Binding(d1);
   }
+
   await ensureDbPromise();
+
   return next();
 });

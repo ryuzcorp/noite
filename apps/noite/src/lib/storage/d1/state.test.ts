@@ -22,6 +22,7 @@ describe("filters", () => {
       { column: "note", op: "like" as const, value: "%50%+" },
       { column: "deletedAt", op: "is_null" as const, value: "" },
     ];
+
     expect(decodeFilters(encodeFilters(filters))).toEqual(filters);
   });
 
@@ -38,6 +39,7 @@ describe("filters", () => {
       op: "eq" as const,
       value: String(i),
     }));
+
     expect(decodeFilters(encodeFilters(many))).toHaveLength(maxFilters);
   });
 });

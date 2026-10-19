@@ -17,10 +17,12 @@ interface TestEnv {
 }
 
 const seen: string[] = [];
+
 const ENV: TestEnv = {
   ASSETS: {
     fetch: (request: Request) => {
       seen.push(new URL(request.url).pathname);
+
       return Promise.resolve(new Response("asset", { status: 200 }));
     },
   },
@@ -33,6 +35,7 @@ const gate = async (
   env: TestEnv = ENV
 ): Promise<{ nextCalls: number; response: Response | undefined }> => {
   let nextCalls = 0;
+
   const raw = await podHost(
     testRouteContext(
       new Request(`http://${host}${path}`, { headers: { host }, method }),
@@ -41,19 +44,23 @@ const gate = async (
     ),
     () => {
       nextCalls += 1;
+
       return Promise.resolve();
     }
   );
+
   return { nextCalls, response: raw ?? undefined };
 };
 
 describe("pod-host middleware", () => {
   test("answers every pod path on the Preview host", async () => {
     seen.length = 0;
+
     const paths = [
       ...CONTROL_HOST_DENIED_ASSETS,
       `${PREVIEW_ASSET_PREFIX}bundle-CKoOeS2C.js`,
     ];
+
     for (const path of paths) {
       // oxlint-disable-next-line eslint/no-await-in-loop -- sequential: each path is asserted before the next
       const { nextCalls, response } = await gate(PREVIEW_HOST, path);
@@ -61,6 +68,7 @@ describe("pod-host middleware", () => {
         `${path} -> 200/0`
       );
     }
+
     // Every path but the pod host document: that one is the app's own
     // response, so the static assets are never asked for it.
     expect(seen).toEqual(paths.filter((path) => path !== POD_HOST_HTML_PATH));
@@ -83,6 +91,7 @@ describe("pod-host middleware", () => {
       "localhost:9080",
       "/assets/index-CKoOeS2C.js"
     );
+
     expect(response).toBeUndefined();
     expect(nextCalls).toBe(1);
   });
@@ -93,6 +102,7 @@ describe("pod-host middleware", () => {
       POD_HOST_HTML_PATH,
       "POST"
     );
+
     expect(response).toBeUndefined();
     expect(nextCalls).toBe(1);
   });

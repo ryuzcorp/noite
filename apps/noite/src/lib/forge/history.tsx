@@ -30,6 +30,7 @@ export const HistoryView = ({
   // One page only: both directions are already disabled, so the pager is
   // noise. Hide it rather than show two dead buttons.
   const singlePage = current === 0 && data?.nextSkip === null;
+
   return (
     <div class="flex flex-col gap-3">
       <LoadError error={error} label="Failed to load history" />
@@ -61,6 +62,7 @@ export const HistoryView = ({
                 disabled={data.nextSkip === null}
                 onclick={() => {
                   const next = data.nextSkip;
+
                   if (next !== null) {
                     skip.set(next);
                   }

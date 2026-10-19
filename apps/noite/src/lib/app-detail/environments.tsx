@@ -50,13 +50,17 @@ const trackedRef = (gitRef: string): string => {
       return gitRef.slice(prefix.length);
     }
   }
+
   const preview = "refs/previews/";
+
   if (gitRef.startsWith(preview)) {
     // Only the user segment goes: a branch name may hold slashes of its own.
     const rest = gitRef.slice(preview.length);
     const slash = rest.indexOf("/");
+
     return slash === -1 ? rest : rest.slice(slash + 1);
   }
+
   return gitRef;
 };
 
@@ -126,6 +130,7 @@ const EnvironmentVars = ({
   const name = atom("");
   const value = atom("");
   const canWrite = myRole === "push" || myRole === "admin";
+
   const reload = async () => {
     try {
       await res.refetch();
@@ -134,15 +139,20 @@ const EnvironmentVars = ({
       err.set(errorMessage(error));
     }
   };
+
   const submit = () => {
     if (busy()) {
       return;
     }
+
     const raw = name().trim();
+
     if (!raw) {
       err.set("Name is required");
+
       return;
     }
+
     busy.set(true);
     err.set("");
     void (async () => {
@@ -160,18 +170,23 @@ const EnvironmentVars = ({
       } catch (error) {
         err.set(errorMessage(error));
       }
+
       busy.set(false);
     })();
   };
+
   const remove = async (row: EnvironmentVarView) => {
     const ok = await confirmDialog({
       confirmLabel: "Delete",
       title: `Delete ${row.name}?`,
     });
+
     if (!ok) {
       return;
     }
+
     busy.set(true);
+
     try {
       await api<{ ok: true }>("/api/environments/deleteEnvironmentVar", {
         appId,
@@ -182,8 +197,10 @@ const EnvironmentVars = ({
     } catch (error) {
       err.set(errorMessage(error));
     }
+
     busy.set(false);
   };
+
   return (
     <div class="flex flex-col gap-2">
       <div class="flex items-center justify-between gap-2">
@@ -348,11 +365,13 @@ export const EnvironmentGroup = ({
   // The label usually is the branch; say what it tracks only when it is not
   // (a workspace preview, or a branch name the label had to sanitize).
   let tracks: string | null = null;
+
   if (env.kind === "workspace") {
     tracks = `Preview of ${branch}`;
   } else if (branch !== env.label) {
     tracks = branch;
   }
+
   // Scroll the group into view the first time it expands — a deep link lands
   // on it, and a manual expand reveals it. `whenLive` waits out the first ref.
   const box = atom.lazy(newLiveRef<HTMLElement>)();
@@ -361,12 +380,14 @@ export const EnvironmentGroup = ({
     if (!isOpen || scrolled.done) {
       return;
     }
+
     scrolled.done = true;
     void (async () => {
       const el = await whenLive(box, signal);
       el?.scrollIntoView({ block: "start" });
     })();
   });
+
   return (
     <section
       class="flex w-full flex-col gap-2"
@@ -432,6 +453,7 @@ export const EnvironmentGroup = ({
                       } catch (error) {
                         err.set(errorMessage(error));
                       }
+
                       busy.set(false);
                     })();
                   }}
@@ -462,6 +484,7 @@ export const EnvironmentGroup = ({
                     } catch (error) {
                       err.set(errorMessage(error));
                     }
+
                     busy.set(false);
                   })();
                 }}
@@ -493,10 +516,13 @@ export const EnvironmentGroup = ({
                     confirmLabel: "Delete",
                     title: `Delete ${env.label}?`,
                   });
+
                   if (!ok) {
                     return;
                   }
+
                   busy.set(true);
+
                   try {
                     await api<{ ok: true }>(
                       "/api/environments/deleteEnvironment",
@@ -506,6 +532,7 @@ export const EnvironmentGroup = ({
                   } catch (error) {
                     err.set(errorMessage(error));
                   }
+
                   busy.set(false);
                 }}
               >
@@ -542,6 +569,7 @@ export const CreateEnvironmentDialog = ({
   const branch = atom("");
   const busy = atom(false);
   const err = atom("");
+
   // Only branches that can get one: the default branch is the app itself, and
   // a branch already tracked by an environment has it (the runner refuses
   // both, so offering them only produces an error).
@@ -553,15 +581,19 @@ export const CreateEnvironmentDialog = ({
           env.kind === "branch" && env.gitRef === `refs/heads/${one.name}`
       )
   );
+
   const picked = (): string =>
     branches.some((one) => one.name === branch())
       ? branch()
       : (branches[0]?.name ?? "");
+
   const submit = () => {
     const target = picked();
+
     if (!target || busy()) {
       return;
     }
+
     busy.set(true);
     err.set("");
     void (async () => {
@@ -570,17 +602,21 @@ export const CreateEnvironmentDialog = ({
           "/api/environments/createEnvironment",
           { appId, branch: target }
         );
+
         invalidate(keys.environments(appId));
         open.set(false);
+
         if (env) {
           onCreated?.(env);
         }
       } catch (error) {
         err.set(errorMessage(error));
       }
+
       busy.set(false);
     })();
   };
+
   return (
     <Dialog open={open} class="modal">
       <div class="modal-box bg-base-100 dark:bg-base-200">

@@ -27,6 +27,7 @@ export const Avatar = ({
   tone?: string;
 }) => {
   const sizeClasses = SIZES[size];
+
   return (
     <div class={`avatar avatar-placeholder ${extra ?? ""}`.trim()}>
       <div

@@ -22,11 +22,13 @@ const tenant = (port: number): string => `http://localhost:${port}`;
 
 const e2eApp = async (request: APIRequestContext): Promise<string> => {
   const appId = await findAppId(request, E2E_SLUG);
+
   if (appId === null) {
     throw new Error(
       `app ${E2E_SLUG} is missing — deploy.spec.ts must run (and pass) first`
     );
   }
+
   return appId;
 };
 
@@ -127,6 +129,7 @@ test("uploading and deleting round-trips through the Worker", async ({
   const roundTrip = await request.get(
     `${tenant(port)}/files/${encodeURIComponent("my docs/note.txt")}`
   );
+
   expect(roundTrip.ok()).toBe(true);
   expect(await roundTrip.text()).toBe("noite e2e note\n");
   expect(roundTrip.headers()["content-type"]).toContain("text/plain");
@@ -141,6 +144,7 @@ test("uploading and deleting round-trips through the Worker", async ({
   const gone = await request.get(
     `${tenant(port)}/files/${encodeURIComponent("my docs/note.txt")}`
   );
+
   expect(gone.status()).toBe(404);
 
   // Single delete from the detail panel (test.txt was written by the first
@@ -185,13 +189,16 @@ test("the Durable Object view reads the instance's stored state", async ({
   const row = page
     .getByRole("row", { name: new RegExp(`n=${n}`, "u") })
     .first();
+
   await expect(row).toBeVisible();
   await row.click();
 
   const panel = details(page);
+
   const valueRow = panel
     .getByRole("row")
     .filter({ has: page.getByRole("cell", { exact: true, name: "n" }) });
+
   await expect(valueRow).toBeVisible();
   await expect(valueRow).toContainText(String(n));
   await expect(panel).toContainText("Read-only. celld keeps an instance's");

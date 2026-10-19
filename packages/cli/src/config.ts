@@ -18,12 +18,15 @@ export const resolveSlug = (flag: string, repo: string | null): string => {
   const direct = sanitizeSlug(
     flag === "" ? (process.env.NOITE_SLUG ?? "") : flag
   );
+
   if (direct !== "") {
     return direct;
   }
+
   if (repo === null) {
     return "";
   }
+
   return sanitizeSlug(repo.split("/")[1] ?? "");
 };
 
@@ -43,20 +46,25 @@ export interface Connection {
  * is not a URL. */
 const derivedAppUrl = (gitBase: string): string | null => {
   let url: URL;
+
   try {
     url = new URL(gitBase);
   } catch {
     return null;
   }
+
   const base = url.hostname.startsWith("git.")
     ? url.hostname.slice("git.".length)
     : url.hostname;
+
   const local =
     base === "localhost" ||
     base.endsWith(".localhost") ||
     base === "127.0.0.1" ||
     base === "[::1]";
+
   const port = url.port === "" ? "" : `:${url.port}`;
+
   return `${url.protocol}//${local ? base : `app.${base}`}${port}`;
 };
 
@@ -75,20 +83,24 @@ export const connection = (
 ): Effect.Effect<Connection, string, never> =>
   Effect.gen(function* run() {
     const slug = resolveSlug(flags.slug, repo);
+
     if (slug === "") {
       return yield* Effect.fail(
         "slug required: --slug, NOITE_SLUG, or GITHUB_REPOSITORY"
       );
     }
+
     const token =
       flags.token === ""
         ? (process.env.NOITE_API_KEY ?? process.env.NOITE_GIT_TOKEN ?? "")
         : flags.token;
+
     if (token === "") {
       return yield* Effect.fail(
         "API key required: --token, NOITE_API_KEY or NOITE_GIT_TOKEN (Account → API keys)"
       );
     }
+
     const gitBase = (
       flags.url === ""
         ? (process.env.GIT_PUBLIC_BASE ??
@@ -96,10 +108,13 @@ export const connection = (
           "http://git.noite.localhost:9080")
         : flags.url
     ).replace(/\/+$/u, "");
+
     const named = (flags.appUrl ?? "") || (process.env.NOITE_APP_URL ?? "");
     const appUrl = named === "" ? derivedAppUrl(gitBase) : named;
+
     if (appUrl === null) {
       return yield* Effect.fail(`git base URL is malformed: ${gitBase}`);
     }
+
     return { appUrl: appUrl.replace(/\/+$/u, ""), gitBase, slug, token };
   });

@@ -6,6 +6,7 @@
 import type { Crumb } from "../shared";
 
 export const R2_VIEWS = ["list", "columns"] as const;
+
 export type R2View = (typeof R2_VIEWS)[number];
 
 export const R2_VIEW_LABELS: Record<R2View, string> = {
@@ -30,6 +31,7 @@ export const r2Crumbs = (
   // A folder prefix always ends in `/`, so its parts are everything before
   // that last slash (an empty segment stays visible as "(empty)").
   const parts = prefix === "" ? [] : prefix.split("/").slice(0, -1);
+
   const crumbs: Crumb[] = [
     { href: `/apps/${appId}`, label: appName || "App" },
     { label: "Buckets" },
@@ -38,6 +40,7 @@ export const r2Crumbs = (
       label: bucket,
     },
   ];
+
   for (const [index, part] of parts.entries()) {
     crumbs.push({
       href:
@@ -47,6 +50,7 @@ export const r2Crumbs = (
       label: part === "" ? "(empty)" : part,
     });
   }
+
   return crumbs;
 };
 
@@ -57,10 +61,12 @@ export const toggledKey = (
   on: boolean
 ): Set<string> => {
   const next = new Set(selection);
+
   if (on) {
     next.add(key);
   } else {
     next.delete(key);
   }
+
   return next;
 };

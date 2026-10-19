@@ -31,16 +31,19 @@ import { apiAction } from "./api";
 import { requireViewApp, sessionUser } from "./session.server";
 
 const AppIdArgs = Schema.Struct({ appId: Schema.String });
+
 const PrListArgs = Schema.Struct({
   appId: Schema.String,
   limit: Schema.optional(Schema.Number),
   skip: Schema.optional(Schema.Number),
   state: Schema.optional(Schema.String),
 });
+
 const PrGetArgs = Schema.Struct({
   appId: Schema.String,
   number: Schema.Number,
 });
+
 const PrCreateArgs = Schema.Struct({
   appId: Schema.String,
   base: Schema.String,
@@ -48,6 +51,7 @@ const PrCreateArgs = Schema.Struct({
   head: Schema.String,
   title: Schema.String,
 });
+
 const PrUpdateArgs = Schema.Struct({
   appId: Schema.String,
   body: Schema.optional(Schema.String),
@@ -55,6 +59,7 @@ const PrUpdateArgs = Schema.Struct({
   state: Schema.optional(Schema.String),
   title: Schema.optional(Schema.String),
 });
+
 const PrCommentArgs = Schema.Struct({
   appId: Schema.String,
   body: Schema.String,
@@ -64,15 +69,18 @@ const PrCommentArgs = Schema.Struct({
   path: Schema.optional(Schema.String),
   side: Schema.optional(Schema.String),
 });
+
 const PrCommentEditArgs = Schema.Struct({
   appId: Schema.String,
   body: Schema.String,
   commentId: Schema.String,
 });
+
 const PrCommentDeleteArgs = Schema.Struct({
   appId: Schema.String,
   commentId: Schema.String,
 });
+
 const PrReviewArgs = Schema.Struct({
   appId: Schema.String,
   number: Schema.Number,
@@ -81,6 +89,7 @@ const PrReviewArgs = Schema.Struct({
     Schema.Literal("changes_requested"),
   ]),
 });
+
 const PrMergeArgs = Schema.Struct({
   appId: Schema.String,
   deleteBranch: Schema.optional(Schema.Boolean),
@@ -88,11 +97,13 @@ const PrMergeArgs = Schema.Struct({
   number: Schema.Number,
   title: Schema.optional(Schema.String),
 });
+
 const BranchRulesSetArgs = Schema.Struct({
   appId: Schema.String,
   requirePr: Schema.Boolean,
   requiredApprovals: Schema.Number,
 });
+
 const PrNamesArgs = Schema.Struct({
   appId: Schema.String,
   userIds: Schema.Array(Schema.String),
@@ -107,6 +118,7 @@ const userNamesQuery = (ids: string[]) =>
   Effect.gen(function* run() {
     const sql = yield* SqlClient;
     const placeholders = ids.map(() => "?").join(", ");
+
     return yield* sql.unsafe(
       `SELECT id, name FROM "user" WHERE id IN (${placeholders})`,
       ids
@@ -119,17 +131,21 @@ export const resolveUserNames = async (
   userIds: readonly string[]
 ): Promise<Record<string, string>> => {
   const ids = [...new Set(userIds.filter((id) => id !== ""))];
+
   if (ids.length === 0) {
     return {};
   }
+
   // SAFETY: the projection is exactly the id/name columns; D1 returns plain rows.
   const rows = (await withDb(userNamesQuery(ids))) as UserNameRow[];
   const names: Record<string, string> = {};
+
   for (const row of rows) {
     if (row.name !== null && row.name !== "") {
       names[row.id] = row.name;
     }
   }
+
   return names;
 };
 
@@ -138,6 +154,7 @@ export const prsUserNames = apiAction(
   PrNamesArgs,
   async ({ appId, userIds }, { env, request }) => {
     await requireViewApp(request, env, appId);
+
     return resolveUserNames(userIds);
   }
 );
@@ -149,6 +166,7 @@ export const prsViewer = apiAction(
   async ({ appId }, { env, request }) => {
     const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "view");
+
     return { id: user.id, name: user.name, role };
   }
 );
@@ -158,6 +176,7 @@ export const branchRulesGet = apiAction(
   AppIdArgs,
   async ({ appId }, { env, request }) => {
     await requireViewApp(request, env, appId);
+
     return runnerBranchRulesGet(appId);
   }
 );
@@ -168,6 +187,7 @@ export const branchRulesSet = apiAction(
   async ({ appId, requirePr, requiredApprovals }, { env, request }) => {
     const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "admin");
+
     return runnerBranchRulesSet(appId, { requirePr, requiredApprovals });
   }
 );
@@ -177,6 +197,7 @@ export const prsList = apiAction(
   PrListArgs,
   async ({ appId, limit, skip, state }, { env, request }) => {
     await requireViewApp(request, env, appId);
+
     return runnerPrsList(appId, { limit, skip, state });
   }
 );
@@ -186,6 +207,7 @@ export const prsGet = apiAction(
   PrGetArgs,
   async ({ appId, number }, { env, request }) => {
     await requireViewApp(request, env, appId);
+
     return runnerPrGet(appId, number);
   }
 );
@@ -196,6 +218,7 @@ export const prsCreate = apiAction(
   async ({ appId, base, body, head, title }, { env, request }) => {
     const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "push");
+
     return runnerPrCreate(appId, {
       actor: { name: user.name, userId: user.id },
       base,
@@ -213,6 +236,7 @@ export const prsUpdate = apiAction(
   async ({ appId, number, body, state, title }, { env, request }) => {
     const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "push");
+
     return runnerPrUpdate(appId, number, {
       actor: { name: user.name, userId: user.id },
       body,
@@ -233,6 +257,7 @@ export const prsComment = apiAction(
   ) => {
     const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "push");
+
     return runnerPrComment(appId, number, {
       actor: { name: user.name, userId: user.id },
       body,
@@ -251,6 +276,7 @@ export const prsCommentEdit = apiAction(
   async ({ appId, commentId, body }, { env, request }) => {
     const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "push");
+
     return runnerPrCommentEdit(appId, commentId, {
       actor: { name: user.name, userId: user.id },
       body,
@@ -264,6 +290,7 @@ export const prsCommentDelete = apiAction(
   async ({ appId, commentId }, { env, request }) => {
     const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "push");
+
     return runnerPrCommentDelete(appId, commentId, {
       actor: { name: user.name, userId: user.id },
       role,
@@ -277,6 +304,7 @@ export const prsReview = apiAction(
   async ({ appId, number, state }, { env, request }) => {
     const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "push");
+
     return runnerPrReview(appId, number, {
       actor: { name: user.name, userId: user.id },
       role,
@@ -295,6 +323,7 @@ export const prsMerge = apiAction(
     const { role } = await requireAppRole(appId, user.id, "push");
     const detail = await runnerPrGet(appId, number);
     const names = await resolveUserNames([detail.pullRequest.authorId]);
+
     return runnerPrMerge(appId, number, {
       actor: { name: user.name, userId: user.id },
       authorName: names[detail.pullRequest.authorId],

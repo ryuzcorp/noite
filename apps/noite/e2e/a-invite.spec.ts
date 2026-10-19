@@ -16,12 +16,14 @@ test("the signup policy flips to invite-only after the first account", async ({
 }) => {
   const res = await request.get(`${control}/api/invite/status`);
   expect(res.ok()).toBe(true);
+
   // SAFETY: the route answers exactly this shape (see handleInviteStatus).
   const policy = (await res.json()) as {
     firstRun: boolean;
     invitesPerUser: number;
     requiresInvite: boolean;
   };
+
   // The bootstrap account exists, so registration is no longer open.
   expect(policy.firstRun).toBe(false);
   expect(policy.requiresInvite).toBe(true);

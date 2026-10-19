@@ -28,6 +28,7 @@ test.afterAll(async ({ request }) => {
 // the built bundle, so serving it proves which one shipped.
 test("vite build output is what deploys", async ({ page, request }) => {
   createdApps.push(VITE_SLUG);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Vite",
     slug: VITE_SLUG,
@@ -50,6 +51,7 @@ test("vite build output is what deploys", async ({ page, request }) => {
     .poll(
       async () => {
         const res = await request.get(`${base}/api/greeting`).catch(() => null);
+
         return res?.ok() ? await res.json() : null;
       },
       { intervals: [1000], timeout: 60_000 }
@@ -64,6 +66,7 @@ test("vite build output is what deploys", async ({ page, request }) => {
   const deep = await request.get(`${base}/some/client/route`, {
     headers: { accept: "text/html", "sec-fetch-mode": "navigate" },
   });
+
   expect(deep.status()).toBe(200);
   expect(await deep.text()).toContain("Vite on Noite");
 });

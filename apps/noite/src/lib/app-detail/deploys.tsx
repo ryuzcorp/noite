@@ -25,6 +25,7 @@ import { RuntimeLogs } from "./logs";
 
 export const deployBadge = (status: string) => {
   let tone = "badge-ghost";
+
   if (status === "success") {
     tone = "badge-primary";
   } else if (status === "failed") {
@@ -32,6 +33,7 @@ export const deployBadge = (status: string) => {
   } else if (status === "building" || status === "deploying") {
     tone = "badge-warning";
   }
+
   return <span class={`badge badge-sm ${tone}`}>{status}</span>;
 };
 
@@ -42,10 +44,13 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
   const info = appDetail(appId).data();
   const redeploying = atom(false);
   const redeployError = atom("");
+
   if (!info) {
     return null;
   }
+
   const canPush = info.myRole === "push" || info.myRole === "admin";
+
   return (
     <div class="dropdown dropdown-end">
       <div tabindex={0} role="button" class="btn btn-sm btn-neutral">
@@ -97,9 +102,11 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
                 title="Re-run the pipeline at the current commit with the latest env vars and flags"
                 onclick={() => {
                   const sha = info.app.lastDeploySha;
+
                   if (!sha) {
                     return;
                   }
+
                   redeploying.set(true);
                   redeployError.set("");
                   void (async () => {
@@ -111,6 +118,7 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
                     } catch (error) {
                       redeployError.set(errorMessage(error));
                     }
+
                     redeploying.set(false);
                   })();
                 }}
@@ -143,6 +151,7 @@ const FinishedBuildLog = ({
 }) => {
   const res = deployLog(appId, deployId);
   const log = res.data()?.log;
+
   return (
     <div class="bg-base-200 rounded-lg p-3">
       <pre class="max-h-64 overflow-auto rounded font-mono text-xs whitespace-pre-wrap">
@@ -174,6 +183,7 @@ const BuildLogPane = ({
       </div>
     );
   }
+
   if (d.log) {
     return (
       <div class="bg-base-200 rounded-lg p-3">
@@ -183,6 +193,7 @@ const BuildLogPane = ({
       </div>
     );
   }
+
   return <FinishedBuildLog appId={appId} deployId={d.id} />;
 };
 
@@ -208,6 +219,7 @@ const DeployRow = ({
   const logTab = atom<"build" | "deploy">("deploy");
   const rolling = atom(false);
   const rollError = atom("");
+
   // Roll back re-runs production's pipeline at that sha, so it belongs to
   // production rows only — an environment row must never deploy its sha to
   // production (its header's Redeploy covers redeploying the environment).
@@ -216,6 +228,7 @@ const DeployRow = ({
     d.status === "success" &&
     !!d.sha &&
     d.sha !== currentSha;
+
   return (
     <>
       <li class="list-row">
@@ -248,23 +261,29 @@ const DeployRow = ({
             disabled={rolling()}
             onclick={async () => {
               const { sha } = d;
+
               if (!sha) {
                 return;
               }
+
               const ok = await confirmDialog({
                 confirmLabel: "Roll back",
                 title: `Roll back to ${sha.slice(0, 12)}?`,
               });
+
               if (!ok) {
                 return;
               }
+
               rolling.set(true);
               rollError.set("");
+
               try {
                 await api<{ ok: true }>("/api/apps/rollback", { appId, sha });
               } catch (error) {
                 rollError.set(errorMessage(error));
               }
+
               rolling.set(false);
             }}
           >
@@ -341,14 +360,19 @@ const DeployFeedList = ({
     deploysUrl(appId, environmentId),
     decodeDeploys
   );
+
   const items = (): RunnerDeploy[] => feed.latest() ?? [];
+
   const loaded = (): boolean =>
     feed.latest() !== undefined || feed.status() === "open";
+
   const retrying = (): boolean => feed.status() === "retrying";
+
   const currentSha =
     environmentId === ""
       ? (appDetail(appId).data()?.app.lastDeploySha ?? null)
       : null;
+
   // One sha can be deployed many times (redeploys, rollbacks); only the
   // newest successful deploy of the live sha is the one serving traffic.
   // The feed is newest-first. In an environment's feed the newest successful
@@ -357,14 +381,17 @@ const DeployFeedList = ({
     if (environmentId !== "") {
       return items().find((d) => d.status === "success")?.id ?? null;
     }
+
     if (currentSha === null) {
       return null;
     }
+
     return (
       items().find((d) => d.sha === currentSha && d.status === "success")?.id ??
       null
     );
   };
+
   return (
     <div class="flex w-full flex-col gap-4">
       {retrying() ? (
@@ -416,6 +443,7 @@ export const DeployList = ({
   const open = atom(false);
   const deep = searchParam("env", { default: "" });
   const canPush = myRole === "push" || myRole === "admin";
+
   return (
     <div class="flex w-full flex-col gap-4">
       <div class="flex items-center justify-between gap-2">

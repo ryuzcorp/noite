@@ -71,6 +71,7 @@ describe("withTrustedClientAddress", () => {
     const out = withTrustedClientAddress(
       req({ "x-forwarded-for": "6.6.6.6, 7.7.7.7, 203.0.113.9" })
     );
+
     expect(out.headers.get("x-forwarded-for")).toBe("203.0.113.9");
   });
 
@@ -80,6 +81,7 @@ describe("withTrustedClientAddress", () => {
       headers: { "x-forwarded-for": "6.6.6.6, 203.0.113.9" },
       method: "POST",
     });
+
     const out = withTrustedClientAddress(original);
     expect(out.method).toBe("POST");
     expect(out.url).toBe("http://localhost/api/auth/sign-in");

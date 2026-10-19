@@ -26,26 +26,32 @@ export const sourcePreviewOrigin = apiAction(
     const user = await sessionUser(request, env);
     const { app } = await requireAppRole(appId, user.id, "view");
     const url = new URL(request.url);
+
     // Behind the edge the action sees the internal http URL: the page's real
     // scheme and host ride `X-Forwarded-Proto`/`X-Forwarded-Host`, which Caddy
     // sets.
     const scheme =
       request.headers.get("x-forwarded-proto") ??
       url.protocol.replace(/:$/u, "");
+
     const pageHost = request.headers.get("x-forwarded-host") ?? url.host;
+
     const base = previewBase(
       pageHost,
       env?.BASE_DOMAIN ?? "localhost",
       env?.CONTROL_EXTRA_HOSTS
     );
+
     const port = isLocalhostDomain(base) ? url.port : "";
     const origin = previewOrigin(app.slug, base, port);
+
     // Fail closed: a localhost pod host is plain http, which browsers
     // block inside a secure page as mixed content. The action surfaces the
     // message through `fail`, and the browser shows it verbatim.
     if (scheme === "https" && origin.startsWith("http://")) {
       fail(PREVIEW_MIXED_CONTENT_MESSAGE);
     }
+
     return { previewOrigin: origin };
   }
 );

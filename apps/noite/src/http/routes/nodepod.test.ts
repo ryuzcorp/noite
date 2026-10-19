@@ -26,6 +26,7 @@ const assetsThatServe = (seen: string[]) => ({
     fetch: (request: Request) => {
       const url = new URL(request.url);
       seen.push(url.pathname);
+
       return Promise.resolve(
         new Response(`asset:${url.pathname}`, { status: 200 })
       );
@@ -43,11 +44,13 @@ const call = (host: string, path: string, env: TestEnv) =>
 describe("preview host assets", () => {
   test("serves the pod host document from the app", async () => {
     const seen: string[] = [];
+
     const response = await call(
       PREVIEW_HOST,
       POD_HOST_HTML_PATH,
       assetsThatServe(seen)
     );
+
     // The document is the app's own response, not an asset: the control UI
     // embeds it cross-origin, so it carries its own Resource-Policy and
     // isolation headers instead of the deployment's `/*` static-asset rules.
@@ -110,6 +113,7 @@ describe("preview host assets", () => {
         `${PREVIEW_ASSET_PREFIX}index-CKoOeS2C.js`,
         assetsThatServe([])
       );
+
       expect(response).toBeUndefined();
     }
   });

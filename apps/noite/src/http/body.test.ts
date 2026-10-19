@@ -15,11 +15,13 @@ describe("readBoundedText", () => {
       headers: { "content-length": "20" },
       method: "POST",
     });
+
     expect(await readBoundedText(request, 10)).toBeNull();
   });
 
   test("refuses a streamed body that lies about, or omits, its length", async () => {
     const chunk = new TextEncoder().encode("x".repeat(8));
+
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(chunk);
@@ -27,12 +29,14 @@ describe("readBoundedText", () => {
         controller.close();
       },
     });
+
     const request = new Request("http://x", {
       body,
       // @ts-expect-error -- Bun/undici need duplex for a stream body.
       duplex: "half",
       method: "POST",
     });
+
     expect(await readBoundedText(request, 10)).toBeNull();
   });
 });

@@ -133,12 +133,15 @@ export const severityFromCategory = (category: number): IntelSeverity => {
   if (category === 0) {
     return "warning";
   }
+
   if (category === 2) {
     return "hint";
   }
+
   if (category === 3) {
     return "info";
   }
+
   return "error";
 };
 
@@ -146,17 +149,21 @@ export const severityFromCategory = (category: number): IntelSeverity => {
  * TypeScript's own line map does (a lone `\r` breaks; `\r\n` is one break). */
 export const lineStarts = (text: string): number[] => {
   const starts = [0];
+
   for (let i = 0; i < text.length; i += 1) {
     const code = text.codePointAt(i);
+
     if (code === 13) {
       if (text.codePointAt(i + 1) === 10) {
         i += 1;
       }
+
       starts.push(i + 1);
     } else if (code === 10) {
       starts.push(i + 1);
     }
   }
+
   return starts;
 };
 
@@ -168,14 +175,17 @@ export const positionAtOffset = (
   const clamped = Math.max(0, offset);
   let low = 0;
   let high = starts.length - 1;
+
   while (low < high) {
     const mid = Math.ceil((low + high) / 2);
+
     if ((starts[mid] ?? 0) <= clamped) {
       low = mid;
     } else {
       high = mid - 1;
     }
   }
+
   return { character: clamped - (starts[low] ?? 0), line: low };
 };
 
@@ -188,6 +198,7 @@ export const offsetAtPosition = (
   const line = Math.min(Math.max(position.line, 0), starts.length - 1);
   const start = starts[line] ?? 0;
   const end = starts[line + 1] ?? text.length + 1;
+
   return Math.min(start + Math.max(position.character, 0), end - 1);
 };
 
@@ -199,6 +210,7 @@ export const diagnosticsToMarkers = (
   text: string
 ): Marker[] => {
   const starts = lineStarts(text);
+
   return diagnostics.map((diagnostic) => ({
     end: positionAtOffset(
       starts,
@@ -217,14 +229,20 @@ export const diagnosticsToMarkers = (
 export const diagnosticMessagesAtOffset = (
   diagnostics: readonly IntelDiagnostic[],
   offset: number
-): string[] =>
-  diagnostics
-    .filter(
-      (diagnostic) =>
-        offset >= diagnostic.start &&
-        offset < Math.max(diagnostic.end, diagnostic.start + 1)
-    )
-    .map((diagnostic) => `TS${diagnostic.code}: ${diagnostic.message}`);
+): string[] => {
+  const messages: string[] = [];
+
+  for (const diagnostic of diagnostics) {
+    if (
+      offset >= diagnostic.start &&
+      offset < Math.max(diagnostic.end, diagnostic.start + 1)
+    ) {
+      messages.push(`TS${diagnostic.code}: ${diagnostic.message}`);
+    }
+  }
+
+  return messages;
+};
 
 /** The identifier characters a completion may extend leftwards. */
 const IDENTIFIER_TAIL = /[\w$]+$/u;
@@ -241,11 +259,15 @@ export const completionRemainder = (
 ): string | null => {
   const insert =
     completion.insertText === "" ? completion.name : completion.insertText;
+
   const prefix =
     text.slice(0, Math.max(offset, 0)).match(IDENTIFIER_TAIL)?.[0] ?? "";
+
   if (!insert.startsWith(prefix)) {
     return null;
   }
+
   const remainder = insert.slice(prefix.length);
+
   return /^[\w$]+$/u.test(remainder) ? remainder : null;
 };

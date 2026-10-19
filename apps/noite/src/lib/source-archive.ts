@@ -7,12 +7,15 @@ export const fetchSourceArchive = async (
   ref: string
 ): Promise<Uint8Array> => {
   const query = new URLSearchParams({ ref });
+
   const res = await fetch(
     `/api/apps/${encodeURIComponent(appId)}/source/archive?${query}`
   );
+
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     throw new Error(`archive failed: ${res.status} ${text}`);
   }
+
   return new Uint8Array(await res.arrayBuffer());
 };

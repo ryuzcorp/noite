@@ -27,9 +27,11 @@ test.afterAll(async ({ request }) => {
  * branch. Local to this spec — the shared helper pushes a single branch. */
 const pushMainAndFeature = (apiKey: string, source: URL, slug: string) => {
   const dir = mkdtempSync(nodePath.join(tmpdir(), "noite-forge-"));
+
   try {
     cpSync(source, dir, { recursive: true });
     rmSync(nodePath.join(dir, ".git"), { force: true, recursive: true });
+
     const git = (args: string[]): string =>
       execFileSync("git", args, {
         cwd: dir,
@@ -42,6 +44,7 @@ const pushMainAndFeature = (apiKey: string, source: URL, slug: string) => {
           GIT_COMMITTER_NAME: E2E_NAME,
         },
       });
+
     git(["init", "-b", "main"]);
     git([
       "remote",
@@ -62,6 +65,7 @@ const pushMainAndFeature = (apiKey: string, source: URL, slug: string) => {
     git(["commit", "-m", "forge: feature commit"]);
     const feature = git(["rev-parse", "HEAD"]).trim();
     git(["push", "-u", "origin", "feature"]);
+
     return { feature, main };
   } finally {
     rmSync(dir, { force: true, recursive: true });
@@ -73,10 +77,12 @@ test("browse a branch, its history, a commit and a compare; create and delete a 
   request,
 }) => {
   createdApps.push(FORGE_SLUG);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Forge App",
     slug: FORGE_SLUG,
   });
+
   const { feature } = pushMainAndFeature(
     apiKey,
     new URL("../test", import.meta.url),
@@ -171,15 +177,18 @@ test("a deployment links to its commit page", async ({ page, request }) => {
   // Only main deploys; the feature branch push alongside it is ignored, so
   // the main sha is the deployment tip this test looks for.
   createdApps.push(`${FORGE_SLUG}-deploy`);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Forge Deploy",
     slug: `${FORGE_SLUG}-deploy`,
   });
+
   const { main } = pushMainAndFeature(
     apiKey,
     new URL("../test", import.meta.url),
     `${FORGE_SLUG}-deploy`
   );
+
   await page.goto(`/apps/${appId}?t=deployments`);
   const link = page.getByRole("link", { name: main.slice(0, 12) });
   await expect(link).toBeVisible({ timeout: 5 * 60_000 });

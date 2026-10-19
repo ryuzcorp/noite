@@ -22,6 +22,7 @@ const toTabId = (raw: string): TabId =>
 const Header = ({ admin }: { admin: boolean }) => {
   const user = session().data()?.user;
   const name = user?.name || user?.email || "Account";
+
   return (
     <header class="flex min-w-0 items-center gap-3">
       <Avatar class="shrink-0" label={name} size="lg" />

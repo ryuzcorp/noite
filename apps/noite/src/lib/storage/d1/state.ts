@@ -43,6 +43,7 @@ export const FILTER_OP_LABELS: Record<D1FilterOp, string> = {
 };
 
 export const VIEWS = ["data", "definition"] as const;
+
 export type D1View = (typeof VIEWS)[number];
 
 export const VIEW_LABELS: Record<D1View, string> = {
@@ -58,6 +59,7 @@ const FIELD_SEP = "~";
 
 export const encodeFilters = (filters: readonly D1Filter[]): string => {
   const parts: string[] = [];
+
   for (const filter of filters) {
     parts.push(
       [filter.column, filter.op, filter.value]
@@ -65,6 +67,7 @@ export const encodeFilters = (filters: readonly D1Filter[]): string => {
         .join(FIELD_SEP)
     );
   }
+
   return parts.join(FILTER_SEP);
 };
 
@@ -72,28 +75,36 @@ export const decodeFilters = (raw: string): D1Filter[] => {
   if (raw === "") {
     return [];
   }
+
   const filters: D1Filter[] = [];
+
   for (const part of raw.split(FILTER_SEP)) {
     const [column = "", op = "", ...rest] = part.split(FIELD_SEP);
+
     if (column === "" || !Object.hasOwn(FILTER_OP_LABELS, op)) {
       continue;
     }
+
     let name: string;
     let value: string;
+
     try {
       name = decodeURIComponent(column);
       value = decodeURIComponent(rest.join(FIELD_SEP));
     } catch {
       continue;
     }
+
     // SAFETY: the `Object.hasOwn` guard above proves `op` is a key of
     // FILTER_OP_LABELS, whose keys are exactly D1FilterOp.
     const kind = op as D1FilterOp;
     filters.push({ column: name, op: kind, value });
+
     if (filters.length >= MAX_FILTERS) {
       break;
     }
   }
+
   return filters;
 };
 
@@ -101,19 +112,24 @@ export const encodeSort = (sort: D1RowsQuery["sort"]): string => {
   if (sort === null) {
     return "";
   }
+
   return `${sort.column}:${sort.desc ? "desc" : "asc"}`;
 };
 
 /** The last `:` splits the direction, so a column name may contain one. */
 export const decodeSort = (raw: string): D1RowsQuery["sort"] => {
   const sep = raw.lastIndexOf(":");
+
   if (sep <= 0) {
     return null;
   }
+
   const dir = raw.slice(sep + 1);
+
   if (dir !== "asc" && dir !== "desc") {
     return null;
   }
+
   return { column: raw.slice(0, sep), desc: dir === "desc" };
 };
 
@@ -125,6 +141,7 @@ export const toPageSize = (raw: string): number => {
   // SAFETY: widening the readonly tuple to a number[] for `includes` is a
   // read-only view — no elements change type.
   const sizes = PAGE_SIZES as readonly number[];
+
   return sizes.includes(n) ? n : DEFAULT_PAGE_SIZE;
 };
 
@@ -140,10 +157,13 @@ export const validSort = (
   if (sort === null || schema === undefined) {
     return null;
   }
+
   const column = schema.columns.find((c) => c.name === sort.column);
+
   if (column === undefined || schema.redacted.includes(sort.column)) {
     return null;
   }
+
   return sort;
 };
 
@@ -154,6 +174,7 @@ export const validFilters = (
   if (schema === undefined) {
     return [];
   }
+
   return filters.filter(
     (filter) =>
       schema.columns.some((c) => c.name === filter.column) &&

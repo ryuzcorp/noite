@@ -145,10 +145,12 @@ const podReady = (value: unknown): PodReady | null => {
   if (typeof value !== "object" || value === null) {
     return null;
   }
+
   const fields = new Map<string, Carried>(Object.entries(value));
   const nonce = fields.get("nonce");
   const t = fields.get("t");
   const v = fields.get("v");
+
   if (
     typeof nonce !== "string" ||
     typeof t !== "string" ||
@@ -156,6 +158,7 @@ const podReady = (value: unknown): PodReady | null => {
   ) {
     return null;
   }
+
   return {
     isolated: fields.get("isolated") === true,
     nonce,
@@ -171,6 +174,7 @@ const stringField = (
   name: string
 ): string | null => {
   const value = fields.get(name);
+
   return typeof value === "string" ? value : null;
 };
 
@@ -180,9 +184,11 @@ const objectField = (
   name: string
 ): Map<string, Carried> | null => {
   const value = fields.get(name);
+
   if (typeof value !== "object" || value === null) {
     return null;
   }
+
   return new Map<string, Carried>(Object.entries(value));
 };
 
@@ -190,6 +196,7 @@ const objectField = (
 const failureField = (fields: Map<string, Carried>): string | null => {
   const error = objectField(fields, "e");
   const message = error === null ? null : error.get("message");
+
   return typeof message === "string" ? message : null;
 };
 
@@ -199,10 +206,13 @@ const portMessage = (value: unknown): PortMessage | null => {
   if (typeof value !== "object" || value === null) {
     return null;
   }
+
   const fields = new Map<string, Carried>(Object.entries(value));
   const i = fields.get("i");
+
   if (typeof i === "number") {
     const ok = fields.get("ok");
+
     if (ok === true) {
       // SAFETY: a frame's own server typed this value against the same request
       // map this page minted the id from, which is the only thing that could
@@ -214,6 +224,7 @@ const portMessage = (value: unknown): PortMessage | null => {
         value: fields.get("v") as AnsweredValue,
       };
     }
+
     if (ok === false) {
       return {
         failure: failureField(fields) ?? "the pod frame failed",
@@ -222,18 +233,23 @@ const portMessage = (value: unknown): PortMessage | null => {
         ok: false,
       };
     }
+
     // `archive` is the protocol's only ask, so an id with that kind is the
     // only one worth reading.
     const ask = stringField(fields, "ask");
     const params = objectField(fields, "p");
     const sha = params === null ? null : stringField(params, "sha");
+
     if (ask === "archive" && sha !== null) {
       return { i, kind: "ask", message: { ask, i, p: { sha } } };
     }
+
     return null;
   }
+
   const ev = stringField(fields, "ev");
   const payload = fields.get("p");
+
   if (ev !== null && typeof payload === "object" && payload !== null) {
     // SAFETY: every event the protocol defines carries an object payload, and
     // the listener for `ev` is the one that says which of them this is.
@@ -248,6 +264,7 @@ const portMessage = (value: unknown): PortMessage | null => {
         ) ?? "",
     };
   }
+
   return null;
 };
 /* oxlint-enable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof */
@@ -276,15 +293,18 @@ export const bindPodPort = (options: PodPortOptions): PodConnection => {
   const stop = (message: string): void => {
     closed = true;
     port.close();
+
     for (const call of pending.values()) {
       clearTimeout(call.timer);
       call.reject(new Error(message));
     }
+
     pending.clear();
   };
 
   const answerAsk = async (ask: PodAskMessage): Promise<void> => {
     const { i } = ask;
+
     try {
       const answer = await onAsk(ask);
       port.postMessage(
@@ -307,23 +327,31 @@ export const bindPodPort = (options: PodPortOptions): PodConnection => {
   const receive = (message: PortMessage): void => {
     if (message.kind === "ask") {
       void answerAsk(message.message);
+
       return;
     }
+
     if (message.kind === "answer") {
       const call = pending.get(message.i);
+
       if (call === undefined) {
         return;
       }
+
       pending.delete(message.i);
       clearTimeout(call.timer);
+
       if (message.ok) {
         call.resolve(message.value);
       } else {
         call.reject(new Error(message.failure));
       }
+
       return;
     }
+
     const { ev, payload, text } = message;
+
     // The unrecoverable one: the frame's pod is gone, so every request in
     // flight fails with the same words, the page says why, and the frame's
     // document goes.
@@ -332,8 +360,10 @@ export const bindPodPort = (options: PodPortOptions): PodConnection => {
       onFatal?.(reason);
       stop(reason);
       dispose();
+
       return;
     }
+
     for (const listener of listeners.get(ev) ?? []) {
       listener(payload);
     }
@@ -341,6 +371,7 @@ export const bindPodPort = (options: PodPortOptions): PodConnection => {
 
   port.addEventListener("message", (event: MessageEvent) => {
     const message = portMessage(event.data);
+
     if (message !== null) {
       receive(message);
     }
@@ -358,13 +389,17 @@ export const bindPodPort = (options: PodPortOptions): PodConnection => {
     callOptions?: CallOptions
   ): Promise<PodRequestMap[K]["r"]> => {
     const answeredCall = Promise.withResolvers<PodRequestMap[K]["r"]>();
+
     if (closed) {
       answeredCall.reject(new Error("the pod frame is closed"));
+
       return answeredCall.promise;
     }
+
     const id = nextId;
     nextId += 1;
     const timeout = callOptions?.timeout ?? REQUEST_TIMEOUT_MS;
+
     const timer =
       timeout === 0
         ? undefined
@@ -376,6 +411,7 @@ export const bindPodPort = (options: PodPortOptions): PodConnection => {
               )
             );
           }, timeout);
+
     pending.set(id, {
       reject: answeredCall.reject,
       resolve: (value) => {
@@ -386,6 +422,7 @@ export const bindPodPort = (options: PodPortOptions): PodConnection => {
       timer,
     });
     port.postMessage({ i: id, k: kind, p: params });
+
     return answeredCall.promise;
   };
 
@@ -398,13 +435,16 @@ export const bindPodPort = (options: PodPortOptions): PodConnection => {
   ): (() => void) => {
     const name = String(kind);
     const attached = listeners.get(name) ?? new Set<DispatchListener>();
+
     const stored: DispatchListener = (payload) => {
       // SAFETY: this listener was registered for `name`, and `receive` routes
       // a payload by its own `ev` alone, so the payload is `listener`'s kind.
       listener(payload as PodEventMap[K]);
     };
+
     attached.add(stored);
     listeners.set(name, attached);
+
     return () => {
       attached.delete(stored);
     };
@@ -415,6 +455,7 @@ export const bindPodPort = (options: PodPortOptions): PodConnection => {
     close: () => {
       stop("the pod frame was closed");
       dispose();
+
       return Promise.resolve();
     },
     on: onEvent,
@@ -429,9 +470,11 @@ export const openPodFrame = async (
   options: PodFrameOptions
 ): Promise<PodConnection> => {
   const { appId, branch, onAsk, onFatal, previewOrigin } = options;
+
   if (previewOrigin === "") {
     throw new Error(NO_POD_HOST_MESSAGE);
   }
+
   const nonce = crypto.randomUUID();
   const frame = document.createElement("iframe");
   // Hidden, not sandboxed: a sandboxed frame has an opaque origin, and this
@@ -443,25 +486,30 @@ export const openPodFrame = async (
   frame.setAttribute("aria-hidden", "true");
   frame.setAttribute("allow", "cross-origin-isolated");
   frame.title = "Workspace";
+
   const query = new URLSearchParams({
     appId,
     branch,
     nonce,
     parentOrigin: window.location.origin,
   });
+
   const frameUrl = `${previewOrigin}${POD_HOST_HTML_PATH}?${query}`;
   frame.src = frameUrl;
   const answered = Promise.withResolvers<PodReady>();
   const frameWindow = (): Window | null => frame.contentWindow;
+
   const say = (
     message: PodConnect | PodHello,
     transfer: Transferable[] = []
   ): void => {
     frameWindow()?.postMessage(message, previewOrigin, transfer);
   };
+
   const hello = (): void => {
     say({ nonce, t: "hello", v: POD_PROTOCOL_VERSION });
   };
+
   const onWindowMessage = (event: MessageEvent): void => {
     // Both the origin and the source window are checked: another document on
     // the pod host origin may post to the frame, but only the frame's own
@@ -469,7 +517,9 @@ export const openPodFrame = async (
     if (event.origin !== previewOrigin || event.source !== frameWindow()) {
       return;
     }
+
     const reply = podReady(event.data);
+
     if (
       reply === null ||
       reply.v !== POD_PROTOCOL_VERSION ||
@@ -477,10 +527,13 @@ export const openPodFrame = async (
     ) {
       return;
     }
+
     answered.resolve(reply);
   };
+
   window.addEventListener("message", onWindowMessage);
   let retry: TimerHandle | undefined;
+
   const onFrameLoad = (): void => {
     // The first `hello` that can land: until the frame's document commits, its
     // window is still the initial `about:blank`, which inherits *this* page's
@@ -493,8 +546,10 @@ export const openPodFrame = async (
       frame.src = frameUrl;
     }, HANDSHAKE_RETRY_MS);
   };
+
   frame.addEventListener("load", onFrameLoad);
   document.body.append(frame);
+
   const deadline = setTimeout(() => {
     answered.reject(
       new Error(
@@ -502,7 +557,9 @@ export const openPodFrame = async (
       )
     );
   }, HANDSHAKE_TIMEOUT_MS);
+
   let replied: PodReady;
+
   try {
     replied = await answered.promise;
   } catch (error) {
@@ -514,6 +571,7 @@ export const openPodFrame = async (
     clearTimeout(deadline);
     frame.removeEventListener("load", onFrameLoad);
   }
+
   // Fail closed: without a cross-origin-isolated agent cluster on the frame's
   // origin its workers get no `SharedArrayBuffer`, which would cost the pod
   // `execSync`, its shared filesystem and the threaded WASM toolchains. A pod
@@ -526,10 +584,12 @@ export const openPodFrame = async (
       `Pod host ${previewOrigin} is not cross-origin isolated, so the workspace cannot run with SharedArrayBuffer`
     );
   }
+
   const channel = new MessageChannel();
   say({ nonce, port: channel.port2, t: "connect", v: POD_PROTOCOL_VERSION }, [
     channel.port2,
   ]);
+
   return bindPodPort({
     dispose: () => {
       window.removeEventListener("message", onWindowMessage);

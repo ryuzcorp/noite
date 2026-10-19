@@ -37,15 +37,19 @@ const SEGMENT_RE = /^[A-Za-z0-9_.-]{1,100}$/u;
  * query or fragment. */
 const githubHttpsUrl = (raw: string): URL | null => {
   const value = raw.trim();
+
   if (!value) {
     return null;
   }
+
   let url: URL;
+
   try {
     url = new URL(value);
   } catch {
     return null;
   }
+
   const plain =
     url.protocol === "https:" &&
     url.hostname.toLowerCase() === "github.com" &&
@@ -54,6 +58,7 @@ const githubHttpsUrl = (raw: string): URL | null => {
     url.hash === "" &&
     url.username === "" &&
     url.password === "";
+
   return plain ? url : null;
 };
 
@@ -66,16 +71,21 @@ const githubHttpsUrl = (raw: string): URL | null => {
  * correct that. */
 export const parseGitHubRepo = (raw: string): GitHubRepo | null => {
   const url = githubHttpsUrl(raw);
+
   if (!url) {
     return null;
   }
+
   const parts = url.pathname.split("/").filter((part) => part.length > 0);
   const folderLink = parts.length >= 4 && parts[2] === "tree";
+
   if (parts.length !== 2 && !folderLink) {
     return null;
   }
+
   const [owner = "", rawRepo = ""] = parts;
   const repo = rawRepo.replace(/\.git$/u, "");
+
   if (
     !(SEGMENT_RE.test(owner) && SEGMENT_RE.test(repo)) ||
     owner.startsWith("-") ||
@@ -83,15 +93,18 @@ export const parseGitHubRepo = (raw: string): GitHubRepo | null => {
   ) {
     return null;
   }
+
   const parsed: GitHubRepo = {
     name: repo,
     owner,
     repo,
     slug: slugifyName(repo),
   };
+
   if (folderLink) {
     const [ref, ...folders] = parts.slice(3);
     parsed.ref = ref;
+
     if (folders.length > 0) {
       const folder = folders.at(-1) ?? repo;
       parsed.path = folders.join("/");
@@ -99,5 +112,6 @@ export const parseGitHubRepo = (raw: string): GitHubRepo | null => {
       parsed.slug = slugifyName(folder);
     }
   }
+
   return parsed;
 };

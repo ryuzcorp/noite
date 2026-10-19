@@ -33,14 +33,17 @@ export const StorageDetail = ({
         />
       );
     }
+
     return <p class="m-0 text-sm opacity-70">Unknown storage resource.</p>;
   }
+
   const detail = appDetail(appId);
   const appName = detail.data()?.app.name ?? "";
   // Writes (upload, New folder, delete) need the push role; a viewer still
   // browses, previews and downloads.
   const myRole = parseAppRole(detail.data()?.myRole ?? "") ?? "view";
   const canWrite = roleAtLeast(myRole, "push");
+
   if (resourceId.startsWith("r2:")) {
     return (
       <R2Browser
@@ -51,6 +54,7 @@ export const StorageDetail = ({
       />
     );
   }
+
   if (resourceId.startsWith("d1:")) {
     return (
       <D1Editor
@@ -60,10 +64,12 @@ export const StorageDetail = ({
       />
     );
   }
+
   // DO resource ids are "do:{Binding}:{Name}" — the class is everything
   // after the binding, and either part may itself contain a colon.
   const className = resourceId.startsWith("do:")
     ? resourceId.split(":").slice(2).join(":")
     : resourceId;
+
   return <DoBrowser appId={appId} appName={appName} className={className} />;
 };

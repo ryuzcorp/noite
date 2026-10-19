@@ -17,6 +17,7 @@ const FIELD = "input input-sm w-56";
 const PRIMARY = "btn btn-sm";
 export const ACTION = "btn btn-sm btn-ghost";
 export const DANGER = `${ACTION} text-error`;
+
 /** Row actions are right-aligned and fixed-width, so a label that flips
  * (Stop/Start, Ban/Unban, Make/Remove admin) or a button that is absent
  * (Revoke on a used code) never shifts its neighbours. */
@@ -102,6 +103,7 @@ export const SearchForm = ({
   value: string;
 }) => {
   const draft = atom(value);
+
   return (
     <form
       class="flex items-center gap-2"

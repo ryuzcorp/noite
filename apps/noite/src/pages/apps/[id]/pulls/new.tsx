@@ -10,9 +10,11 @@ export default function NewPrPage() {
   const base = searchParam("base", { default: "main" });
   const headRef = searchParam("head", { default: "" });
   const title = searchParam("title", { default: "" });
+
   if (!appId) {
     return <p class="text-error m-0 p-4 text-sm">Missing app id.</p>;
   }
+
   return (
     <PullsPage appId={appId} back>
       <h1 class="m-0 text-xl font-semibold">New pull request</h1>

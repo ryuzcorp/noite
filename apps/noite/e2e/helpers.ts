@@ -23,9 +23,11 @@ const tenantBase = (port: number): string => `http://localhost:${port}`;
 
 const runnerToken = (): string => {
   const token = process.env.E2E_RUNNER_TOKEN ?? "";
+
   if (!token) {
     throw new Error("E2E_RUNNER_TOKEN is not set");
   }
+
   return token;
 };
 
@@ -59,6 +61,7 @@ export const addVirtualAuthenticator = async (page: Page): Promise<void> => {
     },
   });
 };
+
 /** Authenticated runner call (raw-port lane: direct on :8080). The runner is
  * the platform's API, so feature checks that do not need a browser belong
  * here. */
@@ -75,16 +78,19 @@ export const runnerCall = async (
     headers: { authorization: `Bearer ${runnerToken()}` },
     method: init.method ?? "GET",
   });
+
   // Success bodies are JSON, error bodies (and 204) are plain text: read the
   // text and parse what parses, so a caller asserting on an error message
   // reads the runner's words instead of a swallowed `null`.
   const text = await res.text();
   let parsed: unknown = text;
+
   try {
     parsed = JSON.parse(text);
   } catch {
     // Plain-text body: keep it as-is.
   }
+
   // SAFETY: the runner answers `{ body }`-less JSON on success and plain text
   // on 204/error; either value fits the union this helper advertises.
   return {
@@ -107,9 +113,11 @@ export const runnerApi = async <T>(
   const res = await request.get(`${apiBase}${path}`, {
     headers: { authorization: `Bearer ${runnerToken()}` },
   });
+
   if (!res.ok) {
     throw new Error(`runner ${path}: ${res.status()} ${await res.text()}`);
   }
+
   // SAFETY: the runner returns raw JSON objects matching the caller's shape (runnerFetch contract — never a { body } envelope).
   return (await res.json()) as T;
 };
@@ -122,11 +130,13 @@ export const waitForCreatedApp = async (page: Page): Promise<void> => {
     { timeout: 30_000 }
   );
 };
+
 export const findAppId = async (
   request: APIRequestContext,
   slug: string
 ): Promise<string | null> => {
   const apps = await runnerApi<RunnerApp[]>(request, "/v1/apps");
+
   return apps.find((app) => app.slug === slug)?.id ?? null;
 };
 
@@ -138,9 +148,11 @@ export const deleteApp = async (
   slug: string
 ): Promise<void> => {
   const appId = await findAppId(request, slug);
+
   if (appId === null) {
     return;
   }
+
   await runnerCall(request, `/v1/apps/${appId}`, { method: "DELETE" });
 };
 
@@ -151,9 +163,11 @@ export const appListenPort = async (
 ): Promise<number> => {
   const app = await runnerApi<RunnerApp>(request, `/v1/apps/${appId}`);
   const { listenPort } = app;
+
   if (listenPort === null || listenPort === undefined) {
     throw new TypeError(`app ${appId} has no listen port yet`);
   }
+
   return listenPort;
 };
 
@@ -172,13 +186,16 @@ export const waitForDeploy = async (
   sha?: string
 ): Promise<RunnerDeploy> => {
   const start = Date.now();
+
   for (;;) {
     // oxlint-disable-next-line eslint/no-await-in-loop -- sequential deploy poll with early exit; Promise.all would defeat it
     const deploys = await runnerApi<RunnerDeploy[]>(
       request,
       `/v1/apps/${appId}/deploys`
     );
+
     const [latest] = deploys;
+
     if (
       latest &&
       (latest.status === "success" || latest.status === "failed") &&
@@ -186,13 +203,16 @@ export const waitForDeploy = async (
     ) {
       return latest;
     }
+
     if (Date.now() - start > timeoutMs) {
       throw new Error(`deploy for ${appId} did not finish in ${timeoutMs}ms`);
     }
+
     // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll backoff
     await sleep(DEPLOY_POLL_MS);
   }
 };
+
 /** Mint an API key on the signed-in account's Account page. The raw key is
  * shown exactly once, so it is read from that one screen. */
 export const mintApiKey = async (
@@ -210,9 +230,11 @@ export const mintApiKey = async (
   await page.locator("text=Copy now — shown once").waitFor({ timeout: 30_000 });
   const raw = await page.locator("code.break-all").first().textContent();
   const apiKey = raw?.trim() ?? "";
+
   if (apiKey.length === 0) {
     throw new Error("no API key shown after Create key");
   }
+
   return apiKey;
 };
 
@@ -224,8 +246,10 @@ export const readInviteCode = async (page: Page): Promise<string> => {
   const invitesCard = page.locator("div.card", {
     has: page.getByRole("heading", { name: "Invitations" }),
   });
+
   await page.goto("/account");
   await expect(invitesCard).toBeVisible();
+
   if ((await invitesCard.locator("code").count()) === 0) {
     await page.goto("/apps/_control?t=invites");
     await page.locator("#invite-count").fill("1");
@@ -233,14 +257,18 @@ export const readInviteCode = async (page: Page): Promise<string> => {
     await expect(page.locator("#admin-invite-search")).toBeVisible();
     await page.goto("/account");
   }
+
   const raw = await invitesCard
     .locator("code")
     .first()
     .textContent({ timeout: 15_000 });
+
   const code = raw?.trim() ?? "";
+
   if (code === "") {
     throw new Error("no invite code on the Account page");
   }
+
   return code;
 };
 
@@ -259,6 +287,7 @@ export const registerInviteeAccount = async (
     baseURL: uiBaseURL,
     storageState: { cookies: [], origins: [] },
   });
+
   const page = await context.newPage();
   await addVirtualAuthenticator(page);
   await page.goto("/login");
@@ -279,6 +308,7 @@ export const registerInviteeAccount = async (
   await page.locator("#onboarding-finish").click();
   await page.reload();
   await expect(page.getByRole("dialog")).toBeHidden();
+
   return { context, page };
 };
 
@@ -295,10 +325,13 @@ export const createAppWithKey = async (
   await page.getByRole("button", { name: "Create app" }).click();
   await waitForCreatedApp(page);
   const appId = await findAppId(request, app.slug);
+
   if (appId === null) {
     throw new Error(`app ${app.slug} was not created`);
   }
+
   const apiKey = await mintApiKey(page, `${app.slug}-ci`);
+
   return { apiKey, appId };
 };
 
@@ -314,18 +347,21 @@ export const pushAppDir = (
   mutate?: (dir: string) => void
 ): string => {
   const dir = mkdtempSync(nodePath.join(tmpdir(), `noite-${slug}-`));
+
   try {
     cpSync(source, dir, { recursive: true });
     mutate?.(dir);
     // The sample checkout is itself a repo — drop its history so the push
     // is a fresh repo + fresh commit (new deploy), like deploy.sh re-init.
     rmSync(nodePath.join(dir, ".git"), { force: true, recursive: true });
+
     const git = (args: string[], extraEnv: Record<string, string> = {}) =>
       execFileSync("git", args, {
         cwd: dir,
         encoding: "utf-8",
         env: { ...process.env, ...extraEnv },
       });
+
     git(["init", "-b", "main"]);
     git([
       "remote",
@@ -341,6 +377,7 @@ export const pushAppDir = (
       GIT_COMMITTER_NAME: E2E_NAME,
     });
     git(["push", "-uf", "origin", "main"]);
+
     return git(["rev-parse", "HEAD"]).trim();
   } finally {
     rmSync(dir, { force: true, recursive: true });
@@ -357,9 +394,11 @@ export const readSampleApp = async (
   port: number
 ): Promise<{ n: number }> => {
   const res = await request.get(`${tenantBase(port)}/?read=1`);
+
   if (!res.ok) {
     throw new Error(`tenant ${res.status()} ${await res.text()}`);
   }
+
   // SAFETY: the sample counter answers { n } on ?read=1 (test/index.js probe).
   return (await res.json()) as { n: number };
 };

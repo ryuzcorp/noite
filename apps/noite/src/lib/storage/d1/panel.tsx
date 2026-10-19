@@ -58,9 +58,11 @@ const editorKey = (
   if (open === null) {
     return "closed";
   }
+
   if (open.row === null) {
     return "insert";
   }
+
   return `edit:${JSON.stringify(open.row)}`;
 };
 
@@ -118,12 +120,14 @@ const TableWorkspace = ({
   const editor = atom<null | { row: Record<string, D1Cell> | null }>(null);
   const schema = schemaRes.data();
   const loadError = schemaRes.error();
+
   if (!schema) {
     if (loadError) {
       return (
         <p class="text-error m-0 p-4 text-sm">{errorMessage(loadError)}</p>
       );
     }
+
     return (
       <div class="flex min-h-0 flex-1 flex-col gap-2 p-4">
         <span class="skeleton h-8 w-full" />
@@ -132,7 +136,9 @@ const TableWorkspace = ({
       </div>
     );
   }
+
   const sort = validSort(state.sort, schema);
+
   const query: D1RowsQuery = {
     filters: validFilters(state.filters, schema),
     page: state.page,
@@ -141,19 +147,25 @@ const TableWorkspace = ({
     sort,
     table,
   };
+
   const refresh = () => {
     invalidateD1(appId, databaseId);
   };
+
   const cycleSort = (column: string) => {
     if (sort === null || sort.column !== column) {
       setters.setSort({ column, desc: false });
+
       return;
     }
+
     setters.setSort(sort.desc ? null : { column, desc: true });
   };
+
   const viewSlot = <ViewSwitch onPick={setters.setView} view={state.view} />;
   const open = editor();
   const openKey = editorKey(open);
+
   return (
     <div class="flex min-h-0 flex-1 flex-col">
       {state.view === "data" ? (
@@ -228,10 +240,12 @@ export const D1Editor = ({
   const tablesRes = d1Tables(appId, databaseId);
   const tableParam = searchParam("table", { default: "" });
   const page = searchParam("page", { default: 0, parse: toPageIndex });
+
   const size = searchParam("size", {
     default: DEFAULT_PAGE_SIZE,
     parse: toPageSize,
   });
+
   const search = searchParam("q", { default: "" });
   const sortRaw = searchParam("sort", { default: "" });
   const filtersRaw = searchParam("f", { default: "" });
@@ -242,8 +256,10 @@ export const D1Editor = ({
   const tablesData = tablesRes.data();
   const loadError = tablesRes.error();
   const tables = tablesData?.tables ?? [];
+
   const current =
     tables.find((candidate) => candidate.name === tableParam()) ?? tables[0];
+
   const state: UrlState = {
     filters: decodeFilters(filtersRaw()),
     page: page(),
@@ -252,6 +268,7 @@ export const D1Editor = ({
     sort: decodeSort(sortRaw()),
     view: view(),
   };
+
   const setters: UrlSetters = {
     setFilters: (next) => {
       filtersRaw.set(encodeFilters(next));
@@ -276,6 +293,7 @@ export const D1Editor = ({
       view.set(next);
     },
   };
+
   const nav = {
     /** Jump to the table a foreign key points at, filtered to that row. */
     openForeignKey: (target: {
@@ -304,12 +322,14 @@ export const D1Editor = ({
       page.set(0);
     },
   };
+
   if (!tablesData) {
     if (loadError) {
       return (
         <p class="text-error m-0 p-4 text-sm">{errorMessage(loadError)}</p>
       );
     }
+
     return (
       <div class="flex min-h-0 flex-1 flex-col gap-2 p-4">
         <span class="skeleton h-8 w-full" />
@@ -317,11 +337,13 @@ export const D1Editor = ({
       </div>
     );
   }
+
   if (current === undefined) {
     return (
       <p class="m-0 p-4 text-sm opacity-60">This database has no tables yet.</p>
     );
   }
+
   return (
     <div class="flex h-full min-h-0 w-full overflow-hidden">
       <TableSidebar

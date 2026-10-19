@@ -80,9 +80,11 @@ const R2Page = ({
 
   const data = res.data();
   const loadError = res.error();
+
   if (loadError && data === undefined) {
     return <p class="text-error m-0 p-4 text-sm">{errorMessage(loadError)}</p>;
   }
+
   if (!data) {
     return (
       <div class="flex flex-col gap-2 p-4">
@@ -102,11 +104,14 @@ const R2Page = ({
     if (busy()) {
       return;
     }
+
     busy.set(true);
     failure.set("");
+
     try {
       const problem = await run();
       invalidateR2(appId, bucket);
+
       if (problem === null) {
         notify(done);
       } else {
@@ -136,19 +141,23 @@ const R2Page = ({
                 file,
                 file.type || "application/octet-stream"
               );
+
               return null;
             } catch (error) {
               return `${file.name}: ${errorMessage(error)}`;
             }
           })
         );
+
         const failures = attempts.filter((message) => message !== null);
         const notes = [...failures];
+
         if (oversized > 0) {
           notes.unshift(
             `${oversized} file(s) exceed the ${formatBytes(R2_UPLOAD_LIMIT)} cap.`
           );
         }
+
         return notes.length > 0 ? notes.join("\n") : null;
       },
       `${uploadable.length} file${uploadable.length === 1 ? "" : "s"} uploaded`
@@ -164,6 +173,7 @@ const R2Page = ({
         new Blob([]),
         "application/octet-stream"
       );
+
       return null;
     }, `Folder “${name}” created`);
   };
@@ -178,9 +188,11 @@ const R2Page = ({
         });
         checked.set(new Set());
         confirming.set(false);
+
         if (keys.includes(selected() ?? "")) {
           selected.set(null);
         }
+
         return null;
       },
       `${keys.length} object${keys.length === 1 ? "" : "s"} deleted`
@@ -188,18 +200,21 @@ const R2Page = ({
   };
 
   const needle = search().trim().toLowerCase();
+
   const folders =
     needle === ""
       ? data.folders
       : data.folders.filter((folder) =>
           folder.name.toLowerCase().includes(needle)
         );
+
   const files =
     needle === ""
       ? data.objects
       : data.objects.filter((object) =>
           object.name.toLowerCase().includes(needle)
         );
+
   const checkedKeys = [...checked()];
   const selectedObject = data.objects.find((o) => o.key === selected()) ?? null;
 
@@ -216,6 +231,7 @@ const R2Page = ({
       title="Nothing here yet"
     />
   );
+
   if (data.folders.length > 0 || data.objects.length > 0) {
     browser =
       view === "list" ? (
@@ -434,6 +450,7 @@ export const R2Folder = ({
   const cursors = atom<string[]>([""]);
   const pageIndex = atom(0);
   const at = Math.min(pageIndex(), cursors().length - 1);
+
   return (
     <R2Page
       key={at}

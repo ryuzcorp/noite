@@ -14,19 +14,23 @@ import { ChevronDown } from "../ui/icons";
 
 const parseTags = (raw: string): [string, string][] => {
   let parsed: unknown;
+
   try {
     parsed = JSON.parse(raw);
   } catch {
     // Corrupt tags never break the feed; the row just shows none.
     return [];
   }
+
   if (!parsed || Array.isArray(parsed)) {
     return [];
   }
+
   // SAFETY: the runner validates tag maps at ingest (string|number|boolean
   // values); anything else degrades to String() display below, and null is
   // excluded above so entries() cannot throw.
   const obj = parsed as Record<string, string | number | boolean>;
+
   return Object.entries(obj).map(([k, v]) => [k, String(v)]);
 };
 
@@ -35,14 +39,18 @@ const profileStatus = (props: string | null, propsError: string) => {
   if (propsError) {
     return <span class="text-warning">{propsError}</span>;
   }
+
   if (props === null) {
     return "Loading profile…";
   }
+
   if (props === "") {
     return "No profile properties.";
   }
+
   return <span class="font-mono">{props}</span>;
 };
+
 /** Event feed row (daisyUI list-row, like the storage inventory): icon,
  * name + subline, expand chevron; details stack in the content column. */
 const EventRow = ({
@@ -59,6 +67,7 @@ const EventRow = ({
   propsError: string;
 }) => {
   const tags = parseTags(event.tags);
+
   return (
     <li class="list-row">
       <div>
@@ -116,12 +125,15 @@ const EventRow = ({
     </li>
   );
 };
+
 /** Control origin for the ingest snippet. */
 const controlOrigin = (): string => window.location.origin;
+
 /** Page-size options (same set as the D1 browser) + feed fetch cap. */
 const PAGE_SIZES = [10, 25, 50, 100];
 const DEFAULT_PAGE_SIZE = 10;
 const FEED_LIMIT = 200;
+
 /** Parse `?p=` (page index): garbage falls back to the first page. */
 const toPageIndex = (raw: string): number =>
   Math.max(Math.trunc(Number(raw)) || 0, 0);
@@ -135,21 +147,25 @@ export const liveEventCount = (appId: string): number => {
     eventsUrl(appId, "", FEED_LIMIT),
     decodeEvents
   );
+
   return feed.latest()?.feed.length ?? 0;
 };
 
 /** Parse `?s=` (page size): unknown sizes fall back to the default. */
 const toPageSize = (raw: string): number => {
   const n = Math.trunc(Number(raw));
+
   return PAGE_SIZES.includes(n) ? n : DEFAULT_PAGE_SIZE;
 };
 
 /** Case-insensitive substring over the rendered row fields (D1 includesString). */
 const filterEvents = (all: RunnerEvent[], rawQuery: string): RunnerEvent[] => {
   const q = rawQuery.trim().toLowerCase();
+
   if (!q) {
     return all;
   }
+
   return all.filter((event) =>
     [
       event.channel,
@@ -171,8 +187,10 @@ const pageSlice = (
   index: number
 ): RunnerEvent[] => {
   const start = index * size;
+
   return matched.slice(start, start + size);
 };
+
 /** Ingest snippet card, shown only before the first event lands. */
 const SendEventsCard = ({
   appId,
@@ -184,11 +202,13 @@ const SendEventsCard = ({
   if (!visible) {
     return null;
   }
+
   const snippet = `curl -X POST ${controlOrigin()}/api/apps/${appId}/ingest/events \\
   -H "Authorization: Bearer noite_..." \\
   -H "Content-Type: application/json" \\
   -d '{"channel": "billing", "event": "Payment received", "icon": "💰",
        "tags": {"plan": "premium"}, "user_id": "123"}'`;
+
   return (
     <section class="card bg-base-100 dark:bg-base-200 border-base-300 w-full border shadow-md">
       <div class="card-body gap-2">
@@ -233,6 +253,7 @@ const EventsPager = ({
   if (!visible) {
     return null;
   }
+
   return (
     <div class="flex flex-wrap items-center justify-between gap-2">
       <p class="m-0 text-sm opacity-70">
@@ -296,10 +317,13 @@ const EventsFeed = ({
     eventsUrl(appId, channel(), FEED_LIMIT),
     decodeEvents
   );
+
   const snapshot = (): EventsSnapshot =>
     feed.latest() ?? { channels: [], feed: [], insights: [] };
+
   const loaded = (): boolean =>
     feed.latest() !== undefined || feed.status() === "open";
+
   const retrying = (): boolean => feed.status() === "retrying";
   const expanded = atom<string | null>(null);
   const profiles = atom<Record<string, string>>({});
@@ -308,6 +332,7 @@ const EventsFeed = ({
   const toggle = (event: RunnerEvent) => {
     const open = expanded() === event.id ? null : event.id;
     expanded.set(open);
+
     if (open && event.userId && !(event.userId in profiles())) {
       void (async () => {
         try {
@@ -315,6 +340,7 @@ const EventsFeed = ({
             "/api/events/getUserProps",
             { appId, userId: event.userId }
           );
+
           profiles.set({
             ...profiles(),
             [event.userId]: row?.properties ?? "",
@@ -328,13 +354,18 @@ const EventsFeed = ({
       })();
     }
   };
+
   const matchedEvents = (): RunnerEvent[] =>
     filterEvents(snapshot().feed, query());
+
   const pageCount = (): number =>
     eventPageCount(matchedEvents().length, pageSize());
+
   const safePage = (): number => Math.min(pageIndex(), pageCount() - 1);
+
   const pageEvents = (): RunnerEvent[] =>
     pageSlice(matchedEvents(), pageSize(), safePage());
+
   return (
     <div class="flex flex-col gap-4">
       {snapshot().insights.length > 0 ? (
@@ -463,14 +494,17 @@ export const EventsPanel = ({ appId }: { appId: string }) => {
   // filter resets the page in the same handler.
   const q = searchParam("q", { default: "" });
   const pageIndex = searchParam("p", { default: 0, parse: toPageIndex });
+
   const pageSize = searchParam("s", {
     default: DEFAULT_PAGE_SIZE,
     parse: toPageSize,
   });
+
   const clearQuery = () => {
     q.set("");
     pageIndex.set(0);
   };
+
   return (
     <EventsFeed
       key={channel()}

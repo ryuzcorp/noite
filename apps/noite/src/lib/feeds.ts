@@ -49,13 +49,17 @@ export const liveFeed = <T>(
       globalThis.EventSource === undefined
     ) {
       status.set("closed");
+
       return;
     }
+
     let source: EventSource | undefined;
+
     const open = () => {
       if (source) {
         return;
       }
+
       status.set("connecting");
       const next = new EventSource(url);
       source = next;
@@ -76,10 +80,12 @@ export const liveFeed = <T>(
         }
       });
     };
+
     const close = () => {
       source?.close();
       source = undefined;
     };
+
     const onVisibility = () => {
       if (document.hidden) {
         close();
@@ -88,17 +94,21 @@ export const liveFeed = <T>(
         open();
       }
     };
+
     document.addEventListener("visibilitychange", onVisibility);
+
     if (document.hidden) {
       status.set("closed");
     } else {
       open();
     }
+
     return () => {
       document.removeEventListener("visibilitychange", onVisibility);
       close();
     };
   });
+
   return { latest: withSnapshot(key, latest), status };
 };
 
@@ -120,6 +130,7 @@ export const feedKeys = {
  * next visit to /apps would otherwise flash the app that just went away. */
 export const dropAppFromSnapshot = (appId: string): void => {
   const cached = readSwr<RunnerApp[]>(feedKeys.apps);
+
   if (cached) {
     writeSwr(
       feedKeys.apps,
@@ -164,10 +175,13 @@ export const eventsUrl = (
   limit: number
 ): string => {
   const params = new URLSearchParams();
+
   if (channel) {
     params.set("channel", channel);
   }
+
   params.set("limit", String(limit));
+
   return `/api/apps/${encodeURIComponent(appId)}/events/stream?${params.toString()}`;
 };
 
@@ -180,9 +194,11 @@ const badFrame = (what: string): Error => new Error(`bad ${what} frame`);
 /** App rows (same shape as the list action; entries flow into rendering). */
 export const decodeApps = (raw: string): RunnerApp[] => {
   const next = parseFrame(raw);
+
   if (!Array.isArray(next)) {
     throw badFrame("apps");
   }
+
   // SAFETY: the apps stream emits the same App rows as the list action.
   return next as RunnerApp[];
 };
@@ -190,9 +206,11 @@ export const decodeApps = (raw: string): RunnerApp[] => {
 /** Deploy rows (same shape as the list endpoint). */
 export const decodeDeploys = (raw: string): RunnerDeploy[] => {
   const next = parseFrame(raw);
+
   if (!Array.isArray(next)) {
     throw badFrame("deploys");
   }
+
   // SAFETY: the runner deploys stream emits the same Deploy rows as the
   // list endpoint; entries flow only into list rendering.
   return next as RunnerDeploy[];
@@ -202,9 +220,11 @@ export const decodeDeploys = (raw: string): RunnerDeploy[] => {
 export const decodeErrors = (raw: string): RunnerErrorList => {
   // SAFETY: field shapes verified below; the runner emits the list result.
   const frame = parseFrame(raw) as Partial<RunnerErrorList> | null;
+
   if (!Array.isArray(frame?.issues) || !frame.counts) {
     throw badFrame("errors");
   }
+
   // SAFETY: issues array and counts object verified above.
   return frame as RunnerErrorList;
 };
@@ -212,9 +232,11 @@ export const decodeErrors = (raw: string): RunnerErrorList => {
 /** Runtime log lines (string array). */
 export const decodeLogs = (raw: string): string[] => {
   const next = parseFrame(raw);
+
   if (!Array.isArray(next)) {
     throw badFrame("logs");
   }
+
   // SAFETY: the runner log stream emits string arrays; entries flow only
   // into text rendering.
   return next as string[];
@@ -270,27 +292,33 @@ export const decodeMetrics = (raw: string): MetricsFrame => {
     refs?: unknown;
     spans?: unknown;
   };
+
   if (!Array.isArray(frame.metrics) || !Array.isArray(frame.spans)) {
     throw badFrame("metrics");
   }
+
   // SAFETY: both arrays passed Array.isArray above; rows mirror the list
   // endpoint shapes and flow only into usage rendering.
   const out: MetricsFrame = {
     metrics: frame.metrics as MetricsFrame["metrics"],
     spans: frame.spans as MetricsFrame["spans"],
   };
+
   if (Array.isArray(frame.devices)) {
     // SAFETY: passed Array.isArray above; entries flow into usage rendering.
     out.devices = frame.devices as NonNullable<MetricsFrame["devices"]>;
   }
+
   if (Array.isArray(frame.paths)) {
     // SAFETY: passed Array.isArray above; entries flow into usage rendering.
     out.paths = frame.paths as NonNullable<MetricsFrame["paths"]>;
   }
+
   if (Array.isArray(frame.refs)) {
     // SAFETY: passed Array.isArray above; entries flow into usage rendering.
     out.refs = frame.refs as NonNullable<MetricsFrame["refs"]>;
   }
+
   return out;
 };
 
@@ -305,6 +333,7 @@ export interface EventsSnapshot {
 export const decodeEvents = (raw: string): EventsSnapshot => {
   // SAFETY: field arrays verified below; the runner emits list rows.
   const snapshot = parseFrame(raw) as Partial<EventsSnapshot>;
+
   if (
     !Array.isArray(snapshot.feed) ||
     !Array.isArray(snapshot.channels) ||
@@ -312,6 +341,7 @@ export const decodeEvents = (raw: string): EventsSnapshot => {
   ) {
     throw badFrame("events");
   }
+
   // SAFETY: all three field arrays verified above.
   return snapshot as EventsSnapshot;
 };

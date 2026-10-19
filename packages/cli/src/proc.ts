@@ -29,9 +29,11 @@ export const runProc = (
         maxBuffer: 16 * 1024 * 1024,
         stdio: ["ignore", "pipe", "pipe"],
       });
+
       if (proc.error) {
         throw proc.error;
       }
+
       return {
         code: proc.status ?? 1,
         stderr: proc.stderr.trim(),

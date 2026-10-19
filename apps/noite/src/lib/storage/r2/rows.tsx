@@ -14,6 +14,7 @@ const FileTypeIcon = ({ kind }: { kind: PreviewKind }) => {
   if (kind === "image") {
     return <ImageIcon class="h-4 w-4 shrink-0 opacity-60" />;
   }
+
   return <FileIcon class="h-4 w-4 shrink-0 opacity-60" />;
 };
 
@@ -44,6 +45,7 @@ export const R2ListRows = ({
 }) => {
   const allChecked =
     files.length > 0 && files.every((object) => checked.has(object.key));
+
   return (
     <div class="min-h-0 flex-1 overflow-auto">
       <table class="table-sm table-pin-rows table w-full">
@@ -161,6 +163,7 @@ export const R2ColumnRows = ({
   // Native `<a>`s below: folder rows sit as `li > a` under daisyUI `menu`
   // CSS (child combinators), where a `Link` host span would break styling.
   const link = useLink();
+
   return (
     <div class="min-h-0 flex-1 overflow-auto">
       <ul class="menu m-0 w-full gap-0.5 p-2">

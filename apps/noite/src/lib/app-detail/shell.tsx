@@ -56,6 +56,7 @@ export const DetailTabs = ({
   const onKeyDown = (event: KeyboardEvent): void => {
     const index = tabs.findIndex((item) => item.id === active);
     let next = -1;
+
     if (event.key === "ArrowRight") {
       next = (index + 1) % tabs.length;
     } else if (event.key === "ArrowLeft") {
@@ -65,18 +66,23 @@ export const DetailTabs = ({
     } else if (event.key === "End") {
       next = tabs.length - 1;
     }
+
     if (next === -1) {
       return;
     }
+
     event.preventDefault();
     const target = tabs[next];
     onSelect(target.id);
+
     const list =
       event.target instanceof HTMLElement
         ? event.target.closest('[role="tablist"]')
         : null;
+
     list?.querySelectorAll<HTMLElement>('[role="tab"]')[next]?.focus();
   };
+
   return (
     <div class="border-base-300 flex items-center gap-2 border-b">
       <div class="min-w-0 flex-1 overflow-x-auto">
@@ -87,8 +93,10 @@ export const DetailTabs = ({
         >
           {tabs.map((item) => {
             const count = counts?.[item.id];
+
             const showCount =
               count !== undefined && (showZeroCounts || count > 0);
+
             return (
               <button
                 key={item.id}

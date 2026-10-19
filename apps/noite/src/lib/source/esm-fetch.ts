@@ -47,6 +47,7 @@ const CACHE_NAME = "noite-esm-types";
  * folded into "no response", because that is all the caller can act on. */
 const fetchResponse = async (url: string): Promise<Response | undefined> => {
   let response: Response | undefined;
+
   try {
     response = await fetch(url, {
       credentials: "omit",
@@ -56,6 +57,7 @@ const fetchResponse = async (url: string): Promise<Response | undefined> => {
   } catch {
     // Offline, blocked, DNS: the caller sees no response and moves on.
   }
+
   return response;
 };
 
@@ -98,12 +100,15 @@ export const collectSpecifiers = (text: string): string[] => {
   const specifiers = ts
     .preProcessFile(text, true, true)
     .importedFiles.map((file) => file.fileName);
+
   for (const match of text.matchAll(REFERENCE_DIRECTIVE)) {
     const specifier = match.groups?.specifier;
+
     if (specifier !== undefined) {
       specifiers.push(specifier);
     }
   }
+
   return specifiers;
 };
 
@@ -168,6 +173,7 @@ export class EsmTypes {
    * module the worker is holding (TS2307) until something else re-checks it. */
   setVersions(versions: PackageVersions): void {
     this.#versions = versions;
+
     // `#versionOf` reads the lockfile that just arrived: a specifier whose
     // version it no longer pins (or pins differently) is judged again.
     for (const [specifier, judged] of this.#judged) {
@@ -183,10 +189,12 @@ export class EsmTypes {
    * ordered. */
   async acquire(specifiers: Iterable<string>): Promise<void> {
     const previous = this.#tail;
+
     const next = (async (): Promise<void> => {
       await previous;
       await this.#run(specifiers);
     })();
+
     this.#tail = next;
     await next;
   }
@@ -201,10 +209,13 @@ export class EsmTypes {
     if (HTTP_URL.test(specifier)) {
       return this.#urls.get(canonicalUrl(specifier));
     }
+
     const bare = this.#bare.get(specifier);
+
     if (bare !== undefined) {
       return bare;
     }
+
     // A relative specifier inside a fetched declaration: TypeScript's own
     // resolver finds these in the virtual FS, but it has no reason to know
     // that `./x.mjs` is served as `x.d.mts` — this is where that is decided.
@@ -218,11 +229,13 @@ export class EsmTypes {
         typesUrlOfPath(containingFile)
       )) {
         const hit = this.#urls.get(target);
+
         if (hit !== undefined) {
           return hit;
         }
       }
     }
+
     return undefined;
   }
 
@@ -234,10 +247,12 @@ export class EsmTypes {
     this.#drained = () => {
       round.resolve();
     };
+
     for (const specifier of specifiers) {
       if (this.#atCapacity()) {
         break;
       }
+
       if (
         this.#bare.has(specifier) ||
         this.#requested.has(specifier) ||
@@ -245,14 +260,18 @@ export class EsmTypes {
       ) {
         continue;
       }
+
       this.#requested.add(specifier);
       this.#enqueue(() => this.#bareFor(specifier));
     }
+
     if (this.#outstanding === 0) {
       this.#drained?.();
       this.#drained = undefined;
     }
+
     await round.promise;
+
     // A round moves what the pane's imports mean either by landing files or by
     // resolving a specifier out of what is already in the FS (a ref whose
     // lockfile pins a package the previous ref only reached through another
@@ -261,6 +280,7 @@ export class EsmTypes {
     if (this.#stored !== before || this.#resolutions !== resolved) {
       this.#host.changed();
     }
+
     this.#summarize(missed);
   }
 
@@ -270,9 +290,11 @@ export class EsmTypes {
    * never a per-package warning. */
   #summarize(from: number): void {
     const missed = this.#misses.slice(from);
+
     if (missed.length === 0) {
       return;
     }
+
     const names = missed.slice(0, 5).join(", ");
     const rest = missed.length > 5 ? `, +${missed.length - 5} more` : "";
     this.#host.debug(
@@ -285,6 +307,7 @@ export class EsmTypes {
    * builtin, a URL), or one this repo does not depend on. */
   #versionOf(specifier: string): string {
     const parsed = parsePackageSpecifier(specifier);
+
     return parsed === null ? "" : (this.#versions.get(parsed.name) ?? "");
   }
 
@@ -295,9 +318,11 @@ export class EsmTypes {
    * changes — only this specifier's reading of it does. */
   #forget(specifier: string): void {
     this.#judged.delete(specifier);
+
     if (this.#bare.delete(specifier)) {
       this.#resolutions += 1;
     }
+
     this.#requested.delete(specifier);
     this.#unresolved.delete(specifier);
   }
@@ -310,8 +335,10 @@ export class EsmTypes {
   #publish(specifier: string, version: string, answer: () => void): void {
     if (this.#versionOf(specifier) === version) {
       answer();
+
       return;
     }
+
     this.#forget(specifier);
   }
 
@@ -321,30 +348,38 @@ export class EsmTypes {
    * build esbuild refuses). */
   async #bareFor(specifier: string): Promise<void> {
     const parsed = parsePackageSpecifier(specifier);
+
     if (parsed === null || !isCodeSubpath(parsed.subpath)) {
       // Not a package — a `tsconfig` `paths` alias, a builtin, a virtual
       // module — or a subpath naming something that is not code at all
       // (`pkg/package.json`, `pkg/logo.svg`): esm.sh has no declaration to
       // serve, and TypeScript resolves the former the way it always did.
       this.#unresolved.add(specifier);
+
       return;
     }
+
     const version = this.#versions.get(parsed.name);
     // The version this specifier is judged at, kept so the next ref's lockfile
     // re-judges exactly the specifiers it moved (`setVersions`). `""` records
     // a package no lockfile pins: settled where it is, until a lockfile that
     // pins one re-judges it.
     this.#judged.set(specifier, version ?? "");
+
     if (version === undefined) {
       this.#unresolved.add(specifier);
+
       return;
     }
+
     const moduleUrl = canonicalUrl(esmModuleUrl(parsed, version));
     const header = await this.#moduleTypes(moduleUrl);
     let path: string | undefined;
+
     if (header !== undefined) {
       path = await this.#declaration(header);
     }
+
     if (path === undefined) {
       /* The conventional declaration paths are alternatives, and esm.sh's
        * answers are unevenly slow — a 500 for a types-only package takes
@@ -356,15 +391,19 @@ export class EsmTypes {
           this.#declaration(candidate)
         )
       );
+
       path = found.find((candidate) => candidate !== undefined);
     }
+
     if (path !== undefined) {
       this.#publish(specifier, version, () => {
         this.#bare.set(specifier, path);
         this.#resolutions += 1;
       });
+
       return;
     }
+
     this.#publish(specifier, version, () => {
       this.#unresolved.add(specifier);
       this.#misses.push(`${specifier}@${version}`);
@@ -381,18 +420,24 @@ export class EsmTypes {
    * once. */
   async #moduleTypes(moduleUrl: string): Promise<string | undefined> {
     const known = this.#modules.get(moduleUrl);
+
     if (known !== undefined) {
       return known;
     }
+
     if (this.#failed.has(moduleUrl)) {
       return;
     }
+
     const pending = this.#moduleLookups.get(moduleUrl);
+
     if (pending !== undefined) {
       return await pending;
     }
+
     const lookup = this.#lookupModuleTypes(moduleUrl);
     this.#moduleLookups.set(moduleUrl, lookup);
+
     return await lookup;
   }
 
@@ -400,31 +445,41 @@ export class EsmTypes {
     try {
       if (await this.#missed(moduleUrl)) {
         this.#failed.add(moduleUrl);
+
         return;
       }
+
       const response = await fetchResponse(moduleUrl);
+
       if (response === undefined) {
         // Nothing answered: not a fact about the module, so nothing is
         // remembered and a later round tries again.
         return;
       }
+
       if (!response.ok) {
         void response.body?.cancel();
         this.#failed.add(moduleUrl);
         await this.#rememberMiss(moduleUrl, response.status);
+
         return;
       }
+
       const header = response.headers.get("x-typescript-types");
       // The header is all this response is wanted for: drop the body (it is a
       // bundled module, megabytes for a big package).
       void response.body?.cancel();
+
       if (header === null) {
         return;
       }
+
       const url = canonicalUrl(
         new URL(header, response.url === "" ? moduleUrl : response.url).href
       );
+
       this.#modules.set(moduleUrl, url);
+
       return url;
     } finally {
       this.#moduleLookups.delete(moduleUrl);
@@ -436,18 +491,24 @@ export class EsmTypes {
   async #declaration(url: string): Promise<string | undefined> {
     const key = canonicalUrl(url);
     const known = this.#urls.get(key);
+
     if (known !== undefined) {
       return known;
     }
+
     if (this.#failed.has(key)) {
       return;
     }
+
     const pending = this.#declarations.get(key);
+
     if (pending !== undefined) {
       return await pending;
     }
+
     const loading = this.#loadDeclaration(key);
     this.#declarations.set(key, loading);
+
     return await loading;
   }
 
@@ -455,15 +516,19 @@ export class EsmTypes {
     try {
       if (await this.#missed(key)) {
         this.#failed.add(key);
+
         return;
       }
+
       let fetched = await this.#fetchText(key);
+
       if (fetched.text === undefined && fetched.status >= 500) {
         // esm.sh found the file but could not build it (a types-only package,
         // whatever esbuild refuses): `?raw` serves the package's own file, the
         // same declaration. A 404 needs no second look — `?raw` serves that
         // same nonexistent file.
         const raw = await this.#fetchText(`${key}?raw`);
+
         if (raw.text !== undefined) {
           // Worth caching under the declaration's own URL: the next open then
           // reads the file straight out of the cache instead of paying for the
@@ -472,14 +537,19 @@ export class EsmTypes {
           fetched = raw;
         }
       }
+
       const { status, text } = fetched;
+
       if (text === undefined) {
         this.#failed.add(key);
+
         if (status !== 0) {
           await this.#rememberMiss(key, status);
         }
+
         return;
       }
+
       return this.#store(key, text);
     } finally {
       this.#declarations.delete(key);
@@ -490,9 +560,11 @@ export class EsmTypes {
    * the URL it stands for. */
   async #rememberText(key: string, text: string): Promise<void> {
     const cache = await this.#openCache(CACHE_NAME);
+
     if (cache === undefined) {
       return;
     }
+
     try {
       await cache.put(key, new Response(text));
     } catch {
@@ -505,38 +577,49 @@ export class EsmTypes {
    * branch — does not pay for the same answer twice. */
   async #missed(url: string): Promise<boolean> {
     const cache = await this.#openCache(MISS_CACHE_NAME);
+
     if (cache === undefined) {
       return false;
     }
+
     let hit: Response | undefined;
+
     try {
       hit = await cache.match(url);
     } catch {
       return false;
     }
+
     if (!hit) {
       return false;
     }
+
     const expiry = Number(hit.headers.get(MISS_EXPIRY_HEADER) ?? 0);
+
     if (Date.now() < expiry) {
       return true;
     }
+
     try {
       await cache.delete(url);
     } catch {
       // A cache that cannot delete still must not break the round.
     }
+
     return false;
   }
 
   async #rememberMiss(url: string, status: number): Promise<void> {
     const cache = await this.#openCache(MISS_CACHE_NAME);
+
     if (cache === undefined) {
       return;
     }
+
     const entry = new Response(null, {
       headers: { [MISS_EXPIRY_HEADER]: String(missExpiry(status, Date.now())) },
     });
+
     try {
       await cache.put(url, entry);
     } catch {
@@ -549,21 +632,27 @@ export class EsmTypes {
    * declaration graph with a cycle terminates. */
   #store(url: string, text: string): string | undefined {
     const known = this.#urls.get(url);
+
     if (known !== undefined) {
       return known;
     }
+
     if (text.length > MAX_TYPES_FILE || this.#atCapacity()) {
       this.#capsReached();
+
       return undefined;
     }
+
     const path = typesVirtualPath(url);
     this.#urls.set(url, path);
     this.#files += 1;
     this.#bytes += text.length;
     this.#stored += 1;
     this.#host.write(path, text);
+
     for (const specifier of collectSpecifiers(text)) {
       const bare = parsePackageSpecifier(specifier);
+
       if (bare !== null) {
         if (
           !this.#bare.has(specifier) &&
@@ -573,8 +662,10 @@ export class EsmTypes {
           this.#requested.add(specifier);
           this.#enqueue(() => this.#bareFor(specifier));
         }
+
         continue;
       }
+
       if (
         specifier.startsWith(".") ||
         specifier.startsWith("/") ||
@@ -583,6 +674,7 @@ export class EsmTypes {
         this.#enqueueTargets(declarationTargets(specifier, url));
       }
     }
+
     return path;
   }
 
@@ -595,12 +687,15 @@ export class EsmTypes {
         !this.#failed.has(target) &&
         !this.#requested.has(target)
     );
+
     if (keys.length === 0) {
       return;
     }
+
     for (const key of keys) {
       this.#requested.add(key);
     }
+
     this.#enqueue(async () => {
       /* oxlint-disable eslint/no-await-in-loop -- alternatives again: the first candidate that exists is the declaration, and the rest are the same import. */
       for (const key of keys) {
@@ -616,25 +711,33 @@ export class EsmTypes {
    * URLs are immutable, so a cached copy is never stale. */
   async #fetchText(url: string): Promise<FetchedText> {
     const cache = await this.#openCache(CACHE_NAME);
+
     if (cache !== undefined) {
       let hit: Response | undefined;
+
       try {
         hit = await cache.match(url);
       } catch {
         // An unreadable cache is a cache that does not answer.
       }
+
       if (hit?.ok) {
         return { status: hit.status, text: await hit.text() };
       }
     }
+
     const response = await fetchResponse(url);
+
     if (response === undefined) {
       return { status: 0 };
     }
+
     if (!response.ok) {
       void response.body?.cancel();
+
       return { status: response.status };
     }
+
     if (cache !== undefined) {
       // Storing is an optimization: a full or opaque cache must not lose the
       // text we already hold.
@@ -644,6 +747,7 @@ export class EsmTypes {
         // Nothing to recover: the fetch is the source of truth.
       }
     }
+
     return { status: response.status, text: await response.text() };
   }
 
@@ -651,9 +755,11 @@ export class EsmTypes {
    * that refuses the storage) the acquisition still works, only slower. */
   #openCache(name: string): Promise<Cache | undefined> {
     let opened = this.#caches.get(name);
+
     if (opened === undefined) {
       opened = (async (): Promise<Cache | undefined> => {
         let cache: Cache | undefined;
+
         try {
           if (typeof caches !== "undefined") {
             cache = await caches.open(name);
@@ -661,10 +767,12 @@ export class EsmTypes {
         } catch {
           // A browser that refuses the storage just means no cache.
         }
+
         return cache;
       })();
       this.#caches.set(name, opened);
     }
+
     return opened;
   }
 
@@ -681,9 +789,11 @@ export class EsmTypes {
   #pump(): void {
     while (this.#active < FETCH_CONCURRENCY && this.#queue.length > 0) {
       const task = this.#queue.shift();
+
       if (task === undefined) {
         break;
       }
+
       this.#active += 1;
       void this.#settle(task);
     }
@@ -697,12 +807,15 @@ export class EsmTypes {
     } catch {
       // Nothing to recover: the round's other tasks still run.
     }
+
     this.#active -= 1;
     this.#outstanding -= 1;
+
     if (this.#outstanding === 0) {
       this.#drained?.();
       this.#drained = undefined;
     }
+
     this.#pump();
   }
 
@@ -713,6 +826,7 @@ export class EsmTypes {
     if (this.#capped) {
       return;
     }
+
     this.#capped = true;
     this.#host.warn(
       "[esm.sh] declaration files hit the acquisition caps — some imports stay unresolved"

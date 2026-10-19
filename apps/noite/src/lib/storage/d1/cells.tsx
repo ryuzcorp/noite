@@ -38,6 +38,7 @@ export const CellValue = ({
   if (redacted) {
     return <span class="italic opacity-60">{cell ?? "•••• redacted"}</span>;
   }
+
   if (cell === null) {
     return (
       <span class="badge badge-ghost badge-sm font-normal opacity-60">
@@ -45,6 +46,7 @@ export const CellValue = ({
       </span>
     );
   }
+
   if (cell === "") {
     return (
       <span class="text-xs italic opacity-40" title="empty string">
@@ -52,10 +54,14 @@ export const CellValue = ({
       </span>
     );
   }
+
   const date = timestamp ? parseTimestamp(cell) : null;
+
   const title =
     date === null ? cell : `${formatDateTime(date)} · ${formatAgo(date)}`;
+
   const mono = isMonoCell(columnName, columnType, cell);
+
   return (
     <span class="group/cell flex min-w-0 items-center gap-1">
       <span

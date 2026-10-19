@@ -30,25 +30,32 @@ export const getSessionOrNull = async (
 ): Promise<RequestSession | null> => {
   await ensureDbPromise();
   const origin = requestOrigin(request);
+
   if (!origin) {
     return null;
   }
+
   // authFromEnv throws MissingAuthSecretError on a misconfigured instance; the
   // session read below is the only part that reads as "signed out".
   const auth = authFromEnv(env, origin);
   let session;
+
   try {
     session = await auth.api.getSession({ headers: request.headers });
   } catch {
     return null;
   }
+
   const user = session?.user;
+
   if (!user) {
     return null;
   }
+
   // The admin plugin adds an optional impersonatedBy id to sessions it
   // creates; presence means this session is impersonated.
   const impersonatedBy = session?.session?.impersonatedBy;
+
   return {
     impersonatedBy: impersonatedBy ? String(impersonatedBy) : null,
     user,
@@ -60,9 +67,11 @@ export const sessionUser = async (
   env: KitEnv
 ): Promise<SessionUser> => {
   const session = await getSessionOrNull(request, env);
+
   if (!session) {
     throw new UnauthorizedError({ message: "Sign in required" });
   }
+
   return {
     email: session.user.email,
     id: session.user.id,
@@ -90,16 +99,20 @@ export const requireControlAdmin = async (
   env: KitEnv
 ): Promise<SessionUser> => {
   const user = await sessionUser(request, env);
+
   // Skip the admin lookup on an impersonated session: it is refused anyway.
   const isAdmin =
     user.impersonatedBy === null &&
     (await isInstanceAdmin(user.id, user.email));
+
   const refusal = controlAccessRefusal({
     impersonatedBy: user.impersonatedBy,
     isAdmin,
   });
+
   if (refusal !== null) {
     fail(refusal);
   }
+
   return user;
 };

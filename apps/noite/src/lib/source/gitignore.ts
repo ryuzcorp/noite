@@ -68,15 +68,18 @@ const classEnd = (segment: string, start: number): number => {
   ) {
     if (segment.charAt(i) === "[" && segment.charAt(i + 1) === ":") {
       const posix = segment.indexOf(":]", i + 2);
+
       if (posix !== -1) {
         i = posix + 1;
         continue;
       }
     }
+
     if (segment.charAt(i) === "]") {
       return i;
     }
   }
+
   return -1;
 };
 
@@ -102,22 +105,28 @@ const POSIX_CLASSES = {
  * escape a plain character does not need is still a legal one in a class). */
 const classSource = (body: string): string => {
   let source = "";
+
   for (let i = 0; i < body.length; i += 1) {
     const char = body.charAt(i);
+
     if (char === "[" && body.charAt(i + 1) === ":") {
       const end = body.indexOf(":]", i + 2);
       const name = end === -1 ? "" : body.slice(i + 2, end);
+
       const named = Object.entries(POSIX_CLASSES).find(
         ([key]) => key === name
       )?.[1];
+
       if (named !== undefined) {
         source += named;
         i = end + 1;
         continue;
       }
     }
+
     source += char === "-" ? char : literal(char);
   }
+
   return source;
 };
 
@@ -126,39 +135,51 @@ const classSource = (body: string): string => {
  * negation, and a backslash makes the character after it literal. */
 const segmentSource = (segment: string): string => {
   let source = "";
+
   for (let i = 0; i < segment.length; i += 1) {
     const char = segment.charAt(i);
+
     if (char === "\\") {
       const next = segment.charAt(i + 1);
       source += next === "" ? "\\\\" : literal(next);
+
       if (next !== "") {
         i += 1;
       }
+
       continue;
     }
+
     if (char === "*") {
       source += "[^/]*";
       continue;
     }
+
     if (char === "?") {
       source += "[^/]";
       continue;
     }
+
     if (char === "[") {
       const invert =
         segment.charAt(i + 1) === "!" || segment.charAt(i + 1) === "^";
+
       const start = invert ? i + 2 : i + 1;
       const close = classEnd(segment, start);
+
       if (close === -1) {
         source += "\\[";
         continue;
       }
+
       source += `[${invert ? "^" : ""}${classSource(segment.slice(start, close))}]`;
       i = close;
       continue;
     }
+
     source += literal(char);
   }
+
   return source;
 };
 
@@ -169,16 +190,20 @@ const segmentSource = (segment: string): string => {
 const patternSource = (pattern: string): string => {
   const segments = pattern.split("/");
   let source = "";
+
   for (const [index, segment] of segments.entries()) {
     if (segment === "**" && segments.length > 1) {
       source += index === segments.length - 1 ? ".*" : "(?:[^/]+/)*";
       continue;
     }
+
     source += segmentSource(segment);
+
     if (index < segments.length - 1) {
       source += "/";
     }
   }
+
   return source;
 };
 
@@ -205,34 +230,46 @@ const compiled = (body: string, anchored: boolean): RegExp => {
 const compile = (line: string, base: string): Rule | null => {
   const trimmed = line.endsWith("\r") ? line.slice(0, -1) : line;
   let end = trimmed.length;
+
   while (end > 0 && trimmed[end - 1] === " " && trimmed[end - 2] !== "\\") {
     end -= 1;
   }
+
   let text = trimmed.slice(0, end);
+
   if (text === "" || text.startsWith("#")) {
     return null;
   }
+
   let negated = false;
+
   if (text.startsWith("!")) {
     negated = true;
     text = text.slice(1);
   } else if (text.startsWith("\\!") || text.startsWith("\\#")) {
     text = text.slice(1);
   }
+
   const dirOnly = text.endsWith("/");
+
   if (dirOnly) {
     text = text.slice(0, -1);
   }
+
   // A separator anywhere but the end anchors the pattern to the `.gitignore`'s
   // own directory; without one it matches at any depth below it.
   const anchored = text.startsWith("/") || text.includes("/");
+
   if (text.startsWith("/")) {
     text = text.slice(1);
   }
+
   if (text === "") {
     return null;
   }
+
   const body = patternSource(text);
+
   return {
     base,
     dirOnly,
@@ -250,12 +287,15 @@ export const addIgnoreFile = (
   base: string
 ): IgnoreRules => {
   const added: Rule[] = [];
+
   for (const line of text.split("\n")) {
     const rule = compile(line, base);
+
     if (rule !== null) {
       added.push(rule);
     }
   }
+
   return added.length === 0 ? rules : [...rules, ...added];
 };
 
@@ -266,19 +306,24 @@ export const addIgnoreFile = (
 const decides = (rules: IgnoreRules, path: string, isDir: boolean): boolean => {
   for (let i = rules.length - 1; i >= 0; i -= 1) {
     const rule = rules[i];
+
     if (rule === undefined || (rule.dirOnly && !isDir)) {
       continue;
     }
+
     // A rule of a nested `.gitignore` reads paths from its own directory, and
     // only reaches what sits under it.
     if (rule.base !== "" && !path.startsWith(`${rule.base}/`)) {
       continue;
     }
+
     const rel = rule.base === "" ? path : path.slice(rule.base.length + 1);
+
     if (rule.re.test(rel)) {
       return !rule.negated;
     }
   }
+
   return false;
 };
 
@@ -298,14 +343,18 @@ export const isIgnored = (
   if (committed(path, isDir)) {
     return false;
   }
+
   const parts = path.split("/");
+
   if (parts.includes(DEPENDENCY_DIR)) {
     return true;
   }
+
   for (let i = 1; i < parts.length; i += 1) {
     if (decides(rules, parts.slice(0, i).join("/"), true)) {
       return true;
     }
   }
+
   return decides(rules, path, isDir);
 };

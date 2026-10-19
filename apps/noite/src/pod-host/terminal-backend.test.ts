@@ -20,12 +20,14 @@ const withShell = async (
 ): Promise<void> => {
   const pod = await Nodepod.boot();
   const written: string[] = [];
+
   const backend = createTerminalBackend({
     onWrite: (data) => {
       written.push(data);
     },
     pod,
   });
+
   try {
     await run({ backend, written });
   } finally {

@@ -9,6 +9,7 @@ import { requireViewApp, sessionUser } from "./session.server";
 const AppId = Schema.String;
 
 const Rpm = Schema.Union([Schema.Number, Schema.Null]);
+
 const LimitArgs = Schema.Struct({
   appId: Schema.String,
   appRpm: Rpm,
@@ -18,6 +19,7 @@ const LimitArgs = Schema.Struct({
 /** The app's edge limits beside the platform defaults they fall back to. */
 export const getLimits = apiAction(AppId, async (appId, { env, request }) => {
   await requireViewApp(request, env, appId);
+
   try {
     return await runnerGetLimits(appId);
   } catch (error) {
@@ -32,6 +34,7 @@ export const setLimits = apiAction(
   async ({ appId, appRpm, clientRpm }, { env, request }) => {
     const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "admin");
+
     try {
       return await runnerSetLimits(appId, clientRpm, appRpm);
     } catch (error) {

@@ -15,11 +15,13 @@ const moveOrigin = (state: WorkspaceState, change: WorkspaceChange): string =>
 /** `journal` without the record of one undone move. */
 const dropJournal = (journal: Journal, path: string): Journal => {
   const kept: Journal = {};
+
   for (const [current, committed] of Object.entries(journal)) {
     if (current !== path) {
       kept[current] = committed;
     }
   }
+
   return kept;
 };
 
@@ -33,13 +35,16 @@ const restoreBytes = async (
   origin: string
 ): Promise<void> => {
   const entry = state.base.entries[origin];
+
   const bytes =
     entry === undefined ? null : await readObject(state.fs, entry.sha);
+
   if (bytes === null) {
     throw new Error(
       `workspace: there is no committed copy of ${origin} to restore`
     );
   }
+
   const abs = projectPath(path);
   await state.fs.mkdir(parentDir(abs), { recursive: true });
   await state.fs.writeFile(abs, bytes);
@@ -57,10 +62,13 @@ export const discardChange = async (
       force: true,
       recursive: true,
     });
+
     return;
   }
+
   const origin =
     change.kind === "moved" ? moveOrigin(state, change) : change.path;
+
   await restoreBytes(state, change.path, origin);
 };
 
@@ -73,12 +81,14 @@ const moveHome = async (
 ): Promise<void> => {
   const origin = moveOrigin(state, change);
   const abs = projectPath(change.path);
+
   if (origin !== change.path && (await state.fs.exists(abs))) {
     const destination = projectPath(origin);
     await state.fs.rm(destination, { force: true, recursive: true });
     await state.fs.mkdir(parentDir(destination), { recursive: true });
     await state.fs.rename(abs, destination);
   }
+
   await restoreBytes(state, origin, origin);
 };
 
@@ -94,12 +104,16 @@ const undoOne = async (
       force: true,
       recursive: true,
     });
+
     return;
   }
+
   if (change.kind === "moved") {
     await moveHome(state, change);
+
     return;
   }
+
   await restoreBytes(state, change.path, change.path);
 };
 

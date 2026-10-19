@@ -37,6 +37,7 @@ export const prList = (
 ): Resource<PrList> => {
   const key = prKeys.list(appId, state, skip);
   listKeys.add(key);
+
   return tracked(key, () =>
     api<PrList>("/api/prs/prsList", { appId, limit: PR_PAGE_SIZE, skip, state })
   );
@@ -81,12 +82,15 @@ export const invalidatePr = (appId: string, number?: number): void => {
   if (number !== undefined) {
     invalidate(prKeys.detail(appId, number));
   }
+
   const prefix = `prs:list:${appId}:`;
+
   for (const key of listKeys) {
     if (key.startsWith(prefix)) {
       invalidate(key);
     }
   }
+
   invalidate(forgeKeys.refs(appId));
   invalidate(keys.environments(appId));
 };

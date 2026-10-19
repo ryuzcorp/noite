@@ -12,16 +12,21 @@ import { Link, useParams } from "@ilha/void";
  * and the list below. */
 export default function PullsListPage() {
   const { id: appId } = useParams();
+
   const state = searchParam<PrStateFilter>("state", {
     default: "open",
     parse: toPrStateFilter,
   });
+
   const skip = searchParam<number>("skip", { default: 0, parse: parseSkip });
+
   if (!appId) {
     return <p class="text-error m-0 p-4 text-sm">Missing app id.</p>;
   }
+
   const counts = prList(appId, state(), skip()).data()?.counts;
   const active = state();
+
   return (
     <PullsPage
       appId={appId}

@@ -29,6 +29,7 @@ const cliBin = nodePath.join(cliDir, "dist", "bin.js");
 const control = new URL(
   process.env.E2E_BASE_URL ?? "http://noite.localhost:8090"
 );
+
 const gitOrigin = `${control.protocol}//git.${control.host}`;
 const deployOrigin = `${control.protocol}//${DEPLOY_SLUG}.${control.host}`;
 
@@ -63,13 +64,17 @@ const runCli = (args: readonly string[]): string => {
     encoding: "utf-8",
     env: { ...process.env },
   });
+
   if (proc.error) {
     throw proc.error;
   }
+
   const output = `${proc.stdout}${proc.stderr}`;
+
   if (proc.status !== 0) {
     throw new Error(`noite ${args.join(" ")} failed:\n${output}`);
   }
+
   return output;
 };
 
@@ -102,6 +107,7 @@ const pushSeededBranch = (
         GIT_COMMITTER_NAME: E2E_NAME,
       },
     });
+
   git(["init", "-b", "main"]);
   git([
     "remote",
@@ -129,9 +135,11 @@ test.beforeAll(() => {
     cwd: cliDir,
     encoding: "utf-8",
   });
+
   if (proc.error) {
     throw proc.error;
   }
+
   expect(proc.status).toBe(0);
 });
 
@@ -140,14 +148,17 @@ test("noite deploy ships a prebuilt dist and the printed URL serves it", async (
   request,
 }) => {
   createdApps.push(DEPLOY_SLUG);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "CLI",
     slug: DEPLOY_SLUG,
   });
 
   const dir = mkdtempSync(nodePath.join(tmpdir(), "noite-cli-"));
+
   try {
     await seedPrebuiltApp(dir);
+
     const output = runCli([
       "deploy",
       ...connFlags(DEPLOY_SLUG, apiKey),
@@ -156,6 +167,7 @@ test("noite deploy ships a prebuilt dist and the printed URL serves it", async (
       "--wrangler",
       nodePath.join(dir, "wrangler.jsonc"),
     ]);
+
     const printed = output.match(/→ (?<url>\S+)\s*$/mu)?.groups?.url ?? "";
     expect(printed).toBe(deployOrigin);
 
@@ -169,6 +181,7 @@ test("noite deploy ships a prebuilt dist and the printed URL serves it", async (
       .poll(
         async (): Promise<string> => {
           await page.goto(printed);
+
           return (await page.getByText("hello from cli").count()) === 0
             ? ""
             : "hello from cli";
@@ -186,6 +199,7 @@ test("noite environments manages vars over the control origin", async ({
   request,
 }) => {
   createdApps.push(ENVS_SLUG);
+
   const { apiKey } = await createAppWithKey(page, request, {
     name: "CLI envs",
     slug: ENVS_SLUG,
@@ -195,6 +209,7 @@ test("noite environments manages vars over the control origin", async ({
   // prebuilt tree the deploy test ships, so the environment's own deploy
   // (which `create` starts) has something real to build.
   const dir = mkdtempSync(nodePath.join(tmpdir(), "noite-cli-env-"));
+
   try {
     await seedPrebuiltApp(dir);
     pushSeededBranch(dir, apiKey, ENVS_SLUG, "refs/heads/staging");

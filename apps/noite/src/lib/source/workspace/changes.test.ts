@@ -31,6 +31,7 @@ const withPod = async (
   run: (fs: NodepodFS) => Promise<void>
 ): Promise<void> => {
   const pod = await Nodepod.boot();
+
   try {
     await run(pod.fs);
   } finally {
@@ -63,15 +64,19 @@ const seed = async (
         await put(fs, path, text);
         const sha = await gitBlobSha(bytes);
         await writeObject(fs, sha, bytes);
+
         return [path, { mode: "100644", sha }];
       }
     )
   );
+
   const base: BaseIndex = {
     baseSha: "base1",
     entries: Object.fromEntries(entries),
   };
+
   await writeBase(fs, base);
+
   return { base, cache: new Map(), fs, journal: {} };
 };
 
@@ -79,14 +84,17 @@ const seed = async (
  * one. */
 const countingFs = (fs: NodepodFS) => {
   let reads = 0;
+
   // SAFETY: this returns exactly what `fs.readFile` returns; the assertion
   // only puts back the two overloads, which one arrow cannot carry.
   const readFile = ((path: string, encoding?: "utf-8") => {
     reads += 1;
+
     return encoding === undefined
       ? fs.readFile(path)
       : fs.readFile(path, encoding);
   }) as WorkspaceFs["readFile"];
+
   const counted: WorkspaceFs = {
     exists: (path: string) => fs.exists(path),
     mkdir: (path: string, opts?: { recursive?: boolean }) =>
@@ -105,6 +113,7 @@ const countingFs = (fs: NodepodFS) => {
     writeFile: (path: string, data: string | Uint8Array) =>
       fs.writeFile(path, data),
   };
+
   return { counted, reads: () => reads };
 };
 
@@ -116,15 +125,18 @@ const row = (
   path: string
 ): WorkspaceChange => {
   const found = changes.find((change) => change.path === path);
+
   if (found === undefined) {
     throw new Error(`no change for ${path}`);
   }
+
   return found;
 };
 
 /** What the derive reports, as the paths the panel lists them by. */
 const derivedPaths = async (state: WorkspaceState): Promise<string[]> => {
   const changes = await deriveChanges(state);
+
   return changes.map((change) => change.path);
 };
 
@@ -548,6 +560,7 @@ describe("the checkout's .gitignore", () => {
         ".gitignore": "dist/\n",
         "dist/a.js": "one\n",
       });
+
       await put(fs, "dist/a.js", "two\n");
       await put(fs, "dist/new.js", "new\n");
       // Git keeps tracking what it has committed: a.js is a change, and the
@@ -567,6 +580,7 @@ describe("the checkout's .gitignore", () => {
         "src/.gitignore": "*.map\n",
         "src/a.ts": "a\n",
       });
+
       await put(fs, "src/a.ts.map", "map\n");
       await put(fs, "a.ts.map", "map\n");
       expect(await derivedPaths(state)).toEqual(["a.ts.map"]);

@@ -58,12 +58,14 @@ let ghosttyReady: Promise<void> | null = null;
  * retries. */
 const ensureGhostty = async (): Promise<GhosttyModule> => {
   const module = await (ghosttyModule ??= import("ghostty-web"));
+
   try {
     await (ghosttyReady ??= module.init());
   } catch (error) {
     ghosttyReady = null;
     throw error;
   }
+
   return module;
 };
 
@@ -88,12 +90,15 @@ const resolveVar = (name: string, fallback: string): string => {
   const resolved = getComputedStyle(probe).color;
   probe.remove();
   const context = document.createElement("canvas").getContext("2d");
+
   if (resolved === "" || context === null) {
     return fallback;
   }
+
   context.fillStyle = resolved;
   context.fillRect(0, 0, 1, 1);
   const [red = 0, green = 0, blue = 0] = context.getImageData(0, 0, 1, 1).data;
+
   return `#${[red, green, blue].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 };
 
@@ -101,6 +106,7 @@ const resolveVar = (name: string, fallback: string): string => {
  * a light/dark flip while the panel was hidden still lands. */
 const readTheme = (): ITheme => {
   const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+
   return {
     background: resolveVar("--color-base-100", dark ? "#141414" : "#ffffff"),
     foreground: resolveVar(
@@ -125,9 +131,11 @@ const readTheme = (): ITheme => {
  * fade. */
 const repaint = (drawn: Terminal): void => {
   const { renderer, wasmTerm: buffer } = drawn;
+
   if (renderer === undefined || buffer === undefined) {
     return;
   }
+
   renderer.render(buffer, true, drawn.viewportY, drawn, 0);
 };
 
@@ -178,6 +186,7 @@ export const createTerminalSession = (): TerminalSession => {
    * change. */
   const refit = (): void => {
     fitAddon?.fit();
+
     if (terminal !== null) {
       repaint(terminal);
     }
@@ -195,6 +204,7 @@ export const createTerminalSession = (): TerminalSession => {
    * mount. */
   const refitSoon = (): void => {
     refit();
+
     if (fitting === 0) {
       fitting = requestAnimationFrame(refitFrame);
     }
@@ -219,6 +229,7 @@ export const createTerminalSession = (): TerminalSession => {
     frame = 0;
     const chunk = pending;
     pending = "";
+
     if (chunk !== "") {
       terminal?.write(chunk);
     }
@@ -230,10 +241,12 @@ export const createTerminalSession = (): TerminalSession => {
       cancelAnimationFrame(frame);
       frame = 0;
     }
+
     if (fitting !== 0) {
       cancelAnimationFrame(fitting);
       fitting = 0;
     }
+
     pending = "";
     observer?.disconnect();
     observer = null;
@@ -253,21 +266,27 @@ export const createTerminalSession = (): TerminalSession => {
   const create = async (mine: number): Promise<void> => {
     const opened = connection;
     const host = panel;
+
     if (opened === null || host === null) {
       return;
     }
+
     try {
       const ghostty = await ensureGhostty();
+
       if (mine !== epoch || connection !== opened || panel !== host) {
         return;
       }
+
       disposeShell();
+
       const next = new ghostty.Terminal({
         fontFamily: TERMINAL_FONT,
         fontSize: TERMINAL_FONT_SIZE,
         scrollback: TERMINAL_SCROLLBACK,
         theme: readTheme(),
       });
+
       const addon = new ghostty.FitAddon();
       next.loadAddon(addon);
       const shellHost = document.createElement("div");
@@ -291,9 +310,11 @@ export const createTerminalSession = (): TerminalSession => {
       watch(host);
       refit();
       await opened.call("terminal.open", { cols: next.cols, rows: next.rows });
+
       if (mine !== epoch || connection !== opened) {
         return;
       }
+
       ready = true;
       failure = "";
       // The panel may still be laying out: fit again on the next frame.
@@ -302,6 +323,7 @@ export const createTerminalSession = (): TerminalSession => {
       failure = errorMessage(error);
       ready = false;
     }
+
     notify();
   };
 
@@ -335,6 +357,7 @@ export const createTerminalSession = (): TerminalSession => {
       connection = opened;
       unwatch = stopWrites(opened);
       failure = "";
+
       // A frame that lands while mounted (a ref change remounts the browser
       // under a standing panel) rebuilds the shell in place: the old frame,
       // and the shell in it, go away. The generation abandons any build the
@@ -346,6 +369,7 @@ export const createTerminalSession = (): TerminalSession => {
         creating = buildShell(epoch);
         void creating;
       }
+
       notify();
     },
     detach: async (opened) => {
@@ -355,12 +379,14 @@ export const createTerminalSession = (): TerminalSession => {
         // own teardown's business.
         return;
       }
+
       connection = null;
       unwatch?.();
       unwatch = null;
       creating = null;
       disposeShell();
       notify();
+
       try {
         // oxlint-disable-next-line unicorn/no-useless-undefined -- the protocol's paramless kinds still take their (undefined) params slot.
         await opened.call("terminal.close", undefined);
@@ -373,13 +399,16 @@ export const createTerminalSession = (): TerminalSession => {
     mount: (host) => {
       panel = host;
       const running = terminal;
+
       if (running !== null) {
         // A remount: the shell survived hidden — move it back in, relearn
         // the theme (light/dark may have flipped), and refit.
         const parked = shell;
+
         if (parked !== null && parked.parentElement !== host) {
           host.append(parked);
         }
+
         running.options.theme = readTheme();
         // The pane is new (it was built with this panel), so the shell's box
         // is not the one it was fitted to: watch it, measure it now and again
@@ -387,19 +416,24 @@ export const createTerminalSession = (): TerminalSession => {
         // hidden grid and nothing else redraws it on show.
         watch(host);
         refitSoon();
+
         return Promise.resolve();
       }
+
       // Mounting before the frame lands (the panel paints long before the
       // workspace opens) is the normal order, not an error: `attach` builds
       // once the frame is here.
       if (connection === null) {
         return Promise.resolve();
       }
+
       creating ??= buildShell(epoch);
+
       return creating;
     },
     subscribe: (listener) => {
       listeners.add(listener);
+
       return () => {
         listeners.delete(listener);
       };
@@ -410,10 +444,12 @@ export const createTerminalSession = (): TerminalSession => {
       // of the document (nothing to measure, nothing to draw): the next mount
       // points the observer at the pane it moves the shell into.
       observer?.disconnect();
+
       if (fitting !== 0) {
         cancelAnimationFrame(fitting);
         fitting = 0;
       }
+
       // Out of the panel, not out of existence: the div keeps the canvas, its
       // scrollback and its shell, and the next mount moves it back.
       shell?.remove();

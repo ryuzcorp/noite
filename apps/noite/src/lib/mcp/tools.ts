@@ -89,12 +89,14 @@ const requireApp = async (
       throw error;
     }
   }
+
   try {
     return await requireAppRole(ref, userId, need);
   } catch (error) {
     if (!(error instanceof UnauthorizedError)) {
       throw error;
     }
+
     throw new McpToolError(
       `No app "${ref}" this account can ${NEEDS[need]} (it may not exist, or you may not be a collaborator).`
     );
@@ -107,10 +109,12 @@ const displayName = async (userId: string): Promise<string> => {
   const rows = await withDb(
     Effect.gen(function* () {
       const sql = yield* SqlClient;
+
       return yield* sql<{ name: string }>`
         SELECT name FROM "user" WHERE id = ${userId} LIMIT 1`;
     })
   );
+
   return rows[0]?.name?.trim() ?? "";
 };
 
@@ -125,6 +129,7 @@ const iso = (unixSeconds: number): string =>
 const appUrl = (remoteUrl: string, subdomain: string): string => {
   const parsed = new URL(remoteUrl);
   const port = parsed.port === "" ? "" : `:${parsed.port}`;
+
   return `${parsed.protocol}//${subdomain}${port}`;
 };
 
@@ -138,6 +143,7 @@ const envUrl = (
 ): string => {
   const parsed = new URL(remoteUrl);
   const port = parsed.port === "" ? "" : `:${parsed.port}`;
+
   return `${parsed.protocol}//${label}.${subdomain}${port}`;
 };
 
@@ -157,11 +163,13 @@ const requireEnvironment = async (
 ): Promise<RunnerEnvironment> => {
   const environments = await appEnvironments(app.id, role);
   const found = environments.find((env) => env.id === ref || env.label === ref);
+
   if (!found) {
     throw new McpToolError(
       `No environment "${ref}" in ${app.slug}. List them with list_environments (a label or an id).`
     );
   }
+
   return found;
 };
 
@@ -279,6 +287,7 @@ const toCreateSource = (
   if (!source || source.kind === "blank") {
     return { kind: "blank" };
   }
+
   if (source.kind === "github") {
     return {
       kind: "git",
@@ -287,6 +296,7 @@ const toCreateSource = (
       url: source.url,
     };
   }
+
   return { id: source.template, kind: "template" };
 };
 
@@ -298,17 +308,20 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     params: NoArgs,
     run: async ({ userId }) => {
       const apps = await listAppsForCollaborator(userId);
+
       if (apps.length === 0) {
         return {
           structured: { apps: [] },
           text: "No apps yet. Create one with create_app.",
         };
       }
+
       // One batched git.remote gives every app's public URL (the git base
       // carries the scheme and dev port) without a round trip per app.
       const remotes = await runnerRpcBatch<RunnerGitRemote>(
         apps.map((app) => ({ method: "git.remote", params: { id: app.id } }))
       );
+
       const rows = apps.map((app, index) => ({
         id: app.id,
         lastDeploySha: app.lastDeploySha,
@@ -317,6 +330,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         status: app.status,
         url: appUrl(remotes[index].url, app.subdomain),
       }));
+
       return {
         structured: { apps: rows },
         text: [
@@ -338,6 +352,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       const { app, role } = await requireApp(userId, ref, "view");
       const remote = await runnerGitRemote(app.id);
       const url = appUrl(remote.url, app.subdomain);
+
       return {
         structured: { app: { ...app, role, url }, gitRemote: remote.url },
         text: `${app.slug} — ${app.name}\nstatus: ${app.status} (desired ${app.desiredState})\nrole: ${role}\nurl: ${url}\ngit: ${remote.url}${app.lastError === null ? "" : `\nlast error: ${app.lastError}`}`,
@@ -372,23 +387,28 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     run: async ({ userId }, { name, slug, source }) => {
       const normalized = slug.trim().toLowerCase();
       const problem = slugError(normalized);
+
       if (problem) {
         throw new McpToolError(problem, { invalid: true });
       }
+
       const app = await createAppForUser({
         account: { id: userId, name: await displayName(userId) },
         name: name?.trim() || normalized,
         slug: normalized,
         source: toCreateSource(source),
       });
+
       const remote = await runnerGitRemote(app.id);
       const url = appUrl(remote.url, app.subdomain);
+
       const pushInstructions = [
         "git init -b main",
         'git add -A && git commit -m "Initial commit"',
         `git remote add origin ${remote.url}`,
         'git push -u origin main  # username "git", password: your Noite API key',
       ].join("\n");
+
       return {
         structured: {
           app: {
@@ -421,23 +441,29 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     params: appParams({ environment: Schema.optional(EnvironmentRef) }),
     run: async ({ userId }, { app: ref, environment }) => {
       const { app, role } = await requireApp(userId, ref, "view");
+
       const env = environment
         ? await requireEnvironment(app, role, environment)
         : null;
+
       const deploys = await runnerRpc<RunnerDeploy[]>(
         "deploys.list",
         env === null ? { id: app.id } : { environmentId: env.id, id: app.id }
       );
+
       const recent = deploys.slice(0, 5);
       const latest = recent.at(0) ?? null;
       // An environment has no `subdomain`: its host is `<label>.<app host>`.
       const where = env === null ? app.slug : `${app.slug}/${env.label}`;
       const status = env === null ? app.status : env.status;
       const desiredState = env === null ? app.desiredState : env.desiredState;
+
       const lastDeploySha =
         env === null ? app.lastDeploySha : env.lastDeploySha;
+
       const lastError = env === null ? app.lastError : env.lastError;
       const live = status === "running";
+
       return {
         structured: {
           appId: app.id,
@@ -478,17 +504,23 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     run: async ({ userId }, { app: ref, deployId }) => {
       const { app } = await requireApp(userId, ref, "view");
       let wanted = deployId;
+
       if (!wanted) {
         const deploys = await runnerRpc<RunnerDeploy[]>("deploys.list", {
           id: app.id,
         });
+
         const [latest] = deploys;
+
         if (!latest) {
           throw new McpToolError(`${app.slug} has no deploys yet.`);
         }
+
         wanted = latest.id;
       }
+
       const { log } = await runnerDeployLog(app.id, wanted);
+
       return {
         structured: { appId: app.id, deployId: wanted, log, slug: app.slug },
         text: log === "" ? `${wanted}: no log output yet.` : log,
@@ -514,6 +546,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       const { app } = await requireApp(userId, ref, "view");
       const all = await runnerRpc<string[]>("logs.get", { id: app.id });
       const lines = all.slice(-(limit ?? 200));
+
       return {
         structured: { appId: app.id, lines, slug: app.slug, total: all.length },
         text:
@@ -534,10 +567,12 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     }),
     run: async ({ userId }, { app: ref, status }) => {
       const { app } = await requireApp(userId, ref, "view");
+
       const list = await runnerRpc<RunnerErrorList>("errors.list", {
         id: app.id,
         status: status ?? "open",
       });
+
       const issues = list.issues.slice(0, 50).map((issue) => ({
         count: issue.count,
         culprit: issue.culprit,
@@ -547,7 +582,9 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         message: issue.message,
         status: issue.status,
       }));
+
       const counts = `${list.counts.open} open, ${list.counts.resolved} resolved, ${list.counts.ignored} ignored`;
+
       return {
         structured: {
           appId: app.id,
@@ -576,10 +613,13 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     run: async ({ userId }, { app: ref }) => {
       const { app } = await requireApp(userId, ref, "view");
       const rows = await runnerListEnv(app.id);
+
       const env = rows.map((row) => {
         const { name, updatedAt, value } = redactEnv(row);
+
         return { name, updatedAt, value };
       });
+
       return {
         structured: { appId: app.id, env, slug: app.slug },
         text:
@@ -606,6 +646,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     run: async ({ userId }, { app: ref, key, value }) => {
       const { app } = await requireApp(userId, ref, "admin");
       await runnerSetEnv(app.id, key, value);
+
       return {
         structured: { appId: app.id, key, ok: true, slug: app.slug },
         text: `Set ${key} on ${app.slug}. The next deploy picks it up.`,
@@ -623,6 +664,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     run: async ({ userId }, { app: ref, key }) => {
       const { app } = await requireApp(userId, ref, "admin");
       await runnerDeleteEnv(app.id, key);
+
       return {
         structured: { appId: app.id, key, ok: true, slug: app.slug },
         text: `Removed ${key} from ${app.slug}.`,
@@ -638,9 +680,11 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       const { app, role } = await requireApp(userId, ref, "view");
       const environments = await appEnvironments(app.id, role);
       const remote = await runnerGitRemote(app.id);
+
       const rows = environments.map((env) =>
         environmentRow(env, app.subdomain, remote.url)
       );
+
       return {
         structured: { appId: app.id, environments: rows, slug: app.slug },
         text:
@@ -667,6 +711,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       const env = await runnerEnvironmentCreate(app.id, branch, role);
       const remote = await runnerGitRemote(app.id);
       const row = environmentRow(env, app.subdomain, remote.url);
+
       return {
         structured: { appId: app.id, environment: row, slug: app.slug },
         text: [
@@ -686,6 +731,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       const { app, role } = await requireApp(userId, ref, "admin");
       const env = await requireEnvironment(app, role, environment);
       await runnerEnvironmentDelete(app.id, env.id, role);
+
       return {
         structured: {
           appId: app.id,
@@ -707,6 +753,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       const { app, role } = await requireApp(userId, ref, "push");
       const env = await requireEnvironment(app, role, environment);
       const result = await runnerEnvironmentDeploy(app.id, env.id, role);
+
       return {
         structured: {
           appId: app.id,
@@ -733,14 +780,17 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     run: async ({ userId }, { app: ref, environment, public: isPublic }) => {
       const { app, role } = await requireApp(userId, ref, "admin");
       const before = await requireEnvironment(app, role, environment);
+
       const env = await runnerEnvironmentUpdate(
         app.id,
         before.id,
         isPublic,
         role
       );
+
       const remote = await runnerGitRemote(app.id);
       const row = environmentRow(env, app.subdomain, remote.url);
+
       return {
         structured: { appId: app.id, environment: row, slug: app.slug },
         text: `${row.label} is now ${isPublic ? "public" : "members-only"}: ${row.url}`,
@@ -756,10 +806,13 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       const { app, role } = await requireApp(userId, ref, "view");
       const env = await requireEnvironment(app, role, environment);
       const rows = await runnerEnvironmentVars(app.id, env.id, role);
+
       const env2 = rows.map((row) => {
         const { name, updatedAt, value } = redactEnv(row);
+
         return { name, updatedAt, value };
       });
+
       return {
         structured: {
           appId: app.id,
@@ -795,6 +848,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       const { app, role } = await requireApp(userId, ref, "push");
       const env = await requireEnvironment(app, role, environment);
       await runnerEnvironmentVarSet(app.id, env.id, key, value, role);
+
       return {
         structured: {
           appId: app.id,
@@ -822,6 +876,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       const { app, role } = await requireApp(userId, ref, "push");
       const env = await requireEnvironment(app, role, environment);
       await runnerEnvironmentVarDelete(app.id, env.id, key, role);
+
       return {
         structured: {
           appId: app.id,
@@ -843,6 +898,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     run: async ({ userId }, { app: ref }) => {
       const { app } = await requireApp(userId, ref, "view");
       const refs: GitRefs = await runnerGitRefs(app.id);
+
       return {
         structured: { appId: app.id, refs, slug: app.slug },
         text: [
@@ -863,6 +919,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     run: async ({ userId }, { app: ref, ref: revision }) => {
       const { app } = await requireApp(userId, ref, "view");
       const tree: RunnerTree = await runnerSourceTree(app.id, revision);
+
       return {
         structured: {
           appId: app.id,
@@ -886,11 +943,13 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
       const { app } = await requireApp(userId, ref, "view");
       const blob: RunnerBlob = await runnerSourceBlob(app.id, path, revision);
       let note = "";
+
       if (blob.binary) {
         note = " (binary: contents omitted)";
       } else if (blob.truncated) {
         note = " (truncated)";
       }
+
       return {
         structured: {
           appId: app.id,
@@ -922,11 +981,13 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     }),
     run: async ({ userId }, { app: ref, path, ref: revision, skip }) => {
       const { app } = await requireApp(userId, ref, "view");
+
       const log: GitLog = await runnerGitLog(app.id, {
         path,
         ref: revision,
         skip,
       });
+
       const structured = {
         appId: app.id,
         log,
@@ -934,13 +995,16 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         ref: revision ?? null,
         slug: app.slug,
       };
+
       if (log.commits.length === 0) {
         return {
           structured,
           text: `${app.slug}: no commits${path === undefined ? "" : ` touching ${path}`}.`,
         };
       }
+
       const tail = log.nextSkip === null ? [] : [`next: skip ${log.nextSkip}`];
+
       return {
         structured,
         text: [
@@ -965,6 +1029,7 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     run: async ({ userId }, { app: ref, sha }) => {
       const { app } = await requireApp(userId, ref, "view");
       const detail: GitCommitDetail = await runnerGitCommit(app.id, sha);
+
       return {
         structured: { appId: app.id, detail, slug: app.slug },
         text: [

@@ -14,6 +14,7 @@ const SetEnvArgs = Schema.Struct({
   name: Schema.String,
   value: Schema.String,
 });
+
 const DeleteEnvArgs = Schema.Struct({
   appId: Schema.String,
   name: Schema.String,
@@ -41,6 +42,7 @@ export const listEnv = apiAction(
   async (appId, { env, request }): Promise<EnvVarView[]> => {
     await requireViewApp(request, env, appId);
     const rows = await runnerListEnv(appId);
+
     return rows.map((row) => redactEnv(row));
   }
 );
@@ -50,6 +52,7 @@ export const setEnv = apiAction(
   async ({ appId, name, value }, { env, request }) => {
     const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "admin");
+
     try {
       return await runnerSetEnv(appId, name, value);
     } catch (error) {
@@ -63,6 +66,7 @@ export const deleteEnv = apiAction(
   async ({ appId, name }, { env, request }) => {
     const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "admin");
+
     try {
       return await runnerDeleteEnv(appId, name);
     } catch (error) {
@@ -77,9 +81,12 @@ export const envDotVars = apiAction(AppId, async (appId, { env, request }) => {
   const user = await sessionUser(request, env);
   await requireAppRole(appId, user.id, "admin");
   const rows = await runnerListEnv(appId);
+
   const lines = rows.map(({ name, value }) => {
     const escaped = value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+
     return /\s|#/u.test(value) ? `${name}="${escaped}"` : `${name}=${escaped}`;
   });
+
   return lines.join("\n");
 });

@@ -36,10 +36,12 @@ export const PrsList = ({
   const data = res.data();
   const error = res.error();
   const pulls = data?.pullRequests ?? [];
+
   const names = prNames(
     appId,
     pulls.map((pull) => pull.authorId)
   ).data();
+
   const loading = data === undefined && error === undefined;
   // A deletion can leave `?skip=` past the end (and the page empty): clamp it
   // back to the page that holds the last row. Reacting to the resource's
@@ -48,10 +50,12 @@ export const PrsList = ({
     if (value === undefined || value.pullRequests.length > 0 || skip() === 0) {
       return;
     }
+
     const known =
       state === "all"
         ? value.counts.open + value.counts.closed + value.counts.merged
         : value.counts[state];
+
     if (known > 0) {
       skip.set(
         Math.max(0, (Math.ceil(known / PR_PAGE_SIZE) - 1) * PR_PAGE_SIZE)
@@ -60,20 +64,25 @@ export const PrsList = ({
   });
   const counts = data?.counts;
   let total: number | undefined;
+
   if (counts !== undefined) {
     total =
       state === "all"
         ? counts.open + counts.closed + counts.merged
         : counts[state];
   }
+
   const hasNext =
     total !== undefined && skip() + pulls.length < total && pulls.length > 0;
+
   let emptyMessage = `No ${state} pull requests.`;
+
   if (state === "open") {
     emptyMessage = "No open pull requests.";
   } else if (state === "all") {
     emptyMessage = "No pull requests.";
   }
+
   const compareLink = (
     <Link
       class="link link-hover text-sm"

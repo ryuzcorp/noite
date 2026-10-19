@@ -58,9 +58,11 @@ const decodeResponse = Schema.decodeUnknownSync(
  * endpoint's JSON shape. */
 const refusalReason = (body: string, fallback: string): string => {
   const text = body.trim();
+
   if (text === "") {
     return fallback;
   }
+
   try {
     return Schema.decodeUnknownSync(Refusal)(JSON.parse(text)).error;
   } catch {
@@ -86,6 +88,7 @@ export const callTool = <T>(
 ): Effect.Effect<ToolCall<T>, Error> =>
   Effect.gen(function* run() {
     const { appUrl, token } = connection;
+
     const response = yield* Effect.tryPromise({
       catch: (cause) =>
         new Error(`cannot reach ${appUrl}/mcp: ${String(cause)}`),
@@ -107,7 +110,9 @@ export const callTool = <T>(
           signal: AbortSignal.timeout(TIMEOUT_MS),
         }),
     });
+
     const body = yield* Effect.promise(() => response.text());
+
     if (!response.ok) {
       return yield* Effect.fail(
         new Error(
@@ -115,36 +120,45 @@ export const callTool = <T>(
         )
       );
     }
+
     const payload = yield* Effect.try({
       catch: () =>
         new Error(`${name}: the MCP response is not a JSON-RPC message`),
       try: () => decodeResponse(body),
     });
+
     const { error, result } = payload;
+
     if (error) {
       return yield* Effect.fail(
         new Error(`MCP ${name}: ${error.code} ${error.message}`)
       );
     }
+
     if (result === undefined) {
       return yield* Effect.fail(new Error(`MCP ${name}: no result`));
     }
+
     const text = (result.content ?? [])
       .map((part) => part.text ?? "")
       .join("\n")
       .trim();
+
     if (result.isError) {
       return yield* Effect.fail(
         new Error(text === "" ? `${name} failed` : text)
       );
     }
+
     if (result.structuredContent === undefined) {
       return yield* Effect.fail(
         new Error(`MCP ${name}: no structured content`)
       );
     }
+
     // SAFETY: the caller names the tool and its result shape; the published
     // schema is the server's half of that contract.
     const structured = result.structuredContent as T;
+
     return { structured, text };
   });

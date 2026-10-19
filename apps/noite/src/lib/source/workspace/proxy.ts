@@ -108,16 +108,21 @@ const tieToSignal = (
       // No signal: nothing was tied, nothing to untie.
     };
   }
+
   const close = (): void => {
     void connection.close();
   };
+
   if (signal.aborted) {
     close();
+
     return () => {
       // Already closed above.
     };
   }
+
   signal.addEventListener("abort", close, { once: true });
+
   return () => {
     signal.removeEventListener("abort", close);
   };
@@ -143,17 +148,21 @@ export const openSourceWorkspace = async (
    * archive only while it is: an ask at any other time would make this page a
    * general fetch proxy for a compromised frame. */
   let opening = false;
+
   const onAsk = async (ask: PodAskMessage): Promise<PodAskAnswer> => {
     if (ask.ask !== "archive") {
       throw new Error(`the frame asked for an unsupported "${ask.ask}"`);
     }
+
     if (!opening) {
       throw new Error("the frame asked for an archive outside an open");
     }
+
     const bytes = await fetchArchive(ask.p.sha);
     // SAFETY: `fetchSourceArchive` allocates the view over the whole response
     // buffer, so the transfer takes exactly these bytes and nothing else.
     const buffer = bytes.buffer as ArrayBuffer;
+
     return { transfer: [buffer], value: { bytes: buffer } };
   };
 
@@ -176,9 +185,11 @@ export const openSourceWorkspace = async (
   let changes: WorkspaceChange[] = [];
   let base = "";
   const subscribers = new Set<(next: WorkspaceChange[]) => void>();
+
   const peerSubscribers = new Set<
     (structural: boolean, paths: readonly string[]) => void
   >();
+
   const watches = new Map<
     number,
     (event: string, filename: string | null) => void
@@ -188,6 +199,7 @@ export const openSourceWorkspace = async (
     const { changes: rows, baseSha } = event;
     changes = rows;
     base = baseSha;
+
     for (const notify of subscribers) {
       notify(rows);
     }
@@ -205,6 +217,7 @@ export const openSourceWorkspace = async (
   });
 
   let opened: { baseSha: string; editable: boolean; stale: string | null };
+
   try {
     opening = true;
     opened = await connection.call(
@@ -221,6 +234,7 @@ export const openSourceWorkspace = async (
     opening = false;
     untie();
   }
+
   base = opened.baseSha;
 
   /** Every path's write slot, so a keystroke burst is one write in flight and
@@ -233,9 +247,11 @@ export const openSourceWorkspace = async (
    * burst typed is always the text the pod ends up with. */
   const drain = (path: string): void => {
     const writer = writers.get(path);
+
     if (writer === undefined || writer.writing) {
       return;
     }
+
     writer.writing = true;
     void (async () => {
       while (writer.pending !== null) {
@@ -243,6 +259,7 @@ export const openSourceWorkspace = async (
         const { waiting } = writer;
         writer.pending = null;
         writer.waiting = [];
+
         try {
           // The keystroke path is the facade's own: the page speaks checkout
           // paths, and the frame's `fs.write` is one of the pod-path kinds
@@ -252,6 +269,7 @@ export const openSourceWorkspace = async (
             data: text,
             path: projectPath(path),
           });
+
           for (const call of waiting) {
             call.resolve();
           }
@@ -265,12 +283,15 @@ export const openSourceWorkspace = async (
           const stranded = [...waiting, ...writer.waiting];
           writer.pending = null;
           writer.waiting = [];
+
           for (const call of stranded) {
             call.reject(error);
           }
+
           return;
         }
       }
+
       writer.writing = false;
       writers.delete(path);
     })();
@@ -284,9 +305,11 @@ export const openSourceWorkspace = async (
   const shipPending = (): void => {
     for (const [path, writer] of writers) {
       const text = writer.pending;
+
       if (text === null) {
         continue;
       }
+
       writer.pending = null;
       const { waiting } = writer;
       writer.waiting = [];
@@ -296,6 +319,7 @@ export const openSourceWorkspace = async (
             data: text,
             path: projectPath(path),
           });
+
           for (const call of waiting) {
             call.resolve();
           }
@@ -316,12 +340,14 @@ export const openSourceWorkspace = async (
       waiting: [],
       writing: false,
     };
+
     writers.set(path, writer);
     // oxlint-disable-next-line typescript/no-invalid-void-type -- the write answers nothing, so `void` is its honest result; the rule reads the generic argument as a declaration.
     const written = Promise.withResolvers<void>();
     writer.pending = text;
     writer.waiting.push({ reject: written.reject, resolve: written.resolve });
     drain(path);
+
     return written.promise;
   };
 
@@ -351,21 +377,27 @@ export const openSourceWorkspace = async (
             path,
             recursive: opts.recursive,
           });
+
           const { watchId: startedId } = started;
           watchId = startedId;
+
           if (closed) {
             void connection.call("fs.unwatch", { watchId: startedId });
+
             return;
           }
+
           watches.set(startedId, notify);
         } catch {
           // The frame is gone: there is nothing left to watch.
         }
       })();
+
       return {
         close: () => {
           closed = true;
           const id = watchId;
+
           if (id !== null) {
             watches.delete(id);
             void connection.call("fs.unwatch", { watchId: id });
@@ -393,11 +425,13 @@ export const openSourceWorkspace = async (
         // Nothing left to do about a save that failed: the pod goes away
         // either way, and the frame's own `saveError` already said so.
       }
+
       try {
         await connection.call("close", undefined, { timeout: 0 });
       } catch {
         // A teardown the frame did not finish is still a frame to remove.
       }
+
       await connection.close();
     },
     discard: (path) => connection.call("discard", { path }),
@@ -411,12 +445,14 @@ export const openSourceWorkspace = async (
     mkdir: (path) => connection.call("mkdir", { path }),
     onChanges: (notify) => {
       subscribers.add(notify);
+
       return () => {
         subscribers.delete(notify);
       };
     },
     onPeerChange: (notify) => {
       peerSubscribers.add(notify);
+
       return () => {
         peerSubscribers.delete(notify);
       };
@@ -425,7 +461,9 @@ export const openSourceWorkspace = async (
       const prepared = await connection.call("push.prepare", request, {
         timeout: 0,
       });
+
       const { target } = request;
+
       try {
         const { sha: committed } = await commit(prepared.payload);
         await connection.call("push.settle", {
@@ -443,6 +481,7 @@ export const openSourceWorkspace = async (
         } catch {
           // The frame is gone, so there is nothing left to settle on.
         }
+
         throw error;
       }
     },
@@ -456,6 +495,7 @@ export const openSourceWorkspace = async (
     writeBytes: (path, bytes) => connection.call("writeBytes", { bytes, path }),
     writeText,
   };
+
   /* oxlint-enable unicorn/no-useless-undefined */
   return { connection, workspace };
 };

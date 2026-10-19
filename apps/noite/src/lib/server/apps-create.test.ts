@@ -58,8 +58,10 @@ describe("createAppForUser", () => {
       expect(errorMessage(error)).toContain("D1 is down");
       expect(runner.calls).toEqual(["apps.create", "apps.delete"]);
       expect(runner.apps).toEqual([]);
+
       return;
     }
+
     throw new Error("expected createAppForUser to reject");
   });
 });

@@ -61,15 +61,18 @@ const rowsQuery = (
 /** One cell of a rows result (missing row/column is null). */
 const cell = (result: D1Rows, column: string, rowIndex = 0): D1Cell => {
   const index = result.columns.indexOf(column);
+
   if (index === -1) {
     throw new Error(`no column ${column}`);
   }
+
   return result.rows[rowIndex]?.[index] ?? null;
 };
 
 /** Total rows the query matches on the `nums` fixture. */
 const numsTotal = async (extra: Partial<D1RowsQuery>): Promise<number> => {
   const result = await controlRows(db.d1, rowsQuery("nums", extra));
+
   return result.total;
 };
 
@@ -187,10 +190,12 @@ describe("rows", () => {
     for (let i = 0; i < 5; i += 1) {
       addInvite(`i${i}`, `CODE-${i}`, `note ${i}`);
     }
+
     const first = await controlRows(
       db.d1,
       rowsQuery("invite", { pageSize: 2 })
     );
+
     expect(first.columns[0]).toBe("id");
     expect(first.total).toBe(5);
     expect(first.page).toBe(0);
@@ -198,10 +203,12 @@ describe("rows", () => {
     expect(first.rows).toHaveLength(2);
     // No sort: the primary key order (id ASC).
     expect(cell(first, "id", 0)).toBe("i0");
+
     const last = await controlRows(
       db.d1,
       rowsQuery("invite", { page: 2, pageSize: 2 })
     );
+
     expect(last.rows).toHaveLength(1);
     expect(cell(last, "id")).toBe("i4");
   });
@@ -211,6 +218,7 @@ describe("rows", () => {
       db.d1,
       rowsQuery("invite", { page: -3, pageSize: 1000 })
     );
+
     expect(result.page).toBe(0);
     expect(result.pageSize).toBe(100);
   });
@@ -224,15 +232,19 @@ describe("rows", () => {
 
   test("sorts by the requested column", async () => {
     addNums();
+
     const desc = await controlRows(
       db.d1,
       rowsQuery("nums", { sort: { column: "n", desc: true } })
     );
+
     expect(cell(desc, "n", 0)).toBe("4");
+
     const asc = await controlRows(
       db.d1,
       rowsQuery("nums", { sort: { column: "n", desc: false } })
     );
+
     expect(cell(asc, "n", 0)).toBe("1");
   });
 
@@ -269,6 +281,7 @@ describe("rows", () => {
 
   test("ANDs the filters and refuses more than ten", async () => {
     addNums();
+
     const result = await controlRows(
       db.d1,
       rowsQuery("nums", {
@@ -278,6 +291,7 @@ describe("rows", () => {
         ],
       })
     );
+
     expect(result.total).toBe(2);
     await expect(
       controlRows(
@@ -336,16 +350,20 @@ describe("rows", () => {
         rowsQuery("session", { sort: { column: "token", desc: false } })
       )
     ).rejects.toThrow(/redacted and cannot be sorted/u);
+
     // Search silently skips it: the secret must not be a reachable oracle.
     const secretSearch = await controlRows(
       db.d1,
       rowsQuery("session", { search: "zzz-secret-token" })
     );
+
     expect(secretSearch.total).toBe(0);
+
     const idSearch = await controlRows(
       db.d1,
       rowsQuery("session", { search: "s1" })
     );
+
     expect(idSearch.total).toBe(1);
   });
 });
@@ -375,6 +393,7 @@ describe("write refusals", () => {
         }),
       ]
     );
+
     await Promise.all(
       refusals.map((promise) => expect(promise).rejects.toThrow(/read-only/u))
     );
@@ -429,6 +448,7 @@ describe("write refusals", () => {
   test("user.role and the ban columns are refused: the Users tab owns them", async () => {
     addUser("u1");
     const refusals = ["role", "banned", "banReason", "banExpires"];
+
     for (const column of refusals) {
       // oxlint-disable-next-line eslint/no-await-in-loop -- sequential policy refusals, one column at a time
       await expect(
@@ -441,6 +461,7 @@ describe("write refusals", () => {
         })
       ).rejects.toThrow(/Users tab/u);
     }
+
     // The row itself stays writable: banning and role changes are the Users
     // tab's actions (admin.server banUser/unbanUser/setUserRole), not this raw
     // editor, but a plain profile update is still allowed here.
@@ -550,12 +571,14 @@ describe("permitted writes", () => {
         note: "first",
       },
     });
+
     // SAFETY: the query selects exactly these two columns from bun:sqlite,
     // which returns one plain row object (or null).
     const inserted = db.raw.query(`SELECT id, note FROM invite`).get() as {
       id: string;
       note: string;
     } | null;
+
     expect(inserted?.note).toBe("first");
     expect(inserted?.id).toBe("11111111-1111-1111-1111-111111111111");
 
@@ -617,6 +640,7 @@ describe("permitted writes", () => {
       table: "invite",
       values: { code: "CODE", createdBy: "admin1", id: "i1" },
     });
+
     // SAFETY: the query selects exactly these columns from bun:sqlite, which
     // returns one plain row object (or null).
     const row = db.raw
@@ -626,6 +650,7 @@ describe("permitted writes", () => {
       note: string | null;
       revoked: number;
     } | null;
+
     // revoked/createdAt are NOT NULL with defaults: omitted, they take the
     // default instead of a NULL that would violate the schema.
     expect(row?.revoked).toBe(0);
@@ -639,11 +664,13 @@ describe("permitted writes", () => {
       table: "invite",
       values: { code: "NO-ID", createdBy: "a" },
     });
+
     // SAFETY: the query selects exactly `id` from bun:sqlite, which returns
     // one plain row object (or null).
     const generated = db.raw
       .query(`SELECT id FROM invite WHERE code = 'NO-ID'`)
       .get() as { id: string } | null;
+
     expect(generated?.id).toHaveLength(36);
     // Other NOT NULL columns without a default are still required.
     await expect(
@@ -675,11 +702,13 @@ describe("permitted writes", () => {
     addInvite("i2", "C2", "b");
     addInvite("i3", "C3", "c");
     const before = db.executed.length;
+
     const result = await deleteControlRows(db.d1, {
       actorId: "admin1",
       keys: [{ id: "i1" }, { id: "i2" }, { id: "i3" }],
       table: "invite",
     });
+
     expect(result).toEqual({ deleted: 3, ok: true });
     expect(
       db.executed.slice(before).filter((sql) => sql.startsWith("DELETE"))

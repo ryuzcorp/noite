@@ -22,18 +22,22 @@ const ASCII_ALNUM = /^[A-Za-z0-9]$/u;
 export const sanitizedLabel = (raw: string): string => {
   let out = "";
   let dash = true;
+
   for (const char of raw) {
     if (ASCII_ALNUM.test(char)) {
       out += char.toLowerCase();
       dash = false;
       continue;
     }
+
     if (!dash) {
       out += "-";
       dash = true;
     }
   }
+
   out = out.slice(0, MAX_LABEL).replace(/-+$/u, "");
+
   return out === "" ? "env" : out;
 };
 
@@ -60,6 +64,7 @@ export const environmentExpiresAt = (
   const from = Date.parse(
     environment.lastDeployedAt ?? environment.createdAt ?? ""
   );
+
   return Number.isNaN(from) ? null : from + ENVIRONMENT_TTL_HOURS * HOUR_MS;
 };
 
@@ -71,13 +76,17 @@ export const expiryLabel = (
   now: number = Date.now()
 ): string | null => {
   const at = environmentExpiresAt(environment);
+
   if (at === null) {
     return null;
   }
+
   const days = Math.ceil((at - now) / DAY_MS);
+
   if (days <= 0) {
     return "expires soon";
   }
+
   return `expires in ${days} ${days === 1 ? "day" : "days"}`;
 };
 
@@ -94,9 +103,11 @@ const DIGEST_MOD = 2_147_483_647;
  * wrong deploy. */
 const digestOf = (text: string, seed: number): number => {
   let hash = seed;
+
   for (const char of text) {
     hash = (hash * 33 + (char.codePointAt(0) ?? 0)) % DIGEST_MOD;
   }
+
   return hash;
 };
 
@@ -113,12 +124,15 @@ export const changesFingerprint = (
   // Sorted, so the digest is the change set's content and not its order.
   const ordered = [...changes].toSorted((a, b) => (a.path < b.path ? -1 : 1));
   let hash = DIGEST_SEED;
+
   for (const change of ordered) {
     const key = `${change.path}\u0000${change.kind}\u0000${change.movedFrom ?? ""}\u0000${change.binary === undefined ? "t" : "b"}${change.binary ?? ""}`;
     hash = digestOf(key, hash);
+
     if (change.binary === undefined) {
       hash = digestOf(change.after, hash);
     }
   }
+
   return hash.toString(16);
 };

@@ -161,6 +161,7 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     if (hasRow(path)) {
       tree?.remove(path);
     }
+
     held.delete(path);
   };
 
@@ -182,6 +183,7 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
    * counts, and what a delete of it takes with it. */
   const filesUnder = (dir: string): string[] => {
     const prefix = dir === "" ? "" : `${dir}/`;
+
     return [...held].filter(
       (path) => !path.endsWith("/") && path.startsWith(prefix)
     );
@@ -204,15 +206,19 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
    * the checkout's rules exclude, which pierre paints dimmed beside them. A
    * no-op while neither set moved, so typing never repaints the tree. */
   let treeStatusKey = "";
+
   const syncStatus = () => {
     const entries = [...markers(host.changes()), ...ignored];
     const key = statusKey(entries);
+
     if (key === treeStatusKey) {
       return;
     }
+
     treeStatusKey = key;
     tree?.setGitStatus(entries);
   };
+
   /** The placeholder path the inline input is naming, if any. The naming flow
    * below owns it, but the flows it feeds need `resync` first — so this cell
    * is assigned with the naming flow and `resync` reads through it. */
@@ -239,13 +245,17 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
       // those children are exactly what implies the folder now — an empty or
       // ignored folder that just gained a file is the usual way to get here.
       const implied = new Set<string>();
+
       for (const row of next) {
         const parts = row.split("/");
+
         for (let i = 1; i < parts.length; i += 1) {
           implied.add(`${parts.slice(0, i).join("/")}/`);
         }
       }
+
       const pending = pendingPath === undefined ? undefined : pendingPath();
+
       for (const path of [...held].toSorted((a, b) => b.length - a.length)) {
         if (
           !wanted.has(path) &&
@@ -255,6 +265,7 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
           dropRow(path);
         }
       }
+
       for (const path of next.toSorted((a, b) => a.length - b.length)) {
         // A row pierre moved itself (its inline rename, a drag) is already in
         // its store under the new path: the mirror takes it from there.
@@ -262,8 +273,10 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
           held.add(path);
           continue;
         }
+
         store.add(path);
       }
+
       syncStatus();
     } catch (error) {
       toaster.notify(errorMessage(error));
@@ -277,15 +290,19 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
    * A caller that arrives mid-run is answered by the run after it. */
   let syncing: Promise<void> | null = null;
   let again = false;
+
   const resync = async (): Promise<void> => {
     if (syncing !== null) {
       again = true;
       await syncing;
+
       return;
     }
+
     do {
       again = false;
       syncing = syncRows();
+
       try {
         // oxlint-disable-next-line eslint/no-await-in-loop -- one run at a time is the point: a later listing must not overtake an earlier one.
         await syncing;
@@ -351,6 +368,7 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     toaster,
     treeReady: () => tree !== undefined,
   });
+
   // oxlint-disable-next-line eslint/prefer-destructuring -- assigning one cell, not unpacking a shape.
   pendingPath = naming.pendingPath;
 
@@ -371,33 +389,41 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     closeMenu();
     const { path } = target;
     const dir = menuDir(path);
+
     // The adds take focus themselves (pierre's inline input), so the menu
     // closes without handing it back to the tree.
     const newFile = () => {
       close({ restoreFocus: false });
       naming.startAdd(dir, false);
     };
+
     const newFolder = () => {
       close({ restoreFocus: false });
       naming.startAdd(dir, true);
     };
+
     const onUpload = () => {
       close({ restoreFocus: false });
       uploads.pick(dir);
     };
+
     if (path === null) {
       menu = openTreeMenu(
         newTreeMenu({ newFile, newFolder, onUpload }),
         point,
         close
       );
+
       return;
     }
+
     // A right-click inside a multi-selection acts on all of it; anywhere
     // else, on that row alone.
     const selected = tree?.getSelectedPaths() ?? [];
+
     const rows =
       selected.length > 1 && selected.includes(path) ? selected : [path];
+
     menu = openTreeMenu(
       newTreeMenu({
         deleteCount: rows.length,
@@ -429,12 +455,16 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
   const onTreeContextMenu = (event: MouseEvent) => {
     if (!host.editable()) {
       toaster.notify("This checkout is read-only.");
+
       return;
     }
+
     if (isTreeRow(event)) {
       return;
     }
+
     event.preventDefault();
+
     if (menu === null) {
       openMenu(
         { path: null },
@@ -451,13 +481,17 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     const deleting =
       event.key === "Delete" ||
       (event.key === "Backspace" && (event.metaKey || event.ctrlKey));
+
     if (!deleting || !host.editable() || renameInput(event) !== null) {
       return;
     }
+
     const rows = tree?.getSelectedPaths() ?? [];
+
     if (rows.length === 0) {
       return;
     }
+
     event.preventDefault();
     void flow.deleteRows(rows);
   };
@@ -495,21 +529,27 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     // the sensible default to open — and the tree highlights whichever file
     // lands open.
     const urlFile = host.file();
+
     const configFile = CONFIG_FILES.find((name) =>
       listing.files.includes(name)
     );
+
     const initial: string | undefined =
       urlFile !== "" && held.has(urlFile) ? urlFile : configFile;
+
     // Ancestor dirs of the initial file, so deep links land with
     // parents expanded (collapsed parents hide the selection and
     // block the focus scroll).
     const ancestors: string[] = [];
+
     if (initial) {
       const parts = initial.split("/");
+
       for (let i = 1; i < parts.length; i += 1) {
         ancestors.push(parts.slice(0, i).join("/"));
       }
     }
+
     tree?.cleanUp();
     // A rebuild drops the old tree with whatever menu or placeholder row it
     // was showing: the rows come straight back from the fresh input.
@@ -573,16 +613,19 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     // `browser.tsx`): the rows replace it rather than stack under it.
     host.treeEl.textContent = "";
     tree.render({ fileTreeContainer: host.treeEl });
+
     // An empty folder is a row nothing implies — git keeps none, so the
     // checkout only has one because someone made it here: pierre is told about
     // it by name. An excluded folder is named for the same reason: nothing
     // under it was listed, so no row of its own implies it either.
     for (const dir of [...listing.dirs, ...listing.ignoredDirs]) {
       const row = `${dir}/`;
+
       if (!hasRow(row)) {
         tree.add(row);
       }
     }
+
     return initial;
   };
 
@@ -593,24 +636,33 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
     if (!host.editable()) {
       return;
     }
+
     void (async () => {
       const wasOpen = host.getCurrentPath();
+
       try {
         await host.workspace().discardAll();
       } catch (error) {
         toaster.notify(errorMessage(error));
       }
+
       await resync();
       host.report();
+
       if (wasOpen !== null && hasRow(wasOpen)) {
         void host.openFile(wasOpen);
+
         return;
       }
+
       const wanted = host.file();
+
       if (wanted !== "" && hasRow(wanted)) {
         void host.openFile(wanted);
+
         return;
       }
+
       await host.syncOpen();
     })();
   };

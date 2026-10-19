@@ -44,15 +44,19 @@ export const forgeLog = (
 ): Resource<GitLog> => {
   const key = forgeKeys.log(appId, ref, path, skip);
   logKeys.add(key);
+
   return tracked(key, () => {
     // Absent, never `undefined`: the action encoder refuses non-JSON values.
     const args: GitLogInput = { appId, limit: LOG_PAGE_SIZE, skip };
+
     if (path !== "") {
       args.path = path;
     }
+
     if (ref !== "") {
       args.ref = ref;
     }
+
     return api<GitLog>("/api/forge/gitLog", args);
   });
 };
@@ -74,6 +78,7 @@ export const forgeCompare = (appId: string, base: string, head: string) =>
 export const invalidateForge = (appId: string): void => {
   invalidate(forgeKeys.refs(appId));
   const prefix = `forge:log:${appId}:`;
+
   for (const key of logKeys) {
     if (key.startsWith(prefix)) {
       invalidate(key);

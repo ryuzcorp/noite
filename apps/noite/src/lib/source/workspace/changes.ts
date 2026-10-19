@@ -74,12 +74,15 @@ interface Walked {
 const committedPaths = (base: BaseIndex): Committed => {
   const files = new Set(Object.keys(base.entries));
   const dirs = new Set<string>();
+
   for (const path of files) {
     const parts = path.split("/");
+
     for (let i = 1; i < parts.length; i += 1) {
       dirs.add(parts.slice(0, i).join("/"));
     }
   }
+
   return (path, isDir) => (isDir ? dirs.has(path) : files.has(path));
 };
 
@@ -96,12 +99,15 @@ const walk = async (
   committed: Committed
 ): Promise<Walked> => {
   const names = await fs.readdir(dir);
+
   const entries = await Promise.all(
     names.toSorted().map(async (name) => {
       const abs = `${dir}/${name}`;
+
       return { abs, stat: await fs.stat(abs) };
     })
   );
+
   // A `.gitignore` here layers over the ones above it, and is read before
   // anything beside it is judged. Writing one is an ordinary change: the next
   // walk reads it again, so an edit to the rules re-applies on its own.
@@ -112,12 +118,15 @@ const walk = async (
         relPath(dir)
       )
     : rules;
+
   const files: DiskFile[] = [];
   const folders: string[] = [];
   const ignoredFiles: string[] = [];
   const ignoredDirs: string[] = [];
+
   for (const entry of entries) {
     const path = relPath(entry.abs);
+
     if (entry.stat.isFile) {
       if (isIgnored(held, path, false, committed)) {
         ignoredFiles.push(path);
@@ -132,22 +141,27 @@ const walk = async (
       }
     }
   }
+
   const dirs: string[] = [];
+
   const children = await Promise.all(
     folders.map(async (folder) => ({
       folder,
       walked: await walk(fs, folder, held, committed),
     }))
   );
+
   for (const { folder, walked } of children) {
     files.push(...walked.files);
     dirs.push(...walked.dirs);
     ignoredFiles.push(...walked.ignoredFiles);
     ignoredDirs.push(...walked.ignoredDirs);
+
     if (walked.files.length === 0) {
       dirs.push(relPath(folder));
     }
   }
+
   return { dirs, files, ignoredDirs, ignoredFiles };
 };
 
@@ -160,6 +174,7 @@ export const listFiles = async (
   base: BaseIndex
 ): Promise<DiskFile[]> => {
   const walked = await walk(fs, PROJECT_ROOT, NO_RULES, committedPaths(base));
+
   return walked.files.toSorted((a, b) => (a.path < b.path ? -1 : 1));
 };
 
@@ -178,6 +193,7 @@ export const listCheckout = async (
     NO_RULES,
     committedPaths(base)
   );
+
   return {
     dirs: dirs.toSorted(),
     files: files.map((file) => file.path).toSorted(),
@@ -196,12 +212,15 @@ export const fileSha = async (
 ): Promise<ShaDigest> => {
   const key = hashKey(file.path, file.size, file.mtime);
   const held = cache.get(file.path);
+
   if (held !== undefined && held.key === key) {
     return { bytes: null, sha: held.sha };
   }
+
   const bytes = await fs.readFile(projectPath(file.path));
   const sha = await gitBlobSha(bytes);
   cache.set(file.path, { key, sha });
+
   return { bytes, sha };
 };
 
@@ -221,13 +240,17 @@ const committedSide = async (
   path: string
 ): Promise<{ loading: boolean; text: string }> => {
   const entry = base.entries[path];
+
   if (entry === undefined) {
     return { loading: false, text: "" };
   }
+
   const bytes = await readObject(fs, entry.sha);
+
   if (bytes === null) {
     return { loading: true, text: "" };
   }
+
   return { loading: false, text: isBinary(bytes) ? "" : DECODER.decode(bytes) };
 };
 
@@ -236,6 +259,7 @@ const makeRow = async (input: RowInput): Promise<WorkspaceChange> => {
   const { base, bytes, fs, kind, origin, path } = input;
   const after = afterSide(bytes ?? (await fs.readFile(projectPath(path))));
   const before = await committedSide(fs, base, origin ?? path);
+
   const row: WorkspaceChange = {
     after: after.after,
     before: before.text,
@@ -243,12 +267,15 @@ const makeRow = async (input: RowInput): Promise<WorkspaceChange> => {
     loading: before.loading,
     path,
   };
+
   if (after.binary !== undefined) {
     row.binary = after.binary;
   }
+
   if (origin !== undefined) {
     row.movedFrom = origin;
   }
+
   return row;
 };
 
@@ -259,6 +286,7 @@ const deletedRow = async (
   path: string
 ): Promise<WorkspaceChange> => {
   const before = await committedSide(fs, base, path);
+
   return {
     after: "",
     before: before.text,
@@ -294,15 +322,18 @@ export const deriveChanges = async (
   // A journaled move only pairs while the file it names is where it landed and
   // the commit's copy is gone: a path that still holds its own file is a copy.
   const movedFrom = new Map<string, string>();
+
   for (const [current, committed] of Object.entries(journal)) {
     if (onDisk.has(current) && !onDisk.has(committed)) {
       movedFrom.set(current, committed);
     }
   }
+
   const classified = await Promise.all(
     disk.map(async (file): Promise<Classified> => {
       const digest = await fileSha(fs, cache, file);
       const origin = movedFrom.get(file.path);
+
       if (origin !== undefined) {
         return {
           change: await makeRow({
@@ -315,13 +346,17 @@ export const deriveChanges = async (
           }),
         };
       }
+
       const entry = base.entries[file.path];
+
       if (entry === undefined) {
         return { digest, file };
       }
+
       if (entry.sha === digest.sha) {
         return null;
       }
+
       return {
         change: await makeRow({
           base,
@@ -333,31 +368,41 @@ export const deriveChanges = async (
       };
     })
   );
+
   const moved: WorkspaceChange[] = [];
   const modified: WorkspaceChange[] = [];
   const fresh: { digest: ShaDigest; file: DiskFile }[] = [];
+
   for (const item of classified) {
     if (item === null) {
       continue;
     }
+
     if ("change" in item) {
       const bucket = item.change.kind === "moved" ? moved : modified;
       bucket.push(item.change);
       continue;
     }
+
     fresh.push(item);
   }
+
   // A path the commit had that is gone and that no journaled move claimed is
   // the other half of a move nobody told the UI about — or a deletion.
   const claimed = new Set(movedFrom.values());
+
   const gone = Object.keys(base.entries)
     .filter((path) => !(onDisk.has(path) || claimed.has(path)))
     .toSorted();
+
   const bySha = new Map<string, string[]>();
+
   for (const path of gone) {
     const entry = base.entries[path];
+
     if (entry !== undefined) {
       const bucket = bySha.get(entry.sha);
+
       if (bucket === undefined) {
         bySha.set(entry.sha, [path]);
       } else {
@@ -365,12 +410,15 @@ export const deriveChanges = async (
       }
     }
   }
+
   // The shifts happen before each row is built, in the candidates' order, so a
   // path pairs with the first deletion that holds the same bytes.
   const consumed = new Set<string>();
+
   const paired = await Promise.all(
     fresh.map(async (item): Promise<Paired> => {
       const origin = bySha.get(item.digest.sha)?.shift();
+
       if (origin === undefined) {
         return {
           change: await makeRow({
@@ -383,7 +431,9 @@ export const deriveChanges = async (
           moved: false,
         };
       }
+
       consumed.add(origin);
+
       return {
         change: await makeRow({
           base,
@@ -397,14 +447,18 @@ export const deriveChanges = async (
       };
     })
   );
+
   const added: WorkspaceChange[] = [];
+
   for (const item of paired) {
     (item.moved ? moved : added).push(item.change);
   }
+
   const deleted = await Promise.all(
     gone
       .filter((path) => !consumed.has(path))
       .map((path) => deletedRow(fs, base, path))
   );
+
   return [...moved, ...modified, ...added, ...deleted];
 };

@@ -36,8 +36,10 @@ const LAST_STEP = STEP_COUNT - 1;
  * The dialog sits in the top layer, so the spotlight is drawn inside it: a
  * ring over the target whose huge box-shadow dims everything else. */
 const TOUR_TARGETS = ["apps", "account", null] as const;
+
 /** Breathing room between the target and the spotlight ring, in px. */
 const SPOT_PAD = 6;
+
 /** daisyUI's drawer hides its side with a delayed visibility/translate
  * transition (100 ms + 300 ms); re-measure once it has settled. */
 const DRAWER_SETTLE_MS = 450;
@@ -88,6 +90,7 @@ const LinkRow = ({
 
 export const Onboarding = () => {
   const res = session();
+
   // Derived from the session resource, so it also corrects itself if the
   // session arrives after mount or changes under the mounted layout.
   const show = atom(
@@ -98,6 +101,7 @@ export const Onboarding = () => {
         !value.session.impersonatedBy
     )(res.data.atom)
   );
+
   const open = atom(show());
   const step = atom(0);
   const closed = atom(false);
@@ -108,9 +112,11 @@ export const Onboarding = () => {
 
   const measure = () => {
     const target = TOUR_TARGETS[step()];
+
     const el = target
       ? document.querySelector(`[data-tour="${target}"]`)
       : null;
+
     // The closed mobile drawer hides the sidebar with visibility/opacity, so
     // its items keep a real rect: ask for actual visibility too.
     const visible =
@@ -118,27 +124,34 @@ export const Onboarding = () => {
         opacityProperty: true,
         visibilityProperty: true,
       }) ?? false;
+
     const rect = visible ? el?.getBoundingClientRect() : undefined;
+
     const onScreen =
       rect !== undefined &&
       rect.width > 0 &&
       rect.height > 0 &&
       rect.right > 0 &&
       rect.left < window.innerWidth;
+
     spot.set(onScreen ? rect : null);
   };
+
   watch(step, () => {
     if (typeof document === "undefined") {
       // SSR: nothing to measure; the client's own mount measures on show.
       return;
     }
+
     measure();
   });
   watch(open, (isOpen, { onCleanup, signal }) => {
     if (!isOpen) {
       spot.set(null);
+
       return;
     }
+
     // Measure once the dialog is up, and again whenever the layout moves —
     // right away and after the drawer's transition settles (a resize into
     // the mobile layout hides the sidebar only after that transition).
@@ -170,13 +183,16 @@ export const Onboarding = () => {
     if (closed()) {
       return;
     }
+
     closed.set(true);
+
     try {
       await api<{ ok: true }>("/api/account/completeOnboarding", {});
     } catch {
       // A failed write must not trap the user in the modal; worst case the
       // tour shows again on the next load.
     }
+
     open.set(false);
     // The session snapshot still says onboardedAt is NULL. Drop every
     // user-scoped cache so the next read sees the marked account and the

@@ -61,13 +61,17 @@ const isFileDrag = (event: DragEvent): boolean =>
  * every shadow root is probed in turn. */
 const deepestElementAt = (x: number, y: number): Element | null => {
   let element = document.elementFromPoint(x, y);
+
   while (element?.shadowRoot) {
     const inner = element.shadowRoot.elementFromPoint(x, y);
+
     if (inner === null || inner === element) {
       break;
     }
+
     element = inner;
   }
+
   return element;
 };
 
@@ -78,6 +82,7 @@ const dropDirAt = (x: number, y: number): string => {
   const row = deepestElementAt(x, y)?.closest<HTMLElement>(
     '[data-type="item"]'
   );
+
   return menuDir(row?.dataset.itemPath ?? null);
 };
 
@@ -92,22 +97,28 @@ export const createTreeUploads = (host: TreeUploadsHost): TreeUploads => {
     dir: string
   ): Promise<void> => {
     const breach = checkLimits(reads, UPLOAD_LIMITS);
+
     if (breach !== null) {
       host.notify(breach);
+
       return;
     }
+
     // The read's own path is relative to the target; the folder becomes its
     // prefix (the root contributes none).
     const prefix = dir === "" ? "" : `${dir}/`;
     /** The writes the confirms let through: each lands as it is made, and the
      * re-list waits for all of them. */
     const writes: Promise<void>[] = [];
+
     for (const read of reads) {
       if (read.kind === "error") {
         host.notify(read.reason);
         continue;
       }
+
       const path = `${prefix}${read.path}`;
+
       if (host.hasRow(path) || host.changeAt(path)?.kind === "deleted") {
         // One dialog at a time: two stacked confirms would make no sense, so
         // the wait here is deliberately sequential.
@@ -118,10 +129,12 @@ export const createTreeUploads = (host: TreeUploadsHost): TreeUploads => {
           signal: host.signal,
           title: `Replace ${path}?`,
         });
+
         if (!replace || host.aborted()) {
           continue;
         }
       }
+
       // A staged deletion loses to the write: the file is coming back.
       writes.push(
         (async () => {
@@ -135,6 +148,7 @@ export const createTreeUploads = (host: TreeUploadsHost): TreeUploads => {
         })()
       );
     }
+
     await Promise.all(writes);
     await host.resync();
     host.report();
@@ -157,9 +171,11 @@ export const createTreeUploads = (host: TreeUploadsHost): TreeUploads => {
     // twice in a row.
     const files = [...(input.files ?? [])];
     input.value = "";
+
     if (files.length === 0) {
       return;
     }
+
     void (async () => {
       const reads = await readPickedFiles(files);
       await applyUploads(reads, pickDir);
@@ -205,11 +221,14 @@ export const createTreeUploads = (host: TreeUploadsHost): TreeUploads => {
     if (!host.editable() || !isFileDrag(event)) {
       return;
     }
+
     // The browser only delivers a drop when a dragover was canceled.
     event.preventDefault();
+
     if (event.dataTransfer !== null) {
       event.dataTransfer.dropEffect = "copy";
     }
+
     showDropHighlight();
   };
 
@@ -218,11 +237,13 @@ export const createTreeUploads = (host: TreeUploadsHost): TreeUploads => {
    * own rectangle is what decides whether the drag really left it. */
   const onTreeDragLeave = (event: DragEvent) => {
     const rect = host.treeEl.getBoundingClientRect();
+
     const inside =
       event.clientX >= rect.left &&
       event.clientX <= rect.right &&
       event.clientY >= rect.top &&
       event.clientY <= rect.bottom;
+
     if (!inside) {
       hideDropHighlight();
     }
@@ -234,12 +255,15 @@ export const createTreeUploads = (host: TreeUploadsHost): TreeUploads => {
     if (!host.editable() || !isFileDrag(event)) {
       return;
     }
+
     event.preventDefault();
     hideDropHighlight();
     const items = event.dataTransfer?.items;
+
     if (items === undefined) {
       return;
     }
+
     const dir = dropDirAt(event.clientX, event.clientY);
     void (async () => {
       const reads = await readDroppedItems(items);

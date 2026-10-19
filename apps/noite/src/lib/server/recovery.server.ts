@@ -17,6 +17,7 @@ export const findRecoveryEmail = (
     Effect.gen(function* () {
       const sql = yield* SqlClient;
       const email = requested?.trim().toLowerCase();
+
       const rows = email
         ? yield* sql<{ email: string }>`
             SELECT email FROM "user"
@@ -25,6 +26,7 @@ export const findRecoveryEmail = (
             SELECT email FROM "user"
             WHERE role = 'admin' AND banned = 0
             ORDER BY createdAt LIMIT 1`;
+
       return rows[0]?.email;
     })
   );

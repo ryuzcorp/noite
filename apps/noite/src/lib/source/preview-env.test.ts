@@ -69,12 +69,15 @@ describe("changesFingerprint", () => {
     expect(changesFingerprint([row("src/a.ts", "", { binary: 3 })])).not.toBe(
       base
     );
+
     const moved = changesFingerprint([
       row("src/a.ts", "one", { kind: "moved", movedFrom: "src/old.ts" }),
     ]);
+
     const fromElsewhere = changesFingerprint([
       row("src/a.ts", "one", { kind: "moved", movedFrom: "src/other.ts" }),
     ]);
+
     expect(moved).not.toBe(fromElsewhere);
   });
 });

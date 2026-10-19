@@ -14,6 +14,7 @@ const DECODER = new TextDecoder();
 const POD_STATE_ROOT = "/home/.noite/state";
 
 const open: TabSync[] = [];
+
 afterEach(() => {
   for (const sync of open.splice(0)) {
     sync.close();
@@ -27,19 +28,24 @@ let channels = 0;
 const tabs = (startSecond = true) => {
   channels += 1;
   const name = `tab-sync-test-${channels}`;
+
   const one = () => {
     const volume = new MemoryVolume();
     volume.mkdirSync(PROJECT_ROOT, { recursive: true });
     const sync = syncTabs(volume, new BroadcastChannel(name));
     open.push(sync);
+
     return { sync, volume };
   };
+
   const a = one();
   const b = one();
   a.sync.start();
+
   if (startSecond) {
     b.sync.start();
   }
+
   return { a, b };
 };
 
@@ -51,15 +57,19 @@ const appliedUntil = (
 ): Promise<boolean> => {
   const { promise, resolve } = Promise.withResolvers<boolean>();
   let structural = false;
+
   const stop = sync.onApplied((moved) => {
     structural ||= moved;
+
     if (done()) {
       stop();
       resolve(structural);
     }
   });
+
   return promise;
 };
+
 const put = (volume: MemoryVolume, path: string, body: string): void => {
   volume.writeFileSync(path, ENCODER.encode(body));
 };
@@ -150,6 +160,7 @@ describe("tabs on one workspace", () => {
     let flushed = 0;
     a.sync.serveFlush(() => {
       flushed += 1;
+
       return Promise.resolve();
     });
     await b.sync.flushPeers(5000);

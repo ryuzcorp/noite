@@ -39,6 +39,7 @@ const serve = (address: PodAddress): void => {
       t: "ready",
       v: POD_PROTOCOL_VERSION,
     };
+
     window.parent.postMessage(ready, parentOrigin);
   };
 
@@ -49,20 +50,27 @@ const serve = (address: PodAddress): void => {
     if (event.origin !== parentOrigin || event.source !== window.parent) {
       return;
     }
+
     const message = handshakeMessage(event.data);
+
     if (message === null || message.v !== POD_PROTOCOL_VERSION) {
       return;
     }
+
     if (message.nonce !== nonce) {
       return;
     }
+
     if (message.t === "hello") {
       answerHandshake();
+
       return;
     }
+
     if (bound) {
       return;
     }
+
     bound = true;
     window.removeEventListener("message", onMessage);
     server = createPodServer({

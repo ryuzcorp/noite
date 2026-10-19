@@ -20,6 +20,7 @@ export const route = (handler: RouteHandler) =>
   defineHandler((c: CloudContext) => {
     // SAFETY: Hono exposes every `:param` (and the `:rest{.+}` catch-all) here; names this route never declares stay undefined.
     const params = c.req.param() as Record<string, string | undefined>;
+
     return (
       handler(c.req.raw, kitEnv(c), params) ??
       new Response("Not Found", { status: 404 })

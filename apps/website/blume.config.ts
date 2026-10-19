@@ -11,6 +11,7 @@ const INTER = {
     },
   ],
 } as const;
+
 const PLEX_MONO = "./node_modules/@fontsource/ibm-plex-mono/files";
 
 export default defineConfig({

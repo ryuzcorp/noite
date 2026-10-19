@@ -43,19 +43,23 @@ import {
 } from "./session.server";
 
 const StorageListArgs = Schema.Struct({ appId: Schema.String });
+
 const D1TablesArgs = Schema.Struct({
   appId: Schema.String,
   databaseId: Schema.String,
 });
+
 const D1TableArgs = Schema.Struct({
   appId: Schema.String,
   databaseId: Schema.String,
   table: Schema.String,
 });
+
 const D1KeySchema = Schema.Record(
   Schema.String,
   Schema.Union([Schema.String, Schema.Null])
 );
+
 const D1FilterSchema = Schema.Struct({
   column: Schema.String,
   op: Schema.Union([
@@ -71,10 +75,12 @@ const D1FilterSchema = Schema.Struct({
   ]),
   value: Schema.String,
 });
+
 const D1SortSchema = Schema.Struct({
   column: Schema.String,
   desc: Schema.Boolean,
 });
+
 const D1RowsArgs = Schema.Struct({
   appId: Schema.String,
   databaseId: Schema.String,
@@ -85,27 +91,32 @@ const D1RowsArgs = Schema.Struct({
   sort: Schema.optional(Schema.NullOr(D1SortSchema)),
   table: Schema.String,
 });
+
 const D1DeleteRowsArgs = Schema.Struct({
   appId: Schema.String,
   databaseId: Schema.String,
   keys: Schema.Array(D1KeySchema),
   table: Schema.String,
 });
+
 const DoPreviewArgs = Schema.Struct({
   appId: Schema.String,
   className: Schema.String,
 });
+
 const R2ListArgs = Schema.Struct({
   appId: Schema.String,
   bucket: Schema.String,
   cursor: Schema.optional(Schema.NullOr(Schema.String)),
   prefix: Schema.optional(Schema.String),
 });
+
 const R2GetArgs = Schema.Struct({
   appId: Schema.String,
   bucket: Schema.String,
   key: Schema.String,
 });
+
 const R2DeleteArgs = Schema.Struct({
   appId: Schema.String,
   bucket: Schema.String,
@@ -121,6 +132,7 @@ export const listAppStorage = apiAction(
   async ({ appId }, { env, request }) => {
     if (appId === CONTROL_APP_ID) {
       await requireControlAdmin(request, env);
+
       return [
         {
           appId: CONTROL_APP_ID,
@@ -132,7 +144,9 @@ export const listAppStorage = apiAction(
         },
       ];
     }
+
     await requireViewApp(request, env, appId);
+
     try {
       return await runnerStorage(appId);
     } catch (error) {
@@ -149,9 +163,11 @@ const requireControlDatabase = async (
   databaseId: string
 ): Promise<SessionUser> => {
   const user = await requireControlAdmin(request, env);
+
   if (databaseId !== CONTROL_APP_DATABASE_ID) {
     fail(`Unknown control database ${databaseId}`);
   }
+
   return user;
 };
 
@@ -171,17 +187,21 @@ export const d1Tables = apiAction(
   async ({ appId, databaseId }, { env, request }) => {
     if (appId === CONTROL_APP_ID) {
       await requireControlDatabase(request, env, databaseId);
+
       try {
         return await listControlTables(resolveD1());
       } catch (error) {
         failUnknown(error);
       }
     }
+
     const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "view");
+
     try {
       const listed = await runnerD1Tables(appId, databaseId);
       const caps = capsForRole(role);
+
       return {
         databaseId: listed.databaseId,
         tables: listed.tables.map((table) => ({ ...table, caps })),
@@ -199,16 +219,20 @@ export const d1Schema = apiAction(
   async ({ appId, databaseId, table }, { env, request }) => {
     if (appId === CONTROL_APP_ID) {
       await requireControlDatabase(request, env, databaseId);
+
       try {
         return await controlSchema(resolveD1(), table);
       } catch (error) {
         failUnknown(error);
       }
     }
+
     const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "view");
+
     try {
       const schema = await runnerD1Schema(appId, databaseId, table);
+
       return {
         ...schema,
         caps: capsForRole(role),
@@ -237,15 +261,19 @@ export const d1Rows = apiAction(
       sort: sort ?? null,
       table,
     };
+
     if (appId === CONTROL_APP_ID) {
       await requireControlDatabase(request, env, databaseId);
+
       try {
         return await controlRows(resolveD1(), query);
       } catch (error) {
         failUnknown(error);
       }
     }
+
     await requireViewApp(request, env, appId);
+
     try {
       return await runnerD1Rows(appId, databaseId, query);
     } catch (error) {
@@ -279,8 +307,10 @@ export const d1Write = apiAction(
   D1WriteArgs,
   async ({ appId, databaseId, key, op, table, values }, { env, request }) => {
     const body: D1WriteBody = { key, op, table, values };
+
     if (appId === CONTROL_APP_ID) {
       const user = await requireControlDatabase(request, env, databaseId);
+
       try {
         await writeControlD1(resolveD1(), {
           actorId: user.id,
@@ -289,13 +319,16 @@ export const d1Write = apiAction(
           table,
           values,
         });
+
         return { ok: true };
       } catch (error) {
         failUnknown(error);
       }
     }
+
     const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "push");
+
     try {
       return await runnerD1Write(appId, databaseId, body);
     } catch (error) {
@@ -310,8 +343,10 @@ export const d1DeleteRows = apiAction(
   D1DeleteRowsArgs,
   async ({ appId, databaseId, keys, table }, { env, request }) => {
     const body: D1DeleteRowsBody = { keys: [...keys], table };
+
     if (appId === CONTROL_APP_ID) {
       const user = await requireControlDatabase(request, env, databaseId);
+
       try {
         return await deleteControlRows(resolveD1(), {
           actorId: user.id,
@@ -322,8 +357,10 @@ export const d1DeleteRows = apiAction(
         failUnknown(error);
       }
     }
+
     const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "push");
+
     try {
       return await runnerD1DeleteRows(appId, databaseId, body);
     } catch (error) {
@@ -337,6 +374,7 @@ export const doPreview = apiAction(
   DoPreviewArgs,
   async ({ appId, className }, { env, request }) => {
     await requireViewApp(request, env, appId);
+
     try {
       return await runnerDoInstances(appId, className);
     } catch (error) {
@@ -350,6 +388,7 @@ export const r2List = apiAction(
   R2ListArgs,
   async ({ appId, bucket, prefix, cursor }, { env, request }) => {
     await requireViewApp(request, env, appId);
+
     try {
       return await runnerR2List(appId, bucket, prefix ?? "", cursor ?? null);
     } catch (error) {
@@ -363,6 +402,7 @@ export const r2Get = apiAction(
   R2GetArgs,
   async ({ appId, bucket, key }, { env, request }) => {
     await requireViewApp(request, env, appId);
+
     try {
       return await runnerR2Get(appId, bucket, key);
     } catch (error) {
@@ -378,8 +418,10 @@ export const r2Delete = apiAction(
     if (keys.length === 0 || keys.length > 100) {
       fail("select 1 to 100 objects");
     }
+
     const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "push");
+
     try {
       return await runnerR2Delete(appId, bucket, [...keys]);
     } catch (error) {

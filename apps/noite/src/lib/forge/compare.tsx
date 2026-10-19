@@ -61,6 +61,7 @@ export const CompareView = ({
   const res = forgeCompare(appId, base, head);
   const data = res.data();
   const error = res.error();
+
   return (
     <div class="flex flex-col gap-6">
       <CompareBar appId={appId} base={base} head={head} onPick={onPick} />

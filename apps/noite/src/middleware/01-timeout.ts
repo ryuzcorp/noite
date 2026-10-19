@@ -25,14 +25,17 @@ export const timeoutMiddleware = (ms: number) =>
     if (timeoutExempt(c.req.path)) {
       return next();
     }
+
     const timeout = Promise.withResolvers<"timeout">();
     const timer = setTimeout(() => timeout.resolve("timeout"), ms);
+
     try {
       const winner = await Promise.race([
         // oxlint-disable-next-line node/callback-return -- Hono's next() resolves the downstream pipeline (not a Node callback); the race — not a return — settles the response.
         next().then((): "done" => "done"),
         timeout.promise,
       ]);
+
       if (winner === "timeout") {
         return c.json({ error: "Request timed out" }, 504);
       }

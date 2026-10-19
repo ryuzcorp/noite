@@ -17,16 +17,20 @@ export const newInviteCode = (): string => {
   const bytes = new Uint8Array(CODE_GROUPS * GROUP_LEN);
   crypto.getRandomValues(bytes);
   const groups: string[] = [];
+
   for (let group = 0; group < CODE_GROUPS; group += 1) {
     let chars = "";
+
     for (let i = 0; i < GROUP_LEN; i += 1) {
       // `bytes` is a fixed-size Uint8Array we just filled, so every index in
       // range yields a value; the modulo keeps it inside the alphabet.
       const offset = bytes[group * GROUP_LEN + i] ?? 0;
       chars += ALPHABET[offset % ALPHABET.length];
     }
+
     groups.push(chars);
   }
+
   return groups.join("-");
 };
 
@@ -34,9 +38,11 @@ export const newInviteCode = (): string => {
 export const normalizeInviteCode = (raw: string): string => {
   const cleaned = raw.toUpperCase().replaceAll(/[^A-Z0-9]/gu, "");
   const groups: string[] = [];
+
   for (let i = 0; i < cleaned.length; i += GROUP_LEN) {
     groups.push(cleaned.slice(i, i + GROUP_LEN));
   }
+
   return groups.join("-");
 };
 
@@ -65,13 +71,16 @@ export const signupPolicy = async (): Promise<{
   const rows = await withDb(
     Effect.gen(function* () {
       const sql = yield* SqlClient;
+
       return yield* sql.unsafe(`SELECT count(*) AS n FROM "user"`);
     })
   );
+
   // SAFETY: the query selects a single `n` count; D1 returns plain rows.
   const [first] = rows as CountRow[];
   const count = first?.n ?? 0;
   const firstRun = Number(count) === 0;
+
   return {
     firstRun,
     invitesPerUser: INVITES_PER_USER,
@@ -91,12 +100,15 @@ const lookup = async (code: string): Promise<InviteState | null> =>
   await withDb(
     Effect.gen(function* () {
       const sql = yield* SqlClient;
+
       const rows = yield* sql.unsafe(
         `SELECT id, usedBy, revoked FROM invite WHERE code = ?`,
         [normalizeInviteCode(code)]
       );
+
       // SAFETY: the projection is (id, usedBy, revoked); D1 returns plain rows.
       const [row] = rows as InviteRow[];
+
       return row
         ? { id: row.id, revoked: Boolean(row.revoked), usedBy: row.usedBy }
         : null;
@@ -113,13 +125,17 @@ export const checkInvite = async (
   if (!code?.trim()) {
     return "missing";
   }
+
   const row = await lookup(code);
+
   if (!row) {
     return "unknown";
   }
+
   if (row.usedBy) {
     return "used";
   }
+
   return row.revoked ? "revoked" : null;
 };
 
@@ -141,6 +157,7 @@ export const consumeInvite = async (
     })
   );
   const row = await lookup(normalized);
+
   return row?.usedBy === userId;
 };
 
@@ -154,9 +171,11 @@ export const mintInvites = async (
   const codes = Array.from({ length: Math.max(1, count) }, () =>
     newInviteCode()
   );
+
   await withDb(
     Effect.gen(function* () {
       const sql = yield* SqlClient;
+
       for (const code of codes) {
         yield* sql.unsafe(
           `INSERT INTO invite (id, code, createdBy, note, revoked, createdAt) VALUES (?, ?, ?, ?, 0, ?)`,
@@ -171,6 +190,7 @@ export const mintInvites = async (
       }
     })
   );
+
   return codes;
 };
 
@@ -183,14 +203,17 @@ export const listUnusedInvitesFor = async (
   const rows = await withDb(
     Effect.gen(function* () {
       const sql = yield* SqlClient;
+
       return yield* sql.unsafe(
         `SELECT id, code FROM invite WHERE createdBy = ? AND usedBy IS NULL AND revoked = 0 ORDER BY createdAt`,
         [userId]
       );
     })
   );
+
   // SAFETY: the projection is (id, code); D1 returns plain rows.
   const found = rows as InviteRow[];
+
   return found.map((row) => ({ code: row.code, id: row.id }));
 };
 
@@ -230,6 +253,7 @@ export const listInvites = async (): Promise<InviteView[]> => {
   const rows = await withDb(
     Effect.gen(function* () {
       const sql = yield* SqlClient;
+
       return yield* sql.unsafe(
         `SELECT i.id, i.code, i.createdBy, i.usedBy, i.usedAt, i.revoked, i.note, i.createdAt,
                 c.email AS createdByEmail, u.email AS usedByEmail
@@ -241,8 +265,10 @@ export const listInvites = async (): Promise<InviteView[]> => {
       );
     })
   );
+
   // SAFETY: the projection mirrors InviteJoinRow; D1 returns plain rows.
   const found = rows as InviteJoinRow[];
+
   return found.map((row) => ({
     code: row.code,
     createdAt: asIso(row.createdAt),

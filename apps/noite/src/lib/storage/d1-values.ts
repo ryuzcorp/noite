@@ -46,15 +46,19 @@ export const keyFor = (
   row: Record<string, D1Cell>
 ): D1Key => {
   const primary = columns.filter((column) => column.pk > 0);
+
   const names =
     primary.length > 0
       ? primary.map((c) => c.name)
       : columns.map((c) => c.name);
+
   const key: D1Key = {};
+
   for (const name of names) {
     const value = row[name];
     key[name] = value === undefined ? null : value;
   }
+
   return key;
 };
 
@@ -75,12 +79,15 @@ export interface WriteScope {
 export const writtenColumns = (scope: WriteScope): string[] => {
   const skip = new Set(scope.locked);
   const names: string[] = [];
+
   for (const column of scope.columns) {
     if (skip.has(column.name) || (scope.isEdit && column.pk > 0)) {
       continue;
     }
+
     const original = scope.original[column.name] ?? null;
     const draft = scope.drafts[column.name] ?? draftFromCell(original);
+
     if (scope.isEdit) {
       if (draftDiffers(draft, original)) {
         names.push(column.name);
@@ -89,17 +96,20 @@ export const writtenColumns = (scope: WriteScope): string[] => {
       names.push(column.name);
     }
   }
+
   return names;
 };
 
 /** The update/insert `values` payload for the current drafts. */
 export const writeValues = (scope: WriteScope) => {
   const values: Record<string, D1Cell> = {};
+
   for (const name of writtenColumns(scope)) {
     const original = scope.original[name] ?? null;
     const draft = scope.drafts[name] ?? draftFromCell(original);
     values[name] = cellFromDraft(draft);
   }
+
   return values;
 };
 
@@ -113,6 +123,7 @@ const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z?$/u;
 const DATETIME_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/u;
 const EPOCH_MS_RE = /^\d{13}$/u;
 const EPOCH_S_RE = /^\d{10}$/u;
+
 // Plausible-epoch guard: a 13-digit number outside 2000..2100 is an id, not
 // a millisecond stamp, and must not render (or be rewritten) as a timestamp.
 const EPOCH_MIN_MS = 946_684_800_000;
@@ -120,9 +131,11 @@ const EPOCH_MAX_MS = 4_102_444_800_000;
 
 const epochMs = (value: string): number | null => {
   const n = Number(value);
+
   if (!Number.isFinite(n) || n < EPOCH_MIN_MS || n > EPOCH_MAX_MS) {
     return null;
   }
+
   return n;
 };
 
@@ -131,39 +144,52 @@ export const timestampKind = (value: D1Cell): TimestampKind | null => {
   if (value === null || value === "") {
     return null;
   }
+
   if (ISO_RE.test(value)) {
     return Number.isNaN(Date.parse(value)) ? null : "iso";
   }
+
   if (DATETIME_RE.test(value)) {
     const normalized = value.replace(" ", "T");
+
     return Number.isNaN(Date.parse(`${normalized}Z`)) ? null : "datetime";
   }
+
   if (EPOCH_MS_RE.test(value)) {
     return epochMs(value) === null ? null : "epoch_ms";
   }
+
   if (EPOCH_S_RE.test(value)) {
     return epochMs(`${value}000`) === null ? null : "epoch_s";
   }
+
   return null;
 };
 
 /** Parse a timestamp-kind cell into a Date, else null. */
 export const parseTimestamp = (value: D1Cell): Date | null => {
   const kind = timestampKind(value);
+
   if (kind === null || value === null) {
     return null;
   }
+
   if (kind === "epoch_ms") {
     const n = epochMs(value);
+
     return n === null ? null : new Date(n);
   }
+
   if (kind === "epoch_s") {
     const seconds = Number(value) * 1000;
+
     return epochMs(String(seconds)) === null ? null : new Date(seconds);
   }
+
   if (kind === "datetime") {
     return new Date(`${value.replace(" ", "T")}Z`);
   }
+
   return new Date(value);
 };
 
@@ -171,15 +197,19 @@ export const parseTimestamp = (value: D1Cell): Date | null => {
  * conventions). Defaults to ISO 8601 with milliseconds and a `Z`. */
 export const nowValue = (kind: TimestampKind | null): string => {
   const now = new Date();
+
   if (kind === "epoch_ms") {
     return String(now.getTime());
   }
+
   if (kind === "epoch_s") {
     return String(Math.floor(now.getTime() / 1000));
   }
+
   if (kind === "datetime") {
     return now.toISOString().slice(0, 19).replace("T", " ");
   }
+
   return now.toISOString();
 };
 
@@ -197,15 +227,18 @@ const TIME_TOKENS = {
   time: true,
   timestamp: true,
 } satisfies Record<string, true>;
+
 const CAMEL_RE = /(?<lower>[a-z0-9])(?<upper>[A-Z])/gu;
 
 export const isTimestampColumn = (name: string, type: string): boolean => {
   const snake = name.replace(CAMEL_RE, "$<lower>_$<upper>").toLowerCase();
+
   for (const token of snake.split("_")) {
     if (Object.hasOwn(TIME_TOKENS, token)) {
       return true;
     }
   }
+
   return /date|time/iu.test(type);
 };
 
@@ -215,6 +248,7 @@ export const isTimestampColumn = (name: string, type: string): boolean => {
  * the Format helper). */
 export const isJsonLooking = (value: string): boolean => {
   const trimmed = value.trim();
+
   return trimmed.startsWith("{") || trimmed.startsWith("[");
 };
 
@@ -224,8 +258,10 @@ export const jsonValid = (value: string): boolean | null => {
   if (!isJsonLooking(value)) {
     return null;
   }
+
   try {
     JSON.parse(value);
+
     return true;
   } catch {
     return false;
@@ -237,10 +273,12 @@ export const formatJson = (value: string): string | null => {
   if (!isJsonLooking(value)) {
     return null;
   }
+
   try {
     // SAFETY: JSON.parse accepts any JSON text; the editor only ever passes
     // user text and re-stringifies whatever parses.
     const parsed: unknown = JSON.parse(value);
+
     return JSON.stringify(parsed, null, 2);
   } catch {
     return null;
@@ -252,6 +290,7 @@ export const formatJson = (value: string): string | null => {
 /** BOOL/BOOLEAN columns get a 0/1 toggle. */
 export const isBoolType = (type: string): boolean => {
   const normalized = type.trim().toUpperCase();
+
   return normalized === "BOOL" || normalized === "BOOLEAN";
 };
 

@@ -74,6 +74,7 @@ describe("remoteUrlOf", () => {
 describe("stageDist", () => {
   test("stages dotfiles and dotdirs alongside visible entries", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "noite-stage-"));
+
     try {
       const dist = path.join(root, "dist");
       const staging = path.join(root, "staging");

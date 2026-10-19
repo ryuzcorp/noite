@@ -29,10 +29,12 @@ test("the tree menu adds and deletes a file, and one Push commits both", async (
   request,
 }) => {
   createdApps.push(MENU_SLUG);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Source Tree Menu",
     slug: MENU_SLUG,
   });
+
   pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), MENU_SLUG);
 
   await page.goto(`/apps/${appId}/source?ref=main`);
@@ -41,9 +43,11 @@ test("the tree menu adds and deletes a file, and one Push commits both", async (
   // New File from the empty space below the rows (the tree's root).
   const tree = page.locator(".noite-src-tree");
   const box = await tree.boundingBox();
+
   if (box === null) {
     throw new TypeError("the tree column has no box");
   }
+
   await tree.click({
     button: "right",
     position: { x: 24, y: box.height - 16 },
@@ -116,10 +120,12 @@ test("dragging a file into a folder pushes a move", async ({
   request,
 }) => {
   createdApps.push(MOVE_SLUG);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Source Tree Move",
     slug: MOVE_SLUG,
   });
+
   pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), MOVE_SLUG);
 
   await page.goto(`/apps/${appId}/source?ref=main`);
@@ -128,9 +134,11 @@ test("dragging a file into a folder pushes a move", async ({
   // The fixture has no folder, so make one to drop into.
   const tree = page.locator(".noite-src-tree");
   const box = await tree.boundingBox();
+
   if (box === null) {
     throw new TypeError("the tree column has no box");
   }
+
   await tree.click({
     button: "right",
     position: { x: 24, y: box.height - 16 },
@@ -171,9 +179,11 @@ const editOpenFile = async (page: Page, line: string): Promise<void> => {
   const editor = page.locator('[contenteditable="true"]').first();
   await expect(editor).toBeVisible({ timeout: 60_000 });
   const box = await editor.boundingBox();
+
   if (box === null) {
     throw new TypeError("the editor has no box");
   }
+
   await page.mouse.click(box.x + 8, box.y + box.height - 8);
   await page.keyboard.press("ControlOrMeta+End");
   await page.keyboard.press("Enter");
@@ -191,10 +201,12 @@ test("rename, discard and the delete key shape the stash", async ({
   request,
 }) => {
   createdApps.push(EDIT_SLUG);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Source Tree Edit",
     slug: EDIT_SLUG,
   });
+
   pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), EDIT_SLUG);
 
   await page.goto(`/apps/${appId}/source?file=util.ts&ref=main`);
@@ -219,9 +231,11 @@ test("rename, discard and the delete key shape the stash", async ({
   await panel
     .getByRole("button", { exact: true, name: "Discard changes to util.ts" })
     .click();
+
   const discard = page.getByRole("alertdialog", {
     name: "Discard changes to util.ts?",
   });
+
   await discard.getByRole("button", { name: "Discard" }).click();
   await expect(changes.locator(".badge")).toBeHidden();
   await expect(editor).not.toContainText("// throw this away");
@@ -281,10 +295,12 @@ test("a change survives a tab restart, and Discard all clears it", async ({
   request,
 }) => {
   createdApps.push(RESTART_SLUG);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Source Tree Restart",
     slug: RESTART_SLUG,
   });
+
   pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), RESTART_SLUG);
 
   const source = `/apps/${appId}/source?file=util.ts&ref=main`;
@@ -327,9 +343,11 @@ test("a change survives a tab restart, and Discard all clears it", async ({
   // Discard all clears the pod: the panel and the editor are back to the
   // commit, with nothing left for the badge to count.
   await panel.getByRole("button", { exact: true, name: "Discard all" }).click();
+
   const discard = reopened.getByRole("alertdialog", {
     name: "Discard all changes?",
   });
+
   await discard
     .getByRole("button", { exact: true, name: "Discard all" })
     .click();
@@ -361,10 +379,12 @@ test("two tabs on one branch edit the same workspace", async ({
   request,
 }) => {
   createdApps.push(TABS_SLUG);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Source Tree Tabs",
     slug: TABS_SLUG,
   });
+
   pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), TABS_SLUG);
 
   const source = `/apps/${appId}/source?file=util.ts&ref=main`;
@@ -393,16 +413,20 @@ test("two tabs on one branch edit the same workspace", async ({
   // tab's pod host frame on the app's preview origin. A change to a second file
   // shows in the badge only after the save it triggers has landed.
   await page.close();
+
   const podFrame = other
     .frames()
     .find((frame) => frame.url().includes("/noite-pod-host.html"));
+
   if (podFrame === undefined) {
     throw new TypeError("the second tab has no pod host frame");
   }
+
   await expect
     .poll(() =>
       podFrame.evaluate(async () => {
         const { held = [], pending = [] } = await navigator.locks.query();
+
         return (
           held.some((lock) => lock.name?.startsWith("nodepod-workspace:")) &&
           pending.length === 0
@@ -436,10 +460,12 @@ test("an uploaded binary lands in the tree and pushes", async ({
   request,
 }) => {
   createdApps.push(UPLOAD_SLUG);
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Source Tree Upload",
     slug: UPLOAD_SLUG,
   });
+
   pushAppDir(apiKey, new URL("fixtures/intel", import.meta.url), UPLOAD_SLUG);
 
   await page.goto(`/apps/${appId}/source?ref=main`);
@@ -448,9 +474,11 @@ test("an uploaded binary lands in the tree and pushes", async ({
   // "Upload files…" opens the picker; a NUL byte makes the file binary.
   const tree = page.locator(".noite-src-tree");
   const box = await tree.boundingBox();
+
   if (box === null) {
     throw new TypeError("the tree column has no box");
   }
+
   await tree.click({
     button: "right",
     position: { x: 24, y: box.height - 16 },

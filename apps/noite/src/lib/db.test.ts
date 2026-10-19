@@ -39,6 +39,7 @@ describe("ledgerMismatch", () => {
       ],
       KNOWN
     );
+
     expect(reason).toContain("newer Noite");
     expect(reason).toContain("Downgrades are not supported");
   });
@@ -53,9 +54,11 @@ describe("ledgerMismatch", () => {
 describe("ensureDb", () => {
   test("migrates a fresh database and records the ledger", async () => {
     await ensureDbPromise();
+
     const rows = db.raw
       .query(`SELECT migration_id, name FROM paranorm_migrations`)
       .all();
+
     expect(rows).toEqual([
       { migration_id: 1, name: "1.3.0" },
       { migration_id: 2, name: "1.4.0" },
@@ -70,9 +73,11 @@ describe("ensureDb", () => {
     const again = { ...db.d1 } as typeof db.d1;
     setD1Binding(again);
     await ensureDbPromise();
+
     const rows = db.raw
       .query(`SELECT migration_id FROM paranorm_migrations`)
       .all();
+
     expect(rows).toHaveLength(2);
   });
 

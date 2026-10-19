@@ -134,13 +134,17 @@ const isSplit = (value: unknown, count: number): value is number[] => {
   if (!Array.isArray(value) || value.length !== count) {
     return false;
   }
+
   let total = 0;
+
   for (const size of value) {
     if (typeof size !== "number" || !Number.isFinite(size) || size < 0) {
       return false;
     }
+
     total += size;
   }
+
   return total > 0;
 };
 
@@ -149,12 +153,15 @@ const isSplit = (value: unknown, count: number): value is number[] => {
 const readStored = (key: string, count: number): number[] | null => {
   try {
     const raw = localStorage.getItem(`${STORAGE_PREFIX}${key}`);
+
     if (raw === null) {
       return null;
     }
+
     // SAFETY: JSON.parse returns any; nothing trusts it — `isSplit` narrows
     // the value field by field.
     const parsed: unknown = JSON.parse(raw);
+
     return isSplit(parsed, count) ? parsed : null;
   } catch {
     // Storage is off (private mode, a denied origin): the group opens on the
@@ -180,6 +187,7 @@ const draw = (value: number): string => String(Math.round(value * 1000) / 1000);
 /** How long the group is on its own axis, in px. */
 const axisSize = (el: Element, horizontal: boolean): number => {
   const box = el.getBoundingClientRect();
+
   return horizontal ? box.width : box.height;
 };
 
@@ -205,13 +213,18 @@ const paneLimits = (
 ): PaneLimits => {
   const share = (px: number): number =>
     Math.max(0, Math.min(100, (px / size) * 100));
+
   const min = options.minPx.slice(0, panes.length).map(share);
+
   const max = panes.map((_pane, index) => {
     const px = options.maxPx?.[index] ?? null;
+
     return px === null ? 100 : share(px);
   });
+
   const total = min.reduce((sum, value) => sum + value, 0);
   const scale = total > MIN_TOTAL ? MIN_TOTAL / total : 1;
+
   return {
     max,
     min: min.map((value, index) => Math.min(value * scale, max[index] ?? 100)),
@@ -227,6 +240,7 @@ const limitHolds = (
 ): boolean => {
   const raw = el.dataset[key];
   const have = raw === undefined ? Number.NaN : Number(raw);
+
   return Number.isFinite(have) && Math.abs(have - want) <= MIN_STEP;
 };
 
@@ -249,6 +263,7 @@ const measuredSplit = (
 ): number[] | null => {
   const sizes = panes.map((pane) => axisSize(pane, horizontal));
   const total = sizes.reduce((sum, size) => sum + size, 0);
+
   return total > 0 ? sizes.map((size) => (size / total) * 100) : null;
 };
 
@@ -263,14 +278,18 @@ const openingSplit = (
   horizontal: boolean
 ): (number | null)[] | null => {
   const stored = readStored(options.key, panes.length);
+
   if (stored !== null) {
     return stored;
   }
+
   if (options.openPx === undefined || size <= 0) {
     return measuredSplit(panes, horizontal);
   }
+
   return panes.map((_pane, index) => {
     const px = options.openPx?.[index] ?? null;
+
     return px === null ? null : Math.max(0, Math.min(100, (px / size) * 100));
   });
 };
@@ -288,9 +307,11 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
   /** Whether each collapsible pane should be open: the page's own state
    * (`?panel=`), or the split a pane's own drag landed on. */
   const wanted = new Map<number, boolean>();
+
   for (const index of options.closed ?? []) {
     wanted.set(index, false);
   }
+
   /** The last split with every collapsible pane open: what reopening is owed,
    * and what is kept when a pane closes. */
   let open: number[] | null = null;
@@ -315,10 +336,12 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
     sliding?.abort();
     sliding = null;
     clearTimeout(timer);
+
     if (typeof document === "undefined") {
       // SSR: no binding ever ran, so there is no slide class to take off.
       return;
     }
+
     document.documentElement.classList.remove(SLIDING);
   };
 
@@ -328,12 +351,15 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
   const unbind = (): void => {
     endSlide();
     dragging = false;
+
     if (typeof document !== "undefined") {
       document.documentElement.classList.remove(DRAGGING);
     }
+
     for (const el of [root, ...panels]) {
       el?.removeAttribute("style");
     }
+
     controller?.destroy();
     controller = null;
     panels = [];
@@ -355,12 +381,15 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
    * instead of at an even split of its own. */
   const applyOpening = (panes: readonly HTMLElement[], size: number): void => {
     const split = openingSplit(options, panes, size, horizontal);
+
     for (const [index, pane] of panes.entries()) {
       const opening = split?.[index];
+
       if (opening === null || opening === undefined) {
         delete pane.dataset.defaultSize;
         continue;
       }
+
       pane.dataset.defaultSize = draw(opening);
     }
   };
@@ -381,6 +410,7 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
   const save = (): void => {
     clearTimeout(saving);
     saving = 0;
+
     if (open !== null) {
       writeStored(options.key, open);
     }
@@ -393,9 +423,12 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
     if (settling) {
       return;
     }
+
     const closed = collapsible.filter((index) => layout[index] === 0);
+
     if (closed.length === 0) {
       open = [...layout];
+
       for (const index of collapsible) {
         wanted.set(index, true);
       }
@@ -408,9 +441,11 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
         if (wanted.get(index) ?? true) {
           options.onCollapsed?.(index);
         }
+
         wanted.set(index, false);
       }
     }
+
     remember();
   };
 
@@ -420,15 +455,19 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
    * motion). */
   const apply = (index: number, shouldOpen: boolean, slide: boolean): void => {
     const current = controller;
+
     if (current === null || current.isCollapsed(index) === !shouldOpen) {
       return;
     }
+
     if (slide && !window.matchMedia(REDUCED_MOTION_QUERY).matches) {
       endSlide();
       document.documentElement.classList.add(SLIDING);
+
       const finish = (): void => {
         endSlide();
       };
+
       sliding = new AbortController();
       root?.addEventListener(
         "transitionend",
@@ -441,6 +480,7 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
       );
       timer = window.setTimeout(finish, SLIDE_MS + SLIDE_SLACK_MS);
     }
+
     if (shouldOpen) {
       current.expand(index);
     } else {
@@ -453,14 +493,18 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
    * since the note the library keeps dies with its controller. */
   const applyWanted = (layout: readonly number[] | null): void => {
     const current = controller;
+
     if (current === null) {
       return;
     }
+
     for (const index of collapsible) {
       const shouldOpen = wanted.get(index) ?? true;
+
       if (!shouldOpen && current.isCollapsed(index) && layout !== null) {
         current.setLayout([...layout]);
       }
+
       apply(index, shouldOpen, false);
     }
   };
@@ -470,27 +514,33 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
    * group was unbound below `lg` and is back). */
   const rebind = (el: HTMLElement, panes: HTMLElement[]): void => {
     const previous = controller?.layout ?? null;
+
     const keep =
       previous !== null && previous.length === panes.length
         ? [...previous]
         : null;
+
     unbind();
     settling = true;
     const size = axisSize(el, horizontal);
     const limits = paneLimits(options, panes, size);
+
     for (const [index, pane] of panes.entries()) {
       pane.dataset.minSize = draw(limits.min[index] ?? 0);
       pane.dataset.maxSize = draw(limits.max[index] ?? 100);
     }
+
     applyOpening(panes, size);
     controller = createResizable(el, {
       direction: options.direction,
       onLayoutChange: changed,
     });
     panels = panes;
+
     if (keep !== null) {
       controller.setLayout(keep);
     }
+
     applyWanted(keep ?? readStored(options.key, panes.length));
     settling = false;
   };
@@ -498,13 +548,17 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
   /** Bring the binding in step with the group's DOM and the size it is at. */
   const sync = (): void => {
     const el = root;
+
     if (el === null || media === null || !media.matches) {
       unbind();
+
       return;
     }
+
     const panes = owned(el, "resizable-panel");
     const handles = owned(el, "resizable-handle");
     const size = axisSize(el, horizontal);
+
     if (
       panes.length === 0 ||
       handles.length !== panes.length - 1 ||
@@ -513,11 +567,14 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
       // Not a group yet (a mount in progress), or nothing to lay out: keep
       // watching, bind nothing.
       unbind();
+
       return;
     }
+
     const same =
       panes.length === panels.length &&
       panes.every((pane, index) => pane === panels[index]);
+
     if (
       same &&
       controller !== null &&
@@ -525,6 +582,7 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
     ) {
       return;
     }
+
     rebind(el, panes);
   };
 
@@ -535,11 +593,14 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
     // value is read as unknown and narrowed by `isDragging`.
     const detail: unknown = event instanceof CustomEvent ? event.detail : null;
     const now = isDragging(detail);
+
     if (now === dragging) {
       return;
     }
+
     dragging = now;
     document.documentElement.classList.toggle(DRAGGING, now);
+
     if (!now) {
       // The drag is over: what it landed on is what to keep, now.
       save();
@@ -550,12 +611,14 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
     release();
     root = el;
     binding = new AbortController();
+
     if (media === null) {
       // The breakpoint is the helper's, not the element's: it decides whether
       // a group binds at all.
       media = window.matchMedia(LG_QUERY);
       media.addEventListener("change", sync, { signal: lifetime.signal });
     }
+
     el.addEventListener("resizable:dragging", onDragging, {
       signal: binding.signal,
     });
@@ -570,10 +633,13 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
     if (el === null || el === root) {
       return;
     }
+
     if (el.isConnected) {
       attach(el);
+
       return;
     }
+
     // A re-render's scratch copy (see live-ref.ts), or a first mount that
     // called `ref` before insertion: bind the element that really lands in the
     // document, once it is there.
@@ -586,6 +652,7 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
           });
         });
       }
+
       if (el.isConnected && el !== root) {
         attach(el);
       }
@@ -596,6 +663,7 @@ export const createPaneGroup = (options: PaneGroupOptions): PaneGroup => {
     if (!collapsible.includes(index)) {
       return;
     }
+
     wanted.set(index, shouldOpen);
     // Idempotent: a pane already where the page wants it is left alone (which
     // is also what keeps a repaint from re-opening a pane it closed by drag).

@@ -29,9 +29,11 @@ export const toCodePanel = (raw: string): CodePanel =>
  * so the button keeps the size of its siblings whatever the count. */
 const ChangeBadge = ({ count }: { count: () => number }) => {
   const changed = count();
+
   if (changed === 0) {
     return null;
   }
+
   // The badge holds the number alone; the words around it are for screen
   // readers only ("Changes, 2 changed").
   return (
@@ -52,12 +54,15 @@ const sourcePanelHref = (
   { file, ref }: SourceFrom
 ): string => {
   const params = new URLSearchParams({ panel });
+
   if (ref !== "") {
     params.set("ref", ref);
   }
+
   if (file !== "") {
     params.set("file", file);
   }
+
   return `/apps/${appId}/source?${params}`;
 };
 
@@ -85,8 +90,10 @@ export const PanelToggles = ({
       if (entry.id === "changes" && !changeCount) {
         return null;
       }
+
       const open = active === entry.id;
       const cls = `btn btn-sm relative ${open ? "btn-neutral" : "btn-ghost"}`;
+
       const label = (
         <>
           <entry.icon />
@@ -96,6 +103,7 @@ export const PanelToggles = ({
           ) : null}
         </>
       );
+
       return onToggle ? (
         <button
           key={entry.id}
@@ -149,6 +157,7 @@ export const CodePage = ({
   children: View;
 }) => {
   const from = { file: backFile, ref: backRef };
+
   return (
     <div class="flex min-h-screen w-full flex-col">
       <div class="border-base-300 flex items-center justify-between gap-2 border-b px-4 py-2">

@@ -32,11 +32,14 @@ beforeEach(() => {
  * (localhost prints it instead of calling the email webhook). */
 const requestCode = async (email: string): Promise<string> => {
   const log = spyOn(console, "log").mockImplementation(() => {});
+
   try {
     await auth().api.sendVerificationOTP({ body: { email, type: "sign-in" } });
+
     const line = log.mock.calls
       .map((args) => String(args[0]))
       .find((text) => text.includes("[noite:otp]"));
+
     return /: (?<code>\d{6})$/u.exec(line ?? "")?.groups?.code ?? "";
   } finally {
     log.mockRestore();
@@ -55,6 +58,7 @@ describe("email-code sign-in", () => {
   test("an unknown address cannot mint an account (the invite gate stays shut)", async () => {
     const code = await requestCode("newcomer@example.com");
     let signedIn = false;
+
     try {
       await auth().api.signInEmailOTP({
         body: { email: "newcomer@example.com", otp: code || "000000" },
@@ -63,6 +67,7 @@ describe("email-code sign-in", () => {
     } catch {
       signedIn = false;
     }
+
     expect(signedIn).toBe(false);
     expect(userCount("newcomer@example.com")).toBe(0);
   });
@@ -73,9 +78,11 @@ describe("email-code sign-in", () => {
     );
     const code = await requestCode("known@example.com");
     expect(code).toMatch(/^\d{6}$/u);
+
     const result = await auth().api.signInEmailOTP({
       body: { email: "known@example.com", otp: code },
     });
+
     expect(result.user.email).toBe("known@example.com");
     expect(userCount("known@example.com")).toBe(1);
   });
@@ -86,9 +93,11 @@ describe("email-code sign-in", () => {
       `INSERT INTO "user" (id, name, email, emailVerified, onboardedAt) VALUES ('u2', 'Done', 'done@example.com', 1, '2026-01-02T03:04:05.000Z')`
     );
     const code = await requestCode("done@example.com");
+
     const result = await auth().api.signInEmailOTP({
       body: { email: "done@example.com", otp: code },
     });
+
     // SAFETY: the field is an additional-field addition to the user output; the generated type may not surface it.
     const { onboardedAt } = result.user as { onboardedAt?: unknown };
     // The `type: "date"` field is parsed into a Date server-side (and
@@ -101,9 +110,11 @@ describe("email-code sign-in", () => {
       `INSERT INTO "user" (id, name, email, emailVerified) VALUES ('u3', 'New', 'new@example.com', 1)`
     );
     const code = await requestCode("new@example.com");
+
     const result = await auth().api.signInEmailOTP({
       body: { email: "new@example.com", otp: code },
     });
+
     // SAFETY: same additional-field probe as above.
     const { onboardedAt } = result.user as { onboardedAt?: unknown };
     expect(onboardedAt ?? null).toBeNull();
@@ -117,13 +128,16 @@ describe("dev-only shortcuts key on the localhost family", () => {
     );
     const env = { ...ENV, BASE_DOMAIN: "noite.localhost" };
     const log = spyOn(console, "log").mockImplementation(() => {});
+
     try {
       await createAuth(env, env.BETTER_AUTH_URL).api.sendVerificationOTP({
         body: { email: "dev@example.com", type: "sign-in" },
       });
+
       const printed = log.mock.calls
         .map((args) => String(args[0]))
         .some((text) => text.includes("[noite:otp]"));
+
       expect(printed).toBe(true);
     } finally {
       log.mockRestore();

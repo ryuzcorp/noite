@@ -13,6 +13,7 @@ const runGit = (
 ): Effect.Effect<string, Error> =>
   Effect.gen(function* run() {
     const proc = yield* runProc("git", args, cwd);
+
     if (proc.code !== 0) {
       return yield* Effect.fail(
         new Error(
@@ -20,6 +21,7 @@ const runGit = (
         )
       );
     }
+
     return proc.stdout;
   });
 
@@ -34,7 +36,9 @@ export const lsRemoteTip = (
       ["ls-remote", remoteUrl, "refs/heads/main"],
       process.cwd()
     );
+
     const sha = out.split("\t")[0]?.trim();
+
     return sha !== undefined && sha !== "" ? sha : null;
   });
 
@@ -97,6 +101,7 @@ export const clearWorkdir = (workdir: string): Effect.Effect<void, Error> =>
 export const pushTree = (input: PushInput): Effect.Effect<string, Error> =>
   Effect.gen(function* run() {
     const tip = yield* lsRemoteTip(input.remoteUrl);
+
     return yield* withTempDir((workdir) =>
       Effect.gen(function* push() {
         if (tip === null) {
@@ -111,6 +116,7 @@ export const pushTree = (input: PushInput): Effect.Effect<string, Error> =>
           yield* runGit(["rm", "-r", "--cached", "."], workdir);
           yield* clearWorkdir(workdir);
         }
+
         yield* copyTreeEntries(input.treeDir, workdir);
         yield* runGit(["add", "-A"], workdir);
         yield* runGit(
@@ -126,6 +132,7 @@ export const pushTree = (input: PushInput): Effect.Effect<string, Error> =>
           workdir
         );
         yield* runGit(["push", "-u", "origin", "main"], workdir);
+
         return yield* runGit(["rev-parse", "HEAD"], workdir);
       })
     );

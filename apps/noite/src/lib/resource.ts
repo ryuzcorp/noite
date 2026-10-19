@@ -51,6 +51,7 @@ interface KeySub {
  * and every mounted reader per key. */
 const fetchers = new Map<string, ResourceFetcher<unknown>>();
 const generations = new Map<string, number>();
+
 /** Keys whose snapshots stay in memory only (`tracked(..., { persist: false
  * })`): bulky entries that would crowd the small sessionStorage quota. */
 const memoryOnly = new Set<string>();
@@ -68,17 +69,20 @@ const cache = Effect.runSync(
         catch: (cause: unknown): unknown => cause,
         try: async (signal: AbortSignal) => {
           const run = fetchers.get(key);
+
           const value: unknown =
             run === undefined
               ? await Promise.reject<unknown>(
                   new Error(`no fetcher registered for resource "${key}"`)
                 )
               : await run(key, { signal });
+
           writeSwr(
             key,
             value,
             memoryOnly.has(key) ? { persist: false } : undefined
           );
+
           return value;
         },
       }),
@@ -95,10 +99,13 @@ const settleKey = (
   if (generations.get(key) !== generation) {
     return;
   }
+
   const readers = subs.get(key);
+
   if (readers === undefined) {
     return;
   }
+
   for (const sub of readers) {
     sub.settle(outcome);
   }
@@ -112,15 +119,19 @@ const reload = async (key: string): Promise<unknown> => {
   const generation = (generations.get(key) ?? 0) + 1;
   generations.set(key, generation);
   const readers = subs.get(key);
+
   if (readers !== undefined) {
     for (const sub of readers) {
       sub.blank();
     }
   }
+
   await Effect.runPromise(Cache.invalidate(cache, key));
+
   try {
     const value = await Effect.runPromise(Cache.get(cache, key));
     settleKey(key, generation, { ok: true, value });
+
     return value;
   } catch (error) {
     settleKey(key, generation, { error, ok: false });
@@ -151,10 +162,13 @@ const kick = (key: string): void => {
  * with no readers just evicts, so the next mount refetches. */
 export const invalidate = (key: string): void => {
   const readers = subs.get(key);
+
   if (readers === undefined || readers.size === 0) {
     void Effect.runPromise(Cache.invalidate(cache, key));
+
     return;
   }
+
   void (async (): Promise<void> => {
     try {
       await reload(key);
@@ -178,11 +192,13 @@ export const tracked = <T>(
   opts?: { persist?: boolean }
 ): Resource<T> => {
   fetchers.set(key, fetcher);
+
   if (opts?.persist === false) {
     memoryOnly.add(key);
   } else {
     memoryOnly.delete(key);
   }
+
   const data = atom<T | undefined>(readSwr<T>(key));
   // oxlint-disable-next-line unicorn/no-useless-undefined -- the cell starts without an error; undefined is the seed
   const error = atom<unknown>(undefined);
@@ -194,6 +210,7 @@ export const tracked = <T>(
       // kicks the key when it hydrates; SSR paints the skeleton.
       return;
     }
+
     const sub: KeySub = {
       blank: (): void => {
         data.set(undefined);
@@ -208,27 +225,36 @@ export const tracked = <T>(
         } else {
           error.set(outcome.error);
         }
+
         loading.set(false);
       },
     };
+
     const readers = subs.get(key);
+
     if (readers === undefined) {
       subs.set(key, new Set<KeySub>([sub]));
     } else {
       readers.add(sub);
     }
+
     kick(key);
+
     return (): void => {
       const live = subs.get(key);
+
       if (live === undefined) {
         return;
       }
+
       live.delete(sub);
+
       if (live.size === 0) {
         subs.delete(key);
       }
     };
   });
+
   return {
     data: withSnapshot(key, data),
     error,
@@ -236,9 +262,11 @@ export const tracked = <T>(
     refetch: (): Promise<T | undefined> => {
       const settle = async (): Promise<T | undefined> => {
         const value = await reload(key);
+
         // SAFETY: the lookup ran this key's own fetcher, so the value is this key's T.
         return value as T;
       };
+
       return settle();
     },
   };

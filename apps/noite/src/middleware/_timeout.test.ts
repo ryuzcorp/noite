@@ -34,10 +34,13 @@ describe("timeoutExempt", () => {
 describe("timeout middleware", () => {
   test("lets a fast route through", async () => {
     let nextCalls = 0;
+
     const result = await withTimeout(20)(contextFor("/health"), () => {
       nextCalls += 1;
+
       return Promise.resolve();
     });
+
     expect(nextCalls).toBe(1);
     expect(result).toBeUndefined();
   });
@@ -50,19 +53,23 @@ describe("timeout middleware", () => {
       // oxlint-disable-next-line promise/avoid-new -- a never-settling next() is the stuck route under test
       () => new Promise<void>(() => {})
     );
+
     expect(result?.status).toBe(504);
     expect(await result?.json()).toEqual({ error: "Request timed out" });
   });
 
   test("never races an exempt path", async () => {
     let nextCalls = 0;
+
     const result = await withTimeout(20)(
       contextFor("/api/apps/a/logs/stream"),
       () => {
         nextCalls += 1;
+
         return Promise.resolve();
       }
     );
+
     expect(nextCalls).toBe(1);
     expect(result).toBeUndefined();
   });
@@ -70,10 +77,13 @@ describe("timeout middleware", () => {
   test("the default export gates with the 15 s bound", async () => {
     expect(TIMEOUT_MS).toBe(15_000);
     let nextCalls = 0;
+
     const result = await defaultTimeoutMiddleware(contextFor("/health"), () => {
       nextCalls += 1;
+
       return Promise.resolve();
     });
+
     expect(nextCalls).toBe(1);
     expect(result).toBeUndefined();
   });

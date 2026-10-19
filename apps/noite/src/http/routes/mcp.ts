@@ -49,6 +49,7 @@ const parseFailure = (): Response => {
     id: null,
     jsonrpc: "2.0",
   };
+
   return Response.json(body, {
     headers: { "cache-control": "no-store" },
     status: 400,
@@ -57,10 +58,13 @@ const parseFailure = (): Response => {
 
 const bearerKey = (request: Request): string | null => {
   const header = request.headers.get("authorization") ?? "";
+
   if (!header.toLowerCase().startsWith("bearer ")) {
     return null;
   }
+
   const key = header.slice("bearer ".length).trim();
+
   return key === "" ? null : key;
 };
 
@@ -71,58 +75,77 @@ export const handleMcp: RouteHandler = async (request, env) => {
       status: 405,
     });
   }
+
   if (!originAllowed(request, env)) {
     return Response.json(
       { error: "origin not allowed" },
       { headers: { "cache-control": "no-store" }, status: 403 }
     );
   }
+
   const version = request.headers.get(PROTOCOL_VERSION_HEADER);
+
   if (version && !SUPPORTED_PROTOCOL_VERSIONS.includes(version)) {
     return Response.json(
       { error: `unsupported MCP protocol version: ${version}` },
       { headers: { "cache-control": "no-store" }, status: 400 }
     );
   }
+
   const key = bearerKey(request);
+
   if (!key) {
     return unauthorized();
   }
+
   await ensureDbPromise();
   let userId: string;
+
   try {
     const auth = authFromEnv(
       env,
       env.BETTER_AUTH_URL ?? new URL(request.url).origin
     );
+
     const verified = await auth.api.verifyApiKey({
       body: { key, permissions: { apps: ["manage"] } },
     });
+
     const owner = verified.valid ? verified.key?.referenceId : null;
+
     if (!owner) {
       return unauthorized();
     }
+
     userId = owner;
   } catch (error) {
     if (error instanceof MissingAuthSecretError) {
       return new Response(error.message, { status: 500 });
     }
+
     throw error;
   }
+
   const body = await readBoundedText(request, MAX_BODY_BYTES);
+
   if (body === null) {
     return tooLarge();
   }
+
   let message: Json;
+
   try {
     message = JSON.parse(body);
   } catch {
     return parseFailure();
   }
+
   const response = await handleMcpMessage({ userId }, message, MCP_TOOLS);
+
   if (response === null) {
     return new Response(null, { status: 202 });
   }
+
   return Response.json(response, {
     headers: { "cache-control": "no-store" },
   });

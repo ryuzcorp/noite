@@ -43,10 +43,12 @@ const onDropdownClick = (event: MouseEvent) => {
           ".dropdown-content a[href], .dropdown-content.menu button"
         )
       : null;
+
   if (item && document.activeElement instanceof HTMLElement) {
     document.activeElement.blur();
   }
 };
+
 // `<details class="dropdown">` popovers (filters, sort, menus) only close
 // when their own summary is clicked. Close every open one on a press
 // outside it, which also means opening one dropdown closes the others.
@@ -59,26 +61,32 @@ const closeOpenDetails = (except?: Node) => {
     }
   }
 };
+
 const onDropdownPointerDown = (event: PointerEvent) => {
   closeOpenDetails(event.target instanceof Node ? event.target : undefined);
 };
+
 // Esc closes any dropdown: open `<details>` ones, and focus-based ones by
 // dropping focus out of them. A dialog's own Esc handling is unaffected.
 const onDropdownKeyDown = (event: KeyboardEvent) => {
   if (event.key !== "Escape") {
     return;
   }
+
   closeOpenDetails();
   const active = document.activeElement;
+
   if (active instanceof HTMLElement && active.closest(".dropdown")) {
     active.blur();
   }
 };
+
 const useDropdownWiring = (): void => {
   watch.once(({ onCleanup }) => {
     if (typeof document === "undefined") {
       return;
     }
+
     document.addEventListener("click", onDropdownClick);
     document.addEventListener("pointerdown", onDropdownPointerDown);
     document.addEventListener("keydown", onDropdownKeyDown);
@@ -108,6 +116,7 @@ export default function DashboardLayout({ children }: { children?: View }) {
   // It must run on every render, before the /login early return.
   provideQueryCell();
   useDropdownWiring();
+
   // The chrome's own state, like the cell above: the sidebar is part of the
   // shell, so it is created before the /login early return — nothing binds
   // there, because the drawer is not rendered.
@@ -117,6 +126,7 @@ export default function DashboardLayout({ children }: { children?: View }) {
   const sidebar = atom.lazy(() => createPaneGroup(SIDEBAR_PANES), {
     snapshot: false,
   })();
+
   watch.once(({ onCleanup }) => {
     onCleanup(() => {
       sidebar.destroy();
@@ -127,6 +137,7 @@ export default function DashboardLayout({ children }: { children?: View }) {
   // daisyUI `menu` CSS (child combinators), where a `Link` host span would
   // break the item styling.
   const link = useLink();
+
   const signOut = async () => {
     // Sign out first: invalidating before the cookie is gone refetched (and
     // re-cached) the outgoing user's session.
@@ -134,14 +145,17 @@ export default function DashboardLayout({ children }: { children?: View }) {
     invalidateSession();
     await router.visit("/login");
   };
+
   const { activeAppId, activeView, onAppsPages } = sidebarPlace(router.path);
   const appsItemActive = onAppsPages && activeAppId === null;
   const sessionRes = session();
   const user = sessionRes.data()?.user;
   const displayName = user?.name || user?.email || "";
+
   if (router.path === "/login") {
     return <>{children}</>;
   }
+
   const sidebarSplit = sidebar.stored(2);
 
   return (

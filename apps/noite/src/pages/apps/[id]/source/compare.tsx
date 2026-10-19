@@ -14,13 +14,16 @@ export default function ComparePage() {
   // The ref the compare was opened from (the branch picker sets it), so the
   // back link and the commit links return to that checkout.
   const gitRef = searchParam("ref", { default: "" });
+
   if (!appId) {
     return <p class="text-error m-0 p-4 text-sm">Missing app id.</p>;
   }
+
   const pick = (nextBase: string, nextHead: string): void => {
     base.set(nextBase);
     headRef.set(nextHead);
   };
+
   return (
     <CodePage appId={appId} backRef={gitRef()}>
       <DocumentTitle title={`Compare ${base()}…${headRef()} · Noite`} />

@@ -14,6 +14,7 @@ export const getUserProps = apiAction(
   UserPropsArgs,
   async ({ appId, userId }, { env, request }) => {
     await requireViewApp(request, env, appId);
+
     return runnerGetUserProps(appId, userId);
   }
 );

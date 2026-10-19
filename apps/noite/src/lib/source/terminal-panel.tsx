@@ -25,14 +25,17 @@ const TERMINAL_CSS = `
 const shadowPane = (host: HTMLElement): HTMLElement => {
   const root = host.shadowRoot ?? host.attachShadow({ mode: "open" });
   const existing = root.querySelector<HTMLElement>(".term-body");
+
   if (existing) {
     return existing;
   }
+
   const style = document.createElement("style");
   style.textContent = TERMINAL_CSS;
   const pane = document.createElement("div");
   pane.className = "term-body";
   root.append(style, pane);
+
   return pane;
 };
 
@@ -54,6 +57,7 @@ export const TerminalPanel = ({
     const stopTerminal = terminal.subscribe(() => {
       terminalView.set(terminal.view());
     });
+
     // The ref fires before insertion: wait for the host that is really in
     // the document, never a scratch copy the morph is about to discard. The
     // wait repeats while mounted: on a slow first paint the bounded wait can
@@ -63,21 +67,26 @@ export const TerminalPanel = ({
       while (!signal.aborted) {
         // oxlint-disable-next-line eslint/no-await-in-loop -- one host lookup per pass; the loop ends at the first connected host
         const el = await whenLive(body, signal);
+
         if (signal.aborted || el === null) {
           continue;
         }
+
         // Mount never rejects (the session reports readiness through its
         // view), so this is fired and the loop ends on the first live host.
         void terminal.mount(shadowPane(el));
+
         return;
       }
     })();
+
     onCleanup(() => {
       stopTerminal();
       terminal.unmount();
     });
   });
   const current = terminalView();
+
   return (
     // The pane itself: the page's own resizable group owns the rows and the
     // split (see $lib/ui/resizable); below `lg` this root only fills its own

@@ -22,24 +22,31 @@ const MODAL_RESERVED_SLUGS = {
 /** Live slug validation message (null = valid), mirroring the runner gate. */
 const slugValidationMessage = (raw: string): string | null => {
   const value = raw.trim();
+
   if (!value) {
     return "Slug is required";
   }
+
   if (value.length > 48) {
     return "Max 48 characters";
   }
+
   if (/[A-Z]/u.test(value)) {
     return "Lowercase letters only";
   }
+
   if (/[^a-z0-9-]/u.test(value)) {
     return "Only lowercase letters, digits, and hyphens";
   }
+
   if (value.startsWith("-") || value.endsWith("-")) {
     return "Must start and end with a letter or digit";
   }
+
   if (value in MODAL_RESERVED_SLUGS) {
     return "Slug is reserved";
   }
+
   return null;
 };
 
@@ -107,11 +114,15 @@ export const AppDangerZone = ({
     if (busy()) {
       return;
     }
+
     const raw = slugDraft();
+
     if (slugValidationMessage(raw)) {
       return;
     }
+
     busy.set(true);
+
     try {
       await api<{ ok: true }>("/api/apps/renameApp", {
         id: appId,
@@ -169,9 +180,11 @@ export const AppDangerZone = ({
                   "This removes the app, its git remote and its fleet. This cannot be undone.",
                 title: `Delete ${name}?`,
               });
+
               if (!ok) {
                 return;
               }
+
               try {
                 await api<{ ok: true }>("/api/apps/remove", appId);
                 dropAppFromSnapshot(appId);

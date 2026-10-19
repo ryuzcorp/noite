@@ -12,6 +12,7 @@ describe("agent setup snippets", () => {
       "cursor",
       "codex",
     ]);
+
     for (const snippet of snippets) {
       expect(snippet.text).toContain(`${origin}/mcp`);
       expect(snippet.text).toContain("noite_testkey");
@@ -23,6 +24,7 @@ describe("agent setup snippets", () => {
     const cursor = agentSnippets({ apiKey: "noite_testkey", origin }).find(
       (snippet) => snippet.id === "cursor"
     )?.text;
+
     expect(JSON.parse(cursor ?? "null")).toEqual({
       mcpServers: {
         noite: {
@@ -38,6 +40,7 @@ describe("agent setup snippets", () => {
         snippet.text,
       ])
     );
+
     expect(byId.get("claude-code")).toContain(
       `claude mcp add --transport http noite ${origin}/mcp`
     );

@@ -99,6 +99,7 @@ export const AdminAppsPanel = () => {
   const apps = res.data() ?? [];
   const loadError = res.error();
   const needle = search().trim().toLowerCase();
+
   const shown = needle
     ? apps.filter((app) =>
         [app.name, app.slug, app.ownerEmail].some((field) =>
@@ -110,17 +111,20 @@ export const AdminAppsPanel = () => {
   const mutate = async <T,>(work: () => Promise<T>): Promise<void> => {
     busy.set(true);
     panelError.set("");
+
     try {
       await work();
       await res.refetch();
     } catch (error) {
       panelError.set(errorMessage(error));
     }
+
     busy.set(false);
   };
 
   const loading = res.loading() && res.data() === undefined;
   let body: View;
+
   if (loading) {
     body = <SkeletonRows />;
   } else if (shown.length === 0) {
@@ -154,9 +158,11 @@ export const AdminAppsPanel = () => {
                     "This removes the app, its git remote and its fleet.",
                   title: `Delete ${app.name} (${app.slug})?`,
                 });
+
                 if (!ok) {
                   return;
                 }
+
                 await mutate(() =>
                   api<{ ok: true }>("/api/admin/adminDeleteApp", app.id)
                 );
@@ -167,6 +173,7 @@ export const AdminAppsPanel = () => {
       </>
     );
   }
+
   return (
     <PanelCard
       title="Apps"

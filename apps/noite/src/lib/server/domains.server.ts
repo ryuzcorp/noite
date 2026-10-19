@@ -20,6 +20,7 @@ const DomainArgs = Schema.Struct({
 /** Hostnames this app answers on, for anyone who can see the app. */
 export const listDomains = apiAction(AppId, async (appId, { env, request }) => {
   await requireViewApp(request, env, appId);
+
   try {
     return await runnerListDomains(appId);
   } catch (error) {
@@ -34,6 +35,7 @@ export const addDomain = apiAction(
   async ({ appId, hostname }, { env, request }) => {
     const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "admin");
+
     try {
       return await runnerAddDomain(appId, hostname);
     } catch (error) {
@@ -47,6 +49,7 @@ export const removeDomain = apiAction(
   async ({ appId, hostname }, { env, request }) => {
     const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "admin");
+
     try {
       return await runnerRemoveDomain(appId, hostname);
     } catch (error) {

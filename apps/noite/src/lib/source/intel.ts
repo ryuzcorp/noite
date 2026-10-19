@@ -58,6 +58,7 @@ export class SourceIntel {
     drafts: readonly IntelFile[]
   ): Promise<void> {
     this.#started ??= this.#start(load, drafts);
+
     return this.#started;
   }
 
@@ -71,6 +72,7 @@ export class SourceIntel {
     this.#failPending(new Error("source intelligence reset"));
     this.#sent.clear();
     this.#started = this.#start(load, drafts);
+
     return this.#started;
   }
 
@@ -89,6 +91,7 @@ export class SourceIntel {
       kind: "diagnostics",
       path,
     }));
+
     return found ?? [];
   }
 
@@ -141,19 +144,25 @@ export class SourceIntel {
   ): Promise<T | null> {
     const generation = this.#generation;
     const ready = this.#started;
+
     if (!ready) {
       return null;
     }
+
     try {
       await ready;
     } catch {
       return null;
     }
+
     const worker = this.#worker;
+
     if (generation !== this.#generation || !worker) {
       return null;
     }
+
     this.#syncText(path, text);
+
     try {
       // SAFETY: the worker answers each id with the payload its request kind
       // asks for — `build` is what decided the kind, and `T` is the payload
@@ -171,12 +180,14 @@ export class SourceIntel {
     if (this.#sent.get(path) === text) {
       return;
     }
+
     this.#sent.set(path, text);
     this.#worker?.postMessage({ kind: "update", path, text });
   }
 
   #nextId(): number {
     this.#seq += 1;
+
     return this.#seq;
   }
 
@@ -192,6 +203,7 @@ export class SourceIntel {
     });
     // oxlint-disable-next-line unicorn/require-post-message-target-origin -- a Worker's postMessage has no target origin (the worker is same-origin by construction)
     worker.postMessage(request);
+
     return reply.promise;
   }
 
@@ -204,6 +216,7 @@ export class SourceIntel {
     const generation = this.#generation;
     const worker = this.#worker ?? this.#createWorker();
     let bundle: IntelBundle;
+
     try {
       bundle = await load();
     } catch {
@@ -213,9 +226,12 @@ export class SourceIntel {
       if (generation === this.#generation) {
         this.#started = undefined;
       }
+
       return;
     }
+
     this.#sent = new Map(drafts.map((draft) => [draft.path, draft.text]));
+
     try {
       await this.#post(worker, {
         bundle,
@@ -229,6 +245,7 @@ export class SourceIntel {
       // dropped so the next attempt builds a live one instead of posting into
       // a scope that will never answer.
       this.#drop(worker);
+
       if (generation === this.#generation) {
         this.#started = undefined;
       }
@@ -239,6 +256,7 @@ export class SourceIntel {
    * never answered, so reusing it would hang every later request. */
   #drop(worker: Worker): void {
     worker.terminate();
+
     if (this.#worker === worker) {
       this.#worker = undefined;
     }
@@ -248,17 +266,23 @@ export class SourceIntel {
     const worker = createIntelWorker();
     worker.addEventListener("message", (event: MessageEvent<IntelMessage>) => {
       const message = event.data;
+
       if (!("id" in message)) {
         // Unsolicited: declarations landed after a reply the pane already
         // painted, so what it painted is worth re-checking.
         this.#onTypesChanged?.();
+
         return;
       }
+
       const pending = this.#pending.get(message.id);
+
       if (!pending) {
         return;
       }
+
       this.#pending.delete(message.id);
+
       if (message.ok) {
         pending.resolve(message.value);
       } else {
@@ -272,6 +296,7 @@ export class SourceIntel {
       this.#failPending(new Error(event.message || "language worker failed"));
     });
     this.#worker = worker;
+
     return worker;
   }
 
@@ -279,6 +304,7 @@ export class SourceIntel {
     for (const pending of this.#pending.values()) {
       pending.reject(error);
     }
+
     this.#pending.clear();
   }
 }

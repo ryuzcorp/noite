@@ -165,16 +165,21 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
    * by every sync. A push drops it (the repo moved under the worker), and so
    * does a failed fetch, so opening a file retries. */
   let serverBundle: Promise<IntelBundle> | undefined;
+
   const fetchServerBundle = async (): Promise<IntelBundle> => {
     const fetched = serverBundle;
+
     if (fetched !== undefined) {
       return await fetched;
     }
+
     const loading = api<RunnerSourceBundle>("/api/source/sourceBundle", {
       appId: host.appId,
       ref: host.gitRef(),
     });
+
     serverBundle = loading;
+
     try {
       return await loading;
     } catch (error) {
@@ -199,6 +204,7 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
    * arrive later, as a `typesChanged` event. */
   const ensureIntel = (): Promise<void> => {
     intelStarted = true;
+
     return intel.sync(fetchServerBundle, workerDrafts());
   };
 
@@ -213,8 +219,10 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
       character: request.cursorOffsetInExcerpt,
       line: request.excerptStartLine,
     };
+
     const nothing: EditPredictResponse = { edits: [], newCursor: cursor };
     const text = liveText.get(request.path);
+
     if (
       text === undefined ||
       !host.currentEditable() ||
@@ -222,15 +230,20 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
     ) {
       return nothing;
     }
+
     const offset = offsetAtPosition(text, cursor);
     const completion = await intel.completion(request.path, text, offset);
+
     if (!completion || context.signal.aborted) {
       return nothing;
     }
+
     const remainder = completionRemainder(text, offset, completion);
+
     if (remainder === null) {
       return nothing;
     }
+
     return {
       edits: [{ newText: remainder, range: { end: cursor, start: cursor } }],
       newCursor: positionAtOffset(lineStarts(text), offset + remainder.length),
@@ -243,6 +256,7 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
    * escalated. */
   const paintIntel = () => {
     const target = sessionTarget;
+
     if (
       target === undefined ||
       !sessionReady ||
@@ -250,6 +264,7 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
     ) {
       return;
     }
+
     if (pendingIntel.markers && host.currentEditable()) {
       try {
         target.setMarkers(pendingIntel.markers);
@@ -257,12 +272,16 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
         // The session went away between the check and the write: the next
         // attach (or file switch) settles it.
         sessionReady = false;
+
         return;
       }
     }
+
     const { caret } = pendingIntel;
+
     if (caret) {
       pendingIntel.caret = undefined;
+
       // Two independent best-effort steps: the selection is what the pane
       // paints, and the focus request is delivered by pierre's own render
       // queue (it may land on the next paint) — neither may block the other.
@@ -271,6 +290,7 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
       } catch {
         // The session moved on; nothing to recover.
       }
+
       try {
         target.focus();
       } catch {
@@ -283,14 +303,17 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
    * once it is disposed there is no document left to clear them from. */
   const clearMarkers = () => {
     const target = sessionTarget;
+
     if (target === undefined || !(sessionReady && pendingIntel.markers)) {
       return;
     }
+
     try {
       target.setMarkers([]);
     } catch {
       sessionReady = false;
     }
+
     pendingIntel.markers = undefined;
   };
 
@@ -300,12 +323,15 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
    * no squiggles; binary and oversize previews have no text to check. */
   const runDiagnostics = async (path: string) => {
     const text = liveText.get(path);
+
     if (text === undefined || !host.currentEditable()) {
       return;
     }
+
     intelSeq += 1;
     const seq = intelSeq;
     const diagnostics = await intel.diagnostics(path, text);
+
     if (
       seq !== intelSeq ||
       host.aborted() ||
@@ -314,6 +340,7 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
     ) {
       return;
     }
+
     currentDiagnostics = diagnostics;
     pendingIntel.markers = diagnosticsToMarkers(diagnostics, text);
     pendingIntel.path = path;
@@ -325,13 +352,16 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
     cancelDiagnostics?.();
     cancelDiagnostics = undefined;
     const path = host.currentPath();
+
     if (path === null || !host.currentEditable() || !isScriptFile(path)) {
       return;
     }
+
     const timer = setTimeout(() => {
       cancelDiagnostics = undefined;
       void runDiagnostics(path);
     }, DIAGNOSTICS_DELAY);
+
     cancelDiagnostics = () => {
       clearTimeout(timer);
     };
@@ -362,13 +392,17 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
     props: TokenEventBase
   ): { offset: number; path: string; text: string } | null => {
     const path = host.currentPath();
+
     if (path === null) {
       return null;
     }
+
     const text = liveText.get(path);
+
     if (text === undefined || !isScriptFile(path)) {
       return null;
     }
+
     return {
       offset: offsetAtPosition(text, {
         character: props.lineCharStart,
@@ -381,9 +415,11 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
 
   const tokenEnter = async (props: TokenEventBase) => {
     const hit = tokenOffset(props);
+
     if (!hit) {
       return;
     }
+
     hoverSeq += 1;
     const seq = hoverSeq;
     // Ask right away, open only once the pointer has rested: a pass over the
@@ -392,19 +428,24 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
     setTimeout(() => {
       rested.resolve();
     }, HOVER_DELAY);
+
     const [info] = await Promise.all([
       intel.quickInfo(hit.path, hit.text, hit.offset),
       rested.promise,
     ]);
+
     if (seq !== hoverSeq) {
       return;
     }
+
     // The token's diagnostics ride the same tip: type first, then the errors
     // under a divider. Either one alone still opens the tip.
     const errors = diagnosticMessagesAtOffset(currentDiagnostics, hit.offset);
+
     if (!info && errors.length === 0) {
       return;
     }
+
     await tip.show(
       {
         code: info?.signature ?? "",
@@ -434,16 +475,21 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
     if (!(event.metaKey || event.ctrlKey)) {
       return;
     }
+
     const hit = tokenOffset(props);
+
     if (!hit) {
       return;
     }
+
     void (async () => {
       try {
         const target = await intel.definition(hit.path, hit.text, hit.offset);
+
         if (!target || host.aborted()) {
           return;
         }
+
         if (target.preview) {
           hoverSeq += 1;
           await tip.show(
@@ -456,8 +502,10 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
             },
             props.tokenElement
           );
+
           return;
         }
+
         await navigate(target.path, target.start);
       } catch {
         // Navigation is best-effort: a failed jump must never disturb the
@@ -474,9 +522,11 @@ export const createEditorIntel = (host: EditorIntelHost): EditorIntel => {
    * row lands twice), and dropping it would leave the pane unfocused. */
   const beginPreview = (path: string) => {
     clearMarkers();
+
     if (pendingIntel.path !== path) {
       pendingIntel.caret = undefined;
     }
+
     pendingIntel.markers = undefined;
     pendingIntel.path = path;
     sessionReady = false;

@@ -95,6 +95,7 @@ const stringField = (
   name: string
 ): string | null => {
   const value = fields.get(name);
+
   return typeof value === "string" ? value : null;
 };
 
@@ -103,6 +104,7 @@ const errorField = (value: unknown): string | null => {
   if (typeof value !== "object" || value === null) {
     return null;
   }
+
   return stringField(new Map(Object.entries(value)), "message");
 };
 
@@ -113,8 +115,10 @@ const incoming = (value: unknown): Incoming | null => {
   if (typeof value !== "object" || value === null) {
     return null;
   }
+
   const fields = new Map(Object.entries(value));
   const answer = fields.get("answer");
+
   if (typeof answer === "number") {
     if (fields.get("ok") === false) {
       return {
@@ -124,13 +128,17 @@ const incoming = (value: unknown): Incoming | null => {
         value: undefined,
       };
     }
+
     return { answer, failed: null, kind: "answer", value: fields.get("v") };
   }
+
   const request = stringField(fields, "k");
   const i = fields.get("i");
+
   if (request === null || typeof i !== "number") {
     return null;
   }
+
   return { i, kind: "request", params: fields.get("p"), request };
 };
 /* oxlint-enable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof */
@@ -142,10 +150,13 @@ const archiveBytes = (value: unknown): Uint8Array | null => {
   if (typeof value !== "object" || value === null) {
     return null;
   }
+
   const bytes = new Map(Object.entries(value)).get("bytes");
+
   if (bytes instanceof ArrayBuffer) {
     return new Uint8Array(bytes);
   }
+
   return bytes instanceof Uint8Array ? bytes : null;
 };
 /* oxlint-enable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof */
@@ -200,6 +211,7 @@ export const createPodServer = (options: {
     if (workspace === null) {
       throw new PodRequestError("not-open", "pod: no workspace is open");
     }
+
     return workspace;
   };
 
@@ -208,12 +220,14 @@ export const createPodServer = (options: {
    * refuses its own. */
   const writable = (): FrameWorkspace => {
     const open = requireWorkspace();
+
     if (!open.editable) {
       throw new PodRequestError(
         "read-only",
         "workspace: this checkout is read-only"
       );
     }
+
     return open;
   };
 
@@ -228,9 +242,11 @@ export const createPodServer = (options: {
     const ask: PodAskMessage<"archive"> = { ask: "archive", i, p: { sha } };
     port.postMessage(ask);
     const bytes = archiveBytes(await answered.promise);
+
     if (bytes === null) {
       throw new Error("pod: the archive ask answered no bytes");
     }
+
     return bytes;
   };
 
@@ -255,12 +271,14 @@ export const createPodServer = (options: {
         "pod: this frame already holds a workspace"
       );
     }
+
     if (params.appId !== appId || params.branch !== branch) {
       throw new PodRequestError(
         "forbidden",
         "pod: this frame serves another ref"
       );
     }
+
     // oxlint-disable-next-line anti-slop/no-runtime-typeof -- the params came off the port: this is the check, before the boot trusts them.
     if (!Array.isArray(params.files) || typeof params.sha !== "string") {
       throw new PodRequestError(
@@ -268,6 +286,7 @@ export const createPodServer = (options: {
         "pod: an open needs the ref's listing and its commit"
       );
     }
+
     const open = await createWorkspace({
       appId,
       branch,
@@ -280,6 +299,7 @@ export const createPodServer = (options: {
       openPod,
       sha: params.sha,
     });
+
     workspace = open;
     stops.push(
       open.onChanges(() => {
@@ -292,6 +312,7 @@ export const createPodServer = (options: {
     // The rows the open itself derived: the page has its own subscription
     // working, and a workspace with changes is never drawn as clean.
     publishChanges();
+
     return {
       baseSha: open.baseSha,
       editable: open.editable,
@@ -306,6 +327,7 @@ export const createPodServer = (options: {
         "pod: this frame already holds a workspace"
       );
     }
+
     const booting = bootWorkspace(params);
     opening = booting;
     // oxlint-disable-next-line promise/prefer-await-to-then -- the boot's own promise is the request's answer; this only clears the in-flight marker, whichever way it settles.
@@ -317,6 +339,7 @@ export const createPodServer = (options: {
         opening = null;
       }
     );
+
     return booting;
   };
 
@@ -327,6 +350,7 @@ export const createPodServer = (options: {
    * down too, rather than left holding the saved copy's lock. */
   const closeWorkspace = async (): Promise<void> => {
     const booting = opening;
+
     if (booting !== null) {
       try {
         await booting;
@@ -334,17 +358,23 @@ export const createPodServer = (options: {
         // The boot's own failure is its request's to report.
       }
     }
+
     const open = workspace;
+
     if (open === null) {
       return;
     }
+
     workspace = null;
+
     for (const stop of stops.splice(0)) {
       stop();
     }
+
     for (const watch of watches.values()) {
       watch.close();
     }
+
     watches.clear();
     terminal?.close();
     terminal = null;
@@ -360,21 +390,25 @@ export const createPodServer = (options: {
     params: WorkspacePush
   ): Promise<{ payload: PushPayload }> => {
     const open = requireWorkspace();
+
     if (push !== null) {
       throw new PodRequestError(
         "busy",
         "workspace: a push is already in flight"
       );
     }
+
     const settled = Promise.withResolvers<{ sha: string }>();
     const built = Promise.withResolvers<PushPayload>();
     let handed = false;
+
     const pending: OpenPush = {
       finishing: null,
       handed: false,
       refused: false,
       settled,
     };
+
     push = pending;
     pending.finishing = open.push(
       { branch: params.branch, message: params.message, target: params.target },
@@ -382,6 +416,7 @@ export const createPodServer = (options: {
         handed = true;
         pending.handed = true;
         built.resolve(payload);
+
         return await settled.promise;
       }
     );
@@ -392,19 +427,23 @@ export const createPodServer = (options: {
         // exactly as it was.
         return;
       }
+
       if (!handed) {
         // The push never reached the page's commit at all: this request's own
         // failure (a read-only ref, a journal that would not read).
         push = null;
         built.reject(error);
+
         return;
       }
+
       // The commit landed, so the page's push succeeded and this is the
       // frame's own state that did not settle — nothing else can say so.
       emit("fatal", {
         message: `The push landed, but settling the workspace failed: ${errorMessage(error)}`,
       });
     });
+
     return { payload: await built.promise };
   };
 
@@ -412,18 +451,23 @@ export const createPodServer = (options: {
    * publishes the post-push rows), and a failure leaves the pod untouched. */
   const pushSettle = async (params: PushSettleParams): Promise<void> => {
     const pending = push;
+
     if (pending === null) {
       throw new PodRequestError(
         "busy",
         "workspace: no push is waiting to settle"
       );
     }
+
     push = null;
+
     if (params.ok !== true) {
       pending.refused = true;
       pending.settled.reject(new Error(params.error ?? "the commit failed"));
+
       return;
     }
+
     // oxlint-disable-next-line anti-slop/no-runtime-typeof -- the params came off the port; a settled push without a commit id is refused here.
     if (typeof params.sha !== "string" || params.sha === "") {
       throw new PodRequestError(
@@ -431,6 +475,7 @@ export const createPodServer = (options: {
         "pod: a settled push needs the commit it landed"
       );
     }
+
     pending.settled.resolve({ sha: params.sha });
     // The answer waits for the continuation, so a push that resolved on the
     // page's side means the pod has re-derived. A failure there is the
@@ -465,10 +510,12 @@ export const createPodServer = (options: {
     },
     "fs.watch": ({ path, recursive }) => {
       const open = requireWorkspace();
+
       // oxlint-disable-next-line anti-slop/no-runtime-typeof -- the params came off the port: a watch needs a path before the pod's own watcher is asked to follow one.
       if (typeof path !== "string" || path === "") {
         throw new PodRequestError("bad-params", "pod: a watch needs a path");
       }
+
       const watchId = nextWatchId;
       nextWatchId += 1;
       watches.set(
@@ -481,6 +528,7 @@ export const createPodServer = (options: {
           }
         )
       );
+
       return { watchId };
     },
     "fs.write": async ({ data, path }) => {
@@ -507,15 +555,18 @@ export const createPodServer = (options: {
     "terminal.open": ({ cols, rows }) => {
       const open = requireWorkspace();
       terminal?.close();
+
       const backend = createTerminalBackend({
         onWrite: (data) => {
           emit("terminal.write", { data });
         },
         pod: open.pod,
       });
+
       backend.open(cols, rows);
       terminal = backend;
       nextSessionId += 1;
+
       return { sessionId: nextSessionId };
     },
     "terminal.resize": ({ cols, rows }) => {
@@ -532,12 +583,14 @@ export const createPodServer = (options: {
     request: string;
   }): Promise<void> => {
     const { i } = request;
+
     // SAFETY: the kind was checked to be one of the map's own keys, so the
     // lookup is the map's own handler for it.
     // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- justified above.
     const handler = Object.hasOwn(handlers, request.request)
       ? handlers[request.request as PodRequestKind]
       : undefined;
+
     if (handler === undefined) {
       port.postMessage({
         e: {
@@ -547,8 +600,10 @@ export const createPodServer = (options: {
         i,
         ok: false,
       } satisfies PodResponse);
+
       return;
     }
+
     try {
       // SAFETY: the kind's own handler is the only one that reads `params`,
       // and its result type is the map's for that same kind.
@@ -556,6 +611,7 @@ export const createPodServer = (options: {
       const run = handler as (
         params: unknown
       ) => PodAnyResult | Promise<PodAnyResult>;
+
       /* oxlint-enable anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-unknown-parameters */
       const value = await run(request.params);
       port.postMessage({ i, ok: true, v: value } satisfies PodResponse);
@@ -572,22 +628,29 @@ export const createPodServer = (options: {
   // oxlint-disable-next-line unicorn/prefer-add-event-listener -- `onmessage` is the port's own API: assigning it is what starts the port, which `addEventListener` does not do.
   port.onmessage = (event: MessageEvent) => {
     const message = incoming(event.data);
+
     if (message === null) {
       return;
     }
+
     if (message.kind === "answer") {
       const waiting = asks.get(message.answer);
+
       if (waiting === undefined) {
         return;
       }
+
       asks.delete(message.answer);
+
       if (message.failed === null) {
         waiting.resolve(message.value);
       } else {
         waiting.reject(new Error(message.failed));
       }
+
       return;
     }
+
     void serve(message);
   };
 

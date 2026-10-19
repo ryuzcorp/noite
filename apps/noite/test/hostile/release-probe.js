@@ -3,6 +3,7 @@
 import { readFileSync, writeFileSync, appendFileSync } from "node:fs";
 
 const out = {};
+
 for (const key of [
   "RUNNER_TOKEN",
   "AWS_SECRET_ACCESS_KEY",
@@ -12,6 +13,7 @@ for (const key of [
     ? { detail: "present", ok: true }
     : { detail: "absent", ok: false };
 }
+
 try {
   out["read:/data/noite.sqlite"] = {
     detail: String(readFileSync("/data/noite.sqlite", "utf-8").length),
@@ -23,6 +25,7 @@ try {
     ok: false,
   };
 }
+
 try {
   const res = await fetch("http://127.0.0.1:8091/state");
   out["fetch:control-internal"] = { detail: `status ${res.status}`, ok: true };
@@ -32,15 +35,19 @@ try {
     ok: false,
   };
 }
+
 try {
   const prefix = process.env.NOITE_APP_PREFIX ?? "";
   out["scoped-prefix"] = { detail: prefix, ok: prefix.startsWith("fleets/") };
 } catch (error) {
   out["scoped-prefix"] = { detail: String(error).slice(0, 200), ok: false };
 }
+
 writeFileSync(
   "dist/release-probe.json",
   JSON.stringify({ phase: "release", probes: out }, null, 2)
 );
+
 appendFileSync("dist/probe.log", `release probes ${JSON.stringify(out)}\n`);
+
 console.log(`hostile release probes: ${JSON.stringify(out)}`);

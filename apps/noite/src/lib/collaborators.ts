@@ -23,6 +23,7 @@ const findApp = async (
       "id" in key
         ? await runnerGetApp(key.id)
         : await runnerGetAppBySlug(key.slug);
+
     return app ?? null;
   } catch {
     return null;
@@ -38,6 +39,7 @@ export const grantCollaborator = (
     const existing = yield* orm.app_collaborator.findFirst({
       where: { appId, userId },
     });
+
     if (existing) {
       if (existing.role !== role) {
         yield* orm.app_collaborator.update({
@@ -45,8 +47,10 @@ export const grantCollaborator = (
           where: { id: existing.id },
         });
       }
+
       return;
     }
+
     yield* orm.app_collaborator.create({
       data: { appId, id: crypto.randomUUID(), role, userId },
     });
@@ -81,6 +85,7 @@ interface AccessRow {
 const accessRow = (appId: string, userId: string, adminEmail: string | null) =>
   Effect.gen(function* run() {
     const sql = yield* SqlClient;
+
     const rows = yield* sql.unsafe(
       `SELECT
          (SELECT CASE WHEN role = 'admin' THEN 1 ELSE 0 END FROM "user" WHERE id = ?) AS isAdmin,
@@ -88,9 +93,11 @@ const accessRow = (appId: string, userId: string, adminEmail: string | null) =>
          (SELECT role FROM app_collaborator WHERE appId = ? AND userId = ?) AS collabRole`,
       [userId, adminEmail, adminEmail, userId, appId, userId]
     );
+
     // SAFETY: the projection is the three columns named above; D1 returns
     // plain rows.
     const [row] = rows as AccessRow[];
+
     return row ?? { anchored: 0, collabRole: null, isAdmin: 0 };
   });
 
@@ -101,9 +108,11 @@ const roleFor = async (
 ): Promise<AppRole | null> => {
   const anchored = resolveAdminEmail();
   const row = await withDb(accessRow(app.id, userId, anchored));
+
   if (row.isAdmin === 1 || row.anchored === 1) {
     return "admin";
   }
+
   // Grants are the only source of access below instance admin: the creator
   // gets an admin grant on create, and can be removed like anyone else (as
   // long as another admin remains).
@@ -116,9 +125,11 @@ const gate = async (
   need: AppRole
 ): Promise<{ app: RunnerApp; role: AppRole }> => {
   const role = app ? await roleFor(app, userId) : null;
+
   if (!(app && role && roleAtLeast(role, need))) {
     throw new UnauthorizedError({ message: "App not found" });
   }
+
   return { app, role };
 };
 
@@ -138,9 +149,11 @@ export const isInstanceAdmin = async (
   email: string
 ): Promise<boolean> => {
   const anchored = resolveAdminEmail();
+
   const rows = await withDb(
     Effect.gen(function* run() {
       const sql = yield* SqlClient;
+
       return yield* sql.unsafe(
         `SELECT CASE WHEN role = 'admin' THEN 1 ELSE 0 END AS isAdmin,
                 CASE WHEN ? IS NOT NULL AND lower(?) = ? THEN 1 ELSE 0 END AS anchored
@@ -149,9 +162,11 @@ export const isInstanceAdmin = async (
       );
     })
   );
+
   // SAFETY: the projection is exactly those two integer columns; a missing
   // row yields undefined, handled below.
   const row = rows[0] as { anchored?: number; isAdmin?: number } | undefined;
+
   return row !== undefined && (row.isAdmin === 1 || row.anchored === 1);
 };
 
@@ -173,7 +188,9 @@ export const listAppsForCollaborator = async (
     runnerListApps(),
     withDb(orm.app_collaborator.findMany({ where: { userId } })),
   ]);
+
   const granted = new Set(grants.map((grant) => grant.appId));
+
   return apps
     .filter((app) => granted.has(app.id))
     .toSorted(
@@ -187,6 +204,7 @@ export const countAdmins = (appId: string) =>
     const rows = yield* orm.app_collaborator.findMany({
       where: { appId, role: "admin" },
     });
+
     return rows.length;
   });
 
@@ -215,6 +233,7 @@ export const listCollaboratorRows = async (
   const rows = await withDb(
     Effect.gen(function* run() {
       const sql = yield* SqlClient;
+
       return yield* sql.unsafe(
         `SELECT c.userId AS userId, c.role AS role, c.createdAt AS createdAt,
                 u.email AS email, u.name AS name
@@ -226,14 +245,18 @@ export const listCollaboratorRows = async (
       );
     })
   );
+
   // SAFETY: the projection is the five columns named above; D1 returns plain rows.
   const found = rows as CollaboratorSqlRow[];
   const out: CollaboratorRow[] = [];
+
   for (const row of found) {
     const role = parseAppRole(row.role);
+
     if (!role) {
       continue;
     }
+
     out.push({
       createdAt:
         row.createdAt instanceof Date
@@ -245,6 +268,7 @@ export const listCollaboratorRows = async (
       userId: row.userId,
     });
   }
+
   return out;
 };
 
@@ -279,11 +303,14 @@ interface PendingInviteSqlRow {
 
 const asPendingInvites = (rows: PendingInviteSqlRow[]): PendingInvite[] => {
   const out: PendingInvite[] = [];
+
   for (const row of rows) {
     const role = parseAppRole(row.role);
+
     if (!role) {
       continue;
     }
+
     out.push({
       appId: row.appId,
       appName: row.appName,
@@ -296,6 +323,7 @@ const asPendingInvites = (rows: PendingInviteSqlRow[]): PendingInvite[] => {
       role,
     });
   }
+
   return out;
 };
 
@@ -309,12 +337,14 @@ const selectPendingInvites = async (
   const rows = await withDb(
     Effect.gen(function* run() {
       const sql = yield* SqlClient;
+
       return yield* sql.unsafe(
         `SELECT ${PENDING_COLUMNS} FROM collaborator_invite ${tail}`,
         params
       );
     })
   );
+
   // SAFETY: the projection is PENDING_COLUMNS, i.e. exactly PendingInviteSqlRow; D1 returns plain rows.
   return asPendingInvites(rows as PendingInviteSqlRow[]);
 };
@@ -382,9 +412,11 @@ export const acceptPendingInvite = async (
     inviteId,
     normalizeEmail(email),
   ]);
+
   if (!invite) {
     return null;
   }
+
   await withDb(
     Effect.gen(function* run() {
       const sql = yield* SqlClient;
@@ -405,6 +437,7 @@ export const acceptPendingInvite = async (
       ]);
     })
   );
+
   return { appId: invite.appId };
 };
 

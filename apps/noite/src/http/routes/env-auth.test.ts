@@ -53,12 +53,15 @@ const answer = (method: string): unknown => {
   if (method === "apps.get") {
     return APP;
   }
+
   if (method === "environments.list") {
     return [ENVIRONMENT];
   }
+
   if (method === "environments.grant") {
     return { token: "tok" };
   }
+
   return null;
 };
 
@@ -80,8 +83,10 @@ beforeAll(async () => {
       method: string;
       params: Record<string, string>;
     };
+
     calls.push({ method: body.method, params: body.params });
     const result = answer(body.method);
+
     return result === null
       ? Response.json({ error: { code: -32_001, message: "no" }, id: body.id })
       : Response.json({ id: body.id, jsonrpc: "2.0", result });
@@ -123,10 +128,13 @@ const call = async (
   const request = new Request(`http://127.0.0.1:8090/api/env-auth${query}`, {
     headers,
   });
+
   const response = await handleEnvAuth(request, ENV as never, {});
+
   if (!response) {
     throw new Error("route answered nothing");
   }
+
   return response;
 };
 
@@ -148,9 +156,11 @@ describe("GET /api/env-auth", () => {
     expect(response.status).toBe(302);
     const location = response.headers.get("location") ?? "";
     expect(location.startsWith("/login?return=")).toBe(true);
+
     const back = new URLSearchParams(location.slice("?login".length)).get(
       "return"
     );
+
     expect(back).toBe(
       `/api/env-auth?env=env-1&app=app-1&return=${returnUrl()}`
     );
@@ -172,6 +182,7 @@ describe("GET /api/env-auth", () => {
     const signedOut = await call(`?env=env-1&app=app-1&return=${returnUrl()}`, {
       "sec-fetch-dest": "iframe",
     });
+
     expect(signedOut.status).toBe(401);
     expect(signedOut.headers.get("content-type")).toBe(
       "text/html; charset=utf-8"
@@ -183,9 +194,11 @@ describe("GET /api/env-auth", () => {
     // A refusal the gate cannot resolve reads as a page too.
     signIn("u-view");
     await withDb(grantCollaborator(APP.id, "u-view", "view"));
+
     const missing = await call(`?env=other&app=app-1&return=${returnUrl()}`, {
       "sec-fetch-dest": "iframe",
     });
+
     expect(missing.status).toBe(404);
     expect(await missing.text()).toContain("expired or was deleted");
   });
@@ -193,9 +206,11 @@ describe("GET /api/env-auth", () => {
   test("mints a grant and 302s to the environment's own /__noite/auth", async () => {
     signIn("u-view");
     await withDb(grantCollaborator(APP.id, "u-view", "view"));
+
     const response = await call(`?env=env-1&app=app-1&return=${returnUrl()}`, {
       "x-forwarded-host": "noite.localhost:9080",
     });
+
     expect(response.status).toBe(302);
     expect(response.headers.get("location")).toBe(
       "http://feat-x.app-one.noite.localhost:9080/__noite/auth?token=tok&return=%2Ffiles%2Fa.ts%3Fline%3D3"
@@ -216,10 +231,12 @@ describe("GET /api/env-auth", () => {
   test("never trusts the host inside return", async () => {
     signIn("u-view");
     await withDb(grantCollaborator(APP.id, "u-view", "view"));
+
     const response = await call(
       `?env=env-1&app=app-1&return=${returnUrl("evil.example")}`,
       { "x-forwarded-host": "noite.localhost:9080" }
     );
+
     expect(response.headers.get("location")).toBe(
       "http://feat-x.app-one.noite.localhost:9080/__noite/auth?token=tok&return=%2F"
     );
@@ -228,9 +245,11 @@ describe("GET /api/env-auth", () => {
   test("404s an environment the app does not own", async () => {
     signIn("u-view");
     await withDb(grantCollaborator(APP.id, "u-view", "view"));
+
     const response = await call(`?env=other&app=app-1&return=${returnUrl()}`, {
       "x-forwarded-host": "noite.localhost:9080",
     });
+
     expect(response.status).toBe(404);
   });
 });
