@@ -15,6 +15,7 @@ import {
   podHostHtml,
 } from "./src/lib/pod-host-document.ts";
 import {
+  CONTROL_HOST_DENIED_ASSETS,
   isControlDeniedAsset,
   isPreviewHost,
   POD_HOST_HTML_PATH,
@@ -356,16 +357,16 @@ const emitCelldConfig = (): Plugin => ({
       }
     }
     config["main"] = `ssr/${ssrMain}`;
-    // celld reads `run_worker_first` only as a boolean, but Void's build
-    // forces the pattern-array form whenever routing rules exist (ours do:
-    // the isolation headers). Coerce it here — this file is celld's config
-    // surface only; `dist/ssr/wrangler.json` keeps Void's own form. Without
-    // worker-first, celld serves every existing static file itself and the
-    // worker (with the pod-host gate) never sees it.
+    // celld matches `run_worker_first` per path: neither `true` nor `["/**"]`
+    // sends existing static files to the worker (both validate, neither
+    // routes), so the pod-host gate never fires for them. Name the pod paths
+    // explicitly — same list the gate denies on the control origin, so the
+    // two cannot drift. This file is celld's config surface only;
+    // `dist/ssr/wrangler.json` keeps Void's own form.
     config["assets"] = {
       ...ssrAssets,
       directory: "client",
-      run_worker_first: true,
+      run_worker_first: [...CONTROL_HOST_DENIED_ASSETS],
     };
     // D1 is keyed by name: drop Void's default `migrations_dir` (it points
     // at a directory that does not exist; schema migrates at runtime via
