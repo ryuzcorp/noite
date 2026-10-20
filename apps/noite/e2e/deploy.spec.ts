@@ -55,8 +55,12 @@ test("push to deploy serves traffic", async ({ page, request }) => {
   await expect(page.getByText("Running", { exact: true })).toBeVisible({
     timeout: 60_000,
   });
-  const restarted = await readSampleApp(request, port);
-  expect(Number.isInteger(restarted.n)).toBe(true);
+  // "Running" means the fleet is spawned, not yet listening: a read in that
+  // gap is reset on the raw port, so give celld its boot before failing.
+  await expect(async () => {
+    const restarted = await readSampleApp(request, port);
+    expect(Number.isInteger(restarted.n)).toBe(true);
+  }).toPass({ timeout: 30_000 });
 
   // A dropdown closes once one of its items is clicked: SPA navigation used to
   // leave focus (and so the open menu) on the clicked item.

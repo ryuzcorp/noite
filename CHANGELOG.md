@@ -8,6 +8,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Deployment logs stream again.** In 0.1.0-alpha.6 the Deployments tab's **Deployment logs** pane only said "Log stream disconnected — retrying…": the release image shipped without the control UI's `/api/apps/:id/logs/stream` route, which answered 404. A repo-wide ignore rule for `logs` directories had kept that file out of git.
+
 ## [0.1.0-alpha.6] - 2026-10-20
 
 The control UI moves to the Void framework, the CLI ships on npm as `@noitenow/cli`, and the runner gets stricter boot validation plus a round of concurrency and robustness fixes.
