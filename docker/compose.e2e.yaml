@@ -22,3 +22,8 @@ services:
       NOITE_EDGE_GIT_RPM: "0"
       # `E2E_TENANCY=multi` runs the isolation lane (hostile tenant spec).
       NOITE_TENANCY: ${E2E_TENANCY:-single}
+      # Spec files run in parallel (E2E_WORKERS) and each holds its apps until
+      # its afterAll: peak live apps are workers × per-file holdings (prs and
+      # source-tree each hold up to 6), far above the default quota of 10.
+      # Lane-only: the bucket, volumes and apps are wiped on every reset.
+      RUNNER_MAX_APPS_PER_USER: "32"

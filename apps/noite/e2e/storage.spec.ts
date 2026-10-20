@@ -1,16 +1,25 @@
 import { expect, test } from "@playwright/test";
-import type { APIRequestContext, Page } from "@playwright/test";
+import type { Page } from "@playwright/test";
 
-import { E2E_SLUG, appListenPort, findAppId, readSampleApp } from "./helpers";
+import {
+  appListenPort,
+  createAppWithKey,
+  deleteApp,
+  pushAppDir,
+  readSampleApp,
+  waitForDeploy,
+} from "./helpers";
 
 // The sample app (apps/noite/test) binds R2 `uploads`, the `Counter` Durable
 // Object and D1 `demo`, so this spec proves the storage views against a real
 // Worker: the runner's listing/upload/delete go through `celld r2 put|delete`,
 // and the app's own `env.FILES.get` is the referee for every write.
 //
-// Runs after deploy.spec.ts (specs run alphabetically, one worker): that spec
-// creates the `e2e` app and pushes the sample. If the app is missing the
-// dependency broke — fail loudly instead of recreating it.
+// Hermetic: the spec deploys its own copy of the sample (in the first test)
+// instead of borrowing deploy.spec.ts's `e2e` app, so files may
+// run in parallel in any order.
+
+const SLUG = "storage-e2e";
 
 const R2_ROOT = (appId: string): string =>
   `/storage/${appId}/${encodeURIComponent("r2:uploads")}`;
@@ -20,16 +29,19 @@ const DO_COUNTER = (appId: string): string =>
 
 const tenant = (port: number): string => `http://localhost:${port}`;
 
-const e2eApp = async (request: APIRequestContext): Promise<string> => {
-  const appId = await findAppId(request, E2E_SLUG);
+let deployedAppId: string | null = null;
 
-  if (appId === null) {
-    throw new Error(
-      `app ${E2E_SLUG} is missing — deploy.spec.ts must run (and pass) first`
-    );
+test.afterAll(async ({ request }) => {
+  await deleteApp(request, SLUG);
+  deployedAppId = null;
+});
+
+const storageApp = (): string => {
+  if (deployedAppId === null) {
+    throw new Error("storage-e2e app was not deployed by the first test");
   }
 
-  return appId;
+  return deployedAppId;
 };
 
 /** The detail column (R2 and DO views share the labelled shell). */
@@ -40,7 +52,20 @@ test("the overview lists the app's storage resources by id", async ({
   page,
   request,
 }) => {
-  const appId = await e2eApp(request);
+  // Hermetic: the file deploys its own copy of the sample here (tests run
+  // serially within a file, so the later tests reuse it) instead of
+  // borrowing deploy.spec.ts's `e2e` app — `page` is unavailable in
+  // beforeAll, and the app must be created through the UI.
+  const { apiKey, appId } = await createAppWithKey(page, request, {
+    name: "Storage E2E",
+    slug: SLUG,
+  });
+
+  pushAppDir(apiKey, new URL("../test", import.meta.url), SLUG);
+  const deploy = await waitForDeploy(request, appId);
+  expect(deploy.status).toBe("success");
+  deployedAppId = appId;
+
   await page.goto(`/apps/${appId}`);
   // The id the storage route parses: `{kind}:{name}` (DO adds its binding).
   await expect(
@@ -61,7 +86,7 @@ test("a Worker-written object appears in the browser with its type", async ({
   page,
   request,
 }) => {
-  const appId = await e2eApp(request);
+  const appId = storageApp();
   const port = await appListenPort(request, appId);
 
   // Worker -> R2: GET /upload-test-txt stores test.txt as text/plain.
@@ -87,7 +112,7 @@ test("uploading and deleting round-trips through the Worker", async ({
   page,
   request,
 }) => {
-  const appId = await e2eApp(request);
+  const appId = storageApp();
   const port = await appListenPort(request, appId);
 
   await page.goto(R2_ROOT(appId));
@@ -170,7 +195,7 @@ test("the Durable Object view reads the instance's stored state", async ({
   page,
   request,
 }) => {
-  const appId = await e2eApp(request);
+  const appId = storageApp();
   const port = await appListenPort(request, appId);
 
   // Calling the app advances the Counter and creates/adopts its instance.

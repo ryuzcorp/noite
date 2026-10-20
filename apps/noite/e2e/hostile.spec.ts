@@ -3,12 +3,19 @@ import { expect, test } from "@playwright/test";
 import {
   appListenPort,
   createAppWithKey,
+  deleteApp,
   pushAppDir,
   runnerApi,
   waitForDeploy,
 } from "./helpers";
 
 const HOSTILE_SLUG = "hostile";
+const NEIGHBOUR_SLUG = "hostile-neighbour";
+
+test.afterAll(async ({ request }) => {
+  await deleteApp(request, HOSTILE_SLUG);
+  await deleteApp(request, NEIGHBOUR_SLUG);
+});
 
 interface Probe {
   ok: boolean;
@@ -39,6 +46,24 @@ test("hostile tenant is contained", async ({ page, request }) => {
     "needs the isolation lane (E2E_HOSTILE=1, single image, NOITE_TENANCY=multi)"
   );
 
+  // A real neighbour this spec deploys itself (the sample app): its internal
+  // (operator) port is the probe target, its public port is how the lane
+  // checks it still serves afterwards, and its build cache is what the
+  // cross-build probe aims at. Self-deployed so files may run in parallel in
+  // any order — borrowing deploy.spec.ts's app serialized the lanes.
+  const neighbourApp = await createAppWithKey(page, request, {
+    name: "Hostile Neighbour",
+    slug: NEIGHBOUR_SLUG,
+  });
+
+  pushAppDir(
+    neighbourApp.apiKey,
+    new URL("../test", import.meta.url),
+    NEIGHBOUR_SLUG
+  );
+  const neighbourDeploy = await waitForDeploy(request, neighbourApp.appId);
+  expect(neighbourDeploy.status).toBe("success");
+
   const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "Hostile",
     slug: HOSTILE_SLUG,
@@ -50,20 +75,22 @@ test("hostile tenant is contained", async ({ page, request }) => {
 
   const port = await appListenPort(request, appId);
 
-  // A real neighbour: another deployed app (the deploy spec's). Its internal
-  // (operator) port is the probe target; its public port is how the lane
-  // checks it still serves afterwards. Without one the probe would aim at a
-  // port nothing listens on and pass without proving anything.
+  // Without a neighbour the probe would aim at a port nothing listens on and
+  // pass without proving anything.
   const apps = await runnerApi<
     { internalPort: number | null; listenPort: number | null; slug: string }[]
   >(request, "/v1/apps");
 
-  const other = apps.find(
-    (a) =>
-      a.slug !== HOSTILE_SLUG &&
-      a.internalPort !== null &&
-      a.listenPort !== null
+  // Prefer the spec's own neighbour: other files' apps come and go beside
+  // this probe under parallel workers, but the neighbour above lives until
+  // this file's afterAll.
+  const serving = apps.filter(
+    (a) => a.internalPort !== null && a.listenPort !== null
   );
+
+  const other =
+    serving.find((a) => a.slug === NEIGHBOUR_SLUG) ??
+    serving.find((a) => a.slug !== HOSTILE_SLUG);
 
   expect(other, "needs a second deployed app as the neighbour").toBeDefined();
   const neighbour = other?.internalPort ?? 0;
@@ -82,8 +109,8 @@ test("hostile tenant is contained", async ({ page, request }) => {
   }
 
   // The cross-build probe only proves isolation if a sibling app's build
-  // cache actually existed to probe. workers:1 + file order deploy the
-  // sample app first, so at least one other cache is present.
+  // cache actually existed to probe. The neighbour above deploys first, so
+  // its cache is present.
   const crossBuild = report.build.probes["read:sibling-build-cache"];
   expect(
     crossBuild,

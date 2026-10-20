@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdtempSync, rmSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import nodePath from "node:path";
 
@@ -173,7 +173,7 @@ export const appListenPort = async (
 
 /** Deploy status poll interval: the runner API is local and a status read is
  * one row, so a short interval only trims the wait after a deploy ends. */
-export const DEPLOY_POLL_MS = 1000;
+export const DEPLOY_POLL_MS = 500;
 
 /** Poll deploys until the tip reaches a terminal status. Push fast-path
  * spawns within seconds; the reconcile tip poll is the fallback. `sha`
@@ -310,6 +310,48 @@ export const registerInviteeAccount = async (
   await expect(page.getByRole("dialog")).toBeHidden();
 
   return { context, page };
+};
+
+/** Register a second account on a freshly-read invite code, serialized across
+ * Playwright workers. Invite codes are single-use: two files redeeming the
+ * same code in parallel would fail the loser with a spent code, so the
+ * read-plus-redeem section runs under a filesystem lock (mkdir is atomic;
+ * workers are separate processes on the one lane machine). The lock lives
+ * under e2e/.auth, which the lane wipes on every reset. */
+export const registerInviteeWithFreshCode = async (
+  browser: Browser,
+  page: Page,
+  account: { email: string; name: string }
+): Promise<{ context: BrowserContext; page: Page }> => {
+  const lockDir = new URL(".auth/invite.lock", import.meta.url);
+  const start = Date.now();
+
+  for (;;) {
+    try {
+      mkdirSync(lockDir);
+      break;
+    } catch {
+      if (Date.now() - start > 120_000) {
+        throw new Error("invite lock timed out after 120s");
+      }
+
+      // oxlint-disable-next-line eslint/no-await-in-loop -- sequential lock acquisition with a timeout; Promise.all would defeat it
+      await sleep(200);
+    }
+  }
+
+  try {
+    const inviteCode = await readInviteCode(page);
+
+    return await registerInviteeAccount(
+      browser,
+      inviteCode,
+      account.email,
+      account.name
+    );
+  } finally {
+    rmSync(lockDir, { force: true, recursive: true });
+  }
 };
 
 /** Create an app through the UI and mint an API key for pushing to it,
