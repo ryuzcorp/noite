@@ -102,7 +102,14 @@ CREATE TABLE IF NOT EXISTS metrics.app_error_event (
   http_status INTEGER NOT NULL DEFAULT 0,
   browser TEXT NOT NULL DEFAULT '',
   os TEXT NOT NULL DEFAULT '',
-  sha TEXT NOT NULL DEFAULT ''
+  sha TEXT NOT NULL DEFAULT '',
+  -- SDK extras (phase 2): the page URL with its query stripped, and the
+  -- release/environment the SDK reported. Existing installs gain them in
+  -- `db::attach_metrics` (a tolerant ALTER: the metrics schema carries no
+  -- version stamp).
+  url TEXT NOT NULL DEFAULT '',
+  release TEXT NOT NULL DEFAULT '',
+  environment TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS metrics.idx_app_error_event_issue_ts ON app_error_event(app_id, fingerprint, ts_us);
 CREATE TABLE IF NOT EXISTS metrics.app_error_hour (

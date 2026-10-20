@@ -20,6 +20,7 @@ mod env;
 pub mod environments;
 mod errors;
 mod events;
+mod ingest_keys;
 mod instance_setting;
 mod metrics;
 pub mod prs;
@@ -59,6 +60,7 @@ pub use events::{
     get_app_user_props, inc_app_insight, insert_app_event, list_app_channels, list_app_events,
     list_app_insights, set_app_insight, upsert_app_user_props,
 };
+pub use ingest_keys::{app_for_project, get_or_create_ingest_key, rotate_ingest_key};
 pub use instance_setting::{
     ensure_identity, get_setting, set_setting, TELEMETRY_ENABLED, TELEMETRY_LAST_SENT_AT,
 };
@@ -176,6 +178,27 @@ macro_rules! attach_metrics {
             sqlx::raw_sql(include_str!("../../schema.metrics.sql")),
         )
         .await?;
+        // Phase-2 SDK columns on `app_error_event`: the metrics schema is
+        // CREATE-IF-NOT-EXISTS with no version stamp, so a new column lands
+        // as a tolerant ALTER — PRAGMA lists the live columns and only the
+        // missing ones are added (a failed ALTER would fail every connect).
+        let live: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('app_error_event', 'metrics')")
+                .fetch_all(&mut *$conn)
+                .await?;
+        for (column, ddl) in [
+            ("url", "TEXT NOT NULL DEFAULT ''"),
+            ("release", "TEXT NOT NULL DEFAULT ''"),
+            ("environment", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            if !live.iter().any(|name| name == column) {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "ALTER TABLE metrics.app_error_event ADD COLUMN {column} {ddl}"
+                )))
+                .execute(&mut *$conn)
+                .await?;
+            }
+        }
     }};
 }
 pub(crate) use attach_metrics;

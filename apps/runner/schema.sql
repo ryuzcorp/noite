@@ -174,6 +174,20 @@ CREATE TABLE IF NOT EXISTS app_domain (
 
 CREATE INDEX IF NOT EXISTS idx_app_domain_app ON app_domain(app_id);
 
+-- Sentry-compatible error ingest (ROADMAP, Error tracking phase 2): one row
+-- per app holding its public ingest key and its stable numeric project id.
+-- `project_id` is AUTOINCREMENT, so a deleted app's number is never reused;
+-- rotating the key keeps the number. The row cascades with the app, and a
+-- fresh database gets it from here while existing installs gain it in
+-- migration 9.
+CREATE TABLE IF NOT EXISTS app_ingest_key (
+  project_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+  app_id TEXT NOT NULL UNIQUE REFERENCES app(id) ON DELETE CASCADE,
+  key TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 -- Per-app edge rate limits (SPEC, Edge limits), requests per minute. NULL
 -- takes the platform default (NOITE_EDGE_RPM / NOITE_EDGE_APP_RPM), 0 turns
 -- the limit off. No row means both defaults. A table of its own rather than

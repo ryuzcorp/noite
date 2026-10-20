@@ -21,7 +21,7 @@ use anyhow::{bail, Context};
 use sqlx::SqliteConnection;
 
 /// Version a database has after every migration ran. 1 is the alpha baseline.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`.
@@ -190,6 +190,21 @@ pub const MIGRATIONS: &[Migration] = &[
           );\
           ALTER TABLE main.deploy ADD COLUMN environment_id TEXT REFERENCES environment(id) ON DELETE CASCADE;\
           CREATE INDEX IF NOT EXISTS idx_deploy_environment ON deploy(environment_id);",
+    },
+    Migration {
+        version: 9,
+        // Sentry-compatible error ingest (ROADMAP, Error tracking phase 2):
+        // one row per app with its public ingest key and its stable numeric
+        // project id. AUTOINCREMENT so a deleted app's number is never
+        // reused; rotation rewrites only the key. A fresh database gets the
+        // same shape from schema.sql.
+        sql: "CREATE TABLE IF NOT EXISTS main.app_ingest_key (\
+            project_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,\
+            app_id TEXT NOT NULL UNIQUE REFERENCES app(id) ON DELETE CASCADE,\
+            key TEXT NOT NULL,\
+            created_at TEXT NOT NULL,\
+            updated_at TEXT NOT NULL\
+          );",
     },
 ];
 
