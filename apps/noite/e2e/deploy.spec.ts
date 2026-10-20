@@ -26,6 +26,21 @@ test("push to deploy serves traffic", async ({ page, request }) => {
   const body = await readSampleApp(request, port);
   expect(Number.isInteger(body.n)).toBe(true);
 
+  // The Deployments tab's live log reaches the runner: the serving deploy
+  // opens on its Deployment logs, and the fleet's output streams in (the
+  // route once never shipped, so the pane said "disconnected" forever).
+  const logStream = page.waitForResponse((res) =>
+    res.url().includes(`/api/apps/${appId}/logs/stream`)
+  );
+
+  await page.goto(`/apps/${appId}?t=deployments`);
+  const streamed = await logStream;
+  expect(streamed.status()).toBe(200);
+  await expect(page.getByText("celld listening")).toBeVisible({
+    timeout: 60_000,
+  });
+  await expect(page.getByText("Log stream disconnected")).toBeHidden();
+
   // The header's Stop/Start button reaches the runner: the desired state flips
   // and the status converges (Stop was once a silent no-op).
   await page.goto(`/apps/${appId}`);
@@ -40,8 +55,12 @@ test("push to deploy serves traffic", async ({ page, request }) => {
   await expect(page.getByText("Running", { exact: true })).toBeVisible({
     timeout: 60_000,
   });
-  const restarted = await readSampleApp(request, port);
-  expect(Number.isInteger(restarted.n)).toBe(true);
+  // "Running" means the fleet is spawned, not yet listening: a read in that
+  // gap is reset on the raw port, so give celld its boot before failing.
+  await expect(async () => {
+    const restarted = await readSampleApp(request, port);
+    expect(Number.isInteger(restarted.n)).toBe(true);
+  }).toPass({ timeout: 30_000 });
 
   // A dropdown closes once one of its items is clicked: SPA navigation used to
   // leave focus (and so the open menu) on the clicked item.
