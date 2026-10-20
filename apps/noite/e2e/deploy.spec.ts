@@ -17,6 +17,19 @@ test("push to deploy serves traffic", async ({ page, request }) => {
     slug: E2E_SLUG,
   });
 
+  // The Deployments tab is open before the push, so everything below must
+  // arrive live, without a reload. The serving deploy opens on its
+  // Deployment logs and the fleet's output streams in (the route once never
+  // shipped, so the pane said "disconnected" forever); the page streams every
+  // feed over one connection (`/api/streams`).
+  const pageStream = page.waitForResponse(
+    (res) =>
+      res.url().includes("/api/streams?") &&
+      res.url().includes(encodeURIComponent(`/api/apps/${appId}/logs/stream`))
+  );
+
+  await page.goto(`/apps/${appId}?t=deployments`);
+
   pushSampleApp(apiKey);
 
   const deploy = await waitForDeploy(request, appId);
@@ -26,17 +39,26 @@ test("push to deploy serves traffic", async ({ page, request }) => {
   const body = await readSampleApp(request, port);
   expect(Number.isInteger(body.n)).toBe(true);
 
-  // The Deployments tab's live log reaches the runner: the serving deploy
-  // opens on its Deployment logs, and the fleet's output streams in (the
-  // route once never shipped, so the pane said "disconnected" forever). The
-  // page streams every feed over one connection (`/api/streams`).
-  const pageStream = page.waitForResponse(
-    (res) =>
-      res.url().includes("/api/streams?") &&
-      res.url().includes(encodeURIComponent(`/api/apps/${appId}/logs/stream`))
-  );
+  // Every status badge on the page follows the deploy: the header and the
+  // Production dot once stayed on "deploying" while the sidebar moved on.
+  await expect(page.getByText("Running", { exact: true })).toBeVisible({
+    timeout: 15_000,
+  });
 
-  await page.goto(`/apps/${appId}?t=deployments`);
+  const production = page
+    .locator("div")
+    .filter({ has: page.getByText("Production", { exact: true }) })
+    .last();
+
+  await expect(production.locator(".status")).toHaveAttribute(
+    "title",
+    "running",
+    { timeout: 15_000 }
+  );
+  await expect(
+    page.getByRole("link", { exact: true, name: "E2E App" }).locator(".status")
+  ).toHaveAttribute("title", "running", { timeout: 15_000 });
+
   const streamed = await pageStream;
   expect(streamed.status()).toBe(200);
   await expect(page.getByText("celld listening")).toBeVisible({

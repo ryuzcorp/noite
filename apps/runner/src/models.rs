@@ -250,6 +250,17 @@ pub struct Environment {
     pub app_slug: String,
 }
 
+/// One app's live state: its row and its preview environments, as the
+/// control UI's status badges show them (`GET /v1/apps/{id}/state/stream`
+/// re-sends it whenever either changes).
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AppStateFrame {
+    pub app: App,
+    pub environments: Vec<Environment>,
+}
+
 impl Environment {
     pub fn desired(&self) -> DesiredState {
         DesiredState::parse(&self.desired_state).unwrap_or(DesiredState::Running)

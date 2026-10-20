@@ -1379,3 +1379,91 @@ async fn logs_scope_to_environment() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     h.finish().await;
 }
+
+/// An SSE response body read frame by frame (keep-alive comments skipped).
+struct SseReader {
+    body: axum::body::BodyDataStream,
+    buf: String,
+}
+
+impl SseReader {
+    /// The next `data:` frame as JSON, within 10 s.
+    async fn next_json(&mut self) -> Value {
+        use futures::StreamExt;
+        loop {
+            while let Some(end) = self.buf.find("\n\n") {
+                let event: String = self.buf.drain(..end + 2).collect();
+                let data: Vec<&str> = event
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data:"))
+                    .map(str::trim_start)
+                    .collect();
+                if !data.is_empty() {
+                    return serde_json::from_str(&data.join("\n")).expect("json frame");
+                }
+            }
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(10), self.body.next())
+                .await
+                .expect("a frame within 10 s")
+                .expect("stream still open")
+                .expect("body chunk");
+            self.buf
+                .push_str(std::str::from_utf8(&chunk).expect("utf-8 frame"));
+        }
+    }
+}
+
+/// The state stream every status badge follows: the first frame carries the
+/// app and its environments, a status change on either sends a fresh frame,
+/// and an unknown app is a 404.
+#[tokio::test]
+async fn the_state_stream_resends_the_app_and_its_environments_on_change() {
+    let h = Harness::new().await;
+    let app = h.seed_app("state").await;
+    let env = seed_env(
+        &h,
+        &app,
+        "feature",
+        crate::models::EnvironmentKind::Branch,
+        "refs/heads/feature",
+    )
+    .await;
+    let request = Request::builder()
+        .uri(format!("/v1/apps/{}/state/stream", app.id))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .expect("build request");
+    let response = h
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router call");
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut frames = SseReader {
+        body: response.into_body().into_data_stream(),
+        buf: String::new(),
+    };
+
+    let first = frames.next_json().await;
+    assert_eq!(first["app"]["id"], json!(app.id));
+    assert_eq!(first["app"]["status"], json!(app.status));
+    assert_eq!(first["environments"][0]["id"], json!(env.id));
+
+    crate::db::update_app_status(&h.state.pool, &app.id, "running", None, Some("abc123"))
+        .await
+        .expect("app status");
+    let deployed = frames.next_json().await;
+    assert_eq!(deployed["app"]["status"], json!("running"));
+    assert_eq!(deployed["app"]["lastDeploySha"], json!("abc123"));
+
+    crate::db::update_environment_status(&h.state.pool, &env.id, "failed", Some("boom"))
+        .await
+        .expect("environment status");
+    let failed = frames.next_json().await;
+    assert_eq!(failed["environments"][0]["status"], json!("failed"));
+
+    let (status, _) = h.rest("GET", "/v1/apps/nope/state/stream", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    h.finish().await;
+}

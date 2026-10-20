@@ -33,8 +33,8 @@ mod tests;
 
 pub use admin::{snapshot, stats};
 pub use apps::{
-    create_app, delete_app, get_app, health, list_apps, patch_app, ready, rename_app, retry_import,
-    sleep_app,
+    app_state_stream, create_app, delete_app, get_app, health, list_apps, patch_app, ready,
+    rename_app, retry_import, sleep_app,
 };
 pub use deploys::{deploy_log, list_deploys, list_deploys_stream, rollback};
 pub use domains::{add_domain, list_domains, remove_domain};

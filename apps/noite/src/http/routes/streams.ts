@@ -126,9 +126,11 @@ export const handleLogsStream: RouteHandler = (request, env, params) => {
   );
 };
 
-/** App list snapshot poll cadence: change diffs push immediately, comment
- * heartbeats land well inside celld's ~60s idle-stream expiry. */
-const APPS_STREAM_POLL_MS = 10_000;
+/** App list snapshot poll cadence: the same as the runner's own streams
+ * (deploys, app state), so the sidebar's status dots move with the page's
+ * badges. Unchanged cycles send nothing; `eventStream`'s keep-alive comments
+ * hold celld's ~60s idle-stream expiry. */
+const APPS_STREAM_POLL_MS = 2000;
 
 /** App list over SSE (like DeployList). Unverified: whether a Void SSE
  * route's first frame arrives on celld — an earlier 0.5.x attempt hung with
@@ -441,6 +443,16 @@ export const handleDeploysStream: RouteHandler = (request, env, params) => {
       }`
   );
 };
+
+/** One app's row and its environments, re-sent on change (see
+ * `lib/apps/state-sync.tsx`): what every status badge on its pages shows. */
+export const handleAppStateStream: RouteHandler = (request, env, params) =>
+  proxyRunnerStream(
+    request,
+    env,
+    params,
+    (appId) => `/v1/apps/${appId}/state/stream`
+  );
 
 /** Live grouped-errors proxy (see proxyRunnerStream). `?status=` passes
  * through; the runner validates it. */

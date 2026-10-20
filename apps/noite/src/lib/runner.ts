@@ -95,6 +95,8 @@ export type { DoPreview } from "./runner-types/DoPreview";
 
 export type { EnvGrant } from "./runner-types/EnvGrant";
 
+export type { AppStateFrame as RunnerAppState } from "./runner-types/AppStateFrame";
+
 export type { Environment as RunnerEnvironment } from "./runner-types/Environment";
 
 export type { EnvironmentKind } from "./runner-types/EnvironmentKind";

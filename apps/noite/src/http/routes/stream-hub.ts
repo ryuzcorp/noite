@@ -20,6 +20,7 @@ import type { SseStream } from "void/sse";
 import type { RouteHandler } from "../config";
 import { sleepUnlessAborted } from "../sse";
 import {
+  handleAppStateStream,
   handleAppsStream,
   handleDeploysStream,
   handleErrorsStream,
@@ -57,6 +58,10 @@ export const TOPIC_ROUTES: readonly TopicRoute[] = [
   {
     handler: handleMetricsStream,
     pattern: /^\/api\/apps\/(?<appId>[^/]+)\/metrics\/stream$/u,
+  },
+  {
+    handler: handleAppStateStream,
+    pattern: /^\/api\/apps\/(?<appId>[^/]+)\/state\/stream$/u,
   },
 ];
 

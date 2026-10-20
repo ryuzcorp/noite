@@ -11,6 +11,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - **`install --pre` installs the newest release again.** It took the first entry of GitHub's release list, which puts the release marked Latest ahead of newer pre-releases, so it installed 0.1.0-alpha.6 instead of 0.1.0-alpha.7. It now picks the most recently published release. `run.sh` is served from noite.now, so the fix applies without a new image.
+- **Status badges stay in sync.** After a deploy, a stop or a sleep, the app header's status and the Deployments tab's Production and environment dots kept the old state (a yellow "Deploying" dot after a finished deploy) while the sidebar moved on, until a reload. An app's pages now follow a live state stream (`/api/apps/:id/state/stream`) and refresh whatever it shows has changed, and the sidebar's app list updates every 2 s instead of every 10 s.
 
 ## [0.1.0-alpha.7] - 2026-10-20
 

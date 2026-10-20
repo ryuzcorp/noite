@@ -42,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/apps/{id}/rename", post(api::rename_app))
         .route("/v1/apps/{id}/retry-import", post(api::retry_import))
         .route("/v1/apps/{id}/sleep", post(api::sleep_app))
+        .route("/v1/apps/{id}/state/stream", get(api::app_state_stream))
         .route(
             "/v1/apps/{id}/domains",
             get(api::list_domains).post(api::add_domain),
