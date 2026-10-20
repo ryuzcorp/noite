@@ -214,8 +214,12 @@ const DeployRow = ({
 }) => {
   // Atom-driven expansion: the log is a sibling <li> (block layout, full
   // width by construction) instead of a grid child — immune to list-row
-  // span subtleties.
-  const open = atom(live);
+  // span subtleties. Until the reader toggles it, the row follows `live`:
+  // that is only known once both the app's live sha and the feed's rows are
+  // in, in either order, so a row seeded at mount stayed collapsed whenever
+  // the rows came first.
+  const toggled = atom<boolean | null>(null);
+  const open = (): boolean => toggled() ?? live;
   const logTab = atom<"build" | "deploy">("deploy");
   const rolling = atom(false);
   const rollError = atom("");
@@ -295,7 +299,7 @@ const DeployRow = ({
           class="btn btn-sm btn-ghost shrink-0"
           aria-expanded={open()}
           onclick={() => {
-            open.set(!open());
+            toggled.set(!open());
           }}
         >
           <span class="inline-flex items-center gap-1">
