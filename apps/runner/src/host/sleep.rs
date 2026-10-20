@@ -9,6 +9,7 @@
 //! finish and then wakes it, instead of racing the fleet shutdown.
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, OnceLock};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
@@ -500,5 +501,106 @@ mod tests {
             !should_sleep(now, &[None, None], 24),
             "no timestamps: never guess idle"
         );
+    }
+
+    /// Minimal celld health gate: 200 on `/.well-known/celld/health`.
+    async fn serve_health(listener: tokio::net::TcpListener) {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let mut req = Vec::new();
+                while !req.ends_with(b"\r\n\r\n") {
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 || req.len() > 8192 {
+                        return;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                }
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    }
+
+    async fn healthy_port() -> i64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(serve_health(listener));
+        i64::from(port)
+    }
+
+    async fn dead_port() -> i64 {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("probe");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        i64::from(port)
+    }
+
+    /// The gate opens for a serving fleet and stays shut for a dead one.
+    #[tokio::test]
+    async fn health_gate_tracks_the_fleet() {
+        let cfg = crate::config::config_for_tests();
+        let port = healthy_port().await;
+        assert!(wait_healthy(&cfg, port, Duration::from_secs(5)).await);
+        let dead = dead_port().await;
+        assert!(!wait_healthy(&cfg, dead, Duration::from_millis(600)).await);
+    }
+
+    /// A confirm flips a wanted fleet to running once the gate opens, and
+    /// leaves a stopped one alone — the Stop/Start race, pinned.
+    #[tokio::test]
+    async fn confirm_marks_running_only_while_wanted() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.wake_timeout_s = 1;
+        let pool = crate::db::connect("sqlite::memory:").await.expect("memory db");
+        let app = crate::db::create_app(
+            &pool,
+            &cfg,
+            crate::db::NewApp {
+                name: "confirm",
+                slug: "confirm",
+                user_id: "local",
+                subdomain: "confirm.localhost",
+                listen: 30100,
+                internal: 30101,
+            },
+        )
+        .await
+        .expect("seed app");
+        crate::db::update_app_status(&pool, &app.id, "deploying", None, None)
+            .await
+            .expect("deploying");
+        let confirming: Confirming =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        confirm_app_running(&pool, &cfg, &confirming, &app.id, healthy_port().await).await;
+        let fresh = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(fresh.status, "running");
+
+        crate::db::patch_app_desired(&pool, &app.id, "stopped")
+            .await
+            .expect("stop");
+        crate::db::update_app_status(&pool, &app.id, "deploying", None, None)
+            .await
+            .expect("deploying again");
+        confirm_app_running(&pool, &cfg, &confirming, &app.id, dead_port().await).await;
+        let fresh = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(fresh.status, "deploying");
     }
 }

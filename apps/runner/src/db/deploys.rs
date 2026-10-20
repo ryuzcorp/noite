@@ -11,10 +11,8 @@ use sqlx::SqlitePool;
 
 use crate::models::{new_id, now_iso, AppStatus, Deploy};
 
-use super::apps::{record_app_deploy_sha, update_app_status, update_app_status_if_wanted};
-use super::environments::{
-    mark_environment_deployed, update_environment_status, update_environment_status_if_wanted,
-};
+use super::apps::{record_app_deploy_sha, update_app_status_if_wanted};
+use super::environments::{mark_environment_deployed, update_environment_status_if_wanted};
 
 /// Columns every `deploy` query selects, in [`Deploy`] order.
 const DEPLOY_COLS: &str = "id, app_id, environment_id, sha, status, log, created_at, updated_at";

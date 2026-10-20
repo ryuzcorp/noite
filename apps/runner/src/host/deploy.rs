@@ -292,7 +292,7 @@ impl Progress<'_> {
                     AppStatus::Failed.as_str(),
                     Some(&summary),
                 )
-                .await
+                .await?;
             }
             None => {
                 db::update_app_status_if_wanted(
@@ -301,9 +301,10 @@ impl Progress<'_> {
                     AppStatus::Failed.as_str(),
                     Some(&summary),
                 )
-                .await
+                .await?;
             }
         }
+        Ok(())
     }
 }
 

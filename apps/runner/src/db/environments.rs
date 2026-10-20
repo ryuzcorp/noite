@@ -659,4 +659,45 @@ mod tests {
             "a deploy re-arms the clock"
         );
     }
+
+    /// A stop racing an environment status flip wins, while a deploy's sha
+    /// still records — the preview mirror of the app rule.
+    #[tokio::test]
+    async fn environment_status_flips_only_while_wanted() {
+        let pool = connect("sqlite::memory:").await.expect("boot");
+        let cfg = crate::config::config_for_tests();
+        let app = seed(&pool).await;
+        let env = create_environment(&pool, &cfg, new(&app.id, "feature", "refs/heads/feat"))
+            .await
+            .expect("env");
+        mark_environment_deployed(&pool, &env.id, "abc1234")
+            .await
+            .expect("deployed");
+        let fresh = get_environment(&pool, &env.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(fresh.status, "running");
+        assert_eq!(fresh.last_deploy_sha.as_deref(), Some("abc1234"));
+        // A stop in the window: a later deploy's sha still records, but the
+        // status never flips back.
+        sqlx::query("UPDATE environment SET desired_state = 'stopped', status = 'deploying' WHERE id = ?")
+            .bind(&env.id)
+            .execute(&pool)
+            .await
+            .expect("stop");
+        mark_environment_deployed(&pool, &env.id, "def5678")
+            .await
+            .expect("stopped deploy");
+        let flipped = update_environment_status_if_wanted(&pool, &env.id, "running", None)
+            .await
+            .expect("stopped flip");
+        assert!(!flipped, "a stop in the window wins over running");
+        let fresh = get_environment(&pool, &env.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(fresh.status, "deploying");
+        assert_eq!(fresh.last_deploy_sha.as_deref(), Some("def5678"));
+    }
 }
