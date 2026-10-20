@@ -8,6 +8,7 @@ import {
   eventsUrl,
   logsUrl,
   metricsUrl,
+  streamHubUrl,
 } from "../lib/feeds";
 import { testRouteContext } from "../testing/context";
 import defaultTimeoutMiddleware, {
@@ -50,6 +51,7 @@ describe("timeoutExempt", () => {
       logsUrl("app_1", "env_1"),
       metricsUrl("app_1", 24),
       eventsUrl("app_1", "deploys", 50),
+      streamHubUrl([logsUrl("app_1"), deploysUrl("app_1")]),
     ];
 
     expect(streams.length).toBeGreaterThan(0);

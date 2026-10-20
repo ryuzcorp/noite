@@ -1,7 +1,7 @@
 /* oxlint-disable anti-slop/no-chained-type-assertions, eslint/max-classes-per-file -- test doubles: a fake EventSource and document stand in for the browser globals connectStream reads */
 import { afterEach, describe, expect, test } from "bun:test";
 
-import { connectStream } from "./feeds";
+import { connectStream, createStreamHub, streamHubUrl } from "./feeds";
 import type { EventSourceStatus, StreamHooks } from "./feeds";
 
 type Listener = (event: { data?: string }) => void;
@@ -299,5 +299,128 @@ describe("connectStream", () => {
     expect(statuses).toEqual(["closed"]);
 
     dispose();
+  });
+});
+
+/** A hub whose settle runs only when the test flushes it. */
+const manualHub = () => {
+  const pending: (() => void)[] = [];
+
+  const streams = createStreamHub({
+    baseMs: 10,
+    capMs: 40,
+    random: () => 0,
+    settle: (reopen) => {
+      pending.push(reopen);
+    },
+    // SAFETY: the fake implements the EventSource surface connectStream uses.
+    source: FakeSource as unknown as typeof EventSource,
+  });
+
+  const flush = (): void => {
+    for (const reopen of pending.splice(0)) {
+      reopen();
+    }
+  };
+
+  return { flush, streams };
+};
+
+/** The fake sources still open. */
+const liveSources = (): FakeSource[] =>
+  FakeSource.instances.filter((source) => !source.closed);
+
+describe("createStreamHub", () => {
+  const LOGS = "/api/apps/a/logs/stream";
+  const DEPLOYS = "/api/apps/a/deploys/stream";
+
+  test("every feed of a page shares one connection, and topics route by index", () => {
+    const { flush, streams } = manualHub();
+    const logs = collect();
+    const deploys = collect();
+    streams.subscribe(LOGS, logs.hooks);
+    streams.subscribe(DEPLOYS, deploys.hooks);
+    flush();
+
+    expect(liveSources().map((source) => source.url)).toEqual([
+      streamHubUrl([LOGS, DEPLOYS]),
+    ]);
+
+    const [source] = liveSources();
+    source?.emit("open");
+    source?.emit("message", "0:+");
+    source?.emit("message", '0:["celld listening"]');
+    source?.emit("message", "1:[]");
+    expect(logs.messages).toEqual(['["celld listening"]']);
+    expect(deploys.messages).toEqual(["[]"]);
+    expect(logs.statuses.at(-1)).toBe("open");
+
+    // A second panel on a topic already streaming gets its last frame at
+    // once and reuses the connection.
+    const sidebar = collect();
+    streams.subscribe(LOGS, sidebar.hooks);
+    flush();
+    expect(sidebar.messages).toEqual(['["celld listening"]']);
+    expect(FakeSource.instances).toHaveLength(1);
+  });
+
+  test("a dropped topic says retrying while the others stay open", () => {
+    const { flush, streams } = manualHub();
+    const logs = collect();
+    const deploys = collect();
+    streams.subscribe(LOGS, logs.hooks);
+    streams.subscribe(DEPLOYS, deploys.hooks);
+    flush();
+    const [source] = liveSources();
+    source?.emit("open");
+    source?.emit("message", "0:+");
+    source?.emit("message", "1:+");
+
+    source?.emit("message", "1:!");
+    expect(deploys.statuses.at(-1)).toBe("retrying");
+    expect(logs.statuses.at(-1)).toBe("open");
+
+    source?.emit("message", "1:[]");
+    expect(deploys.statuses.at(-1)).toBe("open");
+    expect(deploys.messages).toEqual(["[]"]);
+  });
+
+  test("leaving reopens with the smaller set, and the last one out closes it", () => {
+    const { flush, streams } = manualHub();
+    const logs = collect();
+    const deploys = collect();
+    const leaveLogs = streams.subscribe(LOGS, logs.hooks);
+    const leaveDeploys = streams.subscribe(DEPLOYS, deploys.hooks);
+    flush();
+
+    leaveDeploys();
+    flush();
+    expect(liveSources().map((source) => source.url)).toEqual([
+      streamHubUrl([LOGS]),
+    ]);
+
+    leaveLogs();
+    flush();
+    expect(liveSources()).toEqual([]);
+  });
+
+  test("a remount before the set settles keeps the connection and the frame", () => {
+    const { flush, streams } = manualHub();
+    const first = collect();
+    const leave = streams.subscribe(LOGS, first.hooks);
+    flush();
+    const [source] = liveSources();
+    source?.emit("open");
+    source?.emit("message", '0:["line"]');
+
+    leave();
+    const again = collect();
+    streams.subscribe(LOGS, again.hooks);
+    flush();
+
+    expect(FakeSource.instances).toHaveLength(1);
+    expect(source?.closed).toBe(false);
+    expect(again.messages).toEqual(['["line"]']);
+    expect(again.statuses.at(-1)).toBe("open");
   });
 });
