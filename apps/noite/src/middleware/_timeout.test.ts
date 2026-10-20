@@ -1,6 +1,14 @@
 /* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: a minimal KitEnv stands in for the Worker env */
 import { describe, expect, test } from "bun:test";
 
+import {
+  applistUrl,
+  deploysUrl,
+  errorsUrl,
+  eventsUrl,
+  logsUrl,
+  metricsUrl,
+} from "../lib/feeds";
 import { testRouteContext } from "../testing/context";
 import defaultTimeoutMiddleware, {
   TIMEOUT_MS,
@@ -28,6 +36,29 @@ describe("timeoutExempt", () => {
     expect(timeoutExempt("/api/auth/session")).toBe(false);
     expect(timeoutExempt("/health")).toBe(false);
     expect(timeoutExempt("/mcp")).toBe(false);
+  });
+
+  test("spares every live-feed stream (a 15 s bound would cut them)", () => {
+    // Every URL builder in lib/feeds.ts: bounding one would cut a healthy
+    // long-lived stream with a 504.
+    const streams = [
+      applistUrl(),
+      deploysUrl("app_1"),
+      deploysUrl("app_1", "env_1"),
+      errorsUrl("app_1", "open"),
+      logsUrl("app_1"),
+      logsUrl("app_1", "env_1"),
+      metricsUrl("app_1", 24),
+      eventsUrl("app_1", "deploys", 50),
+    ];
+
+    expect(streams.length).toBeGreaterThan(0);
+
+    for (const url of streams) {
+      expect(timeoutExempt(new URL(url, "http://localhost").pathname)).toBe(
+        true
+      );
+    }
   });
 });
 
