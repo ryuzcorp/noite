@@ -79,6 +79,7 @@ jobs:
           app_domain
           app_env
           app_event
+          app_ingest_key
           app_insight
           app_limit
           app_user_prop
