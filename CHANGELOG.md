@@ -15,6 +15,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **"Running" means serving.** An app or environment showed **Running** as soon as its fleet was spawned, before celld listened, and a deploy reported success the same way. Both now wait for celld's health gate. A deploy whose celld exits before it serves fails at once, and one whose fleet is stopped or deleted in the meantime completes without waiting. A stop or delete during a deploy or start always wins over the status change.
 - **Code mode: typing right after New File kept its order.** Under load, the first character typed into a new file could end up last (`xport const extra = 1;e`): the editor moved the caret back to the top after typing had begun.
 - **The serving deploy's logs open on their own again.** The Deployments tab should open the deploy serving traffic with its logs showing. It stayed collapsed whenever the deploy list arrived before the app's details.
+- **Pages with many live panels no longer freeze on plain-HTTP installs.** Each live panel held its own connection, and browsers allow six HTTP/1.1 connections per host. The Deployments tab with an environment reached six, so its links and API calls queued forever on `make dev`, LAN and other installs without HTTPS. A page now streams all its live panels over one connection (`/api/streams`), and a panel whose feed drops reconnects on its own while the others keep streaming. HTTPS installs (HTTP/2) weren't affected.
+- **The login page's tabs and buttons wait for the page to be ready.** A click on **Create account** before the page had finished loading did nothing. The controls are now disabled until they can respond.
 
 ### Changed
 
