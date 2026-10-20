@@ -8,6 +8,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The Ilha + Void template replaces Oxide + ilha.** The creator offers exactly **Ilha + Void** and **TanStack Start**. Ilha + Void lives in the same repository, `ryuzcorp/noite-template-oxide`, now rewritten as Ilha pages on Void (Vite) with server-rendered pages, a server action and an island. The template id changed from `oxide` to `ilha-void` with no alias, so MCP `create_app` calls that pass `source: { kind: "template", template: "oxide" }` must switch to `ilha-void`. A new e2e spec creates an app from the template, waits for the deploy and checks that it serves.
+
 ### Fixed
 
 - **`install --pre` installs the newest release again.** It took the first entry of GitHub's release list, which puts the release marked Latest ahead of newer pre-releases, so it installed 0.1.0-alpha.6 instead of 0.1.0-alpha.7. It now picks the most recently published release. `run.sh` is served from noite.now, so the fix applies without a new image.
