@@ -7,7 +7,7 @@
     "prebuild": "rm -rf dist",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "bun test src",
+    "test": "bun test --isolate src",
     "test:e2e": "playwright test"
   },
   "dependencies": {
