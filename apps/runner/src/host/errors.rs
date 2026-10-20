@@ -610,10 +610,7 @@ fn strip_url_query(url: &str) -> &str {
 fn url_path(url: &str) -> String {
     let clean = strip_url_query(url);
     let after_scheme = clean.split("://").nth(1).unwrap_or(clean);
-    let path = after_scheme
-        .split_once('/')
-        .map(|(_, rest)| rest)
-        .unwrap_or("");
+    let path = after_scheme.split_once('/').map(|(_, rest)| rest).unwrap_or("");
     format!("/{path}")
 }
 
@@ -666,11 +663,7 @@ pub async fn ingest_sdk(
         // the fingerprint reads the first in-app frames — reverse so the same
         // exception groups with its telemetry twin (see `sdk_parsed`).
         let parsed = sdk_parsed(event);
-        let source: &'static str = if event.source == "browser" {
-            "browser"
-        } else {
-            "sdk"
-        };
+        let source: &'static str = if event.source == "browser" { "browser" } else { "sdk" };
         let (browser, os) = super::accesslog::device_classify(&event.user_agent);
         let url = strip_url_query(&event.url).to_string();
         let ts = if event.timestamp_us > 0 {
@@ -702,9 +695,7 @@ pub async fn ingest_sdk(
             environment: clip(&event.environment, MAX_MESSAGE),
         };
         let (fp, hour, n) = record(pool, &occ).await?;
-        *counts
-            .entry((app_id.to_string(), fp.clone(), hour))
-            .or_default() += n;
+        *counts.entry((app_id.to_string(), fp.clone(), hour)).or_default() += n;
         issues.insert((app_id.to_string(), fp.clone()));
         fps.push(fp);
     }
@@ -895,14 +886,8 @@ mod tests {
 
     #[test]
     fn sdk_urls_lose_query_and_fragment_but_keep_path() {
-        assert_eq!(
-            strip_url_query("https://a.example/x?y=1#z"),
-            "https://a.example/x"
-        );
-        assert_eq!(
-            url_path("https://shop.example.com/checkout?plan=pro"),
-            "/checkout"
-        );
+        assert_eq!(strip_url_query("https://a.example/x?y=1#z"), "https://a.example/x");
+        assert_eq!(url_path("https://shop.example.com/checkout?plan=pro"), "/checkout");
         assert_eq!(url_path("https://shop.example.com"), "/");
         assert_eq!(url_path("/already/a/path"), "/already/a/path");
     }

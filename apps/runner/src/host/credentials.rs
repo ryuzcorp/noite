@@ -278,10 +278,7 @@ mod tests {
             unhex("0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf")
         );
 
-        let hk = Hkdf::<Sha256>::new(
-            Some(&unhex("000102030405060708090a0b0c")[..]),
-            &[0x0bu8; 22],
-        );
+        let hk = Hkdf::<Sha256>::new(Some(&unhex("000102030405060708090a0b0c")[..]), &[0x0bu8; 22]);
         let mut okm = [0u8; 42];
         hk.expand(&unhex("f0f1f2f3f4f5f6f7f8f9"), &mut okm)
             .expect("hkdf expand");
@@ -292,8 +289,7 @@ mod tests {
             )[..]
         );
 
-        let mut mac =
-            <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&[0x0bu8; 20]).expect("hmac key");
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&[0x0bu8; 20]).expect("hmac key");
         mac.update(b"Hi There");
         assert_eq!(
             mac.finalize().into_bytes()[..],
@@ -303,10 +299,7 @@ mod tests {
         let mut h = Sha256::new();
         h.update(b"abc");
         assert_eq!(
-            h.finalize()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>(),
+            h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }

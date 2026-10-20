@@ -282,12 +282,10 @@ pub async fn apply(
         .await
         .context("apply schema")?;
     // PRAGMA takes no bind parameters; `latest` is a constant integer.
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "PRAGMA main.user_version = {latest}"
-    )))
-    .execute(&mut *conn)
-    .await
-    .context("stamp schema version")?;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("PRAGMA main.user_version = {latest}")))
+        .execute(&mut *conn)
+        .await
+        .context("stamp schema version")?;
     if stored != latest {
         tracing::info!(from = stored, to = latest, "runner database schema stamped");
     }

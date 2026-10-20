@@ -492,7 +492,12 @@ async fn get_once(
     let url = handle
         .get_object(Some(&creds), key)
         .sign(Duration::from_secs(PRESIGN_SECS));
-    let resp = match http_client().get(url).timeout(timeout).send().await {
+    let resp = match http_client()
+        .get(url)
+        .timeout(timeout)
+        .send()
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             return Err(S3Fail::Retryable(anyhow::anyhow!(
@@ -1131,8 +1136,7 @@ mod tests {
     /// "start fresh" and callers uploaded an empty database over a good one.
     #[test]
     fn not_found_ignores_key_names_and_transport_failures() {
-        let missing =
-            anyhow::anyhow!("s3 download tip.bundle failed: HTTP 404 <Code>NoSuchKey</Code>");
+        let missing = anyhow::anyhow!("s3 download tip.bundle failed: HTTP 404 <Code>NoSuchKey</Code>");
         assert!(is_not_found(&missing));
         let legacy =
             anyhow::anyhow!("aws exit 1\nfatal error: An error occurred (404) when calling the HeadObject operation");
