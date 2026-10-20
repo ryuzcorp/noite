@@ -28,13 +28,16 @@ test("push to deploy serves traffic", async ({ page, request }) => {
 
   // The Deployments tab's live log reaches the runner: the serving deploy
   // opens on its Deployment logs, and the fleet's output streams in (the
-  // route once never shipped, so the pane said "disconnected" forever).
-  const logStream = page.waitForResponse((res) =>
-    res.url().includes(`/api/apps/${appId}/logs/stream`)
+  // route once never shipped, so the pane said "disconnected" forever). The
+  // page streams every feed over one connection (`/api/streams`).
+  const pageStream = page.waitForResponse(
+    (res) =>
+      res.url().includes("/api/streams?") &&
+      res.url().includes(encodeURIComponent(`/api/apps/${appId}/logs/stream`))
   );
 
   await page.goto(`/apps/${appId}?t=deployments`);
-  const streamed = await logStream;
+  const streamed = await pageStream;
   expect(streamed.status()).toBe(200);
   await expect(page.getByText("celld listening")).toBeVisible({
     timeout: 60_000,

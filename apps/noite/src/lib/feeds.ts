@@ -177,6 +177,195 @@ export const connectStream = (
   };
 };
 
+/** The one connection a page streams every feed over. A topic is a feed's
+ * own stream path (`deploysUrl(…)` and friends); the server runs that
+ * route's handler and relays its frames (see `http/routes/stream-hub.ts`). */
+export const streamHubUrl = (topics: readonly string[]): string =>
+  `/api/streams?${topics.map((topic) => `t=${encodeURIComponent(topic)}`).join("&")}`;
+
+/** A page's feed subscriptions, multiplexed onto one EventSource. */
+export interface StreamHub {
+  /** Start receiving `topic`; answers the unsubscribe. A topic two panels
+   * share is streamed once, and a late subscriber gets its last frame. */
+  subscribe: (topic: string, hooks: StreamHooks) => () => void;
+}
+
+/** Hub tuning: the connection's retry options plus when a changed topic set
+ * is applied. */
+export interface StreamHubOptions extends StreamRetryOptions {
+  /** Runs the reopen once the set settles. Default: 30 ms later, so a
+   * re-render's unsubscribe and resubscribe cancel out. Tests run it by
+   * hand. */
+  settle?: (reopen: () => void) => void;
+}
+
+interface HubTopic {
+  /** The last frame, replayed to a subscriber that joins later. */
+  last: string | undefined;
+  /** This topic's own state while the connection is open. */
+  state: EventSourceStatus;
+  subs: Set<StreamHooks>;
+}
+
+/** Browsers allow six HTTP/1.1 connections per host and an EventSource
+ * holds one for good, so one EventSource per feed starved every page with
+ * six feeds of its own navigation and fetches (the Deployments tab with an
+ * environment froze on plain-HTTP installs). The hub keeps one connection
+ * for all of them: subscribing or leaving reopens it with the new topic set
+ * once the set settles, and the server re-sends each topic's snapshot. */
+export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
+  const schedule =
+    options.settle ??
+    ((reopen: () => void) => {
+      setTimeout(reopen, 30);
+    });
+
+  const topics = new Map<string, HubTopic>();
+  /** The topics the open connection carries, in its frames' index order. */
+  let connected: string[] = [];
+  let connection: EventSourceStatus = "closed";
+  let dispose: (() => void) | undefined;
+  let settling = false;
+
+  // No connection yet (the set is still settling): the topic is on its way.
+  const statusOf = (topic: HubTopic): EventSourceStatus => {
+    if (dispose === undefined) {
+      return "connecting";
+    }
+
+    return connection === "open" ? topic.state : connection;
+  };
+
+  const announce = (topic: HubTopic): void => {
+    const status = statusOf(topic);
+
+    for (const sub of topic.subs) {
+      sub.onStatus(status);
+    }
+  };
+
+  const onMessage = (data: string): void => {
+    // `<index>:<frame>`, or `<index>:+` / `<index>:!` for a topic that
+    // opened / dropped (see `http/routes/stream-hub.ts`).
+    const colon = data.indexOf(":");
+
+    const name =
+      colon > 0 ? connected[Number(data.slice(0, colon))] : undefined;
+
+    const topic = name === undefined ? undefined : topics.get(name);
+
+    if (topic === undefined) {
+      return;
+    }
+
+    const payload = data.slice(colon + 1);
+    const state = payload === "!" ? "retrying" : "open";
+
+    if (topic.state !== state) {
+      topic.state = state;
+      announce(topic);
+    }
+
+    if (payload === "!" || payload === "+") {
+      return;
+    }
+
+    topic.last = payload;
+
+    for (const sub of topic.subs) {
+      sub.onMessage(payload);
+    }
+  };
+
+  const reconcile = (): void => {
+    settling = false;
+
+    for (const [name, topic] of topics) {
+      if (topic.subs.size === 0) {
+        topics.delete(name);
+      }
+    }
+
+    const wanted = [...topics.keys()];
+
+    const same =
+      wanted.length === connected.length &&
+      wanted.every((name) => connected.includes(name));
+
+    if (same && dispose !== undefined) {
+      return;
+    }
+
+    dispose?.();
+    dispose = undefined;
+    connected = wanted;
+
+    for (const topic of topics.values()) {
+      topic.state = "connecting";
+    }
+
+    if (wanted.length === 0) {
+      connection = "closed";
+
+      return;
+    }
+
+    dispose = connectStream(
+      streamHubUrl(wanted),
+      {
+        onMessage,
+        onStatus: (status) => {
+          connection = status;
+
+          for (const topic of topics.values()) {
+            announce(topic);
+          }
+        },
+      },
+      options
+    );
+  };
+
+  const settle = (): void => {
+    if (!settling) {
+      settling = true;
+      schedule(reconcile);
+    }
+  };
+
+  return {
+    subscribe: (name, hooks) => {
+      let topic = topics.get(name);
+
+      if (topic === undefined) {
+        topic = { last: undefined, state: "connecting", subs: new Set() };
+        topics.set(name, topic);
+      }
+
+      if (!connected.includes(name) || dispose === undefined) {
+        settle();
+      }
+
+      topic.subs.add(hooks);
+      hooks.onStatus(statusOf(topic));
+
+      if (topic.last !== undefined) {
+        hooks.onMessage(topic.last);
+      }
+
+      return () => {
+        // The topic itself goes once the set settles, so a remount within
+        // the window keeps its frame and its place on the connection.
+        if (topics.get(name)?.subs.delete(hooks) === true) {
+          settle();
+        }
+      };
+    },
+  };
+};
+
+let pageHub: StreamHub | undefined;
+
 export const liveFeed = <T>(
   key: string,
   url: string,
@@ -185,9 +374,9 @@ export const liveFeed = <T>(
   // oxlint-disable-next-line unicorn/no-useless-undefined -- the feed starts valueless; undefined is the seed
   const latest = atom<T | undefined>(undefined);
   const status = atom<EventSourceStatus>("connecting");
-  // T1.9: background tabs hold no connection. Closing on hidden (and
-  // reopening on visible) stops the control proxy and runner loops through
-  // T1.2; the SWR snapshot keeps the panel painted while away.
+  // One connection per page, shared by every feed (see `createStreamHub`).
+  // T1.9: background tabs hold no connection; the SWR snapshot keeps the
+  // panel painted while away.
   watch.once(() => {
     if (
       typeof document === "undefined" ||
@@ -198,7 +387,9 @@ export const liveFeed = <T>(
       return;
     }
 
-    return connectStream(url, {
+    pageHub ??= createStreamHub();
+
+    return pageHub.subscribe(url, {
       onMessage: (data) => {
         try {
           const frame = decode(data);

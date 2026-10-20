@@ -15,6 +15,7 @@ import {
   eventsUrl,
   logsUrl,
   metricsUrl,
+  streamHubUrl,
 } from "./feeds";
 
 const SRC = path.join(import.meta.dir, "..");
@@ -208,6 +209,9 @@ describe("api routes exist", () => {
       metricsUrl("app_1", 720),
       eventsUrl("app_1", "deploys", 50),
       eventsUrl("app_1", "", 20),
+      // Every feed above reaches the browser through the page's one hub
+      // connection; the per-feed routes stay as the hub's topics.
+      streamHubUrl([logsUrl("app_1"), applistUrl()]),
     ];
 
     const missing = urls.filter((url) => resolveRoute(url) === null);
