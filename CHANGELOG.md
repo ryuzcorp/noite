@@ -14,6 +14,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Live panels recover on their own.** Deployment logs, deploy history, errors, events, usage and the app list went quiet for good, showing "… disconnected — retrying…", once the control UI or runner answered an error (a 502 while either restarts, say): the browser's `EventSource` does not retry after an HTTP error. They now reconnect with backoff (1 s up to 30 s), and the control UI answers a short 502 `runner unavailable` while the runner is down instead of failing the request.
 - **"Running" means serving.** An app or environment showed **Running** as soon as its fleet was spawned, before celld listened, and a deploy reported success the same way. Both now wait for celld's health gate. A deploy whose celld exits before it serves fails at once, and one whose fleet is stopped or deleted in the meantime completes without waiting. A stop or delete during a deploy or start always wins over the status change.
 - **Code mode: typing right after New File kept its order.** Under load, the first character typed into a new file could end up last (`xport const extra = 1;e`): the editor moved the caret back to the top after typing had begun.
+- **The serving deploy's logs open on their own again.** The Deployments tab should open the deploy serving traffic with its logs showing. It stayed collapsed whenever the deploy list arrived before the app's details.
 
 ### Changed
 
