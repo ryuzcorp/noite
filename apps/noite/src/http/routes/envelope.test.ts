@@ -363,6 +363,16 @@ describe("envelope bodies", () => {
     expect(calls).toEqual([]);
   });
 
+  test("a drop-only envelope skips the runner even with a wrong key", async () => {
+    const response = await run(
+      post("42", fixture("session.envelope.txt"), "not-the-key"),
+      { projectId: "42" }
+    );
+
+    expect(response?.status).toBe(200);
+    expect(calls).toEqual([]);
+  });
+
   test("stores nothing for a transaction/session envelope", async () => {
     const text = [
       '{"sent_at":"2026-10-20T21:42:47.836Z"}',

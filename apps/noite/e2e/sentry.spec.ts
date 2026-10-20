@@ -190,17 +190,21 @@ test("browser errors reach the Errors tab through the Sentry envelope route", as
   await page.goto(`/apps/${appId}?t=errors`);
   await expect(page.getByText(token).first()).toBeVisible();
 
-  // --- refusals: cheap posts, no new issues ---------------------------------
+  // --- refusals: event envelopes with a bad identity are refused alike -----
+  // (Drop-only envelopes skip the runner entirely, so refusal probes use an
+  // event envelope; a wrong key with a session still answers 200.)
+  const eventBytes = fixture("exception.envelope.txt");
+
   const wrongKey = await request.post(
     `${control}/api/${ingest.projectId}/envelope/?sentry_key=not-the-key`,
-    { data: sessionBytes, headers }
+    { data: eventBytes, headers }
   );
 
   expect(wrongKey.status()).toBe(403);
 
   const unknownProject = await request.post(
     `${control}/api/999999999/envelope/?sentry_key=${ingest.key}`,
-    { data: sessionBytes, headers }
+    { data: eventBytes, headers }
   );
 
   expect(unknownProject.status()).toBe(403);
