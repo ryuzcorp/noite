@@ -52,6 +52,14 @@ const handlerLabel = (handler: string, source: string): string => {
     return "console.error";
   }
 
+  if (source === "browser") {
+    return "Browser";
+  }
+
+  if (source === "sdk") {
+    return "SDK";
+  }
+
   return HANDLER_LABELS.get(handler) ?? handler;
 };
 
@@ -300,6 +308,18 @@ const Occurrence = ({ event }: { event: RunnerErrorEvent }) => (
       <dd class="m-0 min-w-0 break-all">
         <RequestLine event={event} />
       </dd>
+      {event.url ? (
+        <>
+          <dt class="opacity-60">URL</dt>
+          <dd class="m-0 min-w-0 font-mono break-all">{event.url}</dd>
+        </>
+      ) : null}
+      {event.release ? (
+        <>
+          <dt class="opacity-60">Release</dt>
+          <dd class="m-0 min-w-0 font-mono break-all">{event.release}</dd>
+        </>
+      ) : null}
       <dt class="opacity-60">Handler</dt>
       <dd class="m-0">
         {handlerLabel(event.handler, event.source)}

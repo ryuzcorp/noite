@@ -31,6 +31,7 @@ import type {
   RunnerDomain,
   RunnerEnvironment,
   RunnerErrorDetail,
+  RunnerIngestKey,
   RunnerLimits,
   RunnerTelemetryStatus,
   StorageItem,
@@ -137,6 +138,7 @@ export const keys = {
   environments: (id: string) => `app:${id}:environments`,
   errorDetail: (appId: string, fingerprint: string) =>
     `app:${appId}:error:${fingerprint}`,
+  ingestKey: (id: string) => `app:${id}:ingest-key`,
   inviteCodes: "me:invites",
   limits: (id: string) => `app:${id}:limits`,
   myInvitations: "me:collaborator-invitations",
@@ -235,6 +237,12 @@ export const environmentVars = (appId: string, envId: string) =>
 export const errorDetail = (appId: string, fingerprint: string) =>
   tracked(keys.errorDetail(appId, fingerprint), () =>
     api<RunnerErrorDetail>("/api/errors/errorDetail", { appId, fingerprint })
+  );
+
+/** This app's public error-ingest identity (project id + key) for the DSN. */
+export const ingestKey = (id: string) =>
+  tracked(keys.ingestKey(id), () =>
+    api<RunnerIngestKey>("/api/errors/ingestKey", id)
   );
 
 /** What the UI renders from the session — and all it may persist. The
