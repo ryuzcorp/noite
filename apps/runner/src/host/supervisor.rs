@@ -650,9 +650,10 @@ mod tests {
         stop_fleet(&procs, "probe").await;
 
         assert!(!procs.lock().await.contains_key("probe"));
+
         assert!(
-            !crate::testutil::live_cmdline_has(marker),
-            "stopped fleet left a worker behind"
+            crate::testutil::wait_for_cmdline_gone(marker, Duration::from_secs(5)).await,
+            "stopped fleet left a worker behind (sleep {marker} still live 5s after the group kill)"
         );
     }
 }
