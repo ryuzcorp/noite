@@ -66,7 +66,7 @@ test("only the exact GitHub https shape prefills", () => {
 
 test("a template's id is already the slug the picker prefills", () => {
   expect(TEMPLATES.map((template) => template.id)).toEqual([
-    "oxide",
+    "ilha-void",
     "tanstack-start",
   ]);
 

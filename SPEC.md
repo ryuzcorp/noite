@@ -294,7 +294,7 @@ Operator guide: `apps/website/docs/self-hosting/platforms.mdx`.
   - **Limits:** the clone runs in its own process group; a 500 ms poll kills the group once the scratch dir passes 500 MiB, or at the 600 s timeout.
   - **Templates** (`squash`) become one root commit "Initial commit from <owner>/<repo>@<sha>".
   - **Publish:** `publish_ref(main)`, then deploy. A failure sets `error` and `last_error`; `apps.retry_import` re-runs it (409 only while an import is actually running).
-- **Templates:** `apps/noite/src/lib/apps/templates.ts` lists public repos (`ryuzcorp/noite-template-oxide`, `ryuzcorp/noite-template-tanstack-start`). Both were verified to build, deploy and serve on celld; TanStack Start does SSR and hydration through the Cloudflare Vite plugin's `dist/server/wrangler.json`.
+- **Templates:** `apps/noite/src/lib/apps/templates.ts` lists public repos (`ryuzcorp/noite-template-oxide`, `ryuzcorp/noite-template-tanstack-start`). The oxide repo ships the Ilha + Void template (Void on Vite, writing `dist/wrangler.json`); both were verified to build, deploy and serve on celld; TanStack Start does SSR and hydration through the Cloudflare Vite plugin's `dist/server/wrangler.json`.
 - **Push to create:** on `git-receive-pack` for an unknown slug, `git_http::authorize` asks `/internal/git-auth` with `need: "create"`.
   - The UI checks the key, `SLUG_RE`/`RESERVED_SLUGS` and creates the app through `createAppForUser`, the same function as the create action. A reserved or invalid slug is a 404, the app limit a 403 with a readable message.
   - A lost race re-reads the role, and only an admin of the existing app gets through.

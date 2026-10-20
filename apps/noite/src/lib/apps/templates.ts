@@ -16,11 +16,11 @@ export interface AppTemplate {
 
 export const TEMPLATES: readonly AppTemplate[] = [
   {
-    description: "Oxide worker with the ilha router and Vite.",
-    id: "oxide",
-    name: "Oxide + ilha",
+    description: "Ilha pages on Void (Vite), served by celld.",
+    id: "ilha-void",
+    name: "Ilha + Void",
     ref: "main",
-    stack: ["Oxide", "ilha", "Vite"],
+    stack: ["Ilha", "Void", "Vite"],
     url: "https://github.com/ryuzcorp/noite-template-oxide",
   },
   {
