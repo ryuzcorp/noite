@@ -894,6 +894,7 @@ async fn deploy_inner(
     progress
         .log(DeployStatus::Success, "deploy complete\n")
         .await?;
+    tracing::info!(fleet = %fleet, sha = %&commit_sha[..12.min(commit_sha.len())], "deploy ok");
     // It is live: status, fleet and reload are all done above, so the
     // worktree wipe runs detached. Nothing that waits on this deploy — the app
     // lock, the next push, a delete — is held open by it.
