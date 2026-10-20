@@ -65,7 +65,7 @@ export interface TreeHost {
   followMove: (from: string, to: string) => void;
   getCurrentPath: () => string | null;
   openFile: (path: string, caret?: IntelPosition) => Promise<boolean>;
-  placeCaret: (position: IntelPosition) => void;
+  reclaimCaret: (path: string, caret: IntelPosition) => void;
   /** The page's report: a change happened, so an earlier push outcome is
    * superseded. */
   report: () => void;
@@ -324,7 +324,7 @@ export const createTreeWiring = (host: TreeHost): TreeWiring => {
       toaster.notify(message);
     },
     openFile: host.openFile,
-    placeCaret: host.placeCaret,
+    reclaimCaret: host.reclaimCaret,
     report: host.report,
     resync,
     rows: store,

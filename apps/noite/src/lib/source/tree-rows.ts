@@ -61,7 +61,9 @@ export interface TreeRowsHost {
   /** The pane's toast corner, for a write the pod refused. */
   notify: (message: string) => void;
   openFile: (path: string, caret?: IntelPosition) => Promise<boolean>;
-  placeCaret: (position: IntelPosition) => void;
+  /** The pane's `reclaimCaret`: the caret back into `path`, unless the user
+   * has typed there since it opened. */
+  reclaimCaret: (path: string, caret: IntelPosition) => void;
   report: () => void;
   /** Derive again and put the rows in step with the pod (see `./tree`). */
   resync: () => Promise<void>;
@@ -210,7 +212,8 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
       // the caret and pierre's attach places it, which needs no click (pierre
       // only takes text where its own caret sits). The row pierre named is its
       // own — it moves, selects and focuses it as the rename lands — so the
-      // caret is asked for again once that has had its frame.
+      // caret is asked for again once that has had its frame; the pane drops
+      // that if typing already began.
       await host.openFile(add.path, { character: 0, line: 0 });
       // oxlint-disable-next-line promise/avoid-new -- frame-paced wait: the row pierre focused hands the DOM back on its own render
       await new Promise<void>((resolve) => {
@@ -219,9 +222,7 @@ export const createTreeRows = (host: TreeRowsHost): TreeRows => {
         });
       });
 
-      if (host.getCurrentPath() === add.path) {
-        host.placeCaret({ character: 0, line: 0 });
-      }
+      host.reclaimCaret(add.path, { character: 0, line: 0 });
     })();
   };
 

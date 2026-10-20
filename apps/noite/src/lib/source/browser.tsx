@@ -482,7 +482,7 @@ export const SourceBrowser = ({
       followMove: editor.followMove,
       getCurrentPath: editor.getCurrentPath,
       openFile: editor.openFile,
-      placeCaret: editor.placeCaret,
+      reclaimCaret: editor.reclaimCaret,
       report,
       signal,
       syncOpen: editor.syncOpen,
