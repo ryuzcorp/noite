@@ -45,6 +45,10 @@ pub async fn run_forever(
     // so telemetry ingest has caught up before any app is judged idle.
     let mut last_sleep_sweep = Instant::now();
     let sleep_sweeping = Arc::new(AtomicBool::new(false));
+    // Fleets with a running-status confirm in flight (host/sleep.rs): one
+    // confirm per transitioning fleet, never blocking the tick.
+    let confirming: crate::host::sleep::Confirming =
+        Arc::new(tokio::sync::Mutex::new(HashSet::new()));
     loop {
         tick.tick().await;
         if shutdown.load(Ordering::Relaxed) {
@@ -82,6 +86,7 @@ pub async fn run_forever(
             &mut tip_rx,
             &mut last_sweep,
             &log_tx,
+            &confirming,
         )
         .await
         {
@@ -104,6 +109,7 @@ async fn reconcile_once(
     tip_rx: &mut TipReceiver,
     last_sweep: &mut Option<Instant>,
     log_tx: &tokio::sync::watch::Sender<u64>,
+    confirming: &crate::host::sleep::Confirming,
 ) -> anyhow::Result<()> {
     let claimed = deploy::snapshot_claimed(deploying).await;
     let swept = db::fail_stuck_deploys(pool, DEPLOY_STUCK_MS, &claimed).await?;
@@ -152,24 +158,34 @@ async fn reconcile_once(
         if app.listen_port.is_some() && app.is_deployed() && !app.is_asleep() {
             match supervisor::ensure_fleet(pool, cfg, procs, logs, app).await {
                 Ok(()) => {
-                    // Mirror the stopped branch: a spawned fleet is running.
-                    // Without this, start/resume leaves the stop-time status
-                    // stuck until the next deploy flips it.
+                    // "Running" means the fleet answers its health gate, not
+                    // just that celld was spawned: confirm off the tick (the
+                    // loop must never block behind one app's cold boot) and
+                    // flip only while still wanted, so a stop in the window
+                    // wins. Without any confirm, start/resume would leave the
+                    // stop-time status stuck until the next deploy flips it.
                     if app.status != AppStatus::Running.as_str() {
-                        db::update_app_status(
-                            pool,
-                            &app.id,
-                            AppStatus::Running.as_str(),
-                            None,
-                            None,
-                        )
-                        .await?;
+                        if let Some(port) = app.listen_port {
+                            let (pool, cfg, confirming) =
+                                (pool.clone(), cfg.clone(), confirming.clone());
+                            let id = app.id.clone();
+                            tokio::spawn(async move {
+                                crate::host::sleep::confirm_app_running(
+                                    &pool,
+                                    &cfg,
+                                    &confirming,
+                                    &id,
+                                    port,
+                                )
+                                .await;
+                            });
+                        }
                     }
                 }
                 Err(e) => {
                     tracing::warn!(slug = %app.slug, error = %e, "ensure_fleet");
                     let msg = format!("{e:#}");
-                    db::update_app_status(pool, &app.id, &app.status, Some(&msg), None).await?;
+                    db::update_app_status_if_wanted(pool, &app.id, &app.status, Some(&msg)).await?;
                 }
             }
         }
@@ -215,20 +231,30 @@ async fn reconcile_once(
         if env.listen_port.is_some() && env.is_deployed() && !env.is_asleep() {
             match supervisor::ensure_environment_fleet(pool, cfg, procs, logs, env).await {
                 Ok(()) => {
+                    // Same truthful order as the app branch above.
                     if env.status != AppStatus::Running.as_str() {
-                        db::update_environment_status(
-                            pool,
-                            &env.id,
-                            AppStatus::Running.as_str(),
-                            None,
-                        )
-                        .await?;
+                        if let Some(port) = env.listen_port {
+                            let (pool, cfg, confirming) =
+                                (pool.clone(), cfg.clone(), confirming.clone());
+                            let id = env.id.clone();
+                            tokio::spawn(async move {
+                                crate::host::sleep::confirm_environment_running(
+                                    &pool,
+                                    &cfg,
+                                    &confirming,
+                                    &id,
+                                    port,
+                                )
+                                .await;
+                            });
+                        }
                     }
                 }
                 Err(e) => {
                     tracing::warn!(fleet = %fleet, error = %e, "ensure_environment_fleet");
                     let msg = format!("{e:#}");
-                    db::update_environment_status(pool, &env.id, &env.status, Some(&msg)).await?;
+                    db::update_environment_status_if_wanted(pool, &env.id, &env.status, Some(&msg))
+                        .await?;
                 }
             }
         }

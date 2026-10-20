@@ -11,8 +11,8 @@ use sqlx::SqlitePool;
 
 use crate::models::{new_id, now_iso, AppStatus, Deploy};
 
-use super::apps::update_app_status;
-use super::environments::{mark_environment_deployed, update_environment_status};
+use super::apps::{record_app_deploy_sha, update_app_status_if_wanted};
+use super::environments::{mark_environment_deployed, update_environment_status_if_wanted};
 
 /// Columns every `deploy` query selects, in [`Deploy`] order.
 const DEPLOY_COLS: &str = "id, app_id, environment_id, sha, status, log, created_at, updated_at";
@@ -154,13 +154,12 @@ pub async fn upsert_deploy(
 ) -> sqlx::Result<String> {
     let ts = now_iso();
     if let Some(id) = id {
-        if let Some(existing) =
-            sqlx::query_as::<_, Deploy>(sqlx::AssertSqlSafe(format!(
-                "SELECT {DEPLOY_COLS} FROM deploy WHERE id = ?"
-            )))
-                .bind(id)
-                .fetch_optional(pool)
-                .await?
+        if let Some(existing) = sqlx::query_as::<_, Deploy>(sqlx::AssertSqlSafe(format!(
+            "SELECT {DEPLOY_COLS} FROM deploy WHERE id = ?"
+        )))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
         {
             // Keep the tail — deploy logs grow with every push and the UI
             // collapsible must stay cheap.
@@ -200,7 +199,10 @@ pub async fn upsert_deploy(
 }
 
 /// Where a deploy row's status lands: the app (production) or its
-/// environment (preview).
+/// environment (preview). Every write is stop-race safe: the sha lands even
+/// when a stop raced the deploy, but `running`/`failed`/in-flight only apply
+/// while the target still wants to run — a stop (or delete) in the window
+/// must win over the deploy's status flip.
 async fn apply_status(
     pool: &SqlitePool,
     app_id: &str,
@@ -212,30 +214,34 @@ async fn apply_status(
     let Some(environment_id) = environment_id else {
         if status == "success" {
             if let Some(sha) = sha {
-                update_app_status(pool, app_id, AppStatus::Running.as_str(), None, Some(sha))
+                record_app_deploy_sha(pool, app_id, sha).await?;
+                update_app_status_if_wanted(pool, app_id, AppStatus::Running.as_str(), None)
                     .await?;
             }
         } else if status == "failed" {
-            update_app_status(
+            update_app_status_if_wanted(
                 pool,
                 app_id,
                 AppStatus::Failed.as_str(),
                 Some(append_log.trim()),
-                None,
             )
             .await?;
         } else if status == "building" || status == "deploying" {
-            update_app_status(pool, app_id, status, None, None).await?;
+            update_app_status_if_wanted(pool, app_id, status, None).await?;
         }
         return Ok(());
     };
     match status {
         "success" => match sha {
+            // `mark_environment_deployed` records the sha unconditionally and
+            // flips to running only while still wanted.
             Some(sha) => mark_environment_deployed(pool, environment_id, sha).await?,
-            None => update_environment_status(pool, environment_id, "running", None).await?,
+            None => {
+                update_environment_status_if_wanted(pool, environment_id, "running", None).await?;
+            }
         },
         "failed" => {
-            update_environment_status(
+            update_environment_status_if_wanted(
                 pool,
                 environment_id,
                 AppStatus::Failed.as_str(),
@@ -243,7 +249,9 @@ async fn apply_status(
             )
             .await?;
         }
-        other => update_environment_status(pool, environment_id, other, None).await?,
+        other => {
+            update_environment_status_if_wanted(pool, environment_id, other, None).await?;
+        }
     }
     Ok(())
 }
@@ -290,7 +298,9 @@ pub async fn fail_stuck_deploys(
             .await?;
         match row.environment_id.as_deref() {
             Some(env_id) => {
-                update_environment_status(
+                // The row still records the stall, but a stop in the window
+                // keeps its status.
+                update_environment_status_if_wanted(
                     pool,
                     env_id,
                     AppStatus::Failed.as_str(),
@@ -299,12 +309,11 @@ pub async fn fail_stuck_deploys(
                 .await?;
             }
             None => {
-                update_app_status(
+                update_app_status_if_wanted(
                     pool,
                     &row.app_id,
                     AppStatus::Failed.as_str(),
                     Some("deploy stalled (host interrupted or timed out)"),
-                    None,
                 )
                 .await?;
             }

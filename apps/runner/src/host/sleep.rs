@@ -7,8 +7,8 @@
 //! Every transition (sleep, wake) for one app runs under that app's lock, so
 //! a request arriving while the sweep parks the app waits for the park to
 //! finish and then wakes it, instead of racing the fleet shutdown.
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -22,11 +22,15 @@ use crate::host::logs::LogState;
 use crate::host::supervisor::{self, ProcMap};
 use crate::models::{parse_time, App, AppStatus, Environment};
 
+/// Fleets with a running-status confirm in flight (`app:{id}` / `env:{id}`):
+/// the reconcile loop spawns one confirm per transitioning fleet instead of
+/// blocking behind a health gate, and the set keeps one tick from piling a
+/// second confirm onto the first.
+pub type Confirming = Arc<Mutex<HashSet<String>>>;
+
 /// Per-app transition locks (keyed by app id, which survives renames).
-fn locks() -> &'static std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>> {
-    static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
-    LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
+static LOCKS: LazyLock<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Host-wide bound on apps cold-starting for a request at once
 /// (`RUNNER_WAKE_CONCURRENCY`). Each app's own wakes already coalesce on its
@@ -38,7 +42,7 @@ fn wake_slots(cfg: &Config) -> &'static Semaphore {
 }
 
 fn lock_for(app_id: &str) -> Arc<Mutex<()>> {
-    let mut map = locks()
+    let mut map = LOCKS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     map.entry(app_id.to_string())
@@ -192,14 +196,14 @@ pub async fn sleep_app(
 }
 
 /// Poll the fleet's public health route until celld's ready gate opens.
-async fn wait_healthy(cfg: &Config, port: i64, timeout: Duration) -> bool {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    let client = CLIENT.get_or_init(|| {
+pub(crate) async fn wait_healthy(cfg: &Config, port: i64, timeout: Duration) -> bool {
+    static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap_or_default()
     });
+    let client = &*CLIENT;
     let url = format!(
         "http://{}:{}/.well-known/celld/health",
         cfg.caddy_upstream_host, port
@@ -215,6 +219,63 @@ async fn wait_healthy(cfg: &Config, port: i64, timeout: Duration) -> bool {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Mark one app running once its fleet answers the health gate. The
+/// reconcile loop spawns this per transitioning fleet instead of blocking
+/// behind the gate; a stop or delete in the window wins through the
+/// conditional write, and an unhealthy fleet simply never flips (its deploy
+/// row says why).
+pub async fn confirm_app_running(
+    pool: &SqlitePool,
+    cfg: &Config,
+    confirming: &Confirming,
+    app_id: &str,
+    port: i64,
+) {
+    let key = format!("app:{}", app_id);
+    if !confirming.lock().await.insert(key.clone()) {
+        return;
+    }
+    let budget = Duration::from_secs(cfg.wake_timeout_s.max(1));
+    let healthy = wait_healthy(cfg, port, budget).await;
+    confirming.lock().await.remove(&key);
+    if !healthy {
+        tracing::warn!(app_id, "fleet never passed its health gate; leaving status");
+        return;
+    }
+    if let Err(e) =
+        db::update_app_status_if_wanted(pool, app_id, AppStatus::Running.as_str(), None).await
+    {
+        tracing::warn!(app_id, error = %e, "mark running after its health gate");
+    }
+}
+
+/// The same confirm for one preview environment.
+pub async fn confirm_environment_running(
+    pool: &SqlitePool,
+    cfg: &Config,
+    confirming: &Confirming,
+    env_id: &str,
+    port: i64,
+) {
+    let key = format!("env:{}", env_id);
+    if !confirming.lock().await.insert(key.clone()) {
+        return;
+    }
+    let budget = Duration::from_secs(cfg.wake_timeout_s.max(1));
+    let healthy = wait_healthy(cfg, port, budget).await;
+    confirming.lock().await.remove(&key);
+    if !healthy {
+        tracing::warn!(env_id, "fleet never passed its health gate; leaving status");
+        return;
+    }
+    if let Err(e) =
+        db::update_environment_status_if_wanted(pool, env_id, AppStatus::Running.as_str(), None)
+            .await
+    {
+        tracing::warn!(env_id, error = %e, "mark running after its health gate");
     }
 }
 
@@ -266,12 +327,14 @@ pub async fn wake_app(
     // tick: the request is waiting.
     let app = db::get_app(pool, app_id).await?.unwrap_or(app);
     supervisor::ensure_fleet(pool, cfg, procs, logs, &app).await?;
-    if app.status != AppStatus::Running.as_str() {
-        db::update_app_status(pool, &app.id, AppStatus::Running.as_str(), None, None).await?;
-    }
     let left = deadline.saturating_duration_since(tokio::time::Instant::now());
     if !wait_healthy(cfg, port, left.max(Duration::from_secs(1))).await {
         anyhow::bail!("fleet not healthy within {}s", cfg.wake_timeout_s);
+    }
+    // "Running" means the fleet answered the gate above: the write lands
+    // after it, and still loses to a stop in the window.
+    if app.status != AppStatus::Running.as_str() {
+        db::update_app_status_if_wanted(pool, &app.id, AppStatus::Running.as_str(), None).await?;
     }
     if was_asleep {
         // Back to the plain proxy route: later requests skip the wake hop.
@@ -360,15 +423,17 @@ pub async fn wake_environment(
     }
     let env = db::get_environment(pool, env_id).await?.unwrap_or(env);
     supervisor::ensure_environment_fleet(pool, cfg, procs, logs, &env).await?;
-    if env.status != AppStatus::Running.as_str() {
-        db::update_environment_status(pool, &env.id, AppStatus::Running.as_str(), None).await?;
-    }
     let left = deadline.saturating_duration_since(tokio::time::Instant::now());
     if !wait_healthy(cfg, port, left.max(Duration::from_secs(1))).await {
         anyhow::bail!(
             "environment fleet not healthy within {}s",
             cfg.wake_timeout_s
         );
+    }
+    // Same truthful order as `wake_app`.
+    if env.status != AppStatus::Running.as_str() {
+        db::update_environment_status_if_wanted(pool, &env.id, AppStatus::Running.as_str(), None)
+            .await?;
     }
     if was_asleep {
         rewrite_edge(pool, cfg).await?;
@@ -438,5 +503,107 @@ mod tests {
             !should_sleep(now, &[None, None], 24),
             "no timestamps: never guess idle"
         );
+    }
+
+    /// Minimal celld health gate: 200 on `/.well-known/celld/health`.
+    async fn serve_health(listener: tokio::net::TcpListener) {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let mut req = Vec::new();
+                while !req.ends_with(b"\r\n\r\n") {
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 || req.len() > 8192 {
+                        return;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                }
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    }
+
+    async fn healthy_port() -> i64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(serve_health(listener));
+        i64::from(port)
+    }
+
+    async fn dead_port() -> i64 {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("probe");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        i64::from(port)
+    }
+
+    /// The gate opens for a serving fleet and stays shut for a dead one.
+    #[tokio::test]
+    async fn health_gate_tracks_the_fleet() {
+        let cfg = crate::config::config_for_tests();
+        let port = healthy_port().await;
+        assert!(wait_healthy(&cfg, port, Duration::from_secs(5)).await);
+        let dead = dead_port().await;
+        assert!(!wait_healthy(&cfg, dead, Duration::from_millis(600)).await);
+    }
+
+    /// A confirm flips a wanted fleet to running once the gate opens, and
+    /// leaves a stopped one alone — the Stop/Start race, pinned.
+    #[tokio::test]
+    async fn confirm_marks_running_only_while_wanted() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.wake_timeout_s = 1;
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let app = crate::db::create_app(
+            &pool,
+            &cfg,
+            crate::db::NewApp {
+                name: "confirm",
+                slug: "confirm",
+                user_id: "local",
+                subdomain: "confirm.localhost",
+                listen: 30100,
+                internal: 30101,
+            },
+        )
+        .await
+        .expect("seed app");
+        crate::db::update_app_status(&pool, &app.id, "deploying", None, None)
+            .await
+            .expect("deploying");
+        let confirming: Confirming = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        confirm_app_running(&pool, &cfg, &confirming, &app.id, healthy_port().await).await;
+        let fresh = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(fresh.status, "running");
+
+        crate::db::patch_app_desired(&pool, &app.id, "stopped")
+            .await
+            .expect("stop");
+        crate::db::update_app_status(&pool, &app.id, "deploying", None, None)
+            .await
+            .expect("deploying again");
+        confirm_app_running(&pool, &cfg, &confirming, &app.id, dead_port().await).await;
+        let fresh = crate::db::get_app(&pool, &app.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(fresh.status, "deploying");
     }
 }

@@ -63,12 +63,16 @@ pub async fn set_app_import_source(
 
 pub async fn list_apps(pool: &SqlitePool) -> sqlx::Result<Vec<App>> {
     let sql = format!("SELECT {APP_COLS} FROM app ORDER BY created_at DESC");
-    sqlx::query_as::<_, App>(sqlx::AssertSqlSafe(sql)).fetch_all(pool).await
+    sqlx::query_as::<_, App>(sqlx::AssertSqlSafe(sql))
+        .fetch_all(pool)
+        .await
 }
 
 pub async fn list_all_apps(pool: &SqlitePool) -> sqlx::Result<Vec<App>> {
     let sql = format!("SELECT {APP_COLS} FROM app ORDER BY created_at ASC");
-    sqlx::query_as::<_, App>(sqlx::AssertSqlSafe(sql)).fetch_all(pool).await
+    sqlx::query_as::<_, App>(sqlx::AssertSqlSafe(sql))
+        .fetch_all(pool)
+        .await
 }
 
 pub async fn get_app(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<App>> {
@@ -382,11 +386,47 @@ pub async fn update_app_status(
     Ok(())
 }
 
+/// Record a deploy's sha without touching the observed status: a deploy that
+/// lands while the app is stopped still counts for tip dedup, but must not
+/// flip the status back to running.
+pub async fn record_app_deploy_sha(pool: &SqlitePool, id: &str, sha: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE app SET last_deploy_sha = COALESCE(?, last_deploy_sha), updated_at = ? WHERE id = ?")
+        .bind(sha)
+        .bind(now_iso())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Write the observed status only while the app still wants to run. A stop
+/// (or delete) racing a deploy, a wake or a reconcile confirm must win:
+/// without the guard the loser flips a stopped app back to running (or
+/// failed). Returns whether the row was updated.
+pub async fn update_app_status_if_wanted(
+    pool: &SqlitePool,
+    id: &str,
+    status: &str,
+    last_error: Option<&str>,
+) -> sqlx::Result<bool> {
+    let done = sqlx::query(
+        "UPDATE app SET status = ?, last_error = ?, updated_at = ? WHERE id = ? AND desired_state = 'running'",
+    )
+    .bind(status)
+    .bind(last_error)
+    .bind(now_iso())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::db::connect;
+    use crate::models::DesiredState;
 
     async fn insert_app(pool: &SqlitePool, id: &str, slug: &str, subdomain: &str) {
         sqlx::query(
@@ -442,5 +482,43 @@ mod tests {
         assert_eq!(again, 0, "nothing left to rewrite");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A stop racing a status flip wins: the conditional write only lands
+    /// while the app still wants to run (and reports it), the sha still
+    /// records for tip dedup, and a missing row is a quiet no-op.
+    #[tokio::test]
+    async fn status_flips_only_while_wanted_and_sha_always_records() {
+        let pool = connect("sqlite::memory:").await.expect("memory db");
+        insert_app(&pool, "a", "a", "a.localhost").await;
+        update_app_status(&pool, "a", "deploying", None, None)
+            .await
+            .expect("deploying");
+        record_app_deploy_sha(&pool, "a", "abc123")
+            .await
+            .expect("sha");
+        patch_app_desired(&pool, "a", DesiredState::Stopped.as_str())
+            .await
+            .expect("stop");
+
+        let flipped = update_app_status_if_wanted(&pool, "a", AppStatus::Running.as_str(), None)
+            .await
+            .expect("stopped flip");
+        assert!(!flipped, "a stop in the window wins over running");
+        let failed =
+            update_app_status_if_wanted(&pool, "a", AppStatus::Failed.as_str(), Some("boom"))
+                .await
+                .expect("stopped fail");
+        assert!(!failed, "a stop in the window wins over failed");
+
+        let app = get_app(&pool, "a").await.expect("get").expect("row");
+        assert_eq!(app.status, "deploying");
+        assert_eq!(app.last_deploy_sha.as_deref(), Some("abc123"));
+        assert_eq!(app.last_error, None);
+
+        let gone = update_app_status_if_wanted(&pool, "nope", AppStatus::Running.as_str(), None)
+            .await
+            .expect("missing");
+        assert!(!gone, "a deleted row is a quiet no-op");
     }
 }

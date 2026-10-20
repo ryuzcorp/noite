@@ -145,7 +145,9 @@ pub async fn list_all_environments(pool: &SqlitePool) -> sqlx::Result<Vec<Enviro
         "SELECT {ENV_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
          ORDER BY e.created_at ASC"
     );
-    sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql)).fetch_all(pool).await
+    sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql))
+        .fetch_all(pool)
+        .await
 }
 
 /// Every environment the edge should route (the Caddyfile writer and the TLS
@@ -264,12 +266,18 @@ pub async fn update_environment_status(
 }
 
 /// A successful deploy: the environment is live at this sha. `last_deploy_sha`
-/// is the environment's own, never the app's.
+/// is the environment's own, never the app's. The sha lands even when a stop
+/// raced the deploy (tip dedup); `running` (and the error/asleep clearing)
+/// only applies while the environment still wants to run, in one statement
+/// so the stop cannot slip between the two.
 pub async fn mark_environment_deployed(pool: &SqlitePool, id: &str, sha: &str) -> sqlx::Result<()> {
     let ts = now_iso();
     sqlx::query(
-        "UPDATE environment SET status = 'running', last_deploy_sha = ?, last_deployed_at = ?, \
-         last_error = NULL, asleep_since = NULL, updated_at = ? WHERE id = ?",
+        "UPDATE environment SET status = CASE WHEN desired_state = 'running' THEN 'running' ELSE status END, \
+         last_deploy_sha = ?, last_deployed_at = ?, \
+         last_error = CASE WHEN desired_state = 'running' THEN NULL ELSE last_error END, \
+         asleep_since = CASE WHEN desired_state = 'running' THEN NULL ELSE asleep_since END, \
+         updated_at = ? WHERE id = ?",
     )
     .bind(sha)
     .bind(&ts)
@@ -278,6 +286,42 @@ pub async fn mark_environment_deployed(pool: &SqlitePool, id: &str, sha: &str) -
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Write the observed status only while the environment still wants to run
+/// (same stop-race rule as [`crate::db::update_app_status_if_wanted`]).
+/// Returns whether the row was updated.
+pub async fn update_environment_status_if_wanted(
+    pool: &SqlitePool,
+    id: &str,
+    status: &str,
+    last_error: Option<&str>,
+) -> sqlx::Result<bool> {
+    let ts = now_iso();
+    let done = match last_error {
+        Some(message) => {
+            sqlx::query(
+                "UPDATE environment SET status = ?, last_error = ?, updated_at = ? WHERE id = ? AND desired_state = 'running'",
+            )
+            .bind(status)
+            .bind(message)
+            .bind(&ts)
+            .bind(id)
+            .execute(pool)
+            .await?
+        }
+        None => {
+            sqlx::query(
+                "UPDATE environment SET status = ?, updated_at = ? WHERE id = ? AND desired_state = 'running'",
+            )
+            .bind(status)
+            .bind(&ts)
+            .bind(id)
+            .execute(pool)
+            .await?
+        }
+    };
+    Ok(done.rows_affected() > 0)
 }
 
 /// Instance-wide environment count: the `RUNNER_MAX_ENVIRONMENTS` cap.
@@ -616,5 +660,48 @@ mod tests {
             stale.iter().all(|e| e.id != workspace.id),
             "a deploy re-arms the clock"
         );
+    }
+
+    /// A stop racing an environment status flip wins, while a deploy's sha
+    /// still records — the preview mirror of the app rule.
+    #[tokio::test]
+    async fn environment_status_flips_only_while_wanted() {
+        let pool = connect("sqlite::memory:").await.expect("boot");
+        let cfg = crate::config::config_for_tests();
+        let app = seed(&pool).await;
+        let env = create_environment(&pool, &cfg, new(&app.id, "feature", "refs/heads/feat"))
+            .await
+            .expect("env");
+        mark_environment_deployed(&pool, &env.id, "abc1234")
+            .await
+            .expect("deployed");
+        let fresh = get_environment(&pool, &env.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(fresh.status, "running");
+        assert_eq!(fresh.last_deploy_sha.as_deref(), Some("abc1234"));
+        // A stop in the window: a later deploy's sha still records, but the
+        // status never flips back.
+        sqlx::query(
+            "UPDATE environment SET desired_state = 'stopped', status = 'deploying' WHERE id = ?",
+        )
+        .bind(&env.id)
+        .execute(&pool)
+        .await
+        .expect("stop");
+        mark_environment_deployed(&pool, &env.id, "def5678")
+            .await
+            .expect("stopped deploy");
+        let flipped = update_environment_status_if_wanted(&pool, &env.id, "running", None)
+            .await
+            .expect("stopped flip");
+        assert!(!flipped, "a stop in the window wins over running");
+        let fresh = get_environment(&pool, &env.id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(fresh.status, "deploying");
+        assert_eq!(fresh.last_deploy_sha.as_deref(), Some("def5678"));
     }
 }
