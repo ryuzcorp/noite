@@ -203,6 +203,9 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
 
   let disposeEdit: (() => void) | undefined;
   let activePreview = 0;
+  /** The path the latest `openFile` is still resolving, or null once it has
+   * painted, given up or been superseded. */
+  let opening: string | null = null;
 
   const editor = new host.edit.Editor("file", {
     editPrediction: {
@@ -413,6 +416,7 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
 
     activePreview += 1;
     const previewToken = activePreview;
+    opening = path;
 
     try {
       const show = await resolveShow(path);
@@ -451,6 +455,10 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
       }
 
       return false;
+    } finally {
+      if (previewToken === activePreview) {
+        opening = null;
+      }
     }
   };
 
@@ -479,6 +487,7 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
    * of the old checkout answer into nothing (their token is spent). */
   const rebase = () => {
     activePreview += 1;
+    opening = null;
     currentPath = null;
     currentEditable = false;
     shown = null;
@@ -504,6 +513,13 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
       return;
     }
 
+    // The pane is leaving this file: the open of another one owns the code
+    // surface. Superseding it would strand the outgoing file on screen (and in
+    // `?file=`) while the open the user asked for answers into nothing.
+    if (opening !== null && opening !== path) {
+      return;
+    }
+
     // The change may be all that moved (an edit settling on the commit's text
     // leaves no change, a new one arrives): the header follows it here, before
     // any of the reads below can short-circuit.
@@ -511,6 +527,7 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
     paintStatus(path);
     activePreview += 1;
     const previewToken = activePreview;
+    opening = null;
     // A write of the pane's own is in flight: the pod may answer with bytes
     // older than the editor, so this read is not one to compare against.
     const writing = pendingWrites.has(path);
