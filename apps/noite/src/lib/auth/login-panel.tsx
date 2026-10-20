@@ -60,6 +60,10 @@ export const LoginPanel = () => {
   const recovery = atom(false);
   const otpSent = atom(false);
   const otpEmail = atom("");
+  // The page is server-rendered with its tabs and buttons in place, but they
+  // have no handlers until the client mounts: a click before that was lost
+  // (the tab stayed on Sign in). The controls stay disabled until then.
+  const mounted = atom(false);
   const policy = signupPolicy();
   const invite = () => policy.data();
   // Where a gated flow (the environment gate) asked to come back to. Always a
@@ -80,6 +84,7 @@ export const LoginPanel = () => {
       return;
     }
 
+    mounted.set(true);
     const { data } = await fetchSession();
 
     if (data?.user) {
@@ -325,7 +330,10 @@ export const LoginPanel = () => {
   }
 
   return (
-    <div class="flex flex-col gap-6">
+    <fieldset
+      class="m-0 flex min-w-0 flex-col gap-6 border-0 p-0"
+      disabled={!mounted()}
+    >
       <div class="flex flex-col gap-2">
         <h1 class="m-0 text-2xl font-semibold tracking-tight">{intro.title}</h1>
         <p class="m-0 text-sm leading-relaxed opacity-70">{intro.body}</p>
@@ -437,6 +445,6 @@ export const LoginPanel = () => {
       )}
 
       {error() ? <p class="text-error m-0 text-sm">{error()}</p> : null}
-    </div>
+    </fieldset>
   );
 };
