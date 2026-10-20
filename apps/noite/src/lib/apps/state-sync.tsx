@@ -73,12 +73,13 @@ export const staleKeys = (
 };
 
 /** Follow one app's state stream and invalidate whichever cache it proves
- * stale. Renders nothing. */
+ * stale. Renders nothing, so its frames stay out of sessionStorage. */
 const AppStateSync = ({ appId }: { appId: string }) => {
   const feed = liveFeed(
     feedKeys.appState(appId),
     appStateUrl(appId),
-    decodeAppState
+    decodeAppState,
+    { persist: false }
   );
 
   watch(feed.latest, (frame) => {

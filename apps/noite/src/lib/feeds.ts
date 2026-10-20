@@ -367,10 +367,13 @@ export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
 
 let pageHub: StreamHub | undefined;
 
+/** A live panel's feed. `persist: false` keeps its snapshots in memory only,
+ * for a feed the UI never paints (see `writeSwr`). */
 export const liveFeed = <T>(
   key: string,
   url: string,
-  decode: (raw: string) => T
+  decode: (raw: string) => T,
+  opts?: { persist?: boolean }
 ): LiveFeed<T> => {
   // oxlint-disable-next-line unicorn/no-useless-undefined -- the feed starts valueless; undefined is the seed
   const latest = atom<T | undefined>(undefined);
@@ -394,7 +397,7 @@ export const liveFeed = <T>(
       onMessage: (data) => {
         try {
           const frame = decode(data);
-          writeSwr(key, frame);
+          writeSwr(key, frame, opts);
           latest.set(frame);
         } catch {
           // Bad frame: skip, like fromEventSource's throwing schema.
