@@ -118,6 +118,24 @@ jobs:
           git diff --exit-code -- apps/noite/src/lib/runner-types
           test -z "$(git status --porcelain apps/noite/src/lib/runner-types)"
 
+  # The control UI's unit tests, from a checkout: among them the guard that
+  # every `/api/...` path the browser requests has a committed route file
+  # (alpha.6 shipped without the logs stream route because `.gitignore` hid
+  # it, and only a git checkout shows that). `apps/noite` has its own
+  # lockfile, installed standalone like the image does.
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - run: bun install
+      - name: install UI deps
+        working-directory: apps/noite
+        run: bun install --frozen-lockfile
+      - name: unit tests
+        working-directory: apps/noite
+        run: bun test src
+
   # packages/cli ships to npm but no other lane builds it: guard the bundle,
   # the typecheck, and the version it advertises (inlined from package.json).
   cli:
@@ -136,3 +154,6 @@ jobs:
           node dist/bin.js --help
       - name: typecheck
         run: bunx tsc --noEmit -p packages/cli
+      - name: unit tests
+        working-directory: packages/cli
+        run: bun test

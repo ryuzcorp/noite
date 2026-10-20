@@ -18,6 +18,44 @@ import type { RouteHandler } from "../config";
 import { controlStreamRefusal, routeUserId } from "../session";
 import { sleepUnlessAborted } from "../sse";
 
+/** GET a runner SSE endpoint and re-wrap it for the browser. A `fetch` throw
+ * (runner restarting or unreachable) becomes a short 502 instead of an
+ * unhandled throw. Exported for the unit tests. */
+export const proxyRunnerFetch = async (
+  upstreamUrl: string,
+  token: string,
+  signal: AbortSignal
+): Promise<Response> => {
+  let upstream: Response;
+
+  try {
+    upstream = await fetch(upstreamUrl, {
+      headers: { authorization: `Bearer ${token}` },
+      // T1.2: a browser leaving aborts this proxy, which must abort the
+      // runner request too — otherwise the runner loop only notices on its
+      // next change-send and can poll forever.
+      signal,
+    });
+  } catch (error) {
+    console.error("runner stream upstream unreachable", error);
+
+    return new Response("runner unavailable", { status: 502 });
+  }
+
+  if (!upstream.ok || !upstream.body) {
+    const text = await upstream.text().catch(() => upstream.statusText);
+
+    return new Response(text, { status: upstream.status });
+  }
+
+  const headers = new Headers();
+  headers.set("content-type", "text/event-stream");
+  headers.set("cache-control", "no-cache");
+  headers.set("connection", "keep-alive");
+
+  return new Response(upstream.body, { headers, status: upstream.status });
+};
+
 /** Runner SSE proxy shared by the log tail and deploy history streams:
  * session + view-role gate, then pipe the runner events (the browser
  * never sees RUNNER_TOKEN). */
@@ -62,29 +100,11 @@ const proxyRunnerStream = async (
     return new Response("RUNNER_TOKEN is not configured", { status: 500 });
   }
 
-  const upstream = await fetch(
+  return proxyRunnerFetch(
     `${rc.runner}${upstreamPath(encodeURIComponent(appId))}`,
-    {
-      headers: { authorization: `Bearer ${rc.token}` },
-      // T1.2: a browser leaving aborts this proxy, which must abort the
-      // runner request too — otherwise the runner loop only notices on its
-      // next change-send and can poll forever.
-      signal: request.signal,
-    }
+    rc.token,
+    request.signal
   );
-
-  if (!upstream.ok || !upstream.body) {
-    const text = await upstream.text().catch(() => upstream.statusText);
-
-    return new Response(text, { status: upstream.status });
-  }
-
-  const headers = new Headers();
-  headers.set("content-type", "text/event-stream");
-  headers.set("cache-control", "no-cache");
-  headers.set("connection", "keep-alive");
-
-  return new Response(upstream.body, { headers, status: upstream.status });
 };
 
 /** Live log tail proxy (see proxyRunnerStream). `?environmentId=` passes

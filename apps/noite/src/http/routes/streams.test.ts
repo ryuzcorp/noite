@@ -3,7 +3,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 
 import { controlStreamRefusalDecision } from "../session";
 import { sleepUnlessAborted } from "../sse";
-import { metricsWindowHours, streamMetrics } from "./streams";
+import { metricsWindowHours, proxyRunnerFetch, streamMetrics } from "./streams";
 
 const realFetch = globalThis.fetch;
 
@@ -169,5 +169,62 @@ describe("streamMetrics", () => {
   test("a moved version polls again", async () => {
     const { versionCalls } = await runMetricsStream((n) => n);
     expect(versionCalls).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe("proxyRunnerFetch", () => {
+  test("a dead runner becomes a short 502, keeping the abort signal", async () => {
+    const seen: (AbortSignal | null)[] = [];
+    setFetch(async (_url, init) => {
+      seen.push(init?.signal ?? null);
+      throw new Error("connection refused");
+    });
+    const controller = new AbortController();
+
+    const response = await proxyRunnerFetch(
+      "http://runner.test/v1/apps/a/logs/stream",
+      "tok",
+      controller.signal
+    );
+
+    expect(response.status).toBe(502);
+    expect(await response.text()).toBe("runner unavailable");
+    expect(seen[0]).toBe(controller.signal);
+  });
+
+  test("an upstream error passes through with its status", async () => {
+    setFetch(async () => new Response("no such app", { status: 404 }));
+    const controller = new AbortController();
+
+    const response = await proxyRunnerFetch(
+      "http://runner.test/v1/apps/a/logs/stream",
+      "tok",
+      controller.signal
+    );
+
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe("no such app");
+  });
+
+  test("a live upstream is re-wrapped as an event stream", async () => {
+    const body = "data: [1]\n\n";
+    setFetch(
+      async () =>
+        new Response(body, {
+          headers: { "content-type": "text/event-stream" },
+        })
+    );
+    const controller = new AbortController();
+
+    const response = await proxyRunnerFetch(
+      "http://runner.test/v1/apps/a/logs/stream",
+      "tok",
+      controller.signal
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("text/event-stream");
+    expect(response.headers.get("cache-control")).toBe("no-cache");
+    expect(await response.text()).toBe(body);
   });
 });

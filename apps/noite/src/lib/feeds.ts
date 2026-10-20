@@ -32,6 +32,151 @@ export interface LiveFeed<T> {
   status: AtomHandle<EventSourceStatus>;
 }
 
+/** What a reconnecting stream reports back to its owner (ilha atoms in
+ * `liveFeed`, plain collectors in the unit tests). */
+export interface StreamHooks {
+  onMessage: (data: string) => void;
+  onStatus: (status: EventSourceStatus) => void;
+}
+
+/** Reconnect tuning for {@link connectStream} (tests pass millisecond
+ * budgets; the UI keeps the defaults). */
+export interface StreamRetryOptions {
+  /** First reconnect delay; doubles per attempt. Default 1 s. */
+  baseMs?: number;
+  /** Delay cap (jitter included). Default 30 s. */
+  capMs?: number;
+  /** 0..1 random source for the jitter; pass `() => 0` for exact delays. */
+  random?: () => number;
+  /** EventSource constructor; default `globalThis.EventSource`. */
+  source?: typeof EventSource;
+}
+
+const RETRY_BASE_MS = 1000;
+const RETRY_CAP_MS = RETRY_BASE_MS * 30;
+
+/** `readyState` a dead source reports (`EventSource.CLOSED`). */
+const SOURCE_CLOSED = 2;
+
+/** Framework-free EventSource manager behind `liveFeed`: opens the stream,
+ * reopens a CLOSED source itself with capped exponential backoff plus jitter
+ * (resetting on `open`), closes on hidden tabs and reopens on visible, never
+ * holds two live sources, and tears down timers and listeners on dispose.
+ * Native `EventSource` retries transport drops on its own — but after an HTTP
+ * error response (any non-2xx, or a wrong content-type such as a 404 page,
+ * or a 500/502/503 while the control fleet or runner restarts) `readyState`
+ * goes CLOSED and it gives up for good; without this the panel would show
+ * "retrying" forever without retrying. Returns the dispose function. */
+export const connectStream = (
+  url: string,
+  hooks: StreamHooks,
+  options: StreamRetryOptions = {}
+): (() => void) => {
+  const baseMs = options.baseMs ?? RETRY_BASE_MS;
+  const capMs = options.capMs ?? RETRY_CAP_MS;
+  const random = options.random ?? Math.random;
+  const Source = options.source ?? globalThis.EventSource;
+
+  if (Source === undefined) {
+    hooks.onStatus("closed");
+
+    return () => {
+      // No source exists, so there is nothing to dispose.
+    };
+  }
+
+  let source: EventSource | undefined;
+  // Pending-reopen generation: scheduling bumps it and each timer only fires
+  // for its own generation, so a stale timer can never open a second source.
+  let pending = 0;
+  let attempts = 0;
+  let disposed = false;
+
+  const clearTimer = (): void => {
+    pending += 1;
+  };
+
+  const open = (): void => {
+    if (disposed || source !== undefined) {
+      return;
+    }
+
+    // T1.9: background tabs hold no connection. The SWR snapshot keeps the
+    // panel painted while away.
+    if (typeof document !== "undefined" && document.hidden) {
+      hooks.onStatus("closed");
+
+      return;
+    }
+
+    hooks.onStatus("connecting");
+    const next = new Source(url);
+    source = next;
+    next.addEventListener("open", () => {
+      attempts = 0;
+      hooks.onStatus("open");
+    });
+    next.addEventListener("error", () => {
+      hooks.onStatus("retrying");
+
+      if (next.readyState === SOURCE_CLOSED) {
+        if (source === next) {
+          source = undefined;
+        }
+
+        const backoff = Math.min(capMs, baseMs * 2 ** attempts);
+        attempts += 1;
+        const delay = Math.min(capMs, backoff + Math.floor(random() * baseMs));
+        pending += 1;
+        const seen = pending;
+        setTimeout(() => {
+          if (seen === pending) {
+            open();
+          }
+        }, delay);
+      }
+    });
+    next.addEventListener("message", (event) => {
+      hooks.onMessage(event.data);
+    });
+  };
+
+  const close = (): void => {
+    clearTimer();
+    source?.close();
+    source = undefined;
+  };
+
+  const onVisibility = (): void => {
+    if (typeof document === "undefined") {
+      return;
+    }
+
+    if (document.hidden) {
+      close();
+      hooks.onStatus("closed");
+    } else {
+      open();
+    }
+  };
+
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", onVisibility);
+  }
+
+  open();
+
+  return () => {
+    disposed = true;
+
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", onVisibility);
+    }
+
+    close();
+  };
+};
+
 export const liveFeed = <T>(
   key: string,
   url: string,
@@ -53,60 +198,20 @@ export const liveFeed = <T>(
       return;
     }
 
-    let source: EventSource | undefined;
-
-    const open = () => {
-      if (source) {
-        return;
-      }
-
-      status.set("connecting");
-      const next = new EventSource(url);
-      source = next;
-      next.addEventListener("open", () => {
-        status.set("open");
-      });
-      next.addEventListener("error", () => {
-        // Native EventSource retries on its own unless closed.
-        status.set("retrying");
-      });
-      next.addEventListener("message", (event) => {
+    return connectStream(url, {
+      onMessage: (data) => {
         try {
-          const frame = decode(event.data);
+          const frame = decode(data);
           writeSwr(key, frame);
           latest.set(frame);
         } catch {
           // Bad frame: skip, like fromEventSource's throwing schema.
         }
-      });
-    };
-
-    const close = () => {
-      source?.close();
-      source = undefined;
-    };
-
-    const onVisibility = () => {
-      if (document.hidden) {
-        close();
-        status.set("closed");
-      } else {
-        open();
-      }
-    };
-
-    document.addEventListener("visibilitychange", onVisibility);
-
-    if (document.hidden) {
-      status.set("closed");
-    } else {
-      open();
-    }
-
-    return () => {
-      document.removeEventListener("visibilitychange", onVisibility);
-      close();
-    };
+      },
+      onStatus: (next) => {
+        status.set(next);
+      },
+    });
   });
 
   return { latest: withSnapshot(key, latest), status };
