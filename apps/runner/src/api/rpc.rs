@@ -855,6 +855,13 @@ async fn dispatch_call(
                 Ok(p) => p,
                 Err(e) => return e,
             };
+            if p.events.len() > 1 {
+                return rpc_err(
+                    id,
+                    JsonRpcErrorReason::InvalidParams,
+                    "at most one event per envelope".into(),
+                );
+            }
             complete(
                 id,
                 service::errors::ingest(state, p)

@@ -4,7 +4,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 
 import { controlEnv } from "../../lib/control-env";
-import { DEFAULT_RPM, resetRateLimits } from "../../lib/rate-limit";
+import { DEFAULT_RPM, envelopeLimiter } from "../../lib/rate-limit";
 import {
   ENVELOPE_MAX_BYTES,
   handleEnvelope,
@@ -171,7 +171,7 @@ beforeEach(() => {
   rpcError = null;
   controlEnv.RUNNER_TOKEN = ENV.RUNNER_TOKEN;
   controlEnv.RUNNER_URL = ENV.RUNNER_URL;
-  resetRateLimits();
+  envelopeLimiter.reset();
   setFetch(async (_url, init) => {
     // SAFETY: the handler only posts JSON-RPC bodies to the runner.
     const payload = JSON.parse(String(init?.body ?? "{}")) as RpcPayload;
@@ -388,6 +388,24 @@ describe("envelope bodies", () => {
     });
 
     expect(response?.status).toBe(200);
+    expect(calls).toEqual([]);
+  });
+
+  test("refuses an envelope with more than one event", async () => {
+    const text = [
+      '{"event_id":"9ec79c33ec9942ab8353589fcb2f04d"}',
+      '{"type":"event"}',
+      '{"event_id":"9ec79c33ec9942ab8353589fcb2f04d","message":"one"}',
+      '{"type":"event"}',
+      '{"event_id":"9ec79c33ec9942ab8353589fcb2f04d","message":"two"}',
+      "",
+    ].join("\n");
+
+    const response = await run(post("42", text, "key-multi"), {
+      projectId: "42",
+    });
+
+    expect(response?.status).toBe(400);
     expect(calls).toEqual([]);
   });
 });

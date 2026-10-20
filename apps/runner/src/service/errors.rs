@@ -255,7 +255,9 @@ pub async fn ingest_key(
     role: Option<&str>,
 ) -> Result<IngestKeyView, ApiError> {
     let Some(role) = role else {
-        return Err(ApiError::forbidden("the view role is required for this operation"));
+        return Err(ApiError::forbidden(
+            "the view role is required for this operation",
+        ));
     };
     if !role_ok(role, "view") {
         return Err(ApiError::forbidden(format!(
@@ -286,7 +288,9 @@ pub async fn rotate_ingest_key(
     role: Option<&str>,
 ) -> Result<IngestKeyView, ApiError> {
     let Some(role) = role else {
-        return Err(ApiError::forbidden("the admin role is required for this operation"));
+        return Err(ApiError::forbidden(
+            "the admin role is required for this operation",
+        ));
     };
     if !role_ok(role, "admin") {
         return Err(ApiError::forbidden(format!(
@@ -321,8 +325,14 @@ pub struct SdkIngestBatch {
 /// `errors.ingest`: record one envelope's events under the app the project
 /// number resolves to. An unknown number and a wrong key share one refusal,
 /// so the response never reveals which apps exist. Returns the fingerprints
-/// that gained occurrences (empty when the envelope held no events).
+/// that gained occurrences (empty when the envelope held no events). The
+/// protocol allows at most one event per envelope; more is an invalid-params
+/// refusal before any database work, so a direct RPC caller cannot multiply
+/// writes with one fat batch.
 pub async fn ingest(state: &AppState, batch: SdkIngestBatch) -> Result<Vec<String>, ApiError> {
+    if batch.events.len() > 1 {
+        return Err(ApiError::bad("at most one event per envelope"));
+    }
     let row = db::app_for_project(&state.pool, batch.project_id)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -342,4 +352,79 @@ pub async fn ingest(state: &AppState, batch: SdkIngestBatch) -> Result<Vec<Strin
     ingest_sdk(&state.pool, &app_id, sha.as_deref(), &batch.events)
         .await
         .map_err(ApiError::from_anyhow)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    async fn test_state() -> AppState {
+        let dir =
+            std::env::temp_dir().join(format!("noite-ingest-cap-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        cfg.work_dir = dir.join("work").to_string_lossy().into_owned();
+        let config = Arc::new(cfg);
+        let pool = crate::db::connect(&config.database_url)
+            .await
+            .expect("connect db");
+        let (tip_tx, _tip_rx) = crate::host::tips::channel();
+        let (log_notify, _log_rx) = tokio::sync::watch::channel(0u64);
+        AppState {
+            pool,
+            config,
+            procs: crate::host::supervisor::new_procs(),
+            logs: crate::host::logs::new_state(),
+            deploying: crate::host::deploy::new_deploying(),
+            log_notify,
+            git_sync: crate::host::git_manifest::GitSync::default(),
+            tip_tx,
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            isolation: Arc::new(tokio::sync::RwLock::new(
+                crate::host::isolation::IsolationStatus::default(),
+            )),
+            state_sync: crate::host::state::StateSync::new(),
+            bucket_ok: Arc::new(tokio::sync::RwLock::new((
+                true,
+                String::new(),
+                std::time::Instant::now(),
+            ))),
+            started_at: chrono::Utc::now(),
+        }
+    }
+
+    fn event(message: &str) -> SdkEvent {
+        SdkEvent {
+            kind: "Error".into(),
+            message: message.into(),
+            frames: Vec::new(),
+            url: String::new(),
+            release: String::new(),
+            environment: String::new(),
+            user_agent: String::new(),
+            trace_id: String::new(),
+            timestamp_us: 0,
+            source: "browser".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_rejects_more_than_one_event() {
+        let state = test_state().await;
+        let batch = SdkIngestBatch {
+            project_id: 1,
+            key: "k".into(),
+            events: vec![event("one"), event("two")],
+        };
+        let err = ingest(&state, batch)
+            .await
+            .expect_err("two events must be refused");
+        assert!(
+            matches!(err, ApiError::BadRequest(_)),
+            "unexpected: {err:?}"
+        );
+    }
 }

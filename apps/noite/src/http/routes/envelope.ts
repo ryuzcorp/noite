@@ -1,4 +1,4 @@
-import { DEFAULT_RPM, rateLimitDecision } from "../../lib/rate-limit";
+import { DEFAULT_RPM, envelopeLimiter } from "../../lib/rate-limit";
 import {
   RunnerRpcError,
   runnerIngestErrors,
@@ -142,7 +142,9 @@ const storeEvents = async (
 
 /** Parse one envelope body: invalid bytes are a 400, while an envelope with
  * no events (sessions, transactions, client reports) is a 200 that never
- * reaches the runner. */
+ * reaches the runner. The protocol allows at most one event per envelope,
+ * so more than one is a 400: without the cap a 200 KiB body of tiny events
+ * would multiply into thousands of stored writes. */
 const ingestText = (
   text: string,
   projectId: number,
@@ -161,6 +163,10 @@ const ingestText = (
     return answer(JSON.stringify({ fingerprints: [] }), 200, {
       "content-type": "application/json",
     });
+  }
+
+  if (parsed.events.length > 1) {
+    return answer("envelope holds more than one event", 400);
   }
 
   return storeEvents(projectId, key, parsed.events, env);
@@ -204,7 +210,11 @@ export const makeEnvelopeHandler = (deps?: {
       return answer("sentry_key required", 401);
     }
 
-    const decision = rateLimitDecision(`envelope:${key}`, DEFAULT_RPM, now());
+    const decision = envelopeLimiter.decision(
+      `envelope:${key}`,
+      DEFAULT_RPM,
+      now()
+    );
 
     if (!decision.allowed) {
       return answer("rate limited", 429, {

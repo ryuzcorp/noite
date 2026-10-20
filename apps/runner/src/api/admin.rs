@@ -34,7 +34,10 @@ pub async fn snapshot(State(state): State<AppState>) -> impl IntoResponse {
         return ApiError::internal("snapshot path is not valid UTF-8").into_response();
     };
     let sql = format!("VACUUM INTO '{}'", target.replace('\'', "''"));
-    if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&state.pool).await {
+    if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .execute(&state.pool)
+        .await
+    {
         return ApiError::internal(format!("vacuum failed: {e}")).into_response();
     }
     let bytes = tokio::fs::metadata(&path)

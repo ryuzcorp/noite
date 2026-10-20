@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 
 import { controlEnv } from "../lib/control-env";
-import { resetRateLimits } from "../lib/rate-limit";
+import { envelopeLimiter } from "../lib/rate-limit";
 import { testRouteContext } from "../testing/context";
 import envelopeSlash from "./05-envelope-slash";
 
@@ -25,7 +25,7 @@ describe("envelope trailing-slash alias", () => {
   test("answers the SDK's trailing-slash POST with the envelope handler", async () => {
     controlEnv.RUNNER_TOKEN = ENV.RUNNER_TOKEN;
     controlEnv.RUNNER_URL = ENV.RUNNER_URL;
-    resetRateLimits();
+    envelopeLimiter.reset();
 
     // SAFETY: the handler only posts JSON-RPC bodies to the runner.
     globalThis.fetch = (() =>

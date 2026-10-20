@@ -8,6 +8,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Browser errors through any Sentry SDK.** Settings → Error reporting shows the app's DSN (`https://<key>@<control host>/<n>`, rotatable by admins). A stock Sentry SDK pointed at it reports exceptions to `POST /api/<n>/envelope/`, and they land in the Errors tab as the same issues as the Worker's own errors, labelled Browser (or SDK for server SDKs) with the page URL and release. Transactions, sessions, replays and other non-error items are accepted and dropped. Source maps are still to come.
+
 ### Changed
 
 - **The Ilha + Void template replaces Oxide + ilha.** The creator offers exactly **Ilha + Void** and **TanStack Start**. Ilha + Void lives in the same repository, `ryuzcorp/noite-template-oxide`, now rewritten as Ilha pages on Void (Vite) with server-rendered pages, a server action and an island. The template id changed from `oxide` to `ilha-void` with no alias, so MCP `create_app` calls that pass `source: { kind: "template", template: "oxide" }` must switch to `ilha-void`. A new e2e spec creates an app from the template, waits for the deploy and checks that it serves.
