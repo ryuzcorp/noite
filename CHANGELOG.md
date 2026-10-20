@@ -11,6 +11,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - **Deployment logs stream again.** In 0.1.0-alpha.6 the Deployments tab's **Deployment logs** pane only said "Log stream disconnected — retrying…": the release image shipped without the control UI's `/api/apps/:id/logs/stream` route, which answered 404. A repo-wide ignore rule for `logs` directories had kept that file out of git.
+- **Live panels recover on their own.** Deployment logs, deploy history, errors, events, usage and the app list went quiet for good, showing "… disconnected — retrying…", once the control UI or runner answered an error (a 502 while either restarts, say): the browser's `EventSource` does not retry after an HTTP error. They now reconnect with backoff (1 s up to 30 s), and the control UI answers a short 502 `runner unavailable` while the runner is down instead of failing the request.
+- **"Running" means serving.** An app or environment showed **Running** as soon as its fleet was spawned, before celld listened, and a deploy reported success the same way. Both now wait for celld's health gate. A deploy whose celld exits before it serves fails at once, and one whose fleet is stopped or deleted in the meantime completes without waiting. A stop or delete during a deploy or start always wins over the status change.
+- **Code mode: typing right after New File kept its order.** Under load, the first character typed into a new file could end up last (`xport const extra = 1;e`): the editor moved the caret back to the top after typing had begun.
+
+### Changed
+
+- **Operator note:** a deploy now succeeds once its fleet passes the health gate, up to `RUNNER_WAKE_TIMEOUT_S` (120 s by default); one whose fleet never becomes healthy fails with `fleet not healthy within …` instead of reporting success.
+- **CI:** the control UI and CLI unit tests run on every pull request and release tag; among them, a guard that every `/api/...` path the browser requests has a committed route file. The e2e lanes run spec files in parallel (3 workers) on a cached image build.
 
 ## [0.1.0-alpha.6] - 2026-10-20
 
