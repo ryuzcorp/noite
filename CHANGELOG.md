@@ -8,7 +8,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [0.1.0-alpha.6] - 2026-10-19
+## [0.1.0-alpha.6] - 2026-10-20
 
 The control UI moves to the Void framework, the CLI ships on npm as `@noitenow/cli`, and the runner gets stricter boot validation plus a round of concurrency and robustness fixes.
 
@@ -34,10 +34,12 @@ The control UI moves to the Void framework, the CLI ships on npm as `@noitenow/c
 - **Runner robustness:** S3 GET/PUT/LIST retry transient 5xx/SlowDown/transport errors (never 4xx); missing-key detection no longer mistakes key names or transport failures for "not found"; timed-out commands and stopped fleets kill the whole process group including grandchildren; deploy/log streams drop unserializable snapshots with a warning instead of blank events; snapshot setup failures surface as errors; expired or revoked credentials on delete/rename are logged; trailing-dot FQDNs pass the TLS gate like the custom-domain branch.
 - Non-UTF-8 work-dir paths now fail the git request/deploy/rehydrate with an error instead of panicking the task, and a deploy whose target environment row is missing reports an error instead of crashing.
 - Control UI server-rendering no longer crashes on the app-creation, onboarding and preview paths (browser-only globals guarded); a failed app grant rolls back the created row and surfaces the cause instead of masking it as a 500; deploy logs and file previews stay out of persistent snapshots.
+- **Code mode could stay on the file you were leaving.** Clicking another file right after typing could leave the editor and `?file=` on the old file: the old file's last write settling after the click cancelled the open. The open now wins.
 
 ### Changed
 
-- **JS deps (patch/minor):** `better-auth` 1.7.7 → 1.7.11, `effect` + `@effect/sql-d1` + `@effect/platform-node` 4.0.4 → 4.0.5, `kysely` 0.29.6 → 0.29.7, `void` 1.1.11 → 1.1.12 with `@ilha/void` 0.1.4, plus `blume`, `daisyui`, `@cloudflare/workers-types`, `@playwright/test`, `@types/bun`, `@types/node` and `oxfmt` bumps. Runner deps get a semver-compatible `cargo update`; the lint toolchain moves to ultracite 8.
+- **JS deps, all at latest:** `better-auth` 1.7.7 → 1.7.11, `effect` + `@effect/sql-d1` + `@effect/platform-node` 4.0.4 → 4.0.5, `kysely` 0.29.6 → 0.29.7, `void` 1.1.11 → 1.1.12 with `@ilha/void` 0.1.4, `@types/node` 26 for the CLI, `oxlint` 1.89 / `oxfmt` 0.74, plus `blume`, `daisyui`, `@cloudflare/workers-types`, `@playwright/test`, `@types/bun` and the sample apps' `cf` / `vite` / `@cloudflare/vite-plugin`; the lint toolchain moves to ultracite 8. Code mode's language service stays on TypeScript 5.9: TypeScript 7 ships no `createLanguageService`.
+- **Runner deps, all at latest (majors included):** `sqlx` 0.9, `reqwest` 0.13, `tower-http` 0.7, RustCrypto `aes-gcm` 0.11 / `hkdf` 0.13 / `hmac` 0.13 / `sha2` 0.11, `rand` 0.10, `base64` 0.23, `zstd` 0.14, `constant_time_eq` 0.6, `tokio` 1.54. Stored credentials, tokens and SigV4 signatures are byte-identical (pinned by fixed-vector tests). The runner's outbound HTTPS (PostHog, BYO S3) now trusts the OS certificate store, which the image ships; no schema or config change.
 - **CI:** the release image target now builds on every PR (no push), and the e2e lanes run on PRs carrying the `e2e` label (plus manual dispatch). GitHub Action pins move to current majors, and the schema gate diffs the full 17-table allowlist.
 - Docs refresh: release references to 0.1.0-alpha.5, control-host denied-asset 404s, preview environments starting empty, and the environments bucket prefix; dev installs derive `BETTER_AUTH_URL`/`GIT_PUBLIC_BASE` from `BASE_DOMAIN`, and `make nuke` also removes the UI's `.wrangler`/`.void` dirs.
 
