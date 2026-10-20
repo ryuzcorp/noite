@@ -878,16 +878,30 @@ async fn deploy_inner(
     // health/ready gate — not just that celld was spawned. The reload above
     // races a cold boot (`started celld` then `reload failed (connection
     // error)` within milliseconds), so confirm the gate before calling the
-    // deploy live. Runs on the deploy's own task, never on the reconcile
-    // tick, and well inside the stuck-deploy sweep.
+    // deploy live. This deploy holds the app's claim, so the wait ends the
+    // moment the fleet is no longer a live child: a crash fails the deploy at
+    // once, and a stop or teardown in the window (nobody wants it serving,
+    // and a delete is queued on the claim) completes it as before.
     let fleet_port = match &environment {
         Some(env) => env.listen_port,
         None => app.listen_port,
     };
     if let Some(port) = fleet_port {
         let budget = std::time::Duration::from_secs(cfg.wake_timeout_s.max(1));
-        if !crate::host::sleep::wait_healthy(cfg, port, budget).await {
-            anyhow::bail!("fleet not healthy within {}s", cfg.wake_timeout_s);
+        tokio::select! {
+            healthy = crate::host::sleep::wait_healthy(cfg, port, budget) => {
+                if !healthy {
+                    anyhow::bail!("fleet not healthy within {}s", cfg.wake_timeout_s);
+                }
+            }
+            fate = supervisor::fleet_gone(procs, &fleet) => match fate {
+                supervisor::FleetFate::Removed => {
+                    tracing::info!(fleet = %fleet, "fleet stopped before its health gate; deploy recorded");
+                }
+                supervisor::FleetFate::Exited(why) => {
+                    anyhow::bail!("celld exited before answering its health gate: {why}");
+                }
+            },
         }
     }
 
@@ -942,10 +956,7 @@ async fn materialize_bundle(
     }
     let refspec = format!("+{sha}:{git_ref}");
     let Some(bundle_arg) = bundle_path.to_str() else {
-        anyhow::bail!(
-            "bundle path is not valid UTF-8: {}",
-            bundle_path.display()
-        );
+        anyhow::bail!("bundle path is not valid UTF-8: {}", bundle_path.display());
     };
     exec::run_cmd(
         "git",

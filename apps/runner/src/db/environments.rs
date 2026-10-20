@@ -145,7 +145,9 @@ pub async fn list_all_environments(pool: &SqlitePool) -> sqlx::Result<Vec<Enviro
         "SELECT {ENV_COLS} FROM environment e JOIN app a ON a.id = e.app_id \
          ORDER BY e.created_at ASC"
     );
-    sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql)).fetch_all(pool).await
+    sqlx::query_as::<_, Environment>(sqlx::AssertSqlSafe(sql))
+        .fetch_all(pool)
+        .await
 }
 
 /// Every environment the edge should route (the Caddyfile writer and the TLS
@@ -681,11 +683,13 @@ mod tests {
         assert_eq!(fresh.last_deploy_sha.as_deref(), Some("abc1234"));
         // A stop in the window: a later deploy's sha still records, but the
         // status never flips back.
-        sqlx::query("UPDATE environment SET desired_state = 'stopped', status = 'deploying' WHERE id = ?")
-            .bind(&env.id)
-            .execute(&pool)
-            .await
-            .expect("stop");
+        sqlx::query(
+            "UPDATE environment SET desired_state = 'stopped', status = 'deploying' WHERE id = ?",
+        )
+        .bind(&env.id)
+        .execute(&pool)
+        .await
+        .expect("stop");
         mark_environment_deployed(&pool, &env.id, "def5678")
             .await
             .expect("stopped deploy");

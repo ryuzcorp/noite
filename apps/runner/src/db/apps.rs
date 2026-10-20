@@ -63,12 +63,16 @@ pub async fn set_app_import_source(
 
 pub async fn list_apps(pool: &SqlitePool) -> sqlx::Result<Vec<App>> {
     let sql = format!("SELECT {APP_COLS} FROM app ORDER BY created_at DESC");
-    sqlx::query_as::<_, App>(sqlx::AssertSqlSafe(sql)).fetch_all(pool).await
+    sqlx::query_as::<_, App>(sqlx::AssertSqlSafe(sql))
+        .fetch_all(pool)
+        .await
 }
 
 pub async fn list_all_apps(pool: &SqlitePool) -> sqlx::Result<Vec<App>> {
     let sql = format!("SELECT {APP_COLS} FROM app ORDER BY created_at ASC");
-    sqlx::query_as::<_, App>(sqlx::AssertSqlSafe(sql)).fetch_all(pool).await
+    sqlx::query_as::<_, App>(sqlx::AssertSqlSafe(sql))
+        .fetch_all(pool)
+        .await
 }
 
 pub async fn get_app(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<App>> {
@@ -385,11 +389,7 @@ pub async fn update_app_status(
 /// Record a deploy's sha without touching the observed status: a deploy that
 /// lands while the app is stopped still counts for tip dedup, but must not
 /// flip the status back to running.
-pub async fn record_app_deploy_sha(
-    pool: &SqlitePool,
-    id: &str,
-    sha: &str,
-) -> sqlx::Result<()> {
+pub async fn record_app_deploy_sha(pool: &SqlitePool, id: &str, sha: &str) -> sqlx::Result<()> {
     sqlx::query("UPDATE app SET last_deploy_sha = COALESCE(?, last_deploy_sha), updated_at = ? WHERE id = ?")
         .bind(sha)
         .bind(now_iso())
@@ -505,14 +505,10 @@ mod tests {
             .await
             .expect("stopped flip");
         assert!(!flipped, "a stop in the window wins over running");
-        let failed = update_app_status_if_wanted(
-            &pool,
-            "a",
-            AppStatus::Failed.as_str(),
-            Some("boom"),
-        )
-        .await
-        .expect("stopped fail");
+        let failed =
+            update_app_status_if_wanted(&pool, "a", AppStatus::Failed.as_str(), Some("boom"))
+                .await
+                .expect("stopped fail");
         assert!(!failed, "a stop in the window wins over failed");
 
         let app = get_app(&pool, "a").await.expect("get").expect("row");

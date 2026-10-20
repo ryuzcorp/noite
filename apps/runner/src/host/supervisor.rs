@@ -65,6 +65,35 @@ pub fn new_procs() -> ProcMap {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// What became of a fleet a caller was waiting on.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FleetFate {
+    /// Gone from the map: a stop or a teardown took it on purpose.
+    Removed,
+    /// celld exited on its own (still in the map until the next ensure).
+    Exited(String),
+}
+
+/// Resolve once the fleet under `key` is no longer a live child. A waiter
+/// that holds a claim (a deploy on the health gate) races this, so the claim
+/// never outlives the fleet it waits on.
+pub async fn fleet_gone(procs: &ProcMap, key: &str) -> FleetFate {
+    loop {
+        {
+            let mut map = procs.lock().await;
+            let Some(child) = map.get_mut(key) else {
+                return FleetFate::Removed;
+            };
+            match child.try_wait() {
+                Ok(None) => {}
+                Ok(Some(status)) => return FleetFate::Exited(status.to_string()),
+                Err(e) => return FleetFate::Exited(format!("{e}")),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// Stop one tenant fleet. The docs are explicit: celld shuts down gracefully
 /// on SIGTERM/SIGINT (cancel work, prove durability, release leases, seal
 /// the node log). SIGKILL only as a bounded fallback — delivered to the whole
@@ -655,5 +684,42 @@ mod tests {
             crate::testutil::wait_for_cmdline_gone(marker, Duration::from_secs(5)).await,
             "stopped fleet left a worker behind (sleep {marker} still live 5s after the group kill)"
         );
+    }
+
+    /// A deploy waiting on the health gate must let go when its fleet does:
+    /// a stop resolves as Removed (the deploy completes, a queued delete gets
+    /// the claim), a crash as Exited with its status (the deploy fails fast),
+    /// and a live fleet keeps the waiter waiting.
+    #[tokio::test]
+    async fn fleet_gone_tells_a_stop_from_a_crash() {
+        let procs = new_procs();
+        let live = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleeper");
+        procs.lock().await.insert("live".into(), live);
+        let still =
+            tokio::time::timeout(Duration::from_millis(600), fleet_gone(&procs, "live")).await;
+        assert!(still.is_err(), "a live fleet keeps the waiter waiting");
+
+        let stopper = {
+            let procs = procs.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                stop_fleet(&procs, "live").await;
+            })
+        };
+        assert_eq!(fleet_gone(&procs, "live").await, FleetFate::Removed);
+        stopper.await.expect("stopper");
+
+        let crashed = Command::new("sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .expect("spawn crasher");
+        procs.lock().await.insert("crashed".into(), crashed);
+        let FleetFate::Exited(why) = fleet_gone(&procs, "crashed").await else {
+            panic!("a crashed fleet is Exited, not Removed");
+        };
+        assert!(why.contains('3'), "{why}");
     }
 }

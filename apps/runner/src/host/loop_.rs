@@ -185,8 +185,7 @@ async fn reconcile_once(
                 Err(e) => {
                     tracing::warn!(slug = %app.slug, error = %e, "ensure_fleet");
                     let msg = format!("{e:#}");
-                    db::update_app_status_if_wanted(pool, &app.id, &app.status, Some(&msg))
-                        .await?;
+                    db::update_app_status_if_wanted(pool, &app.id, &app.status, Some(&msg)).await?;
                 }
             }
         }

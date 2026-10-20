@@ -154,13 +154,12 @@ pub async fn upsert_deploy(
 ) -> sqlx::Result<String> {
     let ts = now_iso();
     if let Some(id) = id {
-        if let Some(existing) =
-            sqlx::query_as::<_, Deploy>(sqlx::AssertSqlSafe(format!(
-                "SELECT {DEPLOY_COLS} FROM deploy WHERE id = ?"
-            )))
-                .bind(id)
-                .fetch_optional(pool)
-                .await?
+        if let Some(existing) = sqlx::query_as::<_, Deploy>(sqlx::AssertSqlSafe(format!(
+            "SELECT {DEPLOY_COLS} FROM deploy WHERE id = ?"
+        )))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
         {
             // Keep the tail — deploy logs grow with every push and the UI
             // collapsible must stay cheap.
@@ -216,13 +215,8 @@ async fn apply_status(
         if status == "success" {
             if let Some(sha) = sha {
                 record_app_deploy_sha(pool, app_id, sha).await?;
-                update_app_status_if_wanted(
-                    pool,
-                    app_id,
-                    AppStatus::Running.as_str(),
-                    None,
-                )
-                .await?;
+                update_app_status_if_wanted(pool, app_id, AppStatus::Running.as_str(), None)
+                    .await?;
             }
         } else if status == "failed" {
             update_app_status_if_wanted(

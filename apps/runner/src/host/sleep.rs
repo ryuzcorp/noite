@@ -42,7 +42,9 @@ fn wake_slots(cfg: &Config) -> &'static Semaphore {
 }
 
 fn lock_for(app_id: &str) -> Arc<Mutex<()>> {
-    let mut map = LOCKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut map = LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     map.entry(app_id.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
@@ -562,7 +564,9 @@ mod tests {
     async fn confirm_marks_running_only_while_wanted() {
         let mut cfg = crate::config::config_for_tests();
         cfg.wake_timeout_s = 1;
-        let pool = crate::db::connect("sqlite::memory:").await.expect("memory db");
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
         let app = crate::db::create_app(
             &pool,
             &cfg,
@@ -580,8 +584,7 @@ mod tests {
         crate::db::update_app_status(&pool, &app.id, "deploying", None, None)
             .await
             .expect("deploying");
-        let confirming: Confirming =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let confirming: Confirming = Arc::new(Mutex::new(std::collections::HashSet::new()));
 
         confirm_app_running(&pool, &cfg, &confirming, &app.id, healthy_port().await).await;
         let fresh = crate::db::get_app(&pool, &app.id)
