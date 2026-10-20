@@ -124,7 +124,10 @@ export interface EditorPane {
   /** Open `path`; answers whether the pane shows it at all (`false` for a
    * folder row, or a path neither the pod nor the commit has a file at). */
   openFile: (path: string, caret?: IntelPosition) => Promise<boolean>;
-  placeCaret: (position: IntelPosition) => void;
+  /** Hand the caret back to `path` after something else took focus (the tree
+   * row a New File names grabs it as the rename lands), unless the user has
+   * typed since the file opened. */
+  reclaimCaret: (path: string, caret: IntelPosition) => void;
   /** Re-sync the worker from scratch (a push changed the repo). */
   resetIntel: () => void;
   startedIntel: () => boolean;
@@ -150,6 +153,15 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
    * writes is still landing comes back with bytes older than the editor, and
    * repainting from them would drop the keystroke that is in them. */
   const pendingWrites = new Map<string, string>();
+  /** Edits the user has made in this pane. A caret the pane was asked for
+   * lands only if no edit happened since it was asked for: Playwright and
+   * people alike type between frames, and a caret placed after the first
+   * keystroke sends the rest of the typing in front of it (`xport const
+   * extra = 1;e` in a new file). */
+  let edits = 0;
+  /** `edits` as of the open file's last paint, or a re-open nobody typed
+   * through. */
+  let editsAtOpen = 0;
   // The open file's change, in the code header beside its name: pierre renders
   // the header from a shadow root with a slot for it, and the chip rides along
   // as light DOM. It reads the same workspace changes the tree marks from, so
@@ -225,6 +237,8 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
     if (path === null || !currentEditable) {
       return;
     }
+
+    edits += 1;
 
     const text = editor.getText();
     liveText.set(path, text);
@@ -344,6 +358,7 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
   const paint = (path: string, show: Show, caret?: IntelPosition) => {
     beginPreview(path);
     currentEditable = show.editable;
+    editsAtOpen = edits;
     shown = {
       contents: show.contents,
       editable: show.editable,
@@ -416,6 +431,7 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
 
     activePreview += 1;
     const previewToken = activePreview;
+    const editsAtCall = edits;
     opening = path;
 
     try {
@@ -433,14 +449,25 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
       // selection follows the open, and a move re-keys the open file without
       // repainting it. Painting that again would rebuild the same document for
       // nothing (and take the caret's place with it), so only the deep link
-      // and the caret asked for here are applied.
-      if (shows(path, show)) {
+      // and the caret asked for here are applied. The same holds while one of
+      // the pane's own writes to it is landing: the read is older than the
+      // editor (see `syncOpen`), and painting it would drop the keystrokes in
+      // that write. A caret asked for before the user typed in this document
+      // is stale.
+      if (
+        shows(path, show) ||
+        (path === currentPath && pendingWrites.has(path))
+      ) {
         if (host.file() !== path) {
           host.file.set(path);
         }
 
-        if (caret) {
-          intel.placeCaret(caret);
+        if (edits === editsAtCall) {
+          editsAtOpen = edits;
+
+          if (caret) {
+            intel.placeCaret(caret);
+          }
         }
 
         return true;
@@ -625,6 +652,12 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
     editor.cleanUp();
   };
 
+  const reclaimCaret = (path: string, caret: IntelPosition) => {
+    if (path === currentPath && edits === editsAtOpen) {
+      intel.placeCaret(caret);
+    }
+  };
+
   return {
     cleanUp,
     dispose,
@@ -632,8 +665,8 @@ export const createEditorPane = (host: EditorHost): EditorPane => {
     followMove,
     getCurrentPath: () => currentPath,
     openFile,
-    placeCaret: intel.placeCaret,
     rebase,
+    reclaimCaret,
     resetIntel: intel.reset,
     startedIntel: intel.started,
     syncOpen,
