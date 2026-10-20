@@ -8,6 +8,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`install --pre` installs the newest release again.** It took the first entry of GitHub's release list, which puts the release marked Latest ahead of newer pre-releases, so it installed 0.1.0-alpha.6 instead of 0.1.0-alpha.7. It now picks the most recently published release. `run.sh` is served from noite.now, so the fix applies without a new image.
+
 ## [0.1.0-alpha.7] - 2026-10-20
 
 Fixes the Deployment logs pane alpha.6 shipped broken, makes every live panel recover on its own and share one connection per page, and makes "Running" mean the app actually serves.
