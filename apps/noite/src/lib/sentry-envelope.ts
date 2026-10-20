@@ -1,17 +1,9 @@
 /**
  * Sentry envelope parsing for the browser-error ingest (ROADMAP, Error
- * tracking phase 2). Pure: the envelope route reads the (possibly gzipped)
- * body and hands its text here; this module splits the newline-delimited
- * envelope, keeps `event` items and names everything else dropped (sessions,
- * transactions/spans, replays, profiles, attachments, client reports, ...),
- * so the route answers those with a 200 and the SDK never retries them.
- *
- * Envelope shape (verified against `@sentry/browser` 11.8.0 wire bytes in
- * `sentry-fixtures/`): a JSON header line, then per item a JSON header line
- * plus one JSON payload line. An item header may carry `length` (attachments
- * and span batches); those lines are skipped by byte count, never parsed.
- * A line that is not JSON is skipped, never fatal — only a broken envelope
- * header rejects the whole body.
+ * tracking phase 2): split a Sentry envelope body into stored `event` items
+ * mapped onto the runner's `errors.ingest` shape, plus dropped item types.
+ * Every field is schema-guarded at this boundary: unknown wire JSON narrows
+ * to `Wire`/`WireValue` before anything is read.
  */
 
 const MAX_TEXT = 2000;
@@ -48,31 +40,68 @@ export interface ParsedEnvelope {
   events: SentryEventItem[];
 }
 
-/** A JSON value read from the wire: unknown until a guard narrows it. */
-type Wire = Record<string, unknown>;
+/** A JSON value read from the wire: primitives, arrays, or string-keyed objects. */
+type WireValue = string | number | boolean | null | WireValue[] | Wire;
 
-/* oxlint-disable anti-slop/no-runtime-typeof -- the envelope boundary: every field is checked here before it is read, and nothing unguarded escapes. */
-const isWire = (value: unknown): value is Wire =>
+/** A JSON object read from the wire: every value narrows via a guard below. */
+interface Wire {
+  [key: string]: WireValue;
+}
+
+/** A wire value holding a JSON object (arrays excluded: they are lists). */
+const isWire = (value: WireValue): value is Wire =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
+/** A wire value holding text. */
+const isTextValue = (value: WireValue): value is string =>
+  typeof value === "string";
+
+/** A wire value holding a number. */
+const isNumberValue = (value: WireValue): value is number =>
+  typeof value === "number";
+
+/** Read a string field: anything unexpected decodes to empty. */
 const wireString = (node: Wire, key: string): string => {
-  const value = node[key];
+  const value: WireValue = node[key];
 
-  return typeof value === "string" ? value : "";
+  return isTextValue(value) ? value : "";
 };
 
+/** Read a finite-number field: anything unexpected decodes to null. */
 const wireNumber = (node: Wire, key: string): number | null => {
-  const value = node[key];
+  const value: WireValue = node[key];
 
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+  return isNumberValue(value) && Number.isFinite(value) ? value : null;
 };
 
-const wireArray = (node: Wire, key: string): unknown[] => {
-  const value = node[key];
+/** Read a list field: anything unexpected decodes to empty. */
+const wireList = (node: Wire, key: string): WireValue[] => {
+  const value: WireValue = node[key];
 
   return Array.isArray(value) ? value : [];
 };
-/* oxlint-enable anti-slop/no-runtime-typeof */
+
+/** Read a child object field: anything unexpected decodes to null. */
+const parseWireChild = (node: Wire, key: string): Wire | null => {
+  const child: WireValue = node[key];
+
+  return isWire(child) ? child : null;
+};
+
+/** A string field with envelope-trace fallback (release, environment). */
+const firstString = (
+  primary: Wire,
+  fallback: Wire | null,
+  key: string
+): string => {
+  const direct = wireString(primary, key);
+
+  if (direct !== "") {
+    return direct;
+  }
+
+  return fallback === null ? "" : wireString(fallback, key);
+};
 
 /** The `sentry_key` of an `X-Sentry-Auth` header (`Sentry sentry_key=.., ..`). */
 export const parseSentryAuth = (header: string | null): string | null => {
@@ -101,9 +130,30 @@ export const parseSentryAuth = (header: string | null): string | null => {
   return null;
 };
 
+/** Prefix shared by every Sentry JavaScript SDK build name. */
+const BROWSER_SDK_PREFIX = "sentry.javascript.";
+
 /** Frontend SDK families: their `javascript`-platform events broke in a browser tab. */
-const BROWSER_SDK =
-  /sentry\.javascript\.(angular|astro|browser|ember|gatsby|react|solid|svelte|vue)/u;
+const BROWSER_SDK_SUFFIXES = {
+  angular: true,
+  astro: true,
+  browser: true,
+  ember: true,
+  gatsby: true,
+  react: true,
+  solid: true,
+  svelte: true,
+  vue: true,
+} satisfies Record<string, true>;
+
+/** Whether an SDK name is a browser build (exact family, no substring match). */
+const isBrowserSdkName = (sdkName: string): boolean => {
+  if (!sdkName.startsWith(BROWSER_SDK_PREFIX)) {
+    return false;
+  }
+
+  return sdkName.slice(BROWSER_SDK_PREFIX.length) in BROWSER_SDK_SUFFIXES;
+};
 
 /** `filename:line:col` from a Sentry frame (any part may be missing). */
 const frameLocation = (frame: Wire): string => {
@@ -120,7 +170,8 @@ const frameLocation = (frame: Wire): string => {
     : `${filename}:${lineno}:${colno}`;
 };
 
-const mapFrame = (frame: unknown): SentryFrame => {
+/** One wire frame onto the runner shape: non-objects decode to empty. */
+const parseFrame = (frame: WireValue): SentryFrame => {
   if (!isWire(frame)) {
     return { function: "", inApp: false, location: "" };
   }
@@ -134,15 +185,119 @@ const mapFrame = (frame: unknown): SentryFrame => {
 
 /** The primary exception: Sentry chains causes in `values`, last is newest. */
 const primaryException = (payload: Wire): Wire | null => {
-  const { exception } = payload;
+  const exception = parseWireChild(payload, "exception");
 
-  if (!isWire(exception)) {
+  if (exception === null) {
     return null;
   }
 
-  const values = wireArray(exception, "values").filter(isWire);
+  const values = wireList(exception, "values").filter(isWire);
+  const last: Wire | undefined = values.at(-1);
 
-  return values.length > 0 ? (values.at(-1) as Wire) : null;
+  return last ?? null;
+};
+
+/** The exception slice of an event: kind, message, and stack frames. */
+interface ExceptionPart {
+  frames: SentryFrame[];
+  kind: string;
+  message: string;
+}
+
+/** Narrow an event payload onto its exception slice. */
+const parseExceptionPart = (payload: Wire): ExceptionPart => {
+  const exception = primaryException(payload);
+
+  if (exception === null) {
+    return {
+      frames: [],
+      kind: "Message",
+      message: clip(wireString(payload, "message")),
+    };
+  }
+
+  const stacktrace = parseWireChild(exception, "stacktrace");
+
+  return {
+    frames:
+      stacktrace === null
+        ? []
+        : wireList(stacktrace, "frames").map((frame) => parseFrame(frame)),
+    kind: clip(wireString(exception, "type") || "Message"),
+    message: clip(
+      wireString(exception, "value") || wireString(payload, "message")
+    ),
+  };
+};
+
+/** The request slice of an event: page URL and user agent. */
+interface RequestPart {
+  url: string;
+  userAgent: string;
+}
+
+/** Narrow an event payload onto its request slice. */
+const parseRequestPart = (payload: Wire): RequestPart => {
+  const request = parseWireChild(payload, "request");
+  const headers = request === null ? null : parseWireChild(request, "headers");
+  const rawUrl = request === null ? "" : wireString(request, "url");
+
+  // The page URL with its query and fragment stripped: they can carry tokens
+  // and would split one page's errors across issues.
+  const url = rawUrl.split("?", 1)[0]?.split("#", 1)[0] ?? "";
+
+  return {
+    url: clip(url),
+    userAgent: clip(headers === null ? "" : wireString(headers, "User-Agent")),
+  };
+};
+
+/** The SDK slice of an event: SDK name and browser-vs-sdk source. */
+interface SdkPart {
+  sdkName: string;
+  source: "browser" | "sdk";
+}
+
+/** Narrow an event payload onto its SDK slice. */
+const parseSdkPart = (payload: Wire): SdkPart => {
+  const sdk = parseWireChild(payload, "sdk");
+  const sdkName = sdk === null ? "" : wireString(sdk, "name");
+
+  // `browser` for browser SDK events (platform `javascript` + browser SDK
+  // name), `sdk` for everything else (server SDKs, mobile, workers).
+  if (
+    wireString(payload, "platform") === "javascript" &&
+    isBrowserSdkName(sdkName)
+  ) {
+    return { sdkName, source: "browser" };
+  }
+
+  return { sdkName, source: "sdk" };
+};
+
+/** The envelope slice of an event: fallbacks shared with the header trace. */
+interface IdentityPart {
+  environment: string;
+  release: string;
+  timestampUs: number;
+  traceId: string;
+}
+
+/** Narrow an event payload plus envelope header onto the shared slice. */
+const parseIdentityPart = (
+  payload: Wire,
+  envelopeHeader: Wire
+): IdentityPart => {
+  const trace = parseWireChild(envelopeHeader, "trace");
+  const timestamp = wireNumber(payload, "timestamp");
+
+  return {
+    environment: clip(firstString(payload, trace, "environment")),
+    release: clip(firstString(payload, trace, "release")),
+    timestampUs: timestamp === null ? 0 : Math.round(timestamp * 1_000_000),
+    traceId:
+      wireString(envelopeHeader, "event_id") || wireString(payload, "event_id"),
+  };
 };
 
 /** One `event` payload onto the runner shape (query stripped at this boundary). */
@@ -150,74 +305,36 @@ export const mapSentryEvent = (
   payload: Wire,
   envelopeHeader: Wire
 ): SentryEventItem => {
-  const exception = primaryException(payload);
-  const stacktrace =
-    exception !== null && isWire(exception["stacktrace"])
-      ? (exception["stacktrace"] as Wire)
-      : null;
-  const request = isWire(payload["request"])
-    ? (payload["request"] as Wire)
-    : null;
-  const headers =
-    request !== null && isWire(request["headers"])
-      ? (request["headers"] as Wire)
-      : null;
-  const sdk = isWire(payload["sdk"]) ? (payload["sdk"] as Wire) : null;
-  const trace = isWire(envelopeHeader["trace"])
-    ? (envelopeHeader["trace"] as Wire)
-    : null;
-  const sdkName = sdk === null ? "" : wireString(sdk, "name");
-  const timestamp = wireNumber(payload, "timestamp");
-
-  // `browser` for browser SDK events (platform `javascript` + browser SDK
-  // name), `sdk` for everything else (server SDKs, mobile, workers).
-  const source =
-    wireString(payload, "platform") === "javascript" &&
-    BROWSER_SDK.test(sdkName)
-      ? "browser"
-      : "sdk";
-
-  // The page URL with its query and fragment stripped: they can carry tokens
-  // and would split one page's errors across issues.
-  const rawUrl = request === null ? "" : wireString(request, "url");
-  const url = rawUrl.split("?", 1)[0]?.split("#", 1)[0] ?? "";
+  const exception = parseExceptionPart(payload);
+  const request = parseRequestPart(payload);
+  const sdk = parseSdkPart(payload);
+  const identity = parseIdentityPart(payload, envelopeHeader);
 
   return {
-    environment: clip(
-      wireString(payload, "environment") ||
-        wireString(trace ?? {}, "environment")
-    ),
-    frames:
-      stacktrace === null ? [] : wireArray(stacktrace, "frames").map(mapFrame),
-    kind: clip(
-      (exception === null ? "" : wireString(exception, "type")) || "Message"
-    ),
-    message: clip(
-      (exception === null ? "" : wireString(exception, "value")) ||
-        wireString(payload, "message")
-    ),
-    release: clip(
-      wireString(payload, "release") || wireString(trace ?? {}, "release")
-    ),
-    sdkName,
-    source,
-    timestampUs: timestamp === null ? 0 : Math.round(timestamp * 1_000_000),
-    traceId:
-      wireString(envelopeHeader, "event_id") || wireString(payload, "event_id"),
-    url: clip(url),
-    userAgent: clip(headers === null ? "" : wireString(headers, "User-Agent")),
+    environment: identity.environment,
+    frames: exception.frames,
+    kind: exception.kind,
+    message: exception.message,
+    release: identity.release,
+    sdkName: sdk.sdkName,
+    source: sdk.source,
+    timestampUs: identity.timestampUs,
+    traceId: identity.traceId,
+    url: request.url,
+    userAgent: request.userAgent,
   };
 };
 
+/** Parse one envelope line: blank lines and non-objects decode to null. */
 const parseJsonLine = (line: string): Wire | null => {
   const trimmed = line.trim();
 
-  if (!trimmed) {
+  if (trimmed === "") {
     return null;
   }
 
   try {
-    const parsed: unknown = JSON.parse(trimmed);
+    const parsed: WireValue = JSON.parse(trimmed);
 
     return isWire(parsed) ? parsed : null;
   } catch {

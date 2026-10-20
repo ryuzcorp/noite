@@ -10,8 +10,8 @@
 //! is empty here and the query-strip mapping is asserted on a synthetic
 //! event object (mapping input, not envelope shape).
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import fs from "node:fs";
+import path from "node:path";
 
 import {
   mapSentryEvent,
@@ -20,7 +20,7 @@ import {
 } from "./sentry-envelope";
 
 const fixture = (name: string): string =>
-  readFileSync(join(import.meta.dir, "sentry-fixtures", name), "utf-8");
+  fs.readFileSync(path.join(import.meta.dir, "sentry-fixtures", name), "utf-8");
 
 describe("parseSentryEnvelope on real SDK bytes", () => {
   test("an exception envelope yields one browser event, oldest-first", () => {
