@@ -31,9 +31,14 @@ for arg in "$@"; do
   if [[ "$name" == install && "$arg" == --pre ]]; then pre=1; else args+=("$arg"); fi
 done
 if ((pre)); then
-  # Newest first, drafts excluded; GitHub lists pre-releases with the rest.
-  tag=$(curl -fsS --max-time 10 "https://api.github.com/repos/ryuzcorp/noite/releases?per_page=1" |
-    grep -o '"tag_name": *"[^"]*"' | head -n 1 | cut -d '"' -f 4) || tag=""
+  # The newest published release, pre-releases included. GitHub's list order
+  # is not "newest first": a release marked Latest comes ahead of newer
+  # pre-releases, so the first entry installed the old release. Pick by
+  # published_at instead (drafts have none and never show unauthenticated).
+  tag=$(curl -fsS --max-time 10 "https://api.github.com/repos/ryuzcorp/noite/releases?per_page=30" |
+    grep -o -E '"(tag_name|published_at)": *"[^"]*"' |
+    awk -F'"' '$2 == "tag_name" { tag = $4 } $2 == "published_at" { print $4, tag }' |
+    sort -r | awk 'NR == 1 { print $2 }') || tag=""
   [[ "$tag" == v* ]] || { echo "--pre: could not find the newest release on GitHub" >&2; exit 1; }
   echo "--pre: installing ${tag} (image ${NOITE_VERSION:-${tag#v}})" >&2
   NOITE_REF="${NOITE_REF:-$tag}"
