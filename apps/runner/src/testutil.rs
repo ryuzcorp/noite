@@ -56,3 +56,21 @@ pub fn live_cmdline_has(marker: &str) -> bool {
         .filter_map(|entry| std::fs::read(entry.path().join("cmdline")).ok())
         .any(|raw| String::from_utf8_lossy(&raw).contains(marker))
 }
+
+/// Poll until no live process carries `marker`, up to `timeout`. A single
+/// /proc scan right after a group SIGKILL races the kernel: the killed
+/// grandchild keeps its cmdline until its exit finishes tearing down its
+/// address space, so an immediate scan can still see it. Returns true once
+/// the marker is gone.
+pub async fn wait_for_cmdline_gone(marker: &str, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if !live_cmdline_has(marker) {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}

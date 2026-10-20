@@ -531,8 +531,8 @@ mod tests {
         .expect_err("sleep must hit the timeout");
         assert!(err.to_string().contains("command timeout"), "{err:#}");
         assert!(
-            !crate::testutil::live_cmdline_has(marker),
-            "timed-out step left a grandchild behind"
+            crate::testutil::wait_for_cmdline_gone(marker, Duration::from_secs(5)).await,
+            "timed-out step left a grandchild behind (sleep {marker} still live 5s after the group kill)"
         );
     }
 }
