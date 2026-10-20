@@ -2,10 +2,12 @@ import "@fontsource-variable/geist";
 import "@fontsource-variable/geist-mono";
 import "../app.css";
 import { SidebarApps, sidebarPlace } from "$lib/apps/sidebar";
+import { AppStateSyncSlot } from "$lib/apps/state-sync";
 import { authClient } from "$lib/auth-client";
 import { Authed } from "$lib/auth/authed";
 import { Onboarding } from "$lib/auth/onboarding";
 import { invalidateSession } from "$lib/auth/session";
+import { CONTROL_APP_ID } from "$lib/control-app";
 import { session } from "$lib/resources";
 import { provideQueryCell } from "$lib/search-param";
 import { Avatar } from "$lib/ui/avatar";
@@ -297,6 +299,11 @@ export default function DashboardLayout({ children }: { children?: View }) {
           {children}
         </div>
       </div>
+      {/* The open app's status badges follow its state stream (see
+          $lib/apps/state-sync); the control plane has its own page. */}
+      {activeAppId !== null && activeAppId !== CONTROL_APP_ID ? (
+        <AppStateSyncSlot appId={activeAppId} />
+      ) : null}
       <Onboarding />
     </Authed>
   );

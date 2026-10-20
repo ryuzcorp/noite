@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  appStateUrl,
   applistUrl,
   deploysUrl,
   errorsUrl,
@@ -19,6 +20,7 @@ import {
 } from "./stream-hub";
 import type { TopicRoute } from "./stream-hub";
 import {
+  handleAppStateStream,
   handleAppsStream,
   handleDeploysStream,
   handleErrorsStream,
@@ -102,13 +104,14 @@ describe("matchTopic", () => {
       [logsUrl("app_1"), handleLogsStream],
       [logsUrl("app_1", "env_1"), handleLogsStream],
       [metricsUrl("app_1", 24), handleMetricsStream],
+      [appStateUrl("app_1"), handleAppStateStream],
     ];
 
     for (const [topic, handler] of cases) {
       expect(matchTopic(topic)?.handler).toBe(handler);
     }
 
-    expect(TOPIC_ROUTES).toHaveLength(6);
+    expect(TOPIC_ROUTES).toHaveLength(7);
   });
 
   test("hands the handler a decoded app id, like the router does", () => {

@@ -2,6 +2,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  appStateUrl,
   applistUrl,
   deploysUrl,
   errorsUrl,
@@ -50,6 +51,7 @@ describe("timeoutExempt", () => {
       logsUrl("app_1"),
       logsUrl("app_1", "env_1"),
       metricsUrl("app_1", 24),
+      appStateUrl("app_1"),
       eventsUrl("app_1", "deploys", 50),
       streamHubUrl([logsUrl("app_1"), deploysUrl("app_1")]),
     ];

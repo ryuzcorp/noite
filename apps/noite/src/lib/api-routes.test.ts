@@ -9,6 +9,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
 import {
+  appStateUrl,
   applistUrl,
   deploysUrl,
   errorsUrl,
@@ -207,6 +208,7 @@ describe("api routes exist", () => {
       metricsUrl("app_1", 24),
       metricsUrl("app_1", 168),
       metricsUrl("app_1", 720),
+      appStateUrl("app_1"),
       eventsUrl("app_1", "deploys", 50),
       eventsUrl("app_1", "", 20),
       // Every feed above reaches the browser through the page's one hub

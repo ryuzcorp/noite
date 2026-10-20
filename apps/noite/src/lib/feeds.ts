@@ -8,6 +8,7 @@ import type { AtomHandle } from "ilha";
 
 import type {
   ErrorStatus,
+  RunnerAppState,
   RunnerDeploy,
   RunnerErrorList,
   RunnerEvent,
@@ -366,10 +367,13 @@ export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
 
 let pageHub: StreamHub | undefined;
 
+/** A live panel's feed. `persist: false` keeps its snapshots in memory only,
+ * for a feed the UI never paints (see `writeSwr`). */
 export const liveFeed = <T>(
   key: string,
   url: string,
-  decode: (raw: string) => T
+  decode: (raw: string) => T,
+  opts?: { persist?: boolean }
 ): LiveFeed<T> => {
   // oxlint-disable-next-line unicorn/no-useless-undefined -- the feed starts valueless; undefined is the seed
   const latest = atom<T | undefined>(undefined);
@@ -393,7 +397,7 @@ export const liveFeed = <T>(
       onMessage: (data) => {
         try {
           const frame = decode(data);
-          writeSwr(key, frame);
+          writeSwr(key, frame, opts);
           latest.set(frame);
         } catch {
           // Bad frame: skip, like fromEventSource's throwing schema.
@@ -410,6 +414,7 @@ export const liveFeed = <T>(
 
 /** Snapshot keys for the live panels (one per app / channel). */
 export const feedKeys = {
+  appState: (appId: string) => `feed:${appId}:state`,
   apps: "feed:apps",
   deploys: (appId: string, environmentId = "") =>
     `feed:${appId}:deploys${environmentId === "" ? "" : `:${environmentId}`}`,
@@ -463,6 +468,11 @@ export const logsUrl = (appId: string, environmentId = ""): string =>
 /** Usage frames for one app over a `hours`-long window (24, 168 or 720). */
 export const metricsUrl = (appId: string, hours: number): string =>
   `/api/apps/${encodeURIComponent(appId)}/metrics/stream?hours=${hours}`;
+
+/** One app's row and its environments, re-sent whenever either changes:
+ * every status badge on the app's pages follows it (`lib/apps/state-sync`). */
+export const appStateUrl = (appId: string): string =>
+  `/api/apps/${encodeURIComponent(appId)}/state/stream`;
 
 /** Event snapshots for one app, scoped server-side by channel. */
 export const eventsUrl = (
@@ -523,6 +533,19 @@ export const decodeErrors = (raw: string): RunnerErrorList => {
 
   // SAFETY: issues array and counts object verified above.
   return frame as RunnerErrorList;
+};
+
+/** App state frame: the app row plus its environments. */
+export const decodeAppState = (raw: string): RunnerAppState => {
+  // SAFETY: field shapes verified below; the runner emits an AppStateFrame.
+  const frame = parseFrame(raw) as Partial<RunnerAppState> | null;
+
+  if (!frame?.app || !Array.isArray(frame.environments)) {
+    throw badFrame("state");
+  }
+
+  // SAFETY: the app row and the environments array verified above.
+  return frame as RunnerAppState;
 };
 
 /** Runtime log lines (string array). */

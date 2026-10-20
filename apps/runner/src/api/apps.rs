@@ -1,13 +1,17 @@
 //! App CRUD + health/readiness (thin adapters over `service::apps`).
+use std::time::Duration;
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde_json::json;
 
-use crate::models::{CreateApp, PatchApp, RenameApp};
+use crate::api::sse::poll_stream;
+use crate::db;
+use crate::models::{AppStateFrame, CreateApp, PatchApp, RenameApp};
 use crate::service;
 use crate::AppState;
 
@@ -165,4 +169,47 @@ pub async fn sleep_app(State(state): State<AppState>, Path(id): Path<String>) ->
         .into_response(),
         Err(e) => e.into_response(),
     }
+}
+
+/// The app's row and its environments as server-sent events, one
+/// `AppStateFrame` per message, sent only when either changed (plus
+/// keep-alive comments). Every status badge on the control UI's app pages
+/// follows it, so a deploy, a stop or a sleep shows everywhere at once.
+pub async fn app_state_stream(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let app = match service::apps::app_or_404(&state, &id).await {
+        Ok(app) => app,
+        Err(e) => return e.into_response(),
+    };
+    let pool = state.pool.clone();
+    let app_id = app.id;
+    poll_stream("state", Duration::from_secs(2), move || {
+        let pool = pool.clone();
+        let app_id = app_id.clone();
+        async move {
+            // A deleted app has nothing left to show: skip the tick, the page
+            // that holds the stream navigates away.
+            let app = match db::get_app(&pool, &app_id).await {
+                Ok(Some(app)) => app,
+                Ok(None) => return None,
+                Err(e) => {
+                    tracing::warn!(error = %e, "state stream: skipping failed snapshot");
+                    return None;
+                }
+            };
+            let environments = match db::list_environments(&pool, &app_id).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!(error = %e, "state stream: skipping failed snapshot");
+                    return None;
+                }
+            };
+            match serde_json::to_string(&AppStateFrame { app, environments }) {
+                Ok(json) => Some(json),
+                Err(e) => {
+                    tracing::warn!(error = %e, "state stream: dropping unserializable snapshot");
+                    None
+                }
+            }
+        }
+    })
 }
