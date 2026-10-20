@@ -13,8 +13,7 @@ import {
   deleteApp,
   mintApiKey,
   pushAppDir,
-  readInviteCode,
-  registerInviteeAccount,
+  registerInviteeWithFreshCode,
   runnerApi,
   runnerCall,
   waitForDeploy,
@@ -457,16 +456,14 @@ test("require_pr rejects a push-role push to main while an admin push lands", as
 
   // A second account joins as a push collaborator. It gets its invite code
   // from the e2e account's Account page, registers with it, then the e2e
-  // admin invites the address and it accepts.
+  // admin invites the address and it accepts. The read-plus-redeem is locked
+  // across workers: codes are single-use, so parallel redeems would collide.
   const email = `push-user-${Date.now()}@example.com`;
-  const inviteCode = await readInviteCode(page);
 
-  const invitee = await registerInviteeAccount(
-    browser,
-    inviteCode,
+  const invitee = await registerInviteeWithFreshCode(browser, page, {
     email,
-    "Push User"
-  );
+    name: "Push User",
+  });
 
   contexts.push(invitee.context);
   const pushKey = await mintApiKey(invitee.page, `${slug}-push`);

@@ -40,6 +40,8 @@ help:
 	@echo "  make usage     cost harness: stats delta over WINDOW s (default 600)"
 	@echo "  make e2e       pre-release lane: image + doctor + Playwright (TAG=<sha> pulls GHCR)"
 	@echo "  make e2e-isolation  the same lane in multi-tenant mode + hostile-tenant spec"
+	@echo "    lane knobs: E2E_WORKERS=3 (spec files in parallel), E2E_IMAGE=<tag>"
+	@echo "      (prebuilt image, no build), E2E_KEEP=1 (leave the stack up)"
 	@echo "  make backup    consistent backup of both volumes (brief downtime)"
 	@echo "  make restore   restore a backup directory (FROM=<dir>; replaces volumes)"
 	@echo "  make down      stop (keeps volumes)"

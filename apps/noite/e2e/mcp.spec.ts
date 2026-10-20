@@ -8,8 +8,7 @@ import {
   deleteApp,
   mintApiKey,
   pushAppDir,
-  readInviteCode,
-  registerInviteeAccount,
+  registerInviteeWithFreshCode,
   runnerCall,
 } from "./helpers";
 
@@ -335,15 +334,13 @@ test("a wrong key is refused and another account's app is denied", async ({
   // The lane's account bootstrapped the instance, so it is the instance admin:
   // an agent key on it resolves a role on every app, exactly as the UI does
   // (docs/reference/mcp). The denial has to come from a plain account's key —
-  // register one with an invite code the admin's Account page hands out.
-  const inviteCode = await readInviteCode(page);
-
-  const invitee = await registerInviteeAccount(
-    browser,
-    inviteCode,
-    `mcp-denied-${Date.now()}@example.com`,
-    "MCP Denied"
-  );
+  // register one with an invite code the admin's Account page hands out. The
+  // read-plus-redeem is locked across workers: codes are single-use, so
+  // parallel redeems would collide.
+  const invitee = await registerInviteeWithFreshCode(browser, page, {
+    email: `mcp-denied-${Date.now()}@example.com`,
+    name: "MCP Denied",
+  });
 
   const key = await mintApiKey(invitee.page, "mcp-e2e-denied");
   await invitee.context.close();

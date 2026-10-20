@@ -13,9 +13,14 @@
 # Usage:
 #   make e2e                       build the image from the tree, then test
 #   TAG=<short-sha> make e2e       pull that release from GHCR instead
+#   E2E_IMAGE=<tag> make e2e       test a prebuilt local image, no build
+#                                  (CI builds each lane's image with buildx
+#                                  and hands it to compose this way)
 #   E2E_TENANCY=multi make e2e     isolation lane: multi-tenant mode and the
 #                                  hostile-tenant spec (E2E_HOSTILE=1)
 #   E2E_KEEP=1 make e2e            leave the stack running afterwards (debug)
+#   E2E_WORKERS=3 make e2e         Playwright workers (default 3; files run in
+#                                  parallel, tests within a file stay serial)
 #   E2E_SPECS="e2e/forge.spec.ts e2e/prs.spec.ts" make e2e
 #                                  run only those spec files (the setup project
 #                                  still runs first); quick to check one fix
@@ -32,8 +37,12 @@ command -v bun >/dev/null 2>&1 || {
 }
 
 TAG="${TAG:-}"
+E2E_IMAGE="${E2E_IMAGE:-}"
 FILES="-f docker/compose.yaml -f docker/compose.e2e.yaml"
-if [ -n "$TAG" ]; then
+if [ -n "$E2E_IMAGE" ]; then
+  export NOITE_IMAGE="$E2E_IMAGE"
+  UP_FLAGS=""
+elif [ -n "$TAG" ]; then
   export NOITE_IMAGE="ghcr.io/ryuzcorp/noite:${TAG}"
   UP_FLAGS="--pull always"
 else
