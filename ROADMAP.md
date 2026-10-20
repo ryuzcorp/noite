@@ -32,14 +32,14 @@ No cloud version: every alpha user runs their own install. The bar moves from "t
 - `CONTRIBUTING.md`, issue templates asking for `make doctor` output, a community channel.
 - A restore drill for BYO S3 and Railway installs, where `make backup` does not apply.
 
-### Error tracking, phase 2: Sentry-compatible ingest
+### Error tracking, phase 2: Sentry-compatible ingest (shipped)
 
 **Phase 1 (shipped, 2026-09-30):** errors with no SDK. The telemetry ingest groups failed spans (`error`: `rejected: Name: msg [at f (worker.js:1:2) <- …]`) and `ERROR …` log bodies that carry a stack (`console.error(err)`, rejected `waitUntil`) into issues (`host/errors.rs`, `metrics.app_error_*`). Tenant sites stamp a `traceparent` and log its id, so each occurrence carries its request (method, query-less path, status, device). The Errors tab lists, details and triages them (resolve / ignore / reopen, regressed on recurrence). What phase 1 cannot see: anything thrown in the browser.
 
-**Phase 2** takes errors from a stock Sentry SDK by pointing its DSN at Noite. Sentry is an ingest _format_ here, not a dependency: events land in the same issues, grouping and tab as phase 1.
+**Phase 2 (shipped):** errors from a stock Sentry SDK by pointing its DSN at Noite. Sentry is an ingest _format_ here, not a dependency: events land in the same issues, grouping and tab as phase 1.
 
-- **Per-app public ingest key.** Browser DSNs are public, so this is not the account API key used by `ingest/events`: a separate per-app key that can only submit errors, shown in Settings → "Error reporting" as `https://<key>@app.<domain>/<appId>`, rotatable.
-- **Endpoint** `POST /api/<appId>/envelope/` on the control UI, beside `ingest/events`. Key from `sentry_key` (query) or `X-Sentry-Auth`; CORS open; body capped (~200 KB); rate-limited per key (`lib/rate-limit.ts`). Parse the envelope (newline-delimited header, item headers, payloads) and keep only `event` items; accept and drop transactions, sessions, replays, profiles, attachments and client reports with a 200, so SDKs never retry them.
+- **Per-app public ingest key.** Browser DSNs are public, so this is not the account API key used by `ingest/events`: a separate per-app key that can only submit errors, shown in Settings → "Error reporting" as `https://<key>@<control-host>/<n>`, where `<n>` is the stable per-app numeric project id. The id is numeric because stock `@sentry/core` rejects non-numeric project ids when it parses the DSN, so the app slug cannot serve as the id. Rotatable.
+- **Endpoint** `POST /api/<n>/envelope/` on the control UI, beside `ingest/events`. Key from `sentry_key` (query) or `X-Sentry-Auth`; CORS open; body capped at 200 KB post-gzip; rate-limited per key (`lib/rate-limit.ts`). Parse the envelope (newline-delimited header, item headers, payloads) and keep only `event` items; accept and drop transactions, sessions, replays, profiles, attachments and client reports with a 200, so SDKs never retry them.
 - **Mapping.** `exception.values[]` → type, message and frames. Sentry lists frames oldest-first, so reverse them, and trust the SDK's `in_app` flag. Also carry the request URL (query stripped), release, environment and a classified user agent. A runner RPC `errors.ingest` feeds `host/errors.rs::record`, so fingerprints match phase 1's; `source` becomes `browser` (or `sdk` for server SDKs).
 - **UI.** A "Browser" handler label and the SDK extras (URL, release) on each occurrence; the settings card shows the DSN and a `@sentry/browser` snippet.
 - **Docs.** Observe → Errors covers browser setup. `@sentry/cloudflare` inside the Worker stays documented as _untested_ until a spike confirms AsyncLocalStorage on celld (`node:async_hooks` is listed; ALS is not named).
