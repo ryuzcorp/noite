@@ -8,6 +8,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.0-alpha.7] - 2026-10-20
+
+Fixes the Deployment logs pane alpha.6 shipped broken, makes every live panel recover on its own and share one connection per page, and makes "Running" mean the app actually serves.
+
+### Operator action required
+
+- None. No schema, config, DNS or certificate change.
+- Behaviour to know about: a deploy now reports success only once its fleet answers celld's health check, waiting up to `RUNNER_WAKE_TIMEOUT_S` (120 s by default). A fleet that never becomes healthy fails the deploy with `fleet not healthy within …` where it used to report success.
+
 ### Fixed
 
 - **Deployment logs stream again.** In 0.1.0-alpha.6 the Deployments tab's **Deployment logs** pane only said "Log stream disconnected — retrying…": the release image shipped without the control UI's `/api/apps/:id/logs/stream` route, which answered 404. A repo-wide ignore rule for `logs` directories had kept that file out of git.
@@ -20,7 +29,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- **Operator note:** a deploy now succeeds once its fleet passes the health gate, up to `RUNNER_WAKE_TIMEOUT_S` (120 s by default); one whose fleet never becomes healthy fails with `fleet not healthy within …` instead of reporting success.
 - **CI:** the control UI and CLI unit tests run on every pull request and release tag; among them, a guard that every `/api/...` path the browser requests has a committed route file. The e2e lanes run spec files in parallel (3 workers) on a cached image build.
 
 ## [0.1.0-alpha.6] - 2026-10-20
