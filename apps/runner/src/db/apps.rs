@@ -382,6 +382,45 @@ pub async fn update_app_status(
     Ok(())
 }
 
+/// Record a deploy's sha without touching the observed status: a deploy that
+/// lands while the app is stopped still counts for tip dedup, but must not
+/// flip the status back to running.
+pub async fn record_app_deploy_sha(
+    pool: &SqlitePool,
+    id: &str,
+    sha: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE app SET last_deploy_sha = COALESCE(?, last_deploy_sha), updated_at = ? WHERE id = ?")
+        .bind(sha)
+        .bind(now_iso())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Write the observed status only while the app still wants to run. A stop
+/// (or delete) racing a deploy, a wake or a reconcile confirm must win:
+/// without the guard the loser flips a stopped app back to running (or
+/// failed). Returns whether the row was updated.
+pub async fn update_app_status_if_wanted(
+    pool: &SqlitePool,
+    id: &str,
+    status: &str,
+    last_error: Option<&str>,
+) -> sqlx::Result<bool> {
+    let done = sqlx::query(
+        "UPDATE app SET status = ?, last_error = ?, updated_at = ? WHERE id = ? AND desired_state = 'running'",
+    )
+    .bind(status)
+    .bind(last_error)
+    .bind(now_iso())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

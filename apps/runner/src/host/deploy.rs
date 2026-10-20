@@ -286,7 +286,7 @@ impl Progress<'_> {
             // `upsert_deploy` already moved the environment to failed with the
             // log tail; this adds the one-line summary the UI lists.
             Some(env_id) => {
-                db::update_environment_status(
+                db::update_environment_status_if_wanted(
                     self.pool,
                     env_id,
                     AppStatus::Failed.as_str(),
@@ -295,12 +295,11 @@ impl Progress<'_> {
                 .await
             }
             None => {
-                db::update_app_status(
+                db::update_app_status_if_wanted(
                     self.pool,
                     self.app_id,
                     AppStatus::Failed.as_str(),
                     Some(&summary),
-                    None,
                 )
                 .await
             }
@@ -874,10 +873,26 @@ async fn deploy_inner(
         }
     }
 
+    // "Running" (and this row's success) means the fleet answers its
+    // health/ready gate — not just that celld was spawned. The reload above
+    // races a cold boot (`started celld` then `reload failed (connection
+    // error)` within milliseconds), so confirm the gate before calling the
+    // deploy live. Runs on the deploy's own task, never on the reconcile
+    // tick, and well inside the stuck-deploy sweep.
+    let fleet_port = match &environment {
+        Some(env) => env.listen_port,
+        None => app.listen_port,
+    };
+    if let Some(port) = fleet_port {
+        let budget = std::time::Duration::from_secs(cfg.wake_timeout_s.max(1));
+        if !crate::host::sleep::wait_healthy(cfg, port, budget).await {
+            anyhow::bail!("fleet not healthy within {}s", cfg.wake_timeout_s);
+        }
+    }
+
     progress
         .log(DeployStatus::Success, "deploy complete\n")
         .await?;
-    tracing::info!(fleet = %fleet, sha = %&commit_sha[..12.min(commit_sha.len())], "deploy ok");
     // It is live: status, fleet and reload are all done above, so the
     // worktree wipe runs detached. Nothing that waits on this deploy — the app
     // lock, the next push, a delete — is held open by it.
