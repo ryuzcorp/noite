@@ -122,7 +122,9 @@ jobs:
   # every `/api/...` path the browser requests has a committed route file
   # (alpha.6 shipped without the logs stream route because `.gitignore` hid
   # it, and only a git checkout shows that). `apps/noite` has its own
-  # lockfile, installed standalone like the image does.
+  # lockfile, installed standalone like the image does. `bun run test` runs
+  # each file isolated: a `mock.module` is process-wide otherwise, and the
+  # checkout's file order decided which later file saw it.
   ui:
     runs-on: ubuntu-latest
     steps:
@@ -134,7 +136,7 @@ jobs:
         run: bun install --frozen-lockfile
       - name: unit tests
         working-directory: apps/noite
-        run: bun test src
+        run: bun run test
 
   # packages/cli ships to npm but no other lane builds it: guard the bundle,
   # the typecheck, and the version it advertises (inlined from package.json).
