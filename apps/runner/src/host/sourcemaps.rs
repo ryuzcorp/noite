@@ -1086,15 +1086,17 @@ async fn run_shadow_esbuild(
     Ok(Some((out, note)))
 }
 
-/// Drop sources that do not resolve under the deploy root (symlink escapes,
-/// absolute build-host paths) down to their file names before anything is
-/// stored: chaining already ran on the full strings, so entry matching is
-/// unaffected, and no host-absolute path reaches the bucket or the UI.
+/// Drop absolute host paths (symlink escapes, build-host absolutes) down to
+/// their file names before anything is stored: chaining already ran on the
+/// full strings, so entry matching is unaffected, and no host-absolute path
+/// reaches the bucket or the UI. Relative sources — including the
+/// `../..` form every Vite build emits — carry no host information and stay
+/// intact, since the UI renders them as the original path.
 fn sanitize_sources(sm: &sourcemap::SourceMap) -> sourcemap::SourceMap {
     let mut builder = sourcemap::SourceMapBuilder::new(None);
     for token in sm.tokens() {
         let source = token.get_source().map(|s| {
-            if s.starts_with('/') || s.contains("..") {
+            if s.starts_with('/') {
                 s.rsplit('/').next().unwrap_or(s).to_string()
             } else {
                 s.to_string()
@@ -1442,12 +1444,15 @@ mod tests {
             .all(|s| s == "vite_sample/index.js"));
         let inner = sourcemap::SourceMap::from_slice(FIXTURE_ENTRY_MAP).expect("parse entry map");
         let chained = chain_maps(&norm, &inner, "vite_sample/index.js");
+        // The store sanitizes before upload; the sanitized map must still
+        // resolve (relative sources survive, absolute ones do not).
+        let stored = sanitize_sources(&chained);
         let manifest = MapManifest {
             worker: Some("worker.js.map".to_string()),
             assets_dir: None,
             files: HashMap::new(),
         };
-        let load = |_: &str| Some(Arc::new(chained.clone()));
+        let load = |_: &str| Some(Arc::new(stored.clone()));
         // The deployed throw site, 1-based as V8 prints it.
         let mut frames = vec![frame_at("worker.js:17:46")];
         let mut budget = SymbolicateBudget::for_read();
@@ -2048,7 +2053,9 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_drops_unresolvable_sources_to_basenames() {
+    fn sanitize_drops_absolute_paths_but_keeps_relative_sources() {
+        // Absolute host paths become basenames; relative sources — including
+        // the `../..` form every Vite build emits — stay intact for display.
         let mut builder = sourcemap::SourceMapBuilder::new(None);
         builder.add(0, 0, 0, 0, Some("/data/build/x.js"), Some("evil"), false);
         builder.add(1, 0, 5, 2, Some("../../elsewhere/y.js"), None, false);
@@ -2056,6 +2063,13 @@ mod tests {
         let cleaned = sanitize_sources(&builder.into_sourcemap());
         let mut sources: Vec<Option<&str>> = cleaned.tokens().map(|t| t.get_source()).collect();
         sources.sort();
-        assert_eq!(sources, [Some("src/ok.ts"), Some("x.js"), Some("y.js")]);
+        assert_eq!(
+            sources,
+            [
+                Some("../../elsewhere/y.js"),
+                Some("src/ok.ts"),
+                Some("x.js")
+            ]
+        );
     }
 }
