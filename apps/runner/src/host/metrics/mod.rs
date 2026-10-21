@@ -114,6 +114,23 @@ fn drain_forgotten(state: &mut MetricsState) {
     }
 }
 
+fn minute_bucket_now() -> String {
+    Utc::now().format("%Y-%m-%dT%H:%M:00Z").to_string()
+}
+
+/// Current time as unix microseconds. Also used by endpoints that window the
+/// ingested SQLite rings.
+pub fn now_us() -> i64 {
+    // Epoch-relative time via the loop_.rs pattern (chrono DateTime math,
+    // num_milliseconds).
+    // Static invariant: the epoch is a hard-coded RFC 3339 literal, so parsing never fails.
+    let epoch = chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
+        .ok()
+        .map(|d| d.with_timezone(&Utc))
+        .expect("epoch literal");
+    (Utc::now() - epoch).num_milliseconds() * 1000
+}
+
 #[cfg(test)]
 mod forget_tests {
     use super::*;
@@ -155,21 +172,4 @@ mod forget_tests {
         drain_forgotten(&mut state);
         assert_eq!(state.watermark.get(gone), Some(&7));
     }
-}
-
-fn minute_bucket_now() -> String {
-    Utc::now().format("%Y-%m-%dT%H:%M:00Z").to_string()
-}
-
-/// Current time as unix microseconds. Also used by endpoints that window the
-/// ingested SQLite rings.
-pub fn now_us() -> i64 {
-    // Epoch-relative time via the loop_.rs pattern (chrono DateTime math,
-    // num_milliseconds).
-    // Static invariant: the epoch is a hard-coded RFC 3339 literal, so parsing never fails.
-    let epoch = chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
-        .ok()
-        .map(|d| d.with_timezone(&Utc))
-        .expect("epoch literal");
-    (Utc::now() - epoch).num_milliseconds() * 1000
 }
