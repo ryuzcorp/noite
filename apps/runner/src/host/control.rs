@@ -102,11 +102,7 @@ pub fn revision(bundle_rev: &str, vars: &serde_json::Value) -> String {
     let mut h = Sha256::new();
     h.update(bundle_rev.as_bytes());
     h.update(canonical_json(vars).as_bytes());
-    let hex: String = h
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
     format!("{bundle_rev}-{}", &hex[..16.min(hex.len())])
 }
 

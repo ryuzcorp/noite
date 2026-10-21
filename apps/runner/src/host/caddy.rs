@@ -1521,7 +1521,12 @@ mod tests {
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
         // Behind a terminating proxy the plaintext twin carries the same deny,
         // including across joined extra control hosts.
-        let mut proxied = test_config("noite.now", "app", false, "/tmp/noite-test-control-deny-proxy");
+        let mut proxied = test_config(
+            "noite.now",
+            "app",
+            false,
+            "/tmp/noite-test-control-deny-proxy",
+        );
         proxied.control_bundle_dir = "/tmp/noite-test-control-deny-bundle".into();
         proxied.control_extra_hosts = vec!["lab.netbird.cloud".into()];
         let out = rendered(&proxied, &[test_app()]).await;

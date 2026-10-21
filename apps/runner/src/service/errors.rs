@@ -255,7 +255,9 @@ pub async fn ingest_key(
     role: Option<&str>,
 ) -> Result<IngestKeyView, ApiError> {
     let Some(role) = role else {
-        return Err(ApiError::forbidden("the view role is required for this operation"));
+        return Err(ApiError::forbidden(
+            "the view role is required for this operation",
+        ));
     };
     if !role_ok(role, "view") {
         return Err(ApiError::forbidden(format!(
@@ -286,7 +288,9 @@ pub async fn rotate_ingest_key(
     role: Option<&str>,
 ) -> Result<IngestKeyView, ApiError> {
     let Some(role) = role else {
-        return Err(ApiError::forbidden("the admin role is required for this operation"));
+        return Err(ApiError::forbidden(
+            "the admin role is required for this operation",
+        ));
     };
     if !role_ok(role, "admin") {
         return Err(ApiError::forbidden(format!(
