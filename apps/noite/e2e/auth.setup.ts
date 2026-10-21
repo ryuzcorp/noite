@@ -1,6 +1,11 @@
 import { expect, test as setup } from "@playwright/test";
 
-import { E2E_EMAIL, E2E_NAME, addVirtualAuthenticator } from "./helpers";
+import {
+  E2E_EMAIL,
+  E2E_NAME,
+  addVirtualAuthenticator,
+  finishOnboarding,
+} from "./helpers";
 
 const authFile = "e2e/.auth/user.json";
 
@@ -39,10 +44,7 @@ setup("register e2e account", async ({ page }) => {
     "href",
     "https://github.com/sponsors/ryuzdev"
   );
-  await page.locator("#onboarding-finish").click();
-  await expect(dialog).toBeHidden();
-  await page.reload();
-  await expect(page.getByRole("dialog")).toBeHidden();
 
+  await finishOnboarding(page);
   await page.context().storageState({ path: authFile });
 });
