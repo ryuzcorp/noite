@@ -98,6 +98,26 @@ while [ "$attempt" -lt 100 ]; do
       rc=0
     else
       rc=$?
+      # A red lane without container logs is undiagnosable (the CI log holds
+      # only the Playwright output): capture the runner + store logs, the
+      # Caddy access log (per-request status and upstream latency — the 504s
+      # live here) and a stats snapshot into the report dir, which the e2e
+      # workflow uploads as an artifact. Runs before the teardown below, while
+      # the containers (and the Caddy log inside the volume) still exist.
+      echo "==> lane failed — capturing container logs, Caddy access log and stats"
+      mkdir -p apps/noite/playwright-report
+      # shellcheck disable=SC2086
+      $CE2E logs --tail=1000 > apps/noite/playwright-report/lane-containers.log 2>&1 || true
+      # shellcheck disable=SC2086
+      $CE2E exec -T noite tail -c 2000000 /data/caddy/access.log > apps/noite/playwright-report/lane-caddy-access.log 2>&1 || true
+      $CLI stats --no-stream > apps/noite/playwright-report/lane-stats.txt 2>&1 || true
+      # A container that OOM-looped (or otherwise restarted) mid-lane leaves
+      # no trace in the Playwright output: restart counts plus the OOM-killed
+      # flag name the next stall's victim the way logs alone cannot.
+      for id in $($CE2E ps -q 2>/dev/null); do
+        # shellcheck disable=SC2086
+        $CLI inspect --format '{{.Name}} restarts={{.RestartCount}} oom_killed={{.State.OOMKilled}}' $id >> apps/noite/playwright-report/lane-stats.txt 2>&1 || true
+      done
     fi
     if [ "$rc" -eq 0 ]; then
       # The operator's way back in after a lost passkey, through the image's
