@@ -34,7 +34,10 @@ pub async fn tick(
     log_tx: &tokio::sync::watch::Sender<u64>,
 ) -> anyhow::Result<()> {
     let apps = db::list_apps(pool).await?;
-    let envs = db::list_all_environments(pool).await.unwrap_or_default();
+    // A failed listing skips the tick (like a failed app listing): an empty
+    // fallback would drop every environment-host access line past the
+    // advancing log offset, and could clear a pending replay unrewound.
+    let envs = db::list_all_environments(pool).await?;
     let (slug_id, slug_env) = telemetry_fleets(&apps, &envs);
     // Each fleet's own deploy sha (an environment's errors symbolicate
     // against the environment's deploy), keyed by fleet key like the bounds.

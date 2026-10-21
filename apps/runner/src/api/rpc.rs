@@ -489,6 +489,9 @@ struct HoursParams {
 #[serde(rename_all = "camelCase")]
 struct UserPropsParams {
     id: String,
+    // The wire name stays `user_id` (the control UI, CLI and MCP send it);
+    // `userId` is accepted as an alias for camelCase callers.
+    #[serde(rename = "user_id", alias = "userId")]
     user_id: String,
     #[serde(default)]
     environment_id: Option<String>,
@@ -1503,5 +1506,29 @@ async fn dispatch_call(
             JsonRpcErrorReason::MethodNotFound,
             format!("unknown method: {m}"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::UserPropsParams;
+
+    /// The `user_id` wire name is the contract the control UI, CLI and MCP
+    /// send; `rename_all = "camelCase"` must not silently rename it.
+    #[test]
+    fn user_props_accepts_snake_and_camel_user_id() {
+        let snake: UserPropsParams =
+            serde_json::from_value(serde_json::json!({"id": "a", "user_id": "u1"}))
+                .expect("snake_case user_id parses");
+        assert_eq!(snake.user_id, "u1");
+        assert_eq!(snake.environment_id, None);
+        let camel: UserPropsParams = serde_json::from_value(serde_json::json!({
+            "id": "a",
+            "userId": "u2",
+            "environmentId": "e1",
+        }))
+        .expect("camelCase alias parses");
+        assert_eq!(camel.user_id, "u2");
+        assert_eq!(camel.environment_id.as_deref(), Some("e1"));
     }
 }

@@ -5,7 +5,7 @@ description: Preview environments — one per branch, each on its own host with 
 
 An **environment** is a real deployment of one app's branch on celld: its own fleet, its own host, its own storage, from the same build pipeline as production. `main` is the app itself, never an environment — an environment deploy never touches the app's bucket, ports or deploy state.
 
-On the app page's **Deployments** tab each environment is its own group, below **Production** (`/apps/<id>?t=deployments&env=<id>` deep-links to one): the group header shows its label, what it tracks, status, last deploy, URL and whether it is public, with the environment's own deploy history beneath it. The **Metrics**, **Errors** and **Logs** tabs scope to one environment the same way — **Production** first, then each environment (`?env=<id>` deep-links) — and a pull request's page shows its head branch's environment card (status, URL, last deploy, links to its Metrics and Errors).
+On the app page's **Deployments** tab each environment is its own group, below **Production** (`/apps/<id>?t=deployments&env=<id>` deep-links to one): the group header shows its label, what it tracks, status, last deploy, URL and whether it is public, with the environment's own deploy history beneath it — deploy logs and live output plus the environment's ingested telemetry, never production's lines. The **Metrics** and **Errors** tabs scope to one environment the same way with a picker — **Production** first, then each environment (`?env=<id>` deep-links) — and a pull request's page shows its head branch's environment card (status, URL, last deploy, links to its Metrics and Errors).
 
 | | |
 | --- | --- |

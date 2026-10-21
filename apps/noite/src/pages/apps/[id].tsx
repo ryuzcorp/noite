@@ -19,6 +19,7 @@ import { DocumentTitle } from "$lib/ui/document-title";
 import { Cog } from "$lib/ui/icons";
 import { SidePanel } from "$lib/ui/side-panel";
 import { useParams } from "@ilha/void";
+import type { View } from "ilha";
 
 const TABS = [
   { id: "overview", label: "Overview" },
@@ -96,6 +97,40 @@ const SettingsAside = ({ onClose }: { onClose: () => void }) => (
   </SidePanel>
 );
 
+/** Tab bar with live badges. `liveFeed` binds its stream URL once per
+ * component life, so the Errors badge — which follows the tabs' `?env=` —
+ * lives in this child, keyed by environment: changing scope remounts it
+ * and resubscribes, instead of keeping the first scope's stream. The
+ * Events badge is app-wide (custom events carry no environment identity). */
+const TabBar = ({
+  active,
+  appId,
+  environmentId,
+  onSelect,
+  trailing,
+}: {
+  active: TabId;
+  appId: string;
+  environmentId: string;
+  onSelect: (id: string) => void;
+  trailing: View;
+}) => {
+  const counts = {
+    errors: liveErrors(appId, "open", environmentId).data()?.counts.open ?? 0,
+    events: liveEventCount(appId),
+  };
+
+  return (
+    <DetailTabs
+      active={active}
+      counts={counts}
+      onSelect={onSelect}
+      tabs={TABS}
+      trailing={trailing}
+    />
+  );
+};
+
 const AppPageBody = ({ appId }: { appId: string }) => {
   // The reserved control app has no runner row, fleet or telemetry: it gets a
   // dedicated minimal detail instead of the tenant tabs. Branching before any
@@ -128,15 +163,10 @@ const AppPageBody = ({ appId }: { appId: string }) => {
   // Same live feeds as the Errors tab's open list and the Events tab's
   // default view, so the tab badges never lag the lists — the Errors
   // badge follows the tabs' `?env=` (production until an environment is
-  // picked); custom events are app-scoped, so the Events badge is always
-  // app-wide.
+  // picked, via the keyed TabBar above); custom events are app-scoped, so
+  // the Events badge is always app-wide.
   const env = searchParam("env", { default: "" });
   const environmentId = validEnvId(environments(appId).data() ?? [], env());
-
-  const counts = {
-    errors: liveErrors(appId, "open", environmentId).data()?.counts.open ?? 0,
-    events: liveEventCount(appId),
-  };
 
   const settingsOpen = panel() === "settings";
 
@@ -147,10 +177,11 @@ const AppPageBody = ({ appId }: { appId: string }) => {
         header={
           <>
             <AppHeader appId={appId} />
-            <DetailTabs
+            <TabBar
+              key={environmentId}
               active={tab()}
-              counts={counts}
-              tabs={TABS}
+              appId={appId}
+              environmentId={environmentId}
               onSelect={(next) => {
                 openError.set("");
                 tab.set(toTabId(next));

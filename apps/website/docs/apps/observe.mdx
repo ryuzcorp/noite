@@ -4,7 +4,7 @@ description: Logs, metrics with spans, errors, product-analytics events, and idl
 ---
 
 :::note
-The **Metrics**, **Errors** and **Logs** tabs scope to one environment: **Production** first, then each [preview environment](/apps/environments) (`?env=` deep-links). Reads without an environment mean production only. Custom events stay app-wide — their writes carry no environment identity — so the **Events** tab has no picker.
+The **Metrics** and **Errors** tabs scope to one environment with a picker: **Production** first, then each [preview environment](/apps/environments) (`?env=` deep-links). Reads without an environment mean production only. Logs scope through the Deployments tab's environment groups (each group shows its own fleet's ingested telemetry plus live output). Custom events stay app-wide — their writes carry no environment identity — so the **Events** tab has no picker.
 :::
 
 ## Logs
