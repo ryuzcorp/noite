@@ -21,7 +21,7 @@ export const TEMPLATES: readonly AppTemplate[] = [
     name: "Ilha + Void",
     ref: "main",
     stack: ["Ilha", "Void", "Vite"],
-    url: "https://github.com/ryuzcorp/noite-template-oxide",
+    url: "https://github.com/ryuzcorp/noite-template-ilha",
   },
   {
     description: "TanStack Start (Vite + the Cloudflare plugin) serving SSR.",
