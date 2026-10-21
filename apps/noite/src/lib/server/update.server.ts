@@ -20,8 +20,9 @@ export const getUpdateStatus = apiActionNoInput(async ({ env, request }) => {
 
 const SetUpdateStatus = Schema.Struct({ enabled: Schema.Boolean });
 
-/** Store the preference; enabling runs one immediate check runner-side (a
- * failed fetch keeps the last result). Same admin gate as the read. */
+/** Store the preference; enabling hands one immediate check to a background
+ * task and returns at once (a failed fetch keeps the last result). Same
+ * admin gate as the read. */
 export const setUpdateStatus = apiAction(
   SetUpdateStatus,
   async ({ enabled }, { env, request }) => {

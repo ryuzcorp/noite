@@ -16,9 +16,11 @@ const LockNotice = ({ reason }: { reason: string | null }) => (
 
 /** The card body, given a status (so the checkbox and lock are always real). */
 const UpdateSettings = ({
+  checking,
   status,
   saved,
 }: {
+  checking: AtomHandle<boolean>;
   status: RunnerUpdateStatus;
   saved: AtomHandle<boolean>;
 }) => {
@@ -37,9 +39,18 @@ const UpdateSettings = ({
     error.set("");
 
     try {
-      await api<{ ok: true }>("/api/update/setUpdateStatus", { enabled });
+      const reply = await api<RunnerUpdateStatus>(
+        "/api/update/setUpdateStatus",
+        {
+          enabled,
+        }
+      );
+
       draft.set(null);
       saved.set(true);
+      // The set reply says whether a background check is now in flight; the
+      // card shows "Checking…" until the next normal load picks up its result.
+      checking.set(reply.checking);
       // The banner and the detail rows come from the runner; the live card
       // refetches behind the confirmation.
       invalidate(keys.update);
@@ -65,6 +76,7 @@ const UpdateSettings = ({
             onchange={(event) => {
               draft.set(event.currentTarget.checked);
               saved.set(false);
+              checking.set(false);
             }}
           />
           Check for new Noite releases
@@ -90,6 +102,11 @@ const UpdateSettings = ({
       {saved() ? (
         <p class="text-success m-0 text-sm">Release check setting saved.</p>
       ) : null}
+      {checking() ? (
+        <p class="m-0 text-sm opacity-70">
+          Checking for new releases — the banner appears above if one is found.
+        </p>
+      ) : null}
       <div>
         <button
           type="button"
@@ -113,6 +130,7 @@ export const UpdateCard = () => {
   // Lives here, not in the body: the invalidate below blanks `status` for a
   // beat and remounts the body, which must keep the save confirmation.
   const saved = atom(false);
+  const checking = atom(false);
 
   if (res.loading() && status === undefined) {
     return <SectionSkeleton lines={3} />;
@@ -130,5 +148,5 @@ export const UpdateCard = () => {
     );
   }
 
-  return <UpdateSettings saved={saved} status={status} />;
+  return <UpdateSettings checking={checking} saved={saved} status={status} />;
 };

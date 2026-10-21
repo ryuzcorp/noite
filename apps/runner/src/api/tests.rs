@@ -988,7 +988,7 @@ async fn update_status_agrees() {
     assert_eq!(rest["enabled"], json!(true));
     assert_eq!(rest["setting"], json!(true));
     assert_eq!(rest["locked"], json!(false));
-    assert!(rest["lockReason"].is_null());
+    assert_eq!(rest["checking"], json!(false), "reads never report a check");
     assert_eq!(rest["current"], json!("dev"));
     assert!(rest["latest"].is_null());
     assert!(rest["checkedAt"].is_null());

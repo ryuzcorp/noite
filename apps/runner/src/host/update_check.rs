@@ -14,6 +14,7 @@
 //! plus the clock.
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,12 +39,6 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// How stale the last check must be for the next one: at most one request a
 /// day, plus one at enable.
 const CHECK_AFTER_HOURS: i64 = 24;
-
-/// Test-only base-URL override, honored on local/dev domains only (the e2e
-/// lane runs on `noite.localhost`, as does `make dev`). Public installs
-/// always use the fixed URL above, so no tenant or operator input can steer
-/// the outbound fetch off its fixed path.
-const OVERRIDE_ENV: &str = "NOITE_UPDATE_CHECK_URL";
 
 /// One entry of the GitHub release list. Only the promotion state and the
 /// link are read; everything else in the payload is ignored.
@@ -96,6 +91,10 @@ pub struct UpdateStatus {
     pub checked_at: Option<String>,
     /// Release-notes link for `latest`.
     pub notes_url: Option<String>,
+    /// True only on the `set` reply that triggered a background check: the
+    /// action returns at once and the card shows "Checking…" until the next
+    /// normal load. Reads (`status`) never report it.
+    pub checking: bool,
 }
 
 /// The cached check result (`instance_setting` row `update_check_result`):
@@ -291,22 +290,6 @@ pub async fn due(pool: &SqlitePool, cfg: &Config, now: DateTime<Utc>) -> sqlx::R
     ))
 }
 
-/// The release-list URL: the fixed public list, unless the test-only
-/// override is set on a local/dev domain (the e2e lane).
-pub fn releases_url(cfg: &Config) -> String {
-    if let Some(url) = non_empty_env(OVERRIDE_ENV) {
-        if crate::config::is_local_domain(&cfg.base_domain) {
-            return url;
-        }
-        tracing::debug!("ignoring {OVERRIDE_ENV} on a public domain");
-    }
-    RELEASES_URL.to_string()
-}
-
-fn non_empty_env(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
-}
-
 /// GET the release list: fixed URL, fixed User-Agent, no auth, no instance
 /// data. The timeout bounds the one network leg.
 pub async fn fetch_releases(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<Release>> {
@@ -395,7 +378,7 @@ where
     apply_fetch(pool, now, &current, fetch().await).await;
 }
 
-fn http_client() -> anyhow::Result<reqwest::Client> {
+pub fn http_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .build()
@@ -421,24 +404,52 @@ pub async fn status(pool: &SqlitePool, cfg: &Config) -> anyhow::Result<UpdateSta
         latest: cached.as_ref().map(|c| c.latest.clone()),
         checked_at: db::get_setting(pool, db::UPDATE_CHECK_LAST_AT).await?,
         notes_url: cached.as_ref().map(|c| c.notes_url.clone()),
+        checking: false,
     })
 }
 
-/// The enable-time fetch: store the preference, then check once right away
-/// (bounded by the fetch timeout) when the check is effectively on.
-pub async fn set(pool: &SqlitePool, cfg: &Config, enabled: bool) -> anyhow::Result<UpdateStatus> {
+/// Store the preference without any fetch (the disable path, and the fallback
+/// when no HTTP client can be built).
+pub async fn set_stored(
+    pool: &SqlitePool,
+    cfg: &Config,
+    enabled: bool,
+) -> anyhow::Result<UpdateStatus> {
     let stored = if enabled { "1" } else { "0" };
     db::set_setting(pool, db::UPDATE_CHECK_ENABLED, stored).await?;
-    if enabled && cfg.update_check_lock_reason().is_none() {
-        match http_client() {
-            Ok(client) => {
-                let url = releases_url(cfg);
-                check_now(pool, Utc::now(), || fetch_releases(&client, &url)).await;
-            }
-            Err(e) => tracing::debug!(error = %e, "update check: no http client at enable"),
-        }
-    }
     self::status(pool, cfg).await
+}
+
+/// The enable-time path: store the preference and hand one immediate check to
+/// `spawn` (production passes `tokio::spawn`), returning the status at once
+/// with `checking: true` — the admin save action never waits on GitHub.
+/// Disabling, or a locked check, stores without spawning. Tests inject the
+/// fetch and the spawner, so the trigger is observable with no network.
+pub async fn set<F, Fut, S>(
+    pool: &SqlitePool,
+    cfg: &Config,
+    enabled: bool,
+    fetch: F,
+    spawn: S,
+) -> anyhow::Result<UpdateStatus>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<Vec<Release>>> + Send + 'static,
+    S: FnOnce(Pin<Box<dyn Future<Output = ()> + Send + 'static>>),
+{
+    let stored = if enabled { "1" } else { "0" };
+    db::set_setting(pool, db::UPDATE_CHECK_ENABLED, stored).await?;
+    let mut checking = false;
+    if enabled && cfg.update_check_lock_reason().is_none() {
+        let pool = pool.clone();
+        spawn(Box::pin(async move {
+            check_now(&pool, Utc::now(), fetch).await;
+        }));
+        checking = true;
+    }
+    let mut status = self::status(pool, cfg).await?;
+    status.checking = checking;
+    Ok(status)
 }
 
 /// The update-check task: first attempt five minutes after boot, then hourly
@@ -456,8 +467,7 @@ pub async fn run_scheduler(pool: SqlitePool, cfg: Arc<Config>) {
     tokio::time::sleep(FIRST_CHECK_DELAY).await;
     loop {
         let now = Utc::now();
-        let url = releases_url(&cfg);
-        tick(&pool, &cfg, now, || fetch_releases(&client, &url)).await;
+        tick(&pool, &cfg, now, || fetch_releases(&client, RELEASES_URL)).await;
         tokio::time::sleep(CHECK_INTERVAL).await;
     }
 }
@@ -763,21 +773,6 @@ mod tests {
         assert!(parse_releases("<html>nope</html>").is_err());
     }
 
-    #[test]
-    fn override_url_is_local_only() {
-        let local = crate::config::config_for_tests();
-        assert_eq!(local.base_domain, "localhost");
-        // NOTE: this mutates process env; restored before returning so no
-        // other test in the process sees the override.
-        std::env::set_var(OVERRIDE_ENV, "http://127.0.0.1:9/stub");
-        assert_eq!(releases_url(&local), "http://127.0.0.1:9/stub");
-        let mut public = local.clone();
-        public.base_domain = "noite.now".to_string();
-        assert_eq!(releases_url(&public), RELEASES_URL);
-        std::env::remove_var(OVERRIDE_ENV);
-        assert_eq!(releases_url(&local), RELEASES_URL);
-    }
-
     /// One-shot stub release feed: serves `body` to a single connection and
     /// hands back the raw request for header assertions.
     fn stub_feed(body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
@@ -854,22 +849,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_stores_the_preference_even_when_the_fetch_fails() {
+    async fn enable_spawns_one_check_without_awaiting_it() {
         let pool = memory_pool().await;
         let cfg = crate::config::config_for_tests();
-        // The enable-time fetch runs against the real list (or fails without
-        // network); either way the preference is stored and a dev build
-        // shows no notice.
-        let status = self::set(&pool, &cfg, true).await.expect("set");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let seen = Arc::clone(&calls);
+        let status = self::set(
+            &pool,
+            &cfg,
+            true,
+            move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Ok(releases())
+                }
+            },
+            |check| {
+                tx.send(check).ok();
+            },
+        )
+        .await
+        .expect("set");
+        // The action returns with the check still unrun.
         assert!(status.setting, "preference stored");
         assert!(status.enabled, "test config is not locked");
-        assert_eq!(status.latest, None, "a dev build never shows a notice");
-        assert_eq!(
-            db::get_setting(&pool, db::UPDATE_CHECK_ENABLED)
-                .await
-                .expect("read"),
-            Some("1".to_string())
-        );
+        assert!(status.checking, "the reply says a check is in flight");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing ran yet");
+        // Run exactly what was spawned: one fetch, then it caches.
+        let check = rx.await.expect("one check spawned");
+        check.await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one fetch");
+        let checked_at = db::get_setting(&pool, db::UPDATE_CHECK_LAST_AT)
+            .await
+            .expect("read");
+        assert!(checked_at.is_some(), "the spawned check recorded itself");
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn disable_and_locked_spawn_nothing() {
+        for locked in [false, true] {
+            let pool = memory_pool().await;
+            let mut cfg = crate::config::config_for_tests();
+            cfg.update_check_disabled = locked;
+            let spawns = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&spawns);
+            let status = self::set(
+                &pool,
+                &cfg,
+                false,
+                || async { Ok(releases()) },
+                move |_check| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await
+            .expect("set");
+            assert!(!status.setting, "preference stored");
+            assert!(!status.checking, "no check in flight");
+            assert_eq!(
+                spawns.load(Ordering::SeqCst),
+                0,
+                "locked={locked}: no spawn"
+            );
+            pool.close().await;
+        }
+        // Enabling while locked stores but spawns nothing either.
+        let pool = memory_pool().await;
+        let mut cfg = crate::config::config_for_tests();
+        cfg.update_check_disabled = true;
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&spawns);
+        let status = self::set(
+            &pool,
+            &cfg,
+            true,
+            || async { Ok(releases()) },
+            move |_check| {
+                seen.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("set");
+        assert!(status.setting, "the preference still moves while locked");
+        assert!(!status.enabled, "the lock wins");
+        assert!(!status.checking, "locked means no spawn");
+        assert_eq!(spawns.load(Ordering::SeqCst), 0, "locked enable: no spawn");
         pool.close().await;
     }
 }

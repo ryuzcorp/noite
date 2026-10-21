@@ -7,6 +7,7 @@ const status = (
   override: Partial<RunnerUpdateStatus> = {}
 ): RunnerUpdateStatus => ({
   checkedAt: "2026-10-21T00:00:00.000Z",
+  checking: false,
   current: "0.1.0-alpha.8",
   enabled: true,
   latest: "0.1.0-alpha.9",

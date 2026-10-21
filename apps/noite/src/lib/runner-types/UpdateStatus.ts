@@ -32,4 +32,10 @@ checkedAt: string | null,
 /**
  * Release-notes link for `latest`.
  */
-notesUrl: string | null, };
+notesUrl: string | null, 
+/**
+ * True only on the `set` reply that triggered a background check: the
+ * action returns at once and the card shows "Checking…" until the next
+ * normal load. Reads (`status`) never report it.
+ */
+checking: boolean, };
