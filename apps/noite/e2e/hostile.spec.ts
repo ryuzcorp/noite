@@ -146,7 +146,9 @@ test(
     const report = (await res.json()) as ProbeReport;
 
     for (const [name, probe] of Object.entries(report.build.probes)) {
-      expect(probe.ok, `build probe ${name} leaked: ${probe.detail}`).toBe(false);
+      expect(probe.ok, `build probe ${name} leaked: ${probe.detail}`).toBe(
+        false
+      );
     }
 
     // The cross-build probe only proves isolation if a sibling app's build
