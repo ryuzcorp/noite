@@ -1,0 +1,7 @@
+{
+  "version": 3,
+  "sources": ["../../vite_sample/index.js"],
+  "sourcesContent": ["//#region src/greeting.txt?raw\nvar greeting_default = \"hello from vite\\n\";\n//#endregion\n//#region \\0virtual:cloudflare/worker-entry\nvar worker_entry_default = { async fetch(request) {\n\tconst { pathname } = new URL(request.url);\n\tif (pathname === \"/api/greeting\") return Response.json({ greeting: greeting_default.trim() });\n\tif (pathname === \"/api/phase1-boom\") throw new Error(\"phase1-boom-testtoken\");\n\treturn new Response(\"not found\", { status: 404 });\n} };\n//#endregion\nexport { worker_entry_default as default };\n"],
+  "mappings": ";;;;;;;;;;;;AACA,IAAI,mBAAmB;AAGvB,IAAI,uBAAuB,EAAE,MAAM,MAAM,SAAS;AACjD,QAAM,EAAE,SAAS,IAAI,IAAI,IAAI,QAAQ,GAAG;AACxC,MAAI,aAAa,gBAAiB,QAAO,SAAS,KAAK,EAAE,UAAU,iBAAiB,KAAK,EAAE,CAAC;AAC5F,MAAI,aAAa,mBAAoB,OAAM,IAAI,MAAM,uBAAuB;AAC5E,SAAO,IAAI,SAAS,aAAa,EAAE,QAAQ,IAAI,CAAC;AACjD,EAAE;",
+  "names": []
+}

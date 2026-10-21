@@ -767,6 +767,15 @@ async fn deploy_inner(
         }
     }
 
+    // The Worker map's shadow bundle runs here, while the tree is still the
+    // build uid's: the runner-owned tree below would be unreadable to the
+    // sandboxed build uid under the install's umask. Same sandbox as the
+    // build itself. The bytes upload only after a successful deploy; a
+    // failed deploy drops them with the worktree.
+    let worker_map = crate::host::sourcemaps::build_worker_map(&deploy_root, &sb)
+        .await
+        .map_err(|e| format!("{e:#}"));
+
     // Tenant steps are over: take the tree back from the build uid, so
     // nothing it left behind can change the bundle `celld deploy` uploads.
     #[cfg(unix)]
@@ -902,6 +911,40 @@ async fn deploy_inner(
                     anyhow::bail!("celld exited before answering its health gate: {why}");
                 }
             },
+        }
+    }
+
+    // Per-deploy source maps for the Errors tab (symbolication at read
+    // time): the Worker map via a shadow esbuild run over the deployed entry,
+    // plus every client map the build emitted. The shadow runs sandboxed as
+    // the build uid, like the build itself. Best-effort — the deploy
+    // already succeeded — so a failure is a log line, never a failed deploy.
+    match crate::host::sourcemaps::store_deploy_maps(
+        pool,
+        cfg,
+        &crate::host::sourcemaps::StoreMaps {
+            app_id: &app.id,
+            environment_id: target.environment_id(),
+            bucket_uri: &bucket,
+            sha: &commit_sha,
+            deploy_root: &deploy_root,
+        },
+        worker_map,
+    )
+    .await
+    {
+        Ok(summary) => {
+            progress
+                .log(DeployStatus::Success, &format!("sourcemaps: {summary}\n"))
+                .await?;
+        }
+        Err(e) => {
+            progress
+                .log(
+                    DeployStatus::Success,
+                    &format!("sourcemaps skipped: {e:#}\n"),
+                )
+                .await?;
         }
     }
 

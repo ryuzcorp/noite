@@ -8,6 +8,7 @@ import {
   createAppWithKey,
   deleteApp,
   pushAppDir,
+  runnerApi,
   runnerCall,
   waitForDeploy,
 } from "./helpers";
@@ -43,6 +44,8 @@ interface ErrorFrame {
   function: string;
   inApp: boolean;
   location: string;
+  mappedFunction?: string | null;
+  mappedLocation?: string | null;
 }
 
 interface ErrorEvent {
@@ -177,6 +180,20 @@ test("a worker throw becomes an errors-tab issue", async ({
   const deploy = await waitForDeploy(request, appId);
   expect(deploy.status, deploy.log).toBe("success");
 
+  // The deploy log line proves the maps step ran for this sha (and names
+  // which map was stored).
+  const deployLog = await runnerApi<{ log: string }>(
+    request,
+    `/v1/apps/${appId}/deploys/${deploy.id}/log`
+  );
+
+  expect(deployLog.log).toMatch(/sourcemaps: /u);
+
+  // The worker map must actually be stored: without it every frame below
+  // stays raw, and the mapped assertions cannot distinguish "store failed"
+  // from "read failed".
+  expect(deployLog.log).toMatch(/worker\.js\.map \(/u);
+
   // Through the lane Caddy, not the raw fleet port: the tenant site sets a
   // sampled `traceparent` and logs the same `traceID` in the access log, so
   // the ingest joins the exception to its method, path and status
@@ -237,7 +254,19 @@ test("a worker throw becomes an errors-tab issue", async ({
   expect(first?.frames.length).toBeGreaterThan(0);
   expect(first?.frames.some((frame) => frame.inApp)).toBe(true);
 
+  // Source maps: the occurrence resolves against its deploy's worker map,
+  // chained through the build's own map to the original worker source.
+
+  const mapped = first?.frames.find((frame) => frame.mappedLocation);
+
+  expect(mapped).toBeDefined();
+  expect(mapped?.mappedLocation).toContain("src/index.ts");
+
   // The Errors tab renders the issue (status filter `es` defaults to open).
   await page.goto(`/apps/${appId}?t=errors`);
   await expect(page.getByText(token).first()).toBeVisible();
+
+  // ...and the detail view renders the symbolicated frame.
+  await page.goto(`/apps/${appId}?t=errors&e=${detail.issue.fingerprint}`);
+  await expect(page.getByText("src/index.ts").first()).toBeVisible();
 });

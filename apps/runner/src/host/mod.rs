@@ -31,6 +31,7 @@ pub mod rename;
 pub mod s3;
 pub mod sleep;
 pub mod source;
+pub mod sourcemaps;
 pub mod state;
 pub mod stats;
 pub mod storage;

@@ -172,7 +172,7 @@ pub async fn get(
     id: &str,
     fingerprint: &str,
 ) -> Result<ErrorIssueDetail, ApiError> {
-    let (app_id, _) = telemetry_target_or_404(&state.pool, id).await?;
+    let (app_id, slug) = telemetry_target_or_404(&state.pool, id).await?;
     let issue = match db::get_error_issue(&state.pool, &app_id, fingerprint).await {
         Ok(Some(issue)) => issue,
         Ok(None) => return Err(ApiError::not_found("error not found")),
@@ -187,7 +187,7 @@ pub async fn get(
     let hourly = error_series(&keys, &hours)
         .remove(&issue.fingerprint)
         .unwrap_or_else(|| vec![0; 24]);
-    let events: Vec<ErrorEventView> = events
+    let mut events: Vec<ErrorEventView> = events
         .into_iter()
         .map(|e| ErrorEventView {
             ts_us: e.ts_us,
@@ -211,6 +211,26 @@ pub async fn get(
             environment: e.environment,
         })
         .collect();
+    // Original positions for display: each occurrence resolves its own
+    // deploy's maps (`fleets/<slug>/maps/<sha>/`). Stored frames stay raw, so
+    // grouping is untouched; a missing map just leaves raw positions. One
+    // budget across all events: a hostile issue cannot fan out S3 or burn
+    // the executor, and the rest renders raw.
+    let bucket = state.config.s3_bucket.clone();
+    let prefix = format!("fleets/{slug}");
+    let mut budget = crate::host::sourcemaps::SymbolicateBudget::for_read();
+    for event in events.iter_mut() {
+        crate::host::sourcemaps::symbolicate_frames(
+            &state.source_maps,
+            &state.config,
+            &bucket,
+            &prefix,
+            &event.sha,
+            &mut event.frames,
+            &mut budget,
+        )
+        .await;
+    }
     Ok(ErrorIssueDetail {
         issue: with_hourly(issue, hourly),
         events,
@@ -394,6 +414,7 @@ mod tests {
                 std::time::Instant::now(),
             ))),
             started_at: chrono::Utc::now(),
+            source_maps: Default::default(),
         }
     }
 
