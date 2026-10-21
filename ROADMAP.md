@@ -47,7 +47,7 @@ No cloud version: every alpha user runs their own install. The bar moves from "t
 
 **Later: source maps.** Noite runs the build, so it can keep each deploy's `*.map` next to the bundle and symbolicate stacks at read time, for Worker and browser errors alike, with no upload step. Browser bundles are minified, so this matters most after phase 2.
 
-5. **E2E gaps.** Unit tests (`bun run test`) cover the role gate, invitations, invites, rate limiter and stream loop against a SQLite-backed D1 shim; still without e2e: storage editing, rollback, commits from the source browser and the admin page. Covered in the lane: rollback (`rollback.spec.ts`) and commits from the source browser (`source-edit`/`source-tree`/`forge.spec.ts`).
+5. **E2E gaps.** Unit tests (`bun run test`) cover the role gate, invitations, invites, rate limiter and stream loop against a SQLite-backed D1 shim; still without e2e: storage editing and the admin page. Covered in the lane: rollback (`rollback.spec.ts`) and commits from the source browser (`source-edit`/`source-tree`/`forge.spec.ts`).
 6. **Not built:** a README for `apps/noite/test` (app-author docs exist: Apps → Deploy/Build/Configure); pricing. Forge follow-ups after alpha.4: forks, notifications, a conflict-resolution UI, merge methods other than squash, issues. Preview environments shipped ([Design history](#design-history)); still open around them: a pull request page that surfaces its head branch's environment, and telemetry keyed by environment, so metrics, errors and analytics are app-wide for now ([Environments](SPEC.md#environments-previews)).
 
 ## Design history

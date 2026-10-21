@@ -88,8 +88,11 @@ impl SystemResolver {
 
 /// Upper bound on one Verify lookup, owned by this code: a wedged resolver
 /// must not hold the HTTP handler past this, no matter hickory's own
-/// retries. The timeout test advances past exactly this long.
-pub(crate) const TXT_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// retries. Kept below the control UI's 5 s `RUNNER_TIMEOUT_MS` (see
+/// `apps/noite/src/lib/runner.ts`): the UI aborts first otherwise and the
+/// runner's readable timeout never reaches it. Well inside the 15 s action
+/// bound too. The timeout test advances past exactly this long.
+pub(crate) const TXT_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 /// One lookup under the Verify bound: elapsed time becomes a readable
 /// `DnsError::Lookup("timed out")`, an inner failure keeps its own message.
 /// Split out so tests can drive it with a future that never answers.

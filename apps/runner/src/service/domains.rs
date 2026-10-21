@@ -107,13 +107,25 @@ pub async fn add(
         Tenancy::Multi => (DOMAIN_STATUS_PENDING, None),
     };
     // Re-check under the insert: a rival verified row committed between the
-    // check above and now fails here on the partial unique index. The message
-    // stays static: the storage detail in the sqlx error is not for callers.
-    if db::add_domain(&state.pool, app_id, &hostname, status, &token, verified_at)
-        .await
-        .is_err()
+    // check above and now fails here on the partial unique index, and a
+    // concurrent same-app claim loses the primary-key race. Only a unique
+    // violation maps to 409 (re-reading for idempotency); anything else —
+    // pool timeouts, I/O — is a 500. The message stays static: the storage
+    // detail in the sqlx error is not for callers.
+    if let Err(e) =
+        db::add_domain(&state.pool, app_id, &hostname, status, &token, verified_at).await
     {
-        return Err(ApiError::conflict("hostname is already in use"));
+        let unique = e
+            .as_database_error()
+            .is_some_and(|e| e.is_unique_violation());
+        if !unique {
+            return Err(ApiError::internal(e.to_string()));
+        }
+        return match db::domain_claim(&state.pool, app_id, &hostname).await {
+            Ok(Some(_)) => list(state, app_id, role).await,
+            Ok(None) => Err(ApiError::conflict("hostname is already in use")),
+            Err(read_err) => Err(ApiError::internal(read_err.to_string())),
+        };
     }
     list(state, app_id, role).await
 }
@@ -484,5 +496,34 @@ mod tests {
         remove(&state, &app.id, "gated.example.com", ADMIN)
             .await
             .expect("admin removes");
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_app_claims_stay_idempotent() {
+        let (state, _fake) = test_state(Tenancy::Multi, &[]).await;
+        let app = seed_app(&state, "racer").await;
+        // Start together so the losers check before the winner commits and
+        // lose the primary-key race instead of early-returning: a unique
+        // violation with our own claim present must list, never 409.
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let state = state.clone();
+            let app_id = app.id.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                add(&state, &app_id, "race.example.com", ADMIN).await
+            }));
+        }
+        for handle in handles {
+            let rows = handle
+                .await
+                .expect("task")
+                .expect("concurrent claim stays idempotent");
+            assert_eq!(rows.len(), 1);
+        }
+        let rows = list(&state, &app.id, ADMIN).await.expect("list");
+        assert_eq!(rows.len(), 1, "one claim row, not eight");
     }
 }

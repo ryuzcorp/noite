@@ -796,10 +796,15 @@ async fn dispatch_call(
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            complete(
-                id,
-                service::domains::verify(state, &p.id, &p.hostname, p.role.as_deref()).await,
-            )
+            // REST marks dirty in middleware (POST /v1/*); /rpc bypasses it,
+            // so a successful Verify marks dirty here and the Caddyfile
+            // picks up the newly verified domain at once.
+            let result =
+                service::domains::verify(state, &p.id, &p.hostname, p.role.as_deref()).await;
+            if result.is_ok() {
+                state.state_sync.mark_dirty();
+            }
+            complete(id, result)
         }
         "domains.remove" => {
             let p: HostnameParams = match parse(params, &id) {
