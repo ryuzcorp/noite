@@ -34,7 +34,7 @@ One service from the image, one volume, one bucket:
 | Service | Image | Volume | Public domain |
 | --- | --- | --- | --- |
 | `noite` | `ghcr.io/ryuzcorp/noite:alpha` | `/data` | `*.<domain>` → port `80` |
-| `rustfs` (or use R2/Tigris) | `rustfs/rustfs:1.0.0` | `/data` | none |
+| `rustfs` (or use R2/Tigris) | `rustfs/rustfs:1.0.3` | `/data` | none |
 
 `noite` takes the same variables as a Compose install: `BASE_DOMAIN`, `CONTROL_SUBDOMAIN=app`, `BETTER_AUTH_URL=https://app.<domain>` (set before the first registration: passkeys bind to it), `GIT_PUBLIC_BASE=https://git.<domain>`, the public ports `HTTP_PORT=80` / `HTTPS_PORT=443` (the runner prints them in tenant URLs; the dev defaults 9080/9443 are unreachable here), `BETTER_AUTH_SECRET`, `RUNNER_TOKEN`, the bucket (`S3_ENDPOINT=http://rustfs.railway.internal:9000` and its keys, or your R2/Tigris endpoint), plus `CADDY_AUTO_HTTPS=off` (Railway terminates TLS) and `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=35` so the runner's stop budget fits. For a healthcheck, set `PORT=8080` (Railway probes the port in `PORT`; the runner always listens on 8080 and Caddy on 80, so this changes nothing else), path `/ready`, and `RAILWAY_HEALTHCHECK_TIMEOUT_SEC=600`: a first boot deploys the control bundle and can take minutes.
 

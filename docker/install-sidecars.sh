@@ -10,8 +10,8 @@
 # uname -m (native builds). Needs curl + unzip + tar present.
 set -eu
 
-ESBUILD_VERSION="${ESBUILD_VERSION:-0.25.12}"
-DUCKDB_VERSION="${DUCKDB_VERSION:-1.5.5}"
+ESBUILD_VERSION="${ESBUILD_VERSION:-0.28.2}"
+DUCKDB_VERSION="${DUCKDB_VERSION:-1.5.6}"
 
 wanted_esbuild=0
 wanted_duckdb=0

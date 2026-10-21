@@ -438,6 +438,13 @@ fn static_caddyfile(cfg: &Config) -> String {
         lines.push("\tauto_https off".into());
     }
     lines.push("\tadmin 127.0.0.1:2019".into());
+    // Server-wide request bounds. `read_header` drops a client that trickles
+    // its headers (slowloris) instead of holding the connection open; only
+    // `read_header` and `idle` are set, so Caddy 2.11's progress-based
+    // `read_body_idle`/`write_idle` (1m) still apply: a stalled body or
+    // response is cut, a quiet event stream between writes is not. Behind
+    // a proxy, `trusted_proxies` makes `{client_ip}` (the rate-limit key)
+    // the visitor, not the proxy.
     lines.push("\tservers {".into());
     lines.push("\t\ttimeouts {".into());
     lines.push("\t\t\tread_header 10s".into());

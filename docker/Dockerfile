@@ -19,21 +19,21 @@
 # One celld, one Caddy, one Node, one jup and one bun pin;
 # docker/check-versions.ts asserts they appear exactly once. Sidecar versions
 # (esbuild, duckdb) live in docker/install-sidecars.sh.
-ARG CELLD_VERSION=0.6.1
+ARG CELLD_VERSION=0.6.2
 # Noite's own release version, reported by the instance heartbeat
 # (`NOITE_BUILD_VERSION` ENV in the runtime stages): the tag without `v` on a
 # release build (images.yml passes it), `dev` otherwise.
 ARG NOITE_BUILD_VERSION=dev
- ARG CADDY_VERSION=2.10.0
- # The edge route-table module (edge/, handler `http.handlers.edge_routes`):
- # a local path, so no version pin — but its go.mod must require exactly
- # CADDY_VERSION above (docker/check-versions.ts asserts it), or Go's
- # minimum version selection would silently raise the Caddy xcaddy builds.
-ARG NODE_VERSION=24.21.0
+ARG CADDY_VERSION=2.11.7
+# The edge route-table module (edge/, handler `http.handlers.edge_routes`):
+# a local path, so no version pin — but its go.mod must require exactly
+# CADDY_VERSION above (docker/check-versions.ts asserts it), or Go's
+# minimum version selection would silently raise the Caddy xcaddy builds.
+ARG NODE_VERSION=24.22.0
 # jup (https://github.com/unjs/jup) runs the tenant's npm, pnpm or Yarn at
 # the version the project pins. The npm tarball's sha512, as hex.
-ARG JUP_VERSION=0.6.3
-ARG JUP_SHA512=5b1c2ed95edc02d521a511a4cfc5027a54dc674e29afcfca9c7ad55b285d346c4c4c1c5ed65985e0fa5a758ceaf6c32663b18d117a7d071ce29c56989f63988f
+ARG JUP_VERSION=0.6.5
+ARG JUP_SHA512=85297de2f655be9f7a98fdc3b59182eb5fe7d9b3315bc1e5858d91b5047a9e74ecbaaddc9b446714e37c3d7c40abb65ef9e63ab1eb7ae1a688dfa5f3f28fb2cf
 
 FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
 
