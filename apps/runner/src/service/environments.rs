@@ -14,7 +14,7 @@ use crate::db;
 use crate::host::deploy::{self, DeployTarget, DeployTrigger};
 use crate::host::env_label;
 use crate::host::git_identity::Actor;
-use crate::host::{env_teardown, forge, git_http, git_identity, sleep, web_commit};
+use crate::host::{env_teardown, forge, git_http, git_identity, web_commit};
 use crate::models::{App, AppEnv, Environment, EnvironmentKind};
 use crate::service::source::SourceCommitBody;
 use crate::AppState;
@@ -168,7 +168,7 @@ pub async fn create(
     .map_err(|e| ApiError::internal(e.to_string()))?;
     // The new site has to exist before the fleet does, so the first request
     // reaches a route instead of the app's wildcard fallback.
-    if let Err(e) = sleep::rewrite_edge(&state.pool, &state.config).await {
+    if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
         tracing::warn!(error = %format!("{e:#}"), "caddy rewrite after environment create");
     }
     spawn_deploy(state, &app, env.clone(), &sha).await?;
@@ -188,7 +188,7 @@ pub async fn delete(
     env_teardown::teardown(&state.config, &state.pool, &state.procs, &state.logs, &env)
         .await
         .map_err(|e| ApiError::internal(format!("{e:#}")))?;
-    if let Err(e) = sleep::rewrite_edge(&state.pool, &state.config).await {
+    if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
         tracing::warn!(error = %format!("{e:#}"), "caddy rewrite after environment delete");
     }
     Ok(())
@@ -209,7 +209,7 @@ pub async fn update(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
         .ok_or_else(|| ApiError::not_found("environment not found"))?;
-    if let Err(e) = sleep::rewrite_edge(&state.pool, &state.config).await {
+    if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
         tracing::warn!(error = %format!("{e:#}"), "caddy rewrite after environment update");
     }
     Ok(env)
@@ -424,7 +424,7 @@ pub async fn preview(
             )
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
-            if let Err(e) = sleep::rewrite_edge(&state.pool, &state.config).await {
+            if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
                 tracing::warn!(error = %format!("{e:#}"), "caddy rewrite after preview create");
             }
             env

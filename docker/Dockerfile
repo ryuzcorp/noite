@@ -24,12 +24,11 @@ ARG CELLD_VERSION=0.6.1
 # (`NOITE_BUILD_VERSION` ENV in the runtime stages): the tag without `v` on a
 # release build (images.yml passes it), `dev` otherwise.
 ARG NOITE_BUILD_VERSION=dev
-ARG CADDY_VERSION=2.10.0
-# Caddy's rate-limit handler (github.com/mholt/caddy-ratelimit), which the
-# runner writes for every site (SPEC, Edge limits). It has no releases past
-# v0.1.0, so the pin is a commit; bump it together with CADDY_VERSION (its
-# go.mod names the Caddy it builds against).
-ARG CADDY_RATELIMIT_VERSION=5625512f24f6f59d6f64fb3aafe5eecff0b286db
+ ARG CADDY_VERSION=2.10.0
+ # The edge route-table module (edge/, handler `http.handlers.edge_routes`):
+ # a local path, so no version pin — but its go.mod must require exactly
+ # CADDY_VERSION above (docker/check-versions.ts asserts it), or Go's
+ # minimum version selection would silently raise the Caddy xcaddy builds.
 ARG NODE_VERSION=24.21.0
 # jup (https://github.com/unjs/jup) runs the tenant's npm, pnpm or Yarn at
 # the version the project pins. The npm tarball's sha512, as hex.
@@ -38,18 +37,23 @@ ARG JUP_SHA512=5b1c2ed95edc02d521a511a4cfc5027a54dc674e29afcfca9c7ad55b285d346c4
 
 FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
 
-# --- Caddy with the rate-limit module ----------------------------------------
-# Built on the build host's platform and cross-compiled for the target, so an
-# arm64 image does not run the Go toolchain under emulation.
-# The builder image's own CADDY_VERSION env (v-prefixed, from the tag above)
-# is the version xcaddy builds.
-FROM --platform=$BUILDPLATFORM docker.io/library/caddy:${CADDY_VERSION}-builder AS caddy-build
-ARG CADDY_RATELIMIT_VERSION
-ARG TARGETOS
-ARG TARGETARCH
-RUN GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" CGO_ENABLED=0 xcaddy build \
-      --with "github.com/mholt/caddy-ratelimit@${CADDY_RATELIMIT_VERSION}" \
-      --output /out/caddy
+ # --- Caddy with the edge route-table module ----------------------------------
+ # Built on the build host's platform and cross-compiled for the target, so an
+ # arm64 image does not run the Go toolchain under emulation.
+ # The builder image's own CADDY_VERSION env (v-prefixed, from the tag above)
+ # is the version xcaddy builds.
+ FROM --platform=$BUILDPLATFORM docker.io/library/caddy:${CADDY_VERSION}-builder AS caddy-build
+ ARG TARGETOS
+ ARG TARGETARCH
+ # The builder image is golang-based, so the module's own tests run here and
+ # the image job covers them (`go vet`, formatting, `go test -race`). The
+ # race detector needs a C compiler the builder image does not carry.
+ COPY edge /edge
+ RUN apk add --no-cache gcc musl-dev \
+     && cd /edge && go vet ./... && test -z "$(gofmt -l .)" && CGO_ENABLED=1 go test -race ./...
+ RUN GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" CGO_ENABLED=0 xcaddy build \
+       --with "github.com/ryuzcorp/noite/edge=/edge" \
+       --output /out/caddy
 
 # The pinned Node's binary, for the ui-build stage below (`COPY --from` cannot
 # expand variables, so the pin lives in a stage of its own).
@@ -155,7 +159,7 @@ RUN useradd -u 10020 -m -s /bin/sh fleet \
   && mkdir -p /data /opt/noite/control
 COPY --from=celld /usr/local/bin/celld /usr/local/bin/celld
 COPY --from=caddy-build /out/caddy /usr/local/bin/caddy
-RUN caddy version && caddy list-modules | grep -qx 'http.handlers.rate_limit'
+RUN caddy version && caddy list-modules | grep -qx 'http.handlers.edge_routes'
 # Apache-2.0 §4(a): a distributed image carries a copy of the License, and
 # §4(d) its NOTICE (third-party attributions, e.g. the bundled Nodepod).
 COPY LICENSE NOTICE /licenses/
@@ -172,6 +176,7 @@ ENV RUNNER_BIND=0.0.0.0:8080 \
     RUNNER_WORK_DIR=/data/runner \
     CONTROL_BUNDLE_DIR=/opt/noite/control/dist \
     CADDYFILE_PATH=/data/caddy/Caddyfile \
+    CADDY_ROUTES_PATH=/data/caddy/routes.json \
     CADDY_ACCESS_LOG=/data/caddy/access.log \
     CADDY_ADMIN_URL=http://127.0.0.1:2019 \
     NOITE_FLEET_PORTS=20000-29999

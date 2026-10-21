@@ -217,8 +217,11 @@ struct Line {
     os: &'static str,
     path: String,
     source: String,
-    /// The `traceID` tenant sites log (host/caddy.rs `TENANT_TRACE`) with
-    /// the request it names, for the error ingest (host/errors.rs).
+    /// The `traceID` fleet sites log (`TENANT_TRACE` in the static edge
+    /// config, `traceparent` on tenant/custom/env requests) with the request
+    /// it names, for the error ingest (host/errors.rs). Non-fleet log lines
+    /// carry no `traceID` (the log appender emits an empty value, which the
+    /// parser filters).
     trace: Option<(String, RequestCtx)>,
 }
 

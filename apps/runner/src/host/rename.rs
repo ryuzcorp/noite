@@ -298,6 +298,11 @@ async fn rename_slugged(
         &format!("s3://{}/{}", cfg.s3_bucket, cfg.envs_prefix(new_slug)),
     )
     .await?;
+
+    // The slug (and every host under it) changed: push the table now.
+    if let Err(e) = crate::host::edge_table::push_routes(pool, cfg).await {
+        tracing::warn!(app_id = %app.id, error = %format!("{e:#}"), "edge push after rename");
+    }
     db::get_app(pool, &app.id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("app not found"))

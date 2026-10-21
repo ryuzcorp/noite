@@ -413,6 +413,9 @@ pub struct Config {
     pub control_extra_hosts: Vec<String>,
     pub work_dir: String,
     pub caddyfile_path: String,
+    /// Pushed route-table file the edge module loads in Provision and the
+    /// runner re-pushes live on every lifecycle event (`CADDY_ROUTES_PATH`).
+    pub routes_path: String,
     pub celld_bin: String,
     /// Fleet port range (SPEC, Ports): two ports per app.
     pub fleet_port_min: u16,
@@ -605,6 +608,8 @@ impl Config {
             work_dir: env_or(&["RUNNER_WORK_DIR"], "/data/runner"),
             caddyfile_path: env::var("CADDYFILE_PATH")
                 .unwrap_or_else(|_| "/data/caddy/Caddyfile".into()),
+            routes_path: env::var("CADDY_ROUTES_PATH")
+                .unwrap_or_else(|_| "/data/caddy/routes.json".into()),
             caddy_access_log: env::var("CADDY_ACCESS_LOG")
                 .unwrap_or_else(|_| "/data/caddy/access.log".into()),
             celld_bin: env::var("CELLD_BIN").unwrap_or_else(|_| "celld".into()),
@@ -1027,6 +1032,7 @@ pub(crate) fn config_for_tests() -> Config {
         control_extra_hosts: Vec::new(),
         work_dir: "/tmp/noite-test".into(),
         caddyfile_path: "/tmp/noite-test-bases".into(),
+        routes_path: "/tmp/noite-test-routes.json".into(),
         celld_bin: "celld".into(),
         fleet_port_min: 20000,
         fleet_port_max: 29999,

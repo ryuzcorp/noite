@@ -228,14 +228,11 @@ async fn main() -> anyhow::Result<()> {
     // route a visitor hits is live — or answering the starting page — for the
     // whole boot, and nothing below it can hold the tenants up.
     host::children::ensure_bootstrap_caddyfile(&config.caddyfile_path).await?;
-    // Before the first Caddyfile: whether this Caddy can take rate limits.
-    host::caddy::detect_modules().await;
-    if !config.edge_sees_clients() {
-        tracing::warn!(
-            "CADDY_AUTO_HTTPS=off without NOITE_TRUSTED_PROXIES: the edge sees the proxy, not \
-             visitors, so per-visitor rate limits are off (per-app ceilings still apply)"
-        );
-    }
+    // The edge config is static after boot: write it from platform config
+    // (never from app rows), then start Caddy from it. App events push the
+    // route table through the admin API and never reload. No `/load` here:
+    // Caddy boots from the file just written.
+    host::caddy::write_static_caddyfile(&config).await?;
     let caddy_child = host::children::supervise_caddy(&config);
 
     let procs = host::supervisor::new_procs();

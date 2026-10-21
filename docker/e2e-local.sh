@@ -137,6 +137,46 @@ while [ "$attempt" -lt 100 ]; do
         echo "error: noite-runner recover did not mint a code"
         rc=1
       fi
+    if [ "$rc" -eq 0 ]; then
+      # The edge static config is written once at boot; app events only push
+      # the route table through Caddy's admin API, never reloading. Any
+      # Caddy reload after boot (a second static write, "servers shutting
+      # down" in the log, or a container restart) fails the lane — and the
+      # lane must also prove pushes actually happened (a lane with no pushes
+      # would pass vacuously), via the module's per-generation push lines.
+      # shellcheck disable=SC2086
+      edge_log="$($CE2E logs --tail=20000 noite 2>&1 || true)"
+      static_writes="$(printf '%s\n' "$edge_log" | grep -c "edge static config written" || true)"
+      if [ "$static_writes" != "1" ]; then
+        echo "error: expected exactly one static edge config write, found $static_writes"
+        rc=1
+      fi
+      if printf '%s\n' "$edge_log" | grep -Eq "servers shutting down"; then
+        echo "error: caddy reloaded after boot"
+        rc=1
+      fi
+      # shellcheck disable=SC2086
+      restarts="$($CE2E ps -q 2>/dev/null | xargs $CLI inspect --format '{{.RestartCount}}' 2>/dev/null | awk '{s+=$1} END {print s+0}')"
+      if [ "$restarts" != "0" ]; then
+        echo "error: $restarts container restarts during the lane"
+        rc=1
+      fi
+      pushes="$(printf '%s\n' "$edge_log" | grep -c "edge_routes: table pushed" || true)"
+      if [ "$pushes" -lt 5 ]; then
+        echo "error: expected at least 5 route-table pushes, found $pushes (pushes never ran?)"
+        rc=1
+      fi
+      # The module logs through Caddy's zap logger: "generation":N (JSON),
+      # not generation=N.
+      maxgen="$(printf '%s\n' "$edge_log" | grep -o '"generation":[0-9]*' | grep -o "[0-9]*" | sort -n | tail -1)"
+      if [ -z "$maxgen" ] || [ "$maxgen" -lt 5 ]; then
+        echo "error: route-table generation never advanced (max ${maxgen:-none})"
+        rc=1
+      fi
+      if [ "$rc" -eq 0 ]; then
+        echo "==> edge did not reload after boot ($pushes pushes, generation $maxgen)"
+      fi
+    fi
     fi
     if [ "${E2E_KEEP:-0}" = 1 ]; then
       echo "==> E2E_KEEP=1: stack left running (project noite-e2e)"

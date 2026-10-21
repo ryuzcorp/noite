@@ -2,7 +2,7 @@
 /**
  * Pin guard for the one image (docker/Dockerfile) and its sidecars.
  *
- * - celld, Caddy (and its rate-limit module), Node and jup (with its tarball digest) are pinned exactly once (an ARG default); a second pin in
+ * - celld, Caddy, Node and jup (with its tarball digest) are pinned exactly once (an ARG default); a second pin in
  *   the same file is how a stage silently builds against another version.
  * - The floating lines stay covered without freezing them: every oven/bun
  *   stage must agree on one line, and the rust line must appear exactly
@@ -72,7 +72,6 @@ const compareVersions = (a: string, b: string): number => {
 for (const [name, pattern] of [
   ["celld", /ARG CELLD_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
   ["caddy", /ARG CADDY_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
-  ["caddy-ratelimit", /ARG CADDY_RATELIMIT_VERSION=(?<version>[0-9a-f]{40})/gu],
   ["node", /ARG NODE_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
   ["jup", /ARG JUP_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
   ["jup digest", /ARG JUP_SHA512=(?<version>[0-9a-f]{128})/gu],
@@ -88,6 +87,32 @@ for (const [name, pattern] of [
       `${name}: docker/Dockerfile must pin exactly once (found ${versions.length}: ${versions.join(", ")})`
     );
   }
+}
+
+// The edge module builds into Caddy via xcaddy: its go.mod must require
+// exactly the image's CADDY_VERSION, or Go's minimum version selection
+// would silently raise the Caddy that ships.
+const caddyPin =
+  [...dockerfile.matchAll(/ARG CADDY_VERSION=(?<version>\d+\.\d+\.\d+)/gu)].map(
+    (m) => m.groups?.version ?? ""
+  )[0] ?? "";
+
+const edgeMod = read("edge/go.mod");
+
+const edgeCaddy =
+  /github.com\/caddyserver\/caddy\/v2 v(?<version>\d+\.\d+\.\d+)/u.exec(edgeMod)
+    ?.groups?.version ?? "";
+
+if (!caddyPin || !edgeCaddy) {
+  fail(
+    "edge module: could not read CADDY_VERSION from the Dockerfile or the caddy require from edge/go.mod"
+  );
+} else if (caddyPin === edgeCaddy) {
+  console.log(`edge module: caddy v${edgeCaddy} (matches image)`);
+} else {
+  fail(
+    `edge module: edge/go.mod requires caddy v${edgeCaddy} but the image builds v${caddyPin}`
+  );
 }
 
 const imageLog = /CADDY_ACCESS_LOG=(?<sink>\S+)/u.exec(dockerfile)?.groups

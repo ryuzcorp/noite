@@ -225,6 +225,10 @@ pub async fn patch(state: &AppState, id: &str, desired: Option<&str>) -> Result<
         db::patch_app_desired(&state.pool, id, ds.as_str())
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
+        // A stop parks the route (and a start restores it): push now.
+        if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
+            tracing::warn!(app_id = %id, error = %format!("{e:#}"), "edge push after desired-state patch");
+        }
     }
     app_or_404(state, id).await
 }
@@ -342,6 +346,9 @@ pub async fn delete(state: &AppState, id: &str) -> Result<(), ApiError> {
     let delete_result = db::delete_app(&state.pool, id).await;
     drop(claim);
     delete_result.map_err(|e| ApiError::internal(e.to_string()))?;
+    if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
+        tracing::warn!(app_id = %id, error = %format!("{e:#}"), "edge push after app delete");
+    }
     // A reconcile tick that listed apps before the stop above can still have
     // started the fleet again; with the row gone nothing else would stop it.
     supervisor::stop_fleet(&state.procs, &app.slug, supervisor::StopGrace::FOR_DELETE).await;
