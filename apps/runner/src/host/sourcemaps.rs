@@ -628,24 +628,24 @@ pub fn chain_maps(
     inner: &sourcemap::SourceMap,
     entry_source: &str,
 ) -> sourcemap::SourceMap {
+    // The build's tokens, once: the neighborhood fallback scans them per
+    // outer token. Store-time work only, never on a read, and maps are
+    // small enough that the scan is cheap.
+    let inner_tokens: Vec<sourcemap::Token<'_>> = inner.tokens().collect();
     let mut builder = sourcemap::SourceMapBuilder::new(None);
     for token in outer.tokens() {
         let chained = token
             .get_source()
             .filter(|s| source_is_entry(s, entry_source))
             .and_then(|_| {
-                inner
-                    .lookup_token(token.get_src_line(), token.get_src_col())
-                    .and_then(|t| {
-                        t.get_source().map(|source| {
-                            (
-                                source.to_string(),
-                                t.get_src_line(),
-                                t.get_src_col(),
-                                t.get_name(),
-                            )
-                        })
-                    })
+                inner_token_for(&inner_tokens, token.get_src_line(), token.get_src_col()).map(|t| {
+                    (
+                        t.get_source().unwrap_or_default().to_string(),
+                        t.get_src_line(),
+                        t.get_src_col(),
+                        t.get_name(),
+                    )
+                })
             });
         match chained {
             Some((source, line, col, name)) => {
@@ -681,6 +681,43 @@ pub fn chain_maps(
 /// dependency's same-named file.
 fn source_is_entry(source: &str, entry: &str) -> bool {
     trim_dot(source) == trim_dot(entry) && !entry.is_empty()
+}
+
+/// Lines around a query that still name the same statement: V8 async frames
+/// can land on a generated wrapper line while the executing code sits
+/// beside it, and only a small window stays an honest guess.
+const INNER_SEARCH_LINES: u32 = 4;
+
+/// The build-map token an outer source position resolves through: the
+/// nearest sourced token on the same generated line, else the nearest
+/// sourced token within [`INNER_SEARCH_LINES`] lines. `None` past that
+/// window, so a position far from any mapped code keeps the outer (built)
+/// position instead of inventing an original one.
+fn inner_token_for<'a>(
+    inner_tokens: &[sourcemap::Token<'a>],
+    line: u32,
+    col: u32,
+) -> Option<sourcemap::Token<'a>> {
+    let mut best: Option<(u32, sourcemap::Token<'_>)> = None;
+    for t in inner_tokens {
+        let Some(_) = t.get_source() else {
+            continue;
+        };
+        let line_diff = t.get_dst_line().abs_diff(line);
+        // Same generated line always wins: that is the same statement.
+        // Across lines, closer wins; past the window, not a guess worth making.
+        let distance = if line_diff == 0 {
+            t.get_dst_col().abs_diff(col)
+        } else if line_diff <= INNER_SEARCH_LINES {
+            1_000_000 + line_diff * 1_000 + t.get_dst_col().abs_diff(col).min(999)
+        } else {
+            continue;
+        };
+        if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+            best = Some((distance, *t));
+        }
+    }
+    best.map(|(_, t)| t)
 }
 
 /// The config may prefix the entry with `./` while map sources arrive
@@ -1159,14 +1196,31 @@ mod tests {
 
     #[test]
     fn chaining_falls_back_when_the_build_map_misses() {
-        // Below the inner map's first token the greatest-lower-bound lookup
-        // finds nothing: the outer position survives unchained.
+        // Far from any mapped inner code the outer position survives
+        // unchained rather than inventing an original one.
         let outer = built_map(&[((0, 5), ("dist/app/index.js", 0, 0), Some("bundleFn"))]);
         let inner = built_map(&[((10, 3), ("src/index.ts", 2, 0), Some("realFn"))]);
         let chained = chain_maps(&outer, &inner, "dist/app/index.js");
         let token = chained.lookup_token(0, 5).expect("outer token");
         assert_eq!(token.get_source(), Some("dist/app/index.js"));
         assert_eq!((token.get_src_line(), token.get_src_col()), (0, 0));
+    }
+
+    #[test]
+    fn chaining_resolves_through_a_sourceless_wrapper_segment() {
+        // V8 async frames can land on a generated wrapper segment (no
+        // source) while the executing code sits on the same generated
+        // line: the neighbor's original position wins over the built one.
+        let outer = built_map(&[((0, 5), ("dist/app/index.js", 9, 2), Some("bundleFn"))]);
+        let mut builder = sourcemap::SourceMapBuilder::new(None);
+        builder.add(9, 2, 0, 0, None, None, false);
+        builder.add(9, 5, 21, 8, Some("src/index.ts"), Some("realFn"), false);
+        let inner = builder.into_sourcemap();
+        let chained = chain_maps(&outer, &inner, "dist/app/index.js");
+        let token = chained.lookup_token(0, 5).expect("chained token");
+        assert_eq!(token.get_source(), Some("src/index.ts"));
+        assert_eq!((token.get_src_line(), token.get_src_col()), (21, 8));
+        assert_eq!(token.get_name(), Some("realFn"));
     }
 
     #[test]
