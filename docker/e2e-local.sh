@@ -137,8 +137,29 @@ while [ "$attempt" -lt 100 ]; do
         echo "error: noite-runner recover did not mint a code"
         rc=1
       fi
-    fi
-    if [ "${E2E_KEEP:-0}" = 1 ]; then
+    if [ "$rc" -eq 0 ]; then
+       # The edge static config is written once at boot; app events only push
+       # the route table. Any Caddy reload after boot (a second static write,
+       # an admin /load, or a container restart) fails the lane.
+       echo "==> edge did not reload after boot"
+       # shellcheck disable=SC2086
+       edge_log="$($CE2E logs --tail=20000 noite 2>&1 || true)"
+       static_writes="$(printf '%s\n' "$edge_log" | grep -c "edge static config written" || true)"
+       if [ "$static_writes" != "1" ]; then
+         echo "error: expected exactly one static edge config write, found $static_writes"
+         rc=1
+       fi
+       if printf '%s\n' "$edge_log" | grep -Eq "caddy admin /load|servers shutting down"; then
+         echo "error: caddy reloaded after boot"
+         rc=1
+       fi
+       # shellcheck disable=SC2086
+       restarts="$($CE2E ps -q 2>/dev/null | xargs $CLI inspect --format '{{.RestartCount}}' 2>/dev/null | awk '{s+=$1} END {print s+0}')"
+       if [ "$restarts" != "0" ]; then
+         echo "error: $restarts container restarts during the lane"
+         rc=1
+       fi
+     fi
       echo "==> E2E_KEEP=1: stack left running (project noite-e2e)"
     else
       # shellcheck disable=SC2086

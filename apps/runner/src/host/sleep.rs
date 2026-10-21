@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::Config;
 use crate::db;
-use crate::host::caddy;
+use crate::host::edge_table;
 use crate::host::logs::LogState;
 use crate::host::supervisor::{self, ProcMap};
 use crate::models::{parse_time, App, AppStatus, Environment};
@@ -155,14 +155,6 @@ fn environment_activity(env: &Environment) -> Vec<Option<DateTime<Utc>>> {
     ]
 }
 
-pub async fn rewrite_edge(pool: &SqlitePool, cfg: &Config) -> anyhow::Result<()> {
-    let apps = db::list_apps(pool).await?;
-    let domains = db::list_app_domains(pool).await.unwrap_or_default();
-    let limits = db::list_app_limits(pool).await.unwrap_or_default();
-    let envs = db::list_environment_routes(pool).await.unwrap_or_default();
-    caddy::rewrite_caddy(cfg, &apps, &domains, &limits, &envs).await
-}
-
 /// Park one app. Order matters: flag it asleep, switch its sites to the
 /// wake-on-request route, *then* stop the fleet — a request arriving
 /// mid-transition already takes the wake path (and waits on this lock).
@@ -188,7 +180,7 @@ pub async fn sleep_app(
         return Ok(false);
     }
     db::set_app_asleep(pool, &app.id).await?;
-    rewrite_edge(pool, cfg).await?;
+    edge_table::push_routes(pool, cfg).await?;
     supervisor::stop_fleet(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
     crate::host::stats::record_sleep();
     tracing::info!(slug = %app.slug, force, after_h = cfg.sleep_after_h, "app asleep");
@@ -338,7 +330,7 @@ pub async fn wake_app(
     }
     if was_asleep {
         // Back to the plain proxy route: later requests skip the wake hop.
-        rewrite_edge(pool, cfg).await?;
+        edge_table::push_routes(pool, cfg).await?;
     }
     Ok(())
 }
@@ -365,7 +357,7 @@ pub async fn sleep_environment(
         return Ok(false);
     }
     db::set_environment_asleep(pool, &env.id).await?;
-    rewrite_edge(pool, cfg).await?;
+    edge_table::push_routes(pool, cfg).await?;
     supervisor::stop_environment_fleet(procs, &env.app_slug, &env.label).await;
     crate::host::stats::record_sleep();
     tracing::info!(
@@ -436,7 +428,7 @@ pub async fn wake_environment(
             .await?;
     }
     if was_asleep {
-        rewrite_edge(pool, cfg).await?;
+        edge_table::push_routes(pool, cfg).await?;
     }
     Ok(())
 }

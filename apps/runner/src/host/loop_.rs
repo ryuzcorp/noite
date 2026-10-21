@@ -11,8 +11,8 @@ use sqlx::SqlitePool;
 
 use crate::config::Config;
 use crate::db;
-use crate::host::caddy;
 use crate::host::deploy::{self, Deploying};
+use crate::host::edge_table;
 use crate::host::logs::LogState;
 use crate::host::metrics::{self, MetricsState};
 use crate::host::supervisor::{self, ProcMap};
@@ -304,11 +304,7 @@ async fn reconcile_once(
         sweep_expired_environments(pool, cfg, procs, logs).await;
     }
 
-    let visible = db::list_apps(pool).await?;
-    let domains = db::list_app_domains(pool).await.unwrap_or_default();
-    let limits = db::list_app_limits(pool).await.unwrap_or_default();
-    let routes = db::list_environment_routes(pool).await.unwrap_or_default();
-    caddy::rewrite_caddy(cfg, &visible, &domains, &limits, &routes).await?;
+    edge_table::push_routes(pool, cfg).await?;
     // Backstop for a fleet left running after its app's (or environment's)
     // row was deleted.
     supervisor::stop_orphan_fleets(pool, procs).await;

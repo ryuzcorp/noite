@@ -66,6 +66,26 @@ export default {
 
       worker[n3] = v3;
 
+      // The route-table push endpoint: unreachable from a tenant. The body
+      // is deliberately invalid (unknown kind), so even a regressed egress
+      // policy yields a 400 that keeps the old table — while the probe
+      // reports reached and the spec fails closed.
+      const [n10, v10] = await attempt("fetch:edge-routes-push", async () => {
+        const res = await fetch("http://127.0.0.1:2019/edge/routes", {
+          body: JSON.stringify({
+            exact: { "probe.invalid": { kind: "nope" } },
+            generation: 1,
+            wildcards: [],
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        });
+
+        return `status ${res.status}`;
+      });
+
+      worker[n10] = v10;
+
       // The fleet's own celld must reach the object store, so the egress
       // policy allows its address; the keys stay inside celld. Reaching it
       // is expected: only a store that serves data without them is a leak.

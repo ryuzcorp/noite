@@ -80,5 +80,8 @@ pub async fn set(
     db::set_app_limit(&state.pool, &limit)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
+        tracing::warn!(app_id = %app.id, error = %format!("{e:#}"), "edge push after limits change");
+    }
     Ok(limits_view(&state.config, &limit))
 }

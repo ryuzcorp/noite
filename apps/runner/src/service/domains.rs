@@ -67,6 +67,12 @@ pub async fn list(
         .map_err(|e| ApiError::internal(e.to_string()))
 }
 
+async fn push_edge(state: &AppState, what: &str) {
+    if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
+        tracing::warn!(error = %format!("{e:#}"), "edge push after domain {what}");
+    }
+}
+
 pub async fn add(
     state: &AppState,
     app_id: &str,
@@ -127,6 +133,7 @@ pub async fn add(
             Err(read_err) => Err(ApiError::internal(read_err.to_string())),
         };
     }
+    push_edge(state, "add").await;
     list(state, app_id, role).await
 }
 
@@ -181,7 +188,10 @@ pub async fn verify(
         )));
     }
     match db::verify_domain(&state.pool, app_id, &hostname).await {
-        Ok(true) => list(state, app_id, role).await,
+        Ok(true) => {
+            push_edge(state, "verify").await;
+            list(state, app_id, role).await
+        }
         Ok(false) => {
             // Lost a race inside the transaction, or the claim vanished:
             // re-read to answer precisely.
@@ -207,7 +217,10 @@ pub async fn remove(
     let hostname = hostname.trim().trim_end_matches('.').to_lowercase();
     match db::remove_domain(&state.pool, app_id, &hostname).await {
         Ok(0) => Err(ApiError::not_found("hostname is not attached to this app")),
-        Ok(_) => list(state, app_id, role).await,
+        Ok(_) => {
+            push_edge(state, "remove").await;
+            list(state, app_id, role).await
+        }
         Err(e) => Err(ApiError::internal(e.to_string())),
     }
 }

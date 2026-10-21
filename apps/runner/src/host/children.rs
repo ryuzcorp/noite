@@ -181,13 +181,12 @@ pub async fn ensure_bootstrap_caddyfile(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Caddy: admin on its default 127.0.0.1:2019, where the runner POSTs each
-/// new config (`host::caddy::load_admin`). The runner is the only writer, so
-/// there is exactly one reload path: a `--watch` fallback would race the
-/// admin load on every write, and two overlapping server restarts strand
-/// in-flight connections. On boot Caddy reads the file the runner wrote
-/// before supervising it; an unreachable admin only logs (the file stays the
-/// boot source).
+/// Caddy: static config, written once at boot (`host::caddy`), with the
+/// admin on its default 127.0.0.1:2019, where the runner pushes the route
+/// table (`host::edge_table::push_routes`). App events never reload: there
+/// is no `--watch` and no `/load` path after boot. On boot Caddy reads the
+/// file the runner wrote before supervising it; the table file it loads in
+/// Provision, and the tick re-pushes the live table.
 pub fn supervise_caddy(config: &Config) -> Supervised {
     let caddyfile = config.caddyfile_path.clone();
     Supervised::start("caddy", move || {

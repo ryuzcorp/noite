@@ -6,6 +6,7 @@ pub mod control;
 pub mod credentials;
 pub mod deploy;
 pub mod edge;
+pub mod edge_table;
 pub mod env_gate;
 pub mod env_label;
 pub mod env_teardown;
