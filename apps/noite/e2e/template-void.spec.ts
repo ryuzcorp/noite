@@ -66,20 +66,54 @@ test("the Ilha + Void template deploys and serves", async ({
     )
     .toContain("Render a page with Void and Ilha");
 
+  // Pre-hydration race regression (flake CI run 39514830134): the page is
+  // server-rendered with the form in place, but the controlled input and
+  // submit handler exist only after the client hydrates — a fill or click
+  // before that was lost (the Add click fell back to a native GET submit to
+  // /?text=…, and the todo never appeared). The template keeps its controls
+  // disabled until the client mounts, so drivers wait instead. Client
+  // scripts are held behind a promise the test resolves itself (no timers):
+  // while held, the server-rendered input, Add button and island counter
+  // must already be disabled; after release the test drives the page as a
+  // user would.
+  let gate: Promise<unknown> = Promise.resolve();
+  let releaseGate: (() => void) | undefined;
+
+  const holdScripts = (): void => {
+    const deferred = Promise.withResolvers();
+
+    gate = deferred.promise;
+    releaseGate = deferred.resolve;
+  };
+
+  await page.route("**/*.js", async (route) => {
+    await gate;
+    await route.continue();
+  });
+
   // The server action: adding a todo from the browser, through the Worker.
-  await page.goto(`${base}/`);
+  holdScripts();
+  await page.goto(`${base}/`, { waitUntil: "commit" });
+  const todoInput = page.getByLabel("New todo");
+  const addButton = page.getByRole("button", { name: "Add" });
+  await expect(todoInput).toBeDisabled();
+  await expect(addButton).toBeDisabled();
+  releaseGate?.();
   await expect(
     page.getByRole("heading", { name: "Ilha + Void on Noite" })
   ).toBeVisible();
-  await page.getByLabel("New todo").fill("Serve on celld");
-  await page.getByRole("button", { name: "Add" }).click();
+  await todoInput.fill("Serve on celld");
+  await addButton.click();
   await expect(page.locator("li", { hasText: "Serve on celld" })).toBeVisible();
 
   // The island page serves static HTML with a working counter island.
-  await page.goto(`${base}/about`);
+  holdScripts();
+  await page.goto(`${base}/about`, { waitUntil: "commit" });
   await expect(page.getByRole("heading", { name: "About" })).toBeVisible();
   const counter = page.getByRole("button", { name: /Clicked \d+ times/u });
+  await expect(counter).toBeDisabled();
   await expect(counter).toContainText("Clicked 1 times");
+  releaseGate?.();
   await counter.click();
   await expect(counter).toContainText("Clicked 2 times");
 });
