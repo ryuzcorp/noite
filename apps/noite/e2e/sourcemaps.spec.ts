@@ -156,7 +156,11 @@ test("worker and browser errors symbolicate to original sources", async ({
       { intervals: [1000], timeout: 60_000 }
     )
     .toEqual({ greeting: "hello from vite" });
-  // Telemetry flushes every ~30 s and the ingest pass runs after it.
+
+  // Trigger the Worker throw; the 500 proves the worker ran the new bundle.
+  const boom = await request.get(`${base}/api/boom`);
+  expect(boom.status()).toBe(500);
+
   await expect
     .poll(() => findIssue(request, appId, "worker-boom"), {
       intervals: [5000],
