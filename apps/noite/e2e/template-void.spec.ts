@@ -86,13 +86,25 @@ test("the Ilha + Void template deploys and serves", async ({
     releaseGate = deferred.resolve;
   };
 
-  await page.route("**/*.js", async (route) => {
-    await gate;
-    await route.continue();
-  });
+  // Arm the held-scripts gate for one guarded navigation. The previous
+  // section's gate is released and unrouted first: a request held for the
+  // old page must never survive the navigation. Continuing it afterwards
+  // is a silent no-op (no response, no error), which wedged the island
+  // counter in CI run 39535601008: old-page scripts parked on the new
+  // gate stayed `pending` after release and hydration never ran.
+  const guardScripts = async (): Promise<void> => {
+    releaseGate?.();
+    await page.unroute("**/*.js");
+    holdScripts();
+    await page.route("**/*.js", async (route) => {
+      await gate;
+      await route.continue();
+    });
+  };
+
+  await guardScripts();
 
   // The server action: adding a todo from the browser, through the Worker.
-  holdScripts();
   await page.goto(`${base}/`, { waitUntil: "commit" });
   const todoInput = page.getByLabel("New todo");
   const addButton = page.getByRole("button", { name: "Add" });
@@ -107,7 +119,7 @@ test("the Ilha + Void template deploys and serves", async ({
   await expect(page.locator("li", { hasText: "Serve on celld" })).toBeVisible();
 
   // The island page serves static HTML with a working counter island.
-  holdScripts();
+  await guardScripts();
   await page.goto(`${base}/about`, { waitUntil: "commit" });
   await expect(page.getByRole("heading", { name: "About" })).toBeVisible();
   const counter = page.getByRole("button", { name: /Clicked \d+ times/u });
