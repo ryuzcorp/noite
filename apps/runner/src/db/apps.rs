@@ -221,25 +221,24 @@ pub async fn add_domain(
     .await
     .map(|_| ())
 }
+/// Whether a SQLite failure is a unique-constraint violation — the shape a
+/// lost verification race takes when the partial unique index refuses the
+/// second verified row. Detected structurally through sqlx's error kind, so
+fn rival_won(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .is_some_and(|e| e.is_unique_violation())
+}
 
-/// Mark an app's pending claim verified and drop every rival pending claim
 /// for the hostname: the first to verify wins, and the losers' rows vanish
-/// so their panels stop offering a proof that can never succeed. Runs in one
-/// transaction, re-checking for a verified rival inside it, so two apps
-/// verifying the same hostname at once serialize instead of both winning.
-/// Returns whether the claim flipped (false = already verified, or a rival
-/// got there first).
+/// so their panels stop offering a proof that can never succeed. The flip
+/// is one blind `UPDATE`: the partial unique index on verified rows is the
+/// arbiter, so two apps verifying at once cannot both win no matter how
+/// their transactions interleave. A unique violation means a rival won the
+/// race and maps to `Ok(false)` (the service re-reads and answers 409),
+/// detected structurally — never by matching the message. Returns whether
+/// the claim flipped (`false` = already verified, gone, or a rival won).
 pub async fn verify_domain(pool: &SqlitePool, app_id: &str, hostname: &str) -> sqlx::Result<bool> {
     let mut tx = pool.begin().await?;
-    let rival: Option<(String,)> =
-        sqlx::query_as("SELECT app_id FROM app_domain WHERE hostname = ? AND status = 'verified'")
-            .bind(hostname)
-            .fetch_optional(&mut *tx)
-            .await?;
-    if rival.is_some() {
-        tx.rollback().await?;
-        return Ok(false);
-    }
     let flipped = sqlx::query(
         "UPDATE app_domain SET status = 'verified', verified_at = ? WHERE app_id = ? AND hostname = ? AND status = 'pending'",
     )
@@ -247,8 +246,15 @@ pub async fn verify_domain(pool: &SqlitePool, app_id: &str, hostname: &str) -> s
     .bind(app_id)
     .bind(hostname)
     .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    .await;
+    let flipped = match flipped {
+        Ok(done) => done.rows_affected(),
+        Err(e) if rival_won(&e) => {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
     if flipped == 0 {
         tx.rollback().await?;
         return Ok(false);
@@ -595,5 +601,63 @@ mod tests {
             .await
             .expect("missing");
         assert!(!gone, "a deleted row is a quiet no-op");
+    }
+
+    /// A verification that loses the race maps to `false` (the service
+    /// answers 409), never a 500: the blind flip hits the partial unique
+    /// index when a rival won, and the violation is the loser's signal.
+    #[tokio::test]
+    async fn verify_maps_a_lost_race_to_false() {
+        let pool = connect("sqlite::memory:").await.expect("memory db");
+        insert_app(&pool, "a", "a", "a.localhost").await;
+        insert_app(&pool, "b", "b", "b.localhost").await;
+        add_domain(&pool, "a", "race.test", "verified", "tok", Some("now"))
+            .await
+            .expect("rival");
+        add_domain(&pool, "b", "race.test", "pending", "tok", None)
+            .await
+            .expect("own pending");
+        assert!(
+            !verify_domain(&pool, "b", "race.test")
+                .await
+                .expect("a lost race is not a 500"),
+            "the loser maps to false"
+        );
+        assert_eq!(
+            verified_domain_owner(&pool, "race.test")
+                .await
+                .expect("owner")
+                .as_deref(),
+            Some("a"),
+            "the rival still holds the name"
+        );
+    }
+
+    /// `rival_won` classifies by sqlx's error kind, never the message: a
+    /// real partial-index refusal counts, any other failure does not.
+    #[tokio::test]
+    async fn rival_won_detects_unique_violations_structurally() {
+        let pool = connect("sqlite::memory:").await.expect("memory db");
+        insert_app(&pool, "a", "a", "a.localhost").await;
+        insert_app(&pool, "b", "b", "b.localhost").await;
+        add_domain(&pool, "a", "race.test", "verified", "tok", Some("now"))
+            .await
+            .expect("rival");
+        add_domain(&pool, "b", "race.test", "pending", "tok", None)
+            .await
+            .expect("own pending");
+        let refused = sqlx::query("UPDATE app_domain SET status = 'verified' WHERE app_id = 'b'")
+            .execute(&pool)
+            .await
+            .expect_err("the partial index refuses the second verified row");
+        assert!(
+            rival_won(&refused),
+            "a unique violation is a rival win: {refused}"
+        );
+        let missing = sqlx::query("UPDATE no_such_table SET x = 1")
+            .execute(&pool)
+            .await
+            .expect_err("missing table");
+        assert!(!rival_won(&missing), "other failures are not rival wins");
     }
 }

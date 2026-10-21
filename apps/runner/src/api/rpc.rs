@@ -244,9 +244,12 @@ struct EnvDeleteParams {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct HostnameParams {
     id: String,
     hostname: String,
+    #[serde(default)]
+    role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -763,18 +766,30 @@ async fn dispatch_call(
             )
         }
         "domains.list" => {
-            let p: IdParams = match parse(params, &id) {
+            #[derive(Deserialize)]
+            struct P {
+                id: String,
+                #[serde(default)]
+                role: Option<String>,
+            }
+            let p: P = match parse(params, &id) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            complete(id, service::domains::list(state, &p.id).await)
+            complete(
+                id,
+                service::domains::list(state, &p.id, p.role.as_deref()).await,
+            )
         }
         "domains.add" => {
             let p: HostnameParams = match parse(params, &id) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            complete(id, service::domains::add(state, &p.id, &p.hostname).await)
+            complete(
+                id,
+                service::domains::add(state, &p.id, &p.hostname, p.role.as_deref()).await,
+            )
         }
         "domains.verify" => {
             let p: HostnameParams = match parse(params, &id) {
@@ -783,7 +798,7 @@ async fn dispatch_call(
             };
             complete(
                 id,
-                service::domains::verify(state, &p.id, &p.hostname).await,
+                service::domains::verify(state, &p.id, &p.hostname, p.role.as_deref()).await,
             )
         }
         "domains.remove" => {
@@ -793,7 +808,7 @@ async fn dispatch_call(
             };
             complete(
                 id,
-                service::domains::remove(state, &p.id, &p.hostname).await,
+                service::domains::remove(state, &p.id, &p.hostname, p.role.as_deref()).await,
             )
         }
         "limits.get" => {

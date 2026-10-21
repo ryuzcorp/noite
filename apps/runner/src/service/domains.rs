@@ -23,21 +23,45 @@ use crate::models::{AppDomain, DOMAIN_STATUS_PENDING, DOMAIN_STATUS_VERIFIED};
 use crate::AppState;
 
 use super::apps::app_or_404;
+use super::environments::role_ok;
 
+/// Enforce one gate. A missing role is a refusal, never a default: the caller
+/// (the control UI) always knows its role, and an unknown caller must not
+/// inherit rights.
+fn require(role: Option<&str>, need: &str) -> Result<(), ApiError> {
+    match role {
+        Some(role) if role_ok(role, need) => Ok(()),
+        Some(role) => Err(ApiError::forbidden(format!(
+            "role {role:?} may not {need} this app's domains"
+        ))),
+        None => Err(ApiError::forbidden(format!(
+            "the {need} role is required for this operation"
+        ))),
+    }
+}
 /// Hostnames this platform answers for itself: the base domain and its
-/// platform subdomains, plus every extra control hostname. An app may never
-/// claim one — `Host` dispatch would otherwise fight the control plane.
+/// platform subdomains, plus every extra control hostname and its
+/// subdomains (tenant sites serve under extra bases too — `tenant_bases` —
+/// so a custom claim there would collide with the tenant site for one
+/// address). An app may never claim one — `Host` dispatch would otherwise
+/// fight the control plane.
 fn platform_host(cfg: &Config, hostname: &str) -> bool {
     let base = cfg.base_domain.to_lowercase();
     if hostname == base || hostname.ends_with(&format!(".{base}")) {
         return true;
     }
-    cfg.control_extra_hosts
-        .iter()
-        .any(|extra| hostname == extra.trim().trim_matches('.').to_lowercase())
+    cfg.control_extra_hosts.iter().any(|raw| {
+        let extra = raw.trim().trim_matches('.').to_lowercase();
+        !extra.is_empty() && (hostname == extra || hostname.ends_with(&format!(".{extra}")))
+    })
 }
 
-pub async fn list(state: &AppState, app_id: &str) -> Result<Vec<AppDomain>, ApiError> {
+pub async fn list(
+    state: &AppState,
+    app_id: &str,
+    role: Option<&str>,
+) -> Result<Vec<AppDomain>, ApiError> {
+    require(role, "view")?;
     db::list_domains_for(&state.pool, app_id)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))
@@ -47,7 +71,9 @@ pub async fn add(
     state: &AppState,
     app_id: &str,
     hostname: &str,
+    role: Option<&str>,
 ) -> Result<Vec<AppDomain>, ApiError> {
+    require(role, "admin")?;
     let hostname = hostname.trim().trim_end_matches('.').to_lowercase();
     if !hostname_ok(&hostname) {
         return Err(ApiError::bad("invalid hostname"));
@@ -70,7 +96,7 @@ pub async fn add(
     // Re-claiming our own hostname is idempotent: the token the panel shows
     // stays the one the operator may already have published.
     match db::domain_claim(&state.pool, app_id, &hostname).await {
-        Ok(Some(_)) => return list(state, app_id).await,
+        Ok(Some(_)) => return list(state, app_id, role).await,
         Ok(None) => {}
         Err(e) => return Err(ApiError::internal(e.to_string())),
     }
@@ -81,15 +107,15 @@ pub async fn add(
         Tenancy::Multi => (DOMAIN_STATUS_PENDING, None),
     };
     // Re-check under the insert: a rival verified row committed between the
-    // check above and now fails here on the partial unique index.
-    if let Err(e) =
-        db::add_domain(&state.pool, app_id, &hostname, status, &token, verified_at).await
+    // check above and now fails here on the partial unique index. The message
+    // stays static: the storage detail in the sqlx error is not for callers.
+    if db::add_domain(&state.pool, app_id, &hostname, status, &token, verified_at)
+        .await
+        .is_err()
     {
-        return Err(ApiError::conflict(format!(
-            "hostname is already in use: {e}"
-        )));
+        return Err(ApiError::conflict("hostname is already in use"));
     }
-    list(state, app_id).await
+    list(state, app_id, role).await
 }
 
 /// Verify our pending claim: the TXT record at the challenge name must
@@ -99,7 +125,9 @@ pub async fn verify(
     state: &AppState,
     app_id: &str,
     hostname: &str,
+    role: Option<&str>,
 ) -> Result<Vec<AppDomain>, ApiError> {
+    require(role, "admin")?;
     let hostname = hostname.trim().trim_end_matches('.').to_lowercase();
     if !hostname_ok(&hostname) {
         return Err(ApiError::bad("invalid hostname"));
@@ -112,7 +140,7 @@ pub async fn verify(
         return Err(ApiError::not_found("hostname is not attached to this app"));
     };
     if claim.is_verified() {
-        return list(state, app_id).await;
+        return list(state, app_id, role).await;
     }
     // A rival verified while we waited: the proof can never succeed now.
     match db::verified_domain_owner(&state.pool, &hostname).await {
@@ -141,7 +169,7 @@ pub async fn verify(
         )));
     }
     match db::verify_domain(&state.pool, app_id, &hostname).await {
-        Ok(true) => list(state, app_id).await,
+        Ok(true) => list(state, app_id, role).await,
         Ok(false) => {
             // Lost a race inside the transaction, or the claim vanished:
             // re-read to answer precisely.
@@ -161,11 +189,13 @@ pub async fn remove(
     state: &AppState,
     app_id: &str,
     hostname: &str,
+    role: Option<&str>,
 ) -> Result<Vec<AppDomain>, ApiError> {
+    require(role, "admin")?;
     let hostname = hostname.trim().trim_end_matches('.').to_lowercase();
     match db::remove_domain(&state.pool, app_id, &hostname).await {
         Ok(0) => Err(ApiError::not_found("hostname is not attached to this app")),
-        Ok(_) => list(state, app_id).await,
+        Ok(_) => list(state, app_id, role).await,
         Err(e) => Err(ApiError::internal(e.to_string())),
     }
 }
@@ -176,12 +206,20 @@ mod tests {
     use crate::models::new_id;
     use std::sync::Arc;
 
-    async fn test_state(tenancy: Tenancy) -> (AppState, Arc<crate::dns::FakeResolver>) {
+    /// The tests act as an app admin: every service call carries the role
+    /// the control UI would resolve and pass.
+    const ADMIN: Option<&str> = Some("admin");
+
+    async fn test_state(
+        tenancy: Tenancy,
+        extra_hosts: &[&str],
+    ) -> (AppState, Arc<crate::dns::FakeResolver>) {
         let dir = std::env::temp_dir().join(format!("noite-domains-{tenancy:?}-{}", new_id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let mut cfg = crate::config::config_for_tests();
         cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
         cfg.tenancy = tenancy;
+        cfg.control_extra_hosts = extra_hosts.iter().map(|host| host.to_string()).collect();
         let fake = Arc::new(crate::dns::FakeResolver::default());
         let config = Arc::new(cfg);
         let pool = crate::db::connect(&config.database_url)
@@ -233,10 +271,12 @@ mod tests {
 
     #[tokio::test]
     async fn single_tenancy_verifies_on_claim() {
-        let (state, _fake) = test_state(Tenancy::Single).await;
+        let (state, _fake) = test_state(Tenancy::Single, &[]).await;
         let app = seed_app(&state, "solo").await;
 
-        let rows = add(&state, &app.id, "app.example.com").await.expect("add");
+        let rows = add(&state, &app.id, "app.example.com", ADMIN)
+            .await
+            .expect("add");
         assert_eq!(rows.len(), 1);
         assert!(rows[0].is_verified(), "single auto-verifies");
         assert!(rows[0].verified_at.is_some());
@@ -250,10 +290,12 @@ mod tests {
 
     #[tokio::test]
     async fn pending_claim_resolves_nothing_until_verified() {
-        let (state, fake) = test_state(Tenancy::Multi).await;
+        let (state, fake) = test_state(Tenancy::Multi, &[]).await;
         let app = seed_app(&state, "pending").await;
 
-        let rows = add(&state, &app.id, "shop.example.com").await.expect("add");
+        let rows = add(&state, &app.id, "shop.example.com", ADMIN)
+            .await
+            .expect("add");
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].is_verified());
         assert!(!rows[0].token.is_empty());
@@ -269,7 +311,7 @@ mod tests {
             &dns::challenge_name("shop.example.com"),
             vec!["not-our-token".to_owned()],
         );
-        let err = verify(&state, &app.id, "shop.example.com")
+        let err = verify(&state, &app.id, "shop.example.com", ADMIN)
             .await
             .expect_err("wrong value must fail");
         assert!(
@@ -279,7 +321,7 @@ mod tests {
 
         // No record at all fails readably too.
         fake.set(&dns::challenge_name("shop.example.com"), Vec::new());
-        let err = verify(&state, &app.id, "shop.example.com")
+        let err = verify(&state, &app.id, "shop.example.com", ADMIN)
             .await
             .expect_err("missing record must fail");
         assert!(
@@ -290,7 +332,7 @@ mod tests {
         // The right token flips the claim, which then resolves.
         let token = rows[0].token.clone();
         fake.set(&dns::challenge_name("shop.example.com"), vec![token]);
-        let rows = verify(&state, &app.id, "shop.example.com")
+        let rows = verify(&state, &app.id, "shop.example.com", ADMIN)
             .await
             .expect("verify");
         assert!(rows[0].is_verified());
@@ -302,14 +344,14 @@ mod tests {
 
     #[tokio::test]
     async fn first_to_verify_wins_and_rivals_are_dropped() {
-        let (state, fake) = test_state(Tenancy::Multi).await;
+        let (state, fake) = test_state(Tenancy::Multi, &[]).await;
         let a = seed_app(&state, "rival-a").await;
         let b = seed_app(&state, "rival-b").await;
         let host = "contested.example.com";
 
         // Parallel pending claims coexist: no squatting by mere claim.
-        add(&state, &a.id, host).await.expect("a claims");
-        add(&state, &b.id, host).await.expect("b claims");
+        add(&state, &a.id, host, ADMIN).await.expect("a claims");
+        add(&state, &b.id, host, ADMIN).await.expect("b claims");
         let b_token = db::domain_claim(&state.pool, &b.id, host)
             .await
             .expect("read")
@@ -317,7 +359,9 @@ mod tests {
             .token;
 
         fake.set(&dns::challenge_name(host), vec![b_token]);
-        verify(&state, &b.id, host).await.expect("b verifies");
+        verify(&state, &b.id, host, ADMIN)
+            .await
+            .expect("b verifies");
 
         // B's claim resolves; A's pending row is gone, and A can never win now.
         assert!(db::get_app_by_domain(&state.pool, host)
@@ -328,7 +372,7 @@ mod tests {
             .await
             .expect("read")
             .is_none());
-        let err = verify(&state, &a.id, host)
+        let err = verify(&state, &a.id, host, ADMIN)
             .await
             .expect_err("loser must fail");
         assert!(
@@ -337,7 +381,9 @@ mod tests {
         );
 
         // A fresh claim by the loser is refused while B holds the name.
-        let err = add(&state, &a.id, host).await.expect_err("add must fail");
+        let err = add(&state, &a.id, host, ADMIN)
+            .await
+            .expect_err("add must fail");
         assert!(
             err.to_string().contains("already verified"),
             "clear refusal: {err}"
@@ -346,17 +392,97 @@ mod tests {
 
     #[tokio::test]
     async fn verify_without_a_resolver_fails_readably() {
-        let (mut state, _fake) = test_state(Tenancy::Multi).await;
+        let (mut state, _fake) = test_state(Tenancy::Multi, &[]).await;
         state.dns = Arc::new(crate::dns::UnavailableResolver::new(
             "no nameservers".to_owned(),
         ));
         let app = seed_app(&state, "noresolv").await;
-        add(&state, &app.id, "dark.example.com")
+        add(&state, &app.id, "dark.example.com", ADMIN)
             .await
             .expect("claim");
-        let err = verify(&state, &app.id, "dark.example.com")
+        let err = verify(&state, &app.id, "dark.example.com", ADMIN)
             .await
             .expect_err("no resolver must fail");
         assert_eq!(err.to_string(), "DNS resolver unavailable: no nameservers");
+    }
+
+    #[tokio::test]
+    async fn extra_control_hosts_and_their_subdomains_are_platform() {
+        let (state, _fake) = test_state(Tenancy::Multi, &["noite.local"]).await;
+        let app = seed_app(&state, "extra").await;
+        for host in ["noite.local", "myapp.noite.local", "deep.myapp.noite.local"] {
+            let err = add(&state, &app.id, host, ADMIN)
+                .await
+                .expect_err("platform host must be refused");
+            assert_eq!(err.to_string(), "hostname belongs to the platform");
+        }
+        // A sibling suffix that merely shares the tail is claimable.
+        add(&state, &app.id, "notnoite.local", ADMIN)
+            .await
+            .expect("non-platform suffix claims");
+    }
+
+    #[tokio::test]
+    async fn conflict_messages_carry_no_storage_detail() {
+        let (state, fake) = test_state(Tenancy::Multi, &[]).await;
+        let a = seed_app(&state, "static-a").await;
+        let b = seed_app(&state, "static-b").await;
+        add(&state, &a.id, "held.example.com", ADMIN)
+            .await
+            .expect("a claims");
+        let token = db::domain_claim(&state.pool, &a.id, "held.example.com")
+            .await
+            .expect("read")
+            .expect("a claim")
+            .token;
+        fake.set(&dns::challenge_name("held.example.com"), vec![token]);
+        verify(&state, &a.id, "held.example.com", ADMIN)
+            .await
+            .expect("a verifies");
+        let err = add(&state, &b.id, "held.example.com", ADMIN)
+            .await
+            .expect_err("rival claim must conflict");
+        assert_eq!(
+            err.to_string(),
+            "hostname is already verified by another app"
+        );
+    }
+
+    #[tokio::test]
+    async fn role_gates_hold_without_a_control_ui() {
+        let (state, _fake) = test_state(Tenancy::Multi, &[]).await;
+        let app = seed_app(&state, "gated").await;
+        // No role is a refusal on every call, never a default.
+        assert!(matches!(
+            list(&state, &app.id, None).await,
+            Err(ApiError::Forbidden(_))
+        ));
+        assert!(matches!(
+            add(&state, &app.id, "gated.example.com", None).await,
+            Err(ApiError::Forbidden(_))
+        ));
+        assert!(matches!(
+            verify(&state, &app.id, "gated.example.com", None).await,
+            Err(ApiError::Forbidden(_))
+        ));
+        assert!(matches!(
+            remove(&state, &app.id, "gated.example.com", None).await,
+            Err(ApiError::Forbidden(_))
+        ));
+        // A viewer reads but mutates nothing.
+        list(&state, &app.id, Some("view"))
+            .await
+            .expect("view lists");
+        assert!(matches!(
+            add(&state, &app.id, "gated.example.com", Some("view")).await,
+            Err(ApiError::Forbidden(_))
+        ));
+        // An admin passes everywhere.
+        add(&state, &app.id, "gated.example.com", ADMIN)
+            .await
+            .expect("admin adds");
+        remove(&state, &app.id, "gated.example.com", ADMIN)
+            .await
+            .expect("admin removes");
     }
 }

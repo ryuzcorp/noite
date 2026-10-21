@@ -9,7 +9,7 @@ import {
   runnerVerifyDomain,
 } from "../runner";
 import { apiAction } from "./api";
-import { requireViewApp, sessionUser } from "./session.server";
+import { sessionUser } from "./session.server";
 
 const AppId = Schema.String;
 
@@ -18,12 +18,14 @@ const DomainArgs = Schema.Struct({
   hostname: Schema.String,
 });
 
-/** Hostnames this app answers on, for anyone who can see the app. */
+/** Hostnames this app answers on. The runner enforces the view gate, so the
+ * resolved role is passed through (mirrors `environments.list`). */
 export const listDomains = apiAction(AppId, async (appId, { env, request }) => {
-  await requireViewApp(request, env, appId);
+  const user = await sessionUser(request, env);
+  const { role } = await requireAppRole(appId, user.id, "view");
 
   try {
-    return await runnerListDomains(appId);
+    return await runnerListDomains(appId, role);
   } catch (error) {
     failUnknown(error);
   }
@@ -31,16 +33,16 @@ export const listDomains = apiAction(AppId, async (appId, { env, request }) => {
 
 /** Reserve a hostname for the app (admin). In `multi` tenancy the claim
  * starts pending and the panel shows the TXT proof to publish; in `single`
- * it is verified at once. The runner is the authority on shape, collisions
- * and platform-owned names; its message is surfaced. */
+ * it is verified at once. The runner is the authority on shape, collisions,
+ * platform-owned names and the role gate; its message is surfaced. */
 export const addDomain = apiAction(
   DomainArgs,
   async ({ appId, hostname }, { env, request }) => {
     const user = await sessionUser(request, env);
-    await requireAppRole(appId, user.id, "admin");
+    const { role } = await requireAppRole(appId, user.id, "admin");
 
     try {
-      return await runnerAddDomain(appId, hostname);
+      return await runnerAddDomain(appId, hostname, role);
     } catch (error) {
       failUnknown(error);
     }
@@ -54,10 +56,10 @@ export const verifyDomain = apiAction(
   DomainArgs,
   async ({ appId, hostname }, { env, request }) => {
     const user = await sessionUser(request, env);
-    await requireAppRole(appId, user.id, "admin");
+    const { role } = await requireAppRole(appId, user.id, "admin");
 
     try {
-      return await runnerVerifyDomain(appId, hostname);
+      return await runnerVerifyDomain(appId, hostname, role);
     } catch (error) {
       failUnknown(error);
     }
@@ -68,10 +70,10 @@ export const removeDomain = apiAction(
   DomainArgs,
   async ({ appId, hostname }, { env, request }) => {
     const user = await sessionUser(request, env);
-    await requireAppRole(appId, user.id, "admin");
+    const { role } = await requireAppRole(appId, user.id, "admin");
 
     try {
-      return await runnerRemoveDomain(appId, hostname);
+      return await runnerRemoveDomain(appId, hostname, role);
     } catch (error) {
       failUnknown(error);
     }

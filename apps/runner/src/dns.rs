@@ -86,17 +86,31 @@ impl SystemResolver {
     }
 }
 
+/// Upper bound on one Verify lookup, owned by this code: a wedged resolver
+/// must not hold the HTTP handler past this, no matter hickory's own
+/// retries. The timeout test advances past exactly this long.
+pub(crate) const TXT_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// One lookup under the Verify bound: elapsed time becomes a readable
+/// `DnsError::Lookup("timed out")`, an inner failure keeps its own message.
+/// Split out so tests can drive it with a future that never answers.
+async fn with_lookup_timeout<F, T, E>(lookup: F) -> Result<T, DnsError>
+where
+    F: Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    tokio::time::timeout(TXT_LOOKUP_TIMEOUT, lookup)
+        .await
+        .map_err(|_| DnsError::Lookup("timed out".to_owned()))?
+        .map_err(|e| DnsError::Lookup(e.to_string()))
+}
+
 impl TxtResolver for SystemResolver {
     fn txt_records<'a>(
         &'a self,
         name: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, DnsError>> + Send + 'a>> {
         Box::pin(async move {
-            let lookup = self
-                .inner
-                .txt_lookup(name)
-                .await
-                .map_err(|e| DnsError::Lookup(e.to_string()))?;
+            let lookup = with_lookup_timeout(self.inner.txt_lookup(name)).await?;
             let mut out = Vec::new();
             for record in lookup.answers() {
                 let hickory_resolver::proto::rr::RData::TXT(txt) = &record.data else {
@@ -241,5 +255,16 @@ mod tests {
             .expect_err("unavailable must fail");
         assert_eq!(err, DnsError::Unavailable("no nameservers".to_owned()));
         assert_eq!(err.to_string(), "DNS resolver unavailable: no nameservers");
+    }
+
+    #[tokio::test]
+    async fn wedged_lookup_times_out_readably() {
+        tokio::time::pause();
+        // A lookup that never answers: the Verify bound, not the wall
+        // clock, ends it — paused time advances deterministically.
+        let wedged = with_lookup_timeout(std::future::pending::<Result<Vec<String>, DnsError>>());
+        tokio::time::advance(TXT_LOOKUP_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        let err = wedged.await.expect_err("a wedged lookup must fail");
+        assert_eq!(err, DnsError::Lookup("timed out".to_owned()));
     }
 }

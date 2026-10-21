@@ -521,24 +521,31 @@ export const runnerIngestErrors = (
     projectId,
   });
 
-/** Custom hostnames attached to an app (all of them, in hostname order). */
-export const runnerListDomains = (id: string) =>
-  runnerRpc<RunnerDomain[]>("domains.list", { id });
+/** Custom hostnames attached to an app (all of them, in hostname order).
+ * `role` is the caller's resolved app role, enforced runner-side. */
+export const runnerListDomains = (id: string, role: string) =>
+  runnerRpc<RunnerDomain[]>("domains.list", { id, role });
 
 /** Reserve a hostname. The runner validates the shape and rejects a hostname
  * the platform owns or another app already holds. In `multi` tenancy the
  * claim starts pending until its TXT proof verifies; in `single` it is
  * verified immediately. */
-export const runnerAddDomain = (id: string, hostname: string) =>
-  runnerRpc<RunnerDomain[]>("domains.add", { hostname, id });
+export const runnerAddDomain = (id: string, hostname: string, role: string) =>
+  runnerRpc<RunnerDomain[]>("domains.add", { hostname, id, role });
 
 /** Check this app's pending claim: the TXT record at
  * `_noite-challenge.<hostname>` must contain the claim's token. */
-export const runnerVerifyDomain = (id: string, hostname: string) =>
-  runnerRpc<RunnerDomain[]>("domains.verify", { hostname, id });
+export const runnerVerifyDomain = (
+  id: string,
+  hostname: string,
+  role: string
+) => runnerRpc<RunnerDomain[]>("domains.verify", { hostname, id, role });
 
-export const runnerRemoveDomain = (id: string, hostname: string) =>
-  runnerRpc<RunnerDomain[]>("domains.remove", { hostname, id });
+export const runnerRemoveDomain = (
+  id: string,
+  hostname: string,
+  role: string
+) => runnerRpc<RunnerDomain[]>("domains.remove", { hostname, id, role });
 
 export const runnerGetLimits = (id: string) =>
   runnerRpc<RunnerLimits>("limits.get", { id });
