@@ -33,6 +33,7 @@ pub async fn tick(
     state: &mut MetricsState,
     log_tx: &tokio::sync::watch::Sender<u64>,
 ) -> anyhow::Result<()> {
+    super::drain_forgotten(state);
     let apps = db::list_apps(pool).await?;
     // A failed listing skips the tick (like a failed app listing): an empty
     // fallback would drop every environment-host access line past the

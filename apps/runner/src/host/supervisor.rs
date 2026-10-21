@@ -418,7 +418,7 @@ async fn ensure_spawned(
     // metric prune) come from the same helper the control fleet uses, so the
     // two sources cannot drift. An environment's files land under
     // `envs/<slug>/<label>/telemetry/...` (its own `--bucket`), which the
-    // Phase 1 ingest does not read (ROADMAP Phase 3).
+    // ingest reads alongside production, keyed by environment.
     for (key, value) in crate::host::metrics::otel_env(cfg) {
         cmd.env(key, value);
     }

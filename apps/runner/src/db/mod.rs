@@ -242,6 +242,35 @@ mod tests {
     use super::*;
     use crate::models::new_id;
 
+    /// A boot that crashed after the PK rebuild committed but before the new
+    /// index was created leaves a rebuilt table without its index. The next
+    /// boot sees the PK already rebuilt (nothing to change), so the index
+    /// must still be recreated, or every dashboard read and ingest write
+    /// scans the table forever.
+    #[tokio::test]
+    async fn a_missing_telemetry_index_is_recreated_on_boot() {
+        let dir = std::env::temp_dir().join(format!("noite-db-index-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        let pool = connect(&url).await.expect("boot");
+        sqlx::query("DROP INDEX metrics.idx_app_metric_app_bucket")
+            .execute(&pool)
+            .await
+            .expect("simulate the crash window");
+        ensure_environment_telemetry(&pool)
+            .await
+            .expect("reboot migration");
+        let found: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM metrics.sqlite_master WHERE type = 'index' AND name = 'idx_app_metric_app_bucket'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("index lookup");
+        assert_eq!(found.as_deref(), Some("idx_app_metric_app_bucket"));
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Boot applies schema.sql on every connect, with metrics.sqlite
     /// attached. A bare `DROP TABLE` there once fell through to the attached
     /// database and wiped the metric history and ingest watermark on every

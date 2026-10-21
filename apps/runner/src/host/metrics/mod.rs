@@ -81,6 +81,82 @@ pub fn set_watermarks(state: &mut MetricsState, marks: HashMap<String, i64>) {
     state.watermark = marks;
 }
 
+/// Fleet keys whose persisted telemetry state was deleted (an environment
+/// teardown) and whose in-memory copies the tick must drop before its next
+/// pass. The tick owns `MetricsState` and teardown runs elsewhere, so the
+/// handoff is this set: a label reused right after a teardown must start
+/// from the floor, not inherit the dead fleet's watermark or "already
+/// compacted" marks.
+static FORGOTTEN: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// Ask the tick to drop every in-memory trace of `fleet_key`.
+pub fn forget_fleet(fleet_key: &str) {
+    FORGOTTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(fleet_key.to_string());
+}
+
+/// Drop the in-memory state of every forgotten fleet key (start of a tick).
+fn drain_forgotten(state: &mut MetricsState) {
+    let keys: Vec<String> = FORGOTTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain()
+        .collect();
+    for key in keys {
+        state.watermark.remove(&key);
+        state.compacted.remove(&key);
+        state.last_cpu.remove(&key);
+        state.attempted.retain(|(slug, _)| slug != &key);
+        state.ingest_backoff.retain(|(slug, _), _| slug != &key);
+    }
+}
+
+#[cfg(test)]
+mod forget_tests {
+    use super::*;
+
+    /// A torn-down environment's in-memory marks are dropped before the next
+    /// pass, so a label reused in the same process starts from the floor
+    /// instead of inheriting the dead fleet's watermark and "already
+    /// compacted" hour. Other fleets keep theirs.
+    #[test]
+    fn forgetting_a_fleet_drops_only_its_in_memory_marks() {
+        let gone = "forget-test-app.feature";
+        let kept = "forget-test-app";
+        let mut state = new_state();
+        for key in [gone, kept] {
+            state.watermark.insert(key.to_string(), 42);
+            state
+                .compacted
+                .insert(key.to_string(), "2026/10/22/01".to_string());
+            state.last_cpu.insert(key.to_string(), (1, 1));
+            state
+                .attempted
+                .insert((key.to_string(), "2026/10/22/02".to_string()));
+            state
+                .ingest_backoff
+                .insert((key.to_string(), 7), std::time::Instant::now());
+        }
+        forget_fleet(gone);
+        drain_forgotten(&mut state);
+        assert!(!state.watermark.contains_key(gone));
+        assert!(!state.compacted.contains_key(gone));
+        assert!(!state.last_cpu.contains_key(gone));
+        assert!(state.attempted.iter().all(|(slug, _)| slug != gone));
+        assert!(state.ingest_backoff.keys().all(|(slug, _)| slug != gone));
+        assert_eq!(state.watermark.get(kept), Some(&42));
+        assert!(state.compacted.contains_key(kept));
+        assert!(state.attempted.iter().any(|(slug, _)| slug == kept));
+        // Drained once: a second pass forgets nothing more.
+        state.watermark.insert(gone.to_string(), 7);
+        drain_forgotten(&mut state);
+        assert_eq!(state.watermark.get(gone), Some(&7));
+    }
+}
+
 fn minute_bucket_now() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:00Z").to_string()
 }

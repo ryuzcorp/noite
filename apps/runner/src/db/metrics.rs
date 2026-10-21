@@ -721,6 +721,10 @@ pub async fn ensure_environment_telemetry(pool: &SqlitePool) -> anyhow::Result<(
                 changed = true;
             }
         }
+        // Drop the old-shape indexes only after a rebuild, but always
+        // (re)create the new ones: the rebuild commits before these run, so a
+        // crash in between leaves a table whose PK is already rebuilt
+        // (`changed` false on the next boot) and that never got its index.
         if changed {
             for index in t.index_names {
                 sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -729,9 +733,9 @@ pub async fn ensure_environment_telemetry(pool: &SqlitePool) -> anyhow::Result<(
                 .execute(pool)
                 .await?;
             }
-            for create in t.indexes {
-                sqlx::query(*create).execute(pool).await?;
-            }
+        }
+        for create in t.indexes {
+            sqlx::query(*create).execute(pool).await?;
         }
     }
     Ok(())

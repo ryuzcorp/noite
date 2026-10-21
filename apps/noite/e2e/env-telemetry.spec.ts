@@ -295,10 +295,16 @@ test(
       .pullRequest.number;
 
     await page.goto(`/apps/${appId}/pulls/${prNumber}`);
+    // No environment yet: the card offers the create action instead of a
+    // status (the behavior, not its wording). The button is awaited first so
+    // the "no Open link" check runs on the rendered card, not a loading page.
+    const createEnv = page.getByRole("button", { name: "Create environment" });
+
+    await expect(createEnv).toBeVisible();
     await expect(
-      page.getByText(`No environment for ${BRANCH} yet.`)
-    ).toBeVisible();
-    await page.getByRole("button", { name: "Create environment" }).click();
+      page.getByRole("link", { name: "Open environment" })
+    ).toHaveCount(0);
+    await createEnv.click();
 
     const branchSelect = page.locator("#env-branch");
 

@@ -59,6 +59,10 @@ pub async fn teardown(
     if let Err(e) = db::delete_compactions_for(pool, &fleet_key).await {
         tracing::warn!(env_id = %env.id, error = %e, "environment compaction-mark purge failed");
     }
+    // The tick's in-memory copies of those marks go too, or a label reused
+    // before the next restart would inherit the dead fleet's watermark and
+    // skip its first compactions.
+    crate::host::metrics::forget_fleet(&fleet_key);
     // The environment's key must not outlive its prefix (SPEC, Scoped
     // credentials); the app's own key is untouched.
     if let Err(e) = crate::host::credentials::revoke_environment(pool, cfg, &env.id).await {

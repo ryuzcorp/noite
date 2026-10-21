@@ -108,8 +108,7 @@ pub async fn app_logs(
 /// only when the snapshot changed (plus keep-alive comments). Wakes on the
 /// ingest tick's "new logs" signal (spec T3.3) instead of polling DuckDB, and
 /// ends when the client disconnects. `?environmentId=` serves that
-/// environment's ring instead (its telemetry is not ingested, so there is no
-/// OTel merge and no production data in it).
+/// environment's own ring and its ingested OTel logs, never production's.
 pub async fn app_logs_stream(
     State(state): State<AppState>,
     Path(id): Path<String>,
