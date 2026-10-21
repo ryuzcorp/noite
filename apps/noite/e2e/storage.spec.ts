@@ -312,6 +312,14 @@ const openVisits = async (page: Page, appId: string): Promise<void> => {
   await expect(page.getByRole("tab", { name: /visits/u })).toBeVisible();
 };
 
+/** Open one visits row in the editor by clicking its url cell text. A click
+ * on the row's center can land on the hover-revealed per-cell Copy button,
+ * which stops propagation and copies instead of opening the row. */
+const openVisitRow = async (page: Page, url: string): Promise<void> => {
+  await page.getByText(url, { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Update row" })).toBeVisible();
+};
+
 test("tenant D1 rows insert, edit and single-delete through the editor", async ({
   page,
   request,
@@ -340,8 +348,7 @@ test("tenant D1 rows insert, edit and single-delete through the editor", async (
   await expect.poll(pollD1Count(request, appId, inserted)).toBe(1);
 
   // Edit that same row: open it from the grid, change only the url, save.
-  await page.getByRole("row", { name: /d1-alpha/u }).click();
-  await expect(page.getByRole("heading", { name: "Update row" })).toBeVisible();
+  await openVisitRow(page, inserted);
   await page.locator("#d1-field-visits-url").fill(edited);
   await page.getByRole("button", { name: "Save" }).click();
   await expect(page.getByText("Row updated")).toBeVisible();
@@ -353,8 +360,7 @@ test("tenant D1 rows insert, edit and single-delete through the editor", async (
   // Single delete from the row editor's inline confirm.
   await search.fill(edited);
   await expect(page.getByRole("row", { name: /d1-beta/u })).toBeVisible();
-  await page.getByRole("row", { name: /d1-beta/u }).click();
-  await expect(page.getByRole("heading", { name: "Update row" })).toBeVisible();
+  await openVisitRow(page, edited);
   await page.getByRole("button", { name: "Delete row" }).click();
   await expect(page.getByText(/Delete row where/u)).toBeVisible();
   await page.getByRole("button", { exact: true, name: "Delete" }).click();
