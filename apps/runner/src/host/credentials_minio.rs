@@ -241,7 +241,7 @@ impl CredentialProvider for MinioAdmin {
 fn is_no_such(status: u16, body: &[u8]) -> bool {
     status == 404
         || body.windows(9).any(|w| w == b"NoSuchKey")
-        || body.windows(13).any(|w| w == b"NoSuchEntity")
+        || body.windows(12).any(|w| w == b"NoSuchEntity")
         || body.windows(13).any(|w| w == b"XMinioAdminNo")
 }
 

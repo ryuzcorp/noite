@@ -10,7 +10,7 @@ Noite is alpha and self-hosted: you run it, so you decide who gets an account. T
 Under `NOITE_TENANCY=multi` ([Tenancy](/self-hosting/tenancy)) tenant code runs as unprivileged users, with a cleared environment and an egress policy. Builds and release commands run as **one uid per app**, so two concurrent builds cannot read each other's worktrees or caches. That is still a sandbox for **semi-trusted** tenants, not for adversaries:
 
 - **Bucket keys in fleets.** A fleet's celld process holds scoped keys for its own prefix only — except on stores with no prefix-scoped keys (R2) or without the extra `NOITE_CREDENTIAL_PROVIDER=aws` configuration (AWS S3), where fleets keep the object store's **root** keys as an explicit `root` mode the boot log, `/ready` and `make doctor` all name.
-- **Object store reachable from Worker code.** The store's unauthenticated surface (it answers 401/403) is the one private address tenants may reach, because celld needs it.
+- **Object store reachable from Worker code and builds.** The store's unauthenticated surface (it answers 401/403) is the one private address tenants may reach, because celld and the release command's scoped key need it. Builds hold no keys.
 - **No per-app memory cap.** Fleets share the container's memory. One app's growth pushes every app toward the same shed threshold.
 - **No container per build.** Depth is uid, environment, resource limits and egress rules. Rootless containers or gVisor are not planned unless tenants are expected to be hostile.
 

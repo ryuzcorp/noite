@@ -68,7 +68,6 @@ deny("read:/proc/self/environ:secrets", () => {
 await Promise.all(
   [
     ["fetch:runner-loopback", "http://127.0.0.1:8080/health"],
-    ["fetch:rustfs", "http://rustfs:9000/"],
     ["fetch:control-operator", "http://127.0.0.1:8091/state"],
     ["fetch:caddy-admin", "http://127.0.0.1:2019/config/"],
   ].map(([name, target]) =>
@@ -79,6 +78,23 @@ await Promise.all(
     })
   )
 );
+
+// The store's unauthenticated surface answers 401/403 by design (Workers
+// reach it too); only an answered request counts as a leak. The build uid
+// is allowed the store's address for the release command's scoped key, so
+// a refused connection here would prove nothing — the status does.
+try {
+  const res = await fetch("http://rustfs:9000/", {
+    signal: AbortSignal.timeout(3000),
+  });
+
+  out["fetch:rustfs"] =
+    res.status === 401 || res.status === 403
+      ? { detail: `status ${res.status}`, ok: false }
+      : { detail: `status ${res.status}`, ok: true };
+} catch (error) {
+  out["fetch:rustfs"] = { detail: String(error).slice(0, 200), ok: false };
+}
 
 await denyAsync("fetch:metadata", async () => {
   const res = await fetch("http://169.254.169.254/");

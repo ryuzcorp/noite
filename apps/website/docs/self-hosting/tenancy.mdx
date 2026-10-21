@@ -13,7 +13,7 @@ description: NOITE_TENANCY decides whether other people may push code — multi 
 `multi` is for **semi-trusted tenants**: people you would invite to your server, running code you do not review, who are not trying to break out. It stops accidents and casual snooping. It is not a boundary you can hand to strangers.
 
 - Fleets and release commands hold **scoped bucket keys** for their own prefix only — an app reaches `fleets/{slug}/`, a preview environment reaches `envs/{slug}/{label}/` (never production's), and no key lists the bucket root. The one exception is a store with no prefix-scoped keys (R2) or without the extra configuration (AWS S3 needs `NOITE_CREDENTIAL_PROVIDER=aws` and an IAM-capable key): there fleets keep the **root** keys as an explicit `root` mode the boot log, `/ready` and `make doctor` all name. Worker code holds no keys either way.
-- Worker code can reach the object store's unauthenticated surface.
+- Worker code and builds can reach the object store's unauthenticated surface (it answers 401/403; builds hold no keys).
 - Fleets share the container's memory: one app's growth pushes every app toward the same shed threshold.
 - Release commands (for example D1 migrations) are skipped in `multi` where no scoped provider exists, because they would need the root keys.
 

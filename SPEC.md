@@ -136,7 +136,7 @@ Fallback where a platform grants no `NET_ADMIN` (not built): run each fleet unde
 
 - The build uid is **shared**, so two concurrent builds can read each other's worktrees. Acceptable while tenants are untrusted rather than adversarial; per-build uids are the fix.
 - Fleets hold [scoped bucket keys](#scoped-credentials) for their own prefix only — except on stores with no prefix-scoped keys (R2) or without the extra configuration (AWS S3 needs `NOITE_CREDENTIAL_PROVIDER=aws` and an IAM-capable key), where they hold the **root** keys as an explicit `root` mode the boot log, `/ready` and `make doctor` all name.
-- Worker code can reach the object store's unauthenticated surface (it answers 401/403).
+- Worker code and builds can reach the object store's unauthenticated surface (it answers 401/403; builds hold no keys).
 - Sandbox depth is uid + env + rlimits + egress rules. A container per build (rootless Podman in the image, gVisor) is out of scope unless tenants are expected to be adversarial.
 - No per-tenant memory containment: fleets share the container cgroup, so one fleet's growth pushes every fleet toward the shared shed threshold. Per-fleet cgroups (memory.max per fleet, which also gives celld a per-fleet working set) are the fix where cgroupfs is writable.
 - Railway does not grant `NET_ADMIN` (verified 2026-09-27: `nft` fails with `Operation not permitted`), so Railway installs run `NOITE_TENANCY=single`. Railway also wraps the entrypoint, so tini is not PID 1 there; set `TINI_SUBREAPER=1`.
