@@ -47,7 +47,7 @@ Browser events land in the same Errors tab with the same grouping, labelled **Br
 
 ### Source maps
 
-Each successful deploy stores its source maps under `maps/<deploy-sha>/` in the app's own bucket prefix, and the Errors tab symbolicates every occurrence against the maps of the commit it ran on: the stack shows the original file, line and function, with the minified frame kept on a dimmer line below.
+Each successful production deploy stores its source maps under `maps/<deploy-sha>/` in the app's own bucket prefix, and the Errors tab symbolicates every occurrence against the maps of the commit it ran on: the stack shows the original file, line and function, with the minified frame kept on a dimmer line below. (Preview environment deploys store no maps yet — environment errors aren't ingested.)
 
 - **Worker maps need no config.** `celld deploy` bundles with esbuild but emits no map, so after a successful deploy the runner re-runs celld's exact esbuild flags over the same entry with `--sourcemap` and keeps only the map — the deployed bytes stay byte-identical — chained through the build's own map when the entry carries one.
 - **Browser maps come from your build.** Only maps the build emitted are collected, never generated. With Vite, set `build.sourcemap: "hidden"` in `vite.config.ts`: the `hidden` setting emits `*.js.map` next to the bundles without the `sourceMappingURL` comment, so browsers fetch no map file while the runner can still symbolicate. Like any hidden-map setup, the map files stay publicly fetchable by exact URL — the same tradeoff as Cloudflare.

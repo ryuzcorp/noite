@@ -907,16 +907,21 @@ async fn deploy_inner(
 
     // Per-deploy source maps for the Errors tab (symbolication at read
     // time): the Worker map via a shadow esbuild run over the deployed entry,
-    // plus every client map the build emitted. Best-effort — the deploy
+    // plus every client map the build emitted. The shadow runs sandboxed as
+    // the build uid, like the build itself. Best-effort — the deploy
     // already succeeded — so a failure is a log line, never a failed deploy.
     match crate::host::sourcemaps::store_deploy_maps(
         pool,
         cfg,
-        &app.id,
-        target.environment_id(),
-        &bucket,
-        &commit_sha,
-        &deploy_root,
+        &crate::host::sourcemaps::StoreMaps {
+            app_id: &app.id,
+            environment_id: target.environment_id(),
+            bucket_uri: &bucket,
+            sha: &commit_sha,
+            deploy_root: &deploy_root,
+            sandbox_uid: sandbox_id,
+            sandbox_gid: sandbox_id,
+        },
     )
     .await
     {

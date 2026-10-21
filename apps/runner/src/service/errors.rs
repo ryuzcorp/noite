@@ -213,9 +213,12 @@ pub async fn get(
         .collect();
     // Original positions for display: each occurrence resolves its own
     // deploy's maps (`fleets/<slug>/maps/<sha>/`). Stored frames stay raw, so
-    // grouping is untouched; a missing map just leaves raw positions.
+    // grouping is untouched; a missing map just leaves raw positions. One
+    // budget across all events: a hostile issue cannot fan out S3 or burn
+    // the executor, and the rest renders raw.
     let bucket = state.config.s3_bucket.clone();
     let prefix = format!("fleets/{slug}");
+    let mut budget = crate::host::sourcemaps::SymbolicateBudget::for_read();
     for event in events.iter_mut() {
         crate::host::sourcemaps::symbolicate_frames(
             &state.source_maps,
@@ -224,6 +227,7 @@ pub async fn get(
             &prefix,
             &event.sha,
             &mut event.frames,
+            &mut budget,
         )
         .await;
     }

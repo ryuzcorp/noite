@@ -56,9 +56,20 @@ const MAX_MAP_BYTES: u64 = 8 * 1024 * 1024;
 /// Cap on files walked per deploy: maps are small and hashed, so hundreds of
 /// them means a misconfigured build, not a real app.
 const MAX_MAP_FILES: usize = 200;
+/// All maps stored for one deploy, worker map included: the per-file cap
+/// alone would let a hostile build land gigabytes per deploy (times the
+/// retained sha dirs). Past this, client maps are skipped in walk order with
+/// a deploy-log note.
+const TOTAL_MAP_BYTES_PER_DEPLOY: u64 = 64 * 1024 * 1024;
 /// Parsed maps cached per process: enough for the recent deploys of a busy
 /// account, bounded so one giant app cannot grow the runner.
 const MAX_CACHED_BYTES: usize = 32 * 1024 * 1024;
+/// Distinct maps fetched per `errors.get`: a normal issue needs one or two,
+/// and a hostile manifest must not fan out hundreds of S3 reads.
+const MAX_MAPS_PER_GET: usize = 8;
+/// Frames attempted per `errors.get`: past this the rest stay raw instead of
+/// burning executor time on a pathological stack.
+const MAX_FRAMES_PER_GET: usize = 256;
 /// Deploy sha dirs kept per target besides the just-finished one. Occurrences
 /// older than this still render — with their raw, unsymbolicated stacks.
 const KEEP_DEPLOY_SHAS: usize = 10;
@@ -120,6 +131,12 @@ pub struct MapManifest {
     /// Stored map path for the Worker bundle, relative to `maps/<sha>/`.
     #[serde(default)]
     pub worker: Option<String>,
+    /// The assets directory the client maps live under, deploy-root-relative
+    /// (`client` when the bundle key is `client/assets/app.js`). A served
+    /// frame path (`assets/app.js`) matches the bundle key exactly once
+    /// this prefix is re-attached — no suffix guessing across hashed names.
+    #[serde(default)]
+    pub assets_dir: Option<String>,
     /// Bundle-relative asset path → stored map path, relative to
     /// `maps/<sha>/`.
     #[serde(default)]
@@ -205,26 +222,46 @@ fn map_for_frame<'a>(manifest: &'a MapManifest, location: &str) -> Option<&'a st
         return manifest.worker.as_deref();
     }
     let path = frame_asset_path(location)?;
-    if let Some(rel) = manifest.files.get(&path) {
-        return Some(rel);
+    // Exact match only: the bundle key is `{assets_dir}/{served path}` (or
+    // the full key for root-level maps). Suffix guessing attached the wrong
+    // map across hashed sibling names, so it is gone on purpose.
+    if let Some(dir) = manifest.assets_dir.as_deref() {
+        if let Some(rel) = manifest.files.get(&format!("{dir}/{path}")) {
+            return Some(rel);
+        }
+        return None;
     }
-    let mut candidates: Vec<&String> = manifest
-        .files
-        .iter()
-        .filter(|(bundle, _)| bundle.ends_with(path.as_str()) || path.ends_with(bundle.as_str()))
-        .map(|(_, map)| map)
-        .collect();
-    candidates.sort();
-    candidates.into_iter().next().map(String::as_str)
+    manifest.files.get(&path).map(String::as_str)
+}
+
+/// Abuse bounds for one `errors.get`: distinct maps fetched and frames
+/// attempted. A normal issue uses one map and dozens of frames; a hostile
+/// manifest (hundreds of rels) or a pathological stack stops here and renders
+/// the rest raw, instead of fanning S3 reads and executor time out.
+#[derive(Debug, Clone)]
+pub struct SymbolicateBudget {
+    pub maps: usize,
+    pub frames: usize,
+}
+
+impl SymbolicateBudget {
+    pub fn for_read() -> Self {
+        Self {
+            maps: MAX_MAPS_PER_GET,
+            frames: MAX_FRAMES_PER_GET,
+        }
+    }
 }
 
 /// Attach original positions to frames in place, loading maps through `load`.
 /// Pure apart from the loader, so unit tests drive it with built maps. Never
-/// fails: an unmapped frame keeps its raw (minified) position.
+/// fails: an unmapped frame keeps its raw (minified) position. Stops loading
+/// new maps and attempting frames past the budget, leaving the rest raw.
 pub fn symbolicate_with(
     frames: &mut [Frame],
     manifest: &MapManifest,
     load: &impl Fn(&str) -> Option<Arc<sourcemap::SourceMap>>,
+    budget: &mut SymbolicateBudget,
 ) -> usize {
     let mut mapped = 0;
     let mut loaded: HashMap<&str, Option<Arc<sourcemap::SourceMap>>> = HashMap::new();
@@ -232,13 +269,29 @@ pub fn symbolicate_with(
         if frame.mapped_location.is_some() {
             continue;
         }
+        if budget.frames == 0 {
+            break;
+        }
         let Some(rel) = map_for_frame(manifest, &frame.location) else {
             continue;
         };
-        let sm = loaded.entry(rel).or_insert_with(|| load(rel));
-        let Some(sm) = sm.clone() else {
+        let hit = loaded.get(rel).cloned();
+        let sm = match hit {
+            Some(hit) => hit,
+            None => {
+                if budget.maps == 0 {
+                    continue;
+                }
+                budget.maps -= 1;
+                let fetched = load(rel);
+                loaded.insert(rel, fetched.clone());
+                fetched
+            }
+        };
+        let Some(sm) = sm else {
             continue;
         };
+        budget.frames -= 1;
         let Some((_, line, col)) = split_frame_location(&frame.location) else {
             continue;
         };
@@ -248,14 +301,18 @@ pub fn symbolicate_with(
         let Some(source) = token.get_source() else {
             continue;
         };
-        frame.mapped_location = Some(format!(
-            "{}:{}:{}",
-            source,
-            token.get_src_line() + 1,
-            token.get_src_col() + 1
+        // Clip like the raw frames: map contents are tenant-controlled.
+        frame.mapped_location = Some(super::errors::clip(
+            &format!(
+                "{}:{}:{}",
+                source,
+                token.get_src_line() + 1,
+                token.get_src_col() + 1
+            ),
+            super::errors::MAX_MESSAGE,
         ));
         if let Some(name) = token.get_name() {
-            frame.mapped_function = Some(name.to_string());
+            frame.mapped_function = Some(super::errors::clip(name, super::errors::MAX_MESSAGE));
         }
         mapped += 1;
     }
@@ -265,7 +322,8 @@ pub fn symbolicate_with(
 /// Attach original positions to one occurrence's frames from its deploy's
 /// maps. Best-effort by contract: a missing manifest, an S3 hiccup or a bad
 /// map leaves the raw positions the ingest stored — the read never fails for
-/// symbolication.
+/// symbolication. The budget caps distinct maps fetched and frames attempted
+/// for the whole `errors.get`, and is shared across its events.
 pub async fn symbolicate_frames(
     cache: &SourceMapCache,
     cfg: &Config,
@@ -273,6 +331,7 @@ pub async fn symbolicate_frames(
     prefix: &str,
     sha: &str,
     frames: &mut [Frame],
+    budget: &mut SymbolicateBudget,
 ) {
     if sha.is_empty() || !is_key_sha(sha) {
         return;
@@ -286,14 +345,21 @@ pub async fn symbolicate_frames(
         .collect();
     rels.sort();
     rels.dedup();
+    let take = rels.len().min(budget.maps);
+    budget.maps -= take;
     let mut loaded: HashMap<String, Option<Arc<sourcemap::SourceMap>>> = HashMap::new();
-    for rel in rels {
+    for rel in rels.into_iter().take(take) {
         loaded.insert(
             rel.to_string(),
             cache.map(cfg, bucket, prefix, sha, rel).await,
         );
     }
-    symbolicate_with(frames, &manifest, &|rel| loaded.get(rel).cloned().flatten());
+    symbolicate_with(
+        frames,
+        &manifest,
+        &|rel| loaded.get(rel).cloned().flatten(),
+        budget,
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -309,13 +375,24 @@ struct ManifestKey {
     sha: String,
 }
 
+/// One entry in the shared eviction order (maps and manifests evict oldest
+/// first out of the same byte budget, negatives included).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CachedKey {
+    Map(CacheKey),
+    Manifest(ManifestKey),
+}
+
+/// Weight of a cached negative entry: the two keys are the bulk of it.
+const NEGATIVE_ENTRY_WEIGHT: usize = 256;
+
 #[derive(Debug, Default)]
 struct CacheInner {
     bytes: usize,
-    /// Insertion order for oldest-first eviction.
-    order: VecDeque<CacheKey>,
-    maps: HashMap<CacheKey, Option<Arc<sourcemap::SourceMap>>>,
-    manifests: HashMap<ManifestKey, Option<Arc<MapManifest>>>,
+    /// Insertion order for oldest-first eviction, across maps and manifests.
+    order: VecDeque<CachedKey>,
+    maps: HashMap<CacheKey, (Option<Arc<sourcemap::SourceMap>>, usize)>,
+    manifests: HashMap<ManifestKey, (Option<Arc<MapManifest>>, usize)>,
 }
 
 /// Parsed maps and manifests, bounded by [`MAX_CACHED_BYTES`]. Entries are
@@ -332,6 +409,8 @@ impl SourceMapCache {
     }
 
     /// The deploy's manifest, cached negative when no deploy stored one.
+    /// Manifests share the maps' byte budget (negatives included), so one
+    /// entry per sha ever read cannot grow the runner.
     pub async fn manifest(
         &self,
         cfg: &Config,
@@ -342,13 +421,14 @@ impl SourceMapCache {
             prefix: prefix.to_string(),
             sha: sha.to_string(),
         };
-        if let Some(hit) = poisoned(self.inner.lock()).manifests.get(&key) {
+        if let Some((hit, _)) = poisoned(self.inner.lock()).manifests.get(&key) {
             return hit.clone();
         }
-        let loaded = fetch_manifest(cfg, prefix, sha).await;
-        poisoned(self.inner.lock())
-            .manifests
-            .insert(key, loaded.clone());
+        // Weighed before locking: the fetch (and the parse it will do for
+        // maps) never runs under the mutex.
+        let (loaded, weight) = fetch_manifest(cfg, prefix, sha).await;
+        let mut inner = poisoned(self.inner.lock());
+        insert_manifest(&mut inner, key, loaded.clone(), weight);
         loaded
     }
 
@@ -367,28 +447,56 @@ impl SourceMapCache {
             sha: sha.to_string(),
             rel: rel.to_string(),
         };
-        if let Some(hit) = poisoned(self.inner.lock()).maps.get(&key) {
+        if let Some((hit, _)) = poisoned(self.inner.lock()).maps.get(&key) {
             return hit.clone();
         }
-        let loaded = fetch_map(cfg, bucket, prefix, sha, rel).await;
+        let (loaded, weight) = fetch_map(cfg, bucket, prefix, sha, rel).await;
         let mut inner = poisoned(self.inner.lock());
-        if let Some(sm) = loaded.as_ref() {
-            let bytes = sm_json_len(sm);
-            while inner.bytes + bytes > MAX_CACHED_BYTES {
-                let Some(oldest) = inner.order.pop_front() else {
-                    break;
-                };
-                if let Some(removed) = inner.maps.remove(&oldest) {
-                    inner.bytes = inner
-                        .bytes
-                        .saturating_sub(removed.as_deref().map(sm_json_len).unwrap_or(0));
-                }
-            }
-            inner.bytes += bytes;
-            inner.order.push_back(key.clone());
-        }
-        inner.maps.insert(key, loaded.clone());
+        insert_map(&mut inner, key, loaded.clone(), weight);
         loaded
+    }
+}
+
+/// Insert one manifest, evicting oldest-first across maps and manifests so
+/// the shared byte bound holds (negatives included).
+fn insert_manifest(
+    inner: &mut CacheInner,
+    key: ManifestKey,
+    value: Option<Arc<MapManifest>>,
+    weight: usize,
+) {
+    evict_until_fit(inner, weight);
+    inner.bytes += weight;
+    inner.order.push_back(CachedKey::Manifest(key.clone()));
+    inner.manifests.insert(key, (value, weight));
+}
+
+/// Insert one parsed map, same shared bound as manifests.
+fn insert_map(
+    inner: &mut CacheInner,
+    key: CacheKey,
+    value: Option<Arc<sourcemap::SourceMap>>,
+    weight: usize,
+) {
+    evict_until_fit(inner, weight);
+    inner.bytes += weight;
+    inner.order.push_back(CachedKey::Map(key.clone()));
+    inner.maps.insert(key, (value, weight));
+}
+
+/// Make room for `extra` bytes, oldest first, across maps and manifests.
+fn evict_until_fit(inner: &mut CacheInner, extra: usize) {
+    while inner.bytes + extra > MAX_CACHED_BYTES {
+        let Some(oldest) = inner.order.pop_front() else {
+            break;
+        };
+        let removed = match oldest {
+            CachedKey::Map(key) => inner.maps.remove(&key).map(|(_, weight)| weight),
+            CachedKey::Manifest(key) => inner.manifests.remove(&key).map(|(_, weight)| weight),
+        };
+        if let Some(weight) = removed {
+            inner.bytes = inner.bytes.saturating_sub(weight);
+        }
     }
 }
 
@@ -405,49 +513,66 @@ fn map_object_key(prefix: &str, sha: &str, rel: &str) -> String {
     format!("{prefix}/{MAPS_DIR}/{sha}/{rel}")
 }
 
-async fn fetch_manifest(cfg: &Config, prefix: &str, sha: &str) -> Option<Arc<MapManifest>> {
+/// A deploy's manifest plus its cache weight (the stored bytes, or the
+/// negative-entry weight when nothing usable was stored).
+async fn fetch_manifest(
+    cfg: &Config,
+    prefix: &str,
+    sha: &str,
+) -> (Option<Arc<MapManifest>>, usize) {
     let key = map_object_key(prefix, sha, MANIFEST_FILE);
-    let bytes = s3::s3_get_bytes(cfg, &key).await.ok()?;
+    let Ok(bytes) = s3::s3_get_bytes(cfg, &key).await else {
+        return (None, NEGATIVE_ENTRY_WEIGHT);
+    };
     if bytes.len() > 1024 * 1024 {
-        return None;
+        return (None, NEGATIVE_ENTRY_WEIGHT);
     }
-    serde_json::from_slice::<MapManifest>(&bytes)
+    match serde_json::from_slice::<MapManifest>(&bytes)
         .ok()
         .map(Arc::new)
+    {
+        Some(manifest) => (Some(manifest), bytes.len()),
+        None => (None, NEGATIVE_ENTRY_WEIGHT),
+    }
 }
 
+/// One stored map plus its cache weight. Confined to the sha's own dir: a
+/// hostile manifest entry (`..`, an absolute path) never reaches S3, and a
+/// `rel` that names another sha still lands inside this sha's prefix (flat
+/// keys, no traversal). Parsing runs off the async executor.
 async fn fetch_map(
     cfg: &Config,
     bucket: &str,
     prefix: &str,
     sha: &str,
     rel: &str,
-) -> Option<Arc<sourcemap::SourceMap>> {
-    if rel.contains("..") {
-        return None;
+) -> (Option<Arc<sourcemap::SourceMap>>, usize) {
+    if rel.contains("..") || rel.starts_with('/') {
+        return (None, NEGATIVE_ENTRY_WEIGHT);
     }
     let key = map_object_key(prefix, sha, rel);
     if !matches!(
         s3::s3_head_object(cfg, bucket, &key).await,
         Some(head) if head.size >= 0 && (head.size as u64) <= MAX_MAP_BYTES
     ) {
-        return None;
+        return (None, NEGATIVE_ENTRY_WEIGHT);
     }
-    let bytes = s3::s3_get_bytes(cfg, &key).await.ok()?;
+    let Ok(bytes) = s3::s3_get_bytes(cfg, &key).await else {
+        return (None, NEGATIVE_ENTRY_WEIGHT);
+    };
     if bytes.len() as u64 > MAX_MAP_BYTES {
-        return None;
+        return (None, NEGATIVE_ENTRY_WEIGHT);
     }
-    sourcemap::SourceMap::from_slice(&bytes).ok().map(Arc::new)
-}
-
-/// Rough weight of a parsed map for the cache bound (re-serialized JSON
-/// length: proportional to tokens, names and sources together).
-fn sm_json_len(sm: &sourcemap::SourceMap) -> usize {
-    let mut bytes = Vec::new();
-    if sm.to_writer(&mut bytes).is_err() {
-        return 0;
+    let weight = bytes.len();
+    let parsed = tokio::task::spawn_blocking(move || sourcemap::SourceMap::from_slice(&bytes))
+        .await
+        .ok()
+        .and_then(|parsed| parsed.ok())
+        .map(Arc::new);
+    match parsed {
+        Some(sm) => (Some(sm), weight),
+        None => (None, NEGATIVE_ENTRY_WEIGHT),
     }
-    bytes.len()
 }
 
 /// The Worker's map inputs: the deploy root's entry (as celld resolves it)
@@ -463,8 +588,8 @@ struct WorkerEntry {
 /// celld's entry resolution, minimally: `main` from the deploy root's Wrangler
 /// file (`main` is required — an asset-only app has no worker to map).
 fn worker_entry(deploy_root: &Path) -> anyhow::Result<Option<WorkerEntry>> {
-    let (main, no_bundle) = read_worker_config(deploy_root)?;
-    let Some(main) = main else {
+    let config = read_worker_config(deploy_root)?;
+    let Some(main) = config.main else {
         return Ok(None);
     };
     let abs = deploy_root.join(&main);
@@ -484,14 +609,26 @@ fn worker_entry(deploy_root: &Path) -> anyhow::Result<Option<WorkerEntry>> {
     Ok(Some(WorkerEntry {
         rel: main,
         abs,
-        no_bundle,
+        no_bundle: config.no_bundle,
     }))
 }
 
-/// `(main, no_bundle)` from the deploy root's Wrangler file. JSON(C) parses
-/// like the runner's other config reads; TOML gets a line scan (only `main`
-/// and `no_bundle` are needed, never the full config).
-fn read_worker_config(deploy_root: &Path) -> anyhow::Result<(Option<PathBuf>, bool)> {
+/// The deploy root's Wrangler file, minimally: `main` (required — an
+/// asset-only app has no worker to map) plus whether celld deploys it as-is
+/// (`no_bundle`) instead of bundling, and the assets directory the client
+/// maps live under (for exact frame→map matching; TOML `[assets]` tables are
+/// skipped and then matching falls back to full keys).
+struct DeployWorkerConfig {
+    main: Option<PathBuf>,
+    no_bundle: bool,
+    assets_dir: Option<String>,
+}
+
+/// The deploy root's Wrangler file, minimally: parsed like the runner's other
+/// config reads for JSON(C); TOML gets a line scan (only `main` and
+/// `no_bundle` there — a TOML `[assets]` table is skipped and matching falls
+/// back to full keys).
+fn read_worker_config(deploy_root: &Path) -> anyhow::Result<DeployWorkerConfig> {
     for name in ["wrangler.jsonc", "wrangler.json"] {
         let Ok(text) = std::fs::read_to_string(deploy_root.join(name)) else {
             continue;
@@ -507,11 +644,25 @@ fn read_worker_config(deploy_root: &Path) -> anyhow::Result<(Option<PathBuf>, bo
             .get("no_bundle")
             .and_then(|b| b.as_bool())
             .unwrap_or(false);
-        return Ok((main, no_bundle));
+        let assets_dir = value
+            .get("assets")
+            .and_then(|a| a.get("directory"))
+            .and_then(|d| d.as_str())
+            .map(|d| d.trim_matches('/').replace('\\', "/"))
+            .filter(|d| !d.is_empty());
+        return Ok(DeployWorkerConfig {
+            main,
+            no_bundle,
+            assets_dir,
+        });
     }
     let toml = deploy_root.join("wrangler.toml");
     let Ok(text) = std::fs::read_to_string(&toml) else {
-        return Ok((None, false));
+        return Ok(DeployWorkerConfig {
+            main: None,
+            no_bundle: false,
+            assets_dir: None,
+        });
     };
     let mut main = None;
     let mut no_bundle = false;
@@ -525,7 +676,11 @@ fn read_worker_config(deploy_root: &Path) -> anyhow::Result<(Option<PathBuf>, bo
             no_bundle = rest.split('=').nth(1).is_some_and(|v| v.trim() == "true");
         }
     }
-    Ok((main, no_bundle))
+    Ok(DeployWorkerConfig {
+        main,
+        no_bundle,
+        assets_dir: None,
+    })
 }
 
 /// The quoted value of a `key = "value"` TOML line, if that is all it holds.
@@ -623,29 +778,33 @@ fn strip_to_root(root: &Path, abs: &Path) -> Option<String> {
 /// the shadow map: tokens the shadow bundle read from the entry file resolve
 /// through the entry's map to the original sources, everything else stays.
 /// Both maps are 0-based; the composed map names the build's sources.
+/// Token counts are capped ([`MAX_CHAIN_TOKENS`]): past that the outer map
+/// passes through unchained instead of burning the deploy task.
 pub fn chain_maps(
     outer: &sourcemap::SourceMap,
     inner: &sourcemap::SourceMap,
     entry_source: &str,
 ) -> sourcemap::SourceMap {
-    // The build's tokens, once: the neighborhood fallback scans them per
-    // outer token. Store-time work only, never on a read, and maps are
-    // small enough that the scan is cheap.
-    let inner_tokens: Vec<sourcemap::Token<'_>> = inner.tokens().collect();
     let mut builder = sourcemap::SourceMapBuilder::new(None);
+    let indexed = (outer.tokens().count() <= MAX_CHAIN_TOKENS)
+        .then(|| InnerIndex::new(inner))
+        .flatten();
     for token in outer.tokens() {
         let chained = token
             .get_source()
             .filter(|s| source_is_entry(s, entry_source))
             .and_then(|_| {
-                inner_token_for(&inner_tokens, token.get_src_line(), token.get_src_col()).map(|t| {
-                    (
-                        t.get_source().unwrap_or_default().to_string(),
-                        t.get_src_line(),
-                        t.get_src_col(),
-                        t.get_name(),
-                    )
-                })
+                indexed
+                    .as_ref()
+                    .and_then(|idx| idx.nearest(token.get_src_line(), token.get_src_col()))
+            })
+            .map(|t| {
+                (
+                    t.get_source().unwrap_or_default().to_string(),
+                    t.get_src_line(),
+                    t.get_src_col(),
+                    t.get_name(),
+                )
             });
         match chained {
             Some((source, line, col, name)) => {
@@ -687,37 +846,92 @@ fn source_is_entry(source: &str, entry: &str) -> bool {
 /// can land on a generated wrapper line while the executing code sits
 /// beside it, and only a small window stays an honest guess.
 const INNER_SEARCH_LINES: u32 = 4;
+/// Token counts indexed and composed per chain: past this the outer map
+/// passes through unchained instead of burning the deploy task on a hostile
+/// (or merely enormous) build map.
+const MAX_CHAIN_TOKENS: usize = 20_000;
 
-/// The build-map token an outer source position resolves through: the
-/// nearest sourced token on the same generated line, else the nearest
-/// sourced token within [`INNER_SEARCH_LINES`] lines. `None` past that
-/// window, so a position far from any mapped code keeps the outer (built)
-/// position instead of inventing an original one.
-fn inner_token_for<'a>(
-    inner_tokens: &[sourcemap::Token<'a>],
-    line: u32,
-    col: u32,
-) -> Option<sourcemap::Token<'a>> {
+/// The build map's sourced tokens, indexed by generated line (each vec sorted
+/// by column, as the iterator yields them), so chaining resolves with binary
+/// searches instead of a full scan per outer token.
+struct InnerIndex<'a> {
+    lines: HashMap<u32, Vec<sourcemap::Token<'a>>>,
+}
+
+impl<'a> InnerIndex<'a> {
+    /// `None` when the map holds more sourced tokens than chaining will
+    /// spend time on (the caller passes the outer map through unchained).
+    fn new(inner: &'a sourcemap::SourceMap) -> Option<Self> {
+        let mut lines: HashMap<u32, Vec<sourcemap::Token<'a>>> = HashMap::new();
+        let mut count = 0;
+        for token in inner.tokens() {
+            if token.get_source().is_none() {
+                continue;
+            }
+            count += 1;
+            if count > MAX_CHAIN_TOKENS {
+                return None;
+            }
+            lines.entry(token.get_dst_line()).or_default().push(token);
+        }
+        Some(Self { lines })
+    }
+
+    /// The token an outer source position resolves through: the nearest
+    /// sourced token on the same generated line, else the nearest sourced
+    /// token within [`INNER_SEARCH_LINES`] lines. `None` past that window,
+    /// so a position far from any mapped code keeps the outer (built)
+    /// position instead of inventing an original one.
+    fn nearest(&self, line: u32, col: u32) -> Option<sourcemap::Token<'_>> {
+        if let Some(tokens) = self.lines.get(&line) {
+            if let Some(token) = nearest_col(tokens, col) {
+                return Some(token);
+            }
+        }
+        let mut best: Option<(u32, sourcemap::Token<'_>)> = None;
+        for dist in 1..=INNER_SEARCH_LINES {
+            for candidate in [line.checked_sub(dist), line.checked_add(dist)]
+                .into_iter()
+                .flatten()
+            {
+                let Some(tokens) = self.lines.get(&candidate) else {
+                    continue;
+                };
+                let Some(token) = nearest_col(tokens, col) else {
+                    continue;
+                };
+                let distance = dist * 1_000 + token.get_dst_col().abs_diff(col).min(999);
+                if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+                    best = Some((distance, token));
+                }
+            }
+        }
+        best.map(|(_, token)| token)
+    }
+}
+
+/// The token nearest to `col` in a column-sorted line, if the line maps
+/// anything at all.
+fn nearest_col<'s, 'a>(tokens: &'s [sourcemap::Token<'a>], col: u32) -> Option<sourcemap::Token<'s>>
+where
+    'a: 's,
+{
+    if tokens.is_empty() {
+        return None;
+    }
+    let at = tokens.partition_point(|t| t.get_dst_col() < col);
     let mut best: Option<(u32, sourcemap::Token<'_>)> = None;
-    for t in inner_tokens {
-        let Some(_) = t.get_source() else {
-            continue;
-        };
-        let line_diff = t.get_dst_line().abs_diff(line);
-        // Same generated line always wins: that is the same statement.
-        // Across lines, closer wins; past the window, not a guess worth making.
-        let distance = if line_diff == 0 {
-            t.get_dst_col().abs_diff(col)
-        } else if line_diff <= INNER_SEARCH_LINES {
-            1_000_000 + line_diff * 1_000 + t.get_dst_col().abs_diff(col).min(999)
-        } else {
-            continue;
-        };
+    for token in tokens
+        .get(at.saturating_sub(1)..)
+        .iter()
+        .flat_map(|w| w.iter().take(2))
+    {
+        let distance = token.get_dst_col().abs_diff(col);
         if best.is_none_or(|(best_distance, _)| distance < best_distance) {
-            best = Some((distance, *t));
+            best = Some((distance, *token));
         }
     }
-    best.map(|(_, t)| t)
+    best.map(|(_, token)| token)
 }
 
 /// The config may prefix the entry with `./` while map sources arrive
@@ -726,11 +940,33 @@ fn trim_dot(s: &str) -> &str {
     s.strip_prefix("./").unwrap_or(s)
 }
 
+/// A map file the store may keep: the per-file cap applies to the build's
+/// own maps too, not just collected and fetched ones.
+fn fits_map_bytes(len: u64) -> bool {
+    len <= MAX_MAP_BYTES
+}
+
+/// Read a map file capped at [`MAX_MAP_BYTES`]: the metadata gate keeps a
+/// huge sibling out of memory, and the post-read check covers the TOCTOU
+/// window. `None` on any IO error or oversize.
+async fn read_capped_map(path: &Path) -> Option<Vec<u8>> {
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    if !fits_map_bytes(meta.len()) {
+        return None;
+    }
+    let bytes = tokio::fs::read(path).await.ok()?;
+    fits_map_bytes(bytes.len() as u64).then_some(bytes)
+}
+
 /// Build the Worker map: the shadow esbuild map (chained through the entry's
 /// own map when the build emitted one), or the entry's sibling map directly
 /// when celld deploys the entry as-is (`no_bundle`). `None` when there is no
 /// bundleable entry — asset-only apps and non-JS workers map nothing.
-async fn build_worker_map(deploy_root: &Path) -> anyhow::Result<Option<(Vec<u8>, String)>> {
+async fn build_worker_map(
+    deploy_root: &Path,
+    sandbox_uid: Option<u32>,
+    sandbox_gid: Option<u32>,
+) -> anyhow::Result<Option<(Vec<u8>, String)>> {
     let Some(entry) = worker_entry(deploy_root)? else {
         return Ok(None);
     };
@@ -738,42 +974,58 @@ async fn build_worker_map(deploy_root: &Path) -> anyhow::Result<Option<(Vec<u8>,
         "{}.map",
         entry.abs.file_name().unwrap_or_default().to_string_lossy()
     ));
-    let sibling_bytes = tokio::fs::read(&sibling_map).await.ok();
+    let sibling_bytes = read_capped_map(&sibling_map).await;
     if entry.no_bundle {
         // celld uploads the entry as written: its sibling map already maps
-        // the deployed bytes, no shadow bundle needed.
-        return Ok(sibling_bytes.map(|bytes| (bytes, "entry map (no_bundle)".to_string())));
+        // the deployed bytes, no shadow bundle needed. Parsed and sanitized
+        // like any stored map; an unparseable sibling maps nothing.
+        let Some(bytes) = sibling_bytes else {
+            return Ok(None);
+        };
+        let Ok(inner) = sourcemap::SourceMap::from_slice(&bytes) else {
+            return Ok(None);
+        };
+        let mut out = Vec::new();
+        sanitize_sources(&inner).to_writer(&mut out)?;
+        return Ok(Some((out, "entry map (no_bundle)".to_string())));
     }
-    let outdir = std::env::temp_dir().join(format!(
-        "noite-esbuild-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    tokio::fs::create_dir_all(&outdir).await?;
-    let result = run_shadow_esbuild(deploy_root, &entry, &outdir, sibling_bytes).await;
-    let _ = tokio::fs::remove_dir_all(&outdir).await;
-    result
+    run_shadow_esbuild(deploy_root, &entry, sandbox_uid, sandbox_gid, sibling_bytes).await
 }
 
+/// Run the shadow esbuild the way the build runs: as the tenant build uid
+/// through `run_sandboxed` (clean env, rlimits, kill group), never as the
+/// runner. Nothing it reads leaves the bundle — and with `sanitize_sources`
+/// not even absolute host paths reach storage.
 async fn run_shadow_esbuild(
     deploy_root: &Path,
     entry: &WorkerEntry,
-    outdir: &Path,
+    sandbox_uid: Option<u32>,
+    sandbox_gid: Option<u32>,
     sibling_bytes: Option<Vec<u8>>,
 ) -> anyhow::Result<Option<(Vec<u8>, String)>> {
     let Some(entry_arg) = entry.rel.to_str() else {
         anyhow::bail!("worker entry is not valid UTF-8");
     };
+    // Inside the sandbox-owned tmp dir: `run_sandboxed` creates and chowns
+    // `.tmp-sandbox` for the build uid, so the child can write here even
+    // though the tree itself was handed back to the runner.
+    let outdir = deploy_root.join(".tmp-sandbox").join("shadow-maps");
     let Some(outdir_arg) = outdir.to_str() else {
         anyhow::bail!("esbuild outdir is not valid UTF-8");
     };
     let args = esbuild_args(entry_arg, outdir_arg);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    exec::run_cmd(
+    let sandbox = exec::Sandbox {
+        uid: sandbox_uid,
+        gid: sandbox_gid,
+        env: &[],
+        cache: None,
+    };
+    exec::run_sandboxed(
         &esbuild_bin(),
         &refs,
-        Some(deploy_root),
-        &[],
+        deploy_root,
+        &sandbox,
         Duration::from_secs(120),
     )
     .await
@@ -781,11 +1033,12 @@ async fn run_shadow_esbuild(
     let raw = tokio::fs::read(outdir.join("index.js.map"))
         .await
         .context("shadow esbuild wrote no map")?;
+    let _ = tokio::fs::remove_dir_all(deploy_root.join(".tmp-sandbox")).await;
     let outer = sourcemap::SourceMap::from_slice(&raw).context("parse shadow map")?;
     let root = deploy_root
         .canonicalize()
         .unwrap_or_else(|_| deploy_root.to_path_buf());
-    let normalized = normalize_sources(&root, outdir, &outer);
+    let normalized = normalize_sources(&root, &outdir, &outer);
     let entry_source = entry.rel.to_string_lossy().replace('\\', "/");
     let (composed, note) = match sibling_bytes {
         Some(bytes) => match sourcemap::SourceMap::from_slice(&bytes) {
@@ -801,8 +1054,35 @@ async fn run_shadow_esbuild(
         None => (normalized, "shadow map".to_string()),
     };
     let mut out = Vec::new();
-    composed.to_writer(&mut out)?;
+    sanitize_sources(&composed).to_writer(&mut out)?;
     Ok(Some((out, note)))
+}
+
+/// Drop sources that do not resolve under the deploy root (symlink escapes,
+/// absolute build-host paths) down to their file names before anything is
+/// stored: chaining already ran on the full strings, so entry matching is
+/// unaffected, and no host-absolute path reaches the bucket or the UI.
+fn sanitize_sources(sm: &sourcemap::SourceMap) -> sourcemap::SourceMap {
+    let mut builder = sourcemap::SourceMapBuilder::new(None);
+    for token in sm.tokens() {
+        let source = token.get_source().map(|s| {
+            if s.starts_with('/') || s.contains("..") {
+                s.rsplit('/').next().unwrap_or(s).to_string()
+            } else {
+                s.to_string()
+            }
+        });
+        builder.add(
+            token.get_dst_line(),
+            token.get_dst_col(),
+            token.get_src_line(),
+            token.get_src_col(),
+            source.as_deref(),
+            token.get_name(),
+            false,
+        );
+    }
+    builder.into_sourcemap()
 }
 
 /// The manifest key for a collected map: the bundle path stack frames name.
@@ -810,6 +1090,28 @@ async fn run_shadow_esbuild(
 /// a manifest keyed on `…/app.js.map` would never match a frame's `…/app.js`.
 fn manifest_bundle_key(map_rel: &str) -> Option<&str> {
     map_rel.strip_suffix(".map")
+}
+
+/// Keep client maps while they fit the deploy's remaining byte budget
+/// (sorted walk order, so the kept set is deterministic); the rest are
+/// skipped and the caller notes the count. The manifest counts the same
+/// bytes its `files` entries point at.
+fn cap_client_maps(
+    maps: Vec<(String, Vec<u8>)>,
+    budget: &mut u64,
+) -> (Vec<(String, Vec<u8>)>, usize) {
+    let mut kept = Vec::new();
+    let mut skipped = 0;
+    for (rel, bytes) in maps {
+        let len = bytes.len() as u64;
+        if len <= *budget {
+            *budget -= len;
+            kept.push((rel, bytes));
+        } else {
+            skipped += 1;
+        }
+    }
+    (kept, skipped)
 }
 
 /// Every `*.map` the build emitted, as deploy-root-relative path + bytes —
@@ -875,15 +1177,36 @@ fn prune_victims(listed: &[String], keep: &HashSet<String>) -> Vec<String> {
 /// Store this deploy's maps and prune sha dirs outside the recent deploy
 /// history. Best-effort by contract: the deploy already succeeded, so a
 /// failure here is a log line, never a failed deploy.
+#[derive(Debug, Clone, Copy)]
+pub struct StoreMaps<'a> {
+    pub app_id: &'a str,
+    pub environment_id: Option<&'a str>,
+    pub bucket_uri: &'a str,
+    pub sha: &'a str,
+    pub deploy_root: &'a Path,
+    pub sandbox_uid: Option<u32>,
+    pub sandbox_gid: Option<u32>,
+}
+
 pub async fn store_deploy_maps(
     pool: &SqlitePool,
     cfg: &Config,
-    app_id: &str,
-    environment_id: Option<&str>,
-    bucket_uri: &str,
-    sha: &str,
-    deploy_root: &Path,
+    target: &StoreMaps<'_>,
 ) -> anyhow::Result<String> {
+    let StoreMaps {
+        app_id,
+        environment_id,
+        bucket_uri,
+        sha,
+        deploy_root,
+        sandbox_uid,
+        sandbox_gid,
+    } = *target;
+    // Preview environments have no error ingest, so their maps would never
+    // be read: skip storing them (YAGNI until environment errors exist).
+    if environment_id.is_some() {
+        return Ok("skipped: preview environments store no maps".to_string());
+    }
     if !is_key_sha(sha) {
         anyhow::bail!("refusing to store maps for non-sha {sha:?}");
     }
@@ -895,14 +1218,23 @@ pub async fn store_deploy_maps(
     let mut manifest = MapManifest::default();
     let mut notes = Vec::new();
 
+    // The assets dir the client keys are relative to (exact frame→map
+    // matching re-attaches it to the served path). Best-effort like the
+    // rest: without it, only full-key matches resolve.
+    manifest.assets_dir = read_worker_config(deploy_root)
+        .ok()
+        .and_then(|c| c.assets_dir);
+
     let entry_sibling = worker_entry(deploy_root).ok().flatten().map(|entry| {
         entry.abs.with_file_name(format!(
             "{}.map",
             entry.abs.file_name().unwrap_or_default().to_string_lossy()
         ))
     });
-    match build_worker_map(deploy_root).await {
+    let mut worker_bytes = 0u64;
+    match build_worker_map(deploy_root, sandbox_uid, sandbox_gid).await {
         Ok(Some((bytes, note))) => {
+            worker_bytes = bytes.len() as u64;
             let key = format!("{maps_prefix}/{WORKER_MAP_FILE}");
             put_bytes(cfg, &key, &bytes).await?;
             manifest.worker = Some(WORKER_MAP_FILE.to_string());
@@ -912,8 +1244,16 @@ pub async fn store_deploy_maps(
         Err(e) => notes.push(format!("no worker map ({e:#})")),
     }
 
+    // One deploy's maps stay small in aggregate: a hostile build cannot turn
+    // the per-file cap into gigabytes of stored maps.
+    let mut budget = TOTAL_MAP_BYTES_PER_DEPLOY.saturating_sub(worker_bytes);
+    let collected = collect_client_maps(deploy_root, entry_sibling.as_deref());
+    let (kept, skipped) = cap_client_maps(collected, &mut budget);
+    if skipped > 0 {
+        notes.push(format!("client maps capped at 64 MiB ({skipped} skipped)"));
+    }
     let mut client_count = 0;
-    for (rel, bytes) in collect_client_maps(deploy_root, entry_sibling.as_deref()) {
+    for (rel, bytes) in kept {
         let stored = format!("{CLIENT_MAP_DIR}/{rel}");
         let key = format!("{maps_prefix}/{stored}");
         let Some(bundle) = manifest_bundle_key(&rel) else {
@@ -944,6 +1284,27 @@ pub async fn store_deploy_maps(
     Ok(notes.join(", "))
 }
 
+/// Sha dirs worth keeping: the just-finished deploy plus the newest
+/// successful deploy shas (newest first from the deploy rows), capped. The
+/// current sha is always kept — prune can never delete the deploy that just
+/// stored.
+fn keep_shas(current: &str, rows: impl Iterator<Item = (Option<String>, bool)>) -> HashSet<String> {
+    let mut keep: HashSet<String> = HashSet::from([current.to_string()]);
+    for (sha, success) in rows {
+        if !success {
+            continue;
+        }
+        let Some(sha) = sha else {
+            continue;
+        };
+        if keep.len() > KEEP_DEPLOY_SHAS {
+            break;
+        }
+        keep.insert(sha);
+    }
+    keep
+}
+
 /// Delete `maps/<sha>/` dirs no recent deploy owns. Reads the keep set from
 /// the deploy rows (the maps follow the deploys' own retention) and lists the
 /// bucket so crashed prunes converge.
@@ -955,21 +1316,20 @@ async fn prune_old_maps(
     maps_prefix: &str,
     sha: &str,
 ) -> anyhow::Result<usize> {
-    let mut keep: HashSet<String> = HashSet::new();
-    keep.insert(sha.to_string());
-    if let Ok(deploys) = db::list_deploys(pool, app_id, environment_id).await {
-        for deploy in deploys {
-            if deploy.status_enum() == Some(crate::models::DeployStatus::Success) {
-                if let Some(deploy_sha) = deploy.sha {
-                    keep.insert(deploy_sha);
-                    if keep.len() > KEEP_DEPLOY_SHAS + 1 {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    // Deploys list newest first: the break above keeps the newest successes.
+    // Deploys list newest first: the break inside keeps the newest successes.
+    let keep = if let Ok(deploys) = db::list_deploys(pool, app_id, environment_id).await {
+        keep_shas(
+            sha,
+            deploys.iter().map(|d| {
+                (
+                    d.sha.clone(),
+                    d.status_enum() == Some(crate::models::DeployStatus::Success),
+                )
+            }),
+        )
+    } else {
+        HashSet::from([sha.to_string()])
+    };
     // `maps/` holds one dir per sha; strip that level to sha names.
     let Some(dir) = maps_prefix.strip_suffix(&format!("/{sha}")) else {
         return Ok(0);
@@ -1084,6 +1444,7 @@ mod tests {
     fn worker_frames_use_the_worker_map() {
         let manifest = MapManifest {
             worker: Some("worker.js.map".to_string()),
+            assets_dir: None,
             files: HashMap::from([(
                 "assets/a.js".to_string(),
                 "client/assets/a.js.map".to_string(),
@@ -1108,12 +1469,21 @@ mod tests {
     fn symbolication_attaches_original_positions() {
         let manifest = MapManifest {
             worker: Some("worker.js.map".to_string()),
+            assets_dir: None,
             files: HashMap::new(),
         };
         let sm = built_map(&[((20, 26), ("src/worker.ts", 4, 7), Some("charge"))]);
         let load = |_: &str| Some(Arc::new(sm.clone()));
         let mut frames = vec![frame_at("worker.js:21:27")];
-        assert_eq!(symbolicate_with(&mut frames, &manifest, &load), 1);
+        assert_eq!(
+            symbolicate_with(
+                &mut frames,
+                &manifest,
+                &load,
+                &mut SymbolicateBudget::for_read()
+            ),
+            1
+        );
         assert_eq!(
             frames[0].mapped_location.as_deref(),
             Some("src/worker.ts:5:8")
@@ -1136,7 +1506,15 @@ mod tests {
                 ..frame_at("worker.js:21:27")
             },
         ];
-        assert_eq!(symbolicate_with(&mut frames, &manifest, &load), 0);
+        assert_eq!(
+            symbolicate_with(
+                &mut frames,
+                &manifest,
+                &load,
+                &mut SymbolicateBudget::for_read()
+            ),
+            0
+        );
         // No worker map in the manifest: nothing attaches.
         assert!(frames[0].mapped_location.is_none());
         // Runtime frames never map, whatever their stored flag.
@@ -1149,6 +1527,7 @@ mod tests {
         // through the asset maps by location alone.
         let manifest = MapManifest {
             worker: None,
+            assets_dir: Some("client".to_string()),
             files: HashMap::from([(
                 "client/assets/app.js".to_string(),
                 "client/client/assets/app.js.map".to_string(),
@@ -1160,12 +1539,173 @@ mod tests {
             in_app: false,
             ..frame_at("https://app.example/assets/app.js:1:523")
         }];
-        assert_eq!(symbolicate_with(&mut frames, &manifest, &load), 1);
+        assert_eq!(
+            symbolicate_with(
+                &mut frames,
+                &manifest,
+                &load,
+                &mut SymbolicateBudget::for_read()
+            ),
+            1
+        );
         assert_eq!(
             frames[0].mapped_location.as_deref(),
             Some("src/client.ts:13:5")
         );
         assert_eq!(frames[0].mapped_function.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn mismatched_hashes_do_not_attach_the_wrong_map() {
+        // Exact matching only: a hashed sibling name must not resolve
+        // through a different hash's map.
+        let manifest = MapManifest {
+            worker: None,
+            assets_dir: Some("client".to_string()),
+            files: HashMap::from([(
+                "client/assets/app-DEADBEEF.js".to_string(),
+                "client/client/assets/app-DEADBEEF.js.map".to_string(),
+            )]),
+        };
+        assert_eq!(
+            map_for_frame(&manifest, "https://app.example/assets/app-12345678.js:1:2"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn env_deploys_skip_map_storage() {
+        // Preview environments have no error ingest, so nothing would ever
+        // read their maps: the store returns before touching S3.
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        let cfg = crate::config::config_for_tests();
+        let dir =
+            std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let target = StoreMaps {
+            app_id: "app-id",
+            environment_id: Some("env-id"),
+            bucket_uri: "s3://bucket/envs/app/preview",
+            sha: "abc123",
+            deploy_root: &dir,
+            sandbox_uid: None,
+            sandbox_gid: None,
+        };
+        let summary = store_deploy_maps(&pool, &cfg, &target)
+            .await
+            .expect("skip succeeds");
+        assert!(summary.contains("skipped"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn budget_stops_loading_maps_and_attempting_frames() {
+        let manifest = MapManifest {
+            worker: Some("worker.js.map".to_string()),
+            assets_dir: Some("client".to_string()),
+            files: HashMap::from([
+                (
+                    "client/assets/a.js".to_string(),
+                    "client/client/assets/a.js.map".to_string(),
+                ),
+                (
+                    "client/assets/b.js".to_string(),
+                    "client/client/assets/b.js.map".to_string(),
+                ),
+            ]),
+        };
+        let sm = built_map(&[((0, 0), ("src/a.ts", 0, 0), Some("a"))]);
+        let load = |_: &str| Some(Arc::new(sm.clone()));
+        // One map allowed: the second asset's frames stay raw.
+        let mut frames = vec![
+            frame_at("https://h/assets/a.js:1:1"),
+            frame_at("https://h/assets/b.js:1:1"),
+        ];
+        let mut budget = SymbolicateBudget {
+            maps: 1,
+            frames: 10,
+        };
+        assert_eq!(
+            symbolicate_with(&mut frames, &manifest, &load, &mut budget),
+            1
+        );
+        assert!(frames[0].mapped_location.is_some());
+        assert!(frames[1].mapped_location.is_none());
+        // No frame attempts left: nothing else maps.
+        let mut frames = vec![frame_at("https://h/assets/a.js:1:1")];
+        let mut budget = SymbolicateBudget {
+            maps: 10,
+            frames: 0,
+        };
+        assert_eq!(
+            symbolicate_with(&mut frames, &manifest, &load, &mut budget),
+            0
+        );
+        assert!(frames[0].mapped_location.is_none());
+    }
+
+    #[test]
+    fn cache_evicts_oldest_first_across_kinds() {
+        // One shared byte bound for maps and manifests, negatives included:
+        // the oldest entry goes first no matter its kind.
+        let mut inner = CacheInner::default();
+        let map_key = |rel: &str| CacheKey {
+            prefix: "fleets/app".to_string(),
+            sha: "abc123".to_string(),
+            rel: rel.to_string(),
+        };
+        let manifest_key = ManifestKey {
+            prefix: "fleets/app".to_string(),
+            sha: "abc123".to_string(),
+        };
+        insert_manifest(
+            &mut inner,
+            manifest_key.clone(),
+            Some(Arc::new(MapManifest::default())),
+            MAX_CACHED_BYTES - 1000,
+        );
+        insert_map(
+            &mut inner,
+            map_key("old.js.map"),
+            None,
+            NEGATIVE_ENTRY_WEIGHT,
+        );
+        assert_eq!(inner.bytes, MAX_CACHED_BYTES - 1000 + NEGATIVE_ENTRY_WEIGHT);
+        // Must evict the manifest (oldest) to fit; the negative survives
+        // because it is newer and the bound holds again.
+        insert_map(&mut inner, map_key("new.js.map"), None, 2000);
+        assert!(!inner.manifests.contains_key(&manifest_key));
+        assert!(inner.maps.contains_key(&map_key("old.js.map")));
+        assert!(inner.maps.contains_key(&map_key("new.js.map")));
+        assert!(inner.bytes <= MAX_CACHED_BYTES);
+    }
+
+    #[test]
+    fn mapped_strings_clip_like_raw_frames() {
+        // Map contents are tenant-controlled: hostile names and sources must
+        // not bloat the `errors.get` response past the raw-frame cap.
+        let long = "x".repeat(super::super::errors::MAX_MESSAGE + 10);
+        let manifest = MapManifest {
+            worker: Some("worker.js.map".to_string()),
+            assets_dir: None,
+            files: HashMap::new(),
+        };
+        let sm = built_map(&[((20, 26), (long.as_str(), 4, 7), Some(long.as_str()))]);
+        let load = |_: &str| Some(Arc::new(sm.clone()));
+        let mut frames = vec![frame_at("worker.js:21:27")];
+        let mut budget = SymbolicateBudget::for_read();
+        assert_eq!(
+            symbolicate_with(&mut frames, &manifest, &load, &mut budget),
+            1
+        );
+        let location = frames[0].mapped_location.as_deref().expect("mapped");
+        assert!(location.len() <= super::super::errors::MAX_MESSAGE + 3);
+        assert!(location.ends_with('…'));
+        let function = frames[0].mapped_function.as_deref().expect("named");
+        assert!(function.len() <= super::super::errors::MAX_MESSAGE + 3);
+        assert!(function.ends_with('…'));
     }
 
     #[test]
@@ -1224,11 +1764,72 @@ mod tests {
     }
 
     #[test]
+    fn chaining_skips_maps_past_the_token_cap() {
+        // A hostile (or merely enormous) build map must not burn the deploy
+        // task: past the token cap the outer map passes through unchained.
+        let outer = built_map(&[((0, 5), ("dist/app/index.js", 10, 3), Some("bundleFn"))]);
+        let mut builder = sourcemap::SourceMapBuilder::new(None);
+        for line in 0..=MAX_CHAIN_TOKENS as u32 {
+            builder.add(line, 0, line, 0, Some("src/big.ts"), None, false);
+        }
+        let inner = builder.into_sourcemap();
+        let chained = chain_maps(&outer, &inner, "dist/app/index.js");
+        let token = chained.lookup_token(0, 5).expect("outer token");
+        assert_eq!(token.get_source(), Some("dist/app/index.js"));
+        assert_eq!((token.get_src_line(), token.get_src_col()), (10, 3));
+    }
+
+    #[test]
     fn prune_keeps_recent_shas_only() {
         let listed = vec!["aaa".to_string(), "bbb".to_string(), "ccc".to_string()];
         let keep: HashSet<String> = HashSet::from(["bbb".to_string()]);
         assert_eq!(prune_victims(&listed, &keep), vec!["aaa", "ccc"]);
         assert!(prune_victims(&listed, &listed.iter().cloned().collect()).is_empty());
+    }
+
+    #[test]
+    fn keep_set_pins_the_current_sha_and_newest_successes() {
+        // Newest first, as `list_deploys` returns them; failures and
+        // sha-less rows never join, and the current deploy is kept even
+        // when it has no row yet.
+        let rows = vec![
+            (Some("new-fail".to_string()), false),
+            (Some("new-ok".to_string()), true),
+            (None, true),
+            (Some("old-ok".to_string()), true),
+        ];
+        let keep = keep_shas("current", rows.into_iter());
+        assert!(keep.contains("current"));
+        assert!(keep.contains("new-ok"));
+        assert!(keep.contains("old-ok"));
+        assert!(!keep.contains("new-fail"));
+        // Past the cap only the newest successes survive.
+        let rows: Vec<(Option<String>, bool)> = (0..KEEP_DEPLOY_SHAS + 5)
+            .map(|i| (Some(format!("sha{i:02}")), true))
+            .collect();
+        let keep = keep_shas("current", rows.into_iter());
+        assert!(keep.contains("current"));
+        assert!(keep.contains("sha00"));
+        assert!(!keep.contains(format!("sha{:02}", KEEP_DEPLOY_SHAS + 4).as_str()));
+        assert!(keep.contains(format!("sha{:02}", KEEP_DEPLOY_SHAS - 1).as_str()));
+        assert!(!keep.contains(format!("sha{:02}", KEEP_DEPLOY_SHAS).as_str()));
+        assert!(keep.len() <= KEEP_DEPLOY_SHAS + 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_map_confines_hostile_manifest_entries() {
+        // `..` and absolute rels never reach S3 (no IO happens for these).
+        let cfg = crate::config::config_for_tests();
+        let (hit, _) = fetch_map(&cfg, "b", "fleets/a", "abc123", "../evil.js.map").await;
+        assert!(hit.is_none());
+        let (hit, _) = fetch_map(&cfg, "b", "fleets/a", "abc123", "/etc/passwd").await;
+        assert!(hit.is_none());
+        // A rel naming another sha still lands inside this sha's own dir
+        // (flat keys, no traversal): the key shape itself is the confinement.
+        assert_eq!(
+            map_object_key("fleets/a", "abc123", "maps/xyz/x.js.map"),
+            "fleets/a/maps/abc123/maps/xyz/x.js.map"
+        );
     }
 
     #[test]
@@ -1327,5 +1928,57 @@ mod tests {
             map_object_key("fleets/app", "abc123", "worker.js.map"),
             "fleets/app/maps/abc123/worker.js.map"
         );
+    }
+
+    #[test]
+    fn oversize_sibling_maps_are_refused() {
+        assert!(fits_map_bytes(0));
+        assert!(fits_map_bytes(MAX_MAP_BYTES));
+        assert!(!fits_map_bytes(MAX_MAP_BYTES + 1));
+    }
+
+    #[tokio::test]
+    async fn capped_reads_refuse_huge_files() {
+        let dir =
+            std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let small = dir.join("small.js.map");
+        std::fs::write(&small, "{}").expect("small map");
+        assert_eq!(read_capped_map(&small).await, Some(b"{}".to_vec()));
+        let huge = dir.join("huge.js.map");
+        let file = std::fs::File::create(&huge).expect("huge map");
+        file.set_len(MAX_MAP_BYTES + 1).expect("sparse huge map");
+        drop(file);
+        assert_eq!(read_capped_map(&huge).await, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn client_maps_stop_at_the_deploy_budget() {
+        let maps = vec![
+            ("b.js.map".to_string(), vec![0u8; 30]),
+            ("a.js.map".to_string(), vec![0u8; 30]),
+            ("c.js.map".to_string(), vec![0u8; 30]),
+        ];
+        // Input order wins (deterministic): 30 + 30 fit in 70, the third is
+        // skipped and counted.
+        let mut budget = 70;
+        let (kept, skipped) = cap_client_maps(maps, &mut budget);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(skipped, 1);
+        assert_eq!(budget, 10);
+        assert_eq!(kept[0].0, "b.js.map");
+    }
+
+    #[test]
+    fn sanitize_drops_unresolvable_sources_to_basenames() {
+        let mut builder = sourcemap::SourceMapBuilder::new(None);
+        builder.add(0, 0, 0, 0, Some("/data/build/x.js"), Some("evil"), false);
+        builder.add(1, 0, 5, 2, Some("../../elsewhere/y.js"), None, false);
+        builder.add(2, 0, 9, 1, Some("src/ok.ts"), Some("fine"), false);
+        let cleaned = sanitize_sources(&builder.into_sourcemap());
+        let mut sources: Vec<Option<&str>> = cleaned.tokens().map(|t| t.get_source()).collect();
+        sources.sort();
+        assert_eq!(sources, [Some("src/ok.ts"), Some("x.js"), Some("y.js")]);
     }
 }

@@ -47,8 +47,9 @@ const MAX_FRAMES: usize = 50;
 /// not per pass, so a day-long catch-up chunk keeps the same bound as the
 /// steady-state partial-hour pass.
 const MAX_LOGGED_PER_HOUR: usize = 200;
-/// Stored message cap: messages can embed whole payloads.
-const MAX_MESSAGE: usize = 2000;
+/// Stored message cap: messages can embed whole payloads. Shared with the
+/// read-time symbolication, which clips mapped positions the same way.
+pub(crate) const MAX_MESSAGE: usize = 2000;
 /// Frames that feed the fingerprint.
 const FINGERPRINT_FRAMES: usize = 5;
 /// Trace → request entries: kept long enough to outlive the telemetry flush
@@ -151,7 +152,8 @@ pub fn parse_frame(raw: &str) -> Frame {
     }
 }
 
-fn clip(s: &str, max: usize) -> String {
+/// Clip over-long strings with an ellipsis, keeping a UTF-8 boundary.
+pub(crate) fn clip(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
