@@ -166,7 +166,9 @@ while [ "$attempt" -lt 100 ]; do
         echo "error: expected at least 5 route-table pushes, found $pushes (pushes never ran?)"
         rc=1
       fi
-      maxgen="$(printf '%s\n' "$edge_log" | grep -o "generation=[0-9]*" | grep -o "[0-9]*" | sort -n | tail -1)"
+      # The module logs through Caddy's zap logger: "generation":N (JSON),
+      # not generation=N.
+      maxgen="$(printf '%s\n' "$edge_log" | grep -o '"generation":[0-9]*' | grep -o "[0-9]*" | sort -n | tail -1)"
       if [ -z "$maxgen" ] || [ "$maxgen" -lt 5 ]; then
         echo "error: route-table generation never advanced (max ${maxgen:-none})"
         rc=1
