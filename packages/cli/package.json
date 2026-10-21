@@ -1,6 +1,6 @@
 {
   "name": "@noitenow/cli",
-  "version": "0.1.0-alpha.7",
+  "version": "0.1.0-alpha.8",
   "description": "Noite CLI: deploy CI-built dist over Git smart-HTTP (no server build needed)",
   "keywords": [
     "celld",
