@@ -1,15 +1,18 @@
-//! Custom hostnames: list, add, remove (thin adapters over `service::domains`).
+//! Custom hostnames: list, add, verify, remove (thin adapters over
+//! `service::domains`).
 //!
-//! One hostname belongs to exactly one app (`app_domain.hostname` is the
-//! primary key), and the edge only serves it while its app is deployed and
-//! running. Hostname grammar, platform-host refusal and the conflict mapping
-//! live in the service layer so the RPC surface cannot drift.
+//! Only verified claims reach the edge — `host/caddy.rs` writes routes for
+//! them and `host/edge.rs` mints certificates through them. A pending claim
+//! is invisible to routing, TLS and the fallback page. Hostname grammar,
+//! platform-host refusal, the collision mapping and the role gates live in
+//! the service layer so the RPC surface cannot drift.
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
     Json,
 };
 
+use super::environments::RoleQuery;
 use crate::service;
 use crate::AppState;
 
@@ -21,16 +24,31 @@ pub struct AddDomain {
 pub async fn list_domains(
     State(state): State<AppState>,
     Path(app_id): Path<String>,
+    Query(q): Query<RoleQuery>,
 ) -> impl IntoResponse {
-    service::domains::list(&state, &app_id).await.map(Json)
+    service::domains::list(&state, &app_id, q.role.as_deref())
+        .await
+        .map(Json)
 }
 
 pub async fn add_domain(
     State(state): State<AppState>,
     Path(app_id): Path<String>,
+    Query(q): Query<RoleQuery>,
     Json(body): Json<AddDomain>,
 ) -> impl IntoResponse {
-    service::domains::add(&state, &app_id, &body.hostname)
+    service::domains::add(&state, &app_id, &body.hostname, q.role.as_deref())
+        .await
+        .map(Json)
+}
+
+pub async fn verify_domain(
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+    Query(q): Query<RoleQuery>,
+    Json(body): Json<AddDomain>,
+) -> impl IntoResponse {
+    service::domains::verify(&state, &app_id, &body.hostname, q.role.as_deref())
         .await
         .map(Json)
 }
@@ -38,8 +56,9 @@ pub async fn add_domain(
 pub async fn remove_domain(
     State(state): State<AppState>,
     Path((app_id, hostname)): Path<(String, String)>,
+    Query(q): Query<RoleQuery>,
 ) -> impl IntoResponse {
-    service::domains::remove(&state, &app_id, &hostname)
+    service::domains::remove(&state, &app_id, &hostname, q.role.as_deref())
         .await
         .map(Json)
 }

@@ -162,15 +162,25 @@ CREATE TABLE IF NOT EXISTS app_insight (
   PRIMARY KEY (app_id, title)
 );
 
--- Custom hostnames an app serves on. The edge (Caddyfile) and the on-demand
--- TLS gate both read this table, so a hostname is live only while its row
--- exists and its app is deployed and running. `hostname` is the primary key:
--- one app per hostname, globally.
+-- Custom hostnames an app serves on. A claim starts `pending` with a random
+-- per-claim token and becomes `verified` once the TXT record at
+-- `_noite-challenge.<hostname>` proves ownership (or immediately in `single`
+-- tenancy). The edge (Caddyfile), the on-demand TLS gate and the fallback
+-- page only honor `verified` rows, and only for apps that are deployed and
+-- running. Several apps may hold a `pending` claim for one hostname, but
+-- the first to verify wins: at most one row per hostname may be `verified`,
+-- enforced by the partial unique index below.
 CREATE TABLE IF NOT EXISTS app_domain (
+  hostname TEXT NOT NULL,
   app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,
-  hostname TEXT PRIMARY KEY NOT NULL,
-  created_at TEXT NOT NULL
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'verified')),
+  token TEXT NOT NULL DEFAULT '',
+  verified_at TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (hostname, app_id)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_app_domain_verified ON app_domain(hostname) WHERE status = 'verified';
 
 CREATE INDEX IF NOT EXISTS idx_app_domain_app ON app_domain(app_id);
 

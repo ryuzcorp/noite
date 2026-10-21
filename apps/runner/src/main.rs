@@ -10,6 +10,7 @@ mod api_error;
 mod auth;
 mod config;
 mod db;
+mod dns;
 mod host;
 mod lifecycle;
 mod models;
@@ -55,6 +56,9 @@ pub struct AppState {
     pub state_sync: host::state::StateSync,
     /// Bucket reachability probe (cached 5 s) for /ready.
     pub bucket_ok: Arc<tokio::sync::RwLock<(bool, String, std::time::Instant)>>,
+    /// TXT ownership proofs for custom domains (SPEC, Custom domains):
+    /// the system resolver in production, a fake in tests.
+    pub dns: Arc<dyn crate::dns::TxtResolver>,
     /// Process start (whole hours of uptime go into the instance heartbeat).
     pub started_at: chrono::DateTime<chrono::Utc>,
 }
@@ -253,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
         ready: ready.clone(),
         isolation: Arc::new(tokio::sync::RwLock::new(isolation)),
         state_sync: state_sync.clone(),
+        dns: crate::dns::system(),
         bucket_ok: Arc::new(tokio::sync::RwLock::new((
             true,
             String::new(),

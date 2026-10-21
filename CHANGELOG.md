@@ -8,9 +8,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Operator action required
+
+- **Existing custom domains keep working.** The runner schema moves to version 10, and every custom domain attached before the upgrade is kept as verified. As always, an older image refuses the newer data, so back up before upgrading.
+- **Direct runner REST callers:** `GET/POST /v1/apps/{id}/domains`, `DELETE …/domains/{hostname}` and the new `POST …/domains/verify` (RPC `domains.list|add|remove|verify`) now take the caller's `role` (`view` to list, `admin` to change) and refuse requests without it. The control UI, the CLI and MCP aren't affected.
+
 ### Added
 
 - **Browser errors through any Sentry SDK.** Settings → Error reporting shows the app's DSN (`https://<key>@<control host>/<n>`, rotatable by admins). A stock Sentry SDK pointed at it reports exceptions to `POST /api/<n>/envelope/`, and they land in the Errors tab as the same issues as the Worker's own errors, labelled Browser (or SDK for server SDKs) with the page URL and release. Transactions, sessions, replays and other non-error items are accepted and dropped. Source maps are still to come.
+- **Custom domains need DNS proof of ownership on multi-tenant installs.** Before, any tenant could claim any hostname, first come first served. Now a new domain starts as _pending_, and Settings shows the TXT record to create (`_noite-challenge.<hostname>` with the domain's token) plus a **Verify** button that names what's wrong (no record, wrong value, DNS error). A pending domain gets no route and no certificate. Several apps may hold a pending claim for the same hostname, and the first to verify wins. On `single` installs a domain is verified as soon as it's added.
 
 ### Changed
 

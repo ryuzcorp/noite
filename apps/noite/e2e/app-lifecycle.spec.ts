@@ -19,22 +19,32 @@ test("custom domains, env vars and deletion behave", async ({
   const id = appId ?? "";
 
   // --- custom domains -----------------------------------------------------
-  // Shape is validated, and a platform hostname is refused before insert.
-  const invalid = await runnerCall(request, `/v1/apps/${id}/domains`, {
-    body: { hostname: "not a host" },
-    method: "POST",
-  });
+  // Shape is validated, and a platform hostname is refused before insert. The
+  // runner enforces the caller role on every domains call, so these pass it
+  // explicitly like the control UI does.
+  const invalid = await runnerCall(
+    request,
+    `/v1/apps/${id}/domains?role=admin`,
+    {
+      body: { hostname: "not a host" },
+      method: "POST",
+    }
+  );
 
   expect(invalid.status).toBe(400);
 
-  const platform = await runnerCall(request, `/v1/apps/${id}/domains`, {
-    body: { hostname: "api.noite.localhost" },
-    method: "POST",
-  });
+  const platform = await runnerCall(
+    request,
+    `/v1/apps/${id}/domains?role=admin`,
+    {
+      body: { hostname: "api.noite.localhost" },
+      method: "POST",
+    }
+  );
 
   expect(platform.status).toBe(400);
 
-  const added = await runnerCall(request, `/v1/apps/${id}/domains`, {
+  const added = await runnerCall(request, `/v1/apps/${id}/domains?role=admin`, {
     body: { hostname: "probe.example.com" },
     method: "POST",
   });
@@ -42,7 +52,10 @@ test("custom domains, env vars and deletion behave", async ({
   expect(added.status).toBe(200);
   expect(JSON.stringify(added.body)).toContain("probe.example.com");
 
-  // One hostname belongs to one app: a second app cannot claim it.
+  // A verified hostname belongs to one app. In `single` tenancy the first
+  // claim verifies at once, so a second app's claim conflicts. In `multi`
+  // both claims stay pending until one proves ownership (first to verify
+  // wins), so the second claim succeeds as pending too.
   const other = await runnerCall(request, "/v1/apps", {
     body: { name: "Claimant", slug: "claimant" },
     method: "POST",
@@ -52,16 +65,24 @@ test("custom domains, env vars and deletion behave", async ({
   // SAFETY: `POST /v1/apps` answers the created app object (201 above).
   const otherId = (other.body as { id?: string }).id ?? "";
 
-  const conflict = await runnerCall(request, `/v1/apps/${otherId}/domains`, {
-    body: { hostname: "probe.example.com" },
-    method: "POST",
-  });
+  const conflict = await runnerCall(
+    request,
+    `/v1/apps/${otherId}/domains?role=admin`,
+    {
+      body: { hostname: "probe.example.com" },
+      method: "POST",
+    }
+  );
 
-  expect(conflict.status).toBe(409);
+  if (process.env.E2E_TENANCY === "multi") {
+    expect(conflict.status).toBe(200);
+  } else {
+    expect(conflict.status).toBe(409);
+  }
 
   const removed = await runnerCall(
     request,
-    `/v1/apps/${id}/domains/probe.example.com`,
+    `/v1/apps/${id}/domains/probe.example.com?role=admin`,
     { method: "DELETE" }
   );
 

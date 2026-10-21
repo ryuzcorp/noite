@@ -21,7 +21,7 @@ use anyhow::{bail, Context};
 use sqlx::SqliteConnection;
 
 /// Version a database has after every migration ran. 1 is the alpha baseline.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`.
@@ -205,6 +205,37 @@ pub const MIGRATIONS: &[Migration] = &[
             created_at TEXT NOT NULL,\
             updated_at TEXT NOT NULL\
           );",
+    },
+    Migration {
+        version: 10,
+        // DNS TXT ownership for custom domains (SPEC, Custom domains): a
+        // claim is `(hostname, app_id)` now, not one row per hostname, with
+        // a `pending`/`verified` status, a per-claim token and the moment it
+        // verified. Several apps may hold a pending claim for one hostname;
+        // at most one row per hostname may be verified (the partial unique
+        // index). Every pre-migration row is a live site today, so it is
+        // grandfathered as verified with its original timestamp. A fresh
+        // database gets the same shape from schema.sql. SQLite cannot drop a
+        // primary key, so the table is rebuilt through `main.app_domain_new`;
+        // `main.` qualification cannot appear in CREATE INDEX, and these
+        // names are unique to main.
+        sql: "CREATE TABLE IF NOT EXISTS main.app_domain_new (\
+            hostname TEXT NOT NULL,\
+            app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,\
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'verified')),\
+            token TEXT NOT NULL DEFAULT '',\
+            verified_at TEXT,\
+            created_at TEXT NOT NULL,\
+            PRIMARY KEY (hostname, app_id)\
+          );\
+          INSERT OR IGNORE INTO main.app_domain_new \
+            (hostname, app_id, status, token, verified_at, created_at) \
+            SELECT hostname, app_id, 'verified', '', created_at, created_at FROM main.app_domain;\
+          DROP TABLE main.app_domain;\
+          ALTER TABLE main.app_domain_new RENAME TO app_domain;\
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_app_domain_verified \
+            ON app_domain(hostname) WHERE status = 'verified';\
+          CREATE INDEX IF NOT EXISTS idx_app_domain_app ON app_domain(app_id);",
     },
 ];
 
@@ -549,5 +580,70 @@ mod tests {
             .execute(&mut conn)
             .await
             .expect("2 approvals allowed");
+    }
+
+    /// The shipped domain-verification migration rebuilds `app_domain` from
+    /// a hostname-keyed table into a `(hostname, app_id)` claim table. Every
+    /// pre-migration row is a live site today, so it must come out
+    /// grandfathered as verified (still routed), while the new shape lets
+    /// two apps hold a pending claim for one hostname but never two
+    /// verified ones.
+    #[tokio::test]
+    async fn shipped_domain_claim_migration_grandfathers_live_rows() {
+        let mut conn = memory().await;
+        sqlx::raw_sql(
+            "CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT);\
+             INSERT INTO main.app VALUES ('a', 'a'), ('b', 'b');\
+             CREATE TABLE main.app_domain (\
+               app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,\
+               hostname TEXT PRIMARY KEY NOT NULL,\
+               created_at TEXT NOT NULL);\
+             INSERT INTO main.app_domain VALUES ('a', 'shop.example.com', '2026-09-01T00:00:00Z');\
+             PRAGMA main.user_version = 9;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed the pre-verification shape");
+        let v10 = "CREATE TABLE IF NOT EXISTS main.app_domain (\
+              hostname TEXT NOT NULL,\
+              app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,\
+              status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'verified')),\
+              token TEXT NOT NULL DEFAULT '',\
+              verified_at TEXT,\
+              created_at TEXT NOT NULL,\
+              PRIMARY KEY (hostname, app_id));\
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_app_domain_verified \
+              ON app_domain(hostname) WHERE status = 'verified';\
+            CREATE INDEX IF NOT EXISTS idx_app_domain_app ON app_domain(app_id);";
+        let idx = MIGRATIONS
+            .iter()
+            .position(|m| m.version == 10)
+            .expect("the domain-claim migration is shipped");
+        apply(&mut conn, v10, 10, &MIGRATIONS[idx..=idx])
+            .await
+            .expect("upgrade");
+        assert_eq!(version(&mut conn).await, 10);
+        // The live row stays live: verified, with its original timestamp.
+        let row: (String, Option<String>, String) = sqlx::query_as(
+            "SELECT status, verified_at, created_at FROM main.app_domain WHERE hostname = 'shop.example.com'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("grandfathered row");
+        assert_eq!(row.0, "verified", "existing domains stay routed");
+        assert_eq!(row.1, Some("2026-09-01T00:00:00Z".to_owned()));
+        assert_eq!(row.2, "2026-09-01T00:00:00Z");
+        // A pending rival claim coexists; flipping it to verified is refused.
+        sqlx::query(
+            "INSERT INTO main.app_domain (hostname, app_id, status, token, created_at) \
+             VALUES ('shop.example.com', 'b', 'pending', 'tok', 'now')",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("pending rivals coexist");
+        let dup = sqlx::query("UPDATE main.app_domain SET status = 'verified' WHERE app_id = 'b'")
+            .execute(&mut conn)
+            .await;
+        assert!(dup.is_err(), "only the first verifier holds the name");
     }
 }

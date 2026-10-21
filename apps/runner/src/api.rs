@@ -37,7 +37,7 @@ pub use apps::{
     rename_app, retry_import, sleep_app,
 };
 pub use deploys::{deploy_log, list_deploys, list_deploys_stream, rollback};
-pub use domains::{add_domain, list_domains, remove_domain};
+pub use domains::{add_domain, list_domains, remove_domain, verify_domain};
 pub use env::{delete_env, list_env, set_env};
 pub use env_gate::grant_environment;
 pub use environments::{

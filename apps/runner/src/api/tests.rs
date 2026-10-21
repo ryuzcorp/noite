@@ -60,6 +60,7 @@ impl Harness {
                 crate::host::isolation::IsolationStatus::default(),
             )),
             state_sync: crate::host::state::StateSync::new(),
+            dns: std::sync::Arc::new(crate::dns::FakeResolver::default()),
             bucket_ok: Arc::new(tokio::sync::RwLock::new((
                 true,
                 String::new(),
@@ -303,14 +304,14 @@ async fn domains_agree() {
     let (status, listed) = h
         .rest(
             "POST",
-            &format!("/v1/apps/{}/domains", app.id),
+            &format!("/v1/apps/{}/domains?role=admin", app.id),
             Some(json!({ "hostname": "one.example.com" })),
         )
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listed.as_array().map(Vec::len), Some(1));
     assert_eq!(
-        h.rpc("domains.list", json!({ "id": app.id }))
+        h.rpc("domains.list", json!({ "id": app.id, "role": "admin" }))
             .await
             .expect("domains.list"),
         listed
@@ -319,12 +320,36 @@ async fn domains_agree() {
     let added = h
         .rpc(
             "domains.add",
-            json!({ "id": app.id, "hostname": "two.example.com" }),
+            json!({ "id": app.id, "hostname": "two.example.com", "role": "admin" }),
         )
         .await
         .expect("domains.add");
+    // `domains.verify` is a round-trip on an already-verified claim here
+    // (single tenancy verifies on add): both transports return the list.
+    let (status, rest_verified) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/domains/verify?role=admin", app.id),
+            Some(json!({ "hostname": "one.example.com" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rest_verified, added);
+    assert_eq!(
+        h.rpc(
+            "domains.verify",
+            json!({ "id": app.id, "hostname": "one.example.com", "role": "admin" })
+        )
+        .await
+        .expect("domains.verify"),
+        added
+    );
     let (status, rest_list) = h
-        .rest("GET", &format!("/v1/apps/{}/domains", app.id), None)
+        .rest(
+            "GET",
+            &format!("/v1/apps/{}/domains?role=view", app.id),
+            None,
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(rest_list, added);
@@ -332,13 +357,13 @@ async fn domains_agree() {
     let (status, after_rest_remove) = h
         .rest(
             "DELETE",
-            &format!("/v1/apps/{}/domains/one.example.com", app.id),
+            &format!("/v1/apps/{}/domains/one.example.com?role=admin", app.id),
             None,
         )
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        h.rpc("domains.list", json!({ "id": app.id }))
+        h.rpc("domains.list", json!({ "id": app.id, "role": "admin" }))
             .await
             .expect("domains.list"),
         after_rest_remove
@@ -347,15 +372,140 @@ async fn domains_agree() {
     let after_rpc_remove = h
         .rpc(
             "domains.remove",
-            json!({ "id": app.id, "hostname": "two.example.com" }),
+            json!({ "id": app.id, "hostname": "two.example.com", "role": "admin" }),
         )
         .await
         .expect("domains.remove");
     let (status, rest_list) = h
-        .rest("GET", &format!("/v1/apps/{}/domains", app.id), None)
+        .rest(
+            "GET",
+            &format!("/v1/apps/{}/domains?role=admin", app.id),
+            None,
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(rest_list, after_rpc_remove);
+    // Verifying a detached hostname 404s on both transports.
+    let (status, _) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/domains/verify?role=admin", app.id),
+            Some(json!({ "hostname": "gone.example.com" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(matches!(
+        h.rpc(
+            "domains.verify",
+            json!({ "id": app.id, "hostname": "gone.example.com", "role": "admin" })
+        )
+        .await,
+        Err((404, _))
+    ));
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn domains_roles_hold_on_both_transports() {
+    let h = Harness::new().await;
+    let app = h.seed_app("role-app").await;
+    // No role is a refusal, never a default — on REST and RPC alike.
+    let (status, _) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/domains", app.id),
+            Some(json!({ "hostname": "gated.example.com" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = h
+        .rest("GET", &format!("/v1/apps/{}/domains", app.id), None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(matches!(
+        h.rpc("domains.list", json!({ "id": app.id })).await,
+        Err((403, _))
+    ));
+    assert!(matches!(
+        h.rpc(
+            "domains.add",
+            json!({ "id": app.id, "hostname": "gated.example.com" })
+        )
+        .await,
+        Err((403, _))
+    ));
+    // A viewer reads but mutates nothing, on either transport.
+    let (status, _) = h
+        .rest(
+            "GET",
+            &format!("/v1/apps/{}/domains?role=view", app.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/domains?role=view", app.id),
+            Some(json!({ "hostname": "gated.example.com" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(matches!(
+        h.rpc(
+            "domains.verify",
+            json!({ "id": app.id, "hostname": "gated.example.com", "role": "view" })
+        )
+        .await,
+        Err((403, _))
+    ));
+    // An admin passes everywhere: this claim also proves the 200 path still
+    // works with a role attached.
+    let (status, listed) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/domains?role=admin", app.id),
+            Some(json!({ "hostname": "gated.example.com" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed.as_array().map(Vec::len), Some(1));
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn pending_domains_mint_no_certificates() {
+    let h = Harness::new().await;
+    let app = h.seed_app("tls-app").await;
+    crate::db::update_app_status(&h.state.pool, &app.id, "running", None, Some("abc"))
+        .await
+        .expect("deployed");
+    // A pending claim (what `domains.add` writes in `multi` tenancy) mints
+    // no certificate, even on a deployed and running app.
+    crate::db::add_domain(
+        &h.state.pool,
+        &app.id,
+        "shop.example.com",
+        crate::models::DOMAIN_STATUS_PENDING,
+        "tok",
+        None,
+    )
+    .await
+    .expect("pending claim");
+    let (status, _) = h
+        .rest("GET", "/v1/edge/tls-ask?domain=shop.example.com", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "pending mints nothing");
+    // Once verified, the same hostname mints.
+    assert!(
+        crate::db::verify_domain(&h.state.pool, &app.id, "shop.example.com")
+            .await
+            .expect("flip")
+    );
+    let (status, _) = h
+        .rest("GET", "/v1/edge/tls-ask?domain=shop.example.com", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "verified mints");
     h.finish().await;
 }
 
@@ -530,18 +680,19 @@ async fn conflict_statuses_agree() {
         Err((409, "slug already taken".into()))
     );
 
-    // A hostname belongs to exactly one app.
+    // A verified hostname belongs to exactly one app (single tenancy verifies
+    // on claim, so the second claim conflicts).
     let _ = h
         .rest(
             "POST",
-            &format!("/v1/apps/{}/domains", a.id),
+            &format!("/v1/apps/{}/domains?role=admin", a.id),
             Some(json!({ "hostname": "shared.example.com" })),
         )
         .await;
     let (status, _) = h
         .rest(
             "POST",
-            &format!("/v1/apps/{}/domains", b.id),
+            &format!("/v1/apps/{}/domains?role=admin", b.id),
             Some(json!({ "hostname": "shared.example.com" })),
         )
         .await;
@@ -549,7 +700,7 @@ async fn conflict_statuses_agree() {
     assert!(matches!(
         h.rpc(
             "domains.add",
-            json!({ "id": b.id, "hostname": "shared.example.com" })
+            json!({ "id": b.id, "hostname": "shared.example.com", "role": "admin" })
         )
         .await,
         Err((409, _))
@@ -627,20 +778,24 @@ async fn validation_statuses_agree() {
         Err((400, _))
     ));
 
-    // Hostname grammar, then a platform hostname.
+    // Hostname grammar, then a platform hostname (validated after the role
+    // gate, so these carry an admin role to reach the shape checks).
     for hostname in ["bad host", "app.localhost"] {
         let (status, _) = h
             .rest(
                 "POST",
-                &format!("/v1/apps/{}/domains", app.id),
+                &format!("/v1/apps/{}/domains?role=admin", app.id),
                 Some(json!({ "hostname": hostname })),
             )
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "rest {hostname}");
         assert!(
             matches!(
-                h.rpc("domains.add", json!({ "id": app.id, "hostname": hostname }))
-                    .await,
+                h.rpc(
+                    "domains.add",
+                    json!({ "id": app.id, "hostname": hostname, "role": "admin" })
+                )
+                .await,
                 Err((400, _))
             ),
             "rpc {hostname}"
