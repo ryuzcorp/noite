@@ -180,19 +180,14 @@ test("a worker throw becomes an errors-tab issue", async ({
   const deploy = await waitForDeploy(request, appId);
   expect(deploy.status, deploy.log).toBe("success");
 
-  // Diagnostic (source-maps debugging): the store step's note names which
-  // map was stored. Visible in the lane log on failure.
+  // The deploy log line proves the maps step ran for this sha (and names
+  // which map was stored).
   const deployLog = await runnerApi<{ log: string }>(
     request,
     `/v1/apps/${appId}/deploys/${deploy.id}/log`
   );
 
-  console.log(
-    deployLog.log
-      .split("\n")
-      .filter((line) => line.includes("sourcemaps"))
-      .join("\n")
-  );
+  expect(deployLog.log).toMatch(/sourcemaps: /u);
 
   // Through the lane Caddy, not the raw fleet port: the tenant site sets a
   // sampled `traceparent` and logs the same `traceID` in the access log, so
@@ -256,8 +251,6 @@ test("a worker throw becomes an errors-tab issue", async ({
 
   // Source maps: the occurrence resolves against its deploy's worker map,
   // chained through the build's own map to the original worker source.
-  // Logged for lane debugging (raw + mapped per frame).
-  console.log(JSON.stringify(first?.frames));
 
   const mapped = first?.frames.find((frame) => frame.mappedLocation);
 
