@@ -1,6 +1,3 @@
-import { mkdirSync, rmSync } from "node:fs";
-
-import { sleep } from "$lib/sleep";
 import { expect, test } from "@playwright/test";
 import type {
   APIRequestContext,
@@ -21,6 +18,7 @@ import {
   runnerApi,
   waitForCreatedApp,
   waitForDeploy,
+  withInviteLock,
 } from "./helpers";
 
 // Instance admin page (`/apps/_control?t=users|apps|invites`): every effect is
@@ -79,32 +77,6 @@ const secondOrThrow = () => {
   }
 
   return { context: secondContext, page: secondPage };
-};
-
-/** The filesystem lock that serializes invite mint/redeem across workers. */
-const inviteLockDir = new URL(".auth/invite.lock", import.meta.url);
-
-const acquireInviteLock = async (): Promise<void> => {
-  const start = Date.now();
-
-  for (;;) {
-    try {
-      mkdirSync(inviteLockDir);
-
-      return;
-    } catch {
-      if (Date.now() - start > 120_000) {
-        throw new Error("invite lock timed out after 120s");
-      }
-
-      // oxlint-disable-next-line eslint/no-await-in-loop -- sequential lock acquisition with a timeout; Promise.all would defeat it
-      await sleep(200);
-    }
-  }
-};
-
-const releaseInviteLock = (): void => {
-  rmSync(inviteLockDir, { force: true, recursive: true });
 };
 
 const adminListInvites = async (
@@ -191,9 +163,7 @@ test("invite codes mint, revoke, and gate registration", async ({
   page,
   request,
 }) => {
-  await acquireInviteLock();
-
-  try {
+  await withInviteLock(async () => {
     const listed = await adminListInvites(request);
 
     const before = new Set(
@@ -278,9 +248,7 @@ test("invite codes mint, revoke, and gate registration", async ({
     secondPage = second.page;
     const registered = await sessionOf(second.page.request);
     expect(registered.user?.email).toBe(SECOND_EMAIL);
-  } finally {
-    releaseInviteLock();
-  }
+  });
 });
 
 test("the users tab finds the second account and refuses it admin surfaces", async ({

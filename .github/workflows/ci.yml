@@ -106,6 +106,10 @@ jobs:
   changes:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # paths-filter lists a pull request's files through the API.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
@@ -115,9 +119,11 @@ jobs:
       - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
         id: filter
         with:
+          # apps/website is the docs site, outside the runtime.
           filters: |
             code:
-              - 'apps/**'
+              - 'apps/noite/**'
+              - 'apps/runner/**'
               - 'packages/**'
               - 'docker/**'
               - 'Makefile'

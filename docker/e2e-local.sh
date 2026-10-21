@@ -74,7 +74,9 @@ echo "==> reset lane state (fresh volumes, fresh bucket, no session)"
 $CE2E down -v --remove-orphans >/dev/null 2>&1 || true
 # `down -v` is best-effort (podman-compose) — remove whatever it left behind.
 remove_project noite-e2e
-rm -rf apps/noite/e2e/.auth/user.json
+# A worker killed mid-run (cancel, timeout) leaves the invite lock behind,
+# which would stall the next run's invite specs for 120 s.
+rm -rf apps/noite/e2e/.auth/user.json apps/noite/e2e/.auth/invite.lock
 for p in 8080 8090 "$RUSTFS_API_PORT"; do
   if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:${p}/"; then
     echo "error: something already answers on :${p} (make down first?)"

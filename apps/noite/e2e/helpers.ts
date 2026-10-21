@@ -349,27 +349,30 @@ export const registerInviteeAccount = async (
   return { context, page };
 };
 
-/** Register a second account on a freshly-read invite code, serialized across
- * Playwright workers. Invite codes are single-use: two files redeeming the
- * same code in parallel would fail the loser with a spent code, so the
- * read-plus-redeem section runs under a filesystem lock (mkdir is atomic;
- * workers are separate processes on the one lane machine). The lock lives
- * under e2e/.auth, which the lane wipes on every reset. */
-export const registerInviteeWithFreshCode = async (
-  browser: Browser,
-  page: Page,
-  account: { email: string; name: string }
-): Promise<{ context: BrowserContext; page: Page }> => {
-  const lockDir = new URL(".auth/invite.lock", import.meta.url);
+/** Run `fn` holding the cross-worker invite lock. Invite codes are
+ * single-use, and invite listings are diffed by the admin spec, so every
+ * read-mint-redeem section runs under a filesystem lock (mkdir is atomic;
+ * workers are separate processes on the one lane machine). The lane script
+ * deletes a lock a killed worker left behind before every run. */
+export const withInviteLock = async <T>(fn: () => Promise<T>): Promise<T> => {
+  const authDir = new URL(".auth/", import.meta.url);
+  const lockDir = new URL("invite.lock", authDir);
   const start = Date.now();
+
+  mkdirSync(authDir, { recursive: true });
 
   for (;;) {
     try {
       mkdirSync(lockDir);
       break;
-    } catch {
+    } catch (error) {
+      // SAFETY: node:fs throws ErrnoException; any code but EEXIST is a real error, not contention.
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+
       if (Date.now() - start > 120_000) {
-        throw new Error("invite lock timed out after 120s");
+        throw new Error("invite lock timed out after 120s", { cause: error });
       }
 
       // oxlint-disable-next-line eslint/no-await-in-loop -- sequential lock acquisition with a timeout; Promise.all would defeat it
@@ -378,18 +381,27 @@ export const registerInviteeWithFreshCode = async (
   }
 
   try {
-    const inviteCode = await readInviteCode(page);
-
-    return await registerInviteeAccount(
-      browser,
-      inviteCode,
-      account.email,
-      account.name
-    );
+    return await fn();
   } finally {
     rmSync(lockDir, { force: true, recursive: true });
   }
 };
+
+/** Register a second account on a freshly-read invite code, under the
+ * invite lock (see `withInviteLock`). */
+export const registerInviteeWithFreshCode = (
+  browser: Browser,
+  page: Page,
+  account: { email: string; name: string }
+): Promise<{ context: BrowserContext; page: Page }> =>
+  withInviteLock(async () =>
+    registerInviteeAccount(
+      browser,
+      await readInviteCode(page),
+      account.email,
+      account.name
+    )
+  );
 
 /** Create an app through the UI and mint an API key for pushing to it,
  * under the registered session. */
