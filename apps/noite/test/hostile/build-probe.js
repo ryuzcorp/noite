@@ -160,11 +160,12 @@ deny("read:sibling-build-cache", () => {
   throw new Error(`siblings=${seen.length} readable=0`);
 });
 
-// Per-fleet cgroups: the inverse of the probes above — containment holds
-// when the fleet groups are visible with a positive `memory.max`. The build
-// runs in the runner's leaf (`.../noite/runner`), so the anchor is its
-// parent; every sibling entry is a live tenant fleet. Throws (ok: false)
-// when cgroups are inactive (no anchor) or a fleet runs uncapped.
+// Per-fleet cgroups are the inverse probe: containment holds when every
+// fleet group carries a positive `memory.max`, read by the sandboxed build
+// itself from the shared anchor. The build runs in the runner's leaf
+// (`.../noite/runner`), so the anchor is its parent; every sibling directory
+// is a live tenant fleet. Throws (ok: false) when cgroups are inactive (no
+// anchor) or a fleet runs uncapped.
 try {
   const selfLine = readFileSync("/proc/self/cgroup", "utf-8")
     .split("\n")
@@ -177,7 +178,11 @@ try {
       ? "/sys/fs/cgroup/noite"
       : `/sys/fs/cgroup${own.replace(/\/runner$/u, "")}`;
 
-  const fleets = readdirSync(anchor).filter((name) => name !== "runner");
+  // Every cgroup dir also carries the kernel's own interface files
+  // (`cgroup.procs`, `memory.stat`, …): only subdirectories are fleets.
+  const fleets = readdirSync(anchor, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name !== "runner")
+    .map((entry) => entry.name);
 
   const caps = fleets.map((name) => {
     const max = Number(
