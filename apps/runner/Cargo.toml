@@ -51,6 +51,7 @@ sourcemap = "9"
 # warnings for serde attrs ts-rs does not model (e.g. `alias`).
 ts-rs = { version = "12", features = ["no-serde-warnings"] }
 hickory-resolver = "0.26.3"
+argon2 = "0.6.0"
 
 [dev-dependencies]
 # `time::pause`/`advance` for the DNS-timeout test; tests only.

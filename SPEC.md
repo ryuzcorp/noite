@@ -135,7 +135,7 @@ Fallback where a platform grants no `NET_ADMIN` (not built): run each fleet unde
 ### Known limits
 
 - The build uid is **shared**, so two concurrent builds can read each other's worktrees. Acceptable while tenants are untrusted rather than adversarial; per-build uids are the fix.
-- Fleets hold the **root** bucket keys until [Scoped credentials](#scoped-credentials) land, so a compromised fleet process can reach every prefix.
+- Fleets hold [scoped bucket keys](#scoped-credentials) for their own prefix only — except on stores with no prefix-scoped keys (R2) or without the extra configuration (AWS S3 needs `NOITE_CREDENTIAL_PROVIDER=aws` and an IAM-capable key), where they hold the **root** keys as an explicit `root` mode the boot log, `/ready` and `make doctor` all name.
 - Worker code can reach the object store's unauthenticated surface (it answers 401/403).
 - Sandbox depth is uid + env + rlimits + egress rules. A container per build (rootless Podman in the image, gVisor) is out of scope unless tenants are expected to be adversarial.
 - No per-tenant memory containment: fleets share the container cgroup, so one fleet's growth pushes every fleet toward the shared shed threshold. Per-fleet cgroups (memory.max per fleet, which also gives celld a per-fleet working set) are the fix where cgroupfs is writable.
@@ -201,26 +201,26 @@ Measured on a 32-core host with 15 apps: first fleet healthy 2.1 s after the con
 
 ## Readiness
 
-`GET /ready` answers 200 only when all hold, else 503 with `{"ok":false,"failing":[…]}`: first reconcile done (`reconcile`); the bucket answers (`bucket: …`, cached briefly); `multi` isolation checks passed (`isolation: …`); the control fleet is healthy when the image has a bundle (`control: …`); Caddy accepted the last config (`caddy: …`). It is the container healthcheck and what `make doctor` prints. One check fits Compose, Railway, Coolify and Fly.
+`GET /ready` answers 200 only when all hold, else 503 with `{"ok":false,"failing":[…]}`: first reconcile done (`reconcile`); the bucket answers (`bucket: …`, cached briefly); `multi` isolation checks passed (`isolation: …`); the control fleet is healthy when the image has a bundle (`control: …`); Caddy accepted the last config (`caddy: …`). Both answers carry `credentials` — what tenant fleets hold ([Scoped credentials](#scoped-credentials)) — which is what `make doctor` prints. One check fits Compose, Railway, Coolify and Fly.
 
 ## Scoped credentials
 
 Goal: a compromise of one fleet reaches one app.
 
-Built (`host/credentials.rs`, table `app_credential`): rows are AES-256-GCM with a random nonce and the app id as associated data, under a key derived from `RUNNER_TOKEN` with HKDF, so the snapshot in the bucket is not a key dump and a row cannot be replayed onto another app. Lookups: `scoped_credentials` (the decrypted row or nothing), `tenant_process_credentials` (scoped, else root in `single` only; used by release), `fleet_credentials` (scoped, else root). The write path refuses to store root keys. No provider mints keys yet, so fleets run with root keys.
+Built (`host/credentials.rs`, `host/credentials_minio.rs`, `host/credentials_aws.rs`, table `scoped_credential`): every tenant scope — an app (`fleets/{slug}/`) or a preview environment (`envs/{slug}/{label}/`, so an environment's keys never reach production's) — holds keys minted through the store's own IAM that read, write and list only its own prefix, plus the bucket-location call SDKs make. No bucket-wide listing, no bucket HEAD: both would reveal other apps' key names. The runner keeps the root keys for its own work (deploys, purges, renames, telemetry, snapshots). Rows are AES-256-GCM with a random nonce and the scope as associated data, under a key derived from `RUNNER_TOKEN` with HKDF, so the snapshot in the bucket is not a key dump and a row cannot be replayed onto another scope. The write path refuses to store root keys.
 
-To build: a `CredentialProvider` (`app_credentials(slug)`, `revoke(slug)`), keys minted at app create, rotated on rename, revoked on delete (`host/purge.rs`), used by fleet spawn, release and the D1 table editor.
+`NOITE_CREDENTIAL_PROVIDER` (`auto` default): `minio` forces the MinIO admin-API provider (MinIO and RustFS), `aws` forces the AWS IAM provider, `root` keeps the root keys everywhere explicitly, and `auto` scopes the bundled RustFS, probes any other unknown store for the MinIO admin API once the bucket answers, and stays on root keys for R2 and AWS S3 with the reason named (see the operator table below). Keys are minted lazily at the first fleet spawn or deploy — an install that predates this gets its keys with no manual step — superseded on rename, revoked on delete (`host/purge.rs`; environment teardown revokes only the environment's key). Two consumers, two rules: `fleet_credentials` (the scope's own key, else root), `tenant_process_credentials` (the scope's own key; root only in `single`, used by release — in `multi` the release is skipped until scoped keys exist). A deleted-then-recreated slug waits for the old key's store delete before a new key is minted for the prefix.
 
 | Store | Mechanism | Status |
 | --- | --- | --- |
-| RustFS | IAM user + policy on `arn:aws:s3:::{bucket}/fleets/{slug}/*` via its admin API | verify support at the pinned version |
-| MinIO | same, admin API user + policy | supported |
-| AWS S3 | IAM user or STS `AssumeRole` with a prefix-scoped session policy | supported |
-| Cloudflare R2 | tokens scope to buckets: bucket-per-app (`noite-{slug}`) via the Cloudflare API | optional provider; changes the bucket layout on R2 |
-| Tigris | per-bucket keys; bucket-per-app like R2 | verify |
-| none of these | root keys | `single` only |
+| RustFS | IAM user + canned policy on `arn:aws:s3:::{bucket}/fleets/{slug}/*` via its MinIO-compatible admin API (payloads use the madmin argon2id + sio-DARE encryption) | supported, verified against 1.0.0 and 1.0.3 |
+| MinIO | same admin API user + policy | supported |
+| AWS S3 | IAM user + inline prefix policy + access key via the IAM Query API; needs an IAM-capable key and `NOITE_CREDENTIAL_PROVIDER=aws` | supported |
+| Cloudflare R2 | tokens scope to buckets, not prefixes: no long-lived prefix-scoped keys; bucket-per-app would change the bucket layout on R2 | root keys (explicit `root` mode); not planned |
+| Tigris | per-bucket keys; bucket-per-app like R2 | root keys unless the store answers the MinIO admin probe |
+| none of these | root keys, surfaced in the boot log, `isolation::self_check`, `/ready`, `make doctor` — loud in `multi`, never silent | explicit documented mode, not a fallback |
 
-celld's storage contract (conditional writes, read-after-write, ranged reads) must hold under the scoped keys; celld's startup check fails loudly when a policy blocks a required call. Order: MinIO/S3 first, RustFS after verification, R2 last. Done when fleet keys fail `ListObjectsV2` outside `fleets/{slug}/`, release migrations work with them, and purge revokes them.
+celld's storage contract (conditional writes, read-after-write, ranged reads) holds under the scoped keys — the LIST and multipart calls the contract needs are inside the prefix policy; celld's startup check fails loudly when a policy blocks a required call. Done when fleet keys fail `ListObjectsV2` outside their prefix, release migrations work with them (the hostile e2e suite asserts all of this), and delete revokes them with a retrying sweep.
 
 ## Configuration
 

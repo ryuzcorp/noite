@@ -33,6 +33,44 @@ interface ProbeReport {
 const pushHostileApp = (apiKey: string): string =>
   pushAppDir(apiKey, new URL("../test/hostile", import.meta.url), HOSTILE_SLUG);
 
+// Scoped bucket keys (SPEC, Scoped credentials): the release ran with a key,
+// the key reaches its own prefix, and every cross-prefix attempt was refused.
+// The presence assertions fail closed: a release that never ran (root mode
+// skips it in multi) proves nothing.
+const expectReleaseProbes = (probes: Record<string, Probe>): void => {
+  for (const name of [
+    "s3:scoped-key",
+    "s3:own-read-write",
+    "s3:cross-app-list",
+    "s3:cross-app-write",
+    "s3:env-list",
+    "s3:root-list",
+  ]) {
+    expect(
+      probes[name],
+      `release probe ${name} present (release ran with bucket keys)`
+    ).toBeDefined();
+  }
+
+  for (const [name, probe] of Object.entries(probes)) {
+    if (
+      name === "scoped-prefix" ||
+      name === "s3:scoped-key" ||
+      name === "s3:own-read-write"
+    ) {
+      expect(probe.ok, `release probe ${name} must hold: ${probe.detail}`).toBe(
+        true
+      );
+
+      continue;
+    }
+
+    expect(probe.ok, `release probe ${name} leaked: ${probe.detail}`).toBe(
+      false
+    );
+  }
+};
+
 // Hostile tenant (SPEC, Hostile-tenant suite): the Worker and build scripts
 // attempt each attack and report results as JSON; every attempt must fail
 // except internet egress. It only means something against an install that
@@ -108,9 +146,7 @@ test(
     const report = (await res.json()) as ProbeReport;
 
     for (const [name, probe] of Object.entries(report.build.probes)) {
-      expect(probe.ok, `build probe ${name} leaked: ${probe.detail}`).toBe(
-        false
-      );
+      expect(probe.ok, `build probe ${name} leaked: ${probe.detail}`).toBe(false);
     }
 
     // The cross-build probe only proves isolation if a sibling app's build
@@ -132,15 +168,7 @@ test(
       `needs a sibling app's build cache to probe (${crossBuild?.detail ?? ""})`
     ).toBeGreaterThan(0);
 
-    for (const [name, probe] of Object.entries(report.release.probes)) {
-      if (name === "scoped-prefix") {
-        continue;
-      }
-
-      expect(probe.ok, `release probe ${name} leaked: ${probe.detail}`).toBe(
-        false
-      );
-    }
+    expectReleaseProbes(report.release.probes);
 
     for (const [name, probe] of Object.entries(report.worker)) {
       if (probe.mustSucceed === true) {

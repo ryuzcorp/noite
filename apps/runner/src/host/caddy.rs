@@ -1243,6 +1243,7 @@ mod tests {
             wake_timeout_s: 120,
             fleet_asset_cache_mb: 64,
             tenancy: crate::config::Tenancy::Single,
+            credentials: crate::host::credentials::Credentials::Detect,
             stop_budget_ms: 25000,
             build_max_mb: 2048,
             build_cache_mb: 512,

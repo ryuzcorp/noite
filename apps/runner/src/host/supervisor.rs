@@ -231,8 +231,9 @@ pub async fn stop_environment_fleets(procs: &ProcMap, slug: &str, grace: StopGra
 struct FleetSpec {
     /// `ProcMap` key and log-ring key (`slug`, or `slug.label`).
     key: String,
-    /// Owning app slug: scoped credentials and logs are per app.
-    slug: String,
+    /// The tenant scope whose key the fleet holds: the app's own prefix, or
+    /// the environment's own when this fleet is a preview.
+    scope: crate::host::credentials::Scope,
     bucket: String,
     listen: i64,
     internal: i64,
@@ -253,7 +254,6 @@ pub async fn ensure_fleet(
     };
     let spec = FleetSpec {
         key: app.slug.clone(),
-        slug: app.slug.clone(),
         bucket: app.fleet_bucket.clone(),
         listen,
         internal,
@@ -261,6 +261,7 @@ pub async fn ensure_fleet(
             .join("fleets")
             .join(&app.slug),
         env: db::tenant_env(pool, &app.id).await,
+        scope: crate::host::credentials::Scope::app(app),
     };
     ensure_spawned(pool, cfg, procs, logs, spec).await
 }
@@ -292,12 +293,12 @@ pub async fn ensure_environment_fleet(
     }
     let spec = FleetSpec {
         key: env_fleet_key(&env.app_slug, &env.label),
-        slug: env.app_slug.clone(),
         bucket: env.fleet_bucket.clone(),
         listen,
         internal,
         state_dir,
         env: db::environment_tenant_env(pool, &env.app_id, &env.id).await,
+        scope: crate::host::credentials::Scope::environment(env),
     };
     ensure_spawned(pool, cfg, procs, logs, spec).await
 }
@@ -344,10 +345,10 @@ async fn ensure_spawned(
             tracing::warn!(fleet = %key, "could not hand the fleet state dir to the fleet user");
         }
     }
-    // Scoped credentials are per app prefix: until a provider that also scopes
-    // `envs/<slug>/` lands, an environment fleet shares its app's pair
-    // (SPEC, Scoped credentials).
-    let creds = credentials::fleet_credentials(pool, cfg, &spec.slug).await?;
+    // The fleet holds its scope's key — the app's own prefix, or the
+    // environment's own for a preview — minted lazily on first spawn so
+    // upgrades need no manual step (SPEC, Scoped credentials).
+    let creds = credentials::fleet_credentials(pool, cfg, &spec.scope).await?;
     let (access, secret_key) = (creds.access_key, creds.secret_key);
     // Advertise on loopback: a tenant fleet is a single node, a child of the
     // runner in its own network namespace, and the runner already reaches it

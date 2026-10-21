@@ -37,7 +37,11 @@ pub use compaction::{
     bump_metric_version, get_compacted_hours, get_metric_version, mark_hour_compacted,
     prune_compactions,
 };
-pub use credentials::{delete_app_credential, get_app_credential};
+pub use credentials::{
+    delete_scoped_credential, insert_scoped_credential, live_scoped_credential,
+    mark_app_scoped_credentials_revoking, mark_scoped_credential_revoking,
+    revoking_scoped_credentials, NewScopedCredential, ScopedCredential,
+};
 pub use deploys::{
     fail_stuck_deploys, get_deploy_log, get_success_deploy, latest_deploy_status,
     latest_deploy_status_for_env, list_deploys, list_deploys_lean, upsert_deploy,

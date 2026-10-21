@@ -42,6 +42,11 @@ pub async fn teardown(
             .with_context(|| format!("remove {}", state_dir.display()))?;
     }
     clear_env_prefix(cfg, &env.app_slug, &env.label).await?;
+    // The environment's key must not outlive its prefix (SPEC, Scoped
+    // credentials); the app's own key is untouched.
+    if let Err(e) = crate::host::credentials::revoke_environment(pool, cfg, &env.id).await {
+        tracing::warn!(env_id = %env.id, error = %format!("{e:#}"), "environment deleted but credential revoke failed");
+    }
     db::delete_environment(pool, &env.id).await?;
     tracing::info!(
         slug = %env.app_slug,

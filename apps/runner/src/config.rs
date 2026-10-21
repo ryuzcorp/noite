@@ -1,5 +1,7 @@
 use std::env;
 
+use crate::host::credentials::{Credentials, ProviderSetting, StoreAccess};
+
 /// Process-wide lock serializing tests that mutate process env (and every
 /// other test that reads the whole env through `Config::from_env`): tests run
 /// in threads, so an uncleared `RUNNER_POLL_MS=abc` would otherwise fail a
@@ -491,6 +493,10 @@ pub struct Config {
     pub caddy_access_log: String,
     /// Tenancy mode (SPEC). Default multi off localhost.
     pub tenancy: Tenancy,
+    /// Where tenant fleet keys come from (SPEC, Scoped credentials):
+    /// `NOITE_CREDENTIAL_PROVIDER` resolved at boot (`auto` probes an
+    /// unknown store once the bucket answers). `Detect` before that.
+    pub credentials: Credentials,
     /// Graceful-stop budget in ms (SPEC, Shutdown). Fleets get
     /// budget - 3000 as CELLD_SHUTDOWN_TOTAL_MS.
     pub stop_budget_ms: u64,
@@ -571,6 +577,10 @@ impl Config {
         let auto_https =
             parse_auto_https(env::var("CADDY_AUTO_HTTPS").ok().as_deref(), &base_domain);
         let tenancy = parse_tenancy(env::var("NOITE_TENANCY").ok().as_deref(), &base_domain);
+        let credential_setting = ProviderSetting::parse(
+            env::var("NOITE_CREDENTIAL_PROVIDER").ok().as_deref(),
+            &mut env_problems,
+        );
         let (fleet_port_min, fleet_port_max) = parse_fleet_ports(&mut env_problems);
         let cfg = Self {
             bind: env_or(&["RUNNER_BIND"], "0.0.0.0:8080"),
@@ -690,6 +700,22 @@ impl Config {
                 &mut env_problems,
             ),
             tenancy,
+            credentials: Credentials::configure(
+                credential_setting,
+                &StoreAccess {
+                    // Resolved from the same vars as the literal below; kept
+                    // inline so the two cannot drift.
+                    endpoint: env::var("S3_ENDPOINT")
+                        .unwrap_or_else(|_| "http://rustfs:9000".into()),
+                    region: env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into()),
+                    access_key: env::var("AWS_ACCESS_KEY_ID")
+                        .or_else(|_| env::var("RUSTFS_ACCESS_KEY"))
+                        .unwrap_or_else(|_| "noiteaccess".into()),
+                    secret_key: env::var("AWS_SECRET_ACCESS_KEY")
+                        .or_else(|_| env::var("RUSTFS_SECRET_KEY"))
+                        .unwrap_or_else(|_| "noitesecretnoitesecretnoite12".into()),
+                },
+            ),
             stop_budget_ms: env_num(
                 "NOITE_STOP_BUDGET_MS",
                 25000,
@@ -748,6 +774,18 @@ impl Config {
         cfg.validate()?;
         Ok(cfg)
     }
+    /// Finish resolving where tenant keys come from, once the bucket
+    /// answers. `auto` against an unknown store probes it for the MinIO
+    /// admin API; anything already decided stays. Runs before the first
+    /// fleet spawn (existing installs mint their keys lazily from there).
+    pub async fn resolve_credentials(&mut self) -> anyhow::Result<()> {
+        if matches!(self.credentials, Credentials::Detect) {
+            self.credentials =
+                crate::host::credentials::detect(&StoreAccess::from_config(self)).await?;
+        }
+        Ok(())
+    }
+
     /// Boot validation (SPEC, Configuration): fail fast with a
     /// list of problems instead of serving half-configured.
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -1016,6 +1054,7 @@ pub(crate) fn config_for_tests() -> Config {
         git_public_base: "https://git.localhost".into(),
         caddy_access_log: "/caddy/access.log".into(),
         tenancy: Tenancy::Single,
+        credentials: Credentials::Detect,
         stop_budget_ms: 25000,
         build_max_mb: 2048,
         build_cache_mb: 512,

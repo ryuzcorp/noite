@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config = Arc::new(Config::from_env()?);
+    let mut config = Arc::new(Config::from_env()?);
     tokio::fs::create_dir_all(&config.work_dir).await.ok();
 
     // Before anything writes to /data: private by default (SPEC, Data directory).
@@ -137,6 +137,25 @@ async fn main() -> anyhow::Result<()> {
     });
 
     host::s3::ensure_buckets(&config).await?;
+    // Where tenant keys come from (SPEC, Scoped credentials): `auto` probes
+    // an unknown store now that the bucket answers, before any fleet spawns.
+    // A store that cannot answer fails the boot rather than guess, because
+    // the answer decides what every fleet holds.
+    Arc::get_mut(&mut config)
+        .expect("config uniquely owned at boot")
+        .resolve_credentials()
+        .await?;
+    tracing::info!(
+        credentials = %config.credentials.summary(),
+        tenancy = %config.tenancy.as_str(),
+        "tenant bucket credentials"
+    );
+    if !config.credentials.is_scoped() && config.tenancy == crate::config::Tenancy::Multi {
+        tracing::warn!(
+            "multi-tenant install runs fleets with the root bucket keys: \
+             a compromised fleet process can reach every prefix (SPEC, Scoped credentials)"
+        );
+    }
 
     // Boot: restore SQLite snapshot when the volume is empty (SPEC, Runner state). A
     // failure other than "no snapshot" stops the boot: starting empty would

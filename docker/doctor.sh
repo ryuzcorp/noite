@@ -70,6 +70,19 @@ else
   echo "FAIL runner /ready: ${ready:-no answer}"
   fail=1
 fi
+# What tenant fleets hold (SPEC, Scoped credentials): `scoped (...)` is the
+# goal; `root (...)` is explicit and loud, especially with multi tenancy.
+credentials="$(printf '%s' "$ready" | sed -n 's/.*"credentials":"\([^"]*\)".*/\1/p')"
+if [ -n "$credentials" ]; then
+  case "$credentials" in
+    scoped*)
+      echo "ok   tenant bucket credentials: $credentials"
+      ;;
+    *)
+      echo "WARN tenant bucket credentials: $credentials"
+      ;;
+  esac
+fi
 
 check "runner API auth" api -H "Authorization: Bearer ${TOKEN}" "${API}/v1/apps"
 # Ask for HTML like a browser: the control worker's page router answers a
