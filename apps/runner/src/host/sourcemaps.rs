@@ -1407,11 +1407,13 @@ mod tests {
     /// store for a deploy, and the Vite worker map it chains through.
     /// Assert exact composed positions: this is the composition the Errors
     /// tab reads at `errors.get` time.
-    const FIXTURE_SHADOW_MAP: &[u8] =
-        include_bytes!("testdata/sourcemaps/dist/.tmp-sandbox/shadow-maps/shadow.js.map");
+    const FIXTURE_SHADOW_MAP: &[u8] = include_bytes!(
+        "testdata/sourcemaps/approot/.tmp-sandbox/shadow-maps/shadow.js.map.txt"
+    );
     const FIXTURE_ENTRY_MAP: &[u8] =
-        include_bytes!("testdata/sourcemaps/dist/vite_sample/entry.js.map");
-    const FIXTURE_ENTRY_JS: &[u8] = include_bytes!("testdata/sourcemaps/dist/vite_sample/entry.js");
+        include_bytes!("testdata/sourcemaps/approot/vite_sample/entry.js.map.txt");
+    const FIXTURE_ENTRY_JS: &[u8] =
+        include_bytes!("testdata/sourcemaps/approot/vite_sample/entry.js.txt");
 
     #[test]
     fn real_shadow_map_chains_to_original_sources() {

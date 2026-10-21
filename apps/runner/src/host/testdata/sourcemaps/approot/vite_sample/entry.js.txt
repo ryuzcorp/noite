@@ -1,0 +1,21 @@
+//#region src/greeting.txt?raw
+const greeting_default = "hello from vite\n";
+
+//#endregion
+//#region \0virtual:cloudflare/worker-entry
+const worker_entry_default = {
+  async fetch(request) {
+    const { pathname } = new URL(request.url);
+
+    if (pathname === "/api/greeting") {
+      return Response.json({ greeting: greeting_default.trim() });
+    }
+    if (pathname === "/api/phase1-boom") {
+      throw new Error("phase1-boom-testtoken");
+    }
+    return new Response("not found", { status: 404 });
+  },
+};
+
+//#endregion
+export { worker_entry_default as default };
