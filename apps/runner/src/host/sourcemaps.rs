@@ -30,7 +30,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -242,6 +242,9 @@ fn map_for_frame<'a>(manifest: &'a MapManifest, location: &str) -> Option<&'a st
 pub struct SymbolicateBudget {
     pub maps: usize,
     pub frames: usize,
+    /// `(sha, rel)` pairs already charged in this read, so a map shared by
+    /// many occurrences costs the budget once (cache hits included).
+    pub seen: HashSet<(String, String)>,
 }
 
 impl SymbolicateBudget {
@@ -249,6 +252,7 @@ impl SymbolicateBudget {
         Self {
             maps: MAX_MAPS_PER_GET,
             frames: MAX_FRAMES_PER_GET,
+            seen: HashSet::new(),
         }
     }
 }
@@ -345,21 +349,46 @@ pub async fn symbolicate_frames(
         .collect();
     rels.sort();
     rels.dedup();
-    let take = rels.len().min(budget.maps);
-    budget.maps -= take;
     let mut loaded: HashMap<String, Option<Arc<sourcemap::SourceMap>>> = HashMap::new();
-    for rel in rels.into_iter().take(take) {
+    for rel in rels {
+        if !charge_map(budget, sha, rel) {
+            continue;
+        }
         loaded.insert(
             rel.to_string(),
             cache.map(cfg, bucket, prefix, sha, rel).await,
         );
     }
+    // The maps above are already charged; the inner pass spends frame
+    // attempts only, so one event's maps never cost the budget twice.
+    let mut inner = SymbolicateBudget {
+        maps: usize::MAX,
+        frames: budget.frames,
+        seen: HashSet::new(),
+    };
     symbolicate_with(
         frames,
         &manifest,
         &|rel| loaded.get(rel).cloned().flatten(),
-        budget,
+        &mut inner,
     );
+    budget.frames = inner.frames;
+}
+
+/// Whether `symbolicate_frames` may load `rel` for `sha`: an unseen pair
+/// costs one map from the budget, a repeat rides on the first charge (cache
+/// hits included), and an unseen pair past the budget stays raw.
+fn charge_map(budget: &mut SymbolicateBudget, sha: &str, rel: &str) -> bool {
+    let key = (sha.to_string(), rel.to_string());
+    if budget.seen.contains(&key) {
+        return true;
+    }
+    if budget.maps == 0 {
+        return false;
+    }
+    budget.maps -= 1;
+    budget.seen.insert(key);
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -385,6 +414,26 @@ enum CachedKey {
 
 /// Weight of a cached negative entry: the two keys are the bulk of it.
 const NEGATIVE_ENTRY_WEIGHT: usize = 256;
+/// How long a missing manifest stays cached: the store uploads the manifest
+/// last, so a deploy's first errors can arrive before it exists. Past this
+/// the next read refetches instead of rendering raw for the life of the
+/// process.
+const NEGATIVE_MANIFEST_TTL: Duration = Duration::from_secs(60);
+
+/// What a fetch found: a usable value, a permanent absence, or a failure
+/// that must not be cached. Only the first two enter the cache — a hiccup
+/// (timeout, 5xx, refused HEAD) retries on the next read instead of
+/// disabling symbolication until the runner restarts.
+enum FetchOutcome<T> {
+    Hit(T, usize),
+    Missing,
+    Transient,
+}
+
+/// A cached manifest plus its byte weight and negative-cache time (`Some`
+/// exactly when the value is `None`, so an expired missing entry refetches
+/// on next read).
+type ManifestEntry = (Option<Arc<MapManifest>>, usize, Option<Instant>);
 
 #[derive(Debug, Default)]
 struct CacheInner {
@@ -392,7 +441,7 @@ struct CacheInner {
     /// Insertion order for oldest-first eviction, across maps and manifests.
     order: VecDeque<CachedKey>,
     maps: HashMap<CacheKey, (Option<Arc<sourcemap::SourceMap>>, usize)>,
-    manifests: HashMap<ManifestKey, (Option<Arc<MapManifest>>, usize)>,
+    manifests: HashMap<ManifestKey, ManifestEntry>,
 }
 
 /// Parsed maps and manifests, bounded by [`MAX_CACHED_BYTES`]. Entries are
@@ -408,9 +457,11 @@ impl SourceMapCache {
         Self::default()
     }
 
-    /// The deploy's manifest, cached negative when no deploy stored one.
+    /// The deploy's manifest, cached negative while no deploy stored one.
     /// Manifests share the maps' byte budget (negatives included), so one
-    /// entry per sha ever read cannot grow the runner.
+    /// entry per sha ever read cannot grow the runner. A negative entry
+    /// expires after [`NEGATIVE_MANIFEST_TTL`] (the manifest uploads last),
+    /// and a fetch failure is not cached at all.
     pub async fn manifest(
         &self,
         cfg: &Config,
@@ -421,19 +472,35 @@ impl SourceMapCache {
             prefix: prefix.to_string(),
             sha: sha.to_string(),
         };
-        if let Some((hit, _)) = poisoned(self.inner.lock()).manifests.get(&key) {
-            return hit.clone();
+        // The guard drops at the block end, before the fetch below: a
+        // `std` mutex held across `.await` would make this future `!Send`.
+        let hit = {
+            let mut inner = poisoned(self.inner.lock());
+            cached_manifest(&mut inner, &key)
+        };
+        if let Some(hit) = hit {
+            return hit;
         }
         // Weighed before locking: the fetch (and the parse it will do for
         // maps) never runs under the mutex.
-        let (loaded, weight) = fetch_manifest(cfg, prefix, sha).await;
-        let mut inner = poisoned(self.inner.lock());
-        insert_manifest(&mut inner, key, loaded.clone(), weight);
-        loaded
+        match fetch_manifest(cfg, prefix, sha).await {
+            FetchOutcome::Hit(loaded, weight) => {
+                let mut inner = poisoned(self.inner.lock());
+                insert_manifest(&mut inner, key, Some(loaded.clone()), weight);
+                Some(loaded)
+            }
+            FetchOutcome::Missing => {
+                let mut inner = poisoned(self.inner.lock());
+                insert_manifest(&mut inner, key, None, NEGATIVE_ENTRY_WEIGHT);
+                None
+            }
+            FetchOutcome::Transient => None,
+        }
     }
 
     /// One stored map, parsed: `None` cached for missing, oversize or broken
-    /// maps so a bad deploy does not S3-hit every read.
+    /// maps so a bad deploy does not S3-hit every read. A fetch failure is
+    /// not cached: the next read retries instead of staying raw.
     pub async fn map(
         &self,
         cfg: &Config,
@@ -450,11 +517,33 @@ impl SourceMapCache {
         if let Some((hit, _)) = poisoned(self.inner.lock()).maps.get(&key) {
             return hit.clone();
         }
-        let (loaded, weight) = fetch_map(cfg, bucket, prefix, sha, rel).await;
-        let mut inner = poisoned(self.inner.lock());
-        insert_map(&mut inner, key, loaded.clone(), weight);
-        loaded
+        match fetch_map(cfg, bucket, prefix, sha, rel).await {
+            FetchOutcome::Hit(loaded, weight) => {
+                let mut inner = poisoned(self.inner.lock());
+                insert_map(&mut inner, key, Some(loaded.clone()), weight);
+                Some(loaded)
+            }
+            FetchOutcome::Missing => {
+                let mut inner = poisoned(self.inner.lock());
+                insert_map(&mut inner, key, None, NEGATIVE_ENTRY_WEIGHT);
+                None
+            }
+            FetchOutcome::Transient => None,
+        }
     }
+}
+
+/// The cached manifest for `key`, if it is still valid: an expired negative
+/// entry is dropped (its bytes released) so the caller refetches.
+fn cached_manifest(inner: &mut CacheInner, key: &ManifestKey) -> Option<Option<Arc<MapManifest>>> {
+    let (value, _, since) = inner.manifests.get(key)?;
+    if value.is_none() && since.is_some_and(|at| at.elapsed() > NEGATIVE_MANIFEST_TTL) {
+        if let Some((_, weight, _)) = inner.manifests.remove(key) {
+            inner.bytes = inner.bytes.saturating_sub(weight);
+        }
+        return None;
+    }
+    Some(value.clone())
 }
 
 /// Insert one manifest, evicting oldest-first across maps and manifests so
@@ -468,7 +557,8 @@ fn insert_manifest(
     evict_until_fit(inner, weight);
     inner.bytes += weight;
     inner.order.push_back(CachedKey::Manifest(key.clone()));
-    inner.manifests.insert(key, (value, weight));
+    let since = value.is_none().then(Instant::now);
+    inner.manifests.insert(key, (value, weight, since));
 }
 
 /// Insert one parsed map, same shared bound as manifests.
@@ -492,7 +582,7 @@ fn evict_until_fit(inner: &mut CacheInner, extra: usize) {
         };
         let removed = match oldest {
             CachedKey::Map(key) => inner.maps.remove(&key).map(|(_, weight)| weight),
-            CachedKey::Manifest(key) => inner.manifests.remove(&key).map(|(_, weight)| weight),
+            CachedKey::Manifest(key) => inner.manifests.remove(&key).map(|(_, weight, _)| weight),
         };
         if let Some(weight) = removed {
             inner.bytes = inner.bytes.saturating_sub(weight);
@@ -606,55 +696,56 @@ async fn verified_worker_map(
     }
 }
 
-/// A deploy's manifest plus its cache weight (the stored bytes, or the
-/// negative-entry weight when nothing usable was stored).
-async fn fetch_manifest(
-    cfg: &Config,
-    prefix: &str,
-    sha: &str,
-) -> (Option<Arc<MapManifest>>, usize) {
+/// A deploy's manifest. `Missing` (never stored, oversize, unparseable) is
+/// cached negative; `Transient` (the store hiccuped) is never cached.
+async fn fetch_manifest(cfg: &Config, prefix: &str, sha: &str) -> FetchOutcome<Arc<MapManifest>> {
     let key = map_object_key(prefix, sha, MANIFEST_FILE);
-    let Ok(bytes) = s3::s3_get_bytes(cfg, &key).await else {
-        return (None, NEGATIVE_ENTRY_WEIGHT);
+    let bytes = match s3::s3_get_bytes(cfg, &key).await {
+        Ok(bytes) => bytes,
+        Err(e) if s3::is_not_found(&e) => return FetchOutcome::Missing,
+        Err(_) => return FetchOutcome::Transient,
     };
     if bytes.len() > 1024 * 1024 {
-        return (None, NEGATIVE_ENTRY_WEIGHT);
+        return FetchOutcome::Missing;
     }
     match serde_json::from_slice::<MapManifest>(&bytes)
         .ok()
         .map(Arc::new)
     {
-        Some(manifest) => (Some(manifest), bytes.len()),
-        None => (None, NEGATIVE_ENTRY_WEIGHT),
+        Some(manifest) => FetchOutcome::Hit(manifest, bytes.len()),
+        None => FetchOutcome::Missing,
     }
 }
 
-/// One stored map plus its cache weight. Confined to the sha's own dir: a
-/// hostile manifest entry (`..`, an absolute path) never reaches S3, and a
-/// `rel` that names another sha still lands inside this sha's prefix (flat
-/// keys, no traversal). Parsing runs off the async executor.
+/// One stored map. Confined to the sha's own dir: a hostile manifest entry
+/// (`..`, an absolute path) never reaches S3, and a `rel` that names another
+/// sha still lands inside this sha's prefix (flat keys, no traversal).
+/// Parsing runs off the async executor. A refused HEAD proves nothing (the
+/// store answers `None` for missing and for failures alike), so it falls
+/// through to the GET, whose error tells them apart.
 async fn fetch_map(
     cfg: &Config,
     bucket: &str,
     prefix: &str,
     sha: &str,
     rel: &str,
-) -> (Option<Arc<sourcemap::SourceMap>>, usize) {
+) -> FetchOutcome<Arc<sourcemap::SourceMap>> {
     if rel.contains("..") || rel.starts_with('/') {
-        return (None, NEGATIVE_ENTRY_WEIGHT);
+        return FetchOutcome::Missing;
     }
     let key = map_object_key(prefix, sha, rel);
-    if !matches!(
-        s3::s3_head_object(cfg, bucket, &key).await,
-        Some(head) if head.size >= 0 && (head.size as u64) <= MAX_MAP_BYTES
-    ) {
-        return (None, NEGATIVE_ENTRY_WEIGHT);
+    match s3::s3_head_object(cfg, bucket, &key).await {
+        Some(head) if head.size >= 0 && (head.size as u64) <= MAX_MAP_BYTES => {}
+        Some(_) => return FetchOutcome::Missing,
+        None => {}
     }
-    let Ok(bytes) = s3::s3_get_bytes(cfg, &key).await else {
-        return (None, NEGATIVE_ENTRY_WEIGHT);
+    let bytes = match s3::s3_get_bytes(cfg, &key).await {
+        Ok(bytes) => bytes,
+        Err(e) if s3::is_not_found(&e) => return FetchOutcome::Missing,
+        Err(_) => return FetchOutcome::Transient,
     };
     if bytes.len() as u64 > MAX_MAP_BYTES {
-        return (None, NEGATIVE_ENTRY_WEIGHT);
+        return FetchOutcome::Missing;
     }
     let weight = bytes.len();
     let parsed = tokio::task::spawn_blocking(move || sourcemap::SourceMap::from_slice(&bytes))
@@ -663,8 +754,8 @@ async fn fetch_map(
         .and_then(|parsed| parsed.ok())
         .map(Arc::new);
     match parsed {
-        Some(sm) => (Some(sm), weight),
-        None => (None, NEGATIVE_ENTRY_WEIGHT),
+        Some(sm) => FetchOutcome::Hit(sm, weight),
+        None => FetchOutcome::Missing,
     }
 }
 
@@ -737,12 +828,24 @@ fn read_worker_config(deploy_root: &Path) -> anyhow::Result<DeployWorkerConfig> 
             .get("no_bundle")
             .and_then(|b| b.as_bool())
             .unwrap_or(false);
+        // Normalized through path segments: configs write `"./public"` or
+        // `"./dist/client"`, while manifest keys are deploy-root-relative
+        // (`public/...`) — a kept `./` prefix would never exact-match. `.`
+        // segments drop out; `..` refuses the value (matching falls back to
+        // full keys) rather than letting a frame lookup escape the root.
         let assets_dir = value
             .get("assets")
             .and_then(|a| a.get("directory"))
             .and_then(|d| d.as_str())
-            .map(|d| d.trim_matches('/').replace('\\', "/"))
-            .filter(|d| !d.is_empty());
+            .map(|d| {
+                d.replace('\\', "/")
+                    .split('/')
+                    .filter(|seg| !seg.is_empty() && *seg != ".")
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|segs| !segs.is_empty() && !segs.iter().any(|s| s == ".."))
+            .map(|segs| segs.join("/"));
         return Ok(DeployWorkerConfig {
             main,
             no_bundle,
@@ -1060,9 +1163,14 @@ fn fits_map_bytes(len: u64) -> bool {
 
 /// Read a map file capped at [`MAX_MAP_BYTES`]: the metadata gate keeps a
 /// huge sibling out of memory, and the post-read check covers the TOCTOU
-/// window. `None` on any IO error or oversize.
+/// window. `None` on any IO error or oversize. Never follows symlinks: the
+/// tree is tenant-built, so a `dist/leak.map -> /data/<secret>` link must
+/// not become a stored map.
 async fn read_capped_map(path: &Path) -> Option<Vec<u8>> {
-    let meta = tokio::fs::metadata(path).await.ok()?;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
     if !fits_map_bytes(meta.len()) {
         return None;
     }
@@ -1277,8 +1385,18 @@ fn collect_client_maps(deploy_root: &Path, entry_sibling: Option<&Path>) -> Vec<
             continue;
         };
         for entry in entries.flatten() {
+            // Never follow tenant symlinks out of the worktree: a
+            // `dist/leak.map -> /data/<secret>` link (or a directory link
+            // into `/data`) must not become a stored map. `file_type` does
+            // not follow links, unlike `path.is_dir`.
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
+            if kind.is_dir() {
                 if path
                     .file_name()
                     .is_some_and(|n| n == "node_modules" || n.to_string_lossy().starts_with('.'))
@@ -1477,20 +1595,23 @@ async fn prune_old_maps(
     maps_prefix: &str,
     sha: &str,
 ) -> anyhow::Result<usize> {
+    // Without the deploy history the keep set is just this sha, and the
+    // prune below would delete every older deploy's maps (which can never
+    // be rebuilt). Fail closed instead: the deploy already succeeded, and
+    // the caller logs the error without failing it.
     // Deploys list newest first: the break inside keeps the newest successes.
-    let keep = if let Ok(deploys) = db::list_deploys(pool, app_id, environment_id).await {
-        keep_shas(
-            sha,
-            deploys.iter().map(|d| {
-                (
-                    d.sha.clone(),
-                    d.status_enum() == Some(crate::models::DeployStatus::Success),
-                )
-            }),
-        )
-    } else {
-        HashSet::from([sha.to_string()])
-    };
+    let deploys = db::list_deploys(pool, app_id, environment_id)
+        .await
+        .context("list deploys for map retention")?;
+    let keep = keep_shas(
+        sha,
+        deploys.iter().map(|d| {
+            (
+                d.sha.clone(),
+                d.status_enum() == Some(crate::models::DeployStatus::Success),
+            )
+        }),
+    );
     // `maps/` holds one dir per sha; strip that level to sha names.
     let Some(dir) = maps_prefix.strip_suffix(&format!("/{sha}")) else {
         return Ok(0);
@@ -1842,6 +1963,7 @@ mod tests {
         let mut budget = SymbolicateBudget {
             maps: 1,
             frames: 10,
+            seen: HashSet::new(),
         };
         assert_eq!(
             symbolicate_with(&mut frames, &manifest, &load, &mut budget),
@@ -1854,12 +1976,70 @@ mod tests {
         let mut budget = SymbolicateBudget {
             maps: 10,
             frames: 0,
+            seen: HashSet::new(),
         };
         assert_eq!(
             symbolicate_with(&mut frames, &manifest, &load, &mut budget),
             0
         );
         assert!(frames[0].mapped_location.is_none());
+    }
+
+    #[test]
+    fn map_budget_charges_once_per_pair_across_events() {
+        // One event, one map: repeats of the same `(sha, rel)` ride on the
+        // first charge (cache hits included), instead of draining the
+        // budget once per occurrence.
+        let mut budget = SymbolicateBudget::for_read();
+        assert!(charge_map(&mut budget, "abc123", "client/a.js.map"));
+        assert_eq!(budget.maps, MAX_MAPS_PER_GET - 1);
+        assert!(charge_map(&mut budget, "abc123", "client/a.js.map"));
+        assert_eq!(budget.maps, MAX_MAPS_PER_GET - 1);
+        // Another sha's same rel is a different fetch: charged again.
+        assert!(charge_map(&mut budget, "def456", "client/a.js.map"));
+        assert_eq!(budget.maps, MAX_MAPS_PER_GET - 2);
+        // Past the budget, unseen pairs stay raw but seen ones still load.
+        let mut budget = SymbolicateBudget {
+            maps: 1,
+            frames: 10,
+            seen: HashSet::new(),
+        };
+        assert!(charge_map(&mut budget, "abc123", "a.map"));
+        assert!(!charge_map(&mut budget, "abc123", "b.map"));
+        assert!(charge_map(&mut budget, "abc123", "a.map"));
+    }
+
+    #[test]
+    fn expired_negative_manifests_refetch() {
+        // The manifest uploads last, so a deploy's first errors can arrive
+        // before it exists: a missing entry must expire instead of rendering
+        // raw for the life of the process.
+        let mut inner = CacheInner::default();
+        let key = ManifestKey {
+            prefix: "fleets/a".to_string(),
+            sha: "abc123".to_string(),
+        };
+        insert_manifest(&mut inner, key.clone(), None, NEGATIVE_ENTRY_WEIGHT);
+        assert!(cached_manifest(&mut inner, &key).is_some_and(|hit| hit.is_none()));
+        // Backdated past the TTL (no sleeping in tests): treated as a miss
+        // and dropped, so the next read refetches.
+        let stale = Instant::now()
+            .checked_sub(NEGATIVE_MANIFEST_TTL + Duration::from_secs(1))
+            .expect("backdate");
+        inner
+            .manifests
+            .insert(key.clone(), (None, NEGATIVE_ENTRY_WEIGHT, Some(stale)));
+        assert!(cached_manifest(&mut inner, &key).is_none());
+        assert!(!inner.manifests.contains_key(&key));
+        assert_eq!(inner.bytes, 0);
+        // A stored manifest never expires.
+        insert_manifest(
+            &mut inner,
+            key.clone(),
+            Some(Arc::new(MapManifest::default())),
+            128,
+        );
+        assert!(cached_manifest(&mut inner, &key).is_some());
     }
 
     #[test]
@@ -2069,10 +2249,15 @@ mod tests {
     async fn fetch_map_confines_hostile_manifest_entries() {
         // `..` and absolute rels never reach S3 (no IO happens for these).
         let cfg = crate::config::config_for_tests();
-        let (hit, _) = fetch_map(&cfg, "b", "fleets/a", "abc123", "../evil.js.map").await;
-        assert!(hit.is_none());
-        let (hit, _) = fetch_map(&cfg, "b", "fleets/a", "abc123", "/etc/passwd").await;
-        assert!(hit.is_none());
+        let FetchOutcome::Missing =
+            fetch_map(&cfg, "b", "fleets/a", "abc123", "../evil.js.map").await
+        else {
+            panic!("hostile rel must stay Missing");
+        };
+        let FetchOutcome::Missing = fetch_map(&cfg, "b", "fleets/a", "abc123", "/etc/passwd").await
+        else {
+            panic!("absolute rel must stay Missing");
+        };
         // A rel naming another sha still lands inside this sha's own dir
         // (flat keys, no traversal): the key shape itself is the confinement.
         assert_eq!(
@@ -2126,6 +2311,33 @@ mod tests {
         let found = worker_entry(&dir).expect("entry").expect("some");
         assert_eq!(found.rel, PathBuf::from("./entry.ts"));
         assert!(!found.no_bundle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dot_prefixed_assets_directories_match_manifest_keys() {
+        // Wrangler configs write `"./public"`; manifest keys are
+        // deploy-root-relative (`public/...`), so the prefix must normalize
+        // before exact frame matching.
+        let dir =
+            std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("wrangler.json"),
+            "{\"main\": \"./worker.js\", \"assets\": {\"directory\": \"./public\"}}",
+        )
+        .expect("config");
+        let config = read_worker_config(&dir).expect("readable");
+        assert_eq!(config.assets_dir.as_deref(), Some("public"));
+        // `..` refuses the value (matching falls back to full keys) rather
+        // than letting a frame lookup escape the root.
+        std::fs::write(
+            dir.join("wrangler.json"),
+            "{\"main\": \"./worker.js\", \"assets\": {\"directory\": \"../shared\"}}",
+        )
+        .expect("config");
+        let config = read_worker_config(&dir).expect("readable");
+        assert_eq!(config.assets_dir, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2199,6 +2411,42 @@ mod tests {
         file.set_len(MAX_MAP_BYTES + 1).expect("sparse huge map");
         drop(file);
         assert_eq!(read_capped_map(&huge).await, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tenant_symlinks_never_become_stored_maps() {
+        // The tree is tenant-built: a `dist/leak.map -> /outside` link (or a
+        // directory link out of the worktree) must not become a stored map.
+        use std::os::unix::fs::symlink;
+        let dir =
+            std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("app");
+        std::fs::create_dir_all(root.join("dist")).expect("temp dir");
+        let secret = dir.join("outside.txt");
+        std::fs::write(&secret, "platform secret").expect("secret");
+        std::fs::write(root.join("dist").join("real.js.map"), "{}").expect("real map");
+        symlink(&secret, root.join("dist").join("leak.js.map")).expect("file link");
+        let outside = dir.join("outside-maps");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        std::fs::write(outside.join("evil.js.map"), "{}").expect("outside map");
+        symlink(&outside, root.join("dist").join("linkdir")).expect("dir link");
+        // The walk skips both links: only the real map is collected.
+        let maps = collect_client_maps(&root, None);
+        assert_eq!(
+            maps.iter().map(|(rel, _)| rel.clone()).collect::<Vec<_>>(),
+            vec!["dist/real.js.map".to_string()]
+        );
+        // The capped read refuses the link too, even though its target fits.
+        assert_eq!(
+            read_capped_map(&root.join("dist").join("leak.js.map")).await,
+            None
+        );
+        assert_eq!(
+            read_capped_map(&root.join("dist").join("real.js.map")).await,
+            Some(b"{}".to_vec())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
