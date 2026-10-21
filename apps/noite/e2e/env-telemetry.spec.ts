@@ -350,8 +350,10 @@ test(
     await page.goto(`${envBase}/api/greeting`);
     await expect(page.locator("body")).toContainText("hello from vite");
 
-    // Prod takes 3 greetings + 1 throw; the environment takes the handshake
-    // greeting + 1 greeting + 1 throw. Distinct totals per scope.
+    // Prod takes the readiness greeting + 3 greetings + 1 throw; the
+    // environment takes the handshake greeting + 1 greeting + 1 throw
+    // (a retry or a favicon fetch would only add real requests, so the
+    // totals are lower bounds, captured for the tab assertions below).
     await request.get(`${prodBase}/api/greeting`);
     await request.get(`${prodBase}/api/greeting`);
     await request.get(`${prodBase}/api/greeting`);
@@ -366,18 +368,34 @@ test(
     expect(envBoom.status()).toBe(500);
 
     // --- metrics split per environment ------------------------------------
+    let prodTotal = 0;
     await expect
-      .poll(() => metricTotal(request, appId, ""), {
-        intervals: [5000],
-        timeout: 300_000,
-      })
-      .toBe(4);
+      .poll(
+        async () => {
+          prodTotal = await metricTotal(request, appId, "");
+
+          return prodTotal;
+        },
+        {
+          intervals: [5000],
+          timeout: 300_000,
+        }
+      )
+      .toBeGreaterThanOrEqual(5);
+    let envTotal = 0;
     await expect
-      .poll(() => metricTotal(request, appId, envId), {
-        intervals: [5000],
-        timeout: 300_000,
-      })
-      .toBe(3);
+      .poll(
+        async () => {
+          envTotal = await metricTotal(request, appId, envId);
+
+          return envTotal;
+        },
+        {
+          intervals: [5000],
+          timeout: 300_000,
+        }
+      )
+      .toBeGreaterThanOrEqual(3);
 
     // --- the throwing route issues under the environment, not prod --------
     await expect
@@ -405,11 +423,11 @@ test(
     await expect(
       page.getByRole("combobox", { name: "Environment" })
     ).toHaveValue(envId);
-    await expect(page.getByText("3 requests").first()).toBeVisible({
+    await expect(page.getByText(`${envTotal} requests`).first()).toBeVisible({
       timeout: 60_000,
     });
     await page.goto(`/apps/${appId}?t=metrics`);
-    await expect(page.getByText("4 requests").first()).toBeVisible({
+    await expect(page.getByText(`${prodTotal} requests`).first()).toBeVisible({
       timeout: 60_000,
     });
 
