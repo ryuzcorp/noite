@@ -181,26 +181,23 @@ pub async fn ensure_bootstrap_caddyfile(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Caddy: admin on its default 127.0.0.1:2019, where the runner
-/// POSTs each new config (`host::caddy::load_admin`); `--watch` on the same
-/// file stays as the fallback path.
+/// Caddy: admin on its default 127.0.0.1:2019, where the runner POSTs each
+/// new config (`host::caddy::load_admin`). The runner is the only writer, so
+/// there is exactly one reload path: a `--watch` fallback would race the
+/// admin load on every write, and two overlapping server restarts strand
+/// in-flight connections. On boot Caddy reads the file the runner wrote
+/// before supervising it; an unreachable admin only logs (the file stays the
+/// boot source).
 pub fn supervise_caddy(config: &Config) -> Supervised {
     let caddyfile = config.caddyfile_path.clone();
     Supervised::start("caddy", move || {
         let mut cmd = tokio::process::Command::new("caddy");
-        cmd.args([
-            "run",
-            "--config",
-            &caddyfile,
-            "--adapter",
-            "caddyfile",
-            "--watch",
-        ])
-        // Certificates and ACME state in the volume, not in the
-        // container's $HOME: a recreate must not re-issue every cert
-        // (CA rate limits) or lose the on-demand ones.
-        .env("XDG_DATA_HOME", "/data/caddy/data")
-        .env("XDG_CONFIG_HOME", "/data/caddy/config");
+        cmd.args(["run", "--config", &caddyfile, "--adapter", "caddyfile"])
+            // Certificates and ACME state in the volume, not in the
+            // container's $HOME: a recreate must not re-issue every cert
+            // (CA rate limits) or lose the on-demand ones.
+            .env("XDG_DATA_HOME", "/data/caddy/data")
+            .env("XDG_CONFIG_HOME", "/data/caddy/config");
         cmd
     })
 }

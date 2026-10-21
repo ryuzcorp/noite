@@ -145,6 +145,19 @@ fn plaintext_hosts(addr: &str) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
+/// `Connection: close` on every proxied response. A config reload closes the
+/// old server's idle and not-yet-active downstream connections, and a client
+/// that reuses a pooled one races the close: the request dies transport-level
+/// (`ERR_EMPTY_RESPONSE`, `ECONNRESET`) with no access-log entry and no 5xx.
+/// Browsers retry a stale idempotent GET most of the time, but a fan-out wave
+/// can lose several at once and a POST is never retried — the lane stalled
+/// exactly this way on every Caddyfile rewrite. Closing after each response
+/// trades one handshake per HTTP/1.1 request for making restarts harmless to
+/// pooled clients, while in-flight requests keep draining through the old
+/// server as before. HTTP/2+ is unaffected (Go strips hop-by-hop headers, so
+/// multiplexed connections keep pooling and GOAWAY restart semantics), and
+/// event streams are unaffected (their response never completes).
+const DOWNSTREAM_CLOSE: &str = "header Connection close";
 
 /// One reverse-proxy site block. `tls` adds an on-demand TLS gate so the site
 /// serves HTTPS with per-hostname certs (no wildcard cert needed); a tls-gated
@@ -184,6 +197,7 @@ fn push_block(
     // uncompressed, chunked and unbuffered (the proxy below keeps
     // `flush_interval -1`, and Caddy skips an event stream).
     lines.push("\tencode zstd gzip".into());
+    lines.push(format!("\t{DOWNSTREAM_CLOSE}"));
     if tls {
         lines.push("\ttls {".into());
         lines.push("\t\ton_demand".into());
@@ -698,8 +712,10 @@ pub async fn rewrite_caddy(
     tracing::info!(path = %cfg.caddyfile_path, n = apps.len(), "caddyfile updated");
     // POST the changed config to Caddy's admin (127.0.0.1:2019). A non-2xx
     // is logged with Caddy's body and surfaced in /ready; the previous config
-    // keeps serving (Caddy applies loads atomically). `--watch` on the file
-    // above applies it too, so a Caddy that is still starting loses nothing.
+    // keeps serving (Caddy applies loads atomically). This is the only reload
+    // path — no `--watch` — so one write is exactly one restart. A Caddy that
+    // is still starting reads the file on boot and converges on the next
+    // reconcile; an unreachable admin only logs.
     load_admin(cfg, &next).await;
     Ok(())
 }
@@ -757,6 +773,7 @@ fn push_preview_block(
     lines.push("\t\tformat json".into());
     lines.push("\t}".into());
     lines.push("\tencode zstd gzip".into());
+    lines.push(format!("\t{DOWNSTREAM_CLOSE}"));
     if tls {
         lines.push("\ttls {".into());
         lines.push("\t\ton_demand".into());
@@ -936,6 +953,7 @@ fn push_env_block(
     lines.push("\t\tformat json".into());
     lines.push("\t}".into());
     lines.push("\tencode zstd gzip".into());
+    lines.push(format!("\t{DOWNSTREAM_CLOSE}"));
     if tls {
         lines.push("\ttls {".into());
         lines.push("\t\ton_demand".into());
@@ -1844,6 +1862,33 @@ mod tests {
         let out = rendered(&cfg, &[test_app()]).await;
         assert!(out.contains("http://test.localhost {"), "tenant plain site");
         assert!(!out.contains("\ttls {"), "no TLS site in dev");
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+    /// Every proxied site answers `Connection: close`: a reload closes the
+    /// old server's idle downstream connections, and a pooled HTTP/1.1 client
+    /// that reuses one races the close — the request dies transport-level
+    /// with no access-log entry and no 5xx, and a POST is never retried.
+    /// Fresh connections per request make restarts harmless to pooled
+    /// clients; HTTP/2+ strips the hop-by-hop header, so multiplexing stays.
+    #[tokio::test]
+    async fn every_site_closes_downstream_connections() {
+        let cfg = test_config("noite.now", "app", true, "/tmp/noite-test-close");
+        let app = test_app();
+        let apps = [app.clone()];
+        let out = rendered_envs(&cfg, &apps, &[], &[test_env(&app, "staging")]).await;
+        for addr in [
+            "app.noite.now",
+            "test.noite.now",
+            "staging.test.noite.now",
+            "app-0.preview.test.noite.now",
+            "*.noite.now",
+        ] {
+            let block = site_block(&out, addr);
+            assert!(
+                block.contains("\theader Connection close"),
+                "{addr} must close downstream connections:\n{block}"
+            );
+        }
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
     }
 

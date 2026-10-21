@@ -10,7 +10,7 @@ Noite is one image, `ghcr.io/ryuzcorp/noite`. The runner is PID 1 (under `tini`)
 ```
 tini (PID 1: reaps zombies, forwards signals)
 └── noite-runner                      root; API on :8080
-    ├── caddy run --watch             :80/:443, admin 127.0.0.1:2019
+    ├── caddy run                      :80/:443, admin 127.0.0.1:2019
     ├── celld  control fleet #0       public 127.0.0.1:8090, internal 0.0.0.0:8091
     ├── celld  tenant fleet × N       uid fleet (10020); public 0.0.0.0:{p}, internal 127.0.0.1:{p+1}
     └── bun / node / sh               installs, builds and release, one uid per app (10030+), transient
