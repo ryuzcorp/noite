@@ -1701,7 +1701,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_domains_get_no_route() {
-        let cfg = test_config("noite.now", "app", true, "/tmp/noite-test-domains");
+        let cfg = test_config("noite.now", "app", true, "/tmp/noite-test-pending-domains");
         let app = test_app();
         let domains = [
             test_domain(&app.id, "www.example.com"),
