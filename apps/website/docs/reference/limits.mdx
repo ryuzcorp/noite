@@ -46,6 +46,8 @@ The edge (Caddy) limits every site before a request reaches a worker; the contro
 
 An app admin can override both app limits (per visitor and whole app) in the app's **Settings → Rate Limits**. The edge counts over a sliding 10-second window: a limit of 1800/min lets 300 requests through in any 10 seconds. Per-visitor limits group IPv6 addresses by `/64`. Behind a proxy, see [Edge protection](/self-hosting/protection).
 
+The edge also bounds each request before a worker sees it: request headers past 16 KiB answer `431`, header fields whose names contain `_` or `.` are dropped (a backend that maps `-`, `_` and `.` to one name would read them as another header), and a body upload or response write that makes no progress for a minute closes the connection. A pause between writes, like a quiet event stream, does not count.
+
 ## Sleep (scale to zero)
 
 An app with no requests for `RUNNER_SLEEP_AFTER_H` hours (default 24, `0` disables) stops costing anything; the next request brings it back transparently.

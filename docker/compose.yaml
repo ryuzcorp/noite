@@ -133,7 +133,7 @@ services:
       start_period: 180s
 
   rustfs:
-    image: docker.io/rustfs/rustfs:1.0.0
+    image: docker.io/rustfs/rustfs:1.0.3
     restart: unless-stopped
     command: ["/data"]
     environment:

@@ -73,10 +73,11 @@ const MAX_FRAMES_PER_GET: usize = 256;
 /// Deploy sha dirs kept per target besides the just-finished one. Occurrences
 /// older than this still render — with their raw, unsymbolicated stacks.
 const KEEP_DEPLOY_SHAS: usize = 10;
-/// celld 0.6.1 `run_esbuild` externals (`crates/celld/js.rs
-/// BARE_NODE_BUILTINS`): node builtins stay external, the runtime provides
-/// them. Pinned here so the shadow bundle matches celld's; revisit on a
-/// celld bump (docker/check-versions.ts pins CELLD_VERSION).
+/// celld 0.6.2 `run_esbuild` externals (`BARE_NODE_BUILTINS` in
+/// `crates/celld/engine_api.rs`, re-exported by `js.rs`): node builtins stay
+/// external, the runtime provides them. Pinned here so the shadow bundle
+/// matches celld's; revisit on a celld bump (docker/check-versions.ts pins
+/// CELLD_VERSION).
 const ESBUILD_BARE_BUILTINS: &[&str] = &[
     "assert",
     "async_hooks",
@@ -911,18 +912,18 @@ fn esbuild_bin() -> String {
     std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string())
 }
 
-/// celld 0.6.1's exact bundle flags plus `--sourcemap`: the shadow bundle must
-/// map the same bytes celld deployed, so every flag that shapes the output is
-/// mirrored (no `--minify`: celld does not minify either).
-/// celld 0.6.1's CommonJS-builtin bridge, passed as `--banner:js` so the
+/// celld 0.6.2's CommonJS-builtin bridge, passed as `--banner:js` so the
 /// shadow bundle is byte-identical to the deployed one (Apache-2.0,
 /// denoland/celld `crates/celld/deploy.rs` `run_esbuild`; without it every
-/// mapping sits nine lines too early). Wrangler `define`/`rules` need no
-/// mirroring: the runner strips those keys before `celld deploy`, so celld
-/// always runs on its `BundleConfig` defaults (empty defines, `.wasm=copy`)
-/// — the same flags below.
+/// mapping sits nine lines too early).
 const ESBUILD_BANNER: &str = "var require = (id) => {\n  const name = String(id);\n  const builtin = process.getBuiltinModule(name);\n  if (builtin === undefined) {\n    const error = new Error(`Cannot find module '${name}'`);\n    error.code = \"MODULE_NOT_FOUND\";\n    throw error;\n  }\n  return builtin;\n};";
 
+/// celld 0.6.2's exact bundle flags plus `--sourcemap`: the shadow bundle must
+/// map the same bytes celld deployed, so every flag that shapes the output is
+/// mirrored (no `--minify`: celld does not minify either). Wrangler
+/// `define`/`rules` need no mirroring: the runner strips those keys before
+/// `celld deploy`, so celld always runs on its `BundleConfig` defaults (empty
+/// defines, `.wasm=copy`) — the same flags below.
 fn esbuild_args(entry: &str, outdir: &str) -> Vec<String> {
     let mut args = vec![
         entry.to_string(),
@@ -1681,9 +1682,10 @@ async fn put_bytes(cfg: &Config, key: &str, bytes: &[u8]) -> anyhow::Result<()> 
 mod tests {
     use super::*;
 
-    /// Real-tool fixtures, generated once with the lane's pinned esbuild
-    /// (0.25.12) over the vite sample build: the shadow map the runner would
-    /// store for a deploy, and the Vite worker map it chains through.
+    /// Real-tool fixtures, generated once with esbuild 0.25.12 over the vite
+    /// sample build (0.28.2 regenerates the shadow map byte for byte): the
+    /// shadow map the runner would store for a deploy, and the Vite worker map
+    /// it chains through.
     /// Assert exact composed positions: this is the composition the Errors
     /// tab reads at `errors.get` time.
     const FIXTURE_SHADOW_MAP: &[u8] =
