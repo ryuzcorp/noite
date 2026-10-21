@@ -120,6 +120,14 @@ func (s *sharedState) release() {
 func (s *sharedState) swap(t *Table) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.swapLocked(t)
+}
+
+// swapLocked is swap with the mutex held, so an admin push's generation
+// check, the table store, prober.Track and lim.Sweep are one atomic step:
+// overlapping pushes (or a push racing the Provision load) cannot
+// interleave them.
+func (s *sharedState) swapLocked(t *Table) {
 	s.initLocked(nil)
 	s.tab.Store(t)
 	s.loaded = true
@@ -385,13 +393,10 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) error {
 			return caddy.APIError{HTTPStatus: http.StatusBadRequest, Err: err}
 		}
 		// Generations are monotonic (persisted in the file): an older
-		// table landing last would un-publish newer routes.
-		if cur := shared.tab.Load(); cur != nil && t.Generation < cur.Generation {
-			return caddy.APIError{
-				HTTPStatus: http.StatusConflict,
-				Err:        fmt.Errorf("edge: generation %d older than current %d", t.Generation, cur.Generation),
-			}
-		}
+		// table landing last would un-publish newer routes. The check, the
+		// store, prober.Track and lim.Sweep are one locked step, so
+		// overlapping pushes (or a push racing the Provision load) cannot
+		// interleave them.
 		shared.mu.Lock()
 		log := shared.log
 		var curGen uint64
@@ -399,11 +404,18 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) error {
 		if cur := shared.tab.Load(); cur != nil {
 			curGen, hasCur = cur.Generation, true
 		}
-		shared.mu.Unlock()
+		if hasCur && t.Generation < curGen {
+			shared.mu.Unlock()
+			return caddy.APIError{
+				HTTPStatus: http.StatusConflict,
+				Err:        fmt.Errorf("edge: generation %d older than current %d", t.Generation, curGen),
+			}
+		}
 		// No-op re-pushes (the runner re-pushes every tick as a backstop)
 		// stay quiet; only a new generation logs at info, so the lane can
 		// assert pushes happened and operators can see real changes.
 		if hasCur && t.Generation == curGen {
+			shared.mu.Unlock()
 			if log != nil {
 				log.Debug("edge_routes: table re-push (unchanged)",
 					zap.Uint64("generation", t.Generation))
@@ -413,7 +425,8 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) error {
 				"routes":     len(t.Exact) + len(t.Wildcards),
 			})
 		}
-		shared.swap(&t)
+		shared.swapLocked(&t)
+		shared.mu.Unlock()
 		if log != nil {
 			log.Info("edge_routes: table pushed",
 				zap.Uint64("generation", t.Generation),

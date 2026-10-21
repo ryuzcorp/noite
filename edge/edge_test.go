@@ -425,6 +425,45 @@ func TestWildcardWireShape(t *testing.T) {
 	}
 }
 
+func TestConcurrentPostsNewestWins(t *testing.T) {
+	// Two overlapping POSTs, older and newer generation: whatever order
+	// they run in, the newer generation wins and the older gets a 409.
+	testHandler(t, &Table{Generation: 100, Exact: map[string]Route{
+		"a.test": {Kind: KindTenant, Upstream: "127.0.0.1:1"},
+	}})
+	post := func(gen uint64) {
+		raw := `{"generation": ` + itoa(gen) + `, "exact": {"h.test": {"kind": "custom", "upstream": "127.0.0.1:2"}}}`
+		r := httptest.NewRequest(http.MethodPost, "/edge/routes", strings.NewReader(raw))
+		_ = handleAdmin(httptest.NewRecorder(), r)
+	}
+	// Rounds of two overlapping POSTs from a start barrier. Whatever order
+	// a round runs in, the newer generation wins; without the lock the
+	// older routinely swaps last.
+	for round := uint64(0); round < 30; round++ {
+		base := uint64(200 + round*2)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for _, gen := range []uint64{base + 1, base + 2} {
+			wg.Add(1)
+			go func(g uint64) {
+				defer wg.Done()
+				<-start
+				post(g)
+			}(gen)
+		}
+		close(start)
+		wg.Wait()
+		final := shared.tab.Load()
+		if final == nil || final.Generation != base+2 {
+			got := uint64(0)
+			if final != nil {
+				got = final.Generation
+			}
+			t.Fatalf("round %d: want newest generation %d, got %d", round, base+2, got)
+		}
+	}
+}
+
 func TestRejectsOlderGeneration(t *testing.T) {
 	// F6: generations are monotonic; an older table landing last must not
 	// un-publish newer routes.
@@ -447,6 +486,56 @@ func TestRejectsOlderGeneration(t *testing.T) {
 	if err := handleAdmin(httptest.NewRecorder(), r); err != nil {
 		t.Fatalf("same generation must be accepted (idempotent re-push): %v", err)
 	}
+}
+
+func TestConcurrentPushesKeepNewest(t *testing.T) {
+	// Overlapping pushes must serialize around the generation check and
+	// the swap: the final table is always the newest generation, never a
+	// stale one landing last. Rounds of 16 concurrent pushes from a start
+	// barrier force the interleave; without the lock a lower generation
+	// routinely swaps last.
+	testHandler(t, &Table{Generation: 100, Exact: map[string]Route{
+		"a.test": {Kind: KindTenant, Upstream: "127.0.0.1:1"},
+	}})
+	for round := 0; round < 10; round++ {
+		base := uint64(200 + round*16)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for g := base + 16; g > base; g-- {
+			wg.Add(1)
+			go func(gen uint64) {
+				defer wg.Done()
+				<-start
+				raw := `{"generation": ` + itoa(gen) + `, "exact": {"h` + itoa(gen) + `.test": {"kind": "custom", "upstream": "127.0.0.1:2"}}}`
+				r := httptest.NewRequest(http.MethodPost, "/edge/routes", strings.NewReader(raw))
+				_ = handleAdmin(httptest.NewRecorder(), r)
+			}(g)
+		}
+		close(start)
+		wg.Wait()
+		final := shared.tab.Load()
+		if final == nil || final.Generation != base+16 {
+			got := uint64(0)
+			if final != nil {
+				got = final.Generation
+			}
+			t.Fatalf("round %d: want newest generation %d, got %d", round, base+16, got)
+		}
+	}
+}
+
+func itoa(n uint64) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
 }
 
 func TestAdminValidation(t *testing.T) {

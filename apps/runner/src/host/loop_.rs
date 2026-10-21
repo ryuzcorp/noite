@@ -304,7 +304,11 @@ async fn reconcile_once(
         sweep_expired_environments(pool, cfg, procs, logs).await;
     }
 
-    edge_table::push_routes(pool, cfg).await?;
+    // Best-effort on the tick: a failed push must not abort the
+    // reconcile (orphan sweeps, metrics) every tick while it persists.
+    if let Err(e) = edge_table::push_routes(pool, cfg).await {
+        tracing::warn!(error = %format!("{e:#}"), "edge push on tick");
+    }
     // Backstop for a fleet left running after its app's (or environment's)
     // row was deleted.
     supervisor::stop_orphan_fleets(pool, procs).await;

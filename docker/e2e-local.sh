@@ -175,6 +175,8 @@ while [ "$attempt" -lt 100 ]; do
         echo "==> edge did not reload after boot ($pushes pushes, generation $maxgen)"
       fi
     fi
+    fi
+    if [ "${E2E_KEEP:-0}" = 1 ]; then
       echo "==> E2E_KEEP=1: stack left running (project noite-e2e)"
     else
       # shellcheck disable=SC2086

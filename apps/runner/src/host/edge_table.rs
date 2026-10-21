@@ -441,10 +441,13 @@ fn apply_table(prev: Option<&EdgeTable>, mut fresh: EdgeTable) -> (EdgeTable, bo
 
 pub async fn push_routes(pool: &sqlx::SqlitePool, cfg: &Config) -> anyhow::Result<()> {
     let _held = PUSH_LOCK.lock().await;
+    // Every read propagates: a transient DB error (SQLITE_BUSY) must keep
+    // the previous table serving, never push a table with silently
+    // dropped domains, limits or environments.
     let apps = db::list_apps(pool).await?;
-    let domains = db::list_app_domains(pool).await.unwrap_or_default();
-    let limits = db::list_app_limits(pool).await.unwrap_or_default();
-    let envs = db::list_environment_routes(pool).await.unwrap_or_default();
+    let domains = db::list_app_domains(pool).await?;
+    let limits = db::list_app_limits(pool).await?;
+    let envs = db::list_environment_routes(pool).await?;
     warn_if_blind(cfg, &limits);
     let fresh = build_table(cfg, &apps, &domains, &limits, &envs);
     let prev_table = std::fs::read_to_string(&cfg.routes_path)
@@ -731,7 +734,10 @@ mod tests {
         };
 
         // Fresh file: generation starts at 1.
-        let (t1, changed) = apply_table(None, build_table(&cfg, std::slice::from_ref(&app), &[], &[], &[]));
+        let (t1, changed) = apply_table(
+            None,
+            build_table(&cfg, std::slice::from_ref(&app), &[], &[], &[]),
+        );
         assert!(changed);
         write(&t1);
         assert_eq!(load().generation, 1);
