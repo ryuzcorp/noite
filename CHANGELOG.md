@@ -21,6 +21,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **Admins hear about new releases.** The opt-out daily release check above feeds a dismissible per-version banner in the control UI shell (admins only; `dev` and SHA builds never notify) linking the release notes and the upgrade docs, plus `instance.update_status` (`GET /v1/admin/update`) for the toggle state, the running version and the newest release seen.
 
+### Fixed
+
+- **A failed snapshot meta upload is retried, not skipped.** The runner recorded a snapshot's hash as soon as the state object uploaded. If the metadata upload after it failed, the next pass saw identical bytes and skipped, leaving the bucket's `noite.sqlite.meta.json` stale (a new runner seeds its generation and skip hash from it) while `/ready` reported a fresh upload. The hash is now recorded only once both objects landed, and a skipped pass no longer resets the reported upload age.
+
 ## [0.1.0-alpha.8] - 2026-10-21
 
 Browser errors arrive through any Sentry SDK with stacks mapped back to your source, custom domains need DNS proof of ownership on multi-tenant installs, and every fleet holds bucket keys scoped to its own prefix. The edge no longer drops requests whenever an app starts, stops or deploys, and every pinned tool moves to its latest.
