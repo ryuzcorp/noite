@@ -15,6 +15,13 @@ pub const INSTALL_ID: &str = "install_id";
 pub const INSTALLED_AT: &str = "installed_at";
 pub const TELEMETRY_ENABLED: &str = "telemetry_enabled";
 pub const TELEMETRY_LAST_SENT_AT: &str = "telemetry_last_sent_at";
+/// Opt-out update check (`host::update_check`): `"0"` = the admin turned the
+/// daily release-list fetch off (absent = on), the last successful fetch time,
+/// and the cached newest release (`{"latest","checked_at","notes_url"}` or
+/// empty when nothing newer was seen).
+pub const UPDATE_CHECK_ENABLED: &str = "update_check_enabled";
+pub const UPDATE_CHECK_LAST_AT: &str = "update_check_last_at";
+pub const UPDATE_CHECK_RESULT: &str = "update_check_result";
 
 /// One setting's value; `None` when the row has never been written.
 pub async fn get_setting(pool: &SqlitePool, key: &str) -> sqlx::Result<Option<String>> {

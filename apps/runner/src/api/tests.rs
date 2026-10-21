@@ -967,6 +967,57 @@ async fn telemetry_status_agrees() {
     h.finish().await;
 }
 
+/// Update check over both transports: same status, off by default, and the
+/// stored preference moves through either transport. Only the disabled
+/// direction is exercised here — enabling runs a live fetch against the
+/// release list (covered with a stub feed in `host::update_check` tests).
+#[tokio::test]
+async fn update_status_agrees() {
+    let h = Harness::new().await;
+
+    let (status, rest) = h.rest("GET", "/v1/admin/update", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rpc = h
+        .rpc("instance.update_status", json!({}))
+        .await
+        .expect("instance.update_status");
+    assert_eq!(rest, rpc, "REST and RPC must agree");
+
+    // On by default; the test harness is not locked (only
+    // `NOITE_UPDATE_CHECK=off` locks the check).
+    assert_eq!(rest["enabled"], json!(true));
+    assert_eq!(rest["setting"], json!(true));
+    assert_eq!(rest["locked"], json!(false));
+    assert!(rest["lockReason"].is_null());
+    assert_eq!(rest["current"], json!("dev"));
+    assert!(rest["latest"].is_null());
+    assert!(rest["checkedAt"].is_null());
+    assert!(rest["notesUrl"].is_null());
+
+    // The preference moves through either transport while staying off.
+    let (status, put) = h
+        .rest("PUT", "/v1/admin/update", Some(json!({ "enabled": false })))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(put["setting"], json!(false));
+
+    let rpc = h
+        .rpc("instance.update_set", json!({ "enabled": false }))
+        .await
+        .expect("instance.update_set");
+    assert_eq!(rpc["setting"], json!(false));
+    let (status, rest) = h.rest("GET", "/v1/admin/update", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rest["setting"], json!(false));
+    assert_eq!(
+        crate::db::get_setting(&h.state.pool, crate::db::UPDATE_CHECK_ENABLED)
+            .await
+            .expect("read setting"),
+        Some("0".to_string())
+    );
+    h.finish().await;
+}
+
 /// `source.bundle` reads a real push mirror at the requested ref, through the
 /// REST mirror and the RPC, which must agree.
 #[tokio::test]

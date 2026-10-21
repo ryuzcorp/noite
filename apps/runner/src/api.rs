@@ -24,6 +24,7 @@ pub mod source;
 pub mod sse;
 pub mod storage;
 pub mod telemetry;
+pub mod update_check;
 
 #[cfg(test)]
 mod env_gate_tests;
@@ -68,3 +69,4 @@ pub use storage::{
     app_r2_delete, app_r2_object, app_r2_put, app_r2_raw, app_storage,
 };
 pub use telemetry::{get_telemetry, set_telemetry};
+pub use update_check::{get_update_status, set_update_status};

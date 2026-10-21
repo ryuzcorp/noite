@@ -325,6 +325,13 @@ async fn main() -> anyhow::Result<()> {
         config.clone(),
         started_at,
     ));
+    // Opt-out update check, off the boot critical path: the task sleeps five
+    // minutes before its first attempt, then checks hourly, and is a no-op
+    // once the admin opts out (SPEC, update check).
+    tokio::spawn(host::update_check::run_scheduler(
+        pool.clone(),
+        config.clone(),
+    ));
 
     // Control fleet #0: deploy the bundle baked into the image, then run it.
     // The dev image has no bundle: `vite dev` serves the UI on the same port

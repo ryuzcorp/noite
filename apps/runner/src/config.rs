@@ -149,6 +149,15 @@ pub fn parse_telemetry_disabled(raw: Option<&str>) -> bool {
         Some("0") | Some("false") | Some("off")
     )
 }
+/// `NOITE_UPDATE_CHECK` force-off: `0`/`false`/`off` (case-insensitive) lock
+/// the opt-out update check off. Anything else — including unset — leaves the
+/// stored preference (on unless the admin disables it) in charge.
+pub fn parse_update_check_disabled(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
 
 /// `DO_NOT_TRACK` (https://donottrack.sh): any non-empty value other than `0`
 /// is a global opt-out and locks telemetry off.
@@ -538,6 +547,9 @@ pub struct Config {
     pub telemetry_disabled: bool,
     /// `DO_NOT_TRACK` set to anything but `0`/empty locks it off.
     pub do_not_track: bool,
+    /// Opt-out update check (SPEC, update check): `NOITE_UPDATE_CHECK`
+    /// (`0`/`false`/`off`) locks it off.
+    pub update_check_disabled: bool,
     /// Malformed numeric env values seen by `from_env` (var, value and
     /// expected form per entry). `validate` refuses the boot with all of
     /// them at once; empty for configs built any other way.
@@ -774,6 +786,9 @@ impl Config {
                 env::var("NOITE_TELEMETRY").ok().as_deref(),
             ),
             do_not_track: parse_do_not_track(env::var("DO_NOT_TRACK").ok().as_deref()),
+            update_check_disabled: parse_update_check_disabled(
+                env::var("NOITE_UPDATE_CHECK").ok().as_deref(),
+            ),
             env_problems,
         };
         cfg.validate()?;
@@ -908,6 +923,17 @@ impl Config {
         }
         if is_local_domain(&self.base_domain) {
             return Some("local domain");
+        }
+        None
+    }
+    /// Why the update check is locked off, if it is: only the
+    /// `NOITE_UPDATE_CHECK=0` force-off locks it. Unlike the heartbeat, a
+    /// local domain does not lock it — the e2e lane runs on `localhost` and
+    /// still exercises the toggle. `None` means the stored preference (off
+    /// unless the admin disables it) decides.
+    pub fn update_check_lock_reason(&self) -> Option<&'static str> {
+        if self.update_check_disabled {
+            return Some("NOITE_UPDATE_CHECK=off");
         }
         None
     }
@@ -1076,6 +1102,7 @@ pub(crate) fn config_for_tests() -> Config {
         edge: EdgeLimits::default(),
         telemetry_disabled: false,
         do_not_track: false,
+        update_check_disabled: false,
         env_problems: Vec::new(),
     }
 }

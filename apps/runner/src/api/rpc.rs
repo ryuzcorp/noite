@@ -1426,6 +1426,14 @@ async fn dispatch_call(
             };
             complete(id, service::telemetry::set(state, p.enabled).await)
         }
+        "instance.update_status" => complete(id, service::update_check::get(state).await),
+        "instance.update_set" => {
+            let p: TelemetrySetParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(id, service::update_check::set(state, p.enabled).await)
+        }
         m => rpc_err(
             id,
             JsonRpcErrorReason::MethodNotFound,

@@ -21,6 +21,8 @@
 #                      recover with `noite-runner recover` (printed at the end)
 #   NOITE_TELEMETRY=0  turn off the anonymous daily heartbeat (on by default);
 #                      also DO_NOT_TRACK=1. https://noite.now/self-hosting/telemetry
+#   NOITE_UPDATE_CHECK=0  turn off the daily release check (on by default).
+#                      https://noite.now/self-hosting/operations#updating
 #   NOITE_VERSION      release channel or version (default: alpha; `stable`
 #                      follows final releases only, `0.1.0-alpha.5` or a short
 #                      SHA holds an install in place; `run.sh … install --pre`
@@ -309,6 +311,9 @@ EOF
   fi
   if [[ -n "${NOITE_TELEMETRY:-}" ]]; then
     env_set NOITE_TELEMETRY "$NOITE_TELEMETRY"
+  fi
+  if [[ -n "${NOITE_UPDATE_CHECK:-}" ]]; then
+    env_set NOITE_UPDATE_CHECK "$NOITE_UPDATE_CHECK"
   fi
 }
 

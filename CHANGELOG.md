@@ -8,10 +8,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Operator action required
+
+- **The runner now checks for new releases once a day (opt-out).** Five minutes after boot and then hourly, the runner makes one anonymous `GET` of the public GitHub release list (`https://api.github.com/repos/ryuzcorp/noite/releases` — fixed URL, fixed User-Agent, no auth) and shows instance admins a dismissible banner when a newer promoted release exists on the install's channel. Nothing about the instance is sent — no version, no identifiers. To turn it off: clear **Check for new Noite releases** on `/account` (Admin tab), or set `NOITE_UPDATE_CHECK=0` in `.env` (the installer accepts it; `false` and `off` work too). The variable wins over the UI toggle. `make doctor` reports the check state and the newest release seen.
+
 ### Changed
 
 - **The Ilha + Void template lives at `ryuzcorp/noite-template-ilha`.** Its repository was renamed from `ryuzcorp/noite-template-oxide`, and new apps clone it under the new name. Installs on 0.1.0-alpha.8 and older keep creating apps from it: GitHub still serves git clones of the old name directly, with no redirect, which is what the runner's redirect-refusing clone needs (verified after the rename).
 - **Runner state snapshots land faster and report their health.** The sync task polls for changes every 2 s (was 10 s), waits 5 s for bursts to settle (was 10 s) and uploads at most every 15 s (was a minute), so an ungraceful crash with a lost volume loses about 22 s of API mutations instead of about 70 s. Uploads are still skipped when the database bytes are unchanged, and the single-writer fence, the fail-closed restore and the snapshot format are untouched: no new config, and an older image reads the new snapshots. `/ready` gains an additive `snapshot` object (still the bucket owner, seconds since the last upload, last upload error) and `make doctor` prints it.
+
+### Added
+
+- **Admins hear about new releases.** The opt-out daily release check above feeds a dismissible per-version banner in the control UI shell (admins only; `dev` and SHA builds never notify) linking the release notes and the upgrade docs, plus `instance.update_status` (`GET /v1/admin/update`) for the toggle state, the running version and the newest release seen.
 
 ## [0.1.0-alpha.8] - 2026-10-21
 
