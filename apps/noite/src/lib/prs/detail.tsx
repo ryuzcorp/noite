@@ -165,9 +165,10 @@ const PrEnvironment = ({ appId, head }: { appId: string; head: string }) => {
       <div class="flex flex-wrap items-center gap-2">
         <span class="opacity-70">Environment</span>
         <span class="font-mono text-xs">{environment.label}</span>
-        <span class={`status ${presenceTone(environment.status)}`}>
-          <span class="sr-only">{environment.status}</span>
-        </span>
+        <span
+          aria-hidden="true"
+          class={`status ${presenceTone(environment.status)}`}
+        />
         <span class="text-xs">{environment.status}</span>
         {subdomain === "" ? null : (
           <a
