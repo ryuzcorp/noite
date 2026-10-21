@@ -48,7 +48,7 @@ FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
  # The builder image is golang-based, so the module's own tests run here and
  # the image job covers them (`go vet`, formatting, `go test -race`).
  COPY edge /edge
- RUN cd /edge && go vet ./... && test -z "$(gofmt -l .)" && go test -race ./...
+ RUN cd /edge && go vet ./... && test -z "$(gofmt -l .)" && CGO_ENABLED=1 go test -race ./...
  RUN GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" CGO_ENABLED=0 xcaddy build \
        --with "github.com/ryuzcorp/noite/edge=/edge" \
        --output /out/caddy
