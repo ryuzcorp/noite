@@ -2,9 +2,13 @@
 # and driven by Playwright (passkey signup, invites, git push, deploys, tenant
 # serve), then the same lane in multi-tenant mode with the hostile-tenant spec.
 #
-# Run on pull requests carrying the `e2e` label (via `ci.yml`), by hand from
-# the Actions tab, and by `images.yml` as the gate in front of every release
-# tag. Locally: `make e2e` and `make e2e-isolation`.
+# Two suites over the same specs (`inputs.suite`, `E2E_SUITE` in the lane):
+# `fast` runs the tagged PR gate (@fast single, @isolation multi — the
+# critical paths plus the policy probe); `release` runs every spec. `ci.yml`
+# runs `fast` on pull requests that touch runtime code and `release` on the
+# `e2e` label; `images.yml` gates every `v*` tag on `release`; a nightly
+# schedule runs `release` on main. Locally: `make e2e`,
+# `E2E_SUITE=fast make e2e`, and `make e2e-isolation`.
 #
 # Speed shape: each lane builds the image once with buildx into the local
 # daemon (no per-lane from-scratch compose build) and tests it via
@@ -17,7 +21,26 @@ name: e2e
 
 on:
   workflow_call:
+    inputs:
+      suite:
+        default: release
+        description: Which spec set to run (fast = the tagged PR gate, release = every spec).
+        required: false
+        type: string
   workflow_dispatch:
+    inputs:
+      suite:
+        default: release
+        description: Which spec set to run (fast = the tagged PR gate, release = every spec).
+        options: [release, fast]
+        required: false
+        type: choice
+  # Nightly release-suite run on main: the tag gate only runs on `v*`, so this
+  # is what catches a slow main-branch regression in a spec outside the fast
+  # set. `inputs.suite` is empty on a schedule trigger; the lane step below
+  # falls back to `release`.
+  schedule:
+    - cron: "0 4 * * *"
 
 permissions:
   contents: read
@@ -102,7 +125,7 @@ jobs:
           tags: noite:e2e
           target: noite
       - name: e2e lane
-        run: E2E_IMAGE=noite:e2e make ${{ matrix.target }}
+        run: E2E_IMAGE=noite:e2e E2E_SUITE=${{ inputs.suite || 'release' }} make ${{ matrix.target }}
       - name: upload playwright report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

@@ -5,10 +5,12 @@
 # Release images are a separate workflow (`images.yml`).
 #
 # The end-to-end lanes (`make e2e`, `make e2e-isolation`) need a container
-# engine plus a few minutes, so they are not on the default path: they run on
-# pull requests carrying the `e2e` label, from the Actions tab
-# (`workflow_dispatch`), or locally. They are the release gate too:
-# `images.yml` runs them on every `v*` tag before pushing an image.
+# engine plus a few minutes, so the pull-request default is the fast suite:
+# PRs that touch runtime code run the tagged gate automatically, and the
+# `e2e` label upgrades the run to the release suite (every spec). Dispatch
+# from the Actions tab runs the chosen suite. They are the release gate too:
+# `images.yml` runs the release suite on every `v*` tag before pushing an
+# image.
 name: ci
 
 on:
@@ -17,6 +19,13 @@ on:
     # below sees it without another push.
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
+    inputs:
+      suite:
+        default: release
+        description: Which e2e spec set to run (fast = the tagged PR gate, release = every spec).
+        options: [release, fast]
+        required: false
+        type: choice
 
 permissions:
   contents: read
@@ -92,9 +101,36 @@ jobs:
           cache-from: type=gha,scope=noite-linux/amd64
           cache-to: type=gha,mode=max,scope=noite-linux/amd64
 
-  # Opt-in per pull request: add the `e2e` label, or run by hand from the
+  # Which runtime-code filter decides the automatic fast run. The `e2e` label
+  # upgrades a pull request to the release suite; docs-only PRs run no lane.
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'apps/**'
+              - 'packages/**'
+              - 'docker/**'
+              - 'Makefile'
+              - 'bun.lock'
+              - '.env.example'
+              - '.github/workflows/e2e.yml'
+
+  # Fast on code pull requests, release on the `e2e` label or by hand from the
   # Actions tab. The lanes live in e2e.yml, which `images.yml` also runs as
   # the release gate.
   e2e:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'e2e')
+    needs: changes
+    if: always() && (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'e2e') || needs.changes.outputs.code == 'true')
     uses: ./.github/workflows/e2e.yml
+    with:
+      suite: ${{ contains(github.event.pull_request.labels.*.name, 'e2e') && 'release' || inputs.suite || 'fast' }}

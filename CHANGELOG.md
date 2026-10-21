@@ -22,6 +22,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - **The Ilha + Void template replaces Oxide + ilha.** The creator offers exactly **Ilha + Void** and **TanStack Start**. Ilha + Void lives in the same repository, `ryuzcorp/noite-template-oxide`, now rewritten as Ilha pages on Void (Vite) with server-rendered pages, a server action and an island. The template id changed from `oxide` to `ilha-void` with no alias, so MCP `create_app` calls that pass `source: { kind: "template", template: "oxide" }` must switch to `ilha-void`. A new e2e spec creates an app from the template, waits for the deploy and checks that it serves.
+- **E2E runs a fast gate on pull requests and the full suite on release.** The lanes run two suites over the same specs: `fast` (the tagged critical paths — create, push and deploy, logs, Code mode edits, PR merge, auth/invite gates, template deploy, rollback, environments, error ingest — plus the isolation-relevant set on the multi lane) and `release` (every spec, including the new storage-editing and admin-page coverage). Pull requests that touch runtime code run `fast` automatically; the `e2e` label runs `release`; every `v*` tag and a nightly run gate on `release`. Locally: `E2E_SUITE=fast make e2e`.
 
 ### Fixed
 

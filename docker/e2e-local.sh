@@ -19,8 +19,10 @@
 #   E2E_TENANCY=multi make e2e     isolation lane: multi-tenant mode and the
 #                                  hostile-tenant spec (E2E_HOSTILE=1)
 #   E2E_KEEP=1 make e2e            leave the stack running afterwards (debug)
-#   E2E_WORKERS=3 make e2e         Playwright workers (default 3; files run in
-#                                  parallel, tests within a file stay serial)
+#   E2E_SUITE=fast make e2e       only the pull-request gate: the tagged
+#                                  critical paths (@fast single, @isolation
+#                                  multi); `release` (the default) runs
+#                                  every spec
 #   E2E_SPECS="e2e/forge.spec.ts e2e/prs.spec.ts" make e2e
 #                                  run only those spec files (the setup project
 #                                  still runs first); quick to check one fix
@@ -56,6 +58,7 @@ export BASE_DOMAIN=noite.localhost HTTP_PORT=8090 HTTPS_PORT=8443
 # The lane's own store port, so a dev stack on :9000 can keep running.
 export RUSTFS_API_PORT="${E2E_RUSTFS_PORT:-19000}"
 export E2E_TENANCY="${E2E_TENANCY:-single}"
+export E2E_SUITE="${E2E_SUITE:-release}"
 export E2E_RUNNER_TOKEN="${RUNNER_TOKEN:-dev-runner-token}"
 export E2E_BASE_URL=http://noite.localhost:8090
 export E2E_API_BASE=http://localhost:8080
