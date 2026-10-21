@@ -53,9 +53,9 @@ Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
 
 | Method | Route | Notes |
 | --- | --- | --- |
-| `GET` / `POST` | `/v1/apps/{id}/domains` | List; claim a custom hostname (pending in `multi`, verified at once in `single`) |
-| `POST` | `/v1/apps/{id}/domains/verify` | Check the claim's TXT proof; flips it to verified |
-| `DELETE` | `/v1/apps/{id}/domains/{hostname}` | Detaches the hostname |
+| `GET` / `POST` | `/v1/apps/{id}/domains?role=` | List (view); claim a custom hostname (admin; pending in `multi`, verified at once in `single`) |
+| `POST` | `/v1/apps/{id}/domains/verify?role=admin` | Check the claim's TXT proof; flips it to verified |
+| `DELETE` | `/v1/apps/{id}/domains/{hostname}?role=admin` | Detaches the hostname |
 
 ## Source
 
