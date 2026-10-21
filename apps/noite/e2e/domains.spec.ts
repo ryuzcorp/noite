@@ -36,7 +36,9 @@ test("custom domain claim shows its status and verifies or fails readably", asyn
       await row.getByRole("button", { name: "Verify" }).click();
       // No record exists for this name: the lookup fails, and the panel
       // shows the runner's reason instead of a generic error.
-      await expect(page.getByText(/no TXT record|DNS lookup failed/u)).toBeVisible();
+      await expect(
+        page.getByText(/no TXT record|DNS lookup failed/u)
+      ).toBeVisible();
     } else {
       await expect(row.getByText("Verified")).toBeVisible();
     }

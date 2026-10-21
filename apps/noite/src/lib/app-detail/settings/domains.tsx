@@ -61,7 +61,9 @@ export const CustomDomainsPanel = ({
         appId,
         hostname: value,
       });
+
       hostname.set("");
+
       const claimed = rows.find(
         (row) => row.hostname === value.toLowerCase().replace(/\.+$/u, "")
       );
@@ -124,9 +126,9 @@ export const CustomDomainsPanel = ({
     <SettingsSection>
       <h3 class="m-0 text-lg font-semibold">Custom Domain</h3>
       <p class="m-0 text-sm opacity-70">
-        Serve this app from your own hostname. Only a verified hostname
-        routes: add it, publish the TXT proof, then verify. Keep DNS pointed
-        at this server; the edge issues the hostname's certificate on demand.
+        Serve this app from your own hostname. Only a verified hostname routes:
+        add it, publish the TXT proof, then verify. Keep DNS pointed at this
+        server; the edge issues the hostname's certificate on demand.
       </p>
       {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
       {err() ? null : <LoadError error={res.error()} />}

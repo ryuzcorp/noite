@@ -28,6 +28,7 @@ export const listDomains = apiAction(AppId, async (appId, { env, request }) => {
     failUnknown(error);
   }
 });
+
 /** Reserve a hostname for the app (admin). In `multi` tenancy the claim
  * starts pending and the panel shows the TXT proof to publish; in `single`
  * it is verified at once. The runner is the authority on shape, collisions

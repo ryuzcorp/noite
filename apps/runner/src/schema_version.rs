@@ -641,11 +641,9 @@ mod tests {
         .execute(&mut conn)
         .await
         .expect("pending rivals coexist");
-        let dup = sqlx::query(
-            "UPDATE main.app_domain SET status = 'verified' WHERE app_id = 'b'",
-        )
-        .execute(&mut conn)
-        .await;
+        let dup = sqlx::query("UPDATE main.app_domain SET status = 'verified' WHERE app_id = 'b'")
+            .execute(&mut conn)
+            .await;
         assert!(dup.is_err(), "only the first verifier holds the name");
     }
 }

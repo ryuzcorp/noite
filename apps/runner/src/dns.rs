@@ -98,12 +98,13 @@ pub struct FakeResolver {
 }
 
 impl FakeResolver {
+    #[cfg(test)]
     pub fn with_record(name: &str, value: &str) -> Arc<Self> {
         let fake = Arc::new(Self::default());
         fake.set(name, vec![value.to_owned()]);
         fake
     }
-
+    #[cfg(test)]
     pub fn set(&self, name: &str, values: Vec<String>) {
         self.records
             .lock()

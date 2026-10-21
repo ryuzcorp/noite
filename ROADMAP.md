@@ -21,8 +21,7 @@ No cloud version: every alpha user runs their own install. The bar moves from "t
 
 **Nice to have:**
 
-- Per-build uids and per-fleet cgroups (`memory.max`), so one fleet's growth
-  stops shedding every app.
+- Per-build uids and per-fleet cgroups (`memory.max`), so one fleet's growth stops shedding every app.
 - Upgrades that do not cold-boot every fleet, or at least the expected downtime per upgrade in the docs.
 - A shorter snapshot loss window ([open question 3](#open-questions-and-known-issues), Litestream).
 - E2E for storage editing, rollback, commits from the source browser and the admin page ([open question 5](#open-questions-and-known-issues)).
