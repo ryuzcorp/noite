@@ -338,6 +338,12 @@ fn route_block(cfg: &Config) -> Vec<String> {
     }
     out.push("\trewrite @gitrewrite /v1/git{uri}".into());
     out.push("\trewrite @fallbackrewrite /v1/edge/fallback".into());
+    // The readiness hold runs here: after the wake/gate hops (so an
+    // anonymous request to a gated env with a down fleet gets the gate's
+    // answer immediately) and immediately before the proxy. Asleep routes
+    // skip it (the wake hop already waited); limits already ran in
+    // `edge_routes`, preserving limits → gate/wake → readiness order.
+    out.push("\tedge_hold".into());
     out.push("\thandle @fleetish {".into());
     for line in proxy_block("{http.vars.edge_upstream}", LB_TRY) {
         out.push(format!("\t\t{line}"));
@@ -587,6 +593,23 @@ mod tests {
         assert!(out.contains("handle @fleetish {"), "{out}");
         assert!(out.contains("This app is starting"), "{out}");
         assert!(out.contains("header Retry-After 5"), "{out}");
+    }
+
+    #[test]
+    fn readiness_hold_runs_after_hops_before_proxy() {
+        // F3: limits (edge_routes) → gate/wake (forward_auth) → readiness
+        // (edge_hold) → proxy. An anonymous gated request with a down fleet
+        // meets the gate first, never a 20 s hold.
+        let cfg = prod_config();
+        let out = static_caddyfile(&cfg);
+        let edge_routes = out.find("edge_routes {").expect("edge_routes");
+        let gate = out.find("forward_auth @is_gated").expect("gate hop");
+        let wake = out.find("forward_auth @is_asleep").expect("wake hop");
+        let hold = out.find("\n\t\tedge_hold\n").expect("edge_hold");
+        let proxy = out.find("handle @fleetish {").expect("fleet proxy");
+        assert!(edge_routes < gate, "{out}");
+        assert!(gate < hold && wake < hold, "{out}");
+        assert!(hold < proxy, "{out}");
     }
 
     #[test]

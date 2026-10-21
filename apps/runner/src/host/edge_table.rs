@@ -412,25 +412,47 @@ async fn push_live(cfg: &Config, table: &EdgeTable) {
 /// Build the table from the DB, write the file atomically when it changed,
 /// and push it live. Every app lifecycle event calls this immediately; the
 /// reconcile tick calls it too as the self-healing backstop.
+/// Serializes concurrent pushes: two lifecycle events at once must not
+/// interleave build → write → push, or an older table lands last until the
+/// next tick (the module also rejects older generations with a 409, and the
+/// generation counter is monotonic across restarts because it is persisted
+/// in the table file).
+static PUSH_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Fold a fresh build onto the previous file state: keep the old generation
+/// when nothing changed (and skip the write), else bump it.
+fn apply_table(prev: Option<&EdgeTable>, mut fresh: EdgeTable) -> (EdgeTable, bool) {
+    match prev {
+        Some(prev) if prev.exact == fresh.exact && prev.wildcards == fresh.wildcards => {
+            fresh.generation = prev.generation;
+            (fresh, false)
+        }
+        Some(prev) => {
+            fresh.generation = prev.generation + 1;
+            (fresh, true)
+        }
+        None => {
+            fresh.generation = 1;
+            (fresh, true)
+        }
+    }
+}
+
 pub async fn push_routes(pool: &sqlx::SqlitePool, cfg: &Config) -> anyhow::Result<()> {
+    let _held = PUSH_LOCK.lock().await;
     let apps = db::list_apps(pool).await?;
     let domains = db::list_app_domains(pool).await.unwrap_or_default();
     let limits = db::list_app_limits(pool).await.unwrap_or_default();
     let envs = db::list_environment_routes(pool).await.unwrap_or_default();
     warn_if_blind(cfg, &limits);
-    let mut table = build_table(cfg, &apps, &domains, &limits, &envs);
+    let fresh = build_table(cfg, &apps, &domains, &limits, &envs);
     let prev_table = std::fs::read_to_string(&cfg.routes_path)
         .ok()
         .and_then(|raw| serde_json::from_str::<EdgeTable>(&raw).ok());
-    // The file carries the generation, so compare content without it: an
-    // unchanged table keeps its generation and skips the write.
-    if prev_table
-        .as_ref()
-        .is_some_and(|prev| prev.exact == table.exact && prev.wildcards == table.wildcards)
-    {
-        table.generation = prev_table.map_or(0, |t| t.generation);
-    } else {
-        table.generation = prev_table.map_or(1, |t| t.generation + 1);
+    // The file carries the generation, so compare content without it.
+    let (table, changed) = apply_table(prev_table.as_ref(), fresh);
+    if changed {
         let path = Path::new(&cfg.routes_path);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -689,6 +711,47 @@ mod tests {
         // Longest-suffix wins on the Go side too; order here is stable.
         let suffixes: Vec<&str> = t.wildcards.iter().map(|w| w.suffix.as_str()).collect();
         assert!(suffixes.contains(&".localhost"));
+    }
+
+    #[test]
+    fn generation_is_monotonic_across_reloads() {
+        // F6: the counter persists in the file, so a runner restart keeps
+        // ordering pushes (and the module's 409 rejects anything older).
+        let cfg = config_for_tests();
+        let app = test_app("myapp");
+        let dir = std::env::temp_dir().join(format!("noite-edge-gen-{}", app.id));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("routes.json");
+        let write = |t: &EdgeTable| {
+            std::fs::write(&path, serde_json::to_string_pretty(t).expect("json")).expect("write");
+        };
+        let load = || {
+            serde_json::from_str::<EdgeTable>(&std::fs::read_to_string(&path).expect("read"))
+                .expect("parse")
+        };
+
+        // Fresh file: generation starts at 1.
+        let (t1, changed) = apply_table(None, build_table(&cfg, std::slice::from_ref(&app), &[], &[], &[]));
+        assert!(changed);
+        write(&t1);
+        assert_eq!(load().generation, 1);
+
+        // Same content after a "restart" (reload from file): same generation.
+        let (t2, changed) = apply_table(
+            Some(&load()),
+            build_table(&cfg, std::slice::from_ref(&app), &[], &[], &[]),
+        );
+        assert!(!changed);
+        assert_eq!(t2.generation, 1);
+
+        // Changed content: generation advances.
+        let mut gone = app.clone();
+        gone.listen_port = Some(20099);
+        let (t3, changed) = apply_table(Some(&load()), build_table(&cfg, &[gone], &[], &[], &[]));
+        assert!(changed);
+        write(&t3);
+        assert_eq!(load().generation, 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -17,17 +17,36 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
+// resetShared installs a fresh process-wide state for one test (the
+// package's tests run sequentially, and every test starts here, so no two
+// share a prober or a table).
+func resetShared(t *testing.T, table *Table, prober *Prober) {
+	t.Helper()
+	shared.mu.Lock()
+	if shared.prober != nil {
+		shared.prober.Stop()
+	}
+	shared.refs = 0
+	shared.tab = atomic.Pointer[Table]{}
+	shared.lim = NewLimiter(time.Now)
+	if prober == nil {
+		prober = NewProber(time.Second, 2*time.Second, func(string) bool { return true })
+	}
+	shared.prober = prober
+	shared.holdRecheck = 5 * time.Millisecond
+	shared.holdCap = 50 * time.Millisecond
+	shared.log = zap.NewNop()
+	shared.loaded = false
+	shared.mu.Unlock()
+	if table != nil {
+		shared.swap(table)
+	}
+}
+
 func testHandler(t *testing.T, table *Table) *EdgeRoutes {
 	t.Helper()
-	e := &EdgeRoutes{
-		lim:         NewLimiter(time.Now),
-		prober:      NewProber(time.Second, 2*time.Second, func(string) bool { return true }),
-		log:         zap.NewNop(),
-		holdRecheck: 5 * time.Millisecond,
-		holdCap:     50 * time.Millisecond,
-	}
-	e.swap(table)
-	return e
+	resetShared(t, table, nil)
+	return &EdgeRoutes{}
 }
 
 func nextOK(vars map[string]string) (caddyhttp.Handler, *atomic.Bool) {
@@ -75,6 +94,9 @@ func TestLookup(t *testing.T) {
 		{"x.preview.myapp.noite.localhost", KindDeny, true},
 		{"unknown.noite.localhost", KindFallback, true},
 		{"other.example.com", "", false},
+		// Suffixes match exactly one label: multi-label hosts fall through.
+		{"a.b.noite.localhost", "", false},
+		{"a.b.myapp.noite.localhost", "", false},
 	}
 	for _, tc := range cases {
 		r, ok := table.Lookup(tc.host)
@@ -86,12 +108,18 @@ func TestLookup(t *testing.T) {
 
 func TestValidate(t *testing.T) {
 	bad := []*Table{
-		{Exact: map[string]Route{"": {Kind: KindTenant, Upstream: "x"}}},
+		{Exact: map[string]Route{"": {Kind: KindTenant, Upstream: "127.0.0.1:1"}}},
 		{Exact: map[string]Route{"a": {Kind: "nope"}}},
 		{Exact: map[string]Route{"a": {Kind: KindTenant}}},
-		{Exact: map[string]Route{"a": {Kind: KindDeny, Upstream: "x"}}},
-		{Exact: map[string]Route{"a": {Kind: KindTenant, Upstream: "x", ClientRPM: 1}}},
+		{Exact: map[string]Route{"a": {Kind: KindDeny, Upstream: "127.0.0.1:1"}}},
+		{Exact: map[string]Route{"a": {Kind: KindTenant, Upstream: "127.0.0.1:1", ClientRPM: 1}}},
+		{Exact: map[string]Route{"B.test": {Kind: KindTenant, Upstream: "127.0.0.1:1"}}},
+		{Exact: map[string]Route{"a": {Kind: KindTenant, Upstream: "10.0.0.1:1"}}},
+		{Exact: map[string]Route{"a": {Kind: KindTenant, Upstream: "127.0.0.1:0"}}},
+		{Exact: map[string]Route{"a": {Kind: KindTenant, Upstream: "127.0.0.1:99999"}}},
+		{Exact: map[string]Route{"a": {Kind: KindTenant, Upstream: "127.0.0.1"}}},
 		{Wildcards: []Wildcard{{Suffix: "nodot", Route: Route{Kind: KindDeny}}}},
+		{Wildcards: []Wildcard{{Suffix: ".B.test", Route: Route{Kind: KindDeny}}}},
 	}
 	for i, tbl := range bad {
 		if err := tbl.Validate(); err == nil {
@@ -200,8 +228,8 @@ func TestAtomicSwapUnderRace(t *testing.T) {
 				return
 			default:
 			}
-			e.swap(newT)
-			e.swap(oldT)
+			shared.swap(newT)
+			shared.swap(oldT)
 		}
 	}()
 	// Every request must see one coherent table: route and upstream agree,
@@ -228,24 +256,27 @@ func TestAtomicSwapUnderRace(t *testing.T) {
 	wg.Wait()
 }
 
-func TestReadinessHold(t *testing.T) {
-	table := &Table{Exact: map[string]Route{
-		"a.test": {Kind: KindTenant, Upstream: "127.0.0.1:9"},
-	}}
+func TestHoldAndRelease(t *testing.T) {
 	healthy := &atomic.Bool{} // starts down
-	e := &EdgeRoutes{
-		lim:         NewLimiter(time.Now),
-		prober:      NewProber(5*time.Millisecond, 10*time.Millisecond, func(string) bool { return healthy.Load() }),
-		holdRecheck: 5 * time.Millisecond,
-		holdCap:     10 * time.Second,
-	}
-	e.swap(table)
+	resetShared(t, &Table{Exact: map[string]Route{
+		"a.test": {Kind: KindTenant, Upstream: "127.0.0.1:9"},
+	}}, NewProber(5*time.Millisecond, 10*time.Millisecond, func(string) bool { return healthy.Load() }))
+	shared.holdCap = 10 * time.Second
+	hold := EdgeHold{}
 	next, called := nextOK(map[string]string{VarRoute: KindTenant})
+	// EdgeRoutes sets the vars; the hold reads them.
+	routes := &EdgeRoutes{}
+	r := requestWithVars("a.test")
+	w := httptest.NewRecorder()
+	noop, _ := nextOK(nil)
+	if err := routes.ServeHTTP(w, r, noop); err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		w := httptest.NewRecorder()
-		_ = e.ServeHTTP(w, requestWithVars("a.test"), next)
+		_ = hold.ServeHTTP(w, r, next)
 	}()
 	// While down, the request must not reach the upstream.
 	select {
@@ -262,43 +293,97 @@ func TestReadinessHold(t *testing.T) {
 	if !called.Load() {
 		t.Fatalf("released request did not reach next")
 	}
-	// Freshly tracked upstreams hold until the first probe lands, then
-	// serve (the test prober reports healthy).
-	e.swap(&Table{Exact: map[string]Route{"b.test": {Kind: KindTenant, Upstream: "127.0.0.1:10"}}})
-	deadline := time.Now().Add(5 * time.Second)
-	for !e.prober.Healthy("127.0.0.1:10") && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
+}
+
+func TestHoldSkipsAsleep(t *testing.T) {
+	// F2: a down prober plus Asleep must reach next immediately — the wake
+	// hop, not the hold, waits for the fleet.
+	down := NewProber(time.Hour, time.Second, func(string) bool { return false })
+	resetShared(t, &Table{Exact: map[string]Route{
+		"a.test": {Kind: KindTenant, Upstream: "127.0.0.1:9", Asleep: true},
+	}}, down)
+	routes := &EdgeRoutes{}
+	hold := EdgeHold{}
+	next, called := nextOK(map[string]string{VarRoute: KindTenant})
+	r := requestWithVars("a.test")
+	w := httptest.NewRecorder()
+	if err := routes.ServeHTTP(w, r, next); err != nil {
+		t.Fatal(err)
 	}
-	if !e.prober.Healthy("127.0.0.1:10") {
-		t.Fatalf("tracked healthy upstream never flipped up")
+	done := make(chan error, 1)
+	go func() { done <- hold.ServeHTTP(httptest.NewRecorder(), r, next) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("asleep hold returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("asleep route held despite down prober")
 	}
-	// Truly untracked upstreams fail open.
-	if !e.prober.Healthy("never-tracked:1") {
-		t.Fatalf("untracked upstream must fail open")
+	if !called.Load() {
+		t.Fatalf("asleep request did not reach next")
+	}
+	// Asleep upstreams are never probed.
+	shared.mu.Lock()
+	_, tracked := shared.prober.up["127.0.0.1:9"]
+	shared.mu.Unlock()
+	if tracked {
+		t.Fatalf("asleep upstream must not be tracked")
 	}
 }
 
 func TestHoldTimeoutReturns503WithoutProxying(t *testing.T) {
-	table := &Table{Exact: map[string]Route{
+	resetShared(t, &Table{Exact: map[string]Route{
 		"a.test": {Kind: KindTenant, Upstream: "127.0.0.1:9"},
-	}}
-	e := &EdgeRoutes{
-		lim:         NewLimiter(time.Now),
-		prober:      NewProber(time.Hour, time.Second, func(string) bool { return false }),
-		log:         zap.NewNop(),
-		holdRecheck: 5 * time.Millisecond,
-		holdCap:     40 * time.Millisecond,
-	}
-	e.swap(table)
+	}}, NewProber(time.Hour, time.Second, func(string) bool { return false }))
+	shared.holdCap = 40 * time.Millisecond
+	routes := &EdgeRoutes{}
+	hold := EdgeHold{}
 	next, called := nextOK(map[string]string{VarRoute: KindTenant})
+	r := requestWithVars("a.test")
 	w := httptest.NewRecorder()
-	err := e.ServeHTTP(w, requestWithVars("a.test"), next)
+	noop, _ := nextOK(nil)
+	if err := routes.ServeHTTP(w, r, noop); err != nil {
+		t.Fatal(err)
+	}
+	w = httptest.NewRecorder()
+	err := hold.ServeHTTP(w, r, next)
 	if called.Load() {
 		t.Fatalf("timed-out hold must not proxy")
 	}
 	herr, ok := err.(caddyhttp.HandlerError)
 	if !ok || herr.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("want 503 HandlerError, got %#v", err)
+	}
+}
+
+func TestTwoInstancesShareOneTable(t *testing.T) {
+	// F1: every instance reads the same process-wide table; one push
+	// swaps it for all of them.
+	testHandler(t, &Table{Exact: map[string]Route{
+		"a.test": {Kind: KindTenant, Upstream: "127.0.0.1:1"},
+	}})
+	first, second := &EdgeRoutes{}, &EdgeRoutes{}
+	raw := `{"generation": 2, "exact": {"b.test": {"kind": "custom", "upstream": "127.0.0.1:2"}}}`
+	r := httptest.NewRequest(http.MethodPost, "/edge/routes", strings.NewReader(raw))
+	if err := handleAdmin(httptest.NewRecorder(), r); err != nil {
+		t.Fatalf("push rejected: %v", err)
+	}
+	for i, e := range []*EdgeRoutes{first, second} {
+		seen := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			up, _ := caddyhttp.GetVar(r.Context(), VarUpstream).(string)
+			if up != "127.0.0.1:2" {
+				t.Errorf("instance %d routes stale upstream %q", i, up)
+			}
+			return nil
+		})
+		w := httptest.NewRecorder()
+		if err := e.ServeHTTP(w, requestWithVars("b.test"), seen); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := shared.tab.Load().Lookup("a.test"); ok {
+			t.Fatalf("stale host survived the swap")
+		}
 	}
 }
 
@@ -321,27 +406,51 @@ func TestWaitHealthyCap(t *testing.T) {
 func TestWildcardWireShape(t *testing.T) {
 	// The runner serializes wildcards nested as {"suffix", "route"}; a flat
 	// shape would decode with a zero Route and fail validation.
-	e := testHandler(t, &Table{})
+	testHandler(t, &Table{})
 	raw := `{"generation": 3, "exact": {}, "wildcards": [{"suffix": ".example.com", "route": {"kind": "fallback", "upstream": "127.0.0.1:8080", "rewrite": "/v1/edge/fallback"}}]}}`
 	r := httptest.NewRequest(http.MethodPost, "/edge/routes", strings.NewReader(raw))
 	w := httptest.NewRecorder()
-	if err := e.handleAdmin(w, r); err != nil {
+	if err := handleAdmin(w, r); err != nil {
 		t.Fatalf("nested wildcard rejected: %v", err)
 	}
-	rt, ok := e.tab.Load().Lookup("anything.example.com")
+	rt, ok := shared.tab.Load().Lookup("anything.example.com")
 	if !ok || rt.Kind != KindFallback || rt.Rewrite != "/v1/edge/fallback" {
 		t.Fatalf("wildcard not applied: %+v %v", rt, ok)
 	}
 	flat := `{"generation": 4, "exact": {}, "wildcards": [{"suffix": ".example.com", "kind": "fallback", "upstream": "127.0.0.1:8080"}]}}`
 	r = httptest.NewRequest(http.MethodPost, "/edge/routes", strings.NewReader(flat))
 	w = httptest.NewRecorder()
-	if _, ok := e.handleAdmin(w, r).(caddy.APIError); !ok {
+	if _, ok := handleAdmin(w, r).(caddy.APIError); !ok {
 		t.Fatalf("flat wildcard must be rejected")
 	}
 }
 
+func TestRejectsOlderGeneration(t *testing.T) {
+	// F6: generations are monotonic; an older table landing last must not
+	// un-publish newer routes.
+	testHandler(t, &Table{Generation: 9, Exact: map[string]Route{
+		"a.test": {Kind: KindTenant, Upstream: "127.0.0.1:1"},
+	}})
+	old := `{"generation": 8, "exact": {"b.test": {"kind": "custom", "upstream": "127.0.0.1:2"}}}`
+	r := httptest.NewRequest(http.MethodPost, "/edge/routes", strings.NewReader(old))
+	w := httptest.NewRecorder()
+	err := handleAdmin(w, r)
+	apiErr, ok := err.(caddy.APIError)
+	if !ok || apiErr.HTTPStatus != http.StatusConflict {
+		t.Fatalf("want 409 APIError, got %#v", err)
+	}
+	if _, ok := shared.tab.Load().Lookup("b.test"); ok {
+		t.Fatalf("older generation clobbered the table")
+	}
+	same := `{"generation": 9, "exact": {"c.test": {"kind": "custom", "upstream": "127.0.0.1:3"}}}`
+	r = httptest.NewRequest(http.MethodPost, "/edge/routes", strings.NewReader(same))
+	if err := handleAdmin(httptest.NewRecorder(), r); err != nil {
+		t.Fatalf("same generation must be accepted (idempotent re-push): %v", err)
+	}
+}
+
 func TestAdminValidation(t *testing.T) {
-	e := testHandler(t, &Table{Generation: 7, Exact: map[string]Route{
+	testHandler(t, &Table{Generation: 7, Exact: map[string]Route{
 		"a.test": {Kind: KindTenant, Upstream: "127.0.0.1:1"},
 	}})
 	bad := `{"generation": 8, "exact": {"b.test": {"kind": "nope"}}}`
@@ -349,30 +458,30 @@ func TestAdminValidation(t *testing.T) {
 	w := httptest.NewRecorder()
 	// handleAdmin returns caddy.APIError; the admin framework turns it
 	// into the status code, so assert on the value here.
-	err := e.handleAdmin(w, r)
+	err := handleAdmin(w, r)
 	apiErr, ok := err.(caddy.APIError)
 	if !ok || apiErr.HTTPStatus != http.StatusBadRequest {
 		t.Fatalf("want 400 APIError, got %#v", err)
 	}
 	// Old table intact.
-	if r2, ok := e.tab.Load().Lookup("a.test"); !ok || r2.Kind != KindTenant {
+	if r2, ok := shared.tab.Load().Lookup("a.test"); !ok || r2.Kind != KindTenant {
 		t.Fatalf("bad push clobbered the table")
 	}
 	good := `{"generation": 8, "exact": {"b.test": {"kind": "custom", "upstream": "127.0.0.1:2"}}}`
 	r = httptest.NewRequest(http.MethodPost, "/edge/routes", strings.NewReader(good))
 	w = httptest.NewRecorder()
-	if err := e.handleAdmin(w, r); err != nil {
+	if err := handleAdmin(w, r); err != nil {
 		t.Fatalf("good push rejected: %v", err)
 	}
-	if r2, ok := e.tab.Load().Lookup("b.test"); !ok || r2.Upstream != "127.0.0.1:2" {
+	if r2, ok := shared.tab.Load().Lookup("b.test"); !ok || r2.Upstream != "127.0.0.1:2" {
 		t.Fatalf("good push not applied")
 	}
-	if _, ok := e.tab.Load().Lookup("a.test"); ok {
+	if _, ok := shared.tab.Load().Lookup("a.test"); ok {
 		t.Fatalf("stale host survived the swap")
 	}
 	r = httptest.NewRequest(http.MethodDelete, "/edge/routes", nil)
 	w = httptest.NewRecorder()
-	err = e.handleAdmin(w, r)
+	err = handleAdmin(w, r)
 	apiErr, ok = err.(caddy.APIError)
 	if !ok || apiErr.HTTPStatus != http.StatusMethodNotAllowed {
 		t.Fatalf("want 405 APIError, got %#v", err)
@@ -406,7 +515,17 @@ func TestAsleepAndGatedVars(t *testing.T) {
 	if err := e.ServeHTTP(w, requestWithVars("missing.test"), next); err != nil {
 		t.Fatal(err)
 	}
+	// Loaded table, unknown host: 404 (the 503 is only for the boot gap).
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("unknown host: want 404, got %d", w.Code)
+	}
+	// No table at all: 503 edge starting.
+	resetShared(t, nil, nil)
+	w = httptest.NewRecorder()
+	if err := e.ServeHTTP(w, requestWithVars("missing.test"), next); err != nil {
+		t.Fatal(err)
+	}
 	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("unknown host: want 503, got %d", w.Code)
+		t.Fatalf("unloaded edge: want 503, got %d", w.Code)
 	}
 }

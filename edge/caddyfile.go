@@ -33,3 +33,11 @@ func parseInto(e *EdgeRoutes, d *caddyfile.Dispenser) error {
 	}
 	return nil
 }
+
+func parseHoldCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+	e := new(EdgeHold)
+	if err := e.UnmarshalCaddyfile(h.Dispenser); err != nil {
+		return nil, err
+	}
+	return e, nil
+}

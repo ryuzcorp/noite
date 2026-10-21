@@ -79,8 +79,9 @@ func NewProber(interval, timeout time.Duration, check func(string) bool) *Prober
 }
 
 // Track starts probing every upstream in the set and stops the ones that
-// left. New upstreams start healthy (a fresh push proxies immediately, as
-// a fresh Caddy config does) and flip within one interval when down.
+// left. New upstreams start down and the first probe runs immediately, so
+// requests hold until the first result lands (like a fresh Caddy config
+// checking health on load); they flip within one interval when up.
 func (p *Prober) Track(upstreams map[string]bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

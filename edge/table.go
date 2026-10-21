@@ -69,6 +69,28 @@ type Table struct {
 	Wildcards  []Wildcard       `json:"wildcards"`
 }
 
+// validUpstream admits only loopback upstreams: the runner's upstreams
+// are compile-time constants (control/api/fleets on 127.0.0.1).
+func validUpstream(upstream string) bool {
+	host, port, err := splitHostPort(upstream)
+	if err != nil || host != "127.0.0.1" || port == "" {
+		return false
+	}
+	for _, c := range port {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	n := 0
+	for _, c := range port {
+		n = n*10 + int(c-'0')
+		if n > 65535 {
+			return false
+		}
+	}
+	return n > 0
+}
+
 func validKind(kind string) bool {
 	switch kind {
 	case KindControl, KindAPI, KindGit, KindTenant, KindCustom,
@@ -84,6 +106,9 @@ func (t *Table) Validate() error {
 		if strings.TrimSpace(host) == "" {
 			return fmt.Errorf("edge: exact route with empty host")
 		}
+		if host != strings.ToLower(host) {
+			return fmt.Errorf("edge: host %q must be lowercase", host)
+		}
 		if err := r.validate(); err != nil {
 			return fmt.Errorf("edge: host %q: %w", host, err)
 		}
@@ -91,6 +116,9 @@ func (t *Table) Validate() error {
 	for i, w := range t.Wildcards {
 		if !strings.HasPrefix(w.Suffix, ".") || len(w.Suffix) < 2 {
 			return fmt.Errorf("edge: wildcard %d has bad suffix %q", i, w.Suffix)
+		}
+		if w.Suffix != strings.ToLower(w.Suffix) {
+			return fmt.Errorf("edge: wildcard %q must be lowercase", w.Suffix)
 		}
 		if err := w.Route.validate(); err != nil {
 			return fmt.Errorf("edge: wildcard %q: %w", w.Suffix, err)
@@ -109,8 +137,8 @@ func (r Route) validate() error {
 		}
 		return nil
 	}
-	if r.Upstream == "" {
-		return fmt.Errorf("missing upstream")
+	if !validUpstream(r.Upstream) {
+		return fmt.Errorf("upstream %q must be 127.0.0.1:<port>", r.Upstream)
 	}
 	if r.ClientRPM > 1<<30 || r.AppRPM > 1<<30 {
 		return fmt.Errorf("rpm out of range")
@@ -146,6 +174,10 @@ func splitHostPort(hostport string) (string, string, error) {
 }
 
 // Lookup returns the route for host: exact first, then longest suffix.
+// Suffixes match exactly one label (like Caddy's `*.base`): the remainder
+// must be a single non-empty label, so `a.b.base` never matches `.base`.
+// Environment and preview suffixes need no multi-label match: labels never
+// contain dots (the runner's labeler folds everything else to `-`).
 func (t *Table) Lookup(host string) (Route, bool) {
 	if t == nil {
 		return Route{}, false
@@ -157,10 +189,15 @@ func (t *Table) Lookup(host string) (Route, bool) {
 	var best Route
 	bestLen := -1
 	for _, w := range t.Wildcards {
-		if strings.HasSuffix(host, w.Suffix) && len(w.Suffix) > bestLen {
-			bestLen = len(w.Suffix)
-			best = w.Route
+		if len(w.Suffix) <= bestLen || !strings.HasSuffix(host, w.Suffix) {
+			continue
 		}
+		rest := host[:len(host)-len(w.Suffix)]
+		if rest == "" || strings.Contains(rest, ".") {
+			continue
+		}
+		bestLen = len(w.Suffix)
+		best = w.Route
 	}
 	if bestLen < 0 {
 		return Route{}, false

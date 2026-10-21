@@ -1,3 +1,11 @@
+// The noite edge module: a host route table for Caddy.
+//
+// Caddy's config is static after boot. The runner pushes this table on
+// every app lifecycle event (and every reconcile tick as a backstop), so
+// app events never reload Caddy. All state (table, limiters, readiness
+// probers) is process-wide and shared by every handler instance: the
+// static config has one EdgeRoutes per site, and a push swaps the table
+// once for all of them.
 package edge
 
 import (
@@ -5,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,13 +26,11 @@ import (
 
 func init() {
 	caddy.RegisterModule(new(EdgeRoutes))
+	caddy.RegisterModule(new(EdgeHold))
 	caddy.RegisterModule(new(EdgeAdmin))
 	httpcaddyfile.RegisterHandlerDirective("edge_routes", parseCaddyfile)
+	httpcaddyfile.RegisterHandlerDirective("edge_hold", parseHoldCaddyfile)
 }
-
-// liveEdge is the provisioned HTTP handler the admin API delegates to.
-// There is exactly one in the static config.
-var liveEdge atomic.Pointer[EdgeRoutes]
 
 // Vars the module publishes for the static config.
 const (
@@ -45,19 +52,111 @@ const (
 	ProbeTimeout = 2 * time.Second
 )
 
+// sharedState is the process-wide edge state, shared by every EdgeRoutes
+// and EdgeHold instance (the static config provisions one per site).
+type sharedState struct {
+	mu sync.Mutex
+	// refs counts provisioned instances; the last Cleanup stops the
+	// probers so a full Caddy stop leaks no goroutines.
+	refs        int
+	tab         atomic.Pointer[Table]
+	lim         *Limiter
+	prober      *Prober
+	log         *zap.Logger
+	holdRecheck time.Duration
+	holdCap     time.Duration
+	// loaded is true once any table has been installed (file or push).
+	// Lookup misses answer 404 only then; before that the edge is still
+	// starting and answers 503.
+	loaded bool
+}
+
+var shared = newSharedState()
+
+func newSharedState() *sharedState {
+	return &sharedState{
+		holdRecheck: HoldRecheck,
+		holdCap:     HoldCap,
+	}
+}
+
+// initLocked creates the limiter and prober on first use. Callers hold mu.
+func (s *sharedState) initLocked(log *zap.Logger) {
+	if s.lim == nil {
+		s.lim = NewLimiter(nil)
+	}
+	if s.prober == nil {
+		s.prober = NewProber(ProbeEvery, ProbeTimeout, nil)
+	}
+	if log != nil {
+		s.log = log
+	}
+}
+
+func (s *sharedState) retain(log *zap.Logger) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refs++
+	s.initLocked(log)
+}
+
+func (s *sharedState) release() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.refs > 0 {
+		s.refs--
+	}
+	if s.refs == 0 && s.prober != nil {
+		s.prober.Stop()
+		s.prober = nil
+		s.lim = nil
+	}
+}
+
+// swap installs a table and converges the prober and limiter state.
+// Asleep routes are never probed: the wake hop waits for the fleet's
+// health gate itself, so probing them would only burn checks on a
+// deliberately parked fleet.
+func (s *sharedState) swap(t *Table) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initLocked(nil)
+	s.tab.Store(t)
+	s.loaded = true
+	keep := make(map[string]bool)
+	fleet := make(map[string]bool)
+	collect := func(r Route) {
+		if r.ClientZone != "" {
+			keep[r.ClientZone] = true
+		}
+		if r.AppZone != "" {
+			keep[r.AppZone] = true
+		}
+		if FleetKind(r.Kind) && !r.Asleep && r.Upstream != "" {
+			fleet[r.Upstream] = true
+		}
+	}
+	for _, r := range t.Exact {
+		collect(r)
+	}
+	for _, w := range t.Wildcards {
+		collect(w.Route)
+	}
+	s.prober.Track(fleet)
+	s.lim.Sweep(keep, time.Hour)
+}
+
 // EdgeRoutes holds the pushed route table and serves it per request.
+//
+// Per request it does the minimum only Go can do: host lookup, http.vars,
+// and per-app rate limiting. The readiness hold lives in EdgeHold, placed
+// after the wake/gate hops, so an anonymous request to a gated env with a
+// down fleet gets the gate's answer immediately instead of waiting out
+// the hold.
 type EdgeRoutes struct {
 	// TablePath is the JSON file the runner writes atomically and the
 	// module loads in Provision (restart persistence without a manual step).
 	TablePath string `json:"table,omitempty"`
-
-	tab    atomic.Pointer[Table]
-	lim    *Limiter
-	prober *Prober
-	log    *zap.Logger
-	// Hold timing (defaults set in Provision; tests inject shorts).
-	holdRecheck time.Duration
-	holdCap     time.Duration
 }
 
 // CaddyModule returns the Caddy module information.
@@ -68,32 +167,26 @@ func (*EdgeRoutes) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision loads the table file (written by the runner before Caddy
-// starts; a missing file starts empty and converges on the first push).
+// Provision joins the shared state and loads the table file (written by
+// the runner before Caddy starts; a missing file leaves the edge
+// unloaded — 503 — until the first push).
 func (e *EdgeRoutes) Provision(ctx caddy.Context) error {
-	e.log = ctx.Logger()
-	e.lim = NewLimiter(nil)
-	e.prober = NewProber(ProbeEvery, ProbeTimeout, nil)
-	e.holdRecheck = HoldRecheck
-	e.holdCap = HoldCap
 	if e.TablePath == "" {
 		return fmt.Errorf("edge_routes: table path is required")
 	}
-	liveEdge.Store(e)
+	shared.retain(ctx.Logger())
 	t, err := loadTable(e.TablePath)
 	if err != nil {
-		e.log.Warn("edge_routes: starting with an empty table", zap.Error(err))
-		t = &Table{Exact: make(map[string]Route)}
+		ctx.Logger().Warn("edge_routes: no table yet", zap.Error(err))
+		return nil
 	}
-	e.swap(t)
+	shared.swap(t)
 	return nil
 }
 
-// Cleanup stops the readiness probers.
+// Cleanup releases the shared state.
 func (e *EdgeRoutes) Cleanup() error {
-	if e.prober != nil {
-		e.prober.Stop()
-	}
+	shared.release()
 	return nil
 }
 
@@ -109,38 +202,6 @@ func (e *EdgeRoutes) Validate() error {
 // parseInto in caddyfile.go).
 func (e *EdgeRoutes) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return parseInto(e, d)
-}
-
-// swap installs a table and converges the prober and limiter state.
-func (e *EdgeRoutes) swap(t *Table) {
-	e.tab.Store(t)
-	keep := make(map[string]bool)
-	fleet := make(map[string]bool)
-	for _, r := range t.Exact {
-		if r.ClientZone != "" {
-			keep[r.ClientZone] = true
-		}
-		if r.AppZone != "" {
-			keep[r.AppZone] = true
-		}
-		if FleetKind(r.Kind) && r.Upstream != "" {
-			fleet[r.Upstream] = true
-		}
-	}
-	for _, w := range t.Wildcards {
-		r := w.Route
-		if r.ClientZone != "" {
-			keep[r.ClientZone] = true
-		}
-		if r.AppZone != "" {
-			keep[r.AppZone] = true
-		}
-		if FleetKind(r.Kind) && r.Upstream != "" {
-			fleet[r.Upstream] = true
-		}
-	}
-	e.prober.Track(fleet)
-	e.lim.Sweep(keep, time.Hour)
 }
 
 func loadTable(path string) (*Table, error) {
@@ -163,16 +224,22 @@ func loadTable(path string) (*Table, error) {
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
 func (e *EdgeRoutes) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	t := e.tab.Load()
-	if t == nil {
+	t := shared.tab.Load()
+	// Snapshot shared pointers under the mutex: swap/release publish
+	// them there, and the limiter/prober have their own internal locks
+	// for use after the snapshot.
+	shared.mu.Lock()
+	loaded, lim := shared.loaded, shared.lim
+	shared.mu.Unlock()
+	if t == nil || !loaded || lim == nil {
 		http.Error(w, "edge starting", http.StatusServiceUnavailable)
 		return nil
 	}
 	route, ok := t.Lookup(r.Host)
 	if !ok {
-		// No route (empty table during the boot gap): a plain 503, not a
-		// proxy to an empty upstream.
-		http.Error(w, "edge starting", http.StatusServiceUnavailable)
+		// No route with a loaded table: 404, as Caddy did for unmatched
+		// hosts. The 503 above is only for the boot gap.
+		http.Error(w, "not found", http.StatusNotFound)
 		return nil
 	}
 	if route.Kind == KindDeny {
@@ -181,14 +248,14 @@ func (e *EdgeRoutes) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 	}
 	if route.ClientRPM > 0 {
 		clientIP, _ := caddyhttp.GetVar(r.Context(), caddyhttp.ClientIPVarKey).(string)
-		if allowed, retry := e.lim.Allow(route.ClientZone, route.ClientRPM, ClientKey(clientIP)); !allowed {
+		if allowed, retry := lim.Allow(route.ClientZone, route.ClientRPM, ClientKey(clientIP)); !allowed {
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retry.Seconds())))
 			http.Error(w, "rate limited", http.StatusTooManyRequests)
 			return nil
 		}
 	}
 	if route.AppRPM > 0 {
-		if allowed, retry := e.lim.Allow(route.AppZone, route.AppRPM, "all"); !allowed {
+		if allowed, retry := lim.Allow(route.AppZone, route.AppRPM, "all"); !allowed {
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retry.Seconds())))
 			http.Error(w, "rate limited", http.StatusTooManyRequests)
 			return nil
@@ -202,24 +269,75 @@ func (e *EdgeRoutes) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 	if route.Gated {
 		caddyhttp.SetVar(r.Context(), VarGate, "1")
 	}
-	if FleetKind(route.Kind) && !e.prober.Healthy(route.Upstream) {
-		// Held before any byte is sent (POSTs are never sent early). On
-		// recovery the request proxies; on timeout return a 503 error so
-		// the static handle_errors renders the starting page — proxying
-		// anyway would stack the hold cap on top of lb_try_duration.
-		if !e.prober.WaitHealthy(route.Upstream, e.holdRecheck, e.holdCap) {
-			return caddyhttp.Error(http.StatusServiceUnavailable, fmt.Errorf("edge: upstream %s not ready", route.Upstream))
-		}
+	return next.ServeHTTP(w, r)
+}
+
+// EdgeHold is the fleet readiness hold. It runs after the wake/gate hops
+// (so those answer first) and immediately before reverse_proxy. Asleep
+// routes are never held: the wake hop already waited for the fleet.
+type EdgeHold struct{}
+
+// CaddyModule returns the Caddy module information.
+func (*EdgeHold) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "http.handlers.edge_hold",
+		New: func() caddy.Module { return new(EdgeHold) },
+	}
+}
+
+// Provision joins the shared state.
+func (EdgeHold) Provision(ctx caddy.Context) error {
+	shared.retain(ctx.Logger())
+	return nil
+}
+
+// Cleanup releases the shared state.
+func (EdgeHold) Cleanup() error {
+	shared.release()
+	return nil
+}
+
+// UnmarshalCaddyfile accepts a bare `edge_hold` directive.
+func (EdgeHold) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	d.Next()
+	if d.NextArg() {
+		return d.ArgErr()
+	}
+	return nil
+}
+
+// ServeHTTP implements caddyhttp.MiddlewareHandler.
+func (EdgeHold) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	route, _ := caddyhttp.GetVar(r.Context(), VarRoute).(string)
+	upstream, _ := caddyhttp.GetVar(r.Context(), VarUpstream).(string)
+	if !FleetKind(route) || upstream == "" {
+		return next.ServeHTTP(w, r)
+	}
+	if wake, _ := caddyhttp.GetVar(r.Context(), VarWake).(string); wake == "1" {
+		return next.ServeHTTP(w, r)
+	}
+	shared.mu.Lock()
+	prober, recheck, cap := shared.prober, shared.holdRecheck, shared.holdCap
+	shared.mu.Unlock()
+	if prober == nil || prober.Healthy(upstream) {
+		return next.ServeHTTP(w, r)
+	}
+	// Held before any byte is sent (POSTs are never sent early). On
+	// recovery the request proxies; on timeout return a 503 error so
+	// the static handle_errors renders the starting page — proxying
+	// anyway would stack the hold cap on top of lb_try_duration.
+	if !prober.WaitHealthy(upstream, recheck, cap) {
+		return caddyhttp.Error(http.StatusServiceUnavailable, fmt.Errorf("edge: upstream %s not ready", upstream))
 	}
 	return next.ServeHTTP(w, r)
 }
 
 // EdgeAdmin exposes the privileged table-push endpoint on the
 // loopback-only admin API. Caddy only discovers admin routes on modules in
-// the admin.api.* namespace, so this is a separate module ID delegating to
-// the provisioned HTTP handler. A tenant that could reach it could hijack
-// other apps' hosts; reachability is closed by the nft egress policy
-// (hostile suite covers it).
+// the admin.api.* namespace, so this is a separate module ID operating on
+// the shared state. A tenant that could reach it could hijack other apps'
+// hosts; reachability is closed by the nft egress policy (hostile suite
+// covers it).
 type EdgeAdmin struct{}
 
 // CaddyModule returns the Caddy module information.
@@ -240,23 +358,11 @@ func (*EdgeAdmin) Routes() []caddy.AdminRoute {
 	}
 }
 
-// handleAdmin serves GET/POST by delegating to the live HTTP handler,
-// which owns the table, prober and limiter state.
+// handleAdmin serves GET/POST on the shared state.
 func handleAdmin(w http.ResponseWriter, r *http.Request) error {
-	e := liveEdge.Load()
-	if e == nil {
-		return caddy.APIError{
-			HTTPStatus: http.StatusServiceUnavailable,
-			Err:        fmt.Errorf("edge: handler not provisioned yet"),
-		}
-	}
-	return e.handleAdmin(w, r)
-}
-
-func (e *EdgeRoutes) handleAdmin(w http.ResponseWriter, r *http.Request) error {
 	switch r.Method {
 	case http.MethodGet:
-		t := e.tab.Load()
+		t := shared.tab.Load()
 		var gen uint64
 		var n int
 		if t != nil {
@@ -278,11 +384,42 @@ func (e *EdgeRoutes) handleAdmin(w http.ResponseWriter, r *http.Request) error {
 		if err := t.Validate(); err != nil {
 			return caddy.APIError{HTTPStatus: http.StatusBadRequest, Err: err}
 		}
-		e.swap(&t)
-		e.log.Info("edge_routes: table pushed",
-			zap.Uint64("generation", t.Generation),
-			zap.Int("exact", len(t.Exact)),
-			zap.Int("wildcards", len(t.Wildcards)))
+		// Generations are monotonic (persisted in the file): an older
+		// table landing last would un-publish newer routes.
+		if cur := shared.tab.Load(); cur != nil && t.Generation < cur.Generation {
+			return caddy.APIError{
+				HTTPStatus: http.StatusConflict,
+				Err:        fmt.Errorf("edge: generation %d older than current %d", t.Generation, cur.Generation),
+			}
+		}
+		shared.mu.Lock()
+		log := shared.log
+		var curGen uint64
+		var hasCur bool
+		if cur := shared.tab.Load(); cur != nil {
+			curGen, hasCur = cur.Generation, true
+		}
+		shared.mu.Unlock()
+		// No-op re-pushes (the runner re-pushes every tick as a backstop)
+		// stay quiet; only a new generation logs at info, so the lane can
+		// assert pushes happened and operators can see real changes.
+		if hasCur && t.Generation == curGen {
+			if log != nil {
+				log.Debug("edge_routes: table re-push (unchanged)",
+					zap.Uint64("generation", t.Generation))
+			}
+			return writeJSON(w, map[string]any{
+				"generation": t.Generation,
+				"routes":     len(t.Exact) + len(t.Wildcards),
+			})
+		}
+		shared.swap(&t)
+		if log != nil {
+			log.Info("edge_routes: table pushed",
+				zap.Uint64("generation", t.Generation),
+				zap.Int("exact", len(t.Exact)),
+				zap.Int("wildcards", len(t.Wildcards)))
+		}
 		return writeJSON(w, map[string]any{
 			"generation": t.Generation,
 			"routes":     len(t.Exact) + len(t.Wildcards),
@@ -300,13 +437,13 @@ func writeJSON(w http.ResponseWriter, v any) error {
 	return json.NewEncoder(w).Encode(v)
 }
 
-// _ caddy.Provisioner = (*EdgeRoutes)(nil)
-// _ caddy.CleanerUpper = (*EdgeRoutes)(nil)
-// _ caddy.Validator = (*EdgeRoutes)(nil)
 var (
 	_ caddy.Provisioner           = (*EdgeRoutes)(nil)
 	_ caddy.CleanerUpper          = (*EdgeRoutes)(nil)
 	_ caddy.Validator             = (*EdgeRoutes)(nil)
-	_ caddy.AdminRouter           = (*EdgeAdmin)(nil)
+	_ caddy.Provisioner           = (*EdgeHold)(nil)
+	_ caddy.CleanerUpper          = (*EdgeHold)(nil)
 	_ caddyhttp.MiddlewareHandler = (*EdgeRoutes)(nil)
+	_ caddyhttp.MiddlewareHandler = (*EdgeHold)(nil)
+	_ caddy.AdminRouter           = (*EdgeAdmin)(nil)
 )
