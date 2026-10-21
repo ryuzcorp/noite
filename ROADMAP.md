@@ -24,10 +24,9 @@ No cloud version: every alpha user runs their own install. The bar moves from "t
 - Per-build uids and per-fleet cgroups (`memory.max`), so one fleet's growth stops shedding every app.
 - Upgrades that do not cold-boot every fleet, or at least the expected downtime per upgrade in the docs.
 - A shorter snapshot loss window ([open question 3](#open-questions-and-known-issues), Litestream).
-- E2E for storage editing, rollback, commits from the source browser and the admin page ([open question 5](#open-questions-and-known-issues)).
+- E2E for storage editing and the admin page ([open question 5](#open-questions-and-known-issues)).
 - The `bwrap` egress fallback, so platforms without `NET_ADMIN` (Railway) can run `multi` ([open question 1](#open-questions-and-known-issues)).
 - An opt-in "new version available" notice in the UI linking the changelog, with no telemetry.
-- Source maps (below).
 - `CONTRIBUTING.md`, issue templates asking for `make doctor` output, a community channel.
 - A restore drill for BYO S3 and Railway installs, where `make backup` does not apply.
 
@@ -47,6 +46,12 @@ No cloud version: every alpha user runs their own install. The bar moves from "t
 
 **Phase 3 (shipped): source maps.** Noite runs the build, so each successful deploy keeps its maps under `maps/<sha>/` in the app's own bucket prefix and the Errors tab symbolicates stacks at read time, for Worker and browser errors alike, with no upload step. Worker maps come from a shadow esbuild run with celld's exact flags (no user config); browser maps are collected only when the app's build emits them (Vite: `build.sourcemap: "hidden"`). Grouping still reads the raw frames, so fingerprints stay stable and minified renames may split an issue per deploy — each occurrence resolves against its own deploy's maps. Design record: [SPEC](SPEC.md#observability-the-pricing-substrate); user setup: Observe → Errors.
 
+## Open questions and known issues
+
+1. **Railway multi-tenancy:** `NET_ADMIN` is unavailable (verified 2026-09-27), so the nft egress policy cannot run there. Still open: probe `SETUID`/`SETGID`/`CHOWN` and unprivileged user namespaces, and decide whether a `bwrap` fallback is worth building or Railway stays `single` only.
+2. **RustFS IAM:** if unsupported at the pinned version, bundled-RustFS installs stay on root keys, i.e. effectively `single`, unless the operator moves to MinIO/S3/R2.
+3. **Snapshot loss window** (about 70 s) vs Litestream.
+4. **Control and runner restart together** on every image update. Accepted: the UI cannot act without the runner, and one node removes the two-node readiness-gate drain that stalled the old topology.
 5. **E2E gaps.** Unit tests (`bun run test`) cover the role gate, invitations, invites, rate limiter and stream loop against a SQLite-backed D1 shim; still without e2e: storage editing and the admin page. Covered in the lane: rollback (`rollback.spec.ts`) and commits from the source browser (`source-edit`/`source-tree`/`forge.spec.ts`).
 6. **Not built:** a README for `apps/noite/test` (app-author docs exist: Apps → Deploy/Build/Configure); pricing. Forge follow-ups after alpha.4: forks, notifications, a conflict-resolution UI, merge methods other than squash, issues. Preview environments shipped ([Design history](#design-history)); still open around them: a pull request page that surfaces its head branch's environment, and telemetry keyed by environment, so metrics, errors and analytics are app-wide for now ([Environments](SPEC.md#environments-previews)).
 

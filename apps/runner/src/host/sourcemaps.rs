@@ -534,16 +534,30 @@ impl SourceMapCache {
 }
 
 /// The cached manifest for `key`, if it is still valid: an expired negative
-/// entry is dropped (its bytes released) so the caller refetches.
+/// entry is dropped (its bytes and eviction slot released) so the caller
+/// refetches.
 fn cached_manifest(inner: &mut CacheInner, key: &ManifestKey) -> Option<Option<Arc<MapManifest>>> {
     let (value, _, since) = inner.manifests.get(key)?;
     if value.is_none() && since.is_some_and(|at| at.elapsed() > NEGATIVE_MANIFEST_TTL) {
-        if let Some((_, weight, _)) = inner.manifests.remove(key) {
-            inner.bytes = inner.bytes.saturating_sub(weight);
-        }
+        forget(inner, &CachedKey::Manifest(key.clone()));
         return None;
     }
     Some(value.clone())
+}
+
+/// Drop `key`'s entry, its bytes and its eviction slot. Every cached key
+/// holds exactly one slot in `order`: a key inserted twice (two reads that
+/// missed together) or re-inserted after expiring must not leave its old
+/// bytes counted or a stale slot that evicts the fresh entry early.
+fn forget(inner: &mut CacheInner, key: &CachedKey) {
+    let removed = match key {
+        CachedKey::Map(key) => inner.maps.remove(key).map(|(_, weight)| weight),
+        CachedKey::Manifest(key) => inner.manifests.remove(key).map(|(_, weight, _)| weight),
+    };
+    if let Some(weight) = removed {
+        inner.bytes = inner.bytes.saturating_sub(weight);
+        inner.order.retain(|queued| queued != key);
+    }
 }
 
 /// Insert one manifest, evicting oldest-first across maps and manifests so
@@ -554,6 +568,7 @@ fn insert_manifest(
     value: Option<Arc<MapManifest>>,
     weight: usize,
 ) {
+    forget(inner, &CachedKey::Manifest(key.clone()));
     evict_until_fit(inner, weight);
     inner.bytes += weight;
     inner.order.push_back(CachedKey::Manifest(key.clone()));
@@ -568,6 +583,7 @@ fn insert_map(
     value: Option<Arc<sourcemap::SourceMap>>,
     weight: usize,
 ) {
+    forget(inner, &CachedKey::Map(key.clone()));
     evict_until_fit(inner, weight);
     inner.bytes += weight;
     inner.order.push_back(CachedKey::Map(key.clone()));
@@ -2040,6 +2056,54 @@ mod tests {
             128,
         );
         assert!(cached_manifest(&mut inner, &key).is_some());
+    }
+
+    #[test]
+    fn reinserting_a_key_counts_its_bytes_and_slot_once() {
+        // Two reads that miss together both insert the same key. Counting it
+        // twice drifted the byte total up for good, until every insert
+        // emptied the cache; a stale slot also evicted the fresh entry early.
+        let mut inner = CacheInner::default();
+        let map = CacheKey {
+            prefix: "fleets/app".to_string(),
+            sha: "abc123".to_string(),
+            rel: "worker.js.map".to_string(),
+        };
+        insert_map(&mut inner, map.clone(), None, 300);
+        insert_map(&mut inner, map.clone(), None, 500);
+        assert_eq!(inner.bytes, 500);
+        assert_eq!(inner.order.len(), 1);
+
+        let manifest = ManifestKey {
+            prefix: "fleets/app".to_string(),
+            sha: "abc123".to_string(),
+        };
+        insert_manifest(&mut inner, manifest.clone(), None, NEGATIVE_ENTRY_WEIGHT);
+        insert_manifest(
+            &mut inner,
+            manifest.clone(),
+            Some(Arc::new(MapManifest::default())),
+            128,
+        );
+        assert_eq!(inner.bytes, 628);
+        assert_eq!(inner.order.len(), 2);
+
+        // An expired negative manifest releases its slot too, so the
+        // refetched entry is the only one queued for it.
+        let stale = Instant::now()
+            .checked_sub(NEGATIVE_MANIFEST_TTL + Duration::from_secs(1))
+            .expect("backdate");
+        let missing = ManifestKey {
+            prefix: "fleets/app".to_string(),
+            sha: "def456".to_string(),
+        };
+        insert_manifest(&mut inner, missing.clone(), None, NEGATIVE_ENTRY_WEIGHT);
+        if let Some(entry) = inner.manifests.get_mut(&missing) {
+            entry.2 = Some(stale);
+        }
+        assert!(cached_manifest(&mut inner, &missing).is_none());
+        assert_eq!(inner.order.len(), 2);
+        assert_eq!(inner.bytes, 628);
     }
 
     #[test]
