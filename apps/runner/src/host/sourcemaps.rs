@@ -513,6 +513,99 @@ fn map_object_key(prefix: &str, sha: &str, rel: &str) -> String {
     format!("{prefix}/{MAPS_DIR}/{sha}/{rel}")
 }
 
+/// celld's fleet pointer, minimally: which deployment is live. Only the
+/// prefix is needed — the deployed worker module always lands at
+/// `<fleet-prefix>/<prefix>/index.js` (celld names the module `index.js`).
+#[derive(Debug, serde::Deserialize)]
+struct DeployPointerRef {
+    #[serde(default)]
+    prefix: Option<String>,
+}
+
+/// The deployed worker bundle's key from the fleet pointer, or `None` when
+/// there is nothing to compare against (no pointer yet, unparseable, or a
+/// hostile/legacy pointer without a usable prefix).
+fn deployed_bundle_key(prefix: &str, pointer_json: &[u8]) -> Option<String> {
+    let pointer: DeployPointerRef = serde_json::from_slice(pointer_json).ok()?;
+    let dir = pointer
+        .prefix
+        .filter(|p| !p.is_empty() && !p.contains(".."))?;
+    Some(format!("{prefix}/{dir}/index.js"))
+}
+
+/// The shadow bundle minus esbuild's trailing sourcemap comment (celld
+/// deploys without `--sourcemap`, so its bytes never carry that line).
+/// Trailing newlines are ignored on both sides: they move no mapping.
+fn shadow_bundle_body(bundle: &[u8]) -> &[u8] {
+    let mut body = bundle;
+    if let Some(at) = body
+        .windows(b"//# sourceMappingURL=".len())
+        .rposition(|w| w == b"//# sourceMappingURL=")
+    {
+        // The comment is always the last line esbuild emits; anything after
+        // it would be a real difference, so only strip to the line start.
+        if let Some(line_start) = body[..at].iter().rposition(|b| *b == b'\n') {
+            body = &body[..line_start];
+        }
+    }
+    trim_trailing_newlines(body)
+}
+
+fn trim_trailing_newlines(mut bytes: &[u8]) -> &[u8] {
+    while bytes.last() == Some(&b'\n') {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+/// Byte identity between the shadow bundle and the deployed module (modulo
+/// the sourcemap comment): the proof the maps describe the served bytes.
+fn shadow_matches_deployed(shadow: &[u8], deployed: &[u8]) -> bool {
+    shadow_bundle_body(shadow) == trim_trailing_newlines(deployed)
+}
+
+/// The deployed worker bundle, or `None` when it cannot be fetched and
+/// parsed within the read cap. Small by construction (worker bundles, not
+/// client assets); anything bigger fails the check instead of eating memory.
+async fn fetch_deployed_bundle(cfg: &Config, bucket: &str, prefix: &str) -> Option<Vec<u8>> {
+    let pointer_key = format!("{prefix}/deploy/current.json");
+    let head = s3::s3_head_object(cfg, bucket, &pointer_key).await?;
+    if head.size < 0 || head.size as u64 > MAX_MAP_BYTES {
+        return None;
+    }
+    let raw = s3::s3_get_bytes(cfg, &pointer_key).await.ok()?;
+    let key = deployed_bundle_key(prefix, &raw)?;
+    let head = s3::s3_head_object(cfg, bucket, &key).await?;
+    if head.size < 0 || head.size as u64 > MAX_MAP_BYTES {
+        return None;
+    }
+    s3::s3_get_bytes(cfg, &key).await.ok()
+}
+
+/// Verify the shadow bundle against the module celld actually deployed
+/// before storing its map: a celld bump that changes bundling (flags,
+/// banner, loaders) would otherwise shift every Worker mapping with no test
+/// catching it (the e2e pins one position, this pins the bytes).
+/// `Ok` stores; `Err(note)` skips the worker map with a deploy-log note.
+async fn verified_worker_map(
+    cfg: &Config,
+    bucket: &str,
+    prefix: &str,
+    built: &WorkerMap,
+) -> Result<(), String> {
+    if built.bundle.len() as u64 > MAX_MAP_BYTES {
+        return Err("deployed bundle over 8 MiB (unverified)".to_string());
+    }
+    let deployed = fetch_deployed_bundle(cfg, bucket, prefix)
+        .await
+        .ok_or_else(|| "deployed bundle unreadable".to_string())?;
+    if shadow_matches_deployed(&built.bundle, &deployed) {
+        Ok(())
+    } else {
+        Err("shadow bundle differs from the deployed bundle".to_string())
+    }
+}
+
 /// A deploy's manifest plus its cache weight (the stored bytes, or the
 /// negative-entry weight when nothing usable was stored).
 async fn fetch_manifest(
@@ -977,6 +1070,21 @@ async fn read_capped_map(path: &Path) -> Option<Vec<u8>> {
     fits_map_bytes(bytes.len() as u64).then_some(bytes)
 }
 
+/// A built worker map plus the exact bundle bytes it was composed for: the
+/// store verifies the shadow bundle against the deployed module before
+/// storing, so a celld bump that changes bundling can never silently shift
+/// every Worker mapping.
+#[derive(Debug)]
+pub(crate) struct WorkerMap {
+    pub map: Vec<u8>,
+    /// The shadow bundle (or the entry itself for `no_bundle`), minus the
+    /// trailing `//# sourceMappingURL=` comment esbuild appends to its own
+    /// output — celld deploys without `--sourcemap`, so its bytes never
+    /// carry that line.
+    pub bundle: Vec<u8>,
+    pub note: String,
+}
+
 /// Build the Worker map: the shadow esbuild map (chained through the entry's
 /// own map when the build emitted one), or the entry's sibling map directly
 /// when celld deploys the entry as-is (`no_bundle`). `None` when there is no
@@ -986,7 +1094,7 @@ async fn read_capped_map(path: &Path) -> Option<Vec<u8>> {
 pub(crate) async fn build_worker_map(
     deploy_root: &Path,
     sandbox: &exec::Sandbox<'_>,
-) -> anyhow::Result<Option<(Vec<u8>, String)>> {
+) -> anyhow::Result<Option<WorkerMap>> {
     let Some(entry) = worker_entry(deploy_root)? else {
         return Ok(None);
     };
@@ -1007,7 +1115,12 @@ pub(crate) async fn build_worker_map(
         };
         let mut out = Vec::new();
         sanitize_sources(&inner).to_writer(&mut out)?;
-        return Ok(Some((out, "entry map (no_bundle)".to_string())));
+        let bundle = tokio::fs::read(&entry.abs).await?;
+        return Ok(Some(WorkerMap {
+            map: out,
+            bundle,
+            note: "entry map (no_bundle)".to_string(),
+        }));
     }
     run_shadow_esbuild(deploy_root, &entry, sandbox, sibling_bytes).await
 }
@@ -1022,7 +1135,7 @@ async fn run_shadow_esbuild(
     entry: &WorkerEntry,
     sandbox: &exec::Sandbox<'_>,
     sibling_bytes: Option<Vec<u8>>,
-) -> anyhow::Result<Option<(Vec<u8>, String)>> {
+) -> anyhow::Result<Option<WorkerMap>> {
     let Some(entry_arg) = entry.rel.to_str() else {
         anyhow::bail!("worker entry is not valid UTF-8");
     };
@@ -1083,7 +1196,11 @@ async fn run_shadow_esbuild(
     // keeps it for inspection: drop the sandbox tmp dir either way so no
     // `index.js.map` decoy sits beside the real entry map.
     let _ = tokio::fs::remove_dir_all(deploy_root.join(".tmp-sandbox")).await;
-    Ok(Some((out, note)))
+    Ok(Some(WorkerMap {
+        map: out,
+        bundle: raw,
+        note,
+    }))
 }
 
 /// Drop absolute host paths (symlink escapes, build-host absolutes) down to
@@ -1220,7 +1337,7 @@ pub async fn store_deploy_maps(
     pool: &SqlitePool,
     cfg: &Config,
     target: &StoreMaps<'_>,
-    worker_map: Result<Option<(Vec<u8>, String)>, String>,
+    worker_map: Result<Option<WorkerMap>, String>,
 ) -> anyhow::Result<String> {
     let StoreMaps {
         app_id,
@@ -1241,6 +1358,13 @@ pub async fn store_deploy_maps(
         anyhow::bail!("bucket {bucket_uri} is outside this install");
     };
     let maps_prefix = prefix;
+    // The fleet's own prefix (the maps dir's parent): where celld's deploy
+    // pointer and modules live. Always present — it is `maps_prefix` minus
+    // the `/maps/<sha>` this function appended.
+    let fleet_prefix = maps_prefix
+        .strip_suffix(&format!("/maps/{sha}"))
+        .unwrap_or(&maps_prefix)
+        .to_string();
 
     let mut manifest = MapManifest::default();
     let mut notes = Vec::new();
@@ -1260,12 +1384,17 @@ pub async fn store_deploy_maps(
     });
     let mut worker_bytes = 0u64;
     match worker_map {
-        Ok(Some((bytes, note))) => {
-            worker_bytes = bytes.len() as u64;
-            let key = format!("{maps_prefix}/{WORKER_MAP_FILE}");
-            put_bytes(cfg, &key, &bytes).await?;
-            manifest.worker = Some(WORKER_MAP_FILE.to_string());
-            notes.push(format!("{WORKER_MAP_FILE} ({note})"));
+        Ok(Some(built)) => {
+            worker_bytes = built.map.len() as u64;
+            match verified_worker_map(cfg, &cfg.s3_bucket, &fleet_prefix, &built).await {
+                Ok(()) => {
+                    let key = format!("{maps_prefix}/{WORKER_MAP_FILE}");
+                    put_bytes(cfg, &key, &built.map).await?;
+                    manifest.worker = Some(WORKER_MAP_FILE.to_string());
+                    notes.push(format!("{} ({})", WORKER_MAP_FILE, built.note));
+                }
+                Err(note) => notes.push(format!("{WORKER_MAP_FILE} skipped ({note})")),
+            }
         }
         Ok(None) => notes.push("no worker map (no bundleable entry)".to_string()),
         Err(note) => notes.push(format!("no worker map ({note})")),
@@ -1896,6 +2025,39 @@ mod tests {
         assert!(keep.contains(format!("sha{:02}", KEEP_DEPLOY_SHAS - 1).as_str()));
         assert!(!keep.contains(format!("sha{:02}", KEEP_DEPLOY_SHAS).as_str()));
         assert!(keep.len() <= KEEP_DEPLOY_SHAS + 1);
+    }
+
+    #[test]
+    fn deployed_bundle_key_comes_from_the_fleet_pointer() {
+        let pointer = br#"{"script_name":"shop","version":"abc123","prefix":"deploy/shop/abc123","rollout":{"percent":100}}"#;
+        assert_eq!(
+            deployed_bundle_key("fleets/shop", pointer),
+            Some("fleets/shop/deploy/shop/abc123/index.js".to_string())
+        );
+        // Legacy or hostile pointers without a usable prefix: nothing to
+        // compare against, so the guard skips instead of fetching sideways.
+        assert_eq!(deployed_bundle_key("fleets/a", b"{}"), None);
+        assert_eq!(
+            deployed_bundle_key("fleets/a", b"{\"prefix\":\"../evil\"}"),
+            None
+        );
+        assert_eq!(deployed_bundle_key("fleets/a", b"not json"), None);
+    }
+
+    #[test]
+    fn shadow_matches_deployed_ignores_only_the_trailing_comment() {
+        let deployed = b"var a = 1;\nconsole.log(a);\n";
+        let mut shadow = deployed.to_vec();
+        shadow.extend_from_slice(b"//# sourceMappingURL=index.js.map\n");
+        assert!(shadow_matches_deployed(&shadow, deployed));
+        assert!(shadow_matches_deployed(deployed, deployed));
+        // A real content difference — e.g. a celld banner change — fails
+        // closed so the maps never describe the wrong bytes.
+        let mut drifted = b"var require = (id) => {};\n".to_vec();
+        drifted.extend_from_slice(deployed);
+        drifted.extend_from_slice(b"//# sourceMappingURL=index.js.map\n");
+        assert!(!shadow_matches_deployed(&drifted, deployed));
+        assert!(!shadow_matches_deployed(b"var a = 1;\n", b"var a = 2;\n"));
     }
 
     #[tokio::test]
