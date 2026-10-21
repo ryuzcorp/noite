@@ -60,20 +60,41 @@ pub use aws::AwsIam;
 pub use minio::MinioAdmin;
 
 /// One key pair handed to a fleet or a release command.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AppCredentials {
     pub access_key: String,
     pub secret_key: String,
 }
 
+/// Secrets never reach logs: a `Debug` that printed the secret would leak it
+/// through any `{:?}` on a fleet spec, deploy error or test failure.
+impl std::fmt::Debug for AppCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppCredentials")
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"[redacted]")
+            .finish()
+    }
+}
+
 /// A key a provider just created. `handle` is what
 /// [`CredentialProvider::revoke`] needs to delete it (the IAM user name, the
 /// service account's access key).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MintedKey {
     pub handle: String,
     pub access_key: String,
     pub secret_key: String,
+}
+
+impl std::fmt::Debug for MintedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintedKey")
+            .field("handle", &self.handle)
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"[redacted]")
+            .finish()
+    }
 }
 
 /// The store's own IAM: creates and deletes keys limited to one prefix.
@@ -91,10 +112,11 @@ pub trait CredentialProvider: Send + Sync {
     fn revoke<'a>(&'a self, handle: &'a str) -> BoxFuture<'a, anyhow::Result<()>>;
 }
 
-/// The IAM policy every provider attaches: objects under `prefix`, a listing
-/// only with a `prefix` condition inside it, and the bucket's location (SDKs
-/// ask for it). No bucket-wide listing and no HEAD on the bucket: both would
-/// reveal other apps' key names.
+/// The IAM policy every provider attaches: objects under `prefix` (including
+/// multipart completion on them), listings only with a `prefix` condition
+/// inside them (including in-progress multipart uploads), and the bucket's
+/// location (SDKs ask for it). No bucket-wide listing and no HEAD on the
+/// bucket: both would reveal other apps' key names.
 pub fn prefix_policy(bucket: &str, prefix: &str) -> String {
     serde_json::json!({
         "Version": "2012-10-17",
@@ -106,13 +128,14 @@ pub fn prefix_policy(bucket: &str, prefix: &str) -> String {
                     "s3:DeleteObject",
                     "s3:AbortMultipartUpload",
                     "s3:ListMultipartUploadParts",
+                    "s3:CompleteMultipartUpload",
                 ],
                 "Effect": "Allow",
                 "Resource": [format!("arn:aws:s3:::{bucket}/{prefix}*")],
                 "Sid": "PrefixObjects",
             },
             {
-                "Action": ["s3:ListBucket"],
+                "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
                 "Condition": {"StringLike": {"s3:prefix": [format!("{prefix}*")]}},
                 "Effect": "Allow",
                 "Resource": [format!("arn:aws:s3:::{bucket}")],
@@ -254,8 +277,9 @@ impl Credentials {
 
 /// `auto` against an unknown store: does it speak the MinIO admin API with
 /// these keys? Yes → scoped through it; a definite no → root with the
-/// reason. A store that cannot answer fails the boot rather than guess,
-/// because the answer decides what every fleet holds.
+/// reason. Keys the store refuses fail the boot instead of silently
+/// downgrading every fleet to root, because the answer decides what every
+/// fleet holds.
 pub async fn detect(store: &StoreAccess) -> anyhow::Result<Credentials> {
     let admin = MinioAdmin::minio(store.clone());
     match admin.probe().await? {

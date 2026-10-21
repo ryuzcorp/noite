@@ -87,6 +87,10 @@ impl AwsIam {
         Ok(text)
     }
 
+    /// IAM allows 64 chars: `noite-` plus a sanitized prefix truncated to 47
+    /// plus `-` plus 8 hex of SHA-256(prefix) (62 max). The hash keeps names
+    /// unique past the truncation point, where two long prefixes would
+    /// otherwise collide and wedge on `EntityAlreadyExists`.
     fn user_name(prefix: &str) -> String {
         let mut name: String = prefix
             .chars()
@@ -98,7 +102,12 @@ impl AwsIam {
                 }
             })
             .collect();
-        name.truncate(60);
+        if name.len() > 47 {
+            use sha2::{Digest, Sha256};
+            let hash = super::hex_encode(Sha256::digest(prefix.as_bytes()).as_slice());
+            name.truncate(47);
+            return format!("noite-{name}-{}", &hash[..8]);
+        }
         format!("noite-{name}")
     }
 }
@@ -145,12 +154,28 @@ impl CredentialProvider for AwsIam {
         Box::pin(async move {
             let user = Self::user_name(prefix);
             let policy = super::prefix_policy(bucket, prefix);
-            self.iam(&[
-                ("Action", "CreateUser"),
-                ("UserName", &user),
-                ("Version", "2010-05-08"),
-            ])
-            .await?;
+            if let Err(e) = self
+                .iam(&[
+                    ("Action", "CreateUser"),
+                    ("UserName", &user),
+                    ("Version", "2010-05-08"),
+                ])
+                .await
+            {
+                // A half-minted user from a crashed mint (user without key):
+                // clear it and retry once, so a scope can't wedge until
+                // someone cleans up IAM by hand.
+                if !format!("{e:#}").contains("EntityAlreadyExists") {
+                    return Err(e);
+                }
+                self.revoke(&user).await?;
+                self.iam(&[
+                    ("Action", "CreateUser"),
+                    ("UserName", &user),
+                    ("Version", "2010-05-08"),
+                ])
+                .await?;
+            }
             let policy_result = self
                 .iam(&[
                     ("Action", "PutUserPolicy"),
@@ -312,6 +337,124 @@ mod tests {
     fn user_name_stays_in_iam_alphabet() {
         assert_eq!(AwsIam::user_name("fleets/my.app/"), "noite-fleets-my.app-");
         assert!(AwsIam::user_name("envs/a/b/").len() < 64);
+    }
+
+    /// Maximum-length environment prefixes stay within IAM's 64 chars and
+    /// stay distinct past the truncation point.
+    #[test]
+    fn user_name_bounds_long_prefixes() {
+        let a = format!("envs/{}/{}", "a".repeat(64), "x".repeat(64));
+        let b = format!("envs/{}/{}", "a".repeat(64), "y".repeat(64));
+        let na = AwsIam::user_name(&a);
+        let nb = AwsIam::user_name(&b);
+        assert!(na.len() <= 64, "{na}");
+        assert!(nb.len() <= 64, "{nb}");
+        assert_ne!(na, nb, "tails must differ: {na} vs {nb}");
+        assert_eq!(AwsIam::user_name(&a), na, "deterministic");
+    }
+
+    /// A stateful stub: the first CreateUser reports a half-minted user.
+    async fn recovery_stub() -> (
+        tokio::task::JoinHandle<()>,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        let actions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let creates: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let task_actions = actions.clone();
+        let task_creates = creates.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let actions = task_actions.clone();
+                let creates = task_creates.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 65536];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let action = req
+                        .split("Action=")
+                        .nth(1)
+                        .unwrap_or_default()
+                        .split('&')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    actions.lock().expect("actions lock").push(action.clone());
+                    let (status, body) = match action.as_str() {
+                        "CreateUser" if creates.fetch_add(1, Ordering::SeqCst) == 0 => (
+                            400,
+                            "<ErrorResponse><Error><Code>EntityAlreadyExists</Code></Error></Error>",
+                        ),
+                        "CreateUser" => (
+                            200,
+                            "<CreateUserResponse><User><UserName>u</UserName></User></CreateUserResponse>",
+                        ),
+                        "CreateAccessKey" => (
+                            200,
+                            "<CreateAccessKeyResponse><AccessKey><AccessKeyId>AKNEW</AccessKeyId><SecretAccessKey>SKNEW</SecretAccessKey></AccessKey></CreateAccessKeyResponse>",
+                        ),
+                        "ListAccessKeys" => (
+                            200,
+                            "<ListAccessKeysResponse><AccessKeyMetadata><AccessKeyId>AKOLD</AccessKeyId></AccessKeyMetadata></ListAccessKeysResponse>",
+                        ),
+                        _ => (200, "<Response/>"),
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (handle, format!("http://127.0.0.1:{}", addr.port()), actions)
+    }
+
+    /// A half-minted user (EntityAlreadyExists on create) is cleared and
+    /// retried instead of wedging the scope.
+    #[tokio::test]
+    async fn mint_recovers_from_half_minted_user() {
+        let (_handle, endpoint, actions) = recovery_stub().await;
+        let store = StoreAccess {
+            endpoint: "https://s3.us-east-1.amazonaws.com".into(),
+            region: "us-east-1".into(),
+            access_key: "AK".into(),
+            secret_key: "SK".into(),
+        };
+        let provider = AwsIam::test(store, endpoint);
+        let minted = provider
+            .mint("noite", "fleets/a/")
+            .await
+            .expect("mint recovers");
+        assert_eq!(minted.access_key, "AKNEW");
+        let actions = actions.lock().expect("actions lock");
+        for expected in [
+            "CreateUser",
+            "ListAccessKeys",
+            "DeleteAccessKey",
+            "DeleteUserPolicy",
+            "DeleteUser",
+            "CreateUser",
+            "PutUserPolicy",
+            "CreateAccessKey",
+        ] {
+            assert!(
+                actions.contains(&expected.to_string()),
+                "saw {expected}: {actions:?}"
+            );
+        }
     }
 
     /// The provider speaks the IAM Query protocol: user, inline prefix

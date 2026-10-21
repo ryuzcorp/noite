@@ -11,8 +11,8 @@ use futures::future::BoxFuture;
 
 use super::{
     decrypt, encrypt, ensure, fleet_credentials, prefix_policy, revoke_app, revoke_environment,
-    sweep, tenant_process_credentials, CredentialProvider, Credentials, MintedKey, ProviderSetting,
-    Scope, StoreAccess,
+    sweep, tenant_process_credentials, AppCredentials, CredentialProvider, Credentials, MintedKey,
+    ProviderSetting, Scope, StoreAccess,
 };
 use crate::config::{config_for_tests, Config, Tenancy};
 use crate::db;
@@ -380,10 +380,43 @@ fn prefix_policy_scopes_to_one_prefix() {
     );
     assert_eq!(list["Resource"], serde_json::json!(["arn:aws:s3:::noite"]));
     assert!(by_sid.contains_key("BucketLocation"));
+    // Multipart uploads complete under the prefix: the object-level complete
+    // call and the bucket-level in-progress listing (under the same prefix
+    // condition, so other apps' uploads stay hidden).
+    let list_actions: Vec<&str> = list["Action"]
+        .as_array()
+        .expect("actions")
+        .iter()
+        .map(|a| a.as_str().expect("action"))
+        .collect();
+    assert!(actions.contains(&"s3:CompleteMultipartUpload"));
+    assert!(list_actions.contains(&"s3:ListBucketMultipartUploads"));
     // The neighbour's prefix and the environment cross-prefix appear nowhere.
     let text = serde_json::to_string(&policy).expect("json");
     assert!(!text.contains("other"));
     assert!(!text.contains("envs/"));
+}
+
+/// Secrets never reach logs: `Debug` redacts them on both credential types.
+#[test]
+fn debug_redacts_secrets() {
+    let creds = AppCredentials {
+        access_key: "AK".into(),
+        secret_key: "TOPSECRET".into(),
+    };
+    let minted = MintedKey {
+        handle: "user-1".into(),
+        access_key: "AK".into(),
+        secret_key: "TOPSECRET".into(),
+    };
+    for rendered in [format!("{creds:?}"), format!("{minted:?}")] {
+        assert!(!rendered.contains("TOPSECRET"), "{rendered}");
+        assert!(rendered.contains("[redacted]"), "{rendered}");
+    }
+    assert!(
+        format!("{creds:?}").contains("AK"),
+        "access key stays visible"
+    );
 }
 
 /// Encrypted rows round-trip and bind to their scope; a row copied onto
@@ -542,18 +575,43 @@ async fn scoped_key_enforced_by_rustfs() {
     };
     let client = reqwest::Client::new();
     // Signed S3 call with an arbitrary key pair (proves enforcement, not
-    // just minting): PUT/GET bodies are small, LIST is one page.
+    // just minting): PUT/GET bodies are small, LIST is one page. Returns the
+    // status, body, and the ETag / version-id response headers multipart
+    // and versioning assertions need.
     async fn s3(
         client: &reqwest::Client,
         endpoint: &str,
-        access: &str,
-        secret: &str,
+        keys: (&str, &str),
         method: &str,
         path_qs: &str,
+        headers: &[(&str, &str)],
         body: &[u8],
-    ) -> (u16, String) {
+    ) -> (u16, String, Option<String>, Option<String>) {
         use sha2::{Digest, Sha256};
         let (path, qs) = path_qs.split_once('?').unwrap_or((path_qs, ""));
+        // SigV4 signs `name=` for valueless subresources (`?uploads`,
+        // `?versioning`): the raw form signs a different string than the
+        // store verifies. Normalize before signing and sending.
+        let qs: String = {
+            let mut parts: Vec<&str> = qs.split('&').filter(|p| !p.is_empty()).collect();
+            parts.sort_unstable();
+            parts
+                .iter()
+                .map(|p| {
+                    if p.contains('=') {
+                        (*p).to_string()
+                    } else {
+                        format!("{p}=")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("&")
+        };
+        let path_qs = if qs.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{qs}")
+        };
         let payload_hash = super::hex_encode(Sha256::digest(body).as_slice());
         let (amz_date, date_stamp) = super::sigv4_now();
         let url = reqwest::Url::parse(endpoint).expect("endpoint");
@@ -564,41 +622,59 @@ async fn scoped_key_enforced_by_rustfs() {
         let auth = super::SigV4 {
             method,
             uri: path,
-            query: qs,
+            query: qs.as_str(),
             host: &host,
             region: "us-east-1",
             service: "s3",
-            access_key: access,
-            secret_key: secret,
+            access_key: keys.0,
+            secret_key: keys.1,
             payload_hash: &payload_hash,
             amz_date: &amz_date,
             date_stamp: &date_stamp,
         }
         .authorization();
-        let resp = client
+        let mut req = client
             .request(
                 method.parse().expect("method"),
                 format!("{endpoint}{path_qs}"),
             )
             .header("x-amz-date", amz_date)
             .header("x-amz-content-sha256", payload_hash)
-            .header("authorization", auth)
-            .body(body.to_vec())
-            .send()
-            .await
-            .expect("s3 call");
+            .header("authorization", auth);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = req.body(body.to_vec()).send().await.expect("s3 call");
         let status = resp.status().as_u16();
+        let etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let version = resp
+            .headers()
+            .get("x-amz-version-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let text = resp.text().await.unwrap_or_default();
-        (status, text)
+        (status, text, etag, version)
+    }
+
+    fn tag(text: &str, name: &str) -> Option<String> {
+        let open = format!("<{name}>");
+        let close = format!("</{name}>");
+        let start = text.find(&open)? + open.len();
+        let end = text[start..].find(&close)?;
+        Some(text[start..start + end].to_string())
     }
     let bucket = format!("noite-scope-test-{}", std::process::id());
-    let (status, _) = s3(
+    let (status, ..) = s3(
         &client,
         &endpoint,
-        &root_access,
-        &root_secret,
+        (&root_access, &root_secret),
         "PUT",
         &format!("/{bucket}"),
+        &[],
         b"",
     )
     .await;
@@ -607,24 +683,24 @@ async fn scoped_key_enforced_by_rustfs() {
     let minted = provider.mint(&bucket, "fleets/shop/").await.expect("mint");
     let (access, secret) = (minted.access_key.clone(), minted.secret_key.clone());
     // Its own prefix: write, read, list.
-    let (status, _) = s3(
+    let (status, ..) = s3(
         &client,
         &endpoint,
-        &access,
-        &secret,
+        (&access, &secret),
         "PUT",
         &format!("/{bucket}/fleets/shop/a.txt"),
+        &[],
         b"hi",
     )
     .await;
     assert_eq!(status, 200, "scoped key writes its own prefix");
-    let (status, body) = s3(
+    let (status, body, ..) = s3(
         &client,
         &endpoint,
-        &access,
-        &secret,
+        (&access, &secret),
         "GET",
         &format!("/{bucket}/fleets/shop/a.txt"),
+        &[],
         b"",
     )
     .await;
@@ -633,86 +709,281 @@ async fn scoped_key_enforced_by_rustfs() {
         (200, "hi"),
         "scoped key reads its own prefix"
     );
-    let (status, _) = s3(
+    let (status, ..) = s3(
         &client,
         &endpoint,
-        &access,
-        &secret,
+        (&access, &secret),
         "GET",
         &format!("/{bucket}/?list-type=2&prefix=fleets%2Fshop%2F"),
+        &[],
         b"",
     )
     .await;
     assert_eq!(status, 200, "scoped key lists its own prefix");
     // Another app, the environment prefix and the bucket root: refused.
-    let (status, _) = s3(
+    let (status, ..) = s3(
         &client,
         &endpoint,
-        &access,
-        &secret,
+        (&access, &secret),
         "PUT",
         &format!("/{bucket}/fleets/other/e.txt"),
+        &[],
         b"hi",
     )
     .await;
     assert_eq!(status, 403, "scoped key cannot write another app");
-    let (status, _) = s3(
+    let (status, ..) = s3(
         &client,
         &endpoint,
-        &access,
-        &secret,
+        (&access, &secret),
         "GET",
         &format!("/{bucket}/envs/shop/preview/d.txt"),
+        &[],
         b"",
     )
     .await;
     assert_eq!(status, 403, "app key cannot read the environment prefix");
-    let (status, _) = s3(
+    let (status, ..) = s3(
         &client,
         &endpoint,
-        &access,
-        &secret,
+        (&access, &secret),
         "GET",
         &format!("/{bucket}/?list-type=2&delimiter=%2F"),
+        &[],
         b"",
     )
     .await;
     assert_eq!(status, 403, "scoped key cannot list the bucket root");
-    // Revoked: the store forgets the key entirely.
-    provider.revoke(&minted.handle).await.expect("revoke");
-    let (status, _) = s3(
+    // The trailing slash is the boundary: `fleets/shop` without it, and the
+    // neighbour prefix under a delimiter, are both refused.
+    let (status, ..) = s3(
         &client,
         &endpoint,
-        &access,
-        &secret,
+        (&access, &secret),
+        "GET",
+        &format!("/{bucket}/?list-type=2&prefix=fleets%2Fshop"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(status, 403, "prefix without trailing slash is refused");
+    let (status, ..) = s3(
+        &client,
+        &endpoint,
+        (&access, &secret),
+        "GET",
+        &format!("/{bucket}/?delimiter=%2F&list-type=2&prefix=fleets%2Fother%2F"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(status, 403, "neighbour prefix under a delimiter is refused");
+    // Copying from outside the prefix is refused even though the destination
+    // is inside it.
+    let (status, ..) = s3(
+        &client,
+        &endpoint,
+        (&access, &secret),
+        "PUT",
+        &format!("/{bucket}/fleets/shop/copied.txt"),
+        &[(
+            "x-amz-copy-source",
+            &format!("/{bucket}/fleets/other/secret.txt"),
+        )],
+        b"",
+    )
+    .await;
+    assert_eq!(status, 403, "copy from outside the prefix is refused");
+    // Versioned reads and deletes outside the prefix are refused. The runner
+    // enables bucket versioning, so version ids exist here.
+    let (status, ..) = s3(
+        &client,
+        &endpoint,
+        (&root_access, &root_secret),
+        "PUT",
+        &format!("/{bucket}?versioning"),
+        &[],
+        br#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>"#,
+    )
+    .await;
+    assert!((200..300).contains(&status), "enable versioning: {status}");
+    let (status, _, _, version) = s3(
+        &client,
+        &endpoint,
+        (&access, &secret),
+        "PUT",
+        &format!("/{bucket}/fleets/shop/v.txt"),
+        &[],
+        b"v",
+    )
+    .await;
+    assert_eq!(status, 200, "versioned write under the prefix");
+    let version = version.expect("version id");
+    for (method, path, what) in [
+        (
+            "GET",
+            format!("/{bucket}/fleets/other/x.txt?versionId={version}"),
+            "GetObjectVersion",
+        ),
+        (
+            "GET",
+            format!("/{bucket}/?prefix=fleets%2Fother%2F&versions="),
+            "ListVersions",
+        ),
+        (
+            "DELETE",
+            format!("/{bucket}/fleets/other/x.txt?versionId={version}"),
+            "DeleteObjectVersion",
+        ),
+    ] {
+        let (status, ..) = s3(
+            &client,
+            &endpoint,
+            (&access, &secret),
+            method,
+            &path,
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(status, 403, "{what} outside the prefix is refused");
+    }
+    // A multipart upload completes inside the prefix (the policy's
+    // CompleteMultipartUpload + ListBucketMultipartUploadParts exist for
+    // exactly this).
+    let (status, body, ..) = s3(
+        &client,
+        &endpoint,
+        (&access, &secret),
+        "POST",
+        &format!("/{bucket}/fleets/shop/big.bin?uploads"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(status, 200, "initiate multipart upload: {body}");
+    let upload = tag(&body, "UploadId").expect("upload id");
+    let (status, _, etag, ..) = s3(
+        &client,
+        &endpoint,
+        (&access, &secret),
+        "PUT",
+        &format!("/{bucket}/fleets/shop/big.bin?partNumber=1&uploadId={upload}"),
+        &[],
+        b"hello-mpu",
+    )
+    .await;
+    assert_eq!(status, 200, "upload part");
+    let etag = etag.expect("part etag");
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (status, ..) = s3(
+        &client,
+        &endpoint,
+        (&access, &secret),
+        "POST",
+        &format!("/{bucket}/fleets/shop/big.bin?uploadId={upload}"),
+        &[],
+        complete.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 200, "complete multipart upload");
+    let (status, body, ..) = s3(
+        &client,
+        &endpoint,
+        (&access, &secret),
+        "GET",
+        &format!("/{bucket}/fleets/shop/big.bin"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "hello-mpu"),
+        "multipart object reads back"
+    );
+    // Revoked: the store forgets the key entirely.
+    provider.revoke(&minted.handle).await.expect("revoke");
+    let (status, ..) = s3(
+        &client,
+        &endpoint,
+        (&access, &secret),
         "GET",
         &format!("/{bucket}/fleets/shop/a.txt"),
+        &[],
         b"",
     )
     .await;
     assert_ne!(status, 200, "revoked key is refused");
     // Tidy the bucket; the provider rows are the caller's business.
-    let (status, _) = s3(
+    for key in [
+        "fleets/shop/a.txt",
+        "fleets/shop/v.txt",
+        "fleets/shop/big.bin",
+    ] {
+        let (status, ..) = s3(
+            &client,
+            &endpoint,
+            (&root_access, &root_secret),
+            "DELETE",
+            &format!("/{bucket}/{key}"),
+            &[],
+            b"",
+        )
+        .await;
+        assert!(
+            (200..300).contains(&status) || status == 404,
+            "cleanup object {key}: {status}"
+        );
+    }
+    // Versioning is on: plain deletes leave versions and delete markers
+    // behind, so remove every version of every key before dropping the bucket.
+    let (status, body, ..) = s3(
         &client,
         &endpoint,
-        &root_access,
-        &root_secret,
-        "DELETE",
-        &format!("/{bucket}/fleets/shop/a.txt"),
+        (&root_access, &root_secret),
+        "GET",
+        &format!("/{bucket}/?prefix=fleets%2Fshop%2F&versions="),
+        &[],
         b"",
     )
     .await;
-    assert!(
-        (200..300).contains(&status) || status == 404,
-        "cleanup object: {status}"
-    );
-    let (status, _) = s3(
+    assert_eq!(status, 200, "list versions: {body}");
+    let mut cleaned = 0;
+    for chunk in body
+        .split("<Version>")
+        .skip(1)
+        .chain(body.split("<DeleteMarker>").skip(1))
+    {
+        let (Some(key), Some(version)) = (tag(chunk, "Key"), tag(chunk, "VersionId")) else {
+            continue;
+        };
+        let (status, ..) = s3(
+            &client,
+            &endpoint,
+            (&root_access, &root_secret),
+            "DELETE",
+            &format!("/{bucket}/{key}?versionId={version}"),
+            &[],
+            b"",
+        )
+        .await;
+        assert!(
+            (200..300).contains(&status) || status == 404,
+            "delete version of {key}: {status}"
+        );
+        cleaned += 1;
+    }
+    assert!(cleaned > 0, "expected versioned objects to clean");
+    let (status, ..) = s3(
         &client,
         &endpoint,
-        &root_access,
-        &root_secret,
+        (&root_access, &root_secret),
         "DELETE",
         &format!("/{bucket}"),
+        &[],
         b"",
     )
     .await;

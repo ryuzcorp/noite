@@ -18,7 +18,38 @@ Store connection variables (`S3_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCE
 Fleets and release commands hold keys that reach only their own prefix (`fleets/{slug}/`, or `envs/{slug}/{label}/` for a preview environment). `NOITE_CREDENTIAL_PROVIDER` (`auto` default) decides how, per store:
 
 - **Bundled RustFS and MinIO** (`auto`, or `minio` to force): keys are minted through the MinIO-compatible admin API. Nothing to configure.
-- **AWS S3**: set `NOITE_CREDENTIAL_PROVIDER=aws`. The keys above must be IAM-capable (the runner creates one IAM user per app and environment, with an inline prefix policy, and mints an access key for it). Without it, fleets keep the root keys as an explicit `root` mode.
+- **AWS S3**: set `NOITE_CREDENTIAL_PROVIDER=aws`. The keys above must be IAM-capable (the runner creates one IAM user per app and environment, with an inline prefix policy, and mints an access key for it). Without it, fleets keep the root keys as an explicit `root` mode. Minimal policy for the runner's keys: user administration on the names it mints, plus the data permissions the bucket layout needs:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateUser",
+        "iam:DeleteUser",
+        "iam:PutUserPolicy",
+        "iam:DeleteUserPolicy",
+        "iam:CreateAccessKey",
+        "iam:ListAccessKeys",
+        "iam:DeleteAccessKey"
+      ],
+      "Resource": "arn:aws:iam::<account-id>:user/noite-*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::<bucket>/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": "arn:aws:s3:::<bucket>"
+    }
+  ]
+}
+```
 - **Cloudflare R2**: R2 API tokens scope to buckets, not prefixes, so there are no long-lived prefix-scoped keys. Fleets keep the root keys as an explicit `root` mode; the bucket layout stays one bucket per install. If that is not acceptable for your tenants, move the install to MinIO or S3.
 - **Anything else**: `auto` probes the store for the MinIO admin API once the bucket answers. If it answers, keys are scoped; if not, fleets keep the root keys as an explicit `root` mode, named in the boot log, `/ready` and `make doctor`.
 

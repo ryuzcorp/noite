@@ -114,27 +114,47 @@ impl MinioAdmin {
     }
 
     /// Does this store speak the MinIO admin API with these keys? `Ok(())`
-    /// on any answer the API itself gives (200 with an encrypted body);
-    /// `Err(why)` when the store definitely does not (wrong path, wrong
-    /// signature scheme, wrong keys).
+    /// on any answer the API itself gives (200 with an encrypted body).
+    /// A 401/403 is the API answering that the keys are wrong: that fails
+    /// the boot with a credential error rather than silently downgrading
+    /// every fleet to root keys. Anything else (404, 501, transport) means
+    /// no admin API here: `Ok(Err(..))`, and the caller runs root.
     pub async fn probe(&self) -> anyhow::Result<Result<(), String>> {
         // `info` is the current name; older MinIO answers `server-info`.
         for path in ["/minio/admin/v3/info", "/minio/admin/v3/server-info"] {
             match self.call("GET", path, "", b"").await {
                 Ok((200, _)) => return Ok(Ok(())),
-                // A signed-shaped refusal means the API is there but the
-                // keys are wrong: definite, not transient.
                 Ok((status, body)) if status == 401 || status == 403 => {
-                    return Ok(Err(format!(
-                        "HTTP {status} {}",
+                    return Err(anyhow::anyhow!(
+                        "store refused the admin credentials (HTTP {status} {}): check the S3 keys",
                         String::from_utf8_lossy(&body)
-                    )));
+                    ));
                 }
                 // Anything else (404, 501, transport): try the next path.
                 Ok(_) | Err(_) => continue,
             }
         }
         Ok(Err("no MinIO admin API".into()))
+    }
+    /// The policy this provider attaches: the shared prefix policy, except
+    /// on RustFS, whose 1.0.x policy engine rejects the
+    /// `s3:CompleteMultipartUpload` name at create time (verified against
+    /// 1.0.0 and 1.0.3). RustFS maps completion onto `s3:PutObject` instead,
+    /// so its keys complete multipart uploads without the action; MinIO and
+    /// AWS get the full policy.
+    fn policy(&self, bucket: &str, prefix: &str) -> String {
+        let full = super::prefix_policy(bucket, prefix);
+        if self.label != "rustfs" {
+            return full;
+        }
+        let mut policy: serde_json::Value =
+            serde_json::from_str(&full).expect("prefix policy is valid json");
+        for statement in policy["Statement"].as_array_mut().expect("statements") {
+            if let Some(actions) = statement["Action"].as_array_mut() {
+                actions.retain(|a| a != "s3:CompleteMultipartUpload");
+            }
+        }
+        policy.to_string()
     }
 }
 
@@ -151,7 +171,10 @@ impl CredentialProvider for MinioAdmin {
         Box::pin(async move {
             let access_key = format!("noite{}", super::random_key(15));
             let secret_key = super::random_key(40);
-            let policy_name = format!("noite-{}", sanitize(prefix));
+            // The policy is named per key, not per prefix: revoke only knows
+            // the handle (the access key), so the name it deletes must be
+            // derivable from the key alone.
+            let policy_name = format!("noite-{}", sanitize(&access_key));
             // The request body is JSON the API encrypts (madmin `SetUserReq`):
             // the raw secret alone is refused with "failed to decrypt".
             let user_body = serde_json::json!({
@@ -177,7 +200,7 @@ impl CredentialProvider for MinioAdmin {
                     "PUT",
                     "/minio/admin/v3/add-canned-policy",
                     &format!("name={policy_name}"),
-                    super::prefix_policy(bucket, prefix).as_bytes(),
+                    self.policy(bucket, prefix).as_bytes(),
                 )
                 .await?;
             if status != 200 {
@@ -318,6 +341,92 @@ fn argon2_key(secret: &str, salt: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn stub_store(endpoint: String) -> StoreAccess {
+        StoreAccess {
+            endpoint,
+            region: "us-east-1".into(),
+            access_key: "AK".into(),
+            secret_key: "SK".into(),
+        }
+    }
+
+    /// The RustFS variant drops exactly the action its policy engine
+    /// rejects; everything else (including the multipart listing) stays.
+    #[test]
+    fn rustfs_policy_omits_unrecognized_complete_action() {
+        let full: serde_json::Value =
+            serde_json::from_str(&super::super::prefix_policy("noite", "fleets/shop/"))
+                .expect("json");
+        let reduced: serde_json::Value = serde_json::from_str(
+            &MinioAdmin::rustfs(stub_store("http://rustfs:9000".into()))
+                .policy("noite", "fleets/shop/"),
+        )
+        .expect("json");
+        let actions = |v: &serde_json::Value| {
+            v["Statement"]
+                .as_array()
+                .expect("statements")
+                .iter()
+                .flat_map(|s| s["Action"].as_array().expect("actions").iter().cloned())
+                .collect::<Vec<_>>()
+        };
+        let (full_actions, reduced_actions) = (actions(&full), actions(&reduced));
+        assert!(full_actions.contains(&serde_json::json!("s3:CompleteMultipartUpload")));
+        assert!(!reduced_actions.contains(&serde_json::json!("s3:CompleteMultipartUpload")));
+        assert!(reduced_actions.contains(&serde_json::json!("s3:ListBucketMultipartUploads")));
+        assert_eq!(
+            reduced_actions.len() + 1,
+            full_actions.len(),
+            "only the one action differs"
+        );
+    }
+
+    async fn status_stub(status: u16) -> (tokio::task::JoinHandle<()>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let body = "<Error><Code>Denied</Code></Error>";
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (handle, format!("http://127.0.0.1:{}", addr.port()))
+    }
+
+    fn stub_admin(endpoint: String) -> MinioAdmin {
+        MinioAdmin::minio(stub_store(endpoint))
+    }
+
+    /// A store that refuses the keys fails the boot; a store without the
+    /// admin API falls back to root. A silent downgrade on wrong keys
+    /// would run every fleet with root keys and log only a reason.
+    #[tokio::test]
+    async fn probe_refused_keys_fail_and_missing_api_falls_back() {
+        let (_handle, endpoint) = status_stub(403).await;
+        let err = stub_admin(endpoint).probe().await.expect_err("403 fails");
+        assert!(
+            format!("{err:#}").contains("refused the admin credentials"),
+            "{err:#}"
+        );
+        let (_handle, endpoint) = status_stub(404).await;
+        let outcome = stub_admin(endpoint).probe().await.expect("404 probes");
+        assert!(outcome.is_err(), "404 means no admin API: {outcome:?}");
+    }
+
     /// A missing user or policy is already revoked: 404, or the store's
     /// `NoSuch*` error codes in the body.
     #[test]
@@ -386,6 +495,72 @@ mod tests {
                 &[0x00]
             )),
             "61ed193d12a2adf6f1c41f31de4ead6c5c"
+        );
+    }
+
+    /// Mint then revoke hits the store with the exact policy name mint
+    /// created: a per-key name, so no scope leaves an orphaned policy.
+    #[tokio::test]
+    async fn revoke_removes_the_policy_mint_created() {
+        use std::sync::{Arc, Mutex};
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        let seen = calls.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 65536];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let line = req.lines().next().unwrap_or_default().to_string();
+                    seen.lock().expect("calls lock").push(line);
+                    let resp = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let store = StoreAccess {
+            endpoint: format!("http://127.0.0.1:{}", addr.port()),
+            region: "us-east-1".into(),
+            access_key: "AK".into(),
+            secret_key: "SK".into(),
+        };
+        let provider = MinioAdmin::minio(store);
+        let minted = provider.mint("noite", "fleets/shop/").await.expect("mint");
+        provider.revoke(&minted.handle).await.expect("revoke");
+        handle.abort();
+        let calls = calls.lock().expect("calls lock");
+        let created = calls
+            .iter()
+            .find(|l| l.contains("add-canned-policy"))
+            .expect("policy created");
+        let created_name = created
+            .split("name=")
+            .nth(1)
+            .expect("policy name")
+            .split_whitespace()
+            .next()
+            .expect("policy name end");
+        let removed = calls
+            .iter()
+            .find(|l| l.contains("remove-canned-policy"))
+            .expect("policy removed");
+        assert!(
+            removed.contains(created_name),
+            "revoke deletes {created_name}, the policy mint created: {removed}"
+        );
+        // And the name is per key: the access key, not the prefix.
+        assert!(
+            created_name.contains(&minted.access_key),
+            "policy name derives from the key: {created_name}"
         );
     }
 }
