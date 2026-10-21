@@ -145,6 +145,39 @@ fn write_file(dir: &Path, name: &str, value: &str) -> anyhow::Result<()> {
 /// Enable the fleet controllers on `cgroup` and confirm they took: a write
 /// the kernel ignores (read-only mount, no delegation) reads back empty.
 #[cfg(unix)]
+/// Snapshot of a cgroup's enable-relevant state, for the boot log and the
+/// `/ready` detail when enabling fails: the failure mode differs by
+/// platform, and the next step depends on which of these is off.
+#[cfg(unix)]
+fn describe(cgroup: &Path) -> String {
+    let read = |name: &str| {
+        std::fs::read_to_string(cgroup.join(name))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "<unreadable>".to_string())
+    };
+    let members = std::fs::read_to_string(cgroup.join("cgroup.procs"))
+        .map(|m| m.split_whitespace().count().to_string())
+        .unwrap_or_else(|_| "<unreadable>".to_string());
+    format!(
+        "type={} members={} controllers=[{}] subtree=[{}] parent_subtree=[{}]",
+        read("cgroup.type"),
+        members,
+        read("cgroup.controllers"),
+        read("cgroup.subtree_control"),
+        cgroup
+            .parent()
+            .map(
+                |p| std::fs::read_to_string(p.join("cgroup.subtree_control"))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| "<unreadable>".to_string())
+            )
+            .unwrap_or_else(|| "<no parent>".to_string()),
+    )
+}
+
+/// Enable the fleet controllers on `cgroup` and confirm they took: a write
+/// the kernel ignores (read-only mount, no delegation) reads back empty.
+#[cfg(unix)]
 fn enable_controllers(cgroup: &Path) -> anyhow::Result<()> {
     write_file(cgroup, "cgroup.subtree_control", CONTROLLERS)?;
     let enabled = std::fs::read_to_string(cgroup.join("cgroup.subtree_control"))
@@ -259,11 +292,14 @@ fn setup_inner(root: &Path, placement: &str) -> anyhow::Result<PathBuf> {
         std::thread::sleep(std::time::Duration::from_millis(DRAIN_SETTLE_MS));
     }
     match last_error {
-        Some(error) => Err(error).with_context(|| format!("enabling {}", own.display())),
+        Some(error) => {
+            Err(error).with_context(|| format!("enabling {} ({})", own.display(), describe(&own)))
+        }
         None => {
             anyhow::bail!(
-                "{} still holds live processes after the drain",
-                own.display()
+                "{} still holds live processes after the drain ({})",
+                own.display(),
+                describe(&own)
             );
         }
     }
