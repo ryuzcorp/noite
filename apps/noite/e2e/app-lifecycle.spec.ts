@@ -42,7 +42,10 @@ test("custom domains, env vars and deletion behave", async ({
   expect(added.status).toBe(200);
   expect(JSON.stringify(added.body)).toContain("probe.example.com");
 
-  // One hostname belongs to one app: a second app cannot claim it.
+  // A verified hostname belongs to one app. In `single` tenancy the first
+  // claim verifies at once, so a second app's claim conflicts. In `multi`
+  // both claims stay pending until one proves ownership (first to verify
+  // wins), so the second claim succeeds as pending too.
   const other = await runnerCall(request, "/v1/apps", {
     body: { name: "Claimant", slug: "claimant" },
     method: "POST",
@@ -57,7 +60,11 @@ test("custom domains, env vars and deletion behave", async ({
     method: "POST",
   });
 
-  expect(conflict.status).toBe(409);
+  if (process.env.E2E_TENANCY === "multi") {
+    expect(conflict.status).toBe(200);
+  } else {
+    expect(conflict.status).toBe(409);
+  }
 
   const removed = await runnerCall(
     request,
