@@ -159,6 +159,7 @@ pub async fn stop_fleet(procs: &ProcMap, slug: &str, grace: StopGrace) {
     if let Some(dir) = crate::host::cgroups::fleet_cgroup_path(slug) {
         crate::host::cgroups::remove_fleet_cgroup(&dir);
     }
+    crate::host::cgroups::forget_spawned(slug);
     tracing::info!(slug, "stopped celld");
 }
 
@@ -237,6 +238,8 @@ pub async fn stop_environment_fleets(procs: &ProcMap, slug: &str, grace: StopGra
 struct FleetSpec {
     /// `ProcMap` key and log-ring key (`slug`, or `slug.label`).
     key: String,
+    /// The app that owns this fleet: the OOM-kill app event's owner.
+    app_id: String,
     /// The tenant scope whose key the fleet holds: the app's own prefix, or
     /// the environment's own when this fleet is a preview.
     scope: crate::host::credentials::Scope,
@@ -280,6 +283,7 @@ pub async fn ensure_fleet(
     };
     let spec = FleetSpec {
         key: app.slug.clone(),
+        app_id: app.id.clone(),
         bucket: app.fleet_bucket.clone(),
         listen,
         internal,
@@ -320,6 +324,7 @@ pub async fn ensure_environment_fleet(
     }
     let spec = FleetSpec {
         key: env_fleet_key(&env.app_slug, &env.label),
+        app_id: env.app_id.clone(),
         bucket: env.fleet_bucket.clone(),
         listen,
         internal,
@@ -329,6 +334,40 @@ pub async fn ensure_environment_fleet(
         memory_mb: fleet_memory_mb(pool, cfg, &env.app_id).await,
     };
     ensure_spawned(pool, cfg, procs, logs, spec).await
+}
+
+/// An exited fleet whose cgroup counter moved since its own spawn died by
+/// OOM kill at its cap: record the tenant-visible app event and the fleet
+/// log line, then let the restart below respawn it like any other crash.
+/// Anything else (no cgroups, no movement, no baseline) stays quiet here —
+/// the caller still logs and restarts.
+async fn note_possible_oom(pool: &SqlitePool, logs: &LogState, spec: &FleetSpec) {
+    let Some(dir) = crate::host::cgroups::fleet_cgroup_path(&spec.key) else {
+        return;
+    };
+    match crate::host::cgroups::oom_kills_since_spawn(&spec.key, &dir) {
+        Some(kills) if kills > 0 => {}
+        _ => return,
+    }
+    let detail = format!(
+        "fleet restarted: memory limit {} MiB exceeded (Settings → Limits)",
+        spec.memory_mb
+    );
+    tracing::warn!(fleet = %spec.key, detail = %detail, "fleet OOM-killed at its cap; restarting");
+    logs::append(logs, &spec.key, detail.clone()).await;
+    let _ = db::insert_app_event(
+        pool,
+        &crate::models::new_id(),
+        &spec.app_id,
+        "fleet",
+        "fleet restarted",
+        &detail,
+        "🧠",
+        "{}",
+        "",
+        &crate::models::now_iso(),
+    )
+    .await;
 }
 
 /// Spawn (or confirm) one celld fleet, whoever owns it.
@@ -346,10 +385,12 @@ async fn ensure_spawned(
             match child.try_wait() {
                 Ok(None) => return Ok(()), // still running
                 Ok(Some(status)) => {
+                    note_possible_oom(pool, logs, &spec).await;
                     tracing::warn!(fleet = %key, ?status, "celld exited; restarting");
                     map.remove(&key);
                 }
                 Err(e) => {
+                    note_possible_oom(pool, logs, &spec).await;
                     tracing::warn!(fleet = %key, error = %e, "celld status; restarting");
                     map.remove(&key);
                 }
@@ -501,6 +542,7 @@ async fn ensure_spawned(
     // sliver of startup memory is charged to the shared cgroup instead —
     // negligible next to the fleet's lifetime, and documented, not hidden.
     if let Some(dir) = &fleet_cgroup {
+        crate::host::cgroups::note_spawned(&key, dir);
         match child.id() {
             Some(pid) => {
                 if let Err(e) = crate::host::cgroups::enter_cgroup(dir, pid) {

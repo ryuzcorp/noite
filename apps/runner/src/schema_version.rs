@@ -21,7 +21,7 @@ use anyhow::{bail, Context};
 use sqlx::SqliteConnection;
 
 /// Version a database has after every migration ran. 1 is the alpha baseline.
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`.
@@ -259,6 +259,13 @@ pub const MIGRATIONS: &[Migration] = &[
             updated_at TEXT NOT NULL\
           );\
           CREATE INDEX IF NOT EXISTS idx_scoped_credential_app ON scoped_credential(app_id);",
+    },
+    Migration {
+        version: 12,
+        // Per-app fleet memory override (SPEC, Limits): `app_limit.memory_mb`
+        // overrides `RUNNER_FLEET_MEMORY_MB` for one app. Additive, so older
+        // snapshots gain it on boot; a fresh database gets it from schema.sql.
+        sql: "ALTER TABLE main.app_limit ADD COLUMN memory_mb INTEGER;",
     },
 ];
 

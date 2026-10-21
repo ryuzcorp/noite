@@ -84,7 +84,7 @@ Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (hand
 | `RUNNER_MAX_ENVIRONMENTS` | `25` | Preview environments per instance, enforced at create | runner-owned |
 | `RUNNER_ENVIRONMENT_TTL_H` | `168` | Hours without a deploy before a workspace preview is swept (7 days); `0` disables the sweep | runner-owned |
 | `RUNNER_FLEET_MAX_RSS_MB` | `0` | → `CELLD_MAX_RSS_MB` when non-zero; container-wide shed threshold by design (celld measures container-scale working set), never per-fleet; `0` = celld default (80% of container memory) | worker-passthrough (fleet) |
-| `RUNNER_FLEET_MEMORY_MB` | `512` | Per-fleet `memory.max` in MiB (own cgroup per fleet); per-app override in Settings → Limits; needs the writable cgroupfs mount | runner-owned |
+| `RUNNER_FLEET_MEMORY_MB` | `512` | Per-fleet `memory.max` in MiB (own cgroup per fleet); per-app override in Settings → Limits; needs the multi-only cgroup grant (`docker/compose.multi.yaml`) — without it fleets share the container cgroup | runner-owned |
 | `RUNNER_FLEET_IDLE_EVICT_S` | `120` | → `CELLD_IDLE_EVICT_S`; idle seconds before a fleet hibernates cells | worker-passthrough (fleet) |
 | `RUNNER_FLEET_DEPLOY_POLL_S` | `300` | → `CELLD_DEPLOY_POLL_S`; covers missed `/reload` only | worker-passthrough (fleet) |
 | `RUNNER_FLEET_ASSET_CACHE_MB` | `64` | → `CELLD_ASSET_CACHE_BYTES`; per-fleet on-disk asset cache | worker-passthrough (fleet) |

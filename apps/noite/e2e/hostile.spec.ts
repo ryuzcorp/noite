@@ -62,6 +62,15 @@ const expectReleaseProbes = (probes: Record<string, Probe>): void => {
       expect(probe.ok, `release probe ${name} must hold: ${probe.detail}`).toBe(
         true
       );
+      continue;
+    }
+
+    expect(probe.ok, `release probe ${name} leaked: ${probe.detail}`).toBe(
+      false
+    );
+  }
+};
+
 // Per-fleet cgroups are the inverse probe: containment holds when every live
 // fleet carries a positive `memory.max`, read by the sandboxed build itself
 // from the shared anchor — and the runner agrees on `/ready`.
@@ -85,22 +94,13 @@ const assertFleetCgroups = async (
   );
 };
 
-      continue;
-    }
-
-    expect(probe.ok, `release probe ${name} leaked: ${probe.detail}`).toBe(
-      false
-    );
-  }
-};
-
 // Hostile tenant (SPEC, Hostile-tenant suite): the Worker and build scripts
 // attempt each attack and report results as JSON; every attempt must fail
 // except internet egress. It only means something against an install that
-// claims isolation: the single image with NOITE_TENANCY=multi and its
-// capabilities (NET_ADMIN, SETUID, SETGID, CHOWN). The 4-service lane runs
-// single tenancy and would fail it by design, so the lane opts in with
-// E2E_HOSTILE=1.
+// claims isolation: the single image with NOITE_TENANCY=multi, its
+// capabilities (NET_ADMIN, SETUID, SETGID, CHOWN) and the multi cgroup grant
+// (SYS_ADMIN, compose.multi.yaml). The 4-service lane runs single tenancy
+// and would fail it by design, so the lane opts in with E2E_HOSTILE=1.
 test(
   "hostile tenant is contained",
   { tag: "@isolation" },

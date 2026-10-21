@@ -6,22 +6,26 @@
 //! toward a shared shed threshold.
 //!
 //! What the container needs (probed at boot): cgroup v2, a writable cgroupfs
-//! mount, and delegation of the `memory` and `pids` controllers. The runner
-//! anchors at its own cgroup: with a private cgroup namespace that is the
-//! mount root itself (`/proc/self/cgroup` reads `0::/`), otherwise the
-//! runner's own scope path under the mount. The cgroup
+//! mount, and delegation of the `memory` and `pids` controllers. Docker
+//! mounts the cgroupfs read-only; the runner remounts its own subtree once
+//! at setup, which needs the multi-only compose grant (`CAP_SYS_ADMIN` in
+//! `docker/compose.multi.yaml`). The runner anchors at its own cgroup: with
+//! a private cgroup namespace that is the mount root itself
+//! (`/proc/self/cgroup` reads `0::/`), otherwise the runner's own scope
+//! path under the mount. The cgroup
 //! v2 "no internal processes" rule forbids enabling controllers on a cgroup
 //! that holds member processes, so the runner moves its own processes
 //! (including PID 1's group siblings — tini stays reaper, cgroups do not
 //! affect reaping) into a `runner` leaf before enabling `+memory +pids`.
 //! Fleet leaves need no `subtree_control`: they are leaves, limits only.
 //!
-//! Where cgroups cannot be created (read-only cgroupfs, no delegation, no
-//! `privileged`), the runner records the reason and fleets run in the shared
-//! cgroup as before: an explicit, surfaced status in `isolation::self_check`,
-//! the boot log and `make doctor` — never a silent no-op. Compose files ship
-//! `privileged: true`, which is what makes the mount writable.
-
+//! Where cgroups cannot be created (remount refused, no delegation), the
+//! runner records the reason and fleets run in the shared cgroup as before:
+//! an explicit, surfaced status in `isolation::self_check`, the boot log
+//! and `make doctor` — never a silent no-op. Single-tenant installs get no
+//! new grant; multi installs without the overlay block `/ready` like the
+//! missing egress policy.
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -137,6 +141,109 @@ const DRAIN_ATTEMPTS: usize = 50;
 #[cfg(unix)]
 const DRAIN_SETTLE_MS: u64 = 100;
 
+/// Remount `root` read-write, preserving its other flags: Docker mounts the
+/// container's cgroupfs read-only, and the multi compose override grants
+/// `CAP_SYS_ADMIN` exactly so the runner can flip its own cgroup subtree
+/// writable. Without the grant (the base compose, every single-tenant
+/// install) this fails and setup degrades loudly as before. Linux-only.
+#[cfg(target_os = "linux")]
+fn remount_rw(root: &Path) -> anyhow::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let options = mount_options(root).ok_or_else(|| {
+        anyhow::anyhow!(
+            "remount needs a cgroupfs mount: no /proc/self/mounts entry for {}",
+            root.display()
+        )
+    })?;
+    let target = CString::new(root.as_os_str().as_bytes())
+        .map_err(|e| anyhow::anyhow!("cgroup root is not a C string: {e}"))?;
+    let mut flags: libc::c_ulong = libc::MS_REMOUNT;
+    // A remount replaces the flag set, so every flag worth keeping is
+    // restated; only the read-only bit is dropped. Unknown options are the
+    // filesystem's own (seclabel, nsdelegate) and need no restating.
+    for option in options.split(',') {
+        flags |= match option {
+            "nosuid" => libc::MS_NOSUID,
+            "nodev" => libc::MS_NODEV,
+            "noexec" => libc::MS_NOEXEC,
+            "relatime" => libc::MS_RELATIME,
+            "strictatime" => libc::MS_STRICTATIME,
+            "noatime" => libc::MS_NOATIME,
+            "nodiratime" => libc::MS_NODIRATIME,
+            "sync" => libc::MS_SYNCHRONOUS,
+            "dirsync" => libc::MS_DIRSYNC,
+            _ => 0,
+        };
+    }
+    // SAFETY: null source/type/data with MS_REMOUNT only flips the flags of
+    // this mount (a bind inside the container), touching nothing else.
+    let rc = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        return Err(anyhow::anyhow!(
+            "remount {} read-write: {}",
+            root.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// This mount's option list from `/proc/self/mounts` (`source target fstype
+/// options …`), so a remount can restate the flags it keeps. Octal escapes
+/// (`\040`) decode to their byte; the comparison target has none, but a
+/// container root under a spaced path must still match.
+#[cfg(target_os = "linux")]
+fn mount_options(root: &Path) -> Option<String> {
+    let mounts = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    find_mount_options(&mounts, root)
+}
+
+/// The option list for `root` in one `/proc/self/mounts` dump (`source
+/// target fstype options …`). Pure so tests can pin the parsing.
+#[cfg(target_os = "linux")]
+fn find_mount_options(mounts: &str, root: &Path) -> Option<String> {
+    let want = root.to_string_lossy();
+    mounts.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next()?;
+        let target = fields.next()?.replace("\\040", " ");
+        fields.next()?;
+        let options = fields.next()?;
+        (target.as_str() == want.as_ref()).then(|| options.to_string())
+    })
+}
+
+/// The container's cgroupfs mount is read-only on Docker: probe with a
+/// throwaway directory, remount once when the probe says read-only, and bail
+/// with the operator fix when the grant is missing. A mount that is already
+/// writable (privileged, some Podman setups) skips the remount entirely.
+#[cfg(unix)]
+fn ensure_writable(root: &Path, own: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let probe = own.join(".writable");
+    if std::fs::create_dir(&probe).is_ok() {
+        let _ = std::fs::remove_dir(&probe);
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    if remount_rw(root).is_ok() && std::fs::create_dir(&probe).is_ok() {
+        let _ = std::fs::remove_dir(&probe);
+        tracing::info!(root = %root.display(), "cgroupfs remounted read-write");
+        return Ok(());
+    }
+    Err(anyhow::anyhow!("cgroupfs is not writable"))
+        .with_context(|| format!("remount {} refused (multi installs: apply docker/compose.multi.yaml, see the Operator action in CHANGELOG; single installs only warn)", root.display()))
+}
+
 fn write_file(dir: &Path, name: &str, value: &str) -> anyhow::Result<()> {
     std::fs::write(dir.join(name), value)
         .map_err(|e| anyhow::anyhow!("write {name} in {}: {e}", dir.display()))
@@ -251,6 +358,11 @@ fn setup_inner(root: &Path, placement: &str) -> anyhow::Result<PathBuf> {
             anyhow::bail!("controller {controller} not delegated to {}", own.display());
         }
     }
+    // Docker mounts the container's cgroupfs read-only: one remount attempt
+    // here (succeeds only with the multi override's CAP_SYS_ADMIN) before
+    // anything else writes. The drain loop below stays read-only-safe: a
+    // refused remount degrades loudly at once, never after the budget.
+    ensure_writable(root, &own)?;
     let anchor = own.join(FLEET_PARENT);
     let leaf = anchor.join(RUNNER_LEAF);
     std::fs::create_dir_all(&leaf).with_context(|| format!("create {}", leaf.display()))?;
@@ -264,23 +376,26 @@ fn setup_inner(root: &Path, placement: &str) -> anyhow::Result<PathBuf> {
     // curl that lands between the final check and the enable fails that too
     // (EBUSY — observed on Docker). Retry the drain *and* the enable with a
     // bounded settle; a live squatter past the budget degrades to the shared
-    // cgroup, loudly. Persistent errors (read-only mount, no delegation)
-    // fail the same way every attempt, so the budget only delays the
-    // already-loud degradation by seconds.
+    // cgroup, loudly. Persistent errors fail the same way every attempt
+    // (read-only mounts and missing delegation bail earlier, in
+    // `ensure_writable` and the delegation check), so the loop only spends
+    // its budget on the contested case.
     let mut last_error: Option<anyhow::Error> = None;
     for _ in 0..DRAIN_ATTEMPTS {
         drain_to_leaf(&own, &leaf)?;
         if is_drained(&own) {
             match enable_controllers(&own) {
                 Ok(()) => {
-                    enable_controllers(&anchor)?;
+                    enable_controllers(&anchor).with_context(|| {
+                        format!("enabling {} ({})", anchor.display(), describe(&own))
+                    })?;
                     return Ok(anchor);
                 }
                 // EBUSY here is a member that landed between the check and
                 // the write (a healthcheck exec) — worth another round.
-                // Anything else (read-only mount, no delegation) fails the
-                // same way every attempt: bail at once instead of burning
-                // the whole budget on an already-loud degradation.
+                // Anything else fails the same way every attempt: bail at
+                // once instead of burning the whole budget on an
+                // already-loud degradation.
                 Err(error) if is_busy(&error) => {
                     last_error = Some(error);
                 }
@@ -373,6 +488,58 @@ pub fn remove_fleet_cgroup(dir: &Path) {
 /// Path of a fleet's cgroup under the active anchor, for stop-time cleanup.
 pub fn fleet_cgroup_path(key: &str) -> Option<PathBuf> {
     anchor().map(|a| a.join(fleet_dir_name(key)))
+}
+
+/// OOM-kill baselines per fleet key, taken at spawn: `memory.events`
+/// `oom_kill` only grows inside a group, so a restart reports an OOM kill
+/// exactly when the counter moved since that fleet's own spawn. Entries are
+/// consumed by the first exit check after the spawn and forgotten at stop.
+static OOM_BASELINE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Current `oom_kill` count of a fleet group: how many times the kernel
+/// OOM-killed inside it. Unreadable (no cgroups, already removed) reads as
+/// zero — callers only ever compare against a baseline from the same group.
+fn oom_kill_count(dir: &Path) -> u64 {
+    let Ok(events) = std::fs::read_to_string(dir.join("memory.events")) else {
+        return 0;
+    };
+    for line in events.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some("oom_kill") {
+            if let Some(count) = parts.next().and_then(|n| n.parse().ok()) {
+                return count;
+            }
+        }
+    }
+    0
+}
+
+/// Remember this spawn's OOM-kill count, so the next exit check can tell an
+/// OOM kill from any other crash. Called with the fleet's own group dir.
+pub fn note_spawned(key: &str, dir: &Path) {
+    let count = oom_kill_count(dir);
+    if let Ok(mut baseline) = OOM_BASELINE.lock() {
+        baseline.insert(key.to_string(), count);
+    }
+}
+
+/// OOM kills since this fleet's own spawn. `Some(n)` with `n > 0` means the
+/// kernel killed inside the group and the supervisor is restarting it —
+/// record the tenant-visible event. Consumes the baseline: one spawn reports
+/// at most once. `None` means no baseline (spawned without cgroups, or a
+/// runner restart in between) — never report on that.
+pub fn oom_kills_since_spawn(key: &str, dir: &Path) -> Option<u64> {
+    let baseline = OOM_BASELINE.lock().ok()?.remove(key)?;
+    oom_kill_count(dir).checked_sub(baseline)
+}
+
+/// Forget a stopped fleet's baseline (stop-time cleanup; a respawn records a
+/// fresh one). Best-effort: a missing entry is the common case.
+pub fn forget_spawned(key: &str) {
+    if let Ok(mut baseline) = OOM_BASELINE.lock() {
+        baseline.remove(key);
+    }
 }
 
 #[cfg(test)]
@@ -554,5 +721,126 @@ mod tests {
         assert!(!is_busy(&denied));
         let plain = anyhow::anyhow!("not even io");
         assert!(!is_busy(&plain));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mount_options_picks_this_mount() {
+        let mounts = "cgroup2 /sys/fs/cgroup cgroup2 ro,nosuid,nodev,noexec,relatime,nsdelegate 0 0\ntmpfs /run tmpfs rw,nosuid,nodev 0 0\n";
+        assert_eq!(
+            find_mount_options(mounts, Path::new("/sys/fs/cgroup")),
+            Some("ro,nosuid,nodev,noexec,relatime,nsdelegate".to_string())
+        );
+        assert_eq!(
+            find_mount_options(mounts, Path::new("/run")),
+            Some("rw,nosuid,nodev".to_string())
+        );
+        assert_eq!(find_mount_options(mounts, Path::new("/missing")), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mount_options_decodes_escaped_spaces() {
+        let mounts = "cgroup2 /mnt/my\\040cgroup cgroup2 rw,nosuid 0 0\n";
+        assert_eq!(
+            find_mount_options(mounts, Path::new("/mnt/my cgroup")),
+            Some("rw,nosuid".to_string())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remount_off_a_mount_fails_loudly() {
+        let err = remount_rw(Path::new("/definitely/not/a/mount")).expect_err("must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("remount"), "names the operation: {msg}");
+        assert!(
+            msg.contains("/definitely/not/a/mount"),
+            "names the root: {msg}"
+        );
+    }
+
+    #[test]
+    fn writable_dir_needs_no_remount() {
+        let tmp = fakefs();
+        ensure_writable(tmp.path(), tmp.path()).expect("tmp is writable");
+        assert!(!tmp.path().join(".writable").exists(), "probe removed");
+    }
+
+    #[test]
+    fn unwritable_dir_names_the_override() {
+        let tmp = fakefs();
+        // No such subdirectory: the probe mkdir fails, and the throwaway
+        // path is no mount, so the remount is refused too.
+        let missing = tmp.path().join("no-such-dir");
+        let err = ensure_writable(&missing, &missing).expect_err("must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cgroupfs is not writable"),
+            "names the cause: {msg}"
+        );
+        assert!(msg.contains("compose.multi.yaml"), "names the fix: {msg}");
+    }
+
+    fn fake_events(dir: &Path, oom_kill: u64) {
+        std::fs::write(
+            dir.join("memory.events"),
+            format!("low 0\nhigh 0\nmax 0\noom 0\noom_kill {oom_kill}\n"),
+        )
+        .expect("fake memory.events");
+    }
+
+    #[test]
+    fn oom_kill_count_reads_the_counter() {
+        let tmp = fakefs();
+        fake_events(tmp.path(), 3);
+        assert_eq!(oom_kill_count(tmp.path()), 3);
+        assert_eq!(
+            oom_kill_count(&tmp.path().join("no-such-dir")),
+            0,
+            "unreadable reads as zero"
+        );
+    }
+
+    #[test]
+    fn oom_baseline_reports_growth_once() {
+        let tmp = fakefs();
+        let key = format!("oom-once-{}", crate::models::new_id());
+        fake_events(tmp.path(), 2);
+        note_spawned(&key, tmp.path());
+        assert_eq!(
+            oom_kills_since_spawn(&key, tmp.path()),
+            Some(0),
+            "no growth since spawn"
+        );
+        // Consumed by the first check: a second exit without a respawn
+        // reports nothing, so one spawn records at most one event.
+        assert_eq!(oom_kills_since_spawn(&key, tmp.path()), None);
+        // A respawn rebaselines past old kills; growth after that reports.
+        fake_events(tmp.path(), 5);
+        note_spawned(&key, tmp.path());
+        fake_events(tmp.path(), 7);
+        assert_eq!(
+            oom_kills_since_spawn(&key, tmp.path()),
+            Some(2),
+            "growth since this spawn reports"
+        );
+        assert_eq!(oom_kills_since_spawn(&key, tmp.path()), None);
+        // A stop forgets the baseline: stale entries never blame a respawn.
+        note_spawned(&key, tmp.path());
+        forget_spawned(&key);
+        assert_eq!(oom_kills_since_spawn(&key, tmp.path()), None);
+    }
+
+    #[test]
+    fn oom_without_baseline_never_reports() {
+        let tmp = fakefs();
+        let key = format!("oom-none-{}", crate::models::new_id());
+        fake_events(tmp.path(), 9);
+        assert_eq!(
+            oom_kills_since_spawn(&key, tmp.path()),
+            None,
+            "a restarted runner must not blame the previous boot"
+        );
     }
 }

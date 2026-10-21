@@ -66,8 +66,10 @@ export E2E_GIT_BASE=http://localhost:8080/v1/git
 export E2E_RAW_PORTS=1
 if [ "$E2E_TENANCY" = multi ]; then
   export E2E_HOSTILE=1
+  # The isolation lane is a multi install: it gets the multi cgroup grant,
+  # the same file production multi installs apply.
+  FILES="$FILES -f docker/compose.multi.yaml"
 fi
-CE2E="$COMPOSE -p noite-e2e $FILES"
 
 echo "==> reset lane state (fresh volumes, fresh bucket, no session)"
 # shellcheck disable=SC2086

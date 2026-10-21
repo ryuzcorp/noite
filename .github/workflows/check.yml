@@ -35,12 +35,13 @@ jobs:
         run: bun docker/check-versions.ts
       # `config` needs no daemon, so a broken compose file fails here instead
       # of on someone's server. Every variant, including the test overlays.
-      - name: render compose (prod, build, dev, e2e)
+      - name: render compose (prod, build, dev, e2e, multi)
         run: |
           docker compose -f docker/compose.yaml config > /dev/null
           docker compose -f docker/compose.yaml -f docker/compose.build.yaml config > /dev/null
           docker compose -f docker/compose.yaml -f docker/compose.dev.yaml config > /dev/null
           docker compose -f docker/compose.yaml -f docker/compose.e2e.yaml config > /dev/null
+          docker compose -f docker/compose.yaml -f docker/compose.multi.yaml config > /dev/null
       # The runner prints tenant URLs from its own env: both public ports
       # must reach the container, or prod links a dev-default port (the
       # first-push note once printed :9443 on a :443 install).

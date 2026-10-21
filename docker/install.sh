@@ -111,9 +111,21 @@ install_docker() {
   info "$(docker --version)"
 }
 
-# .env next to compose.yaml is picked up: the project directory is the
-# compose file's own.
-compose() { docker compose -f "$NOITE_DIR/compose.yaml" "$@"; }
+compose() {
+  if [[ "$(env_get NOITE_TENANCY)" == "multi" && -f "$NOITE_DIR/compose.multi.yaml" ]]; then
+    docker compose -f "$NOITE_DIR/compose.yaml" -f "$NOITE_DIR/compose.multi.yaml" "$@"
+  else
+    docker compose -f "$NOITE_DIR/compose.yaml" "$@"
+  fi
+}
+
+# The `-f` flags an operator must pass to reproduce `compose` above outside
+# the installer (empty on single installs, which get nothing new).
+compose_hint() {
+  if [[ "$(env_get NOITE_TENANCY)" == "multi" ]]; then
+    printf '%s' "-f compose.yaml -f compose.multi.yaml"
+  fi
+}
 
 check_ports() {
   if [[ -f "$NOITE_DIR/compose.yaml" && -n "$(compose ps -q noite 2>/dev/null)" ]]; then
@@ -251,7 +263,6 @@ ensure_env_defaults() {
   env_secret RUSTFS_ACCESS_KEY "noite$(rand_hex 8)" "noiteaccess"
   env_secret RUSTFS_SECRET_KEY "$(rand_hex 24)" "noitesecretnoitesecretnoite12"
 }
-
 write_config() {
   step "Writing $NOITE_DIR"
   mkdir -p "$NOITE_DIR"
@@ -260,6 +271,13 @@ write_config() {
   curl -fsSL "$url" -o "$tmp" || die "could not download $url"
   grep -q '^services:' "$tmp" || die "$url is not a compose file"
   install -m 0644 "$tmp" "$NOITE_DIR/compose.yaml"
+  # The multi-tenant cgroup grant: referenced only when .env says
+  # NOITE_TENANCY=multi (see compose()). Downloaded always so an install can
+  # switch tenancy with a re-run; single installs never reference it.
+  url="https://raw.githubusercontent.com/$NOITE_REPO/$NOITE_REF/docker/compose.multi.yaml"
+  curl -fsSL "$url" -o "$tmp" || die "could not download $url"
+  grep -q 'apparmor' "$tmp" || die "$url is not the multi override"
+  install -m 0644 "$tmp" "$NOITE_DIR/compose.multi.yaml"
   rm -f "$tmp"
 
   local fresh=0
@@ -288,6 +306,11 @@ write_config() {
 # BASE_DOMAIN and BETTER_AUTH_URL are fixed once someone registers: passkeys
 # bind to that origin. The RustFS keys guard the bundled bucket's data.
 #
+# Multi-tenant installs (letting other people push code) need
+# NOITE_TENANCY=multi plus the cgroup grant: re-run this installer after
+# setting it and the installer layers compose.multi.yaml on (single installs
+# need nothing). Without the grant a multi install stays at 503 on /ready.
+#NOITE_TENANCY=single
 # Lost-passkey sign-in codes are POSTed to this webhook as JSON; without it
 # nothing is emailed, and the operator recovers from the server with
 #   cd $NOITE_DIR && docker compose exec noite noite-runner recover
@@ -386,7 +409,7 @@ start_stack() {
   done
   body=$(compose exec -T noite curl -s -m 5 http://127.0.0.1:8080/ready 2>/dev/null || true)
   warn "not ready after ${READY_TIMEOUT_S}s: ${body:-no answer from the runner}"
-  die "inspect with: cd $NOITE_DIR && docker compose logs -f noite"
+  die "inspect with: cd $NOITE_DIR && docker compose $(compose_hint) logs -f noite"
 }
 
 # How an operator gets back in after losing the passkey: the webhook when one is
@@ -400,6 +423,11 @@ recovery_note() {
 }
 
 summary() {
+  # Multi installs manage two compose files; every operator-run command below
+  # must name both (empty on single installs).
+  local files=""
+  files=$(compose_hint)
+  files=${files:+ $files}
   cat <<EOF
 
 ${GREEN}${BOLD}Noite is running.${RESET}
@@ -415,12 +443,12 @@ ${YELLOW}${BOLD}Telemetry.${RESET} On by default: once a day this install sends 
 an anonymous, count-only summary (version, platform, apps, deploys, users) — no
 domains, names, emails or IPs. Turn it off under Admin on
 https://app.$DOMAIN/account, or set NOITE_TELEMETRY=0 in $NOITE_DIR/.env and run
-  cd $NOITE_DIR && docker compose up -d
+  cd $NOITE_DIR && docker compose$files up -d
 
   Config       $NOITE_DIR/.env (keep it: it holds the secrets)
-  Logs         cd $NOITE_DIR && docker compose logs -f
+  Logs         cd $NOITE_DIR && docker compose$files logs -f
   $(recovery_note)
-               either way, from this server: cd $NOITE_DIR && docker compose exec noite noite-runner recover
+               either way, from this server: cd $NOITE_DIR && docker compose$files exec noite noite-runner recover
   Upgrade      re-run this installer: a new image restarts the runner and every
                app (it warns and asks first); read CHANGELOG.md's
                "Operator action required" before you do
