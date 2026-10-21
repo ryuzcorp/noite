@@ -768,6 +768,13 @@ async fn run_shadow_esbuild(
     Ok(Some((out, note)))
 }
 
+/// The manifest key for a collected map: the bundle path stack frames name.
+/// `collect_client_maps` yields map paths, so the `.map` suffix comes off —
+/// a manifest keyed on `…/app.js.map` would never match a frame's `…/app.js`.
+fn manifest_bundle_key(map_rel: &str) -> Option<&str> {
+    map_rel.strip_suffix(".map")
+}
+
 /// Every `*.map` the build emitted, as deploy-root-relative path + bytes —
 /// except the worker entry's own sibling (an intermediate the worker map
 /// already chains through, never served as its own map).
@@ -872,9 +879,12 @@ pub async fn store_deploy_maps(
     for (rel, bytes) in collect_client_maps(deploy_root, entry_sibling.as_deref()) {
         let stored = format!("{CLIENT_MAP_DIR}/{rel}");
         let key = format!("{maps_prefix}/{stored}");
+        let Some(bundle) = manifest_bundle_key(&rel) else {
+            continue;
+        };
         match put_bytes(cfg, &key, &bytes).await {
             Ok(()) => {
-                manifest.files.insert(rel, stored);
+                manifest.files.insert(bundle.to_string(), stored);
                 client_count += 1;
             }
             Err(e) => notes.push(format!("skipped {rel} ({e:#})")),
@@ -1242,6 +1252,17 @@ mod tests {
         assert!(!is_key_sha(""));
         assert!(!is_key_sha("../evil"));
         assert!(!is_key_sha("not a sha"));
+    }
+
+    #[test]
+    fn manifest_keys_name_bundles_not_maps() {
+        // Regression: keys once kept the `.map` suffix, so no frame path
+        // ever matched and browser stacks stayed minified.
+        assert_eq!(
+            manifest_bundle_key("client/assets/app.js.map"),
+            Some("client/assets/app.js")
+        );
+        assert_eq!(manifest_bundle_key("app.js"), None);
     }
 
     #[test]
