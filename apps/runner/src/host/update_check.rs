@@ -388,6 +388,20 @@ pub fn http_client() -> anyhow::Result<reqwest::Client> {
 /// The status behind `instance.update_status`: stored preference, env lock,
 /// running version, and the cached newest release.
 pub async fn status(pool: &SqlitePool, cfg: &Config) -> anyhow::Result<UpdateStatus> {
+    status_for(pool, cfg, &crate::host::telemetry_report::build_version()).await
+}
+
+/// The status for an explicit running version (production passes
+/// `build_version()`; tests inject the version). The cached `latest` is
+/// re-checked under the same rules as a fresh fetch: after an upgrade to
+/// the cached version (whose `update_check_last_at` survives in the
+/// snapshotted database for up to a day) the notice must clear at once,
+/// not linger until the next fetch.
+async fn status_for(
+    pool: &SqlitePool,
+    cfg: &Config,
+    current: &str,
+) -> anyhow::Result<UpdateStatus> {
     let stored = db::get_setting(pool, db::UPDATE_CHECK_ENABLED).await?;
     let setting = stored.as_deref() != Some("0");
     let lock_reason = cfg.update_check_lock_reason().map(str::to_string);
@@ -395,15 +409,25 @@ pub async fn status(pool: &SqlitePool, cfg: &Config) -> anyhow::Result<UpdateSta
         .await?
         .filter(|raw| !raw.is_empty())
         .and_then(|raw| serde_json::from_str(&raw).ok());
+    let fresh = cached.filter(|result| {
+        let probe = Release {
+            tag: result.latest.clone(),
+            draft: false,
+            prerelease: false,
+            html_url: result.notes_url.clone(),
+            published_at: None,
+        };
+        select_update(current, std::slice::from_ref(&probe)).is_some()
+    });
     Ok(UpdateStatus {
         enabled: setting && lock_reason.is_none(),
         setting,
         locked: lock_reason.is_some(),
         lock_reason,
-        current: crate::host::telemetry_report::build_version(),
-        latest: cached.as_ref().map(|c| c.latest.clone()),
+        current: current.to_string(),
+        latest: fresh.as_ref().map(|c| c.latest.clone()),
         checked_at: db::get_setting(pool, db::UPDATE_CHECK_LAST_AT).await?,
-        notes_url: cached.as_ref().map(|c| c.notes_url.clone()),
+        notes_url: fresh.as_ref().map(|c| c.notes_url.clone()),
         checking: false,
     })
 }
@@ -750,7 +774,9 @@ mod tests {
         let now = Utc::now();
         apply_fetch(&pool, now, "0.1.0-alpha.8", Ok(releases())).await;
         let cfg = crate::config::config_for_tests();
-        let status = self::status(&pool, &cfg).await.expect("status");
+        let status = self::status_for(&pool, &cfg, "0.1.0-alpha.8")
+            .await
+            .expect("status");
         assert_eq!(status.latest.as_deref(), Some("v0.1.0-alpha.10"));
         assert!(status
             .notes_url
@@ -758,8 +784,35 @@ mod tests {
             .is_some_and(|u| u.contains("alpha.10")));
         // Caught up: the notice clears.
         apply_fetch(&pool, now, "0.1.0-alpha.10", Ok(releases())).await;
-        let status = self::status(&pool, &cfg).await.expect("status");
+        let status = self::status_for(&pool, &cfg, "0.1.0-alpha.10")
+            .await
+            .expect("status");
         assert_eq!(status.latest, None, "no newer release, no notice");
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn upgraded_install_clears_a_stale_notice_without_a_new_fetch() {
+        // Cache alpha.10 while running alpha.8 (no new fetch afterwards —
+        // `update_check_last_at` survives upgrades in the snapshotted DB).
+        let pool = memory_pool().await;
+        let now = Utc::now();
+        apply_fetch(&pool, now, "0.1.0-alpha.8", Ok(releases())).await;
+        let cfg = crate::config::config_for_tests();
+        let before = self::status_for(&pool, &cfg, "0.1.0-alpha.8")
+            .await
+            .expect("status");
+        assert_eq!(before.latest.as_deref(), Some("v0.1.0-alpha.10"));
+        // After upgrading to that very version the notice clears at once.
+        let after = self::status_for(&pool, &cfg, "0.1.0-alpha.10")
+            .await
+            .expect("status");
+        assert_eq!(after.latest, None, "already running it: no notice");
+        assert_eq!(after.notes_url, None, "no stale release-notes link");
+        assert_eq!(after.current.as_str(), "0.1.0-alpha.10");
+        // A dev build never shows the same cached notice either.
+        let dev = self::status_for(&pool, &cfg, "dev").await.expect("status");
+        assert_eq!(dev.latest, None, "a dev build never notifies");
         pool.close().await;
     }
 
