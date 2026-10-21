@@ -39,6 +39,7 @@ interface RunnerApp {
 }
 
 interface RunnerDeploy {
+  id: string;
   sha: string | null;
   status: string;
   log: string;
