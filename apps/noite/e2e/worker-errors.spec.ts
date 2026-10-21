@@ -189,6 +189,11 @@ test("a worker throw becomes an errors-tab issue", async ({
 
   expect(deployLog.log).toMatch(/sourcemaps: /u);
 
+  // The worker map must actually be stored: without it every frame below
+  // stays raw, and the mapped assertions cannot distinguish "store failed"
+  // from "read failed".
+  expect(deployLog.log).toMatch(/worker\.js\.map \(/u);
+
   // Through the lane Caddy, not the raw fleet port: the tenant site sets a
   // sampled `traceparent` and logs the same `traceID` in the access log, so
   // the ingest joins the exception to its method, path and status

@@ -1157,13 +1157,13 @@ async fn run_shadow_esbuild(
     )
     .await
     .context("shadow esbuild for the worker map")?;
-    let raw = tokio::fs::read(outdir.join("index.js.map"))
+    let map_bytes = tokio::fs::read(outdir.join("index.js.map"))
         .await
         .context("shadow esbuild wrote no map")?;
     // Normalize while the outdir still exists: entry sources are recorded
     // relative to it, and canonicalizing them away needs the tree in place
     // (deleting `.tmp-sandbox` first strands every `../..` source).
-    let outer = sourcemap::SourceMap::from_slice(&raw).context("parse shadow map")?;
+    let outer = sourcemap::SourceMap::from_slice(&map_bytes).context("parse shadow map")?;
     let root = deploy_root
         .canonicalize()
         .unwrap_or_else(|_| deploy_root.to_path_buf());
@@ -1192,13 +1192,18 @@ async fn run_shadow_esbuild(
     };
     let mut out = Vec::new();
     sanitize_sources(&composed).to_writer(&mut out)?;
+    // Read the bundle before dropping the outdir below.
+    let bundle = tokio::fs::read(outdir.join("index.js")).await.ok();
+    let Some(bundle) = bundle else {
+        anyhow::bail!("shadow esbuild wrote no bundle");
+    };
     // The worktree is wiped right after a successful deploy, but a failed one
     // keeps it for inspection: drop the sandbox tmp dir either way so no
     // `index.js.map` decoy sits beside the real entry map.
     let _ = tokio::fs::remove_dir_all(deploy_root.join(".tmp-sandbox")).await;
     Ok(Some(WorkerMap {
         map: out,
-        bundle: raw,
+        bundle,
         note,
     }))
 }
