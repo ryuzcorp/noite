@@ -3,7 +3,12 @@ import * as Schema from "effect/Schema";
 import { failUnknown } from "../auth";
 import { requireAppRole } from "../collaborators";
 import { isControlApp } from "../control-app";
-import { runnerGetError, runnerSetErrorStatus } from "../runner";
+import {
+  runnerGetError,
+  runnerGetIngestKey,
+  runnerRotateIngestKey,
+  runnerSetErrorStatus,
+} from "../runner";
 import { apiAction } from "./api";
 import { requireControlAdmin, sessionUser } from "./session.server";
 
@@ -67,6 +72,57 @@ export const setErrorStatus = apiAction(
 
     try {
       return await runnerSetErrorStatus(appId, fingerprint, status);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }
+);
+
+/** Resolve the caller role to pass the runner, mirroring requireTelemetryRole:
+ * the reserved control app has no collaborator row, so a control admin calls
+ * with `"admin"` (which satisfies every `role_ok` need); every other app
+ * passes its collaborator role through. */
+const ingestRole = async (
+  request: Request,
+  env: KitEnv,
+  appId: string,
+  need: "view" | "admin"
+): Promise<string> => {
+  if (isControlApp(appId)) {
+    await requireControlAdmin(request, env);
+
+    return "admin";
+  }
+
+  const user = await sessionUser(request, env);
+  const { role } = await requireAppRole(appId, user.id, need);
+
+  return role;
+};
+
+/** This app's public error-ingest identity (project id + key) for the DSN.
+ * View-gated: the key is public by design, it only submits errors. */
+export const ingestKey = apiAction(
+  Schema.String,
+  async (appId, { env, request }) => {
+    const role = await ingestRole(request, env, appId, "view");
+
+    try {
+      return await runnerGetIngestKey(appId, role);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }
+);
+
+/** Mint a replacement ingest key, keeping the numeric project id. Admin. */
+export const rotateIngestKey = apiAction(
+  Schema.String,
+  async (appId, { env, request }) => {
+    const role = await ingestRole(request, env, appId, "admin");
+
+    try {
+      return await runnerRotateIngestKey(appId, role);
     } catch (error) {
       failUnknown(error);
     }

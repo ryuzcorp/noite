@@ -29,8 +29,6 @@ interface Bucket {
   resetAt: number;
 }
 
-const buckets = new Map<string, Bucket>();
-
 export interface RateLimitDecision {
   allowed: boolean;
   /** Seconds until the window resets, for `Retry-After`. */
@@ -38,52 +36,81 @@ export interface RateLimitDecision {
   remaining: number;
 }
 
-/** Pure decision + bookkeeping for one key. Split out so the logic is
- * exercisable without a Request. */
-export const rateLimitDecision = (
-  key: string,
-  limit: number,
-  now: number
-): RateLimitDecision => {
-  if (limit <= 0) {
-    return { allowed: true, remaining: 0, retryAfter: 0 };
-  }
+/** One independent set of rate-limit buckets: decisions never touch another
+ * instance's counters, so attacker-chosen keys cannot evict platform buckets
+ * no matter how many distinct keys arrive. */
+export interface RateLimiter {
+  decision: (key: string, limit: number, now: number) => RateLimitDecision;
+  reset: () => void;
+}
 
-  const existing = buckets.get(key);
+/** A limiter with its own bucket store. Pure decision + bookkeeping per key,
+ * split out so the logic is exercisable without a Request. */
+export const createRateLimiter = (): RateLimiter => {
+  const buckets = new Map<string, Bucket>();
 
-  if (!existing || existing.resetAt <= now) {
-    if (buckets.size >= MAX_BUCKETS) {
-      // Drop everything already expired, then give up on the oldest entry.
-      for (const [k, v] of buckets) {
-        if (v.resetAt <= now) {
-          buckets.delete(k);
+  const decision = (
+    key: string,
+    limit: number,
+    now: number
+  ): RateLimitDecision => {
+    if (limit <= 0) {
+      return { allowed: true, remaining: 0, retryAfter: 0 };
+    }
+
+    const existing = buckets.get(key);
+
+    if (!existing || existing.resetAt <= now) {
+      if (buckets.size >= MAX_BUCKETS) {
+        // Drop everything already expired, then give up on the oldest entry.
+        for (const [entryKey, entry] of buckets) {
+          if (entry.resetAt <= now) {
+            buckets.delete(entryKey);
+          }
+        }
+
+        const oldest = buckets.keys().next();
+
+        if (!oldest.done) {
+          buckets.delete(oldest.value);
         }
       }
 
-      const oldest = buckets.keys().next();
+      buckets.set(key, { count: 1, resetAt: now + WINDOW_MS });
 
-      if (!oldest.done) {
-        buckets.delete(oldest.value);
-      }
+      return { allowed: true, remaining: limit - 1, retryAfter: 0 };
     }
 
-    buckets.set(key, { count: 1, resetAt: now + WINDOW_MS });
+    if (existing.count >= limit) {
+      return {
+        allowed: false,
+        remaining: 0,
+        retryAfter: Math.max(1, Math.ceil((existing.resetAt - now) / 1000)),
+      };
+    }
 
-    return { allowed: true, remaining: limit - 1, retryAfter: 0 };
-  }
+    existing.count += 1;
 
-  if (existing.count >= limit) {
-    return {
-      allowed: false,
-      remaining: 0,
-      retryAfter: Math.max(1, Math.ceil((existing.resetAt - now) / 1000)),
-    };
-  }
+    return { allowed: true, remaining: limit - existing.count, retryAfter: 0 };
+  };
 
-  existing.count += 1;
-
-  return { allowed: true, remaining: limit - existing.count, retryAfter: 0 };
+  return {
+    decision,
+    reset: () => {
+      buckets.clear();
+    },
+  };
 };
+
+/** The platform limiter behind the 04 middleware (per client IP, one budget
+ * per route class): a request refused here never reaches better-auth, its
+ * own limiter, or D1. */
+export const platformLimiter = createRateLimiter();
+
+/** The envelope handler's own per-key limiter: its keys come from the
+ * attacker's `sentry_key`, so they live in a store of their own and can
+ * never evict platform buckets. */
+export const envelopeLimiter = createRateLimiter();
 
 /** Client identity for the counter: the RIGHT-most forwarded address. Caddy
  * appends the peer it actually saw to whatever `X-Forwarded-For` the client
@@ -116,9 +143,16 @@ export const withTrustedClientAddress = (request: Request): Request => {
   return new Request(request, { headers });
 };
 
+/** The Sentry envelope endpoint, slash-less and slash variants: the 04
+ * middleware runs before the trailing-slash alias, so both spellings land
+ * in the same per-IP class. */
+const ENVELOPE_PATH = /^\/api\/\d+\/envelope\/?$/u;
+
 /** Route classes the platform limiter covers, each with its own budget so a
  * busy class cannot starve the other. Auth is included on purpose: a request
- * rejected here never reaches better-auth, its own limiter, or D1. */
+ * rejected here never reaches better-auth, its own limiter, or D1. The
+ * envelope endpoint is included per client IP (before its own per-key
+ * check): a random key per request still shares the sender's IP bucket. */
 export const limitedClass = (pathname: string): string | null => {
   if (pathname === "/api/invite/status") {
     return "invite";
@@ -128,10 +162,9 @@ export const limitedClass = (pathname: string): string | null => {
     return "recovery";
   }
 
-  return pathname.startsWith("/api/auth") ? "auth" : null;
-};
+  if (ENVELOPE_PATH.test(pathname)) {
+    return "envelope";
+  }
 
-/** Forget every counter (the unit tests reset between cases). */
-export const resetRateLimits = (): void => {
-  buckets.clear();
+  return pathname.startsWith("/api/auth") ? "auth" : null;
 };

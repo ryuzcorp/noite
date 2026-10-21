@@ -277,6 +277,15 @@ struct ErrorStatusParams {
     status: String,
 }
 
+/// Params for the ingest-key RPCs: the UI resolves the caller's app role and
+/// passes it; the runner enforces it (view to read, admin to rotate).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestKeyParams {
+    id: String,
+    #[serde(default)]
+    role: Option<String>,
+}
 #[derive(Deserialize)]
 struct RollbackParams {
     id: String,
@@ -819,6 +828,45 @@ async fn dispatch_call(
                 service::errors::set_status(state, &p.id, &p.fingerprint, &p.status)
                     .await
                     .map(|()| json!({ "ok": true })),
+            )
+        }
+        "errors.ingest_key" => {
+            let p: IngestKeyParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::errors::ingest_key(state, &p.id, p.role.as_deref()).await,
+            )
+        }
+        "errors.rotate_ingest_key" => {
+            let p: IngestKeyParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::errors::rotate_ingest_key(state, &p.id, p.role.as_deref()).await,
+            )
+        }
+        "errors.ingest" => {
+            let p: service::errors::SdkIngestBatch = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            if p.events.len() > 1 {
+                return rpc_err(
+                    id,
+                    JsonRpcErrorReason::InvalidParams,
+                    "at most one event per envelope".into(),
+                );
+            }
+            complete(
+                id,
+                service::errors::ingest(state, p)
+                    .await
+                    .map(|fingerprints| json!({ "fingerprints": fingerprints })),
             )
         }
         "deploys.list" => {

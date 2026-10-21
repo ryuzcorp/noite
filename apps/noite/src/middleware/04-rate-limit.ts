@@ -9,7 +9,7 @@ import {
   clientKey,
   DEFAULT_RPM,
   limitedClass,
-  rateLimitDecision,
+  platformLimiter,
 } from "../lib/rate-limit";
 
 export default defineMiddleware((c, next) => {
@@ -20,7 +20,7 @@ export default defineMiddleware((c, next) => {
     const kit = c.env as KitEnv;
     const rpm = Number(kit.NOITE_RATE_LIMIT_RPM ?? DEFAULT_RPM);
 
-    const decision = rateLimitDecision(
+    const decision = platformLimiter.decision(
       `${klass}:${clientKey(c.req.raw)}`,
       Number.isFinite(rpm) ? rpm : DEFAULT_RPM,
       Date.now()

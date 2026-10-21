@@ -28,6 +28,7 @@ import type { GitCompare } from "./runner-types/GitCompare";
 import type { GitLog } from "./runner-types/GitLog";
 import type { GitRefs } from "./runner-types/GitRefs";
 import type { GitRemote as RunnerGitRemote } from "./runner-types/GitRemote";
+import type { IngestKeyView as RunnerIngestKey } from "./runner-types/IngestKeyView";
 import type { LimitsView as RunnerLimits } from "./runner-types/LimitsView";
 import type { PrComment } from "./runner-types/PrComment";
 import type { PrDetail } from "./runner-types/PrDetail";
@@ -39,6 +40,7 @@ import type { SourceCommitBody } from "./runner-types/SourceCommitBody";
 import type { StorageItem } from "./runner-types/StorageItem";
 import type { TelemetryStatus as RunnerTelemetryStatus } from "./runner-types/TelemetryStatus";
 import type { TreeResponse as RunnerTree } from "./runner-types/TreeResponse";
+import type { SentryEventItem } from "./sentry-envelope";
 /** Server-side client for the Rust runner. Browser never sees RUNNER_TOKEN. */
 
 export type { App as RunnerApp } from "./runner-types/App";
@@ -133,6 +135,8 @@ export type { GitLog } from "./runner-types/GitLog";
 export type { GitRefs } from "./runner-types/GitRefs";
 
 export type { GitRemote as RunnerGitRemote } from "./runner-types/GitRemote";
+
+export type { IngestKeyView as RunnerIngestKey } from "./runner-types/IngestKeyView";
 
 export type { LimitsView as RunnerLimits } from "./runner-types/LimitsView";
 
@@ -289,6 +293,19 @@ interface JsonRpcEnvelope<T> {
   result?: T;
 }
 
+/** A JSON-RPC error from the runner, with its numeric code kept on the
+ * error instead of only inside the message: envelope ingest tells a wrong
+ * key from a transport failure by matching `code`, never message text. */
+export class RunnerRpcError extends Error {
+  readonly code: number;
+
+  constructor(method: string, code: number, message: string) {
+    super(`runner rpc ${method}: ${code} ${message}`);
+    this.name = "RunnerRpcError";
+    this.code = code;
+  }
+}
+
 let rpcId = 0;
 
 export const runnerRpc = async <T = unknown>(
@@ -304,9 +321,7 @@ export const runnerRpc = async <T = unknown>(
   });
 
   if (payload.error) {
-    throw new Error(
-      `runner rpc ${method}: ${payload.error.code} ${payload.error.message}`
-    );
+    throw new RunnerRpcError(method, payload.error.code, payload.error.message);
   }
 
   // SAFETY: JSON-RPC success responses always carry `result`; error responses throw above.
@@ -478,6 +493,30 @@ export const runnerSetErrorStatus = (
   status: ErrorStatus
 ) =>
   runnerRpc<{ ok: boolean }>("errors.set_status", { fingerprint, id, status });
+
+/** The app's public error-ingest identity (numeric project id + key). The
+ * runner mints the row on first view; `role` is the caller's resolved app
+ * role, enforced runner-side. */
+export const runnerGetIngestKey = (id: string, role: string) =>
+  runnerRpc<RunnerIngestKey>("errors.ingest_key", { id, role });
+
+/** Mint a replacement ingest key, keeping the numeric project id. Admin. */
+export const runnerRotateIngestKey = (id: string, role: string) =>
+  runnerRpc<RunnerIngestKey>("errors.rotate_ingest_key", { id, role });
+
+/** Record one envelope's events under the app the project number resolves
+ * to. A wrong key or unknown number fails with a 404-code RunnerRpcError;
+ * callers map that to one refusal that reveals neither. */
+export const runnerIngestErrors = (
+  projectId: number,
+  key: string,
+  events: SentryEventItem[]
+) =>
+  runnerRpc<{ fingerprints: string[] }>("errors.ingest", {
+    events,
+    key,
+    projectId,
+  });
 
 /** Custom hostnames attached to an app (all of them, in hostname order). */
 export const runnerListDomains = (id: string) =>

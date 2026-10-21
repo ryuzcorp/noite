@@ -1,15 +1,16 @@
 //! Grouped errors: the unary reads (REST route + `errors.*` RPC) and the
 //! hourly/series shaping the errors SSE stream also consumes.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::api_error::ApiError;
 use crate::db;
-use crate::host::errors::Frame;
+use crate::host::errors::{ingest_sdk, Frame, SdkEvent};
 use crate::models::ErrorIssue;
 use crate::AppState;
 
+use super::environments::role_ok;
 use super::observe::telemetry_target_or_404;
 
 pub const ERROR_STATUSES: &[&str] = &["open", "resolved", "ignored"];
@@ -62,6 +63,11 @@ pub struct ErrorEventView {
     pub browser: String,
     pub os: String,
     pub sha: String,
+    /// SDK extras (phase 2): the page URL with its query stripped, and the
+    /// release/environment the SDK reported. Empty on telemetry occurrences.
+    pub url: String,
+    pub release: String,
+    pub environment: String,
 }
 
 /// The `errors.get` result: the issue plus its recent events.
@@ -200,6 +206,9 @@ pub async fn get(
             browser: e.browser,
             os: e.os,
             sha: e.sha,
+            url: e.url,
+            release: e.release,
+            environment: e.environment,
         })
         .collect();
     Ok(ErrorIssueDetail {
@@ -222,5 +231,196 @@ pub async fn set_status(
         Ok(0) => Err(ApiError::not_found("error not found")),
         Ok(_) => Ok(()),
         Err(e) => Err(ApiError::internal(e.to_string())),
+    }
+}
+
+/// An app's public error-ingest identity: the stable numeric project id in
+/// its DSN and envelope path, plus the key that authenticates envelope posts.
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct IngestKeyView {
+    pub project_id: i64,
+    pub key: String,
+}
+
+/// `errors.ingest_key`: read the app's ingest identity, creating the row
+/// (key + number together) on first view. The key is public by design — it
+/// ships in the app's client bundle — so viewing needs only the app role.
+/// The row is created lazily: installs that predate phase 2 gain it without
+/// a backfill, and `apps.create` stays untouched.
+pub async fn ingest_key(
+    state: &AppState,
+    id: &str,
+    role: Option<&str>,
+) -> Result<IngestKeyView, ApiError> {
+    let Some(role) = role else {
+        return Err(ApiError::forbidden("the view role is required for this operation"));
+    };
+    if !role_ok(role, "view") {
+        return Err(ApiError::forbidden(format!(
+            "role {role:?} may not view this app's error reporting"
+        )));
+    }
+    let app = db::get_app(&state.pool, id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let Some(app) = app else {
+        return Err(ApiError::not_found("app not found"));
+    };
+    let key = db::get_or_create_ingest_key(&state.pool, &app.id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(IngestKeyView {
+        project_id: key.project_id,
+        key: key.key,
+    })
+}
+
+/// `errors.rotate_ingest_key`: mint a replacement key, keeping the project
+/// number (deployed SDKs keep their DSN path; only the key changes). Admin
+/// only; the old key stops working immediately.
+pub async fn rotate_ingest_key(
+    state: &AppState,
+    id: &str,
+    role: Option<&str>,
+) -> Result<IngestKeyView, ApiError> {
+    let Some(role) = role else {
+        return Err(ApiError::forbidden("the admin role is required for this operation"));
+    };
+    if !role_ok(role, "admin") {
+        return Err(ApiError::forbidden(format!(
+            "role {role:?} may not rotate this app's ingest key"
+        )));
+    }
+    let app = db::get_app(&state.pool, id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let Some(app) = app else {
+        return Err(ApiError::not_found("app not found"));
+    };
+    let key = db::rotate_ingest_key(&state.pool, &app.id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(IngestKeyView {
+        project_id: key.project_id,
+        key: key.key,
+    })
+}
+
+/// One envelope's worth of Sentry events, as the UI parsed and mapped them.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SdkIngestBatch {
+    pub project_id: i64,
+    pub key: String,
+    #[serde(default)]
+    pub events: Vec<SdkEvent>,
+}
+
+/// `errors.ingest`: record one envelope's events under the app the project
+/// number resolves to. An unknown number and a wrong key share one refusal,
+/// so the response never reveals which apps exist. Returns the fingerprints
+/// that gained occurrences (empty when the envelope held no events). The
+/// protocol allows at most one event per envelope; more is an invalid-params
+/// refusal before any database work, so a direct RPC caller cannot multiply
+/// writes with one fat batch.
+pub async fn ingest(state: &AppState, batch: SdkIngestBatch) -> Result<Vec<String>, ApiError> {
+    if batch.events.len() > 1 {
+        return Err(ApiError::bad("at most one event per envelope"));
+    }
+    let row = db::app_for_project(&state.pool, batch.project_id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let Some((app_id, live)) = row else {
+        return Err(ApiError::not_found("unknown project or key"));
+    };
+    if batch.key != live {
+        return Err(ApiError::not_found("unknown project or key"));
+    }
+    if batch.events.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sha = db::get_app(&state.pool, &app_id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .and_then(|app| app.last_deploy_sha);
+    ingest_sdk(&state.pool, &app_id, sha.as_deref(), &batch.events)
+        .await
+        .map_err(ApiError::from_anyhow)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    async fn test_state() -> AppState {
+        let dir =
+            std::env::temp_dir().join(format!("noite-ingest-cap-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        cfg.work_dir = dir.join("work").to_string_lossy().into_owned();
+        let config = Arc::new(cfg);
+        let pool = crate::db::connect(&config.database_url)
+            .await
+            .expect("connect db");
+        let (tip_tx, _tip_rx) = crate::host::tips::channel();
+        let (log_notify, _log_rx) = tokio::sync::watch::channel(0u64);
+        AppState {
+            pool,
+            config,
+            procs: crate::host::supervisor::new_procs(),
+            logs: crate::host::logs::new_state(),
+            deploying: crate::host::deploy::new_deploying(),
+            log_notify,
+            git_sync: crate::host::git_manifest::GitSync::default(),
+            tip_tx,
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            isolation: Arc::new(tokio::sync::RwLock::new(
+                crate::host::isolation::IsolationStatus::default(),
+            )),
+            state_sync: crate::host::state::StateSync::new(),
+            bucket_ok: Arc::new(tokio::sync::RwLock::new((
+                true,
+                String::new(),
+                std::time::Instant::now(),
+            ))),
+            started_at: chrono::Utc::now(),
+        }
+    }
+
+    fn event(message: &str) -> SdkEvent {
+        SdkEvent {
+            kind: "Error".into(),
+            message: message.into(),
+            frames: Vec::new(),
+            url: String::new(),
+            release: String::new(),
+            environment: String::new(),
+            user_agent: String::new(),
+            trace_id: String::new(),
+            timestamp_us: 0,
+            source: "browser".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_rejects_more_than_one_event() {
+        let state = test_state().await;
+        let batch = SdkIngestBatch {
+            project_id: 1,
+            key: "k".into(),
+            events: vec![event("one"), event("two")],
+        };
+        let err = ingest(&state, batch)
+            .await
+            .expect_err("two events must be refused");
+        assert!(
+            matches!(err, ApiError::BadRequest(_)),
+            "unexpected: {err:?}"
+        );
     }
 }

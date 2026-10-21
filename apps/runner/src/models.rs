@@ -402,6 +402,11 @@ pub struct ErrorEvent {
     pub browser: String,
     pub os: String,
     pub sha: String,
+    /// SDK extras (phase 2): the page URL with its query stripped, and the
+    /// release/environment the SDK reported. Empty on telemetry occurrences.
+    pub url: String,
+    pub release: String,
+    pub environment: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]

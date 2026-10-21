@@ -369,6 +369,11 @@ pub struct Occurrence<'a> {
     pub logs: Vec<String>,
     pub request: Option<RequestCtx>,
     pub sha: Option<&'a str>,
+    /// SDK extras (phase 2): the page URL with its query stripped, and the
+    /// release/environment the SDK reported. Empty on telemetry occurrences.
+    pub url: String,
+    pub release: String,
+    pub environment: String,
 }
 
 /// `celld.cell_fetch` → `cell_fetch`: the handler that failed.
@@ -436,6 +441,9 @@ pub async fn ingest(
             logs: trace_logs(&row.trace_id),
             request: requests.get(&row.trace_id).cloned(),
             sha: app_sha.get(app_id).map(String::as_str),
+            url: String::new(),
+            release: String::new(),
+            environment: String::new(),
         };
         let (fp, hour, n) = record(pool, &occ).await?;
         *hours.entry((app_id.clone(), fp.clone(), hour)).or_default() += n;
@@ -470,6 +478,9 @@ pub async fn ingest(
             logs: trace_logs(&row.trace_id),
             request: requests.get(&row.trace_id).cloned(),
             sha: app_sha.get(app_id).map(String::as_str),
+            url: String::new(),
+            release: String::new(),
+            environment: String::new(),
         };
         let (fp, hour, c) = record(pool, &occ).await?;
         *hours.entry((app_id.clone(), fp.clone(), hour)).or_default() += c;
@@ -534,11 +545,167 @@ async fn record(pool: &SqlitePool, occ: &Occurrence<'_>) -> anyhow::Result<(Stri
             browser: req.map(|r| r.browser).unwrap_or(""),
             os: req.map(|r| r.os).unwrap_or(""),
             sha: occ.sha.unwrap_or(""),
+            url: &occ.url,
+            release: &occ.release,
+            environment: &occ.environment,
         },
     )
     .await?;
     db::prune_error_events(pool, occ.app_id, &fp, EVENTS_PER_ISSUE).await?;
     Ok((fp, hour, occ.count))
+}
+
+/// One Sentry stack frame as the UI forwards it: oldest-first, exactly as the
+/// SDK sends it, with the SDK's own `in_app` flag (trusted per the phase-2
+/// mapping, like phase 1 trusts V8 order).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SdkFrame {
+    #[serde(default)]
+    pub function: String,
+    #[serde(default)]
+    pub location: String,
+    #[serde(default)]
+    pub in_app: bool,
+}
+
+/// One Sentry event item as the UI forwards it (already parsed from the
+/// envelope and mapped: type/message, not-yet-reversed frames, the page URL
+/// with its query stripped, release, environment and the raw user agent,
+/// which is classified here and never stored raw).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SdkEvent {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub frames: Vec<SdkFrame>,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub release: String,
+    #[serde(default)]
+    pub environment: String,
+    #[serde(default)]
+    pub user_agent: String,
+    #[serde(default)]
+    pub trace_id: String,
+    #[serde(default)]
+    pub timestamp_us: i64,
+    /// `browser` for browser SDK events, `sdk` for server SDKs.
+    #[serde(default)]
+    pub source: String,
+}
+
+/// Strip the query string and fragment the UI was supposed to remove already:
+/// defense in depth, so a query never reaches storage through this path.
+fn strip_url_query(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or("")
+}
+
+/// The URL's path for the `path` column (the breakdown the Metrics tab
+/// already keeps), defaulting to `/` when the URL carries none.
+fn url_path(url: &str) -> String {
+    let clean = strip_url_query(url);
+    let after_scheme = clean.split("://").nth(1).unwrap_or(clean);
+    let path = after_scheme.split_once('/').map(|(_, rest)| rest).unwrap_or("");
+    format!("/{path}")
+}
+
+/// An SDK event as the stored parse: kind/message clipped like phase 1, no
+/// log context, and frames reversed from Sentry's oldest-first to phase 1's
+/// newest-first so the fingerprint reads the same in-app names in the same
+/// order. Pure, so the grouping parity with `parse_span_error` is a unit
+/// test, not an integration one.
+fn sdk_parsed(event: &SdkEvent) -> ParsedError {
+    let frames: Vec<Frame> = event
+        .frames
+        .iter()
+        .rev()
+        .take(MAX_FRAMES)
+        .map(|f| Frame {
+            function: clip(&f.function, MAX_MESSAGE),
+            location: clip(&f.location, MAX_MESSAGE),
+            in_app: f.in_app,
+        })
+        .collect();
+    ParsedError {
+        kind: if event.kind.is_empty() {
+            "Error".to_string()
+        } else {
+            clip(&event.kind, MAX_MESSAGE)
+        },
+        message: clip(&event.message, MAX_MESSAGE),
+        frames,
+        context: String::new(),
+    }
+}
+
+/// Turn one envelope batch into stored issues through the same `record` path
+/// as the telemetry ingest, so fingerprints match phase 1's for the same
+/// exception. Returns the fingerprints that gained occurrences. Hour buckets
+/// aggregate in memory first (replace semantics, like `ingest`), so two
+/// events of one issue in one envelope count twice instead of overwriting
+/// each other.
+pub async fn ingest_sdk(
+    pool: &SqlitePool,
+    app_id: &str,
+    sha: Option<&str>,
+    events: &[SdkEvent],
+) -> anyhow::Result<Vec<String>> {
+    let mut counts: HashMap<(String, String, String), i64> = HashMap::new();
+    let mut issues: HashSet<(String, String)> = HashSet::new();
+    let mut fps = Vec::new();
+    for event in events {
+        // Sentry lists frames oldest-first; phase 1 stores newest-first, and
+        // the fingerprint reads the first in-app frames — reverse so the same
+        // exception groups with its telemetry twin (see `sdk_parsed`).
+        let parsed = sdk_parsed(event);
+        let source: &'static str = if event.source == "browser" { "browser" } else { "sdk" };
+        let (browser, os) = super::accesslog::device_classify(&event.user_agent);
+        let url = strip_url_query(&event.url).to_string();
+        let ts = if event.timestamp_us > 0 {
+            event.timestamp_us
+        } else {
+            super::metrics::now_us()
+        };
+        let occ = Occurrence {
+            app_id,
+            parsed,
+            source,
+            handler: source.to_string(),
+            cell: String::new(),
+            trace_id: event.trace_id.clone(),
+            count: 1,
+            first_us: ts,
+            last_us: ts,
+            logs: Vec::new(),
+            request: Some(RequestCtx {
+                method: String::new(),
+                path: url_path(&url),
+                status: 0,
+                browser,
+                os,
+            }),
+            sha,
+            url,
+            release: clip(&event.release, MAX_MESSAGE),
+            environment: clip(&event.environment, MAX_MESSAGE),
+        };
+        let (fp, hour, n) = record(pool, &occ).await?;
+        *counts.entry((app_id.to_string(), fp.clone(), hour)).or_default() += n;
+        issues.insert((app_id.to_string(), fp.clone()));
+        fps.push(fp);
+    }
+    for ((app_id, fp, hour), n) in &counts {
+        db::set_error_hour(pool, app_id, fp, hour, *n).await?;
+    }
+    for (app_id, fp) in &issues {
+        db::refresh_error_issue_count(pool, app_id, fp).await?;
+    }
+    Ok(fps)
 }
 
 #[cfg(test)]
@@ -674,5 +841,119 @@ mod tests {
         }
         assert!(idx.get("a").is_none());
         assert!(idx.map.len() <= REQUEST_CAP);
+    }
+
+    fn sdk_twin() -> SdkEvent {
+        // The same exception as `parses_uncaught_span_errors`, in Sentry's
+        // oldest-first frame order with the SDK's in_app flags.
+        SdkEvent {
+            kind: "PaymentError".to_string(),
+            message: "card declined for amount 500".to_string(),
+            frames: vec![
+                SdkFrame {
+                    function: "fetch".to_string(),
+                    location: "worker.js:34:9".to_string(),
+                    in_app: true,
+                },
+                SdkFrame {
+                    function: "chargeCard".to_string(),
+                    location: "worker.js:21:27".to_string(),
+                    in_app: true,
+                },
+            ],
+            url: "https://shop.example.com/checkout?plan=pro#pay".to_string(),
+            release: "shop@2.0.1".to_string(),
+            environment: "production".to_string(),
+            user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36".to_string(),
+            trace_id: "sdk-trace-1".to_string(),
+            timestamp_us: 1_789_000_000_000_000,
+            source: "browser".to_string(),
+        }
+    }
+
+    #[test]
+    fn sdk_events_group_with_their_telemetry_twin() {
+        let twin = parse_span_error(
+            "rejected: PaymentError: card declined for amount 500 [at chargeCard (worker.js:21:27) <- at fetch (worker.js:34:9)]",
+        );
+        let parsed = sdk_parsed(&sdk_twin());
+        assert_eq!(parsed.kind, "PaymentError");
+        assert_eq!(parsed.frames[0].function, "chargeCard");
+        assert_eq!(parsed.frames[1].function, "fetch");
+        assert_eq!(fingerprint(&parsed), fingerprint(&twin));
+        assert_eq!(culprit(&parsed), "chargeCard (worker.js:21)");
+    }
+
+    #[test]
+    fn sdk_urls_lose_query_and_fragment_but_keep_path() {
+        assert_eq!(strip_url_query("https://a.example/x?y=1#z"), "https://a.example/x");
+        assert_eq!(url_path("https://shop.example.com/checkout?plan=pro"), "/checkout");
+        assert_eq!(url_path("https://shop.example.com"), "/");
+        assert_eq!(url_path("/already/a/path"), "/already/a/path");
+    }
+
+    /// In-memory pool with the metrics schema attached (the `db::errors`
+    /// tests' pattern): `ingest_sdk` writes issues, events and hour buckets
+    /// there, never to the main schema.
+    async fn metrics_pool() -> SqlitePool {
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn: &mut sqlx::sqlite::SqliteConnection, _| {
+                Box::pin(async move {
+                    crate::db::attach_metrics!(conn, ":memory:");
+                    Ok::<_, sqlx::Error>(())
+                })
+            })
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory db")
+    }
+
+    #[tokio::test]
+    async fn ingest_sdk_stores_browser_occurrences_with_extras() {
+        let pool = metrics_pool().await;
+        let fps = ingest_sdk(&pool, "app-x", Some("abc123"), &[sdk_twin()])
+            .await
+            .expect("ingest");
+        assert_eq!(fps.len(), 1);
+        let twin = parse_span_error(
+            "rejected: PaymentError: card declined for amount 500 [at chargeCard (worker.js:21:27) <- at fetch (worker.js:34:9)]",
+        );
+        assert_eq!(fps[0], fingerprint(&twin));
+        let issue = crate::db::get_error_issue(&pool, "app-x", &fps[0])
+            .await
+            .expect("issue read")
+            .expect("issue");
+        assert_eq!(issue.source, "browser");
+        assert_eq!(issue.count, 1);
+        let events = crate::db::list_error_events(&pool, "app-x", &fps[0])
+            .await
+            .expect("events read");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].url, "https://shop.example.com/checkout");
+        assert_eq!(events[0].release, "shop@2.0.1");
+        assert_eq!(events[0].environment, "production");
+        assert_eq!(events[0].path, "/checkout");
+        assert_eq!(events[0].browser, "Chrome");
+        assert_eq!(events[0].os, "macOS");
+        assert_eq!(events[0].sha, "abc123");
+    }
+
+    #[tokio::test]
+    async fn ingest_sdk_counts_two_envelope_events_in_one_hour() {
+        let pool = metrics_pool().await;
+        let mut second = sdk_twin();
+        second.trace_id = "sdk-trace-2".to_string();
+        let fps = ingest_sdk(&pool, "app-x", None, &[sdk_twin(), second])
+            .await
+            .expect("ingest");
+        assert_eq!(fps[0], fps[1]);
+        let issue = crate::db::get_error_issue(&pool, "app-x", &fps[0])
+            .await
+            .expect("issue read")
+            .expect("issue");
+        // Replace-semantics buckets aggregate in memory first: both events
+        // count instead of the second hour write overwriting the first.
+        assert_eq!(issue.count, 2);
     }
 }

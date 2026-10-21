@@ -132,6 +132,9 @@ pub struct NewErrorEvent<'a> {
     pub browser: &'a str,
     pub os: &'a str,
     pub sha: &'a str,
+    pub url: &'a str,
+    pub release: &'a str,
+    pub environment: &'a str,
 }
 
 /// Insert one occurrence unless the same one (issue + timestamp + trace) is
@@ -142,8 +145,9 @@ pub async fn insert_error_event(pool: &SqlitePool, e: &NewErrorEvent<'_>) -> sql
     sqlx::query(
         r#"INSERT INTO metrics.app_error_event
            (app_id, fingerprint, ts_us, trace_id, source, handler, cell, kind, message,
-            context, frames, logs, method, path, http_status, browser, os, sha)
-           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            context, frames, logs, method, path, http_status, browser, os, sha,
+            url, release, environment)
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
            WHERE NOT EXISTS (
              SELECT 1 FROM metrics.app_error_event
               WHERE app_id = ? AND fingerprint = ? AND ts_us = ? AND trace_id = ?
@@ -167,6 +171,9 @@ pub async fn insert_error_event(pool: &SqlitePool, e: &NewErrorEvent<'_>) -> sql
     .bind(e.browser)
     .bind(e.os)
     .bind(e.sha)
+    .bind(e.url)
+    .bind(e.release)
+    .bind(e.environment)
     .bind(e.app_id)
     .bind(e.fingerprint)
     .bind(e.ts_us)
@@ -250,7 +257,7 @@ pub async fn list_error_events(
 ) -> sqlx::Result<Vec<ErrorEvent>> {
     sqlx::query_as::<_, ErrorEvent>(
         "SELECT ts_us, trace_id, source, handler, cell, kind, message, context, frames, logs, \
-                method, path, http_status, browser, os, sha \
+                method, path, http_status, browser, os, sha, url, release, environment \
          FROM metrics.app_error_event WHERE app_id = ? AND fingerprint = ? \
          ORDER BY ts_us DESC, rowid DESC",
     )

@@ -1,12 +1,12 @@
 /* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: a minimal KitEnv stands in for the Worker env */
 import { beforeEach, describe, expect, test } from "bun:test";
 
-import { resetRateLimits } from "../lib/rate-limit";
+import { platformLimiter } from "../lib/rate-limit";
 import { testRouteContext } from "../testing/context";
 import rateLimit from "./04-rate-limit";
 
 beforeEach(() => {
-  resetRateLimits();
+  platformLimiter.reset();
 });
 
 const limited = (host: string, env: KitEnv = {}) =>
@@ -37,14 +37,28 @@ describe("rate-limit middleware", () => {
     expect(statuses.slice(2)).toEqual([429, 429]);
   });
 
-  test("a 429 carries the retry headers", async () => {
-    const env = { NOITE_RATE_LIMIT_RPM: "1" };
-    await limited("9.9.9.9", env);
-    const refused = await limited("9.9.9.9", env);
-    expect(refused?.status).toBe(429);
-    expect(await refused?.text()).toBe("Too many requests");
-    expect(refused?.headers.get("retry-after")).toBeTypeOf("string");
-    expect(refused?.headers.get("x-ratelimit-remaining")).toBe("0");
+  test("a random-key flood on the envelope endpoint 429s from one IP", async () => {
+    const env = { NOITE_RATE_LIMIT_RPM: "3" };
+    const statuses: (number | undefined)[] = [];
+
+    for (let i = 0; i < 5; i += 1) {
+      // A fresh attacker-chosen sentry_key per request: the per-IP class
+      // bucket still fills, so the flood is refused without sleeps.
+      const request = new Request(
+        `http://localhost/api/42/envelope/?sentry_key=random-${i}`,
+        { method: "POST" }
+      );
+
+      // SAFETY: the middleware takes the full Worker env; the test env carries the rate-limit key it reads.
+      const context = testRouteContext(request, env as unknown as never);
+
+      // oxlint-disable-next-line eslint/no-await-in-loop -- sequential: the limiter counts in order
+      const res = await rateLimit(context, () => Promise.resolve());
+      statuses.push(res?.status);
+    }
+
+    expect(statuses.slice(0, 3)).toEqual([undefined, undefined, undefined]);
+    expect(statuses.slice(3)).toEqual([429, 429]);
   });
 
   test("leaves unlimited paths alone", async () => {

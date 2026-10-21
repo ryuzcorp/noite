@@ -29,9 +29,29 @@ The **Errors** tab collects exceptions without an SDK. Noite reads them from the
 - **Triage:** anyone with push access can resolve, ignore or reopen an error. A resolved error that happens again reopens and is marked _Regressed_. An ignored one keeps counting but never reopens.
 - **Retention** follows telemetry retention (`RUNNER_TELEMETRY_RETENTION_DAYS`, 30 days by default).
 
-:::note
+### Browser errors via Sentry
+
+Server-side errors need no SDK, but anything thrown in the browser needs the stock Sentry SDK pointed at Noite. Install `@sentry/browser` and initialize it with the DSN from Settings → Error reporting:
+
+```ts
+import * as Sentry from "@sentry/browser";
+
+Sentry.init({
+  dsn: "https://<key>@<control-host>/<n>",
+  release: "my-app@1.0.0",
+  environment: "production",
+});
+```
+
+Browser events land in the same Errors tab with the same grouping, labelled **Browser**, and each occurrence keeps the page URL plus the release and environment rows. Envelopes are gzipped by the SDK, capped at 200 KB, and non-error items (transactions, sessions, replays, attachments, client reports) are accepted and dropped with a 200 so the SDK never retries them.
+
+::::note
 Stack locations point into the bundle celld runs (`worker.js:58`), not your source files. Source-mapped stacks are planned.
-:::
+::::
+
+::::note
+`@sentry/cloudflare` inside the Worker is _untested_ until an AsyncLocalStorage spike on celld confirms it.
+::::
 
 ## Events, insights, devices, paths, refs
 

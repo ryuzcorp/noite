@@ -12,6 +12,7 @@ import { CollaboratorsPanel } from "./collaborators";
 import { AppDangerZone } from "./danger";
 import { CustomDomainsPanel } from "./domains";
 import { EnvVarsPanel } from "./env";
+import { ErrorReportingPanel } from "./error-reporting";
 import { AppIdentityForm } from "./identity";
 import { RateLimitsPanel } from "./limits";
 
@@ -76,6 +77,9 @@ export const AppSettingsPanel = () => {
       </div>
       <div class={SECTION_CLASS}>
         <RateLimitsPanel appId={gate.appId} myRole={gate.myRole} />
+      </div>
+      <div class={SECTION_CLASS}>
+        <ErrorReportingPanel appId={gate.appId} myRole={gate.myRole} />
       </div>
       <div class={SECTION_CLASS}>
         <CollaboratorsPanel appId={gate.appId} myRole={gate.myRole} />

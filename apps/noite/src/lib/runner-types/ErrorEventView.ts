@@ -4,4 +4,9 @@ import type { Frame } from "./Frame";
 /**
  * One stored occurrence with its frames/logs parsed from their JSON text.
  */
-export type ErrorEventView = { tsUs: number, traceId: string, source: string, handler: string, cell: string, kind: string, message: string, context: string, frames: Array<Frame>, logs: Array<string>, method: string, path: string, httpStatus: number, browser: string, os: string, sha: string, };
+export type ErrorEventView = { tsUs: number, traceId: string, source: string, handler: string, cell: string, kind: string, message: string, context: string, frames: Array<Frame>, logs: Array<string>, method: string, path: string, httpStatus: number, browser: string, os: string, sha: string, 
+/**
+ * SDK extras (phase 2): the page URL with its query stripped, and the
+ * release/environment the SDK reported. Empty on telemetry occurrences.
+ */
+url: string, release: string, environment: string, };
