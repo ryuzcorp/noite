@@ -702,6 +702,15 @@ fn esbuild_bin() -> String {
 /// celld 0.6.1's exact bundle flags plus `--sourcemap`: the shadow bundle must
 /// map the same bytes celld deployed, so every flag that shapes the output is
 /// mirrored (no `--minify`: celld does not minify either).
+/// celld 0.6.1's CommonJS-builtin bridge, passed as `--banner:js` so the
+/// shadow bundle is byte-identical to the deployed one (Apache-2.0,
+/// denoland/celld `crates/celld/deploy.rs` `run_esbuild`; without it every
+/// mapping sits nine lines too early). Wrangler `define`/`rules` need no
+/// mirroring: the runner strips those keys before `celld deploy`, so celld
+/// always runs on its `BundleConfig` defaults (empty defines, `.wasm=copy`)
+/// — the same flags below.
+const ESBUILD_BANNER: &str = "var require = (id) => {\n  const name = String(id);\n  const builtin = process.getBuiltinModule(name);\n  if (builtin === undefined) {\n    const error = new Error(`Cannot find module '${name}'`);\n    error.code = \"MODULE_NOT_FOUND\";\n    throw error;\n  }\n  return builtin;\n};";
+
 fn esbuild_args(entry: &str, outdir: &str) -> Vec<String> {
     let mut args = vec![
         entry.to_string(),
@@ -710,6 +719,7 @@ fn esbuild_args(entry: &str, outdir: &str) -> Vec<String> {
         "--platform=browser".to_string(),
         "--target=es2024".to_string(),
         "--conditions=workerd,worker,browser".to_string(),
+        format!("--banner:js={ESBUILD_BANNER}"),
         "--external:node:*".to_string(),
         "--external:cloudflare:*".to_string(),
         "--loader:.wasm=copy".to_string(),
@@ -780,6 +790,15 @@ fn strip_to_root(root: &Path, abs: &Path) -> Option<String> {
 /// Both maps are 0-based; the composed map names the build's sources.
 /// Token counts are capped ([`MAX_CHAIN_TOKENS`]): past that the outer map
 /// passes through unchained instead of burning the deploy task.
+///
+/// Distinct source names for deploy-log diagnostics, capped at `limit`.
+fn distinct_sources(sm: &sourcemap::SourceMap, limit: usize) -> Vec<&str> {
+    let mut sources: Vec<&str> = sm.tokens().filter_map(|t| t.get_source()).collect();
+    sources.sort();
+    sources.dedup();
+    sources.truncate(limit);
+    sources
+}
 pub fn chain_maps(
     outer: &sourcemap::SourceMap,
     inner: &sourcemap::SourceMap,
@@ -1038,23 +1057,14 @@ async fn run_shadow_esbuild(
     let (composed, note) = match sibling_bytes {
         Some(bytes) => match sourcemap::SourceMap::from_slice(&bytes) {
             Ok(inner) => {
-                // Deploy-log diagnostics: the entry the shadow was chained
-                // through, plus both maps' source sets, so a mismatch is
-                // diagnosable from the deploy log alone.
-                let mut outer_sources: Vec<&str> =
-                    normalized.tokens().filter_map(|t| t.get_source()).collect();
-                outer_sources.sort();
-                outer_sources.dedup();
-                let inner_tokens = inner.tokens().count();
-                let mut inner_sources: Vec<&str> =
-                    inner.tokens().filter_map(|t| t.get_source()).collect();
-                inner_sources.sort();
-                inner_sources.dedup();
                 let chained = chain_maps(&normalized, &inner, &entry_source);
+                // Deploy-log diagnostics: the entry the shadow was chained
+                // through, plus both maps' source sets (first few), so a
+                // mismatch is diagnosable from the deploy log alone.
                 let note = format!(
-                    "shadow map chained through the build map (entry {entry_source}; outer {:?}; inner {} sources, {inner_tokens} tokens: {inner_sources:?})",
-                    outer_sources,
-                    inner_sources.len(),
+                    "shadow map chained through the build map (entry {entry_source}; outer {:?}; inner {:?})",
+                    distinct_sources(&normalized, 3),
+                    distinct_sources(&inner, 3),
                 );
                 (chained, note)
             }
@@ -1391,6 +1401,59 @@ async fn put_bytes(cfg: &Config, key: &str, bytes: &[u8]) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real-tool fixtures, generated once with the lane's pinned esbuild
+    /// (0.25.12) over the vite sample build: the shadow map the runner would
+    /// store for a deploy, and the Vite worker map it chains through.
+    /// Assert exact composed positions: this is the composition the Errors
+    /// tab reads at `errors.get` time.
+    const FIXTURE_SHADOW_MAP: &[u8] =
+        include_bytes!("testdata/sourcemaps/dist/.tmp-sandbox/shadow-maps/shadow.js.map");
+    const FIXTURE_ENTRY_MAP: &[u8] =
+        include_bytes!("testdata/sourcemaps/dist/vite_sample/entry.js.map");
+    const FIXTURE_ENTRY_JS: &[u8] = include_bytes!("testdata/sourcemaps/dist/vite_sample/entry.js");
+
+    #[test]
+    fn real_shadow_map_chains_to_original_sources() {
+        // Mirror the deploy layout the store sees: deploy root with the
+        // worker entry beside its map, and the shadow outdir two levels
+        // below it (so the shadow map's `../../` sources resolve).
+        let dir =
+            std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("dist");
+        let outdir = root.join(".tmp-sandbox").join("shadow-maps");
+        std::fs::create_dir_all(&outdir).expect("shadow dir");
+        std::fs::create_dir_all(root.join("vite_sample")).expect("entry dir");
+        std::fs::write(root.join("vite_sample").join("index.js"), FIXTURE_ENTRY_JS).expect("entry");
+        let root = root.canonicalize().expect("canonical root");
+        let outer = sourcemap::SourceMap::from_slice(FIXTURE_SHADOW_MAP).expect("parse shadow map");
+        // Normalization names repo-relative paths, never the temp dir.
+        let norm = normalize_sources(&root, &outdir, &outer);
+        assert!(norm
+            .tokens()
+            .filter_map(|t| t.get_source())
+            .all(|s| s == "vite_sample/index.js"));
+        let inner = sourcemap::SourceMap::from_slice(FIXTURE_ENTRY_MAP).expect("parse entry map");
+        let chained = chain_maps(&norm, &inner, "vite_sample/index.js");
+        let manifest = MapManifest {
+            worker: Some("worker.js.map".to_string()),
+            assets_dir: None,
+            files: HashMap::new(),
+        };
+        let load = |_: &str| Some(Arc::new(chained.clone()));
+        // The deployed throw site, 1-based as V8 prints it.
+        let mut frames = vec![frame_at("worker.js:17:46")];
+        let mut budget = SymbolicateBudget::for_read();
+        assert_eq!(
+            symbolicate_with(&mut frames, &manifest, &load, &mut budget),
+            1
+        );
+        assert_eq!(
+            frames[0].mapped_location.as_deref(),
+            Some("../../src/index.ts:14:13")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// One zero-based token map: `generated -> (source:line:col, name)`.
     type MapEntries<'a> = [((u32, u32), (&'a str, u32, u32), Option<&'a str>)];
