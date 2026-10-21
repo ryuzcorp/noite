@@ -1037,10 +1037,27 @@ async fn run_shadow_esbuild(
     let entry_source = entry.rel.to_string_lossy().replace('\\', "/");
     let (composed, note) = match sibling_bytes {
         Some(bytes) => match sourcemap::SourceMap::from_slice(&bytes) {
-            Ok(inner) => (
-                chain_maps(&normalized, &inner, &entry_source),
-                "shadow map chained through the build map".to_string(),
-            ),
+            Ok(inner) => {
+                // Deploy-log diagnostics: the entry the shadow was chained
+                // through, plus both maps' source sets, so a mismatch is
+                // diagnosable from the deploy log alone.
+                let mut outer_sources: Vec<&str> =
+                    normalized.tokens().filter_map(|t| t.get_source()).collect();
+                outer_sources.sort();
+                outer_sources.dedup();
+                let inner_tokens = inner.tokens().count();
+                let mut inner_sources: Vec<&str> =
+                    inner.tokens().filter_map(|t| t.get_source()).collect();
+                inner_sources.sort();
+                inner_sources.dedup();
+                let chained = chain_maps(&normalized, &inner, &entry_source);
+                let note = format!(
+                    "shadow map chained through the build map (entry {entry_source}; outer {:?}; inner {} sources, {inner_tokens} tokens: {inner_sources:?})",
+                    outer_sources,
+                    inner_sources.len(),
+                );
+                (chained, note)
+            }
             Err(_) => (
                 normalized,
                 "shadow map (build map did not parse)".to_string(),
