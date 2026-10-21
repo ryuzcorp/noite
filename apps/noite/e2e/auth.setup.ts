@@ -39,9 +39,38 @@ setup("register e2e account", async ({ page }) => {
     "href",
     "https://github.com/sponsors/ryuzdev"
   );
+
+  // The Finish click fires the onboarding write; the reload below must wait
+  // for it — navigation aborts the in-flight POST and the account stays
+  // un-onboarded, so the tour would pop over every later spec's pages.
+  const completed = page.waitForResponse(
+    (response) => response.url().includes("/api/account/completeOnboarding"),
+    { timeout: 30_000 }
+  );
+
   await page.locator("#onboarding-finish").click();
+  const completedResponse = await completed;
+
+  if (!completedResponse.ok()) {
+    throw new Error(
+      `completeOnboarding failed with ${completedResponse.status()}`
+    );
+  }
+
   await expect(dialog).toBeHidden();
   await page.reload();
+  // The dialog hides optimistically on click, so hidden-before-session
+  // proves nothing: wait until the reloaded session carries the marker.
+  await expect(async () => {
+    const res = await page.request.get("/api/auth/get-session");
+
+    // SAFETY: better-auth get-session answers { user } on success (verified ok above).
+    const body = (await res.json()) as {
+      user?: { onboardedAt?: unknown };
+    };
+
+    expect(body.user?.onboardedAt ?? null).not.toBeNull();
+  }).toPass({ timeout: 30_000 });
   await expect(page.getByRole("dialog")).toBeHidden();
 
   await page.context().storageState({ path: authFile });

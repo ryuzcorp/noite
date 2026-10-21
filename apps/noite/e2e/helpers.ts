@@ -305,8 +305,38 @@ export const registerInviteeAccount = async (
   await page.goto("/apps");
   await page.locator("#onboarding-next").click();
   await page.locator("#onboarding-next").click();
+
+  // The Finish click fires the onboarding write; the reload below must wait
+  // for it — navigation aborts the in-flight POST, the account stays
+  // un-onboarded, and the tour pops over every later page in this context
+  // (prs.spec's mintApiKey click starved behind it for the full 30 s).
+  const completed = page.waitForResponse(
+    (response) => response.url().includes("/api/account/completeOnboarding"),
+    { timeout: 30_000 }
+  );
+
   await page.locator("#onboarding-finish").click();
+  const completedResponse = await completed;
+
+  if (!completedResponse.ok()) {
+    throw new Error(
+      `completeOnboarding failed with ${completedResponse.status()}`
+    );
+  }
+
   await page.reload();
+  // The dialog hides optimistically on click, so hidden-before-session
+  // proves nothing: wait until the reloaded session carries the marker.
+  await expect(async () => {
+    const res = await page.request.get("/api/auth/get-session");
+
+    // SAFETY: better-auth answers the session object or null; only the onboarded marker is read.
+    const session = (await res.json()) as {
+      user?: { onboardedAt?: unknown };
+    };
+
+    expect(session.user?.onboardedAt ?? null).not.toBeNull();
+  }).toPass({ timeout: 30_000 });
   await expect(page.getByRole("dialog")).toBeHidden();
 
   return { context, page };
