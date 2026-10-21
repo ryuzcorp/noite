@@ -20,6 +20,7 @@ import {
 } from "$lib/ui/icons";
 import { createPaneGroup, MORPH_PRESERVE } from "$lib/ui/resizable";
 import { ResizeHandle } from "$lib/ui/resize-handle";
+import { UpdateBanner } from "$lib/update/banner";
 import { Link, useLink, useRouter } from "@ilha/void";
 import { atom, watch } from "ilha";
 import type { View } from "ilha";
@@ -296,6 +297,7 @@ export default function DashboardLayout({ children }: { children?: View }) {
               />
             </Link>
           </div>
+          <UpdateBanner />
           {children}
         </div>
       </div>

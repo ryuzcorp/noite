@@ -39,4 +39,5 @@ pub mod storage;
 pub mod supervisor;
 pub mod telemetry_report;
 pub mod tips;
+pub mod update_check;
 pub mod web_commit;

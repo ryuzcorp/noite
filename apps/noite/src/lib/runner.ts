@@ -40,6 +40,7 @@ import type { SourceCommitBody } from "./runner-types/SourceCommitBody";
 import type { StorageItem } from "./runner-types/StorageItem";
 import type { TelemetryStatus as RunnerTelemetryStatus } from "./runner-types/TelemetryStatus";
 import type { TreeResponse as RunnerTree } from "./runner-types/TreeResponse";
+import type { UpdateStatus as RunnerUpdateStatus } from "./runner-types/UpdateStatus";
 import type { SentryEventItem } from "./sentry-envelope";
 /** Server-side client for the Rust runner. Browser never sees RUNNER_TOKEN. */
 
@@ -181,6 +182,8 @@ export type { TelemetryStatus as RunnerTelemetryStatus } from "./runner-types/Te
 export type { TreeEntry } from "./runner-types/TreeEntry";
 
 export type { TreeResponse as RunnerTree } from "./runner-types/TreeResponse";
+
+export type { UpdateStatus as RunnerUpdateStatus } from "./runner-types/UpdateStatus";
 
 const readEnv = (): KitEnv => {
   hydrateControlEnv();
@@ -403,6 +406,17 @@ export const runnerTelemetryGet = () =>
  * setting is locked the preference is stored but effective stays disabled. */
 export const runnerTelemetrySet = (enabled: boolean) =>
   runnerRpc<RunnerTelemetryStatus>("telemetry.set", { enabled });
+
+/** Opt-out update check: effective + stored state, the lock, the running
+ * version and the newest release seen. */
+export const runnerUpdateGet = () =>
+  runnerRpc<RunnerUpdateStatus>("instance.update_status", {});
+
+/** Store the opt-out preference; returns the same status shape. Enabling
+ * runs one immediate check, so the banner can appear without waiting for
+ * the next hourly tick; a failed fetch keeps the last result. */
+export const runnerUpdateSet = (enabled: boolean) =>
+  runnerRpc<RunnerUpdateStatus>("instance.update_set", { enabled });
 
 export const runnerListApps = () => runnerRpc<RunnerApp[]>("apps.list", {});
 

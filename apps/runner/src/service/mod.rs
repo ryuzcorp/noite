@@ -22,3 +22,4 @@ pub mod prs;
 pub mod source;
 pub mod storage;
 pub mod telemetry;
+pub mod update_check;

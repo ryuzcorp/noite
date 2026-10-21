@@ -44,6 +44,14 @@ What a visitor sees in that window is a delayed response, not an error: the edge
 
 An upgrade that changes the telemetry ingest (the 0.1.0-alpha.3 release) also queues a **one-time replay of the retention window**: every fleet's telemetry is re-read through the now-idempotent ingest so rows an older version dropped are recovered. It runs in the background, bounded by `RUNNER_TELEMETRY_RETENTION_DAYS`, and is documented under [Telemetry](/self-hosting/storage#replaying-a-window).
 
+### Release check (opt-out)
+
+The runner watches for new releases so admins hear about them in the control UI: **on by default**, once a day, it makes one anonymous `GET` of the public release list (`https://api.github.com/repos/ryuzcorp/noite/releases` — a fixed URL, a fixed `noite-update-check` User-Agent, no auth) and shows admins a dismissible banner when a newer **promoted** release exists on the install's channel (`alpha` hears about every promoted release, a final release only about finals; `dev` and SHA builds never notify). Drafts and unpromoted pre-releases never notify.
+
+**What is sent:** nothing about the instance. The request carries no version, no install id, no identifiers of any kind — it reads the same public list a browser would. Failures are silent (a debug log) and keep the last result.
+
+**Turning it off:** clear **Check for new Noite releases** on `/account` (Admin tab) and save, or set `NOITE_UPDATE_CHECK=0` in `/opt/noite/.env` and recreate (`false` and `off` work too; the installer accepts it as well). The variable wins over the UI toggle, and the card says so while it applies. `make doctor` reports the check state and the newest release seen.
+
 Stop-budget tuning lives in [Environment variables](/reference/environment-variables).
 
 ## Backups

@@ -97,6 +97,18 @@ if [ -n "$snapshot_owner" ]; then
 fi
 
 check "runner API auth" api -H "Authorization: Bearer ${TOKEN}" "${API}/v1/apps"
+# Opt-out release check (SPEC, update check): on/off plus the newest release
+# the runner has seen. Informational only — an unanswered endpoint must not
+# fail the health check.
+update_body="$(api -H "Authorization: Bearer ${TOKEN}" "${API}/v1/admin/update" 2>/dev/null || true)"
+if [ -n "$update_body" ]; then
+  update_enabled="$(printf '%s' "$update_body" | sed -n 's/.*"enabled":\([^,}]*\).*/\1/p')"
+  update_latest="$(printf '%s' "$update_body" | sed -n 's/.*"latest":\("[^"]*"\|null\).*/\1/p' | tr -d '"')"
+  echo "ok   update check ${update_enabled} (latest seen: ${update_latest:-none})"
+else
+  echo "WARN update check: no answer from /v1/admin/update"
+fi
+
 # Ask for HTML like a browser: the control worker's page router answers a
 # bare `Accept: */*` with 404 (API routes and assets are unaffected).
 check "edge serves the control UI" sh -c "curl -fs -H 'Host: ${BASE_HOST}' -H 'Accept: text/html' '${EDGE}/' | grep -qi '<html'"

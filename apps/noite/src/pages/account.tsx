@@ -1,4 +1,5 @@
 import { isInstanceAdmin, TelemetryCard } from "$lib/account/admin-telemetry";
+import { UpdateCard } from "$lib/account/admin-update";
 import { AccountPanel } from "$lib/account/panel";
 import { DetailShell, DetailTabs } from "$lib/app-detail/shell";
 import { CONTROL_APP_ID, CONTROL_APP_NAME } from "$lib/control-app";
@@ -78,6 +79,7 @@ export default function Account() {
       {active === "admin" ? (
         <>
           <TelemetryCard />
+          <UpdateCard />
           <AdminHomeCard />
         </>
       ) : null}

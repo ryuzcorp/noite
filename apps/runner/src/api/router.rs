@@ -32,6 +32,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/admin/telemetry",
             get(api::get_telemetry).put(api::set_telemetry),
         )
+        .route(
+            "/v1/admin/update",
+            get(api::get_update_status).put(api::set_update_status),
+        )
         .route("/v1/apps", get(api::list_apps).post(api::create_app))
         .route(
             "/v1/apps/{id}",

@@ -34,6 +34,7 @@ import type {
   RunnerIngestKey,
   RunnerLimits,
   RunnerTelemetryStatus,
+  RunnerUpdateStatus,
   StorageItem,
 } from "./runner";
 import { clearSwrStore } from "./swr-store";
@@ -155,6 +156,7 @@ export const keys = {
   session: "session",
   signupPolicy: "signup:policy",
   telemetry: "admin:telemetry",
+  update: "admin:update",
 } as const;
 
 export const appDetail = (id: string) =>
@@ -314,6 +316,13 @@ export const adminStatus = () =>
 export const telemetry = () =>
   tracked(keys.telemetry, () =>
     api<RunnerTelemetryStatus>("/api/telemetry/getTelemetry", {})
+  );
+
+/** Opt-out update-check state (admin-only server side): the toggle, the
+ * lock, the running version and the newest release seen. */
+export const updateStatus = () =>
+  tracked(keys.update, () =>
+    api<RunnerUpdateStatus>("/api/update/getUpdateStatus", {})
   );
 
 export const inviteCodes = () =>

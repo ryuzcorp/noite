@@ -81,6 +81,9 @@ services:
       # value but 0 locks it off.
       NOITE_TELEMETRY: ${NOITE_TELEMETRY:-}
       DO_NOT_TRACK: ${DO_NOT_TRACK:-}
+      # Opt-out release check (SPEC, update check): `NOITE_UPDATE_CHECK=0`
+      # (also `false`/`off`) locks it off.
+      NOITE_UPDATE_CHECK: ${NOITE_UPDATE_CHECK:-}
       NOITE_STOP_BUDGET_MS: ${NOITE_STOP_BUDGET_MS:-25000}
       RUNNER_MAX_APPS_PER_USER: ${RUNNER_MAX_APPS_PER_USER:-10}
       RUNNER_FLEET_MAX_RSS_MB: ${RUNNER_FLEET_MAX_RSS_MB:-0}
