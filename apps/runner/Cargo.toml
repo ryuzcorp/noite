@@ -16,7 +16,7 @@ sqlx = { version = "0.9", features = [
   "chrono",
   "uuid",
 ] }
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -49,4 +49,6 @@ ts-rs = { version = "12", features = ["no-serde-warnings"] }
 hickory-resolver = "0.26.3"
 
 [dev-dependencies]
+# `time::pause`/`advance` for the DNS-timeout test; tests only.
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
