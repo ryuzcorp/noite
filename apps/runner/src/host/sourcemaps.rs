@@ -274,7 +274,7 @@ pub async fn symbolicate_frames(
     if frames.iter().all(|f| !f.in_app) {
         return;
     }
-    let Some(manifest) = cache.manifest(cfg, bucket, prefix, sha).await else {
+    let Some(manifest) = cache.manifest(cfg, prefix, sha).await else {
         return;
     };
     let mut rels: Vec<&str> = frames
@@ -332,7 +332,6 @@ impl SourceMapCache {
     pub async fn manifest(
         &self,
         cfg: &Config,
-        bucket: &str,
         prefix: &str,
         sha: &str,
     ) -> Option<Arc<MapManifest>> {
@@ -343,7 +342,7 @@ impl SourceMapCache {
         if let Some(hit) = poisoned(self.inner.lock()).manifests.get(&key) {
             return hit.clone();
         }
-        let loaded = fetch_manifest(cfg, bucket, prefix, sha).await;
+        let loaded = fetch_manifest(cfg, prefix, sha).await;
         poisoned(self.inner.lock())
             .manifests
             .insert(key, loaded.clone());
@@ -396,16 +395,16 @@ fn poisoned<T>(guard: Result<T, std::sync::PoisonError<T>>) -> T {
     guard.unwrap_or_else(|e| e.into_inner())
 }
 
-async fn fetch_manifest(
-    cfg: &Config,
-    bucket: &str,
-    prefix: &str,
-    sha: &str,
-) -> Option<Arc<MapManifest>> {
-    let key = format!("{prefix}/{MAPS_DIR}/{sha}/{MANIFEST_FILE}");
-    let bytes = s3::s3_get_bytes(cfg, &format!("{bucket}/{key}"))
-        .await
-        .ok()?;
+/// The full object key for a stored map file, already under the shared
+/// bucket: `s3_get_bytes` prepends `s3://{bucket}/` itself, so the bucket
+/// must NOT appear here (a doubled prefix reads nothing, forever).
+fn map_object_key(prefix: &str, sha: &str, rel: &str) -> String {
+    format!("{prefix}/{MAPS_DIR}/{sha}/{rel}")
+}
+
+async fn fetch_manifest(cfg: &Config, prefix: &str, sha: &str) -> Option<Arc<MapManifest>> {
+    let key = map_object_key(prefix, sha, MANIFEST_FILE);
+    let bytes = s3::s3_get_bytes(cfg, &key).await.ok()?;
     if bytes.len() > 1024 * 1024 {
         return None;
     }
@@ -424,16 +423,14 @@ async fn fetch_map(
     if rel.contains("..") {
         return None;
     }
-    let key = format!("{prefix}/{MAPS_DIR}/{sha}/{rel}");
+    let key = map_object_key(prefix, sha, rel);
     if !matches!(
         s3::s3_head_object(cfg, bucket, &key).await,
         Some(head) if head.size >= 0 && (head.size as u64) <= MAX_MAP_BYTES
     ) {
         return None;
     }
-    let bytes = s3::s3_get_bytes(cfg, &format!("{bucket}/{key}"))
-        .await
-        .ok()?;
+    let bytes = s3::s3_get_bytes(cfg, &key).await.ok()?;
     if bytes.len() as u64 > MAX_MAP_BYTES {
         return None;
     }
@@ -1217,5 +1214,15 @@ mod tests {
         assert!(!is_key_sha(""));
         assert!(!is_key_sha("../evil"));
         assert!(!is_key_sha("not a sha"));
+    }
+
+    #[test]
+    fn map_keys_carry_no_bucket_prefix() {
+        // Regression: the read path once prefixed the bucket a second time,
+        // so every manifest/map fetch missed and nothing ever symbolicated.
+        assert_eq!(
+            map_object_key("fleets/app", "abc123", "worker.js.map"),
+            "fleets/app/maps/abc123/worker.js.map"
+        );
     }
 }
