@@ -160,6 +160,16 @@ fn enable_controllers(cgroup: &Path) -> anyhow::Result<()> {
     }
     Ok(())
 }
+/// Whether `error` is the kernel refusing a contested write (EBUSY): a
+/// member landed between the drain check and the enable. Only that case is
+/// worth another round; every other failure is permanent.
+#[cfg(unix)]
+fn is_busy(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| io.raw_os_error() == Some(libc::EBUSY))
+}
 
 /// Set up the fleet anchor under `root` (usually `/sys/fs/cgroup`): capture
 /// the runner's own cgroup BEFORE moving (its path changes with the move),
@@ -215,29 +225,48 @@ fn setup_inner(root: &Path, placement: &str) -> anyhow::Result<PathBuf> {
     // the runner leaf itself stays private.
     std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o755))
         .with_context(|| format!("chmod {}", anchor.display()))?;
-    // The container cgroup is shared with healthcheck execs at boot:
-    // a one-shot drain loses to a curl that lands mid-drain (observed in
-    // the isolation lane: two curls held the root past a single drain).
-    // Retry with a bounded settle; a live squatter past the budget degrades
-    // to the shared cgroup, loudly.
-    let mut drained = false;
+    // The container cgroup is shared with healthcheck execs at boot: a
+    // one-shot drain loses to a curl that lands mid-drain (observed in the
+    // isolation lane: two curls held the root past a single drain), and a
+    // curl that lands between the final check and the enable fails that too
+    // (EBUSY — observed on Docker). Retry the drain *and* the enable with a
+    // bounded settle; a live squatter past the budget degrades to the shared
+    // cgroup, loudly. Persistent errors (read-only mount, no delegation)
+    // fail the same way every attempt, so the budget only delays the
+    // already-loud degradation by seconds.
+    let mut last_error: Option<anyhow::Error> = None;
     for _ in 0..DRAIN_ATTEMPTS {
         drain_to_leaf(&own, &leaf)?;
         if is_drained(&own) {
-            drained = true;
-            break;
+            match enable_controllers(&own) {
+                Ok(()) => {
+                    enable_controllers(&anchor)?;
+                    return Ok(anchor);
+                }
+                // EBUSY here is a member that landed between the check and
+                // the write (a healthcheck exec) — worth another round.
+                // Anything else (read-only mount, no delegation) fails the
+                // same way every attempt: bail at once instead of burning
+                // the whole budget on an already-loud degradation.
+                Err(error) if is_busy(&error) => {
+                    last_error = Some(error);
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("enabling {}", own.display()));
+                }
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(DRAIN_SETTLE_MS));
     }
-    if !drained {
-        anyhow::bail!(
-            "{} still holds live processes after the drain",
-            own.display()
-        );
+    match last_error {
+        Some(error) => Err(error).with_context(|| format!("enabling {}", own.display())),
+        None => {
+            anyhow::bail!(
+                "{} still holds live processes after the drain",
+                own.display()
+            );
+        }
     }
-    enable_controllers(&own)?;
-    enable_controllers(&anchor)?;
-    Ok(anchor)
 }
 
 #[cfg(not(unix))]
@@ -479,5 +508,15 @@ mod tests {
             !blocks_drain(procfs.path(), "100"),
             "unparseable stat races as gone"
         );
+    }
+
+    #[test]
+    fn only_ebusy_is_worth_another_round() {
+        let busy = anyhow::anyhow!(std::io::Error::from_raw_os_error(libc::EBUSY));
+        assert!(is_busy(&busy));
+        let denied = anyhow::anyhow!(std::io::Error::from_raw_os_error(libc::EROFS));
+        assert!(!is_busy(&denied));
+        let plain = anyhow::anyhow!("not even io");
+        assert!(!is_busy(&plain));
     }
 }
