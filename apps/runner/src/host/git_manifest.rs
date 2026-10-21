@@ -52,11 +52,14 @@ pub struct Manifest {
 /// fewer locks skips one, never reorders: create holds `CREATE_LOCK` then its
 /// slug's `push_guard`; delete holds `AppLock` then its slug's `push_guard`;
 /// a slug-changing rename holds all three (`CREATE_LOCK`, then `AppLock`,
-/// then both slugs' `push_guard`s). Pushes hold only their slug's
-/// `push_guard` and never claim `AppLock` while holding it, so waiting on an
-/// outer-held lock while holding an inner one cannot happen. Two slug guards
-/// are always taken in lexical slug order (see `push_guards`), so opposite
-/// renames cannot deadlock against each other.
+/// then both slugs' `push_guard`s). Tenant D1 reads and writes hold only
+/// their slug's `push_guard` (their project materialization runs
+/// `git checkout -f` on the shared bare repo, and two concurrent checkouts
+/// race on its index.lock). Pushes hold only their slug's `push_guard` and
+/// never claim `AppLock` while holding it, so waiting on an outer-held lock
+/// while holding an inner one cannot happen. Two slug guards are always taken
+/// in lexical slug order (see `push_guards`), so opposite renames cannot
+/// deadlock against each other.
 #[derive(Clone, Default)]
 pub struct GitSync {
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,

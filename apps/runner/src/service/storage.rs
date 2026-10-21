@@ -47,6 +47,11 @@ pub async fn d1_tables(
     database_id: &str,
 ) -> Result<D1Tables, ApiError> {
     let app = app_or_404(state, id).await?;
+    // Serialized per app: materializing the project runs `git checkout -f`
+    // on the shared bare repo, and two concurrent checkouts race on its
+    // index.lock (one fails with 32603). The same guard a purge holds, so a
+    // wipe cannot empty the project out from under a running `celld d1`.
+    let _push = state.git_sync.push_guard(&app.slug).await;
     storage::d1_tables(&state.config, &app, database_id)
         .await
         .map_err(error)
@@ -59,6 +64,7 @@ pub async fn d1_schema(
     table: &str,
 ) -> Result<D1TableSchemaRaw, ApiError> {
     let app = app_or_404(state, id).await?;
+    let _push = state.git_sync.push_guard(&app.slug).await;
     storage::d1_schema(&state.config, &app, database_id, table)
         .await
         .map_err(error)
@@ -71,6 +77,7 @@ pub async fn d1_rows(
     query: &D1RowsQuery,
 ) -> Result<D1Rows, ApiError> {
     let app = app_or_404(state, id).await?;
+    let _push = state.git_sync.push_guard(&app.slug).await;
     storage::d1_rows(&state.config, &app, database_id, query)
         .await
         .map_err(error)
@@ -87,6 +94,7 @@ pub async fn d1_write(
     key: &BTreeMap<String, Option<String>>,
 ) -> Result<(), ApiError> {
     let app = app_or_404(state, id).await?;
+    let _push = state.git_sync.push_guard(&app.slug).await;
     storage::d1_write(&state.config, &app, database_id, op, table, values, key)
         .await
         .map_err(error)
@@ -100,6 +108,7 @@ pub async fn d1_delete_rows(
     keys: &[BTreeMap<String, Option<String>>],
 ) -> Result<u64, ApiError> {
     let app = app_or_404(state, id).await?;
+    let _push = state.git_sync.push_guard(&app.slug).await;
     storage::d1_delete_rows(&state.config, &app, database_id, table, keys)
         .await
         .map_err(error)
