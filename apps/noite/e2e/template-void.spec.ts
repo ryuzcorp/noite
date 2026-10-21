@@ -22,7 +22,7 @@ test.afterAll(async ({ request }) => {
   }
 });
 
-// The Ilha + Void template (`ryuzcorp/noite-template-oxide`): picked in the
+// The Ilha + Void template (`ryuzcorp/noite-template-ilha`): picked in the
 // creator, deployed like any other app, serving SSR plus a server action on
 // celld. A broken template fails this spec, which fails the release gate.
 test(

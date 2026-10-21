@@ -8,6 +8,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The Ilha + Void template lives at `ryuzcorp/noite-template-ilha`.** Its repository was renamed from `ryuzcorp/noite-template-oxide`, and new apps clone it under the new name. Installs on 0.1.0-alpha.8 and older keep creating apps from it: GitHub still serves git clones of the old name directly, with no redirect, which is what the runner's redirect-refusing clone needs (verified after the rename).
+
 ## [0.1.0-alpha.8] - 2026-10-21
 
 Browser errors arrive through any Sentry SDK with stacks mapped back to your source, custom domains need DNS proof of ownership on multi-tenant installs, and every fleet holds bucket keys scoped to its own prefix. The edge no longer drops requests whenever an app starts, stops or deploys, and every pinned tool moves to its latest.
