@@ -419,17 +419,24 @@ test(
     expect(prodIssue).not.toBeNull();
 
     // --- tabs scope by `?env=` ----------------------------------------------
+    // The detail view renders a Requests stat tile per scope; its value
+    // must equal the API total captured above (no traffic after the boom,
+    // so the number is stable).
+    const requestsTile = page.locator("section", {
+      has: page.getByText("Requests", { exact: true }),
+    });
+
     await page.goto(`/apps/${appId}?t=metrics&env=${envId}`);
     await expect(
       page.getByRole("combobox", { name: "Environment" })
     ).toHaveValue(envId);
-    await expect(page.getByText(`${envTotal} requests`).first()).toBeVisible({
-      timeout: 60_000,
-    });
+    await expect(
+      requestsTile.getByText(`${envTotal}`, { exact: true })
+    ).toBeVisible({ timeout: 60_000 });
     await page.goto(`/apps/${appId}?t=metrics`);
-    await expect(page.getByText(`${prodTotal} requests`).first()).toBeVisible({
-      timeout: 60_000,
-    });
+    await expect(
+      requestsTile.getByText(`${prodTotal}`, { exact: true })
+    ).toBeVisible({ timeout: 60_000 });
 
     await page.goto(`/apps/${appId}?t=errors&env=${envId}`);
     await expect(page.getByText(envToken).first()).toBeVisible({
