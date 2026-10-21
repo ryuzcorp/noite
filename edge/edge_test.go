@@ -318,6 +318,28 @@ func TestWaitHealthyCap(t *testing.T) {
 	}
 }
 
+func TestWildcardWireShape(t *testing.T) {
+	// The runner serializes wildcards nested as {"suffix", "route"}; a flat
+	// shape would decode with a zero Route and fail validation.
+	e := testHandler(t, &Table{})
+	raw := `{"generation": 3, "exact": {}, "wildcards": [{"suffix": ".example.com", "route": {"kind": "fallback", "upstream": "127.0.0.1:8080", "rewrite": "/v1/edge/fallback"}}]}}`
+	r := httptest.NewRequest(http.MethodPost, "/edge/routes", strings.NewReader(raw))
+	w := httptest.NewRecorder()
+	if err := e.handleAdmin(w, r); err != nil {
+		t.Fatalf("nested wildcard rejected: %v", err)
+	}
+	rt, ok := e.tab.Load().Lookup("anything.example.com")
+	if !ok || rt.Kind != KindFallback || rt.Rewrite != "/v1/edge/fallback" {
+		t.Fatalf("wildcard not applied: %+v %v", rt, ok)
+	}
+	flat := `{"generation": 4, "exact": {}, "wildcards": [{"suffix": ".example.com", "kind": "fallback", "upstream": "127.0.0.1:8080"}]}}`
+	r = httptest.NewRequest(http.MethodPost, "/edge/routes", strings.NewReader(flat))
+	w = httptest.NewRecorder()
+	if _, ok := e.handleAdmin(w, r).(caddy.APIError); !ok {
+		t.Fatalf("flat wildcard must be rejected")
+	}
+}
+
 func TestAdminValidation(t *testing.T) {
 	e := testHandler(t, &Table{Generation: 7, Exact: map[string]Route{
 		"a.test": {Kind: KindTenant, Upstream: "127.0.0.1:1"},

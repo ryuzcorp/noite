@@ -65,7 +65,7 @@ pub struct EdgeRoute {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgeWildcard {
     pub suffix: String,
-    #[serde(flatten)]
+    /// Nested (not flattened): the Go module decodes `{"suffix", "route"}`.
     pub route: EdgeRoute,
 }
 
@@ -680,6 +680,12 @@ mod tests {
         let raw = serde_json::to_value(&t).expect("table serializes");
         assert_eq!(raw["exact"]["myapp.localhost"]["kind"], "tenant");
         assert_eq!(raw["generation"], 0);
+        // Wildcards serialize nested ({suffix, route}), never flattened:
+        // the Go module decodes that exact shape (a flat route would fail
+        // validation with an empty kind).
+        let wild = &raw["wildcards"][0];
+        assert!(wild.get("route").is_some(), "{raw}");
+        assert!(wild.get("kind").is_none(), "{raw}");
         // Longest-suffix wins on the Go side too; order here is stable.
         let suffixes: Vec<&str> = t.wildcards.iter().map(|w| w.suffix.as_str()).collect();
         assert!(suffixes.contains(&".localhost"));
