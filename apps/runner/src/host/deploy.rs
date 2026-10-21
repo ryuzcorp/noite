@@ -767,6 +767,15 @@ async fn deploy_inner(
         }
     }
 
+    // The Worker map's shadow bundle runs here, while the tree is still the
+    // build uid's: the runner-owned tree below would be unreadable to the
+    // sandboxed build uid under the install's umask. Same sandbox as the
+    // build itself. The bytes upload only after a successful deploy; a
+    // failed deploy drops them with the worktree.
+    let worker_map = crate::host::sourcemaps::build_worker_map(&deploy_root, &sb)
+        .await
+        .map_err(|e| format!("{e:#}"));
+
     // Tenant steps are over: take the tree back from the build uid, so
     // nothing it left behind can change the bundle `celld deploy` uploads.
     #[cfg(unix)]
@@ -919,9 +928,8 @@ async fn deploy_inner(
             bucket_uri: &bucket,
             sha: &commit_sha,
             deploy_root: &deploy_root,
-            sandbox_uid: sandbox_id,
-            sandbox_gid: sandbox_id,
         },
+        worker_map,
     )
     .await
     {

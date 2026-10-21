@@ -961,11 +961,12 @@ async fn read_capped_map(path: &Path) -> Option<Vec<u8>> {
 /// Build the Worker map: the shadow esbuild map (chained through the entry's
 /// own map when the build emitted one), or the entry's sibling map directly
 /// when celld deploys the entry as-is (`no_bundle`). `None` when there is no
-/// bundleable entry — asset-only apps and non-JS workers map nothing.
-async fn build_worker_map(
+/// bundleable entry — asset-only apps and non-JS workers map nothing. Runs
+/// while the tree is still the build uid's (the deploy task calls it before
+/// taking the tree back); the bytes upload only after a successful deploy.
+pub(crate) async fn build_worker_map(
     deploy_root: &Path,
-    sandbox_uid: Option<u32>,
-    sandbox_gid: Option<u32>,
+    sandbox: &exec::Sandbox<'_>,
 ) -> anyhow::Result<Option<(Vec<u8>, String)>> {
     let Some(entry) = worker_entry(deploy_root)? else {
         return Ok(None);
@@ -989,43 +990,37 @@ async fn build_worker_map(
         sanitize_sources(&inner).to_writer(&mut out)?;
         return Ok(Some((out, "entry map (no_bundle)".to_string())));
     }
-    run_shadow_esbuild(deploy_root, &entry, sandbox_uid, sandbox_gid, sibling_bytes).await
+    run_shadow_esbuild(deploy_root, &entry, sandbox, sibling_bytes).await
 }
-
-/// Run the shadow esbuild the way the build runs: as the tenant build uid
-/// through `run_sandboxed` (clean env, rlimits, kill group), never as the
-/// runner. Nothing it reads leaves the bundle — and with `sanitize_sources`
-/// not even absolute host paths reach storage.
+/// Run the shadow esbuild the way the build runs: sandboxed as the build uid
+/// (the deploy task calls this before taking the worktree back, while the
+/// tree is still the build uid's — afterwards the runner-owned tree would
+/// be unreadable to it under the install's umask). Nothing the child reads
+/// leaves the bundle — and with `sanitize_sources` not even absolute host
+/// paths reach storage.
 async fn run_shadow_esbuild(
     deploy_root: &Path,
     entry: &WorkerEntry,
-    sandbox_uid: Option<u32>,
-    sandbox_gid: Option<u32>,
+    sandbox: &exec::Sandbox<'_>,
     sibling_bytes: Option<Vec<u8>>,
 ) -> anyhow::Result<Option<(Vec<u8>, String)>> {
     let Some(entry_arg) = entry.rel.to_str() else {
         anyhow::bail!("worker entry is not valid UTF-8");
     };
     // Inside the sandbox-owned tmp dir: `run_sandboxed` creates and chowns
-    // `.tmp-sandbox` for the build uid, so the child can write here even
-    // though the tree itself was handed back to the runner.
+    // `.tmp-sandbox` for the build uid, so the child can write its outdir
+    // there.
     let outdir = deploy_root.join(".tmp-sandbox").join("shadow-maps");
     let Some(outdir_arg) = outdir.to_str() else {
         anyhow::bail!("esbuild outdir is not valid UTF-8");
     };
     let args = esbuild_args(entry_arg, outdir_arg);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let sandbox = exec::Sandbox {
-        uid: sandbox_uid,
-        gid: sandbox_gid,
-        env: &[],
-        cache: None,
-    };
     exec::run_sandboxed(
         &esbuild_bin(),
         &refs,
         deploy_root,
-        &sandbox,
+        sandbox,
         Duration::from_secs(120),
     )
     .await
@@ -1184,14 +1179,13 @@ pub struct StoreMaps<'a> {
     pub bucket_uri: &'a str,
     pub sha: &'a str,
     pub deploy_root: &'a Path,
-    pub sandbox_uid: Option<u32>,
-    pub sandbox_gid: Option<u32>,
 }
 
 pub async fn store_deploy_maps(
     pool: &SqlitePool,
     cfg: &Config,
     target: &StoreMaps<'_>,
+    worker_map: Result<Option<(Vec<u8>, String)>, String>,
 ) -> anyhow::Result<String> {
     let StoreMaps {
         app_id,
@@ -1199,8 +1193,6 @@ pub async fn store_deploy_maps(
         bucket_uri,
         sha,
         deploy_root,
-        sandbox_uid,
-        sandbox_gid,
     } = *target;
     // Preview environments have no error ingest, so their maps would never
     // be read: skip storing them (YAGNI until environment errors exist).
@@ -1232,7 +1224,7 @@ pub async fn store_deploy_maps(
         ))
     });
     let mut worker_bytes = 0u64;
-    match build_worker_map(deploy_root, sandbox_uid, sandbox_gid).await {
+    match worker_map {
         Ok(Some((bytes, note))) => {
             worker_bytes = bytes.len() as u64;
             let key = format!("{maps_prefix}/{WORKER_MAP_FILE}");
@@ -1241,7 +1233,7 @@ pub async fn store_deploy_maps(
             notes.push(format!("{WORKER_MAP_FILE} ({note})"));
         }
         Ok(None) => notes.push("no worker map (no bundleable entry)".to_string()),
-        Err(e) => notes.push(format!("no worker map ({e:#})")),
+        Err(note) => notes.push(format!("no worker map ({note})")),
     }
 
     // One deploy's maps stay small in aggregate: a hostile build cannot turn
@@ -1590,10 +1582,8 @@ mod tests {
             bucket_uri: "s3://bucket/envs/app/preview",
             sha: "abc123",
             deploy_root: &dir,
-            sandbox_uid: None,
-            sandbox_gid: None,
         };
-        let summary = store_deploy_maps(&pool, &cfg, &target)
+        let summary = store_deploy_maps(&pool, &cfg, &target, Ok(None))
             .await
             .expect("skip succeeds");
         assert!(summary.contains("skipped"));
