@@ -19,6 +19,9 @@ pub struct IsolationStatus {
     pub detail: String,
     /// Hard failure in multi (blocks /ready + builds).
     pub blocked: bool,
+    /// What tenant fleets hold (SPEC, Scoped credentials): `scoped (...)`
+    /// or `root (<why>)`. Root is an explicit documented mode, not a block.
+    pub credentials: String,
 }
 
 pub async fn self_check(cfg: &Config, nft_installed: bool) -> IsolationStatus {
@@ -48,6 +51,17 @@ pub async fn self_check(cfg: &Config, nft_installed: bool) -> IsolationStatus {
         problems.push(format!("egress policy missing ({nft_detail})"));
     }
     let blocked = cfg.tenancy == Tenancy::Multi && !problems.is_empty();
+    // Root bucket keys in multi are explicit, not silent: warn loudly here
+    // (and in the boot log, /ready and doctor) without blocking.
+    let credentials = cfg.credentials.summary();
+    if !cfg.credentials.is_scoped() {
+        if cfg.tenancy == Tenancy::Multi {
+            tracing::warn!(credentials = %credentials, "multi-tenant install without scoped bucket keys");
+        }
+        problems.push(format!(
+            "tenant fleets hold the root bucket keys ({credentials})"
+        ));
+    }
     if blocked {
         tracing::error!(tenancy = "multi", problems = ?problems, "isolation self-check failed");
     } else if !problems.is_empty() {
@@ -60,6 +74,7 @@ pub async fn self_check(cfg: &Config, nft_installed: bool) -> IsolationStatus {
         nft_ok,
         detail: problems.join("; "),
         blocked,
+        credentials,
     }
 }
 

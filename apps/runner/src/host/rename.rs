@@ -269,10 +269,10 @@ async fn rename_slugged(
         &cfg.fleets_uri(new_slug),
     )
     .await?;
-    // The prefix changed, so a scoped pair for the old prefix must not
-    // survive (SPEC, Scoped credentials). A scoped provider mints the new-prefix pair here.
+    // The prefix changed, so keys for the old prefix must not survive
+    // (SPEC, Scoped credentials); the next spawn mints the new-prefix pair.
     // R-10: a revoke failure must not vanish — warn loudly instead of `let _`.
-    if let Err(e) = crate::host::credentials::revoke(pool, &app.id).await {
+    if let Err(e) = crate::host::credentials::revoke_app(pool, cfg, &app.id).await {
         tracing::warn!(app_id = %app.id, error = %format!("{e:#}"), "slug renamed but credential revoke failed");
     }
     // The loop may have respawned the old-slug fleet mid-move (it reads the

@@ -75,7 +75,6 @@ jobs:
           diff /tmp/tables.txt - <<'EOF'
           app
           app_branch_rule
-          app_credential
           app_domain
           app_env
           app_event
@@ -90,6 +89,7 @@ jobs:
           pr_comment
           pr_review
           pull_request
+          scoped_credential
           telemetry_replay
           EOF
 

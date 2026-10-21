@@ -45,6 +45,11 @@ pub async fn run_forever(
     // so telemetry ingest has caught up before any app is judged idle.
     let mut last_sleep_sweep = Instant::now();
     let sleep_sweeping = Arc::new(AtomicBool::new(false));
+    // Scoped-key revocation retries (SPEC, Scoped credentials): a store
+    // delete refused at revoke time stays marked until the store accepts.
+    // One cheap SELECT per tick when nothing pends; a failed sweep backs
+    // off a minute instead of hammering a struggling store.
+    let mut last_cred_sweep: Option<Instant> = None;
     // Fleets with a running-status confirm in flight (host/sleep.rs): one
     // confirm per transitioning fleet, never blocking the tick.
     let confirming: crate::host::sleep::Confirming =
@@ -74,6 +79,15 @@ pub async fn run_forever(
                 }
                 flag.store(false, Ordering::SeqCst);
             });
+        }
+        // Scoped-key revocation retries (SPEC, Scoped credentials): a store
+        // delete refused at revoke time stays marked until the store accepts.
+        if last_cred_sweep.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
+            last_cred_sweep = Some(Instant::now());
+            let left = crate::host::credentials::sweep(&pool, &cfg).await;
+            if left > 0 {
+                tracing::warn!(left, "scoped keys still awaiting revocation");
+            }
         }
         if let Err(e) = reconcile_once(
             &pool,

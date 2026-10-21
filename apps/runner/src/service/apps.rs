@@ -345,10 +345,10 @@ pub async fn delete(state: &AppState, id: &str) -> Result<(), ApiError> {
     // A reconcile tick that listed apps before the stop above can still have
     // started the fleet again; with the row gone nothing else would stop it.
     supervisor::stop_fleet(&state.procs, &app.slug, supervisor::StopGrace::FOR_DELETE).await;
-    // Both transports revoke: the RPC path used to skip this and leak the row.
+    // Revoke the app's keys and its environments' (SPEC, Scoped credentials).
     // R-10: a revoke failure must not vanish — warn loudly so the orphaned
     // credential row is visible instead of silently kept.
-    if let Err(e) = crate::host::credentials::revoke(&state.pool, id).await {
+    if let Err(e) = crate::host::credentials::revoke_app(&state.pool, &state.config, id).await {
         tracing::warn!(app_id = %id, error = %format!("{e:#}"), "app deleted but credential revoke failed");
     }
     Ok(())

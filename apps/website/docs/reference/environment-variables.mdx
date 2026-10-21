@@ -67,6 +67,7 @@ Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (hand
 | Var | Default | Effect | Owner |
 | --- | --- | --- | --- |
 | `NOITE_TENANCY` | unset = `multi` off a `localhost` base, `single` on | `multi` sandboxes builds/fleets as users behind egress policy; `single` = operator pushes only | runner-owned |
+| `NOITE_CREDENTIAL_PROVIDER` | `auto` | Where tenant fleet keys come from: `auto` scopes the bundled RustFS and probes other stores for the MinIO admin API, `minio` forces that provider (MinIO, RustFS), `aws` forces the AWS IAM provider (needs an IAM-capable key), `root` keeps the root keys explicitly | runner-owned |
 | `RUNNER_BUILD_UID_BASE` / `RUNNER_BUILD_UID_RANGE` | `10030` / `1024` | Reserved per-app build uid range `[base, base + range)`; each app's builds and release commands run as their own uid from it | runner-owned |
 | `RUNNER_FLEET_UID` / `RUNNER_FLEET_GID` | `10020` | Tenant fleet user | runner-owned |
 | `NOITE_FLEET_PORTS` | `20000-29999` | Fleet port range, two ports per app | runner-owned |

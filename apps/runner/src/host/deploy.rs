@@ -749,10 +749,16 @@ async fn deploy_inner(
     // Release must not see root keys (SPEC, Build and release sandbox): in multi it gets the scoped
     // credential or is disabled with a clear log line; single keeps root.
     if let Some(release) = release_cmd(&src_dir).await {
+        // The scope whose key the release holds: the environment's own
+        // prefix for a preview deploy, the app's for production.
+        let scope = match target.environment() {
+            Some(env) => credentials::Scope::environment(env),
+            None => credentials::Scope::app(app),
+        };
         progress
             .step("release", DeployStatus::Building, &release)
             .await?;
-        let scoped = credentials::tenant_process_credentials(pool, cfg, &app.slug)
+        let scoped = credentials::tenant_process_credentials(pool, cfg, &scope)
             .await
             .ok()
             .flatten();

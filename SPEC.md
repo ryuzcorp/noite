@@ -86,7 +86,7 @@ celld's internal listener carries peer traffic and an **unauthenticated operator
 `NOITE_TENANCY=single|multi` (default `multi` when `BASE_DOMAIN` is outside the `localhost` family, else `single`). `host/isolation.rs::self_check` runs at boot: build uid drop, fleet uid drop, nft table installed.
 
 - `multi`: any failed check keeps `/ready` at 503 with the reason and refuses builds.
-- `single`: checks run and warn, nothing is refused; fleets and release commands use the root bucket keys, and no egress policy is installed.
+- `single`: checks run and warn, nothing is refused; fleets and release commands use the root bucket keys only in `root` credential mode, and no egress policy is installed.
 
 This is the honest contract for platforms that cannot provide isolation: they run Noite for one person.
 
@@ -97,7 +97,7 @@ This is the honest contract for platforms that cannot provide isolation: they ru
 - Bounds: `bun install` and the build `RUNNER_BUILD_TIMEOUT_S` (300) each, the `cloudflare.config.ts` conversion 60 s, release 600 s; `RLIMIT_NPROC` (only when dropping uid) and `RLIMIT_FSIZE`; a worktree above `RUNNER_BUILD_MAX_MB` (2048) fails the deploy.
 - Worktrees are `lchown`ed to the build uid (never following symlinks) and taken back after the build. `builds/<slug>` is 0755 so bun can resolve its cwd.
 - Once the tree is taken back, the deploy root must resolve inside it and its Wrangler config may not be a symlink (`deploy.rs::contained_deploy_root`): `celld deploy` runs as the runner, so a `dist` symlink into `/data` would ship platform files into the tenant's bucket. The check runs after the last tenant step (release), not when the root is picked. Symlinks further down (`main`'s imports, files in the assets directory) are not checked yet.
-- **Release** (`release` in the tenant's `wrangler.jsonc`, meant for migrations) runs in `multi` only with scoped bucket keys, so it is **skipped** there until a credential provider lands, with a deploy-log line saying so. In `single` it runs with the root keys. Noite's `release` key is stripped from `wrangler.json` before `celld deploy` (celld rejects unknown keys).
+- **Release** (`release` in the tenant's `wrangler.jsonc`, meant for migrations) runs in `multi` with the scope's own bucket keys; where no scoped provider exists it is **skipped** (`root` mode), with a deploy-log line saying so. In `single` it runs with the scope's keys, or the root keys in `root` mode. Noite's `release` key is stripped from `wrangler.json` before `celld deploy` (celld rejects unknown keys).
 - Build network stays open (package registries); the egress policy below applies to the build uid as well.
 
 ### Egress policy
@@ -106,7 +106,7 @@ This is the honest contract for platforms that cannot provide isolation: they ru
 
 1. accept `ct state established,related` (without it, replies on connections the runner itself opened were rejected);
 2. accept DNS (udp/tcp 53);
-3. accept the storage endpoint, for the fleet uid only: the addresses `S3_ENDPOINT` resolves to, on its port, refreshed every 30 s (a fleet's celld needs its bucket, and bundled RustFS sits on a private address);
+3. accept the storage endpoint, for the fleet uid and the build range: the addresses `S3_ENDPOINT` resolves to, on its port, refreshed every 30 s (a fleet's celld needs its bucket, and bundled RustFS sits on a private address; the release command runs as the build uid and holds the scope's own key, and builds hold no keys of their own);
 4. reject loopback (`127.0.0.0/8`, `::1`), RFC 1918, link-local and metadata (`169.254.0.0/16`), CGNAT (`100.64.0.0/10`), and ULA/link-local IPv6 (`fc00::/7`, `fe80::/10`).
 
 Since all fleets share one uid, "the fleet uid may not dial loopback" blocks fleet → fleet, fleet → operator API, fleet → runner and fleet → Caddy admin. A single-node fleet never needs to dial loopback: Caddy dials the fleet, not the reverse. The same rules, loopback included, apply to builds. Tenant fleets additionally bind their internal listener to loopback. The control node's internal listener binds `0.0.0.0:8091` so a replacement node can reach it during an overlapping redeploy; the policy, not the bind, keeps tenants off it.
@@ -135,8 +135,8 @@ Fallback where a platform grants no `NET_ADMIN` (not built): run each fleet unde
 ### Known limits
 
 - The build uid is **shared**, so two concurrent builds can read each other's worktrees. Acceptable while tenants are untrusted rather than adversarial; per-build uids are the fix.
-- Fleets hold the **root** bucket keys until [Scoped credentials](#scoped-credentials) land, so a compromised fleet process can reach every prefix.
-- Worker code can reach the object store's unauthenticated surface (it answers 401/403).
+- Fleets hold [scoped bucket keys](#scoped-credentials) for their own prefix only — except on stores with no prefix-scoped keys (R2) or without the extra configuration (AWS S3 needs `NOITE_CREDENTIAL_PROVIDER=aws` and an IAM-capable key), where they hold the **root** keys as an explicit `root` mode the boot log, `/ready` and `make doctor` all name.
+- Worker code and builds can reach the object store's unauthenticated surface (it answers 401/403; builds hold no keys).
 - Sandbox depth is uid + env + rlimits + egress rules. A container per build (rootless Podman in the image, gVisor) is out of scope unless tenants are expected to be adversarial.
 - No per-tenant memory containment: fleets share the container cgroup, so one fleet's growth pushes every fleet toward the shared shed threshold. Per-fleet cgroups (memory.max per fleet, which also gives celld a per-fleet working set) are the fix where cgroupfs is writable.
 - Railway does not grant `NET_ADMIN` (verified 2026-09-27: `nft` fails with `Operation not permitted`), so Railway installs run `NOITE_TENANCY=single`. Railway also wraps the entrypoint, so tini is not PID 1 there; set `TINI_SUBREAPER=1`.
@@ -201,26 +201,26 @@ Measured on a 32-core host with 15 apps: first fleet healthy 2.1 s after the con
 
 ## Readiness
 
-`GET /ready` answers 200 only when all hold, else 503 with `{"ok":false,"failing":[…]}`: first reconcile done (`reconcile`); the bucket answers (`bucket: …`, cached briefly); `multi` isolation checks passed (`isolation: …`); the control fleet is healthy when the image has a bundle (`control: …`); Caddy accepted the last config (`caddy: …`). It is the container healthcheck and what `make doctor` prints. One check fits Compose, Railway, Coolify and Fly.
+`GET /ready` answers 200 only when all hold, else 503 with `{"ok":false,"failing":[…]}`: first reconcile done (`reconcile`); the bucket answers (`bucket: …`, cached briefly); `multi` isolation checks passed (`isolation: …`); the control fleet is healthy when the image has a bundle (`control: …`); Caddy accepted the last config (`caddy: …`). Both answers carry `credentials` — what tenant fleets hold ([Scoped credentials](#scoped-credentials)) — which is what `make doctor` prints. One check fits Compose, Railway, Coolify and Fly.
 
 ## Scoped credentials
 
 Goal: a compromise of one fleet reaches one app.
 
-Built (`host/credentials.rs`, table `app_credential`): rows are AES-256-GCM with a random nonce and the app id as associated data, under a key derived from `RUNNER_TOKEN` with HKDF, so the snapshot in the bucket is not a key dump and a row cannot be replayed onto another app. Lookups: `scoped_credentials` (the decrypted row or nothing), `tenant_process_credentials` (scoped, else root in `single` only; used by release), `fleet_credentials` (scoped, else root). The write path refuses to store root keys. No provider mints keys yet, so fleets run with root keys.
+Built (`host/credentials.rs`, `host/credentials_minio.rs`, `host/credentials_aws.rs`, table `scoped_credential`): every tenant scope — an app (`fleets/{slug}/`) or a preview environment (`envs/{slug}/{label}/`, so an environment's keys never reach production's) — holds keys minted through the store's own IAM that read, write and list only its own prefix, plus the bucket-location call SDKs make. No bucket-wide listing, no bucket HEAD: both would reveal other apps' key names. The runner keeps the root keys for its own work (deploys, purges, renames, telemetry, snapshots). Rows are AES-256-GCM with a random nonce and the scope as associated data, under a key derived from `RUNNER_TOKEN` with HKDF, so the snapshot in the bucket is not a key dump and a row cannot be replayed onto another scope. The write path refuses to store root keys.
 
-To build: a `CredentialProvider` (`app_credentials(slug)`, `revoke(slug)`), keys minted at app create, rotated on rename, revoked on delete (`host/purge.rs`), used by fleet spawn, release and the D1 table editor.
+`NOITE_CREDENTIAL_PROVIDER` (`auto` default): `minio` forces the MinIO admin-API provider (MinIO and RustFS), `aws` forces the AWS IAM provider, `root` keeps the root keys everywhere explicitly, and `auto` scopes the bundled RustFS, probes any other unknown store for the MinIO admin API once the bucket answers, and stays on root keys for R2 and AWS S3 with the reason named (see the operator table below). Keys are minted lazily at the first fleet spawn or deploy — an install that predates this gets its keys with no manual step — superseded on rename, revoked on delete (`host/purge.rs`; environment teardown revokes only the environment's key). Two consumers, two rules: `fleet_credentials` (the scope's own key, else root), `tenant_process_credentials` (the scope's own key; root only in `single`, used by release — in `multi` the release is skipped until scoped keys exist). A deleted-then-recreated slug waits for the old key's store delete before a new key is minted for the prefix.
 
 | Store | Mechanism | Status |
 | --- | --- | --- |
-| RustFS | IAM user + policy on `arn:aws:s3:::{bucket}/fleets/{slug}/*` via its admin API | verify support at the pinned version |
-| MinIO | same, admin API user + policy | supported |
-| AWS S3 | IAM user or STS `AssumeRole` with a prefix-scoped session policy | supported |
-| Cloudflare R2 | tokens scope to buckets: bucket-per-app (`noite-{slug}`) via the Cloudflare API | optional provider; changes the bucket layout on R2 |
-| Tigris | per-bucket keys; bucket-per-app like R2 | verify |
-| none of these | root keys | `single` only |
+| RustFS | IAM user + canned policy on `arn:aws:s3:::{bucket}/fleets/{slug}/*` via its MinIO-compatible admin API (payloads use the madmin argon2id + sio-DARE encryption) | supported, verified against 1.0.0 and 1.0.3 |
+| MinIO | same admin API user + policy | supported |
+| AWS S3 | IAM user + inline prefix policy + access key via the IAM Query API; needs an IAM-capable key and `NOITE_CREDENTIAL_PROVIDER=aws` | supported |
+| Cloudflare R2 | tokens scope to buckets, not prefixes: no long-lived prefix-scoped keys; bucket-per-app would change the bucket layout on R2 | root keys (explicit `root` mode); not planned |
+| Tigris | per-bucket keys; bucket-per-app like R2 | root keys unless the store answers the MinIO admin probe |
+| none of these | root keys, surfaced in the boot log, `isolation::self_check`, `/ready`, `make doctor` — loud in `multi`, never silent | explicit documented mode, not a fallback |
 
-celld's storage contract (conditional writes, read-after-write, ranged reads) must hold under the scoped keys; celld's startup check fails loudly when a policy blocks a required call. Order: MinIO/S3 first, RustFS after verification, R2 last. Done when fleet keys fail `ListObjectsV2` outside `fleets/{slug}/`, release migrations work with them, and purge revokes them.
+celld's storage contract (conditional writes, read-after-write, ranged reads) holds under the scoped keys — the LIST and multipart calls the contract needs are inside the prefix policy; celld's startup check fails loudly when a policy blocks a required call. Done when fleet keys fail `ListObjectsV2` outside their prefix, release migrations work with them (the hostile e2e suite asserts all of this), and delete revokes them with a retrying sweep.
 
 ## Configuration
 

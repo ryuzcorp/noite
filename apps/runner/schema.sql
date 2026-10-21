@@ -279,15 +279,24 @@ CREATE TABLE IF NOT EXISTS app_branch_rule (
     CHECK (required_approvals BETWEEN 0 AND 2)
 );
 
--- Scoped per-app credentials (SPEC, Scoped credentials): one encrypted row per
--- app. Nonce + AES-GCM ciphertext over JSON {access_key, secret_key}; the KEK
--- derives from RUNNER_TOKEN via HKDF, so the bucket snapshot is not a key dump.
-CREATE TABLE IF NOT EXISTS app_credential (
-  app_id TEXT PRIMARY KEY NOT NULL,
+-- Scoped bucket keys per tenant scope (SPEC, Scoped credentials): one row per
+-- scope (`app:<app_id>`, `env:<env_id>`). Nonce + AES-GCM ciphertext over
+-- JSON {access_key, secret_key}; the KEK derives from RUNNER_TOKEN via HKDF,
+-- so the bucket snapshot is not a key dump. The plaintext columns are what
+-- the runner needs without decrypting: the store handle for revocation, the
+-- prefix the key reaches, which store minted it, live vs revoking.
+CREATE TABLE IF NOT EXISTS scoped_credential (
+  scope TEXT PRIMARY KEY NOT NULL,
+  app_id TEXT NOT NULL,
+  handle TEXT NOT NULL,
+  prefix TEXT NOT NULL,
+  store TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'live' CHECK (state IN ('live', 'revoking')),
   nonce BLOB NOT NULL,
   ciphertext BLOB NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_scoped_credential_app ON scoped_credential(app_id);
 
 -- One-time telemetry replay request (SPEC, Observability). Written by
 -- `noite-runner telemetry reingest` and by the migration that ships the

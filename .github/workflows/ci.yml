@@ -42,6 +42,19 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # The scoped-credential integration test mints and enforces real keys
+    # against this store (SPEC, Scoped credentials); the pin matches the
+    # bundled image the item verified.
+    services:
+      rustfs:
+        image: docker.io/rustfs/rustfs:1.0.3
+        env:
+          RUSTFS_ACCESS_KEY: noiteaccess
+          RUSTFS_SECRET_KEY: noitesecretnoitesecretnoite12
+        ports:
+          - 9000:9000
+    env:
+      NOITE_TEST_RUSTFS_ENDPOINT: http://localhost:9000
     defaults:
       run:
         working-directory: apps/runner

@@ -21,7 +21,7 @@ use anyhow::{bail, Context};
 use sqlx::SqliteConnection;
 
 /// Version a database has after every migration ran. 1 is the alpha baseline.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`.
@@ -236,6 +236,29 @@ pub const MIGRATIONS: &[Migration] = &[
           CREATE UNIQUE INDEX IF NOT EXISTS idx_app_domain_verified \
             ON app_domain(hostname) WHERE status = 'verified';\
           CREATE INDEX IF NOT EXISTS idx_app_domain_app ON app_domain(app_id);",
+    },
+    Migration {
+        version: 11,
+        // Scoped bucket keys per tenant scope (SPEC, Scoped credentials):
+        // `app_credential` never minted a row (no provider existed), so it
+        // goes and `scoped_credential` replaces it — one row per scope
+        // (`app:<app_id>`, `env:<env_id>`) with the plaintext the runner
+        // needs without decrypting (the store handle for revocation, the
+        // prefix the key reaches, which store minted it, live vs revoking).
+        // A fresh database gets the same shape from schema.sql.
+        sql: "DROP TABLE IF EXISTS main.app_credential;\
+          CREATE TABLE IF NOT EXISTS main.scoped_credential (\
+            scope TEXT PRIMARY KEY NOT NULL,\
+            app_id TEXT NOT NULL,\
+            handle TEXT NOT NULL,\
+            prefix TEXT NOT NULL,\
+            store TEXT NOT NULL,\
+            state TEXT NOT NULL DEFAULT 'live' CHECK (state IN ('live', 'revoking')),\
+            nonce BLOB NOT NULL,\
+            ciphertext BLOB NOT NULL,\
+            updated_at TEXT NOT NULL\
+          );\
+          CREATE INDEX IF NOT EXISTS idx_scoped_credential_app ON scoped_credential(app_id);",
     },
 ];
 
