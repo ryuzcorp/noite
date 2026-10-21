@@ -241,7 +241,7 @@ impl CredentialProvider for MinioAdmin {
 fn is_no_such(status: u16, body: &[u8]) -> bool {
     status == 404
         || body.windows(9).any(|w| w == b"NoSuchKey")
-        || body.windows(12).any(|w| w == b"NoSuchEntity")
+        || body.windows(13).any(|w| w == b"NoSuchEntity")
         || body.windows(13).any(|w| w == b"XMinioAdminNo")
 }
 
@@ -318,6 +318,16 @@ fn argon2_key(secret: &str, salt: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A missing user or policy is already revoked: 404, or the store's
+    /// `NoSuch*` error codes in the body.
+    #[test]
+    fn missing_user_or_policy_counts_as_revoked() {
+        assert!(is_no_such(404, b""));
+        assert!(is_no_such(400, b"<Code>NoSuchKey</Code>"));
+        assert!(is_no_such(400, b"<Code>NoSuchEntity</Code>"));
+        assert!(!is_no_such(400, b"<Code>AccessDenied</Code>"));
+        assert!(!is_no_such(200, b""));
+    }
 
     /// sio-go's own stream test vectors (AES-128-GCM, bufsize 16): our
     /// framing must seal the identical final chunk, or every admin write

@@ -153,8 +153,10 @@ fn ruleset(build: Option<(u32, u32)>, fleet_uid: u32, storage: &Storage) -> Stri
     }
     // The fleet's own celld needs the object store, which in Compose sits on a
     // private address (rustfs:9000): allow exactly those addresses and port,
-    // ahead of the private-range rejects. Builds are deliberately not allowed
-    // the store (only the runner and celld hold keys).
+    // ahead of the private-range rejects. Release commands run as the app's
+    // build uid and hold the scope's own key (SPEC, Scoped credentials), so
+    // the build range needs the same allowance; builds hold no keys of their
+    // own, so the store's unauthenticated surface is all they can reach.
     let (v4, v6): (Vec<IpAddr>, Vec<IpAddr>) =
         storage.addrs.iter().copied().partition(IpAddr::is_ipv4);
     let join = |ips: &[IpAddr]| {
@@ -163,19 +165,21 @@ fn ruleset(build: Option<(u32, u32)>, fleet_uid: u32, storage: &Storage) -> Stri
             .collect::<Vec<_>>()
             .join(", ")
     };
-    if !v4.is_empty() {
-        rules.push(format!(
-            "    meta skuid {fleet_uid} ip daddr {{ {} }} tcp dport {} accept",
-            join(&v4),
-            storage.port
-        ));
-    }
-    if !v6.is_empty() {
-        rules.push(format!(
-            "    meta skuid {fleet_uid} ip6 daddr {{ {} }} tcp dport {} accept",
-            join(&v6),
-            storage.port
-        ));
+    for id in &identities {
+        if !v4.is_empty() {
+            rules.push(format!(
+                "    meta skuid {id} ip daddr {{ {} }} tcp dport {} accept",
+                join(&v4),
+                storage.port
+            ));
+        }
+        if !v6.is_empty() {
+            rules.push(format!(
+                "    meta skuid {id} ip6 daddr {{ {} }} tcp dport {} accept",
+                join(&v6),
+                storage.port
+            ));
+        }
     }
     // No new connection to loopback, any protocol: that is where the operator
     // APIs, the runner, Caddy's admin and every other fleet listen.
@@ -289,13 +293,17 @@ mod tests {
             assert!(accept < first_reject, "dns for {uid} must come first");
         }
         // The fleet's celld reaches its object store before private ranges close.
-        let store = rules
-            .find("meta skuid 10020 ip daddr { 10.89.0.7 } tcp dport 9000 accept")
-            .expect("storage allowance");
-        assert!(
-            store < first_reject,
-            "storage must be allowed before the rejects"
-        );
+        for uid in ["10020", "10030-11053"] {
+            let store = rules
+                .find(&format!(
+                    "meta skuid {uid} ip daddr {{ 10.89.0.7 }} tcp dport 9000 accept"
+                ))
+                .expect("storage allowance");
+            assert!(
+                store < first_reject,
+                "storage must be allowed before the rejects for {uid}"
+            );
+        }
         // Replies to inbound connections pass before anything is rejected.
         let replies = rules
             .find("ct state established,related accept")

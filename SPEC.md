@@ -86,7 +86,7 @@ celld's internal listener carries peer traffic and an **unauthenticated operator
 `NOITE_TENANCY=single|multi` (default `multi` when `BASE_DOMAIN` is outside the `localhost` family, else `single`). `host/isolation.rs::self_check` runs at boot: build uid drop, fleet uid drop, nft table installed.
 
 - `multi`: any failed check keeps `/ready` at 503 with the reason and refuses builds.
-- `single`: checks run and warn, nothing is refused; fleets and release commands use the root bucket keys, and no egress policy is installed.
+- `single`: checks run and warn, nothing is refused; fleets and release commands use the root bucket keys only in `root` credential mode, and no egress policy is installed.
 
 This is the honest contract for platforms that cannot provide isolation: they run Noite for one person.
 
@@ -97,7 +97,7 @@ This is the honest contract for platforms that cannot provide isolation: they ru
 - Bounds: `bun install` and the build `RUNNER_BUILD_TIMEOUT_S` (300) each, the `cloudflare.config.ts` conversion 60 s, release 600 s; `RLIMIT_NPROC` (only when dropping uid) and `RLIMIT_FSIZE`; a worktree above `RUNNER_BUILD_MAX_MB` (2048) fails the deploy.
 - Worktrees are `lchown`ed to the build uid (never following symlinks) and taken back after the build. `builds/<slug>` is 0755 so bun can resolve its cwd.
 - Once the tree is taken back, the deploy root must resolve inside it and its Wrangler config may not be a symlink (`deploy.rs::contained_deploy_root`): `celld deploy` runs as the runner, so a `dist` symlink into `/data` would ship platform files into the tenant's bucket. The check runs after the last tenant step (release), not when the root is picked. Symlinks further down (`main`'s imports, files in the assets directory) are not checked yet.
-- **Release** (`release` in the tenant's `wrangler.jsonc`, meant for migrations) runs in `multi` only with scoped bucket keys, so it is **skipped** there until a credential provider lands, with a deploy-log line saying so. In `single` it runs with the root keys. Noite's `release` key is stripped from `wrangler.json` before `celld deploy` (celld rejects unknown keys).
+- **Release** (`release` in the tenant's `wrangler.jsonc`, meant for migrations) runs in `multi` with the scope's own bucket keys; where no scoped provider exists it is **skipped** (`root` mode), with a deploy-log line saying so. In `single` it runs with the scope's keys, or the root keys in `root` mode. Noite's `release` key is stripped from `wrangler.json` before `celld deploy` (celld rejects unknown keys).
 - Build network stays open (package registries); the egress policy below applies to the build uid as well.
 
 ### Egress policy
@@ -106,7 +106,7 @@ This is the honest contract for platforms that cannot provide isolation: they ru
 
 1. accept `ct state established,related` (without it, replies on connections the runner itself opened were rejected);
 2. accept DNS (udp/tcp 53);
-3. accept the storage endpoint, for the fleet uid only: the addresses `S3_ENDPOINT` resolves to, on its port, refreshed every 30 s (a fleet's celld needs its bucket, and bundled RustFS sits on a private address);
+3. accept the storage endpoint, for the fleet uid and the build range: the addresses `S3_ENDPOINT` resolves to, on its port, refreshed every 30 s (a fleet's celld needs its bucket, and bundled RustFS sits on a private address; the release command runs as the build uid and holds the scope's own key, and builds hold no keys of their own);
 4. reject loopback (`127.0.0.0/8`, `::1`), RFC 1918, link-local and metadata (`169.254.0.0/16`), CGNAT (`100.64.0.0/10`), and ULA/link-local IPv6 (`fc00::/7`, `fe80::/10`).
 
 Since all fleets share one uid, "the fleet uid may not dial loopback" blocks fleet → fleet, fleet → operator API, fleet → runner and fleet → Caddy admin. A single-node fleet never needs to dial loopback: Caddy dials the fleet, not the reverse. The same rules, loopback included, apply to builds. Tenant fleets additionally bind their internal listener to loopback. The control node's internal listener binds `0.0.0.0:8091` so a replacement node can reach it during an overlapping redeploy; the policy, not the bind, keeps tenants off it.
