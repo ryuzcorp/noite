@@ -125,7 +125,11 @@ pub async fn verify(
         Err(e) => return Err(ApiError::internal(e.to_string())),
     }
     let owner = dns::challenge_name(&hostname);
-    let records = state.dns.txt_records(&owner).await.map_err(ApiError::bad)?;
+    let records = state
+        .dns
+        .txt_records(&owner)
+        .await
+        .map_err(|e| ApiError::bad(e.to_string()))?;
     if records.is_empty() {
         return Err(ApiError::bad(format!(
             "no TXT record at {owner} yet — create it, then verify again"
@@ -338,5 +342,21 @@ mod tests {
             err.to_string().contains("already verified"),
             "clear refusal: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn verify_without_a_resolver_fails_readably() {
+        let (mut state, _fake) = test_state(Tenancy::Multi).await;
+        state.dns = Arc::new(crate::dns::UnavailableResolver::new(
+            "no nameservers".to_owned(),
+        ));
+        let app = seed_app(&state, "noresolv").await;
+        add(&state, &app.id, "dark.example.com")
+            .await
+            .expect("claim");
+        let err = verify(&state, &app.id, "dark.example.com")
+            .await
+            .expect_err("no resolver must fail");
+        assert_eq!(err.to_string(), "DNS resolver unavailable: no nameservers");
     }
 }

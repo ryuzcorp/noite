@@ -10,10 +10,13 @@
 //! the control UI's Verify button triggers one lookup per click, and the
 //! failure reason names what was missing.
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 
 /// TXT owner label: the proof lives at `<CHALLENGE_LABEL>.<hostname>`.
 pub const CHALLENGE_LABEL: &str = "_noite-challenge";
@@ -36,15 +39,37 @@ pub fn new_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// One TXT lookup: the record strings at `name`, or a human-readable
-/// failure. A boxed future (not `async fn`: that is not object-safe, so
+/// Why a TXT lookup failed. `Unavailable` means this runner cannot resolve
+/// at all (the system resolver failed to build at boot); `Lookup` is one
+/// failed query. Both render as the readable reason the Verify button shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsError {
+    Unavailable(String),
+    Lookup(String),
+}
+
+impl std::fmt::Display for DnsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DnsError::Unavailable(reason) => {
+                write!(f, "DNS resolver unavailable: {reason}")
+            }
+            DnsError::Lookup(reason) => write!(f, "DNS lookup failed: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for DnsError {}
+
+/// One TXT lookup: the record strings at `name`, or a [`DnsError`]. A boxed
+/// future (not `async fn`: that is not object-safe, so
 /// `Arc<dyn TxtResolver>` would not compile) so [`FakeResolver`] can stand
 /// in for the network in tests, which must never dial DNS.
 pub trait TxtResolver: Send + Sync {
     fn txt_records<'a>(
         &'a self,
         name: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, DnsError>> + Send + 'a>>;
 }
 
 /// Production resolver: the system resolver via hickory (Tokio).
@@ -65,13 +90,13 @@ impl TxtResolver for SystemResolver {
     fn txt_records<'a>(
         &'a self,
         name: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, DnsError>> + Send + 'a>> {
         Box::pin(async move {
             let lookup = self
                 .inner
                 .txt_lookup(name)
                 .await
-                .map_err(|e| format!("DNS lookup failed: {e}"))?;
+                .map_err(|e| DnsError::Lookup(e.to_string()))?;
             let mut out = Vec::new();
             for record in lookup.answers() {
                 let hickory_resolver::proto::rr::RData::TXT(txt) = &record.data else {
@@ -91,20 +116,23 @@ impl TxtResolver for SystemResolver {
 }
 
 /// Test resolver: canned TXT answers per owner name, no network. Awaits
-/// nothing and holds no clock, so tests stay deterministic.
+/// nothing and holds no clock, so tests stay deterministic. Test-only: the
+/// production fallback for a missing system resolver is
+/// [`UnavailableResolver`], never this.
 #[derive(Debug, Default)]
+#[cfg(test)]
 pub struct FakeResolver {
     records: Mutex<HashMap<String, Vec<String>>>,
 }
 
+#[cfg(test)]
 impl FakeResolver {
-    #[cfg(test)]
     pub fn with_record(name: &str, value: &str) -> Arc<Self> {
         let fake = Arc::new(Self::default());
         fake.set(name, vec![value.to_owned()]);
         fake
     }
-    #[cfg(test)]
+
     pub fn set(&self, name: &str, values: Vec<String>) {
         self.records
             .lock()
@@ -113,11 +141,12 @@ impl FakeResolver {
     }
 }
 
+#[cfg(test)]
 impl TxtResolver for FakeResolver {
     fn txt_records<'a>(
         &'a self,
         name: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, DnsError>> + Send + 'a>> {
         let records = self
             .records
             .lock()
@@ -129,13 +158,40 @@ impl TxtResolver for FakeResolver {
     }
 }
 
+/// The resolver [`system()`] falls back to when the system resolver cannot
+/// be built: every lookup fails as [`DnsError::Unavailable`], so Verify
+/// answers a readable "DNS resolver unavailable: …" instead of hanging or
+/// silently failing. Boot logs a warning naming the cause.
+#[derive(Debug)]
+pub struct UnavailableResolver {
+    reason: String,
+}
+
+impl UnavailableResolver {
+    pub fn new(reason: String) -> Self {
+        Self { reason }
+    }
+}
+
+impl TxtResolver for UnavailableResolver {
+    fn txt_records<'a>(
+        &'a self,
+        _name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, DnsError>> + Send + 'a>> {
+        let reason = self.reason.clone();
+        Box::pin(async move { Err(DnsError::Unavailable(reason)) })
+    }
+}
+
 /// Shared handle carried on [`crate::AppState`].
 pub fn system() -> Arc<dyn TxtResolver> {
-    SystemResolver::new().map(|r| Arc::new(r) as Arc<dyn TxtResolver>)
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "system DNS resolver unavailable; TXT verification will fail");
-        Arc::new(FakeResolver::default()) as Arc<dyn TxtResolver>
-    })
+    match SystemResolver::new() {
+        Ok(resolver) => Arc::new(resolver),
+        Err(e) => {
+            tracing::warn!(error = %e, "system DNS resolver unavailable; TXT verification will fail");
+            Arc::new(UnavailableResolver::new(e.to_string()))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -174,5 +230,16 @@ mod tests {
             fake.txt_records("_noite-challenge.other.test").await,
             Ok(Vec::new())
         );
+    }
+
+    #[tokio::test]
+    async fn unavailable_resolver_fails_readably() {
+        let resolver = UnavailableResolver::new("no nameservers".to_owned());
+        let err = resolver
+            .txt_records("_noite-challenge.x.test")
+            .await
+            .expect_err("unavailable must fail");
+        assert_eq!(err, DnsError::Unavailable("no nameservers".to_owned()));
+        assert_eq!(err.to_string(), "DNS resolver unavailable: no nameservers");
     }
 }
