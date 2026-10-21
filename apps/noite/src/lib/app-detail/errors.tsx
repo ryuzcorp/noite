@@ -263,16 +263,28 @@ const ErrorList = ({
   );
 };
 
-const FrameLine = ({ frame }: { frame: RunnerErrorFrame }) => (
-  <li
-    class={`flex flex-wrap gap-x-2 px-3 py-1 font-mono text-xs ${frame.inApp ? "" : "opacity-50"}`}
-  >
-    <span class={frame.inApp ? "font-semibold" : ""}>
-      {frame.function || "<anonymous>"}
-    </span>
-    <span class="opacity-70">{frame.location}</span>
-  </li>
-);
+const FrameLine = ({ frame }: { frame: RunnerErrorFrame }) => {
+  const mapped = frame.mappedLocation ?? null;
+
+  return (
+    <li
+      class={`flex flex-col gap-0 px-3 py-1 font-mono text-xs ${frame.inApp ? "" : "opacity-50"}`}
+    >
+      <span class="flex flex-wrap gap-x-2">
+        <span class={frame.inApp ? "font-semibold" : ""}>
+          {(mapped ? frame.mappedFunction || frame.function : frame.function) ||
+            "<anonymous>"}
+        </span>
+        <span class="opacity-70">{mapped ?? frame.location}</span>
+      </span>
+      {mapped ? (
+        <span class="text-[11px] opacity-50">
+          minified: {frame.function || "<anonymous>"} ({frame.location})
+        </span>
+      ) : null}
+    </li>
+  );
+};
 
 const RequestLine = ({ event }: { event: RunnerErrorEvent }) => {
   if (!event.path) {

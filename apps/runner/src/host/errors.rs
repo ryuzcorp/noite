@@ -63,6 +63,14 @@ pub struct Frame {
     pub function: String,
     pub location: String,
     pub in_app: bool,
+    /// Read-time symbolication (`service::errors::get`): the original
+    /// function and `file:line:col` from the deploy's maps. Stored frames
+    /// stay raw (`record` never sets these), so grouping fingerprints are
+    /// unchanged and old rows parse — hence the serde defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapped_function: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapped_location: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +142,8 @@ pub fn parse_frame(raw: &str) -> Frame {
         function,
         location,
         in_app,
+        mapped_function: None,
+        mapped_location: None,
     }
 }
 
@@ -632,6 +642,8 @@ fn sdk_parsed(event: &SdkEvent) -> ParsedError {
             function: clip(&f.function, MAX_MESSAGE),
             location: clip(&f.location, MAX_MESSAGE),
             in_app: f.in_app,
+            mapped_function: None,
+            mapped_location: None,
         })
         .collect();
     ParsedError {
@@ -952,6 +964,33 @@ mod tests {
         assert_eq!(events[0].browser, "Chrome");
         assert_eq!(events[0].os, "macOS");
         assert_eq!(events[0].sha, "abc123");
+    }
+
+    /// Symbolication happens at read time, never at ingest: the stored
+    /// frames stay exactly the raw triple, so fingerprints (and old rows)
+    /// never see the mapped fields.
+    #[tokio::test]
+    async fn stored_frames_stay_raw_for_read_time_symbolication() {
+        let pool = metrics_pool().await;
+        let fps = ingest_sdk(&pool, "app-x", Some("abc123"), &[sdk_twin()])
+            .await
+            .expect("ingest");
+        let events = crate::db::list_error_events(&pool, "app-x", &fps[0])
+            .await
+            .expect("events read");
+        assert_eq!(events.len(), 1);
+        let frames: serde_json::Value =
+            serde_json::from_str(&events[0].frames).expect("frames parse");
+        let frames = frames.as_array().expect("frames array");
+        assert!(!frames.is_empty());
+        for frame in frames {
+            let frame = frame.as_object().expect("frame object");
+            assert!(frame.contains_key("function"));
+            assert!(frame.contains_key("location"));
+            assert!(frame.contains_key("inApp"));
+            assert!(!frame.contains_key("mappedFunction"));
+            assert!(!frame.contains_key("mappedLocation"));
+        }
     }
 
     #[tokio::test]

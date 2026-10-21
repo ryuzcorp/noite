@@ -61,6 +61,9 @@ pub struct AppState {
     pub dns: Arc<dyn crate::dns::TxtResolver>,
     /// Process start (whole hours of uptime go into the instance heartbeat).
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Parsed per-deploy source maps for error symbolication, bounded
+    /// (`host::sourcemaps::SourceMapCache`).
+    pub source_maps: host::sourcemaps::SourceMapCache,
 }
 
 #[tokio::main]
@@ -264,6 +267,7 @@ async fn main() -> anyhow::Result<()> {
             std::time::Instant::now(),
         ))),
         started_at,
+        source_maps: host::sourcemaps::SourceMapCache::new(),
     };
 
     let cfg_loop = (*config).clone();

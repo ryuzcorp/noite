@@ -10,6 +10,12 @@ export default {
       return Response.json({ greeting: greeting.trim() });
     }
 
+    if (pathname === "/api/boom") {
+      // E2E hook (sourcemaps.spec.ts): throws inside the Worker so the
+      // Errors tab records a Worker issue symbolicated to this file.
+      throw new Error("worker-boom");
+    }
+
     return new Response("not found", { status: 404 });
   },
 };

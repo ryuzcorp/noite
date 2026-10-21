@@ -424,6 +424,7 @@ mod tests {
                 std::time::Instant::now(),
             ))),
             started_at: chrono::Utc::now(),
+            source_maps: Default::default(),
         };
         (state, dir)
     }
