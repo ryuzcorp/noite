@@ -6,7 +6,7 @@ import {
   createAppWithKey,
   deleteApp,
   pushAppDir,
-  runnerCall,
+  runnerApi,
   waitForDeploy,
 } from "./helpers";
 
@@ -135,7 +135,14 @@ test("worker and browser errors symbolicate to original sources", async ({
   pushAppDir(apiKey, new URL("../test/vite", import.meta.url), SOURCEMAPS_SLUG);
   const deploy = await waitForDeploy(request, appId);
   expect(deploy.status, deploy.log).toBe("success");
-  expect(deploy.log).toMatch(/sourcemaps: /u);
+
+  // The deploy row's own log proves the maps step ran for this sha.
+  const deployLog = await runnerApi<{ log: string }>(
+    request,
+    `/v1/apps/${appId}/deploys/${deploy.id}/log`
+  );
+
+  expect(deployLog.log).toMatch(/sourcemaps: /u);
 
   const base = `http://localhost:${await appListenPort(request, appId)}`;
   await expect
