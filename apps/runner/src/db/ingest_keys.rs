@@ -53,22 +53,21 @@ pub async fn app_for_project(
 }
 
 /// Get the app's row, creating it (key + number together) when missing.
-pub async fn get_or_create_ingest_key(
-    pool: &SqlitePool,
-    app_id: &str,
-) -> sqlx::Result<IngestKey> {
+pub async fn get_or_create_ingest_key(pool: &SqlitePool, app_id: &str) -> sqlx::Result<IngestKey> {
     if let Some(existing) = get_ingest_key(pool, app_id).await? {
         return Ok(existing);
     }
     let key = mint_key();
     let now = now_iso();
-    sqlx::query("INSERT INTO app_ingest_key (app_id, key, created_at, updated_at) VALUES (?, ?, ?, ?)")
-        .bind(app_id)
-        .bind(&key)
-        .bind(&now)
-        .bind(&now)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO app_ingest_key (app_id, key, created_at, updated_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(app_id)
+    .bind(&key)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
     let row: (i64,) = sqlx::query_as("SELECT project_id FROM app_ingest_key WHERE app_id = ?")
         .bind(app_id)
         .fetch_one(pool)
@@ -136,11 +135,18 @@ mod tests {
     async fn creates_key_and_number_together_then_reads_them_back() {
         let pool = pool().await;
         seed_app(&pool, "app-one").await;
-        assert!(get_ingest_key(&pool, "app-one").await.expect("get").is_none());
-        let created = get_or_create_ingest_key(&pool, "app-one").await.expect("create");
+        assert!(get_ingest_key(&pool, "app-one")
+            .await
+            .expect("get")
+            .is_none());
+        let created = get_or_create_ingest_key(&pool, "app-one")
+            .await
+            .expect("create");
         assert!(created.project_id >= 1);
         assert_eq!(created.key.len(), 40);
-        let again = get_or_create_ingest_key(&pool, "app-one").await.expect("again");
+        let again = get_or_create_ingest_key(&pool, "app-one")
+            .await
+            .expect("again");
         assert_eq!(again.project_id, created.project_id);
         assert_eq!(again.key, created.key);
         let (app_id, key) = app_for_project(&pool, created.project_id)
@@ -149,14 +155,19 @@ mod tests {
             .expect("row");
         assert_eq!(app_id, "app-one");
         assert_eq!(key, created.key);
-        assert!(app_for_project(&pool, created.project_id + 1000).await.expect("missing").is_none());
+        assert!(app_for_project(&pool, created.project_id + 1000)
+            .await
+            .expect("missing")
+            .is_none());
     }
 
     #[tokio::test]
     async fn rotation_keeps_the_number_and_invalidates_the_old_key() {
         let pool = pool().await;
         seed_app(&pool, "app-two").await;
-        let before = get_or_create_ingest_key(&pool, "app-two").await.expect("create");
+        let before = get_or_create_ingest_key(&pool, "app-two")
+            .await
+            .expect("create");
         let after = rotate_ingest_key(&pool, "app-two").await.expect("rotate");
         assert_eq!(after.project_id, before.project_id);
         assert_ne!(after.key, before.key);
@@ -171,11 +182,20 @@ mod tests {
     async fn numbers_are_never_reused_after_delete() {
         let pool = pool().await;
         seed_app(&pool, "app-gone").await;
-        let gone = get_or_create_ingest_key(&pool, "app-gone").await.expect("create");
-        crate::db::delete_app(&pool, "app-gone").await.expect("delete");
-        assert!(app_for_project(&pool, gone.project_id).await.expect("lookup").is_none());
+        let gone = get_or_create_ingest_key(&pool, "app-gone")
+            .await
+            .expect("create");
+        crate::db::delete_app(&pool, "app-gone")
+            .await
+            .expect("delete");
+        assert!(app_for_project(&pool, gone.project_id)
+            .await
+            .expect("lookup")
+            .is_none());
         seed_app(&pool, "app-next").await;
-        let next = get_or_create_ingest_key(&pool, "app-next").await.expect("create");
+        let next = get_or_create_ingest_key(&pool, "app-next")
+            .await
+            .expect("create");
         assert_ne!(next.project_id, gone.project_id);
     }
 }
