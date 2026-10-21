@@ -86,13 +86,6 @@ test("the Ilha + Void template deploys and serves", async ({
     releaseGate = deferred.resolve;
   };
 
-  const routeScripts = async (): Promise<void> => {
-    await page.route("**/*.js", async (route) => {
-      await gate;
-      await route.continue();
-    });
-  };
-
   // Arm the held-scripts gate for one guarded navigation. The previous
   // section's gate is released and unrouted first: a request held for the
   // old page must never survive the navigation. Continuing it afterwards
@@ -103,7 +96,10 @@ test("the Ilha + Void template deploys and serves", async ({
     releaseGate?.();
     await page.unroute("**/*.js");
     holdScripts();
-    await routeScripts();
+    await page.route("**/*.js", async (route) => {
+      await gate;
+      await route.continue();
+    });
   };
 
   await guardScripts();
