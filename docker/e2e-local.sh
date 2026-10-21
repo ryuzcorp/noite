@@ -70,6 +70,7 @@ if [ "$E2E_TENANCY" = multi ]; then
   # the same file production multi installs apply.
   FILES="$FILES -f docker/compose.multi.yaml"
 fi
+CE2E="$COMPOSE -p noite-e2e $FILES"
 
 echo "==> reset lane state (fresh volumes, fresh bucket, no session)"
 # shellcheck disable=SC2086
