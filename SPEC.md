@@ -351,7 +351,29 @@ The worker D1 has an `invite` table (`code`, `createdBy`, `usedBy`, `usedAt`, `r
 
 ### Custom domains
 
-`app_domain` (hostname PRIMARY KEY: one app per hostname) with `GET/POST /v1/apps/{id}/domains`, `DELETE …/domains/{hostname}` and RPC `domains.list|add|remove`. `lifecycle.rs::hostname_ok` validates (lowercase DNS shape, ≥ 2 labels, no wildcard/IP/port/path); platform hostnames and `CONTROL_EXTRA_HOSTS` are refused, a taken hostname is 409. Routed and certified only while the app is deployed and running; the fallback page resolves custom hosts too. No DNS/TXT ownership check yet.
+`app_domain` claims keyed `(hostname, app_id)` with `status`
+(`pending`/`verified`), a per-claim `token` and `verified_at`, exposed as
+`GET/POST /v1/apps/{id}/domains`, `POST …/domains/verify`,
+`DELETE …/domains/{hostname}` and RPC `domains.list|add|verify|remove`.
+`lifecycle.rs::hostname_ok` validates (lowercase DNS shape, ≥ 2 labels, no
+wildcard/IP/port/path); platform hostnames and `CONTROL_EXTRA_HOSTS` are
+refused. Ownership is proven by a DNS TXT record at
+`_noite-challenge.<hostname>` containing the claim's token (the same shape
+as ACME's `_acme-challenge` DNS proof, under our own label so a Noite proof
+can never be mistaken for a certificate-issuance record). The runner
+resolves TXT through an injectable resolver (a trait; hickory against the
+system resolver in production, a fake in tests) — one lookup per explicit
+Verify call, no background polling.
+Several apps may hold a pending claim for one hostname; the first to verify
+wins, after which other pending claims for it are dropped and new claims are
+refused (409), so a tenant can never squat a hostname it does not own. At
+most one verified row per hostname is enforced by a partial unique index.
+Only verified domains are routed (Caddyfile), certified (`tls-ask` mints
+nothing for pending names) or resolved by the fallback page, and only while
+the app is deployed and running. In `single` tenancy a claim verifies
+immediately (one trusted operator owns the DNS); in `multi` it stays
+pending until its TXT proof resolves. Pre-verification rows are
+grandfathered as verified (schema version 10), because they are live sites.
 
 ### Limits
 

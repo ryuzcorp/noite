@@ -460,12 +460,16 @@ pub async fn rewrite_caddy(
             );
         }
     }
-    // Custom hostnames (app_domain): one site per registered name, routed to
+    // Custom hostnames (app_domain): one site per *verified* name, routed to
     // its app's port. Same rule as the tenant sites — a stopped or
     // never-deployed app gets no route, so the request lands on the wildcard
     // fallback page instead of a dead upstream (host/edge.rs resolves custom
-    // hosts there too).
+    // hosts there too). A pending (unverified) claim gets no site at all:
+    // no route, and the ask gate mints no certificate for it.
     for domain in domains {
+        if !domain.is_verified() {
+            continue;
+        }
         let Some(app) = apps.iter().find(|a| a.id == domain.app_id) else {
             continue;
         };
@@ -1287,7 +1291,18 @@ mod tests {
         AppDomain {
             app_id: app_id.into(),
             hostname: hostname.into(),
+            status: crate::models::DOMAIN_STATUS_VERIFIED.into(),
+            token: "tok".into(),
+            verified_at: Some("2026-09-15T00:00:00Z".into()),
             created_at: "2026-09-15T00:00:00Z".into(),
+        }
+    }
+
+    fn test_pending_domain(app_id: &str, hostname: &str) -> AppDomain {
+        AppDomain {
+            status: crate::models::DOMAIN_STATUS_PENDING.into(),
+            verified_at: None,
+            ..test_domain(app_id, hostname)
         }
     }
 
@@ -1680,6 +1695,23 @@ mod tests {
         assert!(
             !out.contains("orphan.example.com"),
             "a domain without an app gets no route"
+        );
+        let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
+    }
+
+    #[tokio::test]
+    async fn pending_domains_get_no_route() {
+        let cfg = test_config("noite.now", "app", true, "/tmp/noite-test-domains");
+        let app = test_app();
+        let domains = [
+            test_domain(&app.id, "www.example.com"),
+            test_pending_domain(&app.id, "draft.example.com"),
+        ];
+        let out = rendered_with(&cfg, &[app], &domains).await;
+        assert!(out.contains("www.example.com {"), "verified gets a site");
+        assert!(
+            !out.contains("draft.example.com"),
+            "a pending claim gets no route, even on a live app"
         );
         let _ = tokio::fs::remove_file(&cfg.caddyfile_path).await;
     }

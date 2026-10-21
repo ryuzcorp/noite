@@ -60,6 +60,7 @@ impl Harness {
                 crate::host::isolation::IsolationStatus::default(),
             )),
             state_sync: crate::host::state::StateSync::new(),
+            dns: std::sync::Arc::new(crate::dns::FakeResolver::default()),
             bucket_ok: Arc::new(tokio::sync::RwLock::new((
                 true,
                 String::new(),
@@ -323,6 +324,26 @@ async fn domains_agree() {
         )
         .await
         .expect("domains.add");
+    // `domains.verify` is a round-trip on an already-verified claim here
+    // (single tenancy verifies on add): both transports return the list.
+    let (status, rest_verified) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/domains/verify", app.id),
+            Some(json!({ "hostname": "one.example.com" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rest_verified, added);
+    assert_eq!(
+        h.rpc(
+            "domains.verify",
+            json!({ "id": app.id, "hostname": "one.example.com" })
+        )
+        .await
+        .expect("domains.verify"),
+        added
+    );
     let (status, rest_list) = h
         .rest("GET", &format!("/v1/apps/{}/domains", app.id), None)
         .await;
@@ -356,6 +377,59 @@ async fn domains_agree() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(rest_list, after_rpc_remove);
+    // Verifying a detached hostname 404s on both transports.
+    let (status, _) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/domains/verify", app.id),
+            Some(json!({ "hostname": "gone.example.com" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(matches!(
+        h.rpc(
+            "domains.verify",
+            json!({ "id": app.id, "hostname": "gone.example.com" })
+        )
+        .await,
+        Err((404, _))
+    ));
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn pending_domains_mint_no_certificates() {
+    let h = Harness::new().await;
+    let app = h.seed_app("tls-app").await;
+    crate::db::update_app_status(&h.state.pool, &app.id, "running", None, Some("abc"))
+        .await
+        .expect("deployed");
+    // A pending claim (what `domains.add` writes in `multi` tenancy) mints
+    // no certificate, even on a deployed and running app.
+    crate::db::add_domain(
+        &h.state.pool,
+        &app.id,
+        "shop.example.com",
+        crate::models::DOMAIN_STATUS_PENDING,
+        "tok",
+        None,
+    )
+    .await
+    .expect("pending claim");
+    let (status, _) = h
+        .rest("GET", "/v1/edge/tls-ask?domain=shop.example.com", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "pending mints nothing");
+    // Once verified, the same hostname mints.
+    assert!(
+        crate::db::verify_domain(&h.state.pool, &app.id, "shop.example.com")
+            .await
+            .expect("flip")
+    );
+    let (status, _) = h
+        .rest("GET", "/v1/edge/tls-ask?domain=shop.example.com", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "verified mints");
     h.finish().await;
 }
 

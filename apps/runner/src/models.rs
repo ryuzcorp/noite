@@ -280,13 +280,30 @@ impl Environment {
     }
 }
 
+/// A custom-domain claim's verification state (SPEC, Custom domains), stored
+/// as text like every other status column (`Environment.kind`, `App.status`):
+/// `pending` until its TXT proof resolves, `verified` once it does (or
+/// immediately in `single` tenancy, where one trusted operator owns the DNS).
+/// Only verified rows route, certify and resolve.
+pub const DOMAIN_STATUS_PENDING: &str = "pending";
+pub const DOMAIN_STATUS_VERIFIED: &str = "verified";
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct AppDomain {
     pub app_id: String,
     pub hostname: String,
+    pub status: String,
+    pub token: String,
+    pub verified_at: Option<String>,
     pub created_at: String,
+}
+
+impl AppDomain {
+    pub fn is_verified(&self) -> bool {
+        self.status == DOMAIN_STATUS_VERIFIED
+    }
 }
 
 /// An app's own edge rate limits (requests per minute). `None` takes the

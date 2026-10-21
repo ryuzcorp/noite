@@ -46,6 +46,7 @@ rusty-s3 = "0.10.2"
 # from the structs that cross the JSON boundary. `no-serde-warnings` silences
 # warnings for serde attrs ts-rs does not model (e.g. `alias`).
 ts-rs = { version = "12", features = ["no-serde-warnings"] }
+hickory-resolver = "0.26.3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

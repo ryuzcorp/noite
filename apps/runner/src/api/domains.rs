@@ -1,9 +1,11 @@
-//! Custom hostnames: list, add, remove (thin adapters over `service::domains`).
+//! Custom hostnames: list, add, verify, remove (thin adapters over
+//! `service::domains`).
 //!
-//! One hostname belongs to exactly one app (`app_domain.hostname` is the
-//! primary key), and the edge only serves it while its app is deployed and
-//! running. Hostname grammar, platform-host refusal and the conflict mapping
-//! live in the service layer so the RPC surface cannot drift.
+//! Only verified claims reach the edge — `host/caddy.rs` writes routes for
+//! them and `host/edge.rs` mints certificates through them. A pending claim
+//! is invisible to routing, TLS and the fallback page. Hostname grammar,
+//! platform-host refusal and the collision mapping live in the service layer
+//! so the RPC surface cannot drift.
 use axum::{
     extract::{Path, State},
     response::IntoResponse,
@@ -31,6 +33,16 @@ pub async fn add_domain(
     Json(body): Json<AddDomain>,
 ) -> impl IntoResponse {
     service::domains::add(&state, &app_id, &body.hostname)
+        .await
+        .map(Json)
+}
+
+pub async fn verify_domain(
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+    Json(body): Json<AddDomain>,
+) -> impl IntoResponse {
+    service::domains::verify(&state, &app_id, &body.hostname)
         .await
         .map(Json)
 }

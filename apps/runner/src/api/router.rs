@@ -47,6 +47,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/apps/{id}/domains",
             get(api::list_domains).post(api::add_domain),
         )
+        .route("/v1/apps/{id}/domains/verify", post(api::verify_domain))
         .route(
             "/v1/apps/{id}/domains/{hostname}",
             delete(api::remove_domain),

@@ -21,8 +21,8 @@ No cloud version: every alpha user runs their own install. The bar moves from "t
 
 **Nice to have:**
 
-- DNS/TXT ownership check for custom domains (a tenant can claim a hostname it does not own).
-- Per-build uids and per-fleet cgroups (`memory.max`), so one fleet's growth stops shedding every app.
+- Per-build uids and per-fleet cgroups (`memory.max`), so one fleet's growth
+  stops shedding every app.
 - Upgrades that do not cold-boot every fleet, or at least the expected downtime per upgrade in the docs.
 - A shorter snapshot loss window ([open question 3](#open-questions-and-known-issues), Litestream).
 - E2E for storage editing, rollback, commits from the source browser and the admin page ([open question 5](#open-questions-and-known-issues)).
@@ -48,14 +48,8 @@ No cloud version: every alpha user runs their own install. The bar moves from "t
 
 **Later: source maps.** Noite runs the build, so it can keep each deploy's `*.map` next to the bundle and symbolicate stacks at read time, for Worker and browser errors alike, with no upload step. Browser bundles are minified, so this matters most after phase 2.
 
-## Open questions and known issues
-
-1. **Railway multi-tenancy:** `NET_ADMIN` is unavailable (verified 2026-09-27), so the nft egress policy cannot run there. Still open: probe `SETUID`/`SETGID`/`CHOWN` and unprivileged user namespaces, and decide whether a `bwrap` fallback is worth building or Railway stays `single` only.
-2. **RustFS IAM:** if unsupported at the pinned version, bundled-RustFS installs stay on root keys, i.e. effectively `single`, unless the operator moves to MinIO/S3/R2.
-3. **Snapshot loss window** (about 70 s) vs Litestream.
-4. **Control and runner restart together** on every image update. Accepted: the UI cannot act without the runner, and one node removes the two-node readiness-gate drain that stalled the old topology.
-5. **E2E gaps.** Unit tests (`bun run test`) cover the role gate, invitations, invites, rate limiter and stream loop against a SQLite-backed D1 shim; still without e2e: storage editing, the admin page. Covered in the lane: rollback (`rollback.spec.ts`) and commits from the source browser (`source-edit`/`source-tree`/`forge.spec.ts`).
-6. **Not built:** a README for `apps/noite/test` (app-author docs exist: Apps → Deploy/Build/Configure); DNS/TXT verification for custom domains; pricing. Forge follow-ups after alpha.4: forks, notifications, a conflict-resolution UI, merge methods other than squash, issues. Preview environments shipped ([Design history](#design-history)); still open around them: a pull request page that surfaces its head branch's environment, and telemetry keyed by environment, so metrics, errors and analytics are app-wide for now ([Environments](SPEC.md#environments-previews)).
+5. **E2E gaps.** Unit tests (`bun run test`) cover the role gate, invitations, invites, rate limiter and stream loop against a SQLite-backed D1 shim; still without e2e: storage editing, rollback, commits from the source browser and the admin page. Covered in the lane: rollback (`rollback.spec.ts`) and commits from the source browser (`source-edit`/`source-tree`/`forge.spec.ts`).
+6. **Not built:** a README for `apps/noite/test` (app-author docs exist: Apps → Deploy/Build/Configure); pricing. Forge follow-ups after alpha.4: forks, notifications, a conflict-resolution UI, merge methods other than squash, issues. Preview environments shipped ([Design history](#design-history)); still open around them: a pull request page that surfaces its head branch's environment, and telemetry keyed by environment, so metrics, errors and analytics are app-wide for now ([Environments](SPEC.md#environments-previews)).
 
 ## Design history
 

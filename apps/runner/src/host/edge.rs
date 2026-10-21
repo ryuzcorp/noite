@@ -539,9 +539,9 @@ pub async fn tls_ask(
             _ => StatusCode::NOT_FOUND,
         };
     }
-    // A tenant hostname or a registered custom hostname. Both must belong to
+    // A tenant hostname or a verified custom hostname. Both must belong to
     // an app that is deployed and running, so a certificate is never minted for
-    // a name this fleet does not serve.
+    // a name this fleet does not serve. A pending claim mints nothing.
     match parse_edge_slug(domain, &cfg.tenant_bases(), &cfg.control_subdomain) {
         Some(slug) => {
             if !crate::lifecycle::slug_ok(&slug) {

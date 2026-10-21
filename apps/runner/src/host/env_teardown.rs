@@ -114,6 +114,7 @@ mod tests {
                 crate::host::isolation::IsolationStatus::default(),
             )),
             state_sync: crate::host::state::StateSync::new(),
+            dns: std::sync::Arc::new(crate::dns::FakeResolver::default()),
             bucket_ok: std::sync::Arc::new(tokio::sync::RwLock::new((
                 true,
                 String::new(),

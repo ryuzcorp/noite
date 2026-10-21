@@ -776,6 +776,16 @@ async fn dispatch_call(
             };
             complete(id, service::domains::add(state, &p.id, &p.hostname).await)
         }
+        "domains.verify" => {
+            let p: HostnameParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::domains::verify(state, &p.id, &p.hostname).await,
+            )
+        }
         "domains.remove" => {
             let p: HostnameParams = match parse(params, &id) {
                 Ok(p) => p,

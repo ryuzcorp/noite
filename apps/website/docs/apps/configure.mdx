@@ -17,15 +17,24 @@ Reserved prefixes are dropped silently: `PORT`, `HOST`, `AWS_*`, `S3_*`, `CELLD_
 
 ## Custom domains
 
-Settings → Custom Domain. Adding a hostname reserves it; the edge picks it up on the next reconcile (seconds). Then point DNS at the server:
+Settings → Custom Domain. Adding a hostname claims it for the app; proving
+ownership takes one DNS step: publish the TXT record the panel shows
+(`_noite-challenge.<hostname>` containing the claim's token — the same shape
+as ACME's `_acme-challenge` DNS proof, under our own label), then press
+**Verify**. Only a verified hostname routes, resolves and gets a certificate
+on the first visit (ask-gated on-demand TLS), picked up on the next reconcile
+(seconds). Then point DNS at the server:
 
 ```bash
 dig +short app.<domain>
 ```
 
-The certificate issues on the first visit (ask-gated on-demand TLS). Validation rules: lowercase DNS shape, ≥ 2 labels, no wildcard/IP/port/path. Platform hostnames are refused; a taken hostname returns 409. There is no DNS ownership check yet — first claimant wins.
-
-Removing a hostname releases it.
+Validation rules: lowercase DNS shape, ≥ 2 labels, no wildcard/IP/port/path.
+Platform hostnames are refused. Several apps may hold a pending claim for one
+hostname, but the first to verify wins: a hostname another app already
+verified answers 409, and verifying drops rival pending claims. In `single`
+tenancy (one trusted operator) a claim verifies immediately, with no TXT
+step. Removing a hostname releases it.
 
 ## Rate limits
 
