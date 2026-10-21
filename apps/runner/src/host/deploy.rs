@@ -140,10 +140,10 @@ pub async fn deploy_app(
 ) {
     // One deploy per app at a time: its builds share the app's build cache,
     // which every deploy prunes when it ends. A deploy someone is watching —
-    // the caller pre-created its "queued" row (an environment's create or
-    // redeploy, a workspace preview) — waits its turn: a preview must not fail
-    // because production is building. A background tip deploy has no row and
-    // skips; the next reconcile tick picks the tip up again.
+    // the caller pre-created its "queued" row (a rollback, an environment's
+    // create or redeploy, a workspace preview) — waits its turn: a preview
+    // must not fail because production is building. A background tip deploy
+    // has no row and skips; the next reconcile tick picks the tip up again.
     let claimed = match deploy_id {
         Some(_) => {
             let wait = Duration::from_millis(crate::lifecycle::DEPLOY_STUCK_MS.unsigned_abs());

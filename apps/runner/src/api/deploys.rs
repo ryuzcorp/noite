@@ -29,7 +29,7 @@ pub async fn rollback(
 ) -> impl IntoResponse {
     service::deploys::rollback(&state, &id, &body.sha)
         .await
-        .map(|sha| Json(json!({ "ok": true, "sha": sha })))
+        .map(|(deploy_id, sha)| Json(json!({ "ok": true, "sha": sha, "deployId": deploy_id })))
 }
 
 /// `?environmentId=` — one preview environment's history; absent is
