@@ -597,22 +597,26 @@ fn normalize_sources(
 
 /// A map source as a deploy-root-relative path when it resolves inside the
 /// root, else unchanged (absolute build paths never leak into storage when
-/// the file is where the bundle read it from).
+/// the file is where the bundle read it from). Relative sources resolve
+/// against the project root first — esbuild usually records them relative to
+/// its working directory — then against the map's own directory.
 fn relativize_source(root: &Path, outdir: &Path, source: &str) -> String {
     let candidate = Path::new(source);
-    let abs = if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        outdir.join(candidate)
-    };
-    abs.canonicalize()
-        .ok()
-        .and_then(|abs| {
-            abs.strip_prefix(root)
-                .ok()
-                .map(|rel| rel.to_string_lossy().replace('\\', "/"))
-        })
+    if candidate.is_absolute() {
+        return strip_to_root(root, candidate).unwrap_or_else(|| source.to_string());
+    }
+    [root, outdir]
+        .into_iter()
+        .filter_map(|base| base.join(candidate).canonicalize().ok())
+        .find_map(|abs| strip_to_root(root, &abs))
         .unwrap_or_else(|| source.to_string())
+}
+
+/// `abs` as a root-relative slash path, when it lives inside the root.
+fn strip_to_root(root: &Path, abs: &Path) -> Option<String> {
+    abs.strip_prefix(root)
+        .ok()
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
 }
 
 /// Fold the build's own map (when the entry carries a sibling `.map`) into
@@ -671,16 +675,18 @@ pub fn chain_maps(
     builder.into_sourcemap()
 }
 
-/// The shadow map's entry source, root-relative after normalization; match it
-/// exactly, or by file name when the build recorded a different prefix.
+/// The shadow map's entry source, root-relative after normalization; the
+/// config may prefix the entry with `./`, so compare without the dot. No
+/// basename fallback: an entry named `index.js` must not claim a
+/// dependency's same-named file.
 fn source_is_entry(source: &str, entry: &str) -> bool {
-    if source == entry {
-        return true;
-    }
-    fn file_name(s: &str) -> &str {
-        s.rsplit('/').next().unwrap_or(s)
-    }
-    file_name(source) == file_name(entry) && !entry.is_empty()
+    trim_dot(source) == trim_dot(entry) && !entry.is_empty()
+}
+
+/// The config may prefix the entry with `./` while map sources arrive
+/// root-relative — compare without the dot.
+fn trim_dot(s: &str) -> &str {
+    s.strip_prefix("./").unwrap_or(s)
 }
 
 /// Build the Worker map: the shadow esbuild map (chained through the entry's
@@ -1134,6 +1140,37 @@ mod tests {
         let keep: HashSet<String> = HashSet::from(["bbb".to_string()]);
         assert_eq!(prune_victims(&listed, &keep), vec!["aaa", "ccc"]);
         assert!(prune_victims(&listed, &listed.iter().cloned().collect()).is_empty());
+    }
+
+    #[test]
+    fn entry_match_ignores_a_dot_prefix_but_not_basenames() {
+        assert!(source_is_entry("index.js", "./index.js"));
+        assert!(source_is_entry("dist/app/index.js", "dist/app/index.js"));
+        assert!(!source_is_entry("other/index.js", "src/index.js"));
+        assert!(!source_is_entry("index.js", ""));
+    }
+
+    #[test]
+    fn sources_resolve_against_the_project_root_first() {
+        let root =
+            std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("src")).expect("temp dir");
+        std::fs::write(root.join("src/app.ts"), "export {}").expect("source");
+        let outdir =
+            std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outdir).expect("outdir");
+        // esbuild records inputs relative to its working directory (the
+        // root), not to the temp outdir the map lands in.
+        assert_eq!(
+            relativize_source(&root, &outdir, "src/app.ts"),
+            "src/app.ts"
+        );
+        assert_eq!(
+            relativize_source(&root, &outdir, "src/missing.ts"),
+            "src/missing.ts"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outdir);
     }
 
     #[test]
