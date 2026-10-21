@@ -45,7 +45,7 @@ flowchart LR
 ```
 tini (PID 1: reaps zombies, forwards signals)
 └── noite-runner                      root; API on :8080
-    ├── caddy run --watch             :80/:443, admin 127.0.0.1:2019
+    ├── caddy run                      :80/:443, admin 127.0.0.1:2019
     ├── celld  control fleet #0       public 127.0.0.1:8090, internal 0.0.0.0:8091
     ├── celld  tenant fleet × N       uid fleet (10020); public 0.0.0.0:{p}, internal 127.0.0.1:{p+1}
     └── bun / sh                      builds and release, one uid per app (10030+), transient
@@ -158,9 +158,9 @@ Code mode's workspace **is a document on the app's pod host**, never code on the
 
 ## Edge
 
-- Caddy is a runner child (`--watch` on `/data/caddy/Caddyfile`, admin on `127.0.0.1:2019`). `host/caddy.rs` generates Caddyfile text (the generator and its tests are unchanged), writes it only when it changed, and `POST`s it to the admin `/load`; a rejected config is logged with Caddy's error and surfaced in `/ready`, and the previous config keeps serving. Admin connection errors during Caddy's own startup are debug-level.
+- Caddy is a runner child (no `--watch`: the runner is the only writer, so the admin `/load` is the single reload path and one write is exactly one restart; admin on `127.0.0.1:2019`). `host/caddy.rs` generates Caddyfile text, writes it only when it changed, and `POST`s it to the admin `/load`; a rejected config is logged with Caddy's error and surfaced in `/ready`, and the previous config keeps serving. A Caddy that is still starting reads the file on boot and converges on the next reconcile; admin connection errors during startup are debug-level.
 - Upstreams are loopback: control `127.0.0.1:8090`, `api.`/`git.` `127.0.0.1:8080`, tenants `127.0.0.1:{port}`.
-- Every site carries `encode zstd gzip` (celld does not compress; `text/event-stream` stays uncompressed and unbuffered) and a 30 s `response_header_timeout`.
+- Every site carries `encode zstd gzip` (celld does not compress; `text/event-stream` stays uncompressed and unbuffered) and a 30 s `response_header_timeout`, plus `header Connection close`: no downstream keep-alive pooling on HTTP/1.1, so a restart cannot strand a reused connection (a pooled client racing the old server's shutdown used to die transport-level with no log and no 5xx, and POSTs never retry). HTTP/2+ strips the hop-by-hop header, so multiplexing and GOAWAY restart semantics are kept; event streams never end, so they never close.
 - Tenant and custom-domain sites are **gated on fleet readiness** (`caddy.rs::TENANT_PROXY`): Caddy health-checks `/.well-known/celld/health` (503 until celld's ready gate opens) on load and every second, holds a request up to 20 s (`lb_try_duration`) while the fleet is not ready, and otherwise serves a self-refreshing "starting" page with 503 + `Retry-After: 5` (`TENANT_STARTING`, `handle_errors 502 503`). A ready fleet is proxied with no added wait; a held request is never sent, so POSTs are safe. celld's own 503s (load shedding) pass through.
 - Access log at `/data/caddy/access.log` (one constant, `CADDY_ACCESS_LOG`); Caddy does not roll it, the tailer (`host/accesslog.rs`) truncates after reading. Metrics do **not** come from it.
 - On-demand TLS is ask-gated at `/v1/edge/tls-ask`: a certificate is minted only for a platform host, a live tenant/custom host, or a preview host of an existing app. `CADDY_AUTO_HTTPS=off` behind a terminating proxy serves plaintext `:80`.
