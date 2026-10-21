@@ -195,8 +195,16 @@ impl StateSync {
         self.dirty.store(false, Ordering::Relaxed);
         let result = self.upload_snapshot(pool, cfg).await;
         match &result {
-            Ok(_) => {
+            // An upload landed: the bucket now holds this state and its meta.
+            Ok(bytes) if *bytes > 0 => {
                 *self.last_upload.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+                *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+            // Skipped as identical: `last_hash` is only recorded once state
+            // and meta both landed, so the bucket already matches. Nothing
+            // was uploaded, so the upload age stays the real one; an older
+            // error no longer describes the bucket.
+            Ok(_) => {
                 *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
             }
             Err(e) => {
@@ -264,19 +272,22 @@ impl StateSync {
         let uploaded = s3::s3_cp_upload(cfg, &src, STATE_KEY).await;
         let _ = tokio::fs::remove_file(&src).await;
         uploaded?;
-        *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash.clone());
         crate::host::stats::count_snapshot(packed_len);
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let meta = serde_json::json!({
             "generation": generation,
             "written_at": chrono::Utc::now().to_rfc3339(),
             "codec": "zstd",
-            "sha256": hash,
+            "sha256": hash.as_str(),
             "bytes": packed_len,
             "raw_bytes": raw.len(),
             "instance": self.instance.as_str(),
         });
         upload_text(cfg, META_KEY, &serde_json::to_string_pretty(&meta)?).await?;
+        // Only now is this hash in the bucket with its meta. Recorded earlier,
+        // a failed meta upload would make the retry skip as "identical" and
+        // leave stale meta behind, which `claim` seeds the next runner from.
+        *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash);
         tracing::info!(
             bytes = packed_len,
             raw_bytes = raw.len(),
@@ -532,24 +543,32 @@ mod tests {
         ));
     }
 
+    /// PUTs whose key ends with this suffix get one 403 (a non-retried
+    /// refusal), then the hook clears.
+    type RefuseOnce = Arc<Mutex<Option<String>>>;
+
     /// In-test S3 stand-in: PUTs are stored, GETs serve them back, anything
     /// else is a missing key. Enough of the store for `claim` + `snapshot_now`
     /// (owner fence, state upload, meta upload) with no sleeps: the listener
-    /// is bound before the first client call.
-    async fn spawn_state_stub() -> (String, Arc<Mutex<HashMap<String, Vec<u8>>>>) {
+    /// is bound before the first client call. `RefuseOnce` fails one chosen
+    /// PUT.
+    async fn spawn_state_stub() -> (String, Arc<Mutex<HashMap<String, Vec<u8>>>>, RefuseOnce) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let store: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let refuse: RefuseOnce = Arc::new(Mutex::new(None));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind state stub");
         let endpoint = format!("http://{}", listener.local_addr().expect("stub addr"));
         let served = store.clone();
+        let refusing = refuse.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     break;
                 };
                 let served = served.clone();
+                let refusing = refusing.clone();
                 tokio::spawn(async move {
                     let mut head = Vec::new();
                     let mut buf = [0u8; 4096];
@@ -600,7 +619,21 @@ mod tests {
                         .next()
                         .unwrap_or_default()
                         .to_string();
-                    let (status, payload) = if request.starts_with("PUT") {
+                    let refused = request.starts_with("PUT") && {
+                        let mut hook = refusing.lock().expect("refuse lock");
+                        let hit = hook.as_deref().is_some_and(|suffix| path.ends_with(suffix));
+                        if hit {
+                            *hook = None;
+                        }
+                        hit
+                    };
+                    let (status, payload) = if refused {
+                        (
+                            "HTTP/1.1 403 Forbidden",
+                            b"<?xml version=\"1.0\"?><Error><Code>AccessDenied</Code></Error>"
+                                .to_vec(),
+                        )
+                    } else if request.starts_with("PUT") {
                         served.lock().expect("store lock").insert(path, body);
                         ("HTTP/1.1 200 OK", Vec::new())
                     } else {
@@ -626,7 +659,7 @@ mod tests {
                 });
             }
         });
-        (endpoint, store)
+        (endpoint, store, refuse)
     }
 
     /// End to end against the stub: claim, upload, identical-skip, status —
@@ -635,7 +668,7 @@ mod tests {
     async fn snapshot_uploads_and_reports_status() {
         let dir = std::env::temp_dir().join(format!("noite-state-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let (endpoint, store) = spawn_state_stub().await;
+        let (endpoint, store, _refuse) = spawn_state_stub().await;
         let mut cfg = crate::config::config_for_tests();
         cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
         cfg.s3_endpoint = endpoint.clone();
@@ -676,6 +709,65 @@ mod tests {
         assert!(body.get("owner").is_some());
         assert!(body.get("last_upload_secs_ago").is_some());
         assert!(body.get("last_error").is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A meta upload that fails after the state object landed must not let
+    /// the retry skip as "identical": the retry re-uploads state and meta, so
+    /// the bucket's meta (which `claim` seeds the next runner from) matches
+    /// the state, and `/ready` reports the failure until then.
+    #[tokio::test]
+    async fn a_failed_meta_upload_is_retried_not_skipped() {
+        let dir = std::env::temp_dir().join(format!("noite-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (endpoint, store, refuse) = spawn_state_stub().await;
+        let mut cfg = crate::config::config_for_tests();
+        cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        cfg.s3_endpoint = endpoint.clone();
+        cfg.s3_public_endpoint = endpoint;
+        let pool = crate::db::connect(&cfg.database_url)
+            .await
+            .expect("test database");
+        sqlx::query("INSERT INTO app (id, slug, name, status, subdomain, git_prefix, fleet_bucket, created_at, updated_at) VALUES ('a1', 'shop', 'Shop', 'running', 'shop.x', 'git/shop/', 'fleets/shop/', 't', 't')")
+            .execute(&pool)
+            .await
+            .expect("seed app");
+        let sync = super::StateSync::new();
+        sync.claim(&cfg).await.expect("claim against stub");
+
+        *refuse.lock().expect("refuse lock") = Some(super::META_KEY.to_string());
+        sync.snapshot_now(&pool, &cfg)
+            .await
+            .expect_err("the refused meta PUT fails the snapshot");
+        let failed = sync.snapshot_status();
+        assert!(failed.last_error.is_some(), "the failure is reported");
+        assert!(
+            failed.last_upload_secs_ago.is_none(),
+            "nothing fully landed"
+        );
+
+        // Same database bytes: the retry must upload again, not skip.
+        let bytes = sync.snapshot_now(&pool, &cfg).await.expect("retry");
+        assert!(
+            bytes > 0,
+            "the retry re-uploads instead of skipping as identical"
+        );
+        let healed = sync.snapshot_status();
+        assert!(healed.last_error.is_none());
+        assert!(healed.last_upload_secs_ago.is_some());
+        let meta_raw = store
+            .lock()
+            .expect("store lock")
+            .iter()
+            .find(|(k, _)| k.ends_with(super::META_KEY))
+            .map(|(_, v)| v.clone())
+            .expect("meta uploaded on the retry");
+        let meta: serde_json::Value = serde_json::from_slice(&meta_raw).expect("meta is JSON");
+        assert!(meta["sha256"].as_str().is_some_and(|h| !h.is_empty()));
+
+        // Now the skip is honest: unchanged bytes upload nothing and keep
+        // the real upload age.
+        assert_eq!(sync.snapshot_now(&pool, &cfg).await.expect("skip"), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
