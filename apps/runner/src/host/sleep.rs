@@ -66,7 +66,7 @@ pub fn should_sleep(now: DateTime<Utc>, activity: &[Option<DateTime<Utc>>], afte
 
 /// Newest activity timestamps for an app, as `should_sleep` expects them.
 async fn activity(pool: &SqlitePool, app: &App) -> Vec<Option<DateTime<Utc>>> {
-    let last_request = db::last_request_bucket(pool, &app.id)
+    let last_request = db::last_request_bucket(pool, &app.id, "")
         .await
         .ok()
         .flatten()
@@ -128,7 +128,11 @@ pub async fn sweep(pool: &SqlitePool, cfg: &Config, procs: &ProcMap) -> usize {
         return parked;
     };
     for env in envs.iter().filter(|e| sleep_candidate_env(e)) {
-        if !should_sleep(now, &environment_activity(env), cfg.sleep_after_h) {
+        if !should_sleep(
+            now,
+            &environment_activity(pool, env).await,
+            cfg.sleep_after_h,
+        ) {
             continue;
         }
         match sleep_environment(pool, cfg, procs, &env.id, false).await {
@@ -142,13 +146,19 @@ pub async fn sweep(pool: &SqlitePool, cfg: &Config, procs: &ProcMap) -> usize {
     parked
 }
 
-/// Idle signal for an environment: its own deploy / wake / creation clock.
-/// Phase 1 does not key telemetry by environment (ROADMAP Phase 3), so unlike
-/// an app there is no request bucket to read — and parking a preview that is
-/// actually busy only costs the next visitor a cold start, because the edge
-/// wakes it.
-fn environment_activity(env: &Environment) -> Vec<Option<DateTime<Utc>>> {
+/// Idle signal for an environment: its own last request bucket keyed by
+/// environment (like apps), with its own deploy, wake and creation clocks as
+/// the floor. An environment nobody requested still parks on its deploy
+/// clock; a busy one no longer parks just because its deploy is old.
+async fn environment_activity(pool: &SqlitePool, env: &Environment) -> Vec<Option<DateTime<Utc>>> {
+    let last_request = db::last_request_bucket(pool, &env.app_id, &env.id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| parse_time(&b));
     vec![
+        last_request,
+        env.last_deployed_at.as_deref().and_then(parse_time),
         env.asleep_since.as_deref().and_then(parse_time),
         env.woke_at.as_deref().and_then(parse_time),
         parse_time(&env.created_at),
@@ -352,7 +362,12 @@ pub async fn sleep_environment(
         return Ok(false);
     };
     if !sleep_candidate_env(&env)
-        || (!force && !should_sleep(Utc::now(), &environment_activity(&env), cfg.sleep_after_h))
+        || (!force
+            && !should_sleep(
+                Utc::now(),
+                &environment_activity(pool, &env).await,
+                cfg.sleep_after_h,
+            ))
     {
         return Ok(false);
     }
@@ -597,5 +612,104 @@ mod tests {
             .expect("get")
             .expect("row");
         assert_eq!(fresh.status, "deploying");
+    }
+}
+
+#[cfg(test)]
+mod env_activity_tests {
+    use super::*;
+
+    async fn seed_app(pool: &SqlitePool) -> App {
+        let cfg = crate::config::config_for_tests();
+        db::create_app(
+            pool,
+            &cfg,
+            db::NewApp {
+                name: "envapp",
+                slug: "envapp",
+                user_id: "local",
+                subdomain: "envapp.localhost",
+                listen: 30300,
+                internal: 30301,
+            },
+        )
+        .await
+        .expect("seed app")
+    }
+
+    async fn seed_env(pool: &SqlitePool, app: &App, label: &str, git_ref: &str) -> Environment {
+        let cfg = crate::config::config_for_tests();
+        db::create_environment(
+            pool,
+            &cfg,
+            db::NewEnvironment {
+                app_id: &app.id,
+                slug: &app.slug,
+                label,
+                kind: crate::models::EnvironmentKind::Branch,
+                git_ref,
+                created_by: "local",
+                listen: 30400,
+                internal: 30401,
+            },
+        )
+        .await
+        .expect("seed env")
+    }
+
+    /// An environment's idle clock reads its own request bucket: traffic
+    /// on the environment moves it, production traffic (and a sibling
+    /// environment's) does not, and a quiet environment falls back to its
+    /// deploy/wake/creation floor instead of sleeping blind.
+    #[tokio::test]
+    async fn environment_activity_reads_the_environments_own_bucket() {
+        // A file-backed database: the metrics tables live in an ATTACHed
+        // sibling file, and one pooled `:memory:` connection cannot see
+        // another's ATTACH.
+        let dir = std::env::temp_dir().join(format!("noite-sleep-env-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let pool = crate::db::connect(&format!(
+            "sqlite:{}?mode=rwc",
+            dir.join("noite.sqlite").display()
+        ))
+        .await
+        .expect("temp db");
+        let app = seed_app(&pool).await;
+        let env = seed_env(&pool, &app, "preview", "refs/heads/preview").await;
+        let app_id = env.app_id.clone();
+        // Quiet: no request bucket, but the creation floor is still there.
+        let quiet = environment_activity(&pool, &env).await;
+        assert_eq!(quiet[0], None, "no traffic yet");
+        assert!(
+            quiet.iter().any(|t| t.is_some()),
+            "the creation clock is the floor"
+        );
+        // Traffic on the environment moves its clock.
+        let bucket = Utc::now().format("%Y-%m-%dT%H:%M:00Z").to_string();
+        db::replace_app_metric_usage(&pool, &app_id, &env.id, &bucket, 3, 0, 10)
+            .await
+            .expect("env traffic");
+        let active = environment_activity(&pool, &env).await;
+        assert_eq!(
+            active[0].map(|t| t.format("%Y-%m-%dT%H:%M:00Z").to_string()),
+            Some(bucket.clone()),
+            "the environment's own bucket is its newest activity"
+        );
+        assert!(
+            !should_sleep(Utc::now(), &active, 1),
+            "a busy environment never parks"
+        );
+        // Production traffic on the same app does not move it: a sibling
+        // environment stays quiet.
+        let sibling = seed_env(&pool, &app, "other", "refs/heads/other").await;
+        db::replace_app_metric_usage(&pool, &app_id, "", &bucket, 9, 0, 10)
+            .await
+            .expect("prod traffic");
+        let still_quiet = environment_activity(&pool, &sibling).await;
+        assert_eq!(
+            still_quiet[0], None,
+            "production traffic must not count for the environment"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

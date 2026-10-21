@@ -16,14 +16,18 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::sse::poll_stream;
+use crate::api_error::ApiError;
 use crate::db;
 use crate::service;
 use crate::AppState;
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FeedQuery {
     channel: Option<String>,
     limit: Option<i64>,
+    #[serde(default)]
+    environment_id: Option<String>,
 }
 
 pub async fn log_event(
@@ -41,16 +45,25 @@ pub async fn list_events(
     Path(id): Path<String>,
     Query(q): Query<FeedQuery>,
 ) -> impl IntoResponse {
-    service::events::list(&state, &id, q.channel.as_deref(), q.limit)
-        .await
-        .map(Json)
+    service::events::list(
+        &state,
+        &id,
+        q.channel.as_deref(),
+        q.limit,
+        q.environment_id.as_deref(),
+    )
+    .await
+    .map(Json)
 }
 
 pub async fn list_channels(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<FeedQuery>,
 ) -> impl IntoResponse {
-    service::events::channels(&state, &id).await.map(Json)
+    service::events::channels(&state, &id, q.environment_id.as_deref())
+        .await
+        .map(Json)
 }
 
 #[derive(Deserialize)]
@@ -72,8 +85,9 @@ pub async fn identify_user(
 pub async fn get_user_props(
     State(state): State<AppState>,
     Path((id, user_id)): Path<(String, String)>,
+    Query(q): Query<FeedQuery>,
 ) -> impl IntoResponse {
-    service::events::user_props(&state, &id, &user_id)
+    service::events::user_props(&state, &id, &user_id, q.environment_id.as_deref())
         .await
         .map(Json)
 }
@@ -98,8 +112,11 @@ pub async fn set_insight(
 pub async fn list_insights(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<FeedQuery>,
 ) -> impl IntoResponse {
-    service::events::insights(&state, &id).await.map(Json)
+    service::events::insights(&state, &id, q.environment_id.as_deref())
+        .await
+        .map(Json)
 }
 
 /// Event feed as server-sent events: one combined JSON snapshot
@@ -115,6 +132,16 @@ pub async fn list_events_stream(
         Ok(app) => app,
         Err(e) => return e.into_response(),
     };
+    if let Some(env_id) = q.environment_id.as_deref().filter(|s| !s.is_empty()) {
+        let scoped = db::get_environment(&state.pool, env_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|env| env.app_id == app.id);
+        if !scoped {
+            return ApiError::not_found("environment not found").into_response();
+        }
+    }
     let limit = q.limit.unwrap_or(200).clamp(1, 200);
     let channel = q
         .channel

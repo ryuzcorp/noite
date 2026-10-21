@@ -137,8 +137,8 @@ export const keys = {
   environmentVars: (appId: string, envId: string) =>
     `app:${appId}:environment:${envId}:vars`,
   environments: (id: string) => `app:${id}:environments`,
-  errorDetail: (appId: string, fingerprint: string) =>
-    `app:${appId}:error:${fingerprint}`,
+  errorDetail: (appId: string, fingerprint: string, environmentId = "") =>
+    `app:${appId}:error:${fingerprint}${environmentId === "" ? "" : `:env:${environmentId}`}`,
   ingestKey: (id: string) => `app:${id}:ingest-key`,
   inviteCodes: "me:invites",
   limits: (id: string) => `app:${id}:limits`,
@@ -235,10 +235,19 @@ export const environmentVars = (appId: string, envId: string) =>
     })
   );
 
-/** One error with its latest occurrences. */
-export const errorDetail = (appId: string, fingerprint: string) =>
-  tracked(keys.errorDetail(appId, fingerprint), () =>
-    api<RunnerErrorDetail>("/api/errors/errorDetail", { appId, fingerprint })
+/** One error with its latest occurrences, optionally in one preview
+ * environment (absent/"" is production). */
+export const errorDetail = (
+  appId: string,
+  fingerprint: string,
+  environmentId = ""
+) =>
+  tracked(keys.errorDetail(appId, fingerprint, environmentId), () =>
+    api<RunnerErrorDetail>("/api/errors/errorDetail", {
+      appId,
+      environmentId: environmentId === "" ? undefined : environmentId,
+      fingerprint,
+    })
   );
 
 /** This app's public error-ingest identity (project id + key) for the DSN. */

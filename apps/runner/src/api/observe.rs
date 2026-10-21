@@ -17,8 +17,11 @@ use crate::service;
 use crate::AppState;
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MetricsQuery {
     pub hours: Option<i64>,
+    #[serde(default)]
+    pub environment_id: Option<String>,
 }
 
 pub async fn app_metrics(
@@ -26,7 +29,7 @@ pub async fn app_metrics(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    service::observe::metrics(&state, &id, q.hours)
+    service::observe::metrics(&state, &id, q.hours, q.environment_id.as_deref())
         .await
         .map(Json)
 }
@@ -36,7 +39,7 @@ pub async fn app_devices(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    service::observe::devices(&state, &id, q.hours)
+    service::observe::devices(&state, &id, q.hours, q.environment_id.as_deref())
         .await
         .map(Json)
 }
@@ -46,7 +49,7 @@ pub async fn app_paths(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    service::observe::paths(&state, &id, q.hours)
+    service::observe::paths(&state, &id, q.hours, q.environment_id.as_deref())
         .await
         .map(Json)
 }
@@ -56,7 +59,9 @@ pub async fn app_refs(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    service::observe::refs(&state, &id, q.hours).await.map(Json)
+    service::observe::refs(&state, &id, q.hours, q.environment_id.as_deref())
+        .await
+        .map(Json)
 }
 
 pub async fn app_spans(
@@ -64,18 +69,18 @@ pub async fn app_spans(
     Path(id): Path<String>,
     Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    service::observe::spans(&state, &id, q.hours)
+    service::observe::spans(&state, &id, q.hours, q.environment_id.as_deref())
         .await
         .map(Json)
 }
-
 /// Per-app metrics version (spec T3.6): dashboard polls fetch this first and
 /// skip their window queries when it hasn't moved.
 pub async fn app_metrics_version(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<MetricsQuery>,
 ) -> impl IntoResponse {
-    service::observe::metrics_version(&state, &id)
+    service::observe::metrics_version(&state, &id, q.environment_id.as_deref())
         .await
         .map(Json)
 }

@@ -501,15 +501,29 @@ export type ErrorStatus = "open" | "resolved" | "ignored";
 // service::errors::{ErrorIssueView, ErrorEventView, ErrorIssueList,
 // ErrorIssueDetail}).
 
-export const runnerGetError = (id: string, fingerprint: string) =>
-  runnerRpc<RunnerErrorDetail>("errors.get", { fingerprint, id });
+export const runnerGetError = (
+  id: string,
+  fingerprint: string,
+  environmentId = ""
+) =>
+  runnerRpc<RunnerErrorDetail>("errors.get", {
+    environmentId: environmentId === "" ? undefined : environmentId,
+    fingerprint,
+    id,
+  });
 
 export const runnerSetErrorStatus = (
   id: string,
   fingerprint: string,
-  status: ErrorStatus
+  status: ErrorStatus,
+  environmentId = ""
 ) =>
-  runnerRpc<{ ok: boolean }>("errors.set_status", { fingerprint, id, status });
+  runnerRpc<{ ok: boolean }>("errors.set_status", {
+    environmentId: environmentId === "" ? undefined : environmentId,
+    fingerprint,
+    id,
+    status,
+  });
 
 /** The app's public error-ingest identity (numeric project id + key). The
  * runner mints the row on first view; `role` is the caller's resolved app
@@ -825,8 +839,13 @@ export const runnerEnvironmentGrant = (
 // from the models::App*Stat rows, models::AppEvent, AppUserProps and
 // AppInsight.
 
-export const runnerGetUserProps = (id: string, userId: string) =>
+export const runnerGetUserProps = (
+  id: string,
+  userId: string,
+  environmentId = ""
+) =>
   runnerRpc<RunnerUserProps | null>("events.user_props", {
+    environmentId: environmentId === "" ? undefined : environmentId,
     id,
     user_id: userId,
   });

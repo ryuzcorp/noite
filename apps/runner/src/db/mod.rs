@@ -34,8 +34,8 @@ pub use apps::{
     verify_domain, NewApp,
 };
 pub use compaction::{
-    bump_metric_version, get_compacted_hours, get_metric_version, mark_hour_compacted,
-    prune_compactions,
+    bump_metric_version, delete_compactions_for, get_compacted_hours, get_metric_version,
+    mark_hour_compacted, prune_compactions,
 };
 pub use credentials::{
     delete_scoped_credential, insert_scoped_credential, live_scoped_credential,
@@ -72,6 +72,7 @@ pub use instance_setting::{
 };
 pub use metrics::{
     add_app_device, add_app_metric_cpu, add_app_path, add_app_ref, clear_telemetry_replay,
+    delete_environment_telemetry, delete_metric_watermarks_for, ensure_environment_telemetry,
     get_metric_watermarks, get_telemetry_replay, last_request_bucket, list_app_devices,
     list_app_logs, list_app_metrics, list_app_paths, list_app_refs, list_span_stats,
     prune_app_devices, prune_app_logs, prune_app_metrics, prune_app_paths, prune_app_refs,
@@ -139,6 +140,10 @@ pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     )
     .await?;
     tx.commit().await?;
+    // Per-environment telemetry shape (`environment_id` + extended PKs):
+    // fresh files already match, upgraded ones are ALTERed and rebuilt with
+    // their rows copied. Runs once here, not in the per-connection attach.
+    ensure_environment_telemetry(&pool).await?;
     Ok(pool)
 }
 
@@ -248,16 +253,16 @@ mod tests {
         let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
         {
             let pool = connect(&url).await.expect("first boot");
-            replace_app_metric_usage(&pool, "a", "2026-09-30T12:36:00Z", 5, 4, 10)
+            replace_app_metric_usage(&pool, "a", "", "2026-09-30T12:36:00Z", 5, 4, 10)
                 .await
                 .expect("metric");
-            add_app_metric_cpu(&pool, "a", "2026-09-30T12:36:00Z", 1)
+            add_app_metric_cpu(&pool, "a", "", "2026-09-30T12:36:00Z", 1)
                 .await
                 .expect("cpu");
             set_metric_watermarks(&pool, &[("test".to_string(), 42)])
                 .await
                 .expect("watermark");
-            add_app_path(&pool, "a", "2026-09-30T12:00:00Z", "/")
+            add_app_path(&pool, "a", "", "2026-09-30T12:00:00Z", "/")
                 .await
                 .expect("path");
             pool.close().await;
@@ -267,11 +272,11 @@ mod tests {
             .await
             .expect("watermarks readable");
         assert_eq!(marks.get("test"), Some(&42));
-        let rows = list_app_metrics(&pool, "a", "2026-09-30T00:00:00Z")
+        let rows = list_app_metrics(&pool, "a", "", "2026-09-30T00:00:00Z")
             .await
             .expect("metrics readable");
         assert_eq!(rows.len(), 1);
-        let paths = list_app_paths(&pool, "a", "2026-09-30T00:00:00Z")
+        let paths = list_app_paths(&pool, "a", "", "2026-09-30T00:00:00Z")
             .await
             .expect("paths readable");
         assert_eq!(paths.len(), 1);

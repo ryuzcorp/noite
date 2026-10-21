@@ -17,9 +17,13 @@ use crate::host::s3;
 use crate::host::supervisor::{self, ProcMap};
 use crate::models::{App, Environment};
 
-/// Remove one environment: fleet, local state dir, S3 prefix, then its row.
+/// Remove one environment: fleet, local state dir, S3 prefix, telemetry
+/// rows, then its row.
 /// The row goes last so a failure leaves something to retry (the same
-/// reasoning as `purge_slug` + `delete_app`).
+/// reasoning as `purge_slug` + `delete_app`). Telemetry goes before the row
+/// for the same reason — and because the fleet key (`{slug}.{label}`) dies
+/// with the label: a reused label must not inherit rows, watermarks or
+/// compaction marks.
 pub async fn teardown(
     cfg: &Config,
     pool: &SqlitePool,
@@ -42,6 +46,19 @@ pub async fn teardown(
             .with_context(|| format!("remove {}", state_dir.display()))?;
     }
     clear_env_prefix(cfg, &env.app_slug, &env.label).await?;
+    // The maps live under the cleared prefix, so they are gone already; the
+    // SQLite rows, the ingest watermark and the compaction marks are keyed
+    // by (app, environment) and fleet key and must be dropped explicitly.
+    let fleet_key = supervisor::env_fleet_key(&env.app_slug, &env.label);
+    if let Err(e) = db::delete_environment_telemetry(pool, &env.app_id, &env.id).await {
+        tracing::warn!(env_id = %env.id, error = %e, "environment telemetry purge failed");
+    }
+    if let Err(e) = db::delete_metric_watermarks_for(pool, &fleet_key).await {
+        tracing::warn!(env_id = %env.id, error = %e, "environment watermark purge failed");
+    }
+    if let Err(e) = db::delete_compactions_for(pool, &fleet_key).await {
+        tracing::warn!(env_id = %env.id, error = %e, "environment compaction-mark purge failed");
+    }
     // The environment's key must not outlive its prefix (SPEC, Scoped
     // credentials); the app's own key is untouched.
     if let Err(e) = crate::host::credentials::revoke_environment(pool, cfg, &env.id).await {

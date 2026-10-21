@@ -45,6 +45,15 @@ impl IngestRows {
     }
 }
 
+/// Fleet identity maps for one tick, built once by `telemetry_fleets` (plus
+/// the deploy SHAs): fleet key -> app id, fleet key -> environment id
+/// (absent means production), fleet key -> last deploy sha.
+pub(super) struct FleetKeys {
+    pub(super) ids: HashMap<String, String>,
+    pub(super) envs: HashMap<String, String>,
+    pub(super) shas: HashMap<String, String>,
+}
+
 fn json_str(v: &serde_json::Value, key: &str) -> String {
     let path = format!("/{key}");
     v.pointer(path.as_str())
@@ -79,17 +88,14 @@ fn canonical_file_list_sql(globs: &str) -> String {
 ///    counted per distinct trace so a Durable Object failure — reported on
 ///    the cell span and again on its parent — counts once; capped at 200
 ///    groups per fleet per chunk.
-///    The slug comes from the file path (`filename=true`: `fleets/<slug>/`
-///    for a tenant fleet, the control prefix for the control fleet), and each
-///    slug's exact `[from_us, until_us)` chunk
+///    The slug is the fleet key from the file path (`filename=true`):
+///    `fleets/<slug>/` for a tenant fleet, the control prefix for the
+///    control fleet, and `envs/<slug>/<label>/` for a preview environment
+///    (as `{slug}.{label}`). Each slug's exact `[from_us, until_us)` chunk
 ///    rides along in a `VALUES` bounds table, so windows stay exact per fleet
 ///    while every Parquet file is read once. Chunks are hour-aligned (whole
 ///    hours, then the partial current hour), which is what lets the writers
 ///    replace whole minute/span/hour buckets instead of accumulating them.
-///    A preview environment's files live under `envs/<slug>/<label>/` and are
-///    never named by a glob (`metrics::plan::telemetry_prefix`), so they
-///    cannot reach this query at all — Phase 1 makes env telemetry invisible,
-///    never mis-keyed onto the app (ROADMAP Phase 3 adds the env dimension).
 async fn ingest_all(cfg: &Config, bounds: &[(String, i64, i64)]) -> anyhow::Result<IngestRows> {
     let mut out = IngestRows {
         minutes: Vec::new(),
@@ -146,13 +152,20 @@ async fn ingest_all(cfg: &Config, bounds: &[(String, i64, i64)]) -> anyhow::Resu
     // column the query reads, so a pass with only trace files, only log
     // files, or only pre-0.6.1 logs (no severity column) still binds.
     let control_slug = crate::host::control::SLUG;
+    // The fleet key from the file path: `fleets/<slug>/` for a tenant
+    // fleet, the control prefix for the control fleet, and
+    // `envs/<slug>/<label>/` for a preview environment (as
+    // `{slug}.{label}` — the same key watermarks, compaction and the
+    // writers use).
+    let slug_expr = format!("CASE WHEN filename LIKE '%/control/telemetry/%' THEN '{control_slug}' \
+         WHEN filename LIKE '%/envs/%' THEN replace(regexp_extract(filename, 'envs/([^/]+/[^/]+)/', 1), '/', '.') \
+         ELSE regexp_extract(filename, 'fleets/([^/]+)/', 1) END");
     let sql = s3_setup(
         cfg,
         &format!(
             "SET VARIABLE files = ({files}); \
              WITH files AS ( \
-               SELECT CASE WHEN filename LIKE '%/control/telemetry/%' THEN '{control_slug}' \
-                           ELSE regexp_extract(filename, 'fleets/([^/]+)/', 1) END AS slug, \
+               SELECT {slug_expr} AS slug, \
                       name, kind, start_unix_us, duration_us, ok, \
                       coalesce(queue_wait_us, 0) AS qwait, time_unix_us, \
                       CASE WHEN severity_text IN ('ERROR', 'WARN') \
@@ -306,10 +319,10 @@ async fn ingest_all(cfg: &Config, bounds: &[(String, i64, i64)]) -> anyhow::Resu
     Ok(out)
 }
 
-/// What a committed chunk changed: app ids whose dashboards must re-read, and
-/// whether the log stream should wake.
+/// What a committed chunk changed: the (app id, environment id) pairs whose
+/// dashboards must re-read, and whether the log stream should wake.
 pub(super) struct ChunkWrites {
-    pub(super) touched: HashSet<String>,
+    pub(super) touched: HashSet<(String, String)>,
     pub(super) new_logs: bool,
 }
 
@@ -320,14 +333,15 @@ pub(super) struct ChunkWrites {
 /// only after this returns `Ok`.
 async fn write_ingest_rows(
     pool: &SqlitePool,
-    slug_id: &HashMap<String, String>,
-    app_sha: &HashMap<String, String>,
+    keys: &FleetKeys,
     bounds: &[(String, i64, i64)],
     rows: IngestRows,
     requests: &errors::RequestIndex,
     prune_logs_before_us: i64,
 ) -> anyhow::Result<ChunkWrites> {
-    let mut touched: HashSet<String> = HashSet::new();
+    let slug_id = &keys.ids;
+    let env_of = |slug: &str| -> &str { keys.envs.get(slug).map(String::as_str).unwrap_or("") };
+    let mut touched: HashSet<(String, String)> = HashSet::new();
     for (slug, bucket, n, dur_us, err_n) in rows.minutes {
         let Some(id) = slug_id.get(&slug) else {
             continue;
@@ -335,8 +349,9 @@ async fn write_ingest_rows(
         if n == 0 && err_n == 0 {
             continue;
         }
-        db::replace_app_metric_usage(pool, id, &bucket, n, err_n, dur_us / 1000).await?;
-        touched.insert(id.clone());
+        let env_id = env_of(&slug);
+        db::replace_app_metric_usage(pool, id, env_id, &bucket, n, err_n, dur_us / 1000).await?;
+        touched.insert((id.clone(), env_id.to_string()));
     }
     for (slug, hour, name, kind, n, ms, err, qwait) in rows.spans {
         let Some(id) = slug_id.get(&slug) else {
@@ -345,13 +360,24 @@ async fn write_ingest_rows(
         if n == 0 && err == 0 {
             continue;
         }
-        db::replace_span_stat(pool, id, &hour, &name, kind, n, ms, err, qwait).await?;
-        touched.insert(id.clone());
+        let env_id = env_of(&slug);
+        db::replace_span_stat(pool, id, env_id, &hour, &name, kind, n, ms, err, qwait).await?;
+        touched.insert((id.clone(), env_id.to_string()));
     }
     // Errors before the log ring takes the rows: an occurrence keeps the log
     // lines of its own trace (host/errors.rs).
-    touched
-        .extend(errors::ingest(pool, slug_id, app_sha, &rows.errors, &rows.logs, requests).await?);
+    touched.extend(
+        errors::ingest(
+            pool,
+            &keys.ids,
+            &keys.envs,
+            &keys.shas,
+            &rows.errors,
+            &rows.logs,
+            requests,
+        )
+        .await?,
+    );
     // Replace each app's window in the log ring. The window is that app's
     // chunk; a slug appears at most once in `bounds`.
     let mut log_groups: HashMap<String, Vec<(i64, String)>> = HashMap::new();
@@ -366,6 +392,7 @@ async fn write_ingest_rows(
         let Some(id) = slug_id.get(&slug) else {
             continue;
         };
+        let env_id = env_of(&slug);
         let Some((_, from, until)) = bounds.iter().find(|(s, _, _)| s == &slug) else {
             continue;
         };
@@ -378,10 +405,10 @@ async fn write_ingest_rows(
         if *until <= prune_logs_before_us {
             continue;
         }
-        db::replace_app_logs(pool, id, *from, *until, &log_rows).await?;
-        // Bounded ring per app: last 24 h AND last 2,000 lines.
-        let _ = db::prune_app_logs(pool, id, prune_logs_before_us, 2000).await;
-        touched.insert(id.clone());
+        db::replace_app_logs(pool, id, env_id, *from, *until, &log_rows).await?;
+        // Bounded ring per app and environment: last 24 h AND last 2,000 lines.
+        let _ = db::prune_app_logs(pool, id, env_id, prune_logs_before_us, 2000).await;
+        touched.insert((id.clone(), env_id.to_string()));
         new_logs = true;
     }
     Ok(ChunkWrites { touched, new_logs })
@@ -395,16 +422,14 @@ async fn write_ingest_rows(
 pub(super) async fn commit_chunk(
     pool: &SqlitePool,
     state: &mut MetricsState,
-    slug_id: &HashMap<String, String>,
-    app_sha: &HashMap<String, String>,
+    keys: &FleetKeys,
     bounds: &[(String, i64, i64)],
     rows: IngestRows,
     prune_logs_before_us: i64,
 ) -> anyhow::Result<ChunkWrites> {
     let writes = write_ingest_rows(
         pool,
-        slug_id,
-        app_sha,
+        keys,
         bounds,
         rows,
         &state.requests,

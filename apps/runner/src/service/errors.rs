@@ -11,7 +11,6 @@ use crate::models::ErrorIssue;
 use crate::AppState;
 
 use super::environments::role_ok;
-use super::observe::telemetry_target_or_404;
 
 pub const ERROR_STATUSES: &[&str] = &["open", "resolved", "ignored"];
 
@@ -115,13 +114,14 @@ fn with_hourly(issue: ErrorIssue, hourly: Vec<i64>) -> ErrorIssueView {
 pub async fn list(
     pool: &sqlx::SqlitePool,
     app_id: &str,
+    environment_id: &str,
     status: &str,
 ) -> sqlx::Result<ErrorIssueList> {
     let keys = error_hour_keys();
     let (issues, counts, hours) = tokio::try_join!(
-        db::list_error_issues(pool, app_id, status, 200),
-        db::count_error_issues(pool, app_id),
-        db::list_error_hours(pool, app_id, &keys[0]),
+        db::list_error_issues(pool, app_id, environment_id, status, 200),
+        db::count_error_issues(pool, app_id, environment_id),
+        db::list_error_hours(pool, app_id, environment_id, &keys[0]),
     )?;
     let mut series = error_series(&keys, &hours);
     let issues: Vec<ErrorIssueView> = issues
@@ -152,15 +152,16 @@ fn validate_status(status: &str) -> Result<(), ApiError> {
     }
 }
 
-/// `errors.list`: validate, resolve the telemetry target, then shape.
+/// `errors.list`: validate, resolve the telemetry scope, then shape.
 pub async fn list_for(
     state: &AppState,
     id: &str,
     status: &str,
+    environment: Option<&str>,
 ) -> Result<ErrorIssueList, ApiError> {
     validate_status(status)?;
-    let (app_id, _) = telemetry_target_or_404(&state.pool, id).await?;
-    list(&state.pool, &app_id, status)
+    let scope = super::observe::telemetry_scope(&state.pool, id, environment).await?;
+    list(&state.pool, &scope.app_id, &scope.environment_id, status)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))
 }
@@ -171,17 +172,30 @@ pub async fn get(
     state: &AppState,
     id: &str,
     fingerprint: &str,
+    environment: Option<&str>,
 ) -> Result<ErrorIssueDetail, ApiError> {
-    let (app_id, slug) = telemetry_target_or_404(&state.pool, id).await?;
-    let issue = match db::get_error_issue(&state.pool, &app_id, fingerprint).await {
+    let scope = super::observe::telemetry_scope(&state.pool, id, environment).await?;
+    let issue = match db::get_error_issue(
+        &state.pool,
+        &scope.app_id,
+        &scope.environment_id,
+        fingerprint,
+    )
+    .await
+    {
         Ok(Some(issue)) => issue,
         Ok(None) => return Err(ApiError::not_found("error not found")),
         Err(e) => return Err(ApiError::internal(e.to_string())),
     };
     let keys = error_hour_keys();
     let (events, hours) = tokio::try_join!(
-        db::list_error_events(&state.pool, &app_id, fingerprint),
-        db::list_error_hours(&state.pool, &app_id, &keys[0]),
+        db::list_error_events(
+            &state.pool,
+            &scope.app_id,
+            &scope.environment_id,
+            fingerprint
+        ),
+        db::list_error_hours(&state.pool, &scope.app_id, &scope.environment_id, &keys[0]),
     )
     .map_err(|e| ApiError::internal(e.to_string()))?;
     let hourly = error_series(&keys, &hours)
@@ -212,12 +226,14 @@ pub async fn get(
         })
         .collect();
     // Original positions for display: each occurrence resolves its own
-    // deploy's maps (`fleets/<slug>/maps/<sha>/`). Stored frames stay raw, so
-    // grouping is untouched; a missing map just leaves raw positions. One
-    // budget across all events: a hostile issue cannot fan out S3 or burn
-    // the executor, and the rest renders raw.
+    // deploy's maps — the environment's `envs/<slug>/<label>/maps/<sha>/`
+    // for environment errors, `fleets/<slug>/maps/<sha>/` for production.
+    // Stored frames stay raw, so grouping is untouched; a missing map just
+    // leaves raw positions. One budget across all events: a hostile issue
+    // cannot fan out S3 or burn the executor, and the rest renders raw.
     let bucket = state.config.s3_bucket.clone();
-    let prefix = format!("fleets/{slug}");
+    let prefix =
+        crate::host::sourcemaps::error_maps_prefix(&scope.slug, scope.env_label.as_deref());
     let mut budget = crate::host::sourcemaps::SymbolicateBudget::for_read();
     for event in events.iter_mut() {
         crate::host::sourcemaps::symbolicate_frames(
@@ -237,17 +253,27 @@ pub async fn get(
     })
 }
 
-/// `errors.set_status`: 404 when the fingerprint is unknown for the target.
+/// `errors.set_status`: 404 when the fingerprint is unknown for the scope.
 pub async fn set_status(
     state: &AppState,
     id: &str,
     fingerprint: &str,
     status: &str,
+    environment: Option<&str>,
 ) -> Result<(), ApiError> {
     validate_status(status)?;
-    let (app_id, _) = telemetry_target_or_404(&state.pool, id).await?;
+    let scope = super::observe::telemetry_scope(&state.pool, id, environment).await?;
     let now = crate::host::metrics::now_us();
-    match db::set_error_status(&state.pool, &app_id, fingerprint, status, now).await {
+    match db::set_error_status(
+        &state.pool,
+        &scope.app_id,
+        &scope.environment_id,
+        fingerprint,
+        status,
+        now,
+    )
+    .await
+    {
         Ok(0) => Err(ApiError::not_found("error not found")),
         Ok(_) => Ok(()),
         Err(e) => Err(ApiError::internal(e.to_string())),

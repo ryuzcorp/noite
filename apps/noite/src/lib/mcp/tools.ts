@@ -529,9 +529,10 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
   }),
   defineTool({
     description:
-      "The app's recent runtime log lines (the tail of the merged build and runtime log).",
+      "The app's recent runtime log lines (the tail of the merged build and runtime log). Pass `environment` for one preview environment's logs instead of production's.",
     name: "app_logs",
     params: appParams({
+      environment: Schema.optional(EnvironmentRef),
       limit: Schema.optional(
         Schema.Number.check(
           Schema.isInt(),
@@ -542,33 +543,54 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         })
       ),
     }),
-    run: async ({ userId }, { app: ref, limit }) => {
-      const { app } = await requireApp(userId, ref, "view");
-      const all = await runnerRpc<string[]>("logs.get", { id: app.id });
+    run: async ({ userId }, { app: ref, environment, limit }) => {
+      const { app, role } = await requireApp(userId, ref, "view");
+
+      const env = environment
+        ? await requireEnvironment(app, role, environment)
+        : null;
+
+      const all = await runnerRpc<string[]>("logs.get", {
+        environmentId: env?.id,
+        id: app.id,
+      });
+
       const lines = all.slice(-(limit ?? 200));
+      const where = env === null ? app.slug : `${app.slug}/${env.label}`;
 
       return {
-        structured: { appId: app.id, lines, slug: app.slug, total: all.length },
-        text:
-          lines.length === 0 ? `${app.slug}: no log lines.` : lines.join("\n"),
+        structured: {
+          appId: app.id,
+          environmentId: env?.id ?? null,
+          lines,
+          slug: app.slug,
+          total: all.length,
+        },
+        text: lines.length === 0 ? `${where}: no log lines.` : lines.join("\n"),
       };
     },
   }),
   defineTool({
     description:
-      "The app's error issues grouped by fingerprint, with 24-hour counts.",
+      "The app's error issues grouped by fingerprint, with 24-hour counts. Pass `environment` for one preview environment's issues instead of production's.",
     name: "app_errors",
     params: appParams({
+      environment: Schema.optional(EnvironmentRef),
       status: Schema.optional(
         Schema.Literals(["open", "resolved", "ignored"]).annotate({
           description: "Which issues to list (default open).",
         })
       ),
     }),
-    run: async ({ userId }, { app: ref, status }) => {
-      const { app } = await requireApp(userId, ref, "view");
+    run: async ({ userId }, { app: ref, environment, status }) => {
+      const { app, role } = await requireApp(userId, ref, "view");
+
+      const env = environment
+        ? await requireEnvironment(app, role, environment)
+        : null;
 
       const list = await runnerRpc<RunnerErrorList>("errors.list", {
+        environmentId: env?.id,
         id: app.id,
         status: status ?? "open",
       });
@@ -583,20 +605,22 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
         status: issue.status,
       }));
 
+      const where = env === null ? app.slug : `${app.slug}/${env.label}`;
       const counts = `${list.counts.open} open, ${list.counts.resolved} resolved, ${list.counts.ignored} ignored`;
 
       return {
         structured: {
           appId: app.id,
           counts: list.counts,
+          environmentId: env?.id ?? null,
           issues,
           slug: app.slug,
         },
         text:
           issues.length === 0
-            ? `${app.slug}: no ${status ?? "open"} errors (${counts}).`
+            ? `${where}: no ${status ?? "open"} errors (${counts}).`
             : [
-                `${issues.length} ${status ?? "open"} error issue${issues.length === 1 ? "" : "s"} in ${app.slug} (${counts}):`,
+                `${issues.length} ${status ?? "open"} error issue${issues.length === 1 ? "" : "s"} in ${where} (${counts}):`,
                 ...issues.map(
                   (issue) =>
                     `- [${issue.count}×] ${issue.message} (${issue.kind}${issue.culprit === "" ? "" : ` at ${issue.culprit}`}, ${issue.fingerprint})`

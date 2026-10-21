@@ -58,6 +58,7 @@ const runMetricsStream = async (versionFor: (call: number) => number) => {
   const done = streamMetrics({
     auth: { authorization: "Bearer t" },
     base: "http://runner.test/v1/apps/a",
+    envQuery: "",
     pollMs: 20,
     signal: controller.signal,
     sink: {

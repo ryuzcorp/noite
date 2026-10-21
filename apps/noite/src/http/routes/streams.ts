@@ -199,12 +199,18 @@ export const metricsWindowHours = (request: Request): number => {
 };
 
 /** Runner change counter (spec T3.6): NaN when the check itself fails, so
- * the poll below runs instead of skipping. */
+ * the poll below runs instead of skipping. `envQuery` scopes the gate to
+ * one preview environment, like the frame poll. */
 const pollMetricsVersion = async (
   base: string,
-  auth: { authorization: string }
+  auth: { authorization: string },
+  envQuery = ""
 ): Promise<number> => {
-  const vRes = await fetch(`${base}/metrics/version`, { headers: auth });
+  const versionQuery = envQuery === "" ? "" : `?${envQuery.slice(1)}`;
+
+  const vRes = await fetch(`${base}/metrics/version${versionQuery}`, {
+    headers: auth,
+  });
 
   if (!vRes.ok) {
     return Number.NaN;
@@ -220,6 +226,9 @@ const pollMetricsVersion = async (
 interface MetricsPoll {
   auth: { authorization: string };
   base: string;
+  /** "" for production, else `&environmentId=<id>` appended to the frame
+   * queries and (as `?…`) to the version gate. */
+  envQuery: string;
   windowQuery: string;
 }
 
@@ -304,7 +313,7 @@ interface MetricsStreamOptions extends MetricsPoll {
 export const streamMetrics = async (
   options: MetricsStreamOptions
 ): Promise<void> => {
-  const { auth, base, sink, pollMs, signal, windowQuery } = options;
+  const { auth, base, envQuery, sink, pollMs, signal, windowQuery } = options;
   let lastReq = -1;
   let lastVersion: number | null = null;
 
@@ -317,7 +326,7 @@ export const streamMetrics = async (
       // the whole 5-call poll is skipped — but the cycle still ends in
       // the sleep below (a bare `continue` here would spin the loop).
       // oxlint-disable-next-line eslint/no-await-in-loop -- one sequential cycle per loop by design
-      const v = await pollMetricsVersion(base, auth);
+      const v = await pollMetricsVersion(base, auth, envQuery);
 
       const unchanged =
         !Number.isNaN(v) && lastVersion !== null && v === lastVersion;
@@ -325,7 +334,7 @@ export const streamMetrics = async (
       if (!unchanged) {
         // oxlint-disable-next-line eslint/no-await-in-loop -- one sequential cycle per loop by design
         const polled = await pollMetricsFrame(
-          { auth, base, windowQuery },
+          { auth, base, envQuery, windowQuery },
           lastReq
         );
 
@@ -405,17 +414,29 @@ export const handleMetricsStream: RouteHandler = async (
     return new Response("RUNNER_TOKEN is not configured", { status: 500 });
   }
 
+  const environmentId =
+    new URL(request.url).searchParams.get("environmentId") ?? "";
+
   const base = `${rc.runner}/v1/apps/${encodeURIComponent(appId)}`;
   const auth = { authorization: `Bearer ${rc.token}` };
+
   // One window for every series in the frame, so tiles, charts, spans and
-  // analytics always describe the same period.
-  const windowQuery = `hours=${metricsWindowHours(request)}`;
+  // analytics always describe the same period; `?environmentId=` scopes the
+  // whole frame (and the version gate below) to one preview environment,
+  // absent/"" is production.
+  const envQuery =
+    environmentId === ""
+      ? ""
+      : `&environmentId=${encodeURIComponent(environmentId)}`;
+
+  const windowQuery = `hours=${metricsWindowHours(request)}${envQuery}`;
 
   return eventStream(
     (stream) =>
       streamMetrics({
         auth,
         base,
+        envQuery,
         pollMs: METRICS_STREAM_POLL_MS,
         signal: request.signal,
         sink: stream,
@@ -455,16 +476,23 @@ export const handleAppStateStream: RouteHandler = (request, env, params) =>
   );
 
 /** Live grouped-errors proxy (see proxyRunnerStream). `?status=` passes
- * through; the runner validates it. */
+ * through (the runner validates it), and `?environmentId=` scopes the list
+ * to one preview environment (absent/"" is production). */
 export const handleErrorsStream: RouteHandler = (request, env, params) => {
-  const status = new URL(request.url).searchParams.get("status") ?? "open";
+  const query = new URL(request.url).searchParams;
+  const status = query.get("status") ?? "open";
+  const environmentId = query.get("environmentId") ?? "";
+  const upstream = new URLSearchParams({ status });
+
+  if (environmentId !== "") {
+    upstream.set("environmentId", environmentId);
+  }
 
   return proxyRunnerStream(
     request,
     env,
     params,
-    (appId) =>
-      `/v1/apps/${appId}/errors/stream?status=${encodeURIComponent(status)}`
+    (appId) => `/v1/apps/${appId}/errors/stream?${upstream.toString()}`
   );
 };
 

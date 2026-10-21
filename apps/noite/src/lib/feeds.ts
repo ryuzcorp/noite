@@ -412,18 +412,22 @@ export const liveFeed = <T>(
   return { latest: withSnapshot(key, latest), status };
 };
 
-/** Snapshot keys for the live panels (one per app / channel). */
+/** Snapshot keys for the live panels (one per app / channel / environment:
+ * an environment id suffix keeps each env's frames from overwriting
+ * production's — absent/"" is production, matching the runner). */
 export const feedKeys = {
   appState: (appId: string) => `feed:${appId}:state`,
   apps: "feed:apps",
   deploys: (appId: string, environmentId = "") =>
     `feed:${appId}:deploys${environmentId === "" ? "" : `:${environmentId}`}`,
-  errors: (appId: string, status: ErrorStatus) =>
-    `feed:${appId}:errors:${status}`,
-  events: (appId: string, channel: string) => `feed:${appId}:events:${channel}`,
+  errors: (appId: string, status: ErrorStatus, environmentId = "") =>
+    `feed:${appId}:errors:${status}${environmentId === "" ? "" : `:${environmentId}`}`,
+  events: (appId: string, channel: string, environmentId = "") =>
+    `feed:${appId}:events:${channel}${environmentId === "" ? "" : `:${environmentId}`}`,
   logs: (appId: string, environmentId = "") =>
     `feed:${appId}:logs${environmentId === "" ? "" : `:${environmentId}`}`,
-  metrics: (appId: string, hours: number) => `feed:${appId}:metrics:${hours}`,
+  metrics: (appId: string, hours: number, environmentId = "") =>
+    `feed:${appId}:metrics:${hours}${environmentId === "" ? "" : `:${environmentId}`}`,
 } as const;
 
 /** Forget one app in the cached app-list snapshot. The list feed paints its
@@ -452,9 +456,21 @@ export const deploysUrl = (appId: string, environmentId = ""): string =>
       : `?environmentId=${encodeURIComponent(environmentId)}`
   }`;
 
-/** Grouped errors in one status for one app. */
-export const errorsUrl = (appId: string, status: ErrorStatus): string =>
-  `/api/apps/${encodeURIComponent(appId)}/errors/stream?status=${status}`;
+/** Grouped errors in one status for one app; `environmentId` scopes it to
+ * one preview environment (absent/"" is production). */
+export const errorsUrl = (
+  appId: string,
+  status: ErrorStatus,
+  environmentId = ""
+): string => {
+  const params = new URLSearchParams({ status });
+
+  if (environmentId !== "") {
+    params.set("environmentId", environmentId);
+  }
+
+  return `/api/apps/${encodeURIComponent(appId)}/errors/stream?${params.toString()}`;
+};
 
 /** Live runtime log tail for one app's own fleet, or for one environment
  * (`environmentId`; absent/"" is production). */
@@ -465,20 +481,36 @@ export const logsUrl = (appId: string, environmentId = ""): string =>
       : `?environmentId=${encodeURIComponent(environmentId)}`
   }`;
 
-/** Usage frames for one app over a `hours`-long window (24, 168 or 720). */
-export const metricsUrl = (appId: string, hours: number): string =>
-  `/api/apps/${encodeURIComponent(appId)}/metrics/stream?hours=${hours}`;
+/** Usage frames for one app over a `hours`-long window (24, 168 or 720);
+ * `environmentId` scopes it to one preview environment (absent/"" is
+ * production). */
+export const metricsUrl = (
+  appId: string,
+  hours: number,
+  environmentId = ""
+): string => {
+  const params = new URLSearchParams({ hours: String(hours) });
+
+  if (environmentId !== "") {
+    params.set("environmentId", environmentId);
+  }
+
+  return `/api/apps/${encodeURIComponent(appId)}/metrics/stream?${params.toString()}`;
+};
 
 /** One app's row and its environments, re-sent whenever either changes:
  * every status badge on the app's pages follows it (`lib/apps/state-sync`). */
 export const appStateUrl = (appId: string): string =>
   `/api/apps/${encodeURIComponent(appId)}/state/stream`;
 
-/** Event snapshots for one app, scoped server-side by channel. */
+/** Event snapshots for one app, scoped server-side by channel;
+ * `environmentId` scopes them to one preview environment (absent/"" is
+ * production). */
 export const eventsUrl = (
   appId: string,
   channel: string,
-  limit: number
+  limit: number,
+  environmentId = ""
 ): string => {
   const params = new URLSearchParams();
 
@@ -487,6 +519,10 @@ export const eventsUrl = (
   }
 
   params.set("limit", String(limit));
+
+  if (environmentId !== "") {
+    params.set("environmentId", environmentId);
+  }
 
   return `/api/apps/${encodeURIComponent(appId)}/events/stream?${params.toString()}`;
 };

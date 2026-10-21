@@ -30,6 +30,16 @@ pub async fn mark_hour_compacted(pool: &SqlitePool, slug: &str, hour: &str) -> s
     Ok(())
 }
 
+/// Drop one fleet's compaction marks (environment delete: a reused label must
+/// not inherit the old fleet's "already compacted" watermarks).
+pub async fn delete_compactions_for(pool: &SqlitePool, slug: &str) -> sqlx::Result<u64> {
+    let res = sqlx::query("DELETE FROM metrics.metric_compaction WHERE slug = ?")
+        .bind(slug)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 pub async fn prune_compactions(pool: &SqlitePool, older_than_hour: &str) -> sqlx::Result<u64> {
     let res = sqlx::query("DELETE FROM metrics.metric_compaction WHERE hour < ?")
         .bind(older_than_hour)
@@ -38,24 +48,36 @@ pub async fn prune_compactions(pool: &SqlitePool, older_than_hour: &str) -> sqlx
     Ok(res.rows_affected())
 }
 
-/// Per-app metrics version (spec T3.6): bumped by the ingest tick whenever
-/// it persists new rows, so dashboard polls can skip unchanged windows.
-pub async fn bump_metric_version(pool: &SqlitePool, app_id: &str) -> sqlx::Result<()> {
+/// Per-app-and-environment metrics version (spec T3.6): bumped by the ingest
+/// tick whenever it persists new rows, so each dashboard tab (production or
+/// one environment) can poll its own version and skip unchanged windows.
+pub async fn bump_metric_version(
+    pool: &SqlitePool,
+    app_id: &str,
+    environment_id: &str,
+) -> sqlx::Result<()> {
     sqlx::query(
-        "INSERT INTO metrics.metric_version (app_id, version) VALUES (?, 1) \
-         ON CONFLICT (app_id) DO UPDATE SET version = version + 1",
+        "INSERT INTO metrics.metric_version (app_id, environment_id, version) VALUES (?, ?, 1) \
+         ON CONFLICT (app_id, environment_id) DO UPDATE SET version = version + 1",
     )
     .bind(app_id)
+    .bind(environment_id)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-pub async fn get_metric_version(pool: &SqlitePool, app_id: &str) -> sqlx::Result<u64> {
-    let v: Option<i64> =
-        sqlx::query_scalar("SELECT version FROM metrics.metric_version WHERE app_id = ?")
-            .bind(app_id)
-            .fetch_optional(pool)
-            .await?;
+pub async fn get_metric_version(
+    pool: &SqlitePool,
+    app_id: &str,
+    environment_id: &str,
+) -> sqlx::Result<u64> {
+    let v: Option<i64> = sqlx::query_scalar(
+        "SELECT version FROM metrics.metric_version WHERE app_id = ? AND environment_id = ?",
+    )
+    .bind(app_id)
+    .bind(environment_id)
+    .fetch_optional(pool)
+    .await?;
     Ok(v.unwrap_or(0).max(0) as u64)
 }

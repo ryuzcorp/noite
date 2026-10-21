@@ -69,8 +69,8 @@ After the key's first sighting the card shows the placeholder `noite_…`; mint 
 | `create_app` | Creates an app — blank, a public GitHub import, or a template — and returns push instructions. | app quota |
 | `deploy_status` | An app's deploy state and recent deploys; pass `environment` for one preview environment. Poll this after a push. | `view` |
 | `deploy_log` | One deploy's build log (the newest by default). | `view` |
-| `app_logs` | The app's recent runtime log lines (trailing tail, default 200). | `view` |
-| `app_errors` | Error issues grouped by fingerprint, with 24-hour counts. | `view` |
+| `app_logs` | The app's recent runtime log lines (trailing tail, default 200); pass `environment` for one preview environment. | `view` |
+| `app_errors` | Error issues grouped by fingerprint, with 24-hour counts; pass `environment` for one preview environment. | `view` |
 | `env_list` | Environment variables; values are hidden unless they are `0`/`1` flags. | `view` |
 | `env_set` | Sets an environment variable for the next deploy. | `admin` |
 | `env_unset` | Removes an environment variable. | `admin` |

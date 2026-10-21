@@ -1,8 +1,11 @@
-//! Error issue folding, occurrence storage, and counting.
+//! Error issue folding, occurrence storage, and counting. Every row keys on
+//! `(app_id, environment_id, …)` (`''` is production) so an environment's
+//! issues never mix with production's.
 
 use sqlx::SqlitePool;
 
-use crate::models::{ErrorEvent, ErrorIssue};
+use crate::models::ErrorEvent;
+use crate::models::ErrorIssue;
 
 use super::ISSUE_COLS;
 
@@ -18,6 +21,7 @@ use super::ISSUE_COLS;
 pub async fn upsert_error_issue(
     pool: &SqlitePool,
     app_id: &str,
+    environment_id: &str,
     fingerprint: &str,
     kind: &str,
     message: &str,
@@ -31,10 +35,10 @@ pub async fn upsert_error_issue(
 ) -> sqlx::Result<()> {
     sqlx::query(
         r#"INSERT INTO metrics.app_error_issue
-           (app_id, fingerprint, kind, message, culprit, handler, source, count,
+           (app_id, environment_id, fingerprint, kind, message, culprit, handler, source, count,
             first_seen_us, last_seen_us, first_sha, last_sha)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (app_id, fingerprint) DO UPDATE SET
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (app_id, environment_id, fingerprint) DO UPDATE SET
              kind = CASE WHEN excluded.last_seen_us >= last_seen_us THEN excluded.kind ELSE kind END,
              message = CASE WHEN excluded.last_seen_us >= last_seen_us THEN excluded.message ELSE message END,
              culprit = CASE WHEN excluded.last_seen_us >= last_seen_us THEN excluded.culprit ELSE culprit END,
@@ -52,6 +56,7 @@ pub async fn upsert_error_issue(
                            THEN 'open' ELSE status END"#,
     )
     .bind(app_id)
+    .bind(environment_id)
     .bind(fingerprint)
     .bind(kind)
     .bind(message)
@@ -74,16 +79,19 @@ pub async fn upsert_error_issue(
 pub async fn refresh_error_issue_count(
     pool: &SqlitePool,
     app_id: &str,
+    environment_id: &str,
     fingerprint: &str,
 ) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE metrics.app_error_issue SET count = COALESCE( \
-           (SELECT SUM(n) FROM metrics.app_error_hour WHERE app_id = ? AND fingerprint = ?), 0) \
-         WHERE app_id = ? AND fingerprint = ?",
+           (SELECT SUM(n) FROM metrics.app_error_hour WHERE app_id = ? AND environment_id = ? AND fingerprint = ?), 0) \
+         WHERE app_id = ? AND environment_id = ? AND fingerprint = ?",
     )
     .bind(app_id)
+    .bind(environment_id)
     .bind(fingerprint)
     .bind(app_id)
+    .bind(environment_id)
     .bind(fingerprint)
     .execute(pool)
     .await?;
@@ -95,16 +103,18 @@ pub async fn refresh_error_issue_count(
 pub async fn set_error_hour(
     pool: &SqlitePool,
     app_id: &str,
+    environment_id: &str,
     fingerprint: &str,
     bucket_hour: &str,
     n: i64,
 ) -> sqlx::Result<()> {
     sqlx::query(
-        r#"INSERT INTO metrics.app_error_hour (app_id, fingerprint, bucket_hour, n)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT (app_id, fingerprint, bucket_hour) DO UPDATE SET n = excluded.n"#,
+        r#"INSERT INTO metrics.app_error_hour (app_id, environment_id, fingerprint, bucket_hour, n)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (app_id, environment_id, fingerprint, bucket_hour) DO UPDATE SET n = excluded.n"#,
     )
     .bind(app_id)
+    .bind(environment_id)
     .bind(fingerprint)
     .bind(bucket_hour)
     .bind(n)
@@ -115,6 +125,7 @@ pub async fn set_error_hour(
 
 pub struct NewErrorEvent<'a> {
     pub app_id: &'a str,
+    pub environment_id: &'a str,
     pub fingerprint: &'a str,
     pub ts_us: i64,
     pub trace_id: &'a str,
@@ -144,16 +155,17 @@ pub struct NewErrorEvent<'a> {
 pub async fn insert_error_event(pool: &SqlitePool, e: &NewErrorEvent<'_>) -> sqlx::Result<()> {
     sqlx::query(
         r#"INSERT INTO metrics.app_error_event
-           (app_id, fingerprint, ts_us, trace_id, source, handler, cell, kind, message,
+           (app_id, environment_id, fingerprint, ts_us, trace_id, source, handler, cell, kind, message,
             context, frames, logs, method, path, http_status, browser, os, sha,
             url, release, environment)
-           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
            WHERE NOT EXISTS (
              SELECT 1 FROM metrics.app_error_event
-              WHERE app_id = ? AND fingerprint = ? AND ts_us = ? AND trace_id = ?
+              WHERE app_id = ? AND environment_id = ? AND fingerprint = ? AND ts_us = ? AND trace_id = ?
            )"#,
     )
     .bind(e.app_id)
+    .bind(e.environment_id)
     .bind(e.fingerprint)
     .bind(e.ts_us)
     .bind(e.trace_id)
@@ -175,6 +187,7 @@ pub async fn insert_error_event(pool: &SqlitePool, e: &NewErrorEvent<'_>) -> sql
     .bind(e.release)
     .bind(e.environment)
     .bind(e.app_id)
+    .bind(e.environment_id)
     .bind(e.fingerprint)
     .bind(e.ts_us)
     .bind(e.trace_id)
@@ -187,17 +200,20 @@ pub async fn insert_error_event(pool: &SqlitePool, e: &NewErrorEvent<'_>) -> sql
 pub async fn prune_error_events(
     pool: &SqlitePool,
     app_id: &str,
+    environment_id: &str,
     fingerprint: &str,
     keep: i64,
 ) -> sqlx::Result<u64> {
     let res = sqlx::query(
-        "DELETE FROM metrics.app_error_event WHERE app_id = ? AND fingerprint = ? AND rowid NOT IN \
-         (SELECT rowid FROM metrics.app_error_event WHERE app_id = ? AND fingerprint = ? \
+        "DELETE FROM metrics.app_error_event WHERE app_id = ? AND environment_id = ? AND fingerprint = ? AND rowid NOT IN \
+         (SELECT rowid FROM metrics.app_error_event WHERE app_id = ? AND environment_id = ? AND fingerprint = ? \
           ORDER BY ts_us DESC, rowid DESC LIMIT ?)",
     )
     .bind(app_id)
+    .bind(environment_id)
     .bind(fingerprint)
     .bind(app_id)
+    .bind(environment_id)
     .bind(fingerprint)
     .bind(keep)
     .execute(pool)
@@ -209,14 +225,16 @@ pub async fn prune_error_events(
 pub async fn list_error_issues(
     pool: &SqlitePool,
     app_id: &str,
+    environment_id: &str,
     status: &str,
     limit: i64,
 ) -> sqlx::Result<Vec<ErrorIssue>> {
     sqlx::query_as::<_, ErrorIssue>(sqlx::AssertSqlSafe(format!(
         "SELECT {ISSUE_COLS} FROM metrics.app_error_issue \
-         WHERE app_id = ? AND status = ? ORDER BY last_seen_us DESC LIMIT ?"
+         WHERE app_id = ? AND environment_id = ? AND status = ? ORDER BY last_seen_us DESC LIMIT ?"
     )))
     .bind(app_id)
+    .bind(environment_id)
     .bind(status)
     .bind(limit)
     .fetch_all(pool)
@@ -227,11 +245,13 @@ pub async fn list_error_issues(
 pub async fn count_error_issues(
     pool: &SqlitePool,
     app_id: &str,
+    environment_id: &str,
 ) -> sqlx::Result<Vec<(String, i64)>> {
     sqlx::query_as(
-        "SELECT status, count(*) FROM metrics.app_error_issue WHERE app_id = ? GROUP BY status",
+        "SELECT status, count(*) FROM metrics.app_error_issue WHERE app_id = ? AND environment_id = ? GROUP BY status",
     )
     .bind(app_id)
+    .bind(environment_id)
     .fetch_all(pool)
     .await
 }
@@ -239,12 +259,14 @@ pub async fn count_error_issues(
 pub async fn get_error_issue(
     pool: &SqlitePool,
     app_id: &str,
+    environment_id: &str,
     fingerprint: &str,
 ) -> sqlx::Result<Option<ErrorIssue>> {
     sqlx::query_as::<_, ErrorIssue>(sqlx::AssertSqlSafe(format!(
-        "SELECT {ISSUE_COLS} FROM metrics.app_error_issue WHERE app_id = ? AND fingerprint = ?"
+        "SELECT {ISSUE_COLS} FROM metrics.app_error_issue WHERE app_id = ? AND environment_id = ? AND fingerprint = ?"
     )))
     .bind(app_id)
+    .bind(environment_id)
     .bind(fingerprint)
     .fetch_optional(pool)
     .await
@@ -253,15 +275,17 @@ pub async fn get_error_issue(
 pub async fn list_error_events(
     pool: &SqlitePool,
     app_id: &str,
+    environment_id: &str,
     fingerprint: &str,
 ) -> sqlx::Result<Vec<ErrorEvent>> {
     sqlx::query_as::<_, ErrorEvent>(
         "SELECT ts_us, trace_id, source, handler, cell, kind, message, context, frames, logs, \
                 method, path, http_status, browser, os, sha, url, release, environment \
-         FROM metrics.app_error_event WHERE app_id = ? AND fingerprint = ? \
+         FROM metrics.app_error_event WHERE app_id = ? AND environment_id = ? AND fingerprint = ? \
          ORDER BY ts_us DESC, rowid DESC",
     )
     .bind(app_id)
+    .bind(environment_id)
     .bind(fingerprint)
     .fetch_all(pool)
     .await
@@ -272,13 +296,15 @@ pub async fn list_error_events(
 pub async fn list_error_hours(
     pool: &SqlitePool,
     app_id: &str,
+    environment_id: &str,
     since_hour: &str,
 ) -> sqlx::Result<Vec<(String, String, i64)>> {
     sqlx::query_as(
         "SELECT fingerprint, bucket_hour, n FROM metrics.app_error_hour \
-         WHERE app_id = ? AND bucket_hour >= ?",
+         WHERE app_id = ? AND environment_id = ? AND bucket_hour >= ?",
     )
     .bind(app_id)
+    .bind(environment_id)
     .bind(since_hour)
     .fetch_all(pool)
     .await
@@ -289,17 +315,19 @@ pub async fn list_error_hours(
 pub async fn set_error_status(
     pool: &SqlitePool,
     app_id: &str,
+    environment_id: &str,
     fingerprint: &str,
     status: &str,
     at_us: i64,
 ) -> sqlx::Result<u64> {
     let res = sqlx::query(
         "UPDATE metrics.app_error_issue SET status = ?, regressed = 0, status_at_us = ? \
-         WHERE app_id = ? AND fingerprint = ?",
+         WHERE app_id = ? AND environment_id = ? AND fingerprint = ?",
     )
     .bind(status)
     .bind(at_us)
     .bind(app_id)
+    .bind(environment_id)
     .bind(fingerprint)
     .execute(pool)
     .await?;
@@ -356,6 +384,7 @@ mod tests {
                 upsert_error_issue(
                     &pool,
                     "a",
+                    "",
                     "fp",
                     "TypeError",
                     msg,
@@ -372,10 +401,10 @@ mod tests {
                 // The displayed count is derived from the per-hour buckets the
                 // ingest replaces, so seed a distinct bucket per call, as a
                 // chunk would.
-                set_error_hour(&pool, "a", "fp", &format!("{at}"), n)
+                set_error_hour(&pool, "a", "", "fp", &format!("{at}"), n)
                     .await
                     .expect("hour");
-                refresh_error_issue_count(&pool, "a", "fp")
+                refresh_error_issue_count(&pool, "a", "", "fp")
                     .await
                     .expect("count");
             }
@@ -384,7 +413,7 @@ mod tests {
         up("second", 3, 200, "s2").await;
         // A late batch from before the newest occurrence must not rename it.
         up("stale", 1, 150, "s0").await;
-        let issue = get_error_issue(&pool, "a", "fp")
+        let issue = get_error_issue(&pool, "a", "", "fp")
             .await
             .expect("get")
             .expect("issue");
@@ -395,12 +424,12 @@ mod tests {
         assert_eq!(issue.last_sha.as_deref(), Some("s2"));
         assert_eq!(issue.status, "open");
 
-        set_error_status(&pool, "a", "fp", "resolved", 300)
+        set_error_status(&pool, "a", "", "fp", "resolved", 300)
             .await
             .expect("resolve");
         // An occurrence from before the resolve (ingest lag) keeps it resolved.
         up("second", 1, 250, "s2").await;
-        let issue = get_error_issue(&pool, "a", "fp")
+        let issue = get_error_issue(&pool, "a", "", "fp")
             .await
             .expect("get")
             .expect("issue");
@@ -410,22 +439,83 @@ mod tests {
         );
         // One after it reopens the issue as a regression.
         up("second", 1, 400, "s3").await;
-        let issue = get_error_issue(&pool, "a", "fp")
+        let issue = get_error_issue(&pool, "a", "", "fp")
             .await
             .expect("get")
             .expect("issue");
         assert_eq!((issue.status.as_str(), issue.regressed), ("open", true));
 
         // Ignored stays ignored however often it fires.
-        set_error_status(&pool, "a", "fp", "ignored", 500)
+        set_error_status(&pool, "a", "", "fp", "ignored", 500)
             .await
             .expect("ignore");
         up("second", 1, 600, "s3").await;
-        let issue = get_error_issue(&pool, "a", "fp")
+        let issue = get_error_issue(&pool, "a", "", "fp")
             .await
             .expect("get")
             .expect("issue");
         assert_eq!((issue.status.as_str(), issue.regressed), ("ignored", false));
         assert_eq!(issue.count, 9);
+    }
+
+    #[tokio::test]
+    async fn same_fingerprint_in_two_environments_stays_separate() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn: &mut SqliteConnection, _| {
+                Box::pin(async move {
+                    crate::db::attach_metrics!(conn, ":memory:");
+                    Ok::<_, sqlx::Error>(())
+                })
+            })
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory db");
+        for env in ["", "env-1"] {
+            upsert_error_issue(
+                &pool,
+                "a",
+                env,
+                "fp",
+                "TypeError",
+                "boom",
+                "f (w.js:1)",
+                "fetch",
+                "uncaught",
+                1,
+                100,
+                100,
+                Some("s1"),
+            )
+            .await
+            .expect("upsert");
+            set_error_hour(&pool, "a", env, "fp", "100", 1)
+                .await
+                .expect("hour");
+            refresh_error_issue_count(&pool, "a", env, "fp")
+                .await
+                .expect("count");
+        }
+        set_error_status(&pool, "a", "", "fp", "resolved", 200)
+            .await
+            .expect("resolve production");
+        let prod = get_error_issue(&pool, "a", "", "fp")
+            .await
+            .expect("get")
+            .expect("issue");
+        let env = get_error_issue(&pool, "a", "env-1", "fp")
+            .await
+            .expect("get")
+            .expect("issue");
+        assert_eq!(prod.status.as_str(), "resolved");
+        assert_eq!(env.status.as_str(), "open");
+        assert_eq!(prod.count, 1);
+        assert_eq!(env.count, 1);
+        let counts = count_error_issues(&pool, "a", "env-1")
+            .await
+            .expect("counts");
+        assert_eq!(counts, vec![("open".to_string(), 1)]);
+        let counts = count_error_issues(&pool, "a", "").await.expect("counts");
+        assert_eq!(counts, vec![("resolved".to_string(), 1)]);
     }
 }

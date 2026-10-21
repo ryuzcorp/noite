@@ -556,17 +556,21 @@ export const EnvironmentGroup = ({
 /** Create environment: a branch picker; the runner derives the label. */
 export const CreateEnvironmentDialog = ({
   appId,
+  initialBranch = "",
   onCreated,
   open,
 }: {
   appId: string;
+  /** Preselect a branch in the picker (the PR card passes the head branch);
+   * falls back to the first available branch when it has no environment. */
+  initialBranch?: string;
   /** After the runner creates the environment (used to deep-link its group). */
   onCreated?: (env: RunnerEnvironment) => void;
   open: AtomHandle<boolean>;
 }) => {
   const refs = forgeRefs(appId).data();
   const envs = environments(appId).data() ?? [];
-  const branch = atom("");
+  const branch = atom(initialBranch);
   const busy = atom(false);
   const err = atom("");
 

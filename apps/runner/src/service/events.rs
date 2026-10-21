@@ -14,6 +14,27 @@ use crate::AppState;
 
 use super::apps::app_or_404;
 
+/// Validate an optional environment for the event reads: absent or empty is
+/// production (the event tables are app-scoped, not per-environment), a given
+/// one must be this app's, else 404. The reads stay app-wide; the param keeps
+/// the observability surfaces uniform so a tab can pass its scope blindly.
+async fn require_env(
+    state: &AppState,
+    app_id: &str,
+    environment: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(env_id) = environment.filter(|raw| !raw.is_empty()) else {
+        return Ok(());
+    };
+    let env = db::get_environment(&state.pool, env_id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    match env {
+        Some(env) if env.app_id == app_id => Ok(()),
+        _ => Err(ApiError::not_found("environment not found")),
+    }
+}
+
 fn is_key(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && {
         let mut parts = s.split('-');
@@ -109,8 +130,10 @@ pub async fn list(
     id: &str,
     channel: Option<&str>,
     limit: Option<i64>,
+    environment: Option<&str>,
 ) -> Result<Vec<AppEvent>, ApiError> {
     let app = app_or_404(state, id).await?;
+    require_env(state, &app.id, environment).await?;
     let limit = limit.unwrap_or(50).clamp(1, 200);
     let channel = channel.map(str::trim).filter(|c| !c.is_empty());
     db::list_app_events(&state.pool, &app.id, channel, limit)
@@ -118,15 +141,25 @@ pub async fn list(
         .map_err(|e| ApiError::internal(e.to_string()))
 }
 
-pub async fn channels(state: &AppState, id: &str) -> Result<Vec<String>, ApiError> {
+pub async fn channels(
+    state: &AppState,
+    id: &str,
+    environment: Option<&str>,
+) -> Result<Vec<String>, ApiError> {
     let app = app_or_404(state, id).await?;
+    require_env(state, &app.id, environment).await?;
     db::list_app_channels(&state.pool, &app.id)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))
 }
 
-pub async fn insights(state: &AppState, id: &str) -> Result<Vec<AppInsight>, ApiError> {
+pub async fn insights(
+    state: &AppState,
+    id: &str,
+    environment: Option<&str>,
+) -> Result<Vec<AppInsight>, ApiError> {
     let app = app_or_404(state, id).await?;
+    require_env(state, &app.id, environment).await?;
     db::list_app_insights(&state.pool, &app.id)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))
@@ -163,8 +196,10 @@ pub async fn user_props(
     state: &AppState,
     id: &str,
     user_id: &str,
+    environment: Option<&str>,
 ) -> Result<Option<AppUserProps>, ApiError> {
     let app = app_or_404(state, id).await?;
+    require_env(state, &app.id, environment).await?;
     db::get_app_user_props(&state.pool, &app.id, user_id.trim())
         .await
         .map_err(|e| ApiError::internal(e.to_string()))
