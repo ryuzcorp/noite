@@ -13,14 +13,14 @@ import {
 const OOM_SLUG = "oom-fleet";
 
 // Small per-app cap in MiB, set from the measured idle peak (D3): just above
-// it, so the fleet deploys healthy, and less than one per-isolate V8 heap
-// limit (128 MiB) above it, so the kernel's per-fleet `memory.max` trips
-// before any isolate's own heap cap does — an isolate OOM aborts the
-// process without a cgroup `oom_kill`, which would restart the fleet but
-// record no event. Small repeated grows accumulate in the fleet total
-// whichever isolate serves them.
+// it, so the fleet deploys healthy. Each burst holds eight 64 MiB
+// allocations in flight at once (512 MiB fleet-wide, 64 per isolate), so the
+// kernel's per-fleet `memory.max` trips while every isolate stays well under
+// its own 128 MiB heap cap — an isolate OOM aborts the process without a
+// cgroup `oom_kill`, which would restart the fleet but record no event.
 const OOM_CAP_MB = 256;
-const GROW_MB = 32;
+const GROW_MB = 64;
+const BURST = 8;
 
 test.afterAll(async ({ request }) => {
   await deleteApp(request, OOM_SLUG);
@@ -122,30 +122,40 @@ test(
       return res.status();
     };
 
-    // Grow the fleet past its cap in concurrent batches: four 32 MiB
-    // allocations in flight at once overlap in the fleet whichever isolate
-    // serves them, and sequential batches accumulate when isolates persist.
-    // Either way the fleet total crosses the cap while every isolate stays
-    // far under its own 128 MiB heap limit. The request in flight when the
-    // kernel's OOM-killer fires never answers (its connection dies with the
-    // fleet); later requests fail while the supervisor respawns it.
-    for (let batch = 1; batch <= 6; batch += 1) {
-      // oxlint-disable-next-line eslint/no-await-in-loop -- sequential batches with an early break: each batch builds on the last allocation
-      const settled = await Promise.allSettled([
-        get(`/grow?mb=${GROW_MB}`),
-        get(`/grow?mb=${GROW_MB}`),
-        get(`/grow?mb=${GROW_MB}`),
-        get(`/grow?mb=${GROW_MB}`),
-      ]);
+    // Grow the fleet past its cap in concurrent bursts: eight 64 MiB
+    // allocations in flight at once (512 MiB fleet-wide, 64 per isolate)
+    // overlap in the fleet whichever isolate serves them, and sequential
+    // bursts accumulate when isolates persist. Either way the fleet total
+    // crosses the 256 MiB cap while every isolate stays well under its own
+    // 128 MiB heap limit. The request in flight when the kernel's OOM-killer
+    // fires never answers (its connection dies with the fleet); later
+    // requests fail while the supervisor respawns it.
+    let killObserved = false;
+
+    for (let batch = 1; batch <= 4; batch += 1) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- sequential bursts with an early break: each burst builds on the last allocation
+      const settled = await Promise.allSettled(
+        Array.from({ length: BURST }, () => get(`/grow?mb=${GROW_MB}`))
+      );
 
       const alive = settled.filter(
         (result) => result.status === "fulfilled" && result.value === 200
       ).length;
 
-      if (alive < 4) {
+      if (alive < BURST) {
+        killObserved = true;
         break;
       }
     }
+
+    // The kill itself, before the event: at least one burst request died
+    // with the fleet. If the fleet survived every burst, no OOM kill
+    // happened and no event is coming — fail here, not after a 120 s wait
+    // for the impossible.
+    expect(
+      killObserved,
+      "fleet survived every growth burst (no OOM kill to observe)"
+    ).toBe(true);
 
     const expected = `fleet restarted: memory limit ${OOM_CAP_MB} MiB exceeded (Settings → Limits)`;
 
