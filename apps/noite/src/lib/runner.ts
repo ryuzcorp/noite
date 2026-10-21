@@ -466,7 +466,10 @@ export const runnerDeployLog = (id: string, deployId: string) =>
   runnerRpc<{ log: string }>("deploys.log", { deploy_id: deployId, id });
 
 export const runnerRollback = (id: string, sha: string) =>
-  runnerRpc<{ ok: boolean; sha: string }>("deploys.rollback", { id, sha });
+  runnerRpc<{ deployId: string; ok: boolean; sha: string }>(
+    "deploys.rollback",
+    { id, sha }
+  );
 
 export const runnerListEnv = (id: string) =>
   runnerRpc<RunnerEnv[]>("env.list", { id });

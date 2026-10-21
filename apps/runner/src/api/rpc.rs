@@ -905,9 +905,9 @@ async fn dispatch_call(
             };
             complete(
                 id,
-                service::deploys::rollback(state, &p.id, &p.sha)
-                    .await
-                    .map(|sha| json!({ "ok": true, "sha": sha })),
+                service::deploys::rollback(state, &p.id, &p.sha).await.map(
+                    |(deploy_id, sha)| json!({ "ok": true, "sha": sha, "deployId": deploy_id }),
+                ),
             )
         }
         "git.remote" => {

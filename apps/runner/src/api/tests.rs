@@ -991,6 +991,69 @@ async fn a_watched_environment_deploy_waits_for_the_apps_other_deploy() {
     assert!(!log.contains("skipped"), "{log}");
 }
 
+/// A rollback issued while the app's previous deploy is still finishing
+/// queues behind it instead of vanishing: the lane's rollback spec watched
+/// `ok: true` turn into no row at all and waited 8 minutes for a deploy
+/// that never started (the previous deploy's tail still held the lock).
+#[tokio::test]
+async fn rollback_queues_behind_the_apps_in_flight_deploy() {
+    let h = Harness::new().await;
+    let app = h.seed_app("rollback-wait").await;
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    // Rollback needs a successful deploy at this sha.
+    crate::db::upsert_deploy(
+        &h.state.pool,
+        None,
+        &app.id,
+        None,
+        "success",
+        Some(sha),
+        "deploy complete\n",
+    )
+    .await
+    .expect("seed success row");
+    // The previous deploy still holds the app's lock: its success row is
+    // written, but the tail (health gate, prune) still owns the claim.
+    assert!(crate::host::deploy::claim(&h.state.deploying, &app.id).await);
+    let prepared = crate::service::deploys::prepare_rollback(&h.state, &app.id, sha)
+        .await
+        .expect("rollback queues");
+    assert_eq!(prepared.sha, sha);
+    let deploy_id = prepared.deploy_id.clone();
+    assert!(!deploy_id.is_empty(), "rollback hands back its row");
+    // The row exists before the run is even spawned: without the pre-created
+    // row this lookup fails and the caller waits on a deploy that never
+    // started.
+    let queued = crate::db::get_deploy_log(&h.state.pool, &app.id, &deploy_id)
+        .await
+        .expect("log")
+        .expect("row");
+    assert!(queued.contains("queued"), "{queued}");
+    // The run cannot proceed while the previous deploy holds the lock (the
+    // queued wait touches no row), so spawning it changes nothing yet.
+    let task = tokio::spawn(async move { prepared.run().await });
+    let waiting = crate::db::get_deploy_log(&h.state.pool, &app.id, &deploy_id)
+        .await
+        .expect("log")
+        .expect("row");
+    assert!(waiting.contains("queued"), "{waiting}");
+    // The previous deploy ends: the rollback runs to a real attempt — fetch
+    // fails here (no bundle in the stubbed S3) — never a skip.
+    crate::host::deploy::release(&h.state.deploying, &app.id).await;
+    tokio::time::timeout(std::time::Duration::from_secs(30), task)
+        .await
+        .expect("rollback ran after the lock freed")
+        .expect("task");
+    let log = crate::db::get_deploy_log(&h.state.pool, &app.id, &deploy_id)
+        .await
+        .expect("log")
+        .expect("row");
+    assert_ne!(log, waiting, "the run wrote its row: {log}");
+    assert!(!log.contains("skipped"), "{log}");
+
+    h.finish().await;
+}
+
 /// Environments agree across transports, and the role gates are real: a read
 /// needs `view`, toggling public and deleting need `admin`.
 #[tokio::test]
