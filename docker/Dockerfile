@@ -49,8 +49,7 @@ FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
  # the image job covers them (`go vet`, formatting, `go test -race`). The
  # race detector needs a C compiler the builder image does not carry.
  COPY edge /edge
- RUN apt-get update && apt-get install -y --no-install-recommends gcc \
-     && rm -rf /var/lib/apt/lists/* \
+ RUN apk add --no-cache gcc musl-dev \
      && cd /edge && go vet ./... && test -z "$(gofmt -l .)" && CGO_ENABLED=1 go test -race ./...
  RUN GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" CGO_ENABLED=0 xcaddy build \
        --with "github.com/ryuzcorp/noite/edge=/edge" \
