@@ -239,106 +239,107 @@ const branchNames = async (
 const mainLog = (request: APIRequestContext, appId: string) =>
   runnerApi<GitLogBody>(request, `/v1/apps/${appId}/git/log?limit=100`);
 
-test("a pull request is commented, approved, rebased onto a new head and merged", async ({
-  page,
-  request,
-}) => {
-  const slug = "prs-lifecycle";
-  createdApps.push(slug);
+test(
+  "a pull request is commented, approved, rebased onto a new head and merged",
+  { tag: "@fast" },
+  async ({ page, request }) => {
+    const slug = "prs-lifecycle";
+    createdApps.push(slug);
 
-  const { apiKey, appId } = await createAppWithKey(page, request, {
-    name: "PRs Lifecycle",
-    slug,
-  });
+    const { apiKey, appId } = await createAppWithKey(page, request, {
+      name: "PRs Lifecycle",
+      slug,
+    });
 
-  pushAppDir(apiKey, new URL("../test", import.meta.url), slug);
+    pushAppDir(apiKey, new URL("../test", import.meta.url), slug);
 
-  // Feature branch with one commit to review.
-  const repo = cloneRepo(apiKey, slug);
-  repo.run(["checkout", "-b", "feature"]);
+    // Feature branch with one commit to review.
+    const repo = cloneRepo(apiKey, slug);
+    repo.run(["checkout", "-b", "feature"]);
 
-  const featureSha = commitFiles(
-    repo,
-    {
-      "FEATURE.md": "# Feature\n\nFirst line.\n",
-    },
-    "prs: feature commit"
-  );
+    const featureSha = commitFiles(
+      repo,
+      {
+        "FEATURE.md": "# Feature\n\nFirst line.\n",
+      },
+      "prs: feature commit"
+    );
 
-  repo.run(["push", "-u", "origin", "feature"]);
+    repo.run(["push", "-u", "origin", "feature"]);
 
-  // (1) Open the PR and leave a line comment on the new head.
-  const opened = await openPr(request, appId, {
-    authorId: "pr-author",
-    base: "main",
-    head: "feature",
-    title: "Add a feature",
-  });
+    // (1) Open the PR and leave a line comment on the new head.
+    const opened = await openPr(request, appId, {
+      authorId: "pr-author",
+      base: "main",
+      head: "feature",
+      title: "Add a feature",
+    });
 
-  const { number } = opened.pullRequest;
-  expect(opened.pullRequest.headSha).toBe(featureSha);
+    const { number } = opened.pullRequest;
+    expect(opened.pullRequest.headSha).toBe(featureSha);
 
-  // Anchored on the line the next commit rewrites, so the push strands it.
-  const comment = await commentOnLine(request, appId, number, {
-    commitSha: featureSha,
-    line: 3,
-    path: "FEATURE.md",
-    side: "new",
-  });
+    // Anchored on the line the next commit rewrites, so the push strands it.
+    const comment = await commentOnLine(request, appId, number, {
+      commitSha: featureSha,
+      line: 3,
+      path: "FEATURE.md",
+      side: "new",
+    });
 
-  expect(comment.status).toBe(200);
-  const commented = await fetchPr(request, appId, number);
-  expect(commented.pullRequest.commentCount).toBe(1);
+    expect(comment.status).toBe(200);
+    const commented = await fetchPr(request, appId, number);
+    expect(commented.pullRequest.commentCount).toBe(1);
 
-  // (2) Approve, then push a new commit: the comment goes outdated and the
-  // approval is dismissed because it was recorded at the old head.
-  const approved = await reviewPr(request, appId, number, "pr-reviewer");
-  expect(approved.status).toBe(200);
-  expect(asJson<PrDetail>(approved.body).approvals).toBe(1);
+    // (2) Approve, then push a new commit: the comment goes outdated and the
+    // approval is dismissed because it was recorded at the old head.
+    const approved = await reviewPr(request, appId, number, "pr-reviewer");
+    expect(approved.status).toBe(200);
+    expect(asJson<PrDetail>(approved.body).approvals).toBe(1);
 
-  repo.run(["checkout", "feature"]);
+    repo.run(["checkout", "feature"]);
 
-  const newHead = commitFiles(
-    repo,
-    {
-      "FEATURE.md": "# Feature\n\nRewritten first line.\n",
-    },
-    "prs: rework the first line"
-  );
+    const newHead = commitFiles(
+      repo,
+      {
+        "FEATURE.md": "# Feature\n\nRewritten first line.\n",
+      },
+      "prs: rework the first line"
+    );
 
-  repo.run(["push", "origin", "feature"]);
-  expect(newHead).not.toBe(featureSha);
+    repo.run(["push", "origin", "feature"]);
+    expect(newHead).not.toBe(featureSha);
 
-  const moved = await fetchPr(request, appId, number);
-  expect(moved.pullRequest.headSha).toBe(newHead);
-  expect(moved.comments[0]?.outdated).toBe(true);
-  expect(moved.reviews[0]?.dismissedAt).not.toBeNull();
-  expect(moved.approvals).toBe(0);
+    const moved = await fetchPr(request, appId, number);
+    expect(moved.pullRequest.headSha).toBe(newHead);
+    expect(moved.comments[0]?.outdated).toBe(true);
+    expect(moved.reviews[0]?.dismissedAt).not.toBeNull();
+    expect(moved.approvals).toBe(0);
 
-  // (3) A fresh approval on the new head unblocks the squash merge; the
-  // branch is deleted and main gains exactly one commit that deploys.
-  const reapproved = await reviewPr(request, appId, number, "pr-reviewer");
-  expect(reapproved.status).toBe(200);
-  const before = await mainLog(request, appId);
+    // (3) A fresh approval on the new head unblocks the squash merge; the
+    // branch is deleted and main gains exactly one commit that deploys.
+    const reapproved = await reviewPr(request, appId, number, "pr-reviewer");
+    expect(reapproved.status).toBe(200);
+    const before = await mainLog(request, appId);
 
-  const merged = await mergePr(request, appId, number, "pr-reviewer", "push");
-  expect(merged.status).toBe(200);
-  const mergedDetail = asJson<PrDetail>(merged.body);
-  expect(mergedDetail.pullRequest.state).toBe("merged");
-  const mergeSha = mergedDetail.pullRequest.mergeSha ?? "";
-  expect(mergeSha).not.toBe("");
+    const merged = await mergePr(request, appId, number, "pr-reviewer", "push");
+    expect(merged.status).toBe(200);
+    const mergedDetail = asJson<PrDetail>(merged.body);
+    expect(mergedDetail.pullRequest.state).toBe("merged");
+    const mergeSha = mergedDetail.pullRequest.mergeSha ?? "";
+    expect(mergeSha).not.toBe("");
 
-  const after = await mainLog(request, appId);
-  expect(after.commits.length).toBe(before.commits.length + 1);
-  expect(after.commits[0]?.sha).toBe(mergeSha);
-  expect(await branchNames(request, appId)).not.toContain("feature");
+    const after = await mainLog(request, appId);
+    expect(after.commits.length).toBe(before.commits.length + 1);
+    expect(after.commits[0]?.sha).toBe(mergeSha);
+    expect(await branchNames(request, appId)).not.toContain("feature");
 
-  // The squash commit deploys like any other main push.
-  await expect(async () => {
-    const deploy = await waitForDeploy(request, appId);
-    expect(deploy.sha).toBe(mergeSha);
-  }).toPass({ timeout: 8 * 60_000 });
-});
+    // The squash commit deploys like any other main push.
+    await expect(async () => {
+      const deploy = await waitForDeploy(request, appId);
+      expect(deploy.sha).toBe(mergeSha);
+    }).toPass({ timeout: 8 * 60_000 });
+  }
+);
 
 test("a conflicting pull request reports conflicts and refuses to merge", async ({
   page,

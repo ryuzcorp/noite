@@ -169,31 +169,32 @@ test("rejects an import URL that is not a public GitHub repo", async ({
   expect(await findAppId(request, "nope-import")).toBeNull();
 });
 
-test("pushing to a new slug creates the app and serves the push", async ({
-  page,
-  request,
-}) => {
-  createdApps.push("key-holder", "pushed-app");
+test(
+  "pushing to a new slug creates the app and serves the push",
+  { tag: "@fast" },
+  async ({ page, request }) => {
+    createdApps.push("key-holder", "pushed-app");
 
-  // Any account's API key may create an app this way; mint one on a throwaway
-  // app through the same UI a user would.
-  const { apiKey } = await createAppWithKey(page, request, {
-    name: "Key Holder",
-    slug: "key-holder",
-  });
+    // Any account's API key may create an app this way; mint one on a throwaway
+    // app through the same UI a user would.
+    const { apiKey } = await createAppWithKey(page, request, {
+      name: "Key Holder",
+      slug: "key-holder",
+    });
 
-  const pushed = pushNewRepo(apiKey, "pushed-app");
-  const appId = await findAppId(request, "pushed-app");
-  expect(appId).not.toBeNull();
-  const id = appId ?? "";
-  // The pusher became its admin: the push went through and the deploy runs.
-  const deploy = await waitForDeploy(request, id);
-  expect(deploy.sha).toBe(pushed.sha);
-  const app = await runnerApi<RunnerAppRow>(request, `/v1/apps/${id}`);
-  expect(app.status).toBe("running");
-  // The first push prints the app URL (a `remote:` sideband line).
-  expect(pushed.stderr).toContain("pushed-app");
-});
+    const pushed = pushNewRepo(apiKey, "pushed-app");
+    const appId = await findAppId(request, "pushed-app");
+    expect(appId).not.toBeNull();
+    const id = appId ?? "";
+    // The pusher became its admin: the push went through and the deploy runs.
+    const deploy = await waitForDeploy(request, id);
+    expect(deploy.sha).toBe(pushed.sha);
+    const app = await runnerApi<RunnerAppRow>(request, `/v1/apps/${id}`);
+    expect(app.status).toBe("running");
+    // The first push prints the app URL (a `remote:` sideband line).
+    expect(pushed.stderr).toContain("pushed-app");
+  }
+);
 
 test("a reserved slug cannot be pushed into existence", async ({
   page,

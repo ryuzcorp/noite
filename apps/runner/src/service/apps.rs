@@ -100,7 +100,15 @@ pub async fn create(
     // — safe now: no row exists for it (checked just above, under these locks).
     // Callers of `purge_slug` hold the slug's push guard (see its docs); the
     // `_push` guard above is that holder for this path.
-    if let Err(e) = purge::purge_slug(&state.config, &state.procs, &state.logs, &slug).await {
+    if let Err(e) = purge::purge_slug(
+        &state.config,
+        &state.procs,
+        &state.logs,
+        &slug,
+        supervisor::StopGrace::NORMAL,
+    )
+    .await
+    {
         return Err(ApiError::internal(format!(
             "failed to clear slug data: {e:#}"
         )));
@@ -298,10 +306,14 @@ pub async fn delete(state: &AppState, id: &str) -> Result<(), ApiError> {
     // acquires after us must find no row and bail instead of building into
     // the just-purged prefix. Ordering here is AppLock → push_guard (see
     // [`crate::host::git_manifest::GitSync`]); `purge_slug` requires its
-    // callers to hold the slug's push guard.
-    if !deploy::claim_wait(&state.deploying, &app.id, Duration::from_secs(120)).await {
+    // callers to hold the slug's push guard. The guard releases on every
+    // return below — and on cancel or panic — so a dropped delete can never
+    // wedge later deletes behind a stale "deploy in flight".
+    let Some(claim) =
+        deploy::claim_wait_owned(&state.deploying, &app.id, Duration::from_secs(120)).await
+    else {
         return Err(ApiError::conflict("deploy in flight; retry delete shortly"));
-    }
+    };
     // R-02: a concurrent push writes under `push_guard(&slug)` across git +
     // S3 + manifest; the purge must not run inside one of those writes.
     let _push = state.git_sync.push_guard(&app.slug).await;
@@ -312,22 +324,27 @@ pub async fn delete(state: &AppState, id: &str) -> Result<(), ApiError> {
     if let Err(e) =
         db::patch_app_desired(&state.pool, &app.id, DesiredState::Stopped.as_str()).await
     {
-        deploy::release(&state.deploying, &app.id).await;
         return Err(ApiError::internal(e.to_string()));
     }
-    let purge_result = purge::purge_slug(&state.config, &state.procs, &state.logs, &app.slug).await;
+    let purge_result = purge::purge_slug(
+        &state.config,
+        &state.procs,
+        &state.logs,
+        &app.slug,
+        supervisor::StopGrace::FOR_DELETE,
+    )
+    .await;
     if let Err(e) = purge_result {
-        deploy::release(&state.deploying, &app.id).await;
         return Err(ApiError::internal(format!(
             "failed to purge app data: {e:#}"
         )));
     }
     let delete_result = db::delete_app(&state.pool, id).await;
-    deploy::release(&state.deploying, &app.id).await;
+    drop(claim);
     delete_result.map_err(|e| ApiError::internal(e.to_string()))?;
     // A reconcile tick that listed apps before the stop above can still have
     // started the fleet again; with the row gone nothing else would stop it.
-    supervisor::stop_fleet(&state.procs, &app.slug).await;
+    supervisor::stop_fleet(&state.procs, &app.slug, supervisor::StopGrace::FOR_DELETE).await;
     // Both transports revoke: the RPC path used to skip this and leak the row.
     // R-10: a revoke failure must not vanish — warn loudly so the orphaned
     // credential row is visible instead of silently kept.
@@ -492,7 +509,9 @@ mod tests {
             .await
             .expect("create");
         // A fake in-flight deploy holding the AppLock.
-        assert!(deploy::claim(&state.deploying, &app.id).await);
+        let fake_deploy = deploy::claim_owned(&state.deploying, &app.id)
+            .await
+            .expect("fake deploy takes the claim");
         let owned = state.clone();
         let id = app.id.clone();
         let deleting = tokio::spawn(async move { delete(&owned, &id).await });
@@ -505,7 +524,7 @@ mod tests {
         // it owns the claim, then queue a waiter behind it (an explicit
         // deploy's `claim_wait`). The purge's settle sleep keeps this window
         // wide open.
-        deploy::release(&state.deploying, &app.id).await;
+        drop(fake_deploy);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while !deploy::snapshot_claimed(&state.deploying)
             .await
@@ -520,13 +539,10 @@ mod tests {
         let owned = state.clone();
         let id = app.id.clone();
         let waiter = tokio::spawn(async move {
-            assert!(
-                deploy::claim_wait(&owned.deploying, &id, Duration::from_secs(30)).await,
-                "waiter acquires once delete releases"
-            );
-            let row = db::get_app(&owned.pool, &id).await.expect("lookup");
-            deploy::release(&owned.deploying, &id).await;
-            row
+            let _waiter = deploy::claim_wait_owned(&owned.deploying, &id, Duration::from_secs(30))
+                .await
+                .expect("waiter acquires once delete releases");
+            db::get_app(&owned.pool, &id).await.expect("lookup")
         });
         tokio::time::timeout(Duration::from_secs(30), deleting)
             .await

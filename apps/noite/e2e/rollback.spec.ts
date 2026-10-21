@@ -74,41 +74,45 @@ const readMarker = async (
 // Rollback re-runs the pipeline at an earlier successful deploy: deploy twice
 // with observable revisions, roll back to the first sha, and the first
 // revision serves again.
-test("rollback restores the earlier deploy", async ({ page, request }) => {
-  createdApps.push(SLUG);
+test(
+  "rollback restores the earlier deploy",
+  { tag: "@fast" },
+  async ({ page, request }) => {
+    createdApps.push(SLUG);
 
-  const { apiKey, appId } = await createAppWithKey(page, request, {
-    name: "Rollback",
-    slug: SLUG,
-  });
+    const { apiKey, appId } = await createAppWithKey(page, request, {
+      name: "Rollback",
+      slug: SLUG,
+    });
 
-  const sha1 = pushMarkerRevision(apiKey, V1_MARKER);
-  const first = await waitForDeploy(request, appId, 8 * 60_000, sha1);
-  expect(first.status, first.log).toBe("success");
+    const sha1 = pushMarkerRevision(apiKey, V1_MARKER);
+    const first = await waitForDeploy(request, appId, 8 * 60_000, sha1);
+    expect(first.status, first.log).toBe("success");
 
-  const port = await appListenPort(request, appId);
-  expect(await readMarker(request, port)).toBe(V1_MARKER);
+    const port = await appListenPort(request, appId);
+    expect(await readMarker(request, port)).toBe(V1_MARKER);
 
-  const sha2 = pushMarkerRevision(apiKey, V2_MARKER);
-  expect(sha2).not.toBe(sha1);
-  const second = await waitForDeploy(request, appId, 8 * 60_000, sha2);
-  expect(second.status, second.log).toBe("success");
-  expect(await readMarker(request, port)).toBe(V2_MARKER);
+    const sha2 = pushMarkerRevision(apiKey, V2_MARKER);
+    expect(sha2).not.toBe(sha1);
+    const second = await waitForDeploy(request, appId, 8 * 60_000, sha2);
+    expect(second.status, second.log).toBe("success");
+    expect(await readMarker(request, port)).toBe(V2_MARKER);
 
-  const rolled = await runnerCall(request, `/v1/apps/${appId}/rollback`, {
-    body: { sha: sha1 },
-    method: "POST",
-  });
+    const rolled = await runnerCall(request, `/v1/apps/${appId}/rollback`, {
+      body: { sha: sha1 },
+      method: "POST",
+    });
 
-  expect(rolled.status).toBe(200);
-  expect(JSON.stringify(rolled.body)).toContain(sha1);
+    expect(rolled.status).toBe(200);
+    expect(JSON.stringify(rolled.body)).toContain(sha1);
 
-  const live = await waitForDeploy(request, appId, 8 * 60_000, sha1);
-  expect(live.status, live.log).toBe("success");
-  expect(live.sha).toBe(sha1);
+    const live = await waitForDeploy(request, appId, 8 * 60_000, sha1);
+    expect(live.status, live.log).toBe("success");
+    expect(live.sha).toBe(sha1);
 
-  // The earlier revision serves traffic again, not just a matching row.
-  expect(await readMarker(request, port)).toBe(V1_MARKER);
-  const sample = await readSampleApp(request, port);
-  expect(Number.isInteger(sample.n)).toBe(true);
-});
+    // The earlier revision serves traffic again, not just a matching row.
+    expect(await readMarker(request, port)).toBe(V1_MARKER);
+    const sample = await readSampleApp(request, port);
+    expect(Number.isInteger(sample.n)).toBe(true);
+  }
+);

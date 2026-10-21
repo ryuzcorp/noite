@@ -31,12 +31,13 @@ pub async fn purge_slug(
     procs: &ProcMap,
     log_state: &LogState,
     slug: &str,
+    grace: supervisor::StopGrace,
 ) -> anyhow::Result<()> {
-    supervisor::stop_fleet(procs, slug).await;
+    supervisor::stop_fleet(procs, slug, grace).await;
     // Preview environments are fleets of their own (`slug.label`): they share
     // this app's data, so they go down before it is cleared. Their rows go
     // with the app row (FK cascade); `envs/<slug>/` is cleared below.
-    supervisor::stop_environment_fleets(procs, slug).await;
+    supervisor::stop_environment_fleets(procs, slug, grace).await;
     // Brief settle: aws rm racing a dying node leaves incomplete LTX chains
     // (own.json epoch N, ltX only under e1) → D1 RestoreFailed on next boot.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -158,9 +159,15 @@ mod tests {
         // the purge so no push writes under the wiped prefixes mid-teardown.
         let git_sync = crate::host::git_manifest::GitSync::default();
         let _push = git_sync.push_guard("purge").await;
-        purge_slug(&cfg, &procs, &crate::host::logs::new_state(), "purge")
-            .await
-            .expect("purge");
+        purge_slug(
+            &cfg,
+            &procs,
+            &crate::host::logs::new_state(),
+            "purge",
+            crate::host::supervisor::StopGrace::NORMAL,
+        )
+        .await
+        .expect("purge");
 
         assert!(!state_dir.exists(), "the environment state dir is wiped");
         assert!(

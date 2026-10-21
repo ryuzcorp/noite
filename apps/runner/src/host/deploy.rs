@@ -1,9 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-use tokio::sync::Mutex;
 
 use crate::config::{Config, Tenancy};
 use crate::db;
@@ -22,6 +20,9 @@ use sqlx::SqlitePool;
 
 /// Per-app exclusive lock shared by deploy and purge/delete so S3 fleets/git
 /// never see overlapping writers (ghost LTX / RestoreFailed after partial wipe).
+/// A plain mutex: every critical section below is brief and never held across
+/// an await, so a blocking lock here always succeeds promptly (and it lets
+/// the guard below release synchronously on drop).
 pub type AppLock = Arc<Mutex<HashSet<String>>>;
 
 pub type Deploying = AppLock;
@@ -30,35 +31,71 @@ pub fn new_deploying() -> Deploying {
     Arc::new(Mutex::new(HashSet::new()))
 }
 
-pub async fn claim(deploying: &Deploying, app_id: &str) -> bool {
-    let mut g = deploying.lock().await;
-    if g.contains(app_id) {
-        return false;
+/// Holding the per-app build/delete/rename claim. The claim releases when
+/// this drops, so a cancelled, failed or panicked task can never wedge later
+/// callers behind a stale "deploy in flight" — a retried delete finishes
+/// instead of 409ing forever.
+pub struct AppClaim {
+    app_id: String,
+    deploying: Deploying,
+}
+
+impl AppClaim {
+    fn take(deploying: &Deploying, app_id: &str) -> Option<Self> {
+        let mut claimed = deploying
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if claimed.contains(app_id) {
+            return None;
+        }
+        claimed.insert(app_id.to_string());
+        Some(Self {
+            app_id: app_id.to_string(),
+            deploying: deploying.clone(),
+        })
     }
-    g.insert(app_id.to_string());
-    true
+}
+
+impl Drop for AppClaim {
+    fn drop(&mut self) {
+        deploying_remove(&self.deploying, &self.app_id);
+    }
+}
+
+fn deploying_remove(deploying: &Deploying, app_id: &str) {
+    deploying
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(app_id);
+}
+
+pub async fn claim_owned(deploying: &Deploying, app_id: &str) -> Option<AppClaim> {
+    AppClaim::take(deploying, app_id)
 }
 
 /// Wait up to `timeout` to acquire the lock (delete waits out an in-flight deploy).
-pub async fn claim_wait(deploying: &Deploying, app_id: &str, timeout: Duration) -> bool {
+pub async fn claim_wait_owned(
+    deploying: &Deploying,
+    app_id: &str,
+    timeout: Duration,
+) -> Option<AppClaim> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if claim(deploying, app_id).await {
-            return true;
+        if let Some(claim) = claim_owned(deploying, app_id).await {
+            return Some(claim);
         }
         if tokio::time::Instant::now() >= deadline {
-            return false;
+            return None;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
-pub async fn release(deploying: &Deploying, app_id: &str) {
-    deploying.lock().await.remove(app_id);
-}
-
 pub async fn snapshot_claimed(deploying: &Deploying) -> HashSet<String> {
-    deploying.lock().await.clone()
+    deploying
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// Why a deploy runs. A tip deploy is deduped against the sha already live
@@ -147,11 +184,11 @@ pub async fn deploy_app(
     let claimed = match deploy_id {
         Some(_) => {
             let wait = Duration::from_millis(crate::lifecycle::DEPLOY_STUCK_MS.unsigned_abs());
-            claim_wait(deploying, &app.id, wait).await
+            claim_wait_owned(deploying, &app.id, wait).await
         }
-        None => claim(deploying, &app.id).await,
+        None => claim_owned(deploying, &app.id).await,
     };
-    if !claimed {
+    let Some(_claim) = claimed else {
         // The caller may be waiting on that pre-created row: close it, or it
         // sits "building" until the stuck-deploy sweep.
         if let Some(id) = deploy_id {
@@ -168,7 +205,7 @@ pub async fn deploy_app(
         }
         tracing::info!(slug = %app.slug, "deploy skip (in flight)");
         return;
-    }
+    };
     // A deploy is activity (SPEC, Scale to zero): wake an asleep app — or
     // preview environment — so the reconcile loop spawns the fleet this
     // release lands in.
@@ -206,9 +243,10 @@ pub async fn deploy_app(
         }
     }
     // T5.1: the build just populated the persistent cache; prune it back to
-    // the cap now, on success and on failure alike.
+    // the cap now, on success and on failure alike. The claim releases when
+    // `_claim` drops at the end of this function (or on any early return,
+    // cancel or panic above).
     exec::prune_build_cache(&exec::build_cache_dir(cfg, &app.slug), cfg.build_cache_mb);
-    release(deploying, &app.id).await;
 }
 
 /// Log label for a target: the slug, or `slug.label` for an environment.

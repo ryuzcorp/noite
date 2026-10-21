@@ -51,12 +51,14 @@ jobs:
     with:
       changelog: ${{ startsWith(github.ref, 'refs/tags/v') }}
 
-  # Release tags only: the same lanes the Actions tab runs by hand, as a gate.
-  # The image below is built from the same commit and Dockerfile.
+  # Release tags only: the full release suite on both lanes, as a gate. The
+  # image below is built from the same commit and Dockerfile.
   e2e:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: check
     uses: ./.github/workflows/e2e.yml
+    with:
+      suite: release
 
   image:
     needs: [check, e2e]

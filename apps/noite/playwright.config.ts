@@ -21,6 +21,35 @@ const baseURL = process.env.E2E_BASE_URL ?? "http://noite.localhost:8090";
 // 4-vCPU GitHub runner.
 const workers = Number(process.env.E2E_WORKERS ?? 3);
 
+// Two suites over the same specs (E2E_SUITE, set by docker/e2e-local.sh):
+// `release` (the default) runs everything; `fast` is the pull-request gate,
+// the tests tagged for this lane's tenancy. `@fast` marks the single lane's
+// critical user paths (create, push and deploy, live logs, Code mode push, PR
+// merge, auth and invite gates, template deploy, rollback, environments,
+// error ingest); `@isolation` marks the multi lane's set, the paths
+// `NOITE_TENANCY=multi` changes (the hostile tenant, a sandboxed deploy, domain
+// verification). A tag is opt-in on purpose: a new test joins the release
+// suite, and joining the gate every pull request waits on is a decision. The
+// setup and policy projects run in both suites (every other test needs them).
+const SUITE_TAGS = {
+  multi: /@isolation/u,
+  single: /@fast/u,
+};
+
+const suite = process.env.E2E_SUITE ?? "release";
+
+if (suite !== "fast" && suite !== "release") {
+  throw new Error(`E2E_SUITE must be fast or release, not ${suite}`);
+}
+
+const tenancy = process.env.E2E_TENANCY ?? "single";
+
+if (tenancy !== "single" && tenancy !== "multi") {
+  throw new Error(`E2E_TENANCY must be single or multi, not ${tenancy}`);
+}
+
+const suiteGrep = suite === "fast" ? SUITE_TAGS[tenancy] : undefined;
+
 export default defineConfig({
   expect: { timeout: 30_000 },
   fullyParallel: false,
@@ -40,6 +69,7 @@ export default defineConfig({
     },
     {
       dependencies: ["policy"],
+      grep: suiteGrep,
       name: "e2e",
       testIgnore: [/a-invite\.spec\.ts/u, /auth\.setup\.ts/u],
       testMatch: /.*\.spec\.ts/u,

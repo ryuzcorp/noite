@@ -189,7 +189,7 @@ pub async fn sleep_app(
     }
     db::set_app_asleep(pool, &app.id).await?;
     rewrite_edge(pool, cfg).await?;
-    supervisor::stop_fleet(procs, &app.slug).await;
+    supervisor::stop_fleet(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
     crate::host::stats::record_sleep();
     tracing::info!(slug = %app.slug, force, after_h = cfg.sleep_after_h, "app asleep");
     Ok(true)
