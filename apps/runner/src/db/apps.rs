@@ -155,17 +155,18 @@ pub async fn verified_domain_owner(
 }
 
 /// Every app's own edge limits (the Caddyfile writer reads these once per
-/// reconcile, next to the custom domains).
+/// reconcile, next to the custom domains) and fleet memory overrides (the
+/// fleet supervisor reads these on spawn).
 pub async fn list_app_limits(pool: &SqlitePool) -> sqlx::Result<Vec<AppLimit>> {
-    sqlx::query_as::<_, AppLimit>("SELECT app_id, client_rpm, app_rpm FROM app_limit")
+    sqlx::query_as::<_, AppLimit>("SELECT app_id, client_rpm, app_rpm, memory_mb FROM app_limit")
         .fetch_all(pool)
         .await
 }
 
-/// One app's edge limits; both `None` when it has never set any.
+/// One app's limits; `None` fields when it has never set any.
 pub async fn get_app_limit(pool: &SqlitePool, app_id: &str) -> sqlx::Result<AppLimit> {
     let row = sqlx::query_as::<_, AppLimit>(
-        "SELECT app_id, client_rpm, app_rpm FROM app_limit WHERE app_id = ?",
+        "SELECT app_id, client_rpm, app_rpm, memory_mb FROM app_limit WHERE app_id = ?",
     )
     .bind(app_id)
     .fetch_optional(pool)
@@ -176,10 +177,10 @@ pub async fn get_app_limit(pool: &SqlitePool, app_id: &str) -> sqlx::Result<AppL
     }))
 }
 
-/// Replace an app's edge limits. Both `None` drops the row: back to the
-/// platform defaults.
+/// Replace an app's limits. All `None` drops the row: back to the platform
+/// defaults.
 pub async fn set_app_limit(pool: &SqlitePool, limit: &AppLimit) -> sqlx::Result<()> {
-    if limit.client_rpm.is_none() && limit.app_rpm.is_none() {
+    if limit.client_rpm.is_none() && limit.app_rpm.is_none() && limit.memory_mb.is_none() {
         sqlx::query("DELETE FROM app_limit WHERE app_id = ?")
             .bind(&limit.app_id)
             .execute(pool)
@@ -187,13 +188,14 @@ pub async fn set_app_limit(pool: &SqlitePool, limit: &AppLimit) -> sqlx::Result<
         return Ok(());
     }
     sqlx::query(
-        "INSERT INTO app_limit (app_id, client_rpm, app_rpm, updated_at) VALUES (?, ?, ?, ?) \
+        "INSERT INTO app_limit (app_id, client_rpm, app_rpm, memory_mb, updated_at) VALUES (?, ?, ?, ?, ?) \
          ON CONFLICT(app_id) DO UPDATE SET client_rpm = excluded.client_rpm, \
-         app_rpm = excluded.app_rpm, updated_at = excluded.updated_at",
+         app_rpm = excluded.app_rpm, memory_mb = excluded.memory_mb, updated_at = excluded.updated_at",
     )
     .bind(&limit.app_id)
     .bind(limit.client_rpm)
     .bind(limit.app_rpm)
+    .bind(limit.memory_mb)
     .bind(now_iso())
     .execute(pool)
     .await?;

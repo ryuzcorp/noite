@@ -217,6 +217,11 @@ async fn main() -> anyhow::Result<()> {
             false
         }
     };
+    // Per-fleet cgroups before any child is spawned: setup drains the
+    // runner's own cgroup (tini stays reaped, cgroups do not affect that)
+    // into a leaf, so children spawned after it inherit the leaf and tenant
+    // fleets can each move to their own group (SPEC, Tenant isolation).
+    host::cgroups::setup(&config.cgroup_root);
     let isolation = host::isolation::self_check(&config, nft_installed).await;
     if isolation.blocked {
         tracing::error!(detail = %isolation.detail, "multi-tenant isolation checks failed; /ready stays 503");

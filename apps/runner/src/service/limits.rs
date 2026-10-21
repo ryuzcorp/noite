@@ -1,4 +1,5 @@
-//! Per-app edge rate limits (`limits.*` RPC; the settings panel's source).
+//! Per-app limits (`limits.*` RPC; the settings panel's source): edge rate
+//! limits and the fleet memory cap override.
 
 use serde::Serialize;
 use ts_rs::TS;
@@ -15,6 +16,11 @@ use super::apps::app_or_404;
 /// module's per-client ring buffer stops being small.
 const MAX_EDGE_RPM: i64 = 600_000;
 
+/// Bounds on a per-app fleet memory cap in MiB: below the floor celld cannot
+/// boot, so a typo'd `1` refuses loudly instead of OOM-looping the fleet.
+const MIN_FLEET_MEMORY_MB: i64 = 64;
+const MAX_FLEET_MEMORY_MB: i64 = 1_048_576;
+
 /// The platform defaults an app's limits fall back to.
 #[derive(Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -22,9 +28,10 @@ const MAX_EDGE_RPM: i64 = 600_000;
 pub struct LimitDefaults {
     pub client_rpm: u32,
     pub app_rpm: u32,
+    pub memory_mb: u32,
 }
 
-/// An app's edge limits as the settings panel shows them: its own values
+/// An app's limits as the settings panel shows them: its own values
 /// (null = default) beside the platform defaults they fall back to.
 /// `perClient` is false behind a proxy the edge does not trust, where
 /// per-client limits cannot apply (`Config::edge_sees_clients`).
@@ -34,6 +41,7 @@ pub struct LimitDefaults {
 pub struct LimitsView {
     pub client_rpm: Option<i64>,
     pub app_rpm: Option<i64>,
+    pub memory_mb: Option<i64>,
     pub per_client: bool,
     pub defaults: LimitDefaults,
 }
@@ -42,10 +50,12 @@ fn limits_view(cfg: &Config, limit: &AppLimit) -> LimitsView {
     LimitsView {
         client_rpm: limit.client_rpm,
         app_rpm: limit.app_rpm,
+        memory_mb: limit.memory_mb,
         per_client: cfg.edge_sees_clients(),
         defaults: LimitDefaults {
             client_rpm: cfg.edge.client_rpm,
             app_rpm: cfg.edge.app_rpm,
+            memory_mb: cfg.fleet_memory_mb,
         },
     }
 }
@@ -63,6 +73,7 @@ pub async fn set(
     id: &str,
     client_rpm: Option<i64>,
     app_rpm: Option<i64>,
+    memory_mb: Option<i64>,
 ) -> Result<LimitsView, ApiError> {
     // Requests per minute; null = the platform default, 0 = off.
     let in_range = |v: Option<i64>| v.is_none_or(|v| (0..=MAX_EDGE_RPM).contains(&v));
@@ -71,11 +82,17 @@ pub async fn set(
             "limits must be between 0 and {MAX_EDGE_RPM} requests per minute"
         )));
     }
+    if memory_mb.is_some_and(|v| !(MIN_FLEET_MEMORY_MB..=MAX_FLEET_MEMORY_MB).contains(&v)) {
+        return Err(ApiError::bad(format!(
+            "memory must be between {MIN_FLEET_MEMORY_MB} and {MAX_FLEET_MEMORY_MB} MiB"
+        )));
+    }
     let app = app_or_404(state, id).await?;
     let limit = AppLimit {
         app_id: app.id.clone(),
         client_rpm,
         app_rpm,
+        memory_mb,
     };
     db::set_app_limit(&state.pool, &limit)
         .await

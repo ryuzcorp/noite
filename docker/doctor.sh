@@ -95,6 +95,18 @@ if [ -n "$snapshot_owner" ]; then
     echo "WARN state snapshot (owner=${snapshot_owner}, last upload ${snapshot_age:-?}s ago, error=${snapshot_err:-none})"
   fi
 fi
+# Per-fleet cgroups (SPEC, Tenant isolation): live means every tenant fleet
+# runs in its own group with its own `memory.max`. Inactive shares the
+# container cgroup, and a multi install stays at 503 on /ready above until
+# the operator applies the multi grant — so the failure names the fix.
+if printf '%s' "$ready" | grep -q '"cgroups":{"active":true}'; then
+  echo "ok   per-fleet cgroups ($(printf '%s' "$ready" | grep -o '"detail":"[^"]*"' | head -1))"
+else
+  echo "WARN per-fleet cgroups inactive (fleets share the container cgroup)"
+  echo "     fix for multi installs: layer the cgroup grant and recreate:"
+  echo "       docker compose -f docker/compose.yaml -f docker/compose.multi.yaml up -d"
+  echo "     single installs need nothing (this stays a warning)."
+fi
 
 check "runner API auth" api -H "Authorization: Bearer ${TOKEN}" "${API}/v1/apps"
 # Opt-out release check (SPEC, update check): on/off plus the newest release

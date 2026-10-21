@@ -306,8 +306,8 @@ impl AppDomain {
     }
 }
 
-/// An app's own edge rate limits (requests per minute). `None` takes the
-/// platform default, `Some(0)` turns the limit off.
+/// An app's own edge rate limits (requests per minute) and fleet memory cap.
+/// `None` takes the platform default, `Some(0)` turns the rate limit off.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct AppLimit {
@@ -316,6 +316,8 @@ pub struct AppLimit {
     pub client_rpm: Option<i64>,
     /// Across every client.
     pub app_rpm: Option<i64>,
+    /// Fleet `memory.max` in MiB (`None` = `RUNNER_FLEET_MEMORY_MB`).
+    pub memory_mb: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]

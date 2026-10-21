@@ -3,4 +3,4 @@
 /**
  * The platform defaults an app's limits fall back to.
  */
-export type LimitDefaults = { clientRpm: number, appRpm: number, };
+export type LimitDefaults = { clientRpm: number, appRpm: number, memoryMb: number, };

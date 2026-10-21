@@ -27,6 +27,14 @@ services:
     # worktrees over, and the nft egress policy. Without them the runner
     # serves single-tenant only (NOITE_TENANCY=multi refuses to start builds).
     cap_add: [NET_ADMIN, SETUID, SETGID, CHOWN]
+    # Per-fleet cgroups (SPEC, Tenant isolation): the runner anchors fleet
+    # sub-cgroups under its own cgroup, which needs a writable cgroupfs mount
+    # (cgroup v2, delegated `memory`/`pids`). Privileged is the one compose
+    # key that provides it on both Docker and rootless Podman while keeping
+    # the private cgroup namespace. Without it the runner logs why, fleets
+    # share the container cgroup as before, and `multi` stays at 503 until an
+    # operator grants it (or drops to `single`).
+    privileged: true
     environment:
       RUST_LOG: ${RUST_LOG:-noite_runner=info,tower_http=info}
       BASE_DOMAIN: ${BASE_DOMAIN:-noite.localhost}
@@ -87,6 +95,10 @@ services:
       NOITE_STOP_BUDGET_MS: ${NOITE_STOP_BUDGET_MS:-25000}
       RUNNER_MAX_APPS_PER_USER: ${RUNNER_MAX_APPS_PER_USER:-10}
       RUNNER_FLEET_MAX_RSS_MB: ${RUNNER_FLEET_MAX_RSS_MB:-0}
+      # Per-fleet memory cap in MiB (SPEC, Tenant isolation): each tenant
+      # fleet's own cgroup `memory.max`. Needs the writable cgroupfs mount
+      # (`privileged` above); without it fleets share the container cgroup.
+      RUNNER_FLEET_MEMORY_MB: ${RUNNER_FLEET_MEMORY_MB:-512}
       RUNNER_FLEET_IDLE_EVICT_S: ${RUNNER_FLEET_IDLE_EVICT_S:-120}
       RUNNER_FLEET_LOG: ${RUNNER_FLEET_LOG:-error,celld=warn}
       RUNNER_BUILD_MAX_MB: ${RUNNER_BUILD_MAX_MB:-2048}

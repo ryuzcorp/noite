@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import type { APIRequestContext } from "@playwright/test";
 
 import {
   appListenPort,
@@ -61,6 +62,28 @@ const expectReleaseProbes = (probes: Record<string, Probe>): void => {
       expect(probe.ok, `release probe ${name} must hold: ${probe.detail}`).toBe(
         true
       );
+// Per-fleet cgroups are the inverse probe: containment holds when every live
+// fleet carries a positive `memory.max`, read by the sandboxed build itself
+// from the shared anchor — and the runner agrees on `/ready`.
+const assertFleetCgroups = async (
+  request: APIRequestContext,
+  report: ProbeReport
+): Promise<void> => {
+  const cgroup = report.build.probes["cgroup:fleet-memory-max"];
+  expect(cgroup, "build probe cgroup:fleet-memory-max present").toBeDefined();
+  expect(cgroup?.ok, `per-fleet cgroups missing: ${cgroup?.detail ?? ""}`).toBe(
+    true
+  );
+
+  const ready = await runnerApi<{ cgroups?: { active?: boolean } }>(
+    request,
+    "/ready"
+  );
+
+  expect(ready.cgroups?.active, "runner reports per-fleet cgroups active").toBe(
+    true
+  );
+};
 
       continue;
     }
@@ -146,10 +169,16 @@ test(
     const report = (await res.json()) as ProbeReport;
 
     for (const [name, probe] of Object.entries(report.build.probes)) {
+      if (name === "cgroup:fleet-memory-max") {
+        continue;
+      }
+
       expect(probe.ok, `build probe ${name} leaked: ${probe.detail}`).toBe(
         false
       );
     }
+
+    await assertFleetCgroups(request, report);
 
     // The cross-build probe only proves isolation if a sibling app's build
     // cache actually existed to probe. The neighbour above deploys first, so

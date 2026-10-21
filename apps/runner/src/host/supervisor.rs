@@ -153,6 +153,12 @@ pub async fn stop_fleet(procs: &ProcMap, slug: &str, grace: StopGrace) {
     if let Some(pid) = pid {
         sigkill_tree(pid);
     }
+    // A stopped fleet leaves its cgroup behind only when a member outlived
+    // the kill: an empty group removes, a live one is reused by the next
+    // spawn (which rewrites the limits). Best-effort either way.
+    if let Some(dir) = crate::host::cgroups::fleet_cgroup_path(slug) {
+        crate::host::cgroups::remove_fleet_cgroup(&dir);
+    }
     tracing::info!(slug, "stopped celld");
 }
 
@@ -239,6 +245,26 @@ struct FleetSpec {
     internal: i64,
     state_dir: std::path::PathBuf,
     env: Vec<(String, String)>,
+    /// Effective per-fleet memory cap in MiB (per-app override, else
+    /// `RUNNER_FLEET_MEMORY_MB`): the cgroup's `memory.max`. `CELLD_MAX_RSS_MB`
+    /// deliberately does not follow it (celld measures container-scale).
+    memory_mb: u32,
+}
+
+/// Effective fleet memory cap: the app's `app_limit.memory_mb` override, or
+/// the platform default. A corrupt row value cannot happen — `limits.set`
+/// refuses it — so a defensive fallback keeps the type.
+async fn fleet_memory_mb(pool: &SqlitePool, cfg: &Config, app_id: &str) -> u32 {
+    match db::get_app_limit(pool, app_id).await {
+        Ok(limit) => limit
+            .memory_mb
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(cfg.fleet_memory_mb),
+        Err(e) => {
+            tracing::warn!(app_id, error = %e, "could not read app limits; using platform fleet memory");
+            cfg.fleet_memory_mb
+        }
+    }
 }
 
 /// App fleet: celld on the app's bucket and ports (SPEC, Fleet lifecycle).
@@ -262,6 +288,7 @@ pub async fn ensure_fleet(
             .join(&app.slug),
         env: db::tenant_env(pool, &app.id).await,
         scope: crate::host::credentials::Scope::app(app),
+        memory_mb: fleet_memory_mb(pool, cfg, &app.id).await,
     };
     ensure_spawned(pool, cfg, procs, logs, spec).await
 }
@@ -299,6 +326,7 @@ pub async fn ensure_environment_fleet(
         state_dir,
         env: db::environment_tenant_env(pool, &env.app_id, &env.id).await,
         scope: crate::host::credentials::Scope::environment(env),
+        memory_mb: fleet_memory_mb(pool, cfg, &env.app_id).await,
     };
     ensure_spawned(pool, cfg, procs, logs, spec).await
 }
@@ -422,10 +450,32 @@ async fn ensure_spawned(
     for (key, value) in crate::host::metrics::otel_env(cfg) {
         cmd.env(key, value);
     }
+    // Per-fleet containment (SPEC, Tenant isolation): while cgroups are
+    // active the fleet gets its own group with the effective memory cap; the
+    // kernel OOM-kills overgrowth inside that group (contained, and the
+    // supervisor restarts the fleet) instead of every fleet shedding.
+    //
+    // `CELLD_MAX_RSS_MB` deliberately does NOT follow the per-fleet cap:
+    // celld measures the greater of its own RSS and the *container-scale*
+    // cgroup working set (through the private-ns cgroupfs root, not the
+    // fleet leaf), so a per-fleet value closes every fleet's ready gate as
+    // soon as the container as a whole passes it — the exact incident that
+    // retired the old 512 default, replayed in the isolation lane
+    // (2026-10-21: `CELLD_MAX_RSS_MB=512` per fleet, trivial fleets never
+    // healthy while builds ran). The explicit knob keeps its container-wide
+    // shed meaning; unset stays celld's default (80% of the container).
+    let fleet_cgroup = crate::host::cgroups::anchor().and_then(|anchor| {
+        match crate::host::cgroups::ensure_fleet_cgroup(&anchor, &key, u64::from(spec.memory_mb)) {
+            Ok(dir) => Some(dir),
+            Err(e) => {
+                tracing::warn!(fleet = %key, error = %e, "fleet cgroup unavailable; shared cgroup");
+                None
+            }
+        }
+    });
     if cfg.fleet_max_rss_mb > 0 {
         cmd.env("CELLD_MAX_RSS_MB", cfg.fleet_max_rss_mb.to_string());
     }
-    #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         if let Some(uid) = cfg.fleet_uid {
@@ -447,6 +497,19 @@ async fn ensure_spawned(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
+    // Move the fleet into its group at once: between spawn and this write a
+    // sliver of startup memory is charged to the shared cgroup instead —
+    // negligible next to the fleet's lifetime, and documented, not hidden.
+    if let Some(dir) = &fleet_cgroup {
+        match child.id() {
+            Some(pid) => {
+                if let Err(e) = crate::host::cgroups::enter_cgroup(dir, pid) {
+                    tracing::warn!(fleet = %key, pid, error = %e, "fleet left in the shared cgroup");
+                }
+            }
+            None => tracing::warn!(fleet = %key, "fleet exited before its cgroup move"),
+        }
+    }
 
     // Capture the fleet's stdout+stderr into the shared per-fleet log buffer
     // (was Stdio::inherit, which lost it to the runner's console).
@@ -472,7 +535,7 @@ async fn ensure_spawned(
     }
 
     procs.lock().await.insert(key.clone(), child);
-    tracing::info!(fleet = %key, listen = spec.listen, internal = spec.internal, "started celld");
+    tracing::info!(fleet = %key, listen = spec.listen, internal = spec.internal, memory_mb = spec.memory_mb, cgroup = fleet_cgroup.is_some(), "started celld");
     Ok(())
 }
 

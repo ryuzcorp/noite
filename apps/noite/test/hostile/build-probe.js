@@ -160,6 +160,52 @@ deny("read:sibling-build-cache", () => {
   throw new Error(`siblings=${seen.length} readable=0`);
 });
 
+// Per-fleet cgroups: the inverse of the probes above — containment holds
+// when the fleet groups are visible with a positive `memory.max`. The build
+// runs in the runner's leaf (`.../noite/runner`), so the anchor is its
+// parent; every sibling entry is a live tenant fleet. Throws (ok: false)
+// when cgroups are inactive (no anchor) or a fleet runs uncapped.
+try {
+  const selfLine = readFileSync("/proc/self/cgroup", "utf-8")
+    .split("\n")
+    .find((line) => line.startsWith("0::"));
+
+  const own = (selfLine ?? "").slice(3) || "/";
+
+  const anchor =
+    own === "/"
+      ? "/sys/fs/cgroup/noite"
+      : `/sys/fs/cgroup${own.replace(/\/runner$/u, "")}`;
+
+  const fleets = readdirSync(anchor).filter((name) => name !== "runner");
+
+  const caps = fleets.map((name) => {
+    const max = Number(
+      readFileSync(`${anchor}/${name}/memory.max`, "utf-8").trim()
+    );
+
+    if (!Number.isInteger(max) || max <= 0) {
+      throw new Error(`${name} uncapped (${max})`);
+    }
+
+    return `${name}=${max}`;
+  });
+
+  if (caps.length === 0) {
+    throw new Error("no sibling fleet group to prove containment");
+  }
+
+  out["cgroup:fleet-memory-max"] = {
+    detail: `fleets=${caps.length} ${caps.slice(0, 3).join(" ")}`,
+    ok: true,
+  };
+} catch (error) {
+  out["cgroup:fleet-memory-max"] = {
+    detail: String(error).slice(0, 200),
+    ok: false,
+  };
+}
+
 mkdirSync("dist", { recursive: true });
 
 // Placeholder for the Worker import: in multi-tenant mode without scoped

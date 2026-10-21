@@ -51,12 +51,17 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
             failing.push(format!("bucket: {detail}"));
         }
     }
-    {
+    // Per-fleet cgroups (SPEC, Tenant isolation): reported on both answers
+    // so `make doctor` and the e2e lane can assert containment is live, not
+    // just "not failing". The failing list above already refuses builds in
+    // multi when cgroups are down.
+    let (cgroups_active, cgroups_detail) = {
         let iso = state.isolation.read().await;
         if iso.blocked {
             failing.push(format!("isolation: {}", iso.detail));
         }
-    }
+        (iso.cgroup_ok, iso.cgroup_detail.clone())
+    };
     // Control fleet #0 (absent in the dev image, where vite dev serves it).
     if std::path::Path::new(&state.config.control_bundle_dir).exists() {
         let healthy = reqwest::Client::new()
@@ -77,15 +82,15 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     }
     let credentials = state.isolation.read().await.credentials.clone();
     let snapshot = state.state_sync.snapshot_status();
+    let body = json!({ "ok": failing.is_empty(), "service": "noite-runner",
+        "cgroups": { "active": cgroups_active, "detail": cgroups_detail },
+        "credentials": credentials,
+        "snapshot": snapshot,
+        "failing": failing });
     if failing.is_empty() {
-        Json(json!({ "ok": true, "service": "noite-runner", "credentials": credentials, "snapshot": snapshot }))
-            .into_response()
+        Json(body).into_response()
     } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "ok": false, "failing": failing, "credentials": credentials, "snapshot": snapshot })),
-        )
-            .into_response()
+        (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
     }
 }
 

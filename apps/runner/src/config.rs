@@ -476,6 +476,20 @@ pub struct Config {
     /// such as 512 closes every fleet's admission as soon as the container
     /// as a whole passes it.
     pub fleet_max_rss_mb: u32,
+    /// Per-fleet memory cap in MiB (`RUNNER_FLEET_MEMORY_MB`, 512): each
+    /// tenant fleet runs in its own cgroup v2 child with this `memory.max`,
+    /// so one fleet's growth is OOM-killed inside its own group — contained,
+    /// and the supervisor restarts it — instead of pushing every fleet toward
+    /// the shared shed threshold (SPEC, Tenant isolation). An app's
+    /// `app_limit.memory_mb` overrides it. `CELLD_MAX_RSS_MB` deliberately
+    /// does not follow it: celld measures container-scale working set, so a
+    /// per-fleet value would close every fleet's ready gate.
+    pub fleet_memory_mb: u32,
+    /// Cgroup v2 mount the runner manages fleet groups under
+    /// (`RUNNER_CGROUP_ROOT`, `/sys/fs/cgroup`). Tests point it at a tempdir
+    /// fake; operators leave it alone unless the container mounts cgroupfs
+    /// elsewhere.
+    pub cgroup_root: std::path::PathBuf,
     /// celld's own log filter for tenant fleets (`RUNNER_FLEET_LOG`). The
     /// runner's RUST_LOG describes the runner's modules, so inheriting it left
     /// a fleet's runtime logs out of the per-app log view entirely.
@@ -679,6 +693,16 @@ impl Config {
                 "a non-negative integer",
                 &mut env_problems,
             ),
+            fleet_memory_mb: env_num(
+                "RUNNER_FLEET_MEMORY_MB",
+                512,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            cgroup_root: std::path::PathBuf::from(env_or(
+                &["RUNNER_CGROUP_ROOT"],
+                "/sys/fs/cgroup",
+            )),
             fleet_log: env_or(&["RUNNER_FLEET_LOG"], "error,celld=warn"),
             fleet_idle_evict_s: env_num(
                 "RUNNER_FLEET_IDLE_EVICT_S",
@@ -1074,6 +1098,8 @@ pub(crate) fn config_for_tests() -> Config {
         max_environments: 25,
         environment_ttl_h: 168,
         fleet_max_rss_mb: 0,
+        fleet_memory_mb: 512,
+        cgroup_root: std::path::PathBuf::from("/sys/fs/cgroup"),
         fleet_idle_evict_s: 120,
         fleet_deploy_poll_s: 300,
         sleep_after_h: 24,
