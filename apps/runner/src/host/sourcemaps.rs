@@ -195,6 +195,12 @@ pub fn frame_asset_path(location: &str) -> Option<String> {
 /// for client frames.
 fn map_for_frame<'a>(manifest: &'a MapManifest, location: &str) -> Option<&'a str> {
     let (file, _, _) = split_frame_location(location)?;
+    // Runtime frames never map to app code. Every other frame maps
+    // regardless of the stored `in_app` flag: browser SDK frames arrive
+    // without it, and the flag only dims display.
+    if super::errors::is_internal(file) {
+        return None;
+    }
     if is_worker_bundle_file(file) {
         return manifest.worker.as_deref();
     }
@@ -223,7 +229,7 @@ pub fn symbolicate_with(
     let mut mapped = 0;
     let mut loaded: HashMap<&str, Option<Arc<sourcemap::SourceMap>>> = HashMap::new();
     for frame in frames.iter_mut() {
-        if !frame.in_app || frame.mapped_location.is_some() {
+        if frame.mapped_location.is_some() {
             continue;
         }
         let Some(rel) = map_for_frame(manifest, &frame.location) else {
@@ -269,9 +275,6 @@ pub async fn symbolicate_frames(
     frames: &mut [Frame],
 ) {
     if sha.is_empty() || !is_key_sha(sha) {
-        return;
-    }
-    if frames.iter().all(|f| !f.in_app) {
         return;
     }
     let Some(manifest) = cache.manifest(cfg, prefix, sha).await else {
@@ -1082,15 +1085,40 @@ mod tests {
         let mut frames = vec![
             frame_at("worker.js:99:99"),
             Frame {
-                in_app: false,
+                location: "node:fs:1:1".to_string(),
                 ..frame_at("worker.js:21:27")
             },
         ];
         assert_eq!(symbolicate_with(&mut frames, &manifest, &load), 0);
         // No worker map in the manifest: nothing attaches.
         assert!(frames[0].mapped_location.is_none());
-        // Non-app frames never map.
+        // Runtime frames never map, whatever their stored flag.
         assert!(frames[1].mapped_location.is_none());
+    }
+
+    #[test]
+    fn symbolication_maps_browser_frames_without_the_in_app_flag() {
+        // Stock browser SDKs send no `in_app` flag; the frames still resolve
+        // through the asset maps by location alone.
+        let manifest = MapManifest {
+            worker: None,
+            files: HashMap::from([(
+                "client/assets/app.js".to_string(),
+                "client/client/assets/app.js.map".to_string(),
+            )]),
+        };
+        let sm = built_map(&[((0, 522), ("src/client.ts", 12, 4), Some("boom"))]);
+        let load = |_: &str| Some(Arc::new(sm.clone()));
+        let mut frames = vec![Frame {
+            in_app: false,
+            ..frame_at("https://app.example/assets/app.js:1:523")
+        }];
+        assert_eq!(symbolicate_with(&mut frames, &manifest, &load), 1);
+        assert_eq!(
+            frames[0].mapped_location.as_deref(),
+            Some("src/client.ts:13:5")
+        );
+        assert_eq!(frames[0].mapped_function.as_deref(), Some("boom"));
     }
 
     #[test]

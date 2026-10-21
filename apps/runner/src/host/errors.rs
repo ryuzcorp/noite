@@ -119,7 +119,11 @@ fn split_header(head: &str) -> (String, String) {
     ("Error".to_string(), head.to_string())
 }
 
-fn is_internal(location: &str) -> bool {
+/// Runtime frames that never map to app code (shared with the read-time
+/// symbolication in `host::sourcemaps`, which skips these but maps every
+/// other frame regardless of the stored `in_app` flag — browser SDK frames
+/// arrive without it).
+pub(crate) fn is_internal(location: &str) -> bool {
     location.is_empty()
         || location.starts_with("<anonymous>")
         || location.starts_with("node:")

@@ -265,13 +265,16 @@ const ErrorList = ({
 
 const FrameLine = ({ frame }: { frame: RunnerErrorFrame }) => {
   const mapped = frame.mappedLocation ?? null;
+  // A mapped frame is app code even when the SDK sent no `in_app` flag
+  // (stock browser SDKs don't), so it renders full-strength.
+  const inApp = frame.inApp || mapped !== null;
 
   return (
     <li
-      class={`flex flex-col gap-0 px-3 py-1 font-mono text-xs ${frame.inApp ? "" : "opacity-50"}`}
+      class={`flex flex-col gap-0 px-3 py-1 font-mono text-xs ${inApp ? "" : "opacity-50"}`}
     >
       <span class="flex flex-wrap gap-x-2">
-        <span class={frame.inApp ? "font-semibold" : ""}>
+        <span class={inApp ? "font-semibold" : ""}>
           {(mapped ? frame.mappedFunction || frame.function : frame.function) ||
             "<anonymous>"}
         </span>
