@@ -76,13 +76,14 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
         }
     }
     let credentials = state.isolation.read().await.credentials.clone();
+    let snapshot = state.state_sync.snapshot_status();
     if failing.is_empty() {
-        Json(json!({ "ok": true, "service": "noite-runner", "credentials": credentials }))
+        Json(json!({ "ok": true, "service": "noite-runner", "credentials": credentials, "snapshot": snapshot }))
             .into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "ok": false, "failing": failing, "credentials": credentials })),
+            Json(json!({ "ok": false, "failing": failing, "credentials": credentials, "snapshot": snapshot })),
         )
             .into_response()
     }

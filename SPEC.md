@@ -177,10 +177,10 @@ Code mode's workspace **is a document on the app's pod host**, never code on the
 
 `host/state.rs` makes the volume a cache:
 
-- **Write path:** a task polls `PRAGMA data_version` every 2 s; after a change it waits for 10 s of quiet and at most one upload a minute, then `VACUUM INTO` a temp file and uploads `runner/state/noite.sqlite`. Also on graceful shutdown and on `POST /v1/admin/snapshot`. The loss window on an ungraceful crash is therefore about 70 s of API mutations. Everything else is reconstructible: git mirrors from tip bundles (`host/rehydrate.rs`), fleets from the bucket, telemetry from Parquet.
+- **Write path:** a task polls `PRAGMA data_version` every 2 s; after a change it waits for 5 s of quiet and at most one upload every 15 s, then `VACUUM INTO` a temp file and uploads `runner/state/noite.sqlite.zst` (plus `noite.sqlite.meta.json`). Also on graceful shutdown and on `POST /v1/admin/snapshot`. The loss window on an ungraceful crash is about 22 s of API mutations. `/ready` reports the snapshot status (`snapshot`: still the bucket owner, seconds since the last upload, last upload error); `make doctor` prints it. Everything else is reconstructible: git mirrors from tip bundles (`host/rehydrate.rs`), fleets from the bucket, telemetry from Parquet.
 - **Single writer:** `claim()` writes `runner/state/owner.json` at boot and every upload re-checks it first (`still_owner`), so a replaced runner stops uploading instead of overwriting its successor. This is a fence rather than an `If-Match` conditional write because not every S3 store supports those.
 - **Boot path:** if the local database is missing, download the snapshot into `.restoring` and rename it into place before `db::connect`. Not-found starts fresh; any other error is retried and then **fails the boot**, because an empty database would overwrite the good snapshot. A local file always wins over the bucket (only local state is ever uploaded).
-- Litestream was considered: a smaller loss window for a sidecar and a second config surface. Revisit if operators report lost mutations.
+- Litestream was revisited (alpha.9) and declined: about a 1 s window, but the restore format is a generations layout an older image cannot read and its replication is unfenced, so it fails the non-breaking gate (no new required config, no unreadable data format, no new supervised process). A per-mutation journal of the high-value rows (apps, domains, credentials, environments) is the documented next step if operators report the residual ~22 s window hurting.
 
 ## Shutdown
 
