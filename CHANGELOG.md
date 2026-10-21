@@ -20,6 +20,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`install --pre` installs the newest release again.** It took the first entry of GitHub's release list, which puts the release marked Latest ahead of newer pre-releases, so it installed 0.1.0-alpha.6 instead of 0.1.0-alpha.7. It now picks the most recently published release. `run.sh` is served from noite.now, so the fix applies without a new image.
 - **Status badges stay in sync.** After a deploy, a stop or a sleep, the app header's status and the Deployments tab's Production and environment dots kept the old state (a yellow "Deploying" dot after a finished deploy) while the sidebar moved on, until a reload. An app's pages now follow a live state stream (`/api/apps/:id/state/stream`) and refresh whatever it shows has changed, and the sidebar's app list updates every 2 s instead of every 10 s.
+- **The Ilha + Void template no longer loses early input.** Its todo form and About-page counter were server-rendered in place but worked only once the page's scripts had run. A todo typed and added before that turned into a plain form GET that reloaded the page without adding it, and an early counter click did nothing. Both now stay disabled until the page can handle them. The template is fetched from GitHub when an app is created, so the fix applies without a new image.
 
 ## [0.1.0-alpha.7] - 2026-10-20
 
