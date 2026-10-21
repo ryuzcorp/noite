@@ -8,11 +8,11 @@
 //! `PRAGMA data_version`, which changes whenever *another* connection
 //! commits, so every write counts (REST, RPC, deploys, the reconcile loop),
 //! not just the API calls someone remembered to mark. Once dirty, it waits
-//! 10 s for bursts to settle and uploads at most once a minute:
+//! 5 s for bursts to settle and uploads at most every 15 s:
 //! `VACUUM INTO` a temp file, skip when its hash matches the last upload
 //! (T4.3), else zstd-compress (T4.2) and upload, then `meta`. Only the main
 //! database is snapshotted — metrics.sqlite is attached, not copied (T4.1).
-//! Also on graceful shutdown (2.1). Loss window on a crash: about 70 s of writes.
+//! Also on graceful shutdown (2.1). Loss window on a crash: about 22 s of writes.
 //!
 //! Fencing: the store's conditional writes are not reachable through the aws
 //! CLI we ship, so instead each runner claims `runner/state/owner.json` at
@@ -39,11 +39,23 @@ use crate::host::s3;
 const STATE_KEY: &str = "runner/state/noite.sqlite.zst";
 const META_KEY: &str = "runner/state/noite.sqlite.meta.json";
 const OWNER_KEY: &str = "runner/state/owner.json";
-/// Snapshot cadence: poll data_version every 10 s, wait 10 s for bursts to
-/// settle, upload at most once a minute.
-const POLL: Duration = Duration::from_secs(10);
-const DEBOUNCE: Duration = Duration::from_secs(10);
-const MIN_INTERVAL: Duration = Duration::from_secs(60);
+/// Snapshot cadence: poll data_version every 2 s, wait 5 s for bursts to
+/// settle, upload at most every 15 s. Worst-case loss on an ungraceful crash
+/// is about 22 s of API mutations (2 + 5 + 15); the identical-hash skip
+/// below keeps idle installs at zero uploads.
+const POLL: Duration = Duration::from_secs(2);
+const DEBOUNCE: Duration = Duration::from_secs(5);
+const MIN_INTERVAL: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Debug, serde::Serialize)]
+/// Snapshot health for `/ready` and `make doctor`: whether this runner still
+/// owns the bucket claim, how long ago the last upload finished, and the
+/// last upload error (cleared by the next success).
+pub struct SnapshotStatus {
+    pub owner: bool,
+    pub last_upload_secs_ago: Option<u64>,
+    pub last_error: Option<String>,
+}
 
 #[derive(Clone, Debug)]
 pub struct StateSync {
@@ -62,6 +74,10 @@ pub struct StateSync {
     /// each other's partial bytes. Unique temp names per run (see
     /// `snapshot_tmp_paths`) are the second half of the fix.
     snapshot_lock: Arc<tokio::sync::Mutex<()>>,
+    /// When the last upload finished (wall age for `/ready`).
+    last_upload: Arc<std::sync::Mutex<Option<Instant>>>,
+    /// Last upload failure, cleared by the next success.
+    last_error: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl StateSync {
@@ -73,6 +89,8 @@ impl StateSync {
             owner: Arc::new(AtomicBool::new(true)),
             last_hash: Arc::new(std::sync::Mutex::new(None)),
             snapshot_lock: Arc::new(tokio::sync::Mutex::new(())),
+            last_upload: Arc::new(std::sync::Mutex::new(None)),
+            last_error: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -88,6 +106,21 @@ impl StateSync {
     /// Whether this runner still owns the bucket state (for /ready detail).
     pub fn is_owner(&self) -> bool {
         self.owner.load(Ordering::Relaxed)
+    }
+    /// Snapshot health for `/ready` (additive: never fails the gate).
+    pub fn snapshot_status(&self) -> SnapshotStatus {
+        let last_upload_secs_ago = self
+            .last_upload
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .map(|at| at.elapsed().as_secs());
+        let last_error = self.last_error.lock().ok().and_then(|guard| guard.clone());
+        SnapshotStatus {
+            owner: self.is_owner(),
+            last_upload_secs_ago,
+            last_error,
+        }
     }
 
     /// Claim the bucket state for this runner (boot). Continues the stored
@@ -161,8 +194,16 @@ impl StateSync {
         // is picked up by the next pass instead of being lost.
         self.dirty.store(false, Ordering::Relaxed);
         let result = self.upload_snapshot(pool, cfg).await;
-        if result.is_err() {
-            self.dirty.store(true, Ordering::Relaxed);
+        match &result {
+            Ok(_) => {
+                *self.last_upload.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+                *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+            Err(e) => {
+                self.dirty.store(true, Ordering::Relaxed);
+                let msg: String = format!("{e:#}").chars().take(300).collect();
+                *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+            }
         }
         result
     }
@@ -371,8 +412,8 @@ pub fn spawn_sync_task(sync: StateSync, pool: SqlitePool, cfg: Config) {
                 dirty_since = None;
                 continue;
             }
-            let since = *dirty_since.get_or_insert_with(Instant::now);
-            if since.elapsed() < DEBOUNCE || last_upload.elapsed() < MIN_INTERVAL {
+            let since = dirty_since.get_or_insert_with(Instant::now);
+            if !should_upload(true, Some(*since), last_upload, Instant::now()) {
                 continue;
             }
             match sync.snapshot_now(&pool, &cfg).await {
@@ -386,6 +427,19 @@ pub fn spawn_sync_task(sync: StateSync, pool: SqlitePool, cfg: Config) {
     });
 }
 
+/// Pure upload gate (injected clock, no I/O): dirty, quiet for DEBOUNCE, and
+/// MIN_INTERVAL since the last upload. Unit-tested with explicit Instants.
+fn should_upload(
+    dirty: bool,
+    dirty_since: Option<Instant>,
+    last_upload: Instant,
+    now: Instant,
+) -> bool {
+    dirty
+        && dirty_since.is_some_and(|since| now.duration_since(since) >= DEBOUNCE)
+        && now.duration_since(last_upload) >= MIN_INTERVAL
+}
+
 /// Final snapshot on graceful shutdown (2.1).
 pub async fn final_snapshot(sync: &StateSync, pool: &SqlitePool, cfg: &Config) {
     if let Err(e) = sync.snapshot_now(pool, cfg).await {
@@ -395,8 +449,11 @@ pub async fn final_snapshot(sync: &StateSync, pool: &SqlitePool, cfg: &Config) {
 
 #[cfg(test)]
 mod tests {
-    use super::snapshot_tmp_paths;
+    use super::{should_upload, snapshot_tmp_paths, DEBOUNCE, MIN_INTERVAL};
     use crate::host::s3::is_not_found;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     #[test]
     fn only_a_missing_object_counts_as_no_snapshot() {
@@ -448,5 +505,208 @@ mod tests {
             format!("{err:#}").contains("refusing to claim"),
             "unexpected error: {err:#}"
         );
+    }
+    /// Injected-clock gate: nothing uploads before its time, whatever the
+    /// wall clock says. Pure function on explicit Instants — no sleeps.
+    #[test]
+    fn upload_gate_needs_quiet_and_interval() {
+        let now = Instant::now();
+        let old_upload = now - MIN_INTERVAL;
+        // Clean is never uploaded, however stale the last one is.
+        assert!(!should_upload(false, None, old_upload, now));
+        assert!(!should_upload(false, Some(now - DEBOUNCE), old_upload, now));
+        // Dirty but still settling.
+        assert!(!should_upload(true, Some(now), old_upload, now));
+        // Quiet long enough, but the last upload was just now.
+        assert!(!should_upload(true, Some(now - DEBOUNCE), now, now));
+        // No first observation yet: the tick is still dating the change.
+        assert!(!should_upload(true, None, old_upload, now));
+        // Quiet past the debounce and an old enough last upload: go.
+        assert!(should_upload(true, Some(now - DEBOUNCE), old_upload, now));
+        // Boundaries are inclusive: exactly quiet / exactly due uploads.
+        assert!(should_upload(
+            true,
+            Some(now - DEBOUNCE - std::time::Duration::from_nanos(1)),
+            now - MIN_INTERVAL,
+            now
+        ));
+    }
+
+    /// In-test S3 stand-in: PUTs are stored, GETs serve them back, anything
+    /// else is a missing key. Enough of the store for `claim` + `snapshot_now`
+    /// (owner fence, state upload, meta upload) with no sleeps: the listener
+    /// is bound before the first client call.
+    async fn spawn_state_stub() -> (String, Arc<Mutex<HashMap<String, Vec<u8>>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let store: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind state stub");
+        let endpoint = format!("http://{}", listener.local_addr().expect("stub addr"));
+        let served = store.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let served = served.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let Ok(n) = sock.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        head.extend_from_slice(&buf[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let head_end = head
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|p| p + 4)
+                        .unwrap_or(head.len());
+                    let header = String::from_utf8_lossy(&head[..head_end]).into_owned();
+                    let mut lines = header.lines();
+                    let request = lines.next().unwrap_or_default().to_string();
+                    let mut length = 0usize;
+                    for line in lines {
+                        if let Some(v) = line.strip_prefix("Content-Length:") {
+                            length = v.trim().parse().unwrap_or(0);
+                        }
+                        if let Some(v) = line.strip_prefix("content-length:") {
+                            length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = head[head_end..].to_vec();
+                    while body.len() < length {
+                        let Ok(n) = sock.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(&buf[..n]);
+                    }
+                    let path = request
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .split('?')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    let (status, payload) = if request.starts_with("PUT") {
+                        served.lock().expect("store lock").insert(path, body);
+                        ("HTTP/1.1 200 OK", Vec::new())
+                    } else {
+                        match served.lock().expect("store lock").get(&path).cloned() {
+                            Some(found) => ("HTTP/1.1 200 OK", found),
+                            None => (
+                                "HTTP/1.1 404 Not Found",
+                                b"<?xml version=\"1.0\"?><Error><Code>NoSuchKey</Code></Error>"
+                                    .to_vec(),
+                            ),
+                        }
+                    };
+                    let _ = sock
+                        .write_all(
+                            format!(
+                                "{status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                payload.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    let _ = sock.write_all(&payload).await;
+                });
+            }
+        });
+        (endpoint, store)
+    }
+
+    /// End to end against the stub: claim, upload, identical-skip, status —
+    /// the phases a lane kill test would observe, at unit-test speed.
+    #[tokio::test]
+    async fn snapshot_uploads_and_reports_status() {
+        let dir = std::env::temp_dir().join(format!("noite-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (endpoint, store) = spawn_state_stub().await;
+        let mut cfg = crate::config::config_for_tests();
+        cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        cfg.s3_endpoint = endpoint.clone();
+        cfg.s3_public_endpoint = endpoint;
+        let pool = crate::db::connect(&cfg.database_url)
+            .await
+            .expect("test database");
+        sqlx::query("INSERT INTO app (id, slug, name, status, subdomain, git_prefix, fleet_bucket, created_at, updated_at) VALUES ('a1', 'shop', 'Shop', 'running', 'shop.x', 'git/shop/', 'fleets/shop/', 't', 't')")
+            .execute(&pool)
+            .await
+            .expect("seed app");
+        let sync = super::StateSync::new();
+        sync.claim(&cfg).await.expect("claim against stub");
+        let bytes = sync.snapshot_now(&pool, &cfg).await.expect("snapshot");
+        assert!(bytes > 0, "a seeded database uploads bytes");
+        let status = sync.snapshot_status();
+        assert!(status.owner, "stub answers the fence with our claim");
+        assert!(status.last_upload_secs_ago.is_some());
+        assert!(status.last_error.is_none());
+        // Unchanged bytes upload nothing (T4.3 identical-skip).
+        let skipped = sync.snapshot_now(&pool, &cfg).await.expect("resnapshot");
+        assert_eq!(skipped, 0);
+        // The meta object carries generation 1 with this run's hash.
+        let meta_key = store
+            .lock()
+            .expect("store lock")
+            .keys()
+            .find(|k| k.ends_with("runner/state/noite.sqlite.meta.json"))
+            .cloned()
+            .expect("meta uploaded");
+        let meta: serde_json::Value =
+            serde_json::from_slice(&store.lock().expect("store lock")[&meta_key])
+                .expect("meta is JSON");
+        assert_eq!(meta["generation"], 1);
+        assert!(meta["sha256"].as_str().is_some_and(|h| !h.is_empty()));
+        // The `/ready` + doctor contract: these exact keys.
+        let body = serde_json::to_value(sync.snapshot_status()).expect("status JSON");
+        assert!(body.get("owner").is_some());
+        assert!(body.get("last_upload_secs_ago").is_some());
+        assert!(body.get("last_error").is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A failed upload records the error for `/ready` and stays dirty, so
+    /// the next tick retries instead of dropping the change.
+    #[tokio::test]
+    async fn snapshot_failure_records_status_and_stays_dirty() {
+        let dir = std::env::temp_dir().join(format!("noite-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        cfg.s3_endpoint = "http://127.0.0.1:1".to_string();
+        cfg.s3_public_endpoint = "http://127.0.0.1:1".to_string();
+        let pool = crate::db::connect(&cfg.database_url)
+            .await
+            .expect("test database");
+        let sync = super::StateSync::new();
+        sync.mark_dirty();
+        sync.snapshot_now(&pool, &cfg)
+            .await
+            .expect_err("closed-port store must fail the upload");
+        assert!(
+            sync.is_dirty(),
+            "a failed upload stays dirty for the next tick"
+        );
+        let status = sync.snapshot_status();
+        assert!(status.last_upload_secs_ago.is_none());
+        assert!(
+            status.last_error.is_some_and(|e| !e.is_empty()),
+            "the failure is reported, not swallowed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

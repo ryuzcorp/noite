@@ -64,9 +64,9 @@ Bucket prefixes under the single `NOITE_S3_BUCKET`: `git/` (tip bundles), `fleet
 
 ## Snapshots
 
-The runner snapshots its SQLite into the bucket about once a minute after changes (and on every graceful stop), and restores it on boot when the volume has none, so the bucket alone is enough to rebuild an install: mirrors rehydrate from the tip bundles and fleets from their prefixes. `docker compose down` keeps volumes; `docker compose down -v` deletes them. With your own bucket, delete its objects at the provider.
+The runner snapshots its SQLite into the bucket at most every 15 s once changes settle (and on every graceful stop), and restores it on boot when the volume has none, so the bucket alone is enough to rebuild an install: mirrors rehydrate from the tip bundles and fleets from their prefixes. `docker compose down` keeps volumes; `docker compose down -v` deletes them. With your own bucket, delete its objects at the provider.
 
-The loss window on an ungraceful crash is about 70 s of API mutations. A `claim()` writes `runner/state/owner.json` at boot and every upload re-checks it first, so a replaced runner stops uploading instead of overwriting its successor — a fence rather than a conditional write, because not every S3 store supports those. Boot with an empty volume downloads the snapshot before connecting; any error other than not-found retries and then fails the boot, because an empty database would overwrite the good snapshot.
+The loss window on an ungraceful crash is about 22 s of API mutations. `/ready` reports the snapshot status (`snapshot`: still the bucket owner, seconds since the last upload, last upload error), and `make doctor` prints it. A `claim()` writes `runner/state/owner.json` at boot and every upload re-checks it first, so a replaced runner stops uploading instead of overwriting its successor — a fence rather than a conditional write, because not every S3 store supports those. Boot with an empty volume downloads the snapshot before connecting; any error other than not-found retries and then fails the boot, because an empty database would overwrite the good snapshot.
 
 ## Telemetry
 
