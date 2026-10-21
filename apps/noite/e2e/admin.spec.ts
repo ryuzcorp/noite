@@ -528,10 +528,11 @@ test("ban freezes the session and sign-in; unban restores both", async ({
   await second.goto("/apps");
   await expect(second).toHaveURL(/\/login/u);
 
-  // A fresh passkey sign-in is refused while banned.
+  // A fresh passkey sign-in is refused while banned: better-auth answers
+  // the ban with its own message (not ours — match the stable substring).
   await second.goto("/login");
   await second.getByRole("button", { name: "Sign in with passkey" }).click();
-  await expect(second.getByText("User is banned")).toBeVisible({
+  await expect(second.getByText(/banned from this application/u)).toBeVisible({
     timeout: 30_000,
   });
   await expect(second).toHaveURL(/\/login/u);

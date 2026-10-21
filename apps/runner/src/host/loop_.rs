@@ -144,7 +144,7 @@ async fn reconcile_once(
         .collect();
     for app in &apps {
         if app.desired() == DesiredState::Stopped {
-            supervisor::stop_fleet(procs, &app.slug).await;
+            supervisor::stop_fleet(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
             if app.status != AppStatus::Stopped.as_str() {
                 db::update_app_status(pool, &app.id, AppStatus::Stopped.as_str(), None, None)
                     .await?;

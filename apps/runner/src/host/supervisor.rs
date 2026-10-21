@@ -94,12 +94,35 @@ pub async fn fleet_gone(procs: &ProcMap, key: &str) -> FleetFate {
     }
 }
 
+/// How long a fleet stop waits for graceful exit (SIGTERM) and then for the
+/// SIGKILL reaping before giving up and logging. Deletes use the short grace:
+/// the fleet's data is wiped right after, so waiting out a slow graceful
+/// shutdown only delays the delete past the API caller's own timeout — and a
+/// dropped delete leaves the app half-deleted. Every other stop keeps the
+/// full grace so a healthy fleet always shuts down cleanly.
+#[derive(Debug, Clone, Copy)]
+pub struct StopGrace {
+    kill: Duration,
+    term: Duration,
+}
+
+impl StopGrace {
+    pub const FOR_DELETE: Self = Self {
+        kill: Duration::from_secs(3),
+        term: Duration::from_secs(3),
+    };
+    pub const NORMAL: Self = Self {
+        kill: Duration::from_secs(5),
+        term: Duration::from_secs(15),
+    };
+}
+
 /// Stop one tenant fleet. The docs are explicit: celld shuts down gracefully
 /// on SIGTERM/SIGINT (cancel work, prove durability, release leases, seal
 /// the node log). SIGKILL only as a bounded fallback — delivered to the whole
 /// process group, so an orphaned worker can never keep the fleet's port into
 /// the next spawn.
-pub async fn stop_fleet(procs: &ProcMap, slug: &str) {
+pub async fn stop_fleet(procs: &ProcMap, slug: &str, grace: StopGrace) {
     let mut map = procs.lock().await;
     let Some(mut child) = map.remove(slug) else {
         return;
@@ -112,18 +135,18 @@ pub async fn stop_fleet(procs: &ProcMap, slug: &str) {
     if let Some(pid) = pid {
         sigterm(pid);
     }
-    if tokio::time::timeout(Duration::from_secs(15), child.wait())
+    if tokio::time::timeout(grace.term, child.wait())
         .await
         .is_err()
     {
-        tracing::warn!(slug, "celld did not stop within 15s; killing");
+        tracing::warn!(slug, "celld did not stop in time; killing");
         match pid {
             Some(pid) => sigkill_tree(pid),
             None => {
                 let _ = child.kill().await;
             }
         }
-        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        let _ = tokio::time::timeout(grace.kill, child.wait()).await;
     }
     // Whatever survived — a worker that ignored SIGTERM — must not outlive
     // the stop: reap the whole group, like `run_sandboxed`.
@@ -146,7 +169,7 @@ pub async fn stop_orphan_fleets(pool: &SqlitePool, procs: &ProcMap) {
     for key in running {
         if !fleet_still_wanted(pool, &key).await {
             tracing::warn!(fleet = %key, "stopping fleet with no app/environment row");
-            stop_fleet(procs, &key).await;
+            stop_fleet(procs, &key, StopGrace::NORMAL).await;
         }
     }
 }
@@ -186,12 +209,12 @@ pub fn env_state_dir(cfg: &Config, slug: &str, label: &str) -> std::path::PathBu
 
 /// Stop one environment fleet.
 pub async fn stop_environment_fleet(procs: &ProcMap, slug: &str, label: &str) {
-    stop_fleet(procs, &env_fleet_key(slug, label)).await;
+    stop_fleet(procs, &env_fleet_key(slug, label), StopGrace::NORMAL).await;
 }
 
 /// Stop every environment fleet of one app (`slug.*`): what a delete, a purge
 /// and a rename need before touching the envs/<slug>/ prefix.
-pub async fn stop_environment_fleets(procs: &ProcMap, slug: &str) {
+pub async fn stop_environment_fleets(procs: &ProcMap, slug: &str, grace: StopGrace) {
     let keys: Vec<String> = procs
         .lock()
         .await
@@ -200,7 +223,7 @@ pub async fn stop_environment_fleets(procs: &ProcMap, slug: &str) {
         .cloned()
         .collect();
     for key in keys {
-        stop_fleet(procs, &key).await;
+        stop_fleet(procs, &key, grace).await;
     }
 }
 
@@ -676,7 +699,7 @@ mod tests {
         let procs = new_procs();
         procs.lock().await.insert("probe".into(), child);
 
-        stop_fleet(&procs, "probe").await;
+        stop_fleet(&procs, "probe", StopGrace::NORMAL).await;
 
         assert!(!procs.lock().await.contains_key("probe"));
 
@@ -706,7 +729,7 @@ mod tests {
             let procs = procs.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(300)).await;
-                stop_fleet(&procs, "live").await;
+                stop_fleet(&procs, "live", StopGrace::NORMAL).await;
             })
         };
         assert_eq!(fleet_gone(&procs, "live").await, FleetFate::Removed);

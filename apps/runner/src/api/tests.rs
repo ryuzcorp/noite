@@ -1107,7 +1107,9 @@ async fn a_watched_environment_deploy_waits_for_the_apps_other_deploy() {
     .await
     .expect("queued row");
     // Production holds the app's lock.
-    assert!(crate::host::deploy::claim(&h.state.deploying, &app.id).await);
+    let prod_lock = crate::host::deploy::claim_owned(&h.state.deploying, &app.id)
+        .await
+        .expect("production takes the claim");
     let state = h.state.clone();
     let (task_app, task_id) = (app.clone(), deploy_id.clone());
     let task = tokio::spawn(async move {
@@ -1135,7 +1137,7 @@ async fn a_watched_environment_deploy_waits_for_the_apps_other_deploy() {
     assert!(!waiting.contains("skipped"), "{waiting}");
     // Production ends: the environment's deploy runs (and fails at fetch —
     // there is no bundle here — which is a real attempt, not a skip).
-    crate::host::deploy::release(&h.state.deploying, &app.id).await;
+    drop(prod_lock);
     tokio::time::timeout(std::time::Duration::from_secs(30), task)
         .await
         .expect("deploy ran after the lock freed")
@@ -1170,7 +1172,9 @@ async fn rollback_queues_behind_the_apps_in_flight_deploy() {
     .expect("seed success row");
     // The previous deploy still holds the app's lock: its success row is
     // written, but the tail (health gate, prune) still owns the claim.
-    assert!(crate::host::deploy::claim(&h.state.deploying, &app.id).await);
+    let previous = crate::host::deploy::claim_owned(&h.state.deploying, &app.id)
+        .await
+        .expect("previous deploy takes the claim");
     let prepared = crate::service::deploys::prepare_rollback(&h.state, &app.id, sha)
         .await
         .expect("rollback queues");
@@ -1195,7 +1199,7 @@ async fn rollback_queues_behind_the_apps_in_flight_deploy() {
     assert!(waiting.contains("queued"), "{waiting}");
     // The previous deploy ends: the rollback runs to a real attempt — fetch
     // fails here (no bundle in the stubbed S3) — never a skip.
-    crate::host::deploy::release(&h.state.deploying, &app.id).await;
+    drop(previous);
     tokio::time::timeout(std::time::Duration::from_secs(30), task)
         .await
         .expect("rollback ran after the lock freed")

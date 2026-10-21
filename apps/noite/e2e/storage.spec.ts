@@ -385,6 +385,11 @@ test("tenant D1 rows bulk-delete through the grid selection", async ({
   await expect.poll(pollD1Count(request, appId, "d1-bulk")).toBe(2);
 
   await page.getByRole("searchbox", { name: "Search rows" }).fill("d1-bulk");
+  // The search commits through a 300ms debounce and remounts the grid: the
+  // rows below are already visible on the pre-commit grid, so the committed
+  // query in the URL is the only signal the check is safe — a check on the
+  // old grid is wiped by the remount and "2 selected" never appears.
+  await expect(page).toHaveURL(/q=d1-bulk/u);
   await expect(page.getByRole("row", { name: /d1-bulk-1/u })).toBeVisible();
   await expect(page.getByRole("row", { name: /d1-bulk-2/u })).toBeVisible();
 

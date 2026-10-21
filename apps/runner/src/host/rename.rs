@@ -153,18 +153,17 @@ pub async fn rename_app(
     if !crate::lifecycle::slug_ok(new_slug) {
         anyhow::bail!("invalid slug");
     }
-    if !deploy::claim_wait(deploying, app_id, Duration::from_secs(120)).await {
+    let Some(_claim) = deploy::claim_wait_owned(deploying, app_id, Duration::from_secs(120)).await
+    else {
         anyhow::bail!("deploy in flight; retry rename shortly");
-    }
+    };
     // R-02: pushes hold `push_guard(slug)` across git + S3 + manifest, so the
     // whole move (dirs, both S3 prefixes, row update, re-sweep) runs under
     // both slugs' guards — a push to either slug lands fully before or fully
     // after. Taken after the AppLock (ordering: AppLock → push_guard), in
     // lexical order so opposite renames cannot invert.
     let (_old_push, _new_push) = git_sync.push_guards(&app.slug, new_slug).await;
-    let result = rename_slugged(cfg, pool, procs, logs, &app, new_name, new_slug).await;
-    deploy::release(deploying, app_id).await;
-    result
+    rename_slugged(cfg, pool, procs, logs, &app, new_name, new_slug).await
 }
 
 async fn rename_slugged(
@@ -176,11 +175,11 @@ async fn rename_slugged(
     new_name: &str,
     new_slug: &str,
 ) -> anyhow::Result<App> {
-    supervisor::stop_fleet(procs, &app.slug).await;
+    supervisor::stop_fleet(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
     // Environment fleets are keyed `slug.label`, so the rename has to stop
     // them too; the reconcile loop respawns them under the new key from the
     // updated rows.
-    supervisor::stop_environment_fleets(procs, &app.slug).await;
+    supervisor::stop_environment_fleets(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
     // Same settle as purge: don't move S3 under a dying node.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -279,8 +278,8 @@ async fn rename_slugged(
     // The loop may have respawned the old-slug fleet mid-move (it reads the
     // pre-update row); kill it and re-sweep both prefixes so late writes
     // land under the new slug instead of orphaning under the old one.
-    supervisor::stop_fleet(procs, &app.slug).await;
-    supervisor::stop_environment_fleets(procs, &app.slug).await;
+    supervisor::stop_fleet(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
+    supervisor::stop_environment_fleets(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
     move_s3_prefix(
         cfg,
         &format!("s3://{}/git/{}/", cfg.s3_bucket, app.slug),
