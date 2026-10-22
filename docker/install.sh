@@ -302,6 +302,8 @@ write_config() {
 # Written by install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ). Every variable is
 # documented in docker/compose.yaml and .env.example; apply changes with
 #   cd $NOITE_DIR && docker compose up -d
+# (multi installs add -f compose.yaml -f compose.multi.yaml to every
+# recreating command; the installer does it itself on re-run)
 #
 # BASE_DOMAIN and BETTER_AUTH_URL are fixed once someone registers: passkeys
 # bind to that origin. The RustFS keys guard the bundled bucket's data.

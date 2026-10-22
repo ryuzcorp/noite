@@ -68,10 +68,18 @@ pub fn status() -> (bool, String) {
 /// install-wide status exactly like a failed setup, so `/ready` and doctor
 /// report it and `multi` blocks. One-way until reboot — a kernel refusing
 /// these writes will not start accepting them, and the alternative is a
-/// silently uncapped fleet.
+/// silently uncapped fleet. Entries accumulate per fleet (a crash loop
+/// re-trips the same key once), so concurrent failures all name themselves.
 pub fn note_limit_failed(fleet: &str, reason: String) {
     CGROUPS_OK.store(false, Ordering::Relaxed);
-    self::reason(format!("fleet {fleet}: {reason}"));
+    if let Ok(mut current) = CGROUP_REASON.lock() {
+        if !current.contains(&format!("fleet {fleet}:")) {
+            if !current.is_empty() {
+                current.push_str("; ");
+            }
+            current.push_str(&format!("fleet {fleet}: {reason}"));
+        }
+    }
 }
 
 /// Anchor holding the per-fleet groups (`<anchor>/<fleet key>`), once setup

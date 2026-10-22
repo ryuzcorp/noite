@@ -883,6 +883,12 @@ impl Config {
         if self.telemetry_retention_days < 1 {
             problems.push("RUNNER_TELEMETRY_RETENTION_DAYS must be >= 1".into());
         }
+        // The platform default shares the per-app override's floor: below it
+        // celld cannot boot, so a typo'd `1` refuses loudly instead of
+        // OOM-looping every fleet. 0 disables the cap.
+        if self.fleet_memory_mb != 0 && self.fleet_memory_mb < 64 {
+            problems.push("RUNNER_FLEET_MEMORY_MB must be 0 (no cap) or >= 64".into());
+        }
         if self.otel_flush_ms < 1000 {
             problems.push("RUNNER_OTEL_FLUSH_MS must be >= 1000".into());
         }
@@ -1241,6 +1247,7 @@ mod tests {
         "RUNNER_MAX_ENVIRONMENTS",
         "RUNNER_ENVIRONMENT_TTL_H",
         "RUNNER_FLEET_MAX_RSS_MB",
+        "RUNNER_FLEET_MEMORY_MB",
         "RUNNER_FLEET_IDLE_EVICT_S",
         "RUNNER_FLEET_DEPLOY_POLL_S",
         "RUNNER_SLEEP_AFTER_H",
@@ -1298,6 +1305,23 @@ mod tests {
         });
     }
 
+    #[test]
+    fn fleet_memory_floor_matches_the_per_app_override() {
+        with_env(&[("RUNNER_FLEET_MEMORY_MB", "16")], || {
+            let err = Config::from_env().expect_err("16 MiB must fail boot");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("RUNNER_FLEET_MEMORY_MB"),
+                "names the var: {msg}"
+            );
+        });
+        for ok in ["0", "64"] {
+            with_env(&[("RUNNER_FLEET_MEMORY_MB", ok)], || {
+                let cfg = Config::from_env().expect("floor value must boot");
+                assert_eq!(cfg.fleet_memory_mb.to_string(), ok);
+            });
+        }
+    }
     #[test]
     fn every_malformed_numeric_is_listed_at_once() {
         with_env(

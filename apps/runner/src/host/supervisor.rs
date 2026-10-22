@@ -337,37 +337,42 @@ pub async fn ensure_environment_fleet(
 }
 
 /// An exited fleet whose cgroup counter moved since its own spawn died by
-/// OOM kill at its cap: record the tenant-visible app event and the fleet
-/// log line, then let the restart below respawn it like any other crash.
-/// Anything else (no cgroups, no movement, no baseline) stays quiet here —
-/// the caller still logs and restarts.
-async fn note_possible_oom(pool: &SqlitePool, logs: &LogState, spec: &FleetSpec) {
-    let Some(dir) = crate::host::cgroups::fleet_cgroup_path(&spec.key) else {
-        return;
-    };
-    match crate::host::cgroups::oom_kills_since_spawn(&spec.key, &dir) {
-        Some(kills) if kills > 0 => {}
-        _ => return,
+/// OOM kill at its cap: collect the tenant-visible app event detail. Sync
+/// so the caller can run it under the proc-map lock; the log and DB writes
+/// happen after the guard drops. Anything else (no cgroups, no movement, no
+/// baseline) yields nothing — the caller still logs and restarts.
+fn collect_possible_oom(spec: &FleetSpec) -> Option<String> {
+    let dir = crate::host::cgroups::fleet_cgroup_path(&spec.key)?;
+    oom_detail_for(&spec.key, &dir, spec.memory_mb)
+}
+
+/// The `collect_possible_oom` core over an explicit group dir, so tests can
+/// drive it against a fake cgroupfs without the global anchor.
+fn oom_detail_for(key: &str, dir: &std::path::Path, memory_mb: u32) -> Option<String> {
+    if !dir.is_dir() {
+        return None;
     }
-    let detail = format!(
-        "fleet restarted: memory limit {} MiB exceeded (Settings → Limits)",
-        spec.memory_mb
-    );
-    tracing::warn!(fleet = %spec.key, detail = %detail, "fleet OOM-killed at its cap; restarting");
-    logs::append(logs, &spec.key, detail.clone()).await;
-    let _ = db::insert_app_event(
-        pool,
-        &crate::models::new_id(),
-        &spec.app_id,
-        "fleet",
-        "fleet restarted",
-        &detail,
-        "🧠",
-        "{}",
-        "",
-        &crate::models::now_iso(),
-    )
-    .await;
+    match crate::host::cgroups::oom_kills_since_spawn(key, dir) {
+        Some(kills) if kills > 0 => {}
+        _ => return None,
+    }
+    Some(format!(
+        "fleet restarted: memory limit {memory_mb} MiB exceeded (Settings → Limits)"
+    ))
+}
+
+/// Record a fleet's cgroup move outcome: a fleet that missed its group runs
+/// uncapped, so a refused move trips containment (and records no OOM
+/// baseline — there is no group to baseline against). Returns whether the
+/// fleet is contained.
+fn note_moved(key: &str, dir: &std::path::Path, moved: bool) -> bool {
+    if moved {
+        crate::host::cgroups::note_spawned(key, dir);
+        true
+    } else {
+        crate::host::cgroups::note_limit_failed(key, "fleet missed its cgroup".into());
+        false
+    }
 }
 
 /// Spawn (or confirm) one celld fleet, whoever owns it.
@@ -379,23 +384,49 @@ async fn ensure_spawned(
     spec: FleetSpec,
 ) -> anyhow::Result<()> {
     let key = spec.key.clone();
-    {
+    // Consume the OOM baseline and collect the event under the lock; the
+    // log and DB writes happen after the guard drops, never while holding
+    // it. Removal stays in the same critical section as the consume, so a
+    // same-key respawn cannot slip between them and inherit or orphan a
+    // baseline.
+    let oom_detail: Option<String> = {
         let mut map = procs.lock().await;
         if let Some(child) = map.get_mut(&key) {
             match child.try_wait() {
                 Ok(None) => return Ok(()), // still running
                 Ok(Some(status)) => {
-                    note_possible_oom(pool, logs, &spec).await;
+                    let detail = collect_possible_oom(&spec);
                     tracing::warn!(fleet = %key, ?status, "celld exited; restarting");
                     map.remove(&key);
+                    detail
                 }
                 Err(e) => {
-                    note_possible_oom(pool, logs, &spec).await;
+                    let detail = collect_possible_oom(&spec);
                     tracing::warn!(fleet = %key, error = %e, "celld status; restarting");
                     map.remove(&key);
+                    detail
                 }
             }
+        } else {
+            None
         }
+    };
+    if let Some(detail) = oom_detail {
+        tracing::warn!(fleet = %key, detail = %detail, "fleet OOM-killed at its cap; restarting");
+        logs::append(logs, &key, detail.clone()).await;
+        let _ = db::insert_app_event(
+            pool,
+            &crate::models::new_id(),
+            &spec.app_id,
+            "fleet",
+            "fleet restarted",
+            &detail,
+            "🧠",
+            "{}",
+            "",
+            &crate::models::now_iso(),
+        )
+        .await;
     }
 
     let state_dir = spec.state_dir.to_string_lossy().into_owned();
@@ -541,15 +572,26 @@ async fn ensure_spawned(
     // Move the fleet into its group at once: between spawn and this write a
     // sliver of startup memory is charged to the shared cgroup instead —
     // negligible next to the fleet's lifetime, and documented, not hidden.
+    // A fleet that misses its group runs uncapped, so a refused move trips
+    // containment (and records no OOM baseline — there is no group to
+    // baseline against).
+    let mut fleet_cgroup = fleet_cgroup;
     if let Some(dir) = &fleet_cgroup {
-        crate::host::cgroups::note_spawned(&key, dir);
-        match child.id() {
-            Some(pid) => {
-                if let Err(e) = crate::host::cgroups::enter_cgroup(dir, pid) {
+        let moved = match child.id() {
+            Some(pid) => match crate::host::cgroups::enter_cgroup(dir, pid) {
+                Ok(()) => true,
+                Err(e) => {
                     tracing::warn!(fleet = %key, pid, error = %e, "fleet left in the shared cgroup");
+                    false
                 }
+            },
+            None => {
+                tracing::warn!(fleet = %key, "fleet exited before its cgroup move");
+                false
             }
-            None => tracing::warn!(fleet = %key, "fleet exited before its cgroup move"),
+        };
+        if !note_moved(&key, dir, moved) {
+            fleet_cgroup = None;
         }
     }
 
@@ -850,5 +892,80 @@ mod tests {
             panic!("a crashed fleet is Exited, not Removed");
         };
         assert!(why.contains('3'), "{why}");
+    }
+
+    fn fake_fleet_leaf(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "noite-fleet-unit-{name}-{}",
+            crate::models::new_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fake fleet leaf");
+        dir
+    }
+
+    fn fake_oom_events(dir: &std::path::Path, oom_kill: u64) {
+        std::fs::write(
+            dir.join("memory.events"),
+            format!("low 0\nhigh 0\nmax 0\noom 0\noom_kill {oom_kill}\n"),
+        )
+        .expect("fake memory.events");
+    }
+
+    #[test]
+    fn oom_detail_reports_growth_with_the_effective_cap() {
+        let dir = fake_fleet_leaf("detail");
+        let key = format!("detail-{}", crate::models::new_id());
+        fake_oom_events(&dir, 0);
+        crate::host::cgroups::note_spawned(&key, &dir);
+        assert_eq!(oom_detail_for(&key, &dir, 256), None, "no growth, no event");
+        fake_oom_events(&dir, 0);
+        crate::host::cgroups::note_spawned(&key, &dir);
+        fake_oom_events(&dir, 3);
+        assert_eq!(
+            oom_detail_for(&key, &dir, 256),
+            Some("fleet restarted: memory limit 256 MiB exceeded (Settings → Limits)".to_string()),
+            "growth names the cap in force"
+        );
+        assert_eq!(
+            oom_detail_for(&key, &dir, 256),
+            None,
+            "one spawn reports once"
+        );
+    }
+
+    #[test]
+    fn refused_move_trips_containment_and_skips_baseline() {
+        let dir = fake_fleet_leaf("move");
+        let key = format!("move-{}", crate::models::new_id());
+        assert!(
+            !note_moved(&key, &dir, false),
+            "a missed group is not containment"
+        );
+        let (ok, detail) = crate::host::cgroups::status();
+        assert!(!ok, "a refused move trips containment");
+        assert!(
+            detail.contains(&key),
+            "the reason names the fleet: {detail}"
+        );
+        assert_eq!(
+            crate::host::cgroups::oom_kills_since_spawn(&key, &dir),
+            None,
+            "no baseline without a group"
+        );
+    }
+
+    #[test]
+    fn successful_move_records_baseline() {
+        let dir = fake_fleet_leaf("moved");
+        let key = format!("moved-{}", crate::models::new_id());
+        assert!(
+            note_moved(&key, &dir, true),
+            "an entered group is contained"
+        );
+        assert_eq!(
+            crate::host::cgroups::oom_kills_since_spawn(&key, &dir),
+            Some(0),
+            "the spawn baseline exists"
+        );
     }
 }

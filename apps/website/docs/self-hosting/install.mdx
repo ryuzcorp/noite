@@ -120,6 +120,7 @@ NOITE_S3_BUCKET=noite
 
 ```bash
 docker compose up -d --scale rustfs=0
+# multi: docker compose -f compose.yaml -f compose.multi.yaml up -d --scale rustfs=0
 ```
 
 Key requirements: Get/Put/Delete/List on the bucket. The bucket is created if the key allows, otherwise create it first. This works the same for an installer-made `/opt/noite`.

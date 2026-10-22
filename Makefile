@@ -18,6 +18,11 @@ export
 # pi-lens-ignore: shellcheck-14-1073
 # pi-lens-ignore: shellcheck-14-1050
 # pi-lens-ignore: shellcheck-14-1072
+# Multi installs layer the cgroup grant onto every compose invocation the
+# same way production does (single installs need nothing).
+ifeq ("$(NOITE_TENANCY)", "multi")
+COMPOSE += -f docker/compose.multi.yaml
+endif
 
 .PHONY: help up up-prod e2e e2e-isolation dev dev-host logs doctor backup restore down nuke usage
 

@@ -159,8 +159,13 @@ test(
 
     const expected = `fleet restarted: memory limit ${OOM_CAP_MB} MiB exceeded (Settings → Limits)`;
 
-    // The supervisor restarts the fleet like any crash: it serves again.
-    await expect.poll(() => get("/"), { timeout: 120_000 }).toBe(200);
+    // The supervisor restarts the fleet like any crash: it serves again. A
+    // transport error from the restarting fleet is "not serving yet", and
+    // expect.poll only retries a failing matcher — never a throwing
+    // generator — so map it to 0 and keep requiring a real 200.
+    await expect
+      .poll(() => get("/").catch(() => 0), { timeout: 120_000 })
+      .toBe(200);
 
     // The kill recorded the tenant-visible app event naming the cap.
     await expect
@@ -184,6 +189,6 @@ test(
     expect(
       lines.some((line) => line.includes(expected)),
       "fleet log carries the OOM line"
-    );
+    ).toBe(true);
   }
 );

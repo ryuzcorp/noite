@@ -49,7 +49,7 @@ A single server cannot absorb a large flood: the network link fills before any s
 
 1. Add your domain to Cloudflare and create **proxied** (orange cloud) `A`/`AAAA` records for `app`, `api`, `git` and `*` pointing at the server. Cloudflare's free certificate covers one level of subdomains, which is every Noite hostname.
 2. Under **SSL/TLS**, choose **Full (strict)**, and leave **Always Use HTTPS** off. Noite's Caddy gets its certificates through the plain-HTTP challenge, which Cloudflare's redirect would break; Caddy redirects everything else to HTTPS itself.
-3. Add `NOITE_TRUSTED_PROXIES=cloudflare` to `/opt/noite/.env` and apply it: `cd /opt/noite && docker compose up -d`.
+3. Add `NOITE_TRUSTED_PROXIES=cloudflare` to `/opt/noite/.env` and apply it: `cd /opt/noite && docker compose up -d` (`-f compose.yaml -f compose.multi.yaml` added on a multi install).
 4. Let only Cloudflare reach ports 80 and 443. Otherwise an attacker who finds the server's address can skip Cloudflare. Use your hosting provider's firewall (Hetzner, DigitalOcean and most others have one) with [Cloudflare's IP list](https://www.cloudflare.com/ips/). `ufw` is not enough: Docker publishes ports around it.
 
 :::warning
