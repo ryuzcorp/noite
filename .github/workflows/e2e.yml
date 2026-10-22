@@ -200,7 +200,7 @@ jobs:
   # file nothing and pass.
   flakes:
     name: flake issues
-    needs: e2e
+    needs: [plan, e2e]
     if: ${{ !cancelled() && needs.e2e.result != 'skipped' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     permissions:
@@ -215,7 +215,11 @@ jobs:
         with:
           pattern: playwright-report-*
           path: /tmp/e2e-reports
+      # `--lanes`/`--shards` mirror the e2e matrix above and `--rounds` is the
+      # plan's output: a planned cell without a result file fails this job.
       - name: open or update flake issues
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bun .github/scripts/flake-issues.ts --reports /tmp/e2e-reports --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          ROUNDS: ${{ needs.plan.outputs.rounds }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bun .github/scripts/flake-issues.ts --reports /tmp/e2e-reports --run-url "$RUN_URL" --lanes single,multi --rounds "$ROUNDS" --shards 2

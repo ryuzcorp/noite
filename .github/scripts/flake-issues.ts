@@ -41,8 +41,11 @@ interface ReportResult {
   status?: string;
 }
 
+// `status` is Playwright's per-test outcome: `expected` (including a
+// `test.fail()` that failed as declared), `unexpected`, `flaky` or `skipped`.
 interface ReportTest {
   results?: ReportResult[];
+  status?: string;
 }
 
 interface ReportSpec {
@@ -81,10 +84,20 @@ interface OpenIssue {
 }
 
 const usage = (): never => {
-  console.error("usage: flake-issues.ts --reports DIR --run-url URL");
+  console.error(
+    "usage: flake-issues.ts --reports DIR --run-url URL --lanes a,b --rounds '[1,2]' --shards N"
+  );
 
   process.exit(2);
 };
+
+const FLAGS = {
+  "--lanes": "lanes",
+  "--reports": "reports",
+  "--rounds": "rounds",
+  "--run-url": "runUrl",
+  "--shards": "shards",
+} satisfies Record<string, string>;
 
 const parseArgs = (argv: string[]) => {
   const out: Record<string, string> = {};
@@ -93,29 +106,82 @@ const parseArgs = (argv: string[]) => {
     const arg = argv[index];
     const value = argv[index + 1];
 
-    if ((arg === "--reports" || arg === "--run-url") && value !== undefined) {
-      out[arg.slice(2).replace("-", "")] = value;
+    if (arg !== undefined && Object.hasOwn(FLAGS, arg) && value !== undefined) {
+      // SAFETY: `Object.hasOwn` just proved `arg` is a FLAGS key.
+      out[FLAGS[arg as keyof typeof FLAGS]] = value;
       index += 1;
     } else {
       usage();
     }
   }
 
-  const { reports, runurl } = out;
+  const { lanes, reports, rounds, runUrl, shards } = out;
 
-  if (reports === undefined || runurl === undefined) {
-    usage();
+  if (
+    lanes === undefined ||
+    reports === undefined ||
+    rounds === undefined ||
+    runUrl === undefined ||
+    shards === undefined
+  ) {
+    return usage();
   }
 
-  return { reports, runUrl: runurl };
+  // SAFETY: the plan job emits `rounds` as a JSON array of round numbers;
+  // anything else fails the check below instead of shrinking the matrix.
+  const roundList = JSON.parse(rounds) as unknown;
+  const shardCount = Number(shards);
+
+  if (
+    !Array.isArray(roundList) ||
+    !roundList.every((round) => Number.isInteger(round)) ||
+    !Number.isInteger(shardCount) ||
+    shardCount < 1
+  ) {
+    return usage();
+  }
+
+  return {
+    lanes: lanes.split(",").filter((lane) => lane !== ""),
+    reports,
+    // SAFETY: the check above proved an array of integers.
+    rounds: roundList as number[],
+    runUrl,
+    shards: shardCount,
+  };
 };
 
 const gh = (args: string[]): string =>
   execFileSync("gh", args, { encoding: "utf-8" }).trim();
 
+// What a filed test reports: its first failing result's error and status,
+// `flaky` when a retry passed, or an unexpected pass when a `test.fail()`
+// passed (no failing result at all).
+const outcomeOf = (failing: ReportTest): Pick<Failure, "error" | "status"> => {
+  const bad = (failing.results ?? []).find(
+    (result) =>
+      result.status !== undefined && Object.hasOwn(BAD_STATUSES, result.status)
+  );
+
+  if (bad === undefined) {
+    return {
+      error: "(passed, but the test is declared to fail)",
+      status: failing.status === "flaky" ? "flaky" : "unexpected pass",
+    };
+  }
+
+  return {
+    error: bad.error?.message ?? bad.error?.stack ?? "(no error text)",
+    status: failing.status === "flaky" ? "flaky" : (bad.status ?? "failed"),
+  };
+};
+
 // Walk the JSON reporter's suite tree, carrying ancestor titles, and collect
-// every spec with a failed/timedOut/interrupted result.
-const collectFailures = (
+// every spec whose test outcome is `unexpected` or `flaky`. The outcome, not
+// a result status, decides: a `test.fail()` that failed as declared is
+// `expected` (green, never filed), and one that passed is `unexpected` with
+// no failing result (filed as an unexpected pass).
+export const collectFailures = (
   suites: ReportSuite[] | undefined,
   ancestors: string[],
   file: string | undefined,
@@ -129,20 +195,14 @@ const collectFailures = (
     const suiteFile = suite.file ?? file ?? "unknown";
 
     for (const spec of suite.specs ?? []) {
-      const first = (spec.tests ?? [])
-        .flatMap((test) => test.results ?? [])
-        .find(
-          (result) =>
-            result.status !== undefined &&
-            Object.hasOwn(BAD_STATUSES, result.status)
-        );
+      const failing = (spec.tests ?? []).find(
+        (test) => test.status === "unexpected" || test.status === "flaky"
+      );
 
-      if (first !== undefined) {
+      if (failing !== undefined) {
         out.push({
-          error:
-            first.error?.message ?? first.error?.stack ?? "(no error text)",
+          ...outcomeOf(failing),
           file: spec.file ?? suiteFile,
-          status: first.status ?? "failed",
           title: [...titles, spec.title ?? ""]
             .filter((part) => part !== "")
             .join(" › "),
@@ -155,6 +215,25 @@ const collectFailures = (
 
   return out;
 };
+
+// Every planned (lane, round, shard) cell must have uploaded its results: a
+// shard that died before Playwright wrote them (a lane that never booted, a
+// cancelled job) would otherwise shrink the hunt silently.
+export const missingReports = (
+  present: ReadonlySet<string>,
+  lanes: readonly string[],
+  rounds: readonly number[],
+  shards: number
+): string[] =>
+  lanes.flatMap((lane) =>
+    rounds.flatMap((round) =>
+      Array.from({ length: shards }, (_, index) => {
+        const cell = `${lane}-r${round}-s${index + 1}`;
+
+        return present.has(cell) ? [] : [cell];
+      }).flat()
+    )
+  );
 
 const errorSnippet = (error: string): string => {
   const lines = error.split("\n").slice(0, MAX_ERROR_LINES).join("\n");
@@ -194,78 +273,10 @@ const issueBody = (
   ].join("\n");
 };
 
-const main = (): void => {
-  const { reports, runUrl } = parseArgs(process.argv.slice(2));
-
-  const dirs = readdirSync(reports, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .toSorted();
-
-  const bySpec = new Map<string, Occurrence[]>();
-  let filesRead = 0;
-
-  for (const dir of dirs) {
-    const match = REPORT_DIR.exec(dir);
-
-    if (match === null || match.groups === undefined) {
-      continue;
-    }
-
-    const { lane, round, shard } = match.groups;
-    const resultsPath = path.join(reports, dir, "e2e-results.json");
-
-    if (!existsSync(resultsPath)) {
-      console.log(
-        `::warning::no e2e-results.json in ${dir} (lane never ran tests?)`
-      );
-
-      continue;
-    }
-
-    filesRead += 1;
-
-    // SAFETY: the file is the Playwright `json` reporter output the lane just
-    // wrote; every field this script reads is optional and defaulted above,
-    // so an older or newer reporter shape collects fewer failures instead of
-    // crashing (and zero files still fails the job below).
-    const report = JSON.parse(
-      readFileSync(resultsPath, "utf-8")
-    ) as PlaywrightReport;
-
-    for (const failure of collectFailures(report.suites, [], undefined, [])) {
-      // The file suite's own title is the file path, which the key already
-      // carries: `e2e/a.spec.ts › admin › does x`, not the doubled form.
-      const shortTitle = failure.title.startsWith(`${failure.file} › `)
-        ? failure.title.slice(failure.file.length + 3)
-        : failure.title;
-
-      const key = `${failure.file} › ${shortTitle}`.slice(0, MAX_TITLE);
-
-      if (!bySpec.has(key)) {
-        bySpec.set(key, []);
-      }
-
-      const occurrences = bySpec.get(key);
-
-      occurrences?.push({ ...failure, lane, round, shard });
-    }
-  }
-
-  console.log(
-    `read ${filesRead} result file(s), ${bySpec.size} failing spec(s)`
-  );
-
-  if (filesRead === 0) {
-    console.error("no e2e-results.json found: the lanes never ran tests");
-
-    process.exit(1);
-  }
-
-  if (bySpec.size === 0) {
-    return;
-  }
-
+const fileIssues = (
+  bySpec: ReadonlyMap<string, Occurrence[]>,
+  runUrl: string
+): void => {
   try {
     gh([
       "label",
@@ -281,22 +292,21 @@ const main = (): void => {
     // will fail loudly if the label is really missing).
   }
 
-  // SAFETY: `gh issue list --json` always answers an array of issue objects;
-  // a CLI or API change fails this job loudly instead of filing blindly.
-  const open = JSON.parse(
-    gh([
-      "issue",
-      "list",
-      "--label",
-      "flake",
-      "--state",
-      "open",
-      "--json",
-      "number,title",
-      "--limit",
-      "100",
-    ])
-  ) as OpenIssue[];
+  // Every open `flake` issue, paginated (a capped list could miss one and
+  // file a duplicate); titles are matched exactly in memory below. The
+  // issues endpoint also lists pull requests, which never match a title.
+  // SAFETY: `gh api --paginate --slurp` answers an array of pages, each an
+  // array of issue objects; a CLI or API change fails this job loudly.
+  const open = (
+    JSON.parse(
+      gh([
+        "api",
+        "--paginate",
+        "--slurp",
+        "repos/{owner}/{repo}/issues?state=open&labels=flake&per_page=100",
+      ])
+    ) as OpenIssue[][]
+  ).flat();
 
   const tmp = mkdtempSync(path.join(tmpdir(), "flake-"));
 
@@ -346,4 +356,84 @@ const main = (): void => {
   }
 };
 
-main();
+const main = (): void => {
+  const { lanes, reports, rounds, runUrl, shards } = parseArgs(
+    process.argv.slice(2)
+  );
+
+  const dirs = readdirSync(reports, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .toSorted();
+
+  const bySpec = new Map<string, Occurrence[]>();
+  const present = new Set<string>();
+
+  for (const dir of dirs) {
+    const match = REPORT_DIR.exec(dir);
+
+    if (match === null || match.groups === undefined) {
+      continue;
+    }
+
+    const { lane, round, shard } = match.groups;
+    const resultsPath = path.join(reports, dir, "e2e-results.json");
+
+    if (!existsSync(resultsPath)) {
+      continue;
+    }
+
+    present.add(`${lane}-r${round}-s${shard}`);
+
+    // SAFETY: the file is the Playwright `json` reporter output the lane just
+    // wrote; every field this script reads is optional and defaulted above,
+    // so an older or newer reporter shape collects fewer failures instead of
+    // crashing (and zero files still fails the job below).
+    const report = JSON.parse(
+      readFileSync(resultsPath, "utf-8")
+    ) as PlaywrightReport;
+
+    for (const failure of collectFailures(report.suites, [], undefined, [])) {
+      // The file suite's own title is the file path, which the key already
+      // carries: `e2e/a.spec.ts › admin › does x`, not the doubled form.
+      const shortTitle = failure.title.startsWith(`${failure.file} › `)
+        ? failure.title.slice(failure.file.length + 3)
+        : failure.title;
+
+      const key = `${failure.file} › ${shortTitle}`.slice(0, MAX_TITLE);
+
+      if (!bySpec.has(key)) {
+        bySpec.set(key, []);
+      }
+
+      const occurrences = bySpec.get(key);
+
+      occurrences?.push({ ...failure, lane, round, shard });
+    }
+  }
+
+  const missing = missingReports(present, lanes, rounds, shards);
+
+  console.log(
+    `read ${present.size} result file(s), ${bySpec.size} failing spec(s), ${missing.length} missing`
+  );
+
+  if (bySpec.size > 0) {
+    fileIssues(bySpec, runUrl);
+  }
+
+  // Checked after filing, so the failures that did report still land: a
+  // missing cell (a lane that never booted, a shard that died before its
+  // report) fails the hunt loudly instead of passing on partial coverage.
+  if (missing.length > 0) {
+    console.error(
+      `::error::no e2e-results.json for ${missing.join(", ")}: the hunt did not cover the planned matrix`
+    );
+
+    process.exit(1);
+  }
+};
+
+if (import.meta.main) {
+  main();
+}
