@@ -50,6 +50,11 @@ pub async fn run_forever(
     // One cheap SELECT per tick when nothing pends; a failed sweep backs
     // off a minute instead of hammering a struggling store.
     let mut last_cred_sweep: Option<Instant> = None;
+    // Orphan scoped-key reconcile (SPEC, Scoped credentials): the store
+    // listed against the DB, revoking what no row names. `None` runs on
+    // the first tick, then every ten minutes — a full listing on every
+    // tick would hammer the store's IAM.
+    let mut last_orphan_sweep: Option<Instant> = None;
     // Fleets with a running-status confirm in flight (host/sleep.rs): one
     // confirm per transitioning fleet, never blocking the tick.
     let confirming: crate::host::sleep::Confirming =
@@ -87,6 +92,23 @@ pub async fn run_forever(
             let left = crate::host::credentials::sweep(&pool, &cfg).await;
             if left > 0 {
                 tracing::warn!(left, "scoped keys still awaiting revocation");
+            }
+        }
+        if crate::host::credentials::orphan_sweep_due(
+            last_orphan_sweep,
+            Instant::now(),
+            Duration::from_secs(10 * 60),
+        ) {
+            last_orphan_sweep = Some(Instant::now());
+            let report = crate::host::credentials::orphan_sweep(&pool, &cfg).await;
+            if let Some(error) = report.error {
+                tracing::warn!(error = %error, "orphan credential sweep failed");
+            } else if report.revoked > 0 {
+                tracing::info!(
+                    revoked = report.revoked,
+                    listed = report.listed,
+                    "orphan credential sweep"
+                );
             }
         }
         if let Err(e) = reconcile_once(

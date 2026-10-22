@@ -149,6 +149,28 @@ pub async fn delete_scoped_credential(pool: &SqlitePool, handle: &str) -> sqlx::
     Ok(())
 }
 
+/// Every `scoped_credential` handle, live or revoking: the orphan sweep
+/// keeps any listed principal one of these names.
+pub async fn all_scoped_credential_handles(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT handle FROM main.scoped_credential")
+        .fetch_all(pool)
+        .await
+}
+
+/// Whether any `scoped_credential` row names `handle`: the orphan sweep's
+/// per-key re-check under `MUTATE` (see `host::credentials::orphan_sweep`).
+pub async fn scoped_credential_handle_exists(
+    pool: &SqlitePool,
+    handle: &str,
+) -> sqlx::Result<bool> {
+    let found: Option<String> =
+        sqlx::query_scalar("SELECT handle FROM main.scoped_credential WHERE handle = ? LIMIT 1")
+            .bind(handle)
+            .fetch_optional(pool)
+            .await?;
+    Ok(found.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

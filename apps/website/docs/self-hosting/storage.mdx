@@ -18,8 +18,7 @@ Store connection variables (`S3_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCE
 Fleets and release commands hold keys that reach only their own prefix (`fleets/{slug}/`, or `envs/{slug}/{label}/` for a preview environment). `NOITE_CREDENTIAL_PROVIDER` (`auto` default) decides how, per store:
 
 - **Bundled RustFS and MinIO** (`auto`, or `minio` to force): keys are minted through the MinIO-compatible admin API. Nothing to configure.
-- **AWS S3**: set `NOITE_CREDENTIAL_PROVIDER=aws`. The keys above must be IAM-capable (the runner creates one IAM user per app and environment, with an inline prefix policy, and mints an access key for it). Without it, fleets keep the root keys as an explicit `root` mode. Minimal policy for the runner's keys: user administration on the names it mints, plus the data permissions the bucket layout needs:
-
+- **AWS S3**: set `NOITE_CREDENTIAL_PROVIDER=aws`. The keys above must be IAM-capable (the runner creates one IAM user per app and environment, with an inline prefix policy, and mints an access key for it). Every user is stamped with this install's tag — a short hash of the bucket and region shown as `install_tag` in `/ready` — in its name (`noite-<tag>-…`) and its path (`/noite/<tag>/`), so two installs on one AWS account mint different users and never revoke each other's keys. At boot and every ten minutes the runner also reconciles the store against its credential rows (`ListUsers`, paginated): any tagged user under the install's path with no row — a mint whose row never landed — is revoked, so a lost row can no longer leave a live key behind. When a user name collides, the runner reads it back first (`GetUser`) and only clears a user under its own path; anything else fails the mint loudly instead of deleting a foreign user. Without it, fleets keep the root keys as an explicit `root` mode. Minimal policy for the runner's keys: user administration on the names it mints (including `iam:GetUser` for the collision check), plus listing users (IAM allows no narrower resource for this call), plus the data permissions the bucket layout needs:
 ```json
 {
   "Version": "2012-10-17",
@@ -29,6 +28,7 @@ Fleets and release commands hold keys that reach only their own prefix (`fleets/
       "Action": [
         "iam:CreateUser",
         "iam:DeleteUser",
+        "iam:GetUser",
         "iam:PutUserPolicy",
         "iam:DeleteUserPolicy",
         "iam:CreateAccessKey",
@@ -36,6 +36,11 @@ Fleets and release commands hold keys that reach only their own prefix (`fleets/
         "iam:DeleteAccessKey"
       ],
       "Resource": "arn:aws:iam::<account-id>:user/noite-*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["iam:ListUsers"],
+      "Resource": "*"
     },
     {
       "Effect": "Allow",
@@ -53,6 +58,13 @@ Fleets and release commands hold keys that reach only their own prefix (`fleets/
 - **Cloudflare R2**: R2 API tokens scope to buckets, not prefixes, so there are no long-lived prefix-scoped keys. Fleets keep the root keys as an explicit `root` mode; the bucket layout stays one bucket per install. If that is not acceptable for your tenants, move the install to MinIO or S3.
 - **Anything else**: `auto` probes the store for the MinIO admin API once the bucket answers. If it answers, keys are scoped; if not, fleets keep the root keys as an explicit `root` mode, named in the boot log, `/ready` and `make doctor`.
 
+**Install tag and the orphan sweep.** With scoped keys (MinIO/RustFS or AWS), every key this install mints is stamped with its `install_tag`: an 8-hex hash of the store endpoint, bucket and region, shown in `/ready` and `make doctor`. On AWS the tag is in the user's name and path; on MinIO/RustFS it's in the key's policy name. The sweep only ever revokes keys carrying this install's tag and no credential row.
+
+- **One bucket serves one install.** Two installs with the same endpoint, bucket and region get the same tag, so they would revoke each other's rowless keys. They would also fight over `runner/state/`. Give every install its own bucket.
+- **Spelling never re-tags.** Whitespace, case, a trailing slash and the scheme's default port (`:80`, `:443`) are normalized away.
+- **A real endpoint, bucket or region change does re-tag.** Keys minted under the old tag then read as foreign: the sweep never revokes them, and deleting their app still does. Point the install back, or delete them at the store by hand.
+- **Older keys are never swept.** Keys minted before tags existed (alpha.8 and earlier) carry no tag. The sweep never revokes them; deleting an app still revokes its keys. Remove genuine leftovers by hand.
+
 ## Volumes
 
 | Volume | Holds |
@@ -66,7 +78,7 @@ Bucket prefixes under the single `NOITE_S3_BUCKET`: `git/` (tip bundles), `fleet
 
 The runner snapshots its SQLite into the bucket at most every 15 s once changes settle (and on every graceful stop), and restores it on boot when the volume has none, so the bucket alone is enough to rebuild an install: mirrors rehydrate from the tip bundles and fleets from their prefixes. `docker compose down` keeps volumes; `docker compose down -v` deletes them. With your own bucket, delete its objects at the provider.
 
-The loss window on an ungraceful crash is about 22 s of API mutations, as long as uploads succeed. While uploads fail, every change since the last successful upload is at risk. `/ready` reports the snapshot status (`snapshot`: still the bucket owner, seconds since the last upload, last upload error), and `make doctor` prints it. A `claim()` writes `runner/state/owner.json` at boot and every upload re-checks it first, so a replaced runner stops uploading instead of overwriting its successor — a fence rather than a conditional write, because not every S3 store supports those. Boot with an empty volume downloads the snapshot before connecting; any error other than not-found retries and then fails the boot, because an empty database would overwrite the good snapshot.
+The loss window on an ungraceful crash is about 22 s of API mutations, as long as uploads succeed. While uploads fail, every change since the last successful upload is at risk. `/ready` reports the snapshot status (`snapshot`: still the bucket owner, seconds since the last upload, last upload error), and `make doctor` prints it. A `claim()` writes `runner/state/owner.json` at boot and every upload re-checks it first, so a replaced runner stops uploading instead of overwriting its successor — a fence rather than a conditional write, because not every S3 store supports those. Boot with an empty volume downloads the snapshot before connecting; any error other than not-found retries and then fails the boot, because an empty database would overwrite the good snapshot. Restoring an older snapshot revokes keys minted after it: their credential rows are gone, so the next orphan sweep treats those live fleet keys as orphans and deletes them — restart fleets after a restore (or expect one revoke-and-re-mint cycle).
 
 ## Telemetry
 

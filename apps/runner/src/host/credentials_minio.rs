@@ -19,13 +19,17 @@ use super::{sigv4_now, CredentialProvider, MintedKey, SigV4, StoreAccess};
 pub struct MinioAdmin {
     store: StoreAccess,
     label: &'static str,
+    tag: String,
     client: reqwest::Client,
 }
 
 impl MinioAdmin {
-    /// The bundled image's own store.
-    pub fn rustfs(store: StoreAccess) -> Self {
+    /// The bundled image's own store. `bucket` feeds the install tag (see
+    /// [`super::install_tag`]): the tag must survive DB loss, so it derives
+    /// from the configured store, never from a row.
+    pub fn rustfs(store: StoreAccess, bucket: &str) -> Self {
         Self {
+            tag: super::install_tag(&store.endpoint, bucket, &store.region),
             store,
             label: "rustfs",
             client: reqwest::Client::new(),
@@ -33,12 +37,21 @@ impl MinioAdmin {
     }
 
     /// Any other MinIO-family store (MinIO itself, another RustFS).
-    pub fn minio(store: StoreAccess) -> Self {
+    pub fn minio(store: StoreAccess, bucket: &str) -> Self {
         Self {
+            tag: super::install_tag(&store.endpoint, bucket, &store.region),
             store,
             label: "minio",
             client: reqwest::Client::new(),
         }
+    }
+
+    /// The canned policy a minted key's permissions live under: per key and
+    /// per install, so the sweep can require it back. Keys minted before
+    /// tags used `noite-<handle>` (no tag); [`CredentialProvider::revoke`]
+    /// deletes both names so old-format revokes keep working.
+    fn policy_name(&self, handle: &str) -> String {
+        format!("noite-{}-{}", self.tag, sanitize(handle))
     }
 
     fn host(&self) -> String {
@@ -163,6 +176,10 @@ impl CredentialProvider for MinioAdmin {
         self.label
     }
 
+    fn install_tag(&self) -> &str {
+        &self.tag
+    }
+
     fn mint<'a>(
         &'a self,
         bucket: &'a str,
@@ -171,10 +188,11 @@ impl CredentialProvider for MinioAdmin {
         Box::pin(async move {
             let access_key = format!("noite{}", super::random_key(15));
             let secret_key = super::random_key(40);
-            // The policy is named per key, not per prefix: revoke only knows
-            // the handle (the access key), so the name it deletes must be
-            // derivable from the key alone.
-            let policy_name = format!("noite-{}", sanitize(&access_key));
+            // The policy is named per key and per install, not per prefix:
+            // revoke only knows the handle (the access key), so the name it
+            // deletes must be derivable from the key alone, and the sweep
+            // requires the tag back to tell installs apart.
+            let policy_name = self.policy_name(&access_key);
             // The request body is JSON the API encrypts (madmin `SetUserReq`):
             // the raw secret alone is refused with "failed to decrypt".
             let user_body = serde_json::json!({
@@ -226,7 +244,6 @@ impl CredentialProvider for MinioAdmin {
             })
         })
     }
-
     fn revoke<'a>(&'a self, handle: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             // Best effort on both halves: a half-minted key (user without
@@ -243,21 +260,88 @@ impl CredentialProvider for MinioAdmin {
             if status != 200 && !is_no_such(status, &body) {
                 return Err(Self::fail(status, &body, "remove-user"));
             }
-            let policy_name = format!("noite-{}", sanitize(handle));
-            let (status, body) = self
-                .call(
-                    "DELETE",
-                    "/minio/admin/v3/remove-canned-policy",
-                    &format!("name={policy_name}"),
-                    b"",
-                )
-                .await?;
-            if status != 200 && !is_no_such(status, &body) {
-                return Err(Self::fail(status, &body, "remove-canned-policy"));
+            // The tagged name first, then the pre-tag legacy name
+            // (`noite-<handle>`): revoke by handle must keep working for
+            // keys minted before tags, policy leak included.
+            for policy_name in [
+                self.policy_name(handle),
+                format!("noite-{}", sanitize(handle)),
+            ] {
+                let (status, body) = self
+                    .call(
+                        "DELETE",
+                        "/minio/admin/v3/remove-canned-policy",
+                        &format!("name={policy_name}"),
+                        b"",
+                    )
+                    .await?;
+                if status != 200 && !is_no_such(status, &body) {
+                    return Err(Self::fail(status, &body, "remove-canned-policy"));
+                }
             }
             Ok(())
         })
     }
+
+    fn manages(&self, handle: &str) -> bool {
+        is_managed_key(handle) && handle != self.store.access_key
+    }
+
+    fn list_managed<'a>(&'a self) -> BoxFuture<'a, anyhow::Result<Vec<String>>> {
+        Box::pin(async move {
+            let (status, body) = self
+                .call("GET", "/minio/admin/v3/list-users", "", b"")
+                .await?;
+            if status != 200 {
+                return Err(Self::fail(status, &body, "list-users"));
+            }
+            // The answer carries secret keys, so the store seals it under
+            // our own secret (same framing as `encrypt_admin_payload`).
+            let plain = decrypt_admin_payload(&self.store.secret_key, &body)?;
+            // The plaintext is a bare `{accessKey: {...}}` map; accept a
+            // `{"users": ...}` wrapper too rather than fail the sweep on
+            // shape. A key counts as managed only when it has this
+            // install's shape AND the map value names exactly the policy
+            // minting attaches: a shape-matching key with `consoleAdmin`
+            // (or another install's tagged policy) is never listed. Array
+            // items carry no policy proof and are skipped for the same
+            // reason.
+            let json: serde_json::Value = serde_json::from_slice(&plain)?;
+            let users = json.get("users").unwrap_or(&json);
+            let mut out = Vec::new();
+            match users {
+                serde_json::Value::Object(map) => {
+                    for (handle, value) in map {
+                        let policy_matches =
+                            value.get("policyName").and_then(serde_json::Value::as_str)
+                                == Some(self.policy_name(handle).as_str());
+                        if self.manages(handle) && policy_matches {
+                            out.push(handle.clone());
+                        }
+                    }
+                }
+                serde_json::Value::Array(_) => {}
+                _ => {
+                    return Err(anyhow::anyhow!("list-users: unexpected shape"));
+                }
+            }
+            Ok(out)
+        })
+    }
+}
+
+/// Whether `handle` names a key this provider could have minted: `noite`
+/// plus the 15 random chars [`super::random_key`] produces (a leading
+/// lowercase letter, then alphanumerics). Anything else — the operator's
+/// root key (`noiteaccess` on bundled installs), foreign users — is never
+/// an orphan this sweep may revoke. The configured root key is excluded
+/// again in [`MinioAdmin::manages`], in case it ever matches the shape.
+fn is_managed_key(handle: &str) -> bool {
+    let bytes = handle.as_bytes();
+    bytes.len() == 20
+        && handle.starts_with("noite")
+        && bytes[5].is_ascii_lowercase()
+        && bytes[6..].iter().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// A missing user or policy is already revoked.
@@ -326,6 +410,86 @@ pub fn encrypt_admin_payload(secret: &str, data: &[u8]) -> anyhow::Result<Vec<u8
     Ok(out)
 }
 
+/// madmin `DecryptData`: inverse of [`encrypt_admin_payload`]. Responses
+/// that carry secrets (`list-users` returns secret keys) arrive in the same
+/// `salt | id | nonce | sio-DARE ciphertext` framing, sealed under a key
+/// derived from the caller's own secret — which is why only the admin key
+/// that listed can read the answer.
+pub fn decrypt_admin_payload(secret: &str, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    // `pkg/madmin/encrypt.go`: the id byte selects the KDF — `0x00` is
+    // Argon2id (what our own seals carry), `0x02` is PBKDF2-HMAC-SHA256
+    // (what RustFS emits; madmin uses it in FIPS mode). The framing is
+    // identical either way, and the GCM open below authenticates the body,
+    // so the byte only selects the key and gates the shape error.
+    if data.len() < 41 + 16 {
+        return Err(anyhow::anyhow!("admin payload: unexpected shape"));
+    }
+    let (salt, rest) = data.split_at(32);
+    let key = admin_seal_key(secret, data[32], salt)?;
+    let nonce: &[u8; 8] = rest[1..9]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("admin payload: unexpected shape"))?;
+    let chunk = &rest[9..];
+    let cipher = Aes256Gcm::new_from_slice(&key)?;
+    // The ad tag is deterministic under the stream nonce, so recompute it
+    // and open the final chunk: a wrong key or a corrupt body fails here.
+    let mut seq0 = [0u8; 12];
+    seq0[..8].copy_from_slice(nonce);
+    let tag = cipher
+        .encrypt(&Nonce::from(seq0), &[][..])
+        .map_err(|_| anyhow::anyhow!("admin payload seal failed"))?;
+    let mut ad = vec![0x80u8];
+    ad.extend_from_slice(&tag);
+    let mut seq1 = [0u8; 12];
+    seq1[..8].copy_from_slice(nonce);
+    seq1[8] = 1;
+    cipher
+        .decrypt(
+            &Nonce::from(seq1),
+            aes_gcm::aead::Payload {
+                msg: chunk,
+                aad: &ad,
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("admin payload: decrypt failed (wrong key?)"))
+}
+
+/// The seal key for a sealed admin payload (`pkg/madmin/encrypt.go`): the
+/// id byte selects the KDF. `0x01` (ChaCha20) has no corresponding setup
+/// here and is refused rather than guessed.
+fn admin_seal_key(secret: &str, id: u8, salt: &[u8]) -> anyhow::Result<[u8; 32]> {
+    match id {
+        0x00 => Ok(argon2_key(secret, salt)),
+        0x02 => Ok(pbkdf2_key(secret, salt)),
+        other => Err(anyhow::anyhow!(
+            "admin payload: unknown seal id {other:#04x}"
+        )),
+    }
+}
+
+/// PBKDF2-HMAC-SHA256 with 8192 iterations (madmin `pbkdf2Cost`), matching
+/// `pbkdf2.Key` for the single block a 32-byte key needs.
+fn pbkdf2_key(secret: &str, salt: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut block = {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
+        mac.update(salt);
+        mac.update(&[0, 0, 0, 1]);
+        mac.finalize().into_bytes()
+    };
+    let mut out = block;
+    for _ in 1..8192 {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
+        mac.update(&block);
+        block = mac.finalize().into_bytes();
+        for (o, b) in out.iter_mut().zip(block.iter()) {
+            *o ^= *b;
+        }
+    }
+    out.into()
+}
+
 fn argon2_key(secret: &str, salt: &[u8]) -> [u8; 32] {
     let mut key = [0u8; 32];
     Argon2::new(
@@ -358,7 +522,7 @@ mod tests {
             serde_json::from_str(&super::super::prefix_policy("noite", "fleets/shop/"))
                 .expect("json");
         let reduced: serde_json::Value = serde_json::from_str(
-            &MinioAdmin::rustfs(stub_store("http://rustfs:9000".into()))
+            &MinioAdmin::rustfs(stub_store("http://rustfs:9000".into()), "noite")
                 .policy("noite", "fleets/shop/"),
         )
         .expect("json");
@@ -408,7 +572,7 @@ mod tests {
     }
 
     fn stub_admin(endpoint: String) -> MinioAdmin {
-        MinioAdmin::minio(stub_store(endpoint))
+        MinioAdmin::minio(stub_store(endpoint), "noite")
     }
 
     /// A store that refuses the keys fails the boot; a store without the
@@ -533,7 +697,7 @@ mod tests {
             access_key: "AK".into(),
             secret_key: "SK".into(),
         };
-        let provider = MinioAdmin::minio(store);
+        let provider = MinioAdmin::minio(store, "noite");
         let minted = provider.mint("noite", "fleets/shop/").await.expect("mint");
         provider.revoke(&minted.handle).await.expect("revoke");
         handle.abort();
@@ -561,6 +725,429 @@ mod tests {
         assert!(
             created_name.contains(&minted.access_key),
             "policy name derives from the key: {created_name}"
+        );
+    }
+
+    /// Only the mint shape counts as managed: the bundled default root key
+    /// (`noiteaccess`) and foreign users are never sweep candidates, while
+    /// the real mint shape round-trips.
+    #[test]
+    fn managed_shape_excludes_root_and_foreign_keys() {
+        assert!(is_managed_key("noitea0123456789ABCD"));
+        assert!(is_managed_key(&format!(
+            "noite{}",
+            super::super::random_key(15)
+        )));
+        assert!(
+            !is_managed_key("noiteaccess"),
+            "the bundled default root key"
+        );
+        assert!(!is_managed_key("minioadmin"));
+        assert!(!is_managed_key("operator-root"));
+        assert!(
+            !is_managed_key("noiteA0123456789ABCD"),
+            "sixth char is lowercase"
+        );
+        assert!(!is_managed_key("noitea0123456789ABC"), "too short");
+        assert!(!is_managed_key("noitea0123456789ABCDE"), "too long");
+        assert!(!is_managed_key("noitea0123456789ABC!"), "not alnum");
+    }
+
+    /// `manages` excludes the configured root key even if it ever matched
+    /// the mint shape: the store's own admin must never be revoked.
+    #[test]
+    fn manages_excludes_the_configured_root_key() {
+        let root = "noitea0123456789ABCD".to_string();
+        let store = StoreAccess {
+            endpoint: "http://rustfs:9000".into(),
+            region: "us-east-1".into(),
+            access_key: root.clone(),
+            secret_key: "secret".into(),
+        };
+        assert!(!MinioAdmin::minio(store, "noite").manages(&root));
+    }
+
+    /// `list-users` answers sealed (it carries secret keys): the stub seals
+    /// like the store. Only keys with this install's shape AND this
+    /// install's attached policy are listed — the operator's root key,
+    /// foreign users, a shape-matching key with `consoleAdmin`, and a
+    /// shape-matching key with the pre-tag legacy policy are never listed —
+    /// while a refused listing is an error (the sweep revokes nothing then).
+    #[tokio::test]
+    async fn list_users_returns_only_managed_keys() {
+        async fn list_stub(
+            status: u16,
+            body: Vec<u8>,
+        ) -> (
+            tokio::task::JoinHandle<()>,
+            String,
+            std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        ) {
+            use std::sync::{Arc, Mutex};
+            let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let body: Arc<Vec<u8>> = Arc::new(body);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind stub");
+            let addr = listener.local_addr().expect("stub addr");
+            let seen_task = seen.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let seen_task = seen_task.clone();
+                    let body = body.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = vec![0u8; 65536];
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        seen_task
+                            .lock()
+                            .expect("calls lock")
+                            .push(req.lines().next().unwrap_or_default().to_string());
+                        let head = format!(
+                            "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(&body).await;
+                    });
+                }
+            });
+            (handle, format!("http://127.0.0.1:{}", addr.port()), seen)
+        }
+        // The tag depends on the stub endpoint, so bind first, then seal a
+        // map whose expected policy embeds this install's tag.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let endpoint = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("addr").port()
+        );
+        let provider = stub_admin(endpoint.clone());
+        let own = "noitea0123456789ABCD";
+        let plain = serde_json::json!({
+            own: {"policyName": provider.policy_name(own), "status": "enabled"},
+            "noiteaccess": {"policyName": "consoleAdmin", "status": "enabled"},
+            "operator-root": {"policyName": "consoleAdmin", "status": "enabled"},
+            "noiteb0123456789ABCD": {"policyName": "consoleAdmin", "status": "enabled"},
+            "noitec0123456789ABCD": {"policyName": "noite-noitec0123456789ABCD", "status": "enabled"},
+        });
+        // The stub seals under the stub secret, like the store seals under
+        // the caller's: `stub_store`'s secret is `SK`.
+        let sealed =
+            encrypt_admin_payload("SK", &serde_json::to_vec(&plain).expect("json")).expect("seal");
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_task = seen.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen_task = seen_task.clone();
+                let sealed = sealed.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 65536];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    seen_task
+                        .lock()
+                        .expect("calls lock")
+                        .push(req.lines().next().unwrap_or_default().to_string());
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        sealed.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&sealed).await;
+                });
+            }
+        });
+        let listed = provider.list_managed().await.expect("list");
+        handle.abort();
+        assert_eq!(
+            listed,
+            vec![own.to_string()],
+            "only the key with this install's policy lists: {listed:?}"
+        );
+        {
+            let seen = seen.lock().expect("calls lock");
+            assert!(
+                seen.iter().any(|l| l.contains("list-users")),
+                "lists through list-users: {seen:?}"
+            );
+        }
+        let (_handle, endpoint, _) = list_stub(403, b"denied".to_vec()).await;
+        let err = stub_admin(endpoint)
+            .list_managed()
+            .await
+            .expect_err("refused listing");
+        assert!(format!("{err:#}").contains("list-users"), "{err:#}");
+    }
+
+    /// Revoke by handle deletes the tagged policy and the pre-tag legacy
+    /// policy: revoke paths keep working for keys minted before tags.
+    #[tokio::test]
+    async fn revoke_by_handle_deletes_the_legacy_policy_too() {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        let seen_task = seen.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen_task = seen_task.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 65536];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let line = req.lines().next().unwrap_or_default().to_string();
+                    let query = line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    seen_task.lock().expect("seen lock").push(query);
+                    let resp = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let provider = stub_admin(format!("http://127.0.0.1:{}", addr.port()));
+        let legacy = "noitea0123456789ABCD";
+        provider.revoke(legacy).await.expect("revoke");
+        handle.abort();
+        let seen = seen.lock().expect("seen lock");
+        assert!(
+            seen.iter()
+                .any(|q| q.contains("remove-user") && q.contains(legacy)),
+            "the user is deleted: {seen:?}"
+        );
+        for policy in [provider.policy_name(legacy), format!("noite-{legacy}")] {
+            assert!(
+                seen.iter()
+                    .any(|q| q.contains("remove-canned-policy") && q.contains(&policy)),
+                "policy {policy} is deleted: {seen:?}"
+            );
+        }
+    }
+
+    /// End to end at the sweep: a stub store shared by two installs (same
+    /// endpoint and keys, different buckets, hence different tags) holds
+    /// this install's live key (row present), this install's orphan (no
+    /// row), the other install's live key, a pre-tag legacy key, and a
+    /// privileged shape-matching key. The sweep revokes exactly the orphan.
+    #[tokio::test]
+    async fn cross_install_sweep_revokes_only_own_orphans() {
+        use crate::config::config_for_tests;
+        use crate::host::credentials::{orphan_sweep, Credentials};
+        use std::sync::Arc;
+        let store = || StoreAccess {
+            endpoint: String::new(),
+            region: "us-east-1".into(),
+            access_key: "AK".into(),
+            secret_key: "SK".into(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let endpoint = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("addr").port()
+        );
+        let mut store_a = store();
+        store_a.endpoint.clone_from(&endpoint);
+        let store_b = store_a.clone();
+        let provider_a = MinioAdmin::minio(store_a, "bucket-a");
+        let provider_b = MinioAdmin::minio(store_b, "bucket-b");
+        assert_ne!(provider_a.install_tag(), provider_b.install_tag());
+        let (own, orphan) = ("noitea0123456789ABCD", "noiteo0123456789ABCD");
+        let (live_b, legacy, privileged) = (
+            "noiteb0123456789ABCD",
+            "noitec0123456789ABCD",
+            "noited0123456789ABCD",
+        );
+        let plain = serde_json::json!({
+            own: {"policyName": provider_a.policy_name(own), "status": "enabled"},
+            orphan: {"policyName": provider_a.policy_name(orphan), "status": "enabled"},
+            live_b: {"policyName": provider_b.policy_name(live_b), "status": "enabled"},
+            legacy: {"policyName": format!("noite-{legacy}"), "status": "enabled"},
+            privileged: {"policyName": "consoleAdmin", "status": "enabled"},
+        });
+        let sealed =
+            encrypt_admin_payload("SK", &serde_json::to_vec(&plain).expect("json")).expect("seal");
+        let removed: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let removed_task = removed.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let removed_task = removed_task.clone();
+                let sealed = sealed.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 65536];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let line = req.lines().next().unwrap_or_default().to_string();
+                    if line.contains("remove-user") {
+                        let key = line
+                            .split("accessKey=")
+                            .nth(1)
+                            .unwrap_or_default()
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or_default()
+                            .to_string();
+                        removed_task.lock().expect("removed lock").push(key);
+                    }
+                    let body: &[u8] = if line.contains("list-users") {
+                        &sealed
+                    } else {
+                        b""
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                });
+            }
+        });
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        sqlx::query(include_str!("../../schema.sql"))
+            .execute(&pool)
+            .await
+            .expect("test schema");
+        // This install's live key has a row; everything else rowless.
+        let (nonce, ciphertext) = (b"nonce12bytes".as_slice(), b"ct".as_slice());
+        crate::db::insert_scoped_credential(
+            &pool,
+            &crate::db::NewScopedCredential {
+                app_id: "app-1",
+                ciphertext,
+                handle: own,
+                nonce,
+                prefix: "fleets/shop/",
+                scope: "app:app-1",
+                store: "test-store",
+            },
+        )
+        .await
+        .expect("row");
+        let mut cfg = config_for_tests();
+        cfg.credentials = Credentials::Scoped(Arc::new(provider_a));
+        let report = orphan_sweep(&pool, &cfg).await;
+        handle.abort();
+        pool.close().await;
+        assert!(
+            report.error.is_none(),
+            "unexpected error: {:?}",
+            report.error
+        );
+        assert_eq!(
+            report.listed, 2,
+            "only this install's keys list: {report:?}"
+        );
+        assert_eq!(report.revoked, 1, "exactly the orphan revokes: {report:?}");
+        assert_eq!(
+            removed.lock().expect("removed lock").as_slice(),
+            &[orphan.to_string()],
+            "the other install's key, the legacy key and the privileged key survive"
+        );
+    }
+
+    /// Seal then open round-trips, and the wrong secret fails to open.
+    #[test]
+    fn admin_payload_seal_open_round_trip() {
+        let sealed = encrypt_admin_payload("secret", b"{\"a\":1}").expect("seal");
+        assert_eq!(
+            decrypt_admin_payload("secret", &sealed).expect("open"),
+            b"{\"a\":1}"
+        );
+        assert!(decrypt_admin_payload("wrong", &sealed).is_err());
+        assert!(decrypt_admin_payload("secret", b"{}").is_err());
+    }
+
+    /// The PBKDF2 leg matches an independent implementation at the exact
+    /// production parameters (HMAC-SHA256, 8192 iterations, 32-byte key;
+    /// cross-checked with Python's `hashlib.pbkdf2_hmac`).
+    #[test]
+    fn pbkdf2_matches_reference_at_production_cost() {
+        let hex = |key: [u8; 32]| super::super::hex_encode(&key);
+        assert_eq!(
+            hex(pbkdf2_key("password", b"salt")),
+            "59ac909f3fe671dd3800be131dec3098461a3582419ce121d149f8cf573b6260"
+        );
+    }
+
+    /// Against real rustfs (the image pin): a minted key shows up in
+    /// `list-users`, and the listing never names the operator's root key.
+    /// Gated like the lifecycle rustfs test: `NOITE_TEST_RUSTFS_ENDPOINT`.
+    #[tokio::test]
+    async fn list_users_names_minted_keys_on_real_rustfs() {
+        let Some(endpoint) = std::env::var("NOITE_TEST_RUSTFS_ENDPOINT")
+            .ok()
+            .filter(|v| !v.is_empty())
+        else {
+            eprintln!("skip: NOITE_TEST_RUSTFS_ENDPOINT unset (CI provides the rustfs service)");
+            return;
+        };
+        let (root_access, root_secret) = match std::env::var("NOITE_TEST_RUSTFS_KEYS").ok() {
+            Some(pair) => {
+                let (a, s) = pair
+                    .split_once(':')
+                    .expect("NOITE_TEST_RUSTFS_KEYS is access:secret");
+                (a.to_string(), s.to_string())
+            }
+            None => (
+                "noiteaccess".to_string(),
+                "noitesecretnoitesecretnoite12".to_string(),
+            ),
+        };
+        let provider = MinioAdmin::rustfs(
+            StoreAccess {
+                endpoint,
+                region: "us-east-1".into(),
+                access_key: root_access.clone(),
+                secret_key: root_secret,
+            },
+            "noite",
+        );
+        let minted = provider
+            .mint("noite", "fleets/orphan-sweep-probe/")
+            .await
+            .expect("mint");
+        let listed = provider.list_managed().await.expect("list");
+        assert!(
+            listed.contains(&minted.access_key),
+            "minted key is listed: {listed:?}"
+        );
+        assert!(
+            !listed.contains(&root_access),
+            "the root key is never a sweep candidate: {listed:?}"
+        );
+        provider.revoke(&minted.handle).await.expect("revoke");
+        let listed = provider.list_managed().await.expect("list again");
+        assert!(
+            !listed.contains(&minted.access_key),
+            "revoked key is gone: {listed:?}"
         );
     }
 }
