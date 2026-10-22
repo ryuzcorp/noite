@@ -112,17 +112,36 @@ install_docker() {
 }
 
 compose() {
-  if [[ "$(env_get NOITE_TENANCY)" == "multi" && -f "$NOITE_DIR/compose.multi.yaml" ]]; then
+  if is_multi_tenancy && [ -f "$NOITE_DIR/compose.multi.yaml" ]; then
     docker compose -f "$NOITE_DIR/compose.yaml" -f "$NOITE_DIR/compose.multi.yaml" "$@"
   else
     docker compose -f "$NOITE_DIR/compose.yaml" "$@"
   fi
 }
 
+# Mirror the runner's parse_tenancy (and docker/lib.sh is_multi_tenancy):
+# explicit NOITE_TENANCY wins (blank = unset); otherwise a localhost-family
+# BASE_DOMAIN means single, anything else means multi. install.sh is fetched
+# standalone via curl, so this duplicates lib.sh instead of sourcing it.
+is_multi_tenancy() {
+  local tenancy base
+  tenancy="$(printf '%s' "$(env_get NOITE_TENANCY)" | tr 'A-Z' 'a-z' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  case "$tenancy" in
+    single) return 1 ;;
+    multi) return 0 ;;
+  esac
+  base="$(env_get BASE_DOMAIN)"
+  base="$(printf '%s' "${base:-localhost}" | tr 'A-Z' 'a-z' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\.*$//')"
+  case "$base" in
+    localhost | *.localhost) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # The `-f` flags an operator must pass to reproduce `compose` above outside
 # the installer (empty on single installs, which get nothing new).
 compose_hint() {
-  if [[ "$(env_get NOITE_TENANCY)" == "multi" ]]; then
+  if is_multi_tenancy; then
     printf '%s' "-f compose.yaml -f compose.multi.yaml"
   fi
 }

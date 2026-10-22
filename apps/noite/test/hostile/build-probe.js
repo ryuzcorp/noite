@@ -4,6 +4,7 @@
 // The deploy only passes when every secret/file/network probe failed.
 import {
   appendFileSync,
+  existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -17,7 +18,11 @@ const deny = (name, fn) => {
     const detail = fn();
     out[name] = { detail: String(detail).slice(0, 200), ok: true };
   } catch (error) {
-    out[name] = { detail: String(error).slice(0, 200), ok: false };
+    out[name] = {
+      code: error?.code ?? "unknown",
+      detail: String(error).slice(0, 200),
+      ok: false,
+    };
   }
 };
 
@@ -242,7 +247,11 @@ try {
     ({ anchor, fleets } = cgroupAnchor());
   } catch (error) {
     for (const name of names) {
-      out[name] = { detail: String(error).slice(0, 200), ok: false };
+      out[name] = {
+        code: error?.code ?? "unknown",
+        detail: String(error).slice(0, 200),
+        ok: false,
+      };
     }
   }
 
@@ -266,7 +275,26 @@ try {
       }
 
       const path = `${leaf}/memory.swap.max`;
-      const current = readFileSync(path, "utf-8");
+      let current = null;
+
+      try {
+        current = readFileSync(path, "utf-8");
+      } catch (error) {
+        if (
+          error?.code === "ENOENT" &&
+          !existsSync(`${leaf}/memory.swap.current`)
+        ) {
+          const absent = new Error(
+            "memory.swap.max absent and no swap accounting (no memory.swap.current)"
+          );
+
+          absent.code = "NO_SWAP_ACCOUNTING";
+          throw absent;
+        }
+
+        throw error;
+      }
+
       writeFileSync(path, current);
 
       return "memory.swap.max writable";
@@ -291,6 +319,51 @@ try {
       return "subtree_control writable";
     });
   }
+}
+
+// Fleet peak snapshot (D3 sizing basis): per-fleet high-water marks at build
+// time. Measurement only — asserted nowhere as containment, attached to the
+// lane report by hostile.spec. In single tenancy (or with no anchor) the
+// container high-water is the only number available: an upper bound, not a
+// per-fleet peak.
+{
+  const peaks = {};
+
+  try {
+    const { anchor, fleets } = cgroupAnchor();
+
+    for (const name of fleets) {
+      try {
+        peaks[name] = {
+          max: readFileSync(`${anchor}/${name}/memory.max`, "utf-8").trim(),
+          peak: Number(
+            readFileSync(`${anchor}/${name}/memory.peak`, "utf-8").trim()
+          ),
+        };
+      } catch (error) {
+        peaks[name] = { error: error?.code ?? String(error).slice(0, 60) };
+      }
+    }
+
+    if (fleets.length === 0) {
+      peaks._note = "no fleet leaves at build time";
+    }
+  } catch (error) {
+    try {
+      const selfLine = readFileSync("/proc/self/cgroup", "utf-8")
+        .split("\n")
+        .find((line) => line.startsWith("0::"));
+
+      const own = (selfLine ?? "").slice(3) || "/";
+      peaks._container = Number(
+        readFileSync(`/sys/fs/cgroup${own}/memory.peak`, "utf-8").trim()
+      );
+    } catch {
+      peaks._error = String(error).slice(0, 100);
+    }
+  }
+
+  out["fleet-peaks"] = { detail: JSON.stringify(peaks), ok: true };
 }
 
 mkdirSync("dist", { recursive: true });

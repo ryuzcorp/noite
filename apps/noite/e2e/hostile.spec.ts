@@ -21,6 +21,7 @@ test.afterAll(async ({ request }) => {
 interface Probe {
   ok: boolean;
   detail: string;
+  code?: string;
   mustSucceed?: boolean;
 }
 
@@ -95,8 +96,11 @@ const assertFleetCgroups = async (
 };
 
 // Tamper probes are the negative half of the cgroup story: every cgroupfs
-// write a tenant build attempts must fail. Present and refused, not merely
-// absent — a missing probe would pass the build loop above vacuously.
+// write a tenant build attempts must fail with a permission denial
+// (EACCES/EPERM/EROFS). Present and refused, not merely absent — an ENOENT
+// from a missing file would pass an any-throw check vacuously, so the probe
+// records the errno code and the spec asserts it. swap.max is exempt only
+// when swap accounting is genuinely absent (NO_SWAP_ACCOUNTING).
 const expectTamperProbes = (report: ProbeReport): void => {
   for (const name of [
     "tamper:write-memory-max",
@@ -111,6 +115,19 @@ const expectTamperProbes = (report: ProbeReport): void => {
       probe?.ok,
       `tamper probe ${name} must fail: ${probe?.detail ?? ""}`
     ).toBe(false);
+
+    if (
+      name === "tamper:write-memory-swap-max" &&
+      probe?.code === "NO_SWAP_ACCOUNTING"
+    ) {
+      continue;
+    }
+
+    const code = probe?.code ?? "";
+    expect(
+      code === "EACCES" || code === "EPERM" || code === "EROFS",
+      `tamper probe ${name} must be refused with EACCES|EPERM|EROFS, got ${code === "" ? "no code" : code}: ${probe?.detail ?? ""}`
+    ).toBe(true);
   }
 };
 
@@ -124,7 +141,7 @@ const expectTamperProbes = (report: ProbeReport): void => {
 test(
   "hostile tenant is contained",
   { tag: "@isolation" },
-  async ({ page, request }) => {
+  async ({ page, request }, testInfo) => {
     test.skip(
       process.env.E2E_HOSTILE !== "1",
       "needs the isolation lane (E2E_HOSTILE=1, single image, NOITE_TENANCY=multi)"
@@ -189,7 +206,9 @@ test(
     const report = (await res.json()) as ProbeReport;
 
     for (const [name, probe] of Object.entries(report.build.probes)) {
-      if (name === "cgroup:fleet-memory-max") {
+      // Positive containment and the peak snapshot are asserted/attached
+      // separately below; this loop is the leak check.
+      if (name === "cgroup:fleet-memory-max" || name === "fleet-peaks") {
         continue;
       }
 
@@ -199,8 +218,18 @@ test(
     }
 
     // Tamper probes are asserted separately: every cgroupfs write a tenant
-    // build attempts must fail — present and refused, not merely absent.
+    // build attempts must fail with a permission denial — present and
+    // refused, not merely absent.
     expectTamperProbes(report);
+
+    // D3 sizing basis: per-fleet high-water marks at build time, attached
+    // to the always-uploaded report for the default-cap measurement.
+    await testInfo.attach("fleet-peaks", {
+      body: Buffer.from(
+        JSON.stringify(report.build.probes["fleet-peaks"] ?? { missing: true })
+      ),
+      contentType: "application/json",
+    });
 
     await assertFleetCgroups(request, report);
 

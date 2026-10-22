@@ -394,6 +394,8 @@ async fn move_fleet_into_group(
 ) -> MoveOutcome {
     let pid = match child.id() {
         None => {
+            // Already waited (id() is None only after wait), so nothing to
+            // reap here — unlike the ESRCH arm below.
             tracing::warn!(fleet = %key, "fleet exited before its cgroup move");
             return MoveOutcome::Gone;
         }
@@ -405,12 +407,22 @@ async fn move_fleet_into_group(
             MoveOutcome::Moved
         }
         Err(error) if crate::host::cgroups::is_gone(&error) => {
+            // Exited between spawn and the move: reap the zombie (a dropped
+            // Child only kill()-on-drops its leader) so no pid-table slot
+            // leaks on a persistently refusing move.
+            let _ = child.try_wait();
             tracing::warn!(fleet = %key, pid, "fleet exited before its cgroup move; nothing runs uncapped");
             MoveOutcome::Gone
         }
         Err(error) => {
-            tracing::warn!(fleet = %key, pid, error = %error, "fleet refused its cgroup move; killing");
-            let _ = child.kill().await;
+            tracing::warn!(fleet = %key, pid, error = %error, "fleet refused its cgroup move; killing its tree");
+            // Whole-tree kill: the fleet leads its own group, so a worker it
+            // forked before the move dies with it instead of serving uncapped
+            // from the shared cgroup and holding the fleet's ports past the
+            // recovery respawn. Then reap (short timeout): without the wait
+            // the dropped Child leaks a zombie until runner exit.
+            sigkill_tree(pid);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
             crate::host::cgroups::note_limit_failed(
                 key,
                 format!("fleet missed its cgroup: {error:#}"),
@@ -993,6 +1005,55 @@ mod tests {
             .await
             .expect("killed fleet dies")
             .expect("reap killed fleet");
+        let (ok, detail) = crate::host::cgroups::status();
+        assert!(!ok, "a refused move trips containment");
+        assert!(
+            detail.contains(&key),
+            "the reason names the fleet: {detail}"
+        );
+    }
+
+    /// A refused move kills the whole tree, not just the leader: a worker
+    /// the fleet forked before the move must die with it instead of serving
+    /// uncapped from the shared cgroup, and the child is reaped (no zombie).
+    #[tokio::test]
+    async fn refused_move_kills_the_tree_and_reaps() {
+        use std::os::unix::process::CommandExt;
+        // Unique per test-process run: a leaked sleeper from an earlier run
+        // must never satisfy this run's /proc scan.
+        let marker = format!("31337{}", std::process::id() % 100000);
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", &format!("sleep {marker} & wait")]);
+        cmd.as_std_mut().process_group(0);
+        cmd.kill_on_drop(true);
+        let mut leader = cmd.spawn().expect("spawn group leader");
+        // The leader must have forked its sleeper before the move, or a
+        // leader-only kill passes vacuously with nothing to orphan.
+        let spawned = std::time::Instant::now();
+        while !crate::testutil::live_cmdline_has(&marker) {
+            assert!(
+                spawned.elapsed() < Duration::from_secs(5),
+                "group leader never forked its sleeper"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // cgroup.procs as a directory: the move is refused (EISDIR, not
+        // ESRCH) for a live pid, like a real denial.
+        let dir = fake_fleet_leaf("refused-tree");
+        std::fs::create_dir_all(dir.join("cgroup.procs")).expect("fake procs dir");
+        let key = format!("refused-tree-{}", crate::models::new_id());
+        assert_eq!(
+            move_fleet_into_group(&key, &dir, &mut leader).await,
+            MoveOutcome::Refused
+        );
+        assert!(
+            leader.id().is_none(),
+            "the refused child is reaped inside the move, not left a zombie"
+        );
+        assert!(
+            crate::testutil::wait_for_cmdline_gone(&marker, Duration::from_secs(5)).await,
+            "refused move left a grandchild behind (sleep {marker} still live 5s after the group kill)"
+        );
         let (ok, detail) = crate::host::cgroups::status();
         assert!(!ok, "a refused move trips containment");
         assert!(
