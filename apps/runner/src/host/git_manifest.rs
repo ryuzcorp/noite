@@ -5,7 +5,9 @@
 //! once; readers resolve refs from the manifest, so a half-written push is
 //! never visible. Every push writes a complete manifest, so it is the only
 //! source of refs; a slug without one has never been pushed. The manifest moves with `git/{slug}/` on rename and clears with
-//! the prefix on purge, so no extra handling is needed there.
+//! the prefix on purge; both also drop the slug's `applied_seq` marker
+//! ([`GitSync::forget`]), so the next generation's seq (which restarts at 1)
+//! is applied instead of skipped as stale.
 //!
 //! Concurrency: the runner is the single writer; pushes to one slug are
 //! serialized by [`GitSync::push_guard`]. The manifest gives atomic
@@ -13,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,10 +63,20 @@ pub struct Manifest {
 /// while holding an inner one cannot happen. Two slug guards are always taken
 /// in lexical slug order (see `push_guards`), so opposite renames cannot
 /// deadlock against each other.
+///
+/// `applied_seq` only moves forward: a reader that syncs a manifest older
+/// than one a concurrent write already applied must not drag the marker back
+/// (that hid a fresh ref until the next guarded read re-synced). The two
+/// exceptions are explicit: a cold mirror resets to 0 so the next manifest
+/// wins unconditionally, and a purge or slug-changing rename forgets the
+/// slug's generation outright so the next generation's seq (which restarts
+/// at 1) is applied rather than skipped as stale.
 #[derive(Clone, Default)]
 pub struct GitSync {
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     applied: Arc<Mutex<HashMap<String, u64>>>,
+    #[cfg(test)]
+    apply_gate: Arc<std::sync::Mutex<Option<test_hooks::Gate>>>,
 }
 
 impl GitSync {
@@ -110,16 +123,105 @@ impl GitSync {
         self.applied.lock().await.get(slug).copied()
     }
 
+    /// Record an applied manifest seq. Only moves forward: a concurrent
+    /// reader syncing a pre-flip manifest must not clobber the seq a write
+    /// already recorded. Cold resets and generation changes use
+    /// [`GitSync::reset_applied_seq`] and [`GitSync::forget`] instead.
     pub async fn set_applied_seq(&self, slug: &str, seq: u64) {
+        let mut applied = self.applied.lock().await;
+        if applied.get(slug).is_none_or(|current| seq > *current) {
+            applied.insert(slug.to_string(), seq);
+        }
+    }
+
+    /// Unconditional seq record for a cold mirror: the local refs were just
+    /// hydrated from the raw bundle listing, so no seq can be trusted and the
+    /// next manifest read must win.
+    pub async fn reset_applied_seq(&self, slug: &str, seq: u64) {
         self.applied.lock().await.insert(slug.to_string(), seq);
+    }
+
+    /// Drop a slug's generation marker. Purge and slug-changing rename call
+    /// this under the slug's `push_guard`: the mirror, the S3 prefix and the
+    /// marker move together, so a recreated slug's seq-1 manifest is applied
+    /// instead of skipped as stale.
+    pub async fn forget(&self, slug: &str) {
+        self.applied.lock().await.remove(slug);
+    }
+
+    /// Pause point for the deterministic M1 race test: the test parks a
+    /// reader here (after its unlocked manifest read, before it takes
+    /// `push_guard`), completes a create, then releases it. Without a gate
+    /// installed this is a no-op; production builds compile it away.
+    pub(crate) async fn pause_before_sync(&self) {
+        #[cfg(test)]
+        {
+            let gate = self
+                .apply_gate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+        }
+    }
+}
+
+/// Deterministic-race scaffolding: gates a test installs so it can freeze one
+/// manifest operation mid-flight, interleave another, then release it. No
+/// sleeps, no wall-clock waits — the test awaits real signals.
+#[cfg(test)]
+pub mod test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    use tokio::sync::Notify;
+
+    /// A parked operation signals `entered`, then waits for `release`.
+    #[derive(Clone, Default)]
+    pub struct Gate {
+        pub entered: Arc<Notify>,
+        pub release: Arc<Notify>,
+    }
+
+    static WRITE_GATES: LazyLock<Mutex<HashMap<String, Gate>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Install the apply gate on one `GitSync`: the next
+    /// [`super::GitSync::pause_before_sync`] parks there. `None` removes it.
+    pub fn set_apply_gate(sync: &super::GitSync, gate: Option<Gate>) {
+        *sync.apply_gate.lock().unwrap_or_else(|e| e.into_inner()) = gate;
+    }
+
+    /// Park the next [`super::write_manifest`] for `slug` after it stages its
+    /// tmp file and before it uploads. `None` removes the gate.
+    pub fn set_write_gate(slug: &str, gate: Option<Gate>) {
+        let mut gates = WRITE_GATES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(gate) = gate {
+            gates.insert(slug.to_string(), gate);
+        } else {
+            gates.remove(slug);
+        }
+    }
+
+    pub(crate) async fn pause_write_staged(slug: &str) {
+        let gate = WRITE_GATES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(slug)
+            .cloned();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
     }
 }
 
 /// Read the manifest, if the slug has one yet.
 pub async fn read_manifest(cfg: &Config, slug: &str) -> anyhow::Result<Option<Manifest>> {
-    let tmp = exec::work_root(cfg)
-        .join("git-http")
-        .join(format!(".manifest-{slug}.json"));
+    let tmp = manifest_tmp(cfg, slug);
     if let Some(parent) = tmp.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -132,8 +234,9 @@ pub async fn read_manifest(cfg: &Config, slug: &str) -> anyhow::Result<Option<Ma
         Err(e) if s3::is_not_found(&e) => return Ok(None),
         Err(e) => return Err(e.context("read git manifest")),
     }
-    let bytes = tokio::fs::read(&tmp).await?;
+    let result = tokio::fs::read(&tmp).await;
     let _ = tokio::fs::remove_file(&tmp).await;
+    let bytes = result?;
     let manifest: Manifest = serde_json::from_slice(&bytes)?;
     if manifest.version != MANIFEST_VERSION {
         anyhow::bail!("manifest version {} unsupported", manifest.version);
@@ -143,17 +246,52 @@ pub async fn read_manifest(cfg: &Config, slug: &str) -> anyhow::Result<Option<Ma
 
 /// Write the manifest once per push, after all tip bundles land.
 pub async fn write_manifest(cfg: &Config, slug: &str, manifest: &Manifest) -> anyhow::Result<()> {
-    let tmp = exec::work_root(cfg)
-        .join("git-http")
-        .join(format!(".manifest-{slug}.json"));
+    let tmp = manifest_tmp(cfg, slug);
     if let Some(parent) = tmp.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let bytes = serde_json::to_vec(manifest)?;
     tokio::fs::write(&tmp, &bytes).await?;
+    #[cfg(test)]
+    test_hooks::pause_write_staged(slug).await;
     let result = s3::s3_cp_upload(cfg, &tmp, &manifest_key(slug)).await;
     let _ = tokio::fs::remove_file(&tmp).await;
     result
+}
+/// A tmp path unique to this call. A concurrent reader's download must never
+/// land on the path a writer staged (a lost manifest flip), and a reader
+/// must never parse bytes a writer is still staging (torn reads).
+fn manifest_tmp(cfg: &Config, slug: &str) -> PathBuf {
+    static MANIFEST_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = MANIFEST_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    exec::work_root(cfg)
+        .join("git-http")
+        .join(format!(".manifest-{slug}.{}.{n}.json", std::process::id()))
+}
+
+/// The store's manifest when the mirror still needs it: `None` when no
+/// manifest exists yet or `applied_seq` already covers it. Unlocked; a
+/// caller that decides to sync MUST re-call this under the slug's
+/// `push_guard` before syncing — a concurrent push can flip the manifest
+/// between the check and the sync, and syncing the older read would delete a
+/// ref the flip just added.
+pub async fn pending_manifest(
+    cfg: &Config,
+    git_sync: &GitSync,
+    slug: &str,
+) -> anyhow::Result<Option<Manifest>> {
+    let manifest = match read_manifest(cfg, slug).await? {
+        Some(manifest) => manifest,
+        None => return Ok(None),
+    };
+    if git_sync
+        .applied_seq(slug)
+        .await
+        .is_some_and(|applied| applied >= manifest.seq)
+    {
+        return Ok(None);
+    }
+    Ok(Some(manifest))
 }
 
 fn bundle_tmp(cfg: &Config, slug: &str, sha: &str) -> PathBuf {

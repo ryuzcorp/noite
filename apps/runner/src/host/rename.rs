@@ -163,7 +163,13 @@ pub async fn rename_app(
     // after. Taken after the AppLock (ordering: AppLock → push_guard), in
     // lexical order so opposite renames cannot invert.
     let (_old_push, _new_push) = git_sync.push_guards(&app.slug, new_slug).await;
-    rename_slugged(cfg, pool, procs, logs, &app, new_name, new_slug).await
+    let renamed = rename_slugged(cfg, pool, procs, logs, &app, new_name, new_slug).await?;
+    // The old generation ends here: its S3 prefix moved to the new slug, so
+    // its seq marker must go too — otherwise a future slug reuse would skip
+    // its restarted seq as stale. `applied[new_slug]` starts empty, so the
+    // moved manifest is applied once on the next read.
+    git_sync.forget(&app.slug).await;
+    Ok(renamed)
 }
 
 async fn rename_slugged(

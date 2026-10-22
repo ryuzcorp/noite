@@ -191,34 +191,60 @@ fn valid_ref(reference: &str) -> bool {
 /// Materialize the push mirror and apply `MANIFEST.json` exactly, then return
 /// it. Reads and server-side ref moves both start here, so neither ever sees
 /// a branch the manifest dropped.
+///
+/// Double-checked sync: the common path serves local without taking the
+/// slug's `push_guard`; only a manifest newer than `applied_seq` takes the
+/// guard and re-reads before syncing, so a refs read overlapping a create
+/// can never apply the pre-flip manifest and delete the fresh ref.
 pub async fn read_mirror(state: &AppState, slug: &str) -> anyhow::Result<PathBuf> {
     let path = http_bare(&state.config, slug);
     let existed = path.join("HEAD").exists();
     let bare = ensure_bare(&state.config, slug).await?;
     if !existed {
         // A cold mirror is filled from the raw bundle listing, which can
-        // still hold a bundle the delete did not prune. Make the manifest
-        // win below rather than trust the cache's seq.
-        state.git_sync.set_applied_seq(slug, 0).await;
+        // still hold a bundle the delete did not prune. Reset under the
+        // guard so the reset, the re-read and the sync are atomic with
+        // respect to a concurrent push, then let the manifest win below
+        // rather than trust the cache's seq.
+        let _push = state.git_sync.push_guard(slug).await;
+        state.git_sync.reset_applied_seq(slug, 0).await;
+        apply_manifest_locked(state, slug, &bare).await;
+        return Ok(bare);
     }
     apply_manifest(state, slug, &bare).await;
     Ok(bare)
 }
 
-/// [`read_mirror`] for callers that only hold a `Config` (deploy-side config
-/// discovery): no per-process seq cache, so the manifest is read each time.
-/// Unknown refs are still dropped, so a config read never sees a deleted
-/// branch either.
-pub async fn read_mirror_cfg(cfg: &Config, slug: &str) -> anyhow::Result<PathBuf> {
-    let bare = ensure_bare(cfg, slug).await?;
-    sync_manifest_cfg(cfg, slug, &bare).await;
+/// [`read_mirror`] when the caller already holds the slug's `push_guard`
+/// (server-side ref moves): re-taking it would self-deadlock. The whole
+/// read-sync stays inside the caller's guard, so no interleaving push can
+/// land between the manifest read and the sync.
+async fn read_mirror_locked(state: &AppState, slug: &str) -> anyhow::Result<PathBuf> {
+    let path = http_bare(&state.config, slug);
+    let existed = path.join("HEAD").exists();
+    let bare = ensure_bare(&state.config, slug).await?;
+    if !existed {
+        // Fresh hydration inside an already-held guard (see `read_mirror`).
+        state.git_sync.reset_applied_seq(slug, 0).await;
+    }
+    apply_manifest_locked(state, slug, &bare).await;
     Ok(bare)
 }
 
-/// Bring a mirror to the manifest, warn-only. `ensure_bare` can call this
-/// right after its cold hydration so the push mirror never keeps a ref the
+/// [`read_mirror`] for callers that only hold a `Config` (deploy-side config
+/// discovery): hot config readers serve local, like every other hot reader.
+/// Cold hydration already syncs the manifest once inside `ensure_bare`, so an
+/// unconditional sync here could only apply a stale manifest read over a
+/// fresh mirror and delete a just-created branch.
+pub async fn read_mirror_cfg(cfg: &Config, slug: &str) -> anyhow::Result<PathBuf> {
+    ensure_bare(cfg, slug).await
+}
+
+/// Bring a mirror to the manifest, warn-only. `ensure_bare` calls this right
+/// after its cold hydration so the push mirror never keeps a ref the
 /// manifest dropped (a tip bundle an interrupted delete left behind is
-/// otherwise fetched again from the listing).
+/// otherwise fetched again from the listing). Hot paths never call this:
+/// they serve local or go through the seq-guarded double-checked apply.
 pub async fn sync_manifest_cfg(cfg: &Config, slug: &str, bare: &Path) {
     match git_manifest::read_manifest(cfg, slug).await {
         Ok(Some(manifest)) => {
@@ -272,8 +298,39 @@ async fn unborn_default(bare: &Path, reference: &str) -> anyhow::Result<bool> {
 /// Bring the mirror to the manifest. Warn-only, like `refresh_from_manifest`:
 /// a reader serves from what is local when the manifest cannot be read; a
 /// writer's `after_receive` still refuses to publish without it.
+///
+/// Double-checked sync under the slug's `push_guard`: the unlocked fast path
+/// below serves local when `applied_seq` already covers the manifest; only a
+/// newer manifest takes the guard and re-reads before syncing. Without the
+/// re-check a refs read overlapping a create could apply its pre-flip
+/// manifest read, delete the fresh ref, and drag `applied_seq` backward —
+/// the flake where a branch missed from the refs list right after its
+/// create. `set_applied_seq` is monotonic as a second net for the same
+/// hazard.
 async fn apply_manifest(state: &AppState, slug: &str, bare: &Path) {
-    let manifest = match git_manifest::read_manifest(&state.config, slug).await {
+    let pending = match git_manifest::pending_manifest(&state.config, &state.git_sync, slug).await {
+        Ok(pending) => pending,
+        Err(e) => {
+            tracing::warn!(slug, error = %format!("{e:#}"), "forge manifest read");
+            return;
+        }
+    };
+    if pending.is_none() {
+        return;
+    }
+    // Parked by the M1 race test so a create lands here, deterministically.
+    state.git_sync.pause_before_sync().await;
+    let _push = state.git_sync.push_guard(slug).await;
+    apply_manifest_locked(state, slug, bare).await;
+}
+
+/// [`apply_manifest`] when the caller already holds the slug's `push_guard`:
+/// re-read the manifest and re-check `applied_seq` under the guard, then
+/// sync and record. Writers call this inside their guard, so a reader's sync
+/// can never apply a manifest older than one a concurrent write applied.
+async fn apply_manifest_locked(state: &AppState, slug: &str, bare: &Path) {
+    let manifest = match git_manifest::pending_manifest(&state.config, &state.git_sync, slug).await
+    {
         Ok(Some(manifest)) => manifest,
         Ok(None) => return,
         Err(e) => {
@@ -281,9 +338,6 @@ async fn apply_manifest(state: &AppState, slug: &str, bare: &Path) {
             return;
         }
     };
-    if state.git_sync.applied_seq(slug).await == Some(manifest.seq) {
-        return;
-    }
     if let Err(e) = sync_to_manifest(&state.config, bare, &manifest).await {
         tracing::warn!(slug, error = %format!("{e:#}"), "forge manifest apply");
         return;
@@ -355,9 +409,11 @@ pub async fn publish_refname(
     if new.is_none() && expected_old.is_none() {
         bail!("nothing to publish for {refname}");
     }
-    // Serialize with pushes and other server-side ref moves.
+    // Serialize with pushes and other server-side ref moves. The mirror read
+    // below runs inside this guard (`read_mirror_locked`): re-taking it
+    // would self-deadlock.
     let _push_guard = state.git_sync.push_guard(&app.slug).await;
-    let bare = read_mirror(state, &app.slug).await?;
+    let bare = read_mirror_locked(state, &app.slug).await?;
     if refname.starts_with(crate::host::git_http::PREVIEW_REF_PREFIX) {
         // A mirror hydrated before preview environments existed has no hidden
         // refs configured yet, and this is the first write that can create
@@ -1609,6 +1665,336 @@ mod tests {
             !refs_now.contains_key("refs/heads/feature"),
             "deleted branch came back: {refs_now:?}"
         );
+
+        h.finish().await;
+    }
+    #[tokio::test]
+    async fn a_stale_manifest_read_keeps_a_fresh_branch() {
+        // The picker flake: `refs` right after a `branch_create` served a
+        // manifest read that predated the create, and the sync deleted the
+        // fresh ref from the mirror (then cached its absence). A manifest at
+        // or below the newest applied seq is stale and must never move the
+        // mirror backward, while a newer one still propagates a delete.
+        let h = Harness::new("stale-refs").await;
+        let bare = h.mirror().await;
+        let work = Work::new(&h.dir.join("scratch")).await;
+        work.write("f.txt", "base\n");
+        let base = work.commit("base").await;
+        work.branch("topic", &base).await;
+        work.write("t.txt", "topic\n");
+        let topic = work.commit("topic").await;
+        work.branch("main", &base).await;
+        let tips = seed_objects(&bare, &work).await;
+        let main = tips.get("main").expect("main tip").clone();
+        publish_ref(&h.state, &h.app, "main", None, Some(&main))
+            .await
+            .expect("publish main");
+        publish_ref(&h.state, &h.app, "topic", None, Some(&topic))
+            .await
+            .expect("publish topic");
+
+        let manifest = git_manifest::read_manifest(&h.state.config, &h.app.slug)
+            .await
+            .expect("manifest")
+            .expect("manifest");
+        assert_eq!(manifest.seq, 2);
+        assert!(manifest.refs.contains_key("refs/heads/topic"));
+
+        // Plant the pre-create manifest as if the store served a stale read
+        // right after the create's manifest flip.
+        let stale = git_manifest::Manifest {
+            version: git_manifest::MANIFEST_VERSION,
+            seq: 1,
+            refs: HashMap::from([(
+                "refs/heads/main".to_string(),
+                manifest.refs["refs/heads/main"].clone(),
+            )]),
+        };
+        git_manifest::write_manifest(&h.state.config, &h.app.slug, &stale)
+            .await
+            .expect("plant stale manifest");
+
+        // The refs read the picker performs next still lists the branch.
+        let bare = read_mirror(&h.state, &h.app.slug)
+            .await
+            .expect("read mirror");
+        let refs_now = refs(&bare, None).await.expect("refs");
+        assert!(
+            refs_now
+                .branches
+                .iter()
+                .any(|branch| branch.name == "topic"),
+            "fresh branch lost to a stale manifest: {:?}",
+            refs_now
+                .branches
+                .iter()
+                .map(|branch| branch.name.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        // A genuinely newer manifest without the branch (a delete the store
+        // already flipped) still propagates the delete.
+        let deleted = git_manifest::Manifest { seq: 3, ..stale };
+        git_manifest::write_manifest(&h.state.config, &h.app.slug, &deleted)
+            .await
+            .expect("plant delete manifest");
+        let bare = read_mirror(&h.state, &h.app.slug)
+            .await
+            .expect("read mirror");
+        let refs_now = refs(&bare, None).await.expect("refs");
+        assert!(
+            !refs_now
+                .branches
+                .iter()
+                .any(|branch| branch.name == "topic"),
+            "delete did not propagate: {:?}",
+            refs_now
+                .branches
+                .iter()
+                .map(|branch| branch.name.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        h.finish().await;
+    }
+    #[tokio::test]
+    async fn hot_config_reads_serve_local_after_a_create() {
+        // H1: `read_mirror_cfg` used to sync to whatever manifest it read,
+        // with no seq guard. A stale read right after a create then deleted
+        // the fresh ref from the shared push mirror. Hot config readers now
+        // serve local; cold hydration still syncs once inside `ensure_bare`.
+        let h = Harness::new("hot-cfg-local").await;
+        let bare = h.mirror().await;
+        let work = Work::new(&h.dir.join("scratch")).await;
+        work.write("f.txt", "base\n");
+        let base = work.commit("base").await;
+        work.branch("topic", &base).await;
+        work.write("t.txt", "topic\n");
+        let topic = work.commit("topic").await;
+        work.branch("main", &base).await;
+        let tips = seed_objects(&bare, &work).await;
+        let main = tips.get("main").expect("main tip").clone();
+        publish_ref(&h.state, &h.app, "main", None, Some(&main))
+            .await
+            .expect("publish main");
+        publish_ref(&h.state, &h.app, "topic", None, Some(&topic))
+            .await
+            .expect("publish topic");
+        assert_eq!(h.state.git_sync.applied_seq(&h.app.slug).await, Some(2));
+
+        // Plant the pre-create manifest as if the store served a stale read.
+        let manifest = git_manifest::read_manifest(&h.state.config, &h.app.slug)
+            .await
+            .expect("manifest")
+            .expect("manifest");
+        let stale = git_manifest::Manifest {
+            version: git_manifest::MANIFEST_VERSION,
+            seq: 1,
+            refs: HashMap::from([(
+                "refs/heads/main".to_string(),
+                manifest.refs["refs/heads/main"].clone(),
+            )]),
+        };
+        git_manifest::write_manifest(&h.state.config, &h.app.slug, &stale)
+            .await
+            .expect("plant stale manifest");
+
+        // The deploy-config read still lists the branch, straight from local.
+        let bare = read_mirror_cfg(&h.state.config, &h.app.slug)
+            .await
+            .expect("config mirror");
+        let local = list_refs(&bare).await.expect("local refs");
+        assert!(
+            local.get("refs/heads/topic") == Some(&topic),
+            "hot config read lost the fresh branch to a stale manifest"
+        );
+
+        // And the guarded picker path is unaffected: still listed, seq intact.
+        let bare = read_mirror(&h.state, &h.app.slug)
+            .await
+            .expect("read mirror");
+        let refs_now = refs(&bare, None).await.expect("refs");
+        assert!(
+            refs_now
+                .branches
+                .iter()
+                .any(|branch| branch.name == "topic"),
+            "fresh branch lost after a hot config read"
+        );
+        assert_eq!(h.state.git_sync.applied_seq(&h.app.slug).await, Some(2));
+
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn guarded_apply_never_syncs_a_pre_flip_manifest() {
+        // M1: a refs read overlapping a create applied its pre-flip manifest
+        // read, deleted the fresh ref, and dragged `applied_seq` backward.
+        // The reader now re-reads under the slug's `push_guard`, so the
+        // create's flip always wins. The gate parks the reader between its
+        // unlocked manifest read and its guarded sync; the create lands
+        // in between, deterministically.
+        let h = Harness::new("guarded-race").await;
+        let bare = h.mirror().await;
+        let work = Work::new(&h.dir.join("scratch")).await;
+        work.write("f.txt", "base\n");
+        let base = work.commit("base").await;
+        work.branch("topic", &base).await;
+        work.write("t.txt", "topic\n");
+        let topic = work.commit("topic").await;
+        work.branch("main", &base).await;
+        let tips = seed_objects(&bare, &work).await;
+        let main = tips.get("main").expect("main tip").clone();
+        publish_ref(&h.state, &h.app, "main", None, Some(&main))
+            .await
+            .expect("publish main");
+        // A reader that never applied seq 1 (a fresh process polling while
+        // the create lands): its unlocked read says a sync is needed.
+        h.state.git_sync.forget(&h.app.slug).await;
+        let gate = git_manifest::test_hooks::Gate::default();
+        git_manifest::test_hooks::set_apply_gate(&h.state.git_sync, Some(gate.clone()));
+
+        let reader_state = h.state.clone();
+        let reader_slug = h.app.slug.clone();
+        let reader = tokio::spawn(async move { read_mirror(&reader_state, &reader_slug).await });
+        tokio::time::timeout(Duration::from_secs(30), gate.entered.notified())
+            .await
+            .expect("the reader must reach its guarded sync");
+
+        // The create lands while the reader is parked.
+        publish_ref(&h.state, &h.app, "topic", None, Some(&topic))
+            .await
+            .expect("publish topic");
+        assert_eq!(h.state.git_sync.applied_seq(&h.app.slug).await, Some(2));
+        gate.release.notify_one();
+
+        let bare = reader.await.expect("reader task").expect("read mirror");
+        git_manifest::test_hooks::set_apply_gate(&h.state.git_sync, None);
+        let refs_now = refs(&bare, None).await.expect("refs");
+        assert!(
+            refs_now
+                .branches
+                .iter()
+                .any(|branch| branch.name == "topic"),
+            "fresh branch lost to a pre-flip manifest: {:?}",
+            refs_now
+                .branches
+                .iter()
+                .map(|branch| branch.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            h.state.git_sync.applied_seq(&h.app.slug).await,
+            Some(2),
+            "applied_seq regressed under a concurrent create"
+        );
+
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn purge_forgets_applied_seq_and_next_generation_applies() {
+        // M2: `applied_seq` leaked across purge, so a recreated slug's
+        // restarted seq looked stale and its first manifest was skipped.
+        let h = Harness::new("purge-forget").await;
+        h.state.git_sync.set_applied_seq(&h.app.slug, 5).await;
+        let _push = h.state.git_sync.push_guard(&h.app.slug).await;
+        crate::host::purge::purge_slug(
+            &h.state.config,
+            &h.state.procs,
+            &h.state.logs,
+            &h.state.git_sync,
+            &h.app.slug,
+            crate::host::supervisor::StopGrace::NORMAL,
+        )
+        .await
+        .expect("purge");
+        drop(_push);
+        assert_eq!(h.state.git_sync.applied_seq(&h.app.slug).await, None);
+
+        // The recreated slug's first manifest (seq 1) is applied, not
+        // skipped, and the branch is listed.
+        let bare = h.mirror().await;
+        let work = Work::new(&h.dir.join("scratch")).await;
+        work.write("f.txt", "base\n");
+        let base = work.commit("base").await;
+        work.branch("main", &base).await;
+        let tips = seed_objects(&bare, &work).await;
+        let main = tips.get("main").expect("main tip").clone();
+        publish_ref(&h.state, &h.app, "main", None, Some(&main))
+            .await
+            .expect("publish main");
+        assert_eq!(h.state.git_sync.applied_seq(&h.app.slug).await, Some(1));
+        let bare = read_mirror(&h.state, &h.app.slug)
+            .await
+            .expect("read mirror");
+        let refs_now = refs(&bare, None).await.expect("refs");
+        assert!(
+            refs_now.branches.iter().any(|branch| branch.name == "main"),
+            "recreated slug lost its first branch"
+        );
+
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_manifest_read_never_clobbers_a_write() {
+        // M3: `read_manifest` and `write_manifest` shared one tmp path, so a
+        // concurrent reader's download could clobber the writer's staged
+        // bytes (a lost manifest flip) or read torn bytes. Each call now
+        // stages its own path. The gate parks the writer after staging and
+        // before upload; the reader runs to completion in between,
+        // deterministically.
+        let h = Harness::new("manifest-tmp-race").await;
+        let slug = h.app.slug.clone();
+        let entry = git_manifest::ManifestRef {
+            sha: "a".repeat(40),
+            bundle: format!("git/{slug}/refs/heads/main/aaa.bundle"),
+        };
+        let first = git_manifest::Manifest {
+            version: git_manifest::MANIFEST_VERSION,
+            seq: 1,
+            refs: HashMap::from([("refs/heads/main".to_string(), entry.clone())]),
+        };
+        git_manifest::write_manifest(&h.state.config, &slug, &first)
+            .await
+            .expect("seed seq 1");
+        let gate = git_manifest::test_hooks::Gate::default();
+        git_manifest::test_hooks::set_write_gate(&slug, Some(gate.clone()));
+
+        let writer_cfg = h.state.config.clone();
+        let writer_slug = slug.clone();
+        let flipped = git_manifest::Manifest {
+            version: git_manifest::MANIFEST_VERSION,
+            seq: 2,
+            refs: HashMap::from([("refs/heads/main".to_string(), entry)]),
+        };
+        let writer = tokio::spawn(async move {
+            git_manifest::write_manifest(&writer_cfg, &writer_slug, &flipped).await
+        });
+        tokio::time::timeout(Duration::from_secs(30), gate.entered.notified())
+            .await
+            .expect("the writer must stage before uploading");
+
+        // The reader downloads, parses and cleans up while the write is
+        // parked: on a shared tmp path this overwrote the staged flip.
+        let seen = git_manifest::read_manifest(&h.state.config, &slug)
+            .await
+            .expect("concurrent read")
+            .expect("manifest present");
+        assert_eq!(seen.seq, 1, "reader must see the last flipped manifest");
+        gate.release.notify_one();
+        writer
+            .await
+            .expect("writer task")
+            .expect("parked write lands");
+        git_manifest::test_hooks::set_write_gate(&slug, None);
+
+        let stored = git_manifest::read_manifest(&h.state.config, &slug)
+            .await
+            .expect("final read")
+            .expect("manifest present");
+        assert_eq!(stored.seq, 2, "concurrent read lost the manifest flip");
 
         h.finish().await;
     }
