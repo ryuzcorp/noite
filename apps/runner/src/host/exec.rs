@@ -46,6 +46,59 @@ const CACHE_BUN: &str = "bun";
 const CACHE_JUP: &str = "jup";
 const CACHE_HOME: &str = "home";
 
+/// The image's read-only store of bundled package managers
+/// (`docker/Dockerfile` seeds it at build time with `JUP_HOME` pointed here):
+/// jup's own layout, `v1/<name>/<version>/` entries each carrying jup's `.jup`
+/// completion marker. World-readable; the build uid must read but never
+/// modify the shared copy, so deploys copy (never symlink) entries into the
+/// app's own `JUP_HOME`.
+pub const BUNDLED_SEED_DIR: &str = "/opt/jup-bundled";
+
+/// Copy a bundled manager (`name@version`, e.g. from
+/// `package_manager::PackageManager::bundled`) from `seed_dir` (production:
+/// `BUNDLED_SEED_DIR`) into the app's `JUP_HOME`, so jup runs the installed
+/// exact version with no registry request. Copies only when the versioned
+/// entry (with jup's `.jup` marker) is missing; returns true when the entry is
+/// present afterwards. Any failure returns false so the caller falls back to
+/// today's behavior (jup downloads the release): dev targets and old images
+/// have no seed.
+pub fn seed_bundled_manager(seed_dir: &Path, cache: &Path, name: &str, version: &str) -> bool {
+    let target = cache.join(CACHE_JUP).join("v1").join(name).join(version);
+    if target.join(".jup").is_file() {
+        return true;
+    }
+    let source = seed_dir.join("v1").join(name).join(version);
+    if copy_dir(&source, &target).is_ok() && target.join(".jup").is_file() {
+        return true;
+    }
+    let _ = std::fs::remove_dir_all(&target);
+    false
+}
+
+/// Recursively copy `source` to `target` without following symlinks. A tenant
+/// tree can link at platform paths (see `lchown_tree`), so links are
+/// recreated, never traversed.
+fn copy_dir(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)?.flatten() {
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_dir(&from, &to)?;
+        } else if kind.is_symlink() {
+            #[cfg(unix)]
+            {
+                let link = std::fs::read_link(&from)?;
+                std::os::unix::fs::symlink(link, to)?;
+            }
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
 /// Tenant sandbox: uid/gid drop + explicit env (SPEC, Build and release sandbox).
 /// `uid: None` = current user (dev only, single-tenant).
 /// `cache: None` = a throwaway `.build-cache` inside the worktree; `Some` =
@@ -480,6 +533,43 @@ pub fn work_root(cfg: &Config) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seed_copies_the_bundled_entry_once() {
+        let root = std::env::temp_dir().join(format!("noite-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let seed = root.join("seed");
+        let cache = root.join("cache");
+        let entry = seed.join("v1").join("pnpm").join("9.9.9");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join(".jup"), "{}").unwrap();
+        std::fs::write(entry.join("pnpm"), vec![0u8; 1024]).unwrap();
+
+        // Missing seed: false, and no half-written entry left behind.
+        assert!(!seed_bundled_manager(
+            &root.join("absent"),
+            &cache,
+            "pnpm",
+            "9.9.9"
+        ));
+        assert!(!cache.join("jup/v1/pnpm/9.9.9").exists());
+
+        // Present seed: copies the entry with its marker.
+        assert!(seed_bundled_manager(&seed, &cache, "pnpm", "9.9.9"));
+        assert!(cache.join("jup/v1/pnpm/9.9.9/.jup").is_file());
+        assert_eq!(
+            std::fs::read(cache.join("jup/v1/pnpm/9.9.9/pnpm"))
+                .unwrap()
+                .len(),
+            1024
+        );
+
+        // Second deploy: already seeded, no copy (a stray file survives).
+        std::fs::write(cache.join("jup/v1/pnpm/9.9.9/stray"), "x").unwrap();
+        assert!(seed_bundled_manager(&seed, &cache, "pnpm", "9.9.9"));
+        assert!(cache.join("jup/v1/pnpm/9.9.9/stray").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn prune_drops_whole_caches_largest_first() {
