@@ -405,6 +405,27 @@ pub async fn tick(
             db::add_app_path(pool, &l.app_id, &l.environment_id, &l.bucket, &l.path).await?;
             db::add_app_ref(pool, &l.app_id, &l.environment_id, &l.bucket, &l.source).await?;
             if let Some((trace_id, ctx)) = l.trace {
+                // A span ingested before this line was tailed stored its
+                // occurrence without a request: heal the row now that the
+                // line has landed, then keep the index entry for the next
+                // ingest pass.
+                if requests.is_pending(&trace_id) {
+                    db::backfill_error_request(
+                        pool,
+                        &l.app_id,
+                        &l.environment_id,
+                        &trace_id,
+                        &db::ErrorRequest {
+                            method: &ctx.method,
+                            path: &ctx.path,
+                            http_status: ctx.status,
+                            browser: ctx.browser,
+                            os: ctx.os,
+                        },
+                    )
+                    .await?;
+                    requests.clear_pending(&trace_id);
+                }
                 requests.insert(trace_id, ctx);
             }
         }

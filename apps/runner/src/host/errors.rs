@@ -318,13 +318,16 @@ pub struct RequestCtx {
     pub os: &'static str,
 }
 
-/// Trace id → request, filled by the access-log tail and read by the
-/// error ingest one flush later. In memory only: a runner restart loses at
-/// most the context of errors still in flight.
+/// Trace id → request, filled by the access-log tail and read by the error
+/// ingest. A span ingested before its access line was tailed stores its
+/// occurrence without a request and is marked pending; the tail backfills
+/// the stored row when the line lands. In memory only: a runner restart
+/// loses at most the context of errors still in flight.
 #[derive(Default)]
 pub struct RequestIndex {
     map: HashMap<String, RequestCtx>,
     order: VecDeque<(Instant, String)>,
+    pending: HashMap<String, Instant>,
 }
 
 impl RequestIndex {
@@ -341,10 +344,45 @@ impl RequestIndex {
         if self.map.insert(trace_id.clone(), ctx).is_none() {
             self.order.push_back((now, trace_id));
         }
+        self.evict_pending(now);
     }
 
     pub fn get(&self, trace_id: &str) -> Option<&RequestCtx> {
         self.map.get(trace_id)
+    }
+
+    /// Remember a trace whose occurrence stored without its request. The
+    /// access-log tail backfills the row when the line lands; entries
+    /// expire with the index so a line that never lands (burst skip,
+    /// restart) cannot leak.
+    pub fn mark_pending(&mut self, trace_id: &str) {
+        if trace_id.is_empty() {
+            return;
+        }
+        self.evict_pending(Instant::now());
+        self.pending.insert(trace_id.to_string(), Instant::now());
+    }
+
+    /// True while a stored occurrence still waits for this trace's line.
+    pub fn is_pending(&self, trace_id: &str) -> bool {
+        self.pending.contains_key(trace_id)
+    }
+
+    /// Drop the wait once the tail has backfilled the row.
+    pub fn clear_pending(&mut self, trace_id: &str) {
+        self.pending.remove(trace_id);
+    }
+
+    fn evict_pending(&mut self, now: Instant) {
+        self.pending
+            .retain(|_, at| now.duration_since(*at) < REQUEST_TTL);
+        while self.pending.len() > REQUEST_CAP {
+            if let Some(old) = self.pending.keys().next().cloned() {
+                self.pending.remove(&old);
+            } else {
+                break;
+            }
+        }
     }
 }
 
@@ -409,6 +447,18 @@ fn hour_bucket(us: i64) -> String {
         .unwrap_or_default()
 }
 
+/// The access log's view of one trace, marking the trace pending when its
+/// line has not been tailed yet so the tail can backfill the stored row.
+fn take_request(requests: &mut RequestIndex, trace_id: &str) -> Option<RequestCtx> {
+    match requests.get(trace_id).cloned() {
+        Some(request) => Some(request),
+        None => {
+            requests.mark_pending(trace_id);
+            None
+        }
+    }
+}
+
 /// Turn one ingest pass into stored issues. `slug_id` maps each fleet key to
 /// its app id, `slug_env` to its environment id (`''` for production), and
 /// `fleet_sha` carries each fleet's own deploy sha (an environment's errors
@@ -421,7 +471,7 @@ pub async fn ingest(
     fleet_sha: &HashMap<String, String>,
     spans: &[SpanErrorRow],
     logs: &[LogRow],
-    requests: &RequestIndex,
+    requests: &mut RequestIndex,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let mut by_trace: HashMap<&str, Vec<&str>> = HashMap::new();
     for row in logs {
@@ -463,7 +513,7 @@ pub async fn ingest(
             first_us: row.first_us,
             last_us: row.last_us,
             logs: trace_logs(&row.trace_id),
-            request: requests.get(&row.trace_id).cloned(),
+            request: take_request(requests, &row.trace_id),
             sha: fleet_sha.get(&row.slug).map(String::as_str),
             url: String::new(),
             release: String::new(),
@@ -504,7 +554,7 @@ pub async fn ingest(
             first_us: row.ts_us,
             last_us: row.ts_us,
             logs: trace_logs(&row.trace_id),
-            request: requests.get(&row.trace_id).cloned(),
+            request: take_request(requests, &row.trace_id),
             sha: fleet_sha.get(&row.slug).map(String::as_str),
             url: String::new(),
             release: String::new(),

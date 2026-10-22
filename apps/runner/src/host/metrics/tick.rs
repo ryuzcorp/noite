@@ -1,5 +1,5 @@
 //! The reconcile tick's telemetry pass, one named step per concern:
-//! sample CPU (1), ingest chunks (2), access log (3), compaction (3b),
+//! sample CPU (1), access log (2), ingest chunks (3), compaction (3b),
 //! persist versions + wake the log stream (4), prune (5) — same order, same
 //! error handling, same watermark semantics as the single-function original.
 //! The idempotency rule lives in `ingest::commit_chunk`: a failed pass never
@@ -67,9 +67,12 @@ pub async fn tick(
     let live_slugs: HashSet<String> = procs.lock().await.keys().cloned().collect();
 
     let cpu = sample_cpu_step(procs, control_pid, state, &keys.ids, &keys.envs);
+    // The tail runs before the ingest so a line already on disk joins its
+    // span in the same tick; a line that lands later backfills the stored
+    // occurrence when the next tail sees it (host/errors.rs `RequestIndex`).
+    accesslog_step(pool, cfg, &keys.ids, &keys.envs, state).await;
     let (mut touched, new_logs) =
         ingest_step(pool, cfg, state, &keys, &live_slugs, control_pid).await;
-    accesslog_step(pool, cfg, &keys.ids, &keys.envs, state).await;
     compact_step(pool, cfg, state, &keys.ids).await;
     persist_step(pool, &cpu, &mut touched, new_logs, log_tx).await?;
     prune_step(pool, cfg, state).await;
@@ -150,7 +153,7 @@ fn sample_cpu_step(
     cpu
 }
 
-/// Step 2 — ingest in hour-chunks (spec T3.1), at most once per flush interval
+/// Step 3 — ingest in hour-chunks (spec T3.1), at most once per flush interval
 /// (spec T3.4) — not every reconcile tick. Each chunk recomputes whole hours
 /// (plus the partial current hour) and REPLACES their aggregates, so
 /// re-reading is exact: a retry, a catch-up after downtime, and a replay are
@@ -315,9 +318,10 @@ async fn ingest_step(
     (touched, new_logs)
 }
 
-/// Step 3 — Caddy access log → device families, plus the trace → request index the
-/// error ingest joins on. Never fails the tick: a missing log (Caddy not yet
-/// reloaded) or a corrupt line is a silent skip.
+/// Step 2 — Caddy access log → device families, plus the trace → request index the
+/// error ingest joins on. Runs before the ingest so a line already on disk
+/// joins its span in the same tick; a line that lands later backfills the
+/// stored occurrence when the tail sees it. Never fails the tick:
 async fn accesslog_step(
     pool: &SqlitePool,
     cfg: &Config,

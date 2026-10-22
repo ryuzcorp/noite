@@ -152,6 +152,9 @@ pub struct NewErrorEvent<'a> {
 /// already stored. A re-read or replay of a window therefore adds only the
 /// occurrences that were genuinely missing, and keeps the request context the
 /// first ingest captured (the in-memory trace index is long gone on a replay).
+/// A span ingested before its access line was tailed stores empty request
+/// columns; the tail fills them with `backfill_error_request` when the line
+/// lands, which is the only writer that touches a stored row's request.
 pub async fn insert_error_event(pool: &SqlitePool, e: &NewErrorEvent<'_>) -> sqlx::Result<()> {
     sqlx::query(
         r#"INSERT INTO metrics.app_error_event
@@ -194,6 +197,51 @@ pub async fn insert_error_event(pool: &SqlitePool, e: &NewErrorEvent<'_>) -> sql
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// The request columns a late access-log line attaches to an occurrence.
+pub struct ErrorRequest<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub http_status: i64,
+    pub browser: &'a str,
+    pub os: &'a str,
+}
+
+/// Attach a late access-log line to an already-stored occurrence: fill the
+/// request columns only where the ingesting tick found no request (a span
+/// ingested before its access line was tailed). Never overwrites a context
+/// the ingest captured. Returns the rows healed.
+///
+/// Scoped to the line's own app and environment and to telemetry
+/// occurrences (`uncaught`, `logged`): an SDK or browser event carries a
+/// caller-supplied trace id and its own URL-derived path, and another
+/// app's occurrence sharing the trace id must never receive this app's
+/// request.
+pub async fn backfill_error_request(
+    pool: &SqlitePool,
+    app_id: &str,
+    environment_id: &str,
+    trace_id: &str,
+    request: &ErrorRequest<'_>,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE metrics.app_error_event \
+         SET method = ?, path = ?, http_status = ?, browser = ?, os = ? \
+         WHERE app_id = ? AND environment_id = ? AND trace_id = ? AND method = '' \
+           AND source IN ('uncaught', 'logged')",
+    )
+    .bind(request.method)
+    .bind(request.path)
+    .bind(request.http_status)
+    .bind(request.browser)
+    .bind(request.os)
+    .bind(app_id)
+    .bind(environment_id)
+    .bind(trace_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
 }
 
 /// Keep the newest `keep` occurrences of one issue.
