@@ -485,6 +485,11 @@ pub struct Config {
     /// does not follow it: celld measures container-scale working set, so a
     /// per-fleet value would close every fleet's ready gate.
     pub fleet_memory_mb: u32,
+    /// Ceiling for a tenant's per-app memory override in MiB
+    /// (`RUNNER_FLEET_MEMORY_MAX_MB`, default = the effective default cap):
+    /// in `multi` a tenant can only lower its cap, never raise it past this.
+    /// Single-tenant installs ignore it (the operator is the only admin).
+    pub fleet_memory_max_mb: u32,
     /// Cgroup v2 mount the runner manages fleet groups under
     /// (`RUNNER_CGROUP_ROOT`, `/sys/fs/cgroup`). Tests point it at a tempdir
     /// fake; operators leave it alone unless the container mounts cgroupfs
@@ -611,6 +616,15 @@ impl Config {
             &mut env_problems,
         );
         let (fleet_port_min, fleet_port_max) = parse_fleet_ports(&mut env_problems);
+        // The per-app ceiling defaults to the effective platform default, so
+        // in multi a tenant can only lower its cap until the operator raises
+        // the ceiling.
+        let fleet_memory_mb: u32 = env_num(
+            "RUNNER_FLEET_MEMORY_MB",
+            512,
+            "a non-negative integer",
+            &mut env_problems,
+        );
         let cfg = Self {
             bind: env_or(&["RUNNER_BIND"], "0.0.0.0:8080"),
             runner_token,
@@ -693,9 +707,10 @@ impl Config {
                 "a non-negative integer",
                 &mut env_problems,
             ),
-            fleet_memory_mb: env_num(
-                "RUNNER_FLEET_MEMORY_MB",
-                512,
+            fleet_memory_mb,
+            fleet_memory_max_mb: env_num(
+                "RUNNER_FLEET_MEMORY_MAX_MB",
+                fleet_memory_mb,
                 "a non-negative integer",
                 &mut env_problems,
             ),
@@ -1105,6 +1120,7 @@ pub(crate) fn config_for_tests() -> Config {
         environment_ttl_h: 168,
         fleet_max_rss_mb: 0,
         fleet_memory_mb: 512,
+        fleet_memory_max_mb: 512,
         cgroup_root: std::path::PathBuf::from("/sys/fs/cgroup"),
         fleet_idle_evict_s: 120,
         fleet_deploy_poll_s: 300,

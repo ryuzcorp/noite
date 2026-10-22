@@ -180,9 +180,14 @@ export const RateLimitsPanel = ({
             class="input input-sm"
             type="number"
             min="64"
+            max={current.defaults.memoryMaxMb ?? undefined}
             step="1"
             value={memoryText}
-            placeholder={`Default: ${current.defaults.memoryMb} MiB`}
+            placeholder={
+              current.defaults.memoryMaxMb === null
+                ? `Default: ${current.defaults.memoryMb} MiB`
+                : `Default: ${current.defaults.memoryMb} MiB (max ${current.defaults.memoryMaxMb})`
+            }
             disabled={!isAdmin || busy()}
             oninput={(e) => {
               memoryDraft.set(e.currentTarget.value);

@@ -552,12 +552,62 @@ pub fn fleet_cgroup_path(key: &str) -> Option<PathBuf> {
     anchor().map(|a| a.join(fleet_dir_name(key)))
 }
 
+/// A fleet that stays up past this long after a spawn starts a fresh OOM
+/// chain on its next kill instead of continuing the old one.
+const OOM_STABLE_SECS: u64 = 300;
+/// First respawn wait after an OOM kill; doubles per consecutive kill.
+const OOM_BACKOFF_BASE_SECS: u64 = 5;
+/// Longest respawn wait no matter how long the chain gets.
+const OOM_BACKOFF_CAP_SECS: u64 = 300;
+/// At most one tenant-visible OOM event per fleet per window; every restart
+/// still lands in the (ring-bounded) fleet log.
+const OOM_EVENT_WINDOW_SECS: u64 = 3600;
+
+/// Per-fleet OOM state: the spawn baseline for kill detection, plus the
+/// backoff and event-dedup clocks for a crash loop pinned at its cap. One
+/// entry per fleet with a live or recently-dead fleet; forgotten at stop.
+struct OomFleet {
+    baseline: Option<u64>,
+    spawned_at: std::time::Instant,
+    consecutive: u32,
+    last_event: Option<std::time::Instant>,
+    not_before: Option<std::time::Instant>,
+}
+
+impl Default for OomFleet {
+    fn default() -> Self {
+        Self {
+            baseline: None,
+            spawned_at: std::time::Instant::now(),
+            consecutive: 0,
+            last_event: None,
+            not_before: None,
+        }
+    }
+}
+
 /// OOM-kill baselines per fleet key, taken at spawn: `memory.events`
 /// `oom_kill` only grows inside a group, so a restart reports an OOM kill
-/// exactly when the counter moved since that fleet's own spawn. Entries are
-/// consumed by the first exit check after the spawn and forgotten at stop.
-static OOM_BASELINE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
+/// exactly when the counter moved since that fleet's own spawn.
+static OOM_FLEETS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, OomFleet>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// What one observed OOM kill means for the supervisor: how long to hold
+/// the respawn, whether the tenant event is due (deduped per window), and
+/// the event detail naming the cap in force.
+pub struct OomNote {
+    pub detail: String,
+    pub delay: std::time::Duration,
+    pub event_due: bool,
+}
+
+/// Respawn wait for N consecutive OOM kills: exponential from the base,
+/// capped. Pure arithmetic, pinned by unit tests.
+fn oom_backoff_delay(consecutive: u32) -> std::time::Duration {
+    let shift = consecutive.saturating_sub(1).min(6);
+    std::time::Duration::from_secs(OOM_BACKOFF_BASE_SECS * 2u64.pow(shift))
+        .min(std::time::Duration::from_secs(OOM_BACKOFF_CAP_SECS))
+}
 
 /// Current `oom_kill` count of a fleet group: how many times the kernel
 /// OOM-killed inside it. Unreadable (no cgroups, already removed) reads as
@@ -578,29 +628,94 @@ fn oom_kill_count(dir: &Path) -> u64 {
 }
 
 /// Remember this spawn's OOM-kill count, so the next exit check can tell an
-/// OOM kill from any other crash. Called with the fleet's own group dir.
+/// OOM kill from any other crash. Preserves the chain clocks across
+/// respawns; a hold the spawn passed is spent. Called with the fleet's own
+/// group dir.
 pub fn note_spawned(key: &str, dir: &Path) {
     let count = oom_kill_count(dir);
-    if let Ok(mut baseline) = OOM_BASELINE.lock() {
-        baseline.insert(key.to_string(), count);
+    if let Ok(mut fleets) = OOM_FLEETS.lock() {
+        let entry = fleets.entry(key.to_string()).or_default();
+        entry.baseline = Some(count);
+        entry.spawned_at = std::time::Instant::now();
+        entry.not_before = None;
     }
 }
 
 /// OOM kills since this fleet's own spawn. `Some(n)` with `n > 0` means the
-/// kernel killed inside the group and the supervisor is restarting it —
-/// record the tenant-visible event. Consumes the baseline: one spawn reports
-/// at most once. `None` means no baseline (spawned without cgroups, or a
-/// runner restart in between) — never report on that.
+/// kernel killed inside the group and the supervisor is restarting it.
+/// Consumes the baseline: one spawn reports at most once. `None` means no
+/// baseline (spawned without cgroups, or a runner restart in between).
 pub fn oom_kills_since_spawn(key: &str, dir: &Path) -> Option<u64> {
-    let baseline = OOM_BASELINE.lock().ok()?.remove(key)?;
+    let mut fleets = OOM_FLEETS.lock().ok()?;
+    let baseline = fleets.get_mut(key)?.baseline.take()?;
     oom_kill_count(dir).checked_sub(baseline)
 }
 
-/// Forget a stopped fleet's baseline (stop-time cleanup; a respawn records a
-/// fresh one). Best-effort: a missing entry is the common case.
+/// Record one observed OOM kill for a fleet: advance its consecutive-kill
+/// chain (reset when the fleet stayed up past the stable threshold), hold
+/// the next respawn by the backoff, and decide whether the tenant event is
+/// due (at most one per window; every restart still lands in the fleet log).
+pub fn oom_note_kill(key: &str, memory_mb: u32, now: std::time::Instant) -> Option<OomNote> {
+    let mut fleets = OOM_FLEETS.lock().ok()?;
+    let fleet = fleets.get_mut(key)?;
+    let uptime = now.duration_since(fleet.spawned_at);
+    fleet.consecutive = if uptime < std::time::Duration::from_secs(OOM_STABLE_SECS) {
+        fleet.consecutive.saturating_add(1).max(1)
+    } else {
+        1
+    };
+    let delay = oom_backoff_delay(fleet.consecutive);
+    let due = match fleet.last_event {
+        None => true,
+        Some(at) => now.duration_since(at) >= std::time::Duration::from_secs(OOM_EVENT_WINDOW_SECS),
+    };
+    if due {
+        fleet.last_event = Some(now);
+    }
+    fleet.not_before = Some(now + delay);
+    let detail =
+        format!("fleet restarted: memory limit {memory_mb} MiB exceeded (Settings → Limits)");
+    Some(OomNote {
+        detail,
+        delay,
+        event_due: due,
+    })
+}
+
+/// Whether a fleet's respawn hold has passed (or was never set). Expired
+/// holds are forgotten. Callers skip the spawn while this is false.
+pub fn oom_spawn_ready(key: &str, now: std::time::Instant) -> bool {
+    let Ok(mut fleets) = OOM_FLEETS.lock() else {
+        return true;
+    };
+    match fleets.get(key).and_then(|fleet| fleet.not_before) {
+        Some(at) if now < at => false,
+        _ => {
+            if let Some(fleet) = fleets.get_mut(key) {
+                fleet.not_before = None;
+            }
+            true
+        }
+    }
+}
+
+/// Whether `error` is the kernel reporting a gone process (ESRCH): a move
+/// target that exited mid-move. Only that case means nothing runs uncapped;
+/// every other refusal (EACCES, EPERM, read-only mount, no delegation) trips
+/// containment.
+#[cfg(unix)]
+pub fn is_gone(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| io.raw_os_error() == Some(libc::ESRCH))
+}
+
+/// Forget a stopped fleet's OOM state (stop-time cleanup; a respawn records
+/// a fresh one). Best-effort: a missing entry is the common case.
 pub fn forget_spawned(key: &str) {
-    if let Ok(mut baseline) = OOM_BASELINE.lock() {
-        baseline.remove(key);
+    if let Ok(mut fleets) = OOM_FLEETS.lock() {
+        fleets.remove(key);
     }
 }
 
@@ -904,6 +1019,75 @@ mod tests {
             None,
             "a restarted runner must not blame the previous boot"
         );
+    }
+
+    #[test]
+    fn consecutive_oom_kills_back_off_and_dedupe_the_event() {
+        let tmp = fakefs();
+        let key = format!("oom-loop-{}", crate::models::new_id());
+        let now = std::time::Instant::now();
+        // Three rapid kills: delays grow 5 s, 10 s, 20 s, but only the
+        // first records its tenant event.
+        let mut delays = Vec::new();
+        let mut events = 0;
+        for n in 1..=3u64 {
+            fake_events(tmp.path(), n - 1);
+            note_spawned(&key, tmp.path());
+            fake_events(tmp.path(), n);
+            assert_eq!(
+                oom_kills_since_spawn(&key, tmp.path()),
+                Some(1),
+                "kill {n} observed"
+            );
+            let note = oom_note_kill(&key, 256, now).expect("kill recorded");
+            assert!(
+                note.detail.contains("256 MiB"),
+                "the event names the cap in force"
+            );
+            delays.push(note.delay);
+            events += usize::from(note.event_due);
+        }
+        assert_eq!(
+            delays,
+            vec![
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(20)
+            ],
+            "respawn backoff grows exponentially"
+        );
+        assert_eq!(events, 1, "one tenant event per window, not one per kill");
+        assert!(
+            !oom_spawn_ready(&key, now),
+            "the respawn holds until the backoff passes"
+        );
+    }
+
+    #[test]
+    fn oom_backoff_caps_at_five_minutes() {
+        assert_eq!(oom_backoff_delay(1), std::time::Duration::from_secs(5));
+        assert_eq!(
+            oom_backoff_delay(7),
+            std::time::Duration::from_secs(300),
+            "the wait never exceeds the cap"
+        );
+        assert_eq!(
+            oom_backoff_delay(u32::MAX),
+            std::time::Duration::from_secs(300),
+            "no shift overflow past the cap"
+        );
+    }
+
+    #[test]
+    fn only_gone_processes_read_as_gone() {
+        let gone = anyhow::anyhow!(std::io::Error::from_raw_os_error(libc::ESRCH));
+        assert!(is_gone(&gone));
+        for raw in [libc::EACCES, libc::EPERM, libc::EBUSY, libc::EROFS] {
+            let denied = anyhow::anyhow!(std::io::Error::from_raw_os_error(raw));
+            assert!(!is_gone(&denied), "os error {raw} still trips containment");
+        }
+        let plain = anyhow::anyhow!("not even io");
+        assert!(!is_gone(&plain));
     }
 
     #[test]

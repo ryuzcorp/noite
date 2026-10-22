@@ -94,6 +94,26 @@ const assertFleetCgroups = async (
   );
 };
 
+// Tamper probes are the negative half of the cgroup story: every cgroupfs
+// write a tenant build attempts must fail. Present and refused, not merely
+// absent — a missing probe would pass the build loop above vacuously.
+const expectTamperProbes = (report: ProbeReport): void => {
+  for (const name of [
+    "tamper:write-memory-max",
+    "tamper:write-memory-swap-max",
+    "tamper:move-to-anchor",
+    "tamper:mkdir-fleet-child",
+    "tamper:subtree-control",
+  ]) {
+    const probe = report.build.probes[name];
+    expect(probe, `tamper probe ${name} present`).toBeDefined();
+    expect(
+      probe?.ok,
+      `tamper probe ${name} must fail: ${probe?.detail ?? ""}`
+    ).toBe(false);
+  }
+};
+
 // Hostile tenant (SPEC, Hostile-tenant suite): the Worker and build scripts
 // attempt each attack and report results as JSON; every attempt must fail
 // except internet egress. It only means something against an install that
@@ -177,6 +197,10 @@ test(
         false
       );
     }
+
+    // Tamper probes are asserted separately: every cgroupfs write a tenant
+    // build attempts must fail — present and refused, not merely absent.
+    expectTamperProbes(report);
 
     await assertFleetCgroups(request, report);
 

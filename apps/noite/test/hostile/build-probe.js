@@ -166,7 +166,7 @@ deny("read:sibling-build-cache", () => {
 // (`.../noite/runner`), so the anchor is its parent; every sibling directory
 // is a live tenant fleet. Throws (ok: false) when cgroups are inactive (no
 // anchor) or a fleet runs uncapped.
-try {
+const cgroupAnchor = () => {
   const selfLine = readFileSync("/proc/self/cgroup", "utf-8")
     .split("\n")
     .find((line) => line.startsWith("0::"));
@@ -183,6 +183,12 @@ try {
   const fleets = readdirSync(anchor, { withFileTypes: true })
     .filter((entry) => entry.isDirectory() && entry.name !== "runner")
     .map((entry) => entry.name);
+
+  return { anchor, fleets };
+};
+
+try {
+  const { anchor, fleets } = cgroupAnchor();
 
   const caps = fleets.map((name) => {
     const max = Number(
@@ -209,6 +215,66 @@ try {
     detail: String(error).slice(0, 200),
     ok: false,
   };
+
+  // Tamper probes are the negative half of the cgroup story: every write a
+  // tenant build attempts against the cgroupfs must fail. A success
+  // (ok: true) is a containment hole and fails the lane. Writes that would
+  // change state are written back verbatim (memory.max, swap.max), so even a
+  // miss is a no-op for the lane.
+  try {
+    const { anchor, fleets } = cgroupAnchor();
+
+    if (fleets.length === 0) {
+      throw new Error("no sibling fleet group to probe writes against", {
+        cause: error,
+      });
+    }
+
+    const leaf = `${anchor}/${fleets[0]}`;
+
+    deny("tamper:write-memory-max", () => {
+      const path = `${leaf}/memory.max`;
+      const current = readFileSync(path, "utf-8");
+      writeFileSync(path, current);
+
+      return "memory.max writable";
+    });
+    deny("tamper:write-memory-swap-max", () => {
+      const path = `${leaf}/memory.swap.max`;
+      const current = readFileSync(path, "utf-8");
+      writeFileSync(path, current);
+
+      return "memory.swap.max writable";
+    });
+    deny("tamper:move-to-anchor", () => {
+      writeFileSync(`${anchor}/cgroup.procs`, String(process.pid));
+
+      return "anchor cgroup.procs writable";
+    });
+    deny("tamper:mkdir-fleet-child", () => {
+      mkdirSync(`${leaf}/noite-tamper-probe`);
+
+      return "mkdir under fleet leaf writable";
+    });
+    deny("tamper:subtree-control", () => {
+      writeFileSync(`${anchor}/cgroup.subtree_control`, "+memory");
+
+      return "subtree_control writable";
+    });
+  } catch (error_) {
+    // No anchor, no fleet leaves: the tamper probes have nothing to write
+    // against. The positive probe above already fails the lane in that
+    // case; record the same shape here instead of crashing the build.
+    for (const name of [
+      "tamper:write-memory-max",
+      "tamper:write-memory-swap-max",
+      "tamper:move-to-anchor",
+      "tamper:mkdir-fleet-child",
+      "tamper:subtree-control",
+    ]) {
+      out[name] = { detail: String(error_).slice(0, 200), ok: false };
+    }
+  }
 }
 
 mkdirSync("dist", { recursive: true });
