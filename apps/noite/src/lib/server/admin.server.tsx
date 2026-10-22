@@ -36,10 +36,18 @@ interface DbUser {
 }
 
 /** Promote the env-anchored address to `admin` (idempotent, no-op if unset
- * or the user does not exist yet — they register first via passkeys). */
-const ensureAdminAccount = (email: string | null) =>
+ * or the user does not exist yet — they register first via passkeys). The
+ * caller passes the session's fresh role: better-auth reads the user row on
+ * every session read, so an admin needs no promotion round-trip and the
+ * SELECT is skipped, saving one sequential D1 query on every admin action.
+ * Exported for the round-trip-count unit test. */
+export const ensureAdminAccount = (email: string | null, role: string) =>
   Effect.gen(function* run() {
     if (!email) {
+      return;
+    }
+
+    if (role === "admin") {
       return;
     }
 
@@ -99,7 +107,7 @@ const requireAdmin = async (
     const anchored = resolveAdminEmail();
 
     if (anchored && email === anchored) {
-      await withDb(ensureAdminAccount(anchored));
+      await withDb(ensureAdminAccount(anchored, role));
 
       return { email, id: user.id, isAdmin: true };
     }

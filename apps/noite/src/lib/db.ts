@@ -416,12 +416,30 @@ const runDbSetup = Effect.gen(function* runDbSetup() {
  * well inside a request's own deadline instead of hanging it. */
 const SETUP_TIMEOUT_MS = 15_000;
 
-/** How long a request waits on a pass another request started before it drops
- * that pass and runs its own. celld cancels a request's pending work when that
- * request ends or its client goes away, so a shared pass can be orphaned
- * without ever failing — without this bound, every later request on the
- * isolate would wait on it forever. */
+/** How long a request waits on a pass another request started before it
+ * shares the single replacement pass instead. celld drops a request's
+ * pending work when that request answers or its client leaves, so a shared
+ * pass can be orphaned without ever failing — without this bound, every
+ * later request on the isolate would wait on it forever. */
 const SHARED_SETUP_WAIT_MS = 5000;
+
+/** A request-scoped lifetime for the shared setup pass: the middleware
+ * passes the worker's execution context, and the pass starter registers
+ * the pass with `waitUntil` so the pass survives its starter answering or
+ * disconnecting. An unregistered pass dies with its starter, and every
+ * waiter burns the full wait below (5 s, 10 s, 15 s stalls on actions and
+ * asset chunks alike — issues #91, #92, flake H). */
+export interface SetupLifetime {
+  waitUntil: (promise: Promise<unknown>) => void;
+}
+
+/** Per-request knobs for the shared setup pass: the worker lifetime that
+ * keeps the pass alive past its starter, and the wait bound (tests inject a
+ * small one and await real signals, never a sleep). */
+export interface EnsureDbOptions {
+  ctx?: SetupLifetime;
+  waitMs?: number;
+}
 
 /** One in-flight setup pass: its promise plus whether it settled. A settled
  * failure is dropped from the table so the next caller retries. */
@@ -447,7 +465,7 @@ const failAfter = async (promise: Promise<void>, ms: number): Promise<void> => {
   await Promise.race([promise, expiry]);
 };
 
-const startSetupPass = (db: D1Database): SetupPass => {
+const startSetupPass = (db: D1Database, ctx?: SetupLifetime): SetupPass => {
   const promise = failAfter(
     Effect.runPromise(
       runDbSetup.pipe(Effect.provide(D1Client.layer({ db })), Effect.scoped)
@@ -457,6 +475,21 @@ const startSetupPass = (db: D1Database): SetupPass => {
 
   const pass: SetupPass = { promise, settled: false };
   setupPasses.set(db, pass);
+
+  // Survive the starter: a pass whose request answers or disconnects first
+  // would otherwise hang every waiter to the full wait below. The derived
+  // promise settles with the pass without observing its failure (which
+  // travels on the pass promise itself, as before).
+  const tracked = (async (): Promise<void> => {
+    try {
+      await promise;
+    } catch {
+      // The setup failure travels on the pass promise itself; `waitUntil`
+      // only extends the pass lifetime past its starter.
+    }
+  })();
+
+  ctx?.waitUntil(tracked);
   void (async (): Promise<void> => {
     try {
       await promise;
@@ -475,20 +508,31 @@ const startSetupPass = (db: D1Database): SetupPass => {
 };
 
 /** At most one setup pass per isolate, per D1 binding (an isolate-once
- * helper, whose semantics this keeps: concurrent callers share one
- * pass, a failure or timeout clears it so the next request retries, and a
- * caller that has waited {@link SHARED_SETUP_WAIT_MS} runs its own instead
- * of hanging on a pass orphaned by a finished request. The binding is the
- * pass key, so a test that swaps in a fresh database gets a fresh pass. */
-const runDbSetupOnce = async (db: D1Database): Promise<void> => {
+ * helper, whose semantics this keeps): concurrent callers share one pass;
+ * the starter registers it with the worker lifetime so it survives the
+ * starter answering or disconnecting; a failure or timeout clears it so the
+ * next request retries; and a caller that has waited out its bound shares
+ * the single replacement pass instead of starting its own, so one slow
+ * pass can never turn N waiters into N concurrent migrations hammering
+ * celld's single-threaded D1. The binding is the pass key, so a test that
+ * swaps in a fresh database gets a fresh pass. */
+const runDbSetupOnce = async (
+  db: D1Database,
+  opts?: EnsureDbOptions
+): Promise<void> => {
+  const waitMs = opts?.waitMs ?? SHARED_SETUP_WAIT_MS;
   const cached = setupPasses.get(db);
 
   if (cached === undefined) {
-    return startSetupPass(db).promise;
+    return startSetupPass(db, opts?.ctx).promise;
   }
 
-  // A settled pass (ok or failed) answers false so the caller shares it;
-  // only an expired wait runs a fresh pass. `Promise.race` lets the first
+  if (cached.settled) {
+    return cached.promise;
+  }
+
+  // A settled pass answers false so the caller shares it; only an expired
+  // wait shares the single replacement pass. `Promise.race` lets the first
   // *settlement* win (see `failAfter`); the race handles both branches.
   const shared = (async (): Promise<boolean> => {
     try {
@@ -501,9 +545,7 @@ const runDbSetupOnce = async (db: D1Database): Promise<void> => {
     return false;
   })();
 
-  const elapsed = Effect.runPromise(
-    Effect.as(Effect.sleep(SHARED_SETUP_WAIT_MS), true)
-  );
+  const elapsed = Effect.runPromise(Effect.as(Effect.sleep(waitMs), true));
 
   const waited = await Promise.race([shared, elapsed]);
 
@@ -511,16 +553,26 @@ const runDbSetupOnce = async (db: D1Database): Promise<void> => {
     return cached.promise;
   }
 
-  if (!cached.settled && setupPasses.get(db) === cached) {
-    setupPasses.delete(db);
+  // Single-flight replacement: only the waiter that still sees the pass it
+  // waited on replaces it; a waiter that lost the race shares the winner's
+  // replacement. Both then await that pass outright: it is registered with
+  // the worker lifetime and bounded by its own timeout, and re-expiring
+  // here would replace it again, rebuilding the herd this removes.
+  const current = setupPasses.get(db);
+
+  if (current !== undefined && current !== cached) {
+    return current.promise;
   }
 
-  return startSetupPass(db).promise;
+  setupPasses.delete(db);
+
+  return startSetupPass(db, opts?.ctx).promise;
 };
 
 export const ensureDb = Effect.promise(() => runDbSetupOnce(resolveD1()));
 
-export const ensureDbPromise = (): Promise<void> => runDbSetupOnce(resolveD1());
+export const ensureDbPromise = (opts?: EnsureDbOptions): Promise<void> =>
+  runDbSetupOnce(resolveD1(), opts);
 
 /** Bound on one `withDb` unit of work. A D1 read that never answers fails
  * the action (the client sees an error) instead of leaving it pending. */

@@ -10,9 +10,10 @@
 //! still gates skeletons) and subscribes to reloads for its key. `data`
 //! paints the last good swr-store snapshot until the fresh fetch lands, and
 //! blanks while a reload is in flight — across SPA remounts and reloads.
-//! A failed mount load retries on its own (the cache keeps failures, so
-//! each retry invalidates first): a transient 504 paints rows instead of a
-//! dead empty panel. After a mutation call `invalidate(key)` or `res.refetch()`.
+//! A failed load is evicted, never cached: the shared cache keeps failures
+//! forever, so the failure is dropped when it lands and a later mount (or an
+//! explicit refetch) starts a fresh lookup. After a mutation call
+//! `invalidate(key)` or `res.refetch()`.
 import * as Cache from "effect/Cache";
 import * as Effect from "effect/Effect";
 import { atom, watch } from "ilha";
@@ -58,22 +59,6 @@ const generations = new Map<string, number>();
  * })`): bulky entries that would crowd the small sessionStorage quota. */
 const memoryOnly = new Set<string>();
 const subs = new Map<string, Set<KeySub>>();
-
-/** Extra mount loads after a failed first load: the 504 in the trace died
- * on its one attempt, so one retry would have saved it; two bounds the
- * added lane load while a sick lane keeps failing. */
-const MOUNT_RETRIES = 2;
-
-/** Delay between mount retries: a transient 504 costs its 15 s timeout, so
- * the retry waits only long enough for the lane contention to clear. */
-const MOUNT_RETRY_MS = 2000;
-
-/** Per-`tracked` options: snapshot persistence plus the mount-retry clock
- * (tests inject a small one and await the painted data, never a sleep). */
-export interface TrackedOptions {
-  mountRetryMs?: number;
-  persist?: boolean;
-}
 
 /** One cache for every resource key: concurrent reads share one lookup,
  * later reads hit the entry until `invalidate` drops it. No TTL — entries
@@ -158,65 +143,30 @@ const reload = async (key: string): Promise<unknown> => {
 };
 
 /** Serve the cache entry for `key` (concurrent mounts share one lookup) and
- * fan the landing out to every mounted reader. Answers whether the lookup
- * succeeded, so a failed mount load can schedule its own retry. */
-const settleGet = async (key: string, generation: number): Promise<boolean> => {
+ * fan the landing out to every mounted reader. A failure is evicted, never
+ * cached: the entry is dropped when the failure lands so a later mount (or
+ * an explicit refetch) starts a fresh lookup instead of re-serving it. */
+const settleGet = async (key: string, generation: number): Promise<void> => {
   try {
     const value = await Effect.runPromise(Cache.get(cache, key));
     settleKey(key, generation, { ok: true, value });
-
-    return true;
   } catch (error) {
     settleKey(key, generation, { error, ok: false });
 
-    return false;
+    if (generations.get(key) === generation) {
+      await Effect.runPromise(Cache.invalidate(cache, key));
+    }
   }
 };
 
 /** First paint for a newly mounted reader: serve the cache (concurrent mounts
  * of one key share the lookup) and settle every mounted reader when it lands.
- * A failed first load retries on its own, up to `MOUNT_RETRIES` times: the
- * cache keeps failures forever, so each retry invalidates first and blanks
- * the readers back to the skeleton while it lands. An explicit reload or an
- * unmount in between wins and the pending retry stands down. */
-const kick = (key: string, retryMs: number, attempt = 0): void => {
+ * A failed load surfaces on every reader's `error` and evicts the entry, so
+ * a remount refetches; nothing retries on a timer. */
+const kick = (key: string): void => {
   const generation = (generations.get(key) ?? 0) + 1;
   generations.set(key, generation);
-  void (async (): Promise<void> => {
-    if (attempt > 0) {
-      await Effect.runPromise(Cache.invalidate(cache, key));
-
-      if (generations.get(key) !== generation) {
-        return;
-      }
-
-      const readers = subs.get(key);
-
-      if (readers === undefined || readers.size === 0) {
-        return;
-      }
-
-      for (const sub of readers) {
-        sub.blank();
-      }
-    }
-
-    const ok = await settleGet(key, generation);
-
-    if (ok || attempt >= MOUNT_RETRIES) {
-      return;
-    }
-
-    if (generations.get(key) !== generation) {
-      return;
-    }
-
-    if ((subs.get(key)?.size ?? 0) === 0) {
-      return;
-    }
-
-    setTimeout(() => kick(key, retryMs, attempt + 1), retryMs);
-  })();
+  void settleGet(key, generation);
 };
 
 /** Drop the cached entry for `key` and reload every mounted reader. A key
@@ -246,12 +196,12 @@ export const invalidate = (key: string): void => {
  * undefined` skeleton check — it now only fires on a genuinely cold key.
  * `persist: false` keeps the snapshot in memory only, for bulky entries
  * (file contents, build logs) that would crowd the small sessionStorage
- * quota. A failed mount load retries on its own (`mountRetryMs` is its
- * clock); an explicit `refetch()` never retries — the caller decides. */
+ * quota. A failed load surfaces on `error` and evicts the entry, so a
+ * remount refetches; nothing retries on a timer. */
 export const tracked = <T>(
   key: string,
   fetcher: ResourceFetcher<T>,
-  opts?: TrackedOptions
+  opts?: { persist?: boolean }
 ): Resource<T> => {
   fetchers.set(key, fetcher);
 
@@ -300,7 +250,7 @@ export const tracked = <T>(
       readers.add(sub);
     }
 
-    kick(key, opts?.mountRetryMs ?? MOUNT_RETRY_MS);
+    kick(key);
 
     return (): void => {
       const live = subs.get(key);

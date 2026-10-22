@@ -1,3 +1,0 @@
-### Fixed
-
-- **A transient list failure no longer leaves a panel permanently empty.** A resource whose first load fails (for example, the admin Apps list hitting the 15 s action bound under lane load) used to settle into an error with no recovery: the shared cache keeps failures, so even leaving the tab and coming back re-served the same failure until a mutation forced a refetch. A failed mount load now retries on its own, twice with a short delay — each retry invalidates the cached failure first and blanks the readers back to the skeleton while it lands — then settles the error. An explicit refetch still fails fast: the caller decides.

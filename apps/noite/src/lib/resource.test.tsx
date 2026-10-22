@@ -144,39 +144,13 @@ const installDomFixture = (): (() => void) => {
   };
 };
 
-/** Deterministic retry clock: the mount retry queues here instead of on the
- * event loop, so the test fires retries by hand and never sleeps. */
-const installManualTimers = () => {
-  const queue: (() => void)[] = [];
-  const realSetTimeout = globalThis.setTimeout;
-  globalThis.setTimeout = ((handler: () => void): number => {
-    queue.push(handler);
-
-    return queue.length;
-  }) as typeof setTimeout;
-
-  return {
-    fire: (): void => {
-      const due = queue.splice(0);
-
-      for (const run of due) {
-        run();
-      }
-    },
-    pending: (): number => queue.length,
-    restore: (): void => {
-      globalThis.setTimeout = realSetTimeout;
-    },
-  };
-};
-
 /** Unique resource keys: the shared cache and snapshots persist per file. */
 let fetchKey = 0;
 
 const nextKey = (): string => {
   fetchKey += 1;
 
-  return `resource:test:mount-retry:${fetchKey}`;
+  return `resource:test:mount-evict:${fetchKey}`;
 };
 
 let captured: Resource<string[]> | undefined;
@@ -190,7 +164,7 @@ let probeFetch: () => Promise<string[]> = () => Promise.resolve([]);
 
 /** A mounted `tracked` reader reporting its paint and failure as signals. */
 const ResourceProbe = () => {
-  const res = tracked<string[]>(probeKey, probeFetch, { mountRetryMs: 1000 });
+  const res = tracked<string[]>(probeKey, probeFetch);
   captured = res;
   watch(res.data, (value) => {
     if (value !== undefined) {
@@ -224,55 +198,9 @@ const resetSignals = (): void => {
   signalSettled = undefined;
 };
 
-describe("tracked mount retry", () => {
-  test("a failed mount load retries with a fresh lookup and paints", async () => {
+describe("tracked mount failures", () => {
+  test("a failed mount load surfaces the error and never retries on its own", async () => {
     const restoreDom = installDomFixture();
-    const timers = installManualTimers();
-
-    try {
-      let calls = 0;
-      probeKey = nextKey();
-      probeFetch = () => {
-        calls += 1;
-
-        return calls === 1
-          ? Promise.reject(new Error("Request timed out"))
-          : Promise.resolve(["fresh"]);
-      };
-
-      const painted = nextPainted();
-      const settledOnce = nextSettled();
-      const ui = render(ResourceProbe);
-
-      try {
-        await ui.settled();
-        await settledOnce;
-        await ui.settled();
-        expect(calls).toBe(1);
-        expect(captured?.data()).toBeUndefined();
-        expect(timers.pending()).toBe(1);
-
-        timers.fire();
-        expect(await painted).toEqual(["fresh"]);
-        await ui.settled();
-        expect(calls).toBe(2);
-        expect(captured?.data()).toEqual(["fresh"]);
-        expect(captured?.error()).toBeUndefined();
-        expect(captured?.loading()).toBe(false);
-        expect(timers.pending()).toBe(0);
-      } finally {
-        ui.unmount();
-      }
-    } finally {
-      resetSignals();
-      timers.restore();
-      restoreDom();
-    }
-  });
-
-  test("a persistently failing mount load settles the error after bounded retries", async () => {
-    const restoreDom = installDomFixture();
-    const timers = installManualTimers();
 
     try {
       let calls = 0;
@@ -289,36 +217,22 @@ describe("tracked mount retry", () => {
       try {
         await ui.settled();
         await settledOnce;
+        await ui.settled();
         expect(calls).toBe(1);
-
-        const settledTwice = nextSettled();
-        timers.fire();
-        await settledTwice;
-        await ui.settled();
-        expect(calls).toBe(2);
-
-        const settledThrice = nextSettled();
-        timers.fire();
-        await settledThrice;
-        await ui.settled();
-        expect(calls).toBe(3);
         expect(captured?.data()).toBeUndefined();
         expect(captured?.error()).toBeInstanceOf(Error);
         expect(captured?.loading()).toBe(false);
-        expect(timers.pending()).toBe(0);
       } finally {
         ui.unmount();
       }
     } finally {
       resetSignals();
-      timers.restore();
       restoreDom();
     }
   });
 
-  test("an unmounted reader stands its retry down", async () => {
+  test("a failed mount load evicts the failure so a remount refetches", async () => {
     const restoreDom = installDomFixture();
-    const timers = installManualTimers();
 
     try {
       let calls = 0;
@@ -332,26 +246,42 @@ describe("tracked mount retry", () => {
       };
 
       const settledOnce = nextSettled();
-      const ui = render(ResourceProbe);
-      await ui.settled();
-      await settledOnce;
-      await ui.settled();
-      expect(timers.pending()).toBe(1);
+      const first = render(ResourceProbe);
 
-      ui.unmount();
-      timers.fire();
-      await ui.settled();
-      expect(calls).toBe(1);
+      try {
+        await first.settled();
+        await settledOnce;
+        await first.settled();
+        expect(calls).toBe(1);
+        expect(captured?.error()).toBeInstanceOf(Error);
+      } finally {
+        first.unmount();
+      }
+
+      // The failure was evicted when it landed, so mounting the same key
+      // again starts a fresh lookup instead of re-serving the error.
+      const painted = nextPainted();
+      const second = render(ResourceProbe);
+
+      try {
+        await second.settled();
+        expect(await painted).toEqual(["fresh"]);
+        await second.settled();
+        expect(calls).toBe(2);
+        expect(captured?.data()).toEqual(["fresh"]);
+        expect(captured?.error()).toBeUndefined();
+        expect(captured?.loading()).toBe(false);
+      } finally {
+        second.unmount();
+      }
     } finally {
       resetSignals();
-      timers.restore();
       restoreDom();
     }
   });
 
   test("a successful mount load fetches once", async () => {
     const restoreDom = installDomFixture();
-    const timers = installManualTimers();
 
     try {
       let calls = 0;
@@ -369,13 +299,11 @@ describe("tracked mount retry", () => {
         await ui.settled();
         expect(await painted).toEqual(["rows"]);
         expect(calls).toBe(1);
-        expect(timers.pending()).toBe(0);
       } finally {
         ui.unmount();
       }
     } finally {
       resetSignals();
-      timers.restore();
       restoreDom();
     }
   });
