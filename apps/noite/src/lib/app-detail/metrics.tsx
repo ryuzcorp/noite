@@ -2,6 +2,7 @@
 import { Link } from "@ilha/void";
 import { atom } from "ilha";
 
+import { api } from "../api";
 import { formatDateTime, formatHour } from "../dates";
 import { decodeMetrics, feedKeys, liveFeed, metricsUrl } from "../feeds";
 import type { MetricsFrame } from "../feeds";
@@ -616,12 +617,28 @@ export const MetricsCard = ({
   hours?: number;
   viewAllHref?: string;
 }) => {
-  // Usage over SSE: last snapshot (or skeleton when cold) until the first
-  // frame, then the stream pushes a frame only when the request total moves.
+  // Usage reads the initial snapshot (or the last snapshot, or a skeleton
+  // when cold) until the stream's first frame, then the stream pushes a
+  // frame only when the request total moves.
   const feed = liveFeed(
     feedKeys.metrics(appId, hours, environmentId),
     metricsUrl(appId, hours, environmentId),
-    decodeMetrics
+    decodeMetrics,
+    {
+      initial: async () => {
+        const frame = await api<string | null>("/api/metrics/metricsFrame", {
+          appId,
+          environmentId,
+          hours,
+        });
+
+        if (frame === null) {
+          throw new Error("metrics frame unavailable");
+        }
+
+        return decodeMetrics(frame);
+      },
+    }
   );
 
   // Read the frame (or its stored snapshot) directly: no copy into atoms,

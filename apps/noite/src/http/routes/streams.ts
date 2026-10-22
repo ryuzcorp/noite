@@ -200,8 +200,9 @@ export const metricsWindowHours = (request: Request): number => {
 
 /** Runner change counter (spec T3.6): NaN when the check itself fails, so
  * the poll below runs instead of skipping. `envQuery` scopes the gate to
- * one preview environment, like the frame poll. */
-const pollMetricsVersion = async (
+ * one preview environment, like the frame poll. Also reused by the metrics
+ * frame action (the stream's initial snapshot). */
+export const pollMetricsVersion = async (
   base: string,
   auth: { authorization: string },
   envQuery = ""
@@ -232,8 +233,9 @@ interface MetricsPoll {
   windowQuery: string;
 }
 
-/** One 5-call metrics poll: null when the request total hasn't moved. */
-const pollMetricsFrame = async (
+/** One 5-call metrics poll: null when the request total hasn't moved.
+ * Also reused by the metrics frame action (the stream's initial snapshot). */
+export const pollMetricsFrame = async (
   poll: MetricsPoll,
   lastTotal: number
 ): Promise<{ frame: string; total: number } | null> => {

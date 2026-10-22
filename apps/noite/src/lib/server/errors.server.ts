@@ -6,6 +6,7 @@ import { isControlApp } from "../control-app";
 import {
   runnerGetError,
   runnerGetIngestKey,
+  runnerListErrors,
   runnerRotateIngestKey,
   runnerSetErrorStatus,
 } from "../runner";
@@ -35,8 +36,9 @@ const ErrorStatusArgs = Schema.Struct({
  * reserved control app has no runner row and therefore no collaborator role,
  * so it is gated on the same real-admin / never-impersonating rule as the
  * control D1; every other app keeps its collaborator role. One function, so
- * the two paths cannot drift. */
-const requireTelemetryRole = async (
+ * the two paths cannot drift. Shared by the sibling telemetry lists
+ * (deploys, events, logs, metrics), whose streams gate the same way. */
+export const requireTelemetryRole = async (
   request: Request,
   env: KitEnv,
   appId: string,
@@ -51,6 +53,29 @@ const requireTelemetryRole = async (
   const user = await sessionUser(request, env);
   await requireAppRole(appId, user.id, need);
 };
+
+const ErrorListArgs = Schema.Struct({
+  appId: Schema.String,
+  environmentId: Schema.optional(Schema.String),
+  status: ErrorStatusSchema,
+});
+
+/** One status's issue list, optionally in one preview environment
+ * (absent/"" is production): the initial snapshot behind the live Errors
+ * tab, so the list renders current data even when the stream's first frame
+ * is delayed or lost. View-gated like the stream. */
+export const errorList = apiAction(
+  ErrorListArgs,
+  async ({ appId, environmentId, status }, { env, request }) => {
+    await requireTelemetryRole(request, env, appId, "view");
+
+    try {
+      return await runnerListErrors(appId, status, environmentId ?? "");
+    } catch (error) {
+      failUnknown(error);
+    }
+  }
+);
 
 /** One error with its recent occurrences, optionally in one preview
  * environment (stack, request, trace logs). Absent/"" is production. */

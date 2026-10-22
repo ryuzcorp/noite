@@ -362,7 +362,14 @@ const DeployFeedList = ({
   const feed = liveFeed(
     feedKeys.deploys(appId, environmentId),
     deploysUrl(appId, environmentId),
-    decodeDeploys
+    decodeDeploys,
+    {
+      initial: () =>
+        api<RunnerDeploy[]>("/api/apps/listDeploys", {
+          appId,
+          environmentId,
+        }),
+    }
   );
 
   const items = (): RunnerDeploy[] => feed.latest() ?? [];

@@ -1,8 +1,19 @@
-/* oxlint-disable anti-slop/no-chained-type-assertions, eslint/max-classes-per-file -- test doubles: a fake EventSource and document stand in for the browser globals connectStream reads */
+/* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/no-unsafe-dictionary-type, anti-slop/require-safety-comment-for-type-assertion, eslint/max-classes-per-file -- test doubles: a fake EventSource, document and mounted DOM stand in for the browser globals liveFeed reads, like the fixture in testing/dom */
 import { afterEach, describe, expect, test } from "bun:test";
 
-import { connectStream, createStreamHub, streamHubUrl } from "./feeds";
-import type { EventSourceStatus, StreamHooks } from "./feeds";
+import { atom } from "ilha";
+import type { AtomHandle } from "ilha";
+import { render } from "ilha/test";
+
+import {
+  connectStream,
+  createStreamHub,
+  liveFeed,
+  paintInitial,
+  streamHubUrl,
+} from "./feeds";
+import type { EventSourceStatus, LiveFeed, StreamHooks } from "./feeds";
+import { readSwr, writeSwr } from "./swr-store";
 
 type Listener = (event: { data?: string }) => void;
 
@@ -422,5 +433,381 @@ describe("createStreamHub", () => {
     expect(source?.closed).toBe(false);
     expect(again.messages).toEqual(['["line"]']);
     expect(again.statuses.at(-1)).toBe("open");
+  });
+});
+
+/** Unique feed keys: swr snapshots and the shared page hub persist per file. */
+let initialKey = 0;
+
+const nextInitialKey = (): string => {
+  initialKey += 1;
+
+  return `feed:test:initial:${initialKey}`;
+};
+
+let probeKey = "";
+let probeUrl = "";
+let probeFetch: () => Promise<string[]> = () => Promise.resolve([]);
+let capturedFeed: LiveFeed<string[]> | undefined;
+
+const readFeed = (): LiveFeed<string[]> | undefined => capturedFeed;
+
+/** Enough DOM for ilha's mount: the probes render one static span and only
+ * read atoms, so element creation, tree assembly, selection and teardown
+ * are faked — no layout, no events, no serialization. */
+/* eslint-disable eslint/no-use-before-define, eslint/class-methods-use-this, anti-slop/no-runtime-typeof -- test double: circular fake-DOM classes with DOM-shaped no-op methods; the string wrap mirrors Node.append */
+
+class FakeNode {
+  parent: FakeNode | null = null;
+
+  children: FakeNode[] = [];
+
+  append(...nodes: (FakeNode | string)[]): void {
+    for (const node of nodes) {
+      this.attach(
+        typeof node === "string" ? new FakeCharacterData(node) : node
+      );
+    }
+  }
+
+  prepend(...nodes: (FakeNode | string)[]): void {
+    for (const node of nodes.toReversed()) {
+      const child =
+        typeof node === "string" ? new FakeCharacterData(node) : node;
+
+      child.remove();
+      child.parent = this;
+      this.children.unshift(child);
+    }
+  }
+
+  hasChildNodes(): boolean {
+    return this.children.length > 0;
+  }
+
+  get firstChild(): FakeNode | null {
+    return this.children[0] ?? null;
+  }
+
+  get nextSibling(): FakeNode | null {
+    if (this.parent === null) {
+      return null;
+    }
+
+    const siblings = this.parent.children;
+
+    return siblings[siblings.indexOf(this) + 1] ?? null;
+  }
+
+  appendChild<T extends FakeNode>(child: T): T {
+    this.attach(child);
+
+    return child;
+  }
+
+  insertBefore<T extends FakeNode>(child: T, reference: FakeNode | null): T {
+    child.remove();
+    child.parent = this;
+    const at = reference === null ? -1 : this.children.indexOf(reference);
+
+    if (at === -1) {
+      this.children.push(child);
+    } else {
+      this.children.splice(at, 0, child);
+    }
+
+    return child;
+  }
+
+  removeChild<T extends FakeNode>(child: T): T {
+    if (child.parent === this) {
+      child.remove();
+    }
+
+    return child;
+  }
+
+  remove(): void {
+    if (this.parent === null) {
+      return;
+    }
+
+    const siblings = this.parent.children;
+    const at = siblings.indexOf(this);
+
+    if (at !== -1) {
+      siblings.splice(at, 1);
+    }
+
+    this.parent = null;
+  }
+
+  addEventListener(): void {}
+
+  removeEventListener(): void {}
+
+  private attach(child: FakeNode): void {
+    child.remove();
+    child.parent = this;
+    this.children.push(child);
+  }
+}
+
+class FakeElement extends FakeNode {
+  attributes = new Map<string, string>();
+
+  tagName: string;
+
+  constructor(tag: string) {
+    super();
+    this.tagName = tag;
+  }
+
+  setAttribute(name: string, value: string): void {
+    this.attributes.set(name, value);
+  }
+
+  removeAttribute(name: string): void {
+    this.attributes.delete(name);
+  }
+}
+
+class FakeCharacterData extends FakeNode {
+  data: string;
+
+  constructor(data: string) {
+    super();
+    this.data = data;
+  }
+}
+
+/* eslint-enable eslint/no-use-before-define, eslint/class-methods-use-this, anti-slop/no-runtime-typeof */
+
+const installDomFixture = (): (() => void) => {
+  const body = new FakeElement("body");
+
+  const document = {
+    activeElement: null,
+    addEventListener: (): void => {},
+    body,
+    createComment: (data: string): FakeCharacterData =>
+      new FakeCharacterData(data),
+    createDocumentFragment: (): FakeNode => new FakeNode(),
+    createElement: (tag: string): FakeElement => new FakeElement(tag),
+    createElementNS: (_ns: string, tag: string): FakeElement =>
+      new FakeElement(tag),
+    createRange: () => ({
+      createContextualFragment: (_html: string): FakeNode => new FakeNode(),
+    }),
+    createTextNode: (data: string): FakeCharacterData =>
+      new FakeCharacterData(data),
+    removeEventListener: (): void => {},
+  };
+
+  const globals = globalThis as unknown as Record<string, unknown>;
+  globals.document = document;
+  globals.window = {
+    addEventListener: (): void => {},
+    removeEventListener: (): void => {},
+  };
+  globals.HTMLElement = FakeElement;
+  globals.Element = FakeNode;
+  globals.Node = FakeNode;
+  globals.getSelection = () => null;
+  globals.requestAnimationFrame = (frame: (time: number) => void): number => {
+    frame(0);
+
+    return 0;
+  };
+
+  // SAFETY: the fake implements the EventSource surface liveFeed uses.
+  globals.EventSource = FakeSource as unknown as typeof EventSource;
+
+  return () => {
+    delete globals.document;
+    delete globals.window;
+    delete globals.HTMLElement;
+    delete globals.Element;
+    delete globals.Node;
+    delete globals.getSelection;
+    delete globals.requestAnimationFrame;
+    delete globals.EventSource;
+  };
+};
+
+/** Atoms and feeds run at the top level of a component: the probes capture
+ * the handles for the test to drive. */
+const FeedProbe = () => {
+  capturedFeed = liveFeed<string[]>(
+    probeKey,
+    probeUrl,
+    // SAFETY: the test frames are JSON string arrays by construction.
+    (raw: string) => JSON.parse(raw) as string[],
+    { initial: probeFetch }
+  );
+
+  return <span />;
+};
+
+let capturedAtoms: AtomHandle<string[] | undefined>[] = [];
+
+const AtomProbe = () => {
+  // oxlint-disable-next-line unicorn/no-useless-undefined -- the probe starts valueless; undefined is the seed
+  capturedAtoms.push(atom<string[] | undefined>(undefined));
+
+  return <span />;
+};
+
+const captureAtom = async (): Promise<{
+  latest: AtomHandle<string[] | undefined>;
+  unmount: () => void;
+}> => {
+  capturedAtoms = [];
+  const ui = render(AtomProbe);
+  await ui.settled();
+
+  const [latest] = capturedAtoms;
+
+  if (latest === undefined) {
+    throw new Error("the probe did not capture an atom");
+  }
+
+  return {
+    latest,
+    unmount: () => {
+      ui.unmount();
+    },
+  };
+};
+
+describe("liveFeed initial snapshot", () => {
+  test("a cold key paints the initial fetch when the stream never emits", async () => {
+    const restore = installDomFixture();
+
+    try {
+      probeKey = nextInitialKey();
+      probeUrl = `/api/apps/a/logs/stream:${initialKey}`;
+      probeFetch = () => Promise.resolve(["a", "b"]);
+      capturedFeed = undefined;
+      const ui = render(FeedProbe);
+      await ui.settled();
+
+      const feed = readFeed();
+
+      if (feed === undefined) {
+        throw new Error("the probe did not capture a feed");
+      }
+
+      expect(feed.latest()).toEqual(["a", "b"]);
+      expect(readSwr<string[]>(probeKey)).toEqual(["a", "b"]);
+      ui.unmount();
+    } finally {
+      restore();
+    }
+  });
+
+  test("a stream frame wins over a slower initial fetch", async () => {
+    const restore = installDomFixture();
+
+    try {
+      const key = nextInitialKey();
+      const { latest, unmount } = await captureAtom();
+      // The stream already delivered: the atom holds its frame.
+      latest.set(["stream"]);
+
+      let calls = 0;
+      await paintInitial(key, latest, {
+        initial: () => {
+          calls += 1;
+
+          return Promise.resolve(["stale"]);
+        },
+      });
+
+      expect(calls).toBe(1);
+      expect(latest()).toEqual(["stream"]);
+      expect(readSwr<string[]>(key)).toBeUndefined();
+      unmount();
+    } finally {
+      restore();
+    }
+  });
+
+  test("a failed initial fetch is ignored and leaves the stream live", async () => {
+    const restore = installDomFixture();
+
+    try {
+      const key = nextInitialKey();
+      const { latest, unmount } = await captureAtom();
+
+      await paintInitial(key, latest, {
+        initial: () => Promise.reject(new Error("runner away")),
+      });
+
+      expect(latest()).toBeUndefined();
+      expect(readSwr<string[]>(key)).toBeUndefined();
+      unmount();
+    } finally {
+      restore();
+    }
+  });
+
+  test("a warm key never fetches", async () => {
+    const restore = installDomFixture();
+
+    try {
+      const key = nextInitialKey();
+      writeSwr(key, ["cached"]);
+      const { latest, unmount } = await captureAtom();
+
+      let calls = 0;
+      await paintInitial(key, latest, {
+        initial: () => {
+          calls += 1;
+
+          return Promise.resolve(["fresh"]);
+        },
+      });
+
+      expect(calls).toBe(0);
+      expect(latest()).toBeUndefined();
+      unmount();
+    } finally {
+      restore();
+    }
+  });
+
+  test("panels on one key share one fetch", async () => {
+    const restore = installDomFixture();
+
+    try {
+      const key = nextInitialKey();
+      const { latest: first, unmount: unmountFirst } = await captureAtom();
+      const { latest: second, unmount: unmountSecond } = await captureAtom();
+
+      let calls = 0;
+      // One pending fetch both panels attach to: the second sees the
+      // in-flight entry and shares it instead of fetching again.
+      const shared = Promise.resolve(["shared"]);
+
+      const initial = (): Promise<string[]> => {
+        calls += 1;
+
+        return shared;
+      };
+
+      await Promise.all([
+        paintInitial(key, first, { initial }),
+        paintInitial(key, second, { initial }),
+      ]);
+
+      expect(calls).toBe(1);
+      expect(first()).toEqual(["shared"]);
+      expect(second()).toEqual(["shared"]);
+      unmountFirst();
+      unmountSecond();
+    } finally {
+      restore();
+    }
   });
 });
