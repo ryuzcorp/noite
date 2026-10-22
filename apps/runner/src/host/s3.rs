@@ -136,7 +136,10 @@ where
                 if attempt >= S3_MAX_ATTEMPTS {
                     return Err(e);
                 }
-                tracing::debug!(op, target, attempt, error = %e, "s3 attempt failed; retrying");
+                // Visible at the default level: a retried attempt is a stall
+                // (a 20 s list timeout, a 5xx) that a slow caller must be able
+                // to name, not only a final failure.
+                tracing::warn!(op, target, attempt, error = %format!("{e:#}"), "s3 attempt failed; retrying");
                 tokio::time::sleep(s3_retry_delay(attempt)).await;
             }
         }
