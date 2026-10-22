@@ -66,6 +66,12 @@ const pushNewRepo = (apiKey: string, slug: string) => {
         timeout: CHILD_PROC_TIMEOUT_MS,
       });
 
+      // A timeout (or a spawn failure) leaves `status` null with the reason
+      // on `error`: surface `ETIMEDOUT` itself, not an empty stderr.
+      if (run.error) {
+        throw run.error;
+      }
+
       if (run.status !== 0) {
         throw new Error(`git ${args.join(" ")}: ${run.stderr}`);
       }
