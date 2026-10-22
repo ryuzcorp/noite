@@ -9,6 +9,7 @@
 
 pub mod apps;
 pub mod deploys;
+pub(crate) mod detached;
 pub mod domains;
 pub mod env;
 pub mod env_gate;

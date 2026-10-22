@@ -305,21 +305,16 @@ pub async fn rename(
 }
 
 pub async fn delete(state: &AppState, id: &str) -> Result<(), ApiError> {
-    // A dropped HTTP handler must not cancel the purge halfway: the control
-    // plane times the call out after 5 s, and a cancelled delete leaves the
-    // app row, the fleet and the scoped credentials behind. The destructive
-    // work runs as its own task, so dropping this future only drops the
-    // waiter — the task runs to completion either way. The handler still
-    // awaits it, so a connected caller gets the real outcome.
+    // A dropped HTTP handler must not cancel the purge halfway (see
+    // `service::detached`): the work runs as its own task.
     let state = state.clone();
     let id = id.to_string();
-    match tokio::spawn(async move { delete_inner(&state, &id).await }).await {
-        Ok(result) => result,
-        Err(join) => Err(ApiError::internal(format!(
-            "app delete task failed: {join}"
-        ))),
-    }
+    super::detached::run(format!("app:{id}"), async move {
+        delete_inner(&state, &id).await
+    })
+    .await
 }
+
 async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     let app = app_or_404(state, id).await?;
     // Same lock as deploy: wait out an in-flight build, then purge exclusively.
@@ -778,6 +773,7 @@ mod tests {
         .expect("insert scoped key");
         gated.armed.store(true, std::sync::atomic::Ordering::SeqCst);
         let id = app.id.clone();
+        let done = crate::service::detached::finished(&format!("app:{id}"));
 
         // Drive the delete until the purge reaches S3, then drop the caller —
         // the control plane timing out is just the handler future going away.
@@ -792,23 +788,21 @@ mod tests {
         let _ = slot.take();
         gated.release.notify_one();
 
-        // The detached work still runs: the row must go and the key must stop
-        // being handed out.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let gone = crate::db::get_app(&state.pool, &id)
+        // The detached work still runs to its end — every effect, the key's
+        // revoke included, which lands after the row is gone. Waiting on the
+        // row alone raced that revoke (CI 39751293992). A delete cancelled
+        // with its caller never signals, and the bound turns that into a
+        // failure instead of a hang.
+        tokio::time::timeout(Duration::from_secs(30), done.notified())
+            .await
+            .expect("delete cancelled with its caller: the detached work never finished");
+        assert!(
+            crate::db::get_app(&state.pool, &id)
                 .await
                 .expect("lookup")
-                .is_none();
-            if gone {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "delete cancelled with its caller: the app row survived a dropped delete"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+                .is_none(),
+            "the app row survived a dropped delete"
+        );
         assert!(
             crate::db::live_scoped_credential(&state.pool, &format!("app:{id}"))
                 .await
@@ -847,6 +841,7 @@ mod tests {
         .await
         .expect("environment");
         gated.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let done = crate::service::detached::finished(&format!("env:{}", env.id));
 
         // Drive the teardown until it reaches S3, then drop the caller.
         let mut slot = Some(Box::pin(crate::service::environments::delete(
@@ -865,22 +860,18 @@ mod tests {
         let _ = slot.take();
         gated.release.notify_one();
 
-        // The detached work still runs: the row must go.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let gone = crate::db::get_environment(&state.pool, &env.id)
+        // The detached work still runs to its end; a teardown cancelled with
+        // its caller never signals, and the bound turns that into a failure.
+        tokio::time::timeout(Duration::from_secs(30), done.notified())
+            .await
+            .expect("teardown cancelled with its caller: the detached work never finished");
+        assert!(
+            crate::db::get_environment(&state.pool, &env.id)
                 .await
                 .expect("lookup")
-                .is_none();
-            if gone {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "teardown cancelled with its caller: the environment row survived a dropped delete"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+                .is_none(),
+            "the environment row survived a dropped delete"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

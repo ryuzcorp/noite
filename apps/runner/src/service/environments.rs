@@ -182,20 +182,16 @@ pub async fn delete(
     role: Option<&str>,
 ) -> Result<(), ApiError> {
     // Like app delete: a dropped HTTP handler must not cancel the teardown
-    // halfway and leave the fleet, the prefix or the row behind. The work
-    // runs as its own task; the handler still awaits it for the real outcome.
+    // halfway and leave the fleet, the prefix or the row behind (see
+    // `service::detached`).
     let state = state.clone();
     let id = id.to_string();
     let env_id = env_id.to_string();
     let role = role.map(str::to_string);
-    match tokio::spawn(async move { delete_inner(&state, &id, &env_id, role.as_deref()).await })
-        .await
-    {
-        Ok(result) => result,
-        Err(join) => Err(ApiError::internal(format!(
-            "environment delete task failed: {join}"
-        ))),
-    }
+    super::detached::run(format!("env:{env_id}"), async move {
+        delete_inner(&state, &id, &env_id, role.as_deref()).await
+    })
+    .await
 }
 
 async fn delete_inner(
