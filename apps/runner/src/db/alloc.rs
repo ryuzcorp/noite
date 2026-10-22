@@ -1,9 +1,47 @@
 //! Range-bounded resource allocation from persisted rows: per-app build uids
 //! (SPEC, Tenant isolation) and fleet ports (SPEC, Ports).
 
+use std::sync::LazyLock;
+
 use sqlx::SqlitePool;
+use tokio::sync::MutexGuard;
 
 use super::apps::list_all_apps;
+
+/// Serializes fleet-port pick-then-insert (SPEC, Ports). `next_ports_in`
+/// reads the lowest free pair from the app + environment rows, so two
+/// concurrent creates — two environments, or an app and an environment —
+/// can read the same free pair and start two fleets on one port; the loser
+/// then dies at bind with "celld exited before answering its health gate".
+/// A claim holds this lock from the pick until the row insert commits, so a
+/// concurrent claim always sees the earlier claim's ports. Single-process
+/// invariant, like `service::apps::CREATE_LOCK` (which stays outermost: app
+/// create holds `CREATE_LOCK` across purge → insert and the port claim
+/// inside it; environment creates hold only this lock).
+static PORT_ALLOC_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// A picked fleet-port pair plus the allocation lock, held until the
+/// app/environment row carrying the pair is inserted: dropping the claim
+/// before the insert reopens the race this exists to close.
+pub struct PortClaim {
+    pub listen: i64,
+    pub internal: i64,
+    _guard: MutexGuard<'static, ()>,
+}
+
+/// Lowest free pair, claimed: concurrent claims serialize on
+/// `PORT_ALLOC_LOCK` and never return the same pair. Hold the returned
+/// claim across the row insert, then drop it.
+pub async fn claim_ports_in(pool: &SqlitePool, min: u16, max: u16) -> sqlx::Result<PortClaim> {
+    let guard = PORT_ALLOC_LOCK.lock().await;
+    let (listen, internal) = next_ports_in(pool, min, max).await?;
+    Ok(PortClaim {
+        listen,
+        internal,
+        _guard: guard,
+    })
+}
 
 /// Lowest free uid in `[base, base + range)`, given every uid SQLite already
 /// holds (NULL rows are absent). `None` when the range is exhausted: callers
@@ -93,17 +131,26 @@ pub async fn next_ports_in(pool: &SqlitePool, min: u16, max: u16) -> sqlx::Resul
         .chain(envs.iter().flat_map(|e| [e.listen_port, e.internal_port]))
         .flatten()
     {
-        used.insert(p as u16);
+        // Only the allocator writes ports, so stored values are in range;
+        // a hand-edited row must neither reserve a live port by aliasing
+        // nor panic the scan.
+        if let Ok(port) = u16::try_from(p) {
+            used.insert(port);
+        }
     }
     let mut listen = min;
     loop {
-        if listen.saturating_add(1) > max {
+        let next = listen.saturating_add(1);
+        if next > max {
             return Err(sqlx::Error::RowNotFound);
         }
-        if !used.contains(&listen) && !used.contains(&(listen + 1)) {
-            return Ok((listen as i64, (listen + 1) as i64));
+        if !used.contains(&listen) && !used.contains(&next) {
+            return Ok((listen as i64, next as i64));
         }
-        listen = listen.saturating_add(2);
+        if next == max {
+            return Err(sqlx::Error::RowNotFound);
+        }
+        listen = next.saturating_add(1);
     }
 }
 
@@ -223,6 +270,95 @@ mod tests {
             ensure_app_build_uid(&pool, None, 4, "b").await.unwrap(),
             None
         );
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Concurrent creates must never take the same pair (SPEC, Ports): the
+    /// multi-lane flakes #94 and #96 started two fleets on one port and the
+    /// loser died at bind. Each task claims, yields so that without the claim
+    /// lock every pick would land before any insert, inserts its row, then
+    /// releases.
+    #[tokio::test]
+    async fn concurrent_port_claims_never_share_a_pair() {
+        let dir = std::env::temp_dir().join(format!("noite-ports-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        let pool = connect(&url).await.expect("boot");
+        let tasks: Vec<_> = (0..8)
+            .map(|n| {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    let ports = claim_ports_in(&pool, 20000, 20015).await.expect("claim");
+                    // Scheduler signal, not a wait: without the claim lock this
+                    // yield lets every other task's pick land first, which is
+                    // the interleaving that shared one pair in the lane.
+                    tokio::task::yield_now().await;
+                    sqlx::query(
+                        "INSERT INTO app (id, slug, name, subdomain, git_prefix, fleet_bucket, listen_port, internal_port, created_at, updated_at) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                    )
+                    .bind(format!("app-{}", n))
+                    .bind(format!("app-{}", n))
+                    .bind(format!("app-{}", n))
+                    .bind(format!("app-{}.localhost", n))
+                    .bind(format!("git/app-{}/", n))
+                    .bind(format!("s3://noite/fleets/app-{}", n))
+                    .bind(ports.listen)
+                    .bind(ports.internal)
+                    .execute(&pool)
+                    .await
+                    .expect("insert app");
+                    let pair = (ports.listen, ports.internal);
+                    drop(ports);
+                    pair
+                })
+            })
+            .collect();
+        let mut pairs = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            pairs.push(task.await.expect("join"));
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        assert_eq!(pairs.len(), 8, "concurrent claims shared a pair: {pairs:?}");
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The scan skips stored ports that cannot be a `u16` instead of
+    /// aliasing them onto a live port, and a full range errors instead of
+    /// wandering past `max` (or panicking at `u16::MAX`).
+    #[tokio::test]
+    async fn port_scan_ignores_unrepresentable_ports_and_reports_exhaustion() {
+        let dir = std::env::temp_dir().join(format!("noite-ports-edge-{}", new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        let pool = connect(&url).await.expect("boot");
+        sqlx::query(
+            "INSERT INTO app (id, slug, name, subdomain, git_prefix, fleet_bucket, listen_port, internal_port, created_at, updated_at) \
+             VALUES ('hand', 'hand', 'hand', 'hand.localhost', 'git/hand/', 's3://noite/fleets/hand', 99999, -7, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert hand-edited row");
+        // Neither out-of-range value reserves anything: the lowest pair wins.
+        assert_eq!(
+            next_ports_in(&pool, 20000, 20001)
+                .await
+                .expect("lowest pair"),
+            (20000, 20001)
+        );
+        insert_app(&pool, "full", "full").await;
+        sqlx::query("UPDATE app SET listen_port = 20000, internal_port = 20001 WHERE id = 'full'")
+            .execute(&pool)
+            .await
+            .expect("fill the range");
+        // The range holds one pair and it is taken: exhaustion, not a wander.
+        assert!(matches!(
+            next_ports_in(&pool, 20000, 20001).await,
+            Err(sqlx::Error::RowNotFound)
+        ));
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }

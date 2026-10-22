@@ -51,17 +51,19 @@ pub struct Manifest {
 /// Lock ordering (deadlock rule — every path below follows it, outer first):
 /// `CREATE_LOCK` (service/apps.rs, the create/rename critical section) →
 /// `AppLock` (host/deploy.rs, the per-app-id deploy/delete/rename claim) →
-/// `push_guard` (here, the per-slug git+S3+manifest mutex). A path that needs
+/// `push_guard` (here, the per-slug git+S3+manifest mutex) →
+/// `PORT_ALLOC_LOCK` (db/alloc.rs, the fleet-port pick-then-insert claim,
+/// leaf-only: pure SQL under it, never another lock). A path that needs
 /// fewer locks skips one, never reorders: create holds `CREATE_LOCK` then its
-/// slug's `push_guard`; delete holds `AppLock` then its slug's `push_guard`;
-/// a slug-changing rename holds all three (`CREATE_LOCK`, then `AppLock`,
-/// then both slugs' `push_guard`s). Tenant D1 reads and writes hold only
-/// their slug's `push_guard` (their project materialization runs
-/// `git checkout -f` on the shared bare repo, and two concurrent checkouts
-/// race on its index.lock). Pushes hold only their slug's `push_guard` and
-/// never claim `AppLock` while holding it, so waiting on an outer-held lock
-/// while holding an inner one cannot happen. Two slug guards are always taken
-/// in lexical slug order (see `push_guards`), so opposite renames cannot
+/// slug's `push_guard` plus the port claim at insert; delete holds `AppLock`
+/// then its slug's `push_guard`; a slug-changing rename holds all three
+/// (`CREATE_LOCK`, then `AppLock`, then both slugs' `push_guard`s). Tenant D1
+/// reads and writes hold only their slug's `push_guard` (their project
+/// materialization runs `git checkout -f` on the shared bare repo, and two
+/// concurrent checkouts race on its index.lock). Pushes hold only their slug's
+/// `push_guard` and never claim `AppLock` while holding it, so waiting on an
+/// outer-held lock while holding an inner one cannot happen. Two slug guards
+/// are always taken in lexical slug order (see `push_guards`), so opposite
 /// deadlock against each other.
 ///
 /// `applied_seq` only moves forward: a reader that syncs a manifest older
