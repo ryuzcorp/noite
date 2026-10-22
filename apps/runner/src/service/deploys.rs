@@ -14,15 +14,13 @@ pub fn sha_valid(sha: &str) -> bool {
 
 /// Deploy history, filtered by target: `environment_id = None` is the app's
 /// production history, `Some` one preview environment's (ROADMAP, the
-/// Deployments tab filters by environment). Lean rows like the stream
-/// (T1.7): finished rows carry no build log (fetch it from `log` on demand),
-/// only the newest in-flight row keeps its live log.
+/// Deployments tab filters by environment).
 pub async fn list(
     state: &AppState,
     id: &str,
     environment_id: Option<&str>,
 ) -> Result<Vec<Deploy>, ApiError> {
-    db::list_deploys_lean(&state.pool, id, environment_id)
+    db::list_deploys(&state.pool, id, environment_id)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))
 }
@@ -141,111 +139,4 @@ pub async fn rollback(state: &AppState, id: &str, sha: &str) -> Result<(String, 
     let out = (prepared.deploy_id.clone(), prepared.sha.clone());
     tokio::spawn(async move { prepared.run().await });
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    async fn test_state() -> AppState {
-        let dir =
-            std::env::temp_dir().join(format!("noite-deploys-list-{}", crate::models::new_id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let mut cfg = crate::config::config_for_tests();
-        cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
-        let config = Arc::new(cfg);
-        let pool = crate::db::connect(&config.database_url)
-            .await
-            .expect("connect db");
-        let (tip_tx, _tip_rx) = crate::host::tips::channel();
-        let (log_notify, _log_rx) = tokio::sync::watch::channel(0u64);
-        AppState {
-            pool,
-            config,
-            procs: crate::host::supervisor::new_procs(),
-            logs: crate::host::logs::new_state(),
-            deploying: crate::host::deploy::new_deploying(),
-            log_notify,
-            git_sync: crate::host::git_manifest::GitSync::default(),
-            tip_tx,
-            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            isolation: Arc::new(tokio::sync::RwLock::new(
-                crate::host::isolation::IsolationStatus::default(),
-            )),
-            state_sync: crate::host::state::StateSync::new(),
-            dns: std::sync::Arc::new(crate::dns::FakeResolver::default()),
-            bucket_ok: Arc::new(tokio::sync::RwLock::new((
-                true,
-                String::new(),
-                std::time::Instant::now(),
-            ))),
-            started_at: chrono::Utc::now(),
-            source_maps: Default::default(),
-        }
-    }
-
-    async fn seed_app(state: &AppState, slug: &str) -> crate::models::App {
-        db::create_app(
-            &state.pool,
-            &state.config,
-            db::NewApp {
-                name: slug,
-                slug,
-                user_id: "local",
-                subdomain: &format!("{slug}.localhost"),
-                listen: 30000,
-                internal: 30001,
-            },
-        )
-        .await
-        .expect("seed app")
-    }
-
-    #[tokio::test]
-    async fn list_serves_finished_rows_without_build_logs() {
-        let state = test_state().await;
-        let app = seed_app(&state, "lean").await;
-        db::upsert_deploy(
-            &state.pool,
-            None,
-            &app.id,
-            None,
-            "success",
-            Some("abc1234"),
-            "full build log",
-        )
-        .await
-        .expect("seed deploy");
-
-        let rows = list(&state, &app.id, None).await.expect("list");
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].log, "",
-            "a finished deploy's log rides its own endpoint, not every list row"
-        );
-    }
-
-    #[tokio::test]
-    async fn list_keeps_the_newest_in_flight_log() {
-        let state = test_state().await;
-        let app = seed_app(&state, "live").await;
-        db::upsert_deploy(
-            &state.pool,
-            None,
-            &app.id,
-            None,
-            "building",
-            Some("def5678"),
-            "live log",
-        )
-        .await
-        .expect("seed deploy");
-
-        let rows = list(&state, &app.id, None).await.expect("list");
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].log, "live log");
-    }
 }

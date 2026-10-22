@@ -22,7 +22,7 @@ import {
   runnerRetryImport,
   runnerRollback,
 } from "../runner";
-import type { RunnerApp, RunnerCreateSource } from "../runner";
+import type { RunnerApp, RunnerCreateSource, RunnerDeploy } from "../runner";
 import { apiAction, fail } from "./api";
 import { requireTelemetryRole } from "./errors.server";
 import { requireViewApp, sessionUser } from "./session.server";
@@ -396,6 +396,17 @@ const ListDeploysArgs = Schema.Struct({
   environmentId: Schema.optional(Schema.String),
 });
 
+/** Lean rows like the deploys stream (newest first): finished rows carry no
+ * build log (fetch it from `deployLog` on demand) — only the newest row
+ * keeps its live log while in flight. Exported for the unit tests. */
+export const leanDeployRows = (rows: RunnerDeploy[]): RunnerDeploy[] =>
+  rows.map((deploy, index) =>
+    index === 0 &&
+    (deploy.status === "building" || deploy.status === "deploying")
+      ? deploy
+      : { ...deploy, log: "" }
+  );
+
 /** Deploy history, optionally in one preview environment (absent/"" is
  * production): the initial snapshot behind the live Deployments list, so it
  * renders current data even when the stream's first frame is delayed or
@@ -406,7 +417,9 @@ export const listDeploys = apiAction(
     await requireTelemetryRole(request, env, appId, "view");
 
     try {
-      return await runnerListDeploys(appId, environmentId ?? "");
+      const rows = await runnerListDeploys(appId, environmentId ?? "");
+
+      return leanDeployRows(rows);
     } catch (error) {
       failUnknown(error);
     }
