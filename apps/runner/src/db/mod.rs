@@ -44,7 +44,7 @@ pub use credentials::{
 };
 pub use deploys::{
     fail_stuck_deploys, get_deploy_log, get_success_deploy, latest_deploy_status,
-    latest_deploy_status_for_env, list_deploys, list_deploys_lean, upsert_deploy,
+    latest_deploy_status_for_env, list_deploys, list_deploys_lean, mark_deploy_live, upsert_deploy,
 };
 pub use env::{delete_env, list_env, set_env, tenant_env};
 pub use environments::{

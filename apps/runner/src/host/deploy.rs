@@ -958,6 +958,12 @@ async fn deploy_inner(
         }
     }
 
+    // Healthy: route it at the edge before the row says so. Every Success
+    // write below re-applies the same transition, but a client that waits
+    // for the row (the CLI's push note, the UI, the e2e) must not reach the
+    // edge before its table carries the new target and get "Starting".
+    route_live(pool, cfg, &app.id, target.environment_id(), &commit_sha).await?;
+
     // Per-deploy source maps for the Errors tab (symbolication at read
     // time): the Worker map via a shadow esbuild run over the deployed entry,
     // plus every client map the build emitted. The shadow runs sandboxed as
@@ -996,13 +1002,29 @@ async fn deploy_inner(
         .log(DeployStatus::Success, "deploy complete\n")
         .await?;
     tracing::info!(fleet = %fleet, sha = %&commit_sha[..12.min(commit_sha.len())], "deploy ok");
-    if let Err(e) = crate::host::edge_table::push_routes(pool, cfg).await {
-        tracing::warn!(fleet = %fleet, error = %format!("{e:#}"), "edge push after deploy ok");
-    }
     // It is live: status, fleet and reload are all done above, so the
     // worktree wipe runs detached. Nothing that waits on this deploy — the app
     // lock, the next push, a delete — is held open by it.
     tokio::spawn(wipe_worktree(work));
+    Ok(())
+}
+
+/// Make a healthy deploy's target routable (its sha and `running`, the state
+/// `edge_table::serves` / `edge::env_live` read) and push the edge table, so
+/// the route exists before the deploy row first reads `success`. A DB error
+/// fails the deploy like any status write; a failed push is logged, and the
+/// reconcile tick's push is the backstop (as for every lifecycle push).
+async fn route_live(
+    pool: &SqlitePool,
+    cfg: &Config,
+    app_id: &str,
+    environment_id: Option<&str>,
+    sha: &str,
+) -> sqlx::Result<()> {
+    db::mark_deploy_live(pool, app_id, environment_id, sha).await?;
+    if let Err(e) = crate::host::edge_table::push_routes(pool, cfg).await {
+        tracing::warn!(app_id = %app_id, error = %format!("{e:#}"), "edge push before deploy success");
+    }
     Ok(())
 }
 
@@ -1319,10 +1341,69 @@ pub async fn deploy_tip(
 #[cfg(test)]
 mod tests {
     use super::{
-        contained_deploy_root, failure_summary, has_build_script, parse_wrangler_build,
+        contained_deploy_root, failure_summary, has_build_script, parse_wrangler_build, route_live,
         wipe_worktree, without_runner_keys,
     };
     use serde_json::json;
+
+    /// A client that waits for the deploy row (the CLI, the UI, the e2e)
+    /// sends its first request the moment the row reads `success`. The edge
+    /// table must already route a first deploy by then, or that request gets
+    /// the "Starting" fallback (503). Before this, the target only became
+    /// routable through the success write itself, and the table was pushed
+    /// after it.
+    #[tokio::test]
+    async fn a_first_deploy_is_routed_before_its_row_reads_success() {
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let dir =
+            std::env::temp_dir().join(format!("noite-route-live-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.routes_path = dir.join("routes.json").to_string_lossy().into_owned();
+        // Nothing listens here: the live push fails fast; the file is the table.
+        cfg.caddy_admin_url = "http://127.0.0.1:9".into();
+        let app = crate::db::create_app(
+            &pool,
+            &cfg,
+            crate::db::NewApp {
+                name: "blog",
+                slug: "blog",
+                user_id: "local",
+                subdomain: "blog.localhost",
+                listen: 30100,
+                internal: 30101,
+            },
+        )
+        .await
+        .expect("seed app");
+        let deploy_id =
+            crate::db::upsert_deploy(&pool, None, &app.id, None, "deploying", Some("abc123"), "")
+                .await
+                .expect("deploy row");
+
+        route_live(&pool, &cfg, &app.id, None, "abc123")
+            .await
+            .expect("route live");
+
+        let raw = std::fs::read_to_string(&cfg.routes_path).expect("route table written");
+        let table: crate::host::edge_table::EdgeTable =
+            serde_json::from_str(&raw).expect("route table");
+        let host = format!("blog.{}", cfg.tenant_bases()[0]).to_lowercase();
+        assert!(
+            table.exact.contains_key(&host),
+            "{host} not routed: {:?}",
+            table.exact.keys().collect::<Vec<_>>()
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM deploy WHERE id = ?")
+            .bind(&deploy_id)
+            .fetch_one(&pool)
+            .await
+            .expect("deploy status");
+        assert_eq!(status, "deploying", "routing must not announce the deploy");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[cfg(unix)]
     #[test]

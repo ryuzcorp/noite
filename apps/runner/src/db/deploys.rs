@@ -198,6 +198,31 @@ pub async fn upsert_deploy(
     Ok(id)
 }
 
+/// The success transition of a deploy's target: the sha it now serves, and
+/// `running` while it still wants to run (production: the app; a preview: its
+/// environment). This is what makes the target routable at the edge
+/// (`edge_table::serves`, `edge::env_live`), so a deploy calls it and pushes
+/// the route table *before* its row reads `success`: a client that waits for
+/// the row must find the edge already routing (the success upsert re-applies
+/// it idempotently).
+pub async fn mark_deploy_live(
+    pool: &SqlitePool,
+    app_id: &str,
+    environment_id: Option<&str>,
+    sha: &str,
+) -> sqlx::Result<()> {
+    match environment_id {
+        // `mark_environment_deployed` records the sha unconditionally and
+        // flips to running only while still wanted.
+        Some(environment_id) => mark_environment_deployed(pool, environment_id, sha).await,
+        None => {
+            record_app_deploy_sha(pool, app_id, sha).await?;
+            update_app_status_if_wanted(pool, app_id, AppStatus::Running.as_str(), None).await?;
+            Ok(())
+        }
+    }
+}
+
 /// Where a deploy row's status lands: the app (production) or its
 /// environment (preview). Every write is stop-race safe: the sha lands even
 /// when a stop raced the deploy, but `running`/`failed`/in-flight only apply
@@ -211,14 +236,21 @@ async fn apply_status(
     sha: Option<&str>,
     append_log: &str,
 ) -> sqlx::Result<()> {
+    if status == "success" {
+        return match sha {
+            Some(sha) => mark_deploy_live(pool, app_id, environment_id, sha).await,
+            None => match environment_id {
+                Some(environment_id) => {
+                    update_environment_status_if_wanted(pool, environment_id, "running", None)
+                        .await
+                        .map(|_| ())
+                }
+                None => Ok(()),
+            },
+        };
+    }
     let Some(environment_id) = environment_id else {
-        if status == "success" {
-            if let Some(sha) = sha {
-                record_app_deploy_sha(pool, app_id, sha).await?;
-                update_app_status_if_wanted(pool, app_id, AppStatus::Running.as_str(), None)
-                    .await?;
-            }
-        } else if status == "failed" {
+        if status == "failed" {
             update_app_status_if_wanted(
                 pool,
                 app_id,
@@ -232,14 +264,6 @@ async fn apply_status(
         return Ok(());
     };
     match status {
-        "success" => match sha {
-            // `mark_environment_deployed` records the sha unconditionally and
-            // flips to running only while still wanted.
-            Some(sha) => mark_environment_deployed(pool, environment_id, sha).await?,
-            None => {
-                update_environment_status_if_wanted(pool, environment_id, "running", None).await?;
-            }
-        },
         "failed" => {
             update_environment_status_if_wanted(
                 pool,
