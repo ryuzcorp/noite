@@ -110,7 +110,9 @@ jobs:
   # replicates — every past image-only breakage (trustedDependencies,
   # .assetsignore handling, SSR snapshot atoms) was green here. Single
   # platform plus the shared GHA cache (same scope as the release build, so
-  # main's layers warm the PR build) keeps it incremental.
+  # main's layers warm the PR build) keeps it incremental. Built once per run
+  # and handed to the e2e lanes as an artifact, so no lane rebuilds it
+  # (every lane paid ~280 s for its own build before).
   image:
     runs-on: ubuntu-latest
     permissions:
@@ -124,8 +126,23 @@ jobs:
           file: docker/Dockerfile
           target: noite
           push: false
+          load: true
+          tags: noite:ci
           cache-from: type=gha,scope=noite-linux/amd64
           cache-to: type=gha,mode=max,scope=noite-linux/amd64
+      - name: save lane image
+        run: |
+          mkdir -p /tmp/noite-image
+          docker save noite:ci | zstd -T0 -3 -o /tmp/noite-image/noite-ci.tar.zst
+          ls -la /tmp/noite-image
+      - name: upload lane image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: noite-ci-image
+          path: /tmp/noite-image/noite-ci.tar.zst
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
 
   # Which runtime-code filter decides the automatic fast run. The `e2e` label
   # upgrades a pull request to the release suite; docs-only PRs run no lane.
@@ -162,11 +179,20 @@ jobs:
   # Actions tab, always release on merge_group. The lanes live in e2e.yml,
   # which `images.yml` also runs as the release gate.
   e2e:
-    needs: changes
-    if: always() && (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'e2e') || needs.changes.outputs.code == 'true')
+    needs: [changes, image]
+    if: always() && needs.image.result == 'success' && (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'e2e') || needs.changes.outputs.code == 'true')
+    # Permission envelope for the called workflow: GitHub validates the
+    # callee's jobs against this. The lanes download the shared image
+    # artifact (`actions: read`) and the nightly follow-up files `flake`
+    # issues (`issues: write`).
+    permissions:
+      contents: read
+      actions: read
+      issues: write
     uses: ./.github/workflows/e2e.yml
     with:
       suite: ${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'e2e')) && 'release' || inputs.suite || 'fast' }}
+      image_artifact: noite-ci-image
 
   # The merge-queue gate (required check, with `security-gate`): fails if any
   # needed job failed or was cancelled. `skipped` is accepted only where the

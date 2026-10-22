@@ -19,6 +19,26 @@ const baseURL = process.env.E2E_BASE_URL ?? "http://noite.localhost:8090";
 // (per-app locks only), so concurrent deploys contend on CPU but proceed;
 // each deploy keeps its 8-minute budget, and 3 workers leave headroom on a
 // 4-vCPU GitHub runner.
+// Sharding across CI jobs (E2E_SHARD="<current>/<total>", set by e2e.yml):
+// each shard still runs the setup and policy dependency projects in full
+// (verified: Playwright repeats project dependencies on every shard), so
+// every shard signs up and probes policy beside its half of the bulk. Unset
+// locally means today's behaviour: one unsharded run.
+const shardValue = process.env.E2E_SHARD;
+let shard: { current: number; total: number } | undefined;
+
+if (shardValue !== undefined && shardValue !== "") {
+  const match = /^(?<current>\d+)\/(?<total>\d+)$/u.exec(shardValue);
+  const current = Number(match?.groups?.current);
+  const total = Number(match?.groups?.total);
+
+  if (match === null || total < 1 || current < 1 || current > total) {
+    throw new Error(`E2E_SHARD must be "<current>/<total>", not ${shardValue}`);
+  }
+
+  shard = { current, total };
+}
+
 const workers = Number(process.env.E2E_WORKERS ?? 3);
 
 // Two suites over the same specs (E2E_SUITE, set by docker/e2e-local.sh):
@@ -77,7 +97,15 @@ export default defineConfig({
       use: { storageState: "e2e/.auth/user.json" },
     },
   ],
-  reporter: [["list"], ["html", { open: "never" }]],
+  reporter: [
+    ["list"],
+    ["html", { open: "never" }],
+    // Machine-readable results for the nightly flake hunt (e2e.yml's flakes
+    // job reads this from the uploaded report). Local runs write it too,
+    // next to the html report; both are gitignored.
+    ["json", { outputFile: "playwright-report/e2e-results.json" }],
+  ],
+  shard,
   testDir: "./e2e",
   // Deploys (bun install + celld deploy + fleet boot) take minutes.
   timeout: 10 * 60_000,
