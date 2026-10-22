@@ -68,7 +68,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ACTION: ${{ github.event.action }}
           SENSITIVE: ${{ steps.filter.outputs.sensitive || 'true' }}
-          SENSITIVE_FILES: ${{ steps.filter.outputs.sensitive_files || 'no sensitive list on the base commit: every change counts as sensitive' }}
+          SENSITIVE_FILES: ${{ steps.filter.outputs.sensitive_files || 'no sensitive list on the base commit, so every change counts as sensitive' }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           if [ "${EVENT_NAME}" = "merge_group" ]; then
