@@ -729,3 +729,142 @@ async fn environment_rows_stay_separate_from_production() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+fn error_rows(trace: &str) -> IngestRows {
+    IngestRows {
+        minutes: Vec::new(),
+        spans: Vec::new(),
+        logs: Vec::new(),
+        errors: vec![errors::SpanErrorRow {
+            slug: "blog".to_string(),
+            error: "rejected: TypeError: boom [at f (worker.js:1:1)]".to_string(),
+            name: "celld.fetch".to_string(),
+            cell: String::new(),
+            trace_id: trace.to_string(),
+            count: 1,
+            first_us: H + 1_000_000,
+            last_us: H + 1_000_000,
+        }],
+    }
+}
+
+fn access_log_line(trace: &str) -> String {
+    serde_json::json!({
+        "request": {
+            "host": "blog.localhost",
+            "uri": "/boom?token=secret",
+            "method": "POST",
+            "headers": {"User-Agent": ["curl/8.18.0"], "Referer": [""]},
+        },
+        "status": 500,
+        "ts": 1_767_225_600.0,
+        "traceID": trace,
+    })
+    .to_string()
+}
+
+async fn stored_request(pool: &SqlitePool) -> (String, String, i64, String, String) {
+    sqlx::query_as("SELECT method, path, http_status, browser, os FROM metrics.app_error_event")
+        .fetch_one(pool)
+        .await
+        .expect("error event")
+}
+
+/// Flake G (alpha.9 blocker): the tick ingested a failed span before the
+/// access-log tail had seen its request, so the occurrence froze
+/// context-free (`method ""`) and the re-read dedup kept it that way. A
+/// late access line must still attach the request to the stored occurrence.
+#[tokio::test]
+async fn a_late_access_line_backfills_the_stored_occurrence() {
+    let (pool, dir) = test_pool("late-request").await;
+    let mut state = new_state();
+    let keys = FleetKeys {
+        ids: slug_id(),
+        envs: slug_env(),
+        shas: HashMap::new(),
+    };
+    // The span lands first: no access line tailed yet, so the occurrence
+    // stores without its request — exactly the flake's ordering.
+    commit_chunk(
+        &pool,
+        &mut state,
+        &keys,
+        &[("blog".to_string(), H, H + HOUR_US)],
+        error_rows("t-late"),
+        0,
+    )
+    .await
+    .expect("commit the span");
+    assert_eq!(
+        stored_request(&pool).await,
+        (
+            String::new(),
+            String::new(),
+            0,
+            String::new(),
+            String::new()
+        ),
+        "the span-first occurrence stores context-free"
+    );
+    // The access line lands a tick later; tailing it must heal the row.
+    let log = dir.join("access.log");
+    std::fs::write(&log, format!("{}\n", access_log_line("t-late"))).expect("log line");
+    let mut cfg = crate::config::config_for_tests();
+    cfg.caddy_access_log = log.to_string_lossy().into_owned();
+    crate::host::accesslog::tick(&pool, &cfg, &slug_id(), &slug_env(), &mut state.requests)
+        .await
+        .expect("tail the late line");
+    assert_eq!(
+        stored_request(&pool).await,
+        (
+            "POST".to_string(),
+            "/boom".to_string(),
+            500,
+            "CLI".to_string(),
+            String::new()
+        ),
+        "the late access line attaches the request"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The same join in the other order: a tailed line is already in the index
+/// when the span ingests, so the occurrence stores its request directly.
+#[tokio::test]
+async fn a_tailed_line_joins_at_ingest() {
+    let (pool, dir) = test_pool("early-request").await;
+    let mut state = new_state();
+    let log = dir.join("access.log");
+    std::fs::write(&log, format!("{}\n", access_log_line("t-early"))).expect("log line");
+    let mut cfg = crate::config::config_for_tests();
+    cfg.caddy_access_log = log.to_string_lossy().into_owned();
+    crate::host::accesslog::tick(&pool, &cfg, &slug_id(), &slug_env(), &mut state.requests)
+        .await
+        .expect("tail the line");
+    commit_chunk(
+        &pool,
+        &mut state,
+        &FleetKeys {
+            ids: slug_id(),
+            envs: slug_env(),
+            shas: HashMap::new(),
+        },
+        &[("blog".to_string(), H, H + HOUR_US)],
+        error_rows("t-early"),
+        0,
+    )
+    .await
+    .expect("commit the span");
+    assert_eq!(
+        stored_request(&pool).await,
+        (
+            "POST".to_string(),
+            "/boom".to_string(),
+            500,
+            "CLI".to_string(),
+            String::new()
+        ),
+        "the tailed line joins at ingest"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

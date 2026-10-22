@@ -336,7 +336,7 @@ async fn write_ingest_rows(
     keys: &FleetKeys,
     bounds: &[(String, i64, i64)],
     rows: IngestRows,
-    requests: &errors::RequestIndex,
+    requests: &mut errors::RequestIndex,
     prune_logs_before_us: i64,
 ) -> anyhow::Result<ChunkWrites> {
     let slug_id = &keys.ids;
@@ -432,7 +432,7 @@ pub(super) async fn commit_chunk(
         keys,
         bounds,
         rows,
-        &state.requests,
+        &mut state.requests,
         prune_logs_before_us,
     )
     .await?;

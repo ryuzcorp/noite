@@ -42,8 +42,9 @@ pub struct MetricsState {
     /// Last ingest pass: the DuckDB ingest runs at most once per
     /// `cfg.otel_flush_ms` (spec T3.4), not every reconcile tick.
     last_ingest: Option<std::time::Instant>,
-    /// Trace id → edge request, from the access log; read when an error's
-    /// span lands one flush later (host/errors.rs).
+    /// Trace id → edge request, from the access log; a span ingested before
+    /// its line was tailed stores its occurrence pending, and the tail
+    /// backfills the row when the line lands (host/errors.rs).
     requests: errors::RequestIndex,
     /// `requested_at` of the telemetry replay already rewound into
     /// `watermark`. The request row outlives it until every fleet catches up,

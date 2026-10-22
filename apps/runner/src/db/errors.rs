@@ -152,6 +152,9 @@ pub struct NewErrorEvent<'a> {
 /// already stored. A re-read or replay of a window therefore adds only the
 /// occurrences that were genuinely missing, and keeps the request context the
 /// first ingest captured (the in-memory trace index is long gone on a replay).
+/// A span ingested before its access line was tailed stores empty request
+/// columns; the tail fills them with `backfill_error_request` when the line
+/// lands, which is the only writer that touches a stored row's request.
 pub async fn insert_error_event(pool: &SqlitePool, e: &NewErrorEvent<'_>) -> sqlx::Result<()> {
     sqlx::query(
         r#"INSERT INTO metrics.app_error_event
@@ -194,6 +197,35 @@ pub async fn insert_error_event(pool: &SqlitePool, e: &NewErrorEvent<'_>) -> sql
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Attach a late access-log line to an already-stored occurrence: fill the
+/// request columns only where the ingesting tick found no request (a span
+/// ingested before its access line was tailed). Never overwrites a context
+/// the ingest captured. Returns the rows healed.
+pub async fn backfill_error_request(
+    pool: &SqlitePool,
+    trace_id: &str,
+    method: &str,
+    path: &str,
+    http_status: i64,
+    browser: &str,
+    os: &str,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE metrics.app_error_event \
+         SET method = ?, path = ?, http_status = ?, browser = ?, os = ? \
+         WHERE trace_id = ? AND method = ''",
+    )
+    .bind(method)
+    .bind(path)
+    .bind(http_status)
+    .bind(browser)
+    .bind(os)
+    .bind(trace_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
 }
 
 /// Keep the newest `keep` occurrences of one issue.
