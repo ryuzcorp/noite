@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { expect, test } from "@playwright/test";
 
 import {
+  CHILD_PROC_TIMEOUT_MS,
   E2E_EMAIL,
   E2E_NAME,
   createAppWithKey,
@@ -63,6 +64,8 @@ const runCli = (args: readonly string[]): string => {
   const proc = spawnSync("node", [cliBin, ...args], {
     encoding: "utf-8",
     env: { ...process.env },
+    killSignal: "SIGKILL",
+    timeout: CHILD_PROC_TIMEOUT_MS,
   });
 
   if (proc.error) {
@@ -105,7 +108,10 @@ const pushSeededBranch = (
         GIT_AUTHOR_NAME: E2E_NAME,
         GIT_COMMITTER_EMAIL: E2E_EMAIL,
         GIT_COMMITTER_NAME: E2E_NAME,
+        GIT_TERMINAL_PROMPT: "0",
       },
+      killSignal: "SIGKILL",
+      timeout: CHILD_PROC_TIMEOUT_MS,
     });
 
   git(["init", "-b", "main"]);
@@ -134,6 +140,8 @@ test.beforeAll(() => {
   const proc = spawnSync("bun", ["run", "build"], {
     cwd: cliDir,
     encoding: "utf-8",
+    killSignal: "SIGKILL",
+    timeout: CHILD_PROC_TIMEOUT_MS,
   });
 
   if (proc.error) {

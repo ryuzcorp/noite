@@ -155,6 +155,15 @@ while [ "$attempt" -lt 100 ]; do
         # shellcheck disable=SC2086
         $CLI inspect --format '{{.Name}} restarts={{.RestartCount}} oom_killed={{.State.OOMKilled}}' $id >> apps/noite/playwright-report/lane-stats.txt 2>&1 || true
       done
+      # A hung Playwright worker (a blocked event loop — a wedged `git`
+      # child held the multi lane open for 35 silent minutes in merge-queue
+      # run 39785255412) leaves no trace in the Playwright output either:
+      # the host process tree (parents included) names the stuck command
+      # and its arguments, the way the orphan `git` + `git-remote-http`
+      # pair did there. Host-side, so it also covers children the lane's
+      # containers never see.
+      ps -ef > apps/noite/playwright-report/lane-host-procs.txt 2>&1 || true
+      echo "==> lane failed — see lane-containers.log, lane-host-procs.txt and lane-stats.txt in the playwright-report artifact"
     fi
     if [ "$rc" -eq 0 ]; then
       # The operator's way back in after a lost passkey, through the image's
