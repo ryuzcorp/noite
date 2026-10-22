@@ -92,50 +92,6 @@ where
     })
 }
 
-/// TEMPORARY (fleet-oom root-cause): read a fleet's cgroup state for the
-/// lane — whether the celld pid sits in the capped leaf, the applied limits,
-/// current/peak usage, and the OOM counters. Removed before merge.
-async fn debug_fleet_cgroup(state: &AppState, id: &str) -> Result<serde_json::Value, ApiError> {
-    let app = service::apps::app_or_404(state, id).await?;
-    let dir = crate::host::cgroups::fleet_cgroup_path(&app.slug);
-    let read = |name: &str| -> String {
-        dir.as_ref()
-            .and_then(|d| std::fs::read_to_string(d.join(name)).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "<unreadable>".to_string())
-    };
-    let oom_kill = read("memory.events")
-        .lines()
-        .find_map(|line| {
-            let mut parts = line.split_whitespace();
-            (parts.next() == Some("oom_kill")).then(|| parts.next().unwrap_or("?").to_string())
-        })
-        .unwrap_or_else(|| "<unreadable>".to_string());
-    let procs = read("cgroup.procs");
-    let first_pid = procs.split_whitespace().next().unwrap_or("").to_string();
-    let pid_cgroup = if first_pid.is_empty() {
-        "<no member>".to_string()
-    } else {
-        std::fs::read_to_string(format!("/proc/{first_pid}/cgroup"))
-            .unwrap_or_default()
-            .lines()
-            .find_map(|line| line.strip_prefix("0::").map(str::to_string))
-            .unwrap_or_else(|| "<unreadable>".to_string())
-    };
-    Ok(serde_json::json!({
-        "dir": dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "<none>".to_string()),
-        "memory_max": read("memory.max"),
-        "memory_high": read("memory.high"),
-        "memory_swap_max": read("memory.swap.max"),
-        "memory_current": read("memory.current"),
-        "memory_peak": read("memory.peak"),
-        "memory_swap_current": read("memory.swap.current"),
-        "oom_kill": oom_kill,
-        "members": procs.split_whitespace().count(),
-        "pid_cgroup": pid_cgroup,
-    }))
-}
-
 pub async fn handle_rpc(State(state): State<AppState>, body: String) -> impl IntoResponse {
     let value: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
@@ -1337,21 +1293,6 @@ async fn dispatch_call(
                 id,
                 service::observe::logs_lines(state, &p.id, p.environment_id.as_deref()).await,
             )
-        }
-        // TEMPORARY (fleet-oom root-cause): on-demand read of a fleet's
-        // cgroup state — placement, applied limits, usage, OOM counters.
-        // Removed before merge; the permanent surface is the OOM app event.
-        "debug.fleet_cgroup" => {
-            #[derive(Deserialize)]
-            #[serde(rename_all = "camelCase")]
-            struct P {
-                id: String,
-            }
-            let p: P = match parse(params, &id) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            complete(id, debug_fleet_cgroup(state, &p.id).await)
         }
         "events.list" => {
             #[derive(Deserialize)]

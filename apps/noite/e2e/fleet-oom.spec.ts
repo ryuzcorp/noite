@@ -75,20 +75,6 @@ interface AppEvent {
   channel: string;
 }
 
-// TEMPORARY (fleet-oom root-cause): debug RPC shape. Removed with it.
-interface FleetCgroupDebug {
-  dir: string;
-  memory_max: string;
-  memory_high: string;
-  memory_swap_max: string;
-  memory_current: string;
-  memory_peak: string;
-  memory_swap_current: string;
-  oom_kill: string;
-  members: number;
-  pid_cgroup: string;
-}
-
 // Per-fleet OOM kills are tenant-visible (SPEC, Tenant isolation): a Worker
 // that allocates past its cap is killed inside its own group, the supervisor
 // restarts the fleet like any crash, and the kill records a `fleet` app
@@ -128,14 +114,6 @@ test(
     const deploy = await waitForDeploy(request, appId);
     expect(deploy.status).toBe("success");
 
-    // TEMPORARY (fleet-oom root-cause): baseline cgroup state before the
-    // bursts. Removed before merge with the debug RPC.
-    const before = await rpc<FleetCgroupDebug>(request, "debug.fleet_cgroup", {
-      id: appId,
-    });
-
-    console.log(`fleet cgroup before bursts: ${JSON.stringify(before)}`);
-
     const port = await appListenPort(request, appId);
 
     const get = async (path: string): Promise<number> => {
@@ -170,18 +148,10 @@ test(
       }
     }
 
-    // TEMPORARY (fleet-oom root-cause): post-burst state, whatever happened.
-    const after = await rpc<FleetCgroupDebug>(request, "debug.fleet_cgroup", {
-      id: appId,
-    });
-
-    console.log(`fleet cgroup after bursts: ${JSON.stringify(after)}`);
-
     // The kill itself, before the event: at least one burst request died
     // with the fleet. If the fleet survived every burst, no OOM kill
     // happened and no event is coming — fail here, not after a 120 s wait
-    // for the impossible. The before/after cgroup readings are in the
-    // report stdout (the TEMPORARY console.logs above).
+    // for the impossible.
     expect(
       killObserved,
       "fleet survived every growth burst (no OOM kill to observe)"
