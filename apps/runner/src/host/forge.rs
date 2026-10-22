@@ -271,7 +271,11 @@ async fn unborn_default(bare: &Path, reference: &str) -> anyhow::Result<bool> {
 
 /// Bring the mirror to the manifest. Warn-only, like `refresh_from_manifest`:
 /// a reader serves from what is local when the manifest cannot be read; a
-/// writer's `after_receive` still refuses to publish without it.
+/// writer's `after_receive` still refuses to publish without it. The manifest
+/// only moves forward, so a read at or below the newest applied seq is stale
+/// (a write this process published, or a sync it already ran): syncing to it
+/// would delete refs the newer state added — the flake where a branch missed
+/// from the refs list right after its create. Serve local instead.
 async fn apply_manifest(state: &AppState, slug: &str, bare: &Path) {
     let manifest = match git_manifest::read_manifest(&state.config, slug).await {
         Ok(Some(manifest)) => manifest,
@@ -281,7 +285,12 @@ async fn apply_manifest(state: &AppState, slug: &str, bare: &Path) {
             return;
         }
     };
-    if state.git_sync.applied_seq(slug).await == Some(manifest.seq) {
+    if state
+        .git_sync
+        .applied_seq(slug)
+        .await
+        .is_some_and(|applied| applied >= manifest.seq)
+    {
         return;
     }
     if let Err(e) = sync_to_manifest(&state.config, bare, &manifest).await {
@@ -1608,6 +1617,95 @@ mod tests {
         assert!(
             !refs_now.contains_key("refs/heads/feature"),
             "deleted branch came back: {refs_now:?}"
+        );
+
+        h.finish().await;
+    }
+    #[tokio::test]
+    async fn a_stale_manifest_read_keeps_a_fresh_branch() {
+        // The picker flake: `refs` right after a `branch_create` served a
+        // manifest read that predated the create, and the sync deleted the
+        // fresh ref from the mirror (then cached its absence). A manifest at
+        // or below the newest applied seq is stale and must never move the
+        // mirror backward, while a newer one still propagates a delete.
+        let h = Harness::new("stale-refs").await;
+        let bare = h.mirror().await;
+        let work = Work::new(&h.dir.join("scratch")).await;
+        work.write("f.txt", "base\n");
+        let base = work.commit("base").await;
+        work.branch("topic", &base).await;
+        work.write("t.txt", "topic\n");
+        let topic = work.commit("topic").await;
+        work.branch("main", &base).await;
+        let tips = seed_objects(&bare, &work).await;
+        let main = tips.get("main").expect("main tip").clone();
+        publish_ref(&h.state, &h.app, "main", None, Some(&main))
+            .await
+            .expect("publish main");
+        publish_ref(&h.state, &h.app, "topic", None, Some(&topic))
+            .await
+            .expect("publish topic");
+
+        let manifest = git_manifest::read_manifest(&h.state.config, &h.app.slug)
+            .await
+            .expect("manifest")
+            .expect("manifest");
+        assert_eq!(manifest.seq, 2);
+        assert!(manifest.refs.contains_key("refs/heads/topic"));
+
+        // Plant the pre-create manifest as if the store served a stale read
+        // right after the create's manifest flip.
+        let stale = git_manifest::Manifest {
+            version: git_manifest::MANIFEST_VERSION,
+            seq: 1,
+            refs: HashMap::from([(
+                "refs/heads/main".to_string(),
+                manifest.refs["refs/heads/main"].clone(),
+            )]),
+        };
+        git_manifest::write_manifest(&h.state.config, &h.app.slug, &stale)
+            .await
+            .expect("plant stale manifest");
+
+        // The refs read the picker performs next still lists the branch.
+        let bare = read_mirror(&h.state, &h.app.slug)
+            .await
+            .expect("read mirror");
+        let refs_now = refs(&bare, None).await.expect("refs");
+        assert!(
+            refs_now
+                .branches
+                .iter()
+                .any(|branch| branch.name == "topic"),
+            "fresh branch lost to a stale manifest: {:?}",
+            refs_now
+                .branches
+                .iter()
+                .map(|branch| branch.name.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        // A genuinely newer manifest without the branch (a delete the store
+        // already flipped) still propagates the delete.
+        let deleted = git_manifest::Manifest { seq: 3, ..stale };
+        git_manifest::write_manifest(&h.state.config, &h.app.slug, &deleted)
+            .await
+            .expect("plant delete manifest");
+        let bare = read_mirror(&h.state, &h.app.slug)
+            .await
+            .expect("read mirror");
+        let refs_now = refs(&bare, None).await.expect("refs");
+        assert!(
+            !refs_now
+                .branches
+                .iter()
+                .any(|branch| branch.name == "topic"),
+            "delete did not propagate: {:?}",
+            refs_now
+                .branches
+                .iter()
+                .map(|branch| branch.name.as_str())
+                .collect::<Vec<_>>()
         );
 
         h.finish().await;

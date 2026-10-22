@@ -273,12 +273,16 @@ pub(crate) async fn ensure_bare(cfg: &Config, slug: &str) -> anyhow::Result<Path
     if !bare.join("HEAD").exists() {
         init_bare(&bare).await?;
         hydrate_from_s3(cfg, &bare, slug).await?;
+        // Cold hydration only: the listing is not the linearization point, so
+        // a delete interrupted between the manifest flip and its prune left a
+        // tip bundle behind, and the manifest wins before anyone reads or
+        // writes through this mirror (warn-only — see
+        // `forge::sync_manifest_cfg`). Hot callers follow with a seq-guarded
+        // sync (`apply_manifest`, `refresh_from_manifest`); syncing here on
+        // every call would let one stale manifest read delete a ref a newer
+        // write just added.
+        crate::host::forge::sync_manifest_cfg(cfg, slug, &bare).await;
     }
-    // Hydration reads the raw bundle listing, which is not the linearization
-    // point: a delete interrupted between the manifest flip and its prune left
-    // a tip bundle behind. Make the manifest win before anyone reads or writes
-    // through this mirror (warn-only — see `forge::sync_manifest_cfg`).
-    crate::host::forge::sync_manifest_cfg(cfg, slug, &bare).await;
     Ok(bare)
 }
 
@@ -672,7 +676,9 @@ pub(crate) async fn after_receive(
 
 /// Re-apply the manifest to a bare mirror when it moved under us (another
 /// push landed since this mirror was hydrated). Warn-only: readers serve
-/// from what is local on failure, same as before manifests existed.
+/// from what is local on failure, same as before manifests existed. A read at
+/// or below the newest applied seq is stale, so it carries no new information
+/// and must not move refs backward; serve local instead.
 async fn refresh_from_manifest(state: &AppState, slug: &str, bare: &Path) {
     let manifest = match git_manifest::read_manifest(&state.config, slug).await {
         Ok(Some(m)) => m,
@@ -682,7 +688,12 @@ async fn refresh_from_manifest(state: &AppState, slug: &str, bare: &Path) {
             return;
         }
     };
-    if state.git_sync.applied_seq(slug).await == Some(manifest.seq) {
+    if state
+        .git_sync
+        .applied_seq(slug)
+        .await
+        .is_some_and(|applied| applied >= manifest.seq)
+    {
         return;
     }
     let local = list_refs(bare).await.unwrap_or_default();
