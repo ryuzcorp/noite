@@ -1,10 +1,11 @@
 import { CONTROL_HOST_DENIED_ASSETS } from "$lib/preview-host";
 import { expect, test } from "@playwright/test";
 
-// Raw-port lane: the control UI through Caddy on the lane's `*.localhost` base
-// (http://noite.localhost:8090), the runner API/git on raw :8080, tenant
-// fleets on their own ports. A host, never 127.0.0.1: the WebAuthn RP ID has
-// to match the origin.
+// Raw-port lane: the control UI through Caddy on the lane's `*.localhost` base,
+// the runner API/git on the lane's raw API port, tenant fleets on their own
+// ports. A host, never 127.0.0.1: the WebAuthn RP ID has to match the origin.
+const apiBase = process.env.E2E_API_BASE ?? "http://localhost:8080";
+
 test("control serves the UI", async ({ page }) => {
   // Authenticated sessions redirect /login to the app shell; either render
   // proves the worker serves the UI.
@@ -65,12 +66,12 @@ test("control UI still serves its own bundle", async ({ request }) => {
 });
 
 test("runner api requires a token", { tag: "@fast" }, async ({ request }) => {
-  const res = await request.get("http://localhost:8080/v1/apps");
+  const res = await request.get(`${apiBase}/v1/apps`);
   expect(res.status()).toBe(401);
 });
 
 test("runner health is public", async ({ request }) => {
-  const res = await request.get("http://localhost:8080/health");
+  const res = await request.get(`${apiBase}/health`);
   expect(res.ok()).toBe(true);
 });
 
@@ -80,7 +81,7 @@ test(
   async ({ request }) => {
     // ?service= routes past the "service required" 403 into the auth gate.
     const res = await request.get(
-      "http://localhost:8080/v1/git/e2e/info/refs?service=git-upload-pack"
+      `${apiBase}/v1/git/e2e/info/refs?service=git-upload-pack`
     );
 
     expect(res.status()).toBe(401);

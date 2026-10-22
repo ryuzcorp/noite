@@ -198,7 +198,11 @@ test("a worker throw becomes an errors-tab issue", async ({
   // sampled `traceparent` and logs the same `traceID` in the access log, so
   // the ingest joins the exception to its method, path and status
   // (host/errors.rs `RequestIndex`) — the join this spec's assertions pin.
-  const base = `http://${WORKER_ERRORS_SLUG}.noite.localhost:8090`;
+  const edgeHost = new URL(
+    process.env.E2E_BASE_URL ?? "http://noite.localhost:8090"
+  ).host;
+
+  const base = `http://${WORKER_ERRORS_SLUG}.${edgeHost}`;
   // A first deploy spawns the fleet; the site answers 502/503 until celld
   // listens.
   await expect

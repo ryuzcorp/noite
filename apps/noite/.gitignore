@@ -7,10 +7,14 @@
 .dev.vars
 .dev.vars*
 
-# playwright e2e: reports, traces, authed session
+# playwright e2e: reports, traces, authed session (plus per-slot copies when
+# parallel lanes share one checkout: E2E_SLOT=<n> uses the -<n> dirs)
 playwright-report/
+playwright-report-*/
 test-results/
+test-results-*/
 e2e/.auth/
+e2e/.auth-*/
 
 # local celld/wrangler data
 data/

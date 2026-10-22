@@ -1,0 +1,3 @@
+### Changed
+
+- **Parallel e2e lanes.** `E2E_SLOT=<n>` runs a lane in its own compose project (`noite-e2e-<n>`), container/volume/network names, bucket and port block (API/Caddy/store/fleet range all shift with the slot); unset or `0` is exactly today's lane, so CI is unaffected. `E2E_SLOT=auto` takes the first free slot lock. The script takes the slot's own lock itself (`/tmp/noite-e2e-lane-<slot>.lock`, bounded wait via `E2E_LOCK_WAIT`), so a lane can never run unlocked — drop any outer `flock` wrapper. `E2E_KEEP=1` sessions hold the slot until `E2E_SLOT=<n> make e2e-down` stops that slot's stack. The lane report now always includes `lane-containers.log`, `lane-caddy-access.log` and `lane-stats.txt` (bounded on green runs), so green runs can be compared with red ones.

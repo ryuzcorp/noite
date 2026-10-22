@@ -1,0 +1,8 @@
+# Parallel-lane overlay, applied only when E2E_SLOT > 0
+# (docker/e2e-local.sh adds it). It narrows the runner's fleet allocation to
+# the slot's published block. Slot 0 never applies this file, so its rendered
+# config stays byte-identical to the unparameterized lane.
+services:
+  noite:
+    environment:
+      NOITE_FLEET_PORTS: ${E2E_FLEET_PORTS:?E2E_FLEET_PORTS is set by e2e-local.sh for slots > 0}
