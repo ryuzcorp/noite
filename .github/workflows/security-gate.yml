@@ -1,0 +1,130 @@
+# Sensitive-change review gate (required check, with `ci-ok`).
+#
+# Any PR that touches `.github/security-paths.yml`'s `sensitive:` filter fails
+# here until a reviewer — never the change's own author — reads the diff and
+# adds the `security-reviewed` label. Adding that label re-runs this workflow
+# (`labeled`) and passes. New commits strip `security-reviewed` and fail
+# again, so every merged version of a sensitive change was reviewed.
+#
+# On `merge_group` this passes by itself: the PR-level check was already
+# required to enqueue, and the strip-on-synchronize above keeps it honest.
+#
+# Hardening: least privilege (`contents: read`, `pull-requests: write` only
+# on this label job), actions pinned by full SHA like the rest of the repo,
+# and no checkout of PR code is ever executed with write tokens — changed
+# files are listed through the API (paths-filter), the sensitive list is read
+# from the base commit, and the token only adds/removes labels. Never
+# `pull_request_target`.
+#
+# Residual risk, by design of `pull_request` workflows: a PR that edits THIS
+# file runs its own edited copy. Such a PR always touches
+# `.github/workflows/**`, so the reviewer reads the gate change itself before
+# labelling; a gate edit that exempts its own PR is a review finding.
+name: security-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+  merge_group:
+
+permissions:
+  contents: read
+
+# Its own group (never `ci-*`): label-triggered re-runs here must never cancel
+# the main gate, and vice versa. Re-runs supersede each other.
+concurrency:
+  group: security-gate-${{ github.event_name == 'merge_group' && github.sha || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security-gate:
+    name: security-gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # The sensitive list is read from the PR's BASE commit, never from the
+      # PR itself: a PR that edits `.github/security-paths.yml` cannot exempt
+      # its own files (the list change is sensitive under the base list).
+      # paths-filter lists the changed files through the API on
+      # pull_request; nothing from this checkout is executed.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name != 'merge_group'
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      # A base commit without the list (the PR that introduces it) fails
+      # closed: every change counts as sensitive and needs the label.
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        if: github.event_name != 'merge_group' && hashFiles('.github/security-paths.yml') != ''
+        id: filter
+        with:
+          filters: .github/security-paths.yml
+          list-files: csv
+      - name: evaluate gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          SENSITIVE: ${{ steps.filter.outputs.sensitive || 'true' }}
+          SENSITIVE_FILES: ${{ steps.filter.outputs.sensitive_files || 'no sensitive list on the base commit, so every change counts as sensitive' }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "${EVENT_NAME}" = "merge_group" ]; then
+            {
+              echo "## security-gate: pass (merge_group)"
+              echo ""
+              echo "The sensitive-change review was already required on each PR before it could enqueue, and new commits on a PR strip \`security-reviewed\` and fail that PR's gate. Nothing further to review on the queued merge."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          if [ "${SENSITIVE}" != "true" ]; then
+            {
+              echo "## security-gate: pass"
+              echo ""
+              echo "No changed file matches \`.github/security-paths.yml\` (\`sensitive:\`)."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          labels="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.labels[].name')"
+          has_reviewed="no"
+          has_sensitive="no"
+          printf '%s\n' "${labels}" | grep -qx 'security-reviewed' && has_reviewed="yes" || true
+          printf '%s\n' "${labels}" | grep -qx 'security-sensitive' && has_sensitive="yes" || true
+          {
+            echo "## security-gate: sensitive change"
+            echo ""
+            echo "Changed files matching \`sensitive:\`:"
+            echo ""
+            printf '%s' "${SENSITIVE_FILES}" | tr ',' '\n' | sed -e '/^[[:space:]]*$/d' -e 's/^[[:space:]]*/- `/' -e 's/[[:space:]]*$/`/'
+            echo ""
+          } >> "${GITHUB_STEP_SUMMARY}"
+          # New commits invalidate a prior review, even the author's own run:
+          # a fresh read of the new diff is required.
+          if [ "${EVENT_ACTION}" = "synchronize" ] && [ "${has_reviewed}" = "yes" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/security-reviewed" -X DELETE --silent || true
+            {
+              echo "New commits were pushed: removed \`security-reviewed\` — a fresh review of the new diff is required."
+              echo ""
+              echo "::error::new commits need a fresh security review"
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 1
+          fi
+          if [ "${has_sensitive}" = "no" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels" -f 'labels[]=security-sensitive' --silent > /dev/null
+          fi
+          if [ "${has_reviewed}" = "yes" ]; then
+            {
+              echo "Label \`security-reviewed\` is present: the sensitive diff was reviewed."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          {
+            echo "This change touches security-sensitive paths and is not yet reviewed."
+            echo "A reviewer must read the diff and add the \`security-reviewed\` label."
+            echo "The agent or author that wrote the change never labels their own PR."
+            echo ""
+            echo "::error::sensitive change needs the security-reviewed label"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          exit 1

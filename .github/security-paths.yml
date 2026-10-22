@@ -1,0 +1,91 @@
+# Security-sensitive paths (ONE filter key: `sensitive:`).
+#
+# `security-gate.yml` reads this file (dorny/paths-filter format, picomatch
+# globs) and requires a `security-reviewed` label on any PR that touches these
+# paths. `docker/pr-ready.ts` (slice B) reads it too, to warn locally.
+#
+# Comment each group with WHY it is here. Keep this list tight: a list that
+# matches everything trains people to rubber-stamp it. A path belongs here
+# only if a change to it can weaken authentication, authorization, isolation,
+# secret handling, or the integrity of what gets deployed or reviewed.
+sensitive:
+  # Scoped credentials: minting, storage, enforcement and the orphan sweep. A
+  # bug here forges, leaks or wrongly revokes a store or ingest credential.
+  - "apps/runner/src/host/credentials/**"
+  - "apps/runner/src/host/credentials*"
+  - "apps/runner/src/db/credentials.rs"
+  - "apps/runner/src/db/ingest_keys.rs"
+
+  # Authentication and authorization: bearer gating and roles (runner),
+  # the route table that decides what is exposed and what auth wraps it,
+  # collaborator gating on git push, and the preview-environment access gate.
+  - "apps/runner/src/auth.rs"
+  - "apps/runner/src/api/router.rs"
+  - "apps/runner/src/host/git_identity.rs"
+  - "apps/runner/src/host/git_policy.rs"
+  - "apps/runner/src/host/env_gate.rs"
+  # The admin-role gate on per-app limits (#79).
+  - "apps/runner/src/service/limits.rs"
+  # Invite-only signup and the platform limiter that throttles auth and
+  # envelope ingest (brute force, key enumeration).
+  - "apps/noite/src/lib/server/invites.server.ts"
+  - "apps/noite/src/lib/rate-limit.ts"
+
+  # Auth, sessions and passkeys in the control UI, including every route
+  # middleware (pod-host gate, rate limiter, request timeout): the code that
+  # decides who the caller is before any action runs.
+  - "apps/noite/src/lib/auth/**"
+  - "apps/noite/src/lib/auth.ts"
+  - "apps/noite/src/lib/auth-client.ts"
+  - "apps/noite/src/http/session.ts"
+  - "apps/noite/src/http/routes/auth.ts"
+  - "apps/noite/src/lib/server/session.server.ts"
+  - "apps/noite/src/middleware/**"
+
+  # Sandboxed execution and tenant isolation: what a build or fleet process
+  # can reach, and the uid/cgroup/memory containment around it.
+  - "apps/runner/src/host/exec.rs"
+  - "apps/runner/src/host/isolation.rs"
+  - "apps/runner/src/host/netisolation.rs"
+  - "apps/runner/src/host/cgroups.rs"
+  - "apps/runner/src/db/alloc.rs"
+  # The end-to-end proofs of isolation and hardening: weakening these
+  # silently weakens every isolation claim above.
+  - "apps/noite/e2e/hostile.spec.ts"
+  - "apps/noite/e2e/hardening.spec.ts"
+
+  # Deletion and purge paths: a change here can strand credentials, fleets or
+  # app data, or delete what should survive.
+  - "apps/runner/src/host/purge.rs"
+  - "apps/runner/src/host/env_teardown.rs"
+
+  # Edge routing: the Caddy route table that maps public hostnames to control,
+  # runner and tenant backends. A wrong row exposes an internal service.
+  - "apps/runner/src/host/edge.rs"
+  - "apps/runner/src/host/edge_table.rs"
+
+  # Secrets and environment handling: env loading, per-app/per-environment
+  # values, the env-auth route, and the documented secret surface itself.
+  - "apps/runner/src/config.rs"
+  - "apps/runner/src/db/env.rs"
+  - "apps/noite/src/lib/server/env.server.ts"
+  - "apps/noite/src/lib/server/environments.server.ts"
+  - "apps/noite/src/http/routes/env-auth.ts"
+  - ".env.example"
+  - "docker/compose*.yaml"
+
+  # The release image and its entrypoints: everything inside the trust
+  # boundary ships from here, including the third-party binaries baked in.
+  - "docker/Dockerfile"
+  - "docker/dev.sh"
+  - "docker/install-sidecars.sh"
+  - "docker/install.sh"
+  - "docker/uninstall.sh"
+  - "docker/backup.sh"
+  - "docker/restore.sh"
+
+  # The gates themselves: workflows, this list, and the reviewer config.
+  # Weakening review or CI silently weakens every path above.
+  - ".github/workflows/**"
+  - ".github/security-paths.yml"
+  - ".coderabbit.yaml"
