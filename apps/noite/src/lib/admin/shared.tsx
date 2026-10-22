@@ -3,9 +3,42 @@
 //! holds only its rows.
 
 import { atom } from "ilha";
-import type { View } from "ilha";
+import type { AtomHandle, View } from "ilha";
 
 import { errorMessage } from "../errors";
+
+/** Run a panel mutation and reload the list afterwards — on success AND on
+ * error. A mutation that finished server-side while the client timed out
+ * must not leave a stale row: the reload paints the truth under the banner.
+ * A failed reload never masks the mutation's own error. */
+export const mutatePanel = async <T,>(
+  busy: AtomHandle<boolean>,
+  panelError: AtomHandle<string>,
+  // oxlint-disable-next-line anti-slop/no-unknown-returns -- the reload is type-erased: callers pass their own resource's refetch, and mutatePanel never reads the value.
+  refetch: () => Promise<unknown>,
+  work: () => Promise<T>
+): Promise<void> => {
+  busy.set(true);
+  panelError.set("");
+
+  let failed = false;
+  let failure: unknown;
+
+  try {
+    await work();
+  } catch (error) {
+    failed = true;
+    failure = error;
+  }
+
+  await refetch().catch(() => null);
+
+  if (failed) {
+    panelError.set(errorMessage(failure));
+  }
+
+  busy.set(false);
+};
 
 /** The three tabs share one layout so switching between them moves nothing:
  * the same card (header, note, rows), the same control sizes, and the same

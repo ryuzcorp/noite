@@ -4,7 +4,7 @@ import { useRouter } from "@ilha/void";
 import { atom } from "ilha";
 import type { View } from "ilha";
 
-import { api } from "../../api";
+import { ApiError, api } from "../../api";
 import { appHost } from "../../apps/identity";
 import { errorMessage } from "../../errors";
 import { dropAppFromSnapshot } from "../../feeds";
@@ -190,6 +190,28 @@ export const AppDangerZone = ({
                 dropAppFromSnapshot(appId);
                 router.visit("/apps");
               } catch (error) {
+                // A delete that finished server-side while the client timed
+                // out must not strand this page: re-read the app, and when
+                // it is gone follow the success path. A deleted app fails
+                // the role gate with "App not found" (collaborators.ts),
+                // which reaches the browser as a 401 ApiError.
+                let gone = false;
+
+                try {
+                  await api("/api/apps/get", appId);
+                } catch (readError) {
+                  gone =
+                    readError instanceof ApiError &&
+                    readError.message.includes("App not found");
+                }
+
+                if (gone) {
+                  dropAppFromSnapshot(appId);
+                  router.visit("/apps");
+
+                  return;
+                }
+
                 notice.set(errorMessage(error));
               }
             }}

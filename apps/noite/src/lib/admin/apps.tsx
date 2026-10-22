@@ -7,7 +7,6 @@ import type { View } from "ilha";
 import { api } from "../api";
 import type { AdminAppRow } from "../api-types";
 import { presenceTone } from "../apps/identity";
-import { errorMessage } from "../errors";
 import { listAllApps } from "../resources";
 import { searchParam } from "../search-param";
 import { Avatar } from "../ui/avatar";
@@ -22,6 +21,7 @@ import {
   SearchForm,
   SkeletonRows,
   W_SM,
+  mutatePanel,
 } from "./shared";
 
 interface AdminAppRowProps {
@@ -109,17 +109,7 @@ export const AdminAppsPanel = () => {
     : apps;
 
   const mutate = async <T,>(work: () => Promise<T>): Promise<void> => {
-    busy.set(true);
-    panelError.set("");
-
-    try {
-      await work();
-      await res.refetch();
-    } catch (error) {
-      panelError.set(errorMessage(error));
-    }
-
-    busy.set(false);
+    await mutatePanel(busy, panelError, () => res.refetch(), work);
   };
 
   const loading = res.loading() && res.data() === undefined;
