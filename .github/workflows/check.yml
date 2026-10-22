@@ -33,6 +33,8 @@ jobs:
         run: bun run check
       - name: version pins
         run: bun docker/check-versions.ts
+      - name: docker script tests
+        run: bun test docker/
       # `config` needs no daemon, so a broken compose file fails here instead
       # of on someone's server. Every variant, including the test overlays.
       - name: render compose (prod, build, dev, e2e, multi)

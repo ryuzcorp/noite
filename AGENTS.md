@@ -16,6 +16,7 @@ Ground truth for working on Noite. Read this before touching code — the rules 
   - Lint + format: `bun run check` (this is `ultracite check`)
   - Auto-fix: `bun x ultracite fix`
   - UI changes: `cd apps/noite && bun run build` (worker build — proves workerd compat; `check` alone doesn't catch Node/Bun-only imports)
+  - Pre-push gate: `bun docker/pr-ready.ts` (runs every local gate for the changed areas — lint, runner/UI builds and tests, changelog + version pins, `merge-tree` conflict check — then prints a summary table; `--skip-build` skips the UI bundle build)
 - The stack runs via **rootless podman**:
   - `make up` — the `noite` service built from the tree (`compose.build.yaml`) + `rustfs`; `make up-prod` — same file, pulls the release image; `make dev` — the same service from the Dockerfile's `dev` target with the sources bind-mounted (`docker/dev.sh`: cargo-watch runner + `vite dev` on `127.0.0.1:8090`, where the control fleet would be)
 - `make logs`, `make doctor` (`/ready` and its failing gates, API auth, edge, control auth, celld control node), `make down` (keeps volumes), `make nuke` (every local database: the project's volumes + local `.wrangler`/`.void` D1/SQLite). `nuke` removes containers by project label and volumes by name as well as via `down -v` because podman-compose's `down -v` aborts on the first missing container and then never removes named volumes — which left the runner's SQLite (every app row) in place and the next `apps.create` answered `409 slug already taken`. BYO S3 installs (`--scale rustfs=0`) keep their objects outside compose: delete them at the provider.
@@ -66,7 +67,7 @@ Operational do-nots and gotchas not carried by SPEC:
 - **Testing jup by hand** inside this monorepo walks up to `apps/noite/package.json` (pinned to bun) and refuses other managers: set `JUP_ENABLE_STRICT=0`.
 - **Verify a new build shape** with `celld deploy <dir> --bucket s3://x --dry-run` in the image (it lists every refused key) before trusting it; `make e2e` covers Vite through `vite.spec.ts`.
 - **Instance telemetry:** never add or rename a field in the `instance_heartbeat` payload without updating [the telemetry docs page](apps/website/docs/self-hosting/telemetry.mdx) in the same change, and never let a test send a real event to PostHog — inject the sender and assert on the built payload.
-- **Cutting a release:** move CHANGELOG `Unreleased` under `## [x.y.z] - date` with an `### Operator action required` section, bump `packages/cli/package.json` to the same version (`docker/check-versions.ts` enforces it never falls behind), then run `bun install` so `bun.lock` carries the new workspace version (`--frozen-lockfile` doesn't catch the drift, and every later `bun install` rewrites it). Tag `vx.y.z`, try it with `install --pre`, then mark it as a release, which moves the channels. The tag's `images.yml` gate publishes `@noitenow/cli` to npm itself (dist-tag `alpha` for prereleases), so nothing runs by hand after the first publish.
+- **Cutting a release:** run `bun docker/changelog-release.ts x.y.z` (defaults the date to today; `--dry-run` prints without writing) to assemble `changelog.d/` into `## [x.y.z] - date` in canonical order with an `### Operator action required` section and delete the fragments, bump `packages/cli/package.json` to the same version (`docker/check-versions.ts` enforces it never falls behind), then run `bun install` so `bun.lock` carries the new workspace version (`--frozen-lockfile` doesn't catch the drift, and every later `bun install` rewrites it). Tag `vx.y.z`, try it with `install --pre`, then mark it as a release, which moves the channels. The tag's `images.yml` gate publishes `@noitenow/cli` to npm itself (dist-tag `alpha` for prereleases), so nothing runs by hand after the first publish.
 
 ## Build & verify BEFORE saying done (mandatory)
 
@@ -103,6 +104,7 @@ Operational do-nots and gotchas not carried by SPEC:
 ## Agent behavior
 
 - Prefer small, focused changes. When a PR-like diff is large this repo expects the work to be split into reviewable steps.
+- Release notes go in `changelog.d/<unique-topic>.md` (one file per PR, the CHANGELOG's own `### <Section>` headings with `- ` bullets), never under `## [Unreleased]` — `bun docker/check-changelog.ts` fails otherwise. Add an `### Operator action required` bullet whenever an upgrading operator must know or do something.
 - Run `bun run check` and (for runner code) the cargo build before declaring done — automatic formatting/lint is not a substitute for the ryuer build.
 - If an instruction would change a locked decision in `SPEC.md`, remove a deliberate ignore marker, or alter a baked-image pin, pause and ask for explicit confirmation first.
 - If you are unsure how a change affects the deploy pipeline, fleet isolation, the Caddyfile owner invariant, or the metrics substrate, ask rather than guessing — these are the subsystems that break silently.

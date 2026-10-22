@@ -1,74 +1,66 @@
 #!/usr/bin/env bun
 /**
- * Release-notes guard for CHANGELOG.md.
+ * Release-notes guard for CHANGELOG.md and changelog.d/.
  *
- * Every release section (`## [x.y.z] - date`) carries an `### Operator action
+ * Release sections (`## [x.y.z] - date`) each carry an `### Operator action
  * required` subsection, even when it only says "None": an operator upgrading
  * reads that first, so a release that forgot it must fail here, not in prod.
  *
- *   bun docker/check-changelog.ts            every released section is well formed
+ * Since fragments landed, `## [Unreleased]` stays empty: new notes go in
+ * `changelog.d/<unique-topic>.md` (the CHANGELOG's own `### <Section>`
+ * headings with `- ` bullets), so concurrent PRs stop conflicting on one
+ * section. The release PR assembles them with
+ * `bun docker/changelog-release.ts <version> [date]`.
+ *
+ *   bun docker/check-changelog.ts            released sections + fragments + empty Unreleased
  *   bun docker/check-changelog.ts 0.1.0-alpha.1
  *                                            ...and that version has a dated section
  *
  * `images.yml` runs the second form on a `v*` tag before anything is pushed.
  */
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import path from "node:path";
 
-const changelog = readFileSync(
-  new URL("../CHANGELOG.md", import.meta.url),
-  "utf-8"
-);
+import { checkChangelog } from "./changelog-lib";
 
-const SECTION = /^## \[(?<name>[^\]]+)\](?: - (?<date>\S+))?\s*$/gmu;
-const DATE = /^\d{4}-\d{2}-\d{2}$/u;
-const ACTION = /^### Operator action required\s*$/mu;
+const root = new URL("../", import.meta.url).pathname;
 
-const marks = [...changelog.matchAll(SECTION)];
+const changelog = readFileSync(path.join(root, "CHANGELOG.md"), "utf-8");
 
-const sections = marks.map((mark, index) => ({
-  body: changelog.slice(
-    (mark.index ?? 0) + mark[0].length,
-    marks[index + 1]?.index ?? changelog.length
-  ),
-  date: mark.groups?.date,
-  name: mark.groups?.name ?? "",
+const dir = path.join(root, "changelog.d");
+let entries: string[] = [];
+
+try {
+  entries = readdirSync(dir)
+    .filter((name) => name.endsWith(".md"))
+    .toSorted();
+} catch {
+  entries = [];
+}
+
+const fragments = entries.map((name) => ({
+  name,
+  text: readFileSync(path.join(dir, name), "utf-8"),
 }));
 
-let failed = false;
-
-const fail = (message: string): void => {
-  console.error(message);
-  failed = true;
-};
-
-for (const { body, date, name } of sections) {
-  if (name === "Unreleased") {
-    continue;
-  }
-
-  if (!(date && DATE.test(date))) {
-    fail(`CHANGELOG.md: [${name}] needs a date (## [${name}] - YYYY-MM-DD)`);
-  }
-
-  if (!ACTION.test(body)) {
-    fail(
-      `CHANGELOG.md: [${name}] has no "### Operator action required" section`
-    );
-  }
-}
+const errors = checkChangelog(changelog, fragments);
 
 const wanted = process.argv.slice(2).at(0);
 
-if (wanted && !sections.some(({ name }) => name === wanted)) {
-  fail(
-    `CHANGELOG.md has no [${wanted}] section: move the Unreleased notes under it before tagging`
+if (wanted && !new RegExp(`^## \\[${wanted}\\]`, "mu").test(changelog)) {
+  errors.push(
+    `CHANGELOG.md has no [${wanted}] section: run bun docker/changelog-release.ts ${wanted} before tagging`
   );
 }
 
-if (failed) {
+if (errors.length > 0) {
+  for (const error of errors) {
+    console.error(error);
+  }
+
   process.exit(1);
 }
 
 console.log(
-  `changelog: ${sections.length} section(s) ok${wanted ? `, ${wanted} present` : ""}`
+  `changelog: ${fragments.length} fragment(s) ok${wanted ? `, ${wanted} present` : ""}`
 );
