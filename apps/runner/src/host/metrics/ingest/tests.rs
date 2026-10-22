@@ -33,6 +33,10 @@ fn slug_id() -> HashMap<String, String> {
     HashMap::from([("blog".to_string(), "app1".to_string())])
 }
 
+fn slug_env() -> HashMap<String, String> {
+    HashMap::new()
+}
+
 fn log_row(ts_us: i64, body: &str, trace: &str) -> errors::LogRow {
     errors::LogRow {
         slug: "blog".to_string(),
@@ -292,8 +296,11 @@ async fn a_broken_fleet_does_not_hold_the_healthy_one() {
                 commit_chunk(
                     &pool,
                     &mut state,
-                    &slug_id,
-                    &HashMap::new(),
+                    &FleetKeys {
+                        ids: slug_id.clone(),
+                        envs: HashMap::new(),
+                        shas: HashMap::new(),
+                    },
                     &chunk,
                     rows,
                     0,
@@ -343,8 +350,11 @@ async fn reingesting_a_window_is_idempotent_and_a_partial_retry_converges() {
     commit_chunk(
         &pool_a,
         &mut state_a,
-        &slug_id(),
-        &sha,
+        &FleetKeys {
+            ids: slug_id(),
+            envs: slug_env(),
+            shas: sha.clone(),
+        },
         &bounds,
         full.clone(),
         0,
@@ -357,8 +367,11 @@ async fn reingesting_a_window_is_idempotent_and_a_partial_retry_converges() {
     commit_chunk(
         &pool_a,
         &mut state_a,
-        &slug_id(),
-        &sha,
+        &FleetKeys {
+            ids: slug_id(),
+            envs: slug_env(),
+            shas: sha.clone(),
+        },
         &bounds,
         full.clone(),
         0,
@@ -374,12 +387,34 @@ async fn reingesting_a_window_is_idempotent_and_a_partial_retry_converges() {
     let mut partial = full.clone();
     partial.minutes.truncate(1);
     partial.logs.clear();
-    commit_chunk(&pool_b, &mut state_b, &slug_id(), &sha, &bounds, partial, 0)
-        .await
-        .expect("partial");
-    commit_chunk(&pool_b, &mut state_b, &slug_id(), &sha, &bounds, full, 0)
-        .await
-        .expect("retry");
+    commit_chunk(
+        &pool_b,
+        &mut state_b,
+        &FleetKeys {
+            ids: slug_id(),
+            envs: slug_env(),
+            shas: sha.clone(),
+        },
+        &bounds,
+        partial,
+        0,
+    )
+    .await
+    .expect("partial");
+    commit_chunk(
+        &pool_b,
+        &mut state_b,
+        &FleetKeys {
+            ids: slug_id(),
+            envs: slug_env(),
+            shas: sha.clone(),
+        },
+        &bounds,
+        full,
+        0,
+    )
+    .await
+    .expect("retry");
     assert_eq!(
         dump(&pool_b).await,
         once,
@@ -402,8 +437,11 @@ async fn catch_up_in_hour_chunks_equals_one_continuous_pass() {
     commit_chunk(
         &pool_a,
         &mut state_a,
-        &slug_id(),
-        &sha,
+        &FleetKeys {
+            ids: slug_id(),
+            envs: slug_env(),
+            shas: sha.clone(),
+        },
         &[("blog".to_string(), H, H + 2 * HOUR_US)],
         combined(rows_hour1(), rows_hour2()),
         0,
@@ -416,8 +454,11 @@ async fn catch_up_in_hour_chunks_equals_one_continuous_pass() {
     commit_chunk(
         &pool_b,
         &mut state_b,
-        &slug_id(),
-        &sha,
+        &FleetKeys {
+            ids: slug_id(),
+            envs: slug_env(),
+            shas: sha.clone(),
+        },
         &[("blog".to_string(), H, H + HOUR_US)],
         rows_hour1(),
         0,
@@ -427,8 +468,11 @@ async fn catch_up_in_hour_chunks_equals_one_continuous_pass() {
     commit_chunk(
         &pool_b,
         &mut state_b,
-        &slug_id(),
-        &sha,
+        &FleetKeys {
+            ids: slug_id(),
+            envs: slug_env(),
+            shas: sha.clone(),
+        },
         &[("blog".to_string(), H + HOUR_US, H + 2 * HOUR_US)],
         rows_hour2(),
         0,
@@ -454,8 +498,11 @@ async fn control_telemetry_is_keyed_on_the_reserved_slug_without_an_app_row() {
     commit_chunk(
         &pool,
         &mut state,
-        &slug_id,
-        &sha,
+        &FleetKeys {
+            ids: slug_id.clone(),
+            envs: slug_env(),
+            shas: sha.clone(),
+        },
         &bounds,
         rows_control_hour(),
         0,
@@ -485,8 +532,11 @@ async fn control_telemetry_is_keyed_on_the_reserved_slug_without_an_app_row() {
     commit_chunk(
         &pool,
         &mut state,
-        &slug_id,
-        &sha,
+        &FleetKeys {
+            ids: slug_id.clone(),
+            envs: slug_env(),
+            shas: sha.clone(),
+        },
         &bounds,
         rows_control_hour(),
         0,
@@ -511,8 +561,11 @@ async fn a_failed_write_holds_the_watermark() {
     let result = commit_chunk(
         &pool,
         &mut state,
-        &slug_id(),
-        &HashMap::new(),
+        &FleetKeys {
+            ids: slug_id(),
+            envs: slug_env(),
+            shas: HashMap::new(),
+        },
         &[("blog".to_string(), H, H + HOUR_US)],
         rows_hour1(),
         0,
@@ -523,6 +576,156 @@ async fn a_failed_write_holds_the_watermark() {
         state.watermark.get("blog"),
         Some(&H),
         "a failed pass must not advance the watermark"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Ingest assigns environment rows to the right environment: one shared
+/// chunk carrying a production fleet and an environment fleet keys every
+/// row by (app, environment), production stays separate, and each fleet
+/// advances its own watermark.
+#[tokio::test]
+async fn environment_rows_stay_separate_from_production() {
+    let (pool, dir) = test_pool("env-separate").await;
+    let mut state = new_state();
+    let slug_id = HashMap::from([
+        ("blog".to_string(), "app1".to_string()),
+        ("blog.preview".to_string(), "app1".to_string()),
+    ]);
+    let slug_env = HashMap::from([("blog.preview".to_string(), "env-1".to_string())]);
+    let fleet_sha = HashMap::from([
+        ("blog".to_string(), "prod-sha".to_string()),
+        ("blog.preview".to_string(), "env-sha".to_string()),
+    ]);
+    let bounds = vec![
+        ("blog".to_string(), H, H + HOUR_US),
+        ("blog.preview".to_string(), H + HOUR_US, H + 2 * HOUR_US),
+    ];
+    // The environment's rows are the same shapes `ingest_all` emits, keyed
+    // on the `{slug}.{label}` fleet key the file path carries.
+    let mut env_rows = rows_hour2();
+    for m in &mut env_rows.minutes {
+        m.0 = "blog.preview".to_string();
+    }
+    for s in &mut env_rows.spans {
+        s.0 = "blog.preview".to_string();
+    }
+    for l in &mut env_rows.logs {
+        l.slug = "blog.preview".to_string();
+    }
+    for e in &mut env_rows.errors {
+        e.slug = "blog.preview".to_string();
+    }
+    commit_chunk(
+        &pool,
+        &mut state,
+        &FleetKeys {
+            ids: slug_id,
+            envs: slug_env,
+            shas: fleet_sha,
+        },
+        &bounds,
+        combined(rows_hour1(), env_rows),
+        0,
+    )
+    .await
+    .expect("commit the shared chunk");
+    // Minute buckets carry their environment.
+    let metrics: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT app_id, environment_id, bucket_ts, requests FROM metrics.app_metric ORDER BY bucket_ts",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("app_metric");
+    assert_eq!(
+        metrics,
+        vec![
+            (
+                "app1".to_string(),
+                "".to_string(),
+                "2026-01-01T00:05:00Z".to_string(),
+                10
+            ),
+            (
+                "app1".to_string(),
+                "".to_string(),
+                "2026-01-01T00:06:00Z".to_string(),
+                4
+            ),
+            (
+                "app1".to_string(),
+                "env-1".to_string(),
+                "2026-01-01T01:10:00Z".to_string(),
+                7
+            ),
+        ]
+    );
+    // Span stats likewise.
+    let spans: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT app_id, environment_id, bucket_hour FROM metrics.app_span_stat ORDER BY bucket_hour",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("span");
+    assert_eq!(
+        spans,
+        vec![
+            (
+                "app1".to_string(),
+                "".to_string(),
+                "2026-01-01T00:00:00Z".to_string()
+            ),
+            (
+                "app1".to_string(),
+                "env-1".to_string(),
+                "2026-01-01T01:00:00Z".to_string()
+            ),
+        ]
+    );
+    // The log ring keeps both, keyed apart.
+    let logs: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT app_id, environment_id, body FROM metrics.app_log ORDER BY ts_us")
+            .fetch_all(&pool)
+            .await
+            .expect("log");
+    assert_eq!(
+        logs,
+        vec![
+            ("app1".to_string(), "".to_string(), "hello".to_string()),
+            ("app1".to_string(), "env-1".to_string(), "world".to_string()),
+        ]
+    );
+    // The environment's error lands on the environment with its own deploy
+    // sha; production gains no issue from it.
+    let events: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT app_id, environment_id, sha FROM metrics.app_error_event")
+            .fetch_all(&pool)
+            .await
+            .expect("error_event");
+    assert_eq!(
+        events,
+        vec![(
+            "app1".to_string(),
+            "env-1".to_string(),
+            "env-sha".to_string()
+        )]
+    );
+    let prod_issues = db::count_error_issues(&pool, "app1", "")
+        .await
+        .expect("prod counts");
+    assert!(
+        prod_issues.is_empty(),
+        "production must stay clean: {prod_issues:?}"
+    );
+    let env_issues = db::count_error_issues(&pool, "app1", "env-1")
+        .await
+        .expect("env counts");
+    assert_eq!(env_issues, vec![("open".to_string(), 1)]);
+    // Each fleet advances its own watermark from the shared pass.
+    assert_eq!(state.watermark.get("blog"), Some(&(H + HOUR_US)));
+    assert_eq!(
+        state.watermark.get("blog.preview"),
+        Some(&(H + 2 * HOUR_US))
     );
     let _ = std::fs::remove_dir_all(dir);
 }

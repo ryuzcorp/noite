@@ -22,7 +22,7 @@ use sqlx::SqlitePool;
 
 use crate::config::Config;
 use crate::db;
-use crate::host::edge::parse_edge_slug;
+use crate::host::edge::{parse_edge_slug, parse_env_host};
 use crate::host::errors::{RequestCtx, RequestIndex};
 
 /// Log lines are tiny; past this the file is truncated after consuming.
@@ -212,6 +212,7 @@ fn ref_source(referrer: &str) -> String {
 /// One parsed tenant line.
 struct Line {
     app_id: String,
+    environment_id: String,
     bucket: String,
     browser: &'static str,
     os: &'static str,
@@ -245,24 +246,39 @@ fn is_control_host(host: &str, control_hosts: &[String]) -> bool {
         .any(|candidate| candidate.trim().to_lowercase() == bare)
 }
 
-fn parse_line(line: &str, cfg: &Config, slug_id: &HashMap<String, String>) -> Option<Line> {
+fn parse_line(
+    line: &str,
+    cfg: &Config,
+    slug_id: &HashMap<String, String>,
+    slug_env: &HashMap<String, String>,
+) -> Option<Line> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let host = v
         .pointer("/request/host")
         .and_then(|x| x.as_str())
         .unwrap_or("");
-    let slug = match parse_edge_slug(host, &cfg.tenant_bases(), &cfg.control_subdomain) {
-        Some(slug) => slug,
-        // The control UI's own requests — its polling and SSE — are real load
-        // on the control node, so they land on the reserved control key the
-        // metrics ingest also uses. `api.`/`git.` hosts stay out (the runner's
-        // own edge is not a dashboard).
-        None if is_control_host(host, &cfg.control_hosts()) => {
-            crate::host::control::SLUG.to_string()
-        }
-        None => return None,
-    };
-    let app_id = slug_id.get(&slug)?.clone();
+    // A tenant host resolves to the app's production fleet; an environment
+    // host (`<label>.<slug>.<base>`) to that environment's fleet, whose
+    // rows key on the environment id. Slugs never contain dots, so the two
+    // parsers never claim the same host (edge.rs pins this).
+    let (app_id, environment_id) =
+        match parse_edge_slug(host, &cfg.tenant_bases(), &cfg.control_subdomain) {
+            Some(slug) => (slug_id.get(&slug)?.clone(), String::new()),
+            None => match parse_env_host(host, &cfg.tenant_bases()) {
+                Some((slug, label)) => {
+                    let key = format!("{slug}.{label}");
+                    (slug_id.get(&key)?.clone(), slug_env.get(&key)?.clone())
+                }
+                // The control UI's own requests — its polling and SSE — are real load
+                // on the control node, so they land on the reserved control key the
+                // metrics ingest also uses. `api.`/`git.` hosts stay out (the runner's
+                // own edge is not a dashboard).
+                None if is_control_host(host, &cfg.control_hosts()) => {
+                    (crate::host::control::SLUG.to_string(), String::new())
+                }
+                None => return None,
+            },
+        };
     let ua = first_header(&v, "User-Agent");
     let uri = v
         .pointer("/request/uri")
@@ -304,6 +320,7 @@ fn parse_line(line: &str, cfg: &Config, slug_id: &HashMap<String, String>) -> Op
         });
     Some(Line {
         app_id,
+        environment_id,
         bucket: hour_bucket(ts),
         browser,
         os,
@@ -333,11 +350,14 @@ fn read_offset(path: &std::path::Path) -> (u64, u64) {
 }
 
 /// Consume new access-log lines into device stats. Never fails the tick:
-/// a missing log (Caddy not yet reloaded) is a silent skip.
+/// a missing log (Caddy not yet reloaded) is a silent skip. Environment
+/// hosts attribute to the environment's own (app, environment) rows; the
+/// trace → request index is shared (trace ids are unique per request).
 pub async fn tick(
     pool: &SqlitePool,
     cfg: &Config,
     slug_id: &HashMap<String, String>,
+    slug_env: &HashMap<String, String>,
     requests: &mut RequestIndex,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -372,10 +392,18 @@ pub async fn tick(
         let Ok(text) = std::str::from_utf8(line) else {
             continue;
         };
-        if let Some(l) = parse_line(text, cfg, slug_id) {
-            db::add_app_device(pool, &l.app_id, &l.bucket, l.browser, l.os).await?;
-            db::add_app_path(pool, &l.app_id, &l.bucket, &l.path).await?;
-            db::add_app_ref(pool, &l.app_id, &l.bucket, &l.source).await?;
+        if let Some(l) = parse_line(text, cfg, slug_id, slug_env) {
+            db::add_app_device(
+                pool,
+                &l.app_id,
+                &l.environment_id,
+                &l.bucket,
+                l.browser,
+                l.os,
+            )
+            .await?;
+            db::add_app_path(pool, &l.app_id, &l.environment_id, &l.bucket, &l.path).await?;
+            db::add_app_ref(pool, &l.app_id, &l.environment_id, &l.bucket, &l.source).await?;
             if let Some((trace_id, ctx)) = l.trace {
                 requests.insert(trace_id, ctx);
             }
@@ -500,6 +528,61 @@ mod tests {
         assert_eq!(
             ref_source("https://blog.example.com/post?utm=x"),
             "blog.example.com"
+        );
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    fn line(host: &str) -> String {
+        serde_json::json!({
+            "request": {
+                "host": host,
+                "uri": "/about?x=1",
+                "method": "GET",
+                "headers": {"User-Agent": ["curl/8.18.0"], "Referer": [""]},
+            },
+            "status": 200,
+            "ts": 1_767_225_600.0,
+        })
+        .to_string()
+    }
+
+    /// An environment host attributes to the environment's own (app,
+    /// environment) rows; a tenant host stays production; an unknown
+    /// label is dropped, never mis-keyed onto the app.
+    #[test]
+    fn environment_hosts_attribute_to_the_environment() {
+        let cfg = crate::config::config_for_tests();
+        let slug_id = HashMap::from([
+            ("blog".to_string(), "app1".to_string()),
+            ("blog.feature".to_string(), "app1".to_string()),
+        ]);
+        let slug_env = HashMap::from([("blog.feature".to_string(), "env-1".to_string())]);
+        let env = parse_line(&line("feature.blog.localhost"), &cfg, &slug_id, &slug_env)
+            .expect("env host parses");
+        assert_eq!(env.app_id, "app1");
+        assert_eq!(env.environment_id, "env-1");
+        assert_eq!(env.path, "/about");
+        let prod = parse_line(&line("blog.localhost"), &cfg, &slug_id, &slug_env)
+            .expect("tenant host parses");
+        assert_eq!(prod.app_id, "app1");
+        assert_eq!(prod.environment_id, "");
+        assert!(
+            parse_line(&line("ghost.blog.localhost"), &cfg, &slug_id, &slug_env).is_none(),
+            "an unknown label is dropped, never production"
+        );
+        assert!(
+            parse_line(
+                &line("feature.blog.localhost"),
+                &cfg,
+                &slug_id,
+                &HashMap::new()
+            )
+            .is_none(),
+            "an environment with no fleet key is dropped"
         );
     }
 }

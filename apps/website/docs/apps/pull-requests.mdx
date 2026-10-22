@@ -3,7 +3,7 @@ title: Pull requests
 description: Open, review, comment on and squash-merge pull requests for an app's branches, then gate main with branch protection.
 ---
 
-Pull requests work between branches of the **same app**; there are no forks. They have their own pages: the **Pull requests** item under the app in the sidebar shows the open count and opens the list (`/apps/<id>/pulls`). The title carries **New pull request**, and the list filters by **Open**, **Closed**, **Merged** or **All**, with a count on every filter (including `0`). A pull request is at `/apps/<id>/pulls/<number>`.
+Pull requests work between branches of the **same app**; there are no forks. They have their own pages: the **Pull requests** item under the app in the sidebar shows the open count and opens the list (`/apps/<id>/pulls`). The title carries **New pull request**, and the list filters by **Open**, **Closed**, **Merged** or **All**, with a count on every filter (including `0`). A pull request is at `/apps/<id>/pulls/<number>`. When the head branch has a [preview environment](/apps/environments), the page shows its card: status, URL, last deploy (commit, time, link to its log) and links to that environment's Metrics and Errors — or a **Create environment** button when there is none and you have `push` access.
 
 ## Open one
 

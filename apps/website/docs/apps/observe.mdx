@@ -4,16 +4,16 @@ description: Logs, metrics with spans, errors, product-analytics events, and idl
 ---
 
 :::note
-Everything here is per **app**. A [preview environment](/apps/environments) is its own fleet with its own deploy log and live log, but the telemetry ingest does not read an environment's prefix yet, so metrics, errors and analytics cover the app (its production fleet) and not each environment.
+The **Metrics** and **Errors** tabs scope to one environment with a picker: **Production** first, then each [preview environment](/apps/environments) (`?env=` deep-links). Reads without an environment mean production only. Logs scope through the Deployments tab's environment groups (each group shows its own fleet's ingested telemetry plus live output). Custom events stay app-wide — their writes carry no environment identity — so the **Events** tab has no picker.
 :::
 
 ## Logs
 
-The Deployments tab shows the app's runtime logs, live over SSE, and follows the tail while pinned; scroll up to hold still. It holds the last 24 hours of logs ingested from celld's telemetry (up to 500 lines, about 40 s behind live traffic) followed by the fleet's live stdout/stderr, which lives in memory and resets when the runner restarts. Each deploy's build log is on its own row in the same tab. A deploy row inside a [preview environment](/apps/environments)'s group shows that environment's own fleet instead: its live stdout/stderr only (an environment's telemetry is not ingested yet), never production's lines.
+The Deployments tab shows the app's runtime logs, live over SSE, and follows the tail while pinned; scroll up to hold still. It holds the last 24 hours of logs ingested from celld's telemetry (up to 500 lines, about 40 s behind live traffic) followed by the fleet's live stdout/stderr, which lives in memory and resets when the runner restarts. Each deploy's build log is on its own row in the same tab. A deploy row inside a [preview environment](/apps/environments)'s group shows that environment's own fleet instead: its ingested telemetry plus its live stdout/stderr, never production's lines.
 
 ## Metrics and spans
 
-The **Metrics** tab covers the last 24 hours, 7 days or 30 days (the range picker; `?r=` keeps it across reloads): charts for requests, errors, latency and CPU, plus stat tiles. Requests count `celld.fetch` spans; errors, latency, and queue wait come from the same spans; CPU is sampled from the celld process tree. The Overview tab shows the same numbers in a smaller card.
+The **Metrics** tab covers the last 24 hours, 7 days or 30 days (the range picker; `?r=` keeps it across reloads): charts for requests, errors, latency and CPU, plus stat tiles. Requests count `celld.fetch` spans; errors, latency, and queue wait come from the same spans; CPU is sampled from the celld process tree. The Overview tab shows the same numbers in a smaller card. The environment picker scopes every chart and breakdown to one environment; without it the tab is production only.
 
 Below the charts, the spans table lists recent slow or failed requests, and the analytics tables break traffic down by browser and OS, path and referrer.
 
@@ -21,7 +21,7 @@ Ingestion is idempotent and resumable: each pass rewrites the hours it reads, so
 
 ## Errors
 
-The **Errors** tab collects exceptions without an SDK. Noite reads them from the same telemetry as Metrics, so they show up about a minute after they happen.
+The **Errors** tab collects exceptions without an SDK. Noite reads them from the same telemetry as Metrics, so they show up about a minute after they happen. The environment picker scopes the tab to one environment's issues; without it the tab is production only.
 
 - **What counts:** anything a handler throws or rejects (fetch, Durable Objects, alarms, queues, cron), a rejected `ctx.waitUntil()`, and `console.error(err)` when `err` carries a stack. A `console.error("text")` without a stack stays a log line.
 - **Grouping:** occurrences group into one error by type plus the functions in your code on the stack. Line numbers are ignored, so a redeploy doesn't split an error in two. Errors without a stack group by message, with numbers and ids masked.
@@ -47,7 +47,7 @@ Browser events land in the same Errors tab with the same grouping, labelled **Br
 
 ### Source maps
 
-Each successful production deploy stores its source maps under `maps/<deploy-sha>/` in the app's own bucket prefix, and the Errors tab symbolicates every occurrence against the maps of the commit it ran on: the stack shows the original file, line and function, with the minified frame kept on a dimmer line below. (Preview environment deploys store no maps yet — environment errors aren't ingested.)
+Each successful deploy stores its source maps under `maps/<deploy-sha>/` in its own bucket prefix (production or the environment's), and the Errors tab symbolicates every occurrence against the maps of the commit it ran on: the stack shows the original file, line and function, with the minified frame kept on a dimmer line below.
 
 - **Worker maps need no config.** `celld deploy` bundles with esbuild but emits no map, so after a successful deploy the runner re-runs celld's exact esbuild flags over the same entry with `--sourcemap` and keeps only the map — the deployed bytes stay byte-identical — chained through the build's own map when the entry carries one.
 - **Browser maps come from your build.** Only maps the build emitted are collected, never generated. With Vite, set `build.sourcemap: "hidden"` in `vite.config.ts`: the `hidden` setting emits `*.js.map` next to the bundles without the `sourceMappingURL` comment, so browsers fetch no map file while the runner can still symbolicate. Like any hidden-map setup, the map files stay publicly fetchable by exact URL — the same tradeoff as Cloudflare.

@@ -20,11 +20,13 @@ const ErrorStatusSchema = Schema.Union([
 
 const ErrorArgs = Schema.Struct({
   appId: Schema.String,
+  environmentId: Schema.optional(Schema.String),
   fingerprint: Schema.String,
 });
 
 const ErrorStatusArgs = Schema.Struct({
   appId: Schema.String,
+  environmentId: Schema.optional(Schema.String),
   fingerprint: Schema.String,
   status: ErrorStatusSchema,
 });
@@ -50,28 +52,36 @@ const requireTelemetryRole = async (
   await requireAppRole(appId, user.id, need);
 };
 
-/** One error with its recent occurrences (stack, request, trace logs). */
+/** One error with its recent occurrences, optionally in one preview
+ * environment (stack, request, trace logs). Absent/"" is production. */
 export const errorDetail = apiAction(
   ErrorArgs,
-  async ({ appId, fingerprint }, { env, request }) => {
+  async ({ appId, environmentId, fingerprint }, { env, request }) => {
     await requireTelemetryRole(request, env, appId, "view");
 
     try {
-      return await runnerGetError(appId, fingerprint);
+      return await runnerGetError(appId, fingerprint, environmentId ?? "");
     } catch (error) {
       failUnknown(error);
     }
   }
 );
 
-/** Resolve, ignore or reopen an error — anyone who can push can triage. */
+/** Resolve, ignore or reopen an error — anyone who can push can triage.
+ * `environmentId` triages the issue in that environment (absent/"" is
+ * production). */
 export const setErrorStatus = apiAction(
   ErrorStatusArgs,
-  async ({ appId, fingerprint, status }, { env, request }) => {
+  async ({ appId, environmentId, fingerprint, status }, { env, request }) => {
     await requireTelemetryRole(request, env, appId, "push");
 
     try {
-      return await runnerSetErrorStatus(appId, fingerprint, status);
+      return await runnerSetErrorStatus(
+        appId,
+        fingerprint,
+        status,
+        environmentId ?? ""
+      );
     } catch (error) {
       failUnknown(error);
     }

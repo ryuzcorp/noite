@@ -1,4 +1,5 @@
 import { DeployList } from "$lib/app-detail/deploys";
+import { EnvPicker, validEnvId } from "$lib/app-detail/env-picker";
 import { ErrorsPanel, liveErrors } from "$lib/app-detail/errors";
 import { EventsPanel, liveEventCount } from "$lib/app-detail/events";
 import {
@@ -12,12 +13,13 @@ import { AppSettingsPanel } from "$lib/app-detail/settings/panel";
 import { DetailShell, DetailTabs } from "$lib/app-detail/shell";
 import { ControlAppDetail } from "$lib/apps/control-panel";
 import { CONTROL_APP_NAME, isControlApp } from "$lib/control-app";
-import { appDetail } from "$lib/resources";
+import { appDetail, environments } from "$lib/resources";
 import { searchParam } from "$lib/search-param";
 import { DocumentTitle } from "$lib/ui/document-title";
 import { Cog } from "$lib/ui/icons";
 import { SidePanel } from "$lib/ui/side-panel";
 import { useParams } from "@ilha/void";
+import type { View } from "ilha";
 
 const TABS = [
   { id: "overview", label: "Overview" },
@@ -40,27 +42,48 @@ type AppPanel = "settings" | "";
 const toAppPanel = (raw: string): AppPanel =>
   raw === "settings" ? "settings" : "";
 
-/** Metrics tab: the window lives in `?r=` (24 / 168 / 720 hours) so a refresh
- * or shared link keeps it. The card is keyed by the window because its live
- * feed opens one URL for the life of a component. */
+/** Metrics tab: the window lives in `?r=` (24 / 168 / 720 hours) and the
+ * scope in `?env=` (production or one preview environment, the Deployments
+ * tab's convention), so a refresh or shared link keeps both. The card is
+ * keyed by both because its live feed opens one URL for the life of a
+ * component. */
 const MetricsTab = ({ appId }: { appId: string }) => {
   const range = searchParam("r", {
     default: DEFAULT_METRICS_HOURS,
     parse: toMetricsHours,
   });
 
+  const env = searchParam("env", { default: "" });
+  const envs = environments(appId).data() ?? [];
+  const environmentId = validEnvId(envs, env());
+
   return (
     <div class="flex flex-col gap-4">
-      <div class="flex items-center justify-between gap-2">
+      <div class="flex flex-wrap items-center justify-between gap-2">
         <h2 class="m-0 text-lg font-semibold">Metrics</h2>
-        <MetricsRangePicker
-          hours={range()}
-          onPick={(next) => {
-            range.set(next);
-          }}
-        />
+        <span class="flex flex-wrap items-center gap-2">
+          <EnvPicker
+            appId={appId}
+            value={environmentId}
+            onPick={(next) => {
+              env.set(next);
+            }}
+          />
+          <MetricsRangePicker
+            hours={range()}
+            onPick={(next) => {
+              range.set(next);
+            }}
+          />
+        </span>
       </div>
-      <MetricsCard key={range()} appId={appId} detail hours={range()} />
+      <MetricsCard
+        key={`${range()}:${environmentId}`}
+        appId={appId}
+        detail
+        environmentId={environmentId}
+        hours={range()}
+      />
     </div>
   );
 };
@@ -73,6 +96,40 @@ const SettingsAside = ({ onClose }: { onClose: () => void }) => (
     </div>
   </SidePanel>
 );
+
+/** Tab bar with live badges. `liveFeed` binds its stream URL once per
+ * component life, so the Errors badge — which follows the tabs' `?env=` —
+ * lives in this child, keyed by environment: changing scope remounts it
+ * and resubscribes, instead of keeping the first scope's stream. The
+ * Events badge is app-wide (custom events carry no environment identity). */
+const TabBar = ({
+  active,
+  appId,
+  environmentId,
+  onSelect,
+  trailing,
+}: {
+  active: TabId;
+  appId: string;
+  environmentId: string;
+  onSelect: (id: string) => void;
+  trailing: View;
+}) => {
+  const counts = {
+    errors: liveErrors(appId, "open", environmentId).data()?.counts.open ?? 0,
+    events: liveEventCount(appId),
+  };
+
+  return (
+    <DetailTabs
+      active={active}
+      counts={counts}
+      onSelect={onSelect}
+      tabs={TABS}
+      trailing={trailing}
+    />
+  );
+};
 
 const AppPageBody = ({ appId }: { appId: string }) => {
   // The reserved control app has no runner row, fleet or telemetry: it gets a
@@ -104,11 +161,12 @@ const AppPageBody = ({ appId }: { appId: string }) => {
 
   // The server head only knows the fallback; refine once the detail loads.
   // Same live feeds as the Errors tab's open list and the Events tab's
-  // default view, so the tab badges never lag the lists.
-  const counts = {
-    errors: liveErrors(appId, "open").data()?.counts.open ?? 0,
-    events: liveEventCount(appId),
-  };
+  // default view, so the tab badges never lag the lists — the Errors
+  // badge follows the tabs' `?env=` (production until an environment is
+  // picked, via the keyed TabBar above); custom events are app-scoped, so
+  // the Events badge is always app-wide.
+  const env = searchParam("env", { default: "" });
+  const environmentId = validEnvId(environments(appId).data() ?? [], env());
 
   const settingsOpen = panel() === "settings";
 
@@ -119,10 +177,11 @@ const AppPageBody = ({ appId }: { appId: string }) => {
         header={
           <>
             <AppHeader appId={appId} />
-            <DetailTabs
+            <TabBar
+              key={environmentId}
               active={tab()}
-              counts={counts}
-              tabs={TABS}
+              appId={appId}
+              environmentId={environmentId}
               onSelect={(next) => {
                 openError.set("");
                 tab.set(toTabId(next));

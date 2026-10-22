@@ -261,25 +261,33 @@ struct LimitsParams {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StatusParams {
     id: String,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    environment_id: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct FingerprintParams {
     id: String,
     fingerprint: String,
+    #[serde(default)]
+    environment_id: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ErrorStatusParams {
     id: String,
     fingerprint: String,
     status: String,
+    #[serde(default)]
+    environment_id: Option<String>,
 }
-
 /// Params for the ingest-key RPCs: the UI resolves the caller's app role and
 /// passes it; the runner enforces it (view to read, admin to rotate).
 #[derive(Deserialize)]
@@ -468,16 +476,25 @@ struct BranchRulesSetParams {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct HoursParams {
     id: String,
     #[serde(default)]
     hours: Option<i64>,
+    #[serde(default)]
+    environment_id: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct UserPropsParams {
     id: String,
+    // The wire name stays `user_id` (the control UI, CLI and MCP send it);
+    // `userId` is accepted as an alias for camelCase callers.
+    #[serde(rename = "user_id", alias = "userId")]
     user_id: String,
+    #[serde(default)]
+    environment_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -839,14 +856,21 @@ async fn dispatch_call(
                 Err(e) => return e,
             };
             let status = p.status.unwrap_or_else(|| "open".into());
-            complete(id, service::errors::list_for(state, &p.id, &status).await)
+            complete(
+                id,
+                service::errors::list_for(state, &p.id, &status, p.environment_id.as_deref()).await,
+            )
         }
         "errors.get" => {
             let p: FingerprintParams = match parse(params, &id) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            complete(id, service::errors::get(state, &p.id, &p.fingerprint).await)
+            complete(
+                id,
+                service::errors::get(state, &p.id, &p.fingerprint, p.environment_id.as_deref())
+                    .await,
+            )
         }
         "errors.set_status" => {
             let p: ErrorStatusParams = match parse(params, &id) {
@@ -855,9 +879,15 @@ async fn dispatch_call(
             };
             complete(
                 id,
-                service::errors::set_status(state, &p.id, &p.fingerprint, &p.status)
-                    .await
-                    .map(|()| json!({ "ok": true })),
+                service::errors::set_status(
+                    state,
+                    &p.id,
+                    &p.fingerprint,
+                    &p.status,
+                    p.environment_id.as_deref(),
+                )
+                .await
+                .map(|()| json!({ "ok": true })),
             )
         }
         "errors.ingest_key" => {
@@ -1230,14 +1260,20 @@ async fn dispatch_call(
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            complete(id, service::observe::metrics(state, &p.id, p.hours).await)
+            complete(
+                id,
+                service::observe::metrics(state, &p.id, p.hours, p.environment_id.as_deref()).await,
+            )
         }
         "spans.get" => {
             let p: HoursParams = match parse(params, &id) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            complete(id, service::observe::spans(state, &p.id, p.hours).await)
+            complete(
+                id,
+                service::observe::spans(state, &p.id, p.hours, p.environment_id.as_deref()).await,
+            )
         }
         "logs.get" => {
             #[derive(Deserialize)]
@@ -1258,12 +1294,15 @@ async fn dispatch_call(
         }
         "events.list" => {
             #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
             struct P {
                 id: String,
                 #[serde(default)]
                 channel: Option<String>,
                 #[serde(default)]
                 limit: Option<i64>,
+                #[serde(default)]
+                environment_id: Option<String>,
             }
             let p: P = match parse(params, &id) {
                 Ok(p) => p,
@@ -1271,22 +1310,49 @@ async fn dispatch_call(
             };
             complete(
                 id,
-                service::events::list(state, &p.id, p.channel.as_deref(), p.limit).await,
+                service::events::list(
+                    state,
+                    &p.id,
+                    p.channel.as_deref(),
+                    p.limit,
+                    p.environment_id.as_deref(),
+                )
+                .await,
             )
         }
         "events.channels" => {
-            let p: IdParams = match parse(params, &id) {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                id: String,
+                #[serde(default)]
+                environment_id: Option<String>,
+            }
+            let p: P = match parse(params, &id) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            complete(id, service::events::channels(state, &p.id).await)
+            complete(
+                id,
+                service::events::channels(state, &p.id, p.environment_id.as_deref()).await,
+            )
         }
         "events.insights" => {
-            let p: IdParams = match parse(params, &id) {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                id: String,
+                #[serde(default)]
+                environment_id: Option<String>,
+            }
+            let p: P = match parse(params, &id) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            complete(id, service::events::insights(state, &p.id).await)
+            complete(
+                id,
+                service::events::insights(state, &p.id, p.environment_id.as_deref()).await,
+            )
         }
         "events.user_props" => {
             let p: UserPropsParams = match parse(params, &id) {
@@ -1295,7 +1361,8 @@ async fn dispatch_call(
             };
             complete(
                 id,
-                service::events::user_props(state, &p.id, &p.user_id).await,
+                service::events::user_props(state, &p.id, &p.user_id, p.environment_id.as_deref())
+                    .await,
             )
         }
         "storage.list" => {
@@ -1439,5 +1506,29 @@ async fn dispatch_call(
             JsonRpcErrorReason::MethodNotFound,
             format!("unknown method: {m}"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::UserPropsParams;
+
+    /// The `user_id` wire name is the contract the control UI, CLI and MCP
+    /// send; `rename_all = "camelCase"` must not silently rename it.
+    #[test]
+    fn user_props_accepts_snake_and_camel_user_id() {
+        let snake: UserPropsParams =
+            serde_json::from_value(serde_json::json!({"id": "a", "user_id": "u1"}))
+                .expect("snake_case user_id parses");
+        assert_eq!(snake.user_id, "u1");
+        assert_eq!(snake.environment_id, None);
+        let camel: UserPropsParams = serde_json::from_value(serde_json::json!({
+            "id": "a",
+            "userId": "u2",
+            "environmentId": "e1",
+        }))
+        .expect("camelCase alias parses");
+        assert_eq!(camel.user_id, "u2");
+        assert_eq!(camel.environment_id.as_deref(), Some("e1"));
     }
 }

@@ -374,6 +374,7 @@ pub struct LogRow {
 /// One occurrence (or a same-text group of them) ready to store.
 pub struct Occurrence<'a> {
     pub app_id: &'a str,
+    pub environment_id: &'a str,
     pub parsed: ParsedError,
     pub source: &'static str,
     pub handler: String,
@@ -408,16 +409,20 @@ fn hour_bucket(us: i64) -> String {
         .unwrap_or_default()
 }
 
-/// Turn one ingest pass into stored issues. Returns the app ids that got
-/// new occurrences.
+/// Turn one ingest pass into stored issues. `slug_id` maps each fleet key to
+/// its app id, `slug_env` to its environment id (`''` for production), and
+/// `fleet_sha` carries each fleet's own deploy sha (an environment's errors
+/// symbolicate against the environment's deploy). Returns the touched
+/// (app id, environment id) pairs.
 pub async fn ingest(
     pool: &SqlitePool,
     slug_id: &HashMap<String, String>,
-    app_sha: &HashMap<String, String>,
+    slug_env: &HashMap<String, String>,
+    fleet_sha: &HashMap<String, String>,
     spans: &[SpanErrorRow],
     logs: &[LogRow],
     requests: &RequestIndex,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<Vec<(String, String)>> {
     let mut by_trace: HashMap<&str, Vec<&str>> = HashMap::new();
     for row in logs {
         if !row.trace_id.is_empty() {
@@ -434,18 +439,21 @@ pub async fn ingest(
             .unwrap_or_default()
     };
     let mut touched = Vec::new();
-    // (app_id, fingerprint, hour) -> occurrences, and the issues whose derived
-    // count must be refreshed. Kept in memory for the pass so one hour-bucket
-    // is written exactly once (replace semantics), however many span groups
-    // and log lines fold into it.
-    let mut hours: HashMap<(String, String, String), i64> = HashMap::new();
-    let mut issues: HashSet<(String, String)> = HashSet::new();
+    // (app_id, environment_id, fingerprint, hour) -> occurrences, and the
+    // issues whose derived count must be refreshed. Kept in memory for the
+    // pass so one hour-bucket is written exactly once (replace semantics),
+    // however many span groups and log lines fold into it.
+    let mut hours: HashMap<(String, String, String, String), i64> = HashMap::new();
+    let mut issues: HashSet<(String, String, String)> = HashSet::new();
+    let env_of = |slug: &str| -> &str { slug_env.get(slug).map(String::as_str).unwrap_or("") };
     for row in spans {
         let Some(app_id) = slug_id.get(&row.slug) else {
             continue;
         };
+        let env_id = env_of(&row.slug);
         let occ = Occurrence {
             app_id,
+            environment_id: env_id,
             parsed: parse_span_error(&row.error),
             source: "uncaught",
             handler: handler_of(&row.name),
@@ -456,26 +464,29 @@ pub async fn ingest(
             last_us: row.last_us,
             logs: trace_logs(&row.trace_id),
             request: requests.get(&row.trace_id).cloned(),
-            sha: app_sha.get(app_id).map(String::as_str),
+            sha: fleet_sha.get(&row.slug).map(String::as_str),
             url: String::new(),
             release: String::new(),
             environment: String::new(),
         };
         let (fp, hour, n) = record(pool, &occ).await?;
-        *hours.entry((app_id.clone(), fp.clone(), hour)).or_default() += n;
-        issues.insert((app_id.clone(), fp));
-        touched.push(app_id.clone());
+        *hours
+            .entry((app_id.clone(), env_id.to_string(), fp.clone(), hour))
+            .or_default() += n;
+        issues.insert((app_id.clone(), env_id.to_string(), fp));
+        touched.push((app_id.clone(), env_id.to_string()));
     }
-    let mut logged: HashMap<(&str, String), usize> = HashMap::new();
+    let mut logged: HashMap<(&str, &str, String), usize> = HashMap::new();
     for row in logs {
         let Some(app_id) = slug_id.get(&row.slug) else {
             continue;
         };
+        let env_id = env_of(&row.slug);
         let Some(parsed) = parse_log_error(&row.body) else {
             continue;
         };
         let n = logged
-            .entry((app_id.as_str(), hour_bucket(row.ts_us)))
+            .entry((app_id.as_str(), env_id, hour_bucket(row.ts_us)))
             .or_default();
         if *n >= MAX_LOGGED_PER_HOUR {
             continue;
@@ -483,6 +494,7 @@ pub async fn ingest(
         *n += 1;
         let occ = Occurrence {
             app_id,
+            environment_id: env_id,
             parsed,
             source: "logged",
             handler: String::new(),
@@ -493,24 +505,26 @@ pub async fn ingest(
             last_us: row.ts_us,
             logs: trace_logs(&row.trace_id),
             request: requests.get(&row.trace_id).cloned(),
-            sha: app_sha.get(app_id).map(String::as_str),
+            sha: fleet_sha.get(&row.slug).map(String::as_str),
             url: String::new(),
             release: String::new(),
             environment: String::new(),
         };
         let (fp, hour, c) = record(pool, &occ).await?;
-        *hours.entry((app_id.clone(), fp.clone(), hour)).or_default() += c;
-        issues.insert((app_id.clone(), fp));
-        touched.push(app_id.clone());
+        *hours
+            .entry((app_id.clone(), env_id.to_string(), fp.clone(), hour))
+            .or_default() += c;
+        issues.insert((app_id.clone(), env_id.to_string(), fp));
+        touched.push((app_id.clone(), env_id.to_string()));
     }
     // Hour buckets first (replace), then the issue counts derived from them:
     // a re-read or replay of a window rewrites the same buckets and leaves the
     // counts where they were.
-    for ((app_id, fp, hour), n) in &hours {
-        db::set_error_hour(pool, app_id, fp, hour, *n).await?;
+    for ((app_id, env_id, fp, hour), n) in &hours {
+        db::set_error_hour(pool, app_id, env_id, fp, hour, *n).await?;
     }
-    for (app_id, fp) in &issues {
-        db::refresh_error_issue_count(pool, app_id, fp).await?;
+    for (app_id, env_id, fp) in &issues {
+        db::refresh_error_issue_count(pool, app_id, env_id, fp).await?;
     }
     touched.sort();
     touched.dedup();
@@ -526,6 +540,7 @@ async fn record(pool: &SqlitePool, occ: &Occurrence<'_>) -> anyhow::Result<(Stri
     db::upsert_error_issue(
         pool,
         occ.app_id,
+        occ.environment_id,
         &fp,
         &occ.parsed.kind,
         &occ.parsed.message,
@@ -544,6 +559,7 @@ async fn record(pool: &SqlitePool, occ: &Occurrence<'_>) -> anyhow::Result<(Stri
         pool,
         &db::NewErrorEvent {
             app_id: occ.app_id,
+            environment_id: occ.environment_id,
             fingerprint: &fp,
             ts_us: occ.last_us,
             trace_id: &occ.trace_id,
@@ -567,7 +583,7 @@ async fn record(pool: &SqlitePool, occ: &Occurrence<'_>) -> anyhow::Result<(Stri
         },
     )
     .await?;
-    db::prune_error_events(pool, occ.app_id, &fp, EVENTS_PER_ISSUE).await?;
+    db::prune_error_events(pool, occ.app_id, occ.environment_id, &fp, EVENTS_PER_ISSUE).await?;
     Ok((fp, hour, occ.count))
 }
 
@@ -676,8 +692,12 @@ pub async fn ingest_sdk(
     sha: Option<&str>,
     events: &[SdkEvent],
 ) -> anyhow::Result<Vec<String>> {
-    let mut counts: HashMap<(String, String, String), i64> = HashMap::new();
-    let mut issues: HashSet<(String, String)> = HashSet::new();
+    // The SDK envelope carries no runner environment id (the DSN is
+    // app-scoped), so browser/SDK occurrences land on production. A
+    // same-text telemetry twin in an environment stays separate.
+    let environment_id = "";
+    let mut counts: HashMap<(String, String, String, String), i64> = HashMap::new();
+    let mut issues: HashSet<(String, String, String)> = HashSet::new();
     let mut fps = Vec::new();
     for event in events {
         // Sentry lists frames oldest-first; phase 1 stores newest-first, and
@@ -698,6 +718,7 @@ pub async fn ingest_sdk(
         };
         let occ = Occurrence {
             app_id,
+            environment_id,
             parsed,
             source,
             handler: source.to_string(),
@@ -721,16 +742,21 @@ pub async fn ingest_sdk(
         };
         let (fp, hour, n) = record(pool, &occ).await?;
         *counts
-            .entry((app_id.to_string(), fp.clone(), hour))
+            .entry((
+                app_id.to_string(),
+                environment_id.to_string(),
+                fp.clone(),
+                hour,
+            ))
             .or_default() += n;
-        issues.insert((app_id.to_string(), fp.clone()));
+        issues.insert((app_id.to_string(), environment_id.to_string(), fp.clone()));
         fps.push(fp);
     }
-    for ((app_id, fp, hour), n) in &counts {
-        db::set_error_hour(pool, app_id, fp, hour, *n).await?;
+    for ((app_id, env_id, fp, hour), n) in &counts {
+        db::set_error_hour(pool, app_id, env_id, fp, hour, *n).await?;
     }
-    for (app_id, fp) in &issues {
-        db::refresh_error_issue_count(pool, app_id, fp).await?;
+    for (app_id, env_id, fp) in &issues {
+        db::refresh_error_issue_count(pool, app_id, env_id, fp).await?;
     }
     Ok(fps)
 }
@@ -953,13 +979,13 @@ mod tests {
             "rejected: PaymentError: card declined for amount 500 [at chargeCard (worker.js:21:27) <- at fetch (worker.js:34:9)]",
         );
         assert_eq!(fps[0], fingerprint(&twin));
-        let issue = crate::db::get_error_issue(&pool, "app-x", &fps[0])
+        let issue = crate::db::get_error_issue(&pool, "app-x", "", &fps[0])
             .await
             .expect("issue read")
             .expect("issue");
         assert_eq!(issue.source, "browser");
         assert_eq!(issue.count, 1);
-        let events = crate::db::list_error_events(&pool, "app-x", &fps[0])
+        let events = crate::db::list_error_events(&pool, "app-x", "", &fps[0])
             .await
             .expect("events read");
         assert_eq!(events.len(), 1);
@@ -981,7 +1007,7 @@ mod tests {
         let fps = ingest_sdk(&pool, "app-x", Some("abc123"), &[sdk_twin()])
             .await
             .expect("ingest");
-        let events = crate::db::list_error_events(&pool, "app-x", &fps[0])
+        let events = crate::db::list_error_events(&pool, "app-x", "", &fps[0])
             .await
             .expect("events read");
         assert_eq!(events.len(), 1);
@@ -1008,7 +1034,7 @@ mod tests {
             .await
             .expect("ingest");
         assert_eq!(fps[0], fps[1]);
-        let issue = crate::db::get_error_issue(&pool, "app-x", &fps[0])
+        let issue = crate::db::get_error_issue(&pool, "app-x", "", &fps[0])
             .await
             .expect("issue read")
             .expect("issue");

@@ -140,11 +140,13 @@ const toPageIndex = (raw: string): number =>
 
 /** Events in the all-channels feed, for the Events tab's badge: the same
  * stream and snapshot as the tab's default view, so the two never disagree
- * (both stop at the feed's `FEED_LIMIT` newest rows). */
+ * (both stop at the feed's `FEED_LIMIT` newest rows). Custom events are
+ * app-scoped — their writes carry no environment identity — so the count
+ * is always app-wide. */
 export const liveEventCount = (appId: string): number => {
   const feed = liveFeed(
-    feedKeys.events(appId, ""),
-    eventsUrl(appId, "", FEED_LIMIT),
+    feedKeys.events(appId, "", ""),
+    eventsUrl(appId, "", FEED_LIMIT, ""),
     decodeEvents
   );
 
@@ -313,8 +315,8 @@ const EventsFeed = ({
   query: SearchParam<string>;
 }) => {
   const feed = liveFeed(
-    feedKeys.events(appId, channel()),
-    eventsUrl(appId, channel(), FEED_LIMIT),
+    feedKeys.events(appId, channel(), ""),
+    eventsUrl(appId, channel(), FEED_LIMIT, ""),
     decodeEvents
   );
 
@@ -338,7 +340,10 @@ const EventsFeed = ({
         try {
           const row = await api<RunnerUserProps | null>(
             "/api/events/getUserProps",
-            { appId, userId: event.userId }
+            {
+              appId,
+              userId: event.userId,
+            }
           );
 
           profiles.set({
@@ -487,7 +492,10 @@ const EventsFeed = ({
 export const EventsPanel = ({ appId }: { appId: string }) => {
   // Channel + paging live in the URL (like ?t= for tabs) so refresh and
   // tab switches restore them; unknown channels just yield an empty feed.
-  // Writing a default removes the param, matching the old URLs.
+  // Writing a default removes the param, matching the old URLs. Custom
+  // events are app-scoped (their writes carry no environment identity),
+  // so this tab is always app-wide and has no environment picker —
+  // unlike Metrics/Errors, which key every row by environment.
   const channel = searchParam("channel", { default: "" });
   // The text filter writes the URL on every keystroke (no debounced draft
   // atom): ilha keeps focus and caret across the re-render, and editing the
@@ -506,14 +514,19 @@ export const EventsPanel = ({ appId }: { appId: string }) => {
   };
 
   return (
-    <EventsFeed
-      key={channel()}
-      appId={appId}
-      channel={channel}
-      clearQuery={clearQuery}
-      pageIndex={pageIndex}
-      pageSize={pageSize}
-      query={q}
-    />
+    <div class="flex flex-col gap-4">
+      <div class="flex items-center justify-between gap-2">
+        <h2 class="m-0 text-lg font-semibold">Events</h2>
+      </div>
+      <EventsFeed
+        key={channel()}
+        appId={appId}
+        channel={channel}
+        clearQuery={clearQuery}
+        pageIndex={pageIndex}
+        pageSize={pageSize}
+        query={q}
+      />
+    </div>
   );
 };

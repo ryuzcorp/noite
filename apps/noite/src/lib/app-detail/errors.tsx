@@ -9,7 +9,7 @@ import { decodeErrors, errorsUrl, feedKeys, liveFeed } from "../feeds";
 //! runner (`host/errors.rs`) — no SDK in the app. List by status, detail
 //! with stack, request and the failing trace's logs; anyone who can push
 //! resolves, ignores or reopens.
-import { appDetail, errorDetail } from "../resources";
+import { appDetail, environments, errorDetail } from "../resources";
 import type {
   ErrorStatus,
   RunnerErrorEvent,
@@ -21,6 +21,7 @@ import { searchParam } from "../search-param";
 import { ArrowLeft } from "../ui/icons";
 import { LoadError } from "../ui/load-error";
 import { ListSkeleton, SectionSkeleton } from "../ui/skeletons";
+import { EnvPicker, validEnvId } from "./env-picker";
 
 const STATUSES: { id: ErrorStatus; label: string }[] = [
   { id: "open", label: "Open" },
@@ -159,11 +160,17 @@ const IssueRow = ({
 
 /** Live issue list for one status over SSE: the last snapshot (or a
  * skeleton when cold) until the first frame, then the runner pushes a frame
- * whenever the list, a count or a sparkline moves — no refresh button. */
-export const liveErrors = (appId: string, status: ErrorStatus) => {
+ * whenever the list, a count or a sparkline moves — no refresh button.
+ * `environmentId` scopes it to one preview environment (absent/"" is
+ * production). */
+export const liveErrors = (
+  appId: string,
+  status: ErrorStatus,
+  environmentId = ""
+) => {
   const feed = liveFeed(
-    feedKeys.errors(appId, status),
-    errorsUrl(appId, status),
+    feedKeys.errors(appId, status, environmentId),
+    errorsUrl(appId, status, environmentId),
     decodeErrors
   );
 
@@ -201,16 +208,18 @@ const EmptyErrors = ({ status }: { status: ErrorStatus }) => {
 
 const ErrorList = ({
   appId,
+  environmentId,
   onPick,
   onStatus,
   status,
 }: {
   appId: string;
+  environmentId: string;
   onPick: (fingerprint: string) => void;
   onStatus: (status: ErrorStatus) => void;
   status: ErrorStatus;
 }) => {
-  const live = liveErrors(appId, status);
+  const live = liveErrors(appId, status, environmentId);
   const data = live.data();
   const issues = data?.issues ?? [];
 
@@ -389,10 +398,12 @@ const Occurrence = ({ event }: { event: RunnerErrorEvent }) => (
 
 const TriageButtons = ({
   appId,
+  environmentId,
   issue,
   onDone,
 }: {
   appId: string;
+  environmentId: string;
   issue: RunnerErrorIssue;
   onDone: () => Promise<void>;
 }) => {
@@ -406,6 +417,7 @@ const TriageButtons = ({
     try {
       await api<{ ok: true }>("/api/errors/setErrorStatus", {
         appId,
+        environmentId: environmentId === "" ? undefined : environmentId,
         fingerprint: issue.fingerprint,
         status,
       });
@@ -470,15 +482,17 @@ const statusNote = (issue: RunnerErrorIssue): string => {
 const ErrorDetailView = ({
   appId,
   canTriage,
+  environmentId,
   fingerprint,
   onBack,
 }: {
   appId: string;
   canTriage: boolean;
+  environmentId: string;
   fingerprint: string;
   onBack: () => void;
 }) => {
-  const res = errorDetail(appId, fingerprint);
+  const res = errorDetail(appId, fingerprint, environmentId);
   const picked = atom(0);
   const data = res.data();
 
@@ -541,7 +555,12 @@ const ErrorDetailView = ({
               </p>
             </div>
             {canTriage ? (
-              <TriageButtons appId={appId} issue={issue} onDone={refresh} />
+              <TriageButtons
+                appId={appId}
+                environmentId={environmentId}
+                issue={issue}
+                onDone={refresh}
+              />
             ) : null}
           </div>
           {note ? <p class="m-0 text-sm opacity-70">{note}</p> : null}
@@ -673,9 +692,12 @@ export const ErrorsSummary = ({ appId }: { appId: string }) => {
   );
 };
 
-/** Errors tab. `canTriage` overrides the app-role read for a panel whose
- * target has no app row (the reserved control app): the caller passes the
- * gate's answer, and the appDetail resource is never requested. */
+/** Errors tab, optionally scoped to one preview environment (`?env=`, the
+ * Deployments tab's convention; absent/unknown is production). The list and
+ * the detail remount per environment: each keeps its own feed and snapshot.
+ * `canTriage` overrides the app-role read for a panel whose target has no
+ * app row (the reserved control app): the caller passes the gate's answer,
+ * and the appDetail resource is never requested. */
 export const ErrorsPanel = ({
   appId,
   canTriage: canTriageProp,
@@ -691,6 +713,9 @@ export const ErrorsPanel = ({
   });
 
   const selected = searchParam("e", { default: "" });
+  const env = searchParam("env", { default: "" });
+  const envs = environments(appId).data() ?? [];
+  const environmentId = validEnvId(envs, env());
 
   const role =
     canTriageProp === undefined ? appDetail(appId).data()?.myRole : undefined;
@@ -699,29 +724,56 @@ export const ErrorsPanel = ({
 
   if (selected()) {
     return (
-      <ErrorDetailView
-        key={selected()}
-        appId={appId}
-        canTriage={canTriage}
-        fingerprint={selected()}
-        onBack={() => {
-          selected.set("");
-        }}
-      />
+      <div class="flex flex-col gap-4">
+        <div class="flex items-center justify-between gap-2">
+          <h2 class="m-0 text-lg font-semibold">Errors</h2>
+          <EnvPicker
+            appId={appId}
+            value={environmentId}
+            onPick={(next) => {
+              selected.set("");
+              env.set(next);
+            }}
+          />
+        </div>
+        <ErrorDetailView
+          key={`${selected()}:${environmentId}`}
+          appId={appId}
+          canTriage={canTriage}
+          environmentId={environmentId}
+          fingerprint={selected()}
+          onBack={() => {
+            selected.set("");
+          }}
+        />
+      </div>
     );
   }
 
   return (
-    <ErrorList
-      key={status()}
-      appId={appId}
-      status={status()}
-      onStatus={(next) => {
-        status.set(next);
-      }}
-      onPick={(fingerprint) => {
-        selected.set(fingerprint);
-      }}
-    />
+    <div class="flex flex-col gap-4">
+      <div class="flex items-center justify-between gap-2">
+        <h2 class="m-0 text-lg font-semibold">Errors</h2>
+        <EnvPicker
+          appId={appId}
+          value={environmentId}
+          onPick={(next) => {
+            env.set(next);
+          }}
+        />
+      </div>
+      <ErrorList
+        key={`${status()}:${environmentId}`}
+        appId={appId}
+        environmentId={environmentId}
+        status={status()}
+        onStatus={(next) => {
+          status.set(next);
+        }}
+        onPick={(fingerprint) => {
+          selected.set(fingerprint);
+        }}
+      />
+    </div>
   );
 };

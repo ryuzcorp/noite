@@ -43,23 +43,23 @@ pub(super) fn s3_setup(cfg: &Config, query: &str) -> String {
     )
 }
 
-/// Bucket prefix one telemetry source writes under. Tenant fleets use their
-/// celld `--bucket` (`fleets/<slug>`); the control fleet's `--bucket` is
-/// `control`, so its traces and logs land at `control/telemetry/...` — the
-/// control prefix, never `fleets/_control`.
+/// Bucket prefix one telemetry source writes under. The key is a fleet key:
+/// a production slug maps to its celld `--bucket` (`fleets/<slug>`), an
+/// environment's `{slug}.{label}` fleet key to its own `--bucket`
+/// (`envs/<slug>/<label>`), and the control fleet's `--bucket` is `control`,
+/// so its traces and logs land at `control/telemetry/...` — the control
+/// prefix, never `fleets/_control`.
 ///
-/// A preview environment's celld writes under its own `--bucket`
-/// (`envs/<slug>/<label>`), so its files land at
-/// `envs/<slug>/<label>/telemetry/...`. Phase 1 does **not** ingest them
-/// (ROADMAP Phase 3): nothing globs `envs/`, and the ingest's slug extraction
-/// reads `fleets/<slug>/` paths only, so those files are invisible rather than
-/// mis-keyed. An environment therefore shows deploy and live logs, not
-/// metrics — which is exactly what the contract says.
-pub(super) fn telemetry_prefix(slug: &str) -> String {
-    if slug == crate::host::control::SLUG {
+/// Slugs are runner-generated (`[a-z0-9-]`, never a dot), so the first dot
+/// splits a fleet key into its environment. Environment telemetry lands at
+/// `envs/<slug>/<label>/telemetry/...` and ingests exactly like production.
+pub(super) fn telemetry_prefix(fleet_key: &str) -> String {
+    if fleet_key == crate::host::control::SLUG {
         "control".to_string()
+    } else if let Some((slug, label)) = fleet_key.split_once('.') {
+        format!("envs/{slug}/{label}")
     } else {
-        format!("fleets/{slug}")
+        format!("fleets/{fleet_key}")
     }
 }
 
@@ -329,6 +329,9 @@ mod tests {
         // `fleets/_control`, which no fleet writes and purge/rename own.
         assert_eq!(telemetry_prefix(crate::host::control::SLUG), "control");
         assert_eq!(telemetry_prefix("blog"), "fleets/blog");
+        // An environment's `{slug}.{label}` fleet key is its own `--bucket`
+        // (`envs/<slug>/<label>`), never production's.
+        assert_eq!(telemetry_prefix("blog.preview"), "envs/blog/preview");
     }
 
     #[test]
@@ -353,15 +356,23 @@ mod tests {
             tenant.iter().all(|g| g.starts_with(&tenant_root)),
             "{tenant:?}"
         );
+        // An environment fleet globs only its own prefix.
+        for kind in ["traces", "logs"] {
+            let globs = telemetry_globs(&cfg, "blog.preview", kind, from, to);
+            assert!(!globs.is_empty());
+            let root = format!("s3://{}/envs/blog/preview/telemetry/{kind}/", cfg.s3_bucket);
+            assert!(
+                globs.iter().all(|g| g.starts_with(&root)),
+                "{kind}: {globs:?}"
+            );
+        }
     }
 
     /// Preview environments write their telemetry under `envs/<slug>/<label>/`
-    /// (their own `--bucket`). Phase 1 must not ingest it — and it does not,
-    /// because every glob is built from the source's own prefix — so an
-    /// environment bug can never key its rows onto the app (ROADMAP Phase 3
-    /// adds the env dimension).
+    /// (their own `--bucket`), globbed from the environment's own fleet key —
+    /// so an environment's rows land on the environment, never on the app.
     #[test]
-    fn environment_telemetry_is_never_globbed() {
+    fn environment_telemetry_globs_its_own_prefix_only() {
         let _env = crate::config::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -376,10 +387,16 @@ mod tests {
                     .all(|g| !g.contains("/envs/") && !g.contains("envs/blog")),
                 "{kind}: {globs:?}"
             );
+            let env_globs = telemetry_globs(&cfg, "blog.preview", kind, from, to);
+            assert!(
+                env_globs
+                    .iter()
+                    .all(|g| g.contains("/envs/blog/preview/") && !g.contains("/fleets/")),
+                "{kind}: {env_globs:?}"
+            );
         }
-        // The filter that would name an environment lives nowhere: only the
-        // two shapes above are prefixes.
         assert_eq!(telemetry_prefix(crate::host::control::SLUG), "control");
         assert_eq!(telemetry_prefix("blog"), "fleets/blog");
+        assert_eq!(telemetry_prefix("blog.preview"), "envs/blog/preview");
     }
 }

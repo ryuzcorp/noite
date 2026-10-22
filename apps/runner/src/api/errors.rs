@@ -13,8 +13,11 @@ use crate::service;
 use crate::AppState;
 
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ErrorsStreamQuery {
     status: Option<String>,
+    #[serde(default)]
+    environment_id: Option<String>,
 }
 
 /// One status's issue list (the `errors.list` shape) as server-sent events:
@@ -29,17 +32,24 @@ pub async fn list_errors_stream(
     if !service::errors::ERROR_STATUSES.contains(&status.as_str()) {
         return ApiError::bad("status must be open, resolved or ignored").into_response();
     }
-    let app_id = match service::observe::telemetry_target_or_404(&state.pool, &id).await {
-        Ok((app_id, _)) => app_id,
+    let scope = match service::observe::telemetry_scope(
+        &state.pool,
+        &id,
+        q.environment_id.as_deref(),
+    )
+    .await
+    {
+        Ok(scope) => scope,
         Err(e) => return e.into_response(),
     };
     let pool = state.pool.clone();
     poll_stream("errors", Duration::from_secs(2), move || {
         let pool = pool.clone();
-        let app_id = app_id.clone();
+        let app_id = scope.app_id.clone();
+        let environment_id = scope.environment_id.clone();
         let status = status.clone();
         async move {
-            service::errors::list(&pool, &app_id, &status)
+            service::errors::list(&pool, &app_id, &environment_id, &status)
                 .await
                 .ok()
                 .and_then(|list| serde_json::to_string(&list).ok())

@@ -1,5 +1,9 @@
 //! Observability: metrics, spans, devices, paths, refs, logs (the unary reads
 //! plus the merged log view the log SSE stream tails).
+//!
+//! Every read takes an optional environment: absent or empty means
+//! production only — never "everything", now that environments carry their
+//! own rows keyed by environment id.
 
 use crate::api_error::ApiError;
 use crate::db;
@@ -38,17 +42,76 @@ pub async fn telemetry_target_or_404(
     }
 }
 
-/// Merged log view: the ingested OTel ring (up to ~40 s behind live traffic)
-/// plus the in-memory stdout tail (live). Chronological, oldest first.
-pub async fn merged_lines(state: &AppState, app_id: &str, slug: &str) -> Vec<String> {
-    let since = metrics::now_us() - 24 * 3_600_000_000;
-    let mut lines: Vec<String> = db::list_app_logs(&state.pool, app_id, since, 500)
+/// One resolved observability scope: the app id and environment id the
+/// metric tables key on (`''` for production), the environment's label when
+/// scoped to one, and the fleet key the in-memory log tail keys on.
+pub struct TelemetryScope {
+    pub app_id: String,
+    /// The app's slug (or the reserved control key): names the maps prefix
+    /// and the fleet key together with the environment label.
+    pub slug: String,
+    pub environment_id: String,
+    pub env_label: Option<String>,
+    pub fleet_key: String,
+}
+
+/// Resolve one scope: absent or empty `environment_id` is production only;
+/// a given one must be this app's, else 404 (environment rings are keyed
+/// `slug.label` and must never answer for another app — or for the control
+/// fleet, which has no environments).
+pub async fn telemetry_scope(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    environment_id: Option<&str>,
+) -> Result<TelemetryScope, ApiError> {
+    let Some(env_id) = environment_id.filter(|raw| !raw.is_empty()) else {
+        let (app_id, slug) = telemetry_target_or_404(pool, id).await?;
+        return Ok(TelemetryScope {
+            app_id,
+            slug: slug.clone(),
+            environment_id: String::new(),
+            env_label: None,
+            fleet_key: slug,
+        });
+    };
+    let app = db::get_app(pool, id)
         .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(_, body)| body)
-        .collect();
-    lines.extend(logs::tail(&state.logs, slug, 500).await);
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found("app not found"))?;
+    let env = db::get_environment(pool, env_id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    match env {
+        Some(env) if env.app_id == app.id => Ok(TelemetryScope {
+            slug: app.slug.clone(),
+            fleet_key: supervisor::env_fleet_key(&app.slug, &env.label),
+            app_id: app.id,
+            environment_id: env.id,
+            env_label: Some(env.label),
+        }),
+        _ => Err(ApiError::not_found("environment not found")),
+    }
+}
+
+/// Merged log view: the ingested OTel ring for this scope (up to ~40 s
+/// behind live traffic) plus the fleet's in-memory stdout tail (live).
+/// Chronological, oldest first. Environments merge their own ingested ring
+/// with their own fleet ring — never production's.
+pub async fn merged_lines(state: &AppState, scope: &TelemetryScope) -> Vec<String> {
+    let since = metrics::now_us() - 24 * 3_600_000_000;
+    let mut lines: Vec<String> = db::list_app_logs(
+        &state.pool,
+        &scope.app_id,
+        &scope.environment_id,
+        since,
+        500,
+    )
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(_, body)| body)
+    .collect();
+    lines.extend(logs::tail(&state.logs, &scope.fleet_key, 500).await);
     lines
 }
 
@@ -63,40 +126,44 @@ pub async fn metrics(
     state: &AppState,
     id: &str,
     hours: Option<i64>,
+    environment: Option<&str>,
 ) -> Result<serde_json::Value, ApiError> {
-    let (app_id, _) = telemetry_target_or_404(&state.pool, id).await?;
+    let scope = telemetry_scope(&state.pool, id, environment).await?;
     let since = hours_since(hours, "%Y-%m-%dT%H:%M:00Z");
-    json_rows(db::list_app_metrics(&state.pool, &app_id, &since).await)
+    json_rows(db::list_app_metrics(&state.pool, &scope.app_id, &scope.environment_id, &since).await)
 }
 
 pub async fn devices(
     state: &AppState,
     id: &str,
     hours: Option<i64>,
+    environment: Option<&str>,
 ) -> Result<serde_json::Value, ApiError> {
-    let (app_id, _) = telemetry_target_or_404(&state.pool, id).await?;
+    let scope = telemetry_scope(&state.pool, id, environment).await?;
     let since = hours_since(hours, "%Y-%m-%dT%H:00:00Z");
-    json_rows(db::list_app_devices(&state.pool, &app_id, &since).await)
+    json_rows(db::list_app_devices(&state.pool, &scope.app_id, &scope.environment_id, &since).await)
 }
 
 pub async fn paths(
     state: &AppState,
     id: &str,
     hours: Option<i64>,
+    environment: Option<&str>,
 ) -> Result<serde_json::Value, ApiError> {
-    let (app_id, _) = telemetry_target_or_404(&state.pool, id).await?;
+    let scope = telemetry_scope(&state.pool, id, environment).await?;
     let since = hours_since(hours, "%Y-%m-%dT%H:00:00Z");
-    json_rows(db::list_app_paths(&state.pool, &app_id, &since).await)
+    json_rows(db::list_app_paths(&state.pool, &scope.app_id, &scope.environment_id, &since).await)
 }
 
 pub async fn refs(
     state: &AppState,
     id: &str,
     hours: Option<i64>,
+    environment: Option<&str>,
 ) -> Result<serde_json::Value, ApiError> {
-    let (app_id, _) = telemetry_target_or_404(&state.pool, id).await?;
+    let scope = telemetry_scope(&state.pool, id, environment).await?;
     let since = hours_since(hours, "%Y-%m-%dT%H:00:00Z");
-    json_rows(db::list_app_refs(&state.pool, &app_id, &since).await)
+    json_rows(db::list_app_refs(&state.pool, &scope.app_id, &scope.environment_id, &since).await)
 }
 
 /// Ingested hourly span stats (spec T3.2): the 24 h default is one indexed
@@ -105,38 +172,37 @@ pub async fn spans(
     state: &AppState,
     id: &str,
     hours: Option<i64>,
+    environment: Option<&str>,
 ) -> Result<serde_json::Value, ApiError> {
-    let (app_id, _) = telemetry_target_or_404(&state.pool, id).await?;
+    let scope = telemetry_scope(&state.pool, id, environment).await?;
     let since = hours_since(hours, "%Y-%m-%dT%H:00:00Z");
-    json_rows(db::list_span_stats(&state.pool, &app_id, &since).await)
+    json_rows(db::list_span_stats(&state.pool, &scope.app_id, &scope.environment_id, &since).await)
 }
 
-/// Per-app metrics version (spec T3.6): dashboard polls fetch this first and
-/// skip their window queries when it hasn't moved.
-pub async fn metrics_version(state: &AppState, id: &str) -> Result<serde_json::Value, ApiError> {
-    let (app_id, _) = telemetry_target_or_404(&state.pool, id).await?;
-    match db::get_metric_version(&state.pool, &app_id).await {
+/// Per-app-and-environment metrics version (spec T3.6): dashboard polls fetch
+/// this first and skip their window queries when it hasn't moved. Each tab
+/// (production, each environment) has its own version.
+pub async fn metrics_version(
+    state: &AppState,
+    id: &str,
+    environment: Option<&str>,
+) -> Result<serde_json::Value, ApiError> {
+    let scope = telemetry_scope(&state.pool, id, environment).await?;
+    match db::get_metric_version(&state.pool, &scope.app_id, &scope.environment_id).await {
         Ok(v) => Ok(serde_json::json!({ "version": v })),
         Err(e) => Err(ApiError::internal(e.to_string())),
     }
 }
 
-/// One resolved live-log source. Production merges the ingested OTel view
-/// with the fleet's in-memory ring; an environment serves its own fleet ring
-/// only — its celld writes telemetry to `envs/<slug>/<label>/telemetry/`, which
-/// the ingest does not read yet (ROADMAP Phase 3), so there is nothing to
-/// merge and nothing to leak from production.
-pub enum LogSource {
-    Production { app_id: String, slug: String },
-    Environment { key: String },
+/// One resolved live-log source: the scope's own ingested ring plus its own
+/// fleet ring, merged. Production and each environment read only their own.
+pub struct LogSource {
+    pub scope: TelemetryScope,
 }
 
 impl LogSource {
     pub async fn lines(&self, state: &AppState) -> Vec<String> {
-        match self {
-            Self::Production { app_id, slug } => merged_lines(state, app_id, slug).await,
-            Self::Environment { key } => logs::tail(&state.logs, key, 500).await,
-        }
+        merged_lines(state, &self.scope).await
     }
 }
 
@@ -149,23 +215,9 @@ pub async fn log_source(
     id: &str,
     environment_id: Option<&str>,
 ) -> Result<LogSource, ApiError> {
-    let Some(env_id) = environment_id.filter(|raw| !raw.is_empty()) else {
-        let (app_id, slug) = telemetry_target_or_404(&state.pool, id).await?;
-        return Ok(LogSource::Production { app_id, slug });
-    };
-    let app = db::get_app(&state.pool, id)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .ok_or_else(|| ApiError::not_found("app not found"))?;
-    let env = db::get_environment(&state.pool, env_id)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    match env {
-        Some(env) if env.app_id == app.id => Ok(LogSource::Environment {
-            key: supervisor::env_fleet_key(&app.slug, &env.label),
-        }),
-        _ => Err(ApiError::not_found("environment not found")),
-    }
+    Ok(LogSource {
+        scope: telemetry_scope(&state.pool, id, environment_id).await?,
+    })
 }
 
 pub async fn logs_lines(

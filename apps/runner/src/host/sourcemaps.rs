@@ -161,6 +161,17 @@ fn maps_prefix(bucket_uri: &str, bucket: &str, sha: &str) -> Option<String> {
     Some(format!("{key}/{MAPS_DIR}/{sha}"))
 }
 
+/// The fleet prefix an error's maps live under: the environment's own
+/// `envs/<slug>/<label>` when the occurrence belongs to one, else the app's
+/// `fleets/<slug>`. Symbolication resolves each occurrence against its own
+/// deploy's maps (`service::errors::get`).
+pub fn error_maps_prefix(slug: &str, env_label: Option<&str>) -> String {
+    match env_label {
+        Some(label) => format!("envs/{slug}/{label}"),
+        None => format!("fleets/{slug}"),
+    }
+}
+
 /// Deploy shas are git shas; a sha that is not hex would escape the maps dir.
 fn is_key_sha(sha: &str) -> bool {
     !sha.is_empty() && sha.len() <= 64 && sha.chars().all(|c| c.is_ascii_hexdigit())
@@ -1486,11 +1497,9 @@ pub async fn store_deploy_maps(
         sha,
         deploy_root,
     } = *target;
-    // Preview environments have no error ingest, so their maps would never
-    // be read: skip storing them (YAGNI until environment errors exist).
-    if environment_id.is_some() {
-        return Ok("skipped: preview environments store no maps".to_string());
-    }
+    // Environment deploys store under their own `envs/<slug>/<label>/` prefix
+    // (via `maps_prefix`) and prune against the environment's own deploy
+    // history, exactly like production.
     if !is_key_sha(sha) {
         anyhow::bail!("refusing to store maps for non-sha {sha:?}");
     }
@@ -1931,9 +1940,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn env_deploys_skip_map_storage() {
-        // Preview environments have no error ingest, so nothing would ever
-        // read their maps: the store returns before touching S3.
+    async fn env_deploys_store_like_production() {
+        // Environment deploys store under their own `envs/<slug>/<label>/`
+        // prefix: the store no longer skips them, so an env target reaches
+        // the same bucket validation as production before touching S3.
         let pool = crate::db::connect("sqlite::memory:")
             .await
             .expect("in-memory pool");
@@ -1944,14 +1954,17 @@ mod tests {
         let target = StoreMaps {
             app_id: "app-id",
             environment_id: Some("env-id"),
-            bucket_uri: "s3://bucket/envs/app/preview",
+            bucket_uri: "s3://other/envs/app/preview",
             sha: "abc123",
             deploy_root: &dir,
         };
-        let summary = store_deploy_maps(&pool, &cfg, &target, Ok(None))
+        let err = store_deploy_maps(&pool, &cfg, &target, Ok(None))
             .await
-            .expect("skip succeeds");
-        assert!(summary.contains("skipped"));
+            .expect_err("a foreign bucket refuses the env deploy, never skips it");
+        assert!(
+            err.to_string().contains("outside this install"),
+            "unexpected error: {err:#}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2424,6 +2437,15 @@ mod tests {
         assert_eq!(
             maps_prefix("s3://bucket/fleets/app", "bucket", "../evil"),
             None
+        );
+    }
+
+    #[test]
+    fn error_maps_follow_the_occurrence_fleet() {
+        assert_eq!(error_maps_prefix("blog", None), "fleets/blog");
+        assert_eq!(
+            error_maps_prefix("blog", Some("preview")),
+            "envs/blog/preview"
         );
     }
 

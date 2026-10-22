@@ -1,8 +1,15 @@
-/** Pull-request detail: header (title, state and the Close/Merge actions),
- * the review box, and the Conversation/Files tabs. */
 import { Link } from "@ilha/void";
+/** Pull-request detail: header (title, state and the Close/Merge actions),
+ * the head branch's environment card, the review box, and the
+ * Conversation/Files tabs. */
+import { atom } from "ilha";
 
-import { environmentUrl } from "../apps/identity";
+import { CreateEnvironmentDialog } from "../app-detail/environments";
+import {
+  environmentHost,
+  environmentUrl,
+  presenceTone,
+} from "../apps/identity";
 import { formatDateTime } from "../dates";
 import { shortSha } from "../forge/format";
 import { CommitList } from "../forge/parts";
@@ -112,40 +119,97 @@ const PrCommitsTab = ({
 };
 
 /** The head branch's own environment, when it has one (a preview environment
- * is per branch; `main` never has one). */
+ * is per branch; `main` never has one). Status, URL, last deploy and links
+ * into that environment's Metrics/Errors — all from the cached app detail
+ * and environments the page's state stream keeps fresh (`AppStateSync`,
+ * mounted by the layout), so this opens no second event stream. */
 const PrEnvironment = ({ appId, head }: { appId: string; head: string }) => {
   const environment = (environments(appId).data() ?? []).find(
     (row) => row.gitRef === `refs/heads/${head}`
   );
 
+  const detail = appDetail(appId).data();
+  const subdomain = detail?.app.subdomain ?? "";
+  const role = detail?.myRole;
+  const canPush = role === "push" || role === "admin";
+  const createOpen = atom(false);
+
   if (!environment) {
-    return null;
+    if (!canPush) {
+      return null;
+    }
+
+    return (
+      <div class="border-base-300 bg-base-100 dark:bg-base-200 flex flex-wrap items-center gap-2 rounded-lg border p-3 text-sm">
+        <span class="opacity-70">No environment for {head} yet.</span>
+        <button
+          type="button"
+          class="btn btn-sm btn-neutral"
+          onclick={() => {
+            createOpen.set(true);
+          }}
+        >
+          Create environment
+        </button>
+        <CreateEnvironmentDialog
+          appId={appId}
+          initialBranch={head}
+          open={createOpen}
+        />
+      </div>
+    );
   }
 
-  const subdomain = appDetail(appId).data()?.app.subdomain ?? "";
-
   return (
-    <div class="border-base-300 bg-base-100 dark:bg-base-200 flex flex-wrap items-center gap-2 rounded-lg border p-3 text-sm">
-      <span class="opacity-70">Environment</span>
-      <span class="font-mono text-xs">{environment.label}</span>
-      <span class="badge badge-sm">{environment.status}</span>
-      <span class="text-base-content/70 text-xs">
-        {environment.lastDeploySha
-          ? `${shortSha(environment.lastDeploySha)} · ${formatDateTime(
-              environment.lastDeployedAt ?? environment.updatedAt
-            )}`
-          : "no deploy yet"}
-      </span>
-      {subdomain === "" ? null : (
-        <a
-          class="link link-hover ml-auto font-mono text-xs"
-          href={environmentUrl(subdomain, environment.label)}
-          target="_blank"
-          rel="noopener"
-        >
-          Open environment
-        </a>
-      )}
+    <div class="border-base-300 bg-base-100 dark:bg-base-200 flex flex-col gap-2 rounded-lg border p-3 text-sm">
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="opacity-70">Environment</span>
+        <span class="font-mono text-xs">{environment.label}</span>
+        <span
+          aria-hidden="true"
+          class={`status ${presenceTone(environment.status)}`}
+        />
+        <span class="text-xs">{environment.status}</span>
+        {subdomain === "" ? null : (
+          <a
+            class="link link-hover ml-auto font-mono text-xs"
+            href={environmentUrl(subdomain, environment.label)}
+            target="_blank"
+            rel="noopener"
+            title={environmentHost(subdomain, environment.label)}
+          >
+            Open environment
+          </a>
+        )}
+      </div>
+      <div class="text-base-content/70 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+        {environment.lastDeploySha ? (
+          <>
+            <span>
+              {shortSha(environment.lastDeploySha)} ·{" "}
+              {formatDateTime(
+                environment.lastDeployedAt ?? environment.updatedAt
+              )}
+            </span>
+            <Link
+              class="link link-hover"
+              href={`/apps/${appId}?t=deployments&env=${environment.id}`}
+            >
+              Deploy log
+            </Link>
+          </>
+        ) : (
+          <span>no deploy yet</span>
+        )}
+        <span aria-hidden="true">·</span>
+        <Link href={`/apps/${appId}?t=metrics&env=${environment.id}`}>
+          Metrics
+        </Link>
+        <span aria-hidden="true">·</span>
+        <Link href={`/apps/${appId}?t=errors&env=${environment.id}`}>
+          Errors
+        </Link>
+      </div>
     </div>
   );
 };

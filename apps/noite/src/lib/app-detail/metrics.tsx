@@ -604,19 +604,23 @@ export const MetricsRangePicker = ({
 export const MetricsCard = ({
   appId,
   detail = false,
+  environmentId = "",
   hours = DEFAULT_METRICS_HOURS,
   viewAllHref,
 }: {
   appId: string;
   detail?: boolean;
+  /** One preview environment (absent/"" is production). The feed key and
+   * URL carry it, so each environment keeps its own snapshot and stream. */
+  environmentId?: string;
   hours?: number;
   viewAllHref?: string;
 }) => {
   // Usage over SSE: last snapshot (or skeleton when cold) until the first
   // frame, then the stream pushes a frame only when the request total moves.
   const feed = liveFeed(
-    feedKeys.metrics(appId, hours),
-    metricsUrl(appId, hours),
+    feedKeys.metrics(appId, hours, environmentId),
+    metricsUrl(appId, hours, environmentId),
     decodeMetrics
   );
 
