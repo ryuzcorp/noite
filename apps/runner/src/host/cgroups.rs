@@ -43,21 +43,35 @@ const RUNNER_LEAF: &str = "runner";
 pub const FLEET_PIDS_MAX: u64 = 4096;
 
 static CGROUPS_OK: AtomicBool = AtomicBool::new(false);
-static CGROUP_REASON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static CGROUP_REASON: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 static CGROUP_ANCHOR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 fn reason(msg: String) {
-    let _ = CGROUP_REASON.set(msg);
+    if let Ok(mut reason) = CGROUP_REASON.lock() {
+        *reason = msg;
+    }
 }
 
 /// Current cgroup status for `/ready` and doctor.
 pub fn status() -> (bool, String) {
     let ok = CGROUPS_OK.load(Ordering::Relaxed);
     let detail = CGROUP_REASON
-        .get()
-        .cloned()
+        .lock()
+        .ok()
+        .map(|reason| reason.clone())
+        .filter(|reason| !reason.is_empty())
         .unwrap_or_else(|| "not probed".to_string());
     (ok, detail)
+}
+
+/// A fleet leaf that cannot carry its limits is not containment: trip the
+/// install-wide status exactly like a failed setup, so `/ready` and doctor
+/// report it and `multi` blocks. One-way until reboot — a kernel refusing
+/// these writes will not start accepting them, and the alternative is a
+/// silently uncapped fleet.
+pub fn note_limit_failed(fleet: &str, reason: String) {
+    CGROUPS_OK.store(false, Ordering::Relaxed);
+    self::reason(format!("fleet {fleet}: {reason}"));
 }
 
 /// Anchor holding the per-fleet groups (`<anchor>/<fleet key>`), once setup
@@ -456,19 +470,59 @@ pub fn ensure_fleet_cgroup(anchor: &Path, key: &str, memory_mb: u64) -> anyhow::
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
     if memory_mb > 0 {
         let max = (memory_mb * 1024 * 1024).to_string();
-        write_file(&dir, "memory.max", &max)?;
-        // The kernel rejects what it cannot apply; read back so a silent
-        // no-op (read-only mount after setup, a clamped value) surfaces here
-        // instead of running uncapped.
-        let applied = std::fs::read_to_string(dir.join("memory.max"))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        if applied != max {
-            anyhow::bail!("memory.max did not apply (wrote {max}, have {applied:?})");
+        if let Err(error) = write_limit(&dir, "memory.max", &max) {
+            note_limit_failed(key, format!("{error:#}"));
+            return Err(error);
+        }
+        // At the cap the kernel must OOM-kill inside the leaf, not swap the
+        // fleet out: with swap allowed a tenant can push gigabytes into host
+        // swap past `memory.max` without tripping anything. `memory.swap.max`
+        // is absent where the host has no swap accounting — then there is no
+        // swap to escape into and the leaf is contained without it.
+        match cap_swap(&dir) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    fleet = key,
+                    "no cgroup swap accounting; fleet contained without memory.swap.max"
+                );
+            }
+            Err(error) => {
+                note_limit_failed(key, format!("{error:#}"));
+                return Err(error);
+            }
         }
     }
-    write_file(&dir, "pids.max", &FLEET_PIDS_MAX.to_string())?;
+    if let Err(error) = write_file(&dir, "pids.max", &FLEET_PIDS_MAX.to_string()) {
+        note_limit_failed(key, format!("{error:#}"));
+        return Err(error);
+    }
     Ok(dir)
+}
+
+/// Write a cgroup limit and read it back: the kernel rejects what it cannot
+/// apply, and a silent no-op (read-only mount after setup, a clamped value)
+/// must surface here instead of running uncapped.
+fn write_limit(dir: &Path, name: &str, value: &str) -> anyhow::Result<()> {
+    write_file(dir, name, value)?;
+    let applied = std::fs::read_to_string(dir.join(name))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if applied != value {
+        anyhow::bail!("{name} did not apply (wrote {value}, have {applied:?})");
+    }
+    Ok(())
+}
+
+/// Cap a fleet leaf's swap at zero alongside its `memory.max`. Returns
+/// whether swap is now capped: `false` when the kernel offers no swap
+/// accounting (`memory.swap.max` absent — nothing to escape into).
+fn cap_swap(dir: &Path) -> anyhow::Result<bool> {
+    if !dir.join("memory.swap.max").is_file() {
+        return Ok(false);
+    }
+    write_limit(dir, "memory.swap.max", "0")?;
+    Ok(true)
 }
 
 /// Move a fleet process into its cgroup; its children inherit it, so the
@@ -841,6 +895,60 @@ mod tests {
             oom_kills_since_spawn(&key, tmp.path()),
             None,
             "a restarted runner must not blame the previous boot"
+        );
+    }
+
+    #[test]
+    fn fleet_cgroup_writes_swap_max_zero() {
+        let tmp = fakefs();
+        let anchor = tmp.path();
+        // cap_swap only writes where the kernel offers swap accounting: the
+        // fake leaf carries the interface file the way a real leaf does.
+        std::fs::create_dir_all(anchor.join("swapped")).expect("fake fleet leaf");
+        std::fs::write(anchor.join("swapped").join("memory.swap.max"), "max")
+            .expect("fake swap accounting");
+        let dir = ensure_fleet_cgroup(anchor, "swapped", 512).expect("fleet cgroup");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("memory.swap.max")).expect("swap.max"),
+            "0",
+            "the leaf cannot swap past its memory.max"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("memory.max")).expect("memory.max"),
+            (512 * 1024 * 1024).to_string()
+        );
+    }
+
+    #[test]
+    fn missing_swap_accounting_is_contained() {
+        let tmp = fakefs();
+        // No memory.swap.max on the fake leaf (a host without swap
+        // accounting): nothing to escape into, so the spawn succeeds.
+        let dir = ensure_fleet_cgroup(tmp.path(), "noswap", 512).expect("fleet cgroup");
+        assert!(
+            !dir.join("memory.swap.max").exists(),
+            "no accounting file invented"
+        );
+    }
+
+    #[test]
+    fn refused_limit_write_trips_containment_status() {
+        let tmp = fakefs();
+        let anchor = tmp.path();
+        let key = format!("capped-{}", crate::models::new_id());
+        // A directory where memory.max goes: the limit write is refused
+        // (EISDIR, even as root), so the spawn must trip containment
+        // instead of running the fleet uncapped.
+        std::fs::create_dir_all(anchor.join(fleet_dir_name(&key)).join("memory.max"))
+            .expect("fake fleet leaf");
+        let err = ensure_fleet_cgroup(anchor, &key, 512).expect_err("must fail on refused write");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("memory.max"), "names the refused limit: {msg}");
+        let (ok, detail) = status();
+        assert!(!ok, "a refused limit write is not containment");
+        assert!(
+            detail.contains(&key),
+            "the reason names the fleet: {detail}"
         );
     }
 }

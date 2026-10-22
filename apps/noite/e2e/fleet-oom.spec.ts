@@ -180,10 +180,11 @@ test(
     // The kill itself, before the event: at least one burst request died
     // with the fleet. If the fleet survived every burst, no OOM kill
     // happened and no event is coming — fail here, not after a 120 s wait
-    // for the impossible.
+    // for the impossible. The before/after cgroup readings are in the
+    // report stdout (the TEMPORARY console.logs above).
     expect(
       killObserved,
-      `fleet survived every growth burst (before ${JSON.stringify(before)}, after ${JSON.stringify(after)})`
+      "fleet survived every growth burst (no OOM kill to observe)"
     ).toBe(true);
 
     const expected = `fleet restarted: memory limit ${OOM_CAP_MB} MiB exceeded (Settings → Limits)`;
