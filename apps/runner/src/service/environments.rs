@@ -138,17 +138,29 @@ pub async fn create(
             ApiError::bad(msg)
         }
     })?;
-    let label = env_label::unique_label(
-        &env_label::sanitize_label(branch),
-        &taken_labels(state, &app.id).await?,
-    );
-    let (listen, internal) = db::alloc::next_ports_in(
+    // Ports are claimed, not just picked: the claim holds the allocator lock
+    // until the row below lands, so a concurrent app or environment create
+    // cannot take the same pair (SPEC, Ports).
+    let ports = db::alloc::claim_ports_in(
         &state.pool,
         state.config.fleet_port_min,
         state.config.fleet_port_max,
     )
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))?;
+    .map_err(|e| match e {
+        sqlx::Error::RowNotFound => ApiError::conflict(format!(
+            "fleet port range {}-{} exhausted; raise NOITE_FLEET_PORTS",
+            state.config.fleet_port_min, state.config.fleet_port_max
+        )),
+        other => ApiError::internal(other.to_string()),
+    })?;
+    // The label is computed under the claim: a concurrent same-branch create
+    // sees this row's label once it lands and takes a suffix instead of
+    // failing the unique insert.
+    let label = env_label::unique_label(
+        &env_label::sanitize_label(branch),
+        &taken_labels(state, &app.id).await?,
+    );
     let created_by = actor.map(|a| a.user_id.clone()).unwrap_or_default();
     let env = db::create_environment(
         &state.pool,
@@ -160,12 +172,13 @@ pub async fn create(
             kind: EnvironmentKind::Branch,
             git_ref: &git_ref,
             created_by: &created_by,
-            listen,
-            internal,
+            listen: ports.listen,
+            internal: ports.internal,
         },
     )
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
+    drop(ports);
     // The new site has to exist before the fleet does, so the first request
     // reaches a route instead of the app's wildcard fallback.
     if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
@@ -415,17 +428,26 @@ pub async fn preview(
         Some(env) => env,
         None => {
             check_caps(state, &app.id).await?;
-            let label = env_label::unique_label(
-                &env_label::workspace_label(branch, &body.actor.user_id),
-                &taken_labels(state, &app.id).await?,
-            );
-            let (listen, internal) = db::alloc::next_ports_in(
+            // Ports are claimed, not just picked: the claim holds the allocator
+            // lock until the row below lands (SPEC, Ports).
+            let ports = db::alloc::claim_ports_in(
                 &state.pool,
                 state.config.fleet_port_min,
                 state.config.fleet_port_max,
             )
             .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+            .map_err(|e| match e {
+                sqlx::Error::RowNotFound => ApiError::conflict(format!(
+                    "fleet port range {}-{} exhausted; raise NOITE_FLEET_PORTS",
+                    state.config.fleet_port_min, state.config.fleet_port_max
+                )),
+                other => ApiError::internal(other.to_string()),
+            })?;
+            // The label is computed under the claim (see `create` above).
+            let label = env_label::unique_label(
+                &env_label::workspace_label(branch, &body.actor.user_id),
+                &taken_labels(state, &app.id).await?,
+            );
             let env = db::create_environment(
                 &state.pool,
                 &state.config,
@@ -436,12 +458,13 @@ pub async fn preview(
                     kind: EnvironmentKind::Workspace,
                     git_ref: &git_ref,
                     created_by: &body.actor.user_id,
-                    listen,
-                    internal,
+                    listen: ports.listen,
+                    internal: ports.internal,
                 },
             )
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
+            drop(ports);
             if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
                 tracing::warn!(error = %format!("{e:#}"), "caddy rewrite after preview create");
             }

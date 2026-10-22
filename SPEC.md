@@ -68,7 +68,7 @@ The types the two halves share are generated: every REST-boundary struct/enum de
 
 The operator-facing description of the published/fleet ports, the edge's Host routing and the bucket layout lives in the website docs ([How it works](apps/website/docs/02-how-it-works.mdx): Ports, Bucket layout). The contracts this design depends on:
 
-- Fleet ports are two per app from `NOITE_FLEET_PORTS` (default `20000-29999`), allocated by `db/alloc.rs::next_ports_in`; exhaustion errors instead of wandering into ephemeral ports.
+- Fleet ports are two per app from `NOITE_FLEET_PORTS` (default `20000-29999`), claimed atomically by `db/alloc.rs::claim_ports_in` (pick-then-insert under one process-wide lock, so concurrent app/environment creates never take the same pair); exhaustion errors instead of wandering into ephemeral ports.
 - `git/{slug}/` holds tip bundles from Git HTTP plus `MANIFEST.json` (`{seq, refs}`; readers resolve refs from the manifest so half-written pushes stay invisible); `fleets/{slug}/` is tenant celld (deploys, storage, telemetry); `control/` is the UI worker bundle + its D1 (accounts, invites); `envs/{slug}/{label}/` is one [preview environment's](#environments-previews) celld (its own storage and telemetry, created empty); `runner/state/` is the runner SQLite snapshots + the `owner.json` fence.
 - The runner ensures bucket `NOITE_S3_BUCKET` (default `noite`) on boot, enables versioning best-effort, and uses root keys for deploy/reconcile (see [Scoped credentials](#scoped-credentials)).
 - `/data` (volume `noite-data`): the live runner SQLite, git mirrors, builds, fleet working dirs, the control node's working dir, Caddy config and certificates. Everything in it is rebuildable from the bucket (certificates are re-issued).

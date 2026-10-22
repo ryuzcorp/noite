@@ -114,13 +114,6 @@ pub async fn create(
             "failed to clear slug data: {e:#}"
         )));
     }
-    let (listen, internal) = db::alloc::next_ports_in(
-        &state.pool,
-        state.config.fleet_port_min,
-        state.config.fleet_port_max,
-    )
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?;
     let subdomain = format!("{slug}.{}", state.config.base_domain);
     let owner = user_id
         .map(str::trim)
@@ -146,12 +139,28 @@ pub async fn create(
         )));
     }
     // No credential row: only a scoped provider (Phase 4) mints one.
+    // Ports are claimed, not just picked: the claim holds the allocator lock
+    // until the row below lands, so a concurrent environment create cannot
+    // take the same pair (SPEC, Ports).
+    let ports = db::alloc::claim_ports_in(
+        &state.pool,
+        state.config.fleet_port_min,
+        state.config.fleet_port_max,
+    )
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::RowNotFound => ApiError::conflict(format!(
+            "fleet port range {}-{} exhausted; raise NOITE_FLEET_PORTS",
+            state.config.fleet_port_min, state.config.fleet_port_max
+        )),
+        other => ApiError::internal(other.to_string()),
+    })?;
     let app = db::create_app(
         &state.pool,
         &state.config,
         db::NewApp {
-            internal,
-            listen,
+            internal: ports.internal,
+            listen: ports.listen,
             name: &name,
             slug: &slug,
             subdomain: &subdomain,
@@ -160,6 +169,7 @@ pub async fn create(
     )
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
+    drop(ports);
     let Some(git) = git_source else {
         return Ok(app);
     };
