@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 
 use super::{
-    decrypt, encrypt, ensure, fleet_credentials, prefix_policy, revoke_app, revoke_environment,
-    sweep, tenant_process_credentials, AppCredentials, CredentialProvider, Credentials, MintedKey,
-    ProviderSetting, Scope, StoreAccess,
+    decrypt, encrypt, ensure, fleet_credentials, orphan_sweep, orphan_sweep_due, prefix_policy,
+    revoke_app, revoke_environment, sweep, tenant_process_credentials, AppCredentials,
+    CredentialProvider, Credentials, MintedKey, ProviderSetting, Scope, StoreAccess,
 };
 use crate::config::{config_for_tests, Config, Tenancy};
 use crate::db;
@@ -23,6 +23,13 @@ struct FakeState {
     revoked: Vec<String>,
     fail_mint: bool,
     fail_revoke: bool,
+    fail_list: bool,
+    extra_listed: Vec<String>,
+    foreign_listed: Vec<String>,
+    mint_entered: Option<Arc<tokio::sync::Notify>>,
+    mint_release: Option<Arc<tokio::sync::Notify>>,
+    list_entered: Option<Arc<tokio::sync::Notify>>,
+    list_release: Option<Arc<tokio::sync::Notify>>,
     next: u64,
 }
 
@@ -52,24 +59,65 @@ impl CredentialProvider for FakeProvider {
         "fake"
     }
 
+    fn install_tag(&self) -> &str {
+        "fake-tag"
+    }
+
     fn mint<'a>(
         &'a self,
         bucket: &'a str,
         prefix: &'a str,
     ) -> BoxFuture<'a, anyhow::Result<MintedKey>> {
         Box::pin(async move {
-            let mut state = self.state.lock().expect("fake lock");
-            if state.fail_mint {
-                return Err(anyhow::anyhow!("mint refused"));
+            let gates = {
+                let mut state = self.state.lock().expect("fake lock");
+                if state.fail_mint {
+                    return Err(anyhow::anyhow!("mint refused"));
+                }
+                state.next += 1;
+                let n = state.next;
+                state.minted.push((bucket.to_string(), prefix.to_string()));
+                let key = MintedKey {
+                    handle: format!("user-{n}"),
+                    access_key: format!("AK-{n}-{prefix}"),
+                    secret_key: format!("SK-{n}"),
+                };
+                (state.mint_entered.clone(), state.mint_release.clone(), key)
+            };
+            if let Some(entered) = gates.0 {
+                entered.notify_one();
             }
-            state.next += 1;
-            let n = state.next;
-            state.minted.push((bucket.to_string(), prefix.to_string()));
-            Ok(MintedKey {
-                handle: format!("user-{n}"),
-                access_key: format!("AK-{n}-{prefix}"),
-                secret_key: format!("SK-{n}"),
-            })
+            if let Some(release) = gates.1 {
+                release.notified().await;
+            }
+            Ok(gates.2)
+        })
+    }
+
+    fn manages(&self, handle: &str) -> bool {
+        handle.starts_with("user-")
+    }
+
+    fn list_managed<'a>(&'a self) -> BoxFuture<'a, anyhow::Result<Vec<String>>> {
+        Box::pin(async move {
+            let (entered, gate) = {
+                let state = self.state.lock().expect("fake lock");
+                (state.list_entered.clone(), state.list_release.clone())
+            };
+            if let Some(entered) = entered {
+                entered.notify_one();
+            }
+            if let Some(release) = gate {
+                release.notified().await;
+            }
+            let state = self.state.lock().expect("fake lock");
+            if state.fail_list {
+                return Err(anyhow::anyhow!("list refused"));
+            }
+            let mut out: Vec<String> = (1..=state.next).map(|n| format!("user-{n}")).collect();
+            out.extend(state.extra_listed.iter().cloned());
+            out.extend(state.foreign_listed.iter().cloned());
+            Ok(out)
         })
     }
 
@@ -282,6 +330,9 @@ async fn root_key_from_provider_is_refused() {
         fn name(&self) -> &'static str {
             "crook"
         }
+        fn install_tag(&self) -> &str {
+            "crook-tag"
+        }
         fn mint<'a>(
             &'a self,
             _bucket: &'a str,
@@ -297,6 +348,12 @@ async fn root_key_from_provider_is_refused() {
         }
         fn revoke<'a>(&'a self, _handle: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
             Box::pin(async move { Ok(()) })
+        }
+        fn manages(&self, _handle: &str) -> bool {
+            false
+        }
+        fn list_managed<'a>(&'a self) -> BoxFuture<'a, anyhow::Result<Vec<String>>> {
+            Box::pin(async move { Ok(Vec::new()) })
         }
     }
     let pool = memory_db().await;
@@ -342,6 +399,298 @@ async fn root_mode_keeps_root_keys_for_fleets_only_in_single() {
         "multi release runs only with scoped keys"
     );
     pool.close().await;
+}
+
+/// An orphan — at the store but in no `scoped_credential` row — is revoked.
+#[tokio::test]
+async fn orphan_without_a_row_is_revoked() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    provider
+        .state
+        .lock()
+        .expect("fake lock")
+        .extra_listed
+        .push("user-9".into());
+    let report = orphan_sweep(&pool, &cfg).await;
+    assert!(
+        report.error.is_none(),
+        "unexpected sweep error: {:?}",
+        report.error
+    );
+    assert_eq!(report.listed, 1);
+    assert_eq!(report.revoked, 1);
+    assert_eq!(provider.revoked(), vec!["user-9".to_string()]);
+    pool.close().await;
+}
+
+/// Keys with a row — live or still awaiting their store delete — are kept.
+#[tokio::test]
+async fn keys_with_rows_are_kept() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    ensure(&pool, &cfg, &provider, &app_scope())
+        .await
+        .expect("mint");
+    let report = orphan_sweep(&pool, &cfg).await;
+    assert!(
+        report.error.is_none(),
+        "unexpected sweep error: {:?}",
+        report.error
+    );
+    assert_eq!(report.revoked, 0);
+    assert!(provider.revoked().is_empty());
+    db::mark_scoped_credential_revoking(&pool, "user-1")
+        .await
+        .expect("mark");
+    let report = orphan_sweep(&pool, &cfg).await;
+    assert_eq!(report.revoked, 0);
+    assert!(provider.revoked().is_empty());
+    pool.close().await;
+}
+
+/// A foreign principal — no row and outside the runner's naming scheme —
+/// is never touched, even though the listing returned it.
+#[tokio::test]
+async fn foreign_principals_are_never_touched() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    provider
+        .state
+        .lock()
+        .expect("fake lock")
+        .foreign_listed
+        .push("operator-root-key".into());
+    let report = orphan_sweep(&pool, &cfg).await;
+    assert!(
+        report.error.is_none(),
+        "unexpected sweep error: {:?}",
+        report.error
+    );
+    assert_eq!(report.revoked, 0);
+    assert!(provider.revoked().is_empty());
+    pool.close().await;
+}
+
+/// A store listing failure revokes nothing: the sweep is fail-safe.
+#[tokio::test]
+async fn listing_failure_revokes_nothing() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    {
+        let mut state = provider.state.lock().expect("fake lock");
+        state.fail_list = true;
+        state.extra_listed.push("user-9".into());
+    }
+    let report = orphan_sweep(&pool, &cfg).await;
+    assert!(report.error.is_some(), "the list failure must surface");
+    assert_eq!(report.revoked, 0);
+    assert!(provider.revoked().is_empty());
+    pool.close().await;
+}
+
+/// A mint racing the sweep is not revoked: the sweep lists without the
+/// mutation lock, then fences each candidate (lock, row re-check, revoke).
+/// The per-key fence keeps the race guarantee — an uncommitted mint either
+/// finishes first (its row is present at the re-check) or the sweep ran
+/// first (the handle was never listed). The gates force the losing
+/// interleaving: the sweep lists while the mint still holds the lock with
+/// no row committed.
+#[tokio::test]
+async fn mint_racing_the_sweep_is_not_revoked() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let mint_release = Arc::new(tokio::sync::Notify::new());
+    let list_release = Arc::new(tokio::sync::Notify::new());
+    {
+        let mut state = provider.state.lock().expect("fake lock");
+        state.mint_entered = Some(entered.clone());
+        state.mint_release = Some(mint_release.clone());
+        state.list_release = Some(list_release.clone());
+    }
+    let (mint_pool, sweep_pool) = (pool.clone(), pool.clone());
+    let (mint_cfg, sweep_cfg) = (cfg.clone(), cfg.clone());
+
+    let minting = tokio::spawn(async move {
+        fleet_credentials(&mint_pool, &mint_cfg, &app_scope())
+            .await
+            .expect("mint")
+    });
+    entered.notified().await;
+    let sweeping = tokio::spawn(async move { orphan_sweep(&sweep_pool, &sweep_cfg).await });
+    list_release.notify_one();
+    mint_release.notify_one();
+    let (minted, report) = tokio::join!(minting, sweeping);
+    let minted = minted.expect("mint task");
+    let report = report.expect("sweep task");
+    assert!(minted.access_key.contains("fleets/shop/"));
+    assert!(
+        report.error.is_none(),
+        "unexpected sweep error: {:?}",
+        report.error
+    );
+    assert!(
+        provider.revoked().is_empty(),
+        "the racing mint was revoked: {:?}",
+        provider.revoked()
+    );
+    assert!(db::live_scoped_credential(&pool, "app:app-1")
+        .await
+        .expect("read")
+        .is_some());
+    pool.close().await;
+}
+
+/// The sweep never holds the mutation lock across network I/O: with the
+/// listing gated open, a mint attempted mid-list still completes. Before the
+/// per-key fence the sweep held `MUTATE` for the whole pass, so the mint
+/// blocked behind the listing and this timed out.
+#[tokio::test]
+async fn sweep_lists_without_holding_the_mint_lock() {
+    let pool = memory_db().await;
+    let (cfg, provider) = test_config(FakeProvider::new());
+    let list_entered = Arc::new(tokio::sync::Notify::new());
+    let list_release = Arc::new(tokio::sync::Notify::new());
+    {
+        let mut state = provider.state.lock().expect("fake lock");
+        state.list_entered = Some(list_entered.clone());
+        state.list_release = Some(list_release.clone());
+    }
+    let (sweep_pool, mint_pool) = (pool.clone(), pool.clone());
+    let (sweep_cfg, mint_cfg) = (cfg.clone(), cfg.clone());
+    let sweeping = tokio::spawn(async move { orphan_sweep(&sweep_pool, &sweep_cfg).await });
+    // The sweep is inside the gated listing before the mint is attempted.
+    list_entered.notified().await;
+    let minted = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fleet_credentials(&mint_pool, &mint_cfg, &app_scope()),
+    )
+    .await
+    .expect("a mint attempted mid-list completes instead of stalling behind the sweep")
+    .expect("mint");
+    assert!(minted.access_key.contains("fleets/shop/"));
+    list_release.notify_one();
+    let report = sweeping.await.expect("sweep task");
+    assert!(
+        report.error.is_none(),
+        "unexpected sweep error: {:?}",
+        report.error
+    );
+    assert!(
+        provider.revoked().is_empty(),
+        "the mint committed before the re-check, so nothing revokes: {:?}",
+        provider.revoked()
+    );
+    pool.close().await;
+}
+
+/// The install tag is a short, stable, non-secret hash of the configured
+/// store: deterministic, 8 hex chars, and different across endpoints,
+/// buckets and regions.
+#[test]
+fn install_tag_is_stable_short_and_store_bound() {
+    let tag = super::install_tag("https://s3.us-east-1.amazonaws.com/", "noite", "us-east-1");
+    assert_eq!(
+        tag,
+        super::install_tag("https://s3.us-east-1.amazonaws.com", "noite", "us-east-1")
+    );
+    assert_eq!(tag.len(), 8, "{tag}");
+    assert!(
+        tag.bytes().all(|b| b.is_ascii_hexdigit()),
+        "hex for IAM paths, user names and policy names: {tag}"
+    );
+    assert_ne!(
+        tag,
+        super::install_tag("https://s3.us-east-1.amazonaws.com", "other", "us-east-1")
+    );
+    assert_ne!(
+        tag,
+        super::install_tag("http://rustfs:9000", "noite", "us-east-1")
+    );
+    assert_ne!(
+        tag,
+        super::install_tag("https://s3.us-east-1.amazonaws.com", "noite", "eu-west-1")
+    );
+}
+
+/// One store spelled differently in config is one install: surrounding
+/// whitespace, case, a trailing slash and the scheme's default port never
+/// re-tag it (a re-tag would leak every rowless key as foreign). A real
+/// port, scheme or host change still does.
+#[test]
+fn install_tag_ignores_spelling_but_not_the_store() {
+    let tag = super::install_tag("https://s3.us-east-1.amazonaws.com", "noite", "us-east-1");
+    for (endpoint, bucket, region) in [
+        (
+            " https://S3.us-east-1.amazonaws.com/ ",
+            " noite ",
+            " US-EAST-1 ",
+        ),
+        (
+            "https://s3.us-east-1.amazonaws.com:443",
+            "noite",
+            "us-east-1",
+        ),
+        (
+            "https://s3.us-east-1.amazonaws.com:443/",
+            "noite",
+            "us-east-1",
+        ),
+    ] {
+        assert_eq!(
+            tag,
+            super::install_tag(endpoint, bucket, region),
+            "{endpoint:?} {bucket:?} {region:?}"
+        );
+    }
+    let plain = super::install_tag("http://rustfs", "noite", "us-east-1");
+    assert_eq!(
+        plain,
+        super::install_tag("http://rustfs:80", "noite", "us-east-1")
+    );
+    assert_ne!(
+        plain,
+        super::install_tag("http://rustfs:9000", "noite", "us-east-1")
+    );
+    assert_ne!(
+        plain,
+        super::install_tag("https://rustfs", "noite", "us-east-1")
+    );
+}
+
+/// `/ready` echoes store status text: the recorded error is bounded so one
+/// hostile or verbose reply cannot bloat the status object.
+#[test]
+fn sweep_error_is_truncated_for_ready() {
+    let short = "list-users: HTTP 403 denied";
+    assert_eq!(super::truncate_sweep_error(short), short);
+    let long = "x".repeat(1000);
+    let truncated = super::truncate_sweep_error(&long);
+    assert!(truncated.len() <= 304, "bounded: {}", truncated.len());
+    assert!(truncated.ends_with('…'), "marks the cut: {truncated:?}");
+    assert!(truncated.starts_with(&long[..super::MAX_SWEEP_ERROR_LEN - 4]));
+}
+
+/// The orphan pass runs at boot and then every ten minutes by the injected
+/// clock — no sleeps, just instants.
+#[test]
+fn orphan_sweep_runs_at_boot_then_every_ten_minutes() {
+    use std::time::{Duration, Instant};
+    let interval = Duration::from_secs(10 * 60);
+    let boot = Instant::now();
+    assert!(orphan_sweep_due(None, boot, interval));
+    assert!(!orphan_sweep_due(Some(boot), boot, interval));
+    assert!(!orphan_sweep_due(
+        Some(boot),
+        boot + Duration::from_secs(9 * 60 + 59),
+        interval
+    ));
+    assert!(orphan_sweep_due(
+        Some(boot),
+        boot + Duration::from_secs(10 * 60),
+        interval
+    ));
 }
 
 /// The shared policy reaches exactly one prefix: objects under it, a
@@ -509,18 +858,18 @@ fn auto_resolution_matrix() {
         access_key: "a".into(),
         secret_key: "b".into(),
     };
-    let summary = Credentials::configure(ProviderSetting::Auto, &store).summary();
+    let summary = Credentials::configure(ProviderSetting::Auto, &store, "noite").summary();
     assert_eq!(summary, "scoped (rustfs)");
     let mut r2 = store.clone();
     r2.endpoint = "https://abc.r2.cloudflarestorage.com".into();
-    let summary = Credentials::configure(ProviderSetting::Auto, &r2).summary();
+    let summary = Credentials::configure(ProviderSetting::Auto, &r2, "noite").summary();
     assert!(
         summary.starts_with("root ("),
         "R2 has no scoped keys: {summary}"
     );
     let mut aws = store.clone();
     aws.endpoint = "https://s3.us-east-1.amazonaws.com".into();
-    let summary = Credentials::configure(ProviderSetting::Auto, &aws).summary();
+    let summary = Credentials::configure(ProviderSetting::Auto, &aws, "noite").summary();
     assert!(
         summary.contains("NOITE_CREDENTIAL_PROVIDER=aws"),
         "{summary}"
@@ -528,15 +877,15 @@ fn auto_resolution_matrix() {
     let mut other = store.clone();
     other.endpoint = "http://minio.internal:9000".into();
     assert_eq!(
-        Credentials::configure(ProviderSetting::Auto, &other).summary(),
+        Credentials::configure(ProviderSetting::Auto, &other, "noite").summary(),
         "undetected"
     );
     assert_eq!(
-        Credentials::configure(ProviderSetting::Root, &other).summary(),
+        Credentials::configure(ProviderSetting::Root, &other, "noite").summary(),
         "root (NOITE_CREDENTIAL_PROVIDER=root)"
     );
-    assert!(Credentials::configure(ProviderSetting::Minio, &other).is_scoped());
-    assert!(Credentials::configure(ProviderSetting::Aws, &other).is_scoped());
+    assert!(Credentials::configure(ProviderSetting::Minio, &other, "noite").is_scoped());
+    assert!(Credentials::configure(ProviderSetting::Aws, &other, "noite").is_scoped());
 }
 
 /// The store really enforces the minted key: against `rustfs:1.0.3` (the
@@ -679,7 +1028,7 @@ async fn scoped_key_enforced_by_rustfs() {
     )
     .await;
     assert!((200..300).contains(&status), "mkbucket: {status}");
-    let provider = super::MinioAdmin::rustfs(store);
+    let provider = super::MinioAdmin::rustfs(store, &bucket);
     let minted = provider.mint(&bucket, "fleets/shop/").await.expect("mint");
     let (access, secret) = (minted.access_key.clone(), minted.secret_key.clone());
     // Its own prefix: write, read, list.

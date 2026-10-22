@@ -83,6 +83,19 @@ if [ -n "$credentials" ]; then
       ;;
   esac
 fi
+# Orphan scoped-key sweep (SPEC, Scoped credentials): a listing failure
+# revokes nothing, so surface it loudly; otherwise report the count.
+sweep_err="$(printf '%s' "$ready" | sed -n 's/.*"credential_sweep":{[^}]*"last_error":"\([^"]*\)".*/\1/p')"
+sweep_revoked="$(printf '%s' "$ready" | sed -n 's/.*"credential_sweep":{[^}]*"revoked_total":\([^,}]*\).*/\1/p')"
+sweep_tag="$(printf '%s' "$ready" | sed -n 's/.*"credential_sweep":{[^}]*"install_tag":"\([^"]*\)".*/\1/p')"
+if [ -n "$sweep_tag" ]; then
+  echo "ok   install tag: $sweep_tag"
+fi
+if [ -n "$sweep_err" ] && [ "$sweep_err" != "null" ]; then
+  echo "WARN orphan credential sweep: last listing failed ($sweep_err)"
+elif [ -n "$sweep_revoked" ] && [ "$sweep_revoked" != "0" ]; then
+  echo "ok   orphan credential sweep (revoked total $sweep_revoked)"
+fi
 # State-snapshot health (`/ready` `snapshot`: still the bucket owner, how long
 # ago the last upload finished, the last upload error).
 snapshot_owner="$(printf '%s' "$ready" | sed -n 's/.*"snapshot":{[^}]*"owner":\([^,}]*\).*/\1/p')"

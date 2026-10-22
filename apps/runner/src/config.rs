@@ -771,6 +771,10 @@ impl Config {
                         .or_else(|_| env::var("RUSTFS_SECRET_KEY"))
                         .unwrap_or_else(|_| "noitesecretnoitesecretnoite12".into()),
                 },
+                // The install tag derives from the configured store (see
+                // `host::credentials::install_tag`); read the same var as
+                // `s3_bucket` above so the two cannot drift.
+                &env_or(&["NOITE_S3_BUCKET"], "noite"),
             ),
             stop_budget_ms: env_num(
                 "NOITE_STOP_BUDGET_MS",
@@ -839,8 +843,11 @@ impl Config {
     /// fleet spawn (existing installs mint their keys lazily from there).
     pub async fn resolve_credentials(&mut self) -> anyhow::Result<()> {
         if matches!(self.credentials, Credentials::Detect) {
-            self.credentials =
-                crate::host::credentials::detect(&StoreAccess::from_config(self)).await?;
+            self.credentials = crate::host::credentials::detect(
+                &StoreAccess::from_config(self),
+                &self.s3_bucket.clone(),
+            )
+            .await?;
         }
         Ok(())
     }

@@ -97,10 +97,19 @@ impl std::fmt::Debug for MintedKey {
     }
 }
 
-/// The store's own IAM: creates and deletes keys limited to one prefix.
+/// The store's own IAM: creates and deletes keys limited to one prefix,
+/// lists the principals this runner manages for the orphan sweep, and
+/// carries the install tag that keeps two installs sharing a store (or an
+/// AWS account) from revoking each other's live keys.
 pub trait CredentialProvider: Send + Sync {
     /// Short name for status lines and the stored row (`rustfs`, `minio`, `aws`).
     fn name(&self) -> &'static str;
+    /// This install's tag ([`install_tag`]): minting stamps it into every
+    /// principal (the IAM path and user name on AWS, the canned-policy name
+    /// on MinIO/RustFS) and listing requires it back, so a principal minted
+    /// by another install — or by this install before tags existed — never
+    /// matches. It is not secret.
+    fn install_tag(&self) -> &str;
     /// A new key that can read, write and list only `prefix` (it ends with
     /// `/`) in `bucket`: see [`prefix_policy`].
     fn mint<'a>(
@@ -109,7 +118,20 @@ pub trait CredentialProvider: Send + Sync {
         prefix: &'a str,
     ) -> BoxFuture<'a, anyhow::Result<MintedKey>>;
     /// Delete the key `handle` names. A key that is already gone is success.
+    /// Takes the handle as minted (old-format handles included): revoke,
+    /// rename and delete paths work by handle for keys minted before tags.
     fn revoke<'a>(&'a self, handle: &'a str) -> BoxFuture<'a, anyhow::Result<()>>;
+    /// Whether `handle` names a principal this runner could have minted
+    /// (name/shape check only — the install binding lives where the listing
+    /// returns it: the IAM path on AWS, the attached policy on MinIO).
+    /// The orphan sweep revokes only these — never foreign users or the
+    /// operator's own keys, even when the listing returns them.
+    fn manages(&self, handle: &str) -> bool;
+    /// Every managed principal currently at the store, each already
+    /// install-bound (path on AWS, attached policy on MinIO): anything else
+    /// the store returns is excluded here, not revoked. A listing failure
+    /// surfaces as `Err` so the sweep revokes nothing (fail-safe).
+    fn list_managed<'a>(&'a self) -> BoxFuture<'a, anyhow::Result<Vec<String>>>;
 }
 
 /// The IAM policy every provider attaches: objects under `prefix` (including
@@ -231,17 +253,21 @@ fn endpoint_host(endpoint: &str) -> String {
 
 impl Credentials {
     /// Resolve the setting from configuration alone; only `auto` against an
-    /// unknown store is left to [`detect`].
-    pub fn configure(setting: ProviderSetting, store: &StoreAccess) -> Self {
+    /// unknown store is left to [`detect`]. `bucket` feeds the install tag:
+    /// the tag must survive DB loss, so it derives from the configured
+    /// store, never from a row.
+    pub fn configure(setting: ProviderSetting, store: &StoreAccess, bucket: &str) -> Self {
         let host = endpoint_host(&store.endpoint);
         match setting {
             ProviderSetting::Root => Self::Root {
                 reason: "NOITE_CREDENTIAL_PROVIDER=root".into(),
             },
-            ProviderSetting::Minio => Self::Scoped(Arc::new(MinioAdmin::minio(store.clone()))),
-            ProviderSetting::Aws => Self::Scoped(Arc::new(AwsIam::new(store.clone()))),
+            ProviderSetting::Minio => {
+                Self::Scoped(Arc::new(MinioAdmin::minio(store.clone(), bucket)))
+            }
+            ProviderSetting::Aws => Self::Scoped(Arc::new(AwsIam::new(store.clone(), bucket))),
             ProviderSetting::Auto if store.endpoint.trim_end_matches('/') == BUNDLED_ENDPOINT => {
-                Self::Scoped(Arc::new(MinioAdmin::rustfs(store.clone())))
+                Self::Scoped(Arc::new(MinioAdmin::rustfs(store.clone(), bucket)))
             }
             ProviderSetting::Auto if host.ends_with(".r2.cloudflarestorage.com") => Self::Root {
                 reason: "Cloudflare R2 has no long-lived prefix-scoped keys; \
@@ -280,8 +306,8 @@ impl Credentials {
 /// reason. Keys the store refuses fail the boot instead of silently
 /// downgrading every fleet to root, because the answer decides what every
 /// fleet holds.
-pub async fn detect(store: &StoreAccess) -> anyhow::Result<Credentials> {
-    let admin = MinioAdmin::minio(store.clone());
+pub async fn detect(store: &StoreAccess, bucket: &str) -> anyhow::Result<Credentials> {
+    let admin = MinioAdmin::minio(store.clone(), bucket);
     match admin.probe().await? {
         Ok(()) => Ok(Credentials::Scoped(Arc::new(admin))),
         Err(why) => Ok(Credentials::Root {
@@ -393,6 +419,44 @@ fn decrypt(runner_token: &str, aad: &str, nonce: &[u8], ct: &[u8]) -> anyhow::Re
     Ok(String::from_utf8(pt)?)
 }
 
+/// This install's tag: a short, stable hash of the configured store (the S3
+/// endpoint identity plus the bucket name; for AWS the bucket and region,
+/// which the endpoint already carries). Computed at boot from configuration
+/// alone so it survives DB loss — the sweep exists because the DB can be
+/// lost, so the tag must never live in a row. It is not secret: it appears
+/// in IAM paths and user names, policy names, `/ready` and doctor output.
+///
+/// Minting stamps the tag into every principal and listing requires it back,
+/// so two installs sharing a store (or an AWS account) never match each
+/// other's live keys. Keys minted before tags (alpha.8) carry no tag and
+/// never match: the safe direction — the sweep never revokes them, while
+/// revoke/rename/delete by handle keep working for them.
+///
+/// Spelling never re-tags one store: surrounding whitespace, case, a
+/// trailing slash and the scheme's default port (`:80`, `:443`) are
+/// normalized away. A real endpoint, bucket or region change does change
+/// the tag. Old keys then read as foreign (never revoked by the sweep);
+/// point the install back or delete them at the store by hand.
+pub fn install_tag(endpoint: &str, bucket: &str, region: &str) -> String {
+    use sha2::Digest;
+    let lowered = endpoint.trim().trim_end_matches('/').to_ascii_lowercase();
+    let normalized = if let Some(host) = lowered.strip_prefix("http://") {
+        format!("http://{}", host.strip_suffix(":80").unwrap_or(host))
+    } else if let Some(host) = lowered.strip_prefix("https://") {
+        format!("https://{}", host.strip_suffix(":443").unwrap_or(host))
+    } else {
+        lowered
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    hasher.update(b"|");
+    hasher.update(bucket.trim().as_bytes());
+    hasher.update(b"|");
+    hasher.update(region.trim().to_ascii_lowercase().as_bytes());
+    let digest = hasher.finalize();
+    hex_encode(&digest)[..8].to_string()
+}
+
 /// Which store a key lives in: a key minted against another provider,
 /// endpoint or bucket is not one this runner can use or revoke.
 fn store_id(cfg: &Config, provider: &dyn CredentialProvider) -> String {
@@ -413,6 +477,13 @@ fn root_keys(cfg: &Config) -> AppCredentials {
 
 /// Serializes every mint and revoke: two callers ensuring one scope at once
 /// (a fleet spawn racing a deploy) would otherwise mint two keys for it.
+/// The orphan sweep relies on this too: an in-flight mint holds `MUTATE`
+/// until its row commits, so waiting for the lock is the fence that keeps a
+/// half-minted key from reading as orphaned.
+///
+/// `MUTATE` is per-process: the sweep assumes a single runner owns the DB
+/// (the `owner.json` fence in SPEC, Runner state). Two runners sharing one
+/// SQLite file would break the in-flight guarantee.
 static MUTATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn unresolved() -> anyhow::Error {
@@ -634,6 +705,209 @@ pub async fn sweep(pool: &sqlx::SqlitePool, cfg: &Config) -> usize {
         }
     }
     left
+}
+
+/// What one orphan pass found. Returned (not just logged) so tests assert
+/// the outcome without reading process-global status.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OrphanSweepReport {
+    /// Principals the store listed as managed by this runner.
+    pub listed: usize,
+    /// Of those, revoked because no `scoped_credential` row names them.
+    pub revoked: usize,
+    /// The listing (or DB read) failure, when the store could not be read.
+    /// Set means nothing was revoked.
+    pub error: Option<String>,
+}
+
+/// Last orphan-pass outcome for `/ready` and `make doctor`.
+#[derive(Clone, Debug)]
+struct OrphanSweepStatus {
+    last_run: Option<std::time::SystemTime>,
+    revoked_total: u64,
+    last_error: Option<String>,
+    install_tag: Option<String>,
+}
+
+static ORPHAN_SWEEP_STATUS: std::sync::Mutex<OrphanSweepStatus> =
+    std::sync::Mutex::new(OrphanSweepStatus {
+        last_run: None,
+        revoked_total: 0,
+        last_error: None,
+        install_tag: None,
+    });
+
+/// `/ready` shows the error, which echoes store status text: bound its
+/// length so one hostile or verbose store reply cannot bloat the status.
+const MAX_SWEEP_ERROR_LEN: usize = 300;
+
+fn truncate_sweep_error(raw: &str) -> String {
+    if raw.len() <= MAX_SWEEP_ERROR_LEN {
+        return raw.to_string();
+    }
+    let mut end = MAX_SWEEP_ERROR_LEN;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &raw[..end])
+}
+
+fn note_orphan_sweep(report: &OrphanSweepReport, install_tag: Option<&str>) {
+    if let Ok(mut status) = ORPHAN_SWEEP_STATUS.lock() {
+        status.last_run = Some(std::time::SystemTime::now());
+        status.revoked_total += report.revoked as u64;
+        status.last_error = report.error.clone().map(|e| truncate_sweep_error(&e));
+        if let Some(tag) = install_tag {
+            status.install_tag = Some(tag.to_string());
+        }
+    }
+}
+
+/// Additive `/ready` surface for the orphan pass: the install tag (absent
+/// before the first scoped pass), seconds since the last run (absent before
+/// the first), total orphans revoked, and the last listing error, if any.
+pub fn orphan_sweep_status() -> serde_json::Value {
+    let (ago, total, error, tag) = match ORPHAN_SWEEP_STATUS.lock() {
+        Ok(status) => (
+            status
+                .last_run
+                .and_then(|at| at.elapsed().ok())
+                .map(|age| age.as_secs()),
+            status.revoked_total,
+            status.last_error.clone(),
+            status.install_tag.clone(),
+        ),
+        Err(_) => (None, 0, None, None),
+    };
+    serde_json::json!({
+        "install_tag": tag,
+        "last_secs_ago": ago,
+        "revoked_total": total,
+        "last_error": error,
+    })
+}
+
+/// The orphan pass runs at boot (no pass yet) and then every `interval`.
+/// `now` is a parameter so tests inject the clock instead of sleeping.
+pub fn orphan_sweep_due(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    last.is_none_or(|at| now.saturating_duration_since(at) >= interval)
+}
+
+/// Reconcile the store against the DB: revoke every managed principal with
+/// no `scoped_credential` row (live or revoking) — the orphans a crash in
+/// the snapshot loss window (or any DB loss) leaves behind, which [`sweep`]
+/// can never see because it only acts on rows.
+///
+/// Safety, in order:
+/// - the store listing runs without `MUTATE`: holding the mint lock across
+///   network I/O would stall every fleet spawn and deploy for the whole
+///   pass. Each candidate is fenced instead — take `MUTATE`, re-check that
+///   no row names it, revoke that one key, release — so a key being minted
+///   (no row committed yet) can never be judged orphaned: an in-flight mint
+///   holds `MUTATE` until its row commits, so waiting for the lock is the
+///   fence;
+/// - revokes only install-bound principals the listing returns (tag in the
+///   IAM path and name on AWS, in the attached policy on MinIO/RustFS),
+///   never foreign principals or the operator's keys;
+/// - a listing or bulk DB failure revokes nothing and records the error for
+///   `/ready` and `make doctor` (fail-safe); a per-key row re-check failure
+///   skips that key for this pass (leak, retried next pass — never a
+///   wrong revoke).
+///
+/// Rows minted in another store keep [`sweep`]'s handling: any row, in any
+/// store, protects its handle.
+///
+/// Assumes one runner owns the DB (see `MUTATE`): `MUTATE` is per-process.
+pub async fn orphan_sweep(pool: &sqlx::SqlitePool, cfg: &Config) -> OrphanSweepReport {
+    let Credentials::Scoped(provider) = &cfg.credentials else {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                mode = %cfg.credentials.summary(),
+                "no orphan credential sweep: only scoped stores list their principals"
+            );
+        }
+        let report = OrphanSweepReport::default();
+        note_orphan_sweep(&report, None);
+        return report;
+    };
+    let install_tag = provider.install_tag().to_string();
+    let listed = match provider.list_managed().await {
+        Ok(handles) => handles,
+        Err(e) => {
+            let report = OrphanSweepReport {
+                listed: 0,
+                revoked: 0,
+                error: Some(format!("{e:#}")),
+            };
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "orphan credential listing failed; revoking nothing"
+            );
+            note_orphan_sweep(&report, Some(&install_tag));
+            return report;
+        }
+    };
+    let known = match db::all_scoped_credential_handles(pool).await {
+        Ok(handles) => handles,
+        Err(e) => {
+            let report = OrphanSweepReport {
+                listed: listed.len(),
+                revoked: 0,
+                error: Some(format!("{e:#}")),
+            };
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "orphan credential sweep could not read its rows; revoking nothing"
+            );
+            note_orphan_sweep(&report, Some(&install_tag));
+            return report;
+        }
+    };
+    let known: std::collections::HashSet<&str> = known.iter().map(String::as_str).collect();
+    let mut revoked = 0;
+    for handle in &listed {
+        if !provider.manages(handle) || known.contains(handle.as_str()) {
+            continue;
+        }
+        let _guard = MUTATE.lock().await;
+        match db::scoped_credential_handle_exists(pool, handle).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    handle = %handle,
+                    error = %e,
+                    "orphan sweep could not re-check the row; skipping this key"
+                );
+                continue;
+            }
+        }
+        match provider.revoke(handle).await {
+            Ok(()) => {
+                revoked += 1;
+                tracing::info!(handle = %handle, "revoked orphan scoped bucket key");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    handle = %handle,
+                    error = %format!("{e:#}"),
+                    "orphan key revocation failed; retrying on the next sweep"
+                );
+            }
+        }
+    }
+    let report = OrphanSweepReport {
+        listed: listed.len(),
+        revoked,
+        error: None,
+    };
+    note_orphan_sweep(&report, Some(&install_tag));
+    report
 }
 
 /// SigV4-sign one store request, as one struct instead of eleven

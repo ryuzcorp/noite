@@ -38,9 +38,10 @@ pub use compaction::{
     mark_hour_compacted, prune_compactions,
 };
 pub use credentials::{
-    delete_scoped_credential, insert_scoped_credential, live_scoped_credential,
-    mark_app_scoped_credentials_revoking, mark_scoped_credential_revoking,
-    revoking_scoped_credentials, NewScopedCredential, ScopedCredential,
+    all_scoped_credential_handles, delete_scoped_credential, insert_scoped_credential,
+    live_scoped_credential, mark_app_scoped_credentials_revoking, mark_scoped_credential_revoking,
+    revoking_scoped_credentials, scoped_credential_handle_exists, NewScopedCredential,
+    ScopedCredential,
 };
 pub use deploys::{
     fail_stuck_deploys, get_deploy_log, get_success_deploy, latest_deploy_status,
