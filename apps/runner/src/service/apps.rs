@@ -104,6 +104,7 @@ pub async fn create(
         &state.config,
         &state.procs,
         &state.logs,
+        &state.git_sync,
         &slug,
         supervisor::StopGrace::NORMAL,
     )
@@ -334,6 +335,7 @@ pub async fn delete(state: &AppState, id: &str) -> Result<(), ApiError> {
         &state.config,
         &state.procs,
         &state.logs,
+        &state.git_sync,
         &app.slug,
         supervisor::StopGrace::FOR_DELETE,
     )

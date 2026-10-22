@@ -679,23 +679,34 @@ pub(crate) async fn after_receive(
 /// from what is local on failure, same as before manifests existed. A read at
 /// or below the newest applied seq is stale, so it carries no new information
 /// and must not move refs backward; serve local instead.
+///
+/// Double-checked sync under the slug's `push_guard`, like
+/// [`crate::host::forge::read_mirror`]: the unlocked fast path below serves
+/// local when `applied_seq` already covers the manifest; only a newer
+/// manifest takes the guard and re-reads before refreshing, so an
+/// upload-pack read overlapping a push can never apply the pre-flip
+/// manifest.
 async fn refresh_from_manifest(state: &AppState, slug: &str, bare: &Path) {
-    let manifest = match git_manifest::read_manifest(&state.config, slug).await {
-        Ok(Some(m)) => m,
+    let pending = match git_manifest::pending_manifest(&state.config, &state.git_sync, slug).await {
+        Ok(pending) => pending,
+        Err(e) => {
+            tracing::warn!(slug = %slug, error = %format!("{e:#}"), "git manifest read");
+            return;
+        }
+    };
+    if pending.is_none() {
+        return;
+    }
+    let _push = state.git_sync.push_guard(slug).await;
+    let manifest = match git_manifest::pending_manifest(&state.config, &state.git_sync, slug).await
+    {
+        Ok(Some(manifest)) => manifest,
         Ok(None) => return,
         Err(e) => {
             tracing::warn!(slug = %slug, error = %format!("{e:#}"), "git manifest read");
             return;
         }
     };
-    if state
-        .git_sync
-        .applied_seq(slug)
-        .await
-        .is_some_and(|applied| applied >= manifest.seq)
-    {
-        return;
-    }
     let local = list_refs(bare).await.unwrap_or_default();
     if let Err(e) = git_manifest::refresh_bare(&state.config, bare, &manifest, &local).await {
         tracing::warn!(slug = %slug, error = %format!("{e:#}"), "git manifest refresh");

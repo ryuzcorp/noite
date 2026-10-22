@@ -30,9 +30,15 @@ pub async fn purge_slug(
     cfg: &Config,
     procs: &ProcMap,
     log_state: &LogState,
+    git_sync: &crate::host::git_manifest::GitSync,
     slug: &str,
     grace: supervisor::StopGrace,
 ) -> anyhow::Result<()> {
+    // The generation ends here: drop the seq marker first, so a failed purge
+    // still converges on a full manifest sync instead of skipping a restarted
+    // seq as stale. The caller holds the slug's `push_guard`, so no push can
+    // interleave with the wipe.
+    git_sync.forget(slug).await;
     // Per-step durations go on the final log line: a delete that takes tens
     // of seconds (seen in CI, 2026-10-22) must name its slow step.
     let started = std::time::Instant::now();
@@ -186,6 +192,7 @@ mod tests {
             &cfg,
             &procs,
             &crate::host::logs::new_state(),
+            &git_sync,
             "purge",
             crate::host::supervisor::StopGrace::NORMAL,
         )
