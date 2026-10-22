@@ -1314,13 +1314,19 @@ mod tests {
     ];
 
     /// Run `f` with a hermetic env: every strictly-parsed numeric var
-    /// cleared, `BASE_DOMAIN` pinned to the dev base, then `set` applied.
+    /// cleared, `BASE_DOMAIN` pinned to the dev base, `NOITE_TENANCY`
+    /// cleared (a test-set tenancy must not leak into later tests, and a
+    /// caller-shell value must not leak in), then `set` applied.
     /// Holds `ENV_LOCK` throughout and restores everything after, so a
     /// parallel `from_env` elsewhere never observes the mutation.
     fn with_env(set: &[(&str, &str)], f: impl FnOnce()) {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut saved: Vec<(&str, Option<String>)> = Vec::new();
-        for key in STRICT_NUMERIC_VARS.iter().copied().chain(["BASE_DOMAIN"]) {
+        for key in STRICT_NUMERIC_VARS
+            .iter()
+            .copied()
+            .chain(["BASE_DOMAIN", "NOITE_TENANCY"])
+        {
             saved.push((key, env::var(key).ok()));
             env::remove_var(key);
         }
@@ -1334,6 +1340,29 @@ mod tests {
                 Some(v) => env::set_var(key, v),
                 None => env::remove_var(key),
             }
+        }
+    }
+
+    #[test]
+    fn with_env_seals_noite_tenancy_both_ways() {
+        // A caller-shell value must not leak in, and a test-set value must
+        // not leak out (NOITE_TENANCY sits outside STRICT_NUMERIC_VARS).
+        let initial = env::var("NOITE_TENANCY").ok();
+        {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            env::set_var("NOITE_TENANCY", "single");
+        }
+        with_env(&[], || {
+            assert!(env::var("NOITE_TENANCY").is_err());
+        });
+        assert_eq!(env::var("NOITE_TENANCY").as_deref(), Ok("single"));
+        with_env(&[("NOITE_TENANCY", "multi")], || {
+            assert_eq!(env::var("NOITE_TENANCY").as_deref(), Ok("multi"));
+        });
+        assert_eq!(env::var("NOITE_TENANCY").as_deref(), Ok("single"));
+        match initial {
+            Some(v) => env::set_var("NOITE_TENANCY", v),
+            None => env::remove_var("NOITE_TENANCY"),
         }
     }
 
