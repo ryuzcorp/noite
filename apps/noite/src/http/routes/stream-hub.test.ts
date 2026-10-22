@@ -56,7 +56,9 @@ const liveSse = (request: Request, frames: readonly string[]): Response =>
     { headers: { "content-type": "text/event-stream" } }
   );
 
-/** Read a hub response until its frames satisfy `done` (or 2 s pass). */
+/** Read a hub response until its frames satisfy `done` (or the deadline
+ * signal fires, which fails the test with what arrived). The deadline is a
+ * signal, not a sleep: nothing waits on it, it only ends the read below. */
 const readFrames = async (
   response: Response,
   done: (frames: readonly string[]) => boolean
@@ -64,9 +66,10 @@ const readFrames = async (
   const frames: string[] = [];
   const controller = new AbortController();
 
-  const timer = setTimeout(() => {
-    controller.abort();
-  }, 2000);
+  const signal = AbortSignal.any([
+    controller.signal,
+    AbortSignal.timeout(2000),
+  ]);
 
   if (response.body === null) {
     throw new TypeError("the hub answered without a body");
@@ -81,12 +84,10 @@ const readFrames = async (
         controller.abort();
       }
     },
-    controller.signal
+    signal
   ).catch(() => {
     // Cancelled on purpose once `done` holds (or on the timeout).
   });
-
-  clearTimeout(timer);
 
   return frames;
 };

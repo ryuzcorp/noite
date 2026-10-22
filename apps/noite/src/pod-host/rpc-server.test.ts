@@ -193,14 +193,20 @@ const control = (port: MessagePort): Control => {
       },
     });
 
-    const timer = setTimeout(() => {
+    // A deadline only so a frame that never sends fails the test with the
+    // kind that hung, instead of running to the suite's own timeout.
+    const timeout = AbortSignal.timeout(EVENT_TIMEOUT_MS);
+
+    const onTimeout = () => {
       answeredEvent.reject(new Error(`the frame sent no ${kind} event`));
-    }, EVENT_TIMEOUT_MS);
+    };
+
+    timeout.addEventListener("abort", onTimeout);
 
     try {
       return await answeredEvent.promise;
     } finally {
-      clearTimeout(timer);
+      timeout.removeEventListener("abort", onTimeout);
     }
   };
 
@@ -271,20 +277,24 @@ const control = (port: MessagePort): Control => {
 
       // A deadline only so a frame that never answers fails the test with the
       // kind that hung, instead of running to the suite's own timeout.
-      const timer = setTimeout(() => {
+      const timeout = AbortSignal.timeout(CALL_TIMEOUT_MS);
+
+      const onTimeout = () => {
         calls.delete(id);
         answered.reject(new Error(`${kind}: the frame did not answer`));
-      }, CALL_TIMEOUT_MS);
+      };
+
+      timeout.addEventListener("abort", onTimeout);
 
       calls.set(id, {
         reject: (error) => {
-          clearTimeout(timer);
+          timeout.removeEventListener("abort", onTimeout);
           answered.reject(error);
         },
         // SAFETY: the answer belongs to this id, and the frame typed it
         // against the same map.
         resolve: (value) => {
-          clearTimeout(timer);
+          timeout.removeEventListener("abort", onTimeout);
           answered.resolve(value as PodRequestMap[K]["r"]);
         },
       });

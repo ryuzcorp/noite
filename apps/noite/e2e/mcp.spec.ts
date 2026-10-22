@@ -1,4 +1,3 @@
-import { sleep } from "$lib/sleep";
 import { expect, test } from "@playwright/test";
 import type { APIRequestContext } from "@playwright/test";
 import type { Json } from "effect/Schema";
@@ -185,27 +184,33 @@ test("an MCP client creates an app, pushes, follows the deploy, reads it back an
     MCP_SLUG
   );
 
-  let status: DeployStatus | null = null;
-  const deadline = Date.now() + 8 * 60_000;
+  // Follow the deploy over MCP until it is live: the poll reads the real
+  // deploy status (never a clock), and only its deadline can fail the wait.
+  let status: DeployStatus | null | undefined;
 
-  for (;;) {
-    // oxlint-disable-next-line eslint/no-await-in-loop -- sequential deploy poll with an early exit
-    status = await callTool<DeployStatus>(request, key, 6, "deploy_status", {
-      app: MCP_SLUG,
-    });
+  await expect
+    .poll(
+      async () => {
+        status = await callTool<DeployStatus>(
+          request,
+          key,
+          6,
+          "deploy_status",
+          {
+            app: MCP_SLUG,
+          }
+        );
 
-    if (status.live && status.deploy?.status === "success") {
-      break;
-    }
+        return status.live
+          ? (status.deploy?.status ?? "no-deploy")
+          : "not-live";
+      },
+      { intervals: [DEPLOY_POLL_MS], timeout: 8 * 60_000 }
+    )
+    .toBe("success");
 
-    if (Date.now() > deadline) {
-      throw new Error(
-        `deploy did not go live in time: ${JSON.stringify(status)}`
-      );
-    }
-
-    // oxlint-disable-next-line eslint/no-await-in-loop -- poll backoff
-    await sleep(DEPLOY_POLL_MS);
+  if (status === null || status === undefined) {
+    throw new Error("deploy did not go live in time");
   }
 
   expect(status.deploy?.sha).toBe(pushedSha);

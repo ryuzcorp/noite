@@ -1,0 +1,3 @@
+### Changed
+
+- **Tests carry no retries and no wall-clock sleeps.** The last Playwright retry (the e2e setup project's `retries: 1`) is gone: the setup ceremony has passed first-attempt on every sampled lane, and a retry could only ever rescue a failure before the account exists. Every remaining sleep became a real condition: e2e deploy and invite-lock waits poll through `expect.poll`, stream and reconnect tests fire injected clocks by hand, abort deadlines use `AbortSignal.timeout`, and Rust lock-wait tests race a timeout instead of sleeping-then-asserting. `docker/check-tests.ts` (run in `check.yml`, unit-tested by `docker/check-tests.test.ts`) keeps it that way.

@@ -87,18 +87,16 @@ test("the metrics stream honours ?hours= and pauses between polls", async ({
   // Read the SSE stream for a few seconds from inside the page (it carries
   // the session cookie) and count what arrives.
   const observed = await page.evaluate(async (id) => {
-    const controller = new AbortController();
-
-    const timer = setTimeout(() => {
-      controller.abort();
-    }, 4000);
+    // Observation window as a deadline signal, not a sleep: nothing waits
+    // on it, it only ends the stream read below.
+    const signal = AbortSignal.timeout(4000);
 
     let chunks = 0;
     let type = "";
 
     try {
       const res = await fetch(`/api/apps/${id}/metrics/stream?hours=168`, {
-        signal: controller.signal,
+        signal,
       });
 
       type = res.headers.get("content-type") ?? "";
@@ -117,8 +115,6 @@ test("the metrics stream honours ?hours= and pauses between polls", async ({
     } catch {
       // Aborted after the observation window.
     }
-
-    clearTimeout(timer);
 
     return { chunks, type };
   }, appId);

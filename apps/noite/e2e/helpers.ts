@@ -1,9 +1,8 @@
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import nodePath from "node:path";
 
-import { sleep } from "$lib/sleep";
 import { expect } from "@playwright/test";
 import type {
   APIRequestContext,
@@ -179,39 +178,46 @@ export const DEPLOY_POLL_MS = 500;
 /** Poll deploys until the tip reaches a terminal status. Push fast-path
  * spawns within seconds; the reconcile tip poll is the fallback. `sha`
  * waits for that revision's own row: without it a second push (or a
- * rollback) would return the previous deploy's terminal row. */
+ * rollback) would return the previous deploy's terminal row. The poll
+ * reads the real deploy row (never a clock): `expect.poll` re-reads until
+ * the row is terminal, and only its deadline can fail the wait. */
 export const waitForDeploy = async (
   request: APIRequestContext,
   appId: string,
   timeoutMs = 8 * 60_000,
   sha?: string
 ): Promise<RunnerDeploy> => {
-  const start = Date.now();
+  let latest: RunnerDeploy | undefined;
 
-  for (;;) {
-    // oxlint-disable-next-line eslint/no-await-in-loop -- sequential deploy poll with early exit; Promise.all would defeat it
-    const deploys = await runnerApi<RunnerDeploy[]>(
-      request,
-      `/v1/apps/${appId}/deploys`
-    );
+  await expect
+    .poll(
+      async () => {
+        const deploys = await runnerApi<RunnerDeploy[]>(
+          request,
+          `/v1/apps/${appId}/deploys`
+        );
 
-    const [latest] = deploys;
+        [latest] = deploys;
 
-    if (
-      latest &&
-      (latest.status === "success" || latest.status === "failed") &&
-      (sha === undefined || latest.sha === sha)
-    ) {
-      return latest;
-    }
+        if (
+          latest &&
+          (latest.status === "success" || latest.status === "failed") &&
+          (sha === undefined || latest.sha === sha)
+        ) {
+          return latest.status;
+        }
 
-    if (Date.now() - start > timeoutMs) {
-      throw new Error(`deploy for ${appId} did not finish in ${timeoutMs}ms`);
-    }
+        return `waiting:${latest?.status ?? "no-row"}`;
+      },
+      { intervals: [DEPLOY_POLL_MS], timeout: timeoutMs }
+    )
+    .toMatch(/^(?<terminal>success|failed)$/u);
 
-    // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll backoff
-    await sleep(DEPLOY_POLL_MS);
+  if (latest === undefined) {
+    throw new Error(`deploy for ${appId} did not finish in ${timeoutMs}ms`);
   }
+
+  return latest;
 };
 
 /** Mint an API key on the signed-in account's Account page. The raw key is
@@ -353,7 +359,10 @@ export const registerInviteeAccount = async (
  * single-use, and invite listings are diffed by the admin spec, so every
  * read-mint-redeem section runs under a filesystem lock (mkdir is atomic;
  * workers are separate processes on the one lane machine). The lane script
- * deletes a lock a killed worker left behind before every run. */
+ * deletes a lock a killed worker left behind before every run. Contention
+ * waits on the real condition (the holder removes its directory in
+ * `finally`), never on a clock: `expect.poll` re-checks until the
+ * directory is gone, and only its deadline can fail the wait. */
 export const withInviteLock = async <T>(fn: () => Promise<T>): Promise<T> => {
   const authDir = new URL(".auth/", import.meta.url);
   const lockDir = new URL("invite.lock", authDir);
@@ -371,12 +380,19 @@ export const withInviteLock = async <T>(fn: () => Promise<T>): Promise<T> => {
         throw error;
       }
 
-      if (Date.now() - start > 120_000) {
+      const remaining = 120_000 - (Date.now() - start);
+
+      if (remaining <= 0) {
         throw new Error("invite lock timed out after 120s", { cause: error });
       }
 
-      // oxlint-disable-next-line eslint/no-await-in-loop -- sequential lock acquisition with a timeout; Promise.all would defeat it
-      await sleep(200);
+      // oxlint-disable-next-line eslint/no-await-in-loop -- sequential lock acquisition: the poll must finish before retrying the atomic mkdir
+      await expect
+        .poll(() => !existsSync(lockDir), {
+          intervals: [200],
+          timeout: remaining,
+        })
+        .toBe(true);
     }
   }
 
