@@ -1,6 +1,7 @@
 //! Live runtime log tail (+ scroll memory).
 import { atom, watch } from "ilha";
 
+import { api } from "../api";
 import { decodeLogs, feedKeys, liveFeed, logsUrl } from "../feeds";
 import { collectRef, liveEl, newLiveRef } from "../live-ref";
 import type { LiveRef } from "../live-ref";
@@ -34,7 +35,14 @@ export const RuntimeLogs = ({
   const feed = liveFeed(
     feedKeys.logs(appId, environmentId),
     logsUrl(appId, environmentId),
-    decodeLogs
+    decodeLogs,
+    {
+      initial: () =>
+        api<string[]>("/api/logs/logTail", {
+          appId,
+          environmentId,
+        }),
+    }
   );
 
   const lines = (): string[] => feed.latest() ?? [];

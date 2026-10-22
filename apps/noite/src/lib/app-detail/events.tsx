@@ -147,7 +147,14 @@ export const liveEventCount = (appId: string): number => {
   const feed = liveFeed(
     feedKeys.events(appId, "", ""),
     eventsUrl(appId, "", FEED_LIMIT, ""),
-    decodeEvents
+    decodeEvents,
+    {
+      initial: () =>
+        api<EventsSnapshot>("/api/events/eventsSnapshot", {
+          appId,
+          limit: FEED_LIMIT,
+        }),
+    }
   );
 
   return feed.latest()?.feed.length ?? 0;
@@ -317,7 +324,15 @@ const EventsFeed = ({
   const feed = liveFeed(
     feedKeys.events(appId, channel(), ""),
     eventsUrl(appId, channel(), FEED_LIMIT, ""),
-    decodeEvents
+    decodeEvents,
+    {
+      initial: () =>
+        api<EventsSnapshot>("/api/events/eventsSnapshot", {
+          appId,
+          channel: channel(),
+          limit: FEED_LIMIT,
+        }),
+    }
   );
 
   const snapshot = (): EventsSnapshot =>

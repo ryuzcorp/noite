@@ -158,11 +158,11 @@ const IssueRow = ({
   </li>
 );
 
-/** Live issue list for one status over SSE: the last snapshot (or a
- * skeleton when cold) until the first frame, then the runner pushes a frame
- * whenever the list, a count or a sparkline moves — no refresh button.
- * `environmentId` scopes it to one preview environment (absent/"" is
- * production). */
+/** Live issue list for one status: the initial snapshot (or the last
+ * snapshot, or a skeleton when cold) until the stream's first frame, then
+ * the runner pushes a frame whenever the list, a count or a sparkline
+ * moves — no refresh button. `environmentId` scopes it to one preview
+ * environment (absent/"" is production). */
 export const liveErrors = (
   appId: string,
   status: ErrorStatus,
@@ -171,7 +171,15 @@ export const liveErrors = (
   const feed = liveFeed(
     feedKeys.errors(appId, status, environmentId),
     errorsUrl(appId, status, environmentId),
-    decodeErrors
+    decodeErrors,
+    {
+      initial: () =>
+        api<RunnerErrorList>("/api/errors/errorList", {
+          appId,
+          environmentId,
+          status,
+        }),
+    }
   );
 
   const data = (): RunnerErrorList | undefined => feed.latest();

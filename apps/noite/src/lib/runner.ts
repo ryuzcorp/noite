@@ -7,6 +7,8 @@ import { controlEnv, hydrateControlEnv } from "./control-env";
 import type { App as RunnerApp } from "./runner-types/App";
 import type { AppDomain as RunnerDomain } from "./runner-types/AppDomain";
 import type { AppEnv as RunnerEnv } from "./runner-types/AppEnv";
+import type { AppEvent as RunnerEvent } from "./runner-types/AppEvent";
+import type { AppInsight as RunnerInsight } from "./runner-types/AppInsight";
 import type { AppUserProps as RunnerUserProps } from "./runner-types/AppUserProps";
 import type { BlobResponse as RunnerBlob } from "./runner-types/BlobResponse";
 import type { BranchRules } from "./runner-types/BranchRules";
@@ -18,10 +20,12 @@ import type { D1TableInfo as D1TableInfoBase } from "./runner-types/D1TableInfo"
 import type { D1Tables as D1TablesRaw } from "./runner-types/D1Tables";
 import type { D1TableSchemaRaw } from "./runner-types/D1TableSchemaRaw";
 import type { D1WriteBody } from "./runner-types/D1WriteBody";
+import type { Deploy as RunnerDeploy } from "./runner-types/Deploy";
 import type { DoPreview } from "./runner-types/DoPreview";
 import type { EnvGrant } from "./runner-types/EnvGrant";
 import type { Environment as RunnerEnvironment } from "./runner-types/Environment";
 import type { ErrorIssueDetail as RunnerErrorDetail } from "./runner-types/ErrorIssueDetail";
+import type { ErrorIssueList as RunnerErrorList } from "./runner-types/ErrorIssueList";
 import type { GitBranch } from "./runner-types/GitBranch";
 import type { GitCommitDetail } from "./runner-types/GitCommitDetail";
 import type { GitCompare } from "./runner-types/GitCompare";
@@ -485,6 +489,14 @@ export const runnerRollback = (id: string, sha: string) =>
     { id, sha }
   );
 
+/** Deploy history, optionally in one preview environment (absent/"" is
+ * production): the initial snapshot behind the live Deployments list. */
+export const runnerListDeploys = (id: string, environmentId = "") =>
+  runnerRpc<RunnerDeploy[]>("deploys.list", {
+    environmentId: environmentId === "" ? undefined : environmentId,
+    id,
+  });
+
 export const runnerListEnv = (id: string) =>
   runnerRpc<RunnerEnv[]>("env.list", { id });
 
@@ -523,6 +535,59 @@ export const runnerSetErrorStatus = (
     fingerprint,
     id,
     status,
+  });
+
+/** One status's issue list, optionally in one preview environment
+ * (absent/"" is production): the initial snapshot behind the live Errors
+ * tab. Same shape as the stream frame. */
+export const runnerListErrors = (
+  id: string,
+  status: ErrorStatus,
+  environmentId = ""
+) =>
+  runnerRpc<RunnerErrorList>("errors.list", {
+    environmentId: environmentId === "" ? undefined : environmentId,
+    id,
+    status,
+  });
+
+/** Event feed rows for one channel, optionally in one preview environment
+ * (absent/"" is production). */
+export const runnerListEvents = (
+  id: string,
+  channel: string,
+  limit: number,
+  environmentId = ""
+) =>
+  runnerRpc<RunnerEvent[]>("events.list", {
+    channel: channel === "" ? undefined : channel,
+    environmentId: environmentId === "" ? undefined : environmentId,
+    id,
+    limit,
+  });
+
+/** Channel names with events, optionally in one preview environment
+ * (absent/"" is production). */
+export const runnerListEventChannels = (id: string, environmentId = "") =>
+  runnerRpc<string[]>("events.channels", {
+    environmentId: environmentId === "" ? undefined : environmentId,
+    id,
+  });
+
+/** Insight widgets, optionally in one preview environment (absent/"" is
+ * production). */
+export const runnerListEventInsights = (id: string, environmentId = "") =>
+  runnerRpc<RunnerInsight[]>("events.insights", {
+    environmentId: environmentId === "" ? undefined : environmentId,
+    id,
+  });
+
+/** Merged log tail (ingested ring plus the fleet's live stdout), oldest
+ * first — the initial snapshot behind the live Logs tail. */
+export const runnerGetLogs = (id: string, environmentId = "") =>
+  runnerRpc<string[]>("logs.get", {
+    environmentId: environmentId === "" ? undefined : environmentId,
+    id,
   });
 
 /** The app's public error-ingest identity (numeric project id + key). The

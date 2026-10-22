@@ -16,13 +16,15 @@ import {
   runnerDeployLog,
   runnerGitRemote,
   runnerListApps,
+  runnerListDeploys,
   runnerPatchApp,
   runnerRenameApp,
   runnerRetryImport,
   runnerRollback,
 } from "../runner";
-import type { RunnerApp, RunnerCreateSource } from "../runner";
+import type { RunnerApp, RunnerCreateSource, RunnerDeploy } from "../runner";
 import { apiAction, fail } from "./api";
+import { requireTelemetryRole } from "./errors.server";
 import { requireViewApp, sessionUser } from "./session.server";
 
 const CreateSource = Schema.Union([
@@ -383,6 +385,41 @@ export const deployLog = apiAction(
 
     try {
       return await runnerDeployLog(appId, deployId);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }
+);
+
+const ListDeploysArgs = Schema.Struct({
+  appId: Schema.String,
+  environmentId: Schema.optional(Schema.String),
+});
+
+/** Lean rows like the deploys stream (newest first): finished rows carry no
+ * build log (fetch it from `deployLog` on demand) — only the newest row
+ * keeps its live log while in flight. Exported for the unit tests. */
+export const leanDeployRows = (rows: RunnerDeploy[]): RunnerDeploy[] =>
+  rows.map((deploy, index) =>
+    index === 0 &&
+    (deploy.status === "building" || deploy.status === "deploying")
+      ? deploy
+      : { ...deploy, log: "" }
+  );
+
+/** Deploy history, optionally in one preview environment (absent/"" is
+ * production): the initial snapshot behind the live Deployments list, so it
+ * renders current data even when the stream's first frame is delayed or
+ * lost. View-gated like the stream. */
+export const listDeploys = apiAction(
+  ListDeploysArgs,
+  async ({ appId, environmentId }, { env, request }) => {
+    await requireTelemetryRole(request, env, appId, "view");
+
+    try {
+      const rows = await runnerListDeploys(appId, environmentId ?? "");
+
+      return leanDeployRows(rows);
     } catch (error) {
       failUnknown(error);
     }

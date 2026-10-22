@@ -192,9 +192,18 @@ export const readSseData = async (
 export interface HubRetry {
   baseMs: number;
   capMs: number;
+  /** First frame budget per attempt: a topic that opens but sends no frame
+   * within this long is dropped (`!`) and reopened, so a hung upstream
+   * (headers but no body) surfaces as retrying instead of an open,
+   * frameless topic. Defaults to 15 s: the runner ends a topic with an
+   * error within 10 s when its own first snapshot hangs, so this only
+   * fires on the proxy gap behind it, without racing the runner's bound. */
+  firstFrameMs?: number;
 }
 
 const DEFAULT_RETRY: HubRetry = { baseMs: 1000, capMs: 30_000 };
+
+const DEFAULT_FIRST_FRAME_MS = 15_000;
 
 interface Pump {
   env: KitEnv;
@@ -213,6 +222,7 @@ const relayOnce = async ({
   env,
   index,
   request,
+  retry,
   route,
   stream,
   topic,
@@ -242,21 +252,76 @@ const relayOnce = async ({
 
   let delivered = false;
 
+  // `readSseData` cancels through its reader, so a stalled relay is stopped
+  // through a linked signal — cancelling the locked body directly throws.
+  const relayCtl = new AbortController();
+
+  const stopRelay = (): void => {
+    relayCtl.abort();
+  };
+
+  stream.signal.addEventListener("abort", stopRelay);
+
   try {
     await stream.send({ data: `${index}:+` });
-    await readSseData(
+    // The first frame is bounded: an upstream that opened but never sends
+    // (runner fetch with headers and no body) is dropped and reopened
+    // instead of holding the topic open and frameless.
+    let resolveFirst: (() => void) | undefined;
+
+    // oxlint-disable-next-line promise/avoid-new -- one-shot wake for the first frame or its budget, like sleepUnlessAborted
+    const first = new Promise<void>((resolve) => {
+      resolveFirst = resolve;
+    });
+
+    const relayed = readSseData(
       response.body,
       async (data) => {
         delivered = true;
+        resolveFirst?.();
         await stream.send({ data: `${index}:${data}` });
       },
-      stream.signal
+      relayCtl.signal
     );
+
+    // An upstream that ends on its own before any frame (the runner's own
+    // first-frame bound, a restart) ends the wait too: the topic reopens
+    // after the usual backoff instead of sitting out this bound. Its error
+    // surfaces from `await relayed` below.
+    let ended = false;
+
+    const relayEnded = (async (): Promise<void> => {
+      try {
+        await relayed;
+      } catch {
+        // Reported by `await relayed` below; here it only ends the race.
+      } finally {
+        ended = true;
+      }
+    })();
+
+    await Promise.race([
+      first,
+      relayEnded,
+      sleepUnlessAborted(
+        retry.firstFrameMs ?? DEFAULT_FIRST_FRAME_MS,
+        stream.signal
+      ),
+    ]);
+
+    if (!(delivered || ended || stream.signal.aborted)) {
+      console.error("stream hub: topic stalled before its first frame", topic);
+      stopRelay();
+    }
+
+    await relayed;
   } catch (error) {
     if (!stream.signal.aborted) {
       console.error("stream hub: topic dropped", topic, error);
     }
   }
+
+  stream.signal.removeEventListener("abort", stopRelay);
 
   return delivered;
 };

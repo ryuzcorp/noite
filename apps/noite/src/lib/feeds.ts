@@ -365,15 +365,98 @@ export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
   };
 };
 
+/** In-flight initial snapshots by feed key: panels that share one key (the
+ * Errors tab badge and the list) share one fetch instead of doubling it. */
+const initialInflight = new Map<string, Promise<unknown>>();
+
+/** Bound a panel's initial snapshot fetch: above the 5 s runner bound (a
+ * hung runner fails server-side first, through the snapshot actions) and
+ * below the 15 s action bound (a hung action never outlives the platform
+ * deadline). A fetch slower than this is treated like a failed one — the
+ * stream stays the live source. Tests pass millisecond budgets. */
+const INITIAL_TIMEOUT_MS = 10_000;
+
+/** Options for {@link liveFeed}. */
+export interface LiveFeedOptions<T> {
+  /**
+   * Paint the current snapshot on a cold key (no stored snapshot and no
+   * frame yet): the panel renders current data promptly even when the
+   * stream's first frame is delayed or lost. Stream frames always win once
+   * they arrive, and a failed fetch is ignored — the stream stays live.
+   */
+  initial?: () => Promise<T>;
+  /** Keep the snapshot in memory only (see `writeSwr`). */
+  persist?: boolean;
+  /** Bound the `initial` fetch (see `INITIAL_TIMEOUT_MS`). */
+  timeoutMs?: number;
+}
+
+/** Fetch the current snapshot for a cold key (no stored snapshot): the
+ * panel paints it unless a stream frame landed first. Shared per key, so
+ * panels on one key (a tab badge and its list) fetch once. Failures are
+ * ignored — the stream stays the live source. Answers when the paint
+ * settles, so tests can await it instead of sleeping. Exported for the
+ * unit tests. */
+export const paintInitial = async <T>(
+  key: string,
+  latest: AtomHandle<T | undefined>,
+  opts: LiveFeedOptions<T> | undefined
+): Promise<void> => {
+  const initial = opts?.initial;
+
+  if (initial === undefined || readSwr<T>(key) !== undefined) {
+    return;
+  }
+
+  let pending = initialInflight.get(key);
+
+  if (pending === undefined) {
+    // oxlint-disable-next-line anti-slop/no-unknown-returns -- the shared slot erases T across panels; paintInitial restores it with a SAFETY cast below.
+    const run = (async (): Promise<unknown> => {
+      const timeoutMs = opts?.timeoutMs ?? INITIAL_TIMEOUT_MS;
+      const { promise, reject } = Promise.withResolvers<never>();
+
+      const timer = setTimeout(() => {
+        reject(
+          new Error(
+            `initial snapshot for ${key} timed out after ${timeoutMs}ms`
+          )
+        );
+      }, timeoutMs);
+
+      try {
+        return await Promise.race([initial(), promise]);
+      } catch {
+        // A failed or timed-out fetch resolves empty and is ignored below.
+      } finally {
+        clearTimeout(timer);
+        initialInflight.delete(key);
+      }
+    })();
+
+    pending = run;
+    initialInflight.set(key, pending);
+  }
+
+  const frame = await pending;
+
+  if (frame !== undefined && latest() === undefined) {
+    writeSwr(key, frame, opts);
+    // SAFETY: one key carries one T (see `writeSwr`); an empty fetch is a failure, never a frame.
+    latest.set(frame as T);
+  }
+};
+
 let pageHub: StreamHub | undefined;
 
-/** A live panel's feed. `persist: false` keeps its snapshots in memory only,
- * for a feed the UI never paints (see `writeSwr`). */
+/** A live panel's feed. `initial` paints one current snapshot on a cold key
+ * (see `writeSwr`); `persist: false` keeps its snapshots in memory only,
+ * for a feed the UI never paints. */
 export const liveFeed = <T>(
   key: string,
   url: string,
   decode: (raw: string) => T,
-  opts?: { persist?: boolean }
+  opts?: LiveFeedOptions<T>
 ): LiveFeed<T> => {
   // oxlint-disable-next-line unicorn/no-useless-undefined -- the feed starts valueless; undefined is the seed
   const latest = atom<T | undefined>(undefined);
@@ -391,6 +474,7 @@ export const liveFeed = <T>(
       return;
     }
 
+    void paintInitial(key, latest, opts);
     pageHub ??= createStreamHub();
 
     return pageHub.subscribe(url, {
