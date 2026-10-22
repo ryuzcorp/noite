@@ -1,3 +1,5 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+
 import { expect, test } from "@playwright/test";
 import type { APIRequestContext } from "@playwright/test";
 
@@ -141,7 +143,7 @@ const expectTamperProbes = (report: ProbeReport): void => {
 test(
   "hostile tenant is contained",
   { tag: "@isolation" },
-  async ({ page, request }, testInfo) => {
+  async ({ page, request }) => {
     test.skip(
       process.env.E2E_HOSTILE !== "1",
       "needs the isolation lane (E2E_HOSTILE=1, single image, NOITE_TENANCY=multi)"
@@ -222,14 +224,16 @@ test(
     // refused, not merely absent.
     expectTamperProbes(report);
 
-    // D3 sizing basis: per-fleet high-water marks at build time, attached
-    // to the always-uploaded report for the default-cap measurement.
-    await testInfo.attach("fleet-peaks", {
-      body: Buffer.from(
-        JSON.stringify(report.build.probes["fleet-peaks"] ?? { missing: true })
-      ),
-      contentType: "application/json",
+    // D3 sizing basis: per-fleet high-water marks at build time, written
+    // into the always-uploaded lane report (test attachments land in
+    // test-results/, which CI does not upload).
+    mkdirSync(new URL("../playwright-report", import.meta.url), {
+      recursive: true,
     });
+    writeFileSync(
+      new URL("../playwright-report/fleet-peaks.json", import.meta.url),
+      JSON.stringify(report.build.probes["fleet-peaks"] ?? { missing: true })
+    );
 
     await assertFleetCgroups(request, report);
 
