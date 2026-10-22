@@ -45,7 +45,11 @@ const liveSse = (request: Request, frames: readonly string[]): Response =>
         }
 
         request.signal.addEventListener("abort", () => {
-          controller.close();
+          try {
+            controller.close();
+          } catch {
+            // The hub already cancelled this stream (stalled first frame).
+          }
         });
       },
     }),
@@ -246,6 +250,39 @@ describe("streamHub", () => {
     expect(opens).toBe(2);
   });
 
+  test("a topic that never sends a first frame leaves open for retrying within the bound", async () => {
+    let opens = 0;
+
+    const routes: TopicRoute[] = [
+      {
+        handler: (request) => {
+          opens += 1;
+
+          // Headers but no body: the upstream hangs before its first frame.
+          return liveSse(request, []);
+        },
+        pattern: /^\/api\/apps\/(?<appId>[^/]+)\/logs\/stream$/u,
+      },
+    ];
+
+    const page = new AbortController();
+
+    const frames = await readFrames(
+      streamHub(hubRequest([logsUrl("app_1")], page.signal), env, routes, {
+        baseMs: 10,
+        capMs: 40,
+        firstFrameMs: 30,
+      }),
+      (got) => got.filter((frame) => frame === "0:+").length >= 2
+    );
+
+    page.abort();
+
+    // The topic opened, produced no frame in time, and was marked dropped
+    // so the client retries instead of sitting on an open, frameless topic.
+    expect(frames.indexOf("0:+")).toBeLessThan(frames.indexOf("0:!"));
+    expect(opens).toBe(2);
+  });
   test("an unknown topic is refused once; the rest still stream", async () => {
     const routes: TopicRoute[] = [
       {

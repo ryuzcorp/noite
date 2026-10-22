@@ -27,11 +27,17 @@ export const getUserProps = apiAction(
   }
 );
 
-const EventsSnapshotArgs = Schema.Struct({
+export const EventsSnapshotArgs = Schema.Struct({
   appId: Schema.String,
   channel: Schema.optional(Schema.String),
   environmentId: Schema.optional(Schema.String),
-  limit: Schema.optional(Schema.Number),
+  // The runner takes an integer row cap (1–200): a fractional or wild limit
+  // is a 422 here, not a runner 500 behind the snapshot fetch.
+  limit: Schema.optional(
+    Schema.Int.pipe(
+      Schema.check(Schema.isBetween({ maximum: 200, minimum: 1 }))
+    )
+  ),
 });
 
 /** The combined snapshot behind the live Events feed (`feed` rows plus the

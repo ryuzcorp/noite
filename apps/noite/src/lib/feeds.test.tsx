@@ -434,6 +434,51 @@ describe("createStreamHub", () => {
     expect(again.messages).toEqual(['["line"]']);
     expect(again.statuses.at(-1)).toBe("open");
   });
+
+  test("a CLOSED hub source is replaced once with the identical topics, replaying first frames", async () => {
+    const { flush, streams } = manualHub();
+    const logs = collect();
+    const deploys = collect();
+    streams.subscribe(LOGS, logs.hooks);
+    streams.subscribe(DEPLOYS, deploys.hooks);
+    flush();
+
+    const url = streamHubUrl([LOGS, DEPLOYS]);
+    expect(liveSources().map((source) => source.url)).toEqual([url]);
+
+    const [source] = liveSources();
+    source?.emit("open");
+    source?.emit("message", "0:+");
+    source?.emit("message", '0:["celld listening"]');
+    source?.emit("message", "1:+");
+    source?.emit("message", "1:[]");
+    expect(logs.messages).toEqual(['["celld listening"]']);
+    expect(deploys.messages).toEqual(["[]"]);
+
+    // Kill the connection the way an HTTP error kills a native source:
+    // the hub reopens the same topic set on one replacement connection.
+    // `close` marks the dead source gone, like its native CLOSED state.
+    source?.fail();
+    source?.close();
+    await sleep(50);
+
+    expect(FakeSource.instances).toHaveLength(2);
+    expect(liveSources().map((replacement) => replacement.url)).toEqual([url]);
+
+    const [replacement] = liveSources();
+    replacement?.emit("open");
+    replacement?.emit("message", "0:+");
+    replacement?.emit("message", "1:+");
+    replacement?.emit("message", '0:["celld listening"]');
+    replacement?.emit("message", "1:[]");
+    expect(logs.messages).toEqual([
+      '["celld listening"]',
+      '["celld listening"]',
+    ]);
+    expect(deploys.messages).toEqual(["[]", "[]"]);
+    expect(logs.statuses.at(-1)).toBe("open");
+    expect(deploys.statuses.at(-1)).toBe("open");
+  });
 });
 
 /** Unique feed keys: swr snapshots and the shared page hub persist per file. */
@@ -680,6 +725,10 @@ const captureAtom = async (): Promise<{
   };
 };
 
+// A fetch that never settles, for the timeout test below.
+// oxlint-disable-next-line promise/avoid-new -- the test needs a fetch that never settles
+const neverFetch = (): Promise<string[]> => new Promise<string[]>(() => {});
+
 describe("liveFeed initial snapshot", () => {
   test("a cold key paints the initial fetch when the stream never emits", async () => {
     const restore = installDomFixture();
@@ -806,6 +855,37 @@ describe("liveFeed initial snapshot", () => {
       expect(second()).toEqual(["shared"]);
       unmountFirst();
       unmountSecond();
+    } finally {
+      restore();
+    }
+  });
+
+  test("a hung initial fetch times out, stays unpainted, and retries", async () => {
+    const restore = installDomFixture();
+
+    try {
+      const key = nextInitialKey();
+      const { latest, unmount } = await captureAtom();
+
+      let calls = 0;
+
+      const initial = (): Promise<string[]> => {
+        calls += 1;
+
+        return calls === 1 ? neverFetch() : Promise.resolve(["fresh"]);
+      };
+
+      await paintInitial(key, latest, { initial, timeoutMs: 20 });
+      expect(calls).toBe(1);
+      expect(latest()).toBeUndefined();
+      expect(readSwr<string[]>(key)).toBeUndefined();
+
+      // The timed-out fetch left no in-flight entry behind: the next paint
+      // retries instead of attaching to a fetch that never settles.
+      await paintInitial(key, latest, { initial, timeoutMs: 1000 });
+      expect(calls).toBe(2);
+      expect(latest()).toEqual(["fresh"]);
+      unmount();
     } finally {
       restore();
     }

@@ -369,6 +369,13 @@ export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
  * Errors tab badge and the list) share one fetch instead of doubling it. */
 const initialInflight = new Map<string, Promise<unknown>>();
 
+/** Bound a panel's initial snapshot fetch: above the 5 s runner bound (a
+ * hung runner fails server-side first, through the snapshot actions) and
+ * below the 15 s action bound (a hung action never outlives the platform
+ * deadline). A fetch slower than this is treated like a failed one — the
+ * stream stays the live source. Tests pass millisecond budgets. */
+const INITIAL_TIMEOUT_MS = 10_000;
+
 /** Options for {@link liveFeed}. */
 export interface LiveFeedOptions<T> {
   /**
@@ -380,6 +387,8 @@ export interface LiveFeedOptions<T> {
   initial?: () => Promise<T>;
   /** Keep the snapshot in memory only (see `writeSwr`). */
   persist?: boolean;
+  /** Bound the `initial` fetch (see `INITIAL_TIMEOUT_MS`). */
+  timeoutMs?: number;
 }
 
 /** Fetch the current snapshot for a cold key (no stored snapshot): the
@@ -404,11 +413,23 @@ export const paintInitial = async <T>(
   if (pending === undefined) {
     // oxlint-disable-next-line anti-slop/no-unknown-returns -- the shared slot erases T across panels; paintInitial restores it with a SAFETY cast below.
     const run = (async (): Promise<unknown> => {
+      const timeoutMs = opts?.timeoutMs ?? INITIAL_TIMEOUT_MS;
+      const { promise, reject } = Promise.withResolvers<never>();
+
+      const timer = setTimeout(() => {
+        reject(
+          new Error(
+            `initial snapshot for ${key} timed out after ${timeoutMs}ms`
+          )
+        );
+      }, timeoutMs);
+
       try {
-        return await initial();
+        return await Promise.race([initial(), promise]);
       } catch {
-        // A failed fetch resolves empty and is ignored below.
+        // A failed or timed-out fetch resolves empty and is ignored below.
       } finally {
+        clearTimeout(timer);
         initialInflight.delete(key);
       }
     })();

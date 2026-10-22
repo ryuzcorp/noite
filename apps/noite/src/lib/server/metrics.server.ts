@@ -1,17 +1,14 @@
 import * as Schema from "effect/Schema";
 
 import { runnerConfig } from "../../http/config";
+import { failUnknown } from "../auth";
 import {
+  METRICS_WINDOWS_HOURS,
   pollMetricsFrame,
   pollMetricsVersion,
-} from "../../http/routes/streams";
-import { failUnknown } from "../auth";
+} from "../metrics";
 import { apiAction, fail } from "./api";
 import { requireTelemetryRole } from "./errors.server";
-
-/** Windows the metrics endpoints serve, in hours (mirrors the stream's
- * `METRICS_WINDOWS_HOURS` in `http/routes/streams.ts`). */
-const METRICS_WINDOWS_HOURS = new Set([24, 168, 720]);
 
 const MetricsFrameArgs = Schema.Struct({
   appId: Schema.String,
@@ -30,7 +27,9 @@ export const metricsFrame = apiAction(
 
     const rc = runnerConfig(env) ?? fail("RUNNER_TOKEN is not configured");
 
-    const windowHours = METRICS_WINDOWS_HOURS.has(hours) ? hours : 24;
+    const windowHours =
+      METRICS_WINDOWS_HOURS.find((window) => window === hours) ?? 24;
+
     const scope = environmentId ?? "";
     const base = `${rc.runner}/v1/apps/${encodeURIComponent(appId)}`;
     const auth = { authorization: `Bearer ${rc.token}` };

@@ -1,5 +1,6 @@
 //! Observability: metrics, spans, logs (thin adapters over
 //! `service::observe`) + the notify-driven live log tail.
+use std::future::Future;
 use std::time::Duration;
 
 use axum::{
@@ -104,6 +105,23 @@ pub async fn app_logs(
         .map(Json)
 }
 
+/// First log snapshot under a bound. `None` means the snapshot hung past
+/// `timeout` (warned here); the caller must end the stream with an error
+/// instead of holding an open, frameless stream. Split out so tests can
+/// drive it with a future that never answers on paused time.
+async fn first_lines<F>(lines: F, timeout: Duration) -> Option<Vec<String>>
+where
+    F: Future<Output = Vec<String>> + Send,
+{
+    match tokio::time::timeout(timeout, lines).await {
+        Ok(lines) => Some(lines),
+        Err(_) => {
+            tracing::warn!("logs stream: snapshot timed out before the first frame");
+            None
+        }
+    }
+}
+
 /// Live log tail as server-sent events: one JSON array per message, sent
 /// only when the snapshot changed (plus keep-alive comments). Wakes on the
 /// ingest tick's "new logs" signal (spec T3.3) instead of polling DuckDB, and
@@ -126,8 +144,31 @@ pub async fn app_logs_stream(
     let _ = notify.borrow_and_update();
     tokio::spawn(async move {
         let mut last: Option<Vec<String>> = None;
+        // The first snapshot drives the stream's first frame, so it runs
+        // under the same bound as the poll-driven streams: a hung snapshot
+        // ends the stream with an error instead of holding an open, frameless
+        // stream (the hub reports the drop as retrying and reopens the
+        // topic). Later snapshots ride the notify/heartbeat loop and keep
+        // retrying silently, like the poll streams do once framed.
+        let mut first = true;
         loop {
-            let lines = source.lines(&state).await;
+            let lines = if first {
+                first = false;
+                match first_lines(source.lines(&state), super::sse::SNAPSHOT_TIMEOUT).await {
+                    Some(lines) => lines,
+                    None => {
+                        let _ = tx
+                            .send(Err(anyhow::anyhow!(
+                                "logs stream: no first frame within {:?}",
+                                super::sse::SNAPSHOT_TIMEOUT
+                            )))
+                            .await;
+                        break;
+                    }
+                }
+            } else {
+                source.lines(&state).await
+            };
             if last.as_ref() != Some(&lines) {
                 // A blank event would paint a fake empty tail; skip the tick
                 // instead so the next one retries.
@@ -158,4 +199,33 @@ pub async fn app_logs_stream(
     Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_hung_first_snapshot_resolves_to_no_frame() {
+        tokio::time::pause();
+        let hung = first_lines(
+            std::future::pending::<Vec<String>>(),
+            Duration::from_millis(50),
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            hung.await.is_none(),
+            "a hung logs snapshot must resolve within its bound instead of hanging the stream open"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ready_first_snapshot_passes_through() {
+        let lines = first_lines(
+            async { vec!["booted".to_owned()] },
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(lines, Some(vec!["booted".to_owned()]));
+    }
 }
