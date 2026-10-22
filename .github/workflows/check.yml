@@ -41,6 +41,10 @@ jobs:
       # Test hygiene: no retries anywhere, no wall-clock sleeps in tests.
       - name: test hygiene (no retries, no sleeps)
         run: bun docker/check-tests.ts
+      # Worker rules: no cross-request shared async work without a waitUntil
+      # registration, no unbounded store reads (flake H).
+      - name: worker rules (no shared orphans, no unbounded reads)
+        run: bun docker/check-worker-rules.ts
       # `config` needs no daemon, so a broken compose file fails here instead
       # of on someone's server. Every variant, including the test overlays.
       - name: render compose (prod, build, dev, e2e, multi)

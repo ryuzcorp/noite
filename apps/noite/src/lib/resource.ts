@@ -10,7 +10,10 @@
 //! still gates skeletons) and subscribes to reloads for its key. `data`
 //! paints the last good swr-store snapshot until the fresh fetch lands, and
 //! blanks while a reload is in flight — across SPA remounts and reloads.
-//! After a mutation call `invalidate(key)` or `res.refetch()`.
+//! A failed load is evicted, never cached: the shared cache keeps failures
+//! forever, so the failure is dropped when it lands and a later mount (or an
+//! explicit refetch) starts a fresh lookup. After a mutation call
+//! `invalidate(key)` or `res.refetch()`.
 import * as Cache from "effect/Cache";
 import * as Effect from "effect/Effect";
 import { atom, watch } from "ilha";
@@ -140,18 +143,26 @@ const reload = async (key: string): Promise<unknown> => {
 };
 
 /** Serve the cache entry for `key` (concurrent mounts share one lookup) and
- * fan the landing out to every mounted reader. */
+ * fan the landing out to every mounted reader. A failure is evicted, never
+ * cached: the entry is dropped when the failure lands so a later mount (or
+ * an explicit refetch) starts a fresh lookup instead of re-serving it. */
 const settleGet = async (key: string, generation: number): Promise<void> => {
   try {
     const value = await Effect.runPromise(Cache.get(cache, key));
     settleKey(key, generation, { ok: true, value });
   } catch (error) {
     settleKey(key, generation, { error, ok: false });
+
+    if (generations.get(key) === generation) {
+      await Effect.runPromise(Cache.invalidate(cache, key));
+    }
   }
 };
 
 /** First paint for a newly mounted reader: serve the cache (concurrent mounts
- * of one key share the lookup) and settle every mounted reader when it lands. */
+ * of one key share the lookup) and settle every mounted reader when it lands.
+ * A failed load surfaces on every reader's `error` and evicts the entry, so
+ * a remount refetches; nothing retries on a timer. */
 const kick = (key: string): void => {
   const generation = (generations.get(key) ?? 0) + 1;
   generations.set(key, generation);
@@ -185,7 +196,8 @@ export const invalidate = (key: string): void => {
  * undefined` skeleton check — it now only fires on a genuinely cold key.
  * `persist: false` keeps the snapshot in memory only, for bulky entries
  * (file contents, build logs) that would crowd the small sessionStorage
- * quota. */
+ * quota. A failed load surfaces on `error` and evicts the entry, so a
+ * remount refetches; nothing retries on a timer. */
 export const tracked = <T>(
   key: string,
   fetcher: ResourceFetcher<T>,

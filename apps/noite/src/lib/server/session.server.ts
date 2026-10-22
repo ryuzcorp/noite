@@ -1,3 +1,4 @@
+import { sleepUnlessAborted } from "../../http/sse";
 import { authFromEnv, UnauthorizedError } from "../auth";
 import type { SessionUser } from "../auth";
 import { isInstanceAdmin, requireAppRole } from "../collaborators";
@@ -20,13 +21,25 @@ export const requestOrigin = (request: Request): string | undefined => {
   }
 };
 
+/** Bound on one session read. The store is D1 through better-auth (no
+ * timeout anywhere in that chain), so a wedged store would otherwise ride
+ * every action to the 15 s route timeout (flake H's 15.01 s pair). A miss
+ * or an unreadable session is still null (the caller picks 401); a store
+ * that never answers throws, so the action fails fast with cause instead
+ * of hanging, and never logs the caller out over a stall. Tests inject a
+ * small bound and await real signals, never a sleep. */
+const SESSION_TIMEOUT_MS = 5000;
+
 /** One session read shared by actions and HTTP routes: returns null instead
  * of throwing for a missing or unreadable session, so each caller picks its
  * own status/failure semantics. A missing auth secret still escapes — that is
- * a deployment fault, not a signed-out caller. */
+ * a deployment fault, not a signed-out caller. A session store that never
+ * answers throws instead of returning null — that is a stall, not a
+ * signed-out caller. */
 export const getSessionOrNull = async (
   request: Request,
-  env: KitEnv
+  env: KitEnv,
+  opts?: { timeoutMs?: number }
 ): Promise<RequestSession | null> => {
   await ensureDbPromise();
   const origin = requestOrigin(request);
@@ -38,12 +51,39 @@ export const getSessionOrNull = async (
   // authFromEnv throws MissingAuthSecretError on a misconfigured instance; the
   // session read below is the only part that reads as "signed out".
   const auth = authFromEnv(env, origin);
+
+  const read = (async () => {
+    try {
+      return await auth.api.getSession({ headers: request.headers });
+    } catch {
+      return null;
+    }
+  })();
+
+  const timeoutMs = opts?.timeoutMs ?? SESSION_TIMEOUT_MS;
+  const stop = new AbortController();
+
+  const failAfter = (async (): Promise<null> => {
+    await sleepUnlessAborted(timeoutMs, stop.signal);
+
+    if (stop.signal.aborted) {
+      // The read already won: the race settled, so this value is ignored.
+      // Returning (not throwing) keeps a settled promise the race already
+      // observes — no unhandled rejection from the losing branch.
+      return null;
+    }
+
+    throw new Error(
+      `noite: session store did not answer within ${timeoutMs}ms`
+    );
+  })();
+
   let session;
 
   try {
-    session = await auth.api.getSession({ headers: request.headers });
-  } catch {
-    return null;
+    session = await Promise.race([read, failAfter]);
+  } finally {
+    stop.abort();
   }
 
   const user = session?.user;
