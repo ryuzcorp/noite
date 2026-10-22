@@ -900,9 +900,34 @@ impl Config {
         }
         // The platform default shares the per-app override's floor: below it
         // celld cannot boot, so a typo'd `1` refuses loudly instead of
-        // OOM-looping every fleet. 0 disables the cap.
+        // OOM-looping every fleet. In multi the default is the enforced cap,
+        // so 0 there means "no containment at all" and refuses; single keeps
+        // 0 as no cap.
+        if self.tenancy == Tenancy::Multi && self.fleet_memory_mb == 0 {
+            problems.push(
+                "RUNNER_FLEET_MEMORY_MB must be >= 64 in multi (0 would leave every fleet uncapped)".into(),
+            );
+        }
         if self.fleet_memory_mb != 0 && self.fleet_memory_mb < 64 {
             problems.push("RUNNER_FLEET_MEMORY_MB must be 0 (no cap) or >= 64".into());
+        }
+        // The operator ceiling binds every per-app override in multi, so it
+        // carries the same floor (0 must not mean uncapped here) and must
+        // cover the default: a ceiling below the default would silently
+        // lower every fleet, including untouched ones. Inert only for an
+        // uncapped single install, where the ceiling binds nothing.
+        let ceiling_inert = self.tenancy != Tenancy::Multi && self.fleet_memory_mb == 0;
+        if !ceiling_inert {
+            if self.fleet_memory_max_mb < 64 {
+                problems.push(
+                    "RUNNER_FLEET_MEMORY_MAX_MB must be >= 64 (0 must not mean uncapped)".into(),
+                );
+            } else if self.fleet_memory_max_mb < self.fleet_memory_mb {
+                problems.push(format!(
+                    "RUNNER_FLEET_MEMORY_MAX_MB ({}) must cover RUNNER_FLEET_MEMORY_MB ({})",
+                    self.fleet_memory_max_mb, self.fleet_memory_mb
+                ));
+            }
         }
         if self.otel_flush_ms < 1000 {
             problems.push("RUNNER_OTEL_FLUSH_MS must be >= 1000".into());
@@ -1264,6 +1289,7 @@ mod tests {
         "RUNNER_ENVIRONMENT_TTL_H",
         "RUNNER_FLEET_MAX_RSS_MB",
         "RUNNER_FLEET_MEMORY_MB",
+        "RUNNER_FLEET_MEMORY_MAX_MB",
         "RUNNER_FLEET_IDLE_EVICT_S",
         "RUNNER_FLEET_DEPLOY_POLL_S",
         "RUNNER_SLEEP_AFTER_H",
@@ -1338,6 +1364,52 @@ mod tests {
             });
         }
     }
+
+    #[test]
+    fn multi_rejects_an_uncapped_default_but_single_keeps_it() {
+        with_env(
+            &[("NOITE_TENANCY", "multi"), ("RUNNER_FLEET_MEMORY_MB", "0")],
+            || {
+                let err = Config::from_env().expect_err("multi+0 must fail boot");
+                assert!(
+                    format!("{err:#}").contains("multi"),
+                    "names the reason: {err:#}"
+                );
+            },
+        );
+        with_env(
+            &[("NOITE_TENANCY", "single"), ("RUNNER_FLEET_MEMORY_MB", "0")],
+            || {
+                Config::from_env().expect("single keeps 0 as no cap");
+            },
+        );
+    }
+    #[test]
+    fn fleet_memory_ceiling_needs_a_floor_and_must_cover_the_default() {
+        for bad in ["0", "16"] {
+            with_env(&[("RUNNER_FLEET_MEMORY_MAX_MB", bad)], || {
+                let err = Config::from_env().expect_err("a floor-less ceiling must fail boot");
+                assert!(
+                    format!("{err:#}").contains("RUNNER_FLEET_MEMORY_MAX_MB"),
+                    "names the var: {err:#}"
+                );
+            });
+        }
+        with_env(&[("RUNNER_FLEET_MEMORY_MAX_MB", "256")], || {
+            let err = Config::from_env().expect_err("a ceiling below the default must fail boot");
+            assert!(
+                format!("{err:#}").contains("must cover"),
+                "says the ceiling must cover the default: {err:#}"
+            );
+        });
+        for ok in ["512", "1024"] {
+            with_env(&[("RUNNER_FLEET_MEMORY_MAX_MB", ok)], || {
+                let cfg = Config::from_env().expect("a covering ceiling must boot");
+                assert_eq!(cfg.fleet_memory_max_mb.to_string(), ok);
+            });
+        }
+    }
+
     #[test]
     fn every_malformed_numeric_is_listed_at_once() {
         with_env(
@@ -1350,6 +1422,7 @@ mod tests {
                 ("NOITE_EDGE_RPM", "lots"),
                 ("RUNNER_BUILD_UID_BASE", "nope"),
                 ("RUNNER_WAKE_CONCURRENCY", "4.5"),
+                ("RUNNER_FLEET_MEMORY_MAX_MB", "lots"),
             ],
             || {
                 let err = Config::from_env().expect_err("malformed values must fail boot");
@@ -1363,6 +1436,7 @@ mod tests {
                     ("NOITE_EDGE_RPM", "lots"),
                     ("RUNNER_BUILD_UID_BASE", "nope"),
                     ("RUNNER_WAKE_CONCURRENCY", "4.5"),
+                    ("RUNNER_FLEET_MEMORY_MAX_MB", "lots"),
                 ] {
                     assert!(msg.contains(key), "lists {key}: {msg}");
                     assert!(msg.contains(value), "lists the bad {value}: {msg}");
