@@ -95,25 +95,30 @@ pub async fn fleet_gone(procs: &ProcMap, key: &str) -> FleetFate {
 }
 
 /// How long a fleet stop waits for graceful exit (SIGTERM) and then for the
-/// SIGKILL reaping before giving up and logging. Deletes use the short grace:
-/// the fleet's data is wiped right after, so waiting out a slow graceful
-/// shutdown only delays the delete past the API caller's own timeout — and a
-/// dropped delete leaves the app half-deleted. Every other stop keeps the
-/// full grace so a healthy fleet always shuts down cleanly.
+/// SIGKILL reaping before giving up and logging. Deletes SIGKILL first: the
+/// fleet's data is wiped right after, so a graceful shutdown does only
+/// durability work the purge destroys a moment later — waiting it out only
+/// delays the delete past the API caller's own 5 s timeout, and a dropped
+/// delete leaves the app half-deleted. Every other stop keeps the full grace
+/// so a healthy fleet always shuts down cleanly.
 #[derive(Debug, Clone, Copy)]
 pub struct StopGrace {
     kill: Duration,
     term: Duration,
+    /// Skip SIGTERM and the graceful wait: SIGKILL the group at once.
+    kill_first: bool,
 }
 
 impl StopGrace {
     pub const FOR_DELETE: Self = Self {
         kill: Duration::from_secs(3),
-        term: Duration::from_secs(3),
+        term: Duration::ZERO,
+        kill_first: true,
     };
     pub const NORMAL: Self = Self {
         kill: Duration::from_secs(5),
         term: Duration::from_secs(15),
+        kill_first: false,
     };
 }
 
@@ -132,14 +137,12 @@ pub async fn stop_fleet(procs: &ProcMap, slug: &str, grace: StopGrace) {
     // the fallback below needs the pid (the old code signaled `None` and
     // fell back to a `kill()` on an already-waited child — a no-op).
     let pid = child.id();
-    if let Some(pid) = pid {
-        sigterm(pid);
-    }
-    if tokio::time::timeout(grace.term, child.wait())
-        .await
-        .is_err()
-    {
-        tracing::warn!(slug, "celld did not stop in time; killing");
+    if grace.kill_first {
+        // Delete path: no SIGTERM, no graceful wait. The purge wipes the
+        // fleet's data right after the stop, so durability work is pure
+        // delay — and every second here runs against the API caller's own
+        // timeout. SIGKILL the group at once instead.
+        tracing::info!(slug, "stopping celld for delete (SIGKILL first)");
         match pid {
             Some(pid) => sigkill_tree(pid),
             None => {
@@ -147,6 +150,16 @@ pub async fn stop_fleet(procs: &ProcMap, slug: &str, grace: StopGrace) {
             }
         }
         let _ = tokio::time::timeout(grace.kill, child.wait()).await;
+    } else if let Some(pid) = pid {
+        sigterm(pid);
+        if tokio::time::timeout(grace.term, child.wait())
+            .await
+            .is_err()
+        {
+            tracing::warn!(slug, "celld did not stop in time; killing");
+            sigkill_tree(pid);
+            let _ = tokio::time::timeout(grace.kill, child.wait()).await;
+        }
     }
     // Whatever survived — a worker that ignored SIGTERM — must not outlive
     // the stop: reap the whole group, like `run_sandboxed`.
@@ -909,6 +922,37 @@ mod tests {
         assert!(
             crate::testutil::wait_for_cmdline_gone(marker, Duration::from_secs(5)).await,
             "stopped fleet left a worker behind (sleep {marker} still live 5s after the group kill)"
+        );
+    }
+
+    /// Deletes SIGKILL first: a fleet that ignores SIGTERM (young celld
+    /// fleets did, every time in the slow-delete failures) must not hold a
+    /// delete out for a grace period — the API caller gives up after 5 s and
+    /// a dropped delete used to leave the app half-deleted.
+    #[tokio::test]
+    async fn delete_stop_kills_without_grace() {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "trap '' TERM; sleep 60"]);
+        cmd.as_std_mut().process_group(0);
+        cmd.kill_on_drop(true);
+        let child = cmd.spawn().expect("spawn TERM-ignoring sleeper");
+        let pid = child.id().expect("child pid");
+        let procs = new_procs();
+        procs.lock().await.insert("killfirst".into(), child);
+
+        let started = std::time::Instant::now();
+        stop_fleet(&procs, "killfirst", StopGrace::FOR_DELETE).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "delete stop waited out a grace period ({elapsed:?}); FOR_DELETE must SIGKILL first"
+        );
+        assert!(!procs.lock().await.contains_key("killfirst"));
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "SIGKILL-first stop left the fleet leader behind"
         );
     }
 

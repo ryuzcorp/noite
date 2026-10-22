@@ -79,10 +79,42 @@ fn s3_bucket(cfg: &Config, bucket: &str) -> anyhow::Result<(Bucket, Credentials)
 /// Rich S3 failure: HTTP status plus the store's XML error body.
 /// [`is_not_found`] matches on the status-anchored `HTTP 404`/`NoSuchKey`, so
 /// "missing" vs "unreachable" keeps working without knowing the transport.
-async fn s3_err(op: &str, target: &str, resp: reqwest::Response) -> anyhow::Error {
+async fn s3_err(
+    op: &str,
+    target: &str,
+    resp: reqwest::Response,
+    timeout: Duration,
+) -> anyhow::Error {
     let status = resp.status().as_u16();
-    let body = resp.text().await.unwrap_or_default();
+    let body = bounded_text_or_empty(resp, timeout).await;
     s3_err_msg(op, target, status, &body)
+}
+
+/// Body read bounded by the request's own timeout. reqwest's total timeout
+/// already covers streaming, but the bound stays explicit at each call site
+/// instead of relying on client internals — a stalled body after delivered
+/// headers must fail like a stalled send, never hang the caller.
+async fn bounded_text(
+    resp: reqwest::Response,
+    timeout: Duration,
+    what: &str,
+) -> anyhow::Result<String> {
+    let bytes = tokio::time::timeout(timeout, resp.bytes())
+        .await
+        .map_err(|_| anyhow::anyhow!("{what} timed out after {}s", timeout.as_secs()))?
+        .with_context(|| what.to_string())?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Same bound for error bodies, which stay best-effort: garbage (or no body
+/// at all) must not hide the status the caller already has.
+async fn bounded_text_or_empty(resp: reqwest::Response, timeout: Duration) -> String {
+    tokio::time::timeout(timeout, resp.bytes())
+        .await
+        .ok()
+        .and_then(|result| result.ok())
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
 }
 
 /// Same failure without the response: the retryable attempts classify before
@@ -133,6 +165,7 @@ where
             Err(S3Fail::Final(e)) => return Err(e),
             Err(S3Fail::Retryable(e)) => {
                 attempt += 1;
+
                 if attempt >= S3_MAX_ATTEMPTS {
                     return Err(e);
                 }
@@ -323,7 +356,7 @@ async fn s3_create_bucket(cfg: &Config) -> anyhow::Result<()> {
     if resp.status().is_success() {
         return Ok(());
     }
-    Err(s3_err("create-bucket", &bucket, resp).await)
+    Err(s3_err("create-bucket", &bucket, resp, Duration::from_secs(15)).await)
 }
 
 /// SigV4 `Authorization` header for the bucket-config PUTs rusty-s3 has no
@@ -439,7 +472,13 @@ async fn put_bucket_config(cfg: &Config, subresource: &str, body: &str) -> anyho
     if resp.status().is_success() {
         return Ok(());
     }
-    Err(s3_err("put-bucket-config", subresource, resp).await)
+    Err(s3_err(
+        "put-bucket-config",
+        subresource,
+        resp,
+        Duration::from_secs(15),
+    )
+    .await)
 }
 
 async fn put_bucket_versioning(cfg: &Config) -> anyhow::Result<()> {
@@ -505,7 +544,7 @@ async fn get_once(
     };
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = bounded_text_or_empty(resp, timeout).await;
         return Err(classify_status("download", key, status, &body));
     }
     // Created per attempt, so a retry truncates the partial body instead of
@@ -622,7 +661,7 @@ async fn put_once(
     };
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = bounded_text_or_empty(resp, timeout).await;
         return Err(classify_status("upload", key, status, &body));
     }
     super::stats::count_s3("upload", len, 0);
@@ -660,7 +699,7 @@ pub async fn s3_delete_key(cfg: &Config, key: &str) -> anyhow::Result<()> {
     if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(());
     }
-    Err(s3_err("delete", key, resp).await)
+    Err(s3_err("delete", key, resp, Duration::from_secs(20)).await)
 }
 
 /// One S3 object plus the fields the CLI's JSON listing carried for it.
@@ -708,9 +747,9 @@ pub(crate) async fn s3_list_page(
         .await
         .context("s3 LIST")?;
     if !resp.status().is_success() {
-        return Err(s3_err("list", prefix, resp).await);
+        return Err(s3_err("list", prefix, resp, Duration::from_secs(20)).await);
     }
-    let text = resp.text().await.context("s3 LIST body")?;
+    let text = bounded_text(resp, Duration::from_secs(20), "s3 LIST body").await?;
     let parsed = rusty_s3::actions::ListObjectsV2::parse_response(&text)
         .with_context(|| "s3 LIST XML parse")?;
     Ok(S3Page {
@@ -840,13 +879,12 @@ async fn list_once(
         };
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = bounded_text_or_empty(resp, Duration::from_secs(20)).await;
             return Err(classify_status("list", prefix, status, &body));
         }
-        let text = resp
-            .text()
+        let text = bounded_text(resp, Duration::from_secs(20), "s3 LIST body")
             .await
-            .map_err(|e| S3Fail::Final(anyhow::anyhow!("s3 LIST body: {e:#}")))?;
+            .map_err(S3Fail::Final)?;
         let parsed = rusty_s3::actions::ListObjectsV2::parse_response(&text)
             .map_err(|e| S3Fail::Final(anyhow::anyhow!("s3 LIST XML parse: {e:#}")))?;
         objects.extend(parsed.contents.into_iter().map(|o| S3Object {
@@ -918,41 +956,53 @@ pub async fn s3_object_exists(cfg: &Config, bucket: &str, key: &str) -> bool {
 /// `Error` entries is a failure, not a success: access problems surface that
 /// way, and ignoring them would pretend a purge worked.
 async fn s3_delete_keys(cfg: &Config, bucket_name: &str, keys: &[String]) -> anyhow::Result<()> {
-    use rusty_s3::actions::{DeleteObjectsResponse, ObjectIdentifier};
     if keys.is_empty() {
         return Ok(());
     }
     super::stats::count_s3("delete", 0, 0);
     let (handle, creds) = s3_bucket(cfg, bucket_name)?;
     for chunk in keys.chunks(1000) {
-        let ids: Vec<ObjectIdentifier> = chunk
-            .iter()
-            .map(|k| ObjectIdentifier::new(k.clone()))
-            .collect();
-        let action = handle.delete_objects(Some(&creds), ids.iter());
-        let url = action.sign(Duration::from_secs(300));
-        let (body, md5) = action.body_with_md5();
-        let resp = http_client()
-            .post(url)
-            .header("Content-MD5", md5)
-            .body(body)
-            .timeout(Duration::from_secs(60))
-            .send()
-            .await
-            .context("s3 DeleteObjects")?;
-        if !resp.status().is_success() {
-            return Err(s3_err("delete-keys", bucket_name, resp).await);
-        }
-        let text = resp.text().await.context("s3 DeleteObjects body")?;
-        let parsed =
-            DeleteObjectsResponse::parse(&text).with_context(|| "s3 DeleteObjects XML parse")?;
-        if let Some(first) = parsed.errors.first() {
-            bail!(
-                "s3 delete-keys {bucket_name} failed: {} {}",
-                first.code,
-                first.message
-            );
-        }
+        s3_delete_keys_chunk(&handle, &creds, bucket_name, chunk.to_vec()).await?;
+    }
+
+    Ok(())
+}
+
+/// One `DeleteObjects` POST for a single ≤1000-key chunk.
+async fn s3_delete_keys_chunk(
+    handle: &rusty_s3::Bucket,
+    creds: &rusty_s3::Credentials,
+    bucket_name: &str,
+    chunk: Vec<String>,
+) -> anyhow::Result<()> {
+    use rusty_s3::actions::{DeleteObjectsResponse, ObjectIdentifier};
+    let ids: Vec<ObjectIdentifier> = chunk
+        .iter()
+        .map(|k| ObjectIdentifier::new(k.clone()))
+        .collect();
+    let action = handle.delete_objects(Some(creds), ids.iter());
+    let url = action.sign(Duration::from_secs(300));
+    let (body, md5) = action.body_with_md5();
+    let resp = http_client()
+        .post(url)
+        .header("Content-MD5", md5)
+        .body(body)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .context("s3 DeleteObjects")?;
+    if !resp.status().is_success() {
+        return Err(s3_err("delete-keys", bucket_name, resp, Duration::from_secs(60)).await);
+    }
+    let text = bounded_text(resp, Duration::from_secs(60), "s3 DeleteObjects body").await?;
+    let parsed =
+        DeleteObjectsResponse::parse(&text).with_context(|| "s3 DeleteObjects XML parse")?;
+    if let Some(first) = parsed.errors.first() {
+        anyhow::bail!(
+            "s3 delete-keys {bucket_name} failed: {} {}",
+            first.code,
+            first.message
+        );
     }
     Ok(())
 }
@@ -1147,5 +1197,69 @@ mod tests {
             "s3 download tip.bundle transport: error sending request for url (http://rustfs:9000/noite)"
         );
         assert!(!is_not_found(&down));
+    }
+
+    /// Body reads keep the request's own deadline: headers delivered, body
+    /// stalled forever — the read fails at the bound instead of hanging the
+    /// caller past it, and the error-body path degrades to the status alone.
+    #[tokio::test]
+    async fn body_read_keeps_its_deadline() {
+        async fn stalled_body_stub(stall: bool) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind body stub");
+            let endpoint = format!("http://{}", listener.local_addr().expect("stub addr"));
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        break;
+                    };
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = vec![0u8; 4096];
+                        let _ = sock.read(&mut buf).await;
+                        let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: 11\r\nConnection: close\r\n\r\n";
+                        let _ = sock.write_all(headers.as_bytes()).await;
+                        if !stall {
+                            let _ = sock.write_all(b"<Error/>ok!").await;
+                        }
+                    });
+                }
+            });
+            endpoint
+        }
+        let bound = Duration::from_millis(300);
+        // Stalled body: both readers give up at the bound. No request timeout
+        // is set on purpose: the explicit bound alone must hold.
+        let stalled = stalled_body_stub(true).await;
+        let resp = http_client().get(&stalled).send().await.expect("headers");
+        let started = std::time::Instant::now();
+        let err = bounded_text(resp, bound, "probe body")
+            .await
+            .expect_err("stalled body must fail");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "read outlasted its bound: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("probe body"),
+            "the bound names its read: {err:#}"
+        );
+        let resp = http_client().get(&stalled).send().await.expect("headers");
+        let started = std::time::Instant::now();
+        assert_eq!(bounded_text_or_empty(resp, bound).await, "");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "error-body read outlasted its bound"
+        );
+        // Delivered body: the bound is invisible.
+        let live = stalled_body_stub(false).await;
+        let resp = http_client().get(&live).send().await.expect("headers");
+        assert_eq!(
+            bounded_text(resp, bound, "probe body")
+                .await
+                .expect("delivered body"),
+            "<Error/>ok!"
+        );
     }
 }
