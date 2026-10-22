@@ -305,6 +305,22 @@ pub async fn rename(
 }
 
 pub async fn delete(state: &AppState, id: &str) -> Result<(), ApiError> {
+    // A dropped HTTP handler must not cancel the purge halfway: the control
+    // plane times the call out after 5 s, and a cancelled delete leaves the
+    // app row, the fleet and the scoped credentials behind. The destructive
+    // work runs as its own task, so dropping this future only drops the
+    // waiter — the task runs to completion either way. The handler still
+    // awaits it, so a connected caller gets the real outcome.
+    let state = state.clone();
+    let id = id.to_string();
+    match tokio::spawn(async move { delete_inner(&state, &id).await }).await {
+        Ok(result) => result,
+        Err(join) => Err(ApiError::internal(format!(
+            "app delete task failed: {join}"
+        ))),
+    }
+}
+async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     let app = app_or_404(state, id).await?;
     // Same lock as deploy: wait out an in-flight build, then purge exclusively.
     // The row is deleted while the claim is still held (R-01): a waiter that
@@ -413,10 +429,16 @@ mod tests {
 
     /// One runner state with a per-account app limit of `max_apps`.
     async fn test_state(max_apps: u32) -> (AppState, std::path::PathBuf) {
+        let s3 = spawn_s3_stub().await;
+        test_state_with_s3(max_apps, s3).await
+    }
+
+    /// Same, against a caller-supplied S3 endpoint: a test that must park
+    /// the purge mid-flight gates the stub instead of answering at once.
+    async fn test_state_with_s3(max_apps: u32, s3: String) -> (AppState, std::path::PathBuf) {
         let dir =
             std::env::temp_dir().join(format!("noite-create-tests-{}", crate::models::new_id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let s3 = spawn_s3_stub().await;
         let mut cfg = crate::config::config_for_tests();
         cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
         cfg.s3_endpoint = s3.clone();
@@ -658,6 +680,207 @@ mod tests {
             .expect("rename task")
             .expect("rename ok");
         assert_eq!(renamed.slug, "ps-new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// S3 stub that parks the purge mid-flight: once armed, the first
+    /// request is read, `entered` fires, and the response waits for
+    /// `release`. Everything before arming — and every request after the
+    /// release — answers an empty listing at once.
+    struct GatedS3 {
+        endpoint: String,
+        entered: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+        armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    async fn spawn_gated_s3_stub() -> GatedS3 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gated s3 stub");
+        let endpoint = format!("http://{}", listener.local_addr().expect("stub addr"));
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let outer_entered = entered.clone();
+        let outer_release = release.clone();
+        let outer_armed = armed.clone();
+        tokio::spawn(async move {
+            let body = concat!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+                "<Name>noite</Name><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>",
+                "</ListBucketResult>"
+            );
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let entered = outer_entered.clone();
+                let release = outer_release.clone();
+                let armed = outer_armed.clone();
+                let parked = parked.clone();
+                let body = body.to_string();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    if armed.load(std::sync::atomic::Ordering::SeqCst)
+                        && !parked.swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        GatedS3 {
+            endpoint,
+            entered,
+            release,
+            armed,
+        }
+    }
+
+    /// A dropped caller must not cancel a delete halfway: the control plane
+    /// times the call out after 5 s, so a delete that outlasts it runs to
+    /// completion anyway — the purge finishes, the row is gone and the app's
+    /// keys stop being handed out. (Before: the purge cancelled with the
+    /// caller and the row survived.)
+    #[tokio::test]
+    async fn delete_completes_when_caller_goes_away() {
+        let gated = spawn_gated_s3_stub().await;
+        let (state, dir) = test_state_with_s3(10, gated.endpoint).await;
+        let app = create(&state, "Doomed", "doomed", Some("u1"), None)
+            .await
+            .expect("create");
+        // A live scoped key: the delete's revoke must mark it even when the
+        // caller is gone (the test store never deletes, so it stays
+        // `revoking` instead of vanishing — the mark is what revoke owns).
+        crate::db::insert_scoped_credential(
+            &state.pool,
+            &crate::db::NewScopedCredential {
+                scope: &format!("app:{}", app.id),
+                app_id: &app.id,
+                handle: "test-handle",
+                prefix: "fleets/doomed/",
+                store: "test-store",
+                nonce: b"nonce-12-bytes",
+                ciphertext: b"ciphertext",
+            },
+        )
+        .await
+        .expect("insert scoped key");
+        gated.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let id = app.id.clone();
+
+        // Drive the delete until the purge reaches S3, then drop the caller —
+        // the control plane timing out is just the handler future going away.
+        let mut slot = Some(Box::pin(delete(&state, &id)));
+        let finished = tokio::select! {
+            result = async { slot.as_mut().expect("delete future").await } => Some(result),
+            () = gated.entered.notified() => None,
+        };
+        if let Some(result) = finished {
+            panic!("delete finished before reaching the gate: {result:?}");
+        }
+        let _ = slot.take();
+        gated.release.notify_one();
+
+        // The detached work still runs: the row must go and the key must stop
+        // being handed out.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let gone = crate::db::get_app(&state.pool, &id)
+                .await
+                .expect("lookup")
+                .is_none();
+            if gone {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "delete cancelled with its caller: the app row survived a dropped delete"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            crate::db::live_scoped_credential(&state.pool, &format!("app:{id}"))
+                .await
+                .expect("key lookup")
+                .is_none(),
+            "the app's scoped key is still handed out after a dropped delete"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same guarantee for preview environments: a dropped caller must not
+    /// cancel a teardown halfway and leave the fleet, the prefix or the row
+    /// behind. (Before: the teardown cancelled with the caller and the row
+    /// survived.)
+    #[tokio::test]
+    async fn environment_delete_completes_when_caller_goes_away() {
+        let gated = spawn_gated_s3_stub().await;
+        let (state, dir) = test_state_with_s3(10, gated.endpoint).await;
+        let app = create(&state, "EnvApp", "envapp", Some("u1"), None)
+            .await
+            .expect("create");
+        let env = crate::db::create_environment(
+            &state.pool,
+            &state.config,
+            crate::db::NewEnvironment {
+                app_id: &app.id,
+                slug: &app.slug,
+                label: "feature",
+                kind: crate::models::EnvironmentKind::Branch,
+                git_ref: "refs/heads/feature",
+                created_by: "user_1",
+                listen: 30310,
+                internal: 30311,
+            },
+        )
+        .await
+        .expect("environment");
+        gated.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Drive the teardown until it reaches S3, then drop the caller.
+        let mut slot = Some(Box::pin(crate::service::environments::delete(
+            &state,
+            &app.id,
+            &env.id,
+            Some("admin"),
+        )));
+        let finished = tokio::select! {
+            result = async { slot.as_mut().expect("teardown future").await } => Some(result),
+            () = gated.entered.notified() => None,
+        };
+        if let Some(result) = finished {
+            panic!("teardown finished before reaching the gate: {result:?}");
+        }
+        let _ = slot.take();
+        gated.release.notify_one();
+
+        // The detached work still runs: the row must go.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let gone = crate::db::get_environment(&state.pool, &env.id)
+                .await
+                .expect("lookup")
+                .is_none();
+            if gone {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "teardown cancelled with its caller: the environment row survived a dropped delete"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
