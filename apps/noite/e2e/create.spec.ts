@@ -7,6 +7,7 @@ import { expect, test } from "@playwright/test";
 import type { APIRequestContext } from "@playwright/test";
 
 import {
+  CHILD_PROC_TIMEOUT_MS,
   createAppWithKey,
   deleteApp,
   findAppId,
@@ -61,6 +62,8 @@ const pushNewRepo = (apiKey: string, slug: string) => {
         cwd: dir,
         encoding: "utf-8",
         env: { ...process.env, ...env },
+        killSignal: "SIGKILL",
+        timeout: CHILD_PROC_TIMEOUT_MS,
       });
 
       if (run.status !== 0) {
@@ -123,6 +126,9 @@ test("imports a public GitHub repo with its history", async ({
 
   const [upstreamHead] = execFileSync("git", ["ls-remote", UPSTREAM, "HEAD"], {
     encoding: "utf-8",
+    // Egress to github.com: the one child call that leaves localhost.
+    killSignal: "SIGKILL",
+    timeout: CHILD_PROC_TIMEOUT_MS,
   })
     .trim()
     .split(/\s+/u);

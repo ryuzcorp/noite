@@ -1,11 +1,16 @@
-import { execFileSync } from "node:child_process";
 import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import nodePath from "node:path";
 
 import { expect, test } from "@playwright/test";
 
-import { E2E_EMAIL, E2E_NAME, createAppWithKey, deleteApp } from "./helpers";
+import {
+  E2E_EMAIL,
+  E2E_NAME,
+  createAppWithKey,
+  deleteApp,
+  execGit,
+} from "./helpers";
 
 const FORGE_SLUG = "forge";
 
@@ -33,11 +38,9 @@ const pushMainAndFeature = (apiKey: string, source: URL, slug: string) => {
     rmSync(nodePath.join(dir, ".git"), { force: true, recursive: true });
 
     const git = (args: string[]): string =>
-      execFileSync("git", args, {
+      execGit(args, {
         cwd: dir,
-        encoding: "utf-8",
         env: {
-          ...process.env,
           GIT_AUTHOR_EMAIL: E2E_EMAIL,
           GIT_AUTHOR_NAME: E2E_NAME,
           GIT_COMMITTER_EMAIL: E2E_EMAIL,

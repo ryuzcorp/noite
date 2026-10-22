@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import {
   cpSync,
   mkdtempSync,
@@ -17,6 +16,7 @@ import {
   E2E_NAME,
   createAppWithKey,
   deleteApp,
+  execGit,
   runnerApi,
   runnerCall,
   waitForDeploy,
@@ -151,12 +151,10 @@ const pushBoomRevision = (
     );
     rmSync(nodePath.join(dir, ".git"), { force: true, recursive: true });
 
-    const git = (args: string[]) =>
-      execFileSync("git", args, {
+    const git = (args: string[]): string =>
+      execGit(args, {
         cwd: dir,
-        encoding: "utf-8",
         env: {
-          ...process.env,
           GIT_AUTHOR_EMAIL: E2E_EMAIL,
           GIT_AUTHOR_NAME: E2E_NAME,
           GIT_COMMITTER_EMAIL: E2E_EMAIL,

@@ -73,6 +73,14 @@ const suiteGrep = suite === "fast" ? SUITE_TAGS[tenancy] : undefined;
 export default defineConfig({
   expect: { timeout: 30_000 },
   fullyParallel: false,
+  // A stuck worker (a synchronously-blocked event loop — a hung `git` child
+  // froze its worker in merge-queue run 39785255412, so no per-test or hook
+  // timeout could fire) defeats every in-worker timeout. This parent-side
+  // bound trips instead: release shard 2 measured ~5 min wall on 2026-10-22,
+  // an unsharded local release run is ~2x that, and 25 min trips 15 min
+  // before the 40-minute CI job cancel — naming the still-running test
+  // instead of hanging silently. It never makes a test pass.
+  globalTimeout: 25 * 60_000,
   projects: [
     // No retries: a flaky setup must fail loudly (the lane's first project),
     // never pass on a second attempt with the same email.

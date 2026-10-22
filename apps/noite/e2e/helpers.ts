@@ -15,6 +15,32 @@ export const E2E_EMAIL = "e2e@noite.local";
 export const E2E_NAME = "E2E";
 export const E2E_SLUG = "e2e";
 
+/** Bound for every synchronous child process in the suite (git CLI, the
+ * packaged CLI under test, its build). A hung remote blocks the worker's
+ * event loop, so no Playwright timeout can fire: merge-queue run 39785255412
+ * held a `git clone` open for 35 silent minutes until the job cancelled
+ * (job 119849702825 orphaned `git` + `git-remote-http`). The bound turns
+ * that into a loud `ETIMEDOUT` naming the command. Localhost git ops finish
+ * in ~1 s; only a wedge ever reaches this.
+ */
+export const CHILD_PROC_TIMEOUT_MS = 120_000;
+
+/** Synchronous git with the suite's bound and no credential prompts (a
+ * prompt on a headless worker would hang the same silent way). Throws the
+ * command's stderr on a non-zero exit, `ETIMEDOUT` on a wedge.
+ */
+export const execGit = (
+  args: string[],
+  options: { cwd?: string; env?: Record<string, string> } = {}
+): string =>
+  execFileSync("git", args, {
+    cwd: options.cwd,
+    encoding: "utf-8",
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...options.env },
+    killSignal: "SIGKILL",
+    timeout: CHILD_PROC_TIMEOUT_MS,
+  });
+
 const uiBaseURL = process.env.E2E_BASE_URL ?? "http://noite.localhost:8090";
 const apiBase = process.env.E2E_API_BASE ?? "http://localhost:8080";
 const gitBase = process.env.E2E_GIT_BASE ?? "http://localhost:8080/v1/git";
@@ -462,12 +488,10 @@ export const pushAppDir = (
     // is a fresh repo + fresh commit (new deploy), like deploy.sh re-init.
     rmSync(nodePath.join(dir, ".git"), { force: true, recursive: true });
 
-    const git = (args: string[], extraEnv: Record<string, string> = {}) =>
-      execFileSync("git", args, {
-        cwd: dir,
-        encoding: "utf-8",
-        env: { ...process.env, ...extraEnv },
-      });
+    const git = (
+      args: string[],
+      extraEnv: Record<string, string> = {}
+    ): string => execGit(args, { cwd: dir, env: extraEnv });
 
     git(["init", "-b", "main"]);
     git([

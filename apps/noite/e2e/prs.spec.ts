@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import nodePath from "node:path";
@@ -11,6 +10,7 @@ import {
   E2E_NAME,
   createAppWithKey,
   deleteApp,
+  execGit,
   mintApiKey,
   pushAppDir,
   registerInviteeWithFreshCode,
@@ -181,27 +181,20 @@ test.afterEach(async () => {
 const cloneRepo = (apiKey: string, slug: string) => {
   const dir = mkdtempSync(nodePath.join(tmpdir(), `noite-prs-${slug}-`));
   tempDirs.push(dir);
-  execFileSync(
-    "git",
-    [
-      "clone",
-      `http://git:${apiKey}@${gitBase.replace(/^https?:\/\//u, "")}/${slug}`,
-      dir,
-    ],
-    { encoding: "utf-8" }
-  );
+  execGit([
+    "clone",
+    `http://git:${apiKey}@${gitBase.replace(/^https?:\/\//u, "")}/${slug}`,
+    dir,
+  ]);
 
   const run = (args: string[]): string =>
-    execFileSync("git", args, {
+    execGit(args, {
       cwd: dir,
-      encoding: "utf-8",
       env: {
-        ...process.env,
         GIT_AUTHOR_EMAIL: E2E_EMAIL,
         GIT_AUTHOR_NAME: E2E_NAME,
         GIT_COMMITTER_EMAIL: E2E_EMAIL,
         GIT_COMMITTER_NAME: E2E_NAME,
-        GIT_TERMINAL_PROMPT: "0",
       },
     });
 
