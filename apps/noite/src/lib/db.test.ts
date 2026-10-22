@@ -162,14 +162,15 @@ describe("shared setup pass", () => {
       }
     };
 
-    const starter = ensureDbPromise({ waitMs: 0 });
+    const lifetime = { waitUntil: (_promise: Promise<unknown>) => {} };
+    const starter = ensureDbPromise({ ctx: lifetime, waitMs: 0 });
     await quiesce();
     const baseline = prepares;
     expect(baseline).toBeGreaterThan(0);
 
-    const waiter1 = ensureDbPromise({ waitMs: 0 });
-    const waiter2 = ensureDbPromise({ waitMs: 0 });
-    const waiter3 = ensureDbPromise({ waitMs: 0 });
+    const waiter1 = ensureDbPromise({ ctx: lifetime, waitMs: 0 });
+    const waiter2 = ensureDbPromise({ ctx: lifetime, waitMs: 0 });
+    const waiter3 = ensureDbPromise({ ctx: lifetime, waitMs: 0 });
     await quiesce();
 
     // One starter pass plus one shared replacement: without single-flight
@@ -181,5 +182,86 @@ describe("shared setup pass", () => {
     await waiter1;
     await waiter2;
     await waiter3;
+  });
+
+  test("a waiter without a lifetime fails fast instead of storing an orphanable replacement", async () => {
+    // A replacement pass stored without `ctx.waitUntil` dies with its
+    // starter, and every later waiter burns its full wait on the orphan
+    // (flake H's 15.01 s pair). Only the middleware carries a lifetime, so
+    // a lifetime-less waiter that outlasts its bound must fail fast and
+    // leave the stored pass alone — never delete-and-replace it.
+    let release!: () => void;
+
+    // oxlint-disable-next-line promise/avoid-new -- the test releases the gate by hand after asserting the fail-fast
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    let prepares = 0;
+    await ensureDbPromise({ waitMs: 0 });
+
+    // SAFETY: a spread of the shim keeps its prepare/batch methods: a distinct handle over the same database.
+    const again = { ...db.d1 } as typeof db.d1;
+    setD1Binding(
+      gateD1(again, {
+        gate,
+        onPrepare: () => {
+          prepares += 1;
+        },
+      })
+    );
+
+    const starter = ensureDbPromise();
+
+    // Loop-turn yields (never a sleep): the zero-bound waiter below expires
+    // while the starter's pass is still gated.
+    for (let i = 0; i < 50; i += 1) {
+      // oxlint-disable-next-line eslint/no-await-in-loop, promise/avoid-new -- sequential quiescence poll, never a sleep
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+
+      if (prepares > 0) {
+        break;
+      }
+    }
+
+    expect(prepares).toBeGreaterThan(0);
+    const baseline = prepares;
+
+    // Handlers attach now so a lifetime-less expiry never trips
+    // unhandled-rejection tracking while the test observes it.
+    const waiter = ensureDbPromise({ waitMs: 0 });
+    let settled = false;
+    void waiter.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      }
+    );
+
+    // Loop-turn yields (never a sleep): the waiter's zero bound expires
+    // while the stored pass is still gated.
+    for (let i = 0; i < 50; i += 1) {
+      // oxlint-disable-next-line eslint/no-await-in-loop, promise/avoid-new -- sequential quiescence poll: exits when the waiter settles or a replacement starts, never a sleep
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+
+      if (settled || prepares !== baseline) {
+        break;
+      }
+    }
+
+    // No replacement pass started: the stored pass is untouched, so a third
+    // caller still shares it (pre-fix this counted two baselines and the
+    // waiter resolved instead of failing).
+    expect(prepares).toBe(baseline);
+    await expect(waiter).rejects.toThrow(/failing fast/u);
+
+    release();
+    await starter;
   });
 });

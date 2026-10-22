@@ -515,7 +515,14 @@ const startSetupPass = (db: D1Database, ctx?: SetupLifetime): SetupPass => {
  * the single replacement pass instead of starting its own, so one slow
  * pass can never turn N waiters into N concurrent migrations hammering
  * celld's single-threaded D1. The binding is the pass key, so a test that
- * swaps in a fresh database gets a fresh pass. */
+ * swaps in a fresh database gets a fresh pass.
+ *
+ * A waiter with no worker lifetime (`ctx`) can never replace: an
+ * unregistered replacement dies with its starter, and every later waiter
+ * would burn its full wait on the orphan (flake H's 15.01 s pair). It fails
+ * fast instead — the middleware always runs first and always carries
+ * `ctx`, so it owns every replacement, and this only triggers on a
+ * genuinely wedged pass. */
 const runDbSetupOnce = async (
   db: D1Database,
   opts?: EnsureDbOptions
@@ -555,18 +562,26 @@ const runDbSetupOnce = async (
 
   // Single-flight replacement: only the waiter that still sees the pass it
   // waited on replaces it; a waiter that lost the race shares the winner's
-  // replacement. Both then await that pass outright: it is registered with
-  // the worker lifetime and bounded by its own timeout, and re-expiring
-  // here would replace it again, rebuilding the herd this removes.
+  // replacement. The replacement is awaited outright: it is registered
+  // with the worker lifetime and bounded by its own timeout, and
+  // re-expiring here would replace it again, rebuilding the herd this
+  // removes. Without a lifetime the waiter cannot register, so it fails
+  // fast instead of storing an orphanable pass (see above).
   const current = setupPasses.get(db);
 
   if (current !== undefined && current !== cached) {
     return current.promise;
   }
 
+  if (opts?.ctx === undefined) {
+    throw new Error(
+      `noite: db setup still in flight after ${waitMs}ms; failing fast instead of starting an unregistered replacement pass`
+    );
+  }
+
   setupPasses.delete(db);
 
-  return startSetupPass(db, opts?.ctx).promise;
+  return startSetupPass(db, opts.ctx).promise;
 };
 
 export const ensureDb = Effect.promise(() => runDbSetupOnce(resolveD1()));
