@@ -381,9 +381,24 @@ fn push_note(ok: bool, detail: String) {
     crate::host::caddy::admin_note(ok, detail);
 }
 
-/// Push the table to Caddy's admin API (loopback-only). A failure only
-/// warns: Caddy boots from the file, and the next tick re-pushes.
-async fn push_live(cfg: &Config, table: &EdgeTable) {
+/// What the live push to Caddy observed. The table file is already written
+/// either way, and a (re)starting Caddy boots from that file.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Pushed {
+    /// The edge serves this table now.
+    Accepted,
+    /// The admin API did not answer (Caddy booting or restarting): it loads
+    /// the file, which already holds this table, when it comes up.
+    Unreachable,
+    /// The admin API answered and refused the table: the running edge keeps
+    /// its previous one until a later push is accepted.
+    Rejected(String),
+}
+
+/// Push the table to Caddy's admin API (loopback-only). Lifecycle callers
+/// and the reconcile tick only warn on a refusal (the next tick re-pushes);
+/// a deploy must not report success on one (see `deploy::route_live`).
+async fn push_live(cfg: &Config, table: &EdgeTable) -> Pushed {
     let url = format!("{}/edge/routes", cfg.caddy_admin_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
     match client
@@ -395,16 +410,20 @@ async fn push_live(cfg: &Config, table: &EdgeTable) {
     {
         Ok(resp) if resp.status().is_success() => {
             push_note(true, String::new());
+            Pushed::Accepted
         }
         Ok(resp) => {
             let code = resp.status();
             let body = resp.text().await.unwrap_or_default();
             let tail = body.chars().take(300).collect::<String>();
-            push_note(false, format!("caddy /edge/routes {code}: {tail}"));
+            let detail = format!("caddy /edge/routes {code}: {tail}");
+            push_note(false, detail.clone());
             tracing::warn!(%code, body = %tail, "edge table push rejected");
+            Pushed::Rejected(detail)
         }
         Err(e) => {
             tracing::debug!(error = %e, "edge admin not reachable yet");
+            Pushed::Unreachable
         }
     }
 }
@@ -439,7 +458,7 @@ fn apply_table(prev: Option<&EdgeTable>, mut fresh: EdgeTable) -> (EdgeTable, bo
     }
 }
 
-pub async fn push_routes(pool: &sqlx::SqlitePool, cfg: &Config) -> anyhow::Result<()> {
+pub async fn push_routes(pool: &sqlx::SqlitePool, cfg: &Config) -> anyhow::Result<Pushed> {
     let _held = PUSH_LOCK.lock().await;
     // Every read propagates: a transient DB error (SQLITE_BUSY) must keep
     // the previous table serving, never push a table with silently
@@ -466,8 +485,7 @@ pub async fn push_routes(pool: &sqlx::SqlitePool, cfg: &Config) -> anyhow::Resul
         tokio::fs::rename(&tmp, path).await?;
         tracing::info!(path = %cfg.routes_path, n = table.exact.len(), "edge routes updated");
     }
-    push_live(cfg, &table).await;
-    Ok(())
+    Ok(push_live(cfg, &table).await)
 }
 
 /// Warns once when per-client zones collapse (mirrors the old boot warning
