@@ -56,6 +56,13 @@ jobs:
   e2e:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: check
+    # Permission envelope for the called workflow (see ci.yml): the lanes
+    # download nothing here (no artifact input) but still declare
+    # `actions: read`, and the envelope must cover the callee's jobs.
+    permissions:
+      contents: read
+      actions: read
+      issues: write
     uses: ./.github/workflows/e2e.yml
     with:
       suite: release

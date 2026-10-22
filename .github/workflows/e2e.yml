@@ -10,13 +10,13 @@
 # schedule runs `release` on main. Locally: `make e2e`,
 # `E2E_SUITE=fast make e2e`, and `make e2e-isolation`.
 #
-# Speed shape: each lane builds the image once with buildx into the local
-# daemon (no per-lane from-scratch compose build) and tests it via
-# E2E_IMAGE. Unchanged stages come from the GHA layer cache shared with
-# `ci.yml`'s `image` job; the build's cache mounts (cargo registry and
-# target/, bun's package cache) come from the Actions cache, so a source
-# change recompiles the runner crate alone. Playwright then runs spec files
-# in parallel (E2E_WORKERS) against the one stack.
+# Speed shape: `ci.yml` builds the image once per run (its `image` job) and
+# hands it over as an artifact; each lane below downloads and `docker load`s
+# it instead of rebuilding (every lane paid ~280 s for its own build before).
+# Playwright then runs each lane's spec files sharded across 2 jobs
+# (E2E_SHARD) against their own stacks, 3 workers per shard as before.
+# Without the artifact input (the tag gate, the nightly schedule, dispatch),
+# each lane builds exactly as before.
 name: e2e
 
 on:
@@ -27,6 +27,16 @@ on:
         description: Which spec set to run (fast = the tagged PR gate, release = every spec).
         required: false
         type: string
+      image_artifact:
+        default: ""
+        description: Run-local artifact holding the lane image (docker save piped to zstd). When set, each lane downloads and loads it instead of building.
+        required: false
+        type: string
+      rounds:
+        default: "1"
+        description: How many back-to-back rounds to run per lane (the nightly hunt runs 3).
+        required: false
+        type: string
   workflow_dispatch:
     inputs:
       suite:
@@ -35,10 +45,17 @@ on:
         options: [release, fast]
         required: false
         type: choice
+      rounds:
+        default: "1"
+        description: How many back-to-back rounds to run per lane (the nightly hunt runs 3).
+        options: ["1", "2", "3"]
+        required: false
+        type: choice
   # Nightly release-suite run on main: the tag gate only runs on `v*`, so this
   # is what catches a slow main-branch regression in a spec outside the fast
   # set. `inputs.suite` is empty on a schedule trigger; the lane step below
-  # falls back to `release`.
+  # falls back to `release`. Three rounds per lane, so flakes surface; the
+  # flakes job below files them as `flake` issues.
   schedule:
     - cron: "0 4 * * *"
 
@@ -46,17 +63,42 @@ permissions:
   contents: read
 
 jobs:
+  # Which rounds to run: 3 on the nightly schedule, the `rounds` input on
+  # dispatch, 1 for every reusable caller. A job (not an inline expression)
+  # so the lane matrix below stays clean instead of scattering skipped cells.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      rounds: ${{ steps.rounds.outputs.json }}
+    steps:
+      - id: rounds
+        run: |
+          n='${{ inputs.rounds }}'
+          if [ '${{ github.event_name }}' = 'schedule' ]; then n=3; fi
+          case "$n" in
+            1) echo 'json=[1]' >> "$GITHUB_OUTPUT" ;;
+            2) echo 'json=[1,2]' >> "$GITHUB_OUTPUT" ;;
+            *) echo 'json=[1,2,3]' >> "$GITHUB_OUTPUT" ;;
+          esac
+
   e2e:
-    name: e2e (${{ matrix.lane }})
+    name: e2e (${{ matrix.lane }} round ${{ matrix.round }} shard ${{ matrix.shard }})
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    # The two lanes boot their own stack from the same tree and share nothing,
-    # so they run side by side: the gate takes as long as the slower lane
-    # instead of both in a row. `fail-fast: false` keeps the other lane's
-    # verdict (and its report) when one fails.
+    permissions:
+      contents: read
+      actions: read
+    # The lanes boot their own stack from the same image and share nothing,
+    # so shards and lanes run side by side: the gate takes as long as the
+    # slowest shard instead of everything in a row. `fail-fast: false` keeps
+    # the other cells' verdicts (and their reports) when one fails.
     strategy:
       fail-fast: false
       matrix:
+        lane: [single, multi]
+        round: ${{ fromJSON(needs.plan.outputs.rounds) }}
+        shard: [1, 2]
         include:
           - lane: single
             target: e2e
@@ -73,8 +115,9 @@ jobs:
         working-directory: apps/noite
         run: bun install --frozen-lockfile
       # Browser binaries (~170 MB) survive across runs; the install below
-      # stays `--with-deps` so the OS libraries are still ensured, and it
-      # skips binaries already on disk.
+      # skips binaries already on disk. No `--with-deps`: the ubuntu runner
+      # image already ships Chromium's shared libraries, and the apt step swung
+      # from 21 to 260 s run to run.
       - name: cache playwright browsers
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
@@ -82,14 +125,16 @@ jobs:
           path: ~/.cache/ms-playwright
       - name: playwright chromium
         working-directory: apps/noite
-        run: bunx playwright install --with-deps chromium
+        run: bunx playwright install chromium
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       # The runner and UI stages compile into cache mounts, which a hosted
       # runner's throwaway builder never keeps: every lane recompiled every
       # Rust dependency (~4 min) even with the layer cache warm. Carry the
       # mounts in the Actions cache, keyed on both lockfiles, and inject them
-      # into the builder; a lockfile change saves a fresh copy.
+      # into the builder; a lockfile change saves a fresh copy. Skipped when
+      # the lane loads the shared image instead of building.
       - name: cache build mounts
+        if: inputs.image_artifact == ''
         id: mounts
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
@@ -100,6 +145,7 @@ jobs:
             runner-target
             bun-cache
       - name: inject build mounts
+        if: inputs.image_artifact == ''
         uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
         with:
           cache-map: |
@@ -113,8 +159,10 @@ jobs:
       # The lane's image, built once per lane straight into the daemon the
       # compose stack below uses — no second from-scratch build inside
       # `make e2e`. Same Dockerfile target and GHA cache scope as `ci.yml`'s
-      # `image` job, so PR layers warm this build.
+      # `image` job, so PR layers warm this build. Skipped when the caller
+      # hands over the shared image (see below).
       - name: build lane image
+        if: inputs.image_artifact == ''
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           cache-from: type=gha,scope=noite-linux/amd64
@@ -124,12 +172,54 @@ jobs:
           load: true
           tags: noite:e2e
           target: noite
+      # The shared image `ci.yml` built once for this run: download and load
+      # it instead of the build above. Same bytes every lane tests.
+      - name: download lane image
+        if: inputs.image_artifact != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ${{ inputs.image_artifact }}
+          path: /tmp/noite-image
+      - name: load lane image
+        if: inputs.image_artifact != ''
+        run: zstd -d -c /tmp/noite-image/noite-ci.tar.zst | docker load
       - name: e2e lane
-        run: E2E_IMAGE=noite:e2e E2E_SUITE=${{ inputs.suite || 'release' }} make ${{ matrix.target }}
+        run: E2E_IMAGE=${{ inputs.image_artifact == '' && 'noite:e2e' || 'noite:ci' }} E2E_SUITE=${{ inputs.suite || 'release' }} E2E_SHARD=${{ matrix.shard }}/2 make ${{ matrix.target }}
       - name: upload playwright report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: playwright-report-${{ matrix.lane }}
+          name: playwright-report-${{ matrix.lane }}-r${{ matrix.round }}-s${{ matrix.shard }}
           path: apps/noite/playwright-report/
           retention-days: 7
+
+  # The nightly flake hunt's paper trail: after every scheduled (and every
+  # hand-dispatched multi-round) run, read each lane's JSON results and file
+  # one `flake`-labelled issue per failing spec title — or comment on the
+  # already-open one. No retries anywhere: a failure is a finding. Green runs
+  # file nothing and pass.
+  flakes:
+    name: flake issues
+    needs: [plan, e2e]
+    if: ${{ !cancelled() && needs.e2e.result != 'skipped' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - name: download result reports
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: playwright-report-*
+          path: /tmp/e2e-reports
+      # `--lanes`/`--shards` mirror the e2e matrix above and `--rounds` is the
+      # plan's output: a planned cell without a result file fails this job.
+      - name: open or update flake issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ROUNDS: ${{ needs.plan.outputs.rounds }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bun .github/scripts/flake-issues.ts --reports /tmp/e2e-reports --run-url "$RUN_URL" --lanes single,multi --rounds "$ROUNDS" --shards 2
