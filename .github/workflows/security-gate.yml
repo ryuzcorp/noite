@@ -12,8 +12,14 @@
 # Hardening: least privilege (`contents: read`, `pull-requests: write` only
 # on this label job), actions pinned by full SHA like the rest of the repo,
 # and no checkout of PR code is ever executed with write tokens — changed
-# files are listed through the API (paths-filter), and the token only
-# adds/removes labels. Never `pull_request_target`.
+# files are listed through the API (paths-filter), the sensitive list is read
+# from the base commit, and the token only adds/removes labels. Never
+# `pull_request_target`.
+#
+# Residual risk, by design of `pull_request` workflows: a PR that edits THIS
+# file runs its own edited copy. Such a PR always touches
+# `.github/workflows/**`, so the reviewer reads the gate change itself before
+# labelling; a gate edit that exempts its own PR is a review finding.
 name: security-gate
 
 on:
@@ -38,14 +44,20 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      # File list only: nothing from this checkout is executed. The
-      # evaluation step below uses the API for labels and verdicts.
+      # The sensitive list is read from the PR's BASE commit, never from the
+      # PR itself: a PR that edits `.github/security-paths.yml` cannot exempt
+      # its own files (the list change is sensitive under the base list).
+      # paths-filter lists the changed files through the API on
+      # pull_request; nothing from this checkout is executed.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         if: github.event_name != 'merge_group'
         with:
-          fetch-depth: 0
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      # A base commit without the list (the PR that introduces it) fails
+      # closed: every change counts as sensitive and needs the label.
       - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
-        if: github.event_name != 'merge_group'
+        if: github.event_name != 'merge_group' && hashFiles('.github/security-paths.yml') != ''
         id: filter
         with:
           filters: .github/security-paths.yml
@@ -55,8 +67,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ACTION: ${{ github.event.action }}
-          SENSITIVE: ${{ steps.filter.outputs.sensitive }}
-          SENSITIVE_FILES: ${{ steps.filter.outputs.sensitive_files }}
+          SENSITIVE: ${{ steps.filter.outputs.sensitive || 'true' }}
+          SENSITIVE_FILES: ${{ steps.filter.outputs.sensitive_files || 'no sensitive list on the base commit: every change counts as sensitive' }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           if [ "${EVENT_NAME}" = "merge_group" ]; then

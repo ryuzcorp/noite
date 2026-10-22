@@ -9,7 +9,8 @@
 # only if a change to it can weaken authentication, authorization, isolation,
 # secret handling, or the integrity of what gets deployed or reviewed.
 sensitive:
-  # Scoped credentials: minting, storage and enforcement. A bug here forges or
+  # Scoped credentials: minting, storage, enforcement and the orphan sweep. A
+  # bug here forges, leaks or wrongly revokes a store or ingest credential.
   - "apps/runner/src/host/credentials/**"
   - "apps/runner/src/host/credentials*"
   - "apps/runner/src/db/credentials.rs"
@@ -23,6 +24,12 @@ sensitive:
   - "apps/runner/src/host/git_identity.rs"
   - "apps/runner/src/host/git_policy.rs"
   - "apps/runner/src/host/env_gate.rs"
+  # The admin-role gate on per-app limits (#79).
+  - "apps/runner/src/service/limits.rs"
+  # Invite-only signup and the platform limiter that throttles auth and
+  # envelope ingest (brute force, key enumeration).
+  - "apps/noite/src/lib/server/invites.server.ts"
+  - "apps/noite/src/lib/rate-limit.ts"
 
   # Auth, sessions and passkeys in the control UI, including every route
   # middleware (pod-host gate, rate limiter, request timeout): the code that
@@ -42,6 +49,10 @@ sensitive:
   - "apps/runner/src/host/netisolation.rs"
   - "apps/runner/src/host/cgroups.rs"
   - "apps/runner/src/db/alloc.rs"
+  # The end-to-end proofs of isolation and hardening: weakening these
+  # silently weakens every isolation claim above.
+  - "apps/noite/e2e/hostile.spec.ts"
+  - "apps/noite/e2e/hardening.spec.ts"
 
   # Deletion and purge paths: a change here can strand credentials, fleets or
   # app data, or delete what should survive.

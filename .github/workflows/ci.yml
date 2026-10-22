@@ -205,14 +205,19 @@ jobs:
             success|skipped) ;;
             *) echo "::error::changes must be success or skipped, was $changes_result"; fail=1 ;;
           esac
-          # Docs-only PRs run no lane; the queue and manual runs must.
-          case "$event_name" in
-            merge_group|workflow_dispatch) require_success e2e "$e2e_result" ;;
-            *) case "$e2e_result" in
-                 success|skipped) ;;
-                 *) echo "::error::e2e must be success or skipped, was $e2e_result"; fail=1 ;;
-               esac ;;
-          esac
+          # The queue and manual runs must run the lanes. On a PR, `skipped`
+          # is accepted only when the paths-filter found no runtime code and
+          # the PR carries no `e2e` label: exactly when the e2e job's own
+          # condition is false, so a lane skipped for any other reason fails.
+          lane_expected="${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true' || contains(github.event.pull_request.labels.*.name, 'e2e') }}"
+          if [ "$lane_expected" = "true" ]; then
+            require_success e2e "$e2e_result"
+          else
+            case "$e2e_result" in
+              success|skipped) ;;
+              *) echo "::error::e2e must be success or skipped, was $e2e_result"; fail=1 ;;
+            esac
+          fi
           {
             echo "## ci-ok: per-job results (${event_name})"
             echo ""
