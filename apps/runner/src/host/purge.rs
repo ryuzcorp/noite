@@ -33,6 +33,11 @@ pub async fn purge_slug(
     slug: &str,
     grace: supervisor::StopGrace,
 ) -> anyhow::Result<()> {
+    // Per-step durations go on the final log line: a delete that takes tens
+    // of seconds (seen in CI, 2026-10-22) must name its slow step.
+    let started = std::time::Instant::now();
+    let ms =
+        |since: std::time::Instant| u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
     supervisor::stop_fleet(procs, slug, grace).await;
     // Preview environments are fleets of their own (`slug.label`): they share
     // this app's data, so they go down before it is cleared. Their rows go
@@ -42,7 +47,9 @@ pub async fn purge_slug(
     // (own.json epoch N, ltX only under e1) → D1 RestoreFailed on next boot.
     tokio::time::sleep(Duration::from_millis(500)).await;
     logs::clear(log_state, slug).await;
+    let stop_ms = ms(started);
 
+    let local = std::time::Instant::now();
     let root = exec::work_root(cfg);
     for path in [
         source::bare_repo(cfg, slug),
@@ -61,18 +68,34 @@ pub async fn purge_slug(
                 .with_context(|| format!("remove {}", path.display()))?;
         }
     }
+    let local_ms = ms(local);
 
     // git/  — tip bundles + refs (source of truth for redeploy)
     // fleets/ — celld durability: D1 sqlite, DO state, peer-auth, telemetry
     // envs/ — every environment's own celld durability (its own D1/DO/R2)
+    let step = std::time::Instant::now();
     clear_s3_prefix(cfg, &format!("s3://{}/git/{slug}/", cfg.s3_bucket)).await?;
+    let s3_git_ms = ms(step);
+    let step = std::time::Instant::now();
     clear_s3_prefix(cfg, &format!("s3://{}/fleets/{slug}/", cfg.s3_bucket)).await?;
+    let s3_fleets_ms = ms(step);
+    let step = std::time::Instant::now();
     clear_s3_prefix(
         cfg,
         &format!("s3://{}/{}", cfg.s3_bucket, cfg.envs_prefix(slug)),
     )
     .await?;
-    tracing::info!(slug, "purged local + S3 app data");
+    let s3_envs_ms = ms(step);
+    tracing::info!(
+        slug,
+        total_ms = ms(started),
+        stop_ms,
+        local_ms,
+        s3_git_ms,
+        s3_fleets_ms,
+        s3_envs_ms,
+        "purged local + S3 app data"
+    );
     Ok(())
 }
 
