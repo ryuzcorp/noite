@@ -68,6 +68,14 @@ if (tenancy !== "single" && tenancy !== "multi") {
   throw new Error(`E2E_TENANCY must be single or multi, not ${tenancy}`);
 }
 
+// Parallel lanes (E2E_SLOT, set by docker/e2e-local.sh) keep their Playwright
+// state apart: two lanes in one checkout must not share a cookie jar
+// (cookies ignore ports, so one .auth dir would cross logins), a report dir
+// or a test-results dir. Slot 0 keeps today's paths.
+const authFile = process.env.E2E_AUTH_DIR
+  ? `${process.env.E2E_AUTH_DIR}/user.json`
+  : "e2e/.auth/user.json";
+
 const suiteGrep = suite === "fast" ? SUITE_TAGS[tenancy] : undefined;
 
 export default defineConfig({
@@ -81,6 +89,7 @@ export default defineConfig({
   // before the 40-minute CI job cancel — naming the still-running test
   // instead of hanging silently. It never makes a test pass.
   globalTimeout: 25 * 60_000,
+  outputDir: process.env.E2E_TEST_DIR ?? "test-results",
   projects: [
     // No retries: a flaky setup must fail loudly (the lane's first project),
     // never pass on a second attempt with the same email.
@@ -93,7 +102,7 @@ export default defineConfig({
       name: "policy",
       testMatch: /a-invite\.spec\.ts/u,
       // Same session as the bulk project (it ran there before the split).
-      use: { storageState: "e2e/.auth/user.json" },
+      use: { storageState: authFile },
     },
     {
       dependencies: ["policy"],
@@ -102,16 +111,28 @@ export default defineConfig({
       testIgnore: [/a-invite\.spec\.ts/u, /auth\.setup\.ts/u],
       testMatch: /.*\.spec\.ts/u,
       // Deploy tests reuse the registered session, not the browser context.
-      use: { storageState: "e2e/.auth/user.json" },
+      use: { storageState: authFile },
     },
   ],
   reporter: [
     ["list"],
-    ["html", { open: "never" }],
+    [
+      "html",
+      {
+        open: "never",
+        outputFolder: process.env.E2E_REPORT_DIR ?? "playwright-report",
+      },
+    ],
     // Machine-readable results for the nightly flake hunt (e2e.yml's flakes
     // job reads this from the uploaded report). Local runs write it too,
-    // next to the html report; both are gitignored.
-    ["json", { outputFile: "playwright-report/e2e-results.json" }],
+    // next to the html report (the slot's own report dir on a parallel
+    // lane); both are gitignored.
+    [
+      "json",
+      {
+        outputFile: `${process.env.E2E_REPORT_DIR ?? "playwright-report"}/e2e-results.json`,
+      },
+    ],
   ],
   shard,
   testDir: "./e2e",

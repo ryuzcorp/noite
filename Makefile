@@ -28,7 +28,7 @@ ifeq ($(_TENANCY),multi)
 COMPOSE += -f docker/compose.multi.yaml
 endif
 
-.PHONY: help up up-prod e2e e2e-isolation dev dev-host logs doctor backup restore down nuke usage
+.PHONY: help up up-prod e2e e2e-isolation e2e-down dev dev-host logs doctor backup restore down nuke usage
 
 COMPOSE_BUILD := $(COMPOSE) -f docker/compose.build.yaml
 COMPOSE_DEV := $(COMPOSE) -f docker/compose.dev.yaml
@@ -52,6 +52,8 @@ help:
 	@echo "    lane knobs: E2E_WORKERS=3 (spec files in parallel), E2E_IMAGE=<tag>"
 	@echo "      (prebuilt image, no build), E2E_KEEP=1 (leave the stack up),"
 	@echo "      E2E_SUITE=fast (tagged PR gate) or release (default, every spec)"
+	@echo "      E2E_SLOT=<n> (parallel lane, default 0 = today's lane) or auto"
+	@echo "      (first free slot); E2E_SLOT=<n> make e2e-down stops that slot"
 	@echo "  make backup    consistent backup of both volumes (brief downtime)"
 	@echo "  make restore   restore a backup directory (FROM=<dir>; replaces volumes)"
 	@echo "  make down      stop (keeps volumes)"
@@ -77,6 +79,9 @@ e2e:
 
 e2e-isolation:
 	E2E_TENANCY=multi sh docker/e2e-local.sh
+
+e2e-down:
+	sh docker/e2e-local.sh down
 
 dev:
 	$(COMPOSE_DEV) up -d --build --force-recreate
@@ -119,5 +124,6 @@ nuke:
 	-$(COMPOSE_DEV) down -v --remove-orphans
 	-$(COMPOSE) down -v --remove-orphans
 	-$(COMPOSE) -p noite-e2e -f docker/compose.e2e.yaml down -v --remove-orphans
-	@CLI=$(ENGINE) sh -c '. ./docker/lib.sh && remove_project $(PROJECT) noite-e2e'
+	-@for s in 1 2 3 4 5 6 7 8; do $(COMPOSE) -p noite-e2e-$$s -f docker/compose.e2e.yaml down -v --remove-orphans; done
+	@CLI=$(ENGINE) sh -c '. ./docker/lib.sh && remove_project $(PROJECT) noite-e2e noite-e2e-1 noite-e2e-2 noite-e2e-3 noite-e2e-4 noite-e2e-5 noite-e2e-6 noite-e2e-7 noite-e2e-8'
 	rm -rf apps/noite/.wrangler apps/noite/.void

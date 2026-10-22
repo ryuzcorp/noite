@@ -108,7 +108,9 @@ test("custom domains, env vars and deletion behave", async ({
   // --- the edge fallback for a host with no app ---------------------------
   // No Caddy in this lane, so this asks the runner directly: the fallback page
   // is what a wildcard edge serves for an unknown tenant host.
-  const fallback = await request.get("http://localhost:8080/v1/edge/fallback", {
+  const apiBase = process.env.E2E_API_BASE ?? "http://localhost:8080";
+
+  const fallback = await request.get(`${apiBase}/v1/edge/fallback`, {
     headers: { host: "nope.noite.localhost" },
   });
 

@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import nodePath from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { expect } from "@playwright/test";
 import type {
@@ -182,7 +183,8 @@ export const deleteApp = async (
   await runnerCall(request, `/v1/apps/${appId}`, { method: "DELETE" });
 };
 
-/** Tenant listen port for raw-port traffic (published 8100-8199). */
+/** Tenant listen port for raw-port traffic (the lane publishes the slot's
+ * fleet range 1:1, so the runner's allocated port is reachable directly). */
 export const appListenPort = async (
   request: APIRequestContext,
   appId: string
@@ -390,7 +392,12 @@ export const registerInviteeAccount = async (
  * `finally`), never on a clock: `expect.poll` re-checks until the
  * directory is gone, and only its deadline can fail the wait. */
 export const withInviteLock = async <T>(fn: () => Promise<T>): Promise<T> => {
-  const authDir = new URL(".auth/", import.meta.url);
+  // Parallel lanes keep their auth state apart (E2E_AUTH_DIR, set by the lane
+  // script); slot 0 keeps today's dir.
+  const authDir = process.env.E2E_AUTH_DIR
+    ? pathToFileURL(`${process.env.E2E_AUTH_DIR}/`)
+    : new URL(".auth/", import.meta.url);
+
   const lockDir = new URL("invite.lock", authDir);
   const start = Date.now();
 

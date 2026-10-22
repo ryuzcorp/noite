@@ -328,8 +328,12 @@ test(
     // Through the lane Caddy, like worker-errors.spec.ts: the tenant site
     // sets a sampled traceparent so the ingest joins the exception to its
     // method, path and status.
-    const prodBase = `http://${SLUG}.noite.localhost:8090`;
-    const envBase = `http://${LABEL}.${SLUG}.noite.localhost:8090`;
+    const edgeHost = new URL(
+      process.env.E2E_BASE_URL ?? "http://noite.localhost:8090"
+    ).host;
+
+    const prodBase = `http://${SLUG}.${edgeHost}`;
+    const envBase = `http://${LABEL}.${SLUG}.${edgeHost}`;
 
     await expect
       .poll(

@@ -7,7 +7,9 @@ import {
   finishOnboarding,
 } from "./helpers";
 
-const authFile = "e2e/.auth/user.json";
+const authFile = process.env.E2E_AUTH_DIR
+  ? `${process.env.E2E_AUTH_DIR}/user.json`
+  : "e2e/.auth/user.json";
 
 /** Register the e2e account via passkey (virtual authenticator) and persist
  * the session for the e2e project. Registration creates the session

@@ -19,10 +19,10 @@ TOKEN="${RUNNER_TOKEN:-dev-runner-token}"
 # default. Both dev and the e2e lane serve the control UI on the bare base.
 BASE_HOST="${BASE_DOMAIN:-noite.localhost}"
 if [ "${E2E_RAW_PORTS:-}" = 1 ]; then
-  EDGE="http://127.0.0.1:8090"
-  API="http://127.0.0.1:8080"
+  EDGE="http://127.0.0.1:${E2E_HTTP_PORT:-8090}"
+  API="http://127.0.0.1:${E2E_API_PORT:-8080}"
   API_HOST=""
-  PROJECT=noite-e2e
+  PROJECT="${E2E_PROJECT:-noite-e2e}"
 else
   EDGE="http://127.0.0.1:${HTTP_PORT:-9080}"
   API="$EDGE"

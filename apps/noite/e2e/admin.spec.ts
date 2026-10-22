@@ -421,7 +421,9 @@ test("impersonation swaps the session, refuses admin surfaces, and returns clean
   // storageState was never broken by the round trip.
   const fresh = await browser.newContext({
     baseURL: control,
-    storageState: "e2e/.auth/user.json",
+    storageState: process.env.E2E_AUTH_DIR
+      ? `${process.env.E2E_AUTH_DIR}/user.json`
+      : "e2e/.auth/user.json",
   });
 
   try {
