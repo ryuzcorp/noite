@@ -540,16 +540,21 @@ mod tests {
             .expect("fake deploy takes the claim");
         let owned = state.clone();
         let id = app.id.clone();
-        let deleting = tokio::spawn(async move { delete(&owned, &id).await });
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        let mut deleting = tokio::spawn(async move { delete(&owned, &id).await });
+        // The delete must still be waiting on the deploy claim: a timeout
+        // race proves it stayed pending (a delete that skips the wait
+        // finishes early and fails here).
         assert!(
-            !deleting.is_finished(),
+            tokio::time::timeout(Duration::from_millis(400), &mut deleting)
+                .await
+                .is_err(),
             "delete must wait out the deploy claim"
         );
         // The delete holds the claim through purge + row delete: wait until
         // it owns the claim, then queue a waiter behind it (an explicit
         // deploy's `claim_wait`). The purge's settle sleep keeps this window
-        // wide open.
+        // wide open. The wait yields between scans; only the deadline below
+        // can fail it.
         drop(fake_deploy);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while !deploy::snapshot_claimed(&state.deploying)
@@ -560,7 +565,7 @@ mod tests {
                 tokio::time::Instant::now() < deadline,
                 "delete never took the claim"
             );
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
         }
         let owned = state.clone();
         let id = app.id.clone();
@@ -631,13 +636,17 @@ mod tests {
         let (state, dir) = test_state(10).await;
         let _push = state.git_sync.push_guard("guarded").await;
         let owned = state.clone();
-        let creating =
+        let mut creating =
             tokio::spawn(
                 async move { create(&owned, "Guarded", "guarded", Some("u1"), None).await },
             );
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // The create must still be waiting on the push guard: a timeout
+        // race proves it stayed pending (a create that skips the wait
+        // finishes early and fails here).
         assert!(
-            !creating.is_finished(),
+            tokio::time::timeout(Duration::from_millis(400), &mut creating)
+                .await
+                .is_err(),
             "create must wait for the slug push guard"
         );
         drop(_push);
@@ -662,10 +671,15 @@ mod tests {
         let _push = state.git_sync.push_guard("ps-old").await;
         let owned = state.clone();
         let id = app.id.clone();
-        let renaming = tokio::spawn(async move { rename(&owned, &id, None, Some("ps-new")).await });
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        let mut renaming =
+            tokio::spawn(async move { rename(&owned, &id, None, Some("ps-new")).await });
+        // The rename must still be waiting on the push guard: a timeout
+        // race proves it stayed pending (a rename that skips the wait
+        // finishes early and fails here).
         assert!(
-            !renaming.is_finished(),
+            tokio::time::timeout(Duration::from_millis(400), &mut renaming)
+                .await
+                .is_err(),
             "rename must wait for the old-slug push guard"
         );
         drop(_push);

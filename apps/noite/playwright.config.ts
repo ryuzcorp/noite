@@ -74,9 +74,9 @@ export default defineConfig({
   expect: { timeout: 30_000 },
   fullyParallel: false,
   projects: [
-    // One retry: the CDP passkey ceremony flakes rarely, and a retry with
-    // the same email is safe (verified: passes immediately after failing).
-    { name: "setup", retries: 1, testMatch: /auth\.setup\.ts/u },
+    // No retries: a flaky setup must fail loudly (the lane's first project),
+    // never pass on a second attempt with the same email.
+    { name: "setup", testMatch: /auth\.setup\.ts/u },
     // The signup-policy probe runs right after setup, before the parallel
     // bulk: it pins the policy the bootstrap account established, and later
     // specs spend invite codes and register accounts beside it.

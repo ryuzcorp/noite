@@ -1163,7 +1163,7 @@ async fn a_watched_environment_deploy_waits_for_the_apps_other_deploy() {
         .expect("production takes the claim");
     let state = h.state.clone();
     let (task_app, task_id) = (app.clone(), deploy_id.clone());
-    let task = tokio::spawn(async move {
+    let mut task = tokio::spawn(async move {
         crate::host::deploy::deploy_app(
             &state.pool,
             &state.config,
@@ -1179,12 +1179,20 @@ async fn a_watched_environment_deploy_waits_for_the_apps_other_deploy() {
         )
         .await;
     });
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    // The environment deploy must still be waiting on the app's lock: a
+    // timeout race proves it stayed pending (a deploy that skips instead of
+    // waiting, or one that ignores the lock, finishes early and fails here).
+    // The final assertions below catch the skip itself deterministically.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(600), &mut task)
+            .await
+            .is_err(),
+        "the deploy waits for the lock"
+    );
     let waiting = crate::db::get_deploy_log(&h.state.pool, &app.id, &deploy_id)
         .await
         .expect("log")
         .expect("row");
-    assert!(!task.is_finished(), "the deploy waits for the lock");
     assert!(!waiting.contains("skipped"), "{waiting}");
     // Production ends: the environment's deploy runs (and fails at fetch —
     // there is no bundle here — which is a real attempt, not a skip).

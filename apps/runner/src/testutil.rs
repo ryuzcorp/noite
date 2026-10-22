@@ -60,8 +60,10 @@ pub fn live_cmdline_has(marker: &str) -> bool {
 /// Poll until no live process carries `marker`, up to `timeout`. A single
 /// /proc scan right after a group SIGKILL races the kernel: the killed
 /// grandchild keeps its cmdline until its exit finishes tearing down its
-/// address space, so an immediate scan can still see it. Returns true once
-/// the marker is gone.
+/// address space, so an immediate scan can still see it. Between scans the
+/// loop only yields to the scheduler — never sleeps — so the reaping task
+/// and the kernel get a chance to run while the wait stays purely
+/// condition-driven. Returns true once the marker is gone.
 pub async fn wait_for_cmdline_gone(marker: &str, timeout: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
@@ -71,6 +73,6 @@ pub async fn wait_for_cmdline_gone(marker: &str, timeout: std::time::Duration) -
         if start.elapsed() >= timeout {
             return false;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
     }
 }

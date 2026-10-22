@@ -110,11 +110,32 @@ afterEach(() => {
   delete testGlobals.document;
 });
 
-const sleep = (ms: number): Promise<void> =>
-  // oxlint-disable-next-line promise/avoid-new -- the test waits out real reconnect timers, which are the behavior under test
-  new Promise<void>((resolve) => {
-    realSetTimeout(resolve, ms);
-  });
+/** Injected clock for reconnect tests: `setTimeout` calls are captured,
+ * never run; the test fires them by hand, so no test waits out a real
+ * backoff. The recorded delays prove the exact backoff sequence. */
+const installManualClock = () => {
+  const delays: number[] = [];
+  const queue: { delay: number; handler: () => void }[] = [];
+  // SAFETY: test-only clock; every captured reopen is fired by hand below.
+  globalThis.setTimeout = ((handler: () => void, delay?: number) => {
+    delays.push(delay ?? 0);
+    queue.push({ delay: delay ?? 0, handler });
+
+    return queue.length;
+  }) as typeof setTimeout;
+
+  const fire = (): void => {
+    const next = queue.shift();
+
+    if (next === undefined) {
+      throw new Error("no reconnect scheduled");
+    }
+
+    next.handler();
+  };
+
+  return { delays, fire, queue };
+};
 
 const collect = () => {
   const statuses: EventSourceStatus[] = [];
@@ -145,31 +166,9 @@ const connect = (hooks: StreamHooks, document_: FakeDocument): (() => void) => {
   });
 };
 
-/** Records the delays the next reconnect schedules: exact, with no
- * wall-clock involved (the schedule happens synchronously inside the error
- * listener). */
-const scheduledDelays = (fire: () => void): number[] => {
-  const delays: number[] = [];
-  // SAFETY: the wrapper records the delay, then delegates to the real timer.
-  globalThis.setTimeout = ((handler: () => void, delay?: number) => {
-    if (delay !== undefined) {
-      delays.push(delay);
-    }
-
-    return realSetTimeout(handler, delay);
-  }) as typeof setTimeout;
-
-  try {
-    fire();
-  } finally {
-    globalThis.setTimeout = realSetTimeout;
-  }
-
-  return delays;
-};
-
 describe("connectStream", () => {
-  test("recovers from a CLOSED source with capped backoff, reset on open", async () => {
+  test("recovers from a CLOSED source with capped backoff, reset on open", () => {
+    const clock = installManualClock();
     const document_ = new FakeDocument();
     const { hooks, messages, statuses } = collect();
     const dispose = connect(hooks, document_);
@@ -182,40 +181,36 @@ describe("connectStream", () => {
 
     // Transient 404: the source dies CLOSED; the connector schedules a
     // reopen instead of waiting on a native retry that never comes.
-    expect(scheduledDelays(() => FakeSource.instances[0]?.fail())).toEqual([
-      10,
-    ]);
+    FakeSource.instances[0]?.fail();
     expect(statuses).toEqual(["connecting", "open", "retrying"]);
+    expect(clock.delays).toEqual([10]);
 
-    await sleep(30);
+    // Firing the scheduled reopen connects the next source.
+    clock.fire();
     expect(FakeSource.instances).toHaveLength(2);
 
-    expect(scheduledDelays(() => FakeSource.instances[1]?.fail())).toEqual([
-      20,
-    ]);
-    await sleep(40);
+    FakeSource.instances[1]?.fail();
+    expect(clock.delays).toEqual([10, 20]);
+    clock.fire();
     expect(FakeSource.instances).toHaveLength(3);
 
     // Backoff caps instead of doubling forever.
-    expect(scheduledDelays(() => FakeSource.instances[2]?.fail())).toEqual([
-      40,
-    ]);
-    await sleep(60);
+    FakeSource.instances[2]?.fail();
+    expect(clock.delays).toEqual([10, 20, 40]);
+    clock.fire();
     expect(FakeSource.instances).toHaveLength(4);
-    expect(scheduledDelays(() => FakeSource.instances[3]?.fail())).toEqual([
-      40,
-    ]);
+    FakeSource.instances[3]?.fail();
+    expect(clock.delays).toEqual([10, 20, 40, 40]);
 
     // Recovery resets the backoff: the next failure starts at the base again.
-    await sleep(60);
+    clock.fire();
     expect(FakeSource.instances).toHaveLength(5);
     FakeSource.instances[4]?.emit("open");
-    expect(scheduledDelays(() => FakeSource.instances[4]?.fail())).toEqual([
-      10,
-    ]);
+    FakeSource.instances[4]?.fail();
+    expect(clock.delays).toEqual([10, 20, 40, 40, 10]);
 
     // The recovered stream delivers frames.
-    await sleep(30);
+    clock.fire();
     expect(FakeSource.instances).toHaveLength(6);
     FakeSource.instances[5]?.emit("open");
     FakeSource.instances[5]?.emit("message", '{"ok":true}');
@@ -230,7 +225,8 @@ describe("connectStream", () => {
     dispose();
   });
 
-  test("leaves native retry alone while the source is still open", async () => {
+  test("leaves native retry alone while the source is still open", () => {
+    const clock = installManualClock();
     const document_ = new FakeDocument();
     const { hooks, statuses } = collect();
     const dispose = connect(hooks, document_);
@@ -238,16 +234,17 @@ describe("connectStream", () => {
     FakeSource.instances[0]?.emit("open");
     // Transport blip: readyState stays open, so the native retry owns it —
     // no scheduled reopen, no second source.
-    expect(scheduledDelays(() => FakeSource.instances[0]?.blip())).toEqual([]);
+    FakeSource.instances[0]?.blip();
     expect(statuses).toEqual(["connecting", "open", "retrying"]);
-
-    await sleep(30);
+    expect(clock.delays).toEqual([]);
+    expect(clock.queue).toHaveLength(0);
     expect(FakeSource.instances).toHaveLength(1);
 
     dispose();
   });
 
-  test("closes on hidden tabs and reopens when visible", async () => {
+  test("closes on hidden tabs and reopens when visible", () => {
+    const clock = installManualClock();
     const document_ = new FakeDocument();
     const { hooks, statuses } = collect();
     const dispose = connect(hooks, document_);
@@ -258,8 +255,9 @@ describe("connectStream", () => {
     expect(FakeSource.instances[0]?.closed).toBe(true);
     expect(statuses).toEqual(["connecting", "open", "closed"]);
 
-    // No reconnect while hidden, even past the backoff.
-    await sleep(40);
+    // No reconnect while hidden: nothing is scheduled, so there is nothing
+    // a backoff could fire.
+    expect(clock.queue).toHaveLength(0);
     expect(FakeSource.instances).toHaveLength(1);
 
     document_.setHidden(false);
@@ -285,17 +283,20 @@ describe("connectStream", () => {
     dispose();
   });
 
-  test("dispose cancels a pending retry", async () => {
+  test("dispose cancels a pending retry", () => {
+    const clock = installManualClock();
     const document_ = new FakeDocument();
     const { hooks } = collect();
     const dispose = connect(hooks, document_);
 
     FakeSource.instances[0]?.fail();
+    expect(clock.queue).toHaveLength(1);
     dispose();
 
-    // The scheduled reopen never fires.
-    await sleep(40);
+    // The scheduled reopen is stale: firing it reconnects nothing.
+    clock.fire();
     expect(FakeSource.instances).toHaveLength(1);
+    expect(clock.queue).toHaveLength(0);
 
     dispose();
   });
@@ -435,7 +436,8 @@ describe("createStreamHub", () => {
     expect(again.statuses.at(-1)).toBe("open");
   });
 
-  test("a CLOSED hub source is replaced once with the identical topics, replaying first frames", async () => {
+  test("a CLOSED hub source is replaced once with the identical topics, replaying first frames", () => {
+    const clock = installManualClock();
     const { flush, streams } = manualHub();
     const logs = collect();
     const deploys = collect();
@@ -458,9 +460,11 @@ describe("createStreamHub", () => {
     // Kill the connection the way an HTTP error kills a native source:
     // the hub reopens the same topic set on one replacement connection.
     // `close` marks the dead source gone, like its native CLOSED state.
+    // The reopen is fired by hand: no test waits out the backoff.
     source?.fail();
     source?.close();
-    await sleep(50);
+    expect(clock.delays).toEqual([10]);
+    clock.fire();
 
     expect(FakeSource.instances).toHaveLength(2);
     expect(liveSources().map((replacement) => replacement.url)).toEqual([url]);

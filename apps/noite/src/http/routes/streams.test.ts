@@ -1,11 +1,14 @@
-/* oxlint-disable eslint/require-await, anti-slop/no-unknown-returns, anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: they mirror async platform interfaces and stand in for bindings they only partly implement */
 import { afterEach, describe, expect, test } from "bun:test";
+/* oxlint-disable eslint/require-await, anti-slop/no-unknown-returns, anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: they mirror async platform interfaces and stand in for bindings they only partly implement */
+import { setImmediate } from "node:timers/promises";
 
 import { controlStreamRefusalDecision } from "../session";
 import { sleepUnlessAborted } from "../sse";
 import { metricsWindowHours, proxyRunnerFetch, streamMetrics } from "./streams";
 
 const realFetch = globalThis.fetch;
+const realSetTimeout = globalThis.setTimeout;
+const realClearTimeout = globalThis.clearTimeout;
 
 const setFetch = (
   impl: (url: string, init?: RequestInit) => Promise<Response>
@@ -17,7 +20,54 @@ const setFetch = (
 
 afterEach(() => {
   globalThis.fetch = realFetch;
+  globalThis.setTimeout = realSetTimeout;
+  globalThis.clearTimeout = realClearTimeout;
 });
+
+/** Manual timer queue for the stream loop: pauses are fired by hand, so no
+ * test waits out a real poll interval. A loop with no pause (the busy-loop
+ * regression) leaves the queue empty and fails at the pump. */
+const installManualTimers = () => {
+  const queue: { delay: number; handler: () => void; id: number }[] = [];
+  const delays: number[] = [];
+  let nextId = 1;
+  // SAFETY: test-only clock; every scheduled pause is fired by hand below.
+  globalThis.setTimeout = ((handler: () => void, delay?: number) => {
+    const id = nextId;
+    nextId += 1;
+    delays.push(delay ?? 0);
+    queue.push({ delay: delay ?? 0, handler, id });
+
+    return id;
+  }) as typeof setTimeout;
+  // SAFETY: test-only clock; an aborted pause leaves the queue.
+  globalThis.clearTimeout = ((id?: number) => {
+    const at = queue.findIndex((entry) => entry.id === id);
+
+    if (at !== -1) {
+      queue.splice(at, 1);
+    }
+  }) as typeof clearTimeout;
+
+  const fire = (): void => {
+    const next = queue.shift();
+
+    if (next === undefined) {
+      throw new Error("the stream scheduled no pause between cycles");
+    }
+
+    next.handler();
+  };
+
+  return { delays, fire, queue };
+};
+
+/** Drain the loop's fetch/send chain after firing a pause: settling two
+ * immediates means a settled cycle, with no wall-clock involved. */
+const settleCycle = async (): Promise<void> => {
+  await setImmediate();
+  await setImmediate();
+};
 
 const metricsRequest = (query: string) =>
   new Request(`http://localhost/api/apps/a/metrics/stream${query}`);
@@ -54,6 +104,7 @@ const runMetricsStream = async (versionFor: (call: number) => number) => {
     return Response.json([]);
   });
   const controller = new AbortController();
+  const timers = installManualTimers();
 
   const done = streamMetrics({
     auth: { authorization: "Bearer t" },
@@ -71,11 +122,23 @@ const runMetricsStream = async (versionFor: (call: number) => number) => {
     windowQuery: "hours=24",
   });
 
-  await Bun.sleep(200);
+  // Five cycles, each closed by firing its own scheduled pause: exactly one
+  // poll per cycle, exactly one pause per cycle.
+  for (let cycle = 1; cycle <= 5; cycle += 1) {
+    // oxlint-disable-next-line eslint/no-await-in-loop -- sequential pump-and-settle; parallel pumps would race the queue
+    await settleCycle();
+    expect(versionCalls).toBe(cycle);
+    expect(timers.queue).toHaveLength(1);
+
+    if (cycle < 5) {
+      timers.fire();
+    }
+  }
+
   controller.abort();
   await done;
 
-  return { chunks, versionCalls };
+  return { chunks, timers, versionCalls };
 };
 
 describe("control stream gate", () => {
@@ -156,20 +219,26 @@ describe("sleepUnlessAborted", () => {
 
 describe("streamMetrics", () => {
   test("an unchanged runner version still sleeps between cycles (no busy loop)", async () => {
-    const { chunks, versionCalls } = await runMetricsStream(() => 7);
-    // ~200 ms at 20 ms per cycle is about ten cycles; a loop without a pause
-    // would make thousands of calls in the same time.
-    expect(versionCalls).toBeGreaterThanOrEqual(3);
-    expect(versionCalls).toBeLessThan(40);
+    const { chunks, timers, versionCalls } = await runMetricsStream(() => 7);
+    // Five pumped cycles, one version read each: the loop keeps polling.
+    expect(versionCalls).toBe(5);
+    // Every cycle scheduled exactly one 20 ms pause, and the abort cleaned
+    // up the last one: a loop without a pause would fail at the pump, and
+    // would make thousands of calls in the time a real wait would take.
+    expect(timers.delays).toEqual([20, 20, 20, 20, 20]);
+    expect(timers.queue).toHaveLength(0);
     // The first poll sends its frame; unchanged cycles send nothing (the
     // keep-alive comments come from `eventStream`, not the loop).
-    expect(chunks.length).toBeGreaterThanOrEqual(1);
+    expect(chunks.length).toBe(1);
     expect(chunks.every((chunk) => chunk.startsWith("data: "))).toBe(true);
   });
 
   test("a moved version polls again", async () => {
-    const { versionCalls } = await runMetricsStream((n) => n);
-    expect(versionCalls).toBeGreaterThanOrEqual(3);
+    const { chunks, timers, versionCalls } = await runMetricsStream((n) => n);
+    expect(versionCalls).toBe(5);
+    expect(timers.delays).toEqual([20, 20, 20, 20, 20]);
+    expect(timers.queue).toHaveLength(0);
+    expect(chunks.length).toBe(1);
   });
 });
 

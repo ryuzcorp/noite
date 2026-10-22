@@ -9,7 +9,6 @@ import {
 import { tmpdir } from "node:os";
 import nodePath from "node:path";
 
-import { sleep } from "$lib/sleep";
 import { expect, test } from "@playwright/test";
 import type { APIRequestContext } from "@playwright/test";
 
@@ -187,38 +186,35 @@ const pushBoomRevision = (
   }
 };
 
-/** Poll one environment's deploy history until the tip is terminal. */
+/** Poll one environment's deploy history until the tip is terminal. The
+ * poll reads the real deploy row (never a clock): `expect.poll` re-reads
+ * until the row is terminal, and only its deadline can fail the wait. */
 const waitForEnvDeploy = async (
   request: APIRequestContext,
   appId: string,
   environmentId: string,
   timeoutMs = 8 * 60_000
 ): Promise<void> => {
-  const start = Date.now();
+  let latest: { status: string } | undefined;
 
-  for (;;) {
-    // oxlint-disable-next-line eslint/no-await-in-loop -- sequential deploy poll with early exit
-    const deploys = await runnerApi<{ status: string }[]>(
-      request,
-      `/v1/apps/${appId}/deploys?environmentId=${encodeURIComponent(environmentId)}`
-    );
+  await expect
+    .poll(
+      async () => {
+        const deploys = await runnerApi<{ status: string }[]>(
+          request,
+          `/v1/apps/${appId}/deploys?environmentId=${encodeURIComponent(environmentId)}`
+        );
 
-    const [latest] = deploys;
+        [latest] = deploys;
 
-    if (latest?.status === "success") {
-      return;
-    }
+        return latest?.status ?? "no-row";
+      },
+      { intervals: [1000], timeout: timeoutMs }
+    )
+    .toMatch(/^(?<terminal>success|failed)$/u);
 
-    if (latest?.status === "failed") {
-      throw new Error(`environment deploy failed: ${JSON.stringify(latest)}`);
-    }
-
-    if (Date.now() - start > timeoutMs) {
-      throw new Error(`environment deploy did not finish in ${timeoutMs}ms`);
-    }
-
-    // oxlint-disable-next-line eslint/no-await-in-loop -- sequential poll backoff
-    await sleep(1000);
+  if (latest?.status === "failed") {
+    throw new Error(`environment deploy failed: ${JSON.stringify(latest)}`);
   }
 };
 

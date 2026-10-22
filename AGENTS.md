@@ -103,6 +103,7 @@ Operational do-nots and gotchas not carried by SPEC:
 
 ## Agent behavior
 
+- Tests must catch real, consumer-visible bugs. No retries, no wall-clock sleeps in tests: flakes are bugs, fix them at the root — poll the real condition (`expect.poll`), await a real signal, inject the clock (hand-fired timers, paused time, fake timers), or use `AbortSignal.timeout` for a pure deadline. `docker/check-tests.ts` (run in `check.yml`) enforces this; `docker/check-tests.test.ts` unit-tests the checker.
 - Prefer small, focused changes. When a PR-like diff is large this repo expects the work to be split into reviewable steps.
 - Release notes go in `changelog.d/<unique-topic>.md` (one file per PR, the CHANGELOG's own `### <Section>` headings with `- ` bullets), never under `## [Unreleased]` — `bun docker/check-changelog.ts` fails otherwise. Add an `### Operator action required` bullet whenever an upgrading operator must know or do something.
 - Run `bun run check` and (for runner code) the cargo build before declaring done — automatic formatting/lint is not a substitute for the ryuer build.

@@ -982,15 +982,10 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(600), fleet_gone(&procs, "live")).await;
         assert!(still.is_err(), "a live fleet keeps the waiter waiting");
 
-        let stopper = {
-            let procs = procs.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                stop_fleet(&procs, "live", StopGrace::NORMAL).await;
-            })
-        };
+        // The waiter pended while the fleet was live (proven above); stopping
+        // now resolves it as Removed, deterministically and with no stagger.
+        stop_fleet(&procs, "live", StopGrace::NORMAL).await;
         assert_eq!(fleet_gone(&procs, "live").await, FleetFate::Removed);
-        stopper.await.expect("stopper");
 
         let crashed = Command::new("sh")
             .args(["-c", "exit 3"])
@@ -1082,14 +1077,16 @@ mod tests {
         cmd.kill_on_drop(true);
         let mut leader = cmd.spawn().expect("spawn group leader");
         // The leader must have forked its sleeper before the move, or a
-        // leader-only kill passes vacuously with nothing to orphan.
+        // leader-only kill passes vacuously with nothing to orphan. Yield
+        // between scans so the forked child gets scheduled; the deadline
+        // only fires when the fork never happens.
         let spawned = std::time::Instant::now();
         while !crate::testutil::live_cmdline_has(&marker) {
             assert!(
                 spawned.elapsed() < Duration::from_secs(5),
                 "group leader never forked its sleeper"
             );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::task::yield_now().await;
         }
         // cgroup.procs as a directory: the move is refused (EISDIR, not
         // ESRCH) for a live pid, like a real denial.
