@@ -138,19 +138,21 @@ pub async fn next_ports_in(pool: &SqlitePool, min: u16, max: u16) -> sqlx::Resul
             used.insert(port);
         }
     }
+    // `checked_add`, never `saturating_add`: at `u16::MAX` a saturated
+    // successor equals `listen` and would hand out the degenerate pair
+    // (65535, 65535). No representable successor in range is exhaustion.
     let mut listen = min;
     loop {
-        let next = listen.saturating_add(1);
-        if next > max {
+        let Some(next) = listen.checked_add(1).filter(|port| *port <= max) else {
             return Err(sqlx::Error::RowNotFound);
-        }
+        };
         if !used.contains(&listen) && !used.contains(&next) {
             return Ok((listen as i64, next as i64));
         }
-        if next == max {
+        let Some(after) = next.checked_add(1) else {
             return Err(sqlx::Error::RowNotFound);
-        }
-        listen = next.saturating_add(1);
+        };
+        listen = after;
     }
 }
 
@@ -357,6 +359,17 @@ mod tests {
         // The range holds one pair and it is taken: exhaustion, not a wander.
         assert!(matches!(
             next_ports_in(&pool, 20000, 20001).await,
+            Err(sqlx::Error::RowNotFound)
+        ));
+        // An odd-sized range ending at u16::MAX: with the first pair taken
+        // the scan reaches 65535, whose successor does not exist. It must
+        // report exhaustion, never hand out the degenerate (65535, 65535).
+        sqlx::query("UPDATE app SET listen_port = 65533, internal_port = 65534 WHERE id = 'full'")
+            .execute(&pool)
+            .await
+            .expect("take the first top pair");
+        assert!(matches!(
+            next_ports_in(&pool, 65533, 65535).await,
             Err(sqlx::Error::RowNotFound)
         ));
         pool.close().await;
