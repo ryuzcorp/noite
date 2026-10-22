@@ -38,6 +38,7 @@ interface RpcParams {
   appRpm?: number | null;
   clientRpm?: number | null;
   memoryMb?: number | null;
+  role?: string;
   channel?: string;
   limit?: number;
   environmentId?: string;
@@ -105,6 +106,9 @@ test(
         clientRpm: null,
         id: appId,
         memoryMb: OOM_CAP_MB,
+        // The runner re-checks the app role: this lane created the app, so
+        // it calls as its admin.
+        role: "admin",
       }
     );
 

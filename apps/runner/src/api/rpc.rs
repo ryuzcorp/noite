@@ -260,6 +260,8 @@ struct LimitsParams {
     app_rpm: Option<i64>,
     #[serde(default)]
     memory_mb: Option<i64>,
+    #[serde(default)]
+    role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -849,7 +851,15 @@ async fn dispatch_call(
             };
             complete(
                 id,
-                service::limits::set(state, &p.id, p.client_rpm, p.app_rpm, p.memory_mb).await,
+                service::limits::set(
+                    state,
+                    &p.id,
+                    p.client_rpm,
+                    p.app_rpm,
+                    p.memory_mb,
+                    p.role.as_deref(),
+                )
+                .await,
             )
         }
         "errors.list" => {

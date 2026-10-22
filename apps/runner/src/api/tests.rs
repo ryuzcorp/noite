@@ -1741,3 +1741,37 @@ async fn the_state_stream_resends_the_app_and_its_environments_on_change() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     h.finish().await;
 }
+
+/// `limits.set` gates on the caller's role at the RPC boundary, like the
+/// domains mutations: a missing role, `view` or `push` is a 403 (the role is
+/// deserialized and forwarded, not dropped), `admin` passes, and `limits.get`
+/// stays role-free.
+#[tokio::test]
+async fn limits_set_role_gate_holds_over_rpc() {
+    let h = Harness::new().await;
+    let app = h.seed_app("limits-rpc").await;
+    for params in [
+        json!({ "id": app.id, "clientRpm": 30 }),
+        json!({ "id": app.id, "clientRpm": 30, "role": "view" }),
+        json!({ "id": app.id, "clientRpm": 30, "role": "push" }),
+    ] {
+        assert!(
+            matches!(h.rpc("limits.set", params.clone()).await, Err((403, _))),
+            "{params}"
+        );
+    }
+    let set = h
+        .rpc(
+            "limits.set",
+            json!({ "id": app.id, "clientRpm": 30, "role": "admin" }),
+        )
+        .await
+        .expect("admin sets limits");
+    assert_eq!(set["clientRpm"], json!(30));
+    let got = h
+        .rpc("limits.get", json!({ "id": app.id }))
+        .await
+        .expect("limits.get needs no role");
+    assert_eq!(got["clientRpm"], json!(30));
+    h.finish().await;
+}

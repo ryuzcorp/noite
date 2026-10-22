@@ -583,8 +583,16 @@ export const runnerSetLimits = (
   id: string,
   clientRpm: number | null,
   appRpm: number | null,
-  memoryMb: number | null
-) => runnerRpc<RunnerLimits>("limits.set", { appRpm, clientRpm, id, memoryMb });
+  memoryMb: number | null,
+  role: string
+) =>
+  runnerRpc<RunnerLimits>("limits.set", {
+    appRpm,
+    clientRpm,
+    id,
+    memoryMb,
+    role,
+  });
 
 export const runnerGitRemote = (id: string) =>
   runnerRpc<RunnerGitRemote>("git.remote", { id });
