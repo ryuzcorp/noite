@@ -1011,21 +1011,26 @@ async fn deploy_inner(
 
 /// Make a healthy deploy's target routable (its sha and `running`, the state
 /// `edge_table::serves` / `edge::env_live` read) and push the edge table, so
-/// the route exists before the deploy row first reads `success`. A DB error
-/// fails the deploy like any status write; a failed push is logged, and the
-/// reconcile tick's push is the backstop (as for every lifecycle push).
+/// the route exists before the deploy row first reads `success`. A deploy
+/// that cannot get its route onto the edge does not report success:
+/// - a DB error, or a table that could not be built or written, fails it;
+/// - an edge that answers and refuses the table fails it (the running edge
+///   keeps serving the previous table, without this target);
+/// - an unreachable admin API does not: Caddy is booting or restarting, and
+///   it loads the table file written above, which already routes the target.
 async fn route_live(
     pool: &SqlitePool,
     cfg: &Config,
     app_id: &str,
     environment_id: Option<&str>,
     sha: &str,
-) -> sqlx::Result<()> {
+) -> anyhow::Result<()> {
+    use crate::host::edge_table::{push_routes, Pushed};
     db::mark_deploy_live(pool, app_id, environment_id, sha).await?;
-    if let Err(e) = crate::host::edge_table::push_routes(pool, cfg).await {
-        tracing::warn!(app_id = %app_id, error = %format!("{e:#}"), "edge push before deploy success");
+    match push_routes(pool, cfg).await? {
+        Pushed::Rejected(detail) => anyhow::bail!("the edge refused the route table: {detail}"),
+        Pushed::Accepted | Pushed::Unreachable => Ok(()),
     }
-    Ok(())
 }
 
 /// Drop the build worktree after a successful deploy. Best-effort by contract:
@@ -1402,6 +1407,95 @@ mod tests {
             .await
             .expect("deploy status");
         assert_eq!(status, "deploying", "routing must not announce the deploy");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One-shot Caddy admin stand-in: reads one full request, answers with
+    /// `status` and `body`, and closes.
+    async fn admin_stub(status: &'static str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // Headers, then exactly Content-Length body bytes: answering
+            // early would reset the connection and read as "unreachable".
+            loop {
+                let n = sock.read(&mut chunk).await.expect("read");
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf);
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(reply.as_bytes()).await.expect("reply");
+        });
+        format!("http://{addr}")
+    }
+
+    /// A deploy whose route the edge refuses must not go on to report
+    /// success: the running edge keeps its previous table, without the
+    /// target, so a client that trusted the row would get "Starting". An
+    /// edge that accepts the table lets it through.
+    #[tokio::test]
+    async fn a_deploy_the_edge_refuses_to_route_fails() {
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let dir =
+            std::env::temp_dir().join(format!("noite-route-refused-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.routes_path = dir.join("routes.json").to_string_lossy().into_owned();
+        let app = crate::db::create_app(
+            &pool,
+            &cfg,
+            crate::db::NewApp {
+                name: "blog",
+                slug: "blog",
+                user_id: "local",
+                subdomain: "blog.localhost",
+                listen: 30100,
+                internal: 30101,
+            },
+        )
+        .await
+        .expect("seed app");
+
+        cfg.caddy_admin_url = admin_stub("409 Conflict", "stale generation").await;
+        let refused = route_live(&pool, &cfg, &app.id, None, "abc123")
+            .await
+            .expect_err("a refused table must fail the deploy");
+        assert!(
+            format!("{refused:#}").contains("stale generation"),
+            "{refused:#}"
+        );
+
+        cfg.caddy_admin_url = admin_stub("200 OK", "{}").await;
+        route_live(&pool, &cfg, &app.id, None, "abc123")
+            .await
+            .expect("an accepted table lets the deploy through");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

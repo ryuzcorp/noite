@@ -27,7 +27,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - **A failed snapshot meta upload is retried, not skipped.** The runner recorded a snapshot's hash as soon as the state object uploaded. If the metadata upload after it failed, the next pass saw identical bytes and skipped, leaving the bucket's `noite.sqlite.meta.json` stale (a new runner seeds its generation and skip hash from it) while `/ready` reported a fresh upload. The hash is now recorded only once both objects landed, and a skipped pass no longer resets the reported upload age.
-- **A first deploy answers through the edge as soon as it reports success.** The runner added a new app or preview to the edge route table only after recording the deploy as successful. A request sent the moment the CLI, the UI or a script saw that success could get the "is starting" page (503) for a few milliseconds. The target is now routed first, and the deploy reports success after.
+- **A first deploy answers through the edge as soon as it reports success.** The runner added a new app or preview to the edge route table only after recording the deploy as successful. A request sent the moment the CLI, the UI or a script saw that success could get the "is starting" page (503) for a few milliseconds. The target is now routed first, and the deploy reports success after. A deploy whose route table the edge refuses now fails with the edge's answer, instead of reporting success for a target that isn't reachable. An edge that is restarting still lets the deploy through, because it boots from the table file, which already routes the target.
 
 ## [0.1.0-alpha.8] - 2026-10-21
 
