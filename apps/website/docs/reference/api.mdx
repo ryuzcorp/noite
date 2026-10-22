@@ -170,7 +170,8 @@ git push noite main
 | Method | Params | Does |
 | --- | --- | --- |
 | `apps.get_by_slug` | `slug` | One app by slug |
-| `limits.get` / `limits.set` | `id`, `clientRpm`, `appRpm`, `memoryMb` (+ `role` on `set`: `admin`, else 403) | The app's edge rate limits (requests per minute; `null` = platform default, `0` = off) and fleet memory cap override (`null` = default) |
+| `limits.get` | `id` | The app's edge rate limits (requests per minute; `null` = platform default, `0` = off) and fleet memory cap override (`null` = default) |
+| `limits.set` | `id`, `clientRpm`, `appRpm`, `memoryMb`, `role` (`admin`; otherwise 403) | Sets those limits and the memory cap override |
 | `errors.list` / `errors.get` / `errors.set_status` | `id`, `status` / `fingerprint` | Grouped errors, one error with occurrences, resolve / ignore / reopen |
 
 Errors map like the HTTP statuses: application errors keep `400`/`404`/`409`, a bad param shape is `-32602`, and any internal failure — an `events.*` DB error included — is `-32603`.
