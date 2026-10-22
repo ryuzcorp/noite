@@ -283,6 +283,52 @@ describe("streamHub", () => {
     expect(frames.indexOf("0:+")).toBeLessThan(frames.indexOf("0:!"));
     expect(opens).toBe(2);
   });
+
+  test("an upstream that ends before its first frame reopens without waiting out the bound", async () => {
+    let opens = 0;
+
+    const routes: TopicRoute[] = [
+      {
+        handler: (request) => {
+          opens += 1;
+
+          if (opens > 1) {
+            return liveSse(request, ['["back"]']);
+          }
+
+          // The runner ends a topic with an error when its own first
+          // snapshot hangs: the body errors before any frame.
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.error(new Error("no first frame within 10s"));
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } }
+          );
+        },
+        pattern: /^\/api\/apps\/(?<appId>[^/]+)\/logs\/stream$/u,
+      },
+    ];
+
+    const page = new AbortController();
+
+    // A first-frame bound far beyond readFrames' 2 s guard: the reopen must
+    // follow the upstream's own end, not the hub's bound.
+    const frames = await readFrames(
+      streamHub(hubRequest([logsUrl("app_1")], page.signal), env, routes, {
+        baseMs: 10,
+        capMs: 40,
+        firstFrameMs: 60_000,
+      }),
+      (got) => got.includes('0:["back"]')
+    );
+
+    page.abort();
+
+    expect(frames.indexOf("0:!")).toBeLessThan(frames.indexOf('0:["back"]'));
+    expect(opens).toBe(2);
+  });
   test("an unknown topic is refused once; the rest still stream", async () => {
     const routes: TopicRoute[] = [
       {

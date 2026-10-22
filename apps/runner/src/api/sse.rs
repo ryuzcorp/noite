@@ -222,5 +222,14 @@ mod tests {
             text.contains("frame"),
             "the first frame is delivered: {text}"
         );
+        // Every later poll fails, yet the stream stays open well past the
+        // first-frame budget: `next()` is still pending when the paused
+        // clock passes ten budgets (an ended stream would yield `None`).
+        assert!(
+            tokio::time::timeout(BUDGET * 10, frames.next())
+                .await
+                .is_err(),
+            "failures after the first frame must keep retrying, not end the stream"
+        );
     }
 }

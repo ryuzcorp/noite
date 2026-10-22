@@ -284,15 +284,32 @@ const relayOnce = async ({
       relayCtl.signal
     );
 
+    // An upstream that ends on its own before any frame (the runner's own
+    // first-frame bound, a restart) ends the wait too: the topic reopens
+    // after the usual backoff instead of sitting out this bound. Its error
+    // surfaces from `await relayed` below.
+    let ended = false;
+
+    const relayEnded = (async (): Promise<void> => {
+      try {
+        await relayed;
+      } catch {
+        // Reported by `await relayed` below; here it only ends the race.
+      } finally {
+        ended = true;
+      }
+    })();
+
     await Promise.race([
       first,
+      relayEnded,
       sleepUnlessAborted(
         retry.firstFrameMs ?? DEFAULT_FIRST_FRAME_MS,
         stream.signal
       ),
     ]);
 
-    if (!delivered && !stream.signal.aborted) {
+    if (!(delivered || ended || stream.signal.aborted)) {
       console.error("stream hub: topic stalled before its first frame", topic);
       stopRelay();
     }
