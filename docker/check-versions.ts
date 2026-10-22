@@ -75,6 +75,10 @@ for (const [name, pattern] of [
   ["node", /ARG NODE_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
   ["jup", /ARG JUP_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
   ["jup digest", /ARG JUP_SHA512=(?<version>[0-9a-f]{128})/gu],
+  ["npm", /ARG NPM_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
+  ["npm digest", /ARG NPM_SHA512=(?<version>[0-9a-f]{128})/gu],
+  ["pnpm", /ARG PNPM_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
+  ["pnpm digest", /ARG PNPM_SHA512=(?<version>[0-9a-f]{128})/gu],
 ] as const) {
   const versions = [...dockerfile.matchAll(pattern)].map(
     (m) => m.groups?.version ?? ""
@@ -85,6 +89,40 @@ for (const [name, pattern] of [
   } else {
     fail(
       `${name}: docker/Dockerfile must pin exactly once (found ${versions.length}: ${versions.join(", ")})`
+    );
+  }
+}
+
+// The bundled package managers: the Dockerfile pins must name the same
+// exact releases the runner resolves unpinned projects to
+// (`BUNDLED_*_VERSION` in apps/runner/src/host/package_manager.rs), or an
+// unpinned deploy seeds one release and asks jup for another.
+const packageManager = read("apps/runner/src/host/package_manager.rs");
+
+for (const [name, dockerPattern, runnerPattern] of [
+  [
+    "npm",
+    /ARG NPM_VERSION=(?<version>\d+\.\d+\.\d+)/u,
+    /pub const BUNDLED_NPM_VERSION: &str = "(?<version>[^"]+)"/u,
+  ],
+  [
+    "pnpm",
+    /ARG PNPM_VERSION=(?<version>\d+\.\d+\.\d+)/u,
+    /pub const BUNDLED_PNPM_VERSION: &str = "(?<version>[^"]+)"/u,
+  ],
+] as const) {
+  const dockerPin = dockerPattern.exec(dockerfile)?.groups?.version ?? "";
+  const runnerPin = runnerPattern.exec(packageManager)?.groups?.version ?? "";
+
+  if (!dockerPin || !runnerPin) {
+    fail(
+      `${name}: missing pin (docker/Dockerfile=${dockerPin}, runner=${runnerPin})`
+    );
+  } else if (dockerPin === runnerPin) {
+    console.log(`${name}: bundled ${dockerPin} (image and runner agree)`);
+  } else {
+    fail(
+      `${name}: docker/Dockerfile pins ${dockerPin} but the runner bundles ${runnerPin}`
     );
   }
 }

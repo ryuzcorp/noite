@@ -21,13 +21,11 @@ Tools whose launcher asks for Node (`vite`, `rsbuild`) get the image's Node 24. 
 
 ## Package managers
 
-npm, pnpm, Yarn (1 and 2+) and Bun all work. The runner picks one per push:
-
 1. **A pin in `package.json`** — `"packageManager": "pnpm@10.18.0"` or `devEngines.packageManager` with a `version`. That exact release runs, Bun included.
-2. **No pin, a lockfile** — the manager that wrote it: `bun.lock`/`bun.lockb` → Bun, `pnpm-lock.yaml` → pnpm (the major its `lockfileVersion` needs), `yarn.lock` → Yarn 1 for a v1 lockfile, else the latest Yarn, `package-lock.json`/`npm-shrinkwrap.json` → npm.
+2. **No pin, a lockfile** — the manager that wrote it: `bun.lock`/`bun.lockb` → Bun, `pnpm-lock.yaml` → pnpm (the bundled release for `lockfileVersion: 9.0`, the matching major for older formats), `yarn.lock` → Yarn 1 for a v1 lockfile, else the latest Yarn, `package-lock.json`/`npm-shrinkwrap.json` → npm (the bundled release).
 3. **Neither** — Bun.
 
-Bun ships in the image. Every other manager, and a pinned Bun, runs through [jup](https://github.com/unjs/jup), which downloads the release on first use, verifies it against the registry signature, and keeps it in your app's build cache (`RUNNER_BUILD_CACHE_MB`), so later pushes do not download it again. `npm`, `pnpm` and `yarn` are also on `PATH`, so package scripts and the `release` command can call them; unpinned, they follow the same choice as the install step.
+Bun, npm and pnpm ship in the image. A pinned manager, a pinned Bun, and Yarn run through [jup](https://github.com/unjs/jup), which downloads the release on first use, verifies it against the registry signature, and keeps it in your app's build cache (`RUNNER_BUILD_CACHE_MB`), so later pushes do not download it again. An unpinned npm or pnpm project runs the bundled release straight from the image, with no registry request for the manager itself; bumping a bundled release is an image release. `npm`, `pnpm` and `yarn` are also on `PATH`, so package scripts and the `release` command can call them; unpinned, they follow the same choice as the install step.
 
 With `CI=1`, pnpm installs with `--frozen-lockfile` and Yarn 2+ with `--immutable`, so a lockfile that no longer matches `package.json` fails the install. pnpm 10 and later also fail on dependency build scripts you have not approved (`ERR_PNPM_IGNORED_BUILDS`): decide them in `pnpm-workspace.yaml`, for example `allowBuilds: { esbuild: false, workerd: false }` for a Cloudflare Vite app, which needs neither. Pin a version to make builds repeatable; the runner never edits your `package.json`. The deploy log names the manager and why: `▸ install: pnpm install (pnpm-lock.yaml)`.
 

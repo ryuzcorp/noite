@@ -1,22 +1,35 @@
 //! Which package manager installs and builds a tenant project (SPEC, Package
 //! managers).
 //!
-//! bun ships in the image and stays the default. Everything else runs through
-//! jup (https://github.com/unjs/jup), which downloads the manager into the
-//! app's own cache, verifies it against the registry signature, and runs it:
+//! bun ships in the image and stays the default. npm and pnpm ship in the
+//! image too (`/opt/jup-bundled`, seeded into each app's `JUP_HOME` at deploy
+//! time). Everything else runs through jup (https://github.com/unjs/jup),
+//! which downloads the manager into the app's own cache, verifies it against
+//! the registry signature, and runs it:
 //!
 //! 1. A pin in package.json (`packageManager`, `devEngines.packageManager`):
 //!    jup runs exactly that, bun included.
 //! 2. No pin, a lockfile: the manager that wrote it. jup does not guess from
 //!    lockfiles, so the runner hands it a spec file (`JUP_SPEC_FILE`, outside
-//!    the tree) naming the manager and the major the lockfile needs. The same
-//!    spec reaches `npm`/`pnpm`/`yarn` called from package scripts through
-//!    the image's jup shims.
+//!    the tree) naming the manager and the exact bundled release for npm and
+//!    `lockfileVersion: 9.0` pnpm (an installed exact version runs with no
+//!    registry request), the matching major for older pnpm formats, `^1` for
+//!    a `# yarn lockfile v1` file else latest Yarn. The same spec reaches
+//!    `npm`/`pnpm`/`yarn` called from package scripts through the image's jup
+//!    shims.
 //! 3. Neither: bun.
 
 use std::path::Path;
 
 use serde_json::{json, Value};
+
+/// npm bundled in the image (`docker/Dockerfile` `NPM_VERSION`, seeded from
+/// `/opt/jup-bundled` into each app's `JUP_HOME` at deploy time).
+/// `docker/check-versions.ts` asserts it matches the Dockerfile pin.
+pub const BUNDLED_NPM_VERSION: &str = "12.2.1";
+/// pnpm bundled in the image (`docker/Dockerfile` `PNPM_VERSION`).
+/// `docker/check-versions.ts` asserts it matches the Dockerfile pin.
+pub const BUNDLED_PNPM_VERSION: &str = "12.15.0";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PackageManager {
@@ -63,6 +76,21 @@ impl PackageManager {
         let version = self.spec_version?;
         Some(json!({ "devEngines": { "packageManager": { "name": self.name, "version": version } } }).to_string())
     }
+
+    /// `(name, version)` the image bundles, when the spec names a bundled
+    /// exact release; `None` for a range jup must still resolve (older pnpm
+    /// majors, Yarn) or a project pin. An exact version jup already has
+    /// installed runs with no registry request, so unpinned npm/pnpm projects
+    /// never download their manager.
+    pub fn bundled(&self) -> Option<(&str, &str)> {
+        let version = self.spec_version?;
+        match (self.name.as_str(), version) {
+            ("npm", BUNDLED_NPM_VERSION) | ("pnpm", BUNDLED_PNPM_VERSION) => {
+                Some((self.name.as_str(), version))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The package manager for the project at `src_dir` with manifest `package`.
@@ -101,7 +129,7 @@ pub fn detect(src_dir: &Path, package: &Value) -> PackageManager {
     }
     for lock in ["package-lock.json", "npm-shrinkwrap.json"] {
         if src_dir.join(lock).is_file() {
-            return unpinned("npm", lock, "*");
+            return unpinned("npm", lock, BUNDLED_NPM_VERSION);
         }
     }
     PackageManager::bun("default")
@@ -144,9 +172,11 @@ fn lockfile_head(path: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&buf[..n]).into_owned())
 }
 
-/// The pnpm major a `pnpm-lock.yaml` format needs (jup's own table; newer
-/// pnpm rewrites an older lockfile and `--frozen-lockfile`, the CI default,
-/// then fails).
+/// The pnpm jup should run for a `pnpm-lock.yaml` format: the bundled exact
+/// release for `9.0` (what every supported pnpm writes today), the matching
+/// major for older formats (newer pnpm rewrites an older lockfile and
+/// `--frozen-lockfile`, the CI default, then fails). Unknown formats keep
+/// today's behavior (the registry's newest).
 fn pnpm_range(head: &str) -> &'static str {
     let version = head
         .lines()
@@ -154,6 +184,7 @@ fn pnpm_range(head: &str) -> &'static str {
         .map(|v| v.trim().trim_matches(['\'', '"']))
         .unwrap_or("");
     match version {
+        "9.0" => BUNDLED_PNPM_VERSION,
         "6.0" | "6.1" => "^8",
         "5.4" => "^7",
         "5.3" => "^6",
@@ -228,9 +259,11 @@ mod tests {
             (pm.name.as_str(), pm.reason.as_str()),
             ("pnpm", "pnpm-lock.yaml")
         );
+        // A lockfile-9 project names the bundled pnpm exactly, so jup runs it
+        // with no registry request (flake B).
         assert_eq!(
             spec(&pm).unwrap()["devEngines"]["packageManager"],
-            json!({ "name": "pnpm", "version": "*" })
+            json!({ "name": "pnpm", "version": BUNDLED_PNPM_VERSION })
         );
 
         let pnpm8 = project("pnpm8", &[("pnpm-lock.yaml", "lockfileVersion: '6.0'\n")]);
@@ -263,6 +296,12 @@ mod tests {
         let pm = detect(&npm, &json!({}));
         assert_eq!(pm.name, "npm");
         assert_eq!(pm.install(), ("jup", vec!["install"]));
+        // An npm-lockfile project names the bundled npm exactly, so jup runs
+        // it with no registry request (flake B).
+        assert_eq!(
+            spec(&pm).unwrap()["devEngines"]["packageManager"]["version"],
+            BUNDLED_NPM_VERSION
+        );
     }
 
     #[test]
@@ -284,5 +323,31 @@ mod tests {
         assert_eq!(pnpm_range("lockfileVersion: \"5.3\"\n"), "^6");
         assert_eq!(pnpm_range("lockfileVersion: 5.1\n"), "^5");
         assert_eq!(pnpm_range("garbage"), "*");
+    }
+
+    #[test]
+    fn only_bundled_specs_seed() {
+        let dir = project("bundled", &[("pnpm-lock.yaml", "lockfileVersion: '9.0'\n")]);
+        assert_eq!(
+            detect(&dir, &json!({})).bundled(),
+            Some(("pnpm", BUNDLED_PNPM_VERSION))
+        );
+        let dir = project("bundled-npm", &[("package-lock.json", "{}")]);
+        assert_eq!(
+            detect(&dir, &json!({})).bundled(),
+            Some(("npm", BUNDLED_NPM_VERSION))
+        );
+        let dir = project(
+            "old-pnpm",
+            &[("pnpm-lock.yaml", "lockfileVersion: '6.0'\n")],
+        );
+        assert_eq!(detect(&dir, &json!({})).bundled(), None);
+        let dir = project("pinned", &[("pnpm-lock.yaml", "lockfileVersion: '9.0'\n")]);
+        assert_eq!(
+            detect(&dir, &json!({ "packageManager": "pnpm@9.15.0" })).bundled(),
+            None
+        );
+        let dir = project("bun", &[]);
+        assert_eq!(detect(&dir, &json!({})).bundled(), None);
     }
 }
