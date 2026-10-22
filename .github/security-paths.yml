@@ -10,71 +10,71 @@
 # secret handling, or the integrity of what gets deployed or reviewed.
 sensitive:
   # Scoped credentials: minting, storage and enforcement. A bug here forges or
-  - 'apps/runner/src/host/credentials/**'
-  - 'apps/runner/src/host/credentials*'
-  - 'apps/runner/src/db/credentials.rs'
-  - 'apps/runner/src/db/ingest_keys.rs'
+  - "apps/runner/src/host/credentials/**"
+  - "apps/runner/src/host/credentials*"
+  - "apps/runner/src/db/credentials.rs"
+  - "apps/runner/src/db/ingest_keys.rs"
 
   # Authentication and authorization: bearer gating and roles (runner),
   # the route table that decides what is exposed and what auth wraps it,
   # collaborator gating on git push, and the preview-environment access gate.
-  - 'apps/runner/src/auth.rs'
-  - 'apps/runner/src/api/router.rs'
-  - 'apps/runner/src/host/git_identity.rs'
-  - 'apps/runner/src/host/git_policy.rs'
-  - 'apps/runner/src/host/env_gate.rs'
+  - "apps/runner/src/auth.rs"
+  - "apps/runner/src/api/router.rs"
+  - "apps/runner/src/host/git_identity.rs"
+  - "apps/runner/src/host/git_policy.rs"
+  - "apps/runner/src/host/env_gate.rs"
 
   # Auth, sessions and passkeys in the control UI, including every route
   # middleware (pod-host gate, rate limiter, request timeout): the code that
   # decides who the caller is before any action runs.
-  - 'apps/noite/src/lib/auth/**'
-  - 'apps/noite/src/lib/auth.ts'
-  - 'apps/noite/src/lib/auth-client.ts'
-  - 'apps/noite/src/http/session.ts'
-  - 'apps/noite/src/http/routes/auth.ts'
-  - 'apps/noite/src/lib/server/session.server.ts'
-  - 'apps/noite/src/middleware/**'
+  - "apps/noite/src/lib/auth/**"
+  - "apps/noite/src/lib/auth.ts"
+  - "apps/noite/src/lib/auth-client.ts"
+  - "apps/noite/src/http/session.ts"
+  - "apps/noite/src/http/routes/auth.ts"
+  - "apps/noite/src/lib/server/session.server.ts"
+  - "apps/noite/src/middleware/**"
 
   # Sandboxed execution and tenant isolation: what a build or fleet process
   # can reach, and the uid/cgroup/memory containment around it.
-  - 'apps/runner/src/host/exec.rs'
-  - 'apps/runner/src/host/isolation.rs'
-  - 'apps/runner/src/host/netisolation.rs'
-  - 'apps/runner/src/host/cgroups.rs'
-  - 'apps/runner/src/db/alloc.rs'
+  - "apps/runner/src/host/exec.rs"
+  - "apps/runner/src/host/isolation.rs"
+  - "apps/runner/src/host/netisolation.rs"
+  - "apps/runner/src/host/cgroups.rs"
+  - "apps/runner/src/db/alloc.rs"
 
   # Deletion and purge paths: a change here can strand credentials, fleets or
   # app data, or delete what should survive.
-  - 'apps/runner/src/host/purge.rs'
-  - 'apps/runner/src/host/env_teardown.rs'
+  - "apps/runner/src/host/purge.rs"
+  - "apps/runner/src/host/env_teardown.rs"
 
   # Edge routing: the Caddy route table that maps public hostnames to control,
   # runner and tenant backends. A wrong row exposes an internal service.
-  - 'apps/runner/src/host/edge.rs'
-  - 'apps/runner/src/host/edge_table.rs'
+  - "apps/runner/src/host/edge.rs"
+  - "apps/runner/src/host/edge_table.rs"
 
   # Secrets and environment handling: env loading, per-app/per-environment
   # values, the env-auth route, and the documented secret surface itself.
-  - 'apps/runner/src/config.rs'
-  - 'apps/runner/src/db/env.rs'
-  - 'apps/noite/src/lib/server/env.server.ts'
-  - 'apps/noite/src/lib/server/environments.server.ts'
-  - 'apps/noite/src/http/routes/env-auth.ts'
-  - '.env.example'
-  - 'docker/compose*.yaml'
+  - "apps/runner/src/config.rs"
+  - "apps/runner/src/db/env.rs"
+  - "apps/noite/src/lib/server/env.server.ts"
+  - "apps/noite/src/lib/server/environments.server.ts"
+  - "apps/noite/src/http/routes/env-auth.ts"
+  - ".env.example"
+  - "docker/compose*.yaml"
 
   # The release image and its entrypoints: everything inside the trust
   # boundary ships from here, including the third-party binaries baked in.
-  - 'docker/Dockerfile'
-  - 'docker/dev.sh'
-  - 'docker/install-sidecars.sh'
-  - 'docker/install.sh'
-  - 'docker/uninstall.sh'
-  - 'docker/backup.sh'
-  - 'docker/restore.sh'
+  - "docker/Dockerfile"
+  - "docker/dev.sh"
+  - "docker/install-sidecars.sh"
+  - "docker/install.sh"
+  - "docker/uninstall.sh"
+  - "docker/backup.sh"
+  - "docker/restore.sh"
 
   # The gates themselves: workflows, this list, and the reviewer config.
   # Weakening review or CI silently weakens every path above.
-  - '.github/workflows/**'
-  - '.github/security-paths.yml'
-  - '.coderabbit.yaml'
+  - ".github/workflows/**"
+  - ".github/security-paths.yml"
+  - ".coderabbit.yaml"
