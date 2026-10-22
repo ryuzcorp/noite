@@ -420,6 +420,11 @@ async fn move_fleet_into_group(
             MoveOutcome::Moved
         }
         Err(error) if crate::host::cgroups::is_gone(&error) => {
+            // A leader that forked a worker and then exited lands here: the
+            // worker keeps the group (and the fleet's port) alive uncapped
+            // unless it is signaled too. ESRCH on a fully gone group is
+            // fine, per sigkill_tree's contract.
+            sigkill_tree(pid);
             // Exited between spawn and the move: reap the zombie (a dropped
             // Child only kill()-on-drops its leader) so no pid-table slot
             // leaks on a persistently refusing move.

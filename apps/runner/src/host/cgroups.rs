@@ -116,8 +116,9 @@ fn read_self_cgroup() -> Option<String> {
 /// checks the result.
 #[cfg(unix)]
 fn drain_to_leaf(cgroup: &Path, leaf: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
     let members = std::fs::read_to_string(cgroup.join("cgroup.procs"))
-        .map_err(|e| anyhow::anyhow!("read cgroup.procs: {e}"))?;
+        .with_context(|| format!("read cgroup.procs in {}", cgroup.display()))?;
     for pid in members.split_whitespace() {
         if std::fs::write(leaf.join("cgroup.procs"), pid).is_err() {
             tracing::debug!(pid, "cgroup drain: member exited mid-drain");
@@ -145,11 +146,11 @@ fn blocks_drain(proc_root: &Path, pid: &str) -> bool {
 }
 
 /// Is `cgroup` free of live member processes, so controllers may be
-/// enabled? Entries that raced away do not count.
+/// enabled? Entries that raced away do not count. `proc_root` is `/proc`
+/// in production, injected in tests.
 #[cfg(unix)]
-fn is_drained(cgroup: &Path) -> bool {
+fn is_drained(cgroup: &Path, proc_root: &Path) -> bool {
     let members = std::fs::read_to_string(cgroup.join("cgroup.procs")).unwrap_or_default();
-    let proc_root = Path::new("/proc");
     !members
         .split_whitespace()
         .any(|pid| blocks_drain(proc_root, pid))
@@ -266,9 +267,17 @@ fn ensure_writable(root: &Path, own: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("remount {} refused (multi installs: apply docker/compose.multi.yaml, see the Operator action in CHANGELOG; single installs only warn)", root.display()))
 }
 
+/// Write one cgroup interface file. The OS error stays on the chain
+/// (`with_context`, never a formatted message): the boot loop classifies a
+/// contested enable off `EBUSY` and a dead move target off `ESRCH`, and any
+/// formatting here turns both classifiers into dead code — the exact shape
+/// of the intermittent boot failure (first EBUSY bailed instead of
+/// retrying).
 fn write_file(dir: &Path, name: &str, value: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
     std::fs::write(dir.join(name), value)
-        .map_err(|e| anyhow::anyhow!("write {name} in {}: {e}", dir.display()))
+        .with_context(|| format!("write {name} in {}", dir.display()))?;
+    Ok(())
 }
 
 /// Enable the fleet controllers on `cgroup` and confirm they took: a write
@@ -309,8 +318,9 @@ fn describe(cgroup: &Path) -> String {
 #[cfg(unix)]
 fn enable_controllers(cgroup: &Path) -> anyhow::Result<()> {
     write_file(cgroup, "cgroup.subtree_control", CONTROLLERS)?;
+    use anyhow::Context;
     let enabled = std::fs::read_to_string(cgroup.join("cgroup.subtree_control"))
-        .map_err(|e| anyhow::anyhow!("read cgroup.subtree_control: {e}"))?;
+        .with_context(|| format!("read cgroup.subtree_control in {}", cgroup.display()))?;
     if !enabled
         .split_whitespace()
         .any(|t| t == "+memory" || t == "memory")
@@ -392,28 +402,53 @@ fn setup_inner(root: &Path, placement: &str) -> anyhow::Result<PathBuf> {
     // the runner leaf itself stays private.
     std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o755))
         .with_context(|| format!("chmod {}", anchor.display()))?;
-    // The container cgroup is shared with healthcheck execs at boot: a
-    // one-shot drain loses to a curl that lands mid-drain (observed in the
-    // isolation lane: two curls held the root past a single drain), and a
-    // curl that lands between the final check and the enable fails that too
-    // (EBUSY — observed on Docker). Retry the drain *and* the enable with a
-    // bounded settle; a live squatter past the budget degrades to the shared
-    // cgroup, loudly. Persistent errors fail the same way every attempt
-    // (read-only mounts and missing delegation bail earlier, in
-    // `ensure_writable` and the delegation check), so the loop only spends
-    // its budget on the contested case.
+    // The drain-and-enable below retries a contested enable; see it for why
+    // the only racers left are external.
+    drain_and_enable(
+        &own,
+        &anchor,
+        &leaf,
+        Path::new("/proc"),
+        &enable_controllers,
+        &|| std::thread::sleep(std::time::Duration::from_millis(DRAIN_SETTLE_MS)),
+    )
+}
+
+/// Drain `own` into `leaf` and enable the fleet controllers on the way
+/// down, retrying a contested enable with a bounded settle.
+///
+/// Why a retry is the deterministic answer here, not a loophole: everything
+/// the runner forks after this point inherits the leaf (setup runs before
+/// the first child spawn in `main`), so no runner-spawned process can ever
+/// contest `own`. The only arrivals are external — the orchestrator's
+/// healthcheck execs (`compose.yaml` probes `/ready` every 10 s; `docker
+/// exec` joins the container cgroup by design) — which the runner cannot
+/// prevent, only out-wait. A squatter that outlasts the budget degrades to
+/// the shared cgroup loudly, as before. `enable` and `settle` are seams for
+/// the barrier-driven test, not knobs: production passes the real enable
+/// and the bounded settle.
+#[cfg(unix)]
+fn drain_and_enable(
+    own: &Path,
+    anchor: &Path,
+    leaf: &Path,
+    proc_root: &Path,
+    enable: &dyn Fn(&Path) -> anyhow::Result<()>,
+    settle: &dyn Fn(),
+) -> anyhow::Result<PathBuf> {
+    use anyhow::Context;
     let mut last_error: Option<anyhow::Error> = None;
     for _ in 0..DRAIN_ATTEMPTS {
-        drain_to_leaf(&own, &leaf)?;
-        if is_drained(&own) {
-            match enable_controllers(&own) {
+        drain_to_leaf(own, leaf)?;
+        if is_drained(own, proc_root) {
+            match enable(own) {
                 Ok(()) => {
-                    enable_controllers(&anchor).with_context(|| {
-                        format!("enabling {} ({})", anchor.display(), describe(&own))
+                    enable(anchor).with_context(|| {
+                        format!("enabling {} ({})", anchor.display(), describe(own))
                     })?;
-                    return Ok(anchor);
+                    return Ok(anchor.to_path_buf());
                 }
-                // EBUSY here is a member that landed between the check and
+                // EBUSY here is a member that landed between the drain and
                 // the write (a healthcheck exec) — worth another round.
                 // Anything else fails the same way every attempt: bail at
                 // once instead of burning the whole budget on an
@@ -426,17 +461,17 @@ fn setup_inner(root: &Path, placement: &str) -> anyhow::Result<PathBuf> {
                 }
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(DRAIN_SETTLE_MS));
+        settle();
     }
     match last_error {
         Some(error) => {
-            Err(error).with_context(|| format!("enabling {} ({})", own.display(), describe(&own)))
+            Err(error).with_context(|| format!("enabling {} ({})", own.display(), describe(own)))
         }
         None => {
             anyhow::bail!(
                 "{} still holds live processes after the drain ({})",
                 own.display(),
-                describe(&own)
+                describe(own)
             );
         }
     }
@@ -898,6 +933,142 @@ mod tests {
         assert!(!is_busy(&denied));
         let plain = anyhow::anyhow!("not even io");
         assert!(!is_busy(&plain));
+    }
+
+    #[test]
+    fn cgroup_write_errors_keep_their_os_cause() {
+        let tmp = fakefs();
+        // A directory where the interface file goes: the write is refused
+        // (EISDIR, even as root), exercising the production error path
+        // rather than a hand-built error.
+        let leaf = tmp.path().join("leaf");
+        std::fs::create_dir_all(leaf.join("cgroup.procs")).expect("fake interface dir");
+        let err = write_file(&leaf, "cgroup.procs", "1").expect_err("EISDIR must fail");
+        let code = err
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .filter_map(|io| io.raw_os_error())
+            .next();
+        assert_eq!(
+            code,
+            Some(libc::EISDIR),
+            "the OS cause must survive wrapping: the boot loop classifies EBUSY off this chain, and a formatted-away cause makes every retry check dead code"
+        );
+        // The boot failure shape: an EBUSY wrapped the way production now
+        // wraps it must classify as worth another round, while a permanent
+        // refusal still bails at once.
+        let busy = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EBUSY))
+            .context("write cgroup.subtree_control in /sys/fs/cgroup");
+        assert!(is_busy(&busy), "context-wrapped EBUSY retries");
+        assert!(!is_busy(&err), "EISDIR bails at once");
+    }
+
+    #[test]
+    fn busy_enable_retries_past_a_spawn_racing_init() {
+        use std::sync::{Arc, Barrier, Mutex};
+        let tmp = fakefs();
+        // Fake own cgroup holding one member; fake procfs where it is alive.
+        let own = tmp.path().join("own");
+        let anchor = tmp.path().join("noite");
+        let leaf = anchor.join("runner");
+        std::fs::create_dir_all(&leaf).expect("fake leaf");
+        std::fs::create_dir_all(&own).expect("fake own cgroup");
+        std::fs::write(own.join("cgroup.procs"), "100").expect("fake members");
+        let procfs = fake_proc(&[("100", "100 (runner) R 1"), ("200", "200 (curl) R 1")]);
+        // A spawn racing init: it lands in the root between the drain and
+        // the enable, the way a healthcheck exec lands on a real boot. Two
+        // barriers pin the landing inside that window — no sleeps.
+        let start = Arc::new(Barrier::new(2));
+        let landed = Arc::new(Barrier::new(2));
+        let squatter = {
+            let start = Arc::clone(&start);
+            let landed = Arc::clone(&landed);
+            let members = own.join("cgroup.procs");
+            std::thread::spawn(move || {
+                start.wait();
+                let mut current = std::fs::read_to_string(&members).expect("read members");
+                if !current.split_whitespace().any(|pid| pid == "200") {
+                    current.push_str(" 200");
+                    std::fs::write(&members, current).expect("land the squatter");
+                }
+                landed.wait();
+            })
+        };
+        let own_enables = Mutex::new(0usize);
+        let contested = Mutex::new(String::new());
+        let enable = |target: &Path| -> anyhow::Result<()> {
+            if target != own {
+                return Ok(());
+            }
+            let mut n = own_enables.lock().expect("enable count");
+            *n += 1;
+            if *n == 1 {
+                // First enable: let the spawn land mid-window, then fail
+                // the way the kernel does — EBUSY wrapped exactly like
+                // production wraps it.
+                start.wait();
+                landed.wait();
+                *contested.lock().expect("contested members") =
+                    std::fs::read_to_string(target.join("cgroup.procs")).unwrap_or_default();
+                Err(
+                    anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EBUSY)).context(
+                        format!("write cgroup.subtree_control in {}", target.display()),
+                    ),
+                )
+            } else {
+                Ok(())
+            }
+        };
+        // Settle emulates the kernel: a moved pid leaves the source cgroup,
+        // which a plain file cannot do by itself. No sleeps anywhere.
+        let own_procs = own.join("cgroup.procs");
+        let leaf_procs = leaf.join("cgroup.procs");
+        let settle = || {
+            let moved = std::fs::read_to_string(&leaf_procs).unwrap_or_default();
+            let current = std::fs::read_to_string(&own_procs).unwrap_or_default();
+            let remaining: Vec<&str> = current
+                .split_whitespace()
+                .filter(|pid| !moved.split_whitespace().any(|m| m == *pid))
+                .collect();
+            std::fs::write(&own_procs, remaining.join(" ")).expect("emulate kernel removal");
+        };
+        let anchor_out = drain_and_enable(&own, &anchor, &leaf, procfs.path(), &enable, &settle);
+        match anchor_out {
+            Ok(dir) => {
+                assert_eq!(dir, anchor, "the anchor publishes on success");
+                squatter.join().expect("squatter landed");
+                assert_eq!(
+                    *own_enables.lock().expect("enable count"),
+                    2,
+                    "one contested own enable, then success"
+                );
+                assert!(
+                    contested
+                        .lock()
+                        .expect("contested members")
+                        .split_whitespace()
+                        .any(|pid| pid == "200"),
+                    "the spawn landed inside the drain-to-enable window"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&own_procs).expect("drained members"),
+                    "",
+                    "the next round drained the racer too"
+                );
+                assert!(
+                    std::fs::read_to_string(&leaf_procs)
+                        .expect("leaf members")
+                        .split_whitespace()
+                        .any(|pid| pid == "200"),
+                    "the racer moved into the leaf"
+                );
+            }
+            Err(error) => {
+                // The squatter may still be parked on its barrier: fail
+                // without joining it rather than deadlocking the suite.
+                panic!("a transient squatter must not fail the boot: {error:#}");
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
