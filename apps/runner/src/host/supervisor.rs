@@ -168,9 +168,14 @@ pub async fn stop_fleet(procs: &ProcMap, slug: &str, grace: StopGrace) {
     }
     // A stopped fleet leaves its cgroup behind only when a member outlived
     // the kill: an empty group removes, a live one is reused by the next
-    // spawn (which rewrites the limits). Best-effort either way.
+    // spawn (which rewrites the limits). Best-effort either way. The
+    // removal returns the leaf's high-water RSS first: the leaf vanishes
+    // with the fleet, so a later read could never recover it (D3 sizing
+    // basis in SPEC, Limits).
     if let Some(dir) = crate::host::cgroups::fleet_cgroup_path(slug) {
-        crate::host::cgroups::remove_fleet_cgroup(&dir);
+        if let Some(peak_bytes) = crate::host::cgroups::remove_fleet_cgroup(&dir) {
+            tracing::info!(fleet = slug, peak_bytes, "fleet memory peak at stop");
+        }
     }
     crate::host::cgroups::forget_spawned(slug);
     tracing::info!(slug, "stopped celld");

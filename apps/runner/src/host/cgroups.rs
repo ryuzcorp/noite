@@ -539,12 +539,28 @@ pub fn enter_cgroup(dir: &Path, pid: u32) -> anyhow::Result<()> {
     write_file(dir, "cgroup.procs", &pid.to_string())
 }
 
-/// Drop a stopped fleet's cgroup. Best-effort: only an empty cgroup removes,
-/// so a racing move keeps its directory and the next spawn reuses it.
-pub fn remove_fleet_cgroup(dir: &Path) {
+/// Drop a stopped fleet's cgroup, returning its high-water RSS first.
+/// Best-effort: only an empty cgroup removes, so a racing move keeps its
+/// directory and the next spawn reuses it. The peak is read before the
+/// removal deletes the leaf (and with it `memory.peak`), so a later read
+/// could never recover the number (D3 sizing basis). `None` when the peak
+/// is unreadable — no containment, already gone — so callers log only
+/// `Some` and an unreadable peak is silence, never a wrong number.
+pub fn remove_fleet_cgroup(dir: &Path) -> Option<u64> {
+    let peak = fleet_peak_bytes(dir);
     if std::fs::remove_dir(dir).is_err() {
         tracing::debug!(dir = %dir.display(), "fleet cgroup kept (still populated or gone)");
     }
+    peak
+}
+
+/// High-water RSS of a fleet leaf in bytes (`memory.peak`).
+pub fn fleet_peak_bytes(dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(dir.join("memory.peak"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Path of a fleet's cgroup under the active anchor, for stop-time cleanup.
@@ -799,6 +815,51 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("pids.max")).expect("pids.max"),
             FLEET_PIDS_MAX.to_string()
+        );
+    }
+
+    #[test]
+    fn fleet_peak_reads_before_removal() {
+        let tmp = fakefs();
+        let dir = tmp.path().join("shop");
+        std::fs::create_dir_all(&dir).expect("fake fleet leaf");
+        std::fs::write(dir.join("memory.peak"), "63029248\n").expect("fake peak");
+        // A fake leaf holds a real file, so the kernel-empty precondition
+        // never holds here and the directory stays — like a racing move in
+        // production — but the peak is still returned first.
+        assert_eq!(remove_fleet_cgroup(&dir), Some(63029248));
+        assert!(dir.exists(), "a populated leaf is kept for the next spawn");
+        // An emptied leaf removes, and the peak went out with the call above.
+        std::fs::remove_file(dir.join("memory.peak")).expect("empty the leaf");
+        remove_fleet_cgroup(&dir);
+        assert!(!dir.exists(), "the leaf is removed after the read");
+        assert_eq!(
+            fleet_peak_bytes(&dir),
+            None,
+            "a removed leaf reads as absent"
+        );
+    }
+
+    #[test]
+    fn fleet_peak_absent_without_a_reading() {
+        let tmp = fakefs();
+        assert_eq!(
+            fleet_peak_bytes(&tmp.path().join("never-spawned")),
+            None,
+            "no leaf reads as absent"
+        );
+        let dir = tmp.path().join("uncapped");
+        std::fs::create_dir_all(&dir).expect("fake fleet leaf");
+        assert_eq!(
+            fleet_peak_bytes(&dir),
+            None,
+            "a leaf without memory.peak reads as absent"
+        );
+        std::fs::write(dir.join("memory.peak"), "not-a-number").expect("fake peak");
+        assert_eq!(
+            fleet_peak_bytes(&dir),
+            None,
+            "an unreadable peak never logs a wrong number"
         );
     }
 

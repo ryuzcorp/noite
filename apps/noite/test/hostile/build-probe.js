@@ -321,50 +321,11 @@ try {
   }
 }
 
-// Fleet peak snapshot (D3 sizing basis): per-fleet high-water marks at build
-// time. Measurement only — asserted nowhere as containment, attached to the
-// lane report by hostile.spec. In single tenancy (or with no anchor) the
-// container high-water is the only number available: an upper bound, not a
-// per-fleet peak.
-{
-  const peaks = {};
-
-  try {
-    const { anchor, fleets } = cgroupAnchor();
-
-    for (const name of fleets) {
-      try {
-        peaks[name] = {
-          max: readFileSync(`${anchor}/${name}/memory.max`, "utf-8").trim(),
-          peak: Number(
-            readFileSync(`${anchor}/${name}/memory.peak`, "utf-8").trim()
-          ),
-        };
-      } catch (error) {
-        peaks[name] = { error: error?.code ?? String(error).slice(0, 60) };
-      }
-    }
-
-    if (fleets.length === 0) {
-      peaks._note = "no fleet leaves at build time";
-    }
-  } catch (error) {
-    try {
-      const selfLine = readFileSync("/proc/self/cgroup", "utf-8")
-        .split("\n")
-        .find((line) => line.startsWith("0::"));
-
-      const own = (selfLine ?? "").slice(3) || "/";
-      peaks._container = Number(
-        readFileSync(`/sys/fs/cgroup${own}/memory.peak`, "utf-8").trim()
-      );
-    } catch {
-      peaks._error = String(error).slice(0, 100);
-    }
-  }
-
-  out["fleet-peaks"] = { detail: JSON.stringify(peaks), ok: true };
-}
+// Per-fleet peaks are not sampled here: every stopped fleet logs its
+// high-water RSS (`fleet=… peak_bytes=…` at info) before its cgroup leaf is
+// removed, and the lane merges those lines with the live leaves at suite
+// end into the always-uploaded fleet-peaks.json (docker/e2e-local.sh) —
+// a build-time point sample is redundant next to that.
 
 mkdirSync("dist", { recursive: true });
 
