@@ -164,8 +164,7 @@ deny("read:sibling-build-cache", () => {
 // fleet group carries a positive `memory.max`, read by the sandboxed build
 // itself from the shared anchor. The build runs in the runner's leaf
 // (`.../noite/runner`), so the anchor is its parent; every sibling directory
-// is a live tenant fleet. Throws (ok: false) when cgroups are inactive (no
-// anchor) or a fleet runs uncapped.
+// is a live tenant fleet.
 const cgroupAnchor = () => {
   const selfLine = readFileSync("/proc/self/cgroup", "utf-8")
     .split("\n")
@@ -187,6 +186,9 @@ const cgroupAnchor = () => {
   return { anchor, fleets };
 };
 
+// The positive probe: every live fleet carries a positive `memory.max`.
+// Throws (ok: false) when cgroups are inactive (no anchor) or a fleet runs
+// uncapped.
 try {
   const { anchor, fleets } = cgroupAnchor();
 
@@ -215,24 +217,43 @@ try {
     detail: String(error).slice(0, 200),
     ok: false,
   };
+}
 
-  // Tamper probes are the negative half of the cgroup story: every write a
-  // tenant build attempts against the cgroupfs must fail. A success
-  // (ok: true) is a containment hole and fails the lane. Writes that would
-  // change state are written back verbatim (memory.max, swap.max), so even a
-  // miss is a no-op for the lane.
+// Tamper probes are the negative half of the cgroup story and always run,
+// win or lose above: every write a tenant build attempts against the
+// cgroupfs must fail, and a success (ok: true) is a containment hole that
+// fails the lane. Writes that would change state are written back verbatim,
+// so even a miss is a no-op for the lane. With no anchor or no fleet leaves
+// there is nothing to write against; the probes record that shape instead
+// of crashing the build (the positive probe above already fails the lane).
+{
+  const names = [
+    "tamper:write-memory-max",
+    "tamper:write-memory-swap-max",
+    "tamper:move-to-anchor",
+    "tamper:mkdir-fleet-child",
+    "tamper:subtree-control",
+  ];
+
+  let anchor = null;
+  let fleets = [];
+
   try {
-    const { anchor, fleets } = cgroupAnchor();
-
-    if (fleets.length === 0) {
-      throw new Error("no sibling fleet group to probe writes against", {
-        cause: error,
-      });
+    ({ anchor, fleets } = cgroupAnchor());
+  } catch (error) {
+    for (const name of names) {
+      out[name] = { detail: String(error).slice(0, 200), ok: false };
     }
+  }
 
-    const leaf = `${anchor}/${fleets[0]}`;
+  if (anchor !== null) {
+    const leaf = fleets.length > 0 ? `${anchor}/${fleets[0]}` : null;
 
     deny("tamper:write-memory-max", () => {
+      if (leaf === null) {
+        throw new Error("no fleet leaf to probe");
+      }
+
       const path = `${leaf}/memory.max`;
       const current = readFileSync(path, "utf-8");
       writeFileSync(path, current);
@@ -240,6 +261,10 @@ try {
       return "memory.max writable";
     });
     deny("tamper:write-memory-swap-max", () => {
+      if (leaf === null) {
+        throw new Error("no fleet leaf to probe");
+      }
+
       const path = `${leaf}/memory.swap.max`;
       const current = readFileSync(path, "utf-8");
       writeFileSync(path, current);
@@ -252,6 +277,10 @@ try {
       return "anchor cgroup.procs writable";
     });
     deny("tamper:mkdir-fleet-child", () => {
+      if (leaf === null) {
+        throw new Error("no fleet leaf to probe");
+      }
+
       mkdirSync(`${leaf}/noite-tamper-probe`);
 
       return "mkdir under fleet leaf writable";
@@ -261,19 +290,6 @@ try {
 
       return "subtree_control writable";
     });
-  } catch (error_) {
-    // No anchor, no fleet leaves: the tamper probes have nothing to write
-    // against. The positive probe above already fails the lane in that
-    // case; record the same shape here instead of crashing the build.
-    for (const name of [
-      "tamper:write-memory-max",
-      "tamper:write-memory-swap-max",
-      "tamper:move-to-anchor",
-      "tamper:mkdir-fleet-child",
-      "tamper:subtree-control",
-    ]) {
-      out[name] = { detail: String(error_).slice(0, 200), ok: false };
-    }
   }
 }
 
