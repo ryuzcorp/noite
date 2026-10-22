@@ -35,10 +35,10 @@ export const setLimits = apiAction(
   LimitArgs,
   async ({ appId, appRpm, clientRpm, memoryMb }, { env, request }) => {
     const user = await sessionUser(request, env);
-    await requireAppRole(appId, user.id, "admin");
+    const { role } = await requireAppRole(appId, user.id, "admin");
 
     try {
-      return await runnerSetLimits(appId, clientRpm, appRpm, memoryMb);
+      return await runnerSetLimits(appId, clientRpm, appRpm, memoryMb, role);
     } catch (error) {
       failUnknown(error);
     }
