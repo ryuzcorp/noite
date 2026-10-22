@@ -412,12 +412,16 @@ pub async fn tick(
                 if requests.is_pending(&trace_id) {
                     db::backfill_error_request(
                         pool,
+                        &l.app_id,
+                        &l.environment_id,
                         &trace_id,
-                        &ctx.method,
-                        &ctx.path,
-                        ctx.status,
-                        ctx.browser,
-                        ctx.os,
+                        &db::ErrorRequest {
+                            method: &ctx.method,
+                            path: &ctx.path,
+                            http_status: ctx.status,
+                            browser: ctx.browser,
+                            os: ctx.os,
+                        },
                     )
                     .await?;
                     requests.clear_pending(&trace_id);

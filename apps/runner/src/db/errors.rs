@@ -199,29 +199,45 @@ pub async fn insert_error_event(pool: &SqlitePool, e: &NewErrorEvent<'_>) -> sql
     Ok(())
 }
 
+/// The request columns a late access-log line attaches to an occurrence.
+pub struct ErrorRequest<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub http_status: i64,
+    pub browser: &'a str,
+    pub os: &'a str,
+}
+
 /// Attach a late access-log line to an already-stored occurrence: fill the
 /// request columns only where the ingesting tick found no request (a span
 /// ingested before its access line was tailed). Never overwrites a context
 /// the ingest captured. Returns the rows healed.
+///
+/// Scoped to the line's own app and environment and to telemetry
+/// occurrences (`uncaught`, `logged`): an SDK or browser event carries a
+/// caller-supplied trace id and its own URL-derived path, and another
+/// app's occurrence sharing the trace id must never receive this app's
+/// request.
 pub async fn backfill_error_request(
     pool: &SqlitePool,
+    app_id: &str,
+    environment_id: &str,
     trace_id: &str,
-    method: &str,
-    path: &str,
-    http_status: i64,
-    browser: &str,
-    os: &str,
+    request: &ErrorRequest<'_>,
 ) -> sqlx::Result<u64> {
     let res = sqlx::query(
         "UPDATE metrics.app_error_event \
          SET method = ?, path = ?, http_status = ?, browser = ?, os = ? \
-         WHERE trace_id = ? AND method = ''",
+         WHERE app_id = ? AND environment_id = ? AND trace_id = ? AND method = '' \
+           AND source IN ('uncaught', 'logged')",
     )
-    .bind(method)
-    .bind(path)
-    .bind(http_status)
-    .bind(browser)
-    .bind(os)
+    .bind(request.method)
+    .bind(request.path)
+    .bind(request.http_status)
+    .bind(request.browser)
+    .bind(request.os)
+    .bind(app_id)
+    .bind(environment_id)
     .bind(trace_id)
     .execute(pool)
     .await?;

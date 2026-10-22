@@ -828,6 +828,100 @@ async fn a_late_access_line_backfills_the_stored_occurrence() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The backfill heals only the pending telemetry occurrence of the line's own
+/// app and environment. An SDK event carrying the same (caller-supplied)
+/// trace id keeps its own URL-derived path, and another app's occurrence
+/// with that trace id never receives this app's request.
+#[tokio::test]
+async fn the_backfill_never_touches_sdk_or_foreign_occurrences() {
+    let (pool, dir) = test_pool("late-request-scope").await;
+    let mut state = new_state();
+    let keys = FleetKeys {
+        ids: slug_id(),
+        envs: slug_env(),
+        shas: HashMap::new(),
+    };
+    commit_chunk(
+        &pool,
+        &mut state,
+        &keys,
+        &[("blog".to_string(), H, H + HOUR_US)],
+        error_rows("t-shared"),
+        0,
+    )
+    .await
+    .expect("commit the span");
+    for (app_id, source, path) in [("app1", "sdk", "/from-sdk"), ("app2", "uncaught", "")] {
+        crate::db::insert_error_event(
+            &pool,
+            &crate::db::NewErrorEvent {
+                app_id,
+                environment_id: "",
+                fingerprint: "other",
+                ts_us: H + 2_000_000,
+                trace_id: "t-shared",
+                source,
+                handler: "",
+                cell: "",
+                kind: "Error",
+                message: "other",
+                context: "",
+                frames: "[]",
+                logs: "[]",
+                method: "",
+                path,
+                http_status: 0,
+                browser: "",
+                os: "",
+                sha: "",
+                url: "",
+                release: "",
+                environment: "",
+            },
+        )
+        .await
+        .expect("seed a same-trace occurrence");
+    }
+    let log = dir.join("access.log");
+    std::fs::write(&log, format!("{}\n", access_log_line("t-shared"))).expect("log line");
+    let mut cfg = crate::config::config_for_tests();
+    cfg.caddy_access_log = log.to_string_lossy().into_owned();
+    crate::host::accesslog::tick(&pool, &cfg, &slug_id(), &slug_env(), &mut state.requests)
+        .await
+        .expect("tail the late line");
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT app_id, source, method, path FROM metrics.app_error_event ORDER BY app_id, source",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("error events");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "app1".to_string(),
+                "sdk".to_string(),
+                String::new(),
+                "/from-sdk".to_string()
+            ),
+            (
+                "app1".to_string(),
+                "uncaught".to_string(),
+                "POST".to_string(),
+                "/boom".to_string()
+            ),
+            (
+                "app2".to_string(),
+                "uncaught".to_string(),
+                String::new(),
+                String::new()
+            ),
+        ],
+        "only app1's pending telemetry occurrence takes the request"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// The same join in the other order: a tailed line is already in the index
 /// when the span ingests, so the occurrence stores its request directly.
 #[tokio::test]

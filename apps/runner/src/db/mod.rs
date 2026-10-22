@@ -60,7 +60,8 @@ pub use environments::{
 pub use errors::{
     backfill_error_request, count_error_issues, get_error_issue, insert_error_event,
     list_error_events, list_error_hours, list_error_issues, prune_error_events, prune_errors,
-    refresh_error_issue_count, set_error_hour, set_error_status, upsert_error_issue, NewErrorEvent,
+    refresh_error_issue_count, set_error_hour, set_error_status, upsert_error_issue, ErrorRequest,
+    NewErrorEvent,
 };
 pub use events::{
     get_app_user_props, inc_app_insight, insert_app_event, list_app_channels, list_app_events,
