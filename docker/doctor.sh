@@ -99,8 +99,10 @@ fi
 # runs in its own group with its own `memory.max`. Inactive shares the
 # container cgroup, and a multi install stays at 503 on /ready above until
 # the operator applies the multi grant — so the failure names the fix.
-if printf '%s' "$ready" | grep -q '"cgroups":{"active":true}'; then
-  echo "ok   per-fleet cgroups ($(printf '%s' "$ready" | grep -o '"detail":"[^"]*"' | head -1))"
+cgroups_active="$(printf '%s' "$ready" | sed -n 's/.*"cgroups":{"active":\([^,}]*\).*/\1/p')"
+cgroups_detail="$(printf '%s' "$ready" | sed -n 's/.*"cgroups":{[^}]*"detail":"\([^"]*\)".*/\1/p')"
+if [ "$cgroups_active" = "true" ]; then
+  echo "ok   per-fleet cgroups (${cgroups_detail:-no detail})"
 else
   echo "WARN per-fleet cgroups inactive (fleets share the container cgroup)"
   echo "     fix for multi installs: layer the cgroup grant and recreate:"

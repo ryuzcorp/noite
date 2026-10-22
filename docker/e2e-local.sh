@@ -140,6 +140,18 @@ while [ "$attempt" -lt 100 ]; do
         echo "error: noite-runner recover did not mint a code"
         rc=1
       fi
+
+    if [ "$rc" -eq 0 ] && [ "$E2E_TENANCY" = multi ]; then
+      # The multi lane proves containment end to end, so doctor must name
+      # the live cgroups — a parser that never matches the /ready body
+      # would pass the boot gate while printing the inactive warning.
+      if sh docker/doctor.sh 2>&1 | grep -q '^ok   per-fleet cgroups'; then
+        echo "ok   lane doctor names the live per-fleet cgroups"
+      else
+        echo "error: multi lane doctor names no live per-fleet cgroups"
+        rc=1
+      fi
+    fi
     if [ "$rc" -eq 0 ]; then
       # The edge static config is written once at boot; app events only push
       # the route table through Caddy's admin API, never reloading. Any
