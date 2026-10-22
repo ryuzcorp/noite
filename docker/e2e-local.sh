@@ -104,10 +104,28 @@ $CE2E up -d $UP_FLAGS
 
 echo "==> wait for the stack to serve (5 min)"
 attempt=0
+# Every boot-gate doctor run, passing or not, for the snapshot-parser check
+# below: on a fresh boot no snapshot has uploaded yet (`last_upload_secs_ago`
+# is JSON null), which is exactly the body the old parser rendered as
+# "last upload nulls ago".
+doctor_poll_log="$(mktemp)"
 # Same 5-minute budget, checked every 3 s: the stack is usually up within
 # seconds of the first failed check.
 while [ "$attempt" -lt 100 ]; do
-  if sh docker/doctor.sh; then
+  if doctor_out="$(sh docker/doctor.sh 2>&1)"; then
+    printf '%s\n' "$doctor_out"
+    printf '%s\n' "$doctor_out" >>"$doctor_poll_log"
+    # The snapshot parser must render a null age as "no upload yet": the
+    # literal "null" in the /ready body used to print "last upload nulls
+    # ago". Checked over every attempt so a fresh boot (no upload yet)
+    # fails before the doctor fix and passes after it.
+    if grep -q "nulls ago" "$doctor_poll_log"; then
+      echo "error: doctor printed an unparsed snapshot age"
+      # shellcheck disable=SC2086
+      $CE2E down --remove-orphans >/dev/null 2>&1 || true
+      rm -f "$doctor_poll_log"
+      exit 1
+    fi
     echo "==> playwright e2e"
     # `set -e` would abort on a failing suite and skip the teardown below,
     # leaving the stack holding the host ports; capture the status instead.
@@ -164,6 +182,18 @@ while [ "$attempt" -lt 100 ]; do
       fi
     fi
     if [ "$rc" -eq 0 ]; then
+      # The snapshot parser must stay in sync with /ready: a parser that
+      # never matches would print no snapshot line while the boot gate
+      # passes (mirrors the cgroups check above; the null-age shape is
+      # covered by the boot-gate check).
+      if sh docker/doctor.sh 2>&1 | grep -qE '^(ok|WARN) +state snapshot'; then
+        echo "ok   lane doctor names the snapshot status"
+      else
+        echo "error: lane doctor names no snapshot status"
+        rc=1
+      fi
+    fi
+    if [ "$rc" -eq 0 ]; then
       # The edge static config is written once at boot; app events only push
       # the route table through Caddy's admin API, never reloading. Any
       # Caddy reload after boot (a second static write, "servers shutting
@@ -204,21 +234,47 @@ while [ "$attempt" -lt 100 ]; do
       fi
     fi
     fi
-    # Fleet peak snapshot (D3 sizing basis): per-leaf high-waters at suite end
-    # plus the container high-water (the single-lane number), appended to the
-    # always-uploaded report. Best-effort: never fails the lane.
+    # Fleet peak aggregation (D3 sizing basis in SPEC, Limits): every stopped
+    # fleet logs `fleet=… peak_bytes=…` at info before its cgroup leaf is
+    # removed, and the live leaves are read here at suite end. The merged
+    # per-fleet maxima land in the always-uploaded report as
+    # fleet-peaks.json, next to the human-readable lane-stats.txt lines.
+    # Only tenant fleets count: the `runner` leaf holds the platform itself
+    # (runner, Caddy, the control fleet), not a tenant footprint.
+    # Best-effort: never fails the lane.
     {
       echo "==> fleet peaks at suite end"
       # shellcheck disable=SC2016
-      $CE2E exec -T noite sh -c 'for d in /sys/fs/cgroup/noite/*/; do n=$(basename "$d"); if [ -f "$d/memory.peak" ]; then echo "fleet-peak $n peak=$(cat "$d/memory.peak") max=$(cat "$d/memory.max" 2>/dev/null || echo ?)"; fi; done; echo "container-peak $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo unknown)"' 2>/dev/null || echo "peak dump unavailable"
+      $CE2E exec -T noite sh -c 'for d in /sys/fs/cgroup/noite/*/; do n=$(basename "$d"); if [ "$n" = runner ] || [ ! -f "$d/memory.peak" ]; then continue; fi; echo "fleet-peak $n peak=$(cat "$d/memory.peak") max=$(cat "$d/memory.max" 2>/dev/null || echo ?)"; done; echo "container-peak $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo unknown)"' 2>/dev/null || echo "peak dump unavailable"
     } >> apps/noite/playwright-report/lane-stats.txt 2>&1 || true
+    peak_log="$(mktemp)"
+    peak_stripped="$(mktemp)"
+    # shellcheck disable=SC2086
+    $CE2E logs noite >"$peak_log" 2>&1 || true
+    # The runner log carries ANSI escapes around field names and values
+    # (but never inside the message text, which is why the lane's message
+    # greps kept working): strip them before parsing `fleet=`/`peak_bytes=`.
+    sed -e 's/\x1b\[[0-9;]*m//g' "$peak_log" 2>/dev/null >"$peak_stripped" || true
+    grep -a "peak_bytes=" "$peak_stripped" 2>/dev/null | sed -n 's/.*fleet="\{0,1\}\([^" ]*\)"\{0,1\} peak_bytes=\([0-9][0-9]*\).*/\1 \2/p' > apps/noite/playwright-report/fleet-peak-lines.txt || true
+    grep -a "stopped celld" "$peak_stripped" 2>/dev/null > apps/noite/playwright-report/fleet-stop-lines.txt || true
+    {
+      cat apps/noite/playwright-report/fleet-peak-lines.txt 2>/dev/null || true
+      # shellcheck disable=SC2016
+      $CE2E exec -T noite sh -c 'for d in /sys/fs/cgroup/noite/*/; do n=$(basename "$d"); if [ "$n" = runner ] || [ ! -f "$d/memory.peak" ]; then continue; fi; echo "$n $(cat "$d/memory.peak")"; done' 2>/dev/null || true
+    } | awk '$2 ~ /^[0-9]+$/ { if ($2 + 0 > peak[$1]) peak[$1] = $2 + 0 } END { printf "{\n  \"fleet_peaks\": {"; sep = "\n"; for (f in peak) { printf "%s    \"%s\": %d", sep, f, peak[f]; sep = ",\n" } printf "\n  }\n}\n" }' > apps/noite/playwright-report/fleet-peaks.json || true
+    echo "fleet stops: $(grep -ac "stopped celld" "$peak_stripped" 2>/dev/null || echo 0) stop lines, $(wc -l < apps/noite/playwright-report/fleet-peak-lines.txt 2>/dev/null || echo 0) with peaks in the container log"
+    rm -f "$peak_log" "$peak_stripped"
     if [ "${E2E_KEEP:-0}" = 1 ]; then
       echo "==> E2E_KEEP=1: stack left running (project noite-e2e)"
     else
       # shellcheck disable=SC2086
       $CE2E down --remove-orphans >/dev/null 2>&1 || true
     fi
+    rm -f "$doctor_poll_log"
     exit "$rc"
+  else
+    printf '%s\n' "$doctor_out"
+    printf '%s\n' "$doctor_out" >>"$doctor_poll_log"
   fi
   attempt=$((attempt + 1))
   sleep 3

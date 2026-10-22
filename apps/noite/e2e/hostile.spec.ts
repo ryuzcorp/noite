@@ -1,5 +1,3 @@
-import { mkdirSync, writeFileSync } from "node:fs";
-
 import { expect, test } from "@playwright/test";
 import type { APIRequestContext } from "@playwright/test";
 
@@ -208,9 +206,9 @@ test(
     const report = (await res.json()) as ProbeReport;
 
     for (const [name, probe] of Object.entries(report.build.probes)) {
-      // Positive containment and the peak snapshot are asserted/attached
-      // separately below; this loop is the leak check.
-      if (name === "cgroup:fleet-memory-max" || name === "fleet-peaks") {
+      // Positive containment is asserted separately below; this loop is
+      // the leak check.
+      if (name === "cgroup:fleet-memory-max") {
         continue;
       }
 
@@ -224,17 +222,13 @@ test(
     // refused, not merely absent.
     expectTamperProbes(report);
 
-    // D3 sizing basis: per-fleet high-water marks at build time, written
-    // into the always-uploaded lane report (test attachments land in
-    // test-results/, which CI does not upload).
-    mkdirSync(new URL("../playwright-report", import.meta.url), {
-      recursive: true,
-    });
-    writeFileSync(
-      new URL("../playwright-report/fleet-peaks.json", import.meta.url),
-      JSON.stringify(report.build.probes["fleet-peaks"] ?? { missing: true })
-    );
-
+    // D3 sizing basis: per-fleet peaks come from the runner log (`fleet=…
+    // peak_bytes=…` at info on every fleet stop) merged with the live
+    // leaves at suite end into the always-uploaded fleet-peaks.json (see
+    // docker/e2e-local.sh), which covers every fleet across the suite —
+    // including deleted ones whose cgroup leaf is already gone. A
+    // build-time point sample is redundant next to that, so no file is
+    // written here.
     await assertFleetCgroups(request, report);
 
     // The cross-build probe only proves isolation if a sibling app's build

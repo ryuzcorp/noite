@@ -97,15 +97,21 @@ elif [ -n "$sweep_revoked" ] && [ "$sweep_revoked" != "0" ]; then
   echo "ok   orphan credential sweep (revoked total $sweep_revoked)"
 fi
 # State-snapshot health (`/ready` `snapshot`: still the bucket owner, how long
-# ago the last upload finished, the last upload error).
+# ago the last upload finished, the last upload error). A JSON null age means
+# no upload has finished yet (fresh boot): an additive health signal that
+# never fails `/ready`, so it stays `ok`, not a warning.
 snapshot_owner="$(printf '%s' "$ready" | sed -n 's/.*"snapshot":{[^}]*"owner":\([^,}]*\).*/\1/p')"
 snapshot_age="$(printf '%s' "$ready" | sed -n 's/.*"snapshot":{[^}]*"last_upload_secs_ago":\([^,}]*\).*/\1/p')"
 snapshot_err="$(printf '%s' "$ready" | sed -n 's/.*"snapshot":{[^}]*"last_error":"\([^"]*\)".*/\1/p')"
+case "$snapshot_age" in
+  ""|"null") snapshot_age_display="no upload yet" ;;
+  *) snapshot_age_display="last upload ${snapshot_age}s ago" ;;
+esac
 if [ -n "$snapshot_owner" ]; then
   if [ "$snapshot_owner" = "true" ] && [ -z "$snapshot_err" ]; then
-    echo "ok   state snapshot (owner, last upload ${snapshot_age:-?}s ago)"
+    echo "ok   state snapshot (owner, ${snapshot_age_display})"
   else
-    echo "WARN state snapshot (owner=${snapshot_owner}, last upload ${snapshot_age:-?}s ago, error=${snapshot_err:-none})"
+    echo "WARN state snapshot (owner=${snapshot_owner}, ${snapshot_age_display}, error=${snapshot_err:-none})"
   fi
 fi
 # Per-fleet cgroups (SPEC, Tenant isolation): live means every tenant fleet
