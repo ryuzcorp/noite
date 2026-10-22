@@ -11,13 +11,22 @@
 # from the Actions tab runs the chosen suite. They are the release gate too:
 # `images.yml` runs the release suite on every `v*` tag before pushing an
 # image.
+#
+# Labels never start this workflow: `pull_request` has no `labeled`/`unlabeled`
+# trigger on purpose. A label change (security labels, `e2e`) neither starts
+# CI jobs nor cancels the running gate, and a PR opened already carrying
+# `e2e` is a single run. Adding `e2e` to an open PR takes effect on the next
+# push (or close/reopen, or a manual dispatch): push an empty commit if the
+# branch is otherwise done.
 name: ci
 
 on:
   pull_request:
-    # `labeled`: adding the `e2e` label must re-run the gate so the lane
-    # below sees it without another push.
-    types: [opened, synchronize, reopened, labeled]
+    # No `labeled`/`unlabeled`: see above. Reopened still re-runs the gate.
+    types: [opened, synchronize, reopened]
+  # The merge queue runs every job on the merged result, never skipped by
+  # paths, with the release suite on both lanes.
+  merge_group:
   workflow_dispatch:
     inputs:
       suite:
@@ -31,8 +40,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # One in-flight run per PR ref (a push cancels the superseded run). Each
+  # merge-queue entry gets its own group from its head SHA, so queued entries
+  # never cancel each other or a PR's run.
+  group: ci-${{ github.event_name == 'merge_group' && github.sha || github.ref }}
+  # Merge-queue entries must run to completion; PR pushes cancel in progress.
+  cancel-in-progress: ${{ github.event_name != 'merge_group' }}
 
 jobs:
   check:
@@ -116,6 +129,7 @@ jobs:
 
   # Which runtime-code filter decides the automatic fast run. The `e2e` label
   # upgrades a pull request to the release suite; docs-only PRs run no lane.
+  # PR-only: the merge queue runs everything with no paths-filter skip.
   changes:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -145,11 +159,73 @@ jobs:
               - '.github/workflows/e2e.yml'
 
   # Fast on code pull requests, release on the `e2e` label or by hand from the
-  # Actions tab. The lanes live in e2e.yml, which `images.yml` also runs as
-  # the release gate.
+  # Actions tab, always release on merge_group. The lanes live in e2e.yml,
+  # which `images.yml` also runs as the release gate.
   e2e:
     needs: changes
-    if: always() && (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'e2e') || needs.changes.outputs.code == 'true')
+    if: always() && (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'e2e') || needs.changes.outputs.code == 'true')
     uses: ./.github/workflows/e2e.yml
     with:
-      suite: ${{ contains(github.event.pull_request.labels.*.name, 'e2e') && 'release' || inputs.suite || 'fast' }}
+      suite: ${{ (github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, 'e2e')) && 'release' || inputs.suite || 'fast' }}
+
+  # The merge-queue gate (required check, with `security-gate`): fails if any
+  # needed job failed or was cancelled. `skipped` is accepted only where the
+  # paths-filter legitimately skips: docs-only PRs run no lane, and the
+  # `changes` job itself runs on `pull_request` only. On `merge_group` and
+  # `workflow_dispatch` the e2e lanes must be `success`.
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [check, rust, worker, image, changes, e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - name: aggregate job results
+        run: |
+          check_result="${{ needs.check.result }}"
+          rust_result="${{ needs.rust.result }}"
+          worker_result="${{ needs.worker.result }}"
+          image_result="${{ needs.image.result }}"
+          changes_result="${{ needs.changes.result }}"
+          e2e_result="${{ needs.e2e.result }}"
+          event_name="${{ github.event_name }}"
+          fail=0
+          require_success() {
+            if [ "$2" != "success" ]; then
+              echo "::error::$1 must be success, was $2"
+              fail=1
+            fi
+          }
+          require_success check "$check_result"
+          require_success rust "$rust_result"
+          require_success worker "$worker_result"
+          require_success image "$image_result"
+          # The paths-filter job runs on pull_request only; elsewhere it is
+          # legitimately skipped.
+          case "$changes_result" in
+            success|skipped) ;;
+            *) echo "::error::changes must be success or skipped, was $changes_result"; fail=1 ;;
+          esac
+          # Docs-only PRs run no lane; the queue and manual runs must.
+          case "$event_name" in
+            merge_group|workflow_dispatch) require_success e2e "$e2e_result" ;;
+            *) case "$e2e_result" in
+                 success|skipped) ;;
+                 *) echo "::error::e2e must be success or skipped, was $e2e_result"; fail=1 ;;
+               esac ;;
+          esac
+          {
+            echo "## ci-ok: per-job results (${event_name})"
+            echo ""
+            echo "| job | result |"
+            echo "| --- | --- |"
+            echo "| check | ${check_result} |"
+            echo "| rust | ${rust_result} |"
+            echo "| worker | ${worker_result} |"
+            echo "| image | ${image_result} |"
+            echo "| changes | ${changes_result} |"
+            echo "| e2e | ${e2e_result} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+          echo "ci-ok: every needed job met its requirement."
