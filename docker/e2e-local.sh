@@ -104,8 +104,10 @@ fi
 # slot and the lane's own status propagates untouched.
 if [ "$SLOT" = auto ]; then
   for n in 1 2 3 4 5 6 7 8; do
-    flock -o -n -E 99 "/tmp/noite-e2e-lane-${n}.lock" env E2E_LOCK_HELD="$n" E2E_SLOT="$n" "$0" "$@"
-    rc=$?
+    # `|| rc=$?`, never a bare call: under `set -e` a busy slot's 99 would
+    # exit the script before the next slot is tried.
+    rc=0
+    flock -o -n -E 99 "/tmp/noite-e2e-lane-${n}.lock" env E2E_LOCK_HELD="$n" E2E_SLOT="$n" "$0" "$@" || rc=$?
     if [ "$rc" -ne 99 ]; then
       exit "$rc"
     fi
@@ -118,9 +120,11 @@ KEEP_FILE="${LOCK}.keep"
 E2E_LOCK_WAIT="${E2E_LOCK_WAIT:-300}"
 if [ "${E2E_LOCK_HELD:-}" != "$SLOT" ]; then
   echo "==> waiting up to ${E2E_LOCK_WAIT}s for E2E slot ${SLOT} (${LOCK}; E2E_SLOT=auto picks a free slot)"
-  flock -o -w "$E2E_LOCK_WAIT" "$LOCK" env E2E_LOCK_HELD="$SLOT" E2E_SLOT="$SLOT" "$0" "$@"
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
+  # A lock timeout exits 99 (`-E`), apart from the lane's own status: only
+  # a timeout is "busy"; a red lane reports its own failure.
+  rc=0
+  flock -o -w "$E2E_LOCK_WAIT" -E 99 "$LOCK" env E2E_LOCK_HELD="$SLOT" E2E_SLOT="$SLOT" "$0" "$@" || rc=$?
+  if [ "$rc" -eq 99 ]; then
     echo "error: E2E slot ${SLOT} is busy (another lane holds ${LOCK}); E2E_SLOT=auto picks a free slot, E2E_LOCK_WAIT=<s> waits longer"
   fi
   exit "$rc"
@@ -442,6 +446,7 @@ while [ "$attempt" -lt 100 ]; do
       # stale one after a reboot; `down` kills it. Free with:
       # E2E_SLOT=<n> sh docker/e2e-local.sh down (E2E_SLOT=<n> make e2e-down).
       sleep infinity >/dev/null 2>&1 < /dev/null &
+      printf '%s\n' "$!" > "$KEEP_FILE"
       echo "==> E2E_KEEP=1: stack left running (project ${PROJECT}); slot ${SLOT} held by pid $! — free it with E2E_SLOT=${SLOT} sh docker/e2e-local.sh down"
     else
       # shellcheck disable=SC2086
