@@ -18,14 +18,15 @@ description: Quotas, fleet bounds, rate limits, and the scale-to-zero sleep mech
 
 ## Fleet bounds
 
-Every app is its own celld fleet on one host, sharing one cgroup. The bounds stop one account — or one busy app — from owning the machine.
+Every app is its own celld fleet on one host, each in its own cgroup with its own `memory.max`. The bounds stop one account — or one busy app — from owning the machine. A fleet that hits its cap is OOM-killed inside its own group and restarted, and the kill records a tenant-visible `fleet` event and fleet log line (`fleet restarted: memory limit … MiB exceeded (Settings → Limits)`). The cgroups need the multi-only grant (`docker/compose.multi.yaml`); without it fleets share the container cgroup and `multi` stays at 503.
 
 :::warning
-`RUNNER_FLEET_MAX_RSS_MB` is container-wide, not per-app: celld compares it against the greater of its own RSS and the cgroup working set, and every fleet shares the one container cgroup. A per-fleet-sized value closes every fleet's admission gate as soon as the container as a whole passes it. Size it to the container; leave `0` for celld's default (80% of container memory).
+`RUNNER_FLEET_MAX_RSS_MB` stays a container-wide shed threshold even while per-fleet cgroups are active: celld measures the greater of its own RSS and the container-scale cgroup working set, so a per-fleet-sized value closes every fleet's admission gate as soon as the container as a whole passes it (this retired the old 512 default, and replaying it per fleet failed the isolation lane). Size it to the container; leave `0` for celld's default (80% of container memory). Per-fleet containment comes from the kernel's `memory.max`, not from this knob.
 :::
 
 | Knob | Default | Effect |
 | --- | --- | --- |
+| `RUNNER_FLEET_MEMORY_MB` | `512` | Per-fleet `memory.max` in MiB (own cgroup per fleet, plus `pids.max`); overridable per app in Settings → Limits → Fleet memory (applies on next spawn) |
 | `RUNNER_FLEET_MAX_RSS_MB` | `0` | Shed threshold in MiB; over it, fleets refuse cells with `503` + `Retry-After` instead of OOM-ing |
 | `RUNNER_FLEET_IDLE_EVICT_S` | `120` | Idle seconds before a fleet hibernates cells and returns memory |
 | `RUNNER_FLEET_ASSET_CACHE_MB` | `64` | Per-fleet on-disk asset cache (celld default is 512) |

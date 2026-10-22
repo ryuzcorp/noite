@@ -200,12 +200,15 @@ CREATE TABLE IF NOT EXISTS app_ingest_key (
 
 -- Per-app edge rate limits (SPEC, Edge limits), requests per minute. NULL
 -- takes the platform default (NOITE_EDGE_RPM / NOITE_EDGE_APP_RPM), 0 turns
--- the limit off. No row means both defaults. A table of its own rather than
--- columns on `app`, so an existing install gains it at boot.
+-- the limit off. `memory_mb` overrides the platform fleet memory cap
+-- (RUNNER_FLEET_MEMORY_MB) for this app; NULL takes the default. No row
+-- means all defaults. A table of its own rather than columns on `app`, so
+-- an existing install gains it at boot.
 CREATE TABLE IF NOT EXISTS app_limit (
   app_id TEXT PRIMARY KEY NOT NULL REFERENCES app(id) ON DELETE CASCADE,
   client_rpm INTEGER,
   app_rpm INTEGER,
+  memory_mb INTEGER,
   updated_at TEXT NOT NULL
 );
 

@@ -153,6 +153,13 @@ pub async fn stop_fleet(procs: &ProcMap, slug: &str, grace: StopGrace) {
     if let Some(pid) = pid {
         sigkill_tree(pid);
     }
+    // A stopped fleet leaves its cgroup behind only when a member outlived
+    // the kill: an empty group removes, a live one is reused by the next
+    // spawn (which rewrites the limits). Best-effort either way.
+    if let Some(dir) = crate::host::cgroups::fleet_cgroup_path(slug) {
+        crate::host::cgroups::remove_fleet_cgroup(&dir);
+    }
+    crate::host::cgroups::forget_spawned(slug);
     tracing::info!(slug, "stopped celld");
 }
 
@@ -231,6 +238,8 @@ pub async fn stop_environment_fleets(procs: &ProcMap, slug: &str, grace: StopGra
 struct FleetSpec {
     /// `ProcMap` key and log-ring key (`slug`, or `slug.label`).
     key: String,
+    /// The app that owns this fleet: the OOM-kill app event's owner.
+    app_id: String,
     /// The tenant scope whose key the fleet holds: the app's own prefix, or
     /// the environment's own when this fleet is a preview.
     scope: crate::host::credentials::Scope,
@@ -239,6 +248,44 @@ struct FleetSpec {
     internal: i64,
     state_dir: std::path::PathBuf,
     env: Vec<(String, String)>,
+    /// Effective per-fleet memory cap in MiB (per-app override, else
+    /// `RUNNER_FLEET_MEMORY_MB`): the cgroup's `memory.max`. `CELLD_MAX_RSS_MB`
+    /// deliberately does not follow it (celld measures container-scale).
+    memory_mb: u32,
+}
+
+/// Effective fleet memory cap: the app's `app_limit.memory_mb` override, or
+/// the platform default. A corrupt row value cannot happen — `limits.set`
+/// refuses it — so a defensive fallback keeps the type. In `multi` the
+/// override is clamped to the operator ceiling, so rows stored before a
+/// ceiling change cannot exceed it.
+async fn fleet_memory_mb(pool: &SqlitePool, cfg: &Config, app_id: &str) -> u32 {
+    let stored = match db::get_app_limit(pool, app_id).await {
+        Ok(limit) => limit.memory_mb.and_then(|v| u32::try_from(v).ok()),
+        Err(e) => {
+            tracing::warn!(app_id, error = %e, "could not read app limits; using platform fleet memory");
+            None
+        }
+    };
+    clamp_memory_mb(
+        stored,
+        cfg.fleet_memory_mb,
+        cfg.fleet_memory_max_mb,
+        matches!(cfg.tenancy, crate::config::Tenancy::Multi),
+    )
+}
+
+/// Clamp a stored per-app override to the operator ceiling. Pure so tests
+/// pin it: `None` falls back to the platform default, multi caps stored
+/// values (including rows written before the ceiling was lowered), single
+/// applies the override verbatim.
+fn clamp_memory_mb(stored_mb: Option<u32>, default_mb: u32, ceiling_mb: u32, multi: bool) -> u32 {
+    let uncapped = stored_mb.unwrap_or(default_mb);
+    if multi {
+        uncapped.min(ceiling_mb)
+    } else {
+        uncapped
+    }
 }
 
 /// App fleet: celld on the app's bucket and ports (SPEC, Fleet lifecycle).
@@ -254,6 +301,7 @@ pub async fn ensure_fleet(
     };
     let spec = FleetSpec {
         key: app.slug.clone(),
+        app_id: app.id.clone(),
         bucket: app.fleet_bucket.clone(),
         listen,
         internal,
@@ -262,6 +310,7 @@ pub async fn ensure_fleet(
             .join(&app.slug),
         env: db::tenant_env(pool, &app.id).await,
         scope: crate::host::credentials::Scope::app(app),
+        memory_mb: fleet_memory_mb(pool, cfg, &app.id).await,
     };
     ensure_spawned(pool, cfg, procs, logs, spec).await
 }
@@ -293,14 +342,94 @@ pub async fn ensure_environment_fleet(
     }
     let spec = FleetSpec {
         key: env_fleet_key(&env.app_slug, &env.label),
+        app_id: env.app_id.clone(),
         bucket: env.fleet_bucket.clone(),
         listen,
         internal,
         state_dir,
         env: db::environment_tenant_env(pool, &env.app_id, &env.id).await,
         scope: crate::host::credentials::Scope::environment(env),
+        memory_mb: fleet_memory_mb(pool, cfg, &env.app_id).await,
     };
     ensure_spawned(pool, cfg, procs, logs, spec).await
+}
+
+/// An exited fleet whose cgroup counter moved since its own spawn died by
+/// OOM kill at its cap: collect what the restart needs — the tenant-visible
+/// event detail, the respawn backoff, and whether the event is due
+/// (deduplicated per window). Sync so the caller can run it under the
+/// proc-map lock; the log and DB writes happen after the guard drops.
+/// Anything else (no cgroups, no movement, no baseline) yields nothing —
+/// the caller still logs and restarts.
+fn collect_possible_oom(spec: &FleetSpec) -> Option<crate::host::cgroups::OomNote> {
+    let dir = crate::host::cgroups::fleet_cgroup_path(&spec.key)?;
+    if !dir.is_dir() {
+        return None;
+    }
+    match crate::host::cgroups::oom_kills_since_spawn(&spec.key, &dir) {
+        Some(kills) if kills > 0 => {}
+        _ => return None,
+    }
+    crate::host::cgroups::oom_note_kill(&spec.key, spec.memory_mb, std::time::Instant::now())
+}
+
+/// What moving a spawned fleet into its group observed. `Gone` (exited
+/// first, or the kernel says ESRCH) means nothing runs uncapped: log and
+/// hold the spawn for the next tick. `Refused` (live pid, real denial)
+/// trips containment, kills the child so it never runs uncapped, and aborts
+/// the spawn. `Moved` records the OOM baseline.
+#[derive(Debug, PartialEq, Eq)]
+enum MoveOutcome {
+    Moved,
+    Gone,
+    Refused,
+}
+
+/// Move a spawned fleet into its group and report what happened. Async
+/// because a refused move kills the live child first.
+async fn move_fleet_into_group(
+    key: &str,
+    dir: &std::path::Path,
+    child: &mut tokio::process::Child,
+) -> MoveOutcome {
+    let pid = match child.id() {
+        None => {
+            // Already waited (id() is None only after wait), so nothing to
+            // reap here — unlike the ESRCH arm below.
+            tracing::warn!(fleet = %key, "fleet exited before its cgroup move");
+            return MoveOutcome::Gone;
+        }
+        Some(pid) => pid,
+    };
+    match crate::host::cgroups::enter_cgroup(dir, pid) {
+        Ok(()) => {
+            crate::host::cgroups::note_spawned(key, dir);
+            MoveOutcome::Moved
+        }
+        Err(error) if crate::host::cgroups::is_gone(&error) => {
+            // Exited between spawn and the move: reap the zombie (a dropped
+            // Child only kill()-on-drops its leader) so no pid-table slot
+            // leaks on a persistently refusing move.
+            let _ = child.try_wait();
+            tracing::warn!(fleet = %key, pid, "fleet exited before its cgroup move; nothing runs uncapped");
+            MoveOutcome::Gone
+        }
+        Err(error) => {
+            tracing::warn!(fleet = %key, pid, error = %error, "fleet refused its cgroup move; killing its tree");
+            // Whole-tree kill: the fleet leads its own group, so a worker it
+            // forked before the move dies with it instead of serving uncapped
+            // from the shared cgroup and holding the fleet's ports past the
+            // recovery respawn. Then reap (short timeout): without the wait
+            // the dropped Child leaks a zombie until runner exit.
+            sigkill_tree(pid);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+            crate::host::cgroups::note_limit_failed(
+                key,
+                format!("fleet missed its cgroup: {error:#}"),
+            );
+            MoveOutcome::Refused
+        }
+    }
 }
 
 /// Spawn (or confirm) one celld fleet, whoever owns it.
@@ -312,20 +441,55 @@ async fn ensure_spawned(
     spec: FleetSpec,
 ) -> anyhow::Result<()> {
     let key = spec.key.clone();
-    {
+    // A fleet backing off after consecutive OOM kills is not respawned
+    // until its hold passes; the next tick retries.
+    if !crate::host::cgroups::oom_spawn_ready(&key, std::time::Instant::now()) {
+        return Ok(());
+    }
+    // Consume the OOM baseline and collect the verdict under the lock; the
+    // log and DB writes happen after the guard drops, never while holding
+    // it. Removal stays in the same critical section as the consume, so a
+    // same-key respawn cannot slip between them and inherit or orphan a
+    // baseline.
+    let oom_note: Option<crate::host::cgroups::OomNote> = {
         let mut map = procs.lock().await;
         if let Some(child) = map.get_mut(&key) {
             match child.try_wait() {
                 Ok(None) => return Ok(()), // still running
                 Ok(Some(status)) => {
+                    let note = collect_possible_oom(&spec);
                     tracing::warn!(fleet = %key, ?status, "celld exited; restarting");
                     map.remove(&key);
+                    note
                 }
                 Err(e) => {
+                    let note = collect_possible_oom(&spec);
                     tracing::warn!(fleet = %key, error = %e, "celld status; restarting");
                     map.remove(&key);
+                    note
                 }
             }
+        } else {
+            None
+        }
+    };
+    if let Some(note) = oom_note {
+        tracing::warn!(fleet = %key, detail = %note.detail, delay = ?note.delay, "fleet OOM-killed at its cap; restarting");
+        logs::append(logs, &key, note.detail.clone()).await;
+        if note.event_due {
+            let _ = db::insert_app_event(
+                pool,
+                &crate::models::new_id(),
+                &spec.app_id,
+                "fleet",
+                "fleet restarted",
+                &note.detail,
+                "🧠",
+                "{}",
+                "",
+                &crate::models::now_iso(),
+            )
+            .await;
         }
     }
 
@@ -422,10 +586,32 @@ async fn ensure_spawned(
     for (key, value) in crate::host::metrics::otel_env(cfg) {
         cmd.env(key, value);
     }
+    // Per-fleet containment (SPEC, Tenant isolation): while cgroups are
+    // active the fleet gets its own group with the effective memory cap; the
+    // kernel OOM-kills overgrowth inside that group (contained, and the
+    // supervisor restarts the fleet) instead of every fleet shedding.
+    //
+    // `CELLD_MAX_RSS_MB` deliberately does NOT follow the per-fleet cap:
+    // celld measures the greater of its own RSS and the *container-scale*
+    // cgroup working set (through the private-ns cgroupfs root, not the
+    // fleet leaf), so a per-fleet value closes every fleet's ready gate as
+    // soon as the container as a whole passes it — the exact incident that
+    // retired the old 512 default, replayed in the isolation lane
+    // (2026-10-21: `CELLD_MAX_RSS_MB=512` per fleet, trivial fleets never
+    // healthy while builds ran). The explicit knob keeps its container-wide
+    // shed meaning; unset stays celld's default (80% of the container).
+    let fleet_cgroup = crate::host::cgroups::anchor().and_then(|anchor| {
+        match crate::host::cgroups::ensure_fleet_cgroup(&anchor, &key, u64::from(spec.memory_mb)) {
+            Ok(dir) => Some(dir),
+            Err(e) => {
+                tracing::warn!(fleet = %key, error = %e, "fleet cgroup unavailable; shared cgroup");
+                None
+            }
+        }
+    });
     if cfg.fleet_max_rss_mb > 0 {
         cmd.env("CELLD_MAX_RSS_MB", cfg.fleet_max_rss_mb.to_string());
     }
-    #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         if let Some(uid) = cfg.fleet_uid {
@@ -447,6 +633,22 @@ async fn ensure_spawned(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
+    // Move the fleet into its group at once: between spawn and this write a
+    // sliver of startup memory is charged to the shared cgroup instead —
+    // negligible next to the fleet's lifetime, and documented, not hidden.
+    if let Some(dir) = &fleet_cgroup {
+        match move_fleet_into_group(&key, dir, &mut child).await {
+            MoveOutcome::Moved => {}
+            // Exited first: nothing runs uncapped. Hold the spawn for the
+            // next tick instead of inserting a dead child.
+            MoveOutcome::Gone => return Ok(()),
+            // Refused for a live pid: tripped, killed, and the spawn aborts
+            // rather than running uncapped.
+            MoveOutcome::Refused => {
+                return Err(anyhow::anyhow!("fleet {key} missed its cgroup"));
+            }
+        }
+    }
 
     // Capture the fleet's stdout+stderr into the shared per-fleet log buffer
     // (was Stdio::inherit, which lost it to the runner's console).
@@ -472,7 +674,7 @@ async fn ensure_spawned(
     }
 
     procs.lock().await.insert(key.clone(), child);
-    tracing::info!(fleet = %key, listen = spec.listen, internal = spec.internal, "started celld");
+    tracing::info!(fleet = %key, listen = spec.listen, internal = spec.internal, memory_mb = spec.memory_mb, cgroup = fleet_cgroup.is_some(), "started celld");
     Ok(())
 }
 
@@ -745,5 +947,151 @@ mod tests {
             panic!("a crashed fleet is Exited, not Removed");
         };
         assert!(why.contains('3'), "{why}");
+    }
+
+    fn fake_fleet_leaf(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "noite-fleet-unit-{name}-{}",
+            crate::models::new_id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fake fleet leaf");
+        dir
+    }
+
+    #[tokio::test]
+    async fn exited_fleet_skips_move_without_tripping() {
+        // A child that exits before the move is reaped here, so id() is
+        // None exactly like a fleet that dies between spawn and enter.
+        let mut dead = tokio::process::Command::new("sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .expect("spawn exiter");
+        dead.wait().await.expect("reap exiter");
+        let dir = fake_fleet_leaf("gone");
+        let key = format!("gone-{}", crate::models::new_id());
+        assert_eq!(
+            move_fleet_into_group(&key, &dir, &mut dead).await,
+            MoveOutcome::Gone
+        );
+        let (_, detail) = crate::host::cgroups::status();
+        assert!(
+            !detail.contains(&key),
+            "an exited fleet trips nothing: {detail}"
+        );
+        assert_eq!(
+            crate::host::cgroups::oom_kills_since_spawn(&key, &dir),
+            None,
+            "no baseline without a group"
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_move_kills_the_live_fleet_and_trips() {
+        // cgroup.procs as a directory: the move is refused (EISDIR, not
+        // ESRCH) for a live pid, like a real denial.
+        let dir = fake_fleet_leaf("refused");
+        std::fs::create_dir_all(dir.join("cgroup.procs")).expect("fake procs dir");
+        let key = format!("refused-{}", crate::models::new_id());
+        let mut live = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleeper");
+        assert_eq!(
+            move_fleet_into_group(&key, &dir, &mut live).await,
+            MoveOutcome::Refused
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), live.wait())
+            .await
+            .expect("killed fleet dies")
+            .expect("reap killed fleet");
+        let (ok, detail) = crate::host::cgroups::status();
+        assert!(!ok, "a refused move trips containment");
+        assert!(
+            detail.contains(&key),
+            "the reason names the fleet: {detail}"
+        );
+    }
+
+    /// A refused move kills the whole tree, not just the leader: a worker
+    /// the fleet forked before the move must die with it instead of serving
+    /// uncapped from the shared cgroup, and the child is reaped (no zombie).
+    #[tokio::test]
+    async fn refused_move_kills_the_tree_and_reaps() {
+        use std::os::unix::process::CommandExt;
+        // Unique per test-process run: a leaked sleeper from an earlier run
+        // must never satisfy this run's /proc scan.
+        let marker = format!("31337{}", std::process::id() % 100000);
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", &format!("sleep {marker} & wait")]);
+        cmd.as_std_mut().process_group(0);
+        cmd.kill_on_drop(true);
+        let mut leader = cmd.spawn().expect("spawn group leader");
+        // The leader must have forked its sleeper before the move, or a
+        // leader-only kill passes vacuously with nothing to orphan.
+        let spawned = std::time::Instant::now();
+        while !crate::testutil::live_cmdline_has(&marker) {
+            assert!(
+                spawned.elapsed() < Duration::from_secs(5),
+                "group leader never forked its sleeper"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // cgroup.procs as a directory: the move is refused (EISDIR, not
+        // ESRCH) for a live pid, like a real denial.
+        let dir = fake_fleet_leaf("refused-tree");
+        std::fs::create_dir_all(dir.join("cgroup.procs")).expect("fake procs dir");
+        let key = format!("refused-tree-{}", crate::models::new_id());
+        assert_eq!(
+            move_fleet_into_group(&key, &dir, &mut leader).await,
+            MoveOutcome::Refused
+        );
+        assert!(
+            leader.id().is_none(),
+            "the refused child is reaped inside the move, not left a zombie"
+        );
+        assert!(
+            crate::testutil::wait_for_cmdline_gone(&marker, Duration::from_secs(5)).await,
+            "refused move left a grandchild behind (sleep {marker} still live 5s after the group kill)"
+        );
+        let (ok, detail) = crate::host::cgroups::status();
+        assert!(!ok, "a refused move trips containment");
+        assert!(
+            detail.contains(&key),
+            "the reason names the fleet: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_move_records_baseline() {
+        let dir = fake_fleet_leaf("moved");
+        let key = format!("moved-{}", crate::models::new_id());
+        let mut live = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleeper");
+        assert_eq!(
+            move_fleet_into_group(&key, &dir, &mut live).await,
+            MoveOutcome::Moved
+        );
+        assert_eq!(
+            crate::host::cgroups::oom_kills_since_spawn(&key, &dir),
+            Some(0),
+            "the spawn baseline exists"
+        );
+        live.kill().await.expect("stop sleeper");
+    }
+
+    #[test]
+    fn effective_cap_clamps_stored_overrides_to_the_ceiling_in_multi() {
+        // A row stored before the ceiling was lowered still applies, capped.
+        assert_eq!(clamp_memory_mb(Some(1024), 512, 256, true), 256);
+        assert_eq!(clamp_memory_mb(Some(128), 512, 256, true), 128);
+        // Single applies the override verbatim; missing rows fall back to the
+        // default, which the ceiling caps in multi like any other value.
+        assert_eq!(clamp_memory_mb(Some(1024), 512, 256, false), 1024);
+        assert_eq!(clamp_memory_mb(None, 512, 256, true), 256);
+        assert_eq!(clamp_memory_mb(None, 512, 256, false), 512);
     }
 }

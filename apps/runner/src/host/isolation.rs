@@ -2,13 +2,13 @@
 //!
 //! `NOITE_TENANCY=single|multi` (default multi off localhost). In `multi`,
 //! boot runs isolation self-checks (build uid drop works, nft table
-//! installed, fleet uid drop works). Any failure keeps `/ready` at 503 with
-//! the reason; invites/signups are refused while checks fail (enforced by the
-//! control UI reading `/ready`; the runner also refuses builds). In `single`
-//! checks run and warn, nothing is refused.
+//! installed, fleet uid drop works, per-fleet cgroups set up). Any failure
+//! keeps `/ready` at 503 with the reason; invites/signups are refused while
+//! checks fail (enforced by the control UI reading `/ready`; the runner also
+//! refuses builds). In `single` checks run and warn, nothing is refused.
 
 use crate::config::{Config, Tenancy};
-use crate::host::{exec, netisolation};
+use crate::host::{cgroups, exec, netisolation};
 
 #[derive(Clone, Debug, Default)]
 pub struct IsolationStatus {
@@ -16,6 +16,8 @@ pub struct IsolationStatus {
     pub build_uid_ok: bool,
     pub fleet_uid_ok: bool,
     pub nft_ok: bool,
+    pub cgroup_ok: bool,
+    pub cgroup_detail: String,
     pub detail: String,
     /// Hard failure in multi (blocks /ready + builds).
     pub blocked: bool,
@@ -40,6 +42,7 @@ pub async fn self_check(cfg: &Config, nft_installed: bool) -> IsolationStatus {
     } else {
         netisolation::status()
     };
+    let (cgroup_ok, cgroup_detail) = cgroups::status();
     let mut problems = Vec::new();
     if !build_uid_ok {
         problems.push("build uid drop unavailable (needs CAP_SETUID/CAP_SETGID)".to_string());
@@ -49,6 +52,9 @@ pub async fn self_check(cfg: &Config, nft_installed: bool) -> IsolationStatus {
     }
     if !nft_ok {
         problems.push(format!("egress policy missing ({nft_detail})"));
+    }
+    if !cgroup_ok {
+        problems.push(format!("per-fleet cgroups unavailable ({cgroup_detail})"));
     }
     let blocked = cfg.tenancy == Tenancy::Multi && !problems.is_empty();
     // Root bucket keys in multi are explicit, not silent: warn loudly here
@@ -72,6 +78,8 @@ pub async fn self_check(cfg: &Config, nft_installed: bool) -> IsolationStatus {
         build_uid_ok,
         fleet_uid_ok,
         nft_ok,
+        cgroup_ok,
+        cgroup_detail,
         detail: problems.join("; "),
         blocked,
         credentials,

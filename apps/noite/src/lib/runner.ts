@@ -578,12 +578,13 @@ export const runnerRemoveDomain = (
 export const runnerGetLimits = (id: string) =>
   runnerRpc<RunnerLimits>("limits.get", { id });
 
-/** Replace both limits; null returns one to the platform default. */
+/** Replace the limits; null returns one to the platform default. */
 export const runnerSetLimits = (
   id: string,
   clientRpm: number | null,
-  appRpm: number | null
-) => runnerRpc<RunnerLimits>("limits.set", { appRpm, clientRpm, id });
+  appRpm: number | null,
+  memoryMb: number | null
+) => runnerRpc<RunnerLimits>("limits.set", { appRpm, clientRpm, id, memoryMb });
 
 export const runnerGitRemote = (id: string) =>
   runnerRpc<RunnerGitRemote>("git.remote", { id });

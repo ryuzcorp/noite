@@ -1,4 +1,5 @@
-//! Settings panel: the edge rate limits (per visitor and whole app).
+//! Settings panel: the edge rate limits (per visitor and whole app) and the
+//! fleet's memory cap.
 
 import { atom } from "ilha";
 
@@ -34,9 +35,11 @@ const parseRpm = (raw: string): number | null | undefined => {
 const shownRpm = (draft: string | null, saved: number | null) =>
   draft ?? (saved === null ? "" : String(saved));
 
-/** Edge rate limits (SPEC, Edge limits): requests per minute the edge lets
- * through to this app, per visitor and in total, before answering 429. The
- * runner writes them into the Caddyfile on its next reconcile. */
+/** Limits (SPEC, Edge limits and Tenant isolation): requests per minute the
+ * edge lets through to this app, per visitor and in total, before answering
+ * 429 — plus this fleet's memory cap in MiB, the `memory.max` of its own
+ * cgroup. The runner writes rate limits into the Caddyfile on its next
+ * reconcile; a memory cap applies when the fleet next spawns. */
 export const RateLimitsPanel = ({
   appId,
   myRole,
@@ -47,6 +50,7 @@ export const RateLimitsPanel = ({
   const res = limits(appId);
   const clientDraft = atom<string | null>(null);
   const appDraft = atom<string | null>(null);
+  const memoryDraft = atom<string | null>(null);
   const err = atom("");
   const note = atom("");
   const busy = atom(false);
@@ -61,7 +65,7 @@ export const RateLimitsPanel = ({
   if (!current) {
     return (
       <SettingsSection>
-        <h3 class="m-0 text-lg font-semibold">Rate Limits</h3>
+        <h3 class="m-0 text-lg font-semibold">Limits</h3>
         <LoadError error={res.error()} />
       </SettingsSection>
     );
@@ -69,14 +73,22 @@ export const RateLimitsPanel = ({
 
   const clientText = shownRpm(clientDraft(), current.clientRpm);
   const appText = shownRpm(appDraft(), current.appRpm);
+  const memoryText = shownRpm(memoryDraft(), current.memoryMb);
 
   const save = async (event: SubmitEvent) => {
     event.preventDefault();
     const clientRpm = parseRpm(clientText);
     const appRpm = parseRpm(appText);
+    const memoryMb = parseRpm(memoryText);
 
-    if (clientRpm === undefined || appRpm === undefined) {
-      err.set("Limits are whole numbers of requests per minute.");
+    if (
+      clientRpm === undefined ||
+      appRpm === undefined ||
+      memoryMb === undefined
+    ) {
+      err.set(
+        "Limits are whole numbers — requests per minute, and MiB for memory."
+      );
 
       return;
     }
@@ -90,11 +102,15 @@ export const RateLimitsPanel = ({
         appId,
         appRpm,
         clientRpm,
+        memoryMb,
       });
       clientDraft.set(null);
       appDraft.set(null);
+      memoryDraft.set(null);
       await res.refetch();
-      note.set("Saved. The edge applies it within a few seconds.");
+      note.set(
+        "Saved. Rate limits apply within seconds; memory applies when the fleet next spawns."
+      );
     } catch (error) {
       err.set(errorMessage(error));
     }
@@ -104,12 +120,14 @@ export const RateLimitsPanel = ({
 
   return (
     <SettingsSection>
-      <h3 class="m-0 text-lg font-semibold">Rate Limits</h3>
+      <h3 class="m-0 text-lg font-semibold">Limits</h3>
       <p class="m-0 text-sm opacity-70">
         Requests per minute the edge lets through to this app, across all its
         hostnames. Past a limit, visitors get <code>429 Too Many Requests</code>{" "}
         with a <code>Retry-After</code> header. Leave a field empty for the
-        platform default, or enter <code>0</code> for no limit.
+        platform default, or enter <code>0</code> for no limit. Fleet memory
+        caps this app's own cgroup in MiB; leave it empty for the platform
+        default.
       </p>
       {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
       <form class="flex flex-wrap items-end gap-2" onsubmit={save}>
@@ -153,6 +171,29 @@ export const RateLimitsPanel = ({
             }}
           />
         </fieldset>
+        <fieldset class="fieldset min-w-40 flex-1">
+          <label class="label" for="limit-memory">
+            Fleet memory (MiB)
+          </label>
+          <input
+            id="limit-memory"
+            class="input input-sm"
+            type="number"
+            min="64"
+            max={current.defaults.memoryMaxMb ?? undefined}
+            step="1"
+            value={memoryText}
+            placeholder={
+              current.defaults.memoryMaxMb === null
+                ? `Default: ${current.defaults.memoryMb} MiB`
+                : `Default: ${current.defaults.memoryMb} MiB (max ${current.defaults.memoryMaxMb})`
+            }
+            disabled={!isAdmin || busy()}
+            oninput={(e) => {
+              memoryDraft.set(e.currentTarget.value);
+            }}
+          />
+        </fieldset>
         {isAdmin ? (
           <button type="submit" class="btn btn-sm" disabled={busy()}>
             {busy() ? "Saving…" : "Save limits"}
@@ -168,7 +209,8 @@ export const RateLimitsPanel = ({
       )}
       {isAdmin ? null : (
         <p class="m-0 text-sm opacity-70">
-          Only an app admin can change rate limits.
+          Only an app admin can change limits. A new memory cap applies when the
+          fleet next spawns.
         </p>
       )}
       {note() ? <p class="m-0 text-sm opacity-70">{note()}</p> : null}

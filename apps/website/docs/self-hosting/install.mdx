@@ -11,7 +11,7 @@ On a fresh Ubuntu or Debian server (amd64 or arm64, 2 GB of memory or more, port
 curl -fsSL https://noite.now/run.sh | bash -s install
 ```
 
-It elevates itself with `sudo` (no `sudo` in front: piped into `sudo bash`, the script runs in the background and cannot ask anything). It installs Docker Engine and the Compose plugin when missing, asks for the base domain, and writes `/opt/noite/compose.yaml` (option A, from `main`) and `/opt/noite/.env` with generated secrets, `CONTROL_SUBDOMAIN=app` and the edge on 80/443. It then opens 80/443 in `ufw` when it is active, starts the stack and waits for `/ready`. Press Enter for the default `<public-ip>.sslip.io`, which needs no DNS and is enough to try Noite out; with no terminal to ask on, it uses that default. For a real domain, point `app.`, `api.`, `git.` and `*.<domain>` at the server first.
+It elevates itself with `sudo` (no `sudo` in front: piped into `sudo bash`, the script runs in the background and cannot ask anything). It installs Docker Engine and the Compose plugin when missing, asks for the base domain, and writes `/opt/noite/compose.yaml` (option A, from `main`), `/opt/noite/compose.multi.yaml` (the multi-tenant cgroup grant, applied only when `.env` says `NOITE_TENANCY=multi`) and `/opt/noite/.env` with generated secrets, `CONTROL_SUBDOMAIN=app` and the edge on 80/443. It then opens 80/443 in `ufw` when it is active, starts the stack and waits for `/ready`. Press Enter for the default `<public-ip>.sslip.io`, which needs no DNS and is enough to try Noite out; with no terminal to ask on, it uses that default. For a real domain, point `app.`, `api.`, `git.` and `*.<domain>` at the server first.
 
 :::warning
 Register right away: the first account becomes the admin without an invite code.
@@ -35,7 +35,7 @@ The script always runs the installer from the ref's latest commit, so a CDN-cach
 
 Before you invite anyone, read [Known limits](/self-hosting/known-limits): Noite is alpha, and tenant isolation is not a hard boundary yet.
 
-For your own bucket ([option B](#b-your-own-bucket)), lost-passkey email (`NOITE_EMAIL_WEBHOOK_URL`) or any other setting, edit `/opt/noite/.env` and run `cd /opt/noite && docker compose up -d`. The sections below are the same install by hand, for hosts where you'd rather not run the script.
+For your own bucket ([option B](#b-your-own-bucket)), lost-passkey email (`NOITE_EMAIL_WEBHOOK_URL`) or any other setting, edit `/opt/noite/.env` and re-run the installer (it picks up the multi override itself when `.env` says `NOITE_TENANCY=multi`), or run `cd /opt/noite && docker compose up -d` by hand — with `-f compose.yaml -f compose.multi.yaml` on a multi install. The sections below are the same install by hand, for hosts where you'd rather not run the script.
 
 ## Uninstall or start over
 
@@ -73,8 +73,11 @@ The same result without the script, on any host with Docker (or Podman) and Comp
 ```bash
 mkdir -p /opt/noite && cd /opt/noite
 curl -fsSLO https://raw.githubusercontent.com/ryuzcorp/noite/main/docker/compose.yaml
-# write .env (below), then:
-docker compose up -d && docker compose logs -f noite
+curl -fsSLO https://raw.githubusercontent.com/ryuzcorp/noite/main/docker/compose.multi.yaml
+# write .env (below), then single installs:
+# docker compose up -d && docker compose logs -f noite
+# multi installs (`NOITE_TENANCY=multi` in .env) layer the cgroup grant:
+# docker compose -f compose.yaml -f compose.multi.yaml up -d
 ```
 
 `.env` next to `compose.yaml`:
@@ -117,6 +120,7 @@ NOITE_S3_BUCKET=noite
 
 ```bash
 docker compose up -d --scale rustfs=0
+# multi: docker compose -f compose.yaml -f compose.multi.yaml up -d --scale rustfs=0
 ```
 
 Key requirements: Get/Put/Delete/List on the bucket. The bucket is created if the key allows, otherwise create it first. This works the same for an installer-made `/opt/noite`.

@@ -1,4 +1,7 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+
 import { expect, test } from "@playwright/test";
+import type { APIRequestContext } from "@playwright/test";
 
 import {
   appListenPort,
@@ -20,6 +23,7 @@ test.afterAll(async ({ request }) => {
 interface Probe {
   ok: boolean;
   detail: string;
+  code?: string;
   mustSucceed?: boolean;
 }
 
@@ -61,7 +65,6 @@ const expectReleaseProbes = (probes: Record<string, Probe>): void => {
       expect(probe.ok, `release probe ${name} must hold: ${probe.detail}`).toBe(
         true
       );
-
       continue;
     }
 
@@ -71,13 +74,72 @@ const expectReleaseProbes = (probes: Record<string, Probe>): void => {
   }
 };
 
+// Per-fleet cgroups are the inverse probe: containment holds when every live
+// fleet carries a positive `memory.max`, read by the sandboxed build itself
+// from the shared anchor — and the runner agrees on `/ready`.
+const assertFleetCgroups = async (
+  request: APIRequestContext,
+  report: ProbeReport
+): Promise<void> => {
+  const cgroup = report.build.probes["cgroup:fleet-memory-max"];
+  expect(cgroup, "build probe cgroup:fleet-memory-max present").toBeDefined();
+  expect(cgroup?.ok, `per-fleet cgroups missing: ${cgroup?.detail ?? ""}`).toBe(
+    true
+  );
+
+  const ready = await runnerApi<{ cgroups?: { active?: boolean } }>(
+    request,
+    "/ready"
+  );
+
+  expect(ready.cgroups?.active, "runner reports per-fleet cgroups active").toBe(
+    true
+  );
+};
+
+// Tamper probes are the negative half of the cgroup story: every cgroupfs
+// write a tenant build attempts must fail with a permission denial
+// (EACCES/EPERM/EROFS). Present and refused, not merely absent — an ENOENT
+// from a missing file would pass an any-throw check vacuously, so the probe
+// records the errno code and the spec asserts it. swap.max is exempt only
+// when swap accounting is genuinely absent (NO_SWAP_ACCOUNTING).
+const expectTamperProbes = (report: ProbeReport): void => {
+  for (const name of [
+    "tamper:write-memory-max",
+    "tamper:write-memory-swap-max",
+    "tamper:move-to-anchor",
+    "tamper:mkdir-fleet-child",
+    "tamper:subtree-control",
+  ]) {
+    const probe = report.build.probes[name];
+    expect(probe, `tamper probe ${name} present`).toBeDefined();
+    expect(
+      probe?.ok,
+      `tamper probe ${name} must fail: ${probe?.detail ?? ""}`
+    ).toBe(false);
+
+    if (
+      name === "tamper:write-memory-swap-max" &&
+      probe?.code === "NO_SWAP_ACCOUNTING"
+    ) {
+      continue;
+    }
+
+    const code = probe?.code ?? "";
+    expect(
+      code === "EACCES" || code === "EPERM" || code === "EROFS",
+      `tamper probe ${name} must be refused with EACCES|EPERM|EROFS, got ${code === "" ? "no code" : code}: ${probe?.detail ?? ""}`
+    ).toBe(true);
+  }
+};
+
 // Hostile tenant (SPEC, Hostile-tenant suite): the Worker and build scripts
 // attempt each attack and report results as JSON; every attempt must fail
 // except internet egress. It only means something against an install that
-// claims isolation: the single image with NOITE_TENANCY=multi and its
-// capabilities (NET_ADMIN, SETUID, SETGID, CHOWN). The 4-service lane runs
-// single tenancy and would fail it by design, so the lane opts in with
-// E2E_HOSTILE=1.
+// claims isolation: the single image with NOITE_TENANCY=multi, its
+// capabilities (NET_ADMIN, SETUID, SETGID, CHOWN) and the multi cgroup grant
+// (SYS_ADMIN, compose.multi.yaml). The 4-service lane runs single tenancy
+// and would fail it by design, so the lane opts in with E2E_HOSTILE=1.
 test(
   "hostile tenant is contained",
   { tag: "@isolation" },
@@ -146,10 +208,34 @@ test(
     const report = (await res.json()) as ProbeReport;
 
     for (const [name, probe] of Object.entries(report.build.probes)) {
+      // Positive containment and the peak snapshot are asserted/attached
+      // separately below; this loop is the leak check.
+      if (name === "cgroup:fleet-memory-max" || name === "fleet-peaks") {
+        continue;
+      }
+
       expect(probe.ok, `build probe ${name} leaked: ${probe.detail}`).toBe(
         false
       );
     }
+
+    // Tamper probes are asserted separately: every cgroupfs write a tenant
+    // build attempts must fail with a permission denial — present and
+    // refused, not merely absent.
+    expectTamperProbes(report);
+
+    // D3 sizing basis: per-fleet high-water marks at build time, written
+    // into the always-uploaded lane report (test attachments land in
+    // test-results/, which CI does not upload).
+    mkdirSync(new URL("../playwright-report", import.meta.url), {
+      recursive: true,
+    });
+    writeFileSync(
+      new URL("../playwright-report/fleet-peaks.json", import.meta.url),
+      JSON.stringify(report.build.probes["fleet-peaks"] ?? { missing: true })
+    );
+
+    await assertFleetCgroups(request, report);
 
     // The cross-build probe only proves isolation if a sibling app's build
     // cache actually existed to probe. The neighbour above deploys first, so

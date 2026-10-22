@@ -1,0 +1,29 @@
+# Noite multi-tenant cgroup override (SPEC, Tenant isolation). Applied on top
+# of compose.yaml for `NOITE_TENANCY=multi` installs only:
+#
+#   docker compose -f docker/compose.yaml -f docker/compose.multi.yaml up -d
+#
+# Per-fleet memory containment needs a writable cgroupfs mount: Docker mounts
+# the container's cgroupfs read-only, and this override grants exactly what
+# the runner needs to flip its own cgroup subtree writable at boot (one
+# `MS_REMOUNT`, then mkdir/enable/`memory.max` writes — probed, not assumed):
+#
+# - `CAP_SYS_ADMIN`: the remount itself. Far narrower than `privileged`:
+#   no extra devices, seccomp and the rest of the confinement stay on.
+# - `apparmor:unconfined`: Docker's default AppArmor profile denies
+#   `mount(2)` outright (`deny mount` in the docker-default template, and
+#   `deny /sys/fs/cg[^r]*/** wklx` for the cgroup tree), while the default
+#   seccomp profile allows it — so on AppArmor hosts (Ubuntu included) the
+#   remount needs the profile lifted, and nothing else. SELinux-enforcing
+#   hosts are unverified: the remount may still be refused there (the runner
+#   logs the refusal, and `multi` stays at 503 until it succeeds).
+#
+# Single-tenant installs never apply this file: they get no new privileges,
+# and a missing cgroup mount only warns. Rootless Podman cannot satisfy the
+# same grant (the remount is refused inside the user namespace, and cgroup
+# control files stay owned by host root even under `privileged`), so a
+# Podman `multi` install degrades loudly instead — run `multi` on Docker.
+services:
+  noite:
+    cap_add: [SYS_ADMIN]
+    security_opt: [apparmor:unconfined]

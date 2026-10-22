@@ -2,9 +2,9 @@
 import type { LimitDefaults } from "./LimitDefaults";
 
 /**
- * An app's edge limits as the settings panel shows them: its own values
+ * An app's limits as the settings panel shows them: its own values
  * (null = default) beside the platform defaults they fall back to.
  * `perClient` is false behind a proxy the edge does not trust, where
  * per-client limits cannot apply (`Config::edge_sees_clients`).
  */
-export type LimitsView = { clientRpm: number | null, appRpm: number | null, perClient: boolean, defaults: LimitDefaults, };
+export type LimitsView = { clientRpm: number | null, appRpm: number | null, memoryMb: number | null, perClient: boolean, defaults: LimitDefaults, };

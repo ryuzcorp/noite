@@ -10,10 +10,18 @@ use axum::{
 use serde_json::json;
 
 use crate::api::sse::poll_stream;
+use crate::config::Tenancy;
 use crate::db;
 use crate::models::{AppStateFrame, CreateApp, PatchApp, RenameApp};
 use crate::service;
 use crate::AppState;
+
+/// Live cgroup contribution to `/ready`: a failed fleet limit trips
+/// install-wide containment after boot, so `multi` refuses exactly like a
+/// boot-time failure while `single` keeps warning.
+fn cgroup_readiness(tenancy: &Tenancy, active: bool, detail: &str) -> Option<String> {
+    (!active && *tenancy == Tenancy::Multi).then(|| format!("cgroups: {detail}"))
+}
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     // Busy when a deploy holds the runner: the control DO extends its idle
@@ -51,11 +59,21 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
             failing.push(format!("bucket: {detail}"));
         }
     }
-    {
+    // Per-fleet cgroups (SPEC, Tenant isolation): the live status, not the
+    // boot snapshot — a fleet limit refused after boot trips install-wide
+    // containment, and `multi` refuses exactly like a boot-time failure
+    // while `single` keeps warning. Reported on both answers so
+    // `make doctor` and the e2e lane can assert containment is live, not
+    // just "not failing".
+    let (cgroups_active, cgroups_detail) = {
         let iso = state.isolation.read().await;
         if iso.blocked {
             failing.push(format!("isolation: {}", iso.detail));
         }
+        crate::host::cgroups::status()
+    };
+    if let Some(reason) = cgroup_readiness(&state.config.tenancy, cgroups_active, &cgroups_detail) {
+        failing.push(reason);
     }
     // Control fleet #0 (absent in the dev image, where vite dev serves it).
     if std::path::Path::new(&state.config.control_bundle_dir).exists() {
@@ -77,15 +95,15 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     }
     let credentials = state.isolation.read().await.credentials.clone();
     let snapshot = state.state_sync.snapshot_status();
+    let body = json!({ "ok": failing.is_empty(), "service": "noite-runner",
+        "cgroups": { "active": cgroups_active, "detail": cgroups_detail },
+        "credentials": credentials,
+        "snapshot": snapshot,
+        "failing": failing });
     if failing.is_empty() {
-        Json(json!({ "ok": true, "service": "noite-runner", "credentials": credentials, "snapshot": snapshot }))
-            .into_response()
+        Json(body).into_response()
     } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "ok": false, "failing": failing, "credentials": credentials, "snapshot": snapshot })),
-        )
-            .into_response()
+        (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
     }
 }
 
@@ -215,4 +233,29 @@ pub async fn app_state_stream(State(state): State<AppState>, Path(id): Path<Stri
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tripped_containment_blocks_multi_but_warns_single() {
+        // A fleet limit refused after boot trips install-wide containment.
+        crate::host::cgroups::note_limit_failed("fleet-a", "memory.max refused".into());
+        let (active, detail) = crate::host::cgroups::status();
+        assert!(!active, "tripped status is not active");
+        assert!(
+            cgroup_readiness(&Tenancy::Multi, active, &detail).is_some(),
+            "multi refuses on a live trip"
+        );
+        assert!(
+            cgroup_readiness(&Tenancy::Single, active, &detail).is_none(),
+            "single keeps warning on a live trip"
+        );
+        assert!(
+            cgroup_readiness(&Tenancy::Multi, true, "per-fleet cgroups under /x").is_none(),
+            "multi stays ok while containment holds"
+        );
+    }
 }

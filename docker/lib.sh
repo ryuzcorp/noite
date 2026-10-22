@@ -76,3 +76,22 @@ remove_project() {
     [ -z "$vols" ] || "$CLI" volume rm -f $vols >/dev/null
   done
 }
+
+# is_multi_tenancy: mirror the runner's parse_tenancy (apps/runner/src/config.rs).
+# Explicit NOITE_TENANCY wins (blank counts as unset); otherwise a
+# localhost-family BASE_DOMAIN means single, anything else means multi.
+# e2e-local.sh sources this file; install.sh and the Makefile carry the same
+# rule inline (install.sh is fetched standalone via curl, make cannot source
+# shell) — keep all three in sync with parse_tenancy.
+is_multi_tenancy() {
+  _tenancy="$(printf '%s' "${NOITE_TENANCY:-}" | tr 'A-Z' 'a-z' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  case "$_tenancy" in
+    single) return 1 ;;
+    multi) return 0 ;;
+  esac
+  _base="$(printf '%s' "${BASE_DOMAIN:-localhost}" | tr 'A-Z' 'a-z' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/\.*$//')"
+  case "$_base" in
+    localhost | *.localhost) return 1 ;;
+    *) return 0 ;;
+  esac
+}

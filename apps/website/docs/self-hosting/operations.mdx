@@ -34,6 +34,8 @@ Re-run the installer, or pull and recreate by hand:
 curl -fsSL https://noite.now/run.sh | bash -s install
 # or
 cd /opt/noite && docker compose pull && docker compose up -d
+# multi installs add the cgroup grant to every recreating command:
+# docker compose -f compose.yaml -f compose.multi.yaml pull && docker compose -f compose.yaml -f compose.multi.yaml up -d
 ```
 
 The image is disposable and state lives in the volumes and the bucket, so an update is a pull plus a recreate. The runner stops every fleet in parallel inside its stop budget (`NOITE_STOP_BUDGET_MS`, 25 s; Compose's `stop_grace_period` is 35 s), then Caddy, then writes a final state snapshot — measured at ~0.3 s for 15 running fleets.
@@ -63,12 +65,15 @@ cd /opt/noite
 STAMP=$(date -u +%Y%m%dT%H%M%SZ) && mkdir -p "backups/$STAMP"
 docker compose exec -T noite sh -c \
   'curl -fsS -X POST -H "Authorization: Bearer $RUNNER_TOKEN" http://127.0.0.1:8080/v1/admin/snapshot'
+# A multi install recreates with the cgroup grant (every `up`/`down` below
+# takes the same two flags); single installs use the bare commands as written.
 docker compose stop
 for vol in noite-data rustfs-data; do
   docker run --rm --entrypoint tar -v "noite_$vol:/vol:ro" -v "$PWD/backups/$STAMP:/out" \
     ghcr.io/ryuzcorp/noite:alpha -cf "/out/$vol.tar" -C /vol .
 done
 docker compose up -d
+# multi: docker compose -f compose.yaml -f compose.multi.yaml up -d
 ```
 
 With your own bucket, turn on versioning at the provider instead; `rustfs-data` then does not exist and only `noite-data` needs the tar.
@@ -81,13 +86,17 @@ Restoring replaces the live volumes: everything written since that backup is gon
 
 ```bash
 cd /opt/noite
+# A multi install downs and ups with the cgroup grant (same two flags on
+# both commands); single installs use the bare commands as written.
 docker compose down
+# multi: docker compose -f compose.yaml -f compose.multi.yaml down
 for vol in noite-data rustfs-data; do
   docker volume rm -f "noite_$vol" && docker volume create "noite_$vol"
   docker run --rm --entrypoint tar -v "noite_$vol:/vol" -v "$PWD/backups/<stamp>:/in:ro" \
     ghcr.io/ryuzcorp/noite:alpha -xf "/in/$vol.tar" -C /vol
 done
 docker compose up -d
+# multi: docker compose -f compose.yaml -f compose.multi.yaml up -d
 ```
 
 Compose warns that the volumes were not created by it; that is expected. Verify with `docker compose exec noite curl -s http://127.0.0.1:8080/ready`, then open an app.
@@ -97,7 +106,7 @@ Compose warns that the volumes were not created by it; that is expected. Verify 
 - **Boot stops with `refusing to start: the runner database is schema version N`** (or the same for the control database): the data was written by a newer Noite than the image you started. Run the newer image again, or [restore](#restore) a backup taken before the upgrade. Downgrading across a schema change is not supported, and the refusal is what stops an old image from damaging newer data.
 - **Locked out after losing the passkey**: see [Lost passkey](/self-hosting/accounts#lost-passkey).
 - **`/ready` answers 503**: its body names the failing gate (`reconcile`, `bucket`, `isolation`, `control`, `caddy`). A fresh install waits for the control bundle's first deploy into `s3://<bucket>/control` (seconds; revision-gated, so a restart with the same bundle and vars skips it).
-- **`isolation: …` in multi**: the container lacks a capability or `nft`. Grant `NET_ADMIN`, `SETUID`, `SETGID` and `CHOWN`, or run `NOITE_TENANCY=single`.
+- **`isolation: …` in multi**: the container lacks a capability, `nft`, or the per-fleet cgroups (`per-fleet cgroups unavailable …` names the cgroup cause). Grant `NET_ADMIN`, `SETUID`, `SETGID` and `CHOWN` in compose, then layer the multi cgroup grant on top (`docker compose -f docker/compose.yaml -f docker/compose.multi.yaml up -d`), or run `NOITE_TENANCY=single`.
 - **Boot stops with `runner state restore failed`**: the volume is empty and the bucket did not answer. The runner refuses to start with an empty database (it would overwrite the good snapshot); fix the store and it retries on restart.
 - **Boot stops with `config invalid` naming an env var**: a numeric setting is malformed (a typo like `RUNNER_POLL_MS=5s`). The runner refuses to boot instead of silently using the default; fix the named variable to its expected form and restart. Unset (or empty) still means the default.
 - **A deploy fails with `celld deploy does not support these config keys`**: a Wrangler key celld does not accept. Noite strips the keys it consumes (`release`, `build`) before deploying; anything else must go.

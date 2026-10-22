@@ -14,6 +14,7 @@ const LimitArgs = Schema.Struct({
   appId: Schema.String,
   appRpm: Rpm,
   clientRpm: Rpm,
+  memoryMb: Rpm,
 });
 
 /** The app's edge limits beside the platform defaults they fall back to. */
@@ -27,16 +28,17 @@ export const getLimits = apiAction(AppId, async (appId, { env, request }) => {
   }
 });
 
-/** Set the app's edge limits (admin). The runner owns the range check and
- * rewrites the edge on its next reconcile. */
+/** Set the app's limits (admin). The runner owns the range checks; the edge
+ * picks rate limits up on its next reconcile, a new fleet memory cap on the
+ * fleet's next spawn. */
 export const setLimits = apiAction(
   LimitArgs,
-  async ({ appId, appRpm, clientRpm }, { env, request }) => {
+  async ({ appId, appRpm, clientRpm, memoryMb }, { env, request }) => {
     const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "admin");
 
     try {
-      return await runnerSetLimits(appId, clientRpm, appRpm);
+      return await runnerSetLimits(appId, clientRpm, appRpm, memoryMb);
     } catch (error) {
       failUnknown(error);
     }

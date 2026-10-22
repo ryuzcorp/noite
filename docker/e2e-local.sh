@@ -57,7 +57,18 @@ fi
 export BASE_DOMAIN=noite.localhost HTTP_PORT=8090 HTTPS_PORT=8443
 # The lane's own store port, so a dev stack on :9000 can keep running.
 export RUSTFS_API_PORT="${E2E_RUSTFS_PORT:-19000}"
-export E2E_TENANCY="${E2E_TENANCY:-single}"
+export E2E_TENANCY="${E2E_TENANCY:-}"
+if [ -z "$E2E_TENANCY" ]; then
+  # No explicit lane tenancy: follow the runner's own default
+  # (is_multi_tenancy mirrors parse_tenancy), so the overlay decision can
+  # never disagree with the runner about multi.
+  if is_multi_tenancy; then
+    E2E_TENANCY=multi
+  else
+    E2E_TENANCY=single
+  fi
+fi
+export E2E_TENANCY
 export E2E_SUITE="${E2E_SUITE:-release}"
 export E2E_RUNNER_TOKEN="${RUNNER_TOKEN:-dev-runner-token}"
 export E2E_BASE_URL=http://noite.localhost:8090
@@ -66,6 +77,9 @@ export E2E_GIT_BASE=http://localhost:8080/v1/git
 export E2E_RAW_PORTS=1
 if [ "$E2E_TENANCY" = multi ]; then
   export E2E_HOSTILE=1
+  # The isolation lane is a multi install: it gets the multi cgroup grant,
+  # the same file production multi installs apply.
+  FILES="$FILES -f docker/compose.multi.yaml"
 fi
 CE2E="$COMPOSE -p noite-e2e $FILES"
 
@@ -137,6 +151,18 @@ while [ "$attempt" -lt 100 ]; do
         echo "error: noite-runner recover did not mint a code"
         rc=1
       fi
+
+    if [ "$rc" -eq 0 ] && [ "$E2E_TENANCY" = multi ]; then
+      # The multi lane proves containment end to end, so doctor must name
+      # the live cgroups — a parser that never matches the /ready body
+      # would pass the boot gate while printing the inactive warning.
+      if sh docker/doctor.sh 2>&1 | grep -q '^ok   per-fleet cgroups'; then
+        echo "ok   lane doctor names the live per-fleet cgroups"
+      else
+        echo "error: multi lane doctor names no live per-fleet cgroups"
+        rc=1
+      fi
+    fi
     if [ "$rc" -eq 0 ]; then
       # The edge static config is written once at boot; app events only push
       # the route table through Caddy's admin API, never reloading. Any
@@ -178,6 +204,14 @@ while [ "$attempt" -lt 100 ]; do
       fi
     fi
     fi
+    # Fleet peak snapshot (D3 sizing basis): per-leaf high-waters at suite end
+    # plus the container high-water (the single-lane number), appended to the
+    # always-uploaded report. Best-effort: never fails the lane.
+    {
+      echo "==> fleet peaks at suite end"
+      # shellcheck disable=SC2016
+      $CE2E exec -T noite sh -c 'for d in /sys/fs/cgroup/noite/*/; do n=$(basename "$d"); if [ -f "$d/memory.peak" ]; then echo "fleet-peak $n peak=$(cat "$d/memory.peak") max=$(cat "$d/memory.max" 2>/dev/null || echo ?)"; fi; done; echo "container-peak $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo unknown)"' 2>/dev/null || echo "peak dump unavailable"
+    } >> apps/noite/playwright-report/lane-stats.txt 2>&1 || true
     if [ "${E2E_KEEP:-0}" = 1 ]; then
       echo "==> E2E_KEEP=1: stack left running (project noite-e2e)"
     else

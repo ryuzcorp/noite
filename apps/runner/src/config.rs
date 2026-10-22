@@ -476,6 +476,25 @@ pub struct Config {
     /// such as 512 closes every fleet's admission as soon as the container
     /// as a whole passes it.
     pub fleet_max_rss_mb: u32,
+    /// Per-fleet memory cap in MiB (`RUNNER_FLEET_MEMORY_MB`, 512): each
+    /// tenant fleet runs in its own cgroup v2 child with this `memory.max`,
+    /// so one fleet's growth is OOM-killed inside its own group — contained,
+    /// and the supervisor restarts it — instead of pushing every fleet toward
+    /// the shared shed threshold (SPEC, Tenant isolation). An app's
+    /// `app_limit.memory_mb` overrides it. `CELLD_MAX_RSS_MB` deliberately
+    /// does not follow it: celld measures container-scale working set, so a
+    /// per-fleet value would close every fleet's ready gate.
+    pub fleet_memory_mb: u32,
+    /// Ceiling for a tenant's per-app memory override in MiB
+    /// (`RUNNER_FLEET_MEMORY_MAX_MB`, default = the effective default cap):
+    /// in `multi` a tenant can only lower its cap, never raise it past this.
+    /// Single-tenant installs ignore it (the operator is the only admin).
+    pub fleet_memory_max_mb: u32,
+    /// Cgroup v2 mount the runner manages fleet groups under
+    /// (`RUNNER_CGROUP_ROOT`, `/sys/fs/cgroup`). Tests point it at a tempdir
+    /// fake; operators leave it alone unless the container mounts cgroupfs
+    /// elsewhere.
+    pub cgroup_root: std::path::PathBuf,
     /// celld's own log filter for tenant fleets (`RUNNER_FLEET_LOG`). The
     /// runner's RUST_LOG describes the runner's modules, so inheriting it left
     /// a fleet's runtime logs out of the per-app log view entirely.
@@ -597,6 +616,15 @@ impl Config {
             &mut env_problems,
         );
         let (fleet_port_min, fleet_port_max) = parse_fleet_ports(&mut env_problems);
+        // The per-app ceiling defaults to the effective platform default, so
+        // in multi a tenant can only lower its cap until the operator raises
+        // the ceiling.
+        let fleet_memory_mb: u32 = env_num(
+            "RUNNER_FLEET_MEMORY_MB",
+            512,
+            "a non-negative integer",
+            &mut env_problems,
+        );
         let cfg = Self {
             bind: env_or(&["RUNNER_BIND"], "0.0.0.0:8080"),
             runner_token,
@@ -679,6 +707,17 @@ impl Config {
                 "a non-negative integer",
                 &mut env_problems,
             ),
+            fleet_memory_mb,
+            fleet_memory_max_mb: env_num(
+                "RUNNER_FLEET_MEMORY_MAX_MB",
+                fleet_memory_mb,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            cgroup_root: std::path::PathBuf::from(env_or(
+                &["RUNNER_CGROUP_ROOT"],
+                "/sys/fs/cgroup",
+            )),
             fleet_log: env_or(&["RUNNER_FLEET_LOG"], "error,celld=warn"),
             fleet_idle_evict_s: env_num(
                 "RUNNER_FLEET_IDLE_EVICT_S",
@@ -858,6 +897,37 @@ impl Config {
         }
         if self.telemetry_retention_days < 1 {
             problems.push("RUNNER_TELEMETRY_RETENTION_DAYS must be >= 1".into());
+        }
+        // The platform default shares the per-app override's floor: below it
+        // celld cannot boot, so a typo'd `1` refuses loudly instead of
+        // OOM-looping every fleet. In multi the default is the enforced cap,
+        // so 0 there means "no containment at all" and refuses; single keeps
+        // 0 as no cap.
+        if self.tenancy == Tenancy::Multi && self.fleet_memory_mb == 0 {
+            problems.push(
+                "RUNNER_FLEET_MEMORY_MB must be >= 64 in multi (0 would leave every fleet uncapped)".into(),
+            );
+        }
+        if self.fleet_memory_mb != 0 && self.fleet_memory_mb < 64 {
+            problems.push("RUNNER_FLEET_MEMORY_MB must be 0 (no cap) or >= 64".into());
+        }
+        // The operator ceiling binds every per-app override in multi, so it
+        // carries the same floor (0 must not mean uncapped here) and must
+        // cover the default: a ceiling below the default would silently
+        // lower every fleet, including untouched ones. Inert only for an
+        // uncapped single install, where the ceiling binds nothing.
+        let ceiling_inert = self.tenancy != Tenancy::Multi && self.fleet_memory_mb == 0;
+        if !ceiling_inert {
+            if self.fleet_memory_max_mb < 64 {
+                problems.push(
+                    "RUNNER_FLEET_MEMORY_MAX_MB must be >= 64 (0 must not mean uncapped)".into(),
+                );
+            } else if self.fleet_memory_max_mb < self.fleet_memory_mb {
+                problems.push(format!(
+                    "RUNNER_FLEET_MEMORY_MAX_MB ({}) must cover RUNNER_FLEET_MEMORY_MB ({})",
+                    self.fleet_memory_max_mb, self.fleet_memory_mb
+                ));
+            }
         }
         if self.otel_flush_ms < 1000 {
             problems.push("RUNNER_OTEL_FLUSH_MS must be >= 1000".into());
@@ -1074,6 +1144,9 @@ pub(crate) fn config_for_tests() -> Config {
         max_environments: 25,
         environment_ttl_h: 168,
         fleet_max_rss_mb: 0,
+        fleet_memory_mb: 512,
+        fleet_memory_max_mb: 512,
+        cgroup_root: std::path::PathBuf::from("/sys/fs/cgroup"),
         fleet_idle_evict_s: 120,
         fleet_deploy_poll_s: 300,
         sleep_after_h: 24,
@@ -1215,6 +1288,8 @@ mod tests {
         "RUNNER_MAX_ENVIRONMENTS",
         "RUNNER_ENVIRONMENT_TTL_H",
         "RUNNER_FLEET_MAX_RSS_MB",
+        "RUNNER_FLEET_MEMORY_MB",
+        "RUNNER_FLEET_MEMORY_MAX_MB",
         "RUNNER_FLEET_IDLE_EVICT_S",
         "RUNNER_FLEET_DEPLOY_POLL_S",
         "RUNNER_SLEEP_AFTER_H",
@@ -1239,13 +1314,19 @@ mod tests {
     ];
 
     /// Run `f` with a hermetic env: every strictly-parsed numeric var
-    /// cleared, `BASE_DOMAIN` pinned to the dev base, then `set` applied.
+    /// cleared, `BASE_DOMAIN` pinned to the dev base, `NOITE_TENANCY`
+    /// cleared (a test-set tenancy must not leak into later tests, and a
+    /// caller-shell value must not leak in), then `set` applied.
     /// Holds `ENV_LOCK` throughout and restores everything after, so a
     /// parallel `from_env` elsewhere never observes the mutation.
     fn with_env(set: &[(&str, &str)], f: impl FnOnce()) {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut saved: Vec<(&str, Option<String>)> = Vec::new();
-        for key in STRICT_NUMERIC_VARS.iter().copied().chain(["BASE_DOMAIN"]) {
+        for key in STRICT_NUMERIC_VARS
+            .iter()
+            .copied()
+            .chain(["BASE_DOMAIN", "NOITE_TENANCY"])
+        {
             saved.push((key, env::var(key).ok()));
             env::remove_var(key);
         }
@@ -1263,6 +1344,29 @@ mod tests {
     }
 
     #[test]
+    fn with_env_seals_noite_tenancy_both_ways() {
+        // A caller-shell value must not leak in, and a test-set value must
+        // not leak out (NOITE_TENANCY sits outside STRICT_NUMERIC_VARS).
+        let initial = env::var("NOITE_TENANCY").ok();
+        {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            env::set_var("NOITE_TENANCY", "single");
+        }
+        with_env(&[], || {
+            assert!(env::var("NOITE_TENANCY").is_err());
+        });
+        assert_eq!(env::var("NOITE_TENANCY").as_deref(), Ok("single"));
+        with_env(&[("NOITE_TENANCY", "multi")], || {
+            assert_eq!(env::var("NOITE_TENANCY").as_deref(), Ok("multi"));
+        });
+        assert_eq!(env::var("NOITE_TENANCY").as_deref(), Ok("single"));
+        match initial {
+            Some(v) => env::set_var("NOITE_TENANCY", v),
+            None => env::remove_var("NOITE_TENANCY"),
+        }
+    }
+
+    #[test]
     fn malformed_numeric_refuses_boot_naming_the_var() {
         with_env(&[("RUNNER_POLL_MS", "abc")], || {
             let err = Config::from_env().expect_err("malformed RUNNER_POLL_MS must fail boot");
@@ -1270,6 +1374,69 @@ mod tests {
             assert!(msg.contains("RUNNER_POLL_MS"), "names the var: {msg}");
             assert!(msg.contains("abc"), "names the bad value: {msg}");
         });
+    }
+
+    #[test]
+    fn fleet_memory_floor_matches_the_per_app_override() {
+        with_env(&[("RUNNER_FLEET_MEMORY_MB", "16")], || {
+            let err = Config::from_env().expect_err("16 MiB must fail boot");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("RUNNER_FLEET_MEMORY_MB"),
+                "names the var: {msg}"
+            );
+        });
+        for ok in ["0", "64"] {
+            with_env(&[("RUNNER_FLEET_MEMORY_MB", ok)], || {
+                let cfg = Config::from_env().expect("floor value must boot");
+                assert_eq!(cfg.fleet_memory_mb.to_string(), ok);
+            });
+        }
+    }
+
+    #[test]
+    fn multi_rejects_an_uncapped_default_but_single_keeps_it() {
+        with_env(
+            &[("NOITE_TENANCY", "multi"), ("RUNNER_FLEET_MEMORY_MB", "0")],
+            || {
+                let err = Config::from_env().expect_err("multi+0 must fail boot");
+                assert!(
+                    format!("{err:#}").contains("multi"),
+                    "names the reason: {err:#}"
+                );
+            },
+        );
+        with_env(
+            &[("NOITE_TENANCY", "single"), ("RUNNER_FLEET_MEMORY_MB", "0")],
+            || {
+                Config::from_env().expect("single keeps 0 as no cap");
+            },
+        );
+    }
+    #[test]
+    fn fleet_memory_ceiling_needs_a_floor_and_must_cover_the_default() {
+        for bad in ["0", "16"] {
+            with_env(&[("RUNNER_FLEET_MEMORY_MAX_MB", bad)], || {
+                let err = Config::from_env().expect_err("a floor-less ceiling must fail boot");
+                assert!(
+                    format!("{err:#}").contains("RUNNER_FLEET_MEMORY_MAX_MB"),
+                    "names the var: {err:#}"
+                );
+            });
+        }
+        with_env(&[("RUNNER_FLEET_MEMORY_MAX_MB", "256")], || {
+            let err = Config::from_env().expect_err("a ceiling below the default must fail boot");
+            assert!(
+                format!("{err:#}").contains("must cover"),
+                "says the ceiling must cover the default: {err:#}"
+            );
+        });
+        for ok in ["512", "1024"] {
+            with_env(&[("RUNNER_FLEET_MEMORY_MAX_MB", ok)], || {
+                let cfg = Config::from_env().expect("a covering ceiling must boot");
+                assert_eq!(cfg.fleet_memory_max_mb.to_string(), ok);
+            });
+        }
     }
 
     #[test]
@@ -1284,6 +1451,7 @@ mod tests {
                 ("NOITE_EDGE_RPM", "lots"),
                 ("RUNNER_BUILD_UID_BASE", "nope"),
                 ("RUNNER_WAKE_CONCURRENCY", "4.5"),
+                ("RUNNER_FLEET_MEMORY_MAX_MB", "lots"),
             ],
             || {
                 let err = Config::from_env().expect_err("malformed values must fail boot");
@@ -1297,6 +1465,7 @@ mod tests {
                     ("NOITE_EDGE_RPM", "lots"),
                     ("RUNNER_BUILD_UID_BASE", "nope"),
                     ("RUNNER_WAKE_CONCURRENCY", "4.5"),
+                    ("RUNNER_FLEET_MEMORY_MAX_MB", "lots"),
                 ] {
                     assert!(msg.contains(key), "lists {key}: {msg}");
                     assert!(msg.contains(value), "lists the bad {value}: {msg}");

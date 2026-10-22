@@ -18,6 +18,15 @@ export
 # pi-lens-ignore: shellcheck-14-1073
 # pi-lens-ignore: shellcheck-14-1050
 # pi-lens-ignore: shellcheck-14-1072
+# Multi installs layer the cgroup grant onto every compose invocation the
+# same way production does (single installs need nothing). The decision
+# mirrors the runner's parse_tenancy through docker/lib.sh (make cannot
+# source shell, so this runs one probe subshell): explicit NOITE_TENANCY
+# wins, otherwise a localhost-family BASE_DOMAIN means single.
+_TENANCY := $(shell NOITE_TENANCY='$(NOITE_TENANCY)' BASE_DOMAIN='$(or $(BASE_DOMAIN),localhost)' sh -c '. docker/lib.sh && is_multi_tenancy && echo multi || echo single')
+ifeq ($(_TENANCY),multi)
+COMPOSE += -f docker/compose.multi.yaml
+endif
 
 .PHONY: help up up-prod e2e e2e-isolation dev dev-host logs doctor backup restore down nuke usage
 

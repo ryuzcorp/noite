@@ -4,6 +4,7 @@
 // The deploy only passes when every secret/file/network probe failed.
 import {
   appendFileSync,
+  existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -17,7 +18,11 @@ const deny = (name, fn) => {
     const detail = fn();
     out[name] = { detail: String(detail).slice(0, 200), ok: true };
   } catch (error) {
-    out[name] = { detail: String(error).slice(0, 200), ok: false };
+    out[name] = {
+      code: error?.code ?? "unknown",
+      detail: String(error).slice(0, 200),
+      ok: false,
+    };
   }
 };
 
@@ -159,6 +164,207 @@ deny("read:sibling-build-cache", () => {
 
   throw new Error(`siblings=${seen.length} readable=0`);
 });
+
+// Per-fleet cgroups are the inverse probe: containment holds when every
+// fleet group carries a positive `memory.max`, read by the sandboxed build
+// itself from the shared anchor. The build runs in the runner's leaf
+// (`.../noite/runner`), so the anchor is its parent; every sibling directory
+// is a live tenant fleet.
+const cgroupAnchor = () => {
+  const selfLine = readFileSync("/proc/self/cgroup", "utf-8")
+    .split("\n")
+    .find((line) => line.startsWith("0::"));
+
+  const own = (selfLine ?? "").slice(3) || "/";
+
+  const anchor =
+    own === "/"
+      ? "/sys/fs/cgroup/noite"
+      : `/sys/fs/cgroup${own.replace(/\/runner$/u, "")}`;
+
+  // Every cgroup dir also carries the kernel's own interface files
+  // (`cgroup.procs`, `memory.stat`, …): only subdirectories are fleets.
+  const fleets = readdirSync(anchor, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name !== "runner")
+    .map((entry) => entry.name);
+
+  return { anchor, fleets };
+};
+
+// The positive probe: every live fleet carries a positive `memory.max`.
+// Throws (ok: false) when cgroups are inactive (no anchor) or a fleet runs
+// uncapped.
+try {
+  const { anchor, fleets } = cgroupAnchor();
+
+  const caps = fleets.map((name) => {
+    const max = Number(
+      readFileSync(`${anchor}/${name}/memory.max`, "utf-8").trim()
+    );
+
+    if (!Number.isInteger(max) || max <= 0) {
+      throw new Error(`${name} uncapped (${max})`);
+    }
+
+    return `${name}=${max}`;
+  });
+
+  if (caps.length === 0) {
+    throw new Error("no sibling fleet group to prove containment");
+  }
+
+  out["cgroup:fleet-memory-max"] = {
+    detail: `fleets=${caps.length} ${caps.slice(0, 3).join(" ")}`,
+    ok: true,
+  };
+} catch (error) {
+  out["cgroup:fleet-memory-max"] = {
+    detail: String(error).slice(0, 200),
+    ok: false,
+  };
+}
+
+// Tamper probes are the negative half of the cgroup story and always run,
+// win or lose above: every write a tenant build attempts against the
+// cgroupfs must fail, and a success (ok: true) is a containment hole that
+// fails the lane. Writes that would change state are written back verbatim,
+// so even a miss is a no-op for the lane. With no anchor or no fleet leaves
+// there is nothing to write against; the probes record that shape instead
+// of crashing the build (the positive probe above already fails the lane).
+{
+  const names = [
+    "tamper:write-memory-max",
+    "tamper:write-memory-swap-max",
+    "tamper:move-to-anchor",
+    "tamper:mkdir-fleet-child",
+    "tamper:subtree-control",
+  ];
+
+  let anchor = null;
+  let fleets = [];
+
+  try {
+    ({ anchor, fleets } = cgroupAnchor());
+  } catch (error) {
+    for (const name of names) {
+      out[name] = {
+        code: error?.code ?? "unknown",
+        detail: String(error).slice(0, 200),
+        ok: false,
+      };
+    }
+  }
+
+  if (anchor !== null) {
+    const leaf = fleets.length > 0 ? `${anchor}/${fleets[0]}` : null;
+
+    deny("tamper:write-memory-max", () => {
+      if (leaf === null) {
+        throw new Error("no fleet leaf to probe");
+      }
+
+      const path = `${leaf}/memory.max`;
+      const current = readFileSync(path, "utf-8");
+      writeFileSync(path, current);
+
+      return "memory.max writable";
+    });
+    deny("tamper:write-memory-swap-max", () => {
+      if (leaf === null) {
+        throw new Error("no fleet leaf to probe");
+      }
+
+      const path = `${leaf}/memory.swap.max`;
+      let current = null;
+
+      try {
+        current = readFileSync(path, "utf-8");
+      } catch (error) {
+        if (
+          error?.code === "ENOENT" &&
+          !existsSync(`${leaf}/memory.swap.current`)
+        ) {
+          const absent = new Error(
+            "memory.swap.max absent and no swap accounting (no memory.swap.current)"
+          );
+
+          absent.code = "NO_SWAP_ACCOUNTING";
+          throw absent;
+        }
+
+        throw error;
+      }
+
+      writeFileSync(path, current);
+
+      return "memory.swap.max writable";
+    });
+    deny("tamper:move-to-anchor", () => {
+      writeFileSync(`${anchor}/cgroup.procs`, String(process.pid));
+
+      return "anchor cgroup.procs writable";
+    });
+    deny("tamper:mkdir-fleet-child", () => {
+      if (leaf === null) {
+        throw new Error("no fleet leaf to probe");
+      }
+
+      mkdirSync(`${leaf}/noite-tamper-probe`);
+
+      return "mkdir under fleet leaf writable";
+    });
+    deny("tamper:subtree-control", () => {
+      writeFileSync(`${anchor}/cgroup.subtree_control`, "+memory");
+
+      return "subtree_control writable";
+    });
+  }
+}
+
+// Fleet peak snapshot (D3 sizing basis): per-fleet high-water marks at build
+// time. Measurement only — asserted nowhere as containment, attached to the
+// lane report by hostile.spec. In single tenancy (or with no anchor) the
+// container high-water is the only number available: an upper bound, not a
+// per-fleet peak.
+{
+  const peaks = {};
+
+  try {
+    const { anchor, fleets } = cgroupAnchor();
+
+    for (const name of fleets) {
+      try {
+        peaks[name] = {
+          max: readFileSync(`${anchor}/${name}/memory.max`, "utf-8").trim(),
+          peak: Number(
+            readFileSync(`${anchor}/${name}/memory.peak`, "utf-8").trim()
+          ),
+        };
+      } catch (error) {
+        peaks[name] = { error: error?.code ?? String(error).slice(0, 60) };
+      }
+    }
+
+    if (fleets.length === 0) {
+      peaks._note = "no fleet leaves at build time";
+    }
+  } catch (error) {
+    try {
+      const selfLine = readFileSync("/proc/self/cgroup", "utf-8")
+        .split("\n")
+        .find((line) => line.startsWith("0::"));
+
+      const own = (selfLine ?? "").slice(3) || "/";
+      peaks._container = Number(
+        readFileSync(`/sys/fs/cgroup${own}/memory.peak`, "utf-8").trim()
+      );
+    } catch {
+      peaks._error = String(error).slice(0, 100);
+    }
+  }
+
+  out["fleet-peaks"] = { detail: JSON.stringify(peaks), ok: true };
+}
 
 mkdirSync("dist", { recursive: true });
 

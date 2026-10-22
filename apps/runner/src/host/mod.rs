@@ -1,6 +1,7 @@
 pub mod accesslog;
 pub mod build_output;
 pub mod caddy;
+pub mod cgroups;
 pub mod children;
 pub mod control;
 pub mod credentials;
