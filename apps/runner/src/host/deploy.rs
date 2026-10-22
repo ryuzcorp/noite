@@ -602,12 +602,25 @@ async fn deploy_inner(
     // Bundled npm/pnpm (SPEC, Package managers): seed the app's JUP_HOME from
     // the image's read-only store before the handover below, so the install
     // step runs the bundled release with no registry request. A missing seed
-    // (dev, old image) only warns: jup then downloads the release.
+    // (dev, old image) only warns: jup then downloads the release. The copy
+    // is tens of MB of blocking file I/O, so it runs off the async workers.
     if let Some((name, version)) = manager
         .as_ref()
         .and_then(package_manager::PackageManager::bundled)
     {
-        if !exec::seed_bundled_manager(Path::new(exec::BUNDLED_SEED_DIR), &cache, name, version) {
+        let (seed_cache, seed_name, seed_version) =
+            (cache.clone(), name.to_string(), version.to_string());
+        let seeded = tokio::task::spawn_blocking(move || {
+            exec::seed_bundled_manager(
+                Path::new(exec::BUNDLED_SEED_DIR),
+                &seed_cache,
+                &seed_name,
+                &seed_version,
+            )
+        })
+        .await
+        .unwrap_or(false);
+        if !seeded {
             tracing::warn!(slug = %app.slug, name, version, "bundled manager seed missing; jup will download the release");
         }
     }
