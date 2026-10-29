@@ -79,6 +79,7 @@ for (const [name, pattern] of [
   ["npm digest", /ARG NPM_SHA512=(?<version>[0-9a-f]{128})/gu],
   ["pnpm", /ARG PNPM_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
   ["pnpm digest", /ARG PNPM_SHA512=(?<version>[0-9a-f]{128})/gu],
+  ["docker", /ARG DOCKER_VERSION=(?<version>\S+)/gu],
 ] as const) {
   const versions = [...dockerfile.matchAll(pattern)].map(
     (m) => m.groups?.version ?? ""

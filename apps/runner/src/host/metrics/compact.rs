@@ -236,13 +236,18 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let cfg = crate::config::Config::from_env().expect("config");
-        // Watermarked through 13:00, now 15:xx → only 14:00 is pending.
-        let hours = uncompacted_hours(Some(&"2026/09/29/13".to_string()), "2026/09/29/15", &cfg);
-        assert_eq!(hours, vec!["2026/09/29/14".to_string()]);
+        // Hours relative to now: the retention floor (`Utc::now() - retention`)
+        // moves with the wall clock, so fixed dates rot — the hardcoded
+        // 2026/09/29 started failing exactly 30 days later (2026-10-29).
+        let now = chrono::Utc::now().naive_utc();
+        let hour = |dt: chrono::NaiveDateTime| dt.format("%Y/%m/%d/%H").to_string();
+        let current = hour(now);
+        let done = hour(now - chrono::Duration::hours(2));
+        // Watermarked two hours back → only the previous hour is pending.
+        let hours = uncompacted_hours(Some(&done), &current, &cfg);
+        assert_eq!(hours, vec![hour(now - chrono::Duration::hours(1))]);
         // Caught up: nothing pending, and garbage input compacts nothing.
-        assert!(
-            uncompacted_hours(Some(&"2026/09/29/15".to_string()), "2026/09/29/15", &cfg).is_empty()
-        );
+        assert!(uncompacted_hours(Some(&current), &current, &cfg).is_empty());
         assert!(uncompacted_hours(None, "not-an-hour", &cfg).is_empty());
     }
 

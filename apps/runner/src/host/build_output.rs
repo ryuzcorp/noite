@@ -25,6 +25,8 @@ pub const DEPLOY_REDIRECT: &str = ".wrangler/deploy/config.json";
 /// (the celld key allowlist). celld also accepts `no_bundle`, but it is
 /// dropped on purpose: the Vite plugin sets it so Wrangler skips esbuild, and
 /// celld would then load split chunks it cannot resolve.
+/// `containers` holds the celld 0.6 container classes Sandbox templates
+/// (the agent template) deploy into.
 const CELLD_KEYS: &[&str] = &[
     "$schema",
     "name",
@@ -42,6 +44,7 @@ const CELLD_KEYS: &[&str] = &[
     "queues",
     "workflows",
     "r2_buckets",
+    "containers",
 ];
 
 const WRANGLER_NAMES: &[&str] = &["wrangler.jsonc", "wrangler.json", "wrangler.toml"];
@@ -308,7 +311,8 @@ mod tests {
             r#"{"configPath":"/abs/wrangler.jsonc","topLevelName":"app","name":"app","main":"index.js",
                 "compatibility_date":"2026-09-01","compatibility_flags":[],"no_bundle":true,"rules":[],
                 "assets":{"binding":"ASSETS","directory":"../client","not_found_handling":"single-page-application"},
-                "vars":{"GREETING":"hi"},"exports":{},"dev":{"ip":"localhost"},
+                "vars":{"GREETING":"hi"},"exports":{},"dev":{"ip":"localhost"},"unknown_key":true,
+                "containers":[{"class_name":"Sandbox","image":"prebuilt:latest"}],
                 "d1_databases":[{"binding":"DB","database_name":"db","migrations_dir":"../../migrations"}]}"#,
         );
         write(&src.join("dist/app/index.js"), "export default {}");
@@ -345,9 +349,12 @@ mod tests {
             "rules",
             "exports",
             "dev",
+            "unknown_key",
         ] {
             assert!(v.get(dropped).is_none(), "{dropped} kept");
         }
+        // celld 0.6 container classes (Sandbox templates) survive the filter.
+        assert_eq!(v["containers"][0]["class_name"], "Sandbox");
         // Outside the new root: dropped rather than written with `..`.
         assert!(v["d1_databases"][0].get("migrations_dir").is_none());
         assert!(!src.join("dist/client/.assetsignore").exists());
