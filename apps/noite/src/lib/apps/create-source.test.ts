@@ -68,6 +68,7 @@ test("a template's id is already the slug the picker prefills", () => {
   expect(TEMPLATES.map((template) => template.id)).toEqual([
     "ilha-void",
     "tanstack-start",
+    "agent",
   ]);
 
   for (const template of TEMPLATES) {
