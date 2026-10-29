@@ -16,9 +16,9 @@
 #                    docker/dev.sh runs the runner (cargo watch) and the
 #                    control UI (vite dev) side by side.
 #
-# One celld, one Caddy, one Node, one jup, one npm, one pnpm and one bun pin;
-# docker/check-versions.ts asserts they appear exactly once. Sidecar versions
-# (esbuild, duckdb) live in docker/install-sidecars.sh.
+# One celld, one Caddy, one Node, one jup, one npm, one pnpm, one bun and one
+# docker CLI pin; docker/check-versions.ts asserts they appear exactly once.
+# Sidecar versions (esbuild, duckdb) live in docker/install-sidecars.sh.
 ARG CELLD_VERSION=0.6.2
 # Noite's own release version, reported by the instance heartbeat
 # (`NOITE_BUILD_VERSION` ENV in the runtime stages): the tag without `v` on a
@@ -42,6 +42,13 @@ ARG NPM_VERSION=12.2.1
 ARG NPM_SHA512=6ca0a6151553fc107e60f1186d9c10d57508dcde6de31292a54d4cc4e8e8ef3de25b3281274657442d7115d10df930bb3794ddcb0681cdfd9d317189abf7b63d
 ARG PNPM_VERSION=12.15.0
 ARG PNPM_SHA512=b3951d6d6ff4a9f13dc7cf56cd28d2b8eb37dbcc9c68e52e1e1191873ea9f82a017287ab50baadc5ccc494f036c67c0e47eb13608c2fa36f47711b61ea128e61
+# docker CLI: celld drives tenant Sandbox containers through the host's
+# engine (`celld deploy` pulls images, the fence installs its nftables
+# rules), so the image needs the CLI and the compose file mounts the host
+# socket. Pinned against the signed apt repo (docker/check-versions.ts
+# asserts it); the revision carries the base's Debian release, so a base
+# move needs a repin.
+ARG DOCKER_VERSION=5:29.9.2-1~debian.13~trixie
 
 FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
 
@@ -124,7 +131,7 @@ ARG PNPM_SHA512
 # Re-declared so they can be read after FROM: the global defaults (or the
 # --build-arg values) are what the ENV block below bakes in.
 ARG CELLD_VERSION
-ARG NOITE_BUILD_VERSION
+ARG DOCKER_VERSION
 # bun: tenant `bun install` / builds. node: real Node (not bun's shim) for
 # tenant steps that need it, e.g. loading `cloudflare.config.ts` (the `cf`
 # CLI config needs Node's module hooks); only the binary, no npm. jup:
@@ -138,7 +145,13 @@ ARG NOITE_BUILD_VERSION
 # native client (no awscli, no Python).
 COPY docker/install-sidecars.sh /tmp/install-sidecars.sh
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      tini ca-certificates curl git nftables unzip xz-utils \
+      tini ca-certificates curl git nftables unzip xz-utils gnupg \
+  && install -m 0755 -d /etc/apt/keyrings \
+  && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+  && chmod a+r /etc/apt/keyrings/docker.asc \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list \
+  && apt-get update && apt-get install -y --no-install-recommends docker-ce-cli=${DOCKER_VERSION} \
+  && docker --version \
   && rm -rf /var/lib/apt/lists/* \
   && sh /tmp/install-sidecars.sh && rm /tmp/install-sidecars.sh \
   && arch="$(dpkg --print-architecture)" \
