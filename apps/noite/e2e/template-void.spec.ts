@@ -22,9 +22,10 @@ test.afterAll(async ({ request }) => {
   }
 });
 
-// The Ilha + Void template (`ryuzcorp/noite-template-ilha`): picked in the
-// creator, deployed like any other app, serving SSR plus a server action on
-// celld. A broken template fails this spec, which fails the release gate.
+// The Ilha + Void template (`ryuzcorp/noite-templates`, `templates/ilha-void`):
+// picked in the creator, deployed like any other app, serving SSR plus a
+// server action on celld. A broken template fails this spec, which fails the
+// release gate.
 test(
   "the Ilha + Void template deploys and serves",
   { tag: "@fast" },

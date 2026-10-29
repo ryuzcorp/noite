@@ -690,6 +690,7 @@ mod tests {
         let ok = [
             "https://github.com/octocat/Hello-World",
             "https://github.com/octocat/Hello-World.git",
+            "https://github.com/ryuzcorp/noite-templates",
             "https://github.com/ryuzcorp/noite-template-ilha",
             "https://github.com/a/b_c.d-e",
             "https://GitHub.com/octocat/Hello-World",

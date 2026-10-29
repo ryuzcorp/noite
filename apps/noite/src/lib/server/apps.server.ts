@@ -158,6 +158,7 @@ const toRunnerSource = (
     return {
       actor,
       kind: "git",
+      path: picked.path,
       ref: picked.ref,
       squash: true,
       url: picked.url,
