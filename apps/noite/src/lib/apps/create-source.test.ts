@@ -72,8 +72,8 @@ test("a template's id is already the slug the picker prefills", () => {
 
   for (const template of TEMPLATES) {
     expect(slugifyName(template.id)).toBe(template.id);
-    expect(parseGitHubRepo(template.url)?.slug).toBe(
-      template.url.split("/").at(-1)
-    );
+    // One repo holds every template; each id maps to its folder.
+    expect(template.url).toBe("https://github.com/ryuzcorp/noite-templates");
+    expect(template.path).toBe(`templates/${template.id}`);
   }
 });

@@ -30,6 +30,8 @@ export const makeApp = (over: Partial<RunnerApp> = {}): RunnerApp => ({
 export interface RunnerMock {
   apps: RunnerApp[];
   calls: string[];
+  /** The params of every recorded call, in order (mirrors `calls`). */
+  requests: unknown[];
   restore: () => void;
 }
 
@@ -46,6 +48,7 @@ export const installRunnerMock = (apps: RunnerApp[]): RunnerMock => {
   const mock: RunnerMock = {
     apps,
     calls: [],
+    requests: [],
     restore: () => {
       globalThis.fetch = original;
     },
@@ -99,6 +102,7 @@ export const installRunnerMock = (apps: RunnerApp[]): RunnerMock => {
     // SAFETY: runnerFetch always sends a JSON-RPC envelope as a string body.
     const body = JSON.parse(String(init?.body)) as { id: number } & RpcCall;
     mock.calls.push(body.method);
+    mock.requests.push(body.params);
     const result = answer(body);
 
     const envelope =
