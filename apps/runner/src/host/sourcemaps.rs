@@ -73,7 +73,7 @@ const MAX_FRAMES_PER_GET: usize = 256;
 /// Deploy sha dirs kept per target besides the just-finished one. Occurrences
 /// older than this still render — with their raw, unsymbolicated stacks.
 const KEEP_DEPLOY_SHAS: usize = 10;
-/// celld 0.6.2 `run_esbuild` externals (`BARE_NODE_BUILTINS` in
+/// celld 0.6.2–0.6.3 `run_esbuild` externals (`BARE_NODE_BUILTINS` in
 /// `crates/celld/engine_api.rs`, re-exported by `js.rs`): node builtins stay
 /// external, the runtime provides them. Pinned here so the shadow bundle
 /// matches celld's; revisit on a celld bump (docker/check-versions.ts pins
@@ -923,13 +923,13 @@ fn esbuild_bin() -> String {
     std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string())
 }
 
-/// celld 0.6.2's CommonJS-builtin bridge, passed as `--banner:js` so the
+/// celld 0.6.2–0.6.3's CommonJS-builtin bridge, passed as `--banner:js` so the
 /// shadow bundle is byte-identical to the deployed one (Apache-2.0,
 /// denoland/celld `crates/celld/deploy.rs` `run_esbuild`; without it every
 /// mapping sits nine lines too early).
 const ESBUILD_BANNER: &str = "var require = (id) => {\n  const name = String(id);\n  const builtin = process.getBuiltinModule(name);\n  if (builtin === undefined) {\n    const error = new Error(`Cannot find module '${name}'`);\n    error.code = \"MODULE_NOT_FOUND\";\n    throw error;\n  }\n  return builtin;\n};";
 
-/// celld 0.6.2's exact bundle flags plus `--sourcemap`: the shadow bundle must
+/// celld 0.6.2–0.6.3's exact bundle flags plus `--sourcemap`: the shadow bundle must
 /// map the same bytes celld deployed, so every flag that shapes the output is
 /// mirrored (no `--minify`: celld does not minify either). Wrangler
 /// `define`/`rules` need no mirroring: the runner strips those keys before
