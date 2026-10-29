@@ -91,7 +91,12 @@ services:
       # Opt-out release check (SPEC, update check): `NOITE_UPDATE_CHECK=0`
       # (also `false`/`off`) locks it off.
       NOITE_UPDATE_CHECK: ${NOITE_UPDATE_CHECK:-}
-      NOITE_STOP_BUDGET_MS: ${NOITE_STOP_BUDGET_MS:-25000}
+      # Container engine for celld Sandbox classes (the agent template):
+      # the host daemon, so tenant containers are host siblings fenced by
+      # celld. The install script puts Docker here; point DOCKER_SOCKET at
+      # another daemon socket (e.g. rootless podman) when yours differs.
+      # Fleets inherit this env, so no runner change is needed.
+      DOCKER_HOST: ${DOCKER_HOST:-unix:///var/run/docker.sock}
       RUNNER_MAX_APPS_PER_USER: ${RUNNER_MAX_APPS_PER_USER:-10}
       RUNNER_FLEET_MAX_RSS_MB: ${RUNNER_FLEET_MAX_RSS_MB:-0}
       # Per-fleet memory cap in MiB (SPEC, Tenant isolation): each tenant
@@ -125,6 +130,8 @@ services:
       # Runner SQLite (also snapshotted to the bucket), git mirrors, builds,
       # fleet working dirs, Caddy config + certificates.
       - noite-data:/data
+      # Host engine socket for Sandbox containers (see DOCKER_HOST above).
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
     networks: [noite]
     labels:
       # Tenant TLS service for Coolify's Traefik (bare port: Coolify rewrites
