@@ -40,8 +40,8 @@
     "prepack": "bun run build"
   },
   "dependencies": {
-    "@effect/platform-node": "4.0.5",
-    "effect": "^4.0.5"
+    "@effect/platform-node": "4.1.0",
+    "effect": "^4.1.0"
   },
   "devDependencies": {
     "@types/bun": "^1.4.3",

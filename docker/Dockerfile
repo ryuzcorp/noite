@@ -19,7 +19,7 @@
 # One celld, one Caddy, one Node, one jup, one npm, one pnpm, one bun and one
 # docker CLI pin; docker/check-versions.ts asserts they appear exactly once.
 # Sidecar versions (esbuild, duckdb) live in docker/install-sidecars.sh.
-ARG CELLD_VERSION=0.6.2
+ARG CELLD_VERSION=0.6.3
 # Noite's own release version, reported by the instance heartbeat
 # (`NOITE_BUILD_VERSION` ENV in the runtime stages): the tag without `v` on a
 # release build (images.yml passes it), `dev` otherwise.
