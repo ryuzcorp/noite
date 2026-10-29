@@ -35,4 +35,14 @@ export const TEMPLATES: readonly AppTemplate[] = [
     stack: ["TanStack Start", "SSR", "Vite"],
     url: "https://github.com/ryuzcorp/noite-templates",
   },
+  {
+    description:
+      "Pi agent harness on Durable Objects (Pi Durable), tools in a Sandbox container.",
+    id: "agent",
+    name: "Agent",
+    path: "templates/agent",
+    ref: "main",
+    stack: ["Pi Durable", "Sandbox", "celld"],
+    url: "https://github.com/ryuzcorp/noite-templates",
+  },
 ];
