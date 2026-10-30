@@ -64,7 +64,7 @@
     },
     "packages/cli": {
       "name": "@noitenow/cli",
-      "version": "0.1.0-alpha.12",
+      "version": "0.1.0-alpha.13",
       "bin": {
         "noite": "dist/bin.js",
       },
