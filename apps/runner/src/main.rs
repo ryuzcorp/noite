@@ -199,16 +199,15 @@ async fn main() -> anyhow::Result<()> {
     // The build range is `None` when uid drops are disabled; fleets are
     // still policed (builds are refused separately).
     let build_uids = config.build_uid_base.map(|b| (b, config.build_uid_range));
+    // The sandbox plane (celld bridges + this install's subnets): empty when
+    // no engine is reachable, in which case no Sandbox container can exist.
+    let sandbox = host::sandbox_net::discover().await;
     let nft_installed = match (config.tenancy, config.fleet_uid) {
         (config::Tenancy::Multi, Some(f)) => {
             let storage = host::netisolation::storage_target(&config.s3_endpoint).await;
-            let ok = host::netisolation::ensure(build_uids, f, &storage).await;
+            let ok = host::netisolation::ensure(build_uids, f, &storage, &sandbox.celld).await;
             if ok {
-                host::netisolation::spawn_storage_refresh(
-                    build_uids,
-                    f,
-                    config.s3_endpoint.clone(),
-                );
+                host::netisolation::spawn_policy_refresh(build_uids, f, config.s3_endpoint.clone());
             }
             ok
         }
@@ -217,6 +216,11 @@ async fn main() -> anyhow::Result<()> {
             false
         }
     };
+    // The host leg of the sandbox path (both tenancies: single has no
+    // container policy but the same host isolation and celld fence).
+    // Best-effort and never blocking: without an engine there is nothing to
+    // reach, and a failure only keeps Sandbox classes unreachable.
+    host::sandbox_net::ensure_host_table(&sandbox).await;
     // Per-fleet cgroups before any child is spawned: setup drains the
     // runner's own cgroup (tini stays reaped, cgroups do not affect that)
     // into a leaf, so children spawned after it inherit the leaf and tenant
