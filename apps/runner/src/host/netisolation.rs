@@ -11,6 +11,11 @@
 //! so an app allocated any uid in the range is policed. Replies on connections
 //! others opened (Caddy → a fleet, the host's published ports) always pass.
 //!
+//! Two dynamic allowances punch scoped holes ahead of the rejects: the object
+//! store's addresses (both identities — release commands hold the scope key)
+//! and celld's Sandbox bridge subnets (fleet only — builds never dial
+//! sandboxes; see `host::sandbox_net`, which also owns the host-leg table).
+//!
 //! Requires `CAP_NET_ADMIN`. The runner probes at boot (`nft list tables`)
 //! and exposes the result in `/ready` detail and `make doctor`. Where no
 //! capabilities exist, installs run `single` tenancy (Step C bwrap fallback
@@ -22,8 +27,13 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 static NFT_OK: AtomicBool = AtomicBool::new(false);
-/// Storage addresses the applied table allows (to notice when they move).
-static APPLIED_STORAGE: Mutex<Vec<IpAddr>> = Mutex::new(Vec::new());
+/// Storage allowance the applied table carries (to notice when it moves).
+static APPLIED_STORAGE: Mutex<Storage> = Mutex::new(Storage {
+    addrs: Vec::new(),
+    port: 0,
+});
+/// Sandbox subnets the applied table allows (to notice when they appear).
+static APPLIED_SANDBOX: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// The object store a tenant fleet's own celld process must reach: its
 /// resolved addresses and port. Worker code in that process can reach it
@@ -64,25 +74,53 @@ pub fn skip(why: &str) {
     NFT_OK.store(false, Ordering::Relaxed);
 }
 
-/// Keep the storage allowance current: the bundled store's container address
-/// can change when it restarts, and a stale rule would cut every fleet off
-/// from its bucket. Re-resolves every 30 s and re-applies on change.
-pub fn spawn_storage_refresh(build: Option<(u32, u32)>, fleet_uid: u32, endpoint: String) {
+fn applied_storage() -> Storage {
+    APPLIED_STORAGE
+        .lock()
+        .map(|applied| applied.clone())
+        .unwrap_or_default()
+}
+
+fn applied_sandbox() -> Vec<String> {
+    APPLIED_SANDBOX
+        .lock()
+        .map(|applied| applied.clone())
+        .unwrap_or_default()
+}
+
+/// Keep the dynamic allowances current: the bundled store's container address
+/// can change when it restarts, and celld creates its Sandbox bridges lazily
+/// on first Sandbox use — a stale table would cut every fleet off from its
+/// bucket or leave Sandbox containers unreachable. Re-resolves every 30 s and
+/// re-applies on change. An empty discovery keeps the applied values: a
+/// failed lookup must not cut live traffic.
+pub fn spawn_policy_refresh(build: Option<(u32, u32)>, fleet_uid: u32, endpoint: String) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
             let storage = storage_target(&endpoint).await;
-            if storage.addrs.is_empty() {
+            let sandbox = super::sandbox_net::discover().await;
+            let storage_changed = !storage.addrs.is_empty() && applied_storage() != storage;
+            let sandbox_changed = !sandbox.celld.is_empty() && applied_sandbox() != sandbox.celld;
+            if !storage_changed && !sandbox_changed {
                 continue;
             }
-            let changed = APPLIED_STORAGE
-                .lock()
-                .map(|applied| *applied != storage.addrs)
-                .unwrap_or(false);
-            if changed {
-                tracing::info!(addrs = ?storage.addrs, "object store moved; re-applying egress policy");
-                ensure(build, fleet_uid, &storage).await;
-            }
+            let effective_storage = if storage.addrs.is_empty() {
+                applied_storage()
+            } else {
+                storage
+            };
+            let effective_sandbox = if sandbox.celld.is_empty() {
+                applied_sandbox()
+            } else {
+                sandbox.celld
+            };
+            tracing::info!(
+                storage = ?effective_storage.addrs,
+                sandbox = ?effective_sandbox,
+                "dynamic allowances moved; re-applying egress policy"
+            );
+            ensure(build, fleet_uid, &effective_storage, &effective_sandbox).await;
         }
     });
 }
@@ -117,8 +155,17 @@ fn sandbox_identities(build: Option<(u32, u32)>, fleet_uid: u32) -> Vec<String> 
     ids
 }
 
-/// The nftables ruleset for the build range and fleet uid.
-fn ruleset(build: Option<(u32, u32)>, fleet_uid: u32, storage: &Storage) -> String {
+/// The nftables ruleset for the build range and fleet uid. `sandbox` is the
+/// discovered celld bridge subnets (`host::sandbox_net`): the fleet dials
+/// Sandbox containers there, so they are ACCEPTed for the fleet uid only,
+/// ahead of the private-range rejects. Anything failing validation is
+/// dropped here too, so a bad discovery can never render into the table.
+fn ruleset(
+    build: Option<(u32, u32)>,
+    fleet_uid: u32,
+    storage: &Storage,
+    sandbox: &[String],
+) -> String {
     // Order matters: the first matching rule wins. Replies go first (see
     // below), then DNS, which must be accepted
     // before the private/loopback rejects, because the container resolver
@@ -181,6 +228,22 @@ fn ruleset(build: Option<(u32, u32)>, fleet_uid: u32, storage: &Storage) -> Stri
             ));
         }
     }
+    // The fleet's celld dials Sandbox containers at their bridge IPs on
+    // celld's bridges: allow fleet TCP there, ahead of the private-range
+    // rejects that would otherwise refuse every dial (and hang Sandbox SDK
+    // polls until the edge times out). Fleet only: builds never dial
+    // sandboxes. Ports stay open — container ports vary by class.
+    let sandbox: Vec<&str> = sandbox
+        .iter()
+        .map(String::as_str)
+        .filter(|s| super::sandbox_net::valid_cidr(s))
+        .collect();
+    if !sandbox.is_empty() {
+        rules.push(format!(
+            "    meta skuid {fleet_uid} ip daddr {{ {} }} meta l4proto tcp accept",
+            sandbox.join(", ")
+        ));
+    }
     // No new connection to loopback, any protocol: that is where the operator
     // APIs, the runner, Caddy's admin and every other fleet listen.
     for id in &identities {
@@ -208,8 +271,13 @@ table inet noite {{
 
 /// Install the table (idempotent: the ruleset replaces it atomically). Best-effort: records the
 /// reason and returns false when `nft` is missing or CAP_NET_ADMIN is absent.
-pub async fn ensure(build: Option<(u32, u32)>, fleet_uid: u32, storage: &Storage) -> bool {
-    let rules = ruleset(build, fleet_uid, storage);
+pub async fn ensure(
+    build: Option<(u32, u32)>,
+    fleet_uid: u32,
+    storage: &Storage,
+    sandbox: &[String],
+) -> bool {
+    let rules = ruleset(build, fleet_uid, storage, sandbox);
     // Probe first: missing binary or capability surfaces here.
     match nft_run(&["list", "tables"], None).await {
         Ok(()) => {}
@@ -225,7 +293,10 @@ pub async fn ensure(build: Option<(u32, u32)>, fleet_uid: u32, storage: &Storage
             reason("nft noite table installed".to_string());
             NFT_OK.store(true, Ordering::Relaxed);
             if let Ok(mut applied) = APPLIED_STORAGE.lock() {
-                applied.clone_from(&storage.addrs);
+                applied.clone_from(storage);
+            }
+            if let Ok(mut applied) = APPLIED_SANDBOX.lock() {
+                applied.clone_from_slice(sandbox);
             }
             tracing::info!(build_range = ?build, fleet_uid, "nft egress policy installed");
             true
@@ -281,7 +352,7 @@ mod tests {
             addrs: vec!["10.89.0.7".parse().unwrap()],
             port: 9000,
         };
-        let rules = ruleset(BUILD, 10020, &storage);
+        let rules = ruleset(BUILD, 10020, &storage, &[]);
         let first_reject = rules.find(" reject").expect("has rejects");
         for uid in ["10020", "10030-11053"] {
             // Pre-NAT port: Docker DNATs its resolver off port 53.
@@ -322,7 +393,7 @@ mod tests {
     #[test]
     fn build_uid_range_is_closed_off_in_every_rule() {
         let storage = Storage::default();
-        let rules = ruleset(BUILD, 10020, &storage);
+        let rules = ruleset(BUILD, 10020, &storage, &[]);
         let range = "10030-11053";
         for prefix in [
             format!("meta skuid {range} ip daddr 127.0.0.0/8 reject"),
@@ -348,7 +419,7 @@ mod tests {
     /// A one-uid range degrades to a single match (and no `lo-hi`).
     #[test]
     fn single_uid_range_emits_a_plain_match() {
-        let rules = ruleset(Some((10030, 1)), 10020, &Storage::default());
+        let rules = ruleset(Some((10030, 1)), 10020, &Storage::default(), &[]);
         assert!(rules.contains("meta skuid 10030 ip daddr 127.0.0.0/8 reject"));
         assert!(
             !rules.contains("10030-"),
@@ -360,11 +431,36 @@ mod tests {
     /// still installs.
     #[test]
     fn without_build_uids_only_the_fleet_is_policed() {
-        let rules = ruleset(None, 10020, &Storage::default());
+        let rules = ruleset(None, 10020, &Storage::default(), &[]);
         assert!(rules.contains("meta skuid 10020 ip daddr 127.0.0.0/8 reject"));
         assert!(
             !rules.contains("meta skuid 10030"),
             "no build uid configured"
         );
+    }
+
+    /// The fleet reaches Sandbox containers on celld's bridges: a fleet-only
+    /// TCP ACCEPT for the discovered subnets, ahead of the private rejects.
+    /// Builds never dial sandboxes, so the range stays closed.
+    #[test]
+    fn fleet_reaches_sandbox_subnets_before_the_private_rejects() {
+        let sandbox = vec!["172.19.0.0/16".to_string(), "172.20.0.0/16".to_string()];
+        let rules = ruleset(BUILD, 10020, &Storage::default(), &sandbox);
+        let first_reject = rules.find(" reject").expect("has rejects");
+        let accept = rules
+            .find("meta skuid 10020 ip daddr { 172.19.0.0/16, 172.20.0.0/16 } meta l4proto tcp accept")
+            .expect("sandbox accept present");
+        assert!(
+            accept < first_reject,
+            "sandbox must be allowed before the rejects"
+        );
+        assert!(
+            !rules.contains("meta skuid 10030-11053 ip daddr { 172.19.0.0/16"),
+            "builds must not reach sandboxes"
+        );
+        // Nothing discovered: byte-identical to the policy without sandboxes.
+        let bare = ruleset(BUILD, 10020, &Storage::default(), &[]);
+        assert!(!bare.contains("172.19.0.0/16"));
+        assert!(!bare.contains("meta l4proto tcp accept"));
     }
 }
