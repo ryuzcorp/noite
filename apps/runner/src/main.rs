@@ -224,10 +224,13 @@ async fn main() -> anyhow::Result<()> {
     // The host legs of the sandbox path (both tenancies: single has no
     // container policy but the same host isolation): DOCKER-USER allowlist
     // plus raw-pin sweep, re-ensured on a refresh because pins return as
-    // containers churn. Best-effort and never blocking: without an engine
-    // there is nothing to reach, and a failure only keeps Sandbox classes
-    // unreachable.
-    host::sandbox_net::ensure_host_rules(&sandbox).await;
+    // containers churn. Best-effort and never blocking: the pass runs in a
+    // spawned task (a dozen sequential engine calls would otherwise stall
+    // cgroups, isolation checks, and Caddy behind a sick engine), and a
+    // failure only keeps Sandbox classes unreachable.
+    tokio::spawn(async move {
+        host::sandbox_net::ensure_host_rules(&sandbox).await;
+    });
     host::sandbox_net::spawn_host_refresh();
     // Per-fleet cgroups before any child is spawned: setup drains the
     // runner's own cgroup (tini stays reaped, cgroups do not affect that)
