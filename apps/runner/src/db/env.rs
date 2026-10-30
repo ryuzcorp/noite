@@ -55,6 +55,10 @@ pub(crate) fn env_reserved(name: &str) -> bool {
         || name.starts_with("LD_")
         || name == "NODE_OPTIONS"
         || (name.starts_with("BUN_") && name != "BUN_INSTALL_CACHE_DIR")
+        // Engine selection is operator plumbing (compose): a tenant override
+        // would steer fleet celld at another engine than the group the fleet
+        // joins.
+        || name == "DOCKER_HOST"
 }
 
 /// Tenant env ready to inject, minus reserved names. Feature flags are
@@ -76,5 +80,37 @@ pub async fn tenant_env(pool: &SqlitePool, app_id: &str) -> Vec<(String, String)
             tracing::warn!(app_id, error = %e, "tenant env list failed; deploying without");
             Vec::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_reserved;
+
+    #[test]
+    fn platform_names_stay_reserved() {
+        for name in [
+            "PORT",
+            "HOST",
+            "AWS_REGION",
+            "S3_ENDPOINT",
+            "CELLD_WATCH",
+            "RUNNER_TOKEN",
+            "NOITE_IMAGE",
+            "BETTER_AUTH_URL",
+            "CADDY_ADMIN",
+            "LD_PRELOAD",
+            "NODE_OPTIONS",
+            "BUN_BEACON",
+            // Engine selection is operator plumbing: a tenant override would
+            // steer fleet celld at another engine than the group the fleet
+            // joins.
+            "DOCKER_HOST",
+        ] {
+            assert!(env_reserved(name), "{name} reserved");
+        }
+        assert!(!env_reserved("BUN_INSTALL_CACHE_DIR"));
+        assert!(!env_reserved("MODEL"));
+        assert!(!env_reserved("OPENAI_API_KEY"));
     }
 }
