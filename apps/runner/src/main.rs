@@ -221,11 +221,14 @@ async fn main() -> anyhow::Result<()> {
             false
         }
     };
-    // The host leg of the sandbox path (both tenancies: single has no
-    // container policy but the same host isolation and celld fence).
-    // Best-effort and never blocking: without an engine there is nothing to
-    // reach, and a failure only keeps Sandbox classes unreachable.
-    host::sandbox_net::ensure_host_table(&sandbox).await;
+    // The host legs of the sandbox path (both tenancies: single has no
+    // container policy but the same host isolation): DOCKER-USER allowlist
+    // plus raw-pin sweep, re-ensured on a refresh because pins return as
+    // containers churn. Best-effort and never blocking: without an engine
+    // there is nothing to reach, and a failure only keeps Sandbox classes
+    // unreachable.
+    host::sandbox_net::ensure_host_rules(&sandbox).await;
+    host::sandbox_net::spawn_host_refresh();
     // Per-fleet cgroups before any child is spawned: setup drains the
     // runner's own cgroup (tini stays reaped, cgroups do not affect that)
     // into a leaf, so children spawned after it inherit the leaf and tenant
