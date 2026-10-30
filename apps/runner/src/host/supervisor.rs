@@ -455,6 +455,40 @@ async fn move_fleet_into_group(
     }
 }
 
+/// Engine socket celld dials when DOCKER_HOST is unset (compose mounts the
+/// host daemon here).
+const ENGINE_SOCKET_DEFAULT: &str = "/var/run/docker.sock";
+
+/// Gid owning the container engine socket, so a fleet child dropped to the
+/// fleet uid can reach it: the mounted host socket (root:docker 0660)
+/// admits neither the fleet uid nor its gid, and without the engine every
+/// Sandbox-backed DO route fails while the runtime starts (`route RPC ...
+/// RuntimeFailed`, served as `Worker failed: ...`). DOCKER_HOST names the
+/// socket when it is a unix:// URL; anything else (TCP, a missing file)
+/// resolves to None and the child spawns exactly as before.
+fn engine_socket_gid(docker_host: Option<&str>, default: &str) -> Option<u32> {
+    let path = match docker_host {
+        Some(host) => host.strip_prefix("unix://")?,
+        None => default,
+    };
+    let meta = std::fs::metadata(path).ok()?;
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.gid())
+}
+
+/// Supplementary groups for a fleet child: its own gid, plus the engine
+/// socket's gid when one resolves and differs (the single-group case keeps
+/// the old spawn path untouched).
+fn fleet_groups(fleet_gid: u32, docker_host: Option<&str>, default: &str) -> Vec<u32> {
+    let mut groups = vec![fleet_gid];
+    if let Some(gid) = engine_socket_gid(docker_host, default) {
+        if gid != fleet_gid {
+            groups.push(gid);
+        }
+    }
+    groups
+}
+
 /// Spawn (or confirm) one celld fleet, whoever owns it.
 async fn ensure_spawned(
     pool: &SqlitePool,
@@ -647,6 +681,40 @@ async fn ensure_spawned(
         // the whole tree, so an orphaned worker can never keep the fleet's
         // port into the next spawn. Uid drop above is untouched.
         cmd.as_std_mut().process_group(0);
+        // Sandbox containers run on the host engine, which the fleet celld
+        // reaches through the mounted socket: join its group so the dropped
+        // child can dial it. Without a socket (dev, CI lanes) the child
+        // spawns exactly as before.
+        // SAFETY: pre_exec runs between fork and exec while still root (std
+        // applies uid()/gid() after); only async-signal-safe libc calls.
+        // The euid check fails the spawn loudly if that ever stops holding,
+        // instead of running a fleet deaf to the engine.
+        if let (Some(_), Some(gid)) = (cfg.fleet_uid, cfg.fleet_gid) {
+            let groups = fleet_groups(
+                gid,
+                std::env::var("DOCKER_HOST").ok().as_deref(),
+                ENGINE_SOCKET_DEFAULT,
+            );
+            if groups.len() > 1 {
+                tracing::info!(fleet = %key, groups = ?groups, "fleet joins the engine socket group");
+                unsafe {
+                    cmd.as_std_mut().pre_exec(move || {
+                        if libc::geteuid() != 0 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "pre_exec lost root before setgroups",
+                            ));
+                        }
+                        let ret =
+                            libc::setgroups(groups.len(), groups.as_ptr() as *const libc::gid_t);
+                        if ret != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+        }
     }
     for (k, v) in spec.env {
         cmd.env(k, v);
@@ -1132,6 +1200,37 @@ mod tests {
             "the spawn baseline exists"
         );
         live.kill().await.expect("stop sleeper");
+    }
+
+    #[test]
+    fn fleet_child_joins_the_engine_socket_group() {
+        let dir = std::env::temp_dir().join(format!("noite-engsock-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("engine.sock");
+        std::fs::write(&sock, b"").unwrap();
+        let sock = sock.to_string_lossy().into_owned();
+        use std::os::unix::fs::MetadataExt;
+        let gid = std::fs::metadata(&sock).unwrap().gid();
+        let unix = format!("unix://{sock}");
+        // A unix:// DOCKER_HOST resolves to the socket's gid; a TCP host or
+        // a missing file leaves the child exactly as before.
+        assert_eq!(engine_socket_gid(Some(&unix), "/nonexistent"), Some(gid));
+        assert_eq!(engine_socket_gid(Some("tcp://127.0.0.1:2375"), &sock), None);
+        assert_eq!(
+            engine_socket_gid(Some("unix:///nonexistent-sock"), &sock),
+            None
+        );
+        assert_eq!(engine_socket_gid(None, &sock), Some(gid));
+        assert_eq!(engine_socket_gid(None, "/nonexistent"), None);
+        // The fleet gid plus the socket gid, without dupes.
+        let other = gid.wrapping_add(1);
+        assert_eq!(
+            fleet_groups(other, Some(&unix), "/nonexistent"),
+            vec![other, gid]
+        );
+        assert_eq!(fleet_groups(gid, Some(&unix), "/nonexistent"), vec![gid]);
+        assert_eq!(fleet_groups(other, None, "/nonexistent"), vec![other]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
