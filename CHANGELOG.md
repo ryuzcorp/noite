@@ -10,6 +10,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-alpha.11] - 2026-10-30
+
+Hotfix for alpha.10: fleet processes join the host container engine's group, so every Sandbox-backed route works on installs — the agent template's Clone and Task run instead of failing while the runtime starts. Tenant `DOCKER_HOST` overrides are now dropped as reserved, since engine selection is operator plumbing.
+
+### Operator action required
+
+- None.
+
+### Fixed
+
+- **Tenant fleets can reach the host container engine.** The engine socket mount landed without its group: the host socket (`root:docker`, mode 0660) admits neither the fleet uid nor its gid, so every Sandbox-backed route failed while the Durable Object runtime started (`route RPC … RuntimeFailed`, served as `Worker failed: …`) — the agent template's Clone and Task buttons only ever showed a JSON parse error. A fleet child dropped to the fleet uid now also joins the engine socket's group, resolved per spawn from the operator `DOCKER_HOST` (default `/var/run/docker.sock`); without a socket — dev, CI lanes — it spawns exactly as before. Tenant `DOCKER_HOST` overrides are now dropped as reserved: engine selection is operator plumbing, and only a real socket's gid is ever joined (never a compose-materialized directory or a TCP host).
+
 ## [0.1.0-alpha.10] - 2026-10-30
 
 App templates move into one monorepo, a new agent template ships a Pi harness with Sandbox containers, and the install wires the host container engine those containers need. Every npm and Rust dependency moves to latest, and celld 0.6.3 fixes a TLS handshake bug.
