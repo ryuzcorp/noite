@@ -10,6 +10,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-alpha.12] - 2026-10-30
+
+### Operator action required
+
+- None.
+
+### Fixed
+
+- Sandbox-backed apps (the agent template) work on multi-tenant installs: the fleet user can reach Sandbox containers on celld's bridges again. Two layers blocked it — the runner's own egress policy refused fleet dials to the celld subnets (hanging SDK polls until the edge timed out), and on the host Docker's bridge isolation plus celld's fence dropped the install↔sandbox traffic. The runner now discovers the celld subnets and ACCEPTs fleet TCP to them ahead of the private-range rejects, and installs a scoped `noite_sandbox` host table (install subnets → celld bridges, TCP; replies back) at boot. No operator action: both apply automatically on upgrade.
+- Sandbox containers on one host share a network plane across tenant apps (every fleet runs as the same uid, so per-app rules are impossible without per-app fleet uids). The agent template keeps credentials in Worker env — the container only ever holds the cloned repo and tool exec — but treat co-hosted Sandbox classes as mutually visible until per-app fleet uids land.
+
 ## [0.1.0-alpha.11] - 2026-10-30
 
 Hotfix for alpha.10: fleet processes join the host container engine's group, so every Sandbox-backed route works on installs — the agent template's Clone and Task run instead of failing while the runtime starts. Tenant `DOCKER_HOST` overrides are now dropped as reserved, since engine selection is operator plumbing.
