@@ -88,6 +88,19 @@ fn applied_sandbox() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Record what the installed table carries, after a successful apply.
+/// Full assignment, never a slice copy: the lists change length (empty at
+/// boot, non-empty once celld's bridges exist), and a length-mismatched
+/// slice copy panics — at boot, that crash-loops the runner.
+fn record_applied(storage: &Storage, sandbox: &[String]) {
+    if let Ok(mut applied) = APPLIED_STORAGE.lock() {
+        applied.clone_from(storage);
+    }
+    if let Ok(mut applied) = APPLIED_SANDBOX.lock() {
+        *applied = sandbox.to_vec();
+    }
+}
+
 /// Keep the dynamic allowances current: the bundled store's container address
 /// can change when it restarts, and celld creates its Sandbox bridges lazily
 /// on first Sandbox use — a stale table would cut every fleet off from its
@@ -292,12 +305,7 @@ pub async fn ensure(
         Ok(()) => {
             reason("nft noite table installed".to_string());
             NFT_OK.store(true, Ordering::Relaxed);
-            if let Ok(mut applied) = APPLIED_STORAGE.lock() {
-                applied.clone_from(storage);
-            }
-            if let Ok(mut applied) = APPLIED_SANDBOX.lock() {
-                applied.clone_from_slice(sandbox);
-            }
+            record_applied(storage, sandbox);
             tracing::info!(build_range = ?build, fleet_uid, "nft egress policy installed");
             true
         }
@@ -342,7 +350,7 @@ async fn nft_run(args: &[&str], stdin_text: Option<&str>) -> Result<(), String> 
 
 #[cfg(test)]
 mod tests {
-    use super::{ruleset, Storage};
+    use super::{applied_sandbox, record_applied, ruleset, Storage};
 
     const BUILD: Option<(u32, u32)> = Some((10030, 1024));
 
@@ -462,5 +470,21 @@ mod tests {
         let bare = ruleset(BUILD, 10020, &Storage::default(), &[]);
         assert!(!bare.contains("172.19.0.0/16"));
         assert!(!bare.contains("meta l4proto tcp accept"));
+    }
+
+    /// Recording applied state survives length changes: empty at boot, then
+    /// non-empty once celld's bridges exist, then empty again. A slice copy
+    /// here panicked on the first length change and crash-looped the runner.
+    #[test]
+    fn recording_applied_state_handles_length_changes() {
+        record_applied(&Storage::default(), &[]);
+        assert!(applied_sandbox().is_empty());
+        let subnets = vec!["172.19.0.0/16".to_string(), "172.20.0.0/16".to_string()];
+        record_applied(&Storage::default(), &subnets);
+        assert_eq!(applied_sandbox(), subnets);
+        record_applied(&Storage::default(), &subnets[..1]);
+        assert_eq!(applied_sandbox(), subnets[..1].to_vec());
+        record_applied(&Storage::default(), &[]);
+        assert!(applied_sandbox().is_empty());
     }
 }
