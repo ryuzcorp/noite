@@ -202,6 +202,11 @@ async fn main() -> anyhow::Result<()> {
     // The sandbox plane (celld bridges + this install's subnets): empty when
     // no engine is reachable, in which case no Sandbox container can exist.
     let sandbox = host::sandbox_net::discover().await;
+    tracing::info!(
+        celld = ?sandbox.celld,
+        own = ?sandbox.own,
+        "sandbox plane discovered"
+    );
     let nft_installed = match (config.tenancy, config.fleet_uid) {
         (config::Tenancy::Multi, Some(f)) => {
             let storage = host::netisolation::storage_target(&config.s3_endpoint).await;

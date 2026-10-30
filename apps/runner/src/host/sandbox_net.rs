@@ -21,9 +21,12 @@
 //! The host table is applied from a one-shot helper container (this same
 //! image, `--network host`, `NET_ADMIN`, entrypoint `nft`) — the same shape
 //! as celld's fence install, because the runner's own netns is the
-//! container's, not the host's. Everything here is best-effort: no engine
-//! (dev, CI lanes) means no Sandbox containers exist, so discovery returns
-//! empty and the policy installs exactly as before.
+//! container's, not the host's. The helper keeps stdin open (`-i`) so the
+//! piped ruleset reaches `nft -f -`, and the table is listed back before
+//! success is reported: an exit 0 alone once hid an empty stdin behind a
+//! success log. Everything here is best-effort: no engine (dev, CI lanes)
+//! means no Sandbox containers exist, so discovery returns empty and the
+//! policy installs exactly as before.
 //!
 //! Known limitation, stated plainly: every tenant fleet shares the fleet uid,
 //! so the ACCEPTs open the whole sandbox plane to every fleet — a hostile
@@ -274,52 +277,78 @@ table inet noite_sandbox {{
     ))
 }
 
+/// The one-shot host helper command: this same image on the host netns,
+/// `NET_ADMIN`, entrypoint `nft`. `-i` is load-bearing: without it Docker
+/// closes the container's stdin, `nft -f -` reads EOF, applies nothing, and
+/// still exits 0 — a silent no-op the runner once logged as success while
+/// Sandbox traffic stayed blocked. No `-t`: a TTY would mangle the piped
+/// ruleset.
+fn helper_command(image: &str, nft_args: &[&str]) -> Vec<String> {
+    let mut cmd = vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "-i".to_string(),
+        "--network".to_string(),
+        "host".to_string(),
+        "--cap-add".to_string(),
+        "NET_ADMIN".to_string(),
+        "--entrypoint".to_string(),
+        NFT_PATH.to_string(),
+        image.to_string(),
+    ];
+    cmd.extend(nft_args.iter().map(|s| s.to_string()));
+    cmd
+}
+
+async fn helper(image: &str, nft_args: &[&str], stdin_text: Option<&str>) -> Option<String> {
+    let cmd = helper_command(image, nft_args);
+    let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    let out = docker(&refs, stdin_text, Duration::from_secs(30)).await?;
+    if !out.status.success() {
+        return None;
+    }
+    stdout_text(&out)
+}
+
 /// Install the host-leg table via a one-shot helper (this same image on the
-/// host netns). Best-effort: false when there is no engine, no own-subnet, or
-/// the helper fails — the caller logs and keeps booting, sandboxes or not.
+/// host netns), then verify it actually landed before reporting success: an
+/// exit 0 alone proved nothing once already. Best-effort: false when there
+/// is no engine, no own-subnet, or the helper fails — the caller logs and
+/// keeps booting, sandboxes or not.
 pub async fn ensure_host_table(nets: &SandboxNets) -> bool {
     let (Some(rules), Some(image)) = (host_ruleset(&nets.own), nets.image.clone()) else {
         tracing::debug!("no sandbox host table to install (no engine or no own subnet)");
         return false;
     };
-    let out = docker(
-        &[
-            "run",
-            "--rm",
-            "--network",
-            "host",
-            "--cap-add",
-            "NET_ADMIN",
-            "--entrypoint",
-            NFT_PATH,
-            &image,
-            "-f",
-            "-",
-        ],
-        Some(&rules),
-        Duration::from_secs(30),
-    )
-    .await;
-    match out {
-        Some(out) if out.status.success() => {
-            tracing::info!(
-                "sandbox host table installed (install subnets {:?})",
-                nets.own
-            );
-            true
-        }
-        _ => {
-            tracing::warn!(
-                "could not install the sandbox host table; Sandbox containers stay unreachable"
-            );
-            false
-        }
+    if helper(&image, &["-f", "-"], Some(&rules)).await.is_none() {
+        tracing::warn!(
+            "could not install the sandbox host table; Sandbox containers stay unreachable"
+        );
+        return false;
+    }
+    let landed = helper(&image, &["list", "table", "inet", "noite_sandbox"], None)
+        .await
+        .map(|text| text.contains("table inet noite_sandbox"))
+        .unwrap_or(false);
+    if landed {
+        tracing::info!(
+            "sandbox host table installed (install subnets {:?})",
+            nets.own
+        );
+        true
+    } else {
+        tracing::warn!(
+            "sandbox host table apply did not land; Sandbox containers stay unreachable"
+        );
+        false
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{host_ruleset, parse_container_inspect, parse_network_inspect, valid_cidr};
+    use super::{
+        helper_command, host_ruleset, parse_container_inspect, parse_network_inspect, valid_cidr,
+    };
 
     #[test]
     fn cidr_validation_is_strict() {
@@ -406,5 +435,32 @@ mod tests {
         // No own subnet (or only garbage): no table rather than an open one.
         assert!(host_ruleset(&[]).is_none());
         assert!(host_ruleset(&["bogus".to_string()]).is_none());
+    }
+
+    #[test]
+    fn helper_keeps_stdin_open_and_never_allocates_a_tty() {
+        // Without `-i` Docker closes the helper's stdin, `nft -f -` reads
+        // EOF, applies nothing, and still exits 0 — the exact silent no-op
+        // that once left prod's host table missing behind a success log.
+        let args = helper_command("img:tag", &["-f", "-"]);
+        let expected: Vec<String> = [
+            "run",
+            "--rm",
+            "-i",
+            "--network",
+            "host",
+            "--cap-add",
+            "NET_ADMIN",
+            "--entrypoint",
+            "/usr/sbin/nft",
+            "img:tag",
+            "-f",
+            "-",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(args, expected);
+        assert!(!args.iter().any(|a| a == "-t" || a == "--tty"));
     }
 }
