@@ -511,6 +511,17 @@ pub struct Config {
     /// (`CELLD_IDLE_EVICT_S`). The docs' default evicts only under memory
     /// pressure, which keeps idle fleets resident forever.
     pub fleet_idle_evict_s: u32,
+    /// Node lease lifetime for every celld this runner starts, control
+    /// included (`CELLD_TTL_MS`). celld renews at a third of it and halts
+    /// (exit 3, "SELF-FENCE") once it passes, so a store or disk stall longer
+    /// than two thirds of it restarts every fleet at once and celld reaps
+    /// each fleet's Sandbox containers on start. celld's 10 s default suits
+    /// a multi-node fleet that hands cells over fast; Noite runs one node
+    /// per app, so there is no peer to hand to, and 60 s rides out the
+    /// stalls a small host shows when a container starts. The cost: a fleet
+    /// that dies without a clean handoff (SIGKILL, OOM) may wait up to this
+    /// long to own its cells again.
+    pub fleet_lease_ttl_ms: u64,
     /// Seconds between a fleet's own polls for new deployments
     /// (`CELLD_DEPLOY_POLL_S`). The runner POSTs /reload after every deploy,
     /// so this only covers a missed reload — 300 keeps the fleet quiet.
@@ -736,6 +747,12 @@ impl Config {
                 "a non-negative integer",
                 &mut env_problems,
             ),
+            fleet_lease_ttl_ms: env_num(
+                "RUNNER_FLEET_LEASE_TTL_MS",
+                60_000,
+                "a whole number of milliseconds",
+                &mut env_problems,
+            ),
             fleet_deploy_poll_s: env_num(
                 "RUNNER_FLEET_DEPLOY_POLL_S",
                 300,
@@ -916,6 +933,11 @@ impl Config {
         }
         if self.telemetry_retention_days < 1 {
             problems.push("RUNNER_TELEMETRY_RETENTION_DAYS must be >= 1".into());
+        }
+        // celld's own default is the floor: shorter only self-fences fleets
+        // sooner on a slow store, and 0 would stop every celld from booting.
+        if self.fleet_lease_ttl_ms < 10_000 {
+            problems.push("RUNNER_FLEET_LEASE_TTL_MS must be >= 10000".into());
         }
         // The platform default shares the per-app override's floor: below it
         // celld cannot boot, so a typo'd `1` refuses loudly instead of
@@ -1167,6 +1189,7 @@ pub(crate) fn config_for_tests() -> Config {
         fleet_memory_max_mb: 512,
         cgroup_root: std::path::PathBuf::from("/sys/fs/cgroup"),
         fleet_idle_evict_s: 120,
+        fleet_lease_ttl_ms: 60_000,
         fleet_deploy_poll_s: 300,
         sleep_after_h: 24,
         sleep_sweep_s: 3600,
@@ -1311,6 +1334,7 @@ mod tests {
         "RUNNER_FLEET_MEMORY_MB",
         "RUNNER_FLEET_MEMORY_MAX_MB",
         "RUNNER_FLEET_IDLE_EVICT_S",
+        "RUNNER_FLEET_LEASE_TTL_MS",
         "RUNNER_FLEET_DEPLOY_POLL_S",
         "RUNNER_SLEEP_AFTER_H",
         "RUNNER_SLEEP_SWEEP_S",
@@ -1509,6 +1533,7 @@ mod tests {
             assert_eq!(cfg.environment_ttl_h, 168);
             assert_eq!(cfg.fleet_max_rss_mb, 0);
             assert_eq!(cfg.fleet_idle_evict_s, 120);
+            assert_eq!(cfg.fleet_lease_ttl_ms, 60_000);
             assert_eq!(cfg.fleet_deploy_poll_s, 300);
             assert_eq!(cfg.sleep_after_h, 24);
             assert_eq!(cfg.sleep_sweep_s, 3600);

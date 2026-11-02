@@ -29,6 +29,7 @@ Every app is its own celld fleet on one host, each in its own cgroup with its ow
 | `RUNNER_FLEET_MEMORY_MB` | `512` | Per-fleet `memory.max` in MiB (own cgroup per fleet, plus `pids.max`); overridable per app in Settings → Limits → Fleet memory (applies on next spawn) |
 | `RUNNER_FLEET_MAX_RSS_MB` | `0` | Shed threshold in MiB; over it, fleets refuse cells with `503` + `Retry-After` instead of OOM-ing |
 | `RUNNER_FLEET_IDLE_EVICT_S` | `120` | Idle seconds before a fleet hibernates cells and returns memory |
+| `RUNNER_FLEET_LEASE_TTL_MS` | `60000` | Node lease lifetime; a storage stall longer than two thirds of it restarts every app (minimum `10000`) |
 | `RUNNER_FLEET_ASSET_CACHE_MB` | `64` | Per-fleet on-disk asset cache (celld default is 512) |
 | `RUNNER_FLEET_DEPLOY_POLL_S` | `300` | Fleet self-poll for deploys; the runner also POSTs `/reload`, so this covers misses only |
 | `RUNNER_FLEET_LOG` | `error,celld=warn` | Fleet log filter; celld warnings reach the per-app log view |
