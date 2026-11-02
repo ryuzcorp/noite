@@ -349,6 +349,18 @@ fn deleting(id: &str) -> bool {
         .contains(id)
 }
 
+/// An app's [`DELETING`] entry, removed on drop.
+struct DeletingMarker(String);
+
+impl Drop for DeletingMarker {
+    fn drop(&mut self) {
+        DELETING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
 pub async fn delete(state: &AppState, id: &str) -> Result<Deletion, ApiError> {
     let app = app_or_404(state, id).await?;
     let started = DELETING
@@ -364,6 +376,9 @@ pub async fn delete(state: &AppState, id: &str) -> Result<Deletion, ApiError> {
     let state = state.clone();
     let id = app.id;
     let work = super::detached::run(format!("app:{id}"), async move {
+        // Released however the task ends (a panic included): a marker left
+        // behind would hide the app from every listing until a restart.
+        let _marker = DeletingMarker(id.clone());
         let out = delete_inner(&state, &id).await;
         if let Err(e) = &out {
             // The caller may be long gone: the log and the row are where a
@@ -377,10 +392,6 @@ pub async fn delete(state: &AppState, id: &str) -> Result<Deletion, ApiError> {
                 tracing::warn!(app_id = %id, error = %db_error, "could not record the failed delete");
             }
         }
-        DELETING
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id);
         out
     });
     match tokio::time::timeout(DELETE_ANSWER_WITHIN, work).await {
