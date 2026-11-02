@@ -361,17 +361,35 @@ pub async fn expired_workspace_environments(
         .await
 }
 
-/// One environment's overrides only (`environment_env` rows).
+/// One environment's overrides only (`environment_env` rows), provisioned
+/// rows included: the UI shows the per-fleet token's name like any other,
+/// its value redacted as usual.
 pub async fn list_env_override(
     pool: &SqlitePool,
     environment_id: &str,
 ) -> sqlx::Result<Vec<AppEnv>> {
     sqlx::query_as::<_, AppEnv>(
-        "SELECT environment_id AS app_id, name, value, updated_at FROM environment_env \
+        "SELECT environment_id AS app_id, name, value, updated_at, source FROM environment_env \
          WHERE environment_id = ? ORDER BY name",
     )
     .bind(environment_id)
     .fetch_all(pool)
+    .await
+}
+
+/// One override with its source marker, for the provision helpers.
+pub async fn get_env_override(
+    pool: &SqlitePool,
+    environment_id: &str,
+    name: &str,
+) -> sqlx::Result<Option<AppEnv>> {
+    sqlx::query_as::<_, AppEnv>(
+        "SELECT environment_id AS app_id, name, value, updated_at, source FROM environment_env \
+         WHERE environment_id = ? AND name = ?",
+    )
+    .bind(environment_id)
+    .bind(name)
+    .fetch_optional(pool)
     .await
 }
 
@@ -382,14 +400,60 @@ pub async fn set_env_override(
     value: &str,
 ) -> sqlx::Result<()> {
     sqlx::query(
-        r#"INSERT INTO environment_env (environment_id, name, value, updated_at) VALUES (?, ?, ?, ?)
+        r#"INSERT INTO environment_env (environment_id, name, value, updated_at, source) VALUES (?, ?, ?, ?, '')
            ON CONFLICT (environment_id, name) DO UPDATE SET value = excluded.value,
-           updated_at = excluded.updated_at"#,
+           updated_at = excluded.updated_at, source = ''"#,
     )
     .bind(environment_id)
     .bind(name)
     .bind(value)
     .bind(now_iso())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Store a runner-provisioned override, never overwriting: an existing row
+/// wins and the caller reuses it. Returns whether this call inserted the row.
+pub async fn insert_env_override_provisioned(
+    pool: &SqlitePool,
+    environment_id: &str,
+    name: &str,
+    value: &str,
+    source: &str,
+) -> sqlx::Result<bool> {
+    let done = sqlx::query(
+        "INSERT INTO environment_env (environment_id, name, value, updated_at, source) \
+         VALUES (?, ?, ?, ?, ?) ON CONFLICT (environment_id, name) DO NOTHING",
+    )
+    .bind(environment_id)
+    .bind(name)
+    .bind(value)
+    .bind(now_iso())
+    .bind(source)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+/// Overwrite an override with a provisioned value (token rotation).
+pub async fn set_env_override_provisioned(
+    pool: &SqlitePool,
+    environment_id: &str,
+    name: &str,
+    value: &str,
+    source: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO environment_env (environment_id, name, value, updated_at, source) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (environment_id, name) DO UPDATE SET value = excluded.value,
+           updated_at = excluded.updated_at, source = excluded.source"#,
+    )
+    .bind(environment_id)
+    .bind(name)
+    .bind(value)
+    .bind(now_iso())
+    .bind(source)
     .execute(pool)
     .await?;
     Ok(())
@@ -411,7 +475,8 @@ pub async fn delete_env_override(
 /// The app's settings with this environment's overrides applied — the
 /// Worker-vars merge input. Unfiltered, like `db::env::worker_settings`:
 /// an override wins over the app's value, and reserved names are refused
-/// loudly by the merge, never dropped here.
+/// loudly by the merge, never dropped here. The runner-owned token rows
+/// (app or override) are the one filter, as in `worker_settings`.
 pub async fn environment_worker_settings(
     pool: &SqlitePool,
     app_id: &str,
@@ -422,6 +487,9 @@ pub async fn environment_worker_settings(
         merged.insert(name, value);
     }
     for row in list_env_override(pool, environment_id).await? {
+        if row.source == crate::db::env::SOURCE_VOID_PROXY_TOKEN {
+            continue;
+        }
         merged.insert(row.name, row.value);
     }
     Ok(merged.into_iter().collect())
@@ -429,8 +497,9 @@ pub async fn environment_worker_settings(
 
 /// The app's variables with this environment's overrides applied — what the
 /// fleet, the build and the release command see. Reserved names are filtered
-/// exactly as `db::tenant_env` does, overrides included. Worker `vars` come
-/// from [`environment_worker_settings`] instead.
+/// exactly as `db::tenant_env` does, overrides included, and provisioned
+/// rows never reach process env at either level. Worker `vars` come from
+/// [`environment_worker_settings`] instead.
 pub async fn environment_tenant_env(
     pool: &SqlitePool,
     app_id: &str,
@@ -444,6 +513,9 @@ pub async fn environment_tenant_env(
         .await
         .unwrap_or_default()
     {
+        if !row.source.is_empty() {
+            continue;
+        }
         if crate::db::env::env_reserved(&row.name) {
             tracing::warn!(
                 environment_id,
@@ -633,6 +705,73 @@ mod tests {
                 ("SHARED".to_string(), "env".to_string()),
             ]
         );
+    }
+
+    /// A per-fleet token override stays out of both merges (the runner-owned
+    /// merge injects it), while the app's auto-provisioned auth secret is
+    /// inherited by the environment's Worker vars.
+    #[tokio::test]
+    async fn provisioned_override_rows_route_by_source_marker() {
+        let pool = connect("sqlite::memory:").await.expect("boot");
+        let cfg = crate::config::config_for_tests();
+        let app = seed(&pool).await;
+        crate::db::insert_provisioned(
+            &pool,
+            &app.id,
+            "BETTER_AUTH_SECRET",
+            "minted",
+            crate::db::SOURCE_AUTH_DEFAULT,
+        )
+        .await
+        .unwrap();
+        let env = create_environment(&pool, &cfg, new(&app.id, "staging", "refs/heads/staging"))
+            .await
+            .expect("env");
+        assert!(insert_env_override_provisioned(
+            &pool,
+            &env.id,
+            "__VOID_PROXY_TOKEN",
+            "tok",
+            crate::db::SOURCE_VOID_PROXY_TOKEN,
+        )
+        .await
+        .unwrap());
+        set_env_override(&pool, &env.id, "MODEL", "x")
+            .await
+            .unwrap();
+        // Second insert loses: the fleet keeps its first token.
+        assert!(!insert_env_override_provisioned(
+            &pool,
+            &env.id,
+            "__VOID_PROXY_TOKEN",
+            "other",
+            crate::db::SOURCE_VOID_PROXY_TOKEN,
+        )
+        .await
+        .unwrap());
+
+        assert_eq!(
+            environment_worker_settings(&pool, &app.id, &env.id)
+                .await
+                .unwrap(),
+            vec![
+                ("BETTER_AUTH_SECRET".to_string(), "minted".to_string()),
+                ("MODEL".to_string(), "x".to_string()),
+            ]
+        );
+        assert_eq!(
+            environment_tenant_env(&pool, &app.id, &env.id).await,
+            vec![("MODEL".to_string(), "x".to_string())]
+        );
+        assert_eq!(
+            get_env_override(&pool, &env.id, "__VOID_PROXY_TOKEN")
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            "tok"
+        );
+        assert_eq!(list_env_override(&pool, &env.id).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

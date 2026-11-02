@@ -194,6 +194,10 @@ pub struct AppEnv {
     pub name: String,
     pub value: String,
     pub updated_at: String,
+    /// Who wrote the row: `''` for a user setting, else the runner's
+    /// provision marker (`auth-default`, `void-proxy-token`). Served like the
+    /// rest of the row; the deploy merges read it, the UI ignores it.
+    pub source: String,
 }
 
 /// What an environment was created from (ROADMAP): a pushed branch, or a

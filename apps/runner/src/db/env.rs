@@ -4,28 +4,103 @@ use sqlx::SqlitePool;
 
 use crate::models::{now_iso, AppEnv};
 
+/// Source marker for the auto-provisioned `BETTER_AUTH_SECRET`: the one
+/// provisioned row the Worker-vars merge takes (it is an ordinary var under
+/// an allowed name, so it flows through the slice-1 merge like a setting).
+pub const SOURCE_AUTH_DEFAULT: &str = "auth-default";
+
+/// Source marker for the per-fleet `__VOID_PROXY_TOKEN`: injected only by
+/// the runner-owned merge, never through the settings merges (the name is
+/// reserved there, so a settings row carrying it would fail the deploy).
+pub const SOURCE_VOID_PROXY_TOKEN: &str = "void-proxy-token";
+
 /// Tenant env vars (CF `.dev.vars` model: local file for dev, fleet env in
 /// prod). Plaintext in SQLite like the other single-operator secrets — no
 /// vault. Names are validated at the API layer; values capped at 32 KiB.
+///
+/// `source` marks runner-provisioned rows (`auth-default`,
+/// `void-proxy-token`); user rows carry `''`. The listing returns every row —
+/// the UI shows provisioned names like any other, values redacted as usual —
+/// while each deploy input filters on it (see [`worker_settings`] and
+/// [`tenant_env`]).
 pub async fn list_env(pool: &SqlitePool, app_id: &str) -> sqlx::Result<Vec<AppEnv>> {
     sqlx::query_as::<_, AppEnv>(
-        "SELECT app_id, name, value, updated_at FROM app_env WHERE app_id = ? ORDER BY name",
+        "SELECT app_id, name, value, updated_at, source FROM app_env WHERE app_id = ? ORDER BY name",
     )
     .bind(app_id)
     .fetch_all(pool)
     .await
 }
 
+/// One row with its source marker, for the provision helpers.
+pub async fn get_env(pool: &SqlitePool, app_id: &str, name: &str) -> sqlx::Result<Option<AppEnv>> {
+    sqlx::query_as::<_, AppEnv>(
+        "SELECT app_id, name, value, updated_at, source FROM app_env WHERE app_id = ? AND name = ?",
+    )
+    .bind(app_id)
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn set_env(pool: &SqlitePool, app_id: &str, name: &str, value: &str) -> sqlx::Result<()> {
     sqlx::query(
-        r#"INSERT INTO app_env (app_id, name, value, updated_at) VALUES (?, ?, ?, ?)
+        r#"INSERT INTO app_env (app_id, name, value, updated_at, source) VALUES (?, ?, ?, ?, '')
            ON CONFLICT (app_id, name) DO UPDATE SET value = excluded.value,
-           updated_at = excluded.updated_at"#,
+           updated_at = excluded.updated_at, source = ''"#,
     )
     .bind(app_id)
     .bind(name)
     .bind(value)
     .bind(now_iso())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Store a runner-provisioned value, never overwriting: an existing row —
+/// user-written or already provisioned — wins, and the caller reuses it.
+/// Returns whether this call inserted the row.
+pub async fn insert_provisioned(
+    pool: &SqlitePool,
+    app_id: &str,
+    name: &str,
+    value: &str,
+    source: &str,
+) -> sqlx::Result<bool> {
+    let done = sqlx::query(
+        "INSERT INTO app_env (app_id, name, value, updated_at, source) VALUES (?, ?, ?, ?, ?) \
+         ON CONFLICT (app_id, name) DO NOTHING",
+    )
+    .bind(app_id)
+    .bind(name)
+    .bind(value)
+    .bind(now_iso())
+    .bind(source)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+/// Overwrite a row with a provisioned value (token rotation): the value and
+/// the marker are the runner's again, whatever the row held before.
+pub async fn set_provisioned(
+    pool: &SqlitePool,
+    app_id: &str,
+    name: &str,
+    value: &str,
+    source: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO app_env (app_id, name, value, updated_at, source) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (app_id, name) DO UPDATE SET value = excluded.value,
+           updated_at = excluded.updated_at, source = excluded.source"#,
+    )
+    .bind(app_id)
+    .bind(name)
+    .bind(value)
+    .bind(now_iso())
+    .bind(source)
     .execute(pool)
     .await?;
     Ok(())
@@ -66,6 +141,11 @@ pub(crate) fn env_reserved(name: &str) -> bool {
 /// dropping them, and allows every process-reserved prefix there. A read
 /// failure is an error, not an empty list: deploying without the app's
 /// settings would ship a Worker missing its secrets.
+///
+/// The one filter is the runner-owned token row (`void-proxy-token`): its
+/// name is reserved in the merge, so it is injected by the runner-owned
+/// merge alone. The auto-provisioned `BETTER_AUTH_SECRET` (`auth-default`)
+/// stays in: it is an ordinary var under an allowed name.
 pub async fn worker_settings(
     pool: &SqlitePool,
     app_id: &str,
@@ -73,6 +153,7 @@ pub async fn worker_settings(
     Ok(list_env(pool, app_id)
         .await?
         .into_iter()
+        .filter(|r| r.source != SOURCE_VOID_PROXY_TOKEN)
         .map(|r| (r.name, r.value))
         .collect())
 }
@@ -81,12 +162,19 @@ pub async fn worker_settings(
 /// minus reserved names. Feature flags are plain `FLAG_<NAME>` rows (`1`/`0`)
 /// and flow through like any other var. Worker `vars` come from
 /// [`worker_settings`] instead (different reserved set, refused not dropped).
+///
+/// Provisioned rows never reach process env: the token authenticates the
+/// Worker to its own fleet's proxy, and the auth secret is a Worker secret.
+/// (A user row under a reserved name fails the deploy at the Worker-vars
+/// merge, before any fleet sees process env.)
 pub async fn tenant_env(pool: &SqlitePool, app_id: &str) -> Vec<(String, String)> {
     match list_env(pool, app_id).await {
         Ok(rows) => rows
             .into_iter()
             .filter_map(|r| {
-                if env_reserved(&r.name) {
+                if !r.source.is_empty() {
+                    None
+                } else if env_reserved(&r.name) {
                     tracing::warn!(app_id, name = %r.name, "tenant env reserved; skipping");
                     None
                 } else {
@@ -103,7 +191,10 @@ pub async fn tenant_env(pool: &SqlitePool, app_id: &str) -> Vec<(String, String)
 
 #[cfg(test)]
 mod tests {
-    use super::{env_reserved, list_env, set_env, tenant_env, worker_settings};
+    use super::{
+        env_reserved, get_env, insert_provisioned, list_env, set_env, set_provisioned, tenant_env,
+        worker_settings, SOURCE_AUTH_DEFAULT, SOURCE_VOID_PROXY_TOKEN,
+    };
 
     /// The Worker-vars input is unfiltered: process-reserved names
     /// (`BETTER_AUTH_*` for Void auth, `PORT`, …) reach the merge, which
@@ -147,6 +238,103 @@ mod tests {
             tenant_env(&pool, &app.id).await,
             vec![("MODEL".to_string(), "x".to_string())]
         );
+    }
+
+    /// Provisioned rows route by marker: the auth secret rides the settings
+    /// merges, the proxy token rides the runner-owned merge only, and
+    /// neither reaches process env. The listing keeps every row (the UI
+    /// shows the names, values redacted as usual).
+    #[tokio::test]
+    async fn provisioned_rows_route_by_source_marker() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
+        let cfg = crate::config::config_for_tests();
+        let app = crate::db::create_app(
+            &pool,
+            &cfg,
+            crate::db::NewApp {
+                name: "prov-app",
+                slug: "prov-app",
+                user_id: "local",
+                subdomain: "prov-app.localhost",
+                listen: 30000,
+                internal: 30001,
+            },
+        )
+        .await
+        .expect("seed app");
+        assert!(insert_provisioned(
+            &pool,
+            &app.id,
+            "BETTER_AUTH_SECRET",
+            "minted",
+            SOURCE_AUTH_DEFAULT
+        )
+        .await
+        .unwrap());
+        assert!(insert_provisioned(
+            &pool,
+            &app.id,
+            "__VOID_PROXY_TOKEN",
+            "tok",
+            SOURCE_VOID_PROXY_TOKEN
+        )
+        .await
+        .unwrap());
+        set_env(&pool, &app.id, "MODEL", "x").await.unwrap();
+
+        assert_eq!(
+            worker_settings(&pool, &app.id).await.unwrap(),
+            vec![
+                ("BETTER_AUTH_SECRET".to_string(), "minted".to_string()),
+                ("MODEL".to_string(), "x".to_string()),
+            ]
+        );
+        assert_eq!(
+            tenant_env(&pool, &app.id).await,
+            vec![("MODEL".to_string(), "x".to_string())]
+        );
+        assert_eq!(list_env(&pool, &app.id).await.unwrap().len(), 3);
+
+        // Never overwriting: a second insert loses, whatever the marker.
+        assert!(!insert_provisioned(
+            &pool,
+            &app.id,
+            "BETTER_AUTH_SECRET",
+            "other",
+            SOURCE_AUTH_DEFAULT
+        )
+        .await
+        .unwrap());
+        assert!(
+            !insert_provisioned(&pool, &app.id, "MODEL", "other", SOURCE_AUTH_DEFAULT)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            get_env(&pool, &app.id, "BETTER_AUTH_SECRET")
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            "minted"
+        );
+        // A user write over a provisioned row makes it a user row.
+        set_env(&pool, &app.id, "BETTER_AUTH_SECRET", "mine")
+            .await
+            .unwrap();
+        let row = get_env(&pool, &app.id, "BETTER_AUTH_SECRET")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.value, "mine");
+        assert_eq!(row.source, "");
+        // Rotation overwrites unconditionally and re-marks the row.
+        set_provisioned(&pool, &app.id, "MODEL", "rot", SOURCE_VOID_PROXY_TOKEN)
+            .await
+            .unwrap();
+        let row = get_env(&pool, &app.id, "MODEL").await.unwrap().unwrap();
+        assert_eq!(row.value, "rot");
+        assert_eq!(row.source, SOURCE_VOID_PROXY_TOKEN);
     }
 
     #[test]

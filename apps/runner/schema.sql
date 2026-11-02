@@ -109,6 +109,7 @@ CREATE TABLE IF NOT EXISTS app_env (
   name TEXT NOT NULL,
   value TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (app_id, name)
 );
 
@@ -120,6 +121,7 @@ CREATE TABLE IF NOT EXISTS environment_env (
   name TEXT NOT NULL,
   value TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (environment_id, name)
 );
 
