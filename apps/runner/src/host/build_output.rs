@@ -147,6 +147,8 @@ pub fn plan_containers(
                     .transpose()
             };
             match (default.get("image").and_then(Value::as_str), path("dockerfile")?) {
+                // A file-valued `image` goes through the Dockerfile rule
+                // below, exactly as a plain `image` does.
                 (Some(image), None) if !default.contains_key("build_context") => {
                     entry.insert("image".into(), Value::String(image.to_string()));
                 }
@@ -161,7 +163,11 @@ pub fn plan_containers(
                 }
                 _ => bail!("containers[{index}].images.default needs exactly one of `image` or `dockerfile` (+ optional `build_context`)"),
             }
-        } else if let Some(image) = entry.get("image").and_then(Value::as_str) {
+        }
+        // celld builds any `image` naming a file (its `is_dockerfile`), so
+        // every such entry is prepared, whichever key it came from.
+        let built = dockerfiles.last().is_some_and(|(at, _)| *at == index);
+        if let (false, Some(image)) = (built, entry.get("image").and_then(Value::as_str)) {
             if is_dockerfile(deploy_root, image) {
                 dockerfiles.push((
                     index,
@@ -173,6 +179,12 @@ pub fn plan_containers(
             }
         }
     }
+    if dockerfiles.len() > MAX_DOCKERFILE_ENTRIES {
+        bail!(
+            "{} containers build from a Dockerfile; at most {MAX_DOCKERFILE_ENTRIES} may",
+            dockerfiles.len()
+        );
+    }
     Ok(Some(ContainersPlan {
         config: deploy_root.join(label),
         value,
@@ -180,6 +192,10 @@ pub fn plan_containers(
         changed,
     }))
 }
+
+/// Containers entries one deploy may build from a Dockerfile: each one is
+/// pulled, vetted and built before celld starts.
+const MAX_DOCKERFILE_ENTRIES: usize = 4;
 
 /// The deploy root's containers, normalized ([`plan_containers`]): set each
 /// Dockerfile entry's prepared image, then [`ContainersPlan::write`].
@@ -214,9 +230,30 @@ impl ContainersPlan {
         if !self.changed {
             return Ok(());
         }
-        std::fs::write(&self.config, serde_json::to_string_pretty(&self.value)?)
-            .with_context(|| format!("write {}", self.config.display()))
+        write_fresh(&self.config, &serde_json::to_string_pretty(&self.value)?)
     }
+}
+
+/// Write `path` as a new file: whatever the worktree left there (a symlink
+/// planted to aim this root write elsewhere included) is removed first,
+/// and `create_new` refuses to follow anything that reappears.
+pub(crate) fn write_fresh(path: &Path, text: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => bail!("{} is a directory", path.display()),
+        Ok(_) => {
+            std::fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("inspect {}", path.display())),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    file.write_all(text.as_bytes())
+        .with_context(|| format!("write {}", path.display()))
 }
 
 /// Whether `image` names a Dockerfile in the project rather than an image
@@ -384,7 +421,7 @@ fn celld_config_from(src: &Path, config: &Path) -> anyhow::Result<PathBuf> {
     relocate_migrations(obj, &config_dir, &root);
     obj.retain(|k, _| CELLD_KEYS.contains(&k.as_str()));
 
-    std::fs::write(&target, serde_json::to_string_pretty(&value)?)
+    write_fresh(&target, &serde_json::to_string_pretty(&value)?)
         .with_context(|| format!("write {}", display_rel(src, &target)))?;
     if let Some(assets) = &assets {
         apply_assetsignore(assets)?;
@@ -826,6 +863,67 @@ mod tests {
             let plan = plan_containers(&dir, false).unwrap().expect("declares");
             assert_eq!(!plan.dockerfiles.is_empty(), dockerfile, "{image}");
         }
+    }
+
+    /// celld builds any `image` naming a file, so a Void-shaped
+    /// `images.default.image` naming one must be prepared like a plain
+    /// `image`, never passed through unchecked (it would build the tenant's
+    /// `RUN` steps on the host engine).
+    #[test]
+    fn a_file_named_by_images_default_image_is_prepared() {
+        let dir = scratch("images-image-file").canonicalize().unwrap();
+        write(&dir.join("Dockerfile"), "FROM node:26\nRUN echo pwned\n");
+        write(
+            &dir.join("wrangler.json"),
+            r#"{"name":"a","containers":[{"class_name":"S","images":{"default":{"image":"Dockerfile"}}}]}"#,
+        );
+        let plan = plan_containers(&dir, false).unwrap().expect("declares");
+        assert_eq!(
+            plan.dockerfiles,
+            vec![(
+                0,
+                crate::host::container_image::Request {
+                    dockerfile: dir.join("Dockerfile"),
+                    context: None,
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn too_many_dockerfile_entries_are_refused() {
+        let dir = scratch("many-dockerfiles").canonicalize().unwrap();
+        write(&dir.join("Dockerfile"), "FROM scratch\n");
+        let entries: Vec<String> = (0..=MAX_DOCKERFILE_ENTRIES)
+            .map(|i| format!(r#"{{"class_name":"S{i}","image":"Dockerfile"}}"#))
+            .collect();
+        write(
+            &dir.join("wrangler.json"),
+            &format!(r#"{{"name":"a","containers":[{}]}}"#, entries.join(",")),
+        );
+        assert!(plan_containers(&dir, false).is_err());
+    }
+
+    /// The runner writes the relocated config as root: a link the tree left
+    /// at `dist/wrangler.json` (dangling, so nothing treats it as a config)
+    /// is replaced, never followed.
+    #[test]
+    #[cfg(unix)]
+    fn void_relocation_never_writes_through_a_planted_link() {
+        let src = scratch("void-link").canonicalize().unwrap();
+        write(
+            &src.join("dist/ssr/wrangler.json"),
+            r#"{"name":"app","main":"index.js","assets":{"directory":"../client"}}"#,
+        );
+        write(&src.join("dist/ssr/index.js"), "export default {}");
+        write(&src.join("dist/client/a.txt"), "");
+        let victim = scratch("void-link-victim").join("owned");
+        std::os::unix::fs::symlink(&victim, src.join("dist/wrangler.json")).unwrap();
+        built_deploy_root(&src).unwrap().expect("Void output");
+        assert!(!victim.exists(), "the write followed the link");
+        assert!(std::fs::symlink_metadata(src.join("dist/wrangler.json"))
+            .unwrap()
+            .is_file());
     }
 
     /// `NOITE_SANDBOX=off` refuses any `containers` entry; a config

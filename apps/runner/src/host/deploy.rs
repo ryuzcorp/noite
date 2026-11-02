@@ -346,6 +346,9 @@ impl Progress<'_> {
     }
 }
 
+/// One bound over pulling and vetting every Dockerfile image of a deploy.
+const PREPARE_IMAGES_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Output kept per successful step, and for a failure: the deploy row keeps
 /// a 64 KB tail, and earlier steps should survive a noisy failure.
 const STEP_OUTPUT_TAIL: usize = 4 * 1024;
@@ -893,17 +896,28 @@ async fn deploy_inner(
         match build_output::plan_containers(&deploy_root, cfg.sandbox_disabled)? {
             None => false,
             Some(mut plan) => {
-                for (index, request) in plan.dockerfiles.clone() {
-                    let dockerfile = crate::host::container_image::prepare(
-                        &src_dir,
-                        index,
-                        &request,
-                        &container_platform,
+                // One bound over every pull and vet, like the deploy's own.
+                tokio::time::timeout(PREPARE_IMAGES_TIMEOUT, async {
+                    for (index, request) in plan.dockerfiles.clone() {
+                        let dockerfile = crate::host::container_image::prepare(
+                            &src_dir,
+                            index,
+                            &request,
+                            &container_platform,
+                        )
+                        .await
+                        .map_err(|e| e.context(format!("containers[{index}] image")))?;
+                        plan.set_dockerfile(index, &dockerfile);
+                    }
+                    anyhow::Ok(())
+                })
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "preparing container images took longer than {} s",
+                        PREPARE_IMAGES_TIMEOUT.as_secs()
                     )
-                    .await
-                    .map_err(|e| e.context(format!("containers[{index}] image")))?;
-                    plan.set_dockerfile(index, &dockerfile);
-                }
+                })??;
                 plan.write()?;
                 true
             }

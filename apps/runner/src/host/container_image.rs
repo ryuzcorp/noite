@@ -46,6 +46,14 @@ const COPY_FLAGS: &[&str] = &[
 /// hundred bytes).
 const MAX_DOCKERFILE_BYTES: u64 = 64 * 1024;
 
+/// Registry images one Dockerfile may read (each is pulled and vetted).
+const MAX_IMAGES: usize = 8;
+
+/// What `docker build` may send as the build context: it tars the whole
+/// directory as root.
+const MAX_CONTEXT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_CONTEXT_FILES: usize = 20_000;
+
 /// One logical instruction: its keyword and the rest of the line, with
 /// continuations joined.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +219,7 @@ fn add_image(image: &str, images: &mut Vec<String>) {
 /// could swap at build time.
 fn check_reference(image: &str, what: &str) -> anyhow::Result<()> {
     let valid = !image.is_empty()
+        && !image.starts_with('-')
         && image
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | ':' | '@'));
@@ -245,7 +254,7 @@ impl Checked {
                 }
                 "COPY" => instruction
                     .args
-                    .split(' ')
+                    .split_whitespace()
                     .map(|token| match token.strip_prefix("--from=") {
                         Some(image) => format!("--from={}", pin(image)),
                         None => token.to_string(),
@@ -299,7 +308,12 @@ pub async fn prepare(
     if !context.is_dir() {
         bail!("build context {} is not a directory", context.display());
     }
-    let size = std::fs::metadata(&dockerfile)?.len();
+    check_context(&context)?;
+    let meta = std::fs::metadata(&dockerfile)?;
+    if !meta.is_file() {
+        bail!("Dockerfile {} is not a regular file", dockerfile.display());
+    }
+    let size = meta.len();
     if size > MAX_DOCKERFILE_BYTES {
         bail!(
             "Dockerfile {} is larger than {MAX_DOCKERFILE_BYTES} bytes",
@@ -309,13 +323,65 @@ pub async fn prepare(
     let text = std::fs::read_to_string(&dockerfile)
         .with_context(|| format!("read {}", dockerfile.display()))?;
     let checked = check(&text).with_context(|| format!("Dockerfile {}", dockerfile.display()))?;
+    if checked.images.len() > MAX_IMAGES {
+        bail!(
+            "Dockerfile {} reads {} registry images; at most {MAX_IMAGES} may",
+            dockerfile.display(),
+            checked.images.len()
+        );
+    }
     let mut pinned = Vec::new();
     for image in &checked.images {
         pinned.push((image.clone(), vet(image, platform).await?));
     }
     let target = context.join(format!(".noite-image-{index}.Dockerfile"));
-    write_fresh(&target, &checked.render(&pinned))?;
+    crate::host::build_output::write_fresh(&target, &checked.render(&pinned))?;
     Ok(target)
+}
+
+/// Bound the build context and keep every symlink in it pointing inside
+/// it, whatever the builder does with links (BuildKit confines them; the
+/// legacy builder is not relied on).
+fn check_context(context: &Path) -> anyhow::Result<()> {
+    let mut bytes = 0_u64;
+    let mut files = 0_usize;
+    let mut pending = vec![context.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let entry = entry?;
+            let path = entry.path();
+            let meta = entry.metadata()?;
+            files += 1;
+            if files > MAX_CONTEXT_FILES {
+                bail!(
+                    "build context {} holds more than {MAX_CONTEXT_FILES} entries",
+                    context.display()
+                );
+            }
+            if meta.is_symlink() {
+                let resolved = path.canonicalize().ok();
+                if !resolved.is_some_and(|target| target.starts_with(context)) {
+                    bail!(
+                        "{} links outside the build context {}",
+                        path.display(),
+                        context.display()
+                    );
+                }
+            } else if meta.is_dir() {
+                pending.push(path);
+            } else {
+                bytes += meta.len();
+                if bytes > MAX_CONTEXT_BYTES {
+                    bail!(
+                        "build context {} is larger than {} MiB",
+                        context.display(),
+                        MAX_CONTEXT_BYTES / 1024 / 1024
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `path` resolved, symlinks included, and required inside `src`.
@@ -325,28 +391,6 @@ fn within(src: &Path, path: &Path) -> anyhow::Result<PathBuf> {
         bail!("is outside the app's worktree");
     }
     Ok(resolved)
-}
-
-/// Write `path` as a new file: whatever the worktree left there (a symlink
-/// planted to aim this root write elsewhere included) is removed first,
-/// and `create_new` refuses to follow anything that reappears.
-fn write_fresh(path: &Path, text: &str) -> anyhow::Result<()> {
-    use std::io::Write;
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_dir() => bail!("{} is a directory", path.display()),
-        Ok(_) => {
-            std::fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("inspect {}", path.display())),
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("create {}", path.display()))?;
-    file.write_all(text.as_bytes())
-        .with_context(|| format!("write {}", path.display()))
 }
 
 /// Pull `image` for the nodes' platform, refuse it when it carries `ONBUILD`
@@ -458,6 +502,45 @@ mod tests {
         );
     }
 
+    /// Pinning tokenizes like the check: a tab after `--from=<image>` must
+    /// not leave the image unpinned (the build would pull a retagged one).
+    #[test]
+    fn copy_from_is_pinned_whatever_the_whitespace() {
+        let checked = check("FROM scratch\nCOPY --from=evil:1\t/a\t/b\n").expect("copy");
+        assert_eq!(checked.images, vec!["evil:1"]);
+        let rendered = checked.render(&[("evil:1".into(), "evil@sha256:ccc".into())]);
+        assert!(
+            rendered.contains("COPY --from=evil@sha256:ccc /a /b\n"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("evil:1"), "{rendered}");
+    }
+
+    #[test]
+    fn image_references_that_read_as_flags_are_refused() {
+        assert!(check("FROM -f\n").is_err());
+        assert!(check("FROM scratch\nCOPY --from=-x /a /b\n").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn context_links_must_stay_inside_and_size_is_bounded() {
+        let base = std::env::temp_dir().join(format!("noite-ctx-{}", uuid::Uuid::new_v4()));
+        let ctx = base.join("ctx");
+        std::fs::create_dir_all(ctx.join("sub")).unwrap();
+        std::fs::write(ctx.join("sub/a"), "a").unwrap();
+        std::os::unix::fs::symlink(ctx.join("sub/a"), ctx.join("inside")).unwrap();
+        let ctx = ctx.canonicalize().unwrap();
+        check_context(&ctx).expect("links inside the context are fine");
+        std::os::unix::fs::symlink("/etc/passwd", ctx.join("sub/out")).unwrap();
+        assert!(format!("{:#}", check_context(&ctx).unwrap_err()).contains("links outside"));
+        std::fs::remove_file(ctx.join("sub/out")).unwrap();
+        let big = std::fs::File::create(ctx.join("big")).unwrap();
+        big.set_len(MAX_CONTEXT_BYTES + 1).unwrap();
+        assert!(format!("{:#}", check_context(&ctx).unwrap_err()).contains("larger than"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn stages_are_not_registry_images() {
         let checked = check(
@@ -555,12 +638,24 @@ mod tests {
             prepare(&src, 0, &outside, "linux/amd64").await.unwrap_err()
         )
         .contains("outside the app's worktree"));
-        // A planted symlink at the output name is replaced, never followed.
-        let victim = base.join("victim");
-        std::fs::write(&victim, "keep").unwrap();
-        std::os::unix::fs::symlink(&victim, src.join("sandbox/.noite-image-0.Dockerfile")).unwrap();
-        let ok = Request {
+        // A context with a link out of it is refused.
+        let linked = Request {
             dockerfile: src.join("sandbox/Real"),
+            context: None,
+        };
+        assert!(format!(
+            "{:#}",
+            prepare(&src, 0, &linked, "linux/amd64").await.unwrap_err()
+        )
+        .contains("links outside the build context"));
+        // A planted symlink at the output name is replaced, never followed.
+        std::fs::create_dir_all(src.join("ok")).unwrap();
+        std::fs::write(src.join("ok/Dockerfile"), "FROM scratch\n").unwrap();
+        let victim = src.join("ok/victim");
+        std::fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, src.join("ok/.noite-image-0.Dockerfile")).unwrap();
+        let ok = Request {
+            dockerfile: src.join("ok/Dockerfile"),
             context: None,
         };
         let written = prepare(&src, 0, &ok, "linux/amd64")
