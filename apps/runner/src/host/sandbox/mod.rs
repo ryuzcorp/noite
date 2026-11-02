@@ -24,7 +24,10 @@
 //!
 //! [`registry`] is the shared ownership state between them.
 
+pub mod gateway;
+pub mod plane;
 pub mod registry;
+pub mod relay;
 
 /// Loopback port of the gateway listener; fleet dials to celld's bridges are
 /// redirected here. Below the fleet port range (`db::alloc`, 20000+).

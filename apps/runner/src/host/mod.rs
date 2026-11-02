@@ -32,7 +32,6 @@ pub mod rehydrate;
 pub mod rename;
 pub mod s3;
 pub mod sandbox;
-pub mod sandbox_net;
 pub mod sleep;
 pub mod source;
 pub mod sourcemaps;

@@ -24,8 +24,9 @@ struct Registry {
 static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
 
 fn with<T>(f: impl FnOnce(&mut Registry) -> T) -> T {
-    let mut guard: MutexGuard<'_, Option<Registry>> =
-        REGISTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard: MutexGuard<'_, Option<Registry>> = REGISTRY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     f(guard.get_or_insert_with(Registry::default))
 }
 
@@ -128,13 +129,19 @@ mod tests {
         assert_eq!(owner_of_ip(ip), None, "no address yet");
         record_container("reg-a", "celld-reg-a-1", Some(ip));
         assert_eq!(owner_of_ip(ip).as_deref(), Some("reg-a"));
-        assert_eq!(owner_of_container("celld-reg-a-1").as_deref(), Some("reg-a"));
+        assert_eq!(
+            owner_of_container("celld-reg-a-1").as_deref(),
+            Some("reg-a")
+        );
         // The engine reuses a freed address for another fleet's container.
         forget_container("celld-reg-a-1");
         assert_eq!(owner_of_ip(ip), None);
         record_container("reg-b", "celld-reg-b-1", Some(ip));
         assert_eq!(owner_of_ip(ip).as_deref(), Some("reg-b"));
-        assert_eq!(forget_fleet_containers("reg-b"), vec!["celld-reg-b-1".to_string()]);
+        assert_eq!(
+            forget_fleet_containers("reg-b"),
+            vec!["celld-reg-b-1".to_string()]
+        );
         assert_eq!(owner_of_ip(ip), None);
     }
 
