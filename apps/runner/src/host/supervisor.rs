@@ -3,6 +3,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -858,27 +859,106 @@ pub async fn stop_all(procs: &ProcMap, budget: Duration) {
     }
 }
 
-pub async fn reload_fleet(app: &App) {
+/// What celld's `POST /reload` concluded (celld 0.6.3 `internal_reload`):
+/// `{ok, outcome, ...}` with `outcome` one of `adopted`, `unchanged`,
+/// `failed` (422, with `error`), or `unavailable` (503, no pointer yet).
+/// Anything else — a transport error, an unparsable body — is
+/// [`ReloadOutcome::Unreachable`]: the deploy keeps its current handling
+/// (a warning; the health gate below decides), because the reload races a
+/// cold boot and the old generation still serves either way. Only an
+/// explicit failed adoption fails the deploy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReloadOutcome {
+    Adopted,
+    Unchanged,
+    Failed { error: String },
+    Unreachable,
+}
+
+impl ReloadOutcome {
+    /// Fail the deploy when celld refused the new generation, with celld's
+    /// own error; anything else (adopted, unchanged, unreachable) proceeds
+    /// to the health gate.
+    pub fn fail_deploy_on_failed(self, fleet: &str) -> anyhow::Result<()> {
+        match self {
+            ReloadOutcome::Failed { error } => {
+                anyhow::bail!("celld refused the new deployment for {fleet}: {error}")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Parse one `POST /reload` response body into its outcome. `failed`
+/// carries celld's error; `adopted`/`unchanged` succeed; `unavailable` and
+/// anything unparsable read as unreachable (warned by the caller).
+pub fn parse_reload_response(body: &str) -> ReloadOutcome {
+    let outcome = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("outcome")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    match outcome.as_deref() {
+        Some("adopted") => ReloadOutcome::Adopted,
+        Some("unchanged") => ReloadOutcome::Unchanged,
+        Some("failed") => {
+            let error = serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .filter(|error| !error.is_empty())
+                .unwrap_or_else(|| "celld reported a failed reload".to_string());
+            ReloadOutcome::Failed { error }
+        }
+        _ => ReloadOutcome::Unreachable,
+    }
+}
+
+/// POST /reload on the fleet and report what celld concluded. See
+/// [`ReloadOutcome`]: only a failed adoption is returned as such — a
+/// transport error warns, as before, and reads as unreachable.
+pub async fn reload_fleet(app: &App) -> ReloadOutcome {
     let Some(port) = app.internal_port else {
-        return;
+        return ReloadOutcome::Unreachable;
     };
-    reload_at(&app.slug, port).await;
+    reload_at(&app.slug, port).await
 }
 
 /// POST /reload on an environment fleet, so a preview deploy goes live
-/// without waiting for celld's own poll.
-pub async fn reload_environment_fleet(env: &crate::models::Environment) {
+/// without waiting for celld's own poll. Same outcome contract as
+/// [`reload_fleet`].
+pub async fn reload_environment_fleet(env: &crate::models::Environment) -> ReloadOutcome {
     let Some(port) = env.internal_port else {
-        return;
+        return ReloadOutcome::Unreachable;
     };
-    reload_at(&env_fleet_key(&env.app_slug, &env.label), port).await;
+    reload_at(&env_fleet_key(&env.app_slug, &env.label), port).await
 }
 
-async fn reload_at(fleet: &str, port: i64) {
+async fn reload_at(fleet: &str, port: i64) -> ReloadOutcome {
     let url = format!("http://127.0.0.1:{port}/reload");
-    if let Err(e) = reqwest::Client::new().post(&url).send().await {
-        tracing::warn!(fleet = %fleet, error = %e, "reload failed");
+    let response = match reqwest::Client::new().post(&url).send().await {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::warn!(fleet = %fleet, error = %e, "reload failed");
+            return ReloadOutcome::Unreachable;
+        }
+    };
+    let body = response.text().await.unwrap_or_default();
+    let outcome = parse_reload_response(&body);
+    if outcome == ReloadOutcome::Unreachable {
+        // Truncated: the body is celld's, not ours, and the deploy log
+        // below prints only what the deploy does with the outcome.
+        let snippet: String = body.chars().take(200).collect();
+        tracing::warn!(fleet = %fleet, body = %snippet, "reload outcome unparsable");
     }
+    outcome
 }
 
 #[cfg(test)]
@@ -1251,5 +1331,74 @@ mod tests {
         assert_eq!(clamp_memory_mb(Some(1024), 512, 256, false), 1024);
         assert_eq!(clamp_memory_mb(None, 512, 256, true), 256);
         assert_eq!(clamp_memory_mb(None, 512, 256, false), 512);
+    }
+
+    /// celld's `/reload` bodies (0.6.3 `internal_reload`) parse into their
+    /// outcomes: `failed` keeps celld's error, `unavailable` and anything
+    /// unexpected read as unreachable.
+    #[test]
+    fn reload_bodies_parse_into_their_outcomes() {
+        assert_eq!(
+            parse_reload_response(
+                r#"{"ok":true,"outcome":"adopted","generation":3,"version":"v","prefix":"p"}"#
+            ),
+            ReloadOutcome::Adopted
+        );
+        assert_eq!(
+            parse_reload_response(
+                r#"{"ok":true,"outcome":"unchanged","generation":3,"version":"v"}"#
+            ),
+            ReloadOutcome::Unchanged
+        );
+        assert_eq!(
+            parse_reload_response(
+                r#"{"ok":false,"outcome":"failed","version":"v","prefix":"p","error":"load service binding target no-such-script"}"#
+            ),
+            ReloadOutcome::Failed {
+                error: "load service binding target no-such-script".to_string(),
+            }
+        );
+        // A failed outcome without an error still fails, with a fallback.
+        assert!(matches!(
+            parse_reload_response(r#"{"ok":false,"outcome":"failed"}"#),
+            ReloadOutcome::Failed { .. }
+        ));
+        // No pointer yet, an unknown outcome, garbage: all unreachable.
+        for body in [
+            r#"{"ok":false,"outcome":"unavailable","error":"this node has no deployment pointer to reload from"}"#,
+            r#"{"ok":true,"outcome":"rebuilding"}"#,
+            r#"{"ok":true}"#,
+            "not json",
+            "",
+        ] {
+            assert_eq!(
+                parse_reload_response(body),
+                ReloadOutcome::Unreachable,
+                "{body}"
+            );
+        }
+    }
+
+    /// Only a failed adoption fails the deploy — with celld's error naming
+    /// the cause — while adopted, unchanged and unreachable proceed to the
+    /// health gate.
+    #[test]
+    fn only_a_failed_adoption_fails_the_deploy() {
+        let err = ReloadOutcome::Failed {
+            error: "load service binding target no-such-script".to_string(),
+        }
+        .fail_deploy_on_failed("blog")
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("load service binding target no-such-script"),
+            "{err:#}"
+        );
+        for outcome in [
+            ReloadOutcome::Adopted,
+            ReloadOutcome::Unchanged,
+            ReloadOutcome::Unreachable,
+        ] {
+            assert!(outcome.fail_deploy_on_failed("blog").is_ok());
+        }
     }
 }
