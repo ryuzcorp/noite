@@ -11,10 +11,15 @@
 //! so an app allocated any uid in the range is policed. Replies on connections
 //! others opened (Caddy → a fleet, the host's published ports) always pass.
 //!
-//! Two dynamic allowances punch scoped holes ahead of the rejects: the object
-//! store's addresses (both identities — release commands hold the scope key)
-//! and celld's Sandbox bridge subnets (fleet only — builds never dial
-//! sandboxes; see `host::sandbox_net`, which also owns the host-leg table).
+//! One dynamic allowance punches a scoped hole ahead of the rejects: the object
+//! store's addresses (both identities — release commands hold the scope key).
+//! Sandbox container dials no longer cross this chain directly: fleet TCP
+//! toward celld's bridges is redirected (nft `nat` output, the
+//! `noite_gateway` table) to the runner's gateway listener on
+//! 127.0.0.1:8071, which admits only dials to containers the connecting
+//! fleet owns (`host::sandbox::gateway`). This chain accepts those
+//! redirected flows — and only those (`ct status dnat`) — ahead of the
+//! loopback rejects.
 //!
 //! Requires `CAP_NET_ADMIN`. The runner probes at boot (`nft list tables`)
 //! and exposes the result in `/ready` detail and `make doctor`. Where no
@@ -32,8 +37,6 @@ static APPLIED_STORAGE: Mutex<Storage> = Mutex::new(Storage {
     addrs: Vec::new(),
     port: 0,
 });
-/// Sandbox subnets the applied table allows (to notice when they appear).
-static APPLIED_SANDBOX: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// The object store a tenant fleet's own celld process must reach: its
 /// resolved addresses and port. Worker code in that process can reach it
@@ -81,59 +84,32 @@ fn applied_storage() -> Storage {
         .unwrap_or_default()
 }
 
-fn applied_sandbox() -> Vec<String> {
-    APPLIED_SANDBOX
-        .lock()
-        .map(|applied| applied.clone())
-        .unwrap_or_default()
-}
-
 /// Record what the installed table carries, after a successful apply.
-/// Full assignment, never a slice copy: the lists change length (empty at
-/// boot, non-empty once celld's bridges exist), and a length-mismatched
-/// slice copy panics — at boot, that crash-loops the runner.
-fn record_applied(storage: &Storage, sandbox: &[String]) {
+fn record_applied(storage: &Storage) {
     if let Ok(mut applied) = APPLIED_STORAGE.lock() {
         applied.clone_from(storage);
     }
-    if let Ok(mut applied) = APPLIED_SANDBOX.lock() {
-        *applied = sandbox.to_vec();
-    }
 }
 
-/// Keep the dynamic allowances current: the bundled store's container address
-/// can change when it restarts, and celld creates its Sandbox bridges lazily
-/// on first Sandbox use — a stale table would cut every fleet off from its
-/// bucket or leave Sandbox containers unreachable. Re-resolves every 30 s and
-/// re-applies on change. An empty discovery keeps the applied values: a
-/// failed lookup must not cut live traffic.
+/// Keep the storage allowance current: the bundled store's container address
+/// can change when it restarts, and a stale table would cut every fleet off
+/// from its bucket. Re-resolves every 30 s and re-applies on change. An
+/// empty discovery keeps the applied values: a failed lookup must not cut
+/// live traffic. (The sandbox gateway table re-applies on its own refresh;
+/// this chain's gateway rule needs no discovery.)
 pub fn spawn_policy_refresh(build: Option<(u32, u32)>, fleet_uid: u32, endpoint: String) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
             let storage = storage_target(&endpoint).await;
-            let sandbox = super::sandbox_net::discover().await;
-            let storage_changed = !storage.addrs.is_empty() && applied_storage() != storage;
-            let sandbox_changed = !sandbox.celld.is_empty() && applied_sandbox() != sandbox.celld;
-            if !storage_changed && !sandbox_changed {
+            if storage.addrs.is_empty() || applied_storage() == storage {
                 continue;
             }
-            let effective_storage = if storage.addrs.is_empty() {
-                applied_storage()
-            } else {
-                storage
-            };
-            let effective_sandbox = if sandbox.celld.is_empty() {
-                applied_sandbox()
-            } else {
-                sandbox.celld
-            };
             tracing::info!(
-                storage = ?effective_storage.addrs,
-                sandbox = ?effective_sandbox,
-                "dynamic allowances moved; re-applying egress policy"
+                storage = ?storage.addrs,
+                "object store moved; re-applying egress policy"
             );
-            ensure(build, fleet_uid, &effective_storage, &effective_sandbox).await;
+            ensure(build, fleet_uid, &storage).await;
         }
     });
 }
@@ -168,17 +144,8 @@ fn sandbox_identities(build: Option<(u32, u32)>, fleet_uid: u32) -> Vec<String> 
     ids
 }
 
-/// The nftables ruleset for the build range and fleet uid. `sandbox` is the
-/// discovered celld bridge subnets (`host::sandbox_net`): the fleet dials
-/// Sandbox containers there, so they are ACCEPTed for the fleet uid only,
-/// ahead of the private-range rejects. Anything failing validation is
-/// dropped here too, so a bad discovery can never render into the table.
-fn ruleset(
-    build: Option<(u32, u32)>,
-    fleet_uid: u32,
-    storage: &Storage,
-    sandbox: &[String],
-) -> String {
+/// The nftables ruleset for the build range and fleet uid.
+fn ruleset(build: Option<(u32, u32)>, fleet_uid: u32, storage: &Storage) -> String {
     // Order matters: the first matching rule wins. Replies go first (see
     // below), then DNS, which must be accepted
     // before the private/loopback rejects, because the container resolver
@@ -241,22 +208,18 @@ fn ruleset(
             ));
         }
     }
-    // The fleet's celld dials Sandbox containers at their bridge IPs on
-    // celld's bridges: allow fleet TCP there, ahead of the private-range
-    // rejects that would otherwise refuse every dial (and hang Sandbox SDK
-    // polls until the edge times out). Fleet only: builds never dial
-    // sandboxes. Ports stay open — container ports vary by class.
-    let sandbox: Vec<&str> = sandbox
-        .iter()
-        .map(String::as_str)
-        .filter(|s| super::sandbox_net::valid_cidr(s))
-        .collect();
-    if !sandbox.is_empty() {
-        rules.push(format!(
-            "    meta skuid {fleet_uid} ip daddr {{ {} }} meta l4proto tcp accept",
-            sandbox.join(", ")
-        ));
-    }
+    // Sandbox container dials reach the runner's gateway listener, not the
+    // bridges directly: fleet TCP toward celld's subnets is redirected to
+    // 127.0.0.1:GATEWAY_PORT (the `noite_gateway` table), and the gateway
+    // admits only dials to containers the connecting fleet owns. This rule
+    // lets those redirected flows through, ahead of the loopback rejects —
+    // and `ct status dnat` keeps it to exactly those flows, so a fleet
+    // dialing the gateway port directly is still refused below. Fleet only:
+    // builds never dial sandboxes.
+    rules.push(format!(
+        "    meta skuid {fleet_uid} ip daddr 127.0.0.1 tcp dport {} ct status dnat accept",
+        super::sandbox::GATEWAY_PORT,
+    ));
     // No new connection to loopback, any protocol: that is where the operator
     // APIs, the runner, Caddy's admin and every other fleet listen.
     for id in &identities {
@@ -284,13 +247,8 @@ table inet noite {{
 
 /// Install the table (idempotent: the ruleset replaces it atomically). Best-effort: records the
 /// reason and returns false when `nft` is missing or CAP_NET_ADMIN is absent.
-pub async fn ensure(
-    build: Option<(u32, u32)>,
-    fleet_uid: u32,
-    storage: &Storage,
-    sandbox: &[String],
-) -> bool {
-    let rules = ruleset(build, fleet_uid, storage, sandbox);
+pub async fn ensure(build: Option<(u32, u32)>, fleet_uid: u32, storage: &Storage) -> bool {
+    let rules = ruleset(build, fleet_uid, storage);
     // Probe first: missing binary or capability surfaces here.
     match nft_run(&["list", "tables"], None).await {
         Ok(()) => {}
@@ -305,7 +263,7 @@ pub async fn ensure(
         Ok(()) => {
             reason("nft noite table installed".to_string());
             NFT_OK.store(true, Ordering::Relaxed);
-            record_applied(storage, sandbox);
+            record_applied(storage);
             tracing::info!(build_range = ?build, fleet_uid, "nft egress policy installed");
             true
         }
@@ -318,7 +276,9 @@ pub async fn ensure(
     }
 }
 
-async fn nft_run(args: &[&str], stdin_text: Option<&str>) -> Result<(), String> {
+/// Run `nft` in this container's netns (shared with the sandbox gateway
+/// table, which lives in its own table but the same namespace).
+pub(crate) async fn nft_run(args: &[&str], stdin_text: Option<&str>) -> Result<(), String> {
     let mut cmd = tokio::process::Command::new("nft");
     cmd.args(args)
         .env_clear()
@@ -350,7 +310,7 @@ async fn nft_run(args: &[&str], stdin_text: Option<&str>) -> Result<(), String> 
 
 #[cfg(test)]
 mod tests {
-    use super::{applied_sandbox, record_applied, ruleset, Storage};
+    use super::{applied_storage, record_applied, ruleset, Storage};
 
     const BUILD: Option<(u32, u32)> = Some((10030, 1024));
 
@@ -360,7 +320,7 @@ mod tests {
             addrs: vec!["10.89.0.7".parse().unwrap()],
             port: 9000,
         };
-        let rules = ruleset(BUILD, 10020, &storage, &[]);
+        let rules = ruleset(BUILD, 10020, &storage);
         let first_reject = rules.find(" reject").expect("has rejects");
         for uid in ["10020", "10030-11053"] {
             // Pre-NAT port: Docker DNATs its resolver off port 53.
@@ -401,7 +361,7 @@ mod tests {
     #[test]
     fn build_uid_range_is_closed_off_in_every_rule() {
         let storage = Storage::default();
-        let rules = ruleset(BUILD, 10020, &storage, &[]);
+        let rules = ruleset(BUILD, 10020, &storage);
         let range = "10030-11053";
         for prefix in [
             format!("meta skuid {range} ip daddr 127.0.0.0/8 reject"),
@@ -427,7 +387,7 @@ mod tests {
     /// A one-uid range degrades to a single match (and no `lo-hi`).
     #[test]
     fn single_uid_range_emits_a_plain_match() {
-        let rules = ruleset(Some((10030, 1)), 10020, &Storage::default(), &[]);
+        let rules = ruleset(Some((10030, 1)), 10020, &Storage::default());
         assert!(rules.contains("meta skuid 10030 ip daddr 127.0.0.0/8 reject"));
         assert!(
             !rules.contains("10030-"),
@@ -439,7 +399,7 @@ mod tests {
     /// still installs.
     #[test]
     fn without_build_uids_only_the_fleet_is_policed() {
-        let rules = ruleset(None, 10020, &Storage::default(), &[]);
+        let rules = ruleset(None, 10020, &Storage::default());
         assert!(rules.contains("meta skuid 10020 ip daddr 127.0.0.0/8 reject"));
         assert!(
             !rules.contains("meta skuid 10030"),
@@ -447,44 +407,49 @@ mod tests {
         );
     }
 
-    /// The fleet reaches Sandbox containers on celld's bridges: a fleet-only
-    /// TCP ACCEPT for the discovered subnets, ahead of the private rejects.
-    /// Builds never dial sandboxes, so the range stays closed.
+    /// Sandbox container dials arrive at the gateway listener through the
+    /// `noite_gateway` redirect: a fleet-only ACCEPT for those redirected
+    /// flows, ahead of the loopback rejects. `ct status dnat` keeps it to
+    /// redirected flows only (a fleet dialing the gateway port directly is
+    /// still refused below); builds never dial sandboxes, so the range has
+    /// no such rule and no path to the bridges at all.
     #[test]
-    fn fleet_reaches_sandbox_subnets_before_the_private_rejects() {
-        let sandbox = vec!["172.19.0.0/16".to_string(), "172.20.0.0/16".to_string()];
-        let rules = ruleset(BUILD, 10020, &Storage::default(), &sandbox);
+    fn fleet_reaches_the_gateway_only_through_the_redirect() {
+        let rules = ruleset(BUILD, 10020, &Storage::default());
         let first_reject = rules.find(" reject").expect("has rejects");
         let accept = rules
-            .find("meta skuid 10020 ip daddr { 172.19.0.0/16, 172.20.0.0/16 } meta l4proto tcp accept")
-            .expect("sandbox accept present");
+            .find("meta skuid 10020 ip daddr 127.0.0.1 tcp dport 8071 ct status dnat accept")
+            .expect("gateway accept present");
         assert!(
             accept < first_reject,
-            "sandbox must be allowed before the rejects"
+            "gateway must be allowed before the rejects"
         );
         assert!(
-            !rules.contains("meta skuid 10030-11053 ip daddr { 172.19.0.0/16"),
-            "builds must not reach sandboxes"
+            !rules.contains("meta skuid 10030-11053 ip daddr 127.0.0.1 tcp dport 8071"),
+            "builds must not reach the gateway"
         );
-        // Nothing discovered: byte-identical to the policy without sandboxes.
-        let bare = ruleset(BUILD, 10020, &Storage::default(), &[]);
-        assert!(!bare.contains("172.19.0.0/16"));
-        assert!(!bare.contains("meta l4proto tcp accept"));
+        // No direct path to the bridges anywhere in this chain: the old
+        // fleet subnet ACCEPT is gone, the redirect owns that path now.
+        assert!(
+            !rules.contains("meta l4proto tcp accept"),
+            "no direct bridge ACCEPT may remain"
+        );
     }
 
-    /// Recording applied state survives length changes: empty at boot, then
-    /// non-empty once celld's bridges exist, then empty again. A slice copy
-    /// here panicked on the first length change and crash-looped the runner.
+    /// Recording applied state is a full assignment: the store's addresses
+    /// change length when the store restarts, and a slice copy here once
+    /// panicked on the first length change and crash-looped the runner.
     #[test]
     fn recording_applied_state_handles_length_changes() {
-        record_applied(&Storage::default(), &[]);
-        assert!(applied_sandbox().is_empty());
-        let subnets = vec!["172.19.0.0/16".to_string(), "172.20.0.0/16".to_string()];
-        record_applied(&Storage::default(), &subnets);
-        assert_eq!(applied_sandbox(), subnets);
-        record_applied(&Storage::default(), &subnets[..1]);
-        assert_eq!(applied_sandbox(), subnets[..1].to_vec());
-        record_applied(&Storage::default(), &[]);
-        assert!(applied_sandbox().is_empty());
+        record_applied(&Storage::default());
+        assert!(applied_storage().addrs.is_empty());
+        let storage = Storage {
+            addrs: vec!["10.89.0.7".parse().unwrap(), "10.89.0.8".parse().unwrap()],
+            port: 9000,
+        };
+        record_applied(&storage);
+        assert_eq!(applied_storage(), storage);
+        record_applied(&Storage::default());
+        assert!(applied_storage().addrs.is_empty());
     }
 }

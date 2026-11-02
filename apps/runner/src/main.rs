@@ -79,6 +79,11 @@ async fn main() -> anyhow::Result<()> {
         let config = Config::from_env()?;
         return telemetry::run(&config, &argv[1..]).await;
     }
+    // The sandbox relay runs from this same binary in its own container: no
+    // config, no logging setup, nothing started — it must not need runner env.
+    if argv.first().map(String::as_str) == Some("sandbox-relay") {
+        return host::sandbox::relay::run_standalone(&argv[1..]).await;
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -199,18 +204,10 @@ async fn main() -> anyhow::Result<()> {
     // The build range is `None` when uid drops are disabled; fleets are
     // still policed (builds are refused separately).
     let build_uids = config.build_uid_base.map(|b| (b, config.build_uid_range));
-    // The sandbox plane (celld bridges + this install's subnets): empty when
-    // no engine is reachable, in which case no Sandbox container can exist.
-    let sandbox = host::sandbox_net::discover().await;
-    tracing::info!(
-        celld = ?sandbox.celld,
-        own = ?sandbox.own,
-        "sandbox plane discovered"
-    );
     let nft_installed = match (config.tenancy, config.fleet_uid) {
         (config::Tenancy::Multi, Some(f)) => {
             let storage = host::netisolation::storage_target(&config.s3_endpoint).await;
-            let ok = host::netisolation::ensure(build_uids, f, &storage, &sandbox.celld).await;
+            let ok = host::netisolation::ensure(build_uids, f, &storage).await;
             if ok {
                 host::netisolation::spawn_policy_refresh(build_uids, f, config.s3_endpoint.clone());
             }
@@ -221,17 +218,81 @@ async fn main() -> anyhow::Result<()> {
             false
         }
     };
-    // The host legs of the sandbox path (both tenancies: single has no
-    // container policy but the same host isolation): DOCKER-USER allowlist
-    // plus raw-pin sweep, re-ensured on a refresh because pins return as
-    // containers churn. Best-effort and never blocking: the pass runs in a
-    // spawned task (a dozen sequential engine calls would otherwise stall
-    // cgroups, isolation checks, and Caddy behind a sick engine), and a
-    // failure only keeps Sandbox classes unreachable.
-    tokio::spawn(async move {
-        host::sandbox_net::ensure_host_rules(&sandbox).await;
-    });
-    host::sandbox_net::spawn_host_refresh();
+    // The sandbox plane (both tenancies: single has no egress policy but the
+    // same relay/gateway path): celld bridges, relay container, gateway
+    // listener, gateway nft table, and the one-time cleanup of what
+    // alpha.12–14 left on the host. Best-effort and never blocking: the
+    // whole pass runs in a spawned task (sequential engine calls would
+    // otherwise stall cgroups, isolation checks, and Caddy behind a sick
+    // engine, #120's fix), and a failure only keeps Sandbox classes
+    // unreachable. One refresh task re-ensures networks/relay/table every
+    // 30 s, jittered; only the storage allowance refreshes separately.
+    // This install's id scopes the sandbox container labels, so the sweeps
+    // below never touch another install's containers on a shared engine.
+    host::sandbox::set_install(host::credentials::install_tag(
+        &config.s3_endpoint,
+        &config.s3_bucket,
+        &config.aws_region,
+    ));
+    // Before any fleet starts (so it cannot remove a container a fresh fleet
+    // just created): the previous run's fleet containers are orphans now —
+    // their fleets died with the runner. Also with sandboxing switched off,
+    // so turning it off leaves nothing running. Bounded, so a sick engine
+    // delays boot by at most the bound. Reading this container's image here
+    // too lets the engine proxy run celld's fence from it from the start.
+    let boot_pass = async {
+        let swept = host::sandbox::engine::sweep_boot().await;
+        if !config.sandbox_disabled {
+            host::sandbox::plane::own_container().await;
+        }
+        swept
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(20), boot_pass).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "sandbox boot sweep failed"),
+        Err(_) => tracing::warn!("sandbox boot sweep timed out"),
+    }
+    if !config.sandbox_disabled {
+        let fleet_ids = config
+            .fleet_uid
+            .map(|uid| (uid, config.fleet_gid.unwrap_or(uid)));
+        tokio::spawn(async move {
+            let first = host::sandbox::plane::ensure_networks().await;
+            if first.engine {
+                tracing::info!(subnets = ?first.subnets, "sandbox plane ensured");
+                let relay_ok = host::sandbox::relay::ensure().await;
+                host::sandbox::gateway::spawn(fleet_ids);
+                let table_ok = host::sandbox::gateway::ensure_table(
+                    &first.subnets,
+                    fleet_ids.map(|(uid, _)| uid),
+                )
+                .await;
+                host::sandbox::plane::cleanup_legacy().await;
+                let relay_healthy = relay_ok && host::sandbox::relay::healthy().await;
+                host::sandbox::plane::record(true, first.subnets, relay_healthy, table_ok);
+            } else {
+                tracing::debug!("no engine; sandbox plane not ensured");
+                host::sandbox::plane::record(false, Vec::new(), false, false);
+            }
+            loop {
+                let jitter = rand::random::<u64>() % 5;
+                tokio::time::sleep(std::time::Duration::from_secs(30 + jitter)).await;
+                let nets = host::sandbox::plane::ensure_networks().await;
+                if !nets.engine {
+                    host::sandbox::plane::record(false, Vec::new(), false, false);
+                    continue;
+                }
+                let relay_ok = host::sandbox::relay::ensure().await;
+                let table_ok = host::sandbox::gateway::ensure_table(
+                    &nets.subnets,
+                    fleet_ids.map(|(uid, _)| uid),
+                )
+                .await;
+                let relay_healthy = relay_ok && host::sandbox::relay::healthy().await;
+                host::sandbox::plane::record(true, nets.subnets, relay_healthy, table_ok);
+            }
+        });
+    }
     // Per-fleet cgroups before any child is spawned: setup drains the
     // runner's own cgroup (tini stays reaped, cgroups do not affect that)
     // into a leaf, so children spawned after it inherit the leaf and tenant
@@ -389,7 +450,15 @@ async fn main() -> anyhow::Result<()> {
             control.stop(budget).await;
         }
     };
-    tokio::join!(host::supervisor::stop_all(&procs, budget), control_stop);
+    // The sandbox relay belongs to this container: remove it under the same
+    // budget (a leftover is replaced on the next boot, but a clean shutdown
+    // leaves no orphan for the next install to sweep).
+    let relay_stop = host::sandbox::relay::remove_ours();
+    tokio::join!(
+        host::supervisor::stop_all(&procs, budget),
+        control_stop,
+        relay_stop
+    );
     caddy_child.stop(std::time::Duration::from_secs(5)).await;
     host::state::final_snapshot(&state_sync, &pool, &config).await;
     Ok(())

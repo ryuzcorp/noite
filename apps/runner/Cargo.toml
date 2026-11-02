@@ -52,6 +52,12 @@ sourcemap = "9"
 ts-rs = { version = "12", features = ["no-serde-warnings"] }
 hickory-resolver = "0.26.3"
 argon2 = "0.6.0"
+# Per-fleet engine proxy (`host::sandbox::engine`): a unix-socket HTTP/1.1
+# forwarder with exec-stream upgrades. Already transitive via axum/reqwest;
+# pinned to the locked versions so `cargo build --locked` holds.
+hyper = { version = "1.12", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+http-body-util = "0.1.5"
 
 [dev-dependencies]
 # `time::pause`/`advance` for the DNS-timeout test; tests only.
