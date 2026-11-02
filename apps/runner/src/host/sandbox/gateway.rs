@@ -104,7 +104,39 @@ pub fn find_client_inode(text: &str, local: SocketAddrV4, remote: SocketAddrV4) 
 /// The fleet whose pid holds `socket:[inode]` in its fd table. Only live
 /// fleet pids are scanned (the registry's): anything else dialing is not a
 /// tenant dial.
-fn fleet_of_inode(inode: u64, pids: &[(String, u32)]) -> Option<String> {
+///
+/// Reading another user's `/proc/<pid>/fd` links is a ptrace-read check
+/// against the caller's *filesystem* ids, and the runner (root without
+/// `CAP_SYS_PTRACE`) fails it for fleets, which run as the fleet user. So
+/// the scan runs on a thread of its own that first takes the fleet's ids as
+/// its fsuid/fsgid (`setfsuid` is per thread) and then exits, so no pooled
+/// thread ever keeps them.
+async fn fleet_of_inode(
+    inode: u64,
+    pids: Vec<(String, u32)>,
+    fleet_ids: Option<(u32, u32)>,
+) -> Option<String> {
+    let (send, recv) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("gateway-fd-scan".to_string())
+        .spawn(move || {
+            if let Some((uid, gid)) = fleet_ids {
+                // SAFETY: setfsgid/setfsuid only change this thread's
+                // filesystem ids; the thread exits right after the scan.
+                unsafe {
+                    libc::setfsgid(gid);
+                    libc::setfsuid(uid);
+                }
+            }
+            let _ = send.send(scan_fds(inode, &pids));
+        });
+    if spawned.is_err() {
+        return None;
+    }
+    recv.await.ok().flatten()
+}
+
+fn scan_fds(inode: u64, pids: &[(String, u32)]) -> Option<String> {
     let want = format!("socket:[{inode}]");
     for (fleet, pid) in pids {
         let dir = format!("/proc/{pid}/fd");
@@ -198,7 +230,7 @@ fn trigger_relay_ensure() {
 
 /// Serve one gateway connection: original destination, ownership, splice
 /// through the relay.
-async fn handle(mut stream: tokio::net::TcpStream) {
+async fn handle(mut stream: tokio::net::TcpStream, fleet_ids: Option<(u32, u32)>) {
     let peer = stream.peer_addr().ok().and_then(|a| match a {
         std::net::SocketAddr::V4(v4) => Some(v4),
         _ => None,
@@ -211,8 +243,10 @@ async fn handle(mut stream: tokio::net::TcpStream) {
         return;
     }
     let tcp = std::fs::read_to_string("/proc/net/tcp").unwrap_or_default();
-    let fleet = find_client_inode(&tcp, peer, dst)
-        .and_then(|inode| fleet_of_inode(inode, &super::registry::fleet_pids()));
+    let fleet = match find_client_inode(&tcp, peer, dst) {
+        Some(inode) => fleet_of_inode(inode, super::registry::fleet_pids(), fleet_ids).await,
+        None => None,
+    };
     let owner = super::registry::owner_of_ip(*dst.ip());
     if !authorized(fleet.as_deref(), owner.as_deref()) {
         warn_limited(fleet.as_deref().unwrap_or("unknown"), dst);
@@ -273,7 +307,7 @@ async fn handle(mut stream: tokio::net::TcpStream) {
 
 /// Accept loop: binds `127.0.0.1:GATEWAY_PORT`, rebinds after failures (a
 /// lost listener would blackhole every sandbox dial until the next boot).
-async fn accept_loop() {
+async fn accept_loop(fleet_ids: Option<(u32, u32)>) {
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
     loop {
         let listener =
@@ -296,7 +330,7 @@ async fn accept_loop() {
             };
             tokio::spawn(async move {
                 let _permit = permit;
-                handle(stream).await;
+                handle(stream, fleet_ids).await;
             });
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -304,9 +338,10 @@ async fn accept_loop() {
 }
 
 /// Spawn the gateway accept loop (idempotent for the boot path: one
-/// listener; the loop itself survives bind failures).
-pub fn spawn() {
-    tokio::spawn(accept_loop());
+/// listener; the loop itself survives bind failures). `fleet_ids` are the
+/// fleet user's uid/gid (`None` when fleets run as the runner's own user).
+pub fn spawn(fleet_ids: Option<(u32, u32)>) {
+    tokio::spawn(accept_loop(fleet_ids));
 }
 
 /// The gateway nftables ruleset: fleet TCP toward the celld bridges is

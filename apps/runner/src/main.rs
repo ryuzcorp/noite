@@ -242,12 +242,15 @@ async fn main() -> anyhow::Result<()> {
             Ok(Err(e)) => tracing::warn!(error = %e, "sandbox boot sweep failed"),
             Err(_) => tracing::warn!("sandbox boot sweep timed out"),
         }
+        let fleet_ids = config
+            .fleet_uid
+            .map(|uid| (uid, config.fleet_gid.unwrap_or(uid)));
         tokio::spawn(async move {
             let first = host::sandbox::plane::ensure_networks().await;
             if first.engine {
                 tracing::info!(subnets = ?first.subnets, "sandbox plane ensured");
                 let relay_ok = host::sandbox::relay::ensure().await;
-                host::sandbox::gateway::spawn();
+                host::sandbox::gateway::spawn(fleet_ids);
                 let table_ok = host::sandbox::gateway::ensure_table(&first.subnets).await;
                 host::sandbox::plane::cleanup_legacy().await;
                 let relay_healthy = relay_ok && host::sandbox::relay::healthy().await;

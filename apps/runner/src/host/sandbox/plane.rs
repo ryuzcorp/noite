@@ -23,6 +23,9 @@ const ICC_OPTION: &str = "com.docker.network.bridge.enable_icc";
 const BRIDGE_NAME_OPTION: &str = "com.docker.network.bridge.name";
 /// nft in this image (Debian path; the cleanup helper overrides its entrypoint).
 const NFT_PATH: &str = "/usr/sbin/nft";
+/// iptables in this image: the cleanup deletes alpha.14's `DOCKER-USER`
+/// rules with the same tool (and so the same backend) that inserted them.
+const IPTABLES_PATH: &str = "/usr/sbin/iptables";
 /// What alpha.12/13 left behind: an ACCEPT in its own table can never preempt
 /// Docker's later DROP, so it never worked; alpha.14 deleted `inet` on sight
 /// but a host that never ran the new code still carries it.
@@ -403,9 +406,9 @@ pub fn sandbox_status(sandbox_disabled: bool) -> serde_json::Value {
 }
 
 /// A one-shot host helper: this same image on the host netns, `NET_ADMIN`,
-/// entrypoint overridden to the firewall tool. Argv only, like every engine
+/// entrypoint overridden to a firewall tool. Argv only, like every engine
 /// call here. `None` unless the tool exits 0.
-async fn helper(image: &str, tool_args: &[&str]) -> Option<String> {
+async fn helper(image: &str, tool: &str, tool_args: &[&str]) -> Option<String> {
     let mut cmd = vec![
         "run".to_string(),
         "--rm".to_string(),
@@ -414,7 +417,7 @@ async fn helper(image: &str, tool_args: &[&str]) -> Option<String> {
         "--cap-add".to_string(),
         "NET_ADMIN".to_string(),
         "--entrypoint".to_string(),
-        NFT_PATH.to_string(),
+        tool.to_string(),
         image.to_string(),
     ];
     cmd.extend(tool_args.iter().map(|s| s.to_string()));
@@ -426,84 +429,35 @@ async fn helper(image: &str, tool_args: &[&str]) -> Option<String> {
     stdout_text(&out)
 }
 
-/// Handles of alpha.14's `DOCKER-USER` rules in `nft -a list chain ip filter
-/// DOCKER-USER` output. Alpha.14 installed, per install subnet, `iptables -s
-/// <cidr> -o <celld0|celld1> -p tcp -j ACCEPT`, plus two `-i <celld0|celld1>
-/// -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT` reply legs
-/// (`afb31be`); iptables-nft renders them with `counter` clauses and `# handle
-/// N` comments. A line only qualifies when its match set is exactly one of
-/// those two shapes (order-insensitive, counter-insensitive): anything with
-/// an extra match (a port, a second address) is someone else's rule and stays.
-pub fn cleanup_handles(listing: &str) -> Vec<u64> {
-    let mut handles = Vec::new();
+/// alpha.14's `DOCKER-USER` rules in `iptables -S DOCKER-USER` output, as
+/// the argv that deletes each (`-D DOCKER-USER …`). alpha.14 inserted them
+/// with this image's `iptables` (`afb31be`): per install subnet
+/// `-s <cidr> -o <celld0|celld1> -p tcp -j ACCEPT`, plus
+/// `-i <celld0|celld1> -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT`.
+/// `-S` prints rules canonically, so only those exact lines qualify; any
+/// other rule (Docker's, the operator's, one with an extra match) stays. A
+/// duplicated rule yields one delete per copy.
+pub fn legacy_rule_deletes(listing: &str) -> Vec<Vec<String>> {
+    let mut deletes = Vec::new();
     for line in listing.lines() {
-        if !line.contains("accept") {
-            continue;
-        }
-        let Some(handle) = line
-            .split("# handle ")
-            .nth(1)
-            .and_then(|r| r.split_whitespace().next())
-            .and_then(|n| n.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        let body = line.split('#').next().unwrap_or("");
-        let mut tokens: Vec<&str> = body.split_whitespace().collect();
-        // Strip the `counter packets P bytes B` clause iptables-nft adds.
-        if let Some(at) = tokens.iter().position(|t| *t == "counter") {
-            if tokens.len() >= at + 5 && tokens[at + 1] == "packets" && tokens[at + 3] == "bytes" {
-                tokens.drain(at..at + 5);
-            } else {
-                continue;
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let ours = match words.as_slice() {
+            ["-A", "DOCKER-USER", "-s", cidr, "-o", iface, "-p", "tcp", "-j", "ACCEPT"] => {
+                valid_cidr(cidr) && matches!(*iface, "celld0" | "celld1")
             }
-        }
-        if is_outbound_shape(&tokens) || is_reply_shape(&tokens) {
-            handles.push(handle);
-        }
-    }
-    handles.sort_unstable();
-    handles.dedup();
-    handles
-}
-
-/// `ip saddr <cidr> oifname "celld0"|"celld1" meta l4proto tcp accept`,
-/// exactly: the token multiset is the fixed vocabulary plus one valid CIDR
-/// and one celld interface (match order is iptables-nft's, not ours, and a
-/// CIDR or interface name is unambiguous wherever it sits).
-fn is_outbound_shape(tokens: &[&str]) -> bool {
-    if tokens.len() != 9 {
-        return false;
-    }
-    let mut rest: Vec<&str> = tokens.to_vec();
-    for fixed in ["ip", "saddr", "oifname", "meta", "l4proto", "tcp", "accept"] {
-        let Some(at) = rest.iter().position(|t| *t == fixed) else {
-            return false;
+            ["-A", "DOCKER-USER", "-i", iface, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"] =>
+            {
+                matches!(*iface, "celld0" | "celld1")
+            }
+            _ => false,
         };
-        rest.remove(at);
+        if ours {
+            let mut argv: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+            argv[0] = "-D".to_string();
+            deletes.push(argv);
+        }
     }
-    if rest.len() != 2 {
-        return false;
-    }
-    let (a, b) = (rest[0], rest[1]);
-    (valid_cidr(a) && matches!(b.trim_matches('"'), "celld0" | "celld1"))
-        || (valid_cidr(b) && matches!(a.trim_matches('"'), "celld0" | "celld1"))
-}
-
-/// `iifname "celld0"|"celld1" ct state established,related accept`, exactly:
-/// the fixed vocabulary plus one celld interface, in any order.
-fn is_reply_shape(tokens: &[&str]) -> bool {
-    if tokens.len() != 6 {
-        return false;
-    }
-    let mut rest: Vec<&str> = tokens.to_vec();
-    for fixed in ["iifname", "ct", "state", "established,related", "accept"] {
-        let Some(at) = rest.iter().position(|t| *t == fixed) else {
-            return false;
-        };
-        rest.remove(at);
-    }
-    rest.len() == 1 && matches!(rest[0].trim_matches('"'), "celld0" | "celld1")
+    deletes
 }
 
 /// Which stale `noite_sandbox` tables a `nft list tables` output carries:
@@ -526,47 +480,28 @@ pub fn stale_tables(listing: &str) -> Vec<(String, String)> {
 }
 
 /// One-time-per-boot cleanup of what alpha.12–14 left on the host: our own
-/// old `DOCKER-USER` rules (by handle, exact shapes only) and the stale
-/// `noite_sandbox` tables. Lists first; the deletion helper runs only when
-/// there is something to delete. Never touches Docker's rules or the `raw`
-/// pins the old sweep wrongly deleted.
+/// old `DOCKER-USER` rules (exact specs only) and the stale `noite_sandbox`
+/// tables. Lists first; deletion helpers run only when there is something
+/// to delete. Never touches Docker's rules or the `raw` rules the old sweep
+/// wrongly deleted (Docker re-creates those with its containers).
 pub async fn cleanup_legacy() {
     let Some(own) = own_container().await else {
         return;
     };
-    let chain = helper(
-        &own.image,
-        &["-a", "list", "chain", "ip", "filter", "DOCKER-USER"],
-    )
-    .await;
-    let tables = helper(&own.image, &["list", "tables"]).await;
-    let handles = chain.as_deref().map(cleanup_handles).unwrap_or_default();
-    let stale = tables.as_deref().map(stale_tables).unwrap_or_default();
-    if handles.is_empty() && stale.is_empty() {
-        return;
-    }
-    for handle in handles {
-        let arg = handle.to_string();
-        if helper(
-            &own.image,
-            &[
-                "delete",
-                "rule",
-                "ip",
-                "filter",
-                "DOCKER-USER",
-                "handle",
-                &arg,
-            ],
-        )
-        .await
-        .is_some()
-        {
-            tracing::info!(handle, "deleted legacy sandbox DOCKER-USER rule");
+    let chain = helper(&own.image, IPTABLES_PATH, &["-S", "DOCKER-USER"]).await;
+    let tables = helper(&own.image, NFT_PATH, &["list", "tables"]).await;
+    for argv in chain
+        .as_deref()
+        .map(legacy_rule_deletes)
+        .unwrap_or_default()
+    {
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        if helper(&own.image, IPTABLES_PATH, &refs).await.is_some() {
+            tracing::info!(rule = ?argv, "deleted legacy sandbox DOCKER-USER rule");
         }
     }
-    for (family, name) in stale {
-        if helper(&own.image, &["delete", "table", &family, &name])
+    for (family, name) in tables.as_deref().map(stale_tables).unwrap_or_default() {
+        if helper(&own.image, NFT_PATH, &["delete", "table", &family, &name])
             .await
             .is_some()
         {
@@ -595,8 +530,8 @@ pub fn ensure_relay_dir() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        bridge_matches, cleanup_handles, create_args, is_outbound_shape, is_reply_shape,
-        parse_network_inspect, parse_own_container, stale_tables, valid_cidr, DataMount,
+        bridge_matches, create_args, legacy_rule_deletes, parse_network_inspect,
+        parse_own_container, stale_tables, valid_cidr, DataMount,
     };
 
     #[test]
@@ -735,71 +670,37 @@ mod tests {
     }
 
     #[test]
-    fn outbound_shape_is_exact() {
-        let good: Vec<&str> = "ip saddr 172.18.0.0/16 oifname \"celld0\" meta l4proto tcp accept"
-            .split_whitespace()
-            .collect();
-        assert!(is_outbound_shape(&good));
-        // Order-insensitive (iptables-nft's order is not ours to dictate).
-        let mut flipped = good.clone();
-        flipped.reverse();
-        assert!(is_outbound_shape(&flipped));
-        // An extra match is someone else's rule.
-        let with_port: Vec<&str> =
-            "ip saddr 172.18.0.0/16 oifname \"celld0\" meta l4proto tcp tcp dport 80 accept"
-                .split_whitespace()
-                .collect();
-        assert!(!is_outbound_shape(&with_port));
-        let wrong_iface: Vec<&str> =
-            "ip saddr 172.18.0.0/16 oifname \"docker0\" meta l4proto tcp accept"
-                .split_whitespace()
-                .collect();
-        assert!(!is_outbound_shape(&wrong_iface));
-        let bad_cidr: Vec<&str> = "ip saddr 10.0.0.1/8 oifname \"celld0\" meta l4proto tcp accept"
-            .split_whitespace()
-            .collect();
-        assert!(!is_outbound_shape(&bad_cidr));
-        let udp: Vec<&str> = "ip saddr 172.18.0.0/16 oifname \"celld0\" meta l4proto udp accept"
-            .split_whitespace()
-            .collect();
-        assert!(!is_outbound_shape(&udp));
-    }
-
-    #[test]
-    fn reply_shape_is_exact() {
-        let good: Vec<&str> = "iifname \"celld1\" ct state established,related accept"
-            .split_whitespace()
-            .collect();
-        assert!(is_reply_shape(&good));
-        let with_extra: Vec<&str> =
-            "iifname \"celld1\" ip saddr 1.2.3.0/24 ct state established,related accept"
-                .split_whitespace()
-                .collect();
-        assert!(!is_reply_shape(&with_extra));
-        let new_state: Vec<&str> = "iifname \"celld1\" ct state new accept"
-            .split_whitespace()
-            .collect();
-        assert!(!is_reply_shape(&new_state));
-    }
-
-    #[test]
     fn cleanup_deletes_only_our_old_rules() {
-        // Verbatim shape of `nft -a list chain ip filter DOCKER-USER` on a
-        // host that ran alpha.14 (iptables-nft rendering: counters, quoted
-        // interface names, `# handle N`), plus Docker's and foreign rules.
-        let listing = r#"chain DOCKER-USER {
-                ip saddr 172.18.0.0/16 oifname "celld0" meta l4proto tcp counter packets 12 bytes 720 accept # handle 5
-                ip saddr 172.18.0.0/16 oifname "celld1" meta l4proto tcp counter packets 0 bytes 0 accept # handle 6
-                iifname "celld0" ct state established,related counter packets 40 bytes 2400 accept # handle 7
-                iifname "celld1" ct state established,related counter packets 0 bytes 0 accept # handle 8
-                ip saddr 172.18.0.0/16 oifname "celld0" meta l4proto tcp tcp dport 443 counter packets 0 bytes 0 accept # handle 9
-                iifname "docker0" counter packets 0 bytes 0 return # handle 10
-                counter packets 3 bytes 180 return # handle 11
-                ip saddr 172.18.0.0/16 oifname "celld0" meta l4proto tcp counter packets 0 bytes 0 accept
-        }"#;
-        assert_eq!(cleanup_handles(listing), vec![5, 6, 7, 8]);
-        assert!(cleanup_handles("").is_empty());
-        assert!(cleanup_handles("chain DOCKER-USER {\n}").is_empty());
+        // `iptables -S DOCKER-USER` on a Docker 29 host that ran alpha.14
+        // (captured in the lab), plus Docker's and foreign rules.
+        let listing = "-N DOCKER-USER
+-A DOCKER-USER -i celld1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-USER -i celld0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-USER -s 172.18.0.0/16 -o celld1 -p tcp -j ACCEPT
+-A DOCKER-USER -s 172.18.0.0/16 -o celld0 -p tcp -j ACCEPT
+-A DOCKER-USER -s 172.18.0.0/16 -o celld0 -p tcp -j ACCEPT
+-A DOCKER-USER -s 172.18.0.0/16 -o celld0 -p tcp -m tcp --dport 443 -j ACCEPT
+-A DOCKER-USER -i docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-USER -s 10.0.0.1/8 -o celld0 -p tcp -j ACCEPT
+-A DOCKER-USER -j RETURN
+";
+        let deletes: Vec<String> = legacy_rule_deletes(listing)
+            .iter()
+            .map(|argv| argv.join(" "))
+            .collect();
+        assert_eq!(
+            deletes,
+            vec![
+                "-D DOCKER-USER -i celld1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
+                "-D DOCKER-USER -i celld0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
+                "-D DOCKER-USER -s 172.18.0.0/16 -o celld1 -p tcp -j ACCEPT",
+                "-D DOCKER-USER -s 172.18.0.0/16 -o celld0 -p tcp -j ACCEPT",
+                // A duplicate (alpha.14's refresh raced itself) is deleted per copy.
+                "-D DOCKER-USER -s 172.18.0.0/16 -o celld0 -p tcp -j ACCEPT",
+            ]
+        );
+        assert!(legacy_rule_deletes("").is_empty());
+        assert!(legacy_rule_deletes("-N DOCKER-USER\n-A DOCKER-USER -j RETURN\n").is_empty());
     }
 
     #[test]
