@@ -1,0 +1,10 @@
+### Changed
+
+- Void apps (deploy root from Void's `dist/ssr/wrangler.json` output) now get runner-owned deploy entries: identity vars `__PROJECT_ID` (the app id, previews included) and `__VOID_PROJECT_SLUG`, a random per-fleet `__VOID_PROXY_TOKEN` minted once and stored as a runner-provisioned setting (production on the app row, one row per preview), the tenant's `services` preserved with collisions against runner-owned binding names refused, and `kv_namespaces: [{binding: ISR_CACHE, id: noite-isr-cache}]` — celld scopes the id to the fleet bucket, so each app and each preview gets its own ISR namespace. The `__VOID_PROXY` service binding itself stays reserved-but-uninjected until the proxy slice ships its script (a dangling service would fail adoption); a Worker config named `noite-void-proxy` fails the deploy, as does an `ISR_CACHE` setting, config var or binding on a Void app. Non-Void apps deploy exactly as before.
+- When a Void app's `secrets.required` lists `BETTER_AUTH_SECRET` and no setting exists, the deploy generates 32 random bytes hex, stores it once as an `auth-default` setting at the app level (environments inherit it unless overridden), and injects it through the Worker-vars merge; later deploys reuse it and a user value is never overwritten. The required-secrets check now counts only what the runner actually provisions (the identity vars, on Void apps).
+- `POST /reload` after a deploy is no longer fire-and-forget: the runner parses celld's outcome and a failed adoption fails the deploy with celld's error. Previously the row said Success while the old generation kept serving.
+- New operator command `noite-runner void rotate-proxy-token --slug <slug> [--env <label>]`: mints a fresh fleet token (never printed), applied by the fleet's next deploy.
+
+### Operator action required
+
+- A Void-app deploy that fails naming `ISR_CACHE`, `noite-void-proxy` or `__VOID_PROXY` needs that name freed for the platform. If you set a `BETTER_AUTH_SECRET` value yourself it keeps winning; a generated one appears in Settings → Environment like any other setting (value hidden as usual) and can be replaced there.
