@@ -277,8 +277,14 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
 
 async fn accept_loop(listener: UnixListener, fleet: String, upstream: Option<PathBuf>) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            continue;
+        let (stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                // EMFILE and friends persist: back off instead of spinning.
+                tracing::warn!(fleet = %fleet, error = %e, "engine proxy accept failed");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
         };
         let peer = peer_pid(&stream);
         let fleet = fleet.clone();

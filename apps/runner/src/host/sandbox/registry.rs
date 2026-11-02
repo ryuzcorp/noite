@@ -45,16 +45,6 @@ pub fn unregister_fleet(key: &str) {
     });
 }
 
-/// The fleet whose celld process has this pid.
-pub fn fleet_of_pid(pid: u32) -> Option<String> {
-    with(|r| {
-        r.pids
-            .iter()
-            .find(|(_, p)| **p == pid)
-            .map(|(k, _)| k.clone())
-    })
-}
-
 /// The pid of a fleet's celld process.
 pub fn pid_of_fleet(key: &str) -> Option<u32> {
     with(|r| r.pids.get(key).copied())
@@ -84,11 +74,6 @@ pub fn forget_container(name: &str) {
         r.containers.remove(name);
         r.addresses.retain(|_, n| n != name);
     });
-}
-
-/// The fleet owning a container name.
-pub fn owner_of_container(name: &str) -> Option<String> {
-    with(|r| r.containers.get(name).cloned())
 }
 
 /// The fleet owning the container at this bridge address.
@@ -129,10 +114,6 @@ mod tests {
         assert_eq!(owner_of_ip(ip), None, "no address yet");
         record_container("reg-a", "celld-reg-a-1", Some(ip));
         assert_eq!(owner_of_ip(ip).as_deref(), Some("reg-a"));
-        assert_eq!(
-            owner_of_container("celld-reg-a-1").as_deref(),
-            Some("reg-a")
-        );
         // The engine reuses a freed address for another fleet's container.
         forget_container("celld-reg-a-1");
         assert_eq!(owner_of_ip(ip), None);
@@ -143,14 +124,5 @@ mod tests {
             vec!["celld-reg-b-1".to_string()]
         );
         assert_eq!(owner_of_ip(ip), None);
-    }
-
-    #[test]
-    fn pids_map_both_ways_and_unregister() {
-        register_fleet("reg-pid", 4_000_001);
-        assert_eq!(fleet_of_pid(4_000_001).as_deref(), Some("reg-pid"));
-        assert_eq!(pid_of_fleet("reg-pid"), Some(4_000_001));
-        unregister_fleet("reg-pid");
-        assert_eq!(fleet_of_pid(4_000_001), None);
     }
 }

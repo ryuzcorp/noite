@@ -259,6 +259,9 @@ pub fn supervise(config: &Config, control_pid: Arc<AtomicU32>, logs: LogState) -
                 .env("CELLD_READY_FLEET_GATE_MS", "15000")
                 .env("CELLD_DURABILITY", "bucket")
                 .env("CELLD_SHUTDOWN_TOTAL_MS", &shutdown_ms)
+                // The control UI declares no container classes; only the
+                // runner holds the engine socket (host::sandbox::engine).
+                .env_remove("DOCKER_HOST")
                 // Piped so the supervisor captures the node's own log into the
                 // shared buffer (the OTel ring carries the worker's console).
                 .stdout(std::process::Stdio::piped())

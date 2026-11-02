@@ -228,11 +228,21 @@ async fn main() -> anyhow::Result<()> {
     // unreachable. One refresh task re-ensures networks/relay/table every
     // 30 s, jittered; only the storage allowance refreshes separately.
     if !config.sandbox_disabled {
+        // Before any fleet starts (so it cannot remove a container a fresh
+        // fleet just created): the previous run's fleet containers are
+        // orphans now — their fleets died with the runner. Bounded, so a
+        // sick engine delays boot by at most the bound.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            host::sandbox::engine::sweep_boot(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "sandbox boot sweep failed"),
+            Err(_) => tracing::warn!("sandbox boot sweep timed out"),
+        }
         tokio::spawn(async move {
-            // ---- engine slice hook (net slice leaves this block empty) ----
-            // The parent adds the engine proxy's boot sweep here, so stale
-            // fleet containers are gone before the first fleet dials.
-            // ---- end engine slice hook ----
             let first = host::sandbox::plane::ensure_networks().await;
             if first.engine {
                 tracing::info!(subnets = ?first.subnets, "sandbox plane ensured");

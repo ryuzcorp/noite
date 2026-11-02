@@ -96,15 +96,18 @@ pub enum Route<'a> {
 }
 
 /// Route one request. `path` must already be [`strip_api_version`]ed; the
-/// query is only parsed by the routes that take one.
+/// query is only parsed by the routes that take one. Container and exec ids
+/// are interpolated into the upstream path, so they must be plain names
+/// (no `%`-escapes, no `.`/`..` segments): an encoded `/` would let the
+/// daemon route the request somewhere the allowlist never looked.
 pub fn classify<'a>(method: &str, path: &'a str) -> Route<'a> {
     let segments: Vec<&str> = path.split('/').collect();
     let segments = segments.as_slice();
     match (method, segments) {
         ("GET", ["", "containers", "json"]) => Route::List,
         ("POST", ["", "containers", "create"]) => Route::Create,
-        ("DELETE", ["", "containers", id]) if !id.is_empty() => Route::Remove { id },
-        (_, ["", "containers", id, op]) if !id.is_empty() => {
+        ("DELETE", ["", "containers", id]) if valid_ref(id) => Route::Remove { id },
+        (_, ["", "containers", id, op]) if valid_ref(id) => {
             let op = match (*op, method) {
                 ("start", "POST") => ContainerOp::Start,
                 ("wait", "POST") => ContainerOp::Wait,
@@ -116,14 +119,24 @@ pub fn classify<'a>(method: &str, path: &'a str) -> Route<'a> {
             };
             Route::Container { id, op }
         }
-        ("POST", ["", "exec", id, "start"]) if !id.is_empty() => Route::ExecStart { id },
-        ("GET", ["", "exec", id, "json"]) if !id.is_empty() => Route::ExecInspect { id },
+        ("POST", ["", "exec", id, "start"]) if valid_ref(id) => Route::ExecStart { id },
+        ("GET", ["", "exec", id, "json"]) if valid_ref(id) => Route::ExecInspect { id },
         ("GET", ["", "images", name, "json"]) => Route::ImageInspect { name },
         ("POST", ["", "images", "load"]) => Route::ImageLoad,
         ("GET", ["", "networks", name]) if !name.is_empty() => Route::NetworkInspect { name },
         ("POST", ["", "networks", "create"]) => Route::NetworkCreate,
         _ => Route::Refused("no such engine call"),
     }
+}
+
+/// A container name/id or exec id as the engine issues them: 1..=128 of
+/// `[A-Za-z0-9_.-]`, starting alphanumeric (so never `.` or `..`).
+fn valid_ref(id: &str) -> bool {
+    id.len() <= 128
+        && id.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
 /// The validated `name` query of a create: `Some` app-container name, `None`
@@ -765,6 +778,13 @@ mod tests {
             ("POST", "/commit"),
             ("POST", "/build"),
             ("GET", "/distribution/abc/json"),
+            // Ids are interpolated into the upstream path: an encoded `/`
+            // or a dot segment would reroute the daemon past the allowlist.
+            ("POST", "/containers/x%2F..%2F..%2Fbuild/start"),
+            ("DELETE", "/containers/.."),
+            ("GET", "/containers/../json"),
+            ("POST", "/exec/%2E%2E/start"),
+            ("GET", "/exec/.hidden/json"),
         ] {
             assert!(
                 matches!(classify(method, path), Route::Refused(_)),
