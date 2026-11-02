@@ -10,6 +10,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-alpha.17] - 2026-11-02
+
+### Operator action required
+
+- None.
+
+### Added
+
+- Stock Void apps deploy without a build plugin: the runner reads Void's own `dist/ssr/wrangler.json` (Worker in `dist/ssr/`, assets in `dist/client/`).
+- Sandbox container images can be built from a Dockerfile in the app when it runs nothing: `FROM`, `COPY` and metadata instructions only. The runner pulls each base image, refuses one with `ONBUILD` triggers, and pins it by digest before celld builds. A Dockerfile with `RUN` still fails the deploy; publish that image to a registry instead. Void's `containers` entry shape (`scheduling_policy`, `images.default`) is translated for celld. `void/sandbox` itself deploys but does not run yet: celld 0.6.3 lacks `ctx.container.images` and cannot pass RPC stubs or streams between isolates, both of which Cloudflare's Sandbox SDK uses. Drive containers from your own Durable Object through `ctx.container` for now.
+
+### Changed
+
+- The agent template (`ryuzcorp/noite-templates` `templates/agent`) is now a stock Void app: Void routes, agent state in a `defineDurableState` object, and a sandbox container driven from its own Durable Object, built from a RUN-free `sandbox/Dockerfile`. New agent apps need this release. Existing agent apps keep running the version they were created from.
+
+### Fixed
+
+- Deleting an app no longer fails with "The operation was aborted due to timeout". The control UI gives every runner call 5 s. A delete purges the app's whole storage prefix (thousands of telemetry objects after a few days) and waits out a deploy in flight, which takes much longer on a slow host. The runner now answers within 3 s: the app disappears from every listing at once and the purge finishes in the background. If the purge fails, it is logged and the app comes back stopped with the error on it, ready to be deleted again.
+
 ## [0.1.0-alpha.16] - 2026-11-02
 
 ### Operator action required
