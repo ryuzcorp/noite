@@ -61,6 +61,9 @@ jobs:
             --platform "${{ matrix.platform }}" \
             --build-arg "CELLD_COMMIT=$(git -C "$RUNNER_TEMP/celld" rev-parse HEAD)" \
             --build-arg "CELLD_VERSION=$CELLD_VERSION-noite.$CELLD_PATCH_LEVEL" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "now.noite.celld.upstream=$CELLD_COMMIT" \
+            --label "now.noite.revision=$GITHUB_SHA" \
             "$RUNNER_TEMP/celld"
 
   push:
@@ -97,8 +100,14 @@ jobs:
           . docker/celld/upstream.env
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/celld"
           tag="$CELLD_VERSION-noite.$CELLD_PATCH_LEVEL"
-          if docker buildx imagetools inspect "$image:$tag" >/dev/null 2>&1; then
+          # Only a confirmed "not found" lets a level publish: any other
+          # inspect failure (auth, registry outage) stops the run.
+          if found=$(docker buildx imagetools inspect "$image:$tag" 2>&1); then
             echo "$image:$tag is already published; bump CELLD_PATCH_LEVEL" >&2
+            exit 1
+          elif ! grep -qiE 'not found|manifest unknown' <<<"$found"; then
+            echo "cannot tell whether $image:$tag is published:" >&2
+            echo "$found" >&2
             exit 1
           fi
           cache="$image:buildcache-${{ matrix.suffix }}"
@@ -106,6 +115,9 @@ jobs:
             --platform "${{ matrix.platform }}" \
             --build-arg "CELLD_COMMIT=$(git -C "$RUNNER_TEMP/celld" rev-parse HEAD)" \
             --build-arg "CELLD_VERSION=$tag" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "now.noite.celld.upstream=$CELLD_COMMIT" \
+            --label "now.noite.revision=$GITHUB_SHA" \
             --cache-from "type=registry,ref=$cache" \
             --cache-to "type=registry,ref=$cache,mode=max" \
             --tag "$image:$tag-${{ matrix.suffix }}" \

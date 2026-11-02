@@ -18,6 +18,9 @@ if [ "$actual" != "$CELLD_COMMIT" ]; then
   echo "v$CELLD_VERSION is $actual, expected $CELLD_COMMIT" >&2
   exit 1
 fi
-git -C "$dir" -c user.name=noite -c user.email=noite@localhost \
-  am --quiet --keep-cr "$here"/patches/*.patch
+# Committer = author date and a fixed committer: the same pin and patches
+# always give the same commit ids, so the image's revision label names a
+# tree anyone can rebuild with this script.
+git -C "$dir" -c user.name=Noite -c user.email=noite@noite.now \
+  am --quiet --keep-cr --committer-date-is-author-date "$here"/patches/*.patch
 git -C "$dir" log --oneline "$CELLD_COMMIT"..HEAD

@@ -7,12 +7,12 @@ start() answers before the container exists, as on Cloudflare, where the
 calls that follow it on the same handle wait for it. An exec right after
 start() answered the engine's 404 no such container instead.
 ---
- crates/celld/container.rs    | 67 ++++++++++++++++++++++++++++++++++++
- crates/celld/js/container.rs | 30 +++++++++++++---
- 2 files changed, 93 insertions(+), 4 deletions(-)
+ crates/celld/container.rs    | 107 +++++++++++++++++++++++++++++++++++
+ crates/celld/js/container.rs |  27 +++++++--
+ 2 files changed, 130 insertions(+), 4 deletions(-)
 
 diff --git a/crates/celld/container.rs b/crates/celld/container.rs
-index 7058343..afcba13 100644
+index 7058343..f402b0c 100644
 --- a/crates/celld/container.rs
 +++ b/crates/celld/container.rs
 @@ -1,3 +1,4 @@
@@ -32,7 +32,7 @@ index 7058343..afcba13 100644
  }
  
  impl CellContainer {
-@@ -279,6 +285,17 @@ impl CellContainer {
+@@ -279,12 +285,51 @@ impl CellContainer {
          run
      }
  
@@ -50,7 +50,41 @@ index 7058343..afcba13 100644
      /// The run `monitor()` waits on: the newest one.
      pub fn current_run(&self) -> u64 {
          self.state.lock().unwrap().run
-@@ -797,6 +814,7 @@ impl ContainerEngine {
+     }
+ }
+ 
++/// A run whose start is in flight: dropping it marks the start finished,
++/// whichever way the start ends (done, failed, or cancelled and dropped),
++/// so an `exec()` waiting on the run never waits forever.
++pub struct StartGuard {
++    cell: Arc<CellContainer>,
++    run: u64,
++}
++
++impl StartGuard {
++    pub fn new(cell: Arc<CellContainer>, run: u64) -> Self {
++        Self { cell, run }
++    }
++
++    pub fn cell(&self) -> &Arc<CellContainer> {
++        &self.cell
++    }
++
++    pub fn run(&self) -> u64 {
++        self.run
++    }
++}
++
++impl Drop for StartGuard {
++    fn drop(&mut self) {
++        self.cell.finish_start(self.run);
++    }
++}
++
+ pub struct ContainerEngine {
+     /// See `Config::runtime`.
+     runtime: Option<String>,
+@@ -797,6 +842,7 @@ impl ContainerEngine {
                      state: Mutex::new(CellState::default()),
                      processes: Mutex::new(Vec::new()),
                      exit: watch::channel(None).0,
@@ -58,7 +92,7 @@ index 7058343..afcba13 100644
                  })
              });
              // A returning cell cancels the destroy its eviction armed.
-@@ -811,6 +829,7 @@ impl ContainerEngine {
+@@ -811,6 +857,7 @@ impl ContainerEngine {
          let adopted = running.is_some() && !cell.running();
          if adopted {
              let run = cell.begin_run();
@@ -66,7 +100,7 @@ index 7058343..afcba13 100644
              self.watch_exit(&cell, run);
          }
          let mut state = cell.state.lock().unwrap();
-@@ -939,6 +958,7 @@ impl ContainerEngine {
+@@ -939,6 +986,7 @@ impl ContainerEngine {
                  drop(state);
                  cell.exit
                      .send_replace(Some((run, Err(format!("{error:#}")))));
@@ -74,7 +108,7 @@ index 7058343..afcba13 100644
                  return Err(error);
              }
          };
-@@ -948,6 +968,7 @@ impl ContainerEngine {
+@@ -948,6 +996,7 @@ impl ContainerEngine {
              state.address = address;
          }
          self.watch_exit(cell, run);
@@ -82,7 +116,7 @@ index 7058343..afcba13 100644
          Ok(())
      }
  
-@@ -1261,6 +1282,11 @@ impl ContainerEngine {
+@@ -1261,6 +1310,11 @@ impl ContainerEngine {
          cell: &Arc<CellContainer>,
          params: ExecParams,
      ) -> anyhow::Result<Arc<ExecProcess>> {
@@ -94,7 +128,7 @@ index 7058343..afcba13 100644
          if !cell.running() {
              return Err(anyhow!("exec() requires a running container."));
          }
-@@ -1586,3 +1612,44 @@ fn container_name(node: &str, scope: &str) -> String {
+@@ -1586,3 +1640,56 @@ fn container_name(node: &str, scope: &str) -> String {
      let digest = sha2::Sha256::digest(format!("{node}\n{scope}").as_bytes());
      format!("celld-{:x}", digest)[..30].to_string()
  }
@@ -138,9 +172,21 @@ index 7058343..afcba13 100644
 +        cell.finish_start(next);
 +        assert_eq!(*cell.started.borrow(), next);
 +    }
++
++    /// A start cancelled before it finished (its task dropped) still
++    /// releases the exec() calls waiting on its run.
++    #[test]
++    fn a_dropped_start_releases_its_run() {
++        let cell = Arc::new(cell());
++        let run = cell.begin_run();
++        let guard = StartGuard::new(cell.clone(), run);
++        assert!(*cell.started.borrow() < run);
++        drop(guard);
++        assert_eq!(*cell.started.borrow(), run);
++    }
 +}
 diff --git a/crates/celld/js/container.rs b/crates/celld/js/container.rs
-index bd3774b..db01354 100644
+index bd3774b..86cf340 100644
 --- a/crates/celld/js/container.rs
 +++ b/crates/celld/js/container.rs
 @@ -1,3 +1,4 @@
@@ -148,7 +194,16 @@ index bd3774b..db01354 100644
  //! Host ops behind `ctx.container`.
  //!
  //! JavaScript owns the surface and every validation message, copied from
-@@ -87,12 +88,33 @@ pub(super) fn op_container_start(
+@@ -7,7 +8,7 @@
+ //! `__container_exec` returned.
+ 
+ use super::*;
+-use crate::container::{self, CellContainer, ContainerEngine, ExecParams, StartParams};
++use crate::container::{self, CellContainer, ContainerEngine, ExecParams, StartGuard, StartParams};
+ use std::time::Duration;
+ 
+ async fn cell_for(scope: &str) -> Result<(Arc<ContainerEngine>, Arc<CellContainer>), String> {
+@@ -87,12 +88,29 @@ pub(super) fn op_container_start(
      };
      // The run opens here, on the calling thread, so the monitor() that
      // follows this call in the same turn waits for this start's exit.
@@ -158,31 +213,34 @@ index bd3774b..db01354 100644
 -        .map(|cell| cell.begin_run());
 +        .map(|cell| (cell.begin_run(), cell));
      let async_id = asyncrt::enqueue_io_context(async move {
--        let (engine, cell) = cell_for(&cell).await?;
++        // Whatever ends this task (done, failed, or cancelled and dropped
++        // mid-start), the run it opened counts as finished, or an exec()
++        // waiting on it would wait forever.
++        let opened = opened.map(|(run, cell)| StartGuard::new(cell, run));
+         let (engine, cell) = cell_for(&cell).await?;
 -        let run = run.unwrap_or_else(|| cell.begin_run());
-+        let (engine, cell) = match cell_for(&cell).await {
-+            Ok(found) => found,
-+            Err(error) => {
-+                // The run this call opened never starts: release the
-+                // exec() calls waiting on it.
-+                if let Some((run, cell)) = opened {
-+                    cell.finish_start(run);
-+                }
-+                return Err(error);
-+            }
-+        };
 +        // The run belongs to the cell it was opened on. If that cell was
 +        // evicted and the scope came back as a new one, release the old
 +        // run and open one here, or the new cell's exec() would see a
 +        // foreign run number as started.
-+        let run = match opened {
-+            Some((run, opened)) if Arc::ptr_eq(&opened, &cell) => run,
-+            Some((run, opened)) => {
-+                opened.finish_start(run);
-+                cell.begin_run()
++        let guard = match opened {
++            Some(opened) if Arc::ptr_eq(opened.cell(), &cell) => opened,
++            // Dropping `released` releases the run opened on a cell that
++            // was evicted since; this cell gets a run of its own.
++            released => {
++                drop(released);
++                StartGuard::new(cell.clone(), cell.begin_run())
 +            }
-+            None => cell.begin_run(),
 +        };
++        let run = guard.run();
          engine
              .start(
                  &cell,
+@@ -106,6 +124,7 @@ pub(super) fn op_container_start(
+             )
+             .await
+             .map_err(|error| format!("{error:#}"))?;
++        drop(guard);
+         Ok::<String, String>(String::new())
+     });
+     rv.set(promise_for(scope, async_id));
