@@ -25,6 +25,8 @@ No cloud version: every alpha user runs their own install. The bar moves from "t
 - A shorter snapshot loss window ([open question 3](#open-questions-and-known-issues), Litestream).
 - E2E for storage editing and the admin page ([open question 5](#open-questions-and-known-issues)).
 - The `bwrap` egress fallback, so platforms without `NET_ADMIN` (Railway) can run `multi` ([open question 1](#open-questions-and-known-issues)).
+- Sandbox containers under gVisor (`runsc`) or another OCI runtime instead of runc, so a container escape no longer lands on the host kernel ([SPEC](SPEC.md#sandbox-containers)).
+- Garbage collection for pulled Sandbox images, so engine disk stops growing with every new image ([SPEC](SPEC.md#sandbox-containers)).
 - An opt-in "new version available" notice in the UI linking the changelog, with no telemetry.
 - `CONTRIBUTING.md`, issue templates asking for `make doctor` output, a community channel.
 - A restore drill for BYO S3 and Railway installs, where `make backup` does not apply.

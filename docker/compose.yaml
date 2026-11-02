@@ -93,10 +93,19 @@ services:
       NOITE_UPDATE_CHECK: ${NOITE_UPDATE_CHECK:-}
       # Container engine for celld Sandbox classes (the agent template):
       # the host daemon, so tenant containers are host siblings fenced by
-      # celld. The install script puts Docker here; point DOCKER_SOCKET at
-      # another daemon socket (e.g. rootless podman) when yours differs.
-      # Fleets inherit this env, so no runner change is needed.
+      # celld. Only the runner holds this socket: it serves each fleet a
+      # filtered per-fleet engine socket and runs a relay container in the
+      # host netns for the container path; fleets never see the real
+      # socket. The install script puts Docker here; point DOCKER_SOCKET
+      # at another daemon socket when yours differs. Sandbox containers
+      # need a rootful engine (see NOITE_SANDBOX in .env.example).
       DOCKER_HOST: ${DOCKER_HOST:-unix:///var/run/docker.sock}
+      # Sandbox containers (the agent template's celld `containers`
+      # classes). Unset = on when the engine socket answers; `0` (also
+      # `false`/`off`) disables them: no relay, no per-fleet engine
+      # sockets, fleets get no DOCKER_HOST, and deploys declaring
+      # `containers` fail with a clear error.
+      NOITE_SANDBOX: ${NOITE_SANDBOX:-}
       RUNNER_MAX_APPS_PER_USER: ${RUNNER_MAX_APPS_PER_USER:-10}
       RUNNER_FLEET_MAX_RSS_MB: ${RUNNER_FLEET_MAX_RSS_MB:-0}
       # Per-fleet memory cap in MiB (SPEC, Tenant isolation): each tenant
@@ -130,7 +139,8 @@ services:
       # Runner SQLite (also snapshotted to the bucket), git mirrors, builds,
       # fleet working dirs, Caddy config + certificates.
       - noite-data:/data
-      # Host engine socket for Sandbox containers (see DOCKER_HOST above).
+      # Host engine socket for Sandbox containers (see DOCKER_HOST above):
+      # runner-only — fleets get filtered per-fleet sockets, never this.
       - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
     networks: [noite]
     labels:

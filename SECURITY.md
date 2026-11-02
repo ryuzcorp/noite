@@ -20,6 +20,6 @@ Alpha releases are supported on the newest release of their channel only: fixes 
 
 ## Scope
 
-In scope: the runner, the control UI, the install scripts and the image. Authentication and invites, tenant isolation, the Git adapter, the edge configuration, and secrets handling are the areas that matter most.
+In scope: the runner, the control UI, the install scripts and the image. Authentication and invites, tenant isolation (including the Sandbox container plane — the host engine socket is runner-only; fleets hold filtered per-fleet sockets), the Git adapter, the edge configuration, and secrets handling are the areas that matter most.
 
 Out of scope: findings that need access the operator already has (a shell in the container holds every secret by design), `NOITE_TENANCY=single` installs where tenants are trusted by definition, and denial of service from a tenant that the documented per-app and edge rate limits already bound.

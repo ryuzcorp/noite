@@ -128,6 +128,28 @@ else
   echo "       docker compose -f docker/compose.yaml -f docker/compose.multi.yaml up -d"
   echo "     single installs need nothing (this stays a warning)."
 fi
+# Sandbox containers (SPEC, Tenant isolation): `/ready`'s `sandbox` object
+# (`enabled`/`engine`/`relay`/`subnets`/`detail`). Informational only —
+# this section never fails the check. Absent on runners that predate it.
+sandbox="$(printf '%s' "$ready" | sed -n 's/.*"sandbox":\({[^}]*}\).*/\1/p')"
+if [ -n "$sandbox" ]; then
+  sandbox_enabled="$(printf '%s' "$sandbox" | sed -n 's/.*"enabled":\([^,}]*\).*/\1/p')"
+  sandbox_engine="$(printf '%s' "$sandbox" | sed -n 's/.*"engine":\([^,}]*\).*/\1/p')"
+  sandbox_relay="$(printf '%s' "$sandbox" | sed -n 's/.*"relay":\([^,}]*\).*/\1/p')"
+  sandbox_subnets="$(printf '%s' "$sandbox" | sed -n 's/.*"subnets":\[\([^]]*\)\].*/\1/p' | tr -d '"')"
+  sandbox_detail="$(printf '%s' "$sandbox" | sed -n 's/.*"[Dd]etail":"\([^"]*\)".*/\1/p')"
+  if [ "$sandbox_enabled" != "true" ]; then
+    echo "ok   sandbox containers: off (${sandbox_detail:-disabled})"
+  elif [ "$sandbox_engine" != "true" ]; then
+    echo "WARN sandbox containers: no engine socket answers (${sandbox_detail:-no detail})"
+  elif [ "$sandbox_relay" != "true" ]; then
+    echo "WARN sandbox containers: relay not running (${sandbox_detail:-no detail})"
+  elif [ -n "$sandbox_subnets" ]; then
+    echo "ok   sandbox containers: ready (subnets ${sandbox_subnets})"
+  else
+    echo "ok   sandbox containers: ready"
+  fi
+fi
 
 check "runner API auth" api -H "Authorization: Bearer ${TOKEN}" "${API}/v1/apps"
 # Opt-out release check (SPEC, update check): on/off plus the newest release
