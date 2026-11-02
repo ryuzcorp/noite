@@ -83,6 +83,8 @@ sensitive:
   - "docker/uninstall.sh"
   - "docker/backup.sh"
   - "docker/restore.sh"
+  # Noite's patches to celld, the runtime every Worker runs in, and their pin.
+  - "docker/celld/**"
 
   # The gates themselves: workflows, this list, and the reviewer config.
   # Weakening review or CI silently weakens every path above.

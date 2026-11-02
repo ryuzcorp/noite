@@ -1,0 +1,155 @@
+# Noite's celld: upstream denoland/celld at the commit `docker/celld/upstream.env`
+# pins, with `docker/celld/patches/*.patch` applied (upstream ships security
+# fixes only from 0.6.x on). Upstream's own Dockerfile builds it, so its full
+# test suite and clippy run in the image's `test` stage on every build.
+#
+#   pull request   `test`: build and test both architectures with a read-only
+#                  token, push nothing
+#   main push      `push` + `publish`: the same build, pushed per architecture,
+#                  then ghcr.io/<owner>/celld:<version>-noite.<level>
+#                  (multi-arch), which docker/Dockerfile pins by digest
+#
+# A level that is already published is never overwritten: bump
+# CELLD_PATCH_LEVEL with every patch change.
+name: celld
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docker/celld/**"
+      - ".github/workflows/celld.yml"
+  pull_request:
+    paths:
+      - "docker/celld/**"
+      - ".github/workflows/celld.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: celld-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Test and build (${{ matrix.suffix }})
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, platform: linux/amd64, suffix: amd64 }
+          - { runner: ubuntu-24.04-arm, platform: linux/arm64, suffix: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Prepare patched source
+        run: docker/celld/prepare.sh "$RUNNER_TEMP/celld"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Test and build
+        run: |
+          set -euo pipefail
+          . docker/celld/upstream.env
+          docker buildx build \
+            --platform "${{ matrix.platform }}" \
+            --build-arg "CELLD_COMMIT=$(git -C "$RUNNER_TEMP/celld" rev-parse HEAD)" \
+            --build-arg "CELLD_VERSION=$CELLD_VERSION-noite.$CELLD_PATCH_LEVEL" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "now.noite.celld.upstream=$CELLD_COMMIT" \
+            --label "now.noite.revision=$GITHUB_SHA" \
+            "$RUNNER_TEMP/celld"
+
+  push:
+    name: Test, build and push (${{ matrix.suffix }})
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, platform: linux/amd64, suffix: amd64 }
+          - { runner: ubuntu-24.04-arm, platform: linux/arm64, suffix: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Prepare patched source
+        run: docker/celld/prepare.sh "$RUNNER_TEMP/celld"
+      # Registry cache export needs the docker-container driver.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" |
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Test, build and push
+        run: |
+          set -euo pipefail
+          . docker/celld/upstream.env
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/celld"
+          tag="$CELLD_VERSION-noite.$CELLD_PATCH_LEVEL"
+          # Only a confirmed "not found" lets a level publish: any other
+          # inspect failure (auth, registry outage) stops the run.
+          if found=$(docker buildx imagetools inspect "$image:$tag" 2>&1); then
+            echo "$image:$tag is already published; bump CELLD_PATCH_LEVEL" >&2
+            exit 1
+          elif ! grep -qiE 'not found|manifest unknown' <<<"$found"; then
+            echo "cannot tell whether $image:$tag is published:" >&2
+            echo "$found" >&2
+            exit 1
+          fi
+          cache="$image:buildcache-${{ matrix.suffix }}"
+          docker buildx build \
+            --platform "${{ matrix.platform }}" \
+            --build-arg "CELLD_COMMIT=$(git -C "$RUNNER_TEMP/celld" rev-parse HEAD)" \
+            --build-arg "CELLD_VERSION=$tag" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "now.noite.celld.upstream=$CELLD_COMMIT" \
+            --label "now.noite.revision=$GITHUB_SHA" \
+            --cache-from "type=registry,ref=$cache" \
+            --cache-to "type=registry,ref=$cache,mode=max" \
+            --tag "$image:$tag-${{ matrix.suffix }}" \
+            --push \
+            "$RUNNER_TEMP/celld"
+
+  publish:
+    name: Publish multi-arch image
+    needs: push
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" |
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Publish
+        run: |
+          set -euo pipefail
+          . docker/celld/upstream.env
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/celld"
+          tag="$CELLD_VERSION-noite.$CELLD_PATCH_LEVEL"
+          docker buildx imagetools create --tag "$image:$tag" \
+            "$image:$tag-amd64" "$image:$tag-arm64"
+          digest=$(docker buildx imagetools inspect "$image:$tag" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "Pin in docker/Dockerfile: $image:$tag@$digest" >> "$GITHUB_STEP_SUMMARY"

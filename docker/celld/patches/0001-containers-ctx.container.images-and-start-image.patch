@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Noite <noite@noite.now>
+Date: Mon, 2 Nov 2026 22:05:15 +0100
+Subject: [PATCH 1/2] containers: ctx.container.images and start({ image })
+
+Cloudflare's Sandbox SDK (and Void's void/sandbox over it) reads
+ctx.container.images.default and passes it to start({ image }). celld
+deploys one image per class, so images is { default } and start() takes
+only that value.
+---
+ crates/celld/js/harness.js  | 9 +++++++++
+ docs/services/containers.md | 6 +++++-
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/crates/celld/js/harness.js b/crates/celld/js/harness.js
+index 074ea11..4b9fcc5 100644
+--- a/crates/celld/js/harness.js
++++ b/crates/celld/js/harness.js
+@@ -1,3 +1,4 @@
++// Modified for Noite (ryuzcorp/noite, docker/celld/patches): ctx.container.images.
+ // The DO object model and the Cloudflare-compatible runtime surface, run
+ // once per isolate by `js.rs::install_harness` after the Web-API prelude.
+ // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
+@@ -2429,6 +2430,8 @@ class ContainerPort {
+       __container_address(this._scope, this._port), options);
+   }
+ }
++const CONTAINER_IMAGES = Object.freeze({ default: "default" });
++
+ class Container {
+   constructor(scope) {
+     this._scope = scope;
+@@ -2437,10 +2440,16 @@ class Container {
+   // The host's answer, not a JavaScript flag: a monitor() promise can be
+   // dropped with its event, so the flag it would maintain could go stale.
+   get running() { return __container_running(this._scope); }
++  // The class's images by name, as on Cloudflare (`ctx.container.images`).
++  // celld deploys one image per class, so `default` is the only entry, and
++  // it is what `start({ image })` takes.
++  get images() { return CONTAINER_IMAGES; }
+   start(options) {
+     if (this.running)
+       throw new Error("start() cannot be called on a container that is already running.");
+     const o = options ?? {};
++    if (o.image !== undefined && o.image !== CONTAINER_IMAGES.default)
++      throw new TypeError(`start(): unknown image ${JSON.stringify(String(o.image))}; this class has only ctx.container.images.default`);
+     const params = { enableInternet: !!o.enableInternet, labels: [] };
+     if (o.entrypoint !== undefined) params.entrypoint = Array.from(o.entrypoint, String);
+     params.env = __containerEnvList(o.env);
+diff --git a/docs/services/containers.md b/docs/services/containers.md
+index ab26cb5..e6013ac 100644
+--- a/docs/services/containers.md
++++ b/docs/services/containers.md
+@@ -1,3 +1,4 @@
++<!-- Modified for Noite (ryuzcorp/noite, docker/celld/patches): ctx.container.images. -->
+ # Containers
+ 
+ A container runs a program that is not JavaScript beside the Worker that needs
+@@ -25,7 +26,10 @@ most one container.
+ celld implements this part of `ctx.container`:
+ 
+ - `start()` starts the container. It accepts `entrypoint`, `env`,
+-  `enableInternet`, and `labels`.
++  `enableInternet`, `labels`, and `image`.
++- `images` lists the images of the class by name. celld deploys one image per
++  class, so `images.default` is the only entry, and `start({ image })` takes
++  only that value.
+ - `running` reports the state of the engine, so an object that lost its
+   `monitor()` sees the exit at its next event.
+ - `monitor()` returns a promise that settles when the container exits.
