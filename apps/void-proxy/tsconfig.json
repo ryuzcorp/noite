@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "moduleDetection": "force",
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "noImplicitOverride": true,
+    "types": ["bun"]
+  },
+  "include": [
+    "worker.ts",
+    "sockets.d.ts",
+    "worker.test.ts",
+    "email.test.ts",
+    "ai.test.ts",
+    "test-helpers.ts"
+  ]
+}
