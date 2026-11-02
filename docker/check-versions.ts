@@ -70,7 +70,8 @@ const compareVersions = (a: string, b: string): number => {
 };
 
 for (const [name, pattern] of [
-  ["celld", /ARG CELLD_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
+  ["celld", /ARG CELLD_VERSION=(?<version>\d+\.\d+\.\d+-noite\.\d+)/gu],
+  ["celld digest", /ARG CELLD_DIGEST=(?<version>sha256:[0-9a-f]{64})/gu],
   ["caddy", /ARG CADDY_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
   ["node", /ARG NODE_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
   ["jup", /ARG JUP_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
@@ -92,6 +93,28 @@ for (const [name, pattern] of [
       `${name}: docker/Dockerfile must pin exactly once (found ${versions.length}: ${versions.join(", ")})`
     );
   }
+}
+
+// The celld image is Noite's patched build (docker/celld/): its tag must be
+// the `<CELLD_VERSION>-noite.<CELLD_PATCH_LEVEL>` that upstream.env pins, or
+// the image ships a different patch stack than the repo describes.
+const upstream = Object.fromEntries(
+  read("docker/celld/upstream.env")
+    .split("\n")
+    .map((line) => line.match(/^(?<key>[A-Z_]+)=(?<value>\S+)$/u)?.groups)
+    .filter((groups) => groups !== undefined)
+    .map(({ key, value }) => [key, value])
+);
+
+const celldTag = dockerfile.match(/ARG CELLD_VERSION=(?<tag>\S+)/u)?.groups
+  ?.tag;
+
+const expectedCelldTag = `${upstream.CELLD_VERSION}-noite.${upstream.CELLD_PATCH_LEVEL}`;
+
+if (celldTag !== expectedCelldTag) {
+  fail(
+    `celld: docker/Dockerfile pins ${celldTag ?? "nothing"}, docker/celld/upstream.env says ${expectedCelldTag}`
+  );
 }
 
 // The bundled package managers: the Dockerfile pins must name the same
