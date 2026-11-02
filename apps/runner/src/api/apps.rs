@@ -96,11 +96,14 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     let credentials = state.isolation.read().await.credentials.clone();
     let snapshot = state.state_sync.snapshot_status();
     let credential_sweep = crate::host::credentials::orphan_sweep_status();
+    // Sandbox plane: informational only, never fails the gate.
+    let sandbox = crate::host::sandbox::plane::sandbox_status(state.config.sandbox_disabled);
     let body = json!({ "ok": failing.is_empty(), "service": "noite-runner",
         "cgroups": { "active": cgroups_active, "detail": cgroups_detail },
         "credentials": credentials,
         "credential_sweep": credential_sweep,
         "snapshot": snapshot,
+        "sandbox": sandbox,
         "failing": failing });
     if failing.is_empty() {
         Json(body).into_response()
