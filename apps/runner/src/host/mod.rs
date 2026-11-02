@@ -3,6 +3,7 @@ pub mod build_output;
 pub mod caddy;
 pub mod cgroups;
 pub mod children;
+pub mod container_image;
 pub mod control;
 pub mod credentials;
 pub mod deploy;
