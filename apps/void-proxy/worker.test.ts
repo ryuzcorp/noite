@@ -3,21 +3,21 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  FakeKv,
-  makeEnv,
-  post,
-  TEST_PROJECT_ID,
-  TEST_TOKEN,
-} from "./test-helpers.ts";
-import {
-  handleFetch,
   hashOriginalUrl,
   isrCacheKey,
   isrCachePrefix,
   isrCacheVariantPrefix,
   normalizeIsrPath,
   splitIsrCacheKey,
-} from "./worker.ts";
+} from "./src/isr-keys.ts";
+import {
+  FakeKv,
+  makeEnv,
+  post,
+  TEST_PROJECT_ID,
+  TEST_TOKEN,
+} from "./test-helpers.ts";
+import { handleFetch } from "./worker.ts";
 
 const DIRECT = "__void_direct__";
 
@@ -573,7 +573,26 @@ describe("/revalidate", () => {
 
 describe("platform surface guard", () => {
   test("worker source never touches the edge cache", async () => {
-    const source = await Bun.file(new URL("worker.ts", import.meta.url)).text();
-    expect(source).not.toMatch(/[^A-Za-z]caches\s*\./u);
+    // Every shipped source: the router plus the modules it imports. Tests and
+    // helpers never ship, so they are not covered.
+    const shipped = [
+      "worker.ts",
+      "src/env.ts",
+      "src/isr-keys.ts",
+      "src/auth.ts",
+      "src/revalidate.ts",
+      "src/email/validate.ts",
+      "src/email/smtp.ts",
+      "src/email/send.ts",
+      "src/ai.ts",
+    ];
+
+    const sources = await Promise.all(
+      shipped.map((file) => Bun.file(new URL(file, import.meta.url)).text())
+    );
+
+    for (const source of sources) {
+      expect(source).not.toMatch(/[^A-Za-z]caches\s*\./u);
+    }
   });
 });

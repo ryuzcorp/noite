@@ -16,6 +16,7 @@
   },
   "include": [
     "worker.ts",
+    "src/**/*.ts",
     "sockets.d.ts",
     "worker.test.ts",
     "email.test.ts",

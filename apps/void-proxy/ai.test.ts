@@ -3,9 +3,9 @@
 /* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unsafe-dictionary-type, anti-slop/no-known-value-widening, anti-slop/require-safety-comment-for-type-assertion -- tests shuttle untyped JSON bodies and assert on parsed shapes */
 import { describe, expect, test } from "bun:test";
 
+import { PROVIDER_BASE_URLS, PROVIDER_AUTH_DEFAULTS } from "./src/ai.ts";
+import type { Env } from "./src/env.ts";
 import { makeEnv, post } from "./test-helpers.ts";
-import type { Env } from "./worker.ts";
-import { PROVIDER_BASE_URLS, PROVIDER_AUTH_DEFAULTS } from "./worker.ts";
 
 interface SeenRequest {
   url: string;

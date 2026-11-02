@@ -11,7 +11,7 @@ import type {
   ProxyDeps,
   ProxySocket,
   SocketConnect,
-} from "./worker.ts";
+} from "./src/env.ts";
 import { handleFetch } from "./worker.ts";
 
 export const TEST_PROJECT_ID = "proj_test123";
