@@ -3,6 +3,7 @@
 /* oxlint-disable anti-slop/no-unsafe-dictionary-type, anti-slop/no-known-value-widening, anti-slop/require-safety-comment-for-type-assertion -- tests shuttle untyped JSON bodies and assert on parsed shapes */
 import { describe, expect, test } from "bun:test";
 
+import type { Env, ProxySocket } from "./src/env.ts";
 import {
   bunSocketConnect,
   buildMime,
@@ -16,7 +17,6 @@ import {
   TEST_FROM,
 } from "./test-helpers.ts";
 import type { CannedSocketShared } from "./test-helpers.ts";
-import type { Env, ProxySocket } from "./worker.ts";
 
 const emailEnv = (kv: FakeKv, overrides: Partial<Env> = {}): Env =>
   makeEnv({

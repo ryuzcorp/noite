@@ -1,6 +1,6 @@
 // Type-only ambient declaration for the `cloudflare:sockets` platform module.
 // Dev-time only: nothing imports this file, so it never ships in the deployed
-// bundle (the runner embeds `worker.ts` alone).
+// bundle (the runner embeds `worker.ts` plus `src/`).
 declare module "cloudflare:sockets" {
   interface SocketAddress {
     hostname: string;
