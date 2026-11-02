@@ -1,0 +1,135 @@
+# Noite's celld: upstream denoland/celld at the commit `docker/celld/upstream.env`
+# pins, with `docker/celld/patches/*.patch` applied (upstream ships security
+# fixes only from 0.6.x on). Upstream's own Dockerfile builds it, so its full
+# test suite and clippy run in the image's `test` stage on every build.
+#
+#   pull request   build and test both architectures, push nothing
+#   main push      also publish ghcr.io/<owner>/celld:<version>-noite.<level>
+#                  (multi-arch), which docker/Dockerfile pins by digest
+#
+# A level that is already published is never overwritten: bump
+# CELLD_PATCH_LEVEL with every patch change.
+name: celld
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docker/celld/**"
+      - ".github/workflows/celld.yml"
+  pull_request:
+    paths:
+      - "docker/celld/**"
+      - ".github/workflows/celld.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: celld-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Test and build (${{ matrix.suffix }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+            suffix: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PUBLISH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Prepare patched source
+        run: |
+          set -euo pipefail
+          . docker/celld/upstream.env
+          {
+            echo "CELLD_VERSION=$CELLD_VERSION"
+            echo "CELLD_TAG=$CELLD_VERSION-noite.$CELLD_PATCH_LEVEL"
+            echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/celld"
+          } >> "$GITHUB_ENV"
+          docker/celld/prepare.sh "$RUNNER_TEMP/celld"
+          echo "PATCHED_SHA=$(git -C "$RUNNER_TEMP/celld" rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      # Registry cache export needs the docker-container driver.
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" |
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Refuse to overwrite a published level
+        if: env.PUBLISH == 'true'
+        run: |
+          if docker buildx imagetools inspect "$IMAGE:$CELLD_TAG" >/dev/null 2>&1; then
+            echo "$IMAGE:$CELLD_TAG is already published; bump CELLD_PATCH_LEVEL" >&2
+            exit 1
+          fi
+
+      - name: Test and build
+        run: |
+          set -euo pipefail
+          args=(
+            --platform "${{ matrix.platform }}"
+            --build-arg "CELLD_COMMIT=$PATCHED_SHA"
+            --build-arg "CELLD_VERSION=$CELLD_TAG"
+          )
+          if [ "$PUBLISH" = true ]; then
+            cache="$IMAGE:buildcache-${{ matrix.suffix }}"
+            args+=(
+              --cache-from "type=registry,ref=$cache"
+              --cache-to "type=registry,ref=$cache,mode=max"
+              --tag "$IMAGE:$CELLD_TAG-${{ matrix.suffix }}"
+              --push
+            )
+          fi
+          docker buildx build "${args[@]}" "$RUNNER_TEMP/celld"
+
+  publish:
+    name: Publish multi-arch image
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" |
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Publish
+        run: |
+          set -euo pipefail
+          . docker/celld/upstream.env
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/celld"
+          tag="$CELLD_VERSION-noite.$CELLD_PATCH_LEVEL"
+          docker buildx imagetools create --tag "$image:$tag" \
+            "$image:$tag-amd64" "$image:$tag-arm64"
+          digest=$(docker buildx imagetools inspect "$image:$tag" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "Pin in docker/Dockerfile: $image:$tag@$digest" >> "$GITHUB_STEP_SUMMARY"
