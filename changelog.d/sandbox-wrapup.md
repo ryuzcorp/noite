@@ -12,5 +12,7 @@
 
 - Tenant fleets no longer hold the host engine socket: each fleet gets a filtered per-fleet engine API served by the runner (validated container, network and image calls only), and only the runner keeps the real socket.
 - Cross-app sandbox dials are refused: a fleet reaches only the containers it owns.
+- The host-network container celld uses to install its firewall now always runs from Noite's own image with celld's exact ruleset, never from an image a tenant deployed. Sandbox containers must name a deployed image by content key and carry CPU and memory limits (at most celld's largest instance type); network inspects no longer list other apps' containers.
+- Sandbox container cleanup is scoped to this install (`noite.install` label), so two installs sharing one engine never remove each other's containers, and orphans are also removed when `NOITE_SANDBOX=0`.
 - Deploys declaring `containers[]` with a `Dockerfile` image (which celld would build on the host engine outside its fence) or a per-class `runtime` (the OCI runtime is operator-owned) now fail with a direction.
 - The alpha.12–14 host firewall legs are gone: the four DOCKER-USER rules and the stale `noite_sandbox` table are removed automatically at boot, and Docker's own raw PREROUTING rules are no longer deleted.

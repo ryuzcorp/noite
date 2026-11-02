@@ -6,9 +6,10 @@
 
 use std::net::Ipv4Addr;
 
+use bytes::Bytes;
 use serde_json::Value;
 
-use super::super::FLEET_LABEL;
+use super::super::{install, FLEET_LABEL, INSTALL_LABEL};
 
 /// celld 0.6.3's fence ruleset, byte-identical to `FENCE_RULES` in
 /// `crates/celld/container.rs:146-160`. The fence installer is the one
@@ -303,8 +304,8 @@ pub fn validate_app_create(body: &Value, fleet: &str) -> Result<Value, String> {
         return Err(format!("create takes no {key:?}"));
     }
     let image = object.get("Image").and_then(Value::as_str).unwrap_or("");
-    if !image.starts_with("celld-image:") {
-        return Err("create Image must be a celld-image: tag".to_string());
+    if !valid_image_name(image) {
+        return Err("create Image must be a celld-image:<content key> tag".to_string());
     }
     if let Some(env) = object.get("Env") {
         if !is_string_array(env) {
@@ -341,6 +342,10 @@ pub fn validate_app_create(body: &Value, fleet: &str) -> Result<Value, String> {
         return Err("create Labels must be an object".to_string());
     };
     labels.insert(FLEET_LABEL.to_string(), Value::String(fleet.to_string()));
+    labels.insert(
+        INSTALL_LABEL.to_string(),
+        Value::String(install().to_string()),
+    );
     Ok(body)
 }
 
@@ -396,22 +401,43 @@ fn validate_app_host_config(host: &serde_json::Map<String, Value>) -> Result<(),
             return Err("HostConfig Init must be true".to_string());
         }
     }
-    for key in ["NanoCpus", "Memory", "MemorySwap"] {
-        if let Some(value) = host.get(key) {
-            if value.as_u64().is_none() {
-                return Err(format!("HostConfig {key} must be a non-negative integer"));
-            }
-        }
+    // Every container has limits, never above the largest instance type
+    // celld knows (`standard-4`: 4 vCPU, 12 GiB; `container.rs:77-88`):
+    // absent or zero would mean unlimited on the daemon, and a huge value
+    // the same in practice. Swap is never extended beyond memory.
+    let cpus = host.get("NanoCpus").and_then(Value::as_u64);
+    if !cpus.is_some_and(|cpus| (1..=MAX_NANO_CPUS).contains(&cpus)) {
+        return Err(format!("HostConfig NanoCpus must be 1..={MAX_NANO_CPUS}"));
+    }
+    let memory = host.get("Memory").and_then(Value::as_u64);
+    if !memory.is_some_and(|memory| (1..=MAX_MEMORY_BYTES).contains(&memory)) {
+        return Err(format!("HostConfig Memory must be 1..={MAX_MEMORY_BYTES}"));
+    }
+    if host.get("MemorySwap").and_then(Value::as_u64) != memory {
+        return Err("HostConfig MemorySwap must equal Memory".to_string());
     }
     Ok(())
 }
 
-/// Validate the fence installer's create body (celld `container.rs:694-700`),
-/// returning it with the fleet label injected. This is the one host-network
-/// container a fleet may create, and only because the body is celld's own
-/// installer verbatim — image tag and node label aside, every other byte is
-/// pinned, above all the ruleset.
-pub fn validate_fence_create(body: &Value, fleet: &str) -> Result<Value, String> {
+/// The largest instance type celld knows (`standard-4`), as the daemon's
+/// `NanoCpus` and `Memory` values.
+const MAX_NANO_CPUS: u64 = 4_000_000_000;
+const MAX_MEMORY_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+
+/// Validate the fence installer's create body (celld `container.rs:694-700`)
+/// and return the body Noite actually creates. This is the one host-network,
+/// `NET_ADMIN` container a fleet may ask for, so only celld's installer
+/// verbatim passes (node label aside, every byte is pinned, above all the
+/// ruleset) and its image is replaced by `trusted_image`, the runner's own:
+/// a `celld-image:` tag is whatever image a tenant deployed, and its `sh`
+/// or `nft` would otherwise run in the host netns with `NET_ADMIN`. The
+/// runner image carries `sh` and `nft`; the entrypoint is set explicitly
+/// because that image's own entrypoint is the runner.
+pub fn validate_fence_create(
+    body: &Value,
+    fleet: &str,
+    trusted_image: &str,
+) -> Result<Value, String> {
     let Some(object) = body.as_object() else {
         return Err("fence body must be an object".to_string());
     };
@@ -455,11 +481,19 @@ pub fn validate_fence_create(body: &Value, fleet: &str) -> Result<Value, String>
     {
         return Err("fence HostConfig must be exactly celld's installer".to_string());
     }
-    let mut body = body.clone();
-    if let Some(labels) = body.get_mut("Labels").and_then(Value::as_object_mut) {
-        labels.insert(FLEET_LABEL.to_string(), Value::String(fleet.to_string()));
-    }
-    Ok(body)
+    let node = labels.get("celld.node").cloned().unwrap_or(Value::Null);
+    Ok(serde_json::json!({
+        "Image": trusted_image,
+        "Entrypoint": ["sh", "-c", FENCE_CMD],
+        "Env": [format!("CELLD_NFT={FENCE_RULES}")],
+        "Labels": {
+            "celld.node": node,
+            "celld.fence": "1",
+            FLEET_LABEL: fleet,
+            INSTALL_LABEL: install(),
+        },
+        "HostConfig": { "NetworkMode": "host", "CapAdd": ["NET_ADMIN"] },
+    }))
 }
 
 /// Validate an exec-create body (celld `container.rs:1267-1286`, plus the
@@ -577,6 +611,24 @@ pub fn validate_network_create(body: &Value) -> Result<(), String> {
         return Err("network Options must be exactly celld's bridge".to_string());
     }
     Ok(())
+}
+
+/// A network inspect answer without its member list: `Containers` (and the
+/// per-container `Services` some daemons add) become empty, so a fleet never
+/// learns another app's container names or addresses. A non-JSON answer
+/// (an engine error) passes as is.
+pub fn without_network_members(body: &[u8]) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return Bytes::copy_from_slice(body);
+    };
+    if let Some(object) = value.as_object_mut() {
+        for key in ["Containers", "Services"] {
+            if object.contains_key(key) {
+                object.insert(key.to_string(), Value::Object(Default::default()));
+            }
+        }
+    }
+    Bytes::from(value.to_string())
 }
 
 /// The fleet label on an inspected container, from either place the daemon
@@ -943,6 +995,12 @@ mod tests {
             ("PublishAllPorts true", json!(true)),
             ("Init false", json!(false)),
             ("Memory negative", json!(-1)),
+            ("Memory zero (unlimited)", json!(0)),
+            ("Memory huge", json!(1_u64 << 50)),
+            ("missing Memory", Value::Null),
+            ("NanoCpus zero (unlimited)", json!(0)),
+            ("missing NanoCpus", Value::Null),
+            ("MemorySwap unlimited", json!(-1)),
         ]
         .into_iter()
         .map(|(name, value)| {
@@ -972,6 +1030,15 @@ mod tests {
         let mut other_image = base.clone();
         other_image["Image"] = json!("alpine:3.20");
         cases.push(("non-celld image", other_image));
+        for loose in [
+            "celld-image:evil",
+            "celld-image:foo/bar",
+            "celld-image:abc@sha256:00",
+        ] {
+            let mut body = base.clone();
+            body["Image"] = json!(loose);
+            cases.push(("loose celld-image tag", body));
+        }
         for (name, body) in cases {
             assert!(
                 validate_app_create(&body, "shop").is_err(),
@@ -981,13 +1048,27 @@ mod tests {
     }
 
     #[test]
-    fn fence_create_accepts_cellds_installer_verbatim() {
-        let checked = validate_fence_create(&fence_create_body(), "shop").expect("celld's fence");
-        assert_eq!(checked.pointer("/Labels/noite.fleet"), Some(&json!("shop")));
+    fn fence_create_runs_cellds_rules_from_the_runner_image() {
+        const TRUSTED: &str = "sha256:runner-image";
+        let checked =
+            validate_fence_create(&fence_create_body(), "shop", TRUSTED).expect("celld's fence");
+        // Whatever celld-image tag celld named, the host-network container
+        // runs the runner's image with celld's exact ruleset and command.
+        assert_eq!(checked.pointer("/Image"), Some(&json!(TRUSTED)));
         assert_eq!(
-            checked.pointer("/Labels/celld.fence"),
-            Some(&json!("1")),
-            "celld's own labels survive"
+            checked.pointer("/Entrypoint"),
+            Some(&json!(["sh", "-c", FENCE_CMD]))
+        );
+        assert_eq!(checked.get("Cmd"), None);
+        assert_eq!(
+            checked.pointer("/Env"),
+            Some(&json!([format!("CELLD_NFT={FENCE_RULES}")]))
+        );
+        assert_eq!(checked.pointer("/Labels/noite.fleet"), Some(&json!("shop")));
+        assert_eq!(checked.pointer("/Labels/celld.node"), Some(&json!(NODE)));
+        assert_eq!(
+            checked.pointer("/HostConfig"),
+            Some(&json!({ "NetworkMode": "host", "CapAdd": ["NET_ADMIN"] }))
         );
     }
 
@@ -1024,7 +1105,7 @@ mod tests {
             ("fence label off", fence_zero),
         ] {
             assert!(
-                validate_fence_create(&body, "shop").is_err(),
+                validate_fence_create(&body, "shop", "sha256:runner-image").is_err(),
                 "{name} refused"
             );
         }
@@ -1068,6 +1149,30 @@ mod tests {
             };
             assert!(refused, "{name} refused");
         }
+    }
+
+    #[test]
+    fn network_inspect_hides_every_member() {
+        let upstream = json!({
+            "Name": "celld",
+            "Internal": false,
+            "Options": {
+                "com.docker.network.bridge.enable_icc": "false",
+                "com.docker.network.bridge.name": "celld0",
+            },
+            "Containers": {
+                "abc": { "Name": "celld-0123456789abcdef01234567", "IPv4Address": "172.19.0.2/16" },
+            },
+        });
+        let filtered: Value =
+            serde_json::from_slice(&without_network_members(upstream.to_string().as_bytes()))
+                .unwrap();
+        assert_eq!(filtered["Containers"], json!({}));
+        // What celld decides on survives.
+        assert_eq!(filtered["Options"], upstream["Options"]);
+        assert_eq!(filtered["Internal"], json!(false));
+        // An engine error passes through untouched.
+        assert_eq!(&without_network_members(b"not json")[..], b"not json");
     }
 
     #[test]

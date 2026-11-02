@@ -33,7 +33,7 @@ use serde_json::Value;
 use tokio::net::{UnixListener, UnixStream};
 
 use super::registry;
-use super::{ENGINE_SOCKET_DIR, FLEET_LABEL};
+use super::{ENGINE_SOCKET_DIR, FLEET_LABEL, INSTALL_LABEL};
 use validate::{ContainerOp, Route};
 
 /// The engine socket celld dials when the operator names none (compose
@@ -178,24 +178,21 @@ fn chown(path: &Path, uid: u32, gid: u32) -> anyhow::Result<()> {
     }
 }
 
-/// Serve one fleet its engine socket, owned by the fleet user at 0600 in a
-/// root-owned 0711 dir, and answer it on an accept-loop task. Idempotent
+/// Serve one fleet its engine socket, root-owned 0666 in a root-owned 0711
+/// dir, and answer it on an accept-loop task. Every fleet shares one uid, so
+/// file modes cannot tell fleets apart anyway (the per-request peer pid
+/// does); a root-owned socket keeps any fleet from `chmod`-ing another's
+/// shut. Idempotent
 /// while the fleet's loop lives. The upstream engine is resolved once per
 /// serve (the engine socket is mount-static; a fleet respawn re-resolves).
 /// Failing here must never fail the spawn: the supervisor logs and runs the
 /// fleet without an engine instead.
-pub fn serve_fleet(key: &str, uid: u32, gid: u32) -> anyhow::Result<PathBuf> {
+pub fn serve_fleet(key: &str) -> anyhow::Result<PathBuf> {
     let upstream = upstream_socket();
-    serve_inner(key, uid, gid, Path::new(ENGINE_SOCKET_DIR), upstream)
+    serve_inner(key, Path::new(ENGINE_SOCKET_DIR), upstream)
 }
 
-fn serve_inner(
-    key: &str,
-    uid: u32,
-    gid: u32,
-    dir: &Path,
-    upstream: Option<PathBuf>,
-) -> anyhow::Result<PathBuf> {
+fn serve_inner(key: &str, dir: &Path, upstream: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     let socket = dir.join(format!("{}.sock", sanitize(key)));
     if socket.as_os_str().as_encoded_bytes().len() > 107 {
         anyhow::bail!("engine socket path too long for {}", socket.display());
@@ -210,14 +207,17 @@ fn serve_inner(
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o711))?;
     // SAFETY: geteuid only reads.
-    if unsafe { libc::geteuid() } == 0 {
+    let root = unsafe { libc::geteuid() } == 0;
+    if root {
         chown(dir, 0, 0)?;
     }
     // A previous run's socket (an unclean shutdown left the file behind).
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;
-    chown(&socket, uid, gid)?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    if root {
+        chown(&socket, 0, 0)?;
+    }
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666))?;
     let fleet = key.to_string();
     let task = tokio::spawn(accept_loop(listener, fleet, upstream));
     with(|s| {
@@ -236,7 +236,8 @@ pub async fn close_fleet(key: &str) {
     forget_fleet_execs(key);
     let _ = tokio::fs::remove_file(socket_path(key)).await;
     if let Some(upstream) = upstream_socket() {
-        for id in list_labelled(&upstream, &format!("{FLEET_LABEL}={key}")).await {
+        let owner = super::owner(key);
+        for id in list_labelled(&upstream, &format!("{FLEET_LABEL}={owner}")).await {
             delete_container(&upstream, &id).await;
         }
     }
@@ -251,7 +252,8 @@ pub async fn sweep_boot() -> anyhow::Result<()> {
     let Some(upstream) = upstream_socket() else {
         return Ok(());
     };
-    for id in list_labelled(&upstream, FLEET_LABEL).await {
+    let install = format!("{INSTALL_LABEL}={}", super::install());
+    for id in list_labelled(&upstream, &install).await {
         delete_container(&upstream, &id).await;
     }
     Ok(())
@@ -275,7 +277,13 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
     }
 }
 
+/// Concurrent connections per fleet socket: celld holds a handful (one per
+/// call, plus exec streams and long-polled waits); the cap keeps a flood from
+/// exhausting the runner's tasks and fds.
+const MAX_CONNS: usize = 256;
+
 async fn accept_loop(listener: UnixListener, fleet: String, upstream: Option<PathBuf>) {
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -286,10 +294,15 @@ async fn accept_loop(listener: UnixListener, fleet: String, upstream: Option<Pat
                 continue;
             }
         };
+        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
         let peer = peer_pid(&stream);
         let fleet = fleet.clone();
         let upstream = upstream.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let service = hyper::service::service_fn(|req: Request<Incoming>| {
                 handle_request(req, fleet.clone(), upstream.clone(), peer)
             });
@@ -343,7 +356,7 @@ async fn forward(
 ) -> Response<ProxyBody> {
     match route {
         Route::List => {
-            let query = validate::rewrite_list_query(query, fleet);
+            let query = validate::rewrite_list_query(query, &super::owner(fleet));
             forward_simple(
                 upstream,
                 "GET",
@@ -380,7 +393,26 @@ async fn forward(
             if !validate::valid_network_name(name) {
                 return refuse("unknown network");
             }
-            forward_simple(upstream, "GET", &format!("/networks/{name}"), Bytes::new()).await
+            // The daemon lists every container on the bridge — every app's,
+            // with names and addresses. celld only reads the options, so the
+            // list never leaves the proxy.
+            let response = match engine_call(
+                upstream,
+                "GET",
+                &format!("/networks/{name}"),
+                Bytes::new(),
+                false,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(e) => return refuse(&format!("engine unreachable: {e:#}")),
+            };
+            let status = response.status();
+            let Ok(body) = response.into_body().collect().await else {
+                return refuse("engine answer unreadable");
+            };
+            forward_bytes(status, validate::without_network_members(&body.to_bytes()))
         }
         Route::NetworkCreate => {
             let raw = match read_body(req.into_body()).await {
@@ -500,7 +532,7 @@ async fn inspect(upstream: &Path, id: &str) -> anyhow::Result<Option<Value>> {
 async fn owned(upstream: &Path, fleet: &str, id: &str) -> Result<Value, Box<Response<ProxyBody>>> {
     match inspect(upstream, id).await {
         Ok(Some(info)) => {
-            if validate::inspect_fleet_label(&info).as_deref() == Some(fleet) {
+            if validate::inspect_fleet_label(&info) == Some(super::owner(fleet)) {
                 Ok(info)
             } else {
                 Err(Box::new(refuse("foreign container")))
@@ -532,14 +564,22 @@ async fn create(
     // A name means an app container; the nameless create is the fence
     // installer, and only the installer's verbatim body passes there.
     let (checked, record) = match name {
-        Some(name) => match validate::validate_app_create(&body, fleet) {
+        Some(name) => match validate::validate_app_create(&body, &super::owner(fleet)) {
             Ok(checked) => (checked, Some(name)),
             Err(reason) => return refuse(&reason),
         },
-        None => match validate::validate_fence_create(&body, fleet) {
-            Ok(checked) => (checked, None),
-            Err(reason) => return refuse(&reason),
-        },
+        None => {
+            // The fence runs from the runner's own image (see
+            // `validate_fence_create`); unknown until the boot pass inspected
+            // this container, and refused until then.
+            let Some(image) = super::plane::own_image() else {
+                return refuse("fence image not known yet; retry");
+            };
+            match validate::validate_fence_create(&body, &super::owner(fleet), &image) {
+                Ok(checked) => (checked, None),
+                Err(reason) => return refuse(&reason),
+            }
+        }
     };
     let path = match &record {
         Some(name) => format!("/containers/create?name={name}"),
@@ -882,11 +922,6 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn euid_egid() -> (u32, u32) {
-        // SAFETY: both only read.
-        unsafe { (libc::geteuid(), libc::getegid()) }
-    }
-
     /// A unique short temp dir: unix socket paths cap at 107 bytes, so no
     /// UUIDs here — pid plus a counter is unique enough per test binary.
     fn test_dir(name: &str) -> PathBuf {
@@ -1048,14 +1083,14 @@ mod tests {
             seen.clone(),
         ));
         let key = test_key("fwd");
-        let (uid, gid) = euid_egid();
-        let socket = serve_inner(&key, uid, gid, &fleet_dir, Some(upstream_sock)).expect("serve");
+        let socket = serve_inner(&key, &fleet_dir, Some(upstream_sock)).expect("serve");
         // Serving again is the same socket, not a second loop.
         assert_eq!(
-            serve_inner(&key, uid, gid, &fleet_dir, None).expect("re-serve"),
+            serve_inner(&key, &fleet_dir, None).expect("re-serve"),
             socket
         );
-        // The dir traverses but does not list; the socket is the fleet's own.
+        // The dir traverses but does not list; every fleet process may
+        // connect (the peer pid decides), none may chmod the socket shut.
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             std::fs::metadata(&fleet_dir).unwrap().permissions().mode() & 0o777,
@@ -1063,7 +1098,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
-            0o600
+            0o666
         );
         registry::register_fleet(&key, std::process::id());
 
@@ -1116,10 +1151,9 @@ mod tests {
         let dir = test_dir("peer");
         let fleet_dir = dir.join("sockets");
         std::fs::create_dir_all(&fleet_dir).unwrap();
-        let (uid, gid) = euid_egid();
         // Never registered: no fleet process owns this socket yet.
         let key = test_key("peer");
-        let socket = serve_inner(&key, uid, gid, &fleet_dir, None).expect("serve");
+        let socket = serve_inner(&key, &fleet_dir, None).expect("serve");
         let (status, body) = fleet_call(&socket, "GET", "/containers/json?all=true", None).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(
@@ -1182,8 +1216,7 @@ mod tests {
             UnixListener::bind(&upstream_sock).expect("echo engine binds"),
         ));
         let key = test_key("jack");
-        let (uid, gid) = euid_egid();
-        let socket = serve_inner(&key, uid, gid, &fleet_dir, Some(upstream_sock)).expect("serve");
+        let socket = serve_inner(&key, &fleet_dir, Some(upstream_sock)).expect("serve");
         registry::register_fleet(&key, std::process::id());
 
         // An exec id this fleet never created here starts nothing.

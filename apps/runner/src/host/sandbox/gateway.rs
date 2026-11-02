@@ -347,22 +347,28 @@ pub fn spawn(fleet_ids: Option<(u32, u32)>) {
 /// The gateway nftables ruleset: fleet TCP toward the celld bridges is
 /// redirected to the gateway listener. A separate table from the egress
 /// policy, installed in both tenancies; the atomic `table` / `delete table`
-/// / `table {}` replace is the same shape `netisolation` uses.
-pub fn gateway_ruleset(subnets: &[String]) -> String {
+/// / `table {}` replace is the same shape `netisolation` uses. Only the fleet
+/// user's dials are redirected (`None`: fleets run as the runner's own user,
+/// dev only, so every dial is): nothing else on this host dials containers.
+pub fn gateway_ruleset(subnets: &[String], fleet_uid: Option<u32>) -> String {
     let valid: Vec<&str> = subnets
         .iter()
         .map(String::as_str)
         .filter(|s| super::plane::valid_cidr(s))
         .collect();
+    let owner = fleet_uid
+        .map(|uid| format!("meta skuid {uid} "))
+        .unwrap_or_default();
     format!(
         r#"table inet noite_gateway
 delete table inet noite_gateway
 table inet noite_gateway {{
   chain output {{
     type nat hook output priority -100; policy accept;
-    ip daddr {{ {} }} meta l4proto tcp redirect to :{}
+    {}ip daddr {{ {} }} meta l4proto tcp redirect to :{}
   }}
 }}"#,
+        owner,
         valid.join(", "),
         super::GATEWAY_PORT,
     )
@@ -385,7 +391,7 @@ fn table_ok() -> bool {
 /// Install the gateway table when the subnets are known and moved. An empty
 /// discovery keeps the applied table (a flapping engine must not cut live
 /// traffic); returns whether the table is currently correct.
-pub async fn ensure_table(subnets: &[String]) -> bool {
+pub async fn ensure_table(subnets: &[String], fleet_uid: Option<u32>) -> bool {
     let valid: Vec<String> = subnets
         .iter()
         .filter(|s| super::plane::valid_cidr(s))
@@ -397,7 +403,7 @@ pub async fn ensure_table(subnets: &[String]) -> bool {
     if table_ok() && applied() == valid {
         return true;
     }
-    let rules = gateway_ruleset(&valid);
+    let rules = gateway_ruleset(&valid, fleet_uid);
     match super::super::netisolation::nft_run(&["-f", "-"], Some(rules.as_str())).await {
         Ok(()) => {
             if let Ok(mut ok) = TABLE_OK.lock() {
@@ -495,7 +501,7 @@ mod tests {
     #[test]
     fn gateway_ruleset_redirects_celld_tcp_to_the_gateway() {
         let subnets = vec!["172.19.0.0/16".to_string(), "bogus".to_string()];
-        let rules = gateway_ruleset(&subnets);
+        let rules = gateway_ruleset(&subnets, Some(10020));
         assert!(
             rules.starts_with("table inet noite_gateway\ndelete table inet noite_gateway\n"),
             "{rules}"
@@ -505,7 +511,9 @@ mod tests {
             "{rules}"
         );
         assert!(
-            rules.contains("ip daddr { 172.19.0.0/16 } meta l4proto tcp redirect to :8071"),
+            rules.contains(
+                "meta skuid 10020 ip daddr { 172.19.0.0/16 } meta l4proto tcp redirect to :8071"
+            ),
             "{rules}"
         );
         assert!(

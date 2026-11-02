@@ -472,12 +472,8 @@ async fn fleet_gone_cleanup(slug: &str) {
 /// Serve one fleet its engine proxy socket before spawn. `None` (with a
 /// warning) when the socket cannot be served: the fleet then spawns without
 /// an engine rather than not at all.
-fn fleet_engine_socket(cfg: &Config, key: &str) -> Option<std::path::PathBuf> {
-    // SAFETY: both only read.
-    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    let uid = cfg.fleet_uid.unwrap_or(uid);
-    let gid = cfg.fleet_gid.unwrap_or(gid);
-    match crate::host::sandbox::engine::serve_fleet(key, uid, gid) {
+fn fleet_engine_socket(key: &str) -> Option<std::path::PathBuf> {
+    match crate::host::sandbox::engine::serve_fleet(key) {
         Ok(socket) => Some(socket),
         Err(e) => {
             tracing::warn!(fleet = %key, error = %e, "fleet engine socket unavailable; no engine for this fleet");
@@ -727,8 +723,14 @@ async fn ensure_spawned(
     // leak through the inherit): with sandboxing on the fleet gets its own
     // proxy socket, otherwise no engine at all.
     cmd.env_remove("DOCKER_HOST");
+    // celld's operator knobs for containers stay unsupported: a runtime or
+    // resolver makes celld send `Runtime`/`Binds`, which the engine proxy
+    // refuses (they would hand a fleet host paths or a weaker runtime), so an
+    // inherited value would only break every Sandbox start.
+    cmd.env_remove("CELLD_CONTAINER_RUNTIME");
+    cmd.env_remove("CELLD_CONTAINER_DNS");
     if !cfg.sandbox_disabled {
-        if let Some(socket) = fleet_engine_socket(cfg, &key) {
+        if let Some(socket) = fleet_engine_socket(&key) {
             cmd.env("DOCKER_HOST", format!("unix://{}", socket.display()));
         }
     }

@@ -227,21 +227,32 @@ async fn main() -> anyhow::Result<()> {
     // engine, #120's fix), and a failure only keeps Sandbox classes
     // unreachable. One refresh task re-ensures networks/relay/table every
     // 30 s, jittered; only the storage allowance refreshes separately.
-    if !config.sandbox_disabled {
-        // Before any fleet starts (so it cannot remove a container a fresh
-        // fleet just created): the previous run's fleet containers are
-        // orphans now — their fleets died with the runner. Bounded, so a
-        // sick engine delays boot by at most the bound.
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            host::sandbox::engine::sweep_boot(),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "sandbox boot sweep failed"),
-            Err(_) => tracing::warn!("sandbox boot sweep timed out"),
+    // This install's id scopes the sandbox container labels, so the sweeps
+    // below never touch another install's containers on a shared engine.
+    host::sandbox::set_install(host::credentials::install_tag(
+        &config.s3_endpoint,
+        &config.s3_bucket,
+        &config.aws_region,
+    ));
+    // Before any fleet starts (so it cannot remove a container a fresh fleet
+    // just created): the previous run's fleet containers are orphans now —
+    // their fleets died with the runner. Also with sandboxing switched off,
+    // so turning it off leaves nothing running. Bounded, so a sick engine
+    // delays boot by at most the bound. Reading this container's image here
+    // too lets the engine proxy run celld's fence from it from the start.
+    let boot_pass = async {
+        let swept = host::sandbox::engine::sweep_boot().await;
+        if !config.sandbox_disabled {
+            host::sandbox::plane::own_container().await;
         }
+        swept
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(20), boot_pass).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "sandbox boot sweep failed"),
+        Err(_) => tracing::warn!("sandbox boot sweep timed out"),
+    }
+    if !config.sandbox_disabled {
         let fleet_ids = config
             .fleet_uid
             .map(|uid| (uid, config.fleet_gid.unwrap_or(uid)));
@@ -251,7 +262,11 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!(subnets = ?first.subnets, "sandbox plane ensured");
                 let relay_ok = host::sandbox::relay::ensure().await;
                 host::sandbox::gateway::spawn(fleet_ids);
-                let table_ok = host::sandbox::gateway::ensure_table(&first.subnets).await;
+                let table_ok = host::sandbox::gateway::ensure_table(
+                    &first.subnets,
+                    fleet_ids.map(|(uid, _)| uid),
+                )
+                .await;
                 host::sandbox::plane::cleanup_legacy().await;
                 let relay_healthy = relay_ok && host::sandbox::relay::healthy().await;
                 host::sandbox::plane::record(true, first.subnets, relay_healthy, table_ok);
@@ -268,7 +283,11 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 let relay_ok = host::sandbox::relay::ensure().await;
-                let table_ok = host::sandbox::gateway::ensure_table(&nets.subnets).await;
+                let table_ok = host::sandbox::gateway::ensure_table(
+                    &nets.subnets,
+                    fleet_ids.map(|(uid, _)| uid),
+                )
+                .await;
                 let relay_healthy = relay_ok && host::sandbox::relay::healthy().await;
                 host::sandbox::plane::record(true, nets.subnets, relay_healthy, table_ok);
             }

@@ -45,10 +45,33 @@ pub const RELAY_DIR: &str = "/data/sandbox-relay";
 /// The relay's socket inside [`RELAY_DIR`].
 pub const RELAY_SOCKET: &str = "/data/sandbox-relay/relay.sock";
 
-/// Label on every container the engine proxy lets a fleet create: the fleet
-/// key. The runner removes a fleet's containers by it when the fleet exits,
-/// and every labelled container at boot.
+/// Label on every container the engine proxy lets a fleet create:
+/// `<install>:<fleet key>` ([`owner`]). The runner removes a fleet's
+/// containers by it when the fleet exits.
 pub const FLEET_LABEL: &str = "noite.fleet";
+
+/// Label on every container the engine proxy lets a fleet create: the
+/// install id alone, so the boot sweep removes this install's containers
+/// and never another install's on a shared engine.
+pub const INSTALL_LABEL: &str = "noite.install";
+
+static INSTALL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record this install's id (the store-derived install tag,
+/// `credentials::install_tag`) once at boot, before any fleet starts.
+pub fn set_install(id: String) {
+    let _ = INSTALL.set(id);
+}
+
+/// This install's id; empty before [`set_install`] (tests).
+pub fn install() -> &'static str {
+    INSTALL.get().map_or("", String::as_str)
+}
+
+/// The [`FLEET_LABEL`] value for a fleet of this install.
+pub fn owner(fleet: &str) -> String {
+    format!("{}:{fleet}", install())
+}
 
 /// Label on the relay container (value: the noite container's id).
 pub const RELAY_LABEL: &str = "noite.relay";

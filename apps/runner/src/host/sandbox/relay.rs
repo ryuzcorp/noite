@@ -132,8 +132,34 @@ async fn read_header(stream: &mut tokio::net::UnixStream) -> Option<SocketAddrV4
     parse_connect_header(std::str::from_utf8(&line).ok()?)
 }
 
-/// Serve one relay connection: header, allow-check, dial, splice.
+/// The uid on the other end of a relay connection, via `SO_PEERCRED`.
+fn peer_uid(stream: &tokio::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: getsockopt with SO_PEERCRED writes one ucred for a socket fd.
+    unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let ret = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        );
+        (ret == 0).then_some(cred.uid)
+    }
+}
+
+/// Serve one relay connection: peer, header, allow-check, dial, splice.
+/// Only the runner (root) may ask: the relay dials any container on the
+/// bridges, and the ownership check that makes that safe is the runner's
+/// gateway. The directory mode already keeps everyone else out; this is
+/// the second lock.
 async fn handle(mut stream: tokio::net::UnixStream) {
+    if peer_uid(&stream) != Some(0) {
+        let _ = stream.write_all(b"ERR forbidden peer\n").await;
+        return;
+    }
     let header = tokio::time::timeout(HEADER_TIMEOUT, read_header(&mut stream)).await;
     let Ok(Some(target)) = header else {
         let _ = stream.write_all(b"ERR bad header\n").await;

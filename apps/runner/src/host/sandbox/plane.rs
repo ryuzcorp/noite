@@ -225,7 +225,20 @@ pub async fn own_container() -> Option<OwnContainer> {
                 None
             }
         })?;
-    parse_own_container(&id, &text)
+    let own = parse_own_container(&id, &text)?;
+    if let Ok(mut image) = OWN_IMAGE.lock() {
+        *image = Some(own.image.clone());
+    }
+    Some(own)
+}
+
+/// This container's image id, once [`own_container`] read it: the trusted
+/// image the engine proxy runs celld's fence installer from.
+static OWN_IMAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The runner's own image id, when known (see [`OWN_IMAGE`]).
+pub fn own_image() -> Option<String> {
+    OWN_IMAGE.lock().ok().and_then(|image| image.clone())
 }
 
 /// What `ensure_networks` found: whether the engine answered at all, and the
