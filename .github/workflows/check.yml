@@ -32,7 +32,7 @@ jobs:
       - name: lint and format
         run: bun run check
       - name: version pins
-        run: bun docker/check-versions.ts
+        run: bun docker/check-versions.ts ${{ inputs.changelog && '--release' || '' }}
       # check-versions.ts proves the celld tag matches docker/celld/ and the
       # image is pulled by digest; this proves the digest is the one
       # celld.yml published for that tag, not an older patch level's.

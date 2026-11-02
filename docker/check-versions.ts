@@ -95,8 +95,12 @@ for (const [name, pattern] of [
   }
 }
 
-// The celld image is Noite's patched build (docker/celld/): its tag must be
-// the `<CELLD_VERSION>-noite.<CELLD_PATCH_LEVEL>` that upstream.env pins, or
+// The celld image is Noite's patched build (docker/celld/): its tag is
+// `<CELLD_VERSION>-noite.<level>` for the CELLD_VERSION upstream.env pins.
+// A patch change bumps CELLD_PATCH_LEVEL, and celld.yml publishes that level
+// only once it is on main, so between the two PRs the Dockerfile may still
+// pin an earlier level of the same release. A release build
+// (`--release`, check.yml's `changelog` input) requires the exact level, or
 // the image ships a different patch stack than the repo describes.
 const upstream = Object.fromEntries(
   read("docker/celld/upstream.env")
@@ -106,15 +110,26 @@ const upstream = Object.fromEntries(
     .map(({ key, value }) => [key, value])
 );
 
-const celldTag = dockerfile.match(/ARG CELLD_VERSION=(?<tag>\S+)/u)?.groups
-  ?.tag;
+const celldPin = dockerfile.match(
+  /ARG CELLD_VERSION=(?<version>\S+)-noite\.(?<level>\d+)\n/u
+)?.groups;
 
 const expectedCelldTag = `${upstream.CELLD_VERSION}-noite.${upstream.CELLD_PATCH_LEVEL}`;
+const pinnedLevel = Number(celldPin?.level);
+const patchLevel = Number(upstream.CELLD_PATCH_LEVEL);
 
-if (celldTag !== expectedCelldTag) {
+if (celldPin?.version !== upstream.CELLD_VERSION || pinnedLevel > patchLevel) {
   fail(
-    `celld: docker/Dockerfile pins ${celldTag ?? "nothing"}, docker/celld/upstream.env says ${expectedCelldTag}`
+    `celld: docker/Dockerfile pins ${celldPin ? `${celldPin.version}-noite.${celldPin.level}` : "nothing"}, docker/celld/upstream.env says ${expectedCelldTag}`
   );
+} else if (pinnedLevel < patchLevel) {
+  const pending = `celld: docker/Dockerfile pins patch level ${pinnedLevel}; upstream.env is at ${patchLevel}. Pin ${expectedCelldTag} once celld.yml publishes it.`;
+
+  if (process.argv.includes("--release")) {
+    fail(pending);
+  } else {
+    console.log(`note: ${pending}`);
+  }
 }
 
 // ...and the stage must pull exactly that tag from Noite's own package, by
