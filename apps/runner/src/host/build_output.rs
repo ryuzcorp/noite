@@ -49,6 +49,75 @@ const CELLD_KEYS: &[&str] = &[
 
 const WRANGLER_NAMES: &[&str] = &["wrangler.jsonc", "wrangler.json", "wrangler.toml"];
 
+/// Refuse `containers[]` entries tenants must not deploy, read from the
+/// final deploy root's Wrangler config (celld's own `wrangler.jsonc`-first
+/// order; `wrangler.toml` needs no check because celld 0.6 refuses it
+/// outright). Returns whether the config declares containers (a non-empty
+/// array), so the deploy can stretch its timeout over a first image pull.
+///
+/// Three refusals, each a deploy-log error: a `runtime` key (the OCI
+/// runtime is operator-owned — celld lets a class override the node
+/// default); an `image` that names a Dockerfile in the project (`celld
+/// deploy` runs as the runner against the host engine, so it would `docker
+/// build` tenant `RUN` steps on the host daemon outside celld's fence);
+/// and any entry at all when `NOITE_SANDBOX` disabled Sandbox containers
+/// for the install. Anything else malformed is celld's to reject: it
+/// validates before it pulls, so a pass here never starts work a refusal
+/// would have stopped.
+pub fn validate_containers(deploy_root: &Path, sandbox_disabled: bool) -> anyhow::Result<bool> {
+    let mut text = None;
+    let mut label = "";
+    for name in ["wrangler.jsonc", "wrangler.json"] {
+        if let Ok(found) = std::fs::read_to_string(deploy_root.join(name)) {
+            text = Some(found);
+            label = name;
+            break;
+        }
+    }
+    let Some(text) = text else {
+        return Ok(false);
+    };
+    let value =
+        crate::host::storage::parse_wrangler(&text).with_context(|| format!("parse {label}"))?;
+    let Some(obj) = value.as_object() else {
+        return Ok(false);
+    };
+    let Some(containers) = obj.get("containers") else {
+        return Ok(false);
+    };
+    let Some(entries) = containers.as_array() else {
+        return Ok(false);
+    };
+    if entries.is_empty() {
+        return Ok(false);
+    }
+    if sandbox_disabled {
+        bail!("containers[0] refused: Sandbox containers are off on this install (NOITE_SANDBOX)");
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(entry) = entry.as_object() else {
+            continue;
+        };
+        if entry.contains_key("runtime") {
+            bail!("containers[{index}].runtime is refused: the OCI runtime is operator-owned (celld lets a class override the node default); remove the key and the class runs under the install's runtime");
+        }
+        if let Some(image) = entry.get("image").and_then(Value::as_str) {
+            if is_dockerfile(deploy_root, image) {
+                bail!("containers[{index}].image {image:?} names a Dockerfile in the project: `celld deploy` would build it on the host engine, running its RUN steps outside celld's fence; publish the image to a registry and reference it instead");
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Whether `image` names a Dockerfile in the project rather than an image
+/// reference. Mirrors celld 0.6.3's `is_dockerfile` (`deploy.rs`) exactly:
+/// the joined path exists and is a file, via `symlink_metadata` (which
+/// does not follow symlinks, so a symlink never counts — as in celld).
+fn is_dockerfile(root: &Path, image: &str) -> bool {
+    std::fs::symlink_metadata(root.join(image)).is_ok_and(|metadata| metadata.is_file())
+}
+
 /// Where a built tree deploys from, and what the deploy log should call it.
 #[derive(Debug)]
 pub struct BuiltRoot {
@@ -460,5 +529,152 @@ mod tests {
         let dir = scratch("glob");
         write(&dir.join(".assetsignore"), "*.map\n");
         assert!(apply_assetsignore(&dir).is_err());
+    }
+
+    fn deploy_root(name: &str, config: &str) -> PathBuf {
+        let dir = scratch(name).canonicalize().unwrap();
+        write(&dir.join("wrangler.json"), config);
+        dir
+    }
+
+    /// A per-class `runtime` overrides the node's default in celld, so the
+    /// install's runtime would be the tenant's choice. Refused: the OCI
+    /// runtime is operator-owned.
+    #[test]
+    fn container_runtime_is_refused() {
+        let dir = deploy_root(
+            "runtime",
+            r#"{"name":"a","containers":[{"class_name":"Sandbox","image":"ghcr.io/x/y:tag","runtime":"runsc"}]}"#,
+        );
+        let err = validate_containers(&dir, false).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("containers[0].runtime is refused"), "{text}");
+        assert!(text.contains("operator-owned"), "{text}");
+        // Even a null runtime is refused: any present key is either an
+        // override or a celld error, never a valid deploy.
+        let dir = deploy_root(
+            "runtime-null",
+            r#"{"name":"a","containers":[{"class_name":"Sandbox","image":"ghcr.io/x/y:tag","runtime":null}]}"#,
+        );
+        assert!(
+            format!("{:#}", validate_containers(&dir, false).unwrap_err())
+                .contains("operator-owned")
+        );
+    }
+
+    /// An `image` naming a file in the project makes celld `docker build`
+    /// it on the host engine — tenant `RUN` steps outside its fence.
+    /// Refused, with the registry direction.
+    #[test]
+    fn container_dockerfile_image_is_refused() {
+        let dir = scratch("dockerfile").canonicalize().unwrap();
+        write(
+            &dir.join("wrangler.json"),
+            r#"{"name":"a","containers":[{"class_name":"Sandbox","image":"images/app/Dockerfile"}]}"#,
+        );
+        write(
+            &dir.join("images/app/Dockerfile"),
+            "FROM scratch\nRUN echo pwned\n",
+        );
+        let err = validate_containers(&dir, false).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("names a Dockerfile"), "{text}");
+        assert!(text.contains("publish the image to a registry"), "{text}");
+    }
+
+    /// The Dockerfile rule mirrors celld's `is_dockerfile` exactly: a
+    /// missing path is a registry reference, a directory is not a file,
+    /// and a symlink never counts (`symlink_metadata` follows nothing).
+    #[test]
+    #[cfg(unix)]
+    fn container_dockerfile_rule_matches_celld() {
+        let dir = scratch("dockerfile-rule").canonicalize().unwrap();
+        write(&dir.join("images/app/Dockerfile"), "FROM scratch\n");
+        std::fs::create_dir_all(dir.join("emptydir")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.join("images/app/Dockerfile"),
+            dir.join("linked-Dockerfile"),
+        )
+        .unwrap();
+        for image in [
+            "ghcr.io/x/y:tag",
+            "images/missing/Dockerfile",
+            "emptydir",
+            "linked-Dockerfile",
+        ] {
+            write(
+                &dir.join("wrangler.json"),
+                &format!(
+                    r#"{{"name":"a","containers":[{{"class_name":"Sandbox","image":{image:?}}}]}}"#
+                ),
+            );
+            assert!(
+                validate_containers(&dir, false).unwrap(),
+                "{image} must pass: it is not a Dockerfile by celld's rule"
+            );
+        }
+    }
+
+    /// `NOITE_SANDBOX=off` refuses any `containers` entry; a config
+    /// without containers (or with an empty array) still deploys.
+    #[test]
+    fn containers_refused_when_sandbox_disabled() {
+        let dir = deploy_root(
+            "sandbox-off",
+            r#"{"name":"a","containers":[{"class_name":"Sandbox","image":"ghcr.io/x/y:tag"}]}"#,
+        );
+        let err = validate_containers(&dir, true).unwrap_err();
+        assert!(
+            format!("{err:#}")
+                .contains("Sandbox containers are off on this install (NOITE_SANDBOX)"),
+            "{err:#}"
+        );
+        let dir = deploy_root("sandbox-off-empty", r#"{"name":"a","containers":[]}"#);
+        assert!(!validate_containers(&dir, true).unwrap());
+        let dir = deploy_root("sandbox-off-none", r#"{"name":"a"}"#);
+        assert!(!validate_containers(&dir, true).unwrap());
+    }
+
+    /// A registry image with no `runtime` declares containers (the deploy
+    /// stretches its timeout); anything else malformed is celld's to
+    /// reject, so validation passes it through without declaring.
+    #[test]
+    fn container_validation_reports_and_defers() {
+        let dir = deploy_root(
+            "registry",
+            r#"{"name":"a","containers":[{"class_name":"Sandbox","image":"ghcr.io/x/y:tag"}]}"#,
+        );
+        assert!(validate_containers(&dir, false).unwrap());
+        // celld reads `wrangler.jsonc` first: a jsonc without containers
+        // wins over a json with a refused key.
+        write(
+            &dir.join("wrangler.jsonc"),
+            r#"{"name":"a", // celld's pick
+            }"#,
+        );
+        assert!(!validate_containers(&dir, false).unwrap());
+        for (name, config) in [
+            ("no-config", None),
+            ("not-object", Some("[1]")),
+            ("not-array", Some(r#"{"name":"a","containers":{}}"#)),
+        ] {
+            let dir = scratch(name).canonicalize().unwrap();
+            if let Some(config) = config {
+                write(&dir.join("wrangler.json"), config);
+            }
+            assert!(
+                !validate_containers(&dir, false).unwrap(),
+                "{name} must pass through undeclared for celld to reject"
+            );
+        }
+        // A non-empty array declares containers even when its shape is
+        // celld's to reject (it fails before pulling, so the stretched
+        // timeout costs nothing).
+        let dir = scratch("not-entry").canonicalize().unwrap();
+        write(
+            &dir.join("wrangler.json"),
+            r#"{"name":"a","containers":["x"]}"#,
+        );
+        assert!(validate_containers(&dir, false).unwrap());
     }
 }
