@@ -288,11 +288,15 @@ fn relative_up(from: &Path, path: &Path) -> String {
 /// Where a built tree deploys from, what the deploy log should call it, and
 /// the `secrets.required` names the rewrite dropped (celld refuses the key):
 /// the deploy fails before `celld deploy` unless every one has a setting.
+/// `void` marks Void's own build output (`dist/ssr/wrangler.json`): the one
+/// gate for every runner-owned Void injection (identity vars, provisioned
+/// secrets, `ISR_CACHE`), so anything else deploys exactly as before.
 #[derive(Debug)]
 pub struct BuiltRoot {
     pub dir: PathBuf,
     pub note: String,
     pub required_secrets: Vec<String>,
+    pub void: bool,
 }
 
 /// The deploy root the build produced under `src_dir`, or `None` to fall
@@ -308,6 +312,7 @@ pub fn built_deploy_root(src_dir: &Path) -> anyhow::Result<Option<BuiltRoot>> {
             note: "dist/wrangler.json (build output)".into(),
             // Used as written: nothing is dropped, so nothing is required.
             required_secrets: Vec::new(),
+            void: false,
         }));
     }
     // Void's own output: the Worker and its config under `dist/ssr/`, the
@@ -327,6 +332,7 @@ pub fn built_deploy_root(src_dir: &Path) -> anyhow::Result<Option<BuiltRoot>> {
             ),
             dir,
             required_secrets,
+            void: true,
         }));
     }
     let redirect = src.join(DEPLOY_REDIRECT);
@@ -343,6 +349,7 @@ pub fn built_deploy_root(src_dir: &Path) -> anyhow::Result<Option<BuiltRoot>> {
         ),
         dir,
         required_secrets,
+        void: false,
     }))
 }
 
@@ -1088,5 +1095,36 @@ mod tests {
         // Build-owned `__VOID_*` vars are not runner-reserved: they pass
         // through to the deployed config untouched.
         assert_eq!(v["vars"]["__VOID_EMAIL_FROM"], "noreply@example.com");
+    }
+
+    /// Only Void's own output (`dist/ssr/wrangler.json`) marks the root a
+    /// Void app: the redirect and the celld-ready config are not Void's, so
+    /// the runner's Void injections never touch them.
+    #[test]
+    fn only_voids_own_output_marks_a_void_app() {
+        let src = scratch("void-flag").canonicalize().unwrap();
+        write(
+            &src.join("dist/ssr/wrangler.json"),
+            r#"{"name":"app","main":"index.js","assets":{"directory":"../client"}}"#,
+        );
+        write(&src.join("dist/ssr/index.js"), "export default {}");
+        write(&src.join("dist/client/index.html"), "<h1>hi</h1>");
+        let built = built_deploy_root(&src).unwrap().expect("Void output");
+        assert!(built.void);
+        assert!(built.note.contains("Void"));
+
+        let src = scratch("redirect-flag").canonicalize().unwrap();
+        vite_worker_tree(&src);
+        let built = built_deploy_root(&src).unwrap().expect("redirect");
+        assert!(!built.void);
+
+        let src = scratch("oxide-flag").canonicalize().unwrap();
+        vite_worker_tree(&src);
+        write(
+            &src.join("dist/wrangler.json"),
+            r#"{"name":"app","main":"celld/entry.js"}"#,
+        );
+        let built = built_deploy_root(&src).unwrap().expect("dist config");
+        assert!(!built.void);
     }
 }
