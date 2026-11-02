@@ -117,6 +117,36 @@ if (celldTag !== expectedCelldTag) {
   );
 }
 
+// ...and the stage must pull exactly that tag from Noite's own package, by
+// the pinned digest: the version and digest checks above mean nothing if
+// CELLD_IMAGE names another registry or the FROM line ignores it. (CI's
+// `celld pin is published` step checks the digest is that tag's.)
+// A Dockerfile `${NAME}` reference, spelled without tripping the
+// template-in-string lint.
+const arg = (name: string): string => `\${${name}}`;
+
+const celldImage = dockerfile.match(/ARG CELLD_IMAGE=(?<image>\S+)/u)?.groups
+  ?.image;
+
+const expectedCelldImage = `ghcr.io/ryuzcorp/celld:${arg("CELLD_VERSION")}@${arg("CELLD_DIGEST")}`;
+
+if (celldImage !== expectedCelldImage) {
+  fail(
+    `celld: CELLD_IMAGE must be ${expectedCelldImage} (found ${celldImage ?? "nothing"})`
+  );
+}
+
+const celldFrom = [...dockerfile.matchAll(/^FROM (?<image>\S+) AS celld$/gmu)];
+
+if (
+  celldFrom.length !== 1 ||
+  celldFrom[0]?.groups?.image !== arg("CELLD_IMAGE")
+) {
+  fail(
+    `celld: docker/Dockerfile must have exactly one \`FROM ${arg("CELLD_IMAGE")} AS celld\``
+  );
+}
+
 // The bundled package managers: the Dockerfile pins must name the same
 // exact releases the runner resolves unpinned projects to
 // (`BUNDLED_*_VERSION` in apps/runner/src/host/package_manager.rs), or an
