@@ -4,8 +4,8 @@
 //!
 //! The relay listens on a unix socket in the shared data volume and, per
 //! connection, reads one `CONNECT <ipv4>:<port>` header, dials it only when
-//! the address sits inside a subnet currently assigned to `celld0`/`celld1`
-//! (getifaddrs at connect time — nothing else is ever dialable), answers
+//! the address is a container address on `celld0`/`celld1` (never the
+//! host side of a bridge; getifaddrs at connect time — nothing else is ever dialable), answers
 //! `OK`/`ERR`, then splices. It runs as uid 65534 with no capabilities, a
 //! read-only rootfs, and only the relay directory mounted.
 //!
@@ -53,22 +53,28 @@ pub fn parse_connect_header(line: &str) -> Option<SocketAddrV4> {
     Some(addr)
 }
 
-/// Whether `ip` sits inside one of `nets` (`(network, prefix)` pairs).
-pub fn allowed(ip: Ipv4Addr, nets: &[(Ipv4Addr, u32)]) -> bool {
-    let addr = u32::from(ip);
-    nets.iter().any(|(net, prefix)| {
-        if *prefix == 0 || *prefix > 32 {
+/// Whether `ip` is a container address on one of the bridges: inside a
+/// subnet of `addrs` (the host's own `(address, prefix)` on each bridge) but
+/// never the host's own address there, nor the network or broadcast address.
+/// The host side of a bridge is the host itself: dialing it from the host
+/// netns would reach every host service listening on all interfaces.
+pub fn allowed(ip: Ipv4Addr, addrs: &[(Ipv4Addr, u32)]) -> bool {
+    let target = u32::from(ip);
+    addrs.iter().any(|(host, prefix)| {
+        if *prefix == 0 || *prefix > 30 {
             return false;
         }
         let mask = !0u32 << (32 - prefix);
-        addr & mask == u32::from(*net) & mask
+        let host = u32::from(*host);
+        let network = host & mask;
+        target & mask == network && target != host && target != network && target != network | !mask
     })
 }
 
-/// Subnets currently assigned to `celld0`/`celld1`: `(network, prefix)` from
+/// The host's addresses on `celld0`/`celld1` with their prefixes, from
 /// getifaddrs, evaluated per connection so a bridge re-creation takes effect
 /// on the next dial. Non-contiguous masks are dropped, never trusted.
-fn local_celld_subnets() -> Vec<(Ipv4Addr, u32)> {
+fn local_celld_addrs() -> Vec<(Ipv4Addr, u32)> {
     let mut subnets = Vec::new();
     // SAFETY: getifaddrs/freeifaddrs pairing; the list is only read.
     unsafe {
@@ -94,7 +100,7 @@ fn local_celld_subnets() -> Vec<(Ipv4Addr, u32)> {
                 let bits = u32::from_be(mask.sin_addr.s_addr);
                 let prefix = bits.count_ones();
                 if prefix > 0 && bits == (!0u32 << (32 - prefix)) {
-                    subnets.push((Ipv4Addr::from(u32::from(ip) & bits), prefix));
+                    subnets.push((ip, prefix));
                 }
             }
             item = ifa.ifa_next;
@@ -133,7 +139,7 @@ async fn handle(mut stream: tokio::net::UnixStream) {
         let _ = stream.write_all(b"ERR bad header\n").await;
         return;
     };
-    if !allowed(*target.ip(), &local_celld_subnets()) {
+    if !allowed(*target.ip(), &local_celld_addrs()) {
         let _ = stream.write_all(b"ERR forbidden\n").await;
         return;
     }
@@ -503,27 +509,35 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_is_subnet_membership_only() {
-        let nets = vec![
-            (Ipv4Addr::new(172, 19, 0, 0), 16),
-            (Ipv4Addr::new(172, 20, 5, 0), 24),
+    fn allowlist_is_container_addresses_only() {
+        // The host's own addresses on the bridges, as getifaddrs reports them.
+        let addrs = vec![
+            (Ipv4Addr::new(172, 19, 0, 1), 16),
+            (Ipv4Addr::new(172, 20, 5, 1), 24),
         ];
-        assert!(allowed(Ipv4Addr::new(172, 19, 0, 2), &nets));
-        assert!(allowed(Ipv4Addr::new(172, 20, 5, 200), &nets));
+        assert!(allowed(Ipv4Addr::new(172, 19, 0, 2), &addrs));
+        assert!(allowed(Ipv4Addr::new(172, 20, 5, 200), &addrs));
         for denied in [
+            // The host side of each bridge: every host service listens there.
+            Ipv4Addr::new(172, 19, 0, 1),
+            Ipv4Addr::new(172, 20, 5, 1),
+            // Network and broadcast addresses.
+            Ipv4Addr::new(172, 19, 0, 0),
+            Ipv4Addr::new(172, 19, 255, 255),
+            Ipv4Addr::new(172, 20, 5, 255),
+            // Off the bridges.
             Ipv4Addr::new(172, 18, 0, 2),
             Ipv4Addr::new(172, 20, 6, 1),
-            Ipv4Addr::new(127, 0, 0, 1),
             Ipv4Addr::new(10, 0, 0, 1),
             Ipv4Addr::LOCALHOST,
         ] {
-            assert!(!allowed(denied, &nets), "{denied}");
+            assert!(!allowed(denied, &addrs), "{denied}");
         }
         assert!(!allowed(Ipv4Addr::new(172, 19, 0, 2), &[]));
         // Degenerate prefixes never match.
         assert!(!allowed(
             Ipv4Addr::new(172, 19, 0, 2),
-            &[(Ipv4Addr::new(0, 0, 0, 0), 0)]
+            &[(Ipv4Addr::new(0, 0, 0, 1), 0)]
         ));
     }
 
