@@ -614,6 +614,9 @@ async fn ensure_spawned(
     // misbehaves; the inherited runner filter would suppress them.
     .env("RUST_LOG", &cfg.fleet_log)
     .env("CELLD_IDLE_EVICT_S", cfg.fleet_idle_evict_s.to_string())
+    // See `Config::fleet_lease_ttl_ms`: a short store stall must not
+    // self-fence every fleet at once.
+    .env("CELLD_TTL_MS", cfg.fleet_lease_ttl_ms.to_string())
     // T1.5: the runner POSTs /reload after every deploy path (push,
     // rollback, web commit, rename), so the fleet's own poll only covers a
     // missed reload — every 300 s instead of every 5 s.

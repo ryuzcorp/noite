@@ -88,6 +88,7 @@ Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (hand
 | `RUNNER_FLEET_MEMORY_MB` | `512` | Per-fleet `memory.max` in MiB (own cgroup per fleet); per-app override in Settings → Limits; needs the multi-only cgroup grant (`docker/compose.multi.yaml`) — without it fleets share the container cgroup | runner-owned |
 | `RUNNER_FLEET_MEMORY_MAX_MB` | default cap | Ceiling for a per-app memory override in MiB; in `multi` a tenant can only lower its cap, never raise it past this. Single installs ignore it | runner-owned |
 | `RUNNER_FLEET_IDLE_EVICT_S` | `120` | → `CELLD_IDLE_EVICT_S`; idle seconds before a fleet hibernates cells | worker-passthrough (fleet) |
+| `RUNNER_FLEET_LEASE_TTL_MS` | `60000` | → `CELLD_TTL_MS` on every fleet and the control node; a storage or disk stall longer than two thirds of it restarts every app. Minimum `10000` | worker-passthrough (fleet) |
 | `RUNNER_FLEET_DEPLOY_POLL_S` | `300` | → `CELLD_DEPLOY_POLL_S`; covers missed `/reload` only | worker-passthrough (fleet) |
 | `RUNNER_FLEET_ASSET_CACHE_MB` | `64` | → `CELLD_ASSET_CACHE_BYTES`; per-fleet on-disk asset cache | worker-passthrough (fleet) |
 | `RUNNER_OTEL_FLUSH_MS` | `30000` | → `CELLD_OTEL_FLUSH_MS`; bucket-flush + ingest tick cadence (min `1000`); dashboards lag ~40 s | worker-passthrough (fleet) |

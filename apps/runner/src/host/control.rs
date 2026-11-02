@@ -243,6 +243,7 @@ async fn copy_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
 pub fn supervise(config: &Config, control_pid: Arc<AtomicU32>, logs: LogState) -> Supervised {
     let args = spawn_args(config);
     let shutdown_ms = config.fleet_shutdown_ms().to_string();
+    let lease_ttl_ms = config.fleet_lease_ttl_ms.to_string();
     let celld = config.celld_bin.clone();
     let otel = metrics::otel_env(config);
     Supervised::start_observed(
@@ -259,6 +260,8 @@ pub fn supervise(config: &Config, control_pid: Arc<AtomicU32>, logs: LogState) -
                 .env("CELLD_READY_FLEET_GATE_MS", "15000")
                 .env("CELLD_DURABILITY", "bucket")
                 .env("CELLD_SHUTDOWN_TOTAL_MS", &shutdown_ms)
+                // The same lease as tenant fleets (`Config::fleet_lease_ttl_ms`).
+                .env("CELLD_TTL_MS", &lease_ttl_ms)
                 // The control UI declares no container classes; only the
                 // runner holds the engine socket (host::sandbox::engine).
                 .env_remove("DOCKER_HOST")
