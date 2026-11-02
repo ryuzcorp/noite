@@ -9,8 +9,9 @@
 //! Reserved names (shared contract): a setting or a config `vars` entry with
 //! a runner-owned name fails the deploy with the name in the log —
 //! `__VOID_PROXY`, `__PROJECT_ID`, `__VOID_PROXY_TOKEN`,
-//! `__VOID_PROJECT_SLUG`, `__VOID_EMAIL_DOMAIN`, `__VOID_EMAIL_DEPLOYMENT_ID`
-//! (`ISR_CACHE` joins once the runner injects it). The build/fleet process
+//! `__VOID_PROJECT_SLUG`, `__VOID_EMAIL_DOMAIN`, `__VOID_EMAIL_DEPLOYMENT_ID`,
+//! plus `ISR_CACHE` on Void apps (the runner injects that binding there, and
+//! only there, so only there is the name refused). The build/fleet process
 //! prefixes (`PORT`, `AWS_*`, `CELLD_*`, `BETTER_AUTH_*`, …) do NOT apply
 //! here: they guard the process environment, and Worker `vars` are a separate
 //! namespace no platform component reads (SPEC documents the per-prefix
@@ -33,7 +34,8 @@ use std::path::Path;
 use anyhow::Context;
 use serde_json::Value;
 
-/// Runner-owned Worker vars: refused in settings and in config `vars` alike.
+/// Runner-owned Worker vars: refused in settings and in config `vars` alike,
+/// on every app.
 const RESERVED_WORKER_VARS: &[&str] = &[
     "__VOID_PROXY",
     "__PROJECT_ID",
@@ -43,17 +45,37 @@ const RESERVED_WORKER_VARS: &[&str] = &[
     "__VOID_EMAIL_DEPLOYMENT_ID",
 ];
 
-/// True for the runner-owned names no setting or config `vars` entry may use.
+/// Runner-owned Worker vars the runner injects only on Void apps, so the
+/// name is refused only there: a non-Void app keeps deploying a setting
+/// called `ISR_CACHE` exactly as before.
+const VOID_RESERVED_WORKER_VARS: &[&str] = &["ISR_CACHE"];
+
+/// True for the runner-owned names no setting or config `vars` entry may use
+/// on any app.
 pub fn worker_var_reserved(name: &str) -> bool {
-    RESERVED_WORKER_VARS.contains(&name)
+    worker_var_reserved_for(name, false)
+}
+
+/// True for the runner-owned names refused on this deploy: the global set,
+/// plus `ISR_CACHE` when the deploy is a Void app's (the runner injects
+/// that binding there). The Void merge calls this with `true`; the
+/// settings merge stays global.
+pub fn worker_var_reserved_for(name: &str, void_app: bool) -> bool {
+    RESERVED_WORKER_VARS.contains(&name) || (void_app && VOID_RESERVED_WORKER_VARS.contains(&name))
 }
 
 /// Names the runner itself provides as Worker vars: a `secrets.required`
-/// entry naming one is satisfied without a setting. Today only the reserved
-/// runner-owned names; a later slice provisions `BETTER_AUTH_SECRET` here.
-pub fn provisioned_names() -> HashSet<String> {
-    RESERVED_WORKER_VARS
-        .iter()
+/// entry naming one is satisfied without a setting. Exactly what the
+/// runner-owned merge injects — the identity vars, on Void apps only — and
+/// nothing else: the email vars and the `__VOID_PROXY` service binding land
+/// with the proxy slice, and the auto-provisioned `BETTER_AUTH_SECRET`
+/// flows through the settings load, so it needs no entry here.
+pub fn provisioned_names(void_app: bool) -> HashSet<String> {
+    if !void_app {
+        return HashSet::new();
+    }
+    ["__PROJECT_ID", "__VOID_PROJECT_SLUG", "__VOID_PROXY_TOKEN"]
+        .into_iter()
         .map(ToString::to_string)
         .collect()
 }
@@ -427,15 +449,67 @@ mod tests {
             "Settings"
         )
         .is_ok());
-        // The runner-owned names are provisioned by default.
+        // The identity vars are provisioned on Void apps, and only there.
         assert!(check_required(
             &["__PROJECT_ID".to_string()],
             &[],
-            &provisioned_names(),
+            &provisioned_names(true),
             "Settings"
         )
         .is_ok());
         assert!(check_required(&[], &[], &empty, "Settings").is_ok());
+    }
+
+    #[test]
+    fn provisioned_names_are_exactly_what_the_runner_injects() {
+        // Void apps: the three identity vars the runner-owned merge writes.
+        assert_eq!(
+            provisioned_names(true),
+            ["__PROJECT_ID", "__VOID_PROJECT_SLUG", "__VOID_PROXY_TOKEN"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        // The proxy slice's names are reserved but not provisioned yet: a
+        // required entry naming one still fails the deploy.
+        for name in ["__VOID_PROXY", "__VOID_EMAIL_DOMAIN"] {
+            assert!(
+                check_required(
+                    &[name.to_string()],
+                    &[],
+                    &provisioned_names(true),
+                    "Settings"
+                )
+                .is_err(),
+                "{name} must not read as provisioned"
+            );
+        }
+        // Non-Void apps: nothing is provisioned, so even an identity name in
+        // `secrets.required` fails the deploy instead of passing unsatisfied.
+        assert!(provisioned_names(false).is_empty());
+        assert!(check_required(
+            &["__PROJECT_ID".to_string()],
+            &[],
+            &provisioned_names(false),
+            "Settings"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn isr_cache_is_reserved_only_on_void_apps() {
+        assert!(!worker_var_reserved("ISR_CACHE"));
+        assert!(worker_var_reserved_for("ISR_CACHE", true));
+        assert!(!worker_var_reserved_for("ISR_CACHE", false));
+        // A non-Void app still deploys a setting called `ISR_CACHE`.
+        let mut config = json!({"name": "a"});
+        let stats =
+            merge_settings(&mut config, &settings(&[("ISR_CACHE", "v")]), "Settings").unwrap();
+        assert_eq!(stats.merged, 1);
+        assert_eq!(config["vars"]["ISR_CACHE"], "v");
+        // The global set is unchanged either way.
+        assert!(worker_var_reserved("__PROJECT_ID"));
+        assert!(worker_var_reserved_for("__PROJECT_ID", true));
     }
 
     #[test]

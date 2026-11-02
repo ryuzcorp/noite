@@ -14,6 +14,7 @@ use crate::host::package_manager;
 use crate::host::s3;
 use crate::host::supervisor::{self, ProcMap};
 use crate::host::tips::TipBundle;
+use crate::host::void_deploy;
 use crate::host::worker_vars;
 use crate::lifecycle::{self, sha_same};
 use crate::models::{App, AppStatus, DeployStatus};
@@ -738,6 +739,10 @@ async fn deploy_inner(
         .as_ref()
         .map(|built| built.required_secrets.clone())
         .unwrap_or_default();
+    // The Void gate for the runner-owned injections below: only a root from
+    // Void's own build output gets identity vars, provisioned secrets and
+    // the `ISR_CACHE` namespace.
+    let void_app = void_deploy::is_void_build(built_root.as_ref());
     let deploy_root = match built_root {
         Some(built) => {
             progress
@@ -896,19 +901,38 @@ async fn deploy_inner(
     // as `env.NAME`. Reserved platform names and required secrets with no
     // value fail the deploy here, before `celld deploy`, naming the variables
     // — never their values — in the log.
+    let settings_label = match target.environment() {
+        Some(_) => "Settings → Environment or this environment's Variable overrides",
+        None => "Settings → Environment",
+    };
+    // A Void app's required `BETTER_AUTH_SECRET` provisions before the load:
+    // minted once at the app level (unless any value already exists), so it
+    // flows through the ordinary settings load — environments inherit it —
+    // into the merge below like a setting.
+    if void_app
+        && required_secrets
+            .iter()
+            .any(|name| name == void_deploy::AUTH_SECRET_NAME)
+    {
+        let environment_id = target.environment().map(|env| env.id.as_str());
+        if void_deploy::ensure_auth_secret(pool, &app.id, environment_id).await? {
+            progress
+                .log(
+                    DeployStatus::Deploying,
+                    "worker vars: no BETTER_AUTH_SECRET setting, so one was generated and stored in Settings → Environment (set your own value there to replace it)\n",
+                )
+                .await?;
+        }
+    }
     let worker_settings = match target.environment() {
         Some(env) => db::environment_worker_settings(pool, &app.id, &env.id).await,
         None => db::worker_settings(pool, &app.id).await,
     }
     .map_err(|e| anyhow::Error::new(e).context("read the app's settings for the Worker"))?;
-    let settings_label = match target.environment() {
-        Some(_) => "Settings → Environment or this environment's Variable overrides",
-        None => "Settings → Environment",
-    };
     worker_vars::check_required(
         &required_secrets,
         &worker_settings,
-        &worker_vars::provisioned_names(),
+        &worker_vars::provisioned_names(void_app),
         settings_label,
     )?;
     if let Some(stats) =
@@ -917,6 +941,25 @@ async fn deploy_inner(
         if stats.merged > 0 {
             progress
                 .log(DeployStatus::Deploying, &stats.log_line())
+                .await?;
+        }
+    }
+    // Runner-owned Void entries (SPEC, Deploy pipeline): identity vars,
+    // runner-owned `services` and the `ISR_CACHE` namespace, merged into
+    // the same config file the settings merge just wrote. Void apps only.
+    if void_app {
+        if let Some(stats) = void_deploy::merge_void_root(
+            pool,
+            app,
+            target.environment(),
+            &deploy_root,
+            &worker_settings,
+            settings_label,
+        )
+        .await?
+        {
+            progress
+                .log(DeployStatus::Deploying, &stats.log_line(settings_label))
                 .await?;
         }
     }
@@ -1026,11 +1069,18 @@ async fn deploy_inner(
                 anyhow::bail!("environment deploy without its environment row");
             };
             supervisor::ensure_environment_fleet(pool, cfg, procs, logs, env).await?;
-            supervisor::reload_environment_fleet(env).await;
+            // A failed adoption fails the deploy with celld's error: without
+            // this the old generation keeps serving and the row still says
+            // Success.
+            supervisor::reload_environment_fleet(env)
+                .await
+                .fail_deploy_on_failed(&supervisor::env_fleet_key(&env.app_slug, &env.label))?;
         }
         None => {
             supervisor::ensure_fleet(pool, cfg, procs, logs, app).await?;
-            supervisor::reload_fleet(app).await;
+            supervisor::reload_fleet(app)
+                .await
+                .fail_deploy_on_failed(&app.slug)?;
         }
     }
 
