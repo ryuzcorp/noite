@@ -192,15 +192,28 @@ pub fn valid_network_name(name: &str) -> bool {
 /// fleet's containers: the `filters` object gains a
 /// `label=noite.fleet=<fleet>` requirement. A missing or unparsable filters
 /// value becomes exactly that requirement rather than an open list.
+///
+/// Keys are matched after percent-decoding, as the daemon matches them (a
+/// `%66ilters` pair is the daemon's `filters`, and its first value wins),
+/// and only the list's own scalar keys pass through; anything else is
+/// dropped rather than forwarded unseen.
 pub fn rewrite_list_query(query: Option<&str>, fleet: &str) -> String {
     let required = format!("{fleet_label}={fleet}", fleet_label = FLEET_LABEL);
     let mut kept: Vec<String> = Vec::new();
     let mut filters: Option<serde_json::Map<String, Value>> = None;
     for pair in query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
-        let Some(encoded) = pair.strip_prefix("filters=") else {
-            kept.push(pair.to_string());
+        let (raw_key, encoded) = pair.split_once('=').unwrap_or((pair, ""));
+        let Ok(key) = percent_decode(raw_key) else {
             continue;
         };
+        match key.as_str() {
+            "filters" => {}
+            "all" | "limit" | "size" => {
+                kept.push(format!("{key}={encoded}"));
+                continue;
+            }
+            _ => continue,
+        }
         if filters.is_some() {
             continue;
         }
@@ -953,6 +966,22 @@ mod tests {
         );
         assert_eq!(rewritten.matches("filters=").count(), 1, "{rewritten}");
         assert!(rewritten.contains("noite"), "{rewritten}");
+        // The daemon decodes keys: an encoded `filters` key is the same
+        // parameter, so it is rewritten too, never forwarded beside ours.
+        // Unknown keys are dropped.
+        for query in [
+            format!("all=true&%66ilters={open}"),
+            format!("all=true&%66ilters={open}&filters={encoded}"),
+            format!("all=true&%66%69%6c%74%65%72%73={open}&x%3Dy=1"),
+        ] {
+            let rewritten = rewrite_list_query(Some(&query), "shop");
+            assert!(rewritten.starts_with("all=true&filters="), "{rewritten}");
+            assert_eq!(rewritten.matches('&').count(), 1, "{rewritten}");
+            let encoded = rewritten.rsplit("filters=").next().unwrap();
+            let object: Value = serde_json::from_str(&percent_decode(encoded).unwrap()).unwrap();
+            let labels = object.pointer("/label").unwrap().as_array().unwrap();
+            assert!(labels.contains(&json!("noite.fleet=shop")), "{query}");
+        }
     }
 
     #[test]

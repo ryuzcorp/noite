@@ -144,6 +144,8 @@ if [ -n "$sandbox" ]; then
     echo "WARN sandbox containers: no engine socket answers (${sandbox_detail:-no detail})"
   elif [ "$sandbox_relay" != "true" ]; then
     echo "WARN sandbox containers: relay not running (${sandbox_detail:-no detail})"
+  elif [ "$sandbox_detail" != "ok" ]; then
+    echo "WARN sandbox containers: ${sandbox_detail:-not ready}"
   elif [ -n "$sandbox_subnets" ]; then
     echo "ok   sandbox containers: ready (subnets ${sandbox_subnets})"
   else

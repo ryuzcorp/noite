@@ -239,7 +239,9 @@ async fn handle(mut stream: tokio::net::TcpStream, fleet_ids: Option<(u32, u32)>
     let (Some(peer), Some(dst)) = (peer, dst) else {
         return;
     };
-    if !in_subnets(*dst.ip(), &super::plane::current_subnets()) {
+    // The installed table's own subnets: exactly what nft redirects here,
+    // and kept through a probe that briefly saw no engine.
+    if !in_subnets(*dst.ip(), &applied()) {
         return;
     }
     let tcp = std::fs::read_to_string("/proc/net/tcp").unwrap_or_default();

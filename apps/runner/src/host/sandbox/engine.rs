@@ -237,8 +237,18 @@ pub async fn close_fleet(key: &str) {
     let _ = tokio::fs::remove_file(socket_path(key)).await;
     if let Some(upstream) = upstream_socket() {
         let owner = super::owner(key);
-        for id in list_labelled(&upstream, &format!("{FLEET_LABEL}={owner}")).await {
-            delete_container(&upstream, &id).await;
+        // Bounded: shutdown, app delete and respawn all wait on this, and an
+        // engine that accepts but never answers must not hold them.
+        let cleanup = async {
+            for id in list_labelled(&upstream, &format!("{FLEET_LABEL}={owner}")).await {
+                delete_container(&upstream, &id).await;
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(10), cleanup)
+            .await
+            .is_err()
+        {
+            tracing::warn!(fleet = %key, "engine cleanup timed out; the next boot sweep removes leftovers");
         }
     }
     registry::forget_fleet_containers(key);

@@ -375,14 +375,6 @@ pub fn record(engine: bool, subnets: Vec<String>, relay: bool, gateway_table: bo
     }
 }
 
-/// Current celld subnets for the gateway's destination check.
-pub fn current_subnets() -> Vec<String> {
-    PROBE
-        .lock()
-        .map(|probe| probe.subnets.clone())
-        .unwrap_or_default()
-}
-
 /// The `/ready` `sandbox` object: enabled/engine/relay booleans, the known
 /// subnets, and the first problem (or `ok`).
 pub fn sandbox_status(sandbox_disabled: bool) -> serde_json::Value {
