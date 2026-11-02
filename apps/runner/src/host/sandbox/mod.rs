@@ -24,6 +24,7 @@
 //!
 //! [`registry`] is the shared ownership state between them.
 
+pub mod engine;
 pub mod gateway;
 pub mod plane;
 pub mod registry;

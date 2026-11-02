@@ -130,6 +130,10 @@ impl StopGrace {
 pub async fn stop_fleet(procs: &ProcMap, slug: &str, grace: StopGrace) {
     let mut map = procs.lock().await;
     let Some(mut child) = map.remove(slug) else {
+        // No process — but a proxy may still be served (a spawn that never
+        // completed, a crash the tick hasn't reaped): it closes either way.
+        drop(map);
+        fleet_gone_cleanup(slug).await;
         return;
     };
     drop(map);
@@ -178,6 +182,7 @@ pub async fn stop_fleet(procs: &ProcMap, slug: &str, grace: StopGrace) {
         }
     }
     crate::host::cgroups::forget_spawned(slug);
+    fleet_gone_cleanup(slug).await;
     tracing::info!(slug, "stopped celld");
 }
 
@@ -455,45 +460,30 @@ async fn move_fleet_into_group(
     }
 }
 
-/// Engine socket celld dials when DOCKER_HOST is unset (compose mounts the
-/// host daemon here).
-const ENGINE_SOCKET_DEFAULT: &str = "/var/run/docker.sock";
-
-/// Gid owning the container engine socket, so a fleet child dropped to the
-/// fleet uid can reach it: the mounted host socket (root:docker 0660)
-/// admits neither the fleet uid nor its gid, and without the engine every
-/// Sandbox-backed DO route fails while the runtime starts (`route RPC ...
-/// RuntimeFailed`, served as `Worker failed: ...`). DOCKER_HOST names the
-/// socket when it is a unix:// URL; anything else (TCP, a missing path, a
-/// non-socket — compose materializes a directory when the host socket is
-/// absent, and its gid must never be joined) resolves to None and the child
-/// spawns exactly as before. Always the operator value (the runner's own
-/// env): tenant DOCKER_HOST overrides are dropped as reserved, so no tenant
-/// can steer which group a fleet joins.
-fn engine_socket_gid(docker_host: Option<&str>, default: &str) -> Option<u32> {
-    let path = match docker_host {
-        Some(host) => host.strip_prefix("unix://")?,
-        None => default,
-    };
-    let meta = std::fs::metadata(path).ok()?;
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    if !meta.file_type().is_socket() {
-        return None;
-    }
-    Some(meta.gid())
+/// A fleet's process is gone — stopped, crashed, evicted, deleted, or never
+/// spawned: drop its pid registration and close its engine proxy (which
+/// removes its containers from the engine). Idempotent: safe for a fleet
+/// that never served.
+async fn fleet_gone_cleanup(slug: &str) {
+    crate::host::sandbox::registry::unregister_fleet(slug);
+    crate::host::sandbox::engine::close_fleet(slug).await;
 }
 
-/// Supplementary groups for a fleet child: its own gid, plus the engine
-/// socket's gid when one resolves and differs (the single-group case keeps
-/// the old spawn path untouched).
-fn fleet_groups(fleet_gid: u32, docker_host: Option<&str>, default: &str) -> Vec<u32> {
-    let mut groups = vec![fleet_gid];
-    if let Some(gid) = engine_socket_gid(docker_host, default) {
-        if gid != fleet_gid {
-            groups.push(gid);
+/// Serve one fleet its engine proxy socket before spawn. `None` (with a
+/// warning) when the socket cannot be served: the fleet then spawns without
+/// an engine rather than not at all.
+fn fleet_engine_socket(cfg: &Config, key: &str) -> Option<std::path::PathBuf> {
+    // SAFETY: both only read.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let uid = cfg.fleet_uid.unwrap_or(uid);
+    let gid = cfg.fleet_gid.unwrap_or(gid);
+    match crate::host::sandbox::engine::serve_fleet(key, uid, gid) {
+        Ok(socket) => Some(socket),
+        Err(e) => {
+            tracing::warn!(fleet = %key, error = %e, "fleet engine socket unavailable; no engine for this fleet");
+            None
         }
     }
-    groups
 }
 
 /// Spawn (or confirm) one celld fleet, whoever owns it.
@@ -515,7 +505,7 @@ async fn ensure_spawned(
     // it. Removal stays in the same critical section as the consume, so a
     // same-key respawn cannot slip between them and inherit or orphan a
     // baseline.
-    let oom_note: Option<crate::host::cgroups::OomNote> = {
+    let (oom_note, reaped): (Option<crate::host::cgroups::OomNote>, bool) = {
         let mut map = procs.lock().await;
         if let Some(child) = map.get_mut(&key) {
             match child.try_wait() {
@@ -524,19 +514,25 @@ async fn ensure_spawned(
                     let note = collect_possible_oom(&spec);
                     tracing::warn!(fleet = %key, ?status, "celld exited; restarting");
                     map.remove(&key);
-                    note
+                    (note, true)
                 }
                 Err(e) => {
                     let note = collect_possible_oom(&spec);
                     tracing::warn!(fleet = %key, error = %e, "celld status; restarting");
                     map.remove(&key);
-                    note
+                    (note, true)
                 }
             }
         } else {
-            None
+            (None, false)
         }
     };
+    if reaped {
+        // The old process is gone: its proxy — and its containers — go
+        // before the respawn serves a new socket, so the new fleet starts
+        // with no previous run behind it.
+        fleet_gone_cleanup(&key).await;
+    }
     if let Some(note) = oom_note {
         tracing::warn!(fleet = %key, detail = %note.detail, delay = ?note.delay, "fleet OOM-killed at its cap; restarting");
         logs::append(logs, &key, note.detail.clone()).await;
@@ -682,10 +678,11 @@ async fn ensure_spawned(
         // the whole tree, so an orphaned worker can never keep the fleet's
         // port into the next spawn.
         cmd.as_std_mut().process_group(0);
-        // Sandbox containers run on the host engine, which the fleet celld
-        // reaches through the mounted socket: the dropped child joins the
-        // socket's group so it can dial it. Without a socket (dev, CI
-        // lanes) the child spawns exactly as before.
+        // The fleet reaches the engine only through its own proxy socket
+        // (DOCKER_HOST below): it joins no engine group. The demotion still
+        // sets the group list explicitly — a bare uid()/gid() would keep
+        // the runner's own supplementary groups, and one of those reaching
+        // the host socket would bypass the proxy entirely.
         // The whole demotion happens in the hook: std runs pre_exec after
         // it applies uid()/gid(), so a hook that only set groups would run
         // unprivileged and fail every spawn. With no builder ids set,
@@ -694,40 +691,25 @@ async fn ensure_spawned(
         // async-signal-safe libc calls, no allocation (failures surface as
         // raw errnos through the spawn errno pipe).
         match (cfg.fleet_uid, cfg.fleet_gid) {
-            (Some(uid), Some(gid)) => {
-                let groups = fleet_groups(
-                    gid,
-                    std::env::var("DOCKER_HOST").ok().as_deref(),
-                    ENGINE_SOCKET_DEFAULT,
-                );
-                if groups.len() > 1 {
-                    tracing::info!(fleet = %key, groups = ?groups, "fleet joins the engine socket group");
-                    unsafe {
-                        cmd.as_std_mut().pre_exec(move || {
-                            if libc::geteuid() != 0 {
-                                return Err(std::io::Error::from_raw_os_error(libc::EPERM));
-                            }
-                            let mut ret = libc::setgroups(
-                                groups.len(),
-                                groups.as_ptr() as *const libc::gid_t,
-                            );
-                            if ret == 0 {
-                                ret = libc::setgid(gid as libc::gid_t);
-                            }
-                            if ret == 0 {
-                                ret = libc::setuid(uid as libc::uid_t);
-                            }
-                            if ret != 0 {
-                                return Err(std::io::Error::last_os_error());
-                            }
-                            Ok(())
-                        });
+            (Some(uid), Some(gid)) => unsafe {
+                cmd.as_std_mut().pre_exec(move || {
+                    if libc::geteuid() != 0 {
+                        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
                     }
-                } else {
-                    cmd.as_std_mut().uid(uid);
-                    cmd.as_std_mut().gid(gid);
-                }
-            }
+                    let groups = [gid as libc::gid_t];
+                    let mut ret = libc::setgroups(groups.len(), groups.as_ptr());
+                    if ret == 0 {
+                        ret = libc::setgid(gid as libc::gid_t);
+                    }
+                    if ret == 0 {
+                        ret = libc::setuid(uid as libc::uid_t);
+                    }
+                    if ret != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            },
             (Some(uid), None) => {
                 cmd.as_std_mut().uid(uid);
             }
@@ -740,11 +722,34 @@ async fn ensure_spawned(
     for (k, v) in spec.env {
         cmd.env(k, v);
     }
-    let mut child = cmd
+    // The operator's DOCKER_HOST never reaches a fleet (a tenant override
+    // is reserved anyway, but the runner's own environment would otherwise
+    // leak through the inherit): with sandboxing on the fleet gets its own
+    // proxy socket, otherwise no engine at all.
+    cmd.env_remove("DOCKER_HOST");
+    if !cfg.sandbox_disabled {
+        if let Some(socket) = fleet_engine_socket(cfg, &key) {
+            cmd.env("DOCKER_HOST", format!("unix://{}", socket.display()));
+        }
+    }
+    let mut child = match cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()?;
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            // Served a socket for a fleet that never started: close it
+            // rather than leak the loop (the next tick re-serves).
+            fleet_gone_cleanup(&key).await;
+            return Err(e.into());
+        }
+    };
+    // The engine proxy admits only this pid on the fleet's socket.
+    if let Some(pid) = child.id() {
+        crate::host::sandbox::registry::register_fleet(&key, pid);
+    }
     // Move the fleet into its group at once: between spawn and this write a
     // sliver of startup memory is charged to the shared cgroup instead —
     // negligible next to the fleet's lifetime, and documented, not hidden.
@@ -753,10 +758,14 @@ async fn ensure_spawned(
             MoveOutcome::Moved => {}
             // Exited first: nothing runs uncapped. Hold the spawn for the
             // next tick instead of inserting a dead child.
-            MoveOutcome::Gone => return Ok(()),
+            MoveOutcome::Gone => {
+                fleet_gone_cleanup(&key).await;
+                return Ok(());
+            }
             // Refused for a live pid: tripped, killed, and the spawn aborts
             // rather than running uncapped.
             MoveOutcome::Refused => {
+                fleet_gone_cleanup(&key).await;
                 return Err(anyhow::anyhow!("fleet {key} missed its cgroup"));
             }
         }
@@ -810,6 +819,7 @@ pub async fn stop_all(procs: &ProcMap, budget: Duration) {
     if children.is_empty() {
         return;
     }
+    let slugs: Vec<String> = children.iter().map(|(slug, _, _)| slug.clone()).collect();
     let deadline = tokio::time::sleep(budget);
     tokio::pin!(deadline);
     let mut remaining: Vec<(String, Child, Option<u32>)> = children;
@@ -837,6 +847,9 @@ pub async fn stop_all(procs: &ProcMap, budget: Duration) {
                 let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
             }
         }
+    }
+    for slug in &slugs {
+        fleet_gone_cleanup(slug).await;
     }
 }
 
@@ -1221,53 +1234,6 @@ mod tests {
             "the spawn baseline exists"
         );
         live.kill().await.expect("stop sleeper");
-    }
-
-    #[test]
-    fn fleet_child_joins_the_engine_socket_group() {
-        let dir = std::env::temp_dir().join(format!("noite-engsock-{}", crate::models::new_id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("engine.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        let sock = sock.to_string_lossy().into_owned();
-        let plain = dir.join("regular");
-        std::fs::write(&plain, b"").unwrap();
-        let plain = plain.to_string_lossy().into_owned();
-        let sub = dir.join("subdir");
-        std::fs::create_dir(&sub).unwrap();
-        let sub = sub.to_string_lossy().into_owned();
-        use std::os::unix::fs::MetadataExt;
-        let gid = std::fs::metadata(&sock).unwrap().gid();
-        let unix = format!("unix://{sock}");
-        // A unix:// DOCKER_HOST resolves to the socket's gid; a TCP host, a
-        // missing path, a regular file or a directory (compose materializes
-        // one when the host socket is absent — its gid must never be
-        // joined) leaves the child exactly as before.
-        assert_eq!(engine_socket_gid(Some(&unix), "/nonexistent"), Some(gid));
-        assert_eq!(engine_socket_gid(Some("tcp://127.0.0.1:2375"), &sock), None);
-        assert_eq!(
-            engine_socket_gid(Some("unix:///nonexistent-sock"), &sock),
-            None
-        );
-        assert_eq!(
-            engine_socket_gid(Some(&format!("unix://{plain}")), &sock),
-            None
-        );
-        assert_eq!(
-            engine_socket_gid(Some(&format!("unix://{sub}")), &sock),
-            None
-        );
-        assert_eq!(engine_socket_gid(None, &sock), Some(gid));
-        assert_eq!(engine_socket_gid(None, "/nonexistent"), None);
-        // The fleet gid plus the socket gid, without dupes.
-        let other = gid.wrapping_add(1);
-        assert_eq!(
-            fleet_groups(other, Some(&unix), "/nonexistent"),
-            vec![other, gid]
-        );
-        assert_eq!(fleet_groups(gid, Some(&unix), "/nonexistent"), vec![gid]);
-        assert_eq!(fleet_groups(other, None, "/nonexistent"), vec![other]);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -55,9 +55,9 @@ pub(crate) fn env_reserved(name: &str) -> bool {
         || name.starts_with("LD_")
         || name == "NODE_OPTIONS"
         || (name.starts_with("BUN_") && name != "BUN_INSTALL_CACHE_DIR")
-        // Engine selection is operator plumbing (compose): a tenant override
-        // would steer fleet celld at another engine than the group the fleet
-        // joins.
+        // Engine selection is per-fleet proxy plumbing: a tenant override
+        // would steer fleet celld at another engine than its own proxy
+        // socket (or at the host socket directly).
         || name == "DOCKER_HOST"
 }
 
@@ -102,9 +102,9 @@ mod tests {
             "LD_PRELOAD",
             "NODE_OPTIONS",
             "BUN_BEACON",
-            // Engine selection is operator plumbing: a tenant override would
-            // steer fleet celld at another engine than the group the fleet
-            // joins.
+            // Engine selection is per-fleet proxy plumbing: a tenant override
+            // would steer fleet celld at another engine than its own proxy
+            // socket (or at the host socket directly).
             "DOCKER_HOST",
         ] {
             assert!(env_reserved(name), "{name} reserved");
