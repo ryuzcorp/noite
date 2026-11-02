@@ -39,17 +39,22 @@ pub async fn app_or_404(state: &AppState, id: &str) -> Result<App, ApiError> {
 pub async fn list(state: &AppState) -> Result<Vec<App>, ApiError> {
     db::list_apps(&state.pool)
         .await
+        .map(|apps| apps.into_iter().filter(|app| !deleting(&app.id)).collect())
         .map_err(|e| ApiError::internal(e.to_string()))
 }
 
 pub async fn get(state: &AppState, id: &str) -> Result<App, ApiError> {
-    app_or_404(state, id).await
+    let app = app_or_404(state, id).await?;
+    if deleting(&app.id) {
+        return Err(ApiError::not_found("app not found"));
+    }
+    Ok(app)
 }
 
 pub async fn get_by_slug(state: &AppState, slug: &str) -> Result<App, ApiError> {
     match db::get_app_by_slug(&state.pool, slug).await {
-        Ok(Some(app)) => Ok(app),
-        Ok(None) => Err(ApiError::not_found("app not found")),
+        Ok(Some(app)) if !deleting(&app.id) => Ok(app),
+        Ok(_) => Err(ApiError::not_found("app not found")),
         Err(e) => Err(ApiError::internal(e.to_string())),
     }
 }
@@ -314,15 +319,85 @@ pub async fn rename(
     }
 }
 
-pub async fn delete(state: &AppState, id: &str) -> Result<(), ApiError> {
+/// What a delete call reports: finished, or still purging in the
+/// background (a slow store or a deploy in flight).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deletion {
+    Done,
+    InProgress,
+}
+
+/// How long a delete call waits for the purge before answering
+/// [`Deletion::InProgress`]: under the control plane's 5 s bound on every
+/// runner call (`apps/noite/src/lib/runner.ts`), so a purge that takes
+/// longer (thousands of telemetry objects on a slow store, a deploy holding
+/// the claim for minutes) never surfaces as a timeout.
+const DELETE_ANSWER_WITHIN: Duration = Duration::from_secs(3);
+
+/// Apps whose delete is running. They are gone for every caller from the
+/// moment the delete starts ([`list`], [`get`], [`get_by_slug`]), and a
+/// second delete reports the running one instead of starting another purge.
+/// In memory on purpose: a runner restart mid-delete leaves the app
+/// stopped and listed again, and deleting it again finishes the job.
+static DELETING: LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    LazyLock::new(Default::default);
+
+fn deleting(id: &str) -> bool {
+    DELETING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(id)
+}
+
+/// An app's [`DELETING`] entry, removed on drop.
+struct DeletingMarker(String);
+
+impl Drop for DeletingMarker {
+    fn drop(&mut self) {
+        DELETING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+pub async fn delete(state: &AppState, id: &str) -> Result<Deletion, ApiError> {
+    let app = app_or_404(state, id).await?;
+    let started = DELETING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(app.id.clone());
+    if !started {
+        return Ok(Deletion::InProgress);
+    }
     // A dropped HTTP handler must not cancel the purge halfway (see
-    // `service::detached`): the work runs as its own task.
+    // `service::detached`): the work runs as its own task, and the timeout
+    // below only stops waiting for it.
     let state = state.clone();
-    let id = id.to_string();
-    super::detached::run(format!("app:{id}"), async move {
-        delete_inner(&state, &id).await
-    })
-    .await
+    let id = app.id;
+    let work = super::detached::run(format!("app:{id}"), async move {
+        // Released however the task ends (a panic included): a marker left
+        // behind would hide the app from every listing until a restart.
+        let _marker = DeletingMarker(id.clone());
+        let out = delete_inner(&state, &id).await;
+        if let Err(e) = &out {
+            // The caller may be long gone: the log and the row are where a
+            // failed delete shows. The app stays stopped; deleting it again
+            // retries.
+            tracing::warn!(app_id = %id, error = %e, "app delete failed");
+            let note = format!("delete failed: {e}; delete the app again to retry");
+            if let Err(db_error) =
+                db::update_app_status(&state.pool, &id, "stopped", Some(&note), None).await
+            {
+                tracing::warn!(app_id = %id, error = %db_error, "could not record the failed delete");
+            }
+        }
+        out
+    });
+    match tokio::time::timeout(DELETE_ANSWER_WITHIN, work).await {
+        Ok(out) => out.map(|()| Deletion::Done),
+        Err(_) => Ok(Deletion::InProgress),
+    }
 }
 
 async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
@@ -550,7 +625,7 @@ mod tests {
             .expect("fake deploy takes the claim");
         let owned = state.clone();
         let id = app.id.clone();
-        let mut deleting = tokio::spawn(async move { delete(&owned, &id).await });
+        let mut deleting = tokio::spawn(async move { delete_inner(&owned, &id).await });
         // The delete must still be waiting on the deploy claim: a timeout
         // race proves it stayed pending (a delete that skips the wait
         // finishes early and fails here).
@@ -598,6 +673,59 @@ mod tests {
             row.is_none(),
             "a deploy that waits behind delete finds no row"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A delete that cannot finish within the answer bound (here a deploy
+    /// holds the claim) answers "in progress" instead of timing the caller
+    /// out: the app is gone from every listing at once, a second delete
+    /// reports the running one, and the purge still finishes once the claim
+    /// frees.
+    #[tokio::test]
+    async fn a_slow_delete_answers_in_progress_and_still_finishes() {
+        let (state, dir) = test_state(10).await;
+        let app = create(&state, "Slow", "slow-delete", Some("u1"), None)
+            .await
+            .expect("create");
+        let fake_deploy = deploy::claim_owned(&state.deploying, &app.id)
+            .await
+            .expect("fake deploy takes the claim");
+        let done = crate::service::detached::finished(&format!("app:{}", app.id));
+
+        assert_eq!(
+            delete(&state, &app.id).await.expect("delete answers"),
+            Deletion::InProgress
+        );
+        assert!(
+            list(&state)
+                .await
+                .expect("list")
+                .iter()
+                .all(|a| a.id != app.id),
+            "a deleting app is not listed"
+        );
+        assert!(matches!(
+            get(&state, &app.id).await,
+            Err(ApiError::NotFound(_))
+        ));
+        assert!(get_by_slug(&state, "slow-delete").await.is_err());
+        assert_eq!(
+            delete(&state, &app.id)
+                .await
+                .expect("second delete answers"),
+            Deletion::InProgress,
+            "a second delete reports the running one"
+        );
+
+        drop(fake_deploy);
+        tokio::time::timeout(Duration::from_secs(30), done.notified())
+            .await
+            .expect("the background delete finishes");
+        assert!(db::get_app(&state.pool, &app.id)
+            .await
+            .expect("lookup")
+            .is_none());
+        assert!(!deleting(&app.id), "a finished delete leaves no marker");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

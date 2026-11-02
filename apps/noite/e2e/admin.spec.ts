@@ -549,8 +549,19 @@ test("delete refuses the sole admin of an app, then removes the freed account", 
   );
   const doomed = appRow(page, DOOMED_SLUG);
   await expect(doomed).toBeVisible();
+
+  // Wait for the action's answer, not the runner listing: the runner hides
+  // an app the moment its delete starts, and the action drops the grants
+  // only after the runner answered.
+  const deleted = page.waitForResponse((response) =>
+    response.url().endsWith("/api/admin/adminDeleteApp")
+  );
+
   await doomed.getByRole("button", { name: "Delete" }).click();
   await confirmInDialog(page, "Delete");
+
+  const answer = await deleted;
+  expect(answer.ok()).toBe(true);
   await expect(async () => {
     expect(await findAppId(request, DOOMED_SLUG)).toBeNull();
   }).toPass({ timeout: 60_000 });

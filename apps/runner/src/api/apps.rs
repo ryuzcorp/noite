@@ -177,9 +177,16 @@ pub async fn delete_app(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // 204 once the purge finished; 202 while it still runs in the
+    // background (the app is already gone from every listing).
     service::apps::delete(&state, &id)
         .await
-        .map(|()| StatusCode::NO_CONTENT)
+        .map(|deletion| match deletion {
+            service::apps::Deletion::Done => StatusCode::NO_CONTENT.into_response(),
+            service::apps::Deletion::InProgress => {
+                (StatusCode::ACCEPTED, Json(json!({ "deleting": true }))).into_response()
+            }
+        })
 }
 
 /// Park an app now (SPEC, Scale to zero), skipping the idle check — the

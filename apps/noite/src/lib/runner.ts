@@ -472,8 +472,11 @@ export const runnerGetAppBySlug = (slug: string) =>
 export const runnerPatchApp = (id: string, body: { desiredState: string }) =>
   runnerRpc<RunnerApp>("apps.patch", { desiredState: body.desiredState, id });
 
+/** `deleting: true` when the purge still runs in the background (a slow
+ * store, a deploy holding the app): the runner answers within its 3 s bound
+ * either way, and the app is gone from every listing from the start. */
 export const runnerDeleteApp = (id: string) =>
-  runnerRpc<{ ok: boolean }>("apps.delete", { id });
+  runnerRpc<{ deleting: boolean; ok: boolean }>("apps.delete", { id });
 
 export const runnerRenameApp = (
   id: string,

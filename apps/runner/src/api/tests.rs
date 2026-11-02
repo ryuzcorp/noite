@@ -284,7 +284,7 @@ async fn apps_delete_agrees() {
         .rpc("apps.delete", json!({ "id": b.id }))
         .await
         .expect("apps.delete");
-    assert_eq!(rpc_body, json!({ "ok": true }));
+    assert_eq!(rpc_body, json!({ "ok": true, "deleting": false }));
 
     assert!(crate::db::get_app(&h.state.pool, &a.id)
         .await
