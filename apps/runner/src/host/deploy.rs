@@ -346,6 +346,9 @@ impl Progress<'_> {
     }
 }
 
+/// One bound over pulling and vetting every Dockerfile image of a deploy.
+const PREPARE_IMAGES_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Output kept per successful step, and for a failure: the deploy row keeps
 /// a 64 KB tail, and earlier steps should survive a noisy failure.
 const STEP_OUTPUT_TAIL: usize = 4 * 1024;
@@ -880,19 +883,49 @@ async fn deploy_inner(
         )
         .await?;
 
-    // Sandbox containers (SPEC, Tenant isolation): refuse what tenants must
-    // not deploy before celld sees it. A config that declares containers
-    // also stretches the timeout over a first image pull.
-    let declares_containers =
-        build_output::validate_containers(&deploy_root, cfg.sandbox_disabled)?;
-
-    let env_owned = s3::aws_env(cfg);
-    let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    env.push(("S3_ENDPOINT", cfg.s3_endpoint.as_str()));
     // celld pulls container images for linux/amd64 unless told otherwise;
     // pin the pull to the nodes' own arch so arm64 installs pull native
     // images. Without containers celld never reads it.
     let container_platform = format!("linux/{}", go_arch(std::env::consts::ARCH));
+    // Sandbox containers (SPEC, Tenant isolation): refuse what tenants must
+    // not deploy before celld sees it, normalize Void's shape, and prepare
+    // each Dockerfile (checked to run nothing, its images vetted and
+    // pinned). A config that declares containers also stretches the
+    // timeout over a first image pull.
+    let declares_containers =
+        match build_output::plan_containers(&deploy_root, cfg.sandbox_disabled)? {
+            None => false,
+            Some(mut plan) => {
+                // One bound over every pull and vet, like the deploy's own.
+                tokio::time::timeout(PREPARE_IMAGES_TIMEOUT, async {
+                    for (index, request) in plan.dockerfiles.clone() {
+                        let dockerfile = crate::host::container_image::prepare(
+                            &src_dir,
+                            index,
+                            &request,
+                            &container_platform,
+                        )
+                        .await
+                        .map_err(|e| e.context(format!("containers[{index}] image")))?;
+                        plan.set_dockerfile(index, &dockerfile);
+                    }
+                    anyhow::Ok(())
+                })
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "preparing container images took longer than {} s",
+                        PREPARE_IMAGES_TIMEOUT.as_secs()
+                    )
+                })??;
+                plan.write()?;
+                true
+            }
+        };
+
+    let env_owned = s3::aws_env(cfg);
+    let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    env.push(("S3_ENDPOINT", cfg.s3_endpoint.as_str()));
     env.push(("CELLD_CONTAINER_PLATFORM", container_platform.as_str()));
     // Work-dir-derived paths are operator-influenced (a non-UTF-8 mount):
     // fail the deploy instead of panicking the deploy task.
