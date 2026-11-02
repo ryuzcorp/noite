@@ -652,7 +652,10 @@ async fn container(
             registry::record_container(fleet, alias, None);
         }
     }
-    let path = with_query(&format!("/containers/{id}/{}", op_name(op)), query);
+    // Forward by the inspected canonical id, never the caller's ref: a name
+    // could be re-bound to another container between the check and the call.
+    let target = iid.as_deref().unwrap_or(id);
+    let path = with_query(&format!("/containers/{target}/{}", op_name(op)), query);
     match op {
         ContainerOp::Start | ContainerOp::Wait | ContainerOp::Kill => {
             let raw = match read_body(req.into_body()).await {
@@ -747,10 +750,13 @@ async fn remove(
         Ok(info) => info,
         Err(response) => return *response,
     };
+    // By canonical id, as in `container`.
+    let canonical = validate::inspect_identity(&info).0;
+    let target = canonical.as_deref().unwrap_or(id);
     let response = match engine_call(
         upstream,
         "DELETE",
-        &with_query(&format!("/containers/{id}"), query),
+        &with_query(&format!("/containers/{target}"), query),
         Bytes::new(),
         false,
     )
