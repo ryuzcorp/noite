@@ -47,15 +47,15 @@ pub use deploys::{
     fail_stuck_deploys, get_deploy_log, get_success_deploy, latest_deploy_status,
     latest_deploy_status_for_env, list_deploys, list_deploys_lean, mark_deploy_live, upsert_deploy,
 };
-pub use env::{delete_env, list_env, set_env, tenant_env};
+pub use env::{delete_env, list_env, set_env, tenant_env, worker_settings};
 pub use environments::{
     count_environments, count_environments_for_app, create_environment, delete_env_override,
-    delete_environment, environment_route, environment_tenant_env, expired_workspace_environments,
-    get_environment, get_environment_by_label, get_environment_by_ref, list_all_environments,
-    list_env_override, list_environment_routes, list_environments, set_env_override,
-    set_environment_asleep, set_environment_awake, set_environment_bucket, set_environment_public,
-    update_environment_status, update_environment_status_if_wanted, EnvironmentRoute,
-    NewEnvironment,
+    delete_environment, environment_route, environment_tenant_env, environment_worker_settings,
+    expired_workspace_environments, get_environment, get_environment_by_label,
+    get_environment_by_ref, list_all_environments, list_env_override, list_environment_routes,
+    list_environments, set_env_override, set_environment_asleep, set_environment_awake,
+    set_environment_bucket, set_environment_public, update_environment_status,
+    update_environment_status_if_wanted, EnvironmentRoute, NewEnvironment,
 };
 pub use errors::{
     backfill_error_request, count_error_issues, get_error_issue, insert_error_event,

@@ -44,3 +44,4 @@ pub mod telemetry_report;
 pub mod tips;
 pub mod update_check;
 pub mod web_commit;
+pub mod worker_vars;

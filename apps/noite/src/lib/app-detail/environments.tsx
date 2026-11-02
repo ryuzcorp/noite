@@ -125,6 +125,7 @@ const EnvironmentVars = ({
   const res = environmentVars(appId, envId);
   const rows: EnvironmentVarView[] = res.data() ?? [];
   const err = atom("");
+  const savedNote = atom(false);
   const busy = atom(false);
   const open = atom(false);
   const name = atom("");
@@ -167,6 +168,7 @@ const EnvironmentVars = ({
         value.set("");
         open.set(false);
         await reload();
+        savedNote.set(true);
       } catch (error) {
         err.set(errorMessage(error));
       }
@@ -194,6 +196,7 @@ const EnvironmentVars = ({
         name: row.name,
       });
       await reload();
+      savedNote.set(true);
     } catch (error) {
       err.set(errorMessage(error));
     }
@@ -222,9 +225,17 @@ const EnvironmentVars = ({
         ) : null}
       </div>
       <p class="m-0 text-xs opacity-70">
-        Overrides the app's variables for this environment only. Values are
-        hidden after saving; <code>FLAG_</code> names render as on/off toggles.
+        Overrides the app's variables for this environment only, in the build,
+        the fleet, and Worker code (<code>env.NAME</code>). A change takes
+        effect on the next deploy of this environment. Values are hidden after
+        saving; <code>FLAG_</code> names render as on/off toggles.
       </p>
+      {savedNote() ? (
+        <p class="m-0 text-xs opacity-70">
+          Saved. The next deploy picks it up — press Redeploy above to apply it
+          now.
+        </p>
+      ) : null}
       {err() ? <p class="text-error m-0 text-xs">{err()}</p> : null}
       <LoadError error={res.error()} />
       {res.loading() && res.data() === undefined ? (

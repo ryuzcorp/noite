@@ -7,13 +7,13 @@ All of this lives in the **Settings** panel of the app detail page (`/apps/<id>`
 
 ## Environment variables
 
-Settings → Environment. Variables reach the install, the build and the release command, so a bundler can inline them (for example Vite's `import.meta.env`). A change applies from the next deploy. Values are hidden after saving; reads are view-gated, writes admin-gated. Download mirrors the `.dev.vars` file local dev expects. Names starting with `FLAG_` render as on/off toggles (`1`/`0`).
+Settings → Environment. Variables reach the install, the build and the release command, so a bundler can inline them (for example Vite's `import.meta.env`), and every variable also becomes a Worker `vars` entry the deployed code reads as `env.NAME` — a setting wins over the `wrangler.jsonc`'s own value for that name. A change applies from the next deploy; redeploy to apply it now. Values are hidden after saving; reads are view-gated, writes admin-gated. Download mirrors the `.dev.vars` file local dev expects. Names starting with `FLAG_` render as on/off toggles (`1`/`0`).
 
-:::warning
-Worker code does not see these variables at runtime: `env` has no entry for them and `process.env` is empty. For values the Worker reads while serving, use `vars` in your `wrangler.jsonc`.
+:::info
+Worker code reads these variables at runtime (`env.NAME`); `process.env` stays empty. Values travel as plaintext `vars` in the deployed config — celld has no separate secret store — so anything the Worker serves must treat them as the Worker's own data, not as platform secrets.
 :::
 
-Reserved prefixes are dropped silently: `PORT`, `HOST`, `AWS_*`, `S3_*`, `CELLD_*`, `RUNNER_*`, `NOITE_*`, `BETTER_AUTH_*`, `CADDY_*`, `LD_*`, `NODE_OPTIONS`, `BUN_*` (except the cache var). Full detail: [Environment variables](/reference/environment-variables).
+Reserved names come in two sets. For the install/build/release/fleet process environment the reserved prefixes are dropped silently: `PORT`, `HOST`, `AWS_*`, `S3_*`, `CELLD_*`, `RUNNER_*`, `NOITE_*`, `BETTER_AUTH_*`, `CADDY_*`, `LD_*`, `NODE_OPTIONS`, `BUN_*` (except the cache var). For Worker `vars` only the runner-owned names are refused — and loudly: a setting or a config `vars` entry named `__VOID_PROXY`, `__PROJECT_ID`, `__VOID_PROXY_TOKEN`, `__VOID_PROJECT_SLUG`, `__VOID_EMAIL_DOMAIN` or `__VOID_EMAIL_DEPLOYMENT_ID` fails the deploy naming it. Every other name, `BETTER_AUTH_*` included, deploys as a Worker var. Full detail: [Environment variables](/reference/environment-variables).
 
 ## Custom domains
 

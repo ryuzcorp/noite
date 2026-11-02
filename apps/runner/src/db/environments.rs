@@ -408,9 +408,32 @@ pub async fn delete_env_override(
     Ok(())
 }
 
+/// The app's settings with this environment's overrides applied — the
+/// Worker-vars merge input. Unfiltered, like `db::env::worker_settings`:
+/// an override wins over the app's value, and reserved names are refused
+/// loudly by the merge, never dropped here.
+pub async fn environment_worker_settings(
+    pool: &SqlitePool,
+    app_id: &str,
+    environment_id: &str,
+) -> Vec<(String, String)> {
+    let mut merged = std::collections::BTreeMap::new();
+    for (name, value) in crate::db::env::worker_settings(pool, app_id).await {
+        merged.insert(name, value);
+    }
+    for row in list_env_override(pool, environment_id)
+        .await
+        .unwrap_or_default()
+    {
+        merged.insert(row.name, row.value);
+    }
+    merged.into_iter().collect()
+}
+
 /// The app's variables with this environment's overrides applied — what the
 /// fleet, the build and the release command see. Reserved names are filtered
-/// exactly as `db::tenant_env` does, overrides included.
+/// exactly as `db::tenant_env` does, overrides included. Worker `vars` come
+/// from [`environment_worker_settings`] instead.
 pub async fn environment_tenant_env(
     pool: &SqlitePool,
     app_id: &str,
@@ -584,6 +607,33 @@ mod tests {
             .unwrap()
             .expect("row");
         assert!(list_env_override(&pool, &env.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_settings_merge_overrides_unfiltered() {
+        let pool = connect("sqlite::memory:").await.expect("boot");
+        let cfg = crate::config::config_for_tests();
+        let app = seed(&pool).await;
+        crate::db::set_env(&pool, &app.id, "SHARED", "app")
+            .await
+            .unwrap();
+        let env = create_environment(&pool, &cfg, new(&app.id, "staging", "refs/heads/staging"))
+            .await
+            .expect("env");
+        set_env_override(&pool, &env.id, "SHARED", "env")
+            .await
+            .unwrap();
+        // Process-reserved names pass through to the merge here.
+        set_env_override(&pool, &env.id, "BETTER_AUTH_SECRET", "s3cret")
+            .await
+            .unwrap();
+        assert_eq!(
+            environment_worker_settings(&pool, &app.id, &env.id).await,
+            vec![
+                ("BETTER_AUTH_SECRET".to_string(), "s3cret".to_string()),
+                ("SHARED".to_string(), "env".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]
