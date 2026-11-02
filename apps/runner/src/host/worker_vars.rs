@@ -84,6 +84,13 @@ pub fn check_required(
     provisioned: &HashSet<String>,
     settings_label: &str,
 ) -> anyhow::Result<()> {
+    // Required names come from tenant-authored config, so they are held to
+    // the settings' own name shape before any of them reaches the log.
+    if let Some(name) = required.iter().find(|name| !var_name_valid(name)) {
+        anyhow::bail!(
+            "`secrets.required` lists {name:?}, which is not a valid variable name (letters, digits and `_`, not starting with a digit)"
+        );
+    }
     let have: HashSet<&str> = settings.iter().map(|(name, _)| name.as_str()).collect();
     let mut missing: Vec<&str> = required
         .iter()
@@ -100,6 +107,49 @@ pub fn check_required(
         missing.join(", "),
         settings_label
     );
+}
+
+/// The settings' name shape (`service::env`): `[A-Za-z_][A-Za-z0-9_]*`, at
+/// most 64 bytes.
+fn var_name_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Every binding name the config declares outside `vars`: each `binding`
+/// string (assets, KV, D1, R2, services, queues, …) and each Durable Object
+/// binding's `name`. celld refuses a deploy where a var shares one of them.
+fn binding_names(config: &serde_json::Map<String, Value>) -> HashSet<String> {
+    fn walk(value: &Value, names: &mut HashSet<String>) {
+        match value {
+            Value::Object(obj) => {
+                if let Some(Value::String(name)) = obj.get("binding") {
+                    names.insert(name.clone());
+                }
+                obj.values().for_each(|v| walk(v, names));
+            }
+            Value::Array(items) => items.iter().for_each(|v| walk(v, names)),
+            _ => {}
+        }
+    }
+    let mut names = HashSet::new();
+    for (key, value) in config {
+        if key != "vars" {
+            walk(value, &mut names);
+        }
+    }
+    let durable = config
+        .get("durable_objects")
+        .and_then(|d| d.get("bindings"))
+        .and_then(Value::as_array);
+    for binding in durable.into_iter().flatten() {
+        if let Some(Value::String(name)) = binding.get("name") {
+            names.insert(name.clone());
+        }
+    }
+    names
 }
 
 /// What one merge did, for the deploy log.
@@ -148,6 +198,16 @@ pub fn merge_settings(
     {
         anyhow::bail!(
             "settings variable `{name}` is reserved for the platform and cannot become a Worker var (rename it or remove it from {settings_label})"
+        );
+    }
+    let bindings = binding_names(obj);
+    if let Some(name) = settings
+        .iter()
+        .map(|(name, _)| name)
+        .find(|name| bindings.contains(name.as_str()))
+    {
+        anyhow::bail!(
+            "settings variable `{name}` has the same name as a binding in the Wrangler config, so the Worker cannot get both (rename it in {settings_label})"
         );
     }
     let vars = match obj.get_mut("vars") {
@@ -308,6 +368,28 @@ mod tests {
     }
 
     #[test]
+    fn a_setting_named_like_a_binding_is_refused() {
+        let config = json!({
+            "assets": { "binding": "ASSETS", "directory": "dist" },
+            "kv_namespaces": [{ "binding": "CACHE", "id": "c" }],
+            "durable_objects": { "bindings": [{ "name": "ROOM", "class_name": "Room" }] },
+            "services": [{ "binding": "API", "service": "api" }],
+            "vars": { "MODE": "prod" },
+        });
+        for name in ["ASSETS", "CACHE", "ROOM", "API"] {
+            let err = merge_settings(&mut config.clone(), &settings(&[(name, "x")]), "Settings")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("`{name}`")), "{err}");
+            assert!(!err.contains("\"x\""), "{err}");
+        }
+        // A config var of the same name is the setting's to override.
+        let mut ok = config.clone();
+        merge_settings(&mut ok, &settings(&[("MODE", "dev")]), "Settings").unwrap();
+        assert_eq!(ok["vars"]["MODE"], "dev");
+    }
+
+    #[test]
     fn malformed_vars_and_configs_fail_clearly() {
         let mut config = json!({"name": "a", "vars": ["x"]});
         assert!(format!(
@@ -354,6 +436,16 @@ mod tests {
         )
         .is_ok());
         assert!(check_required(&[], &[], &empty, "Settings").is_ok());
+    }
+
+    #[test]
+    fn required_names_outside_the_settings_shape_fail_quoted() {
+        let required = vec!["OK".to_string(), "x\nERROR: forged".to_string()];
+        let err = check_required(&required, &[], &HashSet::new(), "Settings")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"x\\nERROR: forged\""), "{err}");
+        assert!(!err.contains('\n'), "{err}");
     }
 
     #[test]
