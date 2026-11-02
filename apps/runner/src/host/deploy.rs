@@ -905,15 +905,16 @@ async fn deploy_inner(
         Some(_) => "Settings → Environment or this environment's Variable overrides",
         None => "Settings → Environment",
     };
-    // A Void app's required `BETTER_AUTH_SECRET` provisions before the load:
-    // minted once at the app level (unless any value already exists), so it
-    // flows through the ordinary settings load — environments inherit it —
-    // into the merge below like a setting.
-    if void_app
-        && required_secrets
-            .iter()
-            .any(|name| name == void_deploy::AUTH_SECRET_NAME)
-    {
+    // A Void app's `BETTER_AUTH_SECRET` provisions before the load: minted
+    // once at the app level (unless any value already exists), so it flows
+    // through the ordinary settings load — environments inherit it — into
+    // the merge below like a setting. Gated on Void, not on the name's
+    // presence in `secrets.required`: Void's auth signal is build-time
+    // source inference (`manifest.auth`), which plain builds do not repeat
+    // into `required` (only `VOID_CLOUDFLARE_DEPLOY_BUILD=1` does), while
+    // the auth middleware fails every request without the secret — so an
+    // unread extra var on a non-auth app beats a broken auth app.
+    if void_app {
         let environment_id = target.environment().map(|env| env.id.as_str());
         if void_deploy::ensure_auth_secret(pool, &app.id, environment_id).await? {
             progress

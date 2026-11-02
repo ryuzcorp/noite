@@ -30,13 +30,15 @@
 //! tenant entry collides loudly), and the proxy slice adds its one entry in
 //! [`runner_services`] — the only place that changes.
 //!
-//! `BETTER_AUTH_SECRET` is provisioned, not merged here: when a Void app's
-//! `secrets.required` lists it and no setting exists, [`ensure_auth_secret`]
-//! mints 32 random bytes hex and stores them as an `auth-default` setting at
-//! the app level (one per app; environments inherit it unless overridden),
-//! and the value then flows through the ordinary settings load into the
-//! slice-1 merge. A user value — app or override — always wins and is never
-//! overwritten.
+//! `BETTER_AUTH_SECRET` is provisioned, not merged here: when a Void app
+//! has no value for it, [`ensure_auth_secret`] mints 32 random bytes hex
+//! and stores them as an `auth-default` setting at the app level (one per
+//! app; environments inherit it unless overridden), and the value then
+//! flows through the ordinary settings load into the slice-1 merge. A user
+//! value — app or override — always wins and is never overwritten. The
+//! gate is Void, not the name's presence in `secrets.required`: only
+//! `VOID_CLOUDFLARE_DEPLOY_BUILD=1` builds repeat it there, while the auth
+//! middleware fails every request without it.
 //!
 //! Values at rest are plaintext settings rows like any other (`app_env` /
 //! `environment_env`, plus the merged config in `app.deployed_config` and
