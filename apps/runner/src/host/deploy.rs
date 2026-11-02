@@ -880,9 +880,20 @@ async fn deploy_inner(
         )
         .await?;
 
+    // Sandbox containers (SPEC, Tenant isolation): refuse what tenants must
+    // not deploy before celld sees it. A config that declares containers
+    // also stretches the timeout over a first image pull.
+    let declares_containers =
+        build_output::validate_containers(&deploy_root, cfg.sandbox_disabled)?;
+
     let env_owned = s3::aws_env(cfg);
     let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     env.push(("S3_ENDPOINT", cfg.s3_endpoint.as_str()));
+    // celld pulls container images for linux/amd64 unless told otherwise;
+    // pin the pull to the nodes' own arch so arm64 installs pull native
+    // images. Without containers celld never reads it.
+    let container_platform = format!("linux/{}", go_arch(std::env::consts::ARCH));
+    env.push(("CELLD_CONTAINER_PLATFORM", container_platform.as_str()));
     // Work-dir-derived paths are operator-influenced (a non-UTF-8 mount):
     // fail the deploy instead of panicking the deploy task.
     let Some(deploy_arg) = deploy_root.to_str() else {
@@ -902,7 +913,7 @@ async fn deploy_inner(
         ],
         Some(&work),
         &env,
-        Duration::from_secs(120),
+        Duration::from_secs(if declares_containers { 600 } else { 120 }),
     )
     .await?;
 
@@ -1258,6 +1269,17 @@ async fn strip_runner_keys(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The runner's arch as a container platform suffix for
+/// `CELLD_CONTAINER_PLATFORM`. Unknown arches pass through (Go names most
+/// like Rust does).
+fn go_arch(arch: &str) -> &str {
+    match arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
 /// The config without runner-consumed keys, or `None` when it has none.
 fn without_runner_keys(text: &str) -> anyhow::Result<Option<String>> {
     let mut value = crate::host::storage::parse_wrangler(text)?;
@@ -1371,8 +1393,8 @@ pub async fn deploy_tip(
 #[cfg(test)]
 mod tests {
     use super::{
-        contained_deploy_root, failure_summary, has_build_script, parse_wrangler_build, route_live,
-        wipe_worktree, without_runner_keys,
+        contained_deploy_root, failure_summary, go_arch, has_build_script, parse_wrangler_build,
+        route_live, wipe_worktree, without_runner_keys,
     };
     use serde_json::json;
 
@@ -1613,6 +1635,13 @@ mod tests {
             failure_summary("deploy", "celld deploy timed out\nsomething"),
             "deploy failed: celld deploy timed out"
         );
+    }
+
+    #[test]
+    fn container_platform_follows_the_nodes_arch() {
+        assert_eq!(go_arch("x86_64"), "amd64");
+        assert_eq!(go_arch("aarch64"), "arm64");
+        assert_eq!(go_arch("riscv64"), "riscv64");
     }
 
     /// The detached end-of-deploy step: the build worktree is gone afterwards.
