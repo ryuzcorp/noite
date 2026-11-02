@@ -37,7 +37,7 @@ export const TEMPLATES: readonly AppTemplate[] = [
   },
   {
     description:
-      "Pi agent harness on Durable Objects (Pi Durable), tools in a Sandbox container.",
+      "Pi agent harness on Durable Objects (Pi Durable); tools, or the whole agent, in a Sandbox container.",
     id: "agent",
     name: "Agent",
     path: "templates/agent",
