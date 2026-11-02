@@ -631,6 +631,15 @@ pub fn without_network_members(body: &[u8]) -> Bytes {
     Bytes::from(value.to_string())
 }
 
+/// Whether an inspected container is celld's fence installer: its label, or
+/// host networking (no app container is ever created with it).
+pub fn inspect_is_fence(info: &Value) -> bool {
+    let labelled = ["/Config/Labels/celld.fence", "/Labels/celld.fence"]
+        .iter()
+        .any(|pointer| info.pointer(pointer).is_some());
+    labelled || info.pointer("/HostConfig/NetworkMode") == Some(&Value::String("host".into()))
+}
+
 /// The fleet label on an inspected container, from either place the daemon
 /// reports labels. `None` means unlabelled — owned by nobody.
 pub fn inspect_fleet_label(info: &Value) -> Option<String> {
@@ -1149,6 +1158,23 @@ mod tests {
             };
             assert!(refused, "{name} refused");
         }
+    }
+
+    #[test]
+    fn fence_is_recognised_by_label_or_host_network() {
+        assert!(inspect_is_fence(
+            &json!({"Config": {"Labels": {"celld.fence": "1"}}})
+        ));
+        assert!(inspect_is_fence(
+            &json!({"Config": {"Labels": {"celld.fence": "0"}}})
+        ));
+        assert!(inspect_is_fence(
+            &json!({"HostConfig": {"NetworkMode": "host"}})
+        ));
+        assert!(!inspect_is_fence(&json!({
+            "Config": {"Labels": {"celld.cell": "c"}},
+            "HostConfig": {"NetworkMode": "celld"},
+        })));
     }
 
     #[test]

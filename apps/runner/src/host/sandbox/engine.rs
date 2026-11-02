@@ -256,6 +256,20 @@ pub async fn sweep_boot() -> anyhow::Result<()> {
     for id in list_labelled(&upstream, &install).await {
         delete_container(&upstream, &id).await;
     }
+    // Containers from before install labels (alpha.14 and older) are no
+    // install's provably, so they are never removed automatically: say so.
+    let labelled = list_labelled(&upstream, INSTALL_LABEL).await;
+    let unlabelled = list_labelled(&upstream, "celld.cell")
+        .await
+        .into_iter()
+        .filter(|id| !labelled.contains(id))
+        .count();
+    if unlabelled > 0 {
+        tracing::warn!(
+            count = unlabelled,
+            "celld containers without a noite.install label (from before alpha.15, or another celld on this engine) are left running; remove stale ones with `docker ps -aq --filter label=celld.cell`"
+        );
+    }
     Ok(())
 }
 
@@ -280,10 +294,14 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
 /// Concurrent connections per fleet socket: celld holds a handful (one per
 /// call, plus exec streams and long-polled waits); the cap keeps a flood from
 /// exhausting the runner's tasks and fds.
+/// Connections from any other process share a separate, small pool: they
+/// only ever get the refusal, and must not fill the fleet's own slots.
 const MAX_CONNS: usize = 256;
+const MAX_FOREIGN_CONNS: usize = 8;
 
 async fn accept_loop(listener: UnixListener, fleet: String, upstream: Option<PathBuf>) {
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
+    let own = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
+    let foreign = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_FOREIGN_CONNS));
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -294,11 +312,16 @@ async fn accept_loop(listener: UnixListener, fleet: String, upstream: Option<Pat
                 continue;
             }
         };
-        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+        let peer = peer_pid(&stream);
+        let pool = if peer.is_some() && registry::pid_of_fleet(&fleet) == peer {
+            &own
+        } else {
+            &foreign
+        };
+        let Ok(permit) = pool.clone().try_acquire_owned() else {
             drop(stream);
             continue;
         };
-        let peer = peer_pid(&stream);
         let fleet = fleet.clone();
         let upstream = upstream.clone();
         tokio::spawn(async move {
@@ -651,6 +674,13 @@ async fn container(
         if alias != id {
             registry::record_container(fleet, alias, None);
         }
+    }
+    // The fence installer runs host-network with `NET_ADMIN`: celld only
+    // starts it, waits for it, reads its logs and removes it. An exec into
+    // it, or a signal that freezes it before `nft` exits, would be a root
+    // shell in the host netns.
+    if validate::inspect_is_fence(&info) && matches!(op, ContainerOp::Exec | ContainerOp::Kill) {
+        return refuse("the fence installer takes no exec or signal");
     }
     // Forward by the inspected canonical id, never the caller's ref: a name
     // could be re-bound to another container between the check and the call.
@@ -1173,6 +1203,94 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         registry::unregister_fleet(&key);
         close_fleet(&key).await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// A fake engine holding one fence container `fence1` owned by `owner`:
+    /// inspects describe it, every other call answers `{}`; all paths are
+    /// recorded.
+    async fn fence_engine(listener: UnixListener, owner: String, seen: Arc<Mutex<Vec<String>>>) {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let (owner, seen) = (owner.clone(), seen.clone());
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                    let (owner, seen) = (owner.clone(), seen.clone());
+                    async move {
+                        let path = req.uri().path().to_string();
+                        seen.lock().unwrap().push(path.clone());
+                        let body = if path == "/containers/fence1/json" {
+                            json!({
+                                "Id": "fence1",
+                                "Name": "/fence1",
+                                "Config": {"Labels": {"celld.fence": "1", "noite.fleet": owner}},
+                                "HostConfig": {"NetworkMode": "host"},
+                            })
+                        } else {
+                            json!({})
+                        };
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(full(Bytes::from(body.to_string())))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn the_fence_takes_no_exec_and_no_signal() {
+        let dir = test_dir("fence");
+        let fleet_dir = dir.join("sockets");
+        std::fs::create_dir_all(&fleet_dir).unwrap();
+        let upstream_sock = dir.join("upstream.sock");
+        let key = test_key("fence");
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let engine = tokio::spawn(fence_engine(
+            UnixListener::bind(&upstream_sock).expect("fake engine binds"),
+            super::super::owner(&key),
+            seen.clone(),
+        ));
+        let socket = serve_inner(&key, &fleet_dir, Some(upstream_sock)).expect("serve");
+        registry::register_fleet(&key, std::process::id());
+
+        // An exec, or a STOP that would hold the host-network container
+        // open for one, never reaches the engine.
+        let (status, _) = fleet_call(
+            &socket,
+            "POST",
+            "/containers/fence1/exec",
+            Some(json!({"AttachStdout": true, "Cmd": ["sh"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) =
+            fleet_call(&socket, "POST", "/containers/fence1/kill?signal=STOP", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["/containers/fence1/json", "/containers/fence1/json"],
+            "only the ownership inspects went upstream"
+        );
+        // celld's own lifecycle still passes.
+        let (status, _) = fleet_call(&socket, "POST", "/containers/fence1/start", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().last().map(String::as_str),
+            Some("/containers/fence1/start")
+        );
+
+        registry::unregister_fleet(&key);
+        close_fleet(&key).await;
+        engine.abort();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
