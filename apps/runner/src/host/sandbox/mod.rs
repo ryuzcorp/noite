@@ -24,6 +24,7 @@
 //!
 //! [`registry`] is the shared ownership state between them.
 
+pub mod engine;
 pub mod registry;
 
 /// Loopback port of the gateway listener; fleet dials to celld's bridges are
