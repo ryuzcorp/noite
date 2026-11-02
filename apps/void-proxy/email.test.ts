@@ -951,9 +951,10 @@ describe("SMTP submission (canned sockets)", () => {
     });
 
     expect(json).toMatchObject({ ok: true });
-    // Plaintext connect, then an explicit upgrade (celld `startTls()` shape).
+    // `starttls` transport at connect (required for the upgrade below), then
+    // an explicit upgrade (celld `startTls()` shape).
     expect(seen).toEqual([
-      { hostname: "smtp.example.com", port: 587, secureTransport: "off" },
+      { hostname: "smtp.example.com", port: 587, secureTransport: "starttls" },
     ]);
     expect(shared.startTlsCalls).toEqual([
       { expectedServerHostname: "smtp.example.com" },

@@ -1086,6 +1086,13 @@ const logSend = (
 
 type SmtpMode = "starttls" | "implicit" | "plain";
 
+/** `startTls()` requires the `starttls` transport; `off` cannot upgrade. */
+const TRANSPORT_BY_MODE: Record<SmtpMode, "off" | "on" | "starttls"> = {
+  implicit: "on",
+  plain: "off",
+  starttls: "starttls",
+};
+
 interface SmtpReply {
   code: number;
   /** Full reply text (all lines joined), for `messageId` and diagnostics. */
@@ -1378,12 +1385,13 @@ export const smtpSubmit = async (
       () =>
         input.connect(
           { hostname: input.host, port: input.port },
-          { secureTransport: input.mode === "implicit" ? "on" : "off" }
+          { secureTransport: TRANSPORT_BY_MODE[input.mode] }
         ),
       () => new SmtpTimeoutError()
     );
-    // NOTE: `starttls` mode connects plaintext here and upgrades after the
-    // STARTTLS command below (celld exposes the upgrade via `startTls()`).
+    // NOTE: `starttls` mode connects with the `starttls` transport (plaintext
+    // until the upgrade) because `startTls()` requires it; the TLS upgrade
+    // happens after the STARTTLS command below.
     writer = socket.writable.getWriter();
     reader = new SmtpLineReader(socket);
 
