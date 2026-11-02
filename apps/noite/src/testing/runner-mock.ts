@@ -84,7 +84,7 @@ export const installRunnerMock = (apps: RunnerApp[]): RunnerMock => {
       case "apps.delete": {
         mock.apps = mock.apps.filter((app) => app.id !== call.params.id);
 
-        return { ok: true };
+        return { deleting: false, ok: true };
       }
 
       default: {

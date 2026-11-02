@@ -609,9 +609,12 @@ async fn dispatch_call(
             };
             complete(
                 id,
-                service::apps::delete(state, &p.id)
-                    .await
-                    .map(|()| json!({ "ok": true })),
+                service::apps::delete(state, &p.id).await.map(|deletion| {
+                    json!({
+                        "ok": true,
+                        "deleting": deletion == service::apps::Deletion::InProgress,
+                    })
+                }),
             )
         }
         "apps.rename" => {

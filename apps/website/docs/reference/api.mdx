@@ -28,7 +28,7 @@ Public (no credential): `/health`, `/ready`, `/v1/git/*`, `/v1/edge/*`.
 | Method | Route | Notes |
 | --- | --- | --- |
 | `GET` / `POST` | `/v1/apps` | List; create (quota-checked, see [Limits](/reference/limits)) |
-| `GET` / `PATCH` / `DELETE` | `/v1/apps/{id}` | `PATCH` sets `desired_state: running\|stopped`; an unknown key is rejected (`422`) |
+| `GET` / `PATCH` / `DELETE` | `/v1/apps/{id}` | `PATCH` sets `desired_state: running\|stopped`; an unknown key is rejected (`422`). `DELETE` answers `204` once the purge finished, or `202 {"deleting": true}` when it still runs in the background after 3 s; the app is gone from every listing either way |
 | `POST` | `/v1/apps/{id}/rename` | Renames the app; rotates scoped credentials once a provider exists (none today — see [Tenancy](/self-hosting/tenancy)) |
 | `POST` | `/v1/apps/{id}/sleep` | Parks the app; next request wakes it |
 
