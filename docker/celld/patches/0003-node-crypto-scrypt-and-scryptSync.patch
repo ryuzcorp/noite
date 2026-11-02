@@ -1,0 +1,378 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Noite <noite@noite.now>
+Date: Mon, 2 Nov 2026 22:22:29 +0100
+Subject: [PATCH] node:crypto: scrypt and scryptSync
+
+Void's auth (better-auth) hashes passwords with node:crypto scrypt, which celld stubbed as notImplemented, so email/password sign-up threw ERR_METHOD_NOT_IMPLEMENTED. Implement both forms over the scrypt crate (already in the build via pkcs5) with Node's parameters, defaults, and error codes.
+---
+ Cargo.lock                     |   1 +
+ Cargo.toml                     |  10 ++-
+ crates/celld/Cargo.toml        |   2 +
+ crates/celld/js.rs             |   2 +
+ crates/celld/js/crypto.rs      | 127 +++++++++++++++++++++++++++++++++
+ crates/celld/js/node_crypto.js |  84 ++++++++++++++++++++--
+ docs/cloudflare-compat.md      |   4 ++
+ 7 files changed, 223 insertions(+), 7 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 97b9cf5..9baf430 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -336,6 +336,7 @@ dependencies = [
+  "rusqlite",
+  "rustls",
+  "rustls-webpki",
++ "scrypt",
+  "serde",
+  "serde_json",
+  "sha1",
+diff --git a/Cargo.toml b/Cargo.toml
+index 715b7d5..88f3118 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,3 +1,4 @@
++# Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt.
+ # Clean-sheet celld workspace. `crates/logic` owns all behavioral state and
+ # decisions; `crates/celld` is only an effect executor and adapter host.
+ [workspace]
+@@ -62,12 +63,15 @@ futures-util = "0.3"
+ getrandom = "0.3"
+ glob = "0.3"
+ hex = "0.4"
+-# The two node:crypto KDFs. Both crates already reach this build without a
+-# line here -- `pbkdf2` through `pkcs5`, `hkdf` through `elliptic-curve` --
+-# so declaring them costs no compile time and adds no supply-chain surface.
++# The three node:crypto KDFs. All three crates already reach this build
++# without a line here -- `pbkdf2` and `scrypt` through `pkcs5`, `hkdf`
++# through `elliptic-curve` -- so declaring them costs no compile time and
++# adds no supply-chain surface. `scrypt` keeps `pkcs5`'s feature set (no
++# `simple` PHC strings), so the lock gains only the dependency edge.
+ hkdf = "0.12"
+ hmac = "0.12"
+ pbkdf2 = "0.12"
++scrypt = { version = "0.11", default-features = false }
+ http-body-util = "0.1"
+ # hyper also accepts h2 releases before 0.4.18, which retain the remotely
+ # triggerable resource-exhaustion advisory. Keep a direct floor here because a
+diff --git a/crates/celld/Cargo.toml b/crates/celld/Cargo.toml
+index 7173e2a..f256211 100644
+--- a/crates/celld/Cargo.toml
++++ b/crates/celld/Cargo.toml
+@@ -1,3 +1,4 @@
++# Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt.
+ [package]
+ name = "celld"
+ version = "0.6.3"
+@@ -69,6 +70,7 @@ sqlite-vec.workspace = true
+ rustls.workspace = true
+ rustls-webpki.workspace = true
+ rsa.workspace = true
++scrypt.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
+ sha1.workspace = true
+diff --git a/crates/celld/js.rs b/crates/celld/js.rs
+index ec40b41..900c02a 100644
+--- a/crates/celld/js.rs
++++ b/crates/celld/js.rs
+@@ -1,3 +1,4 @@
++// Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt.
+ // Copyright 2026 Deno Land Inc. Apache-2.0 license.
+ 
+ // The raw V8 adapter and its child modules remain outside the Actor execution
+@@ -6866,6 +6867,7 @@ ops! { OP_NAMES, install_op_functions,
+         "$$aesDecrypt" => crypto::op_webcrypto_aes_decrypt,
+         "$$pbkdf2" => crypto::op_node_pbkdf2,
+         "$$hkdf" => crypto::op_node_hkdf,
++        "$$scrypt" => crypto::op_node_scrypt,
+         "$$timingSafeEqual" => crypto::op_timing_safe_equal,
+         "__event_begin" => op_event_begin,
+         "__event_end" => op_event_end,
+diff --git a/crates/celld/js/crypto.rs b/crates/celld/js/crypto.rs
+index 28a1ea5..0035d5b 100644
+--- a/crates/celld/js/crypto.rs
++++ b/crates/celld/js/crypto.rs
+@@ -1,3 +1,4 @@
++// Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt.
+ // Copyright 2026 Deno Land Inc. Apache-2.0 license.
+ 
+ //! Web Crypto and node:crypto: the key formats and the primitives.
+@@ -1742,6 +1743,132 @@ pub(super) fn op_node_hkdf(
+     }
+ }
+ 
++/// scrypt (RFC 7914) for node:crypto, over the `scrypt` crate.
++///
++/// Like `pbkdf2`, the crate already reaches this build through `pkcs5`,
++/// which this file uses for encrypted PKCS#8, so only the `Cargo.toml`
++/// line is new. `None` is an invalid parameter set: `N` is not a power of
++/// two above one, `r` or `p` is zero, or the parameters overflow the
++/// crate's internal sizes. The JS layer validates all of these first and
++/// reports `ERR_CRYPTO_INVALID_SCRYPT_PARAMS`, so `None` here is the same
++/// belt-and-braces as `hkdf_kdf`'s: the ops are reachable from the user's
++/// `globalThis` whatever the JS layer does.
++fn scrypt_kdf(
++    password: &[u8],
++    salt: &[u8],
++    n: u32,
++    r: u32,
++    p: u32,
++    keylen: usize,
++) -> Option<Vec<u8>> {
++    if n <= 1 || !n.is_power_of_two() || r == 0 || p == 0 {
++        return None;
++    }
++    if keylen == 0 {
++        // Node derives an empty key; the crate refuses an empty output.
++        return Some(Vec::new());
++    }
++    // `Params` also carries a PHC hash length the raw `scrypt()` never
++    // reads, and the constructor only accepts 10..=64 for it, so the key
++    // length stays out of here: any placeholder in range behaves the same.
++    let params = scrypt::Params::new(n.trailing_zeros() as u8, r, p, 32).ok()?;
++    let mut out = vec![0u8; keylen];
++    scrypt::scrypt(password, salt, &params, &mut out).ok()?;
++    Some(out)
++}
++
++/// `$$scrypt(password, salt, n, r, p, keylen)` -> Uint8Array
++pub(super) fn op_node_scrypt(
++    scope: &mut v8::PinScope,
++    args: v8::FunctionCallbackArguments,
++    rv: v8::ReturnValue<v8::Value>,
++) {
++    let Some(password) = view_bytes(args.get(0)) else {
++        return;
++    };
++    let Some(salt) = view_bytes(args.get(1)) else {
++        return;
++    };
++    let n = args.get(2).uint32_value(scope).unwrap_or(0);
++    let r = args.get(3).uint32_value(scope).unwrap_or(0);
++    let p = args.get(4).uint32_value(scope).unwrap_or(0);
++    let keylen = args.get(5).uint32_value(scope).unwrap_or(0) as usize;
++    if let Some(out) = scrypt_kdf(&password, &salt, n, r, p, keylen) {
++        webcrypto_return_bytes(scope, rv, &out);
++    }
++}
++
++#[cfg(test)]
++mod scrypt_tests {
++    use super::*;
++
++    fn hex(bytes: &[u8]) -> String {
++        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
++    }
++
++    /// RFC 7914 section 12, vector 1. Node and Python's `hashlib` agree.
++    #[test]
++    fn empty_password_and_salt() {
++        let out = scrypt_kdf(b"", b"", 16, 1, 1, 64).unwrap();
++        assert_eq!(
++            hex(&out),
++            "77d6576238657b203b19ca42c18a0497f16b4844e3074ae8dfdffa3fede21442\
++             fcd0069ded0948f8326a753a0fc81f17e8d3e0fb2e0d3628cf35e20c38d18906"
++        );
++    }
++
++    /// RFC 7914 section 12, vector 2.
++    #[test]
++    fn password_and_nacl() {
++        let out = scrypt_kdf(b"password", b"NaCl", 1024, 8, 16, 64).unwrap();
++        assert_eq!(
++            hex(&out),
++            "fdbabe1c9d3472007856e7190d01e9fe7c6ad7cbc8237830e77376634b373162\
++             2eaf30d92e22a3886ff109279d9830dac727afb94a83ee6d8360cbdfa2cc0640"
++        );
++    }
++
++    /// Node's defaults (N=16384, r=8, p=1), the shape password hashing
++    /// asks for. Ground truth from Node itself.
++    #[test]
++    fn node_defaults() {
++        let out = scrypt_kdf(b"password", b"salt", 16384, 8, 1, 32).unwrap();
++        assert_eq!(
++            hex(&out),
++            "745731af4484f323968969eda289aeee005b5903ac561e64a5aca121797bf773"
++        );
++    }
++
++    /// The smallest valid `N`.
++    #[test]
++    fn smallest_cost() {
++        let out = scrypt_kdf(b"p", b"s", 2, 1, 1, 32).unwrap();
++        assert_eq!(
++            hex(&out),
++            "48b0d2a8a3272611984c50ebd630af52e187db3433930c3b74d0889935944cf3"
++        );
++    }
++
++    /// Node derives an empty key for keylen 0.
++    #[test]
++    fn empty_key() {
++        let out = scrypt_kdf(b"password", b"salt", 16384, 8, 1, 0).unwrap();
++        assert!(out.is_empty());
++    }
++
++    /// Shapes the JS layer refuses with `ERR_CRYPTO_INVALID_SCRYPT_PARAMS`
++    /// never reach the crate: the op refuses them too.
++    #[test]
++    fn invalid_parameters() {
++        for (n, r, p) in [(0, 8, 1), (1, 8, 1), (100, 8, 1), (16, 0, 1), (16, 8, 0)] {
++            assert!(
++                scrypt_kdf(b"password", b"salt", n, r, p, 32).is_none(),
++                "n={n} r={r} p={p} derived a key"
++            );
++        }
++    }
++}
++
+ /// Constant-time equality for equal-length byte views. The JS surfaces own
+ /// their distinct argument and length errors; one native primitive owns the
+ /// security property both APIs promise.
+diff --git a/crates/celld/js/node_crypto.js b/crates/celld/js/node_crypto.js
+index e7baf1f..a64b166 100644
+--- a/crates/celld/js/node_crypto.js
++++ b/crates/celld/js/node_crypto.js
+@@ -1,3 +1,4 @@
++// Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt.
+ // node:crypto for celld -- a port of Workerd's implementation at commit
+ // 191a27f941300dd8956f2afeb66c10a651108c0b. Copyright (c) 2017-2022
+ // Cloudflare, Inc. (Apache-2.0), itself adapted from Node.js (Joyent and
+@@ -13,7 +14,7 @@
+ //   src/node/internal/validators.ts, internal_errors.ts (subsets)
+ //
+ // Types are stripped; the C++ `node-internal:crypto` builtin maps onto the
+-// $$digest / $$hmacSign / $$pbkdf2 / $$hkdf / $$randomValues /
++// $$digest / $$hmacSign / $$pbkdf2 / $$hkdf / $$scrypt / $$randomValues /
+ // $$timingSafeEqual host ops, with hash state buffered on the JS side (digest
+ // runs once, at finalization).
+ // checkPrime/generatePrime are pure-JS BigInt Miller-Rabin, mirroring
+@@ -156,6 +157,9 @@
+   const ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH = () =>
+     nodeErr(RangeError, "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH",
+       "Input buffers must have the same byte length");
++  const ERR_CRYPTO_INVALID_SCRYPT_PARAMS = () =>
++    nodeErr(RangeError, "ERR_CRYPTO_INVALID_SCRYPT_PARAMS",
++      "Invalid scrypt params");
+ 
+   function validateString(value, name) {
+     if (typeof value !== "string")
+@@ -1186,6 +1190,80 @@
+     return getHkdf(hash, key, salt, info, length);
+   }
+ 
++  // ---- scrypt --------------------------------------------------------------
++  // Node's option names and defaults: N/cost, r/blockSize,
++  // p/parallelization, maxmem. A present-but-zero N, r, p, or maxmem means
++  // "use the default", and each alias pair is exclusive. Also doubles as
++  // the `scrypt`/`scryptSync` default-parameter sentinel, like Node's own
++  // `defaults`.
++  const scryptDefaults = { N: 16384, r: 8, p: 1, maxmem: 33554432 };
++  function scryptCheckArgs(password, salt, keylen) {
++    password = getArrayBufferOrView(password, "password");
++    salt = getArrayBufferOrView(salt, "salt");
++    validateInt32(keylen, "keylen", 0);
++    return { password, salt, keylen };
++  }
++  function scryptCheckOptions(options) {
++    let N, cost, r, blockSize, p, parallelization, maxmem;
++    if (options != null) {
++      ({ N, cost, r, blockSize, p, parallelization, maxmem } = options);
++    }
++    if (N !== undefined) validateUint32(N, "N");
++    if (cost !== undefined) validateUint32(cost, "cost");
++    if (r !== undefined) validateUint32(r, "r");
++    if (blockSize !== undefined) validateUint32(blockSize, "blockSize");
++    if (p !== undefined) validateUint32(p, "p");
++    if (parallelization !== undefined)
++      validateUint32(parallelization, "parallelization");
++    if (maxmem !== undefined)
++      validateInteger(maxmem, "maxmem", 0, Number.MAX_SAFE_INTEGER);
++    if (N !== undefined && cost !== undefined)
++      throw ERR_INCOMPATIBLE_OPTION_PAIR("N", "cost");
++    if (r !== undefined && blockSize !== undefined)
++      throw ERR_INCOMPATIBLE_OPTION_PAIR("r", "blockSize");
++    if (p !== undefined && parallelization !== undefined)
++      throw ERR_INCOMPATIBLE_OPTION_PAIR("p", "parallelization");
++    N = N ?? cost ?? 16384;
++    r = r ?? blockSize ?? 8;
++    p = p ?? parallelization ?? 1;
++    maxmem = maxmem ?? 33554432;
++    if (N === 0) N = 16384;
++    if (r === 0) r = 8;
++    if (p === 0) p = 1;
++    if (maxmem === 0) maxmem = 33554432;
++    if (N <= 1 || (N & (N - 1)) !== 0)
++      throw ERR_CRYPTO_INVALID_SCRYPT_PARAMS();
++    if (128 * N * r > maxmem)
++      throw ERR_CRYPTO_INVALID_SCRYPT_PARAMS();
++    return { N, r, p };
++  }
++  function getScrypt(password, salt, keylen, N, r, p) {
++    const out = $$scrypt(asU8(password), asU8(salt), N, r, p, keylen);
++    if (out === undefined) throw ERR_CRYPTO_INVALID_SCRYPT_PARAMS();
++    return out;
++  }
++  function scryptSync(password, salt, keylen, options = scryptDefaults) {
++    ({ password, salt, keylen } = scryptCheckArgs(password, salt, keylen));
++    const { N, r, p } = scryptCheckOptions(options);
++    return Buffer.from(getScrypt(password, salt, keylen, N, r, p));
++  }
++  function scrypt(password, salt, keylen, options, callback = scryptDefaults) {
++    if (callback === scryptDefaults) {
++      callback = options;
++      options = scryptDefaults;
++    }
++    ({ password, salt, keylen } = scryptCheckArgs(password, salt, keylen));
++    validateFunction(callback, "callback");
++    const { N, r, p } = scryptCheckOptions(options);
++    new Promise((resolve, reject) => {
++      try { resolve(getScrypt(password, salt, keylen, N, r, p)); }
++      catch (err) { reject(err); }
++    }).then(
++      (val) => callback(null, Buffer.from(val)),
++      (err) => callback(err),
++    );
++  }
++
+   // ---- random (crypto_random.ts) ------------------------------------------
+   // $$randomValues fills any view (no WebCrypto 65,536-byte quota).
+   const fillRandom = (view) => { $$randomValues(view); return view; };
+@@ -1614,7 +1692,7 @@
+     // Hash and Hmac
+     Hash, Hmac, createHash, createHmac, getHashes, hash,
+     // KDF
+-    hkdf, hkdfSync, pbkdf2, pbkdf2Sync,
++    hkdf, hkdfSync, pbkdf2, pbkdf2Sync, scrypt, scryptSync,
+     // Keys
+     KeyObject, SecretKeyObject, PublicKeyObject, PrivateKeyObject,
+     createSecretKey, createPrivateKey, createPublicKey,
+@@ -1629,8 +1707,6 @@
+     publicDecrypt: notImplemented("publicDecrypt"),
+     privateEncrypt: notImplemented("privateEncrypt"),
+     privateDecrypt: notImplemented("privateDecrypt"),
+-    scrypt: notImplemented("scrypt"),
+-    scryptSync: notImplemented("scryptSync"),
+     createDiffieHellman: notImplemented("createDiffieHellman"),
+     createDiffieHellmanGroup: notImplemented("createDiffieHellmanGroup"),
+     getDiffieHellman: notImplemented("getDiffieHellman"),
+diff --git a/docs/cloudflare-compat.md b/docs/cloudflare-compat.md
+index 4f29ab0..46dae05 100644
+--- a/docs/cloudflare-compat.md
++++ b/docs/cloudflare-compat.md
+@@ -1,3 +1,4 @@
++<!-- Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt. -->
+ # Cloudflare compatibility
+ 
+ This page lists only the differences from the linked Cloudflare APIs. An entry
+@@ -149,6 +150,9 @@ execution.
+ - `node:diagnostics_channel` does not export messages to a tail Worker.
+ - `node:crypto` does not implement Diffie-Hellman, streaming signatures,
+   ciphers, RSA-PSS, or DSA signatures and key generation.
++- `node:crypto` implements `scrypt`/`scryptSync` with Node's parameters
++  and defaults (`N`/`cost` 16384, `r`/`blockSize` 8, `p`/`parallelization`
++  1, `maxmem` 32 MiB).
+ - `KeyObject.toCryptoKey()` applies the requested algorithm, extractability,
+   and usages to an asymmetric key.
+ - `node:zlib` implements only the synchronous gzip and deflate functions.
