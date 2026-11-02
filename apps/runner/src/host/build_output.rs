@@ -310,6 +310,10 @@ pub fn built_deploy_root(src_dir: &Path) -> anyhow::Result<Option<BuiltRoot>> {
     // `dist/wrangler.json`.
     let void_config = src.join(VOID_OUTPUT);
     if void_config.is_file() {
+        // Resolved first, as the redirect is: the runner reads and rewrites
+        // it as root, and a link in it or in a parent would aim both
+        // outside the worktree.
+        let void_config = inside(&src, &void_config).context(VOID_OUTPUT)?;
         let dir = celld_config_from(&src, &void_config)?;
         return Ok(Some(BuiltRoot {
             note: format!(
@@ -924,6 +928,39 @@ mod tests {
         assert!(std::fs::symlink_metadata(src.join("dist/wrangler.json"))
             .unwrap()
             .is_file());
+    }
+
+    /// A link at Void's config, or at a directory above it, that leads out
+    /// of the worktree is refused before the root read and write.
+    #[test]
+    #[cfg(unix)]
+    fn void_output_linked_out_of_the_worktree_is_refused() {
+        let outside = scratch("void-outside").canonicalize().unwrap();
+        write(
+            &outside.join("ssr/wrangler.json"),
+            r#"{"name":"stolen","vars":{"SECRET":"x"}}"#,
+        );
+        let file_link = scratch("void-file-link").canonicalize().unwrap();
+        std::fs::create_dir_all(file_link.join("dist/ssr")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("ssr/wrangler.json"),
+            file_link.join("dist/ssr/wrangler.json"),
+        )
+        .unwrap();
+        let dir_link = scratch("void-dir-link").canonicalize().unwrap();
+        std::os::unix::fs::symlink(&outside, dir_link.join("dist")).unwrap();
+        for src in [file_link, dir_link] {
+            let err = built_deploy_root(&src).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("escapes the worktree"),
+                "{err:#}"
+            );
+        }
+        assert!(!outside.join("wrangler.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("ssr/wrangler.json")).unwrap(),
+            r#"{"name":"stolen","vars":{"SECRET":"x"}}"#
+        );
     }
 
     /// `NOITE_SANDBOX=off` refuses any `containers` entry; a config

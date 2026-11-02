@@ -63,7 +63,7 @@ After a build, the runner deploys what the build produced, in this order:
 4. Otherwise, the source config: `wrangler.jsonc`, `wrangler.json` or `wrangler.toml` at the root, then the first one found below it (`node_modules` excluded).
 5. With no config at all, one the runner generates ([below](#no-config-at-all)).
 
-For 2 and 3 the runner writes `dist/wrangler.json` from the config they point to: it keeps only the keys celld accepts, rewrites `main` and `assets.directory` relative to `dist/`, and applies `.assetsignore`. Without a build step, 1 to 3 do not apply. The deploy log names the config it used (`config: dist/wrangler.json (from …)`, `config: generated: static site from dist/ …`).
+For 2 and 3 the runner writes `dist/wrangler.json` from the config they point to: it keeps only the keys celld accepts, rewrites `main` and `assets.directory` relative to `dist/`, and applies `.assetsignore` (plain file names only: a glob, a path or a `!` negation fails the deploy). Without a build step, 1 to 3 do not apply. The deploy log names the config it used (`config: dist/wrangler.json (from …)`, `config: generated: static site from dist/ …`).
 
 ## No config at all
 
@@ -140,7 +140,7 @@ Add `main` and an `ASSETS` binding to the same config. The Worker is bundled fro
 }
 ```
 
-For a Worker that itself needs the bundler (Oxide, framework plugins), have the build write `dist/wrangler.json`; a stock Void app needs nothing extra.
+For a Worker that itself needs the bundler (Oxide, framework plugins), have the build write `dist/wrangler.json`; a stock Void app needs nothing extra to deploy. Apps using `void/sandbox` deploy but cannot run sandbox calls yet ([Known limits](/self-hosting/known-limits)).
 
 ## Frameworks and Node servers
 
