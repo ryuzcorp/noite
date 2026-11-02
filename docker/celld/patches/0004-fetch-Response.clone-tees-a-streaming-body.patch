@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Noite <noite@noite.now>
+Date: Tue, 3 Nov 2026 00:24:09 +0100
+Subject: [PATCH] fetch: Response.clone() tees a streaming body
+
+Workerd clones a Response whose body is a stream by teeing it; celld threw "Cannot clone a streaming response before consumption", which breaks the common cache-write shape (clone the response, store one copy, serve the other). Void's ISR does exactly that on its streaming SSR responses, so every ISR page answered 500. Request.clone() already tees; Response.clone() now does the same.
+---
+ crates/celld/js/harness.js | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/crates/celld/js/harness.js b/crates/celld/js/harness.js
+index 4b9fcc5..e1209e5 100644
+--- a/crates/celld/js/harness.js
++++ b/crates/celld/js/harness.js
+@@ -1,4 +1,4 @@
+-// Modified for Noite (ryuzcorp/noite, docker/celld/patches): ctx.container.images.
++// Modified for Noite (ryuzcorp/noite, docker/celld/patches): ctx.container.images; Response.clone() of a streaming body.
+ // The DO object model and the Cloudflare-compatible runtime surface, run
+ // once per isolate by `js.rs::install_harness` after the Web-API prelude.
+ // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
+@@ -361,10 +361,16 @@ globalThis.Response = class Response {
+   }
+   clone() {
+     if (this.bodyUsed) throw new TypeError("Body has already been consumed");
+-    if (this._bodyBytes === null)
+-      throw new TypeError("Cannot clone a streaming response before consumption");
++    // Streaming body: tee, keep one branch, clone the other (as
++    // Request.clone does, and as Workerd does for both).
++    let body = this.body === null ? null : this._bodyBytes;
++    if (this._bodyBytes === null) {
++      const [left, right] = this.body.tee();
++      this.body = left;
++      body = right;
++    }
+     const response = new Response(
+-      this.body === null ? null : this._bodyBytes,
++      body,
+       {
+         status: this.status, statusText: this.statusText, headers: this.headers,
+         webSocket: this.webSocket, __wsTarget: this._wsTarget, cf: this.cf,
