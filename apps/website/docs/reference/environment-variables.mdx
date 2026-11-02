@@ -7,6 +7,8 @@ Defaults below are what `docker/compose.yaml` applies when the var is unset. The
 
 Ownership: **runner-owned** (read by the runner) vs **worker-passthrough** (handed to the control UI worker untouched).
 
+These are install-level variables (Compose, the image environment). Per-app values live in each app's Settings → Environment instead: they reach the app's install, build, release command, fleet, and Worker code (`env.NAME`), and a change applies from the next deploy. See [Configure](/apps/configure).
+
 ## Image
 
 | Var | Default | Effect | Owner |

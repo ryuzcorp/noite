@@ -285,11 +285,14 @@ fn relative_up(from: &Path, path: &Path) -> String {
     parts.join("/")
 }
 
-/// Where a built tree deploys from, and what the deploy log should call it.
+/// Where a built tree deploys from, what the deploy log should call it, and
+/// the `secrets.required` names the rewrite dropped (celld refuses the key):
+/// the deploy fails before `celld deploy` unless every one has a setting.
 #[derive(Debug)]
 pub struct BuiltRoot {
     pub dir: PathBuf,
     pub note: String,
+    pub required_secrets: Vec<String>,
 }
 
 /// The deploy root the build produced under `src_dir`, or `None` to fall
@@ -303,6 +306,8 @@ pub fn built_deploy_root(src_dir: &Path) -> anyhow::Result<Option<BuiltRoot>> {
         return Ok(Some(BuiltRoot {
             dir: dist,
             note: "dist/wrangler.json (build output)".into(),
+            // Used as written: nothing is dropped, so nothing is required.
+            required_secrets: Vec::new(),
         }));
     }
     // Void's own output: the Worker and its config under `dist/ssr/`, the
@@ -314,13 +319,14 @@ pub fn built_deploy_root(src_dir: &Path) -> anyhow::Result<Option<BuiltRoot>> {
         // it as root, and a link in it or in a parent would aim both
         // outside the worktree.
         let void_config = inside(&src, &void_config).context(VOID_OUTPUT)?;
-        let dir = celld_config_from(&src, &void_config)?;
+        let (dir, required_secrets) = celld_config_from(&src, &void_config)?;
         return Ok(Some(BuiltRoot {
             note: format!(
                 "{} (from {VOID_OUTPUT}, Void)",
                 display_rel(&src, &dir.join("wrangler.json"))
             ),
             dir,
+            required_secrets,
         }));
     }
     let redirect = src.join(DEPLOY_REDIRECT);
@@ -328,7 +334,7 @@ pub fn built_deploy_root(src_dir: &Path) -> anyhow::Result<Option<BuiltRoot>> {
         return Ok(None);
     }
     let config = redirected_config(&src, &redirect)?;
-    let dir = celld_config_from(&src, &config)?;
+    let (dir, required_secrets) = celld_config_from(&src, &config)?;
     Ok(Some(BuiltRoot {
         note: format!(
             "{} (from {}, via {DEPLOY_REDIRECT})",
@@ -336,6 +342,7 @@ pub fn built_deploy_root(src_dir: &Path) -> anyhow::Result<Option<BuiltRoot>> {
             display_rel(&src, &config)
         ),
         dir,
+        required_secrets,
     }))
 }
 
@@ -361,12 +368,19 @@ fn redirected_config(src: &Path, redirect: &Path) -> anyhow::Result<PathBuf> {
 }
 
 /// Rewrite the built Wrangler config at `config` into a `wrangler.json`
-/// celld accepts and return the directory it was written to.
-fn celld_config_from(src: &Path, config: &Path) -> anyhow::Result<PathBuf> {
+/// celld accepts and return the directory it was written to, plus the
+/// `secrets.required` names the rewrite dropped (checked against settings
+/// before `celld deploy`).
+fn celld_config_from(src: &Path, config: &Path) -> anyhow::Result<(PathBuf, Vec<String>)> {
     let label = display_rel(src, config);
     let text = std::fs::read_to_string(config).with_context(|| format!("read {label}"))?;
-    let mut value =
+    let value =
         crate::host::storage::parse_wrangler(&text).with_context(|| format!("parse {label}"))?;
+    // `secrets` goes below (celld refuses the key): capture Void's required
+    // list first, so the deploy fails naming them instead of the Worker
+    // failing at runtime without them.
+    let required_secrets = crate::host::worker_vars::required_secrets(&value);
+    let mut value = value;
     let Some(obj) = value.as_object_mut() else {
         bail!("{label} is not a JSON object");
     };
@@ -435,7 +449,7 @@ fn celld_config_from(src: &Path, config: &Path) -> anyhow::Result<PathBuf> {
             remove_path(config)?;
         }
     }
-    Ok(root)
+    Ok((root, required_secrets))
 }
 
 /// D1 `migrations_dir` values relative to the new root; one that is missing
@@ -1052,5 +1066,27 @@ mod tests {
         assert_eq!(v["assets"]["run_worker_first"][1], "!/assets/a.js");
         assert!(v.get("no_bundle").is_none() && v.get("rules").is_none());
         assert_eq!(v["containers"][0]["class_name"], "SandboxV1");
+    }
+
+    /// Void's `secrets.required` is captured before the rewrite drops the key
+    /// celld refuses, so the deploy can fail naming the missing settings.
+    #[test]
+    fn void_required_secrets_survive_the_drop() {
+        let src = scratch("void-required").canonicalize().unwrap();
+        write(
+            &src.join("dist/ssr/wrangler.json"),
+            r#"{"name":"app","main":"index.js","assets":{"directory":"../client"},
+                "vars":{"__VOID_EMAIL_FROM":"noreply@example.com"},
+                "secrets":{"required":["SECRET_KEY","DATABASE_URL"]}}"#,
+        );
+        write(&src.join("dist/ssr/index.js"), "export default {}");
+        write(&src.join("dist/client/index.html"), "<h1>hi</h1>");
+        let built = built_deploy_root(&src).unwrap().expect("Void output");
+        assert_eq!(built.required_secrets, ["SECRET_KEY", "DATABASE_URL"]);
+        let v = read_json(&src.join("dist/wrangler.json"));
+        assert!(v.get("secrets").is_none());
+        // Build-owned `__VOID_*` vars are not runner-reserved: they pass
+        // through to the deployed config untouched.
+        assert_eq!(v["vars"]["__VOID_EMAIL_FROM"], "noreply@example.com");
     }
 }

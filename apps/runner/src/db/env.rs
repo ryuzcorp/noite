@@ -61,8 +61,26 @@ pub(crate) fn env_reserved(name: &str) -> bool {
         || name == "DOCKER_HOST"
 }
 
-/// Tenant env ready to inject, minus reserved names. Feature flags are
-/// plain `FLAG_<NAME>` rows (`1`/`0`) and flow through like any other var.
+/// All settings as stored, unfiltered: the Worker-vars merge
+/// (`host::worker_vars`) refuses its own reserved names loudly instead of
+/// dropping them, and allows every process-reserved prefix there. A read
+/// failure is an error, not an empty list: deploying without the app's
+/// settings would ship a Worker missing its secrets.
+pub async fn worker_settings(
+    pool: &SqlitePool,
+    app_id: &str,
+) -> sqlx::Result<Vec<(String, String)>> {
+    Ok(list_env(pool, app_id)
+        .await?
+        .into_iter()
+        .map(|r| (r.name, r.value))
+        .collect())
+}
+
+/// Tenant env ready to inject into build, release and fleet process env,
+/// minus reserved names. Feature flags are plain `FLAG_<NAME>` rows (`1`/`0`)
+/// and flow through like any other var. Worker `vars` come from
+/// [`worker_settings`] instead (different reserved set, refused not dropped).
 pub async fn tenant_env(pool: &SqlitePool, app_id: &str) -> Vec<(String, String)> {
     match list_env(pool, app_id).await {
         Ok(rows) => rows
@@ -85,7 +103,51 @@ pub async fn tenant_env(pool: &SqlitePool, app_id: &str) -> Vec<(String, String)
 
 #[cfg(test)]
 mod tests {
-    use super::env_reserved;
+    use super::{env_reserved, list_env, set_env, tenant_env, worker_settings};
+
+    /// The Worker-vars input is unfiltered: process-reserved names
+    /// (`BETTER_AUTH_*` for Void auth, `PORT`, …) reach the merge, which
+    /// refuses only its own runner-owned names.
+    #[tokio::test]
+    async fn worker_settings_keep_process_reserved_names() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
+        let cfg = crate::config::config_for_tests();
+        let app = crate::db::create_app(
+            &pool,
+            &cfg,
+            crate::db::NewApp {
+                name: "env-app",
+                slug: "env-app",
+                user_id: "local",
+                subdomain: "env-app.localhost",
+                listen: 30000,
+                internal: 30001,
+            },
+        )
+        .await
+        .expect("seed app");
+        for (name, value) in [
+            ("BETTER_AUTH_SECRET", "s3cret"),
+            ("PORT", "9999"),
+            ("MODEL", "x"),
+        ] {
+            set_env(&pool, &app.id, name, value).await.unwrap();
+        }
+        assert_eq!(list_env(&pool, &app.id).await.unwrap().len(), 3);
+        assert_eq!(
+            worker_settings(&pool, &app.id).await.unwrap(),
+            vec![
+                ("BETTER_AUTH_SECRET".to_string(), "s3cret".to_string()),
+                ("MODEL".to_string(), "x".to_string()),
+                ("PORT".to_string(), "9999".to_string()),
+            ]
+        );
+        // The process input still drops the reserved two.
+        assert_eq!(
+            tenant_env(&pool, &app.id).await,
+            vec![("MODEL".to_string(), "x".to_string())]
+        );
+    }
 
     #[test]
     fn platform_names_stay_reserved() {

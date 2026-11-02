@@ -1,6 +1,8 @@
 //! Tenant env vars (`.dev.vars` model): list/set/delete (thin adapters over
 //! `service::env`). Values are injected into build, release-command, and fleet
-//! env; reserved platform names are filtered at inject time (see db::tenant_env).
+//! env (reserved platform names filtered at inject time, see db::tenant_env)
+//! and merged into the deployed config's Worker `vars` (see
+//! host::worker_vars); a change takes effect on the next deploy.
 use axum::{
     extract::{Path, State},
     response::IntoResponse,

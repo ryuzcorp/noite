@@ -6,6 +6,7 @@ import nodePath from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { expect, test } from "@playwright/test";
+import type { APIRequestContext } from "@playwright/test";
 
 import {
   CHILD_PROC_TIMEOUT_MS,
@@ -13,6 +14,8 @@ import {
   E2E_NAME,
   createAppWithKey,
   deleteApp,
+  runnerApi,
+  runnerCall,
   waitForDeploy,
 } from "./helpers";
 
@@ -33,16 +36,19 @@ const control = new URL(
 
 const gitOrigin = `${control.protocol}//git.${control.host}`;
 const deployOrigin = `${control.protocol}//${DEPLOY_SLUG}.${control.host}`;
+const envsOrigin = `${control.protocol}//staging.${ENVS_SLUG}.${control.host}`;
 
 /** A prebuilt app: a worker plus its wrangler config, no package.json, so
  * the runner skips its source build and deploys the tree as-is. Flat on
  * purpose: `deploy` stages `--dist` contents plus `--wrangler` at the root,
- * and a branch push of the same dir carries exactly that shape. */
+ * and a branch push of the same dir carries exactly that shape. The worker
+ * echoes the `CLI_E2E` setting, so the tests below prove Settings reach
+ * Worker code as `env.NAME` (or read `unset` without one). */
 const seedPrebuiltApp = async (root: string): Promise<void> => {
   await mkdir(root, { recursive: true });
   await writeFile(
     nodePath.join(root, "worker.js"),
-    'export default {\n  async fetch() {\n    return new Response("hello from cli");\n  },\n};\n'
+    'export default {\n  async fetch(_request, env) {\n    return new Response("hello from cli / e2e=" + (env.CLI_E2E ?? "unset"));\n  },\n};\n'
   );
   await writeFile(
     nodePath.join(root, "wrangler.jsonc"),
@@ -126,6 +132,62 @@ const pushSeededBranch = (
   git(["push", "-uf", "origin", `main:${ref}`]);
 };
 
+interface EnvDeployRow {
+  id: string;
+  log: string;
+  sha: string | null;
+  status: string;
+}
+
+interface RunnerEnvironmentRow {
+  id: string;
+  label: string;
+}
+
+/** `waitForDeploy` for one preview environment: poll its own deploy history
+ * (`?environmentId=`) until the newest row is terminal. Callers wait out an
+ * earlier deploy before starting the next, so the newest row is always the
+ * deploy under test. */
+const waitForEnvDeploy = async (
+  request: APIRequestContext,
+  appId: string,
+  envId: string,
+  timeoutMs = 8 * 60_000
+): Promise<EnvDeployRow> => {
+  let latest: EnvDeployRow | undefined;
+
+  await expect
+    .poll(
+      async () => {
+        const deploys = await runnerApi<EnvDeployRow[]>(
+          request,
+          `/v1/apps/${appId}/deploys?environmentId=${envId}`
+        );
+
+        [latest] = deploys;
+
+        if (
+          latest &&
+          (latest.status === "success" || latest.status === "failed")
+        ) {
+          return latest.status;
+        }
+
+        return `waiting:${latest?.status ?? "no-row"}`;
+      },
+      { intervals: [500], timeout: timeoutMs }
+    )
+    .toMatch(/^(?<terminal>success|failed)$/u);
+
+  if (latest === undefined) {
+    throw new Error(
+      `deploy for ${appId}/${envId} did not finish in ${timeoutMs}ms`
+    );
+  }
+
+  return latest;
+};
+
 /** Every app this spec creates, dropped after the file. */
 const createdApps: string[] = [];
 
@@ -162,6 +224,14 @@ test("noite deploy ships a prebuilt dist and the printed URL serves it", async (
     slug: DEPLOY_SLUG,
   });
 
+  // A Settings value the deploy below must carry into the Worker's `vars`.
+  const set = await runnerCall(request, `/v1/apps/${appId}/env`, {
+    body: { name: "CLI_E2E", value: "prod-secret" },
+    method: "POST",
+  });
+
+  expect(set.status).toBe(200);
+
   const dir = mkdtempSync(nodePath.join(tmpdir(), "noite-cli-"));
 
   try {
@@ -184,19 +254,22 @@ test("noite deploy ships a prebuilt dist and the printed URL serves it", async (
 
     // A first deploy spawns the fleet; the edge answers 503 until celld
     // listens, so poll the printed URL itself (not the raw port — the
-    // point is the address the CLI hands out).
+    // point is the address the CLI hands out). The worker echoes the
+    // setting, proving Settings reach Worker code as `env.NAME`.
     await expect
       .poll(
         async (): Promise<string> => {
           await page.goto(printed);
 
-          return (await page.getByText("hello from cli").count()) === 0
+          return (await page
+            .getByText("hello from cli / e2e=prod-secret")
+            .count()) === 0
             ? ""
-            : "hello from cli";
+            : "hello from cli / e2e=prod-secret";
         },
         { timeout: 180_000 }
       )
-      .toBe("hello from cli");
+      .toBe("hello from cli / e2e=prod-secret");
   } finally {
     rmSync(dir, { force: true, recursive: true });
   }
@@ -208,7 +281,7 @@ test("noite environments manages vars over the control origin", async ({
 }) => {
   createdApps.push(ENVS_SLUG);
 
-  const { apiKey } = await createAppWithKey(page, request, {
+  const { apiKey, appId } = await createAppWithKey(page, request, {
     name: "CLI envs",
     slug: ENVS_SLUG,
   });
@@ -233,8 +306,48 @@ test("noite environments manages vars over the control origin", async ({
   env(["create", "--branch", "staging"]);
   expect(env(["list"])).toContain("staging");
 
+  const rows = await runnerApi<RunnerEnvironmentRow[]>(
+    request,
+    `/v1/apps/${appId}/environments?role=admin`
+  );
+
+  const envId = rows.find((row) => row.label === "staging")?.id;
+  expect(envId).toBeTruthy();
+
+  if (envId === undefined) {
+    throw new Error("staging environment missing after create");
+  }
+
+  // The `create` deploy must finish before the redeploy below, so the wait
+  // after it observes the second deploy's row.
+  const first = await waitForEnvDeploy(request, appId, envId);
+  expect(first.status, first.log).toBe("success");
+
   env(["vars", "set", "staging", "CLI_E2E", "hello"]);
   expect(env(["vars", "get", "staging"])).toContain("CLI_E2E");
+
+  // An override reaches the Worker's `vars` on the next deploy: make the
+  // site public (no gate cookie in this context), redeploy, and the served
+  // worker echoes the override.
+  env(["public", "staging", "on"]);
+  env(["deploy", "staging"]);
+
+  const second = await waitForEnvDeploy(request, appId, envId);
+  expect(second.status, second.log).toBe("success");
+
+  await expect
+    .poll(
+      async (): Promise<string> => {
+        await page.goto(envsOrigin);
+
+        return (await page.getByText("hello from cli / e2e=hello").count()) ===
+          0
+          ? ""
+          : "hello from cli / e2e=hello";
+      },
+      { timeout: 180_000 }
+    )
+    .toBe("hello from cli / e2e=hello");
 
   env(["vars", "unset", "staging", "CLI_E2E"]);
   expect(env(["vars", "get", "staging"])).not.toContain("CLI_E2E");

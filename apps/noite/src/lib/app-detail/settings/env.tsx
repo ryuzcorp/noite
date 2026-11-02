@@ -14,10 +14,11 @@ import { ListSkeleton } from "../../ui/skeletons";
 import { SettingsSection } from "./section";
 
 /** Tenant env vars (`.dev.vars` model): UI-set vars reach build, release
- * command, and fleet env. Reads are view-gated, writes admin-gated
- * server-side; the form locks for non-admins. Download mirrors the file
- * local dev expects (Cloudflare `.dev.vars` convention). Names starting
- * with `FLAG_` render as on/off toggles (`1`/`0`). */
+ * command, fleet env, and Worker code (`env.NAME`). A change takes effect
+ * on the next deploy. Reads are view-gated, writes admin-gated server-side;
+ * the form locks for non-admins. Download mirrors the file local dev
+ * expects (Cloudflare `.dev.vars` convention). Names starting with `FLAG_`
+ * render as on/off toggles (`1`/`0`). */
 
 /** A `FLAG_<NAME>` row is a feature flag: the toggle writes `1`/`0`. */
 const isFlag = (name: string) => name.startsWith("FLAG_");
@@ -32,6 +33,7 @@ export const EnvVarsPanel = ({
   const res = envVars(appId);
   const rows = res.data() ?? [];
   const err = atom("");
+  const savedNote = atom(false);
   const busy = atom(false);
   const dialogOpen = atom(false);
   const newVarName = atom("");
@@ -45,6 +47,12 @@ export const EnvVarsPanel = ({
     } catch (error) {
       err.set(errorMessage(error));
     }
+  };
+
+  /** A change lands in Settings only: point at the Deployments tab's
+   * Redeploy, which is what applies it. */
+  const showSavedNote = () => {
+    savedNote.set(true);
   };
 
   const toggleFlag = (row: EnvVarView) => {
@@ -61,6 +69,7 @@ export const EnvVarsPanel = ({
           value: row.value === "1" ? "0" : "1",
         });
         await reload();
+        showSavedNote();
       } catch (error) {
         err.set(errorMessage(error));
       }
@@ -105,6 +114,7 @@ export const EnvVarsPanel = ({
         newVarValue.set("");
         dialogOpen.set(false);
         await reload();
+        showSavedNote();
       } catch (error) {
         err.set(errorMessage(error));
       }
@@ -160,10 +170,20 @@ export const EnvVarsPanel = ({
         ) : null}
       </div>
       <p class="m-0 text-sm opacity-70">
-        Variables reach the build, the release command, and the fleet. Values
-        are hidden after saving; names starting with <code>FLAG_</code> render
-        as on/off toggles (<code>1</code>/<code>0</code>).
+        Variables reach the build, the release command, the fleet, and Worker
+        code (<code>env.NAME</code>). A change takes effect on the next deploy.
+        Values are hidden after saving; names starting with <code>FLAG_</code>{" "}
+        render as on/off toggles (<code>1</code>/<code>0</code>).
       </p>
+      {savedNote() ? (
+        <p class="m-0 text-sm opacity-70">
+          Saved. The next deploy picks it up —{" "}
+          <a class="link" href={`/apps/${appId}?t=deployments`}>
+            redeploy
+          </a>{" "}
+          to apply it now.
+        </p>
+      ) : null}
       {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
       {err() ? null : <LoadError error={res.error()} />}
       {res.loading() && res.data() === undefined ? (
@@ -172,7 +192,7 @@ export const EnvVarsPanel = ({
       {rows.length === 0 && !(res.loading() && res.data() === undefined) ? (
         <p class="m-0 text-sm opacity-70">
           No variables yet — add one to configure the build, the release
-          command, or the fleet.
+          command, the fleet, or Worker code.
         </p>
       ) : null}
       {rows.length > 0 ? (
@@ -228,6 +248,7 @@ export const EnvVarsPanel = ({
                           name: r.name,
                         });
                         await reload();
+                        showSavedNote();
                       } catch (error) {
                         err.set(errorMessage(error));
                       }

@@ -14,6 +14,7 @@ use crate::host::package_manager;
 use crate::host::s3;
 use crate::host::supervisor::{self, ProcMap};
 use crate::host::tips::TipBundle;
+use crate::host::worker_vars;
 use crate::lifecycle::{self, sha_same};
 use crate::models::{App, AppStatus, DeployStatus};
 use sqlx::SqlitePool;
@@ -731,6 +732,12 @@ async fn deploy_inner(
     // fails before its release command; written only once the tree is the
     // runner's again, below.
     let mut generated = None;
+    // Void's required secrets, captured before the build-output rewrite
+    // dropped the key celld refuses: checked against settings below.
+    let required_secrets = built_root
+        .as_ref()
+        .map(|built| built.required_secrets.clone())
+        .unwrap_or_default();
     let deploy_root = match built_root {
         Some(built) => {
             progress
@@ -882,6 +889,37 @@ async fn deploy_inner(
             &format!("celld deploy → {bucket}"),
         )
         .await?;
+
+    // Settings → Worker `vars` (SPEC, Tenant env): the app's settings, or the
+    // environment's overrides over them, become the deployed config's `vars`
+    // (a setting wins over the config's own value), so Worker code reads them
+    // as `env.NAME`. Reserved platform names and required secrets with no
+    // value fail the deploy here, before `celld deploy`, naming the variables
+    // — never their values — in the log.
+    let worker_settings = match target.environment() {
+        Some(env) => db::environment_worker_settings(pool, &app.id, &env.id).await,
+        None => db::worker_settings(pool, &app.id).await,
+    }
+    .map_err(|e| anyhow::Error::new(e).context("read the app's settings for the Worker"))?;
+    let settings_label = match target.environment() {
+        Some(_) => "Settings → Environment or this environment's Variable overrides",
+        None => "Settings → Environment",
+    };
+    worker_vars::check_required(
+        &required_secrets,
+        &worker_settings,
+        &worker_vars::provisioned_names(),
+        settings_label,
+    )?;
+    if let Some(stats) =
+        worker_vars::merge_deploy_root(&deploy_root, &worker_settings, settings_label)?
+    {
+        if stats.merged > 0 {
+            progress
+                .log(DeployStatus::Deploying, &stats.log_line())
+                .await?;
+        }
+    }
 
     // celld pulls container images for linux/amd64 unless told otherwise;
     // pin the pull to the nodes' own arch so arm64 installs pull native
