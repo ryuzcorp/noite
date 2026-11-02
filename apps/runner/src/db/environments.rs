@@ -416,18 +416,15 @@ pub async fn environment_worker_settings(
     pool: &SqlitePool,
     app_id: &str,
     environment_id: &str,
-) -> Vec<(String, String)> {
+) -> sqlx::Result<Vec<(String, String)>> {
     let mut merged = std::collections::BTreeMap::new();
-    for (name, value) in crate::db::env::worker_settings(pool, app_id).await {
+    for (name, value) in crate::db::env::worker_settings(pool, app_id).await? {
         merged.insert(name, value);
     }
-    for row in list_env_override(pool, environment_id)
-        .await
-        .unwrap_or_default()
-    {
+    for row in list_env_override(pool, environment_id).await? {
         merged.insert(row.name, row.value);
     }
-    merged.into_iter().collect()
+    Ok(merged.into_iter().collect())
 }
 
 /// The app's variables with this environment's overrides applied — what the
@@ -628,7 +625,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            environment_worker_settings(&pool, &app.id, &env.id).await,
+            environment_worker_settings(&pool, &app.id, &env.id)
+                .await
+                .unwrap(),
             vec![
                 ("BETTER_AUTH_SECRET".to_string(), "s3cret".to_string()),
                 ("SHARED".to_string(), "env".to_string()),

@@ -63,15 +63,18 @@ pub(crate) fn env_reserved(name: &str) -> bool {
 
 /// All settings as stored, unfiltered: the Worker-vars merge
 /// (`host::worker_vars`) refuses its own reserved names loudly instead of
-/// dropping them, and allows every process-reserved prefix there.
-pub async fn worker_settings(pool: &SqlitePool, app_id: &str) -> Vec<(String, String)> {
-    match list_env(pool, app_id).await {
-        Ok(rows) => rows.into_iter().map(|r| (r.name, r.value)).collect(),
-        Err(e) => {
-            tracing::warn!(app_id, error = %e, "tenant env list failed; deploying without");
-            Vec::new()
-        }
-    }
+/// dropping them, and allows every process-reserved prefix there. A read
+/// failure is an error, not an empty list: deploying without the app's
+/// settings would ship a Worker missing its secrets.
+pub async fn worker_settings(
+    pool: &SqlitePool,
+    app_id: &str,
+) -> sqlx::Result<Vec<(String, String)>> {
+    Ok(list_env(pool, app_id)
+        .await?
+        .into_iter()
+        .map(|r| (r.name, r.value))
+        .collect())
 }
 
 /// Tenant env ready to inject into build, release and fleet process env,
@@ -132,7 +135,7 @@ mod tests {
         }
         assert_eq!(list_env(&pool, &app.id).await.unwrap().len(), 3);
         assert_eq!(
-            worker_settings(&pool, &app.id).await,
+            worker_settings(&pool, &app.id).await.unwrap(),
             vec![
                 ("BETTER_AUTH_SECRET".to_string(), "s3cret".to_string()),
                 ("MODEL".to_string(), "x".to_string()),

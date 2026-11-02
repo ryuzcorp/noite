@@ -899,7 +899,8 @@ async fn deploy_inner(
     let worker_settings = match target.environment() {
         Some(env) => db::environment_worker_settings(pool, &app.id, &env.id).await,
         None => db::worker_settings(pool, &app.id).await,
-    };
+    }
+    .map_err(|e| anyhow::Error::new(e).context("read the app's settings for the Worker"))?;
     let settings_label = match target.environment() {
         Some(_) => "Settings → Environment or this environment's Variable overrides",
         None => "Settings → Environment",
