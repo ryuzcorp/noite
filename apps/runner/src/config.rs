@@ -159,6 +159,14 @@ pub fn parse_update_check_disabled(raw: Option<&str>) -> bool {
     )
 }
 
+/// `NOITE_SANDBOX` force-off: `0`/`false`/`off` (case-insensitive) disables
+/// Sandbox containers for the whole install (no engine proxy, no relay, and
+/// fleets get no `DOCKER_HOST`); deploys declaring `containers` are refused.
+/// Anything else, including unset, leaves them on when an engine answers.
+pub fn parse_sandbox_disabled(raw: Option<&str>) -> bool {
+    parse_update_check_disabled(raw)
+}
+
 /// `DO_NOT_TRACK` (https://donottrack.sh): any non-empty value other than `0`
 /// is a global opt-out and locks telemetry off.
 pub fn parse_do_not_track(raw: Option<&str>) -> bool {
@@ -569,6 +577,9 @@ pub struct Config {
     /// Opt-out update check (SPEC, update check): `NOITE_UPDATE_CHECK`
     /// (`0`/`false`/`off`) locks it off.
     pub update_check_disabled: bool,
+    /// Sandbox containers off for the install (`NOITE_SANDBOX=off`): see
+    /// `parse_sandbox_disabled` and `host::sandbox`.
+    pub sandbox_disabled: bool,
     /// Malformed numeric env values seen by `from_env` (var, value and
     /// expected form per entry). `validate` refuses the boot with all of
     /// them at once; empty for configs built any other way.
@@ -832,6 +843,7 @@ impl Config {
             update_check_disabled: parse_update_check_disabled(
                 env::var("NOITE_UPDATE_CHECK").ok().as_deref(),
             ),
+            sandbox_disabled: parse_sandbox_disabled(env::var("NOITE_SANDBOX").ok().as_deref()),
             env_problems,
         };
         cfg.validate()?;
@@ -1183,6 +1195,7 @@ pub(crate) fn config_for_tests() -> Config {
         telemetry_disabled: false,
         do_not_track: false,
         update_check_disabled: false,
+        sandbox_disabled: false,
         env_problems: Vec::new(),
     }
 }
