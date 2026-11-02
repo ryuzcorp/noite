@@ -7,12 +7,12 @@ start() answers before the container exists, as on Cloudflare, where the
 calls that follow it on the same handle wait for it. An exec right after
 start() answered the engine's 404 no such container instead.
 ---
- crates/celld/container.rs    | 107 +++++++++++++++++++++++++++++++++++
- crates/celld/js/container.rs |  27 +++++++--
- 2 files changed, 130 insertions(+), 4 deletions(-)
+ crates/celld/container.rs    | 122 +++++++++++++++++++++++++++++++++++
+ crates/celld/js/container.rs |  27 ++++++--
+ 2 files changed, 145 insertions(+), 4 deletions(-)
 
 diff --git a/crates/celld/container.rs b/crates/celld/container.rs
-index 7058343..f402b0c 100644
+index 7058343..bba1ed9 100644
 --- a/crates/celld/container.rs
 +++ b/crates/celld/container.rs
 @@ -1,3 +1,4 @@
@@ -128,7 +128,7 @@ index 7058343..f402b0c 100644
          if !cell.running() {
              return Err(anyhow!("exec() requires a running container."));
          }
-@@ -1586,3 +1640,56 @@ fn container_name(node: &str, scope: &str) -> String {
+@@ -1586,3 +1640,71 @@ fn container_name(node: &str, scope: &str) -> String {
      let digest = sha2::Sha256::digest(format!("{node}\n{scope}").as_bytes());
      format!("celld-{:x}", digest)[..30].to_string()
  }
@@ -184,9 +184,24 @@ index 7058343..f402b0c 100644
 +        drop(guard);
 +        assert_eq!(*cell.started.borrow(), run);
 +    }
++
++    /// The guard moves into the start task when the run opens, so a task
++    /// cancelled before it ever runs still releases the run.
++    #[test]
++    fn a_start_task_dropped_before_it_runs_releases_its_run() {
++        let cell = Arc::new(cell());
++        let guard = StartGuard::new(cell.clone(), cell.begin_run());
++        let run = guard.run();
++        let task = async move {
++            let _guard = guard;
++        };
++        assert!(*cell.started.borrow() < run);
++        drop(task);
++        assert_eq!(*cell.started.borrow(), run);
++    }
 +}
 diff --git a/crates/celld/js/container.rs b/crates/celld/js/container.rs
-index bd3774b..86cf340 100644
+index bd3774b..1987660 100644
 --- a/crates/celld/js/container.rs
 +++ b/crates/celld/js/container.rs
 @@ -1,3 +1,4 @@
@@ -211,12 +226,12 @@ index bd3774b..86cf340 100644
 +    let opened = container::engine_if_ready()
          .and_then(|engine| engine.cell(&cell))
 -        .map(|cell| cell.begin_run());
-+        .map(|cell| (cell.begin_run(), cell));
++        // Guarded from the moment it opens: whatever ends the task below
++        // (done, failed, or cancelled and dropped, even before it first
++        // runs), the run counts as finished, or an exec() waiting on it
++        // would wait forever.
++        .map(|cell| StartGuard::new(cell.clone(), cell.begin_run()));
      let async_id = asyncrt::enqueue_io_context(async move {
-+        // Whatever ends this task (done, failed, or cancelled and dropped
-+        // mid-start), the run it opened counts as finished, or an exec()
-+        // waiting on it would wait forever.
-+        let opened = opened.map(|(run, cell)| StartGuard::new(cell, run));
          let (engine, cell) = cell_for(&cell).await?;
 -        let run = run.unwrap_or_else(|| cell.begin_run());
 +        // The run belongs to the cell it was opened on. If that cell was
