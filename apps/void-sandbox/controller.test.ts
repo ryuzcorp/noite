@@ -333,24 +333,6 @@ describe("abort maps to kill", () => {
     expect(seen[0]?.kills).toEqual([undefined]);
   });
 
-  test("pty never reaches celld and isPty stays false", async () => {
-    const { container, controller } = rig();
-    succeedExec(container);
-
-    const wire = (await controller.invoke("exec", [
-      ["echo", "hi"],
-      { pty: { cols: 80, rows: 24 } },
-    ])) as SandboxProcessWire;
-
-    expect(wire.isPty).toBe(false);
-
-    const userCall = container.execCalls.find(
-      (call) => call.argv[0] === "echo"
-    );
-
-    expect(userCall?.options).toEqual({ cwd: "/workspace" });
-  });
-
   test("capability kill reaches the process and settles the exit", async () => {
     const { container, controller } = rig();
     const seen: FakeProcess[] = [];
@@ -374,6 +356,109 @@ describe("abort maps to kill", () => {
     const user = seen.at(-1) as FakeProcess;
     expect(user.kills).toEqual([undefined]);
     await expect(wire.capability.invoke("exitCode", [])).resolves.toBe(137);
+  });
+});
+
+describe("pty", () => {
+  test("pty forwards to the native exec and isPty reflects the native value", async () => {
+    const { container, controller } = rig();
+    // The fake mints a PTY exactly when one is requested, like celld.
+    container.execImpl = (_argv: string[], options): FakeProcess => {
+      const process = new FakeProcess();
+      process.isPty = options.pty !== undefined && options.pty !== false;
+      process.finish(0);
+
+      return process;
+    };
+
+    const sized = (await controller.invoke("exec", [
+      ["bash"],
+      { pty: { cols: 100, rows: 30 } },
+    ])) as SandboxProcessWire;
+
+    expect(sized.isPty).toBe(true);
+
+    const sizedCall = container.execCalls.find(
+      (call) => call.argv[0] === "bash"
+    );
+
+    expect(sizedCall?.options).toEqual({
+      cwd: "/workspace",
+      pty: { cols: 100, rows: 30 },
+    });
+
+    const plain = (await controller.invoke("exec", [
+      ["echo", "hi"],
+      { pty: true },
+    ])) as SandboxProcessWire;
+
+    expect(plain.isPty).toBe(true);
+
+    const plainCall = container.execCalls.find(
+      (call) => call.argv[0] === "echo"
+    );
+
+    expect(plainCall?.options).toEqual({ cwd: "/workspace", pty: true });
+
+    const noPty = (await controller.invoke("exec", [
+      ["echo", "bye"],
+    ])) as SandboxProcessWire;
+
+    expect(noPty.isPty).toBe(false);
+  });
+
+  test("capability resize reaches the native resize", async () => {
+    const { container, controller } = rig();
+    const seen: FakeProcess[] = [];
+    container.execImpl = (_argv: string[], options): FakeProcess => {
+      const process = new FakeProcess();
+      process.isPty = options.pty !== undefined && options.pty !== false;
+      process.finish(0);
+      seen.push(process);
+
+      return process;
+    };
+
+    const wire = (await controller.invoke("exec", [
+      ["bash"],
+      { pty: true },
+    ])) as SandboxProcessWire;
+
+    await wire.capability.invoke("resize", [100, 30]);
+    const user = seen.at(-1) as FakeProcess;
+    expect(user.isPty).toBe(true);
+    expect(user.resizes).toEqual([{ cols: 100, rows: 30 }]);
+    expect(container.execCalls.at(-1)?.options.pty).toBe(true);
+  });
+
+  test("resize on a non-PTY process errors back like the native", async () => {
+    const { container, controller } = rig();
+    succeedExec(container);
+
+    const wire = (await controller.invoke("exec", [
+      ["echo", "hi"],
+    ])) as SandboxProcessWire;
+
+    expect(wire.isPty).toBe(false);
+    await expect(wire.capability.invoke("resize", [80, 24])).rejects.toThrow(
+      "resize() requires a PTY process."
+    );
+  });
+
+  test("the heartbeat guard refuses a pty exec on a denied lease", async () => {
+    const admission = new FakeAdmission();
+    admission.heartbeatResult = { ok: false, reason: "unavailable" };
+    const { container, controller } = rig({ admission });
+    succeedExec(container);
+    await expect(
+      controller.invoke("exec", [["bash"], { pty: true }])
+    ).rejects.toThrow("VOID_SANDBOX_unavailable");
+    // Setup execs ran under the setup's own verdicts; the pty user exec
+    // never reached the container, and the denied lease tore it down.
+    expect(container.execCalls.some((call) => call.argv[0] === "bash")).toBe(
+      false
+    );
+    expect(container.destroys).toBe(1);
   });
 });
 
