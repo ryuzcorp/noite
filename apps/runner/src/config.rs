@@ -2112,7 +2112,9 @@ mod tests {
                 let err = format!("{:#}", Config::from_env().unwrap_err());
                 assert!(
                     err.contains("NOITE_VOID_SANDBOX_MAX_CONCURRENT"),
-                    "{bad}: {err}"
+                    "{}: {}",
+                    bad,
+                    err
                 );
             });
         }

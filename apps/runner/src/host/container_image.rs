@@ -426,8 +426,9 @@ pub fn context_digest(src: &Path, request: &Request) -> anyhow::Result<[u8; 32]>
             entries.push(path.clone());
             if entries.len() > MAX_CONTEXT_FILES {
                 bail!(
-                    "build context {} holds more than {MAX_CONTEXT_FILES} entries",
-                    context.display()
+                    "build context {} holds more than {} entries",
+                    context.display(),
+                    MAX_CONTEXT_FILES
                 );
             }
             if meta.is_symlink() {

@@ -90,6 +90,10 @@ sensitive:
   - "apps/runner/src/host/void_proxy.rs"
   - "apps/runner/src/host/void_cohost.rs"
   - "apps/runner/src/db/void_cohost.rs"
+  # The cohosted Void sandbox controller: its bundle sources and the
+  # runner file that stages and deploys it (admission cell, image pinning).
+  - "apps/void-sandbox/**"
+  - "apps/runner/src/host/void_sandbox.rs"
 
   # The release image and its entrypoints: everything inside the trust
   # boundary ships from here, including the third-party binaries baked in.

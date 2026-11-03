@@ -130,7 +130,8 @@ pub fn assert_compatible_void_version(
 ) -> anyhow::Result<()> {
     let Some(bundle_major) = parse_void_major(bundle_version) else {
         anyhow::bail!(
-            "sandbox controller bundle reports void {bundle_version:?}, which has no readable major (rebuild the controller bundle)"
+            "sandbox controller bundle reports void {:?}, which has no readable major (rebuild the controller bundle)",
+            bundle_version
         );
     };
     let app_major = app_spec.and_then(parse_void_major);
@@ -223,7 +224,7 @@ pub fn load_bundle(dir: &Path) -> anyhow::Result<Bundle> {
     let sha256: String = hasher
         .finalize()
         .iter()
-        .map(|b| format!("{b:02x}"))
+        .map(|b| format!("{:02x}", b))
         .collect();
     if sha256 != meta.bundle_sha256 {
         anyhow::bail!(
@@ -250,7 +251,9 @@ pub fn sandbox_entry_index(config: &Value) -> anyhow::Result<Option<usize>> {
         }
         if let Some(first) = found {
             anyhow::bail!(
-                "a Void app declares one managed sandbox, but the config has two `durable_object` containers entries (containers[{first}] and containers[{index}]); keep one"
+                "a Void app declares one managed sandbox, but the config has two `durable_object` containers entries (containers[{}] and containers[{}]); keep one",
+                first,
+                index
             );
         }
         found = Some(index);
@@ -277,7 +280,7 @@ pub fn take_sandbox_entry(deploy_root: &Path) -> anyhow::Result<Option<Value>> {
         return Ok(None);
     };
     let mut value =
-        crate::host::storage::parse_wrangler(&text).with_context(|| format!("parse {label}"))?;
+        crate::host::storage::parse_wrangler(&text).with_context(|| format!("parse {}", label))?;
     let Some(index) = sandbox_entry_index(&value)? else {
         return Ok(None);
     };
@@ -390,7 +393,9 @@ pub fn check_registry_pin(plan: &crate::host::build_output::ContainersPlan) -> a
         };
         if !digest_pinned(image) {
             anyhow::bail!(
-                "containers[{index}].image {image:?} must be digest-pinned (@sha256:<64 lowercase hex>) for a managed Void sandbox: publish the image with a digest, or build it from a Dockerfile"
+                "containers[{}].image {:?} must be digest-pinned (@sha256:<64 lowercase hex>) for a managed Void sandbox: publish the image with a digest, or build it from a Dockerfile",
+                index,
+                image
             );
         }
     }
@@ -425,7 +430,8 @@ pub async fn ensure_admission_name(
             if let Some(row) = db::get_env(pool, app_id, ADMISSION_NAME_VAR).await? {
                 if row.source != db::SOURCE_VOID_SANDBOX_ADMISSION {
                     anyhow::bail!(
-                        "settings variable `{ADMISSION_NAME_VAR}` is reserved for the platform and cannot become a Worker var (rename it or remove it from Settings → Environment)"
+                        "settings variable `{}` is reserved for the platform and cannot become a Worker var (rename it or remove it from Settings → Environment)",
+                        ADMISSION_NAME_VAR
                     );
                 }
                 return Ok((row.value, false));
@@ -449,7 +455,8 @@ pub async fn ensure_admission_name(
             if let Some(row) = db::get_env_override(pool, env_id, ADMISSION_NAME_VAR).await? {
                 if row.source != db::SOURCE_VOID_SANDBOX_ADMISSION {
                     anyhow::bail!(
-                        "settings variable `{ADMISSION_NAME_VAR}` is reserved for the platform and cannot become a Worker var (rename it or remove it from this environment's Variable overrides)"
+                        "settings variable `{}` is reserved for the platform and cannot become a Worker var (rename it or remove it from this environment's Variable overrides)",
+                        ADMISSION_NAME_VAR
                     );
                 }
                 return Ok((row.value, false));
@@ -661,10 +668,10 @@ mod tests {
             (">=1.0.0 <2.0.0", 1),
             (">=2.0.0", 2),
         ] {
-            assert_eq!(parse_void_major(spec), Some(major), "{spec}");
+            assert_eq!(parse_void_major(spec), Some(major), "{}", spec);
         }
         for spec in ["", "latest", "*", "github:org/repo", "next", "1x", "v"] {
-            assert_eq!(parse_void_major(spec), None, "{spec}");
+            assert_eq!(parse_void_major(spec), None, "{}", spec);
         }
     }
 
@@ -686,14 +693,14 @@ mod tests {
                 "{:#}",
                 assert_compatible_void_version(Some(spec), "1.5.0").unwrap_err()
             );
-            assert_eq!(err, VOID_UPGRADE_MESSAGE, "{spec}");
+            assert_eq!(err, VOID_UPGRADE_MESSAGE, "{}", spec);
         }
         for spec in [None, Some("latest"), Some("")] {
             let err = format!(
                 "{:#}",
                 assert_compatible_void_version(spec, "1.5.0").unwrap_err()
             );
-            assert_eq!(err, VOID_UPGRADE_MESSAGE, "{spec:?}");
+            assert_eq!(err, VOID_UPGRADE_MESSAGE, "{:?}", spec);
         }
     }
 
@@ -705,9 +712,9 @@ mod tests {
             "{:#}",
             assert_compatible_void_version(Some("1.5.0"), "garbage").unwrap_err()
         );
-        assert!(err.contains("no readable major"), "{err}");
-        assert!(err.contains("rebuild the controller bundle"), "{err}");
-        assert!(!err.contains("Upgrade void"), "{err}");
+        assert!(err.contains("no readable major"), "{}", err);
+        assert!(err.contains("rebuild the controller bundle"), "{}", err);
+        assert!(!err.contains("Upgrade void"), "{}", err);
     }
 
     /// The app spec reads `dependencies`, then `devDependencies`; a
@@ -739,7 +746,8 @@ mod tests {
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "noite-void-sandbox-{name}-{}",
+            "noite-void-sandbox-{}-{}",
+            name,
             crate::models::new_id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -757,12 +765,13 @@ mod tests {
         let sha256: String = hasher
             .finalize()
             .iter()
-            .map(|b| format!("{b:02x}"))
+            .map(|b| format!("{:02x}", b))
             .collect();
         std::fs::write(
             dir.join("meta.json"),
             format!(
-                "{{\n  \"void\": \"1.5.0\",\n  \"controllerProtocol\": 2,\n  \"bundleSha256\": \"{sha256}\"\n}}\n"
+                "{{\n  \"void\": \"1.5.0\",\n  \"controllerProtocol\": 2,\n  \"bundleSha256\": \"{}\"\n}}\n",
+                sha256
             ),
         )
         .unwrap();
@@ -789,20 +798,20 @@ mod tests {
 
         std::fs::write(dir.join("worker.js"), b"controller-bundle-tampered").unwrap();
         let err = format!("{:#}", load_bundle(&dir).unwrap_err());
-        assert!(err.contains("does not match"), "{err}");
-        assert!(err.contains("rebuild the controller bundle"), "{err}");
+        assert!(err.contains("does not match"), "{}", err);
+        assert!(err.contains("rebuild the controller bundle"), "{}", err);
 
         std::fs::remove_file(dir.join("worker.js")).unwrap();
         let err = format!("{:#}", load_bundle(&dir).unwrap_err());
-        assert!(err.contains("is missing"), "{err}");
-        assert!(err.contains("bun run build"), "{err}");
+        assert!(err.contains("is missing"), "{}", err);
+        assert!(err.contains("bun run build"), "{}", err);
 
         let (broken, _) = bundle_dir("bundle-broken", b"x");
         std::fs::write(broken.join("meta.json"), "not json").unwrap();
         assert!(load_bundle(&broken).is_err());
         std::fs::write(broken.join("meta.json"), "{}").unwrap();
         let err = format!("{:#}", load_bundle(&broken).unwrap_err());
-        assert!(err.contains("has no `void`"), "{err}");
+        assert!(err.contains("has no `void`"), "{}", err);
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&broken).unwrap();
     }
@@ -813,11 +822,12 @@ mod tests {
     fn minted_admission_names_have_their_shape() {
         use base64::Engine as _;
         let name = mint_admission_name();
-        assert_eq!(name.len(), 43, "{name}");
+        assert_eq!(name.len(), 43, "{}", name);
         assert!(
             name.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-            "{name}"
+            "{}",
+            name
         );
         assert_eq!(
             base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -876,7 +886,7 @@ mod tests {
         let app: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("wrangler.json")).unwrap())
                 .unwrap();
-        assert!(app.get("containers").is_none(), "{app}");
+        assert!(app.get("containers").is_none(), "{}", app);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -896,7 +906,7 @@ mod tests {
             r#"{"name": "a", "containers": [{"class_name": "S", "scheduling_policy": "regional", "image": "i"}]}"#,
         ] {
             std::fs::write(dir.join("wrangler.json"), config).unwrap();
-            assert_eq!(take_sandbox_entry(&dir).unwrap(), None, "{config}");
+            assert_eq!(take_sandbox_entry(&dir).unwrap(), None, "{}", config);
             assert_eq!(
                 std::fs::read_to_string(dir.join("wrangler.json")).unwrap(),
                 config,
@@ -927,9 +937,9 @@ mod tests {
         )
         .unwrap();
         let err = format!("{:#}", take_sandbox_entry(&dir).unwrap_err());
-        assert!(err.contains("one managed sandbox"), "{err}");
-        assert!(err.contains("containers[0]"), "{err}");
-        assert!(err.contains("containers[1]"), "{err}");
+        assert!(err.contains("one managed sandbox"), "{}", err);
+        assert!(err.contains("containers[0]"), "{}", err);
+        assert!(err.contains("containers[1]"), "{}", err);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -996,8 +1006,8 @@ mod tests {
         let good = format!("registry.example/x@sha256:{}", "ab12".repeat(16));
         assert!(digest_pinned(&good));
         assert!(digest_pinned(&format!(
-            "registry.example/x:tag@{suffix}",
-            suffix = &good[good.find('@').unwrap() + 1..]
+            "registry.example/x:tag@{}",
+            &good[good.find('@').unwrap() + 1..]
         )));
         for bad in [
             "registry.example/x:latest".to_string(),
@@ -1007,7 +1017,7 @@ mod tests {
             format!("registry.example/x@sha256:{}", "A".repeat(64)),
             "registry.example/x@sha256:zzzz".to_string(),
         ] {
-            assert!(!digest_pinned(&bad), "{bad}");
+            assert!(!digest_pinned(&bad), "{}", bad);
         }
     }
 
@@ -1052,8 +1062,8 @@ mod tests {
             .unwrap()
             .expect("declares");
         let err = format!("{:#}", check_registry_pin(&plan).unwrap_err());
-        assert!(err.contains("must be digest-pinned"), "{err}");
-        assert!(err.contains("registry.example/x:latest"), "{err}");
+        assert!(err.contains("must be digest-pinned"), "{}", err);
+        assert!(err.contains("registry.example/x:latest"), "{}", err);
         std::fs::remove_dir_all(&dir).unwrap();
 
         let dir = scratch("pin-dockerfile");
@@ -1146,7 +1156,7 @@ mod tests {
 
         let (prod, minted) = ensure_admission_name(&pool, &app.id, None).await.unwrap();
         assert!(minted);
-        assert!(prod.len() >= 32, "{prod}");
+        assert!(prod.len() >= 32, "{}", prod);
         let (again, minted) = ensure_admission_name(&pool, &app.id, None).await.unwrap();
         assert!(!minted);
         assert_eq!(again, prod);
@@ -1204,7 +1214,11 @@ mod tests {
         let err = ensure_admission_name(&pool, &app.id, None)
             .await
             .unwrap_err();
-        assert!(format!("{err:#}").contains(ADMISSION_NAME_VAR), "{err:#}");
+        assert!(
+            format!("{:#}", err).contains(ADMISSION_NAME_VAR),
+            "{:#}",
+            err
+        );
         assert_eq!(
             db::get_env(&pool, &app.id, ADMISSION_NAME_VAR)
                 .await
@@ -1258,18 +1272,19 @@ mod tests {
         assert_eq!(written["containers"][0]["max_instances"], 4);
 
         let line = staged.log_line();
-        assert!(line.contains("app void ^1.5.0"), "{line}");
+        assert!(line.contains("app void ^1.5.0"), "{}", line);
         assert!(
             line.contains("bundle void 1.5.0 / bundle sha256:"),
-            "{line}"
+            "{}",
+            line
         );
-        assert!(line.contains("protocol 2"), "{line}");
+        assert!(line.contains("protocol 2"), "{}", line);
         let (name, _) = ensure_admission_name(&pool, &app.id, None).await.unwrap();
         assert!(
             !line.contains(&name),
             "record line leaks the admission name"
         );
-        assert!(!line.contains(ADMISSION_NAME_VAR), "{line}");
+        assert!(!line.contains(ADMISSION_NAME_VAR), "{}", line);
 
         // Dropping the staged value removes the staging dir.
         let dir = staged.dir().to_path_buf();
@@ -1305,7 +1320,7 @@ mod tests {
             .await
             .unwrap_err()
         );
-        assert_eq!(err, VOID_UPGRADE_MESSAGE, "{err}");
+        assert_eq!(err, VOID_UPGRADE_MESSAGE, "{}", err);
         assert!(
             db::get_env(&pool, &app.id, ADMISSION_NAME_VAR)
                 .await
@@ -1330,7 +1345,7 @@ mod tests {
             .await
             .unwrap_err()
         );
-        assert!(err.contains("is missing"), "{err}");
+        assert!(err.contains("is missing"), "{}", err);
         std::fs::remove_dir_all(&bundle_path).unwrap();
         std::fs::remove_dir_all(&src).unwrap();
     }
@@ -1427,7 +1442,8 @@ mod tests {
         // The source var records bundle identity verbatim.
         assert!(
             source.starts_with("void 1.5.0 / bundle sha256:"),
-            "{source}"
+            "{}",
+            source
         );
         assert_eq!(source.len(), "void 1.5.0 / bundle sha256:".len() + 64);
         std::fs::remove_dir_all(&bundle_path).unwrap();

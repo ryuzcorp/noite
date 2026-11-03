@@ -857,7 +857,11 @@ mod tests {
             "Settings",
         )
         .unwrap_err();
-        assert!(format!("{err:#}").contains("noite-void-sandbox"), "{err:#}");
+        assert!(
+            format!("{:#}", err).contains("noite-void-sandbox"),
+            "{:#}",
+            err
+        );
         // A tenant service, KV binding or KV id the runner owns — including
         // a second binding aimed at a runner-owned script and either alias
         // of the proxy's mail-idempotency namespace.

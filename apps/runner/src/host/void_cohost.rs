@@ -179,8 +179,9 @@ impl RenderedCohost {
                 .all(|c| matches!(c, Component::Normal(_)));
             if !inside {
                 anyhow::bail!(
-                    "cohosted script `{}` source path {path:?} escapes its project",
+                    "cohosted script `{}` source path {:?} escapes its project",
                     self.script.name,
+                    path
                 );
             }
             let target = dir.join(path);
@@ -659,7 +660,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("noite-cohost-rtesc-{}", crate::models::new_id()));
         let err = evil.write_project(&dir).unwrap_err();
-        assert!(format!("{err:#}").contains("escapes"), "{err:#}");
+        assert!(format!("{:#}", err).contains("escapes"), "{:#}", err);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -947,18 +948,21 @@ echo "deployed $2"
         assert_eq!(stats.cohosted[1].script, "noite-test-cohost");
 
         let calls = fake.invocations();
-        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(calls.len(), 3, "{:?}", calls);
         assert!(
             calls[0].contains("noite-cohost-noite-test-early-"),
-            "{calls:?}"
+            "{:?}",
+            calls
         );
         assert!(
             calls[1].contains("noite-cohost-noite-test-cohost-"),
-            "{calls:?}"
+            "{:?}",
+            calls
         );
         assert!(
             calls[2].contains(&app_dir.to_string_lossy().into_owned()),
-            "{calls:?}"
+            "{:?}",
+            calls
         );
         std::fs::remove_dir_all(&app_dir).unwrap();
     }

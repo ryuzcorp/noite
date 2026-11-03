@@ -1085,7 +1085,7 @@ async fn deploy_inner(
                         &container_platform,
                     )
                     .await
-                    .map_err(|e| e.context(format!("containers[{index}] image")))?;
+                    .map_err(|e| e.context(format!("containers[{}] image", index)))?;
                     plan.set_dockerfile(index, &dockerfile);
                 }
             }
