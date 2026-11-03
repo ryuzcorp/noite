@@ -170,12 +170,10 @@ test("an MCP client creates an app, pushes, follows the deploy, reads it back an
     "list_templates"
   );
 
-  expect(templates.templates.map((template) => template.id)).toContain(
-    "ilha-void"
-  );
-  expect(templates.templates.map((template) => template.id)).toContain(
-    "tanstack-start"
-  );
+  expect(templates.templates.map((template) => template.id)).toEqual([
+    "ilha-void",
+    "agent",
+  ]);
 
   // Push the sample app with the same key, then follow the deploy over MCP.
   const pushedSha = pushAppDir(

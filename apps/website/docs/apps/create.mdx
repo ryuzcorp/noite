@@ -31,12 +31,12 @@ The runner does the clone, so the import needs outbound HTTPS to `github.com` fr
 
 ### Template
 
-Two templates ship with Noite. Each card in the creator lists its stack and links to its source repository:
+Two templates ship with Noite, both built on Void. Each card in the creator lists its stack and links to its source repository:
 
 | Template | What it is |
 | --- | --- |
 | **Ilha + Void** | Ilha pages on Void (Vite), served by celld. |
-| **TanStack Start** | TanStack Start (Vite plus the Cloudflare plugin) serving SSR, with hydration. |
+| **Agent** | A Pi agent harness in a Durable Object, with its tools (or the whole agent) in a Sandbox container. Needs a container engine on the fleet host. |
 
 A template is created through the same import path as a GitHub import, with its history squashed into one commit titled `Initial commit from <owner>/<repo>@<sha>`, authored as you. Both templates build and serve on Noite; after creation the app deploys like any other.
 

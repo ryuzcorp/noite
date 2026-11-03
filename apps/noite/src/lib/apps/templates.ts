@@ -27,15 +27,6 @@ export const TEMPLATES: readonly AppTemplate[] = [
     url: "https://github.com/ryuzcorp/noite-templates",
   },
   {
-    description: "TanStack Start (Vite + the Cloudflare plugin) serving SSR.",
-    id: "tanstack-start",
-    name: "TanStack Start",
-    path: "templates/tanstack-start",
-    ref: "main",
-    stack: ["TanStack Start", "SSR", "Vite"],
-    url: "https://github.com/ryuzcorp/noite-templates",
-  },
-  {
     description:
       "Pi agent harness on Durable Objects (Pi Durable); tools, or the whole agent, in a Sandbox container.",
     id: "agent",

@@ -238,13 +238,11 @@ test("the template picker lists the shipped templates", async ({ page }) => {
   await expect(
     page.getByRole("radio", { name: /Ilha \+ Void/u })
   ).toBeVisible();
-  await expect(
-    page.getByRole("radio", { name: /TanStack Start/u })
-  ).toBeVisible();
+  await expect(page.getByRole("radio", { name: /^Agent/u })).toBeVisible();
   // Picking one prefills Name and Slug from the template (the slug from its id).
-  await page.getByRole("radio", { name: /TanStack Start/u }).check();
-  await expect(page.locator("#create-name")).toHaveValue("TanStack Start");
-  await expect(page.locator("#create-slug")).toHaveValue("tanstack-start");
+  await page.getByRole("radio", { name: /^Agent/u }).check();
+  await expect(page.locator("#create-name")).toHaveValue("Agent");
+  await expect(page.locator("#create-slug")).toHaveValue("agent");
   await page.getByRole("radio", { name: /Ilha \+ Void/u }).check();
   await expect(page.locator("#create-name")).toHaveValue("Ilha + Void");
   await expect(page.locator("#create-slug")).toHaveValue("ilha-void");
