@@ -507,8 +507,10 @@ The docs at https://celld.dev/docs/ are the source of truth. What Noite relies o
   - `exec()` waits for the `start()` before it (it answered 404 no such container).
   - `node:crypto` `scrypt`/`scryptSync` with Node's parameters, defaults and error codes (Void's auth hashes passwords with it).
   - `Response.clone()` tees a streaming body like `Request.clone()` does (Void's ISR clones its streaming SSR response to cache one copy), and both `clone()`s refuse a body already read through its reader, as Fetch does.
-  - Service-binding RPC carries Durable Object stubs both ways (Noite's Void sandbox controller hands the app its sandbox cell this way); RpcTargets, functions and streams still fail with `DataCloneError`.
+  - Service-binding RPC carries Durable Object stubs both ways (Noite's Void sandbox controller hands the app its sandbox cell this way).
+  - RPC stubs (`RpcTarget`s, functions) and byte streams cross isolates on the same node: the Sandbox SDK's process capability and its stdout/stderr streams reach the app through the controller. Not across nodes, and no caller-owned `WritableStream` arguments (`DataCloneError`); stub mints are capped per scope (4096) and per process (65536).
   - Container exec `pty` (`true` or `{ cols, rows }`, default 80x24), `isPty` and `resize(cols, rows)` for the Sandbox SDK's terminal sessions; the engine proxy must allow `Tty` and the resize route first (#134).
+  - A container process's `exitCode` settles even when the request that started it has ended (a Durable Object keeps the process across requests; the sandbox controller hands it out as a stub).
 
 ## Worker code rules
 
