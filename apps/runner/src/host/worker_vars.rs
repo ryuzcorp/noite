@@ -10,10 +10,11 @@
 //! a runner-owned name fails the deploy with the name in the log —
 //! `__VOID_PROXY`, `__PROJECT_ID`, `__VOID_PROXY_TOKEN`,
 //! `__VOID_PROJECT_SLUG`, `__VOID_EMAIL_DOMAIN`, `__VOID_EMAIL_DEPLOYMENT_ID`,
-//! plus `ISR_CACHE` and the `VOID_PROXY_*` proxy namespace on Void apps
-//! (the runner injects that binding there, and the proxy render consumes
-//! those settings there — and only there, so only there are the names
-//! refused). The build/fleet process prefixes (`PORT`, `AWS_*`, `CELLD_*`,
+//! plus `ISR_CACHE`, `MAIL_IDEMPOTENCY` and the `VOID_PROXY_*` proxy
+//! namespace on Void apps (the runner injects those bindings there, and
+//! the proxy render consumes those settings there — and only there, so
+//! only there are the names refused). The build/fleet process prefixes
+//! (`PORT`, `AWS_*`, `CELLD_*`,
 //! `BETTER_AUTH_*`, …) do NOT apply here: they guard the process
 //! environment, and Worker `vars` are a separate namespace no platform
 //! component reads (SPEC documents the per-prefix decision).
@@ -49,8 +50,11 @@ const RESERVED_WORKER_VARS: &[&str] = &[
 
 /// Runner-owned Worker vars the runner injects only on Void apps, so the
 /// name is refused only there: a non-Void app keeps deploying a setting
-/// called `ISR_CACHE` exactly as before.
-const VOID_RESERVED_WORKER_VARS: &[&str] = &["ISR_CACHE"];
+/// called `ISR_CACHE` (or `MAIL_IDEMPOTENCY`) exactly as before. The
+/// mail name is the proxy's KV binding, refused as a var so a tenant
+/// typo can never shadow it — the namespace-id alias itself is refused
+/// in the `kv_namespaces` merge.
+const VOID_RESERVED_WORKER_VARS: &[&str] = &["ISR_CACHE", "MAIL_IDEMPOTENCY"];
 
 /// The proxy's var namespace: on a Void app every `VOID_PROXY_*` name is
 /// refused as an app Worker var (a setting or a config `vars` entry fails
@@ -73,10 +77,10 @@ pub fn worker_var_reserved(name: &str) -> bool {
 }
 
 /// True for the runner-owned names refused on this deploy: the global set,
-/// plus `ISR_CACHE` and the `VOID_PROXY_*` namespace when the deploy is a
-/// Void app's (the runner injects that binding and consumes those
-/// settings there). The Void merge calls this with `true`; the settings
-/// merge stays global.
+/// plus `ISR_CACHE`, `MAIL_IDEMPOTENCY` and the `VOID_PROXY_*` namespace
+/// when the deploy is a Void app's (the runner injects those bindings and
+/// consumes those settings there). The Void merge calls this with `true`;
+/// the settings merge stays global.
 pub fn worker_var_reserved_for(name: &str, void_app: bool) -> bool {
     RESERVED_WORKER_VARS.contains(&name)
         || (void_app && (VOID_RESERVED_WORKER_VARS.contains(&name) || void_proxy_var(name)))
@@ -545,9 +549,11 @@ mod tests {
 
     #[test]
     fn isr_cache_is_reserved_only_on_void_apps() {
-        assert!(!worker_var_reserved("ISR_CACHE"));
-        assert!(worker_var_reserved_for("ISR_CACHE", true));
-        assert!(!worker_var_reserved_for("ISR_CACHE", false));
+        for name in ["ISR_CACHE", "MAIL_IDEMPOTENCY"] {
+            assert!(!worker_var_reserved(name), "{}", name);
+            assert!(worker_var_reserved_for(name, true), "{}", name);
+            assert!(!worker_var_reserved_for(name, false), "{}", name);
+        }
         // A non-Void app still deploys a setting called `ISR_CACHE`.
         let mut config = json!({"name": "a"});
         let stats =

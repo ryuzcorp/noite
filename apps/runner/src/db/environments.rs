@@ -366,8 +366,9 @@ pub async fn expired_workspace_environments(
 }
 
 /// One environment's overrides only (`environment_env` rows), provisioned
-/// rows included: the UI shows the per-fleet token's name like any other,
-/// its value redacted as usual.
+/// rows included: served with values like any other setting
+/// (single-operator premise; the control worker redacts values for the
+/// UI).
 pub async fn list_env_override(
     pool: &SqlitePool,
     environment_id: &str,

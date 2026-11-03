@@ -502,19 +502,22 @@ export const handleAiRun = async (
       method: "POST",
     });
 
-    if (stream && response.body) {
+    // Upstream errors ride the JSON error path even when the caller asked to
+    // stream — piping a 401/429/500 body as 200 SSE would mask auth/quota
+    // failures from the caller.
+    if (!response.ok || !stream || !response.body) {
+      // Endpoint-native shape (documented, not translated to Workers AI shapes).
       return new Response(response.body, {
-        headers: {
-          "cache-control": "no-cache",
-          "content-type": "text/event-stream",
-        },
+        headers: filteredResponseHeaders(response),
+        status: response.status,
       });
     }
 
-    // Endpoint-native shape (documented, not translated to Workers AI shapes).
     return new Response(response.body, {
-      headers: filteredResponseHeaders(response),
-      status: response.status,
+      headers: {
+        "cache-control": "no-cache",
+        "content-type": "text/event-stream",
+      },
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

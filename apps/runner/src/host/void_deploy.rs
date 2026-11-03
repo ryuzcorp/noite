@@ -46,8 +46,9 @@
 //!
 //! Values at rest are plaintext settings rows like any other (`app_env` /
 //! `environment_env`, plus the merged config in `app.deployed_config` and
-//! celld's manifest): the UI redacts them as usual, the deploy log carries
-//! names only, never values.
+//! celld's manifest): served with values like any other setting
+//! (single-operator premise; the control worker redacts values for the
+//! UI), the deploy log carries names only, never values.
 
 use std::path::Path;
 
@@ -93,6 +94,12 @@ pub const AUTH_SECRET_NAME: &str = "BETTER_AUTH_SECRET";
 /// fails the deploy naming it. Today only the proxy binding (reserved
 /// ahead of its injection); [`runner_services`] decides what is injected.
 const RUNNER_BINDINGS: &[&str] = &[PROXY_BINDING];
+
+/// Service targets the runner owns in `services`: a tenant entry pointing
+/// at one fails the deploy naming it. Resolving the same target twice is
+/// a hard celld adoption error, so the runner refuses the alias with a
+/// clear message instead of letting the deploy die there.
+const RUNNER_SERVICES: &[&str] = &[PROXY_SCRIPT_NAME];
 
 /// True when the deploy root came from Void's build output — the one gate
 /// for every injection in this module. `None` (source config, generated
@@ -367,10 +374,10 @@ impl RunnerOwnedStats {
 /// Merge the runner-owned entries into a Void app's config: the identity
 /// vars, the runner-owned `services`, and the `ISR_CACHE` namespace. The
 /// tenant's `services` are preserved; a collision with a runner-owned
-/// binding name — or a script `name`, `vars` entry or setting the runner
-/// owns — fails the deploy naming it. `settings` is the merged user
-/// settings (for the Void-reserved check); `settings_label` says where to
-/// fix them, as in the settings merge.
+/// binding name or service target — or a script `name`, `vars` entry,
+/// KV binding/id or setting the runner owns — fails the deploy naming it.
+/// `settings` is the merged user settings (for the Void-reserved check);
+/// `settings_label` says where to fix them, as in the settings merge.
 pub fn merge_runner_owned(
     config: &mut Value,
     settings: &[(String, String)],
@@ -381,7 +388,8 @@ pub fn merge_runner_owned(
         anyhow::bail!("the Wrangler config is not a JSON object");
     };
     // The settings merge already refused the global reserved names; the
-    // Void-only ones (`ISR_CACHE`) are refused here, where the gate is known.
+    // Void-only ones (`ISR_CACHE`, `MAIL_IDEMPOTENCY`, `VOID_PROXY_*`) are
+    // refused here, where the gate is known.
     if let Some(name) = settings
         .iter()
         .map(|(name, _)| name)
@@ -416,6 +424,14 @@ pub fn merge_runner_owned(
                 anyhow::bail!(
                     "the config's `services` entry `{}` is reserved for the platform (remove it: the runner injects its own)",
                     binding
+                );
+            }
+        }
+        if let Some(service) = entry.get("service").and_then(Value::as_str) {
+            if RUNNER_SERVICES.contains(&service) {
+                anyhow::bail!(
+                    "the config's `services` entry targets `{}`, reserved for the platform's Void proxy script (remove it: the runner injects its own binding)",
+                    service
                 );
             }
         }
@@ -487,6 +503,25 @@ pub fn merge_runner_owned(
                 ISR_CACHE_NAMESPACE_ID
             );
         }
+        // The proxy's mail-idempotency namespace, same rule: celld scopes
+        // a namespace id to the fleet bucket, so a tenant entry with this
+        // binding or id would share the proxy's idempotency records.
+        if entry.get("binding").and_then(Value::as_str)
+            == Some(super::void_proxy::MAIL_IDEMPOTENCY_BINDING)
+        {
+            anyhow::bail!(
+                "the config's `kv_namespaces` entry `{}` is reserved for the platform (remove it: the proxy owns its mail store)",
+                super::void_proxy::MAIL_IDEMPOTENCY_BINDING
+            );
+        }
+        if entry.get("id").and_then(Value::as_str)
+            == Some(super::void_proxy::MAIL_IDEMPOTENCY_NAMESPACE_ID)
+        {
+            anyhow::bail!(
+                "the config's `kv_namespaces` entry uses the namespace id `{}`, reserved for the platform's mail idempotency (use another id)",
+                super::void_proxy::MAIL_IDEMPOTENCY_NAMESPACE_ID
+            );
+        }
     }
     namespaces
         .push(serde_json::json!({"binding": ISR_CACHE_BINDING, "id": ISR_CACHE_NAMESPACE_ID}));
@@ -503,7 +538,9 @@ pub fn merge_runner_owned(
 /// parsed and written back like the settings merge (never following links).
 /// `Ok(None)` when the root has neither file — a TOML-only root, which
 /// `celld deploy` itself refuses. The fleet's token is ensured (minted
-/// once, then reused) and its mint recorded in the stats. `email_domain`
+/// once, then reused) and returned beside the stats — the deploy threads
+/// this value into the proxy render too, so a rotation landing mid-deploy
+/// cannot leave app and proxy holding different tokens. `email_domain`
 /// is the operator's sender domain, injected when configured.
 pub async fn merge_void_root(
     pool: &SqlitePool,
@@ -513,7 +550,7 @@ pub async fn merge_void_root(
     settings: &[(String, String)],
     email_domain: Option<&str>,
     settings_label: &str,
-) -> anyhow::Result<Option<RunnerOwnedStats>> {
+) -> anyhow::Result<Option<(RunnerOwnedStats, String)>> {
     let mut found = None;
     for name in ["wrangler.jsonc", "wrangler.json"] {
         if let Ok(text) = std::fs::read_to_string(deploy_root.join(name)) {
@@ -534,7 +571,7 @@ pub async fn merge_void_root(
         &RunnerOwned {
             project_id: app.id.clone(),
             project_slug: app.slug.clone(),
-            proxy_token,
+            proxy_token: proxy_token.clone(),
             email_domain: email_domain.map(str::to_string),
             services: runner_services(),
         },
@@ -545,7 +582,7 @@ pub async fn merge_void_root(
         &deploy_root.join(label),
         &serde_json::to_string_pretty(&value)?,
     )?;
-    Ok(Some(stats))
+    Ok(Some((stats, proxy_token)))
 }
 
 #[cfg(test)]
@@ -687,22 +724,36 @@ mod tests {
     #[test]
     fn every_runner_owned_name_fails_naming_it() {
         // A setting or config var the runner owns.
-        let err = merge_runner_owned(
-            &mut json!({"name": "a"}),
-            &settings(&[("ISR_CACHE", "x")]),
-            &owned(),
-            "Settings",
-        )
-        .unwrap_err();
-        assert!(format!("{:#}", err).contains("`ISR_CACHE`"), "{:#}", err);
-        let err = merge_runner_owned(
-            &mut json!({"name": "a", "vars": {"ISR_CACHE": "x"}}),
-            &[],
-            &owned(),
-            "Settings",
-        )
-        .unwrap_err();
-        assert!(format!("{:#}", err).contains("vars.ISR_CACHE"), "{:#}", err);
+        for name in ["ISR_CACHE", "MAIL_IDEMPOTENCY"] {
+            let err = merge_runner_owned(
+                &mut json!({"name": "a"}),
+                &settings(&[(name, "x")]),
+                &owned(),
+                "Settings",
+            )
+            .unwrap_err();
+            assert!(
+                format!("{:#}", err).contains(&format!("`{}`", name)),
+                "{}: {:#}",
+                name,
+                err
+            );
+            let mut vars = serde_json::Map::new();
+            vars.insert(name.to_string(), Value::String("x".to_string()));
+            let err = merge_runner_owned(
+                &mut json!({"name": "a", "vars": Value::Object(vars)}),
+                &[],
+                &owned(),
+                "Settings",
+            )
+            .unwrap_err();
+            assert!(
+                format!("{:#}", err).contains(&format!("vars.{}", name)),
+                "{}: {:#}",
+                name,
+                err
+            );
+        }
         // The proxy-only credential names are refused as app Worker vars
         // too: on a Void app they can only mean the proxy render (the
         // deploy splits them out first, so reaching the merge with one is
@@ -744,11 +795,17 @@ mod tests {
             "{:#}",
             err
         );
-        // A tenant service, KV binding or KV id the runner owns.
+        // A tenant service, KV binding or KV id the runner owns — including
+        // a second binding aimed at the proxy script and either alias of
+        // the proxy's mail-idempotency namespace.
         for (config, name) in [
             (
                 json!({"name": "a", "services": [{"binding": "__VOID_PROXY", "service": "x"}]}),
                 "__VOID_PROXY",
+            ),
+            (
+                json!({"name": "a", "services": [{"binding": "P2", "service": "noite-void-proxy"}]}),
+                "noite-void-proxy",
             ),
             (
                 json!({"name": "a", "kv_namespaces": [{"binding": "ISR_CACHE", "id": "other"}]}),
@@ -757,6 +814,14 @@ mod tests {
             (
                 json!({"name": "a", "kv_namespaces": [{"binding": "OTHER", "id": "noite-isr-cache"}]}),
                 "noite-isr-cache",
+            ),
+            (
+                json!({"name": "a", "kv_namespaces": [{"binding": "MAIL_IDEMPOTENCY", "id": "other"}]}),
+                "MAIL_IDEMPOTENCY",
+            ),
+            (
+                json!({"name": "a", "kv_namespaces": [{"binding": "OTHER", "id": "noite-void-proxy-mail"}]}),
+                "noite-void-proxy-mail",
             ),
         ] {
             let err =
@@ -930,6 +995,36 @@ mod tests {
                 .value,
             rotated.value
         );
+    }
+
+    /// The merge returns the token it injected: the deploy threads this one
+    /// value into the proxy render, so a rotation landing mid-deploy cannot
+    /// split app and proxy onto different tokens.
+    #[tokio::test]
+    async fn merge_void_root_returns_the_token_it_injected() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
+        let app = seed(&pool).await;
+        let root =
+            std::env::temp_dir().join(format!("noite-merge-void-root-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("wrangler.json"), r#"{"name": "void-app"}"#).unwrap();
+        let (stats, token) = merge_void_root(&pool, &app, None, &root, &[], None, "Settings")
+            .await
+            .unwrap()
+            .expect("merges the json root");
+        assert!(stats.token_minted);
+        let text = std::fs::read_to_string(root.join("wrangler.json")).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["vars"][PROXY_TOKEN_VAR], token);
+        // A second deploy reuses the same row value (a deploy always
+        // starts from fresh build output).
+        std::fs::write(root.join("wrangler.json"), r#"{"name": "void-app"}"#).unwrap();
+        let (_, again) = merge_void_root(&pool, &app, None, &root, &[], None, "Settings")
+            .await
+            .unwrap()
+            .expect("merges again");
+        assert_eq!(again, token);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// One secret per fleet: production's lives on the app row, a preview's
@@ -1161,7 +1256,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("wrangler.json"), r#"{"name": "stale"}"#).unwrap();
 
-        let stats = merge_void_root(&pool, &app, None, &dir, &[], None, "Settings")
+        let (stats, _) = merge_void_root(&pool, &app, None, &dir, &[], None, "Settings")
             .await
             .unwrap()
             .expect("jsonc found");
@@ -1186,7 +1281,7 @@ mod tests {
             r#"{"name": "blog", /* c */ "vars": {"MODE": "prod"}}"#,
         )
         .unwrap();
-        let stats = merge_void_root(&pool, &app, None, &dir, &[], None, "Settings")
+        let (stats, _) = merge_void_root(&pool, &app, None, &dir, &[], None, "Settings")
             .await
             .unwrap()
             .expect("jsonc found");

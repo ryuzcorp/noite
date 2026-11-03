@@ -341,6 +341,15 @@ export const smtpSubmit = async (
           }
 
           if (line !== null) {
+            // Defense in depth: the caller validates every address before
+            // submission, but no command line may ever carry a line break —
+            // refuse before the write, never after.
+            if (line.includes("\r") || line.includes("\n")) {
+              throw new SmtpError(
+                "smtp command argument contains a line break"
+              );
+            }
+
             await activeWriter.write(encoder.encode(`${line}\r\n`));
           }
 

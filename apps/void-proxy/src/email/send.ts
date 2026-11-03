@@ -70,13 +70,73 @@ const parseAllowlist = (raw: string | undefined): AllowEntry[] => {
   return entries;
 };
 
-const isAllowlisted = (entries: AllowEntry[], recipient: string): boolean => {
+/**
+ * Conservative RFC 5321 mailbox grammar (dot-atom only — no quoted-strings,
+ * no domain literals, no display names): every recipient must parse as one
+ * `local@domain` before admission. Anything outside it (CR/LF/NUL, `<`/`>`,
+ * spaces, a second `@`, quoted local parts) is refused outright, so no
+ * recipient can smuggle an SMTP line past the allowlist or the envelope.
+ */
+const LOCAL_ATOM_RE = /^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+$/u;
+const DOMAIN_LABEL_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/u;
+
+interface ParsedMailbox {
+  address: string;
+  local: string;
+  domain: string;
+}
+
+/** Parse one addr-spec into its `(local, domain)` pair, or `null`. */
+const parseMailbox = (address: string): ParsedMailbox | null => {
+  const at = address.indexOf("@");
+
+  if (at <= 0 || at !== address.lastIndexOf("@") || at === address.length - 1) {
+    return null;
+  }
+
+  const local = address.slice(0, at);
+  const domain = address.slice(at + 1);
+
+  // RFC 5321 §4.5.3.1.3 size caps (the 320-char envelope cap ran first).
+  if (local.length > 64 || domain.length > 255) {
+    return null;
+  }
+
+  const atoms = local.split(".");
+
+  if (
+    atoms.some((atom) => atom.length === 0 || !LOCAL_ATOM_RE.test(atom)) ||
+    domain
+      .split(".")
+      .some(
+        (label) =>
+          label.length === 0 ||
+          label.length > 63 ||
+          !DOMAIN_LABEL_RE.test(label)
+      )
+  ) {
+    return null;
+  }
+
+  return { address, domain, local };
+};
+
+/**
+ * Allowlist admission on the parsed `(local, domain)` pair: exact entries
+ * match the whole address, `@domain` entries match the domain exactly.
+ * Never a string suffix — `sub.example.com` is not `@example.com`, and a
+ * recipient carrying trailing garbage cannot match by suffix.
+ */
+const isAllowlisted = (
+  entries: AllowEntry[],
+  recipient: ParsedMailbox
+): boolean => {
   for (const entry of entries) {
     if (entry.type === "exact") {
-      if (recipient === entry.value) {
+      if (recipient.address === entry.value) {
         return true;
       }
-    } else if (recipient.endsWith(entry.value)) {
+    } else if (recipient.domain === entry.value.slice(1)) {
       return true;
     }
   }
@@ -90,7 +150,8 @@ const emailPayloadDigest = async (
   mimeBase64: string
 ): Promise<string> => {
   // Noite-defined (no interop with Void's digest needed): unit separators can
-  // never appear in the lower-cased ASCII addresses or the base64 body.
+  // never appear in validated addr-specs (a strict grammar subset of
+  // printable ASCII) or the base64 body.
   const material = `${from}${recipients.toSorted().join("")}${mimeBase64}`;
   const hash = await crypto.subtle.digest("SHA-256", encoder.encode(material));
 
@@ -223,18 +284,23 @@ interface ValidatedEmailRequest {
   fromLower: string;
   mimeBase64: string;
   raw: Uint8Array;
-  recipients: string[];
+  recipients: ParsedMailbox[];
   requestId: string;
   operationKey: string;
   senderDomain: string;
   mailKv: MailKvNamespace;
 }
 
-/** Normalize and dedupe recipients, or the refusal to return. */
+/**
+ * Normalize, dedupe and strictly validate recipients, or the refusal to
+ * return. Every address must parse as one addr-spec here — before the
+ * allowlist, the digest and the SMTP session — so a malformed recipient
+ * fails the whole request instead of riding the per-recipient shape.
+ */
 const normalizeEmailRecipients = (
   recipientsRaw: unknown[]
-): { recipients: string[] } | { response: Response } => {
-  const recipients: string[] = [];
+): { recipients: ParsedMailbox[] } | { response: Response } => {
+  const recipients: ParsedMailbox[] = [];
   const seen = new Set<string>();
 
   for (const r of recipientsRaw) {
@@ -259,8 +325,18 @@ const normalizeEmailRecipients = (
       continue;
     }
 
+    // The address is deliberately not echoed back: it just failed the
+    // grammar, so it may carry control bytes or SMTP metacharacters.
+    const mailbox = parseMailbox(lower);
+
+    if (!mailbox) {
+      return {
+        response: emailError("INVALID_TO", "invalid recipient address", 400),
+      };
+    }
+
     seen.add(lower);
-    recipients.push(lower);
+    recipients.push(mailbox);
   }
 
   if (recipients.length === 0) {
@@ -635,7 +711,7 @@ export const handleEmailSend = async (
 
   const digest = await emailPayloadDigest(
     validated.fromLower,
-    validated.recipients,
+    validated.recipients.map((r) => r.address),
     validated.mimeBase64
   );
 
@@ -659,13 +735,16 @@ export const handleEmailSend = async (
   }
 
   // Admission (replaces Void's SQL admission): operator allowlist of exact
-  // addresses and/or `@domain` suffixes. Empty allowlist = fail closed.
-  // Non-admitted recipients ride the partial-deliveries shape so one bad
-  // address does not fail admitted ones.
+  // addresses and/or `@domain` exact-domain entries. Empty allowlist = fail
+  // closed. Non-admitted recipients ride the partial-deliveries shape so one
+  // unlisted address does not fail admitted ones (malformed addresses never
+  // reach here — normalization refused the whole request).
   const allowlist = parseAllowlist(env.VOID_PROXY_EMAIL_ALLOWLIST);
 
   const admitted = new Set(
-    validated.recipients.filter((r) => isAllowlisted(allowlist, r))
+    validated.recipients
+      .filter((r) => isAllowlisted(allowlist, r))
+      .map((r) => r.address)
   );
 
   const submission = await submitAdmittedEmail(
@@ -686,7 +765,7 @@ export const handleEmailSend = async (
   // them as a set, but ordered output is easier to read and test).
   const deliveries: RecipientResult[] = [];
 
-  for (const recipient of validated.recipients) {
+  for (const { address: recipient } of validated.recipients) {
     if (!admitted.has(recipient)) {
       deliveries.push({
         error: {

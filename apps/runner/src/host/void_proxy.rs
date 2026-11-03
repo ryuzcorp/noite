@@ -29,13 +29,14 @@
 //!
 //! Proxy-only settings (`VOID_PROXY_SMTP_USERNAME`,
 //! `VOID_PROXY_SMTP_PASSWORD`, `VOID_PROXY_AI_API_KEY`) are ordinary
-//! Settings rows (listed, edited and redacted like any other, inheritable
-//! and per-environment overridable) that [`split_proxy_settings`] pulls
-//! out of the Worker-vars input before the merges — they only ever reach
-//! the proxy render, never the app's vars or any process env (the names
-//! are [`crate::host::worker_vars`]-reserved on Void apps and
-//! process-reserved everywhere). No operator-wide secret ever lands in
-//! proxy vars: SMTP/AI credentials are per-app by construction.
+//! Settings rows (served like any other setting — single-operator premise,
+//! the control worker redacts values for the UI — inheritable and
+//! per-environment overridable) that [`split_proxy_settings`] pulls out of
+//! the Worker-vars input before the merges — they only ever reach the
+//! proxy render, never the app's vars or any process env (the names are
+//! [`crate::host::worker_vars`]-reserved on Void apps and process-reserved
+//! everywhere). No operator-wide secret ever lands in proxy vars: SMTP/AI
+//! credentials are per-app by construction.
 
 use serde_json::{json, Value};
 
@@ -253,6 +254,7 @@ mod tests {
             ai_enabled: true,
             ai_models: r#"{"@cf/m": {"endpoint": "https://ai.example.com/v1", "model": "m"}}"#
                 .to_string(),
+            ai_allow_plaintext: false,
         }
     }
 

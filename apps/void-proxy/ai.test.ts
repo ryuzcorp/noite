@@ -871,6 +871,43 @@ describe("/ai/run", () => {
     }
   });
 
+  test("stream:true with an upstream error returns the error, not 200 SSE", async () => {
+    const upstream = startUpstream(() =>
+      Response.json(
+        { error: { message: "bad key", type: "auth" } },
+        { status: 401 }
+      )
+    );
+
+    try {
+      const env = aiEnv({ VOID_PROXY_AI_MODELS: JSON.stringify(MODELS) });
+      const { handleFetch } = await import("./worker.ts");
+
+      const res = await handleFetch(
+        new Request("https://proxy/ai/run", {
+          body: JSON.stringify({
+            aiToken: "test-token-0123456789abcdef",
+            inputs: { messages: [], stream: true },
+            model: "@cf/meta/llama",
+            projectId: "proj_test123",
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        }),
+        env,
+        { fetchUpstream: localFetch(upstream.url) }
+      );
+
+      expect(res.status).toBe(401);
+      expect(res.headers.get("content-type")).not.toBe("text/event-stream");
+      expect(await res.json()).toEqual({
+        error: { message: "bad key", type: "auth" },
+      });
+    } finally {
+      upstream.close();
+    }
+  });
+
   test("upstream errors pass through endpoint-native", async () => {
     const upstream = startUpstream(() =>
       Response.json(

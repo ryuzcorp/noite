@@ -971,9 +971,11 @@ async fn deploy_inner(
     // runner-owned `services` and the `ISR_CACHE` namespace, merged into
     // the same config file the settings merge just wrote. Void apps only.
     // A TOML-only root merges nothing (`celld deploy` itself refuses it):
-    // the flag below keeps such a doomed deploy from running its cohosted
-    // scripts first.
-    let void_root_merged = if void_app {
+    // the `None` below keeps such a doomed deploy from running its
+    // cohosted scripts first. The ensured token rides along so the proxy
+    // render below reuses this deploy's value instead of re-reading the
+    // row (a rotation landing between the two would split app and proxy).
+    let void_proxy_token: Option<String> = if void_app {
         let merged = void_deploy::merge_void_root(
             pool,
             app,
@@ -985,14 +987,14 @@ async fn deploy_inner(
             settings_label,
         )
         .await?;
-        if let Some(stats) = &merged {
+        if let Some((stats, _)) = &merged {
             progress
                 .log(DeployStatus::Deploying, &stats.log_line(settings_label))
                 .await?;
         }
-        merged.is_some()
+        merged.map(|(_, token)| token)
     } else {
-        false
+        None
     };
 
     // celld pulls container images for linux/amd64 unless told otherwise;
@@ -1042,19 +1044,16 @@ async fn deploy_inner(
     // The ordered fleet deploy (SPEC, Void platform proxy): the cohosted
     // scripts first (each skipped when unchanged), the tenant app last
     // with its one infra retry. A Void app with a merged root renders its
-    // proxy here — the token is the row the merge above ensured (reused,
-    // never reminted) — while any other app deploys exactly one script,
+    // proxy here — with the token the merge above ensured, read once for
+    // the whole deploy — while any other app deploys exactly one script,
     // as before. The shared invocation fails the deploy on a non-UTF-8
     // deploy root (work-dir-derived paths are operator-influenced)
     // instead of panicking the deploy task.
-    let cohosted = if void_root_merged {
-        let environment_id = target.environment().map(|env| env.id.as_str());
-        let (proxy_token, _) =
-            void_deploy::ensure_proxy_token(pool, &app.id, environment_id).await?;
+    let cohosted = if let Some(proxy_token) = &void_proxy_token {
         vec![void_proxy::render_proxy(&void_proxy::ProxyRenderCtx {
             app_id: &app.id,
             app_slug: &app.slug,
-            proxy_token: &proxy_token,
+            proxy_token,
             operator: &cfg.void_proxy,
             settings: &proxy_settings,
         })]

@@ -19,10 +19,10 @@ pub const SOURCE_VOID_PROXY_TOKEN: &str = "void-proxy-token";
 /// vault. Names are validated at the API layer; values capped at 32 KiB.
 ///
 /// `source` marks runner-provisioned rows (`auth-default`,
-/// `void-proxy-token`); user rows carry `''`. The listing returns every row —
-/// the UI shows provisioned names like any other, values redacted as usual —
-/// while each deploy input filters on it (see [`worker_settings`] and
-/// [`tenant_env`]).
+/// `void-proxy-token`); user rows carry `''`. The listing serves every row
+/// with its value (single-operator premise; the control worker redacts
+/// values for the UI), while each deploy input filters on the marker (see
+/// [`worker_settings`] and [`tenant_env`]).
 pub async fn list_env(pool: &SqlitePool, app_id: &str) -> sqlx::Result<Vec<AppEnv>> {
     sqlx::query_as::<_, AppEnv>(
         "SELECT app_id, name, value, updated_at, source FROM app_env WHERE app_id = ? ORDER BY name",
@@ -252,8 +252,8 @@ mod tests {
 
     /// Provisioned rows route by marker: the auth secret rides the settings
     /// merges, the proxy token rides the runner-owned merge only, and
-    /// neither reaches process env. The listing keeps every row (the UI
-    /// shows the names, values redacted as usual).
+    /// neither reaches process env. The listing keeps every row with its
+    /// value (the control worker redacts values for the UI).
     #[tokio::test]
     async fn provisioned_rows_route_by_source_marker() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");

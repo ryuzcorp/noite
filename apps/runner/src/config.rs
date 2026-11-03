@@ -174,7 +174,8 @@ pub fn parse_do_not_track(raw: Option<&str>) -> bool {
         .is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-/// Strict opt-in flag (`NOITE_VOID_AI_ENABLED`, `NOITE_VOID_SMTP_ALLOW_PLAINTEXT`):
+/// Strict opt-in flag (`NOITE_VOID_AI_ENABLED`, `NOITE_VOID_SMTP_ALLOW_PLAINTEXT`,
+/// `NOITE_VOID_AI_ALLOW_PLAINTEXT`):
 /// unset or blank is off, `1`/`true`/`on` (case-insensitive) is on,
 /// `0`/`false`/`off` is explicitly off, and anything else records a boot
 /// problem naming the var — a typo'd `yes` must fail loudly, never arm a
@@ -258,6 +259,12 @@ pub struct VoidProxyConfig {
     /// Model map JSON for `/ai/run` (`NOITE_VOID_AI_MODELS`):
     /// `{ "<model>": { "endpoint", "model" } }`. Validated at boot.
     pub ai_models: String,
+    /// Plaintext AI endpoints allowed (`NOITE_VOID_AI_ALLOW_PLAINTEXT=1`):
+    /// without it every `http://` model endpoint fails the boot, and with
+    /// it only loopback endpoints boot — the per-app key travels in the
+    /// upstream `Authorization` header, so plaintext past loopback would
+    /// leak it on the wire.
+    pub ai_allow_plaintext: bool,
 }
 
 impl VoidProxyConfig {
@@ -313,6 +320,7 @@ impl VoidProxyConfig {
             ai_models: env::var("NOITE_VOID_AI_MODELS")
                 .map(|v| v.trim().to_string())
                 .unwrap_or_default(),
+            ai_allow_plaintext: env_flag("NOITE_VOID_AI_ALLOW_PLAINTEXT", problems),
         }
     }
 
@@ -321,7 +329,9 @@ impl VoidProxyConfig {
     /// otherwise fail only at send time.
     fn validate(&self, problems: &mut Vec<String>) {
         if !self.email_domain.is_empty()
-            && (self.email_domain.contains([' ', '\t', '\n', '@', '/'])
+            && (self
+                .email_domain
+                .contains([' ', '\t', '\n', '\r', '@', '/'])
                 || !self.email_domain.contains('.'))
         {
             problems.push(format!(
@@ -329,14 +339,14 @@ impl VoidProxyConfig {
                 self.email_domain
             ));
         }
-        if self.smtp_host.contains([' ', '\t', '\n']) {
+        if self.smtp_host.contains([' ', '\t', '\n', '\r']) {
             problems.push(format!(
                 "NOITE_VOID_SMTP_HOST must be a hostname or IP, got {:?}",
                 self.smtp_host
             ));
         }
         for entry in &self.email_allowlist {
-            let ok = !entry.contains([' ', '\t', '\n'])
+            let ok = !entry.contains([' ', '\t', '\n', '\r'])
                 && (entry
                     .strip_prefix('@')
                     .is_some_and(|rest| !rest.is_empty() && !rest.contains('@'))
@@ -378,6 +388,24 @@ impl VoidProxyConfig {
                                 model,
                                 endpoint.map_or("nothing".to_string(), |u| format!("{:?}", u))
                             ));
+                        }
+                        // Plaintext AI endpoints carry the per-app key in an
+                        // `Authorization` header, so `http` needs the
+                        // explicit allowance — and even then only loopback
+                        // sidecars boot (anything past loopback would leak
+                        // the key on the wire).
+                        if let Some(url) = endpoint.filter(|url| url.starts_with("http://")) {
+                            if !self.ai_allow_plaintext {
+                                problems.push(format!(
+                                    "NOITE_VOID_AI_MODELS[{:?}] uses a plaintext http endpoint; set NOITE_VOID_AI_ALLOW_PLAINTEXT=1 to allow http loopback endpoints",
+                                    model
+                                ));
+                            } else if !url_host(url).is_some_and(|host| is_loopback_host(&host)) {
+                                problems.push(format!(
+                                    "NOITE_VOID_AI_MODELS[{:?}] uses a plaintext http endpoint to a non-loopback host (http endpoints must be loopback sidecars)",
+                                    model
+                                ));
+                            }
                         }
                         if target.is_none_or(|m| m.trim().is_empty()) {
                             problems.push(format!(
@@ -421,6 +449,17 @@ pub fn is_localhost_domain(domain: &str) -> bool {
 /// literal. Such an install never reports (a dev box, the e2e lane, or a LAN
 /// name); an sslip.io install resolves to an IP but is a real public host, so
 /// it does report.
+/// Whether a URL host is loopback: an IP literal in `127/8` or `::1`, or
+/// the `localhost` family. Plaintext AI endpoints are only ever allowed
+/// here — a LAN name still crosses the wire in cleartext.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim().trim_matches('.');
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    is_localhost_domain(host)
+}
+
 pub fn is_local_domain(domain: &str) -> bool {
     let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
     if domain.is_empty() {
@@ -2051,6 +2090,7 @@ mod tests {
                 );
                 assert!(proxy.ai_enabled);
                 assert!(proxy.ai_models.contains("@cf/meta/llama"));
+                assert!(!proxy.ai_allow_plaintext);
             },
         );
     }
@@ -2058,7 +2098,8 @@ mod tests {
     /// Every malformed proxy value refuses the boot naming the var: modes,
     /// ports, flags, domain/host shapes, allowlist entries and the model
     /// map — plus the cross-field rules (host without domain, plain
-    /// without the allowance, models without the AI flag).
+    /// without the allowance, models without the AI flag, `http` AI
+    /// endpoints without the allowance or past loopback).
     #[test]
     fn void_proxy_misconfiguration_fails_boot_naming_the_var() {
         let models = r#"{"@cf/m": {"endpoint": "https://ai.example.com/v1", "model": "m"}}"#;
@@ -2079,10 +2120,27 @@ mod tests {
                 &[("NOITE_VOID_EMAIL_DOMAIN", "user@example.com")],
                 "NOITE_VOID_EMAIL_DOMAIN",
             ),
+            // A CR would inject an SMTP line through `EHLO ${domain}`.
+            // (Interior: the parse trims the value's edges first.)
+            (
+                &[("NOITE_VOID_EMAIL_DOMAIN", "mail.exam\rple.com")],
+                "NOITE_VOID_EMAIL_DOMAIN",
+            ),
+            (
+                &[("NOITE_VOID_EMAIL_ALLOWLIST", "ops@exam\rple.com")],
+                "NOITE_VOID_EMAIL_ALLOWLIST",
+            ),
             (
                 &[
                     ("NOITE_VOID_EMAIL_DOMAIN", "mail.example.com"),
                     ("NOITE_VOID_SMTP_HOST", "smtp example.com"),
+                ],
+                "NOITE_VOID_SMTP_HOST",
+            ),
+            (
+                &[
+                    ("NOITE_VOID_EMAIL_DOMAIN", "mail.example.com"),
+                    ("NOITE_VOID_SMTP_HOST", "smtp.exam\rple.com"),
                 ],
                 "NOITE_VOID_SMTP_HOST",
             ),
@@ -2125,6 +2183,40 @@ mod tests {
                 )],
                 "NOITE_VOID_AI_MODELS",
             ),
+            // Plaintext AI endpoints: refused without the allowance, and
+            // past loopback even with it (a LAN name still crosses the
+            // wire in cleartext).
+            (
+                &[(
+                    "NOITE_VOID_AI_MODELS",
+                    r#"{"m": {"endpoint": "http://127.0.0.1:8080/v1", "model": "m"}}"#,
+                )],
+                "NOITE_VOID_AI_ALLOW_PLAINTEXT",
+            ),
+            (
+                &[("NOITE_VOID_AI_ALLOW_PLAINTEXT", "yes")],
+                "NOITE_VOID_AI_ALLOW_PLAINTEXT",
+            ),
+            (
+                &[
+                    ("NOITE_VOID_AI_ALLOW_PLAINTEXT", "1"),
+                    (
+                        "NOITE_VOID_AI_MODELS",
+                        r#"{"m": {"endpoint": "http://ai.example.com/v1", "model": "m"}}"#,
+                    ),
+                ],
+                "NOITE_VOID_AI_MODELS",
+            ),
+            (
+                &[
+                    ("NOITE_VOID_AI_ALLOW_PLAINTEXT", "1"),
+                    (
+                        "NOITE_VOID_AI_MODELS",
+                        r#"{"m": {"endpoint": "http://nas.local:8080/v1", "model": "m"}}"#,
+                    ),
+                ],
+                "NOITE_VOID_AI_MODELS",
+            ),
             (&[("NOITE_VOID_AI_MODELS", models)], "NOITE_VOID_AI_ENABLED"),
         ];
         for (vars, var) in cases {
@@ -2147,6 +2239,22 @@ mod tests {
                 assert_eq!(cfg.void_proxy.smtp_mode, VoidSmtpMode::Plain);
                 assert!(cfg.void_proxy.smtp_allow_plaintext);
                 assert!(!cfg.void_proxy.ai_enabled);
+            },
+        );
+        // `http` AI endpoints boot only with the allowance on loopback
+        // sidecars (`127/8`, `localhost`).
+        with_env(
+            &[
+                ("NOITE_VOID_AI_ENABLED", "1"),
+                ("NOITE_VOID_AI_ALLOW_PLAINTEXT", "1"),
+                (
+                    "NOITE_VOID_AI_MODELS",
+                    r#"{"a": {"endpoint": "http://127.0.0.1:8080/v1", "model": "m"}, "b": {"endpoint": "http://localhost:11434/v1", "model": "m"}}"#,
+                ),
+            ],
+            || {
+                let cfg = Config::from_env().expect("http loopback+allowance must boot");
+                assert!(cfg.void_proxy.ai_allow_plaintext);
             },
         );
     }

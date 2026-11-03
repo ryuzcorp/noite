@@ -3,6 +3,7 @@
 /* oxlint-disable anti-slop/no-unsafe-dictionary-type, anti-slop/no-known-value-widening, anti-slop/require-safety-comment-for-type-assertion -- tests shuttle untyped JSON bodies and assert on parsed shapes */
 import { describe, expect, test } from "bun:test";
 
+import { smtpSubmit } from "./src/email/smtp.ts";
 import type { Env, ProxySocket } from "./src/env.ts";
 import {
   bunSocketConnect,
@@ -465,6 +466,135 @@ describe("email validation", () => {
   });
 });
 
+describe("email recipient validation", () => {
+  // The review's H1 exploit: passes a suffix allowlist, then injects SMTP
+  // lines through `RCPT TO:<…>`. Refused before admission, digest or dial.
+  const EXPLOIT =
+    "x@example.org>\r\nRCPT TO:<victim@evil.com>\r\n#@example.org";
+
+  test("the CRLF injection recipient is a 400 INVALID_TO and never dials", async () => {
+    const { status, json } = await post(
+      "/email/send",
+      emailBody({ recipients: [EXPLOIT] }),
+      emailEnv(new FakeKv()),
+      noDial
+    );
+
+    expect(status).toBe(400);
+    expect(json).toEqual({
+      error: { code: "INVALID_TO", message: "invalid recipient address" },
+      ok: false,
+    });
+  });
+
+  test.each([
+    ["LF-only injection", "x@example.org\nRCPT TO:<victim@evil.com>"],
+    ["CR-only injection", "x@example.org\rRCPT TO:<victim@evil.com>"],
+    ["DATA injection", "x@example.org>\r\nDATA\r\n#@example.org"],
+    [
+      "MAIL FROM injection",
+      "x@example.org>\r\nMAIL FROM:<a@b>\r\n#@example.org",
+    ],
+    ["NUL byte", "x@exam\0ple.org"],
+    ["angle brackets", "x<@example.org>"],
+    ["display name", "Evil <x@example.org>"],
+    ["space in local part", "x y@example.org"],
+    ["second @", "x@example.org@evil.com"],
+    ["missing local part", "@example.org"],
+    ["missing domain", "x@"],
+    ["no @ at all", "not-an-address"],
+    ["digest separator 0x1F", "x\u001F@example.org"],
+    ["quoted local part", '"x y"@example.org'],
+    ["quoted pair", '"x\\"y"@example.org'],
+    ["leading dot", ".x@example.org"],
+    ["trailing dot", "x.@example.org"],
+    ["consecutive dots", "x..y@example.org"],
+    ["domain literal", "x@[127.0.0.1]"],
+    ["empty domain label", "x@example..org"],
+    ["leading hyphen label", "x@-example.org"],
+    ["overlong local part", `${"l".repeat(65)}@example.org`],
+    ["overlong domain", `x@${"d".repeat(64)}.org`],
+    ["tab in domain", "x@exam\tple.org"],
+  ])("malformed recipient %p is a 400 INVALID_TO", async (_name, recipient) => {
+    const { status, json } = await post(
+      "/email/send",
+      emailBody({ recipients: ["ok@example.org", recipient] }),
+      emailEnv(new FakeKv()),
+      noDial
+    );
+
+    expect(status).toBe(400);
+    expect(json).toEqual({
+      error: { code: "INVALID_TO", message: "invalid recipient address" },
+      ok: false,
+    });
+  });
+
+  test.each([
+    "a+b@example.org",
+    "a.b.c@example.org",
+    "o'brien@example.org",
+    "a!b#c$d%e&f'g*h-i/j=k?l^m_n`o{p|q}r~s@example.org",
+    "x@mail.sub.example.org",
+    "x@localhost",
+  ])("well-formed recipient %p passes validation", async (recipient) => {
+    const { status, json } = await post(
+      "/email/send",
+      emailBody({ recipients: [recipient] }),
+      emailEnv(new FakeKv(), {
+        VOID_PROXY_EMAIL_ALLOWLIST: `@${recipient.split("@")[1]}`,
+      }),
+      {
+        connectSocket: cannedSocketConnect(
+          new CannedSocket([
+            "220 fake ready",
+            "250 fake",
+            "250 2.1.0 ok",
+            "250 2.1.5 ok",
+            "354 go",
+            "250 queued",
+          ])
+        ),
+      }
+    );
+
+    expect(status).toBe(200);
+    expect(json).toMatchObject({ ok: true });
+  });
+
+  test("malformed recipients never reach the SMTP wire", async () => {
+    const server = startFakeSmtpServer();
+
+    try {
+      const env = emailEnv(new FakeKv(), {
+        VOID_PROXY_SMTP_HOST: "127.0.0.1",
+        VOID_PROXY_SMTP_PORT: String(server.port),
+      });
+
+      for (const recipient of [
+        EXPLOIT,
+        "x@example.org\nRCPT TO:<victim@evil.com>",
+        "x@example.org>\r\nDATA\r\n#@example.org",
+      ]) {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- sequential cases, each asserted before the next
+        const { status } = await post(
+          "/email/send",
+          emailBody({ recipients: [recipient] }),
+          env,
+          { connectSocket: bunSocketConnect() }
+        );
+
+        expect(status).toBe(400);
+      }
+
+      expect(server.connections).toBe(0);
+      expect(server.commands).toHaveLength(0);
+    } finally {
+      server.stop();
+    }
+  });
+});
+
 describe("email admission", () => {
   test("empty allowlist fails closed with per-recipient rejections", async () => {
     const kv = new FakeKv();
@@ -558,6 +688,75 @@ describe("email admission", () => {
     expect(wire).toContain("RCPT TO:<a@example.org>");
     expect(wire).toContain("RCPT TO:<vip@example.com>");
     expect(wire).not.toContain("nope@example.net");
+  });
+
+  test("@domain matches the parsed domain exactly: case folds, subdomains refuse", async () => {
+    const kv = new FakeKv();
+
+    const shared: CannedSocketShared = {
+      closed: false,
+      startTlsCalls: [],
+      writes: [],
+    };
+
+    const socket = new CannedSocket(
+      [
+        "220 fake ready",
+        "250 fake greets",
+        "250 2.1.0 ok",
+        "250 2.1.5 ok",
+        "250 2.1.5 ok",
+        "250 2.1.5 ok",
+        "354 go",
+        "250 2.0.0 queued",
+      ],
+      shared
+    );
+
+    const env = emailEnv(kv, {
+      VOID_PROXY_EMAIL_ALLOWLIST: "Vip@Example.COM, @example.org",
+    });
+
+    const { status, json } = await post(
+      "/email/send",
+      emailBody({
+        recipients: [
+          "A@EXAMPLE.ORG",
+          "a+tag@example.org",
+          "VIP@example.com",
+          "a@sub.example.org",
+          "a@example.org.evil.com",
+          "a@notexample.org",
+        ],
+      }),
+      env,
+      { connectSocket: cannedSocketConnect(socket) }
+    );
+
+    expect(status).toBe(200);
+
+    const body = json as {
+      ok: boolean;
+      deliveries: { recipient: string; ok: boolean }[];
+    };
+
+    expect(body.ok).toBe(false);
+    expect(body.deliveries.map((d) => [d.recipient, d.ok])).toEqual([
+      ["a@example.org", true],
+      ["a+tag@example.org", true],
+      ["vip@example.com", true],
+      ["a@sub.example.org", false],
+      ["a@example.org.evil.com", false],
+      ["a@notexample.org", false],
+    ]);
+    // Only the parsed-domain matches reached RCPT.
+    const wire = shared.writes.join("");
+    expect(wire).toContain("RCPT TO:<a@example.org>");
+    expect(wire).toContain("RCPT TO:<a+tag@example.org>");
+    expect(wire).toContain("RCPT TO:<vip@example.com>");
+    expect(wire).not.toContain("sub.example.org");
+    expect(wire).not.toContain("evil.com");
+    expect(wire).not.toContain("notexample.org");
   });
 });
 
@@ -1110,6 +1309,56 @@ describe("SMTP submission (canned sockets)", () => {
     expect(json).toMatchObject({ ok: false });
     expect(shared.writes.join("")).not.toContain("DATA");
     expect(shared.writes.join("")).toContain("QUIT");
+  });
+
+  test("SMTP client refuses CR/LF command arguments before any write", async () => {
+    for (const [name, from, recipients] of [
+      [
+        "RCPT injection",
+        TEST_FROM,
+        ["x@example.org>\r\nRCPT TO:<victim@evil.com>"],
+      ],
+      [
+        "MAIL FROM injection",
+        "myapp@evil.com>\r\nRCPT TO:<victim@evil.com>\r\n#@mail.example.com",
+        ["a@example.org"],
+      ],
+    ] as [string, string, string[]][]) {
+      const shared: CannedSocketShared = {
+        closed: false,
+        startTlsCalls: [],
+        writes: [],
+      };
+
+      const socket = new CannedSocket(
+        ["220 fake ready", "250 fake", "250 2.1.0 ok"],
+        shared
+      );
+
+      // oxlint-disable-next-line eslint/no-await-in-loop -- sequential cases, each asserted before the next
+      const outcomes = await smtpSubmit({
+        commandTimeoutMs: 2000,
+        connect: cannedSocketConnect(socket),
+        connectTimeoutMs: 2000,
+        ehloName: "mail.example.com",
+        from,
+        host: "fake",
+        mode: "plain",
+        password: "",
+        port: 25,
+        raw: new TextEncoder().encode("From: x\r\n\r\nbody\r\n"),
+        recipients,
+        username: null,
+      });
+
+      const wire = shared.writes.join("");
+      expect(wire, name).not.toContain("victim@evil.com");
+      expect(wire, name).not.toContain("RCPT TO:<victim");
+
+      for (const recipient of recipients) {
+        expect(outcomes.get(recipient)?.ok, name).toBe(false);
+      }
+    }
   });
 
   test("MAIL FROM rejection fails every recipient with the reply", async () => {

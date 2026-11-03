@@ -309,8 +309,10 @@ impl CohostOutcome {
 /// unless the hash matches the stored one, in which case the script is
 /// skipped. A failure fails the deploy at once, with no retry: the
 /// sources are the runner's own, so a failure is dead infra (the next
-/// deploy starts over) or a runner bug (loud, with the kept project dir
-/// in the error for debugging).
+/// deploy starts over) or a runner bug (loud, names only in the error).
+/// The temp project holds the fleet's secrets in plaintext, so it is
+/// owner-only from birth and removed on every path — success or failure —
+/// and failed deploys leave nothing on runner disk.
 pub async fn ensure_cohosted(
     pool: &SqlitePool,
     app_id: &str,
@@ -337,15 +339,25 @@ pub async fn ensure_cohosted(
             render.script.name,
             crate::models::new_id()
         ));
+        // Owner-only from birth: the rendered config carries the fleet's
+        // token and proxy credentials in plaintext.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(&dir)?;
+        }
         render.write_project(&dir)?;
-        celld_deploy(celld, &dir, None).await.map_err(|e| {
-            anyhow::anyhow!(
-                "cohosted script `{}` deploy failed (project kept at {}): {:#}",
+        if let Err(e) = celld_deploy(celld, &dir, None).await {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(anyhow::anyhow!(
+                "cohosted script `{}` deploy failed: {:#}",
                 render.script.name,
-                dir.display(),
                 e
-            )
-        })?;
+            ));
+        }
         let _ = std::fs::remove_dir_all(&dir);
         db::set_cohost_hash(pool, app_id, environment_id, render.script.name, &hash).await?;
         outcomes.push(CohostOutcome {
@@ -920,8 +932,8 @@ echo "deployed $2"
     }
 
     /// A failed cohosted deploy fails the deploy before the app moves the
-    /// pointer: no app invocation, no stored hash, the project kept for
-    /// debugging — and the next deploy starts over.
+    /// pointer: no app invocation, no stored hash, the secret-bearing temp
+    /// project removed — and the next deploy starts over.
     #[tokio::test]
     async fn cohost_failure_fails_before_the_app() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
@@ -960,19 +972,15 @@ echo "deployed $2"
             .unwrap_err();
         let text = format!("{:#}", err);
         assert!(text.contains("noite-test-cohost"), "{}", text);
-        assert!(text.contains("project kept at"), "{}", text);
+        assert!(!text.contains("project kept at"), "{}", text);
         assert_eq!(fake.invocations().len(), 1);
-        // The kept project really is there, with the rendered config.
+        // The temp project is gone on the failure path too.
         let project = fake.invocations()[0]
             .split(' ')
             .nth(1)
             .expect("deploy argv")
             .to_string();
-        assert!(
-            Path::new(&project).join("wrangler.json").is_file(),
-            "{}",
-            project
-        );
+        assert!(!Path::new(&project).exists(), "{}", project);
         // Nothing stored: the next deploy tries the cohosted script again.
         assert_eq!(
             db::get_cohost_hash(&pool, &app.id, None, "noite-test-cohost")
@@ -980,7 +988,6 @@ echo "deployed $2"
                 .unwrap(),
             None
         );
-        std::fs::remove_dir_all(&project).unwrap();
         std::fs::remove_dir_all(&app_dir).unwrap();
     }
 }
