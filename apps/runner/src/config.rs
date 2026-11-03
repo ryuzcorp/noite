@@ -1654,6 +1654,7 @@ mod tests {
                 "NOITE_VOID_EMAIL_ALLOWLIST",
                 "NOITE_VOID_AI_ENABLED",
                 "NOITE_VOID_AI_MODELS",
+                "NOITE_VOID_AI_ALLOW_PLAINTEXT",
             ])
         {
             saved.push((key, env::var(key).ok()));

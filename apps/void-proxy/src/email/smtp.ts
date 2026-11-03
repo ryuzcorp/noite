@@ -156,25 +156,53 @@ const base64Encode = (bytes: Uint8Array): string => {
   return btoa(binary);
 };
 
+const DOT = 0x2e;
+const CR = 0x0d;
+const LF = 0x0a;
+
 /**
  * Dot-stuff raw MIME for the DATA phase: every line starting with `.` gains an
- * extra dot, lines are normalized to CRLF, and the output ends with CRLF so
- * the terminating `.` line can follow.
+ * extra dot, line ends are normalized to CRLF, and the output ends with CRLF so
+ * the terminating `.` line can follow. Works on bytes so 8bit content (UTF-8
+ * bodies, RFC 6532 headers) reaches the server byte for byte.
  */
 const dotStuffForSmtp = (raw: Uint8Array): Uint8Array => {
-  const text = new TextDecoder("latin1").decode(raw);
-  const lines = text.split("\n");
-  const stuffed: string[] = [];
+  // Worst case every byte doubles (LF -> CRLF, `.` -> `..`), plus a final CRLF.
+  const out = new Uint8Array(raw.byteLength * 2 + 2);
+  let length = 0;
+  let lineStart = true;
 
-  for (let line of lines) {
-    if (line.endsWith("\r")) {
-      line = line.slice(0, -1);
+  const push = (byte: number): void => {
+    out[length] = byte;
+    length += 1;
+  };
+
+  for (const [index, byte] of raw.entries()) {
+    if (byte === CR && raw[index + 1] === LF) {
+      continue;
     }
 
-    stuffed.push(line.startsWith(".") ? `.${line}` : line);
+    if (byte === LF) {
+      push(CR);
+      push(LF);
+      lineStart = true;
+      continue;
+    }
+
+    if (lineStart && byte === DOT) {
+      push(DOT);
+    }
+
+    push(byte);
+    lineStart = false;
   }
 
-  return encoder.encode(`${stuffed.join("\r\n")}\r\n`);
+  if (!lineStart || length === 0) {
+    push(CR);
+    push(LF);
+  }
+
+  return out.subarray(0, length);
 };
 
 export interface SmtpSubmitInput {

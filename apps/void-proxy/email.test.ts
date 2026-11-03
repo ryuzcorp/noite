@@ -959,6 +959,53 @@ describe("SMTP submission (canned sockets)", () => {
     expect(shared.closed).toBe(true);
   });
 
+  test("8bit content reaches the server byte for byte, dot-stuffed", async () => {
+    const kv = new FakeKv();
+
+    const shared: CannedSocketShared = {
+      closed: false,
+      startTlsCalls: [],
+      writes: [],
+    };
+
+    const transcript = [
+      "220 fake ready",
+      "250 fake greets you",
+      "250 2.1.0 ok",
+      "250 2.1.5 ok",
+      "354 go ahead",
+      "250 2.0.0 queued",
+    ];
+
+    // UTF-8 with bytes in 0x80–0x9F (`€` is E2 82 AC) and 4-byte sequences;
+    // LF-only line ends inside a CRLF message (buildMime ends it with CRLF, so
+    // no blank line may be added before the terminator).
+    const body = "grüße € 😀\n.ünïcode dot\nend";
+    const mime = buildMime(TEST_FROM, ["Subject: résumé"], body);
+
+    const { status } = await post(
+      "/email/send",
+      emailBody({
+        mimeBase64: mimeBase64(mime),
+        recipients: ["a@example.org"],
+      }),
+      emailEnv(kv),
+      {
+        connectSocket: cannedSocketConnect(
+          new CannedSocket(transcript, shared),
+          []
+        ),
+      }
+    );
+
+    expect(status).toBe(200);
+    const wire = shared.writes.join("");
+    expect(wire).toContain("Subject: résumé\r\n");
+    expect(wire).toContain(
+      "grüße € 😀\r\n..ünïcode dot\r\nend\r\n.\r\nQUIT\r\n"
+    );
+  });
+
   test("AUTH PLAIN with initial response", async () => {
     const kv = new FakeKv();
 
