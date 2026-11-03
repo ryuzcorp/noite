@@ -583,8 +583,10 @@ impl StagedSandbox {
     /// version + sha256, and the protocol. Names and versions only — the
     /// admission name never reaches the log.
     pub fn log_line(&self) -> String {
+        // The app spec is tenant text (package.json), so it is quoted: a
+        // spec with a newline cannot forge a deploy-log line.
         format!(
-            "void: managed sandbox: controller staged (app void {}, bundle {}; protocol {})\n",
+            "void: managed sandbox: controller staged (app void {:?}, bundle {}; protocol {})\n",
             self.app_void, self.source, self.protocol
         )
     }
@@ -1238,9 +1240,10 @@ mod tests {
         let app = seed(&pool).await;
         let (bundle_path, _) = bundle_dir("stage-bundle", b"stage-bundle-bytes");
         let src = scratch("stage-src");
+        // A spec the major-version check accepts, carrying a forged line.
         std::fs::write(
             src.join("package.json"),
-            r#"{"dependencies": {"void": "^1.5.0"}}"#,
+            r#"{"dependencies": {"void": "^1.5.0\nERROR: build failed"}}"#,
         )
         .unwrap();
         let pinned = format!("registry.example/x@sha256:{}", "d4".repeat(32));
@@ -1272,7 +1275,12 @@ mod tests {
         assert_eq!(written["containers"][0]["max_instances"], 4);
 
         let line = staged.log_line();
-        assert!(line.contains("app void ^1.5.0"), "{}", line);
+        assert!(
+            line.contains(r#"app void "^1.5.0\nERROR: build failed""#),
+            "{}",
+            line
+        );
+        assert_eq!(line.matches('\n').count(), 1, "{}", line);
         assert!(
             line.contains("bundle void 1.5.0 / bundle sha256:"),
             "{}",

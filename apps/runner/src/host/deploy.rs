@@ -1137,11 +1137,18 @@ async fn deploy_inner(
             let planned = sandbox_plan
                 .as_ref()
                 .context("staged sandbox controller declares no containers")?;
-            let image_digest = match &sandbox_pinned {
+            // Blocking tree I/O (the build context walk): off the async
+            // workers, as the other blocking reads in this pipeline.
+            let image_digest = match sandbox_pinned.clone() {
                 None => None,
                 Some((request, pinned)) => {
-                    let context = crate::host::container_image::context_digest(&src_dir, request)?;
-                    Some(void_sandbox::dockerfile_image_digest(pinned, &context)?)
+                    let src = src_dir.clone();
+                    let context = tokio::task::spawn_blocking(move || {
+                        crate::host::container_image::context_digest(&src, &request)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("build context digest failed: {}", e))??;
+                    Some(void_sandbox::dockerfile_image_digest(&pinned, &context)?)
                 }
             };
             scripts.push(staged.render(planned.value(), image_digest)?);

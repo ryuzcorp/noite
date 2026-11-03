@@ -315,6 +315,10 @@ describe("abort maps to kill", () => {
       return process;
     };
 
+    // A live lease first: direct exec always passes the heartbeat gate.
+    await controller.invoke("exec", [["echo", "hi"]]);
+    const before = seen.length;
+
     // SAFETY: white-box call into the protected override to pin the
     // already-aborted branch (a listener alone would never fire post-abort).
     const execProcess = controller as unknown as {
@@ -329,8 +333,8 @@ describe("abort maps to kill", () => {
     });
 
     await expect(finished.exitCode).resolves.toBe(0);
-    expect(seen).toHaveLength(1);
-    expect(seen[0]?.kills).toEqual([undefined]);
+    expect(seen).toHaveLength(before + 1);
+    expect(seen.at(-1)?.kills).toEqual([undefined]);
   });
 
   test("capability kill reaches the process and settles the exit", async () => {
@@ -721,6 +725,25 @@ describe("direct exec heartbeat", () => {
     await expect(direct.execProcess(["id"])).rejects.toThrow(
       "VOID_SANDBOX_unavailable"
     );
+    expect(container.execCalls).toHaveLength(0);
+  });
+
+  test("a caller-supplied aborted signal does not skip the gate", async () => {
+    const { container, controller } = rig();
+
+    // SAFETY: white-box call into the runtime-visible method (see above);
+    // the options arrive from the tenant, so a plain `{ aborted: true }`
+    // object stands in for a real signal.
+    const direct = controller as unknown as {
+      execProcess: (
+        argv: string[],
+        options: { signal: { aborted: boolean } }
+      ) => Promise<{ exitCode: Promise<number> }>;
+    };
+
+    await expect(
+      direct.execProcess(["id"], { signal: { aborted: true } })
+    ).rejects.toThrow("VOID_SANDBOX_unavailable");
     expect(container.execCalls).toHaveLength(0);
   });
 });

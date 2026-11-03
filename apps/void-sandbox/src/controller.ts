@@ -487,10 +487,10 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
    * works.
    *
    * Noite: direct exec is tenant-reachable, so it heartbeats exactly like an
-   * `invoke` op — a denied lease cannot be outlived past one interval. An
-   * already-aborted signal keeps its fast path (the process is killed on
-   * arrival, so no work happens); setup-time execs run under the setup's own
-   * admission verdicts (see `#guardExec`).
+   * `invoke` op — a denied lease cannot be outlived past one interval. The
+   * guard runs on every call: the options come from the caller, so an
+   * `{ aborted: true }` look-alike must not skip admission. Setup-time
+   * execs run under the setup's own admission verdicts (see `#guardExec`).
    */
   protected override async execProcess(
     argv: string[],
@@ -498,9 +498,7 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
   ): Promise<BaseExecProcess> {
     const { signal, ...nativeOptions } = options;
 
-    if (signal?.aborted !== true) {
-      await this.#guardExec();
-    }
+    await this.#guardExec();
 
     const process = await this.#native.exec(argv, { ...nativeOptions });
     // The celld process satisfies the base wire contract — `pid`, stdio,
