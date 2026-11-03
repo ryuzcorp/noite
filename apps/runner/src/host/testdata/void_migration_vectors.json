@@ -1,0 +1,333 @@
+{
+  "classifierVersion": 1,
+  "plans": {
+    "single": {
+      "input": "CREATE TABLE users (\n  id INTEGER PRIMARY KEY,\n  email TEXT NOT NULL\n);\n",
+      "plan": {
+        "kind": "single-statement",
+        "stability": "stable",
+        "classifierVersion": 1,
+        "dialect": "sqlite",
+        "name": "single.sql",
+        "sqlHash": "sha256:58999436ff444fb41aca9b7686914d1c7aea490e571aed188b480c57480b10ca",
+        "planHash": "sha256:1574a37b875166543a778b00049010f8caa11c886fcb6de7fe06a9694e443419"
+      }
+    },
+    "breakpoints": {
+      "input": "CREATE TABLE `queue_results` (\n\t`id` text PRIMARY KEY NOT NULL,\n\t`body` text NOT NULL\n);\n--> statement-breakpoint\nCREATE INDEX `queue_idx` ON `queue_results` (`id`);\n",
+      "plan": {
+        "kind": "breakpoint-framed",
+        "stability": "stable",
+        "statements": [
+          "CREATE TABLE `queue_results` (\n\t`id` text PRIMARY KEY NOT NULL,\n\t`body` text NOT NULL\n);",
+          "CREATE INDEX `queue_idx` ON `queue_results` (`id`);"
+        ],
+        "classifierVersion": 1,
+        "dialect": "sqlite",
+        "name": "breakpoints.sql",
+        "sqlHash": "sha256:3175a8f457e380051517e757d2dbdd5a7c249245d0d31457d4efccf31994d866",
+        "planHash": "sha256:326452fcc28d28194c4e1ab4bc1282d2c9957f23902e88366486577262d343aa"
+      }
+    },
+    "legacy_split": {
+      "input": "CREATE TABLE a (id INTEGER);\nCREATE TABLE b (id INTEGER);\n",
+      "plan": {
+        "kind": "legacy-unsplit-multi-statement",
+        "stability": "legacy",
+        "allowLegacy": false,
+        "classifierVersion": 1,
+        "dialect": "sqlite",
+        "name": "legacy_split.sql",
+        "sqlHash": "sha256:6e4b346052b866dd0f6018bd2ae094bbe3f6b9e2bd777dca67799c1a873fe3c4",
+        "planHash": "sha256:862bfbe7ce28e12799949f76b8ad0272af6cb996accdbd9689646f51a69a59e3"
+      }
+    },
+    "trigger": {
+      "input": "CREATE TRIGGER users_updated AFTER UPDATE ON users\nBEGIN\n  UPDATE users SET updated_at = 1 WHERE id = NEW.id;\nEND;\n",
+      "plan": {
+        "kind": "legacy-unsplit-multi-statement",
+        "stability": "legacy",
+        "allowLegacy": false,
+        "classifierVersion": 1,
+        "dialect": "sqlite",
+        "name": "trigger.sql",
+        "sqlHash": "sha256:dccf6b23adacd2e5d2d6af6f9d277cd37807d08adf1d1dcf0aa9c8f3871bc91c",
+        "planHash": "sha256:a033ea878cdc0f323a20c1c70c2f536cb83582d2e57ff3751fa5ed053e9ea36b",
+        "warnings": [
+          "Add a `--> statement-breakpoint` line after each complete SQL statement in migration trigger.sql."
+        ]
+      }
+    },
+    "crlf_bom": {
+      "input": "﻿CREATE TABLE a (id INTEGER);\r\nCREATE TABLE b (id INTEGER);\r\n",
+      "plan": {
+        "kind": "legacy-unsplit-multi-statement",
+        "stability": "legacy",
+        "allowLegacy": false,
+        "classifierVersion": 1,
+        "dialect": "sqlite",
+        "name": "crlf_bom.sql",
+        "sqlHash": "sha256:6e4b346052b866dd0f6018bd2ae094bbe3f6b9e2bd777dca67799c1a873fe3c4",
+        "planHash": "sha256:eab4b13dcef5d4b07ff667dbfe1f2e04db43dd53e4d1c364e082743b2486414b"
+      }
+    },
+    "string_semi": {
+      "input": "INSERT INTO t (v) VALUES ('a;b');\n",
+      "plan": {
+        "kind": "single-statement",
+        "stability": "stable",
+        "classifierVersion": 1,
+        "dialect": "sqlite",
+        "name": "string_semi.sql",
+        "sqlHash": "sha256:7ef9aa56851569d22874ba7b9414befb0dc5ffc3b5bcc7eb6f6603acb339e205",
+        "planHash": "sha256:5e98ebe64bc2a19fdcf4852c543390c95a877817266897442afc2517c76da929"
+      }
+    },
+    "string_breakpoint": {
+      "input": "INSERT INTO t (v) VALUES ('--> statement-breakpoint');\nCREATE TABLE u (id INTEGER);\n",
+      "plan": {
+        "kind": "legacy-unsplit-multi-statement",
+        "stability": "legacy",
+        "allowLegacy": false,
+        "classifierVersion": 1,
+        "dialect": "sqlite",
+        "name": "string_breakpoint.sql",
+        "sqlHash": "sha256:c765570d5a7ab5d4b949922e9817ed57b545aebb1bbe35afd8ed64a724bb0cc7",
+        "planHash": "sha256:a8dff941c39dc8069b8ac6d0bcbc098542925afcd6d4b779b2af178d9e1267fd"
+      }
+    },
+    "comments": {
+      "input": "-- leading comment\nCREATE TABLE a (id INTEGER); /* trailing */\n",
+      "plan": {
+        "kind": "single-statement",
+        "stability": "stable",
+        "classifierVersion": 1,
+        "dialect": "sqlite",
+        "name": "comments.sql",
+        "sqlHash": "sha256:211d24366d0b47c284994de7328a09a2b36c196e9db47fef93d4231521a982ed",
+        "planHash": "sha256:ccc8760c1209ef63582416efcf167a7762bdafd5432068988f1f90e4265274f8"
+      }
+    },
+    "txn": {
+      "input": "BEGIN;\nCREATE TABLE a (id INTEGER);\nCOMMIT;\n",
+      "error": "Migration txn.sql contains BEGIN; Void owns the stable D1 transaction boundary."
+    },
+    "empty_breakpoints": {
+      "input": "--> statement-breakpoint\n",
+      "error": "Migration empty_breakpoints.sql has statement breakpoints but no SQL statements."
+    },
+    "txn_commit_lower": {
+      "input": "CREATE TABLE a (id INTEGER);\ncommit;\n",
+      "error": "Migration txn_commit_lower.sql contains COMMIT; Void owns the stable D1 transaction boundary."
+    },
+    "txn_savepoint": {
+      "input": "SAVEPOINT sp1;\nCREATE TABLE a (id INTEGER);\n",
+      "error": "Migration txn_savepoint.sql contains SAVEPOINT; Void owns the stable D1 transaction boundary."
+    },
+    "begin_deferred": {
+      "input": "begin deferred;\nCREATE TABLE a (id INTEGER);\n",
+      "error": "Migration begin_deferred.sql contains BEGIN DEFERRED; Void owns the stable D1 transaction boundary."
+    },
+    "begin_in_word": {
+      "input": "CREATE TABLE beginner (id INTEGER);\n",
+      "plan": {
+        "kind": "single-statement",
+        "stability": "stable",
+        "classifierVersion": 1,
+        "dialect": "sqlite",
+        "name": "begin_in_word.sql",
+        "sqlHash": "sha256:3077f0e351246cc8bdbf8fe297bcd029084ba786f0f44f27fe03befbd18efd78",
+        "planHash": "sha256:05c29bdfbb54932f6039a402b748eabca3f9165a343098179e9920c004317997"
+      }
+    },
+    "begin_suffix_nospace": {
+      "input": "BEGINDEFERRED;\n",
+      "plan": {
+        "kind": "single-statement",
+        "stability": "stable",
+        "classifierVersion": 1,
+        "dialect": "sqlite",
+        "name": "begin_suffix_nospace.sql",
+        "sqlHash": "sha256:d0c8d2e30325db207b9aec0e16ccc8717be0e1bf47bf75383be483333e7a43c6",
+        "planHash": "sha256:818ea2b785f08fc5b7c6b8921aaa02550a40e4e1e60f65b2a781557485ab9480"
+      }
+    },
+    "whitespace_begin": {
+      "input": "  \n\t BEGIN;\n",
+      "error": "Migration whitespace_begin.sql contains BEGIN; Void owns the stable D1 transaction boundary."
+    },
+    "rollback_after_stmt": {
+      "input": "CREATE TABLE a (id INTEGER); ROLLBACK;\n",
+      "error": "Migration rollback_after_stmt.sql contains ROLLBACK; Void owns the stable D1 transaction boundary."
+    },
+    "txn_in_string": {
+      "input": "INSERT INTO t (v) VALUES ('COMMIT');\n",
+      "plan": {
+        "kind": "single-statement",
+        "stability": "stable",
+        "classifierVersion": 1,
+        "dialect": "sqlite",
+        "name": "txn_in_string.sql",
+        "sqlHash": "sha256:cec2d3b8193b06af8971d392be7db3679472b8088d3a678c8e0ba0cb7ce21ab0",
+        "planHash": "sha256:90c0d374265542ca9497e2610c3edfe166b20d66c4271d7b9c0f4dffa464638c"
+      }
+    },
+    "txn_in_comment": {
+      "input": "-- ROLLBACK\nCREATE TABLE a (id INTEGER);\n",
+      "plan": {
+        "kind": "single-statement",
+        "stability": "stable",
+        "classifierVersion": 1,
+        "dialect": "sqlite",
+        "name": "txn_in_comment.sql",
+        "sqlHash": "sha256:ba63974ba27b67623024ab969331f96db3265751fd7fea493d7c6b5ec57717e5",
+        "planHash": "sha256:9571b5261d12301cd3483bc37555f1325296f7c498ba63bd60d7af116de308f8"
+      }
+    },
+    "only_comments": {
+      "input": "-- just a comment\n",
+      "plan": {
+        "kind": "legacy-unsplit-multi-statement",
+        "stability": "legacy",
+        "allowLegacy": false,
+        "classifierVersion": 1,
+        "dialect": "sqlite",
+        "name": "only_comments.sql",
+        "sqlHash": "sha256:bb0ac12f4338585d6fd59f33a98009a4add16fca19637bd6982c0cf63514e1a5",
+        "planHash": "sha256:79d53a29037cb08f59d51764588121355fcf4721760f917ffa9cb8b363aa0594"
+      }
+    },
+    "semicolons_only": {
+      "input": ";;;\n",
+      "plan": {
+        "kind": "legacy-unsplit-multi-statement",
+        "stability": "legacy",
+        "allowLegacy": false,
+        "classifierVersion": 1,
+        "dialect": "sqlite",
+        "name": "semicolons_only.sql",
+        "sqlHash": "sha256:fd523dd115d80b194d401c042e0fc33d2dc1442611975fd6a22954e2f0762cb1",
+        "planHash": "sha256:3e38f4be4a1d1b7f9481bec627b51a69e088d141d27d9b9af917e3a7770649bc"
+      }
+    },
+    "empty_file": {
+      "input": "",
+      "plan": {
+        "kind": "legacy-unsplit-multi-statement",
+        "stability": "legacy",
+        "allowLegacy": false,
+        "classifierVersion": 1,
+        "dialect": "sqlite",
+        "name": "empty_file.sql",
+        "sqlHash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "planHash": "sha256:bef9d46129e284b4c0296e1457ba9bb9cf26e0d2f62fda572d9e10ee006ebf88"
+      }
+    },
+    "trigger_lower": {
+      "input": "create trigger trg after insert on a begin update a set id = 1; end;\n",
+      "plan": {
+        "kind": "legacy-unsplit-multi-statement",
+        "stability": "legacy",
+        "allowLegacy": false,
+        "classifierVersion": 1,
+        "dialect": "sqlite",
+        "name": "trigger_lower.sql",
+        "sqlHash": "sha256:f9aefda3dade02dcff7fa3d56d46bd18fb384f12c585d3f3571457416be376d5",
+        "planHash": "sha256:0f3721351aa7cdefb33837b52a3f0865f6353d63c7dc958b6098714ad63f3bdf",
+        "warnings": [
+          "Add a `--> statement-breakpoint` line after each complete SQL statement in migration trigger_lower.sql."
+        ]
+      }
+    }
+  },
+  "bundles": {
+    "two": {
+      "classifierVersion": 1,
+      "destructiveValidation": "passed",
+      "migrationListHash": "sha256:537f02c728a072d1ad97bfff1aa8042d0123bfee1bc0ca472aaf2d3492e23b19",
+      "plans": [
+        {
+          "kind": "single-statement",
+          "stability": "stable",
+          "classifierVersion": 1,
+          "dialect": "sqlite",
+          "name": "0001_init.sql",
+          "sqlHash": "sha256:58999436ff444fb41aca9b7686914d1c7aea490e571aed188b480c57480b10ca",
+          "planHash": "sha256:890c5633ef7c050f277b5f2dd20371e13c355d280db4b25cdc74cdedfd284c8f"
+        },
+        {
+          "kind": "breakpoint-framed",
+          "stability": "stable",
+          "statements": [
+            "CREATE TABLE `queue_results` (\n\t`id` text PRIMARY KEY NOT NULL,\n\t`body` text NOT NULL\n);",
+            "CREATE INDEX `queue_idx` ON `queue_results` (`id`);"
+          ],
+          "classifierVersion": 1,
+          "dialect": "sqlite",
+          "name": "0002_queue.sql",
+          "sqlHash": "sha256:3175a8f457e380051517e757d2dbdd5a7c249245d0d31457d4efccf31994d866",
+          "planHash": "sha256:26324b24429a06dc83a36868de7ea9b6922cae466a16d66217a656420a525aff"
+        }
+      ],
+      "protocolVersion": 2
+    },
+    "empty": {
+      "classifierVersion": 1,
+      "destructiveValidation": "passed",
+      "migrationListHash": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "plans": [],
+      "protocolVersion": 2
+    },
+    "mixed": {
+      "classifierVersion": 1,
+      "destructiveValidation": "passed",
+      "migrationListHash": "sha256:455af3356a17689e73d3eeebe2242e36a54f20d2b0354e35f6e1d5948d378d50",
+      "plans": [
+        {
+          "kind": "single-statement",
+          "stability": "stable",
+          "classifierVersion": 1,
+          "dialect": "sqlite",
+          "name": "0001_init.sql",
+          "sqlHash": "sha256:58999436ff444fb41aca9b7686914d1c7aea490e571aed188b480c57480b10ca",
+          "planHash": "sha256:890c5633ef7c050f277b5f2dd20371e13c355d280db4b25cdc74cdedfd284c8f"
+        },
+        {
+          "kind": "breakpoint-framed",
+          "stability": "stable",
+          "statements": [
+            "CREATE TABLE `queue_results` (\n\t`id` text PRIMARY KEY NOT NULL,\n\t`body` text NOT NULL\n);",
+            "CREATE INDEX `queue_idx` ON `queue_results` (`id`);"
+          ],
+          "classifierVersion": 1,
+          "dialect": "sqlite",
+          "name": "0002_queue.sql",
+          "sqlHash": "sha256:3175a8f457e380051517e757d2dbdd5a7c249245d0d31457d4efccf31994d866",
+          "planHash": "sha256:26324b24429a06dc83a36868de7ea9b6922cae466a16d66217a656420a525aff"
+        },
+        {
+          "kind": "legacy-unsplit-multi-statement",
+          "stability": "legacy",
+          "allowLegacy": false,
+          "classifierVersion": 1,
+          "dialect": "sqlite",
+          "name": "0003_trigger.sql",
+          "sqlHash": "sha256:dccf6b23adacd2e5d2d6af6f9d277cd37807d08adf1d1dcf0aa9c8f3871bc91c",
+          "planHash": "sha256:1444e77c8bfc0c90d059d3feb58d42fbf4a0ca6c1f6bacc3a5ae41b006e6e4c2",
+          "warnings": [
+            "Add a `--> statement-breakpoint` line after each complete SQL statement in migration 0003_trigger.sql."
+          ]
+        }
+      ],
+      "protocolVersion": 2
+    }
+  },
+  "collector": {
+    "sorted_names": ["0001_first.sql", "0002_second.sql"],
+    "sql_by_name": {
+      "0001_first.sql": "CREATE TABLE b (id INTEGER);\n",
+      "0002_second.sql": "CREATE TABLE a (id INTEGER);\n"
+    },
+    "missing_dir": []
+  }
+}

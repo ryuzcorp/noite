@@ -66,6 +66,16 @@ It runs with `sh -c` in the project with your app's env vars, and is killed afte
 In multi-tenant mode (`NOITE_TENANCY=multi`, the default off a `localhost` base) release commands are **skipped**, with a line in the deploy log: running them would need the install's root storage keys. Migrate from the app itself at startup, or ask the operator to run `single`. See [Tenancy](/self-hosting/tenancy#what-multi-does-and-does-not-promise-alpha).
 :::
 
+## Database migrations (Void apps)
+
+Void apps keep their schema in `db/migrations/*.sql`, and every deploy applies what is pending — no `release` command needed. After the new Worker is up, the runner calls its migration endpoints with the fleet's own token, checks the Worker's migration list against the pushed tree, and only then marks the deploy success. The log reports `migrate: applied N, skipped M` with the file names; a redeploy skips what is already applied, and a failed migration fails the deploy with `migration <name> failed: <error>`.
+
+Migrations are **forward-only**: rolling back the code never un-applies them. There is one more ordering caveat: the new Worker starts serving a moment *before* its migrations run, so keep migrations backward-compatible with the previous release (add tables/columns first, remove them in a later deploy). Each preview environment migrates its own database — preview data never touches production.
+
+Unlike `release` (where a failure keeps the old deployment serving), a failed `migrate` leaves the **new** Worker serving: traffic already switched at reload, so the new code serves a half-migrated schema while the deploy reads Failed. Fix the migration and redeploy — applied migrations are skipped. The step is bounded: worker responses past 4 MiB fail the deploy, warning and name lists log the first 20 plus a count, and per-request timeouts (10 s probes, 300 s executions, 30 s reconciles) cap the worst case at about 11.5 minutes (15.5 for older runtimes on the legacy endpoint).
+
+Postgres/MySQL apps are refused at this step: their migrations need a Hyperdrive binding Noite does not provide, and deploying them would serve an empty database. Move the app to D1 (`database.dialect: "sqlite"` in `void.json`).
+
 ## Deploy from CI
 
 `@noitenow/cli` pushes a prebuilt `dist/` plus `wrangler.jsonc` as a synthetic fast-forward commit — no server build, `push` role suffices, never force-pushes.
@@ -101,6 +111,7 @@ In Actions it writes `url=` + `sha=` to `$GITHUB_OUTPUT` and posts (or updates, 
 3. The runner picks the config to deploy: the build's output when it produced one, else the source config, else one it generates ([Which config deploys](/apps/build#which-config-deploys)).
 4. Optional `release` command (e.g. migrations) runs. A failed release keeps the old deployment serving.
 5. The config is stripped of runner-only keys (`release`, `build`), Settings merge into Worker `vars` (Void apps also get their runner-owned identity vars, services and `ISR_CACHE`), then `celld deploy` ships the fleet; a new fleet spawns or the existing one gets `POST /reload`, whose outcome the runner checks — a refused adoption fails the deploy with celld's error instead of leaving the old generation serving under a Success row.
+6. Void apps with D1 migrations get a `migrate` step: the runner drives the new Worker's migration endpoints before the deploy is marked success ([Database migrations](#database-migrations-void-apps)). Unlike `release`, a failed `migrate` leaves the new Worker serving (see above).
 
 The **Deployments** tab shows status per push with a build-log pane: one `▸ step: command` line per step and its output tail, and on failure the step that failed. Deploy logs keep a 64 KB tail.
 
