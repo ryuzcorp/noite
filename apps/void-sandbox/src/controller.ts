@@ -26,6 +26,10 @@
  *   celld grows PTY support.
  * - Noite: `fetch()` carries the activity guard, so direct port fetches
  *   refresh the idle deadline like `invoke` does.
+ * - Noite: direct `execProcess()` heartbeats like `invoke` (setup-time execs
+ *   excepted), so a denied lease cannot be outlived past one interval.
+ * - Noite: `beforeStart()` serializes per cell, so a superseded start's
+ *   reservation is released instead of orphaned.
  * - Noite: no `SandboxCapability` wrapper. The worker returns this DO's stub
  *   directly (the DO-stub shape); see `worker.ts`. Every method on this class
  *   is therefore tenant-reachable — keep them tenant-safe, and keep the
@@ -205,6 +209,10 @@ const bounded = async <T>(operation: Promise<T>): Promise<T> => {
   }
 };
 
+const settleStart = (): void => {
+  // The tail only sequences; each waiter already owns its own outcome.
+};
+
 /** Platform-owned lifecycle; no application code is loaded in this Worker. */
 export class SandboxController extends SandboxContainer<ControllerEnv> {
   #finishing: Promise<void> | undefined;
@@ -212,6 +220,7 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
   #activityReady: Promise<void> | undefined;
   #busy = 0;
   #generation: ProcessCompletion = {};
+  #startTail: Promise<void> = Promise.resolve();
 
   /** Noite: the unwrapped celld container. Only `execProcess` bypasses the wrapper. */
   get #native(): NoiteContainer {
@@ -467,6 +476,12 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
    * Noite: celld `exec()` takes no `signal` and no `pty`, so both are dropped
    * before the call and an abort kills the process instead. The returned
    * process carries no PTY state, so the wire `isPty` stays false.
+   *
+   * Noite: direct exec is tenant-reachable, so it heartbeats exactly like an
+   * `invoke` op — a denied lease cannot be outlived past one interval. An
+   * already-aborted signal keeps its fast path (the process is killed on
+   * arrival, so no work happens); setup-time execs run under the setup's own
+   * admission verdicts (see `#guardExec`).
    */
   protected override async execProcess(
     argv: string[],
@@ -474,6 +489,11 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
   ): Promise<BaseExecProcess> {
     const { signal, pty: _droppedPty, ...nativeOptions } = options;
     void _droppedPty;
+
+    if (signal?.aborted !== true) {
+      await this.#guardExec();
+    }
+
     const process = await this.#native.exec(argv, { ...nativeOptions });
     // The celld process satisfies the base wire contract — `pid`, stdio,
     // `exitCode`, `kill` and `output` — with `isPty` unset (read as false)
@@ -505,6 +525,29 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
     void process.exitCode.then(detach, detach);
 
     return wire;
+  }
+
+  /**
+   * Noite: heartbeat gate for direct `execProcess` (and thereby
+   * `initializationOutput` and `initialize`). Execs inside a setup — an
+   * `ensureRunning` setup (`starting`) or a direct `setup` (lease pending)
+   * — skip: the setup's own `beforeStart`/`started`/`beforeUse` verdicts own
+   * admission there, and a pending lease would deny. Anything else runs
+   * `beforeUse`, which fails closed without a running lease and destroys on
+   * a denied heartbeat, exactly like `invoke`.
+   */
+  async #guardExec(): Promise<void> {
+    if (this.starting) {
+      return;
+    }
+
+    const lease = await this.ctx.storage.get<Lease>(LEASE_KEY);
+
+    if (lease?.phase === "pending") {
+      return;
+    }
+
+    await this.beforeUse();
   }
 
   /**
@@ -562,36 +605,55 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
     }
   }
 
+  /**
+   * Noite: serialize the lease-reserve sequence per cell. The `invoke` path
+   * already funnels through one `#setup`, but direct `beforeStart` calls
+   * would interleave: two starts could both mint generations, race at
+   * `reserve`, and leave the winner's admission entry with no controller
+   * lease to ever stop it. Queued, a second start cleanly supersedes the
+   * first (`stopped` releases its reservation before the new one mints).
+   */
+  #serializeStart<T>(operation: () => Promise<T>): Promise<T> {
+    // oxlint-disable-next-line promise/prefer-await-to-then -- the queue links continuations; awaiting here would serialize the caller instead of the work.
+    const result = this.#startTail.then(operation);
+    // oxlint-disable-next-line promise/prefer-await-to-then -- see above: the tail must advance without blocking this call.
+    this.#startTail = result.then(settleStart, settleStart);
+
+    return result;
+  }
+
   protected override async beforeStart(): Promise<void> {
-    // Noite: no `instanceType` assignment — celld sizes from config, and the
-    // `container` wrapper strips the `instance` start arg.
-    let lease = await this.ctx.storage.get<Lease>(LEASE_KEY);
+    return await this.#serializeStart(async () => {
+      // Noite: no `instanceType` assignment — celld sizes from config, and the
+      // `container` wrapper strips the `instance` start arg.
+      let lease = await this.ctx.storage.get<Lease>(LEASE_KEY);
 
-    if (lease?.phase === "running" && this.container.running) {
-      await this.#control("heartbeat", lease);
-      await this.#arm();
+      if (lease?.phase === "running" && this.container.running) {
+        await this.#control("heartbeat", lease);
+        await this.#arm();
 
-      return;
-    }
+        return;
+      }
 
-    if (lease !== undefined) {
+      if (lease !== undefined) {
+        if (this.container.running) {
+          await this.container.destroy();
+        }
+
+        await this.stopped();
+      }
+
+      // A container with no durable admission record must never be adopted.
       if (this.container.running) {
         await this.container.destroy();
       }
 
-      await this.stopped();
-    }
-
-    // A container with no durable admission record must never be adopted.
-    if (this.container.running) {
-      await this.container.destroy();
-    }
-
-    this.#generation = {};
-    lease = { generation: crypto.randomUUID(), phase: "pending" };
-    await this.ctx.storage.put(LEASE_KEY, lease);
-    await this.#arm();
-    await this.#control("reserve", lease);
+      this.#generation = {};
+      lease = { generation: crypto.randomUUID(), phase: "pending" };
+      await this.ctx.storage.put(LEASE_KEY, lease);
+      await this.#arm();
+      await this.#control("reserve", lease);
+    });
   }
 
   protected override async afterStart(): Promise<void> {

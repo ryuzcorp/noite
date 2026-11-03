@@ -49,9 +49,11 @@ const RECONCILE_INTERVAL_MS = 60_000;
 export const MIN_ADMISSION_NAME_LENGTH = 32;
 
 /**
- * Parse `__VOID_SANDBOX_MAX_CONCURRENT`. Only a plain non-negative integer
- * counts; anything else (including trailing junk like `4x`) falls back to
- * the default. `0` is a valid cap that admits nothing.
+ * Parse `__VOID_SANDBOX_MAX_CONCURRENT`. A missing var takes the default
+ * (the runner always renders it); a present-but-unreadable value fails
+ * closed to `0` and admits nothing. Only a plain non-negative integer
+ * counts — anything else, including trailing junk like `4x`, is unreadable.
+ * `0` is a valid cap that admits nothing.
  */
 export const readAdmissionCap = (raw?: string): number => {
   if (raw === undefined) {
@@ -61,7 +63,7 @@ export const readAdmissionCap = (raw?: string): number => {
   const text = raw.trim();
 
   if (!/^\d+$/u.test(text)) {
-    return DEFAULT_MAX_CONCURRENT;
+    return 0;
   }
 
   return Math.trunc(Number(text));

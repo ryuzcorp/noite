@@ -23,8 +23,9 @@ export interface ControllerEnv {
    */
   readonly __VOID_SANDBOX_ADMISSION_NAME?: string;
   /**
-   * Max concurrent live sandboxes, parsed as an integer (default `"4"`).
-   * `"0"` admits nothing; an unreadable value falls back to the default.
+   * Max concurrent live sandboxes, parsed as an integer (default `"4"` when
+   * the var is missing — the runner always renders it). `"0"` admits
+   * nothing; a present-but-unreadable value fails closed to `0`.
    */
   readonly __VOID_SANDBOX_MAX_CONCURRENT?: string;
   /**

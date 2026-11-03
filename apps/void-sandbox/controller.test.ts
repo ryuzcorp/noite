@@ -16,6 +16,7 @@ import type {
   SandboxProcessWire,
 } from "void/_sandbox-container";
 
+import { NoiteSandboxAdmission } from "./src/admission.ts";
 import { SandboxController } from "./src/controller.ts";
 import {
   FakeAdmission,
@@ -87,8 +88,9 @@ describe("tenant-reachable method gate", () => {
     //
     // Reviewed 2026-11-03 against void 1.5.0: `configure`/`destroy`/`fetch`
     // are client-invokable by design; `execProcess` can only exec on a running
-    // container the tenant could `invoke('exec')` on anyway (equivalent power,
-    // no escalation); the lifecycle warts (`beforeStart`/`afterStart`/
+    // container the tenant could `invoke('exec')` on anyway, and heartbeats
+    // like `invoke` first (equivalent power, no escalation); the lifecycle
+    // warts (`beforeStart`/`afterStart`/
     // `ensureRunning`/`initialize`/`setup`/`alarm`, plus the
     // `waitForProcessExit`/`processContext`/`initializationOutput` plumbing)
     // are idempotent and
@@ -573,6 +575,132 @@ describe("admission wiring", () => {
   });
 });
 
+describe("direct exec heartbeat", () => {
+  test("direct execProcess heartbeats: a denied heartbeat fails and destroys without execing", async () => {
+    const { admission, container, controller, storage } = rig();
+    succeedExec(container);
+    await controller.invoke("exec", [["echo", "hi"]]);
+    // Cap-shrink denial from here on.
+    admission.heartbeatResult = { ok: false, reason: "concurrency" };
+    const execsBefore = container.execCalls.length;
+
+    // SAFETY: white-box call into the protected override; the method is
+    // runtime-visible to tenants, which is exactly what this pins.
+    const direct = controller as unknown as {
+      execProcess: (argv: string[]) => Promise<{ exitCode: Promise<number> }>;
+    };
+
+    await expect(direct.execProcess(["id"])).rejects.toThrow(
+      "VOID_SANDBOX_concurrency"
+    );
+    // The heartbeat ran before any exec: nothing new reached the container,
+    // and the denied lease tore it down like an `invoke` denial does.
+    expect(container.execCalls.length).toBe(execsBefore);
+    expect(container.destroys).toBe(1);
+    expect(admission.calls.some((call) => call.method === "stopped")).toBe(
+      true
+    );
+    expect(storage.store.has("__voidSandboxLease")).toBe(false);
+  });
+
+  test("direct initializationOutput is covered by the same gate", async () => {
+    const { admission, container, controller } = rig();
+    succeedExec(container);
+    await controller.invoke("exec", [["echo", "hi"]]);
+    admission.heartbeatResult = { ok: false, reason: "unavailable" };
+    const execsBefore = container.execCalls.length;
+
+    // SAFETY: white-box call into the runtime-visible method (see above).
+    const direct = controller as unknown as {
+      initializationOutput: (
+        argv: string[],
+        options: Record<string, never>,
+        timeoutMs: number
+      ) => Promise<{ exitCode: number }>;
+    };
+
+    await expect(
+      direct.initializationOutput(["echo", "hi"], {}, 1000)
+    ).rejects.toThrow("VOID_SANDBOX_unavailable");
+    expect(container.execCalls.length).toBe(execsBefore);
+  });
+
+  test("direct exec with no lease fails closed", async () => {
+    const { container, controller } = rig();
+
+    // SAFETY: white-box call into the runtime-visible method (see above).
+    const direct = controller as unknown as {
+      execProcess: (argv: string[]) => Promise<{ exitCode: Promise<number> }>;
+    };
+
+    await expect(direct.execProcess(["id"])).rejects.toThrow(
+      "VOID_SANDBOX_unavailable"
+    );
+    expect(container.execCalls).toHaveLength(0);
+  });
+});
+
+describe("concurrent beforeStart", () => {
+  test("two direct beforeStarts leave one live reservation and no orphan", async () => {
+    const storage = new FakeStorage();
+
+    const admission = new NoiteSandboxAdmission(
+      makeCtx({ storage: new FakeStorage() }),
+      makeControllerEnv()
+    );
+
+    const container = new FakeContainer();
+
+    const controller = new SandboxController(
+      makeCtx({ container, storage }),
+      makeControllerEnv({
+        // SAFETY: the env cast stands in for the binding; the real admission
+        // class is what this test needs (a scripted fake cannot orphan).
+        admission: new FakeNamespace(
+          () => admission
+        ) as unknown as FakeNamespace<FakeAdmission>,
+      })
+    );
+
+    // SAFETY: white-box call into the runtime-visible method (see above).
+    const direct = controller as unknown as {
+      beforeStart: () => Promise<void>;
+    };
+
+    const outcomes = await Promise.allSettled([
+      direct.beforeStart(),
+      direct.beforeStart(),
+    ]);
+
+    expect(outcomes.map((outcome) => outcome.status)).toEqual([
+      "fulfilled",
+      "fulfilled",
+    ]);
+
+    // The stored lease names the one live admission entry.
+    const lease = storage.store.get("__voidSandboxLease") as {
+      generation: string;
+      phase: string;
+    };
+
+    expect(lease.phase).toBe("pending");
+    await expect(
+      admission.heartbeat("test-do-id-1", lease.generation)
+    ).resolves.toEqual({ ok: true });
+
+    // Teardown frees everything: no orphaned entry occupies cap.
+    await controller.destroy();
+
+    const fresh = await Promise.all(
+      ["o1", "o2", "o3", "o4"].map((id) => admission.reserve(id, "g"))
+    );
+
+    for (const result of fresh) {
+      expect(result).toEqual({ ok: true });
+    }
+  });
+});
+
 describe("lease lifecycle", () => {
   // White-box storage keys: the controller's own lease/activity contract (the
   // same strings Void uses); changing them is a deliberate migration.
@@ -588,7 +716,11 @@ describe("lease lifecycle", () => {
     succeedExec(container);
     await controller.invoke("exec", [["echo", "hi"]]);
     expect(container.starts).toEqual([]);
+    // `beforeStart` + `beforeUse` + the op's own `execProcess` guard (the
+    // setup-time execs skip under the setup's own verdicts) — still no
+    // re-reserve.
     expect(admission.calls.map((c) => c.method)).toEqual([
+      "heartbeat",
       "heartbeat",
       "heartbeat",
     ]);

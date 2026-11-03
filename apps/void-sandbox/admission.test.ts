@@ -26,9 +26,9 @@ describe("readAdmissionCap", () => {
     expect(readAdmissionCap("0")).toBe(0);
   });
 
-  test("unreadable values fall back to the default (fail closed)", () => {
+  test("unreadable values fail closed to 0 (admit nothing)", () => {
     for (const raw of ["", "abc", "-3", "4x", "4.5", "none"]) {
-      expect(readAdmissionCap(raw)).toBe(DEFAULT_MAX_CONCURRENT);
+      expect(readAdmissionCap(raw)).toBe(0);
     }
   });
 });
@@ -85,6 +85,14 @@ describe("reserve", () => {
     for (const result of admitted) {
       expect(result).toEqual({ ok: true });
     }
+  });
+
+  test("an unreadable cap admits nothing", async () => {
+    const admission = makeAdmission(new FakeStorage(), "4x");
+    await expect(admission.reserve("i1", "g1")).resolves.toEqual({
+      ok: false,
+      reason: "concurrency",
+    });
   });
 
   test("cap 1 admits one; cap 0 admits nothing", async () => {
