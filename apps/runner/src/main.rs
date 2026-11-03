@@ -20,6 +20,7 @@ mod service;
 mod telemetry;
 #[cfg(test)]
 mod testutil;
+mod void_cmd;
 
 use std::collections::HashSet;
 use std::sync::{atomic::AtomicBool, Arc};
@@ -78,6 +79,10 @@ async fn main() -> anyhow::Result<()> {
     if argv.first().map(String::as_str) == Some("telemetry") {
         let config = Config::from_env()?;
         return telemetry::run(&config, &argv[1..]).await;
+    }
+    if argv.first().map(String::as_str) == Some("void") {
+        let config = Config::from_env()?;
+        return void_cmd::run(&config, &argv[1..]).await;
     }
     // The sandbox relay runs from this same binary in its own container: no
     // config, no logging setup, nothing started — it must not need runner env.

@@ -100,7 +100,7 @@ In Actions it writes `url=` + `sha=` to `$GITHUB_OUTPUT` and posts (or updates, 
 2. The sandboxed install and build (`build.command` or the `build` script) run when the tree declares them, with the project's package manager.
 3. The runner picks the config to deploy: the build's output when it produced one, else the source config, else one it generates ([Which config deploys](/apps/build#which-config-deploys)).
 4. Optional `release` command (e.g. migrations) runs. A failed release keeps the old deployment serving.
-5. The config is stripped of runner-only keys (`release`, `build`), then `celld deploy` ships the fleet; a new fleet spawns or the existing one gets `POST /reload`.
+5. The config is stripped of runner-only keys (`release`, `build`), Settings merge into Worker `vars` (Void apps also get their runner-owned identity vars, services and `ISR_CACHE`), then `celld deploy` ships the fleet; a new fleet spawns or the existing one gets `POST /reload`, whose outcome the runner checks — a refused adoption fails the deploy with celld's error instead of leaving the old generation serving under a Success row.
 
 The **Deployments** tab shows status per push with a build-log pane: one `▸ step: command` line per step and its output tail, and on failure the step that failed. Deploy logs keep a 64 KB tail.
 

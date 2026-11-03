@@ -21,7 +21,7 @@ use anyhow::{bail, Context};
 use sqlx::SqliteConnection;
 
 /// Version a database has after every migration ran. 1 is the alpha baseline.
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`.
@@ -266,6 +266,21 @@ pub const MIGRATIONS: &[Migration] = &[
         // overrides `RUNNER_FLEET_MEMORY_MB` for one app. Additive, so older
         // snapshots gain it on boot; a fresh database gets it from schema.sql.
         sql: "ALTER TABLE main.app_limit ADD COLUMN memory_mb INTEGER;",
+    },
+    Migration {
+        version: 13,
+        // Runner-provisioned settings (SPEC, Deploy pipeline): `app_env` and
+        // `environment_env` rows the runner minted itself carry a `source`
+        // marker (`auth-default` for the auto-provisioned `BETTER_AUTH_SECRET`,
+        // `void-proxy-token` for the per-fleet `__VOID_PROXY_TOKEN`) instead
+        // of the user-written `''`. The merge inputs read the marker: process
+        // env takes user rows only, Worker vars take user rows plus the
+        // var-safe `auth-default` row, and the token row is injected by the
+        // runner-owned merge alone. Additive with a `''` default, so every
+        // existing row reads as user-written; a fresh database gets it from
+        // schema.sql.
+        sql: "ALTER TABLE main.app_env ADD COLUMN source TEXT NOT NULL DEFAULT '';\
+          ALTER TABLE main.environment_env ADD COLUMN source TEXT NOT NULL DEFAULT '';",
     },
 ];
 

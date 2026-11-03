@@ -43,5 +43,6 @@ pub mod supervisor;
 pub mod telemetry_report;
 pub mod tips;
 pub mod update_check;
+pub mod void_deploy;
 pub mod web_commit;
 pub mod worker_vars;

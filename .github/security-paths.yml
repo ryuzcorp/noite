@@ -75,6 +75,10 @@ sensitive:
   - "apps/noite/src/lib/server/env.server.ts"
   - "apps/noite/src/lib/server/environments.server.ts"
   - "apps/noite/src/http/routes/env-auth.ts"
+  # Runner-provisioned Void secrets (the per-fleet proxy token and
+  # BETTER_AUTH_SECRET) and the reserved names that keep tenants off them.
+  - "apps/runner/src/host/void_deploy.rs"
+  - "apps/runner/src/host/worker_vars.rs"
   - ".env.example"
   - "docker/compose*.yaml"
 
