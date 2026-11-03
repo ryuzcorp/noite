@@ -22,6 +22,9 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    permissions:
+      attestations: read
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -33,9 +36,9 @@ jobs:
         run: bun run check
       - name: version pins
         run: bun docker/check-versions.ts ${{ inputs.changelog && '--release' || '' }}
-      # check-versions.ts proves the celld tag matches docker/celld/ and the
-      # image is pulled by digest; this proves the digest is the one
-      # celld.yml published for that tag, not an older patch level's.
+      # check-versions.ts proves the celld tag names a fork release and the
+      # image is pulled by digest; this proves the pinned digest is what
+      # that tag resolves to, not a stale or rewritten one.
       - name: celld pin is published
         run: |
           tag=$(sed -n 's/^ARG CELLD_VERSION=//p' docker/Dockerfile)
@@ -45,6 +48,16 @@ jobs:
             echo "::error::docker/Dockerfile pins celld $tag at $pinned, but ghcr.io/ryuzcorp/celld:$tag is $published"
             exit 1
           fi
+      # The fork attests every image it publishes (ryuzcorp/celld publish.yml,
+      # SLSA provenance on the multi-arch index): verify the pinned digest
+      # carries that attestation, so the pin can only name an image the fork
+      # built.
+      - name: celld pin attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pinned=$(sed -n 's/^ARG CELLD_DIGEST=//p' docker/Dockerfile)
+          gh attestation verify "oci://ghcr.io/ryuzcorp/celld@$pinned" --repo ryuzcorp/celld
       # Script unit tests: docker/ (including the test-hygiene checker,
       # docker/check-tests.test.ts) and the CI scripts (bun skips dot
       # directories unless they're named explicitly).

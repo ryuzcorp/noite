@@ -1,7 +1,3 @@
-### Changed
-
-- The image now ships Noite's patched build of celld 0.6.3 (`ghcr.io/ryuzcorp/celld:0.6.3-noite.1`, pinned by digest), built from `docker/celld/` with celld's full upstream test suite. Upstream celld ships only security fixes from 0.6.x on, so Noite carries its own patches.
-
 ### Fixed
 
 - Durable Objects with containers can read `ctx.container.images` and pass `start({ image })`, which Void's sandbox needs.
