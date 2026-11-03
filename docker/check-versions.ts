@@ -187,6 +187,61 @@ if (!caddyPin || !edgeCaddy) {
   );
 }
 
+// The Void sandbox controller bundle (SPEC, Void sandbox controller) builds
+// from the pinned `void` npm version plus its `@cloudflare/sandbox` runtime:
+// the package pins both exactly, the bundle's `meta.ts` reports the same
+// `void` version the protocol check enforces, and the package lockfile
+// freezes both for the offline image build. A drifted pin ships a controller
+// the protocol check misreports.
+const sandboxPackage = read("apps/void-sandbox/package.json");
+const sandboxMeta = read("apps/void-sandbox/src/meta.ts");
+const sandboxLock = read("apps/void-sandbox/bun.lock");
+
+const voidPin =
+  /"void":\s*"(?<version>[^"]+)"/u.exec(sandboxPackage)?.groups?.version ?? "";
+
+const sandboxPin =
+  /"@cloudflare\/sandbox":\s*"(?<version>[^"]+)"/u.exec(sandboxPackage)?.groups
+    ?.version ?? "";
+
+const metaVoid =
+  /export const VOID_VERSION = "(?<version>[^"]+)"/u.exec(sandboxMeta)?.groups
+    ?.version ?? "";
+
+const exactSemver = /^\d+\.\d+\.\d+$/u;
+
+if (!exactSemver.test(voidPin)) {
+  fail(
+    `sandbox controller: apps/void-sandbox/package.json must pin void exactly (found "${voidPin}")`
+  );
+} else if (voidPin === metaVoid && sandboxLock.includes(`void@${voidPin}`)) {
+  console.log(
+    `sandbox controller: void ${voidPin} (package, meta and lockfile agree)`
+  );
+} else if (voidPin === metaVoid) {
+  fail(
+    `sandbox controller: apps/void-sandbox/bun.lock does not freeze void@${voidPin}`
+  );
+} else {
+  fail(
+    `sandbox controller: package.json pins void ${voidPin} but src/meta.ts reports ${metaVoid || "nothing"}`
+  );
+}
+
+if (!exactSemver.test(sandboxPin)) {
+  fail(
+    `sandbox controller: apps/void-sandbox/package.json must pin @cloudflare/sandbox exactly (found "${sandboxPin}")`
+  );
+} else if (sandboxLock.includes(`@cloudflare/sandbox@${sandboxPin}`)) {
+  console.log(
+    `sandbox controller: @cloudflare/sandbox ${sandboxPin} (package and lockfile agree)`
+  );
+} else {
+  fail(
+    `sandbox controller: apps/void-sandbox/bun.lock does not freeze @cloudflare/sandbox@${sandboxPin}`
+  );
+}
+
 const imageLog = /CADDY_ACCESS_LOG=(?<sink>\S+)/u.exec(dockerfile)?.groups
   ?.sink;
 
