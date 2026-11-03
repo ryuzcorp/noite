@@ -138,10 +138,10 @@ See [Edge protection](/self-hosting/protection) for how these fit together.
 | `NOITE_VOID_EMAIL_ALLOWLIST` | _(empty)_ | Admission: comma/space-separated exact addresses or `@domain` exact domains (subdomains do not match); empty fails closed | runner-owned |
 | `NOITE_VOID_AI_ENABLED` | _(empty)_ | `1` turns `/ai/*` on, else every AI call answers `501` | runner-owned |
 | `NOITE_VOID_AI_MODELS` | _(empty)_ | Model-map JSON for `/ai/run`: `{ "<model>": { "endpoint", "model" } }` | runner-owned |
-| `NOITE_VOID_AI_ALLOW_PLAINTEXT` | _(empty)_ | `1` allows `http` model endpoints, loopback sidecars only (the runner refuses `http` otherwise) | runner-owned |
+| `NOITE_VOID_AI_ALLOW_PLAINTEXT` | _(empty)_ | `1` allows `http` model endpoints, loopback sidecars only (the runner refuses `http` otherwise; inert in multi tenancy, where loopback endpoints never boot) | runner-owned |
 | `NOITE_VOID_SANDBOX_MAX_CONCURRENT` | `4` | Max concurrent live sandboxes per Void fleet (`0` admits none) | runner-owned |
 
-Unset means email sends and AI calls answer `501`; `/revalidate` needs no operator config. Per-app credentials (the SMTP login, the AI endpoint key) are tenant Settings, never operator config — see [Void email and AI](/self-hosting/operations#void-email-and-ai). Misconfigured values refuse the boot naming the var.
+Unset means email sends and AI calls answer `501`; `/revalidate` needs no operator config. Per-app credentials (the SMTP login, the AI endpoint key) are tenant Settings, never operator config — see [Void email and AI](/self-hosting/operations#void-email-and-ai). Misconfigured values refuse the boot naming the var. In multi tenancy the relay host and AI endpoints must be publicly reachable — loopback, private, link-local, CGNAT and ULA addresses, and obviously local names (`localhost`, `*.local`, `*.internal`, single-label names), refuse the boot naming the var.
 
 ## Platform-only
 

@@ -44,17 +44,19 @@ fn env_or(keys: &[&str], default: &str) -> String {
     default.to_string()
 }
 /// Host part of an http(s) URL without new deps: strip scheme, authority,
-/// port. None when no `://` or empty host.
+/// port. None when no `://` or empty host. A bracketed literal yields its
+/// address (`https://[::1]:8080/x` → `::1`); splitting the port at the
+/// first colon would return `[` instead.
 fn url_host(raw: &str) -> Option<String> {
     let (_, rest) = raw.split_once("://")?;
     let auth = rest.split('/').next().unwrap_or("");
     let auth = auth.split('@').next_back().unwrap_or("");
-    let host = auth
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .trim_matches('.');
+    let host = if let Some(bracketed) = auth.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        auth.split(':').next().unwrap_or("")
+    };
+    let host = host.trim().trim_matches('.');
     if host.is_empty() {
         return None;
     }
@@ -263,7 +265,9 @@ pub struct VoidProxyConfig {
     /// without it every `http://` model endpoint fails the boot, and with
     /// it only loopback endpoints boot — the per-app key travels in the
     /// upstream `Authorization` header, so plaintext past loopback would
-    /// leak it on the wire.
+    /// leak it on the wire. In multi tenancy the allowance is inert:
+    /// loopback endpoints are unreachable from tenant fleets, so they
+    /// fail the boot with or without it.
     pub ai_allow_plaintext: bool,
 }
 
@@ -326,8 +330,11 @@ impl VoidProxyConfig {
 
     /// Boot validation for the proxy section, appended to `validate`'s
     /// problems: shapes first, then the cross-field rules that would
-    /// otherwise fail only at send time.
-    fn validate(&self, problems: &mut Vec<String>) {
+    /// otherwise fail only at send time. In multi tenancy the relay and
+    /// every AI endpoint must additionally be publicly reachable — the
+    /// proxy runs in the tenant fleet, whose egress policy rejects
+    /// loopback/private destinations.
+    fn validate(&self, tenancy: Tenancy, problems: &mut Vec<String>) {
         if !self.email_domain.is_empty()
             && (self
                 .email_domain
@@ -372,6 +379,17 @@ impl VoidProxyConfig {
                     .into(),
             );
         }
+        let smtp_refusal = if tenancy == Tenancy::Multi && !self.smtp_host.is_empty() {
+            proxy_egress_refusal(&self.smtp_host)
+        } else {
+            None
+        };
+        if let Some(reason) = smtp_refusal {
+            problems.push(format!(
+                "NOITE_VOID_SMTP_HOST {:?} is unreachable from tenant fleets in multi tenancy ({}; fleet egress rejects loopback and private destinations, so use a publicly reachable relay)",
+                self.smtp_host, reason
+            ));
+        }
         if !self.ai_models.is_empty() {
             match serde_json::from_str::<serde_json::Value>(&self.ai_models) {
                 Ok(serde_json::Value::Object(map)) => {
@@ -406,6 +424,19 @@ impl VoidProxyConfig {
                                     model
                                 ));
                             }
+                        }
+                        let endpoint_refusal = if tenancy == Tenancy::Multi {
+                            endpoint.and_then(url_host).and_then(|host| {
+                                proxy_egress_refusal(&host).map(|reason| (host, reason))
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some((host, reason)) = endpoint_refusal {
+                            problems.push(format!(
+                                "NOITE_VOID_AI_MODELS[{:?}] endpoint host {:?} is unreachable from tenant fleets in multi tenancy ({}; fleet egress rejects loopback and private destinations, so use a publicly reachable endpoint)",
+                                model, host, reason
+                            ));
                         }
                         if target.is_none_or(|m| m.trim().is_empty()) {
                             problems.push(format!(
@@ -458,6 +489,71 @@ fn is_loopback_host(host: &str) -> bool {
         return ip.is_loopback();
     }
     is_localhost_domain(host)
+}
+
+/// Whether an IPv4 literal sits in carrier-grade NAT space
+/// (`100.64.0.0/10`, RFC 6598): no `is_*` API covers it, so match the
+/// prefix (`100.64`–`100.127` in the second octet).
+fn is_cgnat_v4(ip: &std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (octets[1] & 0xc0) == 0x40
+}
+
+/// Why a Void proxy upstream host (`NOITE_VOID_SMTP_HOST`, an
+/// `NOITE_VOID_AI_MODELS` endpoint) can never answer from a tenant fleet
+/// in multi tenancy: the fleet egress policy rejects fleet→loopback/private
+/// destinations, so the boot refuses it instead of 502ing at send time.
+/// Literal IPs classify by range (loopback, private including ULA,
+/// link-local, CGNAT); names classify by obviously-local form only — boot
+/// resolves nothing, so a name that merely points inside still fails at
+/// send time.
+fn proxy_egress_refusal(host: &str) -> Option<&'static str> {
+    let host = host.trim().trim_matches('.');
+    // A `:port` suffix is not part of the contract (the relay port is its
+    // own var; endpoint URLs lose theirs in `url_host`), but classify the
+    // host part anyway so `127.0.0.1:2525` still refuses. Only a single
+    // colon strips, so IPv6 literals pass through untouched.
+    let host = match host.split_once(':') {
+        Some((bare, port))
+            if !port.contains(':')
+                && !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            bare
+        }
+        _ => host,
+    };
+    let bare = host.trim_matches(['[', ']']);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return match ip {
+            ip if ip.is_unspecified() => Some("unspecified address"),
+            std::net::IpAddr::V4(v4) if v4.is_loopback() => Some("loopback address"),
+            std::net::IpAddr::V4(v4) if v4.is_private() => Some("private address"),
+            std::net::IpAddr::V4(v4) if v4.is_link_local() => Some("link-local address"),
+            std::net::IpAddr::V4(v4) if is_cgnat_v4(&v4) => Some("CGNAT address"),
+            std::net::IpAddr::V6(v6) if v6.is_loopback() => Some("loopback address"),
+            std::net::IpAddr::V6(v6) if v6.is_unique_local() => Some("private ULA address"),
+            std::net::IpAddr::V6(v6) if v6.is_unicast_link_local() => Some("link-local address"),
+            std::net::IpAddr::V6(v6)
+                if v6.to_ipv4_mapped().is_some_and(|m| {
+                    m.is_loopback() || m.is_private() || m.is_link_local() || is_cgnat_v4(&m)
+                }) =>
+            {
+                Some("private IPv4-mapped address")
+            }
+            _ => None,
+        };
+    }
+    let lower = host.to_ascii_lowercase();
+    if is_localhost_domain(&lower) {
+        Some("loopback name")
+    } else if lower.ends_with(".local") || lower.ends_with(".internal") {
+        Some("local-only DNS name")
+    } else if !lower.contains('.') {
+        Some("single-label name")
+    } else {
+        None
+    }
 }
 
 pub fn is_local_domain(domain: &str) -> bool {
@@ -1261,7 +1357,7 @@ impl Config {
         if self.otel_flush_ms < 1000 {
             problems.push("RUNNER_OTEL_FLUSH_MS must be >= 1000".into());
         }
-        self.void_proxy.validate(&mut problems);
+        self.void_proxy.validate(self.tenancy, &mut problems);
         if self.build_uid_range == 0 {
             problems.push("RUNNER_BUILD_UID_RANGE must be >= 1".into());
         }
@@ -2321,5 +2417,179 @@ mod tests {
                 assert!(cfg.void_proxy.ai_allow_plaintext);
             },
         );
+    }
+
+    /// In multi tenancy the proxy's upstreams must be publicly reachable:
+    /// the proxy runs in the tenant fleet, whose egress policy rejects
+    /// loopback/private destinations. Every refused form — loopback,
+    /// private (v4 + ULA), link-local and CGNAT literals, `localhost`,
+    /// `*.local`, `*.internal` and single-label names — fails the boot
+    /// naming the var; the same values boot in single tenancy.
+    #[test]
+    fn void_proxy_multi_refuses_fleet_unreachable_upstreams() {
+        // SMTP relay spellings: bare hosts plus the operator-written
+        // `:port` and bracketed forms, which classify by their host part.
+        let refused_relays = [
+            "127.0.0.1",
+            "127.0.0.2",
+            "::1",
+            "[::1]",
+            "127.0.0.1:2525",
+            "10.0.0.5",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "::ffff:10.0.0.1",
+            "169.254.169.254",
+            "fe80::1",
+            "100.64.0.1",
+            "0.0.0.0",
+            "[::]",
+            "100.127.255.255",
+            "fc00::1",
+            "fd12:3456::1",
+            "localhost",
+            "app.localhost",
+            "smtp.local",
+            "smtp.internal",
+            "smtp",
+        ];
+        for host in refused_relays {
+            with_env(
+                &[
+                    ("NOITE_TENANCY", "multi"),
+                    ("NOITE_VOID_EMAIL_DOMAIN", "mail.example.com"),
+                    ("NOITE_VOID_SMTP_HOST", host),
+                ],
+                || {
+                    let err = Config::from_env().expect_err("multi must refuse the relay");
+                    let msg = format!("{err:#}");
+                    assert!(
+                        msg.contains("NOITE_VOID_SMTP_HOST"),
+                        "names the var for {host:?}: {msg}"
+                    );
+                },
+            );
+            with_env(
+                &[
+                    ("NOITE_TENANCY", "single"),
+                    ("NOITE_VOID_EMAIL_DOMAIN", "mail.example.com"),
+                    ("NOITE_VOID_SMTP_HOST", host),
+                ],
+                || {
+                    Config::from_env().expect("single keeps the relay it always allowed");
+                },
+            );
+        }
+        // AI endpoint URLs on the same forms. The plaintext allowance is
+        // set throughout, so the `http` loopback legs pin that the
+        // allowance cannot save them in multi.
+        let refused_endpoints = [
+            "https://127.0.0.1/v1",
+            "https://[::1]/v1",
+            "https://10.0.0.5/v1",
+            "https://172.16.0.1/v1",
+            "https://192.168.1.1/v1",
+            "https://[::ffff:10.0.0.1]/v1",
+            "https://169.254.169.254/v1",
+            "https://[fe80::1]/v1",
+            "https://100.64.0.1/v1",
+            "https://[fd00::1]/v1",
+            "https://localhost:11434/v1",
+            "https://app.localhost/v1",
+            "https://ai.local/v1",
+            "https://ai.internal/v1",
+            "https://modelserver/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:11434/v1",
+        ];
+        for endpoint in refused_endpoints {
+            let models = format!(
+                "{{\"m\": {{\"endpoint\": {:?}, \"model\": \"m\"}}}}",
+                endpoint
+            );
+            with_env(
+                &[
+                    ("NOITE_TENANCY", "multi"),
+                    ("NOITE_VOID_AI_ENABLED", "1"),
+                    ("NOITE_VOID_AI_ALLOW_PLAINTEXT", "1"),
+                    ("NOITE_VOID_AI_MODELS", models.as_str()),
+                ],
+                || {
+                    let err = Config::from_env().expect_err("multi must refuse the endpoint");
+                    let msg = format!("{err:#}");
+                    assert!(
+                        msg.contains("NOITE_VOID_AI_MODELS"),
+                        "names the var for {endpoint:?}: {msg}"
+                    );
+                },
+            );
+            with_env(
+                &[
+                    ("NOITE_TENANCY", "single"),
+                    ("NOITE_VOID_AI_ENABLED", "1"),
+                    ("NOITE_VOID_AI_ALLOW_PLAINTEXT", "1"),
+                    ("NOITE_VOID_AI_MODELS", models.as_str()),
+                ],
+                || {
+                    Config::from_env().expect("single keeps the endpoint it always allowed");
+                },
+            );
+        }
+    }
+
+    /// Public upstreams boot in both tenancies: names, public literals,
+    /// and the addresses just outside each refused range. The bracketed
+    /// public IPv6 endpoint pins that `url_host` yields the literal, not
+    /// `[` (which would refuse as a single-label name).
+    #[test]
+    fn void_proxy_public_upstreams_boot_in_both_tenancies() {
+        let relays = [
+            "smtp.example.com",
+            "8.8.8.8",
+            "100.63.255.255",
+            "100.128.0.1",
+            "172.15.0.1",
+            "172.32.0.1",
+            "192.167.0.1",
+            "169.253.0.1",
+            "2606:4700:4700::1111",
+        ];
+        let endpoints = [
+            "https://ai.example.com/v1",
+            "https://8.8.8.8/v1",
+            "https://100.128.0.1/v1",
+            "https://[2606:4700:4700::1111]/v1",
+        ];
+        for tenancy in ["single", "multi"] {
+            for host in relays {
+                with_env(
+                    &[
+                        ("NOITE_TENANCY", tenancy),
+                        ("NOITE_VOID_EMAIL_DOMAIN", "mail.example.com"),
+                        ("NOITE_VOID_SMTP_HOST", host),
+                    ],
+                    || {
+                        Config::from_env().expect("public relay must boot");
+                    },
+                );
+            }
+            for endpoint in endpoints {
+                let models = format!(
+                    "{{\"m\": {{\"endpoint\": {:?}, \"model\": \"m\"}}}}",
+                    endpoint
+                );
+                with_env(
+                    &[
+                        ("NOITE_TENANCY", tenancy),
+                        ("NOITE_VOID_AI_ENABLED", "1"),
+                        ("NOITE_VOID_AI_MODELS", models.as_str()),
+                    ],
+                    || {
+                        Config::from_env().expect("public endpoint must boot");
+                    },
+                );
+            }
+        }
     }
 }
