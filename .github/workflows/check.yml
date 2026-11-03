@@ -32,7 +32,19 @@ jobs:
       - name: lint and format
         run: bun run check
       - name: version pins
-        run: bun docker/check-versions.ts
+        run: bun docker/check-versions.ts ${{ inputs.changelog && '--release' || '' }}
+      # check-versions.ts proves the celld tag matches docker/celld/ and the
+      # image is pulled by digest; this proves the digest is the one
+      # celld.yml published for that tag, not an older patch level's.
+      - name: celld pin is published
+        run: |
+          tag=$(sed -n 's/^ARG CELLD_VERSION=//p' docker/Dockerfile)
+          pinned=$(sed -n 's/^ARG CELLD_DIGEST=//p' docker/Dockerfile)
+          published=$(docker buildx imagetools inspect "ghcr.io/ryuzcorp/celld:$tag" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          if [ "$published" != "$pinned" ]; then
+            echo "::error::docker/Dockerfile pins celld $tag at $pinned, but ghcr.io/ryuzcorp/celld:$tag is $published"
+            exit 1
+          fi
       # Script unit tests: docker/ (including the test-hygiene checker,
       # docker/check-tests.test.ts) and the CI scripts (bun skips dot
       # directories unless they're named explicitly).

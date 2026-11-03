@@ -19,7 +19,14 @@
 # One celld, one Caddy, one Node, one jup, one npm, one pnpm, one bun and one
 # docker CLI pin; docker/check-versions.ts asserts they appear exactly once.
 # Sidecar versions (esbuild, duckdb) live in docker/install-sidecars.sh.
-ARG CELLD_VERSION=0.6.3
+# Noite's patched build of the celld release in docker/celld/upstream.env
+# (SPEC, Noite's celld patches): the `<version>-noite.<level>` tag
+# .github/workflows/celld.yml published, pinned by its index digest.
+# docker/check-versions.ts asserts the tag matches upstream.env. A lab build
+# of an unpublished patch stack overrides CELLD_IMAGE with a local image.
+ARG CELLD_VERSION=0.6.3-noite.1
+ARG CELLD_DIGEST=sha256:ca300b8e37fc2180e2830e6aae12859d0515c80de732971269b68d6a15c58bac
+ARG CELLD_IMAGE=ghcr.io/ryuzcorp/celld:${CELLD_VERSION}@${CELLD_DIGEST}
 # Noite's own release version, reported by the instance heartbeat
 # (`NOITE_BUILD_VERSION` ENV in the runtime stages): the tag without `v` on a
 # release build (images.yml passes it), `dev` otherwise.
@@ -50,7 +57,7 @@ ARG PNPM_SHA512=b3951d6d6ff4a9f13dc7cf56cd28d2b8eb37dbcc9c68e52e1e1191873ea9f82a
 # move needs a repin.
 ARG DOCKER_VERSION=5:29.9.2-1~debian.13~trixie
 
-FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
+FROM ${CELLD_IMAGE} AS celld
 
  # --- Caddy with the edge route-table module ----------------------------------
  # Built on the build host's platform and cross-compiled for the target, so an
