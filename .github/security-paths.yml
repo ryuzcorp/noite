@@ -81,6 +81,9 @@ sensitive:
   - "apps/runner/src/host/worker_vars.rs"
   - ".env.example"
   - "docker/compose*.yaml"
+  # Void D1 migrations: the runner module that plans migrations and
+  # applies them through in-worker endpoints (schema writes on tenant data).
+  - "apps/runner/src/host/void_migrate.rs"
 
   # The release image and its entrypoints: everything inside the trust
   # boundary ships from here, including the third-party binaries baked in.

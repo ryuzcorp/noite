@@ -81,7 +81,7 @@ pub fn collect_migrations(dir: &Path) -> anyhow::Result<Vec<MigrationFile>> {
     names
         .into_iter()
         .map(|name| {
-            let bytes = std::fs::read(dir.join(&name)).with_context(|| format!("read {name}"))?;
+            let bytes = std::fs::read(dir.join(&name)).with_context(|| format!("read {}", name))?;
             Ok(MigrationFile {
                 name,
                 sql: String::from_utf8_lossy(&bytes).into_owned(),
@@ -109,7 +109,8 @@ pub fn resolve_migrations_dir(src_dir: &Path) -> anyhow::Result<PathBuf> {
             let rel = Path::new(&dir);
             if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir)) {
                 anyhow::bail!(
-                    "void.json \"sourceDir\" {dir:?} must be a relative path without `..`"
+                    "void.json \"sourceDir\" {:?} must be a relative path without `..`",
+                    dir
                 );
             }
             root = src_dir.join(rel);
@@ -187,9 +188,9 @@ fn sha256_hex(value: &str) -> String {
     let hex: String = hasher
         .finalize()
         .iter()
-        .map(|byte| format!("{byte:02x}"))
+        .map(|byte| format!("{:02x}", byte))
         .collect();
-    format!("sha256:{hex}")
+    format!("sha256:{}", hex)
 }
 
 /// Void's `canonicalSql`: strip one leading BOM, normalize CRLF and lone CR.
@@ -553,7 +554,7 @@ fn transaction_control(sql: &str) -> Option<String> {
                         .next()
                         .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
                     if boundary {
-                        return Some(format!("BEGIN {suffix_upper}"));
+                        return Some(format!("BEGIN {}", suffix_upper));
                     }
                 }
             }
@@ -631,7 +632,8 @@ pub fn classify_migration(name: &str, sql: &str) -> Result<PlannedMigration, Str
     let sql_hash = sha256_hex(&canonical);
     if let Some(keyword) = transaction_control(sql) {
         return Err(format!(
-            "Migration {name} contains {keyword}; Void owns the stable D1 transaction boundary."
+            "Migration {} contains {}; Void owns the stable D1 transaction boundary.",
+            name, keyword
         ));
     }
     let has_breakpoints = !breakpoint_comments(&canonical).is_empty();
@@ -639,7 +641,8 @@ pub fn classify_migration(name: &str, sql: &str) -> Result<PlannedMigration, Str
         let statements = split_breakpoint_framed_sql(sql);
         if statements.is_empty() {
             return Err(format!(
-                "Migration {name} has statement breakpoints but no SQL statements."
+                "Migration {} has statement breakpoints but no SQL statements.",
+                name
             ));
         }
         ("breakpoint-framed", "stable", Some(statements))
@@ -661,7 +664,8 @@ pub fn classify_migration(name: &str, sql: &str) -> Result<PlannedMigration, Str
     plan.plan_hash = sha256_hex(&canonical_json(&plan.hash_input()));
     if kind == "legacy-unsplit-multi-statement" && split_sql_statements(sql).is_none() {
         plan.warnings.push(format!(
-            "Add a `--> statement-breakpoint` line after each complete SQL statement in migration {name}."
+            "Add a `--> statement-breakpoint` line after each complete SQL statement in migration {}.",
+            name
         ));
     }
     Ok(plan)
@@ -730,13 +734,13 @@ impl std::fmt::Display for ProbeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProbeError::Http { status, preview } => {
-                write!(f, "worker capabilities probe HTTP {status}: {preview}")
+                write!(f, "worker capabilities probe HTTP {}: {}", status, preview)
             }
             ProbeError::Shape { preview } => {
-                write!(f, "worker capabilities probe shape invalid: {preview}")
+                write!(f, "worker capabilities probe shape invalid: {}", preview)
             }
             ProbeError::Transport { message } => {
-                write!(f, "worker capabilities probe request failed: {message}")
+                write!(f, "worker capabilities probe request failed: {}", message)
             }
         }
     }
@@ -823,7 +827,8 @@ pub fn normalize_response(value: Value, body_preview: &str) -> MigrateResponse {
             stability: None,
             warnings: Vec::new(),
             error: Some(format!(
-                "migration endpoint returned invalid response: {body_preview}"
+                "migration endpoint returned invalid response: {}",
+                body_preview
             )),
         };
     }
@@ -837,7 +842,8 @@ pub fn normalize_response(value: Value, body_preview: &str) -> MigrateResponse {
             stability: None,
             warnings: Vec::new(),
             error: Some(format!(
-                "migration endpoint returned invalid response: missing migrations array ({body_preview})"
+                "migration endpoint returned invalid response: missing migrations array ({})",
+                body_preview
             )),
         };
     }
@@ -850,7 +856,8 @@ pub fn normalize_response(value: Value, body_preview: &str) -> MigrateResponse {
         stability: None,
         warnings: Vec::new(),
         error: Some(format!(
-            "migration endpoint returned invalid response: missing migrations array ({body_preview})"
+            "migration endpoint returned invalid response: missing migrations array ({})",
+            body_preview
         )),
     })
 }
@@ -876,7 +883,7 @@ pub fn format_migration_failure(response: &MigrateResponse) -> String {
             {
                 response.error.clone().unwrap_or_default()
             } else {
-                format!("migration {name:?} failed: {detail}")
+                format!("migration {:?} failed: {}", name, detail)
             }
         }
         None => response
@@ -1068,7 +1075,8 @@ impl MigrationClient {
                 stability: Some("stable".to_string()),
                 warnings: Vec::new(),
                 error: Some(format!(
-                    "migration outcome unknown and reconciliation returned {status}: {}",
+                    "migration outcome unknown and reconciliation returned {}: {}",
+                    status,
                     preview(&text, 200)
                 )),
             }),
@@ -1089,8 +1097,13 @@ impl MigrationClient {
             .map_err(|e| one_line(&e.to_string()))?;
         let status = response.status().as_u16();
         let text = response.text().await.unwrap_or_default();
-        let data: Value = serde_json::from_str(&text)
-            .map_err(|_| format!("auth migration failed ({status}): {}", preview(&text, 200)))?;
+        let data: Value = serde_json::from_str(&text).map_err(|_| {
+            format!(
+                "auth migration failed ({}): {}",
+                status,
+                preview(&text, 200)
+            )
+        })?;
         if (200..300).contains(&status) && data.get("ok").and_then(Value::as_bool) == Some(true) {
             Ok(())
         } else {
@@ -1098,7 +1111,7 @@ impl MigrationClient {
                 .get("error")
                 .and_then(Value::as_str)
                 .map_or_else(|| status.to_string(), one_line);
-            Err(format!("auth migration failed: {detail}"))
+            Err(format!("auth migration failed: {}", detail))
         }
     }
 
@@ -1137,7 +1150,8 @@ impl MigrationClient {
                         continue;
                     }
                     return Err(format!(
-                        "migration failed ({status}): {}",
+                        "migration failed ({}): {}",
+                        status,
                         preview(&text, 200)
                     ));
                 }
@@ -1157,7 +1171,7 @@ fn urlencoding(segment: &str) -> String {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             out.push(byte as char);
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            out.push_str(&format!("%{:02X}", byte));
         }
     }
     out
@@ -1173,7 +1187,8 @@ mod tests {
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "noite-void-migrate-{name}-{}-{:?}",
+            "noite-void-migrate-{}-{}-{:?}",
+            name,
             std::process::id(),
             std::time::SystemTime::now()
         ));
@@ -1265,12 +1280,13 @@ mod tests {
         for evil in ["../escape", "/absolute", "a/../../escape"] {
             std::fs::write(
                 dir.join("void.json"),
-                format!(r#"{{"sourceDir": "{evil}"}}"#),
+                format!(r#"{{"sourceDir": "{}"}}"#, evil),
             )
             .unwrap();
             assert!(
                 resolve_migrations_dir(&dir).is_err(),
-                "{evil} must not escape the worktree"
+                "{} must not escape the worktree",
+                evil
             );
         }
         // Unparseable or non-string `sourceDir` falls back to the root.
@@ -1279,7 +1295,8 @@ mod tests {
             assert_eq!(
                 resolve_migrations_dir(&dir).unwrap(),
                 dir.join("db").join("migrations"),
-                "{body}"
+                "{}",
+                body
             );
         }
     }
@@ -1296,16 +1313,17 @@ mod tests {
             u64::from(CLASSIFIER_VERSION)
         );
         for (case, entry) in vectors["plans"].as_object().unwrap() {
-            let name = format!("{case}.sql");
+            let name = format!("{}.sql", case);
             let input = entry["input"].as_str().unwrap();
             match classify_migration(&name, input) {
                 Ok(plan) => {
                     let expected = &entry["plan"];
-                    assert_eq!(plan.kind, expected["kind"].as_str().unwrap(), "{case}");
+                    assert_eq!(plan.kind, expected["kind"].as_str().unwrap(), "{}", case);
                     assert_eq!(
                         plan.stability,
                         expected["stability"].as_str().unwrap(),
-                        "{case}"
+                        "{}",
+                        case
                     );
                     let statements: Option<Vec<String>> =
                         expected.get("statements").map(|statements| {
@@ -1316,22 +1334,25 @@ mod tests {
                                 .map(|s| s.as_str().unwrap().to_string())
                                 .collect()
                         });
-                    assert_eq!(plan.statements, statements, "{case}");
+                    assert_eq!(plan.statements, statements, "{}", case);
                     assert_eq!(
                         u64::from(plan.classifier_version),
                         expected["classifierVersion"].as_u64().unwrap(),
-                        "{case}"
+                        "{}",
+                        case
                     );
-                    assert_eq!(plan.name, expected["name"].as_str().unwrap(), "{case}");
+                    assert_eq!(plan.name, expected["name"].as_str().unwrap(), "{}", case);
                     assert_eq!(
                         plan.sql_hash,
                         expected["sqlHash"].as_str().unwrap(),
-                        "{case}"
+                        "{}",
+                        case
                     );
                     assert_eq!(
                         plan.plan_hash,
                         expected["planHash"].as_str().unwrap(),
-                        "{case}"
+                        "{}",
+                        case
                     );
                     let warnings: Vec<String> = expected
                         .get("warnings")
@@ -1344,12 +1365,13 @@ mod tests {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    assert_eq!(plan.warnings, warnings, "{case}");
+                    assert_eq!(plan.warnings, warnings, "{}", case);
                 }
                 Err(error) => assert_eq!(
                     error,
                     entry["error"].as_str().unwrap(),
-                    "{case} must fail exactly as Void's"
+                    "{} must fail exactly as Void's",
+                    case
                 ),
             }
         }
@@ -1389,7 +1411,8 @@ mod tests {
             assert_eq!(
                 built.migration_list_hash,
                 expected["migrationListHash"].as_str().unwrap(),
-                "{bundle}"
+                "{}",
+                bundle
             );
             assert_eq!(
                 built.plans.len(),
@@ -1411,13 +1434,14 @@ mod tests {
         assert_eq!(one_line("a\r\nb\rc\nd"), "a b c d");
         assert_eq!(one_line("plain"), "plain");
         let id = mint_attempt_id();
-        assert!(id.starts_with("migatt_"), "{id}");
-        assert_eq!(id.len(), 19, "{id}");
+        assert!(id.starts_with("migatt_"), "{}", id);
+        assert_eq!(id.len(), 19, "{}", id);
         assert!(
             id.bytes()
                 .skip(7)
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
-            "{id}"
+            "{}",
+            id
         );
         assert!(config_has_hyperdrive(
             &serde_json::json!({"hyperdrive": [{"binding": "HYPERDRIVE"}]})
@@ -1516,7 +1540,8 @@ mod tests {
         assert!(!rendered.contains('\n'));
         assert!(
             rendered.contains("syntax error This deploy runs"),
-            "{rendered}"
+            "{}",
+            rendered
         );
         // When the top error already carries the detail, it wins (as the
         // platform's), still flattened.
@@ -1627,7 +1652,7 @@ mod tests {
         ));
         let legacy = MigrationClient::new(
             reqwest::Client::new(),
-            format!("{base}/legacy-only"),
+            format!("{}/legacy-only", base),
             "token".to_string(),
         );
         // A 404 under a prefix still surfaces as an answered probe: the
@@ -1873,7 +1898,7 @@ mod tests {
         assert_eq!(response.migrations.iter().filter(|m| m.applied).count(), 1);
         let failing = MigrationClient::new(
             reqwest::Client::new(),
-            format!("{base}/failing"),
+            format!("{}/failing", base),
             "token".to_string(),
         )
         .with_retry_delay(std::time::Duration::from_millis(0));

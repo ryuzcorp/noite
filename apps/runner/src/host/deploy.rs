@@ -1262,7 +1262,7 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
     };
     let client = void_migrate::MigrationClient::new(
         reqwest::Client::new(),
-        format!("http://{}:{port}", inputs.cfg.caddy_upstream_host),
+        format!("http://{}:{}", inputs.cfg.caddy_upstream_host, port),
         proxy_token,
     );
     // The health gate above was the readiness probe, so a fleet that answers
@@ -1319,7 +1319,7 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
         }
         if !files.is_empty() {
             let bundle =
-                void_migrate::build_plan_bundle(&files).map_err(|e| anyhow::anyhow!("{e}"))?;
+                void_migrate::build_plan_bundle(&files).map_err(|e| anyhow::anyhow!("{}", e))?;
             if caps.migration_list_hash != bundle.migration_list_hash {
                 diffs.push(format!(
                     "migrationListHash worker={} manifest={}",
@@ -1368,7 +1368,7 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
             client
                 .migrate_auth()
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
             inputs
                 .progress
                 .log(
@@ -1380,7 +1380,10 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
         return Ok(());
     }
     if !answered_without_v2 {
-        anyhow::bail!("could not reach the new worker's migration endpoint: {unreachable}");
+        anyhow::bail!(
+            "could not reach the new worker's migration endpoint: {}",
+            unreachable
+        );
     }
     if files.is_empty() {
         inputs
@@ -1406,7 +1409,7 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
     let response = client
         .migrate_legacy()
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     if !response.ok {
         anyhow::bail!(
             "migration failed: {}",
@@ -1468,7 +1471,7 @@ async fn log_migrate_outcome(
 fn quoted(names: &[&str]) -> String {
     names
         .iter()
-        .map(|name| format!("{name:?}"))
+        .map(|name| format!("{:?}", name))
         .collect::<Vec<_>>()
         .join(", ")
 }
