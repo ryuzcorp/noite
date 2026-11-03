@@ -50,6 +50,10 @@ concurrency:
 jobs:
   check:
     uses: ./.github/workflows/check.yml
+    # check.yml verifies the celld pin's provenance attestation.
+    permissions:
+      attestations: read
+      contents: read
 
   rust:
     runs-on: ubuntu-latest
