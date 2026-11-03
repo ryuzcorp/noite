@@ -49,6 +49,10 @@ sensitive:
   - "apps/runner/src/host/netisolation.rs"
   - "apps/runner/src/host/cgroups.rs"
   - "apps/runner/src/db/alloc.rs"
+  # The Sandbox container plane: the engine proxy that filters every Docker
+  # call a tenant fleet makes, the gateway and the per-container network
+  # plane. A wrong allowlist entry hands a tenant the host's engine.
+  - "apps/runner/src/host/sandbox/**"
   # The end-to-end proofs of isolation and hardening: weakening these
   # silently weakens every isolation claim above.
   - "apps/noite/e2e/hostile.spec.ts"
