@@ -47,5 +47,6 @@ pub mod void_cohost;
 pub mod void_deploy;
 pub mod void_migrate;
 pub mod void_proxy;
+pub mod void_sandbox;
 pub mod web_commit;
 pub mod worker_vars;

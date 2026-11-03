@@ -393,6 +393,88 @@ fn within(src: &Path, path: &Path) -> anyhow::Result<PathBuf> {
     Ok(resolved)
 }
 
+/// The build context's content digest: SHA-256 over every entry's
+/// context-relative path plus, for regular files, their bytes and, for
+/// symlinks, their target. The sandbox controller's skip-when-unchanged
+/// hash feeds this beside the pinned Dockerfile, so a `COPY`'d file change
+/// redeploys the controller even though the Dockerfile reads the same.
+/// Same walk and bounds as [`check_context`]; entries sort by path, so the
+/// digest is stable across filesystems.
+pub fn context_digest(src: &Path, request: &Request) -> anyhow::Result<[u8; 32]> {
+    use sha2::Digest;
+    let dockerfile = within(src, &request.dockerfile)
+        .with_context(|| format!("Dockerfile {}", request.dockerfile.display()))?;
+    let context = match &request.context {
+        Some(context) => {
+            within(src, context).with_context(|| format!("build context {}", context.display()))?
+        }
+        None => dockerfile
+            .parent()
+            .map(Path::to_path_buf)
+            .context("the Dockerfile has no directory")?,
+    };
+    if !context.is_dir() {
+        bail!("build context {} is not a directory", context.display());
+    }
+    let mut entries: Vec<PathBuf> = Vec::new();
+    let mut bytes = 0_u64;
+    let mut pending = vec![context.clone()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let path = entry?.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            entries.push(path.clone());
+            if entries.len() > MAX_CONTEXT_FILES {
+                bail!(
+                    "build context {} holds more than {} entries",
+                    context.display(),
+                    MAX_CONTEXT_FILES
+                );
+            }
+            if meta.is_symlink() {
+                let resolved = path.canonicalize().ok();
+                if !resolved.is_some_and(|target| target.starts_with(&context)) {
+                    bail!(
+                        "{} links outside the build context {}",
+                        path.display(),
+                        context.display()
+                    );
+                }
+            } else if meta.is_dir() {
+                pending.push(path);
+            } else {
+                bytes += meta.len();
+                if bytes > MAX_CONTEXT_BYTES {
+                    bail!(
+                        "build context {} is larger than {} MiB",
+                        context.display(),
+                        MAX_CONTEXT_BYTES / 1024 / 1024
+                    );
+                }
+            }
+        }
+    }
+    entries.sort();
+    let mut hasher = sha2::Sha256::new();
+    for path in &entries {
+        let rel = path.strip_prefix(&context).unwrap_or(path);
+        hasher.update(rel.as_os_str().as_encoded_bytes());
+        hasher.update([0]);
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.is_symlink() {
+            let target = std::fs::read_link(path)?;
+            hasher.update(target.as_os_str().as_encoded_bytes());
+            hasher.update([0]);
+        } else if meta.is_file() {
+            let content =
+                std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+            hasher.update(&content);
+            hasher.update([0]);
+        }
+    }
+    Ok(hasher.finalize().into())
+}
+
 /// Pull `image` for the nodes' platform, refuse it when it carries `ONBUILD`
 /// triggers (a `FROM` would run them during the build), and return it
 /// pinned by digest. An image that only exists on this engine (another
@@ -538,6 +620,63 @@ mod tests {
         let big = std::fs::File::create(ctx.join("big")).unwrap();
         big.set_len(MAX_CONTEXT_BYTES + 1).unwrap();
         assert!(format!("{:#}", check_context(&ctx).unwrap_err()).contains("larger than"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The context digest is stable, and any content change — a file's
+    /// bytes, an added or removed entry, a retargeted link — flips it. An
+    /// escaping link refuses like the prepare walk does.
+    #[cfg(unix)]
+    #[test]
+    fn context_digest_pins_the_build_inputs() {
+        let base = std::env::temp_dir().join(format!("noite-ctxdig-{}", uuid::Uuid::new_v4()));
+        let ctx = base.join("ctx");
+        std::fs::create_dir_all(ctx.join("sub")).unwrap();
+        std::fs::write(base.join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(ctx.join("sub/a"), "a").unwrap();
+        std::os::unix::fs::symlink(ctx.join("sub/a"), ctx.join("inside")).unwrap();
+        let base = base.canonicalize().unwrap();
+        let request = Request {
+            dockerfile: base.join("Dockerfile"),
+            context: Some(base.join("ctx")),
+        };
+        let digest = |request: &Request| context_digest(&base, request).unwrap();
+        let first = digest(&request);
+        assert_eq!(digest(&request), first);
+
+        std::fs::write(base.join("ctx/sub/a"), "b").unwrap();
+        assert_ne!(digest(&request), first, "file bytes flip the digest");
+        std::fs::write(base.join("ctx/sub/a"), "a").unwrap();
+        assert_eq!(digest(&request), first);
+
+        std::os::unix::fs::symlink(base.join("ctx/sub"), base.join("ctx/retarget")).unwrap();
+        assert_ne!(digest(&request), first, "an added link flips the digest");
+        std::fs::remove_file(base.join("ctx/retarget")).unwrap();
+        assert_eq!(digest(&request), first);
+
+        std::os::unix::fs::symlink("/etc/passwd", base.join("ctx/out")).unwrap();
+        assert!(
+            format!("{:#}", context_digest(&base, &request).unwrap_err()).contains("links outside")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Without an explicit context the Dockerfile's own directory is the
+    /// context, as in [`prepare`].
+    #[test]
+    fn context_digest_defaults_to_the_dockerfile_dir() {
+        let base = std::env::temp_dir().join(format!("noite-ctxdef-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(base.join("img")).unwrap();
+        std::fs::write(base.join("img/Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(base.join("img/app.js"), "console.log(1)").unwrap();
+        let base = base.canonicalize().unwrap();
+        let request = Request {
+            dockerfile: base.join("img/Dockerfile"),
+            context: None,
+        };
+        let first = context_digest(&base, &request).unwrap();
+        std::fs::write(base.join("img/app.js"), "console.log(2)").unwrap();
+        assert_ne!(context_digest(&base, &request).unwrap(), first);
         let _ = std::fs::remove_dir_all(&base);
     }
 

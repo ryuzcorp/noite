@@ -850,6 +850,15 @@ pub struct Config {
     /// Operator config for Noite's Void platform proxy: email relay and AI
     /// endpoint rendered into every Void fleet's `noite-void-proxy`.
     pub void_proxy: VoidProxyConfig,
+    /// Max concurrent live sandboxes per fleet
+    /// (`NOITE_VOID_SANDBOX_MAX_CONCURRENT`, default 4): rendered into
+    /// every sandbox controller as `__VOID_SANDBOX_MAX_CONCURRENT` and as
+    /// the moved entry's `max_instances` backstop. `0` admits nothing.
+    pub void_sandbox_max_concurrent: u32,
+    /// Fixed sandbox controller bundle (`worker.js` + `meta.json`)
+    /// deployed as `noite-void-sandbox`. The image ships it; a dev
+    /// checkout overrides this at its built `apps/void-sandbox/dist`.
+    pub void_sandbox_bundle_dir: String,
     /// Opt-out instance heartbeat (SPEC, telemetry): `NOITE_TELEMETRY`
     /// (`0`/`false`/`off`) locks it off.
     pub telemetry_disabled: bool,
@@ -1124,6 +1133,14 @@ impl Config {
             better_auth_url: env::var("BETTER_AUTH_URL").unwrap_or_default(),
             edge: EdgeLimits::from_env(&mut env_problems)?,
             void_proxy: VoidProxyConfig::from_env(&mut env_problems),
+            void_sandbox_max_concurrent: env_num(
+                "NOITE_VOID_SANDBOX_MAX_CONCURRENT",
+                4,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            void_sandbox_bundle_dir: env::var("VOID_SANDBOX_BUNDLE_DIR")
+                .unwrap_or_else(|_| "/opt/noite/void-sandbox".into()),
             telemetry_disabled: parse_telemetry_disabled(
                 env::var("NOITE_TELEMETRY").ok().as_deref(),
             ),
@@ -1488,6 +1505,8 @@ pub(crate) fn config_for_tests() -> Config {
         better_auth_url: "".into(),
         edge: EdgeLimits::default(),
         void_proxy: VoidProxyConfig::default(),
+        void_sandbox_max_concurrent: 4,
+        void_sandbox_bundle_dir: "/opt/noite/void-sandbox".into(),
         telemetry_disabled: false,
         do_not_track: false,
         update_check_disabled: false,
@@ -1643,8 +1662,8 @@ mod tests {
             .iter()
             .copied()
             .chain(["BASE_DOMAIN", "NOITE_TENANCY"])
-            // The Void proxy section reads these; a test-set value must not
-            // leak into a parallel `from_env`.
+            // The Void proxy/sandbox sections read these; a test-set value
+            // must not leak into a parallel `from_env`.
             .chain([
                 "NOITE_VOID_EMAIL_DOMAIN",
                 "NOITE_VOID_SMTP_HOST",
@@ -1655,6 +1674,8 @@ mod tests {
                 "NOITE_VOID_AI_ENABLED",
                 "NOITE_VOID_AI_MODELS",
                 "NOITE_VOID_AI_ALLOW_PLAINTEXT",
+                "NOITE_VOID_SANDBOX_MAX_CONCURRENT",
+                "VOID_SANDBOX_BUNDLE_DIR",
             ])
         {
             saved.push((key, env::var(key).ok()));
@@ -2055,6 +2076,48 @@ mod tests {
             assert!(!cfg.void_proxy.ai_enabled);
             assert!(cfg.void_proxy.ai_models.is_empty());
         });
+    }
+
+    /// The sandbox section defaults: cap 4, the image bundle path — and a
+    /// configured cap parses, `0` included (admits nothing). Malformed
+    /// refuses the boot naming the var.
+    #[test]
+    fn void_sandbox_config_defaults_and_validates() {
+        with_env(&[], || {
+            let cfg = Config::from_env().expect("unset sandbox section must boot");
+            assert_eq!(cfg.void_sandbox_max_concurrent, 4);
+            assert_eq!(cfg.void_sandbox_bundle_dir, "/opt/noite/void-sandbox");
+        });
+        with_env(
+            &[
+                ("NOITE_VOID_SANDBOX_MAX_CONCURRENT", "8"),
+                ("VOID_SANDBOX_BUNDLE_DIR", "/tmp/sb-dist"),
+            ],
+            || {
+                let cfg = Config::from_env().expect("set sandbox section must boot");
+                assert_eq!(cfg.void_sandbox_max_concurrent, 8);
+                assert_eq!(cfg.void_sandbox_bundle_dir, "/tmp/sb-dist");
+            },
+        );
+        with_env(&[("NOITE_VOID_SANDBOX_MAX_CONCURRENT", "0")], || {
+            let cfg = Config::from_env().expect("zero cap must boot");
+            assert_eq!(cfg.void_sandbox_max_concurrent, 0);
+        });
+        with_env(&[("NOITE_VOID_SANDBOX_MAX_CONCURRENT", "  ")], || {
+            let cfg = Config::from_env().expect("blank cap must boot");
+            assert_eq!(cfg.void_sandbox_max_concurrent, 4);
+        });
+        for bad in ["four", "-1", "4x"] {
+            with_env(&[("NOITE_VOID_SANDBOX_MAX_CONCURRENT", bad)], || {
+                let err = format!("{:#}", Config::from_env().unwrap_err());
+                assert!(
+                    err.contains("NOITE_VOID_SANDBOX_MAX_CONCURRENT"),
+                    "{}: {}",
+                    bad,
+                    err
+                );
+            });
+        }
     }
 
     /// A fully configured section parses: modes, ports, flags, allowlist

@@ -482,10 +482,10 @@ pub async fn delete_env_override(
 /// an override wins over the app's value, and reserved names are refused
 /// loudly by the merge, never dropped here. The filters are the
 /// runner-provisioned app rows, which are per-fleet, never inherited: the
-/// token row (as in `worker_settings`) and the auto-provisioned
-/// `BETTER_AUTH_SECRET` (each preview mints its own override instead). A
-/// user-written app value still flows through; the environment's own
-/// provisioned auth row rides the merge like any override.
+/// token and admission-name rows (as in `worker_settings`) and the
+/// auto-provisioned `BETTER_AUTH_SECRET` (each preview mints its own
+/// override instead). A user-written app value still flows through; the
+/// environment's own provisioned auth row rides the merge like any override.
 pub async fn environment_worker_settings(
     pool: &SqlitePool,
     app_id: &str,
@@ -495,13 +495,16 @@ pub async fn environment_worker_settings(
     for row in crate::db::env::list_env(pool, app_id).await? {
         if row.source == crate::db::env::SOURCE_VOID_PROXY_TOKEN
             || row.source == crate::db::env::SOURCE_AUTH_DEFAULT
+            || row.source == crate::db::env::SOURCE_VOID_SANDBOX_ADMISSION
         {
             continue;
         }
         merged.insert(row.name, row.value);
     }
     for row in list_env_override(pool, environment_id).await? {
-        if row.source == crate::db::env::SOURCE_VOID_PROXY_TOKEN {
+        if row.source == crate::db::env::SOURCE_VOID_PROXY_TOKEN
+            || row.source == crate::db::env::SOURCE_VOID_SANDBOX_ADMISSION
+        {
             continue;
         }
         merged.insert(row.name, row.value);
@@ -721,11 +724,12 @@ mod tests {
         );
     }
 
-    /// Provisioned rows route by marker: a per-fleet token override stays
-    /// out of both merges (the runner-owned merge injects it), the app's
-    /// auto-provisioned auth secret is not inherited (the preview mints its
-    /// own override, which rides the merge), and a user-written app value
-    /// still flows through.
+    /// Provisioned rows route by marker: the per-fleet provisioned
+    /// overrides stay out of both merges (the runner-owned merge injects
+    /// the token, the controller render the admission name), the app's
+    /// auto-provisioned auth secret is not inherited (the preview mints
+    /// its own override, which rides the merge), and a user-written app
+    /// value still flows through.
     #[tokio::test]
     async fn provisioned_override_rows_route_by_source_marker() {
         let pool = connect("sqlite::memory:").await.expect("boot");
@@ -752,6 +756,15 @@ mod tests {
             "__VOID_PROXY_TOKEN",
             "tok",
             crate::db::SOURCE_VOID_PROXY_TOKEN,
+        )
+        .await
+        .unwrap());
+        assert!(insert_env_override_provisioned(
+            &pool,
+            &env.id,
+            "__VOID_SANDBOX_ADMISSION_NAME",
+            "admission",
+            crate::db::SOURCE_VOID_SANDBOX_ADMISSION,
         )
         .await
         .unwrap());
@@ -816,7 +829,8 @@ mod tests {
                 .value,
             "tok"
         );
-        assert_eq!(list_env_override(&pool, &env.id).await.unwrap().len(), 3);
+        // Token, admission name, MODEL and the preview's own auth row.
+        assert_eq!(list_env_override(&pool, &env.id).await.unwrap().len(), 4);
     }
 
     #[tokio::test]

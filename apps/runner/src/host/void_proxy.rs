@@ -58,8 +58,8 @@ pub const SMTP_PASSWORD_SETTING: &str = "VOID_PROXY_SMTP_PASSWORD";
 pub const AI_API_KEY_SETTING: &str = "VOID_PROXY_AI_API_KEY";
 
 /// Deploy order among cohosted scripts: the proxy deploys after the
-/// future sandbox controller (which takes a lower order) and before the
-/// tenant app (which always deploys last).
+/// sandbox controller ([`super::void_sandbox::SANDBOX_ORDER`]) and before
+/// the tenant app (which always deploys last).
 pub const PROXY_ORDER: u32 = 10;
 
 /// Vars holding secrets: substituted by their hashes for the content
@@ -236,6 +236,11 @@ pub fn render_proxy(ctx: &ProxyRenderCtx<'_>) -> RenderedCohost {
             ],
             "vars": Value::Object(vars),
         }),
+        // Fully embedded, config-carried, containerless: the proxy needs
+        // none of the runtime render inputs.
+        extra_sources: Vec::new(),
+        extra_hash_input: Vec::new(),
+        declares_containers: false,
     }
 }
 

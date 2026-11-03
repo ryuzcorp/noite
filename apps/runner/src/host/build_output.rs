@@ -214,15 +214,37 @@ impl ContainersPlan {
     pub fn set_dockerfile(&mut self, index: usize, dockerfile: &Path) {
         let root = self.config.parent().unwrap_or(Path::new("."));
         let image = relative_up(root, dockerfile);
+        self.set_image(index, &image);
+    }
+
+    /// Point `containers[index].image` at the prepared Dockerfile by
+    /// absolute path: for a config planned in a staging dir but deployed
+    /// from elsewhere (the sandbox controller's cohosted project), where a
+    /// path relative to the staging dir would dangle. celld joins the
+    /// project dir onto the value, and joining an absolute path is the
+    /// path itself, so the build reads the pinned file with the vetted
+    /// context as its build context.
+    pub fn set_dockerfile_absolute(&mut self, index: usize, dockerfile: &Path) {
+        self.set_image(index, &dockerfile.display().to_string());
+    }
+
+    fn set_image(&mut self, index: usize, image: &str) {
         if let Some(entry) = self
             .value
             .get_mut("containers")
             .and_then(|containers| containers.get_mut(index))
             .and_then(Value::as_object_mut)
         {
-            entry.insert("image".into(), Value::String(image));
+            entry.insert("image".into(), Value::String(image.to_string()));
             self.changed = true;
         }
+    }
+
+    /// The normalized config: the sandbox slice plans the controller's
+    /// moved entry in a staging dir and renders from this value instead of
+    /// writing it back.
+    pub fn value(&self) -> &Value {
+        &self.value
     }
 
     /// Write the normalized config back when anything changed.
@@ -260,7 +282,9 @@ pub(crate) fn write_fresh(path: &Path, text: &str) -> anyhow::Result<()> {
 /// reference. Mirrors celld 0.6.3's `is_dockerfile` (`deploy.rs`) exactly:
 /// the joined path exists and is a file, via `symlink_metadata` (which
 /// does not follow symlinks, so a symlink never counts — as in celld).
-fn is_dockerfile(root: &Path, image: &str) -> bool {
+/// Shared with the sandbox slice, which absolutizes file-named images when
+/// it moves the managed entry out of the app config.
+pub(crate) fn is_dockerfile(root: &Path, image: &str) -> bool {
     std::fs::symlink_metadata(root.join(image)).is_ok_and(|metadata| metadata.is_file())
 }
 
@@ -815,6 +839,42 @@ mod tests {
             v["containers"][1],
             serde_json::json!({"class_name": "Other", "image": "registry.example/x@sha256:00"})
         );
+    }
+
+    /// A staged plan renders from its normalized value instead of writing
+    /// it back, with the prepared Dockerfile pinned by absolute path (the
+    /// cohosted project deploys from a different dir than the staging one,
+    /// so a relative path would dangle).
+    #[test]
+    fn staged_plan_renders_absolute_without_writing() {
+        let dir = scratch("staged-plan").canonicalize().unwrap();
+        write(&dir.join("sandbox/Dockerfile"), "FROM scratch\n");
+        let dockerfile = dir.join("sandbox/Dockerfile");
+        write(
+            &dir.join("staging/wrangler.json"),
+            &format!(
+                r#"{{"name":"s","containers":[{{"name":"n","class_name":"C","scheduling_policy":"durable_object","images":{{"default":{{"dockerfile":{},"build_context":{}}}}}}}]}}"#,
+                serde_json::to_string(&dockerfile.display().to_string()).unwrap(),
+                serde_json::to_string(&dir.join("sandbox").display().to_string()).unwrap(),
+            ),
+        );
+        let mut plan = plan_containers(&dir.join("staging"), false)
+            .unwrap()
+            .expect("declares");
+        assert_eq!(plan.dockerfiles.len(), 1);
+        let pinned = dir.join("sandbox/.noite-image-0.Dockerfile");
+        plan.set_dockerfile_absolute(0, &pinned);
+        assert_eq!(
+            plan.value()["containers"][0],
+            serde_json::json!({
+                "name": "n",
+                "class_name": "C",
+                "image": pinned.display().to_string(),
+            })
+        );
+        // Nothing written back: the staging file still carries the Void shape.
+        let staged: Value = read_json(&dir.join("staging/wrangler.json"));
+        assert!(staged["containers"][0].get("images").is_some());
     }
 
     #[test]

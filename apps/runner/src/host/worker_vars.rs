@@ -10,16 +10,17 @@
 //! a runner-owned name fails the deploy with the name in the log —
 //! `__VOID_PROXY`, `__PROJECT_ID`, `__VOID_PROXY_TOKEN`,
 //! `__VOID_PROJECT_SLUG`, `__VOID_EMAIL_DOMAIN`, `__VOID_EMAIL_DEPLOYMENT_ID`,
-//! plus `ISR_CACHE`, `MAIL_IDEMPOTENCY` and the `VOID_PROXY_*` proxy
-//! namespace on Void apps (the runner injects those bindings there, and
-//! the proxy render consumes those settings there — and only there, so
-//! only there are the names refused). The build/fleet process prefixes
-//! (`PORT`, `AWS_*`, `CELLD_*`,
-//! `BETTER_AUTH_*`, …) do NOT apply here: they guard the process
-//! environment, and Worker `vars` are a separate namespace no platform
-//! component reads (SPEC documents the per-prefix decision).
-//! `BETTER_AUTH_*` in particular must stay allowed: Void auth needs
-//! `BETTER_AUTH_SECRET`/`BETTER_AUTH_URL` in Worker env.
+//! `__VOID_SANDBOX`, `__VOID_SANDBOX_ADMISSION`,
+//! `__VOID_SANDBOX_ADMISSION_NAME`, `__VOID_SANDBOX_MAX_CONCURRENT`,
+//! `__VOID_SANDBOX_SOURCE`, plus `ISR_CACHE`, `MAIL_IDEMPOTENCY` and the
+//! `VOID_PROXY_*` proxy namespace on Void apps (the runner injects those
+//! bindings there, and the proxy render consumes those settings there —
+//! and only there, so only there are the names refused). The build/fleet
+//! process prefixes (`PORT`, `AWS_*`, `CELLD_*`, `BETTER_AUTH_*`, …) do NOT
+//! apply here: they guard the process environment, and Worker `vars` are a
+//! separate namespace no platform component reads (SPEC documents the
+//! per-prefix decision). `BETTER_AUTH_*` in particular must stay allowed:
+//! Void auth needs `BETTER_AUTH_SECRET`/`BETTER_AUTH_URL` in Worker env.
 //!
 //! Void's `secrets.required` (its `dist/ssr/wrangler.json` carries one, which
 //! the build-output rewrite drops because celld refuses the key): every
@@ -46,6 +47,11 @@ const RESERVED_WORKER_VARS: &[&str] = &[
     "__VOID_PROJECT_SLUG",
     "__VOID_EMAIL_DOMAIN",
     "__VOID_EMAIL_DEPLOYMENT_ID",
+    "__VOID_SANDBOX",
+    "__VOID_SANDBOX_ADMISSION",
+    "__VOID_SANDBOX_ADMISSION_NAME",
+    "__VOID_SANDBOX_MAX_CONCURRENT",
+    "__VOID_SANDBOX_SOURCE",
 ];
 
 /// Runner-owned Worker vars the runner injects only on Void apps, so the
@@ -88,13 +94,14 @@ pub fn worker_var_reserved_for(name: &str, void_app: bool) -> bool {
 
 /// Names the runner itself provides as Worker vars: a `secrets.required`
 /// entry naming one is satisfied without a setting. Exactly what the
-/// runner-owned merge injects on Void apps — the identity vars plus the
-/// `__VOID_PROXY` service binding — and `__VOID_EMAIL_DOMAIN` when the
+/// runner-owned merge injects on Void apps — the identity vars, the
+/// `__VOID_PROXY` service binding, and the `__VOID_SANDBOX` service binding
+/// when the app has a managed sandbox — and `__VOID_EMAIL_DOMAIN` when the
 /// operator configured a sender domain (without one the name is still
 /// reserved but unprovided, so a required entry naming it fails the
 /// deploy). Nothing else: the auto-provisioned `BETTER_AUTH_SECRET`
 /// flows through the settings load, so it needs no entry here.
-pub fn provisioned_names(void_app: bool, email_domain: bool) -> HashSet<String> {
+pub fn provisioned_names(void_app: bool, email_domain: bool, sandbox: bool) -> HashSet<String> {
     if !void_app {
         return HashSet::new();
     }
@@ -109,6 +116,9 @@ pub fn provisioned_names(void_app: bool, email_domain: bool) -> HashSet<String> 
     .collect();
     if email_domain {
         names.insert("__VOID_EMAIL_DOMAIN".to_string());
+    }
+    if sandbox {
+        names.insert("__VOID_SANDBOX".to_string());
     }
     names
 }
@@ -486,7 +496,7 @@ mod tests {
         assert!(check_required(
             &["__PROJECT_ID".to_string()],
             &[],
-            &provisioned_names(true, false),
+            &provisioned_names(true, false, false),
             "Settings"
         )
         .is_ok());
@@ -498,7 +508,7 @@ mod tests {
         // Void apps: the three identity vars plus the proxy service binding
         // the runner-owned merge writes.
         assert_eq!(
-            provisioned_names(true, false),
+            provisioned_names(true, false, false),
             [
                 "__PROJECT_ID",
                 "__VOID_PROJECT_SLUG",
@@ -512,14 +522,14 @@ mod tests {
         // The email domain is provisioned only when the operator configured
         // it: without one the name stays reserved-but-unprovided, so a
         // required entry naming it fails the deploy.
-        assert!(provisioned_names(true, false).contains("__VOID_PROXY_TOKEN"));
-        assert!(!provisioned_names(true, false).contains("__VOID_EMAIL_DOMAIN"));
-        assert!(provisioned_names(true, true).contains("__VOID_EMAIL_DOMAIN"));
+        assert!(provisioned_names(true, false, false).contains("__VOID_PROXY_TOKEN"));
+        assert!(!provisioned_names(true, false, false).contains("__VOID_EMAIL_DOMAIN"));
+        assert!(provisioned_names(true, true, false).contains("__VOID_EMAIL_DOMAIN"));
         assert!(
             check_required(
                 &["__VOID_EMAIL_DOMAIN".to_string()],
                 &[],
-                &provisioned_names(true, false),
+                &provisioned_names(true, false, false),
                 "Settings"
             )
             .is_err(),
@@ -529,19 +539,43 @@ mod tests {
             check_required(
                 &["__VOID_EMAIL_DOMAIN".to_string()],
                 &[],
-                &provisioned_names(true, true),
+                &provisioned_names(true, true, false),
                 "Settings"
             )
             .is_ok(),
             "configured domain must satisfy required"
         );
+        // The sandbox binding is provisioned only for Void apps with a
+        // managed sandbox — the only deploys the merge injects it into.
+        assert!(!provisioned_names(true, false, false).contains("__VOID_SANDBOX"));
+        assert!(provisioned_names(true, false, true).contains("__VOID_SANDBOX"));
+        assert!(
+            check_required(
+                &["__VOID_SANDBOX".to_string()],
+                &[],
+                &provisioned_names(true, false, false),
+                "Settings"
+            )
+            .is_err(),
+            "a sandbox-less app must not satisfy a __VOID_SANDBOX requirement"
+        );
+        assert!(
+            check_required(
+                &["__VOID_SANDBOX".to_string()],
+                &[],
+                &provisioned_names(true, false, true),
+                "Settings"
+            )
+            .is_ok(),
+            "a sandbox app's required __VOID_SANDBOX is runner-provided"
+        );
         // Non-Void apps: nothing is provisioned, so even an identity name in
         // `secrets.required` fails the deploy instead of passing unsatisfied.
-        assert!(provisioned_names(false, true).is_empty());
+        assert!(provisioned_names(false, true, true).is_empty());
         assert!(check_required(
             &["__PROJECT_ID".to_string()],
             &[],
-            &provisioned_names(false, false),
+            &provisioned_names(false, false, false),
             "Settings"
         )
         .is_err());

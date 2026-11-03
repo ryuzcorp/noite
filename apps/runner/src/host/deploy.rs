@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::Context;
+
 use crate::config::{Config, Tenancy};
 use crate::db;
 use crate::host::build_output;
@@ -18,6 +20,7 @@ use crate::host::void_cohost;
 use crate::host::void_deploy;
 use crate::host::void_migrate;
 use crate::host::void_proxy;
+use crate::host::void_sandbox;
 use crate::host::worker_vars;
 use crate::lifecycle::{self, sha_same};
 use crate::models::{App, AppStatus, DeployStatus};
@@ -898,6 +901,21 @@ async fn deploy_inner(
         )
         .await?;
 
+    // Managed Void sandbox (SPEC, Void sandbox controller): a Void app
+    // whose built config carries a `durable_object`-policy containers
+    // entry gets a controller cohosted in its fleet. The entry moves out
+    // of the app config now — the merges below never touch `containers`,
+    // so stripping first changes nothing they see — and the held entry
+    // stages the controller after the merges. Detected once, here: the
+    // required-secrets check, the runner-owned merge and the staging all
+    // key on this one value.
+    let sandbox_entry = if void_app {
+        void_sandbox::take_sandbox_entry(&deploy_root)?
+    } else {
+        None
+    };
+    let has_sandbox = sandbox_entry.is_some();
+
     // Settings → Worker `vars` (SPEC, Tenant env): the app's settings, or the
     // environment's overrides over them, become the deployed config's `vars`
     // (a setting wins over the config's own value), so Worker code reads them
@@ -945,7 +963,11 @@ async fn deploy_inner(
     worker_vars::check_required(
         &required_secrets,
         &worker_settings,
-        &worker_vars::provisioned_names(void_app, !cfg.void_proxy.email_domain.is_empty()),
+        &worker_vars::provisioned_names(
+            void_app,
+            !cfg.void_proxy.email_domain.is_empty(),
+            has_sandbox,
+        ),
         settings_label,
     )?;
     // Proxy-only settings (Void apps): the three credential names split
@@ -980,11 +1002,14 @@ async fn deploy_inner(
             pool,
             app,
             target.environment(),
-            &deploy_root,
-            &worker_settings,
-            (!cfg.void_proxy.email_domain.is_empty())
-                .then_some(cfg.void_proxy.email_domain.as_str()),
-            settings_label,
+            &void_deploy::VoidMergeCtx {
+                deploy_root: &deploy_root,
+                settings: &worker_settings,
+                email_domain: (!cfg.void_proxy.email_domain.is_empty())
+                    .then_some(cfg.void_proxy.email_domain.as_str()),
+                settings_label,
+                sandbox: has_sandbox,
+            },
         )
         .await?;
         if let Some((stats, _)) = &merged {
@@ -997,6 +1022,33 @@ async fn deploy_inner(
         None
     };
 
+    // The sandbox controller stages after the merges (SPEC, Void sandbox
+    // controller): protocol check, bundle load, admission name, and the
+    // mapped entry written to a staging dir. Only for a merged root: a
+    // TOML-only root stages nothing (celld refuses it, as before).
+    let staged_sandbox = match (&void_proxy_token, sandbox_entry) {
+        (Some(_), Some(entry)) => {
+            let staged = void_sandbox::StagedSandbox::stage(
+                pool,
+                &app.id,
+                target.environment_id(),
+                &void_sandbox::StageInputs {
+                    entry,
+                    app_root: &deploy_root,
+                    src_dir: &src_dir,
+                    bundle_dir: Path::new(&cfg.void_sandbox_bundle_dir),
+                    max_concurrent: cfg.void_sandbox_max_concurrent,
+                },
+            )
+            .await?;
+            progress
+                .log(DeployStatus::Deploying, &staged.log_line())
+                .await?;
+            Some(staged)
+        }
+        _ => None,
+    };
+
     // celld pulls container images for linux/amd64 unless told otherwise;
     // pin the pull to the nodes' own arch so arm64 installs pull native
     // images. Without containers celld never reads it.
@@ -1005,37 +1057,66 @@ async fn deploy_inner(
     // not deploy before celld sees it, normalize Void's shape, and prepare
     // each Dockerfile (checked to run nothing, its images vetted and
     // pinned). A config that declares containers also stretches the
-    // timeout over a first image pull.
-    let declares_containers =
-        match build_output::plan_containers(&deploy_root, cfg.sandbox_disabled)? {
-            None => false,
-            Some(mut plan) => {
-                // One bound over every pull and vet, like the deploy's own.
-                tokio::time::timeout(PREPARE_IMAGES_TIMEOUT, async {
-                    for (index, request) in plan.dockerfiles.clone() {
-                        let dockerfile = crate::host::container_image::prepare(
-                            &src_dir,
-                            index,
-                            &request,
-                            &container_platform,
-                        )
-                        .await
-                        .map_err(|e| e.context(format!("containers[{index}] image")))?;
-                        plan.set_dockerfile(index, &dockerfile);
-                    }
-                    anyhow::Ok(())
-                })
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "preparing container images took longer than {} s",
-                        PREPARE_IMAGES_TIMEOUT.as_secs()
+    // timeout over a first image pull. The staged controller entry plans
+    // through the same step (its `NOITE_SANDBOX` gate refuses a sandbox app
+    // on an install with containers off), with an unpinned registry ref
+    // refused before anything prepares.
+    let mut app_plan = build_output::plan_containers(&deploy_root, cfg.sandbox_disabled)?;
+    let mut sandbox_plan = match &staged_sandbox {
+        None => None,
+        Some(staged) => build_output::plan_containers(staged.dir(), cfg.sandbox_disabled)
+            .with_context(|| "the managed sandbox containers entry")?,
+    };
+    if let Some(plan) = &sandbox_plan {
+        void_sandbox::check_registry_pin(plan)?;
+    }
+    // The pinned Dockerfile behind the staged entry, if it builds from
+    // one: the render hashes it beside its build context.
+    let mut sandbox_pinned: Option<(crate::host::container_image::Request, PathBuf)> = None;
+    if app_plan.is_some() || sandbox_plan.is_some() {
+        // One bound over every pull and vet, like the deploy's own.
+        tokio::time::timeout(PREPARE_IMAGES_TIMEOUT, async {
+            if let Some(plan) = app_plan.as_mut() {
+                for (index, request) in plan.dockerfiles.clone() {
+                    let dockerfile = crate::host::container_image::prepare(
+                        &src_dir,
+                        index,
+                        &request,
+                        &container_platform,
                     )
-                })??;
-                plan.write()?;
-                true
+                    .await
+                    .map_err(|e| e.context(format!("containers[{}] image", index)))?;
+                    plan.set_dockerfile(index, &dockerfile);
+                }
             }
-        };
+            if let Some(plan) = sandbox_plan.as_mut() {
+                for (index, request) in plan.dockerfiles.clone() {
+                    let dockerfile = crate::host::container_image::prepare(
+                        &src_dir,
+                        index,
+                        &request,
+                        &container_platform,
+                    )
+                    .await
+                    .map_err(|e| e.context("prepare the managed sandbox image"))?;
+                    plan.set_dockerfile_absolute(index, &dockerfile);
+                    sandbox_pinned = Some((request, dockerfile));
+                }
+            }
+            anyhow::Ok(())
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "preparing container images took longer than {} s",
+                PREPARE_IMAGES_TIMEOUT.as_secs()
+            )
+        })??;
+    }
+    if let Some(plan) = &app_plan {
+        plan.write()?;
+    }
+    let declares_containers = app_plan.is_some();
 
     let env_owned = s3::aws_env(cfg);
     let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -1045,18 +1126,41 @@ async fn deploy_inner(
     // scripts first (each skipped when unchanged), the tenant app last
     // with its one infra retry. A Void app with a merged root renders its
     // proxy here — with the token the merge above ensured, read once for
-    // the whole deploy — while any other app deploys exactly one script,
-    // as before. The shared invocation fails the deploy on a non-UTF-8
-    // deploy root (work-dir-derived paths are operator-influenced)
-    // instead of panicking the deploy task.
+    // the whole deploy — plus its sandbox controller when one staged (the
+    // controller's lower order deploys it first), while any other app
+    // deploys exactly one script, as before. The shared invocation fails
+    // the deploy on a non-UTF-8 deploy root (work-dir-derived paths are
+    // operator-influenced) instead of panicking the deploy task.
     let cohosted = if let Some(proxy_token) = &void_proxy_token {
-        vec![void_proxy::render_proxy(&void_proxy::ProxyRenderCtx {
+        let mut scripts = Vec::new();
+        if let Some(staged) = &staged_sandbox {
+            let planned = sandbox_plan
+                .as_ref()
+                .context("staged sandbox controller declares no containers")?;
+            // Blocking tree I/O (the build context walk): off the async
+            // workers, as the other blocking reads in this pipeline.
+            let image_digest = match sandbox_pinned.clone() {
+                None => None,
+                Some((request, pinned)) => {
+                    let src = src_dir.clone();
+                    let context = tokio::task::spawn_blocking(move || {
+                        crate::host::container_image::context_digest(&src, &request)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("build context digest failed: {}", e))??;
+                    Some(void_sandbox::dockerfile_image_digest(&pinned, &context)?)
+                }
+            };
+            scripts.push(staged.render(planned.value(), image_digest)?);
+        }
+        scripts.push(void_proxy::render_proxy(&void_proxy::ProxyRenderCtx {
             app_id: &app.id,
             app_slug: &app.slug,
             proxy_token,
             operator: &cfg.void_proxy,
             settings: &proxy_settings,
-        })]
+        }));
+        scripts
     } else {
         Vec::new()
     };
@@ -1077,7 +1181,11 @@ async fn deploy_inner(
         &void_cohost::FleetApp {
             dir: &deploy_root,
             cwd: Some(&work),
-            timeout: Duration::from_secs(if declares_containers { 600 } else { 120 }),
+            timeout: if declares_containers {
+                void_cohost::CONTAINER_DEPLOY_TIMEOUT
+            } else {
+                Duration::from_secs(120)
+            },
         },
     )
     .await?;
