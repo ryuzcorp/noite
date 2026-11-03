@@ -19,11 +19,17 @@
 # One celld, one Caddy, one Node, one jup, one npm, one pnpm, one bun and one
 # docker CLI pin; docker/check-versions.ts asserts they appear exactly once.
 # Sidecar versions (esbuild, duckdb) live in docker/install-sidecars.sh.
-# Noite's patched build of the celld release in docker/celld/upstream.env
-# (SPEC, Noite's celld patches): the `<version>-noite.<level>` tag
-# .github/workflows/celld.yml published, pinned by its index digest.
-# docker/check-versions.ts asserts the tag matches upstream.env. A lab build
-# of an unpublished patch stack overrides CELLD_IMAGE with a local image.
+# celld comes from the ryuzcorp/celld fork (SPEC, celld): upstream
+# denoland/celld at 0.6.3 plus the fork's patches, published as
+# `<version>-ryuzcorp.<level>` with SLSA provenance attestations. The two
+# ARG lines below are the single source of the pin: a bump changes only
+# these values (the tag, then the digest from the fork's publish summary).
+# docker/check-versions.ts asserts the fork tag format and the digest pin,
+# and CI verifies the digest is what the tag resolves to plus its
+# attestation. A lab build of an unpublished fork tip overrides CELLD_IMAGE
+# with a local image.
+# Still the legacy pre-fork tag for now (same commit as 0.6.3-ryuzcorp.3);
+# the repin to 0.6.3-ryuzcorp.4 lands separately.
 ARG CELLD_VERSION=0.6.3-noite.3
 ARG CELLD_DIGEST=sha256:21190147b586c0c19c7ecc1694cf5e53223e9b7f9a320fbeb926dbc4d007ab96
 ARG CELLD_IMAGE=ghcr.io/ryuzcorp/celld:${CELLD_VERSION}@${CELLD_DIGEST}

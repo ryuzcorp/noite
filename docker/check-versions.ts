@@ -17,6 +17,8 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
+import { checkCelldPin } from "./check-versions-lib";
+
 const root = new URL("../", import.meta.url).pathname;
 
 const read = (rel: string): string =>
@@ -70,7 +72,10 @@ const compareVersions = (a: string, b: string): number => {
 };
 
 for (const [name, pattern] of [
-  ["celld", /ARG CELLD_VERSION=(?<version>\d+\.\d+\.\d+-noite\.\d+)/gu],
+  [
+    "celld",
+    /ARG CELLD_VERSION=(?<version>\d+\.\d+\.\d+-(?:ryuzcorp|noite)\.\d+)/gu,
+  ],
   ["celld digest", /ARG CELLD_DIGEST=(?<version>sha256:[0-9a-f]{64})/gu],
   ["caddy", /ARG CADDY_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
   ["node", /ARG NODE_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
@@ -95,41 +100,22 @@ for (const [name, pattern] of [
   }
 }
 
-// The celld image is Noite's patched build (docker/celld/): its tag is
-// `<CELLD_VERSION>-noite.<level>` for the CELLD_VERSION upstream.env pins.
-// A patch change bumps CELLD_PATCH_LEVEL, and celld.yml publishes that level
-// only once it is on main, so between the two PRs the Dockerfile may still
-// pin an earlier level of the same release. A release build
-// (`--release`, check.yml's `changelog` input) requires the exact level, or
-// the image ships a different patch stack than the repo describes.
-const upstream = Object.fromEntries(
-  read("docker/celld/upstream.env")
-    .split("\n")
-    .map((line) => line.match(/^(?<key>[A-Z_]+)=(?<value>\S+)$/u)?.groups)
-    .filter((groups) => groups !== undefined)
-    .map(({ key, value }) => [key, value])
-);
+// The celld image comes from the ryuzcorp/celld fork (SPEC, celld): its tag
+// is `<version>-ryuzcorp.<level>`. Tags predating the fork carry the legacy
+// `<version>-noite.<level>` name: accepted until the repin, but a release
+// build (`--release`, check.yml's `changelog` input) refuses them, so an
+// alpha can never ship a pre-fork image.
+const celldTag = dockerfile.match(/^ARG CELLD_VERSION=(?<tag>\S+)$/mu)?.groups
+  ?.tag;
 
-const celldPin = dockerfile.match(
-  /ARG CELLD_VERSION=(?<version>\S+)-noite\.(?<level>\d+)\n/u
-)?.groups;
+const celldReport = checkCelldPin(celldTag, process.argv.includes("--release"));
 
-const expectedCelldTag = `${upstream.CELLD_VERSION}-noite.${upstream.CELLD_PATCH_LEVEL}`;
-const pinnedLevel = Number(celldPin?.level);
-const patchLevel = Number(upstream.CELLD_PATCH_LEVEL);
+for (const note of celldReport.notes) {
+  console.log(`note: ${note}`);
+}
 
-if (celldPin?.version !== upstream.CELLD_VERSION || pinnedLevel > patchLevel) {
-  fail(
-    `celld: docker/Dockerfile pins ${celldPin ? `${celldPin.version}-noite.${celldPin.level}` : "nothing"}, docker/celld/upstream.env says ${expectedCelldTag}`
-  );
-} else if (pinnedLevel < patchLevel) {
-  const pending = `celld: docker/Dockerfile pins patch level ${pinnedLevel}; upstream.env is at ${patchLevel}. Pin ${expectedCelldTag} once celld.yml publishes it.`;
-
-  if (process.argv.includes("--release")) {
-    fail(pending);
-  } else {
-    console.log(`note: ${pending}`);
-  }
+for (const error of celldReport.errors) {
+  fail(error);
 }
 
 // ...and the stage must pull exactly that tag from Noite's own package, by

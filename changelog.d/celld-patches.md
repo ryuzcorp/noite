@@ -1,6 +1,6 @@
 ### Changed
 
-- The image now ships Noite's patched build of celld 0.6.3 (`ghcr.io/ryuzcorp/celld:0.6.3-noite.1`, pinned by digest), built from `docker/celld/` with celld's full upstream test suite. Upstream celld ships only security fixes from 0.6.x on, so Noite carries its own patches.
+- The image now ships celld 0.6.3 from the ryuzcorp/celld fork (`ghcr.io/ryuzcorp/celld:0.6.3-noite.1`, pinned by digest), built with celld's full upstream test suite. Upstream celld ships only security fixes from 0.6.x on, so the fork carries the patches.
 
 ### Fixed
 
