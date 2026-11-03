@@ -498,6 +498,7 @@ Portions of the runtime (the lease/admission/activity/alarm structure, the strea
 | --- | --- | --- |
 | `SANDBOX` (DO) | everything | `SandboxController` cells, one per sandbox id |
 | `__VOID_SANDBOX_ADMISSION` (DO) | everything | `NoiteSandboxAdmission` cells; controller-internal, never bound into the app |
+| `__VOID_SANDBOX_ADMISSION_NAME` | everything | secret name of the admission cell (at least 32 base64url characters, minted once per fleet by the runner): celld derives a named id from the name alone, so a fixed name would be a public address; missing or short fails every admission closed |
 | `__VOID_SANDBOX_MAX_CONCURRENT` | everything | max concurrent live sandboxes (default `"4"`; `"0"` admits nothing; unreadable falls back to the default) |
 | `__VOID_SANDBOX_SOURCE` | nothing | `void <version> / bundle sha256:<hex>` recorded at deploy; debug only |
 
