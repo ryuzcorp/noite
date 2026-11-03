@@ -526,6 +526,7 @@ fn proxy_egress_refusal(host: &str) -> Option<&'static str> {
     let bare = host.trim_matches(['[', ']']);
     if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
         return match ip {
+            ip if ip.is_unspecified() => Some("unspecified address"),
             std::net::IpAddr::V4(v4) if v4.is_loopback() => Some("loopback address"),
             std::net::IpAddr::V4(v4) if v4.is_private() => Some("private address"),
             std::net::IpAddr::V4(v4) if v4.is_link_local() => Some("link-local address"),
@@ -2442,6 +2443,8 @@ mod tests {
             "169.254.169.254",
             "fe80::1",
             "100.64.0.1",
+            "0.0.0.0",
+            "[::]",
             "100.127.255.255",
             "fc00::1",
             "fd12:3456::1",
