@@ -40,7 +40,7 @@ import type {
 } from "void/_sandbox-container";
 
 import type { AdmissionResult } from "./admission.ts";
-import { admissionInstanceId } from "./admission.ts";
+import { MIN_ADMISSION_NAME_LENGTH } from "./admission.ts";
 import type { ControllerEnv } from "./env.ts";
 
 interface Control {
@@ -533,7 +533,16 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
   }
 
   #admission(): Control {
-    return this.env.__VOID_SANDBOX_ADMISSION.getByName(admissionInstanceId());
+    // A secret name, not a fixed one: celld derives a named id from the
+    // name alone, so a guessable name would give the admission cell a
+    // public address. Missing or short fails closed.
+    const name = this.env.__VOID_SANDBOX_ADMISSION_NAME ?? "";
+
+    if (name.length < MIN_ADMISSION_NAME_LENGTH) {
+      throw denied("unavailable");
+    }
+
+    return this.env.__VOID_SANDBOX_ADMISSION.getByName(name);
   }
 
   async #arm(): Promise<void> {

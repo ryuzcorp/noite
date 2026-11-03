@@ -268,6 +268,7 @@ export interface EnvFakes {
   readonly admission?: FakeNamespace<FakeAdmission>;
   readonly maxConcurrent?: string;
   readonly source?: string;
+  readonly admissionName?: string | null;
 }
 
 export const makeControllerEnv = (fakes: EnvFakes = {}): ControllerEnv => ({
@@ -279,6 +280,10 @@ export const makeControllerEnv = (fakes: EnvFakes = {}): ControllerEnv => ({
     new FakeNamespace(
       () => new FakeAdmission()
     )) as unknown as ControllerEnv["__VOID_SANDBOX_ADMISSION"],
+  __VOID_SANDBOX_ADMISSION_NAME:
+    fakes.admissionName === null
+      ? undefined
+      : (fakes.admissionName ?? "test-admission-name-0123456789abcdefghij"),
   __VOID_SANDBOX_MAX_CONCURRENT: fakes.maxConcurrent,
   __VOID_SANDBOX_SOURCE: fakes.source,
 });

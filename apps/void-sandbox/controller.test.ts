@@ -198,16 +198,20 @@ interface Rig {
 const rig = (
   init: {
     admission?: FakeAdmission;
+    admissionName?: string | null;
     container?: FakeContainer;
     storage?: FakeStorage;
   } = {}
-): Rig => {
+): Rig & { namespace: FakeNamespace<FakeAdmission> } => {
   const storage = init.storage ?? new FakeStorage();
   const container = init.container ?? new FakeContainer();
   const admission = init.admission ?? new FakeAdmission();
 
+  const namespace = new FakeNamespace(() => admission);
+
   const env = makeControllerEnv({
-    admission: new FakeNamespace(() => admission),
+    admission: namespace,
+    admissionName: init.admissionName,
   });
 
   const controller = new SandboxController(
@@ -215,7 +219,7 @@ const rig = (
     env
   );
 
-  return { admission, container, controller, storage };
+  return { admission, container, controller, namespace, storage };
 };
 
 describe("celld start", () => {
@@ -508,6 +512,33 @@ describe("admission wiring", () => {
     expect(storage.store.has("__voidSandboxActivity")).toBe(false);
     expect(storage.alarmAt).toBeNull();
   });
+
+  test("admission is addressed by the secret name, never a fixed one", async () => {
+    const name = "s3cret-admission-name-abcdefghijklmnopqrstuv";
+    const { container, controller, namespace } = rig({ admissionName: name });
+    succeedExec(container);
+    await controller.invoke("exec", [["echo", "hi"]]);
+    expect([...namespace.instances.keys()]).toEqual([name]);
+  });
+
+  for (const [label, admissionName] of [
+    ["missing", null],
+    ["short", "too-short-to-be-secret"],
+  ] as const) {
+    test(`a ${label} admission name fails closed before any container starts`, async () => {
+      const { admission, container, controller, namespace } = rig({
+        admissionName,
+      });
+
+      succeedExec(container);
+      await expect(controller.invoke("exec", [["echo", "hi"]])).rejects.toThrow(
+        "VOID_SANDBOX_unavailable"
+      );
+      expect(namespace.instances.size).toBe(0);
+      expect(admission.calls).toHaveLength(0);
+      expect(container.starts).toHaveLength(0);
+    });
+  }
 
   test("running reports without admission", async () => {
     const { admission, container, controller } = rig();

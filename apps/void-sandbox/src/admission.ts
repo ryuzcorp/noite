@@ -2,8 +2,10 @@
  * Fleet-local sandbox admission: the Noite replacement for Void's
  * `__VOID_SANDBOX_CONTROL` service (see SPEC.md "Void sandbox controller").
  *
- * One instance per fleet (`getByName("admission")`, bound as
- * `__VOID_SANDBOX_ADMISSION` and never exposed to the app). The interface and
+ * One instance per fleet, bound as `__VOID_SANDBOX_ADMISSION` and never
+ * exposed to the app, addressed by the runner-minted secret name in
+ * `__VOID_SANDBOX_ADMISSION_NAME` (celld named ids are computable from a
+ * public name, so a fixed name would be a public address). The interface and
  * the fencing semantics follow Void's `sandbox-concurrency-counter.ts` (MIT
  * License, Copyright Cloudflare — see NOTICE): a stopped generation is never
  * re-admitted, and `stopped` always succeeds so teardown works after cap
@@ -36,7 +38,6 @@ interface Entry {
 
 type Entries = Record<string, Entry>;
 
-const ADMISSION_ID = "admission";
 const ENTRIES_KEY = "noite-sandbox-admission-v1";
 const COMPLETIONS_KEY = "noite-sandbox-completions-v1";
 const COMPLETION_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -44,8 +45,8 @@ const MAX_COMPLETIONS = 4096;
 const MAX_ID_LENGTH = 128;
 const RECONCILE_INTERVAL_MS = 60_000;
 
-/** Single instance id the controller addresses. Exported for the worker's deploy contract, not for the app. */
-export const admissionInstanceId = (): string => ADMISSION_ID;
+/** Shortest admission name the controller accepts: 32 base64url characters, 192 bits. */
+export const MIN_ADMISSION_NAME_LENGTH = 32;
 
 /**
  * Parse `__VOID_SANDBOX_MAX_CONCURRENT`. Only a plain non-negative integer

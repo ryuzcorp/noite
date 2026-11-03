@@ -17,6 +17,12 @@ export interface ControllerEnv {
   /** Fleet-local admission counter. Controller-internal; never app-visible. */
   readonly __VOID_SANDBOX_ADMISSION: DurableObjectNamespace<NoiteSandboxAdmission>;
   /**
+   * Secret name of the fleet's admission cell: at least 32 base64url
+   * characters, minted once per fleet by the runner. Missing or short
+   * fails every admission closed.
+   */
+  readonly __VOID_SANDBOX_ADMISSION_NAME?: string;
+  /**
    * Max concurrent live sandboxes, parsed as an integer (default `"4"`).
    * `"0"` admits nothing; an unreadable value falls back to the default.
    */
