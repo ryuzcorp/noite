@@ -15,6 +15,7 @@ use crate::host::s3;
 use crate::host::supervisor::{self, ProcMap};
 use crate::host::tips::TipBundle;
 use crate::host::void_deploy;
+use crate::host::void_migrate;
 use crate::host::worker_vars;
 use crate::lifecycle::{self, sha_same};
 use crate::models::{App, AppStatus, DeployStatus};
@@ -262,7 +263,7 @@ fn fleet_label(app: &App, target: &DeployTarget) -> String {
 /// The deploy row one run writes to and the step it is in: every line of the
 /// run, its failure included, lands on that one row, and the failure names
 /// the step (`fetch`, `install`, `build`, `convert`, `generate`, `release`, `deploy`,
-/// `start`).
+/// `start`, `migrate`).
 struct Progress<'a> {
     pool: &'a SqlitePool,
     app_id: &'a str,
@@ -1106,6 +1107,7 @@ async fn deploy_inner(
         Some(env) => env.listen_port,
         None => app.listen_port,
     };
+    let mut fleet_stopped_early = false;
     if let Some(port) = fleet_port {
         let budget = std::time::Duration::from_secs(cfg.wake_timeout_s.max(1));
         tokio::select! {
@@ -1117,12 +1119,39 @@ async fn deploy_inner(
             fate = supervisor::fleet_gone(procs, &fleet) => match fate {
                 supervisor::FleetFate::Removed => {
                     tracing::info!(fleet = %fleet, "fleet stopped before its health gate; deploy recorded");
+                    fleet_stopped_early = true;
                 }
                 supervisor::FleetFate::Exited(why) => {
                     anyhow::bail!("celld exited before answering its health gate: {why}");
                 }
             },
         }
+    }
+
+    // D1 migrations for Void apps (SPEC, Deploy pipeline): the new
+    // generation is adopted and healthy; run its in-worker migration
+    // endpoints before the deploy is marked success. A stop in the window
+    // skips them like it skips the gate (redeploy to run them); anything
+    // else failing fails the deploy.
+    if void_app && !fleet_stopped_early {
+        migrate_void_app(MigrateInputs {
+            pool,
+            cfg,
+            app,
+            target,
+            src_dir: &src_dir,
+            deploy_root: &deploy_root,
+            commit_sha: &commit_sha,
+            progress: &mut *progress,
+        })
+        .await?;
+    } else if void_app {
+        progress
+            .log(
+                DeployStatus::Deploying,
+                "migrate: skipped (the fleet stopped before its health gate; redeploy to run migrations)\n",
+            )
+            .await?;
     }
 
     // Healthy: route it at the edge before the row says so. Every Success
@@ -1174,6 +1203,274 @@ async fn deploy_inner(
     // lock, the next push, a delete — is held open by it.
     tokio::spawn(wipe_worktree(work));
     Ok(())
+}
+
+/// Run a Void app's D1 migrations through the new generation's in-worker
+/// endpoints (`host/void_migrate.rs`): protocol v2 where the worker
+/// advertises it (negotiated against the pushed tree's `db/migrations`), the
+/// legacy endpoint for older sqlite runtimes, and a loud refusal for
+/// Postgres/MySQL (Hyperdrive, which Noite does not run). Runs against this
+/// target's own fleet, so a preview migrates its own D1 and never
+/// production's. Every failure fails the deploy; applied migrations stay
+/// applied (forward-only).
+/// Everything the `migrate` step borrows, grouped so the step stays a plain
+/// function (eight loose parameters would need a lint exception, which the
+/// repo does not add).
+struct MigrateInputs<'a, 'b, 'c> {
+    pool: &'a SqlitePool,
+    cfg: &'a Config,
+    app: &'a App,
+    target: &'a DeployTarget,
+    src_dir: &'a Path,
+    deploy_root: &'a Path,
+    commit_sha: &'a str,
+    progress: &'b mut Progress<'c>,
+}
+
+async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<()> {
+    inputs
+        .progress
+        .step(
+            "migrate",
+            DeployStatus::Deploying,
+            "D1 migrations via the new worker",
+        )
+        .await?;
+    let environment_id = inputs.target.environment().map(|env| env.id.as_str());
+    let files =
+        void_migrate::collect_migrations(&void_migrate::resolve_migrations_dir(inputs.src_dir)?)?;
+    // The fleet's token, minted by the runner-owned merge earlier in this
+    // deploy (reused here, never re-minted): the worker checks it.
+    let (proxy_token, _) =
+        void_deploy::ensure_proxy_token(inputs.pool, &inputs.app.id, environment_id).await?;
+    let fleet_port = match inputs.target.environment() {
+        Some(env) => env.listen_port,
+        None => inputs.app.listen_port,
+    };
+    let Some(port) = fleet_port else {
+        if files.is_empty() {
+            inputs
+                .progress
+                .log(DeployStatus::Deploying, "migrate: no migrations to run\n")
+                .await?;
+            return Ok(());
+        }
+        anyhow::bail!(
+            "cannot run {} migration(s): the fleet has no listen port to reach the worker on",
+            files.len()
+        );
+    };
+    let client = void_migrate::MigrationClient::new(
+        reqwest::Client::new(),
+        format!("http://{}:{port}", inputs.cfg.caddy_upstream_host),
+        proxy_token,
+    );
+    // The health gate above was the readiness probe, so a fleet that answers
+    // it answers this too; still, a transport failure gets two slow-accept
+    // beats before it fails the deploy. Any answered probe without a v2
+    // shape means no v2 handler (a 404 from the inputs.app router, a legacy-only
+    // runtime), decided below from the tree.
+    let mut capabilities = None;
+    let mut answered_without_v2 = false;
+    let mut unreachable = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        match client.capabilities().await {
+            Ok(caps) => {
+                capabilities = Some(caps);
+                break;
+            }
+            Err(void_migrate::ProbeError::Transport { message }) => {
+                tracing::warn!(
+                    fleet = %fleet_label(inputs.app, inputs.target),
+                    attempt,
+                    error = %message,
+                    "migration capabilities probe failed"
+                );
+                unreachable = message;
+            }
+            Err(_) => {
+                answered_without_v2 = true;
+                break;
+            }
+        }
+    }
+    if let Some(caps) = capabilities {
+        // Capability negotiation, as the platform's: the worker's dialect,
+        // classifier and list hash must match the pushed tree's. Without
+        // tree files (a CLI deploy of a prebuilt bundle) there is nothing
+        // to check against, so the worker's self-verified bundle runs
+        // unchecked — and says so in the log.
+        let mut diffs = Vec::new();
+        if caps.dialect != "sqlite" {
+            diffs.push(format!(
+                "dialect worker={} manifest=sqlite",
+                void_migrate::one_line(&caps.dialect)
+            ));
+        }
+        if caps.classifier_version != void_migrate::CLASSIFIER_VERSION {
+            diffs.push(format!(
+                "classifierVersion worker={} manifest={}",
+                caps.classifier_version,
+                void_migrate::CLASSIFIER_VERSION
+            ));
+        }
+        if !files.is_empty() {
+            let bundle =
+                void_migrate::build_plan_bundle(&files).map_err(|e| anyhow::anyhow!("{e}"))?;
+            if caps.migration_list_hash != bundle.migration_list_hash {
+                diffs.push(format!(
+                    "migrationListHash worker={} manifest={}",
+                    void_migrate::one_line(&caps.migration_list_hash),
+                    bundle.migration_list_hash
+                ));
+            }
+        }
+        if !diffs.is_empty() {
+            anyhow::bail!(
+                "migration protocol v2 capability negotiation failed: deployed worker build differs from the pushed tree ({})",
+                diffs.join("; ")
+            );
+        }
+        if files.is_empty() {
+            inputs.progress
+                .log(
+                    DeployStatus::Deploying,
+                    "migrate: the pushed tree has no db/migrations; applying the worker's bundled migrations without a list-hash check\n",
+                )
+                .await?;
+        }
+        let response = client
+            .migrate_app(
+                &void_migrate::mint_attempt_id(),
+                inputs.progress.id.as_deref().unwrap_or(inputs.commit_sha),
+            )
+            .await;
+        for warning in &response.warnings {
+            inputs
+                .progress
+                .log(
+                    DeployStatus::Deploying,
+                    &format!("migrate: warning: {}\n", void_migrate::one_line(warning)),
+                )
+                .await?;
+        }
+        if !response.ok {
+            anyhow::bail!(
+                "migration failed: {}",
+                void_migrate::format_migration_failure(&response)
+            );
+        }
+        log_migrate_outcome(inputs.progress, &response).await?;
+        if caps.auth_endpoint.is_some() {
+            client
+                .migrate_auth()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            inputs
+                .progress
+                .log(
+                    DeployStatus::Deploying,
+                    "migrate: auth migrations applied\n",
+                )
+                .await?;
+        }
+        return Ok(());
+    }
+    if !answered_without_v2 {
+        anyhow::bail!("could not reach the new worker's migration endpoint: {unreachable}");
+    }
+    if files.is_empty() {
+        inputs
+            .progress
+            .log(DeployStatus::Deploying, "migrate: no migrations to run\n")
+            .await?;
+        return Ok(());
+    }
+    // No v2 handler but tree migrations: an older sqlite runtime — or a
+    // Postgres/MySQL inputs.app, whose handlers serve the legacy endpoint only and
+    // need Hyperdrive. Refuse those loudly rather than serve an empty DB.
+    let config = effective_config(inputs.deploy_root)
+        .await
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("cannot run migrations: the deployed config could not be read back")
+        })?;
+    if void_migrate::config_has_hyperdrive(&config) && !void_migrate::config_has_d1(&config) {
+        anyhow::bail!(
+            "this Void app's migrations target Postgres/MySQL (the config has a `hyperdrive` binding and no D1), which Noite does not run; refusing to deploy with an empty database (move the app to D1: `database.dialect: \"sqlite\"` in void.json)"
+        );
+    }
+    let response = client
+        .migrate_legacy()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !response.ok {
+        anyhow::bail!(
+            "migration failed: {}",
+            void_migrate::format_migration_failure(&response)
+        );
+    }
+    log_migrate_outcome(inputs.progress, &response).await?;
+    Ok(())
+}
+
+/// The step's outcome line: applied and skipped counts with the quoted file
+/// names (tenant-controlled, so Debug-quoted, never raw).
+async fn log_migrate_outcome(
+    progress: &mut Progress<'_>,
+    response: &void_migrate::MigrateResponse,
+) -> sqlx::Result<()> {
+    let applied: Vec<&str> = response
+        .migrations
+        .iter()
+        .filter(|migration| migration.is_applied())
+        .map(|migration| migration.name.as_str())
+        .collect();
+    // v2 marks untouched migrations `skipped`; legacy entries carry no
+    // status, so an un-applied one without an error counts as skipped
+    // there. A failed entry never counts here — but failures never reach
+    // this line.
+    let skipped: Vec<&str> = response
+        .migrations
+        .iter()
+        .filter(|migration| {
+            migration.is_skipped()
+                || (!migration.is_applied()
+                    && migration.error.is_none()
+                    && migration.status.is_none())
+        })
+        .map(|migration| migration.name.as_str())
+        .collect();
+    let mut line = format!(
+        "migrate: applied {}, skipped {}",
+        applied.len(),
+        skipped.len()
+    );
+    let mut lists = Vec::new();
+    if !applied.is_empty() {
+        lists.push(format!("applied: {}", quoted(&applied)));
+    }
+    if !skipped.is_empty() {
+        lists.push(format!("skipped: {}", quoted(&skipped)));
+    }
+    if !lists.is_empty() {
+        line.push_str(&format!(" ({})", lists.join("; ")));
+    }
+    line.push('\n');
+    progress.log(DeployStatus::Deploying, &line).await
+}
+
+/// Debug-quote each name (as required-secret names are quoted): no raw
+/// tenant text into the log.
+fn quoted(names: &[&str]) -> String {
+    names
+        .iter()
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Make a healthy deploy's target routable (its sha and `running`, the state
