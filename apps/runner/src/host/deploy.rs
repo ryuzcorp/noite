@@ -1237,8 +1237,14 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
         )
         .await?;
     let environment_id = inputs.target.environment().map(|env| env.id.as_str());
-    let files =
-        void_migrate::collect_migrations(&void_migrate::resolve_migrations_dir(inputs.src_dir)?)?;
+    // Blocking tree I/O (directory walk, capped file reads): off the async
+    // workers, as the other blocking reads in this pipeline.
+    let src_dir = inputs.src_dir.to_path_buf();
+    let files = tokio::task::spawn_blocking(move || {
+        void_migrate::collect_migrations(&void_migrate::resolve_migrations_dir(&src_dir)?)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("migration collection failed: {}", e))??;
     // The fleet's token, minted by the runner-owned merge earlier in this
     // deploy (reused here, never re-minted): the worker checks it.
     let (proxy_token, _) =
@@ -1261,7 +1267,7 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
         );
     };
     let client = void_migrate::MigrationClient::new(
-        reqwest::Client::new(),
+        void_migrate::migration_http_client(),
         format!("http://{}:{}", inputs.cfg.caddy_upstream_host, port),
         proxy_token,
     );
@@ -1290,6 +1296,9 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
                     "migration capabilities probe failed"
                 );
                 unreachable = message;
+            }
+            Err(void_migrate::ProbeError::TooLarge { message }) => {
+                anyhow::bail!("migration capabilities response too large: {}", message);
             }
             Err(_) => {
                 answered_without_v2 = true;
@@ -1348,15 +1357,7 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
                 inputs.progress.id.as_deref().unwrap_or(inputs.commit_sha),
             )
             .await;
-        for warning in &response.warnings {
-            inputs
-                .progress
-                .log(
-                    DeployStatus::Deploying,
-                    &format!("migrate: warning: {}\n", void_migrate::one_line(warning)),
-                )
-                .await?;
-        }
+        log_migrate_warnings(inputs.progress, &response).await?;
         if !response.ok {
             anyhow::bail!(
                 "migration failed: {}",
@@ -1385,16 +1386,10 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
             unreachable
         );
     }
-    if files.is_empty() {
-        inputs
-            .progress
-            .log(DeployStatus::Deploying, "migrate: no migrations to run\n")
-            .await?;
-        return Ok(());
-    }
-    // No v2 handler but tree migrations: an older sqlite runtime — or a
-    // Postgres/MySQL inputs.app, whose handlers serve the legacy endpoint only and
-    // need Hyperdrive. Refuse those loudly rather than serve an empty DB.
+    // No v2 handler: an older sqlite runtime — or a Postgres/MySQL app,
+    // whose handlers serve the legacy endpoint only and need Hyperdrive.
+    // The refusal runs before the empty-tree early return, so a prebuilt pg
+    // tree (no `db/migrations`) can never deploy green with an empty DB.
     let config = effective_config(inputs.deploy_root)
         .await
         .and_then(|text| serde_json::from_str(&text).ok())
@@ -1405,6 +1400,13 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
         anyhow::bail!(
             "this Void app's migrations target Postgres/MySQL (the config has a `hyperdrive` binding and no D1), which Noite does not run; refusing to deploy with an empty database (move the app to D1: `database.dialect: \"sqlite\"` in void.json)"
         );
+    }
+    if files.is_empty() {
+        inputs
+            .progress
+            .log(DeployStatus::Deploying, "migrate: no migrations to run\n")
+            .await?;
+        return Ok(());
     }
     let response = client
         .migrate_legacy()
@@ -1418,6 +1420,39 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
     }
     log_migrate_outcome(inputs.progress, &response).await?;
     Ok(())
+}
+
+/// The worker's warnings in one log write: the first 20 plus a count. One
+/// write, not one per warning — warnings are tenant-controlled, and every
+/// write is ~3 sqlite queries on the writer every app's deploys share.
+async fn log_migrate_warnings(
+    progress: &mut Progress<'_>,
+    response: &void_migrate::MigrateResponse,
+) -> sqlx::Result<()> {
+    if response.warnings.is_empty() && response.warnings_dropped == 0 {
+        return Ok(());
+    }
+    let mut text = String::new();
+    for warning in response
+        .warnings
+        .iter()
+        .take(void_migrate::MAX_LOGGED_WARNINGS)
+    {
+        text.push_str(&format!(
+            "migrate: warning: {}\n",
+            void_migrate::one_line(warning)
+        ));
+    }
+    let rest = response
+        .warnings
+        .len()
+        .saturating_sub(void_migrate::MAX_LOGGED_WARNINGS)
+        + response.warnings_dropped;
+    if rest > 0 {
+        let noun = if rest == 1 { "warning" } else { "warnings" };
+        text.push_str(&format!("migrate: ...and {} more {}\n", rest, noun));
+    }
+    progress.log(DeployStatus::Deploying, &text).await
 }
 
 /// The step's outcome line: applied and skipped counts with the quoted file
@@ -1459,6 +1494,12 @@ async fn log_migrate_outcome(
     if !skipped.is_empty() {
         lists.push(format!("skipped: {}", quoted(&skipped)));
     }
+    if response.migrations_dropped > 0 {
+        lists.push(format!(
+            "{} response entries past the cap are not listed",
+            response.migrations_dropped
+        ));
+    }
     if !lists.is_empty() {
         line.push_str(&format!(" ({})", lists.join("; ")));
     }
@@ -1467,13 +1508,23 @@ async fn log_migrate_outcome(
 }
 
 /// Debug-quote each name (as required-secret names are quoted): no raw
-/// tenant text into the log.
+/// tenant text into the log. Lists the first 20 with a count, and flattens
+/// after quoting (Debug leaves U+2028/U+2029 raw, which would forge lines in
+/// UIs that honor them).
 fn quoted(names: &[&str]) -> String {
-    names
+    let shown = names.len().min(void_migrate::MAX_LOGGED_MIGRATION_NAMES);
+    let mut out = names[..shown]
         .iter()
         .map(|name| format!("{:?}", name))
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    if names.len() > shown {
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("...and {} more", names.len() - shown));
+    }
+    void_migrate::one_line(&out)
 }
 
 /// Make a healthy deploy's target routable (its sha and `running`, the state
@@ -1824,8 +1875,9 @@ pub async fn deploy_tip(
 #[cfg(test)]
 mod tests {
     use super::{
-        contained_deploy_root, failure_summary, go_arch, has_build_script, parse_wrangler_build,
-        route_live, wipe_worktree, without_runner_keys,
+        contained_deploy_root, failure_summary, go_arch, has_build_script, log_migrate_warnings,
+        migrate_void_app, parse_wrangler_build, quoted, route_live, wipe_worktree,
+        without_runner_keys, DeployTarget, MigrateInputs, Progress,
     };
     use serde_json::json;
 
@@ -2088,5 +2140,170 @@ mod tests {
 
         assert!(!work.exists(), "the worktree is wiped");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- migrate step -------------------------------------------------------
+
+    /// One `migrate` step against a fake worker with no v2 handler (every
+    /// probe 404s, so the step takes the legacy path) and an empty pushed
+    /// tree: returns the step's outcome and the deploy log.
+    async fn run_migrate_once(tag: &str, wrangler_json: &str) -> (Result<(), String>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new()).await.unwrap();
+        });
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        let cfg = crate::config::config_for_tests();
+        let app = crate::db::create_app(
+            &pool,
+            &cfg,
+            crate::db::NewApp {
+                name: "migtest",
+                slug: "migtest",
+                user_id: "local",
+                subdomain: "migtest.localhost",
+                listen: i64::from(port),
+                internal: 30101,
+            },
+        )
+        .await
+        .unwrap();
+        let base =
+            std::env::temp_dir().join(format!("noite-migrate-{}-{}", tag, crate::models::new_id()));
+        let src = base.join("src");
+        let root = base.join("root");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("wrangler.json"), wrangler_json).unwrap();
+        let target = DeployTarget::Production;
+        let mut progress = Progress {
+            pool: &pool,
+            app_id: &app.id,
+            environment_id: None,
+            sha: Some("abc123".to_string()),
+            id: None,
+            step: "migrate",
+        };
+        let outcome = migrate_void_app(MigrateInputs {
+            pool: &pool,
+            cfg: &cfg,
+            app: &app,
+            target: &target,
+            src_dir: &src,
+            deploy_root: &root,
+            commit_sha: "abc123",
+            progress: &mut progress,
+        })
+        .await
+        .map_err(|e| e.to_string());
+        let log: String = sqlx::query_scalar("SELECT log FROM deploy WHERE id = ?")
+            .bind(progress.id.clone().unwrap_or_default())
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_default();
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&base);
+        (outcome, log)
+    }
+
+    /// A prebuilt pg tree (no `db/migrations`, older runtime with no v2
+    /// handler) is refused loudly: the hyperdrive check runs before the
+    /// empty-tree early return, so the deploy can never go green with an
+    /// empty database.
+    #[tokio::test]
+    async fn legacy_pg_app_with_no_tree_files_is_still_refused() {
+        let (outcome, _) =
+            run_migrate_once("pg", r#"{"hyperdrive": [{"binding": "HYPERDRIVE"}]}"#).await;
+        let err = outcome.unwrap_err();
+        assert!(
+            err.contains("refusing to deploy with an empty database"),
+            "{}",
+            err
+        );
+    }
+
+    /// The same empty tree without hyperdrive still skips quietly: the
+    /// refusal moved, the skip did not go away.
+    #[tokio::test]
+    async fn legacy_empty_sqlite_tree_skips_migrations() {
+        let (outcome, log) =
+            run_migrate_once("sqlite", r#"{"d1_databases": [{"binding": "DB"}]}"#).await;
+        outcome.expect("an empty sqlite tree skips the step");
+        assert!(log.contains("migrate: no migrations to run"), "{}", log);
+    }
+
+    /// Worker warnings land as one write: the first twenty lines plus a
+    /// count covering the rest and the entries the array cap dropped — never
+    /// one sqlite write per warning.
+    #[tokio::test]
+    async fn migrate_warnings_log_first_twenty_plus_a_count() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        let cfg = crate::config::config_for_tests();
+        let app = crate::db::create_app(
+            &pool,
+            &cfg,
+            crate::db::NewApp {
+                name: "migwarn",
+                slug: "migwarn",
+                user_id: "local",
+                subdomain: "migwarn.localhost",
+                listen: 30100,
+                internal: 30101,
+            },
+        )
+        .await
+        .unwrap();
+        let mut progress = Progress {
+            pool: &pool,
+            app_id: &app.id,
+            environment_id: None,
+            sha: Some("abc123".to_string()),
+            id: None,
+            step: "migrate",
+        };
+        let response = crate::host::void_migrate::MigrateResponse {
+            ok: true,
+            attempt_id: None,
+            migrations: Vec::new(),
+            confirmed_applied: Vec::new(),
+            confirmed_skipped: Vec::new(),
+            stability: None,
+            warnings: (0..25).map(|i| format!("warning {}", i)).collect(),
+            error: None,
+            warnings_dropped: 100,
+            migrations_dropped: 0,
+        };
+        log_migrate_warnings(&mut progress, &response)
+            .await
+            .expect("log warnings");
+        let log: String = sqlx::query_scalar("SELECT log FROM deploy WHERE id = ?")
+            .bind(progress.id.clone().unwrap_or_default())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(log.contains("migrate: warning: warning 0\n"), "{}", log);
+        assert!(log.contains("migrate: warning: warning 19\n"), "{}", log);
+        assert!(!log.contains("warning 20"), "{}", log);
+        assert!(
+            log.contains("migrate: ...and 105 more warnings\n"),
+            "{}",
+            log
+        );
+    }
+
+    /// Outcome name lists show the first twenty with a count, and stay one
+    /// line: quoting flattens U+2028 instead of passing it through.
+    #[test]
+    fn quoted_caps_names_and_flattens_separators() {
+        let names: Vec<String> = (0..25).map(|i| format!("{:04}.sql", i)).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let out = quoted(&refs);
+        assert!(out.contains("\"0019.sql\""), "{}", out);
+        assert!(!out.contains("0020.sql"), "{}", out);
+        assert!(out.contains("...and 5 more"), "{}", out);
+        let sneaky = quoted(&["a\u{2028}b.sql"]);
+        assert!(!sneaky.contains('\u{2028}'), "{:?}", sneaky);
+        assert_eq!(sneaky.lines().count(), 1);
     }
 }

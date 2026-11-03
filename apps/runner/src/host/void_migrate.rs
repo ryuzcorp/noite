@@ -52,14 +52,29 @@ pub struct MigrationFile {
     pub sql: String,
 }
 
+/// Bounds on the migration tree read: pushed trees are untrusted, and an
+/// unbounded collect lets one app OOM the runner (a symlink to `/dev/zero`)
+/// or wedge an executor thread (a fifo). Real trees hold dozens of kilobyte
+/// files; these caps sit orders of magnitude above that.
+pub const MAX_MIGRATION_FILES: usize = 10_000;
+/// Per-file SQL cap.
+pub const MAX_MIGRATION_FILE_BYTES: usize = 16 * 1024 * 1024;
+/// Total SQL cap across the directory.
+pub const MAX_MIGRATION_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+/// `void.json` is a small manifest; anything past this is hostile or broken.
+pub const MAX_VOID_JSON_BYTES: usize = 1024 * 1024;
+
 /// Collect `*.sql` from `dir`, sorted by filename, excluding `seed.sql` —
 /// Void's `migrations/collect.ts` rule, confirmed by running it (see the
 /// `collector` golden vectors): the match is case-sensitive (`.SQL` is not
 /// collected), the read is non-recursive (a `meta/` dir contributes nothing),
 /// and a missing directory collects nothing. File bytes decode lossy, as
 /// Node's `readFileSync(..., 'utf-8')` does, so hashes match even for
-/// non-UTF-8 files. Any other I/O error (including a *directory* named
-/// `*.sql`, which Node also chokes on) fails loudly.
+/// non-UTF-8 files. Blocking file I/O: callers run this off the async
+/// executor. Any other I/O error fails loudly, as does anything that is not
+/// a regular file (a symlink, fifo, device or *directory* named `*.sql` —
+/// Node chokes on the directory too, and follows the symlink, where this
+/// refuses it) or anything past the caps above.
 pub fn collect_migrations(dir: &Path) -> anyhow::Result<Vec<MigrationFile>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -75,31 +90,78 @@ pub fn collect_migrations(dir: &Path) -> anyhow::Result<Vec<MigrationFile>> {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.ends_with(".sql") && name != "seed.sql" {
             names.push(name);
+            if names.len() > MAX_MIGRATION_FILES {
+                anyhow::bail!(
+                    "refusing to collect migrations from {}: more than {} files",
+                    dir.display(),
+                    MAX_MIGRATION_FILES
+                );
+            }
         }
     }
     names.sort();
-    names
-        .into_iter()
-        .map(|name| {
-            let bytes = std::fs::read(dir.join(&name)).with_context(|| format!("read {}", name))?;
-            Ok(MigrationFile {
-                name,
-                sql: String::from_utf8_lossy(&bytes).into_owned(),
-            })
-        })
-        .collect()
+    let mut files = Vec::with_capacity(names.len());
+    let mut total = 0usize;
+    for name in names {
+        let path = dir.join(&name);
+        // `symlink_metadata` follows nothing (as the runner's other tree
+        // readers): only a regular file is ever collected.
+        let file_type = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("read {}", name))?
+            .file_type();
+        if !file_type.is_file() {
+            anyhow::bail!("refusing to collect {}: not a regular file", name);
+        }
+        let bytes = read_capped_file(&path, &name, MAX_MIGRATION_FILE_BYTES)?;
+        total += bytes.len();
+        if total > MAX_MIGRATION_TOTAL_BYTES {
+            anyhow::bail!(
+                "refusing to collect migrations from {}: over the {} MiB total cap",
+                dir.display(),
+                MAX_MIGRATION_TOTAL_BYTES / 1024 / 1024
+            );
+        }
+        files.push(MigrationFile {
+            name,
+            sql: String::from_utf8_lossy(&bytes).into_owned(),
+        });
+    }
+    Ok(files)
+}
+
+/// Read one file with a hard byte cap. `take(limit + 1)` cuts both a plain
+/// oversized file and a stream that never ends (a fifo); the pre-check reads
+/// nothing, so there is no stat-then-read race to win.
+fn read_capped_file(path: &Path, name: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).with_context(|| format!("read {}", name))?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", name))?;
+    if bytes.len() > limit {
+        anyhow::bail!(
+            "refusing to collect {}: over the {} MiB per-file cap",
+            name,
+            limit / 1024 / 1024
+        );
+    }
+    Ok(bytes)
 }
 
 /// The tree's migrations directory: `<root>/db/migrations`, or under
 /// `void.json`'s `sourceDir` when set (Void's `readProjectPaths`). An
 /// absolute `sourceDir`, or one escaping the root via `..`, fails the deploy
-/// instead of taking the runner outside the worktree; a missing or
-/// unreadable `void.json` falls back to the root (the build already parsed
-/// it, and the capabilities-first flow still runs the worker's bundled
-/// migrations when the tree has none).
+/// instead of taking the runner outside the worktree, as does a symlink
+/// anywhere in the resolved path below the root (a `sourceDir` component
+/// pointing at `/`, a symlinked `db/`); a missing or unreadable `void.json`
+/// falls back to the root (the build already parsed it, and the
+/// capabilities-first flow still runs the worker's bundled migrations when
+/// the tree has none). Only an oversized `void.json` fails instead of
+/// falling back. Blocking file I/O, like the collect call.
 pub fn resolve_migrations_dir(src_dir: &Path) -> anyhow::Result<PathBuf> {
     let mut root = src_dir.to_path_buf();
-    if let Ok(text) = std::fs::read_to_string(src_dir.join("void.json")) {
+    if let Some(text) = read_void_json(src_dir)? {
         if let Some(dir) = serde_json::from_str::<Value>(&text).ok().and_then(|value| {
             value
                 .get("sourceDir")
@@ -116,7 +178,56 @@ pub fn resolve_migrations_dir(src_dir: &Path) -> anyhow::Result<PathBuf> {
             root = src_dir.join(rel);
         }
     }
-    Ok(root.join("db").join("migrations"))
+    let dir = root.join("db").join("migrations");
+    refuse_symlinked_components(src_dir, &dir)?;
+    Ok(dir)
+}
+
+/// `void.json`'s text, or `None` when it is missing, unreadable or not
+/// UTF-8 (all fall back to the root, as before). Only an oversized manifest
+/// fails the deploy instead.
+fn read_void_json(src_dir: &Path) -> anyhow::Result<Option<String>> {
+    use std::io::Read as _;
+    let Ok(file) = std::fs::File::open(src_dir.join("void.json")) else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    let Ok(_) = file
+        .take(MAX_VOID_JSON_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+    else {
+        return Ok(None);
+    };
+    if bytes.len() > MAX_VOID_JSON_BYTES {
+        anyhow::bail!(
+            "void.json is over the {} MiB cap; refusing to parse it",
+            MAX_VOID_JSON_BYTES / 1024 / 1024
+        );
+    }
+    Ok(String::from_utf8(bytes).ok())
+}
+
+/// Refuse a symlink anywhere in `dir` below `src_dir`: following one could
+/// hash bytes from outside the worktree. Missing components are fine —
+/// collection treats a missing directory as no migrations.
+fn refuse_symlinked_components(src_dir: &Path, dir: &Path) -> anyhow::Result<()> {
+    let mut current = dir;
+    while let Ok(suffix) = current.strip_prefix(src_dir) {
+        if suffix.as_os_str().is_empty() {
+            break;
+        }
+        if std::fs::symlink_metadata(current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            anyhow::bail!(
+                "refusing to collect migrations: {} is a symlink",
+                suffix.display()
+            );
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -125,9 +236,13 @@ pub fn resolve_migrations_dir(src_dir: &Path) -> anyhow::Result<PathBuf> {
 
 /// Flatten tenant- or engine-controlled text to one log line: the deploy log
 /// is a line stream, and a raw newline would forge lines past the `ERROR:`
-/// prefix. Newlines become spaces; everything else is kept verbatim.
+/// prefix. Every line separator becomes a space — CR, LF, CRLF (one space),
+/// vertical tab, form feed, NEL, U+2028/U+2029 — everything else verbatim.
 pub fn one_line(text: &str) -> String {
-    text.replace("\r\n", " ").replace(['\r', '\n'], " ")
+    text.replace("\r\n", " ").replace(
+        ['\r', '\n', '\x0b', '\x0c', '\u{85}', '\u{2028}', '\u{2029}'],
+        " ",
+    )
 }
 
 /// Mint a v2 attempt id: Void's `generateId('migatt')` shape
@@ -710,6 +825,66 @@ pub fn build_plan_bundle(migrations: &[MigrationFile]) -> Result<PlanBundle, Str
 // `platform/packages/api/src/deploy/migrate-worker.ts` + `migrations.ts`)
 // ---------------------------------------------------------------------------
 
+/// Bounds on worker migration responses: the worker is tenant-influenced,
+/// so every body is stream-read with a hard byte cap and every parsed array
+/// truncated — an unbounded `response.text()` plus per-warning DB writes
+/// once let one app OOM the runner or stall the shared sqlite writer.
+/// Healthy responses are kilobytes; these caps sit far above that.
+pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+/// Parsed-array caps: entries past the cap are dropped and counted in
+/// `migrations_dropped` / `warnings_dropped` on the response.
+pub const MAX_RESPONSE_MIGRATIONS: usize = 10_000;
+pub const MAX_RESPONSE_WARNINGS: usize = 50;
+/// Log lines per deploy: the first warnings and migration names plus a
+/// count, in one write — never one write per tenant-controlled entry.
+pub const MAX_LOGGED_WARNINGS: usize = 20;
+pub const MAX_LOGGED_MIGRATION_NAMES: usize = 20;
+
+/// The migration HTTP client: it never follows redirects, so a
+/// tenant-influenced worker cannot steer the fleet token in
+/// `x-void-internal` to another host (reqwest's default follows up to ten,
+/// keeping that header). Void's platform caller uses a redirect-less fetch,
+/// so this matches the reference too.
+pub fn migration_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("migration HTTP client builds")
+}
+
+/// Read one migration response body with the hard cap: a declared
+/// `Content-Length` past the cap fails before a byte is buffered, and a
+/// chunked body is cut mid-stream. A mid-body transport error keeps today's
+/// shape (an empty body, which each caller's existing garbage/unknown
+/// handling decides), so only the cap itself is a new failure.
+async fn read_capped(response: reqwest::Response) -> Result<String, String> {
+    if let Some(declared) = response.content_length() {
+        if declared > MAX_RESPONSE_BYTES as u64 {
+            return Err(format!(
+                "migration response declares {} bytes, over the {} MiB cap",
+                declared,
+                MAX_RESPONSE_BYTES / 1024 / 1024
+            ));
+        }
+    }
+    use futures::StreamExt as _;
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            return Ok(String::new());
+        };
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_RESPONSE_BYTES {
+            return Err(format!(
+                "migration response body exceeded the {} MiB cap",
+                MAX_RESPONSE_BYTES / 1024 / 1024
+            ));
+        }
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 /// What the capabilities probe concluded. Like the platform, only a valid v2
 /// shape counts as advertised; anything else (a 404 from the app router, a
 /// legacy-only handler, garbage) falls back to the tree-driven decision.
@@ -722,11 +897,13 @@ pub struct Capabilities {
 }
 
 /// Why the capabilities probe did not yield v2: the fleet answered without
-/// one (`Http`/`Shape`), or did not answer at all (`Transport`).
+/// one (`Http`/`Shape`), answered with a body past the cap (`TooLarge`),
+/// or did not answer at all (`Transport`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeError {
     Http { status: u16, preview: String },
     Shape { preview: String },
+    TooLarge { message: String },
     Transport { message: String },
 }
 
@@ -738,6 +915,9 @@ impl std::fmt::Display for ProbeError {
             }
             ProbeError::Shape { preview } => {
                 write!(f, "worker capabilities probe shape invalid: {}", preview)
+            }
+            ProbeError::TooLarge { message } => {
+                write!(f, "worker capabilities response too large: {}", message)
             }
             ProbeError::Transport { message } => {
                 write!(f, "worker capabilities probe request failed: {}", message)
@@ -797,6 +977,13 @@ pub struct MigrateResponse {
     pub warnings: Vec<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// Entries dropped by the parsed-array caps: the arrays above hold the
+    /// first `MAX_RESPONSE_*` entries. Never from the wire (a hostile worker
+    /// must not set its own counts).
+    #[serde(skip)]
+    pub warnings_dropped: usize,
+    #[serde(skip)]
+    pub migrations_dropped: usize,
 }
 
 impl MigrateResponse {
@@ -810,12 +997,34 @@ impl MigrateResponse {
             stability: None,
             warnings: Vec::new(),
             error: Some(message),
+            warnings_dropped: 0,
+            migrations_dropped: 0,
         }
+    }
+
+    /// Drop parsed entries past the array caps, counting them: a worker
+    /// returning a million warnings must cost a bounded Vec, not a million
+    /// log writes downstream.
+    fn truncate_arrays(&mut self) {
+        if self.migrations.len() > MAX_RESPONSE_MIGRATIONS {
+            self.migrations_dropped = self.migrations.len() - MAX_RESPONSE_MIGRATIONS;
+            self.migrations.truncate(MAX_RESPONSE_MIGRATIONS);
+        }
+        if self.warnings.len() > MAX_RESPONSE_WARNINGS {
+            self.warnings_dropped = self.warnings.len() - MAX_RESPONSE_WARNINGS;
+            self.warnings.truncate(MAX_RESPONSE_WARNINGS);
+        }
+        // The confirmed lists mirror the migrations array; bound them the
+        // same way (they are never logged, so they need no counter).
+        self.confirmed_applied.truncate(MAX_RESPONSE_MIGRATIONS);
+        self.confirmed_skipped.truncate(MAX_RESPONSE_MIGRATIONS);
     }
 }
 
 /// Validate one worker response body: the platform's
-/// `normalizeUserWorkerMigrationResult` (object, with a `migrations` array).
+/// `normalizeUserWorkerMigrationResult` (object, with a `migrations` array),
+/// plus the parsed-array caps (a valid shape with a million warnings parses
+/// into the first fifty and a count).
 pub fn normalize_response(value: Value, body_preview: &str) -> MigrateResponse {
     if !value.is_object() {
         return MigrateResponse {
@@ -830,6 +1039,8 @@ pub fn normalize_response(value: Value, body_preview: &str) -> MigrateResponse {
                 "migration endpoint returned invalid response: {}",
                 body_preview
             )),
+            warnings_dropped: 0,
+            migrations_dropped: 0,
         };
     }
     if value.get("migrations").and_then(Value::as_array).is_none() {
@@ -845,21 +1056,28 @@ pub fn normalize_response(value: Value, body_preview: &str) -> MigrateResponse {
                 "migration endpoint returned invalid response: missing migrations array ({})",
                 body_preview
             )),
+            warnings_dropped: 0,
+            migrations_dropped: 0,
         };
     }
-    serde_json::from_value(value).unwrap_or_else(|_| MigrateResponse {
-        ok: false,
-        attempt_id: None,
-        migrations: Vec::new(),
-        confirmed_applied: Vec::new(),
-        confirmed_skipped: Vec::new(),
-        stability: None,
-        warnings: Vec::new(),
-        error: Some(format!(
-            "migration endpoint returned invalid response: missing migrations array ({})",
-            body_preview
-        )),
-    })
+    let mut response: MigrateResponse =
+        serde_json::from_value(value).unwrap_or_else(|_| MigrateResponse {
+            ok: false,
+            attempt_id: None,
+            migrations: Vec::new(),
+            confirmed_applied: Vec::new(),
+            confirmed_skipped: Vec::new(),
+            stability: None,
+            warnings: Vec::new(),
+            error: Some(format!(
+                "migration endpoint returned invalid response: missing migrations array ({})",
+                body_preview
+            )),
+            warnings_dropped: 0,
+            migrations_dropped: 0,
+        });
+    response.truncate_arrays();
+    response
 }
 
 /// Render a failed worker response for the deploy log: the platform's
@@ -950,7 +1168,10 @@ impl MigrationClient {
                 message: one_line(&e.to_string()),
             })?;
         let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
+        let text = match read_capped(response).await {
+            Ok(text) => text,
+            Err(message) => return Err(ProbeError::TooLarge { message }),
+        };
         if !(200..300).contains(&status) {
             return Err(ProbeError::Http {
                 status,
@@ -1010,7 +1231,15 @@ impl MigrationClient {
             .await
         {
             Ok(response) => {
-                let text = response.text().await.unwrap_or_default();
+                // An oversized body is an unknown outcome, like garbage: the
+                // migration may have applied, so reconcile rather than fail.
+                let text = match read_capped(response).await {
+                    Ok(text) => text,
+                    Err(e) => {
+                        tracing::warn!(attempt_id, error = %e, "migration response past the cap; reconciling");
+                        return self.reconcile_twice(attempt_id).await;
+                    }
+                };
                 if is_cf_asset_stub(&text) {
                     return self.reconcile_twice(attempt_id).await;
                 }
@@ -1063,7 +1292,23 @@ impl MigrationClient {
             .send()
             .await?;
         let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
+        let text = match read_capped(response).await {
+            Ok(text) => text,
+            Err(message) => {
+                return Ok(MigrateResponse {
+                    ok: false,
+                    attempt_id: Some(attempt_id.to_string()),
+                    migrations: Vec::new(),
+                    confirmed_applied: Vec::new(),
+                    confirmed_skipped: Vec::new(),
+                    stability: Some("stable".to_string()),
+                    warnings: Vec::new(),
+                    error: Some(format!("migration outcome unknown and {}", message)),
+                    warnings_dropped: 0,
+                    migrations_dropped: 0,
+                });
+            }
+        };
         match serde_json::from_str::<Value>(&text) {
             Ok(value) => Ok(normalize_response(value, &preview(&text, 500))),
             Err(_) => Ok(MigrateResponse {
@@ -1079,6 +1324,8 @@ impl MigrationClient {
                     status,
                     preview(&text, 200)
                 )),
+                warnings_dropped: 0,
+                migrations_dropped: 0,
             }),
         }
     }
@@ -1096,7 +1343,10 @@ impl MigrationClient {
             .await
             .map_err(|e| one_line(&e.to_string()))?;
         let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
+        let text = match read_capped(response).await {
+            Ok(text) => text,
+            Err(message) => return Err(format!("auth migration failed: {}", message)),
+        };
         let data: Value = serde_json::from_str(&text).map_err(|_| {
             format!(
                 "auth migration failed ({}): {}",
@@ -1133,7 +1383,12 @@ impl MigrationClient {
                 .await
                 .map_err(|e| one_line(&e.to_string()))?;
             let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
+            // A capped body is a verdict, not propagation: it fails at once,
+            // with no retry.
+            let text = match read_capped(response).await {
+                Ok(text) => text,
+                Err(message) => return Err(message),
+            };
             if is_cf_asset_stub(&text) {
                 tracing::warn!(attempt, "migration dispatch hit an asset stub; retrying");
                 continue;
@@ -1514,6 +1769,8 @@ mod tests {
             stability: None,
             warnings: Vec::new(),
             error: top.map(str::to_string),
+            warnings_dropped: 0,
+            migrations_dropped: 0,
         };
         assert_eq!(
             format_migration_failure(&failed(
@@ -1576,7 +1833,7 @@ mod tests {
 
     fn client(base: &str) -> MigrationClient {
         MigrationClient::new(
-            reqwest::Client::new(),
+            migration_http_client(),
             base.to_string(),
             "token".to_string(),
         )
@@ -1627,7 +1884,7 @@ mod tests {
             }
         );
         // The token header is the auth the handler expects: wrong token 401s.
-        let denied = MigrationClient::new(reqwest::Client::new(), base, "wrong".to_string())
+        let denied = MigrationClient::new(migration_http_client(), base, "wrong".to_string())
             .capabilities()
             .await;
         assert!(matches!(denied, Err(ProbeError::Http { status: 401, .. })));
@@ -1651,7 +1908,7 @@ mod tests {
             Err(ProbeError::Shape { .. })
         ));
         let legacy = MigrationClient::new(
-            reqwest::Client::new(),
+            migration_http_client(),
             format!("{}/legacy-only", base),
             "token".to_string(),
         );
@@ -1897,7 +2154,7 @@ mod tests {
         assert!(response.ok);
         assert_eq!(response.migrations.iter().filter(|m| m.applied).count(), 1);
         let failing = MigrationClient::new(
-            reqwest::Client::new(),
+            migration_http_client(),
             format!("{}/failing", base),
             "token".to_string(),
         )
@@ -1945,5 +2202,344 @@ mod tests {
         let base = format!("http://{}", probe.local_addr().unwrap());
         drop(probe);
         assert!(client(&base).migrate_legacy().await.is_err());
+    }
+
+    // --- response and tree bounds ------------------------------------------
+
+    /// Every line separator flattens: CR/LF plus vertical tab, form feed,
+    /// NEL and U+2028/U+2029. A hostile name smuggling U+2028 (which Debug
+    /// leaves raw) still renders as one log line.
+    #[test]
+    fn one_line_flattens_every_separator() {
+        assert_eq!(one_line("a\x0bb\x0cc"), "a b c");
+        assert_eq!(one_line("a\u{85}b"), "a b");
+        assert_eq!(one_line("a\u{2028}b\u{2029}c"), "a b c");
+        let response = MigrateResponse {
+            ok: false,
+            attempt_id: None,
+            migrations: vec![MigrationOutcome {
+                name: "a\u{2028}b.sql".to_string(),
+                applied: false,
+                duration_ms: 1,
+                error: Some("boom".to_string()),
+                status: Some("failed".to_string()),
+                stability: Some("stable".to_string()),
+            }],
+            confirmed_applied: Vec::new(),
+            confirmed_skipped: Vec::new(),
+            stability: None,
+            warnings: Vec::new(),
+            error: Some("top".to_string()),
+            warnings_dropped: 0,
+            migrations_dropped: 0,
+        };
+        let rendered = format_migration_failure(&response);
+        assert!(!rendered.contains('\u{2028}'), "{:?}", rendered);
+        assert_eq!(rendered.lines().count(), 1);
+    }
+
+    /// Huge parsed arrays truncate with counts: the first fifty warnings and
+    /// the first ten thousand migrations survive, the rest becomes a number.
+    /// A hostile worker cannot set its own drop counts.
+    #[test]
+    fn normalize_response_truncates_huge_arrays() {
+        let warnings: Vec<Value> = (0..MAX_RESPONSE_WARNINGS + 10)
+            .map(|i| Value::String(format!("w{}", i)))
+            .collect();
+        let migrations: Vec<Value> = (0..MAX_RESPONSE_MIGRATIONS + 5)
+            .map(|i| serde_json::json!({"name": format!("{:05}.sql", i)}))
+            .collect();
+        let confirmed: Vec<Value> = (0..MAX_RESPONSE_MIGRATIONS + 5)
+            .map(|i| Value::String(format!("c{}", i)))
+            .collect();
+        let response = normalize_response(
+            serde_json::json!({
+                "ok": true,
+                "migrations": migrations,
+                "warnings": warnings,
+                "confirmedApplied": confirmed,
+            }),
+            "preview",
+        );
+        assert!(response.ok);
+        assert_eq!(response.warnings.len(), MAX_RESPONSE_WARNINGS);
+        assert_eq!(response.warnings_dropped, 10);
+        assert_eq!(response.warnings[0], "w0");
+        assert_eq!(response.migrations.len(), MAX_RESPONSE_MIGRATIONS);
+        assert_eq!(response.migrations_dropped, 5);
+        assert_eq!(response.migrations[0].name, "00000.sql");
+        assert_eq!(response.confirmed_applied.len(), MAX_RESPONSE_MIGRATIONS);
+        let sneaky = normalize_response(
+            serde_json::json!({"ok": true, "migrations": [], "warnings_dropped": 99}),
+            "preview",
+        );
+        assert_eq!(sneaky.warnings_dropped, 0);
+        assert_eq!(sneaky.migrations_dropped, 0);
+    }
+
+    /// A body past the cap, streamed with no `Content-Length` (the worst
+    /// case: nothing to reject up front).
+    fn flood_stream() -> axum::body::Body {
+        let chunks = (0..MAX_RESPONSE_BYTES / (1024 * 1024) + 1).map(|_| {
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(vec![b'x'; 1024 * 1024]))
+        });
+        axum::body::Body::from_stream(futures::stream::iter(chunks))
+    }
+
+    /// Oversized bodies fail the deploy with a clear error instead of
+    /// buffering unbounded: the capabilities probe (fixed and streamed
+    /// bodies), the legacy call (failing fast, with no retry) and auth.
+    #[tokio::test]
+    async fn oversized_bodies_are_capped() {
+        let router = axum::Router::new()
+            .route(
+                "/fixed/__void/migrate/capabilities",
+                axum::routing::get(|| async { vec![b'x'; MAX_RESPONSE_BYTES + 1] }),
+            )
+            .route(
+                "/streamed/__void/migrate/capabilities",
+                axum::routing::get(|| async { flood_stream() }),
+            );
+        let (base, handle) = serve(router).await;
+        for prefix in ["/fixed", "/streamed"] {
+            let probe = MigrationClient::new(
+                migration_http_client(),
+                format!("{}{}", base, prefix),
+                "token".to_string(),
+            )
+            .capabilities()
+            .await;
+            assert!(
+                matches!(probe, Err(ProbeError::TooLarge { .. })),
+                "{}: {:?}",
+                prefix,
+                probe
+            );
+            assert!(
+                probe.unwrap_err().to_string().contains("4 MiB"),
+                "{}",
+                prefix
+            );
+        }
+        handle.abort();
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let router = {
+            let hits = hits.clone();
+            axum::Router::new()
+                .route(
+                    "/__void/migrate",
+                    axum::routing::post(move || async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        flood_stream()
+                    }),
+                )
+                .route(
+                    "/__void/migrate/auth",
+                    axum::routing::post(|| async { flood_stream() }),
+                )
+        };
+        let (base, handle) = serve(router).await;
+        let err = client(&base).migrate_legacy().await.unwrap_err();
+        assert!(err.contains("4 MiB cap"), "{}", err);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let err = client(&base).migrate_auth().await.unwrap_err();
+        assert!(err.contains("auth migration failed"), "{}", err);
+        assert!(err.contains("4 MiB cap"), "{}", err);
+        handle.abort();
+    }
+
+    /// An oversized app body is an unknown outcome, like garbage: the
+    /// migration may have applied, so the client reconciles — a clean
+    /// reconcile verdict stands, and a capped reconcile fails the deploy.
+    #[tokio::test]
+    async fn oversized_app_body_reconciles() {
+        for reconcile_floods in [false, true] {
+            let reconciled = Arc::new(AtomicUsize::new(0));
+            let router = {
+                let reconciled = reconciled.clone();
+                axum::Router::new()
+                    .route(
+                        "/__void/migrate/app",
+                        axum::routing::post(|| async { flood_stream() }),
+                    )
+                    .route(
+                        "/__void/migrate/app/attempt/{attempt}",
+                        axum::routing::get(move || async move {
+                            reconciled.fetch_add(1, Ordering::SeqCst);
+                            if reconcile_floods {
+                                return flood_stream();
+                            }
+                            axum::body::Body::from(
+                                serde_json::json!({
+                                    "ok": true,
+                                    "attemptId": "migatt_test",
+                                    "confirmedApplied": ["0001_init.sql"],
+                                    "migrations": [
+                                        {"name": "0001_init.sql", "applied": true, "durationMs": 1, "status": "applied"},
+                                    ],
+                                })
+                                .to_string(),
+                            )
+                        }),
+                    )
+            };
+            let (base, handle) = serve(router).await;
+            let response = client(&base).migrate_app("migatt_test", "deploy-1").await;
+            assert_eq!(reconciled.load(Ordering::SeqCst), 1);
+            if reconcile_floods {
+                assert!(!response.ok);
+                let error = response.error.unwrap_or_default();
+                assert!(error.contains("4 MiB cap"), "{}", error);
+            } else {
+                assert!(response.ok);
+                assert_eq!(response.confirmed_applied, ["0001_init.sql"]);
+            }
+            handle.abort();
+        }
+    }
+
+    /// The migration client never follows redirects: a 302 answers as a 302,
+    /// and the redirect target (which would otherwise receive the fleet
+    /// token) is never hit.
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        let marker = Arc::new(AtomicUsize::new(0));
+        let router = {
+            let marker = marker.clone();
+            axum::Router::new()
+                .route(
+                    "/__void/migrate/capabilities",
+                    axum::routing::get(|| async {
+                        (
+                            axum::http::StatusCode::FOUND,
+                            [("location", "/marker")],
+                            "go away",
+                        )
+                    }),
+                )
+                .route(
+                    "/marker",
+                    axum::routing::get(move || async move {
+                        marker.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(serde_json::json!({
+                            "protocolVersion": 2,
+                            "dialect": "sqlite",
+                            "classifierVersion": 1,
+                            "migrationListHash": "sha256:abc",
+                            "destructiveValidation": "passed",
+                        }))
+                    }),
+                )
+        };
+        let (base, handle) = serve(router).await;
+        let probe = client(&base).capabilities().await;
+        assert!(
+            matches!(probe, Err(ProbeError::Http { status: 302, .. })),
+            "{:?}",
+            probe
+        );
+        assert_eq!(marker.load(Ordering::SeqCst), 0);
+        handle.abort();
+    }
+
+    /// File count, per-file and total caps: each refuses the deploy with a
+    /// message naming the cap.
+    #[test]
+    fn collector_caps_files_and_bytes() {
+        let dir = scratch("cap-file").canonicalize().unwrap();
+        std::fs::write(
+            dir.join("big.sql"),
+            vec![b'x'; MAX_MIGRATION_FILE_BYTES + 1],
+        )
+        .unwrap();
+        let err = collect_migrations(&dir).unwrap_err().to_string();
+        assert!(err.contains("per-file cap"), "{}", err);
+
+        let dir = scratch("cap-total").canonicalize().unwrap();
+        for i in 0..5 {
+            std::fs::write(
+                dir.join(format!("{:04}.sql", i)),
+                vec![b'x'; 14 * 1024 * 1024],
+            )
+            .unwrap();
+        }
+        let err = collect_migrations(&dir).unwrap_err().to_string();
+        assert!(err.contains("total cap"), "{}", err);
+
+        let dir = scratch("cap-count").canonicalize().unwrap();
+        for i in 0..=MAX_MIGRATION_FILES {
+            std::fs::write(dir.join(format!("{:06}.sql", i)), "SELECT 1;\n").unwrap();
+        }
+        let err = collect_migrations(&dir).unwrap_err().to_string();
+        assert!(err.contains("more than"), "{}", err);
+    }
+
+    /// Only regular files are collected: symlinks (wherever they point),
+    /// fifos and sockets fail the deploy instead of being read. The type
+    /// check runs before any open, so the fifo never blocks.
+    #[test]
+    #[cfg(unix)]
+    fn collector_refuses_symlinks_fifos_and_sockets() {
+        use std::os::unix::fs::symlink;
+        let dir = scratch("cap-links").canonicalize().unwrap();
+        std::fs::write(dir.join("real.sql"), "SELECT 1;\n").unwrap();
+        symlink(dir.join("real.sql"), dir.join("link.sql")).unwrap();
+        symlink("/dev/null", dir.join("null.sql")).unwrap();
+        let err = collect_migrations(&dir).unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{}", err);
+
+        let dir = scratch("cap-fifo").canonicalize().unwrap();
+        let fifo = dir.join("stuck.sql");
+        let raw = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
+        let err = collect_migrations(&dir).unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{}", err);
+
+        // Unix socket paths must fit SUN_LEN, so this one skips the long
+        // unique scratch prefix.
+        let dir = std::env::temp_dir().join(format!("noite-cap-sock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(dir.join("s.sql")).unwrap();
+        let err = collect_migrations(&dir).unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{}", err);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlink anywhere in the migrations path below the root fails the
+    /// deploy: neither a `sourceDir` component pointing outside the worktree
+    /// nor a symlinked `db/` is followed.
+    #[test]
+    #[cfg(unix)]
+    fn resolve_refuses_symlinked_source_dir() {
+        use std::os::unix::fs::symlink;
+        let outside = scratch("resolve-outside").canonicalize().unwrap();
+        std::fs::create_dir_all(outside.join("db").join("migrations")).unwrap();
+        std::fs::write(
+            outside.join("db").join("migrations").join("evil.sql"),
+            "SELECT 1;\n",
+        )
+        .unwrap();
+
+        let dir = scratch("resolve-link").canonicalize().unwrap();
+        symlink(&outside, dir.join("client")).unwrap();
+        std::fs::write(dir.join("void.json"), r#"{"sourceDir": "client"}"#).unwrap();
+        let err = resolve_migrations_dir(&dir).unwrap_err().to_string();
+        assert!(err.contains("is a symlink"), "{}", err);
+
+        let dir = scratch("resolve-dblink").canonicalize().unwrap();
+        symlink(&outside, dir.join("db")).unwrap();
+        let err = resolve_migrations_dir(&dir).unwrap_err().to_string();
+        assert!(err.contains("is a symlink"), "{}", err);
+    }
+
+    /// An oversized `void.json` fails the deploy instead of being parsed.
+    #[test]
+    fn resolve_refuses_huge_void_json() {
+        let dir = scratch("resolve-big").canonicalize().unwrap();
+        std::fs::write(dir.join("void.json"), vec![b'x'; MAX_VOID_JSON_BYTES + 1]).unwrap();
+        let err = resolve_migrations_dir(&dir).unwrap_err().to_string();
+        assert!(err.contains("over the 1 MiB cap"), "{}", err);
     }
 }

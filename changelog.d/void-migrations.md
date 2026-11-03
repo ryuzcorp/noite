@@ -6,3 +6,4 @@
 ### Operator action required
 
 - Migrations are forward-only: rolling back the code never un-applies them, so a deploy that fails at `migrate` leaves applied migrations in place — fix the migration and redeploy, which skips what is already applied. Between reload adoption and the `migrate` step the new Worker briefly serves the old schema (celld adopts the new generation at reload; Void migrates before its traffic switch), so keep migrations backward-compatible. Stopping an app mid-deploy skips its migrations; redeploy to run them.
+- Unlike `release`, a failed `migrate` leaves the new Worker serving a half-migrated schema (traffic switched at reload) while the deploy reads Failed. The step is bounded: worker responses past 4 MiB fail the deploy, warning/name lists log the first 20 plus a count, and per-request timeouts cap the worst case at ~11.5 min (~15.5 on the legacy endpoint).
