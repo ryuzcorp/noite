@@ -20,18 +20,23 @@
 //! deploy, zero pointer flapping, zero multi-script window. The hash
 //! covers the sources and the rendered config with secret values
 //! substituted by their hashes, so a rotation redeploys the script while
-//! the stored row holds a digest only — never a secret.
+//! the stored row holds a digest only — never a secret. Per-deploy
+//! container-image paths are excluded from the hash (their stable content
+//! rides [`RenderedCohost::extra_hash_input`]), so identical content in
+//! another build dir still skips.
 //!
 //! Failure windows (design §2.4): tenant-code failures are pre-pointer
 //! (celld bundles before writing anything). If a cohosted deploy succeeds
 //! and the app deploy then fails on infra (S3/CAS errors), the fleet
 //! pointer names the cohosted script until the next successful deploy —
 //! the 300 s poll backstop could adopt it as primary in that window and
-//! serve its 404s. Mitigations: the app deploy retries once on infra
-//! errors ([`celld_deploy_app`], idempotent); anything else fails loudly;
-//! the next successful deploy heals. Cohosted scripts themselves get no
-//! retry: a failed one fails the deploy before the app moves the pointer,
-//! so the fleet keeps serving its old generation.
+//! serve its 404s. Mitigations: every `celld deploy` in the sequence
+//! retries once on infra errors ([`deploy_with_infra_retry`], idempotent —
+//! a fence-image `AlreadyExists` race between two concurrent deploys heals
+//! inside the deploy instead of failing it); tenant failures fail at once;
+//! anything else fails loudly; the next successful deploy heals. A failed
+//! cohosted script still fails the deploy before the app moves the
+//! pointer, so the fleet keeps serving its old generation.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -86,8 +91,8 @@ pub struct RenderedCohost {
     /// Extra content-hash inputs beyond sources and config: the sandbox
     /// render feeds its image digest composite here, so an image change
     /// redeploys the script even though the config's `image` string (a
-    /// pinned path) reads the same. Empty for scripts whose config carries
-    /// every input.
+    /// per-deploy pinned path) is excluded from the hash. Empty for
+    /// scripts whose config carries every input.
     pub extra_hash_input: Vec<u8>,
     /// Whether the rendered config declares containers: such a script gets
     /// the container deploy timeout (a first image pull), like the app.
@@ -110,6 +115,53 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Strip per-deploy container-image paths from a config copy before
+/// hashing: a Dockerfile entry's `image` is the pinned file's absolute
+/// path (`/data/runner/builds/<slug>/<timestamp>/…`), which differs on
+/// every deploy while the content is identical — hashing it redeploys the
+/// script (and its fence image) every time and lets two concurrent
+/// deploys race celld's fence-image build. The stable content — pinned
+/// Dockerfile bytes plus build-context digest — rides `extra_hash_input`
+/// instead, so the path carries no signal. Digest-pinned registry refs
+/// are stable content and stay hashed, as does everything outside
+/// `containers[]`: only absolute-path strings (refs never start with
+/// `/`) and the path-valued `dockerfile`/`build_context` keys go.
+fn normalize_container_paths(config: &mut Value) {
+    /// Strip the per-deploy paths from one entry-shaped object.
+    fn strip(entry: &mut serde_json::Map<String, Value>) {
+        entry.remove("dockerfile");
+        entry.remove("build_context");
+        if entry
+            .get("image")
+            .and_then(Value::as_str)
+            .is_some_and(|image| image.starts_with('/'))
+        {
+            entry.remove("image");
+        }
+    }
+    let Some(entries) = config
+        .get_mut("containers")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for entry in entries {
+        let Some(entry) = entry.as_object_mut() else {
+            continue;
+        };
+        strip(entry);
+        // Planned values never carry `images` (planning normalizes it
+        // away), but a direct render caller might — same rule there.
+        if let Some(default) = entry
+            .get_mut("images")
+            .and_then(|images| images.get_mut("default"))
+            .and_then(Value::as_object_mut)
+        {
+            strip(default);
+        }
+    }
+}
+
 impl RenderedCohost {
     /// The `wrangler.json` written beside the sources.
     pub fn config_json(&self) -> anyhow::Result<String> {
@@ -119,8 +171,10 @@ impl RenderedCohost {
     /// The skip-when-unchanged digest: SHA-256 over the source paths and
     /// bytes in order (embedded sources, then runtime ones), then the
     /// extra hash input, then the rendered config with every secret var's
-    /// value substituted by its hash. Deterministic: same inputs, same
-    /// digest — and any source, config, image or secret change flips it.
+    /// value substituted by its hash and per-deploy container-image paths
+    /// excluded ([`normalize_container_paths`]). Deterministic: same
+    /// inputs, same digest — and any source, config, image or secret
+    /// change flips it.
     pub fn content_hash(&self) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
@@ -149,6 +203,7 @@ impl RenderedCohost {
                 }
             }
         }
+        normalize_container_paths(&mut config);
         // `serde_json::Map` without `preserve_order` is a `BTreeMap`: keys
         // serialize sorted, so this is canonical across renders.
         hasher.update(
@@ -274,8 +329,8 @@ const TENANT_ERROR_MARKERS: &[&str] = &[
 ];
 
 /// True when a `celld deploy` failure reads as tenant-caused (no retry).
-/// Everything else — S3/CAS answers, timeouts, a hung celld — reads as
-/// infra and the app deploy retries once.
+/// Everything else — S3/CAS answers, timeouts, a hung celld, a fence-image
+/// `AlreadyExists` race — reads as infra and the deploy retries once.
 pub fn is_tenant_error(output: &str) -> bool {
     TENANT_ERROR_MARKERS.iter().any(|m| output.contains(m))
 }
@@ -289,27 +344,26 @@ pub struct AppDeploy {
     pub attempts: u32,
 }
 
-/// Deploy the tenant app: one `celld deploy`, retried once when the
-/// failure reads as infra (S3/CAS errors, timeouts — [`is_tenant_error`]
-/// decides). The retry is idempotent (content-versioned deploys), and it
-/// narrows §2.4's window: a transient store blip between the cohosted and
-/// app deploys heals inside this deploy instead of leaving the pointer on
-/// a cohosted script. A twice-failed deploy carries both attempts'
-/// errors; the row's summary still truncates to one line.
-pub async fn celld_deploy_app(
+/// One `celld deploy`, retried once when the failure reads as infra
+/// (S3/CAS errors, timeouts — [`is_tenant_error`] decides). The retry is
+/// idempotent (content-versioned deploys). Returns the attempt count: 1,
+/// or 2 when the retry ran. Tenant failures return at once, unretried; a
+/// twice-failed deploy carries both attempts' errors. The cohosted
+/// scripts and the tenant app share this — one classification, one retry.
+async fn deploy_with_infra_retry(
     celld: &CelldDeploy<'_>,
     project_dir: &Path,
     cwd: Option<&Path>,
-) -> anyhow::Result<AppDeploy> {
+) -> anyhow::Result<u32> {
     match celld_deploy(celld, project_dir, cwd).await {
-        Ok(_) => Ok(AppDeploy { attempts: 1 }),
+        Ok(_) => Ok(1),
         Err(first) => {
             if is_tenant_error(&format!("{:#}", first)) {
                 return Err(first);
             }
             tracing::warn!("celld deploy failed (infra); retrying once");
             match celld_deploy(celld, project_dir, cwd).await {
-                Ok(_) => Ok(AppDeploy { attempts: 2 }),
+                Ok(_) => Ok(2),
                 Err(second) => Err(anyhow::anyhow!(
                     "celld deploy failed twice (one infra retry):\nfirst: {:#}\nsecond: {:#}",
                     first,
@@ -320,6 +374,22 @@ pub async fn celld_deploy_app(
     }
 }
 
+/// Deploy the tenant app: one `celld deploy`, retried once when the
+/// failure reads as infra. The retry narrows §2.4's window: a transient
+/// store blip between the cohosted and app deploys heals inside this
+/// deploy instead of leaving the pointer on a cohosted script. A
+/// twice-failed deploy carries both attempts' errors; the row's summary
+/// still truncates to one line.
+pub async fn celld_deploy_app(
+    celld: &CelldDeploy<'_>,
+    project_dir: &Path,
+    cwd: Option<&Path>,
+) -> anyhow::Result<AppDeploy> {
+    Ok(AppDeploy {
+        attempts: deploy_with_infra_retry(celld, project_dir, cwd).await?,
+    })
+}
+
 /// What one cohosted script's deploy did, for the deploy log.
 #[derive(Debug, PartialEq, Eq)]
 pub struct CohostOutcome {
@@ -327,6 +397,9 @@ pub struct CohostOutcome {
     pub skipped: bool,
     /// The content hash deployed (or matched, when skipped).
     pub hash: String,
+    /// `celld deploy` attempts: 0 when skipped, else 1 — or 2 when the
+    /// first attempt failed on infra and the retry ran.
+    pub attempts: u32,
 }
 
 impl CohostOutcome {
@@ -361,12 +434,12 @@ fn render_timeout(celld: &CelldDeploy<'_>, render: &RenderedCohost) -> Duration 
 /// first): each renders to a fresh temp project, deploys with
 /// `celld deploy` into the fleet bucket, and stores its content hash —
 /// unless the hash matches the stored one, in which case the script is
-/// skipped. A failure fails the deploy at once, with no retry: the
-/// sources are the runner's own, so a failure is dead infra (the next
-/// deploy starts over) or a runner bug (loud, names only in the error).
-/// The temp project holds the fleet's secrets in plaintext, so it is
-/// owner-only from birth and removed on every path — success or failure —
-/// and failed deploys leave nothing on runner disk.
+/// skipped. Each deploy retries once on infra errors, like the app's (a
+/// fence-image `AlreadyExists` race heals inside the deploy instead of
+/// failing it); a tenant failure fails the deploy at once, before the app
+/// moves the pointer. The temp project holds the fleet's secrets in
+/// plaintext, so it is owner-only from birth and removed on every path —
+/// success or failure — and failed deploys leave nothing on runner disk.
 pub async fn ensure_cohosted(
     pool: &SqlitePool,
     app_id: &str,
@@ -385,6 +458,7 @@ pub async fn ensure_cohosted(
                 script: render.script.name,
                 skipped: true,
                 hash,
+                attempts: 0,
             });
             continue;
         }
@@ -408,20 +482,24 @@ pub async fn ensure_cohosted(
             timeout: render_timeout(celld, render),
             ..*celld
         };
-        if let Err(e) = celld_deploy(&render_celld, &dir, None).await {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(anyhow::anyhow!(
-                "cohosted script `{}` deploy failed: {:#}",
-                render.script.name,
-                e
-            ));
-        }
+        let attempts = match deploy_with_infra_retry(&render_celld, &dir, None).await {
+            Ok(attempts) => attempts,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(anyhow::anyhow!(
+                    "cohosted script `{}` deploy failed: {:#}",
+                    render.script.name,
+                    e
+                ));
+            }
+        };
         let _ = std::fs::remove_dir_all(&dir);
         db::set_cohost_hash(pool, app_id, environment_id, render.script.name, &hash).await?;
         outcomes.push(CohostOutcome {
             script: render.script.name,
             skipped: false,
             hash,
+            attempts,
         });
     }
     Ok(outcomes)
@@ -443,10 +521,18 @@ pub struct FleetDeployStats {
 }
 
 impl FleetDeployStats {
-    /// The deploy-log lines: one per cohosted script, plus the app retry
-    /// note when the second attempt ran.
+    /// The deploy-log lines: one per cohosted script, plus a retry note
+    /// per script whose second attempt ran (cohosted first, then the app).
     pub fn log_lines(&self) -> Vec<String> {
         let mut lines: Vec<String> = self.cohosted.iter().map(CohostOutcome::log_line).collect();
+        for outcome in &self.cohosted {
+            if !outcome.skipped && outcome.attempts > 1 {
+                lines.push(format!(
+                    "void: cohosted script `{}` succeeded on attempt {} after an infra failure\n",
+                    outcome.script, outcome.attempts
+                ));
+            }
+        }
         if self.app_attempts > 1 {
             lines.push(format!(
                 "void: app deploy succeeded on attempt {} after an infra failure\n",
@@ -553,6 +639,79 @@ mod tests {
         let mut source_changed = render("tok-1");
         source_changed.script = &OTHER;
         assert_ne!(source_changed.content_hash(), base);
+    }
+
+    /// Per-deploy container paths are not hash inputs: an absolute
+    /// `image` (or `dockerfile`/`build_context`, here or under an
+    /// unplanned `images.default`) reads the same whatever the build dir,
+    /// while a registry ref is stable content and still flips the digest
+    /// when it changes.
+    #[test]
+    fn container_image_paths_are_not_hash_inputs() {
+        let with_entry = |entry: Value| {
+            let mut rendered = render("tok");
+            rendered.config["containers"] = json!([entry]);
+            rendered
+        };
+        let first = with_entry(json!({
+            "name": "noite-void-sandbox-v1",
+            "class_name": "SandboxController",
+            "image": "/data/runner/builds/blog/t1/ctx/.noite-image-0.Dockerfile",
+            "max_instances": 4,
+        }));
+        let second = with_entry(json!({
+            "name": "noite-void-sandbox-v1",
+            "class_name": "SandboxController",
+            "image": "/data/runner/builds/blog/t2/ctx/.noite-image-0.Dockerfile",
+            "max_instances": 4,
+        }));
+        assert_eq!(first.content_hash(), second.content_hash());
+
+        // An unplanned shape's path keys go the same way.
+        let unplanned = with_entry(json!({
+            "name": "void-sandbox-v1",
+            "class_name": "SandboxV1",
+            "images": {"default": {
+                "dockerfile": "/data/runner/builds/blog/t3/img/Dockerfile",
+                "build_context": "/data/runner/builds/blog/t3/img",
+            }},
+        }));
+        let unplanned_other = with_entry(json!({
+            "name": "void-sandbox-v1",
+            "class_name": "SandboxV1",
+            "images": {"default": {
+                "dockerfile": "/data/runner/builds/blog/t4/img/Dockerfile",
+                "build_context": "/data/runner/builds/blog/t4/img",
+            }},
+        }));
+        assert_eq!(unplanned.content_hash(), unplanned_other.content_hash());
+
+        // A registry ref is stable content: changing it flips the digest,
+        // and the same ref in another render reads the same.
+        let pinned = with_entry(json!({
+            "name": "noite-void-sandbox-v1",
+            "class_name": "SandboxController",
+            "image": format!("registry.example/x@sha256:{}", "aa".repeat(32)),
+            "max_instances": 4,
+        }));
+        assert_ne!(pinned.content_hash(), first.content_hash());
+        let repinned = with_entry(json!({
+            "name": "noite-void-sandbox-v1",
+            "class_name": "SandboxController",
+            "image": format!("registry.example/x@sha256:{}", "bb".repeat(32)),
+            "max_instances": 4,
+        }));
+        assert_ne!(repinned.content_hash(), pinned.content_hash());
+        assert_eq!(
+            with_entry(json!({
+                "name": "noite-void-sandbox-v1",
+                "class_name": "SandboxController",
+                "image": format!("registry.example/x@sha256:{}", "bb".repeat(32)),
+                "max_instances": 4,
+            }))
+            .content_hash(),
+            repinned.content_hash()
+        );
     }
 
     /// Runtime-loaded sources and the extra hash input feed the digest
@@ -731,6 +890,7 @@ mod tests {
             "esbuild not found (esbuild). `celld deploy` bundles with esbuild; install it and retry",
             "save container image failed:\nError: daemon not running",
             "thread 'main' panicked at crates/celld/deploy.rs:973",
+            "failed to create an image celld-fence/9f2c after deleting the existing one: AlreadyExists",
         ] {
             assert!(!is_tenant_error(infra), "infra misread as tenant: {}", infra);
         }
@@ -1167,16 +1327,14 @@ echo "deployed $2"
 
     /// A failed cohosted deploy fails the deploy before the app moves the
     /// pointer: no app invocation, no stored hash, the secret-bearing temp
-    /// project removed — and the next deploy starts over.
+    /// project removed — and the next deploy starts over. Tenant failures
+    /// fail at once, with no retry.
     #[tokio::test]
     async fn cohost_failure_fails_before_the_app() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
         let fake = FakeCelld::spawn();
-        fake.fail(
-            0,
-            "put deploy/current.json: connection refused (os error 111)",
-        );
+        fake.fail(0, "config `services` must be an array");
         let log = fake.log();
         let dir = fake.dir.to_string_lossy().into_owned();
         let env = vec![
@@ -1222,6 +1380,127 @@ echo "deployed $2"
                 .unwrap(),
             None
         );
+        std::fs::remove_dir_all(&app_dir).unwrap();
+    }
+
+    /// A cohosted script retries once on infra — the fence-image
+    /// `AlreadyExists` race heals inside the deploy — and the stats carry
+    /// the attempt count for the log. A twice-failed cohosted deploy
+    /// carries both attempts' errors and still fails before the app.
+    #[tokio::test]
+    async fn cohosted_deploy_retries_once_on_infra() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
+        let app = seed(&pool).await;
+        let fake = FakeCelld::spawn();
+        // Invocation 0 is the cohosted script's first attempt.
+        fake.fail(
+            0,
+            "failed to create an image celld-fence/9f2c after deleting the existing one: AlreadyExists",
+        );
+        let log = fake.log();
+        let dir = fake.dir.to_string_lossy().into_owned();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let bin = fake.bin();
+        let celld = CelldDeploy {
+            celld_bin: &bin,
+            env: &env,
+            bucket: "s3://noite/fleets/cohost-app",
+            endpoint: "http://rustfs:9000",
+            region: "us-east-1",
+            timeout: Duration::from_secs(30),
+        };
+        let app_dir =
+            std::env::temp_dir().join(format!("noite-cohost-co-retry-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let app_side = FleetApp {
+            dir: &app_dir,
+            cwd: None,
+            timeout: Duration::from_secs(30),
+        };
+
+        let stats =
+            deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
+                .await
+                .unwrap();
+        assert!(!stats.cohosted[0].skipped);
+        assert_eq!(stats.cohosted[0].attempts, 2);
+        assert_eq!(stats.app_attempts, 1);
+        let lines = stats.log_lines().join("");
+        assert!(lines.contains("noite-test-cohost"), "{}", lines);
+        assert!(lines.contains("attempt 2"), "{}", lines);
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 3, "{:?}", calls);
+        // The cohosted script deployed twice (first attempt, retry — same
+        // temp project), then the app once, last.
+        assert!(calls[0].contains("noite-cohost-"), "{:?}", calls);
+        assert!(calls[1].contains("noite-cohost-"), "{:?}", calls);
+        let first_project = calls[0].split(' ').nth(1).expect("deploy argv");
+        let retry_project = calls[1].split(' ').nth(1).expect("deploy argv");
+        assert_eq!(first_project, retry_project);
+        assert!(
+            calls[2].contains(&app_dir.to_string_lossy().into_owned()),
+            "{:?}",
+            calls
+        );
+        // The retry still stores the hash.
+        assert_eq!(
+            db::get_cohost_hash(&pool, &app.id, None, "noite-test-cohost")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(stats.cohosted[0].hash.as_str())
+        );
+
+        // Both cohosted attempts fail on infra: one retry, then both
+        // errors — before the app deploys anything. A fresh token keeps
+        // the cohosted deploy (invocations 0 and 1).
+        let fake = FakeCelld::spawn();
+        fake.fail(0, "first: connection refused");
+        fake.fail(1, "second: 503 SlowDown");
+        let log = fake.log();
+        let dir = fake.dir.to_string_lossy().into_owned();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let bin = fake.bin();
+        let celld = CelldDeploy {
+            celld_bin: &bin,
+            env: &env,
+            bucket: "s3://noite/fleets/cohost-app",
+            endpoint: "http://rustfs:9000",
+            region: "us-east-1",
+            timeout: Duration::from_secs(30),
+        };
+        let err =
+            deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok-2")], &app_side)
+                .await
+                .unwrap_err();
+        let text = format!("{:#}", err);
+        assert!(text.contains("noite-test-cohost"), "{}", text);
+        assert!(text.contains("failed twice"), "{}", text);
+        assert!(text.contains("first: connection refused"), "{}", text);
+        assert!(text.contains("second: 503 SlowDown"), "{}", text);
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 2, "{:?}", calls);
+        // The failed render stored nothing: the earlier hash still stands.
+        assert_eq!(
+            db::get_cohost_hash(&pool, &app.id, None, "noite-test-cohost")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(stats.cohosted[0].hash.as_str())
+        );
+        // The temp project is gone on the failure path too.
+        let project = calls[0]
+            .split(' ')
+            .nth(1)
+            .expect("deploy argv")
+            .to_string();
+        assert!(!Path::new(&project).exists(), "{}", project);
         std::fs::remove_dir_all(&app_dir).unwrap();
     }
 }

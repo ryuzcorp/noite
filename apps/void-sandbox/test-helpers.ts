@@ -83,6 +83,9 @@ export class FakeProcess {
   stdin: WritableStream | null = null;
   stdout: ReadableStream | null = null;
   stderr: ReadableStream | null = null;
+  /** celld 0006: scripted per test — set for the `pty` exec under test. */
+  isPty = false;
+  readonly resizes: { readonly cols: number; readonly rows: number }[] = [];
   killCode = 137;
   readonly #exit = new Deferred<number>();
   readonly exitCode: Promise<number>;
@@ -99,6 +102,15 @@ export class FakeProcess {
   kill(signal?: number): void {
     this.kills.push(signal);
     this.#exit.resolve(this.killCode);
+  }
+
+  /** Mirrors the native refusal: only a PTY process resizes. */
+  async resize(cols: number, rows: number): Promise<void> {
+    if (!this.isPty) {
+      throw new Error("resize() requires a PTY process.");
+    }
+
+    this.resizes.push({ cols, rows });
   }
 
   async output(): Promise<ExecOutput> {

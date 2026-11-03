@@ -1593,6 +1593,57 @@ mod tests {
         std::fs::remove_dir_all(&src2).unwrap();
     }
 
+    /// The pinned Dockerfile path is per-deploy, not content: two renders
+    /// of identical content in different build dirs hash equal, while an
+    /// image-content change flips the hash. The deployed config still
+    /// carries its own real path — celld builds from it.
+    #[tokio::test]
+    async fn dockerfile_path_is_not_a_hash_input() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
+        let app = seed(&pool).await;
+        let (staged, _, _, bundle_path, src) = staged_for_render(&pool, &app.id, 4).await;
+        let planned = |dir: &str| {
+            json!({
+                "containers": [{
+                    "name": CONTAINER_NAME,
+                    "class_name": CONTROLLER_CLASS,
+                    "image": format!("{}/ctx/.noite-image-0.Dockerfile", dir),
+                    "max_instances": 4,
+                }],
+            })
+        };
+        let digest = [9u8; 32];
+        let first = staged
+            .render(
+                &planned("/data/runner/builds/blog/2026-11-03t120000z"),
+                Some(digest),
+            )
+            .unwrap();
+        let second = staged
+            .render(
+                &planned("/data/runner/builds/blog/2026-11-03t121500z"),
+                Some(digest),
+            )
+            .unwrap();
+        assert_eq!(first.content_hash(), second.content_hash());
+        assert_ne!(
+            first.config["containers"][0]["image"],
+            second.config["containers"][0]["image"]
+        );
+        assert_ne!(
+            staged
+                .render(
+                    &planned("/data/runner/builds/blog/2026-11-03t121500z"),
+                    Some([10u8; 32])
+                )
+                .unwrap()
+                .content_hash(),
+            first.content_hash()
+        );
+        std::fs::remove_dir_all(&bundle_path).unwrap();
+        std::fs::remove_dir_all(&src).unwrap();
+    }
+
     /// The Dockerfile image digest is stable and flips on either input:
     /// the pinned Dockerfile bytes or the build-context digest.
     #[test]
