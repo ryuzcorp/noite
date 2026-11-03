@@ -116,6 +116,7 @@ jobs:
           pull_request
           scoped_credential
           telemetry_replay
+          void_cohost_hash
           EOF
 
   # The UI's runner contract is generated from the Rust structs (apps/runner

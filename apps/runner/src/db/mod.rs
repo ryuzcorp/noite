@@ -24,6 +24,7 @@ mod ingest_keys;
 mod instance_setting;
 mod metrics;
 pub mod prs;
+mod void_cohost;
 
 pub use apps::{
     add_domain, count_apps_for_user, create_app, delete_app, domain_claim, finish_app_import,
@@ -85,6 +86,7 @@ pub use metrics::{
     prune_span_stats, replace_app_logs, replace_app_metric_usage, replace_span_stat,
     set_metric_watermarks, set_telemetry_replay,
 };
+pub use void_cohost::{delete_environment_hashes, get_cohost_hash, set_cohost_hash};
 
 /// Columns every `app`-row query selects, in struct order.
 pub(super) const APP_COLS: &str = r#"id, slug, name, user_id, status, subdomain, git_prefix, fleet_bucket,

@@ -90,6 +90,12 @@ COPY apps/runner/Cargo.toml apps/runner/Cargo.lock ./
 COPY apps/runner/src ./src
 # The schemas are `include_str!`-embedded: needed to build, never shipped.
 COPY apps/runner/schema.sql apps/runner/schema.metrics.sql ./
+# The Void proxy worker is `include_str!`-embedded the same way:
+# `src/host/void_proxy.rs` includes `../../../void-proxy/...`, which is
+# `/void-proxy/...` from this stage's `/src` crate root. Only the shipped
+# tree (worker.ts + src/): tests never enter the build.
+COPY apps/void-proxy/worker.ts /void-proxy/worker.ts
+COPY apps/void-proxy/src /void-proxy/src
 # Cache mounts keep the crate registry and target/ between builds, so a source
 # change recompiles the runner crate only, not every dependency. They never
 # reach the image: the binary is copied out of the mount, and `--locked`

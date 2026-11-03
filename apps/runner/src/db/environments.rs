@@ -181,10 +181,14 @@ pub async fn environment_route(
 
 /// Remove one environment's row and return it (its bucket and fleet key are
 /// what the caller needs to wipe). `None` when there was no such row.
+/// Its cohost skip-state goes first: a reused label gets a fresh id and
+/// must not inherit it (`environment_env` cascades; the hash table keys
+/// production on `''`, so it cannot cascade the same way).
 pub async fn delete_environment(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<Environment>> {
     let Some(row) = get_environment(pool, id).await? else {
         return Ok(None);
     };
+    crate::db::delete_environment_hashes(pool, id).await?;
     sqlx::query("DELETE FROM environment WHERE id = ?")
         .bind(id)
         .execute(pool)
@@ -362,8 +366,9 @@ pub async fn expired_workspace_environments(
 }
 
 /// One environment's overrides only (`environment_env` rows), provisioned
-/// rows included: the UI shows the per-fleet token's name like any other,
-/// its value redacted as usual.
+/// rows included: served with values like any other setting
+/// (single-operator premise; the control worker redacts values for the
+/// UI).
 pub async fn list_env_override(
     pool: &SqlitePool,
     environment_id: &str,

@@ -101,6 +101,31 @@ docker compose up -d
 
 Compose warns that the volumes were not created by it; that is expected. Verify with `docker compose exec noite curl -s http://127.0.0.1:8080/ready`, then open an app.
 
+## Void email and AI
+
+Void apps (`revalidate()`, `sendEmail()`, `ai.*`) reach platform services through a runner-owned `noite-void-proxy` script the deploy cohosts in each Void fleet beside the app. ISR revalidation works with no operator config; email and AI need this section, and the runner refuses to boot on a misconfigured one, naming the var.
+
+Email needs a sender domain and a relay:
+
+```bash
+NOITE_VOID_EMAIL_DOMAIN=mail.example.com
+NOITE_VOID_SMTP_HOST=smtp.example.com
+NOITE_VOID_SMTP_PORT=587          # unset = 587/465/25 by mode
+NOITE_VOID_SMTP_MODE=starttls     # or `implicit`, or `plain` (needs the allowance below)
+NOITE_VOID_EMAIL_ALLOWLIST=@example.com,ops@example.org
+```
+
+Senders are pinned to `<slug>[+tag]@<domain>`; every recipient must parse as one addr-spec (a malformed address fails the whole send with 400 `INVALID_TO`), and recipients outside the allowlist are refused per-recipient (an empty allowlist fails closed: nothing sends). `@domain` entries match that domain exactly — subdomains need their own entry. The SMTP login is per app, in each app's Settings (`VOID_PROXY_SMTP_USERNAME` / `VOID_PROXY_SMTP_PASSWORD`) — never here: proxy vars are plaintext in the fleet bucket, so no shared operator password may fan out to every fleet. `plain` SMTP additionally needs `NOITE_VOID_SMTP_ALLOW_PLAINTEXT=1`, and the runner refuses `plain` without it.
+
+AI needs the flag plus, for `/ai/run`, a model map to an OpenAI-compatible endpoint:
+
+```bash
+NOITE_VOID_AI_ENABLED=1
+NOITE_VOID_AI_MODELS={"@cf/meta/llama-3-8b": {"endpoint": "https://ai.example.com/v1", "model": "llama"}}
+```
+
+Unmapped models answer a loud `501` (never a silent substitute), and `/ai/run` returns the endpoint's native response shape untranslated. The endpoint key, when the endpoint needs one, is per app (`VOID_PROXY_AI_API_KEY` in Settings); `/ai/provider` always uses the tenant's own provider key, never operator config. Endpoints are `https` except loopback sidecars (a local model server on `127.0.0.1`/`localhost`), which additionally need `NOITE_VOID_AI_ALLOW_PLAINTEXT=1` — the runner refuses any other `http` endpoint at boot, since the per-app key would travel unencrypted. A new app deploy picks up operator-config changes (like any deploy-time value, they apply from the next deploy).
+
 ## Troubleshooting
 
 - **Boot stops with `refusing to start: the runner database is schema version N`** (or the same for the control database): the data was written by a newer Noite than the image you started. Run the newer image again, or [restore](#restore) a backup taken before the upgrade. Downgrading across a schema change is not supported, and the refusal is what stops an old image from damaging newer data.

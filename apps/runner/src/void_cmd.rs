@@ -4,8 +4,9 @@
 //! The token authenticates a Void Worker's calls to its own fleet's proxy;
 //! it is stored as a runner-provisioned setting and injected at deploy
 //! time, so rotation takes effect on the fleet's next deploy (redeploy to
-//! apply it — until then the old token keeps serving). The value is never
-//! printed: nothing outside the fleet needs it.
+//! apply it — the proxy redeploys beside the app, since the token flips
+//! its content hash — and until then the old token keeps serving). The
+//! value is never printed: nothing outside the fleet needs it.
 //!
 //! ```text
 //! docker exec noite noite-runner void rotate-proxy-token --slug blog

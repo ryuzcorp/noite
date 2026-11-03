@@ -84,6 +84,12 @@ sensitive:
   # Void D1 migrations: the runner module that plans migrations and
   # applies them through in-worker endpoints (schema writes on tenant data).
   - "apps/runner/src/host/void_migrate.rs"
+  # The cohosted Void proxy: its worker sources and the runner files that
+  # render and deploy it (per-app SMTP/AI credentials feed the proxy render).
+  - "apps/void-proxy/**"
+  - "apps/runner/src/host/void_proxy.rs"
+  - "apps/runner/src/host/void_cohost.rs"
+  - "apps/runner/src/db/void_cohost.rs"
 
   # The release image and its entrypoints: everything inside the trust
   # boundary ships from here, including the third-party binaries baked in.

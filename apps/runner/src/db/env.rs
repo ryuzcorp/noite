@@ -19,10 +19,10 @@ pub const SOURCE_VOID_PROXY_TOKEN: &str = "void-proxy-token";
 /// vault. Names are validated at the API layer; values capped at 32 KiB.
 ///
 /// `source` marks runner-provisioned rows (`auth-default`,
-/// `void-proxy-token`); user rows carry `''`. The listing returns every row —
-/// the UI shows provisioned names like any other, values redacted as usual —
-/// while each deploy input filters on it (see [`worker_settings`] and
-/// [`tenant_env`]).
+/// `void-proxy-token`); user rows carry `''`. The listing serves every row
+/// with its value (single-operator premise; the control worker redacts
+/// values for the UI), while each deploy input filters on the marker (see
+/// [`worker_settings`] and [`tenant_env`]).
 pub async fn list_env(pool: &SqlitePool, app_id: &str) -> sqlx::Result<Vec<AppEnv>> {
     sqlx::query_as::<_, AppEnv>(
         "SELECT app_id, name, value, updated_at, source FROM app_env WHERE app_id = ? ORDER BY name",
@@ -134,6 +134,10 @@ pub(crate) fn env_reserved(name: &str) -> bool {
         // would steer fleet celld at another engine than its own proxy
         // socket (or at the host socket directly).
         || name == "DOCKER_HOST"
+        // The Void proxy's namespace: per-app credentials that only the
+        // proxy render consumes. Never process env — like `BETTER_AUTH_*`,
+        // process-reserved but (on non-Void apps) Worker-allowed.
+        || name.starts_with("VOID_PROXY_")
 }
 
 /// All settings as stored, unfiltered: the Worker-vars merge
@@ -165,6 +169,8 @@ pub async fn worker_settings(
 ///
 /// Provisioned rows never reach process env: the token authenticates the
 /// Worker to its own fleet's proxy, and the auth secret is a Worker secret.
+/// The proxy-only credential rows (`VOID_PROXY_*`) are dropped by the
+/// process-reserved prefix rule — only the proxy render consumes them.
 /// (A user row under a reserved name fails the deploy at the Worker-vars
 /// merge, before any fleet sees process env.)
 pub async fn tenant_env(pool: &SqlitePool, app_id: &str) -> Vec<(String, String)> {
@@ -221,19 +227,23 @@ mod tests {
             ("BETTER_AUTH_SECRET", "s3cret"),
             ("PORT", "9999"),
             ("MODEL", "x"),
+            ("VOID_PROXY_SMTP_PASSWORD", "cred"),
         ] {
             set_env(&pool, &app.id, name, value).await.unwrap();
         }
-        assert_eq!(list_env(&pool, &app.id).await.unwrap().len(), 3);
+        assert_eq!(list_env(&pool, &app.id).await.unwrap().len(), 4);
+        // The proxy-only row rides the settings load: the deploy flow
+        // splits it out for the proxy render before the app merges.
         assert_eq!(
             worker_settings(&pool, &app.id).await.unwrap(),
             vec![
                 ("BETTER_AUTH_SECRET".to_string(), "s3cret".to_string()),
                 ("MODEL".to_string(), "x".to_string()),
                 ("PORT".to_string(), "9999".to_string()),
+                ("VOID_PROXY_SMTP_PASSWORD".to_string(), "cred".to_string()),
             ]
         );
-        // The process input still drops the reserved two.
+        // The process input still drops the reserved three.
         assert_eq!(
             tenant_env(&pool, &app.id).await,
             vec![("MODEL".to_string(), "x".to_string())]
@@ -242,8 +252,8 @@ mod tests {
 
     /// Provisioned rows route by marker: the auth secret rides the settings
     /// merges, the proxy token rides the runner-owned merge only, and
-    /// neither reaches process env. The listing keeps every row (the UI
-    /// shows the names, values redacted as usual).
+    /// neither reaches process env. The listing keeps every row with its
+    /// value (the control worker redacts values for the UI).
     #[tokio::test]
     async fn provisioned_rows_route_by_source_marker() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
@@ -356,6 +366,9 @@ mod tests {
             // would steer fleet celld at another engine than its own proxy
             // socket (or at the host socket directly).
             "DOCKER_HOST",
+            // The Void proxy's namespace: proxy-render input only.
+            "VOID_PROXY_SMTP_PASSWORD",
+            "VOID_PROXY_AI_API_KEY",
         ] {
             assert!(env_reserved(name), "{name} reserved");
         }

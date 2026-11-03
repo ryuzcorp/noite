@@ -14,8 +14,10 @@ use crate::host::package_manager;
 use crate::host::s3;
 use crate::host::supervisor::{self, ProcMap};
 use crate::host::tips::TipBundle;
+use crate::host::void_cohost;
 use crate::host::void_deploy;
 use crate::host::void_migrate;
+use crate::host::void_proxy;
 use crate::host::worker_vars;
 use crate::lifecycle::{self, sha_same};
 use crate::models::{App, AppStatus, DeployStatus};
@@ -943,9 +945,19 @@ async fn deploy_inner(
     worker_vars::check_required(
         &required_secrets,
         &worker_settings,
-        &worker_vars::provisioned_names(void_app),
+        &worker_vars::provisioned_names(void_app, !cfg.void_proxy.email_domain.is_empty()),
         settings_label,
     )?;
+    // Proxy-only settings (Void apps): the three credential names split
+    // out for the proxy render before the app merges — they are refused
+    // as app Worker vars, so the merges must never see them. The
+    // required check above already ran on the full list; anything else
+    // `VOID_PROXY_*` stays in the remainder and fails its merge loudly.
+    let (proxy_settings, worker_settings) = if void_app {
+        void_proxy::split_proxy_settings(worker_settings)
+    } else {
+        (void_proxy::ProxySettings::default(), worker_settings)
+    };
     if let Some(stats) =
         worker_vars::merge_deploy_root(&deploy_root, &worker_settings, settings_label)?
     {
@@ -958,22 +970,32 @@ async fn deploy_inner(
     // Runner-owned Void entries (SPEC, Deploy pipeline): identity vars,
     // runner-owned `services` and the `ISR_CACHE` namespace, merged into
     // the same config file the settings merge just wrote. Void apps only.
-    if void_app {
-        if let Some(stats) = void_deploy::merge_void_root(
+    // A TOML-only root merges nothing (`celld deploy` itself refuses it):
+    // the `None` below keeps such a doomed deploy from running its
+    // cohosted scripts first. The ensured token rides along so the proxy
+    // render below reuses this deploy's value instead of re-reading the
+    // row (a rotation landing between the two would split app and proxy).
+    let void_proxy_token: Option<String> = if void_app {
+        let merged = void_deploy::merge_void_root(
             pool,
             app,
             target.environment(),
             &deploy_root,
             &worker_settings,
+            (!cfg.void_proxy.email_domain.is_empty())
+                .then_some(cfg.void_proxy.email_domain.as_str()),
             settings_label,
         )
-        .await?
-        {
+        .await?;
+        if let Some((stats, _)) = &merged {
             progress
                 .log(DeployStatus::Deploying, &stats.log_line(settings_label))
                 .await?;
         }
-    }
+        merged.map(|(_, token)| token)
+    } else {
+        None
+    };
 
     // celld pulls container images for linux/amd64 unless told otherwise;
     // pin the pull to the nodes' own arch so arm64 installs pull native
@@ -1019,28 +1041,49 @@ async fn deploy_inner(
     let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     env.push(("S3_ENDPOINT", cfg.s3_endpoint.as_str()));
     env.push(("CELLD_CONTAINER_PLATFORM", container_platform.as_str()));
-    // Work-dir-derived paths are operator-influenced (a non-UTF-8 mount):
-    // fail the deploy instead of panicking the deploy task.
-    let Some(deploy_arg) = deploy_root.to_str() else {
-        anyhow::bail!("deploy root is not valid UTF-8: {}", deploy_root.display());
+    // The ordered fleet deploy (SPEC, Void platform proxy): the cohosted
+    // scripts first (each skipped when unchanged), the tenant app last
+    // with its one infra retry. A Void app with a merged root renders its
+    // proxy here — with the token the merge above ensured, read once for
+    // the whole deploy — while any other app deploys exactly one script,
+    // as before. The shared invocation fails the deploy on a non-UTF-8
+    // deploy root (work-dir-derived paths are operator-influenced)
+    // instead of panicking the deploy task.
+    let cohosted = if let Some(proxy_token) = &void_proxy_token {
+        vec![void_proxy::render_proxy(&void_proxy::ProxyRenderCtx {
+            app_id: &app.id,
+            app_slug: &app.slug,
+            proxy_token,
+            operator: &cfg.void_proxy,
+            settings: &proxy_settings,
+        })]
+    } else {
+        Vec::new()
     };
-    exec::run_cmd(
-        &cfg.celld_bin,
-        &[
-            "deploy",
-            deploy_arg,
-            "--bucket",
-            &bucket,
-            "--endpoint",
-            &cfg.s3_endpoint,
-            "--region",
-            &cfg.aws_region,
-        ],
-        Some(&work),
-        &env,
-        Duration::from_secs(if declares_containers { 600 } else { 120 }),
+    let celld = void_cohost::CelldDeploy {
+        celld_bin: cfg.celld_bin.as_str(),
+        env: &env,
+        bucket: bucket.as_str(),
+        endpoint: cfg.s3_endpoint.as_str(),
+        region: cfg.aws_region.as_str(),
+        timeout: Duration::from_secs(120),
+    };
+    let stats = void_cohost::deploy_fleet_in_order(
+        pool,
+        &app.id,
+        target.environment_id(),
+        &celld,
+        &cohosted,
+        &void_cohost::FleetApp {
+            dir: &deploy_root,
+            cwd: Some(&work),
+            timeout: Duration::from_secs(if declares_containers { 600 } else { 120 }),
+        },
     )
     .await?;
+    for line in stats.log_lines() {
+        progress.log(DeployStatus::Deploying, &line).await?;
+    }
 
     // The row the deploy targets must still be there before the fleet starts:
     // for a preview, the environment's row (a delete raced this build).

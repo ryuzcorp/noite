@@ -126,6 +126,22 @@ See [Limits](/reference/limits) for the sleep mechanism.
 
 See [Edge protection](/self-hosting/protection) for how these fit together.
 
+## Void proxy
+
+| Var | Default | Effect | Owner |
+| --- | --- | --- | --- |
+| `NOITE_VOID_EMAIL_DOMAIN` | _(empty)_ | Sender domain every Void `from` is pinned to (`<slug>[+tag]@<domain>`); required for email | runner-owned |
+| `NOITE_VOID_SMTP_HOST` | _(empty)_ | SMTP relay host; email is enabled iff set | runner-owned |
+| `NOITE_VOID_SMTP_PORT` | _(empty)_ | Relay port; unset = `587`/`465`/`25` by mode | runner-owned |
+| `NOITE_VOID_SMTP_MODE` | `starttls` | `starttls`, `implicit` or `plain` | runner-owned |
+| `NOITE_VOID_SMTP_ALLOW_PLAINTEXT` | _(empty)_ | `1` allows `plain` (the proxy refuses it otherwise) | runner-owned |
+| `NOITE_VOID_EMAIL_ALLOWLIST` | _(empty)_ | Admission: comma/space-separated exact addresses or `@domain` exact domains (subdomains do not match); empty fails closed | runner-owned |
+| `NOITE_VOID_AI_ENABLED` | _(empty)_ | `1` turns `/ai/*` on, else every AI call answers `501` | runner-owned |
+| `NOITE_VOID_AI_MODELS` | _(empty)_ | Model-map JSON for `/ai/run`: `{ "<model>": { "endpoint", "model" } }` | runner-owned |
+| `NOITE_VOID_AI_ALLOW_PLAINTEXT` | _(empty)_ | `1` allows `http` model endpoints, loopback sidecars only (the runner refuses `http` otherwise) | runner-owned |
+
+Unset means email sends and AI calls answer `501`; `/revalidate` needs no operator config. Per-app credentials (the SMTP login, the AI endpoint key) are tenant Settings, never operator config — see [Void email and AI](/self-hosting/operations#void-email-and-ai). Misconfigured values refuse the boot naming the var.
+
 ## Platform-only
 
 Set by the platform, not by operators. Railway: `PORT` (listen port), `RAILWAY_DEPLOYMENT_ID`, `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` (must exceed the stop budget + 5 s). `TINI_SUBREAPER` is set by the image's init. None of these go in `.env`.

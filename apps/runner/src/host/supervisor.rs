@@ -1372,12 +1372,16 @@ mod tests {
             ),
             ReloadOutcome::Unchanged
         );
+        // The missing-service-target body, verbatim from a real celld
+        // `/reload` (a dangling `services` entry fails adoption this way):
+        // the deploy must fail with celld's error, never record Success.
         assert_eq!(
             parse_reload_response(
-                r#"{"ok":false,"outcome":"failed","version":"v","prefix":"p","error":"load service binding target no-such-script"}"#
+                r#"{"ok":false,"outcome":"failed","error":"load service binding target no-such-script: read s3://voidproxy/deploy/no-such-script/current.json: no such key"}"#
             ),
             ReloadOutcome::Failed {
-                error: "load service binding target no-such-script".to_string(),
+                error: "load service binding target no-such-script: read s3://voidproxy/deploy/no-such-script/current.json: no such key"
+                    .to_string(),
             }
         );
         // A failed outcome without an error still fails, with a fallback.
