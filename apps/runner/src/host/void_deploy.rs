@@ -17,7 +17,9 @@
 //!   per environment for previews — never inherited, so each fleet's token
 //!   is its own);
 //! - runner-owned `services` on top of the tenant's (preserved): the
-//!   `__VOID_PROXY` binding to the cohosted `noite-void-proxy` script (a
+//!   `__VOID_PROXY` binding to the cohosted `noite-void-proxy` script —
+//!   plus the `__VOID_SANDBOX` binding to the cohosted
+//!   `noite-void-sandbox` script when the app has a managed sandbox (a
 //!   collision with a runner-owned binding name fails the deploy naming
 //!   it);
 //! - the `ISR_CACHE` KV namespace (`binding: ISR_CACHE`, one fixed id):
@@ -29,8 +31,8 @@
 //! The `__VOID_PROXY` entry is injected because the deploy runs the proxy
 //! first (see [`super::void_cohost`]): a dangling service would fail celld
 //! adoption, so the binding and the script ship in the same deploy. The
-//! later sandbox slice adds its own entry in [`runner_services`] the same
-//! way.
+//! `__VOID_SANDBOX` entry rides [`runner_services`] the same way — the
+//! deploy runs the controller first, so it never dangles either.
 //!
 //! `BETTER_AUTH_SECRET` is provisioned, not merged here: when a Void fleet
 //! has no value for it, [`ensure_auth_secret`] mints 32 random bytes hex
@@ -91,15 +93,15 @@ pub const ISR_CACHE_NAMESPACE_ID: &str = "noite-isr-cache";
 pub const AUTH_SECRET_NAME: &str = "BETTER_AUTH_SECRET";
 
 /// Binding names the runner owns in `services`: a tenant entry using one
-/// fails the deploy naming it. Today only the proxy binding (reserved
-/// ahead of its injection); [`runner_services`] decides what is injected.
-const RUNNER_BINDINGS: &[&str] = &[PROXY_BINDING];
+/// fails the deploy naming it, on every Void app — whether or not this
+/// deploy injects it. [`runner_services`] decides what is injected.
+const RUNNER_BINDINGS: &[&str] = &[PROXY_BINDING, super::void_sandbox::SANDBOX_BINDING];
 
 /// Service targets the runner owns in `services`: a tenant entry pointing
 /// at one fails the deploy naming it. Resolving the same target twice is
 /// a hard celld adoption error, so the runner refuses the alias with a
 /// clear message instead of letting the deploy die there.
-const RUNNER_SERVICES: &[&str] = &[PROXY_SCRIPT_NAME];
+const RUNNER_SERVICES: &[&str] = &[PROXY_SCRIPT_NAME, super::void_sandbox::SANDBOX_SCRIPT_NAME];
 
 /// True when the deploy root came from Void's build output — the one gate
 /// for every injection in this module. `None` (source config, generated
@@ -308,12 +310,22 @@ pub struct RunnerService {
 
 /// The runner-owned `services` entries for a Void app's deploy: the one
 /// place runner-owned bindings are injected (the deploy runs the target
-/// scripts first, so no entry dangles).
-pub fn runner_services() -> Vec<RunnerService> {
-    vec![RunnerService {
+/// scripts first, so no entry dangles). The proxy binding always; the
+/// sandbox binding only when the app has a managed sandbox (only then
+/// does the controller deploy — an injected binding without its script
+/// would fail celld adoption).
+pub fn runner_services(sandbox: bool) -> Vec<RunnerService> {
+    let mut services = vec![RunnerService {
         binding: PROXY_BINDING,
         service: PROXY_SCRIPT_NAME,
-    }]
+    }];
+    if sandbox {
+        services.push(RunnerService {
+            binding: super::void_sandbox::SANDBOX_BINDING,
+            service: super::void_sandbox::SANDBOX_SCRIPT_NAME,
+        });
+    }
+    services
 }
 
 /// The runner-owned values for one Void deploy.
@@ -407,6 +419,12 @@ pub fn merge_runner_owned(
             PROXY_SCRIPT_NAME
         );
     }
+    if obj.get("name").and_then(Value::as_str) == Some(super::void_sandbox::SANDBOX_SCRIPT_NAME) {
+        anyhow::bail!(
+            "the config's `name` is `{}`, reserved for the platform's Void sandbox controller script (rename the Worker)",
+            super::void_sandbox::SANDBOX_SCRIPT_NAME
+        );
+    }
     let services = match obj.get_mut("services") {
         None => {
             obj.insert("services".to_string(), Value::Array(Vec::new()));
@@ -430,7 +448,7 @@ pub fn merge_runner_owned(
         if let Some(service) = entry.get("service").and_then(Value::as_str) {
             if RUNNER_SERVICES.contains(&service) {
                 anyhow::bail!(
-                    "the config's `services` entry targets `{}`, reserved for the platform's Void proxy script (remove it: the runner injects its own binding)",
+                    "the config's `services` entry targets `{}`, reserved for a platform runner-owned script (remove it: the runner injects its own binding)",
                     service
                 );
             }
@@ -533,27 +551,37 @@ pub fn merge_runner_owned(
     })
 }
 
+/// What one Void root merge reads besides the fleet rows: the deploy
+/// root, the merged user settings, the operator's sender domain, where the
+/// log tells the operator to fix settings, and whether the app has a
+/// managed sandbox (which injects the `__VOID_SANDBOX` binding — only then
+/// does the controller deploy).
+pub struct VoidMergeCtx<'a> {
+    pub deploy_root: &'a Path,
+    pub settings: &'a [(String, String)],
+    pub email_domain: Option<&'a str>,
+    pub settings_label: &'a str,
+    pub sandbox: bool,
+}
+
 /// Merge the runner-owned entries into the deploy root's
 /// `wrangler.jsonc`/`wrangler.json` (`jsonc` first, as celld reads them),
 /// parsed and written back like the settings merge (never following links).
 /// `Ok(None)` when the root has neither file — a TOML-only root, which
 /// `celld deploy` itself refuses. The fleet's token is ensured (minted
-/// once, then reused) and returned beside the stats — the deploy threads
-/// this value into the proxy render too, so a rotation landing mid-deploy
-/// cannot leave app and proxy holding different tokens. `email_domain`
-/// is the operator's sender domain, injected when configured.
+/// once, then reused), its mint recorded in the stats, and the value
+/// returned beside them — the deploy threads this value into the proxy
+/// render too, so a rotation landing mid-deploy cannot leave app and
+/// proxy holding different tokens.
 pub async fn merge_void_root(
     pool: &SqlitePool,
     app: &crate::models::App,
     environment: Option<&crate::models::Environment>,
-    deploy_root: &Path,
-    settings: &[(String, String)],
-    email_domain: Option<&str>,
-    settings_label: &str,
+    merge: &VoidMergeCtx<'_>,
 ) -> anyhow::Result<Option<(RunnerOwnedStats, String)>> {
     let mut found = None;
     for name in ["wrangler.jsonc", "wrangler.json"] {
-        if let Ok(text) = std::fs::read_to_string(deploy_root.join(name)) {
+        if let Ok(text) = std::fs::read_to_string(merge.deploy_root.join(name)) {
             found = Some((name, text));
             break;
         }
@@ -567,19 +595,19 @@ pub async fn merge_void_root(
     let (proxy_token, token_minted) = ensure_proxy_token(pool, &app.id, environment_id).await?;
     let mut stats = merge_runner_owned(
         &mut value,
-        settings,
+        merge.settings,
         &RunnerOwned {
             project_id: app.id.clone(),
             project_slug: app.slug.clone(),
             proxy_token: proxy_token.clone(),
-            email_domain: email_domain.map(str::to_string),
-            services: runner_services(),
+            email_domain: merge.email_domain.map(str::to_string),
+            services: runner_services(merge.sandbox),
         },
-        settings_label,
+        merge.settings_label,
     )?;
     stats.token_minted = token_minted;
     crate::host::build_output::write_fresh(
-        &deploy_root.join(label),
+        &merge.deploy_root.join(label),
         &serde_json::to_string_pretty(&value)?,
     )?;
     Ok(Some((stats, proxy_token)))
@@ -603,7 +631,7 @@ mod tests {
             project_slug: "blog".to_string(),
             proxy_token: "tok".to_string(),
             email_domain: None,
-            services: runner_services(),
+            services: runner_services(false),
         }
     }
 
@@ -683,15 +711,29 @@ mod tests {
     }
 
     /// The runner-owned services are the proxy binding, appended after the
-    /// tenant's entries in [`runner_services`] order.
+    /// tenant's entries in [`runner_services`] order — plus the sandbox
+    /// binding for apps with a managed sandbox, and only then.
     #[test]
     fn runner_services_append_after_the_tenants() {
         assert_eq!(
-            runner_services(),
+            runner_services(false),
             vec![RunnerService {
                 binding: "__VOID_PROXY",
                 service: "noite-void-proxy",
             }]
+        );
+        assert_eq!(
+            runner_services(true),
+            vec![
+                RunnerService {
+                    binding: "__VOID_PROXY",
+                    service: "noite-void-proxy",
+                },
+                RunnerService {
+                    binding: "__VOID_SANDBOX",
+                    service: "noite-void-sandbox",
+                },
+            ]
         );
         let mut config = json!({"name": "blog"});
         let stats = merge_runner_owned(&mut config, &[], &owned(), "Settings").unwrap();
@@ -699,6 +741,18 @@ mod tests {
         assert_eq!(
             config["services"],
             json!([{"binding": "__VOID_PROXY", "service": "noite-void-proxy"}])
+        );
+        let mut sandbox_owned = owned();
+        sandbox_owned.services = runner_services(true);
+        let mut config = json!({"name": "blog"});
+        let stats = merge_runner_owned(&mut config, &[], &sandbox_owned, "Settings").unwrap();
+        assert_eq!(stats.services_added, 2);
+        assert_eq!(
+            config["services"],
+            json!([
+                {"binding": "__VOID_PROXY", "service": "noite-void-proxy"},
+                {"binding": "__VOID_SANDBOX", "service": "noite-void-sandbox"},
+            ])
         );
     }
 
@@ -795,9 +849,18 @@ mod tests {
             "{:#}",
             err
         );
+        // The sandbox controller script's name as the Worker's own.
+        let err = merge_runner_owned(
+            &mut json!({"name": "noite-void-sandbox"}),
+            &[],
+            &owned(),
+            "Settings",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("noite-void-sandbox"), "{err:#}");
         // A tenant service, KV binding or KV id the runner owns — including
-        // a second binding aimed at the proxy script and either alias of
-        // the proxy's mail-idempotency namespace.
+        // a second binding aimed at a runner-owned script and either alias
+        // of the proxy's mail-idempotency namespace.
         for (config, name) in [
             (
                 json!({"name": "a", "services": [{"binding": "__VOID_PROXY", "service": "x"}]}),
@@ -806,6 +869,14 @@ mod tests {
             (
                 json!({"name": "a", "services": [{"binding": "P2", "service": "noite-void-proxy"}]}),
                 "noite-void-proxy",
+            ),
+            (
+                json!({"name": "a", "services": [{"binding": "__VOID_SANDBOX", "service": "x"}]}),
+                "__VOID_SANDBOX",
+            ),
+            (
+                json!({"name": "a", "services": [{"binding": "P2", "service": "noite-void-sandbox"}]}),
+                "noite-void-sandbox",
             ),
             (
                 json!({"name": "a", "kv_namespaces": [{"binding": "ISR_CACHE", "id": "other"}]}),
@@ -1008,7 +1079,7 @@ mod tests {
             std::env::temp_dir().join(format!("noite-merge-void-root-{}", crate::models::new_id()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("wrangler.json"), r#"{"name": "void-app"}"#).unwrap();
-        let (stats, token) = merge_void_root(&pool, &app, None, &root, &[], None, "Settings")
+        let (stats, token) = merge_void_root(&pool, &app, None, &ctx(&root, false))
             .await
             .unwrap()
             .expect("merges the json root");
@@ -1019,7 +1090,7 @@ mod tests {
         // A second deploy reuses the same row value (a deploy always
         // starts from fresh build output).
         std::fs::write(root.join("wrangler.json"), r#"{"name": "void-app"}"#).unwrap();
-        let (_, again) = merge_void_root(&pool, &app, None, &root, &[], None, "Settings")
+        let (_, again) = merge_void_root(&pool, &app, None, &ctx(&root, false))
             .await
             .unwrap()
             .expect("merges again");
@@ -1241,6 +1312,16 @@ mod tests {
         dir
     }
 
+    fn ctx(dir: &std::path::Path, sandbox: bool) -> VoidMergeCtx<'_> {
+        VoidMergeCtx {
+            deploy_root: dir,
+            settings: &[],
+            email_domain: None,
+            settings_label: "Settings",
+            sandbox,
+        }
+    }
+
     /// The file wrapper parses, injects and rewrites through the same path
     /// as the settings merge — and `jsonc` wins over `json`, as celld
     /// reads them.
@@ -1256,7 +1337,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("wrangler.json"), r#"{"name": "stale"}"#).unwrap();
 
-        let (stats, _) = merge_void_root(&pool, &app, None, &dir, &[], None, "Settings")
+        let (stats, _) = merge_void_root(&pool, &app, None, &ctx(&dir, false))
             .await
             .unwrap()
             .expect("jsonc found");
@@ -1281,7 +1362,7 @@ mod tests {
             r#"{"name": "blog", /* c */ "vars": {"MODE": "prod"}}"#,
         )
         .unwrap();
-        let (stats, _) = merge_void_root(&pool, &app, None, &dir, &[], None, "Settings")
+        let (stats, _) = merge_void_root(&pool, &app, None, &ctx(&dir, false))
             .await
             .unwrap()
             .expect("jsonc found");
@@ -1292,17 +1373,42 @@ mod tests {
         assert_eq!(value["vars"]["__VOID_PROXY_TOKEN"], before);
     }
 
+    /// The file wrapper threads the sandbox flag: the `__VOID_SANDBOX`
+    /// binding lands in the rewritten config for sandbox apps, and stays
+    /// out otherwise.
+    #[tokio::test]
+    async fn void_root_threads_the_sandbox_binding() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
+        let app = seed(&pool).await;
+        let dir = scratch("sandbox-flag").canonicalize().unwrap();
+        std::fs::write(dir.join("wrangler.json"), r#"{"name": "blog"}"#).unwrap();
+
+        let (stats, _) = merge_void_root(&pool, &app, None, &ctx(&dir, true))
+            .await
+            .unwrap()
+            .expect("json found");
+        assert_eq!(stats.services_added, 2);
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("wrangler.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            value["services"],
+            json!([
+                {"binding": "__VOID_PROXY", "service": "noite-void-proxy"},
+                {"binding": "__VOID_SANDBOX", "service": "noite-void-sandbox"},
+            ])
+        );
+    }
+
     #[tokio::test]
     async fn void_root_without_a_json_config_is_none() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
         let dir = scratch("toml").canonicalize().unwrap();
         std::fs::write(dir.join("wrangler.toml"), "name = \"a\"\n").unwrap();
-        assert!(
-            merge_void_root(&pool, &app, None, &dir, &[], None, "Settings")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(merge_void_root(&pool, &app, None, &ctx(&dir, false))
+            .await
+            .unwrap()
+            .is_none());
     }
 }

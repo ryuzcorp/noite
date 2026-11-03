@@ -2,15 +2,16 @@
 //! reusable mechanism that deploys extra Worker scripts into a fleet before
 //! the tenant app.
 //!
-//! A Void fleet carries the tenant app plus runner-owned scripts — today
-//! `noite-void-proxy` ([`super::void_proxy`]), later `noite-void-sandbox` —
-//! each with embedded sources and a per-fleet rendered config. celld
-//! resolves `services` within the fleet bucket only and moves the
-//! fleet-wide pointer on every deploy, so deploy order is load-bearing:
-//! cohosted scripts first (lowest [`CohostedScript::order`] first), the app
-//! last, then the one `/reload` whose outcome the deploy already checks.
-//! A later script only adds its [`CohostedScript`] and its render: the
-//! order, the skip rule and the invocation below stay untouched.
+//! A Void fleet carries the tenant app plus runner-owned scripts —
+//! `noite-void-proxy` ([`super::void_proxy`]) and, for Void apps with a
+//! managed sandbox, `noite-void-sandbox` ([`super::void_sandbox`]) — each
+//! with its sources and a per-fleet rendered config. celld resolves
+//! `services` within the fleet bucket only and moves the fleet-wide pointer
+//! on every deploy, so deploy order is load-bearing: cohosted scripts first
+//! (lowest [`CohostedScript::order`] first), the app last, then the one
+//! `/reload` whose outcome the deploy already checks. A later script only
+//! adds its [`CohostedScript`] and its render: the order, the skip rule and
+//! the invocation below stay untouched.
 //!
 //! Skip-when-unchanged: the bundle and rendered config are the runner's
 //! own, so a script whose [`RenderedCohost::content_hash`] matches the
@@ -49,6 +50,16 @@ pub struct CohostSource {
     pub contents: &'static str,
 }
 
+/// One runtime-loaded source file: the same shape as [`CohostSource`] with
+/// owned bytes, for scripts whose bundle is built outside the runner
+/// compile (the sandbox controller's image-build bundle, read from disk at
+/// deploy time). Written and hashed exactly like an embedded source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSource {
+    pub path: String,
+    pub contents: Vec<u8>,
+}
+
 /// A runner-owned script: its celld identity, its embedded sources, and
 /// its place in the deploy order (lowest first; the tenant app always
 /// deploys last, after every cohosted script).
@@ -69,7 +80,24 @@ pub struct RenderedCohost {
     pub script: &'static CohostedScript,
     pub secret_vars: &'static [&'static str],
     pub config: Value,
+    /// Runtime-loaded sources, written beside the embedded ones and hashed
+    /// in order after them. Empty for fully-embedded scripts like the proxy.
+    pub extra_sources: Vec<RuntimeSource>,
+    /// Extra content-hash inputs beyond sources and config: the sandbox
+    /// render feeds its image digest composite here, so an image change
+    /// redeploys the script even though the config's `image` string (a
+    /// pinned path) reads the same. Empty for scripts whose config carries
+    /// every input.
+    pub extra_hash_input: Vec<u8>,
+    /// Whether the rendered config declares containers: such a script gets
+    /// the container deploy timeout (a first image pull), like the app.
+    pub declares_containers: bool,
 }
+
+/// The `celld deploy` timeout for a script whose config declares
+/// containers: a first image pull dwarfs the 120 s default. The tenant app
+/// uses the same bound (see the ordered deploy in [`super::deploy`]).
+pub const CONTAINER_DEPLOY_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -89,9 +117,10 @@ impl RenderedCohost {
     }
 
     /// The skip-when-unchanged digest: SHA-256 over the source paths and
-    /// bytes in order, then the rendered config with every secret var's
+    /// bytes in order (embedded sources, then runtime ones), then the
+    /// extra hash input, then the rendered config with every secret var's
     /// value substituted by its hash. Deterministic: same inputs, same
-    /// digest — and any source, config or secret change flips it.
+    /// digest — and any source, config, image or secret change flips it.
     pub fn content_hash(&self) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
@@ -101,6 +130,13 @@ impl RenderedCohost {
             hasher.update(source.contents.as_bytes());
             hasher.update([0]);
         }
+        for source in &self.extra_sources {
+            hasher.update(source.path.as_bytes());
+            hasher.update([0]);
+            hasher.update(&source.contents);
+            hasher.update([0]);
+        }
+        hasher.update(&self.extra_hash_input);
         let mut config = self.config.clone();
         if let Some(vars) = config.get_mut("vars").and_then(Value::as_object_mut) {
             for name in self.secret_vars {
@@ -127,31 +163,38 @@ impl RenderedCohost {
             .collect()
     }
 
-    /// Write the deploy project: every embedded source at its path plus
-    /// the rendered `wrangler.json`. Paths are compile-time constants from
-    /// the script's own module, but a path escaping the root is still
-    /// refused — a deploy project that writes outside itself is never run.
+    /// Write the deploy project: every embedded and runtime-loaded source
+    /// at its path plus the rendered `wrangler.json`. Embedded paths are
+    /// compile-time constants from the script's own module, but a path
+    /// escaping the root is still refused — a deploy project that writes
+    /// outside itself is never run.
     pub fn write_project(&self, dir: &Path) -> anyhow::Result<()> {
         use std::path::Component;
         std::fs::create_dir_all(dir)?;
-        for source in self.script.sources {
+        let write_source = |dir: &Path, path: &str, contents: &[u8]| -> anyhow::Result<()> {
             // A lexical `starts_with` cannot see through `..` (`join` never
             // normalizes), so the path itself must be all normal components.
-            let inside = Path::new(source.path)
+            let inside = Path::new(path)
                 .components()
                 .all(|c| matches!(c, Component::Normal(_)));
             if !inside {
                 anyhow::bail!(
-                    "cohosted script `{}` source path {:?} escapes its project",
+                    "cohosted script `{}` source path {path:?} escapes its project",
                     self.script.name,
-                    source.path
                 );
             }
-            let target = dir.join(source.path);
+            let target = dir.join(path);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&target, source.contents)?;
+            std::fs::write(&target, contents)?;
+            Ok(())
+        };
+        for source in self.script.sources {
+            write_source(dir, source.path, source.contents.as_bytes())?;
+        }
+        for source in &self.extra_sources {
+            write_source(dir, &source.path, &source.contents)?;
         }
         std::fs::write(dir.join("wrangler.json"), self.config_json()?)?;
         Ok(())
@@ -303,6 +346,16 @@ impl CohostOutcome {
     }
 }
 
+/// One render's `celld deploy` timeout: the shared default, stretched
+/// over a first image pull for scripts declaring containers.
+fn render_timeout(celld: &CelldDeploy<'_>, render: &RenderedCohost) -> Duration {
+    if render.declares_containers {
+        CONTAINER_DEPLOY_TIMEOUT
+    } else {
+        celld.timeout
+    }
+}
+
 /// Deploy the fleet's runner-owned scripts in order (lowest `order`
 /// first): each renders to a fresh temp project, deploys with
 /// `celld deploy` into the fleet bucket, and stores its content hash —
@@ -350,7 +403,11 @@ pub async fn ensure_cohosted(
                 .create(&dir)?;
         }
         render.write_project(&dir)?;
-        if let Err(e) = celld_deploy(celld, &dir, None).await {
+        let render_celld = CelldDeploy {
+            timeout: render_timeout(celld, render),
+            ..*celld
+        };
+        if let Err(e) = celld_deploy(&render_celld, &dir, None).await {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(anyhow::anyhow!(
                 "cohosted script `{}` deploy failed: {:#}",
@@ -446,6 +503,13 @@ mod tests {
         order: 10,
     };
 
+    const EARLY_SCRIPT: CohostedScript = CohostedScript {
+        name: "noite-test-early",
+        main: "worker.js",
+        sources: &[],
+        order: 5,
+    };
+
     fn render(token: &str) -> RenderedCohost {
         RenderedCohost {
             script: &SCRIPT,
@@ -455,6 +519,9 @@ mod tests {
                 "main": "worker.ts",
                 "vars": {"__VOID_PROXY_TOKEN": token, "MODE": "prod"},
             }),
+            extra_sources: Vec::new(),
+            extra_hash_input: Vec::new(),
+            declares_containers: false,
         }
     }
 
@@ -485,6 +552,33 @@ mod tests {
         let mut source_changed = render("tok-1");
         source_changed.script = &OTHER;
         assert_ne!(source_changed.content_hash(), base);
+    }
+
+    /// Runtime-loaded sources and the extra hash input feed the digest
+    /// like embedded sources do: a bundle change or an image change flips
+    /// the hash and redeploys the script.
+    #[test]
+    fn extra_sources_and_hash_input_flip_the_digest() {
+        let base = render("tok-1").content_hash();
+        let mut bundle_changed = render("tok-1");
+        bundle_changed.extra_sources.push(RuntimeSource {
+            path: "worker.js".to_string(),
+            contents: b"bundle-bytes".to_vec(),
+        });
+        let with_bundle = bundle_changed.content_hash();
+        assert_ne!(with_bundle, base);
+
+        bundle_changed.extra_sources[0].contents = b"bundle-bytes-2".to_vec();
+        assert_ne!(bundle_changed.content_hash(), with_bundle);
+
+        let mut image_changed = render("tok-1");
+        image_changed.extra_sources.push(RuntimeSource {
+            path: "worker.js".to_string(),
+            contents: b"bundle-bytes".to_vec(),
+        });
+        assert_eq!(image_changed.content_hash(), with_bundle);
+        image_changed.extra_hash_input = vec![1, 2, 3];
+        assert_ne!(image_changed.content_hash(), with_bundle);
     }
 
     /// The project lands exactly: sources at their paths with their bytes,
@@ -526,10 +620,72 @@ mod tests {
             script: &EVIL,
             secret_vars: &[],
             config: json!({"name": "x"}),
+            extra_sources: Vec::new(),
+            extra_hash_input: Vec::new(),
+            declares_containers: false,
         };
         let err = evil.write_project(&dir).unwrap_err();
         assert!(format!("{:#}", err).contains("escapes"), "{:#}", err);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Runtime-loaded sources land beside the embedded ones — and the same
+    /// escape rule refuses an escaping runtime path.
+    #[test]
+    fn write_project_lays_out_runtime_sources() {
+        let mut rendered = render("tok");
+        rendered.extra_sources.push(RuntimeSource {
+            path: "worker.js".to_string(),
+            contents: b"bundle-bytes".to_vec(),
+        });
+        let dir =
+            std::env::temp_dir().join(format!("noite-cohost-runtime-{}", crate::models::new_id()));
+        rendered.write_project(&dir).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("worker.js")).unwrap(),
+            b"bundle-bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("worker.ts")).unwrap(),
+            "export default { fetch: () => new Response('ok') }"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let mut evil = render("tok");
+        evil.extra_sources.push(RuntimeSource {
+            path: "../escape.js".to_string(),
+            contents: Vec::new(),
+        });
+        let dir =
+            std::env::temp_dir().join(format!("noite-cohost-rtesc-{}", crate::models::new_id()));
+        let err = evil.write_project(&dir).unwrap_err();
+        assert!(format!("{err:#}").contains("escapes"), "{err:#}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A render declaring containers gets the container deploy timeout (a
+    /// first image pull); anything else keeps the shared default.
+    #[test]
+    fn container_scripts_get_the_container_timeout() {
+        let celld = CelldDeploy {
+            celld_bin: "celld",
+            env: &[],
+            bucket: "s3://noite/fleets/x",
+            endpoint: "http://rustfs:9000",
+            region: "us-east-1",
+            timeout: Duration::from_secs(120),
+        };
+        assert_eq!(
+            render_timeout(&celld, &render("tok")),
+            Duration::from_secs(120)
+        );
+        let mut containers = render("tok");
+        containers.declares_containers = true;
+        assert_eq!(
+            render_timeout(&celld, &containers),
+            CONTAINER_DEPLOY_TIMEOUT
+        );
+        assert_eq!(CONTAINER_DEPLOY_TIMEOUT, Duration::from_secs(600));
     }
 
     /// celld's own project failures (bundling, config shape) read as
@@ -730,6 +886,80 @@ echo "deployed $2"
         // The cohosted temp project is gone: argv[1] is its dir.
         let project = calls[0].split(' ').nth(1).expect("deploy argv");
         assert!(!Path::new(project).exists(), "{} left behind", project);
+        std::fs::remove_dir_all(&app_dir).unwrap();
+    }
+
+    /// Two cohosted scripts deploy lowest order first no matter the input
+    /// order — the sandbox controller (5) before the proxy (10) — and the
+    /// app still deploys last.
+    #[tokio::test]
+    async fn two_cohosted_scripts_deploy_lowest_order_first() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
+        let app = seed(&pool).await;
+        let fake = FakeCelld::spawn();
+        let log = fake.log();
+        let dir = fake.dir.to_string_lossy().into_owned();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let bin = fake.bin();
+        let celld = CelldDeploy {
+            celld_bin: &bin,
+            env: &env,
+            bucket: "s3://noite/fleets/cohost-app",
+            endpoint: "http://rustfs:9000",
+            region: "us-east-1",
+            timeout: Duration::from_secs(30),
+        };
+        let app_dir =
+            std::env::temp_dir().join(format!("noite-cohost-app3-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&app_dir).unwrap();
+
+        let early = RenderedCohost {
+            script: &EARLY_SCRIPT,
+            secret_vars: &[],
+            config: json!({"name": "noite-test-early", "main": "worker.js"}),
+            extra_sources: vec![RuntimeSource {
+                path: "worker.js".to_string(),
+                contents: b"early".to_vec(),
+            }],
+            extra_hash_input: Vec::new(),
+            declares_containers: true,
+        };
+        let stats = deploy_fleet_in_order(
+            &pool,
+            &app.id,
+            None,
+            &celld,
+            &[render("tok"), early],
+            &FleetApp {
+                dir: &app_dir,
+                cwd: None,
+                timeout: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.app_attempts, 1);
+        assert_eq!(stats.cohosted.len(), 2);
+        assert_eq!(stats.cohosted[0].script, "noite-test-early");
+        assert_eq!(stats.cohosted[1].script, "noite-test-cohost");
+
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert!(
+            calls[0].contains("noite-cohost-noite-test-early-"),
+            "{calls:?}"
+        );
+        assert!(
+            calls[1].contains("noite-cohost-noite-test-cohost-"),
+            "{calls:?}"
+        );
+        assert!(
+            calls[2].contains(&app_dir.to_string_lossy().into_owned()),
+            "{calls:?}"
+        );
         std::fs::remove_dir_all(&app_dir).unwrap();
     }
 

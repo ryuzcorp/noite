@@ -14,15 +14,21 @@ pub const SOURCE_AUTH_DEFAULT: &str = "auth-default";
 /// reserved there, so a settings row carrying it would fail the deploy).
 pub const SOURCE_VOID_PROXY_TOKEN: &str = "void-proxy-token";
 
+/// Source marker for the per-fleet `__VOID_SANDBOX_ADMISSION_NAME`: the
+/// secret name of the fleet's sandbox admission cell, consumed only by the
+/// sandbox controller render — never through the settings merges (the name
+/// is reserved there) and never into the app's vars.
+pub const SOURCE_VOID_SANDBOX_ADMISSION: &str = "void-sandbox-admission";
+
 /// Tenant env vars (CF `.dev.vars` model: local file for dev, fleet env in
 /// prod). Plaintext in SQLite like the other single-operator secrets — no
 /// vault. Names are validated at the API layer; values capped at 32 KiB.
 ///
 /// `source` marks runner-provisioned rows (`auth-default`,
-/// `void-proxy-token`); user rows carry `''`. The listing serves every row
-/// with its value (single-operator premise; the control worker redacts
-/// values for the UI), while each deploy input filters on the marker (see
-/// [`worker_settings`] and [`tenant_env`]).
+/// `void-proxy-token`, `void-sandbox-admission`); user rows carry `''`.
+/// The listing serves every row with its value (single-operator premise;
+/// the control worker redacts values for the UI), while each deploy input
+/// filters on the marker (see [`worker_settings`] and [`tenant_env`]).
 pub async fn list_env(pool: &SqlitePool, app_id: &str) -> sqlx::Result<Vec<AppEnv>> {
     sqlx::query_as::<_, AppEnv>(
         "SELECT app_id, name, value, updated_at, source FROM app_env WHERE app_id = ? ORDER BY name",
@@ -146,10 +152,12 @@ pub(crate) fn env_reserved(name: &str) -> bool {
 /// failure is an error, not an empty list: deploying without the app's
 /// settings would ship a Worker missing its secrets.
 ///
-/// The one filter is the runner-owned token row (`void-proxy-token`): its
-/// name is reserved in the merge, so it is injected by the runner-owned
-/// merge alone. The auto-provisioned `BETTER_AUTH_SECRET` (`auth-default`)
-/// stays in: it is an ordinary var under an allowed name.
+/// The filter is the runner-owned rows (`void-proxy-token`,
+/// `void-sandbox-admission`): their names are reserved in the merge, so
+/// the runner-owned merge (proxy token) and the sandbox controller render
+/// (admission name) inject them alone. The auto-provisioned
+/// `BETTER_AUTH_SECRET` (`auth-default`) stays in: it is an ordinary var
+/// under an allowed name.
 pub async fn worker_settings(
     pool: &SqlitePool,
     app_id: &str,
@@ -158,6 +166,7 @@ pub async fn worker_settings(
         .await?
         .into_iter()
         .filter(|r| r.source != SOURCE_VOID_PROXY_TOKEN)
+        .filter(|r| r.source != SOURCE_VOID_SANDBOX_ADMISSION)
         .map(|r| (r.name, r.value))
         .collect())
 }
@@ -167,10 +176,12 @@ pub async fn worker_settings(
 /// and flow through like any other var. Worker `vars` come from
 /// [`worker_settings`] instead (different reserved set, refused not dropped).
 ///
-/// Provisioned rows never reach process env: the token authenticates the
-/// Worker to its own fleet's proxy, and the auth secret is a Worker secret.
-/// The proxy-only credential rows (`VOID_PROXY_*`) are dropped by the
-/// process-reserved prefix rule — only the proxy render consumes them.
+/// Provisioned rows never reach process env: the proxy token
+/// authenticates the Worker to its own fleet's proxy, the admission name
+/// addresses the fleet's sandbox admission cell, and the auth secret is a
+/// Worker secret. The proxy-only credential rows (`VOID_PROXY_*`) are
+/// dropped by the process-reserved prefix rule — only the proxy render
+/// consumes them.
 /// (A user row under a reserved name fails the deploy at the Worker-vars
 /// merge, before any fleet sees process env.)
 pub async fn tenant_env(pool: &SqlitePool, app_id: &str) -> Vec<(String, String)> {
@@ -200,6 +211,7 @@ mod tests {
     use super::{
         env_reserved, get_env, insert_provisioned, list_env, set_env, set_provisioned, tenant_env,
         worker_settings, SOURCE_AUTH_DEFAULT, SOURCE_VOID_PROXY_TOKEN,
+        SOURCE_VOID_SANDBOX_ADMISSION,
     };
 
     /// The Worker-vars input is unfiltered: process-reserved names
@@ -251,9 +263,10 @@ mod tests {
     }
 
     /// Provisioned rows route by marker: the auth secret rides the settings
-    /// merges, the proxy token rides the runner-owned merge only, and
-    /// neither reaches process env. The listing keeps every row with its
-    /// value (the control worker redacts values for the UI).
+    /// merges, the proxy token rides the runner-owned merge only, the
+    /// sandbox admission name rides the controller render only, and none
+    /// reaches process env. The listing keeps every row with its value
+    /// (the control worker redacts values for the UI).
     #[tokio::test]
     async fn provisioned_rows_route_by_source_marker() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
@@ -290,6 +303,15 @@ mod tests {
         )
         .await
         .unwrap());
+        assert!(insert_provisioned(
+            &pool,
+            &app.id,
+            "__VOID_SANDBOX_ADMISSION_NAME",
+            "admission",
+            SOURCE_VOID_SANDBOX_ADMISSION
+        )
+        .await
+        .unwrap());
         set_env(&pool, &app.id, "MODEL", "x").await.unwrap();
 
         assert_eq!(
@@ -303,7 +325,7 @@ mod tests {
             tenant_env(&pool, &app.id).await,
             vec![("MODEL".to_string(), "x".to_string())]
         );
-        assert_eq!(list_env(&pool, &app.id).await.unwrap().len(), 3);
+        assert_eq!(list_env(&pool, &app.id).await.unwrap().len(), 4);
 
         // Never overwriting: a second insert loses, whatever the marker.
         assert!(!insert_provisioned(

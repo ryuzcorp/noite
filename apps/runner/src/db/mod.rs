@@ -50,7 +50,7 @@ pub use deploys::{
 };
 pub use env::{
     delete_env, get_env, insert_provisioned, list_env, set_env, set_provisioned, tenant_env,
-    worker_settings, SOURCE_AUTH_DEFAULT, SOURCE_VOID_PROXY_TOKEN,
+    worker_settings, SOURCE_AUTH_DEFAULT, SOURCE_VOID_PROXY_TOKEN, SOURCE_VOID_SANDBOX_ADMISSION,
 };
 pub use environments::{
     count_environments, count_environments_for_app, create_environment, delete_env_override,
