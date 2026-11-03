@@ -122,6 +122,22 @@ RUN bun run build \
   && rm -f dist/.dev.vars dist/.dev.vars.* dist/ssr/.dev.vars dist/ssr/.dev.vars.* \
   && find dist -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1 >dist/REVISION
 
+# --- Void sandbox controller bundle -----------------------------------------
+# Fixed bundle for the `noite-void-sandbox` script (SPEC, Void sandbox
+# controller): the Noite-owned runtime in apps/void-sandbox over the pinned
+# `void` npm version. Installs from the package's own lockfile
+# (`bun install --frozen-lockfile`, same as ui-build) and compiles
+# `dist/worker.js` + `dist/meta.json`. Only dist/ leaves this stage (copied
+# into `noite` below); the runner deploys it as `noite-void-sandbox` (a later
+# change renders the config).
+FROM docker.io/oven/bun:1.4-slim AS void-sandbox-build
+WORKDIR /app
+COPY apps/void-sandbox/package.json apps/void-sandbox/bun.lock ./
+RUN --mount=type=cache,id=noite-bun-cache,target=/root/.bun/install/cache,sharing=locked \
+    bun install --frozen-lockfile
+COPY apps/void-sandbox/ ./
+RUN bun run build && test -s dist/worker.js && test -s dist/meta.json
+
  # --- runtime shared by `noite` and `dev` -----------------------------------
  # Runtime base is the slim variant (T6.3): ui-build stays on full debian
  # (build tools); the runtime only needs bun + apt-installed bins.
@@ -271,4 +287,7 @@ CMD ["/bin/sh", "/opt/noite/dev.sh"]
 FROM base AS noite
 COPY --from=runner-build /out/noite-runner /usr/local/bin/noite-runner
 COPY --from=ui-build /app/dist /opt/noite/control/dist
+# Fixed Void sandbox controller bundle + meta (SPEC, Void sandbox
+# controller), deployed by the runner as `noite-void-sandbox`.
+COPY --from=void-sandbox-build /app/dist /opt/noite/void-sandbox
 ENTRYPOINT ["/usr/bin/tini", "--", "noite-runner"]
