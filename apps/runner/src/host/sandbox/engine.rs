@@ -428,7 +428,7 @@ async fn forward(
             forward_simple(
                 upstream,
                 "POST",
-                &format!("/exec/{id}/resize?{query}"),
+                &format!("/exec/{}/resize?{}", id, query),
                 Bytes::new(),
             )
             .await
@@ -1448,7 +1448,7 @@ mod tests {
             let (status, body) = fleet_call(
                 &socket,
                 "POST",
-                &format!("/exec/{id}/resize?h=24&w=80"),
+                &format!("/exec/{}/resize?h=24&w=80", id),
                 None,
             )
             .await;

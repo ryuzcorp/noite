@@ -617,21 +617,21 @@ pub fn validate_exec_resize_query(query: Option<&str>) -> Result<String, String>
             _ => return Err("resize takes only ?h=<rows>&w=<cols>".to_string()),
         };
         if dim.is_some() {
-            return Err(format!("resize takes one {key}"));
+            return Err(format!("resize takes one {}", key));
         }
         if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(format!("resize {key} must be 1..=65535"));
+            return Err(format!("resize {} must be 1..=65535", key));
         }
         let size: u32 = value
             .parse()
-            .map_err(|_| format!("resize {key} must be 1..=65535"))?;
+            .map_err(|_| format!("resize {} must be 1..=65535", key))?;
         if !(1..=65535).contains(&size) {
-            return Err(format!("resize {key} must be 1..=65535"));
+            return Err(format!("resize {} must be 1..=65535", key));
         }
         *dim = Some(size);
     }
     match (rows, cols) {
-        (Some(rows), Some(cols)) => Ok(format!("h={rows}&w={cols}")),
+        (Some(rows), Some(cols)) => Ok(format!("h={}&w={}", rows, cols)),
         _ => Err("resize needs ?h=<rows>&w=<cols>".to_string()),
     }
 }
