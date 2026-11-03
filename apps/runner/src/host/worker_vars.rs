@@ -570,14 +570,16 @@ mod tests {
             "VOID_PROXY_SMTP_HOST",
             "VOID_PROXY_ANYTHING",
         ] {
-            assert!(!worker_var_reserved(name), "{name} refused globally");
+            assert!(!worker_var_reserved(name), "{} refused globally", name);
             assert!(
                 worker_var_reserved_for(name, true),
-                "{name} allowed on Void"
+                "{} allowed on Void",
+                name
             );
             assert!(
                 !worker_var_reserved_for(name, false),
-                "{name} refused off Void"
+                "{} refused off Void",
+                name
             );
         }
         // A non-Void app still deploys such a setting as an ordinary var.

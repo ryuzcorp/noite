@@ -418,15 +418,15 @@ mod tests {
         let a_text = serde_json::to_string(&a.config).unwrap();
         let b_text = serde_json::to_string(&b.config).unwrap();
         for secret in ["token-a", "smtp-user-a", "smtp-pass-a", "ai-key-a"] {
-            assert!(!b_text.contains(secret), "B's render leaks {secret}");
+            assert!(!b_text.contains(secret), "B's render leaks {}", secret);
         }
         for secret in ["token-b", "smtp-user-b", "smtp-pass-b", "ai-key-b"] {
-            assert!(!a_text.contains(secret), "A's render leaks {secret}");
+            assert!(!a_text.contains(secret), "A's render leaks {}", secret);
         }
         // …while the operator section is shared.
         for shared in ["smtp.example.com", "ops@example.com", "ai.example.com"] {
-            assert!(a_text.contains(shared), "A lost {shared}");
-            assert!(b_text.contains(shared), "B lost {shared}");
+            assert!(a_text.contains(shared), "A lost {}", shared);
+            assert!(b_text.contains(shared), "B lost {}", shared);
         }
     }
 

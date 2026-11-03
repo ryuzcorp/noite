@@ -78,7 +78,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hasher
         .finalize()
         .iter()
-        .map(|b| format!("{b:02x}"))
+        .map(|b| format!("{:02x}", b))
         .collect()
 }
 
@@ -123,7 +123,7 @@ impl RenderedCohost {
         hasher
             .finalize()
             .iter()
-            .map(|b| format!("{b:02x}"))
+            .map(|b| format!("{:02x}", b))
             .collect()
     }
 
@@ -260,14 +260,16 @@ pub async fn celld_deploy_app(
     match celld_deploy(celld, project_dir, cwd).await {
         Ok(_) => Ok(AppDeploy { attempts: 1 }),
         Err(first) => {
-            if is_tenant_error(&format!("{first:#}")) {
+            if is_tenant_error(&format!("{:#}", first)) {
                 return Err(first);
             }
             tracing::warn!("celld deploy failed (infra); retrying once");
             match celld_deploy(celld, project_dir, cwd).await {
                 Ok(_) => Ok(AppDeploy { attempts: 2 }),
                 Err(second) => Err(anyhow::anyhow!(
-                    "celld deploy failed twice (one infra retry):\nfirst: {first:#}\nsecond: {second:#}"
+                    "celld deploy failed twice (one infra retry):\nfirst: {:#}\nsecond: {:#}",
+                    first,
+                    second
                 )),
             }
         }
@@ -289,13 +291,13 @@ impl CohostOutcome {
         let short = &self.hash[..12.min(self.hash.len())];
         if self.skipped {
             format!(
-                "void: cohosted script `{}` unchanged ({short}); skipping deploy\n",
-                self.script
+                "void: cohosted script `{}` unchanged ({}); skipping deploy\n",
+                self.script, short
             )
         } else {
             format!(
-                "void: deployed cohosted script `{}` ({short})\n",
-                self.script
+                "void: deployed cohosted script `{}` ({})\n",
+                self.script, short
             )
         }
     }
@@ -338,9 +340,10 @@ pub async fn ensure_cohosted(
         render.write_project(&dir)?;
         celld_deploy(celld, &dir, None).await.map_err(|e| {
             anyhow::anyhow!(
-                "cohosted script `{}` deploy failed (project kept at {}): {e:#}",
+                "cohosted script `{}` deploy failed (project kept at {}): {:#}",
                 render.script.name,
-                dir.display()
+                dir.display(),
+                e
             )
         })?;
         let _ = std::fs::remove_dir_all(&dir);
@@ -513,7 +516,7 @@ mod tests {
             config: json!({"name": "x"}),
         };
         let err = evil.write_project(&dir).unwrap_err();
-        assert!(format!("{err:#}").contains("escapes"), "{err:#}");
+        assert!(format!("{:#}", err).contains("escapes"), "{:#}", err);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -546,7 +549,7 @@ mod tests {
             "`celld deploy` takes one project path, and already has one: x",
             "unknown argument for `celld deploy`: --nope",
         ] {
-            assert!(is_tenant_error(tenant), "tenant not recognized: {tenant}");
+            assert!(is_tenant_error(tenant), "tenant not recognized: {}", tenant);
         }
         for infra in [
             "Error communicating with S3: service error: SlowDown: Please reduce your request rate",
@@ -560,7 +563,7 @@ mod tests {
             "save container image failed:\nError: daemon not running",
             "thread 'main' panicked at crates/celld/deploy.rs:973",
         ] {
-            assert!(!is_tenant_error(infra), "infra misread as tenant: {infra}");
+            assert!(!is_tenant_error(infra), "infra misread as tenant: {}", infra);
         }
     }
 
@@ -609,7 +612,7 @@ echo "deployed $2"
 
         /// Fail invocation `n` with `message` on stderr.
         fn fail(&self, n: usize, message: &str) {
-            std::fs::write(self.dir.join(format!("fail-{n}")), message).unwrap();
+            std::fs::write(self.dir.join(format!("fail-{}", n)), message).unwrap();
         }
 
         fn invocations(&self) -> Vec<String> {
@@ -691,26 +694,30 @@ echo "deployed $2"
         assert!(!stats.cohosted[0].skipped);
 
         let calls = fake.invocations();
-        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls.len(), 2, "{:?}", calls);
         assert!(
             calls[0].contains("noite-cohost-noite-test-cohost-"),
-            "{calls:?}"
+            "{:?}",
+            calls
         );
         assert!(
             calls[0].contains("s3://noite/fleets/cohost-app"),
-            "{calls:?}"
+            "{:?}",
+            calls
         );
         assert!(
             calls[1].contains(&app_dir.to_string_lossy().into_owned()),
-            "{calls:?}"
+            "{:?}",
+            calls
         );
         assert!(
             calls[1].contains("s3://noite/fleets/cohost-app"),
-            "{calls:?}"
+            "{:?}",
+            calls
         );
         // The cohosted temp project is gone: argv[1] is its dir.
         let project = calls[0].split(' ').nth(1).expect("deploy argv");
-        assert!(!Path::new(project).exists(), "{project} left behind");
+        assert!(!Path::new(project).exists(), "{} left behind", project);
         std::fs::remove_dir_all(&app_dir).unwrap();
     }
 
@@ -759,10 +766,11 @@ echo "deployed $2"
                 .unwrap();
         assert!(second.cohosted[0].skipped);
         let calls = fake.invocations();
-        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(calls.len(), 3, "{:?}", calls);
         assert!(
             calls[2].contains(&app_dir.to_string_lossy().into_owned()),
-            "{calls:?}"
+            "{:?}",
+            calls
         );
 
         // A rotation flips the hash: the proxy deploys again beside the app.
@@ -822,18 +830,20 @@ echo "deployed $2"
         .unwrap();
         assert_eq!(stats.app_attempts, 2);
         let lines = stats.log_lines().join("");
-        assert!(lines.contains("attempt 2"), "{lines}");
+        assert!(lines.contains("attempt 2"), "{}", lines);
         let calls = fake.invocations();
-        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(calls.len(), 3, "{:?}", calls);
         // The cohosted script deployed once — the retry is the app's alone.
-        assert!(calls[0].contains("noite-cohost-"), "{calls:?}");
+        assert!(calls[0].contains("noite-cohost-"), "{:?}", calls);
         assert!(
             calls[1].contains(&app_dir.to_string_lossy().into_owned()),
-            "{calls:?}"
+            "{:?}",
+            calls
         );
         assert!(
             calls[2].contains(&app_dir.to_string_lossy().into_owned()),
-            "{calls:?}"
+            "{:?}",
+            calls
         );
         std::fs::remove_dir_all(&app_dir).unwrap();
     }
@@ -873,7 +883,7 @@ echo "deployed $2"
         let err = deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
             .await
             .unwrap_err();
-        assert!(format!("{err:#}").contains("esbuild failed"), "{err:#}");
+        assert!(format!("{:#}", err).contains("esbuild failed"), "{:#}", err);
         assert_eq!(fake.invocations().len(), 2);
 
         // Both app attempts fail on infra: one retry, then both errors.
@@ -901,10 +911,10 @@ echo "deployed $2"
             deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok-2")], &app_side)
                 .await
                 .unwrap_err();
-        let text = format!("{err:#}");
-        assert!(text.contains("failed twice"), "{text}");
-        assert!(text.contains("first: connection refused"), "{text}");
-        assert!(text.contains("second: 503 SlowDown"), "{text}");
+        let text = format!("{:#}", err);
+        assert!(text.contains("failed twice"), "{}", text);
+        assert!(text.contains("first: connection refused"), "{}", text);
+        assert!(text.contains("second: 503 SlowDown"), "{}", text);
         assert_eq!(fake.invocations().len(), 3);
         std::fs::remove_dir_all(&app_dir).unwrap();
     }
@@ -948,9 +958,9 @@ echo "deployed $2"
         let err = deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
             .await
             .unwrap_err();
-        let text = format!("{err:#}");
-        assert!(text.contains("noite-test-cohost"), "{text}");
-        assert!(text.contains("project kept at"), "{text}");
+        let text = format!("{:#}", err);
+        assert!(text.contains("noite-test-cohost"), "{}", text);
+        assert!(text.contains("project kept at"), "{}", text);
         assert_eq!(fake.invocations().len(), 1);
         // The kept project really is there, with the rendered config.
         let project = fake.invocations()[0]
@@ -960,7 +970,8 @@ echo "deployed $2"
             .to_string();
         assert!(
             Path::new(&project).join("wrangler.json").is_file(),
-            "{project}"
+            "{}",
+            project
         );
         // Nothing stored: the next deploy tries the cohosted script again.
         assert_eq!(

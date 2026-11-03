@@ -190,7 +190,8 @@ fn env_flag(key: &str, problems: &mut Vec<String>) -> bool {
         "0" | "false" | "off" => false,
         _ => {
             problems.push(format!(
-                "{key} must be `1`, `true` or `on` (or unset), got {:?}",
+                "{} must be `1`, `true` or `on` (or unset), got {:?}",
+                key,
                 raw.trim()
             ));
             false
@@ -344,7 +345,8 @@ impl VoidProxyConfig {
                     }));
             if !ok {
                 problems.push(format!(
-                    "NOITE_VOID_EMAIL_ALLOWLIST entry {entry:?} must be an exact address (`user@example.com`) or a domain suffix (`@example.com`)"
+                    "NOITE_VOID_EMAIL_ALLOWLIST entry {:?} must be an exact address (`user@example.com`) or a domain suffix (`@example.com`)",
+                    entry
                 ));
             }
         }
@@ -372,13 +374,15 @@ impl VoidProxyConfig {
                         });
                         if !endpoint_ok {
                             problems.push(format!(
-                                "NOITE_VOID_AI_MODELS[{model:?}] needs an `endpoint` http(s) URL, got {}",
-                                endpoint.map_or("nothing".to_string(), |u| format!("{u:?}"))
+                                "NOITE_VOID_AI_MODELS[{:?}] needs an `endpoint` http(s) URL, got {}",
+                                model,
+                                endpoint.map_or("nothing".to_string(), |u| format!("{:?}", u))
                             ));
                         }
                         if target.is_none_or(|m| m.trim().is_empty()) {
                             problems.push(format!(
-                                "NOITE_VOID_AI_MODELS[{model:?}] needs a non-empty `model` name"
+                                "NOITE_VOID_AI_MODELS[{:?}] needs a non-empty `model` name",
+                                model
                             ));
                         }
                     }
@@ -2126,8 +2130,8 @@ mod tests {
         for (vars, var) in cases {
             with_env(vars, || {
                 let err = Config::from_env().expect_err("proxy misconfig must fail boot");
-                let msg = format!("{err:#}");
-                assert!(msg.contains(var), "names {var}: {msg}");
+                let msg = format!("{:#}", err);
+                assert!(msg.contains(var), "names {}: {}", var, msg);
             });
         }
         // The mode parse is case-insensitive; `plain` boots with the

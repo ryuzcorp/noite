@@ -719,7 +719,7 @@ mod tests {
                 "Settings",
             )
             .unwrap_err();
-            assert!(format!("{err:#}").contains(name), "{name}: {err:#}");
+            assert!(format!("{:#}", err).contains(name), "{}: {:#}", name, err);
             let mut vars = serde_json::Map::new();
             vars.insert(name.to_string(), Value::String("x".to_string()));
             let err = merge_runner_owned(
@@ -729,7 +729,7 @@ mod tests {
                 "Settings",
             )
             .unwrap_err();
-            assert!(format!("{err:#}").contains(name), "{name}: {err:#}");
+            assert!(format!("{:#}", err).contains(name), "{}: {:#}", name, err);
         }
         // The proxy script's name as the Worker's own.
         let err = merge_runner_owned(
