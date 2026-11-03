@@ -68,8 +68,8 @@ pub enum ContainerOp {
 
 /// Where one request goes. The proxy still checks ownership (container
 /// label, remembered exec id) before forwarding the [`Route::Container`],
-/// [`Route::Remove`], [`Route::ExecStart`] and [`Route::ExecInspect`]
-/// variants.
+/// [`Route::Remove`], [`Route::ExecStart`], [`Route::ExecInspect`] and
+/// [`Route::ExecResize`] variants.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Route<'a> {
     /// `GET /containers/json`: list, with filters rewritten to this fleet.
@@ -84,6 +84,9 @@ pub enum Route<'a> {
     ExecStart { id: &'a str },
     /// `GET /exec/{id}/json` for a remembered exec id.
     ExecInspect { id: &'a str },
+    /// `POST /exec/{id}/resize` for a remembered exec id, with its query
+    /// rebuilt by [`validate_exec_resize_query`].
+    ExecResize { id: &'a str },
     /// `GET /images/{name}/json` for a celld content tag.
     ImageInspect { name: &'a str },
     /// `POST /images/load`: always refused (the runner deployed the images).
@@ -122,6 +125,7 @@ pub fn classify<'a>(method: &str, path: &'a str) -> Route<'a> {
         }
         ("POST", ["", "exec", id, "start"]) if valid_ref(id) => Route::ExecStart { id },
         ("GET", ["", "exec", id, "json"]) if valid_ref(id) => Route::ExecInspect { id },
+        ("POST", ["", "exec", id, "resize"]) if valid_ref(id) => Route::ExecResize { id },
         ("GET", ["", "images", name, "json"]) => Route::ImageInspect { name },
         ("POST", ["", "images", "load"]) => Route::ImageLoad,
         ("GET", ["", "networks", name]) if !name.is_empty() => Route::NetworkInspect { name },
@@ -512,6 +516,8 @@ pub fn validate_fence_create(
 /// Validate an exec-create body (celld `container.rs:1267-1286`, plus the
 /// attachless `kill` form at `1482-1485`): the stdio wiring, command,
 /// environment, directory and user — no privilege bit, no detach extras.
+/// `Tty` may be true (a PTY exec, whose attach flags celld sends exactly as
+/// for a plain one) or false.
 pub fn validate_exec_create(body: &Value) -> Result<(), String> {
     let Some(object) = body.as_object() else {
         return Err("exec body must be an object".to_string());
@@ -539,8 +545,8 @@ pub fn validate_exec_create(body: &Value) -> Result<(), String> {
         }
     }
     if let Some(tty) = object.get("Tty") {
-        if tty != &Value::Bool(false) {
-            return Err("exec Tty must be false".to_string());
+        if !tty.is_boolean() {
+            return Err("exec Tty must be a boolean".to_string());
         }
     }
     let cmd = object.get("Cmd").and_then(Value::as_array);
@@ -566,8 +572,9 @@ pub fn validate_exec_create(body: &Value) -> Result<(), String> {
 }
 
 /// Validate an exec-start body: celld's hijacked form
-/// (`{"Detach": false, "Tty": false}`, `container.rs:1306`) and its
-/// kill-via-exec form (`{"Detach": true}`, `container.rs:1504`).
+/// (`{"Detach": false, "Tty": false}`, `container.rs:1306`, or `"Tty": true`
+/// for a PTY exec) and its kill-via-exec form (`{"Detach": true}`,
+/// `container.rs:1504`).
 pub fn validate_exec_start(body: &Value) -> Result<(), String> {
     let Some(object) = body.as_object() else {
         return Err("exec start body must be an object".to_string());
@@ -581,11 +588,52 @@ pub fn validate_exec_start(body: &Value) -> Result<(), String> {
         }
     }
     if let Some(tty) = object.get("Tty") {
-        if tty != &Value::Bool(false) {
-            return Err("exec start Tty must be false".to_string());
+        if !tty.is_boolean() {
+            return Err("exec start Tty must be a boolean".to_string());
         }
     }
     Ok(())
+}
+
+/// Validate a `POST /exec/{id}/resize` query and rebuild it canonically:
+/// exactly one `h` (rows) and one `w` (cols), each `1..=65535`, as celld
+/// sends them (`/exec/{id}/resize?h={rows}&w={cols}`). Missing, extra or
+/// duplicate parameters, and non-numeric or out-of-range dimensions, are
+/// refused; the proxy forwards only the rebuilt query, so nothing unseen
+/// reaches the daemon.
+pub fn validate_exec_resize_query(query: Option<&str>) -> Result<String, String> {
+    let Some(query) = query.filter(|query| !query.is_empty()) else {
+        return Err("resize needs ?h=<rows>&w=<cols>".to_string());
+    };
+    let mut rows: Option<u32> = None;
+    let mut cols: Option<u32> = None;
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err("resize takes only ?h=<rows>&w=<cols>".to_string());
+        };
+        let dim = match key {
+            "h" => &mut rows,
+            "w" => &mut cols,
+            _ => return Err("resize takes only ?h=<rows>&w=<cols>".to_string()),
+        };
+        if dim.is_some() {
+            return Err(format!("resize takes one {key}"));
+        }
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("resize {key} must be 1..=65535"));
+        }
+        let size: u32 = value
+            .parse()
+            .map_err(|_| format!("resize {key} must be 1..=65535"))?;
+        if !(1..=65535).contains(&size) {
+            return Err(format!("resize {key} must be 1..=65535"));
+        }
+        *dim = Some(size);
+    }
+    match (rows, cols) {
+        (Some(rows), Some(cols)) => Ok(format!("h={rows}&w={cols}")),
+        _ => Err("resize needs ?h=<rows>&w=<cols>".to_string()),
+    }
 }
 
 /// Validate a bridge create body: exactly celld's (`container.rs:650-658`)
@@ -807,6 +855,10 @@ mod tests {
             Route::ExecInspect { id: "abc" }
         );
         assert_eq!(
+            classify("POST", "/exec/abc/resize"),
+            Route::ExecResize { id: "abc" }
+        );
+        assert_eq!(
             classify("GET", &format!("/images/{IMAGE}/json")),
             Route::ImageInspect { name: IMAGE }
         );
@@ -859,6 +911,10 @@ mod tests {
             ("GET", "/containers/../json"),
             ("POST", "/exec/%2E%2E/start"),
             ("GET", "/exec/.hidden/json"),
+            ("GET", "/exec/abc/resize"),
+            ("POST", "/exec/abc/resize/extra"),
+            ("POST", "/exec/../resize"),
+            ("POST", "/exec/%2E%2E/resize"),
         ] {
             assert!(
                 matches!(classify(method, path), Route::Refused(_)),
@@ -1173,11 +1229,11 @@ mod tests {
                 "privileged exec",
                 json!({"Cmd": ["id"], "Privileged": true}),
             ),
-            ("tty exec", json!({"Cmd": ["id"], "Tty": true})),
+            ("string tty", json!({"Cmd": ["id"], "Tty": "yes"})),
             ("detach extras", json!({"Cmd": ["id"], "Detach": true})),
             ("missing cmd", json!({"AttachStdout": true})),
             ("empty cmd", json!({"Cmd": []})),
-            ("tty start", json!({"Detach": false, "Tty": true})),
+            ("numeric tty start", json!({"Detach": false, "Tty": 1})),
             ("extra start key", json!({"Detach": false, "Cmd": ["id"]})),
         ] {
             let refused = if name.ends_with("start") {
@@ -1186,6 +1242,95 @@ mod tests {
                 validate_exec_create(&body).is_err()
             };
             assert!(refused, "{name} refused");
+        }
+    }
+
+    #[test]
+    fn exec_accepts_cellds_pty_forms() {
+        // celld's PTY exec create: the same attach flags as a plain exec,
+        // with `Tty` true (`container.rs` `exec_create_body`).
+        validate_exec_create(&json!({
+            "AttachStdin": true, "AttachStdout": true, "AttachStderr": true,
+            "Tty": true, "Cmd": ["sh"],
+            "Env": ["MODEL=faux"], "WorkingDir": "/work", "User": "1000",
+        }))
+        .expect("celld's pty exec");
+        validate_exec_start(&json!({ "Detach": false, "Tty": true })).expect("pty start");
+    }
+
+    #[test]
+    fn resize_routes_match_only_the_resize_call() {
+        assert_eq!(
+            classify("POST", "/exec/abc/resize"),
+            Route::ExecResize { id: "abc" }
+        );
+        for (method, path) in [
+            ("GET", "/exec/abc/resize"),
+            ("DELETE", "/exec/abc/resize"),
+            ("POST", "/exec/abc/resize/extra"),
+            ("POST", "/exec/../resize"),
+            ("POST", "/exec/.hidden/resize"),
+            ("POST", "/exec/%2E%2E/resize"),
+            ("POST", "/exec//resize"),
+        ] {
+            assert!(
+                matches!(classify(method, path), Route::Refused(_)),
+                "{method} {path} refused"
+            );
+        }
+    }
+
+    #[test]
+    fn resize_query_rebuilds_exactly_h_and_w() {
+        assert_eq!(
+            validate_exec_resize_query(Some("h=30&w=100")),
+            Ok("h=30&w=100".to_string())
+        );
+        // Order is canonicalized, bounds are inclusive, leading zeroes are
+        // normalized away.
+        assert_eq!(
+            validate_exec_resize_query(Some("w=100&h=30")),
+            Ok("h=30&w=100".to_string())
+        );
+        assert_eq!(
+            validate_exec_resize_query(Some("h=1&w=65535")),
+            Ok("h=1&w=65535".to_string())
+        );
+        assert_eq!(
+            validate_exec_resize_query(Some("h=007&w=0100")),
+            Ok("h=7&w=100".to_string())
+        );
+        for bad in [
+            None,
+            Some(""),
+            // Missing a dimension.
+            Some("h=30"),
+            Some("w=100"),
+            Some("h=30&w="),
+            // Extra parameters, including an empty one.
+            Some("h=30&w=100&signal=9"),
+            Some("h=30&w=100&"),
+            Some("&h=30&w=100"),
+            // Duplicates.
+            Some("h=30&h=31&w=100"),
+            Some("h=30&w=100&w=101"),
+            // Non-numeric.
+            Some("h=x&w=100"),
+            Some("h=30&w=1e2"),
+            Some("h=3.0&w=100"),
+            Some("h=+30&w=100"),
+            Some("h=%33%30&w=100"),
+            Some("h= 30&w=100"),
+            Some("H=30&w=100"),
+            Some("h"),
+            // Out of range.
+            Some("h=0&w=100"),
+            Some("h=30&w=0"),
+            Some("h=65536&w=100"),
+            Some("h=30&w=65536"),
+            Some("h=99999999999999999999&w=100"),
+        ] {
+            assert!(validate_exec_resize_query(bad).is_err(), "{bad:?} refused");
         }
     }
 

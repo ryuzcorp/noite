@@ -408,6 +408,31 @@ async fn forward(
             }
             forward_simple(upstream, "GET", &format!("/exec/{id}/json"), Bytes::new()).await
         }
+        Route::ExecResize { id } => {
+            if exec_owner(id).as_deref() != Some(fleet) {
+                return refuse("unknown exec");
+            }
+            // The query is validated before the body is read: a refusal
+            // never drains a body.
+            let query = match validate::validate_exec_resize_query(query) {
+                Ok(query) => query,
+                Err(reason) => return refuse(&reason),
+            };
+            let raw = match read_body(req.into_body()).await {
+                Ok(raw) => raw,
+                Err(reason) => return refuse(&reason),
+            };
+            if !raw.is_empty() {
+                return refuse("takes no body");
+            }
+            forward_simple(
+                upstream,
+                "POST",
+                &format!("/exec/{id}/resize?{query}"),
+                Bytes::new(),
+            )
+            .await
+        }
         Route::ImageInspect { name } => {
             if !validate::valid_image_name(name) {
                 return refuse("unknown image");
@@ -1396,6 +1421,68 @@ mod tests {
         assert_eq!(&buf, b"hello");
 
         forget_fleet_execs(&key);
+        registry::unregister_fleet(&key);
+        close_fleet(&key).await;
+        engine.abort();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_resize_forwards_only_owned_execs_with_a_rebuilt_query() {
+        let dir = test_dir("resize");
+        let fleet_dir = dir.join("sockets");
+        std::fs::create_dir_all(&fleet_dir).unwrap();
+        let upstream_sock = dir.join("upstream.sock");
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let engine = tokio::spawn(fake_engine(
+            UnixListener::bind(&upstream_sock).expect("fake engine binds"),
+            seen.clone(),
+        ));
+        let key = test_key("resize");
+        let socket = serve_inner(&key, &fleet_dir, Some(upstream_sock)).expect("serve");
+        registry::register_fleet(&key, std::process::id());
+
+        // Unknown ids, and another fleet's exec id, resize nothing.
+        remember_exec("some-other-fleet", "theirs");
+        for id in ["nope", "theirs"] {
+            let (status, body) = fleet_call(
+                &socket,
+                "POST",
+                &format!("/exec/{id}/resize?h=24&w=80"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(
+                message(&body).contains("unknown exec"),
+                "{}",
+                message(&body)
+            );
+        }
+        assert!(seen.lock().unwrap().is_empty());
+
+        // An owned exec forwards with the query rebuilt canonically.
+        remember_exec(&key, "mine");
+        let (status, _) = fleet_call(&socket, "POST", "/exec/mine/resize?w=80&h=24", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(*seen.lock().unwrap(), vec!["/exec/mine/resize?h=24&w=80"]);
+
+        // A bad query, or a body celld never sends, is refused before any
+        // further upstream contact.
+        let (status, _) = fleet_call(&socket, "POST", "/exec/mine/resize?h=24", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = fleet_call(
+            &socket,
+            "POST",
+            "/exec/mine/resize?h=24&w=80",
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        forget_fleet_execs(&key);
+        forget_fleet_execs("some-other-fleet");
         registry::unregister_fleet(&key);
         close_fleet(&key).await;
         engine.abort();
