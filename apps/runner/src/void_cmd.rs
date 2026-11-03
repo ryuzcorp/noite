@@ -37,7 +37,7 @@ struct Args {
 fn parse_args(args: &[String]) -> anyhow::Result<Args> {
     let mut rest = args.iter().map(String::as_str).peekable();
     if rest.next() != Some("rotate-proxy-token") {
-        bail!("{USAGE}");
+        bail!("{}", USAGE);
     }
     let mut slug = None;
     let mut env = None;
@@ -45,11 +45,11 @@ fn parse_args(args: &[String]) -> anyhow::Result<Args> {
         match flag {
             "--slug" => slug = Some(rest.next().context(USAGE)?.to_string()),
             "--env" => env = Some(rest.next().context(USAGE)?.to_string()),
-            _ => bail!("{USAGE}"),
+            _ => bail!("{}", USAGE),
         }
     }
     let Some(slug) = slug else {
-        bail!("{USAGE}");
+        bail!("{}", USAGE);
     };
     Ok(Args { slug, env })
 }
@@ -65,7 +65,7 @@ pub async fn run(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
         Some(label) => {
             let env = db::get_environment_by_label(&pool, &app.id, label)
                 .await?
-                .with_context(|| format!("no environment {label:?} on {:?}", args.slug))?;
+                .with_context(|| format!("no environment {:?} on {:?}", label, args.slug))?;
             Some(env.id)
         }
     };
@@ -76,8 +76,8 @@ pub async fn run(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
             args.slug
         ),
         Some(label) => println!(
-            "Rotated __VOID_PROXY_TOKEN for {:?} environment {label:?}. Redeploy it to apply it.",
-            args.slug
+            "Rotated __VOID_PROXY_TOKEN for {:?} environment {:?}. Redeploy it to apply it.",
+            args.slug, label
         ),
     }
     Ok(())
@@ -126,7 +126,7 @@ mod tests {
             vec!["rotate-proxy-token", "--slug", "blog", "--env"],
             vec!["rotate-proxy-token", "--slug", "blog", "--since", "7d"],
         ] {
-            assert!(parse_args(&args(&words)).is_err(), "{words:?}");
+            assert!(parse_args(&args(&words)).is_err(), "{:?}", words);
         }
     }
 }

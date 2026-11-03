@@ -882,12 +882,34 @@ impl ReloadOutcome {
     pub fn fail_deploy_on_failed(self, fleet: &str) -> anyhow::Result<()> {
         match self {
             ReloadOutcome::Failed { error } => {
-                anyhow::bail!("celld refused the new deployment for {fleet}: {error}")
+                anyhow::bail!(
+                    "celld refused the new deployment for {}: {}",
+                    fleet,
+                    sanitize_reload_error(&error)
+                )
             }
             _ => Ok(()),
         }
     }
 }
+
+/// Celld's reload error, safe for the deploy log and `last_error`: the text
+/// can carry tenant-shaped input (celld formats an unvalidated
+/// `services[].service` target into it), so control characters flatten to
+/// spaces and the whole is capped — the same posture as `check_required`
+/// quoting required names, minus the quotes, so a genuine multi-line build
+/// error stays readable on one line.
+fn sanitize_reload_error(error: &str) -> String {
+    error
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(RELOAD_ERROR_CAP)
+        .collect()
+}
+
+/// Longest reload error kept: genuine build errors fit, while a
+/// tenant-shaped target cannot bloat the deploy log or `last_error`.
+const RELOAD_ERROR_CAP: usize = 2000;
 
 /// Parse one `POST /reload` response body into its outcome. `failed`
 /// carries celld's error; `adopted`/`unchanged` succeed; `unavailable` and
@@ -1374,7 +1396,8 @@ mod tests {
             assert_eq!(
                 parse_reload_response(body),
                 ReloadOutcome::Unreachable,
-                "{body}"
+                "{}",
+                body
             );
         }
     }
@@ -1390,8 +1413,9 @@ mod tests {
         .fail_deploy_on_failed("blog")
         .unwrap_err();
         assert!(
-            format!("{err:#}").contains("load service binding target no-such-script"),
-            "{err:#}"
+            format!("{:#}", err).contains("load service binding target no-such-script"),
+            "{:#}",
+            err
         );
         for outcome in [
             ReloadOutcome::Adopted,
@@ -1400,5 +1424,41 @@ mod tests {
         ] {
             assert!(outcome.fail_deploy_on_failed("blog").is_ok());
         }
+    }
+
+    /// A forged service target cannot inject lines into the deploy failure:
+    /// the reload error collapses to one capped line, while its genuine
+    /// prefix survives.
+    #[test]
+    fn forged_service_targets_cannot_inject_reload_lines() {
+        let forged = "x\nERROR: forged lines\nerror: fake summary";
+        let error = format!("load service binding target {}", forged);
+        // Through the real path: celld's body, parsed, then failed.
+        let body = format!(
+            "{{\"ok\":false,\"outcome\":\"failed\",\"version\":\"v\",\"prefix\":\"p\",\"error\":{:?}}}",
+            error
+        );
+        let err = parse_reload_response(&body)
+            .fail_deploy_on_failed("blog")
+            .unwrap_err();
+        let text = format!("{:#}", err);
+        assert!(!text.contains('\n'), "{}", text);
+        assert!(text.chars().all(|c| !c.is_control()), "{}", text);
+        assert!(text.contains("load service binding target x"), "{}", text);
+        // A directly built failure sanitizes the same way.
+        let err = ReloadOutcome::Failed { error }
+            .fail_deploy_on_failed("blog")
+            .unwrap_err();
+        let text = format!("{:#}", err);
+        assert!(!text.contains('\n'), "{}", text);
+        assert!(text.chars().all(|c| !c.is_control()), "{}", text);
+        // Long errors are capped, not passed through whole.
+        let err = ReloadOutcome::Failed {
+            error: "e".repeat(5000),
+        }
+        .fail_deploy_on_failed("blog")
+        .unwrap_err();
+        let text = format!("{:#}", err);
+        assert!(text.len() < 5000, "{}", text.len());
     }
 }

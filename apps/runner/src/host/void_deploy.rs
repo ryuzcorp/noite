@@ -30,13 +30,15 @@
 //! tenant entry collides loudly), and the proxy slice adds its one entry in
 //! [`runner_services`] — the only place that changes.
 //!
-//! `BETTER_AUTH_SECRET` is provisioned, not merged here: when a Void app
+//! `BETTER_AUTH_SECRET` is provisioned, not merged here: when a Void fleet
 //! has no value for it, [`ensure_auth_secret`] mints 32 random bytes hex
-//! and stores them as an `auth-default` setting at the app level (one per
-//! app; environments inherit it unless overridden), and the value then
-//! flows through the ordinary settings load into the slice-1 merge. A user
-//! value — app or override — always wins and is never overwritten. The
-//! gate is Void, not the name's presence in `secrets.required`: only
+//! and stores them as an `auth-default` setting per fleet (the app row for
+//! production, one override row per preview — never inherited from the
+//! app's auto-provisioned row), and the value then flows through the
+//! ordinary settings load into the slice-1 merge. A user value — app or
+//! override — always wins and is never overwritten (a user-written app
+//! value still applies to previews unless overridden). The gate is Void,
+//! not the name's presence in `secrets.required`: only
 //! `VOID_CLOUDFLARE_DEPLOY_BUILD=1` builds repeat it there, while the auth
 //! middleware fails every request without it.
 //!
@@ -112,41 +114,83 @@ pub fn mint_auth_secret() -> String {
     rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .expect("os randomness");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Ensure the app-level auto-provisioned `BETTER_AUTH_SECRET`, unless a
-/// value already exists: an environment override (any source — overrides
-/// are user-written) or any app-level row wins, and nothing is overwritten.
-/// Environments inherit the app's row through the ordinary settings load.
-/// Returns whether this call minted the secret.
+/// Ensure this fleet's `BETTER_AUTH_SECRET`: the app-level row for
+/// production, the environment's own override row for a preview (per-fleet,
+/// like the proxy token — never inherited from the app's auto-provisioned
+/// row, and a preview deploy never writes the app row). Minted once, reused
+/// on later deploys; any existing value wins and is never overwritten, and
+/// a user-written app value still flows to previews through the ordinary
+/// settings load unless the environment overrides it (only the
+/// auto-provisioned app row is filtered from the env input — see
+/// `db::environment_worker_settings`). Returns whether this call inserted
+/// the row: a raced loser reuses the winner's row through the settings load
+/// that follows, without reporting a mint.
 pub async fn ensure_auth_secret(
     pool: &SqlitePool,
     app_id: &str,
     environment_id: Option<&str>,
 ) -> anyhow::Result<bool> {
-    if let Some(env_id) = environment_id {
-        if db::get_env_override(pool, env_id, AUTH_SECRET_NAME)
-            .await?
-            .is_some()
-        {
-            return Ok(false);
+    match environment_id {
+        None => {
+            if db::get_env(pool, app_id, AUTH_SECRET_NAME).await?.is_some() {
+                return Ok(false);
+            }
+            // Mint-then-insert loses nothing under a raced deploy: the loser
+            // reuses the winner's row through the settings load that follows.
+            let inserted = db::insert_provisioned(
+                pool,
+                app_id,
+                AUTH_SECRET_NAME,
+                &mint_auth_secret(),
+                db::SOURCE_AUTH_DEFAULT,
+            )
+            .await?;
+            Ok(inserted)
+        }
+        Some(env_id) => {
+            if db::get_env_override(pool, env_id, AUTH_SECRET_NAME)
+                .await?
+                .is_some()
+            {
+                return Ok(false);
+            }
+            // A user-written app value still wins for previews through normal
+            // inheritance; only the auto-provisioned app row is per-fleet, so
+            // only then does the preview mint its own override.
+            if let Some(row) = db::get_env(pool, app_id, AUTH_SECRET_NAME).await? {
+                if row.source != db::SOURCE_AUTH_DEFAULT {
+                    return Ok(false);
+                }
+            }
+            let inserted = db::insert_env_override_provisioned(
+                pool,
+                env_id,
+                AUTH_SECRET_NAME,
+                &mint_auth_secret(),
+                db::SOURCE_AUTH_DEFAULT,
+            )
+            .await?;
+            Ok(inserted)
         }
     }
-    if db::get_env(pool, app_id, AUTH_SECRET_NAME).await?.is_some() {
-        return Ok(false);
+}
+
+/// Refuse a user-written row under the token's name: the fleet must only
+/// ever read the runner's own value. Shared by the first read and the
+/// post-mint re-read, so a row that lands in between is refused rather than
+/// returned as the token.
+fn check_token_row(row: &crate::models::AppEnv, settings_label: &str) -> anyhow::Result<()> {
+    if row.source != db::SOURCE_VOID_PROXY_TOKEN {
+        anyhow::bail!(
+            "settings variable `{}` is reserved for the platform and cannot become a Worker var (rename it or remove it from {})",
+            PROXY_TOKEN_VAR,
+            settings_label
+        );
     }
-    // Mint-then-insert loses nothing under a raced deploy: the loser reuses
-    // the winner's row through the settings load that follows.
-    db::insert_provisioned(
-        pool,
-        app_id,
-        AUTH_SECRET_NAME,
-        &mint_auth_secret(),
-        db::SOURCE_AUTH_DEFAULT,
-    )
-    .await?;
-    Ok(true)
+    Ok(())
 }
 
 /// Ensure this fleet's `__VOID_PROXY_TOKEN`: the app-level row for
@@ -163,11 +207,7 @@ pub async fn ensure_proxy_token(
     match environment_id {
         None => {
             if let Some(row) = db::get_env(pool, app_id, PROXY_TOKEN_VAR).await? {
-                if row.source != db::SOURCE_VOID_PROXY_TOKEN {
-                    anyhow::bail!(
-                        "settings variable `{PROXY_TOKEN_VAR}` is reserved for the platform and cannot become a Worker var (rename it or remove it from Settings → Environment)"
-                    );
-                }
+                check_token_row(&row, "Settings → Environment")?;
                 return Ok((row.value, false));
             }
             let token = mint_proxy_token();
@@ -182,16 +222,13 @@ pub async fn ensure_proxy_token(
             let row = db::get_env(pool, app_id, PROXY_TOKEN_VAR)
                 .await?
                 .context("provisioned proxy token missing")?;
+            check_token_row(&row, "Settings → Environment")?;
             let minted = row.value == token;
             Ok((row.value, minted))
         }
         Some(env_id) => {
             if let Some(row) = db::get_env_override(pool, env_id, PROXY_TOKEN_VAR).await? {
-                if row.source != db::SOURCE_VOID_PROXY_TOKEN {
-                    anyhow::bail!(
-                        "settings variable `{PROXY_TOKEN_VAR}` is reserved for the platform and cannot become a Worker var (rename it or remove it from this environment's Variable overrides)"
-                    );
-                }
+                check_token_row(&row, "this environment's Variable overrides")?;
                 return Ok((row.value, false));
             }
             let token = mint_proxy_token();
@@ -206,6 +243,7 @@ pub async fn ensure_proxy_token(
             let row = db::get_env_override(pool, env_id, PROXY_TOKEN_VAR)
                 .await?
                 .context("provisioned proxy token missing")?;
+            check_token_row(&row, "this environment's Variable overrides")?;
             let minted = row.value == token;
             Ok((row.value, minted))
         }
@@ -216,11 +254,13 @@ pub async fn ensure_proxy_token(
 /// held. Takes effect on the next deploy of that fleet (production or the
 /// environment): the deploy injects the new token into the app and — once
 /// the proxy slice lands — redeploys the proxy beside it, so both agree.
+/// Returns nothing: nothing outside the fleet needs the value, so "never
+/// printed" is enforced by the type.
 pub async fn rotate_proxy_token(
     pool: &SqlitePool,
     app_id: &str,
     environment_id: Option<&str>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<()> {
     let token = mint_proxy_token();
     match environment_id {
         None => {
@@ -244,7 +284,7 @@ pub async fn rotate_proxy_token(
             .await?;
         }
     }
-    Ok(token)
+    Ok(())
 }
 
 /// One runner-owned `services` entry: `{binding, service}`.
@@ -264,12 +304,25 @@ pub fn runner_services() -> Vec<RunnerService> {
 }
 
 /// The runner-owned values for one Void deploy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RunnerOwned {
     pub project_id: String,
     pub project_slug: String,
     pub proxy_token: String,
     pub services: Vec<RunnerService>,
+}
+
+impl std::fmt::Debug for RunnerOwned {
+    /// Debug without the secret: a `{:?}` of the deploy's values must never
+    /// carry the fleet's token into a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunnerOwned")
+            .field("project_id", &self.project_id)
+            .field("project_slug", &self.project_slug)
+            .field("proxy_token", &"<redacted>")
+            .field("services", &self.services)
+            .finish()
+    }
 }
 
 /// What one runner-owned merge did, for the deploy log.
@@ -294,7 +347,8 @@ impl RunnerOwnedStats {
         );
         if self.token_minted {
             line.push_str(&format!(
-                "void: minted the fleet's __VOID_PROXY_TOKEN (stored in {settings_label}; redeploying reuses it)\n"
+                "void: minted the fleet's __VOID_PROXY_TOKEN (stored in {}; redeploying reuses it)\n",
+                settings_label
             ));
         }
         line
@@ -325,12 +379,15 @@ pub fn merge_runner_owned(
         .find(|name| crate::host::worker_vars::worker_var_reserved_for(name, true))
     {
         anyhow::bail!(
-            "settings variable `{name}` is reserved for the platform and cannot become a Worker var (rename it or remove it from {settings_label})"
+            "settings variable `{}` is reserved for the platform and cannot become a Worker var (rename it or remove it from {})",
+            name,
+            settings_label
         );
     }
     if obj.get("name").and_then(Value::as_str) == Some(PROXY_SCRIPT_NAME) {
         anyhow::bail!(
-            "the config's `name` is `{PROXY_SCRIPT_NAME}`, reserved for the platform's Void proxy script (rename the Worker)"
+            "the config's `name` is `{}`, reserved for the platform's Void proxy script (rename the Worker)",
+            PROXY_SCRIPT_NAME
         );
     }
     let services = match obj.get_mut("services") {
@@ -348,7 +405,8 @@ pub fn merge_runner_owned(
         if let Some(binding) = entry.get("binding").and_then(Value::as_str) {
             if RUNNER_BINDINGS.contains(&binding) {
                 anyhow::bail!(
-                    "the config's `services` entry `{binding}` is reserved for the platform (remove it: the runner injects its own)"
+                    "the config's `services` entry `{}` is reserved for the platform (remove it: the runner injects its own)",
+                    binding
                 );
             }
         }
@@ -372,7 +430,8 @@ pub fn merge_runner_owned(
         .find(|name| crate::host::worker_vars::worker_var_reserved_for(name, true))
     {
         anyhow::bail!(
-            "the config's `vars.{name}` is reserved for the platform (remove it from the config's `vars`)"
+            "the config's `vars.{}` is reserved for the platform (remove it from the config's `vars`)",
+            name
         );
     }
     vars.insert(
@@ -401,12 +460,14 @@ pub fn merge_runner_owned(
     for entry in namespaces.iter() {
         if entry.get("binding").and_then(Value::as_str) == Some(ISR_CACHE_BINDING) {
             anyhow::bail!(
-                "the config's `kv_namespaces` entry `{ISR_CACHE_BINDING}` is reserved for the platform (remove it: the runner injects its own)"
+                "the config's `kv_namespaces` entry `{}` is reserved for the platform (remove it: the runner injects its own)",
+                ISR_CACHE_BINDING
             );
         }
         if entry.get("id").and_then(Value::as_str) == Some(ISR_CACHE_NAMESPACE_ID) {
             anyhow::bail!(
-                "the config's `kv_namespaces` entry uses the namespace id `{ISR_CACHE_NAMESPACE_ID}`, reserved for the platform's ISR cache (use another id)"
+                "the config's `kv_namespaces` entry uses the namespace id `{}`, reserved for the platform's ISR cache (use another id)",
+                ISR_CACHE_NAMESPACE_ID
             );
         }
     }
@@ -445,7 +506,7 @@ pub async fn merge_void_root(
         return Ok(None);
     };
     let mut value =
-        crate::host::storage::parse_wrangler(&text).with_context(|| format!("parse {label}"))?;
+        crate::host::storage::parse_wrangler(&text).with_context(|| format!("parse {}", label))?;
     let environment_id = environment.map(|env| env.id.as_str());
     let (proxy_token, token_minted) = ensure_proxy_token(pool, &app.id, environment_id).await?;
     let mut stats = merge_runner_owned(
@@ -506,7 +567,7 @@ mod tests {
     fn minted_secrets_have_their_shapes() {
         use base64::Engine as _;
         let token = mint_proxy_token();
-        assert_eq!(token.len(), 43, "{token}");
+        assert_eq!(token.len(), 43, "{}", token);
         assert_eq!(
             base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(&token)
@@ -516,8 +577,8 @@ mod tests {
         );
         assert_ne!(mint_proxy_token(), token);
         let secret = mint_auth_secret();
-        assert_eq!(secret.len(), 64, "{secret}");
-        assert!(secret.chars().all(|c| c.is_ascii_hexdigit()), "{secret}");
+        assert_eq!(secret.len(), 64, "{}", secret);
+        assert!(secret.chars().all(|c| c.is_ascii_hexdigit()), "{}", secret);
         assert_ne!(mint_auth_secret(), secret);
     }
 
@@ -594,7 +655,7 @@ mod tests {
             "Settings",
         )
         .unwrap_err();
-        assert!(format!("{err:#}").contains("`ISR_CACHE`"), "{err:#}");
+        assert!(format!("{:#}", err).contains("`ISR_CACHE`"), "{:#}", err);
         let err = merge_runner_owned(
             &mut json!({"name": "a", "vars": {"ISR_CACHE": "x"}}),
             &[],
@@ -602,7 +663,7 @@ mod tests {
             "Settings",
         )
         .unwrap_err();
-        assert!(format!("{err:#}").contains("vars.ISR_CACHE"), "{err:#}");
+        assert!(format!("{:#}", err).contains("vars.ISR_CACHE"), "{:#}", err);
         // The proxy script's name as the Worker's own.
         let err = merge_runner_owned(
             &mut json!({"name": "noite-void-proxy"}),
@@ -611,7 +672,11 @@ mod tests {
             "Settings",
         )
         .unwrap_err();
-        assert!(format!("{err:#}").contains("noite-void-proxy"), "{err:#}");
+        assert!(
+            format!("{:#}", err).contains("noite-void-proxy"),
+            "{:#}",
+            err
+        );
         // A tenant service, KV binding or KV id the runner owns.
         for (config, name) in [
             (
@@ -629,7 +694,7 @@ mod tests {
         ] {
             let err =
                 merge_runner_owned(&mut config.clone(), &[], &owned(), "Settings").unwrap_err();
-            assert!(format!("{err:#}").contains(name), "{name}: {err:#}");
+            assert!(format!("{:#}", err).contains(name), "{}: {:#}", name, err);
         }
     }
 
@@ -642,7 +707,7 @@ mod tests {
         ] {
             let err =
                 merge_runner_owned(&mut config.clone(), &[], &owned(), "Settings").unwrap_err();
-            assert!(format!("{err:#}").contains(what), "{what}: {err:#}");
+            assert!(format!("{:#}", err).contains(what), "{}: {:#}", what, err);
         }
         assert!(merge_runner_owned(&mut json!([1]), &[], &owned(), "Settings").is_err());
     }
@@ -740,7 +805,7 @@ mod tests {
             .await
             .unwrap();
         let err = ensure_proxy_token(&pool, &app.id, None).await.unwrap_err();
-        assert!(format!("{err:#}").contains(PROXY_TOKEN_VAR), "{err:#}");
+        assert!(format!("{:#}", err).contains(PROXY_TOKEN_VAR), "{:#}", err);
         assert_eq!(
             db::get_env(&pool, &app.id, PROXY_TOKEN_VAR)
                 .await
@@ -752,48 +817,142 @@ mod tests {
     }
 
     /// Rotation replaces the fleet's token (whosever row it was) and the
-    /// next ensure reuses the rotated value.
+    /// next ensure reuses the rotated value — per fleet, and without the
+    /// value ever leaving the function.
     #[tokio::test]
     async fn rotation_replaces_and_reuse_follows() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let (before, _) = ensure_proxy_token(&pool, &app.id, None).await.unwrap();
-        let rotated = rotate_proxy_token(&pool, &app.id, None).await.unwrap();
-        assert_ne!(rotated, before);
-        let (again, minted) = ensure_proxy_token(&pool, &app.id, None).await.unwrap();
-        assert!(!minted);
-        assert_eq!(again, rotated);
-    }
-
-    /// The auth secret provisions once at the app level; any existing value
-    /// — an app row or an environment override — wins untouched.
-    #[tokio::test]
-    async fn auth_secret_provisions_once_and_never_overwrites() {
-        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
-        let app = seed(&pool).await;
         let env = seed_env(&pool, &app.id).await;
 
-        assert!(ensure_auth_secret(&pool, &app.id, None).await.unwrap());
-        let minted = db::get_env(&pool, &app.id, AUTH_SECRET_NAME)
+        let (before, _) = ensure_proxy_token(&pool, &app.id, None).await.unwrap();
+        rotate_proxy_token(&pool, &app.id, None).await.unwrap();
+        let rotated = db::get_env(&pool, &app.id, PROXY_TOKEN_VAR)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(minted.source, db::SOURCE_AUTH_DEFAULT);
-        // Reused, not reminted — for production and for previews alike.
-        assert!(!ensure_auth_secret(&pool, &app.id, None).await.unwrap());
-        assert!(!ensure_auth_secret(&pool, &app.id, Some(&env.id))
+        assert_ne!(rotated.value, before);
+        assert_eq!(rotated.source, db::SOURCE_VOID_PROXY_TOKEN);
+        let (again, minted) = ensure_proxy_token(&pool, &app.id, None).await.unwrap();
+        assert!(!minted);
+        assert_eq!(again, rotated.value);
+
+        // A preview rotates its own row; production's is untouched.
+        let (preview_before, _) = ensure_proxy_token(&pool, &app.id, Some(&env.id))
             .await
-            .unwrap());
+            .unwrap();
+        rotate_proxy_token(&pool, &app.id, Some(&env.id))
+            .await
+            .unwrap();
+        let preview_rotated = db::get_env_override(&pool, &env.id, PROXY_TOKEN_VAR)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(preview_rotated.value, preview_before);
+        assert_eq!(preview_rotated.source, db::SOURCE_VOID_PROXY_TOKEN);
+        let (again, minted) = ensure_proxy_token(&pool, &app.id, Some(&env.id))
+            .await
+            .unwrap();
+        assert!(!minted);
+        assert_eq!(again, preview_rotated.value);
         assert_eq!(
-            db::get_env(&pool, &app.id, AUTH_SECRET_NAME)
+            db::get_env(&pool, &app.id, PROXY_TOKEN_VAR)
                 .await
                 .unwrap()
                 .unwrap()
                 .value,
-            minted.value
+            rotated.value
+        );
+    }
+
+    /// One secret per fleet: production's lives on the app row, a preview's
+    /// on its own override; each is minted once and reused, and the two
+    /// differ. A preview deploy never writes the app row.
+    #[tokio::test]
+    async fn auth_secret_provisions_per_fleet_minted_once() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
+        let app = seed(&pool).await;
+        let env = seed_env(&pool, &app.id).await;
+
+        // Production mints the app row once and reuses it.
+        assert!(ensure_auth_secret(&pool, &app.id, None).await.unwrap());
+        let prod = db::get_env(&pool, &app.id, AUTH_SECRET_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prod.source, db::SOURCE_AUTH_DEFAULT);
+        assert!(!ensure_auth_secret(&pool, &app.id, None).await.unwrap());
+
+        // The preview mints its own override — distinct from production's —
+        // and reuses it.
+        assert!(ensure_auth_secret(&pool, &app.id, Some(&env.id))
+            .await
+            .unwrap());
+        let preview = db::get_env_override(&pool, &env.id, AUTH_SECRET_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(preview.source, db::SOURCE_AUTH_DEFAULT);
+        assert_ne!(preview.value, prod.value);
+        assert!(!ensure_auth_secret(&pool, &app.id, Some(&env.id))
+            .await
+            .unwrap());
+        assert_eq!(
+            db::get_env_override(&pool, &env.id, AUTH_SECRET_NAME)
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            preview.value
         );
 
-        // An override skips the mint: the app gains no row at all.
+        // A preview deploying first writes only its override: no app row.
+        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
+        let app = seed(&pool).await;
+        let env = seed_env(&pool, &app.id).await;
+        assert!(ensure_auth_secret(&pool, &app.id, Some(&env.id))
+            .await
+            .unwrap());
+        assert!(db::get_env(&pool, &app.id, AUTH_SECRET_NAME)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db::get_env_override(&pool, &env.id, AUTH_SECRET_NAME)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// User-written values always win and are never overwritten: an app row —
+    /// which still applies to previews through normal inheritance — or an
+    /// environment override skips the mint.
+    #[tokio::test]
+    async fn user_written_auth_values_win_for_every_fleet() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
+        let app = seed(&pool).await;
+        let env = seed_env(&pool, &app.id).await;
+
+        // A user app row wins for production and is inherited by previews:
+        // nothing is minted anywhere.
+        db::set_env(&pool, &app.id, AUTH_SECRET_NAME, "mine")
+            .await
+            .unwrap();
+        assert!(!ensure_auth_secret(&pool, &app.id, None).await.unwrap());
+        assert!(!ensure_auth_secret(&pool, &app.id, Some(&env.id))
+            .await
+            .unwrap());
+        assert!(db::get_env_override(&pool, &env.id, AUTH_SECRET_NAME)
+            .await
+            .unwrap()
+            .is_none());
+        let row = db::get_env(&pool, &app.id, AUTH_SECRET_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.value, "mine");
+        assert_eq!(row.source, "");
+
+        // A user override wins for its preview, without touching the app.
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
         let env = seed_env(&pool, &app.id).await;
@@ -807,25 +966,112 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
 
-        // A user app row wins untouched.
+    /// Only the auto-provisioned app row is per-fleet: it is filtered from
+    /// the preview's Worker-vars input (the preview mints its own instead),
+    /// while a user-written app value flows through as before.
+    #[tokio::test]
+    async fn auto_provisioned_app_secret_is_not_inherited() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        db::set_env(&pool, &app.id, AUTH_SECRET_NAME, "mine")
-            .await
-            .unwrap();
-        assert!(!ensure_auth_secret(&pool, &app.id, None).await.unwrap());
-        let row = db::get_env(&pool, &app.id, AUTH_SECRET_NAME)
+        let env = seed_env(&pool, &app.id).await;
+        assert!(ensure_auth_secret(&pool, &app.id, None).await.unwrap());
+        let prod = db::get_env(&pool, &app.id, AUTH_SECRET_NAME)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.value, "mine");
-        assert_eq!(row.source, "");
+
+        // Before the preview mints, its Worker vars carry no secret at all.
+        let vars = db::environment_worker_settings(&pool, &app.id, &env.id)
+            .await
+            .unwrap();
+        assert!(!vars.iter().any(|pair| pair.0 == AUTH_SECRET_NAME));
+
+        // After it mints, the preview's vars carry its own secret.
+        assert!(ensure_auth_secret(&pool, &app.id, Some(&env.id))
+            .await
+            .unwrap());
+        let vars = db::environment_worker_settings(&pool, &app.id, &env.id)
+            .await
+            .unwrap();
+        let found: Vec<&(String, String)> = vars
+            .iter()
+            .filter(|pair| pair.0 == AUTH_SECRET_NAME)
+            .collect();
+        assert_eq!(found.len(), 1);
+        assert_ne!(found[0].1, prod.value);
+
+        // A user-written app value still flows into the preview's vars.
+        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
+        let app = seed(&pool).await;
+        let env = seed_env(&pool, &app.id).await;
+        db::set_env(&pool, &app.id, AUTH_SECRET_NAME, "mine")
+            .await
+            .unwrap();
+        let vars = db::environment_worker_settings(&pool, &app.id, &env.id)
+            .await
+            .unwrap();
+        assert!(vars
+            .iter()
+            .any(|pair| pair.0 == AUTH_SECRET_NAME && pair.1 == "mine"));
+    }
+
+    /// Raced deploys mint once: exactly one concurrent ensure reports a mint,
+    /// and the row holds one value.
+    #[tokio::test]
+    async fn raced_auth_mints_report_exactly_once() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
+        let app = seed(&pool).await;
+        let (first, second) = tokio::join!(
+            ensure_auth_secret(&pool, &app.id, None),
+            ensure_auth_secret(&pool, &app.id, None)
+        );
+        // Exactly one winner, however the two interleaved: serialized, the
+        // second sees the row; interleaved, one insert loses.
+        assert_ne!(first.unwrap(), second.unwrap());
+        assert!(db::get_env(&pool, &app.id, AUTH_SECRET_NAME)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// The token check refuses a user row and passes the runner's own: the
+    /// first read and the post-mint re-read share it, so a row landing in
+    /// between is refused rather than returned as the token.
+    #[test]
+    fn token_rows_are_refused_unless_runner_provisioned() {
+        let user = crate::models::AppEnv {
+            app_id: "app-1".to_string(),
+            name: PROXY_TOKEN_VAR.to_string(),
+            value: "spoof".to_string(),
+            updated_at: "now".to_string(),
+            source: String::new(),
+        };
+        let err = check_token_row(&user, "Settings → Environment").unwrap_err();
+        assert!(format!("{:#}", err).contains(PROXY_TOKEN_VAR));
+        let own = crate::models::AppEnv {
+            source: db::SOURCE_VOID_PROXY_TOKEN.to_string(),
+            ..user
+        };
+        assert!(check_token_row(&own, "Settings → Environment").is_ok());
+    }
+
+    /// A Debug dump of the deploy's values never carries the token.
+    #[test]
+    fn runner_owned_debug_redacts_the_token() {
+        let mut values = owned();
+        values.proxy_token = "secret-token-value".to_string();
+        let debug = format!("{:?}", values);
+        assert!(!debug.contains("secret-token-value"), "{}", debug);
+        assert!(debug.contains("<redacted>"), "{}", debug);
+        assert!(debug.contains("RunnerOwned"), "{}", debug);
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "noite-void-deploy-{name}-{}-{:?}",
+            "noite-void-deploy-{}-{}-{:?}",
+            name,
             std::process::id(),
             std::time::SystemTime::now()
         ));

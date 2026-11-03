@@ -906,21 +906,30 @@ async fn deploy_inner(
         None => "Settings → Environment",
     };
     // A Void app's `BETTER_AUTH_SECRET` provisions before the load: minted
-    // once at the app level (unless any value already exists), so it flows
-    // through the ordinary settings load — environments inherit it — into
-    // the merge below like a setting. Gated on Void, not on the name's
-    // presence in `secrets.required`: Void's auth signal is build-time
-    // source inference (`manifest.auth`), which plain builds do not repeat
-    // into `required` (only `VOID_CLOUDFLARE_DEPLOY_BUILD=1` does), while
-    // the auth middleware fails every request without the secret — so an
-    // unread extra var on a non-auth app beats a broken auth app.
+    // once per fleet (the app row for production, the environment's own
+    // override row for a preview — a preview deploy never writes the app
+    // row), unless a value already exists, so it flows through the ordinary
+    // settings load into the merge below like a setting. Gated on Void, not
+    // on the name's presence in `secrets.required`: Void's auth signal is
+    // build-time source inference (`manifest.auth`), which plain builds do
+    // not repeat into `required` (only `VOID_CLOUDFLARE_DEPLOY_BUILD=1`
+    // does), while the auth middleware fails every request without the
+    // secret — so an unread extra var on a non-auth app beats a broken auth
+    // app.
     if void_app {
         let environment_id = target.environment().map(|env| env.id.as_str());
         if void_deploy::ensure_auth_secret(pool, &app.id, environment_id).await? {
+            let provisioned_label = match target.environment() {
+                Some(_) => "this environment's Variable overrides",
+                None => "Settings → Environment",
+            };
             progress
                 .log(
                     DeployStatus::Deploying,
-                    "worker vars: no BETTER_AUTH_SECRET setting, so one was generated and stored in Settings → Environment (set your own value there to replace it)\n",
+                    &format!(
+                        "worker vars: no BETTER_AUTH_SECRET setting, so one was generated and stored in {} (set your own value there to replace it)\n",
+                        provisioned_label
+                    ),
                 )
                 .await?;
         }

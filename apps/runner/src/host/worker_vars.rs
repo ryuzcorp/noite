@@ -481,7 +481,8 @@ mod tests {
                     "Settings"
                 )
                 .is_err(),
-                "{name} must not read as provisioned"
+                "{} must not read as provisioned",
+                name
             );
         }
         // Non-Void apps: nothing is provisioned, so even an identity name in
