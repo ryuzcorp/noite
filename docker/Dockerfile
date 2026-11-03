@@ -24,8 +24,8 @@
 # .github/workflows/celld.yml published, pinned by its index digest.
 # docker/check-versions.ts asserts the tag matches upstream.env. A lab build
 # of an unpublished patch stack overrides CELLD_IMAGE with a local image.
-ARG CELLD_VERSION=0.6.3-noite.2
-ARG CELLD_DIGEST=sha256:b343b222cfd130e90b1dfa276e1a63e64ce9ee18027aa0d0a45090fa89175da8
+ARG CELLD_VERSION=0.6.3-noite.3
+ARG CELLD_DIGEST=sha256:21190147b586c0c19c7ecc1694cf5e53223e9b7f9a320fbeb926dbc4d007ab96
 ARG CELLD_IMAGE=ghcr.io/ryuzcorp/celld:${CELLD_VERSION}@${CELLD_DIGEST}
 # Noite's own release version, reported by the instance heartbeat
 # (`NOITE_BUILD_VERSION` ENV in the runtime stages): the tag without `v` on a
