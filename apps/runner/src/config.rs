@@ -174,6 +174,230 @@ pub fn parse_do_not_track(raw: Option<&str>) -> bool {
         .is_some_and(|v| !v.is_empty() && v != "0")
 }
 
+/// Strict opt-in flag (`NOITE_VOID_AI_ENABLED`, `NOITE_VOID_SMTP_ALLOW_PLAINTEXT`):
+/// unset or blank is off, `1`/`true`/`on` (case-insensitive) is on,
+/// `0`/`false`/`off` is explicitly off, and anything else records a boot
+/// problem naming the var — a typo'd `yes` must fail loudly, never arm a
+/// capability (or silently leave one off).
+fn env_flag(key: &str, problems: &mut Vec<String>) -> bool {
+    let raw = match env::var(key) {
+        Err(_) => return false,
+        Ok(v) if v.trim().is_empty() => return false,
+        Ok(v) => v,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" => true,
+        "0" | "false" | "off" => false,
+        _ => {
+            problems.push(format!(
+                "{key} must be `1`, `true` or `on` (or unset), got {:?}",
+                raw.trim()
+            ));
+            false
+        }
+    }
+}
+
+/// SMTP transport mode for the Void proxy's relay (`NOITE_VOID_SMTP_MODE`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VoidSmtpMode {
+    #[default]
+    Starttls,
+    Implicit,
+    Plain,
+}
+
+impl VoidSmtpMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VoidSmtpMode::Starttls => "starttls",
+            VoidSmtpMode::Implicit => "implicit",
+            VoidSmtpMode::Plain => "plain",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "starttls" => Some(VoidSmtpMode::Starttls),
+            "implicit" => Some(VoidSmtpMode::Implicit),
+            "plain" => Some(VoidSmtpMode::Plain),
+            _ => None,
+        }
+    }
+}
+
+/// Operator config for Noite's Void platform proxy (SPEC, Void platform
+/// proxy): what every Void fleet's `noite-void-proxy` script renders from.
+/// Email and AI are both off unless configured here; per-app credentials
+/// (SMTP user/password, AI endpoint key) are tenant settings, never
+/// operator config — proxy vars are plaintext in the fleet bucket, so no
+/// operator-wide secret may ever land in them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VoidProxyConfig {
+    /// Sender domain every `from` address is pinned to
+    /// (`NOITE_VOID_EMAIL_DOMAIN` → `__VOID_EMAIL_DOMAIN`, proxy and app).
+    pub email_domain: String,
+    /// SMTP relay host (`NOITE_VOID_SMTP_HOST`); email is enabled iff set.
+    pub smtp_host: String,
+    /// Explicit relay port (`NOITE_VOID_SMTP_PORT`); unset leaves the
+    /// proxy's per-mode default (587/465/25).
+    pub smtp_port: Option<u16>,
+    /// Relay transport (`NOITE_VOID_SMTP_MODE`).
+    pub smtp_mode: VoidSmtpMode,
+    /// `plain` transport allowed (`NOITE_VOID_SMTP_ALLOW_PLAINTEXT=1`):
+    /// without it the proxy refuses `plain` outright.
+    pub smtp_allow_plaintext: bool,
+    /// Admission allowlist (`NOITE_VOID_EMAIL_ALLOWLIST`, comma/whitespace
+    /// separated): exact addresses or `@domain` suffixes. Empty fails
+    /// closed — every recipient is unverified.
+    pub email_allowlist: Vec<String>,
+    /// `/ai/*` live (`NOITE_VOID_AI_ENABLED=1`); otherwise every AI call
+    /// answers 501.
+    pub ai_enabled: bool,
+    /// Model map JSON for `/ai/run` (`NOITE_VOID_AI_MODELS`):
+    /// `{ "<model>": { "endpoint", "model" } }`. Validated at boot.
+    pub ai_models: String,
+}
+
+impl VoidProxyConfig {
+    fn from_env(problems: &mut Vec<String>) -> Self {
+        let smtp_mode = match env::var("NOITE_VOID_SMTP_MODE") {
+            Err(_) => VoidSmtpMode::Starttls,
+            Ok(v) if v.trim().is_empty() => VoidSmtpMode::Starttls,
+            Ok(v) => match VoidSmtpMode::parse(&v) {
+                Some(mode) => mode,
+                None => {
+                    problems.push(format!(
+                        "NOITE_VOID_SMTP_MODE must be `starttls`, `implicit` or `plain`, got {:?}",
+                        v.trim()
+                    ));
+                    VoidSmtpMode::Starttls
+                }
+            },
+        };
+        let smtp_port = match env::var("NOITE_VOID_SMTP_PORT") {
+            Err(_) => None,
+            Ok(v) if v.trim().is_empty() => None,
+            Ok(v) => match v.trim().parse::<u16>() {
+                Ok(0) | Err(_) => {
+                    problems.push(format!(
+                        "NOITE_VOID_SMTP_PORT must be a port number (1-65535), got {:?}",
+                        v.trim()
+                    ));
+                    None
+                }
+                Ok(port) => Some(port),
+            },
+        };
+        Self {
+            email_domain: env::var("NOITE_VOID_EMAIL_DOMAIN")
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default(),
+            smtp_host: env::var("NOITE_VOID_SMTP_HOST")
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default(),
+            smtp_port,
+            smtp_mode,
+            smtp_allow_plaintext: env_flag("NOITE_VOID_SMTP_ALLOW_PLAINTEXT", problems),
+            email_allowlist: env::var("NOITE_VOID_EMAIL_ALLOWLIST")
+                .map(|v| {
+                    v.split([',', ' ', '\t', '\n'])
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            ai_enabled: env_flag("NOITE_VOID_AI_ENABLED", problems),
+            ai_models: env::var("NOITE_VOID_AI_MODELS")
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Boot validation for the proxy section, appended to `validate`'s
+    /// problems: shapes first, then the cross-field rules that would
+    /// otherwise fail only at send time.
+    fn validate(&self, problems: &mut Vec<String>) {
+        if !self.email_domain.is_empty()
+            && (self.email_domain.contains([' ', '\t', '\n', '@', '/'])
+                || !self.email_domain.contains('.'))
+        {
+            problems.push(format!(
+                "NOITE_VOID_EMAIL_DOMAIN must be a bare domain (e.g. `mail.example.com`), got {:?}",
+                self.email_domain
+            ));
+        }
+        if self.smtp_host.contains([' ', '\t', '\n']) {
+            problems.push(format!(
+                "NOITE_VOID_SMTP_HOST must be a hostname or IP, got {:?}",
+                self.smtp_host
+            ));
+        }
+        for entry in &self.email_allowlist {
+            let ok = !entry.contains([' ', '\t', '\n'])
+                && (entry
+                    .strip_prefix('@')
+                    .is_some_and(|rest| !rest.is_empty() && !rest.contains('@'))
+                    || entry.split_once('@').is_some_and(|(local, domain)| {
+                        !local.is_empty() && !domain.is_empty() && !domain.contains('@')
+                    }));
+            if !ok {
+                problems.push(format!(
+                    "NOITE_VOID_EMAIL_ALLOWLIST entry {entry:?} must be an exact address (`user@example.com`) or a domain suffix (`@example.com`)"
+                ));
+            }
+        }
+        if !self.smtp_host.is_empty() && self.email_domain.is_empty() {
+            problems.push(
+                "NOITE_VOID_SMTP_HOST is set but NOITE_VOID_EMAIL_DOMAIN is empty (the proxy pins every sender to <slug>@<domain>)"
+                    .into(),
+            );
+        }
+        if self.smtp_mode == VoidSmtpMode::Plain && !self.smtp_allow_plaintext {
+            problems.push(
+                "NOITE_VOID_SMTP_MODE=plain needs NOITE_VOID_SMTP_ALLOW_PLAINTEXT=1 (the proxy refuses plaintext SMTP without it)"
+                    .into(),
+            );
+        }
+        if !self.ai_models.is_empty() {
+            match serde_json::from_str::<serde_json::Value>(&self.ai_models) {
+                Ok(serde_json::Value::Object(map)) => {
+                    for (model, mapping) in &map {
+                        let endpoint = mapping.get("endpoint").and_then(|v| v.as_str());
+                        let target = mapping.get("model").and_then(|v| v.as_str());
+                        let endpoint_ok = endpoint.is_some_and(|url| {
+                            (url.starts_with("http://") || url.starts_with("https://"))
+                                && url_host(url).is_some()
+                        });
+                        if !endpoint_ok {
+                            problems.push(format!(
+                                "NOITE_VOID_AI_MODELS[{model:?}] needs an `endpoint` http(s) URL, got {}",
+                                endpoint.map_or("nothing".to_string(), |u| format!("{u:?}"))
+                            ));
+                        }
+                        if target.is_none_or(|m| m.trim().is_empty()) {
+                            problems.push(format!(
+                                "NOITE_VOID_AI_MODELS[{model:?}] needs a non-empty `model` name"
+                            ));
+                        }
+                    }
+                }
+                _ => problems.push(
+                    "NOITE_VOID_AI_MODELS must be a JSON object like `{\"<model>\": {\"endpoint\": \"https://…\", \"model\": \"…\"}}`"
+                        .into(),
+                ),
+            }
+        }
+        if !self.ai_models.is_empty() && !self.ai_enabled {
+            problems.push(
+                "NOITE_VOID_AI_MODELS is set but NOITE_VOID_AI_ENABLED is not `1` (every AI call would answer 501)"
+                    .into(),
+            );
+        }
+    }
+}
+
 /// Whether a base domain is the `localhost` family: bare `localhost` or any
 /// `*.localhost` name. Browsers resolve every `*.localhost` host to loopback
 /// and treat it as a secure context, so the dev stack runs on
@@ -580,6 +804,9 @@ pub struct Config {
     pub better_auth_url: String,
     /// Edge rate limits, request bounds and trusted proxies.
     pub edge: EdgeLimits,
+    /// Operator config for Noite's Void platform proxy: email relay and AI
+    /// endpoint rendered into every Void fleet's `noite-void-proxy`.
+    pub void_proxy: VoidProxyConfig,
     /// Opt-out instance heartbeat (SPEC, telemetry): `NOITE_TELEMETRY`
     /// (`0`/`false`/`off`) locks it off.
     pub telemetry_disabled: bool,
@@ -853,6 +1080,7 @@ impl Config {
                 .unwrap_or_else(|_| "/opt/noite/control/dist".into()),
             better_auth_url: env::var("BETTER_AUTH_URL").unwrap_or_default(),
             edge: EdgeLimits::from_env(&mut env_problems)?,
+            void_proxy: VoidProxyConfig::from_env(&mut env_problems),
             telemetry_disabled: parse_telemetry_disabled(
                 env::var("NOITE_TELEMETRY").ok().as_deref(),
             ),
@@ -973,6 +1201,7 @@ impl Config {
         if self.otel_flush_ms < 1000 {
             problems.push("RUNNER_OTEL_FLUSH_MS must be >= 1000".into());
         }
+        self.void_proxy.validate(&mut problems);
         if self.build_uid_range == 0 {
             problems.push("RUNNER_BUILD_UID_RANGE must be >= 1".into());
         }
@@ -1215,6 +1444,7 @@ pub(crate) fn config_for_tests() -> Config {
         control_bundle_dir: "/opt/noite/control/dist".into(),
         better_auth_url: "".into(),
         edge: EdgeLimits::default(),
+        void_proxy: VoidProxyConfig::default(),
         telemetry_disabled: false,
         do_not_track: false,
         update_check_disabled: false,
@@ -1370,6 +1600,18 @@ mod tests {
             .iter()
             .copied()
             .chain(["BASE_DOMAIN", "NOITE_TENANCY"])
+            // The Void proxy section reads these; a test-set value must not
+            // leak into a parallel `from_env`.
+            .chain([
+                "NOITE_VOID_EMAIL_DOMAIN",
+                "NOITE_VOID_SMTP_HOST",
+                "NOITE_VOID_SMTP_PORT",
+                "NOITE_VOID_SMTP_MODE",
+                "NOITE_VOID_SMTP_ALLOW_PLAINTEXT",
+                "NOITE_VOID_EMAIL_ALLOWLIST",
+                "NOITE_VOID_AI_ENABLED",
+                "NOITE_VOID_AI_MODELS",
+            ])
         {
             saved.push((key, env::var(key).ok()));
             env::remove_var(key);
@@ -1750,6 +1992,158 @@ mod tests {
         assert_eq!(
             cfg.public_app_url("blog.noite.now"),
             "http://blog.noite.now"
+        );
+    }
+
+    /// Unset proxy section: email and AI off, the boot passes — the proxy
+    /// still deploys (revalidate needs no operator config).
+    #[test]
+    fn void_proxy_defaults_to_disabled() {
+        with_env(&[], || {
+            let cfg = Config::from_env().expect("unset proxy section must boot");
+            assert_eq!(cfg.void_proxy, VoidProxyConfig::default());
+            assert!(cfg.void_proxy.email_domain.is_empty());
+            assert!(cfg.void_proxy.smtp_host.is_empty());
+            assert_eq!(cfg.void_proxy.smtp_port, None);
+            assert_eq!(cfg.void_proxy.smtp_mode, VoidSmtpMode::Starttls);
+            assert!(!cfg.void_proxy.smtp_allow_plaintext);
+            assert!(cfg.void_proxy.email_allowlist.is_empty());
+            assert!(!cfg.void_proxy.ai_enabled);
+            assert!(cfg.void_proxy.ai_models.is_empty());
+        });
+    }
+
+    /// A fully configured section parses: modes, ports, flags, allowlist
+    /// splitting and the model map pass through verbatim.
+    #[test]
+    fn void_proxy_full_config_parses() {
+        with_env(
+            &[
+                ("NOITE_VOID_EMAIL_DOMAIN", "mail.example.com"),
+                ("NOITE_VOID_SMTP_HOST", "smtp.example.com"),
+                ("NOITE_VOID_SMTP_PORT", "2525"),
+                ("NOITE_VOID_SMTP_MODE", "implicit"),
+                (
+                    "NOITE_VOID_EMAIL_ALLOWLIST",
+                    "ops@example.com, @example.com",
+                ),
+                ("NOITE_VOID_AI_ENABLED", "1"),
+                (
+                    "NOITE_VOID_AI_MODELS",
+                    r#"{"@cf/meta/llama": {"endpoint": "https://ai.example.com/v1", "model": "llama"}}"#,
+                ),
+            ],
+            || {
+                let cfg = Config::from_env().expect("full proxy config must boot");
+                let proxy = &cfg.void_proxy;
+                assert_eq!(proxy.email_domain, "mail.example.com");
+                assert_eq!(proxy.smtp_host, "smtp.example.com");
+                assert_eq!(proxy.smtp_port, Some(2525));
+                assert_eq!(proxy.smtp_mode, VoidSmtpMode::Implicit);
+                assert!(!proxy.smtp_allow_plaintext);
+                assert_eq!(
+                    proxy.email_allowlist,
+                    vec!["ops@example.com", "@example.com"]
+                );
+                assert!(proxy.ai_enabled);
+                assert!(proxy.ai_models.contains("@cf/meta/llama"));
+            },
+        );
+    }
+
+    /// Every malformed proxy value refuses the boot naming the var: modes,
+    /// ports, flags, domain/host shapes, allowlist entries and the model
+    /// map — plus the cross-field rules (host without domain, plain
+    /// without the allowance, models without the AI flag).
+    #[test]
+    fn void_proxy_misconfiguration_fails_boot_naming_the_var() {
+        let models = r#"{"@cf/m": {"endpoint": "https://ai.example.com/v1", "model": "m"}}"#;
+        let cases: &[(&[(&str, &str)], &str)] = &[
+            (&[("NOITE_VOID_SMTP_MODE", "ssl")], "NOITE_VOID_SMTP_MODE"),
+            (&[("NOITE_VOID_SMTP_PORT", "smtp")], "NOITE_VOID_SMTP_PORT"),
+            (&[("NOITE_VOID_SMTP_PORT", "0")], "NOITE_VOID_SMTP_PORT"),
+            (&[("NOITE_VOID_AI_ENABLED", "yes")], "NOITE_VOID_AI_ENABLED"),
+            (
+                &[("NOITE_VOID_SMTP_ALLOW_PLAINTEXT", "yes")],
+                "NOITE_VOID_SMTP_ALLOW_PLAINTEXT",
+            ),
+            (
+                &[("NOITE_VOID_EMAIL_DOMAIN", "not a domain")],
+                "NOITE_VOID_EMAIL_DOMAIN",
+            ),
+            (
+                &[("NOITE_VOID_EMAIL_DOMAIN", "user@example.com")],
+                "NOITE_VOID_EMAIL_DOMAIN",
+            ),
+            (
+                &[
+                    ("NOITE_VOID_EMAIL_DOMAIN", "mail.example.com"),
+                    ("NOITE_VOID_SMTP_HOST", "smtp example.com"),
+                ],
+                "NOITE_VOID_SMTP_HOST",
+            ),
+            (
+                &[("NOITE_VOID_EMAIL_ALLOWLIST", "bare-host")],
+                "NOITE_VOID_EMAIL_ALLOWLIST",
+            ),
+            (
+                &[("NOITE_VOID_EMAIL_ALLOWLIST", "@")],
+                "NOITE_VOID_EMAIL_ALLOWLIST",
+            ),
+            (
+                &[("NOITE_VOID_EMAIL_ALLOWLIST", "a@b@c")],
+                "NOITE_VOID_EMAIL_ALLOWLIST",
+            ),
+            (
+                &[("NOITE_VOID_SMTP_HOST", "smtp.example.com")],
+                "NOITE_VOID_EMAIL_DOMAIN",
+            ),
+            (
+                &[("NOITE_VOID_SMTP_MODE", "plain")],
+                "NOITE_VOID_SMTP_ALLOW_PLAINTEXT",
+            ),
+            (
+                &[("NOITE_VOID_AI_MODELS", "not json")],
+                "NOITE_VOID_AI_MODELS",
+            ),
+            (&[("NOITE_VOID_AI_MODELS", "[1]")], "NOITE_VOID_AI_MODELS"),
+            (
+                &[(
+                    "NOITE_VOID_AI_MODELS",
+                    r#"{"m": {"endpoint": "https://ai.example.com/v1"}}"#,
+                )],
+                "NOITE_VOID_AI_MODELS",
+            ),
+            (
+                &[(
+                    "NOITE_VOID_AI_MODELS",
+                    r#"{"m": {"endpoint": "gopher://x", "model": "m"}}"#,
+                )],
+                "NOITE_VOID_AI_MODELS",
+            ),
+            (&[("NOITE_VOID_AI_MODELS", models)], "NOITE_VOID_AI_ENABLED"),
+        ];
+        for (vars, var) in cases {
+            with_env(vars, || {
+                let err = Config::from_env().expect_err("proxy misconfig must fail boot");
+                let msg = format!("{err:#}");
+                assert!(msg.contains(var), "names {var}: {msg}");
+            });
+        }
+        // The mode parse is case-insensitive; `plain` boots with the
+        // allowance; explicit off-flags boot.
+        with_env(
+            &[
+                ("NOITE_VOID_SMTP_MODE", "PLAIN"),
+                ("NOITE_VOID_SMTP_ALLOW_PLAINTEXT", "true"),
+                ("NOITE_VOID_AI_ENABLED", "off"),
+            ],
+            || {
+                let cfg = Config::from_env().expect("plain+allowance must boot");
+                assert_eq!(cfg.void_proxy.smtp_mode, VoidSmtpMode::Plain);
+                assert!(cfg.void_proxy.smtp_allow_plaintext);
+                assert!(!cfg.void_proxy.ai_enabled);
+            },
         );
     }
 }

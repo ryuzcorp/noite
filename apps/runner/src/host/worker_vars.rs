@@ -10,13 +10,15 @@
 //! a runner-owned name fails the deploy with the name in the log —
 //! `__VOID_PROXY`, `__PROJECT_ID`, `__VOID_PROXY_TOKEN`,
 //! `__VOID_PROJECT_SLUG`, `__VOID_EMAIL_DOMAIN`, `__VOID_EMAIL_DEPLOYMENT_ID`,
-//! plus `ISR_CACHE` on Void apps (the runner injects that binding there, and
-//! only there, so only there is the name refused). The build/fleet process
-//! prefixes (`PORT`, `AWS_*`, `CELLD_*`, `BETTER_AUTH_*`, …) do NOT apply
-//! here: they guard the process environment, and Worker `vars` are a separate
-//! namespace no platform component reads (SPEC documents the per-prefix
-//! decision). `BETTER_AUTH_*` in particular must stay allowed: Void auth
-//! needs `BETTER_AUTH_SECRET`/`BETTER_AUTH_URL` in Worker env.
+//! plus `ISR_CACHE` and the `VOID_PROXY_*` proxy namespace on Void apps
+//! (the runner injects that binding there, and the proxy render consumes
+//! those settings there — and only there, so only there are the names
+//! refused). The build/fleet process prefixes (`PORT`, `AWS_*`, `CELLD_*`,
+//! `BETTER_AUTH_*`, …) do NOT apply here: they guard the process
+//! environment, and Worker `vars` are a separate namespace no platform
+//! component reads (SPEC documents the per-prefix decision).
+//! `BETTER_AUTH_*` in particular must stay allowed: Void auth needs
+//! `BETTER_AUTH_SECRET`/`BETTER_AUTH_URL` in Worker env.
 //!
 //! Void's `secrets.required` (its `dist/ssr/wrangler.json` carries one, which
 //! the build-output rewrite drops because celld refuses the key): every
@@ -50,6 +52,20 @@ const RESERVED_WORKER_VARS: &[&str] = &[
 /// called `ISR_CACHE` exactly as before.
 const VOID_RESERVED_WORKER_VARS: &[&str] = &["ISR_CACHE"];
 
+/// The proxy's var namespace: on a Void app every `VOID_PROXY_*` name is
+/// refused as an app Worker var (a setting or a config `vars` entry fails
+/// the deploy naming it), because those names can only mean the proxy —
+/// the three credential settings feed the proxy render alone, and any
+/// other `VOID_PROXY_*` name is a tenant typo the app must never see. A
+/// non-Void app keeps deploying such names as ordinary vars: with no
+/// proxy there is nothing to confuse them with.
+const VOID_RESERVED_WORKER_PREFIX: &str = "VOID_PROXY_";
+
+/// True when the name falls in the Void-only proxy namespace.
+fn void_proxy_var(name: &str) -> bool {
+    name.starts_with(VOID_RESERVED_WORKER_PREFIX)
+}
+
 /// True for the runner-owned names no setting or config `vars` entry may use
 /// on any app.
 pub fn worker_var_reserved(name: &str) -> bool {
@@ -57,27 +73,40 @@ pub fn worker_var_reserved(name: &str) -> bool {
 }
 
 /// True for the runner-owned names refused on this deploy: the global set,
-/// plus `ISR_CACHE` when the deploy is a Void app's (the runner injects
-/// that binding there). The Void merge calls this with `true`; the
-/// settings merge stays global.
+/// plus `ISR_CACHE` and the `VOID_PROXY_*` namespace when the deploy is a
+/// Void app's (the runner injects that binding and consumes those
+/// settings there). The Void merge calls this with `true`; the settings
+/// merge stays global.
 pub fn worker_var_reserved_for(name: &str, void_app: bool) -> bool {
-    RESERVED_WORKER_VARS.contains(&name) || (void_app && VOID_RESERVED_WORKER_VARS.contains(&name))
+    RESERVED_WORKER_VARS.contains(&name)
+        || (void_app && (VOID_RESERVED_WORKER_VARS.contains(&name) || void_proxy_var(name)))
 }
 
 /// Names the runner itself provides as Worker vars: a `secrets.required`
 /// entry naming one is satisfied without a setting. Exactly what the
-/// runner-owned merge injects — the identity vars, on Void apps only — and
-/// nothing else: the email vars and the `__VOID_PROXY` service binding land
-/// with the proxy slice, and the auto-provisioned `BETTER_AUTH_SECRET`
+/// runner-owned merge injects on Void apps — the identity vars plus the
+/// `__VOID_PROXY` service binding — and `__VOID_EMAIL_DOMAIN` when the
+/// operator configured a sender domain (without one the name is still
+/// reserved but unprovided, so a required entry naming it fails the
+/// deploy). Nothing else: the auto-provisioned `BETTER_AUTH_SECRET`
 /// flows through the settings load, so it needs no entry here.
-pub fn provisioned_names(void_app: bool) -> HashSet<String> {
+pub fn provisioned_names(void_app: bool, email_domain: bool) -> HashSet<String> {
     if !void_app {
         return HashSet::new();
     }
-    ["__PROJECT_ID", "__VOID_PROJECT_SLUG", "__VOID_PROXY_TOKEN"]
-        .into_iter()
-        .map(ToString::to_string)
-        .collect()
+    let mut names: HashSet<String> = [
+        "__PROJECT_ID",
+        "__VOID_PROJECT_SLUG",
+        "__VOID_PROXY_TOKEN",
+        "__VOID_PROXY",
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect();
+    if email_domain {
+        names.insert("__VOID_EMAIL_DOMAIN".to_string());
+    }
+    names
 }
 
 /// The `secrets.required` names in a config, if it carries a readable one.
@@ -453,7 +482,7 @@ mod tests {
         assert!(check_required(
             &["__PROJECT_ID".to_string()],
             &[],
-            &provisioned_names(true),
+            &provisioned_names(true, false),
             "Settings"
         )
         .is_ok());
@@ -462,36 +491,53 @@ mod tests {
 
     #[test]
     fn provisioned_names_are_exactly_what_the_runner_injects() {
-        // Void apps: the three identity vars the runner-owned merge writes.
+        // Void apps: the three identity vars plus the proxy service binding
+        // the runner-owned merge writes.
         assert_eq!(
-            provisioned_names(true),
-            ["__PROJECT_ID", "__VOID_PROJECT_SLUG", "__VOID_PROXY_TOKEN"]
-                .into_iter()
-                .map(str::to_string)
-                .collect()
+            provisioned_names(true, false),
+            [
+                "__PROJECT_ID",
+                "__VOID_PROJECT_SLUG",
+                "__VOID_PROXY_TOKEN",
+                "__VOID_PROXY"
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
         );
-        // The proxy slice's names are reserved but not provisioned yet: a
-        // required entry naming one still fails the deploy.
-        for name in ["__VOID_PROXY", "__VOID_EMAIL_DOMAIN"] {
-            assert!(
-                check_required(
-                    &[name.to_string()],
-                    &[],
-                    &provisioned_names(true),
-                    "Settings"
-                )
-                .is_err(),
-                "{} must not read as provisioned",
-                name
-            );
-        }
+        // The email domain is provisioned only when the operator configured
+        // it: without one the name stays reserved-but-unprovided, so a
+        // required entry naming it fails the deploy.
+        assert!(provisioned_names(true, false).contains("__VOID_PROXY_TOKEN"));
+        assert!(!provisioned_names(true, false).contains("__VOID_EMAIL_DOMAIN"));
+        assert!(provisioned_names(true, true).contains("__VOID_EMAIL_DOMAIN"));
+        assert!(
+            check_required(
+                &["__VOID_EMAIL_DOMAIN".to_string()],
+                &[],
+                &provisioned_names(true, false),
+                "Settings"
+            )
+            .is_err(),
+            "unconfigured domain must not read as provisioned"
+        );
+        assert!(
+            check_required(
+                &["__VOID_EMAIL_DOMAIN".to_string()],
+                &[],
+                &provisioned_names(true, true),
+                "Settings"
+            )
+            .is_ok(),
+            "configured domain must satisfy required"
+        );
         // Non-Void apps: nothing is provisioned, so even an identity name in
         // `secrets.required` fails the deploy instead of passing unsatisfied.
-        assert!(provisioned_names(false).is_empty());
+        assert!(provisioned_names(false, true).is_empty());
         assert!(check_required(
             &["__PROJECT_ID".to_string()],
             &[],
-            &provisioned_names(false),
+            &provisioned_names(false, false),
             "Settings"
         )
         .is_err());
@@ -511,6 +557,42 @@ mod tests {
         // The global set is unchanged either way.
         assert!(worker_var_reserved("__PROJECT_ID"));
         assert!(worker_var_reserved_for("__PROJECT_ID", true));
+    }
+
+    #[test]
+    fn the_proxy_namespace_is_reserved_only_on_void_apps() {
+        // Every `VOID_PROXY_*` name — the three credential settings and any
+        // other — is refused as a Void app's Worker var.
+        for name in [
+            "VOID_PROXY_SMTP_USERNAME",
+            "VOID_PROXY_SMTP_PASSWORD",
+            "VOID_PROXY_AI_API_KEY",
+            "VOID_PROXY_SMTP_HOST",
+            "VOID_PROXY_ANYTHING",
+        ] {
+            assert!(!worker_var_reserved(name), "{name} refused globally");
+            assert!(
+                worker_var_reserved_for(name, true),
+                "{name} allowed on Void"
+            );
+            assert!(
+                !worker_var_reserved_for(name, false),
+                "{name} refused off Void"
+            );
+        }
+        // A non-Void app still deploys such a setting as an ordinary var.
+        let mut config = json!({"name": "a"});
+        let stats = merge_settings(
+            &mut config,
+            &settings(&[("VOID_PROXY_SMTP_PASSWORD", "v")]),
+            "Settings",
+        )
+        .unwrap();
+        assert_eq!(stats.merged, 1);
+        assert_eq!(config["vars"]["VOID_PROXY_SMTP_PASSWORD"], "v");
+        // Near-misses are not in the namespace.
+        assert!(!worker_var_reserved_for("VOID_PROXY", true));
+        assert!(!worker_var_reserved_for("XVOID_PROXY_A", true));
     }
 
     #[test]

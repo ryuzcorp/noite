@@ -131,6 +131,18 @@ services:
       RUNNER_SLEEP_SWEEP_S: ${RUNNER_SLEEP_SWEEP_S:-3600}
       RUNNER_WAKE_TIMEOUT_S: ${RUNNER_WAKE_TIMEOUT_S:-120}
       RUNNER_WAKE_CONCURRENCY: ${RUNNER_WAKE_CONCURRENCY:-4}
+      # Void platform proxy (SPEC): the operator's email relay and AI
+      # endpoint, rendered into every Void fleet's `noite-void-proxy`.
+      # Unset = email and AI calls answer 501; per-app credentials are
+      # tenant settings, never operator config (see .env.example).
+      NOITE_VOID_EMAIL_DOMAIN: ${NOITE_VOID_EMAIL_DOMAIN:-}
+      NOITE_VOID_SMTP_HOST: ${NOITE_VOID_SMTP_HOST:-}
+      NOITE_VOID_SMTP_PORT: ${NOITE_VOID_SMTP_PORT:-}
+      NOITE_VOID_SMTP_MODE: ${NOITE_VOID_SMTP_MODE:-}
+      NOITE_VOID_SMTP_ALLOW_PLAINTEXT: ${NOITE_VOID_SMTP_ALLOW_PLAINTEXT:-}
+      NOITE_VOID_EMAIL_ALLOWLIST: ${NOITE_VOID_EMAIL_ALLOWLIST:-}
+      NOITE_VOID_AI_ENABLED: ${NOITE_VOID_AI_ENABLED:-}
+      NOITE_VOID_AI_MODELS: ${NOITE_VOID_AI_MODELS:-}
       # Coolify boot-check domain (ignored elsewhere).
       SERVICE_URL_NOITE_80: /
     ports:

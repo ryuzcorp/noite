@@ -54,7 +54,7 @@ else
   run="cargo run"
 fi
 echo "dev: runner via cargo watch ($run)"
-cargo watch -q -w src -w Cargo.toml -w Cargo.lock -w schema.sql -s "$run" &
+cargo watch -q -w src -w Cargo.toml -w Cargo.lock -w schema.sql -w /void-proxy -s "$run" &
 RUNNER_PID=$!
 
 # docker stop → SIGTERM to tini → this shell: stop both. The runner handles

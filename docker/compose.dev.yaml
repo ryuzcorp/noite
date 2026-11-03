@@ -12,6 +12,9 @@ services:
       target: dev
     volumes:
       - ../apps/runner:/src:z
+      # The Void proxy sources `src/host/void_proxy.rs` embeds via
+      # `include_str!("../../../void-proxy/...")`: `/void-proxy` from `/src`.
+      - ../apps/void-proxy:/void-proxy:z
       - ../apps/noite:/app:z
       - ../docker/dev.sh:/opt/noite/dev.sh:ro,z
       - cargo-registry:/usr/local/cargo/registry

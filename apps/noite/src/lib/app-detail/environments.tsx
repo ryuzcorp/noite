@@ -228,7 +228,9 @@ const EnvironmentVars = ({
         Overrides the app's variables for this environment only, in the build,
         the fleet, and Worker code (<code>env.NAME</code>). A change takes
         effect on the next deploy of this environment. Values are hidden after
-        saving; <code>FLAG_</code> names render as on/off toggles.
+        saving; <code>FLAG_</code> names render as on/off toggles. On Void apps,{" "}
+        <code>VOID_PROXY_</code> names override the proxy-only credentials for
+        this fleet alone.
       </p>
       {savedNote() ? (
         <p class="m-0 text-xs opacity-70">

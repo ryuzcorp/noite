@@ -125,6 +125,21 @@ CREATE TABLE IF NOT EXISTS environment_env (
   PRIMARY KEY (environment_id, name)
 );
 
+-- Skip-when-unchanged state for runner-owned cohosted scripts (Void fleets):
+-- one content hash per fleet per script (`noite-void-proxy`, later
+-- `noite-void-sandbox`). Production keys on `environment_id = ''` (as
+-- telemetry does); previews key on the environment id. The app delete
+-- cascades; an environment delete drops its rows explicitly
+-- (`db::delete_environment_hashes`), so a reused label starts clean.
+CREATE TABLE IF NOT EXISTS void_cohost_hash (
+  app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,
+  environment_id TEXT NOT NULL DEFAULT '',
+  script TEXT NOT NULL,
+  hash TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (app_id, environment_id, script)
+);
+
 -- Tenant app events (LogSnag-style): channel-grouped event log, user
 -- property profiles, and latest-value insight widgets. Ingest comes through
 -- the control UI (API-key + role gate); the runner only stores and serves.

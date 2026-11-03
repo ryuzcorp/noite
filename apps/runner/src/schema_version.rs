@@ -21,7 +21,7 @@ use anyhow::{bail, Context};
 use sqlx::SqliteConnection;
 
 /// Version a database has after every migration ran. 1 is the alpha baseline.
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`.
@@ -281,6 +281,22 @@ pub const MIGRATIONS: &[Migration] = &[
         // schema.sql.
         sql: "ALTER TABLE main.app_env ADD COLUMN source TEXT NOT NULL DEFAULT '';\
           ALTER TABLE main.environment_env ADD COLUMN source TEXT NOT NULL DEFAULT '';",
+    },
+    Migration {
+        version: 14,
+        // Skip-when-unchanged state for runner-owned cohosted scripts
+        // (SPEC, Void platform proxy): one content hash per fleet per
+        // script. New table, so older installs gain it empty (their next
+        // Void deploy stores the hashes) and a fresh database gets it
+        // from schema.sql.
+        sql: "CREATE TABLE IF NOT EXISTS main.void_cohost_hash (\
+            app_id TEXT NOT NULL REFERENCES app(id) ON DELETE CASCADE,\
+            environment_id TEXT NOT NULL DEFAULT '',\
+            script TEXT NOT NULL,\
+            hash TEXT NOT NULL,\
+            updated_at TEXT NOT NULL,\
+            PRIMARY KEY (app_id, environment_id, script)\
+          );",
     },
 ];
 

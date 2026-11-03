@@ -173,7 +173,10 @@ export const EnvVarsPanel = ({
         Variables reach the build, the release command, the fleet, and Worker
         code (<code>env.NAME</code>). A change takes effect on the next deploy.
         Values are hidden after saving; names starting with <code>FLAG_</code>{" "}
-        render as on/off toggles (<code>1</code>/<code>0</code>).
+        render as on/off toggles (<code>1</code>/<code>0</code>). On Void apps,
+        names starting with <code>VOID_PROXY_</code> are proxy-only credentials
+        (SMTP user/password, AI key): they reach the Void proxy alone, never the
+        build, the fleet, or Worker code.
       </p>
       {savedNote() ? (
         <p class="m-0 text-sm opacity-70">
