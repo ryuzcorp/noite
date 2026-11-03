@@ -50,19 +50,14 @@ jobs:
           fi
       # The fork attests every image it publishes (ryuzcorp/celld publish.yml,
       # SLSA provenance on the multi-arch index): verify the pinned digest
-      # carries that attestation. Legacy `-noite.` pins predate the fork and
-      # have no attestation, so they skip this step — that skip disappears
-      # with them in a follow-up once the repin lands.
+      # carries that attestation, so the pin can only name an image the fork
+      # built.
       - name: celld pin attestation
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag=$(sed -n 's/^ARG CELLD_VERSION=//p' docker/Dockerfile)
           pinned=$(sed -n 's/^ARG CELLD_DIGEST=//p' docker/Dockerfile)
-          case "$tag" in
-            *-noite.*) echo "legacy pre-fork pin $tag has no attestation; skipping" ;;
-            *) gh attestation verify "oci://ghcr.io/ryuzcorp/celld@$pinned" --repo ryuzcorp/celld ;;
-          esac
+          gh attestation verify "oci://ghcr.io/ryuzcorp/celld@$pinned" --repo ryuzcorp/celld
       # Script unit tests: docker/ (including the test-hygiene checker,
       # docker/check-tests.test.ts) and the CI scripts (bun skips dot
       # directories unless they're named explicitly).

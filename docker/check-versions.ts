@@ -17,8 +17,6 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
-import { checkCelldPin } from "./check-versions-lib";
-
 const root = new URL("../", import.meta.url).pathname;
 
 const read = (rel: string): string =>
@@ -72,10 +70,9 @@ const compareVersions = (a: string, b: string): number => {
 };
 
 for (const [name, pattern] of [
-  [
-    "celld",
-    /ARG CELLD_VERSION=(?<version>\d+\.\d+\.\d+-(?:ryuzcorp|noite)\.\d+)/gu,
-  ],
+  // celld comes from the ryuzcorp/celld fork (SPEC, celld): a
+  // `<version>-ryuzcorp.<level>` tag, so any other form pins zero times.
+  ["celld", /ARG CELLD_VERSION=(?<version>\d+\.\d+\.\d+-ryuzcorp\.\d+)/gu],
   ["celld digest", /ARG CELLD_DIGEST=(?<version>sha256:[0-9a-f]{64})/gu],
   ["caddy", /ARG CADDY_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
   ["node", /ARG NODE_VERSION=(?<version>\d+\.\d+\.\d+)/gu],
@@ -100,25 +97,7 @@ for (const [name, pattern] of [
   }
 }
 
-// The celld image comes from the ryuzcorp/celld fork (SPEC, celld): its tag
-// is `<version>-ryuzcorp.<level>`. Tags predating the fork carry the legacy
-// `<version>-noite.<level>` name: accepted until the repin, but a release
-// build (`--release`, check.yml's `changelog` input) refuses them, so an
-// alpha can never ship a pre-fork image.
-const celldTag = dockerfile.match(/^ARG CELLD_VERSION=(?<tag>\S+)$/mu)?.groups
-  ?.tag;
-
-const celldReport = checkCelldPin(celldTag, process.argv.includes("--release"));
-
-for (const note of celldReport.notes) {
-  console.log(`note: ${note}`);
-}
-
-for (const error of celldReport.errors) {
-  fail(error);
-}
-
-// ...and the stage must pull exactly that tag from Noite's own package, by
+// The stage must pull exactly that tag from the fork's package, by
 // the pinned digest: the version and digest checks above mean nothing if
 // CELLD_IMAGE names another registry or the FROM line ignores it. (CI's
 // `celld pin is published` step checks the digest is that tag's.)
