@@ -139,10 +139,7 @@ fn normalize_container_paths(config: &mut Value) {
             entry.remove("image");
         }
     }
-    let Some(entries) = config
-        .get_mut("containers")
-        .and_then(Value::as_array_mut)
-    else {
+    let Some(entries) = config.get_mut("containers").and_then(Value::as_array_mut) else {
         return;
     };
     for entry in entries {
@@ -1495,11 +1492,7 @@ echo "deployed $2"
             Some(stats.cohosted[0].hash.as_str())
         );
         // The temp project is gone on the failure path too.
-        let project = calls[0]
-            .split(' ')
-            .nth(1)
-            .expect("deploy argv")
-            .to_string();
+        let project = calls[0].split(' ').nth(1).expect("deploy argv").to_string();
         assert!(!Path::new(&project).exists(), "{}", project);
         std::fs::remove_dir_all(&app_dir).unwrap();
     }
