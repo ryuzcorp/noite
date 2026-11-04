@@ -691,6 +691,7 @@ async fn ensure_spawned(
     // knob, since the builder applies them first. This `apply` call is
     // load-bearing (nothing here fails if it is dropped): the builder and
     // the spawn-path tests in `host::fleet_env` pin what it applies.
+    let inherited = crate::host::fleet_env::runner_inherited();
     let fleet_env =
         crate::host::fleet_env::tenant_fleet_env(&crate::host::fleet_env::TenantFleetEnv {
             cfg,
@@ -701,6 +702,7 @@ async fn ensure_spawned(
             tenant_env: &spec.env,
             has_cgroup_leaf: fleet_cgroup.is_some(),
             engine_socket: engine_socket.as_deref(),
+            inherited: &inherited,
         });
     crate::host::fleet_env::apply(&mut cmd, &fleet_env);
     let mut child = match cmd

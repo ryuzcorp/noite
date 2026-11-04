@@ -140,13 +140,14 @@ pub(crate) fn env_reserved(name: &str) -> bool {
         // would steer fleet celld at another engine than its own proxy
         // socket (or at the host socket directly).
         || name == "DOCKER_HOST"
-        // Fleet TLS trust and proxy routing: the platform sets
-        // `SSL_CERT_*` only when the operator configured them, and never
-        // passes proxy env at all — so ordering alone cannot win these,
-        // and a tenant row would survive verbatim into fleet process env
-        // (store-TLS anchors via rustls-native-certs, store traffic via
+        // Fleet TLS trust and proxy routing: the platform passes these
+        // only when the operator set them (`fleet_env::INHERITED`), so
+        // ordering alone cannot win them, and a tenant row would survive
+        // verbatim into fleet process env (store-TLS anchors via
+        // rustls-native-certs; store, peer and control traffic via
         // reqwest's proxy autodetect). Both cases: the toolchains read
-        // lowercase too.
+        // lowercase too. Dropped, not refused, like every reserved name,
+        // from fleet, build and release env alike.
         || name == "SSL_CERT_FILE"
         || name == "SSL_CERT_DIR"
         || name == "HTTP_PROXY"

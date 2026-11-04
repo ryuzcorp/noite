@@ -284,10 +284,12 @@ pub fn supervise(
             // load-bearing (nothing here fails if it is dropped): the
             // builder and the spawn-path tests in `host::fleet_env` pin
             // what it applies.
+            let inherited = crate::host::fleet_env::runner_inherited();
             let env = crate::host::fleet_env::control_fleet_env(
                 &crate::host::fleet_env::ControlFleetEnv {
                     cfg: &fleet_cfg,
                     operator_token: &operator_token,
+                    inherited: &inherited,
                 },
             );
             crate::host::fleet_env::apply(&mut cmd, &env);

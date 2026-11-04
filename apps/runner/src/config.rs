@@ -43,6 +43,32 @@ fn env_or(keys: &[&str], default: &str) -> String {
     }
     default.to_string()
 }
+
+/// `S3_ENDPOINT` without userinfo. Every store client here and in celld
+/// signs with the access keys (SigV4), so URL credentials never
+/// authenticated anything, but the endpoint travels on: fleet argv and env,
+/// celld CLI env, release-command env, the control Worker. Stripping once
+/// at load keeps credentials out of all of them; `main` warns when it did.
+/// An unparseable endpoint passes through verbatim so it fails loudly where
+/// it is used instead of as a rewritten URL. Apart from the userinfo the
+/// value stays byte-identical.
+pub fn strip_endpoint_userinfo(endpoint: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(endpoint) else {
+        return endpoint.to_string();
+    };
+    if url.username().is_empty() && url.password().is_none() {
+        return endpoint.to_string();
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    let mut out = url.to_string();
+    // Serializing adds a `/` to a bare host: drop it again.
+    if url.path() == "/" && !endpoint.ends_with('/') {
+        out.truncate(out.len().saturating_sub(1));
+    }
+    out
+}
+
 /// Host part of an http(s) URL without new deps: strip scheme, authority,
 /// port. None when no `://` or empty host. A bracketed literal yields its
 /// address (`https://[::1]:8080/x` → `::1`); splitting the port at the
@@ -1026,7 +1052,9 @@ impl Config {
             bind: env_or(&["RUNNER_BIND"], "0.0.0.0:8080"),
             runner_token,
             database_url,
-            s3_endpoint: env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://rustfs:9000".into()),
+            s3_endpoint: strip_endpoint_userinfo(
+                &env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://rustfs:9000".into()),
+            ),
             s3_public_endpoint: env::var("S3_PUBLIC_ENDPOINT")
                 .unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
             s3_bucket: env_or(&["NOITE_S3_BUCKET"], "noite"),
@@ -1614,6 +1642,27 @@ pub(crate) fn config_for_tests() -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The endpoint keeps its shape apart from userinfo: a plain endpoint
+    /// passes through byte-identical, credentials are dropped (keeping a
+    /// configured trailing slash or path), and garbage passes through to
+    /// fail loudly where it is used.
+    #[test]
+    fn endpoint_userinfo_is_stripped_nothing_else() {
+        assert_eq!(
+            strip_endpoint_userinfo("http://rustfs:9000"),
+            "http://rustfs:9000"
+        );
+        assert_eq!(
+            strip_endpoint_userinfo("http://user:pass@rustfs:9000"),
+            "http://rustfs:9000"
+        );
+        assert_eq!(
+            strip_endpoint_userinfo("https://user@store.example:9443/prefix/"),
+            "https://store.example:9443/prefix/"
+        );
+        assert_eq!(strip_endpoint_userinfo("not a url"), "not a url");
+    }
 
     #[test]
     fn auto_https_explicit_off_wins() {
