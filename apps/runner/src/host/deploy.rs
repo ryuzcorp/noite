@@ -857,15 +857,6 @@ async fn deploy_inner(
         }
     }
 
-    // The Worker map's shadow bundle runs here, while the tree is still the
-    // build uid's: the runner-owned tree below would be unreadable to the
-    // sandboxed build uid under the install's umask. Same sandbox as the
-    // build itself. The bytes upload only after a successful deploy; a
-    // failed deploy drops them with the worktree.
-    let worker_map = crate::host::sourcemaps::build_worker_map(&deploy_root, &sb)
-        .await
-        .map_err(|e| format!("{e:#}"));
-
     // Tenant steps are over: take the tree back from the build uid, so
     // nothing it left behind can change the bundle `celld deploy` uploads.
     #[cfg(unix)]
@@ -1172,7 +1163,13 @@ async fn deploy_inner(
         endpoint: cfg.s3_endpoint.as_str(),
         region: cfg.aws_region.as_str(),
         timeout: Duration::from_secs(120),
+        sourcemap: None,
     };
+    // The Worker map celld writes for the Errors tab: in the work dir beside
+    // the checkout, never inside the deploy root. celld warns and writes
+    // nothing for asset-only, `no_bundle`, and Python projects; a missing
+    // file below then means no worker map.
+    let worker_map_path = work.join("worker.js.map");
     let stats = void_cohost::deploy_fleet_in_order(
         pool,
         &app.id,
@@ -1187,12 +1184,19 @@ async fn deploy_inner(
             } else {
                 Duration::from_secs(120)
             },
+            sourcemap: Some(&worker_map_path),
         },
     )
     .await?;
     for line in stats.log_lines() {
         progress.log(DeployStatus::Deploying, &line).await?;
     }
+    // The deploy succeeded, so celld's map (when it wrote one) is final:
+    // read it now, chained through the build's own entry map when one
+    // exists. The bytes upload with the rest of the maps below.
+    let worker_map = crate::host::sourcemaps::read_celld_worker_map(&deploy_root, &worker_map_path)
+        .await
+        .map_err(|e| format!("{e:#}"));
 
     // The row the deploy targets must still be there before the fleet starts:
     // for a preview, the environment's row (a delete raced this build).
@@ -1313,10 +1317,9 @@ async fn deploy_inner(
     route_live(pool, cfg, &app.id, target.environment_id(), &commit_sha).await?;
 
     // Per-deploy source maps for the Errors tab (symbolication at read
-    // time): the Worker map via a shadow esbuild run over the deployed entry,
-    // plus every client map the build emitted. The shadow runs sandboxed as
-    // the build uid, like the build itself. Best-effort — the deploy
-    // already succeeded — so a failure is a log line, never a failed deploy.
+    // time): the Worker map `celld deploy --sourcemap` wrote, plus every
+    // client map the build emitted. Best-effort — the deploy already
+    // succeeded — so a failure is a log line, never a failed deploy.
     match crate::host::sourcemaps::store_deploy_maps(
         pool,
         cfg,

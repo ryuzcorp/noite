@@ -266,6 +266,10 @@ pub struct CelldDeploy<'a> {
     pub endpoint: &'a str,
     pub region: &'a str,
     pub timeout: Duration,
+    /// Where `celld deploy --sourcemap` writes the bundled Worker's external
+    /// map. Set for the tenant app only: cohosted scripts are runner-owned
+    /// and need no symbolication, so their stage forces this to `None`.
+    pub sourcemap: Option<&'a Path>,
 }
 
 /// One staged script version: celld's script name and deployment version,
@@ -385,23 +389,26 @@ pub async fn celld_stage(
     let Some(dir) = project_dir.to_str() else {
         anyhow::bail!("deploy root is not valid UTF-8: {}", project_dir.display());
     };
-    let (attempts, stdout) = run_with_infra_retry(
-        celld,
-        &[
-            "deploy",
-            dir,
-            "--bucket",
-            celld.bucket,
-            "--endpoint",
-            celld.endpoint,
-            "--region",
-            celld.region,
-            "--no-activate",
-            "--json",
-        ],
-        cwd,
-    )
-    .await?;
+    let mut args = vec![
+        "deploy",
+        dir,
+        "--bucket",
+        celld.bucket,
+        "--endpoint",
+        celld.endpoint,
+        "--region",
+        celld.region,
+        "--no-activate",
+        "--json",
+    ];
+    if let Some(path) = celld.sourcemap {
+        let Some(map) = path.to_str() else {
+            anyhow::bail!("source map path is not valid UTF-8: {}", path.display());
+        };
+        args.push("--sourcemap");
+        args.push(map);
+    }
+    let (attempts, stdout) = run_with_infra_retry(celld, &args, cwd).await?;
     Ok((attempts, parse_staged_version(&stdout)?))
 }
 
@@ -580,6 +587,7 @@ pub async fn stage_cohosted(
         render.write_project(&dir)?;
         let render_celld = CelldDeploy {
             timeout: render_timeout(celld, render),
+            sourcemap: None,
             ..*celld
         };
         let (attempts, staged) = match celld_stage(&render_celld, &dir, None).await {
@@ -615,11 +623,13 @@ pub async fn stage_cohosted(
 }
 
 /// The tenant app's side of the ordered deploy: its project dir, the cwd
-/// the app stage runs from, and its own (container-aware) timeout.
+/// the app stage runs from, its own (container-aware) timeout, and where
+/// `--sourcemap` writes the Worker's map (`None` writes no map).
 pub struct FleetApp<'a> {
     pub dir: &'a Path,
     pub cwd: Option<&'a Path>,
     pub timeout: Duration,
+    pub sourcemap: Option<&'a Path>,
 }
 
 /// What the ordered fleet deploy did, for the deploy log.
@@ -704,6 +714,7 @@ pub async fn deploy_fleet_in_order(
     let outcomes = stage_cohosted(pool, app_id, environment_id, celld, cohosted).await?;
     let app_celld = CelldDeploy {
         timeout: app.timeout,
+        sourcemap: app.sourcemap,
         ..*celld
     };
     let (app_attempts, app_staged) = celld_stage(&app_celld, app.dir, app.cwd).await?;
@@ -997,6 +1008,7 @@ mod tests {
             endpoint: "http://rustfs:9000",
             region: "us-east-1",
             timeout: Duration::from_secs(120),
+            sourcemap: None,
         };
         assert_eq!(
             render_timeout(&celld, &render("tok")),
@@ -1245,6 +1257,7 @@ mod tests {
             endpoint: "http://rustfs:9000",
             region: "us-east-1",
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
         let app_dir = app_dir();
 
@@ -1258,6 +1271,7 @@ mod tests {
                 dir: &app_dir,
                 cwd: None,
                 timeout: Duration::from_secs(30),
+                sourcemap: None,
             },
         )
         .await
@@ -1340,6 +1354,7 @@ mod tests {
             endpoint: "http://rustfs:9000",
             region: "us-east-1",
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
         let app_dir = app_dir();
 
@@ -1364,6 +1379,7 @@ mod tests {
                 dir: &app_dir,
                 cwd: None,
                 timeout: Duration::from_secs(30),
+                sourcemap: None,
             },
         )
         .await
@@ -1429,12 +1445,14 @@ mod tests {
             endpoint: "http://rustfs:9000",
             region: "us-east-1",
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
         let app_dir = app_dir();
         let app_side = FleetApp {
             dir: &app_dir,
             cwd: None,
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
 
         let first =
@@ -1519,6 +1537,7 @@ mod tests {
             endpoint: "http://rustfs:9000",
             region: "us-east-1",
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
         let app_dir = app_dir();
 
@@ -1532,6 +1551,7 @@ mod tests {
                 dir: &app_dir,
                 cwd: None,
                 timeout: Duration::from_secs(30),
+                sourcemap: None,
             },
         )
         .await
@@ -1590,12 +1610,14 @@ mod tests {
             endpoint: "http://rustfs:9000",
             region: "us-east-1",
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
         let app_dir = app_dir();
         let app_side = FleetApp {
             dir: &app_dir,
             cwd: None,
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
 
         let err = deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
@@ -1626,6 +1648,7 @@ mod tests {
             endpoint: "http://rustfs:9000",
             region: "us-east-1",
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
         let err =
             deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok-2")], &app_side)
@@ -1665,12 +1688,14 @@ mod tests {
             endpoint: "http://rustfs:9000",
             region: "us-east-1",
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
         let app_dir = app_dir();
         let app_side = FleetApp {
             dir: &app_dir,
             cwd: None,
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
 
         let err = deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
@@ -1726,12 +1751,14 @@ mod tests {
             endpoint: "http://rustfs:9000",
             region: "us-east-1",
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
         let app_dir = app_dir();
         let app_side = FleetApp {
             dir: &app_dir,
             cwd: None,
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
 
         let stats =
@@ -1795,6 +1822,7 @@ mod tests {
             endpoint: "http://rustfs:9000",
             region: "us-east-1",
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
         let err =
             deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok-2")], &app_side)
@@ -1847,12 +1875,14 @@ mod tests {
             endpoint: "http://rustfs:9000",
             region: "us-east-1",
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
         let app_dir = app_dir();
         let app_side = FleetApp {
             dir: &app_dir,
             cwd: None,
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
 
         let err = deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
@@ -1886,6 +1916,7 @@ mod tests {
             endpoint: "http://rustfs:9000",
             region: "us-east-1",
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
         let stats =
             deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
@@ -1927,6 +1958,7 @@ mod tests {
             endpoint: "http://rustfs:9000",
             region: "us-east-1",
             timeout: Duration::from_secs(30),
+            sourcemap: None,
         };
         let app_dir = app_dir();
 
@@ -1940,6 +1972,7 @@ mod tests {
                 dir: &app_dir,
                 cwd: None,
                 timeout: Duration::from_secs(30),
+                sourcemap: None,
             },
         )
         .await
@@ -1969,5 +2002,67 @@ mod tests {
             calls
         );
         std::fs::remove_dir_all(&app_dir).unwrap();
+    }
+
+    /// The app stage carries `--sourcemap <path>` so the Errors tab can
+    /// symbolicate Worker stacks; the cohosted stages are runner-owned and
+    /// the activate stages nothing, so neither takes it.
+    #[tokio::test]
+    async fn app_stage_passes_sourcemap_while_cohosted_and_activate_skip_it() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
+        let app = seed(&pool).await;
+        let fake = FakeCelld::spawn();
+        let log = fake.log();
+        let dir = fake.dir.to_string_lossy().into_owned();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let bin = fake.bin();
+        let celld = CelldDeploy {
+            celld_bin: &bin,
+            env: &env,
+            bucket: "s3://noite/fleets/cohost-app",
+            endpoint: "http://rustfs:9000",
+            region: "us-east-1",
+            timeout: Duration::from_secs(30),
+            sourcemap: None,
+        };
+        let app_dir = app_dir();
+        let map_path = app_dir.join("worker.js.map");
+
+        deploy_fleet_in_order(
+            &pool,
+            &app.id,
+            None,
+            &celld,
+            &[render("tok")],
+            &FleetApp {
+                dir: &app_dir,
+                cwd: None,
+                timeout: Duration::from_secs(30),
+                sourcemap: Some(&map_path),
+            },
+        )
+        .await
+        .unwrap();
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 3, "{:?}", calls);
+        let flag = format!("--sourcemap {}", map_path.to_string_lossy());
+        assert!(
+            !calls[0].contains("--sourcemap"),
+            "the cohosted stage must not take --sourcemap: {:?}",
+            calls
+        );
+        assert!(
+            calls[1].starts_with("deploy ") && calls[1].contains(&flag),
+            "the app stage must carry {flag:?}: {:?}",
+            calls
+        );
+        assert!(
+            calls[2].starts_with("activate ") && !calls[2].contains("--sourcemap"),
+            "the activate must not take --sourcemap: {:?}",
+            calls
+        );
     }
 }

@@ -4,12 +4,14 @@
 //! the Errors tab symbolicates stacks at read time — for Worker and browser
 //! errors alike, with no upload step:
 //!
-//! * Worker: `celld deploy` bundles with esbuild but emits no map, so after a
-//!   successful deploy the runner re-runs celld's exact esbuild flags over the
-//!   same entry with `--sourcemap` added. That shadow bundle is discarded —
-//!   only its `.map` is kept, so the deployed bytes stay byte-identical — and
-//!   the result is chained through the build's own map when the entry carries
-//!   one (a Vite worker build already maps to the original sources).
+//! * Worker: the deploy passes `--sourcemap <path>` to `celld deploy`, which
+//!   writes the bundled Worker's external map with project-root-relative
+//!   sources (the deployed bytes are identical with or without the flag).
+//!   The runner stores that map, chained through the build's own map when
+//!   the entry carries one (a Vite worker build already maps to the original
+//!   sources). A missing map file means celld had nothing to map
+//!   (asset-only, `no_bundle`, or Python projects warn and write nothing),
+//!   so those deploys store no worker map.
 //! * Browser: only maps the app's build emitted are collected (e.g. Vite
 //!   `build.sourcemap: "hidden"`). Maps are never generated for client code,
 //!   and what the build serves publicly is unchanged.
@@ -37,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use super::errors::Frame;
-use super::{exec, s3};
+use super::s3;
 use crate::config::Config;
 use crate::db;
 
@@ -73,55 +75,10 @@ const MAX_FRAMES_PER_GET: usize = 256;
 /// Deploy sha dirs kept per target besides the just-finished one. Occurrences
 /// older than this still render — with their raw, unsymbolicated stacks.
 const KEEP_DEPLOY_SHAS: usize = 10;
-/// celld 0.6.2–0.6.3 `run_esbuild` externals (`BARE_NODE_BUILTINS` in
-/// `crates/celld/engine_api.rs`, re-exported by `js.rs`): node builtins stay
-/// external, the runtime provides them. Pinned here so the shadow bundle
-/// matches celld's; revisit on a celld bump (docker/check-versions.ts pins
-/// CELLD_VERSION).
-const ESBUILD_BARE_BUILTINS: &[&str] = &[
-    "assert",
-    "async_hooks",
-    "buffer",
-    "child_process",
-    "cluster",
-    "constants",
-    "crypto",
-    "dgram",
-    "diagnostics_channel",
-    "dns",
-    "events",
-    "fs",
-    "fs/promises",
-    "http",
-    "http2",
-    "https",
-    "inspector",
-    "module",
-    "net",
-    "os",
-    "path",
-    "perf_hooks",
-    "process",
-    "punycode",
-    "querystring",
-    "readline",
-    "sqlite",
-    "stream",
-    "string_decoder",
-    "timers",
-    "tls",
-    "tty",
-    "url",
-    "util",
-    "util/types",
-    "v8",
-    "vm",
-    "worker_threads",
-    "zlib",
-];
 
-/// Worker entry extensions the shadow esbuild run bundles. Anything else (a
-/// Python `main`, an asset-only app with no `main`) means no worker map.
+/// Worker entry extensions celld bundles (and maps with `--sourcemap`).
+/// Anything else (a Python `main`, an asset-only app with no `main`) means
+/// no worker map: celld warns and writes nothing.
 const BUNDLEABLE_EXTENSIONS: &[&str] = &["js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx"];
 
 /// What `maps/<sha>/manifest.json` records: the Worker bundle's map (when
@@ -631,99 +588,6 @@ fn map_object_key(prefix: &str, sha: &str, rel: &str) -> String {
     format!("{prefix}/{MAPS_DIR}/{sha}/{rel}")
 }
 
-/// celld's fleet pointer, minimally: which deployment is live. Only the
-/// prefix is needed — the deployed worker module always lands at
-/// `<fleet-prefix>/<prefix>/index.js` (celld names the module `index.js`).
-#[derive(Debug, serde::Deserialize)]
-struct DeployPointerRef {
-    #[serde(default)]
-    prefix: Option<String>,
-}
-
-/// The deployed worker bundle's key from the fleet pointer, or `None` when
-/// there is nothing to compare against (no pointer yet, unparseable, or a
-/// hostile/legacy pointer without a usable prefix).
-fn deployed_bundle_key(prefix: &str, pointer_json: &[u8]) -> Option<String> {
-    let pointer: DeployPointerRef = serde_json::from_slice(pointer_json).ok()?;
-    let dir = pointer
-        .prefix
-        .filter(|p| !p.is_empty() && !p.contains(".."))?;
-    Some(format!("{prefix}/{dir}/index.js"))
-}
-
-/// The shadow bundle minus esbuild's trailing sourcemap comment (celld
-/// deploys without `--sourcemap`, so its bytes never carry that line).
-/// Trailing newlines are ignored on both sides: they move no mapping.
-fn shadow_bundle_body(bundle: &[u8]) -> &[u8] {
-    let mut body = bundle;
-    if let Some(at) = body
-        .windows(b"//# sourceMappingURL=".len())
-        .rposition(|w| w == b"//# sourceMappingURL=")
-    {
-        // The comment is always the last line esbuild emits; anything after
-        // it would be a real difference, so only strip to the line start.
-        if let Some(line_start) = body[..at].iter().rposition(|b| *b == b'\n') {
-            body = &body[..line_start];
-        }
-    }
-    trim_trailing_newlines(body)
-}
-
-fn trim_trailing_newlines(mut bytes: &[u8]) -> &[u8] {
-    while bytes.last() == Some(&b'\n') {
-        bytes = &bytes[..bytes.len() - 1];
-    }
-    bytes
-}
-
-/// Byte identity between the shadow bundle and the deployed module (modulo
-/// the sourcemap comment): the proof the maps describe the served bytes.
-fn shadow_matches_deployed(shadow: &[u8], deployed: &[u8]) -> bool {
-    shadow_bundle_body(shadow) == trim_trailing_newlines(deployed)
-}
-
-/// The deployed worker bundle, or `None` when it cannot be fetched and
-/// parsed within the read cap. Small by construction (worker bundles, not
-/// client assets); anything bigger fails the check instead of eating memory.
-async fn fetch_deployed_bundle(cfg: &Config, bucket: &str, prefix: &str) -> Option<Vec<u8>> {
-    let pointer_key = format!("{prefix}/deploy/current.json");
-    let head = s3::s3_head_object(cfg, bucket, &pointer_key).await?;
-    if head.size < 0 || head.size as u64 > MAX_MAP_BYTES {
-        return None;
-    }
-    let raw = s3::s3_get_bytes(cfg, &pointer_key).await.ok()?;
-    let key = deployed_bundle_key(prefix, &raw)?;
-    let head = s3::s3_head_object(cfg, bucket, &key).await?;
-    if head.size < 0 || head.size as u64 > MAX_MAP_BYTES {
-        return None;
-    }
-    s3::s3_get_bytes(cfg, &key).await.ok()
-}
-
-/// Verify the shadow bundle against the module celld actually deployed
-/// before storing its map: a celld bump that changes bundling (flags,
-/// banner, loaders) would otherwise shift every Worker mapping with no test
-/// catching it (the e2e pins one position, this pins the bytes).
-/// `Ok` stores; `Err(note)` skips the worker map with a deploy-log note.
-async fn verified_worker_map(
-    cfg: &Config,
-    bucket: &str,
-    prefix: &str,
-    built: &WorkerMap,
-) -> Result<(), String> {
-    if built.bundle.len() as u64 > MAX_MAP_BYTES {
-        return Err("deployed bundle over 8 MiB (unverified)".to_string());
-    }
-    let deployed = fetch_deployed_bundle(cfg, bucket, prefix)
-        .await
-        .ok_or_else(|| "deployed bundle unreadable".to_string())?;
-    if shadow_matches_deployed(&built.bundle, &deployed) {
-        Ok(())
-    } else {
-        Err("shadow bundle differs from the deployed bundle".to_string())
-    }
-}
-
 /// A deploy's manifest. `Missing` (never stored, oversize, unparseable) is
 /// cached negative; `Transient` (the store hiccuped) is never cached.
 async fn fetch_manifest(cfg: &Config, prefix: &str, sha: &str) -> FetchOutcome<Arc<MapManifest>> {
@@ -787,14 +651,13 @@ async fn fetch_map(
     }
 }
 
-/// The Worker's map inputs: the deploy root's entry (as celld resolves it)
-/// plus whether celld deploys it as-is (`no_bundle`) instead of bundling.
+/// The Worker's map input: the deploy root's entry (as celld resolves it),
+/// whose sibling map the celld map chains through when the build emitted one.
 struct WorkerEntry {
     /// Entry relative to the deploy root, as `main` names it.
     rel: PathBuf,
     /// Entry resolved inside the deploy root.
     abs: PathBuf,
-    no_bundle: bool,
 }
 
 /// celld's entry resolution, minimally: `main` from the deploy root's Wrangler
@@ -818,28 +681,21 @@ fn worker_entry(deploy_root: &Path) -> anyhow::Result<Option<WorkerEntry>> {
     if !BUNDLEABLE_EXTENSIONS.contains(&name) {
         return Ok(None);
     }
-    Ok(Some(WorkerEntry {
-        rel: main,
-        abs,
-        no_bundle: config.no_bundle,
-    }))
+    Ok(Some(WorkerEntry { rel: main, abs }))
 }
 
 /// The deploy root's Wrangler file, minimally: `main` (required — an
-/// asset-only app has no worker to map) plus whether celld deploys it as-is
-/// (`no_bundle`) instead of bundling, and the assets directory the client
+/// asset-only app has no worker to map) and the assets directory the client
 /// maps live under (for exact frame→map matching; TOML `[assets]` tables are
 /// skipped and then matching falls back to full keys).
 struct DeployWorkerConfig {
     main: Option<PathBuf>,
-    no_bundle: bool,
     assets_dir: Option<String>,
 }
 
 /// The deploy root's Wrangler file, minimally: parsed like the runner's other
-/// config reads for JSON(C); TOML gets a line scan (only `main` and
-/// `no_bundle` there — a TOML `[assets]` table is skipped and matching falls
-/// back to full keys).
+/// config reads for JSON(C); TOML gets a line scan (only `main` there — a
+/// TOML `[assets]` table is skipped and matching falls back to full keys).
 fn read_worker_config(deploy_root: &Path) -> anyhow::Result<DeployWorkerConfig> {
     for name in ["wrangler.jsonc", "wrangler.json"] {
         let Ok(text) = std::fs::read_to_string(deploy_root.join(name)) else {
@@ -852,10 +708,6 @@ fn read_worker_config(deploy_root: &Path) -> anyhow::Result<DeployWorkerConfig> 
             .get("main")
             .and_then(|m| m.as_str())
             .map(PathBuf::from);
-        let no_bundle = value
-            .get("no_bundle")
-            .and_then(|b| b.as_bool())
-            .unwrap_or(false);
         // Normalized through path segments: configs write `"./public"` or
         // `"./dist/client"`, while manifest keys are deploy-root-relative
         // (`public/...`) — a kept `./` prefix would never exact-match. `.`
@@ -874,35 +726,26 @@ fn read_worker_config(deploy_root: &Path) -> anyhow::Result<DeployWorkerConfig> 
             })
             .filter(|segs| !segs.is_empty() && !segs.iter().any(|s| s == ".."))
             .map(|segs| segs.join("/"));
-        return Ok(DeployWorkerConfig {
-            main,
-            no_bundle,
-            assets_dir,
-        });
+        return Ok(DeployWorkerConfig { main, assets_dir });
     }
     let toml = deploy_root.join("wrangler.toml");
     let Ok(text) = std::fs::read_to_string(&toml) else {
         return Ok(DeployWorkerConfig {
             main: None,
-            no_bundle: false,
             assets_dir: None,
         });
     };
     let mut main = None;
-    let mut no_bundle = false;
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("main") {
             if let Some(value) = toml_string(rest) {
                 main = Some(PathBuf::from(value));
             }
-        } else if let Some(rest) = line.strip_prefix("no_bundle") {
-            no_bundle = rest.split('=').nth(1).is_some_and(|v| v.trim() == "true");
         }
     }
     Ok(DeployWorkerConfig {
         main,
-        no_bundle,
         assets_dir: None,
     })
 }
@@ -916,100 +759,8 @@ fn toml_string(rest: &str) -> Option<&str> {
         .filter(|s| !s.contains('"'))
 }
 
-/// The esbuild the image builds workers with: celld's `CELLD_ESBUILD` sidecar
-/// when set, else `esbuild` on PATH — the same resolution celld's
-/// `run_esbuild` uses.
-fn esbuild_bin() -> String {
-    std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string())
-}
-
-/// celld 0.6.2–0.6.3's CommonJS-builtin bridge, passed as `--banner:js` so the
-/// shadow bundle is byte-identical to the deployed one (Apache-2.0,
-/// denoland/celld `crates/celld/deploy.rs` `run_esbuild`; without it every
-/// mapping sits nine lines too early).
-const ESBUILD_BANNER: &str = "var require = (id) => {\n  const name = String(id);\n  const builtin = process.getBuiltinModule(name);\n  if (builtin === undefined) {\n    const error = new Error(`Cannot find module '${name}'`);\n    error.code = \"MODULE_NOT_FOUND\";\n    throw error;\n  }\n  return builtin;\n};";
-
-/// celld 0.6.2–0.6.3's exact bundle flags plus `--sourcemap`: the shadow bundle must
-/// map the same bytes celld deployed, so every flag that shapes the output is
-/// mirrored (no `--minify`: celld does not minify either). Wrangler
-/// `define`/`rules` need no mirroring: the runner strips those keys before
-/// `celld deploy`, so celld always runs on its `BundleConfig` defaults (empty
-/// defines, `.wasm=copy`) — the same flags below.
-fn esbuild_args(entry: &str, outdir: &str) -> Vec<String> {
-    let mut args = vec![
-        entry.to_string(),
-        "--bundle".to_string(),
-        "--format=esm".to_string(),
-        "--platform=browser".to_string(),
-        "--target=es2024".to_string(),
-        "--conditions=workerd,worker,browser".to_string(),
-        format!("--banner:js={ESBUILD_BANNER}"),
-        "--external:node:*".to_string(),
-        "--external:cloudflare:*".to_string(),
-        "--loader:.wasm=copy".to_string(),
-        format!("--outdir={outdir}"),
-        "--entry-names=index".to_string(),
-        "--sourcemap".to_string(),
-    ];
-    args.extend(
-        ESBUILD_BARE_BUILTINS
-            .iter()
-            .map(|specifier| format!("--external:{specifier}")),
-    );
-    args
-}
-
-/// Sources in a shadow map point at the temp outdir's neighborhood; rewrite
-/// them root-relative so the stored map names repo paths, not build dirs.
-fn normalize_sources(
-    root: &Path,
-    outdir: &Path,
-    sm: &sourcemap::SourceMap,
-) -> sourcemap::SourceMap {
-    let mut builder = sourcemap::SourceMapBuilder::new(None);
-    for token in sm.tokens() {
-        let source = token
-            .get_source()
-            .map(|s| relativize_source(root, outdir, s));
-        builder.add(
-            token.get_dst_line(),
-            token.get_dst_col(),
-            token.get_src_line(),
-            token.get_src_col(),
-            source.as_deref(),
-            token.get_name(),
-            false,
-        );
-    }
-    builder.into_sourcemap()
-}
-
-/// A map source as a deploy-root-relative path when it resolves inside the
-/// root, else unchanged (absolute build paths never leak into storage when
-/// the file is where the bundle read it from). Relative sources resolve
-/// against the project root first — esbuild usually records them relative to
-/// its working directory — then against the map's own directory.
-fn relativize_source(root: &Path, outdir: &Path, source: &str) -> String {
-    let candidate = Path::new(source);
-    if candidate.is_absolute() {
-        return strip_to_root(root, candidate).unwrap_or_else(|| source.to_string());
-    }
-    [root, outdir]
-        .into_iter()
-        .filter_map(|base| base.join(candidate).canonicalize().ok())
-        .find_map(|abs| strip_to_root(root, &abs))
-        .unwrap_or_else(|| source.to_string())
-}
-
-/// `abs` as a root-relative slash path, when it lives inside the root.
-fn strip_to_root(root: &Path, abs: &Path) -> Option<String> {
-    abs.strip_prefix(root)
-        .ok()
-        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
-}
-
 /// Fold the build's own map (when the entry carries a sibling `.map`) into
-/// the shadow map: tokens the shadow bundle read from the entry file resolve
+/// the celld map: tokens the bundle read from the entry file resolve
 /// through the entry's map to the original sources, everything else stays.
 /// Both maps are 0-based; the composed map names the build's sources.
 /// Token counts are capped ([`MAX_CHAIN_TOKENS`]): past that the outer map
@@ -1077,7 +828,7 @@ pub fn chain_maps(
     builder.into_sourcemap()
 }
 
-/// The shadow map's entry source, root-relative after normalization; the
+/// The celld map's entry source, already project-root-relative; the
 /// config may prefix the entry with `./`, so compare without the dot. No
 /// basename fallback: an entry named `index.js` must not claim a
 /// dependency's same-named file.
@@ -1206,142 +957,71 @@ async fn read_capped_map(path: &Path) -> Option<Vec<u8>> {
     fits_map_bytes(bytes.len() as u64).then_some(bytes)
 }
 
-/// A built worker map plus the exact bundle bytes it was composed for: the
-/// store verifies the shadow bundle against the deployed module before
-/// storing, so a celld bump that changes bundling can never silently shift
-/// every Worker mapping.
+/// The Worker map celld wrote for this deploy, ready to store.
 #[derive(Debug)]
 pub(crate) struct WorkerMap {
     pub map: Vec<u8>,
-    /// The shadow bundle (or the entry itself for `no_bundle`), minus the
-    /// trailing `//# sourceMappingURL=` comment esbuild appends to its own
-    /// output — celld deploys without `--sourcemap`, so its bytes never
-    /// carry that line.
-    pub bundle: Vec<u8>,
     pub note: String,
 }
 
-/// Build the Worker map: the shadow esbuild map (chained through the entry's
-/// own map when the build emitted one), or the entry's sibling map directly
-/// when celld deploys the entry as-is (`no_bundle`). `None` when there is no
-/// bundleable entry — asset-only apps and non-JS workers map nothing. Runs
-/// while the tree is still the build uid's (the deploy task calls it before
-/// taking the tree back); the bytes upload only after a successful deploy.
-pub(crate) async fn build_worker_map(
+/// Read the Worker map `celld deploy --sourcemap` wrote: chained through the
+/// entry's own map when the build emitted one (a Vite worker build already
+/// maps to the original sources), sanitized like any stored map. `None` when
+/// the map file is missing — celld warns and writes nothing for asset-only,
+/// `no_bundle`, and Python projects, so those deploys store no worker map.
+/// Runs after a successful deploy; the bytes upload with the rest of the maps.
+pub(crate) async fn read_celld_worker_map(
     deploy_root: &Path,
-    sandbox: &exec::Sandbox<'_>,
+    map_path: &Path,
 ) -> anyhow::Result<Option<WorkerMap>> {
+    let map_bytes = match tokio::fs::read(map_path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("read the celld source map"),
+    };
+    if !fits_map_bytes(map_bytes.len() as u64) {
+        anyhow::bail!("celld source map over 8 MiB");
+    }
+    let outer =
+        sourcemap::SourceMap::from_slice(&map_bytes).context("parse the celld source map")?;
+    // celld's sources are already project-root-relative, so the map chains
+    // directly; without a bundleable entry there is no sibling to chain
+    // through and the map stores as written.
     let Some(entry) = worker_entry(deploy_root)? else {
-        return Ok(None);
+        let mut out = Vec::new();
+        sanitize_sources(&outer).to_writer(&mut out)?;
+        return Ok(Some(WorkerMap {
+            map: out,
+            note: "celld map".to_string(),
+        }));
     };
     let sibling_map = entry.abs.with_file_name(format!(
         "{}.map",
         entry.abs.file_name().unwrap_or_default().to_string_lossy()
     ));
     let sibling_bytes = read_capped_map(&sibling_map).await;
-    if entry.no_bundle {
-        // celld uploads the entry as written: its sibling map already maps
-        // the deployed bytes, no shadow bundle needed. Parsed and sanitized
-        // like any stored map; an unparseable sibling maps nothing.
-        let Some(bytes) = sibling_bytes else {
-            return Ok(None);
-        };
-        let Ok(inner) = sourcemap::SourceMap::from_slice(&bytes) else {
-            return Ok(None);
-        };
-        let mut out = Vec::new();
-        sanitize_sources(&inner).to_writer(&mut out)?;
-        let bundle = tokio::fs::read(&entry.abs).await?;
-        return Ok(Some(WorkerMap {
-            map: out,
-            bundle,
-            note: "entry map (no_bundle)".to_string(),
-        }));
-    }
-    run_shadow_esbuild(deploy_root, &entry, sandbox, sibling_bytes).await
-}
-/// Run the shadow esbuild the way the build runs: sandboxed as the build uid
-/// (the deploy task calls this before taking the worktree back, while the
-/// tree is still the build uid's — afterwards the runner-owned tree would
-/// be unreadable to it under the install's umask). Nothing the child reads
-/// leaves the bundle — and with `sanitize_sources` not even absolute host
-/// paths reach storage.
-async fn run_shadow_esbuild(
-    deploy_root: &Path,
-    entry: &WorkerEntry,
-    sandbox: &exec::Sandbox<'_>,
-    sibling_bytes: Option<Vec<u8>>,
-) -> anyhow::Result<Option<WorkerMap>> {
-    let Some(entry_arg) = entry.rel.to_str() else {
-        anyhow::bail!("worker entry is not valid UTF-8");
-    };
-    // Inside the sandbox-owned tmp dir: `run_sandboxed` creates and chowns
-    // `.tmp-sandbox` for the build uid, so the child can write its outdir
-    // there.
-    let outdir = deploy_root.join(".tmp-sandbox").join("shadow-maps");
-    let Some(outdir_arg) = outdir.to_str() else {
-        anyhow::bail!("esbuild outdir is not valid UTF-8");
-    };
-    let args = esbuild_args(entry_arg, outdir_arg);
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    exec::run_sandboxed(
-        &esbuild_bin(),
-        &refs,
-        deploy_root,
-        sandbox,
-        Duration::from_secs(120),
-    )
-    .await
-    .context("shadow esbuild for the worker map")?;
-    let map_bytes = tokio::fs::read(outdir.join("index.js.map"))
-        .await
-        .context("shadow esbuild wrote no map")?;
-    // Normalize while the outdir still exists: entry sources are recorded
-    // relative to it, and canonicalizing them away needs the tree in place
-    // (deleting `.tmp-sandbox` first strands every `../..` source).
-    let outer = sourcemap::SourceMap::from_slice(&map_bytes).context("parse shadow map")?;
-    let root = deploy_root
-        .canonicalize()
-        .unwrap_or_else(|_| deploy_root.to_path_buf());
-    let normalized = normalize_sources(&root, &outdir, &outer);
     let entry_source = entry.rel.to_string_lossy().replace('\\', "/");
     let (composed, note) = match sibling_bytes {
         Some(bytes) => match sourcemap::SourceMap::from_slice(&bytes) {
             Ok(inner) => {
-                let chained = chain_maps(&normalized, &inner, &entry_source);
-                // Deploy-log diagnostics: the entry the shadow was chained
+                let chained = chain_maps(&outer, &inner, &entry_source);
+                // Deploy-log diagnostics: the entry the celld map was chained
                 // through, plus both maps' source sets (first few), so a
                 // mismatch is diagnosable from the deploy log alone.
                 let note = format!(
-                    "shadow map chained through the build map (entry {entry_source}; outer {:?}; inner {:?})",
-                    distinct_sources(&normalized, 3),
+                    "celld map chained through the build map (entry {entry_source}; outer {:?}; inner {:?})",
+                    distinct_sources(&outer, 3),
                     distinct_sources(&inner, 3),
                 );
                 (chained, note)
             }
-            Err(_) => (
-                normalized,
-                "shadow map (build map did not parse)".to_string(),
-            ),
+            Err(_) => (outer, "celld map (build map did not parse)".to_string()),
         },
-        None => (normalized, "shadow map".to_string()),
+        None => (outer, "celld map".to_string()),
     };
     let mut out = Vec::new();
     sanitize_sources(&composed).to_writer(&mut out)?;
-    // Read the bundle before dropping the outdir below.
-    let bundle = tokio::fs::read(outdir.join("index.js")).await.ok();
-    let Some(bundle) = bundle else {
-        anyhow::bail!("shadow esbuild wrote no bundle");
-    };
-    // The worktree is wiped right after a successful deploy, but a failed one
-    // keeps it for inspection: drop the sandbox tmp dir either way so no
-    // `index.js.map` decoy sits beside the real entry map.
-    let _ = tokio::fs::remove_dir_all(deploy_root.join(".tmp-sandbox")).await;
-    Ok(Some(WorkerMap {
-        map: out,
-        bundle,
-        note,
-    }))
+    Ok(Some(WorkerMap { map: out, note }))
 }
 
 /// Drop absolute host paths (symlink escapes, build-host absolutes) down to
@@ -1507,13 +1187,6 @@ pub async fn store_deploy_maps(
         anyhow::bail!("bucket {bucket_uri} is outside this install");
     };
     let maps_prefix = prefix;
-    // The fleet's own prefix (the maps dir's parent): where celld's deploy
-    // pointer and modules live. Always present — it is `maps_prefix` minus
-    // the `/maps/<sha>` this function appended.
-    let fleet_prefix = maps_prefix
-        .strip_suffix(&format!("/maps/{sha}"))
-        .unwrap_or(&maps_prefix)
-        .to_string();
 
     let mut manifest = MapManifest::default();
     let mut notes = Vec::new();
@@ -1535,17 +1208,14 @@ pub async fn store_deploy_maps(
     match worker_map {
         Ok(Some(built)) => {
             worker_bytes = built.map.len() as u64;
-            match verified_worker_map(cfg, &cfg.s3_bucket, &fleet_prefix, &built).await {
-                Ok(()) => {
-                    let key = format!("{maps_prefix}/{WORKER_MAP_FILE}");
-                    put_bytes(cfg, &key, &built.map).await?;
-                    manifest.worker = Some(WORKER_MAP_FILE.to_string());
-                    notes.push(format!("{} ({})", WORKER_MAP_FILE, built.note));
-                }
-                Err(note) => notes.push(format!("{WORKER_MAP_FILE} skipped ({note})")),
-            }
+            let key = format!("{maps_prefix}/{WORKER_MAP_FILE}");
+            put_bytes(cfg, &key, &built.map).await?;
+            manifest.worker = Some(WORKER_MAP_FILE.to_string());
+            notes.push(format!("{} ({})", WORKER_MAP_FILE, built.note));
         }
-        Ok(None) => notes.push("no worker map (no bundleable entry)".to_string()),
+        Ok(None) => notes.push(
+            "no worker map (celld wrote no map: asset-only, no_bundle, or Python)".to_string(),
+        ),
         Err(note) => notes.push(format!("no worker map ({note})")),
     }
 
@@ -1691,44 +1361,48 @@ async fn put_bytes(cfg: &Config, key: &str, bytes: &[u8]) -> anyhow::Result<()> 
 mod tests {
     use super::*;
 
-    /// Real-tool fixtures, generated once with esbuild 0.25.12 over the vite
-    /// sample build (0.28.2 regenerates the shadow map byte for byte): the
-    /// shadow map the runner would store for a deploy, and the Vite worker map
-    /// it chains through.
-    /// Assert exact composed positions: this is the composition the Errors
-    /// tab reads at `errors.get` time.
-    const FIXTURE_SHADOW_MAP: &[u8] =
-        include_bytes!("testdata/sourcemaps/approot/.tmp-sandbox/shadow-maps/shadow.js.map.txt");
-    const FIXTURE_ENTRY_MAP: &[u8] =
-        include_bytes!("testdata/sourcemaps/approot/vite_sample/entry.js.map.txt");
-    const FIXTURE_ENTRY_JS: &[u8] =
-        include_bytes!("testdata/sourcemaps/approot/vite_sample/entry.js.txt");
-
-    #[test]
-    fn real_shadow_map_chains_to_original_sources() {
-        // Mirror the deploy layout the store sees: deploy root with the
-        // worker entry beside its map, and the shadow outdir two levels
-        // below it (so the shadow map's `../../` sources resolve).
+    /// The deploy layout the read sees: the map celld wrote (sources already
+    /// project-root-relative) beside a deploy root whose built entry carries
+    /// its own sibling map. The stored map chains through the sibling to the
+    /// original sources — assert exact composed positions, the composition
+    /// the Errors tab reads at `errors.get` time.
+    #[tokio::test]
+    async fn celld_map_chains_through_the_build_map() {
         let dir =
             std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
-        let root = dir.join("dist");
-        let outdir = root.join(".tmp-sandbox").join("shadow-maps");
-        std::fs::create_dir_all(&outdir).expect("shadow dir");
-        std::fs::create_dir_all(root.join("vite_sample")).expect("entry dir");
-        std::fs::write(root.join("vite_sample").join("index.js"), FIXTURE_ENTRY_JS).expect("entry");
-        let root = root.canonicalize().expect("canonical root");
-        let outer = sourcemap::SourceMap::from_slice(FIXTURE_SHADOW_MAP).expect("parse shadow map");
-        // Normalization names repo-relative paths, never the temp dir.
-        let norm = normalize_sources(&root, &outdir, &outer);
-        assert!(norm
-            .tokens()
-            .filter_map(|t| t.get_source())
-            .all(|s| s == "vite_sample/index.js"));
-        let inner = sourcemap::SourceMap::from_slice(FIXTURE_ENTRY_MAP).expect("parse entry map");
-        let chained = chain_maps(&norm, &inner, "vite_sample/index.js");
-        // The store sanitizes before upload; the sanitized map must still
-        // resolve (relative sources survive, absolute ones do not).
-        let stored = sanitize_sources(&chained);
+        let root = dir.join("app");
+        std::fs::create_dir_all(root.join("dist")).expect("entry dir");
+        std::fs::write(
+            root.join("wrangler.jsonc"),
+            "// config\n{\"main\": \"./dist/worker.js\"}\n",
+        )
+        .expect("config");
+        std::fs::write(root.join("dist").join("worker.js"), "console.log(1);").expect("entry");
+        // The build's own map: built entry line 10 → original source line 2.
+        let mut inner_bytes = Vec::new();
+        built_map(&[((10, 3), ("src/index.ts", 2, 0), Some("realFn"))])
+            .to_writer(&mut inner_bytes)
+            .expect("inner map");
+        std::fs::write(root.join("dist").join("worker.js.map"), &inner_bytes).expect("sibling");
+        // celld's map: deployed bundle line 0 → built entry line 10, with
+        // the project-root-relative source celld writes.
+        let mut outer_bytes = Vec::new();
+        built_map(&[((0, 5), ("dist/worker.js", 10, 3), Some("bundleFn"))])
+            .to_writer(&mut outer_bytes)
+            .expect("outer map");
+        let map_path = dir.join("worker.js.map");
+        std::fs::write(&map_path, &outer_bytes).expect("celld map");
+
+        let built = read_celld_worker_map(&root, &map_path)
+            .await
+            .expect("readable")
+            .expect("a map");
+        assert!(
+            built.note.contains("chained through the build map"),
+            "unexpected note: {}",
+            built.note
+        );
+        let stored = sourcemap::SourceMap::from_slice(&built.map).expect("stored map parses");
         let manifest = MapManifest {
             worker: Some("worker.js.map".to_string()),
             assets_dir: None,
@@ -1736,7 +1410,7 @@ mod tests {
         };
         let load = |_: &str| Some(Arc::new(stored.clone()));
         // The deployed throw site, 1-based as V8 prints it.
-        let mut frames = vec![frame_at("worker.js:17:46")];
+        let mut frames = vec![frame_at("worker.js:1:6")];
         let mut budget = SymbolicateBudget::for_read();
         assert_eq!(
             symbolicate_with(&mut frames, &manifest, &load, &mut budget),
@@ -1744,7 +1418,42 @@ mod tests {
         );
         assert_eq!(
             frames[0].mapped_location.as_deref(),
-            Some("../../src/index.ts:14:13")
+            Some("src/index.ts:3:1")
+        );
+        assert_eq!(frames[0].mapped_function.as_deref(), Some("realFn"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn missing_celld_map_means_no_worker_map() {
+        // celld warns and writes nothing for asset-only, `no_bundle`, and
+        // Python projects: a missing file is `None`, never an error.
+        let dir =
+            std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join("wrangler.json"), "{\"main\": \"./worker.js\"}").expect("config");
+        let found = read_celld_worker_map(&dir, &dir.join("worker.js.map"))
+            .await
+            .expect("missing is not an error");
+        assert!(found.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unparseable_celld_map_fails_the_worker_map() {
+        // A corrupt map must not store: the deploy logs the note and keeps
+        // serving raw stacks instead of shifting every mapping.
+        let dir =
+            std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let map_path = dir.join("worker.js.map");
+        std::fs::write(&map_path, "{ not a map").expect("corrupt map");
+        let err = read_celld_worker_map(&dir, &map_path)
+            .await
+            .expect_err("a corrupt map fails the read");
+        assert!(
+            format!("{err:#}").contains("parse the celld source map"),
+            "unexpected error: {err:#}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2185,7 +1894,7 @@ mod tests {
 
     #[test]
     fn chaining_resolves_through_the_build_map() {
-        // Shadow map: deployed bundle line 0 → built entry line 10.
+        // celld map: deployed bundle line 0 → built entry line 10.
         let outer = built_map(&[((0, 5), ("dist/app/index.js", 10, 3), Some("bundleFn"))]);
         // Build map: built entry line 10 → original source line 2.
         let inner = built_map(&[((10, 3), ("src/index.ts", 2, 0), Some("realFn"))]);
@@ -2291,39 +2000,6 @@ mod tests {
         assert!(keep.len() <= KEEP_DEPLOY_SHAS + 1);
     }
 
-    #[test]
-    fn deployed_bundle_key_comes_from_the_fleet_pointer() {
-        let pointer = br#"{"script_name":"shop","version":"abc123","prefix":"deploy/shop/abc123","rollout":{"percent":100}}"#;
-        assert_eq!(
-            deployed_bundle_key("fleets/shop", pointer),
-            Some("fleets/shop/deploy/shop/abc123/index.js".to_string())
-        );
-        // Legacy or hostile pointers without a usable prefix: nothing to
-        // compare against, so the guard skips instead of fetching sideways.
-        assert_eq!(deployed_bundle_key("fleets/a", b"{}"), None);
-        assert_eq!(
-            deployed_bundle_key("fleets/a", b"{\"prefix\":\"../evil\"}"),
-            None
-        );
-        assert_eq!(deployed_bundle_key("fleets/a", b"not json"), None);
-    }
-
-    #[test]
-    fn shadow_matches_deployed_ignores_only_the_trailing_comment() {
-        let deployed = b"var a = 1;\nconsole.log(a);\n";
-        let mut shadow = deployed.to_vec();
-        shadow.extend_from_slice(b"//# sourceMappingURL=index.js.map\n");
-        assert!(shadow_matches_deployed(&shadow, deployed));
-        assert!(shadow_matches_deployed(deployed, deployed));
-        // A real content difference — e.g. a celld banner change — fails
-        // closed so the maps never describe the wrong bytes.
-        let mut drifted = b"var require = (id) => {};\n".to_vec();
-        drifted.extend_from_slice(deployed);
-        drifted.extend_from_slice(b"//# sourceMappingURL=index.js.map\n");
-        assert!(!shadow_matches_deployed(&drifted, deployed));
-        assert!(!shadow_matches_deployed(b"var a = 1;\n", b"var a = 2;\n"));
-    }
-
     #[tokio::test]
     async fn fetch_map_confines_hostile_manifest_entries() {
         // `..` and absolute rels never reach S3 (no IO happens for these).
@@ -2354,29 +2030,6 @@ mod tests {
     }
 
     #[test]
-    fn sources_resolve_against_the_project_root_first() {
-        let root =
-            std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(root.join("src")).expect("temp dir");
-        std::fs::write(root.join("src/app.ts"), "export {}").expect("source");
-        let outdir =
-            std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&outdir).expect("outdir");
-        // esbuild records inputs relative to its working directory (the
-        // root), not to the temp outdir the map lands in.
-        assert_eq!(
-            relativize_source(&root, &outdir, "src/app.ts"),
-            "src/app.ts"
-        );
-        assert_eq!(
-            relativize_source(&root, &outdir, "src/missing.ts"),
-            "src/missing.ts"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&outdir);
-    }
-
-    #[test]
     fn worker_entry_reads_wrangler_main() {
         let dir =
             std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
@@ -2384,12 +2037,11 @@ mod tests {
         std::fs::write(dir.join("entry.ts"), "export default {}").expect("entry");
         std::fs::write(
             dir.join("wrangler.jsonc"),
-            "// config\n{\"main\": \"./entry.ts\", \"no_bundle\": false}\n",
+            "// config\n{\"main\": \"./entry.ts\"}\n",
         )
         .expect("config");
         let found = worker_entry(&dir).expect("entry").expect("some");
         assert_eq!(found.rel, PathBuf::from("./entry.ts"));
-        assert!(!found.no_bundle);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
