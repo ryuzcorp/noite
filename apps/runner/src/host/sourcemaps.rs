@@ -958,21 +958,47 @@ fn fits_map_bytes(len: u64) -> bool {
     len <= MAX_MAP_BYTES
 }
 
-/// Read a map file capped at [`MAX_MAP_BYTES`]: the metadata gate keeps a
-/// huge sibling out of memory, and the post-read check covers the TOCTOU
-/// window. `None` on any IO error or oversize. Never follows symlinks: the
-/// tree is tenant-built, so a `dist/leak.map -> /data/<secret>` link must
-/// not become a stored map.
-async fn read_capped_map(path: &Path) -> Option<Vec<u8>> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
+/// Open `path` without following a final symlink and read at most
+/// [`MAX_MAP_BYTES`]. `Ok(None)` when the file is missing; an error for a
+/// symlink, a non-regular file, or an oversize file. Refusal and cap hold
+/// against a concurrent writer: the checks run on the opened descriptor, and
+/// the read stops one byte past the cap whatever the file grows to.
+async fn read_regular_capped(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    use tokio::io::AsyncReadExt;
+    let file = match tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .await
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // O_NOFOLLOW on a symlink answers ELOOP.
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(std::io::Error::other("not a regular file"));
+        }
+        Err(e) => return Err(e),
+    };
+    let meta = file.metadata().await?;
     if !meta.file_type().is_file() {
-        return None;
+        return Err(std::io::Error::other("not a regular file"));
     }
     if !fits_map_bytes(meta.len()) {
-        return None;
+        return Err(std::io::Error::other("over 8 MiB"));
     }
-    let bytes = tokio::fs::read(path).await.ok()?;
-    fits_map_bytes(bytes.len() as u64).then_some(bytes)
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_MAP_BYTES + 1).read_to_end(&mut bytes).await?;
+    if !fits_map_bytes(bytes.len() as u64) {
+        return Err(std::io::Error::other("over 8 MiB"));
+    }
+    Ok(Some(bytes))
+}
+
+/// Read a map file from the tenant-built tree, capped at [`MAX_MAP_BYTES`].
+/// `None` on any IO error, oversize, or symlink: a `dist/leak.map ->
+/// /data/<secret>` link must not become a stored map.
+async fn read_capped_map(path: &Path) -> Option<Vec<u8>> {
+    read_regular_capped(path).await.ok().flatten()
 }
 
 /// The Worker map celld wrote for this deploy, ready to store.
@@ -993,27 +1019,15 @@ pub(crate) async fn read_celld_worker_map(
     map_path: &Path,
 ) -> anyhow::Result<Option<WorkerMap>> {
     // Never follow symlinks and never read past the cap into memory: the
-    // deploy unlinks this path before celld runs, but a planted link that
+    // deploy removes this path before celld runs, but a planted link that
     // survived (or a rerun against a dirty work dir) must not become a
-    // stored map or a memory spike. No tenant process runs this late, so
-    // the metadata and the read below cannot straddle a swap.
-    let meta = match std::fs::symlink_metadata(map_path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).context("read the celld source map"),
-    };
-    if !meta.file_type().is_file() {
-        anyhow::bail!("refusing to read the celld source map: not a regular file");
-    }
-    if !fits_map_bytes(meta.len()) {
-        anyhow::bail!("celld source map over 8 MiB");
-    }
-    let map_bytes = tokio::fs::read(map_path)
+    // stored map or a memory spike.
+    let Some(map_bytes) = read_regular_capped(map_path)
         .await
-        .context("read the celld source map")?;
-    if !fits_map_bytes(map_bytes.len() as u64) {
-        anyhow::bail!("celld source map over 8 MiB");
-    }
+        .context("read the celld source map")?
+    else {
+        return Ok(None);
+    };
     let outer =
         sourcemap::SourceMap::from_slice(&map_bytes).context("parse the celld source map")?;
     // celld's sources are already project-root-relative, so the map chains

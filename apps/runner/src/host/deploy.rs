@@ -1175,9 +1175,15 @@ async fn deploy_inner(
     // unmapped projects, or a symlink celld's runner-owned write would
     // follow. The tree is runner-owned again by now and no tenant process
     // runs past this point, so drop whatever sits there: whatever celld
-    // writes afterwards is its own.
+    // writes afterwards is its own. If anything survives, refuse to deploy:
+    // celld's write would follow a surviving symlink.
     let _ = tokio::fs::remove_file(&worker_map_path).await;
     let _ = tokio::fs::remove_dir_all(&worker_map_path).await;
+    match tokio::fs::symlink_metadata(&worker_map_path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => anyhow::bail!("could not clear the worker source map path before deploy"),
+        Err(e) => return Err(e).context("check the worker source map path before deploy"),
+    }
     let stats = void_cohost::deploy_fleet_in_order(
         pool,
         &app.id,
