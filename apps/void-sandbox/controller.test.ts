@@ -1,5 +1,5 @@
 // Controller: the DO-stub service shape, the tenant-reachable method gate,
-// the celld start/exec adaptation, abort→kill, the shim probe, fetch
+// the celld start/exec adaptation, signal passthrough, the shim probe, fetch
 // activity, and the admission wiring. The classes under test are the real
 // bundle classes over the real `void/_sandbox-container` base.
 /* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-known-value-widening -- tests narrow unknown RPC results and reach white-box seams; every cast is asserted immediately. */
@@ -252,14 +252,14 @@ describe("celld start", () => {
   });
 });
 
-describe("abort maps to kill", () => {
-  test("closing the abort carrier kills the process (end to end)", async () => {
+describe("signal passthrough", () => {
+  test("the abort signal reaches the native exec (end to end)", async () => {
     const { container, controller } = rig();
     const seen: FakeProcess[] = [];
     container.execImpl = (argv: string[]): FakeProcess => {
       const process = new FakeProcess();
 
-      // Setup execs settle; the user process stays live until killed.
+      // Setup execs settle; the user process stays live until finished.
       if (argv[0] !== "sleep") {
         process.finish(0);
       }
@@ -291,20 +291,25 @@ describe("abort maps to kill", () => {
     const user = seen.at(-1) as FakeProcess;
     expect(user.kills).toEqual([]);
     expect(wire.isPty).toBe(false);
-    // The carrier, not a serialized signal, is what crosses RPC in production.
-    aborter.close?.();
-    await expect(wire.capability.invoke("exitCode", [])).resolves.toBe(137);
-    expect(user.kills).toEqual([undefined]);
 
-    // celld never saw the carrier: only portable options were forwarded.
+    // celld owns abort delivery (0010/0015): the signal crosses to the
+    // native exec, and the controller itself never kills.
     const userCall = container.execCalls.find(
       (call) => call.argv[0] === "sleep"
     );
 
-    expect(userCall?.options).toEqual({ cwd: "/workspace" });
+    expect(userCall?.options.cwd).toBe("/workspace");
+    expect(userCall?.options.signal).toBeInstanceOf(AbortSignal);
+
+    // The carrier, not a serialized signal, is what crosses RPC in production.
+    aborter.close?.();
+    expect(user.kills).toEqual([]);
+
+    user.finish(0);
+    await expect(wire.capability.invoke("exitCode", [])).resolves.toBe(0);
   });
 
-  test("an already-aborted signal kills without relying on a listener", async () => {
+  test("an already-aborted signal is forwarded for celld to refuse", async () => {
     const { container, controller } = rig();
     const seen: FakeProcess[] = [];
     container.execImpl = (): FakeProcess => {
@@ -320,7 +325,8 @@ describe("abort maps to kill", () => {
     const before = seen.length;
 
     // SAFETY: white-box call into the protected override to pin the
-    // already-aborted branch (a listener alone would never fire post-abort).
+    // already-aborted forwarding (celld 0010 refuses it with its reason
+    // before spawning; the fake is not celld and just records the call).
     const execProcess = controller as unknown as {
       execProcess: (
         argv: string[],
@@ -328,15 +334,17 @@ describe("abort maps to kill", () => {
       ) => Promise<{ exitCode: Promise<number> }>;
     };
 
-    const finished = await execProcess.execProcess(["true"], {
-      signal: AbortSignal.abort(),
-    });
+    const signal = AbortSignal.abort();
+    const finished = await execProcess.execProcess(["true"], { signal });
 
     await expect(finished.exitCode).resolves.toBe(0);
     expect(seen).toHaveLength(before + 1);
-    expect(seen.at(-1)?.kills).toEqual([undefined]);
+    expect(seen.at(-1)?.kills).toEqual([]);
+    expect(container.execCalls.at(-1)?.options.signal).toBe(signal);
   });
+});
 
+describe("process kill", () => {
   test("capability kill reaches the process and settles the exit", async () => {
     const { container, controller } = rig();
     const seen: FakeProcess[] = [];

@@ -513,9 +513,11 @@ pub fn validate_fence_create(
     }))
 }
 
-/// Validate an exec-create body (celld `container.rs:1267-1286`, plus the
-/// attachless `kill` form at `1482-1485`): the stdio wiring, command,
-/// environment, directory and user — no privilege bit, no detach extras.
+/// Validate an exec-create body (celld `exec_create_body`,
+/// `container.rs:1925`, plus the attachless kill form at `1973`): the stdio
+/// wiring, command, environment, directory and user — no privilege bit, no
+/// detach extras. The kill form is `sh -c` over a `/proc` scan for the
+/// exec's `CELLD_EXEC_ID` marker, run as the exec's user when it had one.
 /// `Tty` may be true (a PTY exec, whose attach flags celld sends exactly as
 /// for a plain one) or false.
 pub fn validate_exec_create(body: &Value) -> Result<(), String> {
@@ -572,9 +574,9 @@ pub fn validate_exec_create(body: &Value) -> Result<(), String> {
 }
 
 /// Validate an exec-start body: celld's hijacked form
-/// (`{"Detach": false, "Tty": false}`, `container.rs:1306`, or `"Tty": true`
+/// (`{"Detach": false, "Tty": false}`, `container.rs:1793`, or `"Tty": true`
 /// for a PTY exec) and its kill-via-exec form (`{"Detach": true}`,
-/// `container.rs:1504`).
+/// `container.rs:2020`).
 pub fn validate_exec_start(body: &Value) -> Result<(), String> {
     let Some(object) = body.as_object() else {
         return Err("exec start body must be an object".to_string());
@@ -795,6 +797,27 @@ mod tests {
             "Labels": { "celld.node": NODE, "celld.fence": "1" },
             "HostConfig": { "NetworkMode": "host", "CapAdd": ["NET_ADMIN"] },
         })
+    }
+
+    /// celld's kill scan (`kill_scan_script`, `container.rs:1964`) for one
+    /// exec id and signal, byte-identical to what the daemon receives.
+    fn kill_scan(id: u64, signal: u32) -> String {
+        format!(
+            "for d in /proc/[0-9]*;do grep -qa \"CELLD_EXEC_ID={id};\" \"$d/environ\" 2>/dev/null&&kill -{signal} \"${{d#/proc/}}\";done"
+        )
+    }
+
+    /// celld's kill exec create (`kill_exec_body`, `container.rs:1973`):
+    /// the attachless `sh -c` scan, run as the exec's user when it had one.
+    fn kill_exec_body(id: u64, signal: u32, user: Option<&str>) -> Value {
+        let mut body = json!({
+            "AttachStdin": false, "AttachStdout": false, "AttachStderr": false,
+            "Cmd": ["sh", "-c", kill_scan(id, signal)],
+        });
+        if let Some(user) = user {
+            body["User"] = json!(user);
+        }
+        body
     }
 
     #[test]
@@ -1216,12 +1239,9 @@ mod tests {
             "Env": ["MODEL=faux"], "WorkingDir": "/work", "User": "1000",
         }))
         .expect("celld's exec");
-        // The kill-via-exec form: no stdio, no Tty key at all.
-        validate_exec_create(&json!({
-            "AttachStdin": false, "AttachStdout": false, "AttachStderr": false,
-            "Cmd": ["kill", "-9", "42"],
-        }))
-        .expect("celld's kill exec");
+        // The kill-via-exec form (celld 0015): no stdio, no Tty key at
+        // all, a `sh -c` scan for the exec's marker.
+        validate_exec_create(&kill_exec_body(12, 9, None)).expect("celld's kill exec");
         validate_exec_start(&json!({ "Detach": false, "Tty": false })).expect("hijacked start");
         validate_exec_start(&json!({ "Detach": true })).expect("detached start");
         for (name, body) in [
@@ -1256,6 +1276,63 @@ mod tests {
         }))
         .expect("celld's pty exec");
         validate_exec_start(&json!({ "Detach": false, "Tty": true })).expect("pty start");
+    }
+
+    #[test]
+    fn kill_exec_shape_matches_celld_0015_exactly() {
+        // The abort path (celld 0010) kills through this shape: the scan
+        // carries the target exec's marker and the signal, runs as the
+        // exec's user when it had one, and starts detached.
+        for (id, signal, user) in [(12, 9, None), (7, 15, Some("nobody"))] {
+            let body = kill_exec_body(id, signal, user);
+            validate_exec_create(&body).expect("celld's kill exec");
+            let script = body["Cmd"][2].as_str().expect("scan script");
+            assert!(script.contains(&format!("CELLD_EXEC_ID={id};")), "{script}");
+            assert!(script.contains(&format!("kill -{signal} ")), "{script}");
+            assert_eq!(
+                body.get("User").and_then(Value::as_str),
+                user,
+                "kill runs as the exec's user"
+            );
+        }
+        validate_exec_start(&json!({ "Detach": true })).expect("detached kill start");
+        // Near-misses: the kill shape with anything extra or mistyped is
+        // refused, exactly like any other exec.
+        let base = kill_exec_body(12, 9, Some("nobody"));
+        let mut privileged = base.clone();
+        privileged["Privileged"] = json!(true);
+        let mut detached = base.clone();
+        detached["Detach"] = json!(true);
+        let mut string_cmd = base.clone();
+        string_cmd["Cmd"] = json!("sh -c true");
+        let mut empty_cmd = base.clone();
+        empty_cmd["Cmd"] = json!([]);
+        let mut object_env = base.clone();
+        object_env["Env"] = json!({"CELLD_EXEC_ID": "12;"});
+        let mut string_tty = base.clone();
+        string_tty["Tty"] = json!("no");
+        let mut numeric_user = base.clone();
+        numeric_user["User"] = json!(0);
+        let mut numeric_dir = base.clone();
+        numeric_dir["WorkingDir"] = json!(42);
+        let mut missing_cmd = base.clone();
+        missing_cmd
+            .as_object_mut()
+            .expect("kill body is an object")
+            .remove("Cmd");
+        for (name, body) in [
+            ("privileged kill", privileged),
+            ("detach extras", detached),
+            ("string cmd", string_cmd),
+            ("empty cmd", empty_cmd),
+            ("missing cmd", missing_cmd),
+            ("object env", object_env),
+            ("string tty", string_tty),
+            ("numeric user", numeric_user),
+            ("numeric working dir", numeric_dir),
+        ] {
+            assert!(validate_exec_create(&body).is_err(), "{name} refused");
+        }
     }
 
     #[test]
