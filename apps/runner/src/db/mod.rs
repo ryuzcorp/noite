@@ -39,7 +39,8 @@ pub use compaction::{
     mark_hour_compacted, prune_compactions,
 };
 pub use credentials::{
-    all_scoped_credential_handles, delete_scoped_credential, insert_scoped_credential,
+    all_scoped_credential_handles, delete_app_operator_tokens, delete_operator_token,
+    delete_scoped_credential, get_operator_token, insert_operator_token, insert_scoped_credential,
     live_scoped_credential, mark_app_scoped_credentials_revoking, mark_scoped_credential_revoking,
     revoking_scoped_credentials, scoped_credential_handle_exists, NewScopedCredential,
     ScopedCredential,

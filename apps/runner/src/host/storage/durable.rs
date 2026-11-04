@@ -92,16 +92,21 @@ pub async fn do_instances(cfg: &Config, app: &App, class_name: &str) -> anyhow::
 
 /// `GET /do/{scope}?read=1` on the fleet's internal listener, capped and
 /// best-effort. The loopback address matches ensure_fleet's --advertise;
-/// rootless podman routes it to the fleet child in the runner's netns.
+/// rootless podman routes it to the fleet child in the runner's netns. The
+/// fleet's operator token rides as a Bearer token (the node requires it on
+/// every internal route); without a cached token the probe goes out bare
+/// and a 401 reads as missing, exactly as an unresponsive instance does.
 async fn probe_instance(app: &App, scope: &str) -> Option<String> {
     let port = app.internal_port?;
     let url = format!("http://127.0.0.1:{port}/do/{scope}?read=1");
-    let Ok(response) = reqwest::Client::new()
+    let scope_key = crate::host::credentials::Scope::app(app).key();
+    let mut request = reqwest::Client::new()
         .get(&url)
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-    else {
+        .timeout(Duration::from_secs(5));
+    if let Some(token) = crate::host::credentials::cached_operator_token(&scope_key) {
+        request = request.bearer_auth(token);
+    }
+    let Ok(response) = request.send().await else {
         return None;
     };
     let Ok(body) = response.text().await else {

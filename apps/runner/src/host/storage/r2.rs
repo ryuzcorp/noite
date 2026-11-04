@@ -121,15 +121,15 @@ fn normalize_prefix(prefix: &str) -> String {
     }
 }
 
-fn celld_env(cfg: &Config) -> Vec<(&str, String)> {
-    let mut env = s3::aws_env(cfg);
-    env.push(("S3_ENDPOINT", cfg.s3_endpoint.clone()));
-    env
-}
-
 /// Run one `celld` subcommand against the fleet's own bucket.
-async fn run_celld(cfg: &Config, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
-    let env_owned = celld_env(cfg);
+async fn run_celld(
+    cfg: &Config,
+    app: &App,
+    args: &[&str],
+    timeout: Duration,
+) -> anyhow::Result<String> {
+    let scope_key = crate::host::credentials::Scope::app(app).key();
+    let env_owned = s3::celld_cli_env(cfg, &scope_key);
     let env: Vec<(&str, &str)> = env_owned
         .iter()
         .map(|(key, value)| (*key, value.as_str()))
@@ -412,7 +412,7 @@ pub async fn r2_put(
         args.push(value);
     }
     args.extend(fleet);
-    run_celld(cfg, &args, CELD_UPLOAD_TIMEOUT).await?;
+    run_celld(cfg, app, &args, CELD_UPLOAD_TIMEOUT).await?;
     Ok(())
 }
 
@@ -440,7 +440,7 @@ pub async fn r2_delete_many(
         args.push(key);
     }
     args.extend(fleet);
-    run_celld(cfg, &args, CELD_TIMEOUT).await?;
+    run_celld(cfg, app, &args, CELD_TIMEOUT).await?;
     Ok(keys.len())
 }
 

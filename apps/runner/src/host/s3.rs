@@ -33,7 +33,7 @@ pub fn is_not_found(err: &anyhow::Error) -> bool {
         || text.contains("NotFound")
 }
 
-pub fn aws_env(cfg: &Config) -> Vec<(&str, String)> {
+pub fn aws_env(cfg: &Config) -> Vec<(&'static str, String)> {
     vec![
         ("AWS_ACCESS_KEY_ID", cfg.aws_access_key_id.clone()),
         ("AWS_SECRET_ACCESS_KEY", cfg.aws_secret_access_key.clone()),
@@ -41,6 +41,21 @@ pub fn aws_env(cfg: &Config) -> Vec<(&str, String)> {
         ("AWS_EC2_METADATA_DISABLED", "true".into()),
         ("AWS_MAX_ATTEMPTS", "2".into()),
     ]
+}
+
+/// Env for one `celld` CLI subprocess against `scope_key`'s fleet: the
+/// store credentials plus `S3_ENDPOINT`, plus the fleet's operator token
+/// when this process ensured it. The in-tree CLIs that dial the node read
+/// the token from their own env; bucket-only subcommands ignore it. Every
+/// `celld` subprocess builds its env here, so no call site can forget the
+/// token once the fleet it targets is guarded.
+pub fn celld_cli_env(cfg: &Config, scope_key: &str) -> Vec<(&'static str, String)> {
+    let mut env = aws_env(cfg);
+    env.push(("S3_ENDPOINT", cfg.s3_endpoint.clone()));
+    if let Some(token) = crate::host::credentials::cached_operator_token(scope_key) {
+        env.push((crate::host::credentials::OPERATOR_TOKEN_ENV, token));
+    }
+    env
 }
 
 /// Connection-pooled HTTP client shared by every S3 call: one pool for the
@@ -1040,6 +1055,55 @@ pub async fn s3_list_prefix(cfg: &Config, bucket: &str, prefix: &str) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `celld` subprocess env carries the store credentials, the
+    /// endpoint, and — once the fleet was ensured — its operator token.
+    #[tokio::test]
+    async fn celld_cli_env_carries_the_fleet_token() {
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        sqlx::query(include_str!("../../schema.sql"))
+            .execute(&pool)
+            .await
+            .expect("test schema");
+        let cfg = crate::config::config_for_tests();
+        let app_id = crate::models::new_id();
+        let scope_key = format!("app:{app_id}");
+        let bare_owned = celld_cli_env(&cfg, &scope_key);
+        let bare: Vec<(&str, &str)> = bare_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert!(
+            bare.iter().any(|(k, _)| *k == "AWS_ACCESS_KEY_ID"),
+            "store credentials always ride along"
+        );
+        assert!(
+            bare.iter()
+                .any(|(k, v)| *k == "S3_ENDPOINT" && *v == cfg.s3_endpoint),
+            "the endpoint rides along"
+        );
+        assert!(
+            !bare
+                .iter()
+                .any(|(k, _)| *k == crate::host::credentials::OPERATOR_TOKEN_ENV),
+            "no token before the fleet was ensured"
+        );
+        let token =
+            crate::host::credentials::operator_token(&pool, &cfg.runner_token, &scope_key, &app_id)
+                .await
+                .expect("mint");
+        let guarded_owned = celld_cli_env(&cfg, &scope_key);
+        let guarded: Vec<(&str, &str)> = guarded_owned
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect();
+        assert!(
+            guarded
+                .iter()
+                .any(|(k, v)| *k == crate::host::credentials::OPERATOR_TOKEN_ENV && *v == token),
+            "the ensured fleet's token rides along"
+        );
+        pool.close().await;
+    }
 
     /// SigV4 header signer, cross-validated on the IAM ListUsers inputs below:
     /// the Rust `hmac` crate, Python's stdlib `hmac` and `openssl dgst`

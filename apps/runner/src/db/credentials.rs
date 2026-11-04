@@ -171,6 +171,63 @@ pub async fn scoped_credential_handle_exists(
     Ok(found.is_some())
 }
 
+/// The stored token row for `scope` (`app:<id>`, `env:<id>`, `control`),
+/// as nonce + ciphertext over the token, if any. The KEK derives from
+/// RUNNER_TOKEN (see `host::credentials`), so the bucket snapshot is not a
+/// token dump.
+pub async fn get_operator_token(
+    pool: &SqlitePool,
+    scope: &str,
+) -> sqlx::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    sqlx::query_as("SELECT nonce, ciphertext FROM main.fleet_operator_token WHERE scope = ?")
+        .bind(scope)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Store a freshly minted token row. The caller holds `host` `MUTATE`, so a
+/// primary-key conflict means a second runner owns this database (the
+/// `owner.json` fence forbids that) — it surfaces as an error, never a
+/// silent overwrite.
+pub async fn insert_operator_token(
+    pool: &SqlitePool,
+    scope: &str,
+    app_id: &str,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO main.fleet_operator_token (scope, app_id, nonce, ciphertext, updated_at) \
+         VALUES (?, ?, ?, ?, datetime('now'))",
+    )
+    .bind(scope)
+    .bind(app_id)
+    .bind(nonce)
+    .bind(ciphertext)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Drop one fleet's token row: app and environment deletes call it, so a
+/// recreated slug never inherits the previous fleet's token.
+pub async fn delete_operator_token(pool: &SqlitePool, scope: &str) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM main.fleet_operator_token WHERE scope = ?")
+        .bind(scope)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Drop every token row of one app and its environments (app delete).
+pub async fn delete_app_operator_tokens(pool: &SqlitePool, app_id: &str) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM main.fleet_operator_token WHERE app_id = ?")
+        .bind(app_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

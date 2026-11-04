@@ -206,17 +206,22 @@ async fn main() -> anyhow::Result<()> {
     // Isolation: nft egress policy first, then self-checks (SPEC, Egress policy + Tenancy mode).
     // Only in multi tenancy: the single tenant is trusted, and the policy
     // would also cut single-tenant release commands off from the bucket.
-    // The build range is `None` when uid drops are disabled; fleets are
-    // still policed (builds are refused separately).
+    // The table covers the build range only (Worker egress lives in celld);
+    // with no range there is nothing to install (builds are refused
+    // separately).
     let build_uids = config.build_uid_base.map(|b| (b, config.build_uid_range));
-    let nft_installed = match (config.tenancy, config.fleet_uid) {
-        (config::Tenancy::Multi, Some(f)) => {
+    let nft_installed = match (config.tenancy, build_uids) {
+        (config::Tenancy::Multi, Some(_)) => {
             let storage = host::netisolation::storage_target(&config.s3_endpoint).await;
-            let ok = host::netisolation::ensure(build_uids, f, &storage).await;
+            let ok = host::netisolation::ensure(build_uids, &storage).await;
             if ok {
-                host::netisolation::spawn_policy_refresh(build_uids, f, config.s3_endpoint.clone());
+                host::netisolation::spawn_policy_refresh(build_uids, config.s3_endpoint.clone());
             }
             ok
+        }
+        (config::Tenancy::Multi, None) => {
+            host::netisolation::skip("uid drops disabled: no build range to police");
+            false
         }
         _ => {
             host::netisolation::skip("single tenancy: egress policy not installed");
@@ -423,10 +428,26 @@ async fn main() -> anyhow::Result<()> {
     // The dev image has no bundle: `vite dev` serves the UI on the same port
     // (docker/dev.sh), so there is nothing to deploy or supervise.
     let control_child = if host::control::bundle_present(&config) {
+        // The control node's operator token: minted once and snapshotted
+        // with the database, so an overlapping redeploy's new node agrees
+        // with the old one on peer traffic. Without it the node runs with
+        // an open internal listener, as before — warned, never silent.
+        let control_token = host::credentials::operator_token(
+            &pool,
+            &config.runner_token,
+            host::credentials::CONTROL_OPERATOR_SCOPE,
+            "_control",
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %format!("{e:#}"), "control operator token unavailable; the control node runs with an open internal listener");
+            String::new()
+        });
         if let Err(e) = host::control::ensure_deployed(&config).await {
             tracing::warn!(error = %e, "control fleet deploy failed; continuing");
         }
-        let child = host::control::supervise(&config, control_pid.clone(), logs.clone());
+        let child =
+            host::control::supervise(&config, control_pid.clone(), logs.clone(), control_token);
         tracing::info!(ms = boot.elapsed().as_millis(), "control bundle ready");
         Some(child)
     } else {

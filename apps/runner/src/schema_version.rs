@@ -21,7 +21,7 @@ use anyhow::{bail, Context};
 use sqlx::SqliteConnection;
 
 /// Version a database has after every migration ran. 1 is the alpha baseline.
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`.
@@ -298,6 +298,22 @@ pub const MIGRATIONS: &[Migration] = &[
             PRIMARY KEY (app_id, environment_id, script)\
           );",
     },
+    Migration {
+        version: 15,
+        // Per-fleet celld operator tokens (SPEC, Tenant isolation): one
+        // encrypted row per fleet. New table, so older installs gain it
+        // empty (their next fleet spawn mints each token) and a fresh
+        // database gets it from schema.sql.
+        sql: "CREATE TABLE IF NOT EXISTS main.fleet_operator_token (\
+            scope TEXT PRIMARY KEY NOT NULL,\
+            app_id TEXT NOT NULL,\
+            nonce BLOB NOT NULL,\
+            ciphertext BLOB NOT NULL,\
+            updated_at TEXT NOT NULL\
+          );\
+          CREATE INDEX IF NOT EXISTS idx_fleet_operator_token_app \
+            ON fleet_operator_token(app_id);",
+    },
 ];
 
 /// What boot must do to bring a database to the latest version.
@@ -540,6 +556,45 @@ mod tests {
     /// The shipped migration that adds `instance_setting` (the heartbeat's
     /// install identity and opt-out markers) must apply to a database that
     /// predates it, and leave the table usable.
+    #[tokio::test]
+    async fn shipped_operator_token_migration_applies_to_an_old_database() {
+        let mut conn = memory().await;
+        sqlx::raw_sql(
+            "CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT);\
+             PRAGMA main.user_version = 14;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed the pre-15 shape");
+        let v15 = "CREATE TABLE IF NOT EXISTS main.app (id TEXT PRIMARY KEY, slug TEXT);";
+        let idx = MIGRATIONS
+            .iter()
+            .position(|m| m.version == 15)
+            .expect("the operator-token migration is shipped");
+        // Apply just this step: later migrations must not leak into the test.
+        apply(&mut conn, v15, 15, &MIGRATIONS[idx..=idx])
+            .await
+            .expect("upgrade");
+        assert_eq!(version(&mut conn).await, 15);
+        sqlx::raw_sql(
+            "INSERT INTO main.fleet_operator_token (scope, app_id, nonce, ciphertext, updated_at) \
+             VALUES ('app:a', 'a', x'00', x'01', datetime('now'))",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("insert");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM main.fleet_operator_token")
+            .fetch_one(&mut conn)
+            .await
+            .expect("row survives");
+        assert_eq!(count, 1);
+        // Booting again is a no-op.
+        apply(&mut conn, v15, 15, &MIGRATIONS[idx..=idx])
+            .await
+            .expect("second boot");
+        assert_eq!(version(&mut conn).await, 15);
+    }
+
     #[tokio::test]
     async fn shipped_instance_setting_migration_applies_to_an_old_database() {
         let mut conn = memory().await;

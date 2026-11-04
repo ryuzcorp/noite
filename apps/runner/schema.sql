@@ -318,6 +318,22 @@ CREATE TABLE IF NOT EXISTS scoped_credential (
 );
 CREATE INDEX IF NOT EXISTS idx_scoped_credential_app ON scoped_credential(app_id);
 
+-- Per-fleet celld operator tokens (SPEC, Tenant isolation): one row per
+-- fleet (`app:<app_id>`, `env:<env_id>`, `control` for the reserved control
+-- fleet). Nonce + AES-GCM ciphertext over the token; the KEK derives from
+-- RUNNER_TOKEN via HKDF with the scope as associated data, exactly like
+-- `scoped_credential`, so the bucket snapshot is not a token dump. Minted
+-- lazily on first spawn; a fleet respawn reuses the row, so the token is
+-- stable across runner restarts.
+CREATE TABLE IF NOT EXISTS fleet_operator_token (
+  scope TEXT PRIMARY KEY NOT NULL,
+  app_id TEXT NOT NULL,
+  nonce BLOB NOT NULL,
+  ciphertext BLOB NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fleet_operator_token_app ON fleet_operator_token(app_id);
+
 -- One-time telemetry replay request (SPEC, Observability). Written by
 -- `noite-runner telemetry reingest` and by the migration that ships the
 -- idempotent ingest; the metrics tick reads it, rewinds the in-memory

@@ -456,6 +456,11 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     if let Err(e) = crate::host::credentials::revoke_app(&state.pool, &state.config, id).await {
         tracing::warn!(app_id = %id, error = %format!("{e:#}"), "app deleted but credential revoke failed");
     }
+    // The fleets' operator tokens go with the app, so a recreated slug
+    // mints fresh ones instead of inheriting the dead fleets' tokens.
+    if let Err(e) = db::delete_app_operator_tokens(&state.pool, id).await {
+        tracing::warn!(app_id = %id, error = %e, "app deleted but operator token rows remain");
+    }
     Ok(())
 }
 
