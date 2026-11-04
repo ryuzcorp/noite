@@ -766,9 +766,27 @@ fn toml_string(rest: &str) -> Option<&str> {
 /// Token counts are capped ([`MAX_CHAIN_TOKENS`]): past that the outer map
 /// passes through unchained instead of burning the deploy task.
 ///
-/// Distinct source names for deploy-log diagnostics, capped at `limit`.
-fn distinct_sources(sm: &sourcemap::SourceMap, limit: usize) -> Vec<&str> {
-    let mut sources: Vec<&str> = sm.tokens().filter_map(|t| t.get_source()).collect();
+/// A map source safe to store or log: absolute host paths (a symlink escape,
+/// a build-host absolute) become their file name; relative sources —
+/// including the `../..` form every Vite build emits — stay intact for
+/// display.
+fn sanitized_source_name(source: &str) -> &str {
+    if source.starts_with('/') {
+        source.rsplit('/').next().unwrap_or(source)
+    } else {
+        source
+    }
+}
+
+/// Distinct source names for deploy-log diagnostics, capped at `limit`, cut
+/// through the same rule as stored sources so the log never leaks a
+/// build-host absolute the store itself refuses.
+fn distinct_sources(sm: &sourcemap::SourceMap, limit: usize) -> Vec<String> {
+    let mut sources: Vec<String> = sm
+        .tokens()
+        .filter_map(|t| t.get_source())
+        .map(|s| sanitized_source_name(s).to_string())
+        .collect();
     sources.sort();
     sources.dedup();
     sources.truncate(limit);
@@ -974,11 +992,25 @@ pub(crate) async fn read_celld_worker_map(
     deploy_root: &Path,
     map_path: &Path,
 ) -> anyhow::Result<Option<WorkerMap>> {
-    let map_bytes = match tokio::fs::read(map_path).await {
-        Ok(bytes) => bytes,
+    // Never follow symlinks and never read past the cap into memory: the
+    // deploy unlinks this path before celld runs, but a planted link that
+    // survived (or a rerun against a dirty work dir) must not become a
+    // stored map or a memory spike. No tenant process runs this late, so
+    // the metadata and the read below cannot straddle a swap.
+    let meta = match std::fs::symlink_metadata(map_path) {
+        Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).context("read the celld source map"),
     };
+    if !meta.file_type().is_file() {
+        anyhow::bail!("refusing to read the celld source map: not a regular file");
+    }
+    if !fits_map_bytes(meta.len()) {
+        anyhow::bail!("celld source map over 8 MiB");
+    }
+    let map_bytes = tokio::fs::read(map_path)
+        .await
+        .context("read the celld source map")?;
     if !fits_map_bytes(map_bytes.len() as u64) {
         anyhow::bail!("celld source map over 8 MiB");
     }
@@ -1024,22 +1056,17 @@ pub(crate) async fn read_celld_worker_map(
     Ok(Some(WorkerMap { map: out, note }))
 }
 
-/// Drop absolute host paths (symlink escapes, build-host absolutes) down to
-/// their file names before anything is stored: chaining already ran on the
-/// full strings, so entry matching is unaffected, and no host-absolute path
-/// reaches the bucket or the UI. Relative sources — including the
-/// `../..` form every Vite build emits — carry no host information and stay
-/// intact, since the UI renders them as the original path.
+/// Drop absolute host paths down to their file names before anything is
+/// stored: chaining already ran on the full strings, so entry matching is
+/// unaffected, and no host-absolute path reaches the bucket or the UI.
+/// Relative sources carry no host information and stay intact, since the UI
+/// renders them as the original path.
 fn sanitize_sources(sm: &sourcemap::SourceMap) -> sourcemap::SourceMap {
     let mut builder = sourcemap::SourceMapBuilder::new(None);
     for token in sm.tokens() {
-        let source = token.get_source().map(|s| {
-            if s.starts_with('/') {
-                s.rsplit('/').next().unwrap_or(s).to_string()
-            } else {
-                s.to_string()
-            }
-        });
+        let source = token
+            .get_source()
+            .map(|s| sanitized_source_name(s).to_string());
         builder.add(
             token.get_dst_line(),
             token.get_dst_col(),
@@ -1454,6 +1481,77 @@ mod tests {
         assert!(
             format!("{err:#}").contains("parse the celld source map"),
             "unexpected error: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planted_symlink_map_is_refused() {
+        // The deploy unlinks the map path before celld runs; a link that
+        // survived (or a rerun against a dirty work dir) must not be
+        // followed into a stored map.
+        use std::os::unix::fs::symlink;
+        let dir =
+            std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut outer_bytes = Vec::new();
+        built_map(&[((0, 0), ("dist/worker.js", 0, 0), None)])
+            .to_writer(&mut outer_bytes)
+            .expect("outer map");
+        let target = dir.join("planted.js.map");
+        std::fs::write(&target, &outer_bytes).expect("planted map");
+        let map_path = dir.join("worker.js.map");
+        symlink(&target, &map_path).expect("planted link");
+        let err = read_celld_worker_map(&dir, &map_path)
+            .await
+            .expect_err("a symlink map fails the read");
+        assert!(
+            format!("{err:#}").contains("not a regular file"),
+            "unexpected error: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn chained_note_carries_no_absolute_host_paths() {
+        // The deploy-log diagnostics name both maps' source sets; absolute
+        // build-host paths become file names there, as in storage.
+        let dir =
+            std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("app");
+        std::fs::create_dir_all(root.join("dist")).expect("entry dir");
+        std::fs::write(
+            root.join("wrangler.json"),
+            "{\"main\": \"./dist/worker.js\"}",
+        )
+        .expect("config");
+        std::fs::write(root.join("dist").join("worker.js"), "console.log(1);").expect("entry");
+        let mut inner_bytes = Vec::new();
+        built_map(&[((10, 3), ("/data/build/src/index.ts", 2, 0), None)])
+            .to_writer(&mut inner_bytes)
+            .expect("inner map");
+        std::fs::write(root.join("dist").join("worker.js.map"), &inner_bytes).expect("sibling");
+        let mut outer_bytes = Vec::new();
+        built_map(&[((0, 5), ("dist/worker.js", 10, 3), None)])
+            .to_writer(&mut outer_bytes)
+            .expect("outer map");
+        let map_path = dir.join("worker.js.map");
+        std::fs::write(&map_path, &outer_bytes).expect("celld map");
+
+        let built = read_celld_worker_map(&root, &map_path)
+            .await
+            .expect("readable")
+            .expect("a map");
+        assert!(
+            !built.note.contains("/data/build"),
+            "note leaks a host path: {}",
+            built.note
+        );
+        assert!(
+            built.note.contains("index.ts"),
+            "note lost the source name: {}",
+            built.note
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

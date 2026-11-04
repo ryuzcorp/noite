@@ -1170,6 +1170,14 @@ async fn deploy_inner(
     // nothing for asset-only, `no_bundle`, and Python projects; a missing
     // file below then means no worker map.
     let worker_map_path = work.join("worker.js.map");
+    // A tenant build script runs with the whole work dir writable, so it may
+    // have planted this path — a decoy file celld would leave in place for
+    // unmapped projects, or a symlink celld's runner-owned write would
+    // follow. The tree is runner-owned again by now and no tenant process
+    // runs past this point, so drop whatever sits there: whatever celld
+    // writes afterwards is its own.
+    let _ = tokio::fs::remove_file(&worker_map_path).await;
+    let _ = tokio::fs::remove_dir_all(&worker_map_path).await;
     let stats = void_cohost::deploy_fleet_in_order(
         pool,
         &app.id,
