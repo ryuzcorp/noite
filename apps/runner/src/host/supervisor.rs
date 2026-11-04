@@ -1207,9 +1207,12 @@ mod tests {
     #[tokio::test]
     async fn stop_fleet_kills_the_process_group() {
         use std::os::unix::process::CommandExt;
-        // A sleep duration no other process can plausibly share, so the
-        // /proc scan below cannot false-positive.
-        let marker = "31337378";
+        // Unique per test-process run, like the exec group-kill test: a
+        // fixed marker lets a sleeper orphaned by an aborted earlier run
+        // fail this run until someone kills it by hand. The guard kills
+        // this run's marker on every exit path.
+        let marker = format!("31338{}", std::process::id());
+        let _cleanup = crate::testutil::KillMarkerOnDrop::new(&marker);
         let mut cmd = Command::new("sh");
         let script = format!("sleep {marker} & wait");
         cmd.args(["-c", script.as_str()]);
@@ -1224,7 +1227,7 @@ mod tests {
         assert!(!procs.lock().await.contains_key("probe"));
 
         assert!(
-            crate::testutil::wait_for_cmdline_gone(marker, Duration::from_secs(5)).await,
+            crate::testutil::wait_for_cmdline_gone(&marker, Duration::from_secs(5)).await,
             "stopped fleet left a worker behind (sleep {marker} still live 5s after the group kill)"
         );
     }
@@ -1292,13 +1295,8 @@ mod tests {
         assert!(why.contains('3'), "{why}");
     }
 
-    fn fake_fleet_leaf(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "noite-fleet-unit-{name}-{}",
-            crate::models::new_id()
-        ));
-        std::fs::create_dir_all(&dir).expect("fake fleet leaf");
-        dir
+    fn fake_fleet_leaf(name: &str) -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new(&format!("noite-fleet-unit-{name}"))
     }
 
     #[tokio::test]
@@ -1310,7 +1308,8 @@ mod tests {
             .spawn()
             .expect("spawn exiter");
         dead.wait().await.expect("reap exiter");
-        let dir = fake_fleet_leaf("gone");
+        let guard_gone = fake_fleet_leaf("gone");
+        let dir = guard_gone.path().to_path_buf();
         let key = format!("gone-{}", crate::models::new_id());
         assert_eq!(
             move_fleet_into_group(&key, &dir, &mut dead).await,
@@ -1332,7 +1331,8 @@ mod tests {
     async fn refused_move_kills_the_live_fleet_and_trips() {
         // cgroup.procs as a directory: the move is refused (EISDIR, not
         // ESRCH) for a live pid, like a real denial.
-        let dir = fake_fleet_leaf("refused");
+        let guard_refused = fake_fleet_leaf("refused");
+        let dir = guard_refused.path().to_path_buf();
         std::fs::create_dir_all(dir.join("cgroup.procs")).expect("fake procs dir");
         let key = format!("refused-{}", crate::models::new_id());
         let mut live = tokio::process::Command::new("sleep")
@@ -1363,8 +1363,11 @@ mod tests {
     async fn refused_move_kills_the_tree_and_reaps() {
         use std::os::unix::process::CommandExt;
         // Unique per test-process run: a leaked sleeper from an earlier run
-        // must never satisfy this run's /proc scan.
+        // must never satisfy this run's /proc scan. The guard kills this
+        // run's marker on every exit path, so this test never orphans one
+        // itself.
         let marker = format!("31337{}", std::process::id() % 100000);
+        let _cleanup = crate::testutil::KillMarkerOnDrop::new(&marker);
         let mut cmd = tokio::process::Command::new("sh");
         cmd.args(["-c", &format!("sleep {marker} & wait")]);
         cmd.as_std_mut().process_group(0);
@@ -1384,7 +1387,8 @@ mod tests {
         }
         // cgroup.procs as a directory: the move is refused (EISDIR, not
         // ESRCH) for a live pid, like a real denial.
-        let dir = fake_fleet_leaf("refused-tree");
+        let guard_refused_tree = fake_fleet_leaf("refused-tree");
+        let dir = guard_refused_tree.path().to_path_buf();
         std::fs::create_dir_all(dir.join("cgroup.procs")).expect("fake procs dir");
         let key = format!("refused-tree-{}", crate::models::new_id());
         assert_eq!(
@@ -1409,7 +1413,8 @@ mod tests {
 
     #[tokio::test]
     async fn successful_move_records_baseline() {
-        let dir = fake_fleet_leaf("moved");
+        let guard_moved = fake_fleet_leaf("moved");
+        let dir = guard_moved.path().to_path_buf();
         let key = format!("moved-{}", crate::models::new_id());
         let mut live = tokio::process::Command::new("sleep")
             .arg("60")

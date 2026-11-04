@@ -1218,6 +1218,14 @@ mod tests {
         }
     }
 
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            // `finish` is the tidy path (it closes the pool first); this is
+            // the panic path, so a failing assert never leaves the dir behind.
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     /// A scratch worktree that pushes into the mirror.
     struct Work {
         dir: PathBuf,

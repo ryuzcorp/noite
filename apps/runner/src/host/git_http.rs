@@ -1058,18 +1058,16 @@ mod tests {
         );
     }
 
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("noite-git-http-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
+    fn temp_dir(tag: &str) -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new(&format!("noite-git-http-{tag}"))
     }
 
     /// A0: a bare repo the runner creates points HEAD at `main`, so a fresh app
     /// advertises an empty `main` (push instructions) instead of `master`.
     #[tokio::test]
     async fn init_bare_points_head_at_main() {
-        let dir = temp_dir("head");
+        let guard_head = temp_dir("head");
+        let dir = guard_head.path().to_path_buf();
         let repo = dir.join("app.git");
         init_bare(&repo).await.expect("init");
         let head = std::fs::read_to_string(repo.join("HEAD")).expect("HEAD");
@@ -1184,7 +1182,8 @@ mod tests {
     /// same request is served with the admin argv.
     #[tokio::test]
     async fn git_refuses_a_delete_for_the_push_role() {
-        let dir = temp_dir("deny");
+        let guard_deny = temp_dir("deny");
+        let dir = guard_deny.path().to_path_buf();
         let bare = dir.join("t.git");
         init_bare(&bare).await.expect("init");
         let work = dir.join("w");

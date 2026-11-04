@@ -606,9 +606,14 @@ mod tests {
     /// `kill_on_drop`-only code left the sleep holding the step's port.
     #[tokio::test]
     async fn run_cmd_timeout_kills_grandchildren() {
-        // A sleep duration no other process on the machine can plausibly
-        // share, so the /proc scan below cannot false-positive.
-        let marker = "31337377";
+        // Unique per test-process run: a fixed marker lets a sleeper
+        // orphaned by an aborted earlier run (a killed test binary never
+        // reaches the group kill) satisfy this run's /proc scan, failing it
+        // until someone kills the stale sleeper by hand. The guard kills
+        // this run's marker on every exit path — pass, fail or panic — so
+        // this test never orphans one itself.
+        let marker = format!("31337{}", std::process::id());
+        let _cleanup = crate::testutil::KillMarkerOnDrop::new(&marker);
         let script = format!("sleep {marker} & wait");
         let err = run_cmd(
             "sh",
@@ -621,7 +626,7 @@ mod tests {
         .expect_err("sleep must hit the timeout");
         assert!(err.to_string().contains("command timeout"), "{err:#}");
         assert!(
-            crate::testutil::wait_for_cmdline_gone(marker, Duration::from_secs(5)).await,
+            crate::testutil::wait_for_cmdline_gone(&marker, Duration::from_secs(5)).await,
             "timed-out step left a grandchild behind (sleep {marker} still live 5s after the group kill)"
         );
     }

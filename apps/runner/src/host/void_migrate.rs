@@ -1444,15 +1444,8 @@ mod tests {
 
     const VECTORS: &str = include_str!("testdata/void_migration_vectors.json");
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "noite-void-migrate-{}-{}-{:?}",
-            name,
-            std::process::id(),
-            std::time::SystemTime::now()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new(&format!("noite-void-migrate-{name}"))
     }
 
     /// The collector follows Void's rule byte for byte: sorted `.sql`,
@@ -1461,7 +1454,8 @@ mod tests {
     /// `collectMigrations` ran over for the golden `collector` section.
     #[test]
     fn collector_matches_void() {
-        let dir = scratch("collect").canonicalize().unwrap();
+        let guard_collect = scratch("collect");
+        let dir = guard_collect.path().canonicalize().unwrap();
         let migrations = dir.join("db").join("migrations");
         std::fs::create_dir_all(migrations.join("meta")).unwrap();
         std::fs::write(
@@ -1517,7 +1511,8 @@ mod tests {
     /// throws on it.
     #[test]
     fn collector_refuses_a_directory_named_sql() {
-        let dir = scratch("collect-dir").canonicalize().unwrap();
+        let guard_collect_dir = scratch("collect-dir");
+        let dir = guard_collect_dir.path().canonicalize().unwrap();
         std::fs::create_dir(dir.join("0001_oops.sql")).unwrap();
         assert!(collect_migrations(&dir).is_err());
     }
@@ -1526,7 +1521,8 @@ mod tests {
     /// escaping the worktree fails instead.
     #[test]
     fn migrations_dir_resolution() {
-        let dir = scratch("paths").canonicalize().unwrap();
+        let guard_paths = scratch("paths");
+        let dir = guard_paths.path().canonicalize().unwrap();
         assert_eq!(
             resolve_migrations_dir(&dir).unwrap(),
             dir.join("db").join("migrations")
@@ -2451,7 +2447,8 @@ mod tests {
     /// message naming the cap.
     #[test]
     fn collector_caps_files_and_bytes() {
-        let dir = scratch("cap-file").canonicalize().unwrap();
+        let guard_cap_file = scratch("cap-file");
+        let dir = guard_cap_file.path().canonicalize().unwrap();
         std::fs::write(
             dir.join("big.sql"),
             vec![b'x'; MAX_MIGRATION_FILE_BYTES + 1],
@@ -2460,7 +2457,8 @@ mod tests {
         let err = collect_migrations(&dir).unwrap_err().to_string();
         assert!(err.contains("per-file cap"), "{}", err);
 
-        let dir = scratch("cap-total").canonicalize().unwrap();
+        let guard_cap_total = scratch("cap-total");
+        let dir = guard_cap_total.path().canonicalize().unwrap();
         for i in 0..5 {
             std::fs::write(
                 dir.join(format!("{:04}.sql", i)),
@@ -2471,7 +2469,8 @@ mod tests {
         let err = collect_migrations(&dir).unwrap_err().to_string();
         assert!(err.contains("total cap"), "{}", err);
 
-        let dir = scratch("cap-count").canonicalize().unwrap();
+        let guard_cap_count = scratch("cap-count");
+        let dir = guard_cap_count.path().canonicalize().unwrap();
         for i in 0..=MAX_MIGRATION_FILES {
             std::fs::write(dir.join(format!("{:06}.sql", i)), "SELECT 1;\n").unwrap();
         }
@@ -2486,29 +2485,31 @@ mod tests {
     #[cfg(unix)]
     fn collector_refuses_symlinks_fifos_and_sockets() {
         use std::os::unix::fs::symlink;
-        let dir = scratch("cap-links").canonicalize().unwrap();
+        let guard_cap_links = scratch("cap-links");
+        let dir = guard_cap_links.path().canonicalize().unwrap();
         std::fs::write(dir.join("real.sql"), "SELECT 1;\n").unwrap();
         symlink(dir.join("real.sql"), dir.join("link.sql")).unwrap();
         symlink("/dev/null", dir.join("null.sql")).unwrap();
         let err = collect_migrations(&dir).unwrap_err().to_string();
         assert!(err.contains("not a regular file"), "{}", err);
 
-        let dir = scratch("cap-fifo").canonicalize().unwrap();
+        let guard_cap_fifo = scratch("cap-fifo");
+        let dir = guard_cap_fifo.path().canonicalize().unwrap();
         let fifo = dir.join("stuck.sql");
         let raw = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
         let err = collect_migrations(&dir).unwrap_err().to_string();
         assert!(err.contains("not a regular file"), "{}", err);
 
-        // Unix socket paths must fit SUN_LEN, so this one skips the long
-        // unique scratch prefix.
-        let dir = std::env::temp_dir().join(format!("noite-cap-sock-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = dir.canonicalize().unwrap();
+        // Unix socket paths must fit SUN_LEN: the guard's
+        // `/tmp/noite-cap-sock-<pid>-<id>/s.sql` stays well under it. The
+        // guard is declared before the listener so the socket is closed
+        // before the directory is removed.
+        let guard_sock = crate::testutil::TempDir::new("noite-cap-sock");
+        let dir = guard_sock.path().canonicalize().unwrap();
         let _listener = std::os::unix::net::UnixListener::bind(dir.join("s.sql")).unwrap();
         let err = collect_migrations(&dir).unwrap_err().to_string();
         assert!(err.contains("not a regular file"), "{}", err);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A symlink anywhere in the migrations path below the root fails the
@@ -2518,7 +2519,8 @@ mod tests {
     #[cfg(unix)]
     fn resolve_refuses_symlinked_source_dir() {
         use std::os::unix::fs::symlink;
-        let outside = scratch("resolve-outside").canonicalize().unwrap();
+        let guard_outside = scratch("resolve-outside");
+        let outside = guard_outside.path().canonicalize().unwrap();
         std::fs::create_dir_all(outside.join("db").join("migrations")).unwrap();
         std::fs::write(
             outside.join("db").join("migrations").join("evil.sql"),
@@ -2526,13 +2528,15 @@ mod tests {
         )
         .unwrap();
 
-        let dir = scratch("resolve-link").canonicalize().unwrap();
+        let guard_resolve_link = scratch("resolve-link");
+        let dir = guard_resolve_link.path().canonicalize().unwrap();
         symlink(&outside, dir.join("client")).unwrap();
         std::fs::write(dir.join("void.json"), r#"{"sourceDir": "client"}"#).unwrap();
         let err = resolve_migrations_dir(&dir).unwrap_err().to_string();
         assert!(err.contains("is a symlink"), "{}", err);
 
-        let dir = scratch("resolve-dblink").canonicalize().unwrap();
+        let guard_resolve_dblink = scratch("resolve-dblink");
+        let dir = guard_resolve_dblink.path().canonicalize().unwrap();
         symlink(&outside, dir.join("db")).unwrap();
         let err = resolve_migrations_dir(&dir).unwrap_err().to_string();
         assert!(err.contains("is a symlink"), "{}", err);
@@ -2541,7 +2545,8 @@ mod tests {
     /// An oversized `void.json` fails the deploy instead of being parsed.
     #[test]
     fn resolve_refuses_huge_void_json() {
-        let dir = scratch("resolve-big").canonicalize().unwrap();
+        let guard_resolve_big = scratch("resolve-big");
+        let dir = guard_resolve_big.path().canonicalize().unwrap();
         std::fs::write(dir.join("void.json"), vec![b'x'; MAX_VOID_JSON_BYTES + 1]).unwrap();
         let err = resolve_migrations_dir(&dir).unwrap_err().to_string();
         assert!(err.contains("over the 1 MiB cap"), "{}", err);

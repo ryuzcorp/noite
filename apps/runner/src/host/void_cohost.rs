@@ -1213,16 +1213,14 @@ mod tests {
 
     /// One app project dir: a `wrangler.json` naming the app, as every real
     /// deploy root has — the fake stages its worker from it.
-    fn app_dir() -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("noite-cohost-app-{}", crate::models::new_id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn app_dir() -> crate::testutil::TempDir {
+        let guard = crate::testutil::TempDir::new("noite-cohost-app");
         std::fs::write(
-            dir.join("wrangler.json"),
+            guard.path().join("wrangler.json"),
             r#"{"name": "test-app", "main": "worker.js"}"#,
         )
         .unwrap();
-        dir
+        guard
     }
 
     /// The `activate` invocations among the fake's log lines.
@@ -1259,7 +1257,8 @@ mod tests {
             timeout: Duration::from_secs(30),
             sourcemap: None,
         };
-        let app_dir = app_dir();
+        let guard_app = app_dir();
+        let app_dir = guard_app.path().to_path_buf();
 
         let stats = deploy_fleet_in_order(
             &pool,
@@ -1329,7 +1328,7 @@ mod tests {
         // The cohosted temp project is gone: argv[1] is its dir.
         let project = calls[0].split(' ').nth(1).expect("deploy argv");
         assert!(!Path::new(project).exists(), "{} left behind", project);
-        std::fs::remove_dir_all(&app_dir).unwrap();
+        drop(guard_app);
     }
 
     /// Two cohosted scripts stage lowest order first no matter the input
@@ -1356,7 +1355,8 @@ mod tests {
             timeout: Duration::from_secs(30),
             sourcemap: None,
         };
-        let app_dir = app_dir();
+        let guard_app = app_dir();
+        let app_dir = guard_app.path().to_path_buf();
 
         let early = RenderedCohost {
             script: &EARLY_SCRIPT,
@@ -1419,7 +1419,7 @@ mod tests {
             "{:?}",
             calls
         );
-        std::fs::remove_dir_all(&app_dir).unwrap();
+        drop(guard_app);
     }
 
     /// Second deploy with the same content: the cohosted script is
@@ -1447,7 +1447,8 @@ mod tests {
             timeout: Duration::from_secs(30),
             sourcemap: None,
         };
-        let app_dir = app_dir();
+        let guard_app = app_dir();
+        let app_dir = guard_app.path().to_path_buf();
         let app_side = FleetApp {
             dir: &app_dir,
             cwd: None,
@@ -1507,7 +1508,7 @@ mod tests {
             "{:?}",
             calls
         );
-        std::fs::remove_dir_all(&app_dir).unwrap();
+        drop(guard_app);
     }
 
     /// The app stage retries once on infra and then succeeds; the stats
@@ -1539,7 +1540,8 @@ mod tests {
             timeout: Duration::from_secs(30),
             sourcemap: None,
         };
-        let app_dir = app_dir();
+        let guard_app = app_dir();
+        let app_dir = guard_app.path().to_path_buf();
 
         let stats = deploy_fleet_in_order(
             &pool,
@@ -1584,7 +1586,7 @@ mod tests {
             "{:?}",
             calls
         );
-        std::fs::remove_dir_all(&app_dir).unwrap();
+        drop(guard_app);
     }
 
     /// Tenant failures fail at once (no retry), and a twice-failed app
@@ -1612,7 +1614,8 @@ mod tests {
             timeout: Duration::from_secs(30),
             sourcemap: None,
         };
-        let app_dir = app_dir();
+        let guard_app = app_dir();
+        let app_dir = guard_app.path().to_path_buf();
         let app_side = FleetApp {
             dir: &app_dir,
             cwd: None,
@@ -1661,7 +1664,7 @@ mod tests {
         let calls = fake.invocations();
         assert_eq!(calls.len(), 3, "{:?}", calls);
         assert!(activates(&calls).is_empty(), "{:?}", calls);
-        std::fs::remove_dir_all(&app_dir).unwrap();
+        drop(guard_app);
     }
 
     /// A failed cohosted stage fails the deploy before the app stages:
@@ -1690,7 +1693,8 @@ mod tests {
             timeout: Duration::from_secs(30),
             sourcemap: None,
         };
-        let app_dir = app_dir();
+        let guard_app = app_dir();
+        let app_dir = guard_app.path().to_path_buf();
         let app_side = FleetApp {
             dir: &app_dir,
             cwd: None,
@@ -1721,7 +1725,7 @@ mod tests {
                 .unwrap(),
             None
         );
-        std::fs::remove_dir_all(&app_dir).unwrap();
+        drop(guard_app);
     }
 
     /// A cohosted script retries once on infra, and the stats carry the
@@ -1753,7 +1757,8 @@ mod tests {
             timeout: Duration::from_secs(30),
             sourcemap: None,
         };
-        let app_dir = app_dir();
+        let guard_app = app_dir();
+        let app_dir = guard_app.path().to_path_buf();
         let app_side = FleetApp {
             dir: &app_dir,
             cwd: None,
@@ -1847,7 +1852,7 @@ mod tests {
         // The temp project is gone on the failure path too.
         let project = calls[0].split(' ').nth(1).expect("deploy argv").to_string();
         assert!(!Path::new(&project).exists(), "{}", project);
-        std::fs::remove_dir_all(&app_dir).unwrap();
+        drop(guard_app);
     }
 
     /// A failed deploy stores nothing and runs no activate: the cohosted
@@ -1877,7 +1882,8 @@ mod tests {
             timeout: Duration::from_secs(30),
             sourcemap: None,
         };
-        let app_dir = app_dir();
+        let guard_app = app_dir();
+        let app_dir = guard_app.path().to_path_buf();
         let app_side = FleetApp {
             dir: &app_dir,
             cwd: None,
@@ -1934,7 +1940,7 @@ mod tests {
                 .as_deref(),
             Some(stats.cohosted[0].hash.as_str())
         );
-        std::fs::remove_dir_all(&app_dir).unwrap();
+        drop(guard_app);
     }
 
     /// An app with no cohosted scripts (any non-Void app): one stage, one
@@ -1960,7 +1966,8 @@ mod tests {
             timeout: Duration::from_secs(30),
             sourcemap: None,
         };
-        let app_dir = app_dir();
+        let guard_app = app_dir();
+        let app_dir = guard_app.path().to_path_buf();
 
         let stats = deploy_fleet_in_order(
             &pool,
@@ -2001,7 +2008,7 @@ mod tests {
             "{:?}",
             calls
         );
-        std::fs::remove_dir_all(&app_dir).unwrap();
+        drop(guard_app);
     }
 
     /// The app stage carries `--sourcemap <path>` so the Errors tab can
@@ -2028,7 +2035,8 @@ mod tests {
             timeout: Duration::from_secs(30),
             sourcemap: None,
         };
-        let app_dir = app_dir();
+        let guard_app = app_dir();
+        let app_dir = guard_app.path().to_path_buf();
         let map_path = app_dir.join("worker.js.map");
 
         deploy_fleet_in_order(

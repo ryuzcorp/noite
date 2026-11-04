@@ -576,14 +576,8 @@ fn display_rel(src: &Path, path: &Path) -> String {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "noite-build-output-{name}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new(&format!("noite-build-output-{name}"))
     }
 
     fn write(path: &Path, text: &str) {
@@ -625,7 +619,8 @@ mod tests {
 
     #[test]
     fn vite_plugin_output_becomes_a_celld_config_in_dist() {
-        let src = scratch("vite").canonicalize().unwrap();
+        let guard_vite = scratch("vite");
+        let src = guard_vite.path().canonicalize().unwrap();
         vite_worker_tree(&src);
 
         let built = built_deploy_root(&src).unwrap().expect("redirect followed");
@@ -665,7 +660,8 @@ mod tests {
 
     #[test]
     fn asset_only_output_moves_up_and_unpublishes_its_config() {
-        let src = scratch("assets").canonicalize().unwrap();
+        let guard_assets = scratch("assets");
+        let src = guard_assets.path().canonicalize().unwrap();
         write(
             &src.join(DEPLOY_REDIRECT),
             r#"{"configPath":"../../dist/client/wrangler.json"}"#,
@@ -694,7 +690,8 @@ mod tests {
 
     #[test]
     fn celld_ready_dist_config_wins() {
-        let src = scratch("oxide").canonicalize().unwrap();
+        let guard_oxide = scratch("oxide");
+        let src = guard_oxide.path().canonicalize().unwrap();
         vite_worker_tree(&src);
         write(
             &src.join("dist/wrangler.json"),
@@ -711,7 +708,8 @@ mod tests {
 
     #[test]
     fn no_build_output_falls_back() {
-        let src = scratch("plain").canonicalize().unwrap();
+        let guard_plain = scratch("plain");
+        let src = guard_plain.path().canonicalize().unwrap();
         write(
             &src.join("wrangler.jsonc"),
             r#"{"name":"app","main":"index.js"}"#,
@@ -721,9 +719,11 @@ mod tests {
 
     #[test]
     fn redirect_outside_the_worktree_is_refused() {
-        let outside = scratch("outside").canonicalize().unwrap();
+        let guard_outside = scratch("outside");
+        let outside = guard_outside.path().canonicalize().unwrap();
         write(&outside.join("wrangler.json"), r#"{"name":"x"}"#);
-        let src = scratch("escape").canonicalize().unwrap();
+        let guard_escape = scratch("escape");
+        let src = guard_escape.path().canonicalize().unwrap();
         let path = outside.join("wrangler.json");
         write(
             &src.join(DEPLOY_REDIRECT),
@@ -738,7 +738,8 @@ mod tests {
 
     #[test]
     fn output_sharing_the_source_root_is_refused() {
-        let src = scratch("shared").canonicalize().unwrap();
+        let guard_shared = scratch("shared");
+        let src = guard_shared.path().canonicalize().unwrap();
         write(&src.join("wrangler.jsonc"), r#"{"name":"app"}"#);
         write(
             &src.join(DEPLOY_REDIRECT),
@@ -756,15 +757,16 @@ mod tests {
 
     #[test]
     fn assetsignore_globs_are_refused() {
-        let dir = scratch("glob");
+        let guard_glob = scratch("glob");
+        let dir = guard_glob.path().to_path_buf();
         write(&dir.join(".assetsignore"), "*.map\n");
         assert!(apply_assetsignore(&dir).is_err());
     }
 
-    fn deploy_root(name: &str, config: &str) -> PathBuf {
-        let dir = scratch(name).canonicalize().unwrap();
-        write(&dir.join("wrangler.json"), config);
-        dir
+    fn deploy_root(name: &str, config: &str) -> crate::testutil::TempDir {
+        let guard = scratch(name);
+        write(&guard.path().join("wrangler.json"), config);
+        guard
     }
 
     fn declares(dir: &Path, sandbox_disabled: bool) -> bool {
@@ -779,12 +781,13 @@ mod tests {
     #[test]
     fn container_runtime_is_refused() {
         for runtime in [r#""runsc""#, "null"] {
-            let dir = deploy_root(
+            let guard_runtime = deploy_root(
                 "runtime",
                 &format!(
                     r#"{{"name":"a","containers":[{{"class_name":"Sandbox","image":"ghcr.io/x/y:tag","runtime":{runtime}}}]}}"#
                 ),
             );
+            let dir = guard_runtime.path().canonicalize().unwrap();
             let text = format!("{:#}", plan_containers(&dir, false).unwrap_err());
             assert!(text.contains("containers[0].runtime is refused"), "{text}");
             assert!(text.contains("operator-owned"), "{text}");
@@ -796,7 +799,8 @@ mod tests {
     /// `image`, and a Dockerfile is left to prepare, with its context.
     #[test]
     fn voids_container_shape_normalizes_for_celld() {
-        let dir = scratch("void-shape").canonicalize().unwrap();
+        let guard_void_shape = scratch("void-shape");
+        let dir = guard_void_shape.path().canonicalize().unwrap();
         write(&dir.join("sandbox/Dockerfile"), "FROM scratch\n");
         let dockerfile = dir.join("sandbox/Dockerfile");
         write(
@@ -847,7 +851,8 @@ mod tests {
     /// so a relative path would dangle).
     #[test]
     fn staged_plan_renders_absolute_without_writing() {
-        let dir = scratch("staged-plan").canonicalize().unwrap();
+        let guard_staged_plan = scratch("staged-plan");
+        let dir = guard_staged_plan.path().canonicalize().unwrap();
         write(&dir.join("sandbox/Dockerfile"), "FROM scratch\n");
         let dockerfile = dir.join("sandbox/Dockerfile");
         write(
@@ -906,10 +911,11 @@ mod tests {
             ),
             ("empty", r#"{"class_name":"S","images":{"default":{}}}"#),
         ] {
-            let dir = deploy_root(
+            let guard_void_bad = deploy_root(
                 "void-bad",
                 &format!(r#"{{"name":"a","containers":[{entry}]}}"#),
             );
+            let dir = guard_void_bad.path().canonicalize().unwrap();
             assert!(
                 plan_containers(&dir, false).is_err(),
                 "{name} must be refused"
@@ -924,7 +930,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn container_dockerfile_rule_matches_celld() {
-        let dir = scratch("dockerfile-rule").canonicalize().unwrap();
+        let guard_dockerfile_rule = scratch("dockerfile-rule");
+        let dir = guard_dockerfile_rule.path().canonicalize().unwrap();
         write(&dir.join("images/app/Dockerfile"), "FROM scratch\n");
         std::fs::create_dir_all(dir.join("emptydir")).unwrap();
         std::os::unix::fs::symlink(
@@ -956,7 +963,8 @@ mod tests {
     /// `RUN` steps on the host engine).
     #[test]
     fn a_file_named_by_images_default_image_is_prepared() {
-        let dir = scratch("images-image-file").canonicalize().unwrap();
+        let guard_images_image_file = scratch("images-image-file");
+        let dir = guard_images_image_file.path().canonicalize().unwrap();
         write(&dir.join("Dockerfile"), "FROM node:26\nRUN echo pwned\n");
         write(
             &dir.join("wrangler.json"),
@@ -977,7 +985,8 @@ mod tests {
 
     #[test]
     fn too_many_dockerfile_entries_are_refused() {
-        let dir = scratch("many-dockerfiles").canonicalize().unwrap();
+        let guard_many_dockerfiles = scratch("many-dockerfiles");
+        let dir = guard_many_dockerfiles.path().canonicalize().unwrap();
         write(&dir.join("Dockerfile"), "FROM scratch\n");
         let entries: Vec<String> = (0..=MAX_DOCKERFILE_ENTRIES)
             .map(|i| format!(r#"{{"class_name":"S{i}","image":"Dockerfile"}}"#))
@@ -995,14 +1004,16 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn void_relocation_never_writes_through_a_planted_link() {
-        let src = scratch("void-link").canonicalize().unwrap();
+        let guard_void_link = scratch("void-link");
+        let src = guard_void_link.path().canonicalize().unwrap();
         write(
             &src.join("dist/ssr/wrangler.json"),
             r#"{"name":"app","main":"index.js","assets":{"directory":"../client"}}"#,
         );
         write(&src.join("dist/ssr/index.js"), "export default {}");
         write(&src.join("dist/client/a.txt"), "");
-        let victim = scratch("void-link-victim").join("owned");
+        let guard_victim = scratch("void-link-victim");
+        let victim = guard_victim.path().join("owned");
         std::os::unix::fs::symlink(&victim, src.join("dist/wrangler.json")).unwrap();
         built_deploy_root(&src).unwrap().expect("Void output");
         assert!(!victim.exists(), "the write followed the link");
@@ -1016,19 +1027,22 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn void_output_linked_out_of_the_worktree_is_refused() {
-        let outside = scratch("void-outside").canonicalize().unwrap();
+        let guard_void_outside = scratch("void-outside");
+        let outside = guard_void_outside.path().canonicalize().unwrap();
         write(
             &outside.join("ssr/wrangler.json"),
             r#"{"name":"stolen","vars":{"SECRET":"x"}}"#,
         );
-        let file_link = scratch("void-file-link").canonicalize().unwrap();
+        let guard_void_file_link = scratch("void-file-link");
+        let file_link = guard_void_file_link.path().canonicalize().unwrap();
         std::fs::create_dir_all(file_link.join("dist/ssr")).unwrap();
         std::os::unix::fs::symlink(
             outside.join("ssr/wrangler.json"),
             file_link.join("dist/ssr/wrangler.json"),
         )
         .unwrap();
-        let dir_link = scratch("void-dir-link").canonicalize().unwrap();
+        let guard_void_dir_link = scratch("void-dir-link");
+        let dir_link = guard_void_dir_link.path().canonicalize().unwrap();
         std::os::unix::fs::symlink(&outside, dir_link.join("dist")).unwrap();
         for src in [file_link, dir_link] {
             let err = built_deploy_root(&src).unwrap_err();
@@ -1048,19 +1062,23 @@ mod tests {
     /// without containers (or with an empty array) still deploys.
     #[test]
     fn containers_refused_when_sandbox_disabled() {
-        let dir = deploy_root(
+        let guard_sandbox_off = deploy_root(
             "sandbox-off",
             r#"{"name":"a","containers":[{"class_name":"Sandbox","image":"ghcr.io/x/y:tag"}]}"#,
         );
+        let dir = guard_sandbox_off.path().canonicalize().unwrap();
         let err = plan_containers(&dir, true).unwrap_err();
         assert!(
             format!("{err:#}")
                 .contains("Sandbox containers are off on this install (NOITE_SANDBOX)"),
             "{err:#}"
         );
-        let dir = deploy_root("sandbox-off-empty", r#"{"name":"a","containers":[]}"#);
+        let guard_sandbox_off_empty =
+            deploy_root("sandbox-off-empty", r#"{"name":"a","containers":[]}"#);
+        let dir = guard_sandbox_off_empty.path().canonicalize().unwrap();
         assert!(!declares(&dir, true));
-        let dir = deploy_root("sandbox-off-none", r#"{"name":"a"}"#);
+        let guard_sandbox_off_none = deploy_root("sandbox-off-none", r#"{"name":"a"}"#);
+        let dir = guard_sandbox_off_none.path().canonicalize().unwrap();
         assert!(!declares(&dir, true));
     }
 
@@ -1069,10 +1087,11 @@ mod tests {
     /// reject, so the plan passes it through.
     #[test]
     fn container_plan_reports_and_defers() {
-        let dir = deploy_root(
+        let guard_registry = deploy_root(
             "registry",
             r#"{"name":"a","containers":[{"class_name":"Sandbox","image":"ghcr.io/x/y:tag"}]}"#,
         );
+        let dir = guard_registry.path().canonicalize().unwrap();
         assert!(declares(&dir, false));
         // celld reads `wrangler.jsonc` first: a jsonc without containers
         // wins over a json with a refused key.
@@ -1087,7 +1106,8 @@ mod tests {
             ("not-object", Some("[1]")),
             ("not-array", Some(r#"{"name":"a","containers":{}}"#)),
         ] {
-            let dir = scratch(name).canonicalize().unwrap();
+            let guard_iter = scratch(name);
+            let dir = guard_iter.path().canonicalize().unwrap();
             if let Some(config) = config {
                 write(&dir.join("wrangler.json"), config);
             }
@@ -1099,7 +1119,8 @@ mod tests {
         // A non-empty array declares containers even when its shape is
         // celld's to reject (it fails before pulling, so the stretched
         // timeout costs nothing).
-        let dir = scratch("not-entry").canonicalize().unwrap();
+        let guard_not_entry = scratch("not-entry");
+        let dir = guard_not_entry.path().canonicalize().unwrap();
         write(
             &dir.join("wrangler.json"),
             r#"{"name":"a","containers":["x"]}"#,
@@ -1112,7 +1133,8 @@ mod tests {
     /// and only the keys celld accepts.
     #[test]
     fn voids_own_output_becomes_the_deploy_root() {
-        let src = scratch("void-output").canonicalize().unwrap();
+        let guard_void_output = scratch("void-output");
+        let src = guard_void_output.path().canonicalize().unwrap();
         write(
             &src.join("dist/ssr/wrangler.json"),
             r#"{"name":"app","main":"index.js","compatibility_date":"2026-09-01","no_bundle":true,"rules":[],
@@ -1139,7 +1161,8 @@ mod tests {
     /// celld refuses, so the deploy can fail naming the missing settings.
     #[test]
     fn void_required_secrets_survive_the_drop() {
-        let src = scratch("void-required").canonicalize().unwrap();
+        let guard_void_required = scratch("void-required");
+        let src = guard_void_required.path().canonicalize().unwrap();
         write(
             &src.join("dist/ssr/wrangler.json"),
             r#"{"name":"app","main":"index.js","assets":{"directory":"../client"},
@@ -1162,7 +1185,8 @@ mod tests {
     /// the runner's Void injections never touch them.
     #[test]
     fn only_voids_own_output_marks_a_void_app() {
-        let src = scratch("void-flag").canonicalize().unwrap();
+        let guard_void_flag = scratch("void-flag");
+        let src = guard_void_flag.path().canonicalize().unwrap();
         write(
             &src.join("dist/ssr/wrangler.json"),
             r#"{"name":"app","main":"index.js","assets":{"directory":"../client"}}"#,
@@ -1173,12 +1197,16 @@ mod tests {
         assert!(built.void);
         assert!(built.note.contains("Void"));
 
-        let src = scratch("redirect-flag").canonicalize().unwrap();
+        let guard_redirect_flag = scratch("redirect-flag");
+
+        let src = guard_redirect_flag.path().canonicalize().unwrap();
         vite_worker_tree(&src);
         let built = built_deploy_root(&src).unwrap().expect("redirect");
         assert!(!built.void);
 
-        let src = scratch("oxide-flag").canonicalize().unwrap();
+        let guard_oxide_flag = scratch("oxide-flag");
+
+        let src = guard_oxide_flag.path().canonicalize().unwrap();
         vite_worker_tree(&src);
         write(
             &src.join("dist/wrangler.json"),
