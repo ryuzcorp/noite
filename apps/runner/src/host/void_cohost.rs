@@ -324,6 +324,13 @@ fn parse_staged_version(stdout: &str) -> anyhow::Result<StagedVersion> {
         hex16,
         "staged deploy output carries no 16-hex version: {stdout:?}"
     );
+    // A celld that accepted `--no-activate` without staging would move the
+    // pointer here and silently reopen the window this sequence closes.
+    anyhow::ensure!(
+        row.get("staged").and_then(Value::as_bool) == Some(true)
+            && row.get("dry_run").and_then(Value::as_bool) == Some(false),
+        "staged deploy output does not report a staged version: {stdout:?}"
+    );
     Ok(StagedVersion {
         worker: worker.to_string(),
         version: version.to_string(),
@@ -1070,9 +1077,11 @@ mod tests {
         assert_eq!(staged.version, "0123456789abcdef");
         // A single lowercase char is a valid script name.
         assert_eq!(
-            parse_staged_version("{\"worker\": \"a\", \"version\": \"0123456789abcdef\"}")
-                .unwrap()
-                .worker,
+            parse_staged_version(
+                "{\"worker\": \"a\", \"version\": \"0123456789abcdef\", \"dry_run\": false, \"staged\": true}"
+            )
+            .unwrap()
+            .worker,
             "a"
         );
 
@@ -1093,6 +1102,9 @@ mod tests {
             "{\"worker\": \"app_name\", \"version\": \"0123456789abcdef\"}",
             "{\"worker\": \"a b\", \"version\": \"0123456789abcdef\"}",
             "{\"worker\": \"app=1\", \"version\": \"0123456789abcdef\"}",
+            // A version celld did not stage (pointer moved, or a dry run).
+            "{\"worker\": \"test-app\", \"version\": \"0123456789abcdef\", \"staged\": false, \"dry_run\": false}",
+            "{\"worker\": \"test-app\", \"version\": \"0123456789abcdef\", \"staged\": true, \"dry_run\": true}",
         ] {
             assert!(
                 parse_staged_version(bad).is_err(),
@@ -1109,31 +1121,16 @@ mod tests {
         .is_err());
     }
 
-    /// A fake `celld`: appends its argv to `$FAKE_CELLD_LOG`, then fails
-    /// invocation `n` (zero-based) when `$FAKE_CELLD_DIR/fail-<n>` exists
-    /// (file content to stderr, exit 1). A `deploy` answers like
-    /// `celld deploy --no-activate --json` — one JSON object whose worker
-    /// is the project dir's `wrangler.json` name and whose version is the
-    /// invocation index as 16-hex, deterministic per invocation — and an
-    /// `activate` answers a text line the caller discards. The control
-    /// files and the deterministic versions make order, skip, retry and
-    /// the generation the activate names observable without sleeps.
-    const FAKE_CELLD: &str = r#"#!/bin/sh
-n=0
-if [ -f "$FAKE_CELLD_LOG" ]; then n=$(wc -l < "$FAKE_CELLD_LOG"); fi
-printf '%s\n' "$*" >> "$FAKE_CELLD_LOG"
-fail="$FAKE_CELLD_DIR/fail-$n"
-if [ -f "$fail" ]; then cat "$fail" >&2; exit 1; fi
-if [ "$1" = "deploy" ]; then
-  name=$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$2/wrangler.json" 2>/dev/null | head -n 1)
-  name=${name:-test-app}
-  version=$(printf '%016x' "$((n + 1))")
-  printf '{"worker": "%s", "version": "%s", "location": "s3://fake/%s", "dry_run": false, "staged": true}\n' "$name" "$version" "$version"
-else
-  echo "Activated generation: $2 (primary test-app)"
-fi
-"#;
-
+    /// A fake `celld` (`tests/fixtures/fake-celld-cohost.sh`): appends its
+    /// argv to `$FAKE_CELLD_LOG`, then fails invocation `n` (zero-based)
+    /// when `$FAKE_CELLD_DIR/fail-<n>` exists (file content to stderr, exit
+    /// 1). A `deploy` answers like `celld deploy --no-activate --json` — one
+    /// JSON object whose worker is the project dir's `wrangler.json` name
+    /// and whose version is the invocation index as 16-hex, deterministic
+    /// per invocation — and an `activate` answers a text line the caller
+    /// discards. The control files and the deterministic versions make
+    /// order, skip, retry and the generation the activate names observable
+    /// without sleeps.
     struct FakeCelld {
         dir: PathBuf,
     }
@@ -1143,13 +1140,13 @@ fi
             let dir =
                 std::env::temp_dir().join(format!("noite-fake-celld-{}", crate::models::new_id()));
             std::fs::create_dir_all(&dir).unwrap();
-            let bin = dir.join("celld");
-            std::fs::write(&bin, FAKE_CELLD).unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
+            // A symlink to the committed script, never a fresh file: exec'ing
+            // a just-written file while another test thread forks fails
+            // with ETXTBSY, which the infra retry then hides as a second
+            // attempt.
+            let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/fake-celld-cohost.sh");
+            std::os::unix::fs::symlink(fixture, dir.join("celld")).unwrap();
             Self { dir }
         }
 
