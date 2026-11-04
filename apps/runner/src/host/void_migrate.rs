@@ -1127,22 +1127,80 @@ fn preview(text: &str, len: usize) -> String {
     one_line(&text.chars().take(len).collect::<String>())
 }
 
-/// The deploy-side migration caller: `POST`/`GET` against the fleet's own
-/// listen port with the per-fleet proxy token, mirroring the platform's
-/// timeouts (10 s probes, 300 s executions, 30 s reconcile).
-#[derive(Debug, Clone)]
+/// The deploy-side migration caller: the platform's timeouts (10 s probes,
+/// 300 s executions, 30 s reconciles) over one of two deliveries — the
+/// fleet's own listen port after activation, or a staged generation through
+/// `celld invoke` before it. The endpoints, headers and every decision
+/// above the exchange (capability negotiation, attempt reconciliation, the
+/// legacy retry shape) are shared, so both deliveries carry identical
+/// semantics and only the transport differs.
+///
+/// No `Debug`: the token below is the fleet's proxy secret, and the staged
+/// delivery adds the operator token and bucket credentials beside it.
+#[derive(Clone)]
 pub struct MigrationClient {
-    client: reqwest::Client,
-    base: String,
+    transport: MigrateTransport,
     token: String,
     retry_delay: std::time::Duration,
+}
+
+/// Where one migration exchange runs. No `Debug`: the staged target below
+/// holds the operator token and bucket credentials beside the proxy token.
+#[derive(Clone)]
+enum MigrateTransport {
+    /// `POST`/`GET` against the fleet's own listen port with the per-fleet
+    /// proxy token.
+    Fleet {
+        client: reqwest::Client,
+        base: String,
+    },
+    /// One `celld invoke` per exchange against the staged generation: same
+    /// endpoints and headers, the operator token and bucket credentials
+    /// riding `CELLD_*` exactly as for `celld d1 execute`.
+    Staged { target: StagedTarget },
+}
+
+/// Everything one staged migration exchange needs, grouped so the
+/// constructor stays a plain function (`deploy.rs` groups `MigrateInputs`
+/// for the same reason). Pins name the staged generation — the cohosted
+/// scripts the request must see staged plus the app — with the app worker
+/// as the `--target` receiving the migrate endpoints. No `Debug`: `env`
+/// carries the operator token and bucket credentials.
+#[derive(Clone)]
+pub struct StagedTarget {
+    pub celld_bin: String,
+    pub env: Vec<(String, String)>,
+    pub bucket: String,
+    pub endpoint: String,
+    pub region: String,
+    /// `script=version` pins, deploy order (cohosted first, the app last).
+    pub pins: Vec<(String, String)>,
+    /// The app worker receiving the request.
+    pub target: String,
+}
+
+/// One migration exchange's answer: the worker's status and body, however
+/// delivered. The oversize case stays separate because an over-cap body of
+/// an unknown outcome still reconciles (like the fleet cap path), while a
+/// missing answer is always a transport failure.
+enum CallAnswer {
+    Answered { status: u16, body: String },
+    TooLarge { message: String },
+    Transport { message: String },
 }
 
 impl MigrationClient {
     pub fn new(client: reqwest::Client, base: String, token: String) -> Self {
         Self {
-            client,
-            base,
+            transport: MigrateTransport::Fleet { client, base },
+            token,
+            retry_delay: std::time::Duration::from_secs(1),
+        }
+    }
+
+    pub fn staged(target: StagedTarget, token: String) -> Self {
+        Self {
+            transport: MigrateTransport::Staged { target },
             token,
             retry_delay: std::time::Duration::from_secs(1),
         }
@@ -1157,24 +1215,81 @@ impl MigrationClient {
         self
     }
 
+    /// One exchange over whichever delivery this client carries: the
+    /// platform's method, path, headers and timeout, answered with the
+    /// worker's status and body. A `content-type: application/json` rides
+    /// every exchange with a body, exactly as the fleet path always sent.
+    async fn exchange(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        timeout: std::time::Duration,
+    ) -> CallAnswer {
+        match &self.transport {
+            MigrateTransport::Fleet { client, base } => {
+                let url = format!("{base}{path}");
+                let mut request = match method {
+                    "POST" => client.post(&url),
+                    _ => client.get(&url),
+                };
+                request = request.header("x-void-internal", &self.token);
+                if body.is_some() {
+                    request = request.header("content-type", "application/json");
+                }
+                if let Some(body) = body {
+                    request = request.body(body.to_vec());
+                }
+                let response = match request.timeout(timeout).send().await {
+                    Ok(response) => response,
+                    Err(e) => {
+                        return CallAnswer::Transport {
+                            message: one_line(&e.to_string()),
+                        };
+                    }
+                };
+                let status = response.status().as_u16();
+                match read_capped(response).await {
+                    Ok(text) => CallAnswer::Answered { status, body: text },
+                    Err(message) => CallAnswer::TooLarge { message },
+                }
+            }
+            MigrateTransport::Staged { target } => {
+                invoke_exchange(target, &self.token, method, path, body, timeout).await
+            }
+        }
+    }
+
+    /// The platform's per-call timeout, with headroom for the staged
+    /// delivery: every `celld invoke` builds a fresh isolate pool for the
+    /// staged generation, so the sub-minute probes budget a cold build.
+    /// Fast failures (no live node, a shed load) answer at once either way.
+    /// Executions (300 s) keep the platform's timeout on both deliveries.
+    fn probe_timeout(&self) -> std::time::Duration {
+        match self.transport {
+            MigrateTransport::Fleet { .. } => std::time::Duration::from_secs(10),
+            MigrateTransport::Staged { .. } => std::time::Duration::from_secs(60),
+        }
+    }
+
+    fn reconcile_timeout(&self) -> std::time::Duration {
+        match self.transport {
+            MigrateTransport::Fleet { .. } => std::time::Duration::from_secs(30),
+            MigrateTransport::Staged { .. } => std::time::Duration::from_secs(60),
+        }
+    }
+
     /// `GET /__void/migrate/capabilities`: the platform's
     /// `probeWorkerMigrationCapabilities`.
     pub async fn capabilities(&self) -> Result<Capabilities, ProbeError> {
-        let url = format!("{}/__void/migrate/capabilities", self.base);
-        let response = self
-            .client
-            .get(&url)
-            .header("x-void-internal", &self.token)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|e| ProbeError::Transport {
-                message: one_line(&e.to_string()),
-            })?;
-        let status = response.status().as_u16();
-        let text = match read_capped(response).await {
-            Ok(text) => text,
-            Err(message) => return Err(ProbeError::TooLarge { message }),
+        let timeout = self.probe_timeout();
+        let answer = self
+            .exchange("GET", "/__void/migrate/capabilities", None, timeout)
+            .await;
+        let (status, text) = match answer {
+            CallAnswer::Transport { message } => return Err(ProbeError::Transport { message }),
+            CallAnswer::TooLarge { message } => return Err(ProbeError::TooLarge { message }),
+            CallAnswer::Answered { status, body } => (status, body),
         };
         if !(200..300).contains(&status) {
             return Err(ProbeError::Http {
@@ -1222,28 +1337,24 @@ impl MigrationClient {
     /// unparsable body reconciles via `GET .../attempt/:attemptId`; a parsed
     /// `ok: false` is definitive and returns as is.
     pub async fn migrate_app(&self, attempt_id: &str, deployment_id: &str) -> MigrateResponse {
-        let url = format!("{}/__void/migrate/app", self.base);
-        let body = serde_json::json!({"attemptId": attempt_id, "deploymentId": deployment_id});
+        let body =
+            serde_json::json!({"attemptId": attempt_id, "deploymentId": deployment_id}).to_string();
         match self
-            .client
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("x-void-internal", &self.token)
-            .timeout(std::time::Duration::from_secs(300))
-            .json(&body)
-            .send()
+            .exchange(
+                "POST",
+                "/__void/migrate/app",
+                Some(body.as_bytes()),
+                std::time::Duration::from_secs(300),
+            )
             .await
         {
-            Ok(response) => {
-                // An oversized body is an unknown outcome, like garbage: the
-                // migration may have applied, so reconcile rather than fail.
-                let text = match read_capped(response).await {
-                    Ok(text) => text,
-                    Err(e) => {
-                        tracing::warn!(attempt_id, error = %e, "migration response past the cap; reconciling");
-                        return self.reconcile_twice(attempt_id).await;
-                    }
-                };
+            // An oversized body is an unknown outcome, like garbage: the
+            // migration may have applied, so reconcile rather than fail.
+            CallAnswer::TooLarge { message: e } => {
+                tracing::warn!(attempt_id, error = %e, "migration response past the cap; reconciling");
+                self.reconcile_twice(attempt_id).await
+            }
+            CallAnswer::Answered { body: text, .. } => {
                 if is_cf_asset_stub(&text) {
                     return self.reconcile_twice(attempt_id).await;
                 }
@@ -1252,11 +1363,11 @@ impl MigrationClient {
                     Err(_) => self.reconcile_twice(attempt_id).await,
                 }
             }
-            Err(e) => {
+            CallAnswer::Transport { message } => {
                 // The platform warns and reconciles once here (its nested
                 // try/catch reconciles twice only when the first reconcile
                 // itself throws — mirrored in `reconcile_twice`).
-                tracing::warn!(attempt_id, error = %e, "migration attempt unknown");
+                tracing::warn!(attempt_id, error = %message, "migration attempt unknown");
                 self.reconcile_once(attempt_id).await
             }
         }
@@ -1278,44 +1389,16 @@ impl MigrationClient {
     async fn reconcile_once(&self, attempt_id: &str) -> MigrateResponse {
         self.reconcile_request(attempt_id)
             .await
-            .unwrap_or_else(|e| MigrateResponse::transport_error(one_line(&e.to_string())))
+            .unwrap_or_else(|e| MigrateResponse::transport_error(one_line(&e)))
     }
 
     /// The platform's `reconcileStableAppMigration`.
-    async fn reconcile_request(&self, attempt_id: &str) -> Result<MigrateResponse, reqwest::Error> {
-        let url = format!(
-            "{}/__void/migrate/app/attempt/{}",
-            self.base,
-            urlencoding(attempt_id)
-        );
-        let response = self
-            .client
-            .get(&url)
-            .header("x-void-internal", &self.token)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await?;
-        let status = response.status().as_u16();
-        let text = match read_capped(response).await {
-            Ok(text) => text,
-            Err(message) => {
-                return Ok(MigrateResponse {
-                    ok: false,
-                    attempt_id: Some(attempt_id.to_string()),
-                    migrations: Vec::new(),
-                    confirmed_applied: Vec::new(),
-                    confirmed_skipped: Vec::new(),
-                    stability: Some("stable".to_string()),
-                    warnings: Vec::new(),
-                    error: Some(format!("migration outcome unknown and {}", message)),
-                    warnings_dropped: 0,
-                    migrations_dropped: 0,
-                });
-            }
-        };
-        match serde_json::from_str::<Value>(&text) {
-            Ok(value) => Ok(normalize_response(value, &preview(&text, 500))),
-            Err(_) => Ok(MigrateResponse {
+    async fn reconcile_request(&self, attempt_id: &str) -> Result<MigrateResponse, String> {
+        let path = format!("/__void/migrate/app/attempt/{}", urlencoding(attempt_id));
+        let timeout = self.reconcile_timeout();
+        match self.exchange("GET", &path, None, timeout).await {
+            CallAnswer::Transport { message } => Err(message),
+            CallAnswer::TooLarge { message } => Ok(MigrateResponse {
                 ok: false,
                 attempt_id: Some(attempt_id.to_string()),
                 migrations: Vec::new(),
@@ -1323,49 +1406,68 @@ impl MigrationClient {
                 confirmed_skipped: Vec::new(),
                 stability: Some("stable".to_string()),
                 warnings: Vec::new(),
-                error: Some(format!(
-                    "migration outcome unknown and reconciliation returned {}: {}",
-                    status,
-                    preview(&text, 200)
-                )),
+                error: Some(format!("migration outcome unknown and {}", message)),
                 warnings_dropped: 0,
                 migrations_dropped: 0,
             }),
+            CallAnswer::Answered { status, body: text } => {
+                match serde_json::from_str::<Value>(&text) {
+                    Ok(value) => Ok(normalize_response(value, &preview(&text, 500))),
+                    Err(_) => Ok(MigrateResponse {
+                        ok: false,
+                        attempt_id: Some(attempt_id.to_string()),
+                        migrations: Vec::new(),
+                        confirmed_applied: Vec::new(),
+                        confirmed_skipped: Vec::new(),
+                        stability: Some("stable".to_string()),
+                        warnings: Vec::new(),
+                        error: Some(format!(
+                            "migration outcome unknown and reconciliation returned {}: {}",
+                            status,
+                            preview(&text, 200)
+                        )),
+                        warnings_dropped: 0,
+                        migrations_dropped: 0,
+                    }),
+                }
+            }
         }
     }
 
     /// `POST /__void/migrate/auth`: the platform's
     /// `dispatchStableAuthMigration`.
     pub async fn migrate_auth(&self) -> Result<(), String> {
-        let url = format!("{}/__void/migrate/auth", self.base);
-        let response = self
-            .client
-            .post(&url)
-            .header("x-void-internal", &self.token)
-            .timeout(std::time::Duration::from_secs(300))
-            .send()
-            .await
-            .map_err(|e| one_line(&e.to_string()))?;
-        let status = response.status().as_u16();
-        let text = match read_capped(response).await {
-            Ok(text) => text,
-            Err(message) => return Err(format!("auth migration failed: {}", message)),
-        };
-        let data: Value = serde_json::from_str(&text).map_err(|_| {
-            format!(
-                "auth migration failed ({}): {}",
-                status,
-                preview(&text, 200)
+        match self
+            .exchange(
+                "POST",
+                "/__void/migrate/auth",
+                None,
+                std::time::Duration::from_secs(300),
             )
-        })?;
-        if (200..300).contains(&status) && data.get("ok").and_then(Value::as_bool) == Some(true) {
-            Ok(())
-        } else {
-            let detail = data
-                .get("error")
-                .and_then(Value::as_str)
-                .map_or_else(|| status.to_string(), one_line);
-            Err(format!("auth migration failed: {}", detail))
+            .await
+        {
+            CallAnswer::Transport { message } => Err(one_line(&message)),
+            CallAnswer::TooLarge { message } => Err(format!("auth migration failed: {}", message)),
+            CallAnswer::Answered { status, body: text } => {
+                let data: Value = serde_json::from_str(&text).map_err(|_| {
+                    format!(
+                        "auth migration failed ({}): {}",
+                        status,
+                        preview(&text, 200)
+                    )
+                })?;
+                if (200..300).contains(&status)
+                    && data.get("ok").and_then(Value::as_bool) == Some(true)
+                {
+                    Ok(())
+                } else {
+                    let detail = data
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map_or_else(|| status.to_string(), one_line);
+                    Err(format!("auth migration failed: {}", detail))
+                }
+            }
         }
     }
 
@@ -1377,47 +1479,213 @@ impl MigrationClient {
             if attempt > 0 {
                 tokio::time::sleep(self.retry_delay * 2u32.pow(attempt - 1)).await;
             }
-            let url = format!("{}/__void/migrate", self.base);
-            let response = self
-                .client
-                .post(&url)
-                .header("x-void-internal", &self.token)
-                .timeout(std::time::Duration::from_secs(300))
-                .send()
+            match self
+                .exchange(
+                    "POST",
+                    "/__void/migrate",
+                    None,
+                    std::time::Duration::from_secs(300),
+                )
                 .await
-                .map_err(|e| one_line(&e.to_string()))?;
-            let status = response.status().as_u16();
-            // A capped body is a verdict, not propagation: it fails at once,
-            // with no retry.
-            let text = match read_capped(response).await {
-                Ok(text) => text,
-                Err(message) => return Err(message),
-            };
-            if is_cf_asset_stub(&text) {
-                tracing::warn!(attempt, "migration dispatch hit an asset stub; retrying");
-                continue;
-            }
-            match serde_json::from_str::<Value>(&text) {
-                Ok(value) => return Ok(normalize_response(value, &preview(&text, 500))),
-                Err(_) => {
-                    if (200..300).contains(&status) {
-                        tracing::warn!(
-                            attempt,
-                            status,
-                            "migration dispatch non-JSON 2xx; retrying"
-                        );
+            {
+                // A throw fails at once, with no retry.
+                CallAnswer::Transport { message } => return Err(one_line(&message)),
+                // A capped body is a verdict, not propagation: it fails at
+                // once, with no retry.
+                CallAnswer::TooLarge { message } => return Err(message),
+                CallAnswer::Answered { status, body: text } => {
+                    if is_cf_asset_stub(&text) {
+                        tracing::warn!(attempt, "migration dispatch hit an asset stub; retrying");
                         continue;
                     }
-                    return Err(format!(
-                        "migration failed ({}): {}",
-                        status,
-                        preview(&text, 200)
-                    ));
+                    match serde_json::from_str::<Value>(&text) {
+                        Ok(value) => {
+                            return Ok(normalize_response(value, &preview(&text, 500)));
+                        }
+                        Err(_) => {
+                            if (200..300).contains(&status) {
+                                tracing::warn!(
+                                    attempt,
+                                    status,
+                                    "migration dispatch non-JSON 2xx; retrying"
+                                );
+                                continue;
+                            }
+                            return Err(format!(
+                                "migration failed ({}): {}",
+                                status,
+                                preview(&text, 200)
+                            ));
+                        }
+                    }
                 }
             }
         }
         Err("migration dispatch failed after retries".to_string())
     }
+}
+
+/// One migration exchange over the staged generation: `celld invoke` with
+/// the staged pins plus the app as `--target`, the fleet's proxy token on
+/// `x-void-internal`, and `--json` so the worker's status and body come
+/// back however the answer reads. The CLI waits up to ten minutes; the
+/// runner's own timeout fires first (the platform's 10/300/30 s), and a
+/// timeout is unknown, never failed — the invoke runs to completion on the
+/// node, which is exactly what the reconcile path is for.
+async fn invoke_exchange(
+    target: &StagedTarget,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    timeout: std::time::Duration,
+) -> CallAnswer {
+    let mut args: Vec<String> = Vec::with_capacity(target.pins.len() + 16);
+    args.push("invoke".to_string());
+    for (script, version) in &target.pins {
+        args.push(format!("{script}={version}"));
+    }
+    args.push("--target".to_string());
+    args.push(target.target.clone());
+    args.push("--method".to_string());
+    args.push(method.to_string());
+    args.push("--path".to_string());
+    args.push(path.to_string());
+    // The proxy token rides argv (`--header`): `celld invoke` takes headers
+    // only from flags (the body has `--body-file`; headers have no file
+    // equivalent), and env is equally same-uid-visible, so there is no
+    // quieter channel today. The exposure is the token alone — the operator
+    // token and bucket credentials stay in the child's env, as with every
+    // other operator call — for the invoke's own runtime, to code that
+    // already holds this token as the worker. A `--header-file` (0600)
+    // would close even that; until celld grows one, concurrent same-uid
+    // code is trusted with fleet proxy tokens.
+    args.push("--header".to_string());
+    args.push(format!("x-void-internal:{token}"));
+    if let Some(body) = body {
+        let Ok(text) = std::str::from_utf8(body) else {
+            return CallAnswer::Transport {
+                message: "migration request body is not UTF-8".to_string(),
+            };
+        };
+        args.push("--header".to_string());
+        args.push("content-type:application/json".to_string());
+        args.push("--body".to_string());
+        args.push(text.to_string());
+    }
+    args.push("--json".to_string());
+    args.push("--bucket".to_string());
+    args.push(target.bucket.clone());
+    args.push("--endpoint".to_string());
+    args.push(target.endpoint.clone());
+    args.push("--region".to_string());
+    args.push(target.region.clone());
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let env: Vec<(&str, &str)> = target
+        .env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let output =
+        match crate::host::exec::run_cmd_output(&target.celld_bin, &arg_refs, None, &env, timeout)
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                return CallAnswer::Transport {
+                    message: one_line(&format!("{e:#}")),
+                };
+            }
+        };
+    // A non-2xx answer still prints its envelope before the nonzero exit,
+    // so the status decides like the fleet path's; only a missing envelope
+    // — no live node, a shed load, a killed caller — is a transport
+    // failure with an unknown outcome. Stderr is preview-capped: it is
+    // celld's own error lines (tenant bytes arrive on stdout), and the
+    // deploy error truncates it further downstream.
+    match parse_invoke_answer(&output.stdout) {
+        InvokeParse::Answered { status, body } => CallAnswer::Answered {
+            status,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        },
+        InvokeParse::TooLarge { message } => CallAnswer::TooLarge { message },
+        InvokeParse::NoEnvelope => CallAnswer::Transport {
+            message: one_line(&preview(&String::from_utf8_lossy(&output.stderr), 500)),
+        },
+    }
+}
+
+/// What `celld invoke --json` stdout carried.
+#[derive(Debug)]
+enum InvokeParse {
+    Answered { status: u16, body: Vec<u8> },
+    TooLarge { message: String },
+    NoEnvelope,
+}
+
+/// Parse the `--json` result envelope (`{"status","headers","body"}` with
+/// a base64 body), whatever the exit status. The body stays capped at
+/// [`MAX_RESPONSE_BYTES`], like the fleet path's streaming cap: stdout
+/// itself arrives whole from the child (bounded above by the node's 64 MiB
+/// staged-answer cap), so anything past the largest envelope a within-cap
+/// body can fill — base64 inflates 4/3, plus slack for the JSON frame —
+/// verdicts oversized before a byte parses, and an answer past the cap is
+/// known before a byte decodes.
+fn parse_invoke_answer(stdout: &[u8]) -> InvokeParse {
+    // Largest stdout a within-cap body can fill: the base64 alone, plus
+    // slack for `{"status","headers","body"}`. Past it the body is over
+    // the cap or the bytes never were an envelope — both verdict TooLarge,
+    // as the fleet path's cap verdicts any over-cap body however it reads.
+    if stdout.len() > MAX_RESPONSE_BYTES / 3 * 4 + 4 + 128 {
+        return InvokeParse::TooLarge {
+            message: format!(
+                "migration invoke answer of {} bytes is over the {} MiB cap",
+                stdout.len(),
+                MAX_RESPONSE_BYTES / 1024 / 1024
+            ),
+        };
+    }
+    let value: Value = match serde_json::from_slice(stdout) {
+        Ok(value) => value,
+        Err(_) => return InvokeParse::NoEnvelope,
+    };
+    let Some(status) = value.get("status").and_then(Value::as_u64) else {
+        return InvokeParse::NoEnvelope;
+    };
+    let Ok(status) = u16::try_from(status) else {
+        return InvokeParse::NoEnvelope;
+    };
+    let Some(body_b64) = value.get("body").and_then(Value::as_str) else {
+        return InvokeParse::NoEnvelope;
+    };
+    // Bound the decode before it runs: anything past the cap is TooLarge
+    // with no buffer spent, like the fleet path's declared-length check.
+    if body_b64.len() > MAX_RESPONSE_BYTES / 3 * 4 + 4 {
+        return InvokeParse::TooLarge {
+            message: format!(
+                "migration invoke answer of ~{} bytes is over the {} MiB cap",
+                body_b64.len() / 4 * 3,
+                MAX_RESPONSE_BYTES / 1024 / 1024
+            ),
+        };
+    }
+    // Undecodable counts as garbage, like any unparsable fleet body: the
+    // status still decides, and the body parses as nothing.
+    let body = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        body_b64.as_bytes(),
+    )
+    .unwrap_or_default();
+    if body.len() > MAX_RESPONSE_BYTES {
+        return InvokeParse::TooLarge {
+            message: format!(
+                "migration invoke answer of {} bytes is over the {} MiB cap",
+                body.len(),
+                MAX_RESPONSE_BYTES / 1024 / 1024
+            ),
+        };
+    }
+    InvokeParse::Answered { status, body }
 }
 
 /// Percent-encode one path segment (the attempt id): what
@@ -2550,5 +2818,309 @@ mod tests {
         std::fs::write(dir.join("void.json"), vec![b'x'; MAX_VOID_JSON_BYTES + 1]).unwrap();
         let err = resolve_migrations_dir(&dir).unwrap_err().to_string();
         assert!(err.contains("over the 1 MiB cap"), "{}", err);
+    }
+
+    // --- staged transport (`celld invoke`) ----------------------------------
+
+    /// A fake `celld` for the staged transport: the committed cohost
+    /// fixture, fixture-driven per `invoke --path` like the deploy seam.
+    struct FakeInvoke {
+        dir: crate::testutil::TempDir,
+    }
+
+    impl FakeInvoke {
+        fn spawn() -> Self {
+            let dir = crate::testutil::TempDir::new("noite-staged-transport");
+            // A symlink to the committed script, never a fresh file: the
+            // cohost seam's rule (ETXTBSY under parallel load).
+            let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/fake-celld-cohost.sh");
+            std::os::unix::fs::symlink(&fixture, dir.path().join("celld")).unwrap();
+            Self { dir }
+        }
+
+        fn staged(&self) -> MigrationClient {
+            let log = self
+                .dir
+                .path()
+                .join("invocations.log")
+                .to_string_lossy()
+                .into_owned();
+            let dir = self.dir.path().to_string_lossy().into_owned();
+            MigrationClient::staged(
+                StagedTarget {
+                    celld_bin: self.dir.path().join("celld").to_string_lossy().into_owned(),
+                    env: vec![
+                        ("FAKE_CELLD_LOG".to_string(), log),
+                        ("FAKE_CELLD_DIR".to_string(), dir),
+                    ],
+                    bucket: "s3://noite/fleets/staged".to_string(),
+                    endpoint: "http://rustfs:9000".to_string(),
+                    region: "us-east-1".to_string(),
+                    pins: vec![
+                        ("test-proxy".to_string(), "0000000000000001".to_string()),
+                        ("test-app".to_string(), "0000000000000002".to_string()),
+                    ],
+                    target: "test-app".to_string(),
+                },
+                "token".to_string(),
+            )
+            .with_retry_delay(std::time::Duration::from_millis(0))
+        }
+
+        /// Write one `--json` invoke fixture: the full result envelope the
+        /// fake cats to stdout for the endpoint `name`.
+        fn write_invoke(&self, name: &str, status: u16, body: &str) {
+            use base64::Engine as _;
+            let envelope = serde_json::json!({
+                "status": status,
+                "headers": {},
+                "body": base64::engine::general_purpose::STANDARD.encode(body),
+            });
+            std::fs::write(
+                self.dir.path().join(name),
+                serde_json::to_string(&envelope).unwrap(),
+            )
+            .unwrap();
+        }
+
+        fn fail_invoke(&self, name: &str, message: &str) {
+            std::fs::write(self.dir.path().join(format!("{name}.fail")), message).unwrap();
+        }
+
+        fn invocations(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("invocations.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    /// The staged capabilities probe parses v2 and pins the generation:
+    /// every staged pin rides the argv with the app as `--target`, the
+    /// fleet's proxy token on `x-void-internal`, and `--json` for the
+    /// envelope.
+    #[tokio::test]
+    async fn staged_capabilities_parses_v2_and_pins_the_generation() {
+        let fake = FakeInvoke::spawn();
+        fake.write_invoke(
+            "invoke-capabilities",
+            200,
+            &serde_json::json!({
+                "protocolVersion": 2,
+                "dialect": "sqlite",
+                "classifierVersion": CLASSIFIER_VERSION,
+                "migrationListHash": "list-hash",
+                "destructiveValidation": "passed",
+                "endpoints": {"auth": "/auth"},
+            })
+            .to_string(),
+        );
+        let caps = fake.staged().capabilities().await.expect("v2");
+        assert_eq!(caps.dialect, "sqlite");
+        assert_eq!(caps.migration_list_hash, "list-hash");
+        assert_eq!(caps.auth_endpoint.as_deref(), Some("/auth"));
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        for expected in [
+            "invoke test-proxy=0000000000000001 test-app=0000000000000002",
+            "--target test-app",
+            "--method GET",
+            "--path /__void/migrate/capabilities",
+            "--header x-void-internal:token",
+            "--json",
+            "--bucket s3://noite/fleets/staged",
+            "--endpoint http://rustfs:9000",
+            "--region us-east-1",
+        ] {
+            assert!(calls[0].contains(expected), "{}", calls[0]);
+        }
+        assert!(!calls[0].contains("--body"), "{}", calls[0]);
+    }
+
+    /// A non-2xx staged answer reads like the fleet path's: no v2 shape, so
+    /// the deploy falls back to the legacy endpoint.
+    #[tokio::test]
+    async fn staged_capabilities_non_2xx_answers_without_v2() {
+        let fake = FakeInvoke::spawn();
+        fake.write_invoke("invoke-capabilities", 404, "not found");
+        let err = fake.staged().capabilities().await.expect_err("no v2");
+        match err {
+            ProbeError::Http { status, .. } => assert_eq!(status, 404),
+            other => panic!("expected an Http probe error, got {other:?}"),
+        }
+    }
+
+    /// No envelope — no live node, a shed load, a killed caller — is a
+    /// transport error with an unknown outcome, like the fleet path's.
+    #[tokio::test]
+    async fn staged_capabilities_without_envelope_is_a_transport_error() {
+        let fake = FakeInvoke::spawn();
+        fake.fail_invoke("invoke-capabilities", "no live node");
+        let err = fake.staged().capabilities().await.expect_err("no node");
+        match err {
+            ProbeError::Transport { message } => {
+                assert!(message.contains("no live node"), "{message}")
+            }
+            other => panic!("expected a Transport probe error, got {other:?}"),
+        }
+    }
+
+    /// A garbage staged body reconciles through the attempt endpoint, like
+    /// the fleet path's garbage: the outcome is unknown, never failed.
+    #[tokio::test]
+    async fn staged_migrate_app_garbage_body_reconciles() {
+        let fake = FakeInvoke::spawn();
+        fake.write_invoke("invoke-app", 200, "this is not json");
+        fake.write_invoke(
+            "invoke-attempt",
+            200,
+            r#"{"ok":true,"migrations":[{"name":"0001.sql","applied":true}]}"#,
+        );
+        let response = fake.staged().migrate_app("migatt_test", "deploy-id").await;
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.attempt_id.as_deref(), None);
+        let calls = fake.invocations();
+        let attempts: Vec<_> = calls
+            .iter()
+            .filter(|call| call.contains("--path /__void/migrate/app/attempt/"))
+            .collect();
+        assert_eq!(attempts.len(), 1, "{calls:?}");
+        // The attempt id rides the reconcile path; the POST carried it in
+        // the JSON body.
+        let posts: Vec<_> = calls
+            .iter()
+            .filter(|call| call.contains("--path /__void/migrate/app "))
+            .collect();
+        assert_eq!(posts.len(), 1, "{calls:?}");
+        assert!(posts[0].contains("--body"), "{}", posts[0]);
+        assert!(
+            posts[0].contains("--header content-type:application/json"),
+            "{}",
+            posts[0]
+        );
+    }
+
+    /// The legacy endpoint runs staged too: one POST with no body, the
+    /// worker's answer parsed like the fleet path's.
+    #[tokio::test]
+    async fn staged_migrate_legacy_posts_without_a_body() {
+        let fake = FakeInvoke::spawn();
+        fake.write_invoke(
+            "invoke-legacy",
+            200,
+            r#"{"ok":true,"migrations":[{"name":"0001.sql","applied":true}]}"#,
+        );
+        let response = fake.staged().migrate_legacy().await.expect("legacy");
+        assert!(response.ok, "{:?}", response.error);
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].contains("--method POST"), "{}", calls[0]);
+        assert!(calls[0].contains("--path /__void/migrate "), "{}", calls[0]);
+        assert!(!calls[0].contains("--body"), "{}", calls[0]);
+    }
+
+    /// The `--json` envelope parses however the answer read: status and
+    /// base64 body on any exit, since a non-2xx answer still prints its
+    /// envelope before failing.
+    #[test]
+    fn invoke_answer_parses_the_json_envelope() {
+        use base64::Engine as _;
+        let body = br#"{"ok":true}"#;
+        let stdout = serde_json::json!({
+            "status": 404,
+            "headers": {},
+            "body": base64::engine::general_purpose::STANDARD.encode(body),
+        })
+        .to_string();
+        match parse_invoke_answer(stdout.as_bytes()) {
+            InvokeParse::Answered { status, body } => {
+                assert_eq!(status, 404);
+                assert_eq!(body, br#"{"ok":true}"#);
+            }
+            other => panic!("expected an answered envelope, got {other:?}"),
+        }
+    }
+
+    /// Anything without an envelope — a CLI failure, a killed caller — is
+    /// no answer, never a parsed one: unparsable stdout, a missing status,
+    /// and a status wider than u16 all refuse alike.
+    #[test]
+    fn invoke_answer_without_an_envelope_is_no_answer() {
+        match parse_invoke_answer(b"Error: no live node\n") {
+            InvokeParse::NoEnvelope => {}
+            other => panic!("expected no envelope, got {other:?}"),
+        }
+        match parse_invoke_answer(br#"{"status":"200","body":"e30="}"#) {
+            InvokeParse::NoEnvelope => {}
+            other => panic!("expected no envelope, got {other:?}"),
+        }
+        match parse_invoke_answer(br#"{"status":70000,"body":"e30="}"#) {
+            InvokeParse::NoEnvelope => {}
+            other => panic!("expected no envelope, got {other:?}"),
+        }
+    }
+
+    /// An undecodable body counts as garbage, not as a missing answer: the
+    /// status still decides and the body parses as nothing.
+    #[test]
+    fn invoke_answer_with_an_undecodable_body_parses_as_nothing() {
+        match parse_invoke_answer(br#"{"status":200,"body":"!!!not-base64!!!"}"#) {
+            InvokeParse::Answered { status, body } => {
+                assert_eq!(status, 200);
+                assert!(body.is_empty(), "{body:?}");
+            }
+            other => panic!("expected an answered envelope, got {other:?}"),
+        }
+    }
+
+    /// An answer past the cap verdicts oversized twice: past the largest
+    /// envelope a within-cap body can fill, stdout never parses; past the
+    /// cap, the base64 length alone verdicts it, like the fleet path's
+    /// declared-length check.
+    #[test]
+    fn invoke_answer_past_the_cap_is_oversized_before_it_decodes() {
+        let huge = "A".repeat(MAX_RESPONSE_BYTES / 3 * 4 + 5);
+        let stdout = format!(r#"{{"status":200,"body":"{huge}"}}"#);
+        match parse_invoke_answer(stdout.as_bytes()) {
+            InvokeParse::TooLarge { .. } => {}
+            other => panic!("expected an oversized answer, got {other:?}"),
+        }
+    }
+
+    /// Huge garbage never parses either: past the stdout bound it verdicts
+    /// oversized, as the fleet path's cap verdicts any over-cap body
+    /// however it reads.
+    #[test]
+    fn invoke_answer_huge_garbage_verdicts_oversized() {
+        let stdout = vec![b'x'; MAX_RESPONSE_BYTES / 3 * 4 + 4 + 129];
+        match parse_invoke_answer(&stdout) {
+            InvokeParse::TooLarge { .. } => {}
+            other => panic!("expected an oversized answer, got {other:?}"),
+        }
+    }
+
+    /// The boundary holds: a body of exactly the cap parses answered.
+    #[test]
+    fn invoke_answer_at_exactly_the_cap_parses() {
+        use base64::Engine as _;
+        let body = vec![b'A'; MAX_RESPONSE_BYTES];
+        let stdout = serde_json::json!({
+            "status": 200,
+            "headers": {},
+            "body": base64::engine::general_purpose::STANDARD.encode(&body),
+        })
+        .to_string();
+        match parse_invoke_answer(stdout.as_bytes()) {
+            InvokeParse::Answered {
+                status,
+                body: parsed,
+            } => {
+                assert_eq!(status, 200);
+                assert_eq!(parsed.len(), MAX_RESPONSE_BYTES);
+            }
+            other => panic!("expected an answered envelope, got {other:?}"),
+        }
     }
 }
