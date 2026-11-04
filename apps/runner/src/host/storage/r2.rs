@@ -137,23 +137,39 @@ async fn run_celld(
     exec::run_cmd(&cfg.celld_bin, args, None, &env, timeout).await
 }
 
-/// Run one `celld` subcommand that answers bytes (an object body) against
-/// the fleet's own bucket. `run_cmd_stdin` with empty input is the bytes
-/// twin of `run_cmd`: `celld r2 get` never reads stdin, so the closed pipe
-/// is never observed.
-async fn run_celld_bytes(
+/// Run one `celld` subcommand and return its output however it exited. An
+/// absent key prints its verdict on stdout with exit 1, so the reads —
+/// not the spawn — decide what the status means. `stdin` feeds the child's
+/// input when present (`r2 get` passes an empty one to close the pipe —
+/// `celld r2 get` never reads stdin, so the closed pipe is never observed);
+/// `None` leaves stdin inherited.
+async fn run_celld_output(
     cfg: &Config,
     app: &App,
     args: &[&str],
+    stdin: Option<&[u8]>,
     timeout: Duration,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<exec::CmdOutput> {
     let scope_key = crate::host::credentials::Scope::app(app).key();
     let env_owned = s3::celld_cli_env(cfg, &scope_key);
     let env: Vec<(&str, &str)> = env_owned
         .iter()
         .map(|(key, value)| (*key, value.as_str()))
         .collect();
-    exec::run_cmd_stdin(&cfg.celld_bin, args, &[], None, &env, timeout).await
+    exec::run_cmd_output_stdin(&cfg.celld_bin, args, stdin, None, &env, timeout).await
+}
+
+/// The absent-key object `celld r2 head|get --json` prints on stdout with
+/// exit 1 (`{"error":"not_found","bucket":...,"key":...}`): match the
+/// error field, never the English stderr.
+fn is_not_found(stdout: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(stdout) else {
+        return false;
+    };
+    value
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|error| error == "not_found")
 }
 
 /// The fleet options every `celld r2` call carries.
@@ -314,38 +330,57 @@ struct CelldHead {
 }
 
 /// The record for one key, or the not-found bail the service maps to 404.
-/// celld reports a missing key as `no object …` on stderr with exit 1.
+/// A missing key prints the not-found object on stdout with exit 1; the
+/// runner keeps the old `object not found` bail, detected from the
+/// object's error field instead of the English stderr.
 async fn r2_head(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow::Result<R2Head> {
     let fleet = fleet_args(app, cfg);
     let mut args: Vec<&str> = vec!["r2", "head", bucket, key, "--json"];
     args.extend(fleet);
-    let out = match run_celld(cfg, app, &args, CELD_TIMEOUT).await {
-        Ok(out) => out,
-        Err(error) if format!("{error:#}").contains("no object") => {
-            anyhow::bail!("object not found")
-        }
-        Err(error) => return Err(error),
-    };
-    let head: CelldHead = serde_json::from_str(&out).context("parse celld r2 head --json")?;
-    Ok(R2Head {
-        size: head.size,
-        content_type: head.http.content_type,
-    })
+    let output = run_celld_output(cfg, app, &args, None, CELD_TIMEOUT).await?;
+    if output.status.success() {
+        let out = String::from_utf8_lossy(&output.stdout);
+        let head: CelldHead = serde_json::from_str(&out).context("parse celld r2 head --json")?;
+        return Ok(R2Head {
+            size: head.size,
+            content_type: head.http.content_type,
+        });
+    }
+    if is_not_found(&output.stdout) {
+        anyhow::bail!("object not found")
+    }
+    let err = String::from_utf8_lossy(&output.stderr);
+    let out = String::from_utf8_lossy(&output.stdout);
+    anyhow::bail!(
+        "{} {:?} exit {:?}\n{err}{out}",
+        cfg.celld_bin,
+        args,
+        output.status.code()
+    )
 }
 
 /// One object's bytes, or the not-found bail when a racing delete removed
-/// the key between the head and the read.
+/// the key between the head and the read. `--json` leaves a found key's
+/// bytes untouched; a missing key prints the not-found object instead.
 async fn r2_get_bytes(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow::Result<Vec<u8>> {
     let fleet = fleet_args(app, cfg);
-    let mut args: Vec<&str> = vec!["r2", "get", bucket, key];
+    let mut args: Vec<&str> = vec!["r2", "get", bucket, key, "--json"];
     args.extend(fleet);
-    match run_celld_bytes(cfg, app, &args, CELD_UPLOAD_TIMEOUT).await {
-        Ok(bytes) => Ok(bytes),
-        Err(error) if format!("{error:#}").contains("no object") => {
-            anyhow::bail!("object not found")
-        }
-        Err(error) => Err(error),
+    let output = run_celld_output(cfg, app, &args, Some(&[]), CELD_UPLOAD_TIMEOUT).await?;
+    if output.status.success() {
+        return Ok(output.stdout);
     }
+    if is_not_found(&output.stdout) {
+        anyhow::bail!("object not found")
+    }
+    let err = String::from_utf8_lossy(&output.stderr);
+    let out = String::from_utf8_lossy(&output.stdout);
+    anyhow::bail!(
+        "{} {:?} exit {:?}\n{err}{out}",
+        cfg.celld_bin,
+        args,
+        output.status.code()
+    )
 }
 
 /// Download one object's bytes (capped) and the media type to re-serve it.
@@ -523,6 +558,10 @@ mod tests {
 
         fn fail_next(&self, message: &str) {
             self.write("fail-next", message.as_bytes());
+        }
+
+        fn fail_next_stdout(&self, bytes: &[u8]) {
+            self.write("fail-next-stdout", bytes);
         }
 
         fn invocations(&self) -> Vec<String> {
@@ -717,7 +756,7 @@ mod tests {
             "{calls:?}"
         );
         assert!(
-            calls[1].starts_with("r2 get uploads dir/a.txt"),
+            calls[1].starts_with("r2 get uploads dir/a.txt --json"),
             "{calls:?}"
         );
     }
@@ -765,12 +804,14 @@ mod tests {
         assert_eq!(fake.invocations().len(), 3);
     }
 
-    /// celld reports a missing key as `no object …` with exit 1; the
-    /// runner keeps the old `object not found` the service maps to 404.
+    /// A missing key prints the not-found object on stdout with exit 1;
+    /// the runner keeps the old `object not found` the service maps to
+    /// 404, detected from the object's error field — the English stderr
+    /// is gone from the matching entirely.
     #[tokio::test]
     async fn missing_keys_read_as_not_found() {
         let fake = FakeCelld::spawn();
-        fake.fail_next("Error: no object \"gone.txt\" in r2 bucket \"uploads\"");
+        fake.fail_next_stdout(br#"{"error":"not_found","bucket":"uploads","key":"gone.txt"}"#);
         let error = r2_get(&fake.cfg(), &test_app(), "uploads", "gone.txt")
             .await
             .unwrap_err();
@@ -778,7 +819,7 @@ mod tests {
             format!("{error:#}").contains("object not found"),
             "{error:#}"
         );
-        fake.fail_next("Error: no object \"gone.txt\" in r2 bucket \"uploads\"");
+        fake.fail_next_stdout(br#"{"error":"not_found","bucket":"uploads","key":"gone.txt"}"#);
         let error = r2_raw(&fake.cfg(), &test_app(), "uploads", "gone.txt")
             .await
             .unwrap_err();
@@ -786,6 +827,45 @@ mod tests {
             format!("{error:#}").contains("object not found"),
             "{error:#}"
         );
+    }
+
+    /// Anything without the not-found error field still fails loudly: a
+    /// stderr-only failure and a foreign error object both propagate
+    /// instead of reading as absent.
+    #[tokio::test]
+    async fn non_not_found_failures_propagate() {
+        let fake = FakeCelld::spawn();
+        fake.fail_next("Error: transport blew up");
+        let error = r2_get(&fake.cfg(), &test_app(), "uploads", "gone.txt")
+            .await
+            .unwrap_err();
+        assert!(
+            !format!("{error:#}").contains("object not found"),
+            "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("transport blew up"),
+            "{error:#}"
+        );
+        fake.fail_next_stdout(br#"{"error":"forbidden","bucket":"uploads","key":"gone.txt"}"#);
+        let error = r2_get(&fake.cfg(), &test_app(), "uploads", "gone.txt")
+            .await
+            .unwrap_err();
+        assert!(
+            !format!("{error:#}").contains("object not found"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn not_found_matches_the_error_field_only() {
+        assert!(is_not_found(
+            br#"{"error":"not_found","bucket":"uploads","key":"gone.txt"}"#
+        ));
+        assert!(!is_not_found(br#"{"error":"forbidden"}"#));
+        assert!(!is_not_found(br#"{"bucket":"uploads"}"#));
+        assert!(!is_not_found(b"Error: no object \"gone.txt\""));
+        assert!(!is_not_found(b""));
     }
 
     #[test]
