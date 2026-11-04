@@ -276,13 +276,31 @@ pub struct StagedVersion {
     pub version: String,
 }
 
+/// celld's script-name rule (`deploy.rs` `valid_script_name`, pinned
+/// celld): at most 63 bytes of lowercase ASCII letters, digits and
+/// internal hyphens.
+fn valid_worker_name(name: &str) -> bool {
+    name.len() <= 63
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && name
+            .bytes()
+            .last()
+            .is_some_and(|last| last.is_ascii_lowercase() || last.is_ascii_digit())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 /// Parse `celld deploy --no-activate --json` stdout: one JSON object
 /// (`fleet.rs` `Deployed` — stdout carries the datum, the narrative goes to
 /// stderr). The version is validated — the 16-lowercase-hex deployment
 /// version `activate` expects (`deploy.rs` `parse_version_ref`) — and the
-/// worker must name a script (celld validated the name when it built the
-/// version, so non-empty is enough here), so a malformed row fails the
-/// deploy here instead of reaching `activate` as a corrupt `SCRIPT=VERSION`.
+/// worker against celld's script-name rule, so a malformed row fails the
+/// deploy here instead of reaching `activate` as a corrupt `SCRIPT=VERSION`
+/// (a leading-`-` name would otherwise parse as a flag there).
 fn parse_staged_version(stdout: &str) -> anyhow::Result<StagedVersion> {
     let row: Value = serde_json::from_str(stdout)
         .with_context(|| format!("parse staged deploy output: {stdout:?}"))?;
@@ -295,8 +313,8 @@ fn parse_staged_version(stdout: &str) -> anyhow::Result<StagedVersion> {
         .and_then(Value::as_str)
         .unwrap_or_default();
     anyhow::ensure!(
-        !worker.is_empty(),
-        "staged deploy output names no worker: {stdout:?}"
+        valid_worker_name(worker),
+        "staged deploy output names no valid worker: {stdout:?}"
     );
     let hex16 = version.len() == 16
         && version
@@ -1039,8 +1057,9 @@ mod tests {
     }
 
     /// The staged row parses to its worker and version — and anything else
-    /// (garbage, a missing field, a non-16-hex version) fails the deploy
-    /// here instead of reaching `activate` as a corrupt `SCRIPT=VERSION`.
+    /// (garbage, a missing field, a non-16-hex version, a worker outside
+    /// celld's script-name rule) fails the deploy here instead of reaching
+    /// `activate` as a corrupt `SCRIPT=VERSION`.
     #[test]
     fn staged_output_parses_or_fails_loudly() {
         let staged = parse_staged_version(
@@ -1049,6 +1068,13 @@ mod tests {
         .unwrap();
         assert_eq!(staged.worker, "test-app");
         assert_eq!(staged.version, "0123456789abcdef");
+        // A single lowercase char is a valid script name.
+        assert_eq!(
+            parse_staged_version("{\"worker\": \"a\", \"version\": \"0123456789abcdef\"}")
+                .unwrap()
+                .worker,
+            "a"
+        );
 
         for bad in [
             "not json",
@@ -1058,6 +1084,15 @@ mod tests {
             "{\"worker\": \"test-app\", \"version\": \"0123456789ABCDEF\"}",
             "{\"worker\": \"test-app\", \"version\": \"abc\"}",
             "{\"worker\": \"test-app\", \"version\": 42}",
+            // Outside the script-name rule: a leading `-` would parse as
+            // an `activate` flag, the rest never survives celld either.
+            "{\"worker\": \"--bucket\", \"version\": \"0123456789abcdef\"}",
+            "{\"worker\": \"-app\", \"version\": \"0123456789abcdef\"}",
+            "{\"worker\": \"app-\", \"version\": \"0123456789abcdef\"}",
+            "{\"worker\": \"Test-App\", \"version\": \"0123456789abcdef\"}",
+            "{\"worker\": \"app_name\", \"version\": \"0123456789abcdef\"}",
+            "{\"worker\": \"a b\", \"version\": \"0123456789abcdef\"}",
+            "{\"worker\": \"app=1\", \"version\": \"0123456789abcdef\"}",
         ] {
             assert!(
                 parse_staged_version(bad).is_err(),
@@ -1065,6 +1100,13 @@ mod tests {
                 bad
             );
         }
+        // 63 bytes is the cap: one more fails.
+        assert!(valid_worker_name(&"a".repeat(63)));
+        assert!(parse_staged_version(&format!(
+            "{{\"worker\": \"{}\", \"version\": \"0123456789abcdef\"}}",
+            "a".repeat(64)
+        ))
+        .is_err());
     }
 
     /// A fake `celld`: appends its argv to `$FAKE_CELLD_LOG`, then fails
