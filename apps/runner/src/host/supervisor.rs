@@ -688,7 +688,9 @@ async fn ensure_spawned(
     // Explicit environment only (`host::fleet_env`): the spawn inherits
     // nothing — no `RUNNER_TOKEN`, no operator-global `CELLD_*`, no ambient
     // credential chain — and tenant settings cannot override a platform
-    // knob, since the builder applies them first.
+    // knob, since the builder applies them first. This `apply` call is
+    // load-bearing (nothing here fails if it is dropped): the builder and
+    // the spawn-path tests in `host::fleet_env` pin what it applies.
     let fleet_env =
         crate::host::fleet_env::tenant_fleet_env(&crate::host::fleet_env::TenantFleetEnv {
             cfg,

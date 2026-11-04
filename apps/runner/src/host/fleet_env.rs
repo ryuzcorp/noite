@@ -17,12 +17,15 @@
 //! daemon socket), `PATH` (the `esbuild`/`docker`/`hostname` lookups),
 //! `HOME` (the Python runtime cache and docker-socket fallbacks) and
 //! `TMPDIR` (the `temp_dir()` default; the hot paths use explicit
-//! `CELLD_*` dirs). TLS trusts the system store plus three passthroughs:
-//! `SSL_CERT_FILE`/`SSL_CERT_DIR` (rustls-native-certs, via the object
-//! store's hyper client) and `AWS_CA_BUNDLE` (the S3 client) — the only
-//! runner-env values a fleet inherits, so a BYO store behind a private CA
-//! keeps working. celld pins its Worker TLS roots (webpki) and honors no
-//! proxy env, so nothing else is passed.
+//! `CELLD_*` dirs). TLS trusts the system store plus the two passthroughs
+//! below — the only runner-env values a fleet inherits, so a BYO store
+//! behind a private CA keeps working. Proxy env (`HTTP(S)_PROXY`,
+//! `ALL_PROXY`, `NO_PROXY`) deliberately does not propagate: celld's store
+//! client would honor it (reqwest autodetects the system proxy), but
+//! routing fleet traffic through an operator proxy is a network decision
+//! the platform must make explicitly, not inherit — and in `multi` the
+//! policed Worker-fetch path bypasses proxies anyway. celld pins its
+//! Worker TLS roots (webpki), so nothing else is passed.
 //!
 //! Tenant vars (`db::tenant_env`, already denylisted by
 //! `db::env_reserved`) are applied first, so every platform knob wins over
@@ -39,9 +42,15 @@ pub const FLEET_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 /// none), kept so `temp_dir()` users behave exactly as before.
 pub const FLEET_TMPDIR: &str = "/tmp";
 
+/// `DOCKER_HOST` for a fleet with no engine socket: a `unix://` value that
+/// answers nothing, so celld never falls back to probing well-known daemon
+/// paths. Nothing ever listens here — no fleet, sandbox or test binds it.
+pub const DEAD_ENGINE_SOCKET: &str = "unix:///nonexistent/noite-no-engine.sock";
+
 /// The only runner-env values a fleet inherits: custom-CA trust for a BYO
-/// store. Each is passed only when set and non-empty.
-const TLS_PASSTHROUGH: &[&str] = &["SSL_CERT_FILE", "SSL_CERT_DIR", "AWS_CA_BUNDLE"];
+/// store (honored by rustls-native-certs, which loads the fleet's store
+/// TLS anchors). Each is passed only when set and non-empty.
+const TLS_PASSTHROUGH: &[&str] = &["SSL_CERT_FILE", "SSL_CERT_DIR"];
 
 /// Base every fleet needs: `PATH`, a writable `HOME`, `TMPDIR`, and the
 /// TLS passthrough. Tenant fleets pass their state dir as `HOME` (owned by
@@ -76,8 +85,32 @@ pub fn store_env(
         ("AWS_SECRET_ACCESS_KEY".to_string(), secret_key.to_string()),
         ("AWS_REGION".to_string(), region.to_string()),
         ("AWS_EC2_METADATA_DISABLED".to_string(), "true".to_string()),
-        ("S3_ENDPOINT".to_string(), endpoint.to_string()),
+        ("S3_ENDPOINT".to_string(), strip_endpoint_userinfo(endpoint)),
     ]
+}
+
+/// The fleet's `S3_ENDPOINT`: the configured endpoint without userinfo.
+/// celld authenticates with the explicit static keys, so URL credentials
+/// would at best be ignored and at worst ride along as HTTP Basic auth —
+/// either way they must not sit in every fleet's process env. An
+/// unparseable endpoint passes through verbatim so celld fails loudly on
+/// it instead of booting against a rewritten URL.
+fn strip_endpoint_userinfo(endpoint: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(endpoint) else {
+        return endpoint.to_string();
+    };
+    if url.username().is_empty() && url.password().is_none() {
+        return endpoint.to_string();
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    let mut out = url.to_string();
+    // Serializing adds a `/` to a bare host: drop it again so the fleet
+    // sees its endpoint byte-identical apart from the removed userinfo.
+    if url.path() == "/" && !endpoint.ends_with('/') {
+        out.truncate(out.len().saturating_sub(1));
+    }
+    out
 }
 
 /// The `CELLD_EGRESS_ALLOW` entry a fleet needs: its object store as
@@ -205,10 +238,15 @@ pub fn tenant_fleet_env(input: &TenantFleetEnv<'_>) -> Vec<(String, String)> {
     if cfg.fleet_max_rss_mb > 0 {
         put("CELLD_MAX_RSS_MB", cfg.fleet_max_rss_mb.to_string());
     }
-    // The fleet reaches the engine only through its own proxy socket; with
-    // sandboxing off (or the socket unservable) it gets no engine at all.
-    if let Some(socket) = input.engine_socket {
-        put("DOCKER_HOST", format!("unix://{socket}"));
+    // The fleet reaches the engine only through its own proxy socket.
+    // Without one (sandboxing off, or the socket unservable) the spawn sets
+    // a dead socket rather than leaving `DOCKER_HOST` unset: an unset
+    // `DOCKER_HOST` makes celld probe well-known daemon paths
+    // (`/var/run/docker.sock`, …), while a `unix://` value that answers
+    // nothing positively disables the engine.
+    match input.engine_socket {
+        Some(socket) => put("DOCKER_HOST", format!("unix://{socket}")),
+        None => put("DOCKER_HOST", DEAD_ENGINE_SOCKET.to_string()),
     }
     env
 }
@@ -222,10 +260,10 @@ pub struct ControlFleetEnv<'a> {
 }
 
 /// Full environment for the control fleet spawn. Like a tenant fleet but
-/// with no tenant vars, no egress or memory-scope policy of its own, and
-/// no engine: the control UI declares no container classes, and only the
-/// runner holds the engine socket. The store credentials and `RUST_LOG`
-/// below used to arrive by inheritance; they are explicit now.
+/// with no tenant vars, no egress or memory-scope policy of its own, and a
+/// dead engine socket: the control UI declares no container classes, and
+/// only the runner holds the engine socket. The store credentials and
+/// `RUST_LOG` below used to arrive by inheritance; they are explicit now.
 pub fn control_fleet_env(input: &ControlFleetEnv<'_>) -> Vec<(String, String)> {
     let cfg = input.cfg;
     let mut env = base_env("/root");
@@ -258,6 +296,9 @@ pub fn control_fleet_env(input: &ControlFleetEnv<'_>) -> Vec<(String, String)> {
     for (key, value) in crate::host::metrics::otel_env(cfg) {
         put(key, value);
     }
+    // The control UI declares no container classes: a dead socket, never an
+    // unset `DOCKER_HOST` that would probe well-known daemon paths.
+    put("DOCKER_HOST", DEAD_ENGINE_SOCKET.to_string());
     env
 }
 
@@ -287,7 +328,6 @@ mod tests {
             "TMPDIR",
             "SSL_CERT_FILE",
             "SSL_CERT_DIR",
-            "AWS_CA_BUNDLE",
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
             "AWS_REGION",
@@ -332,7 +372,14 @@ mod tests {
         "CELLD_CONTAINER_DNS",
         "DOCKER_HOST",
         "AWS_SESSION_TOKEN",
+        "AWS_CA_BUNDLE",
         "LD_PRELOAD",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
     ];
 
     /// Install the hostile process env: every `HOSTILE` key set to a canary,
@@ -521,22 +568,68 @@ mod tests {
             );
             assert!(!flat.contains_key("CELLD_MEMORY_SCOPE"));
             assert!(!flat.contains_key("CELLD_MAX_RSS_MB"));
-            assert!(!flat.contains_key("DOCKER_HOST"));
+            assert_eq!(
+                flat["DOCKER_HOST"], DEAD_ENGINE_SOCKET,
+                "no socket means a dead engine, not an unset DOCKER_HOST"
+            );
+            assert_eq!(
+                flat["S3_ENDPOINT"], "http://rustfs:9000",
+                "endpoint userinfo never reaches fleet env"
+            );
             assert!(!flat.contains_key("AWS_SESSION_TOKEN"));
+            assert!(!flat.contains_key("AWS_CA_BUNDLE"));
             assert!(!flat.contains_key("LD_PRELOAD"));
+            for proxy in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "NO_PROXY",
+                "http_proxy",
+                "https_proxy",
+            ] {
+                assert!(!flat.contains_key(proxy), "{proxy} never propagates");
+            }
         });
     }
 
     /// `multi` sets the egress policy from the platform config, and the
     /// exception carries the store host without its userinfo; the cgroup
-    /// leaf, the RSS cap and the engine socket each add exactly their knob.
+    /// leaf, the RSS cap and the engine socket each add exactly their knob —
+    /// even against tenant rows squatting on the same names (already refused
+    /// by `db::env_reserved`, and the platform wins by construction even so).
     #[test]
     fn tenant_fleet_env_multi_sets_its_own_policy() {
         with_hostile_env(Some("multi"), || {
             let mut cfg = Config::from_env().expect("config");
             cfg.aws_region = "us-east-1".into();
             cfg.fleet_max_rss_mb = 512;
-            let tenant_env = vec![];
+            let tenant_env = vec![
+                ("CELLD_EGRESS".to_string(), "off".to_string()),
+                (
+                    "CELLD_EGRESS_ALLOW".to_string(),
+                    "evil.example:443".to_string(),
+                ),
+                ("CELLD_MEMORY_SCOPE".to_string(), "container".to_string()),
+                ("CELLD_MAX_RSS_MB".to_string(), "1".to_string()),
+                (
+                    "CELLD_OPERATOR_TOKEN".to_string(),
+                    "tenant-token".to_string(),
+                ),
+                (
+                    "DOCKER_HOST".to_string(),
+                    "unix:///var/run/docker.sock".to_string(),
+                ),
+                ("AWS_REGION".to_string(), "tenant-region".to_string()),
+                (
+                    "AWS_SECRET_ACCESS_KEY".to_string(),
+                    "tenant-secret".to_string(),
+                ),
+                ("S3_ENDPOINT".to_string(), "http://tenant:9999".to_string()),
+                // (`SSL_CERT_FILE` and the proxy vars are refused one layer
+                // up, by `db::env_reserved`: the platform sets them only
+                // when the operator configured them, so ordering alone
+                // cannot win them. Pinned in `db::env` tests.)
+            ];
             let mut input = tenant_input(&cfg, &tenant_env);
             input.has_cgroup_leaf = true;
             input.engine_socket = Some("/run/noite/app.sock");
@@ -548,10 +641,56 @@ mod tests {
             );
             assert_eq!(flat["CELLD_MEMORY_SCOPE"], "self");
             assert_eq!(flat["CELLD_MAX_RSS_MB"], "512");
+            assert_eq!(flat["CELLD_OPERATOR_TOKEN"], "op-token");
             assert_eq!(flat["DOCKER_HOST"], "unix:///run/noite/app.sock");
+            assert_eq!(flat["AWS_REGION"], "us-east-1");
+            assert_eq!(flat["AWS_SECRET_ACCESS_KEY"], "scoped-secret");
+            assert_eq!(flat["S3_ENDPOINT"], "http://rustfs:9000");
             assert!(
                 !flat.contains_key("RUNNER_TOKEN"),
                 "runner token must not reach a fleet"
+            );
+        });
+    }
+
+    /// The endpoint keeps its shape apart from userinfo: a plain endpoint
+    /// passes through byte-identical, credentials are dropped (keeping a
+    /// configured trailing slash or path), and garbage passes through for
+    /// celld to refuse loudly.
+    #[test]
+    fn endpoint_userinfo_is_stripped_nothing_else() {
+        assert_eq!(
+            strip_endpoint_userinfo("http://rustfs:9000"),
+            "http://rustfs:9000"
+        );
+        assert_eq!(
+            strip_endpoint_userinfo("http://user:pass@rustfs:9000"),
+            "http://rustfs:9000"
+        );
+        assert_eq!(
+            strip_endpoint_userinfo("https://user@store.example:9443/prefix/"),
+            "https://store.example:9443/prefix/"
+        );
+        assert_eq!(strip_endpoint_userinfo("not a url"), "not a url");
+    }
+
+    /// The tenant token is passed through verbatim — including empty, which
+    /// celld refuses to boot on (fail-closed). The spawn fails before this
+    /// point when the token cannot be ensured, so empty never happens; but
+    /// omitting the key instead would boot the node with an open internal
+    /// listener, which must never be the fallback.
+    #[test]
+    fn tenant_fleet_env_passes_the_token_through_verbatim() {
+        with_hostile_env(None, || {
+            let cfg = Config::from_env().expect("config");
+            let tenant_env = vec![];
+            let mut input = tenant_input(&cfg, &tenant_env);
+            input.operator_token = "";
+            let flat = flattened(&tenant_fleet_env(&input));
+            assert_eq!(
+                flat.get("CELLD_OPERATOR_TOKEN").map(String::as_str),
+                Some(""),
+                "empty stays present-but-empty, never omitted"
             );
         });
     }
@@ -596,14 +735,20 @@ mod tests {
             );
             assert_eq!(flat["AWS_ACCESS_KEY_ID"], "platform-access");
             assert_eq!(flat["AWS_SECRET_ACCESS_KEY"], "platform-secret");
-            assert_eq!(flat["S3_ENDPOINT"], "http://user:pass@rustfs:9000");
+            assert_eq!(
+                flat["S3_ENDPOINT"], "http://rustfs:9000",
+                "endpoint userinfo never reaches fleet env"
+            );
             assert_eq!(flat["RUST_LOG"], "error,celld=warn");
             assert_eq!(flat["HOME"], "/root");
             assert_eq!(flat["CELLD_WATCH"], "/data/control");
             assert_eq!(flat["CELLD_OPERATOR_TOKEN"], "control-op");
             assert!(!flat.contains_key("CELLD_EGRESS"));
             assert!(!flat.contains_key("CELLD_MEMORY_SCOPE"));
-            assert!(!flat.contains_key("DOCKER_HOST"));
+            assert_eq!(
+                flat["DOCKER_HOST"], DEAD_ENGINE_SOCKET,
+                "control declares no container classes"
+            );
             for key in HOSTILE {
                 if let Some(value) = flat.get(*key) {
                     assert!(

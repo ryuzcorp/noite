@@ -280,7 +280,10 @@ pub fn supervise(
             // Explicit environment only (`host::fleet_env`): the spawn
             // inherits nothing — no `RUNNER_TOKEN`, no operator-global
             // `CELLD_*` — and the store credentials the spawn used to
-            // inherit are passed explicitly.
+            // inherit are passed explicitly. This `apply` call is
+            // load-bearing (nothing here fails if it is dropped): the
+            // builder and the spawn-path tests in `host::fleet_env` pin
+            // what it applies.
             let env = crate::host::fleet_env::control_fleet_env(
                 &crate::host::fleet_env::ControlFleetEnv {
                     cfg: &fleet_cfg,
