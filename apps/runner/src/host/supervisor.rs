@@ -487,8 +487,10 @@ fn egress_allow(s3_endpoint: &str) -> Option<String> {
     let host = url.host_str()?;
     let port = url.port_or_known_default()?;
     // Port 0 is not a dialable exception: celld refuses to boot on it, so
-    // a nonsense endpoint yields no entry instead.
-    if port == 0 {
+    // a nonsense endpoint yields no entry instead. A comma would split into
+    // two entries in celld's comma-separated list (`1.2.3.4,x` allows the
+    // whole of 1.2.3.4 on any port), so it yields no entry either.
+    if port == 0 || host.contains(',') {
         return None;
     }
     Some(format!("{host}:{port}"))
@@ -1522,6 +1524,9 @@ mod tests {
             "http://",
             "unix:///sock",
             "http://rustfs:0",
+            // A comma would split into two allowlist entries.
+            "http://1.2.3.4,x:9000",
+            "http://1.2.3.4%2Cx:9000",
         ] {
             assert_eq!(egress_allow(bad), None, "{bad:?} yields no entry");
         }

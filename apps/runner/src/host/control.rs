@@ -335,19 +335,37 @@ fn write_operator_token_file(work_dir: &str, token: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // Exact bytes, no trailing newline: celld refuses a token with
-    // surrounding whitespace, and `$(cat …)` must reproduce it verbatim.
-    if let Err(e) = std::fs::write(&path, token) {
+    if let Err(e) = write_private_atomically(&path, token.as_bytes()) {
         tracing::warn!(path = %path.display(), error = %e, "could not write the control operator token file; `make doctor`'s celld diagnose will fail its peer probes");
-        return;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
-            tracing::warn!(path = %path.display(), error = %e, "could not lock down the control operator token file");
-        }
+}
+
+/// Write `bytes` to `path` as a `0600` file that is never readable by anyone
+/// else, not even while it is written: a fresh temp file is created with
+/// mode `0600` (no umask window), filled, synced, then renamed over `path`,
+/// so readers see the old file or the whole new one. Exact bytes, no
+/// trailing newline: celld refuses a token with surrounding whitespace, and
+/// `$(cat …)` must reproduce it verbatim.
+fn write_private_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
+    result
 }
 
 /// Spawn arguments for the control fleet (SPEC, Control UI).

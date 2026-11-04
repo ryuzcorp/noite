@@ -65,10 +65,13 @@ for vol in $VOLUMES; do
     echo "    ${vol}: volume ${name} does not exist, skipped"
     continue
   fi
+  # The control operator token file is derived state (rewritten on every
+  # control spawn from the encrypted DB row) and a plaintext secret: leave it
+  # out. The pattern matches nothing in the other volumes.
   "$ENGINE" run --rm --entrypoint sh \
     -v "${name}:/vol:ro" \
     -v "${DEST_DIR}:/out:z" \
-    "$HELPER" -c "tar -cf /out/${vol}.tar -C /vol ."
+    "$HELPER" -c "tar -cf /out/${vol}.tar --exclude=./runner/control-operator-token -C /vol ."
   echo "    ${vol}.tar"
 done
 
