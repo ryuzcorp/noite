@@ -228,7 +228,6 @@ pub async fn remove(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::new_id;
     use std::sync::Arc;
 
     /// The tests act as an app admin: every service call carries the role
@@ -238,11 +237,17 @@ mod tests {
     async fn test_state(
         tenancy: Tenancy,
         extra_hosts: &[&str],
-    ) -> (AppState, Arc<crate::dns::FakeResolver>) {
-        let dir = std::env::temp_dir().join(format!("noite-domains-{tenancy:?}-{}", new_id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+    ) -> (
+        AppState,
+        Arc<crate::dns::FakeResolver>,
+        crate::testutil::TempDir,
+    ) {
+        let guard = crate::testutil::TempDir::new(&format!("noite-domains-{tenancy:?}"));
         let mut cfg = crate::config::config_for_tests();
-        cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        cfg.database_url = format!(
+            "sqlite:{}?mode=rwc",
+            guard.path().join("noite.sqlite").display()
+        );
         cfg.tenancy = tenancy;
         cfg.control_extra_hosts = extra_hosts.iter().map(|host| host.to_string()).collect();
         let fake = Arc::new(crate::dns::FakeResolver::default());
@@ -275,7 +280,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             source_maps: Default::default(),
         };
-        (state, fake)
+        (state, fake, guard)
     }
 
     async fn seed_app(state: &AppState, slug: &str) -> crate::models::App {
@@ -297,7 +302,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_tenancy_verifies_on_claim() {
-        let (state, _fake) = test_state(Tenancy::Single, &[]).await;
+        let (state, _fake, _guard) = test_state(Tenancy::Single, &[]).await;
         let app = seed_app(&state, "solo").await;
 
         let rows = add(&state, &app.id, "app.example.com", ADMIN)
@@ -316,7 +321,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_claim_resolves_nothing_until_verified() {
-        let (state, fake) = test_state(Tenancy::Multi, &[]).await;
+        let (state, fake, _guard) = test_state(Tenancy::Multi, &[]).await;
         let app = seed_app(&state, "pending").await;
 
         let rows = add(&state, &app.id, "shop.example.com", ADMIN)
@@ -370,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_to_verify_wins_and_rivals_are_dropped() {
-        let (state, fake) = test_state(Tenancy::Multi, &[]).await;
+        let (state, fake, _guard) = test_state(Tenancy::Multi, &[]).await;
         let a = seed_app(&state, "rival-a").await;
         let b = seed_app(&state, "rival-b").await;
         let host = "contested.example.com";
@@ -418,7 +423,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_without_a_resolver_fails_readably() {
-        let (mut state, _fake) = test_state(Tenancy::Multi, &[]).await;
+        let (mut state, _fake, _guard) = test_state(Tenancy::Multi, &[]).await;
         state.dns = Arc::new(crate::dns::UnavailableResolver::new(
             "no nameservers".to_owned(),
         ));
@@ -434,7 +439,7 @@ mod tests {
 
     #[tokio::test]
     async fn extra_control_hosts_and_their_subdomains_are_platform() {
-        let (state, _fake) = test_state(Tenancy::Multi, &["noite.local"]).await;
+        let (state, _fake, _guard) = test_state(Tenancy::Multi, &["noite.local"]).await;
         let app = seed_app(&state, "extra").await;
         for host in ["noite.local", "myapp.noite.local", "deep.myapp.noite.local"] {
             let err = add(&state, &app.id, host, ADMIN)
@@ -450,7 +455,7 @@ mod tests {
 
     #[tokio::test]
     async fn conflict_messages_carry_no_storage_detail() {
-        let (state, fake) = test_state(Tenancy::Multi, &[]).await;
+        let (state, fake, _guard) = test_state(Tenancy::Multi, &[]).await;
         let a = seed_app(&state, "static-a").await;
         let b = seed_app(&state, "static-b").await;
         add(&state, &a.id, "held.example.com", ADMIN)
@@ -476,7 +481,7 @@ mod tests {
 
     #[tokio::test]
     async fn role_gates_hold_without_a_control_ui() {
-        let (state, _fake) = test_state(Tenancy::Multi, &[]).await;
+        let (state, _fake, _guard) = test_state(Tenancy::Multi, &[]).await;
         let app = seed_app(&state, "gated").await;
         // No role is a refusal on every call, never a default.
         assert!(matches!(
@@ -514,7 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_same_app_claims_stay_idempotent() {
-        let (state, _fake) = test_state(Tenancy::Multi, &[]).await;
+        let (state, _fake, _guard) = test_state(Tenancy::Multi, &[]).await;
         let app = seed_app(&state, "racer").await;
         // Start together so the losers check before the winner commits and
         // lose the primary-key race instead of early-returning: a unique

@@ -179,14 +179,8 @@ pub fn write(root: &Path, name: &str, plan: &Plan) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "noite-generated-{name}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new(&format!("noite-generated-{name}"))
     }
 
     fn write_file(root: &Path, rel: &str, text: &str) {
@@ -201,7 +195,8 @@ mod tests {
 
     #[test]
     fn a_vite_build_deploys_as_a_single_page_app() {
-        let root = scratch("spa");
+        let guard_spa = scratch("spa");
+        let root = guard_spa.path().to_path_buf();
         write_file(&root, "dist/index.html", "<!doctype html>");
         write_file(&root, "dist/assets/app.js", "");
         let plan = plan(
@@ -226,7 +221,8 @@ mod tests {
 
     #[test]
     fn a_404_page_turns_the_spa_fallback_off() {
-        let root = scratch("mpa");
+        let guard_mpa = scratch("mpa");
+        let root = guard_mpa.path().to_path_buf();
         write_file(&root, "out/index.html", "");
         write_file(&root, "out/404.html", "");
         let plan = plan(&root, None).unwrap().unwrap();
@@ -241,7 +237,8 @@ mod tests {
 
     #[test]
     fn dist_wins_over_build_and_out() {
-        let root = scratch("order");
+        let guard_order = scratch("order");
+        let root = guard_order.path().to_path_buf();
         write_file(&root, "build/index.html", "");
         write_file(&root, "dist/index.html", "");
         assert!(
@@ -251,7 +248,8 @@ mod tests {
 
     #[test]
     fn a_fetch_module_deploys_as_a_worker_with_its_assets() {
-        let root = scratch("worker");
+        let guard_worker = scratch("worker");
+        let root = guard_worker.path().to_path_buf();
         write_file(
             &root,
             "server/index.js",
@@ -276,7 +274,8 @@ mod tests {
 
     #[test]
     fn an_npm_init_main_that_does_not_exist_is_ignored() {
-        let root = scratch("npm-init");
+        let guard_npm_init = scratch("npm-init");
+        let root = guard_npm_init.path().to_path_buf();
         write_file(&root, "dist/index.html", "");
         let plan = plan(&root, Some(&json!({ "main": "index.js" })))
             .unwrap()
@@ -286,7 +285,8 @@ mod tests {
 
     #[test]
     fn a_node_server_is_refused_with_a_reason() {
-        let root = scratch("express");
+        let guard_express = scratch("express");
+        let root = guard_express.path().to_path_buf();
         write_file(
             &root,
             "index.js",
@@ -307,7 +307,8 @@ mod tests {
 
     #[test]
     fn a_server_entry_inside_the_public_output_is_refused() {
-        let root = scratch("leak");
+        let guard_leak = scratch("leak");
+        let root = guard_leak.path().to_path_buf();
         write_file(&root, "dist/index.html", "");
         write_file(&root, "dist/server.js", "export default { fetch() {} }");
         let err = plan(&root, Some(&json!({ "main": "dist/server.js" })))
@@ -318,12 +319,14 @@ mod tests {
 
     #[test]
     fn paths_must_stay_inside_the_project() {
-        let root = scratch("escape");
+        let guard_escape = scratch("escape");
+        let root = guard_escape.path().to_path_buf();
         assert!(plan(&root, Some(&json!({ "main": "../x.js" }))).is_err());
         assert!(plan(&root, Some(&json!({ "main": "/etc/passwd" }))).is_err());
         #[cfg(unix)]
         {
-            let outside = scratch("escape-target");
+            let guard_escape_target = scratch("escape-target");
+            let outside = guard_escape_target.path().to_path_buf();
             write_file(&outside, "index.html", "");
             std::os::unix::fs::symlink(&outside, root.join("dist")).unwrap();
             let plan = plan(&root, None).unwrap().unwrap();
@@ -334,7 +337,8 @@ mod tests {
 
     #[test]
     fn nothing_deployable_is_none() {
-        let root = scratch("empty");
+        let guard_empty = scratch("empty");
+        let root = guard_empty.path().to_path_buf();
         write_file(&root, "src/main.ts", "");
         assert!(plan(&root, Some(&json!({ "name": "x" })))
             .unwrap()

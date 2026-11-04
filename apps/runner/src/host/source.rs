@@ -397,8 +397,9 @@ mod tests {
 
     /// A bare mirror with one commit on `main` holding `files` (plus a `v1`
     /// tag on it); returns the scratch dir, the mirror and the commit sha.
-    async fn seed(files: &[(&str, &str)]) -> (PathBuf, PathBuf, String) {
-        let dir = std::env::temp_dir().join(format!("noite-bundle-{}", crate::models::new_id()));
+    async fn seed(files: &[(&str, &str)]) -> (crate::testutil::TempDir, PathBuf, PathBuf, String) {
+        let guard = crate::testutil::TempDir::new("noite-bundle");
+        let dir = guard.path().to_path_buf();
         let work = dir.join("work");
         let bare = dir.join("mirror.git");
         std::fs::create_dir_all(&work).expect("work dir");
@@ -433,7 +434,7 @@ mod tests {
             ],
         )
         .await;
-        (dir, bare, sha)
+        (guard, dir, bare, sha)
     }
 
     fn paths(bundle: &SourceBundle) -> Vec<&str> {
@@ -442,7 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn bundle_filters_vendored_paths_and_foreign_extensions() {
-        let (dir, bare, sha) = seed(&[
+        let (guard, _dir, bare, sha) = seed(&[
             ("src/index.ts", "export const a = 1;\n"),
             ("src/app.tsx", "export const b = 2;\n"),
             ("src/data.json", "{}\n"),
@@ -474,14 +475,14 @@ mod tests {
             let out = bundle(&bare, rev).await.expect("ref");
             assert_eq!(out.files.len(), 5, "{rev}");
         }
-        std::fs::remove_dir_all(&dir).ok();
+        drop(guard);
     }
 
     #[tokio::test]
     async fn bundle_drops_oversized_and_binary_blobs() {
         let big = "x".repeat(MAX_BUNDLE_FILE as usize + 1);
         let exact = "y".repeat(MAX_BUNDLE_FILE as usize);
-        let (dir, bare, sha) = seed(&[
+        let (guard, _dir, bare, sha) = seed(&[
             ("src/index.ts", "export {};\n"),
             ("src/big.ts", &big),
             ("src/exact.ts", &exact),
@@ -492,16 +493,16 @@ mod tests {
         let out = bundle(&bare, &sha).await.expect("bundle");
         assert_eq!(paths(&out), ["src/exact.ts", "src/index.ts"]);
         assert!(!out.truncated, "a skipped blob is not a truncation");
-        std::fs::remove_dir_all(&dir).ok();
+        drop(guard);
     }
 
     #[tokio::test]
     async fn bundle_with_nothing_to_read_is_empty() {
-        let (dir, bare, sha) = seed(&[("README.md", "# hi\n")]).await;
+        let (guard, _dir, bare, sha) = seed(&[("README.md", "# hi\n")]).await;
         let out = bundle(&bare, &sha).await.expect("bundle");
         assert!(out.files.is_empty());
         assert!(!out.truncated);
-        std::fs::remove_dir_all(&dir).ok();
+        drop(guard);
     }
 
     #[tokio::test]
@@ -510,13 +511,13 @@ mod tests {
             .map(|i| format!("src/f{i:05}.ts"))
             .collect();
         let files: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "export {};\n")).collect();
-        let (dir, bare, sha) = seed(&files).await;
+        let (guard, _dir, bare, sha) = seed(&files).await;
 
         let out = bundle(&bare, &sha).await.expect("bundle");
         assert!(out.truncated);
         assert_eq!(out.files.len(), MAX_BUNDLE_FILES);
         assert!(out.files.windows(2).all(|w| w[0].path < w[1].path));
-        std::fs::remove_dir_all(&dir).ok();
+        drop(guard);
     }
 
     #[tokio::test]
@@ -526,7 +527,7 @@ mod tests {
         let chunk = "z".repeat(MAX_BUNDLE_FILE as usize);
         let names: Vec<String> = (0..40).map(|i| format!("bulk/b{i:03}.ts")).collect();
         let files: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), chunk.as_str())).collect();
-        let (dir, bare, sha) = seed(&files).await;
+        let (guard, _dir, bare, sha) = seed(&files).await;
 
         let out = bundle(&bare, &sha).await.expect("bundle");
         assert!(out.truncated);
@@ -534,6 +535,6 @@ mod tests {
         assert_eq!(out.files.len(), expected);
         let total: usize = out.files.iter().map(|f| f.text.len()).sum();
         assert_eq!(total as u64, MAX_BUNDLE_TOTAL);
-        std::fs::remove_dir_all(&dir).ok();
+        drop(guard);
     }
 }

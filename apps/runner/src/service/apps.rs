@@ -513,22 +513,23 @@ mod tests {
     }
 
     /// One runner state with a per-account app limit of `max_apps`.
-    async fn test_state(max_apps: u32) -> (AppState, std::path::PathBuf) {
+    async fn test_state(max_apps: u32) -> (AppState, crate::testutil::TempDir) {
         let s3 = spawn_s3_stub().await;
         test_state_with_s3(max_apps, s3).await
     }
 
     /// Same, against a caller-supplied S3 endpoint: a test that must park
     /// the purge mid-flight gates the stub instead of answering at once.
-    async fn test_state_with_s3(max_apps: u32, s3: String) -> (AppState, std::path::PathBuf) {
-        let dir =
-            std::env::temp_dir().join(format!("noite-create-tests-{}", crate::models::new_id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+    async fn test_state_with_s3(max_apps: u32, s3: String) -> (AppState, crate::testutil::TempDir) {
+        let guard = crate::testutil::TempDir::new("noite-create-tests");
         let mut cfg = crate::config::config_for_tests();
-        cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        cfg.database_url = format!(
+            "sqlite:{}?mode=rwc",
+            guard.path().join("noite.sqlite").display()
+        );
         cfg.s3_endpoint = s3.clone();
         cfg.s3_public_endpoint = s3;
-        cfg.work_dir = dir.join("work").to_string_lossy().into_owned();
+        cfg.work_dir = guard.path().join("work").to_string_lossy().into_owned();
         cfg.max_apps_per_user = max_apps;
         let config = Arc::new(cfg);
         let pool = crate::db::connect(&config.database_url)
@@ -559,7 +560,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             source_maps: Default::default(),
         };
-        (state, dir)
+        (state, guard)
     }
 
     /// NOITE-APPS-001: the count→insert window and the destructive purge run
@@ -612,7 +613,7 @@ mod tests {
                 .exists(),
             "the winner's source mirror survived the loser's create"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
     }
 
     /// R-01: delete waits out an in-flight deploy claim, and the row is gone
@@ -678,7 +679,7 @@ mod tests {
             row.is_none(),
             "a deploy that waits behind delete finds no row"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
     }
 
     /// A delete that cannot finish within the answer bound (here a deploy
@@ -731,7 +732,7 @@ mod tests {
             .expect("lookup")
             .is_none());
         assert!(!deleting(&app.id), "a finished delete leaves no marker");
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
     }
 
     /// R-03: two apps renaming onto one slug serialize under CREATE_LOCK —
@@ -768,7 +769,7 @@ mod tests {
             winner.id == a.id || winner.id == b.id,
             "the target belongs to one of the racers"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
     }
 
     /// R-12: create holds the slug's push guard across purge → init →
@@ -799,7 +800,7 @@ mod tests {
             .expect("create task")
             .expect("create ok");
         assert_eq!(app.slug, "guarded");
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
     }
 
     /// R-02: a slug rename holds both slugs' push guards across the whole
@@ -832,7 +833,7 @@ mod tests {
             .expect("rename task")
             .expect("rename ok");
         assert_eq!(renamed.slug, "ps-new");
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
     }
     /// S3 stub that parks the purge mid-flight: once armed, the first
     /// request is read, `entered` fires, and the response waits for
@@ -967,7 +968,7 @@ mod tests {
                 .is_none(),
             "the app's scoped key is still handed out after a dropped delete"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
     }
 
     /// Same guarantee for preview environments: a dropped caller must not
@@ -1029,6 +1030,6 @@ mod tests {
                 .is_none(),
             "the environment row survived a dropped delete"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
     }
 }

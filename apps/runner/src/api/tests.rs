@@ -145,6 +145,14 @@ impl Harness {
     }
 }
 
+impl Drop for Harness {
+    fn drop(&mut self) {
+        // `finish` is the tidy path (it closes the pool first); this is the
+        // panic path, so a failing assert never leaves the dir behind.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 fn parse_body(bytes: &[u8]) -> Value {
     if bytes.is_empty() {
         return Value::Null;

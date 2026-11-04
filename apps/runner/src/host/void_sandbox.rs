@@ -746,21 +746,16 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "noite-void-sandbox-{}-{}",
-            name,
-            crate::models::new_id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.canonicalize().unwrap()
+    fn scratch(name: &str) -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new(&format!("noite-void-sandbox-{name}"))
     }
 
     /// Write a bundle dir with `worker.js` + a matching `meta.json`;
     /// returns the dir and the worker bytes.
-    fn bundle_dir(name: &str, worker_js: &[u8]) -> (PathBuf, Vec<u8>) {
+    fn bundle_dir(name: &str, worker_js: &[u8]) -> (crate::testutil::TempDir, Vec<u8>) {
         use sha2::{Digest, Sha256};
-        let dir = scratch(name);
+        let guard = scratch(name);
+        let dir = guard.path();
         std::fs::write(dir.join("worker.js"), worker_js).unwrap();
         let mut hasher = Sha256::new();
         hasher.update(worker_js);
@@ -777,7 +772,7 @@ mod tests {
             ),
         )
         .unwrap();
-        (dir, worker_js.to_vec())
+        (guard, worker_js.to_vec())
     }
 
     /// Bundle loading round-trips `worker.js` + `meta.json` and verifies
@@ -785,7 +780,8 @@ mod tests {
     /// before anything deploys, naming the rebuild.
     #[test]
     fn bundle_load_verifies_its_own_digest() {
-        let (dir, worker) = bundle_dir("bundle-ok", b"controller-bundle");
+        let (guard_bundle_ok, worker) = bundle_dir("bundle-ok", b"controller-bundle");
+        let dir = guard_bundle_ok.path().canonicalize().unwrap();
         let bundle = load_bundle(&dir).unwrap();
         assert_eq!(bundle.worker_js, worker);
         assert_eq!(
@@ -808,7 +804,9 @@ mod tests {
         assert!(err.contains("is missing"), "{}", err);
         assert!(err.contains("bun run build"), "{}", err);
 
-        let (broken, _) = bundle_dir("bundle-broken", b"x");
+        let (guard_bundle_broken, _) = bundle_dir("bundle-broken", b"x");
+
+        let broken = guard_bundle_broken.path().canonicalize().unwrap();
         std::fs::write(broken.join("meta.json"), "not json").unwrap();
         assert!(load_bundle(&broken).is_err());
         std::fs::write(broken.join("meta.json"), "{}").unwrap();
@@ -846,7 +844,8 @@ mod tests {
     /// migration, while an emptied `containers` key goes with the entry.
     #[test]
     fn take_strips_the_managed_entry_and_hands_it_back() {
-        let dir = scratch("take");
+        let guard_take = scratch("take");
+        let dir = guard_take.path().canonicalize().unwrap();
         std::fs::write(
             dir.join("wrangler.json"),
             r#"{
@@ -896,7 +895,8 @@ mod tests {
     /// take, and the file is left byte-identical when there is one.
     #[test]
     fn take_is_none_without_a_managed_entry() {
-        let dir = scratch("take-none");
+        let guard_take_none = scratch("take-none");
+        let dir = guard_take_none.path().canonicalize().unwrap();
         assert_eq!(take_sandbox_entry(&dir).unwrap(), None);
         std::fs::write(dir.join("wrangler.toml"), "name = \"a\"\n").unwrap();
         assert_eq!(take_sandbox_entry(&dir).unwrap(), None);
@@ -929,7 +929,8 @@ mod tests {
     /// namespace, so picking one silently would strand the other's image.
     #[test]
     fn take_refuses_two_managed_entries() {
-        let dir = scratch("take-two");
+        let guard_take_two = scratch("take-two");
+        let dir = guard_take_two.path().canonicalize().unwrap();
         std::fs::write(
             dir.join("wrangler.json"),
             r#"{"name": "a", "containers": [
@@ -951,7 +952,8 @@ mod tests {
     /// against the app root. Registry refs pass through untouched.
     #[test]
     fn map_rewrites_the_entry_onto_the_controller() {
-        let dir = scratch("map");
+        let guard_map = scratch("map");
+        let dir = guard_map.path().canonicalize().unwrap();
         std::fs::create_dir_all(dir.join("img")).unwrap();
         std::fs::write(dir.join("img/Dockerfile"), "FROM scratch\n").unwrap();
         let entry = json!({
@@ -1024,8 +1026,9 @@ mod tests {
     }
 
     /// Write a staging dir holding one mapped entry, as `stage` does.
-    fn staging_dir(name: &str, entry: &Value) -> PathBuf {
-        let dir = scratch(name);
+    fn staging_dir(name: &str, entry: &Value) -> crate::testutil::TempDir {
+        let guard = scratch(name);
+        let dir = guard.path();
         std::fs::write(
             dir.join("wrangler.json"),
             serde_json::to_string_pretty(&json!({
@@ -1035,7 +1038,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        dir
+        guard
     }
 
     /// The pin check runs on the planned staging value: a digest-pinned
@@ -1045,10 +1048,11 @@ mod tests {
     #[test]
     fn registry_pin_checked_on_the_planned_value() {
         let pinned = format!("registry.example/x@sha256:{}", "c3".repeat(32));
-        let dir = staging_dir(
+        let guard_pin_ok = staging_dir(
             "pin-ok",
             &json!({"class_name": "SandboxController", "name": CONTAINER_NAME, "scheduling_policy": "durable_object", "images": {"default": {"image": pinned}}}),
         );
+        let dir = guard_pin_ok.path().canonicalize().unwrap();
         let plan = crate::host::build_output::plan_containers(&dir, false)
             .unwrap()
             .expect("declares");
@@ -1056,10 +1060,11 @@ mod tests {
         assert_eq!(plan.value()["containers"][0]["image"], pinned);
         std::fs::remove_dir_all(&dir).unwrap();
 
-        let dir = staging_dir(
+        let guard_pin_bad = staging_dir(
             "pin-bad",
             &json!({"class_name": "SandboxController", "name": CONTAINER_NAME, "scheduling_policy": "durable_object", "images": {"default": {"image": "registry.example/x:latest"}}}),
         );
+        let dir = guard_pin_bad.path().canonicalize().unwrap();
         let plan = crate::host::build_output::plan_containers(&dir, false)
             .unwrap()
             .expect("declares");
@@ -1068,12 +1073,15 @@ mod tests {
         assert!(err.contains("registry.example/x:latest"), "{}", err);
         std::fs::remove_dir_all(&dir).unwrap();
 
-        let dir = scratch("pin-dockerfile");
+        let guard_pin_dockerfile = scratch("pin-dockerfile");
+
+        let dir = guard_pin_dockerfile.path().canonicalize().unwrap();
         std::fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
-        let staging = staging_dir(
+        let guard_pin_dockerfile_staging = staging_dir(
             "pin-dockerfile-staging",
             &json!({"class_name": "SandboxController", "name": CONTAINER_NAME, "scheduling_policy": "durable_object", "images": {"default": {"dockerfile": dir.join("Dockerfile").display().to_string()}}}),
         );
+        let staging = guard_pin_dockerfile_staging.path().canonicalize().unwrap();
         let plan = crate::host::build_output::plan_containers(&staging, false)
             .unwrap()
             .expect("declares");
@@ -1082,10 +1090,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&staging).unwrap();
 
-        let dir = staging_dir(
+        let guard_pin_missing = staging_dir(
             "pin-missing",
             &json!({"class_name": "SandboxController", "name": CONTAINER_NAME, "scheduling_policy": "durable_object"}),
         );
+        let dir = guard_pin_missing.path().canonicalize().unwrap();
         let plan = crate::host::build_output::plan_containers(&dir, false)
             .unwrap()
             .expect("declares");
@@ -1238,8 +1247,10 @@ mod tests {
     async fn stage_maps_checks_and_records() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let (bundle_path, _) = bundle_dir("stage-bundle", b"stage-bundle-bytes");
-        let src = scratch("stage-src");
+        let (guard_stage_bundle, _) = bundle_dir("stage-bundle", b"stage-bundle-bytes");
+        let bundle_path = guard_stage_bundle.path().canonicalize().unwrap();
+        let guard_stage_src = scratch("stage-src");
+        let src = guard_stage_src.path().canonicalize().unwrap();
         // A spec the major-version check accepts, carrying a forged line.
         std::fs::write(
             src.join("package.json"),
@@ -1309,8 +1320,10 @@ mod tests {
     async fn stage_refuses_before_anything_provisions() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let (bundle_path, _) = bundle_dir("stage-refuse", b"bundle");
-        let src = scratch("stage-refuse-src");
+        let (guard_stage_refuse, _) = bundle_dir("stage-refuse", b"bundle");
+        let bundle_path = guard_stage_refuse.path().canonicalize().unwrap();
+        let guard_stage_refuse_src = scratch("stage-refuse-src");
+        let src = guard_stage_refuse_src.path().canonicalize().unwrap();
         std::fs::write(
             src.join("package.json"),
             r#"{"dependencies": {"void": "2.0.0"}}"#,
@@ -1364,9 +1377,17 @@ mod tests {
         pool: &SqlitePool,
         app_id: &str,
         cap: u32,
-    ) -> (StagedSandbox, Vec<u8>, String, PathBuf, PathBuf) {
-        let (bundle_path, worker) = bundle_dir("render-bundle", b"render-bundle-bytes");
-        let src = scratch("render-src");
+    ) -> (
+        StagedSandbox,
+        Vec<u8>,
+        String,
+        crate::testutil::TempDir,
+        crate::testutil::TempDir,
+    ) {
+        let (guard_render_bundle, worker) = bundle_dir("render-bundle", b"render-bundle-bytes");
+        let bundle_path = guard_render_bundle.path().canonicalize().unwrap();
+        let guard_render_src = scratch("render-src");
+        let src = guard_render_src.path().canonicalize().unwrap();
         std::fs::write(
             src.join("package.json"),
             r#"{"dependencies": {"void": "1.5.0"}}"#,
@@ -1386,7 +1407,14 @@ mod tests {
         .await
         .unwrap();
         let source = staged.source.clone();
-        (staged, worker, source, bundle_path, src)
+        // The guards move out: the dirs must outlive the callers' paths.
+        (
+            staged,
+            worker,
+            source,
+            guard_render_bundle,
+            guard_render_src,
+        )
     }
 
     /// The golden render for a registry-image sandbox: name, main, the
@@ -1397,7 +1425,10 @@ mod tests {
     async fn golden_render_carries_the_spec_contract() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let (staged, worker, source, bundle_path, src) = staged_for_render(&pool, &app.id, 4).await;
+        let (staged, worker, source, guard_bundle, guard_src) =
+            staged_for_render(&pool, &app.id, 4).await;
+        let bundle_path = guard_bundle.path().canonicalize().unwrap();
+        let src = guard_src.path().canonicalize().unwrap();
         let (name, _) = ensure_admission_name(&pool, &app.id, None).await.unwrap();
         let pinned = format!("registry.example/x@sha256:{}", "e5".repeat(32));
         let planned = json!({
@@ -1465,7 +1496,9 @@ mod tests {
     async fn golden_render_for_a_dockerfile_image() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let (staged, _, _, bundle_path, src) = staged_for_render(&pool, &app.id, 2).await;
+        let (staged, _, _, guard_bundle, guard_src) = staged_for_render(&pool, &app.id, 2).await;
+        let bundle_path = guard_bundle.path().canonicalize().unwrap();
+        let src = guard_src.path().canonicalize().unwrap();
         let pinned = src.join("ctx/.noite-image-0.Dockerfile");
         let planned = json!({
             "containers": [{
@@ -1498,7 +1531,9 @@ mod tests {
     async fn content_hash_flips_on_any_render_input() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let (staged, _, _, bundle_path, src) = staged_for_render(&pool, &app.id, 4).await;
+        let (staged, _, _, guard_bundle, guard_src) = staged_for_render(&pool, &app.id, 4).await;
+        let bundle_path = guard_bundle.path().canonicalize().unwrap();
+        let src = guard_src.path().canonicalize().unwrap();
         let planned = json!({
             "containers": [{
                 "name": CONTAINER_NAME,
@@ -1515,8 +1550,10 @@ mod tests {
         // substitution (the stored row holds a digest only): another
         // fleet's name over the same bundle and config.
         let env = seed_env(&pool, &app.id).await;
-        let (other_bundle, _) = bundle_dir("render-rot", b"render-bundle-bytes");
-        let other_src = scratch("render-rot-src");
+        let (guard_render_rot, _) = bundle_dir("render-rot", b"render-bundle-bytes");
+        let other_bundle = guard_render_rot.path().canonicalize().unwrap();
+        let guard_render_rot_src = scratch("render-rot-src");
+        let other_src = guard_render_rot_src.path().canonicalize().unwrap();
         std::fs::write(
             other_src.join("package.json"),
             r#"{"dependencies": {"void": "1.5.0"}}"#,
@@ -1543,8 +1580,10 @@ mod tests {
         std::fs::remove_dir_all(&other_src).unwrap();
 
         // A bundle change flips it.
-        let (bundle2, _) = bundle_dir("render-bundle2", b"render-bundle-bytes-2");
-        let src2 = scratch("render-src2");
+        let (guard_render_bundle2, _) = bundle_dir("render-bundle2", b"render-bundle-bytes-2");
+        let bundle2 = guard_render_bundle2.path().canonicalize().unwrap();
+        let guard_render_src2 = scratch("render-src2");
+        let src2 = guard_render_src2.path().canonicalize().unwrap();
         std::fs::write(
             src2.join("package.json"),
             r#"{"dependencies": {"void": "1.5.0"}}"#,
@@ -1609,7 +1648,9 @@ mod tests {
     async fn dockerfile_path_is_not_a_hash_input() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let (staged, _, _, bundle_path, src) = staged_for_render(&pool, &app.id, 4).await;
+        let (staged, _, _, guard_bundle, guard_src) = staged_for_render(&pool, &app.id, 4).await;
+        let bundle_path = guard_bundle.path().canonicalize().unwrap();
+        let src = guard_src.path().canonicalize().unwrap();
         let planned = |dir: &str| {
             json!({
                 "containers": [{
@@ -1656,7 +1697,8 @@ mod tests {
     /// the pinned Dockerfile bytes or the build-context digest.
     #[test]
     fn dockerfile_image_digest_pins_both_inputs() {
-        let dir = scratch("img-digest");
+        let guard_img_digest = scratch("img-digest");
+        let dir = guard_img_digest.path().canonicalize().unwrap();
         std::fs::write(dir.join("pinned.Dockerfile"), "FROM x@sha256:aaa\n").unwrap();
         let pinned = dir.join("pinned.Dockerfile");
         let first = dockerfile_image_digest(&pinned, &[1u8; 32]).unwrap();

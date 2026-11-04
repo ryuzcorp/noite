@@ -993,12 +993,13 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// A unique short temp dir: unix socket paths cap at 107 bytes, so no
-    /// UUIDs here — pid plus a counter is unique enough per test binary.
-    fn test_dir(name: &str) -> PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        std::env::temp_dir().join(format!("ne-{name}-{}-{n}", std::process::id()))
+    /// A unique short temp dir: unix socket paths cap at 107 bytes, so the
+    /// stem stays two letters (`/tmp/ne-<name>-<pid>-<uuid>/…` still fits
+    /// with room for the `sockets/<key>.sock` leaf).
+    fn test_dir(name: &str) -> crate::testutil::TempDir {
+        // Short prefix: socket paths under it must fit SUN_LEN, hence the
+        // `ne-` stem the old helper used too.
+        crate::testutil::TempDir::new(&format!("ne-{name}"))
     }
 
     /// A unique short fleet key for the same 107-byte reason.
@@ -1053,8 +1054,8 @@ mod tests {
 
     #[test]
     fn upstream_needs_a_unix_socket() {
-        let dir = test_dir("upstream");
-        std::fs::create_dir_all(&dir).unwrap();
+        let guard_upstream = test_dir("upstream");
+        let dir = guard_upstream.path().to_path_buf();
         let sock = dir.join("engine.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let sock = sock.to_string_lossy().into_owned();
@@ -1144,7 +1145,8 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_forwards_a_list_and_refuses_a_privileged_create() {
-        let dir = test_dir("fwd");
+        let guard_fwd = test_dir("fwd");
+        let dir = guard_fwd.path().to_path_buf();
         let fleet_dir = dir.join("sockets");
         std::fs::create_dir_all(&fleet_dir).unwrap();
         let upstream_sock = dir.join("upstream.sock");
@@ -1219,7 +1221,8 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_refuses_connections_from_foreign_processes() {
-        let dir = test_dir("peer");
+        let guard_peer = test_dir("peer");
+        let dir = guard_peer.path().to_path_buf();
         let fleet_dir = dir.join("sockets");
         std::fs::create_dir_all(&fleet_dir).unwrap();
         // Never registered: no fleet process owns this socket yet.
@@ -1283,7 +1286,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_fence_takes_no_exec_and_no_signal() {
-        let dir = test_dir("fence");
+        let guard_fence = test_dir("fence");
+        let dir = guard_fence.path().to_path_buf();
         let fleet_dir = dir.join("sockets");
         std::fs::create_dir_all(&fleet_dir).unwrap();
         let upstream_sock = dir.join("upstream.sock");
@@ -1367,7 +1371,8 @@ mod tests {
 
     #[tokio::test]
     async fn exec_upgrade_splices_end_to_end() {
-        let dir = test_dir("hijack");
+        let guard_hijack = test_dir("hijack");
+        let dir = guard_hijack.path().to_path_buf();
         let fleet_dir = dir.join("sockets");
         std::fs::create_dir_all(&fleet_dir).unwrap();
         let upstream_sock = dir.join("upstream.sock");
@@ -1429,7 +1434,8 @@ mod tests {
 
     #[tokio::test]
     async fn exec_resize_forwards_only_owned_execs_with_a_rebuilt_query() {
-        let dir = test_dir("resize");
+        let guard_resize = test_dir("resize");
+        let dir = guard_resize.path().to_path_buf();
         let fleet_dir = dir.join("sockets");
         std::fs::create_dir_all(&fleet_dir).unwrap();
         let upstream_sock = dir.join("upstream.sock");

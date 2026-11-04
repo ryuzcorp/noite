@@ -406,20 +406,21 @@ mod tests {
 
     use super::*;
 
-    async fn test_state() -> AppState {
-        let dir =
-            std::env::temp_dir().join(format!("noite-ingest-cap-{}", crate::models::new_id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+    async fn test_state() -> (AppState, crate::testutil::TempDir) {
+        let guard = crate::testutil::TempDir::new("noite-ingest-cap");
         let mut cfg = crate::config::config_for_tests();
-        cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
-        cfg.work_dir = dir.join("work").to_string_lossy().into_owned();
+        cfg.database_url = format!(
+            "sqlite:{}?mode=rwc",
+            guard.path().join("noite.sqlite").display()
+        );
+        cfg.work_dir = guard.path().join("work").to_string_lossy().into_owned();
         let config = Arc::new(cfg);
         let pool = crate::db::connect(&config.database_url)
             .await
             .expect("connect db");
         let (tip_tx, _tip_rx) = crate::host::tips::channel();
         let (log_notify, _log_rx) = tokio::sync::watch::channel(0u64);
-        AppState {
+        let state = AppState {
             pool,
             config,
             procs: crate::host::supervisor::new_procs(),
@@ -441,7 +442,8 @@ mod tests {
             ))),
             started_at: chrono::Utc::now(),
             source_maps: Default::default(),
-        }
+        };
+        (state, guard)
     }
 
     fn event(message: &str) -> SdkEvent {
@@ -461,7 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_rejects_more_than_one_event() {
-        let state = test_state().await;
+        let (state, _guard) = test_state().await;
         let batch = SdkIngestBatch {
             project_id: 1,
             key: "k".into(),

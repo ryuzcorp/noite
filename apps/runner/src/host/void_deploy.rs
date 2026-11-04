@@ -1305,15 +1305,8 @@ mod tests {
         assert!(debug.contains("RunnerOwned"), "{}", debug);
     }
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "noite-void-deploy-{}-{}-{:?}",
-            name,
-            std::process::id(),
-            std::time::SystemTime::now()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new(&format!("noite-void-deploy-{name}"))
     }
 
     fn ctx(dir: &std::path::Path, sandbox: bool) -> VoidMergeCtx<'_> {
@@ -1333,7 +1326,8 @@ mod tests {
     async fn void_root_rewrites_and_records_the_mint() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let dir = scratch("root").canonicalize().unwrap();
+        let guard_root = scratch("root");
+        let dir = guard_root.path().canonicalize().unwrap();
         std::fs::write(
             dir.join("wrangler.jsonc"),
             r#"{"name": "blog", /* c */ "vars": {"MODE": "prod"}}"#,
@@ -1384,7 +1378,8 @@ mod tests {
     async fn void_root_threads_the_sandbox_binding() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let dir = scratch("sandbox-flag").canonicalize().unwrap();
+        let guard_sandbox_flag = scratch("sandbox-flag");
+        let dir = guard_sandbox_flag.path().canonicalize().unwrap();
         std::fs::write(dir.join("wrangler.json"), r#"{"name": "blog"}"#).unwrap();
 
         let (stats, _) = merge_void_root(&pool, &app, None, &ctx(&dir, true))
@@ -1408,7 +1403,8 @@ mod tests {
     async fn void_root_without_a_json_config_is_none() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
         let app = seed(&pool).await;
-        let dir = scratch("toml").canonicalize().unwrap();
+        let guard_toml = scratch("toml");
+        let dir = guard_toml.path().canonicalize().unwrap();
         std::fs::write(dir.join("wrangler.toml"), "name = \"a\"\n").unwrap();
         assert!(merge_void_root(&pool, &app, None, &ctx(&dir, false))
             .await

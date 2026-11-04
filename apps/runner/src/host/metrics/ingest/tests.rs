@@ -20,13 +20,14 @@ fn canonical_file_list_prefers_compacted_directories() {
     assert!(sql.contains("compacted_dirs"), "{sql}");
 }
 
-async fn test_pool(name: &str) -> (SqlitePool, std::path::PathBuf) {
-    let dir =
-        std::env::temp_dir().join(format!("noite-metrics-{name}-{}", crate::models::new_id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+async fn test_pool(name: &str) -> (SqlitePool, crate::testutil::TempDir) {
+    let guard = crate::testutil::TempDir::new(&format!("noite-metrics-{name}"));
+    let url = format!(
+        "sqlite:{}?mode=rwc",
+        guard.path().join("noite.sqlite").display()
+    );
     let pool = db::connect(&url).await.expect("connect");
-    (pool, dir)
+    (pool, guard)
 }
 
 fn slug_id() -> HashMap<String, String> {
@@ -335,7 +336,7 @@ async fn a_broken_fleet_does_not_hold_the_healthy_one() {
             .await
             .expect("app_metric");
     assert_eq!(written, vec![("app-good".to_string(), 1)]);
-    let _ = std::fs::remove_dir_all(dir);
+    drop(dir);
 }
 
 #[tokio::test]
@@ -424,7 +425,7 @@ async fn reingesting_a_window_is_idempotent_and_a_partial_retry_converges() {
     // The watermark moved to the chunk's end, not the cutoff.
     assert_eq!(state_a.watermark.get("blog"), Some(&(H + HOUR_US)));
     for dir in [dir_a, dir_b] {
-        let _ = std::fs::remove_dir_all(dir);
+        drop(dir);
     }
 }
 
@@ -481,7 +482,7 @@ async fn catch_up_in_hour_chunks_equals_one_continuous_pass() {
     .expect("hour 2");
     assert_eq!(dump(&pool_b).await, dump(&pool_a).await);
     for dir in [dir_a, dir_b] {
-        let _ = std::fs::remove_dir_all(dir);
+        drop(dir);
     }
 }
 
@@ -548,7 +549,7 @@ async fn control_telemetry_is_keyed_on_the_reserved_slug_without_an_app_row() {
         state.watermark.get(crate::host::control::SLUG),
         Some(&(H + HOUR_US))
     );
-    let _ = std::fs::remove_dir_all(dir);
+    drop(dir);
 }
 
 #[tokio::test]
@@ -577,7 +578,7 @@ async fn a_failed_write_holds_the_watermark() {
         Some(&H),
         "a failed pass must not advance the watermark"
     );
-    let _ = std::fs::remove_dir_all(dir);
+    drop(dir);
 }
 
 /// Ingest assigns environment rows to the right environment: one shared
@@ -727,7 +728,7 @@ async fn environment_rows_stay_separate_from_production() {
         state.watermark.get("blog.preview"),
         Some(&(H + 2 * HOUR_US))
     );
-    let _ = std::fs::remove_dir_all(dir);
+    drop(dir);
 }
 
 fn error_rows(trace: &str) -> IngestRows {
@@ -807,7 +808,7 @@ async fn a_late_access_line_backfills_the_stored_occurrence() {
         "the span-first occurrence stores context-free"
     );
     // The access line lands a tick later; tailing it must heal the row.
-    let log = dir.join("access.log");
+    let log = dir.path().join("access.log");
     std::fs::write(&log, format!("{}\n", access_log_line("t-late"))).expect("log line");
     let mut cfg = crate::config::config_for_tests();
     cfg.caddy_access_log = log.to_string_lossy().into_owned();
@@ -825,7 +826,7 @@ async fn a_late_access_line_backfills_the_stored_occurrence() {
         ),
         "the late access line attaches the request"
     );
-    let _ = std::fs::remove_dir_all(dir);
+    drop(dir);
 }
 
 /// The backfill heals only the pending telemetry occurrence of the line's own
@@ -882,7 +883,7 @@ async fn the_backfill_never_touches_sdk_or_foreign_occurrences() {
         .await
         .expect("seed a same-trace occurrence");
     }
-    let log = dir.join("access.log");
+    let log = dir.path().join("access.log");
     std::fs::write(&log, format!("{}\n", access_log_line("t-shared"))).expect("log line");
     let mut cfg = crate::config::config_for_tests();
     cfg.caddy_access_log = log.to_string_lossy().into_owned();
@@ -919,7 +920,7 @@ async fn the_backfill_never_touches_sdk_or_foreign_occurrences() {
         ],
         "only app1's pending telemetry occurrence takes the request"
     );
-    let _ = std::fs::remove_dir_all(dir);
+    drop(dir);
 }
 
 /// The same join in the other order: a tailed line is already in the index
@@ -928,7 +929,7 @@ async fn the_backfill_never_touches_sdk_or_foreign_occurrences() {
 async fn a_tailed_line_joins_at_ingest() {
     let (pool, dir) = test_pool("early-request").await;
     let mut state = new_state();
-    let log = dir.join("access.log");
+    let log = dir.path().join("access.log");
     std::fs::write(&log, format!("{}\n", access_log_line("t-early"))).expect("log line");
     let mut cfg = crate::config::config_for_tests();
     cfg.caddy_access_log = log.to_string_lossy().into_owned();
@@ -960,5 +961,5 @@ async fn a_tailed_line_joins_at_ingest() {
         ),
         "the tailed line joins at ingest"
     );
-    let _ = std::fs::remove_dir_all(dir);
+    drop(dir);
 }

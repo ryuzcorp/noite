@@ -106,13 +106,11 @@ mod tests {
     use super::*;
 
     use crate::db::connect;
-    use crate::models::new_id;
 
-    async fn pool() -> SqlitePool {
-        let dir = std::env::temp_dir().join(format!("noite-ingest-key-{}", new_id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let url = format!("sqlite:{}/noite.sqlite?mode=rwc", dir.display());
-        connect(&url).await.expect("connect")
+    async fn pool() -> (SqlitePool, crate::testutil::TempDir) {
+        let guard = crate::testutil::TempDir::new("noite-ingest-key");
+        let url = format!("sqlite:{}/noite.sqlite?mode=rwc", guard.path().display());
+        (connect(&url).await.expect("connect"), guard)
     }
 
     async fn seed_app(pool: &SqlitePool, id: &str) {
@@ -133,7 +131,7 @@ mod tests {
 
     #[tokio::test]
     async fn creates_key_and_number_together_then_reads_them_back() {
-        let pool = pool().await;
+        let (pool, _guard) = pool().await;
         seed_app(&pool, "app-one").await;
         assert!(get_ingest_key(&pool, "app-one")
             .await
@@ -163,7 +161,7 @@ mod tests {
 
     #[tokio::test]
     async fn rotation_keeps_the_number_and_invalidates_the_old_key() {
-        let pool = pool().await;
+        let (pool, _guard) = pool().await;
         seed_app(&pool, "app-two").await;
         let before = get_or_create_ingest_key(&pool, "app-two")
             .await
@@ -180,7 +178,7 @@ mod tests {
 
     #[tokio::test]
     async fn numbers_are_never_reused_after_delete() {
-        let pool = pool().await;
+        let (pool, _guard) = pool().await;
         seed_app(&pool, "app-gone").await;
         let gone = get_or_create_ingest_key(&pool, "app-gone")
             .await

@@ -677,10 +677,8 @@ fn dir_bytes(dir: &Path) -> std::io::Result<u64> {
 mod tests {
     use super::*;
 
-    fn dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("noite-import-{}", new_id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
+    fn dir() -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new("noite-import")
     }
 
     /// The URL allowlist is the security boundary: only the exact GitHub https
@@ -793,7 +791,8 @@ mod tests {
     /// a folder that does not exist, or names a file, is a readable error.
     #[tokio::test]
     async fn a_path_import_roots_the_app_at_that_folder() {
-        let root = dir();
+        let guard = dir();
+        let root = guard.path().to_path_buf();
         let upstream = root.join("upstream");
         std::fs::create_dir_all(upstream.join("apps/web/src")).expect("dirs");
         std::fs::write(upstream.join("README.md"), "monorepo").expect("write");
@@ -849,7 +848,7 @@ mod tests {
                 format!("folder {missing} not found in acme/mono@abc1234")
             );
         }
-        let _ = std::fs::remove_dir_all(&root);
+        drop(guard);
     }
 
     /// Run git in one directory with a fixed test identity (panics on failure).
@@ -875,7 +874,8 @@ mod tests {
     /// immediately (a kill that had missed the group would wait out `REAP`).
     #[tokio::test]
     async fn the_cap_kills_a_running_clone() {
-        let root = dir();
+        let guard = dir();
+        let root = guard.path().to_path_buf();
         let started = std::time::Instant::now();
         let err = run_grouped(
             "sh",
@@ -897,14 +897,15 @@ mod tests {
             "the group must be killed at once, took {:?}",
             started.elapsed()
         );
-        let _ = std::fs::remove_dir_all(&root);
+        drop(guard);
     }
 
     /// The cap is re-checked when the child exits, so a clone that finished
     /// before the first poll is refused too (the tiny-cap case).
     #[tokio::test]
     async fn the_cap_refuses_a_finished_clone() {
-        let root = dir();
+        let guard = dir();
+        let root = guard.path().to_path_buf();
         let err = run_grouped(
             "sh",
             &[
@@ -922,14 +923,15 @@ mod tests {
         .expect_err("over the cap");
         let message = format!("{err:#}");
         assert!(message.contains("over the 1-MiB import cap"), "{message}");
-        let _ = std::fs::remove_dir_all(&root);
+        drop(guard);
     }
 
     /// NOITE-IMPORT-002: a timeout kills the whole process group, not just the
     /// direct child, so nothing keeps running after the import is given up on.
     #[tokio::test]
     async fn the_timeout_kills_the_process_group() {
-        let root = dir();
+        let guard = dir();
+        let root = guard.path().to_path_buf();
         let started = std::time::Instant::now();
         let err = run_grouped(
             "sh",
@@ -947,7 +949,7 @@ mod tests {
             "the group must be killed at once, took {:?}",
             started.elapsed()
         );
-        let _ = std::fs::remove_dir_all(&root);
+        drop(guard);
     }
 
     /// A3: the squash import lands exactly one root commit of the fetched tree,
@@ -956,7 +958,8 @@ mod tests {
     /// enables.
     #[tokio::test]
     async fn squash_is_one_root_commit_with_the_noreply_identity() {
-        let root = dir();
+        let guard = dir();
+        let root = guard.path().to_path_buf();
         let upstream = root.join("upstream");
         std::fs::create_dir_all(&upstream).expect("upstream");
         std::fs::write(upstream.join("index.html"), "hello").expect("write");
@@ -1051,6 +1054,6 @@ mod tests {
             identity.email
         );
         assert_eq!(identity.email, "user-1@users.noreply.localhost");
-        let _ = std::fs::remove_dir_all(&root);
+        drop(guard);
     }
 }

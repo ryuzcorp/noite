@@ -661,19 +661,14 @@ mod tests {
         );
     }
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "noite-worker-vars-{name}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> crate::testutil::TempDir {
+        crate::testutil::TempDir::new(&format!("noite-worker-vars-{name}"))
     }
 
     #[test]
     fn jsonc_merges_and_stays_parseable() {
-        let dir = scratch("jsonc").canonicalize().unwrap();
+        let guard_jsonc = scratch("jsonc");
+        let dir = guard_jsonc.path().canonicalize().unwrap();
         std::fs::write(
             dir.join("wrangler.jsonc"),
             r#"{
@@ -697,7 +692,8 @@ mod tests {
 
     #[test]
     fn jsonc_wins_over_json_like_celld() {
-        let dir = scratch("both").canonicalize().unwrap();
+        let guard_both = scratch("both");
+        let dir = guard_both.path().canonicalize().unwrap();
         std::fs::write(dir.join("wrangler.jsonc"), r#"{"name":"a"}"#).unwrap();
         std::fs::write(
             dir.join("wrangler.json"),
@@ -713,7 +709,8 @@ mod tests {
 
     #[test]
     fn empty_settings_leave_the_file_byte_identical() {
-        let dir = scratch("untouched").canonicalize().unwrap();
+        let guard_untouched = scratch("untouched");
+        let dir = guard_untouched.path().canonicalize().unwrap();
         let before = "// kept\n{\"name\": \"a\", \"vars\": {},}\n";
         std::fs::write(dir.join("wrangler.jsonc"), before).unwrap();
         let stats = merge_deploy_root(&dir, &[], "Settings")
@@ -728,7 +725,8 @@ mod tests {
 
     #[test]
     fn toml_only_roots_are_left_for_celld_to_refuse() {
-        let dir = scratch("toml").canonicalize().unwrap();
+        let guard_toml = scratch("toml");
+        let dir = guard_toml.path().canonicalize().unwrap();
         std::fs::write(dir.join("wrangler.toml"), "name = \"a\"\n").unwrap();
         assert!(
             merge_deploy_root(&dir, &settings(&[("N", "v")]), "Settings")
@@ -740,8 +738,10 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn the_merge_never_writes_through_a_planted_link() {
-        let dir = scratch("link").canonicalize().unwrap();
-        let victim_dir = scratch("link-victim").canonicalize().unwrap();
+        let guard_link = scratch("link");
+        let dir = guard_link.path().canonicalize().unwrap();
+        let guard_link_victim = scratch("link-victim");
+        let victim_dir = guard_link_victim.path().canonicalize().unwrap();
         let victim = victim_dir.join("owned");
         std::fs::write(&victim, r#"{"name":"a"}"#).unwrap();
         std::os::unix::fs::symlink(&victim, dir.join("wrangler.json")).unwrap();

@@ -156,18 +156,19 @@ pub async fn set(
 mod tests {
     use super::*;
     use crate::config::Tenancy;
-    use crate::models::new_id;
     use std::sync::Arc;
 
     /// The tests act as the control UI: every `set` carries the role the UI
     /// resolved and passes.
     const ADMIN: Option<&str> = Some("admin");
 
-    async fn test_state(tenancy: Tenancy) -> AppState {
-        let dir = std::env::temp_dir().join(format!("noite-limits-{tenancy:?}-{}", new_id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+    async fn test_state(tenancy: Tenancy) -> (AppState, crate::testutil::TempDir) {
+        let guard = crate::testutil::TempDir::new(&format!("noite-limits-{tenancy:?}"));
         let mut cfg = crate::config::config_for_tests();
-        cfg.database_url = format!("sqlite:{}?mode=rwc", dir.join("noite.sqlite").display());
+        cfg.database_url = format!(
+            "sqlite:{}?mode=rwc",
+            guard.path().join("noite.sqlite").display()
+        );
         cfg.tenancy = tenancy;
         let config = Arc::new(cfg);
         let pool = crate::db::connect(&config.database_url)
@@ -175,7 +176,7 @@ mod tests {
             .expect("connect db");
         let (tip_tx, _tip_rx) = crate::host::tips::channel();
         let (log_notify, _log_rx) = tokio::sync::watch::channel(0u64);
-        AppState {
+        let state = AppState {
             pool,
             config,
             procs: crate::host::supervisor::new_procs(),
@@ -197,7 +198,8 @@ mod tests {
             ))),
             started_at: chrono::Utc::now(),
             source_maps: Default::default(),
-        }
+        };
+        (state, guard)
     }
 
     async fn seed_app(state: &AppState, slug: &str) -> crate::models::App {
@@ -219,7 +221,7 @@ mod tests {
 
     #[tokio::test]
     async fn role_gates_hold_without_a_control_ui() {
-        let state = test_state(Tenancy::Multi).await;
+        let (state, _guard) = test_state(Tenancy::Multi).await;
         let app = seed_app(&state, "gated").await;
         // No role is a refusal, never a default.
         assert!(matches!(
