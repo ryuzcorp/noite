@@ -109,8 +109,110 @@ async fn probe_instance(app: &App, scope: &str) -> Option<String> {
     let Ok(response) = request.send().await else {
         return None;
     };
+    // A refusal (a 401 without the token, a 404 for a gone instance) is
+    // missing, not a preview: surfacing the refusal body would misreport
+    // tenant-visible data.
+    if !response.status().is_success() {
+        return None;
+    }
     let Ok(body) = response.text().await else {
         return None;
     };
     Some(body.chars().take(2000).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal celld `/do/` stand-in: one canned status and body.
+    async fn serve_status(
+        listener: tokio::net::TcpListener,
+        status: &'static str,
+        body: &'static str,
+    ) {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = [0u8; 4096];
+        let mut req = Vec::new();
+        while !req.ends_with(b"\r\n\r\n") {
+            let Ok(n) = stream.read(&mut buf).await else {
+                return;
+            };
+            if n == 0 || req.len() > 8192 {
+                return;
+            }
+            req.extend_from_slice(&buf[..n]);
+        }
+        let _ = stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await;
+    }
+
+    async fn seed_app_on(pool: &sqlx::SqlitePool, port: i64) -> App {
+        let cfg = crate::config::config_for_tests();
+        let slug = format!("shop-{port}");
+        let mut app = crate::db::create_app(
+            pool,
+            &cfg,
+            crate::db::NewApp {
+                name: "shop",
+                slug: &slug,
+                user_id: "user_test",
+                subdomain: "shop.localhost",
+                listen: 30000,
+                internal: 30001,
+            },
+        )
+        .await
+        .expect("seed app");
+        app.internal_port = Some(port);
+        app
+    }
+
+    /// A refusal — a 401 without the token, a 404 for a gone instance —
+    /// reads as a missing instance, never as a preview body; a 200 still
+    /// previews.
+    #[tokio::test]
+    async fn probe_refusals_read_as_missing() {
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        for (status, body) in [
+            ("401 Unauthorized", "unauthorized"),
+            ("404 Not Found", "gone"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = i64::from(listener.local_addr().expect("addr").port());
+            tokio::spawn(serve_status(listener, status, body));
+            let app = seed_app_on(&pool, port).await;
+            assert_eq!(
+                probe_instance(&app, "scope").await,
+                None,
+                "{status} is missing"
+            );
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = i64::from(listener.local_addr().expect("addr").port());
+        tokio::spawn(serve_status(listener, "200 OK", r#"{"n":1}"#));
+        let app = seed_app_on(&pool, port).await;
+        assert_eq!(
+            probe_instance(&app, "scope").await,
+            Some(r#"{"n":1}"#.to_string()),
+            "a 200 previews"
+        );
+        pool.close().await;
+    }
 }

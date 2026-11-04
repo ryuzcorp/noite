@@ -240,8 +240,9 @@ async fn copy_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
 /// it as one more source — keyed `_control`, with no `app` row. Its pid is
 /// mirrored into `control_pid` and its stdout+stderr into the shared log
 /// buffer under the same key. `operator_token` guards its internal listener
-/// like every tenant fleet's; empty leaves the listener open (warned by the
-/// caller), as before.
+/// like every tenant fleet's; the caller refuses to spawn on an empty token
+/// (failing closed), and the empty path below only deletes the stale
+/// published file as belt-and-braces.
 pub fn supervise(
     config: &Config,
     control_pid: Arc<AtomicU32>,
@@ -264,8 +265,12 @@ pub fn supervise(
             // The control fleet's operator token for `make doctor`'s `celld
             // diagnose` (an in-tree internal client that authenticates from
             // its own env): rewritten on every spawn so it never drifts from
-            // the ensured row. Root-only: tenants must never read it.
-            if !operator_token.is_empty() {
+            // the ensured row. Root-only: tenants must never read it. Empty
+            // (the caller refuses to spawn then, but belt-and-braces) deletes
+            // the stale file instead of publishing nothing.
+            if operator_token.is_empty() {
+                remove_operator_token_file(&work_dir);
+            } else {
                 write_operator_token_file(&work_dir, &operator_token);
             }
             let mut cmd = tokio::process::Command::new(&celld);
@@ -274,12 +279,22 @@ pub fn supervise(
                 .env("CELLD_WATCH", state_dir)
                 .env("CELLD_READY_FLEET_GATE_MS", "15000")
                 .env("CELLD_DURABILITY", "bucket");
-            if !operator_token.is_empty() {
+            if operator_token.is_empty() {
+                // Never inherit an operator-global token the runner does not
+                // know: the node would boot guarded with a token no caller
+                // sends.
+                cmd.env_remove(crate::host::credentials::OPERATOR_TOKEN_ENV);
+            } else {
                 cmd.env(
                     crate::host::credentials::OPERATOR_TOKEN_ENV,
                     &operator_token,
                 );
             }
+            // The control node sets no egress or memory-scope policy of its
+            // own; like the tenant spawn, it removes rather than inherits.
+            cmd.env_remove("CELLD_EGRESS");
+            cmd.env_remove("CELLD_EGRESS_ALLOW");
+            cmd.env_remove("CELLD_MEMORY_SCOPE");
             cmd.env("CELLD_SHUTDOWN_TOTAL_MS", &shutdown_ms)
                 // The same lease as tenant fleets (`Config::fleet_lease_ttl_ms`).
                 .env("CELLD_TTL_MS", &lease_ttl_ms)
@@ -303,6 +318,13 @@ pub fn supervise(
 /// node's `CELLD_WATCH` working dir (whose contents celld owns).
 fn operator_token_path(work_dir: &str) -> std::path::PathBuf {
     std::path::Path::new(work_dir).join("control-operator-token")
+}
+
+/// Delete the published control token, if any: when the token cannot be
+/// ensured the stale file must not linger, or `make doctor` would probe
+/// with a dead token instead of failing loudly.
+pub fn remove_operator_token_file(work_dir: &str) {
+    let _ = std::fs::remove_file(operator_token_path(work_dir));
 }
 
 /// Publish the control fleet's operator token for `make doctor`: root-only

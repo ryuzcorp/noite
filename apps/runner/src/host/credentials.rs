@@ -704,14 +704,22 @@ fn cache_operator_token(scope_key: &str, token: &str) {
     }
 }
 
+/// Associated data for an operator token row: the scope, namespaced away
+/// from the scoped-credential table (same KEK, same scope strings) so a row
+/// transplanted across tables does not decrypt either.
+fn operator_token_aad(scope_key: &str) -> String {
+    format!("op:{scope_key}")
+}
+
 /// This fleet's celld operator token, minting and storing it on first use:
 /// 32 random bytes per scope, AES-256-GCM under the RUNNER_TOKEN KEK with
-/// the scope as associated data — the same envelope as [`ensure`], so the
-/// bucket snapshot is not a token dump and a row copied onto another scope
-/// does not decrypt. Stable across restarts (the row is re-read); app and
-/// environment deletes drop the row, so a recreated slug mints fresh. A row
-/// that no longer decrypts (RUNNER_TOKEN rotated) is replaced; the running
-/// fleet keeps serving on the old token until its next spawn adopts the row.
+/// the namespaced scope as associated data — the same envelope as [`ensure`],
+/// so the bucket snapshot is not a token dump and a row copied onto another
+/// scope (or across tables) does not decrypt. Stable across restarts (the
+/// row is re-read); app and environment deletes drop the row, so a recreated
+/// slug mints fresh. A row that no longer decrypts (RUNNER_TOKEN rotated) is
+/// replaced; the running fleet keeps serving on the old token until its next
+/// spawn adopts the row.
 pub async fn operator_token(
     pool: &sqlx::SqlitePool,
     runner_token: &str,
@@ -739,8 +747,9 @@ async fn ensure_operator_token_row(
     scope_key: &str,
     app_id: &str,
 ) -> anyhow::Result<String> {
+    let aad = operator_token_aad(scope_key);
     if let Some((nonce, ciphertext)) = db::get_operator_token(pool, scope_key).await? {
-        match decrypt(runner_token, scope_key, &nonce, &ciphertext) {
+        match decrypt(runner_token, &aad, &nonce, &ciphertext) {
             Ok(token) => return Ok(token),
             Err(e) => tracing::warn!(
                 scope = %scope_key,
@@ -750,7 +759,7 @@ async fn ensure_operator_token_row(
         }
     }
     let token = mint_operator_token();
-    let (nonce, ciphertext) = encrypt(runner_token, scope_key, &token)?;
+    let (nonce, ciphertext) = encrypt(runner_token, &aad, &token)?;
     // A superseded row (undecryptable after a rotation) goes before the
     // insert: the scope is the primary key, and two rows cannot share it.
     db::delete_operator_token(pool, scope_key).await?;

@@ -1432,9 +1432,81 @@ async fn undecryptable_row_is_replaced() {
         .expect("read row")
         .expect("row stored");
     assert_eq!(
-        decrypt("rotated-token", &scope, &nonce, &ciphertext)
-            .expect("replacement decrypts under the rotated key"),
+        decrypt(
+            "rotated-token",
+            &super::operator_token_aad(&scope),
+            &nonce,
+            &ciphertext
+        )
+        .expect("replacement decrypts under the rotated key"),
         after
+    );
+    pool.close().await;
+}
+
+/// The token AAD is namespaced away from the scoped-credential table: a
+/// token row does not decrypt under the bare scope, so a row transplanted
+/// across tables is unreadable.
+#[tokio::test]
+async fn token_row_rejects_the_scoped_credential_aad() {
+    let pool = memory_db().await;
+    let cfg = config_for_tests();
+    let scope = unique_scope("app");
+    operator_token(&pool, &cfg.runner_token, &scope, "app-1")
+        .await
+        .expect("mint");
+    let (nonce, ciphertext) = db::get_operator_token(&pool, &scope)
+        .await
+        .expect("read row")
+        .expect("row stored");
+    assert!(
+        decrypt(&cfg.runner_token, &scope, &nonce, &ciphertext).is_err(),
+        "the bare-scope AAD must not open a token row"
+    );
+    pool.close().await;
+}
+
+/// Deletes drop the rows: one environment's token, then every token of
+/// the app — so a recreated slug or label mints fresh.
+#[tokio::test]
+async fn deletes_drop_the_token_rows() {
+    let pool = memory_db().await;
+    let cfg = config_for_tests();
+    let app_id = format!("app-{}", crate::models::new_id());
+    let app_scope = format!("app:{app_id}");
+    let env_scope = unique_scope("env");
+    operator_token(&pool, &cfg.runner_token, &app_scope, &app_id)
+        .await
+        .expect("app token");
+    operator_token(&pool, &cfg.runner_token, &env_scope, &app_id)
+        .await
+        .expect("env token");
+    db::delete_operator_token(&pool, &env_scope)
+        .await
+        .expect("drop env row");
+    assert!(
+        db::get_operator_token(&pool, &env_scope)
+            .await
+            .expect("read")
+            .is_none(),
+        "the environment row is gone"
+    );
+    assert!(
+        db::get_operator_token(&pool, &app_scope)
+            .await
+            .expect("read")
+            .is_some(),
+        "the app row survives an environment delete"
+    );
+    db::delete_app_operator_tokens(&pool, &app_id)
+        .await
+        .expect("drop app rows");
+    assert!(
+        db::get_operator_token(&pool, &app_scope)
+            .await
+            .expect("read")
+            .is_none(),
+        "the app delete drops every remaining row"
     );
     pool.close().await;
 }

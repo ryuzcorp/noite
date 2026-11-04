@@ -377,6 +377,14 @@ mod tests {
             "AWS_REGION",
             "S3_ENDPOINT",
             "CELLD_WATCH",
+            // The fleet's auth token and network/memory fence: tenant rows
+            // under these names must never reach fleet process env (the
+            // spawn also applies tenant vars before platform knobs, so
+            // platform wins by construction even so).
+            "CELLD_OPERATOR_TOKEN",
+            "CELLD_EGRESS",
+            "CELLD_EGRESS_ALLOW",
+            "CELLD_MEMORY_SCOPE",
             "RUNNER_TOKEN",
             "NOITE_IMAGE",
             "BETTER_AUTH_URL",

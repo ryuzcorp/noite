@@ -482,9 +482,15 @@ async fn fleet_gone_cleanup(slug: &str) {
 fn egress_allow(s3_endpoint: &str) -> Option<String> {
     let url = reqwest::Url::parse(s3_endpoint).ok()?;
     // `host_str` keeps an IPv6 literal's brackets, which is exactly the
-    // `host:port` spelling celld parses.
+    // `host:port` spelling celld parses — and it excludes userinfo, so
+    // credentials in the endpoint cannot leak into the allowlist.
     let host = url.host_str()?;
     let port = url.port_or_known_default()?;
+    // Port 0 is not a dialable exception: celld refuses to boot on it, so
+    // a nonsense endpoint yields no entry instead.
+    if port == 0 {
+        return None;
+    }
     Some(format!("{host}:{port}"))
 }
 
@@ -615,6 +621,13 @@ async fn ensure_spawned(
     let internal_addr = format!("127.0.0.1:{}", spec.internal);
     let advertise_addr = internal_addr.clone();
     let mut cmd = Command::new(&cfg.celld_bin);
+    // Tenant settings first: every platform knob below wins over them by
+    // construction, so a reserved-name filter regression can never override
+    // the operator token, the egress policy or the memory scope (tenant
+    // `CELLD_*` rows are dropped by `db::env_reserved` as well).
+    for (k, v) in spec.env {
+        cmd.env(k, v);
+    }
     cmd.args([
         "--bucket",
         &spec.bucket,
@@ -675,12 +688,19 @@ async fn ensure_spawned(
     // container engine) is exempt either way, as are this node's published
     // container endpoints, node-wide. The nft table now covers builds only;
     // `single` keeps no egress policy, as before (its one tenant is
-    // trusted).
+    // trusted). Each knob is removed when unset: the spawn inherits the
+    // runner's env, and an operator-global value must never silently
+    // confine (or open) a fleet that did not ask for it.
     if matches!(cfg.tenancy, crate::config::Tenancy::Multi) {
         cmd.env("CELLD_EGRESS", "public");
         if let Some(allow) = egress_allow(&cfg.s3_endpoint) {
             cmd.env("CELLD_EGRESS_ALLOW", allow);
+        } else {
+            cmd.env_remove("CELLD_EGRESS_ALLOW");
         }
+    } else {
+        cmd.env_remove("CELLD_EGRESS");
+        cmd.env_remove("CELLD_EGRESS_ALLOW");
     }
     // Fleet telemetry -> Parquet in the fleet bucket (celld OTel, bucket
     // sink), the documented query path for request counts. The flush / the
@@ -712,12 +732,22 @@ async fn ensure_spawned(
     // (`RUNNER_FLEET_MAX_RSS_MB=0`) defaults to 80% of the leaf's
     // `memory.max`, and the fleet sheds gracefully before the kernel
     // OOM-kills it. Without a leaf (no cgroup grant) the knob keeps its
-    // container-wide meaning, as before.
+    // container-wide meaning, as before. Removed when unset, like the
+    // egress knobs above: an inherited value must not silently re-scope a
+    // fleet.
     if fleet_cgroup.is_some() {
         cmd.env("CELLD_MEMORY_SCOPE", "self");
+    } else {
+        cmd.env_remove("CELLD_MEMORY_SCOPE");
     }
+    // The documented knob is `RUNNER_FLEET_MAX_RSS_MB`; a zero value
+    // removes the variable instead of inheriting an operator-global one,
+    // which under `self` scope would silently become a per-fleet
+    // threshold the operator never configured per fleet.
     if cfg.fleet_max_rss_mb > 0 {
         cmd.env("CELLD_MAX_RSS_MB", cfg.fleet_max_rss_mb.to_string());
+    } else {
+        cmd.env_remove("CELLD_MAX_RSS_MB");
     }
     {
         use std::os::unix::process::CommandExt;
@@ -765,9 +795,6 @@ async fn ensure_spawned(
             }
             (None, None) => {}
         }
-    }
-    for (k, v) in spec.env {
-        cmd.env(k, v);
     }
     // The operator's DOCKER_HOST never reaches a fleet (a tenant override
     // is reserved anyway, but the runner's own environment would otherwise
@@ -1484,7 +1511,18 @@ mod tests {
             egress_allow("http://[fd00::7]:9000"),
             Some("[fd00::7]:9000".to_string())
         );
-        for bad in ["", "not a url", "http://", "unix:///sock"] {
+        // Credentials in the endpoint stay out of the allowlist.
+        assert_eq!(
+            egress_allow("http://user:pass@rustfs:9000"),
+            Some("rustfs:9000".to_string())
+        );
+        for bad in [
+            "",
+            "not a url",
+            "http://",
+            "unix:///sock",
+            "http://rustfs:0",
+        ] {
             assert_eq!(egress_allow(bad), None, "{bad:?} yields no entry");
         }
     }
@@ -1571,6 +1609,20 @@ mod tests {
             Some(format!("Bearer {token}")),
             "the reload carries the fleet token"
         );
+        // Another fleet's token is never sent: a scope this process never
+        // ensured goes out bare even while other tokens are cached.
+        let other = format!("app:{}", crate::models::new_id());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = i64::from(listener.local_addr().expect("addr").port());
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        tokio::spawn(serve_reload(listener, seen.clone()));
+        assert_eq!(
+            reload_at("other", port, &other).await,
+            ReloadOutcome::Adopted
+        );
+        assert_eq!(*seen.lock().await, None, "no cross-fleet token");
         pool.close().await;
     }
 

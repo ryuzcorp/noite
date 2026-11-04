@@ -430,26 +430,48 @@ async fn main() -> anyhow::Result<()> {
     let control_child = if host::control::bundle_present(&config) {
         // The control node's operator token: minted once and snapshotted
         // with the database, so an overlapping redeploy's new node agrees
-        // with the old one on peer traffic. Without it the node runs with
-        // an open internal listener, as before — warned, never silent.
-        let control_token = host::credentials::operator_token(
-            &pool,
-            &config.runner_token,
-            host::credentials::CONTROL_OPERATOR_SCOPE,
-            "_control",
-        )
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %format!("{e:#}"), "control operator token unavailable; the control node runs with an open internal listener");
-            String::new()
-        });
-        if let Err(e) = host::control::ensure_deployed(&config).await {
-            tracing::warn!(error = %e, "control fleet deploy failed; continuing");
+        // with the old one on peer traffic. Retried like the control
+        // deploy below; still missing, the control fleet does not run at
+        // all — failing closed, never an open internal listener on :8091 —
+        // and the stale published token (if any) is deleted so `make
+        // doctor` fails loudly instead of probing with a dead token.
+        let mut control_token = String::new();
+        for attempt in 1..=3 {
+            match host::credentials::operator_token(
+                &pool,
+                &config.runner_token,
+                host::credentials::CONTROL_OPERATOR_SCOPE,
+                "_control",
+            )
+            .await
+            {
+                Ok(token) => {
+                    control_token = token;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(attempt, error = %format!("{e:#}"), "control operator token unavailable; retrying");
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
         }
-        let child =
-            host::control::supervise(&config, control_pid.clone(), logs.clone(), control_token);
-        tracing::info!(ms = boot.elapsed().as_millis(), "control bundle ready");
-        Some(child)
+        if control_token.is_empty() {
+            tracing::error!(
+                "control operator token unavailable; not supervising the control fleet"
+            );
+            host::control::remove_operator_token_file(&config.work_dir);
+            None
+        } else {
+            if let Err(e) = host::control::ensure_deployed(&config).await {
+                tracing::warn!(error = %e, "control fleet deploy failed; continuing");
+            }
+            let child =
+                host::control::supervise(&config, control_pid.clone(), logs.clone(), control_token);
+            tracing::info!(ms = boot.elapsed().as_millis(), "control bundle ready");
+            Some(child)
+        }
     } else {
         tracing::info!("no control bundle (dev image): the UI is served by vite dev");
         None
