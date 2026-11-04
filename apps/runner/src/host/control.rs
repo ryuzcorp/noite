@@ -17,7 +17,7 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::host::children::Supervised;
 use crate::host::logs::LogState;
-use crate::host::{exec, metrics, s3};
+use crate::host::{exec, s3};
 
 const MARKER_KEY: &str = "ui/revision";
 
@@ -250,11 +250,9 @@ pub fn supervise(
     operator_token: String,
 ) -> Supervised {
     let args = spawn_args(config);
-    let shutdown_ms = config.fleet_shutdown_ms().to_string();
-    let lease_ttl_ms = config.fleet_lease_ttl_ms.to_string();
     let celld = config.celld_bin.clone();
-    let otel = metrics::otel_env(config);
     let work_dir = config.work_dir.clone();
+    let fleet_cfg = config.clone();
     Supervised::start_observed(
         "control",
         Some(control_pid),
@@ -275,39 +273,21 @@ pub fn supervise(
             }
             let mut cmd = tokio::process::Command::new(&celld);
             cmd.args(&args)
-                .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
-                .env("CELLD_WATCH", state_dir)
-                .env("CELLD_READY_FLEET_GATE_MS", "15000")
-                .env("CELLD_DURABILITY", "bucket");
-            if operator_token.is_empty() {
-                // Never inherit an operator-global token the runner does not
-                // know: the node would boot guarded with a token no caller
-                // sends.
-                cmd.env_remove(crate::host::credentials::OPERATOR_TOKEN_ENV);
-            } else {
-                cmd.env(
-                    crate::host::credentials::OPERATOR_TOKEN_ENV,
-                    &operator_token,
-                );
-            }
-            // The control node sets no egress or memory-scope policy of its
-            // own; like the tenant spawn, it removes rather than inherits.
-            cmd.env_remove("CELLD_EGRESS");
-            cmd.env_remove("CELLD_EGRESS_ALLOW");
-            cmd.env_remove("CELLD_MEMORY_SCOPE");
-            cmd.env("CELLD_SHUTDOWN_TOTAL_MS", &shutdown_ms)
-                // The same lease as tenant fleets (`Config::fleet_lease_ttl_ms`).
-                .env("CELLD_TTL_MS", &lease_ttl_ms)
-                // The control UI declares no container classes; only the
-                // runner holds the engine socket (host::sandbox::engine).
-                .env_remove("DOCKER_HOST")
                 // Piped so the supervisor captures the node's own log into the
                 // shared buffer (the OTel ring carries the worker's console).
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            for (key, value) in &otel {
-                cmd.env(key, value);
-            }
+            // Explicit environment only (`host::fleet_env`): the spawn
+            // inherits nothing — no `RUNNER_TOKEN`, no operator-global
+            // `CELLD_*` — and the store credentials the spawn used to
+            // inherit are passed explicitly.
+            let env = crate::host::fleet_env::control_fleet_env(
+                &crate::host::fleet_env::ControlFleetEnv {
+                    cfg: &fleet_cfg,
+                    operator_token: &operator_token,
+                },
+            );
+            crate::host::fleet_env::apply(&mut cmd, &env);
             cmd
         },
     )
