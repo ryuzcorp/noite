@@ -5,42 +5,43 @@
 //! A Void fleet carries the tenant app plus runner-owned scripts —
 //! `noite-void-proxy` ([`super::void_proxy`]) and, for Void apps with a
 //! managed sandbox, `noite-void-sandbox` ([`super::void_sandbox`]) — each
-//! with its sources and a per-fleet rendered config. celld resolves
-//! `services` within the fleet bucket only and moves the fleet-wide pointer
-//! on every deploy, so deploy order is load-bearing: cohosted scripts first
-//! (lowest [`CohostedScript::order`] first), the app last, then the one
-//! `/reload` whose outcome the deploy already checks. A later script only
-//! adds its [`CohostedScript`] and its render: the order, the skip rule and
-//! the invocation below stay untouched.
+//! with its sources and a per-fleet rendered config. Every script of a
+//! generation is staged first with `celld deploy --no-activate` — the
+//! cohosted scripts in [`CohostedScript::order`] (lowest first), the tenant
+//! app last — and one `celld activate SCRIPT=VERSION...` then serves the
+//! whole generation with a single atomic fleet-pointer write, after which
+//! the one `/reload` (whose outcome the deploy already checks) adopts it.
+//! A later script only adds its [`CohostedScript`] and its render: the
+//! order, the skip rule and the invocation below stay untouched.
 //!
 //! Skip-when-unchanged: the bundle and rendered config are the runner's
 //! own, so a script whose [`RenderedCohost::content_hash`] matches the
-//! stored one (per fleet, the `void_cohost_hash` table) is not
-//! redeployed. Steady state is one app
-//! deploy, zero pointer flapping, zero multi-script window. The hash
-//! covers the sources and the rendered config with secret values
-//! substituted by their hashes, so a rotation redeploys the script while
+//! stored one (per fleet, the `void_cohost_hash` table) is not re-staged:
+//! the activate does not name it and its activated version carries into
+//! the generation. Steady state is one app stage plus the one activate.
+//! The hash covers the sources and the rendered config with secret values
+//! substituted by their hashes, so a rotation re-stages the script while
 //! the stored row holds a digest only — never a secret. Per-deploy
 //! container-image paths are excluded from the hash (their stable content
 //! rides [`RenderedCohost::extra_hash_input`]), so identical content in
 //! another build dir still skips.
 //!
-//! Failure windows (design §2.4): tenant-code failures are pre-pointer
-//! (celld bundles before writing anything). If a cohosted deploy succeeds
-//! and the app deploy then fails on infra (S3/CAS errors), the fleet
-//! pointer names the cohosted script until the next successful deploy —
-//! the 300 s poll backstop could adopt it as primary in that window and
-//! serve its 404s. Mitigations: every `celld deploy` in the sequence
-//! retries once on infra errors ([`deploy_with_infra_retry`], idempotent —
-//! a fence-image `AlreadyExists` race between two concurrent deploys heals
-//! inside the deploy instead of failing it); tenant failures fail at once;
-//! anything else fails loudly; the next successful deploy heals. A failed
-//! cohosted script still fails the deploy before the app moves the
-//! pointer, so the fleet keeps serving its old generation.
+//! Failure handling: staged versions move no pointer and are invisible to
+//! serving, so a failed stage — cohosted or app, tenant or infra — runs no
+//! activate and the previous generation keeps serving. Tenant-code failures
+//! are pre-pointer (celld bundles before writing anything) and fail at
+//! once, with no retry; anything reading as infra (S3/CAS errors, timeouts,
+//! a lost pointer race) retries once ([`run_with_infra_retry`], idempotent
+//! both ways — content-versioned stages, an activate that reports unchanged
+//! when its generation already committed); anything else fails loudly.
+//! Stored hashes name activated content — written only after the activate
+//! commits — so the next deploy heals by staging again from the same
+//! content.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::Context;
 use serde_json::Value;
 use sqlx::SqlitePool;
 
@@ -254,9 +255,9 @@ impl RenderedCohost {
     }
 }
 
-/// What `celld deploy` needs: the binary, the fleet bucket and the env.
-/// One value serves the cohosted scripts and the app alike — same binary,
-/// same bucket, same invocation shape.
+/// What the fleet's `celld` invocations need: the binary, the fleet bucket
+/// and the env. One value serves the staged deploys and the one activate
+/// alike — same binary, same bucket, same invocation shape.
 #[derive(Clone, Copy)]
 pub struct CelldDeploy<'a> {
     pub celld_bin: &'a str,
@@ -267,17 +268,100 @@ pub struct CelldDeploy<'a> {
     pub timeout: Duration,
 }
 
-/// One `celld deploy` of a project dir into the fleet bucket.
-pub async fn celld_deploy(
+/// One staged script version: celld's script name and deployment version,
+/// as `celld deploy --no-activate --json` printed them. The pair is what
+/// the one `celld activate` names as `SCRIPT=VERSION`.
+pub struct StagedVersion {
+    pub worker: String,
+    pub version: String,
+}
+
+/// Parse `celld deploy --no-activate --json` stdout: one JSON object
+/// (`fleet.rs` `Deployed` — stdout carries the datum, the narrative goes to
+/// stderr). The version is validated — the 16-lowercase-hex deployment
+/// version `activate` expects (`deploy.rs` `parse_version_ref`) — and the
+/// worker must name a script (celld validated the name when it built the
+/// version, so non-empty is enough here), so a malformed row fails the
+/// deploy here instead of reaching `activate` as a corrupt `SCRIPT=VERSION`.
+fn parse_staged_version(stdout: &str) -> anyhow::Result<StagedVersion> {
+    let row: Value = serde_json::from_str(stdout)
+        .with_context(|| format!("parse staged deploy output: {stdout:?}"))?;
+    let worker = row
+        .get("worker")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let version = row
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    anyhow::ensure!(
+        !worker.is_empty(),
+        "staged deploy output names no worker: {stdout:?}"
+    );
+    let hex16 = version.len() == 16
+        && version
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    anyhow::ensure!(
+        hex16,
+        "staged deploy output carries no 16-hex version: {stdout:?}"
+    );
+    Ok(StagedVersion {
+        worker: worker.to_string(),
+        version: version.to_string(),
+    })
+}
+
+/// One `celld` invocation — a stage or the activate — retried once when the
+/// failure reads as infra (S3/CAS errors, timeouts, a lost pointer race
+/// whose error says to re-run: this retry IS the re-run —
+/// [`is_tenant_error`] decides). Both commands are idempotent
+/// (content-versioned stages; an activate whose generation already committed
+/// reports unchanged), so the retry is safe. Returns the attempt count and
+/// the command's stdout: 1, or 2 when the retry ran. Tenant failures return
+/// at once, unretried; a twice-failed command carries both attempts'
+/// errors. The stages and the activate share this — one classification, one
+/// retry.
+async fn run_with_infra_retry(
+    celld: &CelldDeploy<'_>,
+    args: &[&str],
+    cwd: Option<&Path>,
+) -> anyhow::Result<(u32, String)> {
+    let subcommand = args.first().copied().unwrap_or("celld");
+    match exec::run_cmd(celld.celld_bin, args, cwd, celld.env, celld.timeout).await {
+        Ok(stdout) => Ok((1, stdout)),
+        Err(first) => {
+            if is_tenant_error(&format!("{:#}", first)) {
+                return Err(first);
+            }
+            tracing::warn!("celld {subcommand} failed (infra); retrying once");
+            match exec::run_cmd(celld.celld_bin, args, cwd, celld.env, celld.timeout).await {
+                Ok(stdout) => Ok((2, stdout)),
+                Err(second) => Err(anyhow::anyhow!(
+                    "celld {subcommand} failed twice (one infra retry):\nfirst: {:#}\nsecond: {:#}",
+                    first,
+                    second
+                )),
+            }
+        }
+    }
+}
+
+/// Stage one project dir into the fleet bucket: `celld deploy --no-activate
+/// --json` uploads and validates a version without moving any pointer — no
+/// queue attachment, no named pointer, no fleet pointer — so the staged
+/// version is invisible to serving until the one activate names it. Returns
+/// the attempt count and the staged version.
+pub async fn celld_stage(
     celld: &CelldDeploy<'_>,
     project_dir: &Path,
     cwd: Option<&Path>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(u32, StagedVersion)> {
     let Some(dir) = project_dir.to_str() else {
         anyhow::bail!("deploy root is not valid UTF-8: {}", project_dir.display());
     };
-    exec::run_cmd(
-        celld.celld_bin,
+    let (attempts, stdout) = run_with_infra_retry(
+        celld,
         &[
             "deploy",
             dir,
@@ -287,12 +371,51 @@ pub async fn celld_deploy(
             celld.endpoint,
             "--region",
             celld.region,
+            "--no-activate",
+            "--json",
         ],
         cwd,
-        celld.env,
-        celld.timeout,
     )
-    .await
+    .await?;
+    Ok((attempts, parse_staged_version(&stdout)?))
+}
+
+/// Serve one generation: `celld activate SCRIPT=VERSION... --primary APP`
+/// replaces the fleet-wide pointer with one compare-and-swap write naming
+/// every script's version, so nodes adopt either the whole old generation
+/// or the whole new one — never a mix. Scripts the call does not name keep
+/// their activated versions (carried from the pointer's component map, or
+/// from the named pointers on a legacy fleet), so skipped cohosted scripts
+/// are simply not named. `--primary` is always the app: it is required on
+/// a first deploy naming several scripts, and it heals a legacy pointer a
+/// stranded cohosted deploy left behind. celld's own stdout is discarded —
+/// the generation is known from the inputs — and the attempt count is
+/// returned for the log.
+pub async fn celld_activate(
+    celld: &CelldDeploy<'_>,
+    staged: &[(String, String)],
+    primary: &str,
+) -> anyhow::Result<u32> {
+    let refs: Vec<String> = staged
+        .iter()
+        .map(|(script, version)| format!("{script}={version}"))
+        .collect();
+    let mut args: Vec<&str> = Vec::with_capacity(refs.len() + 8);
+    args.push("activate");
+    for version_ref in &refs {
+        args.push(version_ref);
+    }
+    args.extend([
+        "--bucket",
+        celld.bucket,
+        "--endpoint",
+        celld.endpoint,
+        "--region",
+        celld.region,
+        "--primary",
+        primary,
+    ]);
+    Ok(run_with_infra_retry(celld, &args, None).await?.0)
 }
 
 /// `celld deploy` failures that come from the project itself: bundling a
@@ -325,77 +448,28 @@ const TENANT_ERROR_MARKERS: &[&str] = &[
     "unknown argument",
 ];
 
-/// True when a `celld deploy` failure reads as tenant-caused (no retry).
-/// Everything else — S3/CAS answers, timeouts, a hung celld, a fence-image
-/// `AlreadyExists` race — reads as infra and the deploy retries once.
+/// True when a `celld` failure reads as tenant-caused (no retry).
+/// Everything else — S3/CAS answers, timeouts, a hung celld, a lost
+/// pointer race — reads as infra and the command retries once. The one
+/// activate shares this classification: nothing it reports matches a
+/// tenant marker, so every activate failure retries once (a lost race's
+/// re-run error included — the retry IS the re-run).
 pub fn is_tenant_error(output: &str) -> bool {
     TENANT_ERROR_MARKERS.iter().any(|m| output.contains(m))
 }
 
-/// What the app deploy took: whether it retried (celld's own stdout is
-/// discarded, as the previous inline deploy did — the log carries the
-/// attempts, the row carries the outcome).
-#[derive(Debug)]
-pub struct AppDeploy {
-    /// 1, or 2 when the first attempt failed on infra and the retry ran.
-    pub attempts: u32,
-}
-
-/// One `celld deploy`, retried once when the failure reads as infra
-/// (S3/CAS errors, timeouts — [`is_tenant_error`] decides). The retry is
-/// idempotent (content-versioned deploys). Returns the attempt count: 1,
-/// or 2 when the retry ran. Tenant failures return at once, unretried; a
-/// twice-failed deploy carries both attempts' errors. The cohosted
-/// scripts and the tenant app share this — one classification, one retry.
-async fn deploy_with_infra_retry(
-    celld: &CelldDeploy<'_>,
-    project_dir: &Path,
-    cwd: Option<&Path>,
-) -> anyhow::Result<u32> {
-    match celld_deploy(celld, project_dir, cwd).await {
-        Ok(_) => Ok(1),
-        Err(first) => {
-            if is_tenant_error(&format!("{:#}", first)) {
-                return Err(first);
-            }
-            tracing::warn!("celld deploy failed (infra); retrying once");
-            match celld_deploy(celld, project_dir, cwd).await {
-                Ok(_) => Ok(2),
-                Err(second) => Err(anyhow::anyhow!(
-                    "celld deploy failed twice (one infra retry):\nfirst: {:#}\nsecond: {:#}",
-                    first,
-                    second
-                )),
-            }
-        }
-    }
-}
-
-/// Deploy the tenant app: one `celld deploy`, retried once when the
-/// failure reads as infra. The retry narrows §2.4's window: a transient
-/// store blip between the cohosted and app deploys heals inside this
-/// deploy instead of leaving the pointer on a cohosted script. A
-/// twice-failed deploy carries both attempts' errors; the row's summary
-/// still truncates to one line.
-pub async fn celld_deploy_app(
-    celld: &CelldDeploy<'_>,
-    project_dir: &Path,
-    cwd: Option<&Path>,
-) -> anyhow::Result<AppDeploy> {
-    Ok(AppDeploy {
-        attempts: deploy_with_infra_retry(celld, project_dir, cwd).await?,
-    })
-}
-
-/// What one cohosted script's deploy did, for the deploy log.
+/// What one cohosted script's stage did, for the deploy log.
 #[derive(Debug, PartialEq, Eq)]
 pub struct CohostOutcome {
     pub script: &'static str,
     pub skipped: bool,
-    /// The content hash deployed (or matched, when skipped).
+    /// The content hash staged (or matched, when skipped).
     pub hash: String,
-    /// `celld deploy` attempts: 0 when skipped, else 1 — or 2 when the
-    /// first attempt failed on infra and the retry ran.
+    /// The staged deployment version: `None` when skipped (the activated
+    /// version carries into the generation unnamed).
+    pub version: Option<String>,
+    /// `celld deploy --no-activate` attempts: 0 when skipped, else 1 — or
+    /// 2 when the first attempt failed on infra and the retry ran.
     pub attempts: u32,
 }
 
@@ -405,20 +479,20 @@ impl CohostOutcome {
         let short = &self.hash[..12.min(self.hash.len())];
         if self.skipped {
             format!(
-                "void: cohosted script `{}` unchanged ({}); skipping deploy\n",
+                "void: cohosted script `{}` unchanged ({}); keeping the activated version\n",
                 self.script, short
             )
         } else {
             format!(
-                "void: deployed cohosted script `{}` ({})\n",
+                "void: staged cohosted script `{}` ({})\n",
                 self.script, short
             )
         }
     }
 }
 
-/// One render's `celld deploy` timeout: the shared default, stretched
-/// over a first image pull for scripts declaring containers.
+/// One render's stage timeout: the shared default, stretched over a
+/// first image pull for scripts declaring containers.
 fn render_timeout(celld: &CelldDeploy<'_>, render: &RenderedCohost) -> Duration {
     if render.declares_containers {
         CONTAINER_DEPLOY_TIMEOUT
@@ -427,17 +501,20 @@ fn render_timeout(celld: &CelldDeploy<'_>, render: &RenderedCohost) -> Duration 
     }
 }
 
-/// Deploy the fleet's runner-owned scripts in order (lowest `order`
-/// first): each renders to a fresh temp project, deploys with
-/// `celld deploy` into the fleet bucket, and stores its content hash —
-/// unless the hash matches the stored one, in which case the script is
-/// skipped. Each deploy retries once on infra errors, like the app's (a
-/// fence-image `AlreadyExists` race heals inside the deploy instead of
-/// failing it); a tenant failure fails the deploy at once, before the app
-/// moves the pointer. The temp project holds the fleet's secrets in
-/// plaintext, so it is owner-only from birth and removed on every path —
-/// success or failure — and failed deploys leave nothing on runner disk.
-pub async fn ensure_cohosted(
+/// Stage the fleet's runner-owned scripts in order (lowest `order` first):
+/// each renders to a fresh temp project and stages with `celld deploy
+/// --no-activate` into the fleet bucket — unless its content hash matches
+/// the stored one, in which case the script is skipped and its activated
+/// version carries into the generation unnamed. Each stage retries once on
+/// infra errors, like the app's and the activate's; a tenant failure fails
+/// the deploy at once, before the app stages. Staged versions move no
+/// pointer, so a failed stage leaves the previous generation serving — and
+/// no hashes are stored here: they name activated content, so
+/// [`deploy_fleet_in_order`] stores them only after the activate commits.
+/// The temp project holds the fleet's secrets in plaintext, so it is
+/// owner-only from birth and removed on every path — success or failure —
+/// and failed deploys leave nothing on runner disk.
+pub async fn stage_cohosted(
     pool: &SqlitePool,
     app_id: &str,
     environment_id: Option<&str>,
@@ -455,6 +532,7 @@ pub async fn ensure_cohosted(
                 script: render.script.name,
                 skipped: true,
                 hash,
+                version: None,
                 attempts: 0,
             });
             continue;
@@ -479,23 +557,32 @@ pub async fn ensure_cohosted(
             timeout: render_timeout(celld, render),
             ..*celld
         };
-        let attempts = match deploy_with_infra_retry(&render_celld, &dir, None).await {
-            Ok(attempts) => attempts,
+        let (attempts, staged) = match celld_stage(&render_celld, &dir, None).await {
+            Ok(staged) => staged,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&dir);
                 return Err(anyhow::anyhow!(
-                    "cohosted script `{}` deploy failed: {:#}",
+                    "cohosted script `{}` stage failed: {:#}",
                     render.script.name,
                     e
                 ));
             }
         };
         let _ = std::fs::remove_dir_all(&dir);
-        db::set_cohost_hash(pool, app_id, environment_id, render.script.name, &hash).await?;
+        // The staged version must identify the script just rendered: celld
+        // read its name from the same `wrangler.json`, so anything else is
+        // a wiring bug, failed loudly before the activate names it.
+        anyhow::ensure!(
+            staged.worker == render.script.name,
+            "cohosted script `{}` staged as worker {:?}",
+            render.script.name,
+            staged.worker
+        );
         outcomes.push(CohostOutcome {
             script: render.script.name,
             skipped: false,
             hash,
+            version: Some(staged.version),
             attempts,
         });
     }
@@ -503,7 +590,7 @@ pub async fn ensure_cohosted(
 }
 
 /// The tenant app's side of the ordered deploy: its project dir, the cwd
-/// `celld deploy` runs from, and its own (container-aware) timeout.
+/// the app stage runs from, and its own (container-aware) timeout.
 pub struct FleetApp<'a> {
     pub dir: &'a Path,
     pub cwd: Option<&'a Path>,
@@ -514,12 +601,24 @@ pub struct FleetApp<'a> {
 #[derive(Debug)]
 pub struct FleetDeployStats {
     pub cohosted: Vec<CohostOutcome>,
+    /// `celld deploy --no-activate` attempts for the app: 1, or 2 when the
+    /// first attempt failed on infra and the retry ran.
     pub app_attempts: u32,
+    /// `celld activate` attempts: 1, or 2 when the first attempt failed on
+    /// infra and the retry ran.
+    pub activate_attempts: u32,
+    /// The generation the one activate named, deploy order (cohosted
+    /// first, the app last); skipped scripts carry unnamed and are absent.
+    pub generation: Vec<(String, String)>,
+    /// The activate's `--primary`: the app script, which ingress serves.
+    pub primary: String,
 }
 
 impl FleetDeployStats {
-    /// The deploy-log lines: one per cohosted script, plus a retry note
-    /// per script whose second attempt ran (cohosted first, then the app).
+    /// The deploy-log lines: one per cohosted script, one for the
+    /// generation the activate served, plus a retry note per command whose
+    /// second attempt ran (cohosted first, then the app stage, then the
+    /// activate).
     pub fn log_lines(&self) -> Vec<String> {
         let mut lines: Vec<String> = self.cohosted.iter().map(CohostOutcome::log_line).collect();
         for outcome in &self.cohosted {
@@ -532,18 +631,43 @@ impl FleetDeployStats {
         }
         if self.app_attempts > 1 {
             lines.push(format!(
-                "void: app deploy succeeded on attempt {} after an infra failure\n",
+                "void: app stage succeeded on attempt {} after an infra failure\n",
                 self.app_attempts
+            ));
+        }
+        let generation = self
+            .generation
+            .iter()
+            .map(|(script, version)| format!("{script}={version}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        lines.push(format!(
+            "void: activated generation: {generation} (primary {})\n",
+            self.primary
+        ));
+        if self.activate_attempts > 1 {
+            lines.push(format!(
+                "void: activate succeeded on attempt {} after an infra failure\n",
+                self.activate_attempts
             ));
         }
         lines
     }
 }
 
-/// The whole ordered fleet deploy: the cohosted scripts first (each
-/// skipped when unchanged), the tenant app last with its one infra
-/// retry. One function owns the sequence, so the order — proxy first,
-/// app last, fleet pointer ends on the app — holds by construction.
+/// The whole ordered fleet deploy: every script of the generation staged
+/// with `celld deploy --no-activate` — the cohosted scripts first (each
+/// skipped when unchanged), the tenant app last — then one `celld activate
+/// SCRIPT=VERSION...` serving the generation with a single atomic pointer
+/// write. One function owns the sequence, so the order — proxy first, app
+/// last, fleet pointer ends on the app — holds by construction; a failed
+/// stage runs no activate, so the previous generation keeps serving.
+/// Cohost hashes are stored only after the activate commits, so a stored
+/// hash always names activated content. Staged versions a failed deploy
+/// leaves behind are inert — no pointer names them — and the next deploy
+/// reproduces them from the same content (versions are content-addressed);
+/// the fork's docs recommend no post-failure discard (they warn to hold
+/// superseded versions as rollback targets instead), so none runs.
 pub async fn deploy_fleet_in_order(
     pool: &SqlitePool,
     app_id: &str,
@@ -552,15 +676,32 @@ pub async fn deploy_fleet_in_order(
     cohosted: &[RenderedCohost],
     app: &FleetApp<'_>,
 ) -> anyhow::Result<FleetDeployStats> {
-    let outcomes = ensure_cohosted(pool, app_id, environment_id, celld, cohosted).await?;
+    let outcomes = stage_cohosted(pool, app_id, environment_id, celld, cohosted).await?;
     let app_celld = CelldDeploy {
         timeout: app.timeout,
         ..*celld
     };
-    let deployed = celld_deploy_app(&app_celld, app.dir, app.cwd).await?;
+    let (app_attempts, app_staged) = celld_stage(&app_celld, app.dir, app.cwd).await?;
+    let mut generation: Vec<(String, String)> = Vec::with_capacity(outcomes.len() + 1);
+    for outcome in &outcomes {
+        if let Some(version) = outcome.version.as_ref() {
+            generation.push((outcome.script.to_string(), version.clone()));
+        }
+    }
+    generation.push((app_staged.worker.clone(), app_staged.version.clone()));
+    let activate_attempts = celld_activate(celld, &generation, &app_staged.worker).await?;
+    for outcome in &outcomes {
+        if !outcome.skipped {
+            db::set_cohost_hash(pool, app_id, environment_id, outcome.script, &outcome.hash)
+                .await?;
+        }
+    }
     Ok(FleetDeployStats {
         cohosted: outcomes,
-        app_attempts: deployed.attempts,
+        app_attempts,
+        activate_attempts,
+        generation,
+        primary: app_staged.worker,
     })
 }
 
@@ -847,7 +988,9 @@ mod tests {
 
     /// celld's own project failures (bundling, config shape) read as
     /// tenant — no retry — while store, CAS and transport failures read
-    /// as infra. Markers are quoted from the pinned celld's `deploy.rs`.
+    /// as infra, including every activate failure (a lost pointer race's
+    /// re-run error heals through the retry). Markers are quoted from the
+    /// pinned celld's `deploy.rs`.
     #[test]
     fn tenant_and_infra_errors_classify() {
         for tenant in [
@@ -887,23 +1030,66 @@ mod tests {
             "esbuild not found (esbuild). `celld deploy` bundles with esbuild; install it and retry",
             "save container image failed:\nError: daemon not running",
             "thread 'main' panicked at crates/celld/deploy.rs:973",
-            "failed to create an image celld-fence/9f2c after deleting the existing one: AlreadyExists",
+            "write s3://noite/fleets/x/deploy/current.json lost a race\nAnother deploy or activate landed first; re-run `celld activate`.",
+            "no staged version \"0123456789abcdef\" of script \"test-app\"; run `celld deploy --no-activate` first",
+            "the generation committed, but its named pointers did not converge: put deploy/test-app/current.json: connection refused; re-run `celld activate` to converge them",
         ] {
             assert!(!is_tenant_error(infra), "infra misread as tenant: {}", infra);
         }
     }
 
+    /// The staged row parses to its worker and version — and anything else
+    /// (garbage, a missing field, a non-16-hex version) fails the deploy
+    /// here instead of reaching `activate` as a corrupt `SCRIPT=VERSION`.
+    #[test]
+    fn staged_output_parses_or_fails_loudly() {
+        let staged = parse_staged_version(
+            "{\"worker\": \"test-app\", \"version\": \"0123456789abcdef\", \"location\": \"s3://x\", \"dry_run\": false, \"staged\": true}\n",
+        )
+        .unwrap();
+        assert_eq!(staged.worker, "test-app");
+        assert_eq!(staged.version, "0123456789abcdef");
+
+        for bad in [
+            "not json",
+            "{\"worker\": \"test-app\"}",
+            "{\"version\": \"0123456789abcdef\"}",
+            "{\"worker\": \"\", \"version\": \"0123456789abcdef\"}",
+            "{\"worker\": \"test-app\", \"version\": \"0123456789ABCDEF\"}",
+            "{\"worker\": \"test-app\", \"version\": \"abc\"}",
+            "{\"worker\": \"test-app\", \"version\": 42}",
+        ] {
+            assert!(
+                parse_staged_version(bad).is_err(),
+                "accepted malformed staged output: {}",
+                bad
+            );
+        }
+    }
+
     /// A fake `celld`: appends its argv to `$FAKE_CELLD_LOG`, then fails
     /// invocation `n` (zero-based) when `$FAKE_CELLD_DIR/fail-<n>` exists
-    /// (file content to stderr, exit 1). The control files make order,
-    /// skip and retry observable without sleeps.
+    /// (file content to stderr, exit 1). A `deploy` answers like
+    /// `celld deploy --no-activate --json` — one JSON object whose worker
+    /// is the project dir's `wrangler.json` name and whose version is the
+    /// invocation index as 16-hex, deterministic per invocation — and an
+    /// `activate` answers a text line the caller discards. The control
+    /// files and the deterministic versions make order, skip, retry and
+    /// the generation the activate names observable without sleeps.
     const FAKE_CELLD: &str = r#"#!/bin/sh
 n=0
 if [ -f "$FAKE_CELLD_LOG" ]; then n=$(wc -l < "$FAKE_CELLD_LOG"); fi
 printf '%s\n' "$*" >> "$FAKE_CELLD_LOG"
 fail="$FAKE_CELLD_DIR/fail-$n"
 if [ -f "$fail" ]; then cat "$fail" >&2; exit 1; fi
-echo "deployed $2"
+if [ "$1" = "deploy" ]; then
+  name=$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$2/wrangler.json" 2>/dev/null | head -n 1)
+  name=${name:-test-app}
+  version=$(printf '%016x' "$((n + 1))")
+  printf '{"worker": "%s", "version": "%s", "location": "s3://fake/%s", "dry_run": false, "staged": true}\n' "$name" "$version" "$version"
+else
+  echo "Activated generation: $2 (primary test-app)"
+fi
 "#;
 
     struct FakeCelld {
@@ -974,9 +1160,33 @@ echo "deployed $2"
         .expect("seed app")
     }
 
-    /// Proxy first, app last: the ordered deploy runs `celld deploy` for
-    /// the cohosted project before the app's, into the same bucket — and
-    /// the cohosted temp project is removed afterwards.
+    /// One app project dir: a `wrangler.json` naming the app, as every real
+    /// deploy root has — the fake stages its worker from it.
+    fn app_dir() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("noite-cohost-app-{}", crate::models::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("wrangler.json"),
+            r#"{"name": "test-app", "main": "worker.js"}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    /// The `activate` invocations among the fake's log lines.
+    fn activates(calls: &[String]) -> Vec<&String> {
+        calls
+            .iter()
+            .filter(|call| call.starts_with("activate "))
+            .collect()
+    }
+
+    /// Proxy first, app last, one activate: the ordered deploy stages the
+    /// cohosted project before the app's with `celld deploy --no-activate`
+    /// into the same bucket, then serves both with a single `celld
+    /// activate` naming each staged version — and the cohosted temp project
+    /// is removed afterwards.
     #[tokio::test]
     async fn ordered_deploy_runs_cohosted_before_the_app() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
@@ -997,9 +1207,7 @@ echo "deployed $2"
             region: "us-east-1",
             timeout: Duration::from_secs(30),
         };
-        let app_dir =
-            std::env::temp_dir().join(format!("noite-cohost-app-{}", crate::models::new_id()));
-        std::fs::create_dir_all(&app_dir).unwrap();
+        let app_dir = app_dir();
 
         let stats = deploy_fleet_in_order(
             &pool,
@@ -1016,40 +1224,64 @@ echo "deployed $2"
         .await
         .unwrap();
         assert_eq!(stats.app_attempts, 1);
+        assert_eq!(stats.activate_attempts, 1);
         assert_eq!(stats.cohosted.len(), 1);
         assert!(!stats.cohosted[0].skipped);
+        assert_eq!(
+            stats.cohosted[0].version.as_deref(),
+            Some("0000000000000001")
+        );
+        assert_eq!(
+            stats.generation,
+            [
+                (
+                    "noite-test-cohost".to_string(),
+                    "0000000000000001".to_string()
+                ),
+                ("test-app".to_string(), "0000000000000002".to_string()),
+            ]
+        );
+        assert_eq!(stats.primary, "test-app");
 
         let calls = fake.invocations();
-        assert_eq!(calls.len(), 2, "{:?}", calls);
+        assert_eq!(calls.len(), 3, "{:?}", calls);
         assert!(
-            calls[0].contains("noite-cohost-noite-test-cohost-"),
+            calls[0].starts_with("deploy ")
+                && calls[0].contains("noite-cohost-noite-test-cohost-")
+                && calls[0].contains("--no-activate")
+                && calls[0].contains("s3://noite/fleets/cohost-app"),
             "{:?}",
             calls
         );
         assert!(
-            calls[0].contains("s3://noite/fleets/cohost-app"),
+            calls[1].starts_with("deploy ")
+                && calls[1].contains(&app_dir.to_string_lossy().into_owned())
+                && calls[1].contains("--no-activate")
+                && calls[1].contains("s3://noite/fleets/cohost-app"),
             "{:?}",
             calls
         );
+        // One activate, last, naming both staged versions with the app as
+        // primary.
+        let activated = activates(&calls);
+        assert_eq!(activated.len(), 1, "{:?}", calls);
         assert!(
-            calls[1].contains(&app_dir.to_string_lossy().into_owned()),
+            activated[0].contains("noite-test-cohost=0000000000000001")
+                && activated[0].contains("test-app=0000000000000002")
+                && activated[0].contains("--primary test-app"),
             "{:?}",
             calls
         );
-        assert!(
-            calls[1].contains("s3://noite/fleets/cohost-app"),
-            "{:?}",
-            calls
-        );
+        assert!(calls[2].starts_with("activate "), "{:?}", calls);
         // The cohosted temp project is gone: argv[1] is its dir.
         let project = calls[0].split(' ').nth(1).expect("deploy argv");
         assert!(!Path::new(project).exists(), "{} left behind", project);
         std::fs::remove_dir_all(&app_dir).unwrap();
     }
 
-    /// Two cohosted scripts deploy lowest order first no matter the input
-    /// order — the sandbox controller (5) before the proxy (10) — and the
-    /// app still deploys last.
+    /// Two cohosted scripts stage lowest order first no matter the input
+    /// order — the sandbox controller (5) before the proxy (10) — the app
+    /// still stages last, and the one activate names all three versions.
     #[tokio::test]
     async fn two_cohosted_scripts_deploy_lowest_order_first() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
@@ -1070,9 +1302,7 @@ echo "deployed $2"
             region: "us-east-1",
             timeout: Duration::from_secs(30),
         };
-        let app_dir =
-            std::env::temp_dir().join(format!("noite-cohost-app3-{}", crate::models::new_id()));
-        std::fs::create_dir_all(&app_dir).unwrap();
+        let app_dir = app_dir();
 
         let early = RenderedCohost {
             script: &EARLY_SCRIPT,
@@ -1105,19 +1335,32 @@ echo "deployed $2"
         assert_eq!(stats.cohosted[1].script, "noite-test-cohost");
 
         let calls = fake.invocations();
-        assert_eq!(calls.len(), 3, "{:?}", calls);
+        assert_eq!(calls.len(), 4, "{:?}", calls);
         assert!(
-            calls[0].contains("noite-cohost-noite-test-early-"),
+            calls[0].starts_with("deploy ") && calls[0].contains("noite-cohost-noite-test-early-"),
             "{:?}",
             calls
         );
         assert!(
-            calls[1].contains("noite-cohost-noite-test-cohost-"),
+            calls[1].starts_with("deploy ") && calls[1].contains("noite-cohost-noite-test-cohost-"),
             "{:?}",
             calls
         );
         assert!(
-            calls[2].contains(&app_dir.to_string_lossy().into_owned()),
+            calls[2].starts_with("deploy ")
+                && calls[2].contains(&app_dir.to_string_lossy().into_owned()),
+            "{:?}",
+            calls
+        );
+        // Every stage precedes the one activate, which names all three.
+        let activated = activates(&calls);
+        assert_eq!(activated.len(), 1, "{:?}", calls);
+        assert!(calls[3].starts_with("activate "), "{:?}", calls);
+        assert!(
+            activated[0].contains("noite-test-early=0000000000000001")
+                && activated[0].contains("noite-test-cohost=0000000000000002")
+                && activated[0].contains("test-app=0000000000000003")
+                && activated[0].contains("--primary test-app"),
             "{:?}",
             calls
         );
@@ -1125,8 +1368,9 @@ echo "deployed $2"
     }
 
     /// Second deploy with the same content: the cohosted script is
-    /// skipped (one `celld deploy` total — the app's), and a rotation
-    /// redeploys it.
+    /// skipped (one stage total — the app's — and the activate does not
+    /// name it, so its activated version carries), and a rotation
+    /// re-stages it.
     #[tokio::test]
     async fn unchanged_cohost_is_skipped_rotation_redeploys() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
@@ -1147,9 +1391,7 @@ echo "deployed $2"
             region: "us-east-1",
             timeout: Duration::from_secs(30),
         };
-        let app_dir =
-            std::env::temp_dir().join(format!("noite-cohost-app2-{}", crate::models::new_id()));
-        std::fs::create_dir_all(&app_dir).unwrap();
+        let app_dir = app_dir();
         let app_side = FleetApp {
             dir: &app_dir,
             cwd: None,
@@ -1161,33 +1403,59 @@ echo "deployed $2"
                 .await
                 .unwrap();
         assert!(!first.cohosted[0].skipped);
-        assert_eq!(fake.invocations().len(), 2);
+        assert_eq!(fake.invocations().len(), 3);
 
         let second =
             deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
                 .await
                 .unwrap();
         assert!(second.cohosted[0].skipped);
+        assert_eq!(second.cohosted[0].version, None);
+        assert_eq!(
+            second.generation,
+            [("test-app".to_string(), "0000000000000004".to_string())]
+        );
+        let lines = second.log_lines().join("");
+        assert!(lines.contains("keeping the activated version"), "{}", lines);
         let calls = fake.invocations();
-        assert_eq!(calls.len(), 3, "{:?}", calls);
+        assert_eq!(calls.len(), 5, "{:?}", calls);
         assert!(
-            calls[2].contains(&app_dir.to_string_lossy().into_owned()),
+            calls[3].starts_with("deploy ")
+                && calls[3].contains(&app_dir.to_string_lossy().into_owned()),
+            "{:?}",
+            calls
+        );
+        // The skipped script is absent from the activate: its activated
+        // version carries unnamed.
+        assert!(calls[4].starts_with("activate "), "{:?}", calls);
+        assert!(!calls[4].contains("noite-test-cohost"), "{:?}", calls);
+        assert!(
+            calls[4].contains("test-app=0000000000000004"),
             "{:?}",
             calls
         );
 
-        // A rotation flips the hash: the proxy deploys again beside the app.
+        // A rotation flips the hash: the proxy stages again beside the app.
         let third =
             deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok-2")], &app_side)
                 .await
                 .unwrap();
         assert!(!third.cohosted[0].skipped);
-        assert_eq!(fake.invocations().len(), 5);
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 8, "{:?}", calls);
+        assert!(calls[7].starts_with("activate "), "{:?}", calls);
+        assert!(
+            calls[7].contains("noite-test-cohost=0000000000000006")
+                && calls[7].contains("test-app=0000000000000007"),
+            "{:?}",
+            calls
+        );
         std::fs::remove_dir_all(&app_dir).unwrap();
     }
 
-    /// The app deploy retries once on infra and then succeeds; the stats
-    /// carry the attempt count for the log.
+    /// The app stage retries once on infra and then succeeds; the stats
+    /// carry the attempt count for the log, and the activate names the
+    /// retried stage's version.
     #[tokio::test]
     async fn app_deploy_retries_once_on_infra() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
@@ -1213,9 +1481,7 @@ echo "deployed $2"
             region: "us-east-1",
             timeout: Duration::from_secs(30),
         };
-        let app_dir =
-            std::env::temp_dir().join(format!("noite-cohost-retry-{}", crate::models::new_id()));
-        std::fs::create_dir_all(&app_dir).unwrap();
+        let app_dir = app_dir();
 
         let stats = deploy_fleet_in_order(
             &pool,
@@ -1232,11 +1498,13 @@ echo "deployed $2"
         .await
         .unwrap();
         assert_eq!(stats.app_attempts, 2);
+        assert_eq!(stats.activate_attempts, 1);
         let lines = stats.log_lines().join("");
         assert!(lines.contains("attempt 2"), "{}", lines);
+        assert!(lines.contains("activated generation"), "{}", lines);
         let calls = fake.invocations();
-        assert_eq!(calls.len(), 3, "{:?}", calls);
-        // The cohosted script deployed once — the retry is the app's alone.
+        assert_eq!(calls.len(), 4, "{:?}", calls);
+        // The cohosted script staged once — the retry is the app's alone.
         assert!(calls[0].contains("noite-cohost-"), "{:?}", calls);
         assert!(
             calls[1].contains(&app_dir.to_string_lossy().into_owned()),
@@ -1248,11 +1516,21 @@ echo "deployed $2"
             "{:?}",
             calls
         );
+        // The activate names the retry's version, not the failed attempt's
+        // (which staged nothing).
+        assert!(calls[3].starts_with("activate "), "{:?}", calls);
+        assert!(
+            calls[3].contains("noite-test-cohost=0000000000000001")
+                && calls[3].contains("test-app=0000000000000003"),
+            "{:?}",
+            calls
+        );
         std::fs::remove_dir_all(&app_dir).unwrap();
     }
 
     /// Tenant failures fail at once (no retry), and a twice-failed app
-    /// deploy carries both attempts' errors.
+    /// stage carries both attempts' errors. Both run no activate, so the
+    /// previous generation keeps serving.
     #[tokio::test]
     async fn tenant_failures_fail_fast_twice_failed_carries_both() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
@@ -1274,9 +1552,7 @@ echo "deployed $2"
             region: "us-east-1",
             timeout: Duration::from_secs(30),
         };
-        let app_dir =
-            std::env::temp_dir().join(format!("noite-cohost-tenant-{}", crate::models::new_id()));
-        std::fs::create_dir_all(&app_dir).unwrap();
+        let app_dir = app_dir();
         let app_side = FleetApp {
             dir: &app_dir,
             cwd: None,
@@ -1287,10 +1563,12 @@ echo "deployed $2"
             .await
             .unwrap_err();
         assert!(format!("{:#}", err).contains("esbuild failed"), "{:#}", err);
-        assert_eq!(fake.invocations().len(), 2);
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 2, "{:?}", calls);
+        assert!(activates(&calls).is_empty(), "{:?}", calls);
 
         // Both app attempts fail on infra: one retry, then both errors.
-        // A fresh token keeps the cohosted deploy (invocation 0) so the
+        // A fresh token keeps the cohosted stage (invocation 0) so the
         // app's attempts stay 1 and 2.
         let fake = FakeCelld::spawn();
         fake.fail(1, "first: connection refused");
@@ -1318,14 +1596,16 @@ echo "deployed $2"
         assert!(text.contains("failed twice"), "{}", text);
         assert!(text.contains("first: connection refused"), "{}", text);
         assert!(text.contains("second: 503 SlowDown"), "{}", text);
-        assert_eq!(fake.invocations().len(), 3);
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 3, "{:?}", calls);
+        assert!(activates(&calls).is_empty(), "{:?}", calls);
         std::fs::remove_dir_all(&app_dir).unwrap();
     }
 
-    /// A failed cohosted deploy fails the deploy before the app moves the
-    /// pointer: no app invocation, no stored hash, the secret-bearing temp
-    /// project removed — and the next deploy starts over. Tenant failures
-    /// fail at once, with no retry.
+    /// A failed cohosted stage fails the deploy before the app stages:
+    /// no app invocation, no activate, no stored hash, the secret-bearing
+    /// temp project removed — and the next deploy starts over. Tenant
+    /// failures fail at once, with no retry.
     #[tokio::test]
     async fn cohost_failure_fails_before_the_app() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
@@ -1347,9 +1627,7 @@ echo "deployed $2"
             region: "us-east-1",
             timeout: Duration::from_secs(30),
         };
-        let app_dir =
-            std::env::temp_dir().join(format!("noite-cohost-cofail-{}", crate::models::new_id()));
-        std::fs::create_dir_all(&app_dir).unwrap();
+        let app_dir = app_dir();
         let app_side = FleetApp {
             dir: &app_dir,
             cwd: None,
@@ -1362,7 +1640,9 @@ echo "deployed $2"
         let text = format!("{:#}", err);
         assert!(text.contains("noite-test-cohost"), "{}", text);
         assert!(!text.contains("project kept at"), "{}", text);
-        assert_eq!(fake.invocations().len(), 1);
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 1, "{:?}", calls);
+        assert!(activates(&calls).is_empty(), "{:?}", calls);
         // The temp project is gone on the failure path too.
         let project = fake.invocations()[0]
             .split(' ')
@@ -1380,10 +1660,9 @@ echo "deployed $2"
         std::fs::remove_dir_all(&app_dir).unwrap();
     }
 
-    /// A cohosted script retries once on infra — the fence-image
-    /// `AlreadyExists` race heals inside the deploy — and the stats carry
-    /// the attempt count for the log. A twice-failed cohosted deploy
-    /// carries both attempts' errors and still fails before the app.
+    /// A cohosted script retries once on infra, and the stats carry the
+    /// attempt count for the log. A twice-failed cohosted stage carries
+    /// both attempts' errors and still fails before the app.
     #[tokio::test]
     async fn cohosted_deploy_retries_once_on_infra() {
         let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
@@ -1392,7 +1671,7 @@ echo "deployed $2"
         // Invocation 0 is the cohosted script's first attempt.
         fake.fail(
             0,
-            "failed to create an image celld-fence/9f2c after deleting the existing one: AlreadyExists",
+            "Error communicating with S3: service error: SlowDown: Please reduce your request rate",
         );
         let log = fake.log();
         let dir = fake.dir.to_string_lossy().into_owned();
@@ -1409,9 +1688,7 @@ echo "deployed $2"
             region: "us-east-1",
             timeout: Duration::from_secs(30),
         };
-        let app_dir =
-            std::env::temp_dir().join(format!("noite-cohost-co-retry-{}", crate::models::new_id()));
-        std::fs::create_dir_all(&app_dir).unwrap();
+        let app_dir = app_dir();
         let app_side = FleetApp {
             dir: &app_dir,
             cwd: None,
@@ -1425,13 +1702,14 @@ echo "deployed $2"
         assert!(!stats.cohosted[0].skipped);
         assert_eq!(stats.cohosted[0].attempts, 2);
         assert_eq!(stats.app_attempts, 1);
+        assert_eq!(stats.activate_attempts, 1);
         let lines = stats.log_lines().join("");
         assert!(lines.contains("noite-test-cohost"), "{}", lines);
         assert!(lines.contains("attempt 2"), "{}", lines);
         let calls = fake.invocations();
-        assert_eq!(calls.len(), 3, "{:?}", calls);
-        // The cohosted script deployed twice (first attempt, retry — same
-        // temp project), then the app once, last.
+        assert_eq!(calls.len(), 4, "{:?}", calls);
+        // The cohosted script staged twice (first attempt, retry — same
+        // temp project), then the app once, then the one activate.
         assert!(calls[0].contains("noite-cohost-"), "{:?}", calls);
         assert!(calls[1].contains("noite-cohost-"), "{:?}", calls);
         let first_project = calls[0].split(' ').nth(1).expect("deploy argv");
@@ -1439,6 +1717,13 @@ echo "deployed $2"
         assert_eq!(first_project, retry_project);
         assert!(
             calls[2].contains(&app_dir.to_string_lossy().into_owned()),
+            "{:?}",
+            calls
+        );
+        assert!(calls[3].starts_with("activate "), "{:?}", calls);
+        assert!(
+            calls[3].contains("noite-test-cohost=0000000000000002")
+                && calls[3].contains("test-app=0000000000000003"),
             "{:?}",
             calls
         );
@@ -1452,8 +1737,8 @@ echo "deployed $2"
         );
 
         // Both cohosted attempts fail on infra: one retry, then both
-        // errors — before the app deploys anything. A fresh token keeps
-        // the cohosted deploy (invocations 0 and 1).
+        // errors — before the app stages anything. A fresh token keeps
+        // the cohosted stage (invocations 0 and 1).
         let fake = FakeCelld::spawn();
         fake.fail(0, "first: connection refused");
         fake.fail(1, "second: 503 SlowDown");
@@ -1483,6 +1768,7 @@ echo "deployed $2"
         assert!(text.contains("second: 503 SlowDown"), "{}", text);
         let calls = fake.invocations();
         assert_eq!(calls.len(), 2, "{:?}", calls);
+        assert!(activates(&calls).is_empty(), "{:?}", calls);
         // The failed render stored nothing: the earlier hash still stands.
         assert_eq!(
             db::get_cohost_hash(&pool, &app.id, None, "noite-test-cohost")
@@ -1494,6 +1780,155 @@ echo "deployed $2"
         // The temp project is gone on the failure path too.
         let project = calls[0].split(' ').nth(1).expect("deploy argv").to_string();
         assert!(!Path::new(&project).exists(), "{}", project);
+        std::fs::remove_dir_all(&app_dir).unwrap();
+    }
+
+    /// A failed deploy stores nothing and runs no activate: the cohosted
+    /// script staged fine but the app stage failed, so no pointer moved —
+    /// the previous generation keeps serving — and the cohost's hash is
+    /// not stored (stored hashes name activated content), so the next
+    /// deploy stages it again instead of skipping it.
+    #[tokio::test]
+    async fn failed_deploy_stores_nothing_and_runs_no_activate() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
+        let app = seed(&pool).await;
+        let fake = FakeCelld::spawn();
+        fake.fail(1, "esbuild failed:\nERROR: Could not resolve \"x\"");
+        let log = fake.log();
+        let dir = fake.dir.to_string_lossy().into_owned();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let bin = fake.bin();
+        let celld = CelldDeploy {
+            celld_bin: &bin,
+            env: &env,
+            bucket: "s3://noite/fleets/cohost-app",
+            endpoint: "http://rustfs:9000",
+            region: "us-east-1",
+            timeout: Duration::from_secs(30),
+        };
+        let app_dir = app_dir();
+        let app_side = FleetApp {
+            dir: &app_dir,
+            cwd: None,
+            timeout: Duration::from_secs(30),
+        };
+
+        let err = deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
+            .await
+            .unwrap_err();
+        assert!(format!("{:#}", err).contains("esbuild failed"), "{:#}", err);
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 2, "{:?}", calls);
+        assert!(activates(&calls).is_empty(), "{:?}", calls);
+        assert_eq!(
+            db::get_cohost_hash(&pool, &app.id, None, "noite-test-cohost")
+                .await
+                .unwrap(),
+            None
+        );
+
+        // The retry stages the cohosted script again (nothing was stored)
+        // and activates the generation.
+        let fake = FakeCelld::spawn();
+        let log = fake.log();
+        let dir = fake.dir.to_string_lossy().into_owned();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let bin = fake.bin();
+        let celld = CelldDeploy {
+            celld_bin: &bin,
+            env: &env,
+            bucket: "s3://noite/fleets/cohost-app",
+            endpoint: "http://rustfs:9000",
+            region: "us-east-1",
+            timeout: Duration::from_secs(30),
+        };
+        let stats =
+            deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
+                .await
+                .unwrap();
+        assert!(!stats.cohosted[0].skipped);
+        assert_eq!(stats.activate_attempts, 1);
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 3, "{:?}", calls);
+        assert_eq!(activates(&calls).len(), 1, "{:?}", calls);
+        assert_eq!(
+            db::get_cohost_hash(&pool, &app.id, None, "noite-test-cohost")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(stats.cohosted[0].hash.as_str())
+        );
+        std::fs::remove_dir_all(&app_dir).unwrap();
+    }
+
+    /// An app with no cohosted scripts (any non-Void app): one stage, one
+    /// activate naming only the app with itself as primary.
+    #[tokio::test]
+    async fn app_without_cohosted_scripts_activates_alone() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
+        let app = seed(&pool).await;
+        let fake = FakeCelld::spawn();
+        let log = fake.log();
+        let dir = fake.dir.to_string_lossy().into_owned();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let bin = fake.bin();
+        let celld = CelldDeploy {
+            celld_bin: &bin,
+            env: &env,
+            bucket: "s3://noite/fleets/cohost-app",
+            endpoint: "http://rustfs:9000",
+            region: "us-east-1",
+            timeout: Duration::from_secs(30),
+        };
+        let app_dir = app_dir();
+
+        let stats = deploy_fleet_in_order(
+            &pool,
+            &app.id,
+            None,
+            &celld,
+            &[],
+            &FleetApp {
+                dir: &app_dir,
+                cwd: None,
+                timeout: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(stats.cohosted.is_empty());
+        assert_eq!(stats.app_attempts, 1);
+        assert_eq!(stats.activate_attempts, 1);
+        assert_eq!(
+            stats.generation,
+            [("test-app".to_string(), "0000000000000001".to_string())]
+        );
+        assert_eq!(stats.primary, "test-app");
+
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 2, "{:?}", calls);
+        assert!(
+            calls[0].starts_with("deploy ") && calls[0].contains("--no-activate"),
+            "{:?}",
+            calls
+        );
+        let activated = activates(&calls);
+        assert_eq!(activated.len(), 1, "{:?}", calls);
+        assert!(
+            activated[0].contains("test-app=0000000000000001")
+                && activated[0].contains("--primary test-app"),
+            "{:?}",
+            calls
+        );
         std::fs::remove_dir_all(&app_dir).unwrap();
     }
 }

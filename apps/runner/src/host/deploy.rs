@@ -1122,15 +1122,16 @@ async fn deploy_inner(
     let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     env.push(("S3_ENDPOINT", cfg.s3_endpoint.as_str()));
     env.push(("CELLD_CONTAINER_PLATFORM", container_platform.as_str()));
-    // The ordered fleet deploy (SPEC, Void platform proxy): the cohosted
-    // scripts first (each skipped when unchanged), the tenant app last
-    // with its one infra retry. A Void app with a merged root renders its
-    // proxy here — with the token the merge above ensured, read once for
-    // the whole deploy — plus its sandbox controller when one staged (the
-    // controller's lower order deploys it first), while any other app
-    // deploys exactly one script, as before. The shared invocation fails
-    // the deploy on a non-UTF-8 deploy root (work-dir-derived paths are
-    // operator-influenced) instead of panicking the deploy task.
+    // The ordered fleet deploy (SPEC, Void platform proxy): every script
+    // staged with `celld deploy --no-activate` — the cohosted scripts first
+    // (each skipped when unchanged), the tenant app last — then one `celld
+    // activate` serving the generation. A Void app with a merged root
+    // renders its proxy here — with the token the merge above ensured, read
+    // once for the whole deploy — plus its sandbox controller when one
+    // staged (the controller's lower order stages it first), while any
+    // other app stages exactly one script, as before. The shared invocation
+    // fails the deploy on a non-UTF-8 deploy root (work-dir-derived paths
+    // are operator-influenced) instead of panicking the deploy task.
     let cohosted = if let Some(proxy_token) = &void_proxy_token {
         let mut scripts = Vec::new();
         if let Some(staged) = &staged_sandbox {
