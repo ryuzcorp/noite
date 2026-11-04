@@ -38,9 +38,9 @@ pub struct DoPreview {
 /// ?read=1` — the object's own handler decides what its preview says.
 pub async fn do_instances(cfg: &Config, app: &App, class_name: &str) -> anyhow::Result<DoPreview> {
     let bucket = app.fleet_bucket.clone();
-    let env_owned = s3::aws_env(cfg);
-    let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    env.push(("S3_ENDPOINT", cfg.s3_endpoint.as_str()));
+    let scope_key = crate::host::credentials::Scope::app(app).key();
+    let env_owned = s3::celld_cli_env(cfg, &scope_key);
+    let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let out = exec::run_cmd(
         &cfg.celld_bin,
         &["cell", "list", class_name, "--json", "--bucket", &bucket],
