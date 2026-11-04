@@ -71,8 +71,7 @@ export const dropAppCollaborators = (appId: string) =>
 /** One round trip for the whole access decision: the account's role/origin
  * anchor, and its collaborator row for this app. The gate runs on every page
  * load, so it stays a single `sql.unsafe` call — the builder path issues a
- * query per lookup, and under celld's D1 the second and later calls in one
- * action stall (the first answers immediately).
+ * query per lookup, and one dispatch beats N.
  *
  * `app_collaborator` has no foreign key to `app` any more (the runner owns the
  * app row), so this reads the grant table directly. */
@@ -224,9 +223,8 @@ interface CollaboratorSqlRow {
   userId: string;
 }
 
-/** Every grant on an app with the account behind it, in ONE query: under
- * celld's D1 the second and later queries in one action stall, so the old
- * per-collaborator user lookup could hang on any app with a few members. */
+/** Every grant on an app with the account behind it, in ONE query: one
+ * dispatch beats a per-collaborator user lookup on any app with members. */
 export const listCollaboratorRows = async (
   appId: string
 ): Promise<CollaboratorRow[]> => {

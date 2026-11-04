@@ -513,9 +513,9 @@ const startSetupPass = (db: D1Database, ctx?: SetupLifetime): SetupPass => {
  * starter answering or disconnecting; a failure or timeout clears it so the
  * next request retries; and a caller that has waited out its bound shares
  * the single replacement pass instead of starting its own, so one slow
- * pass can never turn N waiters into N concurrent migrations hammering
- * celld's single-threaded D1. The binding is the pass key, so a test that
- * swaps in a fresh database gets a fresh pass.
+ * pass can never turn N waiters into N concurrent migrations contending
+ * on one cell. The binding is the pass key, so a test that swaps in a
+ * fresh database gets a fresh pass.
  *
  * A waiter with no worker lifetime (`ctx`) can never replace: an
  * unregistered replacement dies with its starter, and every later waiter
