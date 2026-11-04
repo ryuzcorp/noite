@@ -1,23 +1,127 @@
-/** `POST /revalidate`: KV purge across all deployment ids. */
+/** `POST /revalidate`: KV purge across all deployment ids, plus the matching `caches.default` edge entries. */
 
 /* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unsafe-dictionary-type, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-known-value-widening -- untyped-JSON I/O boundary: every handler validates untrusted bodies field-by-field, so typeof-narrowing and open dictionaries are the job, not slop */
 
 import { errorMessage, json, sanitizeForLog } from "./auth.ts";
-import type { Env, IsrKvNamespace } from "./env.ts";
+import type { EdgeCache, Env, IsrKvNamespace, ProxyDeps } from "./env.ts";
 import {
+  denormalizeIsrPath,
   ISR_HOST_REGISTRY_PREFIX,
   ISR_V3_PREFIX,
+  isrEdgeCacheUrlForToken,
   normalizeIsrPath,
   splitIsrCacheKey,
 } from "./isr-keys.ts";
 
 /**
+ * The fleet-shared `caches.default` (`CELLD_CACHE_SCOPE=deployment` puts every
+ * script of the fleet's deployment in one cache, like a Cloudflare zone), or
+ * null when the runtime has no Cache API. `ProxyDeps.edgeCache` overrides
+ * this in tests.
+ */
+const readDefaultCache = (): EdgeCache | null => {
+  // SAFETY: every Cache API host exposes `caches.default` when `caches`
+  // exists; both are read through `?.` and a missing Cache API yields null.
+  const storage = (globalThis as { caches?: { default?: EdgeCache } }).caches;
+
+  return storage?.default ?? null;
+};
+
+/**
+ * Split a full ISR KV key into deployment id, host and key path. Null for
+ * anything that is not `<v3-prefix><did>/<host>/<path>[#rw=<token>]`
+ * (registry keys, malformed keys).
+ */
+const splitIsrKeyName = (
+  key: string
+): { deploymentId: string; host: string; keyPath: string } | null => {
+  if (!key.startsWith(ISR_V3_PREFIX)) {
+    return null;
+  }
+
+  const tail = key.slice(ISR_V3_PREFIX.length);
+  const didSlash = tail.indexOf("/");
+
+  if (didSlash === -1) {
+    return null;
+  }
+
+  const hostSlash = tail.indexOf("/", didSlash + 1);
+
+  if (hostSlash === -1) {
+    return null;
+  }
+
+  const keyPath = tail.slice(hostSlash + 1);
+
+  if (keyPath.length === 0) {
+    return null;
+  }
+
+  return {
+    deploymentId: tail.slice(0, didSlash),
+    host: tail.slice(didSlash + 1, hostSlash),
+    keyPath,
+  };
+};
+
+/**
+ * Delete one ISR KV key plus its html and json `caches.default` entries,
+ * mirroring Void's self-host `purgeKey` (Void
+ * `packages/void/src/runtime/isr.ts`): the deployment id, host and variant
+ * token come from the KV key name, and a degraded Cache API never fails the
+ * KV purge. Keys with no derivable edge URL (host-registry keys, malformed
+ * keys) delete from KV only.
+ */
+const purgeIsrKey = async (
+  kv: IsrKvNamespace,
+  cache: EdgeCache | null,
+  key: string
+): Promise<void> => {
+  await kv.delete(key);
+
+  const split = splitIsrKeyName(key);
+
+  if (!split || !cache) {
+    return;
+  }
+
+  try {
+    const { normalizedPath, variantToken } = splitIsrCacheKey(split.keyPath);
+    const path = denormalizeIsrPath(normalizedPath);
+
+    await cache.delete(
+      isrEdgeCacheUrlForToken(
+        split.host,
+        path,
+        split.deploymentId,
+        "html",
+        variantToken
+      )
+    );
+    await cache.delete(
+      isrEdgeCacheUrlForToken(
+        split.host,
+        path,
+        split.deploymentId,
+        "json",
+        variantToken
+      )
+    );
+  } catch {
+    // Best effort: a degraded Cache API must not fail the KV purge.
+  }
+};
+
+/**
  * Delete every key under a prefix (cursor-paginated), returning the count.
  * Used for `all: true` (ISR entries plus the host registry, across all
  * deployment ids — old-deployment keys are orphans, so this also GCs them).
+ * ISR keys purge their edge entries too; registry keys have none.
  */
 const deletePrefix = async (
   kv: IsrKvNamespace,
+  cache: EdgeCache | null,
   prefix: string
 ): Promise<number> => {
   let purged = 0;
@@ -29,7 +133,7 @@ const deletePrefix = async (
 
     // Keys in a page are independent: delete them concurrently.
     // oxlint-disable-next-line eslint/no-await-in-loop -- page barrier before advancing the cursor
-    await Promise.all(page.keys.map((key) => kv.delete(key.name)));
+    await Promise.all(page.keys.map((key) => purgeIsrKey(kv, cache, key.name)));
     purged += page.keys.length;
 
     cursor = page.list_complete ? undefined : page.cursor;
@@ -48,35 +152,19 @@ const isrKeyMatchesPaths = (
   key: string,
   wanted: ReadonlySet<string>
 ): boolean => {
-  if (!key.startsWith(ISR_V3_PREFIX)) {
+  const split = splitIsrKeyName(key);
+
+  if (!split) {
     return false;
   }
 
-  const tail = key.slice(ISR_V3_PREFIX.length);
-  const didSlash = tail.indexOf("/");
-
-  if (didSlash === -1) {
-    return false;
-  }
-
-  const hostSlash = tail.indexOf("/", didSlash + 1);
-
-  if (hostSlash === -1) {
-    return false;
-  }
-
-  const keyPath = tail.slice(hostSlash + 1);
-
-  if (keyPath.length === 0) {
-    return false;
-  }
-
-  return wanted.has(splitIsrCacheKey(keyPath).normalizedPath);
+  return wanted.has(splitIsrCacheKey(split.keyPath).normalizedPath);
 };
 
 export const handleRevalidate = async (
   env: Env,
-  body: Record<string, unknown>
+  body: Record<string, unknown>,
+  deps: ProxyDeps = {}
 ): Promise<Response> => {
   const kv = env.ISR_CACHE;
 
@@ -97,12 +185,14 @@ export const handleRevalidate = async (
     return json({ ok: true, purged: 0 });
   }
 
+  const cache = deps.edgeCache ?? readDefaultCache();
+
   try {
     let purged = 0;
 
     if (all) {
-      purged += await deletePrefix(kv, ISR_V3_PREFIX);
-      purged += await deletePrefix(kv, ISR_HOST_REGISTRY_PREFIX);
+      purged += await deletePrefix(kv, cache, ISR_V3_PREFIX);
+      purged += await deletePrefix(kv, cache, ISR_HOST_REGISTRY_PREFIX);
     } else {
       let cursor: string | undefined;
 
@@ -116,7 +206,9 @@ export const handleRevalidate = async (
 
         // Matched keys are independent: delete them concurrently.
         // oxlint-disable-next-line eslint/no-await-in-loop -- page barrier before advancing the cursor
-        await Promise.all(matched.map((key) => kv.delete(key.name)));
+        await Promise.all(
+          matched.map((key) => purgeIsrKey(kv, cache, key.name))
+        );
         purged += matched.length;
 
         cursor = page.list_complete ? undefined : page.cursor;

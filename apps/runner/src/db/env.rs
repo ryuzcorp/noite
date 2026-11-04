@@ -403,6 +403,7 @@ mod tests {
             "CELLD_EGRESS",
             "CELLD_EGRESS_ALLOW",
             "CELLD_MEMORY_SCOPE",
+            "CELLD_CACHE_SCOPE",
             "RUNNER_TOKEN",
             "NOITE_IMAGE",
             "BETTER_AUTH_URL",

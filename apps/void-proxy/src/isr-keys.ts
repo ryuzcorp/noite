@@ -1,6 +1,6 @@
 /**
  * ISR key helpers — ported byte-identically from Void `packages/isr/src/index.ts`
- * (writers, readers and purgers must build byte-identical keys).
+ * (writers, readers and purgers must build byte-identical keys and edge URLs).
  *
  * Portions ported from the Void project (MIT License — see the attribution
  * note in SPEC.md "Void platform proxy").
@@ -125,3 +125,62 @@ export const splitIsrCacheKey = (
     variantToken: fullKey.slice(sepIdx + ISR_VARIANT_SEPARATOR.length),
   };
 };
+
+/**
+ * Inverse of `normalizeIsrPath`: turn a normalized segment back into a
+ * pathname starting with `/`.
+ */
+export const denormalizeIsrPath = (normalized: string): string =>
+  normalized === "__index__" ? "/" : `/${normalized}`;
+
+/**
+ * Canonicalize an inbound pathname to the form used inside edge cache URLs.
+ * Equivalent to `denormalizeIsrPath(normalizeIsrPath(pathname))` — strips any
+ * trailing slash except for root.
+ */
+export const canonicalIsrPathname = (pathname: string): string =>
+  denormalizeIsrPath(normalizeIsrPath(pathname));
+
+const buildIsrEdgeCacheUrl = (
+  hostname: string,
+  pathname: string,
+  deploymentId: string,
+  variant: "html" | "json",
+  variantToken: string | null
+): string => {
+  const normalizedPathname = canonicalIsrPathname(pathname);
+  const url = new URL(`https://${hostname}${normalizedPathname}`);
+
+  if (variant === "json") {
+    url.searchParams.set("__void", "json");
+  }
+
+  url.searchParams.set("__void_isr", deploymentId);
+
+  if (variantToken) {
+    url.searchParams.set("__void_orig", variantToken);
+  }
+
+  return url.toString();
+};
+
+/**
+ * Edge-cache (`caches.default`) URL for an ISR page, from a `#rw=` variant
+ * token out of `splitIsrCacheKey` (`null` for a direct hit). It carries the
+ * deployment id so a new deploy never reads older HTML, and the `json`
+ * variant keeps Pages-protocol JSON apart from HTML for the same path.
+ */
+export const isrEdgeCacheUrlForToken = (
+  hostname: string,
+  pathname: string,
+  deploymentId: string,
+  variant: "html" | "json",
+  variantToken?: string | null
+): string =>
+  buildIsrEdgeCacheUrl(
+    hostname,
+    pathname,
+    deploymentId,
+    variant,
+    variantToken ?? null
+  );

@@ -17,10 +17,12 @@
  * note in SPEC.md "Void platform proxy") carry their attribution in the
  * module where they live.
  *
- * Globals used: `fetch`, `crypto`, KV bindings, `cloudflare:sockets`. `caches`
- * is deliberately never touched (celld's cache is per-node since 0018, and
- * ISR must not depend on node-local state; KV is authoritative) — a test
- * asserts no shipped source contains a `caches` reference.
+ * Globals used: `fetch`, `crypto`, KV bindings, `cloudflare:sockets`, and
+ * `caches.default` for the ISR edge purge (`CELLD_CACHE_SCOPE=deployment`
+ * shares one cache across the fleet's deployment, like a Cloudflare zone, so
+ * the proxy deletes the app's L1 entries alongside the KV keys). The proxy
+ * only ever deletes edge entries — it never `put`s, `match`es or `open`s,
+ * so it holds no cached state of its own.
  */
 
 /* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unsafe-dictionary-type, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-known-value-widening -- untyped-JSON I/O boundary: every handler validates untrusted bodies field-by-field, so typeof-narrowing and open dictionaries are the job, not slop */
@@ -203,7 +205,7 @@ export const handleFetch = async (
     }
   }
 
-  return handleRevalidate(env, body);
+  return handleRevalidate(env, body, deps);
 };
 
 export default {
