@@ -750,6 +750,33 @@ describe("/revalidate edge purge", () => {
     expect(kv.store.size).toBe(1);
   });
 
+  test("a failed html delete still attempts the json delete", async () => {
+    const kv = new FakeKv();
+    seed(kv);
+    const cache = new FakeCache();
+    cache.failUrl = (url) => !url.includes("__void=json");
+
+    const { status, json } = await post(
+      "/revalidate",
+      { paths: ["/blog/hello"] },
+      makeEnv({ ISR_CACHE: kv }),
+      { edgeCache: cache }
+    );
+
+    expect(status).toBe(200);
+    expect(json).toEqual({ ok: true, purged: 5 });
+    // All five json deletes attempted despite every html delete failing.
+    expect(cache.deletes.toSorted()).toEqual(
+      [
+        "https://example.com/blog/hello?__void=json&__void_isr=dep1",
+        "https://example.com/blog/hello?__void=json&__void_isr=dep1&__void_orig=tok1",
+        "https://www.example.com/blog/hello?__void=json&__void_isr=dep1",
+        "https://example.com/blog/hello?__void=json&__void_isr=dep2",
+        "https://example.com/blog/hello?__void=json&__void_isr=dep2&__void_orig=tok2",
+      ].toSorted()
+    );
+  });
+
   test("keys with no derivable edge URL purge from KV only", async () => {
     const kv = new FakeKv();
     kv.store.set(`${DIRECT}/isr/v3/dep1`, "odd");

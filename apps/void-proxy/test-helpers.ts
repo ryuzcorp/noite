@@ -130,13 +130,14 @@ export class FakeKv implements IsrKvNamespace, MailKvNamespace {
   }
 }
 
-/** In-memory edge cache recording every deleted URL, with a failing mode. */
+/** In-memory edge cache recording every deleted URL, with failing modes. */
 export class FakeCache implements EdgeCache {
   readonly deletes: string[] = [];
   failDelete = false;
+  failUrl: ((url: string) => boolean) | null = null;
 
   async delete(url: string): Promise<boolean> {
-    if (this.failDelete) {
+    if (this.failDelete || this.failUrl?.(url)) {
       throw new Error("cache boom");
     }
 

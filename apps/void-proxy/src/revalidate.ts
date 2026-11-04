@@ -86,30 +86,49 @@ const purgeIsrKey = async (
     return;
   }
 
+  // The two edge deletes are independent attempts: unlike Void's self-host
+  // `purgeKey`, which wraps both in one try, a failed html delete must not
+  // skip the json delete (and vice versa) — otherwise the surviving variant
+  // serves stale indefinitely with the key counted as purged. Same URLs,
+  // still best effort: a degraded Cache API never fails the KV purge.
+  let htmlUrl: string;
+  let jsonUrl: string;
+
   try {
     const { normalizedPath, variantToken } = splitIsrCacheKey(split.keyPath);
     const path = denormalizeIsrPath(normalizedPath);
 
-    await cache.delete(
-      isrEdgeCacheUrlForToken(
-        split.host,
-        path,
-        split.deploymentId,
-        "html",
-        variantToken
-      )
+    htmlUrl = isrEdgeCacheUrlForToken(
+      split.host,
+      path,
+      split.deploymentId,
+      "html",
+      variantToken
     );
-    await cache.delete(
-      isrEdgeCacheUrlForToken(
-        split.host,
-        path,
-        split.deploymentId,
-        "json",
-        variantToken
-      )
+    jsonUrl = isrEdgeCacheUrlForToken(
+      split.host,
+      path,
+      split.deploymentId,
+      "json",
+      variantToken
     );
   } catch {
-    // Best effort: a degraded Cache API must not fail the KV purge.
+    // Best effort: an underivable edge URL must not fail the KV purge.
+    return;
+  }
+
+  try {
+    await cache.delete(htmlUrl);
+  } catch {
+    // Best effort (see above), but loud: a swallowed edge failure serves
+    // stale L1 as fresh, and the fleet log is the only signal.
+    console.error("isr edge purge failed:", sanitizeForLog(htmlUrl));
+  }
+
+  try {
+    await cache.delete(jsonUrl);
+  } catch {
+    console.error("isr edge purge failed:", sanitizeForLog(jsonUrl));
   }
 };
 
