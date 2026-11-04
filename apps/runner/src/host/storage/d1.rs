@@ -1,10 +1,12 @@
 //! D1 table editor: table list, schema introspection, and server-side
 //! paging/sort/filter via `celld d1 execute --json`, plus curated writes.
 //!
-//! Every read is a `celld d1 execute` call that returns JSON rows (the CLI's
-//! table output is never parsed). Identifiers only ever come from the
-//! `PRAGMA` allowlist; values go through the escaped-literal helper. The
-//! editor contract lives in `local://d1-contract.md`.
+//! Reads go through `celld d1 execute`, one subprocess per statement, except
+//! where one action needs several independent statements: those share one
+//! `celld d1 execute --batch --json` call (one subprocess, one transaction).
+//! Only JSON output is ever parsed (the CLI's table output is not). Identifiers
+//! only ever come from the `PRAGMA` allowlist; values go through the
+//! escaped-literal helper. The editor contract lives in `local://d1-contract.md`.
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -662,6 +664,40 @@ impl<'a> D1<'a> {
         .await
         .with_context(|| format!("celld d1 {}", self.database_id))
     }
+
+    /// Several independent statements in one `celld d1 execute --batch --json`
+    /// call: one subprocess and one transaction instead of one subprocess per
+    /// statement. Returns one row-set per statement, in order. Every element
+    /// must be a single statement (the batch path prepares each one).
+    async fn exec_batch(
+        &self,
+        stmts: &[String],
+    ) -> anyhow::Result<Vec<Vec<serde_json::Map<String, Value>>>> {
+        let bucket = self.app.fleet_bucket.clone();
+        let env_owned = s3::aws_env(self.cfg);
+        let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        env.push(("S3_ENDPOINT", self.cfg.s3_endpoint.as_str()));
+        let args = [
+            "d1",
+            "execute",
+            self.database_id.as_str(),
+            "--batch",
+            "--json",
+            "--bucket",
+            bucket.as_str(),
+        ];
+        let out = exec::run_cmd_stdin(
+            &self.cfg.celld_bin,
+            &args,
+            build_batch_input(stmts).as_bytes(),
+            Some(&self.proj),
+            &env,
+            Duration::from_secs(30),
+        )
+        .await
+        .with_context(|| format!("celld d1 {}", self.database_id))?;
+        parse_batch_output(&String::from_utf8_lossy(&out), stmts.len())
+    }
 }
 
 /// Materialize the deployed source into a persistent project dir so celld's
@@ -697,6 +733,52 @@ fn parse_json_rows(out: &str) -> Vec<serde_json::Map<String, Value>> {
         .filter_map(|value| match value {
             Value::Object(map) => Some(map),
             _ => None,
+        })
+        .collect()
+}
+
+/// Stdin document for `celld d1 execute --batch --json`: a JSON array of
+/// `{"sql"}` objects (`params` defaults to `[]`, and the editor never binds).
+fn build_batch_input(stmts: &[String]) -> String {
+    let items: Vec<Value> = stmts
+        .iter()
+        .map(|sql| serde_json::json!({ "sql": sql }))
+        .collect();
+    Value::Array(items).to_string()
+}
+
+/// Parse `--batch --json` stdout: one JSON array shaped like the Worker's
+/// `batch()` result, one element per statement in order. Returns one row-set
+/// per statement. A length mismatch is a contract break, not an empty page.
+fn parse_batch_output(
+    out: &str,
+    expected: usize,
+) -> anyhow::Result<Vec<Vec<serde_json::Map<String, Value>>>> {
+    let value: Value =
+        serde_json::from_str(out).with_context(|| "parse the batch reply as JSON")?;
+    let items = value
+        .as_array()
+        .with_context(|| "the batch reply must be a JSON array")?;
+    if items.len() != expected {
+        bail!(
+            "the batch reply carries {} result(s) for {expected} statement(s)",
+            items.len()
+        );
+    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            item.get("results")
+                .and_then(Value::as_array)
+                .with_context(|| format!("batch result {index} carries no rows"))?
+                .iter()
+                .map(|row| {
+                    row.as_object()
+                        .cloned()
+                        .with_context(|| format!("batch result {index} carries a non-object row"))
+                })
+                .collect()
         })
         .collect()
 }
@@ -758,29 +840,34 @@ async fn table_names(d1: &D1<'_>) -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
-/// Columns from `PRAGMA table_info` (empty = unknown table).
-async fn load_columns(d1: &D1<'_>, table: &str) -> anyhow::Result<Vec<D1Column>> {
-    let out = d1
-        .exec(&format!("PRAGMA table_info({})", quote_ident(table)), true)
-        .await?;
+/// Columns from `PRAGMA table_info` rows (empty = unknown table).
+fn parse_columns(rows: &[serde_json::Map<String, Value>]) -> Vec<D1Column> {
     let mut columns = Vec::new();
-    for row in parse_json_rows(&out) {
-        let Some(name) = json_str(&row, "name") else {
+    for row in rows {
+        let Some(name) = json_str(row, "name") else {
             continue;
         };
         columns.push(D1Column {
             name: name.to_string(),
-            col_type: json_str(&row, "type").unwrap_or("").to_string(),
-            not_null: json_i64(&row, "notnull").unwrap_or(0) != 0,
+            col_type: json_str(row, "type").unwrap_or("").to_string(),
+            not_null: json_i64(row, "notnull").unwrap_or(0) != 0,
             default_value: row.get("dflt_value").and_then(|v| match v {
                 Value::String(s) => Some(s.clone()),
                 Value::Number(n) => Some(n.to_string()),
                 _ => None,
             }),
-            pk: json_i64(&row, "pk").unwrap_or(0),
+            pk: json_i64(row, "pk").unwrap_or(0),
         });
     }
-    Ok(columns)
+    columns
+}
+
+/// Columns from `PRAGMA table_info` (empty = unknown table).
+async fn load_columns(d1: &D1<'_>, table: &str) -> anyhow::Result<Vec<D1Column>> {
+    let out = d1
+        .exec(&format!("PRAGMA table_info({})", quote_ident(table)), true)
+        .await?;
+    Ok(parse_columns(&parse_json_rows(&out)))
 }
 
 /// `table_info` only — enough to validate and build a read/write.
@@ -796,21 +883,33 @@ async fn load_table(d1: &D1<'_>, table: &str) -> anyhow::Result<TableSchema> {
 }
 
 /// Full schema for the Definition view: columns, foreign keys, indexes, DDL.
+/// Two subprocesses at most: one batch for the four table-level statements,
+/// then one batch for every index's columns (the index names come from the
+/// first batch, so the two cannot merge).
 async fn load_schema(d1: &D1<'_>, table: &str) -> anyhow::Result<D1TableSchemaRaw> {
-    let schema = load_table(d1, table).await?;
-
-    let fk_out = d1
-        .exec(
-            &format!("PRAGMA foreign_key_list({})", quote_ident(table)),
-            true,
-        )
+    let quoted = quote_ident(table);
+    let sets = d1
+        .exec_batch(&[
+            format!("PRAGMA table_info({quoted})"),
+            format!("PRAGMA foreign_key_list({quoted})"),
+            format!("PRAGMA index_list({quoted})"),
+            format!(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = {}",
+                string_literal(table)
+            ),
+        ])
         .await?;
+    let columns = parse_columns(&sets[0]);
+    if columns.is_empty() {
+        bail!("unknown table {table}");
+    }
+
     let mut foreign_keys = Vec::new();
-    for row in parse_json_rows(&fk_out) {
+    for row in &sets[1] {
         let (Some(from), Some(ftable), Some(to)) = (
-            json_str(&row, "from"),
-            json_str(&row, "table"),
-            json_str(&row, "to"),
+            json_str(row, "from"),
+            json_str(row, "table"),
+            json_str(row, "to"),
         ) else {
             continue;
         };
@@ -821,48 +920,45 @@ async fn load_schema(d1: &D1<'_>, table: &str) -> anyhow::Result<D1TableSchemaRa
         });
     }
 
-    let idx_out = d1
-        .exec(&format!("PRAGMA index_list({})", quote_ident(table)), true)
-        .await?;
-    let mut indexes = Vec::new();
-    for row in parse_json_rows(&idx_out) {
-        let Some(name) = json_str(&row, "name") else {
+    let mut metas: Vec<(String, bool)> = Vec::new();
+    for row in &sets[2] {
+        let Some(name) = json_str(row, "name") else {
             continue;
         };
-        let info_out = d1
-            .exec(&format!("PRAGMA index_info({})", quote_ident(name)), true)
-            .await?;
+        metas.push((name.to_string(), json_i64(row, "unique").unwrap_or(0) != 0));
+    }
+    let mut infos: Vec<Vec<serde_json::Map<String, Value>>> = Vec::new();
+    if !metas.is_empty() {
+        let stmts: Vec<String> = metas
+            .iter()
+            .map(|(name, _)| format!("PRAGMA index_info({})", quote_ident(name)))
+            .collect();
+        infos = d1.exec_batch(&stmts).await?;
+    }
+    let mut indexes = Vec::new();
+    for ((name, unique), rows) in metas.into_iter().zip(infos.iter()) {
         let mut cols: Vec<(i64, String)> = Vec::new();
-        for info in parse_json_rows(&info_out) {
-            let Some(col) = json_str(&info, "name") else {
+        for info in rows {
+            let Some(col) = json_str(info, "name") else {
                 continue;
             };
-            cols.push((json_i64(&info, "seqno").unwrap_or(0), col.to_string()));
+            cols.push((json_i64(info, "seqno").unwrap_or(0), col.to_string()));
         }
         cols.sort_by_key(|(seqno, _)| *seqno);
         indexes.push(D1Index {
-            name: name.to_string(),
-            unique: json_i64(&row, "unique").unwrap_or(0) != 0,
+            name,
+            unique,
             columns: cols.into_iter().map(|(_, col)| col).collect(),
         });
     }
 
-    let sql_out = d1
-        .exec(
-            &format!(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = {}",
-                string_literal(table)
-            ),
-            true,
-        )
-        .await?;
-    let sql = parse_json_rows(&sql_out)
-        .into_iter()
-        .find_map(|row| json_str(&row, "sql").map(str::to_string));
+    let sql = sets[3]
+        .iter()
+        .find_map(|row| json_str(row, "sql").map(str::to_string));
 
     Ok(D1TableSchemaRaw {
         table: table.to_string(),
-        columns: schema.columns,
+        columns,
         foreign_keys,
         indexes,
         sql,
@@ -938,12 +1034,12 @@ pub async fn d1_rows(
         &redacted,
     )?;
     let count = build_count(&schema, &query.filters, &query.search, &redacted)?;
-    let rows_out = d1.exec(&select, true).await?;
-    let count_out = d1.exec(&count, true).await?;
+    // One batch: one subprocess, and the page and its total share a snapshot.
+    let sets = d1.exec_batch(&[select, count]).await?;
 
     let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
-    for row in parse_json_rows(&rows_out) {
+    for row in &sets[0] {
         rows.push(
             columns
                 .iter()
@@ -951,9 +1047,9 @@ pub async fn d1_rows(
                 .collect(),
         );
     }
-    let total = parse_json_rows(&count_out)
-        .into_iter()
-        .find_map(|row| json_i64(&row, "n"))
+    let total = sets[1]
+        .iter()
+        .find_map(|row| json_i64(row, "n"))
         .unwrap_or(0);
     Ok(D1Rows {
         table: query.table.clone(),
@@ -1312,6 +1408,47 @@ mod tests {
     #[test]
     fn quote_ident_doubles_quotes() {
         assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn batch_input_is_a_sql_array() {
+        let input = build_batch_input(&[
+            "SELECT 1".to_string(),
+            "PRAGMA table_info(\"t\")".to_string(),
+        ]);
+        assert_eq!(
+            input,
+            r#"[{"sql":"SELECT 1"},{"sql":"PRAGMA table_info(\"t\")"}]"#
+        );
+    }
+
+    #[test]
+    fn batch_output_parses_one_row_set_per_statement() {
+        // Shaped like the Worker's `batch()` result, as celld prints it.
+        let out = r#"[{"success":true,"meta":{"duration":1.5},"results":[{"id":7,"name":"ada","note":null}]},{"success":true,"meta":{"duration":0.5},"results":[{"n":42}]},{"success":true,"meta":{},"results":[]}]"#;
+        let sets = parse_batch_output(out, 3).unwrap();
+        assert_eq!(sets.len(), 3);
+        assert_eq!(sets[0].len(), 1);
+        assert_eq!(
+            cell_value(sets[0][0].get("name").unwrap()),
+            Some("ada".to_string())
+        );
+        assert_eq!(sets[0][0].get("note"), Some(&Value::Null));
+        assert_eq!(json_i64(&sets[1][0], "n"), Some(42));
+        assert!(sets[2].is_empty());
+    }
+
+    #[test]
+    fn batch_output_rejects_shape_breaks() {
+        let one = r#"[{"success":true,"meta":{},"results":[{"n":1}]}]"#;
+        // Fewer or more results than statements: a contract break, not a page.
+        assert!(parse_batch_output(one, 2).is_err());
+        assert!(parse_batch_output(one, 0).is_err());
+        // Not an array, or results missing / not rows.
+        assert!(parse_batch_output(r#"{"results":[]}"#, 1).is_err());
+        assert!(parse_batch_output("not json", 1).is_err());
+        assert!(parse_batch_output(r#"[{"success":true}]"#, 1).is_err());
+        assert!(parse_batch_output(r#"[{"results":[7]}]"#, 1).is_err());
     }
 
     #[test]
