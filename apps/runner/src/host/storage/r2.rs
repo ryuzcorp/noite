@@ -480,20 +480,13 @@ mod tests {
     /// otherwise answers `list`/`head` from `<verb>.json` and `get` from
     /// `body.bin`. Fixtures live next to the script so no env injection is
     /// needed — the runner clears the environment it spawns with.
-    const FAKE_CELLD: &str = r#"#!/bin/sh
-dir=$(dirname "$0")
-printf '%s\n' "$*" >> "$dir/invocations.log"
-if [ -f "$dir/fail-next" ]; then cat "$dir/fail-next" >&2; rm "$dir/fail-next"; exit 1; fi
-case "$2" in
-  list) cat "$dir/list.json";;
-  head) cat "$dir/head.json";;
-  get) cat "$dir/body.bin";;
-  *) echo "unexpected: $*" >&2; exit 1;;
-esac
-"#;
-
     struct FakeCelld {
         dir: PathBuf,
+    }
+
+    /// The committed fake script every R2 seam test links to.
+    fn fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-celld-r2.sh")
     }
 
     impl FakeCelld {
@@ -501,12 +494,17 @@ esac
             let dir = std::env::temp_dir()
                 .join(format!("noite-fake-r2-celld-{}", crate::models::new_id()));
             std::fs::create_dir_all(&dir).unwrap();
-            let bin = dir.join("celld");
-            std::fs::write(&bin, FAKE_CELLD).unwrap();
+            // A symlink to the committed script, never a fresh file:
+            // exec'ing freshly-written files under parallel load
+            // spuriously fails with ETXTBSY, while the committed inode
+            // stays stable.
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+                std::os::unix::fs::symlink(fixture(), dir.join("celld")).unwrap();
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::copy(fixture(), dir.join("celld")).unwrap();
             }
             Self { dir }
         }
