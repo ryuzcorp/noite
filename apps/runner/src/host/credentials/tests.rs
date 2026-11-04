@@ -10,9 +10,10 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 
 use super::{
-    decrypt, encrypt, ensure, fleet_credentials, orphan_sweep, orphan_sweep_due, prefix_policy,
-    revoke_app, revoke_environment, sweep, tenant_process_credentials, AppCredentials,
-    CredentialProvider, Credentials, MintedKey, ProviderSetting, Scope, StoreAccess,
+    cached_operator_token, decrypt, encrypt, ensure, ensure_operator_token_row, fleet_credentials,
+    mint_operator_token, operator_token, orphan_sweep, orphan_sweep_due, prefix_policy, revoke_app,
+    revoke_environment, sweep, tenant_process_credentials, AppCredentials, CredentialProvider,
+    Credentials, MintedKey, ProviderSetting, Scope, StoreAccess,
 };
 use crate::config::{config_for_tests, Config, Tenancy};
 use crate::db;
@@ -1337,4 +1338,195 @@ async fn scoped_key_enforced_by_rustfs() {
     )
     .await;
     assert!((200..300).contains(&status), "cleanup bucket: {status}");
+}
+
+/// A scope key no other test uses: the token cache is process-wide, so a
+/// shared key would couple tests through it.
+fn unique_scope(prefix: &str) -> String {
+    format!("{prefix}:{}", crate::models::new_id())
+}
+
+/// Minted tokens boot the node: non-empty, no surrounding whitespace (celld
+/// refuses both), 32 random bytes in base64url.
+#[test]
+fn minted_tokens_are_boot_safe() {
+    for _ in 0..8 {
+        let token = mint_operator_token();
+        assert_eq!(token.len(), 43, "32 bytes base64url, unpadded");
+        assert!(
+            token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "base64url only, no whitespace: {token:?}"
+        );
+        assert_ne!(mint_operator_token(), token, "mints differ");
+    }
+}
+
+/// First use mints and stores; the second call reuses the row without
+/// minting again, and the stored row carries ciphertext, not the token.
+#[tokio::test]
+async fn operator_token_mints_once_then_reuses() {
+    let pool = memory_db().await;
+    let cfg = config_for_tests();
+    let scope = unique_scope("app");
+    let first = operator_token(&pool, &cfg.runner_token, &scope, "app-1")
+        .await
+        .expect("mint");
+    let second = operator_token(&pool, &cfg.runner_token, &scope, "app-1")
+        .await
+        .expect("reuse");
+    assert_eq!(first, second, "the row is stable across calls");
+    let (nonce, ciphertext) = db::get_operator_token(&pool, &scope)
+        .await
+        .expect("read row")
+        .expect("row stored");
+    assert_eq!(nonce.len(), 12, "96-bit GCM nonce");
+    assert!(
+        !ciphertext.is_empty() && ciphertext != first.as_bytes(),
+        "the bucket snapshot must not carry the token"
+    );
+    pool.close().await;
+}
+
+/// App, environment and control scopes hold different tokens.
+#[tokio::test]
+async fn operator_tokens_differ_per_scope() {
+    let pool = memory_db().await;
+    let cfg = config_for_tests();
+    let app = unique_scope("app");
+    let env = unique_scope("env");
+    let control = unique_scope("control");
+    let a = operator_token(&pool, &cfg.runner_token, &app, "app-1")
+        .await
+        .expect("app token");
+    let e = operator_token(&pool, &cfg.runner_token, &env, "app-1")
+        .await
+        .expect("env token");
+    let c = operator_token(&pool, &cfg.runner_token, &control, "_control")
+        .await
+        .expect("control token");
+    assert_ne!(a, e);
+    assert_ne!(a, c);
+    assert_ne!(e, c);
+    pool.close().await;
+}
+
+/// A row that no longer decrypts (RUNNER_TOKEN rotated) is replaced, not
+/// reused: the next row read mints fresh, and the new row decrypts under
+/// the new key. Driven past the cache, as a restarted runner reads it.
+#[tokio::test]
+async fn undecryptable_row_is_replaced() {
+    let pool = memory_db().await;
+    let cfg = config_for_tests();
+    let scope = unique_scope("app");
+    let before = operator_token(&pool, &cfg.runner_token, &scope, "app-1")
+        .await
+        .expect("mint");
+    let after = ensure_operator_token_row(&pool, "rotated-token", &scope, "app-1")
+        .await
+        .expect("replace");
+    assert_ne!(before, after, "rotation mints a new token");
+    let (nonce, ciphertext) = db::get_operator_token(&pool, &scope)
+        .await
+        .expect("read row")
+        .expect("row stored");
+    assert_eq!(
+        decrypt(
+            "rotated-token",
+            &super::operator_token_aad(&scope),
+            &nonce,
+            &ciphertext
+        )
+        .expect("replacement decrypts under the rotated key"),
+        after
+    );
+    pool.close().await;
+}
+
+/// The token AAD is namespaced away from the scoped-credential table: a
+/// token row does not decrypt under the bare scope, so a row transplanted
+/// across tables is unreadable.
+#[tokio::test]
+async fn token_row_rejects_the_scoped_credential_aad() {
+    let pool = memory_db().await;
+    let cfg = config_for_tests();
+    let scope = unique_scope("app");
+    operator_token(&pool, &cfg.runner_token, &scope, "app-1")
+        .await
+        .expect("mint");
+    let (nonce, ciphertext) = db::get_operator_token(&pool, &scope)
+        .await
+        .expect("read row")
+        .expect("row stored");
+    assert!(
+        decrypt(&cfg.runner_token, &scope, &nonce, &ciphertext).is_err(),
+        "the bare-scope AAD must not open a token row"
+    );
+    pool.close().await;
+}
+
+/// Deletes drop the rows: one environment's token, then every token of
+/// the app — so a recreated slug or label mints fresh.
+#[tokio::test]
+async fn deletes_drop_the_token_rows() {
+    let pool = memory_db().await;
+    let cfg = config_for_tests();
+    let app_id = format!("app-{}", crate::models::new_id());
+    let app_scope = format!("app:{app_id}");
+    let env_scope = unique_scope("env");
+    operator_token(&pool, &cfg.runner_token, &app_scope, &app_id)
+        .await
+        .expect("app token");
+    operator_token(&pool, &cfg.runner_token, &env_scope, &app_id)
+        .await
+        .expect("env token");
+    db::delete_operator_token(&pool, &env_scope)
+        .await
+        .expect("drop env row");
+    assert!(
+        db::get_operator_token(&pool, &env_scope)
+            .await
+            .expect("read")
+            .is_none(),
+        "the environment row is gone"
+    );
+    assert!(
+        db::get_operator_token(&pool, &app_scope)
+            .await
+            .expect("read")
+            .is_some(),
+        "the app row survives an environment delete"
+    );
+    db::delete_app_operator_tokens(&pool, &app_id)
+        .await
+        .expect("drop app rows");
+    assert!(
+        db::get_operator_token(&pool, &app_scope)
+            .await
+            .expect("read")
+            .is_none(),
+        "the app delete drops every remaining row"
+    );
+    pool.close().await;
+}
+
+/// Ensuring populates the cache the pool-less callers (reload POST, DO
+/// probe, CLI env) read; a scope this process never ensured misses.
+#[tokio::test]
+async fn ensured_token_serves_pool_less_callers() {
+    let pool = memory_db().await;
+    let cfg = config_for_tests();
+    let scope = unique_scope("app");
+    assert_eq!(cached_operator_token(&scope), None, "cold cache misses");
+    let token = operator_token(&pool, &cfg.runner_token, &scope, "app-1")
+        .await
+        .expect("mint");
+    assert_eq!(cached_operator_token(&scope), Some(token));
+    assert_eq!(
+        cached_operator_token(&unique_scope("app")),
+        None,
+        "other scopes still miss"
+    );
+    pool.close().await;
 }

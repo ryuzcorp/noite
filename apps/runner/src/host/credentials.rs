@@ -42,7 +42,8 @@ mod aws;
 #[path = "credentials_minio.rs"]
 mod minio;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use aes_gcm::{
     aead::{Aead, Payload},
@@ -654,6 +655,117 @@ pub async fn revoke_environment(
     }
     sweep(pool, cfg).await;
     Ok(())
+}
+
+/// Scope key of the reserved control fleet's operator token row. Tenant
+/// fleets key on [`Scope::key`] (`app:<app_id>`, `env:<env_id>`).
+pub const CONTROL_OPERATOR_SCOPE: &str = "control";
+
+/// celld's operator-token variable: set on every fleet node, and sent back
+/// on every runner-to-celld internal call — the Bearer header for HTTP, the
+/// env for the in-tree CLIs that read it themselves. Probes use the public
+/// health endpoint, which the token does not guard.
+pub const OPERATOR_TOKEN_ENV: &str = "CELLD_OPERATOR_TOKEN";
+
+/// Mint a fresh operator token: 32 random bytes, base64url. celld refuses
+/// to boot on an empty value or one with surrounding whitespace, and this
+/// spelling carries neither. Never logged: callers keep it in process env
+/// and request headers only.
+pub fn mint_operator_token() -> String {
+    use base64::Engine as _;
+    use rand::TryRng as _;
+    let mut bytes = [0u8; 32];
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("os randomness");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Tokens this process ensured, by scope key: fleet spawn populates it (it
+/// holds the pool), and the runner-to-celld callers that run without one —
+/// the reload POST, the DO probe, the celld CLI env — read from it. A miss
+/// means this runner never spawned the fleet, so no live node of ours can
+/// expect the token; those callers then proceed without it and fail safe (a
+/// 401 reads as unreachable, exactly as a dead fleet does).
+static OPERATOR_TOKENS: std::sync::LazyLock<RwLock<HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// The cached token for `scope_key`, if this process ensured that fleet.
+pub fn cached_operator_token(scope_key: &str) -> Option<String> {
+    OPERATOR_TOKENS
+        .read()
+        .ok()
+        .and_then(|tokens| tokens.get(scope_key).cloned())
+}
+
+fn cache_operator_token(scope_key: &str, token: &str) {
+    if let Ok(mut tokens) = OPERATOR_TOKENS.write() {
+        tokens.insert(scope_key.to_string(), token.to_string());
+    }
+}
+
+/// Associated data for an operator token row: the scope, namespaced away
+/// from the scoped-credential table (same KEK, same scope strings) so a row
+/// transplanted across tables does not decrypt either.
+fn operator_token_aad(scope_key: &str) -> String {
+    format!("op:{scope_key}")
+}
+
+/// This fleet's celld operator token, minting and storing it on first use:
+/// 32 random bytes per scope, AES-256-GCM under the RUNNER_TOKEN KEK with
+/// the namespaced scope as associated data — the same envelope as [`ensure`],
+/// so the bucket snapshot is not a token dump and a row copied onto another
+/// scope (or across tables) does not decrypt. Stable across restarts (the
+/// row is re-read); app and environment deletes drop the row, so a recreated
+/// slug mints fresh. A row that no longer decrypts (RUNNER_TOKEN rotated) is
+/// replaced; the running fleet keeps serving on the old token until its next
+/// spawn adopts the row.
+pub async fn operator_token(
+    pool: &sqlx::SqlitePool,
+    runner_token: &str,
+    scope_key: &str,
+    app_id: &str,
+) -> anyhow::Result<String> {
+    if let Some(token) = cached_operator_token(scope_key) {
+        return Ok(token);
+    }
+    let _guard = MUTATE.lock().await;
+    if let Some(token) = cached_operator_token(scope_key) {
+        return Ok(token);
+    }
+    let token = ensure_operator_token_row(pool, runner_token, scope_key, app_id).await?;
+    cache_operator_token(scope_key, &token);
+    Ok(token)
+}
+
+/// The row behind [`operator_token`], without the cache: re-read a live
+/// row, or mint and store. Split out so tests can drive rotation past the
+/// same-process cache (a restarted runner always reads the row).
+async fn ensure_operator_token_row(
+    pool: &sqlx::SqlitePool,
+    runner_token: &str,
+    scope_key: &str,
+    app_id: &str,
+) -> anyhow::Result<String> {
+    let aad = operator_token_aad(scope_key);
+    if let Some((nonce, ciphertext)) = db::get_operator_token(pool, scope_key).await? {
+        match decrypt(runner_token, &aad, &nonce, &ciphertext) {
+            Ok(token) => return Ok(token),
+            Err(e) => tracing::warn!(
+                scope = %scope_key,
+                error = %format!("{e:#}"),
+                "stored operator token does not decrypt; minting a new one"
+            ),
+        }
+    }
+    let token = mint_operator_token();
+    let (nonce, ciphertext) = encrypt(runner_token, &aad, &token)?;
+    // A superseded row (undecryptable after a rotation) goes before the
+    // insert: the scope is the primary key, and two rows cannot share it.
+    db::delete_operator_token(pool, scope_key).await?;
+    db::insert_operator_token(pool, scope_key, app_id, &nonce, &ciphertext).await?;
+    tracing::info!(scope = %scope_key, "minted celld operator token");
+    Ok(token)
 }
 
 /// Delete every key marked `revoking` at the store. A failure stays marked

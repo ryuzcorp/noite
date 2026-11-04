@@ -123,6 +123,7 @@ jobs:
           deploy
           environment
           environment_env
+          fleet_operator_token
           instance_setting
           pr_comment
           pr_review

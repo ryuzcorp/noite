@@ -840,21 +840,21 @@ pub struct Config {
     /// expiry sweep.
     pub environment_ttl_h: u64,
     /// celld's shedding threshold in MiB (`CELLD_MAX_RSS_MB`); 0 leaves
-    /// celld's default, 80% of the container's memory. celld compares it with
-    /// the greater of its own RSS and the cgroup's working set, and every
-    /// fleet shares the one container cgroup, so this is a container-wide
-    /// threshold, not a per-tenant cap (SPEC, Limits): a per-fleet value
-    /// such as 512 closes every fleet's admission as soon as the container
-    /// as a whole passes it.
+    /// celld's default. Fleets in their own cgroup leaf measure the leaf
+    /// (`CELLD_MEMORY_SCOPE=self`), so the default is 80% of the fleet's own
+    /// `memory.max` and an explicit value is a per-fleet-leaf threshold
+    /// (SPEC, Tenant isolation). Without a leaf (no cgroup grant) the knob
+    /// keeps its container-wide meaning: celld compares it with the greater
+    /// of its own RSS and the container working set.
     pub fleet_max_rss_mb: u32,
     /// Per-fleet memory cap in MiB (`RUNNER_FLEET_MEMORY_MB`, 512): each
     /// tenant fleet runs in its own cgroup v2 child with this `memory.max`,
     /// so one fleet's growth is OOM-killed inside its own group — contained,
     /// and the supervisor restarts it — instead of pushing every fleet toward
     /// the shared shed threshold (SPEC, Tenant isolation). An app's
-    /// `app_limit.memory_mb` overrides it. `CELLD_MAX_RSS_MB` deliberately
-    /// does not follow it: celld measures container-scale working set, so a
-    /// per-fleet value would close every fleet's ready gate.
+    /// `app_limit.memory_mb` overrides it. The shed threshold measures this
+    /// leaf too (`CELLD_MEMORY_SCOPE=self`), so an unset threshold sheds
+    /// gracefully at 80% of it before the kernel OOM-kills the fleet.
     pub fleet_memory_mb: u32,
     /// Ceiling for a tenant's per-app memory override in MiB
     /// (`RUNNER_FLEET_MEMORY_MAX_MB`, default = the effective default cap):

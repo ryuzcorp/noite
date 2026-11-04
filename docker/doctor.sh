@@ -179,10 +179,17 @@ if "$ENGINE" exec "$CID" test -d /opt/noite/control/dist 2>/dev/null; then
   region="$("$ENGINE" exec "$CID" printenv AWS_REGION 2>/dev/null || echo us-east-1)"
   check "celld control node health" "$ENGINE" exec "$CID" curl -fs http://127.0.0.1:8090/.well-known/celld/health
   # `diagnose` bind-checks a listener of its own; its default (:8080) is the
-  # runner's port in this container, so give it an ephemeral one.
-  check "celld control fleet diagnose" "$ENGINE" exec "$CID" celld diagnose --read-only \
-    --listen 127.0.0.1:0 \
-    --bucket "s3://${bucket}/control" --endpoint "$endpoint" --region "$region"
+  # runner's port in this container, so give it an ephemeral one. It is an
+  # in-tree internal client: the control node requires the operator token,
+  # which the runner publishes root-only at <work-dir>/control-operator-token
+  # on every spawn. Values cross as argv ($1..$4), never interpolated into the
+  # script, so an operator value with shell metacharacters cannot execute in
+  # the container; the token is read inside the container shell, so it never
+  # appears on this host's command line. The token is exported only when the
+  # file is non-empty — unset, diagnose sends no header and the peer probes
+  # fail closed with 401s.
+  workdir="$("$ENGINE" exec "$CID" printenv RUNNER_WORK_DIR 2>/dev/null || echo /data/runner)"
+  check "celld control fleet diagnose" "$ENGINE" exec "$CID" sh -c 'token="$(cat "$1/control-operator-token" 2>/dev/null)"; if [ -n "$token" ]; then export CELLD_OPERATOR_TOKEN="$token"; fi; exec celld diagnose --read-only --listen 127.0.0.1:0 --bucket "s3://$2/control" --endpoint "$3" --region "$4"' sh "$workdir" "$bucket" "$endpoint" "$region"
 else
   echo "n/a  celld control node (dev image: vite dev serves the UI)"
 fi

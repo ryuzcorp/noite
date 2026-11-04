@@ -646,9 +646,9 @@ impl<'a> D1<'a> {
     /// validated SQL only — never raw browser input.
     async fn exec(&self, sql: &str, json: bool) -> anyhow::Result<String> {
         let bucket = self.app.fleet_bucket.clone();
-        let env_owned = s3::aws_env(self.cfg);
-        let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        env.push(("S3_ENDPOINT", self.cfg.s3_endpoint.as_str()));
+        let scope_key = crate::host::credentials::Scope::app(self.app).key();
+        let env_owned = s3::celld_cli_env(self.cfg, &scope_key);
+        let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let mut args = vec!["d1", "execute", self.database_id.as_str(), "--command", sql];
         if json {
             args.push("--json");
@@ -674,9 +674,9 @@ impl<'a> D1<'a> {
         stmts: &[String],
     ) -> anyhow::Result<Vec<Vec<serde_json::Map<String, Value>>>> {
         let bucket = self.app.fleet_bucket.clone();
-        let env_owned = s3::aws_env(self.cfg);
-        let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        env.push(("S3_ENDPOINT", self.cfg.s3_endpoint.as_str()));
+        let scope_key = crate::host::credentials::Scope::app(self.app).key();
+        let env_owned = s3::celld_cli_env(self.cfg, &scope_key);
+        let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let args = [
             "d1",
             "execute",

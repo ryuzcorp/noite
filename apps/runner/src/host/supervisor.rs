@@ -273,8 +273,9 @@ struct FleetSpec {
     state_dir: std::path::PathBuf,
     env: Vec<(String, String)>,
     /// Effective per-fleet memory cap in MiB (per-app override, else
-    /// `RUNNER_FLEET_MEMORY_MB`): the cgroup's `memory.max`. `CELLD_MAX_RSS_MB`
-    /// deliberately does not follow it (celld measures container-scale).
+    /// `RUNNER_FLEET_MEMORY_MB`): the cgroup's `memory.max`, which the shed
+    /// threshold measures too once `CELLD_MEMORY_SCOPE=self` points celld
+    /// at the fleet's own leaf.
     memory_mb: u32,
 }
 
@@ -470,6 +471,31 @@ async fn fleet_gone_cleanup(slug: &str) {
     crate::host::sandbox::engine::close_fleet(slug).await;
 }
 
+/// The `CELLD_EGRESS_ALLOW` entry the fleet needs: its object store as
+/// `host:port`, so Worker fetches keep the reachability the old fleet-uid
+/// nft allowance granted (the store answers 401/403 without keys). A
+/// hostname entry re-resolves on every check, so a moved store stays
+/// allowed without a respawn. `None` when the endpoint is not a URL with a
+/// host — the fleet then runs with no exception rather than refusing to
+/// boot on an invalid entry (celld rejects a malformed allowlist at
+/// startup).
+fn egress_allow(s3_endpoint: &str) -> Option<String> {
+    let url = reqwest::Url::parse(s3_endpoint).ok()?;
+    // `host_str` keeps an IPv6 literal's brackets, which is exactly the
+    // `host:port` spelling celld parses — and it excludes userinfo, so
+    // credentials in the endpoint cannot leak into the allowlist.
+    let host = url.host_str()?;
+    let port = url.port_or_known_default()?;
+    // Port 0 is not a dialable exception: celld refuses to boot on it, so
+    // a nonsense endpoint yields no entry instead. A comma would split into
+    // two entries in celld's comma-separated list (`1.2.3.4,x` allows the
+    // whole of 1.2.3.4 on any port), so it yields no entry either.
+    if port == 0 || host.contains(',') {
+        return None;
+    }
+    Some(format!("{host}:{port}"))
+}
+
 /// Serve one fleet its engine proxy socket before spawn. `None` (with a
 /// warning) when the socket cannot be served: the fleet then spawns without
 /// an engine rather than not at all.
@@ -571,17 +597,39 @@ async fn ensure_spawned(
     // upgrades need no manual step (SPEC, Scoped credentials).
     let creds = credentials::fleet_credentials(pool, cfg, &spec.scope).await?;
     let (access, secret_key) = (creds.access_key, creds.secret_key);
+    // The fleet's operator token, minted once per scope and stable across
+    // restarts (SPEC, Tenant isolation): the node requires it as a Bearer
+    // token on every internal route, and the runner sends it back on its
+    // own internal calls. Tenant settings cannot override it — `CELLD_*`
+    // never reaches `spec.env` (`db::env_reserved`) — and Worker code
+    // cannot read the process env (celld builds the Worker env from
+    // declared vars only).
+    let operator_token = credentials::operator_token(
+        pool,
+        &cfg.runner_token,
+        &spec.scope.key(),
+        spec.scope.app_id(),
+    )
+    .await?;
     // Advertise on loopback: a tenant fleet is a single node, a child of the
     // runner in its own network namespace, and the runner already reaches it
     // at 127.0.0.1:{internal} (reload_fleet). A hostname advertise
     // (fleet-{slug}) doesn't resolve inside the container, which breaks celld
     // node discovery (d1/diagnose read the lease and dial `addr`). The
-    // internal listener binds loopback too: it carries celld's
-    // unauthenticated operator API (SPEC, Egress policy).
+    // internal listener binds loopback too: it carries celld's operator API,
+    // token-guarded (SPEC, Tenant isolation) and closed to tenant code by
+    // the Worker egress policy on top.
     let listen_addr = format!("0.0.0.0:{}", spec.listen);
     let internal_addr = format!("127.0.0.1:{}", spec.internal);
     let advertise_addr = internal_addr.clone();
     let mut cmd = Command::new(&cfg.celld_bin);
+    // Tenant settings first: every platform knob below wins over them by
+    // construction, so a reserved-name filter regression can never override
+    // the operator token, the egress policy or the memory scope (tenant
+    // `CELLD_*` rows are dropped by `db::env_reserved` as well).
+    for (k, v) in spec.env {
+        cmd.env(k, v);
+    }
     cmd.args([
         "--bucket",
         &spec.bucket,
@@ -634,7 +682,28 @@ async fn ensure_spawned(
     // assets as the fleet uid crash-looped on EACCES, and tenants would share
     // one cache even when it opened.
     .env("CELLD_ASSET_CACHE_DIR", format!("{state_dir}/asset-cache"))
-    .env("CELLD_TRUST_FORWARDED_HEADERS", "1");
+    .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
+    .env(credentials::OPERATOR_TOKEN_ENV, operator_token);
+    // Worker egress (SPEC, Egress policy): in `multi` the fleet's Workers
+    // dial public addresses only, with the object store as the one named
+    // exception — celld's own traffic (store, peers, control, telemetry,
+    // container engine) is exempt either way, as are this node's published
+    // container endpoints, node-wide. The nft table now covers builds only;
+    // `single` keeps no egress policy, as before (its one tenant is
+    // trusted). Each knob is removed when unset: the spawn inherits the
+    // runner's env, and an operator-global value must never silently
+    // confine (or open) a fleet that did not ask for it.
+    if matches!(cfg.tenancy, crate::config::Tenancy::Multi) {
+        cmd.env("CELLD_EGRESS", "public");
+        if let Some(allow) = egress_allow(&cfg.s3_endpoint) {
+            cmd.env("CELLD_EGRESS_ALLOW", allow);
+        } else {
+            cmd.env_remove("CELLD_EGRESS_ALLOW");
+        }
+    } else {
+        cmd.env_remove("CELLD_EGRESS");
+        cmd.env_remove("CELLD_EGRESS_ALLOW");
+    }
     // Fleet telemetry -> Parquet in the fleet bucket (celld OTel, bucket
     // sink), the documented query path for request counts. The flush / the
     // runner's compaction of the previous hour (`metrics::compact_fleet`) and
@@ -650,16 +719,6 @@ async fn ensure_spawned(
     // active the fleet gets its own group with the effective memory cap; the
     // kernel OOM-kills overgrowth inside that group (contained, and the
     // supervisor restarts the fleet) instead of every fleet shedding.
-    //
-    // `CELLD_MAX_RSS_MB` deliberately does NOT follow the per-fleet cap:
-    // celld measures the greater of its own RSS and the *container-scale*
-    // cgroup working set (through the private-ns cgroupfs root, not the
-    // fleet leaf), so a per-fleet value closes every fleet's ready gate as
-    // soon as the container as a whole passes it — the exact incident that
-    // retired the old 512 default, replayed in the isolation lane
-    // (2026-10-21: `CELLD_MAX_RSS_MB=512` per fleet, trivial fleets never
-    // healthy while builds ran). The explicit knob keeps its container-wide
-    // shed meaning; unset stays celld's default (80% of the container).
     let fleet_cgroup = crate::host::cgroups::anchor().and_then(|anchor| {
         match crate::host::cgroups::ensure_fleet_cgroup(&anchor, &key, u64::from(spec.memory_mb)) {
             Ok(dir) => Some(dir),
@@ -669,8 +728,28 @@ async fn ensure_spawned(
             }
         }
     });
+    // With its own leaf the fleet also sheds against it: `self` measures
+    // the process's own cgroup instead of the container root, so the shed
+    // threshold follows the per-fleet cap — unset
+    // (`RUNNER_FLEET_MAX_RSS_MB=0`) defaults to 80% of the leaf's
+    // `memory.max`, and the fleet sheds gracefully before the kernel
+    // OOM-kills it. Without a leaf (no cgroup grant) the knob keeps its
+    // container-wide meaning, as before. Removed when unset, like the
+    // egress knobs above: an inherited value must not silently re-scope a
+    // fleet.
+    if fleet_cgroup.is_some() {
+        cmd.env("CELLD_MEMORY_SCOPE", "self");
+    } else {
+        cmd.env_remove("CELLD_MEMORY_SCOPE");
+    }
+    // The documented knob is `RUNNER_FLEET_MAX_RSS_MB`; a zero value
+    // removes the variable instead of inheriting an operator-global one,
+    // which under `self` scope would silently become a per-fleet
+    // threshold the operator never configured per fleet.
     if cfg.fleet_max_rss_mb > 0 {
         cmd.env("CELLD_MAX_RSS_MB", cfg.fleet_max_rss_mb.to_string());
+    } else {
+        cmd.env_remove("CELLD_MAX_RSS_MB");
     }
     {
         use std::os::unix::process::CommandExt;
@@ -718,9 +797,6 @@ async fn ensure_spawned(
             }
             (None, None) => {}
         }
-    }
-    for (k, v) in spec.env {
-        cmd.env(k, v);
     }
     // The operator's DOCKER_HOST never reaches a fleet (a tenant override
     // is reserved anyway, but the runner's own environment would otherwise
@@ -945,12 +1021,16 @@ pub fn parse_reload_response(body: &str) -> ReloadOutcome {
 
 /// POST /reload on the fleet and report what celld concluded. See
 /// [`ReloadOutcome`]: only a failed adoption is returned as such — a
-/// transport error warns, as before, and reads as unreachable.
+/// transport error warns, as before, and reads as unreachable. The fleet's
+/// operator token rides as a Bearer token (the node requires it on every
+/// internal route); without a cached token the call goes out bare and a
+/// 401 reads as unreachable, exactly as a dead fleet does.
 pub async fn reload_fleet(app: &App) -> ReloadOutcome {
     let Some(port) = app.internal_port else {
         return ReloadOutcome::Unreachable;
     };
-    reload_at(&app.slug, port).await
+    let scope_key = crate::host::credentials::Scope::app(app).key();
+    reload_at(&app.slug, port, &scope_key).await
 }
 
 /// POST /reload on an environment fleet, so a preview deploy goes live
@@ -960,12 +1040,17 @@ pub async fn reload_environment_fleet(env: &crate::models::Environment) -> Reloa
     let Some(port) = env.internal_port else {
         return ReloadOutcome::Unreachable;
     };
-    reload_at(&env_fleet_key(&env.app_slug, &env.label), port).await
+    let scope_key = crate::host::credentials::Scope::environment(env).key();
+    reload_at(&env_fleet_key(&env.app_slug, &env.label), port, &scope_key).await
 }
 
-async fn reload_at(fleet: &str, port: i64) -> ReloadOutcome {
+async fn reload_at(fleet: &str, port: i64, scope_key: &str) -> ReloadOutcome {
     let url = format!("http://127.0.0.1:{port}/reload");
-    let response = match reqwest::Client::new().post(&url).send().await {
+    let mut request = reqwest::Client::new().post(&url);
+    if let Some(token) = crate::host::credentials::cached_operator_token(scope_key) {
+        request = request.bearer_auth(token);
+    }
+    let response = match request.send().await {
         Ok(response) => response,
         Err(e) => {
             tracing::warn!(fleet = %fleet, error = %e, "reload failed");
@@ -1404,6 +1489,146 @@ mod tests {
                 body
             );
         }
+    }
+
+    /// The store exception is the endpoint's `host:port` — a hostname entry
+    /// re-resolves on every check, an IPv6 literal takes brackets, and a
+    /// default port is spelled out (celld entries need one). Garbage yields
+    /// no entry rather than a value that would refuse the node its boot.
+    #[test]
+    fn egress_allow_names_the_store_host_and_port() {
+        assert_eq!(
+            egress_allow("http://rustfs:9000"),
+            Some("rustfs:9000".to_string())
+        );
+        assert_eq!(
+            egress_allow("https://s3.example.com"),
+            Some("s3.example.com:443".to_string())
+        );
+        assert_eq!(
+            egress_allow("http://10.89.0.7:9000/noite"),
+            Some("10.89.0.7:9000".to_string())
+        );
+        assert_eq!(
+            egress_allow("http://[fd00::7]:9000"),
+            Some("[fd00::7]:9000".to_string())
+        );
+        // Credentials in the endpoint stay out of the allowlist.
+        assert_eq!(
+            egress_allow("http://user:pass@rustfs:9000"),
+            Some("rustfs:9000".to_string())
+        );
+        for bad in [
+            "",
+            "not a url",
+            "http://",
+            "unix:///sock",
+            "http://rustfs:0",
+            // A comma would split into two allowlist entries.
+            "http://1.2.3.4,x:9000",
+            "http://1.2.3.4%2Cx:9000",
+        ] {
+            assert_eq!(egress_allow(bad), None, "{bad:?} yields no entry");
+        }
+    }
+
+    /// Minimal celld `/reload` stand-in: answers `adopted` and records the
+    /// `Authorization` header it saw, so the test pins what the runner sent.
+    async fn serve_reload(listener: tokio::net::TcpListener, seen: Arc<Mutex<Option<String>>>) {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = [0u8; 4096];
+        let mut req = Vec::new();
+        while !req.ends_with(b"\r\n\r\n") {
+            let Ok(n) = stream.read(&mut buf).await else {
+                return;
+            };
+            if n == 0 || req.len() > 8192 {
+                return;
+            }
+            req.extend_from_slice(&buf[..n]);
+        }
+        let text = String::from_utf8_lossy(&req);
+        let header = text.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("authorization")
+                .then(|| value.trim().to_string())
+        });
+        *seen.lock().await = header;
+        let body = r#"{"ok":true,"outcome":"adopted"}"#;
+        let _ = stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await;
+    }
+
+    /// The reload POST carries the fleet's operator token as a Bearer token
+    /// once the fleet was ensured, and goes out bare before that (a 401 then
+    /// reads as unreachable, like a dead fleet).
+    #[tokio::test]
+    async fn reload_sends_the_cached_operator_token() {
+        let pool = db::connect("sqlite::memory:").await.expect("memory db");
+        sqlx::query(include_str!("../../schema.sql"))
+            .execute(&pool)
+            .await
+            .expect("test schema");
+        let cfg = crate::config::config_for_tests();
+        let app_id = crate::models::new_id();
+        let scope_key = format!("app:{app_id}");
+        // Bare before the fleet was ever ensured.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = i64::from(listener.local_addr().expect("addr").port());
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        tokio::spawn(serve_reload(listener, seen.clone()));
+        assert_eq!(
+            reload_at("fleet", port, &scope_key).await,
+            ReloadOutcome::Adopted
+        );
+        assert_eq!(*seen.lock().await, None, "no token cached yet");
+        // Ensuring the fleet caches its token; the next reload sends it.
+        let token = credentials::operator_token(&pool, &cfg.runner_token, &scope_key, &app_id)
+            .await
+            .expect("mint");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = i64::from(listener.local_addr().expect("addr").port());
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        tokio::spawn(serve_reload(listener, seen.clone()));
+        assert_eq!(
+            reload_at("fleet", port, &scope_key).await,
+            ReloadOutcome::Adopted
+        );
+        assert_eq!(
+            *seen.lock().await,
+            Some(format!("Bearer {token}")),
+            "the reload carries the fleet token"
+        );
+        // Another fleet's token is never sent: a scope this process never
+        // ensured goes out bare even while other tokens are cached.
+        let other = format!("app:{}", crate::models::new_id());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = i64::from(listener.local_addr().expect("addr").port());
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        tokio::spawn(serve_reload(listener, seen.clone()));
+        assert_eq!(
+            reload_at("other", port, &other).await,
+            ReloadOutcome::Adopted
+        );
+        assert_eq!(*seen.lock().await, None, "no cross-fleet token");
+        pool.close().await;
     }
 
     /// Only a failed adoption fails the deploy — with celld's error naming

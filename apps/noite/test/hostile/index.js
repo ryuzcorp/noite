@@ -127,6 +127,7 @@ export default {
         "RUNNER_TOKEN",
         "AWS_SECRET_ACCESS_KEY",
         "BETTER_AUTH_SECRET",
+        "CELLD_OPERATOR_TOKEN",
       ]) {
         secrets[key] = env[key] ? "present" : "absent";
       }

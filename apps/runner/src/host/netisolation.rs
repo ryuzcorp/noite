@@ -1,25 +1,32 @@
-//! Per-uid egress policy (SPEC, Egress policy).
+//! Per-uid egress policy for builds (SPEC, Egress policy).
 //!
-//! Fleets run as `fleet` (uid 10020) and each app's builds/release commands as
-//! its own uid from the reserved per-app range (`db::ensure_app_build_uid`,
-//! `config::BUILD_UID_BASE`) via `Command::uid`. The runner installs, at boot,
-//! an nftables table that applies to *new* connections from those uids only:
-//! no loopback (fleet→fleet, fleet→operator APIs, the runner, Caddy's admin),
-//! no RFC1918/link-local/CG NAT (RustFS, peers, cloud metadata), IPv6
-//! loopback/ULA/link-local closed, DNS (53) allowed, everything else
-//! (internet) accepted. The build range is one `skuid lo-hi` match per rule,
-//! so an app allocated any uid in the range is policed. Replies on connections
-//! others opened (Caddy → a fleet, the host's published ports) always pass.
+//! Each app's builds/release commands run as their own uid from the reserved
+//! per-app range (`db::ensure_app_build_uid`, `config::BUILD_UID_BASE`) via
+//! `Command::uid`. The runner installs, at boot, an nftables table that
+//! applies to *new* connections from those uids only: no loopback (builds →
+//! operator APIs, the runner, Caddy's admin), no RFC1918/link-local/CG NAT
+//! (RustFS, peers, cloud metadata), IPv6 loopback/ULA/link-local closed,
+//! DNS (53) allowed, everything else (internet) accepted. The build range is
+//! one `skuid lo-hi` match per rule, so an app allocated any uid in the
+//! range is policed. Replies on connections others opened always pass.
 //!
-//! One dynamic allowance punches a scoped hole ahead of the rejects: the object
-//! store's addresses (both identities — release commands hold the scope key).
-//! Sandbox container dials no longer cross this chain directly: fleet TCP
-//! toward celld's bridges is redirected (nft `nat` output, the
-//! `noite_gateway` table) to the runner's gateway listener on
-//! 127.0.0.1:8071, which admits only dials to containers the connecting
-//! fleet owns (`host::sandbox::gateway`). This chain accepts those
-//! redirected flows — and only those (`ct status dnat`) — ahead of the
-//! loopback rejects.
+//! Tenant fleets used to be policed here too (the same rejects, keyed on
+//! the fleet uid); their Worker egress is now enforced inside celld
+//! (`CELLD_EGRESS=public` plus the store exception, set at spawn), which
+//! sees Workers where nft sees only uids — and the operator API the
+//! loopback blocks protected is token-guarded on top. celld cannot police
+//! non-Worker processes, so the build/release half stays here (NO-15).
+//! Sandbox container dials cross no rule in this chain: fleet TCP toward
+//! celld's bridges is redirected (nft `nat` output, the `noite_gateway`
+//! table) to the runner's gateway listener on 127.0.0.1:8071, which admits
+//! only dials to containers the connecting fleet owns
+//! (`host::sandbox::gateway`), and those flows pass on the chain's accept
+//! policy.
+//!
+//! One dynamic allowance punches a scoped hole ahead of the rejects: the
+//! object store's addresses (release commands hold the scope key; builds
+//! hold no keys of their own, so the store's unauthenticated surface is all
+//! they can reach).
 //!
 //! Requires `CAP_NET_ADMIN`. The runner probes at boot (`nft list tables`)
 //! and exposes the result in `/ready` detail and `make doctor`. Where no
@@ -38,10 +45,11 @@ static APPLIED_STORAGE: Mutex<Storage> = Mutex::new(Storage {
     port: 0,
 });
 
-/// The object store a tenant fleet's own celld process must reach: its
-/// resolved addresses and port. Worker code in that process can reach it
-/// too, but only the store's unauthenticated surface: the keys stay inside
-/// celld.
+/// The object store the policy lets policed uids reach: its resolved
+/// addresses and port. Builds hold no keys of their own, so the store's
+/// unauthenticated surface is all they can reach; release commands hold the
+/// scope's own key. (Tenant fleets reach the same store through celld's own
+/// exempt traffic plus the `CELLD_EGRESS_ALLOW` exception.)
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Storage {
     pub addrs: Vec<IpAddr>,
@@ -49,7 +57,7 @@ pub struct Storage {
 }
 
 /// Resolve `S3_ENDPOINT` (e.g. `http://rustfs:9000`) to the addresses the
-/// fleet user may dial. Empty when it does not resolve.
+/// build range may dial. Empty when it does not resolve.
 pub async fn storage_target(endpoint: &str) -> Storage {
     let Ok(url) = reqwest::Url::parse(endpoint) else {
         return Storage::default();
@@ -92,12 +100,12 @@ fn record_applied(storage: &Storage) {
 }
 
 /// Keep the storage allowance current: the bundled store's container address
-/// can change when it restarts, and a stale table would cut every fleet off
-/// from its bucket. Re-resolves every 30 s and re-applies on change. An
-/// empty discovery keeps the applied values: a failed lookup must not cut
-/// live traffic. (The sandbox gateway table re-applies on its own refresh;
-/// this chain's gateway rule needs no discovery.)
-pub fn spawn_policy_refresh(build: Option<(u32, u32)>, fleet_uid: u32, endpoint: String) {
+/// can change when it restarts, and a stale table would cut release
+/// commands off from their bucket. Re-resolves every 30 s and re-applies on
+/// change. An empty discovery keeps the applied values: a failed lookup must
+/// not cut live traffic. (The sandbox gateway table re-applies on its own
+/// refresh.)
+pub fn spawn_policy_refresh(build: Option<(u32, u32)>, endpoint: String) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -109,7 +117,7 @@ pub fn spawn_policy_refresh(build: Option<(u32, u32)>, fleet_uid: u32, endpoint:
                 storage = ?storage.addrs,
                 "object store moved; re-applying egress policy"
             );
-            ensure(build, fleet_uid, &storage).await;
+            ensure(build, &storage).await;
         }
     });
 }
@@ -136,33 +144,23 @@ fn build_skuid(build: Option<(u32, u32)>) -> Option<String> {
     })
 }
 
-/// Every sandboxed identity the policy keys on: the fleet uid, then the
-/// per-app build range as one `lo-hi` match.
-fn sandbox_identities(build: Option<(u32, u32)>, fleet_uid: u32) -> Vec<String> {
-    let mut ids = vec![fleet_uid.to_string()];
-    ids.extend(build_skuid(build));
-    ids
-}
-
-/// The nftables ruleset for the build range and fleet uid.
-fn ruleset(build: Option<(u32, u32)>, fleet_uid: u32, storage: &Storage) -> String {
+/// The nftables ruleset for the per-app build range.
+fn ruleset(build: Option<(u32, u32)>, storage: &Storage) -> String {
     // Order matters: the first matching rule wins. Replies go first (see
     // below), then DNS, which must be accepted
     // before the private/loopback rejects, because the container resolver
     // lives exactly there (Docker's embedded DNS is 127.0.0.11, Podman's is
     // the network gateway, e.g. 10.89.0.1). Rejecting it first would break
-    // every name lookup, and with it `bun install` and all Worker egress.
+    // every name lookup, and with it `bun install`.
     //
     // The leading `table …` + `delete table …` pair makes the reload one
     // atomic transaction: `nft -f` applies the whole file or nothing, and a
     // table that did not exist yet is created empty first so the delete
     // cannot fail.
     let mut rules = Vec::new();
-    // Replies first: these rules only restrict connections a fleet or a
-    // build *opens*. Without this, a fleet's answers to Caddy (over
-    // loopback) and to the host's published ports (from the network
-    // gateway, a private address) match the rejects below, and no tenant
-    // app is reachable at all.
+    // Replies first: these rules only restrict connections a build *opens*.
+    // A reject must never swallow a reply on a connection someone else
+    // opened.
     rules.push("    ct state established,related accept".to_string());
     // DNS is matched on the port the socket dialed (conntrack's original
     // tuple), not the packet's: Docker's embedded resolver answers on
@@ -171,19 +169,21 @@ fn ruleset(build: Option<(u32, u32)>, fleet_uid: u32, storage: &Storage) -> Stri
     // `dport 53` never matched and the loopback reject below refused every
     // lookup (`bun install` failed with ConnectionRefused on Docker only).
     //
-    // The build range is one rule: every app's uid shares the policy.
-    let identities = sandbox_identities(build, fleet_uid);
+    // The build range is one rule: every app's uid shares the policy. With
+    // no range configured nothing is policed (the caller skips the install;
+    // this shape only ever renders in tests).
+    let identities: Vec<String> = build_skuid(build).into_iter().collect();
     for id in &identities {
         rules.push(format!(
             "    meta skuid {id} meta l4proto {{ tcp, udp }} ct original proto-dst 53 accept"
         ));
     }
-    // The fleet's own celld needs the object store, which in Compose sits on a
-    // private address (rustfs:9000): allow exactly those addresses and port,
-    // ahead of the private-range rejects. Release commands run as the app's
-    // build uid and hold the scope's own key (SPEC, Scoped credentials), so
-    // the build range needs the same allowance; builds hold no keys of their
-    // own, so the store's unauthenticated surface is all they can reach.
+    // Release commands run as the app's build uid and hold the scope's own
+    // key (SPEC, Scoped credentials), and the object store in Compose sits
+    // on a private address (rustfs:9000): allow exactly those addresses and
+    // port, ahead of the private-range rejects. Builds hold no keys of
+    // their own, so the store's unauthenticated surface is all they can
+    // reach.
     let (v4, v6): (Vec<IpAddr>, Vec<IpAddr>) =
         storage.addrs.iter().copied().partition(IpAddr::is_ipv4);
     let join = |ips: &[IpAddr]| {
@@ -208,20 +208,8 @@ fn ruleset(build: Option<(u32, u32)>, fleet_uid: u32, storage: &Storage) -> Stri
             ));
         }
     }
-    // Sandbox container dials reach the runner's gateway listener, not the
-    // bridges directly: fleet TCP toward celld's subnets is redirected to
-    // 127.0.0.1:GATEWAY_PORT (the `noite_gateway` table), and the gateway
-    // admits only dials to containers the connecting fleet owns. This rule
-    // lets those redirected flows through, ahead of the loopback rejects —
-    // and `ct status dnat` keeps it to exactly those flows, so a fleet
-    // dialing the gateway port directly is still refused below. Fleet only:
-    // builds never dial sandboxes.
-    rules.push(format!(
-        "    meta skuid {fleet_uid} ip daddr 127.0.0.1 tcp dport {} ct status dnat accept",
-        super::sandbox::GATEWAY_PORT,
-    ));
-    // No new connection to loopback, any protocol: that is where the operator
-    // APIs, the runner, Caddy's admin and every other fleet listen.
+    // No new connection to loopback, any protocol: that is where the
+    // operator APIs, the runner and Caddy's admin listen.
     for id in &identities {
         rules.push(format!("    meta skuid {id} ip daddr 127.0.0.0/8 reject"));
         rules.push(format!("    meta skuid {id} ip6 daddr ::1 reject"));
@@ -247,8 +235,8 @@ table inet noite {{
 
 /// Install the table (idempotent: the ruleset replaces it atomically). Best-effort: records the
 /// reason and returns false when `nft` is missing or CAP_NET_ADMIN is absent.
-pub async fn ensure(build: Option<(u32, u32)>, fleet_uid: u32, storage: &Storage) -> bool {
-    let rules = ruleset(build, fleet_uid, storage);
+pub async fn ensure(build: Option<(u32, u32)>, storage: &Storage) -> bool {
+    let rules = ruleset(build, storage);
     // Probe first: missing binary or capability surfaces here.
     match nft_run(&["list", "tables"], None).await {
         Ok(()) => {}
@@ -264,7 +252,7 @@ pub async fn ensure(build: Option<(u32, u32)>, fleet_uid: u32, storage: &Storage
             reason("nft noite table installed".to_string());
             NFT_OK.store(true, Ordering::Relaxed);
             record_applied(storage);
-            tracing::info!(build_range = ?build, fleet_uid, "nft egress policy installed");
+            tracing::info!(build_range = ?build, "nft egress policy installed");
             true
         }
         Err(e) => {
@@ -320,29 +308,26 @@ mod tests {
             addrs: vec!["10.89.0.7".parse().unwrap()],
             port: 9000,
         };
-        let rules = ruleset(BUILD, 10020, &storage);
+        let rules = ruleset(BUILD, &storage);
         let first_reject = rules.find(" reject").expect("has rejects");
-        for uid in ["10020", "10030-11053"] {
-            // Pre-NAT port: Docker DNATs its resolver off port 53.
-            let accept = rules
-                .find(&format!(
-                    "meta skuid {uid} meta l4proto {{ tcp, udp }} ct original proto-dst 53 accept"
-                ))
-                .expect("dns accept present");
-            assert!(accept < first_reject, "dns for {uid} must come first");
-        }
-        // The fleet's celld reaches its object store before private ranges close.
-        for uid in ["10020", "10030-11053"] {
-            let store = rules
-                .find(&format!(
-                    "meta skuid {uid} ip daddr {{ 10.89.0.7 }} tcp dport 9000 accept"
-                ))
-                .expect("storage allowance");
-            assert!(
-                store < first_reject,
-                "storage must be allowed before the rejects for {uid}"
-            );
-        }
+        let uid = "10030-11053";
+        // Pre-NAT port: Docker DNATs its resolver off port 53.
+        let accept = rules
+            .find(&format!(
+                "meta skuid {uid} meta l4proto {{ tcp, udp }} ct original proto-dst 53 accept"
+            ))
+            .expect("dns accept present");
+        assert!(accept < first_reject, "dns for {uid} must come first");
+        // Release commands reach the object store before private ranges close.
+        let store = rules
+            .find(&format!(
+                "meta skuid {uid} ip daddr {{ 10.89.0.7 }} tcp dport 9000 accept"
+            ))
+            .expect("storage allowance");
+        assert!(
+            store < first_reject,
+            "storage must be allowed before the rejects for {uid}"
+        );
         // Replies to inbound connections pass before anything is rejected.
         let replies = rules
             .find("ct state established,related accept")
@@ -361,7 +346,7 @@ mod tests {
     #[test]
     fn build_uid_range_is_closed_off_in_every_rule() {
         let storage = Storage::default();
-        let rules = ruleset(BUILD, 10020, &storage);
+        let rules = ruleset(BUILD, &storage);
         let range = "10030-11053";
         for prefix in [
             format!("meta skuid {range} ip daddr 127.0.0.0/8 reject"),
@@ -387,7 +372,7 @@ mod tests {
     /// A one-uid range degrades to a single match (and no `lo-hi`).
     #[test]
     fn single_uid_range_emits_a_plain_match() {
-        let rules = ruleset(Some((10030, 1)), 10020, &Storage::default());
+        let rules = ruleset(Some((10030, 1)), &Storage::default());
         assert!(rules.contains("meta skuid 10030 ip daddr 127.0.0.0/8 reject"));
         assert!(
             !rules.contains("10030-"),
@@ -395,41 +380,42 @@ mod tests {
         );
     }
 
-    /// No build uids (dev/single): only the fleet is keyed on, and the table
-    /// still installs.
+    /// No build uids (uid drops disabled): nothing is policed — the caller
+    /// skips the install instead of writing a reply-only table.
     #[test]
-    fn without_build_uids_only_the_fleet_is_policed() {
-        let rules = ruleset(None, 10020, &Storage::default());
-        assert!(rules.contains("meta skuid 10020 ip daddr 127.0.0.0/8 reject"));
+    fn without_build_uids_nothing_is_policed() {
+        let rules = ruleset(None, &Storage::default());
         assert!(
-            !rules.contains("meta skuid 10030"),
-            "no build uid configured"
+            !rules.contains("meta skuid"),
+            "no identity may be keyed on without a build range"
+        );
+        assert!(
+            rules.contains("ct state established,related accept"),
+            "the reply rule still renders"
         );
     }
 
-    /// Sandbox container dials arrive at the gateway listener through the
-    /// `noite_gateway` redirect: a fleet-only ACCEPT for those redirected
-    /// flows, ahead of the loopback rejects. `ct status dnat` keeps it to
-    /// redirected flows only (a fleet dialing the gateway port directly is
-    /// still refused below); builds never dial sandboxes, so the range has
-    /// no such rule and no path to the bridges at all.
+    /// The fleet-uid half is gone: Worker egress is enforced inside celld
+    /// (`CELLD_EGRESS`), so no rule here may key on the fleet uid — neither
+    /// rejects nor the old gateway-redirect ACCEPT (redirected flows pass on
+    /// the chain's accept policy now).
     #[test]
-    fn fleet_reaches_the_gateway_only_through_the_redirect() {
-        let rules = ruleset(BUILD, 10020, &Storage::default());
-        let first_reject = rules.find(" reject").expect("has rejects");
-        let accept = rules
-            .find("meta skuid 10020 ip daddr 127.0.0.1 tcp dport 8071 ct status dnat accept")
-            .expect("gateway accept present");
+    fn no_fleet_uid_rule_remains() {
+        let storage = Storage {
+            addrs: vec!["10.89.0.7".parse().unwrap()],
+            port: 9000,
+        };
+        let rules = ruleset(BUILD, &storage);
         assert!(
-            accept < first_reject,
-            "gateway must be allowed before the rejects"
+            !rules.contains("skuid 10020"),
+            "no fleet-uid rule may remain:\n{rules}"
         );
         assert!(
-            !rules.contains("meta skuid 10030-11053 ip daddr 127.0.0.1 tcp dport 8071"),
-            "builds must not reach the gateway"
+            !rules.contains("ct status dnat"),
+            "the gateway ACCEPT left with the fleet half"
         );
-        // No direct path to the bridges anywhere in this chain: the old
-        // fleet subnet ACCEPT is gone, the redirect owns that path now.
+        // No direct path to the bridges anywhere in this chain: the
+        // `noite_gateway` redirect owns that path now.
         assert!(
             !rules.contains("meta l4proto tcp accept"),
             "no direct bridge ACCEPT may remain"

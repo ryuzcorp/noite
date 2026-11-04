@@ -206,17 +206,22 @@ async fn main() -> anyhow::Result<()> {
     // Isolation: nft egress policy first, then self-checks (SPEC, Egress policy + Tenancy mode).
     // Only in multi tenancy: the single tenant is trusted, and the policy
     // would also cut single-tenant release commands off from the bucket.
-    // The build range is `None` when uid drops are disabled; fleets are
-    // still policed (builds are refused separately).
+    // The table covers the build range only (Worker egress lives in celld);
+    // with no range there is nothing to install (builds are refused
+    // separately).
     let build_uids = config.build_uid_base.map(|b| (b, config.build_uid_range));
-    let nft_installed = match (config.tenancy, config.fleet_uid) {
-        (config::Tenancy::Multi, Some(f)) => {
+    let nft_installed = match (config.tenancy, build_uids) {
+        (config::Tenancy::Multi, Some(_)) => {
             let storage = host::netisolation::storage_target(&config.s3_endpoint).await;
-            let ok = host::netisolation::ensure(build_uids, f, &storage).await;
+            let ok = host::netisolation::ensure(build_uids, &storage).await;
             if ok {
-                host::netisolation::spawn_policy_refresh(build_uids, f, config.s3_endpoint.clone());
+                host::netisolation::spawn_policy_refresh(build_uids, config.s3_endpoint.clone());
             }
             ok
+        }
+        (config::Tenancy::Multi, None) => {
+            host::netisolation::skip("uid drops disabled: no build range to police");
+            false
         }
         _ => {
             host::netisolation::skip("single tenancy: egress policy not installed");
@@ -423,12 +428,50 @@ async fn main() -> anyhow::Result<()> {
     // The dev image has no bundle: `vite dev` serves the UI on the same port
     // (docker/dev.sh), so there is nothing to deploy or supervise.
     let control_child = if host::control::bundle_present(&config) {
-        if let Err(e) = host::control::ensure_deployed(&config).await {
-            tracing::warn!(error = %e, "control fleet deploy failed; continuing");
+        // The control node's operator token: minted once and snapshotted
+        // with the database, so an overlapping redeploy's new node agrees
+        // with the old one on peer traffic. Retried like the control
+        // deploy below; still missing, the control fleet does not run at
+        // all — failing closed, never an open internal listener on :8091 —
+        // and the stale published token (if any) is deleted so `make
+        // doctor` fails loudly instead of probing with a dead token.
+        let mut control_token = String::new();
+        for attempt in 1..=3 {
+            match host::credentials::operator_token(
+                &pool,
+                &config.runner_token,
+                host::credentials::CONTROL_OPERATOR_SCOPE,
+                "_control",
+            )
+            .await
+            {
+                Ok(token) => {
+                    control_token = token;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(attempt, error = %format!("{e:#}"), "control operator token unavailable; retrying");
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
         }
-        let child = host::control::supervise(&config, control_pid.clone(), logs.clone());
-        tracing::info!(ms = boot.elapsed().as_millis(), "control bundle ready");
-        Some(child)
+        if control_token.is_empty() {
+            tracing::error!(
+                "control operator token unavailable; not supervising the control fleet"
+            );
+            host::control::remove_operator_token_file(&config.work_dir);
+            None
+        } else {
+            if let Err(e) = host::control::ensure_deployed(&config).await {
+                tracing::warn!(error = %e, "control fleet deploy failed; continuing");
+            }
+            let child =
+                host::control::supervise(&config, control_pid.clone(), logs.clone(), control_token);
+            tracing::info!(ms = boot.elapsed().as_millis(), "control bundle ready");
+            Some(child)
+        }
     } else {
         tracing::info!("no control bundle (dev image): the UI is served by vite dev");
         None

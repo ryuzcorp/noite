@@ -1109,9 +1109,12 @@ async fn deploy_inner(
     }
     let declares_containers = app_plan.is_some();
 
-    let env_owned = s3::aws_env(cfg);
+    let scope_key = match target.environment() {
+        Some(env) => crate::host::credentials::Scope::environment(env).key(),
+        None => crate::host::credentials::Scope::app(app).key(),
+    };
+    let env_owned = s3::celld_cli_env(cfg, &scope_key);
     let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    env.push(("S3_ENDPOINT", cfg.s3_endpoint.as_str()));
     env.push(("CELLD_CONTAINER_PLATFORM", container_platform.as_str()));
     // The ordered fleet deploy (SPEC, Void platform proxy): every script
     // staged with `celld deploy --no-activate` — the cohosted scripts first

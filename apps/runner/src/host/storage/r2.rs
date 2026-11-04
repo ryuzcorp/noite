@@ -121,15 +121,15 @@ fn normalize_prefix(prefix: &str) -> String {
     }
 }
 
-fn celld_env(cfg: &Config) -> Vec<(&str, String)> {
-    let mut env = s3::aws_env(cfg);
-    env.push(("S3_ENDPOINT", cfg.s3_endpoint.clone()));
-    env
-}
-
 /// Run one `celld` subcommand against the fleet's own bucket.
-async fn run_celld(cfg: &Config, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
-    let env_owned = celld_env(cfg);
+async fn run_celld(
+    cfg: &Config,
+    app: &App,
+    args: &[&str],
+    timeout: Duration,
+) -> anyhow::Result<String> {
+    let scope_key = crate::host::credentials::Scope::app(app).key();
+    let env_owned = s3::celld_cli_env(cfg, &scope_key);
     let env: Vec<(&str, &str)> = env_owned
         .iter()
         .map(|(key, value)| (*key, value.as_str()))
@@ -143,10 +143,12 @@ async fn run_celld(cfg: &Config, args: &[&str], timeout: Duration) -> anyhow::Re
 /// is never observed.
 async fn run_celld_bytes(
     cfg: &Config,
+    app: &App,
     args: &[&str],
     timeout: Duration,
 ) -> anyhow::Result<Vec<u8>> {
-    let env_owned = celld_env(cfg);
+    let scope_key = crate::host::credentials::Scope::app(app).key();
+    let env_owned = s3::celld_cli_env(cfg, &scope_key);
     let env: Vec<(&str, &str)> = env_owned
         .iter()
         .map(|(key, value)| (*key, value.as_str()))
@@ -291,7 +293,7 @@ pub async fn r2_list(
         args.push(token);
     }
     args.extend(fleet);
-    let out = run_celld(cfg, &args, CELD_TIMEOUT).await?;
+    let out = run_celld(cfg, app, &args, CELD_TIMEOUT).await?;
     let page: CelldPage = serde_json::from_str(&out).context("parse celld r2 list --page")?;
     shape_page(app, bucket, &prefix, page)
 }
@@ -317,7 +319,7 @@ async fn r2_head(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow::Re
     let fleet = fleet_args(app, cfg);
     let mut args: Vec<&str> = vec!["r2", "head", bucket, key, "--json"];
     args.extend(fleet);
-    let out = match run_celld(cfg, &args, CELD_TIMEOUT).await {
+    let out = match run_celld(cfg, app, &args, CELD_TIMEOUT).await {
         Ok(out) => out,
         Err(error) if format!("{error:#}").contains("no object") => {
             anyhow::bail!("object not found")
@@ -337,7 +339,7 @@ async fn r2_get_bytes(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyho
     let fleet = fleet_args(app, cfg);
     let mut args: Vec<&str> = vec!["r2", "get", bucket, key];
     args.extend(fleet);
-    match run_celld_bytes(cfg, &args, CELD_UPLOAD_TIMEOUT).await {
+    match run_celld_bytes(cfg, app, &args, CELD_UPLOAD_TIMEOUT).await {
         Ok(bytes) => Ok(bytes),
         Err(error) if format!("{error:#}").contains("no object") => {
             anyhow::bail!("object not found")
@@ -412,7 +414,7 @@ pub async fn r2_put(
         args.push(value);
     }
     args.extend(fleet);
-    run_celld(cfg, &args, CELD_UPLOAD_TIMEOUT).await?;
+    run_celld(cfg, app, &args, CELD_UPLOAD_TIMEOUT).await?;
     Ok(())
 }
 
@@ -440,7 +442,7 @@ pub async fn r2_delete_many(
         args.push(key);
     }
     args.extend(fleet);
-    run_celld(cfg, &args, CELD_TIMEOUT).await?;
+    run_celld(cfg, app, &args, CELD_TIMEOUT).await?;
     Ok(keys.len())
 }
 

@@ -157,7 +157,7 @@ pub async fn ensure_deployed(cfg: &Config) -> anyhow::Result<serde_json::Value> 
     }
     tokio::fs::write(&wrangler, serde_json::to_string_pretty(&doc)?).await?;
     let bucket = format!("s3://{}/control", cfg.s3_bucket);
-    let env_owned = s3::aws_env(cfg);
+    let env_owned = s3::celld_cli_env(cfg, crate::host::credentials::CONTROL_OPERATOR_SCOPE);
     let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     // Retry: S3 can flip 503 mid-deploy (rustfs restart); give up loudly.
     let mut last = anyhow::anyhow!("not attempted");
@@ -239,13 +239,22 @@ async fn copy_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
 /// to `--bucket`) and the ingest, compaction, error grouping and prune treat
 /// it as one more source — keyed `_control`, with no `app` row. Its pid is
 /// mirrored into `control_pid` and its stdout+stderr into the shared log
-/// buffer under the same key.
-pub fn supervise(config: &Config, control_pid: Arc<AtomicU32>, logs: LogState) -> Supervised {
+/// buffer under the same key. `operator_token` guards its internal listener
+/// like every tenant fleet's; the caller refuses to spawn on an empty token
+/// (failing closed), and the empty path below only deletes the stale
+/// published file as belt-and-braces.
+pub fn supervise(
+    config: &Config,
+    control_pid: Arc<AtomicU32>,
+    logs: LogState,
+    operator_token: String,
+) -> Supervised {
     let args = spawn_args(config);
     let shutdown_ms = config.fleet_shutdown_ms().to_string();
     let lease_ttl_ms = config.fleet_lease_ttl_ms.to_string();
     let celld = config.celld_bin.clone();
     let otel = metrics::otel_env(config);
+    let work_dir = config.work_dir.clone();
     Supervised::start_observed(
         "control",
         Some(control_pid),
@@ -253,13 +262,40 @@ pub fn supervise(config: &Config, control_pid: Arc<AtomicU32>, logs: LogState) -
         move || {
             let state_dir = "/data/control";
             let _ = std::fs::create_dir_all(state_dir);
+            // The control fleet's operator token for `make doctor`'s `celld
+            // diagnose` (an in-tree internal client that authenticates from
+            // its own env): rewritten on every spawn so it never drifts from
+            // the ensured row. Root-only: tenants must never read it. Empty
+            // (the caller refuses to spawn then, but belt-and-braces) deletes
+            // the stale file instead of publishing nothing.
+            if operator_token.is_empty() {
+                remove_operator_token_file(&work_dir);
+            } else {
+                write_operator_token_file(&work_dir, &operator_token);
+            }
             let mut cmd = tokio::process::Command::new(&celld);
             cmd.args(&args)
                 .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
                 .env("CELLD_WATCH", state_dir)
                 .env("CELLD_READY_FLEET_GATE_MS", "15000")
-                .env("CELLD_DURABILITY", "bucket")
-                .env("CELLD_SHUTDOWN_TOTAL_MS", &shutdown_ms)
+                .env("CELLD_DURABILITY", "bucket");
+            if operator_token.is_empty() {
+                // Never inherit an operator-global token the runner does not
+                // know: the node would boot guarded with a token no caller
+                // sends.
+                cmd.env_remove(crate::host::credentials::OPERATOR_TOKEN_ENV);
+            } else {
+                cmd.env(
+                    crate::host::credentials::OPERATOR_TOKEN_ENV,
+                    &operator_token,
+                );
+            }
+            // The control node sets no egress or memory-scope policy of its
+            // own; like the tenant spawn, it removes rather than inherits.
+            cmd.env_remove("CELLD_EGRESS");
+            cmd.env_remove("CELLD_EGRESS_ALLOW");
+            cmd.env_remove("CELLD_MEMORY_SCOPE");
+            cmd.env("CELLD_SHUTDOWN_TOTAL_MS", &shutdown_ms)
                 // The same lease as tenant fleets (`Config::fleet_lease_ttl_ms`).
                 .env("CELLD_TTL_MS", &lease_ttl_ms)
                 // The control UI declares no container classes; only the
@@ -275,6 +311,61 @@ pub fn supervise(config: &Config, control_pid: Arc<AtomicU32>, logs: LogState) -
             cmd
         },
     )
+}
+
+/// Where the runner publishes the control fleet's operator token for
+/// `make doctor`'s `celld diagnose`: under the runner work dir, not the
+/// node's `CELLD_WATCH` working dir (whose contents celld owns).
+fn operator_token_path(work_dir: &str) -> std::path::PathBuf {
+    std::path::Path::new(work_dir).join("control-operator-token")
+}
+
+/// Delete the published control token, if any: when the token cannot be
+/// ensured the stale file must not linger, or `make doctor` would probe
+/// with a dead token instead of failing loudly.
+pub fn remove_operator_token_file(work_dir: &str) {
+    let _ = std::fs::remove_file(operator_token_path(work_dir));
+}
+
+/// Publish the control fleet's operator token for `make doctor`: root-only
+/// (`0600`), best-effort — without it diagnose's peer probes fail closed
+/// with 401s, which is what the warning says.
+fn write_operator_token_file(work_dir: &str, token: &str) {
+    let path = operator_token_path(work_dir);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = write_private_atomically(&path, token.as_bytes()) {
+        tracing::warn!(path = %path.display(), error = %e, "could not write the control operator token file; `make doctor`'s celld diagnose will fail its peer probes");
+    }
+}
+
+/// Write `bytes` to `path` as a `0600` file that is never readable by anyone
+/// else, not even while it is written: a fresh temp file is created with
+/// mode `0600` (no umask window), filled, synced, then renamed over `path`,
+/// so readers see the old file or the whole new one. Exact bytes, no
+/// trailing newline: celld refuses a token with surrounding whitespace, and
+/// `$(cat …)` must reproduce it verbatim.
+fn write_private_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Spawn arguments for the control fleet (SPEC, Control UI).
@@ -324,6 +415,31 @@ pub fn control_advertise() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The published control token file carries the exact token bytes and is
+    /// root-only: tenants must never read it.
+    #[test]
+    fn control_token_file_is_exact_and_root_only() {
+        let dir =
+            std::env::temp_dir().join(format!("noite-control-token-{}", crate::models::new_id()));
+        write_operator_token_file(&dir.to_string_lossy(), "tok-abc-123");
+        let path = operator_token_path(&dir.to_string_lossy());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "tok-abc-123",
+            "exact bytes, no trailing newline"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777,
+                0o600,
+                "root-only"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn bundle_presence_needs_a_wrangler_config() {

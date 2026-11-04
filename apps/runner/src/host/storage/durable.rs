@@ -38,9 +38,9 @@ pub struct DoPreview {
 /// ?read=1` — the object's own handler decides what its preview says.
 pub async fn do_instances(cfg: &Config, app: &App, class_name: &str) -> anyhow::Result<DoPreview> {
     let bucket = app.fleet_bucket.clone();
-    let env_owned = s3::aws_env(cfg);
-    let mut env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    env.push(("S3_ENDPOINT", cfg.s3_endpoint.as_str()));
+    let scope_key = crate::host::credentials::Scope::app(app).key();
+    let env_owned = s3::celld_cli_env(cfg, &scope_key);
+    let env: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let out = exec::run_cmd(
         &cfg.celld_bin,
         &["cell", "list", class_name, "--json", "--bucket", &bucket],
@@ -92,20 +92,127 @@ pub async fn do_instances(cfg: &Config, app: &App, class_name: &str) -> anyhow::
 
 /// `GET /do/{scope}?read=1` on the fleet's internal listener, capped and
 /// best-effort. The loopback address matches ensure_fleet's --advertise;
-/// rootless podman routes it to the fleet child in the runner's netns.
+/// rootless podman routes it to the fleet child in the runner's netns. The
+/// fleet's operator token rides as a Bearer token (the node requires it on
+/// every internal route); without a cached token the probe goes out bare
+/// and a 401 reads as missing, exactly as an unresponsive instance does.
 async fn probe_instance(app: &App, scope: &str) -> Option<String> {
     let port = app.internal_port?;
     let url = format!("http://127.0.0.1:{port}/do/{scope}?read=1");
-    let Ok(response) = reqwest::Client::new()
+    let scope_key = crate::host::credentials::Scope::app(app).key();
+    let mut request = reqwest::Client::new()
         .get(&url)
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-    else {
+        .timeout(Duration::from_secs(5));
+    if let Some(token) = crate::host::credentials::cached_operator_token(&scope_key) {
+        request = request.bearer_auth(token);
+    }
+    let Ok(response) = request.send().await else {
         return None;
     };
+    // A refusal (a 401 without the token, a 404 for a gone instance) is
+    // missing, not a preview: surfacing the refusal body would misreport
+    // tenant-visible data.
+    if !response.status().is_success() {
+        return None;
+    }
     let Ok(body) = response.text().await else {
         return None;
     };
     Some(body.chars().take(2000).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal celld `/do/` stand-in: one canned status and body.
+    async fn serve_status(
+        listener: tokio::net::TcpListener,
+        status: &'static str,
+        body: &'static str,
+    ) {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = [0u8; 4096];
+        let mut req = Vec::new();
+        while !req.ends_with(b"\r\n\r\n") {
+            let Ok(n) = stream.read(&mut buf).await else {
+                return;
+            };
+            if n == 0 || req.len() > 8192 {
+                return;
+            }
+            req.extend_from_slice(&buf[..n]);
+        }
+        let _ = stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await;
+    }
+
+    async fn seed_app_on(pool: &sqlx::SqlitePool, port: i64) -> App {
+        let cfg = crate::config::config_for_tests();
+        let slug = format!("shop-{port}");
+        let mut app = crate::db::create_app(
+            pool,
+            &cfg,
+            crate::db::NewApp {
+                name: "shop",
+                slug: &slug,
+                user_id: "user_test",
+                subdomain: "shop.localhost",
+                listen: 30000,
+                internal: 30001,
+            },
+        )
+        .await
+        .expect("seed app");
+        app.internal_port = Some(port);
+        app
+    }
+
+    /// A refusal — a 401 without the token, a 404 for a gone instance —
+    /// reads as a missing instance, never as a preview body; a 200 still
+    /// previews.
+    #[tokio::test]
+    async fn probe_refusals_read_as_missing() {
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        for (status, body) in [
+            ("401 Unauthorized", "unauthorized"),
+            ("404 Not Found", "gone"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = i64::from(listener.local_addr().expect("addr").port());
+            tokio::spawn(serve_status(listener, status, body));
+            let app = seed_app_on(&pool, port).await;
+            assert_eq!(
+                probe_instance(&app, "scope").await,
+                None,
+                "{status} is missing"
+            );
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = i64::from(listener.local_addr().expect("addr").port());
+        tokio::spawn(serve_status(listener, "200 OK", r#"{"n":1}"#));
+        let app = seed_app_on(&pool, port).await;
+        assert_eq!(
+            probe_instance(&app, "scope").await,
+            Some(r#"{"n":1}"#.to_string()),
+            "a 200 previews"
+        );
+        pool.close().await;
+    }
 }
