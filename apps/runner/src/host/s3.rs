@@ -710,11 +710,10 @@ pub(crate) struct S3Object {
     pub(crate) etag: String,
 }
 
-/// One native LIST response: one request's objects, common prefixes and the
-/// token that continues it. Callers that page keep the token; callers that
+/// One native LIST response: one request's common prefixes and the token
+/// that continues it. Callers that page keep the token; callers that
 /// do not use `s3_list_raw`.
 pub(crate) struct S3Page {
-    pub(crate) objects: Vec<S3Object>,
     pub(crate) prefixes: Vec<String>,
     pub(crate) next: Option<String>,
 }
@@ -753,16 +752,6 @@ pub(crate) async fn s3_list_page(
     let parsed = rusty_s3::actions::ListObjectsV2::parse_response(&text)
         .with_context(|| "s3 LIST XML parse")?;
     Ok(S3Page {
-        objects: parsed
-            .contents
-            .into_iter()
-            .map(|object| S3Object {
-                key: object.key,
-                last_modified: object.last_modified,
-                size: object.size,
-                etag: object.etag,
-            })
-            .collect(),
         prefixes: parsed
             .common_prefixes
             .into_iter()
@@ -772,12 +761,10 @@ pub(crate) async fn s3_list_page(
     })
 }
 
-/// One object's record as a HEAD reports it: the size (S3 lists it too, but a
-/// single-key lookup has no listing) and the real `content-type` header celld
-/// writes for an R2 object.
+/// One object's size as a HEAD reports it (S3 lists it too, but a
+/// single-key lookup has no listing).
 pub(crate) struct S3Head {
     pub(crate) size: i64,
-    pub(crate) content_type: Option<String>,
 }
 
 /// `HEAD` one object: `None` when it does not exist (or the store refused).
@@ -802,12 +789,7 @@ pub(crate) async fn s3_head_object(cfg: &Config, bucket: &str, key: &str) -> Opt
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(0);
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_string());
-    Some(S3Head { size, content_type })
+    Some(S3Head { size })
 }
 
 /// Download one object's whole body into memory.

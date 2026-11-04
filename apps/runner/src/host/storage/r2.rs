@@ -3,21 +3,16 @@
 //! celld serves an `r2_buckets` binding out of the fleet bucket under the
 //! reserved `r2/<bucket_name>/` prefix: the body is a plain object, the five
 //! content headers are real headers, and the rest of the record travels in
-//! the `celld-r2` user-metadata entry (`docs/services/r2`, "Where celld
-//! stores an object"). A key reaches the store percent-encoded — the bytes
-//! celld escapes are `%`, the set `\{}^`[]"<>~#|*?`, controls and every
-//! non-ASCII byte, an empty segment becomes `%`, and a space stays a space —
-//! so a listing that walks S3 directly must encode the prefix it lists and
-//! decode what it reads (`r2_encode` / `r2_decode`, pinned by the tests
-//! below against celld 0.6.1).
-//!
-//! Writes go through `celld r2 put`, which writes the same record a Worker's
-//! `env.BUCKET.put()` writes. A plain S3 PUT would store the body with the
-//! wrong key encoding and without the record, so the upload never does one.
+//! the `celld-r2` user-metadata entry (`docs/services/r2`). Every read and
+//! write here goes through the `celld r2` CLI, which owns both the stored
+//! key form and the record — the runner never encodes a key or touches the
+//! store directly, so a folder listing is one `list --page` call with the
+//! keys already decoded and the content types in-band.
 use std::path::Path;
 use std::time::Duration;
 
-use futures::StreamExt;
+use anyhow::Context;
+use serde::Deserialize;
 use serde::Serialize;
 use ts_rs::TS;
 
@@ -35,8 +30,6 @@ pub const R2_DELETE_LIMIT: usize = 100;
 const R2_RAW_CAP: i64 = 67_108_864;
 /// Largest body the text preview reads.
 const R2_PREVIEW_CAP: usize = 262_144;
-/// HEADs one listing page may run in parallel for content types.
-const R2_HEAD_CONCURRENCY: usize = 8;
 const CELD_TIMEOUT: Duration = Duration::from_secs(120);
 const CELD_UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -89,129 +82,10 @@ pub struct R2File {
 }
 
 /// Raw object bytes plus the record header the download re-serves.
+#[derive(Debug)]
 pub struct R2Raw {
     pub bytes: Vec<u8>,
     pub content_type: Option<String>,
-}
-
-/// celld serves an R2 binding out of the fleet bucket under this prefix.
-fn r2_base(app: &App, bucket: &str) -> String {
-    format!("fleets/{}/r2/{bucket}/", app.slug)
-}
-
-fn hex_digit(value: u8) -> char {
-    match value {
-        0..=9 => (b'0' + value) as char,
-        _ => (b'A' + value - 10) as char,
-    }
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// `true` for a byte celld escapes when it stores a key.
-fn r2_escapable(byte: u8) -> bool {
-    if byte < 0x20 || byte == 0x7F || byte >= 0x80 {
-        return true;
-    }
-    matches!(
-        byte,
-        b'%' | b'\\'
-            | b'{'
-            | b'}'
-            | b'^'
-            | b'`'
-            | b'['
-            | b']'
-            | b'"'
-            | b'<'
-            | b'>'
-            | b'~'
-            | b'#'
-            | b'|'
-            | b'*'
-            | b'?'
-    )
-}
-
-/// The stored form of an R2 key: every escapable byte as `%XX`, an empty
-/// segment as `%` (the docs' `photos/` → `r2/<bucket>/photos/%`).
-pub fn r2_encode(key: &str) -> String {
-    let mut out = String::with_capacity(key.len());
-    for (index, segment) in key.split('/').enumerate() {
-        if index > 0 {
-            out.push('/');
-        }
-        if segment.is_empty() {
-            out.push('%');
-            continue;
-        }
-        for byte in segment.bytes() {
-            if r2_escapable(byte) {
-                out.push('%');
-                out.push(hex_digit(byte >> 4));
-                out.push(hex_digit(byte & 0x0F));
-            } else {
-                out.push(byte as char);
-            }
-        }
-    }
-    out
-}
-
-/// The stored form of a *folder prefix* for a listing. Unlike a key, its
-/// trailing `/` is the parent separator, not an empty segment: `dir/` lists
-/// `…/dir/`, while the key `dir/` would be stored as `…/dir/%`.
-pub fn r2_encode_prefix(prefix: &str) -> String {
-    if prefix.is_empty() {
-        return String::new();
-    }
-    let trimmed = prefix.strip_suffix('/').unwrap_or(prefix);
-    format!("{}/", r2_encode(trimmed))
-}
-
-/// One stored segment back to its key bytes. A lone `%` is the empty
-/// segment celld wrote; a malformed escape (a key another tool wrote) is
-/// kept literally rather than failing the whole page.
-fn r2_decode_segment(segment: &str) -> String {
-    let bytes = segment.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(high), Some(low)) =
-                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
-            {
-                out.push((high << 4) | low);
-                index += 3;
-                continue;
-            }
-        }
-        out.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// The key a stored key names (the inverse of `r2_encode`).
-pub fn r2_decode(stored: &str) -> String {
-    let mut out = String::with_capacity(stored.len());
-    for (index, segment) in stored.split('/').enumerate() {
-        if index > 0 {
-            out.push('/');
-        }
-        if segment == "%" {
-            continue;
-        }
-        out.push_str(&r2_decode_segment(segment));
-    }
-    out
 }
 
 /// A key the browser may write or delete: 1..=1024 bytes, no absolute path
@@ -263,6 +137,23 @@ async fn run_celld(cfg: &Config, args: &[&str], timeout: Duration) -> anyhow::Re
     exec::run_cmd(&cfg.celld_bin, args, None, &env, timeout).await
 }
 
+/// Run one `celld` subcommand that answers bytes (an object body) against
+/// the fleet's own bucket. `run_cmd_stdin` with empty input is the bytes
+/// twin of `run_cmd`: `celld r2 get` never reads stdin, so the closed pipe
+/// is never observed.
+async fn run_celld_bytes(
+    cfg: &Config,
+    args: &[&str],
+    timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    let env_owned = celld_env(cfg);
+    let env: Vec<(&str, &str)> = env_owned
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect();
+    exec::run_cmd_stdin(&cfg.celld_bin, args, &[], None, &env, timeout).await
+}
+
 /// The fleet options every `celld r2` call carries.
 fn fleet_args<'a>(app: &'a App, cfg: &'a Config) -> [&'a str; 4] {
     [
@@ -273,65 +164,100 @@ fn fleet_args<'a>(app: &'a App, cfg: &'a Config) -> [&'a str; 4] {
     ]
 }
 
-/// Split one S3 page into the rows a browser shows: `CommonPrefixes` are the
-/// folders below the listed prefix, `Contents` the files in it. The zero-byte
-/// marker that makes an empty folder visible lands in `Contents` as `<folder>/`
-/// and is dropped — the folder itself comes back as a common prefix. Pure so
-/// the prefix/delimiter rules stay unit-testable without a store.
-fn split_page(
-    s3_prefix: &str,
-    parent: &str,
-    stored_prefixes: &[String],
-    stored_objects: &[s3::S3Object],
-) -> (Vec<R2Folder>, Vec<R2Object>) {
-    let mut folders = Vec::new();
-    for stored in stored_prefixes {
-        let Some(relative) = stored.strip_prefix(s3_prefix) else {
-            continue;
-        };
-        let decoded = r2_decode(relative);
-        // A prefix always ends in `/`; the name is the segment before it, and
-        // an empty one (a key with an empty segment) still browses.
-        let trimmed = decoded.strip_suffix('/').unwrap_or(&decoded);
-        let name = trimmed.rsplit('/').next().unwrap_or("");
-        folders.push(R2Folder {
-            name: if name.is_empty() {
-                "(empty)".to_string()
-            } else {
-                name.to_string()
-            },
-            prefix: format!("{parent}{decoded}"),
-        });
-    }
+/// The `httpMetadata` half of a listed object. Only the content type reaches
+/// the browser; the other headers stay unread rather than unparsed.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CelldHttp {
+    content_type: Option<String>,
+}
+
+/// One object of a `celld r2 list --page` answer: the binding's `list()` row
+/// minus `version`, `checksums` and `storageClass`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CelldPageObject {
+    key: String,
+    size: u64,
+    etag: Option<String>,
+    /// Milliseconds since the epoch, as R2 spells it.
+    uploaded: i64,
+    #[serde(default)]
+    http_metadata: CelldHttp,
+}
+
+/// One `celld r2 list --page` answer: the files in the folder, the prefixes
+/// the delimiter rolled up, and the in-band cursor that continues a
+/// truncated page (absent when the listing is complete).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CelldPage {
+    objects: Vec<CelldPageObject>,
+    delimited_prefixes: Vec<String>,
+    truncated: bool,
+    cursor: Option<String>,
+}
+
+/// The rows a browser shows from one `--page` answer: `delimitedPrefixes`
+/// are the folders below the listed prefix, `objects` the files in it. The
+/// zero-byte marker that makes an empty folder visible answers as an object
+/// whose key is the folder itself and is dropped — the folder comes back as
+/// a prefix. Pure so the shape rules stay unit-testable without a store.
+fn shape_page(app: &App, bucket: &str, prefix: &str, page: CelldPage) -> anyhow::Result<R2Preview> {
+    let mut folders: Vec<R2Folder> = page
+        .delimited_prefixes
+        .into_iter()
+        .map(|entry| {
+            // A prefix always ends in `/`; the name is the segment before
+            // it, and an empty one (a key with an empty segment) still
+            // browses.
+            let trimmed = entry.strip_suffix('/').unwrap_or(&entry);
+            let name = trimmed.rsplit('/').next().unwrap_or("");
+            R2Folder {
+                name: if name.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    name.to_string()
+                },
+                prefix: entry,
+            }
+        })
+        .collect();
     folders.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut objects = Vec::new();
-    for object in stored_objects {
-        let Some(relative) = object.key.strip_prefix(s3_prefix) else {
-            continue;
-        };
-        let key = format!("{parent}{}", r2_decode(relative));
-        if key.ends_with('/') {
+    for object in page.objects {
+        if object.key.ends_with('/') {
             continue;
         }
-        let name = key.rsplit('/').next().unwrap_or("").to_string();
+        let name = object.key.rsplit('/').next().unwrap_or("").to_string();
+        let uploaded = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(object.uploaded)
+            .context("celld r2 list answered an out-of-range upload time")?;
         objects.push(R2Object {
-            key,
+            key: object.key,
             name,
             size: i64::try_from(object.size).unwrap_or(i64::MAX),
-            last_modified: object.last_modified.clone(),
-            content_type: None,
-            etag: Some(object.etag.clone()),
+            last_modified: uploaded.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            content_type: object.http_metadata.content_type,
+            etag: object.etag,
         });
     }
     objects.sort_by(|a, b| a.key.cmp(&b.key));
-    (folders, objects)
+    Ok(R2Preview {
+        app_id: app.id.clone(),
+        app_slug: app.slug.clone(),
+        bucket: bucket.to_string(),
+        prefix: prefix.to_string(),
+        folders,
+        objects,
+        next_cursor: if page.truncated { page.cursor } else { None },
+    })
 }
 
-/// One page of a bucket folder: `CommonPrefixes` are its folders and
-/// `Contents` the files in it (the object stores a key as
-/// `<fleet>/r2/<bucket>/<key>`, so a folder only exists while a key is under
-/// it or a marker object names it).
+/// One page of a bucket folder: the keys below `/` roll up into
+/// `delimitedPrefixes`, the files in the folder answer with their content
+/// types, and the answered `cursor` continues a truncated page past exactly
+/// what it consumed.
 pub async fn r2_list(
     cfg: &Config,
     app: &App,
@@ -344,50 +270,80 @@ pub async fn r2_list(
         anyhow::bail!("invalid prefix");
     }
     let prefix = normalize_prefix(prefix);
-    let base = r2_base(app, bucket);
-    let s3_prefix = format!("{base}{}", r2_encode_prefix(&prefix));
-    let page = s3::s3_list_page(
-        cfg,
-        &cfg.s3_bucket,
-        &s3_prefix,
-        Some("/"),
-        limit.clamp(1, R2_PAGE_LIMIT),
-        cursor,
-    )
-    .await?;
-
-    let (folders, mut objects) = split_page(&s3_prefix, &prefix, &page.prefixes, &page.objects);
-
-    // The listing carries no media type, so ask each visible object for its
-    // record — a page is bounded, head requests are cheap and they run in
-    // parallel. A failure leaves the type unknown rather than failing the page.
-    let full_keys: Vec<String> = objects
-        .iter()
-        .map(|object| format!("{base}{}", r2_encode(&object.key)))
-        .collect();
-    let bucket_name = cfg.s3_bucket.clone();
-    let content_types: Vec<Option<s3::S3Head>> = futures::stream::iter(full_keys)
-        .map(|full| {
-            let bucket_name = bucket_name.clone();
-            async move { s3::s3_head_object(cfg, &bucket_name, &full).await }
-        })
-        .buffered(R2_HEAD_CONCURRENCY)
-        .collect()
-        .await;
-    for (index, head) in content_types.into_iter().enumerate() {
-        if let (Some(object), Some(head)) = (objects.get_mut(index), head) {
-            object.content_type = head.content_type;
-        }
+    let fleet = fleet_args(app, cfg);
+    let limit_arg = limit.clamp(1, R2_PAGE_LIMIT).to_string();
+    let mut args: Vec<&str> = vec![
+        "r2",
+        "list",
+        bucket,
+        "--delimiter",
+        "/",
+        "--page",
+        "--limit",
+        &limit_arg,
+    ];
+    if !prefix.is_empty() {
+        args.push("--prefix");
+        args.push(&prefix);
     }
-    Ok(R2Preview {
-        app_id: app.id.clone(),
-        app_slug: app.slug.clone(),
-        bucket: bucket.to_string(),
-        prefix,
-        folders,
-        objects,
-        next_cursor: page.next,
+    if let Some(token) = cursor {
+        args.push("--cursor");
+        args.push(token);
+    }
+    args.extend(fleet);
+    let out = run_celld(cfg, &args, CELD_TIMEOUT).await?;
+    let page: CelldPage = serde_json::from_str(&out).context("parse celld r2 list --page")?;
+    shape_page(app, bucket, &prefix, page)
+}
+
+/// One object record as `celld r2 head --json` reports it: the size (a
+/// single-key lookup has no listing) and the real `content-type` header the
+/// record carries.
+struct R2Head {
+    size: u64,
+    content_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CelldHead {
+    size: u64,
+    #[serde(default)]
+    http: CelldHttp,
+}
+
+/// The record for one key, or the not-found bail the service maps to 404.
+/// celld reports a missing key as `no object …` on stderr with exit 1.
+async fn r2_head(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow::Result<R2Head> {
+    let fleet = fleet_args(app, cfg);
+    let mut args: Vec<&str> = vec!["r2", "head", bucket, key, "--json"];
+    args.extend(fleet);
+    let out = match run_celld(cfg, &args, CELD_TIMEOUT).await {
+        Ok(out) => out,
+        Err(error) if format!("{error:#}").contains("no object") => {
+            anyhow::bail!("object not found")
+        }
+        Err(error) => return Err(error),
+    };
+    let head: CelldHead = serde_json::from_str(&out).context("parse celld r2 head --json")?;
+    Ok(R2Head {
+        size: head.size,
+        content_type: head.http.content_type,
     })
+}
+
+/// One object's bytes, or the not-found bail when a racing delete removed
+/// the key between the head and the read.
+async fn r2_get_bytes(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow::Result<Vec<u8>> {
+    let fleet = fleet_args(app, cfg);
+    let mut args: Vec<&str> = vec!["r2", "get", bucket, key];
+    args.extend(fleet);
+    match run_celld_bytes(cfg, &args, CELD_UPLOAD_TIMEOUT).await {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if format!("{error:#}").contains("no object") => {
+            anyhow::bail!("object not found")
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Download one object's bytes (capped) and the media type to re-serve it.
@@ -395,14 +351,11 @@ pub async fn r2_raw(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow:
     if !r2_key_ok(key) {
         anyhow::bail!("invalid key");
     }
-    let full = format!("{}{}", r2_base(app, bucket), r2_encode(key));
-    let Some(head) = s3::s3_head_object(cfg, &cfg.s3_bucket, &full).await else {
-        anyhow::bail!("object not found");
-    };
-    if head.size > R2_RAW_CAP {
+    let head = r2_head(cfg, app, bucket, key).await?;
+    if head.size > R2_RAW_CAP as u64 {
         anyhow::bail!("object too large to download");
     }
-    let bytes = s3::s3_get_bytes(cfg, &full).await?;
+    let bytes = r2_get_bytes(cfg, app, bucket, key).await?;
     Ok(R2Raw {
         bytes,
         content_type: head.content_type,
@@ -414,17 +367,13 @@ pub async fn r2_get(cfg: &Config, app: &App, bucket: &str, key: &str) -> anyhow:
     if !r2_key_ok(key) {
         anyhow::bail!("invalid key");
     }
-    let full = format!("{}{}", r2_base(app, bucket), r2_encode(key));
-    // Size-gate before downloading so a stray multi-GB object can't OOM us.
-    let Some(head) = s3::s3_head_object(cfg, &cfg.s3_bucket, &full).await else {
-        anyhow::bail!("object not found");
-    };
-    let bytes = s3::s3_get_bytes(cfg, &full).await?;
+    let head = r2_head(cfg, app, bucket, key).await?;
+    let bytes = r2_get_bytes(cfg, app, bucket, key).await?;
     let truncated = bytes.len() > R2_PREVIEW_CAP;
     let preview = &bytes[..bytes.len().min(R2_PREVIEW_CAP)];
     Ok(R2File {
         key: key.to_string(),
-        size: head.size,
+        size: i64::try_from(head.size).unwrap_or(i64::MAX),
         truncated,
         content_type: head.content_type,
         text: String::from_utf8(preview.to_vec()).ok(),
@@ -497,74 +446,346 @@ pub async fn r2_delete_many(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
-    /// Stored forms captured from celld 0.6.1: `celld r2 put` for each key,
-    /// then a raw `ListObjectsV2`. The encoder must reproduce them byte for
-    /// byte, and the decoder must bring them back — a browser that lists S3
-    /// directly depends on both.
-    const VECTORS: [(&str, &str); 29] = [
-        ("a//b", "a/%/b"),
-        ("photos/", "photos/%"),
-        ("a//", "a/%/%"),
-        ("accent-é", "accent-%C3%A9"),
-        ("back\\slash", "back%5Cslash"),
-        ("brace{}", "brace%7B%7D"),
-        ("brack[et]", "brack%5Bet%5D"),
-        ("caret^", "caret%5E"),
-        ("grave`x", "grave%60x"),
-        ("hash#tag", "hash%23tag"),
-        ("lt<gt>", "lt%3Cgt%3E"),
-        ("percent%25", "percent%2525"),
-        ("pic name+café (1).png", "pic name+caf%C3%A9 (1).png"),
-        ("pipe|x", "pipe%7Cx"),
-        ("q?mark", "q%3Fmark"),
-        ("quote\"z", "quote%22z"),
-        ("star*", "star%2A"),
-        ("tilde~x", "tilde%7Ex"),
-        ("deep/nested/x.txt", "deep/nested/x.txt"),
-        // Left literal by celld.
-        ("sp ace.txt", "sp ace.txt"),
-        ("plus+sign", "plus+sign"),
-        ("amp&and", "amp&and"),
-        ("at@x", "at@x"),
-        ("colon:y", "colon:y"),
-        ("comma,x", "comma,x"),
-        ("bang!", "bang!"),
-        ("semi;x", "semi;x"),
-        ("dollar$x", "dollar$x"),
-        ("paren(1)", "paren(1)"),
-    ];
-
-    #[test]
-    fn keys_encode_and_decode_the_way_celld_stores_them() {
-        for (key, stored) in VECTORS {
-            assert_eq!(r2_encode(key), stored, "encode {key}");
-            assert_eq!(r2_decode(stored), key, "decode {stored}");
+    fn test_app() -> App {
+        App {
+            id: "app-r2".into(),
+            slug: "r2app".into(),
+            name: "r2app".into(),
+            user_id: "local".into(),
+            status: "running".into(),
+            subdomain: "r2app.localhost".into(),
+            git_prefix: "git/r2app".into(),
+            fleet_bucket: "s3://noite/fleets/r2app".into(),
+            listen_port: None,
+            internal_port: None,
+            last_deploy_sha: None,
+            last_error: None,
+            desired_state: "running".into(),
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            asleep_since: None,
+            woke_at: None,
+            deployed_config: None,
+            import_source: None,
+            imported: false,
         }
     }
 
-    #[test]
-    fn listing_prefixes_keep_their_trailing_separator() {
-        // A key `photos/` is stored as `photos/%`, but a *listing* of the
-        // folder `photos/` must ask for `photos/` — the separator, not an
-        // empty segment — or every object under it is missed.
-        assert_eq!(r2_encode_prefix(""), "");
-        assert_eq!(r2_encode_prefix("dir/"), "dir/");
-        assert_eq!(r2_encode_prefix("e2e-probe/"), "e2e-probe/");
-        assert_eq!(r2_encode_prefix("my docs/"), "my docs/");
-        assert_eq!(r2_encode_prefix("café/"), "caf%C3%A9/");
-        assert_eq!(r2_encode_prefix("a//"), "a/%/");
-        assert_eq!(r2_encode_prefix("a//b/"), "a/%/b/");
-        assert_eq!(r2_encode("photos/"), "photos/%");
+    /// A fake `celld`: appends its argv to `invocations.log`, fails once
+    /// when `fail-next` exists (file content to stderr, exit 1), and
+    /// otherwise answers `list`/`head` from `<verb>.json` and `get` from
+    /// `body.bin`. Fixtures live next to the script so no env injection is
+    /// needed — the runner clears the environment it spawns with.
+    const FAKE_CELLD: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$*" >> "$dir/invocations.log"
+if [ -f "$dir/fail-next" ]; then cat "$dir/fail-next" >&2; rm "$dir/fail-next"; exit 1; fi
+case "$2" in
+  list) cat "$dir/list.json";;
+  head) cat "$dir/head.json";;
+  get) cat "$dir/body.bin";;
+  *) echo "unexpected: $*" >&2; exit 1;;
+esac
+"#;
+
+    struct FakeCelld {
+        dir: PathBuf,
     }
 
+    impl FakeCelld {
+        fn spawn() -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("noite-fake-r2-celld-{}", crate::models::new_id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let bin = dir.join("celld");
+            std::fs::write(&bin, FAKE_CELLD).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            Self { dir }
+        }
+
+        fn cfg(&self) -> Config {
+            let mut cfg = crate::config::config_for_tests();
+            cfg.celld_bin = self.dir.join("celld").to_string_lossy().into_owned();
+            cfg
+        }
+
+        fn write(&self, name: &str, bytes: &[u8]) {
+            std::fs::write(self.dir.join(name), bytes).unwrap();
+        }
+
+        fn fail_next(&self, message: &str) {
+            self.write("fail-next", message.as_bytes());
+        }
+
+        fn invocations(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.join("invocations.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    impl Drop for FakeCelld {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The root page a real fork binary answered (shape captured from
+    /// 0.6.3-ryuzcorp.6): folders roll up sorted by name, files carry
+    /// their content types, the folder marker answers as an object and is
+    /// dropped, and a complete page carries no cursor.
     #[test]
-    fn malformed_escapes_stay_literal() {
-        // Another tool wrote an object under a key celld cannot name; the page
-        // still renders instead of failing.
-        assert_eq!(r2_decode_segment("a%ZZ"), "a%ZZ");
-        assert_eq!(r2_decode_segment("50%"), "50%");
+    fn page_shapes_folders_files_and_content_types() {
+        let page: CelldPage = serde_json::from_str(
+            r#"{"delimitedPrefixes":["photos/","dir/","a/"],"objects":[
+{"key":"top.txt","size":6,"etag":"\"abc\"","uploaded":1767225600000,"httpMetadata":{"contentType":"text/plain"},"customMetadata":{}},
+{"key":"photos/","size":0,"etag":"\"d41\"","uploaded":1767225600000,"httpMetadata":{},"customMetadata":{}},
+{"key":"bin.dat","size":9,"etag":null,"uploaded":1767225601000,"httpMetadata":{},"customMetadata":{}}
+],"truncated":false}"#,
+        )
+        .unwrap();
+        let preview = shape_page(&test_app(), "uploads", "", page).unwrap();
+        let names: Vec<String> = preview
+            .folders
+            .iter()
+            .map(|folder| folder.name.clone())
+            .collect();
+        assert_eq!(names, ["a", "dir", "photos"]);
+        assert_eq!(preview.folders[0].prefix, "a/");
+        let keys: Vec<String> = preview
+            .objects
+            .iter()
+            .map(|object| object.key.clone())
+            .collect();
+        assert_eq!(keys, ["bin.dat", "top.txt"]);
+        assert_eq!(preview.objects[1].name, "top.txt");
+        assert_eq!(preview.objects[1].size, 6);
+        assert_eq!(
+            preview.objects[1].content_type.as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(preview.objects[1].etag.as_deref(), Some("\"abc\""));
+        assert_eq!(preview.objects[1].last_modified, "2026-01-01T00:00:00.000Z");
+        assert_eq!(preview.objects[0].content_type, None);
+        assert_eq!(preview.objects[0].etag, None);
+        assert_eq!(preview.objects[0].last_modified, "2026-01-01T00:00:01.000Z");
+        assert_eq!(preview.next_cursor, None);
+    }
+
+    /// The truncated shape (`--limit 2` against the real binary): the
+    /// cursor is in-band only while the page is truncated.
+    #[test]
+    fn truncated_page_carries_its_cursor() {
+        let page: CelldPage = serde_json::from_str(
+            r#"{"delimitedPrefixes":["a/","dir/"],"objects":[],"truncated":true,"cursor":"dir/hello.txt"}"#,
+        )
+        .unwrap();
+        let preview = shape_page(&test_app(), "uploads", "", page).unwrap();
+        assert_eq!(preview.next_cursor.as_deref(), Some("dir/hello.txt"));
+    }
+
+    /// The `a/` listing answers the empty segment as the `a//` prefix,
+    /// which keeps its old label.
+    #[test]
+    fn empty_segment_prefix_browses_as_empty() {
+        let page: CelldPage =
+            serde_json::from_str(r#"{"delimitedPrefixes":["a//"],"objects":[],"truncated":false}"#)
+                .unwrap();
+        let preview = shape_page(&test_app(), "uploads", "a/", page).unwrap();
+        assert_eq!(preview.folders.len(), 1);
+        assert_eq!(preview.folders[0].name, "(empty)");
+        assert_eq!(preview.folders[0].prefix, "a//");
+        assert!(preview.objects.is_empty());
+        assert_eq!(preview.prefix, "a/");
+    }
+
+    /// A listing runs exactly the fork's spelling: delimiter, page shape,
+    /// limit and prefix, with the fleet's bucket and endpoint — and the
+    /// answered page shapes into folders, files and no cursor.
+    #[tokio::test]
+    async fn list_shells_out_to_celld_r2_list() {
+        let fake = FakeCelld::spawn();
+        fake.write(
+            "list.json",
+            br#"{"delimitedPrefixes":["dir/"],"objects":[{"key":"top.txt","size":6,"etag":null,"uploaded":1767225600000,"httpMetadata":{"contentType":"text/plain"}}],"truncated":false}"#,
+        );
+        let preview = r2_list(&fake.cfg(), &test_app(), "uploads", "", None, 100)
+            .await
+            .unwrap();
+        assert_eq!(preview.objects.len(), 1);
+        assert_eq!(
+            preview.objects[0].content_type.as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(preview.folders.len(), 1);
+        assert_eq!(preview.next_cursor, None);
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(
+            calls[0].starts_with("r2 list uploads --delimiter / --page --limit 100"),
+            "{calls:?}"
+        );
+        assert!(
+            calls[0].contains("--bucket s3://noite/fleets/r2app"),
+            "{calls:?}"
+        );
+        assert!(
+            calls[0].contains("--endpoint http://rustfs:9000"),
+            "{calls:?}"
+        );
+        assert!(!calls[0].contains("--prefix"), "{calls:?}");
+        assert!(!calls[0].contains("--cursor"), "{calls:?}");
+    }
+
+    /// Prefix navigation and paging ride on `--prefix`/`--cursor`: the
+    /// second page is asked for the cursor the first one answered.
+    #[tokio::test]
+    async fn list_pages_with_prefix_and_cursor() {
+        let fake = FakeCelld::spawn();
+        fake.write(
+            "list.json",
+            br#"{"delimitedPrefixes":[],"objects":[{"key":"dir/a.txt","size":1,"etag":null,"uploaded":1767225600000,"httpMetadata":{}}],"truncated":true,"cursor":"dir/a.txt"}"#,
+        );
+        let first = r2_list(&fake.cfg(), &test_app(), "uploads", "dir/", None, 1)
+            .await
+            .unwrap();
+        assert_eq!(first.prefix, "dir/");
+        assert_eq!(first.next_cursor.as_deref(), Some("dir/a.txt"));
+        fake.write(
+            "list.json",
+            br#"{"delimitedPrefixes":[],"objects":[{"key":"dir/b.txt","size":2,"etag":null,"uploaded":1767225600000,"httpMetadata":{}}],"truncated":false}"#,
+        );
+        let second = r2_list(
+            &fake.cfg(),
+            &test_app(),
+            "uploads",
+            "dir/",
+            first.next_cursor.as_deref(),
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.objects[0].key, "dir/b.txt");
+        assert_eq!(second.next_cursor, None);
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[0].contains("--prefix dir/"), "{calls:?}");
+        assert!(calls[0].contains("--limit 1"), "{calls:?}");
+        assert!(calls[1].contains("--cursor dir/a.txt"), "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn invalid_prefix_bails_before_spawning() {
+        let fake = FakeCelld::spawn();
+        let error = r2_list(&fake.cfg(), &test_app(), "uploads", "../", None, 100)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("invalid prefix"));
+        assert!(fake.invocations().is_empty());
+    }
+
+    /// A preview is a head for the record plus a get for the bytes.
+    #[tokio::test]
+    async fn get_returns_preview_and_content_type() {
+        let fake = FakeCelld::spawn();
+        fake.write(
+            "head.json",
+            br#"{"key":"dir/a.txt","size":6,"etag":"\"abc\"","uploaded":1767225600000,"http":{"contentType":"text/plain"},"custom":{}}"#,
+        );
+        fake.write("body.bin", b"hello\n");
+        let file = r2_get(&fake.cfg(), &test_app(), "uploads", "dir/a.txt")
+            .await
+            .unwrap();
+        assert_eq!(file.size, 6);
+        assert_eq!(file.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(file.text.as_deref(), Some("hello\n"));
+        assert!(!file.truncated);
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(
+            calls[0].starts_with("r2 head uploads dir/a.txt --json"),
+            "{calls:?}"
+        );
+        assert!(
+            calls[1].starts_with("r2 get uploads dir/a.txt"),
+            "{calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_reports_binary_bodies_as_no_text() {
+        let fake = FakeCelld::spawn();
+        fake.write("head.json", br#"{"key":"bin.dat","size":3,"http":{}}"#);
+        fake.write("body.bin", &[0xff, 0xfe, 0x00]);
+        let file = r2_get(&fake.cfg(), &test_app(), "uploads", "bin.dat")
+            .await
+            .unwrap();
+        assert_eq!(file.size, 3);
+        assert_eq!(file.text, None);
+        assert_eq!(file.content_type, None);
+    }
+
+    #[tokio::test]
+    async fn raw_serves_bytes_and_refuses_over_the_cap() {
+        let fake = FakeCelld::spawn();
+        fake.write(
+            "head.json",
+            br#"{"key":"logo.png","size":4,"http":{"contentType":"image/png"}}"#,
+        );
+        fake.write("body.bin", &[0x89, b'P', b'N', b'G']);
+        let raw = r2_raw(&fake.cfg(), &test_app(), "uploads", "logo.png")
+            .await
+            .unwrap();
+        assert_eq!(raw.bytes, vec![0x89, b'P', b'N', b'G']);
+        assert_eq!(raw.content_type.as_deref(), Some("image/png"));
+
+        fake.write(
+            "head.json",
+            format!(
+                r#"{{"key":"huge.bin","size":{},"http":{{}}}}"#,
+                R2_RAW_CAP + 1
+            )
+            .as_bytes(),
+        );
+        let error = r2_raw(&fake.cfg(), &test_app(), "uploads", "huge.bin")
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("object too large"));
+        // The refused key never downloads: two heads and one get.
+        assert_eq!(fake.invocations().len(), 3);
+    }
+
+    /// celld reports a missing key as `no object …` with exit 1; the
+    /// runner keeps the old `object not found` the service maps to 404.
+    #[tokio::test]
+    async fn missing_keys_read_as_not_found() {
+        let fake = FakeCelld::spawn();
+        fake.fail_next("Error: no object \"gone.txt\" in r2 bucket \"uploads\"");
+        let error = r2_get(&fake.cfg(), &test_app(), "uploads", "gone.txt")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("object not found"),
+            "{error:#}"
+        );
+        fake.fail_next("Error: no object \"gone.txt\" in r2 bucket \"uploads\"");
+        let error = r2_raw(&fake.cfg(), &test_app(), "uploads", "gone.txt")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("object not found"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -596,51 +817,6 @@ mod tests {
         assert!(r2_header_ok("image/png"));
         assert!(!r2_header_ok("image/png\r\nx: y"));
         assert!(!r2_header_ok(""));
-    }
-
-    fn stored(key: &str) -> s3::S3Object {
-        s3::S3Object {
-            key: key.to_string(),
-            last_modified: "2026-10-06T11:00:57.528Z".to_string(),
-            size: 15,
-            etag: "etag".to_string(),
-        }
-    }
-
-    #[test]
-    fn a_page_splits_into_folders_then_files() {
-        let base = "fleets/app/r2/bucket/";
-        let prefixes = vec![
-            format!("{base}dir/"),
-            format!("{base}a/"),
-            "fleets/other/r2/bucket/dir/".to_string(),
-        ];
-        let objects = vec![
-            stored(&format!("{base}dir/hello.txt")),
-            stored(&format!("{base}photos/%")),
-            stored(&format!("{base}pic name+caf%C3%A9 (1).png")),
-        ];
-        let (folders, objects) = split_page(base, "", &prefixes, &objects);
-        let names: Vec<String> = folders.iter().map(|folder| folder.name.clone()).collect();
-        assert_eq!(names, ["a", "dir"]);
-        assert_eq!(folders[0].prefix, "a/");
-        let keys: Vec<String> = objects.iter().map(|object| object.key.clone()).collect();
-        assert_eq!(keys, ["dir/hello.txt", "pic name+café (1).png"]);
-        assert_eq!(objects[0].name, "hello.txt");
-        assert_eq!(objects[0].size, 15);
-    }
-
-    #[test]
-    fn an_empty_segment_folder_browses_as_empty() {
-        let base = "fleets/app/r2/bucket/a/";
-        let prefixes = vec![format!("{base}%/")];
-        let (folders, objects) =
-            split_page(base, "a/", &prefixes, &[stored(&format!("{base}%/b"))]);
-        assert_eq!(folders[0].name, "(empty)");
-        assert_eq!(folders[0].prefix, "a//");
-        // A key with an empty segment round-trips through the parent prefix.
-        assert_eq!(objects[0].key, "a//b");
-        assert_eq!(objects[0].name, "b");
     }
 
     #[test]
