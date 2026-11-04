@@ -311,9 +311,17 @@ pub fn control_fleet_env(input: &ControlFleetEnv<'_>) -> Vec<(String, String)> {
     env
 }
 
-/// `CELLD_*` names the runner itself reads; every other `CELLD_*` in its
-/// env reaches no fleet.
-const RUNNER_READ_CELLD: &[&str] = &["CELLD_BIN", "CELLD_ADVERTISE"];
+/// `CELLD_*` names the boot warning leaves alone: the ones the runner
+/// itself reads (`CELLD_BIN`, `CELLD_ADVERTISE`, and `CELLD_VERSION`,
+/// which telemetry reports), and `CELLD_ESBUILD`, which the image sets as a
+/// default nobody needs to act on (fleets and `celld` CLIs find esbuild on
+/// `PATH`). Every other `CELLD_*` in the runner's env reaches no fleet.
+const NOT_WARNED_CELLD: &[&str] = &[
+    "CELLD_BIN",
+    "CELLD_ADVERTISE",
+    "CELLD_VERSION",
+    "CELLD_ESBUILD",
+];
 
 /// The `CELLD_*` names in `keys` that no fleet will see: fleets get only
 /// the knobs the runner sets (`RUNNER_FLEET_*` and friends), so an
@@ -321,7 +329,7 @@ const RUNNER_READ_CELLD: &[&str] = &["CELLD_BIN", "CELLD_ADVERTISE"];
 /// these names, sorted, rather than ignoring them silently.
 pub fn ignored_celld_vars(keys: impl Iterator<Item = String>) -> Vec<String> {
     let mut ignored: Vec<String> = keys
-        .filter(|key| key.starts_with("CELLD_") && !RUNNER_READ_CELLD.contains(&key.as_str()))
+        .filter(|key| key.starts_with("CELLD_") && !NOT_WARNED_CELLD.contains(&key.as_str()))
         .collect();
     ignored.sort();
     ignored.dedup();
@@ -719,6 +727,8 @@ mod tests {
     fn ignored_celld_vars_names_what_no_fleet_sees() {
         let keys = [
             "CELLD_TOKIO_THREADS",
+            "CELLD_VERSION",
+            "CELLD_ESBUILD",
             "CELLD_BIN",
             "PATH",
             "CELLD_ADVERTISE",
