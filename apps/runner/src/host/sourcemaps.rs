@@ -6,12 +6,15 @@
 //!
 //! * Worker: the deploy passes `--sourcemap <path>` to `celld deploy`, which
 //!   writes the bundled Worker's external map with project-root-relative
-//!   sources (the deployed bytes are identical with or without the flag).
-//!   The runner stores that map, chained through the build's own map when
-//!   the entry carries one (a Vite worker build already maps to the original
-//!   sources). A missing map file means celld had nothing to map
-//!   (asset-only, `no_bundle`, or Python projects warn and write nothing),
-//!   so those deploys store no worker map.
+//!   sources (the deployed bytes are identical with or without the flag) —
+//!   and, for a `no_bundle` entry, collects the entry's sibling
+//!   `<entry>.map` the same way. The runner stores that map, chained
+//!   through the build's own map when the entry carries one (a Vite worker
+//!   build already maps to the original sources; a collected `no_bundle`
+//!   map chains as a pass-through, its sources already original). A missing
+//!   map file means celld had nothing to map (asset-only or Python projects
+//!   warn and write nothing, as does a `no_bundle` entry without a sibling
+//!   map celld accepts), so those deploys store no worker map.
 //! * Browser: only maps the app's build emitted are collected (e.g. Vite
 //!   `build.sourcemap: "hidden"`). Maps are never generated for client code,
 //!   and what the build serves publicly is unchanged.
@@ -1010,10 +1013,12 @@ pub(crate) struct WorkerMap {
 
 /// Read the Worker map `celld deploy --sourcemap` wrote: chained through the
 /// entry's own map when the build emitted one (a Vite worker build already
-/// maps to the original sources), sanitized like any stored map. `None` when
-/// the map file is missing — celld warns and writes nothing for asset-only,
-/// `no_bundle`, and Python projects, so those deploys store no worker map.
-/// Runs after a successful deploy; the bytes upload with the rest of the maps.
+/// maps to the original sources; a collected `no_bundle` map chains as a
+/// pass-through), sanitized like any stored map. `None` when the map file is
+/// missing — celld warns and writes nothing for asset-only and Python
+/// projects, and for a `no_bundle` entry without a sibling map it accepts —
+/// so those deploys store no worker map. Runs after a successful deploy; the
+/// bytes upload with the rest of the maps.
 pub(crate) async fn read_celld_worker_map(
     deploy_root: &Path,
     map_path: &Path,
@@ -1255,7 +1260,8 @@ pub async fn store_deploy_maps(
             notes.push(format!("{} ({})", WORKER_MAP_FILE, built.note));
         }
         Ok(None) => notes.push(
-            "no worker map (celld wrote no map: asset-only, no_bundle, or Python)".to_string(),
+            "no worker map (celld wrote no map: asset-only, Python, or no_bundle without a sibling map)"
+                .to_string(),
         ),
         Err(note) => notes.push(format!("no worker map ({note})")),
     }
@@ -1467,8 +1473,9 @@ mod tests {
 
     #[tokio::test]
     async fn missing_celld_map_means_no_worker_map() {
-        // celld warns and writes nothing for asset-only, `no_bundle`, and
-        // Python projects: a missing file is `None`, never an error.
+        // celld warns and writes nothing for asset-only and Python projects
+        // (and for a `no_bundle` entry without a sibling map it accepts):
+        // a missing file is `None`, never an error.
         let dir =
             std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -1477,6 +1484,60 @@ mod tests {
             .await
             .expect("missing is not an error");
         assert!(found.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `no_bundle` entry map stores again: celld collects the entry's
+    /// sibling map (sources already project-root-relative), and the read
+    /// keeps it — chaining passes through the tokens that never named the
+    /// entry, so the stored map still resolves to the original sources.
+    #[tokio::test]
+    async fn no_bundle_entry_map_stores_through_the_collected_sibling() {
+        let dir =
+            std::env::temp_dir().join(format!("noite-sourcemap-test-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("app");
+        std::fs::create_dir_all(root.join("dist")).expect("entry dir");
+        std::fs::write(
+            root.join("wrangler.json"),
+            "{\"main\": \"./dist/worker.js\", \"no_bundle\": true}",
+        )
+        .expect("config");
+        std::fs::write(root.join("dist").join("worker.js"), "console.log(1);").expect("entry");
+        // The build's own map: entry line 0 → original source line 2.
+        let mut sibling_bytes = Vec::new();
+        built_map(&[((0, 5), ("src/index.ts", 2, 0), Some("realFn"))])
+            .to_writer(&mut sibling_bytes)
+            .expect("sibling map");
+        std::fs::write(root.join("dist").join("worker.js.map"), &sibling_bytes).expect("sibling");
+        // celld's collection: the sibling's mappings, sources rebased to
+        // project-root-relative — already the originals here.
+        let map_path = dir.join("worker.js.map");
+        std::fs::write(&map_path, &sibling_bytes).expect("celld map");
+
+        let built = read_celld_worker_map(&root, &map_path)
+            .await
+            .expect("readable")
+            .expect("a map");
+        assert!(built.note.contains("celld map"), "{}", built.note);
+        let stored = sourcemap::SourceMap::from_slice(&built.map).expect("stored map parses");
+        let manifest = MapManifest {
+            worker: Some("worker.js.map".to_string()),
+            assets_dir: None,
+            files: HashMap::new(),
+        };
+        let load = |_: &str| Some(Arc::new(stored.clone()));
+        // The deployed throw site, 1-based as V8 prints it.
+        let mut frames = vec![frame_at("worker.js:1:6")];
+        let mut budget = SymbolicateBudget::for_read();
+        assert_eq!(
+            symbolicate_with(&mut frames, &manifest, &load, &mut budget),
+            1
+        );
+        assert_eq!(
+            frames[0].mapped_location.as_deref(),
+            Some("src/index.ts:3:1")
+        );
+        assert_eq!(frames[0].mapped_function.as_deref(), Some("realFn"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

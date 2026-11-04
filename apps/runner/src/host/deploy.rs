@@ -1178,8 +1178,9 @@ async fn deploy_inner(
     };
     // The Worker map celld writes for the Errors tab: in the work dir beside
     // the checkout, never inside the deploy root. celld warns and writes
-    // nothing for asset-only, `no_bundle`, and Python projects; a missing
-    // file below then means no worker map.
+    // nothing for asset-only and Python projects, and for a `no_bundle`
+    // entry without a sibling map it accepts; a missing file below then
+    // means no worker map.
     let worker_map_path = work.join("worker.js.map");
     // A tenant build script runs with the whole work dir writable, so it may
     // have planted this path — a decoy file celld would leave in place for
