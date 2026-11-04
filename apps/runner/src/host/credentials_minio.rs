@@ -29,7 +29,7 @@ impl MinioAdmin {
     /// from the configured store, never from a row.
     pub fn rustfs(store: StoreAccess, bucket: &str) -> Self {
         Self {
-            tag: super::install_tag(&store.endpoint, bucket, &store.region),
+            tag: super::install_tag(&store.identity_endpoint, bucket, &store.region),
             store,
             label: "rustfs",
             client: reqwest::Client::new(),
@@ -39,7 +39,7 @@ impl MinioAdmin {
     /// Any other MinIO-family store (MinIO itself, another RustFS).
     pub fn minio(store: StoreAccess, bucket: &str) -> Self {
         Self {
-            tag: super::install_tag(&store.endpoint, bucket, &store.region),
+            tag: super::install_tag(&store.identity_endpoint, bucket, &store.region),
             store,
             label: "minio",
             client: reqwest::Client::new(),
@@ -507,6 +507,7 @@ mod tests {
     use super::*;
     fn stub_store(endpoint: String) -> StoreAccess {
         StoreAccess {
+            identity_endpoint: endpoint.clone(),
             endpoint,
             region: "us-east-1".into(),
             access_key: "AK".into(),
@@ -693,6 +694,7 @@ mod tests {
         });
         let store = StoreAccess {
             endpoint: format!("http://127.0.0.1:{}", addr.port()),
+            identity_endpoint: format!("http://127.0.0.1:{}", addr.port()),
             region: "us-east-1".into(),
             access_key: "AK".into(),
             secret_key: "SK".into(),
@@ -760,6 +762,7 @@ mod tests {
         let root = "noitea0123456789ABCD".to_string();
         let store = StoreAccess {
             endpoint: "http://rustfs:9000".into(),
+            identity_endpoint: "http://rustfs:9000".into(),
             region: "us-east-1".into(),
             access_key: root.clone(),
             secret_key: "secret".into(),
@@ -955,6 +958,7 @@ mod tests {
         use std::sync::Arc;
         let store = || StoreAccess {
             endpoint: String::new(),
+            identity_endpoint: String::new(),
             region: "us-east-1".into(),
             access_key: "AK".into(),
             secret_key: "SK".into(),
@@ -968,6 +972,7 @@ mod tests {
         );
         let mut store_a = store();
         store_a.endpoint.clone_from(&endpoint);
+        store_a.identity_endpoint.clone_from(&endpoint);
         let store_b = store_a.clone();
         let provider_a = MinioAdmin::minio(store_a, "bucket-a");
         let provider_b = MinioAdmin::minio(store_b, "bucket-b");
@@ -1123,6 +1128,7 @@ mod tests {
         };
         let provider = MinioAdmin::rustfs(
             StoreAccess {
+                identity_endpoint: endpoint.clone(),
                 endpoint,
                 region: "us-east-1".into(),
                 access_key: root_access.clone(),

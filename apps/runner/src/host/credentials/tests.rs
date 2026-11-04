@@ -855,6 +855,7 @@ fn provider_setting_parses_with_problems() {
 fn auto_resolution_matrix() {
     let store = StoreAccess {
         endpoint: "http://rustfs:9000".into(),
+        identity_endpoint: "http://rustfs:9000".into(),
         region: "us-east-1".into(),
         access_key: "a".into(),
         secret_key: "b".into(),
@@ -919,6 +920,7 @@ async fn scoped_key_enforced_by_rustfs() {
     };
     let store = StoreAccess {
         endpoint: endpoint.clone(),
+        identity_endpoint: endpoint.clone(),
         region: "us-east-1".into(),
         access_key: root_access.clone(),
         secret_key: root_secret.clone(),
@@ -1529,4 +1531,32 @@ async fn ensured_token_serves_pool_less_callers() {
         "other scopes still miss"
     );
     pool.close().await;
+}
+
+/// Stripping `S3_ENDPOINT` userinfo changes only what requests use: the
+/// install tag and the store id still come from the endpoint as
+/// configured, so an install that carried userinfo keeps its tag and its
+/// stored keys still match their store and stay revocable.
+#[test]
+fn stripping_endpoint_userinfo_keeps_the_store_identity() {
+    let configured = "http://user:pass@rustfs:9000";
+    let mut cfg = config_for_tests();
+    cfg.s3_endpoint_as_configured = configured.into();
+    cfg.s3_endpoint = crate::config::strip_endpoint_userinfo(configured);
+    let store = StoreAccess::from_config(&cfg);
+    assert_eq!(
+        store.endpoint, "http://rustfs:9000",
+        "requests use no userinfo"
+    );
+    let provider = super::MinioAdmin::minio(store, &cfg.s3_bucket);
+    assert_eq!(
+        provider.install_tag(),
+        super::install_tag(configured, &cfg.s3_bucket, &cfg.aws_region),
+        "the tag is the one the configured endpoint always produced"
+    );
+    assert_eq!(
+        super::store_id(&cfg, &provider),
+        format!("{}|{configured}|{}", provider.name(), cfg.s3_bucket),
+        "stored rows keep matching their store"
+    );
 }

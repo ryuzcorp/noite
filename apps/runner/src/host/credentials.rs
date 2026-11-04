@@ -210,7 +210,12 @@ pub const BUNDLED_ENDPOINT: &str = "http://rustfs:9000";
 /// Root S3 access the providers act with.
 #[derive(Clone)]
 pub struct StoreAccess {
+    /// The endpoint requests and provider detection use: no userinfo.
     pub endpoint: String,
+    /// The endpoint as configured, which the install tag hashes, so the
+    /// tag stays what it was before userinfo stopped being used
+    /// (`Config::s3_endpoint_as_configured`).
+    pub identity_endpoint: String,
     pub region: String,
     pub access_key: String,
     pub secret_key: String,
@@ -220,6 +225,7 @@ impl StoreAccess {
     pub fn from_config(cfg: &Config) -> Self {
         Self {
             endpoint: cfg.s3_endpoint.clone(),
+            identity_endpoint: cfg.s3_endpoint_as_configured.clone(),
             region: cfg.aws_region.clone(),
             access_key: cfg.aws_access_key_id.clone(),
             secret_key: cfg.aws_secret_access_key.clone(),
@@ -459,12 +465,14 @@ pub fn install_tag(endpoint: &str, bucket: &str, region: &str) -> String {
 }
 
 /// Which store a key lives in: a key minted against another provider,
-/// endpoint or bucket is not one this runner can use or revoke.
+/// endpoint or bucket is not one this runner can use or revoke. Built from
+/// the endpoint as configured, like the install tag, so rows stored before
+/// userinfo stopped being used still match and still get revoked.
 fn store_id(cfg: &Config, provider: &dyn CredentialProvider) -> String {
     format!(
         "{}|{}|{}",
         provider.name(),
-        cfg.s3_endpoint.trim_end_matches('/'),
+        cfg.s3_endpoint_as_configured.trim_end_matches('/'),
         cfg.s3_bucket
     )
 }

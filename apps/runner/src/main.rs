@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&config.work_dir).await.ok();
     // Config strips `S3_ENDPOINT` userinfo; say so rather than drop it
     // silently (the store authenticates with the access keys).
-    if std::env::var("S3_ENDPOINT").is_ok_and(|raw| raw != config.s3_endpoint) {
+    if config.s3_endpoint_as_configured != config.s3_endpoint {
         tracing::warn!(
             "S3_ENDPOINT credentials ignored: the store authenticates with \
              AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY; remove them from the URL"

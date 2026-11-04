@@ -803,6 +803,11 @@ pub struct Config {
     pub runner_token: String,
     pub database_url: String,
     pub s3_endpoint: String,
+    /// `S3_ENDPOINT` exactly as configured, userinfo included. Only the
+    /// store identity reads it (the scoped-credential install tag and store
+    /// id), so stripping userinfo for use never re-tags an install or
+    /// strands its keys; it never reaches a process or a request.
+    pub s3_endpoint_as_configured: String,
     pub s3_public_endpoint: String,
     /// Single rustfs bucket; git + fleets are prefixes under it.
     pub s3_bucket: String,
@@ -1052,14 +1057,15 @@ impl Config {
         // provider's `StoreAccess` alike: provider detection, the install tag
         // and request URLs must see the same endpoint the rest of the runner
         // does.
-        let s3_endpoint = strip_endpoint_userinfo(
-            &env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://rustfs:9000".into()),
-        );
+        let s3_endpoint_as_configured =
+            env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://rustfs:9000".into());
+        let s3_endpoint = strip_endpoint_userinfo(&s3_endpoint_as_configured);
         let cfg = Self {
             bind: env_or(&["RUNNER_BIND"], "0.0.0.0:8080"),
             runner_token,
             database_url,
             s3_endpoint: s3_endpoint.clone(),
+            s3_endpoint_as_configured: s3_endpoint_as_configured.clone(),
             s3_public_endpoint: env::var("S3_PUBLIC_ENDPOINT")
                 .unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
             s3_bucket: env_or(&["NOITE_S3_BUCKET"], "noite"),
@@ -1199,6 +1205,7 @@ impl Config {
                     // other fields resolve from the same vars as the literal
                     // below, kept inline so the two cannot drift.
                     endpoint: s3_endpoint,
+                    identity_endpoint: s3_endpoint_as_configured,
                     region: env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into()),
                     access_key: env::var("AWS_ACCESS_KEY_ID")
                         .or_else(|_| env::var("RUSTFS_ACCESS_KEY"))
@@ -1577,6 +1584,7 @@ pub(crate) fn config_for_tests() -> Config {
         runner_token: "test-token".into(),
         database_url: "sqlite::memory:".into(),
         s3_endpoint: "http://rustfs:9000".into(),
+        s3_endpoint_as_configured: "http://rustfs:9000".into(),
         s3_public_endpoint: "http://rustfs:9000".into(),
         s3_bucket: "noite".into(),
         aws_region: "us-east-1".into(),
