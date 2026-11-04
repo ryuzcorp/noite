@@ -43,6 +43,32 @@ fn env_or(keys: &[&str], default: &str) -> String {
     }
     default.to_string()
 }
+
+/// `S3_ENDPOINT` without userinfo. Every store client here and in celld
+/// signs with the access keys (SigV4), so URL credentials never
+/// authenticated anything, but the endpoint travels on: fleet argv and env,
+/// celld CLI env, release-command env, the control Worker. Stripping once
+/// at load keeps credentials out of all of them; `main` warns when it did.
+/// An unparseable endpoint passes through verbatim so it fails loudly where
+/// it is used instead of as a rewritten URL. Apart from the userinfo the
+/// value stays byte-identical.
+pub fn strip_endpoint_userinfo(endpoint: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(endpoint) else {
+        return endpoint.to_string();
+    };
+    if url.username().is_empty() && url.password().is_none() {
+        return endpoint.to_string();
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    let mut out = url.to_string();
+    // Serializing adds a `/` to a bare host: drop it again.
+    if url.path() == "/" && !endpoint.ends_with('/') {
+        out.truncate(out.len().saturating_sub(1));
+    }
+    out
+}
+
 /// Host part of an http(s) URL without new deps: strip scheme, authority,
 /// port. None when no `://` or empty host. A bracketed literal yields its
 /// address (`https://[::1]:8080/x` → `::1`); splitting the port at the
@@ -777,6 +803,11 @@ pub struct Config {
     pub runner_token: String,
     pub database_url: String,
     pub s3_endpoint: String,
+    /// `S3_ENDPOINT` exactly as configured, userinfo included. Only the
+    /// store identity reads it (the scoped-credential install tag and store
+    /// id), so stripping userinfo for use never re-tags an install or
+    /// strands its keys; it never reaches a process or a request.
+    pub s3_endpoint_as_configured: String,
     pub s3_public_endpoint: String,
     /// Single rustfs bucket; git + fleets are prefixes under it.
     pub s3_bucket: String,
@@ -1022,11 +1053,19 @@ impl Config {
             "a non-negative integer",
             &mut env_problems,
         );
+        // Read once, stripped, for `s3_endpoint` and the credential
+        // provider's `StoreAccess` alike: provider detection, the install tag
+        // and request URLs must see the same endpoint the rest of the runner
+        // does.
+        let s3_endpoint_as_configured =
+            env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://rustfs:9000".into());
+        let s3_endpoint = strip_endpoint_userinfo(&s3_endpoint_as_configured);
         let cfg = Self {
             bind: env_or(&["RUNNER_BIND"], "0.0.0.0:8080"),
             runner_token,
             database_url,
-            s3_endpoint: env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://rustfs:9000".into()),
+            s3_endpoint: s3_endpoint.clone(),
+            s3_endpoint_as_configured: s3_endpoint_as_configured.clone(),
             s3_public_endpoint: env::var("S3_PUBLIC_ENDPOINT")
                 .unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
             s3_bucket: env_or(&["NOITE_S3_BUCKET"], "noite"),
@@ -1162,10 +1201,11 @@ impl Config {
             credentials: Credentials::configure(
                 credential_setting,
                 &StoreAccess {
-                    // Resolved from the same vars as the literal below; kept
-                    // inline so the two cannot drift.
-                    endpoint: env::var("S3_ENDPOINT")
-                        .unwrap_or_else(|_| "http://rustfs:9000".into()),
+                    // The same stripped endpoint as `s3_endpoint` above; the
+                    // other fields resolve from the same vars as the literal
+                    // below, kept inline so the two cannot drift.
+                    endpoint: s3_endpoint,
+                    identity_endpoint: s3_endpoint_as_configured,
                     region: env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into()),
                     access_key: env::var("AWS_ACCESS_KEY_ID")
                         .or_else(|_| env::var("RUSTFS_ACCESS_KEY"))
@@ -1544,6 +1584,7 @@ pub(crate) fn config_for_tests() -> Config {
         runner_token: "test-token".into(),
         database_url: "sqlite::memory:".into(),
         s3_endpoint: "http://rustfs:9000".into(),
+        s3_endpoint_as_configured: "http://rustfs:9000".into(),
         s3_public_endpoint: "http://rustfs:9000".into(),
         s3_bucket: "noite".into(),
         aws_region: "us-east-1".into(),
@@ -1614,6 +1655,27 @@ pub(crate) fn config_for_tests() -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The endpoint keeps its shape apart from userinfo: a plain endpoint
+    /// passes through byte-identical, credentials are dropped (keeping a
+    /// configured trailing slash or path), and garbage passes through to
+    /// fail loudly where it is used.
+    #[test]
+    fn endpoint_userinfo_is_stripped_nothing_else() {
+        assert_eq!(
+            strip_endpoint_userinfo("http://rustfs:9000"),
+            "http://rustfs:9000"
+        );
+        assert_eq!(
+            strip_endpoint_userinfo("http://user:pass@rustfs:9000"),
+            "http://rustfs:9000"
+        );
+        assert_eq!(
+            strip_endpoint_userinfo("https://user@store.example:9443/prefix/"),
+            "https://store.example:9443/prefix/"
+        );
+        assert_eq!(strip_endpoint_userinfo("not a url"), "not a url");
+    }
 
     #[test]
     fn auto_https_explicit_off_wins() {

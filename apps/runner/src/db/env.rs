@@ -140,6 +140,24 @@ pub(crate) fn env_reserved(name: &str) -> bool {
         // would steer fleet celld at another engine than its own proxy
         // socket (or at the host socket directly).
         || name == "DOCKER_HOST"
+        // Fleet TLS trust and proxy routing: the platform passes these
+        // only when the operator set them (`fleet_env::INHERITED`), so
+        // ordering alone cannot win them, and a tenant row would survive
+        // verbatim into fleet process env (store-TLS anchors via
+        // rustls-native-certs; store, peer and control traffic via
+        // reqwest's proxy autodetect). Both cases: the toolchains read
+        // lowercase too. Dropped, not refused, like every reserved name,
+        // from fleet, build and release env alike.
+        || name == "SSL_CERT_FILE"
+        || name == "SSL_CERT_DIR"
+        || name == "HTTP_PROXY"
+        || name == "HTTPS_PROXY"
+        || name == "ALL_PROXY"
+        || name == "NO_PROXY"
+        || name == "http_proxy"
+        || name == "https_proxy"
+        || name == "all_proxy"
+        || name == "no_proxy"
         // The Void proxy's namespace: per-app credentials that only the
         // proxy render consumes. Never process env — like `BETTER_AUTH_*`,
         // process-reserved but (on non-Void apps) Worker-allowed.
@@ -396,6 +414,18 @@ mod tests {
             // would steer fleet celld at another engine than its own proxy
             // socket (or at the host socket directly).
             "DOCKER_HOST",
+            // Fleet TLS trust and proxy routing (see `env_reserved`): the
+            // platform wins these by refusal, not by ordering.
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
             // The Void proxy's namespace: proxy-render input only.
             "VOID_PROXY_SMTP_PASSWORD",
             "VOID_PROXY_AI_API_KEY",

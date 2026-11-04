@@ -99,6 +99,25 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config = Arc::new(Config::from_env()?);
     tokio::fs::create_dir_all(&config.work_dir).await.ok();
+    // Config strips `S3_ENDPOINT` userinfo; say so rather than drop it
+    // silently (the store authenticates with the access keys).
+    if config.s3_endpoint_as_configured != config.s3_endpoint {
+        tracing::warn!(
+            "S3_ENDPOINT credentials ignored: the store authenticates with \
+             AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY; remove them from the URL"
+        );
+    }
+    // Fleets get only the knobs the runner sets, so an operator-global
+    // `CELLD_*` here reaches no fleet.
+    let ignored = host::fleet_env::ignored_celld_vars(
+        std::env::vars_os().filter_map(|(key, _)| key.into_string().ok()),
+    );
+    if !ignored.is_empty() {
+        tracing::warn!(
+            vars = %ignored.join(","),
+            "CELLD_* in the runner env reaches no fleet; use the RUNNER_FLEET_* knobs"
+        );
+    }
 
     // Before anything writes to /data: private by default (SPEC, Data directory).
     host::isolation::harden_data_dir(&config);

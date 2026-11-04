@@ -471,31 +471,6 @@ async fn fleet_gone_cleanup(slug: &str) {
     crate::host::sandbox::engine::close_fleet(slug).await;
 }
 
-/// The `CELLD_EGRESS_ALLOW` entry the fleet needs: its object store as
-/// `host:port`, so Worker fetches keep the reachability the old fleet-uid
-/// nft allowance granted (the store answers 401/403 without keys). A
-/// hostname entry re-resolves on every check, so a moved store stays
-/// allowed without a respawn. `None` when the endpoint is not a URL with a
-/// host — the fleet then runs with no exception rather than refusing to
-/// boot on an invalid entry (celld rejects a malformed allowlist at
-/// startup).
-fn egress_allow(s3_endpoint: &str) -> Option<String> {
-    let url = reqwest::Url::parse(s3_endpoint).ok()?;
-    // `host_str` keeps an IPv6 literal's brackets, which is exactly the
-    // `host:port` spelling celld parses — and it excludes userinfo, so
-    // credentials in the endpoint cannot leak into the allowlist.
-    let host = url.host_str()?;
-    let port = url.port_or_known_default()?;
-    // Port 0 is not a dialable exception: celld refuses to boot on it, so
-    // a nonsense endpoint yields no entry instead. A comma would split into
-    // two entries in celld's comma-separated list (`1.2.3.4,x` allows the
-    // whole of 1.2.3.4 on any port), so it yields no entry either.
-    if port == 0 || host.contains(',') {
-        return None;
-    }
-    Some(format!("{host}:{port}"))
-}
-
 /// Serve one fleet its engine proxy socket before spawn. `None` (with a
 /// warning) when the socket cannot be served: the fleet then spawns without
 /// an engine rather than not at all.
@@ -623,13 +598,6 @@ async fn ensure_spawned(
     let internal_addr = format!("127.0.0.1:{}", spec.internal);
     let advertise_addr = internal_addr.clone();
     let mut cmd = Command::new(&cfg.celld_bin);
-    // Tenant settings first: every platform knob below wins over them by
-    // construction, so a reserved-name filter regression can never override
-    // the operator token, the egress policy or the memory scope (tenant
-    // `CELLD_*` rows are dropped by `db::env_reserved` as well).
-    for (k, v) in spec.env {
-        cmd.env(k, v);
-    }
     cmd.args([
         "--bucket",
         &spec.bucket,
@@ -643,78 +611,7 @@ async fn ensure_spawned(
         internal_addr.as_str(),
         "--advertise",
         advertise_addr.as_str(),
-    ])
-    .env("AWS_ACCESS_KEY_ID", access)
-    .env("AWS_SECRET_ACCESS_KEY", secret_key)
-    .env("AWS_REGION", &cfg.aws_region)
-    .env("AWS_EC2_METADATA_DISABLED", "true")
-    .env("S3_ENDPOINT", &cfg.s3_endpoint)
-    .env("CELLD_WATCH", &state_dir)
-    .env("CELLD_DURABILITY", "bucket")
-    // Inside the runner's stop budget, so celld seals its node log before
-    // the runner's own SIGKILL fallback (SPEC, Shutdown).
-    .env(
-        "CELLD_SHUTDOWN_TOTAL_MS",
-        cfg.fleet_shutdown_ms().to_string(),
-    )
-    // Bounds: idle eviction returns memory when an app goes quiet; the
-    // shedding threshold (set below only when configured) is container-wide.
-    // celld's own logs are what an app owner reads when a deploy serves but
-    // misbehaves; the inherited runner filter would suppress them.
-    .env("RUST_LOG", &cfg.fleet_log)
-    .env("CELLD_IDLE_EVICT_S", cfg.fleet_idle_evict_s.to_string())
-    // See `Config::fleet_lease_ttl_ms`: a short store stall must not
-    // self-fence every fleet at once.
-    .env("CELLD_TTL_MS", cfg.fleet_lease_ttl_ms.to_string())
-    // T1.5: the runner POSTs /reload after every deploy path (push,
-    // rollback, web commit, rename), so the fleet's own poll only covers a
-    // missed reload — every 300 s instead of every 5 s.
-    .env("CELLD_DEPLOY_POLL_S", cfg.fleet_deploy_poll_s.to_string())
-    // T1.8: bound the per-fleet on-disk asset cache (celld's 512 MiB
-    // default, per idle app, is unbounded across fleets).
-    .env(
-        "CELLD_ASSET_CACHE_BYTES",
-        (cfg.fleet_asset_cache_mb * 1024 * 1024).to_string(),
-    )
-    // In the fleet's own state dir: celld's default, /tmp/celld/asset-cache,
-    // is one directory for every node in the container, created 0700 by
-    // whichever starts first (the control node, as root), so a fleet serving
-    // assets as the fleet uid crash-looped on EACCES, and tenants would share
-    // one cache even when it opened.
-    .env("CELLD_ASSET_CACHE_DIR", format!("{state_dir}/asset-cache"))
-    .env("CELLD_TRUST_FORWARDED_HEADERS", "1")
-    .env(credentials::OPERATOR_TOKEN_ENV, operator_token);
-    // Worker egress (SPEC, Egress policy): in `multi` the fleet's Workers
-    // dial public addresses only, with the object store as the one named
-    // exception — celld's own traffic (store, peers, control, telemetry,
-    // container engine) is exempt either way, as are this node's published
-    // container endpoints, node-wide. The nft table now covers builds only;
-    // `single` keeps no egress policy, as before (its one tenant is
-    // trusted). Each knob is removed when unset: the spawn inherits the
-    // runner's env, and an operator-global value must never silently
-    // confine (or open) a fleet that did not ask for it.
-    if matches!(cfg.tenancy, crate::config::Tenancy::Multi) {
-        cmd.env("CELLD_EGRESS", "public");
-        if let Some(allow) = egress_allow(&cfg.s3_endpoint) {
-            cmd.env("CELLD_EGRESS_ALLOW", allow);
-        } else {
-            cmd.env_remove("CELLD_EGRESS_ALLOW");
-        }
-    } else {
-        cmd.env_remove("CELLD_EGRESS");
-        cmd.env_remove("CELLD_EGRESS_ALLOW");
-    }
-    // Fleet telemetry -> Parquet in the fleet bucket (celld OTel, bucket
-    // sink), the documented query path for request counts. The flush / the
-    // runner's compaction of the previous hour (`metrics::compact_fleet`) and
-    // the retention knob (RUNNER_TELEMETRY_RETENTION_DAYS, shared with the
-    // metric prune) come from the same helper the control fleet uses, so the
-    // two sources cannot drift. An environment's files land under
-    // `envs/<slug>/<label>/telemetry/...` (its own `--bucket`), which the
-    // ingest reads alongside production, keyed by environment.
-    for (key, value) in crate::host::metrics::otel_env(cfg) {
-        cmd.env(key, value);
-    }
+    ]);
     // Per-fleet containment (SPEC, Tenant isolation): while cgroups are
     // active the fleet gets its own group with the effective memory cap; the
     // kernel OOM-kills overgrowth inside that group (contained, and the
@@ -728,29 +625,6 @@ async fn ensure_spawned(
             }
         }
     });
-    // With its own leaf the fleet also sheds against it: `self` measures
-    // the process's own cgroup instead of the container root, so the shed
-    // threshold follows the per-fleet cap — unset
-    // (`RUNNER_FLEET_MAX_RSS_MB=0`) defaults to 80% of the leaf's
-    // `memory.max`, and the fleet sheds gracefully before the kernel
-    // OOM-kills it. Without a leaf (no cgroup grant) the knob keeps its
-    // container-wide meaning, as before. Removed when unset, like the
-    // egress knobs above: an inherited value must not silently re-scope a
-    // fleet.
-    if fleet_cgroup.is_some() {
-        cmd.env("CELLD_MEMORY_SCOPE", "self");
-    } else {
-        cmd.env_remove("CELLD_MEMORY_SCOPE");
-    }
-    // The documented knob is `RUNNER_FLEET_MAX_RSS_MB`; a zero value
-    // removes the variable instead of inheriting an operator-global one,
-    // which under `self` scope would silently become a per-fleet
-    // threshold the operator never configured per fleet.
-    if cfg.fleet_max_rss_mb > 0 {
-        cmd.env("CELLD_MAX_RSS_MB", cfg.fleet_max_rss_mb.to_string());
-    } else {
-        cmd.env_remove("CELLD_MAX_RSS_MB");
-    }
     {
         use std::os::unix::process::CommandExt;
         // Its own process group (like `run_sandboxed`): the stops below kill
@@ -798,22 +672,39 @@ async fn ensure_spawned(
             (None, None) => {}
         }
     }
-    // The operator's DOCKER_HOST never reaches a fleet (a tenant override
-    // is reserved anyway, but the runner's own environment would otherwise
-    // leak through the inherit): with sandboxing on the fleet gets its own
-    // proxy socket, otherwise no engine at all.
-    cmd.env_remove("DOCKER_HOST");
-    // celld's operator knobs for containers stay unsupported: a runtime or
-    // resolver makes celld send `Runtime`/`Binds`, which the engine proxy
-    // refuses (they would hand a fleet host paths or a weaker runtime), so an
-    // inherited value would only break every Sandbox start.
-    cmd.env_remove("CELLD_CONTAINER_RUNTIME");
-    cmd.env_remove("CELLD_CONTAINER_DNS");
-    if !cfg.sandbox_disabled {
-        if let Some(socket) = fleet_engine_socket(&key) {
-            cmd.env("DOCKER_HOST", format!("unix://{}", socket.display()));
-        }
-    }
+    // With sandboxing on the fleet gets its own proxy socket, otherwise no
+    // engine at all. celld's operator knobs for containers stay unsupported:
+    // a runtime or resolver makes celld send `Runtime`/`Binds`, which the
+    // engine proxy refuses (they would hand a fleet host paths or a weaker
+    // runtime), so a value would only break every Sandbox start.
+    let engine_socket = if cfg.sandbox_disabled {
+        None
+    } else {
+        fleet_engine_socket(&key)
+    };
+    let engine_socket = engine_socket
+        .as_ref()
+        .map(|socket| socket.to_string_lossy().into_owned());
+    // Explicit environment only (`host::fleet_env`): the spawn inherits
+    // nothing — no `RUNNER_TOKEN`, no operator-global `CELLD_*`, no ambient
+    // credential chain — and tenant settings cannot override a platform
+    // knob, since the builder applies them first. This `apply` call is
+    // load-bearing (nothing here fails if it is dropped): the builder and
+    // the spawn-path tests in `host::fleet_env` pin what it applies.
+    let inherited = crate::host::fleet_env::runner_inherited();
+    let fleet_env =
+        crate::host::fleet_env::tenant_fleet_env(&crate::host::fleet_env::TenantFleetEnv {
+            cfg,
+            state_dir: &state_dir,
+            access_key: &access,
+            secret_key: &secret_key,
+            operator_token: &operator_token,
+            tenant_env: &spec.env,
+            has_cgroup_leaf: fleet_cgroup.is_some(),
+            engine_socket: engine_socket.as_deref(),
+            inherited: &inherited,
+        });
+    crate::host::fleet_env::apply(&mut cmd, &fleet_env);
     let mut child = match cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1493,47 +1384,6 @@ mod tests {
                 "{}",
                 body
             );
-        }
-    }
-
-    /// The store exception is the endpoint's `host:port` — a hostname entry
-    /// re-resolves on every check, an IPv6 literal takes brackets, and a
-    /// default port is spelled out (celld entries need one). Garbage yields
-    /// no entry rather than a value that would refuse the node its boot.
-    #[test]
-    fn egress_allow_names_the_store_host_and_port() {
-        assert_eq!(
-            egress_allow("http://rustfs:9000"),
-            Some("rustfs:9000".to_string())
-        );
-        assert_eq!(
-            egress_allow("https://s3.example.com"),
-            Some("s3.example.com:443".to_string())
-        );
-        assert_eq!(
-            egress_allow("http://10.89.0.7:9000/noite"),
-            Some("10.89.0.7:9000".to_string())
-        );
-        assert_eq!(
-            egress_allow("http://[fd00::7]:9000"),
-            Some("[fd00::7]:9000".to_string())
-        );
-        // Credentials in the endpoint stay out of the allowlist.
-        assert_eq!(
-            egress_allow("http://user:pass@rustfs:9000"),
-            Some("rustfs:9000".to_string())
-        );
-        for bad in [
-            "",
-            "not a url",
-            "http://",
-            "unix:///sock",
-            "http://rustfs:0",
-            // A comma would split into two allowlist entries.
-            "http://1.2.3.4,x:9000",
-            "http://1.2.3.4%2Cx:9000",
-        ] {
-            assert_eq!(egress_allow(bad), None, "{bad:?} yields no entry");
         }
     }
 

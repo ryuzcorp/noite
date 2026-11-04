@@ -30,7 +30,7 @@ impl AwsIam {
     /// from a row.
     pub fn new(store: StoreAccess, bucket: &str) -> Self {
         Self {
-            tag: super::install_tag(&store.endpoint, bucket, &store.region),
+            tag: super::install_tag(&store.identity_endpoint, bucket, &store.region),
             endpoint: "https://iam.amazonaws.com".into(),
             store,
             client: reqwest::Client::new(),
@@ -40,7 +40,7 @@ impl AwsIam {
     #[cfg(test)]
     fn test(store: StoreAccess, bucket: &str, endpoint: String) -> Self {
         Self {
-            tag: super::install_tag(&store.endpoint, bucket, &store.region),
+            tag: super::install_tag(&store.identity_endpoint, bucket, &store.region),
             endpoint,
             store,
             client: reqwest::Client::new(),
@@ -441,6 +441,7 @@ mod tests {
     fn test_store() -> StoreAccess {
         StoreAccess {
             endpoint: "https://s3.us-east-1.amazonaws.com".into(),
+            identity_endpoint: "https://s3.us-east-1.amazonaws.com".into(),
             region: "us-east-1".into(),
             access_key: "AK".into(),
             secret_key: "SK".into(),
