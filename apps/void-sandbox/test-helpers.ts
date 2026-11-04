@@ -5,14 +5,13 @@
 // `cloudflare:workers` module itself is stubbed (see test-setup.ts).
 /* oxlint-disable eslint/max-classes-per-file -- seven fakes share this helper module */
 /* oxlint-disable eslint/require-await, anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: they mirror async platform interfaces and stand in for bindings they only partly implement */
-import type { SandboxOptions } from "void/_sandbox-container";
+import type {
+  SandboxExecOptions,
+  SandboxOptions,
+} from "void/_sandbox-container";
 
 import type { AdmissionResult } from "./src/admission.ts";
-import type {
-  NoiteExecOptions,
-  NoiteStartOptions,
-  NoiteTcpPort,
-} from "./src/controller.ts";
+import type { NoiteStartOptions, NoiteTcpPort } from "./src/controller.ts";
 import type { ControllerEnv } from "./src/env.ts";
 import SandboxService from "./worker.ts";
 
@@ -126,7 +125,7 @@ export class FakeProcess {
 
 export interface ExecCall {
   readonly argv: string[];
-  readonly options: NoiteExecOptions;
+  readonly options: SandboxExecOptions;
 }
 
 /** Scripted container. `execImpl` decides each process; the default never settles, so tests script it. */
@@ -140,7 +139,7 @@ export class FakeContainer {
   readonly tcpFetches: { readonly port: number; readonly request: Request }[] =
     [];
   // oxlint-disable-next-line eslint/class-methods-use-this -- per-instance script hook reassigned by tests; the default ignores the instance.
-  execImpl: (argv: string[], options: NoiteExecOptions) => FakeProcess = () =>
+  execImpl: (argv: string[], options: SandboxExecOptions) => FakeProcess = () =>
     new FakeProcess();
   // oxlint-disable-next-line eslint/class-methods-use-this -- per-instance script hook reassigned by tests; the default ignores the instance.
   fetchImpl: (port: number, request: Request) => Response = () =>
@@ -153,7 +152,7 @@ export class FakeContainer {
 
   async exec(
     argv: string[],
-    options: NoiteExecOptions = {}
+    options: SandboxExecOptions = {}
   ): Promise<FakeProcess> {
     this.execCalls.push({ argv, options });
 

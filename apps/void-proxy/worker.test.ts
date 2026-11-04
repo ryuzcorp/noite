@@ -573,8 +573,11 @@ describe("/revalidate", () => {
 
 describe("platform surface guard", () => {
   test("worker source never touches the edge cache", async () => {
-    // Every shipped source: the router plus the modules it imports. Tests and
-    // helpers never ship, so they are not covered.
+    // ISR is KV-backed by design (the shared, authoritative store a purge
+    // can reach); celld's `caches` is per-node process-local state since
+    // 0018, which ISR must never depend on. Every shipped source: the
+    // router plus the modules it imports. Tests and helpers never ship,
+    // so they are not covered.
     const shipped = [
       "worker.ts",
       "src/env.ts",

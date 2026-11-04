@@ -140,7 +140,7 @@ Add `main` and an `ASSETS` binding to the same config. The Worker is bundled fro
 }
 ```
 
-For a Worker that itself needs the bundler (Oxide, framework plugins), have the build write `dist/wrangler.json`; a stock Void app needs nothing extra to deploy. Apps using `void/sandbox` deploy but cannot run sandbox calls yet ([Known limits](/self-hosting/known-limits)).
+For a Worker that itself needs the bundler (Oxide, framework plugins), have the build write `dist/wrangler.json`; a stock Void app needs nothing extra to deploy. Apps using `void/sandbox` need nothing extra either: their sandboxes run through the platform's cohosted controller ([Void sandboxes](/self-hosting/operations#void-sandboxes)).
 
 ## Frameworks and Node servers
 

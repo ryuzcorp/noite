@@ -19,8 +19,9 @@
  * - Noite: the sandbox shim must be baked into the image. `initialize()`
  *   probes for `/usr/local/bin/sandbox-shim` and fails closed with a clear
  *   error when a custom image lacks it.
- * - Noite: abort maps to `kill()`. celld `exec()` takes no `signal`, so
- *   `execProcess()` drops it and kills the process on abort.
+ * - Noite: `signal` flows to celld. celld `exec()` honors the AbortSignal
+ *   natively (0010/0015: abort sends SIGKILL through the exec kill path),
+ *   so `execProcess()` forwards it untouched.
  * - Noite: PTY passthrough. celld `exec()` takes `pty` (`true` or
  *   `{ cols, rows }`, patch 0006), so `execProcess()` forwards it; the wire
  *   `isPty` reads the native value and `resize` is the native resize.
@@ -86,8 +87,8 @@ const SHIM_PROBE_TIMEOUT_MS = 30_000;
 /**
  * Minimal celld container surface the controller relies on. celld `start()`
  * takes `{ image, enableInternet, labels, entrypoint, env }` and `exec()`
- * takes `{ env, cwd, user, stdout, stderr, stdin, pty }` — neither takes the
- * Cloudflare-only `instance` or `signal` keys.
+ * takes `{ env, cwd, user, stdout, stderr, stdin, pty, signal }` — only
+ * `start()`'s Cloudflare-only `instance` key is stripped.
  */
 export interface NoiteContainer {
   readonly running: boolean;
@@ -95,7 +96,7 @@ export interface NoiteContainer {
   readonly start: (options: NoiteStartOptions) => void;
   readonly exec: (
     argv: string[],
-    options?: NoiteExecOptions
+    options?: SandboxExecOptions
   ) => Promise<NoiteExecProcess>;
   readonly destroy: () => Promise<void>;
   readonly setInactivityTimeout: (ms: number) => Promise<void>;
@@ -108,13 +109,6 @@ export interface NoiteStartOptions {
   readonly labels?: Record<string, string>;
   readonly entrypoint?: string[];
 }
-
-/**
- * celld exec options: `SandboxExecOptions` minus the `signal` the controller
- * maps to `kill()` instead. `pty` (`true` or `{ cols, rows }`) is portable
- * since celld patch 0006 and flows straight through.
- */
-export type NoiteExecOptions = Omit<SandboxExecOptions, "signal">;
 
 export interface NoiteTcpPort {
   readonly fetch: (request: Request) => Promise<Response>;
@@ -170,11 +164,9 @@ const wrapCelldContainer = (
         return noite.exec(argv);
       }
 
-      // Only `signal` is Cloudflare-only here (`pty` flows to celld).
-      const { signal: _droppedSignal, ...portable } = options;
-      void _droppedSignal;
-
-      return noite.exec(argv, portable);
+      // Every exec option is portable now (`signal` since celld 0010, `pty`
+      // since 0006): only `start()` strips anything.
+      return noite.exec(argv, { ...options });
     },
     getTcpPort: (port: number): NoiteTcpPort => noite.getTcpPort(port),
     get images(): Record<string, string> {
@@ -228,15 +220,6 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
   #busy = 0;
   #generation: ProcessCompletion = {};
   #startTail: Promise<void> = Promise.resolve();
-
-  /** Noite: the unwrapped celld container. Only `execProcess` bypasses the wrapper. */
-  get #native(): NoiteContainer {
-    // Same runtime object the wrapper forwards to (see
-    // `wrapCelldContainer`); read here so `execProcess` can drop the
-    // Cloudflare-only `signal` key before it reaches celld.
-    // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- SAFETY: see above.
-    return super.container as unknown as NoiteContainer;
-  }
 
   /** Noite: strip the Cloudflare-only `instance` start arg (see `wrapCelldContainer`). */
   protected override get container(): SandboxNativeContainer {
@@ -480,11 +463,12 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
   }
 
   /**
-   * Noite: celld `exec()` takes no `signal`, so it is dropped before the
-   * call and an abort kills the process instead. `pty` flows straight to
-   * the native exec (celld patch 0006): the wire `isPty` reads the native
-   * value and `resize` is the native resize, so a terminal session just
-   * works.
+   * Noite: `signal` flows straight to the native exec (celld 0010/0015:
+   * abort sends SIGKILL through the exec kill path, and an already-aborted
+   * signal refuses with its reason before spawning — workerd semantics).
+   * `pty` flows straight too (celld 0006): the wire `isPty` reads the
+   * native value and `resize` is the native resize, so a terminal session
+   * just works.
    *
    * Noite: direct exec is tenant-reachable, so it heartbeats exactly like an
    * `invoke` op — a denied lease cannot be outlived past one interval. The
@@ -496,41 +480,9 @@ export class SandboxController extends SandboxContainer<ControllerEnv> {
     argv: string[],
     options: SandboxExecOptions = {}
   ): Promise<BaseExecProcess> {
-    const { signal, ...nativeOptions } = options;
-
     await this.#guardExec();
 
-    const process = await this.#native.exec(argv, { ...nativeOptions });
-    // The celld process satisfies the base wire contract — `pid`, stdio,
-    // `exitCode`, `kill` and `output` — plus the 0006 PTY surface: `isPty`
-    // reads the native value and `resize` is the native resize.
-    // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- SAFETY: see above.
-    const wire = process as unknown as BaseExecProcess;
-
-    if (signal === undefined) {
-      return wire;
-    }
-
-    const kill = (): void => {
-      process.kill();
-    };
-
-    if (signal.aborted) {
-      kill();
-
-      return wire;
-    }
-
-    signal.addEventListener("abort", kill, { once: true });
-
-    const detach = (): void => {
-      signal.removeEventListener("abort", kill);
-    };
-
-    // oxlint-disable-next-line promise/prefer-await-to-then -- a detach listener, not a wait: abort handling must outlive this call.
-    void process.exitCode.then(detach, detach);
-
-    return wire;
+    return this.container.exec(argv, { ...options });
   }
 
   /**

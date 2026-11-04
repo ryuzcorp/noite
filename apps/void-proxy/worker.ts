@@ -18,9 +18,9 @@
  * module where they live.
  *
  * Globals used: `fetch`, `crypto`, KV bindings, `cloudflare:sockets`. `caches`
- * is deliberately never touched (celld's cache is always-miss; KV is
- * authoritative) — a test asserts no shipped source contains a `caches`
- * reference.
+ * is deliberately never touched (celld's cache is per-node since 0018, and
+ * ISR must not depend on node-local state; KV is authoritative) — a test
+ * asserts no shipped source contains a `caches` reference.
  */
 
 /* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unsafe-dictionary-type, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-known-value-widening -- untyped-JSON I/O boundary: every handler validates untrusted bodies field-by-field, so typeof-narrowing and open dictionaries are the job, not slop */
