@@ -87,8 +87,8 @@ const SHIM_PROBE_TIMEOUT_MS = 30_000;
 /**
  * Minimal celld container surface the controller relies on. celld `start()`
  * takes `{ image, enableInternet, labels, entrypoint, env }` and `exec()`
- * takes `{ env, cwd, user, stdout, stderr, stdin, pty, signal }` — only
- * `start()`'s Cloudflare-only `instance` key is stripped.
+ * takes `{ env, cwd, user, stdout, stderr, stdin, pty, signal, combined }`
+ * — only `start()`'s Cloudflare-only `instance` key is stripped.
  */
 export interface NoiteContainer {
   readonly running: boolean;
