@@ -389,37 +389,7 @@ pub async fn run_cmd(
     env: &[(&str, &str)],
     timeout: Duration,
 ) -> anyhow::Result<String> {
-    super::stats::count_spawn(program);
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .env_clear()
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-        .env("LANG", "C.UTF-8")
-        .env("HOME", "/root")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
-    }
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.as_std_mut().process_group(0);
-    }
-    let child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
-    let pid = child.id();
-    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
-    // Whatever happened, nothing the step started may outlive it: the group
-    // id is the child's pid (process_group(0)); ESRCH when the group is
-    // already empty is fine.
-    #[cfg(unix)]
-    if let Some(pid) = pid {
-        kill_group(pid);
-    }
-    let output = result.context("command timeout")?.context("wait output")?;
+    let output = run_cmd_output(program, args, cwd, env, timeout).await?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         let out = String::from_utf8_lossy(&output.stdout);
@@ -474,6 +444,57 @@ pub async fn run_cmd_stdin(
     env: &[(&str, &str)],
     timeout: Duration,
 ) -> anyhow::Result<Vec<u8>> {
+    let output = run_cmd_output_stdin(program, args, Some(stdin), cwd, env, timeout).await?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "{program} {:?} exit {:?}\n{err}",
+            args,
+            output.status.code()
+        );
+    }
+    Ok(output.stdout)
+}
+
+/// One finished child process: its exit status plus both captured streams.
+/// Unlike [`run_cmd`], a nonzero exit is data rather than an error: some
+/// commands print their verdict on stdout however they exit (`celld invoke
+/// --json` prints the result envelope before its nonzero exit on a non-2xx
+/// answer; `celld r2 get|head --json` prints the `not_found` object for an
+/// absent key), so the caller — not the spawn — decides what the status
+/// means.
+pub struct CmdOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Run a command and return its output however it exited: the spawn,
+/// timeout and process-group kill are exactly [`run_cmd`]'s (a timeout is
+/// still an error), but the exit status comes back for the caller to
+/// interpret instead of failing here.
+pub async fn run_cmd_output(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+    timeout: Duration,
+) -> anyhow::Result<CmdOutput> {
+    run_cmd_output_stdin(program, args, None, cwd, env, timeout).await
+}
+
+/// [`run_cmd_output`] with the child's stdin fed, then closed: for commands
+/// that answer bytes — `celld r2 get` never reads stdin, so the closed pipe
+/// is never observed (the same reason [`run_cmd_stdin`] exists). `None`
+/// leaves stdin inherited, as [`run_cmd`] does.
+pub async fn run_cmd_output_stdin(
+    program: &str,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+    timeout: Duration,
+) -> anyhow::Result<CmdOutput> {
     use tokio::io::AsyncWriteExt;
     super::stats::count_spawn(program);
     let mut cmd = Command::new(program);
@@ -482,10 +503,12 @@ pub async fn run_cmd_stdin(
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("LANG", "C.UTF-8")
         .env("HOME", "/root")
-        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    if stdin.is_some() {
+        cmd.stdin(std::process::Stdio::piped());
+    }
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
@@ -501,29 +524,34 @@ pub async fn run_cmd_stdin(
     // Feed stdin from its own task: a command that answers with more than a
     // pipe buffer holds (batch `git cat-file`) blocks on stdout, and if we
     // were still blocked writing stdin the two would deadlock.
-    let mut pipe = child.stdin.take().context("stdin pipe")?;
-    let input = stdin.to_vec();
-    let writer = tokio::spawn(async move {
-        let _ = pipe.write_all(&input).await;
-        let _ = pipe.shutdown().await;
-    });
+    let writer = match stdin {
+        Some(input) => {
+            let mut pipe = child.stdin.take().context("stdin pipe")?;
+            let input = input.to_vec();
+            Some(tokio::spawn(async move {
+                let _ = pipe.write_all(&input).await;
+                let _ = pipe.shutdown().await;
+            }))
+        }
+        None => None,
+    };
     let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
-    // Nothing the step started may outlive it (see `run_cmd`).
+    // Whatever happened, nothing the step started may outlive it: the group
+    // id is the child's pid (process_group(0)); ESRCH when the group is
+    // already empty is fine.
     #[cfg(unix)]
     if let Some(pid) = pid {
         kill_group(pid);
     }
     let output = result.context("command timeout")?.context("wait output")?;
-    let _ = writer.await;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "{program} {:?} exit {:?}\n{err}",
-            args,
-            output.status.code()
-        );
+    if let Some(writer) = writer {
+        let _ = writer.await;
     }
-    Ok(output.stdout)
+    Ok(CmdOutput {
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
 }
 
 pub fn work_root(cfg: &Config) -> PathBuf {
