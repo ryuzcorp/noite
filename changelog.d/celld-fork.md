@@ -1,7 +1,7 @@
 ### Changed
 
-- The image ships celld `0.6.3-ryuzcorp.7` from the [ryuzcorp/celld](https://github.com/ryuzcorp/celld) fork: upstream celld 0.6.3 plus the fork's patches, built with celld's full upstream test suite, pinned by digest and published with SLSA provenance attestations. Upstream celld ships only security fixes from 0.6.x on, so the fork carries the patches.
-- A deploy reads only the app's own directory, the one holding its Wrangler config. Imports, source maps, `tsconfig.json` `extends`, assets, Dockerfiles and migrations that resolve outside it fail the deploy, and esbuild runs with its file reads confined to that directory. An app whose config sits in a subdirectory of a monorepo that hoists `node_modules` above it must install its packages next to the config.
+- The image ships celld `0.6.3-ryuzcorp.8` from the [ryuzcorp/celld](https://github.com/ryuzcorp/celld) fork: upstream celld 0.6.3 plus the fork's patches, built with celld's full upstream test suite, pinned by digest and published with SLSA provenance attestations. Upstream celld ships only security fixes from 0.6.x on, so the fork carries the patches.
+- A deploy reads only the app's own checkout. Imports, source maps, `tsconfig.json` `extends` and Dockerfiles that resolve outside it fail the deploy, and esbuild runs with its file reads confined to it. Assets, migrations and the Wrangler config itself must sit inside the config's own directory.
 
 ### Fixed
 
