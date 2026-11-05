@@ -1558,7 +1558,7 @@ async fn invoke_exchange(
     // Nothing secret or tenant-derived rides argv: every local user reads
     // `/proc/<pid>/cmdline`, including concurrent tenant builds. The proxy
     // token travels in the child's environment (`--header-env`, celld
-    // 0050), which only the runner's own uid can read, beside the operator
+    // 0049), which only the runner's own uid can read, beside the operator
     // token and bucket credentials; the body travels on stdin.
     args.push("--header-env".to_string());
     args.push(format!("x-void-internal={PROXY_TOKEN_ENV}"));
