@@ -646,6 +646,7 @@ impl StagedSandbox {
                 .map(|digest| digest.to_vec())
                 .unwrap_or_default(),
             declares_containers: true,
+            read_root: None,
         })
     }
 }

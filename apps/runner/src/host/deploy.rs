@@ -1146,7 +1146,15 @@ async fn deploy_inner(
                     Some(void_sandbox::dockerfile_image_digest(&pinned, &context)?)
                 }
             };
-            scripts.push(staged.render(planned.value(), image_digest)?);
+            let mut rendered = staged.render(planned.value(), image_digest)?;
+            // The controller deploys from a staging dir while its pinned
+            // Dockerfile sits in the vetted build context: celld builds it
+            // only with that context named as a read root.
+            rendered.read_root = sandbox_pinned
+                .as_ref()
+                .and_then(|(_, pinned)| pinned.parent())
+                .map(Path::to_path_buf);
+            scripts.push(rendered);
         }
         scripts.push(void_proxy::render_proxy(&void_proxy::ProxyRenderCtx {
             app_id: &app.id,
@@ -1202,6 +1210,7 @@ async fn deploy_inner(
                 Duration::from_secs(120)
             },
             sourcemap: Some(&worker_map_path),
+            read_root: Some(&src_dir),
         },
     )
     .await?;

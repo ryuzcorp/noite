@@ -241,6 +241,7 @@ pub fn render_proxy(ctx: &ProxyRenderCtx<'_>) -> RenderedCohost {
         extra_sources: Vec::new(),
         extra_hash_input: Vec::new(),
         declares_containers: false,
+        read_root: None,
     }
 }
 
