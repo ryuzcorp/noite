@@ -1,10 +1,10 @@
-//! D1 migrations for Void apps (SPEC, Deploy pipeline): after the staged
-//! deploy, the one activate, and a successful reload adoption, before the
-//! deploy is marked success, the runner drives the new generation's in-worker
-//! migration endpoints over the fleet's own listen port — the same endpoints
-//! Void's platform calls, with the same auth (`x-void-internal:
-//! __VOID_PROXY_TOKEN`, the per-fleet token [`crate::host::void_deploy`]
-//! provisions) and the same wire protocol:
+//! D1 migrations for Void apps (SPEC, Deploy pipeline): before the deploy
+//! is marked success, the runner drives the new generation's in-worker
+//! migration endpoints — over the fleet's own listen port after activation,
+//! or against the staged generation before it (see Ordering below) — the
+//! same endpoints Void's platform calls, with the same auth
+//! (`x-void-internal: __VOID_PROXY_TOKEN`, the per-fleet token
+//! [`crate::host::void_deploy`] provisions) and the same wire protocol:
 //!
 //! - protocol v2 where the worker advertises it (`GET
 //!   /__void/migrate/capabilities`, then `POST /__void/migrate/app` with an
@@ -28,16 +28,20 @@
 //! its own bucket, ports and D1), so preview and production migrate
 //! independently.
 //!
-//! Ordering (SPEC documents the window): the fleet pointer moves atomically
-//! at `activate` — staged versions serve nothing until then — but execution
-//! stays in-worker, so this step still runs after reload adoption: only the
-//! adopted worker can run its bundled migrations. Between adoption and this
-//! step the new code serves the old schema (Void migrates the uploaded
-//! worker *before* traffic switches to it; celld has no version-pinned
-//! invocation, so Noite cannot): keep migrations backward-compatible
-//! (expand before contract). A failed migration fails the deploy with the
-//! new generation serving; applied migrations are never rolled back
-//! (forward-only: redeploying applies what is pending, skipping the rest).
+//! Ordering has two deliveries. On a redeploy (a previous generation is
+//! serving) the runner migrates against the *staged* generation before
+//! `activate`, through one `celld invoke` per exchange (needs celld
+//! 0.6.3-ryuzcorp.7+): the fleet pointer moves only after the migrations
+//! succeed, so the old version keeps serving and a failed migration fails
+//! the deploy with nothing activated. On a first deploy — or when the prior
+//! fleet is unreachable so no staged invoke is possible — the step runs
+//! after activation against the fleet's own listen port, as before: between
+//! adoption and this step the new code serves the old schema (Void migrates
+//! the uploaded worker *before* traffic switches to it; celld has no
+//! version-pinned invocation outside `invoke`, so Noite otherwise cannot):
+//! keep migrations backward-compatible (expand before contract). Either
+//! way, applied migrations are never rolled back (forward-only: redeploying
+//! applies what is pending, skipping the rest).
 
 use std::path::{Component, Path, PathBuf};
 
