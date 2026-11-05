@@ -1301,8 +1301,7 @@ async fn deploy_inner(
             }
         }
         let stats =
-            void_cohost::activate_staged(pool, &app.id, target.environment_id(), &celld, staged)
-                .await?;
+            activate_after_staged_migrate(pool, app, target, &celld, staged, progress).await?;
         (stats, environment)
     } else {
         let stats = void_cohost::deploy_fleet_in_order(
@@ -1722,6 +1721,23 @@ async fn migrate_void_app_staged(
         &deployment_id,
     )
     .await
+}
+
+/// Activate the staged generation after a successful staged migrate: the
+/// deploy step resumes first, so an activate failure is reported under
+/// `deploy` instead of the finished `migrate` step.
+async fn activate_after_staged_migrate(
+    pool: &SqlitePool,
+    app: &App,
+    target: &DeployTarget,
+    celld: &void_cohost::CelldDeploy<'_>,
+    staged: void_cohost::StagedFleet,
+    progress: &mut Progress<'_>,
+) -> anyhow::Result<void_cohost::FleetDeployStats> {
+    progress
+        .step("deploy", DeployStatus::Deploying, "celld activate")
+        .await?;
+    void_cohost::activate_staged(pool, &app.id, target.environment_id(), celld, staged).await
 }
 
 /// Run a Void app's D1 migrations through the new generation's in-worker
@@ -2267,9 +2283,10 @@ pub async fn deploy_tip(
 #[cfg(test)]
 mod tests {
     use super::{
-        contained_deploy_root, failure_summary, go_arch, has_build_script, log_migrate_warnings,
-        migrate_void_app, migrate_void_app_staged, parse_wrangler_build, quoted, route_live,
-        wipe_worktree, without_runner_keys, DeployTarget, MigrateInputs, Progress,
+        activate_after_staged_migrate, contained_deploy_root, failure_summary, go_arch,
+        has_build_script, log_migrate_warnings, migrate_void_app, migrate_void_app_staged,
+        parse_wrangler_build, quoted, route_live, wipe_worktree, without_runner_keys, DeployTarget,
+        MigrateInputs, Progress,
     };
     use serde_json::json;
 
@@ -2995,6 +3012,104 @@ mod tests {
             .await
             .unwrap();
         assert!(stored.is_some());
+    }
+
+    /// An activate failure after a successful staged migrate is reported
+    /// under `deploy`, not the finished `migrate` step: the activate runs
+    /// through the helper that resumes the deploy step first.
+    #[tokio::test]
+    async fn staged_migrate_success_then_failed_activate_reports_deploy() {
+        let seam = StagedSeam::spawn("activate-fail").await;
+        seam.write_capabilities();
+        seam.write_invoke(
+            "invoke-app",
+            200,
+            r#"{"ok":true,"migrations":[{"name":"0001.sql","applied":true}]}"#,
+        );
+        seam.write_invoke("invoke-auth", 200, r#"{"ok":true}"#);
+        let log = seam
+            .dir
+            .path()
+            .join("invocations.log")
+            .to_string_lossy()
+            .into_owned();
+        let dir = seam.dir.path().to_string_lossy().into_owned();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let celld = seam.celld(&env);
+        let target = DeployTarget::Production;
+        let app_side = crate::host::void_cohost::FleetApp {
+            dir: seam.root.path(),
+            cwd: None,
+            timeout: std::time::Duration::from_secs(30),
+            sourcemap: None,
+            read_root: None,
+        };
+        let staged = crate::host::void_cohost::stage_fleet_in_order(
+            &seam.pool,
+            &seam.app.id,
+            None,
+            &celld,
+            &[staged_proxy()],
+            &app_side,
+        )
+        .await
+        .expect("stage");
+        let mut progress = Progress {
+            pool: &seam.pool,
+            app_id: &seam.app.id,
+            environment_id: None,
+            sha: Some("abc123".to_string()),
+            id: None,
+            step: "deploy",
+        };
+        migrate_void_app_staged(
+            MigrateInputs {
+                pool: &seam.pool,
+                cfg: &seam.cfg,
+                app: &seam.app,
+                target: &target,
+                src_dir: seam.src.path(),
+                deploy_root: seam.root.path(),
+                commit_sha: "abc123",
+                progress: &mut progress,
+            },
+            &celld,
+            &staged,
+        )
+        .await
+        .expect("staged migrate");
+        assert_eq!(progress.step, "migrate");
+        // Fail the activate: the next celld call, plus one more for the
+        // infra retry a loud failure earns.
+        let n = seam.invocations().len();
+        for i in [n, n + 1] {
+            std::fs::write(
+                seam.dir.path().join(format!("fail-{i}")),
+                "activate blew up",
+            )
+            .unwrap();
+        }
+        let err = activate_after_staged_migrate(
+            &seam.pool,
+            &seam.app,
+            &target,
+            &celld,
+            staged,
+            &mut progress,
+        )
+        .await
+        .expect_err("a failed activate fails the deploy");
+        progress.fail(&err).await.unwrap();
+        let log: String = sqlx::query_scalar("SELECT log FROM deploy WHERE id = ?")
+            .bind(progress.id.clone().unwrap_or_default())
+            .fetch_one(&seam.pool)
+            .await
+            .unwrap();
+        assert!(log.contains("ERROR: deploy failed"), "{log}");
+        assert!(!log.contains("migrate failed"), "{log}");
     }
 
     /// An unknown staged outcome reconciles: no envelope from the app
