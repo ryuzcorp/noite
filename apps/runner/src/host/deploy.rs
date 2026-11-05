@@ -2878,7 +2878,7 @@ mod tests {
             "test-proxy=0000000000000001",
             "test-app=0000000000000002",
             "--target test-app",
-            "--header x-void-internal:",
+            "--header-env x-void-internal=NOITE_VOID_PROXY_TOKEN",
             "--json",
             "--bucket s3://noite/fleets/staged-mig",
         ] {

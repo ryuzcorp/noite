@@ -25,10 +25,18 @@ elif [ "$1" = "invoke" ]; then
   # migrate failure runs no activate.
   path=""
   prev=""
+  stdin_body=""
   for arg in "$@"; do
     if [ "$prev" = "--path" ]; then path="$arg"; fi
+    if [ "$prev" = "--body-file" ] && [ "$arg" = "-" ]; then stdin_body=1; fi
     prev="$arg"
   done
+  # The secret header and the body never ride argv: record what arrived
+  # through the environment (`--header-env`) and stdin, one line per call.
+  printf '%s\n' "${NOITE_VOID_PROXY_TOKEN:-<unset>}" >> "$FAKE_CELLD_DIR/invoke-token.log"
+  if [ -n "$stdin_body" ]; then
+    { cat; printf '\n'; } >> "$FAKE_CELLD_DIR/invoke-body.log"
+  fi
   case "$path" in
     /__void/migrate/capabilities) name="invoke-capabilities";;
     /__void/migrate/auth) name="invoke-auth";;

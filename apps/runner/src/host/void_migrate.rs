@@ -1532,6 +1532,10 @@ impl MigrationClient {
 /// runner's own timeout fires first (the platform's 10/300/30 s), and a
 /// timeout is unknown, never failed — the invoke runs to completion on the
 /// node, which is exactly what the reconcile path is for.
+/// The environment variable carrying the fleet's proxy token to
+/// `celld invoke --header-env`, never argv.
+const PROXY_TOKEN_ENV: &str = "NOITE_VOID_PROXY_TOKEN";
+
 async fn invoke_exchange(
     target: &StagedTarget,
     token: &str,
@@ -1551,27 +1555,18 @@ async fn invoke_exchange(
     args.push(method.to_string());
     args.push("--path".to_string());
     args.push(path.to_string());
-    // The proxy token rides argv (`--header`): `celld invoke` takes headers
-    // only from flags (the body has `--body-file`; headers have no file
-    // equivalent), and env is equally same-uid-visible, so there is no
-    // quieter channel today. The exposure is the token alone — the operator
-    // token and bucket credentials stay in the child's env, as with every
-    // other operator call — for the invoke's own runtime, to code that
-    // already holds this token as the worker. A `--header-file` (0600)
-    // would close even that; until celld grows one, concurrent same-uid
-    // code is trusted with fleet proxy tokens.
-    args.push("--header".to_string());
-    args.push(format!("x-void-internal:{token}"));
-    if let Some(body) = body {
-        let Ok(text) = std::str::from_utf8(body) else {
-            return CallAnswer::Transport {
-                message: "migration request body is not UTF-8".to_string(),
-            };
-        };
+    // Nothing secret or tenant-derived rides argv: every local user reads
+    // `/proc/<pid>/cmdline`, including concurrent tenant builds. The proxy
+    // token travels in the child's environment (`--header-env`, celld
+    // 0050), which only the runner's own uid can read, beside the operator
+    // token and bucket credentials; the body travels on stdin.
+    args.push("--header-env".to_string());
+    args.push(format!("x-void-internal={PROXY_TOKEN_ENV}"));
+    if body.is_some() {
         args.push("--header".to_string());
         args.push("content-type:application/json".to_string());
-        args.push("--body".to_string());
-        args.push(text.to_string());
+        args.push("--body-file".to_string());
+        args.push("-".to_string());
     }
     args.push("--json".to_string());
     args.push("--bucket".to_string());
@@ -1585,18 +1580,25 @@ async fn invoke_exchange(
         .env
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
+        .chain(std::iter::once((PROXY_TOKEN_ENV, token)))
         .collect();
-    let output =
-        match crate::host::exec::run_cmd_output(&target.celld_bin, &arg_refs, None, &env, timeout)
-            .await
-        {
-            Ok(output) => output,
-            Err(e) => {
-                return CallAnswer::Transport {
-                    message: one_line(&format!("{e:#}")),
-                };
-            }
-        };
+    let output = match crate::host::exec::run_cmd_output_stdin(
+        &target.celld_bin,
+        &arg_refs,
+        body,
+        None,
+        &env,
+        timeout,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(e) => {
+            return CallAnswer::Transport {
+                message: one_line(&format!("{e:#}")),
+            };
+        }
+    };
     // A non-2xx answer still prints its envelope before the nonzero exit,
     // so the status decides like the fleet path's; only a missing envelope
     // — no live node, a shed load, a killed caller — is a transport
@@ -1609,8 +1611,15 @@ async fn invoke_exchange(
             body: String::from_utf8_lossy(&body).into_owned(),
         },
         InvokeParse::TooLarge { message } => CallAnswer::TooLarge { message },
+        // No envelope also covers a celld without `invoke` or
+        // `--header-env`: name the requirement rather than leave the
+        // operator chasing the network.
         InvokeParse::NoEnvelope => CallAnswer::Transport {
-            message: one_line(&preview(&String::from_utf8_lossy(&output.stderr), 500)),
+            message: format!(
+                "celld invoke gave no answer (staged migrations need celld \
+                 0.6.3-ryuzcorp.7 or newer): {}",
+                one_line(&preview(&String::from_utf8_lossy(&output.stderr), 500))
+            ),
         },
     }
 }
@@ -2824,6 +2833,9 @@ mod tests {
 
     /// A fake `celld` for the staged transport: the committed cohost
     /// fixture, fixture-driven per `invoke --path` like the deploy seam.
+    /// A token no argv may ever contain.
+    const SECRET_TOKEN: &str = "proxy-secret-7f3a";
+
     struct FakeInvoke {
         dir: crate::testutil::TempDir,
     }
@@ -2863,7 +2875,7 @@ mod tests {
                     ],
                     target: "test-app".to_string(),
                 },
-                "token".to_string(),
+                SECRET_TOKEN.to_string(),
             )
             .with_retry_delay(std::time::Duration::from_millis(0))
         }
@@ -2888,6 +2900,25 @@ mod tests {
             std::fs::write(self.dir.path().join(format!("{name}.fail")), message).unwrap();
         }
 
+        /// One line per invoke: the proxy token celld got from its
+        /// environment.
+        fn tokens(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("invoke-token.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// The request bodies celld read from stdin, one per line.
+        fn bodies(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("invoke-body.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
         fn invocations(&self) -> Vec<String> {
             std::fs::read_to_string(self.dir.path().join("invocations.log"))
                 .unwrap_or_default()
@@ -2899,8 +2930,9 @@ mod tests {
 
     /// The staged capabilities probe parses v2 and pins the generation:
     /// every staged pin rides the argv with the app as `--target`, the
-    /// fleet's proxy token on `x-void-internal`, and `--json` for the
-    /// envelope.
+    /// fleet's proxy token reaches `x-void-internal` through the
+    /// environment (`--header-env`, never argv, which every local user can
+    /// read), and `--json` asks for the envelope.
     #[tokio::test]
     async fn staged_capabilities_parses_v2_and_pins_the_generation() {
         let fake = FakeInvoke::spawn();
@@ -2928,7 +2960,7 @@ mod tests {
             "--target test-app",
             "--method GET",
             "--path /__void/migrate/capabilities",
-            "--header x-void-internal:token",
+            "--header-env x-void-internal=NOITE_VOID_PROXY_TOKEN",
             "--json",
             "--bucket s3://noite/fleets/staged",
             "--endpoint http://rustfs:9000",
@@ -2937,6 +2969,12 @@ mod tests {
             assert!(calls[0].contains(expected), "{}", calls[0]);
         }
         assert!(!calls[0].contains("--body"), "{}", calls[0]);
+        assert!(
+            !calls[0].contains(SECRET_TOKEN),
+            "token on argv: {}",
+            calls[0]
+        );
+        assert_eq!(fake.tokens(), vec![SECRET_TOKEN.to_string()]);
     }
 
     /// A non-2xx staged answer reads like the fleet path's: no v2 shape, so
@@ -2994,12 +3032,31 @@ mod tests {
             .filter(|call| call.contains("--path /__void/migrate/app "))
             .collect();
         assert_eq!(posts.len(), 1, "{calls:?}");
-        assert!(posts[0].contains("--body"), "{}", posts[0]);
+        assert!(posts[0].contains("--body-file -"), "{}", posts[0]);
         assert!(
             posts[0].contains("--header content-type:application/json"),
             "{}",
             posts[0]
         );
+        // The JSON body went over stdin, never argv; every call carried
+        // the token through the environment only.
+        assert!(
+            !posts[0].contains("migatt_test"),
+            "body on argv: {}",
+            posts[0]
+        );
+        assert!(
+            fake.bodies()
+                .iter()
+                .any(|body| body.contains("migatt_test")),
+            "{:?}",
+            fake.bodies()
+        );
+        assert!(
+            calls.iter().all(|call| !call.contains(SECRET_TOKEN)),
+            "{calls:?}"
+        );
+        assert!(fake.tokens().iter().all(|token| token == SECRET_TOKEN));
     }
 
     /// The legacy endpoint runs staged too: one POST with no body, the
