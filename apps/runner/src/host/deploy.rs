@@ -2650,6 +2650,7 @@ mod tests {
             extra_sources: Vec::new(),
             extra_hash_input: Vec::new(),
             declares_containers: false,
+            read_root: None,
         }
     }
 
@@ -2822,6 +2823,7 @@ mod tests {
             cwd: None,
             timeout: std::time::Duration::from_secs(30),
             sourcemap: None,
+            read_root: None,
         };
         let staged = crate::host::void_cohost::stage_fleet_in_order(
             &seam.pool,
@@ -2926,6 +2928,7 @@ mod tests {
             cwd: None,
             timeout: std::time::Duration::from_secs(30),
             sourcemap: None,
+            read_root: None,
         };
         let staged = crate::host::void_cohost::stage_fleet_in_order(
             &seam.pool,
@@ -3026,6 +3029,7 @@ mod tests {
             cwd: None,
             timeout: std::time::Duration::from_secs(30),
             sourcemap: None,
+            read_root: None,
         };
         let staged = crate::host::void_cohost::stage_fleet_in_order(
             &seam.pool,
