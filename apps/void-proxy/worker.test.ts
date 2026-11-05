@@ -777,6 +777,35 @@ describe("/revalidate edge purge", () => {
     );
   });
 
+  test("shipped sources never write to the edge cache (delete-only)", async () => {
+    // The proxy may delete its own fleet-local edge entries on
+    // `/revalidate`, but it must never populate, read, or namespace the
+    // cache: any `put`/`match`/`open` on a cache handle would turn the
+    // proxy into a cache writer/reader with its own state. The `EdgeCache`
+    // interface narrows the handle to `delete`, and this pins the sources.
+    const shipped = [
+      "worker.ts",
+      "src/env.ts",
+      "src/isr-keys.ts",
+      "src/auth.ts",
+      "src/revalidate.ts",
+      "src/email/validate.ts",
+      "src/email/smtp.ts",
+      "src/email/send.ts",
+      "src/ai.ts",
+    ];
+
+    const sources = await Promise.all(
+      shipped.map((file) => Bun.file(new URL(file, import.meta.url)).text())
+    );
+
+    for (const source of sources) {
+      expect(source).not.toMatch(
+        /[^A-Za-z]cache\s*\.\s*(?<op>put|match|open)\s*\(/u
+      );
+    }
+  });
+
   test("keys with no derivable edge URL purge from KV only", async () => {
     const kv = new FakeKv();
     kv.store.set(`${DIRECT}/isr/v3/dep1`, "odd");
