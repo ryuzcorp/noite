@@ -28,8 +28,8 @@
 # and CI verifies the digest is what the tag resolves to plus its
 # attestation. A lab build of an unpublished fork tip overrides CELLD_IMAGE
 # with a local image.
-ARG CELLD_VERSION=0.6.3-ryuzcorp.6
-ARG CELLD_DIGEST=sha256:560fea23e4331e6b47ded740dfde1f8c86137f430a33f7e3b62f315df8040b7f
+ARG CELLD_VERSION=0.6.3-ryuzcorp.7
+ARG CELLD_DIGEST=sha256:9305b4fe70d240f48878a2055196697409636a86c2d93971f7c081070013e608
 ARG CELLD_IMAGE=ghcr.io/ryuzcorp/celld:${CELLD_VERSION}@${CELLD_DIGEST}
 # Noite's own release version, reported by the instance heartbeat
 # (`NOITE_BUILD_VERSION` ENV in the runtime stages): the tag without `v` on a
