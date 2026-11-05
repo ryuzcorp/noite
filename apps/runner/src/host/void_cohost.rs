@@ -98,6 +98,10 @@ pub struct RenderedCohost {
     /// Whether the rendered config declares containers: such a script gets
     /// the container deploy timeout (a first image pull), like the app.
     pub declares_containers: bool,
+    /// The directory `celld deploy --read-root` admits beyond the staging
+    /// dir: the sandbox controller's vetted build context, which holds its
+    /// pinned Dockerfile. `None` for scripts that read nothing outside.
+    pub read_root: Option<PathBuf>,
 }
 
 /// The `celld deploy` timeout for a script whose config declares
@@ -380,11 +384,14 @@ async fn run_with_infra_retry(
 /// --json` uploads and validates a version without moving any pointer — no
 /// queue attachment, no named pointer, no fleet pointer — so the staged
 /// version is invisible to serving until the one activate names it. Returns
-/// the attempt count and the staged version.
+/// the attempt count and the staged version. `read_root` names the one
+/// directory beyond `project_dir` that build inputs may come from (celld's
+/// `--read-root`); every other project read stays inside `project_dir`.
 pub async fn celld_stage(
     celld: &CelldDeploy<'_>,
     project_dir: &Path,
     cwd: Option<&Path>,
+    read_root: Option<&Path>,
 ) -> anyhow::Result<(u32, StagedVersion)> {
     let Some(dir) = project_dir.to_str() else {
         anyhow::bail!("deploy root is not valid UTF-8: {}", project_dir.display());
@@ -407,6 +414,13 @@ pub async fn celld_stage(
         };
         args.push("--sourcemap");
         args.push(map);
+    }
+    if let Some(root) = read_root {
+        let Some(root) = root.to_str() else {
+            anyhow::bail!("read root is not valid UTF-8: {}", root.display());
+        };
+        args.push("--read-root");
+        args.push(root);
     }
     let (attempts, stdout) = run_with_infra_retry(celld, &args, cwd).await?;
     Ok((attempts, parse_staged_version(&stdout)?))
@@ -471,6 +485,7 @@ const TENANT_ERROR_MARKERS: &[&str] = &[
     "does not support these config keys",
     "wrangler.toml is not supported",
     "is not a regular file",
+    "escapes the project",
     "config has neither",
     "is a runtime class",
     "without `main`",
@@ -590,17 +605,18 @@ pub async fn stage_cohosted(
             sourcemap: None,
             ..*celld
         };
-        let (attempts, staged) = match celld_stage(&render_celld, &dir, None).await {
-            Ok(staged) => staged,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err(anyhow::anyhow!(
-                    "cohosted script `{}` stage failed: {:#}",
-                    render.script.name,
-                    e
-                ));
-            }
-        };
+        let (attempts, staged) =
+            match celld_stage(&render_celld, &dir, None, render.read_root.as_deref()).await {
+                Ok(staged) => staged,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return Err(anyhow::anyhow!(
+                        "cohosted script `{}` stage failed: {:#}",
+                        render.script.name,
+                        e
+                    ));
+                }
+            };
         let _ = std::fs::remove_dir_all(&dir);
         // The staged version must identify the script just rendered: celld
         // read its name from the same `wrangler.json`, so anything else is
@@ -630,6 +646,9 @@ pub struct FleetApp<'a> {
     pub cwd: Option<&'a Path>,
     pub timeout: Duration,
     pub sourcemap: Option<&'a Path>,
+    /// The checkout the deploy root sits in: build inputs (hoisted
+    /// packages, a root-level Dockerfile) may come from anywhere in it.
+    pub read_root: Option<&'a Path>,
 }
 
 /// What the ordered fleet deploy did, for the deploy log.
@@ -717,7 +736,8 @@ pub async fn deploy_fleet_in_order(
         sourcemap: app.sourcemap,
         ..*celld
     };
-    let (app_attempts, app_staged) = celld_stage(&app_celld, app.dir, app.cwd).await?;
+    let (app_attempts, app_staged) =
+        celld_stage(&app_celld, app.dir, app.cwd, app.read_root).await?;
     let mut generation: Vec<(String, String)> = Vec::with_capacity(outcomes.len() + 1);
     for outcome in &outcomes {
         if let Some(version) = outcome.version.as_ref() {
@@ -783,6 +803,7 @@ mod tests {
             extra_sources: Vec::new(),
             extra_hash_input: Vec::new(),
             declares_containers: false,
+            read_root: None,
         }
     }
 
@@ -957,6 +978,7 @@ mod tests {
             extra_sources: Vec::new(),
             extra_hash_input: Vec::new(),
             declares_containers: false,
+            read_root: None,
         };
         let err = evil.write_project(&dir).unwrap_err();
         assert!(format!("{:#}", err).contains("escapes"), "{:#}", err);
@@ -1271,6 +1293,7 @@ mod tests {
                 cwd: None,
                 timeout: Duration::from_secs(30),
                 sourcemap: None,
+                read_root: None,
             },
         )
         .await
@@ -1368,6 +1391,7 @@ mod tests {
             }],
             extra_hash_input: Vec::new(),
             declares_containers: true,
+            read_root: None,
         };
         let stats = deploy_fleet_in_order(
             &pool,
@@ -1380,6 +1404,7 @@ mod tests {
                 cwd: None,
                 timeout: Duration::from_secs(30),
                 sourcemap: None,
+                read_root: None,
             },
         )
         .await
@@ -1454,6 +1479,7 @@ mod tests {
             cwd: None,
             timeout: Duration::from_secs(30),
             sourcemap: None,
+            read_root: None,
         };
 
         let first =
@@ -1554,6 +1580,7 @@ mod tests {
                 cwd: None,
                 timeout: Duration::from_secs(30),
                 sourcemap: None,
+                read_root: None,
             },
         )
         .await
@@ -1621,6 +1648,7 @@ mod tests {
             cwd: None,
             timeout: Duration::from_secs(30),
             sourcemap: None,
+            read_root: None,
         };
 
         let err = deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
@@ -1700,6 +1728,7 @@ mod tests {
             cwd: None,
             timeout: Duration::from_secs(30),
             sourcemap: None,
+            read_root: None,
         };
 
         let err = deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
@@ -1764,6 +1793,7 @@ mod tests {
             cwd: None,
             timeout: Duration::from_secs(30),
             sourcemap: None,
+            read_root: None,
         };
 
         let stats =
@@ -1889,6 +1919,7 @@ mod tests {
             cwd: None,
             timeout: Duration::from_secs(30),
             sourcemap: None,
+            read_root: None,
         };
 
         let err = deploy_fleet_in_order(&pool, &app.id, None, &celld, &[render("tok")], &app_side)
@@ -1980,6 +2011,7 @@ mod tests {
                 cwd: None,
                 timeout: Duration::from_secs(30),
                 sourcemap: None,
+                read_root: None,
             },
         )
         .await
@@ -2050,6 +2082,7 @@ mod tests {
                 cwd: None,
                 timeout: Duration::from_secs(30),
                 sourcemap: Some(&map_path),
+                read_root: None,
             },
         )
         .await
@@ -2071,6 +2104,70 @@ mod tests {
             calls[2].starts_with("activate ") && !calls[2].contains("--sourcemap"),
             "the activate must not take --sourcemap: {:?}",
             calls
+        );
+    }
+
+    /// Each stage names its own read root and no other: the app its
+    /// checkout, a cohosted script the directory its render carries (the
+    /// sandbox controller's vetted build context), and the activate none.
+    #[tokio::test]
+    async fn each_stage_passes_only_its_own_read_root() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("boot");
+        let app = seed(&pool).await;
+        let fake = FakeCelld::spawn();
+        let log = fake.log();
+        let dir = fake.dir.to_string_lossy().into_owned();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let bin = fake.bin();
+        let celld = CelldDeploy {
+            celld_bin: &bin,
+            env: &env,
+            bucket: "s3://noite/fleets/cohost-read-root",
+            endpoint: "http://rustfs:9000",
+            region: "us-east-1",
+            timeout: Duration::from_secs(30),
+            sourcemap: None,
+        };
+        let guard_app = app_dir();
+        let app_dir = guard_app.path().to_path_buf();
+        let checkout = app_dir.join("checkout");
+        let context = app_dir.join("controller-context");
+        let mut cohosted = render("tok");
+        cohosted.read_root = Some(context.clone());
+
+        deploy_fleet_in_order(
+            &pool,
+            &app.id,
+            None,
+            &celld,
+            &[cohosted],
+            &FleetApp {
+                dir: &app_dir,
+                cwd: None,
+                timeout: Duration::from_secs(30),
+                sourcemap: None,
+                read_root: Some(&checkout),
+            },
+        )
+        .await
+        .unwrap();
+        let calls = fake.invocations();
+        assert_eq!(calls.len(), 3, "{:?}", calls);
+        let roots: Vec<usize> = calls
+            .iter()
+            .map(|call| call.matches("--read-root").count())
+            .collect();
+        assert_eq!(roots, vec![1, 1, 0], "{calls:?}");
+        assert!(
+            calls[0].contains(&format!("--read-root {}", context.display())),
+            "the cohosted stage reads its context: {calls:?}"
+        );
+        assert!(
+            calls[1].contains(&format!("--read-root {}", checkout.display())),
+            "the app stage reads its checkout: {calls:?}"
         );
     }
 }
