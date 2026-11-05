@@ -10,6 +10,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-alpha.19] - 2026-11-05
+
+### Operator action required
+
+- None.
+
+### Fixed
+
+- Void ISR revalidation (`revalidate()`) now purges the app's `caches.default` L1 entries as well as the KV keys: every purged KV key — the base key and every `#rw=` variant, across all deployment ids — also deletes its html and json edge URLs, mirroring Void's self-host purge (best effort per entry, so a degraded Cache API never fails the KV purge). Previously pages served from L1 stayed stale after revalidation. Fleets run `CELLD_CACHE_SCOPE=deployment` so the cohosted proxy shares the app's edge cache, like a Cloudflare zone; the control node keeps celld's default scope.
+
 ## [0.1.0-alpha.18] - 2026-11-05
 
 ### Operator action required
