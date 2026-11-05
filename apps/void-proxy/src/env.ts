@@ -14,6 +14,11 @@ export interface IsrKvNamespace {
   delete: (key: string) => Promise<void>;
 }
 
+/** Minimal `Cache` surface the proxy needs for the ISR edge purge. Real `Cache` satisfies this. */
+export interface EdgeCache {
+  delete: (url: string) => Promise<boolean>;
+}
+
 /** Minimal KV surface the proxy needs for mail idempotency. */
 export interface MailKvNamespace {
   get: (key: string) => Promise<string | null>;
@@ -84,6 +89,7 @@ export interface Env {
 /** Test seams. Production callers omit this and get the platform defaults. */
 export interface ProxyDeps {
   readonly connectSocket?: SocketConnect;
+  readonly edgeCache?: EdgeCache;
   readonly fetchUpstream?: (
     url: string,
     init: RequestInit

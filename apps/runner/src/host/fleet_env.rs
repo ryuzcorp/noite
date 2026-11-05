@@ -244,6 +244,18 @@ pub fn tenant_fleet_env(input: &TenantFleetEnv<'_>) -> Vec<(String, String)> {
     if cfg.fleet_max_rss_mb > 0 {
         put("CELLD_MAX_RSS_MB", cfg.fleet_max_rss_mb.to_string());
     }
+    // Deployment-scoped Workers cache (SPEC, Void platform proxy): every
+    // script of the fleet's deployment shares one `caches.default`, like a
+    // Cloudflare zone, so the cohosted `noite-void-proxy` deletes the
+    // tenant app's ISR L1 entries when `/revalidate` purges KV. Set on
+    // every tenant fleet, Void or not: fleets are single-tenant (one app
+    // per fleet, its own celld process with a process-local store), and
+    // the cohosted scripts hold no cached state of their own — the proxy
+    // only ever deletes edge entries, the sandbox controller never
+    // touches `caches` — so the tenant app gains no read on runner-owned
+    // state and the proxy gains only the delete path `/revalidate`
+    // already authorizes. Older celld ignores the unknown knob.
+    put("CELLD_CACHE_SCOPE", "deployment".to_string());
     // The fleet reaches the engine only through its own proxy socket.
     // Without one (sandboxing off, or the socket unservable) the spawn sets
     // a dead socket rather than leaving `DOCKER_HOST` unset: an unset
@@ -267,8 +279,8 @@ pub struct ControlFleetEnv<'a> {
 }
 
 /// Full environment for the control fleet spawn. Like a tenant fleet but
-/// with no tenant vars, no egress or memory-scope policy of its own, and a
-/// dead engine socket: the control UI declares no container classes, and
+/// with no tenant vars, no egress, memory-scope or cache-scope policy of
+/// its own, and a dead engine socket: the control UI declares no container classes, and
 /// only the runner holds the engine socket. The store credentials and
 /// `RUST_LOG` below used to arrive by inheritance; they are explicit now.
 pub fn control_fleet_env(input: &ControlFleetEnv<'_>) -> Vec<(String, String)> {
@@ -380,6 +392,7 @@ mod tests {
             "CELLD_EGRESS",
             "CELLD_EGRESS_ALLOW",
             "CELLD_MEMORY_SCOPE",
+            "CELLD_CACHE_SCOPE",
             "CELLD_MAX_RSS_MB",
             "DOCKER_HOST",
             "CELLD_OTEL",
@@ -401,6 +414,7 @@ mod tests {
         "CELLD_EGRESS",
         "CELLD_EGRESS_ALLOW",
         "CELLD_MEMORY_SCOPE",
+        "CELLD_CACHE_SCOPE",
         "CELLD_MAX_RSS_MB",
         "CELLD_CONTAINER_RUNTIME",
         "CELLD_CONTAINER_DNS",
@@ -617,6 +631,7 @@ mod tests {
                 "evil.example:443".to_string(),
             ),
             ("CELLD_MEMORY_SCOPE".to_string(), "container".to_string()),
+            ("CELLD_CACHE_SCOPE".to_string(), "container".to_string()),
             ("CELLD_MAX_RSS_MB".to_string(), "1".to_string()),
             (
                 "CELLD_OPERATOR_TOKEN".to_string(),
@@ -645,6 +660,7 @@ mod tests {
         assert_eq!(flat["CELLD_EGRESS"], "public");
         assert_eq!(flat["CELLD_EGRESS_ALLOW"], "rustfs:9000");
         assert_eq!(flat["CELLD_MEMORY_SCOPE"], "self");
+        assert_eq!(flat["CELLD_CACHE_SCOPE"], "deployment");
         assert_eq!(flat["CELLD_MAX_RSS_MB"], "512");
         assert_eq!(flat["CELLD_OPERATOR_TOKEN"], "op-token");
         assert_eq!(flat["DOCKER_HOST"], "unix:///run/noite/app.sock");
@@ -706,6 +722,7 @@ mod tests {
         assert_eq!(flat["no_proxy"], "http://proxy.op:3128/no_proxy");
         assert!(!flat.contains_key("CELLD_EGRESS"));
         assert!(!flat.contains_key("CELLD_MEMORY_SCOPE"));
+        assert!(!flat.contains_key("CELLD_CACHE_SCOPE"));
         assert_eq!(
             flat["DOCKER_HOST"], DEAD_ENGINE_SOCKET,
             "control declares no container classes"

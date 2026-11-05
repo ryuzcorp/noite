@@ -5,6 +5,7 @@
 /* oxlint-disable eslint/max-classes-per-file -- two fakes (KV, socket) share this helper module */
 /* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unsafe-dictionary-type, anti-slop/no-known-value-widening -- test fakes shuttle untyped JSON bodies */
 import type {
+  EdgeCache,
   Env,
   IsrKvNamespace,
   MailKvNamespace,
@@ -126,6 +127,23 @@ export class FakeKv implements IsrKvNamespace, MailKvNamespace {
       keys: rest.map((name) => ({ name })),
       list_complete: done,
     };
+  }
+}
+
+/** In-memory edge cache recording every deleted URL, with failing modes. */
+export class FakeCache implements EdgeCache {
+  readonly deletes: string[] = [];
+  failDelete = false;
+  failUrl: ((url: string) => boolean) | null = null;
+
+  async delete(url: string): Promise<boolean> {
+    if (this.failDelete || this.failUrl?.(url)) {
+      throw new Error("cache boom");
+    }
+
+    this.deletes.push(url);
+
+    return true;
   }
 }
 
