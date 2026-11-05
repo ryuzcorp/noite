@@ -4,4 +4,4 @@
 
 ### Operator action required
 
-- In-worker D1 migrations still run after reload adoption (only the adopted worker can run its bundled migrations), so the new Worker briefly serves the old schema before the `migrate` step — keep migrations backward-compatible, as before. Requires celld `v0.6.3-ryuzcorp.6` (staged activation): do not deploy this runner against an older celld.
+- Requires celld `v0.6.3-ryuzcorp.6` (staged activation): do not deploy this runner against an older celld.

@@ -709,27 +709,37 @@ impl FleetDeployStats {
     }
 }
 
-/// The whole ordered fleet deploy: every script of the generation staged
-/// with `celld deploy --no-activate` — the cohosted scripts first (each
-/// skipped when unchanged), the tenant app last — then one `celld activate
-/// SCRIPT=VERSION...` serving the generation with a single atomic pointer
-/// write. One function owns the sequence, so the order — proxy first, app
-/// last, fleet pointer ends on the app — holds by construction; a failed
-/// stage runs no activate, so the previous generation keeps serving.
-/// Cohost hashes are stored only after the activate commits, so a stored
-/// hash always names activated content. Staged versions a failed deploy
-/// leaves behind are inert — no pointer names them — and the next deploy
-/// reproduces them from the same content (versions are content-addressed);
-/// the fork's docs recommend no post-failure discard (they warn to hold
-/// superseded versions as rollback targets instead), so none runs.
-pub async fn deploy_fleet_in_order(
+/// What the ordered fleet stage produced: every script of the generation
+/// staged with `celld deploy --no-activate` — the cohosted scripts first
+/// (each skipped when unchanged), the tenant app last — with no pointer
+/// moved yet. [`activate_staged`] serves exactly this generation; anything
+/// the deploy runs between the two (the staged Void migrations) sees these
+/// staged versions and nothing else.
+pub struct StagedFleet {
+    pub cohosted: Vec<CohostOutcome>,
+    pub app_attempts: u32,
+    /// The generation the one activate names, deploy order (cohosted
+    /// first, the app last); skipped scripts carry unnamed and are absent.
+    pub generation: Vec<(String, String)>,
+    /// The activate's `--primary`: the app script, which ingress serves —
+    /// and the staged invoke's `--target`, which receives the migrate
+    /// endpoints.
+    pub primary: String,
+}
+
+/// Stage the whole generation without serving it: the cohosted scripts in
+/// order (each skipped when unchanged), the tenant app last. A failed
+/// stage runs no activate, so the previous generation keeps serving — and
+/// the caller decides what runs before [`activate_staged`] commits this
+/// generation, or fails the deploy leaving it unactivated.
+pub async fn stage_fleet_in_order(
     pool: &SqlitePool,
     app_id: &str,
     environment_id: Option<&str>,
     celld: &CelldDeploy<'_>,
     cohosted: &[RenderedCohost],
     app: &FleetApp<'_>,
-) -> anyhow::Result<FleetDeployStats> {
+) -> anyhow::Result<StagedFleet> {
     let outcomes = stage_cohosted(pool, app_id, environment_id, celld, cohosted).await?;
     let app_celld = CelldDeploy {
         timeout: app.timeout,
@@ -745,20 +755,62 @@ pub async fn deploy_fleet_in_order(
         }
     }
     generation.push((app_staged.worker.clone(), app_staged.version.clone()));
-    let activate_attempts = celld_activate(celld, &generation, &app_staged.worker).await?;
-    for outcome in &outcomes {
+    Ok(StagedFleet {
+        primary: app_staged.worker,
+        cohosted: outcomes,
+        app_attempts,
+        generation,
+    })
+}
+
+/// Serve one staged generation: one `celld activate SCRIPT=VERSION...`
+/// with a single atomic pointer write, then store the cohost hashes — only
+/// after the activate commits, so a stored hash always names activated
+/// content. Staged versions a failed deploy leaves behind are inert — no
+/// pointer names them — and the next deploy reproduces them from the same
+/// content (versions are content-addressed); the fork's docs recommend no
+/// post-failure discard (they warn to hold superseded versions as rollback
+/// targets instead), so none runs.
+pub async fn activate_staged(
+    pool: &SqlitePool,
+    app_id: &str,
+    environment_id: Option<&str>,
+    celld: &CelldDeploy<'_>,
+    staged: StagedFleet,
+) -> anyhow::Result<FleetDeployStats> {
+    let activate_attempts = celld_activate(celld, &staged.generation, &staged.primary).await?;
+    for outcome in &staged.cohosted {
         if !outcome.skipped {
             db::set_cohost_hash(pool, app_id, environment_id, outcome.script, &outcome.hash)
                 .await?;
         }
     }
     Ok(FleetDeployStats {
-        cohosted: outcomes,
-        app_attempts,
+        cohosted: staged.cohosted,
+        app_attempts: staged.app_attempts,
         activate_attempts,
-        generation,
-        primary: app_staged.worker,
+        generation: staged.generation,
+        primary: staged.primary,
     })
+}
+
+/// The whole ordered fleet deploy: every script of the generation staged
+/// with `celld deploy --no-activate` — the cohosted scripts first (each
+/// skipped when unchanged), the tenant app last — then one `celld activate
+/// SCRIPT=VERSION...` serving the generation with a single atomic pointer
+/// write. One function owns the sequence, so the order — proxy first, app
+/// last, fleet pointer ends on the app — holds by construction; a failed
+/// stage runs no activate, so the previous generation keeps serving.
+pub async fn deploy_fleet_in_order(
+    pool: &SqlitePool,
+    app_id: &str,
+    environment_id: Option<&str>,
+    celld: &CelldDeploy<'_>,
+    cohosted: &[RenderedCohost],
+    app: &FleetApp<'_>,
+) -> anyhow::Result<FleetDeployStats> {
+    let staged = stage_fleet_in_order(pool, app_id, environment_id, celld, cohosted, app).await?;
+    activate_staged(pool, app_id, environment_id, celld, staged).await
 }
 
 #[cfg(test)]

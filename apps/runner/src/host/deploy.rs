@@ -23,7 +23,7 @@ use crate::host::void_proxy;
 use crate::host::void_sandbox;
 use crate::host::worker_vars;
 use crate::lifecycle::{self, sha_same};
-use crate::models::{App, AppStatus, DeployStatus};
+use crate::models::{App, AppStatus, DeployStatus, Environment};
 use sqlx::SqlitePool;
 
 /// Per-app exclusive lock shared by deploy and purge/delete so S3 fleets/git
@@ -262,6 +262,33 @@ fn fleet_label(app: &App, target: &DeployTarget) -> String {
     match target.environment() {
         Some(env) => format!("{}.{}", app.slug, env.label),
         None => app.slug.clone(),
+    }
+}
+
+/// The row the deploy targets, re-read after staging: for a preview, the
+/// environment's row (a delete raced this build). The fleet must still be
+/// wanted before it (re)starts — the staged migrate below can start a
+/// stopped fleet — so the Void path checks before its migrate, and every
+/// other path right after its own stage-and-activate.
+async fn load_deploy_target(
+    pool: &SqlitePool,
+    app: &App,
+    target: &DeployTarget,
+) -> anyhow::Result<Option<Environment>> {
+    match target {
+        DeployTarget::Production => {
+            if db::get_app(pool, &app.id).await?.is_none() {
+                anyhow::bail!("app {} deleted during deploy; skipping fleet start", app.id);
+            }
+            Ok(None)
+        }
+        DeployTarget::Environment(env) => match db::get_environment(pool, &env.id).await? {
+            Some(fresh) => Ok(Some(fresh)),
+            None => anyhow::bail!(
+                "environment {} deleted during deploy; skipping fleet start",
+                env.id
+            ),
+        },
     }
 }
 
@@ -1118,14 +1145,16 @@ async fn deploy_inner(
     env.push(("CELLD_CONTAINER_PLATFORM", container_platform.as_str()));
     // The ordered fleet deploy (SPEC, Void platform proxy): every script
     // staged with `celld deploy --no-activate` — the cohosted scripts first
-    // (each skipped when unchanged), the tenant app last — then one `celld
-    // activate` serving the generation. A Void app with a merged root
-    // renders its proxy here — with the token the merge above ensured, read
-    // once for the whole deploy — plus its sandbox controller when one
-    // staged (the controller's lower order stages it first), while any
-    // other app stages exactly one script, as before. The shared invocation
-    // fails the deploy on a non-UTF-8 deploy root (work-dir-derived paths
-    // are operator-influenced) instead of panicking the deploy task.
+    // (each skipped when unchanged), the tenant app last — the Void
+    // migrations of a redeploy running against that staged generation
+    // through `celld invoke`, then one `celld activate` serving the
+    // generation. A Void app with a merged root renders its proxy here —
+    // with the token the merge above ensured, read once for the whole
+    // deploy — plus its sandbox controller when one staged (the
+    // controller's lower order stages it first), while any other app
+    // stages exactly one script, as before. The shared invocation fails
+    // the deploy on a non-UTF-8 deploy root (work-dir-derived paths are
+    // operator-influenced) instead of panicking the deploy task.
     let cohosted = if let Some(proxy_token) = &void_proxy_token {
         let mut scripts = Vec::new();
         if let Some(staged) = &staged_sandbox {
@@ -1195,25 +1224,98 @@ async fn deploy_inner(
         Ok(_) => anyhow::bail!("could not clear the worker source map path before deploy"),
         Err(e) => return Err(e).context("check the worker source map path before deploy"),
     }
-    let stats = void_cohost::deploy_fleet_in_order(
-        pool,
-        &app.id,
-        target.environment_id(),
-        &celld,
-        &cohosted,
-        &void_cohost::FleetApp {
-            dir: &deploy_root,
-            cwd: Some(&work),
-            timeout: if declares_containers {
-                void_cohost::CONTAINER_DEPLOY_TIMEOUT
-            } else {
-                Duration::from_secs(120)
-            },
-            sourcemap: Some(&worker_map_path),
-            read_root: Some(&src_dir),
+    let app_side = void_cohost::FleetApp {
+        dir: &deploy_root,
+        cwd: Some(&work),
+        timeout: if declares_containers {
+            void_cohost::CONTAINER_DEPLOY_TIMEOUT
+        } else {
+            Duration::from_secs(120)
         },
-    )
-    .await?;
+        sourcemap: Some(&worker_map_path),
+        read_root: Some(&src_dir),
+    };
+    let mut migrated_staged = false;
+    // Void apps split the ordered deploy around their migrations: every
+    // script staged first, the migrations driven against that staged
+    // generation, then the one activate serving it. Every other app stages
+    // and activates as one step, as before.
+    let (stats, environment) = if void_app {
+        let staged = void_cohost::stage_fleet_in_order(
+            pool,
+            &app.id,
+            target.environment_id(),
+            &celld,
+            &cohosted,
+            &app_side,
+        )
+        .await?;
+        // The row the deploy targets must still be there before the fleet
+        // starts: for a preview, the environment's row (a delete raced
+        // this build). The staged migrate below can (re)start the fleet,
+        // so the check runs before it.
+        let environment = load_deploy_target(pool, app, target).await?;
+        // A redeploy has a previous generation that could be serving: run
+        // the migrations against the staged generation now, before the
+        // activate moves traffic to it. A migrate failure fails the deploy
+        // here — the old version keeps serving, nothing activates. A
+        // first deploy (or a fleet with no servable generation — wiped
+        // bucket, fleet that cannot boot) has no old schema to protect, so
+        // the migrate step stays after activation there, as before.
+        let previously_deployed = match target.environment() {
+            Some(env) => env.is_deployed(),
+            None => app.is_deployed(),
+        };
+        if previously_deployed {
+            match ensure_prior_fleet_healthy(pool, cfg, procs, logs, app, environment.as_ref())
+                .await
+            {
+                Ok(()) => {
+                    migrate_void_app_staged(
+                        MigrateInputs {
+                            pool,
+                            cfg,
+                            app,
+                            target,
+                            src_dir: &src_dir,
+                            deploy_root: &deploy_root,
+                            commit_sha: &commit_sha,
+                            progress: &mut *progress,
+                        },
+                        &celld,
+                        &staged,
+                    )
+                    .await?;
+                    migrated_staged = true;
+                }
+                Err(error) => {
+                    progress
+                        .log(
+                            DeployStatus::Deploying,
+                            &format!(
+                                "migrate: staged invoke unavailable ({error:#}); migrating after activation\n"
+                            ),
+                        )
+                        .await?;
+                }
+            }
+        }
+        let stats =
+            activate_after_staged_migrate(pool, app, target, &celld, staged, progress).await?;
+        (stats, environment)
+    } else {
+        let stats = void_cohost::deploy_fleet_in_order(
+            pool,
+            &app.id,
+            target.environment_id(),
+            &celld,
+            &cohosted,
+            &app_side,
+        )
+        .await?;
+        let environment = load_deploy_target(pool, app, target).await?;
+        (stats, environment)
+    };
     for line in stats.log_lines() {
         progress.log(DeployStatus::Deploying, &line).await?;
     }
@@ -1224,26 +1326,6 @@ async fn deploy_inner(
         .await
         .map_err(|e| format!("{e:#}"));
 
-    // The row the deploy targets must still be there before the fleet starts:
-    // for a preview, the environment's row (a delete raced this build).
-    let environment = match target {
-        DeployTarget::Production => {
-            if db::get_app(pool, &app.id).await?.is_none() {
-                anyhow::bail!(
-                    "app {} deleted after celld deploy; skipping fleet start",
-                    app.id
-                );
-            }
-            None
-        }
-        DeployTarget::Environment(env) => match db::get_environment(pool, &env.id).await? {
-            Some(fresh) => Some(fresh),
-            None => anyhow::bail!(
-                "environment {} deleted after celld deploy; skipping fleet start",
-                env.id
-            ),
-        },
-    };
     // Only production records the deployed Wrangler config: it is what the
     // app's storage views render, and a preview's config must not overwrite it.
     if environment.is_none() {
@@ -1310,12 +1392,13 @@ async fn deploy_inner(
         }
     }
 
-    // D1 migrations for Void apps (SPEC, Deploy pipeline): the new
-    // generation is adopted and healthy; run its in-worker migration
-    // endpoints before the deploy is marked success. A stop in the window
-    // skips them like it skips the gate (redeploy to run them); anything
-    // else failing fails the deploy.
-    if void_app && !fleet_stopped_early {
+    // D1 migrations for Void apps (SPEC, Deploy pipeline): a redeploy
+    // already ran them against the staged generation above, so only a
+    // first deploy — or a fleet no staged invoke could reach — runs them
+    // here, against the adopted fleet, before the deploy is marked
+    // success. A stop in the window skips them like it skips the gate
+    // (redeploy to run them); anything else failing fails the deploy.
+    if void_app && !migrated_staged && !fleet_stopped_early {
         migrate_void_app(MigrateInputs {
             pool,
             cfg,
@@ -1327,7 +1410,7 @@ async fn deploy_inner(
             progress: &mut *progress,
         })
         .await?;
-    } else if void_app {
+    } else if void_app && !migrated_staged {
         progress
             .log(
                 DeployStatus::Deploying,
@@ -1386,17 +1469,9 @@ async fn deploy_inner(
     Ok(())
 }
 
-/// Run a Void app's D1 migrations through the new generation's in-worker
-/// endpoints (`host/void_migrate.rs`): protocol v2 where the worker
-/// advertises it (negotiated against the pushed tree's `db/migrations`), the
-/// legacy endpoint for older sqlite runtimes, and a loud refusal for
-/// Postgres/MySQL (Hyperdrive, which Noite does not run). Runs against this
-/// target's own fleet, so a preview migrates its own D1 and never
-/// production's. Every failure fails the deploy; applied migrations stay
-/// applied (forward-only).
-/// Everything the `migrate` step borrows, grouped so the step stays a plain
-/// function (eight loose parameters would need a lint exception, which the
-/// repo does not add).
+/// Everything the `migrate` step borrows, grouped so each delivery stays a
+/// plain function (eight loose parameters would need a lint exception,
+/// which the repo does not add).
 struct MigrateInputs<'a, 'b, 'c> {
     pool: &'a SqlitePool,
     cfg: &'a Config,
@@ -1408,55 +1483,56 @@ struct MigrateInputs<'a, 'b, 'c> {
     progress: &'b mut Progress<'c>,
 }
 
-async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<()> {
+/// What both migrate deliveries share: the pushed tree's migration files
+/// plus the fleet's proxy token the worker checks.
+struct MigrateSetup {
+    files: Vec<void_migrate::MigrationFile>,
+    proxy_token: String,
+}
+
+/// Open the `migrate` step: the step line, the pushed tree's migration
+/// files, and the fleet's token. The tree walk is blocking I/O, off the
+/// async workers like the other blocking reads in this pipeline; the token
+/// comes from the runner-owned merge earlier in this deploy (reused here,
+/// never re-minted).
+async fn begin_migrate(
+    inputs: &mut MigrateInputs<'_, '_, '_>,
+    detail: &str,
+) -> anyhow::Result<MigrateSetup> {
     inputs
         .progress
-        .step(
-            "migrate",
-            DeployStatus::Deploying,
-            "D1 migrations via the new worker",
-        )
+        .step("migrate", DeployStatus::Deploying, detail)
         .await?;
     let environment_id = inputs.target.environment().map(|env| env.id.as_str());
-    // Blocking tree I/O (directory walk, capped file reads): off the async
-    // workers, as the other blocking reads in this pipeline.
     let src_dir = inputs.src_dir.to_path_buf();
     let files = tokio::task::spawn_blocking(move || {
         void_migrate::collect_migrations(&void_migrate::resolve_migrations_dir(&src_dir)?)
     })
     .await
     .map_err(|e| anyhow::anyhow!("migration collection failed: {}", e))??;
-    // The fleet's token, minted by the runner-owned merge earlier in this
-    // deploy (reused here, never re-minted): the worker checks it.
     let (proxy_token, _) =
         void_deploy::ensure_proxy_token(inputs.pool, &inputs.app.id, environment_id).await?;
-    let fleet_port = match inputs.target.environment() {
-        Some(env) => env.listen_port,
-        None => inputs.app.listen_port,
-    };
-    let Some(port) = fleet_port else {
-        if files.is_empty() {
-            inputs
-                .progress
-                .log(DeployStatus::Deploying, "migrate: no migrations to run\n")
-                .await?;
-            return Ok(());
-        }
-        anyhow::bail!(
-            "cannot run {} migration(s): the fleet has no listen port to reach the worker on",
-            files.len()
-        );
-    };
-    let client = void_migrate::MigrationClient::new(
-        void_migrate::migration_http_client(),
-        format!("http://{}:{}", inputs.cfg.caddy_upstream_host, port),
-        proxy_token,
-    );
-    // The health gate above was the readiness probe, so a fleet that answers
-    // it answers this too; still, a transport failure gets two slow-accept
-    // beats before it fails the deploy. Any answered probe without a v2
-    // shape means no v2 handler (a 404 from the inputs.app router, a legacy-only
-    // runtime), decided below from the tree.
+    Ok(MigrateSetup { files, proxy_token })
+}
+
+/// Run the migration protocol over one delivery: the capabilities probe
+/// (retried twice on transport failure), then v2 against the staged or
+/// new worker (negotiated against the pushed tree) or the legacy endpoint
+/// for older sqlite runtimes, with the Hyperdrive refusal before the
+/// empty-tree return. The attempt/reconcile semantics live in the client;
+/// this drives the same sequence for both deliveries.
+async fn drive_migration_protocol(
+    progress: &mut Progress<'_>,
+    fleet: &str,
+    files: &[void_migrate::MigrationFile],
+    client: &void_migrate::MigrationClient,
+    deploy_root: &Path,
+    deployment_id: &str,
+) -> anyhow::Result<()> {
+    // Any answered probe without a v2 shape means no v2 handler (a 404
+    // from the inputs.app router, a legacy-only runtime), decided below
+    // from the tree; a transport failure retries the probe twice before
+    // the deploy fails.
     let mut capabilities = None;
     let mut answered_without_v2 = false;
     let mut unreachable = String::new();
@@ -1471,7 +1547,7 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
             }
             Err(void_migrate::ProbeError::Transport { message }) => {
                 tracing::warn!(
-                    fleet = %fleet_label(inputs.app, inputs.target),
+                    fleet = %fleet,
                     attempt,
                     error = %message,
                     "migration capabilities probe failed"
@@ -1509,7 +1585,7 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
         }
         if !files.is_empty() {
             let bundle =
-                void_migrate::build_plan_bundle(&files).map_err(|e| anyhow::anyhow!("{}", e))?;
+                void_migrate::build_plan_bundle(files).map_err(|e| anyhow::anyhow!("{}", e))?;
             if caps.migration_list_hash != bundle.migration_list_hash {
                 diffs.push(format!(
                     "migrationListHash worker={} manifest={}",
@@ -1525,7 +1601,7 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
             );
         }
         if files.is_empty() {
-            inputs.progress
+            progress
                 .log(
                     DeployStatus::Deploying,
                     "migrate: the pushed tree has no db/migrations; applying the worker's bundled migrations without a list-hash check\n",
@@ -1533,26 +1609,22 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
                 .await?;
         }
         let response = client
-            .migrate_app(
-                &void_migrate::mint_attempt_id(),
-                inputs.progress.id.as_deref().unwrap_or(inputs.commit_sha),
-            )
+            .migrate_app(&void_migrate::mint_attempt_id(), deployment_id)
             .await;
-        log_migrate_warnings(inputs.progress, &response).await?;
+        log_migrate_warnings(progress, &response).await?;
         if !response.ok {
             anyhow::bail!(
                 "migration failed: {}",
                 void_migrate::format_migration_failure(&response)
             );
         }
-        log_migrate_outcome(inputs.progress, &response).await?;
+        log_migrate_outcome(progress, &response).await?;
         if caps.auth_endpoint.is_some() {
             client
                 .migrate_auth()
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-            inputs
-                .progress
+            progress
                 .log(
                     DeployStatus::Deploying,
                     "migrate: auth migrations applied\n",
@@ -1571,7 +1643,7 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
     // whose handlers serve the legacy endpoint only and need Hyperdrive.
     // The refusal runs before the empty-tree early return, so a prebuilt pg
     // tree (no `db/migrations`) can never deploy green with an empty DB.
-    let config = effective_config(inputs.deploy_root)
+    let config = effective_config(deploy_root)
         .await
         .and_then(|text| serde_json::from_str(&text).ok())
         .ok_or_else(|| {
@@ -1583,8 +1655,7 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
         );
     }
     if files.is_empty() {
-        inputs
-            .progress
+        progress
             .log(DeployStatus::Deploying, "migrate: no migrations to run\n")
             .await?;
         return Ok(());
@@ -1599,7 +1670,163 @@ async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<(
             void_migrate::format_migration_failure(&response)
         );
     }
-    log_migrate_outcome(inputs.progress, &response).await?;
+    log_migrate_outcome(progress, &response).await?;
+    Ok(())
+}
+
+/// Run a Void app's D1 migrations through the staged generation's in-worker
+/// endpoints, before the activate serves them: the same protocol as
+/// [`migrate_void_app`], delivered by `celld invoke` (operator token and
+/// fleet HMAC over `CELLD_*`, like `celld d1 execute`) with the cohosted
+/// pins plus the app as `--target`. Runs against this target's own fleet,
+/// so a preview migrates its own D1 and never production's. A failure
+/// fails the deploy with nothing activated, so the old version keeps
+/// serving; applied migrations stay applied (forward-only).
+async fn migrate_void_app_staged(
+    inputs: MigrateInputs<'_, '_, '_>,
+    celld: &void_cohost::CelldDeploy<'_>,
+    staged: &void_cohost::StagedFleet,
+) -> anyhow::Result<()> {
+    let mut inputs = inputs;
+    let setup = begin_migrate(&mut inputs, "D1 migrations via the staged worker").await?;
+    let env: Vec<(String, String)> = celld
+        .env
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect();
+    let client = void_migrate::MigrationClient::staged(
+        void_migrate::StagedTarget {
+            celld_bin: celld.celld_bin.to_string(),
+            env,
+            bucket: celld.bucket.to_string(),
+            endpoint: celld.endpoint.to_string(),
+            region: celld.region.to_string(),
+            pins: staged.generation.clone(),
+            target: staged.primary.clone(),
+        },
+        setup.proxy_token,
+    );
+    let fleet = fleet_label(inputs.app, inputs.target);
+    let deployment_id = inputs
+        .progress
+        .id
+        .clone()
+        .unwrap_or_else(|| inputs.commit_sha.to_string());
+    drive_migration_protocol(
+        inputs.progress,
+        &fleet,
+        &setup.files,
+        &client,
+        inputs.deploy_root,
+        &deployment_id,
+    )
+    .await
+}
+
+/// Activate the staged generation after a successful staged migrate: the
+/// deploy step resumes first, so an activate failure is reported under
+/// `deploy` instead of the finished `migrate` step.
+async fn activate_after_staged_migrate(
+    pool: &SqlitePool,
+    app: &App,
+    target: &DeployTarget,
+    celld: &void_cohost::CelldDeploy<'_>,
+    staged: void_cohost::StagedFleet,
+    progress: &mut Progress<'_>,
+) -> anyhow::Result<void_cohost::FleetDeployStats> {
+    progress
+        .step("deploy", DeployStatus::Deploying, "celld activate")
+        .await?;
+    void_cohost::activate_staged(pool, &app.id, target.environment_id(), celld, staged).await
+}
+
+/// Run a Void app's D1 migrations through the new generation's in-worker
+/// endpoints (`host/void_migrate.rs`): protocol v2 where the worker
+/// advertises it (negotiated against the pushed tree's `db/migrations`), the
+/// legacy endpoint for older sqlite runtimes, and a loud refusal for
+/// Postgres/MySQL (Hyperdrive, which Noite does not run). Runs against this
+/// target's own fleet, so a preview migrates its own D1 and never
+/// production's. Every failure fails the deploy; applied migrations stay
+/// applied (forward-only). This is the post-activation delivery — a first
+/// deploy, or a redeploy no staged invoke could reach; redeploys run the
+/// same protocol staged, through [`migrate_void_app_staged`].
+async fn migrate_void_app(inputs: MigrateInputs<'_, '_, '_>) -> anyhow::Result<()> {
+    let mut inputs = inputs;
+    // The health gate above was the readiness probe, so a fleet that answers
+    // it answers this too.
+    let setup = begin_migrate(&mut inputs, "D1 migrations via the new worker").await?;
+    let fleet_port = match inputs.target.environment() {
+        Some(env) => env.listen_port,
+        None => inputs.app.listen_port,
+    };
+    let Some(port) = fleet_port else {
+        if setup.files.is_empty() {
+            inputs
+                .progress
+                .log(DeployStatus::Deploying, "migrate: no migrations to run\n")
+                .await?;
+            return Ok(());
+        }
+        anyhow::bail!(
+            "cannot run {} migration(s): the fleet has no listen port to reach the worker on",
+            setup.files.len()
+        );
+    };
+    let client = void_migrate::MigrationClient::new(
+        void_migrate::migration_http_client(),
+        format!("http://{}:{}", inputs.cfg.caddy_upstream_host, port),
+        setup.proxy_token,
+    );
+    let fleet = fleet_label(inputs.app, inputs.target);
+    let deployment_id = inputs
+        .progress
+        .id
+        .clone()
+        .unwrap_or_else(|| inputs.commit_sha.to_string());
+    drive_migration_protocol(
+        inputs.progress,
+        &fleet,
+        &setup.files,
+        &client,
+        inputs.deploy_root,
+        &deployment_id,
+    )
+    .await
+}
+
+/// The fleet the staged migrations need: the previous generation must be
+/// serving (or bootable) for a staged invoke to have a node to run on.
+/// Spawning here is the same call the start step makes below — just earlier
+/// — so a stopped or asleep fleet wakes for the migrate and the activate
+/// below adopts the new generation into it. A fleet that cannot boot serves
+/// nothing, so the caller falls back to migrating after activation.
+async fn ensure_prior_fleet_healthy(
+    pool: &SqlitePool,
+    cfg: &Config,
+    procs: &ProcMap,
+    logs: &LogState,
+    app: &App,
+    environment: Option<&Environment>,
+) -> anyhow::Result<()> {
+    match environment {
+        Some(env) => {
+            supervisor::ensure_environment_fleet(pool, cfg, procs, logs, env).await?;
+        }
+        None => {
+            supervisor::ensure_fleet(pool, cfg, procs, logs, app).await?;
+        }
+    }
+    let port = match environment {
+        Some(env) => env.listen_port,
+        None => app.listen_port,
+    };
+    let Some(port) = port else {
+        anyhow::bail!("the prior fleet has no listen port for the staged migration");
+    };
+    let budget = std::time::Duration::from_secs(cfg.wake_timeout_s.max(1));
+    if !crate::host::sleep::wait_healthy(cfg, port, budget).await {
+        anyhow::bail!("prior fleet not healthy within {}s", cfg.wake_timeout_s);
+    }
     Ok(())
 }
 
@@ -2056,9 +2283,10 @@ pub async fn deploy_tip(
 #[cfg(test)]
 mod tests {
     use super::{
-        contained_deploy_root, failure_summary, go_arch, has_build_script, log_migrate_warnings,
-        migrate_void_app, parse_wrangler_build, quoted, route_live, wipe_worktree,
-        without_runner_keys, DeployTarget, MigrateInputs, Progress,
+        activate_after_staged_migrate, contained_deploy_root, failure_summary, go_arch,
+        has_build_script, log_migrate_warnings, migrate_void_app, migrate_void_app_staged,
+        parse_wrangler_build, quoted, route_live, wipe_worktree, without_runner_keys, DeployTarget,
+        MigrateInputs, Progress,
     };
     use serde_json::json;
 
@@ -2412,6 +2640,552 @@ mod tests {
             run_migrate_once("sqlite", r#"{"d1_databases": [{"binding": "DB"}]}"#).await;
         outcome.expect("an empty sqlite tree skips the step");
         assert!(log.contains("migrate: no migrations to run"), "{}", log);
+    }
+
+    // --- staged migrate sequencing ------------------------------------------
+
+    /// One cohosted script render for the staged-migrate seam: the proxy
+    /// stages beside the app, so the invoke pins prove the cohosted
+    /// scripts ride staged together with the app as `--target`.
+    static STAGED_PROXY: crate::host::void_cohost::CohostedScript =
+        crate::host::void_cohost::CohostedScript {
+            name: "test-proxy",
+            main: "worker.js",
+            sources: &[],
+            order: 0,
+        };
+
+    fn staged_proxy() -> crate::host::void_cohost::RenderedCohost {
+        crate::host::void_cohost::RenderedCohost {
+            script: &STAGED_PROXY,
+            secret_vars: &[],
+            config: json!({
+                "name": "test-proxy",
+                "main": "worker.js",
+                "compatibility_date": "2026-09-01",
+            }),
+            extra_sources: Vec::new(),
+            extra_hash_input: Vec::new(),
+            declares_containers: false,
+            read_root: None,
+        }
+    }
+
+    /// The staged-migrate seam: a memory pool, a test app, a pushed tree
+    /// with one migration, a deploy root, and the fake celld answering
+    /// `deploy` plus fixture-driven `invoke`. Every guard cleans up on
+    /// drop, including on a failing assert.
+    struct StagedSeam {
+        pool: sqlx::SqlitePool,
+        cfg: crate::config::Config,
+        app: crate::models::App,
+        dir: crate::testutil::TempDir,
+        src: crate::testutil::TempDir,
+        root: crate::testutil::TempDir,
+        bin: String,
+        list_hash: String,
+    }
+
+    impl StagedSeam {
+        async fn spawn(tag: &str) -> Self {
+            let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+            let dir = crate::testutil::TempDir::new(&format!("noite-staged-{tag}"));
+            // A symlink to the committed script, never a fresh file: the
+            // cohost seam's rule (ETXTBSY under parallel load).
+            let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/fake-celld-cohost.sh");
+            std::os::unix::fs::symlink(&fixture, dir.path().join("celld")).unwrap();
+            let mut cfg = crate::config::config_for_tests();
+            let bin = dir.path().join("celld").to_string_lossy().into_owned();
+            cfg.celld_bin = bin.clone();
+            let app = crate::db::create_app(
+                &pool,
+                &cfg,
+                crate::db::NewApp {
+                    name: "staged-mig",
+                    slug: "staged-mig",
+                    user_id: "local",
+                    subdomain: "staged-mig.localhost",
+                    listen: 30200,
+                    internal: 30201,
+                },
+            )
+            .await
+            .unwrap();
+            let src = crate::testutil::TempDir::new(&format!("noite-staged-src-{tag}"));
+            std::fs::create_dir_all(src.path().join("db/migrations")).unwrap();
+            std::fs::write(
+                src.path().join("db/migrations/0001.sql"),
+                "CREATE TABLE users (\n  id INTEGER PRIMARY KEY,\n  email TEXT NOT NULL\n);\n",
+            )
+            .unwrap();
+            let root = crate::testutil::TempDir::new(&format!("noite-staged-root-{tag}"));
+            std::fs::write(
+                root.path().join("wrangler.json"),
+                r#"{"name": "test-app", "main": "worker.js"}"#,
+            )
+            .unwrap();
+            let files = crate::host::void_migrate::collect_migrations(
+                &crate::host::void_migrate::resolve_migrations_dir(src.path()).unwrap(),
+            )
+            .unwrap();
+            let bundle = crate::host::void_migrate::build_plan_bundle(&files).unwrap();
+            Self {
+                pool,
+                cfg,
+                app,
+                dir,
+                src,
+                root,
+                bin,
+                list_hash: bundle.migration_list_hash,
+            }
+        }
+
+        /// The `celld` invocation shape the stage and the staged migrate
+        /// share: the fake's log and dir ride the env, like the operator
+        /// token and bucket credentials ride `CELLD_*` in production.
+        fn celld<'x>(
+            &'x self,
+            env: &'x [(&'x str, &'x str)],
+        ) -> crate::host::void_cohost::CelldDeploy<'x> {
+            crate::host::void_cohost::CelldDeploy {
+                celld_bin: &self.bin,
+                env,
+                bucket: "s3://noite/fleets/staged-mig",
+                endpoint: "http://rustfs:9000",
+                region: "us-east-1",
+                timeout: std::time::Duration::from_secs(30),
+                sourcemap: None,
+            }
+        }
+
+        /// Write one `--json` invoke fixture: the full result envelope the
+        /// fake cats to stdout for the endpoint `name`.
+        fn write_invoke(&self, name: &str, status: u16, body: &str) {
+            use base64::Engine as _;
+            let envelope = serde_json::json!({
+                "status": status,
+                "headers": {},
+                "body": base64::engine::general_purpose::STANDARD.encode(body),
+            });
+            std::fs::write(
+                self.dir.path().join(name),
+                serde_json::to_string(&envelope).unwrap(),
+            )
+            .unwrap();
+        }
+
+        fn fail_invoke(&self, name: &str, message: &str) {
+            std::fs::write(self.dir.path().join(format!("{name}.fail")), message).unwrap();
+        }
+
+        fn write_capabilities(&self) {
+            let body = serde_json::json!({
+                "protocolVersion": 2,
+                "dialect": "sqlite",
+                "classifierVersion": crate::host::void_migrate::CLASSIFIER_VERSION,
+                "migrationListHash": self.list_hash,
+                "destructiveValidation": "passed",
+                "endpoints": {"auth": "/auth"},
+            });
+            self.write_invoke("invoke-capabilities", 200, &body.to_string());
+        }
+
+        fn invocations(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("invocations.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    /// The `activate` invocations among the fake's log lines.
+    fn staged_activates(calls: &[String]) -> Vec<&String> {
+        calls
+            .iter()
+            .filter(|call| call.starts_with("activate "))
+            .collect()
+    }
+
+    /// The staged-migrate sequencing: a failing migrate runs no activate,
+    /// so the old version keeps serving. The fake stages proxy + app, the
+    /// capabilities probe negotiates v2, the app endpoint answers `ok:
+    /// false` — definitive — and the activate never runs.
+    #[tokio::test]
+    async fn staged_migrate_failure_runs_no_activate() {
+        let seam = StagedSeam::spawn("fail").await;
+        seam.write_capabilities();
+        seam.write_invoke(
+            "invoke-app",
+            200,
+            r#"{"ok":false,"migrations":[],"error":"boom"}"#,
+        );
+        let log = seam
+            .dir
+            .path()
+            .join("invocations.log")
+            .to_string_lossy()
+            .into_owned();
+        let dir = seam.dir.path().to_string_lossy().into_owned();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let celld = seam.celld(&env);
+        let target = DeployTarget::Production;
+        let app_side = crate::host::void_cohost::FleetApp {
+            dir: seam.root.path(),
+            cwd: None,
+            timeout: std::time::Duration::from_secs(30),
+            sourcemap: None,
+            read_root: None,
+        };
+        let staged = crate::host::void_cohost::stage_fleet_in_order(
+            &seam.pool,
+            &seam.app.id,
+            None,
+            &celld,
+            &[staged_proxy()],
+            &app_side,
+        )
+        .await
+        .expect("stage");
+        assert_eq!(
+            staged.generation,
+            vec![
+                ("test-proxy".to_string(), "0000000000000001".to_string()),
+                ("test-app".to_string(), "0000000000000002".to_string()),
+            ]
+        );
+        let mut progress = Progress {
+            pool: &seam.pool,
+            app_id: &seam.app.id,
+            environment_id: None,
+            sha: Some("abc123".to_string()),
+            id: None,
+            step: "migrate",
+        };
+        let err = migrate_void_app_staged(
+            MigrateInputs {
+                pool: &seam.pool,
+                cfg: &seam.cfg,
+                app: &seam.app,
+                target: &target,
+                src_dir: seam.src.path(),
+                deploy_root: seam.root.path(),
+                commit_sha: "abc123",
+                progress: &mut progress,
+            },
+            &celld,
+            &staged,
+        )
+        .await
+        .expect_err("a failed migrate fails the deploy");
+        assert!(
+            format!("{err:#}").contains("migration failed: boom"),
+            "{err:#}"
+        );
+        let calls = seam.invocations();
+        let app_invoke = calls
+            .iter()
+            .find(|call| call.contains("--path /__void/migrate/app "))
+            .expect("the app endpoint runs through invoke");
+        // The invoke pinned the staged generation together, app as target.
+        for pinned in [
+            "test-proxy=0000000000000001",
+            "test-app=0000000000000002",
+            "--target test-app",
+            "--header-env x-void-internal=NOITE_VOID_PROXY_TOKEN",
+            "--json",
+            "--bucket s3://noite/fleets/staged-mig",
+        ] {
+            assert!(app_invoke.contains(pinned), "{app_invoke}");
+        }
+        assert!(
+            staged_activates(&calls).is_empty(),
+            "no activate after a failed migrate: {calls:?}"
+        );
+        // Nothing committed: no cohost hash names staged content.
+        let stored = crate::db::get_cohost_hash(&seam.pool, &seam.app.id, None, "test-proxy")
+            .await
+            .unwrap();
+        assert_eq!(stored, None);
+    }
+
+    /// A successful staged migrate activates the staged generation: the
+    /// same pins the invoke saw, with the app as primary — and the auth
+    /// migrations run before activation too.
+    #[tokio::test]
+    async fn staged_migrate_success_activates_the_staged_generation() {
+        let seam = StagedSeam::spawn("ok").await;
+        seam.write_capabilities();
+        seam.write_invoke(
+            "invoke-app",
+            200,
+            r#"{"ok":true,"migrations":[{"name":"0001.sql","applied":true}]}"#,
+        );
+        seam.write_invoke("invoke-auth", 200, r#"{"ok":true}"#);
+        let log = seam
+            .dir
+            .path()
+            .join("invocations.log")
+            .to_string_lossy()
+            .into_owned();
+        let dir = seam.dir.path().to_string_lossy().into_owned();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let celld = seam.celld(&env);
+        let target = DeployTarget::Production;
+        let app_side = crate::host::void_cohost::FleetApp {
+            dir: seam.root.path(),
+            cwd: None,
+            timeout: std::time::Duration::from_secs(30),
+            sourcemap: None,
+            read_root: None,
+        };
+        let staged = crate::host::void_cohost::stage_fleet_in_order(
+            &seam.pool,
+            &seam.app.id,
+            None,
+            &celld,
+            &[staged_proxy()],
+            &app_side,
+        )
+        .await
+        .expect("stage");
+        let mut progress = Progress {
+            pool: &seam.pool,
+            app_id: &seam.app.id,
+            environment_id: None,
+            sha: Some("abc123".to_string()),
+            id: None,
+            step: "migrate",
+        };
+        migrate_void_app_staged(
+            MigrateInputs {
+                pool: &seam.pool,
+                cfg: &seam.cfg,
+                app: &seam.app,
+                target: &target,
+                src_dir: seam.src.path(),
+                deploy_root: seam.root.path(),
+                commit_sha: "abc123",
+                progress: &mut progress,
+            },
+            &celld,
+            &staged,
+        )
+        .await
+        .expect("staged migrate");
+        let log: String = sqlx::query_scalar("SELECT log FROM deploy WHERE id = ?")
+            .bind(progress.id.clone().unwrap_or_default())
+            .fetch_one(&seam.pool)
+            .await
+            .unwrap();
+        assert!(log.contains("migrate: applied 1"), "{log}");
+        assert!(log.contains("migrate: auth migrations applied"), "{log}");
+        let stats = crate::host::void_cohost::activate_staged(
+            &seam.pool,
+            &seam.app.id,
+            None,
+            &celld,
+            staged,
+        )
+        .await
+        .expect("activate");
+        assert_eq!(stats.activate_attempts, 1);
+        let calls = seam.invocations();
+        let activates = staged_activates(&calls);
+        assert_eq!(activates.len(), 1, "{calls:?}");
+        for pinned in [
+            "test-proxy=0000000000000001",
+            "test-app=0000000000000002",
+            "--primary test-app",
+        ] {
+            assert!(activates[0].contains(pinned), "{}", activates[0]);
+        }
+        let stored = crate::db::get_cohost_hash(&seam.pool, &seam.app.id, None, "test-proxy")
+            .await
+            .unwrap();
+        assert!(stored.is_some());
+    }
+
+    /// An activate failure after a successful staged migrate is reported
+    /// under `deploy`, not the finished `migrate` step: the activate runs
+    /// through the helper that resumes the deploy step first.
+    #[tokio::test]
+    async fn staged_migrate_success_then_failed_activate_reports_deploy() {
+        let seam = StagedSeam::spawn("activate-fail").await;
+        seam.write_capabilities();
+        seam.write_invoke(
+            "invoke-app",
+            200,
+            r#"{"ok":true,"migrations":[{"name":"0001.sql","applied":true}]}"#,
+        );
+        seam.write_invoke("invoke-auth", 200, r#"{"ok":true}"#);
+        let log = seam
+            .dir
+            .path()
+            .join("invocations.log")
+            .to_string_lossy()
+            .into_owned();
+        let dir = seam.dir.path().to_string_lossy().into_owned();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let celld = seam.celld(&env);
+        let target = DeployTarget::Production;
+        let app_side = crate::host::void_cohost::FleetApp {
+            dir: seam.root.path(),
+            cwd: None,
+            timeout: std::time::Duration::from_secs(30),
+            sourcemap: None,
+            read_root: None,
+        };
+        let staged = crate::host::void_cohost::stage_fleet_in_order(
+            &seam.pool,
+            &seam.app.id,
+            None,
+            &celld,
+            &[staged_proxy()],
+            &app_side,
+        )
+        .await
+        .expect("stage");
+        let mut progress = Progress {
+            pool: &seam.pool,
+            app_id: &seam.app.id,
+            environment_id: None,
+            sha: Some("abc123".to_string()),
+            id: None,
+            step: "deploy",
+        };
+        migrate_void_app_staged(
+            MigrateInputs {
+                pool: &seam.pool,
+                cfg: &seam.cfg,
+                app: &seam.app,
+                target: &target,
+                src_dir: seam.src.path(),
+                deploy_root: seam.root.path(),
+                commit_sha: "abc123",
+                progress: &mut progress,
+            },
+            &celld,
+            &staged,
+        )
+        .await
+        .expect("staged migrate");
+        assert_eq!(progress.step, "migrate");
+        // Fail the activate: the next celld call, plus one more for the
+        // infra retry a loud failure earns.
+        let n = seam.invocations().len();
+        for i in [n, n + 1] {
+            std::fs::write(
+                seam.dir.path().join(format!("fail-{i}")),
+                "activate blew up",
+            )
+            .unwrap();
+        }
+        let err = activate_after_staged_migrate(
+            &seam.pool,
+            &seam.app,
+            &target,
+            &celld,
+            staged,
+            &mut progress,
+        )
+        .await
+        .expect_err("a failed activate fails the deploy");
+        progress.fail(&err).await.unwrap();
+        let log: String = sqlx::query_scalar("SELECT log FROM deploy WHERE id = ?")
+            .bind(progress.id.clone().unwrap_or_default())
+            .fetch_one(&seam.pool)
+            .await
+            .unwrap();
+        assert!(log.contains("ERROR: deploy failed"), "{log}");
+        assert!(!log.contains("migrate failed"), "{log}");
+    }
+
+    /// An unknown staged outcome reconciles: no envelope from the app
+    /// endpoint reconciles through the attempt endpoint, like the fleet
+    /// path, and the deploy proceeds to the activate.
+    #[tokio::test]
+    async fn staged_migrate_unknown_outcome_reconciles() {
+        let seam = StagedSeam::spawn("unknown").await;
+        seam.write_capabilities();
+        seam.fail_invoke("invoke-app", "invoke blew up");
+        seam.write_invoke(
+            "invoke-attempt",
+            200,
+            r#"{"ok":true,"migrations":[{"name":"0001.sql","applied":true}]}"#,
+        );
+        seam.write_invoke("invoke-auth", 200, r#"{"ok":true}"#);
+        let log = seam
+            .dir
+            .path()
+            .join("invocations.log")
+            .to_string_lossy()
+            .into_owned();
+        let dir = seam.dir.path().to_string_lossy().into_owned();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let celld = seam.celld(&env);
+        let target = DeployTarget::Production;
+        let app_side = crate::host::void_cohost::FleetApp {
+            dir: seam.root.path(),
+            cwd: None,
+            timeout: std::time::Duration::from_secs(30),
+            sourcemap: None,
+            read_root: None,
+        };
+        let staged = crate::host::void_cohost::stage_fleet_in_order(
+            &seam.pool,
+            &seam.app.id,
+            None,
+            &celld,
+            &[],
+            &app_side,
+        )
+        .await
+        .expect("stage");
+        let mut progress = Progress {
+            pool: &seam.pool,
+            app_id: &seam.app.id,
+            environment_id: None,
+            sha: Some("abc123".to_string()),
+            id: None,
+            step: "migrate",
+        };
+        migrate_void_app_staged(
+            MigrateInputs {
+                pool: &seam.pool,
+                cfg: &seam.cfg,
+                app: &seam.app,
+                target: &target,
+                src_dir: seam.src.path(),
+                deploy_root: seam.root.path(),
+                commit_sha: "abc123",
+                progress: &mut progress,
+            },
+            &celld,
+            &staged,
+        )
+        .await
+        .expect("reconciled migrate succeeds");
+        let calls = seam.invocations();
+        let reconciles: Vec<_> = calls
+            .iter()
+            .filter(|call| call.contains("--path /__void/migrate/app/attempt/"))
+            .collect();
+        assert_eq!(reconciles.len(), 1, "{calls:?}");
     }
 
     /// Worker warnings land as one write: the first twenty lines plus a
