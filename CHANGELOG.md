@@ -10,6 +10,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-alpha.20] - 2026-11-06
+
+### Operator action required
+
+- None.
+
+### Added
+
+- Memory-pressure parking: when the container is at or above `RUNNER_PRESSURE_PCT` (85%) of its detected limit, the runner parks the least-recently-active app or preview environment idle for `RUNNER_PRESSURE_IDLE_S` (300 s), stopping 10 points below the trigger. It wakes transparently on its next request and records a `fleet parked` event; anything with an in-flight deploy is never chosen. `0` disables it. `/ready` and `/v1/admin/stats` now report container `current_bytes`/`limit_bytes`/`used_percent`, and stats lists each fleet's cgroup charge under `fleet_memory`.
+
+### Changed
+
+- A small host now sizes the resident set from its own memory: per-fleet celld caches are capped (`RUNNER_FLEET_LOCAL_CACHE_MB`, a sixteenth of the box clamped 64–512 MiB; celld's own default was 2 GiB per node), the control fleet gets its own capped cgroup leaf (`RUNNER_CONTROL_MEMORY_MB`, a quarter of the box) instead of running uncapped, and fleets without cgroup leaves get a derived container-wide shed threshold (75% of the box) so celld answers 503 before the kernel OOM-kills the container.
+- Cold boots ramp instead of stacking: `RUNNER_FLEET_SPAWN_BATCH` starts at most one cold fleet per reconcile pass on two cores or fewer, and `RUNNER_BUILD_CONCURRENCY` serializes tenant deploys. Restarts of an already-running fleet are never delayed by either.
+
+### Fixed
+
+- A fleet that exits without an OOM kill no longer respawns every reconcile tick forever: it backs off 5, 10, 20, 40 s and caps at 60 s, resetting after five minutes of uptime. OOM kills keep their longer cgroup backoff, and a deliberate stop clears the chain.
+- The per-fleet log ring is a `VecDeque`: appending no longer shifted the whole 500-line buffer per line. `/ready` reuses one HTTP client instead of building a new pool every 10 s probe.
+- Telemetry ingest and compaction no longer run DuckDB at its own defaults (80% of RAM, every core): every invocation now carries a memory cap, a thread count and a capped spill directory, so a 24-hour catch-up or compaction scan spills instead of growing past the box. Unset derives the cap from the memory this container may use (10%, clamped 128–1024 MiB) and its cores (capped 4); `RUNNER_DUCKDB_MEMORY_MB`, `RUNNER_DUCKDB_THREADS` and `RUNNER_DUCKDB_TEMP_MB` override them. Measured on one 24-hour chunk (24 M spans, 581 MB Parquet): 1.55 GB peak RSS before versus 271 MB at the cap a 2 GB box derives. The limits use DuckDB's `MiB` unit, so a configured MiB value is exactly that many MiB.
+- A killed DuckDB pass leaves its spill behind, and stale bytes count against the spill cap, which would wedge every later pass. Boot clears the directory outright (no query can be running); a failed pass sweeps entries older than an hour, so a live query's files are never touched.
+
+### Security
+
+- Telemetry DuckDB now receives its SQL on stdin instead of `-c` on the command line. That SQL carries the platform store keys, and `/proc/<pid>/cmdline` is world-readable while tenant build processes share the container's PID namespace, so a build script that sampled the runner's children could have captured them. Every interpolated store field and every object key in the compaction and glob SQL is now a quoted DuckDB literal with doubled quotes, so a credential containing a quote can no longer end a statement. Logged DuckDB errors are scrubbed of both raw and SQL-escaped store keys.
+
 ## [0.1.0-alpha.19] - 2026-11-05
 
 ### Operator action required
