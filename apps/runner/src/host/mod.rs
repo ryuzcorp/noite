@@ -25,6 +25,7 @@ pub mod import;
 pub mod isolation;
 pub mod logs;
 pub mod loop_;
+pub mod memory;
 pub mod metrics;
 pub mod netisolation;
 pub mod package_manager;

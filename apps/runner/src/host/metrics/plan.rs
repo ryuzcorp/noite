@@ -28,17 +28,41 @@ pub(super) fn json_i64(v: &serde_json::Value, key: &str) -> i64 {
     f.as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0)
 }
 
+/// Runtime caps every telemetry query carries. DuckDB's own defaults are the
+/// machine: all cores and 80% of RAM, which on a small install puts a single
+/// ingest or compaction scan larger than every resident fleet together. The
+/// cap is explicit so the box OOMs nothing; a scan that outgrows it spills to
+/// `<work_dir>/duckdb-tmp` instead, bounded by `RUNNER_DUCKDB_TEMP_MB`.
+pub(super) fn duckdb_settings(cfg: &Config) -> String {
+    let mut out = format!(
+        "SET threads={}; SET memory_limit='{}MB';",
+        cfg.duckdb_threads.max(1),
+        cfg.duckdb_memory_mb,
+    );
+    if cfg.duckdb_temp_mb > 0 {
+        // Paths and sizes ride in SQL strings: a quote in RUNNER_WORK_DIR
+        // must not end the literal.
+        let temp = format!("{}/duckdb-tmp", cfg.work_dir.trim_end_matches('/')).replace('\'', "''");
+        out.push_str(&format!(
+            " SET temp_directory='{temp}'; SET max_temp_directory_size='{}MB';",
+            cfg.duckdb_temp_mb,
+        ));
+    }
+    out
+}
+
 /// S3 connection options (PATH style, plain HTTP) as DuckDB SET statements —
 /// no CREATE SECRET, so the -json output carries no DDL glue lines. The docs
 /// prescribe exactly these two for an S3-compatible plain-HTTP endpoint.
 pub(super) fn s3_setup(cfg: &Config, query: &str) -> String {
     format!(
         "SET s3_region='{}'; SET s3_endpoint='{}'; SET s3_url_style='path'; \
-         SET s3_access_key_id='{}'; SET s3_secret_access_key='{}'; SET s3_use_ssl=false; {}",
+         SET s3_access_key_id='{}'; SET s3_secret_access_key='{}'; SET s3_use_ssl=false; {} {}",
         cfg.aws_region,
         endpoint_host(&cfg.s3_endpoint),
         cfg.aws_access_key_id,
         cfg.aws_secret_access_key,
+        duckdb_settings(cfg),
         query,
     )
 }
@@ -248,6 +272,49 @@ mod tests {
 
     const H: i64 = 1_767_225_600_000_000; // 2026-01-01T00:00:00Z in micros
     const HOUR_US: i64 = 3_600_000_000;
+
+    #[test]
+    fn duckdb_settings_cap_memory_threads_and_spill() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = "/data/runner".into();
+        cfg.duckdb_memory_mb = 256;
+        cfg.duckdb_threads = 1;
+        cfg.duckdb_temp_mb = 1024;
+        let sql = s3_setup(&cfg, "SELECT 1");
+        assert!(sql.contains("SET threads=1;"), "{sql}");
+        assert!(sql.contains("SET memory_limit='256MB';"), "{sql}");
+        assert!(
+            sql.contains("SET temp_directory='/data/runner/duckdb-tmp';"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("SET max_temp_directory_size='1024MB';"),
+            "{sql}"
+        );
+        // The caps precede the query, so they apply to it.
+        assert!(sql.ends_with("SELECT 1"), "{sql}");
+    }
+
+    #[test]
+    fn duckdb_spill_can_be_left_to_duckdb() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.duckdb_temp_mb = 0;
+        let sql = duckdb_settings(&cfg);
+        assert!(!sql.contains("temp_directory"), "{sql}");
+        assert!(!sql.contains("max_temp_directory_size"), "{sql}");
+    }
+
+    #[test]
+    fn duckdb_paths_escape_sql_literals() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = "/data/it's".into();
+        cfg.duckdb_temp_mb = 64;
+        let sql = duckdb_settings(&cfg);
+        assert!(
+            sql.contains("temp_directory='/data/it''s/duckdb-tmp'"),
+            "{sql}"
+        );
+    }
 
     #[test]
     fn idle_err_detects_no_files() {
