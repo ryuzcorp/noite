@@ -77,6 +77,13 @@ fn deploying_remove(deploying: &Deploying, app_id: &str) {
         .remove(app_id);
 }
 
+/// One global slot per concurrent deploy (`RUNNER_BUILD_CONCURRENCY`). Sized
+/// once from the boot config; the slot covers the whole deploy.
+fn build_slots(cfg: &Config) -> &'static tokio::sync::Semaphore {
+    static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(cfg.build_concurrency.max(1) as usize))
+}
+
 pub async fn claim_owned(deploying: &Deploying, app_id: &str) -> Option<AppClaim> {
     AppClaim::take(deploying, app_id)
 }
@@ -426,6 +433,19 @@ async fn deploy_inner(
     progress: &mut Progress<'_>,
     trigger: DeployTrigger,
 ) -> anyhow::Result<()> {
+    // One tenant deploy at a time on a small box (`RUNNER_BUILD_CONCURRENCY`):
+    // install, build and release steps are the largest unbounded memory use
+    // after the fleets, and a cold boot of several apps must not stack them.
+    // The slot covers the whole deploy, so S3 upload and migrations never
+    // overlap with another app's build either.
+    let slots = build_slots(cfg);
+    if slots.available_permits() == 0 {
+        tracing::info!(app = %app.slug, "waiting for a build slot");
+    }
+    let _slot = slots
+        .acquire()
+        .await
+        .map_err(|_| anyhow::anyhow!("build slot gate closed"))?;
     let fleet = fleet_label(app, target);
     let commit_sha = progress
         .sha

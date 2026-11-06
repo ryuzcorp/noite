@@ -21,6 +21,12 @@ use crate::host::{exec, s3};
 
 const MARKER_KEY: &str = "ui/revision";
 
+/// Cgroup leaf name of the control fleet (`<anchor>/_control`). The name is
+/// the reserved telemetry key, so no tenant slug can ever hold the same leaf
+/// (`RESERVED_SLUGS` refuses `_control`); a tenant app called `control` would
+/// otherwise share — and rewrite — fleet #0's cap and accounting.
+const CONTROL_CGROUP: &str = "_control";
+
 /// Reserved telemetry key of the control fleet. There is deliberately no
 /// `app` row for it (nothing that iterates apps — reconcile, Caddy, sleep,
 /// purge, list_apps — may ever see the control plane), so the metrics ingest
@@ -253,10 +259,60 @@ pub fn supervise(
     let celld = config.celld_bin.clone();
     let work_dir = config.work_dir.clone();
     let fleet_cfg = config.clone();
-    Supervised::start_observed(
+    // Fleet #0 is a resident like any tenant fleet: give it its own leaf and
+    // cap when the install has writable cgroups. Created before the spawn so
+    // the env can say `CELLD_MEMORY_SCOPE=self`; the pid moves in right
+    // after the spawn (a celld node is one thread group, so the move takes
+    // every thread). Without cgroups the control fleet shares the container
+    // cgroup and the env carries the container-wide shed threshold instead.
+    let control_leaf = crate::host::cgroups::anchor().and_then(|anchor| {
+        match crate::host::cgroups::ensure_fleet_cgroup(
+            &anchor,
+            CONTROL_CGROUP,
+            fleet_cfg.control_memory_mb,
+        ) {
+            Ok(dir) => Some(dir),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    memory_mb = fleet_cfg.control_memory_mb,
+                    "control fleet has no cgroup leaf; it shares the container cgroup"
+                );
+                None
+            }
+        }
+    });
+    let has_leaf = control_leaf.is_some();
+    let place = control_leaf.map(|dir| {
+        move |pid: u32| {
+            let Err(error) = crate::host::cgroups::enter_cgroup(&dir, pid) else {
+                return;
+            };
+            if crate::host::cgroups::is_gone(&error) {
+                // Exited between spawn and move: nothing is running uncapped.
+                tracing::warn!(pid, error = %error, "control fleet exited before its cgroup move");
+                return;
+            }
+            // Fail closed like a tenant fleet: a live control node must never
+            // run outside the cap its environment advertises. Killing it lets
+            // the supervisor restart (with backoff); the failed limit also trips
+            // install-wide containment, so `multi` stops claiming readiness.
+            crate::host::cgroups::note_limit_failed(
+                CONTROL_CGROUP,
+                format!("control fleet missed its cgroup: {error:#}"),
+            );
+            tracing::error!(pid, error = %error, "control fleet refused its cgroup; killing it");
+            // SAFETY: signals the child this spawn just created.
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+        }
+    });
+    Supervised::start_observed_with(
         "control",
         Some(control_pid),
         Some((logs, SLUG.to_string())),
+        place,
         move || {
             let state_dir = "/data/control";
             let _ = std::fs::create_dir_all(state_dir);
@@ -290,6 +346,7 @@ pub fn supervise(
                     cfg: &fleet_cfg,
                     operator_token: &operator_token,
                     inherited: &inherited,
+                    has_cgroup_leaf: has_leaf,
                 },
             );
             crate::host::fleet_env::apply(&mut cmd, &env);

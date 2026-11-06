@@ -197,6 +197,140 @@ pub async fn sleep_app(
     Ok(true)
 }
 
+/// Memory-pressure parking (SPEC, Scale to zero): when the container is at or
+/// above `RUNNER_PRESSURE_PCT` of its limit, park the least-recently-active
+/// app that has been idle for `RUNNER_PRESSURE_IDLE_S`. A parked app wakes
+/// transparently on its next request, so this trades one cold start for the
+/// whole box staying up; an app with an in-flight deploy is never a victim.
+pub async fn sweep_under_pressure(
+    pool: &SqlitePool,
+    cfg: &Config,
+    procs: &ProcMap,
+    deploying: &crate::host::deploy::Deploying,
+) -> usize {
+    if cfg.pressure_pct == 0 {
+        return 0;
+    }
+    let (Some(limit), Some(current)) = (
+        crate::host::memory::total_bytes(),
+        crate::host::memory::current_bytes(),
+    ) else {
+        return 0;
+    };
+    if limit == 0 || current.saturating_mul(100) < limit * u64::from(cfg.pressure_pct) {
+        return 0;
+    }
+    // Stop once the box is back under the low watermark, so one sweep does
+    // not park every idle app just because the first park left it close.
+    let target = u64::from(cfg.pressure_pct.saturating_sub(10));
+    let claimed = crate::host::deploy::snapshot_claimed(deploying).await;
+    let Ok(apps) = db::list_apps(pool).await else {
+        return 0;
+    };
+    let now = Utc::now();
+    let mut idle: Vec<(DateTime<Utc>, String)> = Vec::new();
+    for app in apps
+        .iter()
+        .filter(|app| sleep_candidate(app) && !claimed.contains(&app.id))
+    {
+        let Some(newest) = activity(pool, app).await.into_iter().flatten().max() else {
+            continue;
+        };
+        if now - newest < chrono::Duration::seconds(cfg.pressure_idle_s as i64) {
+            continue;
+        }
+        idle.push((newest, app.id.clone()));
+    }
+    idle.sort_by_key(|(newest, _)| *newest);
+    let mut parked = 0;
+    for (_, id) in idle {
+        match sleep_app(pool, cfg, procs, &id, true).await {
+            Ok(true) => {
+                parked += 1;
+                tracing::info!(
+                    percent = current.saturating_mul(100) / limit,
+                    "app parked under memory pressure"
+                );
+                record_parked(pool, &id, current, limit).await;
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(error = %error, "pressure park"),
+        }
+        let Some(now_bytes) = crate::host::memory::current_bytes() else {
+            break;
+        };
+        if now_bytes.saturating_mul(100) < limit * target {
+            return parked;
+        }
+    }
+    // Preview fleets are residents too; park their idle ones with the same
+    // rule and the same event (scoped to the owning app).
+    let Ok(envs) = db::list_all_environments(pool).await else {
+        return parked;
+    };
+    let mut idle_envs: Vec<(DateTime<Utc>, String, String)> = Vec::new();
+    for env in envs
+        .iter()
+        .filter(|env| sleep_candidate_env(env) && !claimed.contains(&env.app_id))
+    {
+        let Some(newest) = environment_activity(pool, env)
+            .await
+            .into_iter()
+            .flatten()
+            .max()
+        else {
+            continue;
+        };
+        if now - newest < chrono::Duration::seconds(cfg.pressure_idle_s as i64) {
+            continue;
+        }
+        idle_envs.push((newest, env.id.clone(), env.app_id.clone()));
+    }
+    idle_envs.sort_by_key(|(newest, _, _)| *newest);
+    for (_, id, app_id) in idle_envs {
+        match sleep_environment(pool, cfg, procs, &id, true).await {
+            Ok(true) => {
+                parked += 1;
+                tracing::info!(
+                    percent = current.saturating_mul(100) / limit,
+                    "environment parked under memory pressure"
+                );
+                record_parked(pool, &app_id, current, limit).await;
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(error = %error, "pressure park environment"),
+        }
+        let Some(now_bytes) = crate::host::memory::current_bytes() else {
+            break;
+        };
+        if now_bytes.saturating_mul(100) < limit * target {
+            break;
+        }
+    }
+    parked
+}
+
+/// Tenant-visible reason for a pressure park: the app event the UI shows.
+async fn record_parked(pool: &SqlitePool, app_id: &str, current: u64, limit: u64) {
+    let detail = format!(
+        "parked to free memory at {}% of the limit; the next request wakes it",
+        current.saturating_mul(100) / limit
+    );
+    let _ = db::insert_app_event(
+        pool,
+        &crate::models::new_id(),
+        app_id,
+        "fleet",
+        "fleet parked",
+        &detail,
+        "😴",
+        "{}",
+        "",
+        &crate::models::now_iso(),
+    )
+    .await;
+}
+
 /// Poll the fleet's public health route until celld's ready gate opens.
 pub(crate) async fn wait_healthy(cfg: &Config, port: i64, timeout: Duration) -> bool {
     static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {

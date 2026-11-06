@@ -486,7 +486,8 @@ fn setup_inner(_root: &Path, _placement: &str) -> anyhow::Result<PathBuf> {
 /// slug-shaped by construction, but a stray separator must never escape the
 /// anchor.
 pub fn fleet_dir_name(key: &str) -> String {
-    key.chars()
+    let name: String = key
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
                 c
@@ -494,7 +495,15 @@ pub fn fleet_dir_name(key: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    // A leaf is a child of the anchor: `.` addresses the anchor itself and
+    // `..` its parent. No caller produces either today (slugs and labels are
+    // constrained), so this keeps the invariant structural.
+    if name.is_empty() || name == "." || name == ".." {
+        format!("fleet-{name}")
+    } else {
+        name
+    }
 }
 
 /// Create (or reuse) a fleet's cgroup with its limits and return its path.
@@ -592,6 +601,18 @@ pub fn remove_fleet_cgroup(dir: &Path) -> Option<u64> {
 /// High-water RSS of a fleet leaf in bytes (`memory.peak`).
 pub fn fleet_peak_bytes(dir: &Path) -> Option<u64> {
     std::fs::read_to_string(dir.join("memory.peak"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The fleet's current charge from its leaf (`memory.current`): what its cap
+/// is measured against right now. `None` for an install without leaves or a
+/// fleet that has none.
+pub fn fleet_usage_bytes(key: &str) -> Option<u64> {
+    let dir = fleet_cgroup_path(key)?;
+    std::fs::read_to_string(dir.join("memory.current"))
         .ok()?
         .trim()
         .parse()
@@ -835,6 +856,12 @@ mod tests {
         assert_eq!(fleet_dir_name("shop.preview-1"), "shop.preview-1");
         assert_eq!(fleet_dir_name("../../etc"), ".._.._etc");
         assert_eq!(fleet_dir_name("a/b"), "a_b");
+        // `.` and `..` address the anchor or its parent, not a leaf.
+        assert_eq!(fleet_dir_name("."), "fleet-.");
+        assert_eq!(fleet_dir_name(".."), "fleet-..");
+        assert_eq!(fleet_dir_name(""), "fleet-");
+        // The control leaf is a reserved key: no tenant slug can hold it.
+        assert_eq!(fleet_dir_name("_control"), "_control");
     }
 
     #[test]
