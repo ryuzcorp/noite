@@ -45,6 +45,11 @@ pub async fn run_forever(
     // so telemetry ingest has caught up before any app is judged idle.
     let mut last_sleep_sweep = Instant::now();
     let sleep_sweeping = Arc::new(AtomicBool::new(false));
+    // Memory-pressure parking (SPEC, Scale to zero): one cheap sample per
+    // `RUNNER_PRESSURE_SWEEP_S`, and a parked app only when the container is
+    // near its limit. First check one interval after boot.
+    let mut last_pressure_sweep = Instant::now();
+    let pressure_sweeping = Arc::new(AtomicBool::new(false));
     // Scoped-key revocation retries (SPEC, Scoped credentials): a store
     // delete refused at revoke time stays marked until the store accepts.
     // One cheap SELECT per tick when nothing pends; a failed sweep backs
@@ -81,6 +86,31 @@ pub async fn run_forever(
                 let parked = crate::host::sleep::sweep(&pool2, &cfg2, &procs2).await;
                 if parked > 0 {
                     tracing::info!(parked, "sleep sweep");
+                }
+                flag.store(false, Ordering::SeqCst);
+            });
+        }
+        // Last line before the kernel OOM-killer: at or above the configured
+        // percentage, park the least-recently-active idle app. Off the tick,
+        // like the sleep sweep (parking waits on a SIGTERM drain).
+        if cfg.pressure_pct > 0
+            && last_pressure_sweep.elapsed() >= Duration::from_secs(cfg.pressure_sweep_s.max(10))
+            && !pressure_sweeping.swap(true, Ordering::SeqCst)
+        {
+            last_pressure_sweep = Instant::now();
+            let (pool2, cfg2, procs2, deploying2, flag) = (
+                pool.clone(),
+                cfg.clone(),
+                procs.clone(),
+                deploying.clone(),
+                pressure_sweeping.clone(),
+            );
+            tokio::spawn(async move {
+                let parked =
+                    crate::host::sleep::sweep_under_pressure(&pool2, &cfg2, &procs2, &deploying2)
+                        .await;
+                if parked > 0 {
+                    tracing::info!(parked, "pressure sweep");
                 }
                 flag.store(false, Ordering::SeqCst);
             });
@@ -178,6 +208,11 @@ async fn reconcile_once(
         .filter(|a| a.desired() == DesiredState::Stopped)
         .map(|a| a.id.clone())
         .collect();
+    // Cold starts per pass (`RUNNER_FLEET_SPAWN_BATCH`): a boot or upgrade
+    // must not stack every celld's initialization at once. Restarts of an
+    // already-registered child are never batched — those wait on their own
+    // backoff and deserve the next tick.
+    let mut cold_starts: u32 = 0;
     for app in &apps {
         if app.desired() == DesiredState::Stopped {
             supervisor::stop_fleet(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
@@ -192,6 +227,13 @@ async fn reconcile_once(
         // Asleep apps stay parked: the next request wakes them through the
         // edge (host/sleep.rs), and respawning here would undo the sleep.
         if app.listen_port.is_some() && app.is_deployed() && !app.is_asleep() {
+            let cold = !supervisor::has_process(procs, &app.slug).await;
+            if cold {
+                if cold_starts >= cfg.fleet_spawn_batch {
+                    continue;
+                }
+                cold_starts += 1;
+            }
             match supervisor::ensure_fleet(pool, cfg, procs, logs, app).await {
                 Ok(()) => {
                     // "Running" means the fleet answers its health gate, not
@@ -265,6 +307,13 @@ async fn reconcile_once(
             continue;
         }
         if env.listen_port.is_some() && env.is_deployed() && !env.is_asleep() {
+            let cold = !supervisor::has_process(procs, &fleet).await;
+            if cold {
+                if cold_starts >= cfg.fleet_spawn_batch {
+                    continue;
+                }
+                cold_starts += 1;
+            }
             match supervisor::ensure_environment_fleet(pool, cfg, procs, logs, env).await {
                 Ok(()) => {
                     // Same truthful order as the app branch above.

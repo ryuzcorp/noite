@@ -134,9 +134,10 @@ async fn copy_union(
     };
     let list = inputs
         .iter()
-        .map(|k| format!("'s3://{}/{}'", cfg.s3_bucket, k))
+        .map(|k| super::plan::sql_lit(&format!("s3://{}/{}", cfg.s3_bucket, k)))
         .collect::<Vec<_>>()
         .join(", ");
+    let destination = super::plan::sql_lit(&format!("s3://{}/{}", cfg.s3_bucket, dest));
     let sql = s3_setup(
         cfg,
         &format!(
@@ -145,14 +146,15 @@ async fn copy_union(
             // hold two shapes — merge them instead of refusing the
             // whole hour (sources are only deleted after the copy).
             "COPY (SELECT * FROM read_parquet([{list}], union_by_name=true) ORDER BY {sort_col}) \
-               TO 's3://{}/{}' (FORMAT parquet, COMPRESSION zstd);",
-            cfg.s3_bucket, dest,
+               TO {destination} (FORMAT parquet, COMPRESSION zstd);",
         ),
     );
     stats::count_duckdb("compact");
-    let copied = exec::run_cmd(
+    // SQL on stdin, never argv: it carries the store secret.
+    let copied = exec::run_cmd_stdin(
         "/usr/local/bin/duckdb",
-        &["-c", &sql],
+        &[],
+        sql.as_bytes(),
         None,
         &[],
         std::time::Duration::from_secs(120),
@@ -162,7 +164,7 @@ async fn copy_union(
         // A killed copy leaves its spill behind; stale bytes count against
         // the cap and would wedge later passes.
         super::plan::sweep_spill(cfg, super::plan::SPILL_SWEEP_AGE);
-        return Err(error);
+        return Err(super::plan::redact_store_keys(error, cfg));
     }
     if !s3::s3_object_exists(cfg, &cfg.s3_bucket, &dest).await {
         anyhow::bail!("compacted object missing after copy: {dest}");

@@ -24,13 +24,17 @@ description: Quotas, fleet bounds, rate limits, and the scale-to-zero sleep mech
 Every app is its own celld fleet on one host, each in its own cgroup with its own `memory.max`. The bounds stop one account — or one busy app — from owning the machine. A fleet that hits its cap is OOM-killed inside its own group and restarted, and the kill records a tenant-visible `fleet` event and fleet log line (`fleet restarted: memory limit … MiB exceeded (Settings → Limits)`). The cgroups need the multi-only grant (`docker/compose.multi.yaml`); without it fleets share the container cgroup and `multi` stays at 503.
 
 :::warning
-`RUNNER_FLEET_MAX_RSS_MB` stays a container-wide shed threshold even while per-fleet cgroups are active: celld measures the greater of its own RSS and the container-scale cgroup working set, so a per-fleet-sized value closes every fleet's admission gate as soon as the container as a whole passes it (this retired the old 512 default, and replaying it per fleet failed the isolation lane). Size it to the container; leave `0` for celld's default (80% of container memory). Per-fleet containment comes from the kernel's `memory.max`, not from this knob.
+`RUNNER_FLEET_MAX_RSS_MB` is a container-wide shed threshold, never a per-fleet cap: celld measures the greater of its own RSS and the container-scale cgroup working set, so a per-fleet-sized value closes every fleet's admission gate as soon as the container as a whole passes it. With per-fleet cgroups, leave `0` for celld's default (80% of the fleet's own `memory.max`). Without them every fleet shares the container cgroup, so `0` now means a runner-derived container-wide threshold (75% of the detected memory, clamped 256–8192 MiB) — celld answers `503` + `Retry-After` before the kernel OOM-killer acts. An explicit value always wins. Per-fleet containment comes from the kernel's `memory.max`, not from this knob.
 :::
 
 | Knob | Default | Effect |
 | --- | --- | --- |
 | `RUNNER_FLEET_MEMORY_MB` | `512` | Per-fleet `memory.max` in MiB (own cgroup per fleet, plus `pids.max`); overridable per app in Settings → Limits → Fleet memory (applies on next spawn) |
 | `RUNNER_FLEET_MAX_RSS_MB` | `0` | Shed threshold in MiB; over it, fleets refuse cells with `503` + `Retry-After` instead of OOM-ing |
+| `RUNNER_CONTROL_MEMORY_MB` | 1/4 of detected memory, clamped `256`–`1024` | Fleet #0's cap; its own cgroup leaf (and `CELLD_MEMORY_SCOPE=self`) where available, else the container-wide shed threshold |
+| `RUNNER_FLEET_LOCAL_CACHE_MB` | 1/16 of detected memory, clamped `64`–`512` | Per-fleet celld hibernated-DB cache (`CELLD_LOCAL_CACHE_MAX_BYTES`); celld's own default is 2 GiB per node |
+| `RUNNER_FLEET_SPAWN_BATCH` | `1` on ≤ 2 cores, else `2` | Cold fleets started per reconcile pass; restarts are never batched |
+| `RUNNER_BUILD_CONCURRENCY` | `1` on ≤ 2 cores, else `2` | Concurrent tenant deploys (one slot covers install, build, release and `celld deploy`) |
 | `RUNNER_FLEET_IDLE_EVICT_S` | `120` | Idle seconds before a fleet hibernates cells and returns memory |
 | `RUNNER_FLEET_LEASE_TTL_MS` | `60000` | Node lease lifetime; a storage stall longer than two thirds of it restarts every app (minimum `10000`) |
 | `RUNNER_FLEET_ASSET_CACHE_MB` | `64` | Per-fleet on-disk asset cache (celld default is 512) |
@@ -73,3 +77,9 @@ An app with no requests for `RUNNER_SLEEP_AFTER_H` hours (default 24, `0` disabl
 6. Answers 200; Caddy proxies the held request as if the app never slept.
 
 Concurrent requests share one wake (per-app lock), and at most `RUNNER_WAKE_CONCURRENCY` apps (default 4) cold-start at once; the rest queue within the same timeout. Only a failed wake answers `503`. A deploy, rollback, or web commit to an asleep app wakes it first; TLS ask treats asleep apps as live so certificates renew. First-request cost after a quiet day: one cold fleet start (celld boot + ready gate, typically seconds).
+
+## Memory pressure
+
+The runner samples the container's memory charge every `RUNNER_PRESSURE_SWEEP_S` seconds (default `30`). At or above `RUNNER_PRESSURE_PCT` of the detected limit (default `85`; `0` disables), it parks the least-recently-active app that has been idle for `RUNNER_PRESSURE_IDLE_S` seconds (default `300`), stopping at 10 percentage points below the trigger. A parked app wakes on its next request like any sleeping app, and an app with an in-flight deploy is never chosen. Setting `RUNNER_PRESSURE_PCT=0` turns the guard off; the fleet and deploy bounds in the tables above are the first line, and this is the last one before the kernel OOM-killer.
+
+`/ready` and `GET /v1/admin/stats` report the container's `current_bytes`, `limit_bytes` and `used_percent`; with per-fleet cgroups, stats also lists each fleet's own charge under `fleet_memory`. `make usage` diffs them over a window.

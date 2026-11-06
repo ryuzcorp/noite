@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -66,6 +66,72 @@ pub fn new_procs() -> ProcMap {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// Non-OOM restart gate: a fleet that exits on its own is retried after 5 s,
+/// 10 s, 20 s … capped at 60 s, and the chain resets after five minutes of
+/// uptime. OOM kills keep their own, longer backoff in `host::cgroups`; a
+/// crash loop used to respawn every reconcile tick forever.
+#[derive(Default)]
+struct CrashGate {
+    consecutive: u32,
+    ready_at: Option<Instant>,
+    spawned_at: Option<Instant>,
+}
+
+const CRASH_BACKOFF_BASE: Duration = Duration::from_secs(5);
+const CRASH_BACKOFF_CAP: Duration = Duration::from_secs(60);
+const CRASH_HEALTHY_AFTER: Duration = Duration::from_secs(300);
+
+static CRASH_GATES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, CrashGate>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Wait after the N-th consecutive crash: 5, 10, 20, 40, 60 … seconds.
+fn crash_backoff(consecutive: u32) -> Duration {
+    let shift = consecutive.saturating_sub(1).min(4);
+    (CRASH_BACKOFF_BASE * 2u32.pow(shift)).min(CRASH_BACKOFF_CAP)
+}
+
+/// Whether the fleet may spawn now (also true when it never crashed).
+fn crash_ready(key: &str, now: Instant) -> bool {
+    CRASH_GATES
+        .lock()
+        .ok()
+        .and_then(|gates| gates.get(key).and_then(|gate| gate.ready_at))
+        .is_none_or(|ready_at| now >= ready_at)
+}
+
+/// Record one non-OOM exit and hold the next spawn.
+fn note_crash(key: &str, now: Instant) {
+    let Ok(mut gates) = CRASH_GATES.lock() else {
+        return;
+    };
+    let gate = gates.entry(key.to_string()).or_default();
+    // A fleet that stayed up past the healthy window starts a new chain.
+    if gate
+        .spawned_at
+        .is_some_and(|spawned| now.duration_since(spawned) >= CRASH_HEALTHY_AFTER)
+    {
+        gate.consecutive = 0;
+    }
+    gate.consecutive = gate.consecutive.saturating_add(1);
+    gate.ready_at = Some(now + crash_backoff(gate.consecutive));
+}
+
+/// Record a successful spawn: the backoff clock for the next crash starts.
+fn note_spawned(key: &str, now: Instant) {
+    let Ok(mut gates) = CRASH_GATES.lock() else {
+        return;
+    };
+    let gate = gates.entry(key.to_string()).or_default();
+    gate.spawned_at = Some(now);
+}
+
+/// A deliberate stop or delete clears the crash chain.
+fn forget_crash(key: &str) {
+    if let Ok(mut gates) = CRASH_GATES.lock() {
+        gates.remove(key);
+    }
+}
+
 /// What became of a fleet a caller was waiting on.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FleetFate {
@@ -73,6 +139,13 @@ pub enum FleetFate {
     Removed,
     /// celld exited on its own (still in the map until the next ensure).
     Exited(String),
+}
+
+/// Whether a fleet key has a registered child (running, or exited and not
+/// reaped yet). Used by the reconcile loop to tell a cold start from a
+/// restart: only cold starts are batched.
+pub async fn has_process(procs: &ProcMap, key: &str) -> bool {
+    procs.lock().await.contains_key(key)
 }
 
 /// Resolve once the fleet under `key` is no longer a live child. A waiter
@@ -129,6 +202,9 @@ impl StopGrace {
 /// process group, so an orphaned worker can never keep the fleet's port into
 /// the next spawn.
 pub async fn stop_fleet(procs: &ProcMap, slug: &str, grace: StopGrace) {
+    // A deliberate stop (or delete) starts the fleet with a clean chain if
+    // it is started again.
+    forget_crash(slug);
     let mut map = procs.lock().await;
     let Some(mut child) = map.remove(slug) else {
         // No process — but a proxy may still be served (a spawn that never
@@ -498,6 +574,11 @@ async fn ensure_spawned(
     if !crate::host::cgroups::oom_spawn_ready(&key, std::time::Instant::now()) {
         return Ok(());
     }
+    // A non-OOM crash loop backs off too (5, 10, 20 … 60 s), instead of
+    // spawning a fresh celld every reconcile tick.
+    if !crash_ready(&key, Instant::now()) {
+        return Ok(());
+    }
     // Consume the OOM baseline and collect the verdict under the lock; the
     // log and DB writes happen after the guard drops, never while holding
     // it. Removal stays in the same critical section as the consume, so a
@@ -530,6 +611,15 @@ async fn ensure_spawned(
         // before the respawn serves a new socket, so the new fleet starts
         // with no previous run behind it.
         fleet_gone_cleanup(&key).await;
+    }
+    if reaped && oom_note.is_none() {
+        // Not an OOM kill: hold the respawn on the crash chain and let the
+        // next ticks retry. (OOM keeps its own backoff in `cgroups`.)
+        note_crash(&key, Instant::now());
+        return Ok(());
+    }
+    if oom_note.is_some() {
+        forget_crash(&key);
     }
     if let Some(note) = oom_note {
         tracing::warn!(fleet = %key, detail = %note.detail, delay = ?note.delay, "fleet OOM-killed at its cap; restarting");
@@ -768,6 +858,7 @@ async fn ensure_spawned(
     }
 
     procs.lock().await.insert(key.clone(), child);
+    note_spawned(&key, Instant::now());
     tracing::info!(fleet = %key, listen = spec.listen, internal = spec.internal, memory_mb = spec.memory_mb, cgroup = fleet_cgroup.is_some(), "started celld");
     Ok(())
 }
@@ -962,6 +1053,52 @@ async fn reload_at(fleet: &str, port: i64, scope_key: &str) -> ReloadOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crash_backoff_doubles_to_the_cap() {
+        assert_eq!(crash_backoff(1), Duration::from_secs(5));
+        assert_eq!(crash_backoff(2), Duration::from_secs(10));
+        assert_eq!(crash_backoff(3), Duration::from_secs(20));
+        assert_eq!(crash_backoff(4), Duration::from_secs(40));
+        assert_eq!(crash_backoff(5), Duration::from_secs(60));
+        assert_eq!(crash_backoff(99), Duration::from_secs(60));
+        assert_eq!(
+            crash_backoff(0),
+            Duration::from_secs(5),
+            "never a zero wait"
+        );
+    }
+
+    #[test]
+    fn a_crash_holds_the_spawn_and_a_healthy_run_resets_the_chain() {
+        let key = format!("backoff-{}", crate::models::new_id());
+        let t0 = Instant::now();
+        assert!(crash_ready(&key, t0), "never crashed: ready");
+        note_spawned(&key, t0 - Duration::from_secs(600));
+        note_crash(&key, t0);
+        assert!(!crash_ready(&key, t0), "held right after the crash");
+        assert!(
+            !crash_ready(&key, t0 + Duration::from_secs(4)),
+            "held for the first backoff"
+        );
+        assert!(crash_ready(&key, t0 + Duration::from_secs(5)));
+
+        // One more quick crash doubles the wait (respawn at t0+5, crash at +6).
+        note_spawned(&key, t0 + Duration::from_secs(5));
+        note_crash(&key, t0 + Duration::from_secs(6));
+        assert!(!crash_ready(&key, t0 + Duration::from_secs(11)));
+        assert!(crash_ready(&key, t0 + Duration::from_secs(16)));
+
+        // A run past the healthy window starts over at the base wait.
+        let later = t0 + Duration::from_secs(400);
+        note_spawned(&key, later);
+        note_crash(&key, later + Duration::from_secs(301));
+        assert!(!crash_ready(&key, later + Duration::from_secs(304)));
+        assert!(crash_ready(&key, later + Duration::from_secs(306)));
+
+        forget_crash(&key);
+        assert!(crash_ready(&key, Instant::now()), "a stop clears the chain");
+    }
 
     fn spawn_sleeper() -> Child {
         Command::new("sleep")

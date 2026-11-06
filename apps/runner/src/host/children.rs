@@ -59,6 +59,24 @@ impl Supervised {
     where
         F: Fn() -> Command + Send + Sync + 'static,
     {
+        Self::start_observed_with(name, pid, capture, None::<fn(u32)>, make)
+    }
+
+    /// [`start_observed`] plus `on_spawn`, run with the child's pid right
+    /// after a successful spawn (before its pipes are read). The control
+    /// fleet uses it to move itself into its cgroup leaf; a hook must not
+    /// block, or the child runs without its pipe readers meanwhile.
+    pub fn start_observed_with<F, G>(
+        name: &'static str,
+        pid: Option<Arc<AtomicU32>>,
+        capture: Option<(LogState, String)>,
+        on_spawn: Option<G>,
+        make: F,
+    ) -> Self
+    where
+        F: Fn() -> Command + Send + Sync + 'static,
+        G: Fn(u32) + Send + Sync + 'static,
+    {
         let sup = Self {
             name,
             stop: Arc::new(AtomicBool::new(false)),
@@ -75,7 +93,11 @@ impl Supervised {
                 let started = Instant::now();
                 match cmd.spawn() {
                     Ok(mut child) => {
-                        task.pid.store(child.id().unwrap_or(0), Ordering::Relaxed);
+                        let pid = child.id().unwrap_or(0);
+                        task.pid.store(pid, Ordering::Relaxed);
+                        if let Some(hook) = &on_spawn {
+                            hook(pid);
+                        }
                         tracing::info!(child = task.name, "started");
                         if let Some((state, slug)) = &capture {
                             capture_output(&mut child, state, slug);
