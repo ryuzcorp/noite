@@ -1,10 +1,15 @@
 //! The config `celld deploy` takes after a build (SPEC, Deploy pipeline):
 //! what the build produced, not the pushed source config.
 //!
-//! 1. `dist/wrangler.json`, a celld-ready config the build wrote (on Vite or
-//!    Rsbuild alike).
-//! 2. Void's own `dist/ssr/wrangler.json` (`void` on Vite, assets in
-//!    `dist/client/`).
+//! 1. Void's own `dist/ssr/wrangler.json` (`void` on Vite, assets in
+//!    `dist/client/`). It outranks a `dist/wrangler.json` beside it: a build
+//!    may derive that file from Void's for a celld deploy (the app
+//!    templates do), and the derivation copies only the keys its author
+//!    knew, so reading it as the deploy config would drop Void's sandbox
+//!    `containers` and classify the app as non-Void (no migrations,
+//!    identity vars or sandbox controller).
+//! 2. `dist/wrangler.json`, a celld-ready config the build wrote (on Vite or
+//!    Rsbuild alike, with no Void output).
 //! 3. Wrangler's deploy redirect, `.wrangler/deploy/config.json`, which
 //!    `@cloudflare/vite-plugin` writes beside `dist/<worker>/wrangler.json`.
 //!
@@ -330,18 +335,9 @@ pub fn built_deploy_root(src_dir: &Path) -> anyhow::Result<Option<BuiltRoot>> {
         .canonicalize()
         .with_context(|| format!("resolve {}", src_dir.display()))?;
     let dist = src.join("dist");
-    if dist.join("wrangler.json").is_file() {
-        return Ok(Some(BuiltRoot {
-            dir: dist,
-            note: "dist/wrangler.json (build output)".into(),
-            // Used as written: nothing is dropped, so nothing is required.
-            required_secrets: Vec::new(),
-            void: false,
-        }));
-    }
-    // Void's own output: the Worker and its config under `dist/ssr/`, the
-    // assets in `dist/client/`. Rewritten like the redirect below, into
-    // `dist/wrangler.json`.
+    // Void's own output first (see the module docs): a `dist/wrangler.json`
+    // derived from it must not shadow the canonical config and its
+    // `containers`/Void classification.
     let void_config = src.join(VOID_OUTPUT);
     if void_config.is_file() {
         // Resolved first, as the redirect is: the runner reads and rewrites
@@ -357,6 +353,15 @@ pub fn built_deploy_root(src_dir: &Path) -> anyhow::Result<Option<BuiltRoot>> {
             dir,
             required_secrets,
             void: true,
+        }));
+    }
+    if dist.join("wrangler.json").is_file() {
+        return Ok(Some(BuiltRoot {
+            dir: dist,
+            note: "dist/wrangler.json (build output)".into(),
+            // Used as written: nothing is dropped, so nothing is required.
+            required_secrets: Vec::new(),
+            void: false,
         }));
     }
     let redirect = src.join(DEPLOY_REDIRECT);
@@ -451,7 +456,15 @@ fn celld_config_from(src: &Path, config: &Path) -> anyhow::Result<(PathBuf, Vec<
         bail!("{label}: the Worker and its assets are not inside the worktree");
     }
     let target = root.join("wrangler.json");
-    if target != config && WRANGLER_NAMES.iter().any(|n| root.join(n).exists()) {
+    // A config at `target` itself is the file this rewrite produces (a
+    // derived `dist/wrangler.json` includes it); only a *different*
+    // Wrangler name in the same directory is a conflict.
+    if target != config
+        && WRANGLER_NAMES
+            .iter()
+            .map(|name| root.join(name))
+            .any(|path| path != target && path.exists())
+    {
         bail!(
             "{label}: its output shares {} with another Wrangler config; build into a directory of its own (e.g. dist/)",
             display_rel(src, &root)
@@ -468,6 +481,7 @@ fn celld_config_from(src: &Path, config: &Path) -> anyhow::Result<(PathBuf, Vec<
         block.insert("directory".into(), Value::String(relative(&root, assets)));
     }
     relocate_migrations(obj, &config_dir, &root);
+    relocate_container_paths(obj, &config_dir, src)?;
     obj.retain(|k, _| CELLD_KEYS.contains(&k.as_str()));
 
     write_fresh(&target, &serde_json::to_string_pretty(&value)?)
@@ -502,6 +516,62 @@ fn relocate_migrations(obj: &mut serde_json::Map<String, Value>, config_dir: &Pa
             }
         }
     }
+}
+
+/// Container paths are relative to the config's own directory (`dist/ssr/`
+/// for Void's output), and the rewrite moves the config up to the deploy
+/// root. Make every path absolute inside the worktree: the default Void
+/// sandbox Dockerfile lives in `node_modules`, outside the deploy root, and
+/// celld joins a project dir onto the value — joining an absolute path is
+/// the path itself, while `../../../node_modules` would escape.
+fn relocate_container_paths(
+    obj: &mut serde_json::Map<String, Value>,
+    config_dir: &Path,
+    src: &Path,
+) -> anyhow::Result<()> {
+    let Some(containers) = obj.get_mut("containers").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    let absolute = |key: &str, text: &str| -> anyhow::Result<String> {
+        let path = inside(src, &config_dir.join(text))
+            .with_context(|| format!("containers {key} {text:?}"))?;
+        Ok(path.display().to_string())
+    };
+    for entry in containers.iter_mut().filter_map(Value::as_object_mut) {
+        if let Some(default) = entry
+            .get_mut("images")
+            .and_then(|images| images.get_mut("default"))
+            .and_then(Value::as_object_mut)
+        {
+            for key in ["dockerfile", "build_context"] {
+                if let Some(text) = default.get(key).and_then(Value::as_str).map(str::to_string) {
+                    let path = absolute(&format!("images.default.{key}"), &text)?;
+                    default.insert(key.to_string(), Value::String(path));
+                }
+            }
+            if let Some(image) = default
+                .get("image")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            {
+                if is_dockerfile(config_dir, &image) {
+                    let path = absolute("images.default.image", &image)?;
+                    default.insert("image".into(), Value::String(path));
+                }
+            }
+        }
+        if let Some(image) = entry
+            .get("image")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            if is_dockerfile(config_dir, &image) {
+                let path = absolute("image", &image)?;
+                entry.insert("image".into(), Value::String(path));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// celld has no `.assetsignore`: remove the files it names (plain names only,
@@ -1155,6 +1225,55 @@ mod tests {
         assert_eq!(v["assets"]["run_worker_first"][1], "!/assets/a.js");
         assert!(v.get("no_bundle").is_none() && v.get("rules").is_none());
         assert_eq!(v["containers"][0]["class_name"], "SandboxV1");
+    }
+
+    /// A build may derive `dist/wrangler.json` from Void's own config for a
+    /// celld deploy (the app templates do). Void's output still wins: the
+    /// derived file copies only the keys its author knew, so reading it as
+    /// the deploy config drops `containers` and classifies the app as
+    /// non-Void, skipping migrations and the sandbox controller.
+    #[test]
+    fn void_output_outranks_a_derived_dist_config() {
+        let guard_void_derived = scratch("void-derived");
+        let src = guard_void_derived.path().canonicalize().unwrap();
+        write(
+            &src.join("dist/ssr/wrangler.json"),
+            r#"{"name":"app","main":"index.js","compatibility_date":"2026-09-01",
+               "assets":{"binding":"ASSETS","directory":"../client"},
+               "durable_objects":{"bindings":[{"name":"SANDBOX","class_name":"SandboxV1"}]},
+               "containers":[{"name":"void-sandbox-v1","class_name":"SandboxV1","scheduling_policy":"durable_object",
+                 "images":{"default":{"dockerfile":"../../node_modules/void/sandbox.Dockerfile"}}}],
+               "d1_databases":[{"binding":"DB","database_name":"db","migrations_dir":"../../db/migrations"}]}"#,
+        );
+        write(&src.join("dist/ssr/index.js"), "export default {}");
+        write(&src.join("dist/client/assets/a.js"), "");
+        write(
+            &src.join("node_modules/void/sandbox.Dockerfile"),
+            "FROM node:26-trixie-slim\n",
+        );
+        write(&src.join("db/migrations/0001.sql"), "select 1;");
+        // The derived config the app's Vite plugin writes beside Void's.
+        write(
+            &src.join("dist/wrangler.json"),
+            r#"{"name":"app","main":"ssr/index.js","d1_databases":[{"binding":"DB","migrations_dir":"db/migrations"}]}"#,
+        );
+        let built = built_deploy_root(&src).unwrap().expect("Void output");
+        assert!(built.void, "a derived config must not hide the Void build");
+        assert!(built.note.contains("Void"), "{}", built.note);
+        let v = read_json(&src.join("dist/wrangler.json"));
+        assert_eq!(v["main"], "ssr/index.js");
+        assert_eq!(v["containers"][0]["class_name"], "SandboxV1");
+        assert_eq!(
+            v["containers"][0]["images"]["default"]["dockerfile"],
+            src.join("node_modules/void/sandbox.Dockerfile")
+                .display()
+                .to_string(),
+            "the moved config keeps the Dockerfile reachable (absolute)"
+        );
+        // celld refuses `..`, so a migrations dir outside the deploy root is
+        // dropped from the config; the migrate step reads the pushed tree's
+        // `db/migrations` directly.
+        assert!(v["d1_databases"][0].get("migrations_dir").is_none());
     }
 
     /// Void's `secrets.required` is captured before the rewrite drops the key
