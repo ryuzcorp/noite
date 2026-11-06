@@ -30,6 +30,11 @@ mod tick;
 pub use cpu::otel_env;
 pub use tick::tick;
 
+/// Remove stale spill files left by a killed DuckDB run (boot: all of them).
+pub fn sweep_spill(cfg: &crate::config::Config, min_age: std::time::Duration) {
+    plan::sweep_spill(cfg, min_age);
+}
+
 pub struct MetricsState {
     last_cpu: HashMap<String, (u64, u64)>, // slug -> (utime, stime) in ticks
     watermark: HashMap<String, i64>,       // slug -> last consumed start_unix_us

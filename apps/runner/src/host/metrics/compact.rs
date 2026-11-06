@@ -150,14 +150,20 @@ async fn copy_union(
         ),
     );
     stats::count_duckdb("compact");
-    exec::run_cmd(
+    let copied = exec::run_cmd(
         "/usr/local/bin/duckdb",
         &["-c", &sql],
         None,
         &[],
         std::time::Duration::from_secs(120),
     )
-    .await?;
+    .await;
+    if let Err(error) = copied {
+        // A killed copy leaves its spill behind; stale bytes count against
+        // the cap and would wedge later passes.
+        super::plan::sweep_spill(cfg, super::plan::SPILL_SWEEP_AGE);
+        return Err(error);
+    }
     if !s3::s3_object_exists(cfg, &cfg.s3_bucket, &dest).await {
         anyhow::bail!("compacted object missing after copy: {dest}");
     }

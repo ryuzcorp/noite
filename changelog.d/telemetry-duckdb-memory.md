@@ -1,3 +1,4 @@
 ### Fixed
 
 - Telemetry ingest and compaction no longer run DuckDB at its own defaults (80% of RAM, every core): every invocation now carries a memory cap, a thread count and a capped spill directory, so a 24-hour catch-up or compaction scan spills instead of growing past the box. Unset derives the cap from the memory this container may use (10%, clamped 128–1024 MiB) and its cores (capped 4); `RUNNER_DUCKDB_MEMORY_MB`, `RUNNER_DUCKDB_THREADS` and `RUNNER_DUCKDB_TEMP_MB` override them. Measured on one 24-hour chunk (24 M spans, 581 MB Parquet): 1.55 GB peak RSS before versus 298 MB at a 256 MiB cap.
+- A killed DuckDB pass leaves its spill behind, and stale bytes count against the spill cap, which would wedge every later pass. Boot clears the directory outright (no query can be running); a failed pass sweeps entries older than an hour, so a live query's files are never touched.

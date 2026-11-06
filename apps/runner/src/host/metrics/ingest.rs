@@ -236,7 +236,7 @@ async fn ingest_all(cfg: &Config, bounds: &[(String, i64, i64)]) -> anyhow::Resu
                QUALIFY row_number() OVER (PARTITION BY f.slug ORDER BY count(DISTINCT f.trace_id) DESC) <= 200)",
         ),
     );
-    let raw = match duckdb_json(&sql, "ingest").await {
+    let raw = match duckdb_json(cfg, &sql, "ingest").await {
         Ok(o) => o,
         Err(e) if is_idle_telemetry_err(&e) => return Ok(out),
         Err(e) => return Err(e),

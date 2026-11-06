@@ -51,6 +51,47 @@ pub(super) fn duckdb_settings(cfg: &Config) -> String {
     out
 }
 
+/// Spill root for every telemetry DuckDB invocation.
+pub(super) fn spill_dir(cfg: &Config) -> std::path::PathBuf {
+    std::path::Path::new(&cfg.work_dir).join("duckdb-tmp")
+}
+
+/// Best-effort removal of spill entries older than `min_age`. DuckDB removes
+/// its own temp directory on a clean exit; a timeout kill leaves it behind,
+/// and stale bytes count against `max_temp_directory_size`, which would
+/// otherwise wedge every later pass. The age filter keeps a live query's
+/// files untouched; `min_age` of zero clears everything and is only safe
+/// before the first query (boot).
+pub(super) fn sweep_spill(cfg: &Config, min_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(spill_dir(cfg)) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= min_age);
+        if !stale {
+            continue;
+        }
+        let path = entry.path();
+        let _ = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+}
+
+/// Seconds a spilled entry may sit before a failed pass sweeps it. Long
+/// enough that a query still spilling is never touched (directory mtimes
+/// only move on entry creation), short enough that a killed pass does not
+/// pin the spill cap until the next restart.
+pub(super) const SPILL_SWEEP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// S3 connection options (PATH style, plain HTTP) as DuckDB SET statements —
 /// no CREATE SECRET, so the -json output carries no DDL glue lines. The docs
 /// prescribe exactly these two for an S3-compatible plain-HTTP endpoint.
@@ -243,16 +284,23 @@ pub(super) fn telemetry_globs(
     globs
 }
 
-pub(super) async fn duckdb_json(sql: &str, purpose: &str) -> anyhow::Result<String> {
+pub(super) async fn duckdb_json(cfg: &Config, sql: &str, purpose: &str) -> anyhow::Result<String> {
     stats::count_duckdb(purpose);
-    exec::run_cmd(
+    let result = exec::run_cmd(
         "/usr/local/bin/duckdb",
         &["-json", "-c", sql],
         None,
         &[],
         std::time::Duration::from_secs(30),
     )
-    .await
+    .await;
+    if result.is_err() {
+        // A timeout kills the CLI without its clean exit, leaving its spill
+        // behind; stale bytes count against the cap and would wedge the next
+        // passes (see `sweep_spill`).
+        sweep_spill(cfg, SPILL_SWEEP_AGE);
+    }
+    result
 }
 
 /// True when duckdb failed only because the window has no parquet (idle):
@@ -314,6 +362,25 @@ mod tests {
             sql.contains("temp_directory='/data/it''s/duckdb-tmp'"),
             "{sql}"
         );
+    }
+
+    #[test]
+    fn spill_sweep_clears_stale_entries_and_tolerates_a_missing_dir() {
+        let dir = crate::testutil::TempDir::new("noite-spill-sweep");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = dir.path().to_string_lossy().into_owned();
+        let spill = spill_dir(&cfg);
+        std::fs::create_dir_all(spill.join("dead")).expect("spill subdir");
+        std::fs::write(spill.join("dead/query.tmp"), b"bytes").expect("spill file");
+        // A pass that cannot have left anything old keeps it.
+        sweep_spill(&cfg, std::time::Duration::from_secs(86_400));
+        assert!(spill.join("dead/query.tmp").exists());
+        // Boot sweeps everything.
+        sweep_spill(&cfg, std::time::Duration::ZERO);
+        assert!(!spill.join("dead/query.tmp").exists());
+        // No directory at all is a no-op, never a panic.
+        std::fs::remove_dir_all(&spill).expect("remove spill");
+        sweep_spill(&cfg, std::time::Duration::ZERO);
     }
 
     #[test]
