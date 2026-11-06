@@ -77,3 +77,9 @@ An app with no requests for `RUNNER_SLEEP_AFTER_H` hours (default 24, `0` disabl
 6. Answers 200; Caddy proxies the held request as if the app never slept.
 
 Concurrent requests share one wake (per-app lock), and at most `RUNNER_WAKE_CONCURRENCY` apps (default 4) cold-start at once; the rest queue within the same timeout. Only a failed wake answers `503`. A deploy, rollback, or web commit to an asleep app wakes it first; TLS ask treats asleep apps as live so certificates renew. First-request cost after a quiet day: one cold fleet start (celld boot + ready gate, typically seconds).
+
+## Memory pressure
+
+The runner samples the container's memory charge every `RUNNER_PRESSURE_SWEEP_S` seconds (default `30`). At or above `RUNNER_PRESSURE_PCT` of the detected limit (default `85`; `0` disables), it parks the least-recently-active app that has been idle for `RUNNER_PRESSURE_IDLE_S` seconds (default `300`), stopping at 10 percentage points below the trigger. A parked app wakes on its next request like any sleeping app, and an app with an in-flight deploy is never chosen. Setting `RUNNER_PRESSURE_PCT=0` turns the guard off; the fleet and deploy bounds in the tables above are the first line, and this is the last one before the kernel OOM-killer.
+
+`/ready` and `GET /v1/admin/stats` report the container's `current_bytes`, `limit_bytes` and `used_percent`; with per-fleet cgroups, stats also lists each fleet's own charge under `fleet_memory`. `make usage` diffs them over a window.

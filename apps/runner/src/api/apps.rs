@@ -77,9 +77,17 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     }
     // Control fleet #0 (absent in the dev image, where vite dev serves it).
     if std::path::Path::new(&state.config.control_bundle_dir).exists() {
-        let healthy = reqwest::Client::new()
+        // One client for every probe: Docker calls this every 10 s, and a
+        // fresh pool per call was pure allocation.
+        static CONTROL_HEALTH: std::sync::LazyLock<reqwest::Client> =
+            std::sync::LazyLock::new(|| {
+                reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(2))
+                    .build()
+                    .unwrap_or_default()
+            });
+        let healthy = CONTROL_HEALTH
             .get("http://127.0.0.1:8090/.well-known/celld/health")
-            .timeout(std::time::Duration::from_secs(2))
             .send()
             .await
             .is_ok_and(|r| r.status().is_success());
@@ -104,6 +112,9 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
         "credential_sweep": credential_sweep,
         "snapshot": snapshot,
         "sandbox": sandbox,
+        // Informational: never fails the gate, but an operator reading
+        // `make doctor` sees the charge and how close it is to the limit.
+        "memory": crate::host::memory::usage().unwrap_or(serde_json::Value::Null),
         "failing": failing });
     if failing.is_empty() {
         Json(body).into_response()

@@ -5,12 +5,12 @@
 // in-memory ring buffer (per slug) and expose it via /v1/apps/{id}/logs.
 // In-memory and bounded — a runner restart clears the buffer (unlike the
 // persisted metrics watermark), so logs are recent activity only.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-pub type LogState = Arc<Mutex<HashMap<String, Vec<String>>>>;
+pub type LogState = Arc<Mutex<HashMap<String, VecDeque<String>>>>;
 
 const MAX_LINES: usize = 500;
 
@@ -21,10 +21,12 @@ pub fn new_state() -> LogState {
 pub async fn append(state: &LogState, slug: &str, line: String) {
     let mut map = state.lock().await;
     let buf = map.entry(slug.to_string()).or_default();
+    // A ring: `Vec::remove(0)` shifted the whole buffer per line, which a
+    // chatty fleet made quadratic under the tick's ingest.
     if buf.len() >= MAX_LINES {
-        buf.remove(0);
+        buf.pop_front();
     }
-    buf.push(line);
+    buf.push_back(line);
 }
 
 /// Most recent `limit` lines for a fleet (chronological order).

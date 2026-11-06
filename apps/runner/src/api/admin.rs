@@ -65,10 +65,31 @@ pub async fn snapshot(State(state): State<AppState>) -> impl IntoResponse {
 /// instead of showing empty charts, see `host::control::bundle_present`).
 pub async fn stats(State(state): State<AppState>) -> impl IntoResponse {
     let mut value = crate::host::stats::snapshot();
+    let fleet_memory: serde_json::Map<String, serde_json::Value> = {
+        let keys: Vec<String> = state.procs.lock().await.keys().cloned().collect();
+        keys.into_iter()
+            .filter_map(|key| {
+                crate::host::cgroups::fleet_usage_bytes(&key)
+                    .map(|bytes| (key, serde_json::Value::from(bytes)))
+            })
+            .collect()
+    };
     if let Some(obj) = value.as_object_mut() {
         obj.insert(
             "control_fleet".to_string(),
             serde_json::Value::Bool(crate::host::control::bundle_present(&state.config)),
+        );
+        // Container charge vs its limit (the host when unbounded), plus each
+        // resident fleet's cgroup charge where the install has leaves. This is
+        // what tells an operator whether the box is near the OOM line and
+        // which fleet holds it.
+        obj.insert(
+            "memory".to_string(),
+            crate::host::memory::usage().unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "fleet_memory".to_string(),
+            serde_json::Value::Object(fleet_memory),
         );
     }
     Json(value).into_response()

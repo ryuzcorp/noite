@@ -45,6 +45,11 @@ pub async fn run_forever(
     // so telemetry ingest has caught up before any app is judged idle.
     let mut last_sleep_sweep = Instant::now();
     let sleep_sweeping = Arc::new(AtomicBool::new(false));
+    // Memory-pressure parking (SPEC, Scale to zero): one cheap sample per
+    // `RUNNER_PRESSURE_SWEEP_S`, and a parked app only when the container is
+    // near its limit. First check one interval after boot.
+    let mut last_pressure_sweep = Instant::now();
+    let pressure_sweeping = Arc::new(AtomicBool::new(false));
     // Scoped-key revocation retries (SPEC, Scoped credentials): a store
     // delete refused at revoke time stays marked until the store accepts.
     // One cheap SELECT per tick when nothing pends; a failed sweep backs
@@ -81,6 +86,31 @@ pub async fn run_forever(
                 let parked = crate::host::sleep::sweep(&pool2, &cfg2, &procs2).await;
                 if parked > 0 {
                     tracing::info!(parked, "sleep sweep");
+                }
+                flag.store(false, Ordering::SeqCst);
+            });
+        }
+        // Last line before the kernel OOM-killer: at or above the configured
+        // percentage, park the least-recently-active idle app. Off the tick,
+        // like the sleep sweep (parking waits on a SIGTERM drain).
+        if cfg.pressure_pct > 0
+            && last_pressure_sweep.elapsed() >= Duration::from_secs(cfg.pressure_sweep_s.max(10))
+            && !pressure_sweeping.swap(true, Ordering::SeqCst)
+        {
+            last_pressure_sweep = Instant::now();
+            let (pool2, cfg2, procs2, deploying2, flag) = (
+                pool.clone(),
+                cfg.clone(),
+                procs.clone(),
+                deploying.clone(),
+                pressure_sweeping.clone(),
+            );
+            tokio::spawn(async move {
+                let parked =
+                    crate::host::sleep::sweep_under_pressure(&pool2, &cfg2, &procs2, &deploying2)
+                        .await;
+                if parked > 0 {
+                    tracing::info!(parked, "pressure sweep");
                 }
                 flag.store(false, Ordering::SeqCst);
             });

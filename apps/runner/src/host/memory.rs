@@ -46,6 +46,59 @@ pub fn total_bytes() -> Option<u64> {
     None
 }
 
+/// Reads one cgroup memory file, v2 then v1. `parse` filters v1's
+/// page-rounded "no limit" value.
+#[cfg(target_os = "linux")]
+fn read_cgroup(paths: &[&str], max: Option<u64>) -> Option<u64> {
+    for path in paths {
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            if let Ok(value) = raw.trim().parse::<u64>() {
+                if max.is_none_or(|max| value < max) {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The container's current memory charge (`memory.current`, v1
+/// `memory.usage_in_bytes`). Includes page cache and kernel charges, which
+/// is exactly what the kernel OOM limit sees.
+#[cfg(target_os = "linux")]
+pub fn current_bytes() -> Option<u64> {
+    read_cgroup(
+        &[
+            "/sys/fs/cgroup/memory.current",
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+        ],
+        None,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn current_bytes() -> Option<u64> {
+    None
+}
+
+/// A memory sample for `/v1/admin/stats` and `/ready`: what this container
+/// holds now, the limit that applies (the host when unbounded), and the
+/// percentage between them.
+pub fn usage() -> Option<serde_json::Value> {
+    let current = current_bytes()?;
+    let limit = total_bytes()?;
+    let percent = current
+        .saturating_mul(100)
+        .checked_div(limit)
+        .unwrap_or(0)
+        .min(100);
+    Some(serde_json::json!({
+        "current_bytes": current,
+        "limit_bytes": limit,
+        "used_percent": percent,
+    }))
+}
+
 /// Cores this process may use. `available_parallelism` honours cgroup CPU
 /// quotas and affinity, so a 2 vCPU container reports 2 even on a big host.
 pub fn cores() -> usize {

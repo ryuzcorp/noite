@@ -1027,6 +1027,16 @@ pub struct Config {
     /// unset: 1 on two cores or fewer, else 2. Install, build and release
     /// steps are the largest unbounded memory use left after the fleets.
     pub build_concurrency: u32,
+    /// Container memory percentage at which the pressure sweep parks idle
+    /// apps (`RUNNER_PRESSURE_PCT`, 85; 0 disables). The sweep is the last
+    /// line before the kernel OOM-killer: it parks a fleet rather than
+    /// letting the box die.
+    pub pressure_pct: u32,
+    /// An app must have been idle this long before pressure may park it
+    /// (`RUNNER_PRESSURE_IDLE_S`, 300), so a busy app is never the victim.
+    pub pressure_idle_s: u64,
+    /// How often the pressure check runs (`RUNNER_PRESSURE_SWEEP_S`, 30).
+    pub pressure_sweep_s: u64,
     /// Caddy JSON access log the device/path/ref tick tails. The Caddy `log`
     /// block is path-fixed at the volume root; the Caddyfile itself may live
     /// in a subpath (dev `dynamic/`).
@@ -1346,6 +1356,19 @@ impl Config {
                 "an integer",
                 &mut env_problems,
             ),
+            pressure_pct: env_num("RUNNER_PRESSURE_PCT", 85, "an integer", &mut env_problems),
+            pressure_idle_s: env_num(
+                "RUNNER_PRESSURE_IDLE_S",
+                300,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
+            pressure_sweep_s: env_num(
+                "RUNNER_PRESSURE_SWEEP_S",
+                30,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
             tenancy,
             credentials: Credentials::configure(
                 credential_setting,
@@ -1585,6 +1608,12 @@ impl Config {
         if self.build_concurrency == 0 {
             problems.push("RUNNER_BUILD_CONCURRENCY must be >= 1".into());
         }
+        if self.pressure_pct > 100 {
+            problems.push("RUNNER_PRESSURE_PCT must be 0 (disabled) or <= 100".into());
+        }
+        if self.pressure_sweep_s < 10 {
+            problems.push("RUNNER_PRESSURE_SWEEP_S must be >= 10".into());
+        }
         self.void_proxy.validate(self.tenancy, &mut problems);
         if self.build_uid_range == 0 {
             problems.push("RUNNER_BUILD_UID_RANGE must be >= 1".into());
@@ -1814,6 +1843,9 @@ pub(crate) fn config_for_tests() -> Config {
         container_shed_mb: 0,
         fleet_spawn_batch: 1,
         build_concurrency: 1,
+        pressure_pct: 85,
+        pressure_idle_s: 300,
+        pressure_sweep_s: 30,
         caddy_control_upstream: CONTROL_UPSTREAM.into(),
         caddy_api_upstream: API_UPSTREAM.into(),
         caddy_admin_url: "http://127.0.0.1:2019".into(),
@@ -1990,6 +2022,9 @@ mod tests {
         "RUNNER_CONTROL_MEMORY_MB",
         "RUNNER_FLEET_SPAWN_BATCH",
         "RUNNER_BUILD_CONCURRENCY",
+        "RUNNER_PRESSURE_PCT",
+        "RUNNER_PRESSURE_IDLE_S",
+        "RUNNER_PRESSURE_SWEEP_S",
         "NOITE_STOP_BUDGET_MS",
         "RUNNER_BUILD_MAX_MB",
         "RUNNER_BUILD_CACHE_MB",
@@ -2213,6 +2248,10 @@ mod tests {
             assert!(cfg.container_shed_mb == 0 || (256..=8192).contains(&cfg.container_shed_mb));
             assert!((1..=2).contains(&cfg.fleet_spawn_batch));
             assert!((1..=2).contains(&cfg.build_concurrency));
+            assert_eq!(
+                (cfg.pressure_pct, cfg.pressure_idle_s, cfg.pressure_sweep_s),
+                (85, 300, 30)
+            );
             assert_eq!(cfg.stop_budget_ms, 25000);
             assert_eq!(cfg.build_max_mb, 2048);
             assert_eq!(cfg.build_cache_mb, 512);
@@ -2397,6 +2436,37 @@ mod tests {
                 ] {
                     assert!(message.contains(name), "{name} missing from {message}");
                 }
+            },
+        );
+    }
+
+    #[test]
+    fn pressure_knobs_override_and_validate() {
+        with_env(
+            &[
+                ("RUNNER_PRESSURE_PCT", "70"),
+                ("RUNNER_PRESSURE_IDLE_S", "60"),
+                ("RUNNER_PRESSURE_SWEEP_S", "20"),
+            ],
+            || {
+                let cfg = Config::from_env().expect("valid numerics must boot");
+                assert!(cfg.env_problems.is_empty());
+                assert_eq!(
+                    (cfg.pressure_pct, cfg.pressure_idle_s, cfg.pressure_sweep_s),
+                    (70, 60, 20)
+                );
+            },
+        );
+        with_env(
+            &[
+                ("RUNNER_PRESSURE_PCT", "101"),
+                ("RUNNER_PRESSURE_SWEEP_S", "5"),
+            ],
+            || {
+                let error = Config::from_env().expect_err("validate refuses");
+                let message = format!("{error:#}");
+                assert!(message.contains("RUNNER_PRESSURE_PCT"), "{message}");
+                assert!(message.contains("RUNNER_PRESSURE_SWEEP_S"), "{message}");
             },
         );
     }

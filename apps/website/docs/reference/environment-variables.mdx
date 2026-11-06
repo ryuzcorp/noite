@@ -97,6 +97,9 @@ These are install-level variables (Compose, the image environment). Per-app valu
 | `RUNNER_CONTROL_MEMORY_MB` | 1/4 of detected memory, clamped `256`–`1024` | Control fleet (`fleet #0`) cap in MiB; its own cgroup leaf when the install has writable cgroups, else the container-wide shed threshold | runner-owned |
 | `RUNNER_FLEET_SPAWN_BATCH` | `1` on ≤ 2 cores, else `2` | Cold fleets started per reconcile pass, so a boot or upgrade does not stack every celld at once; restarts are never batched | runner-owned |
 | `RUNNER_BUILD_CONCURRENCY` | `1` on ≤ 2 cores, else `2` | Concurrent tenant deploys; one slot covers install, build, release and the `celld deploy` | runner-owned |
+| `RUNNER_PRESSURE_PCT` | `85` | Container memory percentage that triggers pressure parking of idle apps; `0` disables | runner-owned |
+| `RUNNER_PRESSURE_IDLE_S` | `300` | How long an app must be idle before pressure may park it | runner-owned |
+| `RUNNER_PRESSURE_SWEEP_S` | `30` | Pressure check interval (minimum `10`) | runner-owned |
 | `RUNNER_OTEL_FLUSH_MS` | `30000` | → `CELLD_OTEL_FLUSH_MS`; bucket-flush + ingest tick cadence (min `1000`); dashboards lag ~40 s | worker-passthrough (fleet) |
 | `RUNNER_DUCKDB_MEMORY_MB` | 10% of detected memory, clamped `128`–`1024` | Memory cap for every telemetry DuckDB pass (ingest and compaction); DuckDB's own default is 80% of the machine, which on a small install is larger than every resident fleet together | runner-owned |
 | `RUNNER_DUCKDB_THREADS` | container cores, capped at `4` | DuckDB worker threads; the scan is short-lived, so the memory cap — not the thread count — is what keeps it off the fleets | runner-owned |

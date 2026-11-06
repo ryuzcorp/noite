@@ -598,6 +598,18 @@ pub fn fleet_peak_bytes(dir: &Path) -> Option<u64> {
         .ok()
 }
 
+/// The fleet's current charge from its leaf (`memory.current`): what its cap
+/// is measured against right now. `None` for an install without leaves or a
+/// fleet that has none.
+pub fn fleet_usage_bytes(key: &str) -> Option<u64> {
+    let dir = fleet_cgroup_path(key)?;
+    std::fs::read_to_string(dir.join("memory.current"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Path of a fleet's cgroup under the active anchor, for stop-time cleanup.
 pub fn fleet_cgroup_path(key: &str) -> Option<PathBuf> {
     anchor().map(|a| a.join(fleet_dir_name(key)))
