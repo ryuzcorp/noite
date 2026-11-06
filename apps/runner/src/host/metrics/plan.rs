@@ -68,17 +68,22 @@ pub(super) fn sweep_spill(cfg: &Config, min_age: std::time::Duration) {
     };
     let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
-        let stale = entry
-            .metadata()
+        let path = entry.path();
+        // `symlink_metadata`: never follow a link a tenant or a crash could
+        // have planted, either to read the target's age or to delete through
+        // it. A link is removed as a link.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let stale = meta
+            .modified()
             .ok()
-            .and_then(|meta| meta.modified().ok())
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age >= min_age);
         if !stale {
             continue;
         }
-        let path = entry.path();
-        let _ = if path.is_dir() {
+        let _ = if meta.file_type().is_dir() {
             std::fs::remove_dir_all(&path)
         } else {
             std::fs::remove_file(&path)
@@ -378,6 +383,21 @@ mod tests {
         // Boot sweeps everything.
         sweep_spill(&cfg, std::time::Duration::ZERO);
         assert!(!spill.join("dead/query.tmp").exists());
+        // A link inside the spill dir is removed as a link; its target (which
+        // may be outside the directory) survives.
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, b"keep").expect("outside file");
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(&spill).expect("spill root");
+            std::os::unix::fs::symlink(&outside, spill.join("planted")).expect("symlink");
+            sweep_spill(&cfg, std::time::Duration::ZERO);
+            assert!(!spill.join("planted").exists());
+            assert!(
+                outside.exists(),
+                "the sweep must never delete through a link"
+            );
+        }
         // No directory at all is a no-op, never a panic.
         std::fs::remove_dir_all(&spill).expect("remove spill");
         sweep_spill(&cfg, std::time::Duration::ZERO);
