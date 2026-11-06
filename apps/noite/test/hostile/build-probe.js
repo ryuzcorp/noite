@@ -10,6 +10,7 @@ import {
   readFileSync,
   writeFileSync,
 } from "node:fs";
+import nodePath from "node:path";
 
 const out = {};
 
@@ -167,25 +168,53 @@ deny("read:sibling-build-cache", () => {
 
 // Per-fleet cgroups are the inverse probe: containment holds when every
 // fleet group carries a positive `memory.max`, read by the sandboxed build
-// itself from the shared anchor. The build runs in the runner's leaf
-// (`.../noite/runner`), so the anchor is its parent; every sibling directory
-// is a live tenant fleet.
+// itself from the shared anchor. A build (and release) runs in its own
+// `_build-<key>` leaf below that anchor now, not in `runner`, so walk up from
+// this process's cgroup until the anchor's `runner` leaf or its `noite` name
+// marks it. Every remaining subdirectory is a live tenant fleet (`_control`
+// is the platform's own capped leaf; build leaves are transient).
 const cgroupAnchor = () => {
   const selfLine = readFileSync("/proc/self/cgroup", "utf-8")
     .split("\n")
     .find((line) => line.startsWith("0::"));
 
   const own = (selfLine ?? "").slice(3) || "/";
+  let dir = own === "/" ? "/sys/fs/cgroup" : `/sys/fs/cgroup${own}`;
+  let anchor = null;
 
-  const anchor =
-    own === "/"
-      ? "/sys/fs/cgroup/noite"
-      : `/sys/fs/cgroup${own.replace(/\/runner$/u, "")}`;
+  for (;;) {
+    if (existsSync(`${dir}/runner`) || nodePath.basename(dir) === "noite") {
+      anchor = dir;
+      break;
+    }
+
+    if (existsSync(`${dir}/noite/runner`)) {
+      anchor = `${dir}/noite`;
+      break;
+    }
+
+    const parent = nodePath.dirname(dir);
+
+    if (parent === dir) {
+      break;
+    }
+
+    dir = parent;
+  }
+
+  if (anchor === null) {
+    throw new Error(`no cgroup anchor above ${own}`);
+  }
 
   // Every cgroup dir also carries the kernel's own interface files
   // (`cgroup.procs`, `memory.stat`, …): only subdirectories are fleets.
   const fleets = readdirSync(anchor, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && entry.name !== "runner")
+    .filter(
+      (entry) =>
+        entry.isDirectory() &&
+        entry.name !== "runner" &&
+        !entry.name.startsWith("_build-")
+    )
     .map((entry) => entry.name);
 
   return { anchor, fleets };
