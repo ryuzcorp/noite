@@ -47,10 +47,15 @@ test(
 
     const deploy = await waitForDeploy(request, id);
     expect(deploy.status, deploy.log).toBe("success");
-    // The template installs with bun and deploys the config its build wrote.
+    // The template installs with bun; the build writes a derived
+    // `dist/wrangler.json`, but Void's own `dist/ssr/wrangler.json` is what
+    // deploys (it carries the bindings, migrations and sandbox entries the
+    // derivation may not know).
     expect(deploy.log).toContain("▸ install: bun install (bun.lock)");
     expect(deploy.log).toContain("▸ build: bun run build");
-    expect(deploy.log).toContain("config: dist/wrangler.json (build output)");
+    expect(deploy.log).toContain(
+      "config: dist/wrangler.json (from dist/ssr/wrangler.json, Void)"
+    );
 
     const base = `http://localhost:${await appListenPort(request, id)}`;
     // A first deploy spawns the fleet; its port resets connections until
