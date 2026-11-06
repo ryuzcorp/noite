@@ -10,6 +10,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-alpha.22] - 2026-11-06
+
+### Operator action required
+
+- A tenant build now runs in its own capped cgroup (`RUNNER_BUILD_MEMORY_MB`; unset derives half the detected memory split across build slots). A build that used to thrash a small host now fails with a deploy-log message naming the cap; raise the knob where the RAM allows it, or deploy a prebuilt dist from CI. The Void/Ilha template's build peaked at ~610 MB on the 2 GB test box, inside the derived ~978 MiB, so installs whose builds fit need no change.
+
+### Fixed
+
+- A tenant install/build/release step now runs in its own per-deploy `build` cgroup leaf (production and each preview separately) with a hard `memory.max` (`RUNNER_BUILD_MEMORY_MB`; unset derives half the detected memory split across the build slots, clamped 512–4096 MiB), `memory.oom.group`, `pids.max`, swap capped at zero (a build cannot grow past its budget into host swap) and a low CPU share. A build that outgrows the budget — a Vite/Rolldown build of a Void app peaks around 1.3 GiB on two cores — is OOM-killed inside its own leaf, so the runner, Caddy and every fleet keep serving, and the deploy log names the cap and the ways out (raise it on a box with the RAM, or deploy a prebuilt dist from CI). The step moves itself into the leaf in `pre_exec` before the build uid is dropped, and the uid/gid drop moved into that same window (`setgroups(0)`, `setgid`, `setuid`). `/ready` reports the budget and every live leaf's charge, peak and OOM count. Cgroups unavailable still means an uncapped build, but that is logged at boot and named in `/ready`, as before.
+
 ## [0.1.0-alpha.21] - 2026-11-06
 
 ### Operator action required
