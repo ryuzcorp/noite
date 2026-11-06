@@ -10,6 +10,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-alpha.21] - 2026-11-06
+
+### Operator action required
+
+- Redeploy Void apps whose build also writes a `dist/wrangler.json` (the Ilha + Void and Outer templates do): their next deploy now runs D1 migrations and wires identity vars, the platform proxy, `ISR_CACHE` and the sandbox controller. Apps that were serving without them apply pending migrations on that deploy. An upgrade still cold-boots every fleet, so batch upgrades and redeploys.
+
+### Fixed
+
+- A Void app whose build also writes `dist/wrangler.json` — the Void/Ilha and Outer app templates derive that file from Void's own config for celld deploys — no longer deploys as a non-Void app. Void's `dist/ssr/wrangler.json` now outranks it: D1 migrations run again, and identity vars, the platform proxy, `ISR_CACHE` and the managed sandbox controller are wired. The rewrite replaces the derived file in place, and container `dockerfile`/`build_context` paths are made absolute, so a sandbox using the default Void image (it lives in `node_modules`) still resolves after the config moves out of `dist/ssr/`.
+
 ## [0.1.0-alpha.20] - 2026-11-06
 
 ### Operator action required

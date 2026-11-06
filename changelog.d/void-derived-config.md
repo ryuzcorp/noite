@@ -1,3 +1,0 @@
-### Fixed
-
-- A Void app whose build also writes `dist/wrangler.json` — the Void/Ilha and Outer app templates derive that file from Void's own config for celld deploys — no longer deploys as a non-Void app. Void's `dist/ssr/wrangler.json` now outranks it: D1 migrations run again, and identity vars, the platform proxy, `ISR_CACHE` and the managed sandbox controller are wired. The rewrite replaces the derived file in place, and container `dockerfile`/`build_context` paths are made absolute, so a sandbox using the default Void image (it lives in `node_modules`) still resolves after the config moves out of `dist/ssr/`.
