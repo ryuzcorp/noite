@@ -97,17 +97,26 @@ pub(super) fn sweep_spill(cfg: &Config, min_age: std::time::Duration) {
 /// pin the spill cap until the next restart.
 pub(super) const SPILL_SWEEP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// One single-quoted DuckDB SQL literal. A doubled quote is the only escape
+/// DuckDB needs, and store fields or bucket keys may contain one.
+pub(super) fn sql_lit(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 /// S3 connection options (PATH style, plain HTTP) as DuckDB SET statements —
 /// no CREATE SECRET, so the -json output carries no DDL glue lines. The docs
 /// prescribe exactly these two for an S3-compatible plain-HTTP endpoint.
+/// Every interpolated field is a quoted literal: the store secret must not
+/// end the statement, and an operator typo must fail one query, not the
+/// whole telemetry pass.
 pub(super) fn s3_setup(cfg: &Config, query: &str) -> String {
     format!(
-        "SET s3_region='{}'; SET s3_endpoint='{}'; SET s3_url_style='path'; \
-         SET s3_access_key_id='{}'; SET s3_secret_access_key='{}'; SET s3_use_ssl=false; {} {}",
-        cfg.aws_region,
-        endpoint_host(&cfg.s3_endpoint),
-        cfg.aws_access_key_id,
-        cfg.aws_secret_access_key,
+        "SET s3_region={}; SET s3_endpoint={}; SET s3_url_style='path'; \
+         SET s3_access_key_id={}; SET s3_secret_access_key={}; SET s3_use_ssl=false; {} {}",
+        sql_lit(&cfg.aws_region),
+        sql_lit(&endpoint_host(&cfg.s3_endpoint)),
+        sql_lit(&cfg.aws_access_key_id),
+        sql_lit(&cfg.aws_secret_access_key),
         duckdb_settings(cfg),
         query,
     )
@@ -291,14 +300,20 @@ pub(super) fn telemetry_globs(
 
 pub(super) async fn duckdb_json(cfg: &Config, sql: &str, purpose: &str) -> anyhow::Result<String> {
     stats::count_duckdb(purpose);
-    let result = exec::run_cmd(
+    // SQL on stdin, never argv: it carries the store secret (the platform
+    // root keys), and `/proc/<pid>/cmdline` is world-readable while tenant
+    // build processes share the PID namespace. `-json` keeps the output
+    // shape identical to `-c`.
+    let result = exec::run_cmd_stdin(
         "/usr/local/bin/duckdb",
-        &["-json", "-c", sql],
+        &["-json"],
+        sql.as_bytes(),
         None,
         &[],
         std::time::Duration::from_secs(30),
     )
-    .await;
+    .await
+    .map(|out| String::from_utf8_lossy(&out).into_owned());
     if result.is_err() {
         // A timeout kills the CLI without its clean exit, leaving its spill
         // behind; stale bytes count against the cap and would wedge the next
@@ -367,6 +382,28 @@ mod tests {
             sql.contains("temp_directory='/data/it''s/duckdb-tmp'"),
             "{sql}"
         );
+    }
+
+    #[test]
+    fn duckdb_literals_escape_quotes() {
+        assert_eq!(sql_lit("plain"), "'plain'");
+        assert_eq!(sql_lit("it's"), "'it''s'");
+    }
+
+    #[test]
+    fn s3_setup_quotes_every_interpolated_field() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.aws_region = "us'east".into();
+        cfg.aws_access_key_id = "key'one".into();
+        cfg.aws_secret_access_key = "sec'ret".into();
+        let sql = s3_setup(&cfg, "SELECT 1");
+        assert!(sql.contains("SET s3_region='us''east';"), "{sql}");
+        assert!(sql.contains("SET s3_access_key_id='key''one';"), "{sql}");
+        assert!(
+            sql.contains("SET s3_secret_access_key='sec''ret';"),
+            "{sql}"
+        );
+        assert!(!sql.contains("sec'ret'"), "unescaped secret in {sql}");
     }
 
     #[test]
