@@ -35,7 +35,7 @@ pub(super) fn json_i64(v: &serde_json::Value, key: &str) -> i64 {
 /// `<work_dir>/duckdb-tmp` instead, bounded by `RUNNER_DUCKDB_TEMP_MB`.
 pub(super) fn duckdb_settings(cfg: &Config) -> String {
     let mut out = format!(
-        "SET threads={}; SET memory_limit='{}MB';",
+        "SET threads={}; SET memory_limit='{}MiB';",
         cfg.duckdb_threads.max(1),
         cfg.duckdb_memory_mb,
     );
@@ -44,7 +44,7 @@ pub(super) fn duckdb_settings(cfg: &Config) -> String {
         // must not end the literal.
         let temp = format!("{}/duckdb-tmp", cfg.work_dir.trim_end_matches('/')).replace('\'', "''");
         out.push_str(&format!(
-            " SET temp_directory='{temp}'; SET max_temp_directory_size='{}MB';",
+            " SET temp_directory='{temp}'; SET max_temp_directory_size='{}MiB';",
             cfg.duckdb_temp_mb,
         ));
     }
@@ -335,13 +335,13 @@ mod tests {
         cfg.duckdb_temp_mb = 1024;
         let sql = s3_setup(&cfg, "SELECT 1");
         assert!(sql.contains("SET threads=1;"), "{sql}");
-        assert!(sql.contains("SET memory_limit='256MB';"), "{sql}");
+        assert!(sql.contains("SET memory_limit='256MiB';"), "{sql}");
         assert!(
             sql.contains("SET temp_directory='/data/runner/duckdb-tmp';"),
             "{sql}"
         );
         assert!(
-            sql.contains("SET max_temp_directory_size='1024MB';"),
+            sql.contains("SET max_temp_directory_size='1024MiB';"),
             "{sql}"
         );
         // The caps precede the query, so they apply to it.
