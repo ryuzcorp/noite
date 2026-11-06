@@ -19,6 +19,8 @@ Every push to `main` builds on the Noite host, in the build sandbox. You do not 
 
 Tools whose launcher asks for Node (`vite`, `rsbuild`) get the image's Node 24. The build sees your app's environment variables plus `CI=1`, `NODE_ENV=production` and `NO_COLOR=1`. Each install and build step is bounded by `RUNNER_BUILD_TIMEOUT_S` (300 s by default) and the worktree by `RUNNER_BUILD_MAX_MB`.
 
+Install, build and release steps also run in their own cgroup with a memory cap (`RUNNER_BUILD_MEMORY_MB`; unset derives half the detected memory, clamped 512–4096 MiB) and a low CPU share, so a build that outgrows the box is OOM-killed on its own and the runner and your apps keep serving. The deploy log then names the budget. On a 2 GB host a Vite/Void build can reach about 1.3 GiB — above the derived ~978 MiB — so either raise the cap on a box with the RAM, or [build in CI](/apps/deploy#deploy-from-ci) and deploy the dist.
+
 ## Package managers
 
 1. **A pin in `package.json`** — `"packageManager": "pnpm@10.18.0"` or `devEngines.packageManager` with a `version`. That exact release runs, Bun included.

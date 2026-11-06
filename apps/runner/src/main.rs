@@ -327,6 +327,10 @@ async fn main() -> anyhow::Result<()> {
     // into a leaf, so children spawned after it inherit the leaf and tenant
     // fleets can each move to their own group (SPEC, Tenant isolation).
     host::cgroups::setup(&config.cgroup_root);
+    // Builds move into their own capped leaf: a Vite/Rolldown build peaks
+    // above a small box's spare memory, and the build — not a fleet — must be
+    // the thing that dies when it outgrows its budget.
+    host::cgroups::setup_build(config.build_memory_mb);
     let isolation = host::isolation::self_check(&config, nft_installed).await;
     if isolation.blocked {
         tracing::error!(detail = %isolation.detail, "multi-tenant isolation checks failed; /ready stays 503");

@@ -36,6 +36,17 @@ const CONTROLLERS: &str = "+memory +pids";
 const FLEET_PARENT: &str = "noite";
 /// Leaf holding the runner (and PID 1) while controllers are enabled above.
 const RUNNER_LEAF: &str = "runner";
+/// Prefix of a per-install/build/release-key leaf (`_build-<fleet key>`);
+/// the underscore keeps it out of every tenant slug's namespace (slugs
+/// cannot start with one, and `_control` is already a reserved key).
+const BUILD_LEAF_PREFIX: &str = "_build-";
+/// A build's task cap (processes and threads): bun, node, tsc and their
+/// workers; far below a fleet's because a build is one project.
+pub const BUILD_PIDS_MAX: u64 = 2048;
+/// A build's CPU share against a leaf's default 100. Under contention the
+/// build yields; on an idle box it still runs at full speed (shares only
+/// matter between runnable tasks).
+const BUILD_CPU_WEIGHT: u64 = 10;
 
 /// Cap on a fleet's tasks (processes and threads — the pids controller
 /// counts both). Generous on purpose: celld runs isolates in-process and a
@@ -45,6 +56,8 @@ pub const FLEET_PIDS_MAX: u64 = 4096;
 static CGROUPS_OK: AtomicBool = AtomicBool::new(false);
 static CGROUP_REASON: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 static CGROUP_ANCHOR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static BUILD_MEMORY_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static BUILD_CPU: AtomicBool = AtomicBool::new(false);
 
 fn reason(msg: String) {
     if let Ok(mut reason) = CGROUP_REASON.lock() {
@@ -86,6 +99,182 @@ pub fn note_limit_failed(fleet: &str, reason: String) {
 /// succeeded. Fleet keys are ProcMap keys (`slug`, `slug.label`).
 pub fn anchor() -> Option<PathBuf> {
     CGROUP_ANCHOR.get().cloned()
+}
+
+/// The per-build budget in MiB (`0` = uncapped), for the failure message and
+/// `/ready`.
+pub fn build_memory_mb() -> Option<u64> {
+    BUILD_MEMORY_MB.get().copied()
+}
+
+/// Configure build containment once after [`setup`], before any child
+/// spawns: remember the budget and (best-effort) enable the CPU controller on
+/// the way down so each build leaf can take a small share. No leaf is created
+/// here — each deploy creates its own. `false` when cgroupfs is unavailable
+/// (builds then share the runner's cgroup, as before), logged loudly.
+pub fn setup_build(memory_mb: u64) -> bool {
+    let Some(anchor) = anchor() else {
+        tracing::info!("cgroups unavailable; tenant builds run uncapped");
+        return false;
+    };
+    let _ = BUILD_MEMORY_MB.set(memory_mb);
+    // The CPU controller is optional: it only lets a build yield to serving
+    // traffic. Enabling it on the way down changes nothing for existing
+    // leaves (all default to weight 100); failing to enable it must not cost
+    // the memory cap.
+    let own = anchor.parent().unwrap_or(&anchor);
+    let cpu = add_controller(own, "cpu")
+        .and_then(|()| add_controller(&anchor, "cpu"))
+        .map_err(|error| {
+            tracing::debug!(
+                "build cpu.weight unavailable ({error:#}); builds keep the default share"
+            );
+        })
+        .is_ok();
+    BUILD_CPU.store(cpu, Ordering::Relaxed);
+    tracing::info!(memory_mb, cpu, "tenant build containment active");
+    true
+}
+
+/// Enable one controller in `cgroup.subtree_control` when it is not already
+/// on, and verify the kernel kept it (a refused write must not look applied).
+fn add_controller(cgroup: &Path, name: &str) -> anyhow::Result<()> {
+    let path = cgroup.join("cgroup.subtree_control");
+    let current = std::fs::read_to_string(&path)
+        .map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))?;
+    if current.split_whitespace().any(|entry| entry == name) {
+        return Ok(());
+    }
+    write_file(cgroup, "cgroup.subtree_control", &format!("+{name}"))?;
+    let applied = std::fs::read_to_string(&path)
+        .map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))?;
+    if !applied.split_whitespace().any(|entry| entry == name) {
+        anyhow::bail!("{name} did not enable in {}", path.display());
+    }
+    Ok(())
+}
+
+/// The deploy's build leaf when cgroups are active. `Ok(None)` means the
+/// install has no cgroup containment, so the step runs uncapped (the boot log
+/// and `/ready` already say so).
+pub fn build_leaf_for(key: &str, memory_mb: u64) -> anyhow::Result<Option<PathBuf>> {
+    let Some(anchor) = anchor() else {
+        return Ok(None);
+    };
+    let cpu = BUILD_CPU.load(Ordering::Relaxed);
+    Ok(Some(ensure_build_cgroup(&anchor, key, memory_mb, cpu)?))
+}
+
+/// Create (or reuse) the leaf for one deploy key: the memory budget
+/// (`RUNNER_BUILD_MEMORY_MB`, 0 = uncapped), swap capped at zero like a fleet
+/// leaf (a build must not escape its budget into host swap), the group OOM, a
+/// task cap and (when the CPU controller is delegated) a small CPU share.
+/// Reuse after a crash is safe: the limits are rewritten and the new step
+/// moves in. Leaves are world-traversable like fleet leaves; their interface
+/// files stay root-owned, so a tenant cannot raise a limit or move itself
+/// out.
+fn ensure_build_cgroup(
+    anchor: &Path,
+    key: &str,
+    memory_mb: u64,
+    cpu: bool,
+) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = anchor.join(format!("{BUILD_LEAF_PREFIX}{}", fleet_dir_name(key)));
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| anyhow::anyhow!("create {}: {error}", dir.display()))?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+        .map_err(|error| anyhow::anyhow!("chmod {}: {error}", dir.display()))?;
+    if memory_mb > 0 {
+        write_limit(&dir, "memory.max", &(memory_mb * 1024 * 1024).to_string())?;
+        // The same rule as a fleet leaf: allowed swap lets the step grow past
+        // its budget without tripping anything, so cap it at zero. Where the
+        // kernel has no swap accounting there is nothing to escape into.
+        match cap_swap(&dir) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    key,
+                    "no cgroup swap accounting; build contained without memory.swap.max"
+                );
+            }
+            Err(error) => {
+                use anyhow::Context;
+                return Err(error).with_context(|| format!("cap swap for build {key}"));
+            }
+        }
+        // Kill every task in the leaf when one pushes it over: a lone
+        // SIGKILL to the leader can leave a worker holding the budget.
+        write_file(&dir, "memory.oom.group", "1")?;
+    }
+    write_file(&dir, "pids.max", &BUILD_PIDS_MAX.to_string())?;
+    if cpu && memory_mb > 0 {
+        write_limit(&dir, "cpu.weight", &BUILD_CPU_WEIGHT.to_string())?;
+    }
+    Ok(dir)
+}
+
+/// A build leaf's cumulative `oom_kill` counter, or `None` when the file is
+/// unreadable. Callers diff it around one step: a rise means the kernel killed
+/// that step's cgroup.
+pub fn build_oom_kills(dir: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(dir.join("memory.events")).ok()?;
+    parse_oom_kills(&text)
+}
+
+/// The build budget and every live build leaf for `/ready`: charge,
+/// high-water mark and OOM count per deploy key. `null` when cgroups are
+/// unavailable; `memory_mb` is still reported then.
+pub fn build_status() -> serde_json::Value {
+    let Some(anchor) = anchor() else {
+        return serde_json::Value::Null;
+    };
+    let read = |dir: &Path, name: &str| {
+        std::fs::read_to_string(dir.join(name))
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+    };
+    let mut leaves: Vec<(String, serde_json::Value)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&anchor) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(key) = name.strip_prefix(BUILD_LEAF_PREFIX) else {
+                continue;
+            };
+            let dir = entry.path();
+            leaves.push((
+                key.to_string(),
+                serde_json::json!({
+                    "current_bytes": read(&dir, "memory.current"),
+                    "peak_bytes": read(&dir, "memory.peak"),
+                    "oom_kills": build_oom_kills(&dir),
+                }),
+            ));
+        }
+    }
+    leaves.sort_by(|a, b| a.0.cmp(&b.0));
+    let leaves: Vec<serde_json::Value> = leaves
+        .into_iter()
+        .map(|(key, mut value)| {
+            value["key"] = serde_json::Value::String(key);
+            value
+        })
+        .collect();
+    serde_json::json!({
+        "memory_mb": build_memory_mb().unwrap_or(0),
+        "leaves": leaves,
+    })
+}
+
+/// `oom_kill` from a cgroup `memory.events` body.
+fn parse_oom_kills(text: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once(' ')?;
+        if key != "oom_kill" {
+            return None;
+        }
+        value.trim().parse().ok()
+    })
 }
 
 /// Resolve the runner's own cgroup under `root` from its kernel placement:
@@ -877,6 +1066,65 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("pids.max")).expect("pids.max"),
             FLEET_PIDS_MAX.to_string()
+        );
+    }
+
+    /// A deploy's build leaf carries the budget as a hard max, kills its whole
+    /// group on an OOM, and yields CPU; `memory_mb == 0` writes no memory
+    /// limit. The key is namespaced away from tenant slugs.
+    #[test]
+    fn build_leaf_applies_its_budget() {
+        let tmp = fakefs();
+        let dir =
+            ensure_build_cgroup(tmp.path(), "shop.preview-1", 768, true).expect("build cgroup");
+        assert_eq!(dir, tmp.path().join("_build-shop.preview-1"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("memory.max")).expect("memory.max"),
+            (768 * 1024 * 1024).to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("memory.oom.group")).expect("oom.group"),
+            "1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pids.max")).expect("pids.max"),
+            BUILD_PIDS_MAX.to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cpu.weight")).expect("cpu.weight"),
+            BUILD_CPU_WEIGHT.to_string()
+        );
+        assert!(!dir.join("memory.high").exists(), "no early throttle");
+
+        let uncapped = fakefs();
+        let dir =
+            ensure_build_cgroup(uncapped.path(), "shop", 0, false).expect("uncapped build cgroup");
+        assert!(!dir.join("memory.max").exists());
+        assert!(!dir.join("cpu.weight").exists());
+        assert!(dir.join("pids.max").exists());
+    }
+
+    #[test]
+    fn build_oom_counter_reads_memory_events() {
+        let text = "low 0\nhigh 0\nmax 2\noom 3\noom_kill 4\noom_group_kill 1\n";
+        assert_eq!(parse_oom_kills(text), Some(4));
+        assert_eq!(parse_oom_kills("low 0\noom 1\n"), None);
+        assert_eq!(parse_oom_kills(""), None);
+    }
+
+    #[test]
+    fn add_controller_accepts_an_enabled_controller_without_writing() {
+        let tmp = fakefs();
+        std::fs::write(
+            tmp.path().join("cgroup.subtree_control"),
+            "cpu memory pids\n",
+        )
+        .expect("fake subtree_control");
+        add_controller(tmp.path(), "cpu").expect("already enabled");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("cgroup.subtree_control")).unwrap(),
+            "cpu memory pids\n",
+            "an enabled controller is never rewritten"
         );
     }
 

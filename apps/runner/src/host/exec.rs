@@ -4,6 +4,8 @@
 //! in `host::tips`.
 
 use anyhow::{bail, Context};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
@@ -103,11 +105,14 @@ fn copy_dir(source: &Path, target: &Path) -> std::io::Result<()> {
 /// `uid: None` = current user (dev only, single-tenant).
 /// `cache: None` = a throwaway `.build-cache` inside the worktree; `Some` =
 /// the persistent per-app cache root (T5.1).
+/// `cgroup: None` = no build containment on this install; `Some` = the
+/// deploy's capped build leaf, which the step enters before dropping uid.
 pub struct Sandbox<'a> {
     pub uid: Option<u32>,
     pub gid: Option<u32>,
     pub env: &'a [(&'a str, &'a str)],
     pub cache: Option<&'a Path>,
+    pub cgroup: Option<&'a Path>,
 }
 
 /// Probe whether uid drops work (needs CAP_SETUID/CAP_SETGID or root).
@@ -283,6 +288,18 @@ pub async fn run_sandboxed(
         lchown_tree(cache, uid, gid);
     }
     let drops_uid = sb.uid.is_some();
+    // Move the build into its capped leaf before the build uid is applied
+    // (cgroup.procs is root-owned; after setuid the write is refused), so the
+    // whole step — install, build, release — runs under the build budget.
+    let build_procs = match sb.cgroup {
+        Some(dir) => Some(
+            std::ffi::CString::new(dir.join("cgroup.procs").as_os_str().as_bytes())
+                .map_err(|_| anyhow::anyhow!("build cgroup path contains a NUL byte"))?,
+        ),
+        None => None,
+    };
+    let oom_kills_before = sb.cgroup.and_then(crate::host::cgroups::build_oom_kills);
+    let credentials = sb.uid.map(|uid| (uid, sb.gid.unwrap_or(uid)));
     let mut cmd = Command::new(program);
     cmd.args(args)
         .current_dir(cwd)
@@ -298,34 +315,53 @@ pub async fn run_sandboxed(
     }
     {
         let std_cmd = cmd.as_std_mut();
-        if let Some(uid) = sb.uid {
-            std_cmd.uid(uid);
-        }
-        if let Some(gid) = sb.gid {
-            std_cmd.gid(gid);
-        }
         std_cmd.process_group(0);
         // SAFETY: pre_exec runs between fork and exec; only async-signal-safe
-        // libc calls. setrlimit bounds fork bombs (NPROC) and runaway
-        // outputs (FSIZE 4 GiB).
+        // libc calls. Cgroup move, credentials, then rlimits: cgroup.procs
+        // needs root, and NPROC is only meaningful for the dedicated build
+        // uid (on the runner's own uid it would cap the runner and fleets).
         unsafe {
             std_cmd.pre_exec(move || {
-                // RLIMIT_NPROC counts every process of the real uid, so it is
-                // only meaningful for the dedicated build uid; on the
-                // runner's own uid (dev, single tenancy) it would cap the
-                // runner and its fleets too.
+                if let Some(path) = &build_procs {
+                    let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                    if fd < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let moved = libc::write(fd, b"0".as_ptr().cast(), 1);
+                    libc::close(fd);
+                    if moved != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                if let Some((uid, gid)) = credentials {
+                    // Clear root's supplementary groups before gid/uid, or the
+                    // build keeps group access it was never granted.
+                    if libc::setgroups(0, std::ptr::null()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::setgid(gid) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::setuid(uid) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 if drops_uid {
                     let nproc = libc::rlimit {
                         rlim_cur: 512,
                         rlim_max: 512,
                     };
-                    libc::setrlimit(libc::RLIMIT_NPROC, &nproc);
+                    if libc::setrlimit(libc::RLIMIT_NPROC, &nproc) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 let fsize = libc::rlimit {
                     rlim_cur: 4 * 1024 * 1024 * 1024,
                     rlim_max: 4 * 1024 * 1024 * 1024,
                 };
-                libc::setrlimit(libc::RLIMIT_FSIZE, &fsize);
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &fsize) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -342,6 +378,21 @@ pub async fn run_sandboxed(
         // SAFETY: signals only the process group this call created.
         unsafe {
             libc::killpg(pid as i32, libc::SIGKILL);
+        }
+    }
+    // A rise in the leaf's OOM counter is this step outgrowing its budget:
+    // say so, instead of a bare signal or timeout and a log the operator has
+    // to correlate with `dmesg`. The rest of the install kept running.
+    if let Some(before) = oom_kills_before {
+        if sb
+            .cgroup
+            .and_then(crate::host::cgroups::build_oom_kills)
+            .is_some_and(|after| after > before)
+        {
+            bail!(
+                "the build exceeded its memory budget ({} MiB, RUNNER_BUILD_MEMORY_MB) and the kernel killed it inside its own cgroup. Raise the budget (if the box has the RAM for it) or deploy a prebuilt dist from CI; the runner and the apps kept serving",
+                crate::host::cgroups::build_memory_mb().unwrap_or(0)
+            );
         }
     }
     match result {

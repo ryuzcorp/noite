@@ -692,11 +692,19 @@ async fn deploy_inner(
             tracing::warn!(slug = %app.slug, "chown build cache to build uid failed; continuing (needs CAP_CHOWN)");
         }
     }
+    // One capped leaf per deploy key (production and each preview have
+    // their own): the install, build and release steps enter it before the
+    // build uid drops. `None` when the install has no cgroup containment, in
+    // which case the step runs uncapped, exactly as before.
+    let build_cgroup =
+        crate::host::cgroups::build_leaf_for(&fleet_label(app, target), cfg.build_memory_mb)
+            .with_context(|| "prepare the build cgroup")?;
     let sb = Sandbox {
         uid: sandbox_id,
         gid: sandbox_id,
         env: &step_env,
         cache: Some(&cache),
+        cgroup: build_cgroup.as_deref(),
     };
 
     exec::check_work_quota(&work, cfg.build_max_mb)?;
@@ -891,6 +899,7 @@ async fn deploy_inner(
                 gid: sb.gid,
                 env: &cmd_env,
                 cache: sb.cache,
+                cgroup: sb.cgroup,
             };
             let out = exec::run_sandboxed(
                 "sh",
