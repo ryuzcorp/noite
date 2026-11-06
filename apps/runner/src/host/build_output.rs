@@ -545,6 +545,9 @@ fn relocate_container_paths(
         {
             for key in ["dockerfile", "build_context"] {
                 if let Some(text) = default.get(key).and_then(Value::as_str).map(str::to_string) {
+                    if text.is_empty() {
+                        bail!("containers images.default.{key} must be a path");
+                    }
                     let path = absolute(&format!("images.default.{key}"), &text)?;
                     default.insert(key.to_string(), Value::String(path));
                 }
@@ -1274,6 +1277,25 @@ mod tests {
         // dropped from the config; the migrate step reads the pushed tree's
         // `db/migrations` directly.
         assert!(v["d1_databases"][0].get("migrations_dir").is_none());
+    }
+
+    /// An empty path must not be reinterpreted as the config directory:
+    /// relocation would hand `plan_containers` a valid-looking directory
+    /// and the image would build with the wrong context.
+    #[test]
+    fn empty_container_paths_are_refused() {
+        let guard_empty = scratch("void-empty-path");
+        let src = guard_empty.path().canonicalize().unwrap();
+        write(
+            &src.join("dist/ssr/wrangler.json"),
+            r#"{"name":"a","main":"index.js","assets":{"directory":"../client"},
+               "containers":[{"class_name":"SandboxV1","images":{"default":{"dockerfile":"D","build_context":""}}}]}"#,
+        );
+        write(&src.join("dist/ssr/index.js"), "");
+        write(&src.join("dist/ssr/D"), "FROM scratch\n");
+        write(&src.join("dist/client/a.js"), "");
+        let err = built_deploy_root(&src).unwrap_err().to_string();
+        assert!(err.contains("build_context must be a path"), "{err}");
     }
 
     /// Void's `secrets.required` is captured before the rewrite drops the key
