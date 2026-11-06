@@ -28,17 +28,87 @@ pub(super) fn json_i64(v: &serde_json::Value, key: &str) -> i64 {
     f.as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0)
 }
 
+/// Runtime caps every telemetry query carries. DuckDB's own defaults are the
+/// machine: all cores and 80% of RAM, which on a small install puts a single
+/// ingest or compaction scan larger than every resident fleet together. The
+/// cap is explicit so the box OOMs nothing; a scan that outgrows it spills to
+/// `<work_dir>/duckdb-tmp` instead, bounded by `RUNNER_DUCKDB_TEMP_MB`.
+pub(super) fn duckdb_settings(cfg: &Config) -> String {
+    let mut out = format!(
+        "SET threads={}; SET memory_limit='{}MiB';",
+        cfg.duckdb_threads.max(1),
+        cfg.duckdb_memory_mb,
+    );
+    if cfg.duckdb_temp_mb > 0 {
+        // Paths and sizes ride in SQL strings: a quote in RUNNER_WORK_DIR
+        // must not end the literal.
+        let temp = format!("{}/duckdb-tmp", cfg.work_dir.trim_end_matches('/')).replace('\'', "''");
+        out.push_str(&format!(
+            " SET temp_directory='{temp}'; SET max_temp_directory_size='{}MiB';",
+            cfg.duckdb_temp_mb,
+        ));
+    }
+    out
+}
+
+/// Spill root for every telemetry DuckDB invocation.
+pub(super) fn spill_dir(cfg: &Config) -> std::path::PathBuf {
+    std::path::Path::new(&cfg.work_dir).join("duckdb-tmp")
+}
+
+/// Best-effort removal of spill entries older than `min_age`. DuckDB removes
+/// its own temp directory on a clean exit; a timeout kill leaves it behind,
+/// and stale bytes count against `max_temp_directory_size`, which would
+/// otherwise wedge every later pass. The age filter keeps a live query's
+/// files untouched; `min_age` of zero clears everything and is only safe
+/// before the first query (boot).
+pub(super) fn sweep_spill(cfg: &Config, min_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(spill_dir(cfg)) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `symlink_metadata`: never follow a link a tenant or a crash could
+        // have planted, either to read the target's age or to delete through
+        // it. A link is removed as a link.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= min_age);
+        if !stale {
+            continue;
+        }
+        let _ = if meta.file_type().is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+}
+
+/// Seconds a spilled entry may sit before a failed pass sweeps it. Long
+/// enough that a query still spilling is never touched (directory mtimes
+/// only move on entry creation), short enough that a killed pass does not
+/// pin the spill cap until the next restart.
+pub(super) const SPILL_SWEEP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// S3 connection options (PATH style, plain HTTP) as DuckDB SET statements —
 /// no CREATE SECRET, so the -json output carries no DDL glue lines. The docs
 /// prescribe exactly these two for an S3-compatible plain-HTTP endpoint.
 pub(super) fn s3_setup(cfg: &Config, query: &str) -> String {
     format!(
         "SET s3_region='{}'; SET s3_endpoint='{}'; SET s3_url_style='path'; \
-         SET s3_access_key_id='{}'; SET s3_secret_access_key='{}'; SET s3_use_ssl=false; {}",
+         SET s3_access_key_id='{}'; SET s3_secret_access_key='{}'; SET s3_use_ssl=false; {} {}",
         cfg.aws_region,
         endpoint_host(&cfg.s3_endpoint),
         cfg.aws_access_key_id,
         cfg.aws_secret_access_key,
+        duckdb_settings(cfg),
         query,
     )
 }
@@ -219,16 +289,23 @@ pub(super) fn telemetry_globs(
     globs
 }
 
-pub(super) async fn duckdb_json(sql: &str, purpose: &str) -> anyhow::Result<String> {
+pub(super) async fn duckdb_json(cfg: &Config, sql: &str, purpose: &str) -> anyhow::Result<String> {
     stats::count_duckdb(purpose);
-    exec::run_cmd(
+    let result = exec::run_cmd(
         "/usr/local/bin/duckdb",
         &["-json", "-c", sql],
         None,
         &[],
         std::time::Duration::from_secs(30),
     )
-    .await
+    .await;
+    if result.is_err() {
+        // A timeout kills the CLI without its clean exit, leaving its spill
+        // behind; stale bytes count against the cap and would wedge the next
+        // passes (see `sweep_spill`).
+        sweep_spill(cfg, SPILL_SWEEP_AGE);
+    }
+    result
 }
 
 /// True when duckdb failed only because the window has no parquet (idle):
@@ -248,6 +325,83 @@ mod tests {
 
     const H: i64 = 1_767_225_600_000_000; // 2026-01-01T00:00:00Z in micros
     const HOUR_US: i64 = 3_600_000_000;
+
+    #[test]
+    fn duckdb_settings_cap_memory_threads_and_spill() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = "/data/runner".into();
+        cfg.duckdb_memory_mb = 256;
+        cfg.duckdb_threads = 1;
+        cfg.duckdb_temp_mb = 1024;
+        let sql = s3_setup(&cfg, "SELECT 1");
+        assert!(sql.contains("SET threads=1;"), "{sql}");
+        assert!(sql.contains("SET memory_limit='256MiB';"), "{sql}");
+        assert!(
+            sql.contains("SET temp_directory='/data/runner/duckdb-tmp';"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("SET max_temp_directory_size='1024MiB';"),
+            "{sql}"
+        );
+        // The caps precede the query, so they apply to it.
+        assert!(sql.ends_with("SELECT 1"), "{sql}");
+    }
+
+    #[test]
+    fn duckdb_spill_can_be_left_to_duckdb() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.duckdb_temp_mb = 0;
+        let sql = duckdb_settings(&cfg);
+        assert!(!sql.contains("temp_directory"), "{sql}");
+        assert!(!sql.contains("max_temp_directory_size"), "{sql}");
+    }
+
+    #[test]
+    fn duckdb_paths_escape_sql_literals() {
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = "/data/it's".into();
+        cfg.duckdb_temp_mb = 64;
+        let sql = duckdb_settings(&cfg);
+        assert!(
+            sql.contains("temp_directory='/data/it''s/duckdb-tmp'"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn spill_sweep_clears_stale_entries_and_tolerates_a_missing_dir() {
+        let dir = crate::testutil::TempDir::new("noite-spill-sweep");
+        let mut cfg = crate::config::config_for_tests();
+        cfg.work_dir = dir.path().to_string_lossy().into_owned();
+        let spill = spill_dir(&cfg);
+        std::fs::create_dir_all(spill.join("dead")).expect("spill subdir");
+        std::fs::write(spill.join("dead/query.tmp"), b"bytes").expect("spill file");
+        // A pass that cannot have left anything old keeps it.
+        sweep_spill(&cfg, std::time::Duration::from_secs(86_400));
+        assert!(spill.join("dead/query.tmp").exists());
+        // Boot sweeps everything.
+        sweep_spill(&cfg, std::time::Duration::ZERO);
+        assert!(!spill.join("dead/query.tmp").exists());
+        // A link inside the spill dir is removed as a link; its target (which
+        // may be outside the directory) survives.
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, b"keep").expect("outside file");
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(&spill).expect("spill root");
+            std::os::unix::fs::symlink(&outside, spill.join("planted")).expect("symlink");
+            sweep_spill(&cfg, std::time::Duration::ZERO);
+            assert!(!spill.join("planted").exists());
+            assert!(
+                outside.exists(),
+                "the sweep must never delete through a link"
+            );
+        }
+        // No directory at all is a no-op, never a panic.
+        std::fs::remove_dir_all(&spill).expect("remove spill");
+        sweep_spill(&cfg, std::time::Duration::ZERO);
+    }
 
     #[test]
     fn idle_err_detects_no_files() {

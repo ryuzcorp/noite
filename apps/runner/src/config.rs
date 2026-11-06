@@ -122,6 +122,27 @@ fn parse_tenancy(raw: Option<&str>, base_domain: &str) -> Tenancy {
     }
 }
 
+/// Telemetry DuckDB's derived memory cap: 10% of the memory this container
+/// may use, clamped 128..1024 MiB. Hidden is the alternative: DuckDB's own
+/// default is 80% of the machine, and on a 2 GB install that single scan is
+/// larger than every resident fleet together (`apps/runner/src/host/memory.rs`
+/// is the detection). 256 MiB when memory is unreadable.
+fn duckdb_memory_default_mb(total_bytes: Option<u64>) -> u64 {
+    let Some(total) = total_bytes else {
+        return 256;
+    };
+    (total / 10 / (1024 * 1024)).clamp(128, 1024)
+}
+
+/// Telemetry DuckDB's derived worker count: the cores this container may
+/// use, capped at 4. A big host does not need a 32-thread scan for an
+/// hourly aggregation, and the memory cap (not the thread count) is what
+/// keeps the scan off the fleets: a 2 vCPU box finishes in half the time
+/// with both cores than with one.
+fn duckdb_threads_default(cores: usize) -> u32 {
+    cores.clamp(1, 4) as u32
+}
+
 /// Parse one numeric env var: unset or blank means the default (compose
 /// renders an unset var as an empty string, so blank counts as unset — never
 /// as a value). A set-but-malformed value records a boot problem naming the
@@ -958,6 +979,18 @@ pub struct Config {
     /// ingest tick cadence (spec T3.4). 30 s means ~6x fewer Parquet PUTs and
     /// files than the old 5 s; dashboards lag live traffic by up to ~40 s.
     pub otel_flush_ms: u64,
+    /// Telemetry DuckDB's memory cap in MiB (`RUNNER_DUCKDB_MEMORY_MB`).
+    /// Unset derives 10% of the detected cgroup/host memory, clamped
+    /// 128..1024: DuckDB's own default is 80% of the machine, and on a 2 GB
+    /// box that scan collides with the resident fleets.
+    pub duckdb_memory_mb: u64,
+    /// Telemetry DuckDB's worker threads (`RUNNER_DUCKDB_THREADS`). Unset
+    /// derives the container's cores, capped at 4.
+    pub duckdb_threads: u32,
+    /// Cap on DuckDB's spill directory in MiB (`RUNNER_DUCKDB_TEMP_MB`,
+    /// default 1024; 0 = DuckDB's own default). The directory is
+    /// `<work_dir>/duckdb-tmp`, on the data volume, never `/tmp`.
+    pub duckdb_temp_mb: u64,
     /// The per-app build uid range: `[base, base + range)`, allocated
     /// one-to-one to apps (`db::ensure_app_build_uid`). Every app's builds
     /// and release commands run as their own uid in this range, so two
@@ -1053,6 +1086,11 @@ impl Config {
             "a non-negative integer",
             &mut env_problems,
         );
+        // Telemetry's DuckDB CLI defaults to 80% of the machine and every
+        // core. On a small host that scan lands on top of the resident
+        // fleets, so size it from what this container may actually use.
+        let duckdb_memory_default = duckdb_memory_default_mb(crate::host::memory::total_bytes());
+        let duckdb_threads_default = duckdb_threads_default(crate::host::memory::cores());
         // Read once, stripped, for `s3_endpoint` and the credential
         // provider's `StoreAccess` alike: provider detection, the install tag
         // and request URLs must see the same endpoint the rest of the runner
@@ -1255,6 +1293,24 @@ impl Config {
                 "a non-negative integer",
                 &mut env_problems,
             ),
+            duckdb_memory_mb: env_num(
+                "RUNNER_DUCKDB_MEMORY_MB",
+                duckdb_memory_default,
+                "an integer",
+                &mut env_problems,
+            ),
+            duckdb_threads: env_num(
+                "RUNNER_DUCKDB_THREADS",
+                duckdb_threads_default,
+                "an integer",
+                &mut env_problems,
+            ),
+            duckdb_temp_mb: env_num(
+                "RUNNER_DUCKDB_TEMP_MB",
+                1024,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
             build_uid_base: env_opt_uid("RUNNER_BUILD_UID_BASE", BUILD_UID_BASE, &mut env_problems),
             build_uid_range: env_num(
                 "RUNNER_BUILD_UID_RANGE",
@@ -1396,6 +1452,15 @@ impl Config {
         }
         if self.otel_flush_ms < 1000 {
             problems.push("RUNNER_OTEL_FLUSH_MS must be >= 1000".into());
+        }
+        // A 0 memory limit means DuckDB's own 80%-of-RAM default, which is
+        // exactly what this knob exists to avoid; a tiny one makes every
+        // query spill forever. 64 MiB is the floor DuckDB can run a scan in.
+        if self.duckdb_memory_mb < 64 {
+            problems.push("RUNNER_DUCKDB_MEMORY_MB must be >= 64".into());
+        }
+        if self.duckdb_threads == 0 {
+            problems.push("RUNNER_DUCKDB_THREADS must be >= 1".into());
         }
         self.void_proxy.validate(self.tenancy, &mut problems);
         if self.build_uid_range == 0 {
@@ -1634,6 +1699,9 @@ pub(crate) fn config_for_tests() -> Config {
         build_timeout_s: 300,
         telemetry_retention_days: 30,
         otel_flush_ms: 30000,
+        duckdb_memory_mb: 256,
+        duckdb_threads: 1,
+        duckdb_temp_mb: 1024,
         build_uid_base: None,
         build_uid_range: BUILD_UID_RANGE,
         fleet_uid: None,
@@ -1796,6 +1864,9 @@ mod tests {
         "RUNNER_BUILD_TIMEOUT_S",
         "RUNNER_TELEMETRY_RETENTION_DAYS",
         "RUNNER_OTEL_FLUSH_MS",
+        "RUNNER_DUCKDB_MEMORY_MB",
+        "RUNNER_DUCKDB_THREADS",
+        "RUNNER_DUCKDB_TEMP_MB",
         "RUNNER_BUILD_UID_RANGE",
         "RUNNER_BUILD_UID_BASE",
         "RUNNER_FLEET_UID",
@@ -2010,6 +2081,10 @@ mod tests {
             assert_eq!(cfg.build_timeout_s, 300);
             assert_eq!(cfg.telemetry_retention_days, 30);
             assert_eq!(cfg.otel_flush_ms, 30000);
+            // Derived from the machine the test runs on, so assert the band.
+            assert!((128..=1024).contains(&cfg.duckdb_memory_mb));
+            assert!((1..=4).contains(&cfg.duckdb_threads));
+            assert_eq!(cfg.duckdb_temp_mb, 1024);
             assert_eq!(cfg.build_uid_range, BUILD_UID_RANGE);
             assert_eq!((cfg.fleet_port_min, cfg.fleet_port_max), (20000, 29999));
             assert_eq!(cfg.build_uid_base, Some(BUILD_UID_BASE));
@@ -2065,6 +2140,54 @@ mod tests {
                 assert_eq!(cfg.fleet_uid, Some(10020));
                 assert_eq!(cfg.sleep_after_h, 0);
                 assert_eq!(cfg.stop_budget_ms, 5000);
+            },
+        );
+    }
+
+    #[test]
+    fn telemetry_duckdb_defaults_follow_the_machine() {
+        // 2 GB: a tenth is 204 MiB. Threads follow the container's cores,
+        // capped at 4 so a huge host does not fan a scan out 32 ways.
+        assert_eq!(duckdb_memory_default_mb(Some(2 * 1024 * 1024 * 1024)), 204);
+        assert_eq!(duckdb_memory_default_mb(Some(512 * 1024 * 1024)), 128);
+        assert_eq!(
+            duckdb_memory_default_mb(Some(64 * 1024 * 1024 * 1024)),
+            1024
+        );
+        assert_eq!(duckdb_memory_default_mb(None), 256);
+        assert_eq!(duckdb_threads_default(1), 1);
+        assert_eq!(duckdb_threads_default(2), 2);
+        assert_eq!(duckdb_threads_default(4), 4);
+        assert_eq!(duckdb_threads_default(32), 4);
+    }
+
+    #[test]
+    fn duckdb_knobs_override_and_validate() {
+        with_env(
+            &[
+                ("RUNNER_DUCKDB_MEMORY_MB", "320"),
+                ("RUNNER_DUCKDB_THREADS", "2"),
+                ("RUNNER_DUCKDB_TEMP_MB", "0"),
+            ],
+            || {
+                let cfg = Config::from_env().expect("valid numerics must boot");
+                assert!(cfg.env_problems.is_empty());
+                assert_eq!(
+                    (cfg.duckdb_memory_mb, cfg.duckdb_threads, cfg.duckdb_temp_mb),
+                    (320, 2, 0)
+                );
+            },
+        );
+        with_env(
+            &[
+                ("RUNNER_DUCKDB_MEMORY_MB", "32"),
+                ("RUNNER_DUCKDB_THREADS", "0"),
+            ],
+            || {
+                let error = Config::from_env().expect_err("validate refuses");
+                let message = format!("{error:#}");
+                assert!(message.contains("RUNNER_DUCKDB_MEMORY_MB"), "{message}");
+                assert!(message.contains("RUNNER_DUCKDB_THREADS"), "{message}");
             },
         );
     }
