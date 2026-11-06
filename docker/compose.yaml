@@ -133,6 +133,10 @@ services:
       # celld and one build at a time.
       RUNNER_FLEET_SPAWN_BATCH: ${RUNNER_FLEET_SPAWN_BATCH:-}
       RUNNER_BUILD_CONCURRENCY: ${RUNNER_BUILD_CONCURRENCY:-}
+      # A build's own cgroup memory cap. Unset derives half the container's
+      # memory (512..4096 MiB): on a 2 GB box the build dies alone when it
+      # outgrows that, instead of pushing the fleets into the kernel.
+      RUNNER_BUILD_MEMORY_MB: ${RUNNER_BUILD_MEMORY_MB:-}
       # Last line before the kernel OOM-killer: at or above this percentage of
       # the container's memory, park the least-recently-active idle app (which
       # wakes transparently on its next request). 0 disables.

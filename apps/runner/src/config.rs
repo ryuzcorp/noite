@@ -193,6 +193,22 @@ fn build_concurrency_default(cores: usize) -> u32 {
     }
 }
 
+/// A tenant build's (install, build, release) derived memory cap: half the
+/// detected memory, clamped 512..4096 MiB (1024 when unreadable). A Vite /
+/// Rolldown build of a Void app peaks around 1.3 GiB; on a 2 GB box the
+/// other half is already the runner, Caddy, RustFS and the fleets, so the
+/// build is OOM-killed inside its own leaf — failably, with the rest of the
+/// install still serving — rather than thrashing the host. Operators with a
+/// bigger box raise `RUNNER_BUILD_MEMORY_MB`, or deploy a prebuilt dist from
+/// CI so the host only unzips it.
+fn build_memory_default_mb(total_bytes: Option<u64>, concurrency: u32) -> u64 {
+    let Some(total) = total_bytes else {
+        return 1024;
+    };
+    let builds = u64::from(concurrency.max(1));
+    (total / 2 / builds / (1024 * 1024)).clamp(512, 4096)
+}
+
 /// Parse one numeric env var: unset or blank means the default (compose
 /// renders an unset var as an empty string, so blank counts as unset — never
 /// as a value). A set-but-malformed value records a boot problem naming the
@@ -1027,6 +1043,12 @@ pub struct Config {
     /// unset: 1 on two cores or fewer, else 2. Install, build and release
     /// steps are the largest unbounded memory use left after the fleets.
     pub build_concurrency: u32,
+    /// Tenant build/release memory cap in MiB (`RUNNER_BUILD_MEMORY_MB`),
+    /// enforced by a dedicated cgroup leaf so a build that outgrows the box
+    /// dies alone instead of pushing fleets into the kernel OOM-killer.
+    /// Derived when unset: half the detected memory split across the build
+    /// slots, clamped 512..4096. `0` leaves builds uncapped (old behavior).
+    pub build_memory_mb: u64,
     /// Container memory percentage at which the pressure sweep parks idle
     /// apps (`RUNNER_PRESSURE_PCT`, 85; 0 disables). The sweep is the last
     /// line before the kernel OOM-killer: it parks a fleet rather than
@@ -1194,6 +1216,16 @@ impl Config {
         let s3_endpoint_as_configured =
             env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://rustfs:9000".into());
         let s3_endpoint = strip_endpoint_userinfo(&s3_endpoint_as_configured);
+        // Concurrent builds share the box: split the build half of memory
+        // between them, so the default budget does not multiply by the slot
+        // count.
+        let build_concurrency: u32 = env_num(
+            "RUNNER_BUILD_CONCURRENCY",
+            build_concurrency_default,
+            "an integer",
+            &mut env_problems,
+        );
+        let build_memory_default = build_memory_default_mb(total_memory, build_concurrency);
         let cfg = Self {
             bind: env_or(&["RUNNER_BIND"], "0.0.0.0:8080"),
             runner_token,
@@ -1350,9 +1382,10 @@ impl Config {
                 "an integer",
                 &mut env_problems,
             ),
-            build_concurrency: env_num(
-                "RUNNER_BUILD_CONCURRENCY",
-                build_concurrency_default,
+            build_concurrency,
+            build_memory_mb: env_num(
+                "RUNNER_BUILD_MEMORY_MB",
+                build_memory_default,
                 "an integer",
                 &mut env_problems,
             ),
@@ -1608,6 +1641,9 @@ impl Config {
         if self.build_concurrency == 0 {
             problems.push("RUNNER_BUILD_CONCURRENCY must be >= 1".into());
         }
+        if self.build_memory_mb != 0 && self.build_memory_mb < 256 {
+            problems.push("RUNNER_BUILD_MEMORY_MB must be 0 (uncapped) or >= 256".into());
+        }
         if self.pressure_pct > 100 {
             problems.push("RUNNER_PRESSURE_PCT must be 0 (disabled) or <= 100".into());
         }
@@ -1843,6 +1879,7 @@ pub(crate) fn config_for_tests() -> Config {
         container_shed_mb: 0,
         fleet_spawn_batch: 1,
         build_concurrency: 1,
+        build_memory_mb: 1024,
         pressure_pct: 85,
         pressure_idle_s: 300,
         pressure_sweep_s: 30,
@@ -2022,6 +2059,7 @@ mod tests {
         "RUNNER_CONTROL_MEMORY_MB",
         "RUNNER_FLEET_SPAWN_BATCH",
         "RUNNER_BUILD_CONCURRENCY",
+        "RUNNER_BUILD_MEMORY_MB",
         "RUNNER_PRESSURE_PCT",
         "RUNNER_PRESSURE_IDLE_S",
         "RUNNER_PRESSURE_SWEEP_S",
@@ -2376,6 +2414,14 @@ mod tests {
         assert_eq!(fleet_local_cache_default_mb(Some(2 * gb)), 128);
         assert_eq!(control_memory_default_mb(Some(2 * gb)), 512);
         assert_eq!(container_shed_default_mb(Some(2 * gb)), 1536);
+        // Half the box for a build, clamped; a 2 GB box gives the build
+        // ~978 MiB so a 1.3 GiB Vite peak dies in its leaf, not the host.
+        assert_eq!(build_memory_default_mb(Some(2 * gb), 1), 1024);
+        assert_eq!(build_memory_default_mb(Some(256 * 1024 * 1024), 1), 512);
+        assert_eq!(build_memory_default_mb(Some(256 * gb), 2), 4096);
+        assert_eq!(build_memory_default_mb(None, 1), 1024);
+        // Two concurrent builds split the half; four cores give two slots.
+        assert_eq!(build_memory_default_mb(Some(4 * gb), 2), 1024);
         // Clamps keep a tiny and a huge box inside what one process may hold.
         assert_eq!(fleet_local_cache_default_mb(Some(256 * 1024 * 1024)), 64);
         assert_eq!(fleet_local_cache_default_mb(Some(256 * gb)), 512);
@@ -2403,6 +2449,7 @@ mod tests {
                 ("RUNNER_CONTROL_MEMORY_MB", "384"),
                 ("RUNNER_FLEET_SPAWN_BATCH", "3"),
                 ("RUNNER_BUILD_CONCURRENCY", "2"),
+                ("RUNNER_BUILD_MEMORY_MB", "1536"),
             ],
             || {
                 let cfg = Config::from_env().expect("valid numerics must boot");
@@ -2412,9 +2459,10 @@ mod tests {
                         cfg.fleet_local_cache_mb,
                         cfg.control_memory_mb,
                         cfg.fleet_spawn_batch,
-                        cfg.build_concurrency
+                        cfg.build_concurrency,
+                        cfg.build_memory_mb
                     ),
-                    (96, 384, 3, 2)
+                    (96, 384, 3, 2, 1536)
                 );
             },
         );
@@ -2424,6 +2472,7 @@ mod tests {
                 ("RUNNER_CONTROL_MEMORY_MB", "64"),
                 ("RUNNER_FLEET_SPAWN_BATCH", "0"),
                 ("RUNNER_BUILD_CONCURRENCY", "0"),
+                ("RUNNER_BUILD_MEMORY_MB", "128"),
             ],
             || {
                 let error = Config::from_env().expect_err("validate refuses");
@@ -2433,6 +2482,7 @@ mod tests {
                     "RUNNER_CONTROL_MEMORY_MB",
                     "RUNNER_FLEET_SPAWN_BATCH",
                     "RUNNER_BUILD_CONCURRENCY",
+                    "RUNNER_BUILD_MEMORY_MB",
                 ] {
                     assert!(message.contains(name), "{name} missing from {message}");
                 }

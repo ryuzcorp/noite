@@ -115,6 +115,9 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
         // Informational: never fails the gate, but an operator reading
         // `make doctor` sees the charge and how close it is to the limit.
         "memory": crate::host::memory::usage().unwrap_or(serde_json::Value::Null),
+        // The capped build leaf: a null here means cgroups were unavailable
+        // and builds are uncapped, which `cgroups.detail` already explains.
+        "build": crate::host::cgroups::build_status(),
         "failing": failing });
     if failing.is_empty() {
         Json(body).into_response()
