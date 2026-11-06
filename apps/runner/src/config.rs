@@ -143,6 +143,56 @@ fn duckdb_threads_default(cores: usize) -> u32 {
     cores.clamp(1, 4) as u32
 }
 
+/// A per-fleet local cache's derived cap: a sixteenth of the detected memory,
+/// clamped 64..512 MiB (128 when unreadable). celld's 2 GiB default is sized
+/// for one big node; four fleets sharing a 2 GB box are not.
+fn fleet_local_cache_default_mb(total_bytes: Option<u64>) -> u64 {
+    let Some(total) = total_bytes else {
+        return 128;
+    };
+    (total / 16 / (1024 * 1024)).clamp(64, 512)
+}
+
+/// The control fleet's derived cap: a quarter of the detected memory, clamped
+/// 256..1024 MiB (512 when unreadable). It stays the largest fixed resident,
+/// so a quarter is the most the rest of the box can give it.
+fn control_memory_default_mb(total_bytes: Option<u64>) -> u64 {
+    let Some(total) = total_bytes else {
+        return 512;
+    };
+    (total / 4 / (1024 * 1024)).clamp(256, 1024)
+}
+
+/// The container-wide celld shed threshold for installs whose fleets share
+/// one cgroup: 75% of the detected memory, clamped 256..8192 MiB, 0 (celld's
+/// own default) when memory is unreadable. Leaving the last quarter for the
+/// runner, Caddy, RustFS, DuckDB and the deploying app is what keeps the
+/// kernel OOM-killer out of it; over the threshold celld answers 503 instead.
+fn container_shed_default_mb(total_bytes: Option<u64>) -> u64 {
+    let Some(total) = total_bytes else {
+        return 0;
+    };
+    (total * 3 / 4 / (1024 * 1024)).clamp(256, 8192)
+}
+
+/// Fleets started per reconcile pass: one on a small box, two otherwise.
+fn fleet_spawn_batch_default(cores: usize) -> u32 {
+    if cores <= 2 {
+        1
+    } else {
+        2
+    }
+}
+
+/// Concurrent tenant deploys: one on a small box, two otherwise.
+fn build_concurrency_default(cores: usize) -> u32 {
+    if cores <= 2 {
+        1
+    } else {
+        2
+    }
+}
+
 /// Parse one numeric env var: unset or blank means the default (compose
 /// renders an unset var as an empty string, so blank counts as unset — never
 /// as a value). A set-but-malformed value records a boot problem naming the
@@ -952,6 +1002,31 @@ pub struct Config {
     /// Per-fleet on-disk asset cache in MiB (`CELLD_ASSET_CACHE_BYTES`),
     /// bounding the 512 MiB celld default per idle app.
     pub fleet_asset_cache_mb: u64,
+    /// Per-fleet celld hibernated-DB/SQLite cache in MiB
+    /// (`CELLD_LOCAL_CACHE_MAX_BYTES`). Derived when unset: a sixteenth of
+    /// the detected memory, clamped 64..512; celld's own default is 2 GiB per
+    /// node, which four nodes on a 2 GB box can never hold.
+    pub fleet_local_cache_mb: u64,
+    /// Control-fleet memory cap in MiB (`RUNNER_CONTROL_MEMORY_MB`).
+    /// Derived when unset: a quarter of the detected memory, clamped
+    /// 256..1024. Backed by its own cgroup leaf where the install has one
+    /// (fleet #0 used to be the only uncapped resident), else the
+    /// container-wide shed threshold.
+    pub control_memory_mb: u64,
+    /// Container-wide celld shed threshold in MiB for fleets without their
+    /// own cgroup leaf, applied as `CELLD_MAX_RSS_MB` when the operator has
+    /// not set `RUNNER_FLEET_MAX_RSS_MB`: 75% of the detected memory, clamped
+    /// 256..8192; 0 leaves celld's own default. Internal, no env var.
+    pub container_shed_mb: u64,
+    /// Tenant fleets started per reconcile pass (`RUNNER_FLEET_SPAWN_BATCH`).
+    /// Derived when unset: 1 on a box of two cores or fewer, else 2, so a
+    /// cold boot spreads its starts across ticks instead of stacking every
+    /// celld at once.
+    pub fleet_spawn_batch: u32,
+    /// Concurrent tenant deploys (`RUNNER_BUILD_CONCURRENCY`). Derived when
+    /// unset: 1 on two cores or fewer, else 2. Install, build and release
+    /// steps are the largest unbounded memory use left after the fleets.
+    pub build_concurrency: u32,
     /// Caddy JSON access log the device/path/ref tick tails. The Caddy `log`
     /// block is path-fixed at the volume root; the Caddyfile itself may live
     /// in a subpath (dev `dynamic/`).
@@ -1091,6 +1166,17 @@ impl Config {
         // fleets, so size it from what this container may actually use.
         let duckdb_memory_default = duckdb_memory_default_mb(crate::host::memory::total_bytes());
         let duckdb_threads_default = duckdb_threads_default(crate::host::memory::cores());
+        // The same detection sizes the resident set: one budget for the
+        // per-fleet caches, the control fleet's cap and the shared-cgroup
+        // shed threshold, and the core count for how many fleets and builds
+        // may start at once.
+        let total_memory = crate::host::memory::total_bytes();
+        let cores = crate::host::memory::cores();
+        let fleet_local_cache_default = fleet_local_cache_default_mb(total_memory);
+        let control_memory_default = control_memory_default_mb(total_memory);
+        let container_shed_default = container_shed_default_mb(total_memory);
+        let fleet_spawn_batch_default = fleet_spawn_batch_default(cores);
+        let build_concurrency_default = build_concurrency_default(cores);
         // Read once, stripped, for `s3_endpoint` and the credential
         // provider's `StoreAccess` alike: provider detection, the install tag
         // and request URLs must see the same endpoint the rest of the runner
@@ -1233,6 +1319,31 @@ impl Config {
                 "RUNNER_FLEET_ASSET_CACHE_MB",
                 64,
                 "a non-negative integer",
+                &mut env_problems,
+            ),
+            fleet_local_cache_mb: env_num(
+                "RUNNER_FLEET_LOCAL_CACHE_MB",
+                fleet_local_cache_default,
+                "an integer",
+                &mut env_problems,
+            ),
+            control_memory_mb: env_num(
+                "RUNNER_CONTROL_MEMORY_MB",
+                control_memory_default,
+                "an integer",
+                &mut env_problems,
+            ),
+            container_shed_mb: container_shed_default,
+            fleet_spawn_batch: env_num(
+                "RUNNER_FLEET_SPAWN_BATCH",
+                fleet_spawn_batch_default,
+                "an integer",
+                &mut env_problems,
+            ),
+            build_concurrency: env_num(
+                "RUNNER_BUILD_CONCURRENCY",
+                build_concurrency_default,
+                "an integer",
                 &mut env_problems,
             ),
             tenancy,
@@ -1462,6 +1573,18 @@ impl Config {
         if self.duckdb_threads == 0 {
             problems.push("RUNNER_DUCKDB_THREADS must be >= 1".into());
         }
+        if self.fleet_local_cache_mb < 16 {
+            problems.push("RUNNER_FLEET_LOCAL_CACHE_MB must be >= 16".into());
+        }
+        if self.control_memory_mb < 128 {
+            problems.push("RUNNER_CONTROL_MEMORY_MB must be >= 128".into());
+        }
+        if self.fleet_spawn_batch == 0 {
+            problems.push("RUNNER_FLEET_SPAWN_BATCH must be >= 1".into());
+        }
+        if self.build_concurrency == 0 {
+            problems.push("RUNNER_BUILD_CONCURRENCY must be >= 1".into());
+        }
         self.void_proxy.validate(self.tenancy, &mut problems);
         if self.build_uid_range == 0 {
             problems.push("RUNNER_BUILD_UID_RANGE must be >= 1".into());
@@ -1686,6 +1809,11 @@ pub(crate) fn config_for_tests() -> Config {
         sleep_sweep_s: 3600,
         wake_timeout_s: 120,
         fleet_asset_cache_mb: 64,
+        fleet_local_cache_mb: 128,
+        control_memory_mb: 512,
+        container_shed_mb: 0,
+        fleet_spawn_batch: 1,
+        build_concurrency: 1,
         caddy_control_upstream: CONTROL_UPSTREAM.into(),
         caddy_api_upstream: API_UPSTREAM.into(),
         caddy_admin_url: "http://127.0.0.1:2019".into(),
@@ -1858,6 +1986,10 @@ mod tests {
         "RUNNER_SLEEP_SWEEP_S",
         "RUNNER_WAKE_TIMEOUT_S",
         "RUNNER_FLEET_ASSET_CACHE_MB",
+        "RUNNER_FLEET_LOCAL_CACHE_MB",
+        "RUNNER_CONTROL_MEMORY_MB",
+        "RUNNER_FLEET_SPAWN_BATCH",
+        "RUNNER_BUILD_CONCURRENCY",
         "NOITE_STOP_BUDGET_MS",
         "RUNNER_BUILD_MAX_MB",
         "RUNNER_BUILD_CACHE_MB",
@@ -2075,6 +2207,12 @@ mod tests {
             assert_eq!(cfg.sleep_sweep_s, 3600);
             assert_eq!(cfg.wake_timeout_s, 120);
             assert_eq!(cfg.fleet_asset_cache_mb, 64);
+            // Derived from the machine, so assert the bands.
+            assert!((64..=512).contains(&cfg.fleet_local_cache_mb));
+            assert!((256..=1024).contains(&cfg.control_memory_mb));
+            assert!(cfg.container_shed_mb == 0 || (256..=8192).contains(&cfg.container_shed_mb));
+            assert!((1..=2).contains(&cfg.fleet_spawn_batch));
+            assert!((1..=2).contains(&cfg.build_concurrency));
             assert_eq!(cfg.stop_budget_ms, 25000);
             assert_eq!(cfg.build_max_mb, 2048);
             assert_eq!(cfg.build_cache_mb, 512);
@@ -2188,6 +2326,77 @@ mod tests {
                 let message = format!("{error:#}");
                 assert!(message.contains("RUNNER_DUCKDB_MEMORY_MB"), "{message}");
                 assert!(message.contains("RUNNER_DUCKDB_THREADS"), "{message}");
+            },
+        );
+    }
+
+    #[test]
+    fn containment_defaults_follow_the_machine() {
+        let gb = 1024 * 1024 * 1024;
+        // 2 GB box: a sixteenth (128), a quarter (512), 75% (1536).
+        assert_eq!(fleet_local_cache_default_mb(Some(2 * gb)), 128);
+        assert_eq!(control_memory_default_mb(Some(2 * gb)), 512);
+        assert_eq!(container_shed_default_mb(Some(2 * gb)), 1536);
+        // Clamps keep a tiny and a huge box inside what one process may hold.
+        assert_eq!(fleet_local_cache_default_mb(Some(256 * 1024 * 1024)), 64);
+        assert_eq!(fleet_local_cache_default_mb(Some(256 * gb)), 512);
+        assert_eq!(control_memory_default_mb(Some(256 * 1024 * 1024)), 256);
+        assert_eq!(control_memory_default_mb(Some(256 * gb)), 1024);
+        assert_eq!(container_shed_default_mb(Some(256 * 1024 * 1024)), 256);
+        assert_eq!(container_shed_default_mb(Some(256 * gb)), 8192);
+        // Unreadable memory: no container-wide threshold, celld's default.
+        assert_eq!(fleet_local_cache_default_mb(None), 128);
+        assert_eq!(control_memory_default_mb(None), 512);
+        assert_eq!(container_shed_default_mb(None), 0);
+        // Two cores start one fleet and one build at a time.
+        assert_eq!(fleet_spawn_batch_default(1), 1);
+        assert_eq!(fleet_spawn_batch_default(2), 1);
+        assert_eq!(fleet_spawn_batch_default(8), 2);
+        assert_eq!(build_concurrency_default(2), 1);
+        assert_eq!(build_concurrency_default(8), 2);
+    }
+
+    #[test]
+    fn containment_knobs_override_and_validate() {
+        with_env(
+            &[
+                ("RUNNER_FLEET_LOCAL_CACHE_MB", "96"),
+                ("RUNNER_CONTROL_MEMORY_MB", "384"),
+                ("RUNNER_FLEET_SPAWN_BATCH", "3"),
+                ("RUNNER_BUILD_CONCURRENCY", "2"),
+            ],
+            || {
+                let cfg = Config::from_env().expect("valid numerics must boot");
+                assert!(cfg.env_problems.is_empty());
+                assert_eq!(
+                    (
+                        cfg.fleet_local_cache_mb,
+                        cfg.control_memory_mb,
+                        cfg.fleet_spawn_batch,
+                        cfg.build_concurrency
+                    ),
+                    (96, 384, 3, 2)
+                );
+            },
+        );
+        with_env(
+            &[
+                ("RUNNER_FLEET_LOCAL_CACHE_MB", "8"),
+                ("RUNNER_CONTROL_MEMORY_MB", "64"),
+                ("RUNNER_FLEET_SPAWN_BATCH", "0"),
+                ("RUNNER_BUILD_CONCURRENCY", "0"),
+            ],
+            || {
+                let error = Config::from_env().expect_err("validate refuses");
+                let message = format!("{error:#}");
+                for name in [
+                    "RUNNER_FLEET_LOCAL_CACHE_MB",
+                    "RUNNER_CONTROL_MEMORY_MB",
+                    "RUNNER_FLEET_SPAWN_BATCH",
+                    "RUNNER_BUILD_CONCURRENCY",
+                ] {
+                    assert!(message.contains(name), "{name} missing from {message}");
+                }
             },
         );
     }

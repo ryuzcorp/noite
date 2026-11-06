@@ -75,6 +75,13 @@ pub enum FleetFate {
     Exited(String),
 }
 
+/// Whether a fleet key has a registered child (running, or exited and not
+/// reaped yet). Used by the reconcile loop to tell a cold start from a
+/// restart: only cold starts are batched.
+pub async fn has_process(procs: &ProcMap, key: &str) -> bool {
+    procs.lock().await.contains_key(key)
+}
+
 /// Resolve once the fleet under `key` is no longer a live child. A waiter
 /// that holds a claim (a deploy on the health gate) races this, so the claim
 /// never outlives the fleet it waits on.

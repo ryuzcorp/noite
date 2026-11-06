@@ -178,6 +178,11 @@ async fn reconcile_once(
         .filter(|a| a.desired() == DesiredState::Stopped)
         .map(|a| a.id.clone())
         .collect();
+    // Cold starts per pass (`RUNNER_FLEET_SPAWN_BATCH`): a boot or upgrade
+    // must not stack every celld's initialization at once. Restarts of an
+    // already-registered child are never batched — those wait on their own
+    // backoff and deserve the next tick.
+    let mut cold_starts: u32 = 0;
     for app in &apps {
         if app.desired() == DesiredState::Stopped {
             supervisor::stop_fleet(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
@@ -192,6 +197,13 @@ async fn reconcile_once(
         // Asleep apps stay parked: the next request wakes them through the
         // edge (host/sleep.rs), and respawning here would undo the sleep.
         if app.listen_port.is_some() && app.is_deployed() && !app.is_asleep() {
+            let cold = !supervisor::has_process(procs, &app.slug).await;
+            if cold {
+                if cold_starts >= cfg.fleet_spawn_batch {
+                    continue;
+                }
+                cold_starts += 1;
+            }
             match supervisor::ensure_fleet(pool, cfg, procs, logs, app).await {
                 Ok(()) => {
                     // "Running" means the fleet answers its health gate, not
@@ -265,6 +277,13 @@ async fn reconcile_once(
             continue;
         }
         if env.listen_port.is_some() && env.is_deployed() && !env.is_asleep() {
+            let cold = !supervisor::has_process(procs, &fleet).await;
+            if cold {
+                if cold_starts >= cfg.fleet_spawn_batch {
+                    continue;
+                }
+                cold_starts += 1;
+            }
             match supervisor::ensure_environment_fleet(pool, cfg, procs, logs, env).await {
                 Ok(()) => {
                     // Same truthful order as the app branch above.

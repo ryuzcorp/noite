@@ -21,6 +21,9 @@ use crate::host::{exec, s3};
 
 const MARKER_KEY: &str = "ui/revision";
 
+/// Cgroup leaf name of the control fleet (`<anchor>/control`).
+const CONTROL_CGROUP: &str = "control";
+
 /// Reserved telemetry key of the control fleet. There is deliberately no
 /// `app` row for it (nothing that iterates apps — reconcile, Caddy, sleep,
 /// purge, list_apps — may ever see the control plane), so the metrics ingest
@@ -253,10 +256,40 @@ pub fn supervise(
     let celld = config.celld_bin.clone();
     let work_dir = config.work_dir.clone();
     let fleet_cfg = config.clone();
-    Supervised::start_observed(
+    // Fleet #0 is a resident like any tenant fleet: give it its own leaf and
+    // cap when the install has writable cgroups. Created before the spawn so
+    // the env can say `CELLD_MEMORY_SCOPE=self`; the pid moves in right
+    // after the spawn (a celld node is one thread group, so the move takes
+    // every thread). Without cgroups the control fleet shares the container
+    // cgroup and the env carries the container-wide shed threshold instead.
+    let control_leaf = crate::host::cgroups::anchor().and_then(|anchor| {
+        match crate::host::cgroups::ensure_fleet_cgroup(
+            &anchor,
+            CONTROL_CGROUP,
+            fleet_cfg.control_memory_mb,
+        ) {
+            Ok(dir) => Some(dir),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    memory_mb = fleet_cfg.control_memory_mb,
+                    "control fleet has no cgroup leaf; it shares the container cgroup"
+                );
+                None
+            }
+        }
+    });
+    let has_leaf = control_leaf.is_some();
+    let place = control_leaf.map(|dir| move |pid: u32| {
+        if let Err(error) = crate::host::cgroups::enter_cgroup(&dir, pid) {
+            tracing::warn!(error = %error, "control fleet refused its cgroup; it runs in the shared cgroup");
+        }
+    });
+    Supervised::start_observed_with(
         "control",
         Some(control_pid),
         Some((logs, SLUG.to_string())),
+        place,
         move || {
             let state_dir = "/data/control";
             let _ = std::fs::create_dir_all(state_dir);
@@ -290,6 +323,7 @@ pub fn supervise(
                     cfg: &fleet_cfg,
                     operator_token: &operator_token,
                     inherited: &inherited,
+                    has_cgroup_leaf: has_leaf,
                 },
             );
             crate::host::fleet_env::apply(&mut cmd, &env);

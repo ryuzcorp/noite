@@ -121,6 +121,18 @@ services:
       # Resource knobs (SPEC: Limits, Observability).
       RUNNER_BUILD_CACHE_MB: ${RUNNER_BUILD_CACHE_MB:-512}
       RUNNER_FLEET_ASSET_CACHE_MB: ${RUNNER_FLEET_ASSET_CACHE_MB:-64}
+      # Per-fleet celld hibernated-DB cache and the control fleet's cap.
+      # Unset derives both from this container's memory: a sixteenth (local
+      # cache, 64..512 MiB) and a quarter (control, 256..1024 MiB). celld's
+      # own local-cache default is 2 GiB per node. The control fleet gets its
+      # own cgroup leaf when the install has writable cgroups.
+      RUNNER_FLEET_LOCAL_CACHE_MB: ${RUNNER_FLEET_LOCAL_CACHE_MB:-}
+      RUNNER_CONTROL_MEMORY_MB: ${RUNNER_CONTROL_MEMORY_MB:-}
+      # Cold starts per reconcile pass and concurrent tenant deploys. Unset
+      # derives 1 on two cores or fewer, else 2, so a 2 GB box ramps one
+      # celld and one build at a time.
+      RUNNER_FLEET_SPAWN_BATCH: ${RUNNER_FLEET_SPAWN_BATCH:-}
+      RUNNER_BUILD_CONCURRENCY: ${RUNNER_BUILD_CONCURRENCY:-}
       RUNNER_FLEET_DEPLOY_POLL_S: ${RUNNER_FLEET_DEPLOY_POLL_S:-300}
       RUNNER_OTEL_FLUSH_MS: ${RUNNER_OTEL_FLUSH_MS:-30000}
       # Telemetry ingest/compaction DuckDB (a fresh CLI process per pass).

@@ -231,6 +231,13 @@ pub fn tenant_fleet_env(input: &TenantFleetEnv<'_>) -> Vec<(String, String)> {
     for (key, value) in crate::host::metrics::otel_env(cfg) {
         put(key, value);
     }
+    // Per-fleet local caches: celld's hibernated-DB cache default is 2 GiB
+    // per node, sized for one big fleet; four nodes on a 2 GB box can never
+    // hold it. The asset cache is bounded the same way.
+    put(
+        "CELLD_LOCAL_CACHE_MAX_BYTES",
+        (cfg.fleet_local_cache_mb * 1024 * 1024).to_string(),
+    );
     // With its own leaf the fleet also sheds against it: `self` measures
     // the process's own cgroup instead of the container root, so the shed
     // threshold follows the per-fleet cap. Without a leaf (no cgroup grant)
@@ -240,9 +247,20 @@ pub fn tenant_fleet_env(input: &TenantFleetEnv<'_>) -> Vec<(String, String)> {
     }
     // The documented knob is `RUNNER_FLEET_MAX_RSS_MB`; a zero value sets
     // nothing instead of a container-wide threshold the operator never
-    // configured per fleet.
-    if cfg.fleet_max_rss_mb > 0 {
-        put("CELLD_MAX_RSS_MB", cfg.fleet_max_rss_mb.to_string());
+    // configured per fleet. Without a leaf the fleets share the container
+    // cgroup, so a derived container-wide threshold is the one graceful
+    // shed available: it leaves the last quarter of the box for the runner,
+    // Caddy, RustFS, DuckDB and builds instead of letting celld sit at its
+    // own 80% until the kernel OOM-killer acts.
+    let shed_mb: Option<u64> = if cfg.fleet_max_rss_mb > 0 {
+        Some(u64::from(cfg.fleet_max_rss_mb))
+    } else if !input.has_cgroup_leaf && cfg.container_shed_mb > 0 {
+        Some(cfg.container_shed_mb)
+    } else {
+        None
+    };
+    if let Some(mb) = shed_mb {
+        put("CELLD_MAX_RSS_MB", mb.to_string());
     }
     // Deployment-scoped Workers cache (SPEC, Void platform proxy): every
     // script of the fleet's deployment shares one `caches.default`, like a
@@ -276,12 +294,17 @@ pub struct ControlFleetEnv<'a> {
     pub cfg: &'a Config,
     pub operator_token: &'a str,
     pub inherited: &'a [(String, String)],
+    /// Whether this spawn runs in its own cgroup leaf (`host::control` creates
+    /// one when the install has cgroups): `CELLD_MEMORY_SCOPE=self` then sheds
+    /// against the control fleet's own cap instead of the container root.
+    pub has_cgroup_leaf: bool,
 }
 
 /// Full environment for the control fleet spawn. Like a tenant fleet but
-/// with no tenant vars, no egress, memory-scope or cache-scope policy of
-/// its own, and a dead engine socket: the control UI declares no container classes, and
-/// only the runner holds the engine socket. The store credentials and
+/// with no tenant vars, no egress policy, and a dead engine socket: the
+/// control UI declares no container classes, and only the runner holds the
+/// engine socket. Its memory caches and shed threshold are bounded the same
+/// way a tenant fleet's are. The store credentials and
 /// `RUST_LOG` below used to arrive by inheritance; they are explicit now.
 pub fn control_fleet_env(input: &ControlFleetEnv<'_>) -> Vec<(String, String)> {
     let cfg = input.cfg;
@@ -314,6 +337,27 @@ pub fn control_fleet_env(input: &ControlFleetEnv<'_>) -> Vec<(String, String)> {
     // control node's logs either.
     put("CELLD_TTL_MS", cfg.fleet_lease_ttl_ms.to_string());
     put("RUST_LOG", cfg.fleet_log.clone());
+    // Fleet #0 is a resident like any tenant fleet: bound its asset and
+    // local caches, and shed against its own leaf when it has one. Without
+    // a leaf, share the container-wide threshold so the control UI answers
+    // 503 under pressure instead of the kernel killing the box.
+    put(
+        "CELLD_ASSET_CACHE_BYTES",
+        (cfg.fleet_asset_cache_mb * 1024 * 1024).to_string(),
+    );
+    put(
+        "CELLD_ASSET_CACHE_DIR",
+        "/data/control/asset-cache".to_string(),
+    );
+    put(
+        "CELLD_LOCAL_CACHE_MAX_BYTES",
+        (cfg.fleet_local_cache_mb * 1024 * 1024).to_string(),
+    );
+    if input.has_cgroup_leaf {
+        put("CELLD_MEMORY_SCOPE", "self".to_string());
+    } else if cfg.container_shed_mb > 0 {
+        put("CELLD_MAX_RSS_MB", cfg.container_shed_mb.to_string());
+    }
     for (key, value) in crate::host::metrics::otel_env(cfg) {
         put(key, value);
     }
@@ -387,6 +431,7 @@ mod tests {
             "CELLD_DEPLOY_POLL_S",
             "CELLD_ASSET_CACHE_BYTES",
             "CELLD_ASSET_CACHE_DIR",
+            "CELLD_LOCAL_CACHE_MAX_BYTES",
             "CELLD_TRUST_FORWARDED_HEADERS",
             "CELLD_OPERATOR_TOKEN",
             "CELLD_EGRESS",
@@ -686,6 +731,7 @@ mod tests {
             cfg: &cfg,
             operator_token: "",
             inherited: &inherited,
+            has_cgroup_leaf: false,
         }));
         for flat in [tenant, control] {
             assert_eq!(
@@ -710,6 +756,7 @@ mod tests {
             cfg: &cfg,
             operator_token: "control-op",
             inherited: &inherited,
+            has_cgroup_leaf: false,
         }));
         assert!(!flat.contains_key("RUNNER_TOKEN"));
         assert_eq!(flat["AWS_ACCESS_KEY_ID"], "platform-access");
@@ -735,6 +782,79 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Fleet #0 gets the same cache and shed bounds as a tenant fleet: a
+    /// leaf makes it shed against its own cap, no leaf gets the derived
+    /// container-wide threshold, and the operator's explicit fleet cap never
+    /// leaks into the control fleet.
+    #[test]
+    fn control_fleet_env_bounds_its_memory() {
+        let mut cfg = test_cfg(Tenancy::Single);
+        cfg.fleet_max_rss_mb = 384;
+        cfg.container_shed_mb = 1536;
+        cfg.fleet_local_cache_mb = 96;
+        cfg.fleet_asset_cache_mb = 48;
+        let inherited = vec![];
+        let no_leaf = flattened(&control_fleet_env(&ControlFleetEnv {
+            cfg: &cfg,
+            operator_token: "control-op",
+            inherited: &inherited,
+            has_cgroup_leaf: false,
+        }));
+        assert_eq!(no_leaf["CELLD_MAX_RSS_MB"], "1536");
+        assert!(!no_leaf.contains_key("CELLD_MEMORY_SCOPE"));
+        assert_eq!(
+            no_leaf["CELLD_LOCAL_CACHE_MAX_BYTES"],
+            (96 * 1024 * 1024).to_string()
+        );
+        assert_eq!(
+            no_leaf["CELLD_ASSET_CACHE_BYTES"],
+            (48 * 1024 * 1024).to_string()
+        );
+        assert_eq!(
+            no_leaf["CELLD_ASSET_CACHE_DIR"],
+            "/data/control/asset-cache"
+        );
+        let leaf = flattened(&control_fleet_env(&ControlFleetEnv {
+            cfg: &cfg,
+            operator_token: "control-op",
+            inherited: &inherited,
+            has_cgroup_leaf: true,
+        }));
+        assert_eq!(leaf["CELLD_MEMORY_SCOPE"], "self");
+        assert!(!leaf.contains_key("CELLD_MAX_RSS_MB"));
+    }
+
+    /// Without a cgroup leaf a tenant fleet shares the container cgroup, so
+    /// the derived container-wide shed applies; an explicit operator cap
+    /// still wins, and a leaf switches the fleet to its own scope.
+    #[test]
+    fn tenant_fleet_env_shared_cgroup_gets_a_derived_shed() {
+        let mut cfg = test_cfg(Tenancy::Single);
+        cfg.container_shed_mb = 1536;
+        let tenant_env = vec![];
+        let inherited = vec![];
+        let flat = flattened(&tenant_fleet_env(&tenant_input(
+            &cfg,
+            &tenant_env,
+            &inherited,
+        )));
+        assert_eq!(flat["CELLD_MAX_RSS_MB"], "1536");
+        assert!(!flat.contains_key("CELLD_MEMORY_SCOPE"));
+
+        cfg.fleet_max_rss_mb = 1024;
+        let flat = flattened(&tenant_fleet_env(&tenant_input(
+            &cfg,
+            &tenant_env,
+            &inherited,
+        )));
+        assert_eq!(flat["CELLD_MAX_RSS_MB"], "1024", "operator wins");
+
+        let mut input = tenant_input(&cfg, &tenant_env, &inherited);
+        input.has_cgroup_leaf = true;
+        let flat = flattened(&tenant_fleet_env(&input));
+        assert_eq!(flat["CELLD_MEMORY_SCOPE"], "self");
     }
 
     /// Operator-global `CELLD_*` names are reported (sorted, once) so `main`
