@@ -23,6 +23,16 @@ pub struct MinioAdmin {
     client: reqwest::Client,
 }
 
+/// Admin calls get a hard request timeout: a store that accepts the
+/// connection and never answers must fail (or be retried), never hold a
+/// mint/revoke forever. Ten seconds is well past a healthy admin call.
+fn admin_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("reqwest client")
+}
+
 impl MinioAdmin {
     /// The bundled image's own store. `bucket` feeds the install tag (see
     /// [`super::install_tag`]): the tag must survive DB loss, so it derives
@@ -32,7 +42,7 @@ impl MinioAdmin {
             tag: super::install_tag(&store.identity_endpoint, bucket, &store.region),
             store,
             label: "rustfs",
-            client: reqwest::Client::new(),
+            client: admin_client(),
         }
     }
 
@@ -42,7 +52,7 @@ impl MinioAdmin {
             tag: super::install_tag(&store.identity_endpoint, bucket, &store.region),
             store,
             label: "minio",
-            client: reqwest::Client::new(),
+            client: admin_client(),
         }
     }
 
@@ -143,8 +153,12 @@ impl MinioAdmin {
                         String::from_utf8_lossy(&body)
                     ));
                 }
-                // Anything else (404, 501, transport): try the next path.
-                Ok(_) | Err(_) => continue,
+                // Anything else (404, 501): try the next path. A transport
+                // failure (timeout, refused) is not a definitive "no admin
+                // API": fail the probe so `auto` retries or fails the boot
+                // instead of silently minting root keys for every fleet.
+                Ok(_) => continue,
+                Err(e) => return Err(e.context(format!("probe {path} failed"))),
             }
         }
         Ok(Err("no MinIO admin API".into()))
@@ -590,6 +604,46 @@ mod tests {
         let (_handle, endpoint) = status_stub(404).await;
         let outcome = stub_admin(endpoint).probe().await.expect("404 probes");
         assert!(outcome.is_err(), "404 means no admin API: {outcome:?}");
+    }
+
+    /// Accepts the request and never answers: the client's request timeout
+    /// must surface as a probe failure. Treating it as "no admin API" would
+    /// downgrade `auto` to root keys while the admin endpoint is merely slow.
+    async fn stalling_stub() -> (tokio::task::JoinHandle<()>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = vec![0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    // Never write: hold the connection until the peer times out.
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        (handle, format!("http://127.0.0.1:{}", addr.port()))
+    }
+
+    #[tokio::test]
+    async fn probe_transport_failure_is_a_detection_failure() {
+        let (_handle, endpoint) = stalling_stub().await;
+        let mut admin = stub_admin(endpoint);
+        admin.client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .expect("client");
+        let err = admin
+            .probe()
+            .await
+            .expect_err("a timeout is not a definite absence");
+        assert!(format!("{err:#}").contains("probe"), "{err:#}");
     }
 
     /// A missing user or policy is already revoked: 404, or the store's
