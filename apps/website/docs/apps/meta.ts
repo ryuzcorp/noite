@@ -6,6 +6,7 @@ export default defineMeta({
     "create",
     "deploy",
     "build",
+    "ci",
     "configure",
     "source",
     "environments",

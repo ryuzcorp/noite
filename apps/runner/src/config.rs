@@ -325,6 +325,28 @@ fn env_flag(key: &str, problems: &mut Vec<String>) -> bool {
     }
 }
 
+/// Noite CI's kill switch: unset or blank is on (the config file is opt-in),
+/// `0`/`false`/`off` is off, `1`/`true`/`on` is on, and anything else is a
+/// boot problem (same strictness as `env_flag`, different default).
+fn ci_enabled_from_env(problems: &mut Vec<String>) -> bool {
+    let raw = match env::var("RUNNER_CI") {
+        Err(_) => return true,
+        Ok(v) if v.trim().is_empty() => return true,
+        Ok(v) => v,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" => true,
+        "0" | "false" | "off" => false,
+        _ => {
+            problems.push(format!(
+                "RUNNER_CI must be `1`, `true`, `on`, `0`, `false` or `off` (or unset), got {:?}",
+                raw.trim()
+            ));
+            true
+        }
+    }
+}
+
 /// SMTP transport mode for the Void proxy's relay (`NOITE_VOID_SMTP_MODE`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum VoidSmtpMode {
@@ -1093,6 +1115,20 @@ pub struct Config {
     pub build_cache_mb: u64,
     /// Bound on each tenant install and build step (RUNNER_BUILD_TIMEOUT_S).
     pub build_timeout_s: u64,
+    /// Run a repo's `noite.ci.yaml` in containers instead of the built-in
+    /// install/build (`RUNNER_CI`; unset = on, explicit 0/false/off disables).
+    pub ci_enabled: bool,
+    /// Image for a CI job that names none (`RUNNER_CI_IMAGE`).
+    pub ci_default_image: String,
+    /// Exact images a CI job may name (`RUNNER_CI_IMAGES`, comma-separated);
+    /// the default image is always allowed.
+    pub ci_allowed_images: Vec<String>,
+    /// Docker network for CI containers (`RUNNER_CI_NETWORK`: `bridge` for
+    /// installs/tests, `none` for offline jobs).
+    pub ci_network: String,
+    /// Docker CLI binary (`RUNNER_CI_DOCKER_BIN`, default `docker`); a test
+    /// seam and a podman escape hatch.
+    pub ci_docker_bin: String,
     /// Days of telemetry kept everywhere (RUNNER_TELEMETRY_RETENTION_DAYS):
     /// celld's bucket prune, the metric table prune and the glob floor.
     pub telemetry_retention_days: i64,
@@ -1248,6 +1284,28 @@ impl Config {
             &mut env_problems,
         );
         let build_memory_default = build_memory_default_mb(total_memory, build_concurrency);
+        // Noite CI (SPEC): a repo's `noite.ci.yaml` runs in containers. The
+        // default image is always in the allowlist, so a config that names
+        // nothing still runs; `RUNNER_CI_IMAGES` replaces the rest.
+        let ci_default_image = env_or(&["RUNNER_CI_IMAGE"], "oven/bun:1.4.4");
+        let mut ci_allowed_images: Vec<String> = env::var("RUNNER_CI_IMAGES")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|image| !image.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !ci_allowed_images
+            .iter()
+            .any(|image| image == &ci_default_image)
+        {
+            ci_allowed_images.push(ci_default_image.clone());
+        }
+        let ci_network = env_or(&["RUNNER_CI_NETWORK"], "bridge");
         let cfg = Self {
             bind: env_or(&["RUNNER_BIND"], "0.0.0.0:8080"),
             runner_token,
@@ -1470,6 +1528,11 @@ impl Config {
                 "a non-negative integer",
                 &mut env_problems,
             ),
+            ci_enabled: ci_enabled_from_env(&mut env_problems),
+            ci_default_image,
+            ci_allowed_images,
+            ci_network,
+            ci_docker_bin: env_or(&["RUNNER_CI_DOCKER_BIN"], "docker"),
             telemetry_retention_days: env_num(
                 "RUNNER_TELEMETRY_RETENTION_DAYS",
                 30,
@@ -1674,6 +1737,12 @@ impl Config {
         }
         if self.build_memory_mb != 0 && self.build_memory_mb < 256 {
             problems.push("RUNNER_BUILD_MEMORY_MB must be 0 (uncapped) or >= 256".into());
+        }
+        if self.ci_network != "bridge" && self.ci_network != "none" {
+            problems.push("RUNNER_CI_NETWORK must be `bridge` or `none`".into());
+        }
+        if self.ci_default_image.trim().is_empty() {
+            problems.push("RUNNER_CI_IMAGE must not be empty".into());
         }
         if self.pressure_pct > 100 {
             problems.push("RUNNER_PRESSURE_PCT must be 0 (disabled) or <= 100".into());
@@ -1925,6 +1994,11 @@ pub(crate) fn config_for_tests() -> Config {
         build_max_mb: 2048,
         build_cache_mb: 512,
         build_timeout_s: 1800,
+        ci_enabled: true,
+        ci_default_image: "oven/bun:1.4.4".into(),
+        ci_allowed_images: vec!["oven/bun:1.4.4".into()],
+        ci_network: "bridge".into(),
+        ci_docker_bin: "docker".into(),
         telemetry_retention_days: 30,
         otel_flush_ms: 30000,
         duckdb_memory_mb: 256,
@@ -2144,6 +2218,11 @@ mod tests {
                 "NOITE_VOID_AI_ALLOW_PLAINTEXT",
                 "NOITE_VOID_SANDBOX_MAX_CONCURRENT",
                 "VOID_SANDBOX_BUNDLE_DIR",
+                "RUNNER_CI",
+                "RUNNER_CI_IMAGE",
+                "RUNNER_CI_IMAGES",
+                "RUNNER_CI_NETWORK",
+                "RUNNER_CI_DOCKER_BIN",
                 // The canary probe path reads a plain string var; a test-set
                 // value must not leak into a parallel `from_env` either.
                 "RUNNER_DEPLOY_PROBE_PATH",
@@ -2163,6 +2242,55 @@ mod tests {
                 None => env::remove_var(key),
             }
         }
+    }
+
+    #[test]
+    fn ci_defaults_and_overrides() {
+        with_env(&[], || {
+            let cfg = Config::from_env().expect("defaults boot");
+            assert!(cfg.ci_enabled);
+            assert_eq!(cfg.ci_default_image, "oven/bun:1.4.4");
+            assert!(cfg
+                .ci_allowed_images
+                .iter()
+                .any(|image| image == "oven/bun:1.4.4"));
+            assert_eq!(cfg.ci_network, "bridge");
+            assert_eq!(cfg.ci_docker_bin, "docker");
+        });
+        with_env(
+            &[
+                ("RUNNER_CI", "0"),
+                ("RUNNER_CI_IMAGE", "node:24-bookworm-slim"),
+                ("RUNNER_CI_IMAGES", "other:1"),
+                ("RUNNER_CI_NETWORK", "none"),
+                ("RUNNER_CI_DOCKER_BIN", "podman"),
+            ],
+            || {
+                let cfg = Config::from_env().expect("overrides boot");
+                assert!(!cfg.ci_enabled);
+                assert_eq!(cfg.ci_default_image, "node:24-bookworm-slim");
+                // The default image is always allowed, plus the explicit one.
+                assert!(cfg
+                    .ci_allowed_images
+                    .iter()
+                    .any(|image| image == "node:24-bookworm-slim"));
+                assert!(cfg.ci_allowed_images.iter().any(|image| image == "other:1"));
+                assert_eq!(cfg.ci_network, "none");
+                assert_eq!(cfg.ci_docker_bin, "podman");
+            },
+        );
+    }
+
+    #[test]
+    fn ci_bad_network_and_flag_are_boot_problems() {
+        with_env(&[("RUNNER_CI_NETWORK", "host")], || {
+            let error = Config::from_env().expect_err("a bad CI network must not boot");
+            assert!(format!("{error:#}").contains("RUNNER_CI_NETWORK"));
+        });
+        with_env(&[("RUNNER_CI", "yes")], || {
+            let error = Config::from_env().expect_err("a bad CI flag must not boot");
+            assert!(format!("{error:#}").contains("RUNNER_CI"));
+        });
     }
 
     #[test]

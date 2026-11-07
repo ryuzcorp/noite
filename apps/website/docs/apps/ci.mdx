@@ -1,0 +1,75 @@
+---
+title: CI
+description: Run a repo's build and tests in containers with a light GitHub-Actions-style noite.ci.yaml before a deploy activates.
+---
+
+A repo-root `noite.ci.yaml` runs the app's build and tests in a container on every push deploy, instead of the built-in [`install`/`build`](/apps/build) steps. The workflow's `dist/` is what gets released, so a failing test or build never reaches the live version - the old generation keeps serving.
+
+This is a deliberately small subset of GitHub Actions, one container at a time, on the Noite host. It does not make a build fit a host it cannot fit: a 2 GB install still cannot build the ~1.3 GiB Void/Ilha template. Use a bigger box or [`deploy from CI`](/apps/deploy#deploy-from-ci) for that.
+
+## A workflow
+
+```yaml
+# noite.ci.yaml at the repository root
+on: [push]                     # optional and informational
+
+jobs:
+  build:                       # runs in file order
+    image: oven/bun:1.4.4      # optional; defaults to RUNNER_CI_IMAGE
+    steps:
+      - name: Install
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Build
+        run: bun run build
+        env:
+          NODE_ENV: production
+        timeout-minutes: 10
+```
+
+Each job gets a fresh container with the whole checked-out tree at `/work`. Steps share that tree in order; a file written by one step is visible to the next. Jobs also share the host worktree in order, but each job starts with a fresh container and a fresh `/tmp`, so installs are repeated per job - keep one job unless you need a different image.
+
+Only `dist/` is copied back out after a successful workflow; that is the deploy root. If the workflow leaves no `dist/`, the deploy fails with `noite.ci.yaml finished but produced no dist/ to deploy` rather than deploying an empty tree.
+
+## Supported keys
+
+| Key | Values |
+| --- | --- |
+| `on` | ignored; a push deploy is the trigger |
+| `jobs.<name>` | one container per job, run in file order |
+| `jobs.<name>.image` | an image in the install's allowlist; defaults to `RUNNER_CI_IMAGE` |
+| `jobs.<name>.steps[]` | list of steps |
+| `steps[].name` | shown in the deploy log |
+| `steps[].run` | `sh -lc` inside the container |
+| `steps[].env` | string map, exported for that step only |
+| `steps[].working-directory` | relative to the repo root; must stay inside `/work` |
+| `steps[].timeout-minutes` | 1-120; default 10 |
+| `steps[].uses` | `checkout` is a no-op (the tree is already checked out); no marketplace actions |
+
+Unknown keys fail the deploy with the path (for example `jobs.build.steps[1]: unknown key "shell"`). Limits: config 64 KiB, 32 jobs, 32 steps per job, 32 KiB per `run`, 256 env entries per step.
+
+## How it runs
+
+- The runner creates one container per job (`--cap-drop ALL` plus `CHOWN` only for the ownership prep, `--security-opt no-new-privileges`, no host mounts, no Docker socket inside), copies the checkout in with `docker cp`, runs the steps as the app's build uid (no capabilities), and removes the container even on failure.
+- Resources: the build memory cap (`RUNNER_BUILD_MEMORY_MB`, with `--memory-swap` equal so the container cannot swap), one CPU less than the box, and `--pids-limit 2048`.
+- `HOME` and the package-manager cache live in a per-app named volume (`noite-ci-cache-<slug>`), so `bun install`, npm and pnpm caches survive across deploys without a host bind.
+- Network defaults to Docker's `bridge` so installs reach registries; `RUNNER_CI_NETWORK=none` gives fully offline jobs. The host's loopback services are not reachable.
+- The app's build environment variables are passed into the container. Do not print secrets; container output is in the deploy log.
+- A workflow failure fails the deploy before release/activate, so the live version is untouched.
+
+## Configuration
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `RUNNER_CI` | on | `0`/`false`/`off` disables the workflow and uses the built-in install/build |
+| `RUNNER_CI_IMAGE` | `oven/bun:1.4.4` | image for a job that names none |
+| `RUNNER_CI_IMAGES` | the default image only | comma-separated exact allowlist; the default image is always allowed |
+| `RUNNER_CI_NETWORK` | `bridge` | `bridge` (registry access) or `none` |
+| `RUNNER_CI_DOCKER_BIN` | `docker` | Docker CLI binary (Podman escape hatch or a test seam) |
+
+Use an exact tag or a digest in `image`; the runner does not resolve digests for a mutable tag, and a mutable tag can change between deploys. The default image carries Bun; use `node:24-bookworm-slim` or your own pinned image if the app needs Node without Bun.
+
+## Not yet
+
+Marketplace `uses`, `services`, matrices, parallel jobs, and off-host runners. The workflow runs on the Noite host, so it consumes the host's memory and CPU like the built-in build.
