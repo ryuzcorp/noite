@@ -47,6 +47,15 @@ pub const BUILD_PIDS_MAX: u64 = 2048;
 /// build yields; on an idle box it still runs at full speed (shares only
 /// matter between runnable tasks).
 const BUILD_CPU_WEIGHT: u64 = 10;
+/// A build's hard CPU ceiling in 1e5-us periods: one core less than the box,
+/// never below one core. Weight alone only yields under contention inside
+/// the anchor; this caps a build against the whole host (RustFS, Caddy, the
+/// runner and SSH itself). Two vCPUs therefore give one core to the build.
+const CPU_PERIOD_US: u64 = 100_000;
+/// A build's disk share against a leaf's default 100, when the io controller
+/// is delegated: bun installs write hundreds of megabytes while RustFS serves
+/// telemetry, and an unweighted build can keep the whole host in I/O wait.
+const BUILD_IO_WEIGHT: u64 = 10;
 
 /// Cap on a fleet's tasks (processes and threads — the pids controller
 /// counts both). Generous on purpose: celld runs isolates in-process and a
@@ -58,6 +67,7 @@ static CGROUP_REASON: std::sync::Mutex<String> = std::sync::Mutex::new(String::n
 static CGROUP_ANCHOR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 static BUILD_MEMORY_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static BUILD_CPU: AtomicBool = AtomicBool::new(false);
+static BUILD_IO: AtomicBool = AtomicBool::new(false);
 
 fn reason(msg: String) {
     if let Ok(mut reason) = CGROUP_REASON.lock() {
@@ -127,12 +137,27 @@ pub fn setup_build(memory_mb: u64) -> bool {
         .and_then(|()| add_controller(&anchor, "cpu"))
         .map_err(|error| {
             tracing::debug!(
-                "build cpu.weight unavailable ({error:#}); builds keep the default share"
+                "build cpu.weight/quota unavailable ({error:#}); builds keep the default share"
+            );
+        })
+        .is_ok();
+    let io = add_controller(own, "io")
+        .and_then(|()| add_controller(&anchor, "io"))
+        .map_err(|error| {
+            tracing::debug!(
+                "build io.weight unavailable ({error:#}); builds share the disk fairly by default"
             );
         })
         .is_ok();
     BUILD_CPU.store(cpu, Ordering::Relaxed);
-    tracing::info!(memory_mb, cpu, "tenant build containment active");
+    BUILD_IO.store(io, Ordering::Relaxed);
+    tracing::info!(
+        memory_mb,
+        cpu,
+        cpu_cores = build_cpu_cores(),
+        io,
+        "tenant build containment active"
+    );
     true
 }
 
@@ -162,7 +187,8 @@ pub fn build_leaf_for(key: &str, memory_mb: u64) -> anyhow::Result<Option<PathBu
         return Ok(None);
     };
     let cpu = BUILD_CPU.load(Ordering::Relaxed);
-    Ok(Some(ensure_build_cgroup(&anchor, key, memory_mb, cpu)?))
+    let io = BUILD_IO.load(Ordering::Relaxed);
+    Ok(Some(ensure_build_cgroup(&anchor, key, memory_mb, cpu, io)?))
 }
 
 /// Create (or reuse) the leaf for one deploy key: the memory budget
@@ -178,6 +204,7 @@ fn ensure_build_cgroup(
     key: &str,
     memory_mb: u64,
     cpu: bool,
+    io: bool,
 ) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let dir = anchor.join(format!("{BUILD_LEAF_PREFIX}{}", fleet_dir_name(key)));
@@ -208,10 +235,23 @@ fn ensure_build_cgroup(
         write_file(&dir, "memory.oom.group", "1")?;
     }
     write_file(&dir, "pids.max", &BUILD_PIDS_MAX.to_string())?;
-    if cpu && memory_mb > 0 {
+    if cpu {
         write_limit(&dir, "cpu.weight", &BUILD_CPU_WEIGHT.to_string())?;
+        write_limit(
+            &dir,
+            "cpu.max",
+            &format!("{} {CPU_PERIOD_US}", build_cpu_cores() * CPU_PERIOD_US),
+        )?;
+    }
+    if io {
+        write_limit(&dir, "io.weight", &BUILD_IO_WEIGHT.to_string())?;
     }
     Ok(dir)
+}
+
+/// Cores a build may use: one fewer than the box, never below one.
+pub fn build_cpu_cores() -> u64 {
+    crate::host::memory::cores().saturating_sub(1).max(1) as u64
 }
 
 /// A build leaf's cumulative `oom_kill` counter, or `None` when the file is
@@ -248,6 +288,9 @@ pub fn build_status() -> serde_json::Value {
                     "current_bytes": read(&dir, "memory.current"),
                     "peak_bytes": read(&dir, "memory.peak"),
                     "oom_kills": build_oom_kills(&dir),
+                    "cpu_max": std::fs::read_to_string(dir.join("cpu.max"))
+                        .ok()
+                        .map(|raw| raw.trim().to_string()),
                 }),
             ));
         }
@@ -1075,8 +1118,8 @@ mod tests {
     #[test]
     fn build_leaf_applies_its_budget() {
         let tmp = fakefs();
-        let dir =
-            ensure_build_cgroup(tmp.path(), "shop.preview-1", 768, true).expect("build cgroup");
+        let dir = ensure_build_cgroup(tmp.path(), "shop.preview-1", 768, true, false)
+            .expect("build cgroup");
         assert_eq!(dir, tmp.path().join("_build-shop.preview-1"));
         assert_eq!(
             std::fs::read_to_string(dir.join("memory.max")).expect("memory.max"),
@@ -1094,11 +1137,22 @@ mod tests {
             std::fs::read_to_string(dir.join("cpu.weight")).expect("cpu.weight"),
             BUILD_CPU_WEIGHT.to_string()
         );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cpu.max")).expect("cpu.max"),
+            format!("{} {CPU_PERIOD_US}", build_cpu_cores() * CPU_PERIOD_US)
+        );
         assert!(!dir.join("memory.high").exists(), "no early throttle");
 
+        let io = fakefs();
+        let dir = ensure_build_cgroup(io.path(), "shop", 768, false, true).expect("build cgroup");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("io.weight")).expect("io.weight"),
+            BUILD_IO_WEIGHT.to_string()
+        );
+
         let uncapped = fakefs();
-        let dir =
-            ensure_build_cgroup(uncapped.path(), "shop", 0, false).expect("uncapped build cgroup");
+        let dir = ensure_build_cgroup(uncapped.path(), "shop", 0, false, false)
+            .expect("uncapped build cgroup");
         assert!(!dir.join("memory.max").exists());
         assert!(!dir.join("cpu.weight").exists());
         assert!(dir.join("pids.max").exists());
