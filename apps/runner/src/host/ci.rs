@@ -743,8 +743,6 @@ async fn run_job_inner(
         container.to_string(),
         "-v".to_string(),
         cache_mount,
-        "-w".to_string(),
-        "/work".to_string(),
     ];
     for (key, value) in &settings.env {
         create.push("-e".to_string());
@@ -1375,8 +1373,6 @@ esac
                 create[18].as_str(),
                 "-v",
                 "noite-ci-cache-test:/noite-home",
-                "-w",
-                "/work",
                 "-e",
                 "HOME=/noite-home",
                 "oven/bun:1.4.4",
@@ -1719,6 +1715,13 @@ esac
             "jobs:\n  build:\n    steps:\n      - name: Write\n        run: echo hello > msg.txt && mkdir -p dist && echo page > dist/index.html\n      - name: Read\n        run: cat msg.txt\n",
         )
         .expect("parses");
+        // Opt-in: the real-container path pulls an image and needs a
+        // working Docker daemon; CI stays hermetic and runs it only when
+        // asked (`NOITE_CI_REAL_DOCKER=1` on a host with Docker).
+        if std::env::var_os("NOITE_CI_REAL_DOCKER").is_none() {
+            eprintln!("skipping: set NOITE_CI_REAL_DOCKER=1 to run real containers");
+            return;
+        }
         if std::process::Command::new("docker")
             .arg("info")
             .output()
