@@ -77,6 +77,11 @@ These are install-level variables (Compose, the image environment). Per-app valu
 | `NOITE_STOP_BUDGET_MS` | `25000` | Graceful-stop budget (min `5000`); fleets stop inside budget − 3 s | runner-owned |
 | `RUNNER_BUILD_MAX_MB` | `2048` | Refuse builds past this worktree size (MiB) | runner-owned |
 | `RUNNER_BUILD_TIMEOUT_S` | `1800` | Bound on each install and build step (seconds) | runner-owned |
+| `RUNNER_CI` | on | Run a repo-root `noite.ci.yaml` in containers instead of the built-in install/build; `0`/`false`/`off` disables | runner-owned |
+| `RUNNER_CI_IMAGE` | `oven/bun:1.4.4` | Image for a CI job that names none | runner-owned |
+| `RUNNER_CI_IMAGES` | the default image only | Comma-separated exact image allowlist; the default image is always allowed. Use a tag or digest | runner-owned |
+| `RUNNER_CI_NETWORK` | `bridge` | Docker network for CI containers: `bridge` (registry access) or `none` | runner-owned |
+| `RUNNER_CI_DOCKER_BIN` | `docker` | Docker CLI binary for CI containers | runner-owned |
 
 ## Bounds
 
