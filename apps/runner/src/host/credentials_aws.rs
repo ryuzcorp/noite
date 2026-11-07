@@ -10,6 +10,7 @@
 //! IAM user names allow `[A-Za-z0-9+=,.@_-]` (64 chars); scope prefixes fit
 //! that after the `noite-` prefix is trimmed to the allowed set.
 
+use anyhow::Context;
 use futures::future::BoxFuture;
 use sha2::{Digest, Sha256};
 
@@ -24,6 +25,15 @@ pub struct AwsIam {
     client: reqwest::Client,
 }
 
+/// Hard request timeout for IAM admin calls: a hung call must surface as an
+/// error the sweep can report, not hold a mint/revoke forever.
+fn admin_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("reqwest client")
+}
+
 impl AwsIam {
     /// `bucket` feeds the install tag (see [`super::install_tag`]): the tag
     /// must survive DB loss, so it derives from the configured store, never
@@ -33,17 +43,30 @@ impl AwsIam {
             tag: super::install_tag(&store.identity_endpoint, bucket, &store.region),
             endpoint: "https://iam.amazonaws.com".into(),
             store,
-            client: reqwest::Client::new(),
+            client: admin_client(),
         }
     }
 
     #[cfg(test)]
     fn test(store: StoreAccess, bucket: &str, endpoint: String) -> Self {
+        Self::test_with_timeout(store, bucket, endpoint, std::time::Duration::from_secs(10))
+    }
+
+    #[cfg(test)]
+    fn test_with_timeout(
+        store: StoreAccess,
+        bucket: &str,
+        endpoint: String,
+        timeout: std::time::Duration,
+    ) -> Self {
         Self {
             tag: super::install_tag(&store.identity_endpoint, bucket, &store.region),
             endpoint,
             store,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .expect("reqwest client"),
         }
     }
 
@@ -86,7 +109,9 @@ impl AwsIam {
             .send()
             .await?;
         let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
+        // A stalled body must fail the call: an empty string would read as a
+        // successful empty listing and leave orphaned IAM keys unreported.
+        let text = resp.text().await.context("reading the IAM response body")?;
         if status != 200 {
             return Err(anyhow::anyhow!("IAM call failed: HTTP {status} {text}"));
         }
@@ -450,6 +475,50 @@ mod tests {
 
     fn test_provider(endpoint: String, bucket: &str) -> AwsIam {
         AwsIam::test(test_store(), bucket, endpoint)
+    }
+
+    /// A 200 whose body never arrives must fail the IAM call. Returning an
+    /// empty string would parse as a successful empty listing and leave the
+    /// sweep blind to keys it should have revoked.
+    #[tokio::test]
+    async fn a_stalled_iam_body_is_an_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        let provider = AwsIam::test_with_timeout(
+            test_store(),
+            "noite",
+            format!("http://{}", addr.port()),
+            std::time::Duration::from_millis(200),
+        );
+        let err = provider
+            .iam(&[("Action", "ListUsers")])
+            .await
+            .expect_err("a stalled body must not become an empty listing");
+        let text = format!("{err:#}").to_lowercase();
+        assert!(
+            text.contains("body") || text.contains("timed out") || text.contains("timeout"),
+            "{err:#}"
+        );
     }
 
     /// Minted names carry the install tag and stay in the IAM alphabet
