@@ -1836,6 +1836,21 @@ async fn probe_staged_generation(
                 "staged generation failed its probe (HTTP {status}): previous version still serving"
             )
         }
+        // No live fleet means no old version is serving (a first deploy, a
+        // stopped or an asleep app): there is nothing to protect, and
+        // `celld invoke` cannot reach a node that does not exist. Activate.
+        // Every other transport failure still fails closed.
+        Err(void_migrate::ProbeError::Transport { message })
+            if message.contains("no node leases") =>
+        {
+            progress
+                .log(
+                    DeployStatus::Deploying,
+                    "probe: no live fleet to probe (first deploy or parked); activating\n",
+                )
+                .await?;
+            Ok(())
+        }
         Err(void_migrate::ProbeError::Transport { message }) => {
             anyhow::bail!(
                 "staged generation failed its probe (transport failure: {}): previous version still serving",
@@ -3510,6 +3525,42 @@ mod tests {
         assert!(
             staged_activates(&calls).is_empty(),
             "no activate after a failed probe: {calls:?}"
+        );
+    }
+
+    /// A first deploy (no node lease yet) cannot run `celld invoke`: the
+    /// probe skips and the deploy activates, because no old version is
+    /// serving to protect.
+    #[tokio::test]
+    async fn staged_probe_without_a_live_fleet_activates() {
+        let seam = StagedSeam::spawn("probe-no-fleet").await;
+        seam.fail_invoke(
+            "invoke-probe",
+            "no node leases in the bucket; celld invoke needs a running fleet",
+        );
+        let (log, dir) = seam.fake_env();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let mut progress = probe_progress(&seam);
+        let (staged, outcome) = stage_and_probe(&seam, &env, None, &mut progress).await;
+        outcome.expect("no live fleet skips the probe");
+        let celld = seam.celld(&env);
+        let stats = crate::host::void_cohost::activate_staged(
+            &seam.pool,
+            &seam.app.id,
+            None,
+            &celld,
+            staged,
+        )
+        .await
+        .expect("activate");
+        assert_eq!(stats.activate_attempts, 1);
+        let calls = seam.invocations();
+        assert!(
+            staged_activates(&calls).len() == 1,
+            "no-fleet probe still activates: {calls:?}"
         );
     }
 
