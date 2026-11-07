@@ -780,7 +780,9 @@ async fn deploy_inner(
             Err(error) => return Err(error).context("read noite.ci.yaml"),
         }
     }
-    let mut built = false;
+    // CI's `dist/` is the build output: let the build-output selection rank it
+    // above a root Wrangler config, exactly as a built-in build does.
+    let mut built = ci_ran;
     if !ci_ran {
         let wrangler_build = wrangler_build(&src_dir).await?;
         if let Some(pm) = &manager {
