@@ -10,6 +10,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-alpha.23] - 2026-11-07
+
+### Operator action required
+
+- None.
+
+### Changed
+
+- The persistent per-app build cache cap is now 1024 MiB (was 512). A cold `bun install` of the shipped Void/Ilha template writes ~872 MB, so the old cap pruned the cache it had just filled at the end of every deploy and the next one downloaded it again; the cache survives deploys and is still pruned largest-first and deleted with the app. Worst-case disk is 1 GiB per app (the default install has 39 GB free on a 2 GB VPS).
+- The bundled RustFS service now sets `RUSTFS_ALLOCATOR_RECLAIM_ENABLED` and `RUSTFS_ALLOCATOR_RECLAIM_FORCE` explicitly, so freed allocator pages return to the OS between idle periods instead of accumulating: prod measured 752 MB anonymous in the store's own container after four days, outside the noite container's memory accounting. The console stays disabled (it is admin UI, not storage).
+
+### Fixed
+
+- Deleting an app now frees its slug as soon as the app row is gone: the stop of any re-spawned fleet, then the push guard and deploy claim, run before the post-delete cleanup (edge route push, provider key revoke, operator-token cleanup). A slow or hung cleanup step used to keep the slug taken after the app had disappeared from the list, so create or rename onto that slug waited on the guard past the control plane's 5 s and failed with "operation aborted due to timeout". The remaining cleanup is bounded to 30 s and logged when it outlives that, so a hung provider call can no longer outlive the delete task.
+- Create, rename and delete runner calls in the control UI now allow 14 s (the route's own bound is 15 s) instead of the 5 s default (the runner still answers delete within 3 s): clearing a deleted slug's leftovers or moving a large S3 prefix no longer shows as an abort while the runner is still working.
+- The memory-pressure parking sweep now measures what the kernel OOM killer does on an unbounded install: the host's used memory (`MemTotal - MemAvailable`) instead of this container's own `memory.current`. The bundled RustFS runs in its own container and the runner's cgroup is unbounded on the default compose, so the old check read ~20% while the box sat near 75%; the last guard before the OOM killer never fired and idle apps were never parked. Bounded installs (a container `mem_limit`) keep measuring their own cgroup. `/ready` and `/v1/admin/stats` now carry `memory.scope` (`container` or `host`) alongside the existing bytes and percent.
+- MinIO/RustFS admin and AWS IAM calls now time out after 10 s instead of hanging forever. A hung admin call stalled key mint/revoke and the orphan-key sweep, and (before the delete fix) could hold a deleted app's slug. A timeout during the MinIO `auto` probe is now a detection failure that fails the boot, instead of being read as "no admin API" and silently downgrading the install to root keys; a stalled IAM response body is now an error instead of an empty string that parsed as a successful empty listing and hid orphaned keys.
+- Renaming an app now runs as its own task, like delete: the control plane aborting the call (14 s lifecycle bound) only drops the waiter, and the move completes instead of leaving the row on the old slug with local dirs or S3 prefixes half moved. A slug that still belongs to another app answers `409` immediately; a slug freed by a delete has no leftovers (its purge completed before the row went away) and can be taken. Regression tests cover a taken target, a deleted target, and a dropped caller (the last fails without the detached task: the move is canceled and the row stays on the old slug).
+
 ## [0.1.0-alpha.22] - 2026-11-06
 
 ### Operator action required
