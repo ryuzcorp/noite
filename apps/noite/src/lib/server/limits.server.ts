@@ -15,6 +15,7 @@ const LimitArgs = Schema.Struct({
   appRpm: Rpm,
   clientRpm: Rpm,
   memoryMb: Rpm,
+  sleepAfterS: Rpm,
 });
 
 /** The app's edge limits beside the platform defaults they fall back to. */
@@ -33,12 +34,22 @@ export const getLimits = apiAction(AppId, async (appId, { env, request }) => {
  * fleet's next spawn. */
 export const setLimits = apiAction(
   LimitArgs,
-  async ({ appId, appRpm, clientRpm, memoryMb }, { env, request }) => {
+  async (
+    { appId, appRpm, clientRpm, memoryMb, sleepAfterS },
+    { env, request }
+  ) => {
     const user = await sessionUser(request, env);
     const { role } = await requireAppRole(appId, user.id, "admin");
 
     try {
-      return await runnerSetLimits(appId, clientRpm, appRpm, memoryMb, role);
+      return await runnerSetLimits(
+        appId,
+        clientRpm,
+        appRpm,
+        memoryMb,
+        sleepAfterS,
+        role
+      );
     } catch (error) {
       failUnknown(error);
     }

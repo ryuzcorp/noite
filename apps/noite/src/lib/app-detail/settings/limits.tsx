@@ -16,7 +16,7 @@ const defaultLabel = (rpm: number) =>
   rpm === 0 ? "Default: no limit" : `Default: ${rpm}/min`;
 
 /** An input's text as a limit: empty = the platform default (null), else a
- * whole number of requests per minute. `undefined` = not a valid number. */
+ * whole number. `undefined` = not a valid number. */
 const parseRpm = (raw: string): number | null | undefined => {
   const value = raw.trim();
 
@@ -51,6 +51,7 @@ export const RateLimitsPanel = ({
   const clientDraft = atom<string | null>(null);
   const appDraft = atom<string | null>(null);
   const memoryDraft = atom<string | null>(null);
+  const sleepDraft = atom<string | null>(null);
   const err = atom("");
   const note = atom("");
   const busy = atom(false);
@@ -74,20 +75,31 @@ export const RateLimitsPanel = ({
   const clientText = shownRpm(clientDraft(), current.clientRpm);
   const appText = shownRpm(appDraft(), current.appRpm);
   const memoryText = shownRpm(memoryDraft(), current.memoryMb);
+  const sleepText = shownRpm(sleepDraft(), current.sleepAfterS);
+  const sleepDefault = current.defaults.defaultSleepAfterS;
+  let sleepPlaceholder = `Default: ${sleepDefault} s`;
+
+  if (sleepDefault === 0) {
+    sleepPlaceholder = "Default: never";
+  } else if (sleepDefault % 3600 === 0) {
+    sleepPlaceholder = `Default: ${sleepDefault / 3600} h`;
+  }
 
   const save = async (event: SubmitEvent) => {
     event.preventDefault();
     const clientRpm = parseRpm(clientText);
     const appRpm = parseRpm(appText);
     const memoryMb = parseRpm(memoryText);
+    const sleepAfterS = parseRpm(sleepText);
 
     if (
       clientRpm === undefined ||
       appRpm === undefined ||
-      memoryMb === undefined
+      memoryMb === undefined ||
+      sleepAfterS === undefined
     ) {
       err.set(
-        "Limits are whole numbers — requests per minute, and MiB for memory."
+        "Limits are whole numbers — requests per minute, MiB for memory, seconds for sleep."
       );
 
       return;
@@ -103,10 +115,12 @@ export const RateLimitsPanel = ({
         appRpm,
         clientRpm,
         memoryMb,
+        sleepAfterS,
       });
       clientDraft.set(null);
       appDraft.set(null);
       memoryDraft.set(null);
+      sleepDraft.set(null);
       await res.refetch();
       note.set(
         "Saved. Rate limits apply within seconds; memory applies when the fleet next spawns."
@@ -127,7 +141,8 @@ export const RateLimitsPanel = ({
         with a <code>Retry-After</code> header. Leave a field empty for the
         platform default, or enter <code>0</code> for no limit. Fleet memory
         caps this app's own cgroup in MiB; leave it empty for the platform
-        default.
+        default. Sleep after parks this app after that many idle seconds (
+        <code>0</code> = never); leave it empty for the install default.
       </p>
       {err() ? <p class="text-error m-0 text-sm">{err()}</p> : null}
       <form class="flex flex-wrap items-end gap-2" onsubmit={save}>
@@ -191,6 +206,24 @@ export const RateLimitsPanel = ({
             disabled={!isAdmin || busy()}
             oninput={(e) => {
               memoryDraft.set(e.currentTarget.value);
+            }}
+          />
+        </fieldset>
+        <fieldset class="fieldset min-w-40 flex-1">
+          <label class="label" for="limit-sleep">
+            Sleep after (s)
+          </label>
+          <input
+            id="limit-sleep"
+            class="input input-sm"
+            type="number"
+            min="0"
+            step="1"
+            value={sleepText}
+            placeholder={sleepPlaceholder}
+            disabled={!isAdmin || busy()}
+            oninput={(e) => {
+              sleepDraft.set(e.currentTarget.value);
             }}
           />
         </fieldset>

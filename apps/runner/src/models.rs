@@ -310,8 +310,10 @@ impl AppDomain {
     }
 }
 
-/// An app's own edge rate limits (requests per minute) and fleet memory cap.
-/// `None` takes the platform default, `Some(0)` turns the rate limit off.
+/// An app's own edge rate limits (requests per minute), fleet memory cap,
+/// and idle-sleep threshold. `None` takes the platform default, `Some(0)`
+/// turns the rate limit off — and means "never sleep" for the sleep
+/// threshold.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct AppLimit {
@@ -322,6 +324,9 @@ pub struct AppLimit {
     pub app_rpm: Option<i64>,
     /// Fleet `memory.max` in MiB (`None` = `RUNNER_FLEET_MEMORY_MB`).
     pub memory_mb: Option<i64>,
+    /// Idle seconds before the sweep parks this app (`None` =
+    /// `RUNNER_SLEEP_AFTER_H`; `Some(0)` = never).
+    pub sleep_after_s: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]

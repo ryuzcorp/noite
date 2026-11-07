@@ -699,6 +699,7 @@ mod tests {
             client_rpm: Some(60),
             app_rpm: Some(6),
             memory_mb: None,
+            sleep_after_s: None,
         }];
         let t = build_table(&cfg, std::slice::from_ref(&app), &[], &limits, &[]);
         let tenant = &t.exact["myapp.localhost"];

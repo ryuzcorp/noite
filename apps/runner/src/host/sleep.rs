@@ -52,16 +52,62 @@ fn lock_for(app_id: &str) -> Arc<Mutex<()>> {
 
 /// The idle decision, pure so it is testable: an app sleeps when its newest
 /// activity (last request, last wake, last deploy, creation) is older than
-/// `after_h` hours. `after_h == 0` disables sleeping.
-pub fn should_sleep(now: DateTime<Utc>, activity: &[Option<DateTime<Utc>>], after_h: u64) -> bool {
-    if after_h == 0 {
+/// `after_s` seconds. `after_s == 0` disables sleeping.
+pub fn should_sleep_s(
+    now: DateTime<Utc>,
+    activity: &[Option<DateTime<Utc>>],
+    after_s: u64,
+) -> bool {
+    if after_s == 0 {
         return false;
     }
     let Some(newest) = activity.iter().flatten().max() else {
         // No timestamp at all: never guess an app idle.
         return false;
     };
-    now - *newest >= chrono::Duration::hours(after_h as i64)
+    now - *newest >= chrono::Duration::seconds(after_s as i64)
+}
+
+/// Whether the app runs scheduled work: a non-empty `triggers.crons` or
+/// `queues.consumers` in its last deployed config (the stored Wrangler
+/// JSON). Pure so it is testable; unparseable or missing config means no
+/// scheduled work.
+pub fn has_scheduled_work(deployed_config: Option<&str>) -> bool {
+    let Some(raw) = deployed_config else {
+        return false;
+    };
+    let Ok(cfg) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let non_empty = |parent: &str, key: &str| {
+        cfg.get(parent)
+            .and_then(|p| p.get(key))
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty())
+    };
+    non_empty("triggers", "crons") || non_empty("queues", "consumers")
+}
+
+/// An app's auto-sleep threshold in seconds, or `None` when it never
+/// auto-sleeps: an explicit `0` override, or scheduled work without an
+/// explicit override (a sleeping scheduler would silently miss its
+/// triggers). `force` (operator sleep, memory-pressure parking) bypasses
+/// this. Pure so it is testable.
+pub fn auto_sleep_after_s(
+    own_sleep_after_s: Option<i64>,
+    deployed_config: Option<&str>,
+    default_h: u64,
+) -> Option<u64> {
+    if own_sleep_after_s == Some(0) {
+        return None;
+    }
+    if own_sleep_after_s.is_none() && has_scheduled_work(deployed_config) {
+        return None;
+    }
+    Some(match own_sleep_after_s {
+        Some(s) if s > 0 => s as u64,
+        _ => default_h.saturating_mul(3600),
+    })
 }
 
 /// Newest activity timestamps for an app, as `should_sleep` expects them.
@@ -104,18 +150,45 @@ fn sleep_candidate_env(env: &Environment) -> bool {
 }
 
 /// The scheduled sweep: park every running app — and every running preview
-/// environment — idle past the threshold. Returns how many fleets slept.
+/// environment — idle past its threshold. An app's explicit `sleep_after_s`
+/// override wins over the platform default (`0` means never); environments
+/// use their owning app's override. Apps running scheduled work (crons,
+/// queue consumers) skip auto-sleep unless overridden. Returns how many
+/// fleets slept.
 pub async fn sweep(pool: &SqlitePool, cfg: &Config, procs: &ProcMap) -> usize {
+    // The platform `0` is a master off: no app override re-enables a
+    // feature the operator disabled outright.
     if cfg.sleep_after_h == 0 {
         return 0;
     }
+    let limits = match db::list_app_limits(pool).await {
+        Ok(limits) => limits,
+        Err(error) => {
+            // Without the overrides, an explicit "never" could be ignored and
+            // an idle app parked. Skip this sweep; the next tick retries.
+            tracing::warn!(error = %error, "sleep sweep: app limits unavailable");
+            return 0;
+        }
+    };
+    let own_of = |app_id: &str| {
+        limits
+            .iter()
+            .find(|l| l.app_id == app_id)
+            .and_then(|l| l.sleep_after_s)
+    };
     let Ok(apps) = db::list_apps(pool).await else {
         return 0;
     };
     let now = Utc::now();
     let mut parked = 0;
     for app in apps.iter().filter(|a| sleep_candidate(a)) {
-        if !should_sleep(now, &activity(pool, app).await, cfg.sleep_after_h) {
+        let own = own_of(&app.id);
+        let Some(after_s) =
+            auto_sleep_after_s(own, app.deployed_config.as_deref(), cfg.sleep_after_h)
+        else {
+            continue;
+        };
+        if !should_sleep_s(now, &activity(pool, app).await, after_s) {
             continue;
         }
         match sleep_app(pool, cfg, procs, &app.id, false).await {
@@ -128,11 +201,15 @@ pub async fn sweep(pool: &SqlitePool, cfg: &Config, procs: &ProcMap) -> usize {
         return parked;
     };
     for env in envs.iter().filter(|e| sleep_candidate_env(e)) {
-        if !should_sleep(
-            now,
-            &environment_activity(pool, env).await,
-            cfg.sleep_after_h,
-        ) {
+        let own = own_of(&env.app_id);
+        let owner_config = apps
+            .iter()
+            .find(|a| a.id == env.app_id)
+            .and_then(|a| a.deployed_config.as_deref());
+        let Some(after_s) = auto_sleep_after_s(own, owner_config, cfg.sleep_after_h) else {
+            continue;
+        };
+        if !should_sleep_s(now, &environment_activity(pool, env).await, after_s) {
             continue;
         }
         match sleep_environment(pool, cfg, procs, &env.id, false).await {
@@ -182,18 +259,35 @@ pub async fn sleep_app(
     let Some(app) = db::get_app(pool, app_id).await? else {
         return Ok(false);
     };
-    // Re-check under the lock: a request may have woken it, or its owner
-    // stopped it, since the sweep read the list.
-    if !sleep_candidate(&app)
-        || (!force && !should_sleep(Utc::now(), &activity(pool, &app).await, cfg.sleep_after_h))
-    {
+    // Re-check under the lock: a request may have woken it, its owner may
+    // have stopped it, or its sleep override may have changed, since the
+    // sweep read the list.
+    if !sleep_candidate(&app) {
         return Ok(false);
+    }
+    let after_s = if force {
+        None
+    } else {
+        let own = db::get_app_limit(pool, &app.id).await?.sleep_after_s;
+        // The platform `0` is a master off (see `sweep`).
+        if cfg.sleep_after_h == 0 && own.is_none() {
+            return Ok(false);
+        }
+        match auto_sleep_after_s(own, app.deployed_config.as_deref(), cfg.sleep_after_h) {
+            Some(after_s) => Some(after_s),
+            None => return Ok(false),
+        }
+    };
+    if let Some(after_s) = after_s {
+        if !should_sleep_s(Utc::now(), &activity(pool, &app).await, after_s) {
+            return Ok(false);
+        }
     }
     db::set_app_asleep(pool, &app.id).await?;
     edge_table::push_routes(pool, cfg).await?;
     supervisor::stop_fleet(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
     crate::host::stats::record_sleep();
-    tracing::info!(slug = %app.slug, force, after_h = cfg.sleep_after_h, "app asleep");
+    tracing::info!(slug = %app.slug, force, after_s = after_s.unwrap_or(0), "app asleep");
     Ok(true)
 }
 
@@ -494,15 +588,26 @@ pub async fn sleep_environment(
     let Some(env) = db::get_environment(pool, env_id).await? else {
         return Ok(false);
     };
-    if !sleep_candidate_env(&env)
-        || (!force
-            && !should_sleep(
-                Utc::now(),
-                &environment_activity(pool, &env).await,
-                cfg.sleep_after_h,
-            ))
-    {
+    if !sleep_candidate_env(&env) {
         return Ok(false);
+    }
+    // Environments use their owning app's override and scheduled-work rule;
+    // the config lives on the app row, not the environment.
+    if !force {
+        let owner = db::get_app(pool, &env.app_id).await?;
+        let own = db::get_app_limit(pool, &env.app_id).await?.sleep_after_s;
+        if cfg.sleep_after_h == 0 && own.is_none() {
+            return Ok(false);
+        }
+        let owner_config = owner.as_ref().and_then(|a| a.deployed_config.as_deref());
+        match auto_sleep_after_s(own, owner_config, cfg.sleep_after_h) {
+            Some(after_s) => {
+                if !should_sleep_s(Utc::now(), &environment_activity(pool, &env).await, after_s) {
+                    return Ok(false);
+                }
+            }
+            None => return Ok(false),
+        }
     }
     db::set_environment_asleep(pool, &env.id).await?;
     edge_table::push_routes(pool, cfg).await?;
@@ -627,10 +732,13 @@ mod tests {
     #[test]
     fn sleeps_only_past_the_threshold() {
         let now = at(48).unwrap();
-        assert!(should_sleep(now, &[at(0), None], 24));
-        assert!(should_sleep(now, &[at(24)], 24), "exactly 24h idle sleeps");
+        assert!(should_sleep_s(now, &[at(0), None], 24 * 3600));
         assert!(
-            !should_sleep(now, &[at(0), at(30)], 24),
+            should_sleep_s(now, &[at(24)], 24 * 3600),
+            "exactly 24h idle sleeps"
+        );
+        assert!(
+            !should_sleep_s(now, &[at(0), at(30)], 24 * 3600),
             "newest activity wins"
         );
     }
@@ -638,9 +746,9 @@ mod tests {
     #[test]
     fn disabled_or_unknown_never_sleeps() {
         let now = at(1000).unwrap();
-        assert!(!should_sleep(now, &[at(0)], 0), "0 disables");
+        assert!(!should_sleep_s(now, &[at(0)], 0), "0 disables");
         assert!(
-            !should_sleep(now, &[None, None], 24),
+            !should_sleep_s(now, &[None, None], 24 * 3600),
             "no timestamps: never guess idle"
         );
     }
@@ -829,7 +937,7 @@ mod env_activity_tests {
             "the environment's own bucket is its newest activity"
         );
         assert!(
-            !should_sleep(Utc::now(), &active, 1),
+            !should_sleep_s(Utc::now(), &active, 3600),
             "a busy environment never parks"
         );
         // Production traffic on the same app does not move it: a sibling
@@ -844,5 +952,92 @@ mod env_activity_tests {
             "production traffic must not count for the environment"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    const CRON_CONFIG: &str = r#"{"triggers":{"crons":["*/5 * * * *"]},"name":"worker"}"#;
+    const QUEUE_CONFIG: &str = r#"{"queues":{"consumers":[{"queue":"jobs"}]}}"#;
+    const PLAIN_CONFIG: &str = r#"{"name":"worker"}"#;
+    const EMPTY_CRON_CONFIG: &str = r#"{"triggers":{"crons":[]}}"#;
+
+    #[test]
+    fn scheduled_work_detection() {
+        assert!(has_scheduled_work(Some(CRON_CONFIG)), "cron config");
+        assert!(has_scheduled_work(Some(QUEUE_CONFIG)), "queue config");
+        assert!(!has_scheduled_work(Some(PLAIN_CONFIG)), "plain config");
+        assert!(
+            !has_scheduled_work(Some(EMPTY_CRON_CONFIG)),
+            "empty crons is not scheduled work"
+        );
+        assert!(!has_scheduled_work(None), "missing config");
+        assert!(!has_scheduled_work(Some("not json")), "unparseable config");
+    }
+
+    #[test]
+    fn explicit_override_wins_over_scheduled_work() {
+        // Scheduled work without an override never auto-sleeps.
+        assert_eq!(
+            auto_sleep_after_s(None, Some(CRON_CONFIG), 24),
+            None,
+            "cron app without override skips"
+        );
+        assert_eq!(
+            auto_sleep_after_s(None, Some(QUEUE_CONFIG), 24),
+            None,
+            "queue app without override skips"
+        );
+        // An explicit override re-enables auto-sleep for scheduled apps.
+        assert_eq!(
+            auto_sleep_after_s(Some(3600), Some(CRON_CONFIG), 24),
+            Some(3600),
+            "explicit override wins"
+        );
+        assert_eq!(
+            auto_sleep_after_s(Some(0), Some(CRON_CONFIG), 24),
+            None,
+            "0 means never, even with an override-shaped value"
+        );
+    }
+
+    #[test]
+    fn threshold_override_and_never() {
+        // No override: the platform default in seconds.
+        assert_eq!(
+            auto_sleep_after_s(None, Some(PLAIN_CONFIG), 24),
+            Some(86_400)
+        );
+        assert_eq!(auto_sleep_after_s(None, None, 6), Some(21_600));
+        // An explicit threshold overrides the global one in both directions.
+        assert_eq!(
+            auto_sleep_after_s(Some(60), Some(PLAIN_CONFIG), 24),
+            Some(60),
+            "shorter than default"
+        );
+        assert_eq!(
+            auto_sleep_after_s(Some(2_592_000), Some(PLAIN_CONFIG), 24),
+            Some(2_592_000),
+            "longer than default"
+        );
+        // Explicit 0 is never, even for a plain app.
+        assert_eq!(auto_sleep_after_s(Some(0), None, 24), None);
+    }
+
+    #[test]
+    fn seconds_threshold_matches_hours() {
+        let now = DateTime::parse_from_rfc3339("2026-09-29T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let old = Some(
+            DateTime::parse_from_rfc3339("2026-09-28T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        assert!(should_sleep_s(now, &[old], 86_400));
+        assert!(!should_sleep_s(now, &[old], 86_401));
+        assert!(!should_sleep_s(now, &[old], 0), "0 disables");
     }
 }

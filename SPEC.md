@@ -434,7 +434,8 @@ An app with no requests for a day stops costing anything, and the next request b
 
 - **Sleep sweep.** A scheduled job in the runner (`host/sleep.rs`, every `RUNNER_SLEEP_SWEEP_S`, default 3600 s) puts an app to sleep when all of these hold:
   - it is deployed, desired `running` and awake;
-  - it has no request in the last `RUNNER_SLEEP_AFTER_H` hours (default 24; `0` disables the feature).
+  - its newest activity is older than its threshold: the app's own `sleep_after_s` override (`app_limit`, seconds; `None` = platform default, `0` = never), else `RUNNER_SLEEP_AFTER_H` hours. An unset `RUNNER_SLEEP_AFTER_H` derives from detected memory (≤ 2 GiB: 1 h, ≤ 4 GiB: 6 h, else 24 h); an explicit `0` disables sleeping install-wide and no override re-enables it. Environments use their owning app's override. The override is re-checked under the transition lock, so a request arriving mid-sweep still wins.
+- **Scheduled work never auto-sleeps.** An app whose last deployed config (`app.deployed_config`, the stored Wrangler JSON) carries a non-empty `triggers.crons` or `queues.consumers` skips the sweep unless its owner set an explicit `sleep_after_s` override — a sleeping scheduler would silently miss its triggers. Memory-pressure parking below still parks it (an OOM kill would miss the triggers too, and the next request wakes it).
 - **What counts as activity.** Activity is the newest of:
   - the last minute bucket with requests in `metrics.app_metric` (celld `celld.fetch` spans, i.e. real requests);
   - the app's last wake (`app.woke_at`);
@@ -450,7 +451,7 @@ An app with no requests for a day stops costing anything, and the next request b
   3. spawns the fleet immediately;
   4. waits until `/.well-known/celld/health` answers 200, bounded by `RUNNER_WAKE_TIMEOUT_S`, default 120 s, which covers celld's ready gate;
   5. rewrites the Caddyfile back to the plain proxy;
-  6. answers 200. Caddy then proxies the held request as if the app had never slept. There is no "starting" page: concurrent requests wait on the same wake (per-app lock), and only a failed wake answers an error (503).
+  6. answers 200. Caddy then proxies the held request as if the app had never slept. There is no "starting" page: concurrent requests wait on the same wake (per-app lock), and only a failed wake answers an error (503). A failed wake also records a tenant-visible `wake failed` fleet event and bumps the `wake_failed` sleep counter (`GET /v1/admin/stats`).
 - **Bounded cold starts.** At most `RUNNER_WAKE_CONCURRENCY` (4) apps cold-start for requests at once (a semaphore around steps 2–4); a wake queues for a slot and the health wait inside one `RUNNER_WAKE_TIMEOUT_S` budget. A flood across many asleep apps therefore starts them a few at a time instead of all together.
 - **What else counts as activity.** A deploy of an asleep app (push, rollback, web commit) wakes it first. TLS ask treats an asleep app as live, so custom-domain certificates keep renewing.
 - **Cost of the choice.** The first request after a quiet day waits for a cold fleet start: celld boot plus its ready gate, typically a few seconds. Everything after it is unaffected.

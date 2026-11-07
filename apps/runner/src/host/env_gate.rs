@@ -361,6 +361,12 @@ pub async fn env_gate(State(state): State<AppState>, headers: HeaderMap) -> Resp
         .await
         {
             tracing::warn!(slug = %route.app_slug, label = %route.label, error = %e, "env wake failed");
+            crate::host::edge::record_wake_failed(
+                &state.pool,
+                &route.app_id,
+                &format!("{}.{}", route.app_slug, route.label),
+            )
+            .await;
             let control = control_url(
                 host,
                 &cfg.base_domain,

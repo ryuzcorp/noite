@@ -7,7 +7,7 @@
 //! - DuckDB runs by purpose (`ingest`, `spans`, `logs`, `compact`, legacy),
 //! - snapshot uploads with bytes,
 //! - live SSE loops by kind (gauge, not cumulative),
-//! - scale-to-zero transitions (apps slept / woken).
+//! - scale-to-zero transitions (apps slept / woken / wake failures).
 //!
 //! Plus process RSS and CPU time from `/proc/self` at read time.
 //! Served bearer-gated on `GET /v1/admin/stats`.
@@ -106,6 +106,12 @@ pub fn record_sleep() {
 /// One app woken by a held request.
 pub fn record_wake() {
     bump(&counters().sleep, "woken", 1);
+}
+
+/// One wake that failed or timed out (the held request answered 503): the
+/// edge records a tenant-visible `fleet` event alongside this counter.
+pub fn record_wake_failed() {
+    bump(&counters().sleep, "wake_failed", 1);
 }
 
 fn map_snapshot(map: &Mutex<HashMap<String, u64>>) -> serde_json::Value {

@@ -261,6 +261,8 @@ struct LimitsParams {
     #[serde(default)]
     memory_mb: Option<i64>,
     #[serde(default)]
+    sleep_after_s: Option<i64>,
+    #[serde(default)]
     role: Option<String>,
 }
 
@@ -860,6 +862,7 @@ async fn dispatch_call(
                     p.client_rpm,
                     p.app_rpm,
                     p.memory_mb,
+                    p.sleep_after_s,
                     p.role.as_deref(),
                 )
                 .await,
