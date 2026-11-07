@@ -12,6 +12,7 @@ import {
 import { withDb } from "../db";
 import {
   runnerCreateApp,
+  runnerGetAppBySlug,
   runnerDeleteApp,
   runnerDeployLog,
   runnerGitRemote,
@@ -21,6 +22,7 @@ import {
   runnerRenameApp,
   runnerRetryImport,
   runnerRollback,
+  RunnerRpcError,
 } from "../runner";
 import type { RunnerApp, RunnerCreateSource, RunnerDeploy } from "../runner";
 import { apiAction, fail } from "./api";
@@ -184,12 +186,36 @@ export const createAppForUser = async (input: {
   slug: string;
   source?: CreateSourceInput;
 }): Promise<RunnerApp> => {
-  const app = await runnerCreateApp({
-    name: input.name,
-    slug: input.slug,
-    source: toRunnerSource(input.source, input.account),
-    userId: input.account.id,
-  });
+  let app: RunnerApp;
+
+  try {
+    app = await runnerCreateApp({
+      name: input.name,
+      slug: input.slug,
+      source: toRunnerSource(input.source, input.account),
+      userId: input.account.id,
+    });
+  } catch (error) {
+    // A create that outlived the control plane's lifecycle bound still runs
+    // in the runner (it is detached), so a retry can find the slug taken by
+    // the caller's own first attempt. Treat that as the same create instead
+    // of failing the retry, and grant the account below as usual.
+    if (
+      error instanceof RunnerRpcError &&
+      error.code === 409 &&
+      error.message.includes("slug already taken")
+    ) {
+      const existing = await runnerGetAppBySlug(input.slug).catch(() => null);
+
+      if (existing?.userId !== input.account.id) {
+        throw error;
+      }
+
+      app = existing;
+    } else {
+      throw error;
+    }
+  }
 
   try {
     await withDb(grantCollaborator(app.id, input.account.id, "admin"));
