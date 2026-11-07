@@ -68,6 +68,7 @@ static CGROUP_ANCHOR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 static BUILD_MEMORY_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static BUILD_CPU: AtomicBool = AtomicBool::new(false);
 static BUILD_IO: AtomicBool = AtomicBool::new(false);
+static BUILD_SLOTS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
 fn reason(msg: String) {
     if let Ok(mut reason) = CGROUP_REASON.lock() {
@@ -122,12 +123,13 @@ pub fn build_memory_mb() -> Option<u64> {
 /// the way down so each build leaf can take a small share. No leaf is created
 /// here — each deploy creates its own. `false` when cgroupfs is unavailable
 /// (builds then share the runner's cgroup, as before), logged loudly.
-pub fn setup_build(memory_mb: u64) -> bool {
+pub fn setup_build(memory_mb: u64, concurrency: u32) -> bool {
     let Some(anchor) = anchor() else {
         tracing::info!("cgroups unavailable; tenant builds run uncapped");
         return false;
     };
     let _ = BUILD_MEMORY_MB.set(memory_mb);
+    let _ = BUILD_SLOTS.set(concurrency.max(1));
     // The CPU controller is optional: it only lets a build yield to serving
     // traffic. Enabling it on the way down changes nothing for existing
     // leaves (all default to weight 100); failing to enable it must not cost
@@ -234,7 +236,7 @@ fn ensure_build_cgroup(
         // SIGKILL to the leader can leave a worker holding the budget.
         write_file(&dir, "memory.oom.group", "1")?;
     }
-    write_file(&dir, "pids.max", &BUILD_PIDS_MAX.to_string())?;
+    write_limit(&dir, "pids.max", &BUILD_PIDS_MAX.to_string())?;
     if cpu {
         write_limit(&dir, "cpu.weight", &BUILD_CPU_WEIGHT.to_string())?;
         write_limit(
@@ -254,9 +256,14 @@ fn ensure_build_cgroup(
     Ok(dir)
 }
 
-/// Cores a build may use: one fewer than the box, never below one.
+/// Cores one build may use: the box's cores minus one spare, split across
+/// the concurrent build slots (at least one core each). On two vCPUs with one
+/// slot that is one core; on 16 vCPUs with two slots it is seven, leaving two
+/// for the runner, RustFS, Caddy, the fleets and SSH.
 pub fn build_cpu_cores() -> u64 {
-    crate::host::memory::cores().saturating_sub(1).max(1) as u64
+    let cores = crate::host::memory::cores().max(1) as u64;
+    let slots = BUILD_SLOTS.get().copied().unwrap_or(1).max(1) as u64;
+    (cores.saturating_sub(1) / slots).max(1)
 }
 
 /// A build leaf's cumulative `oom_kill` counter, or `None` when the file is
