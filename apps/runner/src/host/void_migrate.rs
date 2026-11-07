@@ -1193,6 +1193,15 @@ enum CallAnswer {
     Transport { message: String },
 }
 
+/// The pre-activation canary's pass rule: an answered status below 500
+/// passes — the staged generation serves the probe path (2xx/3xx/4xx all
+/// mean the staged worker answered as itself). A 5xx fails, and a missing
+/// answer fails closed, so the deploy fails before any activate and the
+/// previous generation keeps serving.
+pub fn probe_status_passes(status: u16) -> bool {
+    status < 500
+}
+
 impl MigrationClient {
     pub fn new(client: reqwest::Client, base: String, token: String) -> Self {
         Self {
@@ -1527,6 +1536,28 @@ impl MigrationClient {
         }
         Err("migration dispatch failed after retries".to_string())
     }
+
+    /// Pre-activation canary: `HEAD <path>` against the staged generation
+    /// through `celld invoke` — the staged pins plus the app as `--target`,
+    /// the same transport [`invoke_exchange`] the migrations ride. An
+    /// answered status below 500 passes (returned, so the deploy log can
+    /// name it); a 5xx or a missing answer (transport failure, over-cap
+    /// body) fails closed, so the deploy fails before any activate.
+    pub async fn probe_staged(
+        &self,
+        path: &str,
+        timeout: std::time::Duration,
+    ) -> Result<u16, ProbeError> {
+        match self.exchange("HEAD", path, None, timeout).await {
+            CallAnswer::Answered { status, .. } if probe_status_passes(status) => Ok(status),
+            CallAnswer::Answered { status, body } => Err(ProbeError::Http {
+                status,
+                preview: preview(&body, 200),
+            }),
+            CallAnswer::TooLarge { message } => Err(ProbeError::TooLarge { message }),
+            CallAnswer::Transport { message } => Err(ProbeError::Transport { message }),
+        }
+    }
 }
 
 /// One migration exchange over the staged generation: `celld invoke` with
@@ -1564,8 +1595,14 @@ async fn invoke_exchange(
     // token travels in the child's environment (`--header-env`, celld
     // 0049), which only the runner's own uid can read, beside the operator
     // token and bucket credentials; the body travels on stdin.
-    args.push("--header-env".to_string());
-    args.push(format!("x-void-internal={PROXY_TOKEN_ENV}"));
+    // A non-Void fleet has no proxy token: omit the header entirely rather
+    // than hand celld `--header-env` for an unset variable (celld refuses
+    // that as "environment variable ... is not set"). Void migrations and
+    // the Void probe always carry one.
+    if !token.is_empty() {
+        args.push("--header-env".to_string());
+        args.push(format!("x-void-internal={PROXY_TOKEN_ENV}"));
+    }
     if body.is_some() {
         args.push("--header".to_string());
         args.push("content-type:application/json".to_string());
@@ -1584,7 +1621,7 @@ async fn invoke_exchange(
         .env
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
-        .chain(std::iter::once((PROXY_TOKEN_ENV, token)))
+        .chain((!token.is_empty()).then_some((PROXY_TOKEN_ENV, token)))
         .collect();
     let output = match crate::host::exec::run_cmd_output_stdin(
         &target.celld_bin,
@@ -2831,6 +2868,18 @@ mod tests {
         std::fs::write(dir.join("void.json"), vec![b'x'; MAX_VOID_JSON_BYTES + 1]).unwrap();
         let err = resolve_migrations_dir(&dir).unwrap_err().to_string();
         assert!(err.contains("over the 1 MiB cap"), "{}", err);
+    }
+
+    /// The canary's pass rule: any answered status below 500 passes — the
+    /// staged worker answered as itself — while a 5xx fails.
+    #[test]
+    fn probe_status_passes_below_500() {
+        for status in [200, 201, 204, 301, 404, 499] {
+            assert!(probe_status_passes(status), "{status}");
+        }
+        for status in [500, 502, 503] {
+            assert!(!probe_status_passes(status), "{status}");
+        }
     }
 
     // --- staged transport (`celld invoke`) ----------------------------------
