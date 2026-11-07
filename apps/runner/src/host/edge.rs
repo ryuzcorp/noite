@@ -317,7 +317,6 @@ pub async fn wake(State(state): State<AppState>, headers: HeaderMap) -> axum::re
                     &state.pool,
                     &route.app_id,
                     &format!("{}.{}", route.app_slug, route.label),
-                    &e,
                 )
                 .await;
                 page(
@@ -343,7 +342,7 @@ pub async fn wake(State(state): State<AppState>, headers: HeaderMap) -> axum::re
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => {
             tracing::warn!(slug = %app.slug, error = %e, "wake failed");
-            record_wake_failed(&state.pool, &app.id, &app.slug, &e).await;
+            record_wake_failed(&state.pool, &app.id, &app.slug).await;
             page(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Unavailable",
@@ -361,14 +360,11 @@ pub async fn wake(State(state): State<AppState>, headers: HeaderMap) -> axum::re
 /// Tenant-visible reason for a failed wake: the app event the UI shows next
 /// to the 503 the held request answered. Best-effort — a lost event must
 /// not change the response.
-async fn record_wake_failed(
-    pool: &sqlx::SqlitePool,
-    app_id: &str,
-    fleet: &str,
-    error: &anyhow::Error,
-) {
+pub(crate) async fn record_wake_failed(pool: &sqlx::SqlitePool, app_id: &str, fleet: &str) {
     crate::host::stats::record_wake_failed();
-    let detail = format!("a held request could not wake {fleet}: {error:#}");
+    // The full error stays in the runner log (each caller's tracing::warn);
+    // the tenant-visible event carries a fixed reason, never runner internals.
+    let detail = format!("a held request could not wake {fleet}; the fleet did not start");
     let _ = crate::db::insert_app_event(
         pool,
         &crate::models::new_id(),

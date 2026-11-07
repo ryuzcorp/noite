@@ -161,7 +161,15 @@ pub async fn sweep(pool: &SqlitePool, cfg: &Config, procs: &ProcMap) -> usize {
     if cfg.sleep_after_h == 0 {
         return 0;
     }
-    let limits = db::list_app_limits(pool).await.unwrap_or_default();
+    let limits = match db::list_app_limits(pool).await {
+        Ok(limits) => limits,
+        Err(error) => {
+            // Without the overrides, an explicit "never" could be ignored and
+            // an idle app parked. Skip this sweep; the next tick retries.
+            tracing::warn!(error = %error, "sleep sweep: app limits unavailable");
+            return 0;
+        }
+    };
     let own_of = |app_id: &str| {
         limits
             .iter()
@@ -260,10 +268,7 @@ pub async fn sleep_app(
     let after_s = if force {
         None
     } else {
-        let own = db::get_app_limit(pool, &app.id)
-            .await
-            .ok()
-            .and_then(|l| l.sleep_after_s);
+        let own = db::get_app_limit(pool, &app.id).await?.sleep_after_s;
         // The platform `0` is a master off (see `sweep`).
         if cfg.sleep_after_h == 0 && own.is_none() {
             return Ok(false);
@@ -590,10 +595,7 @@ pub async fn sleep_environment(
     // the config lives on the app row, not the environment.
     if !force {
         let owner = db::get_app(pool, &env.app_id).await?;
-        let own = db::get_app_limit(pool, &env.app_id)
-            .await
-            .ok()
-            .and_then(|l| l.sleep_after_s);
+        let own = db::get_app_limit(pool, &env.app_id).await?.sleep_after_s;
         if cfg.sleep_after_h == 0 && own.is_none() {
             return Ok(false);
         }
