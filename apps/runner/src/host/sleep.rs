@@ -197,9 +197,11 @@ pub async fn sleep_app(
     Ok(true)
 }
 
-/// Memory-pressure parking (SPEC, Scale to zero): when the container is at or
-/// above `RUNNER_PRESSURE_PCT` of its limit, park the least-recently-active
-/// app that has been idle for `RUNNER_PRESSURE_IDLE_S`. A parked app wakes
+/// Memory-pressure parking (SPEC, Scale to zero): when the box is at or above
+/// `RUNNER_PRESSURE_PCT` of its memory (the container's cgroup limit when it
+/// has one, otherwise the host — the bundled RustFS lives outside this
+/// container), park the least-recently-active app that has been idle for
+/// `RUNNER_PRESSURE_IDLE_S`. A parked app wakes
 /// transparently on its next request, so this trades one cold start for the
 /// whole box staying up; an app with an in-flight deploy is never a victim.
 pub async fn sweep_under_pressure(
@@ -211,10 +213,7 @@ pub async fn sweep_under_pressure(
     if cfg.pressure_pct == 0 {
         return 0;
     }
-    let (Some(limit), Some(current)) = (
-        crate::host::memory::total_bytes(),
-        crate::host::memory::current_bytes(),
-    ) else {
+    let Some((current, limit)) = crate::host::memory::pressure_sample() else {
         return 0;
     };
     if limit == 0 || current.saturating_mul(100) < limit * u64::from(cfg.pressure_pct) {
@@ -256,10 +255,10 @@ pub async fn sweep_under_pressure(
             Ok(false) => {}
             Err(error) => tracing::warn!(error = %error, "pressure park"),
         }
-        let Some(now_bytes) = crate::host::memory::current_bytes() else {
+        let Some((now_used, now_limit)) = crate::host::memory::pressure_sample() else {
             break;
         };
-        if now_bytes.saturating_mul(100) < limit * target {
+        if now_used.saturating_mul(100) < now_limit * target {
             return parked;
         }
     }
@@ -300,10 +299,10 @@ pub async fn sweep_under_pressure(
             Ok(false) => {}
             Err(error) => tracing::warn!(error = %error, "pressure park environment"),
         }
-        let Some(now_bytes) = crate::host::memory::current_bytes() else {
+        let Some((now_used, now_limit)) = crate::host::memory::pressure_sample() else {
             break;
         };
-        if now_bytes.saturating_mul(100) < limit * target {
+        if now_used.saturating_mul(100) < now_limit * target {
             break;
         }
     }
