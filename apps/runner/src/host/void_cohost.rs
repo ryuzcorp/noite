@@ -557,7 +557,7 @@ fn render_timeout(celld: &CelldDeploy<'_>, render: &RenderedCohost) -> Duration 
 /// the deploy at once, before the app stages. Staged versions move no
 /// pointer, so a failed stage leaves the previous generation serving — and
 /// no hashes are stored here: they name activated content, so
-/// [`deploy_fleet_in_order`] stores them only after the activate commits.
+/// [`activate_staged`] stores them only after the activate commits.
 /// The temp project holds the fleet's secrets in plaintext, so it is
 /// owner-only from birth and removed on every path — success or failure —
 /// and failed deploys leave nothing on runner disk.
@@ -794,29 +794,27 @@ pub async fn activate_staged(
     })
 }
 
-/// The whole ordered fleet deploy: every script of the generation staged
-/// with `celld deploy --no-activate` — the cohosted scripts first (each
-/// skipped when unchanged), the tenant app last — then one `celld activate
-/// SCRIPT=VERSION...` serving the generation with a single atomic pointer
-/// write. One function owns the sequence, so the order — proxy first, app
-/// last, fleet pointer ends on the app — holds by construction; a failed
-/// stage runs no activate, so the previous generation keeps serving.
-pub async fn deploy_fleet_in_order(
-    pool: &SqlitePool,
-    app_id: &str,
-    environment_id: Option<&str>,
-    celld: &CelldDeploy<'_>,
-    cohosted: &[RenderedCohost],
-    app: &FleetApp<'_>,
-) -> anyhow::Result<FleetDeployStats> {
-    let staged = stage_fleet_in_order(pool, app_id, environment_id, celld, cohosted, app).await?;
-    activate_staged(pool, app_id, environment_id, celld, staged).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The tests' whole ordered fleet deploy: stage plus the one activate,
+    /// with nothing between — production's deploys prove the staged
+    /// generation with the pre-activation canary first (`host/deploy.rs`),
+    /// so only this seam keeps the bare sequence.
+    async fn deploy_fleet_in_order(
+        pool: &SqlitePool,
+        app_id: &str,
+        environment_id: Option<&str>,
+        celld: &CelldDeploy<'_>,
+        cohosted: &[RenderedCohost],
+        app: &FleetApp<'_>,
+    ) -> anyhow::Result<FleetDeployStats> {
+        let staged =
+            stage_fleet_in_order(pool, app_id, environment_id, celld, cohosted, app).await?;
+        activate_staged(pool, app_id, environment_id, celld, staged).await
+    }
 
     const SOURCES: &[CohostSource] = &[
         CohostSource {
