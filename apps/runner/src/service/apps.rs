@@ -845,6 +845,36 @@ mod tests {
         drop(dir);
     }
 
+    /// Renaming onto a previously deleted slug must not fail on that slug's
+    /// leftovers: the target has no row, so its work dirs and prefixes are
+    /// cleared first, exactly as create does. Before, `move_dir` refused the
+    /// non-empty target and the rename failed.
+    #[tokio::test]
+    async fn rename_clears_the_target_slugs_leftovers() {
+        let (state, dir) = test_state(10).await;
+        let app = create(&state, "Mover", "ps-old", Some("u1"), None)
+            .await
+            .expect("create");
+        let leftover = crate::host::exec::work_root(&state.config)
+            .join("projects")
+            .join("ps-new");
+        tokio::fs::create_dir_all(&leftover)
+            .await
+            .expect("leftover dir");
+        tokio::fs::write(leftover.join("stale.txt"), b"stale")
+            .await
+            .expect("leftover file");
+        let renamed = rename(&state, &app.id, None, Some("ps-new"))
+            .await
+            .expect("rename onto a deleted slug's leftovers");
+        assert_eq!(renamed.slug, "ps-new");
+        assert!(
+            !leftover.join("stale.txt").exists(),
+            "the target slug's leftover survived the rename"
+        );
+        drop(dir);
+    }
+
     /// R-02: a slug rename holds both slugs' push guards across the whole
     /// move, so a rename queued behind a push serializes instead of moving
     /// prefixes under a live git+S3+manifest write.
