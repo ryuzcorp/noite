@@ -244,8 +244,10 @@ const RUNNER_TIMEOUT_MS = 5000;
 /** Create, rename and delete bound themselves: a create clears a deleted
  * slug's leftovers, a rename moves a whole S3 prefix, and a delete stops a
  * fleet before purging. They still answer promptly (delete within 3 s) — the
- * longer abort only covers those lifecycle moves on a slow store. */
-const LIFECYCLE_TIMEOUT_MS = 20_000;
+ * longer abort only covers those lifecycle moves on a slow store. Kept under
+ * the control UI's 15 s route bound (`middleware/01-timeout.ts`): past it the
+ * route answers a 504 and the runner fetch is abandoned anyway. */
+const LIFECYCLE_TIMEOUT_MS = 14_000;
 
 /** Log anything slower than this, with the path and the base URL: when the
  * deployed worker is the only thing we can observe, this is what attributes
