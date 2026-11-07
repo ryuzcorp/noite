@@ -1595,8 +1595,14 @@ async fn invoke_exchange(
     // token travels in the child's environment (`--header-env`, celld
     // 0049), which only the runner's own uid can read, beside the operator
     // token and bucket credentials; the body travels on stdin.
-    args.push("--header-env".to_string());
-    args.push(format!("x-void-internal={PROXY_TOKEN_ENV}"));
+    // A non-Void fleet has no proxy token: omit the header entirely rather
+    // than hand celld `--header-env` for an unset variable (celld refuses
+    // that as "environment variable ... is not set"). Void migrations and
+    // the Void probe always carry one.
+    if !token.is_empty() {
+        args.push("--header-env".to_string());
+        args.push(format!("x-void-internal={PROXY_TOKEN_ENV}"));
+    }
     if body.is_some() {
         args.push("--header".to_string());
         args.push("content-type:application/json".to_string());
@@ -1615,7 +1621,7 @@ async fn invoke_exchange(
         .env
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
-        .chain(std::iter::once((PROXY_TOKEN_ENV, token)))
+        .chain((!token.is_empty()).then_some((PROXY_TOKEN_ENV, token)))
         .collect();
     let output = match crate::host::exec::run_cmd_output_stdin(
         &target.celld_bin,
