@@ -5,7 +5,6 @@ pub mod cgroups;
 pub mod children;
 // The deploy integration (parent slice) wires `ci` into `deploy_inner`;
 // until then the API is exercised only by its tests.
-#[allow(dead_code)]
 pub mod ci;
 pub mod container_image;
 pub mod control;

@@ -709,50 +709,123 @@ async fn deploy_inner(
 
     exec::check_work_quota(&work, cfg.build_max_mb)?;
     let step_timeout = Duration::from_secs(cfg.build_timeout_s);
-    let wrangler_build = wrangler_build(&src_dir).await?;
-    if let Some(pm) = &manager {
-        let (program, args) = pm.install();
-        progress
-            .step(
-                "install",
-                DeployStatus::Building,
-                &format!("{} install ({})", pm.name, pm.reason),
-            )
-            .await?;
-        let out = exec::run_sandboxed(program, &args, &src_dir, &sb, step_timeout).await?;
-        progress.output(&out).await?;
-        exec::check_work_quota(&work, cfg.build_max_mb)?;
+    // Noite CI (SPEC): a repo-root `noite.ci.yaml` runs the jobs in
+    // containers and replaces the built-in install/build; the workflow must
+    // leave a `dist/` for the deploy. A failure here runs no release or
+    // activate, so the live version is untouched.
+    let mut ci_ran = false;
+    if cfg.ci_enabled {
+        match tokio::fs::read_to_string(src_dir.join(crate::host::ci::CI_CONFIG_NAME)).await {
+            Ok(contents) => {
+                let workflow = crate::host::ci::parse(&contents)
+                    .with_context(|| format!("{} is invalid", crate::host::ci::CI_CONFIG_NAME))?;
+                progress
+                    .step(
+                        "ci",
+                        DeployStatus::Building,
+                        crate::host::ci::CI_CONFIG_NAME,
+                    )
+                    .await?;
+                let cores = crate::host::memory::cores().max(1) as u64;
+                let ci_env: Vec<(String, String)> = step_env
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect();
+                let settings = crate::host::ci::CiSettings {
+                    docker_bin: cfg.ci_docker_bin.clone(),
+                    default_image: cfg.ci_default_image.clone(),
+                    allowed_images: cfg.ci_allowed_images.clone(),
+                    network: cfg.ci_network.clone(),
+                    memory_mb: if cfg.build_memory_mb == 0 {
+                        1024
+                    } else {
+                        cfg.build_memory_mb
+                    },
+                    cpus: cores.saturating_sub(1).max(1) as f64,
+                    uid: sandbox_id.unwrap_or(0),
+                    gid: sandbox_id.unwrap_or(0),
+                    cache_volume: format!("noite-ci-cache-{}", app.slug),
+                    env: ci_env,
+                };
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                let running = crate::host::ci::run(&settings, &src_dir, &workflow, move |line| {
+                    let _ = tx.send(line);
+                });
+                tokio::pin!(running);
+                let outcome = loop {
+                    tokio::select! {
+                        Some(line) = rx.recv() => {
+                            progress
+                                .log(DeployStatus::Building, &format!("{line}\n"))
+                                .await?;
+                        }
+                        result = &mut running => break result?,
+                    }
+                };
+                while let Ok(line) = rx.try_recv() {
+                    progress
+                        .log(DeployStatus::Building, &format!("{line}\n"))
+                        .await?;
+                }
+                if outcome.artifact_path.is_none() {
+                    anyhow::bail!(
+                        "{} finished but produced no dist/ to deploy",
+                        crate::host::ci::CI_CONFIG_NAME
+                    );
+                }
+                exec::check_work_quota(&work, cfg.build_max_mb)?;
+                ci_ran = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("read noite.ci.yaml"),
+        }
     }
-    // Wrangler's own custom build (`build.command`, run from `build.cwd`)
-    // wins over the package `build` script, as it does for `wrangler deploy`.
     let mut built = false;
-    if let Some(build) = &wrangler_build {
-        progress
-            .step("build", DeployStatus::Building, &build.command)
-            .await?;
-        let cwd = src_dir.join(&build.cwd);
-        let out =
-            exec::run_sandboxed("sh", &["-c", &build.command], &cwd, &sb, step_timeout).await?;
-        progress.output(&out).await?;
-        built = true;
-    } else if let Some(pm) = manager
-        .as_ref()
-        .filter(|_| package.as_ref().is_some_and(has_build_script))
-    {
-        let (program, args) = pm.run("build");
-        progress
-            .step(
-                "build",
-                DeployStatus::Building,
-                &format!("{} run build", pm.name),
-            )
-            .await?;
-        let out = exec::run_sandboxed(program, &args, &src_dir, &sb, step_timeout).await?;
-        progress.output(&out).await?;
-        built = true;
-    }
-    if built {
-        exec::check_work_quota(&work, cfg.build_max_mb)?;
+    if !ci_ran {
+        let wrangler_build = wrangler_build(&src_dir).await?;
+        if let Some(pm) = &manager {
+            let (program, args) = pm.install();
+            progress
+                .step(
+                    "install",
+                    DeployStatus::Building,
+                    &format!("{} install ({})", pm.name, pm.reason),
+                )
+                .await?;
+            let out = exec::run_sandboxed(program, &args, &src_dir, &sb, step_timeout).await?;
+            progress.output(&out).await?;
+            exec::check_work_quota(&work, cfg.build_max_mb)?;
+        }
+        // Wrangler's own custom build (`build.command`, run from `build.cwd`)
+        // wins over the package `build` script, as it does for `wrangler deploy`.
+        if let Some(build) = &wrangler_build {
+            progress
+                .step("build", DeployStatus::Building, &build.command)
+                .await?;
+            let cwd = src_dir.join(&build.cwd);
+            let out =
+                exec::run_sandboxed("sh", &["-c", &build.command], &cwd, &sb, step_timeout).await?;
+            progress.output(&out).await?;
+            built = true;
+        } else if let Some(pm) = manager
+            .as_ref()
+            .filter(|_| package.as_ref().is_some_and(has_build_script))
+        {
+            let (program, args) = pm.run("build");
+            progress
+                .step(
+                    "build",
+                    DeployStatus::Building,
+                    &format!("{} run build", pm.name),
+                )
+                .await?;
+            let out = exec::run_sandboxed(program, &args, &src_dir, &sb, step_timeout).await?;
+            progress.output(&out).await?;
+            built = true;
+        }
+        if built {
+            exec::check_work_quota(&work, cfg.build_max_mb)?;
+        }
     }
 
     // `cf` CLI apps declare the Worker in cloudflare.config.ts; generate the

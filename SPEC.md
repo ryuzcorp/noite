@@ -104,6 +104,16 @@ This is the honest contract for platforms that cannot provide isolation: they ru
 - **Release** (`release` in the tenant's `wrangler.jsonc`, meant for migrations) runs in `multi` with the scope's own bucket keys; where no scoped provider exists it is **skipped** (`root` mode), with a deploy-log line saying so. In `single` it runs with the scope's keys, or the root keys in `root` mode. Noite's `release` key is stripped from `wrangler.json` before `celld deploy` (celld rejects unknown keys).
 - Build network stays open (package registries); the egress policy below applies to the build uid as well.
 
+### Noite CI
+
+A repo-root `noite.ci.yaml` runs the app's build/tests in containers instead of the built-in install/build; the workflow's `dist/` is the deploy root, and a failure fails the deploy before release/activate (the live generation keeps serving).
+
+- **Shape**: a deliberately small GitHub-Actions subset - `on` (ignored), `jobs` (map, file order), `image`, and `steps` with `name`/`run`/`env`/`working-directory`/`timeout-minutes`; `uses: checkout` is a no-op, marketplace actions are not supported. Unknown keys fail with their path; 64 KiB config, 32 jobs/steps, 32 KiB per `run`, 120 min per step (10 min default).
+- **Execution**: the runner owns the Docker CLI (the celld app-sandbox proxy is not used). One container per job, sequential, fresh `/tmp`; the checkout is copied in with `docker cp` (the runner's paths are not host paths), steps run as the app build uid, `dist/` is copied back out. `--cap-drop ALL`, `no-new-privileges`, no host binds, no Docker socket inside, `--pids-limit 2048`, memory = `RUNNER_BUILD_MEMORY_MB` with swap equal (zero swap), CPU = one core less than the box. `HOME` and package caches live in `noite-ci-cache-<slug>`.
+- **Images**: exact allowlist (`RUNNER_CI_IMAGES`, default `RUNNER_CI_IMAGE=oven/bun:1.4.4`); tags or digests, no signature verification. `RUNNER_CI_NETWORK`: `bridge` (installs reach registries; host loopback is not reachable) or `none`.
+- **Kill switch**: `RUNNER_CI=0` uses the built-in path. The workflow runs on the host, so it consumes host memory/CPU like the built-in build; containers do not make an over-budget build fit.
+- **Not in scope yet**: parallel jobs, services, matrices, marketplace `uses`, off-host runners, GitHub App.
+
 ### Egress policy
 
 Worker egress is enforced inside celld: in `multi` every tenant fleet spawns with `CELLD_EGRESS=public`, so Worker `fetch`/`connect`/outbound-WebSocket dials to loopback, private, link-local, CGNAT, ULA, multicast, reserved and metadata addresses are refused, with `CELLD_EGRESS_ALLOW=<store host:port>` as the one exception (derived from `S3_ENDPOINT`; a hostname entry re-resolves, so a moved store stays allowed). celld's own traffic — store, peers, control, telemetry, container engine — is exempt, as are dials to container endpoints the node published, node-wide: any Worker on the node may dial a published endpoint by address and port. Noite accepts that exemption: the gateway below still admits only dials to containers the connecting fleet owns, and the engine proxy keeps every other container call fleet-scoped. `single` keeps no egress policy, as before (its one tenant is trusted).
