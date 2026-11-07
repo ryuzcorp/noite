@@ -262,6 +262,28 @@ pub async fn rename(
     if name.is_none() && slug.is_none() {
         return Err(ApiError::bad("name or slug required"));
     }
+    // The move (local dirs, three S3 prefixes, then the row) can outlast the
+    // control plane's call bound on a store with real data. Run it as its own
+    // task: a timed-out caller only drops the waiter, and the rename still
+    // finishes; a retry with the same slug then sees it already applied.
+    let state = state.clone();
+    let id = id.to_string();
+    super::detached::run(format!("rename:{id}"), async move {
+        let out = rename_inner(&state, &id, name.as_deref(), slug.as_deref()).await;
+        if let Err(e) = &out {
+            tracing::warn!(app_id = %id, error = %e, "app rename failed");
+        }
+        out
+    })
+    .await
+}
+
+async fn rename_inner(
+    state: &AppState,
+    id: &str,
+    name: Option<&str>,
+    slug: Option<&str>,
+) -> Result<App, ApiError> {
     // R-03: the slug-taken check is per-slug but the rename lock is per app
     // id, so two apps renaming onto one slug could both pass and both move
     // prefixes before the second fails at the row write. A slug-changing
@@ -294,8 +316,8 @@ pub async fn rename(
         &state.deploying,
         &state.git_sync,
         id,
-        name.as_deref(),
-        slug.as_deref(),
+        name,
+        slug,
     )
     .await
     {
@@ -877,6 +899,95 @@ mod tests {
         assert_eq!(renamed.slug, "ps-new");
         drop(dir);
     }
+    /// A slug that still belongs to another app is a conflict, answered
+    /// without moving anything: no local dirs, no S3, no row write.
+    #[tokio::test]
+    async fn rename_onto_a_taken_slug_is_a_conflict() {
+        let (state, dir) = test_state(10).await;
+        let a = create(&state, "Alpha", "ps-a", Some("u1"), None)
+            .await
+            .expect("create a");
+        create(&state, "Beta", "ps-b", Some("u1"), None)
+            .await
+            .expect("create b");
+        let err = rename(&state, &a.id, None, Some("ps-b"))
+            .await
+            .expect_err("the slug belongs to another app");
+        assert!(matches!(err, ApiError::Conflict(_)), "{err:?}");
+        let row = db::get_app(&state.pool, &a.id)
+            .await
+            .expect("lookup")
+            .expect("row");
+        assert_eq!(row.slug, "ps-a");
+        drop(dir);
+    }
+
+    /// The reported case: rename onto a slug whose app was deleted. The
+    /// delete's purge finished before its row went away, so the target has
+    /// no leftover dirs or prefixes and the rename must succeed; the delete
+    /// guard no longer blocks it (alpha.22 bug).
+    #[tokio::test]
+    async fn rename_onto_a_deleted_slug_succeeds() {
+        let (state, dir) = test_state(10).await;
+        let keeper = create(&state, "Keeper", "ps-old", Some("u1"), None)
+            .await
+            .expect("create keeper");
+        let gone = create(&state, "Gone", "ps-target", Some("u1"), None)
+            .await
+            .expect("create gone");
+        let done = crate::service::detached::finished(&format!("app:{}", gone.id));
+        let _ = delete(&state, &gone.id).await.expect("delete answers");
+        tokio::time::timeout(Duration::from_secs(30), done.notified())
+            .await
+            .expect("the delete's detached work never finished");
+        assert!(
+            db::get_app_by_slug(&state.pool, "ps-target")
+                .await
+                .expect("slug lookup")
+                .is_none(),
+            "the deleted slug still has a row"
+        );
+        let renamed = rename(&state, &keeper.id, None, Some("ps-target"))
+            .await
+            .expect("rename onto a deleted slug");
+        assert_eq!(renamed.slug, "ps-target");
+        drop(dir);
+    }
+
+    /// The rename runs as its own task: the control plane aborting the call
+    /// only drops the waiter, and the move completes instead of leaving the
+    /// row on the old slug with dirs or prefixes half moved.
+    #[tokio::test]
+    async fn dropped_rename_caller_does_not_cancel_the_move() {
+        let (state, dir) = test_state(10).await;
+        let app = create(&state, "Mover", "ps-old", Some("u1"), None)
+            .await
+            .expect("create");
+        let guard = state.git_sync.push_guard("ps-old").await;
+        let done = crate::service::detached::finished(&format!("rename:{}", app.id));
+        let owned = state.clone();
+        let id = app.id.clone();
+        let mut caller =
+            tokio::spawn(async move { rename(&owned, &id, None, Some("ps-new")).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut caller)
+                .await
+                .is_err(),
+            "the rename should be waiting on the old-slug guard"
+        );
+        caller.abort();
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(30), done.notified())
+            .await
+            .expect("rename canceled with its caller: the move never finished");
+        let row = db::get_app(&state.pool, &app.id)
+            .await
+            .expect("lookup")
+            .expect("row");
+        assert_eq!(row.slug, "ps-new");
+        drop(dir);
+    }
+
     /// The alpha.22 delete bug: the app row was gone but the slug's push
     /// guard stayed held through the post-delete cleanup (edge push, provider
     /// revoke), so create/rename onto the slug waited past the control plane's
