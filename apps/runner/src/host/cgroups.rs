@@ -244,7 +244,12 @@ fn ensure_build_cgroup(
         )?;
     }
     if io {
-        write_limit(&dir, "io.weight", &BUILD_IO_WEIGHT.to_string())?;
+        // cgroup v2's io.weight takes `default <weight>` (or a device row);
+        // a bare number is refused. Best-effort: a store without a
+        // weight-aware scheduler would otherwise fail every deploy.
+        if let Err(error) = write_limit(&dir, "io.weight", &format!("default {BUILD_IO_WEIGHT}")) {
+            tracing::debug!(key, "build io.weight not applied ({error:#})");
+        }
     }
     Ok(dir)
 }
@@ -1147,7 +1152,7 @@ mod tests {
         let dir = ensure_build_cgroup(io.path(), "shop", 768, false, true).expect("build cgroup");
         assert_eq!(
             std::fs::read_to_string(dir.join("io.weight")).expect("io.weight"),
-            BUILD_IO_WEIGHT.to_string()
+            format!("default {BUILD_IO_WEIGHT}")
         );
 
         let uncapped = fakefs();
