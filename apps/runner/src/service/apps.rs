@@ -334,6 +334,13 @@ pub enum Deletion {
 /// the claim for minutes) never surfaces as a timeout.
 const DELETE_ANSWER_WITHIN: Duration = Duration::from_secs(3);
 
+/// How long the best-effort cleanup after the row delete may take. The app
+/// row (and the slug's push guard) are already released when it starts, so a
+/// hung provider or Caddy call can only delay this task, never a create or
+/// rename onto the slug; the bound also stops a permanently stuck provider
+/// from leaking the detached task and its in-memory delete marker.
+const DELETE_CLEANUP_WITHIN: Duration = Duration::from_secs(30);
+
 /// Apps whose delete is running. They are gone for every caller from the
 /// moment the delete starts ([`list`], [`get`], [`get_by_slug`]), and a
 /// second delete reports the running one instead of starting another purge.
@@ -417,7 +424,7 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     };
     // R-02: a concurrent push writes under `push_guard(&slug)` across git +
     // S3 + manifest; the purge must not run inside one of those writes.
-    let _push = state.git_sync.push_guard(&app.slug).await;
+    let push = state.git_sync.push_guard(&app.slug).await;
     // Mark it stopped before the fleet goes down: the purge takes seconds
     // (S3 prefixes), and an app still marked running is respawned in that
     // window by the reconcile loop or by a wake. A failed purge leaves the
@@ -442,24 +449,45 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
         )));
     }
     let delete_result = db::delete_app(&state.pool, id).await;
-    drop(claim);
     delete_result.map_err(|e| ApiError::internal(e.to_string()))?;
-    if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
-        tracing::warn!(app_id = %id, error = %format!("{e:#}"), "edge push after app delete");
-    }
-    // A reconcile tick that listed apps before the stop above can still have
-    // started the fleet again; with the row gone nothing else would stop it.
+    // A reconcile tick (or a wake) that listed the app before the stop above
+    // can still have started the fleet again; with the row gone nothing else
+    // would stop it. Stop it while the push guard is still ours: releasing
+    // the slug first would let a new app with the same slug spawn, and this
+    // late stop would kill *its* fleet.
     supervisor::stop_fleet(&state.procs, &app.slug, supervisor::StopGrace::FOR_DELETE).await;
-    // Revoke the app's keys and its environments' (SPEC, Scoped credentials).
-    // R-10: a revoke failure must not vanish — warn loudly so the orphaned
-    // credential row is visible instead of silently kept.
-    if let Err(e) = crate::host::credentials::revoke_app(&state.pool, &state.config, id).await {
-        tracing::warn!(app_id = %id, error = %format!("{e:#}"), "app deleted but credential revoke failed");
-    }
-    // The fleets' operator tokens go with the app, so a recreated slug
-    // mints fresh ones instead of inheriting the dead fleets' tokens.
-    if let Err(e) = db::delete_app_operator_tokens(&state.pool, id).await {
-        tracing::warn!(app_id = %id, error = %e, "app deleted but operator token rows remain");
+    // The row is gone and no fleet can start under this slug any more:
+    // release the slug's push guard and the app's deploy claim *now*, before
+    // the best-effort cleanup below. Create and rename onto this slug wait on
+    // the guard (and the control plane aborts their runner call after 5 s); a
+    // hung provider or Caddy call must never keep the slug unusable — that
+    // was the "deleted app, slug still taken" bug.
+    drop(push);
+    drop(claim);
+    let cleanup = async {
+        if let Err(e) = crate::host::edge_table::push_routes(&state.pool, &state.config).await {
+            tracing::warn!(app_id = %id, error = %format!("{e:#}"), "edge push after app delete");
+        }
+        // Revoke the app's keys and its environments' (SPEC, Scoped
+        // credentials). R-10: a revoke failure must not vanish — warn loudly
+        // so the orphaned credential row is visible instead of silently kept.
+        if let Err(e) = crate::host::credentials::revoke_app(&state.pool, &state.config, id).await {
+            tracing::warn!(app_id = %id, error = %format!("{e:#}"), "app deleted but credential revoke failed");
+        }
+        // The fleets' operator tokens go with the app, so a recreated slug
+        // mints fresh ones instead of inheriting the dead fleets' tokens.
+        if let Err(e) = db::delete_app_operator_tokens(&state.pool, id).await {
+            tracing::warn!(app_id = %id, error = %e, "app deleted but operator token rows remain");
+        }
+    };
+    if tokio::time::timeout(DELETE_CLEANUP_WITHIN, cleanup)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            app_id = %id,
+            "post-delete cleanup still pending; the slug is free and the next sweep/reconcile retries the rest"
+        );
     }
     Ok(())
 }
@@ -521,6 +549,17 @@ mod tests {
     /// Same, against a caller-supplied S3 endpoint: a test that must park
     /// the purge mid-flight gates the stub instead of answering at once.
     async fn test_state_with_s3(max_apps: u32, s3: String) -> (AppState, crate::testutil::TempDir) {
+        test_state_with_s3_and(max_apps, s3, None).await
+    }
+
+    /// Same, with the edge admin URL overridden: the delete-frees-the-slug
+    /// test parks the post-delete route push behind a server that never
+    /// answers, so cleanup stays in flight while the test probes the guard.
+    async fn test_state_with_s3_and(
+        max_apps: u32,
+        s3: String,
+        caddy_admin_url: Option<String>,
+    ) -> (AppState, crate::testutil::TempDir) {
         let guard = crate::testutil::TempDir::new("noite-create-tests");
         let mut cfg = crate::config::config_for_tests();
         cfg.database_url = format!(
@@ -531,6 +570,9 @@ mod tests {
         cfg.s3_public_endpoint = s3;
         cfg.work_dir = guard.path().join("work").to_string_lossy().into_owned();
         cfg.max_apps_per_user = max_apps;
+        if let Some(url) = caddy_admin_url {
+            cfg.caddy_admin_url = url;
+        }
         let config = Arc::new(cfg);
         let pool = crate::db::connect(&config.database_url)
             .await
@@ -835,6 +877,61 @@ mod tests {
         assert_eq!(renamed.slug, "ps-new");
         drop(dir);
     }
+    /// The alpha.22 delete bug: the app row was gone but the slug's push
+    /// guard stayed held through the post-delete cleanup (edge push, provider
+    /// revoke), so create/rename onto the slug waited past the control plane's
+    /// 5 s and answered "operation aborted due to timeout". The row delete
+    /// must release the guard before cleanup starts.
+    #[tokio::test]
+    async fn delete_frees_the_slug_before_cleanup_finishes() {
+        // Accepts the edge push and never answers: the cleanup parks on it
+        // until reqwest's request timeout. The first accept is the signal
+        // that the row is gone and cleanup is in flight; the sockets stay
+        // open, since dropping one would reset the request and end the hang.
+        let admin = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled admin");
+        let admin_url = format!("http://{}", admin.local_addr().expect("admin addr"));
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let reached_tx = reached.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = admin.accept().await {
+                reached_tx.notify_waiters();
+                held.push(sock);
+            }
+        });
+        let s3 = spawn_s3_stub().await;
+        let (state, dir) = test_state_with_s3_and(10, s3, Some(admin_url)).await;
+        let app = create(&state, "Doomed", "doomed", Some("u1"), None)
+            .await
+            .expect("create");
+        let owned = state.clone();
+        let id = app.id.clone();
+        let deleting = tokio::spawn(async move { delete(&owned, &id).await });
+        // The edge push starts only after the row delete; from then on the
+        // slug must be usable even while that push is still parked.
+        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+            .await
+            .expect("the post-delete cleanup never reached the edge push");
+        let push = tokio::time::timeout(
+            Duration::from_millis(500),
+            state.git_sync.push_guard("doomed"),
+        )
+        .await;
+        assert!(
+            push.is_ok(),
+            "the deleted slug's push guard is still held while cleanup runs"
+        );
+        drop(push);
+        tokio::time::timeout(Duration::from_secs(30), deleting)
+            .await
+            .expect("delete finishes")
+            .expect("delete task")
+            .expect("delete ok");
+        drop(dir);
+    }
+
     /// S3 stub that parks the purge mid-flight: once armed, the first
     /// request is read, `entered` fires, and the response waits for
     /// `release`. Everything before arming — and every request after the
