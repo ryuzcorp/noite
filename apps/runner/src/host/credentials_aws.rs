@@ -33,7 +33,10 @@ impl AwsIam {
             tag: super::install_tag(&store.identity_endpoint, bucket, &store.region),
             endpoint: "https://iam.amazonaws.com".into(),
             store,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("reqwest client"),
         }
     }
 
@@ -43,7 +46,10 @@ impl AwsIam {
             tag: super::install_tag(&store.identity_endpoint, bucket, &store.region),
             endpoint,
             store,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("reqwest client"),
         }
     }
 

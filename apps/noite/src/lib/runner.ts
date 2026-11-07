@@ -241,6 +241,12 @@ const runnerToken = () => {
  * before a browser gives up — a 10s bound surfaced as a mystery hang. */
 const RUNNER_TIMEOUT_MS = 5000;
 
+/** Create, rename and delete bound themselves: a create clears a deleted
+ * slug's leftovers, a rename moves a whole S3 prefix, and a delete stops a
+ * fleet before purging. They still answer promptly (delete within 3 s) — the
+ * longer abort only covers those lifecycle moves on a slow store. */
+const LIFECYCLE_TIMEOUT_MS = 20_000;
+
 /** Log anything slower than this, with the path and the base URL: when the
  * deployed worker is the only thing we can observe, this is what attributes
  * an intermittent stall instead of guessing. */
@@ -318,13 +324,22 @@ let rpcId = 0;
 export const runnerRpc = async <T = unknown>(
   method: string,
   // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type -- params differ per method; the server parses per-method and rejects mismatches with InvalidParams.
-  params: Record<string, unknown>
+  params: Record<string, unknown>,
+  options?: { timeoutMs?: number }
 ): Promise<T> => {
   rpcId += 1;
 
   const payload = await runnerFetch<JsonRpcEnvelope<T>>("/rpc", {
     body: JSON.stringify({ id: rpcId, jsonrpc: "2.0", method, params }),
     method: "POST",
+    // Lifecycle mutations may move a whole S3 prefix (rename) or clear a
+    // deleted slug's leftovers (create); the runner bounds them itself, but
+    // the default 5 s abort would surface as "operation aborted due to
+    // timeout" while the runner is still working.
+    signal:
+      options?.timeoutMs === undefined
+        ? undefined
+        : AbortSignal.timeout(options.timeoutMs),
   });
 
   if (payload.error) {
@@ -447,14 +462,18 @@ export const runnerCreateApp = (body: {
   source?: RunnerCreateSource;
   userId: string;
 }) =>
-  runnerRpc<RunnerApp>("apps.create", {
-    name: body.name,
-    slug: body.slug,
-    // `source` is camelCase JSON (undefined keys never reach the wire), the
-    // rest of the params are snake_case.
-    source: body.source,
-    user_id: body.userId,
-  });
+  runnerRpc<RunnerApp>(
+    "apps.create",
+    {
+      name: body.name,
+      slug: body.slug,
+      // `source` is camelCase JSON (undefined keys never reach the wire), the
+      // rest of the params are snake_case.
+      source: body.source,
+      user_id: body.userId,
+    },
+    { timeoutMs: LIFECYCLE_TIMEOUT_MS }
+  );
 
 /** Retry the import an app was created from (A2): only meaningful when its
  * stored source is an import and it is not already running. */
@@ -476,12 +495,21 @@ export const runnerPatchApp = (id: string, body: { desiredState: string }) =>
  * store, a deploy holding the app): the runner answers within its 3 s bound
  * either way, and the app is gone from every listing from the start. */
 export const runnerDeleteApp = (id: string) =>
-  runnerRpc<{ deleting: boolean; ok: boolean }>("apps.delete", { id });
+  runnerRpc<{ deleting: boolean; ok: boolean }>(
+    "apps.delete",
+    { id },
+    { timeoutMs: LIFECYCLE_TIMEOUT_MS }
+  );
 
 export const runnerRenameApp = (
   id: string,
   body: { name?: string; slug?: string }
-) => runnerRpc<RunnerApp>("apps.rename", { id, ...body });
+) =>
+  runnerRpc<RunnerApp>(
+    "apps.rename",
+    { id, ...body },
+    { timeoutMs: LIFECYCLE_TIMEOUT_MS }
+  );
 
 export const runnerDeployLog = (id: string, deployId: string) =>
   runnerRpc<{ log: string }>("deploys.log", { deploy_id: deployId, id });

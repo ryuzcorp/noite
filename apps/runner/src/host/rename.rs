@@ -23,7 +23,7 @@ use crate::host::deploy::{self, Deploying};
 use crate::host::logs::LogState;
 use crate::host::source;
 use crate::host::supervisor::{self, ProcMap};
-use crate::host::{exec, s3};
+use crate::host::{exec, purge, s3};
 use crate::models::App;
 
 async fn move_dir(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> {
@@ -163,6 +163,21 @@ pub async fn rename_app(
     // after. Taken after the AppLock (ordering: AppLock → push_guard), in
     // lexical order so opposite renames cannot invert.
     let (_old_push, _new_push) = git_sync.push_guards(&app.slug, new_slug).await;
+    // The target slug has no row (the service checked that under CREATE_LOCK,
+    // which it still holds), so anything under its prefixes or work dirs is a
+    // deleted app's leftover: wipe it exactly as create does. Moving onto it
+    // would otherwise merge stale S3 keys into the new prefix and `move_dir`
+    // would refuse a non-empty target directory.
+    purge::purge_slug(
+        cfg,
+        procs,
+        logs,
+        git_sync,
+        new_slug,
+        supervisor::StopGrace::FOR_DELETE,
+    )
+    .await
+    .context("clear the target slug's leftovers")?;
     let renamed = rename_slugged(cfg, pool, procs, logs, &app, new_name, new_slug).await?;
     // The old generation ends here: its S3 prefix moved to the new slug, so
     // its seq marker must go too — otherwise a future slug reuse would skip

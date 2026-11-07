@@ -32,7 +32,10 @@ impl MinioAdmin {
             tag: super::install_tag(&store.identity_endpoint, bucket, &store.region),
             store,
             label: "rustfs",
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("reqwest client"),
         }
     }
 
@@ -42,7 +45,10 @@ impl MinioAdmin {
             tag: super::install_tag(&store.identity_endpoint, bucket, &store.region),
             store,
             label: "minio",
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("reqwest client"),
         }
     }
 
