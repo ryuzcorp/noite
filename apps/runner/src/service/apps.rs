@@ -71,6 +71,31 @@ pub async fn create(
     if name.is_empty() || !slug_ok(&slug) {
         return Err(ApiError::bad("invalid name/slug"));
     }
+    // The purge of a reused slug can outlast the control plane's lifecycle
+    // bound (a deleted app with a large D1/telemetry history), and a caller
+    // that aborts must not cancel the create halfway: the row would never
+    // land while the prefix was partly deleted. Run it as its own task; a
+    // dropped caller only drops the waiter, and the retry finds the row.
+    let state = state.clone();
+    let user_id = user_id.map(str::to_string);
+    let source = source.cloned();
+    super::detached::run(format!("create:{slug}"), async move {
+        let out = create_inner(&state, &name, &slug, user_id.as_deref(), source.as_ref()).await;
+        if let Err(e) = &out {
+            tracing::warn!(slug = %slug, error = %e, "app create failed");
+        }
+        out
+    })
+    .await
+}
+
+async fn create_inner(
+    state: &AppState,
+    name: &str,
+    slug: &str,
+    user_id: Option<&str>,
+    source: Option<&AppSource>,
+) -> Result<App, ApiError> {
     // A2/A3: refuse a bad import URL before anything is created — the async
     // task only ever runs a source this validated.
     let git_source = match source {
@@ -95,8 +120,8 @@ pub async fn create(
     // held across purge → init → insert (ordering: CREATE_LOCK → push_guard).
     // A push to a half-created slug either lands fully before the purge or
     // waits for the row.
-    let _push = state.git_sync.push_guard(&slug).await;
-    match db::get_app_by_slug(&state.pool, &slug).await {
+    let _push = state.git_sync.push_guard(slug).await;
+    match db::get_app_by_slug(&state.pool, slug).await {
         Ok(Some(_)) => return Err(ApiError::conflict("slug already taken")),
         Ok(None) => {}
         Err(e) => return Err(ApiError::internal(e.to_string())),
@@ -110,7 +135,7 @@ pub async fn create(
         &state.procs,
         &state.logs,
         &state.git_sync,
-        &slug,
+        slug,
         supervisor::StopGrace::NORMAL,
     )
     .await
@@ -138,7 +163,7 @@ pub async fn create(
     }
     // A0: both bare mirrors exist, HEAD at `main`, before the app row does — a
     // failure here leaves no half-created app behind.
-    if let Err(e) = git_http::init_repos(&state.config, &slug).await {
+    if let Err(e) = git_http::init_repos(&state.config, slug).await {
         return Err(ApiError::internal(format!(
             "failed to initialize the git repositories: {e:#}"
         )));
@@ -166,8 +191,8 @@ pub async fn create(
         db::NewApp {
             internal: ports.internal,
             listen: ports.listen,
-            name: &name,
-            slug: &slug,
+            name,
+            slug,
             subdomain: &subdomain,
             user_id: owner,
         },
@@ -864,6 +889,41 @@ mod tests {
             .expect("create task")
             .expect("create ok");
         assert_eq!(app.slug, "guarded");
+        drop(dir);
+    }
+
+    /// The control plane aborting a create only drops the waiter: the row
+    /// still lands and the import is spawned, so a retry sees the app
+    /// instead of re-purging a half-deleted prefix forever. Fails without
+    /// the detached task (the create is canceled on the guard wait).
+    #[tokio::test]
+    async fn dropped_create_caller_does_not_cancel_the_create() {
+        let (state, dir) = test_state(10).await;
+        let guard = state.git_sync.push_guard("slow-create").await;
+        let done = crate::service::detached::finished("create:slow-create");
+        let owned = state.clone();
+        let mut caller =
+            tokio::spawn(
+                async move { create(&owned, "Slow", "slow-create", Some("u1"), None).await },
+            );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut caller)
+                .await
+                .is_err(),
+            "the create should be waiting on the slug guard"
+        );
+        caller.abort();
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(30), done.notified())
+            .await
+            .expect("create canceled with its caller: the row never landed");
+        assert!(
+            db::get_app_by_slug(&state.pool, "slow-create")
+                .await
+                .expect("slug lookup")
+                .is_some(),
+            "the created app is missing"
+        );
         drop(dir);
     }
 

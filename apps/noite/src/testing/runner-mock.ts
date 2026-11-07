@@ -40,6 +40,17 @@ interface RpcCall {
   params: Record<string, string>;
 }
 
+/** A JSON-RPC error the runner would answer with (e.g. a slug conflict). */
+class RpcFailure {
+  readonly code: number;
+  readonly message: string;
+
+  constructor(code: number, message: string) {
+    this.code = code;
+    this.message = message;
+  }
+}
+
 export const installRunnerMock = (apps: RunnerApp[]): RunnerMock => {
   controlEnv.RUNNER_TOKEN = "test-token";
   controlEnv.RUNNER_URL = "http://runner.test";
@@ -69,6 +80,10 @@ export const installRunnerMock = (apps: RunnerApp[]): RunnerMock => {
       }
 
       case "apps.create": {
+        if (mock.apps.some((app) => app.slug === call.params.slug)) {
+          return new RpcFailure(409, "slug already taken");
+        }
+
         const created = makeApp({
           id: `app-${mock.apps.length + 1}`,
           name: String(call.params.name ?? "Created"),
@@ -105,10 +120,23 @@ export const installRunnerMock = (apps: RunnerApp[]): RunnerMock => {
     mock.requests.push(body.params);
     const result = answer(body);
 
-    const envelope =
-      result === null
-        ? { error: { code: -32_004, message: "app not found" }, id: body.id }
-        : { id: body.id, jsonrpc: "2.0", result };
+    let envelope:
+      | { error: { code: number; message: string }; id: number }
+      | { id: number; jsonrpc: string; result: unknown };
+
+    if (result instanceof RpcFailure) {
+      envelope = {
+        error: { code: result.code, message: result.message },
+        id: body.id,
+      };
+    } else if (result === null) {
+      envelope = {
+        error: { code: -32_004, message: "app not found" },
+        id: body.id,
+      };
+    } else {
+      envelope = { id: body.id, jsonrpc: "2.0", result };
+    }
 
     return Response.json(envelope);
   }) as unknown as typeof fetch;

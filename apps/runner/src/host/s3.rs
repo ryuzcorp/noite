@@ -846,57 +846,84 @@ async fn list_once(
     prefix: &str,
     delimiter: Option<&str>,
 ) -> Result<(Vec<S3Object>, Vec<String>), S3Fail> {
-    let (handle, creds) = s3_bucket(cfg, bucket_name).map_err(S3Fail::Final)?;
-    super::stats::count_s3("list", 0, 0);
     let mut objects = Vec::new();
     let mut prefixes = Vec::new();
     let mut continuation: Option<String> = None;
     loop {
-        let mut action = handle.list_objects_v2(Some(&creds));
-        action.with_prefix(prefix.to_string());
-        if let Some(d) = delimiter {
-            action.with_delimiter(d.to_string());
-        }
-        if let Some(t) = continuation.take() {
-            action.with_continuation_token(t);
-        }
-        let url = action.sign(Duration::from_secs(300));
-        let resp = match http_client()
-            .get(url)
-            .timeout(Duration::from_secs(20))
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                return Err(S3Fail::Retryable(anyhow::anyhow!(
-                    "s3 list {prefix} transport: {e:#}"
-                )));
-            }
-        };
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = bounded_text_or_empty(resp, Duration::from_secs(20)).await;
-            return Err(classify_status("list", prefix, status, &body));
-        }
-        let text = bounded_text(resp, Duration::from_secs(20), "s3 LIST body")
-            .await
-            .map_err(S3Fail::Final)?;
-        let parsed = rusty_s3::actions::ListObjectsV2::parse_response(&text)
-            .map_err(|e| S3Fail::Final(anyhow::anyhow!("s3 LIST XML parse: {e:#}")))?;
-        objects.extend(parsed.contents.into_iter().map(|o| S3Object {
-            key: o.key,
-            last_modified: o.last_modified,
-            size: o.size,
-            etag: o.etag,
-        }));
-        prefixes.extend(parsed.common_prefixes.into_iter().map(|p| p.prefix));
-        continuation = parsed.next_continuation_token;
+        let (page_objects, page_prefixes, next) =
+            list_page(cfg, bucket_name, prefix, delimiter, continuation.take()).await?;
+        objects.extend(page_objects);
+        prefixes.extend(page_prefixes);
+        continuation = next;
         if continuation.is_none() {
             break;
         }
     }
     Ok((objects, prefixes))
+}
+
+/// One `ListObjectsV2` page (up to the store's page size, 1000 by default),
+/// plus the token for the next one. Split out so a recursive delete can
+/// stream: list a page, delete it, repeat — a caller canceled mid-purge
+/// (create's 14 s bound) must have made progress, and a retry must not
+/// spend its whole budget re-listing a huge prefix.
+async fn list_page(
+    cfg: &Config,
+    bucket_name: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    continuation: Option<String>,
+) -> Result<(Vec<S3Object>, Vec<String>, Option<String>), S3Fail> {
+    let (handle, creds) = s3_bucket(cfg, bucket_name).map_err(S3Fail::Final)?;
+    super::stats::count_s3("list", 0, 0);
+    let mut action = handle.list_objects_v2(Some(&creds));
+    action.with_prefix(prefix.to_string());
+    if let Some(d) = delimiter {
+        action.with_delimiter(d.to_string());
+    }
+    if let Some(t) = continuation {
+        action.with_continuation_token(t);
+    }
+    let url = action.sign(Duration::from_secs(300));
+    let resp = match http_client()
+        .get(url)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return Err(S3Fail::Retryable(anyhow::anyhow!(
+                "s3 list {prefix} transport: {e:#}"
+            )));
+        }
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = bounded_text_or_empty(resp, Duration::from_secs(20)).await;
+        return Err(classify_status("list", prefix, status, &body));
+    }
+    let text = bounded_text(resp, Duration::from_secs(20), "s3 LIST body")
+        .await
+        .map_err(S3Fail::Final)?;
+    let parsed = rusty_s3::actions::ListObjectsV2::parse_response(&text)
+        .map_err(|e| S3Fail::Final(anyhow::anyhow!("s3 LIST XML parse: {e:#}")))?;
+    let objects = parsed
+        .contents
+        .into_iter()
+        .map(|o| S3Object {
+            key: o.key,
+            last_modified: o.last_modified,
+            size: o.size,
+            etag: o.etag,
+        })
+        .collect();
+    let prefixes = parsed
+        .common_prefixes
+        .into_iter()
+        .map(|p| p.prefix)
+        .collect();
+    Ok((objects, prefixes, parsed.next_continuation_token))
 }
 
 /// The aws CLI's `list-objects-v2 --output json` shape (`Contents[].Key`,
@@ -1025,9 +1052,20 @@ pub async fn s3_rm_dir_except(
 /// Recursive delete of one prefix (app purge, deleted-ref cleanup). Empty
 /// prefixes are a no-op, so retries after a partial delete stay quiet.
 pub async fn s3_rm_prefix(cfg: &Config, bucket: &str, prefix: &str) -> anyhow::Result<()> {
-    let (objects, _) = s3_list_raw(cfg, bucket, prefix, None).await?;
-    let keys: Vec<String> = objects.into_iter().map(|o| o.key).collect();
-    s3_delete_keys(cfg, bucket, &keys).await
+    // Delete page by page, never listing the whole prefix first: a purge cut
+    // by the caller's bound (or a huge telemetry/D1 history) must make
+    // progress, and a retry must not re-walk everything before deleting.
+    loop {
+        let (objects, _, _) = with_s3_retry("list", prefix, || {
+            list_page(cfg, bucket, prefix, None, None)
+        })
+        .await?;
+        if objects.is_empty() {
+            return Ok(());
+        }
+        let keys: Vec<String> = objects.into_iter().map(|o| o.key).collect();
+        s3_delete_keys(cfg, bucket, &keys).await?;
+    }
 }
 
 /// Object copy for renames: download to a temp file, upload under the new

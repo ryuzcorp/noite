@@ -9,7 +9,7 @@ import { afterAll, beforeAll, beforeEach, expect, mock, test } from "bun:test";
 import * as Effect from "effect/Effect";
 
 import { createTestD1 } from "../../testing/d1";
-import { installRunnerMock } from "../../testing/runner-mock";
+import { installRunnerMock, makeApp } from "../../testing/runner-mock";
 import type { RunnerMock } from "../../testing/runner-mock";
 import { ensureDbPromise, setD1Binding } from "../db";
 import { createAppForUser } from "./apps.server";
@@ -83,4 +83,34 @@ test("an unknown template id fails before any runner call", async () => {
     })
   ).rejects.toThrow("Unknown template: nope");
   expect(runner.calls).toEqual([]);
+});
+
+test("a retry recovers an app whose create outlived the call bound", async () => {
+  runner.apps.push(
+    makeApp({ id: "app-9", name: "Taken", slug: "taken", userId: "u-1" })
+  );
+
+  const app = await createAppForUser({
+    account: { id: "u-1", name: "One" },
+    name: "Taken",
+    slug: "taken",
+  });
+
+  expect(app.id).toBe("app-9");
+  expect(runner.calls).toEqual(["apps.create", "apps.get_by_slug"]);
+});
+
+test("a retry on another account's slug still fails", async () => {
+  runner.apps.push(
+    makeApp({ id: "app-9", name: "Taken", slug: "taken", userId: "u-2" })
+  );
+
+  await expect(
+    createAppForUser({
+      account: { id: "u-1", name: "One" },
+      name: "Taken",
+      slug: "taken",
+    })
+  ).rejects.toThrow(/slug already taken/u);
+  expect(runner.calls).toEqual(["apps.create", "apps.get_by_slug"]);
 });
