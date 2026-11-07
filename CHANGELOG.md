@@ -10,6 +10,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-alpha.26] - 2026-11-07
+
+### Operator action required
+
+- Apps with a `noite.ci.yaml` now run it instead of the built-in install/build. Standard installs need nothing: the runner already has the Docker socket and pulls the default image on first use. CI containers consume the host's memory and CPU like the built-in build, so a 2 GB box still cannot build the 1.3 GiB template; use a bigger box or a prebuilt dist.
+- Scheduled apps no longer auto-sleep without an explicit override: if an install relied on idle-sleep for cron/queue workers, set Sleep after per app (Settings → Limits) or leave them awake.
+- Small hosts derive a shorter threshold (`1` h at ≤ 2 GiB, `6` h at ≤ 4 GiB): set `RUNNER_SLEEP_AFTER_H` explicitly to keep the previous `24` h behavior.
+
+### Added
+
+- Deploys now prove the new generation before serving it: after staging, the deploy asks the staged generation for `HEAD <path>` (`RUNNER_DEPLOY_PROBE_PATH`, default `/`) through `celld invoke` — the staged pins plus the app as `--target`, like the staged migrations — before the one `celld activate` moves the pointer, on every deploy (a Void redeploy after its staged migrate, any other deploy right after its stage). An answered status below 500 activates; a 5xx or a missing answer fails the deploy with nothing activated, so the previous generation keeps serving until the new one is proven live. `RUNNER_DEPLOY_PROBE_TIMEOUT_S` (default 30) bounds the probe; empty path disables it (a celld without `invoke`).
+- Noite CI: a repo-root `noite.ci.yaml` (a light GitHub-Actions subset: `jobs`, `steps`, `run`, `env`, `working-directory`, `timeout-minutes`, optional `image`) runs in a container per job instead of the built-in install/build. The workflow's `dist/` is the deploy root; a failure fails the deploy before release/activate, so the live version keeps serving. Containers are cap-dropped, no-new-privileges, memory/CPU/pids-capped, no host binds, no Docker socket inside, and the checkout is copied in/out with `docker cp`; `HOME` and package caches persist in a per-app named volume. Images are an exact allowlist (`RUNNER_CI_IMAGE`, `RUNNER_CI_IMAGES`), network `bridge` or `none`, kill switch `RUNNER_CI=0`. Bounded: 64 KiB config, 32 jobs/steps, 32 KiB scripts, 120 min/step.
+
+### Changed
+
+- Scale-to-zero policy: Settings → Limits gains a per-app Sleep after threshold in seconds (`0` = never, valid range `60`–`2592000`); empty inherits the install default. Preview environments use their owning app's override, re-checked under the transition lock.
+- `RUNNER_SLEEP_AFTER_H` unset now derives from detected memory (≤ 2 GiB: `1` h, ≤ 4 GiB: `6` h, else `24` h); an explicit value (including `0` = never) still wins.
+- Apps running scheduled work (a non-empty `triggers.crons` or `queues.consumers` in the last deployed Wrangler config) no longer auto-sleep unless the owner set an explicit Sleep after override. Memory-pressure parking still parks them; the next request wakes them.
+- A failed wake now records a tenant-visible `wake failed` fleet event and bumps the `wake_failed` sleep counter in `GET /v1/admin/stats`.
+
 ## [0.1.0-alpha.25] - 2026-11-07
 
 ### Operator action required
