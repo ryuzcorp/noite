@@ -117,7 +117,7 @@ services:
       RUNNER_FLEET_LEASE_TTL_MS: ${RUNNER_FLEET_LEASE_TTL_MS:-60000}
       RUNNER_FLEET_LOG: ${RUNNER_FLEET_LOG:-error,celld=warn}
       RUNNER_BUILD_MAX_MB: ${RUNNER_BUILD_MAX_MB:-2048}
-      RUNNER_BUILD_TIMEOUT_S: ${RUNNER_BUILD_TIMEOUT_S:-300}
+      RUNNER_BUILD_TIMEOUT_S: ${RUNNER_BUILD_TIMEOUT_S:-1800}
       # Resource knobs (SPEC: Limits, Observability).
       RUNNER_BUILD_CACHE_MB: ${RUNNER_BUILD_CACHE_MB:-1024}
       RUNNER_FLEET_ASSET_CACHE_MB: ${RUNNER_FLEET_ASSET_CACHE_MB:-64}
@@ -226,6 +226,14 @@ services:
       # periodic collect bounds it (measured 752 MB anonymous after 4 days).
       RUSTFS_ALLOCATOR_RECLAIM_ENABLED: "true"
       RUSTFS_ALLOCATOR_RECLAIM_FORCE: "true"
+      # A 2 GB box builds a tenant app while serving; keep the background
+      # scanner and healer out of the build's CPU and disk. Slowest scan,
+      # once a day, one set/disk scan and one heal at a time.
+      RUSTFS_SCANNER_SPEED: "slowest"
+      RUSTFS_SCANNER_CYCLE: "86400"
+      RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS: "1"
+      RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS: "1"
+      RUSTFS_HEAL_MAX_CONCURRENT_HEALS: "1"
       RUSTFS_OBS_LOGGER_LEVEL: error
     # Loopback only: the S3 API is for this host's tools (doctor, backups),
     # not the network.

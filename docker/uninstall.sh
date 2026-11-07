@@ -172,6 +172,26 @@ remove_data() {
   fi
 }
 
+# The installer's swapfile; a pre-existing swap (`/swapfile`, a partition) is
+# never touched.
+remove_swap() {
+  step "Removing the swapfile"
+  if [[ -L /noite.swap ]]; then
+    rm -f /noite.swap
+    info "removed a /noite.swap link (not following it)"
+    return 0
+  fi
+  if [[ ! -f /noite.swap ]]; then
+    info "not present"
+    return 0
+  fi
+  swapoff /noite.swap 2>/dev/null || true
+  rm -f /noite.swap
+  sed -i '\#^/noite\.swap[[:space:]]\+none[[:space:]]\+swap[[:space:]]\+sw[[:space:]]\+0[[:space:]]\+0$#d' /etc/fstab
+  rm -f /etc/sysctl.d/99-noite-swap.conf
+  info "removed /noite.swap"
+}
+
 summary() {
   if [[ "$NOITE_KEEP_DATA" == "1" ]]; then
     cat <<EOF
@@ -203,6 +223,7 @@ main() {
   stop_stack
   if [[ "$NOITE_KEEP_DATA" != "1" ]]; then
     remove_data
+    remove_swap
   fi
   summary
 }

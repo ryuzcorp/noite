@@ -205,8 +205,18 @@ fn build_memory_default_mb(total_bytes: Option<u64>, concurrency: u32) -> u64 {
     let Some(total) = total_bytes else {
         return 1024;
     };
+    let total_mb = total / (1024 * 1024);
     let builds = u64::from(concurrency.max(1));
-    (total / 2 / builds / (1024 * 1024)).clamp(512, 4096)
+    // Leave a real resident floor: the runner, Caddy, the bundled RustFS
+    // (measured ~525 MB after a restart) and the fleets live outside the
+    // build's leaf. Half the box ignored them: on a 2 GB install the build
+    // could hold ~1 GiB while RustFS and the fleets already held ~1 GB, and
+    // the box thrashed until SSH stopped answering. A quarter (at least
+    // 1 GiB) stays resident; a 2 GB box then gives one build ~933 MiB, which
+    // fits the measured ~610-650 MB Void debug build, while a 1.3 GiB
+    // template build still dies in its leaf with the named budget.
+    let reserve = (total_mb / 4).max(1024);
+    (total_mb.saturating_sub(reserve) / builds).clamp(512, 4096)
 }
 
 /// Parse one numeric env var: unset or blank means the default (compose
@@ -1046,8 +1056,9 @@ pub struct Config {
     /// Tenant build/release memory cap in MiB (`RUNNER_BUILD_MEMORY_MB`),
     /// enforced by a dedicated cgroup leaf so a build that outgrows the box
     /// dies alone instead of pushing fleets into the kernel OOM-killer.
-    /// Derived when unset: half the detected memory split across the build
-    /// slots, clamped 512..4096. `0` leaves builds uncapped (old behavior).
+    /// Derived when unset: the detected memory minus a 1.5 GiB resident
+    /// floor (a quarter of bigger boxes), split across the build slots,
+    /// clamped 512..4096. `0` leaves builds uncapped (old behavior).
     pub build_memory_mb: u64,
     /// Container memory percentage at which the pressure sweep parks idle
     /// apps (`RUNNER_PRESSURE_PCT`, 85; 0 disables). The sweep is the last
@@ -1447,7 +1458,7 @@ impl Config {
             ),
             build_timeout_s: env_num(
                 "RUNNER_BUILD_TIMEOUT_S",
-                300,
+                1800,
                 "a non-negative integer",
                 &mut env_problems,
             ),
@@ -1896,7 +1907,7 @@ pub(crate) fn config_for_tests() -> Config {
         stop_budget_ms: 25000,
         build_max_mb: 2048,
         build_cache_mb: 512,
-        build_timeout_s: 300,
+        build_timeout_s: 1800,
         telemetry_retention_days: 30,
         otel_flush_ms: 30000,
         duckdb_memory_mb: 256,
@@ -2296,7 +2307,7 @@ mod tests {
             assert_eq!(cfg.stop_budget_ms, 25000);
             assert_eq!(cfg.build_max_mb, 2048);
             assert_eq!(cfg.build_cache_mb, 1024);
-            assert_eq!(cfg.build_timeout_s, 300);
+            assert_eq!(cfg.build_timeout_s, 1800);
             assert_eq!(cfg.telemetry_retention_days, 30);
             assert_eq!(cfg.otel_flush_ms, 30000);
             // Derived from the machine the test runs on, so assert the band.
@@ -2417,14 +2428,15 @@ mod tests {
         assert_eq!(fleet_local_cache_default_mb(Some(2 * gb)), 128);
         assert_eq!(control_memory_default_mb(Some(2 * gb)), 512);
         assert_eq!(container_shed_default_mb(Some(2 * gb)), 1536);
-        // Half the box for a build, clamped; a 2 GB box gives the build
-        // ~978 MiB so a 1.3 GiB Vite peak dies in its leaf, not the host.
+        // A 2 GB box leaves 1 GiB resident (RustFS, runner, Caddy, fleets)
+        // and gives one build 1024 MiB: enough for the measured ~610-650 MB
+        // Void debug build, while a 1.3 GiB template build dies in its leaf.
         assert_eq!(build_memory_default_mb(Some(2 * gb), 1), 1024);
         assert_eq!(build_memory_default_mb(Some(256 * 1024 * 1024), 1), 512);
         assert_eq!(build_memory_default_mb(Some(256 * gb), 2), 4096);
         assert_eq!(build_memory_default_mb(None, 1), 1024);
-        // Two concurrent builds split the half; four cores give two slots.
-        assert_eq!(build_memory_default_mb(Some(4 * gb), 2), 1024);
+        // A 4 GB box leaves 1 GiB and splits the rest across two slots.
+        assert_eq!(build_memory_default_mb(Some(4 * gb), 2), 1536);
         // Clamps keep a tiny and a huge box inside what one process may hold.
         assert_eq!(fleet_local_cache_default_mb(Some(256 * 1024 * 1024)), 64);
         assert_eq!(fleet_local_cache_default_mb(Some(256 * gb)), 512);

@@ -12,6 +12,11 @@
 # image are refreshed to the channel's newest release, .env (domain, secrets)
 # is kept, and any required setting it lacks gets the first-install default.
 #
+# On a host under 4 GB the installer also creates a 1-2 GB /noite.swap
+# swapfile (swappiness 10) as a safety net for a transient peak: the build
+# keeps zero swap, so a build that outgrows its budget still dies in its own
+# cgroup instead of thrashing this disk. Skip it with NOITE_SWAP=0.
+#
 # Environment (all optional; `curl … | NOITE_DOMAIN=example.com bash -s install`):
 #   NOITE_DOMAIN       base domain; app./api./git./*. must point at this host
 #                      (default: asked, <public-ip>.sslip.io on Enter or without a terminal)
@@ -31,6 +36,8 @@
 #   NOITE_DIR          install directory (default: /opt/noite)
 #   NOITE_YES=1        skip the upgrade confirmation (`bash -s install --yes`
 #                      does the same; NOITE_CONFIRM=1 is accepted too)
+#   NOITE_SWAP=0       do not create the small-host swapfile (default: on for
+#                      hosts under 4 GB with no swap)
 #
 # An upgrade whose image differs from the running container restarts the
 # runner and every tenant fleet: the installer says so and asks once (when it
@@ -47,6 +54,7 @@ NOITE_DIR="${NOITE_DIR:-/opt/noite}"
 NOITE_VERSION="${NOITE_VERSION:-alpha}"
 NOITE_IMAGE_REPO="ghcr.io/ryuzcorp/noite"
 READY_TIMEOUT_S=600
+NOITE_SWAP="${NOITE_SWAP:-1}"
 MIN_MEM_MB=1900
 # 1 = skip the upgrade confirmation: --yes / -y, NOITE_YES=1, or
 # NOITE_CONFIRM=1 (the flag uninstall.sh uses for its own prompt).
@@ -109,6 +117,71 @@ install_docker() {
   docker compose version >/dev/null 2>&1 || die "the Docker Compose plugin is missing: apt-get install docker-compose-plugin"
   docker info >/dev/null 2>&1 || die "the Docker daemon is not running: systemctl start docker"
   info "$(docker --version)"
+}
+
+# A host under 4 GB builds while serving; one transient peak (a build step or
+# a RustFS burst) can OOM-kill RustFS or Caddy and take the control UI with it.
+# A small swapfile is that safety net, not a build budget: the build cgroups
+# keep memory.swap.max=0, so a build that outgrows RUNNER_BUILD_MEMORY_MB
+# still dies alone instead of swapping the disk to death. Idempotent; a host
+# where swapon is not permitted (a container, OpenVZ) warns and continues.
+ensure_swap() {
+  step "Checking swap"
+  if [[ "$NOITE_SWAP" != "1" ]]; then
+    info "NOITE_SWAP=0: leaving the host's swap alone"
+    return 0
+  fi
+  if [[ -f /.dockerenv || -f /run/.containerenv ]]; then
+    info "inside a container: swap belongs to the host"
+    return 0
+  fi
+  local mem_mb
+  mem_mb=$(awk '/MemTotal/ { print int($2 / 1024) }' /proc/meminfo)
+  if ((mem_mb >= 4096)); then
+    info "${mem_mb} MB of memory; swap is optional"
+    return 0
+  fi
+  if swapon --show --noheadings 2>/dev/null | grep -q .; then
+    info "swap already active"
+    return 0
+  fi
+  local size_mb=$((mem_mb / 2))
+  ((size_mb < 1024)) && size_mb=1024
+  ((size_mb > 2048)) && size_mb=2048
+  local avail_kb
+  avail_kb=$(df -Pk / | awk 'NR == 2 { print $4 }')
+  if ((avail_kb < (size_mb + 3072) * 1024)); then
+    warn "skipping ${size_mb} MB swap: $((avail_kb / 1024)) MB free on /, ${size_mb} MB plus 3 GB headroom needed"
+    return 0
+  fi
+  if [[ -L /noite.swap ]]; then
+    die "refusing to follow a symlink at /noite.swap"
+  fi
+  if [[ ! -f /noite.swap ]]; then
+    if ! fallocate -l "${size_mb}M" /noite.swap 2>/dev/null; then
+      rm -f /noite.swap
+      if ! dd if=/dev/zero of=/noite.swap bs=1M count="$size_mb" status=none; then
+        warn "could not create /noite.swap; continuing without swap"
+        rm -f /noite.swap
+        return 0
+      fi
+    fi
+  fi
+  chmod 600 /noite.swap
+  if ! mkswap /noite.swap >/dev/null 2>&1; then
+    warn "mkswap /noite.swap failed; continuing without swap"
+    return 0
+  fi
+  if ! swapon /noite.swap 2>/dev/null; then
+    warn "swapon is not permitted on this host (OpenVZ or an unusual filesystem); continuing without swap"
+    rm -f /noite.swap
+    return 0
+  fi
+  grep -qE '^[[:space:]]*/noite\.swap[[:space:]]' /etc/fstab ||
+    echo '/noite.swap none swap sw 0 0' >>/etc/fstab
+  printf 'vm.swappiness=10\n' >/etc/sysctl.d/99-noite-swap.conf
+  sysctl -q -p /etc/sysctl.d/99-noite-swap.conf 2>/dev/null || true
+  info "${size_mb} MB swapfile at /noite.swap (swappiness 10)"
 }
 
 compose() {
@@ -494,6 +567,7 @@ main() {
   parse_args "$@"
   check_system
   install_docker
+  ensure_swap
   check_ports
   write_config
   open_firewall
