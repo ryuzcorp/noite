@@ -9,4 +9,9 @@ export type LimitDefaults = { clientRpm: number, appRpm: number, memoryMb: numbe
  * `Some` ceiling in `multi` (a tenant can only lower its cap);
  * `None` in `single`, where the operator is the only admin.
  */
-memoryMaxMb: number | null, };
+memoryMaxMb: number | null, 
+/**
+ * Platform idle-sleep threshold in seconds (`RUNNER_SLEEP_AFTER_H`,
+ * derived from detected memory when unset).
+ */
+defaultSleepAfterS: number, };

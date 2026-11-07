@@ -134,6 +134,20 @@ fn duckdb_memory_default_mb(total_bytes: Option<u64>) -> u64 {
     (total / 10 / (1024 * 1024)).clamp(128, 1024)
 }
 
+/// Scale-to-zero's derived idle threshold in hours: a small box cannot afford
+/// a day-idle fleet sitting resident, so <= 2 GiB sleeps after 1 h and
+/// <= 4 GiB after 6 h; bigger hosts (or unreadable memory) keep 24 h. Only
+/// the unset var derives — an explicit `RUNNER_SLEEP_AFTER_H` (including 0,
+/// which disables) always wins.
+fn sleep_after_default_h(total_bytes: Option<u64>) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    match total_bytes {
+        Some(total) if total <= 2 * GIB => 1,
+        Some(total) if total <= 4 * GIB => 6,
+        _ => 24,
+    }
+}
+
 /// Telemetry DuckDB's derived worker count: the cores this container may
 /// use, capped at 4. A big host does not need a 32-thread scan for an
 /// hourly aggregation, and the memory cap (not the thread count) is what
@@ -1018,7 +1032,8 @@ pub struct Config {
     /// so this only covers a missed reload — 300 keeps the fleet quiet.
     pub fleet_deploy_poll_s: u64,
     /// Scale to zero: park an app after this many hours without a request
-    /// (`RUNNER_SLEEP_AFTER_H`, 24; 0 disables). SPEC, Scale to zero.
+    /// (`RUNNER_SLEEP_AFTER_H`; `0` disables). Unset derives from detected
+    /// memory (<= 2 GiB: 1 h, <= 4 GiB: 6 h, else 24 h). SPEC, Scale to zero.
     pub sleep_after_h: u64,
     /// How often the sleep sweep runs (`RUNNER_SLEEP_SWEEP_S`, 3600).
     pub sleep_sweep_s: u64,
@@ -1240,6 +1255,23 @@ impl Config {
             &mut env_problems,
         );
         let build_memory_default = build_memory_default_mb(total_memory, build_concurrency);
+        // An explicit `RUNNER_SLEEP_AFTER_H` (including 0 = never) always
+        // wins; only an unset/blank var derives from detected memory, so a
+        // small host sleeps sooner without the operator sizing anything.
+        let sleep_default_h = sleep_after_default_h(total_memory);
+        let sleep_after_h: u64 = if env::var("RUNNER_SLEEP_AFTER_H")
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true)
+        {
+            sleep_default_h
+        } else {
+            env_num(
+                "RUNNER_SLEEP_AFTER_H",
+                sleep_default_h,
+                "a non-negative integer",
+                &mut env_problems,
+            )
+        };
         let cfg = Self {
             bind: env_or(&["RUNNER_BIND"], "0.0.0.0:8080"),
             runner_token,
@@ -1353,12 +1385,7 @@ impl Config {
                 "a non-negative integer",
                 &mut env_problems,
             ),
-            sleep_after_h: env_num(
-                "RUNNER_SLEEP_AFTER_H",
-                24,
-                "a non-negative integer",
-                &mut env_problems,
-            ),
+            sleep_after_h,
             sleep_sweep_s: env_num(
                 "RUNNER_SLEEP_SWEEP_S",
                 3600,
@@ -2290,7 +2317,11 @@ mod tests {
             assert_eq!(cfg.fleet_idle_evict_s, 120);
             assert_eq!(cfg.fleet_lease_ttl_ms, 60_000);
             assert_eq!(cfg.fleet_deploy_poll_s, 300);
-            assert_eq!(cfg.sleep_after_h, 24);
+            // Derived from detected memory, like the other machine-sized knobs.
+            assert_eq!(
+                cfg.sleep_after_h,
+                sleep_after_default_h(crate::host::memory::total_bytes())
+            );
             assert_eq!(cfg.sleep_sweep_s, 3600);
             assert_eq!(cfg.wake_timeout_s, 120);
             assert_eq!(cfg.fleet_asset_cache_mb, 64);
@@ -2388,6 +2419,33 @@ mod tests {
         assert_eq!(duckdb_threads_default(2), 2);
         assert_eq!(duckdb_threads_default(4), 4);
         assert_eq!(duckdb_threads_default(32), 4);
+    }
+
+    #[test]
+    fn sleep_default_derives_from_detected_memory() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(sleep_after_default_h(Some(2 * GIB)), 1);
+        assert_eq!(sleep_after_default_h(Some(GIB)), 1);
+        assert_eq!(sleep_after_default_h(Some(3 * GIB)), 6);
+        assert_eq!(sleep_after_default_h(Some(4 * GIB)), 6);
+        assert_eq!(sleep_after_default_h(Some(8 * GIB)), 24);
+        assert_eq!(sleep_after_default_h(None), 24);
+    }
+
+    #[test]
+    fn sleep_after_h_explicit_zero_still_disables() {
+        // An explicit `0` disables even on a small host whose derived
+        // default would sleep after an hour.
+        with_env(&[("RUNNER_SLEEP_AFTER_H", "0")], || {
+            let cfg = Config::from_env().expect("explicit zero must boot");
+            assert!(cfg.env_problems.is_empty());
+            assert_eq!(cfg.sleep_after_h, 0);
+        });
+        with_env(&[("RUNNER_SLEEP_AFTER_H", "48")], || {
+            let cfg = Config::from_env().expect("explicit value must boot");
+            assert!(cfg.env_problems.is_empty());
+            assert_eq!(cfg.sleep_after_h, 48);
+        });
     }
 
     #[test]

@@ -313,6 +313,13 @@ pub async fn wake(State(state): State<AppState>, headers: HeaderMap) -> axum::re
             Ok(()) => StatusCode::OK.into_response(),
             Err(e) => {
                 tracing::warn!(slug = %route.app_slug, label = %route.label, error = %e, "env wake failed");
+                record_wake_failed(
+                    &state.pool,
+                    &route.app_id,
+                    &format!("{}.{}", route.app_slug, route.label),
+                    &e,
+                )
+                .await;
                 page(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Unavailable",
@@ -336,6 +343,7 @@ pub async fn wake(State(state): State<AppState>, headers: HeaderMap) -> axum::re
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => {
             tracing::warn!(slug = %app.slug, error = %e, "wake failed");
+            record_wake_failed(&state.pool, &app.id, &app.slug, &e).await;
             page(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Unavailable",
@@ -348,6 +356,32 @@ pub async fn wake(State(state): State<AppState>, headers: HeaderMap) -> axum::re
             .into_response()
         }
     }
+}
+
+/// Tenant-visible reason for a failed wake: the app event the UI shows next
+/// to the 503 the held request answered. Best-effort — a lost event must
+/// not change the response.
+async fn record_wake_failed(
+    pool: &sqlx::SqlitePool,
+    app_id: &str,
+    fleet: &str,
+    error: &anyhow::Error,
+) {
+    crate::host::stats::record_wake_failed();
+    let detail = format!("a held request could not wake {fleet}: {error:#}");
+    let _ = crate::db::insert_app_event(
+        pool,
+        &crate::models::new_id(),
+        app_id,
+        "fleet",
+        "wake failed",
+        &detail,
+        "⚠️",
+        "{}",
+        "",
+        &crate::models::now_iso(),
+    )
+    .await;
 }
 
 pub async fn edge_fallback(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {

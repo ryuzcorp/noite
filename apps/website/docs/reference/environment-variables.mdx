@@ -114,11 +114,10 @@ These are install-level variables (Compose, the image environment). Per-app valu
 
 | Var | Default | Effect | Owner |
 | --- | --- | --- | --- |
-| `RUNNER_SLEEP_AFTER_H` | `24` | Park apps idle this long; `0` = never | runner-owned |
+| `RUNNER_SLEEP_AFTER_H` | detected memory: `1` (≤ 2 GiB), `6` (≤ 4 GiB), else `24` | Park apps idle this long; `0` = never (no per-app override re-enables it) | runner-owned |
 | `RUNNER_SLEEP_SWEEP_S` | `3600` | Sleep sweep cadence | runner-owned |
 | `RUNNER_WAKE_TIMEOUT_S` | `120` | Longest a held request waits for a woken fleet; failed wake answers `503` | runner-owned |
 | `RUNNER_WAKE_CONCURRENCY` | `4` | Apps allowed to cold-start at once for requests; later wakes queue inside `RUNNER_WAKE_TIMEOUT_S` | runner-owned |
-
 See [Limits](/reference/limits) for the sleep mechanism.
 
 ## Telemetry and rate limits

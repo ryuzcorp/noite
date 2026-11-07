@@ -59,9 +59,13 @@ The edge also bounds each request before a worker sees it: request headers past 
 
 ## Sleep (scale to zero)
 
-An app with no requests for `RUNNER_SLEEP_AFTER_H` hours (default 24, `0` disables) stops costing anything; the next request brings it back transparently.
+An app idle past its threshold stops costing anything; the next request brings it back transparently. The platform threshold is `RUNNER_SLEEP_AFTER_H` hours — unset, it derives from detected memory (`1` at ≤ 2 GiB, `6` at ≤ 4 GiB, else `24`); `0` disables sleeping install-wide and no per-app override re-enables it.
 
-**Sweep.** Every `RUNNER_SLEEP_SWEEP_S` seconds (default 3600) the runner parks apps that are deployed, desired `running`, awake, and request-free for the window.
+**Per-app override.** Settings → Limits → Sleep after sets this app's threshold in seconds (`0` = never, valid range `60`–`2592000` = 30 days); empty falls back to the install default. Preview environments use their owning app's override.
+
+**Scheduled work never auto-sleeps.** An app whose last deploy uploaded a Wrangler config with `triggers.crons` or `queues.consumers` skips the sweep unless its owner set an explicit override — a sleeping scheduler would silently miss its triggers. Memory-pressure parking below still parks it; the next request wakes it.
+
+**Sweep.** Every `RUNNER_SLEEP_SWEEP_S` seconds (default 3600) the runner parks apps that are deployed, desired `running`, awake, and request-free for their window.
 
 **Activity** is the newest of: the last minute bucket with requests in `app_metric` (real `celld.fetch` spans), the app's last wake (`woke_at`), its last deploy. A fresh deploy or manual start gets a full window.
 
@@ -76,7 +80,7 @@ An app with no requests for `RUNNER_SLEEP_AFTER_H` hours (default 24, `0` disabl
 5. Rewrites the Caddyfile back to the plain proxy.
 6. Answers 200; Caddy proxies the held request as if the app never slept.
 
-Concurrent requests share one wake (per-app lock), and at most `RUNNER_WAKE_CONCURRENCY` apps (default 4) cold-start at once; the rest queue within the same timeout. Only a failed wake answers `503`. A deploy, rollback, or web commit to an asleep app wakes it first; TLS ask treats asleep apps as live so certificates renew. First-request cost after a quiet day: one cold fleet start (celld boot + ready gate, typically seconds).
+Concurrent requests share one wake (per-app lock), and at most `RUNNER_WAKE_CONCURRENCY` apps (default 4) cold-start at once; the rest queue within the same timeout. Only a failed wake answers `503` — and records a tenant-visible `wake failed` fleet event plus the `wake_failed` sleep counter. A deploy, rollback, or web commit to an asleep app wakes it first; TLS ask treats asleep apps as live so certificates renew. First-request cost after a quiet day: one cold fleet start (celld boot + ready gate, typically seconds).
 
 ## Memory pressure
 

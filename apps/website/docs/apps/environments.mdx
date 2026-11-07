@@ -45,7 +45,7 @@ The Preview panel frames the environment (and production, for the default branch
 
 ## Lifecycle
 
-- **Scale to zero.** Like an app, an environment's fleet sleeps after `RUNNER_SLEEP_AFTER_H` hours without requests and wakes on the next one ([Limits](/reference/limits#sleep-scale-to-zero)).
+- **Scale to zero.** Like an app, an environment's fleet sleeps after `RUNNER_SLEEP_AFTER_H` hours without requests (or its owning app's Sleep after override) and wakes on the next one ([Limits](/reference/limits#sleep-scale-to-zero)).
 - **Branch deletion deletes its environment** — as does **Delete** in the environment's group (which also removes its fleet, its storage and its deploys).
 - **Workspace previews expire** after `RUNNER_ENVIRONMENT_TTL_H` hours (168 = 7 days) without a deploy.
 

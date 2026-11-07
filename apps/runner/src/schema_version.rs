@@ -21,7 +21,7 @@ use anyhow::{bail, Context};
 use sqlx::SqliteConnection;
 
 /// Version a database has after every migration ran. 1 is the alpha baseline.
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`.
@@ -314,6 +314,15 @@ pub const MIGRATIONS: &[Migration] = &[
           CREATE INDEX IF NOT EXISTS idx_fleet_operator_token_app \
             ON fleet_operator_token(app_id);",
     },
+    Migration {
+        version: 16,
+        // Per-app idle-sleep override (SPEC, Scale to zero):
+        // `app_limit.sleep_after_s` overrides `RUNNER_SLEEP_AFTER_H` for
+        // one app (NULL = default, 0 = never). Additive, so older
+        // installs gain it empty and a fresh database gets it from
+        // schema.sql.
+        sql: "ALTER TABLE main.app_limit ADD COLUMN sleep_after_s INTEGER;",
+    }
 ];
 
 /// What boot must do to bring a database to the latest version.

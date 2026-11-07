@@ -682,6 +682,7 @@ export const runnerSetLimits = (
   clientRpm: number | null,
   appRpm: number | null,
   memoryMb: number | null,
+  sleepAfterS: number | null,
   role: string
 ) =>
   runnerRpc<RunnerLimits>("limits.set", {
@@ -690,6 +691,7 @@ export const runnerSetLimits = (
     id,
     memoryMb,
     role,
+    sleepAfterS,
   });
 
 export const runnerGitRemote = (id: string) =>

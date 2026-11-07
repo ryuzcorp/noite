@@ -37,6 +37,24 @@ const MAX_EDGE_RPM: i64 = 600_000;
 const MIN_FLEET_MEMORY_MB: i64 = 64;
 const MAX_FLEET_MEMORY_MB: i64 = 1_048_576;
 
+/// Bounds on a per-app idle-sleep override in seconds: below a minute the
+/// sweep would park an app between two normal requests, so a typo'd `5`
+/// refuses loudly instead of flapping the fleet. `0` means never sleep.
+const MIN_SLEEP_AFTER_S: i64 = 60;
+const MAX_SLEEP_AFTER_S: i64 = 2_592_000;
+
+/// Whether a per-app sleep override is storable: `None` clears back to the
+/// platform default, `Some(0)` means never, otherwise a real threshold.
+fn check_sleep_override(sleep_after_s: Option<i64>) -> Result<(), ApiError> {
+    if sleep_after_s.is_none_or(|v| v == 0 || (MIN_SLEEP_AFTER_S..=MAX_SLEEP_AFTER_S).contains(&v))
+    {
+        return Ok(());
+    }
+    Err(ApiError::bad(format!(
+        "sleep threshold must be 0 (never) or between {MIN_SLEEP_AFTER_S} and {MAX_SLEEP_AFTER_S} seconds"
+    )))
+}
+
 /// The platform defaults an app's limits fall back to, plus the per-app
 /// memory ceiling the Settings input enforces.
 #[derive(Serialize, TS)]
@@ -49,6 +67,9 @@ pub struct LimitDefaults {
     /// `Some` ceiling in `multi` (a tenant can only lower its cap);
     /// `None` in `single`, where the operator is the only admin.
     pub memory_max_mb: Option<u32>,
+    /// Platform idle-sleep threshold in seconds (`RUNNER_SLEEP_AFTER_H`,
+    /// derived from detected memory when unset).
+    pub default_sleep_after_s: u64,
 }
 
 /// An app's limits as the settings panel shows them: its own values
@@ -62,6 +83,9 @@ pub struct LimitsView {
     pub client_rpm: Option<i64>,
     pub app_rpm: Option<i64>,
     pub memory_mb: Option<i64>,
+    /// This app's own idle-sleep threshold in seconds (`None` = platform
+    /// default, `Some(0)` = never).
+    pub sleep_after_s: Option<i64>,
     pub per_client: bool,
     pub defaults: LimitDefaults,
 }
@@ -71,6 +95,7 @@ fn limits_view(cfg: &Config, limit: &AppLimit) -> LimitsView {
         client_rpm: limit.client_rpm,
         app_rpm: limit.app_rpm,
         memory_mb: limit.memory_mb,
+        sleep_after_s: limit.sleep_after_s,
         per_client: cfg.edge_sees_clients(),
         defaults: LimitDefaults {
             client_rpm: cfg.edge.client_rpm,
@@ -78,6 +103,7 @@ fn limits_view(cfg: &Config, limit: &AppLimit) -> LimitsView {
             memory_mb: cfg.fleet_memory_mb,
             memory_max_mb: matches!(cfg.tenancy, crate::config::Tenancy::Multi)
                 .then_some(cfg.fleet_memory_max_mb),
+            default_sleep_after_s: cfg.sleep_after_h.saturating_mul(3600),
         },
     }
 }
@@ -121,6 +147,7 @@ pub async fn set(
     client_rpm: Option<i64>,
     app_rpm: Option<i64>,
     memory_mb: Option<i64>,
+    sleep_after_s: Option<i64>,
     role: Option<&str>,
 ) -> Result<LimitsView, ApiError> {
     require(role, "admin")?;
@@ -131,6 +158,7 @@ pub async fn set(
             "limits must be between 0 and {MAX_EDGE_RPM} requests per minute"
         )));
     }
+    check_sleep_override(sleep_after_s)?;
     check_memory_override(
         &state.config.tenancy,
         memory_mb,
@@ -142,6 +170,7 @@ pub async fn set(
         client_rpm,
         app_rpm,
         memory_mb,
+        sleep_after_s,
     };
     db::set_app_limit(&state.pool, &limit)
         .await
@@ -225,22 +254,27 @@ mod tests {
         let app = seed_app(&state, "gated").await;
         // No role is a refusal, never a default.
         assert!(matches!(
-            set(&state, &app.id, None, None, None, None).await,
+            set(&state, &app.id, None, None, None, None, None).await,
             Err(ApiError::Forbidden(_))
         ));
         // A viewer or pusher writes nothing here.
         for role in [Some("view"), Some("push")] {
             assert!(matches!(
-                set(&state, &app.id, None, None, None, role).await,
+                set(&state, &app.id, None, None, None, None, role).await,
                 Err(ApiError::Forbidden(_))
             ));
         }
         // An admin passes, and the stored values round-trip through get.
-        let view = set(&state, &app.id, Some(100), Some(200), None, ADMIN)
+        let view = set(&state, &app.id, Some(100), Some(200), None, None, ADMIN)
             .await
             .expect("admin sets");
         assert_eq!(view.client_rpm, Some(100));
         assert_eq!(view.app_rpm, Some(200));
+        assert_eq!(view.sleep_after_s, None);
+        assert_eq!(
+            view.defaults.default_sleep_after_s,
+            state.config.sleep_after_h.saturating_mul(3600)
+        );
         let reread = get(&state, &app.id).await.expect("get stays role-free");
         assert_eq!(reread.client_rpm, Some(100));
     }
@@ -270,5 +304,49 @@ mod tests {
             check_memory_override(&tenancy, Some(64), 512).expect("floor accepted");
             check_memory_override(&tenancy, Some(512), 512).expect("ceiling itself accepted");
         }
+    }
+
+    #[test]
+    fn sleep_override_range_holds() {
+        check_sleep_override(None).expect("clearing always allowed");
+        check_sleep_override(Some(0)).expect("0 means never");
+        check_sleep_override(Some(60)).expect("floor accepted");
+        check_sleep_override(Some(2_592_000)).expect("30 days accepted");
+        assert!(
+            check_sleep_override(Some(1)).is_err(),
+            "below-floor refused"
+        );
+        assert!(
+            check_sleep_override(Some(59)).is_err(),
+            "below-floor refused"
+        );
+        assert!(
+            check_sleep_override(Some(2_592_001)).is_err(),
+            "above-ceiling refused"
+        );
+        assert!(check_sleep_override(Some(-5)).is_err(), "negative refused");
+    }
+
+    #[tokio::test]
+    async fn sleep_override_round_trips_through_set() {
+        let (state, _guard) = test_state(Tenancy::Single).await;
+        let app = seed_app(&state, "sleepy").await;
+        let view = set(&state, &app.id, None, None, None, Some(3600), ADMIN)
+            .await
+            .expect("admin sets sleep");
+        assert_eq!(view.sleep_after_s, Some(3600));
+        let reread = get(&state, &app.id).await.expect("get");
+        assert_eq!(reread.sleep_after_s, Some(3600));
+        // Clearing returns the row to all-defaults (deleted).
+        let cleared = set(&state, &app.id, None, None, None, None, ADMIN)
+            .await
+            .expect("admin clears");
+        assert_eq!(cleared.sleep_after_s, None);
+        assert!(
+            set(&state, &app.id, None, None, None, Some(30), ADMIN)
+                .await
+                .is_err(),
+            "set refuses below-floor sleep"
+        );
     }
 }

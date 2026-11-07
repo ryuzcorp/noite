@@ -7,4 +7,9 @@ import type { LimitDefaults } from "./LimitDefaults";
  * `perClient` is false behind a proxy the edge does not trust, where
  * per-client limits cannot apply (`Config::edge_sees_clients`).
  */
-export type LimitsView = { clientRpm: number | null, appRpm: number | null, memoryMb: number | null, perClient: boolean, defaults: LimitDefaults, };
+export type LimitsView = { clientRpm: number | null, appRpm: number | null, memoryMb: number | null, 
+/**
+ * This app's own idle-sleep threshold in seconds (`None` = platform
+ * default, `Some(0)` = never).
+ */
+sleepAfterS: number | null, perClient: boolean, defaults: LimitDefaults, };
