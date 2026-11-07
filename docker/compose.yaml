@@ -119,7 +119,7 @@ services:
       RUNNER_BUILD_MAX_MB: ${RUNNER_BUILD_MAX_MB:-2048}
       RUNNER_BUILD_TIMEOUT_S: ${RUNNER_BUILD_TIMEOUT_S:-300}
       # Resource knobs (SPEC: Limits, Observability).
-      RUNNER_BUILD_CACHE_MB: ${RUNNER_BUILD_CACHE_MB:-512}
+      RUNNER_BUILD_CACHE_MB: ${RUNNER_BUILD_CACHE_MB:-1024}
       RUNNER_FLEET_ASSET_CACHE_MB: ${RUNNER_FLEET_ASSET_CACHE_MB:-64}
       # Per-fleet celld hibernated-DB cache and the control fleet's cap.
       # Unset derives both from this container's memory: a sixteenth (local
@@ -218,7 +218,14 @@ services:
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-noiteaccess}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-noitesecretnoitesecretnoite12}
       RUSTFS_ADDRESS: ":9000"
+      # The embedded console is admin UI, not storage: off by default.
       RUSTFS_CONSOLE_ENABLE: "false"
+      # Return freed allocator pages to the OS. The image defaults this to
+      # true, but without it RustFS's RSS ratchets with every deploy and the
+      # 2 GB install loses most of a gigabyte to the store; forcing the
+      # periodic collect bounds it (measured 752 MB anonymous after 4 days).
+      RUSTFS_ALLOCATOR_RECLAIM_ENABLED: "true"
+      RUSTFS_ALLOCATOR_RECLAIM_FORCE: "true"
       RUSTFS_OBS_LOGGER_LEVEL: error
     # Loopback only: the S3 API is for this host's tools (doctor, backups),
     # not the network.

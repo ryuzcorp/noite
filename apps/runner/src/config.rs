@@ -1075,7 +1075,10 @@ pub struct Config {
     /// Max worktree bytes before a build is refused (RUNNER_BUILD_MAX_MB).
     pub build_max_mb: u64,
     /// Cap per app on the persistent bun cache (RUNNER_BUILD_CACHE_MB).
-    /// Pruned oldest-first after each deploy; 0 disables persistence.
+    /// Pruned oldest-first after each deploy; 0 disables persistence. 1 GiB
+    /// covers the ~872 MB a cold `bun install` of the Void/Ilha template
+    /// writes, so a deploy no longer prunes the cache it just used and the
+    /// next one re-downloads it.
     pub build_cache_mb: u64,
     /// Bound on each tenant install and build step (RUNNER_BUILD_TIMEOUT_S).
     pub build_timeout_s: u64,
@@ -1438,7 +1441,7 @@ impl Config {
             ),
             build_cache_mb: env_num(
                 "RUNNER_BUILD_CACHE_MB",
-                512,
+                1024,
                 "a non-negative integer",
                 &mut env_problems,
             ),
@@ -2292,7 +2295,7 @@ mod tests {
             );
             assert_eq!(cfg.stop_budget_ms, 25000);
             assert_eq!(cfg.build_max_mb, 2048);
-            assert_eq!(cfg.build_cache_mb, 512);
+            assert_eq!(cfg.build_cache_mb, 1024);
             assert_eq!(cfg.build_timeout_s, 300);
             assert_eq!(cfg.telemetry_retention_days, 30);
             assert_eq!(cfg.otel_flush_ms, 30000);
