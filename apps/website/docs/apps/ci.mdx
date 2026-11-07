@@ -51,7 +51,7 @@ Unknown keys fail the deploy with the path (for example `jobs.build.steps[1]: un
 
 ## How it runs
 
-- The runner creates one container per job (`--cap-drop ALL --security-opt no-new-privileges`, no host mounts, no Docker socket inside), copies the checkout in with `docker cp`, runs the steps as the app's build uid, and removes the container even on failure.
+- The runner creates one container per job (`--cap-drop ALL` plus `CHOWN` only for the ownership prep, `--security-opt no-new-privileges`, no host mounts, no Docker socket inside), copies the checkout in with `docker cp`, runs the steps as the app's build uid (no capabilities), and removes the container even on failure.
 - Resources: the build memory cap (`RUNNER_BUILD_MEMORY_MB`, with `--memory-swap` equal so the container cannot swap), one CPU less than the box, and `--pids-limit 2048`.
 - `HOME` and the package-manager cache live in a per-app named volume (`noite-ci-cache-<slug>`), so `bun install`, npm and pnpm caches survive across deploys without a host bind.
 - Network defaults to Docker's `bridge` so installs reach registries; `RUNNER_CI_NETWORK=none` gives fully offline jobs. The host's loopback services are not reachable.

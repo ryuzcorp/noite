@@ -725,6 +725,11 @@ async fn run_job_inner(
         "create".to_string(),
         "--cap-drop".to_string(),
         "ALL".to_string(),
+        // The ownership prep runs as container root; CAP_CHOWN lets it hand
+        // /work and the cache volume to the build uid. Steps run as that uid
+        // with no capabilities, so this one never reaches tenant code.
+        "--cap-add".to_string(),
+        "CHOWN".to_string(),
         "--security-opt".to_string(),
         "no-new-privileges".to_string(),
         "--pids-limit".to_string(),
@@ -1355,6 +1360,8 @@ esac
                 "create",
                 "--cap-drop",
                 "ALL",
+                "--cap-add",
+                "CHOWN",
                 "--security-opt",
                 "no-new-privileges",
                 "--pids-limit",
@@ -1370,7 +1377,7 @@ esac
                 "--user",
                 "0",
                 "--name",
-                create[18].as_str(),
+                create[20].as_str(),
                 "-v",
                 "noite-ci-cache-test:/noite-home",
                 "-e",
@@ -1385,12 +1392,12 @@ esac
             .collect::<Vec<_>>(),
         );
         assert!(
-            create[18].starts_with("noite-ci-"),
+            create[20].starts_with("noite-ci-"),
             "container name: {}",
-            create[18]
+            create[20]
         );
 
-        let container = create[18].clone();
+        let container = create[20].clone();
         assert_eq!(invocations[1], vec!["start".to_string(), container.clone()]);
         assert_eq!(
             invocations[2],
