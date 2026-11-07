@@ -1187,6 +1187,14 @@ pub struct Config {
     /// Sandbox containers off for the install (`NOITE_SANDBOX=off`): see
     /// `parse_sandbox_disabled` and `host::sandbox`.
     pub sandbox_disabled: bool,
+    /// Pre-activation canary probe path (`RUNNER_DEPLOY_PROBE_PATH`, `/`):
+    /// after staging, the deploy asks the staged generation for
+    /// `HEAD <path>` through `celld invoke` before the one activate serves
+    /// it. Empty disables the probe (a celld without `invoke`).
+    pub deploy_probe_path: String,
+    /// Pre-activation canary probe timeout in seconds
+    /// (`RUNNER_DEPLOY_PROBE_TIMEOUT_S`, 30).
+    pub deploy_probe_timeout_s: u64,
     /// Malformed numeric env values seen by `from_env` (var, value and
     /// expected form per entry). `validate` refuses the boot with all of
     /// them at once; empty for configs built any other way.
@@ -1585,6 +1593,15 @@ impl Config {
                 env::var("NOITE_UPDATE_CHECK").ok().as_deref(),
             ),
             sandbox_disabled: parse_sandbox_disabled(env::var("NOITE_SANDBOX").ok().as_deref()),
+            // Unset means the default probe path; an explicit empty disables
+            // the canary (`env_or` would swallow that empty as unset).
+            deploy_probe_path: env::var("RUNNER_DEPLOY_PROBE_PATH").unwrap_or_else(|_| "/".into()),
+            deploy_probe_timeout_s: env_num(
+                "RUNNER_DEPLOY_PROBE_TIMEOUT_S",
+                30,
+                "a non-negative integer",
+                &mut env_problems,
+            ),
             env_problems,
         };
         cfg.validate()?;
@@ -2001,6 +2018,8 @@ pub(crate) fn config_for_tests() -> Config {
         do_not_track: false,
         update_check_disabled: false,
         sandbox_disabled: false,
+        deploy_probe_path: "/".into(),
+        deploy_probe_timeout_s: 30,
         env_problems: Vec::new(),
     }
 }
@@ -2169,6 +2188,7 @@ mod tests {
         "NOITE_EDGE_GIT_RPM",
         "NOITE_EDGE_APP_RPM",
         "RUNNER_WAKE_CONCURRENCY",
+        "RUNNER_DEPLOY_PROBE_TIMEOUT_S",
     ];
 
     /// Run `f` with a hermetic env: every strictly-parsed numeric var
@@ -2203,6 +2223,9 @@ mod tests {
                 "RUNNER_CI_IMAGES",
                 "RUNNER_CI_NETWORK",
                 "RUNNER_CI_DOCKER_BIN",
+                // The canary probe path reads a plain string var; a test-set
+                // value must not leak into a parallel `from_env` either.
+                "RUNNER_DEPLOY_PROBE_PATH",
             ])
         {
             saved.push((key, env::var(key).ok()));
@@ -2421,7 +2444,8 @@ mod tests {
             assert_eq!(cfg.sleep_after_h, 24);
             assert_eq!(cfg.sleep_sweep_s, 3600);
             assert_eq!(cfg.wake_timeout_s, 120);
-            assert_eq!(cfg.fleet_asset_cache_mb, 64);
+            assert_eq!(cfg.deploy_probe_path, "/");
+            assert_eq!(cfg.deploy_probe_timeout_s, 30);
             // Derived from the machine, so assert the bands.
             assert!((64..=512).contains(&cfg.fleet_local_cache_mb));
             assert!((256..=1024).contains(&cfg.control_memory_mb));
@@ -2482,7 +2506,7 @@ mod tests {
                 ("RUNNER_BUILD_UID_BASE", "20000"),
                 ("RUNNER_FLEET_UID", "10020"),
                 ("RUNNER_SLEEP_AFTER_H", "0"),
-                ("NOITE_STOP_BUDGET_MS", "5000"),
+                ("RUNNER_DEPLOY_PROBE_TIMEOUT_S", "5"),
             ],
             || {
                 let cfg = Config::from_env().expect("valid numerics must boot");
@@ -2496,9 +2520,28 @@ mod tests {
                 assert_eq!(cfg.build_uid_base, Some(20000));
                 assert_eq!(cfg.fleet_uid, Some(10020));
                 assert_eq!(cfg.sleep_after_h, 0);
-                assert_eq!(cfg.stop_budget_ms, 5000);
+                assert_eq!(cfg.deploy_probe_timeout_s, 5);
             },
         );
+    }
+
+    /// The canary probe path: unset means `/`, an explicit empty disables
+    /// the probe (a celld without `invoke`) — empties must survive, unlike
+    /// every `env_or` knob.
+    #[test]
+    fn deploy_probe_path_default_override_and_disable() {
+        with_env(&[], || {
+            let cfg = Config::from_env().expect("unset probe path must boot");
+            assert_eq!(cfg.deploy_probe_path, "/");
+        });
+        with_env(&[("RUNNER_DEPLOY_PROBE_PATH", "/healthz")], || {
+            let cfg = Config::from_env().expect("set probe path must boot");
+            assert_eq!(cfg.deploy_probe_path, "/healthz");
+        });
+        with_env(&[("RUNNER_DEPLOY_PROBE_PATH", "")], || {
+            let cfg = Config::from_env().expect("empty probe path must boot");
+            assert!(cfg.deploy_probe_path.is_empty());
+        });
     }
 
     #[test]

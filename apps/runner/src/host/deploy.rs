@@ -1403,11 +1403,30 @@ async fn deploy_inner(
                 }
             }
         }
+        // Pre-activation canary: the staged generation proves it serves
+        // before the one activate moves the pointer — a redeploy after its
+        // staged migrate above, a first deploy, and the staged-unreachable
+        // fallback alike. A failed probe fails the deploy here with nothing
+        // activated, so the previous generation keeps serving.
+        probe_staged_generation(
+            cfg,
+            &celld,
+            &staged,
+            void_proxy_token.as_deref(),
+            &mut *progress,
+        )
+        .await?;
         let stats =
             activate_after_staged_migrate(pool, app, target, &celld, staged, progress).await?;
         (stats, environment)
     } else {
-        let stats = void_cohost::deploy_fleet_in_order(
+        // Non-Void apps stage the same ordered generation, then prove it
+        // with the canary before the one activate serves it — no D1
+        // migrations ride along, so the probe is the only thing between
+        // stage and activate. A failed probe fails the deploy with nothing
+        // activated, so the previous generation keeps serving. There is no
+        // proxy token on a non-Void fleet, so none rides along.
+        let staged = void_cohost::stage_fleet_in_order(
             pool,
             &app.id,
             target.environment_id(),
@@ -1416,6 +1435,10 @@ async fn deploy_inner(
             &app_side,
         )
         .await?;
+        probe_staged_generation(cfg, &celld, &staged, None, &mut *progress).await?;
+        let stats =
+            void_cohost::activate_staged(pool, &app.id, target.environment_id(), &celld, staged)
+                .await?;
         let environment = load_deploy_target(pool, app, target).await?;
         (stats, environment)
     };
@@ -1792,21 +1815,8 @@ async fn migrate_void_app_staged(
 ) -> anyhow::Result<()> {
     let mut inputs = inputs;
     let setup = begin_migrate(&mut inputs, "D1 migrations via the staged worker").await?;
-    let env: Vec<(String, String)> = celld
-        .env
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect();
     let client = void_migrate::MigrationClient::staged(
-        void_migrate::StagedTarget {
-            celld_bin: celld.celld_bin.to_string(),
-            env,
-            bucket: celld.bucket.to_string(),
-            endpoint: celld.endpoint.to_string(),
-            region: celld.region.to_string(),
-            pins: staged.generation.clone(),
-            target: staged.primary.clone(),
-        },
+        staged_invoke_target(celld, staged),
         setup.proxy_token,
     );
     let fleet = fleet_label(inputs.app, inputs.target);
@@ -1824,6 +1834,114 @@ async fn migrate_void_app_staged(
         &deployment_id,
     )
     .await
+}
+
+/// The staged-generation invoke target the staged migrations and the
+/// pre-activation canary share: the `celld` invocation's bucket, endpoint,
+/// region and env (operator token and bucket credentials ride `CELLD_*`,
+/// like `celld d1 execute`), the staged pins, and the app as `--target`.
+/// One constructor, so the probe's `--target`/pins/bucket shape cannot
+/// drift from the migrate's.
+fn staged_invoke_target(
+    celld: &void_cohost::CelldDeploy<'_>,
+    staged: &void_cohost::StagedFleet,
+) -> void_migrate::StagedTarget {
+    let env: Vec<(String, String)> = celld
+        .env
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect();
+    void_migrate::StagedTarget {
+        celld_bin: celld.celld_bin.to_string(),
+        env,
+        bucket: celld.bucket.to_string(),
+        endpoint: celld.endpoint.to_string(),
+        region: celld.region.to_string(),
+        pins: staged.generation.clone(),
+        target: staged.primary.clone(),
+    }
+}
+
+/// Pre-activation canary (SPEC, Deploy pipeline): `HEAD <probe path>`
+/// against the staged generation through `celld invoke` — the staged pins
+/// plus the app as `--target`, like the staged migrations — before the one
+/// activate serves it. An answered status below 500 passes; a 5xx or a
+/// missing answer (transport failure, over-cap body) fails the deploy here,
+/// so the pointer never moves and the previous generation keeps serving. A
+/// non-Void app has no proxy token, so none rides along — only the empty
+/// string the staged invoke always carries. An empty
+/// `RUNNER_DEPLOY_PROBE_PATH` disables the probe (a celld without `invoke`)
+/// and the deploy activates unprobed, as before.
+async fn probe_staged_generation(
+    cfg: &Config,
+    celld: &void_cohost::CelldDeploy<'_>,
+    staged: &void_cohost::StagedFleet,
+    proxy_token: Option<&str>,
+    progress: &mut Progress<'_>,
+) -> anyhow::Result<()> {
+    let path = cfg.deploy_probe_path.clone();
+    if path.is_empty() {
+        return Ok(());
+    }
+    progress
+        .log(
+            DeployStatus::Deploying,
+            &format!("probe: HEAD {path} against the staged generation\n"),
+        )
+        .await?;
+    let client = void_migrate::MigrationClient::staged(
+        staged_invoke_target(celld, staged),
+        proxy_token.unwrap_or_default().to_string(),
+    );
+    let timeout = Duration::from_secs(cfg.deploy_probe_timeout_s.max(1));
+    match client.probe_staged(&path, timeout).await {
+        Ok(status) => {
+            progress
+                .log(
+                    DeployStatus::Deploying,
+                    &format!("probe: staged generation answered HEAD {path} with {status}\n"),
+                )
+                .await?;
+            Ok(())
+        }
+        Err(void_migrate::ProbeError::Http { status, .. }) => {
+            anyhow::bail!(
+                "staged generation failed its probe (HTTP {status}): previous version still serving"
+            )
+        }
+        // No live fleet means no old version is serving (a first deploy, a
+        // stopped or an asleep app): there is nothing to protect, and
+        // `celld invoke` cannot reach a node that does not exist. Activate.
+        // Every other transport failure still fails closed.
+        Err(void_migrate::ProbeError::Transport { message })
+            if message.contains("no node leases") =>
+        {
+            progress
+                .log(
+                    DeployStatus::Deploying,
+                    "probe: no live fleet to probe (first deploy or parked); activating\n",
+                )
+                .await?;
+            Ok(())
+        }
+        Err(void_migrate::ProbeError::Transport { message }) => {
+            anyhow::bail!(
+                "staged generation failed its probe (transport failure: {}): previous version still serving",
+                void_migrate::one_line(&message)
+            )
+        }
+        Err(void_migrate::ProbeError::TooLarge { message }) => {
+            anyhow::bail!(
+                "staged generation failed its probe (response too large: {}): previous version still serving",
+                void_migrate::one_line(&message)
+            )
+        }
+        Err(other) => {
+            anyhow::bail!(
+                "staged generation failed its probe ({other}): previous version still serving"
+            )
+        }
+    }
 }
 
 /// Activate the staged generation after a successful staged migrate: the
@@ -2388,8 +2506,8 @@ mod tests {
     use super::{
         activate_after_staged_migrate, contained_deploy_root, failure_summary, go_arch,
         has_build_script, log_migrate_warnings, migrate_void_app, migrate_void_app_staged,
-        parse_wrangler_build, quoted, route_live, wipe_worktree, without_runner_keys, DeployTarget,
-        MigrateInputs, Progress,
+        parse_wrangler_build, probe_staged_generation, quoted, route_live, wipe_worktree,
+        without_runner_keys, DeployTarget, MigrateInputs, Progress,
     };
     use serde_json::json;
 
@@ -2902,6 +3020,19 @@ mod tests {
                 .map(str::to_string)
                 .collect()
         }
+
+        /// The fake's env, owned: the log and dir paths the fake reads, like
+        /// the operator token and bucket credentials ride `CELLD_*`.
+        fn fake_env(&self) -> (String, String) {
+            (
+                self.dir
+                    .path()
+                    .join("invocations.log")
+                    .to_string_lossy()
+                    .into_owned(),
+                self.dir.path().to_string_lossy().into_owned(),
+            )
+        }
     }
 
     /// The `activate` invocations among the fake's log lines.
@@ -3289,6 +3420,253 @@ mod tests {
             .filter(|call| call.contains("--path /__void/migrate/app/attempt/"))
             .collect();
         assert_eq!(reconciles.len(), 1, "{calls:?}");
+    }
+
+    /// Stage proxy + app through the fake and run the pre-activation canary,
+    /// like `deploy_inner` does between stage and activate: the `celld`
+    /// shape rides `env` (owned by the caller), the proxy token rides the
+    /// staged client when the seam has one — `None` for a plain worker.
+    /// Returns the staged generation and the probe outcome.
+    async fn stage_and_probe<'a>(
+        seam: &'a StagedSeam,
+        env: &[(&str, &str)],
+        token: Option<&str>,
+        progress: &mut Progress<'a>,
+    ) -> (crate::host::void_cohost::StagedFleet, anyhow::Result<()>) {
+        let celld = seam.celld(env);
+        let app_side = crate::host::void_cohost::FleetApp {
+            dir: seam.root.path(),
+            cwd: None,
+            timeout: std::time::Duration::from_secs(30),
+            sourcemap: None,
+            read_root: None,
+        };
+        let staged = crate::host::void_cohost::stage_fleet_in_order(
+            &seam.pool,
+            &seam.app.id,
+            None,
+            &celld,
+            &[staged_proxy()],
+            &app_side,
+        )
+        .await
+        .expect("stage");
+        let outcome = probe_staged_generation(&seam.cfg, &celld, &staged, token, progress).await;
+        (staged, outcome)
+    }
+
+    fn probe_progress<'a>(seam: &'a StagedSeam) -> Progress<'a> {
+        Progress {
+            pool: &seam.pool,
+            app_id: &seam.app.id,
+            environment_id: None,
+            sha: Some("abc123".to_string()),
+            id: None,
+            step: "deploy",
+        }
+    }
+
+    /// The full pre-activation sequence: the staged generation answers the
+    /// canary, so the deploy activates the staged pins with the app as
+    /// primary. The probe rides `celld invoke` with the staged pins,
+    /// `--target` the app, `HEAD` and the configured path; the proxy token
+    /// travels in the environment, never argv.
+    #[tokio::test]
+    async fn staged_probe_200_then_activate_serves_the_staged_generation() {
+        let seam = StagedSeam::spawn("probe-ok").await;
+        seam.write_invoke("invoke-probe", 200, "");
+        let (log, dir) = seam.fake_env();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let mut progress = probe_progress(&seam);
+        let (staged, outcome) =
+            stage_and_probe(&seam, &env, Some("proxy-secret"), &mut progress).await;
+        outcome.expect("a 200 probe passes");
+        let calls = seam.invocations();
+        let probe = calls
+            .iter()
+            .find(|call| call.contains("--method HEAD"))
+            .expect("the probe runs through invoke");
+        for pinned in [
+            "test-proxy=0000000000000001",
+            "test-app=0000000000000002",
+            "--target test-app",
+            "--path / ",
+            "--header-env x-void-internal=NOITE_VOID_PROXY_TOKEN",
+            "--json",
+            "--bucket s3://noite/fleets/staged-mig",
+        ] {
+            assert!(probe.contains(pinned), "{probe}");
+        }
+        assert!(
+            !probe.contains("proxy-secret"),
+            "no secret on argv: {probe}"
+        );
+        let token_log =
+            std::fs::read_to_string(seam.dir.path().join("invoke-token.log")).unwrap_or_default();
+        assert!(
+            token_log.lines().any(|line| line == "proxy-secret"),
+            "the proxy token rides the environment: {token_log:?}"
+        );
+        let log: String = sqlx::query_scalar("SELECT log FROM deploy WHERE id = ?")
+            .bind(progress.id.clone().unwrap_or_default())
+            .fetch_one(&seam.pool)
+            .await
+            .unwrap();
+        assert!(
+            log.contains("probe: staged generation answered HEAD / with 200"),
+            "{log}"
+        );
+        let celld = seam.celld(&env);
+        let stats = crate::host::void_cohost::activate_staged(
+            &seam.pool,
+            &seam.app.id,
+            None,
+            &celld,
+            staged,
+        )
+        .await
+        .expect("activate");
+        assert_eq!(stats.activate_attempts, 1);
+        let calls = seam.invocations();
+        let activates = staged_activates(&calls);
+        assert_eq!(activates.len(), 1, "{calls:?}");
+        for pinned in [
+            "test-proxy=0000000000000001",
+            "test-app=0000000000000002",
+            "--primary test-app",
+        ] {
+            assert!(activates[0].contains(pinned), "{}", activates[0]);
+        }
+    }
+
+    /// A 500 probe fails the deploy with nothing activated, so the previous
+    /// generation keeps serving. A plain worker has no proxy token, so none
+    /// rides along — the probe still runs.
+    #[tokio::test]
+    async fn staged_probe_500_runs_no_activate() {
+        let seam = StagedSeam::spawn("probe-500").await;
+        seam.write_invoke("invoke-probe", 500, "broken");
+        let (log, dir) = seam.fake_env();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let mut progress = probe_progress(&seam);
+        let (_staged, outcome) = stage_and_probe(&seam, &env, None, &mut progress).await;
+        let err = outcome.expect_err("a 500 probe fails the deploy");
+        let detail = format!("{err:#}");
+        assert!(detail.contains("failed its probe (HTTP 500)"), "{detail}");
+        assert!(
+            detail.contains("previous version still serving"),
+            "{detail}"
+        );
+        let calls = seam.invocations();
+        assert!(
+            calls.iter().any(|call| call.contains("--method HEAD")),
+            "the probe ran: {calls:?}"
+        );
+        assert!(
+            staged_activates(&calls).is_empty(),
+            "no activate after a failed probe: {calls:?}"
+        );
+    }
+
+    /// A probe the staged generation never answers fails closed: no
+    /// activate, so the previous generation keeps serving.
+    #[tokio::test]
+    async fn staged_probe_transport_failure_runs_no_activate() {
+        let seam = StagedSeam::spawn("probe-transport").await;
+        seam.fail_invoke("invoke-probe", "invoke blew up");
+        let (log, dir) = seam.fake_env();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let mut progress = probe_progress(&seam);
+        let (_staged, outcome) = stage_and_probe(&seam, &env, None, &mut progress).await;
+        let err = outcome.expect_err("a missing probe answer fails the deploy");
+        let detail = format!("{err:#}");
+        assert!(detail.contains("transport failure"), "{detail}");
+        assert!(
+            detail.contains("previous version still serving"),
+            "{detail}"
+        );
+        let calls = seam.invocations();
+        assert!(
+            staged_activates(&calls).is_empty(),
+            "no activate after a failed probe: {calls:?}"
+        );
+    }
+
+    /// A first deploy (no node lease yet) cannot run `celld invoke`: the
+    /// probe skips and the deploy activates, because no old version is
+    /// serving to protect.
+    #[tokio::test]
+    async fn staged_probe_without_a_live_fleet_activates() {
+        let seam = StagedSeam::spawn("probe-no-fleet").await;
+        seam.fail_invoke(
+            "invoke-probe",
+            "no node leases in the bucket; celld invoke needs a running fleet",
+        );
+        let (log, dir) = seam.fake_env();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let mut progress = probe_progress(&seam);
+        let (staged, outcome) = stage_and_probe(&seam, &env, None, &mut progress).await;
+        outcome.expect("no live fleet skips the probe");
+        let celld = seam.celld(&env);
+        let stats = crate::host::void_cohost::activate_staged(
+            &seam.pool,
+            &seam.app.id,
+            None,
+            &celld,
+            staged,
+        )
+        .await
+        .expect("activate");
+        assert_eq!(stats.activate_attempts, 1);
+        let calls = seam.invocations();
+        assert!(
+            staged_activates(&calls).len() == 1,
+            "no-fleet probe still activates: {calls:?}"
+        );
+    }
+
+    /// An empty probe path disables the canary: no invoke runs, and the
+    /// deploy activates unprobed, as before.
+    #[tokio::test]
+    async fn staged_probe_disabled_runs_no_probe_call() {
+        let mut seam = StagedSeam::spawn("probe-disabled").await;
+        seam.cfg.deploy_probe_path = String::new();
+        let (log, dir) = seam.fake_env();
+        let env = vec![
+            ("FAKE_CELLD_LOG", log.as_str()),
+            ("FAKE_CELLD_DIR", dir.as_str()),
+        ];
+        let mut progress = probe_progress(&seam);
+        let (staged, outcome) = stage_and_probe(&seam, &env, None, &mut progress).await;
+        outcome.expect("a disabled probe passes");
+        let calls = seam.invocations();
+        assert!(
+            !calls.iter().any(|call| call.contains("--method HEAD")),
+            "no probe call when disabled: {calls:?}"
+        );
+        let celld = seam.celld(&env);
+        let stats = crate::host::void_cohost::activate_staged(
+            &seam.pool,
+            &seam.app.id,
+            None,
+            &celld,
+            staged,
+        )
+        .await
+        .expect("activate");
+        assert_eq!(stats.activate_attempts, 1);
     }
 
     /// Worker warnings land as one write: the first twenty lines plus a

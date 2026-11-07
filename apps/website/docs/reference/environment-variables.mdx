@@ -113,6 +113,8 @@ These are install-level variables (Compose, the image environment). Per-app valu
 | `RUNNER_BUILD_CACHE_MB` | `1024` | Per-app persistent build cache cap (package managers and their caches); `0` disables | runner-owned |
 | `RUNNER_TELEMETRY_RETENTION_DAYS` | `30` | Days kept in bucket prune, metric tables, glob floor (min `1`; a non-integer or `< 1` value fails boot validation) | runner-owned |
 | `RUNNER_TIP_SWEEP_S` | `60` | Fallback S3 tip sweep per app; covers out-of-band bundle writes | runner-owned |
+| `RUNNER_DEPLOY_PROBE_PATH` | `/` | Pre-activation canary: after staging, the deploy asks the staged generation for `HEAD <path>` through `celld invoke` before the one activate serves it; an answer below 500 moves the pointer, anything else fails the deploy with the old generation still serving. Empty disables the probe (a celld without `invoke`) | runner-owned |
+| `RUNNER_DEPLOY_PROBE_TIMEOUT_S` | `30` | Seconds the canary waits for the staged generation | runner-owned |
 | `RUNNER_FLEET_LOG` | `error,celld=warn` | Fleet `RUST_LOG` (runner's own filter stays separate) | worker-passthrough (fleet) |
 
 ## Sleep
