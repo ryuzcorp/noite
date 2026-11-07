@@ -10,6 +10,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-alpha.24] - 2026-11-07
+
+### Operator action required
+
+- None.
+
+### Fixed
+
+- Creating an app on a slug with a large deleted history no longer fails with "operation aborted due to timeout". The prefix purge now lists and deletes one page at a time (a canceled caller leaves progress instead of re-walking the whole prefix on every retry), and the create runs as its own task: the control plane's 14 s abort drops only the waiter, the row lands, and the GitHub import spawns. The control UI's create retry recognizes a `409` for a slug taken by the caller's own timed-out attempt and grants the account instead of failing.
+
 ## [0.1.0-alpha.23] - 2026-11-07
 
 ### Operator action required
