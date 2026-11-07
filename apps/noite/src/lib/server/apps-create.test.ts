@@ -15,7 +15,7 @@ import {
 import * as Effect from "effect/Effect";
 
 import { createTestD1 } from "../../testing/d1";
-import { installRunnerMock } from "../../testing/runner-mock";
+import { installRunnerMock, makeApp } from "../../testing/runner-mock";
 import type { RunnerMock } from "../../testing/runner-mock";
 import { ensureDbPromise, setD1Binding } from "../db";
 import { errorMessage } from "../errors";
@@ -64,4 +64,27 @@ describe("createAppForUser", () => {
 
     throw new Error("expected createAppForUser to reject");
   });
+});
+
+test("a failed grant does not delete a recovered app", async () => {
+  runner.apps.push(
+    makeApp({
+      createdAt: new Date().toISOString(),
+      id: "app-9",
+      name: "Taken",
+      slug: "taken",
+      userId: "u-1",
+    })
+  );
+
+  await expect(
+    createAppForUser({
+      account: { id: "u-1", name: "One" },
+      name: "Taken",
+      slug: "taken",
+    })
+  ).rejects.toThrow();
+
+  expect(runner.calls).toEqual(["apps.create", "apps.get_by_slug"]);
+  expect(runner.apps.map((app) => app.id)).toEqual(["app-9"]);
 });

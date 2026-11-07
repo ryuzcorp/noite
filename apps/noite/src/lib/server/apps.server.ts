@@ -29,6 +29,11 @@ import { apiAction, fail } from "./api";
 import { requireTelemetryRole } from "./errors.server";
 import { requireViewApp, sessionUser } from "./session.server";
 
+/** How long after its creation a `409` slug may be the caller's own
+ * timed-out create (the create runs detached and may outlive the 14 s
+ * lifecycle bound by the purge of a large prefix). */
+const CREATE_RECOVERY_WINDOW_MS = 15 * 60_000;
+
 const CreateSource = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("blank") }),
   Schema.Struct({
@@ -187,6 +192,7 @@ export const createAppForUser = async (input: {
   source?: CreateSourceInput;
 }): Promise<RunnerApp> => {
   let app: RunnerApp;
+  let recovered = false;
 
   try {
     app = await runnerCreateApp({
@@ -207,11 +213,20 @@ export const createAppForUser = async (input: {
     ) {
       const existing = await runnerGetAppBySlug(input.slug).catch(() => null);
 
-      if (existing?.userId !== input.account.id) {
+      // Only a create that just outlived the call bound may be recovered: a
+      // pre-existing app the account already owns stays a 409 (its name and
+      // source were not what this request asked for), and a recovery must
+      // never be rolled back as if this call had created it.
+      const fresh =
+        existing !== null &&
+        Date.now() - Date.parse(existing.createdAt) < CREATE_RECOVERY_WINDOW_MS;
+
+      if (existing?.userId !== input.account.id || !fresh) {
         throw error;
       }
 
       app = existing;
+      recovered = true;
     } else {
       throw error;
     }
@@ -220,7 +235,10 @@ export const createAppForUser = async (input: {
   try {
     await withDb(grantCollaborator(app.id, input.account.id, "admin"));
   } catch (grantError) {
-    await runnerDeleteApp(app.id).catch(() => null);
+    if (!recovered) {
+      await runnerDeleteApp(app.id).catch(() => null);
+    }
+
     failUnknown(grantError);
   }
 

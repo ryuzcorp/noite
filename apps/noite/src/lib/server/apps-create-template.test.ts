@@ -87,7 +87,13 @@ test("an unknown template id fails before any runner call", async () => {
 
 test("a retry recovers an app whose create outlived the call bound", async () => {
   runner.apps.push(
-    makeApp({ id: "app-9", name: "Taken", slug: "taken", userId: "u-1" })
+    makeApp({
+      createdAt: new Date().toISOString(),
+      id: "app-9",
+      name: "Taken",
+      slug: "taken",
+      userId: "u-1",
+    })
   );
 
   const app = await createAppForUser({
@@ -102,7 +108,34 @@ test("a retry recovers an app whose create outlived the call bound", async () =>
 
 test("a retry on another account's slug still fails", async () => {
   runner.apps.push(
-    makeApp({ id: "app-9", name: "Taken", slug: "taken", userId: "u-2" })
+    makeApp({
+      createdAt: new Date().toISOString(),
+      id: "app-9",
+      name: "Taken",
+      slug: "taken",
+      userId: "u-2",
+    })
+  );
+
+  await expect(
+    createAppForUser({
+      account: { id: "u-1", name: "One" },
+      name: "Taken",
+      slug: "taken",
+    })
+  ).rejects.toThrow(/slug already taken/u);
+  expect(runner.calls).toEqual(["apps.create", "apps.get_by_slug"]);
+});
+
+test("an older app on the slug is not recovered", async () => {
+  runner.apps.push(
+    makeApp({
+      createdAt: "2026-01-01T00:00:00Z",
+      id: "app-9",
+      name: "Taken",
+      slug: "taken",
+      userId: "u-1",
+    })
   );
 
   await expect(
