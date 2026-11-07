@@ -131,7 +131,7 @@ ensure_swap() {
     info "NOITE_SWAP=0: leaving the host's swap alone"
     return 0
   fi
-  if [[ -f /.dockerenv ]]; then
+  if [[ -f /.dockerenv || -f /run/.containerenv ]]; then
     info "inside a container: swap belongs to the host"
     return 0
   fi
@@ -153,6 +153,9 @@ ensure_swap() {
   if ((avail_kb < (size_mb + 3072) * 1024)); then
     warn "skipping ${size_mb} MB swap: $((avail_kb / 1024)) MB free on /, ${size_mb} MB plus 3 GB headroom needed"
     return 0
+  fi
+  if [[ -L /noite.swap ]]; then
+    die "refusing to follow a symlink at /noite.swap"
   fi
   if [[ ! -f /noite.swap ]]; then
     if ! fallocate -l "${size_mb}M" /noite.swap 2>/dev/null; then

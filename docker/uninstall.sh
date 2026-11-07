@@ -176,6 +176,11 @@ remove_data() {
 # never touched.
 remove_swap() {
   step "Removing the swapfile"
+  if [[ -L /noite.swap ]]; then
+    rm -f /noite.swap
+    info "removed a /noite.swap link (not following it)"
+    return 0
+  fi
   if [[ ! -f /noite.swap ]]; then
     info "not present"
     return 0
