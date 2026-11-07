@@ -162,6 +162,14 @@ services:
       RUNNER_SLEEP_SWEEP_S: ${RUNNER_SLEEP_SWEEP_S:-3600}
       RUNNER_WAKE_TIMEOUT_S: ${RUNNER_WAKE_TIMEOUT_S:-120}
       RUNNER_WAKE_CONCURRENCY: ${RUNNER_WAKE_CONCURRENCY:-4}
+      # Pre-activation canary (SPEC, Deploy pipeline): after staging, the
+      # deploy asks the staged generation for `HEAD <path>` through
+      # `celld invoke` before the one activate serves it; an answer below
+      # 500 moves the pointer, anything else fails the deploy with the old
+      # generation still serving. Empty disables the probe (a celld without
+      # `invoke`) — `-` (not `:-`) so an explicit empty reaches the runner.
+      RUNNER_DEPLOY_PROBE_PATH: ${RUNNER_DEPLOY_PROBE_PATH-/}
+      RUNNER_DEPLOY_PROBE_TIMEOUT_S: ${RUNNER_DEPLOY_PROBE_TIMEOUT_S:-30}
       # Void platform proxy (SPEC): the operator's email relay and AI
       # endpoint, rendered into every Void fleet's `noite-void-proxy`.
       # Unset = email and AI calls answer 501; per-app credentials are

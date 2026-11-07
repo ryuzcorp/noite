@@ -43,7 +43,12 @@ elif [ "$1" = "invoke" ]; then
     /__void/migrate/app) name="invoke-app";;
     /__void/migrate/app/attempt/*) name="invoke-attempt";;
     /__void/migrate) name="invoke-legacy";;
-    *) echo "unexpected invoke path: $path" >&2; exit 1;;
+    # Any other path is the pre-activation canary probe (`HEAD <path>`
+    # through `celld invoke`): the probe path is operator-configured, so
+    # the fake cannot enumerate it — one fixture answers them all. A
+    # missing fixture (or a `<name>.fail` file, like the migrate
+    # endpoints) fails the call with no envelope: a transport failure.
+    *) name="invoke-probe";;
   esac
   if [ -f "$FAKE_CELLD_DIR/$name.fail" ]; then cat "$FAKE_CELLD_DIR/$name.fail" >&2; exit 1; fi
   cat "$FAKE_CELLD_DIR/$name"
