@@ -185,12 +185,20 @@ const adoptSlowCreate = async (
   slug: string,
   userId: string
 ): Promise<RunnerApp | null> => {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+  // A deadline, not an attempt count: this path runs exactly when the runner
+  // is slow, and each lookup can itself take RUNNER_TIMEOUT_MS (5 s).
+  const deadline = Date.now() + 10_000;
+
+  for (;;) {
     // oxlint-disable-next-line eslint/no-await-in-loop -- polling: each attempt must observe the row the last one missed
     const existing = await runnerGetAppBySlug(slug).catch(() => null);
 
     if (existing) {
       return existing.userId === userId ? existing : null;
+    }
+
+    if (Date.now() >= deadline) {
+      return null;
     }
 
     const { promise, resolve } = Promise.withResolvers<null>();
@@ -200,8 +208,6 @@ const adoptSlowCreate = async (
     // oxlint-disable-next-line eslint/no-await-in-loop -- the next poll waits this interval
     await promise;
   }
-
-  return null;
 };
 
 /** Create an app for one account and grant that account admin — the single

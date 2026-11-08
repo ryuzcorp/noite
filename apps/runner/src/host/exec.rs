@@ -381,28 +381,33 @@ pub async fn run_sandboxed(
     // proves it is stuck (see `build_thrash_pinned`); the flag turns the exit
     // into the budget error below instead of a bare exit 137.
     let thrash = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watchdog = sb.cgroup.map(|leaf| {
-        let leaf = leaf.to_path_buf();
-        let thrash = thrash.clone();
-        tokio::spawn(async move {
-            let mut pinned = 0u32;
-            loop {
-                tokio::time::sleep(THRASH_SAMPLE).await;
-                pinned = if crate::host::cgroups::build_thrash_pinned(&leaf) {
-                    pinned + 1
-                } else {
-                    0
-                };
-                if pinned >= THRASH_SAMPLES {
-                    if let Some(pid) = pid {
-                        kill_group(pid);
+    // Only a capped leaf can thrash; an uncapped install (0 = uncapped) has
+    // no `memory.max` to pin against, so skip the sampler entirely.
+    let watchdog = sb
+        .cgroup
+        .filter(|_| crate::host::cgroups::build_memory_mb().is_some_and(|mb| mb > 0))
+        .map(|leaf| {
+            let leaf = leaf.to_path_buf();
+            let thrash = thrash.clone();
+            tokio::spawn(async move {
+                let mut pinned = 0u32;
+                loop {
+                    tokio::time::sleep(THRASH_SAMPLE).await;
+                    pinned = if crate::host::cgroups::build_thrash_pinned(&leaf) {
+                        pinned + 1
+                    } else {
+                        0
+                    };
+                    if pinned >= THRASH_SAMPLES {
+                        if let Some(pid) = pid {
+                            kill_group(pid);
+                        }
+                        thrash.store(true, std::sync::atomic::Ordering::SeqCst);
+                        return;
                     }
-                    thrash.store(true, std::sync::atomic::Ordering::SeqCst);
-                    return;
                 }
-            }
-        })
-    });
+            })
+        });
     let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
     if let Some(watchdog) = watchdog {
         watchdog.abort();
