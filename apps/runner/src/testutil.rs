@@ -37,8 +37,35 @@ impl Drop for TempDir {
     }
 }
 
-/// Spawn the in-process LIST-only S3 stub and return its endpoint URL.
+/// Spawn the in-process S3 stub and return its endpoint URL.
+///
+/// LIST answers an empty `ListObjectsV2` page; object GET/HEAD answer 404
+/// `NoSuchKey` (callers read "nothing there" instead of dialing RustFS), and
+/// object PUT/DELETE succeed into the void. Bodies and listings therefore
+/// never reach a real store, while missing-vs-unreachable keeps working:
+/// only a transport failure (not this stub) is an outage.
 pub async fn spawn_s3_stub() -> String {
+    fn is_object_op(request: &[u8]) -> Option<bool> {
+        let line = request
+            .split(|byte| *byte == b'\n')
+            .next()
+            .and_then(|line| std::str::from_utf8(line).ok())?;
+        let target = line.split_whitespace().nth(1)?;
+        let mut halves = target.splitn(2, '?');
+        let path = halves.next().unwrap_or("");
+        let query = halves.next().unwrap_or("");
+        // Bucket actions (LIST, batch delete) sign with or without a
+        // trailing slash; only a `list-type` query makes one a listing.
+        if query.contains("list-type") {
+            return Some(false);
+        }
+        Some(path.trim_start_matches('/').contains('/'))
+    }
+
+    fn is_read(request: &[u8]) -> bool {
+        request.starts_with(b"GET ") || request.starts_with(b"HEAD ")
+    }
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind s3 stub");
@@ -52,14 +79,31 @@ pub async fn spawn_s3_stub() -> String {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 8192];
                 let _ = sock.read(&mut buf).await;
-                let body = concat!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
-                    "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
-                    "<Name>noite</Name><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>",
-                    "</ListBucketResult>"
-                );
+                let body = if is_object_op(&buf).unwrap_or(false) {
+                    if is_read(&buf) {
+                        concat!(
+                            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                            "<Error><Code>NoSuchKey</Code>",
+                            "<Message>missing</Message></Error>",
+                        )
+                    } else {
+                        ""
+                    }
+                } else {
+                    concat!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                        "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+                        "<Name>noite</Name><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>",
+                        "</ListBucketResult>"
+                    )
+                };
+                let status = if is_object_op(&buf).unwrap_or(false) && is_read(&buf) {
+                    "404 Not Found"
+                } else {
+                    "200 OK"
+                };
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = sock.write_all(resp.as_bytes()).await;

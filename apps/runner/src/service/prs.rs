@@ -1155,7 +1155,7 @@ mod tests {
                 logs: crate::host::logs::new_state(),
                 deploying: crate::host::deploy::new_deploying(),
                 log_notify,
-                git_sync: crate::host::git_manifest::GitSync::default(),
+                wal: crate::host::git_store::build_wal(&config),
                 tip_tx,
                 ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 isolation: Arc::new(tokio::sync::RwLock::new(

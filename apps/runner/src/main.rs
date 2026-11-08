@@ -42,7 +42,7 @@ pub struct AppState {
     /// Broadcast when the ingest tick appends OTel log rows: the log stream
     /// wakes on this instead of polling (spec T3.3).
     pub log_notify: tokio::sync::watch::Sender<u64>,
-    pub git_sync: host::git_manifest::GitSync,
+    pub wal: host::git_store::GitWal,
     /// Push-driven tip notifications (T2.2): the Git adapter and web commits
     /// send here, the reconcile loop drains every tick and deploys.
     pub tip_tx: host::tips::TipSender,
@@ -388,7 +388,7 @@ async fn main() -> anyhow::Result<()> {
         procs: procs.clone(),
         logs: logs.clone(),
         deploying: deploying.clone(),
-        git_sync: host::git_manifest::GitSync::default(),
+        wal: host::git_store::build_wal(&config),
         tip_tx: tip_tx.clone(),
         log_notify: log_tx.clone(),
         ready: ready.clone(),

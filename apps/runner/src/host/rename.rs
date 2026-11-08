@@ -6,12 +6,12 @@
 //! reconcile loop respawns the fleet and rewrites Caddy from the DB on
 //! its next tick, so no explicit restart/rewrite is needed here.
 //!
-//! Locking (ordering: CREATE_LOCK → AppLock → push_guard, see
-//! [`crate::host::git_manifest::GitSync`]): the service layer holds
+//! Locking (ordering: CREATE_LOCK → AppLock → slug lock, see
+//! [`ryuz_git::GitSync`]): the service layer holds
 //! `CREATE_LOCK` across slug-changing renames (serializing the slug-taken
 //! check → move → row update against creates and other renames); this module
 //! claims the `AppLock` (bailing on an in-flight deploy, 409 at the API
-//! layer) and then holds both slugs' `push_guard`s across the whole move so
+//! layer) and then holds both slugs' locks across the whole move so
 //! no push can write under the old prefix mid-move.
 use std::time::Duration;
 
@@ -125,7 +125,7 @@ pub async fn rename_app(
     procs: &ProcMap,
     logs: &LogState,
     deploying: &Deploying,
-    git_sync: &crate::host::git_manifest::GitSync,
+    git_sync: &ryuz_git::GitSync,
     app_id: &str,
     name: Option<&str>,
     slug: Option<&str>,
@@ -162,7 +162,7 @@ pub async fn rename_app(
     // both slugs' guards — a push to either slug lands fully before or fully
     // after. Taken after the AppLock (ordering: AppLock → push_guard), in
     // lexical order so opposite renames cannot invert.
-    let (_old_push, _new_push) = git_sync.push_guards(&app.slug, new_slug).await;
+    let (_old_push, _new_push) = git_sync.lock_pair(&app.slug, new_slug).await;
     let renamed = rename_slugged(cfg, pool, procs, logs, &app, new_name, new_slug).await?;
     // The old generation ends here: its S3 prefix moved to the new slug, so
     // its seq marker must go too — otherwise a future slug reuse would skip

@@ -65,14 +65,14 @@ pub fn celld_cli_env(cfg: &Config, scope_key: &str) -> Vec<(&'static str, String
 static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| reqwest::Client::builder().build().expect("reqwest client"));
 
-fn http_client() -> &'static reqwest::Client {
+pub(crate) fn http_client() -> &'static reqwest::Client {
     &HTTP_CLIENT
 }
 
 /// Bucket handle for one call: path-style addressing (the bundled RustFS
 /// answers path-style; virtual-host would need wildcard DNS) with the
 /// endpoint, region and credentials the CLI used.
-fn s3_bucket(cfg: &Config, bucket: &str) -> anyhow::Result<(Bucket, Credentials)> {
+pub(crate) fn s3_bucket(cfg: &Config, bucket: &str) -> anyhow::Result<(Bucket, Credentials)> {
     let endpoint: reqwest::Url = cfg
         .s3_endpoint
         .parse()
@@ -206,7 +206,7 @@ fn classify_status(op: &str, target: &str, status: reqwest::StatusCode, body: &s
 }
 
 /// Split an `s3://bucket/key` URI (callers pass `cfg.s3_uri(key)` results).
-fn split_uri(uri: &str) -> anyhow::Result<(&str, &str)> {
+pub(crate) fn split_uri(uri: &str) -> anyhow::Result<(&str, &str)> {
     let rest = uri
         .strip_prefix("s3://")
         .with_context(|| format!("not an S3 URI: {uri}"))?;
@@ -729,10 +729,10 @@ pub(crate) struct S3Object {
 /// that continues it. Callers that page keep the token; callers that
 /// do not use `s3_list_raw`.
 pub(crate) struct S3Page {
+    pub(crate) objects: Vec<S3Object>,
     pub(crate) prefixes: Vec<String>,
     pub(crate) next: Option<String>,
 }
-
 /// One bounded LIST request (unlike `s3_list_raw`, which merges every page).
 pub(crate) async fn s3_list_page(
     cfg: &Config,
@@ -767,6 +767,16 @@ pub(crate) async fn s3_list_page(
     let parsed = rusty_s3::actions::ListObjectsV2::parse_response(&text)
         .with_context(|| "s3 LIST XML parse")?;
     Ok(S3Page {
+        objects: parsed
+            .contents
+            .into_iter()
+            .map(|o| S3Object {
+                key: o.key,
+                last_modified: o.last_modified,
+                size: o.size,
+                etag: o.etag,
+            })
+            .collect(),
         prefixes: parsed
             .common_prefixes
             .into_iter()

@@ -132,12 +132,12 @@ mod tests {
         cfg.s3_endpoint = "http://127.0.0.1:1".into();
         let state = crate::AppState {
             pool: pool.clone(),
-            config: std::sync::Arc::new(cfg),
+            config: std::sync::Arc::new(cfg.clone()),
             procs: supervisor::new_procs(),
             logs: crate::host::logs::new_state(),
             deploying: crate::host::deploy::new_deploying(),
             log_notify: tokio::sync::watch::channel(0u64).0,
-            git_sync: crate::host::git_manifest::GitSync::default(),
+            wal: crate::host::git_store::build_wal(&cfg),
             tip_tx: crate::host::tips::channel().0,
             ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             isolation: std::sync::Arc::new(tokio::sync::RwLock::new(
