@@ -5,7 +5,7 @@ description: Run a repo's build and tests in containers with a light GitHub-Acti
 
 A repo-root `noite.ci.yaml` runs the app's build and tests in a container on every push deploy, instead of the built-in [`install`/`build`](/apps/build) steps. The workflow's `dist/` is what gets released, so a failing test or build never reaches the live version - the old generation keeps serving.
 
-This is a deliberately small subset of GitHub Actions, one container at a time, on the Noite host. It does not make a build fit a host it cannot fit: a 2 GB install still cannot build the ~1.3 GiB Void/Ilha template. Use a bigger box or [`deploy from CI`](/apps/deploy#deploy-from-ci) for that.
+This is a deliberately small subset of GitHub Actions, one container at a time, on the Noite host, implemented by the shared [`ryuz_workflow`](https://crates.io/crates/ryuz_workflow) crate. It does not make a build fit a host it cannot fit: a 2 GB install still cannot build the ~1.3 GiB Void/Ilha template. Use a bigger box or [`deploy from CI`](/apps/deploy#deploy-from-ci) for that.
 
 ## A workflow
 
@@ -26,6 +26,20 @@ jobs:
         env:
           NODE_ENV: production
         timeout-minutes: 10
+      - uses: upload-artifact
+        with: { path: reports/junit.xml, name: junit }
+```
+
+A matrix runs one copy of the job per combination; values reach the steps as `RYUZ_MATRIX_<KEY>` environment variables:
+
+```yaml
+jobs:
+  test:
+    strategy:
+      matrix: { node: [20, 22] }   # test (20), test (22)
+      max-parallel: 1              # deploys run jobs one at a time
+    steps:
+      - run: test "$RYUZ_MATRIX_NODE" = 20 || echo "other version"
 ```
 
 Each job gets a fresh container with the whole checked-out tree at `/work`. Steps share that tree in order; a file written by one step is visible to the next. Jobs also share the host worktree in order, but each job starts with a fresh container and a fresh `/tmp`, so installs are repeated per job - keep one job unless you need a different image.
@@ -37,25 +51,37 @@ Only `dist/` is copied back out after a successful workflow; that is the deploy 
 | Key | Values |
 | --- | --- |
 | `on` | ignored; a push deploy is the trigger |
-| `jobs.<name>` | one container per job, run in file order |
-| `jobs.<name>.image` | an image in the install's allowlist; defaults to `RUNNER_CI_IMAGE` |
+| `name` | workflow display name; informational |
+| `env` | string map, exported to every job and step |
+| `jobs.<name>` | one container per job; jobs run in file order (deploys set `max_parallel: 1`) |
+| `jobs.<name>.image` / `.container` | an image in the install's allowlist; defaults to `RUNNER_CI_IMAGE` |
+| `jobs.<name>.runs-on` | accepted and kept as a hint for other runners; unused locally |
+| `jobs.<name>.env` | string map for that job's steps; a step's own `env` wins |
+| `jobs.<name>.defaults.run` | `shell` / `working-directory` for steps that omit them |
+| `jobs.<name>.timeout-minutes` | 1-360; the container is killed when it expires |
+| `jobs.<name>.strategy` | `matrix`, `max-parallel` (1-256), `fail-fast` (default true) |
 | `jobs.<name>.steps[]` | list of steps |
 | `steps[].name` | shown in the deploy log |
-| `steps[].run` | `sh -lc` inside the container |
+| `steps[].run` | `sh -lc` inside the container (`bash -eo pipefail -lc` with `shell: bash`) |
+| `steps[].shell` | `bash` or `sh` |
 | `steps[].env` | string map, exported for that step only |
 | `steps[].working-directory` | relative to the repo root; must stay inside `/work` |
 | `steps[].timeout-minutes` | 1-120; default 10 |
-| `steps[].uses` | `checkout` is a no-op (the tree is already checked out); no marketplace actions |
+| `steps[].uses` | `checkout` (no-op), `cache` (no-op; `path`/`key` accepted), `upload-artifact` (`path` required, `name` optional); an `@ref` suffix is accepted |
+| `steps[].with` | inputs for `uses`: `path`, `key`, `name` |
 
-Unknown keys fail the deploy with the path (for example `jobs.build.steps[1]: unknown key "shell"`). Limits: config 64 KiB, 32 jobs, 32 steps per job, 32 KiB per `run`, 256 env entries per step.
+Matrix values are exposed as `RYUZ_MATRIX_<KEY>` (key uppercased, `[^A-Z0-9_]` replaced by `_`); an explicit `env` of the same name wins, and two keys that map to one name are a config error. `env` names that configure the host container CLI or the dynamic loader (`PATH`, `HOME`, `TMPDIR`, `LD_*`, `DOCKER_*`, `CONTAINER_*`, `PODMAN_*`, `XDG_*`, proxy/TLS variables) are rejected: export them inside `run` instead.
+
+Unknown keys and `${{ … }}` expressions fail the deploy with the path (for example `jobs.build.steps[1]: unknown key "if"`). Limits: config 64 KiB, 32 declared jobs (256 after `matrix` expansion), 32 steps per job, 32 KiB per `run`, 256 env entries per mapping, 64 KiB per env value, 120 min per step, 360 min per job.
 
 ## How it runs
 
-- The runner creates one container per job (`--cap-drop ALL` plus `CHOWN` only for the ownership prep, `--security-opt no-new-privileges`, no host mounts, no Docker socket inside), copies the checkout in with `docker cp`, runs the steps as the app's build uid (no capabilities), and removes the container even on failure.
+- The runner creates one container per job (`--init`, `--cap-drop ALL` plus `CHOWN` only for the ownership prep, `--security-opt no-new-privileges`, no host mounts, no Docker socket inside), copies the checkout in with `docker cp`, runs the steps as the app's build uid (no capabilities), and removes the container even on failure or a cancelled deploy. Containers carry a `ryuz_workflow.pid` label and leftovers are swept at the start of the next run.
 - Resources: the build memory cap (`RUNNER_BUILD_MEMORY_MB`, with `--memory-swap` equal so the container cannot swap), one CPU less than the box, and `--pids-limit 2048`.
 - `HOME` and the package-manager cache live in a per-app named volume (`noite-ci-cache-<slug>`), so `bun install`, npm and pnpm caches survive across deploys without a host bind.
 - Network defaults to Docker's `bridge` so installs reach registries; `RUNNER_CI_NETWORK=none` gives fully offline jobs. The host's loopback services are not reachable.
-- The app's build environment variables are passed into the container. Do not print secrets; container output is in the deploy log.
+- The app's build environment variables are passed into the container by name (never on the host command line) and every configured value of at least 4 bytes is masked as `***` in the deploy log. Values shorter than that are not masked; do not print secrets regardless. Multi-line values are masked line by line.
+- Step and job timeouts kill the container, and exit 137 is reported as out-of-memory. Artifacts are staged outside the worktree and installed without following symlinks; `upload-artifact` copies its `path` out at that step, and the deploy root `dist/` is copied back after a successful job.
 - A workflow failure fails the deploy before release/activate, so the live version is untouched.
 
 ## Configuration
@@ -72,4 +98,4 @@ Use an exact tag or a digest in `image`; the runner does not resolve digests for
 
 ## Not yet
 
-Marketplace `uses`, `services`, matrices, parallel jobs, and off-host runners. The workflow runs on the Noite host, so it consumes the host's memory and CPU like the built-in build.
+Marketplace `uses` beyond checkout/cache/upload-artifact, `services`, `needs` (jobs are file order, bounded by `max_parallel`), and off-host runners. The workflow runs on the Noite host, so it consumes the host's memory and CPU like the built-in build.
