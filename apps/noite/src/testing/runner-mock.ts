@@ -35,6 +35,17 @@ export interface RunnerMock {
   restore: () => void;
 }
 
+export interface RunnerMockOptions {
+  /** Runs before the canned `apps.create` answer. Return `"timeout"` to make
+   * the call abort the way `AbortSignal.timeout` does when the runner
+   * outlives the control plane's bound — the test can push the row it landed
+   * onto `mock.apps` first, exactly the detached-create case. */
+  onCreate?: (
+    mock: RunnerMock,
+    params: Record<string, string>
+  ) => "timeout" | undefined;
+}
+
 interface RpcCall {
   method: string;
   params: Record<string, string>;
@@ -51,7 +62,10 @@ class RpcFailure {
   }
 }
 
-export const installRunnerMock = (apps: RunnerApp[]): RunnerMock => {
+export const installRunnerMock = (
+  apps: RunnerApp[],
+  options: RunnerMockOptions = {}
+): RunnerMock => {
   controlEnv.RUNNER_TOKEN = "test-token";
   controlEnv.RUNNER_URL = "http://runner.test";
   const original = globalThis.fetch;
@@ -80,6 +94,13 @@ export const installRunnerMock = (apps: RunnerApp[]): RunnerMock => {
       }
 
       case "apps.create": {
+        if (options.onCreate?.(mock, call.params) === "timeout") {
+          throw new DOMException(
+            "The operation was aborted due to timeout.",
+            "TimeoutError"
+          );
+        }
+
         if (mock.apps.some((app) => app.slug === call.params.slug)) {
           return new RpcFailure(409, "slug already taken");
         }

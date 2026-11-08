@@ -190,6 +190,44 @@ export const listAppsForCollaborator = async (
 
   const granted = new Set(grants.map((grant) => grant.appId));
 
+  // A create whose runner RPC outlived the control plane's bound lands after
+  // the caller gave up, so its grant below never ran: the row exists, has no
+  // grant at all, and is invisible (and undeletable) to everyone. Revoking a
+  // creator always leaves another admin on the app, so "no grants anywhere"
+  // is unambiguous evidence of the lost grant, never a revocation: heal it
+  // for the creator. Revoked creators keep their other admins and are not
+  // re-granted here.
+  for (const app of apps) {
+    if (app.userId !== userId || granted.has(app.id)) {
+      continue;
+    }
+
+    // oxlint-disable-next-line eslint/no-await-in-loop -- one candidate at a time; only a grantless app is written
+    const any = await withDb(
+      orm.app_collaborator.findFirst({ where: { appId: app.id } })
+    );
+
+    if (!any) {
+      try {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- the write follows this app's read
+        await withDb(grantCollaborator(app.id, userId, "admin"));
+      } catch (error) {
+        // The page and its SSE stream can heal the same app at once; the
+        // unique (appId, userId) row means the loser reads the winner's.
+        // oxlint-disable-next-line eslint/no-await-in-loop -- one conflict check for this app
+        const raced = await withDb(
+          orm.app_collaborator.findFirst({ where: { appId: app.id, userId } })
+        );
+
+        if (!raced) {
+          throw error;
+        }
+      }
+
+      granted.add(app.id);
+    }
+  }
+
   return apps
     .filter((app) => granted.has(app.id))
     .toSorted(

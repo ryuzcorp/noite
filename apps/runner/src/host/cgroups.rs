@@ -274,6 +274,50 @@ pub fn build_oom_kills(dir: &Path) -> Option<u64> {
     parse_oom_kills(&text)
 }
 
+/// A build leaf pinned at its `memory.max` while stalling on reclaim is not
+/// going to finish: every allocation evicts file pages the step then has to
+/// re-read, so it burns CPU in the kernel until its timeout (a Vite build
+/// with a 613 MiB cap on a 1.6 GiB box read 314 GB in ten minutes while its
+/// anon stayed just under the cap, so the kernel never OOM-killed it).
+///
+/// The exec watchdog samples this every few seconds and fails the step after
+/// it stays true: `memory.current` at ≥90% of `memory.max` and the leaf's own
+/// `memory.pressure` `full avg10` ≥ 10%. A build that is merely large but
+/// progressing does not sit at the cap under sustained full pressure; and
+/// anything unreadable (cgroup v1, PSI off) reads as "not pinned", so
+/// containment only ever fails a build it can positively see stuck.
+pub fn build_thrash_pinned(dir: &Path) -> bool {
+    let read_u64 = |name: &str| {
+        std::fs::read_to_string(dir.join(name))
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    };
+    let Some(max) = read_u64("memory.max") else {
+        return false;
+    };
+    let Some(current) = read_u64("memory.current") else {
+        return false;
+    };
+    if max == 0 || current.saturating_mul(100) < max.saturating_mul(90) {
+        return false;
+    }
+    std::fs::read_to_string(dir.join("memory.pressure"))
+        .ok()
+        .and_then(|text| parse_full_avg10(&text))
+        .is_some_and(|full| full >= 10.0)
+}
+
+/// `full avg10=` from a cgroup `memory.pressure` body.
+fn parse_full_avg10(text: &str) -> Option<f64> {
+    let full = text.lines().find(|line| line.starts_with("full "))?;
+    let avg10 = full
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("avg10="))?;
+    avg10.parse().ok()
+}
+
 /// The build budget and every live build leaf for `/ready`: charge,
 /// high-water mark and OOM count per deploy key. `null` when cgroups are
 /// unavailable; `memory_mb` is still reported then.
@@ -1176,6 +1220,45 @@ mod tests {
         assert_eq!(parse_oom_kills(text), Some(4));
         assert_eq!(parse_oom_kills("low 0\noom 1\n"), None);
         assert_eq!(parse_oom_kills(""), None);
+    }
+
+    fn write_leaf(dir: &Path, current: u64, pressure: Option<&str>) {
+        std::fs::write(dir.join("memory.max"), "642777088\n").expect("memory.max");
+        std::fs::write(dir.join("memory.current"), format!("{current}\n")).expect("memory.current");
+        if let Some(text) = pressure {
+            std::fs::write(dir.join("memory.pressure"), text).expect("memory.pressure");
+        }
+    }
+
+    const THRASHING: &str = "some avg10=17.84 avg60=21.90 avg300=19.69 total=1\n\
+                             full avg10=16.49 avg60=19.22 avg300=17.24 total=1\n";
+
+    #[test]
+    fn build_thrash_pinned_flags_a_cap_bound_leaf_under_full_pressure() {
+        let tmp = fakefs();
+        write_leaf(tmp.path(), 642_000_000, Some(THRASHING));
+        assert!(build_thrash_pinned(tmp.path()));
+    }
+
+    #[test]
+    fn build_thrash_pinned_needs_the_cap_and_the_stall() {
+        let tmp = fakefs();
+        // A large build with headroom is making progress, not thrashing.
+        write_leaf(tmp.path(), 400_000_000, Some(THRASHING));
+        assert!(!build_thrash_pinned(tmp.path()));
+        // Pinned but not stalled: the step is still doing work.
+        write_leaf(
+            tmp.path(),
+            642_000_000,
+            Some("full avg10=1.5 avg60=1.0 avg300=0.5 total=1\n"),
+        );
+        assert!(!build_thrash_pinned(tmp.path()));
+        // No PSI (cgroup v1 or PSI off) never fails a build.
+        write_leaf(tmp.path(), 642_000_000, None);
+        assert!(!build_thrash_pinned(tmp.path()));
+        // An uncapped leaf (no memory.max) is never thrashing.
+        std::fs::remove_file(tmp.path().join("memory.max")).expect("drop memory.max");
+        assert!(!build_thrash_pinned(tmp.path()));
     }
 
     #[test]

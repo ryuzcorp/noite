@@ -176,6 +176,40 @@ const toRunnerSource = (
   };
 };
 
+/** Adopt the row of a create that outlived the control plane's bound: the
+ * runner runs create detached, so the app lands after the RPC was aborted
+ * and the grant below never ran — an app with no grant is invisible to every
+ * list. Poll by slug for up to 10 s. `null` when it never appeared or was
+ * created for someone else. */
+const adoptSlowCreate = async (
+  slug: string,
+  userId: string
+): Promise<RunnerApp | null> => {
+  // A deadline, not an attempt count: this path runs exactly when the runner
+  // is slow, and each lookup can itself take RUNNER_TIMEOUT_MS (5 s).
+  const deadline = Date.now() + 10_000;
+
+  for (;;) {
+    // oxlint-disable-next-line eslint/no-await-in-loop -- polling: each attempt must observe the row the last one missed
+    const existing = await runnerGetAppBySlug(slug).catch(() => null);
+
+    if (existing) {
+      return existing.userId === userId ? existing : null;
+    }
+
+    if (Date.now() >= deadline) {
+      return null;
+    }
+
+    const { promise, resolve } = Promise.withResolvers<null>();
+    setTimeout(() => {
+      resolve(null);
+    }, 500);
+    // oxlint-disable-next-line eslint/no-await-in-loop -- the next poll waits this interval
+    await promise;
+  }
+};
+
 /** Create an app for one account and grant that account admin — the single
  * implementation behind the create action and /internal/git-auth's
  * push-to-create (A5). The runner owns the app row; the grant is ours, and a
@@ -208,6 +242,19 @@ export const createAppForUser = async (input: {
       const existing = await runnerGetAppBySlug(input.slug).catch(() => null);
 
       if (existing?.userId !== input.account.id) {
+        throw error;
+      }
+
+      app = existing;
+    } else if (
+      // The same detached create, but the caller saw the abort: adopt the
+      // row when it lands instead of leaving the app un-granted.
+      error instanceof Error &&
+      (error.name === "TimeoutError" || error.name === "AbortError")
+    ) {
+      const existing = await adoptSlowCreate(input.slug, input.account.id);
+
+      if (!existing) {
         throw error;
       }
 

@@ -12,6 +12,13 @@ use tokio::process::Command;
 
 use crate::config::Config;
 
+/// How often the build thrash watchdog samples its cgroup leaf.
+const THRASH_SAMPLE: Duration = Duration::from_secs(5);
+/// Consecutive samples a leaf must stay pinned before the step is failed
+/// (30 s). A build that is merely large dips in and out of the cap; one
+/// stuck under full memory pressure stays there.
+const THRASH_SAMPLES: u32 = 6;
+
 /// Explicit base environment for tenant builds (SPEC, Build and release sandbox).
 /// Nothing is inherited: `run_sandboxed` starts from `env_clear()` plus
 /// these, then the already-denylisted tenant vars.
@@ -368,7 +375,43 @@ pub async fn run_sandboxed(
     }
     let child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
     let pid = child.id();
+    // A build pinned at its cap never OOMs: it reclaims its own page cache
+    // continuously, re-reading the files it just evicted, until the step
+    // timeout. Sample the leaf while the step runs and kill it once the leaf
+    // proves it is stuck (see `build_thrash_pinned`); the flag turns the exit
+    // into the budget error below instead of a bare exit 137.
+    let thrash = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Only a capped leaf can thrash; an uncapped install (0 = uncapped) has
+    // no `memory.max` to pin against, so skip the sampler entirely.
+    let watchdog = sb
+        .cgroup
+        .filter(|_| crate::host::cgroups::build_memory_mb().is_some_and(|mb| mb > 0))
+        .map(|leaf| {
+            let leaf = leaf.to_path_buf();
+            let thrash = thrash.clone();
+            tokio::spawn(async move {
+                let mut pinned = 0u32;
+                loop {
+                    tokio::time::sleep(THRASH_SAMPLE).await;
+                    pinned = if crate::host::cgroups::build_thrash_pinned(&leaf) {
+                        pinned + 1
+                    } else {
+                        0
+                    };
+                    if pinned >= THRASH_SAMPLES {
+                        if let Some(pid) = pid {
+                            kill_group(pid);
+                        }
+                        thrash.store(true, std::sync::atomic::Ordering::SeqCst);
+                        return;
+                    }
+                }
+            })
+        });
     let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    if let Some(watchdog) = watchdog {
+        watchdog.abort();
+    }
     // Whatever happened, nothing the step started may outlive it: a build
     // that leaves a watcher or a server behind would keep running as the
     // build uid between steps. The group id is the child's pid
@@ -379,6 +422,16 @@ pub async fn run_sandboxed(
         unsafe {
             libc::killpg(pid as i32, libc::SIGKILL);
         }
+    }
+    // The watchdog's kill is the build failing to make progress at its cap,
+    // not a crash: name the budget and the two ways out, like the OOM case.
+    if thrash.load(std::sync::atomic::Ordering::SeqCst)
+        && !matches!(&result, Ok(Ok(output)) if output.status.success())
+    {
+        bail!(
+            "the build is not making progress inside its {} MiB memory budget (RUNNER_BUILD_MEMORY_MB): it stays pinned at the cgroup's memory.max and stalls on reclaim, so it would only end at the step timeout. Raise the budget (if the box has the RAM for it) or deploy a prebuilt dist from CI; the runner and the apps kept serving",
+            crate::host::cgroups::build_memory_mb().unwrap_or(0)
+        );
     }
     // A rise in the leaf's OOM counter is this step outgrowing its budget:
     // say so, instead of a bare signal or timeout and a log the operator has

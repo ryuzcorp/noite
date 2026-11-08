@@ -147,10 +147,34 @@ describe("access gate", () => {
 });
 
 describe("listAppsForCollaborator", () => {
-  test("lists granted apps only — not apps the account merely created", async () => {
-    await withDb(grantCollaborator(OTHER.id, "u-creator", "view"));
+  test("heals an app whose creator grant never landed", async () => {
+    // The create RPC outlived the control plane's bound, so APP exists with
+    // no grant at all: nobody can see or delete it.
+    expect(await listCollaboratorRows(APP.id)).toHaveLength(0);
+
     const apps = await listAppsForCollaborator("u-creator");
+
+    expect(apps.map((app) => app.id)).toEqual([APP.id]);
+    const rows = await listCollaboratorRows(APP.id);
+    expect(rows.map((row) => [row.userId, row.role])).toEqual([
+      ["u-creator", "admin"],
+    ]);
+    // Healed once: the grant is not duplicated on the next list.
+    await listAppsForCollaborator("u-creator");
+    expect(await listCollaboratorRows(APP.id)).toHaveLength(1);
+  });
+
+  test("lists granted apps and never resurrects a revoked creator", async () => {
+    await withDb(grantCollaborator(OTHER.id, "u-creator", "view"));
+    // A revoked creator still leaves this admin grant, so the app is not
+    // grantless and the heal above must not re-add the creator.
+    await withDb(grantCollaborator(APP.id, "u-view", "admin"));
+
+    const apps = await listAppsForCollaborator("u-creator");
+
     expect(apps.map((app) => app.id)).toEqual([OTHER.id]);
+    const rows = await listCollaboratorRows(APP.id);
+    expect(rows.map((row) => row.userId)).toEqual(["u-view"]);
   });
 });
 
