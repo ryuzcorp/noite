@@ -3,9 +3,6 @@ pub mod build_output;
 pub mod caddy;
 pub mod cgroups;
 pub mod children;
-// The deploy integration (parent slice) wires `ci` into `deploy_inner`;
-// until then the API is exercised only by its tests.
-pub mod ci;
 pub mod container_image;
 pub mod control;
 pub mod credentials;

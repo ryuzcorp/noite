@@ -26,6 +26,9 @@ use crate::lifecycle::{self, sha_same};
 use crate::models::{App, AppStatus, DeployStatus, Environment};
 use sqlx::SqlitePool;
 
+/// The workflow file a repo root may carry (read by the deploy).
+const CI_CONFIG_NAME: &str = "noite.ci.yaml";
+
 /// Per-app exclusive lock shared by deploy and purge/delete so S3 fleets/git
 /// never see overlapping writers (ghost LTX / RestoreFailed after partial wipe).
 /// A plain mutex: every critical section below is brief and never held across
@@ -712,26 +715,24 @@ async fn deploy_inner(
     // Noite CI (SPEC): a repo-root `noite.ci.yaml` runs the jobs in
     // containers and replaces the built-in install/build; the workflow must
     // leave a `dist/` for the deploy. A failure here runs no release or
-    // activate, so the live version is untouched.
+    // activate, so the live version is untouched. The engine is the shared
+    // `ryuz_workflow` crate (parsed here, integrated here); its events format
+    // into the same log lines the deploy progress records.
     let mut ci_ran = false;
     if cfg.ci_enabled {
-        match tokio::fs::read_to_string(src_dir.join(crate::host::ci::CI_CONFIG_NAME)).await {
+        match tokio::fs::read_to_string(src_dir.join(CI_CONFIG_NAME)).await {
             Ok(contents) => {
-                let workflow = crate::host::ci::parse(&contents)
-                    .with_context(|| format!("{} is invalid", crate::host::ci::CI_CONFIG_NAME))?;
+                let workflow = ryuz_workflow::parse(&contents)
+                    .with_context(|| format!("{CI_CONFIG_NAME} is invalid"))?;
                 progress
-                    .step(
-                        "ci",
-                        DeployStatus::Building,
-                        crate::host::ci::CI_CONFIG_NAME,
-                    )
+                    .step("ci", DeployStatus::Building, CI_CONFIG_NAME)
                     .await?;
                 let cores = crate::host::memory::cores().max(1) as u64;
                 let ci_env: Vec<(String, String)> = step_env
                     .iter()
                     .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
                     .collect();
-                let settings = crate::host::ci::CiSettings {
+                let settings = ryuz_workflow::Settings {
                     docker_bin: cfg.ci_docker_bin.clone(),
                     default_image: cfg.ci_default_image.clone(),
                     allowed_images: cfg.ci_allowed_images.clone(),
@@ -744,13 +745,22 @@ async fn deploy_inner(
                     cpus: cores.saturating_sub(1).max(1) as f64,
                     uid: sandbox_id.unwrap_or(0),
                     gid: sandbox_id.unwrap_or(0),
-                    cache_volume: format!("noite-ci-cache-{}", app.slug),
+                    cache_volume: Some(format!("noite-ci-cache-{}", app.slug)),
                     env: ci_env,
+                    container_prefix: "noite-ci".to_string(),
+                    artifact_dir: Some("dist".to_string()),
+                    platform: None,
+                    pull: ryuz_workflow::PullPolicy::Missing,
+                    max_parallel: 1,
+                    run_timeout: None,
                 };
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                let running = crate::host::ci::run(&settings, &src_dir, &workflow, move |line| {
-                    let _ = tx.send(line);
-                });
+                let running =
+                    ryuz_workflow::run_with_events(&settings, &src_dir, &workflow, move |event| {
+                        if let Some(line) = ryuz_workflow::format_event(&event) {
+                            let _ = tx.send(line);
+                        }
+                    });
                 tokio::pin!(running);
                 let outcome = loop {
                     tokio::select! {
@@ -767,11 +777,17 @@ async fn deploy_inner(
                         .log(DeployStatus::Building, &format!("{line}\n"))
                         .await?;
                 }
+                if !outcome.success() {
+                    let failed = outcome
+                        .jobs
+                        .iter()
+                        .filter(|job| !job.success())
+                        .map(|job| job.name.as_str())
+                        .collect::<Vec<_>>();
+                    anyhow::bail!("{CI_CONFIG_NAME} failed: {}", failed.join(", "));
+                }
                 if outcome.artifact_path.is_none() {
-                    anyhow::bail!(
-                        "{} finished but produced no dist/ to deploy",
-                        crate::host::ci::CI_CONFIG_NAME
-                    );
+                    anyhow::bail!("{CI_CONFIG_NAME} finished but produced no dist/ to deploy");
                 }
                 exec::check_work_quota(&work, cfg.build_max_mb)?;
                 ci_ran = true;

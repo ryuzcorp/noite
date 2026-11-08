@@ -58,7 +58,9 @@ argon2 = "0.6.0"
 hyper = { version = "1.12", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 http-body-util = "0.1.5"
-serde_yaml_ng = "0.10"
+# The Noite CI engine (`noite.ci.yaml`): parser + container runner shared
+# from ryuzcorp/crates (Apache-2.0).
+ryuz_workflow = "0.1"
 
 [dev-dependencies]
 # `time::pause`/`advance` for the DNS-timeout test; tests only.
