@@ -330,7 +330,7 @@ async fn import_into(
     // (`run_grouped`), so by here the repository is within it.
     let upstream_sha =
         clone_scratch(target, source.reference.as_deref(), scratch, protocols).await?;
-    let mirror = git_http::ensure_bare(&state.config, &app.slug).await?;
+    let mirror = state.wal.ensure_synced(&app.slug).await?;
     // Objects only: moving a ref here would make `after_receive` see no change
     // and publish nothing, so the temp ref is the fetch target and `publish_ref`
     // does the one visible ref move below.

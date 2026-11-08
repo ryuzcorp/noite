@@ -19,10 +19,10 @@ use crate::AppState;
 /// honest fix: the whole check → purge → quota → insert sequence runs alone.
 ///
 /// Lock ordering with the other guards (deadlock rule, see
-/// [`crate::host::git_manifest::GitSync`]): `CREATE_LOCK` is outermost, then
-/// the per-app `AppLock`, then the per-slug `push_guard`. Create holds
-/// `CREATE_LOCK` + its slug's `push_guard`; a slug-changing rename holds all
-/// three; delete holds `AppLock` + its slug's `push_guard`.
+/// [`ryuz_git::GitSync`]): `CREATE_LOCK` is outermost, then
+/// the per-app `AppLock`, then the per-slug lock. Create holds
+/// `CREATE_LOCK` + its slug's lock; a slug-changing rename holds all
+/// three; delete holds `AppLock` + its slug's lock.
 static CREATE_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -116,11 +116,11 @@ async fn create_inner(
     // the insert cannot interleave with another create.
     let _create = CREATE_LOCK.lock().await;
     // R-12: the purge destroys the same `git/<slug>/` + `fleets/<slug>/`
-    // prefixes pushes write under `push_guard(&slug)`, so the guard stays
-    // held across purge → init → insert (ordering: CREATE_LOCK → push_guard).
+    // prefixes pushes write under the slug lock, so the guard stays
+    // held across purge → init → insert (ordering: CREATE_LOCK → slug lock).
     // A push to a half-created slug either lands fully before the purge or
     // waits for the row.
-    let _push = state.git_sync.push_guard(slug).await;
+    let _push = state.wal.lock(slug).await;
     match db::get_app_by_slug(&state.pool, slug).await {
         Ok(Some(_)) => return Err(ApiError::conflict("slug already taken")),
         Ok(None) => {}
@@ -134,7 +134,7 @@ async fn create_inner(
         &state.config,
         &state.procs,
         &state.logs,
-        &state.git_sync,
+        state.wal.sync(),
         slug,
         supervisor::StopGrace::NORMAL,
     )
@@ -163,7 +163,7 @@ async fn create_inner(
     }
     // A0: both bare mirrors exist, HEAD at `main`, before the app row does — a
     // failure here leaves no half-created app behind.
-    if let Err(e) = git_http::init_repos(&state.config, slug).await {
+    if let Err(e) = git_http::init_repos(state, slug).await {
         return Err(ApiError::internal(format!(
             "failed to initialize the git repositories: {e:#}"
         )));
@@ -339,7 +339,7 @@ async fn rename_inner(
         &state.procs,
         &state.logs,
         &state.deploying,
-        &state.git_sync,
+        state.wal.sync(),
         id,
         name,
         slug,
@@ -459,9 +459,9 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     // Same lock as deploy: wait out an in-flight build, then purge exclusively.
     // The row is deleted while the claim is still held (R-01): a waiter that
     // acquires after us must find no row and bail instead of building into
-    // the just-purged prefix. Ordering here is AppLock → push_guard (see
-    // [`crate::host::git_manifest::GitSync`]); `purge_slug` requires its
-    // callers to hold the slug's push guard. The guard releases on every
+    // the just-purged prefix. Ordering here is AppLock → slug lock (see
+    // [`ryuz_git::GitSync`]); `purge_slug` requires its
+    // callers to hold the slug's lock. The guard releases on every
     // return below — and on cancel or panic — so a dropped delete can never
     // wedge later deletes behind a stale "deploy in flight".
     let Some(claim) =
@@ -469,9 +469,9 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     else {
         return Err(ApiError::conflict("deploy in flight; retry delete shortly"));
     };
-    // R-02: a concurrent push writes under `push_guard(&slug)` across git +
+    // R-02: a concurrent push writes under the slug lock across git +
     // S3 + manifest; the purge must not run inside one of those writes.
-    let push = state.git_sync.push_guard(&app.slug).await;
+    let push = state.wal.lock(&app.slug).await;
     // Mark it stopped before the fleet goes down: the purge takes seconds
     // (S3 prefixes), and an app still marked running is respawned in that
     // window by the reconcile loop or by a wake. A failed purge leaves the
@@ -485,7 +485,7 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
         &state.config,
         &state.procs,
         &state.logs,
-        &state.git_sync,
+        state.wal.sync(),
         &app.slug,
         supervisor::StopGrace::FOR_DELETE,
     )
@@ -552,11 +552,31 @@ mod tests {
 
     use super::*;
 
-    /// In-process S3 stand-in: every request answers an empty `ListObjectsV2`
-    /// page, so purge and cold-mirror hydration see "nothing there" instead of
-    /// dialing RustFS (the stub the API parity tests use). Bodies and deletes
-    /// are never reached: an empty listing short-circuits both.
+    /// In-process S3 stand-in: LIST answers an empty `ListObjectsV2` page, and
+    /// object GET/HEAD answer 404 `NoSuchKey`, so purge and cold-mirror
+    /// hydration see "nothing there" instead of dialing RustFS (the stub the
+    /// API parity tests use). Bodies and deletes never reach it: an empty
+    /// listing plus missing keys short-circuit both.
     async fn spawn_s3_stub() -> String {
+        fn is_object_op(request: &[u8]) -> Option<bool> {
+            let line = request
+                .split(|byte| *byte == b'\n')
+                .next()
+                .and_then(|line| std::str::from_utf8(line).ok())?;
+            let target = line.split_whitespace().nth(1)?;
+            let mut halves = target.splitn(2, '?');
+            let path = halves.next().unwrap_or("");
+            let query = halves.next().unwrap_or("");
+            // Bucket actions (LIST, batch delete) sign with or without a
+            // trailing slash; only a `list-type` query makes one a listing.
+            if query.contains("list-type") {
+                return Some(false);
+            }
+            Some(path.trim_start_matches('/').contains('/'))
+        }
+        fn is_read(request: &[u8]) -> bool {
+            request.starts_with(b"GET ") || request.starts_with(b"HEAD ")
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind s3 stub");
@@ -570,14 +590,31 @@ mod tests {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = vec![0u8; 8192];
                     let _ = sock.read(&mut buf).await;
-                    let body = concat!(
-                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
-                        "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
-                        "<Name>noite</Name><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>",
-                        "</ListBucketResult>"
-                    );
+                    let object = is_object_op(&buf).unwrap_or(false);
+                    let (status, body) = if object && is_read(&buf) {
+                        (
+                            "404 Not Found",
+                            concat!(
+                                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                                "<Error><Code>NoSuchKey</Code>",
+                                "<Message>missing</Message></Error>",
+                            ),
+                        )
+                    } else if object {
+                        ("200 OK", "")
+                    } else {
+                        (
+                            "200 OK",
+                            concat!(
+                                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                                "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+                                "<Name>noite</Name><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>",
+                                "</ListBucketResult>"
+                            ),
+                        )
+                    };
                     let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = sock.write_all(resp.as_bytes()).await;
@@ -628,12 +665,12 @@ mod tests {
         let (log_notify, _log_rx) = tokio::sync::watch::channel(0u64);
         let state = AppState {
             pool,
-            config,
+            config: config.clone(),
             procs: crate::host::supervisor::new_procs(),
             logs: crate::host::logs::new_state(),
             deploying: crate::host::deploy::new_deploying(),
             log_notify,
-            git_sync: crate::host::git_manifest::GitSync::default(),
+            wal: crate::host::git_store::build_wal(&config),
             tip_tx,
             ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             isolation: Arc::new(tokio::sync::RwLock::new(
@@ -867,7 +904,7 @@ mod tests {
     #[tokio::test]
     async fn create_waits_for_an_in_flight_push_guard() {
         let (state, dir) = test_state(10).await;
-        let _push = state.git_sync.push_guard("guarded").await;
+        let _push = state.wal.sync().lock("guarded").await;
         let owned = state.clone();
         let mut creating =
             tokio::spawn(
@@ -899,7 +936,7 @@ mod tests {
     #[tokio::test]
     async fn dropped_create_caller_does_not_cancel_the_create() {
         let (state, dir) = test_state(10).await;
-        let guard = state.git_sync.push_guard("slow-create").await;
+        let guard = state.wal.sync().lock("slow-create").await;
         let done = crate::service::detached::finished("create:slow-create");
         let owned = state.clone();
         let mut caller =
@@ -936,7 +973,7 @@ mod tests {
         let app = create(&state, "Mover", "ps-old", Some("u1"), None)
             .await
             .expect("create");
-        let _push = state.git_sync.push_guard("ps-old").await;
+        let _push = state.wal.sync().lock("ps-old").await;
         let owned = state.clone();
         let id = app.id.clone();
         let mut renaming =
@@ -1023,7 +1060,7 @@ mod tests {
         let app = create(&state, "Mover", "ps-old", Some("u1"), None)
             .await
             .expect("create");
-        let guard = state.git_sync.push_guard("ps-old").await;
+        let guard = state.wal.sync().lock("ps-old").await;
         let done = crate::service::detached::finished(&format!("rename:{}", app.id));
         let owned = state.clone();
         let id = app.id.clone();
@@ -1085,11 +1122,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), reached.notified())
             .await
             .expect("the post-delete cleanup never reached the edge push");
-        let push = tokio::time::timeout(
-            Duration::from_millis(500),
-            state.git_sync.push_guard("doomed"),
-        )
-        .await;
+        let push =
+            tokio::time::timeout(Duration::from_millis(500), state.wal.sync().lock("doomed")).await;
         assert!(
             push.is_ok(),
             "the deleted slug's push guard is still held while cleanup runs"
@@ -1127,7 +1161,24 @@ mod tests {
         let outer_release = release.clone();
         let outer_armed = armed.clone();
         tokio::spawn(async move {
-            let body = concat!(
+            fn is_object_op(request: &[u8]) -> Option<bool> {
+                let line = request
+                    .split(|byte| *byte == b'\n')
+                    .next()
+                    .and_then(|line| std::str::from_utf8(line).ok())?;
+                let target = line.split_whitespace().nth(1)?;
+                let mut halves = target.splitn(2, '?');
+                let path = halves.next().unwrap_or("");
+                let query = halves.next().unwrap_or("");
+                if query.contains("list-type") {
+                    return Some(false);
+                }
+                Some(path.trim_start_matches('/').contains('/'))
+            }
+            fn is_read(request: &[u8]) -> bool {
+                request.starts_with(b"GET ") || request.starts_with(b"HEAD ")
+            }
+            let list_body = concat!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
                 "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
                 "<Name>noite</Name><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>",
@@ -1141,7 +1192,7 @@ mod tests {
                 let release = outer_release.clone();
                 let armed = outer_armed.clone();
                 let parked = parked.clone();
-                let body = body.to_string();
+                let list_body = list_body.to_string();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = vec![0u8; 8192];
@@ -1152,8 +1203,23 @@ mod tests {
                         entered.notify_one();
                         release.notified().await;
                     }
+                    let object = is_object_op(&buf).unwrap_or(false);
+                    let (status, body) = if object && is_read(&buf) {
+                        (
+                            "404 Not Found",
+                            concat!(
+                                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                                "<Error><Code>NoSuchKey</Code>",
+                                "<Message>missing</Message></Error>",
+                            ),
+                        )
+                    } else if object {
+                        ("200 OK", "")
+                    } else {
+                        ("200 OK", list_body.as_str())
+                    };
                     let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = sock.write_all(resp.as_bytes()).await;

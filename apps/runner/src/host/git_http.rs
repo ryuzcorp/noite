@@ -28,10 +28,9 @@ use serde_json::json;
 use crate::config::Config;
 use crate::db;
 use crate::host::exec;
-use crate::host::git_manifest::{self, Manifest, ManifestRef};
 use crate::host::git_policy::{self, PolicyDecision};
 use crate::host::s3;
-use crate::host::tips::TipBundle;
+use crate::host::tips::{RefTip, TipBundle};
 use crate::models::App;
 use crate::AppState;
 
@@ -183,6 +182,10 @@ fn repo_not_found(message: &str) -> Response {
     (StatusCode::NOT_FOUND, message.to_string()).into_response()
 }
 
+/// Test-only mirror locator: the canonical push-mirror path the WAL manages
+/// (`Wal::mirror_path`). Production goes through the WAL; tests seed bare
+/// mirrors at this path directly.
+#[cfg(test)]
 pub fn http_bare(cfg: &Config, slug: &str) -> PathBuf {
     exec::work_root(cfg)
         .join("git-http")
@@ -262,116 +265,18 @@ pub(crate) async fn init_bare(repo: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) async fn ensure_bare(cfg: &Config, slug: &str) -> anyhow::Result<PathBuf> {
-    let bare = http_bare(cfg, slug);
-    // Work-dir-derived paths are operator-influenced (a non-UTF-8 mount):
-    // fail the request instead of panicking the task.
-    let Some(parent) = bare.parent() else {
-        anyhow::bail!("bare mirror path has no parent: {}", bare.display());
-    };
-    tokio::fs::create_dir_all(parent).await?;
-    if !bare.join("HEAD").exists() {
-        init_bare(&bare).await?;
-        hydrate_from_s3(cfg, &bare, slug).await?;
-        // Cold hydration only: the listing is not the linearization point, so
-        // a delete interrupted between the manifest flip and its prune left a
-        // tip bundle behind, and the manifest wins before anyone reads or
-        // writes through this mirror (warn-only — see
-        // `forge::sync_manifest_cfg`). Hot callers follow with a seq-guarded
-        // sync (`apply_manifest`, `refresh_from_manifest`); syncing here on
-        // every call would let one stale manifest read delete a ref a newer
-        // write just added.
-        crate::host::forge::sync_manifest_cfg(cfg, slug, &bare).await;
-    }
-    Ok(bare)
-}
-
 /// A0: initialize both bare mirrors a new app owns — the push mirror the Git
 /// adapter writes and the source mirror previews/deploys read — with HEAD at
 /// the default branch. `apps.create` calls this before the row lands, so a
-/// fresh app never has an unborn default branch.
-pub(crate) async fn init_repos(cfg: &Config, slug: &str) -> anyhow::Result<()> {
-    ensure_bare(cfg, slug).await?;
-    let source = crate::host::source::bare_repo(cfg, slug);
+/// fresh app never has an unborn default branch. The caller holds the slug's
+/// lock, so the locked sync variant runs here: re-taking it would
+/// self-deadlock.
+pub(crate) async fn init_repos(state: &AppState, slug: &str) -> anyhow::Result<()> {
+    state.wal.ensure_synced_locked(slug).await?;
+    let source = crate::host::source::bare_repo(&state.config, slug);
     if !source.join("HEAD").exists() {
         init_bare(&source).await?;
     }
-    Ok(())
-}
-
-async fn hydrate_from_s3(cfg: &Config, bare: &Path, slug: &str) -> anyhow::Result<()> {
-    let prefix = format!("git/{slug}/refs/");
-    let json = s3::s3_list_prefix(cfg, &cfg.s3_bucket, &prefix).await?;
-    if json.trim().is_empty() || json.trim() == "null" {
-        return Ok(());
-    }
-    let v: serde_json::Value = serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
-    let Some(contents) = v.get("Contents").and_then(|c| c.as_array()) else {
-        return Ok(());
-    };
-    // Static invariant: a compile-time literal, so construction never fails.
-    let re = regex::Regex::new(r"(?i)/([0-9a-f]{7,40})\.bundle$").expect("bundle re");
-    // ref → (key, sha, last_modified)
-    let mut best: HashMap<String, (String, String, String)> = HashMap::new();
-    for obj in contents {
-        let Some(key) = obj.get("Key").and_then(|k| k.as_str()) else {
-            continue;
-        };
-        let Some(caps) = re.captures(key) else {
-            continue;
-        };
-        // Static invariant: group 1 is present in the literal above, so a match always yields it.
-        let sha = caps.get(1).unwrap().as_str().to_lowercase();
-        // git/{slug}/refs/heads/main/{sha}.bundle → refs/heads/main
-        let Some(after) = key.strip_prefix(&format!("git/{slug}/")) else {
-            continue;
-        };
-        let Some((ref_path, _)) = after.rsplit_once('/') else {
-            continue;
-        };
-        if !ref_path.starts_with("refs/") {
-            continue;
-        }
-        let lm = obj
-            .get("LastModified")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-        let replace = best
-            .get(ref_path)
-            .map(|b| lm.as_str() >= b.2.as_str())
-            .unwrap_or(true);
-        if replace {
-            best.insert(ref_path.to_string(), (key.to_string(), sha, lm));
-        }
-    }
-    let tmp = exec::work_root(cfg)
-        .join("git-http")
-        .join(format!(".hydrate-{slug}"));
-    tokio::fs::create_dir_all(&tmp).await?;
-    for (refname, (key, sha, _)) in best {
-        let bundle = tmp.join(format!("{sha}.bundle"));
-        s3::s3_cp_download(cfg, &cfg.s3_uri(&key), &bundle).await?;
-        let refspec = format!("+{sha}:{refname}");
-        let Some(bundle_arg) = bundle.to_str() else {
-            anyhow::bail!("bundle path is not valid UTF-8: {}", bundle.display());
-        };
-        exec::run_cmd(
-            "git",
-            &[
-                &format!("--git-dir={}", bare.display()),
-                "fetch",
-                bundle_arg,
-                &refspec,
-            ],
-            None,
-            &[],
-            Duration::from_secs(60),
-        )
-        .await?;
-        let _ = tokio::fs::remove_file(&bundle).await;
-    }
-    let _ = tokio::fs::remove_dir_all(&tmp).await;
     Ok(())
 }
 
@@ -431,84 +336,9 @@ pub(crate) async fn list_refs(bare: &Path) -> anyhow::Result<HashMap<String, Str
 /// Where workspace previews commit: a hidden ref per (user, branch) pair.
 pub const PREVIEW_REF_PREFIX: &str = "refs/previews/";
 
-async fn set_ref(bare: &Path, refname: &str, sha: Option<&str>) -> anyhow::Result<()> {
-    match sha {
-        Some(sha) => {
-            exec::run_cmd(
-                "git",
-                &[
-                    &format!("--git-dir={}", bare.display()),
-                    "update-ref",
-                    refname,
-                    sha,
-                ],
-                None,
-                &[],
-                Duration::from_secs(15),
-            )
-            .await?;
-        }
-        None => {
-            let _ = exec::run_cmd(
-                "git",
-                &[
-                    &format!("--git-dir={}", bare.display()),
-                    "update-ref",
-                    "-d",
-                    refname,
-                ],
-                None,
-                &[],
-                Duration::from_secs(15),
-            )
-            .await;
-        }
-    }
-    Ok(())
-}
-
-/// Write one tip bundle for a ref. No manifest flip here, so a half-written
-/// push stays invisible to manifest readers.
-async fn write_ref_bundle(
-    cfg: &Config,
-    bare: &Path,
-    slug: &str,
-    refname: &str,
-    sha: &str,
-) -> anyhow::Result<String> {
-    let bundle_key = format!("git/{slug}/{refname}/{sha}.bundle");
-    let tmp = exec::work_root(cfg)
-        .join("git-http")
-        .join(format!(".bundle-{slug}-{sha}"));
-    if let Some(parent) = tmp.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let result = async {
-        exec::run_cmd(
-            "git",
-            &[
-                &format!("--git-dir={}", bare.display()),
-                "bundle",
-                "create",
-                tmp.to_str().unwrap_or_default(),
-                refname,
-            ],
-            None,
-            &[],
-            Duration::from_secs(120),
-        )
-        .await?;
-        s3::s3_cp_upload(cfg, &tmp, &bundle_key).await?;
-        Ok::<_, anyhow::Error>(bundle_key.clone())
-    }
-    .await;
-    let _ = tokio::fs::remove_file(&tmp).await;
-    result
-}
-
 /// Drop superseded tip bundles for a ref (keep the live one). Runs only
 /// after the manifest flip, so concurrent readers already moved on.
-async fn prune_old_bundles(cfg: &Config, slug: &str, refname: &str, keep_key: &str) {
+pub(crate) async fn prune_old_bundles(cfg: &Config, slug: &str, refname: &str, keep_key: &str) {
     let prefix = format!("git/{slug}/{refname}/");
     let Ok(json) = s3::s3_list_prefix(cfg, &cfg.s3_bucket, &prefix).await else {
         return;
@@ -530,7 +360,7 @@ async fn prune_old_bundles(cfg: &Config, slug: &str, refname: &str, keep_key: &s
 }
 
 /// Best-effort recursive delete of one ref's prefix (ref deletions).
-async fn delete_ref_prefix(cfg: &Config, slug: &str, refname: &str) {
+pub(crate) async fn delete_ref_prefix(cfg: &Config, slug: &str, refname: &str) {
     let bucket = cfg.s3_bucket.clone();
     let prefix = format!("git/{slug}/{refname}/");
     let _ = s3::s3_rm_prefix(cfg, &bucket, &prefix).await;
@@ -563,156 +393,84 @@ pub(crate) struct MovedRefs {
     pub deleted: Vec<String>,
 }
 
-/// Persist a push git already accepted: bundles first, manifest flip once,
-/// prune after. Returns a tip per moved ref (production's `refs/heads/main`
-/// and every branch a preview environment may track), so a push to
-/// `refs/heads/<branch>` or `refs/previews/<userId>/<branch>` reaches the
-/// deploy pipeline. On any failure the local mirror rolls back and the
-/// manifest keeps pointing at the previous state, so the push stays invisible
-/// until retried.
+/// Persist a push git already accepted: the WAL cuts one tip bundle per
+/// changed ref and flips the manifest once, then the superseded bundles and
+/// deleted-ref prefixes are pruned. Returns a tip per moved ref
+/// (production's `refs/heads/main` and every branch a preview environment
+/// may track), so a push to `refs/heads/<branch>` or
+/// `refs/previews/<userId>/<branch>` reaches the deploy pipeline.
+///
+/// The caller holds the slug's lock (`receive_pack`, `forge::publish_refname`
+/// take it across the whole mutation), so the locked record runs inside it:
+/// re-taking the guard here would self-deadlock.
 pub(crate) async fn after_receive(
     state: &AppState,
     app: &App,
-    bare: &Path,
+    _bare: &Path,
     before: &HashMap<String, String>,
 ) -> anyhow::Result<MovedRefs> {
-    let after = list_refs(bare).await?;
-    // 1. One tip bundle per changed ref (not yet visible).
-    let mut changed: Vec<(String, String, String)> = Vec::new();
-    for (refname, sha) in &after {
-        if before.get(refname).map(|s| s.as_str()) == Some(sha.as_str()) {
-            continue;
-        }
-        match write_ref_bundle(&state.config, bare, &app.slug, refname, sha).await {
-            Ok(bundle_key) => changed.push((refname.clone(), sha.clone(), bundle_key)),
-            Err(e) => {
-                for (refname, _, _) in &changed {
-                    let _ = set_ref(bare, refname, before.get(refname).map(|s| s.as_str())).await;
-                }
-                return Err(e);
-            }
-        }
-    }
-    // 2. Full post-push ref map: unchanged refs keep their bundle pointers.
-    let old_manifest = git_manifest::read_manifest(&state.config, &app.slug).await?;
-    let mut refs: HashMap<String, ManifestRef> = HashMap::new();
-    if let Some(old) = &old_manifest {
-        for (name, entry) in &old.refs {
-            if after.get(name).map(|s| s.as_str()) == Some(entry.sha.as_str()) {
-                refs.insert(name.clone(), entry.clone());
-            }
-        }
-    }
-    for (refname, sha, bundle_key) in &changed {
-        refs.insert(
-            refname.clone(),
-            ManifestRef {
-                sha: sha.clone(),
-                bundle: bundle_key.clone(),
-            },
-        );
-    }
-    for (refname, sha) in &after {
-        if refs.contains_key(refname) {
-            continue;
-        }
-        // A ref the previous manifest does not carry (every push writes a
-        // complete one, so this is a ref git itself created): cut its bundle.
-        let bundle = write_ref_bundle(&state.config, bare, &app.slug, refname, sha).await?;
-        refs.insert(
-            refname.clone(),
-            ManifestRef {
-                sha: sha.clone(),
-                bundle,
-            },
-        );
-    }
-    // 3. The linearization point: one manifest write.
-    let seq = old_manifest.map(|m| m.seq + 1).unwrap_or(1);
-    let manifest = Manifest {
-        version: git_manifest::MANIFEST_VERSION,
-        seq,
-        refs,
+    let snapshot = ryuz_git::git::RefSnapshot {
+        refs: before
+            .iter()
+            .map(|(name, sha)| (name.clone(), sha.clone()))
+            .collect(),
+        head: None,
+        peeled: Default::default(),
     };
-    if let Err(e) = git_manifest::write_manifest(&state.config, &app.slug, &manifest).await {
-        for (refname, _, _) in &changed {
-            let _ = set_ref(bare, refname, before.get(refname).map(|s| s.as_str())).await;
+    let outcome = state
+        .wal
+        .record_push_locked(&app.slug, &snapshot, None)
+        .await?;
+    // Prune superseded bundles + deleted-ref prefixes (readers moved on to
+    // the flipped manifest), exactly as the old bundle-then-flip path did.
+    for moved_ref in &outcome.moved {
+        if let Some(bundle) = &moved_ref.bundle {
+            prune_old_bundles(&state.config, &app.slug, &moved_ref.refname, bundle).await;
+        } else {
+            tracing::warn!(
+                refname = %moved_ref.refname,
+                "push recorded without a tip bundle; deploy falls back to the tip sweep"
+            );
         }
-        for refname in before.keys() {
-            if !after.contains_key(refname) {
-                let _ = set_ref(bare, refname, Some(&before[refname])).await;
-            }
-        }
-        return Err(e);
     }
-    state.git_sync.set_applied_seq(&app.slug, seq).await;
-    // 4. Prune superseded bundles + deleted-ref prefixes (readers moved on).
-    for (refname, _, bundle_key) in &changed {
-        prune_old_bundles(&state.config, &app.slug, refname, bundle_key).await;
-    }
-    let mut deleted = Vec::new();
-    for refname in before.keys() {
-        if !after.contains_key(refname) {
-            delete_ref_prefix(&state.config, &app.slug, refname).await;
-            deleted.push(refname.clone());
-        }
+    for refname in &outcome.deleted {
+        delete_ref_prefix(&state.config, &app.slug, refname).await;
     }
     // Every moved ref, not only `main`: the loop decides what tracks a ref
     // (production, or a preview environment).
     Ok(MovedRefs {
-        tips: changed
+        tips: outcome
+            .moved
             .iter()
-            .map(|(refname, sha, bundle_key)| crate::host::tips::RefTip {
-                git_ref: refname.clone(),
-                bundle: TipBundle {
-                    key: bundle_key.clone(),
-                    sha: sha.clone(),
-                },
+            .filter_map(|moved_ref| {
+                moved_ref.bundle.as_ref().map(|bundle| RefTip {
+                    git_ref: moved_ref.refname.clone(),
+                    bundle: TipBundle {
+                        key: bundle.clone(),
+                        sha: moved_ref.sha.clone(),
+                    },
+                })
             })
             .collect(),
-        deleted,
+        deleted: outcome.deleted.clone(),
     })
 }
 
-/// Re-apply the manifest to a bare mirror when it moved under us (another
-/// push landed since this mirror was hydrated). Warn-only: readers serve
-/// from what is local on failure, same as before manifests existed. A read at
-/// or below the newest applied seq is stale, so it carries no new information
-/// and must not move refs backward; serve local instead.
-///
-/// Double-checked sync under the slug's `push_guard`, like
-/// [`crate::host::forge::read_mirror`]: the unlocked fast path below serves
-/// local when `applied_seq` already covers the manifest; only a newer
-/// manifest takes the guard and re-reads before refreshing, so an
-/// upload-pack read overlapping a push can never apply the pre-flip
-/// manifest.
-async fn refresh_from_manifest(state: &AppState, slug: &str, bare: &Path) {
-    let pending = match git_manifest::pending_manifest(&state.config, &state.git_sync, slug).await {
-        Ok(pending) => pending,
-        Err(e) => {
-            tracing::warn!(slug = %slug, error = %format!("{e:#}"), "git manifest read");
-            return;
+/// The push mirror, rebuilt from the manifest when missing or stale. A cold
+/// mirror is a hard error (nothing usable to serve); a hot mirror serves
+/// from what is local when the rebuild fails, same as before manifests
+/// existed.
+async fn synced_bare(state: &AppState, slug: &str) -> Result<PathBuf, String> {
+    let bare = state.wal.mirror_path(slug);
+    let cold = !bare.join("HEAD").exists();
+    match state.wal.ensure_synced(slug).await {
+        Ok(bare) => Ok(bare),
+        Err(e) if !cold => {
+            tracing::warn!(slug = %slug, error = %format!("{e:#}"), "git manifest refresh");
+            Ok(bare)
         }
-    };
-    if pending.is_none() {
-        return;
+        Err(e) => Err(format!("{e:#}")),
     }
-    let _push = state.git_sync.push_guard(slug).await;
-    let manifest = match git_manifest::pending_manifest(&state.config, &state.git_sync, slug).await
-    {
-        Ok(Some(manifest)) => manifest,
-        Ok(None) => return,
-        Err(e) => {
-            tracing::warn!(slug = %slug, error = %format!("{e:#}"), "git manifest read");
-            return;
-        }
-    };
-    let local = list_refs(bare).await.unwrap_or_default();
-    if let Err(e) = git_manifest::refresh_bare(&state.config, bare, &manifest, &local).await {
-        tracing::warn!(slug = %slug, error = %format!("{e:#}"), "git manifest refresh");
-        return;
-    }
-    state.git_sync.set_applied_seq(slug, manifest.seq).await;
 }
 
 pub async fn info_refs(
@@ -736,11 +494,10 @@ pub async fn info_refs(
         Ok(t) => t,
         Err(r) => return r,
     };
-    let bare = match ensure_bare(&state.config, &app.slug).await {
+    let bare = match synced_bare(&state, &app.slug).await {
         Ok(b) => b,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    refresh_from_manifest(&state, &app.slug, &bare).await;
     let prog = if service == "git-upload-pack" {
         "upload-pack"
     } else {
@@ -792,11 +549,10 @@ pub async fn upload_pack(
         Ok(t) => t,
         Err(r) => return r,
     };
-    let bare = match ensure_bare(&state.config, &app.slug).await {
+    let bare = match synced_bare(&state, &app.slug).await {
         Ok(b) => b,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    refresh_from_manifest(&state, &app.slug, &bare).await;
     let Some(bare_arg) = bare.to_str() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -906,11 +662,12 @@ pub async fn receive_pack(
     }
     // Serialize pushes per slug: policy + fast-forward checks stay valid
     // through git + S3 + manifest with no interleaving push. This is the
-    // innermost lock (CREATE_LOCK → AppLock → push_guard, see `GitSync`):
-    // rename/purge/create hold this same guard across their own moves and
-    // wipes, so a push lands fully before or fully after those operations.
-    let _push_guard = state.git_sync.push_guard(&app.slug).await;
-    let bare = match ensure_bare(&state.config, &app.slug).await {
+    // innermost lock (CREATE_LOCK → AppLock → the slug lock, see
+    // [`ryuz_git::GitSync`]): rename/purge/create hold this same guard across
+    // their own moves and wipes, so a push lands fully before or fully after
+    // those operations.
+    let _push_guard = state.wal.lock(&app.slug).await;
+    let bare = match state.wal.ensure_synced_locked(&app.slug).await {
         Ok(b) => b,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     };
