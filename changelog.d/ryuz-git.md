@@ -1,5 +1,0 @@
-### Changed
-
-- The git storage/mirror/manifest engine is now the published `ryuz_git` 0.2 crate (crates.io, same repo family) instead of runner-local modules: all manifest/mirror/publish operations go through `Wal<RefsCodec>` (manifest CAS, immutable tip bundles, mirror rebuilt from the manifest), and `host/git_manifest.rs` is deleted. Role/collaborator auth and branch protection (`git_policy.rs`), smart-HTTP routes, tip-bundle layout, deploy hooks, paths, errors and logs are unchanged.
-- Manifests are v2 on the first push after this change (forward-only): `RefsCodec` reads the existing v1 manifests and writes v2 (same refs plus sequence/revision metadata). No migration step; old mirrors rehydrate from the manifest as before.
-- S3 access for git goes through a new `host::git_store::ObjectStore` adapter over the native S3 client (rusty-s3 signing + one reqwest pool): conditional writes (`If-None-Match: *` create, `If-Match` CAS update), conditional/freshness/range reads, and versioned deletes. 404 maps to missing while transport errors, timeouts and 5xx stay retryable, so an unreachable store is never mistaken for "no manifest".
