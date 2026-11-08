@@ -10,6 +10,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-alpha.27] - 2026-11-08
+
+### Operator action required
+
+- The first push to each repository after upgrading rewrites its `git/{slug}/MANIFEST.json` as manifest v2. This build reads v1 and v2; an older build reads only v1. No manual step is needed to upgrade. Take a backup before upgrading, and preserve repositories pushed after the upgrade before restoring `git/`: the prefix holds both manifests and tip bundles, so restoring an older backup discards every push made since, across repositories. Do not roll back to an image older than this release after pushing; git pushes to already-upgraded repositories then fail until the prefix is repaired.
+
+### Changed
+
+- The git storage/mirror/manifest engine is now the published `ryuz_git` 0.2 crate (crates.io, same repo family) instead of runner-local modules: all manifest/mirror/publish operations go through `Wal<RefsCodec>` (manifest CAS, immutable tip bundles, mirror rebuilt from the manifest), and `host/git_manifest.rs` is deleted. Role/collaborator auth and branch protection (`git_policy.rs`), smart-HTTP routes, tip-bundle layout, deploy hooks, paths, errors and logs are unchanged.
+- Manifests are v2 on the first push after this change (forward-only): `RefsCodec` reads the existing v1 manifests and writes v2 (same refs plus sequence/revision metadata). No migration step; old mirrors rehydrate from the manifest as before.
+- S3 access for git goes through a new `host::git_store::ObjectStore` adapter over the native S3 client (rusty-s3 signing + one reqwest pool): conditional writes (`If-None-Match: *` create, `If-Match` CAS update), conditional/freshness/range reads, and versioned deletes. 404 maps to missing while transport errors, timeouts and 5xx stay retryable, so an unreachable store is never mistaken for "no manifest".
+- Noite CI (`noite.ci.yaml`) now runs on the shared `ryuz_workflow` crate (ryuzcorp/crates) instead of a runner-local module. The accepted workflow surface grows: `strategy.matrix` with `max-parallel`/`fail-fast`, `runs-on` (kept as a routing hint), job-level `env` and `defaults.run`, `shell: bash|sh`, `container:` as an `image:` alias, and `uses: checkout|cache|upload-artifact` with `with`. Matrix values reach steps as `RYUZ_MATRIX_<KEY>` env vars; an explicit `env` of the same name wins.
+- The engine brings its safety properties to deploys: per-step and per-job timeouts kill the container, exit 137 is reported as out-of-memory, containers carry a `ryuz_workflow.pid` label and are swept at start (and removed on cancellation), env values never reach argv and are masked in the log, and artifacts stage outside the worktree and install without following symlinks. Jobs still run one at a time (`max_parallel: 1`) and a workflow must still leave `dist/` for the deploy.
+- Workflow, job and step `env` may not set names reserved for the host container CLI (`PATH`, `HOME`, `TMPDIR`, `LD_*`, `DOCKER_*`, `CONTAINER_*`, `PODMAN_*`, `XDG_*`, proxy/TLS variables); export those inside `run` instead.
+
 ## [0.1.0-alpha.26] - 2026-11-07
 
 ### Operator action required
