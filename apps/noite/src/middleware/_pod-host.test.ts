@@ -9,8 +9,8 @@ import {
 import { testRouteContext } from "../testing/context";
 import podHost from "./02-pod-host";
 
-/** A Preview host (`app-0.preview.<slug>.<base>`). */
-const PREVIEW_HOST = "app-0.preview.demo.noite.example";
+/** A Preview host (`pod-<app id>.<base>`). */
+const PREVIEW_HOST = "pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a.noite.example";
 
 interface TestEnv {
   ASSETS?: { fetch: (request: Request) => Promise<Response> };

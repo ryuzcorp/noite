@@ -199,7 +199,7 @@ Tenant apps work the same way: with `CONTROL_EXTRA_HOSTS=noite.local` the runner
 
 ```bash
 portless alias test.noite 9080                # → https://test.noite.local
-portless alias app-0.preview.test.noite 9080  # → Code mode Preview for `test`
+portless alias pod-<app id>.test.noite 9080  # → Code mode Preview for that app
 ```
 
 </details>

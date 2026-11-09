@@ -13,13 +13,14 @@ import { sessionUser } from "./session.server";
 const PreviewOriginArgs = Schema.Struct({ appId: Schema.String });
 
 /** The app's pod host origin, ready for `Nodepod.boot({ previewOrigin })`:
- * `app-0.preview.<slug>.<base>` (dev `http://…:port`), the one stable origin
- * the edge serves the four Nodepod assets from (never the control UI's, so
- * guest code can't act as the viewer). `<base>` follows the page onto a DNS
+ * `pod-<app id>.<base>` (dev `http://…:port`), the one stable origin the edge
+ * serves the four Nodepod assets from (never the control UI's, so guest code
+ * can't act as the viewer). One label under the base, so the instance's own
+ * `*.<base>` certificate covers it. `<base>` follows the page onto a DNS
  * `CONTROL_EXTRA_HOSTS` entry (`previewBase`), so `https://noite.local` gets
- * `https://app-0.preview.<slug>.noite.local`. Refuses a secure page with a
- * plain http pod host (`PREVIEW_MIXED_CONTENT_MESSAGE`) instead of an
- * origin that cannot connect. */
+ * `https://pod-<app id>.noite.local`. Refuses a secure page with a plain http
+ * pod host (`PREVIEW_MIXED_CONTENT_MESSAGE`) instead of an origin that cannot
+ * connect. */
 export const sourcePreviewOrigin = apiAction(
   PreviewOriginArgs,
   async ({ appId }, { env, request }) => {
@@ -43,7 +44,7 @@ export const sourcePreviewOrigin = apiAction(
     );
 
     const port = isLocalhostDomain(base) ? url.port : "";
-    const origin = previewOrigin(app.slug, base, port);
+    const origin = previewOrigin(app.id, base, port);
 
     // Fail closed: a localhost pod host is plain http, which browsers
     // block inside a secure page as mixed content. The action surfaces the

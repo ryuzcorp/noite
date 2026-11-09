@@ -143,9 +143,12 @@ async fn tls_ask_admits_existing_environment_hosts_only() {
         StatusCode::NOT_FOUND
     );
     // The pod host is admitted for any existing app.
+    let pod_host = format!("pod-{}.localhost", app.id);
+    assert_eq!(tls_ask(state, &pod_host).await, StatusCode::OK);
+    // A pod host naming an app that does not exist mints nothing.
     assert_eq!(
-        tls_ask(state, "app-0.preview.test.localhost").await,
-        StatusCode::OK
+        tls_ask(state, "pod-00000000-0000-0000-0000-000000000000.localhost").await,
+        StatusCode::NOT_FOUND
     );
     // Deleting the environment takes its host away with it.
     crate::db::delete_environment(&state.pool, &env.id)

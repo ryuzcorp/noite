@@ -12,9 +12,12 @@
 pub const MAX_LABEL: usize = 40;
 
 /// Labels the platform itself serves at `<slug>.<base>` scope-adjacent hosts
-/// (`app-0.preview.<slug>.<base>` is the pod host). An environment may never
-/// take one.
+/// (the pod host is `pod-<app id>.<base>`). An environment may never take one.
 pub const RESERVED_LABELS: &[&str] = &["preview", "app-0"];
+
+/// The pod host's label prefix (`host::edge::POD_HOST_PREFIX`): an environment
+/// label that starts with it could be mistaken for one in a hostname.
+pub const RESERVED_PREFIX: &str = "pod-";
 
 /// A branch name or arbitrary string as a DNS label: lowercased, every run of
 /// anything else folded to one `-`, trimmed to [`MAX_LABEL`], no leading or
@@ -49,7 +52,7 @@ fn truncate(mut out: String) -> String {
 }
 
 fn reserved(label: &str) -> bool {
-    RESERVED_LABELS.contains(&label)
+    RESERVED_LABELS.contains(&label) || label.starts_with(RESERVED_PREFIX)
 }
 
 fn free(label: &str, taken: &[String]) -> bool {

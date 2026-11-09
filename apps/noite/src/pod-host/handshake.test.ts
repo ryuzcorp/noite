@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { frameAddress, handshakeMessage } from "./handshake";
 
 const CONTROL = "https://noite.example";
-const PREVIEW = "https://app-0.preview.demo.example";
+const PREVIEW = "https://pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a.example";
 const NONCE = "3f0c2f6e";
 
 /** The frame's URL as the control builds it, with `over` replacing fields. */

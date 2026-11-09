@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::db::{self, EnvironmentRoute};
-use crate::host::edge::{self, PREVIEW_LABEL};
+use crate::host::edge::{self, POD_HOST_PREFIX};
 use crate::models::{App, AppDomain, AppLimit};
 
 fn is_zero(v: &u32) -> bool {
@@ -299,8 +299,12 @@ pub fn build_table(
     // Preview + environment hosts, under every tenant base.
     for base in cfg.tenant_bases() {
         for app in apps {
+            // The pod host: one stable label under the base
+            // (`pod-<app id>.<base>`), so the instance's own `*.<base>`
+            // certificate covers it — the old `app-0.preview.<slug>` needed a
+            // certificate no standard wildcard provides.
             exact.insert(
-                format!("{PREVIEW_LABEL}.preview.{}.{base}", app.slug).to_lowercase(),
+                format!("{POD_HOST_PREFIX}{}.{base}", app.id).to_lowercase(),
                 client_zoned(
                     cfg,
                     EdgeKind::Preview,
@@ -309,11 +313,6 @@ pub fn build_table(
                     cfg.edge.client_rpm,
                 ),
             );
-            // Any other label under the app's preview suffix 404s.
-            wildcards.push(EdgeWildcard {
-                suffix: format!(".preview.{}.{base}", app.slug).to_lowercase(),
-                route: unzoned(EdgeKind::Deny, String::new()),
-            });
         }
         for env in envs {
             let Some(app) = apps.iter().find(|a| a.id == env.app_id) else {
@@ -675,19 +674,16 @@ mod tests {
     fn preview_hosts_allowlist_and_deny_wildcards() {
         let cfg = config_for_tests();
         let app = test_app("myapp");
+        let pod_host = format!("pod-{}.localhost", app.id).to_lowercase();
         let t = build_table(&cfg, &[app], &[], &[], &[]);
-        let pod = t
-            .exact
-            .get("app-0.preview.myapp.localhost")
-            .expect("pod host");
+        let pod = t.exact.get(&pod_host).expect("pod host");
         assert_eq!(pod.kind, EdgeKind::Preview);
         assert_eq!(pod.upstream, cfg.caddy_control_upstream);
-        let deny = t
-            .wildcards
-            .iter()
-            .find(|w| w.suffix == ".preview.myapp.localhost")
-            .expect("preview deny");
-        assert_eq!(deny.route.kind, EdgeKind::Deny);
+        // No wildcard: every pod host is an exact, single-label host.
+        assert!(
+            t.wildcards.iter().all(|w| !w.suffix.contains(".preview.")),
+            "no preview wildcard is left"
+        );
     }
 
     #[test]

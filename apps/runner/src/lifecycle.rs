@@ -49,6 +49,12 @@ pub fn slug_ok(slug: &str) -> bool {
     if RESERVED_SLUGS.contains(&slug) {
         return false;
     }
+    // `pod-<uuid>` is a pod host label (`host::edge::POD_HOST_PREFIX`): an app
+    // with that slug would collide with the Code-mode origin of the app whose
+    // id it spells.
+    if crate::host::edge::pod_label_id(slug).is_some() {
+        return false;
+    }
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
         // Static invariant: a compile-time literal, so construction never fails.
@@ -93,6 +99,16 @@ mod tests {
         assert_eq!(tail_utf8("✓✓", 4), "✓");
         assert_eq!(tail_utf8("abc", 10), "abc");
         assert_eq!(tail_utf8("abcdef", 3), "def");
+    }
+
+    #[test]
+    fn pod_host_labels_are_not_slugs() {
+        // The Code-mode origin of the app whose id this spells.
+        assert!(!slug_ok("pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a"));
+        // Ordinary slugs and near misses stay available.
+        for ok in ["pod", "podcast", "pod-123", "mypod-x"] {
+            assert!(slug_ok(ok), "should accept {ok}");
+        }
     }
 
     #[test]

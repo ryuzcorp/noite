@@ -10,7 +10,7 @@ describe("isLocalhostDomain", () => {
       "localhost.",
       "noite.localhost",
       " app.noite.localhost ",
-      "app-0.preview.test2.noite.localhost",
+      "pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a.noite.localhost",
     ].filter((domain) => !isLocalhostDomain(domain));
 
     expect(missed).toEqual([]);

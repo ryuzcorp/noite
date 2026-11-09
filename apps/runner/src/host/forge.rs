@@ -3164,7 +3164,7 @@ mod tests {
     #[tokio::test]
     async fn tls_ask_admits_preview_hosts_for_existing_apps() {
         let h = Harness::new("previewtls").await;
-        crate::db::create_app(
+        let app = crate::db::create_app(
             &h.state.pool,
             &h.state.config,
             crate::db::NewApp {
@@ -3180,13 +3180,13 @@ mod tests {
         .expect("seed app");
         let router = crate::api::router::router(h.state.clone());
         assert_eq!(
-            ask_tls(&router, "app-0.preview.previewtls.localhost").await,
+            ask_tls(&router, &format!("pod-{}.localhost", app.id)).await,
             axum::http::StatusCode::OK
         );
         // Only that one stable label is admitted: a random pod host gets no
         // certificate (no per-session issuance, no CA-limit drain).
         assert_eq!(
-            ask_tls(&router, "pod123-4444.preview.previewtls.localhost").await,
+            ask_tls(&router, "pod-1234.localhost").await,
             axum::http::StatusCode::NOT_FOUND
         );
         assert_eq!(
