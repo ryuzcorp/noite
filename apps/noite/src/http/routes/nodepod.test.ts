@@ -9,8 +9,8 @@ import {
 } from "../../lib/preview-host";
 import { handlePreviewHostAsset } from "./nodepod";
 
-/** A Preview host as `previewHost` builds it (`app-0.preview.<slug>.<base>`). */
-const PREVIEW_HOST = "app-0.preview.demo.noite.example";
+/** A Preview host as `previewHost` builds it (`pod-<app id>.<base>`). */
+const PREVIEW_HOST = "pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a.noite.example";
 
 /** The hosts the control UI answers on — none of them a Preview host. */
 const CONTROL_HOSTS = ["noite.example", "localhost:9080"];

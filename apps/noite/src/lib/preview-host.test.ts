@@ -7,23 +7,26 @@ import {
   previewOrigin,
 } from "./preview-host";
 
+/** A fixed app id: the pod host is `pod-<id>`, so tests need a real shape. */
+const APP = "0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a";
+
 describe("preview hosts", () => {
   test("a *.localhost dev base stays plain http on the edge's port", () => {
-    expect(previewHost("test2", "noite.localhost")).toBe(
-      "app-0.preview.test2.noite.localhost"
+    expect(previewHost(APP, "noite.localhost")).toBe(
+      `pod-${APP}.noite.localhost`
     );
-    expect(previewOrigin("test2", "noite.localhost", "9080")).toBe(
-      "http://app-0.preview.test2.noite.localhost:9080"
+    expect(previewOrigin(APP, "noite.localhost", "9080")).toBe(
+      `http://pod-${APP}.noite.localhost:9080`
     );
     // Bare `localhost` is the same dev family: unchanged behavior.
-    expect(previewOrigin("test2", "localhost", "9080")).toBe(
-      "http://app-0.preview.test2.localhost:9080"
+    expect(previewOrigin(APP, "localhost", "9080")).toBe(
+      `http://pod-${APP}.localhost:9080`
     );
   });
 
   test("a public base is https without a port", () => {
-    expect(previewOrigin("test2", "noite.now")).toBe(
-      "https://app-0.preview.test2.noite.now"
+    expect(previewOrigin(APP, "noite.now")).toBe(
+      `https://pod-${APP}.noite.now`
     );
   });
 
@@ -32,9 +35,7 @@ describe("preview hosts", () => {
     // `https://noite.local` behind a local TLS proxy: https, same site.
     const base = previewBase("noite.local", "noite.localhost", extras);
     expect(base).toBe("noite.local");
-    expect(previewOrigin("test", base)).toBe(
-      "https://app-0.preview.test.noite.local"
-    );
+    expect(previewOrigin(APP, base)).toBe(`https://pod-${APP}.noite.local`);
     expect(previewBase("NOITE.LOCAL:9080", "noite.localhost", extras)).toBe(
       "noite.local"
     );
@@ -60,11 +61,11 @@ describe("preview hosts", () => {
     );
   });
 
-  test("only the preview label names a preview host", () => {
-    expect(isPreviewHost("app-0.preview.test2.noite.localhost:9080")).toBe(
-      true
-    );
+  test("only the pod label names a preview host", () => {
+    expect(isPreviewHost(`pod-${APP}.noite.localhost:9080`)).toBe(true);
+    expect(isPreviewHost(`pod-${APP}.noite.now`)).toBe(true);
     expect(isPreviewHost("noite.localhost:9080")).toBe(false);
+    expect(isPreviewHost("pod-not-a-uuid.noite.now")).toBe(false);
     expect(isPreviewHost("test2.noite.localhost")).toBe(false);
     expect(isPreviewHost(null)).toBe(false);
   });

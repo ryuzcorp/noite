@@ -25,7 +25,10 @@ import { openSourceWorkspace } from "./proxy";
 import type { SourceCheckout } from "./proxy";
 
 const APP_ID = "app-1";
-const PREVIEW_ORIGIN = "https://app-0.preview.example";
+
+const PREVIEW_ORIGIN =
+  "https://pod-0f4b0f6e-5a8e-4a0e-9c3f-2b1d0c9e8f7a.example";
+
 const SHA = "c0ffee1";
 
 /** One request the page sent the frame. */

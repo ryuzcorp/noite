@@ -2,20 +2,29 @@
 // config loader (the planned default) cannot resolve an extensionless import.
 import { isLocalhostDomain } from "./local-host.ts";
 
-/** Every app's Preview origin label. Must match `PREVIEW_LABEL` in
- * `apps/runner/src/host/edge.rs` (and the site `apps/runner/src/host/caddy.rs`
- * emits). Stable on purpose: on-demand TLS then issues one certificate per app,
- * where Nodepod's per-boot random instance id would re-issue on every open and
- * could drain the CA's issuance limit. The pod host document, the pod's workers
- * and its preview service worker all live on this one origin per app. */
-const PREVIEW_LABEL = "app-0";
+/** The prefix of every app's pod host label. Must match `POD_HOST_PREFIX` in
+ * `apps/runner/src/host/edge.rs`. The host is **one label** under the base —
+ * `pod-<app id>.<base>` — because `*.<base>` certificates (Cloudflare's
+ * Universal SSL among them) cover exactly one label: the old
+ * `app-0.preview.<slug>.<base>` needed a certificate no standard wildcard
+ * provides, and the iframe could never load. Stable per app on purpose:
+ * on-demand TLS issues one certificate per app, and the pod host document, its
+ * workers and its service worker all live on that one origin. */
+export const POD_HOST_PREFIX = "pod-";
 
-/** The app's Preview host: `app-0.preview.<slug>.<BASE_DOMAIN>` (dev:
- * `app-0.preview.<slug>.noite.localhost`). One extra label under the instance
- * wildcard, so it needs no new DNS and the same on-demand TLS, and it can never
- * be a tenant host (a tenant slug carries no dot). */
-export const previewHost = (slug: string, baseDomain: string): string =>
-  `${PREVIEW_LABEL}.preview.${slug}.${baseDomain}`;
+const APP_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+/** The app's pod host label: `pod-<app id>`. */
+export const previewLabel = (appId: string): string =>
+  `${POD_HOST_PREFIX}${appId}`;
+
+/** The app's Preview host: `pod-<app id>.<BASE_DOMAIN>` (dev:
+ * `pod-<app id>.noite.localhost`). One label under the instance wildcard: the
+ * same certificate covers it, and it can never collide with a tenant host (a
+ * tenant slug carries no dots and `pod-<uuid>` shapes are reserved). */
+export const previewHost = (appId: string, baseDomain: string): string =>
+  `${previewLabel(appId)}.${baseDomain}`;
 
 /** The app's Preview origin: where the pod host document is embedded from and
  * where every message the workspace protocol carries must come from. It is a
@@ -25,14 +34,14 @@ export const previewHost = (slug: string, baseDomain: string): string =>
  * `*.localhost` is browser-reserved, so it needs no hosts entry and no wildcard
  * DNS. */
 export const previewOrigin = (
-  slug: string,
+  appId: string,
   baseDomain: string,
   port = ""
 ): string => {
   const scheme = isLocalhostDomain(baseDomain) ? "http" : "https";
   const devPort = port === "" ? "" : `:${port}`;
 
-  return `${scheme}://${previewHost(slug, baseDomain)}${devPort}`;
+  return `${scheme}://${previewHost(appId, baseDomain)}${devPort}`;
 };
 
 const IPV4 = /^\d{1,3}(?:\.\d{1,3}){3}$/u;
@@ -168,18 +177,20 @@ export const isControlDeniedAsset = (path: string): boolean => {
   return false;
 };
 
-/** Whether a request's `Host` is a Preview host (`app-0.preview.<slug>.<base>`,
- * dev `app-0.preview.<slug>.localhost:9080`). The `PREVIEW_LABEL.preview.`
- * prefix is the shape this file emits, so only a preview host — never the
- * control UI's own host — passes. */
+/** Whether a request's `Host` is a Preview host (`pod-<app id>.<base>`, dev
+ * `pod-<app id>.localhost:9080`). Only the exact label shape this file emits
+ * passes, so the control UI's own host never does. */
 export const isPreviewHost = (host: string | null): boolean => {
   if (host === null) {
     return false;
   }
 
-  const name = host.split(":")[0] ?? "";
+  const label = (host.split(":")[0] ?? "").split(".")[0] ?? "";
 
-  return name.toLowerCase().startsWith(`${PREVIEW_LABEL}.preview.`);
+  return (
+    label.startsWith(POD_HOST_PREFIX) &&
+    APP_ID.test(label.slice(POD_HOST_PREFIX.length))
+  );
 };
 
 /** Why a pod refuses to boot with no preview origin: the pod's own code — the
