@@ -114,5 +114,16 @@ test(
     expect(await readMarker(request, port)).toBe(V1_MARKER);
     const sample = await readSampleApp(request, port);
     expect(Number.isInteger(sample.n)).toBe(true);
+
+    // The header's Deploy menu offers the rollback the history holds: the
+    // previous successful production release (sha2) is one click from any tab,
+    // not only the per-row button on the Deployments tab.
+    await page.goto(`/apps/${appId}`);
+    await page.getByRole("button", { exact: true, name: "Deploy" }).focus();
+    await expect(
+      page.getByRole("button", {
+        name: `Roll back to ${sha2.slice(0, 12)}`,
+      })
+    ).toBeVisible();
   }
 );

@@ -44,6 +44,13 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
   const info = appDetail(appId).data();
   const redeploying = atom(false);
   const redeployError = atom("");
+  // The previous successful production deploy, loaded once when the dropdown
+  // first opens: the one sha a rollback would return to. "" = none (or not
+  // loaded yet; `rollbackLoaded` tells them apart).
+  const rollbackSha = atom("");
+  const rollbackLoaded = atom(false);
+  const rollbacking = atom(false);
+  const rollbackError = atom("");
 
   if (!info) {
     return null;
@@ -51,9 +58,48 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
 
   const canPush = info.myRole === "push" || info.myRole === "admin";
 
+  /** Find the newest successful production deploy that is not the live one.
+   * A redeploy of the same sha is not a rollback target: the pipeline would
+   * rebuild the release that is already serving. */
+  const loadRollbackTarget = (): void => {
+    if (rollbackLoaded()) {
+      return;
+    }
+
+    rollbackLoaded.set(true);
+    void (async () => {
+      try {
+        const rows = await api<RunnerDeploy[]>("/api/apps/listDeploys", {
+          appId,
+        });
+
+        const previous = rows.find(
+          (row) =>
+            // Production rows carry `null` (the runner stores NULL); older
+            // frames and fixtures may say "". Either is production.
+            (row.environmentId === null || row.environmentId === "") &&
+            row.status === "success" &&
+            !!row.sha &&
+            row.sha !== info.app.lastDeploySha
+        );
+
+        rollbackSha.set(previous?.sha ?? "");
+      } catch {
+        // No target is the safe reading of a failed lookup: the button stays
+        // hidden and Redeploy (which needs no history) still works.
+        rollbackSha.set("");
+      }
+    })();
+  };
+
   return (
     <div class="dropdown dropdown-end">
-      <div tabindex={0} role="button" class="btn btn-sm btn-neutral">
+      <div
+        tabindex={0}
+        role="button"
+        class="btn btn-sm btn-neutral"
+        onfocus={loadRollbackTarget}
+      >
         <span class="inline-flex items-center gap-1">
           <CloudUpload />
           Deploy
@@ -132,6 +178,64 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
                 Deployments.
               </p>
             </div>
+          ) : null}
+          {canPush && rollbackSha() ? (
+            <div class="flex flex-col gap-2">
+              {rollbackError() ? (
+                <p class="text-error m-0 text-sm">{rollbackError()}</p>
+              ) : null}
+              <button
+                type="button"
+                class="btn btn-sm btn-ghost w-full"
+                disabled={rollbacking()}
+                title="Re-run the pipeline at an earlier release, without touching the checkout"
+                onclick={() => {
+                  const sha = rollbackSha();
+
+                  if (!sha) {
+                    return;
+                  }
+
+                  void (async () => {
+                    const ok = await confirmDialog({
+                      confirmLabel: "Roll back",
+                      title: `Roll back to ${sha.slice(0, 12)}?`,
+                    });
+
+                    if (!ok) {
+                      return;
+                    }
+
+                    rollbacking.set(true);
+                    rollbackError.set("");
+
+                    try {
+                      await api<{ ok: true }>("/api/apps/rollback", {
+                        appId,
+                        sha,
+                      });
+                    } catch (error) {
+                      rollbackError.set(errorMessage(error));
+                    }
+
+                    rollbacking.set(false);
+                  })();
+                }}
+              >
+                {rollbacking()
+                  ? "Rolling back…"
+                  : `Roll back to ${rollbackSha().slice(0, 12)}`}
+              </button>
+              <p class="m-0 text-xs opacity-70">
+                Restores the previous release; the checkout stays where it is.
+                Progress shows in Deployments.
+              </p>
+            </div>
+          ) : null}
+          {canPush && rollbackLoaded() && rollbackSha() === "" ? (
+            <p class="m-0 text-xs opacity-60">
+              No earlier successful deploy to roll back to yet.
+            </p>
           ) : null}
         </div>
       </div>
