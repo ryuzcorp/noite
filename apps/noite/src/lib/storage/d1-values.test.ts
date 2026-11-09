@@ -20,7 +20,7 @@ import {
   writtenColumns,
 } from "./d1-values";
 
-// The representation better-auth/paranorm writes today: ISO 8601 with
+// The representation better-auth (Drizzle) writes today: ISO 8601 with
 // milliseconds and a Z suffix.
 const ISO = "2026-10-06T07:29:28.530Z";
 
