@@ -344,9 +344,6 @@ ensure_env_defaults() {
 }
 write_config() {
   step "Writing $NOITE_DIR"
-  if [[ -f "$NOITE_DIR/.env" ]]; then
-    die "Noite is already installed at $NOITE_DIR. Alpha builds do not upgrade between versions: uninstall it (this wipes its volumes) and run the installer again for a fresh install."
-  fi
   mkdir -p "$NOITE_DIR"
   local url="https://raw.githubusercontent.com/$NOITE_REPO/$NOITE_REF/docker/compose.yaml" tmp
   tmp=$(mktemp)
@@ -490,6 +487,9 @@ parse_args() {
 
 main() {
   parse_args "$@"
+  if [[ -f "$NOITE_DIR/.env" ]]; then
+    die "Noite is already installed at $NOITE_DIR. Alpha builds do not upgrade between versions: uninstall it (this wipes its volumes) and run the installer again for a fresh install."
+  fi
   check_system
   install_docker
   ensure_swap

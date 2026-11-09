@@ -149,7 +149,7 @@ export const INSTALL_TABS = [
     code: INSTALL_COMMAND,
     id: "vps",
     label: "Any VPS",
-    note: "Ubuntu or Debian, amd64 or arm64. Re-run it to upgrade.",
+    note: "Ubuntu or Debian, amd64 or arm64. Alpha versions are fresh installs.",
   },
   {
     code: "curl -fsSLO https://raw.githubusercontent.com/ryuzcorp/noite/main/docker/compose.yaml\ndocker compose up -d",
