@@ -9,7 +9,6 @@ import {
   grantCollaborator,
   requireAppRole,
 } from "../collaborators";
-import { withDb } from "../db";
 import {
   runnerCreateApp,
   runnerGetAppBySlug,
@@ -265,7 +264,7 @@ export const createAppForUser = async (input: {
   }
 
   try {
-    await withDb(grantCollaborator(app.id, input.account.id, "admin"));
+    await grantCollaborator(app.id, input.account.id, "admin");
   } catch (grantError) {
     await runnerDeleteApp(app.id).catch(() => null);
     failUnknown(grantError);
@@ -330,7 +329,7 @@ export const remove = apiAction(AppId, async (appId, { env, request }) => {
   try {
     await runnerDeleteApp(appId);
     // Nothing cascades grants now that the app row lives in the runner.
-    await withDb(dropAppCollaborators(appId));
+    await dropAppCollaborators(appId);
   } catch (error) {
     if (error instanceof UnauthorizedError) {
       throw error;

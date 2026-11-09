@@ -1,10 +1,8 @@
-/* eslint-disable func-names -- Effect.gen uses anonymous generators */
-import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { SqlClient } from "effect/sql/SqlClient";
+import { sql } from "void/db";
 
 import { failUnknown } from "../auth";
-import { withDb } from "../db";
+import { getDb, withDb } from "../db";
 import { runnerTelemetryGet, runnerTelemetrySet } from "../runner";
 import { apiAction, apiActionNoInput } from "./api";
 import { requireControlAdmin } from "./session.server";
@@ -12,14 +10,13 @@ import { requireControlAdmin } from "./session.server";
 /** Accounts on this instance, for the runner's bucketed `users` heartbeat
  * property. Served to the runner by `GET /internal/telemetry-facts`. */
 export const countControlUsers = (): Promise<number> =>
-  withDb(
-    Effect.gen(function* countUsers() {
-      const sql = yield* SqlClient;
-      const rows = yield* sql<{ n: number }>`SELECT COUNT(*) AS n FROM "user"`;
+  withDb(async () => {
+    const row = await getDb().get<{ n: number }>(
+      sql`SELECT COUNT(*) AS n FROM "user"`
+    );
 
-      return Number(rows[0]?.n ?? 0);
-    })
-  );
+    return Number(row?.n ?? 0);
+  });
 
 /** The telemetry opt-out state behind the `/account` admin section. A real
  * instance admin only, never an impersonated session: the runner takes any

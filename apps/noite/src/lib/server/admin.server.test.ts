@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 
 import { createTestD1 } from "../../testing/d1";
 import type { TestD1 } from "../../testing/d1";
-import { ensureDbPromise, setD1Binding, withDb } from "../db";
+import { ensureDbPromise, setD1Binding } from "../db";
 import { ensureAdminAccount } from "./admin.server";
 
 let db: TestD1;
@@ -22,7 +22,7 @@ describe("ensureAdminAccount", () => {
     );
     db.executed.length = 0;
 
-    await withDb(ensureAdminAccount("admin@example.com", "admin"));
+    await ensureAdminAccount("admin@example.com", "admin");
 
     // The session role is read fresh on every request, so a session that
     // already carries `admin` skips the SELECT: one fewer sequential D1
@@ -38,7 +38,7 @@ describe("ensureAdminAccount", () => {
     ]);
     db.executed.length = 0;
 
-    await withDb(ensureAdminAccount("anchored@example.com", "user"));
+    await ensureAdminAccount("anchored@example.com", "user");
 
     // SAFETY: the projection is the single `role` column selected above.
     const rows = db.raw

@@ -24,11 +24,9 @@ export default defineMiddleware(async (c, next) => {
 
   // Every request traverses this middleware — actions and `/assets/*` alike
   // (`run_worker_first: true`) — so every request shares the isolate's one
-  // setup pass. Register the pass with the worker lifetime: celld drops a
-  // request's pending work when that request answers or its client leaves,
-  // and an unregistered pass would hang every waiter on a cold isolate to
-  // the full 5 s wait (issues #91, #92, flake H).
-  await ensureDbPromise({ ctx: c.executionCtx });
+  // admin-bootstrap pass. Schema migrations are the runner's job (Void's
+  // migration endpoint), never a request's.
+  await ensureDbPromise();
 
   return next();
 });

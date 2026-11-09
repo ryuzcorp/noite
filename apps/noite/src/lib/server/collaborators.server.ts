@@ -1,7 +1,7 @@
-/* eslint-disable func-names -- Effect.gen uses anonymous generators */
-import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { and, eq } from "void/db";
 
+import { appCollaboratorTable } from "../../db/schema";
 import { failUnknown } from "../auth";
 import {
   acceptPendingInvite,
@@ -16,7 +16,7 @@ import {
   revokePendingInvite,
   upsertPendingInvite,
 } from "../collaborators";
-import { orm, withDb } from "../db";
+import { getDb } from "../db";
 import { parseAppRole } from "../roles";
 import { apiAction, apiActionNoInput, fail } from "./api";
 import { sessionUser } from "./session.server";
@@ -79,20 +79,18 @@ export const inviteCollaborator = apiAction(
       );
 
       if (member) {
-        await withDb(grantCollaborator(appId, member.userId, nextRole));
+        await grantCollaborator(appId, member.userId, nextRole);
 
         return { ok: true as const, status: "updated" as const };
       }
 
-      await withDb(
-        upsertPendingInvite({
-          appId,
-          appName: app.name,
-          email: normalized,
-          invitedBy: user.id,
-          role: nextRole,
-        })
-      );
+      await upsertPendingInvite({
+        appId,
+        appName: app.name,
+        email: normalized,
+        invitedBy: user.id,
+        role: nextRole,
+      });
 
       return { ok: true as const, status: "invited" as const };
     } catch (error) {
@@ -117,7 +115,7 @@ export const revokeInvitation = apiAction(
   async ({ appId, inviteId }, { env, request }) => {
     const user = await sessionUser(request, env);
     await requireAppRole(appId, user.id, "admin");
-    await withDb(revokePendingInvite(appId, inviteId));
+    await revokePendingInvite(appId, inviteId);
 
     return { ok: true as const };
   }
@@ -156,7 +154,7 @@ export const declineInvitation = apiAction(
   Schema.String,
   async (inviteId, { env, request }) => {
     const user = await sessionUser(request, env);
-    await withDb(declinePendingInvite(inviteId, user.email));
+    await declinePendingInvite(inviteId, user.email);
 
     return { ok: true as const };
   }
@@ -173,34 +171,46 @@ export const updateCollaboratorRole = apiAction(
       return fail("role must be view, push, or admin");
     }
 
-    const err = await withDb(
-      Effect.gen(function* run() {
-        const membership = yield* orm.app_collaborator.findFirst({
-          where: { appId, userId },
-        });
+    const err = await (async () => {
+      const db = getDb();
 
-        if (!membership) {
-          return "Collaborator not found";
+      const rows = await db
+        .select({
+          id: appCollaboratorTable.id,
+          role: appCollaboratorTable.role,
+        })
+        .from(appCollaboratorTable)
+        .where(
+          and(
+            eq(appCollaboratorTable.appId, appId),
+            eq(appCollaboratorTable.userId, userId)
+          )
+        )
+        .limit(1);
+
+      const [membership] = rows;
+
+      if (!membership) {
+        return "Collaborator not found";
+      }
+
+      const current = parseAppRole(membership.role);
+
+      if (current === "admin" && nextRole !== "admin") {
+        const admins = await countAdmins(appId);
+
+        if (admins <= 1) {
+          return "Cannot demote the last admin";
         }
+      }
 
-        const current = parseAppRole(membership.role);
+      await db
+        .update(appCollaboratorTable)
+        .set({ role: nextRole })
+        .where(eq(appCollaboratorTable.id, membership.id));
 
-        if (current === "admin" && nextRole !== "admin") {
-          const admins = yield* countAdmins(appId);
-
-          if (admins <= 1) {
-            return "Cannot demote the last admin";
-          }
-        }
-
-        yield* orm.app_collaborator.update({
-          data: { role: nextRole },
-          where: { id: membership.id },
-        });
-
-        return "";
-      })
-    );
+      return "";
+    })();
 
     if (err) {
       return fail(err);
@@ -216,29 +226,43 @@ export const removeCollaborator = apiAction(
     const actor = await sessionUser(request, env);
     await requireAppRole(appId, actor.id, "admin");
 
-    const err = await withDb(
-      Effect.gen(function* run() {
-        const membership = yield* orm.app_collaborator.findFirst({
-          where: { appId, userId },
-        });
+    const err = await (async () => {
+      const db = getDb();
 
-        if (!membership) {
-          return "";
-        }
+      const rows = await db
+        .select({
+          id: appCollaboratorTable.id,
+          role: appCollaboratorTable.role,
+        })
+        .from(appCollaboratorTable)
+        .where(
+          and(
+            eq(appCollaboratorTable.appId, appId),
+            eq(appCollaboratorTable.userId, userId)
+          )
+        )
+        .limit(1);
 
-        if (parseAppRole(membership.role) === "admin") {
-          const admins = yield* countAdmins(appId);
+      const [membership] = rows;
 
-          if (admins <= 1) {
-            return "Cannot remove the last admin";
-          }
-        }
-
-        yield* orm.app_collaborator.delete({ where: { id: membership.id } });
-
+      if (!membership) {
         return "";
-      })
-    );
+      }
+
+      if (parseAppRole(membership.role) === "admin") {
+        const admins = await countAdmins(appId);
+
+        if (admins <= 1) {
+          return "Cannot remove the last admin";
+        }
+      }
+
+      await db
+        .delete(appCollaboratorTable)
+        .where(eq(appCollaboratorTable.id, membership.id));
+
+      return "";
+    })();
 
     if (err) {
       return fail(err);

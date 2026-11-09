@@ -1,8 +1,6 @@
-/* eslint-disable func-names -- Effect.gen uses anonymous generators */
-import * as Effect from "effect/Effect";
-import { SqlClient } from "effect/sql/SqlClient";
+import { sql } from "void/db";
 
-import { withDb } from "../db";
+import { getDb, withDb } from "../db";
 
 /** Lifetime of a recovery code, as configured on the emailOTP plugin. */
 export const RECOVERY_CODE_TTL_SECONDS = 600;
@@ -13,20 +11,22 @@ export const RECOVERY_CODE_TTL_SECONDS = 600;
 export const findRecoveryEmail = (
   requested: string | undefined
 ): Promise<string | undefined> =>
-  withDb(
-    Effect.gen(function* () {
-      const sql = yield* SqlClient;
-      const email = requested?.trim().toLowerCase();
+  withDb(() => {
+    const db = getDb();
+    const email = requested?.trim().toLowerCase();
 
-      const rows = email
-        ? yield* sql<{ email: string }>`
-            SELECT email FROM "user"
-            WHERE lower(email) = ${email} AND banned = 0 LIMIT 1`
-        : yield* sql<{ email: string }>`
-            SELECT email FROM "user"
-            WHERE role = 'admin' AND banned = 0
-            ORDER BY createdAt LIMIT 1`;
+    if (email) {
+      return db
+        .get<{ email: string }>(sql`
+          SELECT email FROM "user"
+          WHERE lower(email) = ${email} AND banned = 0 LIMIT 1`)
+        .then((row) => row?.email);
+    }
 
-      return rows[0]?.email;
-    })
-  );
+    return db
+      .get<{ email: string }>(sql`
+        SELECT email FROM "user"
+        WHERE role = 'admin' AND banned = 0
+        ORDER BY createdAt LIMIT 1`)
+      .then((row) => row?.email);
+  });

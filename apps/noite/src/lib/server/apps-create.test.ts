@@ -13,8 +13,6 @@ import {
   test,
 } from "bun:test";
 
-import * as Effect from "effect/Effect";
-
 import { createTestD1 } from "../../testing/d1";
 import { installRunnerMock, makeApp } from "../../testing/runner-mock";
 import type { RunnerMock } from "../../testing/runner-mock";
@@ -38,12 +36,12 @@ let grantFails = true;
 mock.module("../collaborators", () => ({
   grantCollaborator: (appId: string, userId: string, role: string) => {
     if (grantFails) {
-      return Effect.fail(new Error("D1 is down"));
+      return Promise.reject(new Error("D1 is down"));
     }
 
     grants.push({ appId, role, userId });
 
-    return Effect.void;
+    return Promise.resolve();
   },
 }));
 

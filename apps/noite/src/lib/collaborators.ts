@@ -1,9 +1,8 @@
-/* eslint-disable func-names -- Effect.gen uses anonymous generators */
-import * as Effect from "effect/Effect";
-import { SqlClient } from "effect/sql/SqlClient";
+import { and, asc, desc, eq, sql } from "void/db";
 
+import { appCollaboratorTable, collaboratorInviteTable } from "../db/schema";
 import { resolveAdminEmail, UnauthorizedError } from "./auth";
-import { orm, withDb } from "./db";
+import { getDb, withDb } from "./db";
 import { parseAppRole, roleAtLeast } from "./roles";
 import type { AppRole } from "./roles";
 import { runnerGetApp, runnerGetAppBySlug, runnerListApps } from "./runner";
@@ -34,47 +33,62 @@ export const grantCollaborator = (
   appId: string,
   userId: string,
   role: AppRole
-) =>
-  Effect.gen(function* run() {
-    const existing = yield* orm.app_collaborator.findFirst({
-      where: { appId, userId },
-    });
+): Promise<void> =>
+  withDb(async () => {
+    const db = getDb();
 
-    if (existing) {
-      if (existing.role !== role) {
-        yield* orm.app_collaborator.update({
-          data: { role },
-          where: { id: existing.id },
-        });
+    const existing = await db
+      .select({ id: appCollaboratorTable.id, role: appCollaboratorTable.role })
+      .from(appCollaboratorTable)
+      .where(
+        and(
+          eq(appCollaboratorTable.appId, appId),
+          eq(appCollaboratorTable.userId, userId)
+        )
+      )
+      .limit(1);
+
+    const [found] = existing;
+
+    if (found) {
+      if (found.role !== role) {
+        await db
+          .update(appCollaboratorTable)
+          .set({ role })
+          .where(eq(appCollaboratorTable.id, found.id));
       }
 
       return;
     }
 
-    yield* orm.app_collaborator.create({
-      data: { appId, id: crypto.randomUUID(), role, userId },
+    await db.insert(appCollaboratorTable).values({
+      appId,
+      id: crypto.randomUUID(),
+      role,
+      userId,
     });
   });
 
 /** Drop every grant and pending invitation for an app (the runner owns the
  * app row, so nothing else cascades it). Called after a successful runner
  * delete. */
-export const dropAppCollaborators = (appId: string) =>
-  Effect.gen(function* run() {
-    const sql = yield* SqlClient;
-    yield* sql.unsafe(`DELETE FROM app_collaborator WHERE appId = ?`, [appId]);
-    yield* sql.unsafe(`DELETE FROM collaborator_invite WHERE appId = ?`, [
-      appId,
+export const dropAppCollaborators = (appId: string): Promise<void> =>
+  withDb(async () => {
+    const db = getDb();
+
+    await db.batch([
+      db
+        .delete(appCollaboratorTable)
+        .where(eq(appCollaboratorTable.appId, appId)),
+      db
+        .delete(collaboratorInviteTable)
+        .where(eq(collaboratorInviteTable.appId, appId)),
     ]);
   });
 
 /** One round trip for the whole access decision: the account's role/origin
  * anchor, and its collaborator row for this app. The gate runs on every page
- * load, so it stays a single `sql.unsafe` call — the builder path issues a
- * query per lookup, and one dispatch beats N.
- *
- * `app_collaborator` has no foreign key to `app` any more (the runner owns the
- * app row), so this reads the grant table directly. */
+ * load, so it stays a single statement — one dispatch beats N. */
 interface AccessRow {
   anchored: number;
   collabRole: string | null;
@@ -82,22 +96,15 @@ interface AccessRow {
 }
 
 const accessRow = (appId: string, userId: string, adminEmail: string | null) =>
-  Effect.gen(function* run() {
-    const sql = yield* SqlClient;
+  withDb(async () => {
+    const rows = await getDb().all<AccessRow>(sql`
+      SELECT
+        (SELECT CASE WHEN role = 'admin' THEN 1 ELSE 0 END FROM "user" WHERE id = ${userId}) AS isAdmin,
+        (SELECT CASE WHEN ${adminEmail} IS NOT NULL AND lower(email) = ${adminEmail} THEN 1 ELSE 0 END FROM "user" WHERE id = ${userId}) AS anchored,
+        (SELECT role FROM app_collaborator WHERE appId = ${appId} AND userId = ${userId}) AS collabRole
+    `);
 
-    const rows = yield* sql.unsafe(
-      `SELECT
-         (SELECT CASE WHEN role = 'admin' THEN 1 ELSE 0 END FROM "user" WHERE id = ?) AS isAdmin,
-         (SELECT CASE WHEN ? IS NOT NULL AND lower(email) = ? THEN 1 ELSE 0 END FROM "user" WHERE id = ?) AS anchored,
-         (SELECT role FROM app_collaborator WHERE appId = ? AND userId = ?) AS collabRole`,
-      [userId, adminEmail, adminEmail, userId, appId, userId]
-    );
-
-    // SAFETY: the projection is the three columns named above; D1 returns
-    // plain rows.
-    const [row] = rows as AccessRow[];
-
-    return row ?? { anchored: 0, collabRole: null, isAdmin: 0 };
+    return rows[0] ?? { anchored: 0, collabRole: null, isAdmin: 0 };
   });
 
 /** Instance admins manage every app, collaborator or not. */
@@ -106,7 +113,7 @@ const roleFor = async (
   userId: string
 ): Promise<AppRole | null> => {
   const anchored = resolveAdminEmail();
-  const row = await withDb(accessRow(app.id, userId, anchored));
+  const row = await accessRow(app.id, userId, anchored);
 
   if (row.isAdmin === 1 || row.anchored === 1) {
     return "admin";
@@ -149,22 +156,15 @@ export const isInstanceAdmin = async (
 ): Promise<boolean> => {
   const anchored = resolveAdminEmail();
 
-  const rows = await withDb(
-    Effect.gen(function* run() {
-      const sql = yield* SqlClient;
-
-      return yield* sql.unsafe(
-        `SELECT CASE WHEN role = 'admin' THEN 1 ELSE 0 END AS isAdmin,
-                CASE WHEN ? IS NOT NULL AND lower(?) = ? THEN 1 ELSE 0 END AS anchored
-           FROM "user" WHERE id = ?`,
-        [anchored, email, anchored, userId]
-      );
-    })
+  const rows = await withDb(() =>
+    getDb().all<{ anchored: number; isAdmin: number }>(sql`
+      SELECT CASE WHEN role = 'admin' THEN 1 ELSE 0 END AS isAdmin,
+             CASE WHEN ${anchored} IS NOT NULL AND lower(${email}) = ${anchored} THEN 1 ELSE 0 END AS anchored
+        FROM "user" WHERE id = ${userId}
+    `)
   );
 
-  // SAFETY: the projection is exactly those two integer columns; a missing
-  // row yields undefined, handled below.
-  const row = rows[0] as { anchored?: number; isAdmin?: number } | undefined;
+  const [row] = rows;
 
   return row !== undefined && (row.isAdmin === 1 || row.anchored === 1);
 };
@@ -185,7 +185,12 @@ export const listAppsForCollaborator = async (
 ): Promise<RunnerApp[]> => {
   const [apps, grants] = await Promise.all([
     runnerListApps(),
-    withDb(orm.app_collaborator.findMany({ where: { userId } })),
+    withDb(() =>
+      getDb()
+        .select({ appId: appCollaboratorTable.appId })
+        .from(appCollaboratorTable)
+        .where(eq(appCollaboratorTable.userId, userId))
+    ),
   ]);
 
   const granted = new Set(grants.map((grant) => grant.appId));
@@ -203,23 +208,36 @@ export const listAppsForCollaborator = async (
     }
 
     // oxlint-disable-next-line eslint/no-await-in-loop -- one candidate at a time; only a grantless app is written
-    const any = await withDb(
-      orm.app_collaborator.findFirst({ where: { appId: app.id } })
+    const any = await withDb(() =>
+      getDb()
+        .select({ id: appCollaboratorTable.id })
+        .from(appCollaboratorTable)
+        .where(eq(appCollaboratorTable.appId, app.id))
+        .limit(1)
     );
 
-    if (!any) {
+    if (!any[0]) {
       try {
         // oxlint-disable-next-line eslint/no-await-in-loop -- the write follows this app's read
-        await withDb(grantCollaborator(app.id, userId, "admin"));
+        await grantCollaborator(app.id, userId, "admin");
       } catch (error) {
         // The page and its SSE stream can heal the same app at once; the
         // unique (appId, userId) row means the loser reads the winner's.
         // oxlint-disable-next-line eslint/no-await-in-loop -- one conflict check for this app
-        const raced = await withDb(
-          orm.app_collaborator.findFirst({ where: { appId: app.id, userId } })
+        const raced = await withDb(() =>
+          getDb()
+            .select({ id: appCollaboratorTable.id })
+            .from(appCollaboratorTable)
+            .where(
+              and(
+                eq(appCollaboratorTable.appId, app.id),
+                eq(appCollaboratorTable.userId, userId)
+              )
+            )
+            .limit(1)
         );
 
-        if (!raced) {
+        if (!raced[0]) {
           throw error;
         }
       }
@@ -236,11 +254,17 @@ export const listAppsForCollaborator = async (
     );
 };
 
-export const countAdmins = (appId: string) =>
-  Effect.gen(function* run() {
-    const rows = yield* orm.app_collaborator.findMany({
-      where: { appId, role: "admin" },
-    });
+export const countAdmins = (appId: string): Promise<number> =>
+  withDb(async () => {
+    const rows = await getDb()
+      .select({ id: appCollaboratorTable.id })
+      .from(appCollaboratorTable)
+      .where(
+        and(
+          eq(appCollaboratorTable.appId, appId),
+          eq(appCollaboratorTable.role, "admin")
+        )
+      );
 
     return rows.length;
   });
@@ -266,27 +290,20 @@ interface CollaboratorSqlRow {
 export const listCollaboratorRows = async (
   appId: string
 ): Promise<CollaboratorRow[]> => {
-  const rows = await withDb(
-    Effect.gen(function* run() {
-      const sql = yield* SqlClient;
-
-      return yield* sql.unsafe(
-        `SELECT c.userId AS userId, c.role AS role, c.createdAt AS createdAt,
-                u.email AS email, u.name AS name
-           FROM app_collaborator c
-           LEFT JOIN "user" u ON u.id = c.userId
-          WHERE c.appId = ?
-          ORDER BY u.email`,
-        [appId]
-      );
-    })
+  const rows = await withDb(() =>
+    getDb().all<CollaboratorSqlRow>(sql`
+      SELECT c.userId AS userId, c.role AS role, c.createdAt AS createdAt,
+             u.email AS email, u.name AS name
+        FROM app_collaborator c
+        LEFT JOIN "user" u ON u.id = c.userId
+       WHERE c.appId = ${appId}
+       ORDER BY u.email
+    `)
   );
 
-  // SAFETY: the projection is the five columns named above; D1 returns plain rows.
-  const found = rows as CollaboratorSqlRow[];
   const out: CollaboratorRow[] = [];
 
-  for (const row of found) {
+  for (const row of rows) {
     const role = parseAppRole(row.role);
 
     if (!role) {
@@ -363,27 +380,29 @@ const asPendingInvites = (rows: PendingInviteSqlRow[]): PendingInvite[] => {
   return out;
 };
 
-const PENDING_COLUMNS = "id, appId, appName, email, role, createdAt";
-
-/** SELECT the invitation columns with a caller-supplied WHERE/ORDER tail. */
-const selectPendingInvites = async (
-  tail: string,
-  params: string[]
-): Promise<PendingInvite[]> => {
-  const rows = await withDb(
-    Effect.gen(function* run() {
-      const sql = yield* SqlClient;
-
-      return yield* sql.unsafe(
-        `SELECT ${PENDING_COLUMNS} FROM collaborator_invite ${tail}`,
-        params
-      );
-    })
+/** Invitations waiting on one app (admin view). */
+export const listPendingInvites = (appId: string): Promise<PendingInvite[]> =>
+  withDb(async () =>
+    asPendingInvites(
+      await getDb()
+        .select()
+        .from(collaboratorInviteTable)
+        .where(eq(collaboratorInviteTable.appId, appId))
+        .orderBy(asc(collaboratorInviteTable.email))
+    )
   );
 
-  // SAFETY: the projection is PENDING_COLUMNS, i.e. exactly PendingInviteSqlRow; D1 returns plain rows.
-  return asPendingInvites(rows as PendingInviteSqlRow[]);
-};
+/** Invitations addressed to one email, newest first (the invitee's view). */
+export const listInvitesForEmail = (email: string): Promise<PendingInvite[]> =>
+  withDb(async () =>
+    asPendingInvites(
+      await getDb()
+        .select()
+        .from(collaboratorInviteTable)
+        .where(eq(collaboratorInviteTable.email, normalizeEmail(email)))
+        .orderBy(desc(collaboratorInviteTable.createdAt))
+    )
+  );
 
 /** Record (or re-role) the invitation for one email on one app. */
 export const upsertPendingInvite = (invite: {
@@ -392,46 +411,45 @@ export const upsertPendingInvite = (invite: {
   email: string;
   invitedBy: string;
   role: AppRole;
-}) =>
-  Effect.gen(function* run() {
-    const sql = yield* SqlClient;
-    yield* sql.unsafe(
-      `INSERT INTO collaborator_invite (id, appId, appName, email, role, invitedBy, createdAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT (appId, email) DO UPDATE SET
-         role = excluded.role,
-         appName = excluded.appName,
-         invitedBy = excluded.invitedBy`,
-      [
-        crypto.randomUUID(),
-        invite.appId,
-        invite.appName,
-        normalizeEmail(invite.email),
-        invite.role,
-        invite.invitedBy,
-        new Date().toISOString(),
-      ]
-    );
+}): Promise<void> =>
+  withDb(async () => {
+    const db = getDb();
+
+    await db
+      .insert(collaboratorInviteTable)
+      .values({
+        appId: invite.appId,
+        appName: invite.appName,
+        createdAt: new Date().toISOString(),
+        email: normalizeEmail(invite.email),
+        id: crypto.randomUUID(),
+        invitedBy: invite.invitedBy,
+        role: invite.role,
+      })
+      .onConflictDoUpdate({
+        set: {
+          appName: invite.appName,
+          invitedBy: invite.invitedBy,
+          role: invite.role,
+        },
+        target: [collaboratorInviteTable.appId, collaboratorInviteTable.email],
+      });
   });
 
-/** Invitations waiting on one app (admin view). */
-export const listPendingInvites = (appId: string): Promise<PendingInvite[]> =>
-  selectPendingInvites("WHERE appId = ? ORDER BY email", [appId]);
-
-/** Invitations addressed to one email, newest first (the invitee's view). */
-export const listInvitesForEmail = (email: string): Promise<PendingInvite[]> =>
-  selectPendingInvites("WHERE email = ? ORDER BY createdAt DESC", [
-    normalizeEmail(email),
-  ]);
-
 /** Withdraw an invitation from the app side. */
-export const revokePendingInvite = (appId: string, inviteId: string) =>
-  Effect.gen(function* run() {
-    const sql = yield* SqlClient;
-    yield* sql.unsafe(
-      `DELETE FROM collaborator_invite WHERE id = ? AND appId = ?`,
-      [inviteId, appId]
-    );
+export const revokePendingInvite = (
+  appId: string,
+  inviteId: string
+): Promise<void> =>
+  withDb(async () => {
+    await getDb()
+      .delete(collaboratorInviteTable)
+      .where(
+        and(
+          eq(collaboratorInviteTable.id, inviteId),
+          eq(collaboratorInviteTable.appId, appId)
+        )
+      );
   });
 
 /** Accept an invitation addressed to `email`: grant the role, then consume
@@ -444,45 +462,65 @@ export const acceptPendingInvite = async (
   email: string,
   userId: string
 ): Promise<{ appId: string } | null> => {
-  const [invite] = await selectPendingInvites("WHERE id = ? AND email = ?", [
-    inviteId,
-    normalizeEmail(email),
-  ]);
+  const target = normalizeEmail(email);
+
+  const invite = await withDb(async () => {
+    const rows = await getDb()
+      .select()
+      .from(collaboratorInviteTable)
+      .where(
+        and(
+          eq(collaboratorInviteTable.id, inviteId),
+          eq(collaboratorInviteTable.email, target)
+        )
+      )
+      .limit(1);
+
+    return rows[0] ?? null;
+  });
 
   if (!invite) {
     return null;
   }
 
-  await withDb(
-    Effect.gen(function* run() {
-      const sql = yield* SqlClient;
-      yield* sql.unsafe(
-        `INSERT INTO app_collaborator (id, appId, userId, role, createdAt)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT (appId, userId) DO UPDATE SET role = excluded.role`,
-        [
-          crypto.randomUUID(),
-          invite.appId,
+  await withDb(async () => {
+    const db = getDb();
+
+    await db.batch([
+      db
+        .insert(appCollaboratorTable)
+        .values({
+          appId: invite.appId,
+          createdAt: new Date().toISOString(),
+          id: crypto.randomUUID(),
+          role: invite.role,
           userId,
-          invite.role,
-          new Date().toISOString(),
-        ]
-      );
-      yield* sql.unsafe(`DELETE FROM collaborator_invite WHERE id = ?`, [
-        invite.id,
-      ]);
-    })
-  );
+        })
+        .onConflictDoUpdate({
+          set: { role: invite.role },
+          target: [appCollaboratorTable.appId, appCollaboratorTable.userId],
+        }),
+      db
+        .delete(collaboratorInviteTable)
+        .where(eq(collaboratorInviteTable.id, invite.id)),
+    ]);
+  });
 
   return { appId: invite.appId };
 };
 
 /** Decline: delete the invitation, but only one addressed to `email`. */
-export const declinePendingInvite = (inviteId: string, email: string) =>
-  Effect.gen(function* run() {
-    const sql = yield* SqlClient;
-    yield* sql.unsafe(
-      `DELETE FROM collaborator_invite WHERE id = ? AND email = ?`,
-      [inviteId, normalizeEmail(email)]
-    );
+export const declinePendingInvite = (
+  inviteId: string,
+  email: string
+): Promise<void> =>
+  withDb(async () => {
+    await getDb()
+      .delete(collaboratorInviteTable)
+      .where(
+        and(
+          eq(collaboratorInviteTable.id, inviteId),
+          eq(collaboratorInviteTable.email, normalizeEmail(email))
+        )
+      );
   });

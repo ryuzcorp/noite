@@ -1,9 +1,11 @@
+import { Database } from "bun:sqlite";
 /* oxlint-disable eslint/require-await, anti-slop/no-unknown-returns, anti-slop/no-known-value-widening, anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: they mirror async platform interfaces and stand in for bindings they only partly implement */
 //! Test-only D1 stand-in over bun:sqlite: enough of the binding surface for
 //! `@effect/sql-d1` (prepare → bind → all/raw/run, batch), so unit tests run
 //! the real migrations and the real SQL. Counts statements so tests can pin
 //! "one query" claims.
-import { Database } from "bun:sqlite";
+import { readdirSync, readFileSync } from "node:fs";
+import path from "node:path";
 
 import type {
   D1Database,
@@ -19,9 +21,31 @@ export interface TestD1 {
   raw: Database;
 }
 
+/** The shipped migrations, applied in file order: the same SQL the runner
+ * sends through Void's migration endpoint, so a test database is the shape
+ * production has. */
+const applyMigrations = (raw: Database): void => {
+  const dir = path.join(import.meta.dir, "..", "db", "migrations");
+
+  const files = readdirSync(dir)
+    .filter((name) => name.endsWith(".sql"))
+    .toSorted();
+
+  for (const file of files) {
+    const sql = readFileSync(path.join(dir, file), "utf-8");
+
+    for (const statement of sql.split("--> statement-breakpoint")) {
+      if (statement.trim()) {
+        raw.run(statement);
+      }
+    }
+  }
+};
+
 export const createTestD1 = (): TestD1 => {
   const raw = new Database(":memory:");
   raw.run("PRAGMA foreign_keys = ON");
+  applyMigrations(raw);
   const executed: string[] = [];
 
   const statement = (sql: string, params: Param[] = []) => {
@@ -61,6 +85,7 @@ export const createTestD1 = (): TestD1 => {
       return out;
     },
     prepare: (sql: string) => statement(sql),
+    withSession: () => db,
   };
 
   // SAFETY: the shim implements the D1 surface the SQL client and the

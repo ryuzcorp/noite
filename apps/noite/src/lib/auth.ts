@@ -1,7 +1,6 @@
 /* eslint-disable max-classes-per-file -- tagged Fail types for auth */
 /* eslint-disable func-names -- Effect.gen uses anonymous generators */
 import { apiKey } from "@better-auth/api-key";
-import { kyselyAdapter } from "@better-auth/kysely-adapter";
 import { passkey } from "@better-auth/passkey";
 import { betterAuth } from "better-auth";
 import { APIError, getSessionFromCtx } from "better-auth/api";
@@ -234,7 +233,7 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
       },
     },
     baseURL,
-    database: kyselyAdapter(getAuthDb()),
+    database: getAuthDb(),
     plugins: [
       // The admin home impersonates any account (including fellow admins) — the
       // impersonator is already an admin, so this grants no new power.
