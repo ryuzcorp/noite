@@ -68,6 +68,7 @@ impl Harness {
             ))),
             started_at: chrono::Utc::now(),
             source_maps: Default::default(),
+            control_boot: Default::default(),
         };
         let router = crate::api::router::router(state.clone());
         Self { router, state, dir }

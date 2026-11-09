@@ -685,6 +685,7 @@ mod tests {
             ))),
             started_at: chrono::Utc::now(),
             source_maps: Default::default(),
+            control_boot: Default::default(),
         };
         (state, guard)
     }

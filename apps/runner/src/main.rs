@@ -65,6 +65,10 @@ pub struct AppState {
     /// Parsed per-deploy source maps for error symbolication, bounded
     /// (`host::sourcemaps::SourceMapCache`).
     pub source_maps: host::sourcemaps::SourceMapCache,
+    /// Why the control fleet failed to come up (deploy or migrations), or
+    /// `None`: /ready reports it beside "fleet not healthy", so a red lane
+    /// names its cause instead of only failing.
+    pub control_boot: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[tokio::main]
@@ -386,6 +390,7 @@ async fn main() -> anyhow::Result<()> {
     let (log_tx, _log_rx) = tokio::sync::watch::channel(0u64);
     let log_tx_loop = log_tx.clone();
     host::state::spawn_sync_task(state_sync.clone(), pool.clone(), (*config).clone());
+    let control_boot = Arc::new(std::sync::Mutex::new(None::<String>));
     let state = AppState {
         pool: pool.clone(),
         config: config.clone(),
@@ -406,6 +411,7 @@ async fn main() -> anyhow::Result<()> {
         ))),
         started_at,
         source_maps: host::sourcemaps::SourceMapCache::new(),
+        control_boot: control_boot.clone(),
     };
 
     let cfg_loop = (*config).clone();
@@ -496,7 +502,10 @@ async fn main() -> anyhow::Result<()> {
             None
         } else {
             if let Err(e) = host::control::ensure_deployed(&config).await {
-                tracing::warn!(error = %e, "control fleet deploy failed; continuing");
+                let reason = format!("{e:#}");
+                tracing::warn!(error = %reason, "control fleet deploy failed; continuing");
+                *control_boot.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(format!("deploy failed: {reason}"));
             }
             let child =
                 host::control::supervise(&config, control_pid.clone(), logs.clone(), control_token);
@@ -515,7 +524,10 @@ async fn main() -> anyhow::Result<()> {
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
                     Err(e) => {
-                        tracing::error!(error = %format!("{e:#}"), "control migrations not applied; the control UI will error until they apply");
+                        let reason = format!("{e:#}");
+                        tracing::error!(error = %reason, "control migrations not applied; the control UI will error until they apply");
+                        *control_boot.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(format!("migrations failed: {reason}"));
                     }
                 }
             }

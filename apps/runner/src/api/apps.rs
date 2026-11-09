@@ -92,7 +92,15 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
             .await
             .is_ok_and(|r| r.status().is_success());
         if !healthy {
-            failing.push("control: fleet not healthy yet".into());
+            let cause = state
+                .control_boot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            failing.push(match cause {
+                Some(reason) => format!("control: fleet not healthy yet ({reason})"),
+                None => "control: fleet not healthy yet".into(),
+            });
         }
     }
     {
