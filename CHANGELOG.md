@@ -14,7 +14,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Operator action required
 
-- None for an install on the compacted baseline (alpha.28 onward): re-run `curl -fsSL https://noite.now/run.sh | bash -s install` (or `install --pre`) to upgrade in place — `.env` and the volumes are kept and the runner restarts with every fleet, as before. A database from before the 2026-11-09 compaction (alpha.27 and earlier) is still refused: back it up, then uninstall and install fresh.
+- None for an install on the compacted baseline (alpha.28 onward): upgrade with `curl -fsSL https://noite.now/run.sh | bash -s install --pre` while `0.1.0-alpha.30` is a pre-release (plain `install` follows the `alpha` channel, which still points at alpha.29 until this release is promoted). `.env` and the volumes are kept and the runner restarts with every fleet. A database from before the 2026-11-09 compaction (alpha.27 and earlier) is still refused: back it up, then uninstall and install fresh.
+- Re-running the installer rewrites `NOITE_IMAGE` to the newest release of the channel; pass `NOITE_VERSION=<tag>` (or `NOITE_IMAGE`) to keep an install on a pinned version or on `stable`.
 
 ### Changed
 
