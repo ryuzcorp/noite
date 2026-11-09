@@ -344,6 +344,9 @@ ensure_env_defaults() {
 }
 write_config() {
   step "Writing $NOITE_DIR"
+  if [[ -f "$NOITE_DIR/.env" ]]; then
+    die "Noite is already installed at $NOITE_DIR. Alpha builds do not upgrade between versions: uninstall it (this wipes its volumes) and run the installer again for a fresh install."
+  fi
   mkdir -p "$NOITE_DIR"
   local url="https://raw.githubusercontent.com/$NOITE_REPO/$NOITE_REF/docker/compose.yaml" tmp
   tmp=$(mktemp)
@@ -351,17 +354,14 @@ write_config() {
   grep -q '^services:' "$tmp" || die "$url is not a compose file"
   install -m 0644 "$tmp" "$NOITE_DIR/compose.yaml"
   # The multi-tenant cgroup grant: referenced only when .env says
-  # NOITE_TENANCY=multi (see compose()). Downloaded always so an install can
-  # switch tenancy with a re-run; single installs never reference it.
+  # NOITE_TENANCY=multi (see compose()). Downloaded always; single installs
+  # never reference it.
   url="https://raw.githubusercontent.com/$NOITE_REPO/$NOITE_REF/docker/compose.multi.yaml"
   curl -fsSL "$url" -o "$tmp" || die "could not download $url"
   grep -q 'apparmor' "$tmp" || die "$url is not the multi override"
   install -m 0644 "$tmp" "$NOITE_DIR/compose.multi.yaml"
   rm -f "$tmp"
 
-  if [[ -f "$NOITE_DIR/.env" ]]; then
-    die "Noite is already installed at $NOITE_DIR. Alpha builds do not upgrade between versions: uninstall it (this wipes its volumes) and run the installer again for a fresh install."
-  fi
   choose_domain
   umask 077
     cat >"$NOITE_DIR/.env" <<EOF
@@ -369,7 +369,7 @@ write_config() {
 # documented in docker/compose.yaml and .env.example; apply changes with
 #   cd $NOITE_DIR && docker compose up -d
 # (multi installs add -f compose.yaml -f compose.multi.yaml to every
-# recreating command; the installer does it itself on re-run)
+# recreating command)
 #
 # BASE_DOMAIN and BETTER_AUTH_URL are fixed once someone registers: passkeys
 # bind to that origin. The RustFS keys guard the bundled bucket's data.
