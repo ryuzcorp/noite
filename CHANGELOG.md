@@ -14,7 +14,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Operator action required
 
-- **This alpha does not upgrade from any earlier alpha.** All schema migrations were compacted into one baseline per store, and the upgrade paths were removed: the runner refuses a SQLite database with a different `user_version`, the control D1 refuses a `paranorm_migrations` ledger from another alpha, and `install.sh` refuses an existing `/opt/noite/.env` instead of acting as an upgrade. Moving to this release means `uninstall` (which deletes the volumes) and a fresh install. A bucket of your own is never deleted: empty it or set a new `NOITE_S3_BUCKET` to start clean.
+- **This alpha does not upgrade from any earlier alpha.** All schema migrations were compacted into one baseline per store, and the upgrade paths were removed: the runner refuses a SQLite database with a different `user_version`, the control D1 refuses a `paranorm_migrations` ledger from another alpha, and `install.sh` refuses an existing `/opt/noite/.env` instead of acting as an upgrade. Moving to this release means `uninstall` (which deletes the volumes) and a fresh install; while it is a pre-release, install it with `curl -fsSL https://noite.now/run.sh | bash -s install --pre` (a plain `install` follows the promoted `alpha` channel). A bucket of your own is never deleted: empty it or set a new `NOITE_S3_BUCKET` to start clean.
 
 ### Changed
 
