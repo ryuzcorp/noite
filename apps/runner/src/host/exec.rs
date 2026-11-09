@@ -428,8 +428,14 @@ pub async fn run_sandboxed(
     if thrash.load(std::sync::atomic::Ordering::SeqCst)
         && !matches!(&result, Ok(Ok(output)) if output.status.success())
     {
+        let swap = crate::host::cgroups::build_swap_mb().unwrap_or(0);
+        let swap_note = if swap > 0 {
+            format!(" and {swap} MiB swap (RUNNER_BUILD_SWAP_MB)")
+        } else {
+            String::new()
+        };
         bail!(
-            "the build is not making progress inside its {} MiB memory budget (RUNNER_BUILD_MEMORY_MB): it stays pinned at the cgroup's memory.max and stalls on reclaim, so it would only end at the step timeout. Raise the budget (if the box has the RAM for it) or deploy a prebuilt dist from CI; the runner and the apps kept serving",
+            "the build is not making progress inside its {} MiB memory budget (RUNNER_BUILD_MEMORY_MB{swap_note}): it stays pinned and stalls on reclaim, so it would only end at the step timeout. Raise the budget (if the box has the RAM for it) or deploy a prebuilt dist from CI; the runner and the apps kept serving",
             crate::host::cgroups::build_memory_mb().unwrap_or(0)
         );
     }
@@ -442,8 +448,14 @@ pub async fn run_sandboxed(
             .and_then(crate::host::cgroups::build_oom_kills)
             .is_some_and(|after| after > before)
         {
+            let swap = crate::host::cgroups::build_swap_mb().unwrap_or(0);
+            let swap_note = if swap > 0 {
+                format!(" plus {swap} MiB swap")
+            } else {
+                String::new()
+            };
             bail!(
-                "the build exceeded its memory budget ({} MiB, RUNNER_BUILD_MEMORY_MB) and the kernel killed it inside its own cgroup. Raise the budget (if the box has the RAM for it) or deploy a prebuilt dist from CI; the runner and the apps kept serving",
+                "the build exceeded its memory budget ({} MiB, RUNNER_BUILD_MEMORY_MB{swap_note}) and the kernel killed it inside its own cgroup. Raise the budget (if the box has the RAM for it) or deploy a prebuilt dist from CI; the runner and the apps kept serving",
                 crate::host::cgroups::build_memory_mb().unwrap_or(0)
             );
         }

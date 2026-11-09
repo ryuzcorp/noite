@@ -699,9 +699,12 @@ async fn deploy_inner(
     // their own): the install, build and release steps enter it before the
     // build uid drops. `None` when the install has no cgroup containment, in
     // which case the step runs uncapped, exactly as before.
-    let build_cgroup =
-        crate::host::cgroups::build_leaf_for(&fleet_label(app, target), cfg.build_memory_mb)
-            .with_context(|| "prepare the build cgroup")?;
+    let build_cgroup = crate::host::cgroups::build_leaf_for(
+        &fleet_label(app, target),
+        cfg.build_memory_mb,
+        cfg.build_swap_mb,
+    )
+    .with_context(|| "prepare the build cgroup")?;
     let sb = Sandbox {
         uid: sandbox_id,
         gid: sandbox_id,
