@@ -500,6 +500,25 @@ async fn main() -> anyhow::Result<()> {
             }
             let child =
                 host::control::supervise(&config, control_pid.clone(), logs.clone(), control_token);
+            // The migration endpoints are served by the control worker, so
+            // this waits for the fleet to adopt the pointer first. Retried:
+            // a refused move or a slow celld start is transient; a schema
+            // that still will not apply leaves the UI erroring (loudly).
+            for attempt in 1..=3 {
+                match host::control::migrate(&config).await {
+                    Ok(()) => {
+                        tracing::info!("control migrations applied");
+                        break;
+                    }
+                    Err(e) if attempt < 3 => {
+                        tracing::warn!(attempt, error = %format!("{e:#}"), "control migrations failed; retrying");
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %format!("{e:#}"), "control migrations not applied; the control UI will error until they apply");
+                    }
+                }
+            }
             tracing::info!(ms = boot.elapsed().as_millis(), "control bundle ready");
             Some(child)
         }

@@ -161,7 +161,6 @@ pub async fn ensure_deployed(cfg: &Config) -> anyhow::Result<serde_json::Value> 
     let deployed = fetch_marker(cfg).await.unwrap_or_default();
     if deployed.trim() == rev {
         tracing::info!("control bundle at revision; skipping deploy");
-        migrate_control(cfg, &rev).await?;
         return Ok(vars);
     }
     // Patch wrangler.json vars into a temp copy.
@@ -218,20 +217,34 @@ pub async fn ensure_deployed(cfg: &Config) -> anyhow::Result<serde_json::Value> 
     if last.to_string() != "ok" {
         return Err(anyhow::anyhow!("control deploy failed: {last:#}"));
     }
-    migrate_control(cfg, &rev).await?;
     store_marker(cfg, &rev).await?;
     let _ = tokio::fs::remove_dir_all(&work).await;
     let _ = tokio::fs::remove_file(&tmp).await;
     Ok(vars)
 }
 
-/// Drive the control worker's Void migration endpoints (`/__void/migrate/app`,
-/// then `/auth` when advertised) after its bundle is live. The fleet adopts a
-/// new pointer on its poll, so the endpoint can answer 404 for a few seconds;
-/// a bundle built without `db/migrations` never advertises v2 and is skipped.
-/// The pushed tree's migration list is hashed and compared with the worker's
-/// advertised hash, exactly like a tenant deploy: a mismatch means the image's
-/// copy and the worker's bundle disagree, and the deploy fails before traffic.
+/// Apply the control app's D1 migrations through the worker's Void endpoints
+/// (`/__void/migrate/app`, then `/auth` when advertised). Call it once the
+/// control fleet is supervised: the endpoint is the worker itself, so it only
+/// answers after celld has adopted the deployment pointer. The image's
+/// `db/migrations` is hashed and compared with the worker's advertised list,
+/// exactly like a tenant deploy: a mismatch means the copied files and the
+/// built bundle disagree, and boot fails before the UI serves a wrong schema.
+pub async fn migrate(cfg: &Config) -> anyhow::Result<()> {
+    if !bundle_present(cfg) {
+        return Ok(());
+    }
+    let dist = PathBuf::from(&cfg.control_bundle_dir);
+    let bundle_rev = tokio::fs::read_to_string(dist.join("REVISION"))
+        .await
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let rev = revision(&bundle_rev, &control_vars(cfg));
+    migrate_control(cfg, &rev).await
+}
+
+/// The migration driver behind [`migrate`]. A bundle built without
+/// `db/migrations` never advertises v2 and is skipped.
 async fn migrate_control(cfg: &Config, revision: &str) -> anyhow::Result<()> {
     let control_dir = Path::new(&cfg.control_bundle_dir)
         .parent()
@@ -258,22 +271,31 @@ async fn migrate_control(cfg: &Config, revision: &str) -> anyhow::Result<()> {
         crate::config::CONTROL_UPSTREAM_URL.to_string(),
         control_proxy_token(cfg),
     );
+    // The fleet adopts a new pointer on its poll and starts the worker from
+    // scratch after an upgrade, so the endpoint answers connection-refused or
+    // 404 for a few seconds. Anything else (401: the derived proxy token does
+    // not match the worker's env) is a bug and fails at once.
     let mut capabilities = None;
-    for _ in 0..60 {
+    let mut last = String::from("not attempted");
+    for _ in 0..20 {
         match client.capabilities().await {
             Ok(caps) => {
                 capabilities = Some(caps);
                 break;
             }
             Err(error) => {
+                if matches!(error, void_migrate::ProbeError::Http { status: 401, .. }) {
+                    anyhow::bail!("control migrate: the worker rejected the proxy token ({error})");
+                }
                 tracing::debug!(%error, "control migration endpoint not ready");
+                last = error.to_string();
             }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     let Some(caps) = capabilities else {
         anyhow::bail!(
-            "control migrate: the worker did not advertise its migration endpoint within 60 s"
+            "control migrate: the worker did not advertise its migration endpoint within 20 s ({last})"
         );
     };
     if caps.dialect != "sqlite" {
