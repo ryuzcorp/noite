@@ -155,15 +155,41 @@ export type AppCollaborator = Selectable<DB["app_collaborator"]>;
 
 export const orm = paranorm<DB>();
 
-const migrator = createMigrator([schema]);
+/** Every shipped schema, oldest first. The compaction left one baseline;
+ * append the next `defineSchema` (with a higher `_version`) here to migrate an
+ * existing control database forward. */
+const schemaHistory = [schema];
+
+const migrator = createMigrator(schemaHistory);
 
 const LEDGER_TABLE = "paranorm_migrations";
 
-/** Alpha builds do not upgrade between versions. A ledger holding anything
- * other than exactly this build's single plan is a control database from a
- * different alpha: refuse it before the migrator touches the shape. A fresh
- * database has no ledger. */
-const assertFreshSchema = Effect.gen(function* assertFreshSchema() {
+/** What is wrong with `recorded` against this build's `known` plans, or
+ * `undefined` when it is a prefix of them (so the migrator can apply the
+ * remaining steps). A pre-compaction alpha recorded different names at these
+ * ids, which makes it a different schema line: refuse it. */
+export const ledgerMismatch = (
+  recorded: readonly { migration_id: number; name: string }[],
+  known: readonly { id: number; name: string }[]
+): string | undefined => {
+  for (const [index, row] of recorded.entries()) {
+    const planned = known[index];
+
+    if (
+      planned === undefined ||
+      Number(row.migration_id) !== planned.id ||
+      row.name !== planned.name
+    ) {
+      return "the control database was created by a different Noite alpha. Alpha builds do not upgrade between versions; wipe the install and start fresh.";
+    }
+  }
+
+  return undefined;
+};
+
+/** Refuse a ledger this build cannot honour before the migrator touches the
+ * shape. An empty ledger (fresh database) passes. */
+const assertLedgerCompatible = Effect.gen(function* assertLedgerCompatible() {
   const sql = yield* SqlClient;
 
   const tables = yield* sql<{ name: string }>`
@@ -178,21 +204,10 @@ const assertFreshSchema = Effect.gen(function* assertFreshSchema() {
     SELECT migration_id, name FROM paranorm_migrations ORDER BY migration_id
   `;
 
-  const [planned] = migrator.plan();
-  const [first] = recorded;
+  const reason = ledgerMismatch(recorded, migrator.plan());
 
-  if (
-    recorded.length !== 1 ||
-    planned === undefined ||
-    first === undefined ||
-    Number(first.migration_id) !== planned.id ||
-    first.name !== planned.name
-  ) {
-    return yield* Effect.fail(
-      new Error(
-        "noite: refusing to start: the control database was created by a different Noite alpha. Alpha builds do not upgrade between versions; wipe the install and start fresh."
-      )
-    );
+  if (reason) {
+    return yield* Effect.fail(new Error(`noite: refusing to start: ${reason}`));
   }
 });
 
@@ -241,7 +256,7 @@ export const sqlLive = () => D1Client.layer({ db: resolveD1() });
 /** The setup pass itself: the ledger check, the migration and the admin
  * bootstrap below. `ensureDb` runs it at most once per isolate. */
 const runDbSetup = Effect.gen(function* runDbSetup() {
-  yield* assertFreshSchema;
+  yield* assertLedgerCompatible;
   yield* migrator.migrate;
 
   // Instance admin bootstrap (runs once per process at startup): if

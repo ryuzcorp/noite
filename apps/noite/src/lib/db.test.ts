@@ -2,13 +2,63 @@ import { beforeEach, describe, expect, test } from "bun:test";
 
 import { createTestD1, gateD1 } from "../testing/d1";
 import type { TestD1 } from "../testing/d1";
-import { ensureDbPromise, setD1Binding } from "./db";
+import { ensureDbPromise, ledgerMismatch, setD1Binding } from "./db";
 
 let db: TestD1;
 
 beforeEach(() => {
   db = createTestD1();
   setD1Binding(db.d1);
+});
+
+const KNOWN = [
+  { id: 1, name: "1.5.0" },
+  { id: 2, name: "1.6.0" },
+];
+
+describe("ledgerMismatch", () => {
+  test("accepts an empty ledger and a prefix of the known plans", () => {
+    expect(ledgerMismatch([], KNOWN)).toBeUndefined();
+    expect(ledgerMismatch([], KNOWN)).toBeUndefined();
+    // A database at the first schema is a prefix and migrates forward.
+    expect(
+      ledgerMismatch([{ migration_id: 1, name: "1.5.0" }], KNOWN)
+    ).toBeUndefined();
+    expect(
+      ledgerMismatch(
+        [
+          { migration_id: 1, name: "1.5.0" },
+          { migration_id: 2, name: "1.6.0" },
+        ],
+        KNOWN
+      )
+    ).toBeUndefined();
+  });
+
+  test("refuses a pre-compaction alpha's ledger", () => {
+    const reason = ledgerMismatch(
+      [
+        { migration_id: 1, name: "1.3.0" },
+        { migration_id: 2, name: "1.4.0" },
+      ],
+      KNOWN
+    );
+
+    expect(reason).toContain("different Noite alpha");
+  });
+
+  test("refuses a ledger longer than this build's plan", () => {
+    const reason = ledgerMismatch(
+      [
+        { migration_id: 1, name: "1.5.0" },
+        { migration_id: 2, name: "1.6.0" },
+        { migration_id: 3, name: "9.9.9" },
+      ],
+      KNOWN
+    );
+
+    expect(reason).toContain("different Noite alpha");
+  });
 });
 
 describe("ensureDb", () => {

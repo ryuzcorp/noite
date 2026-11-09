@@ -4,4 +4,4 @@
 
 ### Changed
 
-- One `schema.sql`, one `schema.metrics.sql` and one control `defineSchema` are the whole schema of a fresh install. The runner's ordered `MIGRATIONS`, the metrics `ensure_environment_telemetry` rebuild, the tolerant `app_error_event` ALTERs, the control `schemaHistory`/ledger compatibility check and the installer upgrade confirmation are gone.
+- The shipped history is compacted to one baseline: `MIGRATIONS` is empty above `SCHEMA_VERSION` 100, `schemaHistory` holds the single control `defineSchema`, and `schema.metrics.sql` carries the final metrics shape. Both migration runners are retained (append a step above the baseline to change the shape forward). The metrics `ensure_environment_telemetry` rebuild, the tolerant `app_error_event` ALTERs, and the installer upgrade confirmation is gone.
