@@ -164,6 +164,11 @@ remove_data() {
   fi
 
   step "Removing $NOITE_DIR"
+  case "$NOITE_DIR" in
+    "" | "/" | "/.")
+      die "refusing to remove \"$NOITE_DIR\": NOITE_DIR must be the install directory"
+      ;;
+  esac
   if [[ -d "$NOITE_DIR" ]]; then
     rm -rf -- "$NOITE_DIR"
     info "removed (with .env and its secrets)"
