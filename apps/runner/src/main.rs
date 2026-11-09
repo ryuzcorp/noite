@@ -535,7 +535,16 @@ async fn main() -> anyhow::Result<()> {
             Some(child)
         }
     } else {
-        tracing::info!("no control bundle (dev image): the UI is served by vite dev");
+        if std::path::Path::new(&config.control_bundle_dir).exists() {
+            // The directory is there, the config is not: a build layout the
+            // deploy cannot read. /ready would only say "fleet not healthy",
+            // so record it.
+            let reason = format!("no wrangler config under {}", config.control_bundle_dir);
+            tracing::error!(%reason, "control bundle unreadable; not deploying it");
+            *control_boot.lock().unwrap_or_else(|p| p.into_inner()) = Some(reason);
+        } else {
+            tracing::info!("no control bundle (dev image): the UI is served by vite dev");
+        }
         None
     };
 

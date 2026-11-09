@@ -400,6 +400,60 @@ if (!dockerfile.includes("install-sidecars.sh")) {
   fail("sidecars: docker/Dockerfile no longer invokes install-sidecars.sh");
 }
 
+// The UI image builds from its own lockfile (the Docker stage cannot use the
+// workspace lock), so every direct dependency of apps/noite must resolve to
+// the version the workspace tests. Drift here ships an untested UI: void
+// 1.7.0, for one, stopped emitting the root `dist/wrangler.json` and turned
+// the control deploy into a silent no-op.
+const lockVersion = (lock: string, name: string): string | undefined =>
+  new RegExp(
+    `"${name.replaceAll("/", "\\/")}": \\["${name.replaceAll("/", "\\/")}@([^"]+)"`,
+    "u"
+  )
+    .exec(lock)
+    ?.at(1);
+
+const rootLock = read("bun.lock");
+const uiLock = read("apps/noite/bun.lock");
+
+// SAFETY: package.json is the repo's own manifest; the two fields below are
+// the ones this check reads (both optional).
+const uiPackage = JSON.parse(read("apps/noite/package.json")) as {
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+};
+
+const drifted: string[] = [];
+
+for (const name of [
+  ...Object.keys(uiPackage.dependencies ?? {}),
+  ...Object.keys(uiPackage.devDependencies ?? {}),
+]) {
+  const spec =
+    uiPackage.dependencies?.[name] ?? uiPackage.devDependencies?.[name];
+
+  // Aliased packages (`npm:...`) resolve under another name: skip them.
+  if (spec?.startsWith("npm:")) {
+    continue;
+  }
+
+  const workspace = lockVersion(rootLock, name);
+
+  const image = lockVersion(uiLock, name);
+
+  if (workspace !== image) {
+    drifted.push(`${name} workspace=${workspace ?? "?"} image=${image ?? "?"}`);
+  }
+}
+
+if (drifted.length === 0) {
+  console.log("ui lock: apps/noite/bun.lock matches the workspace resolutions");
+} else {
+  fail(
+    `ui lock: apps/noite/bun.lock drifts from bun.lock (regenerate it with the workspace versions): ${drifted.join(", ")}`
+  );
+}
+
 if (failed) {
   process.exit(1);
 }

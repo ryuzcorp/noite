@@ -136,8 +136,24 @@ pub fn revision(bundle_rev: &str, vars: &serde_json::Value) -> String {
 /// telemetry — and surfaces that on `GET /v1/admin/stats` as `control_fleet` so
 /// the UI says so instead of showing empty charts.
 pub fn bundle_present(cfg: &Config) -> bool {
-    let dir = Path::new(&cfg.control_bundle_dir);
-    dir.join("wrangler.json").exists() || dir.join("wrangler.jsonc").exists()
+    bundle_config(&cfg.control_bundle_dir).is_some()
+}
+
+/// The bundle's wrangler config: `dist/wrangler.json` (the shipped layout) or
+/// `dist/ssr/wrangler.json` (Void's build puts it there on some versions).
+/// The deploy patches whatever it finds, so a layout change cannot silently
+/// turn the deploy into a no-op.
+fn bundle_config(dir: &str) -> Option<PathBuf> {
+    let dir = Path::new(dir);
+    [
+        "wrangler.json",
+        "ssr/wrangler.json",
+        "wrangler.jsonc",
+        "ssr/wrangler.jsonc",
+    ]
+    .iter()
+    .map(|rel| dir.join(rel))
+    .find(|path| path.exists())
 }
 
 /// Deploy the baked bundle when revision differs, then return the vars.
@@ -156,6 +172,7 @@ pub async fn ensure_deployed(cfg: &Config) -> anyhow::Result<serde_json::Value> 
         .unwrap_or_else(|_| "unknown".to_string());
     let vars = control_vars(cfg);
     let rev = revision(&bundle_rev, &vars);
+    tracing::debug!(revision = %rev, "control bundle revision");
     // Compare with marker.
     let tmp = std::env::temp_dir().join("noite-ui-revision");
     let deployed = fetch_marker(cfg).await.unwrap_or_default();
@@ -167,11 +184,8 @@ pub async fn ensure_deployed(cfg: &Config) -> anyhow::Result<serde_json::Value> 
     let work = std::env::temp_dir().join(format!("noite-ui-{}", &rev[..8.min(rev.len())]));
     let _ = tokio::fs::remove_dir_all(&work).await;
     copy_dir(&dist, &work).await?;
-    let wrangler = if work.join("wrangler.json").exists() {
-        work.join("wrangler.json")
-    } else {
-        work.join("wrangler.jsonc")
-    };
+    let wrangler = bundle_config(&work.to_string_lossy())
+        .ok_or_else(|| anyhow::anyhow!("control bundle has no wrangler config after copy"))?;
     let text = tokio::fs::read_to_string(&wrangler).await?;
     let mut doc: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("control wrangler parse: {e}"))?;
