@@ -14,9 +14,10 @@ import { controlEnv } from "./control-env";
 // pending invitations — the ONLY app-shaped state the UI owns. App rows and deploy history live in the runner
 // (single writer, behind its bearer API), so `app_collaborator.appId` is a
 // plain key into that store: no local FK, no mirror, no sync job.
-// One schema for a fresh control database. Alpha builds do not upgrade between
-// versions: `assertFreshSchema` refuses a database whose `paranorm_migrations`
-// ledger is not exactly this build's plan. Versioned upgrades return in beta.
+// One baseline schema after the 2026-11-09 compaction. `ledgerMismatch`
+// refuses a ledger from before the compaction (different names at the same
+// ids); a database on this baseline is migrated forward by paranorm's
+// `createMigrator` when a newer `defineSchema` is appended.
 
 /** The whole control D1 schema. `user.onboardedAt` is NULL until the account
  * completes the first-run onboarding (server-set only, see auth.ts
@@ -180,7 +181,7 @@ export const ledgerMismatch = (
       Number(row.migration_id) !== planned.id ||
       row.name !== planned.name
     ) {
-      return "the control database was created by a different Noite alpha. Alpha builds do not upgrade between versions; wipe the install and start fresh.";
+      return "the control database was written before the 2026-11-09 schema compaction and cannot be upgraded in place. Back it up, wipe the install and install fresh; databases on the compacted baseline upgrade by re-running the installer.";
     }
   }
 
