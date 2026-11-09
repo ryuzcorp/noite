@@ -10,6 +10,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
 
+## [0.1.0-alpha.29] - 2026-11-09
+
+### Operator action required
+
+- None for a healthy install. Builds that outgrew their memory cap now swap the overflow instead of dying at the cap, so they need host swap: the installer creates `/noite.swap` on hosts under 4 GB (`NOITE_SWAP=0` opts out). If a fresh install shows no swap, add one or the build keeps failing on a box smaller than its working set.
+
+### Fixed
+
+- A build larger than the box's spare RAM no longer dies at its memory cap: each build leaf now carries a bounded swap allowance (`RUNNER_BUILD_SWAP_MB`, derived from the host's swap split across the build slots; `0` keeps builds off swap), the exec watchdog only fails a step once RAM **and** swap are both full, and `/ready` reports the swap budget plus per-leaf swap use. Fleet leaves keep zero swap. On a 1.6 GiB install a Vite 8/Rolldown build peaks around 1.4 GiB: the leaf's 613 MiB RAM cap plus its 1 GiB swap allowance lets that build finish instead of thrashing at the cap until the step timeout.
+
 ## [0.1.0-alpha.28] - 2026-11-09
 
 ### Operator action required
