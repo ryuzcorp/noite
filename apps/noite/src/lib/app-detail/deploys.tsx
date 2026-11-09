@@ -44,11 +44,9 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
   const info = appDetail(appId).data();
   const redeploying = atom(false);
   const redeployError = atom("");
-  // The previous successful production deploy, loaded once when the dropdown
-  // first opens: the one sha a rollback would return to. "" = none (or not
-  // loaded yet; `rollbackLoaded` tells them apart).
-  const rollbackSha = atom("");
-  const rollbackLoaded = atom(false);
+  // Rows behind the rollback target. `null` = not loaded / refresh in
+  // flight, which hides the action.
+  const deployRows = atom<RunnerDeploy[] | null>(null);
   const rollbacking = atom(false);
   const rollbackError = atom("");
 
@@ -58,36 +56,42 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
 
   const canPush = info.myRole === "push" || info.myRole === "admin";
 
-  /** Find the newest successful production deploy that is not the live one.
-   * A redeploy of the same sha is not a rollback target: the pipeline would
-   * rebuild the release that is already serving. */
-  const loadRollbackTarget = (): void => {
-    if (rollbackLoaded()) {
-      return;
+  /** The newest successful production row that is not the live release. A
+   * target that equals the live sha is not a rollback: the pipeline would
+   * rebuild the release already serving. */
+  const rollbackSha = (): string => {
+    const rows = deployRows();
+
+    if (rows === null) {
+      return "";
     }
 
-    rollbackLoaded.set(true);
+    const previous = rows.find(
+      (row) =>
+        // Production rows carry `null` (the runner stores NULL); older frames
+        // and fixtures may say "". Either is production.
+        (row.environmentId === null || row.environmentId === "") &&
+        row.status === "success" &&
+        !!row.sha &&
+        row.sha !== info.app.lastDeploySha
+    );
+
+    return previous?.sha ?? "";
+  };
+
+  /** Refresh the history behind the target on every open: nothing stale may be
+   * clicked, so the action hides until the fresh rows land. */
+  const loadRollbackTarget = (): void => {
+    deployRows.set(null);
     void (async () => {
       try {
-        const rows = await api<RunnerDeploy[]>("/api/apps/listDeploys", {
-          appId,
-        });
-
-        const previous = rows.find(
-          (row) =>
-            // Production rows carry `null` (the runner stores NULL); older
-            // frames and fixtures may say "". Either is production.
-            (row.environmentId === null || row.environmentId === "") &&
-            row.status === "success" &&
-            !!row.sha &&
-            row.sha !== info.app.lastDeploySha
+        deployRows.set(
+          await api<RunnerDeploy[]>("/api/apps/listDeploys", { appId })
         );
-
-        rollbackSha.set(previous?.sha ?? "");
       } catch {
         // No target is the safe reading of a failed lookup: the button stays
         // hidden and Redeploy (which needs no history) still works.
-        rollbackSha.set("");
+        deployRows.set([]);
       }
     })();
   };
@@ -232,7 +236,7 @@ export const DeployDropdown = ({ appId }: { appId: string }) => {
               </p>
             </div>
           ) : null}
-          {canPush && rollbackLoaded() && rollbackSha() === "" ? (
+          {canPush && deployRows() !== null && rollbackSha() === "" ? (
             <p class="m-0 text-xs opacity-60">
               No earlier successful deploy to roll back to yet.
             </p>
