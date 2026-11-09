@@ -742,7 +742,10 @@ mod tests {
         );
         let stop = async {
             tokio::task::yield_now().await;
-            assert!(cancels.cancel("deploy-test"));
+            assert_eq!(
+                cancels.cancel("deploy-test"),
+                super::super::cancel::CancelOutcome::Signalled
+            );
         };
         let (result, ()) = tokio::join!(run, stop);
         let Err(err) = result else {
@@ -760,7 +763,10 @@ mod tests {
         // The token is gone with the run (the deploy's release guard, the
         // same one the pipeline holds): a second stop answers from the row.
         cancels.release("deploy-test");
-        assert!(!cancels.cancel("deploy-test"));
+        assert_eq!(
+            cancels.cancel("deploy-test"),
+            super::super::cancel::CancelOutcome::Missing
+        );
     }
 
     /// A token only exists between register and release; ids are opaque, so
@@ -770,11 +776,29 @@ mod tests {
         let cancels = super::super::cancel::Cancels::default();
         let token = cancels.register("a");
         assert!(!token.is_cancelled());
-        assert!(!cancels.cancel("b"));
-        assert!(cancels.cancel("a"));
+        assert_eq!(
+            cancels.cancel("b"),
+            super::super::cancel::CancelOutcome::Missing
+        );
+        assert_eq!(
+            cancels.cancel("a"),
+            super::super::cancel::CancelOutcome::Signalled
+        );
         assert!(token.is_cancelled());
         cancels.release("a");
-        assert!(!cancels.cancel("a"));
+        assert_eq!(
+            cancels.cancel("a"),
+            super::super::cancel::CancelOutcome::Missing
+        );
+
+        // Past the point of no return the stop is refused, not half-applied.
+        let committed = cancels.register("c");
+        committed.commit();
+        assert_eq!(
+            cancels.cancel("c"),
+            super::super::cancel::CancelOutcome::Committed
+        );
+        assert!(!committed.is_cancelled());
     }
 
     #[test]

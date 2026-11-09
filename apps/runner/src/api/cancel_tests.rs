@@ -103,6 +103,33 @@ async fn stopping_a_live_run_signals_it_and_leaves_the_row_to_the_pipeline() {
 }
 
 #[tokio::test]
+async fn a_run_past_its_activation_cannot_be_stopped() {
+    let h = Harness::new().await;
+    let app = h.seed_app("committed-stop").await;
+    let deploy_id = seed_deploy(&h, &app.id, "deploying", "ccc3333").await;
+    let token = crate::host::cancel::CANCELS.register(&deploy_id);
+    token.commit();
+
+    let (status, body) = h
+        .rest(
+            "POST",
+            &format!("/v1/apps/{}/deploys/{deploy_id}/cancel", app.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+    assert!(!token.is_cancelled());
+    let row = crate::db::get_deploy(&h.state.pool, &app.id, &deploy_id)
+        .await
+        .expect("read deploy")
+        .expect("deploy row");
+    assert_eq!(row.status, "deploying");
+
+    crate::host::cancel::CANCELS.release(&deploy_id);
+    h.finish().await;
+}
+
+#[tokio::test]
 async fn stopping_answers_not_found_and_conflict_honestly() {
     let h = Harness::new().await;
     let app = h.seed_app("stop-errors").await;

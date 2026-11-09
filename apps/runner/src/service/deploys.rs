@@ -54,8 +54,14 @@ pub async fn cancel(state: &AppState, id: &str, deploy_id: &str) -> Result<(), A
     if !in_flight {
         return Err(ApiError::conflict("deploy is not in flight"));
     }
-    if crate::host::cancel::CANCELS.cancel(deploy_id) {
-        return Ok(());
+    match crate::host::cancel::CANCELS.cancel(deploy_id) {
+        crate::host::cancel::CancelOutcome::Signalled => return Ok(()),
+        // The new generation is already on the fleet; only a new deploy (or a
+        // rollback) replaces it now.
+        crate::host::cancel::CancelOutcome::Committed => {
+            return Err(ApiError::conflict("deploy is past the point of no return"));
+        }
+        crate::host::cancel::CancelOutcome::Missing => {}
     }
     // No live token: the process running this row is gone.
     let closed = db::mark_deploy_cancelled(&state.pool, &app.id, deploy_id)

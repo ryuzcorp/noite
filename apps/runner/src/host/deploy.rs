@@ -200,6 +200,13 @@ pub async fn deploy_app(
     // create or redeploy, a workspace preview) — waits its turn: a preview
     // must not fail because production is building. A background tip deploy
     // has no row and skips; the next reconcile tick picks the tip up again.
+    // A caller-made row is the operator's stop target from the moment it
+    // exists, so its token is registered before this run waits for the app's
+    // claim: a stop during that wait must end in the cancel line, never in a
+    // run that starts anyway once the claim frees (the row is already
+    // failed, and `Progress` would rewrite it building).
+    let early_cancel = deploy_id.map(|id| crate::host::cancel::CANCELS.register(id));
+    let _release = deploy_id.map(|id| crate::host::cancel::CANCELS.guard(id));
     let claimed = match deploy_id {
         Some(_) => {
             let wait = Duration::from_millis(crate::lifecycle::DEPLOY_STUCK_MS.unsigned_abs());
@@ -209,8 +216,16 @@ pub async fn deploy_app(
     };
     let Some(_claim) = claimed else {
         // The caller may be waiting on that pre-created row: close it, or it
-        // sits "building" until the stuck-deploy sweep.
+        // sits "building" until the stuck-deploy sweep. A row the operator
+        // already stopped keeps the stop as its story.
         if let Some(id) = deploy_id {
+            let stopped = early_cancel.as_ref().is_some_and(|t| t.is_cancelled());
+            let text = if stopped {
+                format!("ERROR: {CANCELLED}\n")
+            } else {
+                "ERROR: deploy skipped, another deploy of this app did not finish in time\n"
+                    .to_string()
+            };
             let _ = db::upsert_deploy(
                 pool,
                 Some(id),
@@ -218,13 +233,31 @@ pub async fn deploy_app(
                 target.environment_id(),
                 DeployStatus::Failed.as_str(),
                 tip_sha,
-                "ERROR: deploy skipped, another deploy of this app did not finish in time\n",
+                &text,
             )
             .await;
         }
         tracing::info!(slug = %app.slug, "deploy skip (in flight)");
         return;
     };
+    if early_cancel.as_ref().is_some_and(|t| t.is_cancelled()) {
+        // Stopped while queued: the row already says failed (the endpoint
+        // wrote it) and nothing may build.
+        let mut progress = Progress {
+            pool,
+            app_id: &app.id,
+            cancel: early_cancel.clone(),
+            environment_id: target.environment_id().map(str::to_string),
+            sha: tip_sha.map(str::to_string),
+            id: deploy_id.map(str::to_string),
+            step: "queued",
+        };
+        if let Err(e) = progress.fail(&anyhow::anyhow!(CANCELLED)).await {
+            tracing::error!(slug = %app.slug, error = %e, "failed to record the stop of a queued deploy");
+        }
+        tracing::info!(slug = %app.slug, "deploy skip (cancelled while queued)");
+        return;
+    }
     // A deploy is activity (SPEC, Scale to zero): wake an asleep app — or
     // preview environment — so the reconcile loop spawns the fleet this
     // release lands in.
@@ -257,14 +290,14 @@ pub async fn deploy_app(
             }
         },
     };
-    let cancel = deploy_id
-        .as_deref()
-        .map(|id| crate::host::cancel::CANCELS.register(id));
-    // Whether the run ends in success, failure or a panic, the next stop of
-    // this row reads its status instead of tripping a dead token.
-    let _release = deploy_id
-        .as_deref()
-        .map(|id| crate::host::cancel::CANCELS.guard(id));
+    // The caller's token (registered before the wait) is the run's token; a
+    // tip deploy registers its own now that it owns the app.
+    let cancel = match early_cancel {
+        Some(token) => Some(token),
+        None => deploy_id
+            .as_deref()
+            .map(|id| crate::host::cancel::CANCELS.register(id)),
+    };
     let mut progress = Progress {
         pool,
         app_id: &app.id,
@@ -398,6 +431,14 @@ impl Progress<'_> {
             anyhow::bail!("{CANCELLED}");
         }
         Ok(())
+    }
+
+    /// The run's generation is on the fleet: from here a stop is refused, not
+    /// silently half-applied.
+    fn commit_cancel(&self) {
+        if let Some(token) = &self.cancel {
+            token.commit();
+        }
     }
 
     /// Enter `step`, logged as `▸ step: detail`.
@@ -1566,6 +1607,10 @@ async fn deploy_inner(
         let environment = load_deploy_target(pool, app, target).await?;
         (stats, environment)
     };
+    // The staged generation is on the fleet: from here a stop cannot take it
+    // back, so the token commits (later stops answer 409) and the run is
+    // allowed to finish routing and recording its success.
+    progress.commit_cancel();
     for line in stats.log_lines() {
         progress.log(DeployStatus::Deploying, &line).await?;
     }

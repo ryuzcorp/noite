@@ -30,7 +30,22 @@ tokio::task_local! {
 /// operator asks.
 pub struct Cancel {
     flag: AtomicBool,
+    /// Set once the run moved the staged generation onto the fleet: the
+    /// release now serves it, so a stop cannot un-do it (the endpoint
+    /// answers 409 instead of pretending).
+    committed: AtomicBool,
     notify: tokio::sync::Notify,
+}
+
+/// What a stop request found for its deploy id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// A live run was told to stop.
+    Signalled,
+    /// The run is past its point of no return (it activated its generation).
+    Committed,
+    /// No live run holds this id: the caller decides from the row's status.
+    Missing,
 }
 
 pub type CancelHandle = Arc<Cancel>;
@@ -39,6 +54,7 @@ impl Cancel {
     fn new() -> Self {
         Self {
             flag: AtomicBool::new(false),
+            committed: AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
         }
     }
@@ -50,10 +66,26 @@ impl Cancel {
     /// Resolve once the operator cancels; returns at once when it already
     /// happened.
     pub async fn cancelled(&self) {
+        // Register the waiter *before* re-reading the flag: a trip between
+        // the old check and `notified()` would find no waiter and never wake
+        // this future, so the stop would wait out the step instead of
+        // killing it.
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if self.is_cancelled() {
             return;
         }
-        self.notify.notified().await;
+        notified.await;
+    }
+
+    /// Mark the run past the point where a stop can change its outcome.
+    pub fn commit(&self) {
+        self.committed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_committed(&self) -> bool {
+        self.committed.load(Ordering::SeqCst)
     }
 
     fn trip(&self) {
@@ -98,17 +130,17 @@ impl Cancels {
         self.guard_map().remove(deploy_id);
     }
 
-    /// Trip the live token for `deploy_id`. `false` = no run is registered
-    /// (finished, or the runner restarted), so the caller decides from the
-    /// row's status.
-    pub fn cancel(&self, deploy_id: &str) -> bool {
+    /// Trip the live token for `deploy_id`, unless its run already committed
+    /// (it activated a generation: nothing is left to stop).
+    pub fn cancel(&self, deploy_id: &str) -> CancelOutcome {
         let token = self.guard_map().get(deploy_id).cloned();
         match token {
+            Some(token) if token.is_committed() => CancelOutcome::Committed,
             Some(token) => {
                 token.trip();
-                true
+                CancelOutcome::Signalled
             }
-            None => false,
+            None => CancelOutcome::Missing,
         }
     }
 }
