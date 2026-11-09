@@ -36,6 +36,59 @@ pub async fn log(state: &AppState, id: &str, deploy_id: &str) -> Result<String, 
     }
 }
 
+/// Stop an in-flight deploy of `app_id`. A live run is signalled and records
+/// its own failure (`ERROR: cancelled by the operator`); a row whose run is
+/// already gone (finished between the read and the call, or the runner
+/// restarted mid-build) is closed here so the UI never keeps a "building" row
+/// that nothing is building.
+pub async fn cancel(state: &AppState, id: &str, deploy_id: &str) -> Result<(), ApiError> {
+    let app = app_or_404(state, id).await?;
+    let deploy_id = deploy_id.trim();
+    let row = db::get_deploy(&state.pool, &app.id, deploy_id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let Some(row) = row else {
+        return Err(ApiError::not_found("deploy not found"));
+    };
+    let in_flight = matches!(row.status.as_str(), "queued" | "building" | "deploying");
+    if !in_flight {
+        return Err(ApiError::conflict("deploy is not in flight"));
+    }
+    if crate::host::cancel::CANCELS.cancel(deploy_id) {
+        return Ok(());
+    }
+    // No live token: the process running this row is gone.
+    let closed = db::mark_deploy_cancelled(&state.pool, &app.id, deploy_id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if !closed {
+        return Err(ApiError::conflict("deploy is not in flight"));
+    }
+    let summary = crate::host::cancel::CANCELLED;
+    let outcome = match row.environment_id.as_deref() {
+        Some(env_id) => {
+            db::update_environment_status_if_wanted(
+                &state.pool,
+                env_id,
+                crate::models::AppStatus::Failed.as_str(),
+                Some(summary),
+            )
+            .await
+        }
+        None => {
+            db::update_app_status_if_wanted(
+                &state.pool,
+                &app.id,
+                crate::models::AppStatus::Failed.as_str(),
+                Some(summary),
+            )
+            .await
+        }
+    };
+    outcome.map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(())
+}
+
 /// A validated rollback ready to run: its queued deploy row already exists,
 /// so a watcher sees the rollback before the spawned task is even scheduled.
 pub struct PreparedRollback {

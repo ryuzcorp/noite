@@ -305,6 +305,61 @@ const BuildLogPane = ({
   return <FinishedBuildLog appId={appId} deployId={d.id} />;
 };
 
+/** Confirm and stop one in-flight deploy: the rejection text, or `""`. */
+const stopDeploy = async (appId: string, deployId: string): Promise<string> => {
+  try {
+    await api<{ ok: true }>("/api/apps/cancelDeploy", { appId, deployId });
+
+    return "";
+  } catch (error) {
+    return errorMessage(error);
+  }
+};
+
+/** The row's Stop button (push/admin, in-flight only): the run dies with its
+ * step's process group and the row closes as failed. */
+const StopDeployButton = ({
+  appId,
+  deployId,
+}: {
+  appId: string;
+  deployId: string;
+}) => {
+  const stopping = atom(false);
+  const error = atom("");
+
+  return (
+    <>
+      {error() ? <p class="text-error m-0 text-xs">{error()}</p> : null}
+      <button
+        type="button"
+        class="btn btn-sm btn-ghost text-error shrink-0"
+        disabled={stopping()}
+        onclick={async () => {
+          const ok = await confirmDialog({
+            confirmLabel: "Stop deploy",
+            message:
+              "The step running now is killed and the deploy is closed as failed. The release serving traffic stays as it is.",
+            title: "Stop this deploy?",
+          });
+
+          if (!ok) {
+            return;
+          }
+
+          stopping.set(true);
+          error.set("");
+
+          error.set(await stopDeploy(appId, deployId));
+          stopping.set(false);
+        }}
+      >
+        {stopping() ? "Stopping…" : "Stop"}
+      </button>
+    </>
+  );
+};
+
 const DeployRow = ({
   appId,
   currentSha,
@@ -331,6 +386,17 @@ const DeployRow = ({
   const logTab = atom<"build" | "deploy">("deploy");
   const rolling = atom(false);
   const rollError = atom("");
+  const info = appDetail(appId).data();
+
+  const canPush =
+    info !== undefined && (info.myRole === "push" || info.myRole === "admin");
+
+  // A row nothing is building any more is only stopped once the runner has
+  // closed it: the button is for the live run.
+  const inFlight =
+    d.status === "queued" ||
+    d.status === "building" ||
+    d.status === "deploying";
 
   // Roll back re-runs production's pipeline at that sha, so it belongs to
   // production rows only — an environment row must never deploy its sha to
@@ -365,6 +431,9 @@ const DeployRow = ({
         </div>
         {rollError() ? (
           <p class="text-error m-0 text-xs">{rollError()}</p>
+        ) : null}
+        {canPush && inFlight ? (
+          <StopDeployButton appId={appId} deployId={d.id} />
         ) : null}
         {canRollBack ? (
           <button

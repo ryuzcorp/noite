@@ -408,7 +408,22 @@ pub async fn run_sandboxed(
                 }
             })
         });
-    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    // An operator stop must not wait out the step: race the token against
+    // the child, kill its whole group, and let the pipeline record the
+    // failure. `kill_on_drop` alone only reaches the leader.
+    let result = match super::cancel::current() {
+        Some(token) => tokio::select! {
+            r = tokio::time::timeout(timeout, child.wait_with_output()) => r,
+            () = token.cancelled() => {
+                #[cfg(unix)]
+                if let Some(pid) = pid {
+                    kill_group(pid);
+                }
+                bail!("cancelled by the operator");
+            }
+        },
+        None => tokio::time::timeout(timeout, child.wait_with_output()).await,
+    };
     if let Some(watchdog) = watchdog {
         watchdog.abort();
     }
@@ -651,7 +666,22 @@ pub async fn run_cmd_output_stdin(
         }
         None => None,
     };
-    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    // An operator stop must not wait out the step: race the token against
+    // the child, kill its whole group, and let the pipeline record the
+    // failure. `kill_on_drop` alone only reaches the leader.
+    let result = match super::cancel::current() {
+        Some(token) => tokio::select! {
+            r = tokio::time::timeout(timeout, child.wait_with_output()) => r,
+            () = token.cancelled() => {
+                #[cfg(unix)]
+                if let Some(pid) = pid {
+                    kill_group(pid);
+                }
+                bail!("cancelled by the operator");
+            }
+        },
+        None => tokio::time::timeout(timeout, child.wait_with_output()).await,
+    };
     // Whatever happened, nothing the step started may outlive it: the group
     // id is the child's pid (process_group(0)); ESRCH when the group is
     // already empty is fine.
@@ -677,6 +707,57 @@ pub fn work_root(cfg: &Config) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The operator's stop reaches a running step: the wait returns with the
+    /// cancel line instead of holding for the step timeout, and the child is
+    /// killed, not orphaned. The trip runs on the second poll — after
+    /// `run_cmd_output` spawned the child (the current-thread runtime polls
+    /// the join's branches in order) — so the stop lands mid-step.
+    #[tokio::test]
+    async fn a_cancelled_run_ends_at_once_with_the_operator_line() {
+        let cancels = super::super::cancel::Cancels::default();
+        let token = cancels.register("deploy-test");
+        let started = std::time::Instant::now();
+        let run = super::super::cancel::with(
+            token,
+            run_cmd_output("sleep", &["30"], None, &[], Duration::from_secs(60)),
+        );
+        let stop = async {
+            tokio::task::yield_now().await;
+            assert!(cancels.cancel("deploy-test"));
+        };
+        let (result, ()) = tokio::join!(run, stop);
+        let Err(err) = result else {
+            panic!("a stopped run is an error");
+        };
+        assert!(
+            err.to_string().contains("cancelled by the operator"),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the stop waited {:?}",
+            started.elapsed()
+        );
+        // The token is gone with the run (the deploy's release guard, the
+        // same one the pipeline holds): a second stop answers from the row.
+        cancels.release("deploy-test");
+        assert!(!cancels.cancel("deploy-test"));
+    }
+
+    /// A token only exists between register and release; ids are opaque, so
+    /// one deploy's stop can never touch another's.
+    #[test]
+    fn the_registry_trips_only_the_registered_deploy() {
+        let cancels = super::super::cancel::Cancels::default();
+        let token = cancels.register("a");
+        assert!(!token.is_cancelled());
+        assert!(!cancels.cancel("b"));
+        assert!(cancels.cancel("a"));
+        assert!(token.is_cancelled());
+        cancels.release("a");
+        assert!(!cancels.cancel("a"));
+    }
 
     #[test]
     fn seed_copies_the_bundled_entry_once() {

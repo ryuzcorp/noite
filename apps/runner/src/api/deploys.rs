@@ -63,6 +63,18 @@ pub async fn deploy_log(
         .map(|log| Json(json!({ "log": log })))
 }
 
+/// Stop an in-flight deploy (the Deployments tab's Stop button): 200 once the
+/// run is signalled (or, for a run the runner no longer holds, once its row is
+/// closed), 409 when the deploy already finished.
+pub async fn cancel_deploy(
+    State(state): State<AppState>,
+    Path((id, deploy_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    service::deploys::cancel(&state, &id, deploy_id.trim())
+        .await
+        .map(|()| Json(json!({ "ok": true })))
+}
+
 /// Deploy history as server-sent events: one JSON array per message, sent
 /// only when the snapshot changed (plus keep-alive comments). Ends when the
 /// client disconnects.

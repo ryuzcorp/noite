@@ -8,6 +8,7 @@ use anyhow::Context;
 use crate::config::{Config, Tenancy};
 use crate::db;
 use crate::host::build_output;
+use crate::host::cancel::CANCELLED;
 use crate::host::credentials;
 use crate::host::exec::{self, Sandbox};
 use crate::host::generated_config;
@@ -233,26 +234,79 @@ pub async fn deploy_app(
             crate::host::sleep::wake_environment_for_deploy(pool, env).await;
         }
     }
+    // The row must exist before the pipeline runs: it is what the operator's
+    // stop acts on, and its id is the cancel key. A tip deploy has no
+    // caller-made row, so it creates one now that it owns the app.
+    let deploy_id = match deploy_id {
+        Some(id) => Some(id.to_string()),
+        None => match db::upsert_deploy(
+            pool,
+            None,
+            &app.id,
+            target.environment_id(),
+            DeployStatus::Building.as_str(),
+            tip_sha,
+            "▸ queued\n",
+        )
+        .await
+        {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::error!(slug = %app.slug, error = %e, "deploy row create failed");
+                None
+            }
+        },
+    };
+    let cancel = deploy_id
+        .as_deref()
+        .map(|id| crate::host::cancel::CANCELS.register(id));
+    // Whether the run ends in success, failure or a panic, the next stop of
+    // this row reads its status instead of tripping a dead token.
+    let _release = deploy_id
+        .as_deref()
+        .map(|id| crate::host::cancel::CANCELS.guard(id));
     let mut progress = Progress {
         pool,
         app_id: &app.id,
+        cancel: cancel.clone(),
         environment_id: target.environment_id().map(str::to_string),
         sha: tip_sha.map(str::to_string),
-        id: deploy_id.map(str::to_string),
+        id: deploy_id.clone(),
         step: "fetch",
     };
-    let result = deploy_inner(
-        pool,
-        cfg,
-        procs,
-        logs,
-        &app,
-        &target,
-        object_key,
-        &mut progress,
-        trigger,
-    )
-    .await;
+    let result = match &cancel {
+        Some(token) => {
+            crate::host::cancel::with(
+                token.clone(),
+                deploy_inner(
+                    pool,
+                    cfg,
+                    procs,
+                    logs,
+                    &app,
+                    &target,
+                    object_key,
+                    &mut progress,
+                    trigger,
+                ),
+            )
+            .await
+        }
+        None => {
+            deploy_inner(
+                pool,
+                cfg,
+                procs,
+                logs,
+                &app,
+                &target,
+                object_key,
+                &mut progress,
+                trigger,
+            )
+            .await
+        }
+    };
     if let Err(e) = &result {
         let fleet = fleet_label(&app, &target);
         tracing::error!(slug = %fleet, step = progress.step, error = %e, "deploy failed");
@@ -309,6 +363,10 @@ async fn load_deploy_target(
 struct Progress<'a> {
     pool: &'a SqlitePool,
     app_id: &'a str,
+    /// The operator's stop button for this run; `None` only for a deploy the
+    /// registry never saw (cannot happen: `deploy_app` registers before the
+    /// pipeline starts).
+    cancel: Option<crate::host::cancel::CancelHandle>,
     /// The environment this run targets; `None` is production. Decides which
     /// row the status lands on (the app, or the environment).
     environment_id: Option<String>,
@@ -333,30 +391,71 @@ impl Progress<'_> {
         Ok(())
     }
 
+    /// The operator stop, checked at every phase boundary: a step that would
+    /// activate (or start a fleet) never runs after the row was cancelled.
+    fn check_cancel(&self) -> anyhow::Result<()> {
+        if self.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+            anyhow::bail!("{CANCELLED}");
+        }
+        Ok(())
+    }
+
     /// Enter `step`, logged as `▸ step: detail`.
     async fn step(
         &mut self,
         step: &'static str,
         status: DeployStatus,
         detail: &str,
-    ) -> sqlx::Result<()> {
+    ) -> anyhow::Result<()> {
+        self.check_cancel()?;
         self.step = step;
-        self.log(status, &format!("▸ {step}: {detail}\n")).await
+        self.log(status, &format!("▸ {step}: {detail}\n")).await?;
+        Ok(())
     }
 
     /// A step's output tail, for the log of a step that succeeded.
-    async fn output(&mut self, out: &str) -> sqlx::Result<()> {
+    async fn output(&mut self, out: &str) -> anyhow::Result<()> {
+        self.check_cancel()?;
         let out = lifecycle::strip_ansi(out);
         let tail = lifecycle::tail_utf8(out.trim_end(), STEP_OUTPUT_TAIL);
         if tail.is_empty() {
             return Ok(());
         }
-        self.log(DeployStatus::Building, &format!("{tail}\n")).await
+        self.log(DeployStatus::Building, &format!("{tail}\n"))
+            .await?;
+        Ok(())
     }
 
     /// Record `err` on the row and a one-line summary on the target (the app
     /// for production, the environment for a preview).
     async fn fail(&mut self, err: &anyhow::Error) -> sqlx::Result<()> {
+        // A stopped run says why and nothing else: the step that was cut
+        // short did not fail on its own.
+        if self.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+            self.log(DeployStatus::Failed, &format!("ERROR: {CANCELLED}\n"))
+                .await?;
+            match self.environment_id.as_deref() {
+                Some(env_id) => {
+                    db::update_environment_status_if_wanted(
+                        self.pool,
+                        env_id,
+                        AppStatus::Failed.as_str(),
+                        Some(CANCELLED),
+                    )
+                    .await?;
+                }
+                None => {
+                    db::update_app_status_if_wanted(
+                        self.pool,
+                        self.app_id,
+                        AppStatus::Failed.as_str(),
+                        Some(CANCELLED),
+                    )
+                    .await?;
+                }
+            }
+            return Ok(());
+        }
         let detail = lifecycle::strip_ansi(&format!("{err:#}")).into_owned();
         let detail = lifecycle::tail_utf8(detail.trim_end(), FAILURE_TAIL);
         self.log(
@@ -397,6 +496,7 @@ const PREPARE_IMAGES_TIMEOUT: Duration = Duration::from_secs(600);
 /// Output kept per successful step, and for a failure: the deploy row keeps
 /// a 64 KB tail, and earlier steps should survive a noisy failure.
 const STEP_OUTPUT_TAIL: usize = 4 * 1024;
+
 const FAILURE_TAIL: usize = 24 * 1024;
 
 /// One line for the app panel: the failed step and the first line of its
@@ -2831,6 +2931,7 @@ mod tests {
         let mut progress = Progress {
             pool: &pool,
             app_id: &app.id,
+            cancel: None,
             environment_id: None,
             sha: Some("abc123".to_string()),
             id: None,
@@ -3117,6 +3218,7 @@ mod tests {
         let mut progress = Progress {
             pool: &seam.pool,
             app_id: &seam.app.id,
+            cancel: None,
             environment_id: None,
             sha: Some("abc123".to_string()),
             id: None,
@@ -3215,6 +3317,7 @@ mod tests {
         let mut progress = Progress {
             pool: &seam.pool,
             app_id: &seam.app.id,
+            cancel: None,
             environment_id: None,
             sha: Some("abc123".to_string()),
             id: None,
@@ -3315,6 +3418,7 @@ mod tests {
         let mut progress = Progress {
             pool: &seam.pool,
             app_id: &seam.app.id,
+            cancel: None,
             environment_id: None,
             sha: Some("abc123".to_string()),
             id: None,
@@ -3414,6 +3518,7 @@ mod tests {
         let mut progress = Progress {
             pool: &seam.pool,
             app_id: &seam.app.id,
+            cancel: None,
             environment_id: None,
             sha: Some("abc123".to_string()),
             id: None,
@@ -3480,6 +3585,7 @@ mod tests {
         Progress {
             pool: &seam.pool,
             app_id: &seam.app.id,
+            cancel: None,
             environment_id: None,
             sha: Some("abc123".to_string()),
             id: None,
@@ -3714,6 +3820,7 @@ mod tests {
         let mut progress = Progress {
             pool: &pool,
             app_id: &app.id,
+            cancel: None,
             environment_id: None,
             sha: Some("abc123".to_string()),
             id: None,

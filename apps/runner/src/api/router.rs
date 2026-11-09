@@ -61,6 +61,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/apps/{id}/deploys/{deploy_id}/log",
             get(api::deploy_log),
         )
+        .route(
+            "/v1/apps/{id}/deploys/{deploy_id}/cancel",
+            post(api::cancel_deploy),
+        )
         .route("/v1/apps/{id}/rollback", post(api::rollback))
         .route(
             "/v1/apps/{id}/deploys/stream",
