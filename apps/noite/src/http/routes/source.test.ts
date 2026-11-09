@@ -1,7 +1,7 @@
 /* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: a minimal KitEnv stands in for the Worker env */
 import { beforeEach, describe, expect, test } from "bun:test";
 
-import { ensureDbPromise, setD1Binding } from "../../lib/db";
+import { ensureDb, setD1Binding } from "../../lib/db";
 import { createTestD1 } from "../../testing/d1";
 import {
   handleSourceArchive,
@@ -71,7 +71,7 @@ const archiveCall = async (
 beforeEach(async () => {
   const db = createTestD1();
   setD1Binding(db.d1);
-  await ensureDbPromise();
+  await ensureDb();
 });
 
 describe("POST /api/apps/:appId/source/commit", () => {

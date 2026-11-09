@@ -6,7 +6,7 @@ import type { CloudContext } from "void";
 
 import { api, ApiError } from "../../lib/api";
 import { MissingAuthSecretError, UnauthorizedError } from "../../lib/auth";
-import { ensureDbPromise, setD1Binding } from "../../lib/db";
+import { ensureDb, setD1Binding } from "../../lib/db";
 import {
   actionErrorResponse,
   apiAction,
@@ -21,7 +21,7 @@ import { POST as slugCheckPost } from "./apps/slugCheck";
 beforeAll(async () => {
   const fresh = createTestD1();
   setD1Binding(fresh.d1);
-  await ensureDbPromise();
+  await ensureDb();
 });
 
 const ENV = {

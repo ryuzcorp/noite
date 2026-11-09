@@ -9,7 +9,7 @@
 import type { D1Database } from "@cloudflare/workers-types";
 import { defineMiddleware } from "void";
 
-import { ensureDbPromise, setD1Binding } from "../lib/db";
+import { ensureDb, setD1Binding } from "../lib/db";
 import { stampRunnerEnv } from "../lib/runner";
 
 export default defineMiddleware(async (c, next) => {
@@ -26,7 +26,7 @@ export default defineMiddleware(async (c, next) => {
   // (`run_worker_first: true`) — so every request shares the isolate's one
   // admin-bootstrap pass. Schema migrations are the runner's job (Void's
   // migration endpoint), never a request's.
-  await ensureDbPromise();
+  await ensureDb();
 
   return next();
 });

@@ -11,7 +11,7 @@ import * as Effect from "effect/Effect";
 import { createTestD1 } from "../../testing/d1";
 import { installRunnerMock, makeApp } from "../../testing/runner-mock";
 import type { RunnerMock } from "../../testing/runner-mock";
-import { ensureDbPromise, setD1Binding } from "../db";
+import { ensureDb, setD1Binding } from "../db";
 import { createAppForUser } from "./apps.server";
 
 // The grant hits tables the test D1 does not migrate; the rollback path owns
@@ -37,7 +37,7 @@ let runner: RunnerMock;
 beforeAll(async () => {
   const db = createTestD1();
   setD1Binding(db.d1);
-  await ensureDbPromise();
+  await ensureDb();
 });
 
 beforeEach(() => {

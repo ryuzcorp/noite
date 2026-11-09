@@ -25,7 +25,7 @@ import {
   revokePendingInvite,
   upsertPendingInvite,
 } from "./collaborators";
-import { ensureDbPromise, setD1Binding } from "./db";
+import { ensureDb, setD1Binding } from "./db";
 
 let db: TestD1;
 let runner: RunnerMock;
@@ -45,7 +45,7 @@ const addUser = (id: string, email: string, role = "user", name = id) => {
 beforeAll(async () => {
   db = createTestD1();
   setD1Binding(db.d1);
-  await ensureDbPromise();
+  await ensureDb();
 });
 
 beforeEach(() => {

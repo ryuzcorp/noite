@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createTestD1, gateD1 } from "../../testing/d1";
 import type { TestD1 } from "../../testing/d1";
 import { authFromEnv } from "../auth";
-import { ensureDbPromise, setD1Binding } from "../db";
+import { ensureDb, setD1Binding } from "../db";
 import { getSessionOrNull } from "./session.server";
 
 const ENV = {
@@ -18,7 +18,7 @@ let db: TestD1;
 beforeEach(async () => {
   db = createTestD1();
   setD1Binding(db.d1);
-  await ensureDbPromise();
+  await ensureDb();
 });
 
 /** A real better-auth session cookie: the OTP flow mints it exactly as the

@@ -13,10 +13,11 @@
  * Two rules, both with a fail-before unit test behind them (not just this
  * scan):
  * - `no-shared-inflight`: a module-level in-flight promise, cache or client
- *   in worker server code. `setupPasses` (`lib/db.ts`) is the one allowed
- *   instance: every stored pass is `waitUntil`-registered and waiters are
- *   time-bounded (`db.test.ts` pins both). Anything new fails here until it
- *   is registered or split per request — and it gets its own test.
+ *   in worker server code. The control DB has none since the Void swap: the
+ *   admin bootstrap runs per request and migrations are the deploy's job, so
+ *   there is nothing to allowlist. Anything new fails here until it is
+ *   `waitUntil`-registered with bounded waiters, or split per request — and
+ *   it gets its own test.
  * - `no-unbounded-store-read`: the better-auth session read reaches D1 with
  *   no timeout anywhere in its chain, so it must go through the bounded
  *   wrapper in `lib/server/session.server.ts` (5 s, throws instead of
@@ -54,9 +55,7 @@ const hintFor = (rule: WorkerRule): string => {
 };
 
 /** `(file, name)` pairs that may hold module-level shared async work. */
-const SHARED_ALLOWLIST: readonly (readonly [string, string])[] = [
-  ["apps/noite/src/lib/db.ts", "setupPasses"],
-];
+const SHARED_ALLOWLIST: readonly (readonly [string, string])[] = [];
 
 /** Worker server files: directories plus the shared lib modules. `http/`
  * already covers `http/routes/`. */

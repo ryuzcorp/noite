@@ -94,19 +94,12 @@ const runDbSetup = async (): Promise<void> => {
   }
 };
 
-/** One setup pass per isolate: the admin bootstrap. A failure clears it so
- * the next request retries; success is remembered for the isolate's life. */
-let setupPass: Promise<void> | undefined;
-
-export const ensureDbPromise = async (): Promise<void> => {
-  setupPass ??= runDbSetup();
-
-  try {
-    await setupPass;
-  } catch (error) {
-    setupPass = undefined;
-    throw error;
-  }
+/** The admin bootstrap, run per request: one indexed lookup (a write only
+ * when `NOITE_ADMIN_EMAIL` names a registered non-admin). Nothing is cached
+ * across requests, so a pass can never outlive its request or pin the
+ * isolate to a stale binding. */
+export const ensureDb = async (): Promise<void> => {
+  await runDbSetup();
 };
 
 /** Bound on one `withDb` unit of work. A D1 read that never answers fails
@@ -116,7 +109,7 @@ const DB_CALL_TIMEOUT = "10 seconds";
 /** Run one database unit of work: the admin bootstrap first, then the
  * caller's Drizzle work, bounded so a stuck D1 call cannot hang a request. */
 export const withDb = async <A>(work: () => Promise<A>): Promise<A> => {
-  await ensureDbPromise();
+  await ensureDb();
 
   const bounded = Effect.tryPromise({
     catch: (error) => error,

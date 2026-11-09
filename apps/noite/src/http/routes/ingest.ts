@@ -1,6 +1,6 @@
 import { authFromEnv, MissingAuthSecretError } from "../../lib/auth";
 import { requireAppRole } from "../../lib/collaborators";
-import { ensureDbPromise } from "../../lib/db";
+import { ensureDb } from "../../lib/db";
 import { MAX_BODY_BYTES, readBoundedText, tooLarge } from "../body";
 import { runnerConfig } from "../config";
 import type { RouteHandler } from "../config";
@@ -31,7 +31,7 @@ export const forwardIngest: RouteHandler = async (request, env, params) => {
     return new Response("bearer token required", { status: 401 });
   }
 
-  await ensureDbPromise();
+  await ensureDb();
 
   try {
     const auth = authFromEnv(

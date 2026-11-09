@@ -11,7 +11,7 @@ import {
 
 import { grantCollaborator } from "../../lib/collaborators";
 import { controlEnv } from "../../lib/control-env";
-import { ensureDbPromise, setD1Binding } from "../../lib/db";
+import { ensureDb, setD1Binding } from "../../lib/db";
 import { stampRunnerEnv } from "../../lib/runner";
 import type { TestD1 } from "../../testing/d1";
 import { createTestD1 } from "../../testing/d1";
@@ -68,7 +68,7 @@ const answer = (method: string): unknown => {
 beforeAll(async () => {
   db = createTestD1();
   setD1Binding(db.d1);
-  await ensureDbPromise();
+  await ensureDb();
   controlEnv.RUNNER_TOKEN = ENV.RUNNER_TOKEN;
   controlEnv.RUNNER_URL = ENV.RUNNER_URL;
   stampRunnerEnv(ENV as never);

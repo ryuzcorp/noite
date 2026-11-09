@@ -608,14 +608,19 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_control_skips_a_bundle_without_migrations() {
-        let _env = crate::config::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut cfg = Config::from_env().expect("config");
-        let dir =
-            std::env::temp_dir().join(format!("noite-control-migrate-{}", crate::models::new_id()));
-        std::fs::create_dir_all(dir.join("dist")).expect("temp dir");
-        cfg.control_bundle_dir = dir.join("dist").to_string_lossy().into_owned();
+        // The env lock serialises the read, not the await: release it before
+        // the call so the test future stays Send.
+        let (cfg, dir) = {
+            let _env = crate::config::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut cfg = Config::from_env().expect("config");
+            let dir = std::env::temp_dir()
+                .join(format!("noite-control-migrate-{}", crate::models::new_id()));
+            std::fs::create_dir_all(dir.join("dist")).expect("temp dir");
+            cfg.control_bundle_dir = dir.join("dist").to_string_lossy().into_owned();
+            (cfg, dir)
+        };
         migrate_control(&cfg, "rev-test")
             .await
             .expect("a bundle without migrations is skipped");

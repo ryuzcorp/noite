@@ -3,7 +3,7 @@ import { beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createTestD1 } from "../testing/d1";
 import type { TestD1 } from "../testing/d1";
 import { createAuth } from "./auth";
-import { ensureDbPromise, setD1Binding } from "./db";
+import { ensureDb, setD1Binding } from "./db";
 
 let db: TestD1;
 
@@ -18,7 +18,7 @@ const auth = () => createAuth(ENV, ENV.BETTER_AUTH_URL);
 beforeAll(async () => {
   db = createTestD1();
   setD1Binding(db.d1);
-  await ensureDbPromise();
+  await ensureDb();
 });
 
 beforeEach(() => {

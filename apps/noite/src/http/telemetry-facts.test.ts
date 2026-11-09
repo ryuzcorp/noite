@@ -1,7 +1,7 @@
 /* oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion -- test doubles: a minimal KitEnv stands in for the Worker env */
 import { beforeEach, describe, expect, test } from "bun:test";
 
-import { ensureDbPromise, setD1Binding } from "../lib/db";
+import { ensureDb, setD1Binding } from "../lib/db";
 import { platformLimiter } from "../lib/rate-limit";
 import * as telemetryFactsRoute from "../routes/internal/telemetry-facts";
 import { createTestD1 } from "../testing/d1";
@@ -21,7 +21,7 @@ beforeEach(async () => {
   platformLimiter.reset();
   db = createTestD1();
   setD1Binding(db.d1);
-  await ensureDbPromise();
+  await ensureDb();
 });
 
 const addUser = (id: string) => {

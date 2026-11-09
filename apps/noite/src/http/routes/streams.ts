@@ -5,7 +5,7 @@ import {
   requireAppRole,
 } from "../../lib/collaborators";
 import { CONTROL_APP_ID } from "../../lib/control-app";
-import { ensureDbPromise } from "../../lib/db";
+import { ensureDb } from "../../lib/db";
 import {
   METRICS_WINDOWS_HOURS,
   pollMetricsFrame,
@@ -70,7 +70,7 @@ const proxyRunnerStream = async (
     return new Response("app required", { status: 400 });
   }
 
-  await ensureDbPromise();
+  await ensureDb();
 
   if (appId === CONTROL_APP_ID) {
     // The control plane's own telemetry: instance admin, never impersonating.
@@ -140,7 +140,7 @@ const APPS_STREAM_POLL_MS = 2000;
  * resetting the expiry and EventSource auto-reconnect covering the rest.
  * Session-gated like every other browser route. */
 export const handleAppsStream: RouteHandler = async (request, env) => {
-  await ensureDbPromise();
+  await ensureDb();
   const userId = await routeUserId(request, env);
 
   if (!userId) {
@@ -284,7 +284,7 @@ export const handleMetricsStream: RouteHandler = async (
     return new Response("app required", { status: 400 });
   }
 
-  await ensureDbPromise();
+  await ensureDb();
 
   if (appId === CONTROL_APP_ID) {
     // The control plane's own telemetry: instance admin, never impersonating.
