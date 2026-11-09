@@ -14,9 +14,10 @@
 # volumes) and run the installer again.
 #
 # On a host under 4 GB the installer also creates a 1-2 GB /noite.swap
-# swapfile (swappiness 10) as a safety net for a transient peak: the build
-# keeps zero swap, so a build that outgrows its budget still dies in its own
-# cgroup instead of thrashing this disk. Skip it with NOITE_SWAP=0.
+# swapfile (swappiness 10) as a safety net for a transient peak and as the
+# build leaf's bounded overflow (RUNNER_BUILD_SWAP_MB): a build larger than
+# the box's spare RAM can swap the difference and finish, while fleets keep
+# zero swap. Skip it with NOITE_SWAP=0.
 #
 # Environment (all optional; `curl … | NOITE_DOMAIN=example.com bash -s install`):
 #   NOITE_DOMAIN       base domain; app./api./git./*. must point at this host
@@ -109,9 +110,10 @@ install_docker() {
 
 # A host under 4 GB builds while serving; one transient peak (a build step or
 # a RustFS burst) can OOM-kill RustFS or Caddy and take the control UI with it.
-# A small swapfile is that safety net, not a build budget: the build cgroups
-# keep memory.swap.max=0, so a build that outgrows RUNNER_BUILD_MEMORY_MB
-# still dies alone instead of swapping the disk to death. Idempotent; a host
+# A small swapfile is that safety net and the build leaf's bounded overflow
+# (RUNNER_BUILD_SWAP_MB, the host's swap split across build slots): a build
+# that outgrows RUNNER_BUILD_MEMORY_MB swaps the difference instead of
+# thrashing at its cap, and fleets still keep zero swap. Idempotent; a host
 # where swapon is not permitted (a container, OpenVZ) warns and continues.
 ensure_swap() {
   step "Checking swap"

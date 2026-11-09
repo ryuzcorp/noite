@@ -330,7 +330,11 @@ async fn main() -> anyhow::Result<()> {
     // Builds move into their own capped leaf: a Vite/Rolldown build peaks
     // above a small box's spare memory, and the build — not a fleet — must be
     // the thing that dies when it outgrows its budget.
-    host::cgroups::setup_build(config.build_memory_mb, config.build_concurrency);
+    host::cgroups::setup_build(
+        config.build_memory_mb,
+        config.build_swap_mb,
+        config.build_concurrency,
+    );
     let isolation = host::isolation::self_check(&config, nft_installed).await;
     if isolation.blocked {
         tracing::error!(detail = %isolation.detail, "multi-tenant isolation checks failed; /ready stays 503");

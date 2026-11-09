@@ -19,7 +19,7 @@ Every push to `main` builds on the Noite host, in the build sandbox. You do not 
 
 Tools whose launcher asks for Node (`vite`, `rsbuild`) get the image's Node 24. The build sees your app's environment variables plus `CI=1`, `NODE_ENV=production` and `NO_COLOR=1`. Each install and build step is bounded by `RUNNER_BUILD_TIMEOUT_S` (300 s by default) and the worktree by `RUNNER_BUILD_MAX_MB`.
 
-Install, build and release steps also run in their own cgroup with a memory cap (`RUNNER_BUILD_MEMORY_MB`; unset derives half the detected memory, clamped 512–4096 MiB) and a low CPU share, so a build that outgrows the box is OOM-killed on its own and the runner and your apps keep serving. The deploy log then names the budget. On a 2 GB host a Vite/Void build can reach about 1.3 GiB — above the derived ~978 MiB — so either raise the cap on a box with the RAM, or [build in CI](/apps/deploy#deploy-from-ci) and deploy the dist.
+Install, build and release steps also run in their own cgroup with a memory cap (`RUNNER_BUILD_MEMORY_MB`; unset derives the detected memory minus a 1 GiB resident floor, clamped 512–4096 MiB), a bounded swap allowance (`RUNNER_BUILD_SWAP_MB`; unset derives the host's swap across the build slots) and a low CPU share, so a build that outgrows the box cannot starve the runner or your apps. A Vite 8/Rolldown build of a Void app peaks around 1.3–1.5 GiB: the RAM cap keeps the resident services safe and the leaf swaps the overflow, so the build finishes on a small box instead of dying at the cap. A build that fills RAM **and** swap is killed on its own, and the deploy log names both budgets.
 
 ## Package managers
 

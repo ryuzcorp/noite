@@ -82,6 +82,20 @@ pub fn total_bytes() -> Option<u64> {
     None
 }
 
+/// Host swap in bytes (`SwapTotal`), `None` when unreadable. Build leaves
+/// size their swap allowance from it: on a box too small to hold a
+/// Vite/Rolldown build in RAM, the overflow is what keeps the build alive.
+#[cfg(target_os = "linux")]
+pub fn swap_total_bytes() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    meminfo_bytes(&text, "SwapTotal:")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn swap_total_bytes() -> Option<u64> {
+    None
+}
+
 /// Reads one cgroup memory file, v2 then v1. `parse` filters v1's
 /// page-rounded "no limit" value.
 #[cfg(target_os = "linux")]

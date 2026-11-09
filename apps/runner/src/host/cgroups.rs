@@ -66,6 +66,7 @@ static CGROUPS_OK: AtomicBool = AtomicBool::new(false);
 static CGROUP_REASON: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 static CGROUP_ANCHOR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 static BUILD_MEMORY_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static BUILD_SWAP_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static BUILD_CPU: AtomicBool = AtomicBool::new(false);
 static BUILD_IO: AtomicBool = AtomicBool::new(false);
 static BUILD_SLOTS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -118,17 +119,24 @@ pub fn build_memory_mb() -> Option<u64> {
     BUILD_MEMORY_MB.get().copied()
 }
 
+/// The swap a build leaf may use past its RAM budget, in MiB (`0` = none),
+/// for the failure message and `/ready`.
+pub fn build_swap_mb() -> Option<u64> {
+    BUILD_SWAP_MB.get().copied()
+}
+
 /// Configure build containment once after [`setup`], before any child
 /// spawns: remember the budget and (best-effort) enable the CPU controller on
 /// the way down so each build leaf can take a small share. No leaf is created
 /// here — each deploy creates its own. `false` when cgroupfs is unavailable
 /// (builds then share the runner's cgroup, as before), logged loudly.
-pub fn setup_build(memory_mb: u64, concurrency: u32) -> bool {
+pub fn setup_build(memory_mb: u64, swap_mb: u64, concurrency: u32) -> bool {
     let Some(anchor) = anchor() else {
         tracing::info!("cgroups unavailable; tenant builds run uncapped");
         return false;
     };
     let _ = BUILD_MEMORY_MB.set(memory_mb);
+    let _ = BUILD_SWAP_MB.set(swap_mb);
     let _ = BUILD_SLOTS.set(concurrency.max(1));
     // The CPU controller is optional: it only lets a build yield to serving
     // traffic. Enabling it on the way down changes nothing for existing
@@ -155,6 +163,7 @@ pub fn setup_build(memory_mb: u64, concurrency: u32) -> bool {
     BUILD_IO.store(io, Ordering::Relaxed);
     tracing::info!(
         memory_mb,
+        swap_mb,
         cpu,
         cpu_cores = build_cpu_cores(),
         io,
@@ -184,19 +193,21 @@ fn add_controller(cgroup: &Path, name: &str) -> anyhow::Result<()> {
 /// The deploy's build leaf when cgroups are active. `Ok(None)` means the
 /// install has no cgroup containment, so the step runs uncapped (the boot log
 /// and `/ready` already say so).
-pub fn build_leaf_for(key: &str, memory_mb: u64) -> anyhow::Result<Option<PathBuf>> {
+pub fn build_leaf_for(key: &str, memory_mb: u64, swap_mb: u64) -> anyhow::Result<Option<PathBuf>> {
     let Some(anchor) = anchor() else {
         return Ok(None);
     };
     let cpu = BUILD_CPU.load(Ordering::Relaxed);
     let io = BUILD_IO.load(Ordering::Relaxed);
-    Ok(Some(ensure_build_cgroup(&anchor, key, memory_mb, cpu, io)?))
+    Ok(Some(ensure_build_cgroup(
+        &anchor, key, memory_mb, swap_mb, cpu, io,
+    )?))
 }
 
 /// Create (or reuse) the leaf for one deploy key: the memory budget
-/// (`RUNNER_BUILD_MEMORY_MB`, 0 = uncapped), swap capped at zero like a fleet
-/// leaf (a build must not escape its budget into host swap), the group OOM, a
-/// task cap and (when the CPU controller is delegated) a small CPU share.
+/// (`RUNNER_BUILD_MEMORY_MB`, 0 = uncapped) and its swap allowance
+/// (`RUNNER_BUILD_SWAP_MB`, 0 = none), the group OOM, a task cap and (when
+/// the CPU controller is delegated) a small CPU share.
 /// Reuse after a crash is safe: the limits are rewritten and the new step
 /// moves in. Leaves are world-traversable like fleet leaves; their interface
 /// files stay root-owned, so a tenant cannot raise a limit or move itself
@@ -205,6 +216,7 @@ fn ensure_build_cgroup(
     anchor: &Path,
     key: &str,
     memory_mb: u64,
+    swap_mb: u64,
     cpu: bool,
     io: bool,
 ) -> anyhow::Result<PathBuf> {
@@ -216,10 +228,11 @@ fn ensure_build_cgroup(
         .map_err(|error| anyhow::anyhow!("chmod {}: {error}", dir.display()))?;
     if memory_mb > 0 {
         write_limit(&dir, "memory.max", &(memory_mb * 1024 * 1024).to_string())?;
-        // The same rule as a fleet leaf: allowed swap lets the step grow past
-        // its budget without tripping anything, so cap it at zero. Where the
+        // The swap allowance is the overflow past the RAM budget: a box too
+        // small for the build keeps its resident services in RAM and lets
+        // the leaf swap the difference, bounded by this cap. Where the
         // kernel has no swap accounting there is nothing to escape into.
-        match cap_swap(&dir) {
+        match set_swap_cap(&dir, swap_mb) {
             Ok(true) => {}
             Ok(false) => {
                 tracing::info!(
@@ -281,11 +294,14 @@ pub fn build_oom_kills(dir: &Path) -> Option<u64> {
 /// anon stayed just under the cap, so the kernel never OOM-killed it).
 ///
 /// The exec watchdog samples this every few seconds and fails the step after
-/// it stays true: `memory.current` at ≥90% of `memory.max` and the leaf's own
-/// `memory.pressure` `full avg10` ≥ 10%. A build that is merely large but
-/// progressing does not sit at the cap under sustained full pressure; and
-/// anything unreadable (cgroup v1, PSI off) reads as "not pinned", so
-/// containment only ever fails a build it can positively see stuck.
+/// it stays true: `memory.current` at ≥90% of `memory.max`, the leaf's own
+/// `memory.pressure` `full avg10` ≥ 10%, and no swap room left. Swap room
+/// matters: a leaf allowed to swap past a RAM cap too small for the build is
+/// still making progress through the disk, so it is only stuck once it has
+/// filled `memory.swap.max` too (then the next allocation cannot complete at
+/// all). A leaf with zero swap keeps the old rule. Anything unreadable
+/// (cgroup v1, PSI off) reads as "not pinned", so containment only ever
+/// fails a build it can positively see stuck.
 pub fn build_thrash_pinned(dir: &Path) -> bool {
     let read_u64 = |name: &str| {
         std::fs::read_to_string(dir.join(name))
@@ -303,6 +319,16 @@ pub fn build_thrash_pinned(dir: &Path) -> bool {
     if max == 0 || current.saturating_mul(100) < max.saturating_mul(90) {
         return false;
     }
+    // Swap still has room: the overflow the allowance exists for. Only a
+    // leaf that filled its swap cap as well can make no further progress.
+    match (read_u64("memory.swap.max"), read_u64("memory.swap.current")) {
+        (Some(swap_max), Some(swap_current))
+            if swap_max > 0 && swap_current.saturating_mul(100) < swap_max.saturating_mul(90) =>
+        {
+            return false;
+        }
+        _ => {}
+    }
     std::fs::read_to_string(dir.join("memory.pressure"))
         .ok()
         .and_then(|text| parse_full_avg10(&text))
@@ -318,9 +344,9 @@ fn parse_full_avg10(text: &str) -> Option<f64> {
     avg10.parse().ok()
 }
 
-/// The build budget and every live build leaf for `/ready`: charge,
+/// The build budget and every live build leaf for `/ready`: charge, swap,
 /// high-water mark and OOM count per deploy key. `null` when cgroups are
-/// unavailable; `memory_mb` is still reported then.
+/// unavailable; `memory_mb`/`swap_mb` are still reported then.
 pub fn build_status() -> serde_json::Value {
     let Some(anchor) = anchor() else {
         return serde_json::Value::Null;
@@ -343,6 +369,8 @@ pub fn build_status() -> serde_json::Value {
                 serde_json::json!({
                     "current_bytes": read(&dir, "memory.current"),
                     "peak_bytes": read(&dir, "memory.peak"),
+                    "swap_max_bytes": read(&dir, "memory.swap.max"),
+                    "swap_current_bytes": read(&dir, "memory.swap.current"),
                     "oom_kills": build_oom_kills(&dir),
                     "cpu_max": std::fs::read_to_string(dir.join("cpu.max"))
                         .ok()
@@ -361,6 +389,7 @@ pub fn build_status() -> serde_json::Value {
         .collect();
     serde_json::json!({
         "memory_mb": build_memory_mb().unwrap_or(0),
+        "swap_mb": build_swap_mb().unwrap_or(0),
         "leaves": leaves,
     })
 }
@@ -819,7 +848,7 @@ pub fn ensure_fleet_cgroup(anchor: &Path, key: &str, memory_mb: u64) -> anyhow::
         // swap past `memory.max` without tripping anything. `memory.swap.max`
         // is absent where the host has no swap accounting — then there is no
         // swap to escape into and the leaf is contained without it.
-        match cap_swap(&dir) {
+        match set_swap_cap(&dir, 0) {
             Ok(true) => {}
             Ok(false) => {
                 tracing::info!(
@@ -854,14 +883,15 @@ fn write_limit(dir: &Path, name: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Cap a fleet leaf's swap at zero alongside its `memory.max`. Returns
-/// whether swap is now capped: `false` when the kernel offers no swap
-/// accounting (`memory.swap.max` absent — nothing to escape into).
-fn cap_swap(dir: &Path) -> anyhow::Result<bool> {
+/// Cap a leaf's swap alongside its `memory.max`: MiB for a build leaf, zero
+/// for a fleet. Returns whether swap is now capped: `false` when the kernel
+/// offers no swap accounting (`memory.swap.max` absent — nothing to escape
+/// into).
+fn set_swap_cap(dir: &Path, swap_mb: u64) -> anyhow::Result<bool> {
     if !dir.join("memory.swap.max").is_file() {
         return Ok(false);
     }
-    write_limit(dir, "memory.swap.max", "0")?;
+    write_limit(dir, "memory.swap.max", &(swap_mb * 1024 * 1024).to_string())?;
     Ok(true)
 }
 
@@ -1174,12 +1204,22 @@ mod tests {
     #[test]
     fn build_leaf_applies_its_budget() {
         let tmp = fakefs();
-        let dir = ensure_build_cgroup(tmp.path(), "shop.preview-1", 768, true, false)
+        // A real leaf carries the swap interface file when the kernel has
+        // swap accounting; the fake leaf mirrors it to assert the write.
+        let leaf = tmp.path().join("_build-shop.preview-1");
+        std::fs::create_dir_all(&leaf).expect("fake leaf");
+        std::fs::write(leaf.join("memory.swap.max"), "max").expect("fake swap accounting");
+        let dir = ensure_build_cgroup(tmp.path(), "shop.preview-1", 768, 256, true, false)
             .expect("build cgroup");
-        assert_eq!(dir, tmp.path().join("_build-shop.preview-1"));
+        assert_eq!(dir, leaf);
         assert_eq!(
             std::fs::read_to_string(dir.join("memory.max")).expect("memory.max"),
             (768 * 1024 * 1024).to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("memory.swap.max")).expect("swap.max"),
+            (256 * 1024 * 1024).to_string(),
+            "the build may swap its overflow, bounded by this allowance"
         );
         assert_eq!(
             std::fs::read_to_string(dir.join("memory.oom.group")).expect("oom.group"),
@@ -1200,14 +1240,15 @@ mod tests {
         assert!(!dir.join("memory.high").exists(), "no early throttle");
 
         let io = fakefs();
-        let dir = ensure_build_cgroup(io.path(), "shop", 768, false, true).expect("build cgroup");
+        let dir =
+            ensure_build_cgroup(io.path(), "shop", 768, 0, false, true).expect("build cgroup");
         assert_eq!(
             std::fs::read_to_string(dir.join("io.weight")).expect("io.weight"),
             format!("default {BUILD_IO_WEIGHT}")
         );
 
         let uncapped = fakefs();
-        let dir = ensure_build_cgroup(uncapped.path(), "shop", 0, false, false)
+        let dir = ensure_build_cgroup(uncapped.path(), "shop", 0, 0, false, false)
             .expect("uncapped build cgroup");
         assert!(!dir.join("memory.max").exists());
         assert!(!dir.join("cpu.weight").exists());
@@ -1259,6 +1300,26 @@ mod tests {
         // An uncapped leaf (no memory.max) is never thrashing.
         std::fs::remove_file(tmp.path().join("memory.max")).expect("drop memory.max");
         assert!(!build_thrash_pinned(tmp.path()));
+    }
+
+    #[test]
+    fn build_thrash_pinned_waits_for_the_swap_room() {
+        let tmp = fakefs();
+        write_leaf(tmp.path(), 642_000_000, Some(THRASHING));
+        // Pinned at the RAM cap with swap room left: the overflow is still
+        // moving, so the build is slow, not stuck.
+        std::fs::write(tmp.path().join("memory.swap.max"), "1073741824\n").expect("swap.max");
+        std::fs::write(tmp.path().join("memory.swap.current"), "536870912\n")
+            .expect("swap.current");
+        assert!(!build_thrash_pinned(tmp.path()));
+        // Swap filled too: no allocation can complete, so fail the step.
+        std::fs::write(tmp.path().join("memory.swap.current"), "1073741824\n")
+            .expect("swap.current");
+        assert!(build_thrash_pinned(tmp.path()));
+        // A zero swap cap keeps the old rule: pinned + pressure is stuck.
+        std::fs::write(tmp.path().join("memory.swap.max"), "0\n").expect("swap.max");
+        std::fs::write(tmp.path().join("memory.swap.current"), "0\n").expect("swap.current");
+        assert!(build_thrash_pinned(tmp.path()));
     }
 
     #[test]

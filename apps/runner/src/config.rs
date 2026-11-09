@@ -226,11 +226,27 @@ fn build_memory_default_mb(total_bytes: Option<u64>, concurrency: u32) -> u64 {
     // build's leaf. Half the box ignored them: on a 2 GB install the build
     // could hold ~1 GiB while RustFS and the fleets already held ~1 GB, and
     // the box thrashed until SSH stopped answering. A quarter (at least
-    // 1 GiB) stays resident; a 2 GB box then gives one build ~933 MiB, which
-    // fits the measured ~610-650 MB Void debug build, while a 1.3 GiB
-    // template build still dies in its leaf with the named budget.
+    // 1 GiB) stays resident; a 2 GB box then gives one build ~933 MiB.
+    // A 1.6 GiB box gets 613 MiB, below the measured ~1.3-1.5 GiB a Vite 8 /
+    // Rolldown Void build needs: that is what the leaf's swap allowance
+    // (`build_swap_default_mb`) is for, not a reason to lower the floor.
     let reserve = (total_mb / 4).max(1024);
     (total_mb.saturating_sub(reserve) / builds).clamp(512, 4096)
+}
+
+/// A build leaf's swap allowance in MiB (`RUNNER_BUILD_SWAP_MB`): the host's
+/// swap split across the build slots, `0` when the box has none. The RAM cap
+/// stays the guard for the resident services; the overflow swaps (bounded by
+/// the leaf's `memory.swap.max`) so a build larger than the box's free RAM
+/// can finish instead of thrashing at the cap until the step timeout. A leaf
+/// that exhausts RAM and swap is still failed by the exec watchdog. Fleets
+/// keep zero swap: a tenant must never push its working set into host swap.
+fn build_swap_default_mb(swap_bytes: Option<u64>, concurrency: u32) -> u64 {
+    let Some(swap) = swap_bytes else {
+        return 0;
+    };
+    let swap_mb = swap / (1024 * 1024);
+    (swap_mb / u64::from(concurrency.max(1))).min(4096)
 }
 
 /// Parse one numeric env var: unset or blank means the default (compose
@@ -1097,6 +1113,13 @@ pub struct Config {
     /// floor (a quarter of bigger boxes), split across the build slots,
     /// clamped 512..4096. `0` leaves builds uncapped (old behavior).
     pub build_memory_mb: u64,
+    /// Swap a build leaf may use past its memory cap, in MiB
+    /// (`RUNNER_BUILD_SWAP_MB`). The host's swap split across the build
+    /// slots, `0` when the box has none. A Vite/Rolldown build of a Void app
+    /// peaks around 1.3-1.5 GiB; on a box that cannot spare that in RAM the
+    /// leaf keeps its RAM cap and the overflow swaps (bounded) instead of
+    /// thrashing at the cap until the step timeout. Fleets keep zero swap.
+    pub build_swap_mb: u64,
     /// Container memory percentage at which the pressure sweep parks idle
     /// apps (`RUNNER_PRESSURE_PCT`, 85; 0 disables). The sweep is the last
     /// line before the kernel OOM-killer: it parks a fleet rather than
@@ -1299,6 +1322,8 @@ impl Config {
             &mut env_problems,
         );
         let build_memory_default = build_memory_default_mb(total_memory, build_concurrency);
+        let build_swap_default =
+            build_swap_default_mb(crate::host::memory::swap_total_bytes(), build_concurrency);
         // An explicit `RUNNER_SLEEP_AFTER_H` (including 0 = never) always
         // wins; only an unset/blank var derives from detected memory, so a
         // small host sleeps sooner without the operator sizing anything.
@@ -1493,6 +1518,12 @@ impl Config {
             build_memory_mb: env_num(
                 "RUNNER_BUILD_MEMORY_MB",
                 build_memory_default,
+                "an integer",
+                &mut env_problems,
+            ),
+            build_swap_mb: env_num(
+                "RUNNER_BUILD_SWAP_MB",
+                build_swap_default,
                 "an integer",
                 &mut env_problems,
             ),
@@ -2007,6 +2038,7 @@ pub(crate) fn config_for_tests() -> Config {
         fleet_spawn_batch: 1,
         build_concurrency: 1,
         build_memory_mb: 1024,
+        build_swap_mb: 0,
         pressure_pct: 85,
         pressure_idle_s: 300,
         pressure_sweep_s: 30,
@@ -2194,6 +2226,7 @@ mod tests {
         "RUNNER_FLEET_SPAWN_BATCH",
         "RUNNER_BUILD_CONCURRENCY",
         "RUNNER_BUILD_MEMORY_MB",
+        "RUNNER_BUILD_SWAP_MB",
         "RUNNER_PRESSURE_PCT",
         "RUNNER_PRESSURE_IDLE_S",
         "RUNNER_PRESSURE_SWEEP_S",
@@ -2658,14 +2691,21 @@ mod tests {
         assert_eq!(control_memory_default_mb(Some(2 * gb)), 512);
         assert_eq!(container_shed_default_mb(Some(2 * gb)), 1536);
         // A 2 GB box leaves 1 GiB resident (RustFS, runner, Caddy, fleets)
-        // and gives one build 1024 MiB: enough for the measured ~610-650 MB
-        // Void debug build, while a 1.3 GiB template build dies in its leaf.
+        // and gives one build 1024 MiB.
         assert_eq!(build_memory_default_mb(Some(2 * gb), 1), 1024);
         assert_eq!(build_memory_default_mb(Some(256 * 1024 * 1024), 1), 512);
         assert_eq!(build_memory_default_mb(Some(256 * gb), 2), 4096);
         assert_eq!(build_memory_default_mb(None, 1), 1024);
         // A 4 GB box leaves 1 GiB and splits the rest across two slots.
         assert_eq!(build_memory_default_mb(Some(4 * gb), 2), 1536);
+        // A 1.6 GiB box (the measured prod install) gets 613 MiB of RAM,
+        // below what a Vite 8/Rolldown build needs; swap carries the rest.
+        assert_eq!(build_memory_default_mb(Some(1717481472), 1), 613);
+        assert_eq!(build_swap_default_mb(Some(gb), 1), 1024);
+        assert_eq!(build_swap_default_mb(Some(2 * gb), 2), 1024);
+        assert_eq!(build_swap_default_mb(Some(256 * gb), 1), 4096);
+        assert_eq!(build_swap_default_mb(None, 1), 0);
+        assert_eq!(build_swap_default_mb(Some(0), 1), 0);
         // Clamps keep a tiny and a huge box inside what one process may hold.
         assert_eq!(fleet_local_cache_default_mb(Some(256 * 1024 * 1024)), 64);
         assert_eq!(fleet_local_cache_default_mb(Some(256 * gb)), 512);
@@ -2694,6 +2734,7 @@ mod tests {
                 ("RUNNER_FLEET_SPAWN_BATCH", "3"),
                 ("RUNNER_BUILD_CONCURRENCY", "2"),
                 ("RUNNER_BUILD_MEMORY_MB", "1536"),
+                ("RUNNER_BUILD_SWAP_MB", "768"),
             ],
             || {
                 let cfg = Config::from_env().expect("valid numerics must boot");
@@ -2704,12 +2745,17 @@ mod tests {
                         cfg.control_memory_mb,
                         cfg.fleet_spawn_batch,
                         cfg.build_concurrency,
-                        cfg.build_memory_mb
+                        cfg.build_memory_mb,
+                        cfg.build_swap_mb
                     ),
-                    (96, 384, 3, 2, 1536)
+                    (96, 384, 3, 2, 1536, 768)
                 );
             },
         );
+        with_env(&[("RUNNER_BUILD_SWAP_MB", "0")], || {
+            let cfg = Config::from_env().expect("zero swap is valid");
+            assert_eq!(cfg.build_swap_mb, 0, "0 turns the allowance off");
+        });
         with_env(
             &[
                 ("RUNNER_FLEET_LOCAL_CACHE_MB", "8"),

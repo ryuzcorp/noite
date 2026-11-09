@@ -1,0 +1,3 @@
+### Fixed
+
+- A build larger than the box's spare RAM no longer dies at its memory cap: each build leaf now carries a bounded swap allowance (`RUNNER_BUILD_SWAP_MB`, derived from the host's swap split across the build slots; `0` keeps builds off swap), the exec watchdog only fails a step once RAM **and** swap are both full, and `/ready` reports the swap budget plus per-leaf swap use. Fleet leaves keep zero swap. On a 1.6 GiB install a Vite 8/Rolldown build peaks around 1.4 GiB: the leaf's 613 MiB RAM cap plus its 1 GiB swap allowance lets that build finish instead of thrashing at the cap until the step timeout.
