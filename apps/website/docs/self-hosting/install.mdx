@@ -17,7 +17,7 @@ It elevates itself with `sudo` (no `sudo` in front: piped into `sudo bash`, the 
 Register right away: the first account becomes the admin without an invite code.
 :::
 
-The installer is a **fresh-install** tool: alpha builds do not upgrade between versions, and the script refuses an existing `/opt/noite/.env` instead of acting as an upgrade. To move to a new alpha, uninstall (that deletes the volumes) and run the installer again. Settings are written on the first install; after that, edit `/opt/noite/.env` and apply it with `cd /opt/noite && docker compose up -d` (add `-f compose.multi.yaml` on a multi install). Inputs are environment variables, set on `bash`, not on `curl`: `curl … | NOITE_DOMAIN=example.com bash -s install` (a variable in front of `curl` only reaches `curl`).
+The installer is a **fresh-install** tool: alpha builds do not upgrade between versions, and the script refuses an existing `/opt/noite/.env` instead of acting as an upgrade. To move to a new alpha, uninstall (that deletes the volumes) and run the installer again. Settings are written on the first install; after that, edit `/opt/noite/.env` and apply it with `cd /opt/noite && docker compose up -d` (multi installs: `docker compose -f compose.yaml -f compose.multi.yaml up -d`). Inputs are environment variables, set on `bash`, not on `curl`: `curl … | NOITE_DOMAIN=example.com bash -s install` (a variable in front of `curl` only reaches `curl`).
 
 | Variable | Default | Effect |
 | --- | --- | --- |

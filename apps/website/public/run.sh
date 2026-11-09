@@ -21,7 +21,7 @@ name="${1:-}"
 case "$name" in
   install | uninstall) shift ;;
   *)
-    echo "usage: curl -fsSL https://noite.now/run.sh | bash -s install [--pre] [--yes] | uninstall" >&2
+    echo "usage: curl -fsSL https://noite.now/run.sh | bash -s install [--pre] | uninstall" >&2
     exit 1
     ;;
 esac

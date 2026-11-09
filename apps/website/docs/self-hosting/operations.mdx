@@ -28,11 +28,11 @@ Alpha builds do not upgrade or downgrade data in place. Moving between versions 
 
 ## Updating
 
-Alpha builds are **fresh-install only**: there is no in-place update between versions. `install.sh` refuses an existing install, and the runner and the control D1 refuse a database written by another alpha. To move to a new version, uninstall (this deletes the volumes) and install the target version fresh:
+Alpha builds are **fresh-install only**: there is no in-place update between versions. `install.sh` refuses an existing install, and the runner and the control D1 refuse a database written by another alpha. To move to a new version, uninstall (this deletes the volumes) and install again; plain `install` follows the `alpha` channel, while `install --pre` pins the newest pre-release (see [Releases and channels](#releases-and-channels)).
 
 ```bash
 curl -fsSL https://noite.now/run.sh | bash -s uninstall
-curl -fsSL https://noite.now/run.sh | bash -s install --pre
+curl -fsSL https://noite.now/run.sh | bash -s install
 ```
 
 State does not survive a version move. [Back up](#backups) first if you need it; a bucket of your own is never deleted, so point the fresh install at a new `NOITE_S3_BUCKET` (or empty it) to start clean. The runner stops every fleet in parallel inside its stop budget (`NOITE_STOP_BUDGET_MS`, 25 s; Compose's `stop_grace_period` is 35 s), then Caddy, then writes a final state snapshot — measured at ~0.3 s for 15 running fleets.
