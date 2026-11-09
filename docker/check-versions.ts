@@ -423,6 +423,20 @@ const uiPackage = JSON.parse(read("apps/noite/package.json")) as {
   devDependencies?: Record<string, string>;
 };
 
+// `void` is the UI's whole build/runtime contract: a caret range re-resolved
+// 1.3.0 to 1.7.0 on a lockfile regeneration, and 1.7's build emits no root
+// `dist/wrangler.json`, which silently disabled the control deploy.
+const uiVoidPin =
+  uiPackage.dependencies?.void ?? uiPackage.devDependencies?.void ?? "";
+
+if (/^\d+\.\d+\.\d+$/u.test(uiVoidPin)) {
+  console.log(`ui: void pinned at ${uiVoidPin}`);
+} else {
+  fail(
+    `ui: apps/noite/package.json must pin void exactly (found "${uiVoidPin}"): a range lets a lockfile regeneration change the build layout`
+  );
+}
+
 const drifted: string[] = [];
 
 for (const name of [
