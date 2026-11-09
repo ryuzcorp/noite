@@ -125,5 +125,53 @@ test(
         name: `Roll back to ${sha2.slice(0, 12)}`,
       })
     ).toBeVisible();
+
+    // Visible, not invisible: a rollback issued while another deploy holds
+    // the app exists in the history as its own row the moment the API
+    // answers (it then waits its turn or runs). The row's queued state is
+    // pinned by the runner's queue tests; this asserts it is listed at once
+    // rather than appearing only when its build starts.
+    const inFlight = pushMarkerRevision(apiKey, V1_MARKER);
+    expect(inFlight).not.toBe(sha1);
+
+    // Hold the claim before asking: the rollback must contend with a live run.
+    await expect
+      .poll(
+        async () => {
+          const rows = await runnerCall(request, `/v1/apps/${appId}/deploys`);
+
+          // SAFETY: the deploys endpoint answers a JSON array of rows.
+          const row = (
+            rows.body as { sha: string | null; status: string }[]
+          ).find((r) => r.sha === inFlight);
+
+          return row?.status ?? "";
+        },
+        { timeout: 60_000 }
+      )
+      .toMatch(/^(?<phase>building|deploying)$/u);
+
+    const queued = await runnerCall(request, `/v1/apps/${appId}/rollback`, {
+      body: { sha: sha1 },
+      method: "POST",
+    });
+
+    expect(queued.status).toBe(200);
+
+    // SAFETY: the rollback endpoint answers `{ deployId }` (its own contract,
+    // asserted by the runner's transport tests).
+    const rollbackId = (queued.body as { deployId?: string }).deployId ?? "";
+    const listed = await runnerCall(request, `/v1/apps/${appId}/deploys`);
+
+    // SAFETY: the deploys endpoint answers a JSON array of rows.
+    const row = (listed.body as { id: string; sha: string | null }[]).find(
+      (r) => r.id === rollbackId
+    );
+
+    expect(row?.sha).toBe(sha1);
+
+    // …and it runs to success on its own row.
+    const rolledAgain = await waitForDeploy(request, appId, 8 * 60_000, sha1);
+    expect(rolledAgain.status, rolledAgain.log).toBe("success");
   }
 );

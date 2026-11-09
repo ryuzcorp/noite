@@ -498,7 +498,9 @@ const ListDeploysArgs = Schema.Struct({
 export const leanDeployRows = (rows: RunnerDeploy[]): RunnerDeploy[] =>
   rows.map((deploy, index) =>
     index === 0 &&
-    (deploy.status === "building" || deploy.status === "deploying")
+    (deploy.status === "queued" ||
+      deploy.status === "building" ||
+      deploy.status === "deploying")
       ? deploy
       : { ...deploy, log: "" }
   );

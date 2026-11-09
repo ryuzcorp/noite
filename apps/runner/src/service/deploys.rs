@@ -172,9 +172,9 @@ pub async fn prepare_rollback(
         None,
         &app.id,
         None,
-        "building",
+        crate::models::DeployStatus::Queued.as_str(),
         Some(&sha),
-        "▸ queued\n",
+        "▸ queued behind the app's running deploy\n",
     )
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
