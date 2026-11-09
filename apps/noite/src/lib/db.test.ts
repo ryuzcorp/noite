@@ -44,7 +44,7 @@ describe("ledgerMismatch", () => {
       KNOWN
     );
 
-    expect(reason).toContain("different Noite alpha");
+    expect(reason).toContain("before the 2026-11-09 schema compaction");
   });
 
   test("refuses a ledger longer than this build's plan", () => {
@@ -57,7 +57,7 @@ describe("ledgerMismatch", () => {
       KNOWN
     );
 
-    expect(reason).toContain("different Noite alpha");
+    expect(reason).toContain("written by a newer Noite");
   });
 });
 
@@ -88,15 +88,19 @@ describe("ensureDb", () => {
     expect(rows).toHaveLength(1);
   });
 
-  test("refuses a database from a different alpha", async () => {
+  test("refuses a pre-compaction control database", async () => {
     await ensureDbPromise();
+    // The compacted baseline recorded a pre-compaction name at id 1: a
+    // different schema line, refused rather than reshaped.
     db.raw.run(
-      `INSERT INTO paranorm_migrations (migration_id, name) VALUES (2, '1.4.0')`
+      `UPDATE paranorm_migrations SET name = '1.3.0' WHERE migration_id = 1`
     );
     // SAFETY: a spread of the shim keeps its prepare/batch methods: a distinct handle over the same database.
     const again = { ...db.d1 } as typeof db.d1;
     setD1Binding(again);
-    await expect(ensureDbPromise()).rejects.toThrow(/different Noite alpha/u);
+    await expect(ensureDbPromise()).rejects.toThrow(
+      /before the 2026-11-09 schema compaction/u
+    );
   });
 });
 

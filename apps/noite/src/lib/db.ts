@@ -176,11 +176,11 @@ export const ledgerMismatch = (
   for (const [index, row] of recorded.entries()) {
     const planned = known[index];
 
-    if (
-      planned === undefined ||
-      Number(row.migration_id) !== planned.id ||
-      row.name !== planned.name
-    ) {
+    if (planned === undefined) {
+      return "the control database was written by a newer Noite (its schema ledger is longer than this build's). Run that image again, or restore a backup taken before the upgrade; downgrades are not supported.";
+    }
+
+    if (Number(row.migration_id) !== planned.id || row.name !== planned.name) {
       return "the control database was written before the 2026-11-09 schema compaction and cannot be upgraded in place. Back it up, wipe the install and install fresh; databases on the compacted baseline upgrade by re-running the installer.";
     }
   }
