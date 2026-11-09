@@ -37,7 +37,7 @@ async fn a_rollback_row_is_queued_before_its_run_starts() {
     let sha = "abc1234";
     seed(&h, &app.id, DeployStatus::Success, sha).await;
 
-    let prepared = crate::service::deploys::prepare_rollback(&h.state, &app.id, sha)
+    let prepared = crate::service::deploys::prepare_rollback(&h.state, &app.id, sha, None)
         .await
         .expect("prepare rollback");
 
@@ -47,6 +47,65 @@ async fn a_rollback_row_is_queued_before_its_run_starts() {
         .expect("deploy row");
     assert_eq!(row.status, "queued");
     assert_eq!(row.sha.as_deref(), Some(sha));
+
+    h.finish().await;
+}
+
+/// A preview rollback is proven inside its own environment: a successful
+/// production row at the same sha does not authorize it, and the queued row it
+/// creates is that environment's (its stream filters by it).
+#[tokio::test]
+async fn a_preview_rollback_is_proven_in_its_own_target() {
+    let h = Harness::new().await;
+    let app = h.seed_app("env-rollback").await;
+    let env = crate::db::create_environment(
+        &h.state.pool,
+        &h.state.config,
+        crate::db::NewEnvironment {
+            app_id: &app.id,
+            slug: &app.slug,
+            label: "pr-7",
+            kind: crate::models::EnvironmentKind::Branch,
+            git_ref: "refs/heads/pr-7",
+            created_by: "local",
+            listen: 31000,
+            internal: 31001,
+        },
+    )
+    .await
+    .expect("create environment");
+
+    let sha = "abc1234";
+    seed(&h, &app.id, DeployStatus::Success, sha).await;
+
+    // Production's success is not this environment's history.
+    let refused =
+        crate::service::deploys::prepare_rollback(&h.state, &app.id, sha, Some(&env.id)).await;
+    assert!(refused.is_err());
+
+    // A successful row in the environment authorizes it, and the new row is
+    // the environment's (never production's).
+    crate::db::upsert_deploy(
+        &h.state.pool,
+        None,
+        &app.id,
+        Some(&env.id),
+        DeployStatus::Success.as_str(),
+        Some(sha),
+        "▸ seed\n",
+    )
+    .await
+    .expect("seed env deploy");
+
+    let prepared = crate::service::deploys::prepare_rollback(&h.state, &app.id, sha, Some(&env.id))
+        .await
+        .expect("prepare env rollback");
+    let row = crate::db::get_deploy(&h.state.pool, &app.id, &prepared.deploy_id)
+        .await
+        .expect("read deploy")
+        .expect("deploy row");
+    assert_eq!(row.environment_id.as_deref(), Some(env.id.as_str()));
+    assert_eq!(row.status, "queued");
 
     h.finish().await;
 }

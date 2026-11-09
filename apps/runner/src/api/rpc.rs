@@ -307,6 +307,8 @@ struct IngestKeyParams {
 struct RollbackParams {
     id: String,
     sha: String,
+    #[serde(default)]
+    environment_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -995,9 +997,14 @@ async fn dispatch_call(
             };
             complete(
                 id,
-                service::deploys::rollback(state, &p.id, &p.sha).await.map(
-                    |(deploy_id, sha)| json!({ "ok": true, "sha": sha, "deployId": deploy_id }),
-                ),
+                service::deploys::rollback(
+                    state,
+                    &p.id,
+                    &p.sha,
+                    p.environment_id.as_deref().filter(|env| !env.is_empty()),
+                )
+                .await
+                .map(|(deploy_id, sha)| json!({ "ok": true, "sha": sha, "deployId": deploy_id })),
             )
         }
         "git.remote" => {

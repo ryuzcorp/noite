@@ -60,7 +60,11 @@ pub async fn list(
 }
 
 /// Load one environment of one app, or 404.
-async fn env_or_404(state: &AppState, app_id: &str, env_id: &str) -> Result<Environment, ApiError> {
+pub(crate) async fn env_or_404(
+    state: &AppState,
+    app_id: &str,
+    env_id: &str,
+) -> Result<Environment, ApiError> {
     match db::get_environment(&state.pool, env_id).await {
         Ok(Some(env)) if env.app_id == app_id => Ok(env),
         Ok(_) => Err(ApiError::not_found("environment not found")),
