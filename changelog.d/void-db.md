@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- The UI image installs from `apps/noite/bun.lock` (the Docker stage cannot use the workspace lock); the lock is pinned to the versions `bun.lock` resolves and `docker/check-versions.ts` fails on drift. A fresh regeneration had pulled `void` 1.7.0, whose build emits no root `dist/wrangler.json`: `bundle_present` saw nothing and the control deploy was skipped entirely, leaving `/ready` at "control: fleet not healthy yet". The runner now finds the wrangler config at `dist/` or `dist/ssr/` and names an unreadable bundle in `/ready`.
+- The UI image installs from `apps/noite/bun.lock` (the Docker stage cannot use the workspace lock); the lock is pinned to the versions `bun.lock` resolves and `docker/check-versions.ts` fails on drift. A fresh regeneration had pulled `void` 1.7.0, whose build emits no root `dist/wrangler.json`: `bundle_present` saw nothing and the control deploy was skipped entirely, leaving `/ready` at "control: fleet not healthy yet". The runner now names a missing `dist/wrangler.json` in `/ready` instead of skipping the deploy silently.
 
 ### Operator action required
 
