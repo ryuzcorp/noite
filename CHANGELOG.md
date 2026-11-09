@@ -2,13 +2,29 @@
 
 Noite installs follow releases, not `main`. Pick a channel with `NOITE_IMAGE` (or `NOITE_VERSION` for the installer): `alpha` gets every promoted release, `stable` only final ones, and a version tag (`0.1.0-alpha.1`) holds an install in place. A release starts as a GitHub pre-release that only `run.sh | bash -s install --pre` installs; marking it as a full release moves the channels. `edge` and short-SHA tags are for CI and rollbacks.
 
-Every release has an **Operator action required** section, even when it is "None". Read it before moving versions: alpha installs are fresh installs, so a version move wipes the volumes and every tenant fleet cold-boots.
+Every release has an **Operator action required** section, even when it is "None". Read it before moving versions: re-running the installer upgrades in place (`.env` and the volumes stay) and every tenant fleet cold-boots behind the edge.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
+
+## [0.1.0-alpha.30] - 2026-11-09
+
+### Operator action required
+
+- None for an install on the compacted baseline (alpha.28 onward): upgrade with `curl -fsSL https://noite.now/run.sh | bash -s install --pre` while `0.1.0-alpha.30` is a pre-release (plain `install` follows the `alpha` channel, which still points at alpha.29 until this release is promoted). `.env` and the volumes are kept and the runner restarts with every fleet. A database from before the 2026-11-09 compaction (alpha.27 and earlier) is still refused: back it up, then uninstall and install fresh.
+- Re-running the installer rewrites `NOITE_IMAGE` to the newest release of the channel; pass `NOITE_VERSION=<tag>` (or `NOITE_IMAGE`) to keep an install on a pinned version or on `stable`.
+
+### Changed
+
+- The control UI's data layer runs on Void's Drizzle stack: the schema lives in `apps/noite/src/db/schema.ts` (`void/schema-d1`), migrations in `apps/noite/src/db/migrations/`, every query uses `void/db`'s `createDb`, and better-auth uses its Drizzle adapter over the same connection. paranorm, `@effect/sql-d1`, Kysely and the worker's boot-time migrator/ledger are gone. The runner applies the control migrations through the worker's Void migration endpoints after the bundle is live (the same protocol as an app deploy), hashing the image's migration list first. The baseline migration is idempotent, so every existing control database (TEXT timestamps and all) is adopted without a wipe; a fresh install gets the full schema before the UI serves.
+
+### Fixed
+
+- Alpha upgrades work again: `install.sh` re-run is the upgrade (it keeps `.env` and the volumes, refreshes `compose.yaml` and the image, and restarts the runner and every fleet), `uninstall.sh` keeps `NOITE_KEEP_DATA=1`, and `run.sh` accepts `--yes` again. The 2026-11-09 schema compaction is unchanged: both migration runners stay, the compacted baselines apply, and a pre-compaction database is refused with an operator message instead of being reshaped.
+- The UI image installs from `apps/noite/bun.lock` (the Docker stage cannot use the workspace lock); the lock is pinned to the versions `bun.lock` resolves and `docker/check-versions.ts` fails on drift. A fresh regeneration had pulled `void` 1.7.0, whose build emits no root `dist/wrangler.json`: `bundle_present` saw nothing and the control deploy was skipped entirely, leaving `/ready` at "control: fleet not healthy yet". The runner now names a missing `dist/wrangler.json` in `/ready` instead of skipping the deploy silently.
 
 ## [0.1.0-alpha.29] - 2026-11-09
 
