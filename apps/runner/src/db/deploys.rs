@@ -294,8 +294,15 @@ async fn apply_status(
                 Some(append_log.trim()),
             )
             .await?;
-        } else if status == "building" || status == "deploying" {
-            update_app_status_if_wanted(pool, app_id, status, None).await?;
+        } else if status == "building" || status == "deploying" || status == "queued" {
+            // A queued deploy is work in flight for the app: the chip says
+            // building, exactly as the run that holds the claim does.
+            let chip = if status == "queued" {
+                "building"
+            } else {
+                status
+            };
+            update_app_status_if_wanted(pool, app_id, chip, None).await?;
         }
         return Ok(());
     };
@@ -306,6 +313,15 @@ async fn apply_status(
                 environment_id,
                 AppStatus::Failed.as_str(),
                 Some(append_log.trim()),
+            )
+            .await?;
+        }
+        "queued" => {
+            update_environment_status_if_wanted(
+                pool,
+                environment_id,
+                AppStatus::Building.as_str(),
+                None,
             )
             .await?;
         }
@@ -328,7 +344,6 @@ pub async fn fail_stuck_deploys(
     )))
     .fetch_all(pool)
     .await?;
-    let cutoff = utc_cutoff(older_than_ms);
     let mut n = 0u64;
     for row in rows {
         if skip_app_ids.contains(&row.app_id) {
@@ -343,7 +358,13 @@ pub async fn fail_stuck_deploys(
         let Some(updated) = crate::models::parse_time(&row.updated_at) else {
             continue;
         };
-        if updated > cutoff {
+        // A queued row is the bounded wait for the app's claim: it resolves
+        // itself within `older_than_ms`, so only twice that is a stall.
+        let limit = match st {
+            crate::models::DeployStatus::Queued => older_than_ms.saturating_mul(2),
+            _ => older_than_ms,
+        };
+        if updated > utc_cutoff(limit) {
             continue;
         }
         let log = format!(

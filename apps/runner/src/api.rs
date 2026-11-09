@@ -33,7 +33,7 @@ mod cancel_tests;
 mod env_gate_tests;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use admin::{snapshot, stats};
 pub use apps::{

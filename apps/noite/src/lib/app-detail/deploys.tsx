@@ -30,7 +30,11 @@ export const deployBadge = (status: string) => {
     tone = "badge-primary";
   } else if (status === "failed") {
     tone = "badge-error";
-  } else if (status === "building" || status === "deploying") {
+  } else if (
+    status === "queued" ||
+    status === "building" ||
+    status === "deploying"
+  ) {
     tone = "badge-warning";
   }
 

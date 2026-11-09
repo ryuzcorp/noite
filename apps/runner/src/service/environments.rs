@@ -290,9 +290,9 @@ async fn spawn_deploy(
         None,
         &app.id,
         Some(&env.id),
-        "building",
+        crate::models::DeployStatus::Queued.as_str(),
         Some(sha),
-        "▸ queued\n",
+        "▸ queued behind the app's running deploy\n",
     )
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;

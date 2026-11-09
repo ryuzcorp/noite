@@ -74,6 +74,10 @@ impl AppStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeployStatus {
+    /// Obliged to run and waiting for the app's in-flight deploy to release
+    /// the claim (`claim_wait`); the pipeline's first step moves it on.
+    #[serde(rename = "queued")]
+    Queued,
     #[serde(rename = "building")]
     Building,
     #[serde(rename = "deploying")]
@@ -87,6 +91,7 @@ pub enum DeployStatus {
 impl DeployStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Queued => "queued",
             Self::Building => "building",
             Self::Deploying => "deploying",
             Self::Success => "success",
@@ -95,11 +100,12 @@ impl DeployStatus {
     }
 
     pub fn is_in_flight(self) -> bool {
-        matches!(self, Self::Building | Self::Deploying)
+        matches!(self, Self::Queued | Self::Building | Self::Deploying)
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
+            "queued" => Some(Self::Queued),
             "building" => Some(Self::Building),
             "deploying" => Some(Self::Deploying),
             "success" => Some(Self::Success),
