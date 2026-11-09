@@ -17,12 +17,11 @@
 #
 # Environment (all optional):
 #   NOITE_DIR        install directory (default: /opt/noite)
-#   NOITE_KEEP_DATA  1 = remove the containers only; volumes, images and .env
-#                    stay, and re-running install brings the same install back
 #   NOITE_CONFIRM    1 = do not ask (required without a terminal)
 #
-# A bucket of your own (S3_ENDPOINT in .env) is never touched: a reinstall
-# pointed at it restores the old state from its snapshot.
+# A bucket of your own (S3_ENDPOINT in .env) is never touched: a fresh
+# install pointed at it will find the old state, so empty it or set a new
+# NOITE_S3_BUCKET to start clean.
 #
 # Nothing runs before main on the last line, so a truncated download never
 # runs half an uninstall.
@@ -30,7 +29,6 @@
 set -euo pipefail
 
 NOITE_DIR="${NOITE_DIR:-/opt/noite}"
-NOITE_KEEP_DATA="${NOITE_KEEP_DATA:-0}"
 NOITE_CONFIRM="${NOITE_CONFIRM:-0}"
 # `name:` in compose.yaml; Compose labels everything it creates with it, so
 # the stack is found even when compose.yaml is gone.
@@ -96,9 +94,7 @@ survey() {
     info "install directory  $NOITE_DIR${DOMAIN:+ (BASE_DOMAIN=$DOMAIN)}"
   fi
   info "containers         $n_containers"
-  if [[ "$NOITE_KEEP_DATA" != "1" ]]; then
-    info "volumes            $n_volumes $(volumes | tr '\n' ' ')"
-  fi
+  info "volumes            $n_volumes $(volumes | tr '\n' ' ')"
   if [[ ! -d "$NOITE_DIR" ]] && ((n_containers == 0 && n_volumes == 0)); then
     info "nothing to remove"
     exit 0
@@ -110,14 +106,10 @@ confirm() {
   can_ask || die "no terminal to confirm on: run curl -fsSL https://noite.now/run.sh | bash -s uninstall (no sudo), or set NOITE_CONFIRM=1"
 
   local expected="${DOMAIN:-noite}" answer=""
-  if [[ "$NOITE_KEEP_DATA" == "1" ]]; then
-    printf '\n%sStops and removes the Noite containers; data and .env stay.%s\n' "$BOLD" "$RESET" >/dev/tty
-  else
-    printf '\n%s%sDeletes every app, account, git repository, certificate and secret of this install.%s\n' \
-      "$RED" "$BOLD" "$RESET" >/dev/tty
-    printf '%sBack up first if you need any of it: https://noite.now/self-hosting/operations#backups%s\n' \
-      "$DIM" "$RESET" >/dev/tty
-  fi
+  printf '\n%s%sDeletes every app, account, git repository, certificate and secret of this install.%s\n' \
+    "$RED" "$BOLD" "$RESET" >/dev/tty
+  printf '%sBack up first if you need any of it: https://noite.now/self-hosting/operations#backups%s\n' \
+    "$DIM" "$RESET" >/dev/tty
   printf 'Type %s%s%s to continue: ' "$BOLD" "$expected" "$RESET" >/dev/tty
   read -r answer </dev/tty || true
   [[ "$answer" == "$expected" ]] || die "not confirmed; nothing was removed"
@@ -164,6 +156,9 @@ remove_data() {
   fi
 
   step "Removing $NOITE_DIR"
+  if [[ -z "$NOITE_DIR" || "$NOITE_DIR" == "/" ]]; then
+    die "refusing to remove \"$NOITE_DIR\": NOITE_DIR must be the install directory"
+  fi
   if [[ -d "$NOITE_DIR" ]]; then
     rm -rf -- "$NOITE_DIR"
     info "removed (with .env and its secrets)"
@@ -193,17 +188,6 @@ remove_swap() {
 }
 
 summary() {
-  if [[ "$NOITE_KEEP_DATA" == "1" ]]; then
-    cat <<EOF
-
-${GREEN}${BOLD}Noite is stopped.${RESET} Volumes, images and $NOITE_DIR/.env are kept.
-
-  Start again   curl -fsSL https://noite.now/run.sh | bash -s install
-  Remove all    curl -fsSL https://noite.now/run.sh | bash -s uninstall
-EOF
-    return 0
-  fi
-
   cat <<EOF
 
 ${GREEN}${BOLD}Noite is removed.${RESET} Docker and the ufw rules for 80/443 are left in place.
@@ -211,8 +195,8 @@ ${GREEN}${BOLD}Noite is removed.${RESET} Docker and the ufw rules for 80/443 are
   Reinstall     curl -fsSL https://noite.now/run.sh | bash -s install
 EOF
   if [[ -n "${S3_OWN:-}" && "$S3_OWN" != "http://rustfs:9000" ]]; then
-    warn "your bucket at $S3_OWN was not touched: a reinstall pointed at it restores"
-    warn "the old state; empty it or pick a new NOITE_S3_BUCKET to start fresh"
+    warn "your bucket at $S3_OWN was not touched: a fresh install pointed at it will"
+    warn "find the old state; empty it or pick a new NOITE_S3_BUCKET to start clean"
   fi
 }
 
@@ -221,10 +205,8 @@ main() {
   survey
   confirm
   stop_stack
-  if [[ "$NOITE_KEEP_DATA" != "1" ]]; then
-    remove_data
-    remove_swap
-  fi
+  remove_data
+  remove_swap
   summary
 }
 

@@ -114,9 +114,7 @@ CREATE TABLE IF NOT EXISTS metrics.app_error_event (
   os TEXT NOT NULL DEFAULT '',
   sha TEXT NOT NULL DEFAULT '',
   -- SDK extras (phase 2): the page URL with its query stripped, and the
-  -- release/environment the SDK reported. Existing installs gain them in
-  -- `db::attach_metrics` (a tolerant ALTER: the metrics schema carries no
-  -- version stamp).
+  -- release/environment the SDK reported.
   url TEXT NOT NULL DEFAULT '',
   release TEXT NOT NULL DEFAULT '',
   environment TEXT NOT NULL DEFAULT ''

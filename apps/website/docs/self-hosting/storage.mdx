@@ -109,9 +109,9 @@ That is what makes failures and downtime safe:
 
 ### Replaying a window
 
-Because the ingest replaces, a window can be replayed safely — for example to recover rows dropped by the pre-alpha.2 ingest bug (a whole pass was skipped when any running app had no requests or logs in the hour, and the watermark advanced as if there had been nothing to read).
+Because the ingest replaces, a window can be replayed safely — for example to recover rows a failed pass skipped before the watermark advanced.
 
-Upgrading an install that predates this ingest (schema version 4) queues **one automatic replay of the retention window** for every fleet; the runner consumes it, rewinds its watermarks to the floor, and runs the same chunked catch-up. The replay is a re-read of already-stored Parquet through the same DuckDB path, so it costs S3 reads and DuckDB time proportional to the window and the fleet count — a handful of fleets over 30 days takes minutes; a large install on a slow store can take longer. It runs in the background and does not block the control plane.
+A replay is a re-read of already-stored Parquet through the same DuckDB path, so it costs S3 reads and DuckDB time proportional to the window and the fleet count — a handful of fleets over 30 days takes minutes; a large install on a slow store can take longer. It runs in the background and does not block the control plane.
 
 To replay by hand — a later window, one fleet — run:
 

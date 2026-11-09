@@ -80,12 +80,11 @@ pub use instance_setting::{
 };
 pub use metrics::{
     add_app_device, add_app_metric_cpu, add_app_path, add_app_ref, clear_telemetry_replay,
-    delete_environment_telemetry, delete_metric_watermarks_for, ensure_environment_telemetry,
-    get_metric_watermarks, get_telemetry_replay, last_request_bucket, list_app_devices,
-    list_app_logs, list_app_metrics, list_app_paths, list_app_refs, list_span_stats,
-    prune_app_devices, prune_app_logs, prune_app_metrics, prune_app_paths, prune_app_refs,
-    prune_span_stats, replace_app_logs, replace_app_metric_usage, replace_span_stat,
-    set_metric_watermarks, set_telemetry_replay,
+    delete_environment_telemetry, delete_metric_watermarks_for, get_metric_watermarks,
+    get_telemetry_replay, last_request_bucket, list_app_devices, list_app_logs, list_app_metrics,
+    list_app_paths, list_app_refs, list_span_stats, prune_app_devices, prune_app_logs,
+    prune_app_metrics, prune_app_paths, prune_app_refs, prune_span_stats, replace_app_logs,
+    replace_app_metric_usage, replace_span_stat, set_metric_watermarks, set_telemetry_replay,
 };
 pub use void_cohost::{delete_environment_hashes, get_cohost_hash, set_cohost_hash};
 
@@ -136,10 +135,9 @@ pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     sqlx::query("PRAGMA foreign_keys = ON")
         .execute(&pool)
         .await?;
-    // The shape of a fresh database is one idempotent file (embedded at
-    // compile time). A database that already has data is first brought up by
-    // the numbered steps in `schema_version::MIGRATIONS`, and one stamped by a
-    // newer build is refused.
+    // One idempotent file (embedded at compile time) is the whole schema.
+    // Pre-compaction alphas are refused; a database at this baseline takes
+    // any future `MIGRATIONS` step first.
     let mut tx = pool.begin().await?;
     schema_version::apply(
         &mut tx,
@@ -149,10 +147,6 @@ pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     )
     .await?;
     tx.commit().await?;
-    // Per-environment telemetry shape (`environment_id` + extended PKs):
-    // fresh files already match, upgraded ones are ALTERed and rebuilt with
-    // their rows copied. Runs once here, not in the per-connection attach.
-    ensure_environment_telemetry(&pool).await?;
     Ok(pool)
 }
 
@@ -198,27 +192,6 @@ macro_rules! attach_metrics {
             sqlx::raw_sql(include_str!("../../schema.metrics.sql")),
         )
         .await?;
-        // Phase-2 SDK columns on `app_error_event`: the metrics schema is
-        // CREATE-IF-NOT-EXISTS with no version stamp, so a new column lands
-        // as a tolerant ALTER — PRAGMA lists the live columns and only the
-        // missing ones are added (a failed ALTER would fail every connect).
-        let live: Vec<String> =
-            sqlx::query_scalar("SELECT name FROM pragma_table_info('app_error_event', 'metrics')")
-                .fetch_all(&mut *$conn)
-                .await?;
-        for (column, ddl) in [
-            ("url", "TEXT NOT NULL DEFAULT ''"),
-            ("release", "TEXT NOT NULL DEFAULT ''"),
-            ("environment", "TEXT NOT NULL DEFAULT ''"),
-        ] {
-            if !live.iter().any(|name| name == column) {
-                sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "ALTER TABLE metrics.app_error_event ADD COLUMN {column} {ddl}"
-                )))
-                .execute(&mut *$conn)
-                .await?;
-            }
-        }
     }};
 }
 pub(crate) use attach_metrics;
@@ -251,11 +224,10 @@ mod tests {
     use super::*;
     use crate::models::new_id;
 
-    /// A boot that crashed after the PK rebuild committed but before the new
-    /// index was created leaves a rebuilt table without its index. The next
-    /// boot sees the PK already rebuilt (nothing to change), so the index
-    /// must still be recreated, or every dashboard read and ingest write
-    /// scans the table forever.
+    /// The metrics schema is applied on every pooled connection. A dropped
+    /// index (a crash between a rebuild commit and its index) must come back
+    /// on the next boot, or every dashboard read and ingest write scans the
+    /// table forever.
     #[tokio::test]
     async fn a_missing_telemetry_index_is_recreated_on_boot() {
         let dir = std::env::temp_dir().join(format!("noite-db-index-{}", new_id()));
@@ -266,9 +238,8 @@ mod tests {
             .execute(&pool)
             .await
             .expect("simulate the crash window");
-        ensure_environment_telemetry(&pool)
-            .await
-            .expect("reboot migration");
+        pool.close().await;
+        let pool = connect(&url).await.expect("reboot");
         let found: Option<String> = sqlx::query_scalar(
             "SELECT name FROM metrics.sqlite_master WHERE type = 'index' AND name = 'idx_app_metric_app_bucket'",
         )

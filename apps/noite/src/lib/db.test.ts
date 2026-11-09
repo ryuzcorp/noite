@@ -4,11 +4,6 @@ import { createTestD1, gateD1 } from "../testing/d1";
 import type { TestD1 } from "../testing/d1";
 import { ensureDbPromise, ledgerMismatch, setD1Binding } from "./db";
 
-const KNOWN = [
-  { id: 1, name: "1.3.0" },
-  { id: 2, name: "1.4.0" },
-];
-
 let db: TestD1;
 
 beforeEach(() => {
@@ -16,53 +11,65 @@ beforeEach(() => {
   setD1Binding(db.d1);
 });
 
+const KNOWN = [
+  { id: 1, name: "1.5.0" },
+  { id: 2, name: "1.6.0" },
+];
+
 describe("ledgerMismatch", () => {
-  test("agrees with an empty or matching ledger", () => {
+  test("accepts an empty ledger and a prefix of the known plans", () => {
     expect(ledgerMismatch([], KNOWN)).toBeUndefined();
+    expect(ledgerMismatch([], KNOWN)).toBeUndefined();
+    // A database at the first schema is a prefix and migrates forward.
+    expect(
+      ledgerMismatch([{ migration_id: 1, name: "1.5.0" }], KNOWN)
+    ).toBeUndefined();
     expect(
       ledgerMismatch(
         [
-          { migration_id: 1, name: "1.3.0" },
-          { migration_id: 2, name: "1.4.0" },
+          { migration_id: 1, name: "1.5.0" },
+          { migration_id: 2, name: "1.6.0" },
         ],
         KNOWN
       )
     ).toBeUndefined();
   });
 
-  test("refuses a ledger newer than this build", () => {
+  test("refuses a pre-compaction alpha's ledger", () => {
     const reason = ledgerMismatch(
       [
         { migration_id: 1, name: "1.3.0" },
         { migration_id: 2, name: "1.4.0" },
+      ],
+      KNOWN
+    );
+
+    expect(reason).toContain("different Noite alpha");
+  });
+
+  test("refuses a ledger longer than this build's plan", () => {
+    const reason = ledgerMismatch(
+      [
+        { migration_id: 1, name: "1.5.0" },
+        { migration_id: 2, name: "1.6.0" },
         { migration_id: 3, name: "9.9.9" },
       ],
       KNOWN
     );
 
-    expect(reason).toContain("newer Noite");
-    expect(reason).toContain("Downgrades are not supported");
-  });
-
-  test("refuses a ledger whose entry was written by a different schema", () => {
-    const reason = ledgerMismatch([{ migration_id: 1, name: "1.2.0" }], KNOWN);
-    expect(reason).toContain('recorded as "1.2.0"');
-    expect(reason).toContain('expects "1.3.0"');
+    expect(reason).toContain("different Noite alpha");
   });
 });
 
 describe("ensureDb", () => {
-  test("migrates a fresh database and records the ledger", async () => {
+  test("migrates a fresh database and records the one baseline", async () => {
     await ensureDbPromise();
 
     const rows = db.raw
       .query(`SELECT migration_id, name FROM paranorm_migrations`)
       .all();
 
-    expect(rows).toEqual([
-      { migration_id: 1, name: "1.3.0" },
-      { migration_id: 2, name: "1.4.0" },
-    ]);
+    expect(rows).toEqual([{ migration_id: 1, name: "1.5.0" }]);
   });
 
   test("boots again over its own ledger without re-running the migration", async () => {
@@ -78,18 +85,18 @@ describe("ensureDb", () => {
       .query(`SELECT migration_id FROM paranorm_migrations`)
       .all();
 
-    expect(rows).toHaveLength(2);
+    expect(rows).toHaveLength(1);
   });
 
-  test("refuses to boot on a ledger from a newer build", async () => {
+  test("refuses a database from a different alpha", async () => {
     await ensureDbPromise();
     db.raw.run(
-      `INSERT INTO paranorm_migrations (migration_id, name) VALUES (3, '9.9.9')`
+      `INSERT INTO paranorm_migrations (migration_id, name) VALUES (2, '1.4.0')`
     );
     // SAFETY: a spread of the shim keeps its prepare/batch methods: a distinct handle over the same database.
     const again = { ...db.d1 } as typeof db.d1;
     setD1Binding(again);
-    await expect(ensureDbPromise()).rejects.toThrow(/newer Noite/u);
+    await expect(ensureDbPromise()).rejects.toThrow(/different Noite alpha/u);
   });
 });
 
