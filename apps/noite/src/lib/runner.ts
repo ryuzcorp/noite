@@ -516,6 +516,10 @@ export const runnerRenameApp = (
 export const runnerDeployLog = (id: string, deployId: string) =>
   runnerRpc<{ log: string }>("deploys.log", { deploy_id: deployId, id });
 
+/** Stop an in-flight deploy (its row closes with the operator's line). */
+export const runnerCancelDeploy = (id: string, deployId: string) =>
+  runnerRpc<{ ok: boolean }>("deploys.cancel", { deploy_id: deployId, id });
+
 export const runnerRollback = (id: string, sha: string) =>
   runnerRpc<{ deployId: string; ok: boolean; sha: string }>(
     "deploys.rollback",

@@ -102,6 +102,42 @@ pub async fn get_deploy_log(
     Ok(row.map(|(log,)| log))
 }
 
+/// One deploy row of `app_id`: the stop endpoint's ownership check (a token is
+/// only tripped for a row this app owns) and its status read.
+pub async fn get_deploy(
+    pool: &SqlitePool,
+    app_id: &str,
+    deploy_id: &str,
+) -> sqlx::Result<Option<Deploy>> {
+    let sql = format!("SELECT {DEPLOY_COLS} FROM deploy WHERE id = ? AND app_id = ? LIMIT 1");
+    sqlx::query_as::<_, Deploy>(sqlx::AssertSqlSafe(sql))
+        .bind(deploy_id)
+        .bind(app_id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Close an in-flight row with the operator's line. `false` = the row was not
+/// in flight (it finished between the read and this update), so nothing was
+/// stopped.
+pub async fn mark_deploy_cancelled(
+    pool: &SqlitePool,
+    app_id: &str,
+    deploy_id: &str,
+) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "UPDATE deploy SET status = 'failed', log = log || ?, updated_at = ? \
+         WHERE id = ? AND app_id = ? AND status IN ('queued', 'building', 'deploying')",
+    )
+    .bind(format!("ERROR: {}\n", crate::host::cancel::CANCELLED))
+    .bind(now_iso())
+    .bind(deploy_id)
+    .bind(app_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// Deploy history: `environment_id = None` is the app's production history,
 /// `Some` is one preview environment's.
 pub async fn list_deploys(

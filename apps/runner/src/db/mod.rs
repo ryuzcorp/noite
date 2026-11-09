@@ -46,8 +46,9 @@ pub use credentials::{
     ScopedCredential,
 };
 pub use deploys::{
-    fail_stuck_deploys, get_deploy_log, get_success_deploy, latest_deploy_status,
-    latest_deploy_status_for_env, list_deploys, list_deploys_lean, mark_deploy_live, upsert_deploy,
+    fail_stuck_deploys, get_deploy, get_deploy_log, get_success_deploy, latest_deploy_status,
+    latest_deploy_status_for_env, list_deploys, list_deploys_lean, mark_deploy_cancelled,
+    mark_deploy_live, upsert_deploy,
 };
 pub use env::{
     delete_env, get_env, insert_provisioned, list_env, set_env, set_provisioned, tenant_env,

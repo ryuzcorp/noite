@@ -13,6 +13,7 @@ import {
   runnerCreateApp,
   runnerGetAppBySlug,
   runnerDeleteApp,
+  runnerCancelDeploy,
   runnerDeployLog,
   runnerGitRemote,
   runnerListApps,
@@ -438,6 +439,28 @@ export const rollback = apiAction(
 
     try {
       return await runnerRollback(appId, sha);
+    } catch (error) {
+      failUnknown(error);
+    }
+  }
+);
+
+const CancelDeployArgs = Schema.Struct({
+  appId: Schema.String,
+  deployId: Schema.String,
+});
+
+/** Stop an in-flight deploy (push-gated): the runner kills the step's process
+ * group and closes the row with "cancelled by the operator". 409 when the
+ * deploy already finished. */
+export const cancelDeploy = apiAction(
+  CancelDeployArgs,
+  async ({ appId, deployId }, { env, request }) => {
+    const user = await sessionUser(request, env);
+    await requireAppRole(appId, user.id, "push");
+
+    try {
+      return await runnerCancelDeploy(appId, deployId);
     } catch (error) {
       failUnknown(error);
     }

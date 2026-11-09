@@ -976,6 +976,18 @@ async fn dispatch_call(
                     .map(|log| json!({ "log": log })),
             )
         }
+        "deploys.cancel" => {
+            let p: DeployLogParams = match parse(params, &id) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            complete(
+                id,
+                service::deploys::cancel(state, &p.id, &p.deploy_id)
+                    .await
+                    .map(|()| json!({ "ok": true })),
+            )
+        }
         "deploys.rollback" => {
             let p: RollbackParams = match parse(params, &id) {
                 Ok(p) => p,
