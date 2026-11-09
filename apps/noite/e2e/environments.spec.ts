@@ -11,6 +11,7 @@ import {
   deleteApp,
   execGit,
   pushAppDir,
+  runnerCall,
   waitForDeploy,
 } from "./helpers";
 
@@ -126,5 +127,89 @@ test(
     await expect(
       panel.getByRole("link", { name: "Deploys for feature" })
     ).toHaveAttribute("href", /\/apps\/[0-9a-f-]+\?t=deployments&env=/u);
+
+    // --- the environment rolls back to its own earlier release ---------------
+    // The environment's history is its own; a sha that succeeded there is a
+    // valid target, and the rebuild stays in that environment (production's
+    // history never gains this row).
+    const envs = await runnerCall(
+      request,
+      `/v1/apps/${appId}/environments?role=admin`
+    );
+
+    expect(envs.status, JSON.stringify(envs.body)).toBe(200);
+
+    // SAFETY: the environments endpoint answers a JSON array of rows.
+    const env = (envs.body as { id: string; label: string }[]).find(
+      (e) => e.label === "feature"
+    );
+
+    expect(env).toBeDefined();
+
+    let firstSuccess: { id: string; sha: string | null } | undefined;
+
+    await expect
+      .poll(
+        async () => {
+          const rows = await runnerCall(
+            request,
+            `/v1/apps/${appId}/deploys?environmentId=${env?.id ?? ""}`
+          );
+
+          // SAFETY: the deploys endpoint answers a JSON array of rows.
+          firstSuccess = (
+            rows.body as { id: string; sha: string | null }[]
+          ).find(
+            (r) => (r as { status?: string }).status === "success" && !!r.sha
+          );
+
+          return firstSuccess?.sha ?? "";
+        },
+        { timeout: 3 * 60_000 }
+      )
+      .not.toBe("");
+
+    const rolled = await runnerCall(request, `/v1/apps/${appId}/rollback`, {
+      body: { environmentId: env?.id ?? "", sha: firstSuccess?.sha ?? "" },
+      method: "POST",
+    });
+
+    expect(rolled.status).toBe(200);
+
+    // SAFETY: the rollback endpoint answers `{ deployId }` (its own contract).
+    const rollbackId = (rolled.body as { deployId?: string }).deployId ?? "";
+
+    await expect
+      .poll(
+        async () => {
+          const rows = await runnerCall(
+            request,
+            `/v1/apps/${appId}/deploys?environmentId=${env?.id ?? ""}`
+          );
+
+          // SAFETY: the deploys endpoint answers a JSON array of rows.
+          const row = (
+            rows.body as {
+              environmentId: string | null;
+              id: string;
+              status: string;
+            }[]
+          ).find((r) => r.id === rollbackId);
+
+          return row?.status ?? "";
+        },
+        { timeout: 8 * 60_000 }
+      )
+      .toBe("success");
+
+    // Production never saw this row: the rollback rebuilt the preview only.
+    const prodRows = await runnerCall(request, `/v1/apps/${appId}/deploys`);
+
+    // SAFETY: the deploys endpoint answers a JSON array of rows.
+    const inProd = (prodRows.body as { id: string }[]).some(
+      (r) => r.id === rollbackId
+    );
+
+    expect(inProd).toBe(false);
   }
 );
