@@ -2,13 +2,28 @@
 
 Noite installs follow releases, not `main`. Pick a channel with `NOITE_IMAGE` (or `NOITE_VERSION` for the installer): `alpha` gets every promoted release, `stable` only final ones, and a version tag (`0.1.0-alpha.1`) holds an install in place. A release starts as a GitHub pre-release that only `run.sh | bash -s install --pre` installs; marking it as a full release moves the channels. `edge` and short-SHA tags are for CI and rollbacks.
 
-Every release has an **Operator action required** section, even when it is "None". Read it before upgrading: an upgrade restarts the runner and every tenant fleet cold-boots, so batch upgrades.
+Every release has an **Operator action required** section, even when it is "None". Read it before moving versions: alpha installs are fresh installs, so a version move wipes the volumes and every tenant fleet cold-boots.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
 <!-- New entries go in changelog.d/<topic>.md; the release PR assembles them with `bun docker/changelog-release.ts`. -->
+
+## [0.1.0-alpha.28] - 2026-11-09
+
+### Operator action required
+
+- **This alpha does not upgrade from any earlier alpha.** All schema migrations were compacted into one baseline per store, and the upgrade paths were removed: the runner refuses a SQLite database with a different `user_version`, the control D1 refuses a `paranorm_migrations` ledger from another alpha, and `install.sh` refuses an existing `/opt/noite/.env` instead of acting as an upgrade. Moving to this release means `uninstall` (which deletes the volumes) and a fresh install. A bucket of your own is never deleted: empty it or set a new `NOITE_S3_BUCKET` to start clean.
+
+### Changed
+
+- The shipped history is compacted to one baseline: `MIGRATIONS` is empty above `SCHEMA_VERSION` 100, `schemaHistory` holds the single control `defineSchema`, and `schema.metrics.sql` carries the final metrics shape. Both migration runners are retained (append a step above the baseline to change the shape forward). The metrics `ensure_environment_telemetry` rebuild, the tolerant `app_error_event` ALTERs and the installer upgrade confirmation are gone.
+
+### Fixed
+
+- A create whose runner call outlives the control plane's bound now adopts the row the detached runner task lands and grants it; the app list also heals an app left with no grant at all by an earlier timeout. A slow create can no longer leave an app that no one can see or delete.
+- A build pinned at its cgroup `memory.max` under sustained memory pressure now fails after ~30 s with the budget error (raise `RUNNER_BUILD_MEMORY_MB` or deploy a prebuilt dist) instead of reclaiming until the step timeout, which starved the whole install.
 
 ## [0.1.0-alpha.27] - 2026-11-08
 
