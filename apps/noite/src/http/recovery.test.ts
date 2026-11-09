@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { authFromEnv } from "../lib/auth";
-import { ensureDbPromise, setD1Binding } from "../lib/db";
+import { ensureDb, setD1Binding } from "../lib/db";
 import { platformLimiter } from "../lib/rate-limit";
 import rateLimitMiddleware from "../middleware/04-rate-limit";
 import { testRouteContext } from "../testing/context";
@@ -23,7 +23,7 @@ beforeEach(async () => {
   platformLimiter.reset();
   db = createTestD1();
   setD1Binding(db.d1);
-  await ensureDbPromise();
+  await ensureDb();
 });
 
 const addUser = (id: string, role: string, banned = 0) => {

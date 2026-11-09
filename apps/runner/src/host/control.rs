@@ -14,10 +14,12 @@ use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+
 use crate::config::Config;
 use crate::host::children::Supervised;
 use crate::host::logs::LogState;
-use crate::host::{exec, s3};
+use crate::host::{exec, s3, void_migrate};
 
 const MARKER_KEY: &str = "ui/revision";
 
@@ -70,6 +72,20 @@ fn canonical_json(value: &serde_json::Value) -> String {
     }
 }
 
+/// Stable per-install token the control worker checks on its Void migration
+/// endpoints (`x-void-internal`). Derived from RUNNER_TOKEN, so it survives
+/// restarts without a row and never leaves the install.
+fn control_proxy_token(cfg: &Config) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"noite-control-proxy:");
+    hasher.update(cfg.runner_token.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn control_vars(cfg: &Config) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     let mut put = |k: &str, v: &str| {
@@ -89,6 +105,7 @@ fn control_vars(cfg: &Config) -> serde_json::Value {
     put("RUNNER_URL", "http://127.0.0.1:8080");
     put("S3_ENDPOINT", &cfg.s3_endpoint);
     put("S3_PUBLIC_ENDPOINT", &cfg.s3_public_endpoint);
+    put("__VOID_PROXY_TOKEN", &control_proxy_token(cfg));
     if !cfg.better_auth_url.is_empty() {
         put("BETTER_AUTH_URL", &cfg.better_auth_url);
     }
@@ -119,6 +136,9 @@ pub fn revision(bundle_rev: &str, vars: &serde_json::Value) -> String {
 /// telemetry — and surfaces that on `GET /v1/admin/stats` as `control_fleet` so
 /// the UI says so instead of showing empty charts.
 pub fn bundle_present(cfg: &Config) -> bool {
+    // `dist/wrangler.json` (or `.jsonc`) at the bundle root is what
+    // `celld deploy` reads; a build that only emits `dist/ssr/wrangler.json`
+    // is not deployable, and `main` says so on `/ready` instead of skipping.
     let dir = Path::new(&cfg.control_bundle_dir);
     dir.join("wrangler.json").exists() || dir.join("wrangler.jsonc").exists()
 }
@@ -139,6 +159,7 @@ pub async fn ensure_deployed(cfg: &Config) -> anyhow::Result<serde_json::Value> 
         .unwrap_or_else(|_| "unknown".to_string());
     let vars = control_vars(cfg);
     let rev = revision(&bundle_rev, &vars);
+    tracing::debug!(revision = %rev, "control bundle revision");
     // Compare with marker.
     let tmp = std::env::temp_dir().join("noite-ui-revision");
     let deployed = fetch_marker(cfg).await.unwrap_or_default();
@@ -204,6 +225,116 @@ pub async fn ensure_deployed(cfg: &Config) -> anyhow::Result<serde_json::Value> 
     let _ = tokio::fs::remove_dir_all(&work).await;
     let _ = tokio::fs::remove_file(&tmp).await;
     Ok(vars)
+}
+
+/// Apply the control app's D1 migrations through the worker's Void endpoints
+/// (`/__void/migrate/app`, then `/auth` when advertised). Call it once the
+/// control fleet is supervised: the endpoint is the worker itself, so it only
+/// answers after celld has adopted the deployment pointer. The image's
+/// `db/migrations` is hashed and compared with the worker's advertised list,
+/// exactly like a tenant deploy: a mismatch means the copied files and the
+/// built bundle disagree, and boot fails before the UI serves a wrong schema.
+pub async fn migrate(cfg: &Config) -> anyhow::Result<()> {
+    if !bundle_present(cfg) {
+        return Ok(());
+    }
+    let dist = PathBuf::from(&cfg.control_bundle_dir);
+    let bundle_rev = tokio::fs::read_to_string(dist.join("REVISION"))
+        .await
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let rev = revision(&bundle_rev, &control_vars(cfg));
+    migrate_control(cfg, &rev).await
+}
+
+/// The migration driver behind [`migrate`]. A bundle built without
+/// `db/migrations` never advertises v2 and is skipped.
+async fn migrate_control(cfg: &Config, revision: &str) -> anyhow::Result<()> {
+    let control_dir = Path::new(&cfg.control_bundle_dir)
+        .parent()
+        .unwrap_or_else(|| Path::new("/"));
+    let plan = match void_migrate::resolve_migrations_dir(control_dir) {
+        Ok(dir) if dir.is_dir() => {
+            let files = void_migrate::collect_migrations(&dir)?;
+            let plan = void_migrate::build_plan_bundle(&files)
+                .map_err(|error| anyhow::anyhow!("control migration plan: {error}"))?;
+            Some((files, plan))
+        }
+        _ => None,
+    };
+    let Some((files, plan)) = plan else {
+        tracing::info!("control migrate: the bundle ships no db/migrations; skipping");
+        return Ok(());
+    };
+    if files.is_empty() {
+        tracing::info!("control migrate: no migration files; skipping");
+        return Ok(());
+    }
+    let client = void_migrate::MigrationClient::new(
+        void_migrate::migration_http_client(),
+        crate::config::CONTROL_UPSTREAM_URL.to_string(),
+        control_proxy_token(cfg),
+    );
+    // The fleet adopts a new pointer on its poll and starts the worker from
+    // scratch after an upgrade, so the endpoint answers connection-refused or
+    // 404 for a few seconds. Anything else (401: the derived proxy token does
+    // not match the worker's env) is a bug and fails at once.
+    let mut capabilities = None;
+    let mut last = String::from("not attempted");
+    for _ in 0..20 {
+        match client.capabilities().await {
+            Ok(caps) => {
+                capabilities = Some(caps);
+                break;
+            }
+            Err(error) => {
+                if matches!(error, void_migrate::ProbeError::Http { status: 401, .. }) {
+                    anyhow::bail!("control migrate: the worker rejected the proxy token ({error})");
+                }
+                tracing::debug!(%error, "control migration endpoint not ready");
+                last = error.to_string();
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let Some(caps) = capabilities else {
+        anyhow::bail!(
+            "control migrate: the worker did not advertise its migration endpoint within 20 s ({last})"
+        );
+    };
+    if caps.dialect != "sqlite" {
+        anyhow::bail!("control migrate: unexpected dialect {:?}", caps.dialect);
+    }
+    if caps.migration_list_hash != plan.migration_list_hash {
+        anyhow::bail!(
+            "control migrate: the image's migration list ({}) does not match the worker's ({})",
+            plan.migration_list_hash,
+            caps.migration_list_hash
+        );
+    }
+    let attempt = void_migrate::mint_attempt_id();
+    let response = client.migrate_app(&attempt, revision).await;
+    if !response.ok {
+        anyhow::bail!(
+            "control migrate failed: {}",
+            void_migrate::format_migration_failure(&response)
+        );
+    }
+    if caps.auth_endpoint.is_some() {
+        if let Err(error) = client.migrate_auth().await {
+            anyhow::bail!("control auth migrate failed: {error}");
+        }
+    }
+    tracing::info!(
+        attempt,
+        applied = response
+            .migrations
+            .iter()
+            .filter(|m| m.is_applied())
+            .count(),
+        "control migrations applied"
+    );
+    Ok(())
 }
 
 async fn fetch_marker(cfg: &Config) -> anyhow::Result<String> {
@@ -481,6 +612,45 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn control_vars_carry_a_stable_migration_token() {
+        let _env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut cfg = Config::from_env().expect("config");
+        cfg.runner_token = "runner-token-for-tests".into();
+        let token = control_proxy_token(&cfg);
+        assert_eq!(token.len(), 64, "sha256 hex");
+        assert_ne!(token, cfg.runner_token, "never the runner token itself");
+        assert_eq!(token, control_proxy_token(&cfg), "stable across calls");
+        let vars = control_vars(&cfg);
+        assert_eq!(
+            vars.get("__VOID_PROXY_TOKEN").and_then(|v| v.as_str()),
+            Some(token.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_control_skips_a_bundle_without_migrations() {
+        // The env lock serialises the read, not the await: release it before
+        // the call so the test future stays Send.
+        let (cfg, dir) = {
+            let _env = crate::config::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut cfg = Config::from_env().expect("config");
+            let dir = std::env::temp_dir()
+                .join(format!("noite-control-migrate-{}", crate::models::new_id()));
+            std::fs::create_dir_all(dir.join("dist")).expect("temp dir");
+            cfg.control_bundle_dir = dir.join("dist").to_string_lossy().into_owned();
+            (cfg, dir)
+        };
+        migrate_control(&cfg, "rev-test")
+            .await
+            .expect("a bundle without migrations is skipped");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

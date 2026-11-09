@@ -12,9 +12,8 @@
  * parser the transport runs and the `inputSchema` it publishes, so an agent
  * never sees a contract the server does not enforce.
  */
-import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { SqlClient } from "effect/sql/SqlClient";
+import { sql } from "void/db";
 
 import type { CreateSourceInput } from "../apps/create-source";
 import { TEMPLATES } from "../apps/templates";
@@ -24,7 +23,7 @@ import {
   requireAppRole,
   requireAppRoleBySlug,
 } from "../collaborators";
-import { withDb } from "../db";
+import { getDb, withDb } from "../db";
 import type { AppRole } from "../roles";
 import {
   runnerDeleteEnv,
@@ -106,16 +105,12 @@ const requireApp = async (
 /** The account's display name, for the one commit a create may author (a
  * squashed import). Absent accounts fall back to the platform default. */
 const displayName = async (userId: string): Promise<string> => {
-  const rows = await withDb(
-    Effect.gen(function* () {
-      const sql = yield* SqlClient;
-
-      return yield* sql<{ name: string }>`
-        SELECT name FROM "user" WHERE id = ${userId} LIMIT 1`;
-    })
+  const row = await withDb(() =>
+    getDb().get<{ name: string }>(sql`
+      SELECT name FROM "user" WHERE id = ${userId} LIMIT 1`)
   );
 
-  return rows[0]?.name?.trim() ?? "";
+  return row?.name?.trim() ?? "";
 };
 
 const sha10 = (sha: string): string => sha.slice(0, 10);

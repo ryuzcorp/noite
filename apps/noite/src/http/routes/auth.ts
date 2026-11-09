@@ -1,5 +1,5 @@
 import { authFromEnv, MissingAuthSecretError } from "../../lib/auth";
-import { ensureDbPromise } from "../../lib/db";
+import { ensureDb } from "../../lib/db";
 import { withTrustedClientAddress } from "../../lib/rate-limit";
 import {
   INVITES_PER_USER,
@@ -12,7 +12,7 @@ import type { RouteHandler } from "../config";
  * account data. A broken check must not block the UI, so it answers with the
  * stricter policy on failure. */
 export const handleInviteStatus: RouteHandler = async () => {
-  await ensureDbPromise();
+  await ensureDb();
 
   try {
     return Response.json(await signupPolicy());
@@ -26,7 +26,7 @@ export const handleInviteStatus: RouteHandler = async () => {
 };
 
 export const handleAuth: RouteHandler = async (request, env) => {
-  await ensureDbPromise();
+  await ensureDb();
 
   try {
     const auth = authFromEnv(env, new URL(request.url).origin);

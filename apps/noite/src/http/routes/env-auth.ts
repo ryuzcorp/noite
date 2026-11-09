@@ -6,7 +6,7 @@
 //! label, the app's slug and the base, never from the `return` parameter.
 
 import { requireAppRole } from "../../lib/collaborators";
-import { ensureDbPromise } from "../../lib/db";
+import { ensureDb } from "../../lib/db";
 import {
   environmentHost,
   environmentReturnPath,
@@ -151,7 +151,7 @@ export const handleEnvAuth: RouteHandler = async (request, env) => {
     return new Response("env and app are required", { status: 400 });
   }
 
-  await ensureDbPromise();
+  await ensureDb();
   const session = await getSessionOrNull(request, env).catch(() => null);
   const user = session?.user;
 

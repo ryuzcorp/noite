@@ -25,7 +25,7 @@ import {
   revokePendingInvite,
   upsertPendingInvite,
 } from "./collaborators";
-import { ensureDbPromise, setD1Binding, withDb } from "./db";
+import { ensureDb, setD1Binding } from "./db";
 
 let db: TestD1;
 let runner: RunnerMock;
@@ -45,7 +45,7 @@ const addUser = (id: string, email: string, role = "user", name = id) => {
 beforeAll(async () => {
   db = createTestD1();
   setD1Binding(db.d1);
-  await ensureDbPromise();
+  await ensureDb();
 });
 
 beforeEach(() => {
@@ -88,8 +88,8 @@ const denied = async (work: Promise<unknown>) => {
 
 describe("access gate", () => {
   test("a grant decides the role, in order view < push < admin", async () => {
-    await withDb(grantCollaborator(APP.id, "u-view", "view"));
-    await withDb(grantCollaborator(APP.id, "u-push", "push"));
+    await grantCollaborator(APP.id, "u-view", "view");
+    await grantCollaborator(APP.id, "u-push", "push");
     expect(await roleOf(requireAppRole(APP.id, "u-view", "view"))).toBe("view");
     expect(await denied(requireAppRole(APP.id, "u-view", "push"))).toBe(true);
     expect(await roleOf(requireAppRole(APP.id, "u-push", "push"))).toBe("push");
@@ -111,7 +111,7 @@ describe("access gate", () => {
     expect(await denied(requireAppRole(APP.id, "u-creator", "view"))).toBe(
       true
     );
-    await withDb(grantCollaborator(APP.id, "u-creator", "admin"));
+    await grantCollaborator(APP.id, "u-creator", "admin");
     expect(await roleOf(requireAppRole(APP.id, "u-creator", "admin"))).toBe(
       "admin"
     );
@@ -135,7 +135,7 @@ describe("access gate", () => {
   });
 
   test("slug lookup is one runner GET, never the full app list", async () => {
-    await withDb(grantCollaborator(APP.id, "u-view", "view"));
+    await grantCollaborator(APP.id, "u-view", "view");
     runner.calls.length = 0;
     const access = await requireAppRoleBySlug("app-one", "u-view", "view");
     expect(access.app.id).toBe(APP.id);
@@ -165,10 +165,10 @@ describe("listAppsForCollaborator", () => {
   });
 
   test("lists granted apps and never resurrects a revoked creator", async () => {
-    await withDb(grantCollaborator(OTHER.id, "u-creator", "view"));
+    await grantCollaborator(OTHER.id, "u-creator", "view");
     // A revoked creator still leaves this admin grant, so the app is not
     // grantless and the heal above must not re-add the creator.
-    await withDb(grantCollaborator(APP.id, "u-view", "admin"));
+    await grantCollaborator(APP.id, "u-view", "admin");
 
     const apps = await listAppsForCollaborator("u-creator");
 
@@ -180,9 +180,9 @@ describe("listAppsForCollaborator", () => {
 
 describe("listCollaboratorRows", () => {
   test("returns every grant with its account in a single query", async () => {
-    await withDb(grantCollaborator(APP.id, "u-push", "push"));
-    await withDb(grantCollaborator(APP.id, "u-view", "view"));
-    await withDb(grantCollaborator(OTHER.id, "u-stranger", "admin"));
+    await grantCollaborator(APP.id, "u-push", "push");
+    await grantCollaborator(APP.id, "u-view", "view");
+    await grantCollaborator(OTHER.id, "u-stranger", "admin");
     const before = db.executed.length;
     const rows = await listCollaboratorRows(APP.id);
     expect(db.executed.length - before).toBe(1);
@@ -206,15 +206,13 @@ describe("listCollaboratorRows", () => {
 });
 
 const invite = (email: string, role: "view" | "push" | "admin" = "view") =>
-  withDb(
-    upsertPendingInvite({
-      appId: APP.id,
-      appName: APP.name,
-      email,
-      invitedBy: "u-creator",
-      role,
-    })
-  );
+  upsertPendingInvite({
+    appId: APP.id,
+    appName: APP.name,
+    email,
+    invitedBy: "u-creator",
+    role,
+  });
 
 describe("pending invitations", () => {
   test("inviting grants nothing until it is accepted", async () => {
@@ -258,7 +256,7 @@ describe("pending invitations", () => {
   });
 
   test("accepting replaces an existing grant with the invited role", async () => {
-    await withDb(grantCollaborator(APP.id, "u-view", "view"));
+    await grantCollaborator(APP.id, "u-view", "view");
     await invite("view@example.com", "admin");
     const [pending] = await listPendingInvites(APP.id);
     await acceptPendingInvite(pending?.id ?? "", "view@example.com", "u-view");
@@ -280,24 +278,23 @@ describe("pending invitations", () => {
 
     const viewInvite = pending.find((p) => p.email === "view@example.com");
     // Declining someone else's invitation is a no-op.
-    await withDb(
-      declinePendingInvite(strangerInvite?.id ?? "", "view@example.com")
-    );
+    await declinePendingInvite(strangerInvite?.id ?? "", "view@example.com");
     expect(await listPendingInvites(APP.id)).toHaveLength(2);
-    await withDb(
-      declinePendingInvite(strangerInvite?.id ?? "", "stranger@example.com")
+    await declinePendingInvite(
+      strangerInvite?.id ?? "",
+      "stranger@example.com"
     );
     // Revoking through the wrong app is a no-op.
-    await withDb(revokePendingInvite(OTHER.id, viewInvite?.id ?? ""));
+    await revokePendingInvite(OTHER.id, viewInvite?.id ?? "");
     expect(await listPendingInvites(APP.id)).toHaveLength(1);
-    await withDb(revokePendingInvite(APP.id, viewInvite?.id ?? ""));
+    await revokePendingInvite(APP.id, viewInvite?.id ?? "");
     expect(await listPendingInvites(APP.id)).toHaveLength(0);
   });
 
   test("dropping an app's collaborators drops its invitations too", async () => {
-    await withDb(grantCollaborator(APP.id, "u-view", "view"));
+    await grantCollaborator(APP.id, "u-view", "view");
     await invite("stranger@example.com");
-    await withDb(dropAppCollaborators(APP.id));
+    await dropAppCollaborators(APP.id);
     expect(await listCollaboratorRows(APP.id)).toHaveLength(0);
     expect(await listPendingInvites(APP.id)).toHaveLength(0);
   });

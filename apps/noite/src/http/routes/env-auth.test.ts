@@ -11,7 +11,7 @@ import {
 
 import { grantCollaborator } from "../../lib/collaborators";
 import { controlEnv } from "../../lib/control-env";
-import { ensureDbPromise, setD1Binding, withDb } from "../../lib/db";
+import { ensureDb, setD1Binding } from "../../lib/db";
 import { stampRunnerEnv } from "../../lib/runner";
 import type { TestD1 } from "../../testing/d1";
 import { createTestD1 } from "../../testing/d1";
@@ -68,7 +68,7 @@ const answer = (method: string): unknown => {
 beforeAll(async () => {
   db = createTestD1();
   setD1Binding(db.d1);
-  await ensureDbPromise();
+  await ensureDb();
   controlEnv.RUNNER_TOKEN = ENV.RUNNER_TOKEN;
   controlEnv.RUNNER_URL = ENV.RUNNER_URL;
   stampRunnerEnv(ENV as never);
@@ -193,7 +193,7 @@ describe("GET /api/env-auth", () => {
     expect(signInPage).toContain('href="/login?return=');
     // A refusal the gate cannot resolve reads as a page too.
     signIn("u-view");
-    await withDb(grantCollaborator(APP.id, "u-view", "view"));
+    await grantCollaborator(APP.id, "u-view", "view");
 
     const missing = await call(`?env=other&app=app-1&return=${returnUrl()}`, {
       "sec-fetch-dest": "iframe",
@@ -205,7 +205,7 @@ describe("GET /api/env-auth", () => {
 
   test("mints a grant and 302s to the environment's own /__noite/auth", async () => {
     signIn("u-view");
-    await withDb(grantCollaborator(APP.id, "u-view", "view"));
+    await grantCollaborator(APP.id, "u-view", "view");
 
     const response = await call(`?env=env-1&app=app-1&return=${returnUrl()}`, {
       "x-forwarded-host": "noite.localhost:9080",
@@ -230,7 +230,7 @@ describe("GET /api/env-auth", () => {
 
   test("never trusts the host inside return", async () => {
     signIn("u-view");
-    await withDb(grantCollaborator(APP.id, "u-view", "view"));
+    await grantCollaborator(APP.id, "u-view", "view");
 
     const response = await call(
       `?env=env-1&app=app-1&return=${returnUrl("evil.example")}`,
@@ -244,7 +244,7 @@ describe("GET /api/env-auth", () => {
 
   test("404s an environment the app does not own", async () => {
     signIn("u-view");
-    await withDb(grantCollaborator(APP.id, "u-view", "view"));
+    await grantCollaborator(APP.id, "u-view", "view");
 
     const response = await call(`?env=other&app=app-1&return=${returnUrl()}`, {
       "x-forwarded-host": "noite.localhost:9080",

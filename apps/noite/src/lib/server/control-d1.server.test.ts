@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 
 import { createTestD1 } from "../../testing/d1";
 import type { TestD1 } from "../../testing/d1";
-import { ensureDbPromise, setD1Binding } from "../db";
+import { ensureDb, setD1Binding } from "../db";
 import type { D1Cell, D1Rows, D1RowsQuery } from "../runner";
 import {
   controlAccessRefusal,
@@ -20,7 +20,7 @@ let db: TestD1;
 beforeEach(async () => {
   db = createTestD1();
   setD1Binding(db.d1);
-  await ensureDbPromise();
+  await ensureDb();
 });
 
 const addUser = (id: string) => {

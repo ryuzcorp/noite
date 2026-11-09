@@ -1,8 +1,7 @@
-/* eslint-disable func-names -- Effect.gen uses anonymous generators */
-import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { SqlClient } from "effect/sql/SqlClient";
+import { eq, sql } from "void/db";
 
+import { apikeyTable, appCollaboratorTable, userTable } from "../../db/schema";
 import type { AdminAppRow, AdminUserRow } from "../api-types";
 import {
   authFromEnv,
@@ -11,7 +10,7 @@ import {
   UnauthorizedError,
 } from "../auth";
 import { dropAppCollaborators } from "../collaborators";
-import { withDb } from "../db";
+import { getDb, withDb } from "../db";
 import {
   runnerControlFleet,
   runnerDeleteApp,
@@ -41,39 +40,33 @@ interface DbUser {
  * every session read, so an admin needs no promotion round-trip and the
  * SELECT is skipped, saving one sequential D1 query on every admin action.
  * Exported for the round-trip-count unit test. */
-export const ensureAdminAccount = (email: string | null, role: string) =>
-  Effect.gen(function* run() {
-    if (!email) {
-      return;
-    }
+export const ensureAdminAccount = async (
+  email: string | null,
+  role: string
+): Promise<void> => {
+  if (!email || role === "admin") {
+    return;
+  }
 
-    if (role === "admin") {
-      return;
-    }
+  const db = getDb();
 
-    const found = yield* Effect.gen(function* () {
-      const sql = yield* SqlClient;
+  const found = await db
+    .select({ id: userTable.id, role: userTable.role })
+    .from(userTable)
+    .where(eq(userTable.email, email))
+    .limit(1);
 
-      return yield* sql.unsafe(
-        `SELECT id, email, name, banned, role, createdAt FROM "user" WHERE "email" = ?`,
-        [email]
-      );
-    });
+  const [existing] = found;
 
-    // SAFETY: the column list mirrors DbUser and D1 returns plain row
-    // objects; the paranorm builder for this table exceeds tsc's depth
-    // budget, so raw SQL stays shallow in every config.
-    const existing = (found[0] ?? null) as DbUser | null;
+  if (!existing || existing.role === "admin") {
+    return;
+  }
 
-    if (!existing || existing.role === "admin") {
-      return;
-    }
-
-    const sql = yield* SqlClient;
-    yield* sql.unsafe(`UPDATE "user" SET "role" = 'admin' WHERE "id" = ?`, [
-      existing.id,
-    ]);
-  });
+  await db
+    .update(userTable)
+    .set({ role: "admin" })
+    .where(eq(userTable.id, existing.id));
+};
 
 interface AdminSession {
   email: string;
@@ -107,7 +100,7 @@ const requireAdmin = async (
     const anchored = resolveAdminEmail();
 
     if (anchored && email === anchored) {
-      await withDb(ensureAdminAccount(anchored, role));
+      await ensureAdminAccount(anchored, role);
 
       return { email, id: user.id, isAdmin: true };
     }
@@ -200,35 +193,20 @@ export const listUsers = apiAction(
     const offset = Math.max(0, Math.floor(page)) * ADMIN_USERS_PAGE_SIZE;
 
     try {
-      // Plain SELECT outside the paranorm builder: the builder exceeds
-      // tsc's depth budget in some configs, while the untyped call stays
-      // shallow everywhere.
-      const found = await withDb(
-        Effect.gen(function* () {
-          const sql = yield* SqlClient;
+      const pattern = likePattern(needle.toLowerCase());
 
-          const filter = needle
-            ? `WHERE lower(email) LIKE ? ESCAPE '\\' OR lower(name) LIKE ? ESCAPE '\\'`
-            : "";
+      const filter = needle
+        ? sql`WHERE lower(email) LIKE ${pattern} ESCAPE '\\' OR lower(name) LIKE ${pattern} ESCAPE '\\'`
+        : sql``;
 
-          const params: (string | number)[] = needle
-            ? [
-                likePattern(needle.toLowerCase()),
-                likePattern(needle.toLowerCase()),
-              ]
-            : [];
-
-          return yield* sql.unsafe(
-            `SELECT id, email, name, banned, role, createdAt FROM "user"
-              ${filter} ORDER BY createdAt DESC, id LIMIT ? OFFSET ?`,
-            [...params, ADMIN_USERS_PAGE_SIZE + 1, offset]
-          );
-        })
+      const rows = await withDb(() =>
+        getDb().all<DbUser>(sql`
+          SELECT id, email, name, banned, role, createdAt FROM "user"
+          ${filter}
+          ORDER BY createdAt DESC, id
+          LIMIT ${ADMIN_USERS_PAGE_SIZE + 1} OFFSET ${offset}
+        `)
       );
-
-      // SAFETY: the column list mirrors DbUser and D1 returns plain row
-      // objects.
-      const rows = found as DbUser[];
 
       return {
         hasMore: rows.length > ADMIN_USERS_PAGE_SIZE,
@@ -271,12 +249,10 @@ export const listAllApps = apiActionNoInput(async ({ env, request }) => {
   try {
     const [apps, users] = await Promise.all([
       runnerListApps(),
-      withDb(
-        Effect.gen(function* () {
-          const sql = yield* SqlClient;
-
-          return yield* sql.unsafe(`SELECT id, email FROM "user"`);
-        })
+      withDb(() =>
+        getDb()
+          .select({ email: userTable.email, id: userTable.id })
+          .from(userTable)
       ),
     ]);
 
@@ -337,7 +313,7 @@ export const adminDeleteApp = apiAction(
 
     try {
       await runnerDeleteApp(id);
-      await withDb(dropAppCollaborators(id));
+      await dropAppCollaborators(id);
 
       return { ok: true as const };
     } catch (error) {
@@ -435,28 +411,28 @@ export const setUserRole = apiAction(
 
 /** Apps whose only admin is this account: deleting the account would leave
  * them with nobody to manage them. */
-const soleAdminApps = (userId: string) =>
-  Effect.gen(function* () {
-    const sql = yield* SqlClient;
-
-    const rows = yield* sql.unsafe(
-      `SELECT c.appId AS appId FROM app_collaborator c
-        WHERE c.userId = ? AND c.role = 'admin'
-          AND (SELECT count(*) FROM app_collaborator o
-                WHERE o.appId = c.appId AND o.role = 'admin') = 1`,
-      [userId]
-    );
+const soleAdminApps = (userId: string): Promise<number> =>
+  withDb(async () => {
+    const rows = await getDb().all<{ appId: string }>(sql`
+      SELECT c.appId AS appId FROM app_collaborator c
+       WHERE c.userId = ${userId} AND c.role = 'admin'
+         AND (SELECT count(*) FROM app_collaborator o
+               WHERE o.appId = c.appId AND o.role = 'admin') = 1
+    `);
 
     return rows.length;
   });
 
 /** Remove the account rows better-auth does not own a foreign key for. */
-const dropUserLeftovers = (userId: string) =>
-  Effect.gen(function* () {
-    const sql = yield* SqlClient;
-    yield* sql.unsafe(`DELETE FROM apikey WHERE referenceId = ?`, [userId]);
-    yield* sql.unsafe(`DELETE FROM app_collaborator WHERE userId = ?`, [
-      userId,
+const dropUserLeftovers = (userId: string): Promise<void> =>
+  withDb(async () => {
+    const db = getDb();
+
+    await db.batch([
+      db.delete(apikeyTable).where(eq(apikeyTable.referenceId, userId)),
+      db
+        .delete(appCollaboratorTable)
+        .where(eq(appCollaboratorTable.userId, userId)),
     ]);
   });
 
@@ -473,7 +449,7 @@ export const deleteUser = apiAction(
     }
 
     try {
-      const stranded = await withDb(soleAdminApps(userId));
+      const stranded = await soleAdminApps(userId);
 
       if (stranded > 0) {
         fail(
@@ -483,7 +459,7 @@ export const deleteUser = apiAction(
 
       const { auth, headers } = await adminAuth(request, env);
       await auth.api.removeUser({ body: { userId }, headers });
-      await withDb(dropUserLeftovers(userId));
+      await dropUserLeftovers(userId);
 
       return { ok: true as const };
     } catch (error) {

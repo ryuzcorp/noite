@@ -1,10 +1,10 @@
 /* eslint-disable func-names -- Effect.gen uses anonymous generators */
-import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { SqlClient } from "effect/sql/SqlClient";
+import { sql } from "void/db";
 
+import { userTable } from "../../db/schema";
 import { authFromEnv, failUnknown, UnauthorizedError } from "../auth";
-import { withDb } from "../db";
+import { getDb, withDb } from "../db";
 import { apiAction, apiActionNoInput, fail } from "./api";
 import { listUnusedInvitesFor } from "./invites.server";
 import { requestOrigin, sessionUser } from "./session.server";
@@ -21,14 +21,13 @@ export const completeOnboarding = apiActionNoInput(async ({ env, request }) => {
     fail("Onboarding cannot be completed while impersonating");
   }
 
-  await withDb(
-    Effect.gen(function* () {
-      const sql = yield* SqlClient;
-      yield* sql.unsafe(
-        `UPDATE user SET onboardedAt = ? WHERE id = ? AND onboardedAt IS NULL`,
-        [new Date().toISOString(), user.id]
-      );
-    })
+  await withDb(() =>
+    getDb()
+      .update(userTable)
+      .set({ onboardedAt: new Date().toISOString() })
+      .where(
+        sql`${userTable.id} = ${user.id} AND ${userTable.onboardedAt} IS NULL`
+      )
   );
 
   return { ok: true };

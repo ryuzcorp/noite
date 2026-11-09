@@ -2,7 +2,7 @@ import * as Schema from "effect/Schema";
 
 import { authFromEnv, MissingAuthSecretError } from "../../lib/auth";
 import { requireAppRoleBySlug } from "../../lib/collaborators";
-import { ensureDbPromise } from "../../lib/db";
+import { ensureDb } from "../../lib/db";
 import { errorMessage } from "../../lib/errors";
 import { parseAppRole } from "../../lib/roles";
 import { createAppForUser, slugError } from "../../lib/server/apps.server";
@@ -84,7 +84,7 @@ export const handleRecovery: RouteHandler = async (request, env) => {
     );
   }
 
-  await ensureDbPromise();
+  await ensureDb();
   const email = await findRecoveryEmail(decoded.success.email);
 
   if (!email) {
@@ -234,7 +234,7 @@ export const handleGitAuth: RouteHandler = async (request, env) => {
     );
   }
 
-  await ensureDbPromise();
+  await ensureDb();
 
   try {
     const auth = authFromEnv(

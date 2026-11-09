@@ -65,6 +65,10 @@ pub struct AppState {
     /// Parsed per-deploy source maps for error symbolication, bounded
     /// (`host::sourcemaps::SourceMapCache`).
     pub source_maps: host::sourcemaps::SourceMapCache,
+    /// Why the control fleet failed to come up (deploy or migrations), or
+    /// `None`: /ready reports it beside "fleet not healthy", so a red lane
+    /// names its cause instead of only failing.
+    pub control_boot: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[tokio::main]
@@ -386,6 +390,7 @@ async fn main() -> anyhow::Result<()> {
     let (log_tx, _log_rx) = tokio::sync::watch::channel(0u64);
     let log_tx_loop = log_tx.clone();
     host::state::spawn_sync_task(state_sync.clone(), pool.clone(), (*config).clone());
+    let control_boot = Arc::new(std::sync::Mutex::new(None::<String>));
     let state = AppState {
         pool: pool.clone(),
         config: config.clone(),
@@ -406,6 +411,7 @@ async fn main() -> anyhow::Result<()> {
         ))),
         started_at,
         source_maps: host::sourcemaps::SourceMapCache::new(),
+        control_boot: control_boot.clone(),
     };
 
     let cfg_loop = (*config).clone();
@@ -496,15 +502,49 @@ async fn main() -> anyhow::Result<()> {
             None
         } else {
             if let Err(e) = host::control::ensure_deployed(&config).await {
-                tracing::warn!(error = %e, "control fleet deploy failed; continuing");
+                let reason = format!("{e:#}");
+                tracing::warn!(error = %reason, "control fleet deploy failed; continuing");
+                *control_boot.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(format!("deploy failed: {reason}"));
             }
             let child =
                 host::control::supervise(&config, control_pid.clone(), logs.clone(), control_token);
+            // The migration endpoints are served by the control worker, so
+            // this waits for the fleet to adopt the pointer first. Retried:
+            // a refused move or a slow celld start is transient; a schema
+            // that still will not apply leaves the UI erroring (loudly).
+            for attempt in 1..=3 {
+                match host::control::migrate(&config).await {
+                    Ok(()) => {
+                        tracing::info!("control migrations applied");
+                        break;
+                    }
+                    Err(e) if attempt < 3 => {
+                        tracing::warn!(attempt, error = %format!("{e:#}"), "control migrations failed; retrying");
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    Err(e) => {
+                        let reason = format!("{e:#}");
+                        tracing::error!(error = %reason, "control migrations not applied; the control UI will error until they apply");
+                        *control_boot.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(format!("migrations failed: {reason}"));
+                    }
+                }
+            }
             tracing::info!(ms = boot.elapsed().as_millis(), "control bundle ready");
             Some(child)
         }
     } else {
-        tracing::info!("no control bundle (dev image): the UI is served by vite dev");
+        if std::path::Path::new(&config.control_bundle_dir).exists() {
+            // The directory is there, the config is not: a build layout the
+            // deploy cannot read. /ready would only say "fleet not healthy",
+            // so record it.
+            let reason = format!("no wrangler config under {}", config.control_bundle_dir);
+            tracing::error!(%reason, "control bundle unreadable; not deploying it");
+            *control_boot.lock().unwrap_or_else(|p| p.into_inner()) = Some(reason);
+        } else {
+            tracing::info!("no control bundle (dev image): the UI is served by vite dev");
+        }
         None
     };
 

@@ -2,7 +2,7 @@
 //!
 //! `schema.sql` is the complete shape of a fresh database, applied on every
 //! boot. Alpha databases stamped 1..16 predate the 2026-11-09 compaction and
-//! are refused, not migrated (alpha installs are fresh installs). This build's
+//! are refused, not migrated: they predate the compaction and cannot be reshaped in place. This build's
 //! baseline is [`SCHEMA_VERSION`] with an empty [`MIGRATIONS`]; a future shape
 //! change appends a `(version, sql)` above the baseline and bumps the constant,
 //! and a database stamped at the baseline is migrated forward. A database
@@ -88,9 +88,10 @@ pub async fn apply(
     .context("probe database")?;
     let versions = match plan(stored, populated > 0, latest, steps) {
         Plan::Legacy { found } => bail!(
-            "refusing to start: the runner database is from an alpha before the compacted schema \
-             (stamp {found}); alpha builds do not upgrade between versions. Wipe the data volume \
-             and install again."
+            "refusing to start: the runner database was written before the 2026-11-09 schema \
+             compaction (stamp {found}) and cannot be upgraded in place. Back it up, wipe the \
+             data volume and install fresh; databases on the compacted baseline upgrade by \
+             re-running the installer."
         ),
         Plan::TooNew { found } => bail!(
             "refusing to start: the runner database is schema version {found} but this image \

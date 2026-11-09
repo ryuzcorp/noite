@@ -2,7 +2,7 @@ import { sleepUnlessAborted } from "../../http/sse";
 import { authFromEnv, UnauthorizedError } from "../auth";
 import type { SessionUser } from "../auth";
 import { isInstanceAdmin, requireAppRole } from "../collaborators";
-import { ensureDbPromise } from "../db";
+import { ensureDb } from "../db";
 import { fail } from "./api";
 import { controlAccessRefusal } from "./control-d1.server";
 
@@ -41,7 +41,7 @@ export const getSessionOrNull = async (
   env: KitEnv,
   opts?: { timeoutMs?: number }
 ): Promise<RequestSession | null> => {
-  await ensureDbPromise();
+  await ensureDb();
   const origin = requestOrigin(request);
 
   if (!origin) {

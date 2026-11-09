@@ -1,5 +1,5 @@
 import { requireAppRole } from "../../lib/collaborators";
-import { ensureDbPromise } from "../../lib/db";
+import { ensureDb } from "../../lib/db";
 import { runnerConfig } from "../config";
 import type { RouteHandler } from "../config";
 import { routeUserId } from "../session";
@@ -96,7 +96,7 @@ export const handleR2Upload: RouteHandler = async (request, env, params) => {
     return new Response("app, bucket, and key required", { status: 400 });
   }
 
-  await ensureDbPromise();
+  await ensureDb();
   const userId = await routeUserId(request, env);
 
   if (!userId) {
@@ -151,7 +151,7 @@ export const handleR2Raw: RouteHandler = async (request, env, params) => {
     return new Response("app, bucket, and key required", { status: 400 });
   }
 
-  await ensureDbPromise();
+  await ensureDb();
   const userId = await routeUserId(request, env);
 
   if (!userId) {

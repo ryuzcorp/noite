@@ -3,7 +3,7 @@ import {
   MAX_SOURCE_BODY_BYTES,
   SOURCE_FORWARD_TIMEOUT_MS,
 } from "../../lib/commit-source";
-import { ensureDbPromise } from "../../lib/db";
+import { ensureDb } from "../../lib/db";
 import type {
   SourceCommitBody,
   SourceCommitFile,
@@ -120,7 +120,7 @@ const forwardSourceBody = async (
     return refused;
   }
 
-  await ensureDbPromise();
+  await ensureDb();
   const session = await getSessionOrNull(request, env).catch(() => null);
   const user = session?.user;
 
@@ -226,7 +226,7 @@ export const handleSourceArchive: RouteHandler = async (
     return new Response("bad request", { status: 400 });
   }
 
-  await ensureDbPromise();
+  await ensureDb();
   const session = await getSessionOrNull(request, env).catch(() => null);
   const user = session?.user;
 

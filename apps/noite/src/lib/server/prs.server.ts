@@ -8,12 +8,12 @@
  * mutation builds `actor={userId,name}` from the session and passes the role
  * the gate resolved, which the runner trusts for policy.
  */
-import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { SqlClient } from "effect/sql/SqlClient";
+import { inArray } from "void/db";
 
+import { userTable } from "../../db/schema";
 import { requireAppRole } from "../collaborators";
-import { withDb } from "../db";
+import { getDb, withDb } from "../db";
 import {
   runnerBranchRulesGet,
   runnerBranchRulesSet,
@@ -109,21 +109,13 @@ const PrNamesArgs = Schema.Struct({
   userIds: Schema.Array(Schema.String),
 });
 
-interface UserNameRow {
-  id: string;
-  name: string | null;
-}
-
 const userNamesQuery = (ids: string[]) =>
-  Effect.gen(function* run() {
-    const sql = yield* SqlClient;
-    const placeholders = ids.map(() => "?").join(", ");
-
-    return yield* sql.unsafe(
-      `SELECT id, name FROM "user" WHERE id IN (${placeholders})`,
-      ids
-    );
-  });
+  withDb(() =>
+    getDb()
+      .select({ id: userTable.id, name: userTable.name })
+      .from(userTable)
+      .where(inArray(userTable.id, ids))
+  );
 
 /** Display names for user ids in one query; ids with no account (or a blank
  * name) stay absent so callers render "Former user". */
@@ -136,8 +128,7 @@ export const resolveUserNames = async (
     return {};
   }
 
-  // SAFETY: the projection is exactly the id/name columns; D1 returns plain rows.
-  const rows = (await withDb(userNamesQuery(ids))) as UserNameRow[];
+  const rows = await userNamesQuery(ids);
   const names: Record<string, string> = {};
 
   for (const row of rows) {

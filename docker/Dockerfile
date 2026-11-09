@@ -297,6 +297,9 @@ CMD ["/bin/sh", "/opt/noite/dev.sh"]
 FROM base AS noite
 COPY --from=runner-build /out/noite-runner /usr/local/bin/noite-runner
 COPY --from=ui-build /app/dist /opt/noite/control/dist
+# The control app's D1 migrations, so the runner can verify the worker's
+# advertised migration list and drive Void's in-worker migration endpoint.
+COPY --from=ui-build /app/src/db/migrations /opt/noite/control/db/migrations
 # Fixed Void sandbox controller bundle + meta (SPEC, Void sandbox
 # controller), deployed by the runner as `noite-void-sandbox`.
 COPY --from=void-sandbox-build /app/dist /opt/noite/void-sandbox

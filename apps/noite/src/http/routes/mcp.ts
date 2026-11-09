@@ -18,7 +18,7 @@
 import type { Json } from "effect/Schema";
 
 import { authFromEnv, MissingAuthSecretError } from "../../lib/auth";
-import { ensureDbPromise } from "../../lib/db";
+import { ensureDb } from "../../lib/db";
 import {
   handleMcpMessage,
   PROTOCOL_VERSION_HEADER,
@@ -98,7 +98,7 @@ export const handleMcp: RouteHandler = async (request, env) => {
     return unauthorized();
   }
 
-  await ensureDbPromise();
+  await ensureDb();
   let userId: string;
 
   try {

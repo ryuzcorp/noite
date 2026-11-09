@@ -2,7 +2,7 @@
 import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 
 import { authFromEnv } from "../lib/auth";
-import { ensureDbPromise, setD1Binding } from "../lib/db";
+import { ensureDb, setD1Binding } from "../lib/db";
 import { platformLimiter } from "../lib/rate-limit";
 import { createTestD1 } from "../testing/d1";
 import type { TestD1 } from "../testing/d1";
@@ -24,7 +24,7 @@ beforeEach(async () => {
   platformLimiter.reset();
   db = createTestD1();
   setD1Binding(db.d1);
-  await ensureDbPromise();
+  await ensureDb();
 });
 
 /** An account plus a scoped key, minted through better-auth exactly as the

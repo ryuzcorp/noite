@@ -33,7 +33,7 @@ No domains or hostnames. No app names or slugs, no bucket names or endpoints. No
 
 ## The install id
 
-`distinct_id` is a random UUID v4, generated on the install's first boot. It lives in the runner's database (`instance_setting`, key `install_id`), which is snapshotted into your bucket, so it survives container recreation and a restore from the bucket — one install stays one install. It is not derived from your domain, server or account, and a fresh install starts a new one.
+`distinct_id` is a random UUID v4, generated on the install's first boot. It lives in the runner's database (`instance_setting`, key `install_id`), which is snapshotted into your bucket, so it survives container recreation, upgrades and a restore from the bucket — one install stays one install. It is not derived from your domain, server or account, and a fresh install starts a new one.
 
 ## Where it goes
 

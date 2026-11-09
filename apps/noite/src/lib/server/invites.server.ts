@@ -1,8 +1,7 @@
-/* eslint-disable func-names -- Effect.gen uses anonymous generators */
-import * as Effect from "effect/Effect";
-import { SqlClient } from "effect/sql/SqlClient";
+import { eq, sql } from "void/db";
 
-import { withDb } from "../db";
+import { inviteTable } from "../../db/schema";
+import { getDb, withDb } from "../db";
 
 /** Share-able codes every new account receives once it has redeemed one. */
 export const INVITES_PER_USER = 2;
@@ -46,21 +45,6 @@ export const normalizeInviteCode = (raw: string): string => {
   return groups.join("-");
 };
 
-interface CountRow {
-  n: number;
-}
-
-interface InviteRow {
-  code: string;
-  createdBy: string;
-  createdAt: string | Date | null;
-  id: string;
-  note: string | null;
-  revoked: number | boolean;
-  usedAt: string | Date | null;
-  usedBy: string | null;
-}
-
 /** Public signup policy: the very first account bootstraps the instance, so
  * it needs no code; every later one does. */
 export const signupPolicy = async (): Promise<{
@@ -68,18 +52,11 @@ export const signupPolicy = async (): Promise<{
   invitesPerUser: number;
   requiresInvite: boolean;
 }> => {
-  const rows = await withDb(
-    Effect.gen(function* () {
-      const sql = yield* SqlClient;
-
-      return yield* sql.unsafe(`SELECT count(*) AS n FROM "user"`);
-    })
+  const first = await withDb(() =>
+    getDb().get<{ n: number }>(sql`SELECT count(*) AS n FROM "user"`)
   );
 
-  // SAFETY: the query selects a single `n` count; D1 returns plain rows.
-  const [first] = rows as CountRow[];
-  const count = first?.n ?? 0;
-  const firstRun = Number(count) === 0;
+  const firstRun = Number(first?.n ?? 0) === 0;
 
   return {
     firstRun,
@@ -96,24 +73,24 @@ interface InviteState {
 
 /** The code's state, without consuming it: one query for everything the
  * gate and the claim need. */
-const lookup = async (code: string): Promise<InviteState | null> =>
-  await withDb(
-    Effect.gen(function* () {
-      const sql = yield* SqlClient;
+const lookup = (code: string): Promise<InviteState | null> =>
+  withDb(async () => {
+    const rows = await getDb()
+      .select({
+        id: inviteTable.id,
+        revoked: inviteTable.revoked,
+        usedBy: inviteTable.usedBy,
+      })
+      .from(inviteTable)
+      .where(eq(inviteTable.code, normalizeInviteCode(code)))
+      .limit(1);
 
-      const rows = yield* sql.unsafe(
-        `SELECT id, usedBy, revoked FROM invite WHERE code = ?`,
-        [normalizeInviteCode(code)]
-      );
+    const [row] = rows;
 
-      // SAFETY: the projection is (id, usedBy, revoked); D1 returns plain rows.
-      const [row] = rows as InviteRow[];
-
-      return row
-        ? { id: row.id, revoked: Boolean(row.revoked), usedBy: row.usedBy }
-        : null;
-    })
-  );
+    return row
+      ? { id: row.id, revoked: Boolean(row.revoked), usedBy: row.usedBy }
+      : null;
+  });
 
 export type InviteProblem = "missing" | "unknown" | "revoked" | "used";
 
@@ -147,14 +124,13 @@ export const consumeInvite = async (
   userId: string
 ): Promise<boolean> => {
   const normalized = normalizeInviteCode(code);
-  await withDb(
-    Effect.gen(function* () {
-      const sql = yield* SqlClient;
-      yield* sql.unsafe(
-        `UPDATE invite SET usedBy = ?, usedAt = ? WHERE code = ? AND usedBy IS NULL AND revoked = 0`,
-        [userId, new Date().toISOString(), normalized]
-      );
-    })
+  await withDb(() =>
+    getDb()
+      .update(inviteTable)
+      .set({ usedAt: new Date().toISOString(), usedBy: userId })
+      .where(
+        sql`${inviteTable.code} = ${normalized} AND ${inviteTable.usedBy} IS NULL AND ${inviteTable.revoked} = 0`
+      )
   );
   const row = await lookup(normalized);
 
@@ -172,24 +148,20 @@ export const mintInvites = async (
     newInviteCode()
   );
 
-  await withDb(
-    Effect.gen(function* () {
-      const sql = yield* SqlClient;
+  await withDb(async () => {
+    const db = getDb();
 
-      for (const code of codes) {
-        yield* sql.unsafe(
-          `INSERT INTO invite (id, code, createdBy, note, revoked, createdAt) VALUES (?, ?, ?, ?, 0, ?)`,
-          [
-            crypto.randomUUID(),
-            code,
-            userId,
-            note ?? null,
-            new Date().toISOString(),
-          ]
-        );
-      }
-    })
-  );
+    await db.insert(inviteTable).values(
+      codes.map((code) => ({
+        code,
+        createdAt: new Date().toISOString(),
+        createdBy: userId,
+        id: crypto.randomUUID(),
+        note: note ?? null,
+        revoked: false,
+      }))
+    );
+  });
 
   return codes;
 };
@@ -197,36 +169,27 @@ export const mintInvites = async (
 /** The codes one account can still hand out, oldest first. This is the user's
  * own share (`INVITES_PER_USER` on registration) — the account page shows it,
  * so an invitee can pass one on without admin rights. */
-export const listUnusedInvitesFor = async (
+export const listUnusedInvitesFor = (
   userId: string
-): Promise<{ code: string; id: string }[]> => {
-  const rows = await withDb(
-    Effect.gen(function* () {
-      const sql = yield* SqlClient;
+): Promise<{ code: string; id: string }[]> =>
+  withDb(async () => {
+    const rows = await getDb()
+      .select({ code: inviteTable.code, id: inviteTable.id })
+      .from(inviteTable)
+      .where(
+        sql`${inviteTable.createdBy} = ${userId} AND ${inviteTable.usedBy} IS NULL AND ${inviteTable.revoked} = 0`
+      )
+      .orderBy(inviteTable.createdAt);
 
-      return yield* sql.unsafe(
-        `SELECT id, code FROM invite WHERE createdBy = ? AND usedBy IS NULL AND revoked = 0 ORDER BY createdAt`,
-        [userId]
-      );
-    })
-  );
-
-  // SAFETY: the projection is (id, code); D1 returns plain rows.
-  const found = rows as InviteRow[];
-
-  return found.map((row) => ({ code: row.code, id: row.id }));
-};
+    return rows.map((row) => ({ code: row.code, id: row.id }));
+  });
 
 export const revokeInvite = async (id: string): Promise<void> => {
-  await withDb(
-    Effect.gen(function* () {
-      const sql = yield* SqlClient;
-      // Only an unused code can be revoked; a redeemed one is history.
-      yield* sql.unsafe(
-        `UPDATE invite SET revoked = 1 WHERE id = ? AND usedBy IS NULL`,
-        [id]
-      );
-    })
+  await withDb(() =>
+    getDb()
+      .update(inviteTable)
+      .set({ revoked: true })
+      .where(sql`${inviteTable.id} = ${id} AND ${inviteTable.usedBy} IS NULL`)
   );
 };
 
@@ -240,8 +203,13 @@ export interface InviteView {
   usedAt: string;
 }
 
-interface InviteJoinRow extends InviteRow {
+interface InviteJoinRow {
+  code: string;
+  createdAt: string | Date | null;
   createdByEmail: string | null;
+  id: string;
+  revoked: number | boolean;
+  usedAt: string | Date | null;
   usedByEmail: string | null;
 }
 
@@ -250,26 +218,19 @@ const asIso = (value: string | Date | null): string =>
 
 /** Every code with the emails on both ends (admin panel). */
 export const listInvites = async (): Promise<InviteView[]> => {
-  const rows = await withDb(
-    Effect.gen(function* () {
-      const sql = yield* SqlClient;
-
-      return yield* sql.unsafe(
-        `SELECT i.id, i.code, i.createdBy, i.usedBy, i.usedAt, i.revoked, i.note, i.createdAt,
-                c.email AS createdByEmail, u.email AS usedByEmail
-           FROM invite i
-           LEFT JOIN "user" c ON c.id = i.createdBy
-           LEFT JOIN "user" u ON u.id = i.usedBy
-          ORDER BY i.createdAt DESC
-          LIMIT 500`
-      );
-    })
+  const rows = await withDb(() =>
+    getDb().all<InviteJoinRow>(sql`
+      SELECT i.id, i.code, i.createdBy, i.usedBy, i.usedAt, i.revoked, i.note, i.createdAt,
+             c.email AS createdByEmail, u.email AS usedByEmail
+        FROM invite i
+        LEFT JOIN "user" c ON c.id = i.createdBy
+        LEFT JOIN "user" u ON u.id = i.usedBy
+       ORDER BY i.createdAt DESC
+       LIMIT 500
+    `)
   );
 
-  // SAFETY: the projection mirrors InviteJoinRow; D1 returns plain rows.
-  const found = rows as InviteJoinRow[];
-
-  return found.map((row) => ({
+  return rows.map((row) => ({
     code: row.code,
     createdAt: asIso(row.createdAt),
     createdByEmail: row.createdByEmail ?? "(deleted account)",
