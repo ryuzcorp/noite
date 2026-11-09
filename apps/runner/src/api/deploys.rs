@@ -29,6 +29,7 @@ pub struct RollbackBody {
 pub async fn rollback(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<super::environments::RoleQuery>,
     Json(body): Json<RollbackBody>,
 ) -> impl IntoResponse {
     service::deploys::rollback(
@@ -36,6 +37,7 @@ pub async fn rollback(
         &id,
         &body.sha,
         body.environment_id.as_deref().filter(|env| !env.is_empty()),
+        q.role.as_deref(),
     )
     .await
     .map(|(deploy_id, sha)| Json(json!({ "ok": true, "sha": sha, "deployId": deploy_id })))

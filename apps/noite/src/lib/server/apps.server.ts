@@ -437,10 +437,10 @@ export const rollback = apiAction(
   RollbackArgs,
   async ({ appId, sha, environmentId }, { env, request }) => {
     const user = await sessionUser(request, env);
-    await requireAppRole(appId, user.id, "push");
+    const { role } = await requireAppRole(appId, user.id, "push");
 
     try {
-      return await runnerRollback(appId, sha, environmentId ?? "");
+      return await runnerRollback(appId, sha, environmentId ?? "", role);
     } catch (error) {
       failUnknown(error);
     }

@@ -521,13 +521,20 @@ export const runnerCancelDeploy = (id: string, deployId: string) =>
   runnerRpc<{ ok: boolean }>("deploys.cancel", { deploy_id: deployId, id });
 
 /** Re-run an old sha: production, or one preview environment (`""`/absent is
- * production; the runner proves the sha was successful *in that target*). */
-export const runnerRollback = (id: string, sha: string, environmentId = "") =>
+ * production; the runner proves the sha was successful *in that target* and,
+ * for a preview, that the caller may push). */
+export const runnerRollback = (
+  id: string,
+  sha: string,
+  environmentId = "",
+  role = ""
+) =>
   runnerRpc<{ deployId: string; ok: boolean; sha: string }>(
     "deploys.rollback",
     {
       environment_id: environmentId === "" ? undefined : environmentId,
       id,
+      role: role === "" ? undefined : role,
       sha,
     }
   );

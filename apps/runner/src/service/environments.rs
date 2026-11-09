@@ -60,6 +60,11 @@ pub async fn list(
 }
 
 /// Load one environment of one app, or 404.
+/// The push gate a preview-target operation shares with `deploy`.
+pub(crate) fn require_push(role: Option<&str>) -> Result<(), ApiError> {
+    require(role, "push")
+}
+
 pub(crate) async fn env_or_404(
     state: &AppState,
     app_id: &str,

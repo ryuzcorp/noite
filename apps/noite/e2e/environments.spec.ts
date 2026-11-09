@@ -170,7 +170,11 @@ test(
       .not.toBe("");
 
     const rolled = await runnerCall(request, `/v1/apps/${appId}/rollback`, {
-      body: { environmentId: env?.id ?? "", sha: firstSuccess?.sha ?? "" },
+      body: {
+        environmentId: env?.id ?? "",
+        role: "admin",
+        sha: firstSuccess?.sha ?? "",
+      },
       method: "POST",
     });
 

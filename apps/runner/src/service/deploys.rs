@@ -226,7 +226,14 @@ pub async fn rollback(
     id: &str,
     sha: &str,
     environment_id: Option<&str>,
+    role: Option<&str>,
 ) -> Result<(String, String), ApiError> {
+    // A preview target is an environment operation, so it carries the same
+    // push-role gate `environments.deploy` enforces; production rollback is
+    // unchanged (the control already gates it).
+    if environment_id.is_some() {
+        super::environments::require_push(role)?;
+    }
     let prepared = prepare_rollback(state, id, sha, environment_id).await?;
     let out = (prepared.deploy_id.clone(), prepared.sha.clone());
     tokio::spawn(async move { prepared.run().await });
