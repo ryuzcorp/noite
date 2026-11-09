@@ -1,12 +1,12 @@
--- Noite runner schema: the shape of a FRESH database, applied at every boot
--- (`db::connect`) and idempotent: every statement is CREATE ... IF NOT EXISTS.
+-- Noite runner schema: the complete shape of a fresh database, applied at
+-- every boot (`db::connect`) and idempotent: every statement is CREATE ... IF
+-- NOT EXISTS.
 --
--- A database that already holds data is upgraded first by the numbered steps
--- in `schema_version.rs` (version in `PRAGMA user_version`), and one written
--- by a newer build is refused. A shape change therefore does BOTH: edits the
--- CREATE below, and appends a migration that takes an existing table there.
+-- Alpha builds do not migrate between versions: a database stamped by another
+-- alpha is refused in `schema_version.rs` (version in `PRAGMA user_version`),
+-- never reshaped. A shape change therefore only edits the CREATE below.
 -- Nothing in this file ALTERs or DROPs (a bare `DROP` would resolve into the
--- ATTACHed metrics.sqlite); migrations qualify tables as `main.<name>`.
+-- ATTACHed metrics.sqlite).
 
 -- Apps: one row per tenant app. Hard DELETE is the only remove path.
 CREATE TABLE IF NOT EXISTS app (

@@ -2,8 +2,8 @@
 //! replay a window of fleet telemetry into `metrics.sqlite`.
 //!
 //! The ingest REPLACES a window's aggregates instead of adding to them, so a
-//! replay is exact — it recovers rows a failed pass (or the pre-alpha.2 ingest
-//! bug) skipped, wherever the bucket still holds them. Data older than
+//! replay is exact — it recovers rows a failed pass skipped, wherever the
+//! bucket still holds them. Data older than
 //! `RUNNER_TELEMETRY_RETENTION_DAYS` has been pruned by celld and cannot be
 //! recovered.
 //!
@@ -26,8 +26,8 @@ use crate::host::metrics::now_us;
 
 const USAGE: &str = "usage: noite-runner telemetry reingest [--since <RFC3339|duration>] [--slug <slug>] [--no-wait] [--timeout <seconds>]
 
-Replays fleet telemetry into metrics.sqlite so rows a failed ingest pass (or the
-pre-alpha.2 ingest bug) skipped are recovered. The replay is exact: the ingest
+Replays fleet telemetry into metrics.sqlite so rows a failed ingest pass
+skipped are recovered. The replay is exact: the ingest
 replaces a window's aggregates, it never adds to them twice.
 
   --since <when>   RFC3339 timestamp, or a duration back from now (24h, 7d, 30m).

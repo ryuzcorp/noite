@@ -8,9 +8,10 @@
 #
 # Installs Docker when missing, writes /opt/noite/{compose.yaml,.env} with
 # generated secrets, opens 80/443 in ufw when it is active, starts the stack
-# and waits for /ready. Re-running it is the upgrade: compose.yaml and the
-# image are refreshed to the channel's newest release, .env (domain, secrets)
-# is kept, and any required setting it lacks gets the first-install default.
+# and waits for /ready. It installs a FRESH server only: alpha builds do not
+# upgrade between versions (the runner and the control D1 refuse a database
+# from another alpha). To move to a new alpha, uninstall (this wipes the
+# volumes) and run the installer again.
 #
 # On a host under 4 GB the installer also creates a 1-2 GB /noite.swap
 # swapfile (swappiness 10) as a safety net for a transient peak: the build
@@ -34,14 +35,8 @@
 #                      pins the newest release, pre-releases included)
 #   NOITE_REF          git ref the installer and compose.yaml come from (default: main)
 #   NOITE_DIR          install directory (default: /opt/noite)
-#   NOITE_YES=1        skip the upgrade confirmation (`bash -s install --yes`
-#                      does the same; NOITE_CONFIRM=1 is accepted too)
 #   NOITE_SWAP=0       do not create the small-host swapfile (default: on for
 #                      hosts under 4 GB with no swap)
-#
-# An upgrade whose image differs from the running container restarts the
-# runner and every tenant fleet: the installer says so and asks once (when it
-# has a terminal) before it recreates anything.
 #
 # Nothing runs before main on the last line, so a truncated download never
 # runs half an install.
@@ -56,13 +51,6 @@ NOITE_IMAGE_REPO="ghcr.io/ryuzcorp/noite"
 READY_TIMEOUT_S=600
 NOITE_SWAP="${NOITE_SWAP:-1}"
 MIN_MEM_MB=1900
-# 1 = skip the upgrade confirmation: --yes / -y, NOITE_YES=1, or
-# NOITE_CONFIRM=1 (the flag uninstall.sh uses for its own prompt).
-CONFIRM_SKIP=0
-if [[ "${NOITE_YES:-0}" = "1" || "${NOITE_CONFIRM:-0}" = "1" ]]; then
-  CONFIRM_SKIP=1
-fi
-
 if [[ -t 1 ]]; then
   BOLD=$'\e[1m' RED=$'\e[31m' GREEN=$'\e[32m' YELLOW=$'\e[33m' RESET=$'\e[0m'
 else
@@ -331,10 +319,9 @@ env_secret() {
 }
 
 # Everything the runner needs to boot on a real domain, with the defaults a
-# first install writes. A re-run fills in what an older or hand-edited .env
-# lacks instead of leaving the runner to refuse its config; a value that is
-# set is never touched. A localhost .env is a dev setup that compose.yaml's
-# defaults already serve, so it is left alone.
+# fresh install writes; a value that is set is never touched. (No installer
+# re-run exists: alpha builds are fresh-install only.) A localhost .env is a
+# dev setup that compose.yaml's defaults already serve, so it is left alone.
 ensure_env_defaults() {
   ENV_ADDED=()
   # A `localhost`-family .env is a dev setup that compose.yaml's defaults
@@ -372,24 +359,11 @@ write_config() {
   install -m 0644 "$tmp" "$NOITE_DIR/compose.multi.yaml"
   rm -f "$tmp"
 
-  local fresh=0
   if [[ -f "$NOITE_DIR/.env" ]]; then
-    # The domain and secrets are fixed at first install: passkeys bind to
-    # BETTER_AUTH_URL and the bucket keys guard existing data. Only what is
-    # missing gets a default (ensure_env_defaults); a set value is kept.
-    DOMAIN=$(env_get BASE_DOMAIN)
-    if [[ -z "$DOMAIN" ]]; then
-      warn "$NOITE_DIR/.env has no BASE_DOMAIN; choosing one now"
-      choose_domain
-    elif [[ -n "${NOITE_DOMAIN:-}" && "$NOITE_DOMAIN" != "$DOMAIN" ]]; then
-      warn "keeping BASE_DOMAIN=$DOMAIN: changing it breaks every registered passkey (uninstall to start over)"
-    else
-      info "keeping .env (BASE_DOMAIN=$DOMAIN)"
-    fi
-  else
-    fresh=1
-    choose_domain
-    umask 077
+    die "Noite is already installed at $NOITE_DIR. Alpha builds do not upgrade between versions: uninstall it (this wipes its volumes) and run the installer again for a fresh install."
+  fi
+  choose_domain
+  umask 077
     cat >"$NOITE_DIR/.env" <<EOF
 # Written by install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ). Every variable is
 # documented in docker/compose.yaml and .env.example; apply changes with
@@ -401,9 +375,10 @@ write_config() {
 # bind to that origin. The RustFS keys guard the bundled bucket's data.
 #
 # Multi-tenant installs (letting other people push code) need
-# NOITE_TENANCY=multi plus the cgroup grant: re-run this installer after
-# setting it and the installer layers compose.multi.yaml on (single installs
-# need nothing). Without the grant a multi install stays at 503 on /ready.
+# NOITE_TENANCY=multi plus the cgroup grant: set it in the environment before
+# the first install and the installer layers compose.multi.yaml on (single
+# installs need nothing). Without the grant a multi install stays at 503 on
+# /ready.
 #NOITE_TENANCY=single
 # Lost-passkey sign-in codes are POSTed to this webhook as JSON; without it
 # nothing is emailed, and the operator recovers from the server with
@@ -412,12 +387,8 @@ write_config() {
 # NOITE_SMTP_FROM=Noite <no-reply@$DOMAIN>
 
 EOF
-    info "generating .env with fresh secrets (BASE_DOMAIN=$DOMAIN)"
-  fi
+  info "generating .env with fresh secrets (BASE_DOMAIN=$DOMAIN)"
   ensure_env_defaults
-  if [[ "$fresh" -eq 0 && ${#ENV_ADDED[@]} -gt 0 ]]; then
-    info "added the missing settings to .env: ${ENV_ADDED[*]}"
-  fi
   env_set NOITE_IMAGE "$NOITE_IMAGE_REPO:$NOITE_VERSION"
 
   if [[ -n "${NOITE_ADMIN_EMAIL:-}" ]]; then
@@ -442,53 +413,9 @@ open_firewall() {
   ufw allow 443/tcp >/dev/null
 }
 
-# An upgrade recreates the container only when the pulled image differs from
-# the one that is running: a re-run against the same tag changes nothing and
-# must not ask for anything.
-will_restart() {
-  local cid running target
-  cid=$(compose ps -q noite 2>/dev/null | head -n 1)
-  [[ -n "$cid" ]] || return 1
-  running=$(docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true)
-  target=$(docker image inspect --format '{{.Id}}' "$(env_get NOITE_IMAGE)" 2>/dev/null || true)
-  [[ -n "$running" && -n "$target" && "$running" != "$target" ]]
-}
-
-# One container runs the runner and every fleet, so replacing it restarts the
-# tenants with it. They cold-boot behind the edge (a request in that window is
-# held and served once the fleet is up — measured ~2-5 s for 5-15 apps on a
-# 32-core host; past the edge's 20 s hold a short "starting" page answers), and
-# the control UI is back within a few seconds. Say so before recreating, and
-# ask once when there is a terminal to ask on (`--yes` / `NOITE_YES=1` skips).
-confirm_upgrade() {
-  will_restart || return 0
-  local channel
-  channel="${NOITE_VERSION:-$(env_get NOITE_IMAGE)}"
-  if [[ "$CONFIRM_SKIP" -eq 1 ]]; then
-    warn "upgrade: the runner and every tenant fleet restart (target $channel)"
-    return 0
-  fi
-  if can_ask; then
-    warn "this upgrade recreates the container: the runner and every tenant fleet restart"
-    info "Tenant requests are held at the edge and served as each fleet cold-boots (a few seconds for"
-    info "most installs; past 20 s the app answers a short \"starting\" page that reloads itself)."
-    printf '    Upgrade to %s now? [y/N] ' "$channel" >/dev/tty
-    local answer=""
-    read -r answer </dev/tty || true
-    case "$answer" in
-      y | Y | yes | YES) return 0 ;;
-      *)
-        die "upgrade cancelled: nothing was recreated (the new image is pulled; re-run with --yes or NOITE_YES=1 to skip this prompt)"
-        ;;
-    esac
-  fi
-  warn "upgrade: the runner and every tenant fleet restart (target $channel); no terminal to confirm on (NOITE_YES=1 skips this warning)"
-}
-
 start_stack() {
   step "Starting Noite"
   compose pull --quiet
-  confirm_upgrade
   compose up -d --remove-orphans
 
   info "waiting for /ready (the first boot deploys the control UI; this can take a few minutes)"
@@ -543,22 +470,20 @@ https://app.$DOMAIN/account, or set NOITE_TELEMETRY=0 in $NOITE_DIR/.env and run
   Logs         cd $NOITE_DIR && docker compose$files logs -f
   $(recovery_note)
                either way, from this server: cd $NOITE_DIR && docker compose$files exec noite noite-runner recover
-  Upgrade      re-run this installer: a new image restarts the runner and every
-               app (it warns and asks first); read CHANGELOG.md's
-               "Operator action required" before you do
+  Upgrade      none in place: alpha builds do not migrate data. Uninstall
+               (this wipes the volumes), then run the installer again
   Docs         https://noite.now/self-hosting/install
 EOF
 }
 
 # `run.sh` passes through whatever follows `install` (it consumes --pre
-# itself, as NOITE_REF + NOITE_VERSION); only --yes is defined here.
+# itself, as NOITE_REF + NOITE_VERSION). The installer takes no flags.
 parse_args() {
   local arg
   for arg in "$@"; do
     case "$arg" in
-      --yes | -y) CONFIRM_SKIP=1 ;;
       "") ;;
-      *) warn "ignoring unknown argument \"$arg\" (only --yes is understood)" ;;
+      *) warn "ignoring unknown argument \"$arg\" (the installer takes no flags)" ;;
     esac
   done
 }
