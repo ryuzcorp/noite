@@ -410,19 +410,22 @@ pub async fn run_sandboxed(
         });
     // An operator stop must not wait out the step: race the token against
     // the child, kill its whole group, and let the pipeline record the
-    // failure. `kill_on_drop` alone only reaches the leader.
-    let result = match super::cancel::current() {
+    // failure. `kill_on_drop` alone only reaches the leader. The stop is
+    // carried out of the select as a value, never as a `bail!`, so the
+    // thrash watchdog is aborted and the group killed by the one shared
+    // cleanup below — a leaked watchdog would later `killpg` a recycled pid.
+    let (result, stopped) = match super::cancel::current() {
         Some(token) => tokio::select! {
-            r = tokio::time::timeout(timeout, child.wait_with_output()) => r,
-            () = token.cancelled() => {
-                #[cfg(unix)]
-                if let Some(pid) = pid {
-                    kill_group(pid);
-                }
-                bail!("cancelled by the operator");
-            }
+            r = tokio::time::timeout(timeout, child.wait_with_output()) => (r, false),
+            () = token.cancelled() => (
+                Ok(Err(std::io::Error::from(std::io::ErrorKind::Interrupted))),
+                true,
+            ),
         },
-        None => tokio::time::timeout(timeout, child.wait_with_output()).await,
+        None => (
+            tokio::time::timeout(timeout, child.wait_with_output()).await,
+            false,
+        ),
     };
     if let Some(watchdog) = watchdog {
         watchdog.abort();
@@ -437,6 +440,9 @@ pub async fn run_sandboxed(
         unsafe {
             libc::killpg(pid as i32, libc::SIGKILL);
         }
+    }
+    if stopped {
+        bail!("cancelled by the operator");
     }
     // The watchdog's kill is the build failing to make progress at its cap,
     // not a crash: name the budget and the two ways out, like the OOM case.
@@ -669,18 +675,21 @@ pub async fn run_cmd_output_stdin(
     // An operator stop must not wait out the step: race the token against
     // the child, kill its whole group, and let the pipeline record the
     // failure. `kill_on_drop` alone only reaches the leader.
-    let result = match super::cancel::current() {
+    // The stop leaves the select as a value (see `run_sandboxed`): the
+    // cleanup below kills the group and reaps the stdin writer, then the
+    // cancel line is the error.
+    let (result, stopped) = match super::cancel::current() {
         Some(token) => tokio::select! {
-            r = tokio::time::timeout(timeout, child.wait_with_output()) => r,
-            () = token.cancelled() => {
-                #[cfg(unix)]
-                if let Some(pid) = pid {
-                    kill_group(pid);
-                }
-                bail!("cancelled by the operator");
-            }
+            r = tokio::time::timeout(timeout, child.wait_with_output()) => (r, false),
+            () = token.cancelled() => (
+                Ok(Err(std::io::Error::from(std::io::ErrorKind::Interrupted))),
+                true,
+            ),
         },
-        None => tokio::time::timeout(timeout, child.wait_with_output()).await,
+        None => (
+            tokio::time::timeout(timeout, child.wait_with_output()).await,
+            false,
+        ),
     };
     // Whatever happened, nothing the step started may outlive it: the group
     // id is the child's pid (process_group(0)); ESRCH when the group is
@@ -689,7 +698,16 @@ pub async fn run_cmd_output_stdin(
     if let Some(pid) = pid {
         kill_group(pid);
     }
-    let output = result.context("command timeout")?.context("wait output")?;
+    let output = if stopped {
+        // The pipe is closed by the kill; the writer ends on its own, and an
+        // abort keeps it from outliving this call.
+        if let Some(writer) = writer {
+            writer.abort();
+        }
+        bail!("cancelled by the operator");
+    } else {
+        result.context("command timeout")?.context("wait output")?
+    };
     if let Some(writer) = writer {
         let _ = writer.await;
     }

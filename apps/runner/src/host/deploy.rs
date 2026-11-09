@@ -1557,6 +1557,9 @@ async fn deploy_inner(
         )
         .await?;
         probe_staged_generation(cfg, &celld, &staged, None, &mut *progress).await?;
+        // A stop in the probe window must not activate: the staged pointer is
+        // the last irreversible step before the fleet serves it.
+        progress.check_cancel()?;
         let stats =
             void_cohost::activate_staged(pool, &app.id, target.environment_id(), &celld, staged)
                 .await?;
@@ -1584,6 +1587,7 @@ async fn deploy_inner(
         .await?;
     }
 
+    progress.check_cancel()?;
     progress.step = "start";
     match &environment {
         Some(_) => {
@@ -1670,6 +1674,9 @@ async fn deploy_inner(
     // write below re-applies the same transition, but a client that waits
     // for the row (the CLI's push note, the UI, the e2e) must not reach the
     // edge before its table carries the new target and get "Starting".
+    // A stop that landed while the fleet came up must not take traffic: the
+    // row says failed and the previous generation keeps serving.
+    progress.check_cancel()?;
     route_live(pool, cfg, &app.id, target.environment_id(), &commit_sha).await?;
 
     // Per-deploy source maps for the Errors tab (symbolication at read
@@ -2000,6 +2007,7 @@ async fn probe_staged_generation(
     proxy_token: Option<&str>,
     progress: &mut Progress<'_>,
 ) -> anyhow::Result<()> {
+    progress.check_cancel()?;
     let path = cfg.deploy_probe_path.clone();
     if path.is_empty() {
         return Ok(());

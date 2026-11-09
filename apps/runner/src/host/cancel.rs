@@ -73,13 +73,21 @@ pub struct Cancels {
 }
 
 impl Cancels {
+    /// The map, surviving a poisoned lock: a panic while holding this tiny
+    /// section must not turn every later stop into a 500 (and a guard's drop
+    /// panicking during unwinding would abort the process), exactly like
+    /// `AppLock` in `deploy.rs`.
+    fn guard_map(&self) -> std::sync::MutexGuard<'_, HashMap<String, CancelHandle>> {
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A fresh token for `deploy_id`; the previous one (a finished run) is
     /// replaced.
     pub fn register(&self, deploy_id: &str) -> CancelHandle {
         let token: CancelHandle = Arc::new(Cancel::new());
-        self.live
-            .lock()
-            .expect("cancel registry poisoned")
+        self.guard_map()
             .insert(deploy_id.to_string(), token.clone());
         token
     }
@@ -87,22 +95,14 @@ impl Cancels {
     /// Drop the token once the run ends: a later stop of the same row is
     /// then answered from the database, not by tripping a dead token.
     pub fn release(&self, deploy_id: &str) {
-        self.live
-            .lock()
-            .expect("cancel registry poisoned")
-            .remove(deploy_id);
+        self.guard_map().remove(deploy_id);
     }
 
     /// Trip the live token for `deploy_id`. `false` = no run is registered
     /// (finished, or the runner restarted), so the caller decides from the
     /// row's status.
     pub fn cancel(&self, deploy_id: &str) -> bool {
-        let token = self
-            .live
-            .lock()
-            .expect("cancel registry poisoned")
-            .get(deploy_id)
-            .cloned();
+        let token = self.guard_map().get(deploy_id).cloned();
         match token {
             Some(token) => {
                 token.trip();
