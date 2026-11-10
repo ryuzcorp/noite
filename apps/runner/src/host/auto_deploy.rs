@@ -6,8 +6,8 @@
 //! sha stop. A new sha (push) or an explicit deploy (Deploy/Redeploy/Rollback
 //! from the UI, the CLI or MCP — also how a build-affecting settings change
 //! lands) resets it. The state is [`crate::models::AutoDeploy`], whose doc
-//! carries the full
-//! transition diagram; this module owns the one transition function
+//! carries the full transition diagram; this module owns the one transition
+//! function
 //! ([`step`]), the fold over the persisted rows ([`evaluate`]) and the query
 //! that feeds it ([`for_target`]).
 //!
@@ -30,7 +30,7 @@
 use sqlx::SqlitePool;
 
 use crate::db;
-use crate::models::{AutoDeploy, DeployIntent, DeployStatus};
+use crate::models::{App, AutoDeploy, DeployIntent, DeployStatus, Environment};
 
 /// One persisted deploy row's contribution to the machine: the three columns
 /// the rule reads, never the log.
@@ -112,11 +112,64 @@ pub async fn for_target(
     app_id: &str,
     environment_id: Option<&str>,
 ) -> sqlx::Result<AutoDeploy> {
+    // The query answers newest first; the machine folds oldest first.
     let rows = db::auto_deploy_rows(pool, app_id, environment_id)
         .await?
         .into_iter()
-        .map(Outcome::new);
+        .map(Outcome::new)
+        .rev();
     Ok(evaluate(rows))
+}
+
+/// Fill each app's production state, one bounded query per app, all in flight
+/// at once: `apps.list` annotates every row on a page load, and a serial loop
+/// made that one round-trip per app.
+pub async fn annotate_apps(pool: &SqlitePool, apps: &mut [App]) {
+    let states =
+        futures::future::join_all(apps.iter().map(|app| for_target(pool, &app.id, None))).await;
+    for (app, state) in apps.iter_mut().zip(states) {
+        fill(&mut app.auto_deploy, state, &app.id);
+    }
+}
+
+/// Fill each environment's own state; a preview's budget is its own.
+pub async fn annotate_environments(pool: &SqlitePool, envs: &mut [Environment]) {
+    let states = futures::future::join_all(
+        envs.iter()
+            .map(|env| for_target(pool, &env.app_id, Some(&env.id))),
+    )
+    .await;
+    for (env, state) in envs.iter_mut().zip(states) {
+        fill(&mut env.auto_deploy, state, &env.id);
+    }
+}
+
+/// Fill one `AppStateFrame`'s app and environments (the SSE path): the frame
+/// is rebuilt every two seconds, so the targets are read concurrently.
+pub async fn annotate_frame(pool: &SqlitePool, app: &mut App, envs: &mut [Environment]) {
+    let states = futures::future::join_all(
+        std::iter::once(for_target(pool, &app.id, None)).chain(
+            envs.iter()
+                .map(|env| for_target(pool, &env.app_id, Some(&env.id))),
+        ),
+    )
+    .await;
+    let mut states = states.into_iter();
+    if let Some(state) = states.next() {
+        fill(&mut app.auto_deploy, state, &app.id);
+    }
+    for (env, state) in envs.iter_mut().zip(states) {
+        fill(&mut env.auto_deploy, state, &env.id);
+    }
+}
+
+/// A read failure must not hide the rest of the row (the automatic gate
+/// re-reads the same rows before it deploys anything).
+fn fill(state: &mut AutoDeploy, read: sqlx::Result<AutoDeploy>, target: &str) {
+    match read {
+        Ok(auto) => *state = auto,
+        Err(e) => tracing::warn!(target = %target, error = %e, "auto deploy state"),
+    }
 }
 
 /// Record the tenant-visible `deploy` event at the moment the budget runs out:

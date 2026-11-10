@@ -105,21 +105,27 @@ const TARGET_CLAUSE: &str = "environment_id IS ?";
 /// still be the reason a tip is blocked.
 const AUTO_DEPLOY_ROWS: i64 = 50;
 
-/// The newest deploy rows of one target, oldest first: the input of
-/// [`crate::host::auto_deploy::evaluate`]. Only the three columns the rule
-/// reads are selected — never the build logs.
+/// The budget's read, its parameters bound in order: `app_id`,
+/// `environment_id`, limit. The window is served by
+/// `idx_deploy_target_created` (app, target, newest first) with no sort — the
+/// test below pins that plan.
+fn auto_deploy_sql() -> String {
+    format!(
+        "SELECT sha, status, intent FROM deploy \
+         WHERE app_id = ? AND {TARGET_CLAUSE} \
+         ORDER BY created_at DESC, rowid DESC LIMIT ?"
+    )
+}
+
+/// The newest deploy rows of one target, newest first (the caller reverses
+/// them for [`crate::host::auto_deploy::evaluate`]). Only the three columns
+/// the rule reads are selected — never the build logs.
 pub async fn auto_deploy_rows(
     pool: &SqlitePool,
     app_id: &str,
     environment_id: Option<&str>,
 ) -> sqlx::Result<Vec<(Option<String>, DeployStatus, DeployIntent)>> {
-    let sql = format!(
-        "SELECT sha, status, intent FROM (SELECT sha, status, intent, created_at, rowid AS seq \
-         FROM deploy WHERE app_id = ? AND {TARGET_CLAUSE} \
-         ORDER BY created_at DESC, rowid DESC LIMIT ?) \
-         ORDER BY created_at ASC, seq ASC"
-    );
-    sqlx::query_as(sqlx::AssertSqlSafe(sql))
+    sqlx::query_as(sqlx::AssertSqlSafe(auto_deploy_sql()))
         .bind(app_id)
         .bind(environment_id)
         .bind(AUTO_DEPLOY_ROWS)
@@ -942,5 +948,51 @@ mod tests {
                 .expect("second sweep"),
             0
         );
+    }
+
+    /// The budget's read must not scan and sort an app's whole deploy history:
+    /// `idx_deploy_target_created` serves the target filter and the newest-first
+    /// window. Without it, every annotated page load and every automatic deploy
+    /// paid for the history.
+    #[tokio::test]
+    async fn the_auto_deploy_read_uses_the_target_index() {
+        let pool = crate::db::connect("sqlite::memory:")
+            .await
+            .expect("memory db");
+        let app = seed_app(&pool, "budget-plan").await;
+        for sha in ["sha1", "sha2", "sha3"] {
+            upsert_deploy(
+                &pool,
+                None,
+                &app.id,
+                None,
+                DeployStatus::Failed,
+                Some(sha),
+                "boom",
+            )
+            .await
+            .expect("seed deploy");
+        }
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {}",
+            auto_deploy_sql().replace('?', "NULL")
+        )))
+        .fetch_all(&pool)
+        .await
+        .expect("explain");
+        let detail = plan
+            .iter()
+            .map(|(_, _, _, detail)| detail.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            detail.contains("idx_deploy_target_created"),
+            "the budget read must use the target index, plan was: {detail}"
+        );
+        assert!(
+            !detail.contains("USE TEMP B-TREE"),
+            "no sort: the index carries newest-first order, plan was: {detail}"
+        );
+        pool.close().await;
     }
 }

@@ -15,7 +15,7 @@ use sqlx::SqliteConnection;
 pub const FIRST_COMPACTED_VERSION: i64 = 100;
 
 /// Version a database has after every migration ran.
-pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 1;
+pub const SCHEMA_VERSION: i64 = FIRST_COMPACTED_VERSION + 2;
 
 /// One upgrade step: the statements that take a database from `version - 1`
 /// to `version`. Empty at the compacted baseline; append above it to change
@@ -26,13 +26,23 @@ pub struct Migration {
 }
 
 /// Steps above the baseline, ascending and contiguous.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    // 101: why a deploy ran (`DeployIntent`). Every existing row is a plain
-    // deploy — the column's default says so — and the API serves the field
-    // from then on.
-    version: FIRST_COMPACTED_VERSION + 1,
-    sql: "ALTER TABLE main.deploy ADD COLUMN intent TEXT NOT NULL DEFAULT 'deploy';",
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        // 101: why a deploy ran (`DeployIntent`). Every existing row is a
+        // plain deploy — the column's default says so — and the API serves
+        // the field from then on.
+        version: FIRST_COMPACTED_VERSION + 1,
+        sql: "ALTER TABLE main.deploy ADD COLUMN intent TEXT NOT NULL DEFAULT 'deploy';",
+    },
+    Migration {
+        // 102: the automatic-deploy budget reads one target's newest rows on
+        // every annotate and before every automatic deploy. Without this
+        // index that is a scan + sort of the app's whole history.
+        version: FIRST_COMPACTED_VERSION + 2,
+        sql: "CREATE INDEX IF NOT EXISTS main.idx_deploy_target_created \
+              ON deploy(app_id, environment_id, created_at);",
+    },
+];
 
 /// What boot must do to bring a database to the latest version.
 #[derive(Debug, PartialEq, Eq)]
@@ -237,6 +247,38 @@ mod tests {
         assert_eq!(columns, 1);
     }
 
+    /// The 102 step adds the budget's covering index to a stamped database.
+    #[tokio::test]
+    async fn the_budget_index_step_upgrades_a_stamped_database() {
+        let mut conn = memory().await;
+        sqlx::raw_sql(
+            "CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT); \
+             CREATE TABLE main.deploy (id TEXT PRIMARY KEY, app_id TEXT, environment_id TEXT, \
+                                       sha TEXT, status TEXT, intent TEXT, created_at TEXT); \
+             PRAGMA main.user_version = 101;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed a 101 database");
+        apply(
+            &mut conn,
+            "CREATE TABLE IF NOT EXISTS main.app (id TEXT PRIMARY KEY, slug TEXT);",
+            SCHEMA_VERSION,
+            MIGRATIONS,
+        )
+        .await
+        .expect("migrate forward");
+        assert_eq!(version(&mut conn).await, SCHEMA_VERSION);
+        let found: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM main.sqlite_master WHERE type = 'index' \
+             AND name = 'idx_deploy_target_created'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("index lookup");
+        assert_eq!(found, 1);
+    }
+
     /// The 101 step is the live one: a database stamped at the previous
     /// baseline gains `deploy.intent`, and every row it already holds reads
     /// `deploy` (the column default), so no backfill is needed.
@@ -244,8 +286,9 @@ mod tests {
     async fn the_intent_step_upgrades_a_stamped_database() {
         let mut conn = memory().await;
         sqlx::raw_sql(
-            "CREATE TABLE main.deploy (id TEXT PRIMARY KEY, status TEXT NOT NULL); \
-             INSERT INTO main.deploy (id, status) VALUES ('d1', 'failed'); \
+            "CREATE TABLE main.deploy (id TEXT PRIMARY KEY, app_id TEXT, environment_id TEXT, \
+                                      sha TEXT, status TEXT NOT NULL, created_at TEXT); \
+             INSERT INTO main.deploy (id, app_id, status) VALUES ('d1', 'a1', 'failed'); \
              CREATE TABLE main.app (id TEXT PRIMARY KEY, slug TEXT); \
              PRAGMA main.user_version = 100;",
         )

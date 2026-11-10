@@ -100,6 +100,10 @@ CREATE TABLE IF NOT EXISTS deploy (
 
 CREATE INDEX IF NOT EXISTS idx_deploy_app ON deploy(app_id);
 CREATE INDEX IF NOT EXISTS idx_deploy_environment ON deploy(environment_id);
+-- The automatic-deploy budget reads the newest rows of one target on every
+-- annotate and before every automatic deploy: (app, target, newest first).
+CREATE INDEX IF NOT EXISTS idx_deploy_target_created
+  ON deploy(app_id, environment_id, created_at);
 
 -- Per-app usage metrics, edge analytics, span stats, log ring, errors,
 -- watermarks and compaction state live in metrics.sqlite

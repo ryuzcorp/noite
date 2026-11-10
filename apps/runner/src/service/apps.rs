@@ -40,14 +40,7 @@ async fn with_hold(state: &AppState, mut app: App) -> App {
 
 /// Fill each app's automatic-deploy state from its production deploy rows.
 async fn annotate_auto_deploy(state: &AppState, apps: &mut [App]) {
-    for app in apps {
-        match crate::host::auto_deploy::for_target(&state.pool, &app.id, None).await {
-            Ok(auto) => app.auto_deploy = auto,
-            // A read failure must not hide the rest of the row; the automatic
-            // gate re-reads the same rows before it deploys anything.
-            Err(e) => tracing::warn!(app_id = %app.id, error = %e, "auto deploy state"),
-        }
-    }
+    crate::host::auto_deploy::annotate_apps(&state.pool, apps).await;
 }
 
 /// The single "load the app or answer 404" helper every domain uses, so the

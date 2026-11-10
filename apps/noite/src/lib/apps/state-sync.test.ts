@@ -99,6 +99,30 @@ describe("staleKeys", () => {
     ]);
   });
 
+  test("a paused automatic budget makes the detail stale so the line appears live", () => {
+    expect(
+      staleKeys(
+        "app_1",
+        frame({
+          autoDeploy: { failures: 2, sha: "aaa111", state: "exhausted" },
+        }),
+        detail(),
+        [env()]
+      )
+    ).toEqual([keys.appDetail("app_1")]);
+  });
+
+  test("an environment's paused budget repaints its group", () => {
+    expect(
+      staleKeys(
+        "app_1",
+        frame({}, [env({ autoDeploy: { sha: "bbb222", state: "stopped" } })]),
+        detail(),
+        [env()]
+      )
+    ).toEqual([keys.environments("app_1")]);
+  });
+
   test("a stop or a sleep shows too, not only a deploy", () => {
     expect(
       staleKeys("app_1", frame({ desiredState: "stopped" }), detail(), [env()])

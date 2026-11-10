@@ -250,41 +250,83 @@ pub async fn app_state_stream(State(state): State<AppState>, Path(id): Path<Stri
         let pool = pool.clone();
         let procs = procs.clone();
         let app_id = app_id.clone();
-        async move {
-            // A deleted app has nothing left to show: skip the tick, the page
-            // that holds the stream navigates away.
-            let mut app = match db::get_app(&pool, &app_id).await {
-                Ok(Some(app)) => app,
-                Ok(None) => return None,
-                Err(e) => {
-                    tracing::warn!(error = %e, "state stream: skipping failed snapshot");
-                    return None;
-                }
-            };
-            // The frame carries the hold too, so a badge that flips to
-            // "crashed, retrying" no longer waits for a refetch.
-            crate::host::supervisor::annotate_holds(&procs, std::slice::from_mut(&mut app)).await;
-            let environments = match db::list_environments(&pool, &app_id).await {
-                Ok(rows) => rows,
-                Err(e) => {
-                    tracing::warn!(error = %e, "state stream: skipping failed snapshot");
-                    return None;
-                }
-            };
-            match serde_json::to_string(&AppStateFrame { app, environments }) {
-                Ok(json) => Some(json),
-                Err(e) => {
-                    tracing::warn!(error = %e, "state stream: dropping unserializable snapshot");
-                    None
-                }
-            }
-        }
+        async move { state_frame(&pool, &procs, &app_id).await }
     })
+}
+
+/// One `AppStateFrame`, serialized, with every derived field filled: the
+/// fleet hold and the automatic-deploy budget (the same annotations REST and
+/// RPC serve, so a frame never reports `eligible` while a deploy is paused).
+/// `None` when the app row is gone or the snapshot failed; the page that
+/// holds the stream navigates away or keeps the previous frame.
+async fn state_frame(
+    pool: &sqlx::SqlitePool,
+    procs: &crate::host::supervisor::ProcMap,
+    app_id: &str,
+) -> Option<String> {
+    let mut app = match db::get_app(pool, app_id).await {
+        Ok(Some(app)) => app,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(error = %e, "state stream: skipping failed snapshot");
+            return None;
+        }
+    };
+    // The frame carries the hold too, so a badge that flips to
+    // "crashed, retrying" no longer waits for a refetch.
+    crate::host::supervisor::annotate_holds(procs, std::slice::from_mut(&mut app)).await;
+    let mut environments = match db::list_environments(pool, app_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "state stream: skipping failed snapshot");
+            return None;
+        }
+    };
+    crate::host::auto_deploy::annotate_frame(pool, &mut app, &mut environments).await;
+    match serde_json::to_string(&AppStateFrame { app, environments }) {
+        Ok(json) => Some(json),
+        Err(e) => {
+            tracing::warn!(error = %e, "state stream: dropping unserializable snapshot");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The state stream feeds every live badge and the Deployments pause line:
+    /// a frame built without the automatic-deploy annotation reported
+    /// `eligible` while the deploy history said the sha was paused.
+    #[tokio::test]
+    async fn a_state_frame_carries_the_auto_deploy_pause() {
+        let h = crate::api::tests::Harness::new().await;
+        let app = h.seed_app("paused-frame").await;
+        for _ in 0..2 {
+            crate::db::upsert_deploy(
+                &h.state.pool,
+                None,
+                &app.id,
+                None,
+                crate::models::DeployStatus::Failed,
+                Some("sha1"),
+                "boom",
+            )
+            .await
+            .expect("failed deploy");
+        }
+
+        let json = state_frame(&h.state.pool, &h.state.procs, &app.id)
+            .await
+            .expect("frame");
+        let frame: serde_json::Value = serde_json::from_str(&json).expect("frame json");
+        assert_eq!(
+            frame["app"]["autoDeploy"],
+            serde_json::json!({ "state": "exhausted", "sha": "sha1", "failures": 2 })
+        );
+        h.finish().await;
+    }
 
     #[test]
     fn tripped_containment_blocks_multi_but_warns_single() {
