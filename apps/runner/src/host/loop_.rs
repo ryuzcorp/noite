@@ -216,9 +216,16 @@ async fn reconcile_once(
     for app in &apps {
         if app.desired() == DesiredState::Stopped {
             supervisor::stop_fleet(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
-            if app.status != AppStatus::Stopped.as_str() {
-                db::update_app_status(pool, &app.id, AppStatus::Stopped.as_str(), None, None)
-                    .await?;
+            if app.status != AppStatus::Stopped {
+                db::write_app_status(
+                    pool,
+                    &app.id,
+                    AppStatus::Stopped,
+                    None,
+                    None,
+                    crate::models::WriteGuard::Table,
+                )
+                .await?;
             }
             continue;
         }
@@ -227,6 +234,13 @@ async fn reconcile_once(
         // Asleep apps stay parked: the next request wakes them through the
         // edge (host/sleep.rs), and respawning here would undo the sleep.
         if app.listen_port.is_some() && app.is_deployed() && !app.is_asleep() {
+            // `apps` is a snapshot from the top of this tick: a delete (or a
+            // rename) may have moved on since, and spawning from the stale row
+            // would resurrect a fleet the delete already stopped — under a slug
+            // it is about to free. Re-read immediately before the spawn.
+            if !still_wanted(pool, &app.id).await? {
+                continue;
+            }
             let cold = !supervisor::has_process(procs, &app.slug).await;
             if cold {
                 if cold_starts >= cfg.fleet_spawn_batch {
@@ -242,7 +256,7 @@ async fn reconcile_once(
                     // flip only while still wanted, so a stop in the window
                     // wins. Without any confirm, start/resume would leave the
                     // stop-time status stuck until the next deploy flips it.
-                    if app.status != AppStatus::Running.as_str() {
+                    if app.status != AppStatus::Running {
                         if let Some(port) = app.listen_port {
                             let (pool, cfg, confirming) =
                                 (pool.clone(), cfg.clone(), confirming.clone());
@@ -263,7 +277,15 @@ async fn reconcile_once(
                 Err(e) => {
                     tracing::warn!(slug = %app.slug, error = %e, "ensure_fleet");
                     let msg = format!("{e:#}");
-                    db::update_app_status_if_wanted(pool, &app.id, &app.status, Some(&msg)).await?;
+                    db::write_app_status(
+                        pool,
+                        &app.id,
+                        app.status,
+                        Some(&msg),
+                        None,
+                        crate::models::WriteGuard::Wanted,
+                    )
+                    .await?;
                 }
             }
         }
@@ -300,13 +322,24 @@ async fn reconcile_once(
         let fleet = format!("{}.{}", env.app_slug, env.label);
         if env.is_stopped() || stopped_apps.contains(&env.app_id) {
             supervisor::stop_environment_fleet(procs, &env.app_slug, &env.label).await;
-            if env.is_stopped() && env.status != AppStatus::Stopped.as_str() {
-                db::update_environment_status(pool, &env.id, AppStatus::Stopped.as_str(), None)
-                    .await?;
+            if env.is_stopped() && env.status != AppStatus::Stopped {
+                db::write_environment_status(
+                    pool,
+                    &env.id,
+                    AppStatus::Stopped,
+                    None,
+                    crate::models::WriteGuard::Table,
+                )
+                .await?;
             }
             continue;
         }
         if env.listen_port.is_some() && env.is_deployed() && !env.is_asleep() {
+            // Same stale-snapshot rule as the app branch: the row may be gone
+            // (or being torn down) by the time this tick reaches it.
+            if !env_still_wanted(pool, env).await? {
+                continue;
+            }
             let cold = !supervisor::has_process(procs, &fleet).await;
             if cold {
                 if cold_starts >= cfg.fleet_spawn_batch {
@@ -317,7 +350,7 @@ async fn reconcile_once(
             match supervisor::ensure_environment_fleet(pool, cfg, procs, logs, env).await {
                 Ok(()) => {
                     // Same truthful order as the app branch above.
-                    if env.status != AppStatus::Running.as_str() {
+                    if env.status != AppStatus::Running {
                         if let Some(port) = env.listen_port {
                             let (pool, cfg, confirming) =
                                 (pool.clone(), cfg.clone(), confirming.clone());
@@ -338,8 +371,14 @@ async fn reconcile_once(
                 Err(e) => {
                     tracing::warn!(fleet = %fleet, error = %e, "ensure_environment_fleet");
                     let msg = format!("{e:#}");
-                    db::update_environment_status_if_wanted(pool, &env.id, &env.status, Some(&msg))
-                        .await?;
+                    db::write_environment_status(
+                        pool,
+                        &env.id,
+                        env.status,
+                        Some(&msg),
+                        crate::models::WriteGuard::Wanted,
+                    )
+                    .await?;
                 }
             }
         }
@@ -428,6 +467,32 @@ async fn sweep_expired_environments(
     }
 }
 
+/// Whether the row this tick snapshotted still wants a fleet: the app exists,
+/// is not being deleted, and still desires to run. Re-read per spawn so a
+/// delete that landed mid-tick is not undone by a stale snapshot.
+async fn still_wanted(pool: &SqlitePool, app_id: &str) -> sqlx::Result<bool> {
+    if crate::service::apps::deleting(app_id) {
+        return Ok(false);
+    }
+    Ok(db::get_app(pool, app_id)
+        .await?
+        .is_some_and(|row| row.desired() == DesiredState::Running))
+}
+
+/// Same stale-snapshot rule for one preview environment: its own row is
+/// the authority (a teardown removes it), and its app must still want a fleet.
+async fn env_still_wanted(
+    pool: &SqlitePool,
+    env: &crate::models::Environment,
+) -> sqlx::Result<bool> {
+    if crate::service::apps::deleting(&env.app_id) {
+        return Ok(false);
+    }
+    Ok(db::get_environment(pool, &env.id)
+        .await?
+        .is_some_and(|row| row.desired() == DesiredState::Running))
+}
+
 /// True while a recent deploy row is still in flight (T1.6's log-free check):
 /// neither the channel drain nor the fallback sweep may start a second deploy
 /// over it. DB errors read as "busy" — a deploy storm on a sick database is
@@ -437,10 +502,7 @@ async fn app_has_in_flight(pool: &SqlitePool, app_id: &str) -> bool {
         return true;
     };
     recent.iter().any(|(status, updated_at)| {
-        let Some(st) = crate::models::DeployStatus::parse(status) else {
-            return false;
-        };
-        if !st.is_in_flight() {
+        if !status.is_in_flight() {
             return false;
         }
         crate::models::parse_time(updated_at)
@@ -456,10 +518,7 @@ async fn env_has_in_flight(pool: &SqlitePool, environment_id: &str) -> bool {
         return true;
     };
     recent.iter().any(|(status, updated_at)| {
-        let Some(st) = crate::models::DeployStatus::parse(status) else {
-            return false;
-        };
-        if !st.is_in_flight() {
+        if !status.is_in_flight() {
             return false;
         }
         crate::models::parse_time(updated_at)
@@ -562,6 +621,63 @@ fn spawn_tip_deploy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tick's `apps` snapshot can be older than the delete that landed in
+    /// the middle of it: `still_wanted` re-reads the row (and the delete
+    /// registry) right before the spawn, so a stale snapshot cannot resurrect
+    /// a fleet the delete already stopped.
+    #[tokio::test]
+    async fn a_stale_row_snapshot_does_not_want_a_fleet() {
+        let cfg = crate::config::config_for_tests();
+        let pool = db::connect("sqlite::memory:").await.expect("memory db");
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "stale",
+                slug: "stale",
+                user_id: "local",
+                subdomain: "stale.localhost",
+                listen: 30400,
+                internal: 30401,
+            },
+        )
+        .await
+        .expect("app");
+        assert!(still_wanted(&pool, &app.id).await.expect("live row"));
+
+        // A delete in progress (the row is still there for a moment).
+        assert!(crate::service::apps::deleting_claim_for_test(&app.id));
+        assert!(
+            !still_wanted(&pool, &app.id).await.expect("deleting"),
+            "a deleting app wants no fleet"
+        );
+        crate::service::apps::deleting_release_for_test(&app.id);
+
+        // The row is gone.
+        db::delete_app(&pool, &app.id).await.expect("delete");
+        assert!(!still_wanted(&pool, &app.id).await.expect("gone"));
+
+        // An operator stop.
+        let app = db::create_app(
+            &pool,
+            &cfg,
+            db::NewApp {
+                name: "parked",
+                slug: "parked",
+                user_id: "local",
+                subdomain: "parked.localhost",
+                listen: 30402,
+                internal: 30403,
+            },
+        )
+        .await
+        .expect("app");
+        db::patch_app_desired(&pool, &app.id, DesiredState::Stopped)
+            .await
+            .expect("stop");
+        assert!(!still_wanted(&pool, &app.id).await.expect("stopped"));
+    }
 
     /// The expiry sweep removes workspace previews with no deploy for the TTL
     /// and never touches a branch environment (ROADMAP, lifecycle).

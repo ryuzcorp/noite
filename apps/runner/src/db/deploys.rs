@@ -4,18 +4,48 @@
 //! environment. The two never share state: a production deploy writes
 //! `app.last_deploy_sha` and the app's status, an environment deploy writes
 //! the environment's own row.
+//!
+//! One row's lifecycle is [`crate::models::DeployStatus`]:
+//!
+//! ```mermaid
+//! stateDiagram-v2
+//!   [*] --> Queued: caller pre-creates the row (rollback, env deploy)
+//!   [*] --> Building: a background tip deploy creates its own row
+//!   Queued --> Building: the pipeline's first step
+//!   Queued --> Deploying: a step that stages straight away
+//!   Building --> Deploying: stage/activate phase
+//!   Building --> Success: deploy live
+//!   Deploying --> Success: deploy live
+//!   Queued --> Failed: claim timeout, operator stop
+//!   Building --> Failed: step failure, stall, operator stop
+//!   Deploying --> Failed: step failure, stall, operator stop
+//! ```
+//!
+//! `success` and `failed` are terminal: `upsert_deploy` carries the table as
+//! `status IN (…)`, so a late log line, a stalled-sweep or a second stop is
+//! refused instead of rewriting a finished row.
 
 use std::collections::HashSet;
 
 use sqlx::SqlitePool;
 
-use crate::models::{new_id, now_iso, AppStatus, Deploy};
+use crate::models::{
+    new_id, now_iso, AppStatus, Deploy, DeployStatus, DeployWrite, StatusWrite, WriteGuard,
+};
 
-use super::apps::{record_app_deploy_sha, update_app_status_if_wanted};
-use super::environments::{mark_environment_deployed, update_environment_status_if_wanted};
+use super::apps::{record_app_deploy_sha, status_list, write_app_status};
+use super::environments::{mark_environment_deployed, write_environment_status};
 
 /// Columns every `deploy` query selects, in [`Deploy`] order.
 const DEPLOY_COLS: &str = "id, app_id, environment_id, sha, status, log, created_at, updated_at";
+
+/// The only states a running deploy can be closed from (the terminal writers:
+/// stop endpoint, stall sweep, the run itself).
+const IN_FLIGHT: &[DeployStatus] = &[
+    DeployStatus::Queued,
+    DeployStatus::Building,
+    DeployStatus::Deploying,
+];
 
 /// Newest deploy rows without their build logs: what the reconcile loop
 /// needs for the in-flight check (T1.6). `list_deploys` drags 20 full
@@ -25,8 +55,8 @@ const DEPLOY_COLS: &str = "id, app_id, environment_id, sha, status, log, created
 pub async fn latest_deploy_status(
     pool: &SqlitePool,
     app_id: &str,
-) -> sqlx::Result<Vec<(String, String)>> {
-    sqlx::query_as::<_, (String, String)>(
+) -> sqlx::Result<Vec<(DeployStatus, String)>> {
+    sqlx::query_as::<_, (DeployStatus, String)>(
         r#"SELECT status, updated_at FROM deploy
            WHERE app_id = ? AND environment_id IS NULL
            ORDER BY created_at DESC LIMIT 5"#,
@@ -41,8 +71,8 @@ pub async fn latest_deploy_status(
 pub async fn latest_deploy_status_for_env(
     pool: &SqlitePool,
     environment_id: &str,
-) -> sqlx::Result<Vec<(String, String)>> {
-    sqlx::query_as::<_, (String, String)>(
+) -> sqlx::Result<Vec<(DeployStatus, String)>> {
+    sqlx::query_as::<_, (DeployStatus, String)>(
         r#"SELECT status, updated_at FROM deploy
            WHERE environment_id = ? ORDER BY created_at DESC LIMIT 5"#,
     )
@@ -125,10 +155,12 @@ pub async fn mark_deploy_cancelled(
     app_id: &str,
     deploy_id: &str,
 ) -> sqlx::Result<bool> {
-    let res = sqlx::query(
-        "UPDATE deploy SET status = 'failed', log = log || ?, updated_at = ? \
-         WHERE id = ? AND app_id = ? AND status IN ('queued', 'building', 'deploying')",
-    )
+    let res = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE deploy SET status = ?, log = log || ?, updated_at = ? \
+         WHERE id = ? AND app_id = ? AND status IN ({})",
+        status_list(IN_FLIGHT),
+    )))
+    .bind(DeployStatus::Failed.as_str())
     .bind(format!("ERROR: {}\n", crate::host::cancel::CANCELLED))
     .bind(now_iso())
     .bind(deploy_id)
@@ -167,36 +199,51 @@ pub async fn get_success_deploy(
 ) -> sqlx::Result<Option<Deploy>> {
     let sql = format!(
         "SELECT {DEPLOY_COLS} FROM deploy \
-         WHERE app_id = ? AND sha = ? AND status = 'success' AND {TARGET_CLAUSE} \
+         WHERE app_id = ? AND sha = ? AND status = ? AND {TARGET_CLAUSE} \
          ORDER BY created_at DESC LIMIT 1"
     );
     sqlx::query_as::<_, Deploy>(sqlx::AssertSqlSafe(sql))
         .bind(app_id)
         .bind(sha)
+        .bind(DeployStatus::Success.as_str())
         .bind(environment_id)
         .fetch_optional(pool)
         .await
+}
+
+/// What one [`upsert_deploy`] did: the row's id, whether the write landed,
+/// and — when it did not — the terminal status that closed the row first.
+pub struct DeployUpsert {
+    pub id: String,
+    pub outcome: DeployWrite,
 }
 
 /// Create or continue one deploy row. `environment_id = None` keeps the
 /// production transitions (app status + `app.last_deploy_sha`); a preview
 /// deploy writes the environment's status, sha and error instead, so it can
 /// never move the app's.
+///
+/// The status write carries [`DeployStatus::predecessors`] as
+/// `status IN (…)`, so a run whose row was closed as `failed` by the stall
+/// sweep or the stop endpoint cannot resurrect it as `building`: the write is
+/// refused, the log line is not appended, and the caller learns which
+/// terminal status won.
 pub async fn upsert_deploy(
     pool: &SqlitePool,
     id: Option<&str>,
     app_id: &str,
     environment_id: Option<&str>,
-    status: &str,
+    status: DeployStatus,
     sha: Option<&str>,
     append_log: &str,
-) -> sqlx::Result<String> {
+) -> sqlx::Result<DeployUpsert> {
     let ts = now_iso();
     if let Some(id) = id {
         if let Some(existing) = sqlx::query_as::<_, Deploy>(sqlx::AssertSqlSafe(format!(
-            "SELECT {DEPLOY_COLS} FROM deploy WHERE id = ?"
+            "SELECT {DEPLOY_COLS} FROM deploy WHERE id = ? AND app_id = ?"
         )))
         .bind(id)
+        .bind(app_id)
         .fetch_optional(pool)
         .await?
         {
@@ -204,18 +251,37 @@ pub async fn upsert_deploy(
             // collapsible must stay cheap.
             let combined = format!("{}{append_log}", existing.log);
             let log = crate::lifecycle::tail_utf8(&combined, 64 * 1024).to_string();
-            sqlx::query(
-                "UPDATE deploy SET status = ?, sha = COALESCE(?, sha), log = ?, updated_at = ? WHERE id = ?",
-            )
-            .bind(status)
-            .bind(sha)
-            .bind(&log)
-            .bind(&ts)
-            .bind(id)
-            .execute(pool)
-            .await?;
+            let sql = format!(
+                "UPDATE deploy SET status = ?, sha = COALESCE(?, sha), log = ?, updated_at = ? \
+                 WHERE id = ? AND app_id = ? AND status IN ({})",
+                status_list(status.predecessors()),
+            );
+            let done = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(status.as_str())
+                .bind(sha)
+                .bind(&log)
+                .bind(&ts)
+                .bind(id)
+                .bind(app_id)
+                .execute(pool)
+                .await?;
+            if done.rows_affected() == 0 {
+                let current: Option<(DeployStatus,)> =
+                    sqlx::query_as("SELECT status FROM deploy WHERE id = ?")
+                        .bind(id)
+                        .fetch_optional(pool)
+                        .await?;
+                let current = current.map(|(status,)| status).unwrap_or(existing.status);
+                return Ok(DeployUpsert {
+                    id: id.to_string(),
+                    outcome: DeployWrite::Refused { current },
+                });
+            }
             apply_status(pool, app_id, environment_id, status, sha, append_log).await?;
-            return Ok(id.to_string());
+            return Ok(DeployUpsert {
+                id: id.to_string(),
+                outcome: DeployWrite::Applied,
+            });
         }
     }
     let id = new_id();
@@ -227,14 +293,17 @@ pub async fn upsert_deploy(
     .bind(app_id)
     .bind(environment_id)
     .bind(sha)
-    .bind(status)
+    .bind(status.as_str())
     .bind(append_log)
     .bind(&ts)
     .bind(&ts)
     .execute(pool)
     .await?;
     apply_status(pool, app_id, environment_id, status, sha, append_log).await?;
-    Ok(id)
+    Ok(DeployUpsert {
+        id,
+        outcome: DeployWrite::Applied,
+    })
 }
 
 /// The success transition of a deploy's target: the sha it now serves, and
@@ -253,10 +322,20 @@ pub async fn mark_deploy_live(
     match environment_id {
         // `mark_environment_deployed` records the sha unconditionally and
         // flips to running only while still wanted.
-        Some(environment_id) => mark_environment_deployed(pool, environment_id, sha).await,
+        Some(environment_id) => mark_environment_deployed(pool, environment_id, sha)
+            .await
+            .map(|_| ()),
         None => {
             record_app_deploy_sha(pool, app_id, sha).await?;
-            update_app_status_if_wanted(pool, app_id, AppStatus::Running.as_str(), None).await?;
+            write_app_status(
+                pool,
+                app_id,
+                AppStatus::Running,
+                None,
+                Some(sha),
+                WriteGuard::Wanted,
+            )
+            .await?;
             Ok(())
         }
     }
@@ -266,77 +345,77 @@ pub async fn mark_deploy_live(
 /// environment (preview). Every write is stop-race safe: the sha lands even
 /// when a stop raced the deploy, but `running`/`failed`/in-flight only apply
 /// while the target still wants to run — a stop (or delete) in the window
-/// must win over the deploy's status flip.
+/// must win over the deploy's status flip. The status itself is still the
+/// target machine's table, so an illegal move is refused there too.
 async fn apply_status(
     pool: &SqlitePool,
     app_id: &str,
     environment_id: Option<&str>,
-    status: &str,
+    status: DeployStatus,
     sha: Option<&str>,
     append_log: &str,
-) -> sqlx::Result<()> {
-    if status == "success" {
-        return match sha {
-            Some(sha) => mark_deploy_live(pool, app_id, environment_id, sha).await,
-            None => match environment_id {
-                Some(environment_id) => {
-                    update_environment_status_if_wanted(pool, environment_id, "running", None)
-                        .await
-                        .map(|_| ())
-                }
-                None => Ok(()),
-            },
-        };
-    }
-    let Some(environment_id) = environment_id else {
-        if status == "failed" {
-            update_app_status_if_wanted(
+) -> sqlx::Result<StatusWrite> {
+    match status {
+        DeployStatus::Success => match (sha, environment_id) {
+            (Some(sha), _) => mark_deploy_live(pool, app_id, environment_id, sha)
+                .await
+                .map(|()| StatusWrite::Applied),
+            (None, Some(environment_id)) => {
+                write_environment_status(
+                    pool,
+                    environment_id,
+                    AppStatus::Running,
+                    None,
+                    WriteGuard::Wanted,
+                )
+                .await
+            }
+            (None, None) => Ok(StatusWrite::Applied),
+        },
+        DeployStatus::Failed => {
+            write_target_status(
                 pool,
                 app_id,
-                AppStatus::Failed.as_str(),
+                environment_id,
+                AppStatus::Failed,
                 Some(append_log.trim()),
             )
-            .await?;
-        } else if status == "building" || status == "deploying" || status == "queued" {
-            // A queued deploy is work in flight for the app: the chip says
-            // building, exactly as the run that holds the claim does.
-            let chip = if status == "queued" {
-                "building"
-            } else {
-                status
-            };
-            update_app_status_if_wanted(pool, app_id, chip, None).await?;
+            .await
         }
-        return Ok(());
-    };
-    match status {
-        "failed" => {
-            update_environment_status_if_wanted(
-                pool,
-                environment_id,
-                AppStatus::Failed.as_str(),
-                Some(append_log.trim()),
-            )
-            .await?;
+        // A queued deploy is work in flight for the target: the chip says
+        // building, exactly as the run that holds the claim does.
+        DeployStatus::Queued | DeployStatus::Building => {
+            write_target_status(pool, app_id, environment_id, AppStatus::Building, None).await
         }
-        "queued" => {
-            update_environment_status_if_wanted(
-                pool,
-                environment_id,
-                AppStatus::Building.as_str(),
-                None,
-            )
-            .await?;
-        }
-        other => {
-            update_environment_status_if_wanted(pool, environment_id, other, None).await?;
+        DeployStatus::Deploying => {
+            write_target_status(pool, app_id, environment_id, AppStatus::Deploying, None).await
         }
     }
-    Ok(())
+}
+
+/// One chip write on the deploy's target: the app for production, the
+/// environment for a preview, always guarded by "still wants to run".
+async fn write_target_status(
+    pool: &SqlitePool,
+    app_id: &str,
+    environment_id: Option<&str>,
+    next: AppStatus,
+    last_error: Option<&str>,
+) -> sqlx::Result<StatusWrite> {
+    match environment_id {
+        Some(environment_id) => {
+            write_environment_status(pool, environment_id, next, last_error, WriteGuard::Wanted)
+                .await
+        }
+        None => write_app_status(pool, app_id, next, last_error, None, WriteGuard::Wanted).await,
+    }
 }
 
 /// Sweep deploys whose row has not moved since `older_than_ms`, marking them
-/// failed. A preview row marks its environment, never the app.
+/// failed. A preview row marks its environment, never the app. The row write
+/// is guarded by the transition table, so a row that another writer closed
+/// between the read and the update is left alone (and does not touch the
+/// target's status).
 pub async fn fail_stuck_deploys(
     pool: &SqlitePool,
     older_than_ms: i64,
@@ -352,9 +431,7 @@ pub async fn fail_stuck_deploys(
         if skip_app_ids.contains(&row.app_id) {
             continue;
         }
-        let Some(st) = row.status_enum() else {
-            continue;
-        };
+        let st = row.status;
         if !st.is_in_flight() {
             continue;
         }
@@ -364,7 +441,7 @@ pub async fn fail_stuck_deploys(
         // A queued row is the bounded wait for the app's claim: it resolves
         // itself within `older_than_ms`, so only twice that is a stall.
         let limit = match st {
-            crate::models::DeployStatus::Queued => older_than_ms.saturating_mul(2),
+            DeployStatus::Queued => older_than_ms.saturating_mul(2),
             _ => older_than_ms,
         };
         if updated > utc_cutoff(limit) {
@@ -374,34 +451,31 @@ pub async fn fail_stuck_deploys(
             "{}ERROR: deploy stalled (host interrupted or timed out)\n",
             row.log
         );
-        sqlx::query("UPDATE deploy SET status = 'failed', log = ?, updated_at = ? WHERE id = ?")
+        let sql = format!(
+            "UPDATE deploy SET status = ?, log = ?, updated_at = ? \
+             WHERE id = ? AND status IN ({})",
+            status_list(IN_FLIGHT),
+        );
+        let closed = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(DeployStatus::Failed.as_str())
             .bind(&log)
             .bind(now_iso())
             .bind(&row.id)
             .execute(pool)
             .await?;
-        match row.environment_id.as_deref() {
-            Some(env_id) => {
-                // The row still records the stall, but a stop in the window
-                // keeps its status.
-                update_environment_status_if_wanted(
-                    pool,
-                    env_id,
-                    AppStatus::Failed.as_str(),
-                    Some("deploy stalled (host interrupted or timed out)"),
-                )
-                .await?;
-            }
-            None => {
-                update_app_status_if_wanted(
-                    pool,
-                    &row.app_id,
-                    AppStatus::Failed.as_str(),
-                    Some("deploy stalled (host interrupted or timed out)"),
-                )
-                .await?;
-            }
+        if closed.rows_affected() == 0 {
+            // Another writer (the stop endpoint, the run itself) got there
+            // first: its story stands, and the target keeps its status.
+            continue;
         }
+        write_target_status(
+            pool,
+            &row.app_id,
+            row.environment_id.as_deref(),
+            AppStatus::Failed,
+            Some("deploy stalled (host interrupted or timed out)"),
+        )
+        .await?;
         n += 1;
     }
     Ok(n)
@@ -409,4 +483,185 @@ pub async fn fail_stuck_deploys(
 
 fn utc_cutoff(older_than_ms: i64) -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now() - chrono::Duration::milliseconds(older_than_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::App;
+
+    async fn seed_app(pool: &SqlitePool, id: &str) -> App {
+        let cfg = crate::config::config_for_tests();
+        sqlx::query(
+            "INSERT INTO app (id, slug, name, user_id, status, subdomain, git_prefix, fleet_bucket, \
+             listen_port, internal_port, desired_state, created_at, updated_at) \
+             VALUES (?, ?, ?, 'local', 'running', ?, ?, ?, 30000, 30001, 'running', \
+             '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(id)
+        .bind(format!("{id}.{}", cfg.base_domain))
+        .bind(format!("git/{id}/"))
+        .bind(format!("s3://{}/fleets/{id}", cfg.s3_bucket))
+        .execute(pool)
+        .await
+        .expect("seed app");
+        crate::db::get_app(pool, id)
+            .await
+            .expect("read app")
+            .expect("row")
+    }
+
+    /// A terminal row is final: the late log line, the stall sweep and the
+    /// second stop are refused instead of rewriting a finished deploy — the
+    /// bug that let a run resurrect a `failed` row as `building` (only the
+    /// "live run owns the token" invariant stood in its way).
+    #[tokio::test]
+    async fn a_terminal_deploy_row_never_moves_again() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("db");
+        let app = seed_app(&pool, "lifecycle").await;
+        let queued = upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            None,
+            DeployStatus::Queued,
+            Some("abc1234"),
+            "▸ queued\n",
+        )
+        .await
+        .expect("queued row");
+        assert!(queued.outcome.is_applied());
+
+        let built = upsert_deploy(
+            &pool,
+            Some(&queued.id),
+            &app.id,
+            None,
+            DeployStatus::Building,
+            Some("abc1234"),
+            "▸ build\n",
+        )
+        .await
+        .expect("building");
+        assert!(built.outcome.is_applied(), "queued -> building is legal");
+
+        // The stop endpoint (no live token) closes the row.
+        assert!(mark_deploy_cancelled(&pool, &app.id, &queued.id)
+            .await
+            .expect("cancel"));
+        let failed = get_deploy(&pool, &app.id, &queued.id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(failed.status, DeployStatus::Failed);
+
+        // A late step log now loses: nothing rewrites the row.
+        let late = upsert_deploy(
+            &pool,
+            Some(&queued.id),
+            &app.id,
+            None,
+            DeployStatus::Deploying,
+            Some("abc1234"),
+            "▸ late line\n",
+        )
+        .await
+        .expect("late write");
+        assert_eq!(
+            late.outcome,
+            DeployWrite::Refused {
+                current: DeployStatus::Failed
+            }
+        );
+        let after = get_deploy(&pool, &app.id, &queued.id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(after.status, DeployStatus::Failed);
+        assert!(!after.log.contains("late line"), "{}", after.log);
+        assert!(
+            !mark_deploy_cancelled(&pool, &app.id, &queued.id)
+                .await
+                .expect("second cancel"),
+            "a finished row is not in flight"
+        );
+
+        // Same for a success row.
+        let live = upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            None,
+            DeployStatus::Success,
+            Some("abc1234"),
+            "deploy complete\n",
+        )
+        .await
+        .expect("success row");
+        let reopened = upsert_deploy(
+            &pool,
+            Some(&live.id),
+            &app.id,
+            None,
+            DeployStatus::Building,
+            Some("abc1234"),
+            "▸ rewrite\n",
+        )
+        .await
+        .expect("reopen attempt");
+        assert_eq!(
+            reopened.outcome,
+            DeployWrite::Refused {
+                current: DeployStatus::Success
+            }
+        );
+    }
+
+    /// The stall sweep only closes rows that are still in flight, and only
+    /// touches the target's status for a row it actually closed: a row the
+    /// stop endpoint already failed keeps its own story.
+    #[tokio::test]
+    async fn the_stall_sweep_refuses_rows_another_writer_closed() {
+        let pool = crate::db::connect("sqlite::memory:").await.expect("db");
+        let app = seed_app(&pool, "swept").await;
+        let row = upsert_deploy(
+            &pool,
+            None,
+            &app.id,
+            None,
+            DeployStatus::Building,
+            Some("abc1234"),
+            "▸ build\n",
+        )
+        .await
+        .expect("row");
+        // Age it past the bound.
+        let old = (chrono::Utc::now() - chrono::Duration::hours(2))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        sqlx::query("UPDATE deploy SET updated_at = ? WHERE id = ?")
+            .bind(&old)
+            .bind(&row.id)
+            .execute(&pool)
+            .await
+            .expect("age");
+        assert!(mark_deploy_cancelled(&pool, &app.id, &row.id)
+            .await
+            .expect("cancel first"));
+        let swept = fail_stuck_deploys(&pool, 60_000, &HashSet::new())
+            .await
+            .expect("sweep");
+        assert_eq!(swept, 0, "the row was already closed");
+        let fresh = get_deploy(&pool, &app.id, &row.id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert!(
+            fresh.log.contains(crate::host::cancel::CANCELLED),
+            "the stop's line survives: {}",
+            fresh.log
+        );
+        assert!(!fresh.log.contains("stalled"), "{}", fresh.log);
+    }
 }

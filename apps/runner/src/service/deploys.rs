@@ -50,7 +50,7 @@ pub async fn cancel(state: &AppState, id: &str, deploy_id: &str) -> Result<(), A
     let Some(row) = row else {
         return Err(ApiError::not_found("deploy not found"));
     };
-    let in_flight = matches!(row.status.as_str(), "queued" | "building" | "deploying");
+    let in_flight = row.status.is_in_flight();
     if !in_flight {
         return Err(ApiError::conflict("deploy is not in flight"));
     }
@@ -73,20 +73,23 @@ pub async fn cancel(state: &AppState, id: &str, deploy_id: &str) -> Result<(), A
     let summary = crate::host::cancel::CANCELLED;
     let outcome = match row.environment_id.as_deref() {
         Some(env_id) => {
-            db::update_environment_status_if_wanted(
+            db::write_environment_status(
                 &state.pool,
                 env_id,
-                crate::models::AppStatus::Failed.as_str(),
+                crate::models::AppStatus::Failed,
                 Some(summary),
+                crate::models::WriteGuard::Wanted,
             )
             .await
         }
         None => {
-            db::update_app_status_if_wanted(
+            db::write_app_status(
                 &state.pool,
                 &app.id,
-                crate::models::AppStatus::Failed.as_str(),
+                crate::models::AppStatus::Failed,
                 Some(summary),
+                None,
+                crate::models::WriteGuard::Wanted,
             )
             .await
         }
@@ -198,12 +201,13 @@ pub async fn prepare_rollback(
         None,
         &app.id,
         target.environment_id(),
-        crate::models::DeployStatus::Queued.as_str(),
+        crate::models::DeployStatus::Queued,
         Some(&sha),
         "▸ queued behind the app's running deploy\n",
     )
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))?;
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .id;
     Ok(PreparedRollback {
         deploy_id,
         sha,

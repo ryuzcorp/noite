@@ -486,6 +486,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::models::{AppStatus, DesiredState};
 
     fn test_app() -> App {
         App {
@@ -493,7 +494,7 @@ mod tests {
             slug: "r2app".into(),
             name: "r2app".into(),
             user_id: "local".into(),
-            status: "running".into(),
+            status: AppStatus::Running,
             subdomain: "r2app.localhost".into(),
             git_prefix: "git/r2app".into(),
             fleet_bucket: "s3://noite/fleets/r2app".into(),
@@ -501,7 +502,7 @@ mod tests {
             internal_port: None,
             last_deploy_sha: None,
             last_error: None,
-            desired_state: "running".into(),
+            desired_state: DesiredState::Running,
             created_at: "t".into(),
             updated_at: "t".into(),
             asleep_since: None,

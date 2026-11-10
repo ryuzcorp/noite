@@ -692,13 +692,33 @@ mod tests {
                 .expect("seed app");
             }
             let apps = db::list_apps(&pool).await.expect("list");
-            db::set_app_asleep(&pool, &apps[0].id).await.expect("sleep");
-            db::upsert_deploy(&pool, None, &apps[0].id, None, "success", Some("sha1"), "")
+            db::upsert_deploy(
+                &pool,
+                None,
+                &apps[0].id,
+                None,
+                crate::models::DeployStatus::Success,
+                Some("sha1"),
+                "",
+            )
+            .await
+            .expect("deploy");
+            // Park it after it deployed: only a running fleet can sleep.
+            assert!(db::set_app_asleep(&pool, &apps[0].id)
                 .await
-                .expect("deploy");
-            db::upsert_deploy(&pool, None, &apps[1].id, None, "failed", Some("sha2"), "")
-                .await
-                .expect("deploy");
+                .expect("sleep")
+                .is_applied());
+            db::upsert_deploy(
+                &pool,
+                None,
+                &apps[1].id,
+                None,
+                crate::models::DeployStatus::Failed,
+                Some("sha2"),
+                "",
+            )
+            .await
+            .expect("deploy");
 
             let now = DateTime::parse_from_rfc3339("2026-10-06T12:00:00Z")
                 .expect("now")

@@ -428,7 +428,7 @@ pub async fn ensure_admission_name(
     match environment_id {
         None => {
             if let Some(row) = db::get_env(pool, app_id, ADMISSION_NAME_VAR).await? {
-                if row.source != db::SOURCE_VOID_SANDBOX_ADMISSION {
+                if row.source != crate::models::EnvSource::VoidSandboxAdmission {
                     anyhow::bail!(
                         "settings variable `{}` is reserved for the platform and cannot become a Worker var (rename it or remove it from Settings → Environment)",
                         ADMISSION_NAME_VAR
@@ -442,7 +442,7 @@ pub async fn ensure_admission_name(
                 app_id,
                 ADMISSION_NAME_VAR,
                 &name,
-                db::SOURCE_VOID_SANDBOX_ADMISSION,
+                crate::models::EnvSource::VoidSandboxAdmission,
             )
             .await?;
             let row = db::get_env(pool, app_id, ADMISSION_NAME_VAR)
@@ -453,7 +453,7 @@ pub async fn ensure_admission_name(
         }
         Some(env_id) => {
             if let Some(row) = db::get_env_override(pool, env_id, ADMISSION_NAME_VAR).await? {
-                if row.source != db::SOURCE_VOID_SANDBOX_ADMISSION {
+                if row.source != crate::models::EnvSource::VoidSandboxAdmission {
                     anyhow::bail!(
                         "settings variable `{}` is reserved for the platform and cannot become a Worker var (rename it or remove it from this environment's Variable overrides)",
                         ADMISSION_NAME_VAR
@@ -467,7 +467,7 @@ pub async fn ensure_admission_name(
                 env_id,
                 ADMISSION_NAME_VAR,
                 &name,
-                db::SOURCE_VOID_SANDBOX_ADMISSION,
+                crate::models::EnvSource::VoidSandboxAdmission,
             )
             .await?;
             let row = db::get_env_override(pool, env_id, ADMISSION_NAME_VAR)
@@ -1190,7 +1190,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .source,
-            db::SOURCE_VOID_SANDBOX_ADMISSION
+            crate::models::EnvSource::VoidSandboxAdmission
         );
         assert_eq!(
             db::get_env_override(&pool, &env.id, ADMISSION_NAME_VAR)
@@ -1198,7 +1198,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .source,
-            db::SOURCE_VOID_SANDBOX_ADMISSION
+            crate::models::EnvSource::VoidSandboxAdmission
         );
         // Neither row reaches the Worker-vars input: the controller render
         // injects the name alone.

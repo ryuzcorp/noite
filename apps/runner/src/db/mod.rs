@@ -31,8 +31,8 @@ pub use apps::{
     get_app, get_app_by_domain, get_app_by_slug, get_app_limit, list_all_apps, list_app_domains,
     list_app_limits, list_apps, list_domains_for, patch_app_desired, rebind_local_subdomains,
     remove_domain, rename_app, set_app_asleep, set_app_awake, set_app_import_source, set_app_limit,
-    set_deployed_config, update_app_status, update_app_status_if_wanted, verified_domain_owner,
-    verify_domain, NewApp, VerifyOutcome,
+    set_deployed_config, verified_domain_owner, verify_domain, write_app_status, NewApp,
+    VerifyOutcome,
 };
 pub use compaction::{
     bump_metric_version, delete_compactions_for, get_compacted_hours, get_metric_version,
@@ -53,7 +53,7 @@ pub use deploys::{
 };
 pub use env::{
     delete_env, get_env, insert_provisioned, list_env, set_env, set_provisioned, tenant_env,
-    worker_settings, SOURCE_AUTH_DEFAULT, SOURCE_VOID_PROXY_TOKEN, SOURCE_VOID_SANDBOX_ADMISSION,
+    worker_settings,
 };
 pub use environments::{
     count_environments, count_environments_for_app, create_environment, delete_env_override,
@@ -62,8 +62,8 @@ pub use environments::{
     get_environment_by_ref, insert_env_override_provisioned, list_all_environments,
     list_env_override, list_environment_routes, list_environments, set_env_override,
     set_env_override_provisioned, set_environment_asleep, set_environment_awake,
-    set_environment_bucket, set_environment_public, update_environment_status,
-    update_environment_status_if_wanted, EnvironmentRoute, NewEnvironment,
+    set_environment_bucket, set_environment_public, write_environment_status, EnvironmentRoute,
+    NewEnvironment,
 };
 pub use errors::{
     count_error_issues, get_error_issue, insert_error_event, list_error_events, list_error_hours,

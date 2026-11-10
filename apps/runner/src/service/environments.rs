@@ -299,12 +299,13 @@ async fn spawn_deploy(
         None,
         &app.id,
         Some(&env.id),
-        crate::models::DeployStatus::Queued.as_str(),
+        crate::models::DeployStatus::Queued,
         Some(sha),
         "▸ queued behind the app's running deploy\n",
     )
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))?;
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .id;
     let pool = state.pool.clone();
     let cfg = state.config.clone();
     let procs = state.procs.clone();

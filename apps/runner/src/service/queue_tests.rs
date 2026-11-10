@@ -13,16 +13,17 @@ async fn seed(h: &Harness, app_id: &str, status: DeployStatus, sha: &str) -> Str
         None,
         app_id,
         None,
-        status.as_str(),
+        status,
         Some(sha),
         "▸ seed\n",
     )
     .await
     .expect("seed deploy")
+    .id
 }
 
 /// One row's current status.
-async fn status_of(h: &Harness, app_id: &str, deploy_id: &str) -> String {
+async fn status_of(h: &Harness, app_id: &str, deploy_id: &str) -> DeployStatus {
     crate::db::get_deploy(&h.state.pool, app_id, deploy_id)
         .await
         .expect("read deploy")
@@ -45,7 +46,7 @@ async fn a_rollback_row_is_queued_before_its_run_starts() {
         .await
         .expect("read deploy")
         .expect("deploy row");
-    assert_eq!(row.status, "queued");
+    assert_eq!(row.status, DeployStatus::Queued);
     assert_eq!(row.sha.as_deref(), Some(sha));
 
     h.finish().await;
@@ -90,7 +91,7 @@ async fn a_preview_rollback_is_proven_in_its_own_target() {
         None,
         &app.id,
         Some(&env.id),
-        DeployStatus::Success.as_str(),
+        DeployStatus::Success,
         Some(sha),
         "▸ seed\n",
     )
@@ -105,7 +106,7 @@ async fn a_preview_rollback_is_proven_in_its_own_target() {
         .expect("read deploy")
         .expect("deploy row");
     assert_eq!(row.environment_id.as_deref(), Some(env.id.as_str()));
-    assert_eq!(row.status, "queued");
+    assert_eq!(row.status, DeployStatus::Queued);
 
     h.finish().await;
 }
@@ -135,8 +136,11 @@ async fn the_sweep_spares_a_queued_row_twice_as_long_as_a_building_one() {
         .expect("sweep");
     assert_eq!(swept, 1, "only the building row is past its bound");
 
-    assert_eq!(status_of(&h, &app.id, &queued).await, "queued");
-    assert_eq!(status_of(&h, &app.id, &building).await, "failed");
+    assert_eq!(status_of(&h, &app.id, &queued).await, DeployStatus::Queued);
+    assert_eq!(
+        status_of(&h, &app.id, &building).await,
+        DeployStatus::Failed
+    );
 
     // Past twice the bound the queue is dead too (the runner restarted
     // before its waiter could close it).

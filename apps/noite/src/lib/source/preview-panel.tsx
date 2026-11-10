@@ -463,17 +463,24 @@ const TargetPreview = ({
   // render's closures (see AGENTS.md, ilha pitfalls).
   const frameBox = atom.lazy(() => ({ id: 0, token: "" }))();
   watch(feed.state, (state) => {
-    const status = (feedValue(state) ?? [])[0]?.status ?? "";
+    // The deploy status is a closed union now (`runner-types`): no `""`
+    // sentinel, so absence is `undefined` and the settled test is explicit.
+    const status = (feedValue(state) ?? [])[0]?.status;
+    // A finished (or absent) deploy is what closes the log.
+    const settled = status === undefined || status === "success";
 
     if (status !== seen.status) {
       // A deploy that just finished moved the environment's own status
       // (building → running/failed) too: read it again so the dot follows.
-      if (deployRunning(seen.status) && !deployRunning(status)) {
+      if (
+        deployRunning(seen.status) &&
+        (status === undefined || !deployRunning(status))
+      ) {
         invalidateEnvironments(appId);
       }
 
-      seen.status = status;
-      logOpen.set(status !== "" && status !== "success");
+      seen.status = status ?? "";
+      logOpen.set(!settled);
     }
   });
 

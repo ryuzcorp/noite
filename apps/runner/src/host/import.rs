@@ -17,15 +17,17 @@
 //! the app's root as one squashed commit — the same snapshot a tarball
 //! extractor such as giget makes, without a second host to allow.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context};
 
 use crate::db;
+use crate::host::cancel::CancelHandle;
 use crate::host::exec;
 use crate::host::forge;
 use crate::host::git_http;
@@ -228,36 +230,154 @@ async fn note(state: &AppState, app_id: &str, event: &str, description: &str) {
     .await;
 }
 
+/// One background import attempt in THIS process: the in-memory half of the
+/// import machine (RDEP-5). The row's status is the durable half
+/// ([`crate::models::AppStatus::Importing`] → `provisioned` / `error`).
+///
+/// ```mermaid
+/// stateDiagram-v2
+///   [*] --> Running: spawn reserves the app and starts the task
+///   Running --> [*]: the attempt ended (its row carries the outcome)
+///   Running --> [*]: a delete stopped it and awaited the end
+/// ```
+///
+/// An entry exists exactly while an attempt runs: the attempt removes its own
+/// entry on every exit path — a panic included — so nothing is remembered
+/// afterwards (a row that says `importing` with no entry is an import whose
+/// task died with an earlier process, which is what Retry serves).
+struct ImportRun {
+    /// The stop token a delete trips; the clone races it and dies with its
+    /// process group, so the await below is bounded.
+    cancel: CancelHandle,
+    /// The task a delete awaits before purging the slug.
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// App id → the attempt running here.
+static IMPORTS: LazyLock<Mutex<HashMap<String, ImportRun>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn imports() -> std::sync::MutexGuard<'static, HashMap<String, ImportRun>> {
+    IMPORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The cancel-registry key of one app's import: its own namespace, so an
+/// import token can never be mistaken for a deploy's.
+fn import_key(app_id: &str) -> String {
+    format!("import:{app_id}")
+}
+
 /// Start the background import (A2/A3). The caller has already stored the
 /// source and flipped the app to `importing`, so `create` returns at once.
-pub fn spawn(state: &AppState, app: App, source: GitSource) {
-    let app_id = app.id.clone();
-    if let Ok(mut running) = IN_FLIGHT.lock() {
-        running.insert(app_id.clone());
+/// `false` = this process already runs an import for the app, so nothing was
+/// started (the caller reports the conflict).
+///
+/// The slot check, the spawn and the insert are one locked step: two
+/// concurrent retries cannot both start an import (the task's own `finish`
+/// waits for this guard).
+pub fn spawn(state: &AppState, app: App, source: GitSource) -> bool {
+    let mut runs = imports();
+    // Admission is atomic with the delete: the delete marks the app before it
+    // calls `cancel_and_wait`, so either this check sees the mark and refuses,
+    // or the slot is inserted under this lock and the delete's sweep (which
+    // runs after the mark) is guaranteed to find it. Checking outside the lock
+    // left a window where a retry spawned an import nobody cancelled.
+    if crate::service::apps::deleting(&app.id) || runs.contains_key(&app.id) {
+        return false;
     }
+    let key = import_key(&app.id);
+    let cancel = crate::host::cancel::CANCELS.register(&key);
     let state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = run(&state, &app, &source, Protocols::default()).await {
+    let slot_id = app.id.clone();
+    let task_id = slot_id.clone();
+    let token = cancel.clone();
+    let task = tokio::spawn(async move {
+        // Bound first, so a panic in `run` unwinds through it: the slot and
+        // the stop token are released on every exit path.
+        let _fin = Fin {
+            app_id: task_id,
+            token: token.clone(),
+        };
+        // The token is the task-local a child process races, so a delete's
+        // trip kills the clone instead of waiting out its timeout.
+        let out = crate::host::cancel::with(
+            token.clone(),
+            run(&state, &app, &source, Protocols::default()),
+        )
+        .await;
+        if let Err(e) = out {
             tracing::error!(slug = %app.slug, error = %format!("{e:#}"), "import failed");
         }
-        if let Ok(mut running) = IN_FLIGHT.lock() {
-            running.remove(&app_id);
-        }
     });
+    runs.insert(slot_id, ImportRun { cancel, task });
+    true
 }
 
-/// App ids with an import running in THIS process. A row that says `importing`
-/// while nothing is in flight is an import whose task died with an earlier
-/// process (a restart, a crash) — exactly the case Retry must still serve.
-static IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-
-/// Whether this process is running an import for `app_id`.
-pub fn running(app_id: &str) -> bool {
-    IN_FLIGHT
-        .lock()
-        .map(|running| running.contains(app_id))
-        .unwrap_or(false)
+/// The attempt's cleanup, bound inside the spawned task: dropping it releases
+/// the slot and the stop token, so a panic in `run` cannot leave the app
+/// permanently "importing here" (every later Retry would answer 409).
+struct Fin {
+    app_id: String,
+    token: CancelHandle,
 }
+
+impl Drop for Fin {
+    fn drop(&mut self) {
+        finish(&self.app_id, &self.token);
+    }
+}
+
+/// Release this attempt's reservation and its stop token. The slot goes only
+/// while it is this attempt's (a newer attempt may have replaced it); the
+/// token is released unconditionally through `release_if`, which is itself
+/// pointer-checked, so a slot already removed (a delete took it) still loses
+/// its token when the task unwinds.
+fn finish(app_id: &str, cancel: &CancelHandle) {
+    {
+        let mut runs = imports();
+        let ours = runs
+            .get(app_id)
+            .is_some_and(|run| Arc::ptr_eq(&run.cancel, cancel));
+        if ours {
+            runs.remove(app_id);
+        }
+    }
+    crate::host::cancel::CANCELS.release_if(&import_key(app_id), cancel);
+}
+
+/// Stop a running import and wait for it to end. A delete calls this before
+/// it purges the slug: a clone that finished late would otherwise publish
+/// `refs/heads/main` under a slug the delete is about to free, and the next
+/// app to take that slug would inherit the tree. `false` = nothing was
+/// running here.
+pub async fn cancel_and_wait(app_id: &str) -> bool {
+    let run = imports().remove(app_id);
+    let Some(run) = run else {
+        return false;
+    };
+    crate::host::cancel::CANCELS.cancel(&import_key(app_id));
+    // The task ends on its own: the clone is killed with its group and the
+    // remaining steps are local. Bounded anyway, so the delete's `Purging`
+    // phase has a hard ceiling; a task that outlives it can still publish
+    // nothing (the token is tripped and the publish re-checks the row).
+    match tokio::time::timeout(IMPORT_STOP_TIMEOUT, run.task).await {
+        Ok(_) => {}
+        Err(_) => tracing::warn!(
+            app_id,
+            timeout_s = IMPORT_STOP_TIMEOUT.as_secs(),
+            "import did not stop within the bound; the delete continues"
+        ),
+    }
+    crate::host::cancel::CANCELS.release_if(&import_key(app_id), &run.cancel);
+    true
+}
+
+/// How long a delete waits for a stopped import to end. The clone is killed
+/// with its process group, so only local git steps remain; this is a ceiling,
+/// not an expectation.
+const IMPORT_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The whole import, with the app row's status moved by the outcome. Only runs
 /// while the app is still `importing`, so a push that raced the import (and
@@ -277,14 +397,29 @@ async fn run(
                 &format!("{} at {}", source.url, &sha[..sha.len().min(7)]),
             )
             .await;
-            db::finish_app_import(&state.pool, &app.id, AppStatus::Provisioned.as_str(), None)
-                .await?;
+            if !db::finish_app_import(&state.pool, &app.id, AppStatus::Provisioned, None)
+                .await?
+                .is_applied()
+            {
+                tracing::info!(
+                    app_id = %app.id,
+                    "import outcome lost the race to a deploy; the row keeps its story"
+                );
+            }
             Ok(())
         }
         Err(e) => {
             let message = format!("{e:#}");
             note(state, &app.id, "Import failed", &message).await;
-            db::finish_app_import(&state.pool, &app.id, "error", Some(&message)).await?;
+            if !db::finish_app_import(&state.pool, &app.id, AppStatus::Error, Some(&message))
+                .await?
+                .is_applied()
+            {
+                tracing::info!(
+                    app_id = %app.id,
+                    "import failure lost the race to a deploy; the row keeps its story"
+                );
+            }
             Err(e)
         }
     }
@@ -318,6 +453,24 @@ async fn import_once(
 
 /// The body of [`import_once`] with the scratch dir already made, so the
 /// cleanup above runs on every path.
+/// Refuse to touch an app's slug data unless the row still names this app,
+/// with this slug, and no delete is running. Checked before the mirror and the
+/// staging ref (not only at publish): a slug freed by a delete can be taken by
+/// a new app, and writing into its mirror would hand it this tree.
+pub(crate) async fn ensure_app_target(state: &AppState, app: &App) -> anyhow::Result<()> {
+    if crate::service::apps::deleting(&app.id) {
+        anyhow::bail!("app {} is being deleted; import stopped", app.id);
+    }
+    match db::get_app(&state.pool, &app.id).await? {
+        Some(row) if row.slug == app.slug => Ok(()),
+        _ => anyhow::bail!(
+            "app {} no longer owns the slug {}; import stopped",
+            app.id,
+            app.slug
+        ),
+    }
+}
+
 async fn import_into(
     state: &AppState,
     app: &App,
@@ -330,6 +483,9 @@ async fn import_into(
     // (`run_grouped`), so by here the repository is within it.
     let upstream_sha =
         clone_scratch(target, source.reference.as_deref(), scratch, protocols).await?;
+    // The clone is the long step: the row may have been deleted (or renamed)
+    // while it ran, and the slug may already belong to another app.
+    ensure_app_target(state, app).await?;
     let mirror = state.wal.ensure_synced(&app.slug).await?;
     // Objects only: moving a ref here would make `after_receive` see no change
     // and publish nothing, so the temp ref is the fetch target and `publish_ref`
@@ -363,6 +519,11 @@ async fn import_into(
         staged
     };
 
+    // A stopped import must not publish, whatever the clone left behind: the
+    // delete that stopped it is about to free this slug.
+    if crate::host::cancel::current().is_some_and(|token| token.is_cancelled()) {
+        anyhow::bail!("{}", crate::host::cancel::CANCELLED);
+    }
     // Retry after a partial landing: `expected_old` is the ref as it stands now.
     // `None` (a fresh app) means "must not exist", which is exactly right here.
     let current = git_http::list_refs(&mirror)
@@ -464,6 +625,13 @@ async fn run_grouped(
     let group = child.id().map(|id| id as i32);
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
+        // A delete (or any stop) must end the clone here, not after its
+        // timeout: kill the whole group and report the stop.
+        if crate::host::cancel::current().is_some_and(|token| token.is_cancelled()) {
+            kill_group(group);
+            let _ = tokio::time::timeout(REAP, child.wait()).await;
+            anyhow::bail!("{}", crate::host::cancel::CANCELLED);
+        }
         // `Child::wait` is cancel safe, so the poll interval can simply
         // re-enter it while the child keeps running.
         match tokio::time::timeout(poll, child.wait()).await {
@@ -679,6 +847,227 @@ mod tests {
 
     fn dir() -> crate::testutil::TempDir {
         crate::testutil::TempDir::new("noite-import")
+    }
+
+    /// A delete stops the import and waits for it: the task's own end (the
+    /// clone killed with its group) is what the delete can rely on before it
+    /// purges the slug. Without the await, a late clone published
+    /// `refs/heads/main` for a slug the delete had already freed.
+    #[tokio::test]
+    async fn cancel_and_wait_ends_the_attempt_before_it_returns() {
+        let app_id = "sm-cancel-import";
+        let key = import_key(app_id);
+        let cancel = crate::host::cancel::CANCELS.register(&key);
+        let token = cancel.clone();
+        // Stands in for the import task: it only finishes when stopped.
+        let task = tokio::spawn(async move {
+            crate::host::cancel::with(token.clone(), token.cancelled()).await;
+        });
+        imports().insert(
+            app_id.to_string(),
+            ImportRun {
+                cancel: cancel.clone(),
+                task,
+            },
+        );
+
+        assert!(
+            imports().contains_key(app_id),
+            "the attempt is running here"
+        );
+        assert!(cancel_and_wait(app_id).await, "the delete stops it");
+        assert!(
+            !imports().contains_key(app_id),
+            "the attempt ended before the delete went on"
+        );
+        assert!(cancel.is_cancelled(), "the clone's token was tripped");
+        assert!(
+            !cancel_and_wait(app_id).await,
+            "nothing left to stop the second time"
+        );
+    }
+
+    /// Admission is atomic with the delete: a retry that passed its own
+    /// "not deleting" check can no longer spawn an import the delete has
+    /// already swept for (that import would write into the mirror of a slug
+    /// the delete is freeing).
+    #[tokio::test]
+    async fn a_retry_cannot_start_an_import_while_the_app_is_being_deleted() {
+        let h = crate::api::tests::Harness::new().await;
+        let app = h.seed_app("import-delete-admission").await;
+        let source = GitSource {
+            url: "https://127.0.0.1:1/owner/repo".to_string(),
+            reference: None,
+            squash: true,
+            path: None,
+            actor: crate::host::git_identity::Actor {
+                user_id: "user_1".to_string(),
+                name: "User One".to_string(),
+            },
+        };
+        assert!(crate::service::apps::deleting_claim_for_test(&app.id));
+        assert!(
+            !spawn(&h.state, app.clone(), source.clone()),
+            "the delete claim closes import admission"
+        );
+        assert!(!imports().contains_key(&app.id), "nothing was registered");
+        crate::service::apps::deleting_release_for_test(&app.id);
+        assert!(
+            spawn(&h.state, app.clone(), source),
+            "once the delete is over an import may start"
+        );
+        cancel_and_wait(&app.id).await;
+        h.finish().await;
+    }
+
+    /// The mirror and the staging ref are only touched for a row that still
+    /// names this app with this slug: a delete (or a rename) during the clone
+    /// stops the import there, not only at publish time.
+    #[tokio::test]
+    async fn the_import_target_is_revalidated_before_the_mirror() {
+        let h = crate::api::tests::Harness::new().await;
+        let app = h.seed_app("import-revalidate").await;
+        assert!(ensure_app_target(&h.state, &app).await.is_ok(), "live app");
+
+        crate::db::rename_app(
+            &h.state.pool,
+            &app.id,
+            &app.name,
+            "renamed-slug",
+            "renamed.localhost",
+            "git/renamed-slug/",
+            "s3://noite/fleets/renamed-slug",
+        )
+        .await
+        .expect("rename");
+        assert!(
+            ensure_app_target(&h.state, &app).await.is_err(),
+            "the old slug is not this app's any more"
+        );
+
+        crate::db::delete_app(&h.state.pool, &app.id)
+            .await
+            .expect("delete");
+        assert!(
+            ensure_app_target(&h.state, &app).await.is_err(),
+            "a deleted app has no target"
+        );
+        h.finish().await;
+    }
+
+    /// One attempt per app: the slot check and the insert are one locked step,
+    /// so two concurrent retries cannot both clone into the same mirror. The
+    /// attempt's own end (the `finish` path) frees the app and leaves nothing
+    /// behind.
+    #[tokio::test]
+    async fn a_second_import_attempt_is_refused_and_a_finished_one_frees_the_app() {
+        let h = crate::api::tests::Harness::new().await;
+        let app = h.seed_app("import-slot").await;
+        // A closed local port: the clone fails at once, so the attempt ends
+        // without any network.
+        let source = GitSource {
+            url: "https://127.0.0.1:1/owner/repo".to_string(),
+            reference: None,
+            squash: true,
+            path: None,
+            actor: crate::host::git_identity::Actor {
+                user_id: "user_1".to_string(),
+                name: "User One".to_string(),
+            },
+        };
+        assert!(
+            spawn(&h.state, app.clone(), source.clone()),
+            "the first attempt starts"
+        );
+        assert!(
+            !spawn(&h.state, app.clone(), source.clone()),
+            "a second concurrent attempt must not start"
+        );
+        // Deterministic: this awaits the running task to its end.
+        assert!(cancel_and_wait(&app.id).await);
+        assert!(!imports().contains_key(&app.id));
+        assert!(
+            spawn(&h.state, app.clone(), source),
+            "a finished attempt frees the app for Retry"
+        );
+        cancel_and_wait(&app.id).await;
+        h.finish().await;
+    }
+
+    /// A panic inside the attempt must still release the slot and the stop
+    /// token: the cleanup is a drop guard bound in the task, not a statement
+    /// after the await (which unwinding would skip, leaving every later Retry
+    /// answering 409 until a restart).
+    #[tokio::test]
+    async fn a_panicking_attempt_still_releases_its_slot_and_token() {
+        let app_id = "sm-panic-import";
+        let key = import_key(app_id);
+        let cancel = crate::host::cancel::CANCELS.register(&key);
+        let token = cancel.clone();
+        let (started, wait) = tokio::sync::oneshot::channel::<()>();
+        // The real attempt's task is awaited through the test's own handle, so
+        // the slot is never removed by the test itself: what disappears below
+        // is the guard's doing.
+        let attempt = tokio::spawn(async move {
+            let _fin = Fin {
+                app_id: app_id.to_string(),
+                token,
+            };
+            // Deterministic: the panic happens only after the slot below is
+            // registered, exactly as the real task would.
+            wait.await.expect("start");
+            panic!("the import panicked");
+        });
+        imports().insert(
+            app_id.to_string(),
+            ImportRun {
+                cancel: cancel.clone(),
+                task: tokio::spawn(async {}),
+            },
+        );
+        assert!(imports().contains_key(app_id), "the slot is registered");
+        started.send(()).expect("release the attempt");
+
+        let joined = attempt.await;
+        assert!(joined.is_err(), "the attempt panicked");
+        assert!(
+            !imports().contains_key(app_id),
+            "the slot is released on unwind"
+        );
+        assert_eq!(
+            crate::host::cancel::CANCELS.cancel(&key),
+            crate::host::cancel::CancelOutcome::Missing,
+            "the stop token is released on unwind"
+        );
+    }
+
+    /// The task's own end releases its slot and its stop token: nothing is
+    /// remembered per app after the attempt (the old claim left a `Done`
+    /// entry forever).
+    #[tokio::test]
+    async fn an_attempt_that_ends_releases_its_slot_and_token() {
+        let app_id = "sm-finish-import";
+        let key = import_key(app_id);
+        let cancel = crate::host::cancel::CANCELS.register(&key);
+        let task = tokio::spawn(async {});
+        imports().insert(
+            app_id.to_string(),
+            ImportRun {
+                cancel: cancel.clone(),
+                task,
+            },
+        );
+        assert!(imports().contains_key(app_id));
+        finish(app_id, &cancel);
+        assert!(
+            !imports().contains_key(app_id),
+            "no entry survives the attempt"
+        );
+        assert_eq!(
+            crate::host::cancel::CANCELS.cancel(&key),
+            crate::host::cancel::CancelOutcome::Missing,
+            "the stop token is released with it"
+        );
     }
 
     /// The URL allowlist is the security boundary: only the exact GitHub https

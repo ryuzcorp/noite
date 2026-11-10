@@ -10,7 +10,12 @@ use super::tests::Harness;
 
 /// Pre-create an in-flight deploy row, the way callers do before spawning the
 /// pipeline (`upsert_deploy` is the one writer).
-async fn seed_deploy(h: &Harness, app_id: &str, status: &str, sha: &str) -> String {
+async fn seed_deploy(
+    h: &Harness,
+    app_id: &str,
+    status: crate::models::DeployStatus,
+    sha: &str,
+) -> String {
     crate::db::upsert_deploy(
         &h.state.pool,
         None,
@@ -22,13 +27,20 @@ async fn seed_deploy(h: &Harness, app_id: &str, status: &str, sha: &str) -> Stri
     )
     .await
     .expect("seed deploy")
+    .id
 }
 
 #[tokio::test]
 async fn stopping_a_stranded_row_closes_it_with_the_operator_line() {
     let h = Harness::new().await;
     let app = h.seed_app("stopper").await;
-    let deploy_id = seed_deploy(&h, &app.id, "building", "abc1234").await;
+    let deploy_id = seed_deploy(
+        &h,
+        &app.id,
+        crate::models::DeployStatus::Building,
+        "abc1234",
+    )
+    .await;
 
     let (status, body) = h
         .rest(
@@ -43,7 +55,7 @@ async fn stopping_a_stranded_row_closes_it_with_the_operator_line() {
         .await
         .expect("read deploy")
         .expect("deploy row");
-    assert_eq!(row.status, "failed");
+    assert_eq!(row.status, crate::models::DeployStatus::Failed);
     assert!(
         row.log.contains("ERROR: cancelled by the operator"),
         "{}",
@@ -68,7 +80,13 @@ async fn stopping_a_stranded_row_closes_it_with_the_operator_line() {
 async fn stopping_a_live_run_signals_it_and_leaves_the_row_to_the_pipeline() {
     let h = Harness::new().await;
     let app = h.seed_app("live-stop").await;
-    let deploy_id = seed_deploy(&h, &app.id, "deploying", "def5678").await;
+    let deploy_id = seed_deploy(
+        &h,
+        &app.id,
+        crate::models::DeployStatus::Deploying,
+        "def5678",
+    )
+    .await;
     let token = crate::host::cancel::CANCELS.register(&deploy_id);
 
     let (status, body) = h
@@ -87,7 +105,7 @@ async fn stopping_a_live_run_signals_it_and_leaves_the_row_to_the_pipeline() {
         .await
         .expect("read deploy")
         .expect("deploy row");
-    assert_eq!(row.status, "deploying");
+    assert_eq!(row.status, crate::models::DeployStatus::Deploying);
 
     // The RPC transport answers the same operation identically.
     let rpc = h
@@ -106,7 +124,13 @@ async fn stopping_a_live_run_signals_it_and_leaves_the_row_to_the_pipeline() {
 async fn a_run_past_its_activation_cannot_be_stopped() {
     let h = Harness::new().await;
     let app = h.seed_app("committed-stop").await;
-    let deploy_id = seed_deploy(&h, &app.id, "deploying", "ccc3333").await;
+    let deploy_id = seed_deploy(
+        &h,
+        &app.id,
+        crate::models::DeployStatus::Deploying,
+        "ccc3333",
+    )
+    .await;
     let token = crate::host::cancel::CANCELS.register(&deploy_id);
     token.commit();
 
@@ -123,7 +147,7 @@ async fn a_run_past_its_activation_cannot_be_stopped() {
         .await
         .expect("read deploy")
         .expect("deploy row");
-    assert_eq!(row.status, "deploying");
+    assert_eq!(row.status, crate::models::DeployStatus::Deploying);
 
     crate::host::cancel::CANCELS.release(&deploy_id);
     h.finish().await;
@@ -143,7 +167,7 @@ async fn stopping_answers_not_found_and_conflict_honestly() {
         .await;
     assert_eq!(missing, StatusCode::NOT_FOUND);
 
-    let done = seed_deploy(&h, &app.id, "success", "aaa1111").await;
+    let done = seed_deploy(&h, &app.id, crate::models::DeployStatus::Success, "aaa1111").await;
     let (finished, _) = h
         .rest(
             "POST",
@@ -155,7 +179,13 @@ async fn stopping_answers_not_found_and_conflict_honestly() {
 
     // A deploy id of another app is that app's to stop, never this one's.
     let other = h.seed_app("other-stop").await;
-    let theirs = seed_deploy(&h, &other.id, "building", "bbb2222").await;
+    let theirs = seed_deploy(
+        &h,
+        &other.id,
+        crate::models::DeployStatus::Building,
+        "bbb2222",
+    )
+    .await;
     let (foreign, _) = h
         .rest(
             "POST",

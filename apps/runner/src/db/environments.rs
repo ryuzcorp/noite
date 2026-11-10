@@ -8,7 +8,10 @@
 
 use sqlx::SqlitePool;
 
-use crate::models::{new_id, now_iso, AppEnv, Environment, EnvironmentKind};
+use crate::models::{
+    new_id, now_iso, AppEnv, AppStatus, DesiredState, EnvSource, Environment, EnvironmentKind,
+    StatusWrite, WriteGuard,
+};
 
 /// Columns every `environment` query selects, in [`Environment`] order. Every
 /// query joins `app` for the slug (the host shape `<label>.<slug>.<base>` and
@@ -28,7 +31,7 @@ pub struct EnvironmentRoute {
     pub label: String,
     pub listen_port: Option<i64>,
     pub public: bool,
-    pub desired_state: String,
+    pub desired_state: DesiredState,
     pub asleep_since: Option<String>,
     pub last_deployed_at: Option<String>,
 }
@@ -211,18 +214,35 @@ pub async fn set_environment_public(
     get_environment(pool, id).await
 }
 
-/// Park an environment (scale to zero), like `set_app_asleep`.
-pub async fn set_environment_asleep(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
+/// Park an environment (scale to zero), like `set_app_asleep`: one statement,
+/// the timestamp and the badge together, only from a status the table allows.
+pub async fn set_environment_asleep(pool: &SqlitePool, id: &str) -> sqlx::Result<StatusWrite> {
     let now = now_iso();
-    sqlx::query(
-        "UPDATE environment SET asleep_since = ?, status = 'sleeping', updated_at = ? WHERE id = ?",
-    )
-    .bind(&now)
-    .bind(&now)
-    .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(())
+    let sql = format!(
+        "UPDATE environment SET asleep_since = ?, status = ?, updated_at = ? \
+         WHERE id = ? AND status IN ({})",
+        super::apps::status_list(AppStatus::Sleeping.predecessors())
+    );
+    let done = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(&now)
+        .bind(AppStatus::Sleeping.as_str())
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if done.rows_affected() > 0 {
+        return Ok(StatusWrite::Applied);
+    }
+    let current: Option<(AppStatus,)> =
+        sqlx::query_as("SELECT status FROM environment WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(StatusWrite::Refused {
+        current: current
+            .map(|(status,)| status)
+            .unwrap_or(AppStatus::Pending),
+    })
 }
 
 pub async fn set_environment_awake(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
@@ -238,94 +258,91 @@ pub async fn set_environment_awake(pool: &SqlitePool, id: &str) -> sqlx::Result<
     Ok(())
 }
 
-pub async fn update_environment_status(
+/// The one writer of `environment.status` — the same machine as
+/// [`crate::models::AppStatus`], with the environment's own columns. See
+/// [`crate::db::write_app_status`] for the rule; the transition table is the
+/// same, so a preview's badge can never reach a state an app's cannot.
+pub async fn write_environment_status(
     pool: &SqlitePool,
     id: &str,
-    status: &str,
+    next: AppStatus,
     last_error: Option<&str>,
-) -> sqlx::Result<()> {
-    let ts = now_iso();
-    match last_error {
-        Some(message) => {
-            sqlx::query(
-                "UPDATE environment SET status = ?, last_error = ?, updated_at = ? WHERE id = ?",
-            )
-            .bind(status)
-            .bind(message)
-            .bind(&ts)
-            .bind(id)
-            .execute(pool)
-            .await?;
-        }
-        None => {
-            sqlx::query("UPDATE environment SET status = ?, updated_at = ? WHERE id = ?")
-                .bind(status)
-                .bind(&ts)
-                .bind(id)
-                .execute(pool)
-                .await?;
-        }
+    guard: WriteGuard,
+) -> sqlx::Result<StatusWrite> {
+    let predecessors = match guard {
+        WriteGuard::From(states) => states,
+        _ => next.predecessors(),
+    };
+    let mut sql = format!(
+        "UPDATE environment SET status = ?, last_error = ?, updated_at = ? \
+         WHERE id = ? AND status IN ({})",
+        super::apps::status_list(predecessors)
+    );
+    if guard == WriteGuard::Wanted {
+        sql.push_str(" AND desired_state = 'running'");
     }
-    Ok(())
+    let done = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(next.as_str())
+        .bind(last_error)
+        .bind(now_iso())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if done.rows_affected() > 0 {
+        return Ok(StatusWrite::Applied);
+    }
+    let current: Option<(AppStatus,)> =
+        sqlx::query_as("SELECT status FROM environment WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(StatusWrite::Refused {
+        current: current
+            .map(|(status,)| status)
+            .unwrap_or(AppStatus::Pending),
+    })
 }
 
 /// A successful deploy: the environment is live at this sha. `last_deploy_sha`
 /// is the environment's own, never the app's. The sha lands even when a stop
 /// raced the deploy (tip dedup); `running` (and the error/asleep clearing)
 /// only applies while the environment still wants to run, in one statement
-/// so the stop cannot slip between the two.
-pub async fn mark_environment_deployed(pool: &SqlitePool, id: &str, sha: &str) -> sqlx::Result<()> {
+/// so the stop cannot slip between the two, and only from a state the
+/// transition table allows.
+pub async fn mark_environment_deployed(
+    pool: &SqlitePool,
+    id: &str,
+    sha: &str,
+) -> sqlx::Result<StatusWrite> {
     let ts = now_iso();
-    sqlx::query(
+    let sql = format!(
         "UPDATE environment SET status = CASE WHEN desired_state = 'running' THEN 'running' ELSE status END, \
          last_deploy_sha = ?, last_deployed_at = ?, \
          last_error = CASE WHEN desired_state = 'running' THEN NULL ELSE last_error END, \
          asleep_since = CASE WHEN desired_state = 'running' THEN NULL ELSE asleep_since END, \
-         updated_at = ? WHERE id = ?",
-    )
-    .bind(sha)
-    .bind(&ts)
-    .bind(&ts)
-    .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Write the observed status only while the environment still wants to run
-/// (same stop-race rule as [`crate::db::update_app_status_if_wanted`]).
-/// Returns whether the row was updated.
-pub async fn update_environment_status_if_wanted(
-    pool: &SqlitePool,
-    id: &str,
-    status: &str,
-    last_error: Option<&str>,
-) -> sqlx::Result<bool> {
-    let ts = now_iso();
-    let done = match last_error {
-        Some(message) => {
-            sqlx::query(
-                "UPDATE environment SET status = ?, last_error = ?, updated_at = ? WHERE id = ? AND desired_state = 'running'",
-            )
-            .bind(status)
-            .bind(message)
-            .bind(&ts)
+         updated_at = ? WHERE id = ? AND (desired_state != 'running' OR status IN ({}))",
+        super::apps::status_list(AppStatus::Running.predecessors())
+    );
+    let done = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(sha)
+        .bind(&ts)
+        .bind(&ts)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if done.rows_affected() > 0 {
+        return Ok(StatusWrite::Applied);
+    }
+    let current: Option<(AppStatus,)> =
+        sqlx::query_as("SELECT status FROM environment WHERE id = ?")
             .bind(id)
-            .execute(pool)
-            .await?
-        }
-        None => {
-            sqlx::query(
-                "UPDATE environment SET status = ?, updated_at = ? WHERE id = ? AND desired_state = 'running'",
-            )
-            .bind(status)
-            .bind(&ts)
-            .bind(id)
-            .execute(pool)
-            .await?
-        }
-    };
-    Ok(done.rows_affected() > 0)
+            .fetch_optional(pool)
+            .await?;
+    Ok(StatusWrite::Refused {
+        current: current
+            .map(|(status,)| status)
+            .unwrap_or(AppStatus::Pending),
+    })
 }
 
 /// Instance-wide environment count: the `RUNNER_MAX_ENVIRONMENTS` cap.
@@ -425,7 +442,7 @@ pub async fn insert_env_override_provisioned(
     environment_id: &str,
     name: &str,
     value: &str,
-    source: &str,
+    source: EnvSource,
 ) -> sqlx::Result<bool> {
     let done = sqlx::query(
         "INSERT INTO environment_env (environment_id, name, value, updated_at, source) \
@@ -435,7 +452,7 @@ pub async fn insert_env_override_provisioned(
     .bind(name)
     .bind(value)
     .bind(now_iso())
-    .bind(source)
+    .bind(source.as_str())
     .execute(pool)
     .await?;
     Ok(done.rows_affected() == 1)
@@ -447,7 +464,7 @@ pub async fn set_env_override_provisioned(
     environment_id: &str,
     name: &str,
     value: &str,
-    source: &str,
+    source: EnvSource,
 ) -> sqlx::Result<()> {
     sqlx::query(
         r#"INSERT INTO environment_env (environment_id, name, value, updated_at, source) VALUES (?, ?, ?, ?, ?)
@@ -458,7 +475,7 @@ pub async fn set_env_override_provisioned(
     .bind(name)
     .bind(value)
     .bind(now_iso())
-    .bind(source)
+    .bind(source.as_str())
     .execute(pool)
     .await?;
     Ok(())
@@ -493,18 +510,14 @@ pub async fn environment_worker_settings(
 ) -> sqlx::Result<Vec<(String, String)>> {
     let mut merged = std::collections::BTreeMap::new();
     for row in crate::db::env::list_env(pool, app_id).await? {
-        if row.source == crate::db::env::SOURCE_VOID_PROXY_TOKEN
-            || row.source == crate::db::env::SOURCE_AUTH_DEFAULT
-            || row.source == crate::db::env::SOURCE_VOID_SANDBOX_ADMISSION
-        {
+        // Every runner-provisioned app row is per-fleet and never inherited.
+        if row.source.is_provisioned() {
             continue;
         }
         merged.insert(row.name, row.value);
     }
     for row in list_env_override(pool, environment_id).await? {
-        if row.source == crate::db::env::SOURCE_VOID_PROXY_TOKEN
-            || row.source == crate::db::env::SOURCE_VOID_SANDBOX_ADMISSION
-        {
+        if row.source.is_runner_owned() {
             continue;
         }
         merged.insert(row.name, row.value);
@@ -530,7 +543,7 @@ pub async fn environment_tenant_env(
         .await
         .unwrap_or_default()
     {
-        if !row.source.is_empty() {
+        if row.source.is_provisioned() {
             continue;
         }
         if crate::db::env::env_reserved(&row.name) {
@@ -607,7 +620,7 @@ mod tests {
             .await
             .expect("create environment");
         assert_eq!(env.app_slug, "env-app");
-        assert_eq!(env.kind, "branch");
+        assert_eq!(env.kind, EnvironmentKind::Branch);
         assert_eq!(
             env.fleet_bucket,
             format!("s3://{}/envs/env-app/feature", cfg.s3_bucket)
@@ -618,7 +631,7 @@ mod tests {
             .unwrap();
         let fresh = get_environment(&pool, &env.id).await.unwrap().unwrap();
         assert_eq!(fresh.last_deploy_sha.as_deref(), Some("abc1234"));
-        assert_eq!(fresh.status, "running");
+        assert_eq!(fresh.status, AppStatus::Running);
         let app_after = crate::db::get_app(&pool, &app.id).await.unwrap().unwrap();
         assert_eq!(app_after.last_deploy_sha, None);
         // Lookups: by label, by ref, by route (host shape).
@@ -740,7 +753,7 @@ mod tests {
             &app.id,
             "BETTER_AUTH_SECRET",
             "minted",
-            crate::db::SOURCE_AUTH_DEFAULT,
+            EnvSource::AuthDefault,
         )
         .await
         .unwrap();
@@ -755,7 +768,7 @@ mod tests {
             &env.id,
             "__VOID_PROXY_TOKEN",
             "tok",
-            crate::db::SOURCE_VOID_PROXY_TOKEN,
+            EnvSource::VoidProxyToken,
         )
         .await
         .unwrap());
@@ -764,7 +777,7 @@ mod tests {
             &env.id,
             "__VOID_SANDBOX_ADMISSION_NAME",
             "admission",
-            crate::db::SOURCE_VOID_SANDBOX_ADMISSION,
+            EnvSource::VoidSandboxAdmission,
         )
         .await
         .unwrap());
@@ -777,7 +790,7 @@ mod tests {
             &env.id,
             "__VOID_PROXY_TOKEN",
             "other",
-            crate::db::SOURCE_VOID_PROXY_TOKEN,
+            EnvSource::VoidProxyToken,
         )
         .await
         .unwrap());
@@ -800,7 +813,7 @@ mod tests {
             &env.id,
             "BETTER_AUTH_SECRET",
             "env-mint",
-            crate::db::SOURCE_AUTH_DEFAULT,
+            EnvSource::AuthDefault,
         )
         .await
         .unwrap());
@@ -926,7 +939,7 @@ mod tests {
             .await
             .expect("get")
             .expect("row");
-        assert_eq!(fresh.status, "running");
+        assert_eq!(fresh.status, AppStatus::Running);
         assert_eq!(fresh.last_deploy_sha.as_deref(), Some("abc1234"));
         // A stop in the window: a later deploy's sha still records, but the
         // status never flips back.
@@ -940,15 +953,19 @@ mod tests {
         mark_environment_deployed(&pool, &env.id, "def5678")
             .await
             .expect("stopped deploy");
-        let flipped = update_environment_status_if_wanted(&pool, &env.id, "running", None)
-            .await
-            .expect("stopped flip");
-        assert!(!flipped, "a stop in the window wins over running");
+        let flipped =
+            write_environment_status(&pool, &env.id, AppStatus::Running, None, WriteGuard::Wanted)
+                .await
+                .expect("stopped flip");
+        assert!(
+            !flipped.is_applied(),
+            "a stop in the window wins over running"
+        );
         let fresh = get_environment(&pool, &env.id)
             .await
             .expect("get")
             .expect("row");
-        assert_eq!(fresh.status, "deploying");
+        assert_eq!(fresh.status, AppStatus::Deploying);
         assert_eq!(fresh.last_deploy_sha.as_deref(), Some("def5678"));
     }
 }

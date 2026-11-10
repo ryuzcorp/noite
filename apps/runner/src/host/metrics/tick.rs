@@ -102,7 +102,7 @@ fn telemetry_fleets(
 ) -> (HashMap<String, String>, HashMap<String, String>) {
     let mut slug_id: HashMap<String, String> = apps
         .iter()
-        .filter(|a| a.status == AppStatus::Running.as_str() || a.last_deploy_sha.is_some())
+        .filter(|a| a.status == AppStatus::Running || a.last_deploy_sha.is_some())
         .map(|a: &App| (a.slug.clone(), a.id.clone()))
         .collect();
     slug_id.insert(
@@ -112,7 +112,7 @@ fn telemetry_fleets(
     let mut slug_env: HashMap<String, String> = HashMap::new();
     for env in envs
         .iter()
-        .filter(|e| e.status == AppStatus::Running.as_str() || e.last_deploy_sha.is_some())
+        .filter(|e| e.status == AppStatus::Running || e.last_deploy_sha.is_some())
     {
         let key = supervisor::env_fleet_key(&env.app_slug, &env.label);
         slug_id.insert(key.clone(), env.app_id.clone());
@@ -503,9 +503,16 @@ mod tests {
         assert!(envs.is_empty());
         // Deploy the app and one environment; a second environment stays
         // never-deployed.
-        db::update_app_status(&pool, &app.id, "running", None, Some("prodsha"))
-            .await
-            .expect("deploy app");
+        db::write_app_status(
+            &pool,
+            &app.id,
+            crate::models::AppStatus::Running,
+            None,
+            Some("prodsha"),
+            crate::models::WriteGuard::Table,
+        )
+        .await
+        .expect("deploy app");
         let env = db::create_environment(
             &pool,
             &cfg,

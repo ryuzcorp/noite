@@ -136,7 +136,7 @@ fn sleep_candidate(app: &App) -> bool {
         && !app.is_asleep()
         && app.is_deployed()
         && app.listen_port.is_some()
-        && app.status == AppStatus::Running.as_str()
+        && app.status == AppStatus::Running
 }
 
 /// The same rule for an environment (ROADMAP: environments scale to zero like
@@ -146,7 +146,7 @@ fn sleep_candidate_env(env: &Environment) -> bool {
         && !env.is_asleep()
         && env.is_deployed()
         && env.listen_port.is_some()
-        && env.status == AppStatus::Running.as_str()
+        && env.status == AppStatus::Running
 }
 
 /// The scheduled sweep: park every running app — and every running preview
@@ -283,7 +283,13 @@ pub async fn sleep_app(
             return Ok(false);
         }
     }
-    db::set_app_asleep(pool, &app.id).await?;
+    // The write is the admission: a deploy that moved the app to `building`
+    // after the recheck above refuses the park, and stopping its fleet then
+    // would kill the build.
+    if !db::set_app_asleep(pool, &app.id).await?.is_applied() {
+        tracing::debug!(slug = %app.slug, "sleep refused: the app moved on");
+        return Ok(false);
+    }
     edge_table::push_routes(pool, cfg).await?;
     supervisor::stop_fleet(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
     crate::host::stats::record_sleep();
@@ -474,8 +480,15 @@ pub async fn confirm_app_running(
         tracing::warn!(app_id, "fleet never passed its health gate; leaving status");
         return;
     }
-    if let Err(e) =
-        db::update_app_status_if_wanted(pool, app_id, AppStatus::Running.as_str(), None).await
+    if let Err(e) = db::write_app_status(
+        pool,
+        app_id,
+        AppStatus::Running,
+        None,
+        None,
+        crate::models::WriteGuard::Wanted,
+    )
+    .await
     {
         tracing::warn!(app_id, error = %e, "mark running after its health gate");
     }
@@ -500,9 +513,14 @@ pub async fn confirm_environment_running(
         tracing::warn!(env_id, "fleet never passed its health gate; leaving status");
         return;
     }
-    if let Err(e) =
-        db::update_environment_status_if_wanted(pool, env_id, AppStatus::Running.as_str(), None)
-            .await
+    if let Err(e) = db::write_environment_status(
+        pool,
+        env_id,
+        AppStatus::Running,
+        None,
+        crate::models::WriteGuard::Wanted,
+    )
+    .await
     {
         tracing::warn!(env_id, error = %e, "mark running after its health gate");
     }
@@ -562,8 +580,16 @@ pub async fn wake_app(
     }
     // "Running" means the fleet answered the gate above: the write lands
     // after it, and still loses to a stop in the window.
-    if app.status != AppStatus::Running.as_str() {
-        db::update_app_status_if_wanted(pool, &app.id, AppStatus::Running.as_str(), None).await?;
+    if app.status != AppStatus::Running {
+        db::write_app_status(
+            pool,
+            &app.id,
+            AppStatus::Running,
+            None,
+            None,
+            crate::models::WriteGuard::Wanted,
+        )
+        .await?;
     }
     if was_asleep {
         // Back to the plain proxy route: later requests skip the wake hop.
@@ -609,7 +635,18 @@ pub async fn sleep_environment(
             None => return Ok(false),
         }
     }
-    db::set_environment_asleep(pool, &env.id).await?;
+    // Same rule as `sleep_app`: a refused park means the environment moved on
+    // (a deploy started), so its fleet must stay up.
+    if !db::set_environment_asleep(pool, &env.id)
+        .await?
+        .is_applied()
+    {
+        tracing::debug!(
+            fleet = %format!("{}.{}", env.app_slug, env.label),
+            "sleep refused: the environment moved on"
+        );
+        return Ok(false);
+    }
     edge_table::push_routes(pool, cfg).await?;
     supervisor::stop_environment_fleet(procs, &env.app_slug, &env.label).await;
     crate::host::stats::record_sleep();
@@ -676,9 +713,15 @@ pub async fn wake_environment(
         );
     }
     // Same truthful order as `wake_app`.
-    if env.status != AppStatus::Running.as_str() {
-        db::update_environment_status_if_wanted(pool, &env.id, AppStatus::Running.as_str(), None)
-            .await?;
+    if env.status != AppStatus::Running {
+        db::write_environment_status(
+            pool,
+            &env.id,
+            AppStatus::Running,
+            None,
+            crate::models::WriteGuard::Wanted,
+        )
+        .await?;
     }
     if was_asleep {
         edge_table::push_routes(pool, cfg).await?;
@@ -829,9 +872,16 @@ mod tests {
         )
         .await
         .expect("seed app");
-        crate::db::update_app_status(&pool, &app.id, "deploying", None, None)
-            .await
-            .expect("deploying");
+        crate::db::write_app_status(
+            &pool,
+            &app.id,
+            AppStatus::Deploying,
+            None,
+            None,
+            crate::models::WriteGuard::Table,
+        )
+        .await
+        .expect("deploying");
         let confirming: Confirming = Arc::new(Mutex::new(std::collections::HashSet::new()));
 
         confirm_app_running(&pool, &cfg, &confirming, &app.id, healthy_port().await).await;
@@ -839,20 +889,27 @@ mod tests {
             .await
             .expect("get")
             .expect("row");
-        assert_eq!(fresh.status, "running");
+        assert_eq!(fresh.status, AppStatus::Running);
 
-        crate::db::patch_app_desired(&pool, &app.id, "stopped")
+        crate::db::patch_app_desired(&pool, &app.id, crate::models::DesiredState::Stopped)
             .await
             .expect("stop");
-        crate::db::update_app_status(&pool, &app.id, "deploying", None, None)
-            .await
-            .expect("deploying again");
+        crate::db::write_app_status(
+            &pool,
+            &app.id,
+            AppStatus::Building,
+            None,
+            None,
+            crate::models::WriteGuard::Table,
+        )
+        .await
+        .expect("building again");
         confirm_app_running(&pool, &cfg, &confirming, &app.id, dead_port().await).await;
         let fresh = crate::db::get_app(&pool, &app.id)
             .await
             .expect("get")
             .expect("row");
-        assert_eq!(fresh.status, "deploying");
+        assert_eq!(fresh.status, AppStatus::Building);
     }
 }
 

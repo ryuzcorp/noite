@@ -155,7 +155,7 @@ pub fn parse_env_host(host: &str, bases: &[String]) -> Option<(String, String)> 
 pub fn env_live(route: &crate::db::EnvironmentRoute) -> bool {
     route.listen_port.is_some()
         && route.last_deployed_at.is_some()
-        && route.desired_state != crate::models::DesiredState::Stopped.as_str()
+        && !matches!(route.desired_state, crate::models::DesiredState::Stopped)
 }
 
 pub(crate) fn escape(text: &str) -> String {
@@ -423,7 +423,7 @@ pub async fn edge_fallback(State(state): State<AppState>, headers: HeaderMap) ->
                 &control,
             );
         };
-        if route.desired_state == crate::models::DesiredState::Stopped.as_str() {
+        if route.desired_state == crate::models::DesiredState::Stopped {
             return page(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Paused",

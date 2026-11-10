@@ -3,7 +3,10 @@
 use sqlx::SqlitePool;
 
 use crate::config::is_local_domain;
-use crate::models::{new_id, now_iso, App, AppDomain, AppLimit, AppStatus, DomainStatus};
+use crate::models::{
+    new_id, now_iso, App, AppDomain, AppLimit, AppStatus, DesiredState, DomainStatus, StatusWrite,
+    WriteGuard,
+};
 
 use super::APP_COLS;
 
@@ -24,25 +27,25 @@ pub async fn set_deployed_config(
 /// Terminal state of a background import (A2): `provisioned` on success — the
 /// deploy pipeline takes over from there — or `error` with the message. Guarded
 /// on `status = 'importing'`, so a push that raced the import and already
-/// started a deploy is never clobbered. Returns the rows affected (0 = the
-/// import lost the race and its outcome is advisory only).
+/// started a deploy is never clobbered. Returns whether the outcome landed
+/// (a refusal means the import lost the race and its outcome is advisory
+/// only).
 pub async fn finish_app_import(
     pool: &SqlitePool,
     id: &str,
-    status: &str,
+    next: AppStatus,
     last_error: Option<&str>,
-) -> sqlx::Result<u64> {
-    let res = sqlx::query(
-        "UPDATE app SET status = ?, last_error = ?, updated_at = ? \
-         WHERE id = ? AND status = 'importing'",
+) -> sqlx::Result<StatusWrite> {
+    const IMPORTING: &[AppStatus] = &[AppStatus::Importing];
+    write_app_status(
+        pool,
+        id,
+        next,
+        last_error,
+        None,
+        WriteGuard::From(IMPORTING),
     )
-    .bind(status)
-    .bind(last_error)
-    .bind(now_iso())
-    .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(res.rows_affected())
+    .await
 }
 
 /// Record the `source` (JSON) an app was created from, so a failed import can
@@ -380,15 +383,19 @@ pub async fn create_app(
 /// Owner start/stop. Either way the app is no longer asleep, and a start
 /// resets the idle clock so a manually started app gets a full window before
 /// the sleep sweep may park it again (SPEC, Scale to zero).
-pub async fn patch_app_desired(pool: &SqlitePool, id: &str, desired: &str) -> sqlx::Result<()> {
+pub async fn patch_app_desired(
+    pool: &SqlitePool,
+    id: &str,
+    desired: DesiredState,
+) -> sqlx::Result<()> {
     let now = now_iso();
     sqlx::query(
         r#"UPDATE app SET desired_state = ?, asleep_since = NULL,
            woke_at = CASE WHEN ? = 'running' THEN ? ELSE woke_at END,
            updated_at = ? WHERE id = ?"#,
     )
-    .bind(desired)
-    .bind(desired)
+    .bind(desired.as_str())
+    .bind(desired.as_str())
     .bind(&now)
     .bind(&now)
     .bind(id)
@@ -397,18 +404,36 @@ pub async fn patch_app_desired(pool: &SqlitePool, id: &str, desired: &str) -> sq
     Ok(())
 }
 
-/// Park an app (scale to zero): flag it asleep and show `sleeping`.
-pub async fn set_app_asleep(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
+/// Park an app (scale to zero): flag it asleep and show `sleeping`, in one
+/// statement whose `status IN (…)` is [`AppStatus::Sleeping`]'s predecessor
+/// list — a fleet that is not `running` cannot be parked, and the timestamp
+/// and the badge can never disagree. Returns whether the park applied.
+pub async fn set_app_asleep(pool: &SqlitePool, id: &str) -> sqlx::Result<StatusWrite> {
     let now = now_iso();
-    sqlx::query(
-        "UPDATE app SET asleep_since = ?, status = 'sleeping', updated_at = ? WHERE id = ?",
-    )
-    .bind(&now)
-    .bind(&now)
-    .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(())
+    let sql = format!(
+        "UPDATE app SET asleep_since = ?, status = ?, updated_at = ? \
+         WHERE id = ? AND status IN ({})",
+        status_list(AppStatus::Sleeping.predecessors())
+    );
+    let done = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(&now)
+        .bind(AppStatus::Sleeping.as_str())
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if done.rows_affected() > 0 {
+        return Ok(StatusWrite::Applied);
+    }
+    let current: Option<(AppStatus,)> = sqlx::query_as("SELECT status FROM app WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(StatusWrite::Refused {
+        current: current
+            .map(|(status,)| status)
+            .unwrap_or(AppStatus::Pending),
+    })
 }
 
 /// Wake an app: clear the flag and restart the idle clock. `status` is set
@@ -493,25 +518,67 @@ pub async fn delete_app(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
     Ok(())
 }
 
-pub async fn update_app_status(
+/// The one writer of `app.status` (the machine is
+/// [`crate::models::AppStatus`]). The statement carries the transition table
+/// as `status IN (<legal predecessors>)`, so an illegal move is refused by
+/// SQLite in the same write, not checked in Rust and then raced; and every
+/// guard the caller asked for ([`WriteGuard`]) rides the same statement.
+///
+/// A refused write is reported back with the row's current status, never
+/// silently ignored — that is what makes a second stop, a late deploy log or
+/// a retry of a live import visible to its caller instead of rewriting the
+/// row.
+pub async fn write_app_status(
     pool: &SqlitePool,
     id: &str,
-    status: &str,
+    next: AppStatus,
     last_error: Option<&str>,
     last_sha: Option<&str>,
-) -> sqlx::Result<()> {
-    sqlx::query(
-        r#"UPDATE app SET status = ?, last_error = ?, last_deploy_sha = COALESCE(?, last_deploy_sha),
-           updated_at = ? WHERE id = ?"#,
-    )
-    .bind(status)
-    .bind(last_error)
-    .bind(last_sha)
-    .bind(now_iso())
-    .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(())
+    guard: WriteGuard,
+) -> sqlx::Result<StatusWrite> {
+    let predecessors = match guard {
+        WriteGuard::From(states) => states,
+        _ => next.predecessors(),
+    };
+    let mut sql = format!(
+        "UPDATE app SET status = ?, last_error = ?, \
+         last_deploy_sha = COALESCE(?, last_deploy_sha), updated_at = ? \
+         WHERE id = ? AND status IN ({})",
+        status_list(predecessors)
+    );
+    if guard == WriteGuard::Wanted {
+        sql.push_str(" AND desired_state = 'running'");
+    }
+    let done = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(next.as_str())
+        .bind(last_error)
+        .bind(last_sha)
+        .bind(now_iso())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if done.rows_affected() > 0 {
+        return Ok(StatusWrite::Applied);
+    }
+    let current: Option<(AppStatus,)> = sqlx::query_as("SELECT status FROM app WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(StatusWrite::Refused {
+        current: current
+            .map(|(status,)| status)
+            .unwrap_or(AppStatus::Pending),
+    })
+}
+
+/// `'a', 'b'` for a `status IN (…)` clause. The values come from a status
+/// enum's own `as_str`, never from caller input.
+pub(crate) fn status_list<T: crate::models::PersistedStatus>(states: &[T]) -> String {
+    states
+        .iter()
+        .map(|status| format!("'{}'", status.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Record a deploy's sha without touching the observed status: a deploy that
@@ -525,28 +592,6 @@ pub async fn record_app_deploy_sha(pool: &SqlitePool, id: &str, sha: &str) -> sq
         .execute(pool)
         .await?;
     Ok(())
-}
-
-/// Write the observed status only while the app still wants to run. A stop
-/// (or delete) racing a deploy, a wake or a reconcile confirm must win:
-/// without the guard the loser flips a stopped app back to running (or
-/// failed). Returns whether the row was updated.
-pub async fn update_app_status_if_wanted(
-    pool: &SqlitePool,
-    id: &str,
-    status: &str,
-    last_error: Option<&str>,
-) -> sqlx::Result<bool> {
-    let done = sqlx::query(
-        "UPDATE app SET status = ?, last_error = ?, updated_at = ? WHERE id = ? AND desired_state = 'running'",
-    )
-    .bind(status)
-    .bind(last_error)
-    .bind(now_iso())
-    .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(done.rows_affected() > 0)
 }
 
 #[cfg(test)]
@@ -619,35 +664,199 @@ mod tests {
     async fn status_flips_only_while_wanted_and_sha_always_records() {
         let pool = connect("sqlite::memory:").await.expect("memory db");
         insert_app(&pool, "a", "a", "a.localhost").await;
-        update_app_status(&pool, "a", "deploying", None, None)
-            .await
-            .expect("deploying");
+        write_app_status(
+            &pool,
+            "a",
+            AppStatus::Deploying,
+            None,
+            None,
+            WriteGuard::Table,
+        )
+        .await
+        .expect("deploying");
         record_app_deploy_sha(&pool, "a", "abc123")
             .await
             .expect("sha");
-        patch_app_desired(&pool, "a", DesiredState::Stopped.as_str())
+        patch_app_desired(&pool, "a", DesiredState::Stopped)
             .await
             .expect("stop");
 
-        let flipped = update_app_status_if_wanted(&pool, "a", AppStatus::Running.as_str(), None)
-            .await
-            .expect("stopped flip");
-        assert!(!flipped, "a stop in the window wins over running");
-        let failed =
-            update_app_status_if_wanted(&pool, "a", AppStatus::Failed.as_str(), Some("boom"))
-                .await
-                .expect("stopped fail");
-        assert!(!failed, "a stop in the window wins over failed");
+        let flipped = write_app_status(
+            &pool,
+            "a",
+            AppStatus::Running,
+            None,
+            None,
+            WriteGuard::Wanted,
+        )
+        .await
+        .expect("stopped flip");
+        assert!(
+            !flipped.is_applied(),
+            "a stop in the window wins over running"
+        );
+        let failed = write_app_status(
+            &pool,
+            "a",
+            AppStatus::Failed,
+            Some("boom"),
+            None,
+            WriteGuard::Wanted,
+        )
+        .await
+        .expect("stopped fail");
+        assert!(
+            !failed.is_applied(),
+            "a stop in the window wins over failed"
+        );
 
         let app = get_app(&pool, "a").await.expect("get").expect("row");
-        assert_eq!(app.status, "deploying");
+        assert_eq!(app.status, AppStatus::Deploying);
         assert_eq!(app.last_deploy_sha.as_deref(), Some("abc123"));
         assert_eq!(app.last_error, None);
 
-        let gone = update_app_status_if_wanted(&pool, "nope", AppStatus::Running.as_str(), None)
+        let gone = write_app_status(
+            &pool,
+            "nope",
+            AppStatus::Running,
+            None,
+            None,
+            WriteGuard::Wanted,
+        )
+        .await
+        .expect("missing");
+        assert!(!gone.is_applied(), "a deleted row is a quiet no-op");
+    }
+
+    /// An import failure is not a dead end: a push can deploy an app whose
+    /// import failed, so `error -> building -> running` must be legal (it used
+    /// to be refused, leaving a live app badged `error` forever).
+    #[tokio::test]
+    async fn a_failed_import_can_still_deploy_to_running() {
+        let pool = connect("sqlite::memory:").await.expect("memory db");
+        insert_app(&pool, "a", "a", "a.localhost").await;
+        write_app_status(
+            &pool,
+            "a",
+            AppStatus::Importing,
+            None,
+            None,
+            WriteGuard::Table,
+        )
+        .await
+        .expect("importing");
+        let failed = write_app_status(
+            &pool,
+            "a",
+            AppStatus::Error,
+            Some("clone failed"),
+            None,
+            WriteGuard::Table,
+        )
+        .await
+        .expect("import failed");
+        assert!(failed.is_applied());
+        let building = write_app_status(
+            &pool,
+            "a",
+            AppStatus::Building,
+            None,
+            None,
+            WriteGuard::Table,
+        )
+        .await
+        .expect("deploy starts");
+        assert!(
+            building.is_applied(),
+            "a deploy of an import-failed app must not be refused"
+        );
+        let live = write_app_status(
+            &pool,
+            "a",
+            AppStatus::Running,
+            None,
+            Some("abc1234"),
+            WriteGuard::Wanted,
+        )
+        .await
+        .expect("deploy live");
+        assert!(live.is_applied());
+        assert_eq!(
+            get_app(&pool, "a").await.expect("get").expect("row").status,
+            AppStatus::Running
+        );
+    }
+
+    /// The transition table is enforced by the write itself: a live or
+    /// finished app cannot be dragged back to `importing` (which used to
+    /// clobber a running app's badge on Retry), and an import may only be
+    /// re-marked from a state Retry is for.
+    #[tokio::test]
+    async fn illegal_app_status_moves_are_refused_not_written() {
+        let pool = connect("sqlite::memory:").await.expect("memory db");
+        insert_app(&pool, "a", "a", "a.localhost").await;
+        assert_eq!(
+            get_app(&pool, "a").await.expect("get").expect("row").status,
+            AppStatus::Pending,
+            "the schema default decodes as Pending"
+        );
+
+        // A finished deploy leaves the app running.
+        write_app_status(
+            &pool,
+            "a",
+            AppStatus::Running,
+            None,
+            None,
+            WriteGuard::Table,
+        )
+        .await
+        .expect("running");
+        let refused = write_app_status(
+            &pool,
+            "a",
+            AppStatus::Importing,
+            None,
+            None,
+            WriteGuard::Table,
+        )
+        .await
+        .expect("refused");
+        assert_eq!(
+            refused,
+            StatusWrite::Refused {
+                current: AppStatus::Running
+            },
+            "a running app never becomes importing"
+        );
+        assert_eq!(
+            get_app(&pool, "a").await.expect("get").expect("row").status,
+            AppStatus::Running
+        );
+
+        // A failed import may be retried, and only an importing row reports
+        // the import's own outcome.
+        write_app_status(&pool, "a", AppStatus::Failed, None, None, WriteGuard::Table)
             .await
-            .expect("missing");
-        assert!(!gone, "a deleted row is a quiet no-op");
+            .expect("failed");
+        write_app_status(
+            &pool,
+            "a",
+            AppStatus::Importing,
+            None,
+            None,
+            WriteGuard::Table,
+        )
+        .await
+        .expect("retry legal from failed");
+        let landed = finish_app_import(&pool, "a", AppStatus::Error, Some("boom"))
+            .await
+            .expect("import outcome");
+        assert!(landed.is_applied());
+        let stale = finish_app_import(&pool, "a", AppStatus::Provisioned, None)
+            .await
+            .expect("second outcome");
+        assert!(!stale.is_applied(), "an import reports its outcome once");
     }
 
     /// A verification that loses the race reports `RivalWon` (the service
