@@ -155,8 +155,12 @@ impl AppStatus {
                 Self::Failed,
             ],
             Self::Error => &[Self::Importing, Self::Error],
+            // `Error` is here (and on `Running`): a push can deploy an app
+            // whose import failed, and the deploy must be able to show the
+            // badge of what it just did.
             Self::Building => &[
                 Self::Pending,
+                Self::Error,
                 Self::Provisioned,
                 Self::Importing,
                 Self::Building,
@@ -171,6 +175,7 @@ impl AppStatus {
                 Self::Pending,
                 Self::Provisioned,
                 Self::Importing,
+                Self::Error,
                 Self::Building,
                 Self::Deploying,
                 Self::Running,

@@ -221,7 +221,9 @@ async fn create_inner(
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
     let app = app_or_404(state, &app.id).await?;
-    import::spawn(state, app.clone(), git.clone());
+    // A row created a moment ago cannot be held by another attempt, so the
+    // claim always succeeds here.
+    let _ = import::spawn(state, app.clone(), git.clone());
     Ok(app)
 }
 
@@ -236,11 +238,6 @@ pub async fn retry_import(state: &AppState, id: &str) -> Result<App, ApiError> {
     let AppSource::Git(git) = source else {
         return Err(ApiError::bad("this app was not created from an import"));
     };
-    // `importing` with a live task is a real conflict; `importing` without one
-    // is an import interrupted by a restart, which is what Retry is for.
-    if app.status == AppStatus::Importing && import::running(&app.id) {
-        return Err(ApiError::conflict("an import is already running"));
-    }
     // The status write is the gate: only a state an import can start from
     // (pending, provisioned, error, stopped, failed) moves to `importing`, so
     // Retry can no longer drag a running or deploying app back to
@@ -263,8 +260,14 @@ pub async fn retry_import(state: &AppState, id: &str) -> Result<App, ApiError> {
             _ => "the app is busy; retry after its current operation",
         }));
     }
+    // The claim is the gate against a second concurrent retry: `spawn`
+    // takes it atomically, so exactly one attempt runs and the loser answers
+    // the same conflict a live import does. An `importing` row with no claim
+    // is an import interrupted by a restart — what Retry is for.
     let app = app_or_404(state, &app.id).await?;
-    import::spawn(state, app.clone(), git);
+    if !import::spawn(state, app.clone(), git) {
+        return Err(ApiError::conflict("an import is already running"));
+    }
     Ok(app)
 }
 

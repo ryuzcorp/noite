@@ -175,6 +175,14 @@ impl Cancels {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Drop a token, as a finished run does. Production goes through
+    /// [`ReleaseGuard`] (which only removes its own token); tests use this to
+    /// simulate a run that already ended.
+    #[cfg(test)]
+    pub fn release(&self, deploy_id: &str) {
+        self.guard_map().remove(deploy_id);
+    }
+
     /// A fresh token for `deploy_id`; the previous one (a finished run) is
     /// replaced.
     pub fn register(&self, deploy_id: &str) -> CancelHandle {
@@ -182,12 +190,6 @@ impl Cancels {
         self.guard_map()
             .insert(deploy_id.to_string(), token.clone());
         token
-    }
-
-    /// Drop the token once the run ends: a later stop of the same row is
-    /// then answered from the database, not by tripping a dead token.
-    pub fn release(&self, deploy_id: &str) {
-        self.guard_map().remove(deploy_id);
     }
 
     /// Trip the live token for `deploy_id`, unless its run already committed
@@ -213,20 +215,35 @@ impl Cancels {
 /// Releases a deploy's token when the run ends, however it ends (a panic
 /// included): a stop of the finished row is then answered from its status.
 pub struct ReleaseGuard {
+    /// The registry that registered the token (the process-wide `CANCELS` in
+    /// production): the guard releases into the one that made it.
+    registry: Cancels,
     id: String,
+    /// The token this run registered, if any: a guard never releases a
+    /// token another run registered for the same id (a re-used row id).
+    token: Option<CancelHandle>,
 }
 
 impl Drop for ReleaseGuard {
     fn drop(&mut self) {
-        CANCELS.release(&self.id);
+        let mut live = self.registry.guard_map();
+        if let (Some(ours), Some(current)) = (&self.token, live.get(&self.id)) {
+            if Arc::ptr_eq(ours, current) {
+                live.remove(&self.id);
+            }
+        }
     }
 }
 
 impl Cancels {
-    /// The token lifetime guard for one run.
+    /// The token lifetime guard for one run: it releases the token it was
+    /// made for, and only while that token is still the registered one.
     pub fn guard(&self, deploy_id: &str) -> ReleaseGuard {
+        let token = self.guard_map().get(deploy_id).cloned();
         ReleaseGuard {
+            registry: self.clone(),
             id: deploy_id.to_string(),
+            token,
         }
     }
 }
@@ -276,6 +293,25 @@ mod tests {
             !committed_first.is_cancelled(),
             "every later cancel check stays satisfied past the point of no return"
         );
+    }
+
+    /// A late release from an earlier run can never drop a newer run's token
+    /// for the same id: only the token the guard was made for is removed.
+    #[test]
+    fn a_release_guard_never_frees_another_runs_token() {
+        let cancels = Cancels::default();
+        let _first = cancels.register("reused-id");
+        let stale = cancels.guard("reused-id");
+        let second = cancels.register("reused-id");
+        drop(stale);
+        assert_eq!(
+            cancels.cancel("reused-id"),
+            CancelOutcome::Signalled,
+            "the live run's token survives the old run's release"
+        );
+        assert!(second.is_cancelled());
+        drop(cancels.guard("reused-id"));
+        assert_eq!(cancels.cancel("reused-id"), CancelOutcome::Missing);
     }
 
     /// Repeated stops are idempotent, and a released token stops being a

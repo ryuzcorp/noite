@@ -728,6 +728,65 @@ mod tests {
         assert!(!gone.is_applied(), "a deleted row is a quiet no-op");
     }
 
+    /// An import failure is not a dead end: a push can deploy an app whose
+    /// import failed, so `error -> building -> running` must be legal (it used
+    /// to be refused, leaving a live app badged `error` forever).
+    #[tokio::test]
+    async fn a_failed_import_can_still_deploy_to_running() {
+        let pool = connect("sqlite::memory:").await.expect("memory db");
+        insert_app(&pool, "a", "a", "a.localhost").await;
+        write_app_status(
+            &pool,
+            "a",
+            AppStatus::Importing,
+            None,
+            None,
+            WriteGuard::Table,
+        )
+        .await
+        .expect("importing");
+        let failed = write_app_status(
+            &pool,
+            "a",
+            AppStatus::Error,
+            Some("clone failed"),
+            None,
+            WriteGuard::Table,
+        )
+        .await
+        .expect("import failed");
+        assert!(failed.is_applied());
+        let building = write_app_status(
+            &pool,
+            "a",
+            AppStatus::Building,
+            None,
+            None,
+            WriteGuard::Table,
+        )
+        .await
+        .expect("deploy starts");
+        assert!(
+            building.is_applied(),
+            "a deploy of an import-failed app must not be refused"
+        );
+        let live = write_app_status(
+            &pool,
+            "a",
+            AppStatus::Running,
+            None,
+            Some("abc1234"),
+            WriteGuard::Wanted,
+        )
+        .await
+        .expect("deploy live");
+        assert!(live.is_applied());
+        assert_eq!(
+            get_app(&pool, "a").await.expect("get").expect("row").status,
+            AppStatus::Running
+        );
+    }
+
     /// The transition table is enforced by the write itself: a live or
     /// finished app cannot be dragged back to `importing` (which used to
     /// clobber a running app's badge on Retry), and an import may only be

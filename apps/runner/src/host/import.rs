@@ -261,33 +261,47 @@ fn imports() -> std::sync::MutexGuard<'static, HashMap<String, ImportState>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-impl ImportState {
-    /// Whether a task here holds the app right now. A row that says
-    /// `importing` while this is false is an import whose task died with an
-    /// earlier process — exactly the case Retry must still serve.
-    pub fn is_running(self) -> bool {
-        self == Self::Running
-    }
-}
-
 /// The attempt's claim, moved into the import task and moved to
 /// [`ImportState::Done`] on every exit path — a panic included — so an app can
 /// never stay "importing here" forever. One entry per app at most: the map is
 /// bounded by the number of apps, and the next spawn overwrites it.
 struct ImportClaim(String);
 
+impl ImportClaim {
+    /// Claim `app_id` for one attempt. `None` = a task in this process already
+    /// holds it. The check and the insert are one locked step, so two
+    /// concurrent retries cannot both start an import.
+    fn take(app_id: &str) -> Option<Self> {
+        let mut imports = imports();
+        match imports.get(app_id) {
+            Some(ImportState::Running) => None,
+            _ => {
+                imports.insert(app_id.to_string(), ImportState::Running);
+                Some(Self(app_id.to_string()))
+            }
+        }
+    }
+}
+
 impl Drop for ImportClaim {
     fn drop(&mut self) {
-        imports().insert(self.0.clone(), ImportState::Done);
+        // Running -> Done, and only from Running: a claim never un-claims an
+        // attempt that is not its own.
+        let mut imports = imports();
+        if imports.get(&self.0) == Some(&ImportState::Running) {
+            imports.insert(self.0.clone(), ImportState::Done);
+        }
     }
 }
 
 /// Start the background import (A2/A3). The caller has already stored the
 /// source and flipped the app to `importing`, so `create` returns at once.
-pub fn spawn(state: &AppState, app: App, source: GitSource) {
-    let app_id = app.id.clone();
-    imports().insert(app_id.clone(), ImportState::Running);
-    let claim = ImportClaim(app_id);
+/// `false` = this process already runs an import for the app, so nothing was
+/// started (the caller reports the conflict).
+pub fn spawn(state: &AppState, app: App, source: GitSource) -> bool {
+    let Some(claim) = ImportClaim::take(&app.id) else {
+        return false;
+    };
     let state = state.clone();
     tokio::spawn(async move {
         let _claim = claim;
@@ -295,13 +309,7 @@ pub fn spawn(state: &AppState, app: App, source: GitSource) {
             tracing::error!(slug = %app.slug, error = %format!("{e:#}"), "import failed");
         }
     });
-}
-
-/// Whether this process is running an import for `app_id`.
-pub fn running(app_id: &str) -> bool {
-    imports()
-        .get(app_id)
-        .is_some_and(|state| state.is_running())
+    true
 }
 
 /// The whole import, with the app row's status moved by the outcome. Only runs
@@ -739,6 +747,28 @@ mod tests {
 
     fn dir() -> crate::testutil::TempDir {
         crate::testutil::TempDir::new("noite-import")
+    }
+
+    /// One attempt per app: the claim is taken atomically (two concurrent
+    /// retries used to both pass a read-then-spawn check and clone into the
+    /// same mirror), it releases Running -> Done on every exit path, and a
+    /// finished attempt is claimable again.
+    #[test]
+    fn a_second_import_claim_is_refused_and_a_finished_one_frees_the_app() {
+        let first = ImportClaim::take("sm-claim-app").expect("first claim wins");
+        assert!(
+            ImportClaim::take("sm-claim-app").is_none(),
+            "a second attempt must not start"
+        );
+        drop(first);
+        assert_eq!(
+            imports().get("sm-claim-app"),
+            Some(&ImportState::Done),
+            "the claim reports the attempt finished"
+        );
+        let second = ImportClaim::take("sm-claim-app").expect("a finished attempt frees the app");
+        drop(second);
+        imports().remove("sm-claim-app");
     }
 
     /// The URL allowlist is the security boundary: only the exact GitHub https

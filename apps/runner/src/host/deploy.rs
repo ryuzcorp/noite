@@ -206,7 +206,9 @@ pub async fn deploy_app(
     // run that starts anyway once the claim frees (the row is already
     // failed, and `Progress` would rewrite it building).
     let early_cancel = deploy_id.map(|id| crate::host::cancel::CANCELS.register(id));
-    let _release = deploy_id.map(|id| crate::host::cancel::CANCELS.guard(id));
+    // Covers every early return below (a claim that times out or is
+    // refused): the pre-created row keeps no live token once this run ends.
+    let _early_release = deploy_id.map(|id| crate::host::cancel::CANCELS.guard(id));
     let claimed = match deploy_id {
         Some(_) => {
             let wait = Duration::from_millis(crate::lifecycle::DEPLOY_STUCK_MS.unsigned_abs());
@@ -298,6 +300,13 @@ pub async fn deploy_app(
             .as_deref()
             .map(|id| crate::host::cancel::CANCELS.register(id)),
     };
+    // Released when this run ends, whatever id it actually used: a tip
+    // deploy created its row above, so naming only the caller-supplied id
+    // would leak one live token per background deploy for the life of the
+    // process (and leave a stale, still-stoppable key behind).
+    let _release = deploy_id
+        .as_deref()
+        .map(|id| crate::host::cancel::CANCELS.guard(id));
     let mut progress = Progress {
         pool,
         app_id: &app.id,
