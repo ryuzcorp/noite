@@ -112,6 +112,7 @@ func (s *upstreamState) observe(next Health) {
 	s.changed = make(chan struct{})
 }
 
+// get returns the last observed health and the channel that flips with it.
 func (s *upstreamState) get() (Health, <-chan struct{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -185,6 +186,7 @@ func (p *Prober) dropLocked(upstream string) {
 	delete(p.up, upstream)
 }
 
+// run probes upstream until ctx is cancelled, recording every result.
 func (p *Prober) run(ctx context.Context, upstream string, st *upstreamState) {
 	t := time.NewTicker(p.interval)
 	defer t.Stop()

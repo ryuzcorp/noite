@@ -24,6 +24,7 @@ import (
 	"go.uber.org/zap"
 )
 
+// init registers the module and its Caddyfile directives.
 func init() {
 	caddy.RegisterModule(new(EdgeRoutes))
 	caddy.RegisterModule(new(EdgeHold))
@@ -144,6 +145,7 @@ type sharedState struct {
 
 var shared = newSharedState()
 
+// newSharedState returns a booting shared state with the production probe timings.
 func newSharedState() *sharedState {
 	s := &sharedState{
 		holdRecheck: HoldRecheck,
@@ -661,6 +663,7 @@ func handleAdmin(w http.ResponseWriter, r *http.Request) error {
 	}
 }
 
+// writeJSON answers one admin request.
 func writeJSON(w http.ResponseWriter, v any) error {
 	w.Header().Set("Content-Type", "application/json")
 	return json.NewEncoder(w).Encode(v)

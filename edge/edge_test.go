@@ -68,12 +68,14 @@ func tracks(upstream string) bool {
 	return ok
 }
 
+// testHandler resets the shared state around table and returns a handler.
 func testHandler(t *testing.T, table *Table) *EdgeRoutes {
 	t.Helper()
 	resetShared(t, table, nil)
 	return &EdgeRoutes{}
 }
 
+// nextOK is a terminal handler that asserts the vars the static config reads.
 func nextOK(vars map[string]string) (caddyhttp.Handler, *atomic.Bool) {
 	called := &atomic.Bool{}
 	return caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
@@ -90,6 +92,7 @@ func nextOK(vars map[string]string) (caddyhttp.Handler, *atomic.Bool) {
 	}), called
 }
 
+// requestWithVars builds a request with an empty Caddy vars map.
 func requestWithVars(host string) *http.Request {
 	r := httptest.NewRequest(http.MethodGet, "http://"+host+"/", nil)
 	ctx := r.Context()
@@ -97,6 +100,7 @@ func requestWithVars(host string) *http.Request {
 	return r.WithContext(ctx)
 }
 
+// TestLookup pins host normalization, exact-before-wildcard and one-label suffixes.
 func TestLookup(t *testing.T) {
 	table := &Table{Exact: map[string]Route{
 		"myapp.noite.localhost": {Kind: KindTenant, Upstream: "127.0.0.1:20011"},
@@ -131,6 +135,7 @@ func TestLookup(t *testing.T) {
 	}
 }
 
+// TestValidate refuses malformed tables and accepts a complete one.
 func TestValidate(t *testing.T) {
 	bad := []*Table{
 		{Exact: map[string]Route{"": {Kind: KindTenant, Upstream: "127.0.0.1:1"}}},
@@ -159,6 +164,7 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+// TestClientKey pins IPv4 keys, IPv6 /64 collapse and the unparsable skip.
 func TestClientKey(t *testing.T) {
 	v4a, v4b := ClientKey("10.1.2.3"), ClientKey("10.1.2.4")
 	if v4a == "" || v4a != ClientKey("10.1.2.3") {
@@ -182,6 +188,7 @@ func TestClientKey(t *testing.T) {
 	}
 }
 
+// TestRateLimit pins the sliding window, the shared key and the Retry-After.
 func TestRateLimit(t *testing.T) {
 	now := time.Now()
 	clock := &atomic.Int64{}
@@ -208,6 +215,7 @@ func TestRateLimit(t *testing.T) {
 	}
 }
 
+// TestServeRateLimited answers 429 with Retry-After from the client zone.
 func TestServeRateLimited(t *testing.T) {
 	table := &Table{Exact: map[string]Route{
 		"a.test": {Kind: KindTenant, Upstream: "127.0.0.1:1", ClientRPM: 6, ClientZone: "c_a"},
@@ -234,6 +242,7 @@ func TestServeRateLimited(t *testing.T) {
 	}
 }
 
+// TestAtomicSwapUnderRace checks every request sees one coherent table.
 func TestAtomicSwapUnderRace(t *testing.T) {
 	e := testHandler(t, &Table{Generation: 1, Exact: map[string]Route{
 		"a.test": {Kind: KindTenant, Upstream: "127.0.0.1:1"},
@@ -289,6 +298,7 @@ func TestAtomicSwapUnderRace(t *testing.T) {
 	wg.Wait()
 }
 
+// TestHoldAndRelease holds while the upstream is down and proxies once it is up.
 func TestHoldAndRelease(t *testing.T) {
 	healthy := &atomic.Bool{} // starts down
 	resetShared(t, &Table{Exact: map[string]Route{
@@ -328,6 +338,7 @@ func TestHoldAndRelease(t *testing.T) {
 	}
 }
 
+// TestHoldSkipsAsleep leaves asleep routes to the wake hop and never probes them.
 func TestHoldSkipsAsleep(t *testing.T) {
 	// F2: a down prober plus Asleep must reach next immediately — the wake
 	// hop, not the hold, waits for the fleet.
@@ -362,6 +373,7 @@ func TestHoldSkipsAsleep(t *testing.T) {
 	}
 }
 
+// TestHoldTimeoutReturns503WithoutProxying answers 503 at the cap, never a proxy.
 func TestHoldTimeoutReturns503WithoutProxying(t *testing.T) {
 	resetShared(t, &Table{Exact: map[string]Route{
 		"a.test": {Kind: KindTenant, Upstream: "127.0.0.1:9"},
@@ -387,6 +399,7 @@ func TestHoldTimeoutReturns503WithoutProxying(t *testing.T) {
 	}
 }
 
+// TestTwoInstancesShareOneTable pushes once and swaps the table for every instance.
 func TestTwoInstancesShareOneTable(t *testing.T) {
 	// F1: every instance reads the same process-wide table; one push
 	// swaps it for all of them.
@@ -417,6 +430,7 @@ func TestTwoInstancesShareOneTable(t *testing.T) {
 	}
 }
 
+// TestWaitOutcomes distinguishes the cap from an untracked upstream.
 func TestWaitOutcomes(t *testing.T) {
 	// Down past the cap is TimedOut; an untracked upstream is Abandoned
 	// (fail open), never reported as healthy.
@@ -435,6 +449,7 @@ func TestWaitOutcomes(t *testing.T) {
 	}
 }
 
+// TestWaitAbandonsDroppedUpstream ends the hold alone when the table drops the upstream.
 func TestWaitAbandonsDroppedUpstream(t *testing.T) {
 	// A hold must end the moment the table stops tracking the upstream:
 	// the route changed under the request, so waiting out the cap only
@@ -463,6 +478,7 @@ func TestWaitAbandonsDroppedUpstream(t *testing.T) {
 	}
 }
 
+// TestWildcardWireShape accepts the nested runner shape and rejects the flat one.
 func TestWildcardWireShape(t *testing.T) {
 	// The runner serializes wildcards nested as {"suffix", "route"}; a flat
 	// shape would decode with a zero Route and fail validation.
@@ -485,6 +501,7 @@ func TestWildcardWireShape(t *testing.T) {
 	}
 }
 
+// TestConcurrentPostsNewestWins keeps the newest generation under overlap.
 func TestConcurrentPostsNewestWins(t *testing.T) {
 	// Two overlapping POSTs, older and newer generation: whatever order
 	// they run in, the newer generation wins and the older gets a 409.
@@ -524,6 +541,7 @@ func TestConcurrentPostsNewestWins(t *testing.T) {
 	}
 }
 
+// TestRejectsOlderGeneration answers 409 for a stale generation and keeps the live table.
 func TestRejectsOlderGeneration(t *testing.T) {
 	// F6: generations are monotonic; an older table landing last must not
 	// un-publish newer routes.
@@ -548,6 +566,7 @@ func TestRejectsOlderGeneration(t *testing.T) {
 	}
 }
 
+// TestConcurrentPushesKeepNewest serializes overlapping pushes around the check.
 func TestConcurrentPushesKeepNewest(t *testing.T) {
 	// Overlapping pushes must serialize around the generation check and
 	// the swap: the final table is always the newest generation, never a
@@ -584,6 +603,7 @@ func TestConcurrentPushesKeepNewest(t *testing.T) {
 	}
 }
 
+// itoa formats a generation without importing strconv.
 func itoa(n uint64) string {
 	if n == 0 {
 		return "0"
@@ -598,6 +618,7 @@ func itoa(n uint64) string {
 	return string(b[i:])
 }
 
+// TestAdminValidation maps a bad table to 400, keeps the old one and 405s other verbs.
 func TestAdminValidation(t *testing.T) {
 	testHandler(t, &Table{Generation: 7, Exact: map[string]Route{
 		"a.test": {Kind: KindTenant, Upstream: "127.0.0.1:1"},
@@ -637,6 +658,7 @@ func TestAdminValidation(t *testing.T) {
 	}
 }
 
+// TestAsleepAndGatedVars publishes the wake/gate vars and the 404 vs 503 split.
 func TestAsleepAndGatedVars(t *testing.T) {
 	table := &Table{Exact: map[string]Route{
 		"sleepy.test": {Kind: KindTenant, Upstream: "127.0.0.1:1", Asleep: true},
@@ -679,6 +701,7 @@ func TestAsleepAndGatedVars(t *testing.T) {
 	}
 }
 
+// TestLastCleanupDrainsSharedState drops the table, limiter and prober at the last cleanup.
 func TestLastCleanupDrainsSharedState(t *testing.T) {
 	table := &Table{Generation: 1, Exact: map[string]Route{
 		"a.test": {Kind: KindTenant, Upstream: "127.0.0.1:1"},
@@ -739,6 +762,7 @@ func TestLastCleanupDrainsSharedState(t *testing.T) {
 	shared.release()
 }
 
+// TestProvisionOrdersByGeneration keeps a newer pushed table over an older file.
 func TestProvisionOrdersByGeneration(t *testing.T) {
 	// A config reload re-reads the table file. The file is only as fresh as
 	// the runner's last write, which can be older than a table it has
@@ -778,6 +802,7 @@ func TestProvisionOrdersByGeneration(t *testing.T) {
 	}
 }
 
+// TestEqualGenerationContentApplies applies a correction and no-ops an identical re-push.
 func TestEqualGenerationContentApplies(t *testing.T) {
 	// The runner only re-pushes identical bytes under a generation, so an
 	// equal generation with different routes is a correction that must
@@ -805,6 +830,7 @@ func TestEqualGenerationContentApplies(t *testing.T) {
 	}
 }
 
+// writeTableFile writes a route table file for the Provision tests.
 func writeTableFile(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
@@ -812,6 +838,7 @@ func writeTableFile(t *testing.T, path, body string) {
 	}
 }
 
+// TestValidateRefusesImpossibleModes refuses hop, rewrite and limit combinations.
 func TestValidateRefusesImpossibleModes(t *testing.T) {
 	up := "127.0.0.1:1"
 	bad := []Route{
@@ -850,6 +877,7 @@ func TestValidateRefusesImpossibleModes(t *testing.T) {
 	}
 }
 
+// TestModeTransitionTable pins deny/hold/wake/gate for every kind.
 func TestModeTransitionTable(t *testing.T) {
 	up := "127.0.0.1:1"
 	cases := []struct {
@@ -883,6 +911,7 @@ func TestModeTransitionTable(t *testing.T) {
 	}
 }
 
+// TestHoldDecisionPublishedOnce publishes the hold decision and EdgeHold obeys it.
 func TestHoldDecisionPublishedOnce(t *testing.T) {
 	// EdgeHold branches on VarHold, which EdgeRoutes sets from the derived
 	// mode: a parked or asleep host must pass even with a down prober.

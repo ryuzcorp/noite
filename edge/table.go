@@ -281,6 +281,7 @@ func normalizeHost(host string) string {
 	return strings.TrimSuffix(host, ".")
 }
 
+// splitHostPort splits host:port, rejecting a bare host the way the table keys assume.
 func splitHostPort(hostport string) (string, string, error) {
 	// Avoid net.SplitHostPort: it rejects bare hosts without a port,
 	// which is the common case here.
