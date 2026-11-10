@@ -6,4 +6,5 @@
 
 ### Operator action required
 
+- `CONTROL_SUBDOMAIN` and `CONTROL_EXTRA_HOSTS` values must now be bare DNS names or IP literals: a scheme, port or path was never matchable by the edge and now fails validation at boot instead of leaving a claimable short host. Fix the value if the runner refuses to start.
 - An existing app whose slug already collides with a platform host (for example it matches a custom `CONTROL_SUBDOMAIN`) keeps its row and data but loses that host's route: the platform host serves the control plane again. Rename the app to a free slug to serve its site under a tenant hostname.

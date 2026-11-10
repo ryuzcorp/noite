@@ -27,7 +27,28 @@ fn parse_host_list(raw: &str) -> Vec<String> {
 /// or uppercase `BASE_DOMAIN`/`CONTROL_*` value would otherwise leave keys
 /// the edge can never match (and a tenant could take the reachable form).
 pub(crate) fn normalize_host(raw: &str) -> String {
-    raw.trim().trim_end_matches('.').to_lowercase()
+    raw.trim().trim_matches('.').to_lowercase()
+}
+
+/// Whether a configured control host is a bare DNS name or IP literal — the
+/// only shapes a `Host` header can carry. A scheme, port or path would leave
+/// a table key the edge can never match while the short host stays claimable.
+fn bare_host_ok(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    })
 }
 
 fn parse_auto_https(raw: Option<&str>, base_domain: &str) -> bool {
@@ -1790,6 +1811,25 @@ impl Config {
         // A 0 memory limit means DuckDB's own 80%-of-RAM default, which is
         // exactly what this knob exists to avoid; a tiny one makes every
         // query spill forever. 64 MiB is the floor DuckDB can run a scan in.
+        // Control hosts must be what a Host header can carry: a bare DNS
+        // name or IP literal. A scheme/port/path value would key a route the
+        // edge can never match while its short form stays a claimable tenant
+        // host (see `normalize_host`).
+        let sub = normalize_host(&self.control_subdomain);
+        if !sub.is_empty() && !bare_host_ok(&sub) {
+            problems.push(format!(
+                "CONTROL_SUBDOMAIN must be a bare DNS name, got {:?}",
+                self.control_subdomain
+            ));
+        }
+        for raw in &self.control_extra_hosts {
+            let host = normalize_host(raw);
+            if !host.is_empty() && !bare_host_ok(&host) {
+                problems.push(format!(
+                    "CONTROL_EXTRA_HOSTS entries must be bare DNS names or IP literals, got {raw:?}"
+                ));
+            }
+        }
         if self.duckdb_memory_mb < 64 {
             problems.push("RUNNER_DUCKDB_MEMORY_MB must be >= 64".into());
         }
@@ -2961,6 +3001,16 @@ mod tests {
         assert_eq!(cfg.tenant_bases(), vec!["example.com", "panel.example.com"]);
         cfg.control_subdomain = "Console.".into();
         assert_eq!(cfg.control_hosts()[0], "console.example.com");
+        // A scheme/port/path is not a Host header: refuse it at boot instead
+        // of keying a route the edge never matches.
+        let mut bad = config_for_tests();
+        bad.control_subdomain = "https://app".into();
+        assert!(bad.validate().is_err(), "scheme in CONTROL_SUBDOMAIN");
+        bad.control_subdomain = "app".into();
+        bad.control_extra_hosts = vec!["panel.localhost:443".into()];
+        assert!(bad.validate().is_err(), "port in CONTROL_EXTRA_HOSTS");
+        bad.control_extra_hosts = vec!["192.168.10.62".into()];
+        assert!(bad.validate().is_ok(), "an IP literal stays control-only");
     }
 
     #[test]
