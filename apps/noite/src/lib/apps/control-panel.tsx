@@ -245,6 +245,8 @@ export const ControlAppDetail = () => {
     resourceValue(admin.state()) !== undefined &&
     resourceValue(sess.state()) !== undefined;
 
+  // The one predicate (lib/authority): role, env anchor, ban and
+  // impersonation are already folded in by the server's overview.
   const allowed = mayAdministerInstance(
     overviewAuthority(resourceValue(admin.state()))
   );
