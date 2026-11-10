@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use sqlx::{FromRow, SqlitePool};
 
-use crate::models::{new_id, now_iso};
+use crate::models::{new_id, now_iso, PrState, ReviewState};
 
 /// Columns every `pull_request` query selects, in struct order.
 pub const PR_COLS: &str = "id, app_id, number, title, body, author_id, base, head, state, \
@@ -22,7 +22,7 @@ pub struct PullRequestRow {
     pub author_id: String,
     pub base: String,
     pub head: String,
-    pub state: String,
+    pub state: PrState,
     pub head_sha: String,
     pub merge_sha: Option<String>,
     pub merged_by: Option<String>,
@@ -50,7 +50,7 @@ pub struct PrCommentRow {
 pub struct PrReviewRow {
     pub id: String,
     pub reviewer_id: String,
-    pub state: String,
+    pub state: ReviewState,
     pub commit_sha: String,
     pub created_at: String,
     pub dismissed_at: Option<String>,
@@ -107,7 +107,7 @@ pub async fn insert_pr(
         author_id: author_id.to_string(),
         base: base.to_string(),
         head: head.to_string(),
-        state: "open".to_string(),
+        state: PrState::Open,
         head_sha: head_sha.to_string(),
         merge_sha: None,
         merged_by: None,
@@ -172,7 +172,7 @@ pub async fn open_for_pair(
 pub async fn list_prs(
     pool: &SqlitePool,
     app_id: &str,
-    state: Option<&str>,
+    state: Option<PrState>,
     skip: i64,
     limit: i64,
 ) -> sqlx::Result<Vec<PullRequestRow>> {
@@ -193,20 +193,21 @@ pub async fn list_prs(
     query.bind(limit).bind(skip).fetch_all(pool).await
 }
 
-/// `(open, closed, merged)` counts for one app's filter chips.
+/// `(open, closed, merged)` counts for one app's filter chips. Decoding the
+/// state as [`PrState`] makes an unexpected value a loud error instead of a
+/// silently dropped count.
 pub async fn counts(pool: &SqlitePool, app_id: &str) -> sqlx::Result<(i64, i64, i64)> {
-    let rows: Vec<(String, i64)> =
+    let rows: Vec<(PrState, i64)> =
         sqlx::query_as("SELECT state, COUNT(*) FROM pull_request WHERE app_id = ? GROUP BY state")
             .bind(app_id)
             .fetch_all(pool)
             .await?;
     let mut counts = (0, 0, 0);
     for (state, count) in rows {
-        match state.as_str() {
-            "open" => counts.0 = count,
-            "closed" => counts.1 = count,
-            "merged" => counts.2 = count,
-            _ => {}
+        match state {
+            PrState::Open => counts.0 = count,
+            PrState::Closed => counts.1 = count,
+            PrState::Merged => counts.2 = count,
         }
     }
     Ok(counts)
@@ -245,43 +246,86 @@ pub async fn update_pr(
     Ok(())
 }
 
-pub async fn close_pr(pool: &SqlitePool, id: &str, closed_by: &str) -> sqlx::Result<()> {
+/// The result of a conditional PR write. `Refused` names the state the row
+/// was actually in, so the caller can tell an idempotent repeat (close of a
+/// closed PR) from a race it lost (close of a PR another request merged).
+/// A row that vanished mid-request is `RowNotFound`: callers resolved the PR
+/// a moment before, so that is a 404, not a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrWrite {
+    Applied,
+    Refused { current: PrState },
+}
+
+/// Turn a finished conditional UPDATE into [`PrWrite`]: one statement is the
+/// CAS, and a miss re-reads the state the row is really in.
+async fn outcome(
+    pool: &SqlitePool,
+    id: &str,
+    done: sqlx::sqlite::SqliteQueryResult,
+) -> sqlx::Result<PrWrite> {
+    if done.rows_affected() == 1 {
+        return Ok(PrWrite::Applied);
+    }
+    let current: Option<PrState> =
+        sqlx::query_scalar("SELECT state FROM pull_request WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    current
+        .map(|current| PrWrite::Refused { current })
+        .ok_or(sqlx::Error::RowNotFound)
+}
+
+/// `open -> closed`. Closing anything else is refused, never silently
+/// rewritten (a merged PR keeps its merge fields).
+pub async fn close_pr(pool: &SqlitePool, id: &str, closed_by: &str) -> sqlx::Result<PrWrite> {
     let now = now_iso();
-    sqlx::query(
+    let done = sqlx::query(
         "UPDATE pull_request SET state = 'closed', closed_by = ?, closed_at = ?, updated_at = ? \
-         WHERE id = ?",
+         WHERE state = ? AND id = ?",
     )
     .bind(closed_by)
     .bind(&now)
     .bind(&now)
+    .bind(PrState::Open)
     .bind(id)
     .execute(pool)
     .await?;
-    Ok(())
+    outcome(pool, id, done).await
 }
 
-pub async fn reopen_pr(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
-    sqlx::query(
+/// `closed -> open`. A merged PR is terminal: its merge commit is published
+/// to the base branch, so reopening would claim a live PR with no branch
+/// state behind it. The writer refuses it (`Refused { current: Merged }`).
+pub async fn reopen_pr(pool: &SqlitePool, id: &str) -> sqlx::Result<PrWrite> {
+    let done = sqlx::query(
         "UPDATE pull_request SET state = 'open', closed_by = NULL, closed_at = NULL, \
-         updated_at = ? WHERE id = ?",
+         updated_at = ? WHERE state = ? AND id = ?",
     )
     .bind(now_iso())
+    .bind(PrState::Closed)
     .bind(id)
     .execute(pool)
     .await?;
-    Ok(())
+    outcome(pool, id, done).await
 }
 
+/// `open -> merged`, recording the squash commit. The CAS runs *before* the
+/// caller publishes the ref: a concurrent close then loses its own CAS (and
+/// is the one told the PR is not open), instead of the merge landing on a
+/// closed row. A failed publish is undone by [`revert_merge`].
 pub async fn merge_pr(
     pool: &SqlitePool,
     id: &str,
     merge_sha: &str,
     merged_by: &str,
-) -> sqlx::Result<()> {
+) -> sqlx::Result<PrWrite> {
     let now = now_iso();
-    sqlx::query(
+    let done = sqlx::query(
         "UPDATE pull_request SET state = 'merged', merge_sha = ?, merged_by = ?, \
-         merged_at = ?, closed_at = ?, closed_by = ?, updated_at = ? WHERE id = ?",
+         merged_at = ?, closed_at = ?, closed_by = ?, updated_at = ? \
+         WHERE state = ? AND id = ?",
     )
     .bind(merge_sha)
     .bind(merged_by)
@@ -289,10 +333,29 @@ pub async fn merge_pr(
     .bind(&now)
     .bind(merged_by)
     .bind(&now)
+    .bind(PrState::Open)
     .bind(id)
     .execute(pool)
     .await?;
-    Ok(())
+    outcome(pool, id, done).await
+}
+
+/// Undo [`merge_pr`] when the ref publish failed: `merged -> open`, clearing
+/// every merge field. Conditional on the sha this merge wrote, so it can
+/// never erase a different merge.
+pub async fn revert_merge(pool: &SqlitePool, id: &str, merge_sha: &str) -> sqlx::Result<PrWrite> {
+    let done = sqlx::query(
+        "UPDATE pull_request SET state = 'open', merge_sha = NULL, merged_by = NULL, \
+         merged_at = NULL, closed_at = NULL, closed_by = NULL, updated_at = ? \
+         WHERE state = ? AND id = ? AND merge_sha = ?",
+    )
+    .bind(now_iso())
+    .bind(PrState::Merged)
+    .bind(id)
+    .bind(merge_sha)
+    .execute(pool)
+    .await?;
+    outcome(pool, id, done).await
 }
 
 /// The open PRs whose head branch is `head` (after a move, they carry the new
@@ -435,18 +498,23 @@ pub async fn list_comments(pool: &SqlitePool, pr_id: &str) -> sqlx::Result<Vec<P
     .await
 }
 
+/// Insert a review only while its PR is `open`: the `SELECT ... WHERE
+/// EXISTS(...)` guard makes "review a closed PR" unrepresentable even when
+/// the caller's state read raced a close or merge. `None` means the PR is no
+/// longer open (or gone).
 pub async fn insert_review(
     pool: &SqlitePool,
     pr_id: &str,
     reviewer_id: &str,
-    state: &str,
+    state: ReviewState,
     commit_sha: &str,
-) -> sqlx::Result<PrReviewRow> {
+) -> sqlx::Result<Option<PrReviewRow>> {
     let id = new_id();
     let now = now_iso();
-    sqlx::query(
+    let done = sqlx::query(
         "INSERT INTO pr_review (id, pr_id, reviewer_id, state, commit_sha, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+         SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS \
+         (SELECT 1 FROM pull_request WHERE id = ? AND state = 'open')",
     )
     .bind(&id)
     .bind(pr_id)
@@ -454,16 +522,20 @@ pub async fn insert_review(
     .bind(state)
     .bind(commit_sha)
     .bind(&now)
+    .bind(pr_id)
     .execute(pool)
     .await?;
-    Ok(PrReviewRow {
+    if done.rows_affected() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(PrReviewRow {
         id,
         reviewer_id: reviewer_id.to_string(),
-        state: state.to_string(),
+        state,
         commit_sha: commit_sha.to_string(),
         created_at: now,
         dismissed_at: None,
-    })
+    }))
 }
 
 /// The PR's reviews, oldest first (the timeline order).

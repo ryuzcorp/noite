@@ -68,8 +68,11 @@ pub async fn teardown(
     if let Err(e) = crate::host::credentials::revoke_environment(pool, cfg, &env.id).await {
         tracing::warn!(env_id = %env.id, error = %format!("{e:#}"), "environment deleted but credential revoke failed");
     }
-    // Its operator token goes too, so a reused label mints fresh.
-    if let Err(e) = db::delete_operator_token(pool, &format!("env:{}", env.id)).await {
+    // Its operator token goes too (row and process cache), so a reused
+    // label mints fresh.
+    if let Err(e) =
+        crate::host::credentials::delete_operator_token(pool, &format!("env:{}", env.id)).await
+    {
         tracing::warn!(env_id = %env.id, error = %e, "environment deleted but operator token row remains");
     }
     db::delete_environment(pool, &env.id).await?;

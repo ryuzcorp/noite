@@ -712,6 +712,35 @@ fn cache_operator_token(scope_key: &str, token: &str) {
     }
 }
 
+/// Evict one scope's token: the cache is a second copy of the row, so it has
+/// to die with the row or a deleted/recreated slug could be probed with the
+/// dead token until the process restarts.
+fn forget_operator_token(scope_key: &str) {
+    if let Ok(mut tokens) = OPERATOR_TOKENS.write() {
+        tokens.remove(scope_key);
+    }
+}
+
+/// Drop one fleet's stored operator token *and* its cached copy. This is the
+/// only way the row is deleted: [`db::remove_operator_token_row`] alone would
+/// leave the cache pointing at a token no row backs.
+pub async fn delete_operator_token(pool: &sqlx::SqlitePool, scope_key: &str) -> sqlx::Result<()> {
+    db::remove_operator_token_row(pool, scope_key).await?;
+    forget_operator_token(scope_key);
+    Ok(())
+}
+
+/// Drop every operator token of one app and its environments, evicting each
+/// scope's cached copy (app delete; a recreated slug mints fresh tokens).
+pub async fn delete_app_operator_tokens(pool: &sqlx::SqlitePool, app_id: &str) -> sqlx::Result<()> {
+    let scopes = db::operator_token_scopes_for_app(pool, app_id).await?;
+    db::remove_app_operator_token_rows(pool, app_id).await?;
+    for scope in scopes {
+        forget_operator_token(&scope);
+    }
+    Ok(())
+}
+
 /// Associated data for an operator token row: the scope, namespaced away
 /// from the scoped-credential table (same KEK, same scope strings) so a row
 /// transplanted across tables does not decrypt either.
@@ -770,7 +799,7 @@ async fn ensure_operator_token_row(
     let (nonce, ciphertext) = encrypt(runner_token, &aad, &token)?;
     // A superseded row (undecryptable after a rotation) goes before the
     // insert: the scope is the primary key, and two rows cannot share it.
-    db::delete_operator_token(pool, scope_key).await?;
+    db::remove_operator_token_row(pool, scope_key).await?;
     db::insert_operator_token(pool, scope_key, app_id, &nonce, &ciphertext).await?;
     tracing::info!(scope = %scope_key, "minted celld operator token");
     Ok(token)
@@ -807,6 +836,7 @@ pub async fn sweep(pool: &sqlx::SqlitePool, cfg: &Config) -> usize {
             tracing::warn!(
                 handle = %row.handle,
                 store = %row.store,
+                state = row.state.as_str(),
                 "dropping a scoped key minted in another store; delete it there by hand"
             );
             if let Err(e) = db::delete_scoped_credential(pool, &row.handle).await {

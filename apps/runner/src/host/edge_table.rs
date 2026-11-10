@@ -507,7 +507,7 @@ pub fn warn_if_blind(cfg: &Config, limits: &[AppLimit]) {
 mod tests {
     use super::*;
     use crate::config::config_for_tests;
-    use crate::models::{AppStatus, DesiredState, DOMAIN_STATUS_VERIFIED};
+    use crate::models::{AppStatus, DesiredState, DomainStatus};
 
     fn test_app(slug: &str) -> App {
         App {
@@ -613,14 +613,14 @@ mod tests {
         let verified = AppDomain {
             app_id: app.id.clone(),
             hostname: "Example.COM".into(),
-            status: DOMAIN_STATUS_VERIFIED.into(),
+            status: DomainStatus::Verified,
             token: "t".into(),
             verified_at: Some("t".into()),
             created_at: "t".into(),
         };
         let pending = AppDomain {
             hostname: "pending.example.com".into(),
-            status: "pending".into(),
+            status: DomainStatus::Pending,
             ..verified.clone()
         };
         let t = build_table(&cfg, &[app], &[verified, pending], &[], &[]);

@@ -6,6 +6,7 @@ use sqlx::SqlitePool;
 
 use crate::models::ErrorEvent;
 use crate::models::ErrorIssue;
+use crate::models::IssueStatus;
 
 use super::ISSUE_COLS;
 
@@ -274,7 +275,7 @@ pub async fn list_error_issues(
     pool: &SqlitePool,
     app_id: &str,
     environment_id: &str,
-    status: &str,
+    status: IssueStatus,
     limit: i64,
 ) -> sqlx::Result<Vec<ErrorIssue>> {
     sqlx::query_as::<_, ErrorIssue>(sqlx::AssertSqlSafe(format!(
@@ -289,12 +290,14 @@ pub async fn list_error_issues(
     .await
 }
 
-/// Issue counts per status (`open`, `resolved`, `ignored`).
+/// Issue counts per status. Decoding the status as [`IssueStatus`] means a
+/// value no writer can produce is a loud error instead of a count that the
+/// caller silently drops.
 pub async fn count_error_issues(
     pool: &SqlitePool,
     app_id: &str,
     environment_id: &str,
-) -> sqlx::Result<Vec<(String, i64)>> {
+) -> sqlx::Result<Vec<(IssueStatus, i64)>> {
     sqlx::query_as(
         "SELECT status, count(*) FROM metrics.app_error_issue WHERE app_id = ? AND environment_id = ? GROUP BY status",
     )
@@ -358,14 +361,16 @@ pub async fn list_error_hours(
     .await
 }
 
-/// Resolve, ignore or reopen. Clears `regressed`; `status_at_us` is the
-/// point a resolved issue reopens after.
+/// Move an issue to `status` explicitly. `status_at_us` is the point a
+/// resolved issue reopens after, and `regressed` is cleared because the flag
+/// only means anything while the issue is `open` — a triage write says the
+/// operator has seen it.
 pub async fn set_error_status(
     pool: &SqlitePool,
     app_id: &str,
     environment_id: &str,
     fingerprint: &str,
-    status: &str,
+    status: IssueStatus,
     at_us: i64,
 ) -> sqlx::Result<u64> {
     let res = sqlx::query(
@@ -383,7 +388,9 @@ pub async fn set_error_status(
 }
 
 /// Retention: occurrences and hour buckets past the window, and issues not
-/// seen inside it.
+/// seen inside it. The surviving issues' `count` is recomputed from the
+/// retained hour buckets in the same statement run, so a pruned lifetime
+/// count never outlives the series it was derived from.
 pub async fn prune_errors(
     pool: &SqlitePool,
     cutoff_us: i64,
@@ -399,6 +406,17 @@ pub async fn prune_errors(
         .execute(pool)
         .await?
         .rows_affected();
+    sqlx::query(
+        "UPDATE metrics.app_error_issue SET count = COALESCE( \
+           (SELECT SUM(h.n) FROM metrics.app_error_hour h \
+            WHERE h.app_id = app_error_issue.app_id \
+              AND h.environment_id = app_error_issue.environment_id \
+              AND h.fingerprint = app_error_issue.fingerprint), 0) \
+         WHERE last_seen_us >= ?",
+    )
+    .bind(cutoff_us)
+    .execute(pool)
+    .await?;
     n += sqlx::query("DELETE FROM metrics.app_error_issue WHERE last_seen_us < ?")
         .bind(cutoff_us)
         .execute(pool)
@@ -470,9 +488,9 @@ mod tests {
         assert_eq!((issue.first_seen_us, issue.last_seen_us), (100, 200));
         assert_eq!(issue.first_sha.as_deref(), Some("s1"));
         assert_eq!(issue.last_sha.as_deref(), Some("s2"));
-        assert_eq!(issue.status, "open");
+        assert_eq!(issue.status, IssueStatus::Open);
 
-        set_error_status(&pool, "a", "", "fp", "resolved", 300)
+        set_error_status(&pool, "a", "", "fp", IssueStatus::Resolved, 300)
             .await
             .expect("resolve");
         // An occurrence from before the resolve (ingest lag) keeps it resolved.
@@ -482,8 +500,8 @@ mod tests {
             .expect("get")
             .expect("issue");
         assert_eq!(
-            (issue.status.as_str(), issue.regressed),
-            ("resolved", false)
+            (issue.status, issue.regressed),
+            (IssueStatus::Resolved, false)
         );
         // One after it reopens the issue as a regression.
         up("second", 1, 400, "s3").await;
@@ -491,10 +509,10 @@ mod tests {
             .await
             .expect("get")
             .expect("issue");
-        assert_eq!((issue.status.as_str(), issue.regressed), ("open", true));
+        assert_eq!((issue.status, issue.regressed), (IssueStatus::Open, true));
 
         // Ignored stays ignored however often it fires.
-        set_error_status(&pool, "a", "", "fp", "ignored", 500)
+        set_error_status(&pool, "a", "", "fp", IssueStatus::Ignored, 500)
             .await
             .expect("ignore");
         up("second", 1, 600, "s3").await;
@@ -502,8 +520,63 @@ mod tests {
             .await
             .expect("get")
             .expect("issue");
-        assert_eq!((issue.status.as_str(), issue.regressed), ("ignored", false));
+        assert_eq!(
+            (issue.status, issue.regressed),
+            (IssueStatus::Ignored, false)
+        );
         assert_eq!(issue.count, 9);
+    }
+
+    /// Retention must not leave a lifetime `count` behind after the hour
+    /// buckets it was derived from are pruned: the surviving issue's count
+    /// is recomputed in the same prune run (ROTH-6). Without the recompute
+    /// the issue keeps reporting 5 occurrences whose series is gone.
+    #[tokio::test]
+    async fn prune_recomputes_the_surviving_issue_count() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn: &mut SqliteConnection, _| {
+                Box::pin(async move {
+                    crate::db::attach_metrics!(conn, ":memory:");
+                    Ok::<_, sqlx::Error>(())
+                })
+            })
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory db");
+        upsert_error_issue(
+            &pool,
+            "a",
+            "",
+            "fp",
+            "TypeError",
+            "boom",
+            "f (w.js:1)",
+            "fetch",
+            "uncaught",
+            5,
+            100,
+            100,
+            None,
+        )
+        .await
+        .expect("upsert");
+        set_error_hour(&pool, "a", "", "fp", "2026-01-01T00:00:00Z", 5)
+            .await
+            .expect("hour");
+        refresh_error_issue_count(&pool, "a", "", "fp")
+            .await
+            .expect("count");
+        // The issue survives (last_seen is recent); only its hour is past the
+        // retention hour cutoff.
+        prune_errors(&pool, 0, "2026-01-02T00:00:00Z")
+            .await
+            .expect("prune");
+        let issue = get_error_issue(&pool, "a", "", "fp")
+            .await
+            .expect("get")
+            .expect("issue survives");
+        assert_eq!(issue.count, 0, "the count follows the retained series");
     }
 
     #[tokio::test]
@@ -544,7 +617,7 @@ mod tests {
                 .await
                 .expect("count");
         }
-        set_error_status(&pool, "a", "", "fp", "resolved", 200)
+        set_error_status(&pool, "a", "", "fp", IssueStatus::Resolved, 200)
             .await
             .expect("resolve production");
         let prod = get_error_issue(&pool, "a", "", "fp")
@@ -555,15 +628,15 @@ mod tests {
             .await
             .expect("get")
             .expect("issue");
-        assert_eq!(prod.status.as_str(), "resolved");
-        assert_eq!(env.status.as_str(), "open");
+        assert_eq!(prod.status, IssueStatus::Resolved);
+        assert_eq!(env.status, IssueStatus::Open);
         assert_eq!(prod.count, 1);
         assert_eq!(env.count, 1);
         let counts = count_error_issues(&pool, "a", "env-1")
             .await
             .expect("counts");
-        assert_eq!(counts, vec![("open".to_string(), 1)]);
+        assert_eq!(counts, vec![(IssueStatus::Open, 1)]);
         let counts = count_error_issues(&pool, "a", "").await.expect("counts");
-        assert_eq!(counts, vec![("resolved".to_string(), 1)]);
+        assert_eq!(counts, vec![(IssueStatus::Resolved, 1)]);
     }
 }

@@ -496,7 +496,7 @@ async fn pending_domains_mint_no_certificates() {
         &h.state.pool,
         &app.id,
         "shop.example.com",
-        crate::models::DOMAIN_STATUS_PENDING,
+        crate::models::DomainStatus::Pending,
         "tok",
         None,
     )
@@ -507,10 +507,11 @@ async fn pending_domains_mint_no_certificates() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "pending mints nothing");
     // Once verified, the same hostname mints.
-    assert!(
+    assert_eq!(
         crate::db::verify_domain(&h.state.pool, &app.id, "shop.example.com")
             .await
-            .expect("flip")
+            .expect("flip"),
+        crate::db::VerifyOutcome::Verified
     );
     let (status, _) = h
         .rest("GET", "/v1/edge/tls-ask?domain=shop.example.com", None)

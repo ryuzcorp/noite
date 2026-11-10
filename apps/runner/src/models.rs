@@ -290,13 +290,93 @@ impl Environment {
     }
 }
 
-/// A custom-domain claim's verification state (SPEC, Custom domains), stored
-/// as text like every other status column (`Environment.kind`, `App.status`):
+/// A PR's lifecycle (F4). Two terminal outcomes and one live state; every
+/// transition is a compare-and-swap in `db::prs` (`close_pr`, `reopen_pr`,
+/// `merge_pr`), so a write that raced another transition is refused instead
+/// of overwriting it.
+///
+/// ```text
+/// open -> closed -> open     (reopen needs a live head branch, no open rival)
+/// open -> merged             (terminal; merge_sha/merged_by/merged_at set)
+/// ```
+///
+/// `merged` and `closed` are both terminal for the merge box; only `merged`
+/// carries the commit fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, TS)]
+#[serde(rename_all = "lowercase")]
+#[sqlx(rename_all = "lowercase")]
+#[ts(export)]
+pub enum PrState {
+    Open,
+    Closed,
+    Merged,
+}
+
+impl PrState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::Merged => "merged",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "open" => Some(Self::Open),
+            "closed" => Some(Self::Closed),
+            "merged" => Some(Self::Merged),
+            _ => None,
+        }
+    }
+}
+
+/// A reviewer's verdict, recorded at the head sha it was written against.
+/// `dismissed_at` marks a verdict that no longer counts (the head moved).
+/// Superseding a verdict is an insert of a newer one, not an update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, TS)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ReviewState {
+    Approved,
+    ChangesRequested,
+}
+
+impl ReviewState {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "approved" => Some(Self::Approved),
+            "changes_requested" => Some(Self::ChangesRequested),
+            _ => None,
+        }
+    }
+}
+
+/// A custom-domain claim's verification state (SPEC, Custom domains):
 /// `pending` until its TXT proof resolves, `verified` once it does (or
 /// immediately in `single` tenancy, where one trusted operator owns the DNS).
 /// Only verified rows route, certify and resolve.
-pub const DOMAIN_STATUS_PENDING: &str = "pending";
-pub const DOMAIN_STATUS_VERIFIED: &str = "verified";
+///
+/// ```text
+/// pending -> verified   (TXT proof, or add under single tenancy)
+/// pending -> absent     (rival verified first; its verify drops our row)
+/// any     -> absent     (explicit remove)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, TS)]
+#[serde(rename_all = "lowercase")]
+#[sqlx(rename_all = "lowercase")]
+#[ts(export)]
+pub enum DomainStatus {
+    Pending,
+    Verified,
+}
+
+impl DomainStatus {
+    pub fn is_verified(self) -> bool {
+        self == Self::Verified
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
@@ -304,7 +384,7 @@ pub const DOMAIN_STATUS_VERIFIED: &str = "verified";
 pub struct AppDomain {
     pub app_id: String,
     pub hostname: String,
-    pub status: String,
+    pub status: DomainStatus,
     pub token: String,
     pub verified_at: Option<String>,
     pub created_at: String,
@@ -312,7 +392,7 @@ pub struct AppDomain {
 
 impl AppDomain {
     pub fn is_verified(&self) -> bool {
-        self.status == DOMAIN_STATUS_VERIFIED
+        self.status.is_verified()
     }
 }
 
@@ -393,9 +473,40 @@ pub struct AppSpanStat {
     pub qwait_ms: i64,
 }
 
+/// Triage state of a grouped error (ROTH-6). `open` is the only state in
+/// which `regressed` is meaningful: a resolved (or ignored) issue that fires
+/// again goes back to `open` with `regressed = true` in one write, and the
+/// explicit resolve/ignore writer clears the flag. The wire keeps the same
+/// three strings and the same `regressed` boolean.
+///
+/// ```text
+/// open -> resolved -> open   (an occurrence after resolution: regressed)
+/// open -> ignored   -> open  (an occurrence after ignore: regressed)
+/// resolved <-> ignored       (explicit triage)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, TS)]
+#[serde(rename_all = "lowercase")]
+#[sqlx(rename_all = "lowercase")]
+#[ts(export)]
+pub enum IssueStatus {
+    Open,
+    Resolved,
+    Ignored,
+}
+
+impl IssueStatus {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "open" => Some(Self::Open),
+            "resolved" => Some(Self::Resolved),
+            "ignored" => Some(Self::Ignored),
+            _ => None,
+        }
+    }
+}
+
 /// One grouped error (host/errors.rs): every occurrence with the same
-/// fingerprint. `status` is `open`, `resolved` or `ignored`; `regressed`
-/// marks a resolved issue that fired again.
+/// fingerprint. `regressed` marks a resolved issue that fired again.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -411,7 +522,9 @@ pub struct ErrorIssue {
     pub last_seen_us: i64,
     pub first_sha: Option<String>,
     pub last_sha: Option<String>,
-    pub status: String,
+    pub status: IssueStatus,
+    /// Meaningful only for `status == open`; every explicit triage write
+    /// clears it and the ingest sets it only when it reopens a resolved row.
     pub regressed: bool,
     pub status_at_us: Option<i64>,
 }

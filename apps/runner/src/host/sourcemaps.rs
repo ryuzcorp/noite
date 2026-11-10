@@ -386,11 +386,12 @@ enum CachedKey {
 
 /// Weight of a cached negative entry: the two keys are the bulk of it.
 const NEGATIVE_ENTRY_WEIGHT: usize = 256;
-/// How long a missing manifest stays cached: the store uploads the manifest
-/// last, so a deploy's first errors can arrive before it exists. Past this
-/// the next read refetches instead of rendering raw for the life of the
-/// process.
-const NEGATIVE_MANIFEST_TTL: Duration = Duration::from_secs(60);
+/// How long a missing manifest or map stays cached: the store uploads both
+/// after the bundle, so a deploy's first errors can arrive before they exist.
+/// Past this the next read refetches instead of rendering raw for the life of
+/// the process — a map uploaded a minute after its first error still gets
+/// symbolicated.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// What a fetch found: a usable value, a permanent absence, or a failure
 /// that must not be cached. Only the first two enter the cache — a hiccup
@@ -402,18 +403,56 @@ enum FetchOutcome<T> {
     Transient,
 }
 
-/// A cached manifest plus its byte weight and negative-cache time (`Some`
-/// exactly when the value is `None`, so an expired missing entry refetches
-/// on next read).
-type ManifestEntry = (Option<Arc<MapManifest>>, usize, Option<Instant>);
+/// One cache slot. `value: None` is a cached absence, and `since` records
+/// when it was cached (`Some` exactly then) so the entry expires; `weight` is
+/// its share of the shared byte bound.
+#[derive(Debug)]
+struct CacheEntry<T> {
+    value: Option<T>,
+    weight: usize,
+    since: Option<Instant>,
+}
+
+impl<T> CacheEntry<T> {
+    fn hit(value: T, weight: usize) -> Self {
+        Self {
+            value: Some(value),
+            weight,
+            since: None,
+        }
+    }
+
+    fn missing(weight: usize) -> Self {
+        Self {
+            value: None,
+            weight,
+            since: Some(Instant::now()),
+        }
+    }
+
+    /// A negative entry past [`NEGATIVE_CACHE_TTL`] is a miss again.
+    fn expired(&self) -> bool {
+        self.value.is_none()
+            && self
+                .since
+                .is_some_and(|at| at.elapsed() > NEGATIVE_CACHE_TTL)
+    }
+
+    fn cloned_value(&self) -> Option<T>
+    where
+        T: Clone,
+    {
+        self.value.clone()
+    }
+}
 
 #[derive(Debug, Default)]
 struct CacheInner {
     bytes: usize,
     /// Insertion order for oldest-first eviction, across maps and manifests.
     order: VecDeque<CachedKey>,
-    maps: HashMap<CacheKey, (Option<Arc<sourcemap::SourceMap>>, usize)>,
-    manifests: HashMap<ManifestKey, ManifestEntry>,
+    maps: HashMap<CacheKey, CacheEntry<Arc<sourcemap::SourceMap>>>,
+    manifests: HashMap<ManifestKey, CacheEntry<Arc<MapManifest>>>,
 }
 
 /// Parsed maps and manifests, bounded by [`MAX_CACHED_BYTES`]. Entries are
@@ -432,7 +471,7 @@ impl SourceMapCache {
     /// The deploy's manifest, cached negative while no deploy stored one.
     /// Manifests share the maps' byte budget (negatives included), so one
     /// entry per sha ever read cannot grow the runner. A negative entry
-    /// expires after [`NEGATIVE_MANIFEST_TTL`] (the manifest uploads last),
+    /// expires after [`NEGATIVE_CACHE_TTL`] (the manifest uploads last),
     /// and a fetch failure is not cached at all.
     pub async fn manifest(
         &self,
@@ -486,8 +525,14 @@ impl SourceMapCache {
             sha: sha.to_string(),
             rel: rel.to_string(),
         };
-        if let Some((hit, _)) = poisoned(self.inner.lock()).maps.get(&key) {
-            return hit.clone();
+        // Same guard discipline as `manifest`: the lock is released before
+        // the fetch below.
+        let hit = {
+            let mut inner = poisoned(self.inner.lock());
+            cached_map(&mut inner, &key)
+        };
+        if let Some(hit) = hit {
+            return hit;
         }
         match fetch_map(cfg, bucket, prefix, sha, rel).await {
             FetchOutcome::Hit(loaded, weight) => {
@@ -505,16 +550,25 @@ impl SourceMapCache {
     }
 }
 
+/// The cached map for `key`, if it is still valid: an expired negative entry
+/// is dropped (its bytes and eviction slot released) so the caller refetches.
+fn cached_map(inner: &mut CacheInner, key: &CacheKey) -> Option<Option<Arc<sourcemap::SourceMap>>> {
+    if inner.maps.get(key).is_some_and(CacheEntry::expired) {
+        forget(inner, &CachedKey::Map(key.clone()));
+        return None;
+    }
+    inner.maps.get(key).map(CacheEntry::cloned_value)
+}
+
 /// The cached manifest for `key`, if it is still valid: an expired negative
 /// entry is dropped (its bytes and eviction slot released) so the caller
 /// refetches.
 fn cached_manifest(inner: &mut CacheInner, key: &ManifestKey) -> Option<Option<Arc<MapManifest>>> {
-    let (value, _, since) = inner.manifests.get(key)?;
-    if value.is_none() && since.is_some_and(|at| at.elapsed() > NEGATIVE_MANIFEST_TTL) {
+    if inner.manifests.get(key).is_some_and(CacheEntry::expired) {
         forget(inner, &CachedKey::Manifest(key.clone()));
         return None;
     }
-    Some(value.clone())
+    inner.manifests.get(key).map(CacheEntry::cloned_value)
 }
 
 /// Drop `key`'s entry, its bytes and its eviction slot. Every cached key
@@ -523,8 +577,8 @@ fn cached_manifest(inner: &mut CacheInner, key: &ManifestKey) -> Option<Option<A
 /// bytes counted or a stale slot that evicts the fresh entry early.
 fn forget(inner: &mut CacheInner, key: &CachedKey) {
     let removed = match key {
-        CachedKey::Map(key) => inner.maps.remove(key).map(|(_, weight)| weight),
-        CachedKey::Manifest(key) => inner.manifests.remove(key).map(|(_, weight, _)| weight),
+        CachedKey::Map(key) => inner.maps.remove(key).map(|entry| entry.weight),
+        CachedKey::Manifest(key) => inner.manifests.remove(key).map(|entry| entry.weight),
     };
     if let Some(weight) = removed {
         inner.bytes = inner.bytes.saturating_sub(weight);
@@ -544,11 +598,15 @@ fn insert_manifest(
     evict_until_fit(inner, weight);
     inner.bytes += weight;
     inner.order.push_back(CachedKey::Manifest(key.clone()));
-    let since = value.is_none().then(Instant::now);
-    inner.manifests.insert(key, (value, weight, since));
+    let entry = match value {
+        Some(value) => CacheEntry::hit(value, weight),
+        None => CacheEntry::missing(weight),
+    };
+    inner.manifests.insert(key, entry);
 }
 
-/// Insert one parsed map, same shared bound as manifests.
+/// Insert one parsed map, same shared bound and negative expiry as
+/// manifests.
 fn insert_map(
     inner: &mut CacheInner,
     key: CacheKey,
@@ -559,7 +617,11 @@ fn insert_map(
     evict_until_fit(inner, weight);
     inner.bytes += weight;
     inner.order.push_back(CachedKey::Map(key.clone()));
-    inner.maps.insert(key, (value, weight));
+    let entry = match value {
+        Some(value) => CacheEntry::hit(value, weight),
+        None => CacheEntry::missing(weight),
+    };
+    inner.maps.insert(key, entry);
 }
 
 /// Make room for `extra` bytes, oldest first, across maps and manifests.
@@ -569,8 +631,8 @@ fn evict_until_fit(inner: &mut CacheInner, extra: usize) {
             break;
         };
         let removed = match oldest {
-            CachedKey::Map(key) => inner.maps.remove(&key).map(|(_, weight)| weight),
-            CachedKey::Manifest(key) => inner.manifests.remove(&key).map(|(_, weight, _)| weight),
+            CachedKey::Map(key) => inner.maps.remove(&key).map(|entry| entry.weight),
+            CachedKey::Manifest(key) => inner.manifests.remove(&key).map(|entry| entry.weight),
         };
         if let Some(weight) = removed {
             inner.bytes = inner.bytes.saturating_sub(weight);
@@ -1923,6 +1985,34 @@ mod tests {
     }
 
     #[test]
+    fn expired_negative_maps_refetch() {
+        // A map uploaded a moment after a deploy's first error must still be
+        // picked up: a cached absence expires exactly like a manifest's
+        // instead of leaving the stack raw for the runner's lifetime.
+        let mut inner = CacheInner::default();
+        let key = CacheKey {
+            prefix: "fleets/a".to_string(),
+            sha: "abc123".to_string(),
+            rel: "worker.js.map".to_string(),
+        };
+        insert_map(&mut inner, key.clone(), None, NEGATIVE_ENTRY_WEIGHT);
+        assert!(cached_map(&mut inner, &key).is_some_and(|hit| hit.is_none()));
+        let stale = Instant::now()
+            .checked_sub(NEGATIVE_CACHE_TTL + Duration::from_secs(1))
+            .expect("backdate");
+        if let Some(entry) = inner.maps.get_mut(&key) {
+            entry.since = Some(stale);
+        }
+        assert!(cached_map(&mut inner, &key).is_none(), "expired is a miss");
+        assert!(
+            !inner.maps.contains_key(&key),
+            "the slot and bytes are freed"
+        );
+        assert_eq!(inner.bytes, 0);
+        assert!(inner.order.is_empty(), "the eviction slot is gone too");
+    }
+
+    #[test]
     fn expired_negative_manifests_refetch() {
         // The manifest uploads last, so a deploy's first errors can arrive
         // before it exists: a missing entry must expire instead of rendering
@@ -1937,11 +2027,16 @@ mod tests {
         // Backdated past the TTL (no sleeping in tests): treated as a miss
         // and dropped, so the next read refetches.
         let stale = Instant::now()
-            .checked_sub(NEGATIVE_MANIFEST_TTL + Duration::from_secs(1))
+            .checked_sub(NEGATIVE_CACHE_TTL + Duration::from_secs(1))
             .expect("backdate");
-        inner
-            .manifests
-            .insert(key.clone(), (None, NEGATIVE_ENTRY_WEIGHT, Some(stale)));
+        inner.manifests.insert(
+            key.clone(),
+            CacheEntry {
+                value: None,
+                weight: NEGATIVE_ENTRY_WEIGHT,
+                since: Some(stale),
+            },
+        );
         assert!(cached_manifest(&mut inner, &key).is_none());
         assert!(!inner.manifests.contains_key(&key));
         assert_eq!(inner.bytes, 0);
@@ -1988,7 +2083,7 @@ mod tests {
         // An expired negative manifest releases its slot too, so the
         // refetched entry is the only one queued for it.
         let stale = Instant::now()
-            .checked_sub(NEGATIVE_MANIFEST_TTL + Duration::from_secs(1))
+            .checked_sub(NEGATIVE_CACHE_TTL + Duration::from_secs(1))
             .expect("backdate");
         let missing = ManifestKey {
             prefix: "fleets/app".to_string(),
@@ -1996,7 +2091,7 @@ mod tests {
         };
         insert_manifest(&mut inner, missing.clone(), None, NEGATIVE_ENTRY_WEIGHT);
         if let Some(entry) = inner.manifests.get_mut(&missing) {
-            entry.2 = Some(stale);
+            entry.since = Some(stale);
         }
         assert!(cached_manifest(&mut inner, &missing).is_none());
         assert_eq!(inner.order.len(), 2);
