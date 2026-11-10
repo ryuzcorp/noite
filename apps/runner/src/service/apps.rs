@@ -568,6 +568,10 @@ async fn delete_inner(state: &AppState, id: &str) -> Result<(), ApiError> {
     else {
         return Err(ApiError::conflict("deploy in flight; retry delete shortly"));
     };
+    // The delete claim (taken by `delete` before this task starts) is what
+    // closes import admission: a retry that passed its own check cannot
+    // register a new attempt now, and anything registered is swept below.
+    let _direct_claim = DELETIONS.begin(id).then(|| DeletionGuard(id.to_string()));
     // A background import is part of this delete: stop it and wait for it to
     // end before the purge. A clone that finishes late would publish
     // `refs/heads/main` under the slug this delete is about to free, and the

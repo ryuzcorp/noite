@@ -279,7 +279,12 @@ fn import_key(app_id: &str) -> String {
 /// waits for this guard).
 pub fn spawn(state: &AppState, app: App, source: GitSource) -> bool {
     let mut runs = imports();
-    if runs.contains_key(&app.id) {
+    // Admission is atomic with the delete: the delete marks the app before it
+    // calls `cancel_and_wait`, so either this check sees the mark and refuses,
+    // or the slot is inserted under this lock and the delete's sweep (which
+    // runs after the mark) is guaranteed to find it. Checking outside the lock
+    // left a window where a retry spawned an import nobody cancelled.
+    if crate::service::apps::deleting(&app.id) || runs.contains_key(&app.id) {
         return false;
     }
     let key = import_key(&app.id);
@@ -448,6 +453,24 @@ async fn import_once(
 
 /// The body of [`import_once`] with the scratch dir already made, so the
 /// cleanup above runs on every path.
+/// Refuse to touch an app's slug data unless the row still names this app,
+/// with this slug, and no delete is running. Checked before the mirror and the
+/// staging ref (not only at publish): a slug freed by a delete can be taken by
+/// a new app, and writing into its mirror would hand it this tree.
+pub(crate) async fn ensure_app_target(state: &AppState, app: &App) -> anyhow::Result<()> {
+    if crate::service::apps::deleting(&app.id) {
+        anyhow::bail!("app {} is being deleted; import stopped", app.id);
+    }
+    match db::get_app(&state.pool, &app.id).await? {
+        Some(row) if row.slug == app.slug => Ok(()),
+        _ => anyhow::bail!(
+            "app {} no longer owns the slug {}; import stopped",
+            app.id,
+            app.slug
+        ),
+    }
+}
+
 async fn import_into(
     state: &AppState,
     app: &App,
@@ -460,6 +483,9 @@ async fn import_into(
     // (`run_grouped`), so by here the repository is within it.
     let upstream_sha =
         clone_scratch(target, source.reference.as_deref(), scratch, protocols).await?;
+    // The clone is the long step: the row may have been deleted (or renamed)
+    // while it ran, and the slug may already belong to another app.
+    ensure_app_target(state, app).await?;
     let mirror = state.wal.ensure_synced(&app.slug).await?;
     // Objects only: moving a ref here would make `after_receive` see no change
     // and publish nothing, so the temp ref is the fetch target and `publish_ref`
@@ -859,6 +885,74 @@ mod tests {
             !cancel_and_wait(app_id).await,
             "nothing left to stop the second time"
         );
+    }
+
+    /// Admission is atomic with the delete: a retry that passed its own
+    /// "not deleting" check can no longer spawn an import the delete has
+    /// already swept for (that import would write into the mirror of a slug
+    /// the delete is freeing).
+    #[tokio::test]
+    async fn a_retry_cannot_start_an_import_while_the_app_is_being_deleted() {
+        let h = crate::api::tests::Harness::new().await;
+        let app = h.seed_app("import-delete-admission").await;
+        let source = GitSource {
+            url: "https://127.0.0.1:1/owner/repo".to_string(),
+            reference: None,
+            squash: true,
+            path: None,
+            actor: crate::host::git_identity::Actor {
+                user_id: "user_1".to_string(),
+                name: "User One".to_string(),
+            },
+        };
+        assert!(crate::service::apps::deleting_claim_for_test(&app.id));
+        assert!(
+            !spawn(&h.state, app.clone(), source.clone()),
+            "the delete claim closes import admission"
+        );
+        assert!(!imports().contains_key(&app.id), "nothing was registered");
+        crate::service::apps::deleting_release_for_test(&app.id);
+        assert!(
+            spawn(&h.state, app.clone(), source),
+            "once the delete is over an import may start"
+        );
+        cancel_and_wait(&app.id).await;
+        h.finish().await;
+    }
+
+    /// The mirror and the staging ref are only touched for a row that still
+    /// names this app with this slug: a delete (or a rename) during the clone
+    /// stops the import there, not only at publish time.
+    #[tokio::test]
+    async fn the_import_target_is_revalidated_before_the_mirror() {
+        let h = crate::api::tests::Harness::new().await;
+        let app = h.seed_app("import-revalidate").await;
+        assert!(ensure_app_target(&h.state, &app).await.is_ok(), "live app");
+
+        crate::db::rename_app(
+            &h.state.pool,
+            &app.id,
+            &app.name,
+            "renamed-slug",
+            "renamed.localhost",
+            "git/renamed-slug/",
+            "s3://noite/fleets/renamed-slug",
+        )
+        .await
+        .expect("rename");
+        assert!(
+            ensure_app_target(&h.state, &app).await.is_err(),
+            "the old slug is not this app's any more"
+        );
+
+        crate::db::delete_app(&h.state.pool, &app.id)
+            .await
+            .expect("delete");
+        assert!(
+            ensure_app_target(&h.state, &app).await.is_err(),
+            "a deleted app has no target"
+        );
+        h.finish().await;
     }
 
     /// One attempt per app: the slot check and the insert are one locked step,

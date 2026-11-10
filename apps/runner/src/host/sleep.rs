@@ -283,7 +283,13 @@ pub async fn sleep_app(
             return Ok(false);
         }
     }
-    db::set_app_asleep(pool, &app.id).await?;
+    // The write is the admission: a deploy that moved the app to `building`
+    // after the recheck above refuses the park, and stopping its fleet then
+    // would kill the build.
+    if !db::set_app_asleep(pool, &app.id).await?.is_applied() {
+        tracing::debug!(slug = %app.slug, "sleep refused: the app moved on");
+        return Ok(false);
+    }
     edge_table::push_routes(pool, cfg).await?;
     supervisor::stop_fleet(procs, &app.slug, supervisor::StopGrace::NORMAL).await;
     crate::host::stats::record_sleep();
@@ -629,7 +635,18 @@ pub async fn sleep_environment(
             None => return Ok(false),
         }
     }
-    db::set_environment_asleep(pool, &env.id).await?;
+    // Same rule as `sleep_app`: a refused park means the environment moved on
+    // (a deploy started), so its fleet must stay up.
+    if !db::set_environment_asleep(pool, &env.id)
+        .await?
+        .is_applied()
+    {
+        tracing::debug!(
+            fleet = %format!("{}.{}", env.app_slug, env.label),
+            "sleep refused: the environment moved on"
+        );
+        return Ok(false);
+    }
     edge_table::push_routes(pool, cfg).await?;
     supervisor::stop_environment_fleet(procs, &env.app_slug, &env.label).await;
     crate::host::stats::record_sleep();
