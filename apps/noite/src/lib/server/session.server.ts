@@ -80,10 +80,15 @@ export const readSession = async (
     try {
       return await auth.api.getSession({ headers: request.headers });
     } catch (error) {
+      // The cause stays in the log: the client gets the fixed 503 message
+      // below, never a D1/better-auth internal string.
+      console.error(
+        "[session] store read failed",
+        error instanceof Error ? (error.stack ?? error.message) : String(error)
+      );
+
       throw new SessionStoreUnavailableError({
-        message: `noite: session store read failed (${
-          error instanceof Error ? error.message : String(error)
-        })`,
+        message: "The session store did not answer — retry in a moment.",
       });
     }
   })();
@@ -102,7 +107,7 @@ export const readSession = async (
     }
 
     throw new SessionStoreUnavailableError({
-      message: `noite: session store did not answer within ${timeoutMs}ms`,
+      message: "The session store did not answer — retry in a moment.",
     });
   })();
 

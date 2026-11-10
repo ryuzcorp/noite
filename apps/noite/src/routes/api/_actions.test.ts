@@ -101,14 +101,14 @@ describe("actionErrorResponse", () => {
   test("a session-store outage is a retryable 503, never 401 or 500", async () => {
     const response = actionErrorResponse(
       new SessionStoreUnavailableError({
-        message: "noite: session store did not answer within 5000ms",
+        message: "The session store did not answer — retry in a moment.",
       })
     );
 
     expect(response.status).toBe(503);
     expect(response.headers.get("retry-after")).toBe("5");
     expect(await response.json()).toEqual({
-      error: "noite: session store did not answer within 5000ms",
+      error: "The session store did not answer — retry in a moment.",
     });
   });
 
