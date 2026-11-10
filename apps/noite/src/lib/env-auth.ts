@@ -8,16 +8,33 @@
 //! Client-safe on purpose: `login-panel` reuses `sameOriginPath` to come back
 //! to this route after sign-in.
 
+/** Control characters (tab, newline, CR, NUL, DEL) anywhere in a URL: the
+ * WHATWG parser strips several of them *before* parsing, which re-forms a
+ * protocol-relative URL (`"/\n//evil.example"` becomes `https://evil.example/`). */
+const hasControlCharacter = (value: string): boolean => {
+  for (const char of value) {
+    const code = char.codePointAt(0) ?? 0;
+
+    if (code < 0x20 || code === 0x7f) {
+      return true;
+    }
+  }
+
+  return false;
+};
+
 /** A rooted, same-origin path from `raw`, or null when it is not one. A
- * protocol-relative value (`//host`) resolves to another origin, and a
- * backslash is normalized to `/` by browsers, so both are refused. */
+ * protocol-relative value (`//host`) resolves to another origin, a backslash
+ * is normalized to `/` by browsers, and control characters are stripped by
+ * the URL parser — all three are refused. */
 export const sameOriginPath = (raw: string): string | null => {
   const trimmed = raw.trim();
 
   if (
     !trimmed.startsWith("/") ||
     trimmed.startsWith("//") ||
-    trimmed.includes("\\")
+    trimmed.includes("\\") ||
+    hasControlCharacter(trimmed)
   ) {
     return null;
   }

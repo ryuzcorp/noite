@@ -14,9 +14,11 @@
 //! deliberately does not tell them apart), so the log names what happened
 //! while the wire keeps its one 401 body.
 import { Data } from "effect";
+import { eq } from "void/db";
 
+import { userTable } from "../../db/schema";
 import { authFromEnv, MissingAuthSecretError } from "../auth";
-import { ensureDb } from "../db";
+import { ensureDb, getDb, withDb } from "../db";
 
 /** The credential state behind one MCP request. */
 export type McpAuth = Data.TaggedEnum<{
@@ -26,6 +28,9 @@ export type McpAuth = Data.TaggedEnum<{
   /** The key was presented and refused. `code` is the plugin's reason;
    * `KEY_NOT_FOUND` means unknown key *or* missing `apps:manage` scope. */
   Rejected: { readonly code: string };
+  /** The key is valid but its owner is banned: a ban must revoke machine
+   * credentials too, or "Ban" would leave `/mcp` (and git push) working. */
+  OwnerBanned: Record<never, never>;
   /** The worker has no auth secret: a deployment fault, not a caller's. */
   Misconfigured: { readonly message: string };
 }>;
@@ -76,7 +81,24 @@ export const authenticateMcp = async (
       });
     }
 
-    return McpAuthState.Authed({ userId: owner });
+    // A API key outlives the sessions `banUser` revokes, and the plugin's
+    // verification never checks the owner's ban flag: read it here so a ban
+    // really does stop this account's machine credentials.
+    const banned = await withDb(async () => {
+      const rows = await getDb()
+        .select({ banned: userTable.banned })
+        .from(userTable)
+        .where(eq(userTable.id, owner))
+        .limit(1);
+
+      const [row] = rows;
+
+      return row === undefined || row.banned === true;
+    });
+
+    return banned
+      ? McpAuthState.OwnerBanned()
+      : McpAuthState.Authed({ userId: owner });
   } catch (error) {
     if (error instanceof MissingAuthSecretError) {
       return McpAuthState.Misconfigured({ message: error.message });
