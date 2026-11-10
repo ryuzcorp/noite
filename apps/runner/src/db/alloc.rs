@@ -21,9 +21,50 @@ use super::apps::list_all_apps;
 static PORT_ALLOC_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// Why picking a fleet-port pair failed. Two states, and they mean different
+/// things to the caller: an exhausted range is the operator's to widen, a
+/// read error is the database's to fix. They used to be the same
+/// `sqlx::Error::RowNotFound`, so an agent reading a 409 could not tell which.
+#[derive(Debug)]
+pub enum AllocError {
+    /// No free pair in `[min, max]`: every port is held by a live app or
+    /// environment (`RUNNER_FLEET_PORT_MIN/MAX`).
+    Exhausted { min: u16, max: u16 },
+    /// Reading the rows that hold the ports failed.
+    Db(sqlx::Error),
+}
+
+impl std::fmt::Display for AllocError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AllocError::Exhausted { min, max } => {
+                write!(f, "fleet port range {min}-{max} exhausted")
+            }
+            AllocError::Db(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for AllocError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            AllocError::Exhausted { .. } => None,
+            AllocError::Db(e) => Some(e),
+        }
+    }
+}
+
+impl From<sqlx::Error> for AllocError {
+    fn from(error: sqlx::Error) -> Self {
+        AllocError::Db(error)
+    }
+}
+
 /// A picked fleet-port pair plus the allocation lock, held until the
 /// app/environment row carrying the pair is inserted: dropping the claim
-/// before the insert reopens the race this exists to close.
+/// before the insert reopens the race this exists to close. Its two states are
+/// `Leased` (this value is alive, no row holds the pair yet) and `Committed`
+/// (the claim was dropped after the insert) — the only legal order.
 pub struct PortClaim {
     pub listen: i64,
     pub internal: i64,
@@ -33,7 +74,11 @@ pub struct PortClaim {
 /// Lowest free pair, claimed: concurrent claims serialize on
 /// `PORT_ALLOC_LOCK` and never return the same pair. Hold the returned
 /// claim across the row insert, then drop it.
-pub async fn claim_ports_in(pool: &SqlitePool, min: u16, max: u16) -> sqlx::Result<PortClaim> {
+pub async fn claim_ports_in(
+    pool: &SqlitePool,
+    min: u16,
+    max: u16,
+) -> Result<PortClaim, AllocError> {
     let guard = PORT_ALLOC_LOCK.lock().await;
     let (listen, internal) = next_ports_in(pool, min, max).await?;
     Ok(PortClaim {
@@ -121,7 +166,11 @@ pub async fn ensure_app_build_uid(
 /// Both fleets are read: an app's pair **and** every preview environment's,
 /// because an environment is its own celld process with its own pair on the
 /// same range and two fleets on one port crash-loop.
-pub async fn next_ports_in(pool: &SqlitePool, min: u16, max: u16) -> sqlx::Result<(i64, i64)> {
+pub async fn next_ports_in(
+    pool: &SqlitePool,
+    min: u16,
+    max: u16,
+) -> Result<(i64, i64), AllocError> {
     let apps = list_all_apps(pool).await?;
     let envs = super::environments::list_all_environments(pool).await?;
     let mut used = std::collections::HashSet::new();
@@ -144,13 +193,13 @@ pub async fn next_ports_in(pool: &SqlitePool, min: u16, max: u16) -> sqlx::Resul
     let mut listen = min;
     loop {
         let Some(next) = listen.checked_add(1).filter(|port| *port <= max) else {
-            return Err(sqlx::Error::RowNotFound);
+            return Err(AllocError::Exhausted { min, max });
         };
         if !used.contains(&listen) && !used.contains(&next) {
             return Ok((listen as i64, next as i64));
         }
         let Some(after) = next.checked_add(1) else {
-            return Err(sqlx::Error::RowNotFound);
+            return Err(AllocError::Exhausted { min, max });
         };
         listen = after;
     }
@@ -359,7 +408,7 @@ mod tests {
         // The range holds one pair and it is taken: exhaustion, not a wander.
         assert!(matches!(
             next_ports_in(&pool, 20000, 20001).await,
-            Err(sqlx::Error::RowNotFound)
+            Err(AllocError::Exhausted { .. })
         ));
         // An odd-sized range ending at u16::MAX: with the first pair taken
         // the scan reaches 65535, whose successor does not exist. It must
@@ -370,7 +419,7 @@ mod tests {
             .expect("take the first top pair");
         assert!(matches!(
             next_ports_in(&pool, 65533, 65535).await,
-            Err(sqlx::Error::RowNotFound)
+            Err(AllocError::Exhausted { .. })
         ));
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);

@@ -57,9 +57,64 @@ pub struct SnapshotStatus {
     pub last_error: Option<String>,
 }
 
+/// Where the snapshot uploader is. The old encoding was a `dirty` bool plus
+/// three loop-local timers, so "the bucket is current", "a write is waiting
+/// for the debounce", "an upload is running" and "uploads are off because
+/// another runner claimed the bucket" were all indistinguishable from
+/// outside — and `/ready` could not tell a current bucket from a stopped
+/// uploader.
+///
+/// ```text
+/// stateDiagram-v2
+///     Clean --> Dirty: write observed (data_version / mark_dirty)
+///     Dirty --> Uploading: debounce + min-interval passed
+///     Uploading --> Clean: upload landed (or was identical and skipped)
+///     Uploading --> Dirty: error (state retained, retried next pass)
+///     Clean --> Suspended: another runner claimed the bucket
+///     Dirty --> Suspended: another runner claimed the bucket
+///     Uploading --> Suspended: another runner claimed the bucket
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotPhase {
+    /// Nothing to upload: the bucket state matches this runner's database.
+    Clean,
+    /// A write landed; the debounce and min-interval gates decide when.
+    Dirty { since: Instant },
+    /// An upload is in flight (serialized by `snapshot_lock`). `dirty_during`
+    /// records that a write landed while it ran: the upload cannot contain
+    /// that write, so the machine goes back to `Dirty` instead of `Clean`.
+    Uploading { since: Instant, dirty_during: bool },
+    /// Another runner owns the bucket: uploads are off for this process.
+    Suspended { reason: String },
+}
+
+impl SnapshotPhase {
+    /// Whether a write is waiting for the upload gates (the `dirty` bit of
+    /// old).
+    pub fn is_dirty(&self) -> bool {
+        matches!(
+            self,
+            SnapshotPhase::Dirty { .. }
+                | SnapshotPhase::Uploading {
+                    dirty_during: true,
+                    ..
+                }
+        )
+    }
+
+    /// The first instant this phase's write was noticed, when it has one.
+    fn dirty_since(&self) -> Option<Instant> {
+        match self {
+            SnapshotPhase::Dirty { since } => Some(*since),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StateSync {
-    dirty: Arc<AtomicBool>,
+    /// The uploader's lifecycle (see [`SnapshotPhase`]).
+    phase: Arc<std::sync::Mutex<SnapshotPhase>>,
     generation: Arc<AtomicU64>,
     /// This runner's claim on the bucket state (see module docs).
     instance: Arc<String>,
@@ -83,7 +138,7 @@ pub struct StateSync {
 impl StateSync {
     pub fn new() -> Self {
         Self {
-            dirty: Arc::new(AtomicBool::new(false)),
+            phase: Arc::new(std::sync::Mutex::new(SnapshotPhase::Clean)),
             generation: Arc::new(AtomicU64::new(0)),
             instance: Arc::new(uuid::Uuid::new_v4().to_string()),
             owner: Arc::new(AtomicBool::new(true)),
@@ -94,13 +149,35 @@ impl StateSync {
         }
     }
 
-    /// Mark dirty explicitly (API mutations; the poller catches the rest).
+    /// Mark dirty explicitly (API mutations; the poller catches the rest). A
+    /// suspension is terminal for this process: a write cannot un-suspend.
     pub fn mark_dirty(&self) {
-        self.dirty.store(true, Ordering::Relaxed);
+        let mut phase = self.lock_phase();
+        match &mut *phase {
+            SnapshotPhase::Clean => {
+                *phase = SnapshotPhase::Dirty {
+                    since: Instant::now(),
+                }
+            }
+            // A write cannot un-suspend the uploader, and a write during an
+            // upload has to survive it: the snapshot in flight predates it.
+            SnapshotPhase::Suspended { .. } => {}
+            SnapshotPhase::Uploading { dirty_during, .. } => *dirty_during = true,
+            SnapshotPhase::Dirty { .. } => {}
+        }
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.dirty.load(Ordering::Relaxed)
+        self.lock_phase().is_dirty()
+    }
+
+    /// The uploader's current phase (for `/ready` detail and tests).
+    pub fn phase(&self) -> SnapshotPhase {
+        self.lock_phase().clone()
+    }
+
+    fn lock_phase(&self) -> std::sync::MutexGuard<'_, SnapshotPhase> {
+        self.phase.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Whether this runner still owns the bucket state (for /ready detail).
@@ -187,33 +264,72 @@ impl StateSync {
     /// fixed temp path and upload each other's partial bytes (R-08).
     pub async fn snapshot_now(&self, pool: &SqlitePool, cfg: &Config) -> anyhow::Result<u64> {
         let _snapshot = self.snapshot_lock.lock().await;
-        if !self.still_owner(cfg).await {
+        // The latch first: once another runner's claim was seen, this process
+        // never uploads again — not even if a later `owner.json` read fails
+        // (an unreadable claim used to count as "still mine", which could put
+        // a stale database over the newer runner's snapshot).
+        if !self.is_owner() || !self.still_owner(cfg).await {
+            *self.lock_phase() = SnapshotPhase::Suspended {
+                reason: "another runner claimed the bucket state".into(),
+            };
             anyhow::bail!("runner state is owned by another runner; not uploading");
         }
-        // Clear first: a write that lands while we snapshot sets it again and
-        // is picked up by the next pass instead of being lost.
-        self.dirty.store(false, Ordering::Relaxed);
+        // `Uploading` first: a write that lands while we snapshot marks the
+        // phase dirty again and is picked up by the next pass instead of
+        // being lost.
+        let was = std::mem::replace(
+            &mut *self.lock_phase(),
+            SnapshotPhase::Uploading {
+                since: Instant::now(),
+                dirty_during: false,
+            },
+        );
         let result = self.upload_snapshot(pool, cfg).await;
         match &result {
             // An upload landed: the bucket now holds this state and its meta.
             Ok(bytes) if *bytes > 0 => {
-                *self.last_upload.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+                let now = Instant::now();
+                *self.last_upload.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
                 *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                self.settle_clean(was);
             }
             // Skipped as identical: `last_hash` is only recorded once state
-            // and meta both landed, so the bucket already matches. Nothing
-            // was uploaded, so the upload age stays the real one; an older
-            // error no longer describes the bucket.
+            // and meta both landed, so the bucket already matches. The bucket
+            // *is* current, so the upload age restarts here too — otherwise
+            // `/ready` reported an ever-growing age for a bucket that was
+            // being verified every 15 s.
             Ok(_) => {
+                *self.last_upload.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
                 *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                self.settle_clean(was);
             }
             Err(e) => {
-                self.dirty.store(true, Ordering::Relaxed);
                 let msg: String = format!("{e:#}").chars().take(300).collect();
                 *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+                // Back to dirty, keeping the original write's clock so a
+                // failed pass does not restart the debounce.
+                *self.lock_phase() = SnapshotPhase::Dirty {
+                    since: was.dirty_since().unwrap_or_else(Instant::now),
+                };
             }
         }
         result
+    }
+
+    /// Land on `Clean`, unless a write arrived during the upload — then the
+    /// bucket predates it and the machine stays `Dirty` — or another runner
+    /// suspended us mid-flight.
+    fn settle_clean(&self, was: SnapshotPhase) {
+        let mut phase = self.lock_phase();
+        if let SnapshotPhase::Uploading { dirty_during, .. } = *phase {
+            *phase = if dirty_during {
+                SnapshotPhase::Dirty {
+                    since: was.dirty_since().unwrap_or_else(Instant::now),
+                }
+            } else {
+                SnapshotPhase::Clean
+            };
+        }
     }
 
     async fn upload_snapshot(&self, pool: &SqlitePool, cfg: &Config) -> anyhow::Result<u64> {
@@ -406,7 +522,6 @@ pub fn spawn_sync_task(sync: StateSync, pool: SqlitePool, cfg: Config) {
             }
         };
         let mut last_version: Option<i64> = None;
-        let mut dirty_since: Option<Instant> = None;
         let mut last_upload = Instant::now() - MIN_INTERVAL;
         loop {
             tokio::time::sleep(POLL).await;
@@ -419,19 +534,18 @@ pub fn spawn_sync_task(sync: StateSync, pool: SqlitePool, cfg: Config) {
                 }
                 last_version = Some(v);
             }
-            if !sync.is_dirty() {
-                dirty_since = None;
+            // The phase owns the debounce clock now: `Dirty { since }` is set
+            // by whichever write was noticed first, so a pass that is skipped
+            // or fails does not restart it.
+            let phase = sync.phase();
+            let Some(since) = phase.dirty_since() else {
                 continue;
-            }
-            let since = dirty_since.get_or_insert_with(Instant::now);
-            if !should_upload(true, Some(*since), last_upload, Instant::now()) {
+            };
+            if !should_upload(true, Some(since), last_upload, Instant::now()) {
                 continue;
             }
             match sync.snapshot_now(&pool, &cfg).await {
-                Ok(_) => {
-                    last_upload = Instant::now();
-                    dirty_since = None;
-                }
+                Ok(_) => last_upload = Instant::now(),
                 Err(e) => tracing::warn!(error = %e, "state snapshot failed"),
             }
         }
@@ -460,11 +574,74 @@ pub async fn final_snapshot(sync: &StateSync, pool: &SqlitePool, cfg: &Config) {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_upload, snapshot_tmp_paths, DEBOUNCE, MIN_INTERVAL};
+    use super::{
+        should_upload, snapshot_tmp_paths, SnapshotPhase, StateSync, DEBOUNCE, MIN_INTERVAL,
+    };
     use crate::host::s3::is_not_found;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
+
+    /// The uploader's phases: a write is dirty once (its debounce clock is not
+    /// restarted by later writes), a landed upload settles clean, a write that
+    /// arrived during the upload survives it, and a suspension is terminal.
+    #[test]
+    fn snapshot_phase_transitions() {
+        let sync = StateSync::new();
+        assert_eq!(sync.phase(), SnapshotPhase::Clean);
+        assert!(!sync.is_dirty());
+
+        sync.mark_dirty();
+        let SnapshotPhase::Dirty { since } = sync.phase() else {
+            panic!("a write makes it dirty");
+        };
+        // A later write does not restart the debounce clock (the clock is the
+        // first write's instant, so this is exact without waiting).
+        sync.mark_dirty();
+        assert_eq!(sync.phase(), SnapshotPhase::Dirty { since });
+
+        // An upload takes the phase, and a clean result settles it.
+        *sync.lock_phase() = SnapshotPhase::Uploading {
+            since,
+            dirty_during: false,
+        };
+        sync.settle_clean(SnapshotPhase::Dirty { since });
+        assert_eq!(sync.phase(), SnapshotPhase::Clean);
+
+        // A write during the upload is not lost: `mark_dirty` records it on
+        // the in-flight phase, and settling then lands back on `Dirty`.
+        sync.mark_dirty();
+        let SnapshotPhase::Dirty { since } = sync.phase() else {
+            panic!("dirty");
+        };
+        *sync.lock_phase() = SnapshotPhase::Uploading {
+            since,
+            dirty_during: false,
+        };
+        sync.mark_dirty();
+        assert!(
+            matches!(
+                sync.phase(),
+                SnapshotPhase::Uploading {
+                    dirty_during: true,
+                    ..
+                }
+            ),
+            "the write is recorded on the in-flight upload"
+        );
+        sync.settle_clean(SnapshotPhase::Dirty { since });
+        assert!(sync.is_dirty(), "a write during the upload survives it");
+
+        // A suspension is not undone by a write: uploads stay off.
+        *sync.lock_phase() = SnapshotPhase::Suspended {
+            reason: "another runner".into(),
+        };
+        sync.mark_dirty();
+        assert!(
+            matches!(sync.phase(), SnapshotPhase::Suspended { .. }),
+            "a suspended uploader never resumes in this process"
+        );
+    }
 
     #[test]
     fn only_a_missing_object_counts_as_no_snapshot() {

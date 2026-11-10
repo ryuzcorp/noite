@@ -157,7 +157,7 @@ pub async fn create(
     )
     .await
     .map_err(|e| match e {
-        sqlx::Error::RowNotFound => ApiError::conflict(format!(
+        db::alloc::AllocError::Exhausted { .. } => ApiError::conflict(format!(
             "fleet port range {}-{} exhausted; raise NOITE_FLEET_PORTS",
             state.config.fleet_port_min, state.config.fleet_port_max
         )),
@@ -447,7 +447,7 @@ pub async fn preview(
             )
             .await
             .map_err(|e| match e {
-                sqlx::Error::RowNotFound => ApiError::conflict(format!(
+                db::alloc::AllocError::Exhausted { .. } => ApiError::conflict(format!(
                     "fleet port range {}-{} exhausted; raise NOITE_FLEET_PORTS",
                     state.config.fleet_port_min, state.config.fleet_port_max
                 )),

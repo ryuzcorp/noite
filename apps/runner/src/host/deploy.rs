@@ -264,9 +264,9 @@ pub async fn deploy_app(
     // preview environment — so the reconcile loop spawns the fleet this
     // release lands in.
     match &target {
-        DeployTarget::Production => crate::host::sleep::wake_for_deploy(pool, &app).await,
+        DeployTarget::Production => crate::host::sleep::wake_for_deploy(pool, procs, &app).await,
         DeployTarget::Environment(env) => {
-            crate::host::sleep::wake_environment_for_deploy(pool, env).await;
+            crate::host::sleep::wake_environment_for_deploy(pool, procs, env).await;
         }
     }
     // The row must exist before the pipeline runs: it is what the operator's

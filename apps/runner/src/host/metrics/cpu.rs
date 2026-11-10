@@ -59,8 +59,8 @@ pub(super) fn sample_cpu(procs: &ProcMap, control_pid: u32) -> HashMap<String, (
     let Ok(map) = procs.try_lock() else {
         return out;
     };
-    for (slug, child) in map.iter() {
-        if let Some(pid) = child.id() {
+    for (slug, entry) in map.iter() {
+        if let Some(pid) = entry.child().and_then(|child| child.id()) {
             out.insert(slug.clone(), proc_cpu_recursive(pid, 3));
         }
     }

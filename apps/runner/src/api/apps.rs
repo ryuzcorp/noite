@@ -61,8 +61,12 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     // state itself is terminal when it trips.
     {
         let iso = state.isolation.read().await;
-        if iso.blocked {
-            failures.push(ReadyFailure::Isolation(iso.detail.clone()));
+        // The live probe, not the boot snapshot: a capability that failed
+        // after boot blocks here exactly like a boot-time failure. Only a
+        // `multi` install blocks (single runs the checks and warns).
+        let iso_failures = iso.failures();
+        if iso.tenancy == "multi" && !iso_failures.is_empty() {
+            failures.push(ReadyFailure::Isolation(iso_failures.join("; ")));
         }
     }
     // Per-fleet cgroups (SPEC, Tenant isolation): the live status, not the

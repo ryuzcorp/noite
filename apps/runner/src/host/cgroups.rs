@@ -77,6 +77,23 @@ fn reason(msg: String) {
     }
 }
 
+/// The cgroup capability read from the filesystem right now, for `/ready`:
+/// `CGROUPS_OK` is the last *observed* state, which only changes when this
+/// process notices a failure. A leaf directory that no longer exists or is no
+/// longer a cgroup2 directory (the mount went away) is caught here.
+pub fn live_status() -> (bool, String) {
+    let Some(anchor) = anchor() else {
+        return (false, "no cgroup anchor".to_string());
+    };
+    if !anchor.join("cgroup.controllers").is_file() {
+        return (
+            false,
+            format!("{} is not a cgroup2 directory", anchor.display()),
+        );
+    }
+    status()
+}
+
 /// Current cgroup status for `/ready` and doctor.
 pub fn status() -> (bool, String) {
     let ok = CGROUPS_OK.load(Ordering::Relaxed);
@@ -835,8 +852,18 @@ pub fn fleet_dir_name(key: &str) -> String {
 pub fn ensure_fleet_cgroup(anchor: &Path, key: &str, memory_mb: u64) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let dir = anchor.join(fleet_dir_name(key));
-    std::fs::create_dir_all(&dir)?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+    // A leaf this fleet cannot create or expose is a fleet that will run in
+    // the shared group: trip containment here too. Only the limit writes used
+    // to call `note_limit_failed`, so an unbindable anchor read as healthy
+    // while every fleet ran uncapped.
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        note_limit_failed(key, format!("fleet cgroup dir: {error}"));
+        return Err(error.into());
+    }
+    if let Err(error) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)) {
+        note_limit_failed(key, format!("fleet cgroup mode: {error}"));
+        return Err(error.into());
+    }
     if memory_mb > 0 {
         let max = (memory_mb * 1024 * 1024).to_string();
         if let Err(error) = write_limit(&dir, "memory.max", &max) {
@@ -953,34 +980,72 @@ const OOM_BACKOFF_CAP_SECS: u64 = 300;
 /// still lands in the (ring-bounded) fleet log.
 const OOM_EVENT_WINDOW_SECS: u64 = 3600;
 
-/// Per-fleet OOM state: the spawn baseline for kill detection, plus the
-/// backoff and event-dedup clocks for a crash loop pinned at its cap. One
-/// entry per fleet with a live or recently-dead fleet; forgotten at stop.
-struct OomFleet {
-    baseline: Option<u64>,
-    spawned_at: std::time::Instant,
-    consecutive: u32,
-    last_event: Option<std::time::Instant>,
-    not_before: Option<std::time::Instant>,
+/// Per-fleet OOM monitor: one [`OomState`] per fleet key, taken at spawn and
+/// consumed at the exit check, plus the chain clocks a crash loop needs.
+static OOM_FLEETS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, OomState>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Where one fleet's OOM-kill detection stands. The kernel's `memory.events`
+/// counter is the ground truth; this is only the per-fleet memory of what to
+/// compare it against, and the chain length the backoff grows from.
+///
+/// ```text
+/// stateDiagram-v2
+///     Unmonitored --> Watching: spawn into its group (note_spawned)
+///     Watching --> Reported: exit observed (oom_kills_since_spawn)
+///     Reported --> Watching: next spawn
+///     Watching --> Unmonitored: stop / delete (forget_spawned)
+///     Reported --> Unmonitored: stop / delete
+/// ```
+#[derive(Debug, Clone, Copy)]
+enum OomState {
+    /// No spawn recorded since boot: a kill cannot be attributed.
+    Unmonitored,
+    /// A live fleet in its own group: the `oom_kill` count at spawn.
+    Watching {
+        baseline: u64,
+        since: std::time::Instant,
+        consecutive: u32,
+        last_event: Option<std::time::Instant>,
+    },
+    /// This spawn's verdict was consumed: a second exit for it cannot be
+    /// attributed to an OOM kill. The chain carries over to the next spawn.
+    Reported {
+        since: std::time::Instant,
+        consecutive: u32,
+        last_event: Option<std::time::Instant>,
+    },
 }
 
-impl Default for OomFleet {
-    fn default() -> Self {
-        Self {
-            baseline: None,
-            spawned_at: std::time::Instant::now(),
-            consecutive: 0,
-            last_event: None,
-            not_before: None,
+impl OomState {
+    /// The non-OOM/OOM chain length this fleet has accumulated.
+    fn consecutive(self) -> u32 {
+        match self {
+            OomState::Unmonitored => 0,
+            OomState::Watching { consecutive, .. } | OomState::Reported { consecutive, .. } => {
+                consecutive
+            }
+        }
+    }
+
+    /// The instant of the kernel's last reported kill (event dedup).
+    fn last_event(self) -> Option<std::time::Instant> {
+        match self {
+            OomState::Unmonitored => None,
+            OomState::Watching { last_event, .. } | OomState::Reported { last_event, .. } => {
+                last_event
+            }
+        }
+    }
+
+    /// The instant this fleet's current spawn started.
+    fn since(self) -> Option<std::time::Instant> {
+        match self {
+            OomState::Unmonitored => None,
+            OomState::Watching { since, .. } | OomState::Reported { since, .. } => Some(since),
         }
     }
 }
-
-/// OOM-kill baselines per fleet key, taken at spawn: `memory.events`
-/// `oom_kill` only grows inside a group, so a restart reports an OOM kill
-/// exactly when the counter moved since that fleet's own spawn.
-static OOM_FLEETS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, OomFleet>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// What one observed OOM kill means for the supervisor: how long to hold
 /// the respawn, whether the tenant event is due (deduped per window), and
@@ -993,7 +1058,7 @@ pub struct OomNote {
 
 /// Respawn wait for N consecutive OOM kills: exponential from the base,
 /// capped. Pure arithmetic, pinned by unit tests.
-fn oom_backoff_delay(consecutive: u32) -> std::time::Duration {
+pub(crate) fn oom_backoff_delay(consecutive: u32) -> std::time::Duration {
     let shift = consecutive.saturating_sub(1).min(6);
     std::time::Duration::from_secs(OOM_BACKOFF_BASE_SECS * 2u64.pow(shift))
         .min(std::time::Duration::from_secs(OOM_BACKOFF_CAP_SECS))
@@ -1024,10 +1089,16 @@ fn oom_kill_count(dir: &Path) -> u64 {
 pub fn note_spawned(key: &str, dir: &Path) {
     let count = oom_kill_count(dir);
     if let Ok(mut fleets) = OOM_FLEETS.lock() {
-        let entry = fleets.entry(key.to_string()).or_default();
-        entry.baseline = Some(count);
-        entry.spawned_at = std::time::Instant::now();
-        entry.not_before = None;
+        let previous = fleets.get(key).copied().unwrap_or(OomState::Unmonitored);
+        fleets.insert(
+            key.to_string(),
+            OomState::Watching {
+                baseline: count,
+                since: std::time::Instant::now(),
+                consecutive: previous.consecutive(),
+                last_event: previous.last_event(),
+            },
+        );
     }
 }
 
@@ -1037,7 +1108,21 @@ pub fn note_spawned(key: &str, dir: &Path) {
 /// baseline (spawned without cgroups, or a runner restart in between).
 pub fn oom_kills_since_spawn(key: &str, dir: &Path) -> Option<u64> {
     let mut fleets = OOM_FLEETS.lock().ok()?;
-    let baseline = fleets.get_mut(key)?.baseline.take()?;
+    let state = fleets.get_mut(key)?;
+    let OomState::Watching {
+        baseline,
+        since,
+        consecutive,
+        last_event,
+    } = *state
+    else {
+        return None;
+    };
+    *state = OomState::Reported {
+        since,
+        consecutive,
+        last_event,
+    };
     oom_kill_count(dir).checked_sub(baseline)
 }
 
@@ -1047,22 +1132,24 @@ pub fn oom_kills_since_spawn(key: &str, dir: &Path) -> Option<u64> {
 /// due (at most one per window; every restart still lands in the fleet log).
 pub fn oom_note_kill(key: &str, memory_mb: u32, now: std::time::Instant) -> Option<OomNote> {
     let mut fleets = OOM_FLEETS.lock().ok()?;
-    let fleet = fleets.get_mut(key)?;
-    let uptime = now.duration_since(fleet.spawned_at);
-    fleet.consecutive = if uptime < std::time::Duration::from_secs(OOM_STABLE_SECS) {
-        fleet.consecutive.saturating_add(1).max(1)
+    let state = fleets.get_mut(key)?;
+    let since = state.since()?;
+    let uptime = now.duration_since(since);
+    let consecutive = if uptime < std::time::Duration::from_secs(OOM_STABLE_SECS) {
+        state.consecutive().saturating_add(1).max(1)
     } else {
         1
     };
-    let delay = oom_backoff_delay(fleet.consecutive);
-    let due = match fleet.last_event {
+    let delay = oom_backoff_delay(consecutive);
+    let due = match state.last_event() {
         None => true,
         Some(at) => now.duration_since(at) >= std::time::Duration::from_secs(OOM_EVENT_WINDOW_SECS),
     };
-    if due {
-        fleet.last_event = Some(now);
-    }
-    fleet.not_before = Some(now + delay);
+    *state = OomState::Reported {
+        since,
+        consecutive,
+        last_event: if due { Some(now) } else { state.last_event() },
+    };
     let detail =
         format!("fleet restarted: memory limit {memory_mb} MiB exceeded (Settings → Limits)");
     Some(OomNote {
@@ -1070,23 +1157,6 @@ pub fn oom_note_kill(key: &str, memory_mb: u32, now: std::time::Instant) -> Opti
         delay,
         event_due: due,
     })
-}
-
-/// Whether a fleet's respawn hold has passed (or was never set). Expired
-/// holds are forgotten. Callers skip the spawn while this is false.
-pub fn oom_spawn_ready(key: &str, now: std::time::Instant) -> bool {
-    let Ok(mut fleets) = OOM_FLEETS.lock() else {
-        return true;
-    };
-    match fleets.get(key).and_then(|fleet| fleet.not_before) {
-        Some(at) if now < at => false,
-        _ => {
-            if let Some(fleet) = fleets.get_mut(key) {
-                fleet.not_before = None;
-            }
-            true
-        }
-    }
 }
 
 /// Whether `error` is the kernel reporting a gone process (ESRCH): a move
@@ -1774,9 +1844,37 @@ mod tests {
             "respawn backoff grows exponentially"
         );
         assert_eq!(events, 1, "one tenant event per window, not one per kill");
+        // The respawn hold lives in the supervisor's `FleetState::OomHeld`,
+        // built from the delay this reports: the monitor only says what the
+        // kernel did and how long to wait.
+        assert_eq!(
+            delays.last().copied(),
+            Some(std::time::Duration::from_secs(20)),
+            "the last kill still reports its own backoff"
+        );
+        // One spawn reports at most once: a second exit check for the same
+        // spawn cannot blame another kill.
+        assert_eq!(oom_kills_since_spawn(&key, tmp.path()), None);
+    }
+
+    /// A leaf that cannot be created is a fleet that would run in the shared
+    /// group, so it trips install-wide containment here too. Only the limit
+    /// writes used to, so an unwritable anchor read healthy while every fleet
+    /// ran uncapped.
+    #[test]
+    fn an_uncreatable_leaf_trips_containment() {
+        let tmp = fakefs();
+        // A regular file where the anchor's child has to be a directory.
+        let blocker = tmp.path().join("blocked");
+        std::fs::write(&blocker, b"not a directory").expect("blocker");
+        let err = ensure_fleet_cgroup(&blocker, "shop", 512)
+            .expect_err("a leaf under a regular file cannot exist");
+        let _ = err;
+        let (ok, detail) = status();
+        assert!(!ok, "containment tripped: {detail}");
         assert!(
-            !oom_spawn_ready(&key, now),
-            "the respawn holds until the backoff passes"
+            detail.contains("fleet shop"),
+            "the reason names the fleet: {detail}"
         );
     }
 

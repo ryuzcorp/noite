@@ -63,9 +63,14 @@ pub async fn tick(
     // app's sealed Parquet needs no re-scan every 10 s; its status mirrors
     // the supervisor (ensure_fleet marks Running, stop marks Stopped), and a
     // stopped environment's fleet drains the same tail through its own key.
-    // The procs map confirms the process is actually there. The control node
-    // is not in that map either, so its pid slot answers the same question.
-    let live_slugs: HashSet<String> = procs.lock().await.keys().cloned().collect();
+    // The procs map confirms the process is actually there — a parked or
+    // crash-held fleet is still a key in it, so ask for the live ones. The
+    // control node is not in that map either, so its pid slot answers the
+    // same question.
+    let live_slugs: HashSet<String> = crate::host::supervisor::live_keys(procs)
+        .await
+        .into_iter()
+        .collect();
 
     let cpu = sample_cpu_step(procs, control_pid, state, &keys.ids, &keys.envs);
     // The tail runs before the ingest so a line already on disk joins its

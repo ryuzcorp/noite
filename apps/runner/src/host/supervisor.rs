@@ -60,75 +60,346 @@ fn sigkill_tree(pid: u32) {
     }
 }
 
-pub type ProcMap = Arc<Mutex<HashMap<String, Child>>>;
+/// Every supervised fleet's runtime, keyed by fleet key (`slug`, or
+/// `slug.label` for a preview): the child process (when it has one) plus the
+/// explicit [`FleetState`] that says what the fleet is doing. Nothing else in
+/// the runner answers "is this fleet up?" — the map used to be plain
+/// `Child` presence, which could not tell a live child from an exited one,
+/// nor a fresh spawn from a crash-held or parked one.
+pub type ProcMap = Arc<Mutex<HashMap<String, FleetEntry>>>;
 
 pub fn new_procs() -> ProcMap {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// Non-OOM restart gate: a fleet that exits on its own is retried after 5 s,
-/// 10 s, 20 s … capped at 60 s, and the chain resets after five minutes of
-/// uptime. OOM kills keep their own, longer backoff in `host::cgroups`; a
-/// crash loop used to respawn every reconcile tick forever.
-#[derive(Default)]
-struct CrashGate {
-    consecutive: u32,
-    ready_at: Option<Instant>,
-    spawned_at: Option<Instant>,
+/// One fleet's supervised lifecycle. See the module docs on
+/// [`FleetState::on`] for the transition table; every state change goes
+/// through that one function, so a caller never has to combine "child exists",
+/// "row says running", "crash gate", "OOM hold", and "confirm set" by hand.
+///
+/// ```text
+/// stateDiagram-v2
+///     Absent --> Spawning: Spawned
+///     Spawning --> Probing: ProbeStarted
+///     Probing --> Healthy: Confirmed
+///     Probing --> Spawning: Unconfirmed
+///     Probing --> Spawning: Tick (probe deadline passed)
+///     Spawning --> Healthy: Confirmed (a wake's own gate)
+///     Spawning --> CrashHeld: Exited(no OOM)
+///     Probing --> CrashHeld: Exited(no OOM)
+///     Healthy --> CrashHeld: Exited(no OOM)
+///     Spawning --> OomHeld: Exited(OOM)
+///     Probing --> OomHeld: Exited(OOM)
+///     Healthy --> OomHeld: Exited(OOM)
+///     CrashHeld --> Spawning: Spawned (hold passed)
+///     OomHeld --> Spawning: Spawned (hold passed)
+///     Absent --> Asleep: Parked (nothing left to stop)
+///     Spawning --> Absent: SpawnFailed
+///     Spawning --> Asleep: Parked
+///     Probing --> Asleep: Parked
+///     Healthy --> Asleep: Parked
+///     Waking --> Spawning: Spawned (the wake's own cold start)
+///     Asleep --> Waking: Woke
+///     Absent --> Waking: Woke (first wake after a runner restart)
+///     Waking --> Healthy: Confirmed
+///     Waking --> Asleep: Parked (the wake failed)
+///     Spawning --> Stopped: Stopped
+///     Probing --> Stopped: Stopped
+///     Healthy --> Stopped: Stopped
+///     CrashHeld --> Stopped: Stopped
+///     OomHeld --> Stopped: Stopped
+///     Asleep --> Stopped: Stopped
+///     Waking --> Stopped: Stopped
+///     Stopped --> Absent: Woke / Spawned
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FleetState {
+    /// No child and no hold: the next `ensure_fleet` spawns one.
+    Absent,
+    /// A child runs; it has not answered its health gate yet. `since` is the
+    /// instant the current child started (the healthy-window clock), and
+    /// `crashes` the non-OOM chain length it inherited.
+    Spawning { since: Instant, crashes: u32 },
+    /// A health probe is in flight for the child (one per fleet; the state
+    /// itself makes a second probe impossible). `until` is the probe's
+    /// deadline: a probe task that dies without reporting cannot wedge the
+    /// fleet, because the next tick past `until` puts it back to `Spawning`.
+    Probing {
+        since: Instant,
+        crashes: u32,
+        until: Instant,
+    },
+    /// The current child answered its health gate.
+    Healthy { since: Instant, crashes: u32 },
+    /// The child exited on its own; the next spawn waits until `until`
+    /// (5 s, 10 s, 20 s … capped at 60 s, reset after five healthy minutes).
+    CrashHeld { crashes: u32, until: Instant },
+    /// The kernel OOM-killed the child at its memory cap; the next spawn waits
+    /// until `until` (5 s … capped at 300 s).
+    OomHeld { crashes: u32, until: Instant },
+    /// A held request is cold-starting a parked fleet; the row keeps saying
+    /// asleep until the health gate opens, so a failed wake leaves the fleet
+    /// exactly as parked as it was.
+    Waking { since: Instant, crashes: u32 },
+    /// Parked by the sleep sweep, an operator sleep, or memory pressure: no
+    /// child, and the edge wakes it on the next request. `until` is the hold
+    /// the park inherited from a crash/OOM backoff: a parked fleet that had
+    /// just crash-looped still backs off, so waking it fails fast until then.
+    Asleep { until: Option<Instant> },
+    /// Deliberately stopped (desired state, delete, teardown): no child and no
+    /// automatic respawn.
+    Stopped,
 }
 
+/// What happened to a fleet. Every [`FleetState::on`] transition names one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FleetEvent {
+    /// A child was spawned for the fleet.
+    Spawned { at: Instant },
+    /// A health probe started; `until` is its deadline.
+    ProbeStarted { until: Instant },
+    /// The health gate answered 200.
+    Confirmed,
+    /// The health gate gave up without an answer; the next tick probes again.
+    Unconfirmed,
+    /// The child exited on its own. `oom` says the kernel killed it at its cap.
+    Exited { oom: bool, at: Instant },
+    /// A held request is being woken (only meaningful from `Asleep`).
+    Woke { at: Instant },
+    /// The sleep sweep or an operator parked it.
+    Parked,
+    /// A deliberate stop or delete.
+    Stopped,
+    /// The spawn this claim covered never produced a child (exec error, no
+    /// leaf in `multi`, a refused cgroup move): release the claim so the next
+    /// tick may try again.
+    SpawnFailed,
+    /// A timer: an expired hold becomes [`FleetState::Absent`].
+    Tick { at: Instant },
+}
+
+/// Non-OOM crash backoff: 5 s, doubling to a 60 s cap.
 const CRASH_BACKOFF_BASE: Duration = Duration::from_secs(5);
 const CRASH_BACKOFF_CAP: Duration = Duration::from_secs(60);
+/// A fleet that stayed up this long starts a fresh crash chain.
 const CRASH_HEALTHY_AFTER: Duration = Duration::from_secs(300);
 
-static CRASH_GATES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, CrashGate>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-
 /// Wait after the N-th consecutive crash: 5, 10, 20, 40, 60 … seconds.
-fn crash_backoff(consecutive: u32) -> Duration {
+pub(crate) fn crash_backoff(consecutive: u32) -> Duration {
     let shift = consecutive.saturating_sub(1).min(4);
     (CRASH_BACKOFF_BASE * 2u32.pow(shift)).min(CRASH_BACKOFF_CAP)
 }
 
-/// Whether the fleet may spawn now (also true when it never crashed).
-fn crash_ready(key: &str, now: Instant) -> bool {
-    CRASH_GATES
-        .lock()
-        .ok()
-        .and_then(|gates| gates.get(key).and_then(|gate| gate.ready_at))
-        .is_none_or(|ready_at| now >= ready_at)
-}
+impl FleetState {
+    /// The one transition function: every state change in the fleet
+    /// supervisor is `state = state.on(event)`. Illegal events leave the state
+    /// alone (a stop that arrives twice, a confirm for a parked fleet, a probe
+    /// for a fleet with no child), so a caller can act on whichever event it
+    /// observed without re-deriving the preconditions.
+    pub fn on(self, event: FleetEvent) -> Self {
+        use FleetEvent as E;
+        use FleetState as S;
+        match (self, event) {
+            // A spawn is only meaningful for a fleet that is not running.
+            (S::Absent | S::Stopped, E::Spawned { at }) => S::Spawning {
+                since: at,
+                crashes: 0,
+            },
+            (S::CrashHeld { crashes, .. } | S::OomHeld { crashes, .. }, E::Spawned { at }) => {
+                S::Spawning { since: at, crashes }
+            }
+            (S::Asleep { .. } | S::Waking { .. }, E::Spawned { at }) => S::Spawning {
+                since: at,
+                crashes: 0,
+            },
 
-/// Record one non-OOM exit and hold the next spawn.
-fn note_crash(key: &str, now: Instant) {
-    let Ok(mut gates) = CRASH_GATES.lock() else {
-        return;
-    };
-    let gate = gates.entry(key.to_string()).or_default();
-    // A fleet that stayed up past the healthy window starts a new chain.
-    if gate
-        .spawned_at
-        .is_some_and(|spawned| now.duration_since(spawned) >= CRASH_HEALTHY_AFTER)
-    {
-        gate.consecutive = 0;
+            (S::Spawning { since, crashes }, E::ProbeStarted { until }) => S::Probing {
+                since,
+                crashes,
+                until,
+            },
+            (S::Spawning { since, crashes }, E::Confirmed)
+            | (S::Probing { since, crashes, .. }, E::Confirmed) => S::Healthy { since, crashes },
+            (S::Waking { since, crashes }, E::Confirmed) => S::Healthy { since, crashes },
+            // A probe that timed out just means "not yet": the next tick
+            // retries, and the repeated state is the explicit no-op.
+            (S::Probing { since, crashes, .. }, E::Unconfirmed) => S::Spawning { since, crashes },
+            // A probe that never reported (its task died) is reclaimed by the
+            // deadline, so a fleet can always be confirmed again.
+            (
+                S::Probing {
+                    since,
+                    crashes,
+                    until,
+                    ..
+                },
+                E::Tick { at },
+            ) if at >= until => S::Spawning { since, crashes },
+
+            // A crash from any state with a running child takes the exit path.
+            (S::Spawning { since, crashes }, E::Exited { oom, at })
+            | (S::Probing { since, crashes, .. }, E::Exited { oom, at })
+            | (S::Healthy { since, crashes }, E::Exited { oom, at })
+            | (S::Waking { since, crashes }, E::Exited { oom, at }) => {
+                // A fleet that ran longer than the healthy window starts a
+                // fresh chain instead of escalating forever.
+                let chain = if at.saturating_duration_since(since) >= CRASH_HEALTHY_AFTER {
+                    1
+                } else {
+                    crashes.saturating_add(1).max(1)
+                };
+                if oom {
+                    S::OomHeld {
+                        crashes: chain,
+                        until: at + crate::host::cgroups::oom_backoff_delay(chain),
+                    }
+                } else {
+                    S::CrashHeld {
+                        crashes: chain,
+                        until: at + crash_backoff(chain),
+                    }
+                }
+            }
+
+            // Waking from `Absent` is the first wake after a runner restart:
+            // the row was parked but this process never saw the park.
+            (S::Asleep { .. } | S::Absent, E::Woke { at }) => S::Waking {
+                since: at,
+                crashes: 0,
+            },
+            // Parking is a deliberate scale-to-zero, and it keeps whatever
+            // backoff the fleet had: a fleet parked while crash-held rests
+            // `Asleep` with that hold, so a wake still fails fast until it
+            // expires. `Absent` is the state a park lands in once the child is
+            // already gone (the sweep stops the fleet, then records the park).
+            (S::CrashHeld { until, .. } | S::OomHeld { until, .. }, E::Parked) => {
+                S::Asleep { until: Some(until) }
+            }
+            (
+                S::Absent
+                | S::Spawning { .. }
+                | S::Probing { .. }
+                | S::Healthy { .. }
+                | S::Waking { .. },
+                E::Parked,
+            ) => S::Asleep { until: None },
+
+            // A stop wins over every state: the caller then tears the child
+            // down and the fleet stays `Stopped` until a spawn restarts it.
+            (_, E::Stopped) => S::Stopped,
+
+            // Only a claimed spawn can fail: the fleet was never running, so
+            // it is back to "spawn when due".
+            (S::Spawning { .. }, E::SpawnFailed) => S::Absent,
+
+            // An expired hold is not a state of its own: the caller spawns
+            // straight from `CrashHeld`/`OomHeld`, which is what carries
+            // `crashes` into the next `Spawning` and keeps the backoff
+            // growing. Collapsing to `Absent` here would reset the chain to
+            // one crash on every retry (a 5 s restart storm forever).
+
+            // Everything else: illegal or already handled. The state stands.
+            (state, _) => state,
+        }
     }
-    gate.consecutive = gate.consecutive.saturating_add(1);
-    gate.ready_at = Some(now + crash_backoff(gate.consecutive));
+
+    /// The instant a crash/OOM hold expires, when the state has one.
+    pub fn hold_until(self) -> Option<Instant> {
+        match self {
+            FleetState::CrashHeld { until, .. } | FleetState::OomHeld { until, .. } => Some(until),
+            FleetState::Asleep { until } => until,
+            _ => None,
+        }
+    }
+
+    /// Whether a child is expected to be running in this state.
+    pub fn is_live(self) -> bool {
+        matches!(
+            self,
+            FleetState::Spawning { .. }
+                | FleetState::Probing { .. }
+                | FleetState::Healthy { .. }
+                | FleetState::Waking { .. }
+        )
+    }
 }
 
-/// Record a successful spawn: the backoff clock for the next crash starts.
-fn note_spawned(key: &str, now: Instant) {
-    let Ok(mut gates) = CRASH_GATES.lock() else {
-        return;
-    };
-    let gate = gates.entry(key.to_string()).or_default();
-    gate.spawned_at = Some(now);
+/// The next spawn identity, process-wide and monotonic. A per-entry counter
+/// would restart at 0 for a key that was stopped (the entry is removed) and
+/// hand a *new* generation the number an in-flight old one still holds — the
+/// stale spawn would then win its claim again.
+static NEXT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_epoch() -> u64 {
+    NEXT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A deliberate stop or delete clears the crash chain.
-fn forget_crash(key: &str) {
-    if let Ok(mut gates) = CRASH_GATES.lock() {
-        gates.remove(key);
+/// How long a spawn claim may stand before it is treated as debris. A spawn
+/// that takes longer than this is wedged (the runner's own exec timeouts are
+/// shorter), and the claim exists to recover from exactly that.
+const SPAWN_CLAIM_TTL: Duration = Duration::from_secs(300);
+
+/// One entry of the [`ProcMap`]: the child (when the state has one), the state
+/// machine's current value, and the **spawn epoch**.
+///
+/// The epoch is the spawn's identity: `ensure_spawned` bumps it when it claims
+/// the right to spawn (moving the fleet to `Spawning` under the map lock), and
+/// the spawn adopts its child and records its exit only while that epoch is
+/// still the entry's. Two concurrent `ensure_fleet`s therefore cannot both
+/// spawn one fleet, and a child from a spawn that lost its claim is killed
+/// rather than adopted.
+pub struct FleetEntry {
+    child: Option<Child>,
+    state: FleetState,
+    epoch: u64,
+}
+
+impl FleetEntry {
+    fn new(child: Option<Child>, state: FleetState) -> Self {
+        Self {
+            child,
+            state,
+            epoch: 0,
+        }
+    }
+
+    /// The supervised child, when the fleet has one (the metrics sampler only
+    /// needs its pid).
+    pub fn child(&self) -> Option<&Child> {
+        self.child.as_ref()
+    }
+
+    /// Adopt a freshly spawned child, unless the fleet is parked or stopped:
+    /// `Asleep`/`Stopped` with a live child is the state a stop-while-spawning
+    /// race creates, and it must not be representable. Every write to `child`
+    /// goes through here, which is what makes that true by construction.
+    fn adopt(&mut self, child: &mut Option<Child>, epoch: u64) -> bool {
+        if self.epoch != epoch
+            || self.child.is_some()
+            || matches!(self.state, FleetState::Asleep { .. } | FleetState::Stopped)
+        {
+            return false;
+        }
+        self.child = child.take();
+        true
+    }
+
+    /// Take the child out of the entry (a park or a stop is about to kill it).
+    fn take_child(&mut self) -> Option<Child> {
+        self.child.take()
+    }
+
+    /// A supervised child in [`FleetState::Spawning`], for tests that need a
+    /// real process in the map (the map has no other legal way in).
+    #[cfg(test)]
+    pub fn test_entry(child: Child) -> Self {
+        Self::new(
+            Some(child),
+            FleetState::Spawning {
+                since: Instant::now(),
+                crashes: 0,
+            },
+        )
     }
 }
 
@@ -141,27 +412,141 @@ pub enum FleetFate {
     Exited(String),
 }
 
-/// Whether a fleet key has a registered child (running, or exited and not
-/// reaped yet). Used by the reconcile loop to tell a cold start from a
-/// restart: only cold starts are batched.
+/// Whether a fleet is supervised at all right now: a live child, a crash/OOM
+/// hold, or a parked/stopped marker. Used by the reconcile loop to tell a cold
+/// start (no entry, subject to the per-tick batch cap) from a fleet that is
+/// already accounted for (its own hold or backoff decides when it spawns).
 pub async fn has_process(procs: &ProcMap, key: &str) -> bool {
     procs.lock().await.contains_key(key)
+}
+
+/// The keys with a live child (running or spawning), not parked, held or
+/// stopped placeholders. Telemetry and the orphan sweep care about processes,
+/// not about which fleets are accounted for; `has_process` answers the latter.
+pub async fn live_keys(procs: &ProcMap) -> Vec<String> {
+    let map = procs.lock().await;
+    map.iter()
+        .filter(|(_, entry)| entry.state.is_live() && entry.child.is_some())
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+/// The fleet's current state, `Absent` when nothing supervises it.
+pub async fn state_of(procs: &ProcMap, key: &str) -> FleetState {
+    procs
+        .lock()
+        .await
+        .get(key)
+        .map_or(FleetState::Absent, |entry| entry.state)
+}
+
+/// Apply one [`FleetEvent`] under the map lock and return the new state. This
+/// is the only way a state changes: no caller pokes a flag or inserts a child
+/// directly.
+pub async fn note_event(procs: &ProcMap, key: &str, event: FleetEvent) -> FleetState {
+    // Only the events that mean "a supervised fleet exists" create an entry.
+    // A confirm, a probe or a timer that lands after a stop must not insert an
+    // epoch-0 ghost: it would make `owns_scaffolding` reject the stop's epoch
+    // and skip the cleanup of the fleet's leaf, proxy and pid registration.
+    let creates = matches!(
+        event,
+        FleetEvent::Parked | FleetEvent::Woke { .. } | FleetEvent::Spawned { .. }
+    );
+    let mut map = procs.lock().await;
+    if creates {
+        let entry = map
+            .entry(key.to_string())
+            .or_insert_with(|| FleetEntry::new(None, FleetState::Absent));
+        entry.state = entry.state.on(event);
+        return entry.state;
+    }
+    match map.get_mut(key) {
+        Some(entry) => {
+            entry.state = entry.state.on(event);
+            entry.state
+        }
+        None => FleetState::Absent,
+    }
+}
+
+/// Claim the health probe for `key`: `true` when this caller owns it, `false`
+/// when the fleet is parked, held, stopped, or already being probed. `budget`
+/// is the probe's own deadline, so a probe task that dies without reporting
+/// (a cancelled spawn, a panic) cannot wedge the fleet: the tick that follows
+/// the deadline puts it back to `Spawning` and the next confirm retries.
+pub async fn probe_started(procs: &ProcMap, key: &str, budget: Duration) -> bool {
+    let mut map = procs.lock().await;
+    // A probe for a fleet nobody supervises is a no-op: creating an entry here
+    // was another way to leave an epoch-0 ghost that outlives a stop.
+    let Some(entry) = map.get_mut(key) else {
+        return false;
+    };
+    entry.state = entry.state.on(FleetEvent::Tick { at: Instant::now() });
+    if !matches!(entry.state, FleetState::Spawning { .. }) {
+        return false;
+    }
+    entry.state = entry.state.on(FleetEvent::ProbeStarted {
+        until: Instant::now() + budget,
+    });
+    true
+}
+
+/// The health gate answered 200 for `key`. Returns whether the fleet is
+/// `Healthy` now — the caller writes `running` only then, which is what keeps
+/// a confirm that raced a park from flipping a parked row back to running.
+pub async fn confirmed(procs: &ProcMap, key: &str) -> bool {
+    matches!(
+        note_event(procs, key, FleetEvent::Confirmed).await,
+        FleetState::Healthy { .. }
+    )
+}
+
+/// The probe gave up (deadline, timeout, or a connection error): back to
+/// `Spawning` so the next reconcile tick retries instead of the status
+/// sticking at `building` forever.
+pub async fn probe_gave_up(procs: &ProcMap, key: &str) {
+    note_event(procs, key, FleetEvent::Unconfirmed).await;
 }
 
 /// Resolve once the fleet under `key` is no longer a live child. A waiter
 /// that holds a claim (a deploy on the health gate) races this, so the claim
 /// never outlives the fleet it waits on.
+///
+/// The three answers differ, and they decide what a deploy does:
+/// - no entry, `Absent`, `Stopped` or `Asleep`: [`FleetFate::Removed`] — nobody
+///   is trying to serve, so the deploy records as before (a stop in the
+///   window is what this arm exists for);
+/// - a child that exited, or a fleet held after a crash/OOM: [`FleetFate::Exited`]
+///   — the fleet died, so the deploy must fail its health gate instead of
+///   recording success and skipping its migrations;
+/// - a live state with no child yet (`Spawning`/`Probing`/`Waking`): keep
+///   waiting. Returning `Removed` there let a deploy pass its gate before its
+///   fleet had even started.
 pub async fn fleet_gone(procs: &ProcMap, key: &str) -> FleetFate {
     loop {
         {
             let mut map = procs.lock().await;
-            let Some(child) = map.get_mut(key) else {
+            let Some(entry) = map.get_mut(key) else {
                 return FleetFate::Removed;
             };
-            match child.try_wait() {
-                Ok(None) => {}
-                Ok(Some(status)) => return FleetFate::Exited(status.to_string()),
-                Err(e) => return FleetFate::Exited(format!("{e}")),
+            match entry.child.as_mut() {
+                None => match entry.state {
+                    // Nobody is trying to serve this fleet.
+                    FleetState::Absent | FleetState::Stopped | FleetState::Asleep { .. } => {
+                        return FleetFate::Removed;
+                    }
+                    // It died and is backing off: the deploy fails its gate.
+                    FleetState::CrashHeld { .. } | FleetState::OomHeld { .. } => {
+                        return FleetFate::Exited(format!("{:?}", entry.state));
+                    }
+                    // A spawn or a probe is in flight: wait for its answer.
+                    _ => {}
+                },
+                Some(child) => match child.try_wait() {
+                    Ok(None) => {}
+                    Ok(Some(status)) => return FleetFate::Exited(status.to_string()),
+                    Err(e) => return FleetFate::Exited(format!("{e}")),
+                },
             }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -194,6 +579,17 @@ impl StopGrace {
         term: Duration::from_secs(15),
         kill_first: false,
     };
+    /// A cold start that never answered its health gate, stopped because the
+    /// wake that started it failed. It still gets SIGTERM — celld releases its
+    /// leases and seals its log on the way out, and a SIGKILL would leave the
+    /// next wake waiting out the lease TTL — but the budget is short enough to
+    /// stay inside Caddy's wake response margin (`wake_timeout_s` + 15 s),
+    /// which `NORMAL`'s 15 s drain plus 5 s kill would spend on its own.
+    pub const FAILED_WAKE: Self = Self {
+        kill: Duration::from_secs(3),
+        term: Duration::from_secs(5),
+        kill_first: false,
+    };
 }
 
 /// Stop one tenant fleet. The docs are explicit: celld shuts down gracefully
@@ -203,17 +599,75 @@ impl StopGrace {
 /// the next spawn.
 pub async fn stop_fleet(procs: &ProcMap, slug: &str, grace: StopGrace) {
     // A deliberate stop (or delete) starts the fleet with a clean chain if
-    // it is started again.
-    forget_crash(slug);
-    let mut map = procs.lock().await;
-    let Some(mut child) = map.remove(slug) else {
+    // it is started again: the entry — and with it the crash/OOM chain — goes
+    // away, and the resting state is `Absent`.
+    let (child, epoch) = {
+        let mut map = procs.lock().await;
+        match map.remove(slug) {
+            Some(mut entry) => {
+                entry.state = entry.state.on(FleetEvent::Stopped);
+                debug_assert_eq!(entry.state, FleetState::Stopped);
+                (entry.child.take(), entry.epoch)
+            }
+            // No entry: epoch 0 can never match a real one, and the cleanup
+            // below only runs when the key is still unowned.
+            None => (None, 0),
+        }
+    };
+    let Some(child) = child else {
         // No process — but a proxy may still be served (a spawn that never
-        // completed, a crash the tick hasn't reaped): it closes either way.
-        drop(map);
-        fleet_gone_cleanup(slug).await;
+        // completed, a crash the tick hasn't reaped), and the fleet's cgroup
+        // leaf and OOM baseline outlive the entry: both are cleaned here too,
+        // otherwise a held or parked fleet that is deleted leaves its leaf
+        // (and, once its pid is recycled, its baseline) behind. The entry is
+        // gone (or was stopped), so `cleanup_scaffolding` owns the key.
+        cleanup_scaffolding(procs, slug, epoch).await;
         return;
     };
-    drop(map);
+    stop_child(procs, slug, child, grace, epoch).await;
+}
+
+/// Park `key`: under the map lock, move the fleet to `Asleep` and hand back
+/// its child (with the park's epoch, for the stop) so the caller can stop it. Taking the child here is what makes
+/// `Asleep` with a live child unrepresentable: the only way a child leaves an
+/// entry is through this call or a stop, and both stop it.
+pub async fn park(procs: &ProcMap, key: &str) -> Option<(Child, u64)> {
+    // The park starts a new generation: bumping the epoch is what makes a
+    // spawn that is still in flight (pre-adoption) unable to adopt its child
+    // or record its exit into the parked entry — the pre-adoption `Gone` used
+    // to turn `Asleep` into `CrashHeld` for a fleet nobody was spawning.
+    let (child, epoch) = {
+        let mut map = procs.lock().await;
+        let entry = map
+            .entry(key.to_string())
+            .or_insert_with(|| FleetEntry::new(None, FleetState::Absent));
+        entry.epoch = next_epoch();
+        entry.state = entry.state.on(FleetEvent::Parked);
+        (entry.take_child(), entry.epoch)
+    };
+    if child.is_none() {
+        // A park with no child still owns the fleet's scaffolding (a spawn
+        // that never completed leaves a proxy and a leaf behind). The park
+        // just took the key, so a spawn that is *still* running under the
+        // previous epoch cleans whatever it creates after this point itself
+        // (its adoption is refused, and `cleanup_scaffolding` sees a
+        // non-live owner and lets it).
+        cleanup_scaffolding(procs, key, epoch).await;
+    }
+    child.map(|child| (child, epoch))
+}
+
+/// Stop one child that is no longer supervised: SIGTERM, a bounded wait, then
+/// SIGKILL of its whole group, followed by the fleet's key-scoped cleanup.
+/// `stop_fleet` and `park` both end here, so a child can never be left running
+/// by either.
+pub async fn stop_child(
+    procs: &ProcMap,
+    slug: &str,
+    mut child: Child,
+    grace: StopGrace,
+    epoch: u64,
+) {
     // Read before the wait: `id()` goes `None` once the child is reaped, and
     // the fallback below needs the pid (the old code signaled `None` and
     // fell back to a `kill()` on an already-waited child — a no-op).
@@ -247,20 +701,71 @@ pub async fn stop_fleet(procs: &ProcMap, slug: &str, grace: StopGrace) {
     if let Some(pid) = pid {
         sigkill_tree(pid);
     }
-    // A stopped fleet leaves its cgroup behind only when a member outlived
-    // the kill: an empty group removes, a live one is reused by the next
-    // spawn (which rewrites the limits). Best-effort either way. The
-    // removal returns the leaf's high-water RSS first: the leaf vanishes
-    // with the fleet, so a later read could never recover it (D3 sizing
-    // basis in SPEC, Limits).
+    // Only the generation that took this child down owns the key-scoped
+    // cleanup: a spawn that started during the drain must keep its leaf,
+    // baseline and proxy.
+    cleanup_scaffolding(procs, slug, epoch).await;
+    tracing::info!(slug, "stopped celld");
+}
+
+/// The per-fleet cleanup a stop does whether or not a child was found: drop
+/// the cgroup leaf (logging its high-water RSS first — the leaf vanishes with
+/// it, so a later read could never recover the number) and the OOM baseline.
+/// A stopped fleet leaves its leaf behind only when a member outlived the
+/// kill: an empty group removes, a live one is reused by the next spawn, which
+/// rewrites the limits. Best-effort either way.
+fn stop_fleet_side_effects(slug: &str) {
     if let Some(dir) = crate::host::cgroups::fleet_cgroup_path(slug) {
         if let Some(peak_bytes) = crate::host::cgroups::remove_fleet_cgroup(&dir) {
             tracing::info!(fleet = slug, peak_bytes, "fleet memory peak at stop");
         }
     }
     crate::host::cgroups::forget_spawned(slug);
-    fleet_gone_cleanup(slug).await;
-    tracing::info!(slug, "stopped celld");
+}
+
+/// Tear down `key`'s key-scoped scaffolding (cgroup leaf, OOM baseline, pid
+/// registration and engine proxy) on behalf of generation `epoch`.
+///
+/// The rule is the same everywhere, because these pieces are keyed by the
+/// fleet and cannot carry an epoch themselves: **whoever holds the key when the
+/// scaffolding has no live owner cleans it.** That is generation `epoch`
+/// itself, or nobody (a stop or delete removed the entry), or a non-live
+/// owner — a park or stop that ran before this spawn created anything, whose
+/// own cleanup could not see what did not exist yet. A *newer live* generation
+/// owns its own scaffolding and is left alone (a same-key takeover is only
+/// possible past the claim's TTL).
+///
+/// The decision and the synchronous parts run under one map lock, so a
+/// concurrent claim cannot slip between the check and the act; the engine
+/// proxy close is async and re-checks the same rule immediately before it
+/// runs. Returns whether it cleaned up.
+pub(crate) async fn cleanup_scaffolding(procs: &ProcMap, key: &str, epoch: u64) -> bool {
+    {
+        let map = procs.lock().await;
+        let owned = match map.get(key) {
+            None => true,
+            Some(entry) => entry.epoch == epoch || !entry.state.is_live(),
+        };
+        if !owned {
+            return false;
+        }
+        // Synchronous, and cheap: a few syscalls and a hashmap removal. Held
+        // under the lock so the check above cannot go stale.
+        crate::host::sandbox::registry::unregister_fleet(key);
+        stop_fleet_side_effects(key);
+    }
+    // The engine close aborts the fleet's proxy loop (and its containers),
+    // which is async: re-check that no newer live generation took the key in
+    // the meantime — a fresh spawn re-serves its own socket, and closing that
+    // would break the fleet it just started.
+    let still_ours = match procs.lock().await.get(key) {
+        None => true,
+        Some(entry) => entry.epoch == epoch || !entry.state.is_live(),
+    };
+    if still_ours {
+        crate::host::sandbox::engine::close_fleet(key).await;
+    }
+    true
 }
 
 /// Stop every running fleet whose app — or whose environment — no longer
@@ -270,9 +775,12 @@ pub async fn stop_fleet(procs: &ProcMap, slug: &str, grace: StopGrace) {
 /// so the next fleet given that port crash-loops on "Address already in use".
 /// Each candidate is re-read before it is stopped, so an app created or
 /// renamed since the caller listed apps keeps its fleet. A sick database reads
-/// as "still wanted": never kill live fleets on a failed lookup.
+/// as "still wanted": never kill live fleets on a failed lookup. Only fleets
+/// with a live child are candidates: a parked or crash-held entry holds no
+/// process, and re-reading its row every tick for every parked app was pure
+/// database load.
 pub async fn stop_orphan_fleets(pool: &SqlitePool, procs: &ProcMap) {
-    let running: Vec<String> = procs.lock().await.keys().cloned().collect();
+    let running = live_keys(procs).await;
     for key in running {
         if !fleet_still_wanted(pool, &key).await {
             tracing::warn!(fleet = %key, "stopping fleet with no app/environment row");
@@ -360,7 +868,7 @@ struct FleetSpec {
 /// refuses it — so a defensive fallback keeps the type. In `multi` the
 /// override is clamped to the operator ceiling, so rows stored before a
 /// ceiling change cannot exceed it.
-async fn fleet_memory_mb(pool: &SqlitePool, cfg: &Config, app_id: &str) -> u32 {
+pub(crate) async fn fleet_memory_mb(pool: &SqlitePool, cfg: &Config, app_id: &str) -> u32 {
     let stored = match db::get_app_limit(pool, app_id).await {
         Ok(limit) => limit.memory_mb.and_then(|v| u32::try_from(v).ok()),
         Err(e) => {
@@ -462,16 +970,91 @@ pub async fn ensure_environment_fleet(
 /// proc-map lock; the log and DB writes happen after the guard drops.
 /// Anything else (no cgroups, no movement, no baseline) yields nothing —
 /// the caller still logs and restarts.
-fn collect_possible_oom(spec: &FleetSpec) -> Option<crate::host::cgroups::OomNote> {
-    let dir = crate::host::cgroups::fleet_cgroup_path(&spec.key)?;
+fn collect_possible_oom(key: &str, memory_mb: u32) -> Option<crate::host::cgroups::OomNote> {
+    let dir = crate::host::cgroups::fleet_cgroup_path(key)?;
     if !dir.is_dir() {
         return None;
     }
-    match crate::host::cgroups::oom_kills_since_spawn(&spec.key, &dir) {
+    match crate::host::cgroups::oom_kills_since_spawn(key, &dir) {
         Some(kills) if kills > 0 => {}
         _ => return None,
     }
-    crate::host::cgroups::oom_note_kill(&spec.key, spec.memory_mb, std::time::Instant::now())
+    crate::host::cgroups::oom_note_kill(key, memory_mb, std::time::Instant::now())
+}
+
+/// Observe `key`'s child under the map lock: when it has exited, take the OOM
+/// verdict and transition [`FleetEvent::Exited`], so the crash/OOM hold
+/// applies. `None` means the child is still running (or there is none) — the
+/// caller decides what that means for its own flow.
+///
+/// This is what a failed wake uses: a cold start that died must leave its
+/// hold behind, or the parked app spawns again on the very next request.
+pub async fn note_exit(procs: &ProcMap, key: &str, memory_mb: u32) -> Option<FleetState> {
+    let mut map = procs.lock().await;
+    let entry = map.get_mut(key)?;
+    let exited = match entry.child.as_mut() {
+        None => return None,
+        Some(child) => match child.try_wait() {
+            Ok(None) => return None,
+            Ok(Some(status)) => status.to_string(),
+            Err(e) => e.to_string(),
+        },
+    };
+    let oom = collect_possible_oom(key, memory_mb);
+    tracing::warn!(fleet = %key, status = %exited, "celld exited");
+    entry.child = None;
+    entry.state = entry.state.on(FleetEvent::Exited {
+        oom: oom.is_some(),
+        at: Instant::now(),
+    });
+    Some(entry.state)
+}
+
+/// A fleet that exited before it was ever adopted (spawn → dead before its
+/// cgroup move, or before the map insert): record the spawn and its exit in
+/// one step, so the crash/OOM hold applies exactly as it would for a fleet
+/// that ran for a while.
+pub(crate) async fn note_spawn_exit(procs: &ProcMap, key: &str, memory_mb: u32, epoch: u64) {
+    let oom = collect_possible_oom(key, memory_mb);
+    let mut map = procs.lock().await;
+    // Only the spawn that still owns the epoch records its exit: `or_insert`
+    // here used to resurrect an entry for a fleet a stop or delete had just
+    // removed, leaving a held ghost nobody supervises.
+    let Some(entry) = map.get_mut(key) else {
+        return;
+    };
+    if entry.epoch != epoch {
+        return;
+    }
+    let now = Instant::now();
+    entry.state = entry.state.on(FleetEvent::Exited {
+        oom: oom.is_some(),
+        at: now,
+    });
+}
+
+/// Release a spawn claim whose spawn produced no child, so the next tick can
+/// try again instead of waiting out the claim's TTL.
+async fn spawn_failed(procs: &ProcMap, key: &str, epoch: u64) {
+    let mut map = procs.lock().await;
+    let Some(entry) = map.get_mut(key) else {
+        return;
+    };
+    if entry.epoch != epoch || entry.child.is_some() {
+        return;
+    }
+    entry.state = entry.state.on(FleetEvent::SpawnFailed);
+}
+
+/// When `key`'s next spawn is held back (a crash or OOM backoff), the instant
+/// it lifts. Callers that would otherwise spawn on demand — a wake — fail fast
+/// on it instead of spawning once per request.
+pub async fn hold_until(procs: &ProcMap, key: &str) -> Option<Instant> {
+    procs
+        .lock()
+        .await
+        .get(key)
+        .and_then(|entry| entry.state.hold_until())
 }
 
 /// What moving a spawned fleet into its group observed. `Gone` (exited
@@ -569,77 +1152,160 @@ async fn ensure_spawned(
     spec: FleetSpec,
 ) -> anyhow::Result<()> {
     let key = spec.key.clone();
-    // A fleet backing off after consecutive OOM kills is not respawned
-    // until its hold passes; the next tick retries.
-    if !crate::host::cgroups::oom_spawn_ready(&key, std::time::Instant::now()) {
-        return Ok(());
-    }
-    // A non-OOM crash loop backs off too (5, 10, 20 … 60 s), instead of
-    // spawning a fresh celld every reconcile tick.
-    if !crash_ready(&key, Instant::now()) {
-        return Ok(());
-    }
-    // Consume the OOM baseline and collect the verdict under the lock; the
-    // log and DB writes happen after the guard drops, never while holding
-    // it. Removal stays in the same critical section as the consume, so a
-    // same-key respawn cannot slip between them and inherit or orphan a
-    // baseline.
-    let (oom_note, reaped): (Option<crate::host::cgroups::OomNote>, bool) = {
+    let now = Instant::now();
+    // One critical section decides everything the map can answer: expiry of a
+    // crash/OOM hold, whether the child is still running, and — when it exited
+    // — what that exit means. The OOM verdict is read while the baseline still
+    // exists, so a same-key respawn cannot slip between consume and removal.
+    let due = {
         let mut map = procs.lock().await;
-        if let Some(child) = map.get_mut(&key) {
-            match child.try_wait() {
+        let entry = map
+            .entry(key.clone())
+            .or_insert_with(|| FleetEntry::new(None, FleetState::Absent));
+        // A passed hold becomes `Absent` here (the timer lives in the state,
+        // not in a separate gate map).
+        entry.state = entry.state.on(FleetEvent::Tick { at: now });
+        let exited = match entry.child.as_mut() {
+            None => None,
+            Some(child) => match child.try_wait() {
                 Ok(None) => return Ok(()), // still running
-                Ok(Some(status)) => {
-                    let note = collect_possible_oom(&spec);
-                    tracing::warn!(fleet = %key, ?status, "celld exited; restarting");
-                    map.remove(&key);
-                    (note, true)
-                }
-                Err(e) => {
-                    let note = collect_possible_oom(&spec);
-                    tracing::warn!(fleet = %key, error = %e, "celld status; restarting");
-                    map.remove(&key);
-                    (note, true)
+                Ok(Some(status)) => Some(status.to_string()),
+                Err(e) => Some(e.to_string()),
+            },
+        };
+        match exited {
+            // No child: the state alone says whether a spawn is due. A
+            // spawn claim in flight (another caller's) or an unexpired hold
+            // waits; otherwise this caller claims the spawn — bumping the
+            // epoch and moving to `Spawning` under this same lock, so no two
+            // callers can spawn one fleet.
+            None => {
+                if !spawn_due(entry.state, now) {
+                    Due::Wait
+                } else {
+                    if matches!(entry.state, FleetState::Spawning { .. }) {
+                        tracing::warn!(fleet = %key, "spawn claim expired; taking it over");
+                    }
+                    claim(entry, now)
                 }
             }
-        } else {
-            (None, false)
+            Some(why) => {
+                let note = collect_possible_oom(&key, spec.memory_mb);
+                tracing::warn!(fleet = %key, status = %why, "celld exited; restarting");
+                entry.child = None;
+                entry.state = entry.state.on(FleetEvent::Exited {
+                    oom: note.is_some(),
+                    at: now,
+                });
+                Due::Exited { oom: note }
+            }
         }
     };
-    if reaped {
-        // The old process is gone: its proxy — and its containers — go
-        // before the respawn serves a new socket, so the new fleet starts
-        // with no previous run behind it.
-        fleet_gone_cleanup(&key).await;
-    }
-    if reaped && oom_note.is_none() {
-        // Not an OOM kill: hold the respawn on the crash chain and let the
-        // next ticks retry. (OOM keeps its own backoff in `cgroups`.)
-        note_crash(&key, Instant::now());
-        return Ok(());
-    }
-    if oom_note.is_some() {
-        forget_crash(&key);
-    }
-    if let Some(note) = oom_note {
-        tracing::warn!(fleet = %key, detail = %note.detail, delay = ?note.delay, "fleet OOM-killed at its cap; restarting");
-        logs::append(logs, &key, note.detail.clone()).await;
-        if note.event_due {
-            let _ = db::insert_app_event(
-                pool,
-                &crate::models::new_id(),
-                &spec.app_id,
-                "fleet",
-                "fleet restarted",
-                &note.detail,
-                "🧠",
-                "{}",
-                "",
-                &crate::models::now_iso(),
-            )
-            .await;
+    match due {
+        Due::Wait => Ok(()),
+        Due::Spawn(epoch) => spawn_fleet(pool, cfg, procs, logs, spec, epoch).await,
+        Due::Exited { oom } => {
+            // The old process is gone: its proxy — and its containers — go
+            // before a respawn serves a new socket, so the new fleet starts
+            // with no previous run behind it.
+            fleet_gone_cleanup(&key).await;
+            if let Some(note) = oom {
+                tracing::warn!(fleet = %key, detail = %note.detail, delay = ?note.delay, "fleet OOM-killed at its cap; restarting");
+                logs::append(logs, &key, note.detail.clone()).await;
+                if note.event_due {
+                    let _ = db::insert_app_event(
+                        pool,
+                        &crate::models::new_id(),
+                        &spec.app_id,
+                        "fleet",
+                        "fleet restarted",
+                        &note.detail,
+                        "🧠",
+                        "{}",
+                        "",
+                        &crate::models::now_iso(),
+                    )
+                    .await;
+                }
+            }
+            // The exit always took a hold (crash or OOM backoff): the next tick
+            // that finds it passed spawns from the held state, so the chain
+            // (`crashes`) survives into `Spawning`.
+            Ok(())
         }
     }
+}
+
+/// Whether a caller may claim a spawn now that the fleet has no child: an
+/// unexpired crash/OOM hold and another caller's live spawn claim both wait.
+/// Every other state — `Absent`, `Stopped`, `Asleep`, and a `Waking` fleet
+/// whose cold start nobody has claimed yet — is spawnable.
+fn spawn_due(state: FleetState, now: Instant) -> bool {
+    match state {
+        FleetState::Spawning { since, .. } => {
+            now.saturating_duration_since(since) >= SPAWN_CLAIM_TTL
+        }
+        FleetState::CrashHeld { until, .. } | FleetState::OomHeld { until, .. } => now >= until,
+        FleetState::Asleep { until } => until.is_none_or(|until| now >= until),
+        _ => true,
+    }
+}
+
+/// Claim the right to spawn `key` for the caller: bump the epoch (the spawn's
+/// identity) and move the fleet to `Spawning`, which is what makes a second
+/// `ensure_fleet` for the same fleet wait instead of spawning a second child.
+fn claim(entry: &mut FleetEntry, now: Instant) -> Due {
+    entry.epoch = next_epoch();
+    entry.state = entry.state.on(FleetEvent::Spawned { at: now });
+    Due::Spawn(entry.epoch)
+}
+
+/// What an [`ensure_spawned`] pass found under the proc-map lock.
+enum Due {
+    /// A live child, an unexpired hold, or a spawn another caller claimed:
+    /// nothing spawns this pass.
+    Wait,
+    /// No child, no hold, no claim: this caller owns epoch `u64` and spawns.
+    Spawn(u64),
+    /// The child exited on its own and the state now holds the respawn.
+    Exited {
+        oom: Option<crate::host::cgroups::OomNote>,
+    },
+}
+
+/// Spawn one celld for an [`FleetState::Absent`] fleet and record
+/// [`FleetEvent::Spawned`]. Split from [`ensure_spawned`] so the decision half
+/// stays readable: the caller has already established that no child runs and no
+/// hold is pending.
+async fn spawn_fleet(
+    pool: &SqlitePool,
+    cfg: &Config,
+    procs: &ProcMap,
+    logs: &LogState,
+    spec: FleetSpec,
+    epoch: u64,
+) -> anyhow::Result<()> {
+    let key = spec.key.clone();
+    let result = spawn_fleet_inner(pool, cfg, procs, logs, spec, epoch).await;
+    if result.is_err() {
+        // The claim is ours and nothing ran: release it, or the next pass
+        // waits out the claim's TTL before retrying.
+        spawn_failed(procs, &key, epoch).await;
+    }
+    result
+}
+
+/// The body of [`spawn_fleet`]: everything between "a claim exists" and "the
+/// child is adopted". Errors here release the claim through the wrapper.
+async fn spawn_fleet_inner(
+    pool: &SqlitePool,
+    cfg: &Config,
+    procs: &ProcMap,
+    logs: &LogState,
+    spec: FleetSpec,
+    epoch: u64,
+) -> anyhow::Result<()> {
+    let key = spec.key.clone();
 
     let state_dir = spec.state_dir.to_string_lossy().into_owned();
     tokio::fs::create_dir_all(&state_dir).await?;
@@ -706,15 +1372,47 @@ async fn ensure_spawned(
     // active the fleet gets its own group with the effective memory cap; the
     // kernel OOM-kills overgrowth inside that group (contained, and the
     // supervisor restarts the fleet) instead of every fleet shedding.
-    let fleet_cgroup = crate::host::cgroups::anchor().and_then(|anchor| {
-        match crate::host::cgroups::ensure_fleet_cgroup(&anchor, &key, u64::from(spec.memory_mb)) {
-            Ok(dir) => Some(dir),
-            Err(e) => {
-                tracing::warn!(fleet = %key, error = %e, "fleet cgroup unavailable; shared cgroup");
-                None
+    let fleet_cgroup = match crate::host::cgroups::anchor() {
+        None => {
+            // `multi` promises every tenant fleet its own cgroup leaf. Without
+            // an anchor this spawn can only run it in the shared group, so it
+            // fails closed rather than silently running uncapped: boot's
+            // isolation check already reports the missing anchor (`/ready`
+            // 503), and this is the spawn that must not happen anyway.
+            if cfg.tenancy == crate::config::Tenancy::Multi {
+                fleet_gone_cleanup(&key).await;
+                return Err(anyhow::anyhow!(
+                    "multi tenancy requires per-fleet cgroups, but the runner has no cgroup anchor (see /ready isolation); refusing to spawn {key} uncapped"
+                ));
+            }
+            None
+        }
+        Some(anchor) => {
+            match crate::host::cgroups::ensure_fleet_cgroup(
+                &anchor,
+                &key,
+                u64::from(spec.memory_mb),
+            ) {
+                Ok(dir) => Some(dir),
+                Err(e) => {
+                    // `ensure_fleet_cgroup` already tripped containment
+                    // (`note_limit_failed`). In `multi` a fleet without its
+                    // own leaf would run uncapped, so the spawn fails closed
+                    // instead — the same rule as a refused `cgroup.procs`
+                    // move. `single` is one operator's own box: warn and run
+                    // in the shared group, as before.
+                    if cfg.tenancy == crate::config::Tenancy::Multi {
+                        fleet_gone_cleanup(&key).await;
+                        return Err(anyhow::anyhow!(
+                            "fleet {key} could not get its cgroup leaf in multi: {e:#}"
+                        ));
+                    }
+                    tracing::warn!(fleet = %key, error = %e, "fleet cgroup unavailable; shared cgroup");
+                    None
+                }
             }
         }
-    });
+    };
     {
         use std::os::unix::process::CommandExt;
         // Its own process group (like `run_sandboxed`): the stops below kill
@@ -819,16 +1517,18 @@ async fn ensure_spawned(
     if let Some(dir) = &fleet_cgroup {
         match move_fleet_into_group(&key, dir, &mut child).await {
             MoveOutcome::Moved => {}
-            // Exited first: nothing runs uncapped. Hold the spawn for the
-            // next tick instead of inserting a dead child.
+            // Exited first: nothing runs uncapped. That is still an exit —
+            // the crash/OOM hold has to apply, or a fleet that dies during
+            // startup respawns on the next tick forever.
             MoveOutcome::Gone => {
+                note_spawn_exit(procs, &key, spec.memory_mb, epoch).await;
                 fleet_gone_cleanup(&key).await;
                 return Ok(());
             }
             // Refused for a live pid: tripped, killed, and the spawn aborts
             // rather than running uncapped.
             MoveOutcome::Refused => {
-                fleet_gone_cleanup(&key).await;
+                cleanup_scaffolding(procs, &key, epoch).await;
                 return Err(anyhow::anyhow!("fleet {key} missed its cgroup"));
             }
         }
@@ -857,8 +1557,41 @@ async fn ensure_spawned(
         });
     }
 
-    procs.lock().await.insert(key.clone(), child);
-    note_spawned(&key, Instant::now());
+    // Adopt the child only if the fleet is still wanted. A stop or a park that
+    // ran while this spawn was in flight removed or parked the entry, and
+    // resurrecting a child then would leave a fleet nobody supervises — the
+    // state machine's "a stop wins" rule has to hold across the spawn too.
+    let mut child = Some(child);
+    let adopted = {
+        let mut map = procs.lock().await;
+        match map.get_mut(&key) {
+            // No entry at all: a stop or delete ran while this spawn was in
+            // flight and nobody supervises this fleet any more.
+            None => false,
+            // The claim is what serializes spawns per fleet, so a refusal here
+            // means a stop or a park took the fleet (or a TTL-expired claim
+            // was taken over): this child is not wanted, and the key-scoped
+            // cleanup below cannot step on a concurrent spawn of the same
+            // fleet.
+            Some(entry) => entry.adopt(&mut child, epoch),
+        }
+    };
+    if !adopted {
+        // Kill the child this spawn created, as a group, and reap it here.
+        // `stop_fleet(key)` would be wrong: the map entry belongs to whoever
+        // stopped or parked the fleet, and stopping the key would kill *their*
+        // child. The cgroup leaf and OOM baseline for this spawn go too, so
+        // the next spawn starts clean.
+        tracing::info!(fleet = %key, "fleet was stopped or parked while it was spawning; killing the child it no longer wants");
+        if let Some(child) = child.as_mut() {
+            if let Some(pid) = child.id() {
+                sigkill_tree(pid);
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        }
+        cleanup_scaffolding(procs, &key, epoch).await;
+        return Ok(());
+    }
     tracing::info!(fleet = %key, listen = spec.listen, internal = spec.internal, memory_mb = spec.memory_mb, cgroup = fleet_cgroup.is_some(), "started celld");
     Ok(())
 }
@@ -870,9 +1603,12 @@ pub async fn stop_all(procs: &ProcMap, budget: Duration) {
     let mut children: Vec<(String, Child, Option<u32>)> = Vec::new();
     {
         let mut map = procs.lock().await;
-        for (slug, child) in map.drain() {
-            let pid = child.id();
-            children.push((slug, child, pid));
+        for (slug, mut entry) in map.drain() {
+            entry.state = entry.state.on(FleetEvent::Stopped);
+            if let Some(child) = entry.child.take() {
+                let pid = child.id();
+                children.push((slug, child, pid));
+            }
         }
     }
     for (_, _, pid) in &children {
@@ -1069,35 +1805,624 @@ mod tests {
         );
     }
 
+    /// The whole fleet transition table, without a process: a crash takes a
+    /// hold, the hold expires to `Absent`, a healthy run resets the chain, and
+    /// every illegal event is a no-op. This is the table the old
+    /// `CRASH_GATES` map, the `Confirming` set and the "child is in the map"
+    /// check each held a fragment of.
     #[test]
-    fn a_crash_holds_the_spawn_and_a_healthy_run_resets_the_chain() {
-        let key = format!("backoff-{}", crate::models::new_id());
+    fn fleet_state_transition_table() {
+        use FleetEvent as E;
+        use FleetState as S;
         let t0 = Instant::now();
-        assert!(crash_ready(&key, t0), "never crashed: ready");
-        note_spawned(&key, t0 - Duration::from_secs(600));
-        note_crash(&key, t0);
-        assert!(!crash_ready(&key, t0), "held right after the crash");
-        assert!(
-            !crash_ready(&key, t0 + Duration::from_secs(4)),
-            "held for the first backoff"
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+
+        // Cold start -> spawning -> probing -> healthy.
+        let s = S::Absent.on(E::Spawned { at: t0 });
+        let S::Spawning { since, crashes } = s else {
+            panic!("a spawn enters Spawning, got {s:?}");
+        };
+        assert_eq!((since, crashes), (t0, 0));
+        let s = s.on(E::ProbeStarted { until: at(10) });
+        assert!(matches!(s, S::Probing { .. }), "{s:?}");
+        let s = s.on(E::Confirmed);
+        assert!(matches!(s, S::Healthy { .. }), "{s:?}");
+        assert!(s.is_live());
+
+        // A crash holds the next spawn for the first backoff.
+        let s = s.on(E::Exited {
+            oom: false,
+            at: at(60),
+        });
+        let S::CrashHeld { crashes, until } = s else {
+            panic!("a crash enters CrashHeld, got {s:?}");
+        };
+        assert_eq!((crashes, until), (1, at(65)), "5 s after the crash");
+        assert_eq!(
+            s.on(E::Tick { at: at(64) }),
+            s,
+            "still held one second early"
         );
-        assert!(crash_ready(&key, t0 + Duration::from_secs(5)));
+        // An expired hold keeps the state, and with it the chain: the spawn
+        // happens from the held state, so the next crash escalates instead of
+        // restarting at five seconds forever.
+        assert_eq!(s.on(E::Tick { at: at(65) }), s, "a tick does not reset it");
+        assert!(s.hold_until().is_some_and(|until| at(65) >= until));
 
-        // One more quick crash doubles the wait (respawn at t0+5, crash at +6).
-        note_spawned(&key, t0 + Duration::from_secs(5));
-        note_crash(&key, t0 + Duration::from_secs(6));
-        assert!(!crash_ready(&key, t0 + Duration::from_secs(11)));
-        assert!(crash_ready(&key, t0 + Duration::from_secs(16)));
+        // The production path: a tick lands on the held state, then the spawn.
+        // The chain must survive both, or every retry restarts at five
+        // seconds and a crash loop never backs off.
+        let after_tick = s.on(E::Tick { at: at(65) }).on(E::Spawned { at: at(65) });
+        assert!(
+            matches!(after_tick, S::Spawning { crashes: 1, .. }),
+            "a spawn after the hold keeps the chain: {after_tick:?}"
+        );
 
-        // A run past the healthy window starts over at the base wait.
-        let later = t0 + Duration::from_secs(400);
-        note_spawned(&key, later);
-        note_crash(&key, later + Duration::from_secs(301));
-        assert!(!crash_ready(&key, later + Duration::from_secs(304)));
-        assert!(crash_ready(&key, later + Duration::from_secs(306)));
+        // Two quick crashes escalate; a crash after the healthy window does
+        // not (it starts the chain over at the base wait).
+        let quick = S::CrashHeld {
+            crashes: 1,
+            until: at(5),
+        }
+        .on(E::Spawned { at: at(5) })
+        .on(E::Exited {
+            oom: false,
+            at: at(6),
+        });
+        assert!(
+            matches!(quick, S::CrashHeld { crashes: 2, until } if until == at(16)),
+            "10 s after the second crash: {quick:?}"
+        );
+        let long_run = S::Healthy {
+            since: t0,
+            crashes: 4,
+        }
+        .on(E::Exited {
+            oom: false,
+            at: at(400),
+        });
+        assert!(
+            matches!(long_run, S::CrashHeld { crashes: 1, until } if until == at(405)),
+            "five healthy minutes reset the chain: {long_run:?}"
+        );
 
-        forget_crash(&key);
-        assert!(crash_ready(&key, Instant::now()), "a stop clears the chain");
+        // OOM kills hold on their own, longer chain.
+        let oom = S::Healthy {
+            since: t0,
+            crashes: 0,
+        }
+        .on(E::Exited { oom: true, at: t0 });
+        assert!(
+            matches!(oom, S::OomHeld { crashes: 1, until } if until == at(5)),
+            "{oom:?}"
+        );
+
+        // A probe that died is reclaimed by its deadline, so the fleet can be
+        // confirmed again.
+        let stale = S::Probing {
+            since: t0,
+            crashes: 0,
+            until: at(3),
+        }
+        .on(E::Tick { at: at(3) });
+        assert!(
+            matches!(stale, S::Spawning { since, crashes: 0 } if since == t0),
+            "{stale:?}"
+        );
+
+        // Park/wake round trip, and a failed wake stays parked.
+        let parked = S::Healthy {
+            since: t0,
+            crashes: 0,
+        }
+        .on(E::Parked);
+        assert_eq!(parked, S::Asleep { until: None });
+        let waking = parked.on(E::Woke { at: at(1) });
+        assert!(matches!(waking, S::Waking { .. }), "{waking:?}");
+        assert_eq!(
+            waking.on(E::Parked),
+            S::Asleep { until: None },
+            "a failed wake re-parks"
+        );
+        assert!(matches!(waking.on(E::Confirmed), S::Healthy { .. }));
+
+        // A park keeps the hold it inherited: the fleet rests Asleep and a
+        // wake still fails fast until the backoff expires.
+        let held = S::CrashHeld {
+            crashes: 2,
+            until: at(30),
+        };
+        let parked_held = held.on(E::Parked);
+        assert_eq!(
+            parked_held,
+            S::Asleep {
+                until: Some(at(30))
+            }
+        );
+        assert_eq!(
+            parked_held.hold_until(),
+            Some(at(30)),
+            "the hold survives the park"
+        );
+        assert!(!spawn_due(parked_held, at(29)), "and still holds the spawn");
+        assert!(spawn_due(parked_held, at(30)));
+
+        // A stop wins over every state, and nothing but a spawn leaves it.
+        for state in [
+            S::Absent,
+            S::Spawning {
+                since: t0,
+                crashes: 1,
+            },
+            S::Probing {
+                since: t0,
+                crashes: 0,
+                until: at(9),
+            },
+            S::Healthy {
+                since: t0,
+                crashes: 2,
+            },
+            S::CrashHeld {
+                crashes: 1,
+                until: at(9),
+            },
+            S::OomHeld {
+                crashes: 1,
+                until: at(9),
+            },
+            S::Asleep { until: None },
+            S::Waking {
+                since: t0,
+                crashes: 0,
+            },
+        ] {
+            assert_eq!(state.on(E::Stopped), S::Stopped, "{state:?}");
+            assert_eq!(
+                S::Stopped.on(E::Tick { at: at(9999) }),
+                S::Stopped,
+                "a timer never restarts a stopped fleet"
+            );
+            assert_eq!(S::Stopped.on(E::Parked), S::Stopped, "{state:?}");
+            assert!(matches!(
+                S::Stopped.on(E::Spawned { at: t0 }),
+                S::Spawning { .. }
+            ));
+        }
+
+        // Illegal events leave the state alone: a confirm for a parked fleet
+        // must never make it healthy (that is the park race).
+        assert_eq!(
+            S::Asleep { until: None }.on(E::Confirmed),
+            S::Asleep { until: None }
+        );
+        assert_eq!(S::Absent.on(E::Confirmed), S::Absent);
+        assert_eq!(
+            S::CrashHeld {
+                crashes: 1,
+                until: at(5)
+            }
+            .on(E::ProbeStarted { until: at(6) }),
+            S::CrashHeld {
+                crashes: 1,
+                until: at(5)
+            }
+        );
+    }
+
+    /// A fleet that dies before it is adopted (spawn → dead before its cgroup
+    /// move, or before the map insert) still takes its crash hold: the silent
+    /// drop respawned it on every tick.
+    #[tokio::test]
+    async fn a_fleet_that_dies_before_adoption_still_takes_its_hold() {
+        let procs = new_procs();
+        let key = "died-young";
+        let epoch = claim_epoch(&procs, key).await;
+        note_spawn_exit(&procs, key, 256, epoch).await;
+        let state = state_of(&procs, key).await;
+        assert!(
+            matches!(state, FleetState::CrashHeld { crashes: 1, .. }),
+            "the exit took a crash hold: {state:?}"
+        );
+        assert!(hold_until(&procs, key).await.is_some());
+    }
+
+    /// `Asleep`/`Stopped` with a live child is not representable: the only way
+    /// into the map is `adopt`, and it refuses a parked or stopped fleet, so a
+    /// stop or park that lands during a spawn leaves the child to be killed by
+    /// the spawn itself instead of being adopted behind a parked row.
+    #[tokio::test]
+    async fn a_parked_or_stopped_fleet_never_adopts_a_child() {
+        for state in [FleetState::Asleep { until: None }, FleetState::Stopped] {
+            let mut entry = FleetEntry::new(None, state);
+            let mut child = Some(spawn_sleeper());
+            assert!(!entry.adopt(&mut child, 0), "{state:?} refuses a child");
+            assert!(child.is_some(), "the refused child is handed back");
+            assert!(entry.child().is_none(), "{state:?} holds no child");
+        }
+        // A fleet that is still wanted takes it.
+        let mut entry = FleetEntry::new(None, FleetState::Absent);
+        let mut child = Some(spawn_sleeper());
+        assert!(entry.adopt(&mut child, 0));
+        assert!(entry.child().is_some());
+        assert!(child.is_none(), "the child moved into the entry");
+        // A child from a spawn that lost its claim (a stale epoch) is refused
+        // even by a fleet that is still wanted.
+        let mut stale = Some(spawn_sleeper());
+        let mut entry = FleetEntry::new(None, FleetState::Absent);
+        assert!(!entry.adopt(&mut stale, 7), "a stale epoch is refused");
+        assert!(entry.child().is_none());
+    }
+
+    /// A stop with no child still clears the fleet's sled: the cgroup leaf and
+    /// the OOM baseline outlive the entry, and a stopped fleet must not leave
+    /// either behind (the next spawn would inherit a stale baseline).
+    #[tokio::test]
+    async fn a_childless_stop_clears_the_hold_and_the_entry() {
+        let procs = new_procs();
+        let key = "childless-stop";
+        let epoch = claim_epoch(&procs, key).await;
+        note_spawn_exit(&procs, key, 128, epoch).await;
+        assert!(hold_until(&procs, key).await.is_some());
+        stop_fleet(&procs, key, StopGrace::NORMAL).await;
+        assert!(!has_process(&procs, key).await, "the entry is gone");
+        assert!(
+            hold_until(&procs, key).await.is_none(),
+            "and so is the crash hold"
+        );
+    }
+
+    /// A probe is claimed once: the state machine itself is the dedup that the
+    /// `Confirming` set used to be, and a probe whose task died is reclaimed by
+    /// its deadline instead of wedging the fleet forever.
+    #[tokio::test]
+    async fn one_probe_per_fleet_and_a_dead_probe_recovers() {
+        let procs = new_procs();
+        let key = "probe";
+        assert!(!probe_started(&procs, key, Duration::from_secs(5)).await);
+        note_event(&procs, key, FleetEvent::Spawned { at: Instant::now() }).await;
+        assert!(probe_started(&procs, key, Duration::from_secs(5)).await);
+        assert!(
+            !probe_started(&procs, key, Duration::from_secs(5)).await,
+            "a second confirm must not pile onto the first"
+        );
+        assert!(confirmed(&procs, key).await);
+        assert!(matches!(
+            state_of(&procs, key).await,
+            FleetState::Healthy { .. }
+        ));
+        // A probe that never reports is reclaimed by its deadline (the clock
+        // is the state's own, so the test needs no sleep): the fleet goes back
+        // to Spawning and can be probed again instead of sticking in Probing
+        // forever.
+        let stale = FleetState::Probing {
+            since: Instant::now(),
+            crashes: 0,
+            until: Instant::now(),
+        };
+        procs
+            .lock()
+            .await
+            .insert("stale".to_string(), FleetEntry::new(None, stale));
+        assert!(
+            probe_started(&procs, "stale", Duration::from_secs(5)).await,
+            "a probe past its deadline is reclaimed"
+        );
+    }
+
+    /// Claim a spawn the way `ensure_spawned` does, returning the epoch.
+    async fn claim_epoch(procs: &ProcMap, key: &str) -> u64 {
+        let mut map = procs.lock().await;
+        let entry = map
+            .entry(key.to_string())
+            .or_insert_with(|| FleetEntry::new(None, FleetState::Absent));
+        match claim(entry, Instant::now()) {
+            Due::Spawn(epoch) => epoch,
+            Due::Wait => panic!("the fleet was not claimable"),
+            Due::Exited { .. } => panic!("no child to exit"),
+        }
+    }
+
+    /// A parked fleet's wake must be able to spawn: `Waking` (like `Asleep`,
+    /// `Absent` and `Stopped`) is a state with no child and no claim, so it is
+    /// due. Only a `Spawning` claim in flight and an unexpired hold wait.
+    /// Getting this wrong made a parked app's wake wait out the claim TTL and
+    /// never serve (the e2e sleep test).
+    #[test]
+    fn a_wake_and_a_park_are_spawnable_but_a_claim_and_a_hold_are_not() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        for state in [
+            FleetState::Absent,
+            FleetState::Stopped,
+            FleetState::Asleep { until: None },
+            FleetState::Waking {
+                since: t0,
+                crashes: 0,
+            },
+        ] {
+            assert!(spawn_due(state, t0), "{state:?} is spawnable");
+        }
+        assert!(
+            !spawn_due(
+                FleetState::Spawning {
+                    since: t0,
+                    crashes: 0
+                },
+                at(1)
+            ),
+            "another caller's claim waits"
+        );
+        assert!(
+            spawn_due(
+                FleetState::Spawning {
+                    since: t0,
+                    crashes: 0
+                },
+                at(SPAWN_CLAIM_TTL.as_secs())
+            ),
+            "an expired claim is taken over"
+        );
+        assert!(
+            !spawn_due(
+                FleetState::CrashHeld {
+                    crashes: 1,
+                    until: at(5)
+                },
+                at(4)
+            ),
+            "a hold waits"
+        );
+        assert!(spawn_due(
+            FleetState::CrashHeld {
+                crashes: 1,
+                until: at(5)
+            },
+            at(5)
+        ));
+    }
+
+    /// The claim is the spawn's identity: a second `ensure_fleet` for the same
+    /// fleet must not spawn a second child, and a spawn whose claim was taken
+    /// away (a stale epoch) must not adopt or record anything.
+    #[tokio::test]
+    async fn one_spawn_claim_per_fleet() {
+        let procs = new_procs();
+        let key = "claimed";
+        let epoch = claim_epoch(&procs, key).await;
+        assert!(matches!(
+            state_of(&procs, key).await,
+            FleetState::Spawning { .. }
+        ));
+        // A second caller sees the claim and waits instead of spawning.
+        {
+            let mut map = procs.lock().await;
+            let entry = map.get_mut(key).expect("entry");
+            assert!(matches!(
+                entry.state.on(FleetEvent::Tick { at: Instant::now() }),
+                FleetState::Spawning { .. }
+            ));
+            let mut due = None;
+            // The same decision `ensure_spawned` makes: live state, no child.
+            if entry.state.is_live() {
+                let since = match entry.state {
+                    FleetState::Spawning { since, .. } => since,
+                    _ => Instant::now(),
+                };
+                if Instant::now().saturating_duration_since(since) < SPAWN_CLAIM_TTL {
+                    due = Some(Due::Wait);
+                }
+            }
+            assert!(matches!(due, Some(Due::Wait)), "the second caller waits");
+        }
+        // A stale epoch cannot adopt.
+        let mut child = Some(spawn_sleeper());
+        {
+            let mut map = procs.lock().await;
+            let entry = map.get_mut(key).expect("entry");
+            assert!(!entry.adopt(&mut child, epoch + 1), "stale epoch");
+        }
+        drop(child);
+        // And it cannot record an exit either: the entry keeps its state.
+        note_spawn_exit(&procs, key, 64, epoch + 1).await;
+        assert_eq!(
+            state_of(&procs, key).await,
+            FleetState::Spawning {
+                since: match state_of(&procs, key).await {
+                    FleetState::Spawning { since, .. } => since,
+                    other => panic!("unexpected {other:?}"),
+                },
+                crashes: 0,
+            }
+        );
+    }
+
+    /// Epochs are process-wide and monotonic: a key that is stopped and
+    /// respawned must never reuse the number an older, still-in-flight spawn
+    /// holds, or that stale spawn would win its claim again.
+    #[tokio::test]
+    async fn a_new_generation_never_reuses_an_epoch() {
+        let procs = new_procs();
+        let key = "epochs";
+        let first = claim_epoch(&procs, key).await;
+        // The stop removes the entry (the resting state is `Absent`), and the
+        // next claim starts from a fresh entry.
+        stop_fleet(&procs, key, StopGrace::NORMAL).await;
+        assert!(!has_process(&procs, key).await);
+        let second = claim_epoch(&procs, key).await;
+        assert!(
+            second > first,
+            "a new entry must not restart the counter: {second} > {first}"
+        );
+        // A park starts a generation too, and its number is fresh as well.
+        let (_, parked) = park(&procs, key)
+            .await
+            .map_or((None, 0), |(c, e)| (Some(c), e));
+        assert!(
+            parked == 0 || parked > second,
+            "park epoch {parked} > {second}"
+        );
+    }
+
+    /// The ownership rule every cleanup shares: our own generation, nobody, and
+    /// a non-live owner (a park/stop that could not see what did not exist yet)
+    /// may clean; a newer *live* generation owns its own scaffolding.
+    #[tokio::test]
+    async fn only_a_non_live_owner_lets_a_cleanup_through() {
+        let procs = new_procs();
+        let key = "owned";
+        // Our own generation owns the key.
+        let epoch = claim_epoch(&procs, key).await;
+        assert!(cleanup_scaffolding(&procs, key, epoch).await);
+        // A park takes the key and leaves it non-live; the stale generation may
+        // still clean, which is exactly the park-race case: the park ran its
+        // cleanup before this spawn created anything, so the debris is ours.
+        park(&procs, key).await;
+        assert!(
+            cleanup_scaffolding(&procs, key, epoch).await,
+            "a non-live owner lets a stale generation clean its own debris"
+        );
+        // A newer *live* generation (a claim in flight) owns its scaffolding.
+        let fresh = claim_epoch(&procs, key).await;
+        assert!(
+            !cleanup_scaffolding(&procs, key, epoch).await,
+            "a stale generation never tears down a live one"
+        );
+        assert!(cleanup_scaffolding(&procs, key, fresh).await);
+        // No entry at all: nobody owns the debris.
+        stop_fleet(&procs, key, StopGrace::NORMAL).await;
+        assert!(cleanup_scaffolding(&procs, key, fresh).await);
+    }
+
+    /// A late probe or confirm for a fleet that is gone must not create an
+    /// entry: an epoch-0 ghost makes the ownership rule reject the stop's
+    /// epoch, so its leaf, proxy and pid registration are never cleaned.
+    #[tokio::test]
+    async fn a_late_probe_does_not_resurrect_a_fleet_entry() {
+        let procs = new_procs();
+        let key = "late-probe";
+        assert_eq!(
+            note_event(&procs, key, FleetEvent::Confirmed).await,
+            FleetState::Absent
+        );
+        assert!(!probe_started(&procs, key, Duration::from_secs(5)).await);
+        assert!(!confirmed(&procs, key).await);
+        probe_gave_up(&procs, key).await;
+        assert!(
+            !has_process(&procs, key).await,
+            "no entry was created for the late probe"
+        );
+        // The fleet's scaffolding is still the cleanup's to take.
+        assert!(cleanup_scaffolding(&procs, key, 42).await);
+        // The events that *do* mean a fleet exists still create one.
+        note_event(&procs, key, FleetEvent::Parked).await;
+        assert!(has_process(&procs, key).await);
+    }
+
+    /// A deploy waiting on the health gate must not read a held or still
+    /// spawning fleet as "removed": that recorded success without the gate (and
+    /// skipped migrations). A stop or a park still reads as removed.
+    #[tokio::test]
+    async fn fleet_gone_distinguishes_held_and_claiming_from_stopped() {
+        let procs = new_procs();
+        let held = "held";
+        let epoch = claim_epoch(&procs, held).await;
+        note_spawn_exit(&procs, held, 256, epoch).await;
+        assert!(
+            matches!(fleet_gone(&procs, held).await, FleetFate::Exited(_)),
+            "a crash-held fleet died: the deploy must fail its gate"
+        );
+        let parked = "parked";
+        note_event(&procs, parked, FleetEvent::Parked).await;
+        assert_eq!(fleet_gone(&procs, parked).await, FleetFate::Removed);
+        let stopped = "stopped";
+        claim_epoch(&procs, stopped).await;
+        stop_fleet(&procs, stopped, StopGrace::NORMAL).await;
+        assert_eq!(fleet_gone(&procs, stopped).await, FleetFate::Removed);
+        // A claim with no child yet keeps the waiter waiting.
+        let claiming = "claiming";
+        claim_epoch(&procs, claiming).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), fleet_gone(&procs, claiming))
+                .await
+                .is_err(),
+            "a spawn in flight is not 'gone'"
+        );
+    }
+
+    /// A spawn that fails releases its claim: the fleet must be spawnable
+    /// again on the next tick, not parked behind a five-minute claim.
+    #[tokio::test]
+    async fn a_failed_spawn_releases_its_claim() {
+        let procs = new_procs();
+        let key = "spawn-failed";
+        let epoch = claim_epoch(&procs, key).await;
+        assert!(matches!(
+            state_of(&procs, key).await,
+            FleetState::Spawning { .. }
+        ));
+        spawn_failed(&procs, key, epoch).await;
+        assert_eq!(state_of(&procs, key).await, FleetState::Absent);
+        // A stale claim's failure does not touch the current one.
+        let current = claim_epoch(&procs, key).await;
+        spawn_failed(&procs, key, current - 1).await;
+        assert!(matches!(
+            state_of(&procs, key).await,
+            FleetState::Spawning { .. }
+        ));
+    }
+
+    /// `note_spawn_exit` must not resurrect an entry a stop removed: the fleet
+    /// is gone, and a held ghost for it would never be supervised again.
+    #[tokio::test]
+    async fn a_removed_fleet_takes_no_exit_hold() {
+        let procs = new_procs();
+        let key = "removed";
+        let epoch = claim_epoch(&procs, key).await;
+        stop_fleet(&procs, key, StopGrace::NORMAL).await;
+        note_spawn_exit(&procs, key, 128, epoch).await;
+        assert!(!has_process(&procs, key).await, "no entry comes back");
+        assert!(hold_until(&procs, key).await.is_none());
+    }
+
+    /// A park takes the child with it: `Asleep` with a live child cannot be
+    /// produced, so a park that races an adoption leaves nothing running, and
+    /// an adoption that lands after the park is refused.
+    #[tokio::test]
+    async fn a_park_takes_the_child() {
+        let procs = new_procs();
+        let key = "park-race";
+        procs
+            .lock()
+            .await
+            .insert(key.to_string(), FleetEntry::test_entry(spawn_sleeper()));
+        let (child, epoch) = park(&procs, key).await.expect("the child comes back");
+        assert_eq!(
+            state_of(&procs, key).await,
+            FleetState::Asleep { until: None }
+        );
+        assert!(
+            procs
+                .lock()
+                .await
+                .get(key)
+                .expect("entry")
+                .child()
+                .is_none(),
+            "the parked entry holds no child"
+        );
+        // A spawn that was in flight now cannot adopt into the parked entry.
+        let mut late = Some(spawn_sleeper());
+        {
+            let mut map = procs.lock().await;
+            assert!(
+                !map.get_mut(key).expect("entry").adopt(&mut late, 0),
+                "a parked fleet refuses a child"
+            );
+        }
+        drop(late);
+        assert!(epoch > 0, "the park starts a new generation");
+        stop_child(&procs, key, child, StopGrace::FOR_DELETE, epoch).await;
     }
 
     fn spawn_sleeper() -> Child {
@@ -1133,8 +2458,8 @@ mod tests {
         let orphan_pid = orphan.id().expect("orphan pid");
         {
             let mut map = procs.lock().await;
-            map.insert("alive".into(), spawn_sleeper());
-            map.insert("deleted".into(), orphan);
+            map.insert("alive".into(), FleetEntry::test_entry(spawn_sleeper()));
+            map.insert("deleted".into(), FleetEntry::test_entry(orphan));
         }
 
         stop_orphan_fleets(&pool, &procs).await;
@@ -1193,10 +2518,19 @@ mod tests {
         let procs = new_procs();
         {
             let mut map = procs.lock().await;
-            map.insert("env".into(), spawn_sleeper());
-            map.insert(env_fleet_key("env", "live"), spawn_sleeper());
-            map.insert(env_fleet_key("env", "gone"), spawn_sleeper());
-            map.insert(env_fleet_key("env", "never"), spawn_sleeper());
+            map.insert("env".into(), FleetEntry::test_entry(spawn_sleeper()));
+            map.insert(
+                env_fleet_key("env", "live"),
+                FleetEntry::test_entry(spawn_sleeper()),
+            );
+            map.insert(
+                env_fleet_key("env", "gone"),
+                FleetEntry::test_entry(spawn_sleeper()),
+            );
+            map.insert(
+                env_fleet_key("env", "never"),
+                FleetEntry::test_entry(spawn_sleeper()),
+            );
         }
         // Delete the `gone` row while its process is still registered.
         let gone = db::get_environment_by_label(&pool, &app.id, "gone")
@@ -1248,7 +2582,10 @@ mod tests {
         cmd.kill_on_drop(true);
         let child = cmd.spawn().expect("spawn sleeper tree");
         let procs = new_procs();
-        procs.lock().await.insert("probe".into(), child);
+        procs
+            .lock()
+            .await
+            .insert("probe".into(), FleetEntry::test_entry(child));
 
         stop_fleet(&procs, "probe", StopGrace::NORMAL).await;
 
@@ -1274,7 +2611,10 @@ mod tests {
         let child = cmd.spawn().expect("spawn TERM-ignoring sleeper");
         let pid = child.id().expect("child pid");
         let procs = new_procs();
-        procs.lock().await.insert("killfirst".into(), child);
+        procs
+            .lock()
+            .await
+            .insert("killfirst".into(), FleetEntry::test_entry(child));
 
         let started = std::time::Instant::now();
         stop_fleet(&procs, "killfirst", StopGrace::FOR_DELETE).await;
@@ -1302,7 +2642,10 @@ mod tests {
             .arg("30")
             .spawn()
             .expect("spawn sleeper");
-        procs.lock().await.insert("live".into(), live);
+        procs
+            .lock()
+            .await
+            .insert("live".into(), FleetEntry::test_entry(live));
         let still =
             tokio::time::timeout(Duration::from_millis(600), fleet_gone(&procs, "live")).await;
         assert!(still.is_err(), "a live fleet keeps the waiter waiting");
@@ -1316,7 +2659,10 @@ mod tests {
             .args(["-c", "exit 3"])
             .spawn()
             .expect("spawn crasher");
-        procs.lock().await.insert("crashed".into(), crashed);
+        procs
+            .lock()
+            .await
+            .insert("crashed".into(), FleetEntry::test_entry(crashed));
         let FleetFate::Exited(why) = fleet_gone(&procs, "crashed").await else {
             panic!("a crashed fleet is Exited, not Removed");
         };
