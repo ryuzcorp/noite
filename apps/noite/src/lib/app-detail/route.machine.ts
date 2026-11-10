@@ -67,9 +67,11 @@ export interface ScopeParse {
  * deleted id is a notice, not production-by-stealth. */
 export const parseScope = (
   raw: string,
-  envs: readonly RunnerEnvironment[]
+  envs: readonly RunnerEnvironment[] | undefined
 ): ScopeParse => {
-  if (raw === "") {
+  // Still loading the environment list: an id cannot be judged yet, so no
+  // stale-environment notice is invented.
+  if (envs === undefined || raw === "") {
     return {
       notice: RouteNoticeTypes.None(),
       scope: AppScopeTypes.Production(),
@@ -110,7 +112,7 @@ export interface AppRoute {
 
 export const parseAppRoute = (
   params: { readonly env: string; readonly panel: string; readonly t: string },
-  envs: readonly RunnerEnvironment[]
+  envs: readonly RunnerEnvironment[] | undefined
 ): AppRoute => {
   const { notice, scope } = parseScope(params.env, envs);
 

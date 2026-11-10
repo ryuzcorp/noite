@@ -38,6 +38,13 @@ describe("parseAppRoute", () => {
     expect(route.tab).toBe("deployments");
   });
 
+  test("an unloaded environment list never invents a stale notice", () => {
+    const route = parseAppRoute({ env: "env_1", panel: "", t: "metrics" });
+
+    expect(route.notice._tag).toBe("None");
+    expect(route.scope._tag).toBe("Production");
+  });
+
   test("an unknown tab still falls back quietly for old links", () => {
     expect(parseAppRoute({ env: "", panel: "", t: "nope" }, []).tab).toBe(
       "overview"
