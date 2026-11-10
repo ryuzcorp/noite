@@ -2,10 +2,14 @@ import { describe, expect, test } from "bun:test";
 
 import type { RunnerEnvironment } from "../runner";
 import {
+  DEFAULT_SETTINGS_SECTION,
+  legacySettingsHref,
   parseAppRoute,
   parseErrorFilter,
   parseScope,
+  parseSettingsSection,
   scopeId,
+  settingsSectionsFor,
 } from "./route.machine";
 
 // SAFETY: the parser reads only `id`; the rest of the runner row is
@@ -62,5 +66,51 @@ describe("parseErrorFilter", () => {
   test("unknown statuses read as open", () => {
     expect(parseErrorFilter("resolved")).toBe("resolved");
     expect(parseErrorFilter("bogus")).toBe("open");
+  });
+});
+
+describe("parseSettingsSection", () => {
+  test("a known section is the section", () => {
+    expect(parseSettingsSection("domains", true)).toBe("domains");
+  });
+
+  test("an unknown section is the default, never an empty view", () => {
+    expect(parseSettingsSection("", true)).toBe(DEFAULT_SETTINGS_SECTION);
+    expect(parseSettingsSection("nope", true)).toBe(DEFAULT_SETTINGS_SECTION);
+  });
+
+  test("an admin-only section is refused for a non-admin", () => {
+    for (const section of ["branch-protection", "danger"] as const) {
+      expect(parseSettingsSection(section, true)).toBe(section);
+      expect(parseSettingsSection(section, false)).toBe(
+        DEFAULT_SETTINGS_SECTION
+      );
+    }
+  });
+});
+
+describe("settingsSectionsFor", () => {
+  test("the admin-only sections leave a non-admin's tab row", () => {
+    expect(settingsSectionsFor(true)).toContain("branch-protection");
+    expect(settingsSectionsFor(true)).toContain("danger");
+    expect(settingsSectionsFor(false)).not.toContain("branch-protection");
+    expect(settingsSectionsFor(false)).not.toContain("danger");
+    expect(settingsSectionsFor(false)[0]).toBe(DEFAULT_SETTINGS_SECTION);
+  });
+});
+
+describe("legacySettingsHref", () => {
+  test("the old ?panel=settings link becomes the view's path", () => {
+    expect(legacySettingsHref("app_1", "")).toBe("/apps/app_1/settings");
+  });
+
+  test("a known ?section= deep link rides along", () => {
+    expect(legacySettingsHref("app_1", "domains")).toBe(
+      "/apps/app_1/settings?section=domains"
+    );
+  });
+
+  test("an unknown ?section= is dropped, not forwarded", () => {
+    expect(legacySettingsHref("app_1", "nope")).toBe("/apps/app_1/settings");
   });
 });

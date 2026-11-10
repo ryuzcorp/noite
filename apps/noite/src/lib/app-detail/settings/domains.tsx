@@ -1,4 +1,4 @@
-//! Settings panel: custom hostnames this app answers on, with the DNS TXT
+//! Settings view: custom hostnames this app answers on, with the DNS TXT
 //! proof that keeps one tenant from claiming another's hostname.
 //!
 //! The add/verify/remove actions are one machine (`domains.machine.ts`): one

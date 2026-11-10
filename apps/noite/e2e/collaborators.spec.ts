@@ -34,7 +34,7 @@ test("removing a collaborator asks first; Esc and Cancel keep the grant", async 
   });
 
   try {
-    await page.goto(`/apps/${appId}?panel=settings`);
+    await page.goto(`/apps/${appId}/settings?section=collaborators`);
     await page.getByRole("button", { exact: true, name: "Invite" }).click();
     await page.locator("#invite-email").fill(email);
     await page.locator("#invite-role").selectOption("view");
@@ -49,7 +49,7 @@ test("removing a collaborator asks first; Esc and Cancel keep the grant", async 
       .click();
     await expect(invitee.page).toHaveURL(new RegExp(`/apps/${appId}`, "u"));
 
-    await page.goto(`/apps/${appId}?panel=settings`);
+    await page.goto(`/apps/${appId}/settings?section=collaborators`);
 
     // The panel paints its last sessionStorage snapshot while it refetches
     // (lib/resource.ts), so an accepted invitation can still be on screen

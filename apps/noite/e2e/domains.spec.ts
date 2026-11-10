@@ -24,7 +24,7 @@ test(
     });
 
     try {
-      await page.goto(`/apps/${appId}?panel=settings`);
+      await page.goto(`/apps/${appId}/settings?section=domains`);
       await page.locator("#custom-domain-hostname").fill(HOST);
       await page.getByRole("button", { name: "Add domain" }).click();
 

@@ -11,9 +11,10 @@
 //! ```
 //!
 //! The wire stays exactly as before: `?t=`, `?panel=settings`, `?env=<id>`
-//! (`""` = production), `?es=`, `?r=`, `?e=`. Only the *composition* is one
-//! value, and only a stale environment produces a notice — an unknown tab or
-//! panel still falls back quietly, since old links keep working.
+//! (`""` = production), `?es=`, `?r=`, `?e=`, plus the Settings view's
+//! `?section=`. Only the *composition* is one value, and only a stale
+//! environment produces a notice — an unknown tab, panel or section still
+//! falls back quietly, since old links keep working.
 
 import { Data } from "effect";
 
@@ -30,6 +31,81 @@ export const APP_TABS = [
 export type AppTab = (typeof APP_TABS)[number];
 
 export type AppPanel = "" | "settings";
+
+/** The Settings view's sections (`/apps/<id>/settings?section=…`), in display
+ * order. `branch-protection` and `danger` are admin-only: a non-admin never
+ * sees their tab, and a shared link to one lands on the default section. */
+export const SETTINGS_SECTIONS = [
+  "identity",
+  "domains",
+  "limits",
+  "error-reporting",
+  "collaborators",
+  "env",
+  "branch-protection",
+  "danger",
+] as const;
+
+export type SettingsSection = (typeof SETTINGS_SECTIONS)[number];
+
+export const DEFAULT_SETTINGS_SECTION: SettingsSection = "identity";
+
+const SETTINGS_SECTION_META = {
+  "branch-protection": { adminOnly: true, label: "Branch protection" },
+  collaborators: { adminOnly: false, label: "Collaborators" },
+  danger: { adminOnly: true, label: "Danger zone" },
+  domains: { adminOnly: false, label: "Domains" },
+  env: { adminOnly: false, label: "Environment variables" },
+  "error-reporting": { adminOnly: false, label: "Error reporting" },
+  identity: { adminOnly: false, label: "Identity" },
+  limits: { adminOnly: false, label: "Limits" },
+} as const satisfies Record<
+  SettingsSection,
+  { readonly adminOnly: boolean; readonly label: string }
+>;
+
+export const settingsSectionLabel = (section: SettingsSection): string =>
+  SETTINGS_SECTION_META[section].label;
+
+/** The sections this role may open, in display order: the tab row. */
+export const settingsSectionsFor = (
+  isAdmin: boolean
+): readonly SettingsSection[] =>
+  SETTINGS_SECTIONS.filter(
+    (section) => isAdmin || !SETTINGS_SECTION_META[section].adminOnly
+  );
+
+/** `?section=`: an unknown id — or one this role may not open — is the
+ * default section, so an old or shared link never renders an empty view. */
+export const parseSettingsSection = (
+  raw: string,
+  isAdmin: boolean
+): SettingsSection => {
+  const known = SETTINGS_SECTIONS.find((section) => section === raw);
+
+  if (known === undefined) {
+    return DEFAULT_SETTINGS_SECTION;
+  }
+
+  return settingsSectionsFor(isAdmin).includes(known)
+    ? known
+    : DEFAULT_SETTINGS_SECTION;
+};
+
+/** Settings used to be a side panel on the app page (`?panel=settings`). It
+ * has its own view now, so an old link redirects there; a known `?section=`
+ * deep link rides along, an unknown one is dropped (the view's parser would
+ * land on the default anyway, and a clean URL is the honest one). */
+export const legacySettingsHref = (
+  appId: string,
+  rawSection: string
+): string => {
+  const known = SETTINGS_SECTIONS.find((section) => section === rawSection);
+
+  return `/apps/${encodeURIComponent(appId)}/settings${
+    known === undefined ? "" : `?section=${known}`
+  }`;
+};
 
 /** Which environment a telemetry/deploy panel shows. `Production` carries the
  * wire's `""`; `Environment` its id. */

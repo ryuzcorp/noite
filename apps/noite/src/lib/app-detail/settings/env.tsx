@@ -1,4 +1,4 @@
-//! Settings panel: the app's environment variables (and `FLAG_` toggles).
+//! Settings view: the app's environment variables (and `FLAG_` toggles).
 
 import { atom } from "ilha";
 

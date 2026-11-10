@@ -21,7 +21,7 @@ import {
 
 // F4: pull requests and branch protection. The PR data is exercised on the
 // runner's REST mirror (the same raw-port lane the hardening/lifecycle specs
-// use), while the branch protection rule is set through the settings panel it
+// use), while the branch protection rule is set through the settings view it
 // belongs to and the protected-`main` push is a real git push against the
 // runner's git policy.
 
@@ -439,7 +439,7 @@ test("require_pr rejects a push-role push to main while an admin push lands", as
 
   // The settings panel is where the rule lives: save it, then reload to prove
   // both fields round-tripped.
-  await page.goto(`/apps/${appId}?panel=settings`);
+  await page.goto(`/apps/${appId}/settings?section=branch-protection`);
   await page.locator("#branch-require-pr").check();
   await page.locator("#branch-approvals").selectOption("1");
   await page.getByRole("button", { name: "Save branch rules" }).click();
@@ -462,7 +462,7 @@ test("require_pr rejects a push-role push to main while an admin push lands", as
   contexts.push(invitee.context);
   const pushKey = await mintApiKey(invitee.page, `${slug}-push`);
 
-  await page.goto(`/apps/${appId}?panel=settings`);
+  await page.goto(`/apps/${appId}/settings?section=collaborators`);
   await page.getByRole("button", { exact: true, name: "Invite" }).click();
   await page.locator("#invite-email").fill(email);
   await page.locator("#invite-role").selectOption("push");

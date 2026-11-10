@@ -3,7 +3,7 @@ title: Configure
 description: Env vars, custom domains, rate limits, collaborators, source edits, and storage for one app.
 ---
 
-All of this lives in the **Settings** panel of the app detail page (`/apps/<id>`). The app's name, actions and tabs (Overview / Deployments / Metrics / Errors / Events) stay at the top while the tab below them scrolls. **Settings**, at the end of the tab row, opens the panel on the right, a third of the width, and keeps it open while you switch tabs; on narrow screens it covers the page instead. Click it again, or the panel's close button, to hide it; `?panel=settings` keeps it open across reloads and links.
+All of this lives in the app's **Settings** view (`/apps/<id>/settings`), the item directly under **Pull requests** in the sidebar. It is a page of its own, not a panel: one section at a time (Identity / Domains / Limits / Error reporting / Collaborators / Environment variables, then Branch protection and Danger zone for admins) chosen by the tab row, with `?section=` as the deep link — so Settings → Domains is `/apps/<id>/settings?section=domains`. The app's own tabs (Overview / Deployments / Metrics / Errors / Events) carry no Settings item. Old `?panel=settings` links redirect to the view and keep their `?section=`.
 
 ## Environment variables
 
@@ -61,7 +61,7 @@ addressed to them: the account loses access immediately. Instance admins (the
 
 ## Source browser and web commits
 
-While you are on an app, the sidebar lists three items under it: **App** (this page), **Code** and **Pull requests** ([Pull requests](/apps/pull-requests)). **Code** opens `/apps/<id>/source`: the files of the default branch, deep-linkable through `?ref=`, `?file=` and `?panel=`. Editing files there stages a web commit, which pushes like a deploy and wakes a sleeping app. The same page browses any branch, tag or commit, shows history and diffs, and compares refs; see [Source and history](/apps/source).
+While you are on an app, the sidebar lists four items under it: **App** (this page), **Code**, **Pull requests** ([Pull requests](/apps/pull-requests)) and **Settings** (the sections below). **Code** opens `/apps/<id>/source`: the files of the default branch, deep-linkable through `?ref=`, `?file=` and `?panel=`. Editing files there stages a web commit, which pushes like a deploy and wakes a sleeping app. The same page browses any branch, tag or commit, shows history and diffs, and compares refs; see [Source and history](/apps/source).
 
 :::warning
 The browser caps blobs at 256 KB and diffs at 1 MB. Binary files are detected, not rendered.

@@ -1,7 +1,7 @@
 //! One settings section: the panels carry only their heading and their
-//! content. They sit in the Settings side panel, which separates them with
-//! dividers rather than a card each (a card per section inside the bordered
-//! panel only cost width).
+//! content. They are the sub-navigation of the Settings view
+//! (`/apps/<id>/settings?section=…`), one section shown at a time at the
+//! page's own width — the wrapper keeps the section's own spacing.
 
 import type { View } from "ilha";
 

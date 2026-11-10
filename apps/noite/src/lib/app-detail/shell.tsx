@@ -29,10 +29,10 @@ export const DetailShell = ({
 );
 
 /** One row of tabs on every width: narrow screens scroll it sideways instead
- * of wrapping it into a stack. `trailing` sits at the row's end. The tabs are
- * a real tablist: roving tabindex and Left/Right/Home/End. Pass `idPrefix` to
- * also emit `id`/`aria-controls` for `<idPrefix>-panel-<id>` (render the panel
- * with that id and `role="tabpanel"`). */
+ * of wrapping it into a stack. The tabs are a real tablist: roving tabindex
+ * and Left/Right/Home/End. Pass `idPrefix` to also emit `id`/`aria-controls`
+ * for `<idPrefix>-panel-<id>` (render the panel with that id and
+ * `role="tabpanel"`). */
 export const DetailTabs = ({
   active,
   counts,
@@ -40,7 +40,6 @@ export const DetailTabs = ({
   onSelect,
   showZeroCounts = false,
   tabs,
-  trailing,
 }: {
   active: string;
   /** Badge numbers by tab id; a tab without one shows none. */
@@ -51,7 +50,6 @@ export const DetailTabs = ({
   /** Also badge a count of 0 (the pulls list wants every state visible). */
   showZeroCounts?: boolean;
   tabs: readonly { id: string; label: string }[];
-  trailing?: View;
 }) => {
   const onKeyDown = (event: KeyboardEvent): void => {
     const index = tabs.findIndex((item) => item.id === active);
@@ -128,7 +126,6 @@ export const DetailTabs = ({
           })}
         </div>
       </div>
-      {trailing}
     </div>
   );
 };

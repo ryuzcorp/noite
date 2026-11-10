@@ -1,4 +1,4 @@
-//! Settings panel: the app's collaborators and its pending invitations.
+//! Settings view: the app's collaborators and its pending invitations.
 
 import { atom } from "ilha";
 
