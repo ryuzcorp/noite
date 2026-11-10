@@ -129,6 +129,18 @@ const appLink = (page: Page) =>
 const nextStreams = (page: Page) =>
   page.waitForResponse((response) => response.url().includes("/api/streams?"));
 
+/** What each tab paints once its feed has loaded (this app has no data).
+ * A tab switch that keeps the same feed set (Errors ↔ Events, both topics
+ * already carried by the tab badges) reopens nothing, so the tab's own
+ * loaded paint is the signal that its loading state is behind us. */
+const TAB_LOADED = {
+  Deployments: "No deployments yet. Push to main to trigger one.",
+  Errors: "No open errors",
+  Events: "Send events",
+  Metrics: "No traffic recorded yet",
+  Overview: "No traffic recorded yet",
+} as const;
+
 test("pages and tabs never paint an error before a load settles", async ({
   page,
   request,
@@ -167,11 +179,10 @@ test("pages and tabs never paint an error before a load settles", async ({
       "Errors",
       "Events",
       "Overview",
-    ]) {
+    ] as const) {
       await mark(page, `${name} tab`);
-      const stream = nextStreams(page);
       await page.getByRole("tab", { exact: true, name }).click();
-      await stream;
+      await expect(page.getByText(TAB_LOADED[name])).toBeVisible();
       await expect(
         page.getByRole("tab", { exact: true, name })
       ).toHaveAttribute("aria-selected", "true");
