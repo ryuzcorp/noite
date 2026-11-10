@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 
 import { detectAreas, matchSensitive, parseSensitiveGlobs } from "./pr-ready";
 
@@ -85,5 +86,22 @@ describe("matchSensitive", () => {
 
   test("empty pattern list matches nothing", () => {
     expect(matchSensitive(["apps/runner/src/host/exec.rs"], [])).toEqual([]);
+  });
+
+  test("the shipped list marks the edge module and its runner table sensitive", () => {
+    const yaml = readFileSync(
+      new URL("../.github/security-paths.yml", import.meta.url),
+      "utf-8"
+    );
+
+    const globs = parseSensitiveGlobs(yaml);
+
+    const files = [
+      "edge/table.go",
+      "edge/limit.go",
+      "apps/runner/src/host/edge_table.rs",
+    ];
+
+    expect(matchSensitive(files, globs)).toEqual(files);
   });
 });
