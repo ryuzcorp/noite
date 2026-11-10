@@ -119,7 +119,7 @@ A deploy ends as **success**, **failed**, **Stopped** (`cancelled`: the operator
 
 ## Rollback
 
-A failing deploy is not retried forever: after **two consecutive failed deploys of the same target (app or environment) at the same SHA**, the runner pauses its automatic deploys of that SHA — the push fast path and the fallback tip sweep both stop — and the Deployments tab says so. The state is derived from the deploy history, so it survives a restart. A new push, an explicit **Deploy**, **Redeploy** or **Roll back** (UI, CLI or API), or a settings change that affects the build resumes it. A deploy you **Stop** is not a failure and never counts toward the two, but it also leaves the SHA alone until one of those actions happens.
+A failing deploy is not retried forever: after **two consecutive failed deploys of the same target (app or environment) at the same SHA**, the runner pauses its automatic deploys of that SHA — the push fast path and the fallback tip sweep both stop — and the Deployments tab says so. The state is derived from the deploy history, so it survives a restart. A new push, or an explicit **Deploy**, **Redeploy** or **Roll back** (UI, CLI or API) resumes it — that deploy is also how a settings or env-var change that affects the build lands. A deploy you **Stop** is not a failure and never counts toward the two, but it also leaves the SHA alone until one of those actions happens.
 
 `POST /v1/apps/<id>/rollback {sha}` redeploys a past successful SHA — bundles are immutable per SHA. The UI offers rollback on success rows.
 

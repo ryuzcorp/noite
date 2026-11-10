@@ -483,10 +483,11 @@ impl DeployIntent {
 ///
 /// Owner rule (2026-11-10): after **two consecutive failed deploys of the same
 /// target at the same sha**, automatic deploys of that sha stop until a new
-/// sha arrives, an explicit deploy (Deploy/Redeploy/Rollback from the UI, the
-/// CLI or MCP) runs, or a build-affecting setting changes. A `cancelled` run
-/// is an operator stop: it never counts as a failure, but it also never lets
-/// the sweep retry that sha on its own.
+/// sha arrives or an explicit deploy (Deploy/Redeploy/Rollback from the UI,
+/// the CLI or MCP) runs — the same action that applies a build-affecting
+/// settings or env-var change. A `cancelled` run is an operator stop: it never
+/// counts as a failure, but it also never lets the sweep retry that sha on its
+/// own.
 ///
 /// The state is derived from the persisted `deploy` rows on every read
 /// (`host::auto_deploy`), so it survives a restart; nothing here is a column.

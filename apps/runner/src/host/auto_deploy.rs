@@ -3,9 +3,10 @@
 //!
 //! Owner rule (2026-11-10): after **two consecutive failed deploys of the same
 //! target (app or environment) at the same sha**, automatic deploys of that
-//! sha stop. A new sha (push), an explicit deploy (Deploy/Redeploy/Rollback
-//! from the UI, the CLI or MCP) or a build-affecting setting change resets it.
-//! The state is [`crate::models::AutoDeploy`], whose doc carries the full
+//! sha stop. A new sha (push) or an explicit deploy (Deploy/Redeploy/Rollback
+//! from the UI, the CLI or MCP — also how a build-affecting settings change
+//! lands) resets it. The state is [`crate::models::AutoDeploy`], whose doc
+//! carries the full
 //! transition diagram; this module owns the one transition function
 //! ([`step`]), the fold over the persisted rows ([`evaluate`]) and the query
 //! that feeds it ([`for_target`]).
