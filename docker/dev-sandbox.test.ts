@@ -78,6 +78,9 @@ const fixture = (): Fixture => {
     "export const protocol = 2;\n"
   );
   writeFileSync(path.join(source, "build.ts"), STUB_BUILD);
+  // The builder copies the bundler's config with the sources (Bun.build
+  // honours it), so the stand-in package carries one.
+  writeFileSync(path.join(source, "tsconfig.json"), "{}\n");
 
   const install = Bun.spawnSync(["bun", "install", "--silent"], {
     cwd: source,
@@ -267,6 +270,34 @@ describe("dev-sandbox.sh", () => {
     } finally {
       child.kill();
       await child.exited;
+      rmSync(fix.dir, { force: true, recursive: true });
+    }
+  });
+
+  test("--once re-installs and refuses a package.json the lockfile lacks", () => {
+    const fix = fixture();
+
+    try {
+      expect(runOnce(fix).exitCode).toBe(0);
+      // A dependency the lockfile does not carry: the frozen install has to
+      // run and refuse, never build against the tree installed before.
+      edit(
+        path.join(fix.source, "package.json"),
+        JSON.stringify({
+          dependencies: {
+            "fixture-dep": "file:../dep",
+            "not-in-the-lockfile": "^1.0.0",
+          },
+          name: "fixture-sandbox",
+          private: true,
+          type: "module",
+        })
+      );
+
+      const drifted = runOnce(fix);
+      expect(drifted.exitCode).not.toBe(0);
+      expect(drifted.stdout.toString()).toContain("bun install");
+    } finally {
       rmSync(fix.dir, { force: true, recursive: true });
     }
   });

@@ -1241,8 +1241,9 @@ pub struct Config {
     /// the moved entry's `max_instances` backstop. `0` admits nothing.
     pub void_sandbox_max_concurrent: u32,
     /// Fixed sandbox controller bundle (`worker.js` + `meta.json`)
-    /// deployed as `noite-void-sandbox`. The image ships it; a dev
-    /// checkout overrides this at its built `apps/void-sandbox/dist`.
+    /// deployed as `noite-void-sandbox`. The image ships it; the dev stack
+    /// (`docker/dev-sandbox.sh`) compiles it into this same path at container
+    /// start and after every `apps/void-sandbox` change.
     pub void_sandbox_bundle_dir: String,
     /// Opt-out instance heartbeat (SPEC, telemetry): `NOITE_TELEMETRY`
     /// (`0`/`false`/`off`) locks it off.

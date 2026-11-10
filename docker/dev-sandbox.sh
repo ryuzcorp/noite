@@ -71,15 +71,30 @@ fi
 gens="$work_dir/gens"
 mkdir -p "$gens" "$(dirname "$bundle_dir")"
 
-# Everything the bundle is built from: the entry, the bundler, `src/` and the
-# dependency pins. Content, not timestamps, so an editor's atomic save and a
-# checkout whose mtimes moved both count exactly when the bytes changed.
+# Everything the bundle is built from: the entry, the bundler, `src/`, the
+# bundler's own config and the dependency pins. Content, not timestamps, so an
+# editor's atomic save and a checkout whose mtimes moved both count exactly
+# when the bytes changed.
 sources_digest() {
   (
     cd "$source_dir" &&
-      find worker.ts build.ts src package.json bun.lock -type f -print0 |
+      find worker.ts build.ts src package.json bun.lock tsconfig.json \
+        -type f -print0 |
       LC_ALL=C sort -z |
       xargs -0 sha256sum |
+      sha256sum |
+      cut -d' ' -f1
+  )
+}
+
+# What the install is keyed on. The image build installs from these same two
+# files, and a `package.json` edit with a stale `bun.lock` must re-run
+# `--frozen-lockfile` so it fails loudly instead of building against the old
+# tree.
+deps_digest() {
+  (
+    cd "$source_dir" &&
+      sha256sum package.json bun.lock |
       sha256sum |
       cut -d' ' -f1
   )
@@ -100,20 +115,23 @@ require_sources() {
 sync_sources() {
   rm -rf "$work_dir/src" &&
     cp -a "$source_dir/src" "$source_dir/worker.ts" "$source_dir/build.ts" \
-      "$source_dir/package.json" "$source_dir/bun.lock" "$work_dir/"
+      "$source_dir/package.json" "$source_dir/bun.lock" \
+      "$source_dir/tsconfig.json" "$work_dir/"
 }
 
 install_deps() {
-  stamp="$work_dir/.lockfile"
+  stamp="$work_dir/.deps"
+  current=$(deps_digest)
+
   if [ -d "$work_dir/node_modules" ] && [ -f "$stamp" ] &&
-    cmp -s "$stamp" "$source_dir/bun.lock"; then
+    [ "$(cat "$stamp")" = "$current" ]; then
     return 0
   fi
   echo "dev-sandbox: bun install (sandbox controller)"
   (
     cd "$work_dir" && bun install --frozen-lockfile
   ) &&
-    cp "$source_dir/bun.lock" "$stamp"
+    printf '%s\n' "$current" >"$stamp"
 }
 
 # Build into a fresh generation and point the bundle path at it with one
