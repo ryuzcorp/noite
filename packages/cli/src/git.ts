@@ -46,11 +46,16 @@ const { Bootstrap, FastForward } = Data.taggedEnum<PushMode>();
 
 /** GitHub-style Basic `git` + profile key, supplied to git through
  * `GIT_CONFIG_*` so it never appears in a remote URL, `.git/config`, or a
- * process argument list. `GIT_TERMINAL_PROMPT=0` keeps a rejected key from
- * hanging a CI step on a credential prompt. */
-export const gitAuthEnv = (token: string): NodeJS.ProcessEnv => ({
+ * process argument list. The `http.<url>.extraHeader` key scopes the header
+ * to the deploy remote's origin and path, so a followed redirect to another
+ * host never receives the key. `GIT_TERMINAL_PROMPT=0` keeps a rejected key
+ * from hanging a CI step on a credential prompt. */
+export const gitAuthEnv = (
+  token: string,
+  remoteUrl: string
+): NodeJS.ProcessEnv => ({
   GIT_CONFIG_COUNT: "1",
-  GIT_CONFIG_KEY_0: "http.extraHeader",
+  GIT_CONFIG_KEY_0: `http.${remoteUrl}.extraHeader`,
   GIT_CONFIG_VALUE_0: `Authorization: Basic ${Buffer.from(`git:${token}`).toString("base64")}`,
   GIT_TERMINAL_PROMPT: "0",
 });
@@ -87,7 +92,7 @@ export const lsRemoteTip = (
     const out = yield* runGit(
       ["ls-remote", remoteUrl, "refs/heads/main"],
       process.cwd(),
-      gitAuthEnv(token)
+      gitAuthEnv(token, remoteUrl)
     );
 
     const sha = out.split("\t")[0]?.trim();
@@ -167,7 +172,7 @@ export const clearWorkdir = (workdir: string): Effect.Effect<void, Error> =>
 export const pushTree = (input: PushInput): Effect.Effect<string, Error> =>
   Effect.gen(function* run() {
     const mode = yield* remoteState(input.remoteUrl, input.token);
-    const env = gitAuthEnv(input.token);
+    const env = gitAuthEnv(input.token, input.remoteUrl);
 
     return yield* withTempDir(
       (workdir) =>

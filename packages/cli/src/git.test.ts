@@ -7,6 +7,7 @@ import path from "node:path";
 
 import { Effect } from "effect";
 
+import { remoteUrlOf } from "./deploy.js";
 import {
   clearWorkdir,
   copyTreeEntries,
@@ -72,10 +73,21 @@ describe("clearWorkdir", () => {
 });
 
 describe("gitAuthEnv", () => {
-  test("carries the key in the environment, not in a URL", () => {
-    const env = gitAuthEnv("secret-key");
+  test("the URL git receives in argv carries no token", () => {
+    // `pushTree` passes `input.remoteUrl` straight to git; `remoteUrlOf` is
+    // its only production producer, and it never copies the key over.
+    const remoteUrl = remoteUrlOf("https://git.noite.now", "my-app");
+    expect(remoteUrl).toBe("https://git.noite.now/my-app");
+    expect(remoteUrl).not.toContain("secret-key");
+  });
+
+  test("carries the key in the environment, scoped to the remote URL", () => {
+    const env = gitAuthEnv("secret-key", "https://git.noite.now/my-app");
+
     expect(env.GIT_TERMINAL_PROMPT).toBe("0");
-    expect(env.GIT_CONFIG_KEY_0).toBe("http.extraHeader");
+    expect(env.GIT_CONFIG_KEY_0).toBe(
+      "http.https://git.noite.now/my-app.extraHeader"
+    );
 
     const header = String(env.GIT_CONFIG_VALUE_0);
     expect(header.startsWith("Authorization: Basic ")).toBe(true);
