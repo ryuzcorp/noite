@@ -16,7 +16,8 @@ import type { PodConnection } from "./pod-client";
 export interface TerminalLink {
   /** A checkout opened, or a switch landed on another checkout: the shell runs
    * on `connection`'s frame's terminal. A shell already on another frame is
-   * rebuilt (`attach`), which is why the caller detaches first (see below). */
+   * rebuilt (`attach`), which is why the caller detaches first (see below);
+   * the frame the shell is already on is left as it is, shell included. */
   attach: (connection: PodConnection) => void;
   /** Let go of the shell `connection` holds: the canvas goes, and the frame's
    * own terminal closes. A connection that is not the one the shell is on is
@@ -479,6 +480,13 @@ export const createTerminalSession = (): TerminalSession => {
 
   return {
     attach: (opened) => {
+      if (connection === opened) {
+        // The shell is already the one this checkout's frame runs: a switch
+        // back to the ref the panes drive must not close the terminal in that
+        // pod and rebuild a shell the user is working in.
+        return;
+      }
+
       unwatch?.();
       unhearFatal?.();
       connection = opened;

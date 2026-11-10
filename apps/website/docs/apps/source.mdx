@@ -15,6 +15,8 @@ Code mode opens on the default branch (`main`), where browser edits are committe
 
 At the bottom of the dropdown, **Create** makes a branch from the ref you are browsing and switches to it. This needs the `push` role. A create or delete publishes exactly like a push: the tip bundle and manifest are written, and `main` moving deploys.
 
+Switching refs re-points the panes in place, rather than remounting them: the file tree, the editor and the terminal stay where they are, and so does the checkout you came from until the new ref's files are painted, with a small **Switching to …** marker naming the ref on its way. A switch always ends — on the new ref, or on **Could not open** with its **Retry** button — including a pod that takes the request and stops answering, which says so after a minute instead of leaving the marker up.
+
 Browsing a tag or a raw commit sha (both work in `?ref=`) is read-only. Any branch opens editable while you have the `push` role, and a commit lands on the branch you are reading ([below](#browser-edits)).
 
 ## Files and diffs

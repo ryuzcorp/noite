@@ -9,16 +9,30 @@
 //!   [*] --> Booting
 //!   Booting --> Opening: Requested{ref}
 //!   Opening --> Ready: Opened{ref,readOnly}
-//!   Opening --> Failed: Failed{ref} / PodDied{ref}
+//!   Opening --> Failed: Failed{ref} / PodDied{ref} / TimedOut{ref}
+//!   Opening --> Opening: Requested{other ref}  (previous stays on screen)
 //!   Ready --> Opening: Requested{ref}          (previous stays on screen)
 //!   Ready --> Failed: PodDied{ref}             (nothing stays on screen)
 //!   Failed --> Opening: Retry{ref} / Requested{ref}
-//!   Opening --> Opening: PodDied{ref}          (late Opened is refused)
 //! ```
 //!
 //! The refusals are the point: an `Opened` for a ref that already failed (its
 //! pod died between the listing and the install) never becomes `Ready`, and a
 //! `Ready` cannot be produced without a checkout that is alive.
+//!
+//! A `Requested` is refused only when it names the state's own target — the ref
+//! that is opening, or the one that is ready. It is never refused for naming
+//! the ref the panes still *show*: while another ref opens, the shown one is
+//! what the user clicks back to, and refusing that request would leave the
+//! machine `Opening` a ref no request is running for any more (the browser
+//! gives the newest request the generation), which is a spinner that never
+//! clears. The same rule keeps the failure card from outliving its failure: a
+//! request for the checkout a failed switch left on screen is a new open, not
+//! a repaint.
+//!
+//! `TimedOut` is the bound on the one answer that can be lost: a frame that
+//! took the `open` and stopped answering (see `OPEN_DEADLINE_MS`). It ends in
+//! the same failure card as a dead pod, whose Retry opens the ref again.
 
 import { Data } from "effect";
 
@@ -61,9 +75,21 @@ export type RefEvent = Data.TaggedEnum<{
   /** The view (or the retry card) asked for a ref. `force` drops whatever the
    * warm cache held for it and opens it again. */
   Requested: { force: boolean; ref: string };
+  /** `ref`'s frame took the `open` and stopped answering: the answer is lost,
+   * so the switch ends in the failure card rather than in a spinner. */
+  TimedOut: { ref: string };
 }>;
 
 export const RefEvents = Data.taggedEnum<RefEvent>();
+
+/** How long a request may wait for the frame's `open` answer before the
+ * machine gives up on it. The frame's own request is unbounded on purpose (its
+ * work is the archive's untar and the first derive, which report progress as
+ * events rather than as an answer), so a frame that stops answering would
+ * otherwise hold the switch — and the overlay over the panes — forever. A
+ * checkout still opening when this elapses is abandoned, not torn down: its
+ * answer is still welcome in the warm cache, and the Retry opens a fresh one. */
+export const OPEN_DEADLINE_MS = 60_000;
 
 /** What the browser must do besides storing the new state. */
 export interface RefDecision {
@@ -119,13 +145,16 @@ export const stepRef = (state: RefView, event: RefEvent): RefDecision => {
     case "Requested": {
       const { force, ref } = event;
 
-      if (!force && shownCheckout(state)?.ref === ref) {
-        // Already the ref the panes are on (or opening): a repaint is not a
-        // second open.
-        return unchanged(state);
-      }
-
-      if (!force && state._tag === "Opening" && state.ref === ref) {
+      if (
+        !force &&
+        (state._tag === "Opening" || state._tag === "Ready") &&
+        state.ref === ref
+      ) {
+        // The machine is already opening — or ready on — this ref: a repaint,
+        // or a click on the branch already picked, is not a second open. The
+        // ref the panes merely *show* (an `Opening`'s previous, a failure's)
+        // is not this: a request for it starts an open, or the machine would
+        // stay `Opening` a ref no request is running for any more.
         return unchanged(state);
       }
 
@@ -153,7 +182,15 @@ export const stepRef = (state: RefView, event: RefEvent): RefDecision => {
     }
 
     case "Failed":
-    case "PodDied": {
+    case "PodDied":
+    case "TimedOut": {
+      // A lost answer is a failure with the machine's own words; the others
+      // carry the frame's.
+      const message =
+        event._tag === "TimedOut"
+          ? `the checkout did not answer within ${OPEN_DEADLINE_MS / 1000}s`
+          : event.message;
+
       let failure: { previous: ReadyCheckout | null; ref: string } | null =
         null;
 
@@ -173,7 +210,7 @@ export const stepRef = (state: RefView, event: RefEvent): RefDecision => {
         drop: [event.ref],
         refused: false,
         state: RefViews.Failed({
-          message: event.message,
+          message,
           previous: failure.previous,
           ref: failure.ref,
         }),
