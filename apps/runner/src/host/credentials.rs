@@ -723,8 +723,11 @@ fn forget_operator_token(scope_key: &str) {
 
 /// Drop one fleet's stored operator token *and* its cached copy. This is the
 /// only way the row is deleted: [`db::remove_operator_token_row`] alone would
-/// leave the cache pointing at a token no row backs.
+/// leave the cache pointing at a token no row backs. Holds `MUTATE` so a
+/// concurrent [`operator_token`] cannot mint and cache between the row delete
+/// and the eviction.
 pub async fn delete_operator_token(pool: &sqlx::SqlitePool, scope_key: &str) -> sqlx::Result<()> {
+    let _guard = MUTATE.lock().await;
     db::remove_operator_token_row(pool, scope_key).await?;
     forget_operator_token(scope_key);
     Ok(())
@@ -732,7 +735,11 @@ pub async fn delete_operator_token(pool: &sqlx::SqlitePool, scope_key: &str) -> 
 
 /// Drop every operator token of one app and its environments, evicting each
 /// scope's cached copy (app delete; a recreated slug mints fresh tokens).
+/// Holds `MUTATE` across the scope read and the delete for the same reason:
+/// a token minted in that window would otherwise stay cached for a row this
+/// delete removes.
 pub async fn delete_app_operator_tokens(pool: &sqlx::SqlitePool, app_id: &str) -> sqlx::Result<()> {
+    let _guard = MUTATE.lock().await;
     let scopes = db::operator_token_scopes_for_app(pool, app_id).await?;
     db::remove_app_operator_token_rows(pool, app_id).await?;
     for scope in scopes {
