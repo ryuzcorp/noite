@@ -189,13 +189,13 @@ Set `BETTER_AUTH_URL=https://noite.local` in `.env`. Passkeys bind to that origi
 Per boot:
 
 ```bash
-CONTROL_EXTRA_HOSTS=noite.local make dev-host # route noite.local to the control UI
-portless proxy start --lan --https            # https://noite.local (accept sudo)
+make dev-host                       # serves the LAN IP and BETTER_AUTH_URL's host (noite.local)
+portless proxy start --lan --https  # https://noite.local (accept sudo)
 ```
 
 On the phone, install `~/.portless/ca.pem` as a trusted CA (iOS: open the file, install the profile, enable full trust; Android: Security → install CA certificate), open `https://noite.local`, and register a **fresh** passkey: `localhost` credentials never transfer. Android often can't resolve mDNS `.local` names; iOS works. `portless list` shows routes and `portless proxy stop` stops the proxy.
 
-Tenant apps work the same way: with `CONTROL_EXTRA_HOSTS=noite.local` the runner also serves `<slug>.noite.local`, and one alias per app wires DNS on both machines. Code mode's Preview runs on the app's preview host under the same name, so add that alias too:
+Tenant apps work the same way: with `noite.local` among the control hosts the runner also serves `<slug>.noite.local`, and one alias per app wires DNS on both machines. Code mode's Preview runs on the app's preview host under the same name, so add that alias too:
 
 ```bash
 portless alias test.noite 9080                # → https://test.noite.local

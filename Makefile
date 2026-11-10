@@ -54,6 +54,16 @@ PROJECT ?= noite
 # host must share one registrable domain to be same-site.
 DEV_BASE ?= $(or $(BASE_DOMAIN),noite.localhost)
 HOST_IP ?= $(shell ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($$i == "src") {print $$(i+1); exit}}')
+# `make dev-host` adds the LAN IP to the control hosts, plus BETTER_AUTH_URL's
+# host when it is neither the dev base nor already listed: the runner refuses
+# to boot unless the passkey origin is a served control host, so the README's
+# phone setup (`BETTER_AUTH_URL=https://noite.local`) needs no
+# `CONTROL_EXTRA_HOSTS` prefix.
+comma := ,
+empty :=
+space := $(empty) $(empty)
+AUTH_HOST = $(shell printf '%s' '$(BETTER_AUTH_URL)' | sed -E 's#^[A-Za-z]+://##; s#[:/].*##')
+DEV_HOST_EXTRA = $(subst $(space),$(comma),$(strip $(HOST_IP) $(filter-out $(DEV_BASE) $(subst $(comma),$(space),$(CONTROL_EXTRA_HOSTS)),$(AUTH_HOST))))
 
 help:
 	@echo "  make up        build the image from the tree and start"
@@ -105,7 +115,7 @@ dev:
 
 dev-host:
 	@if [ -z "$(HOST_IP)" ]; then echo "error: could not detect LAN IP; retry as \`make dev-host HOST_IP=192.168.x.x\`"; exit 1; fi
-	CONTROL_EXTRA_HOSTS="$${CONTROL_EXTRA_HOSTS:+$$CONTROL_EXTRA_HOSTS,}$(HOST_IP)" $(COMPOSE_DEV) up -d --build --force-recreate
+	CONTROL_EXTRA_HOSTS="$${CONTROL_EXTRA_HOSTS:+$$CONTROL_EXTRA_HOSTS,}$(DEV_HOST_EXTRA)" $(COMPOSE_DEV) up -d --build --force-recreate
 	@echo "dev-host — control UI on LAN at http://$(HOST_IP):$${HTTP_PORT:-9080}"
 
 logs:
