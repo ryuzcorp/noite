@@ -8,6 +8,7 @@ import type { InstanceAuthority } from "../authority";
 import { isInstanceAdmin, requireAppRole } from "../collaborators";
 import { ensureDb, resolveEnv } from "../db";
 import { fail } from "./api";
+import { controlAccessRefusal } from "./control-d1.server";
 
 /** The raw better-auth user plus the impersonation marker. `role` and
  * `banned` are the admin plugin's fields, unknown on purpose. */
@@ -232,12 +233,16 @@ export const requireControlAdmin = async (
 ): Promise<SessionUser> => {
   const user = await sessionUser(request, env);
 
-  if (!mayAdministerInstance(user.authority)) {
-    fail(
-      user.authority._tag === "Impersonating"
-        ? "Impersonation refused"
-        : "Admin only"
-    );
+  // The message comes from `controlAccessRefusal`, the same pure decision the
+  // control stream gate uses, so the page and the stream refuse in one voice
+  // (the D1 editor shows this string verbatim).
+  const refusal = controlAccessRefusal({
+    impersonatedBy: user.impersonatedBy,
+    isAdmin: mayAdministerInstance(user.authority),
+  });
+
+  if (refusal !== null) {
+    fail(refusal);
   }
 
   return user;
