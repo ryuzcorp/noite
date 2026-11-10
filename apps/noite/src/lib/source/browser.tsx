@@ -815,8 +815,11 @@ export const SourceBrowser = ({
 
       // The shell runs on the checkout the panes now drive: the one it was on
       // goes first, because a process left on a pod that is torn down later is
-      // a leaked process and a leaked port.
-      if (previous !== null) {
+      // a leaked process and a leaked port. A switch back to the checkout the
+      // panes already drive (the user clicked the ref on screen while another
+      // opened) leaves its shell alone: detaching would close the terminal in
+      // that pod and rebuild a shell the user is working in.
+      if (previous !== null && previous !== next) {
         await teardown(() => terminal.detach(previous.connection));
       }
 
