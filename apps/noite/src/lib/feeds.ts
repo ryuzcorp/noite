@@ -130,8 +130,16 @@ export const nextConn = (state: Conn, event: ConnEvent): Conn => {
  *   Reconnecting --> Refused: 4xx
  *   any --> Paused: tab hidden
  *   any --> Offline: no EventSource / disposed
+ *   Offline --> Cold: connecting again (no value)
+ *   Offline --> Cached: connecting again (value kept)
+ *   Paused --> Cold: connecting again (no value)
+ *   Paused --> Cached: connecting again (value kept)
  * ```
- */
+ *
+ * `Offline` and `Paused` are not terminal: a link that starts connecting
+ * again is loading, not dead, so the panel returns to `Cold` (skeleton) or
+ * `Cached` (its last value, no error text) instead of painting a problem it
+ * may already have recovered from. */
 export type FeedState<T> = Data.TaggedEnum<{
   Cached: { readonly value: T };
   Cold: Record<never, never>;
@@ -196,6 +204,91 @@ export type FeedEvent<T> =
   | { readonly kind: "frame"; readonly value: T }
   | { readonly kind: "snapshot"; readonly value: T };
 
+/** A snapshot paint: it fills a panel that has no value yet, keeping
+ * whatever the link is doing (a stream that failed first must not drop the
+ * snapshot the panel fetched instead). A frame, or an earlier snapshot,
+ * always wins. */
+const feedFromSnapshot = <T>(state: FeedState<T>, value: T): FeedState<T> => {
+  if (state._tag === "Live" || feedValue(state) !== undefined) {
+    return state;
+  }
+
+  switch (state._tag) {
+    case "Refused": {
+      return Feed.Refused({ value });
+    }
+
+    case "Offline": {
+      return Feed.Offline({ value });
+    }
+
+    case "Paused": {
+      return Feed.Paused({ value });
+    }
+
+    case "Reconnecting": {
+      return Feed.Reconnecting({ value });
+    }
+
+    case "Cold":
+    case "Cached": {
+      return Feed.Cached({ value });
+    }
+
+    default: {
+      return state;
+    }
+  }
+};
+
+/** A link paint: a refusal is terminal for the topic, every other link state
+ * wins over the data, and a link that connects again clears a dead panel
+ * back to loading (see {@link FeedState}). */
+const feedFromConn = <T>(state: FeedState<T>, conn: Conn): FeedState<T> => {
+  if (state._tag === "Refused") {
+    return state;
+  }
+
+  const value = feedValue(state);
+
+  switch (conn._tag) {
+    case "Refused": {
+      return Feed.Refused({ value });
+    }
+
+    case "Paused": {
+      return Feed.Paused({ value });
+    }
+
+    case "Closed": {
+      return Feed.Offline({ value });
+    }
+
+    case "Retrying": {
+      return Feed.Reconnecting({ value });
+    }
+
+    // A link that connects again proves the panel is not dead: an `Offline`
+    // or `Paused` panel goes back to loading — `Cold` without a value,
+    // `Cached` with one — instead of painting "unavailable" until the first
+    // frame lands.
+    case "Idle":
+    case "Connecting": {
+      if (state._tag !== "Offline" && state._tag !== "Paused") {
+        return state;
+      }
+
+      return value === undefined ? Feed.Cold() : Feed.Cached({ value });
+    }
+
+    // Open says nothing about the data yet: keep painting what we have
+    // until a frame arrives (a topic's own `+` marker is not a frame).
+    default: {
+      return state;
+    }
+  }
+};
+
 /** The one transition function for {@link FeedState}. A frame always wins; a
  * snapshot only fills a cold or cached panel (the stream stays the live
  * source, and `paintInitial` guards the write anyway). */
@@ -209,71 +302,11 @@ export const nextFeedState = <T>(
     }
 
     case "snapshot": {
-      // A frame (or an earlier snapshot) always wins; otherwise the snapshot
-      // fills the panel without losing what the link is doing (a stream that
-      // failed first must not drop the snapshot the panel fetched instead).
-      if (state._tag === "Live" || feedValue(state) !== undefined) {
-        return state;
-      }
-
-      switch (state._tag) {
-        case "Refused": {
-          return Feed.Refused({ value: event.value });
-        }
-
-        case "Offline": {
-          return Feed.Offline({ value: event.value });
-        }
-
-        case "Paused": {
-          return Feed.Paused({ value: event.value });
-        }
-
-        case "Reconnecting": {
-          return Feed.Reconnecting({ value: event.value });
-        }
-
-        case "Cold":
-        case "Cached": {
-          return Feed.Cached({ value: event.value });
-        }
-
-        default: {
-          return state;
-        }
-      }
+      return feedFromSnapshot<T>(state, event.value);
     }
 
     case "conn": {
-      if (state._tag === "Refused") {
-        return state;
-      }
-
-      const value = feedValue(state);
-
-      switch (event.conn._tag) {
-        case "Refused": {
-          return Feed.Refused({ value });
-        }
-
-        case "Paused": {
-          return Feed.Paused({ value });
-        }
-
-        case "Closed": {
-          return Feed.Offline({ value });
-        }
-
-        case "Retrying": {
-          return Feed.Reconnecting({ value });
-        }
-
-        // Idle/Connecting/Open say nothing about the data: keep painting
-        // what we have until a frame arrives.
-        default: {
-          return state;
-        }
-      }
+      return feedFromConn<T>(state, event.conn);
     }
 
     default: {
@@ -538,7 +571,14 @@ interface HubTopic {
  * once the set settles, and the server re-sends each topic's snapshot.
  *
  * The topic table is the whole state: `connection` (the link), `connected`
- * (the topic order on the wire), each topic's `phase` and `last` frame. */
+ * (the topic order on the wire), each topic's `phase` and `last` frame.
+ *
+ * A topic-set change replaces the link, and the replaced link's teardown is
+ * fenced by its generation: subscribers hear about the replacement
+ * (`Connecting` …), never `Closed`. An old link's `Closed` is not a fact
+ * about the panels — painting it would read as "live updates are
+ * unavailable" on every feed of the page for as long as the replacement
+ * takes to deliver its first frame. */
 export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
   const schedule =
     options.settle ??
@@ -600,7 +640,7 @@ export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
     announce(topic);
   };
 
-  const onMessage = (data: string): void => {
+  const routeFrame = (data: string): void => {
     // `<index>:<frame>`, or `<index>:+` / `<index>:!` / `<index>:~<status>`
     // for a topic that opened / dropped / was refused (see
     // `http/routes/stream-hub.ts`).
@@ -643,7 +683,12 @@ export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
     }
   };
 
-  const reconcile = (): void => {
+  /** The link generation: every replacement connection gets a new number, and
+   * the replaced one's callbacks are fenced by it, so a planned swap never
+   * announces its own teardown. */
+  let link = 0;
+
+  const reconcile = (force = false): void => {
     settling = false;
 
     for (const [name, topic] of topics) {
@@ -658,9 +703,17 @@ export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
       wanted.length === connected.length &&
       wanted.every((name) => connected.includes(name));
 
-    if (same && dispose !== undefined) {
+    if (!force && same && dispose !== undefined) {
       return;
     }
+
+    // Replace the link before disposing of it: the old stream reports
+    // `Closed` on teardown, and that is not news — the panels are about to
+    // be served by the replacement. Announcing it painted `Offline` ("Live
+    // updates are unavailable") on every feed of the page on every tab or
+    // page switch, until the new stream's first frame landed.
+    link += 1;
+    const generation = link;
 
     dispose?.();
     dispose = undefined;
@@ -681,13 +734,23 @@ export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
       streamHubUrl(wanted),
       {
         onConn: (next) => {
+          if (generation !== link) {
+            return;
+          }
+
           connection = next;
 
           for (const topic of topics.values()) {
             announce(topic);
           }
         },
-        onMessage,
+        onMessage: (data) => {
+          // A frame the replaced stream had already queued belongs to the
+          // topic order it was opened with, not the current one.
+          if (generation === link) {
+            routeFrame(data);
+          }
+        },
       },
       options
     );
@@ -706,9 +769,7 @@ export const createStreamHub = (options: StreamHubOptions = {}): StreamHub => {
         topic.last = undefined;
       }
 
-      dispose?.();
-      dispose = undefined;
-      reconcile();
+      reconcile(true);
     },
     subscribe: (name, hooks) => {
       let topic = topics.get(name);
@@ -880,10 +941,15 @@ export const liveFeed = <T>(
   // T1.9: background tabs hold no connection; the SWR snapshot keeps the
   // panel painted while away.
   watch.once(() => {
-    if (
-      typeof document === "undefined" ||
-      globalThis.EventSource === undefined
-    ) {
+    if (typeof document === "undefined") {
+      // SSR: no transport has been attempted (and none may be, see
+      // lib/resource) — the panel is `Cold` (a skeleton). The client's own
+      // mount subscribes; a server render must never paint the `Offline`
+      // problem for a link the browser has not even tried to open.
+      return;
+    }
+
+    if (globalThis.EventSource === undefined) {
       apply({ conn: ConnTypes.Closed(), kind: "conn" });
 
       return;

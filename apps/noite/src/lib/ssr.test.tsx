@@ -90,13 +90,16 @@ describe("ssr", () => {
     expect(html).not.toContain("data-ilha-error");
   });
 
-  test("a live panel with no stream says so instead of an endless skeleton", async () => {
-    // SSR has no EventSource, so the feed is `Offline`: the list must say
-    // live updates are unavailable rather than render a skeleton forever.
+  test("a live panel paints its loading state before the client mounts", async () => {
+    // A server render has not tried to open a stream, so the panel is
+    // `Cold` (a skeleton). Painting `Offline` here was an error over a load
+    // that had not even started: the client's own mount subscribes, and only
+    // a browser without EventSource is genuinely offline.
     const html = await renderHtml(AppsList);
 
     expect(html).not.toContain("data-ilha-error");
-    expect(html).toContain("Live updates are unavailable");
+    expect(html).toContain("skeleton");
+    expect(html).not.toContain("Live updates are unavailable");
   });
 
   test("the preview panel renders without browser globals", async () => {
