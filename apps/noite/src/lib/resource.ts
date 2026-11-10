@@ -278,15 +278,13 @@ export const invalidate = (key: string): void => {
   })();
 };
 
-/** One mounted reader of `key`: per-component `data`/`error`/`loading` atoms
- * subscribed to reloads, with the last good snapshot (lib/swr-store) painting
- * until the fresh fetch lands. `data` seeds from the snapshot, so warm keys
- * skip skeletons; consumers keep the usual `loading() && data() ===
- * undefined` skeleton check — it now only fires on a genuinely cold key.
- * `persist: false` keeps the snapshot in memory only, for bulky entries
- * (file contents, build logs) that would crowd the small sessionStorage
- * quota. A failed load surfaces on `error` and evicts the entry, so a
- * remount refetches; nothing retries on a timer. */
+/** One mounted reader of `key`: one {@link ResourceState} atom subscribed to
+ * reloads, seeded from the last good snapshot (lib/swr-store) so warm keys
+ * skip skeletons; only `Loading` (a genuinely cold key) is one. `persist:
+ * false` keeps the snapshot in memory only, for bulky entries (file
+ * contents, build logs) that would crowd the small sessionStorage quota. A
+ * failed load lands on `Failed` and evicts the entry, so a remount refetches;
+ * nothing retries on a timer. */
 export const tracked = <T>(
   key: string,
   fetcher: ResourceFetcher<T>,
