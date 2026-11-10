@@ -66,13 +66,16 @@ const (
 //	    Booting --> Draining: last instance Cleanup, no table yet
 //	    Loaded --> Draining: last instance Cleanup
 //	    Draining --> Booting: an instance is Provisioned again
+//	    Draining --> Loaded: a push arrives before the process exits
 //	    Draining --> [*]: the process stops
 //
 // The phase owns the resources it needs, so they can never disagree with
 // it: Loaded has a table, a limiter and a prober; Booting and Draining have
 // none. Requests answer from the phase: Booting is 503 "edge starting"
 // (running, nothing pushed yet), Loaded routes and rate-limits, Draining is
-// 503 "edge shutting down" (the last instance cleaned up).
+// 503 "edge shutting down" (the last instance cleaned up). A push that
+// revives a draining edge creates its limiter and prober again; the process
+// is exiting, so nothing serves them.
 type Phase uint8
 
 const (
