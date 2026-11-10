@@ -278,10 +278,14 @@ const resolved = (
   );
 };
 
-/** The user typed: the surface holds `text` now. The token moves on, so a read
- * the pod is still answering (a sync, or the pane's own open) is spent: it
- * would paint bytes older than the editor. The path and the edit session stay
- * the surface's own, and the write's derive is what reads again. */
+/** The user typed: the surface holds `text` now. The paint keeps the path and
+ * the edit session it has, and the token moves on, so a read the pod is still
+ * answering for it (the sync that started before the keystroke) is spent:
+ * those bytes are older than the editor and would paint the keystroke away.
+ *
+ * Only a paint the current checkout owns is typed over: a keystroke that
+ * arrives while another file opens belongs to the file still on screen, which
+ * that open is about to replace, so the open must land. */
 const textChanged = (
   machine: PaneMachine,
   event: { readonly path: string; readonly text: string }
