@@ -9,12 +9,14 @@ import { emailOTP } from "better-auth/plugins/email-otp";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
+import type { InstanceAuthority } from "./authority";
 import { getAuthDb, resolveEnv } from "./db";
 import { errorMessage } from "./errors";
 import { isLocalhostDomain } from "./local-host";
 import { fail } from "./server/api";
 import {
   checkInvite,
+  claimBootstrapAdmin,
   consumeInvite,
   INVITES_PER_USER,
   mintInvites,
@@ -300,6 +302,9 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
 
             // Invite-only: the first account bootstraps the instance (it owns
             // it, so it also becomes the admin), every later one needs a code.
+            // `firstRun` is only a hint: two concurrent first registrations
+            // both read an empty table, and the conditional claim below is
+            // what decides which of them owns the instance.
             const policy = await signupPolicy();
 
             if (!policy.firstRun) {
@@ -322,7 +327,26 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
               { method: "passkey" }
             );
 
-            if (!policy.firstRun && parsed.invite) {
+            if (policy.firstRun) {
+              // One account wins the bootstrap slot (the `role` cell is the
+              // claim, no schema change); the loser is an ordinary account
+              // that skipped the invite gate by racing the first one, so it
+              // is dropped and refused instead of admitted.
+              const claim = await claimBootstrapAdmin(user.id);
+
+              if (claim._tag === "Lost") {
+                try {
+                  await ctx.context.internalAdapter.deleteUser(user.id);
+                } catch {
+                  // Nothing to do: the account is unusable without a passkey.
+                }
+
+                throw APIError.from("FORBIDDEN", {
+                  code: "INVITE_REQUIRED",
+                  message: inviteProblemMessage("missing"),
+                });
+              }
+            } else if (parsed.invite) {
               const claimed = await consumeInvite(parsed.invite, user.id);
 
               if (!claimed) {
@@ -340,14 +364,6 @@ export const createAuth = (env: KitEnv, baseURL: string) =>
                   message: inviteProblemMessage("used"),
                 });
               }
-            }
-
-            if (policy.firstRun) {
-              // The bootstrap account owns the instance; the role persists even
-              // when NOITE_ADMIN_EMAIL is unset.
-              await ctx.context.internalAdapter.updateUser(user.id, {
-                role: "admin",
-              });
             }
 
             // Every account can invite its own share.
@@ -460,6 +476,9 @@ export const authFromEnv = (env: KitEnv, origin: string) => {
 };
 
 export interface SessionUser {
+  /** What this session may do to the instance (lib/authority): the one
+   * predicate every gate and surface reads. */
+  authority: InstanceAuthority;
   email: string;
   id: string;
   /** Set only on an impersonated session (the admin plugin). The onboarding

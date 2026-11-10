@@ -181,7 +181,7 @@ export const AppDangerZone = ({
                 title: `Delete ${name}?`,
               });
 
-              if (!ok) {
+              if (ok !== "confirm") {
                 return;
               }
 

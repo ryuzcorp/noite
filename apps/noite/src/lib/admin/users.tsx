@@ -30,13 +30,21 @@ import {
 
 interface AdminUserRowItemProps {
   row: AdminUserRow;
-  isSelf: boolean;
-  busy: boolean;
-  impersonating: boolean;
+  /** The action running against this row, or null (per-row, not panel-wide:
+   * one row's mutation no longer disables every other row's buttons). */
+  pending: RowAction | null;
   onToggle: (row: AdminUserRow) => void;
   onImpersonate: (row: AdminUserRow) => void;
   onRole: (row: AdminUserRow) => void;
   onDelete: (row: AdminUserRow) => void;
+}
+
+/** What one admin action is doing to one row. */
+type RowAction = "ban" | "delete" | "impersonate" | "role";
+
+interface PendingAction {
+  action: RowAction;
+  id: string;
 }
 
 const AdminUserRowItem = (props: AdminUserRowItemProps) => {
@@ -46,12 +54,12 @@ const AdminUserRowItem = (props: AdminUserRowItemProps) => {
     <AdminRow
       avatar={<Avatar label={row.name || row.email} />}
       actions={
-        props.isSelf ? null : (
+        row.self ? null : (
           <>
             <button
               type="button"
               class={`${ACTION} ${W_LG}`}
-              disabled={props.busy || props.impersonating}
+              disabled={props.pending !== null}
               onclick={() => {
                 props.onImpersonate(row);
               }}
@@ -61,7 +69,7 @@ const AdminUserRowItem = (props: AdminUserRowItemProps) => {
             <button
               type="button"
               class={`${ACTION} ${W_LG}`}
-              disabled={props.busy}
+              disabled={props.pending !== null}
               onclick={() => {
                 props.onRole(row);
               }}
@@ -71,7 +79,7 @@ const AdminUserRowItem = (props: AdminUserRowItemProps) => {
             <button
               type="button"
               class={`${ACTION} ${W_SM}`}
-              disabled={props.busy}
+              disabled={props.pending !== null}
               onclick={() => {
                 props.onToggle(row);
               }}
@@ -81,7 +89,7 @@ const AdminUserRowItem = (props: AdminUserRowItemProps) => {
             <button
               type="button"
               class={`${DANGER} ${W_SM}`}
-              disabled={props.busy}
+              disabled={props.pending !== null}
               onclick={() => {
                 props.onDelete(row);
               }}
@@ -94,22 +102,20 @@ const AdminUserRowItem = (props: AdminUserRowItemProps) => {
     >
       <div class="flex flex-wrap items-center gap-2">
         <span class="truncate font-medium">{row.name || row.email}</span>
-        {props.isSelf ? (
-          <span class="badge badge-sm badge-ghost">you</span>
-        ) : null}
+        {row.self ? <span class="badge badge-sm badge-ghost">you</span> : null}
         {row.banned ? (
           <span class="badge badge-sm badge-error">banned</span>
         ) : null}
       </div>
       <div class="truncate text-xs opacity-70">
         {row.email} · {row.role}
+        {props.pending ? ` · ${props.pending}…` : ""}
       </div>
     </AdminRow>
   );
 };
 
 interface AdminUsersListProps {
-  email: string;
   onPage: (page: number) => void;
   page: number;
   query: string;
@@ -119,15 +125,9 @@ interface AdminUsersListProps {
  * the parent on both, because a resource key cannot change under a mounted
  * component. The card around it (header, search) belongs to the parent, so a
  * new search or page swaps rows without remounting the input. */
-const AdminUsersRows = ({
-  email,
-  onPage,
-  page,
-  query,
-}: AdminUsersListProps) => {
+const AdminUsersRows = ({ onPage, page, query }: AdminUsersListProps) => {
   const router = useRouter();
-  const busy = atom(false);
-  const impersonating = atom(false);
+  const pending = atom<PendingAction | null>(null);
   const res = listUsers(query, page);
   const users = resourceValue(res.state())?.users ?? [];
   const hasMore = resourceValue(res.state())?.hasMore ?? false;
@@ -137,7 +137,7 @@ const AdminUsersRows = ({
   const reload = () => res.refetch();
 
   const impersonate = async (user: AdminUserRow) => {
-    impersonating.set(true);
+    pending.set({ action: "impersonate", id: user.id });
     panelError.set("");
 
     try {
@@ -147,7 +147,6 @@ const AdminUsersRows = ({
 
       if (result.error) {
         panelError.set(result.error.message ?? "Failed to impersonate user");
-        impersonating.set(false);
 
         return;
       }
@@ -159,13 +158,18 @@ const AdminUsersRows = ({
       router.visit("/apps");
     } catch (error) {
       panelError.set(errorMessage(error));
-      impersonating.set(false);
+    } finally {
+      pending.set(null);
     }
   };
 
-  /** Run one admin mutation, then reload this page of the list. */
-  const mutate = async <T,>(work: () => Promise<T>): Promise<void> => {
-    busy.set(true);
+  /** Run one admin mutation against one row, then reload this page. */
+  const mutate = async <T,>(
+    action: RowAction,
+    id: string,
+    work: () => Promise<T>
+  ): Promise<void> => {
+    pending.set({ action, id });
     panelError.set("");
 
     try {
@@ -173,13 +177,13 @@ const AdminUsersRows = ({
       await reload();
     } catch (error) {
       panelError.set(errorMessage(error));
+    } finally {
+      pending.set(null);
     }
-
-    busy.set(false);
   };
 
   const toggleBan = (user: AdminUserRow) =>
-    mutate(() =>
+    mutate("ban", user.id, () =>
       user.banned
         ? api<{ ok: true }>("/api/admin/unbanUser", user.id)
         : api<{ ok: true }>("/api/admin/banUser", user.id)
@@ -194,11 +198,11 @@ const AdminUsersRows = ({
       tone: "neutral",
     });
 
-    if (!ok) {
+    if (ok !== "confirm") {
       return;
     }
 
-    await mutate(() =>
+    await mutate("role", user.id, () =>
       api<{ ok: true }>("/api/admin/setUserRole", {
         role: next,
         userId: user.id,
@@ -214,11 +218,13 @@ const AdminUsersRows = ({
       title: `Delete ${user.email}?`,
     });
 
-    if (!ok) {
+    if (ok !== "confirm") {
       return;
     }
 
-    await mutate(() => api<{ ok: true }>("/api/admin/deleteUser", user.id));
+    await mutate("delete", user.id, () =>
+      api<{ ok: true }>("/api/admin/deleteUser", user.id)
+    );
   };
 
   const loading = res.state()._tag === "Loading";
@@ -239,9 +245,9 @@ const AdminUsersRows = ({
           <AdminUserRowItem
             key={row.id}
             row={row}
-            isSelf={row.email === email}
-            busy={busy()}
-            impersonating={impersonating()}
+            pending={
+              pending()?.id === row.id ? (pending()?.action ?? null) : null
+            }
             onToggle={(r) => {
               void toggleBan(r);
             }}
@@ -293,7 +299,7 @@ const AdminUsersRows = ({
 
 /** Every account: search, page, ban, role, delete, impersonate. The search
  * and page live in the URL (`?uq=`, `?up=`); a search is a server query. */
-export const AdminUsersPanel = ({ email }: { email: string }) => {
+export const AdminUsersPanel = () => {
   const query = searchParam("uq", { default: "" });
   const page = searchParam("up", { default: 0, parse: toPageIndex });
 
@@ -316,7 +322,6 @@ export const AdminUsersPanel = ({ email }: { email: string }) => {
     >
       <AdminUsersRows
         key={`${query()}:${page()}`}
-        email={email}
         page={page()}
         query={query()}
         onPage={(next) => {

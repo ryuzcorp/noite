@@ -6,6 +6,7 @@
 import { useLink } from "@ilha/void";
 import type { View } from "ilha";
 
+import { mayAdministerInstance, overviewAuthority } from "../authority";
 import { CONTROL_APP_ID, CONTROL_APP_NAME } from "../control-app";
 import {
   applistUrl,
@@ -161,11 +162,14 @@ export const SidebarApps = ({
   const user = resourceValue(session().state());
 
   // The control plane is listed for instance admins, never while
-  // impersonating — the same rule as its card on /apps.
+  // impersonating — `mayAdministerInstance` is the one predicate (the server
+  // folds the impersonation check into the overview's authority).
   const showControl =
     user !== undefined &&
     user !== null &&
-    (resourceValue(adminStatus().state())?.isAdmin ?? false);
+    mayAdministerInstance(
+      overviewAuthority(resourceValue(adminStatus().state()))
+    );
 
   const apps = feedValue(feed.state()) ?? [];
 

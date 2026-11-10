@@ -17,16 +17,15 @@
  */
 import type { Json } from "effect/Schema";
 
-import { authFromEnv, MissingAuthSecretError } from "../../lib/auth";
-import { ensureDb } from "../../lib/db";
 import {
   handleMcpMessage,
   PROTOCOL_VERSION_HEADER,
   RPC_CODES,
-  SUPPORTED_PROTOCOL_VERSIONS,
+  versionFromHeader,
 } from "../../lib/mcp/protocol";
 import type { JsonRpcFailure } from "../../lib/mcp/protocol";
 import { MCP_TOOLS } from "../../lib/mcp/tools";
+import { authenticateMcp } from "../../lib/server/mcp-auth.server";
 import { MAX_BODY_BYTES, readBoundedText, tooLarge } from "../body";
 import type { RouteHandler } from "../config";
 import { originAllowed } from "../origin";
@@ -56,18 +55,6 @@ const parseFailure = (): Response => {
   });
 };
 
-const bearerKey = (request: Request): string | null => {
-  const header = request.headers.get("authorization") ?? "";
-
-  if (!header.toLowerCase().startsWith("bearer ")) {
-    return null;
-  }
-
-  const key = header.slice("bearer ".length).trim();
-
-  return key === "" ? null : key;
-};
-
 export const handleMcp: RouteHandler = async (request, env) => {
   if (request.method !== "POST") {
     return new Response("method not allowed", {
@@ -83,48 +70,31 @@ export const handleMcp: RouteHandler = async (request, env) => {
     );
   }
 
-  const version = request.headers.get(PROTOCOL_VERSION_HEADER);
+  const version = versionFromHeader(
+    request.headers.get(PROTOCOL_VERSION_HEADER)
+  );
 
-  if (version && !SUPPORTED_PROTOCOL_VERSIONS.includes(version)) {
+  if (version._tag === "Unsupported") {
     return Response.json(
-      { error: `unsupported MCP protocol version: ${version}` },
+      { error: `unsupported MCP protocol version: ${version.requested}` },
       { headers: { "cache-control": "no-store" }, status: 400 }
     );
   }
 
-  const key = bearerKey(request);
+  // One state per credential outcome (lib/server/mcp-auth.server); every
+  // refusal keeps the single "missing or invalid API key" 401 body, so a key
+  // without the scope stays indistinguishable from an unknown one.
+  const auth = await authenticateMcp(request, env);
 
-  if (!key) {
+  if (auth._tag === "Misconfigured") {
+    return new Response(auth.message, { status: 500 });
+  }
+
+  if (auth._tag !== "Authed") {
     return unauthorized();
   }
 
-  await ensureDb();
-  let userId: string;
-
-  try {
-    const auth = authFromEnv(
-      env,
-      env.BETTER_AUTH_URL ?? new URL(request.url).origin
-    );
-
-    const verified = await auth.api.verifyApiKey({
-      body: { key, permissions: { apps: ["manage"] } },
-    });
-
-    const owner = verified.valid ? verified.key?.referenceId : null;
-
-    if (!owner) {
-      return unauthorized();
-    }
-
-    userId = owner;
-  } catch (error) {
-    if (error instanceof MissingAuthSecretError) {
-      return new Response(error.message, { status: 500 });
-    }
-
-    throw error;
-  }
+  const { userId } = auth;
 
   const body = await readBoundedText(request, MAX_BODY_BYTES);
 

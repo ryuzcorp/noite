@@ -19,6 +19,13 @@ import { Dialog } from "../ui/dialog";
 import { LoadError } from "../ui/load-error";
 import { SectionSkeleton } from "../ui/skeletons";
 import { ConnectAgentCard } from "./agent-connect";
+import {
+  KeyScopes,
+  scopeInput,
+  scopeSelection,
+  toggleScope,
+} from "./api-key.machine";
+import type { KeyScope } from "./api-key.machine";
 
 interface ApiKeyRow {
   id: string;
@@ -168,17 +175,24 @@ const PasskeysCard = () => {
   };
 
   const remove = async (id: string, name: string) => {
-    const last = rows.length <= 1;
+    if (rows.length <= 1) {
+      // The last passkey is not deletable: with email delivery unconfigured
+      // (NOITE_EMAIL_WEBHOOK_URL unset) that would lock the account out for
+      // good. Add another device first, then remove this one.
+      error.set(
+        "This is your only passkey — add another one first, then delete this."
+      );
+
+      return;
+    }
 
     const ok = await confirmDialog({
       confirmLabel: "Delete",
-      message: last
-        ? "It is your only passkey — you would have to sign in with an emailed code until you add another."
-        : "You can no longer sign in with it.",
+      message: "You can no longer sign in with it.",
       title: `Delete ${name || "this passkey"}?`,
     });
 
-    if (!ok) {
+    if (ok !== "confirm") {
       return;
     }
 
@@ -304,8 +318,8 @@ export const AccountPanel = () => {
   // and intermittently left Name/Email blank.
   const nameDraft = atom<string | null>(null);
   const keyName = atom("");
-  const scopeApps = atom(true);
-  const scopeEvents = atom(true);
+  // One value, never "neither scope" (./api-key.machine).
+  const scope = atom<KeyScope>(KeyScopes.Both());
 
   const reload = async () => {
     try {
@@ -329,8 +343,7 @@ export const AccountPanel = () => {
       return;
     }
 
-    const appManagement = scopeApps();
-    const events = scopeEvents();
+    const { appManagement, events } = scopeInput(scope());
     busy.set(true);
     keyError.set("");
     freshKey.set(null);
@@ -470,8 +483,7 @@ export const AccountPanel = () => {
             class="btn btn-sm btn-neutral shrink-0"
             onclick={() => {
               keyName.set("");
-              scopeApps.set(true);
-              scopeEvents.set(true);
+              scope.set(KeyScopes.Both());
               keyError.set("");
               keyModal.set(true);
             }}
@@ -495,9 +507,11 @@ export const AccountPanel = () => {
                     id="scope-apps"
                     type="checkbox"
                     class="checkbox checkbox-sm"
-                    checked={scopeApps()}
+                    checked={scopeSelection(scope()).apps}
                     onchange={(e) => {
-                      scopeApps.set(e.currentTarget.checked);
+                      scope.set(
+                        toggleScope(scope(), "apps", e.currentTarget.checked)
+                      );
                     }}
                   />
                   App Management — git push, deploys, variables
@@ -507,9 +521,11 @@ export const AccountPanel = () => {
                     id="scope-events"
                     type="checkbox"
                     class="checkbox checkbox-sm"
-                    checked={scopeEvents()}
+                    checked={scopeSelection(scope()).events}
                     onchange={(e) => {
-                      scopeEvents.set(e.currentTarget.checked);
+                      scope.set(
+                        toggleScope(scope(), "events", e.currentTarget.checked)
+                      );
                     }}
                   />
                   Events — publish to the event API

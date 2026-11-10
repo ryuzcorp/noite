@@ -4,10 +4,20 @@
 //! `watch(open, …)` through its `ref`, and `onclose` syncs the atom back
 //! so Esc and backdrop clicks close too. Native `showModal()` traps focus
 //! and returns it to the opener; no `modal-open` class juggling.
+//!
+//! Desired vs native state: the `open` atom is what the page *wants*, the
+//! `<dialog>.open` property is what the browser shows, and `sync` is the only
+//! writer of the second. `onClose` therefore reports WHY the element closed
+//! (`CloseReason`) instead of leaving every caller to guess: a programmatic
+//! `open.set(false)` used to look like a user dismissal, so a caller that
+//! treated `onClose` as consent double-fired.
 import { atom, watch } from "ilha";
 import type { AtomHandle, View } from "ilha";
 
 import { collectRef, liveEl, newLiveRef } from "../live-ref";
+
+/** Why a dialog closed. */
+export type CloseReason = "backdrop" | "esc" | "programmatic";
 
 export const Dialog = ({
   children,
@@ -20,13 +30,19 @@ export const Dialog = ({
   class?: string;
   /** id of the element naming this dialog (sets `aria-labelledby`). */
   labelledBy?: string;
-  onClose?: () => void;
+  onClose?: (reason: CloseReason) => void;
   open: AtomHandle<boolean>;
 }) => {
   // The live <dialog>: ilha also hands `ref` detached scratch copies on
   // every re-render, so resolve the connected element at use (live-ref.ts).
   // atom.lazy keeps the holder across re-renders (a body `let` would not).
   const box = atom.lazy(newLiveRef<HTMLDialogElement>)();
+
+  // Why the element is closing: `cancel` (Esc) and the backdrop form set it
+  // before the native close event; `sync` marks a programmatic close.
+  const closing = atom.lazy<{ reason: CloseReason | null }>(() => ({
+    reason: null,
+  }))();
 
   const sync = (want: boolean) => {
     const dlg = liveEl(box);
@@ -38,6 +54,7 @@ export const Dialog = ({
     if (want && !dlg.open) {
       dlg.showModal();
     } else if (!want && dlg.open) {
+      closing.reason = "programmatic";
       dlg.close();
     }
   };
@@ -61,9 +78,17 @@ export const Dialog = ({
       }}
       class={cls}
       aria-labelledby={labelledBy}
+      oncancel={() => {
+        // Esc: the browser fires `cancel` before `close`.
+        closing.reason = "esc";
+      }}
       onclose={() => {
+        // No reason recorded: the backdrop form submitted (`method="dialog"`).
+        const reason = closing.reason ?? "backdrop";
+
+        closing.reason = null;
         open.set(false);
-        onClose?.();
+        onClose?.(reason);
       }}
     >
       {children}

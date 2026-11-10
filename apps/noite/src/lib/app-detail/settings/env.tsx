@@ -239,7 +239,7 @@ export const EnvVarsPanel = ({
                         title: `Delete ${r.name}?`,
                       });
 
-                      if (!ok) {
+                      if (ok !== "confirm") {
                         return;
                       }
 

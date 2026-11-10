@@ -238,21 +238,21 @@ describe("pending invitations", () => {
     const [pending] = await listPendingInvites(APP.id);
     const id = pending?.id ?? "";
     // Someone else holding the id gets nothing.
-    expect(
-      await acceptPendingInvite(id, "view@example.com", "u-view")
-    ).toBeNull();
+    expect(await acceptPendingInvite(id, "view@example.com", "u-view")).toEqual(
+      { _tag: "NotFound" }
+    );
     expect(await denied(requireAppRole(APP.id, "u-view", "view"))).toBe(true);
     // The addressee joins with the invited role, and it is consumed.
     expect(
       await acceptPendingInvite(id, "Stranger@example.com", "u-stranger")
-    ).toEqual({ appId: APP.id });
+    ).toEqual({ _tag: "Accepted", appId: APP.id, role: "push" });
     expect(await roleOf(requireAppRole(APP.id, "u-stranger", "push"))).toBe(
       "push"
     );
     expect(await listPendingInvites(APP.id)).toHaveLength(0);
     expect(
       await acceptPendingInvite(id, "stranger@example.com", "u-stranger")
-    ).toBeNull();
+    ).toEqual({ _tag: "NotFound" });
   });
 
   test("accepting replaces an existing grant with the invited role", async () => {

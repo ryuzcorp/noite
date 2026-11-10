@@ -12,6 +12,7 @@ import { listAllApps } from "../resources";
 import { searchParam } from "../search-param";
 import { Avatar } from "../ui/avatar";
 import { confirmDialog } from "../ui/confirm";
+import { actionDesiredState } from "./runtime";
 import {
   ACTION,
   AdminRow,
@@ -24,6 +25,15 @@ import {
   W_SM,
   mutatePanel,
 } from "./shared";
+
+/** The button label for the runtime's action (`null`: nothing to do). */
+const toggleLabel = (next: AdminAppRow["next"]): string => {
+  if (next === "stop") {
+    return "Stop";
+  }
+
+  return next === "start" ? "Start" : "—";
+};
 
 interface AdminAppRowProps {
   busy: boolean;
@@ -51,12 +61,15 @@ const AdminAppRowItem = ({
         <button
           type="button"
           class={`${ACTION} ${W_SM}`}
-          disabled={busy}
+          // `next` is the server's derived action (lib/admin/runtime): an
+          // unsettled or unknown runtime offers none, so the panel can never
+          // send a start to an app that is already running.
+          disabled={busy || row.next === null}
           onclick={() => {
             onToggle(row);
           }}
         >
-          {row.desiredState === "running" ? "Stop" : "Start"}
+          {toggleLabel(row.next)}
         </button>
         <button
           type="button"
@@ -133,10 +146,15 @@ export const AdminAppsPanel = () => {
             row={row}
             busy={busy()}
             onToggle={(app) => {
+              const { next } = app;
+
+              if (next === null) {
+                return;
+              }
+
               void mutate(() =>
                 api<{ ok: true }>("/api/admin/adminSetAppState", {
-                  desiredState:
-                    app.desiredState === "running" ? "stopped" : "running",
+                  desiredState: actionDesiredState(next),
                   id: app.id,
                 })
               );
@@ -150,7 +168,7 @@ export const AdminAppsPanel = () => {
                   title: `Delete ${app.name} (${app.slug})?`,
                 });
 
-                if (!ok) {
+                if (ok !== "confirm") {
                   return;
                 }
 

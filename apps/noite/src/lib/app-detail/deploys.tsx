@@ -100,11 +100,7 @@ const DropdownApp = defineApp({
       model.action._tag === "RollingBack";
 
     return (
-      // `key` pins this node in the header's action row: the row gains a
-      // Stop/Start or Retry import control when the app's status lands, and a
-      // positional morph would otherwise replace this subtree — closing an open
-      // menu and dropping its state. The key makes ilha move it instead.
-      <div key="deploy" class="dropdown dropdown-end">
+      <div class="dropdown dropdown-end">
         <div
           tabindex={0}
           role="button"
@@ -201,7 +197,7 @@ const DropdownApp = defineApp({
                       title: `Roll back to ${sha.slice(0, 12)}?`,
                     });
 
-                    if (!ok) {
+                    if (ok !== "confirm") {
                       return;
                     }
 
@@ -399,7 +395,7 @@ const RowApp = defineApp({
                   title: "Stop this deploy?",
                 });
 
-                if (!ok) {
+                if (ok !== "confirm") {
                   return;
                 }
 
@@ -431,7 +427,7 @@ const RowApp = defineApp({
                   title: `Roll back to ${sha.slice(0, 12)}?`,
                 });
 
-                if (!ok) {
+                if (ok !== "confirm") {
                   return;
                 }
 

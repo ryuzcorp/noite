@@ -256,7 +256,7 @@ const VarsApp = defineApp({
                           title: `Delete ${row.name}?`,
                         });
 
-                        if (!ok) {
+                        if (ok !== "confirm") {
                           return;
                         }
 
@@ -586,7 +586,7 @@ const GroupApp = defineApp({
                       title: `Delete ${env.label}?`,
                     });
 
-                    if (!ok) {
+                    if (ok !== "confirm") {
                       return;
                     }
 

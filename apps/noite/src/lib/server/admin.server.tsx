@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 import { eq, sql } from "void/db";
 
 import { apikeyTable, appCollaboratorTable, userTable } from "../../db/schema";
+import { runtimeOf, runtimeWire, nextAction } from "../admin/runtime";
 import type { AdminAppRow, AdminUserRow } from "../api-types";
 import {
   authFromEnv,
@@ -9,6 +10,8 @@ import {
   resolveAdminEmail,
   UnauthorizedError,
 } from "../auth";
+import { Authority, authorityOf, authorityWire } from "../authority";
+import type { InstanceAuthority } from "../authority";
 import { dropAppCollaborators } from "../collaborators";
 import { getDb, withDb } from "../db";
 import {
@@ -20,7 +23,7 @@ import {
 import type { RunnerApp } from "../runner";
 import { apiAction, apiActionNoInput, fail } from "./api";
 import { listInvites, mintInvites, revokeInvite } from "./invites.server";
-import { getSessionOrNull } from "./session.server";
+import { readSession } from "./session.server";
 
 /** Explicit user-row shape (mirrors the paranorm `user` table). Written
  * out instead of `Selectable<DB["user"]>`, whose instantiation blows up
@@ -69,15 +72,43 @@ export const ensureAdminAccount = async (
 };
 
 interface AdminSession {
+  /** The one authority union (lib/authority); non-null means an instance
+   * admin that is not impersonating. */
+  authority: InstanceAuthority;
   email: string;
   id: string;
-  isAdmin: boolean;
 }
 
-/** Gate for every admin action: `admin` role, or the env-anchored address
- * (promoted on the way in so the role persists afterwards), and never an
- * impersonated session — the admin home is hidden while impersonating, and
- * the actions behind it refuse too. Returns null instead of failing so
+/** What this request's session may do to the instance, without promoting
+ * anything. Null when there is no session at all. */
+const probeAuthority = async (
+  request: Request,
+  env: KitEnv
+): Promise<InstanceAuthority | null> => {
+  const read = await readSession(request, env);
+
+  if (read._tag === "SignedOut") {
+    return null;
+  }
+
+  const { session } = read;
+  const { user } = session;
+
+  return authorityOf({
+    adminEmail: resolveAdminEmail(),
+    banned: user.banned === true,
+    email: user.email,
+    impersonatedBy: session.impersonatedBy,
+    role: user.role,
+  });
+};
+
+/** Gate for every admin action: the `admin` role, or the env-anchored
+ * address (promoted on the way in so the role persists afterwards), and never
+ * an impersonated or banned session — the admin home is hidden while
+ * impersonating, and the actions behind it refuse too. The decision is
+ * `authorityOf` (lib/authority), the same predicate the control gates and
+ * the client surfaces read. Returns null instead of failing so
  * `adminOverview` can probe for the panel; a denying caller turns it into a
  * client-visible `fail("Admin only")`. An infra failure is logged and reads
  * as denial, never as the generic "Internal error". */
@@ -86,30 +117,43 @@ const requireAdmin = async (
   env: KitEnv
 ): Promise<AdminSession | null> => {
   try {
-    const session = await getSessionOrNull(request, env);
-    const user = session?.user;
+    const read = await readSession(request, env);
 
-    if (!session || !user?.email || !user.id || session.impersonatedBy) {
+    if (read._tag === "SignedOut") {
       return null;
     }
 
-    // SAFETY: the admin plugin augments the session user with an optional role string; allowlist known roles.
-    const roleField = (user as { role?: unknown }).role;
-    const role = roleField === "admin" ? "admin" : "user";
-    const email = user.email.trim().toLowerCase();
+    const { session } = read;
+    const { user } = session;
+    const email = user.email?.trim().toLowerCase() ?? "";
+
+    if (!(user.id && email)) {
+      return null;
+    }
+
     const anchored = resolveAdminEmail();
 
-    if (anchored && email === anchored) {
-      await ensureAdminAccount(anchored, role);
+    const authority = authorityOf({
+      adminEmail: anchored,
+      banned: user.banned === true,
+      email,
+      impersonatedBy: session.impersonatedBy,
+      role: user.role,
+    });
 
-      return { email, id: user.id, isAdmin: true };
-    }
-
-    if (role !== "admin") {
+    if (authority._tag !== "InstanceAdmin") {
       return null;
     }
 
-    return { email, id: user.id, isAdmin: true };
+    if (authority.via === "anchor") {
+      // Persist the promotion so every later read sees the role too.
+      await ensureAdminAccount(
+        anchored,
+        user.role === "admin" ? "admin" : "user"
+      );
+    }
+
+    return { authority, email, id: user.id };
   } catch (error) {
     console.error(
       "[requireAdmin]",
@@ -134,7 +178,7 @@ const adminAuth = (request: Request, env: KitEnv) => {
   return { auth, headers: request.headers };
 };
 
-const asUserRow = (row: DbUser): AdminUserRow => ({
+const asUserRow = (row: DbUser, actorId: string): AdminUserRow => ({
   banned: row.banned ?? false,
   createdAt:
     row.createdAt instanceof Date
@@ -144,6 +188,7 @@ const asUserRow = (row: DbUser): AdminUserRow => ({
   id: row.id,
   name: row.name ?? "",
   role: row.role === "admin" ? "admin" : "user",
+  self: row.id === actorId,
 });
 
 /** Probe for the admin UI: resolves instead of throwing, so the panel
@@ -153,14 +198,33 @@ const asUserRow = (row: DbUser): AdminUserRow => ({
 export const adminOverview = apiActionNoInput(async ({ env, request }) => {
   const admin = await requireAdmin(request, env);
 
-  if (!admin) {
-    return { controlFleet: true, email: "", isAdmin: false as const };
+  if (admin) {
+    return {
+      authority: authorityWire(admin.authority),
+      controlFleet: await runnerControlFleet(),
+      email: admin.email,
+      isAdmin: true as const,
+    };
+  }
+
+  // The probe answers with the real state (signed out, plain, impersonating
+  // or banned) instead of one flat "not admin": the side bar, the control
+  // page and the Admin tab all read this field, and only the instance-admin
+  // state may see them.
+  let authority: InstanceAuthority = Authority.Anonymous();
+
+  try {
+    authority = (await probeAuthority(request, env)) ?? authority;
+  } catch {
+    // A store outage keeps the panel hidden; it reads as signed out, and the
+    // session resource itself surfaces the failure to the client gate.
   }
 
   return {
-    controlFleet: await runnerControlFleet(),
-    email: admin.email,
-    isAdmin: true as const,
+    authority: authorityWire(authority),
+    controlFleet: true,
+    email: "",
+    isAdmin: false as const,
   };
 });
 
@@ -183,11 +247,7 @@ const likePattern = (query: string): string =>
 export const listUsers = apiAction(
   ListUsersArgs,
   async ({ page, query }, { env, request }) => {
-    const admin = await requireAdmin(request, env);
-
-    if (!admin) {
-      fail("Admin only");
-    }
+    const admin = (await requireAdmin(request, env)) ?? fail("Admin only");
 
     const needle = query.trim().slice(0, 100);
     const offset = Math.max(0, Math.floor(page)) * ADMIN_USERS_PAGE_SIZE;
@@ -212,7 +272,7 @@ export const listUsers = apiAction(
         hasMore: rows.length > ADMIN_USERS_PAGE_SIZE,
         users: rows
           .slice(0, ADMIN_USERS_PAGE_SIZE)
-          .map((row) => asUserRow(row)),
+          .map((row) => asUserRow(row, admin.id)),
       };
     } catch (error) {
       if (error instanceof UnauthorizedError) {
@@ -224,18 +284,22 @@ export const listUsers = apiAction(
   }
 );
 
-const asAppRow = (
-  app: RunnerApp,
-  emails: Map<string, string>
-): AdminAppRow => ({
-  desiredState: app.desiredState ?? "",
-  id: app.id,
-  name: app.name,
-  ownerEmail: emails.get(app.userId) ?? "",
-  ownerId: app.userId,
-  slug: app.slug,
-  status: app.status,
-});
+const asAppRow = (app: RunnerApp, emails: Map<string, string>): AdminAppRow => {
+  const desiredState = app.desiredState ?? "";
+  const runtime = runtimeOf(app.status, desiredState);
+
+  return {
+    desiredState,
+    id: app.id,
+    name: app.name,
+    next: nextAction(runtime),
+    ownerEmail: emails.get(app.userId) ?? "",
+    ownerId: app.userId,
+    runtime: runtimeWire(runtime),
+    slug: app.slug,
+    status: app.status,
+  };
+};
 
 /** Every app on this instance, all owners (admin only; runner is source),
  * each with its owner's email. */
@@ -528,7 +592,17 @@ export const adminRevokeInvite = apiAction(
     }
 
     try {
-      await revokeInvite(id);
+      const outcome = await revokeInvite(id);
+
+      if (outcome._tag === "Refused") {
+        // A spent code is history: say so instead of reporting a revoke that
+        // changed nothing.
+        return fail(
+          outcome.reason === "used"
+            ? "That code has already been used — it cannot be revoked."
+            : "That code no longer exists."
+        );
+      }
 
       return { ok: true as const };
     } catch (error) {
@@ -536,7 +610,7 @@ export const adminRevokeInvite = apiAction(
         throw error;
       }
 
-      failUnknown(error);
+      return failUnknown(error);
     }
   }
 );

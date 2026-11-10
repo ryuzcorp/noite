@@ -12,6 +12,7 @@ import {
   toMetricsHours,
 } from "../app-detail/metrics";
 import { DetailShell, DetailTabs } from "../app-detail/shell";
+import { mayAdministerInstance, overviewAuthority } from "../authority";
 import {
   CONTROL_APP_ID,
   CONTROL_APP_NAME,
@@ -165,13 +166,7 @@ const FleetUnknownNotice = () => (
   </section>
 );
 
-const ControlAppDetailBody = ({
-  fleet,
-  email,
-}: {
-  fleet: FleetState;
-  email: string;
-}) => {
+const ControlAppDetailBody = ({ fleet }: { fleet: FleetState }) => {
   const tab = searchParam<TabId>("t", { default: "overview", parse: toTabId });
   const requested = tab();
   const telemetry = telemetryAvailable(fleet);
@@ -232,7 +227,7 @@ const ControlAppDetailBody = ({
       {active === "logs" ? <RuntimeLogs appId={CONTROL_APP_ID} /> : null}
       {/* Admin panels keep their searches in the URL (`uq`/`up`, `aq`, `iq` —
           none collide with the control page's `t`/`e`/`r`). */}
-      {active === "users" ? <AdminUsersPanel email={email} /> : null}
+      {active === "users" ? <AdminUsersPanel /> : null}
       {active === "apps" ? <AdminAppsPanel /> : null}
       {active === "invites" ? <AdminInvitesPanel /> : null}
     </DetailShell>
@@ -250,9 +245,9 @@ export const ControlAppDetail = () => {
     resourceValue(admin.state()) !== undefined &&
     resourceValue(sess.state()) !== undefined;
 
-  const allowed =
-    (resourceValue(admin.state())?.isAdmin ?? false) &&
-    resourceValue(sess.state())?.session.impersonatedBy === null;
+  const allowed = mayAdministerInstance(
+    overviewAuthority(resourceValue(admin.state()))
+  );
 
   if (!ready) {
     return (
@@ -276,7 +271,6 @@ export const ControlAppDetail = () => {
   return (
     <ControlAppDetailBody
       fleet={fleetState(resourceValue(admin.state())?.controlFleet)}
-      email={resourceValue(sess.state())?.user.email ?? ""}
     />
   );
 };

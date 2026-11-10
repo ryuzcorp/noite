@@ -12,11 +12,15 @@ import {
   listInvitesForEmail,
   listPendingInvites,
   normalizeEmail,
+  removeGrant,
   requireAppRole,
+  revokeMemberInvites,
   revokePendingInvite,
   upsertPendingInvite,
+  writeGrant,
 } from "../collaborators";
-import { getDb } from "../db";
+import { getDb, withDb } from "../db";
+import { decideGrant, decideRemove } from "../membership";
 import { parseAppRole } from "../roles";
 import { apiAction, apiActionNoInput, fail } from "./api";
 import { sessionUser } from "./session.server";
@@ -79,7 +83,11 @@ export const inviteCollaborator = apiAction(
       );
 
       if (member) {
-        await grantCollaborator(appId, member.userId, nextRole);
+        const write = await grantCollaborator(appId, member.userId, nextRole);
+
+        if (write === "last-admin") {
+          return fail("Cannot demote the last admin");
+        }
 
         return { ok: true as const, status: "updated" as const };
       }
@@ -142,8 +150,14 @@ export const acceptInvitation = apiAction(
     const user = await sessionUser(request, env);
     const accepted = await acceptPendingInvite(inviteId, user.email, user.id);
 
-    if (!accepted) {
+    if (accepted._tag === "NotFound") {
       return fail("Invitation not found");
+    }
+
+    if (accepted._tag === "Refused") {
+      return fail(
+        "This app would be left without an admin — ask another admin to change the invitation first."
+      );
     }
 
     return { appId: accepted.appId, ok: true as const };
@@ -171,14 +185,11 @@ export const updateCollaboratorRole = apiAction(
       return fail("role must be view, push, or admin");
     }
 
-    const err = await (async () => {
-      const db = getDb();
-
-      const rows = await db
-        .select({
-          id: appCollaboratorTable.id,
-          role: appCollaboratorTable.role,
-        })
+    // One conditional write carries the last-admin invariant; the account
+    // must hold a grant already (grants are created by invitation).
+    const current = await withDb(() =>
+      getDb()
+        .select({ role: appCollaboratorTable.role })
         .from(appCollaboratorTable)
         .where(
           and(
@@ -186,34 +197,29 @@ export const updateCollaboratorRole = apiAction(
             eq(appCollaboratorTable.userId, userId)
           )
         )
-        .limit(1);
+        .limit(1)
+    );
 
-      const [membership] = rows;
+    const [membership] = current;
 
-      if (!membership) {
-        return "Collaborator not found";
-      }
+    if (!membership) {
+      return fail("Collaborator not found");
+    }
 
-      const current = parseAppRole(membership.role);
+    const decision = decideGrant({
+      adminCount: await countAdmins(appId),
+      current: parseAppRole(membership.role),
+      next: nextRole,
+    });
 
-      if (current === "admin" && nextRole !== "admin") {
-        const admins = await countAdmins(appId);
+    if (decision._tag === "Refused") {
+      return fail("Cannot demote the last admin");
+    }
 
-        if (admins <= 1) {
-          return "Cannot demote the last admin";
-        }
-      }
+    const write = await writeGrant(appId, userId, nextRole);
 
-      await db
-        .update(appCollaboratorTable)
-        .set({ role: nextRole })
-        .where(eq(appCollaboratorTable.id, membership.id));
-
-      return "";
-    })();
-
-    if (err) {
-      return fail(err);
+    if (write === "last-admin") {
+      return fail("Cannot demote the last admin");
     }
 
     return { ok: true as const };
@@ -226,14 +232,9 @@ export const removeCollaborator = apiAction(
     const actor = await sessionUser(request, env);
     await requireAppRole(appId, actor.id, "admin");
 
-    const err = await (async () => {
-      const db = getDb();
-
-      const rows = await db
-        .select({
-          id: appCollaboratorTable.id,
-          role: appCollaboratorTable.role,
-        })
+    const rows = await withDb(() =>
+      getDb()
+        .select({ role: appCollaboratorTable.role })
         .from(appCollaboratorTable)
         .where(
           and(
@@ -241,32 +242,33 @@ export const removeCollaborator = apiAction(
             eq(appCollaboratorTable.userId, userId)
           )
         )
-        .limit(1);
+        .limit(1)
+    );
 
-      const [membership] = rows;
+    const [membership] = rows;
 
-      if (!membership) {
-        return "";
-      }
-
-      if (parseAppRole(membership.role) === "admin") {
-        const admins = await countAdmins(appId);
-
-        if (admins <= 1) {
-          return "Cannot remove the last admin";
-        }
-      }
-
-      await db
-        .delete(appCollaboratorTable)
-        .where(eq(appCollaboratorTable.id, membership.id));
-
-      return "";
-    })();
-
-    if (err) {
-      return fail(err);
+    if (!membership) {
+      return { ok: true as const };
     }
+
+    const decision = decideRemove({
+      adminCount: await countAdmins(appId),
+      current: parseAppRole(membership.role),
+    });
+
+    if (decision._tag === "Refused") {
+      return fail("Cannot remove the last admin");
+    }
+
+    const write = await removeGrant(appId, userId);
+
+    if (write === "last-admin") {
+      return fail("Cannot remove the last admin");
+    }
+
+    // An invitation for a removed member would re-grant on accept, so it goes
+    // with the grant.
+    await revokeMemberInvites(appId, userId);
 
     return { ok: true as const };
   }

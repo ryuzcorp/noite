@@ -12,6 +12,7 @@
  * that also publishes its `inputSchema`. Nothing downstream of a parse looks
  * at a raw JSON shape.
  */
+import { Data } from "effect";
 import type { JsonSchema } from "effect/JsonSchema";
 import * as Schema from "effect/Schema";
 
@@ -25,6 +26,32 @@ export const DEFAULT_PROTOCOL_VERSION = "2025-06-18";
 
 /** The HTTP header carrying the negotiated revision on later requests. */
 export const PROTOCOL_VERSION_HEADER = "mcp-protocol-version";
+
+/** What the header on a later request asked for. Two rules apply, and this
+ * union is where each one is stated: `initialize` answers an unsupported
+ * request with the default (the client decides), while a later request whose
+ * header names an unsupported revision is refused with 400 — the transport
+ * has no session that could have agreed to anything else. */
+export type ProtocolVersionCheck = Data.TaggedEnum<{
+  Absent: Record<never, never>;
+  Supported: { readonly version: string };
+  Unsupported: { readonly requested: string };
+}>;
+
+export const VersionCheck = Data.taggedEnum<ProtocolVersionCheck>();
+
+/** The header rule (`tools/call` and friends). */
+export const versionFromHeader = (
+  header: string | null
+): ProtocolVersionCheck => {
+  if (header === null || header === "") {
+    return VersionCheck.Absent();
+  }
+
+  return SUPPORTED_PROTOCOL_VERSIONS.includes(header)
+    ? VersionCheck.Supported({ version: header })
+    : VersionCheck.Unsupported({ requested: header });
+};
 
 export const SERVER_INFO = {
   name: "noite",

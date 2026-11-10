@@ -8,35 +8,25 @@ import { resourceValue } from "../resource";
 import { session as sessionResource } from "../resources";
 import { sleep } from "../sleep";
 import { DashboardSkeleton } from "../ui/skeletons";
+import { GateEvt, GateState, gateTransition } from "./gate";
+import type { Gate, GateEvent } from "./gate";
 import { invalidateSession } from "./session";
 
-interface SessionWithImpersonation {
-  impersonatedBy?: unknown;
-}
-
-const readImpersonated = (
-  session: SessionWithImpersonation | null | undefined,
-  fallbackEmail: string
-) => {
-  // The admin plugin adds an optional impersonatedBy id to sessions it
-  // creates; presence means this session is impersonated.
-  const impersonated =
-    session?.impersonatedBy !== undefined && session.impersonatedBy !== null;
-
-  return {
-    email: fallbackEmail,
-    impersonated,
-  };
-};
-
-/**
- * Session gate for the dashboard. Renders `fallback` until the session
- * cookie is readable, then renders `then`. Redirects to /login if it never
- * becomes readable — mounted once in the layout so every view is covered.
- */
 /** Dashboard-chrome skeleton while the gate resolves. */
 export const SessionSplash = () => <DashboardSkeleton />;
 
+/** How long the gate waits between cookie-readiness reads. */
+const RETRY_INTERVAL_MS = 50;
+
+/**
+ * Session gate for the dashboard. Renders `fallback` until the session cookie
+ * is readable, then renders `children`. Redirects to /login if it never
+ * becomes readable — mounted once in the layout so every view is covered.
+ *
+ * The states and transitions live in `./gate` (`GateState`); a failed read
+ * paints an explicit error with Retry instead of the skeleton it used to
+ * leave up forever.
+ */
 export const Authed = ({
   children,
   fallback = <SessionSplash />,
@@ -46,8 +36,53 @@ export const Authed = ({
 }) => {
   const router = useRouter();
   const res = sessionResource();
+  const gate = atom<Gate>(GateState.Ssr());
   const returning = atom(false);
   const returnError = atom("");
+
+  const dispatch = (event: GateEvent): Gate => {
+    const next = gateTransition(gate(), event);
+
+    gate.set(next);
+
+    return next;
+  };
+
+  /** Read the session, retrying only while the gate is still `Checking`, and
+   * settle on Authed / SignedOut / Failed. Never throws: a rejected refetch is
+   * the `Failed` state, not an abandoned watcher. */
+  const check = async (signal?: AbortSignal): Promise<void> => {
+    for (;;) {
+      try {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- sequential cookie-readiness poll; parallel reads would defeat the early exit
+        await res.refetch();
+        // SAFETY: `refetch` resolved, so the state carries a value; a null
+        // value is the "cookie not readable yet" case the gate retries.
+        const session = resourceValue(res.state()) ?? null;
+        const next = dispatch(GateEvt.Read({ session }));
+
+        if (next._tag !== "Checking") {
+          if (next._tag === "SignedOut") {
+            router.visit("/login");
+          }
+
+          return;
+        }
+      } catch (error) {
+        dispatch(GateEvt.ReadFailed({ message: errorMessage(error) }));
+
+        return;
+      }
+
+      if (signal?.aborted) {
+        return;
+      }
+
+      // oxlint-disable-next-line eslint/no-await-in-loop -- sequential cookie-readiness poll; Promise.all would defeat the early-exit
+      await sleep(RETRY_INTERVAL_MS);
+    }
+  };
+
   watch.once(async ({ signal }) => {
     if (typeof window === "undefined") {
       // SSR: the session resolves client-side (resources never fetch on
@@ -55,34 +90,17 @@ export const Authed = ({
       return;
     }
 
-    // Wait for the first answer however long it takes: refetch() joins
-    // the in-flight request, so a slow get-session never counts against
-    // the retry budget below (sleeping through it bounced real users).
-    if (res.state()._tag === "Loading" || res.state()._tag === "Failed") {
-      await res.refetch();
+    // A painted snapshot counts as the first read: only a cold gate fetches.
+    const painted = resourceValue(res.state());
+
+    if (painted?.user) {
+      dispatch(GateEvt.Read({ session: painted }));
+
+      return;
     }
 
-    // Post-registration cookie race: the first answer can arrive before
-    // the session cookie is readable, so retry briefly before bouncing.
-    for (let i = 0; i < 20 && !resourceValue(res.state())?.user; i += 1) {
-      if (signal.aborted) {
-        return;
-      }
-
-      // oxlint-disable-next-line eslint/no-await-in-loop -- sequential cookie-readiness poll; Promise.all would defeat the early-exit
-      await sleep(50);
-
-      if (signal.aborted) {
-        return;
-      }
-
-      // oxlint-disable-next-line eslint/no-await-in-loop -- same poll cycle: sleep, then re-read
-      await res.refetch();
-    }
-
-    if (!signal.aborted && !resourceValue(res.state())?.user) {
-      router.visit("/login");
-    }
+    dispatch(GateEvt.Retry());
+    await check(signal);
   });
 
   const stopImpersonating = async () => {
@@ -109,21 +127,44 @@ export const Authed = ({
     }
   };
 
-  const data = resourceValue(res.state());
-  const user = data?.user;
+  const state = gate();
 
-  if (!data || !user) {
+  if (state._tag === "Failed") {
+    return (
+      <div class="mx-auto flex w-full max-w-md flex-col items-start gap-3 p-6">
+        <h1 class="m-0 text-lg font-semibold">Couldn't load your session</h1>
+        <p class="m-0 text-sm opacity-70">{state.message}</p>
+        <p class="m-0 text-sm opacity-70">
+          This is usually a temporary database or network problem — your account
+          is fine.
+        </p>
+        <button
+          type="button"
+          class="btn btn-sm btn-neutral"
+          onclick={() => {
+            dispatch(GateEvt.Retry());
+            void check();
+          }}
+        >
+          Try again
+        </button>
+      </div>
+    );
+  }
+
+  if (state._tag !== "Authed") {
     return fallback;
   }
 
-  const seen = readImpersonated(data.session, user.email);
+  const { session } = state;
+  const impersonated = session.session.impersonatedBy !== null;
 
   return (
     <>
-      {seen.impersonated ? (
+      {impersonated ? (
         <div class="bg-warning text-warning-content px-4 py-2 text-sm">
           <div class="mx-auto flex w-full max-w-5xl flex-wrap items-center justify-between gap-2">
-            <span>Impersonating {seen.email}</span>
+            <span>Impersonating {session.user.email}</span>
             <span class="flex items-center gap-2">
               {returnError() ? <span>{returnError()}</span> : null}
               <button

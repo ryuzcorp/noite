@@ -483,7 +483,7 @@ export const BranchPicker = ({
                     title: `Delete branch ${target}?`,
                   });
 
-                  if (!ok) {
+                  if (ok !== "confirm") {
                     picker.set(settleAction(picker()));
 
                     return;
