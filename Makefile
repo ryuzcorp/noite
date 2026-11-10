@@ -28,6 +28,21 @@ ifeq ($(_TENANCY),multi)
 COMPOSE += -f docker/compose.multi.yaml
 endif
 
+# The compose file bind-mounts the host engine socket (`DOCKER_SOCKET`,
+# default /var/run/docker.sock). Rootless Podman has none there, and unlike
+# Docker (which materializes a directory) it refuses a missing bind source:
+# `statfs /var/run/docker.sock: no such file or directory`. Sandbox
+# containers need a rootful engine anyway (NOITE_SANDBOX in .env.example),
+# so with no explicit DOCKER_SOCKET and no host socket, mount /dev/null (the
+# runner treats a non-socket as no engine) and switch the sandbox plane off
+# unless NOITE_SANDBOX is already set.
+ifeq ($(DOCKER_SOCKET)$(wildcard /var/run/docker.sock),)
+DOCKER_SOCKET := /dev/null
+ifeq ($(NOITE_SANDBOX),)
+NOITE_SANDBOX := 0
+endif
+endif
+
 .PHONY: help up up-prod e2e e2e-isolation e2e-down dev dev-host logs doctor backup restore down nuke usage
 
 COMPOSE_BUILD := $(COMPOSE) -f docker/compose.build.yaml
